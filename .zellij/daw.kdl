@@ -1,0 +1,14 @@
+layout {
+    tab name="daw" focus=true {
+        pane split_direction="vertical" {
+            pane size="62%"
+            pane {
+                pane
+                pane size="38%" close_on_exit=true {
+                    command "lazygit"
+                    cwd "."
+                }
+            }
+        }
+    }
+}

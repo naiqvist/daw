@@ -1,0 +1,133 @@
+//! The action vocabulary: everything a user can ask the app to do.
+//!
+//! Panels never act — they RETURN wishes from this enum; `main.rs` (the only
+//! owner of the Engine) translates them. Buttons, keyboard shortcuts, menus,
+//! and any future command palette all speak these same values, so an input
+//! method is just a different way to emit an action.
+//!
+//! Every action carries a `label()`, because anything that can be done must
+//! be nameable: that is what lets `keymap` print a shortcut table and a View
+//! menu build itself from the panel registry.
+
+use crate::ui::tokens::Density;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum UiAction {
+    StartEngine,
+    StopEngine,
+    /// Play if stopped, stop if playing — what the spacebar and the
+    /// transport button both mean.
+    TogglePlay,
+    /// Halt playback, hold position.
+    Pause,
+    /// Halt playback AND return to zero — pause and return in one press.
+    /// Distinct from `StopEngine`, which shuts the audio device down: this
+    /// one is a transport verb, that one is a power switch.
+    Stop,
+    /// Stop and return to zero.
+    Return,
+    SetTempo(f64),
+    /// Numerator and denominator, e.g. `(3, 4)`.
+    SetTimeSignature(u32, u32),
+    ToggleMetronome,
+    /// Arm or disarm recording. Rolling is `armed && playing`, derived — it
+    /// is not a state anyone sets directly.
+    ToggleRecord,
+    ToggleLoop,
+    /// Keep the playhead on screen as it moves.
+    ToggleFollow,
+
+    // --- the arrangement's grid ---
+    /// Finer divisions: 1/4 becomes 1/8. Ableton calls this Narrow Grid.
+    NarrowGrid,
+    /// Coarser divisions: 1/8 becomes 1/4.
+    WidenGrid,
+    /// Turn the current time selection into the loop region, and enable
+    /// looping. Ableton's Ctrl+L.
+    LoopFromSelection,
+    /// Step the arrangement's keyboard cell cursor by this many grid
+    /// divisions. Negative is earlier. Collapses the selection to one cell.
+    MoveCell(i32),
+    /// Move the cursor the same way, but keep the selection's anchor — so
+    /// the selection grows or shrinks instead of collapsing. Shift+arrow.
+    ExtendCell(i32),
+    /// Remove the selected clip. The mouse selects, this disposes.
+    DeleteSelected,
+    /// The clipboard verbs. Copy stashes the selected clip; paste places it
+    /// at the cursor (or selection, or playhead); duplicate places a copy
+    /// directly after the original — Ableton's Ctrl+D.
+    CopyClip,
+    PasteClip,
+    DuplicateClip,
+
+    // --- view: the app's own furniture, no engine involved ---
+    /// Show/hide a registered panel, by its `Panel::id()`.
+    TogglePanel(&'static str),
+    /// Bring a center-dock panel to the front of its tab strip.
+    FocusPanel(&'static str),
+    SetDensity(Density),
+}
+
+impl UiAction {
+    /// Human name, for menus, tooltips, and the shortcut table.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::StartEngine => "Start engine",
+            Self::StopEngine => "Stop engine",
+            Self::TogglePlay => "Play / stop",
+            Self::Pause => "Pause",
+            Self::Stop => "Stop",
+            Self::Return => "Return to zero",
+            Self::SetTempo(_) => "Set tempo",
+            Self::SetTimeSignature(..) => "Time signature",
+            Self::ToggleMetronome => "Metronome",
+            Self::ToggleRecord => "Record",
+            Self::ToggleLoop => "Loop",
+            Self::ToggleFollow => "Follow",
+            Self::NarrowGrid => "Narrow grid",
+            Self::WidenGrid => "Widen grid",
+            Self::LoopFromSelection => "Loop selection",
+            Self::MoveCell(_) => "Move cursor",
+            Self::ExtendCell(_) => "Extend selection",
+            Self::DeleteSelected => "Delete selected clip",
+            Self::CopyClip => "Copy clip",
+            Self::PasteClip => "Paste clip",
+            Self::DuplicateClip => "Duplicate clip",
+            Self::TogglePanel(id) => id,
+            Self::FocusPanel(id) => id,
+            Self::SetDensity(_) => "Density",
+        }
+    }
+
+    /// Does performing this action require a running engine? The keymap uses
+    /// it to stay quiet when the engine is off, and panels use it to grey
+    /// controls out — one answer, in one place, instead of both guessing.
+    pub fn needs_engine(self) -> bool {
+        match self {
+            Self::TogglePlay
+            | Self::Pause
+            | Self::Stop
+            | Self::Return
+            | Self::SetTempo(_)
+            | Self::SetTimeSignature(..)
+            | Self::ToggleMetronome
+            | Self::ToggleRecord
+            | Self::ToggleLoop
+            | Self::StopEngine => true,
+            Self::StartEngine
+            | Self::ToggleFollow
+            | Self::NarrowGrid
+            | Self::WidenGrid
+            | Self::LoopFromSelection
+            | Self::MoveCell(_)
+            | Self::ExtendCell(_)
+            | Self::DeleteSelected
+            | Self::CopyClip
+            | Self::PasteClip
+            | Self::DuplicateClip
+            | Self::TogglePanel(_)
+            | Self::FocusPanel(_)
+            | Self::SetDensity(_) => false,
+        }
+    }
+}

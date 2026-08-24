@@ -1,0 +1,597 @@
+//! Red zone. Everything in this module is reachable from the audio callback.
+//!
+//! The callback runs on a realtime thread with a hard deadline of
+//! `buffer_frames / sample_rate` seconds — 5.33ms at 48kHz/256. Inside it, and
+//! inside anything it calls, there is no allocation, no locking, no syscalls,
+//! no logging, no panicking, and no unbounded-time work.
+//!
+//! See `AGENTS.md`. If a change appears to require breaking one of those,
+//! stop and explain rather than writing it.
+
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
+pub mod bounce;
+pub mod graph;
+pub mod project;
+pub mod transport;
+
+use assert_no_alloc::assert_no_alloc;
+use rtaudio::{
+    Api, Buffers, DeviceParams, SampleFormat, StreamConfig, StreamFlags, StreamHandle, StreamStatus,
+};
+use std::sync::Mutex;
+use std::time::Instant;
+
+use crate::audio::graph::{NodeId, ParamChange, ProcessCtx, Schedule};
+use crate::audio::transport::{Transport, TransportCmd};
+
+/// Errors reported by the backend's global error callback. Green zone: the
+/// error path may allocate and lock — a stream that is already broken has no
+/// deadline left to miss. rtaudio's callback is a process-wide singleton, so
+/// this store is static too.
+static STREAM_ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// How the stream is doing, judged by two independent signals: errors the
+/// backend reported, and whether blocks are still arriving on schedule.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StreamHealth {
+    Running,
+    /// No error reported, but the block counter has stopped advancing — the
+    /// server died silently or the graph was torn down under us.
+    Stalled {
+        seconds: f32,
+    },
+    /// The backend reported an error.
+    Errored(String),
+}
+
+/// Link the stream's JACK ports to the default sink and source via
+/// `wpctl`/`pw-link`. Failures are ignored: the stream still runs, and links
+/// can be made by hand in qpwgraph.
+fn connect_default_ports() {
+    fn default_node(target: &str) -> Option<String> {
+        let out = std::process::Command::new("wpctl")
+            .args(["inspect", target])
+            .output()
+            .ok()?;
+        let text = String::from_utf8(out.stdout).ok()?;
+        let line = text.lines().find(|l| l.contains("node.name"))?;
+        Some(line.split('"').nth(1)?.to_owned())
+    }
+    fn link(from: &str, to: &str) {
+        let _ = std::process::Command::new("pw-link")
+            .args([from, to])
+            .status();
+    }
+
+    if let Some(sink) = default_node("@DEFAULT_AUDIO_SINK@") {
+        link("daw:outport 0", &format!("{sink}:playback_FL"));
+        link("daw:outport 1", &format!("{sink}:playback_FR"));
+    }
+    if let Some(source) = default_node("@DEFAULT_AUDIO_SOURCE@") {
+        link(&format!("{source}:capture_FL"), "daw:inport 0");
+        link(&format!("{source}:capture_FR"), "daw:inport 1");
+    }
+}
+
+/// Set flush-to-zero and denormals-are-zero in the x86 MXCSR register.
+///
+/// Denormals are the tiny not-quite-zero floats a decaying signal passes
+/// through on its way down (a reverb tail, a filter ringing out). Hardware
+/// handles them via microcode assist at 10-100x the cost of a normal float op,
+/// so a silent decaying tail can cost more CPU than a loud signal. FTZ+DAZ
+/// makes the FPU treat them as zero, which is inaudible and standard practice
+/// in audio engines.
+///
+/// MXCSR is per-thread state: this must run on the audio thread itself, not
+/// the thread that opens the stream. It is a register write — no syscall.
+#[inline]
+fn flush_denormals_to_zero() {
+    // The _mm_getcsr/_mm_setcsr intrinsics are deprecated in favour of inline
+    // asm, so read-modify-write MXCSR directly.
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: setting FTZ (bit 15) and DAZ (bit 6) only changes how the FPU
+    // rounds subnormal values; it cannot fault and affects only this thread.
+    unsafe {
+        let mut mxcsr: u32 = 0;
+        std::arch::asm!(
+            "stmxcsr [{ptr}]",
+            "or dword ptr [{ptr}], 0x8040",
+            "ldmxcsr [{ptr}]",
+            ptr = in(reg) &mut mxcsr,
+            options(nostack),
+        );
+    }
+}
+
+/// What the engine was asked to open with.
+#[derive(Debug, Clone, Copy)]
+pub struct EngineConfig {
+    pub sample_rate: u32,
+    pub buffer_frames: u32,
+    pub channels: u32,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            sample_rate: 48_000,
+            buffer_frames: 256,
+            channels: 2,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum EngineError {
+    /// rtaudio was built without the JACK backend — see AGENTS.md. A build
+    /// missing it succeeds silently and runs through the ALSA/Pulse compat
+    /// layer instead.
+    #[error("rtaudio was compiled without the JACK backend (need features = [\"jack_linux\"])")]
+    NoJackBackend,
+
+    #[error("could not open JACK host: {0}")]
+    Host(String),
+
+    #[error("could not open duplex stream: {0}")]
+    OpenStream(String),
+
+    #[error("could not start stream: {0}")]
+    StartStream(String),
+
+    #[error("schedule queue is full — callback is not draining it")]
+    ScheduleQueueFull,
+
+    /// The stream negotiated interleaved buffers. Every buffer index in the
+    /// engine assumes planar layout — running would produce garbage audio,
+    /// so refuse loudly instead.
+    #[error(
+        "stream negotiated interleaved buffers (NONINTERLEAVED not honoured);          the engine's planar layout assumptions would silently corrupt audio"
+    )]
+    InterleavedNotSupported,
+}
+
+/// How many leading samples of channel 0 each block reports to the UI.
+pub const SNAPSHOT_SAMPLES: usize = 8;
+
+/// One block's worth of telemetry, handed to the UI.
+///
+/// Fixed size and `Copy` on purpose: writing it is a memcpy into a
+/// `triple_buffer`, with no allocation and no lock.
+#[derive(Debug, Clone, Copy)]
+pub struct BlockSnapshot {
+    /// Monotonic block counter since the stream started.
+    pub block: u64,
+    /// Frames in this block. Should equal the configured buffer size.
+    pub frames: usize,
+    /// Largest absolute sample in the INPUT block. The output is silent by
+    /// design (no monitoring path yet — feedback), so metering the output
+    /// would only ever show zero.
+    pub peak: f32,
+    /// Leading samples of input channel 0, as captured from the device.
+    pub head: [f32; SNAPSHOT_SAMPLES],
+
+    /// How long the callback body took for this block, in nanoseconds.
+    pub work_ns: u64,
+    /// Worst callback duration since the stream started.
+    pub work_max_ns: u64,
+    /// Output underflows reported by the device since start. Each one was
+    /// probably audible.
+    pub underflows: u64,
+    /// Input overflows since start — capture data was lost.
+    pub overflows: u64,
+    /// Block number of the most recent xrun (0 = never). Turns "we had an
+    /// xrun at some point" into "it happened at block N", which is the
+    /// difference between attributing and guessing.
+    pub last_xrun_block: u64,
+
+    /// Transport, as of this block's start.
+    pub playing: bool,
+    pub position: u64,
+    pub beat: f64,
+    /// Blocks refused because the server delivered more frames than the
+    /// arena was sized for (a live quantum change). Nonzero means silence
+    /// was output instead of corrupt audio.
+    pub oversized_blocks: u64,
+}
+
+impl Default for BlockSnapshot {
+    fn default() -> Self {
+        Self {
+            block: 0,
+            frames: 0,
+            peak: 0.0,
+            head: [0.0; SNAPSHOT_SAMPLES],
+            work_ns: 0,
+            work_max_ns: 0,
+            underflows: 0,
+            overflows: 0,
+            last_xrun_block: 0,
+            playing: false,
+            position: 0,
+            beat: 0.0,
+            oversized_blocks: 0,
+        }
+    }
+}
+
+impl BlockSnapshot {
+    /// Fraction of the deadline the callback used, at the given stream config.
+    /// 1.0 means the whole budget was spent; past 1.0 the deadline was missed.
+    pub fn load(&self, sample_rate: u32, buffer_frames: u32) -> f64 {
+        if sample_rate == 0 {
+            return 0.0;
+        }
+        let budget_ns = buffer_frames as f64 / sample_rate as f64 * 1e9;
+        self.work_ns as f64 / budget_ns
+    }
+}
+
+/// What the stream actually negotiated, which is not always what was asked for.
+#[derive(Debug, Clone, Copy)]
+pub struct StreamInfoSnapshot {
+    pub sample_rate: u32,
+    pub max_frames: usize,
+    pub in_channels: usize,
+    pub out_channels: usize,
+    /// False means interleaved, which would invalidate the planar assumptions
+    /// the DSP is written against.
+    pub deinterleaved: bool,
+    pub latency_frames: Option<usize>,
+}
+
+/// Owns the running audio stream. Dropping this stops it.
+pub struct Engine {
+    _stream: StreamHandle,
+    info: StreamInfoSnapshot,
+    telemetry: triple_buffer::Output<BlockSnapshot>,
+    /// Heartbeat state for health(): last block number seen, and when it
+    /// last advanced.
+    last_seen_block: u64,
+    last_advance: Instant,
+    /// New schedules go in here; the callback swaps them in between blocks.
+    schedule_tx: rtrb::Producer<Box<Schedule>>,
+    /// Parameter letters: 16-byte Copy structs, drained at each block start.
+    param_tx: rtrb::Producer<ParamChange>,
+    /// Transport commands: one ring, so a stop+seek+play gesture is atomic
+    /// by ring order.
+    transport_tx: rtrb::Producer<TransportCmd>,
+    /// Retired schedules come back here so they are dropped on THIS thread,
+    /// never freed inside the callback.
+    trash_rx: rtrb::Consumer<Box<Schedule>>,
+}
+
+impl Engine {
+    /// Open a duplex stream on JACK and start it. The callback currently writes
+    /// silence and reads nothing.
+    ///
+    /// JACK is requested explicitly: `Api::Unspecified` resolves to ALSA on this
+    /// machine even when JACK is compiled in.
+    pub fn start(cfg: EngineConfig) -> Result<Self, EngineError> {
+        if !rtaudio::compiled_apis().contains(&Api::UnixJack) {
+            return Err(EngineError::NoJackBackend);
+        }
+
+        let mut host =
+            rtaudio::Host::new(Api::UnixJack).map_err(|e| EngineError::Host(e.to_string()))?;
+        host.show_warnings(false);
+
+        let device = |ch| {
+            Some(DeviceParams {
+                num_channels: Some(ch),
+                ..Default::default()
+            })
+        };
+
+        let stream_cfg = StreamConfig {
+            output_device: device(cfg.channels),
+            input_device: device(cfg.channels),
+            sample_format: SampleFormat::Float32,
+            sample_rate: Some(cfg.sample_rate),
+            buffer_frames: cfg.buffer_frames,
+            // NONINTERLEAVED gives planar buffers, which is what the DSP and any
+            // later SIMD work assume. SCHEDULE_REALTIME asks for an RT thread.
+            // JACK_DONT_CONNECT because auto-connect wired our outputs to our
+            // own inputs (a silent loopback); we link explicitly below instead.
+            flags: StreamFlags::NONINTERLEAVED
+                | StreamFlags::SCHEDULE_REALTIME
+                | StreamFlags::JACK_DONT_CONNECT,
+            priority: 80,
+            name: "daw".to_owned(),
+            ..Default::default()
+        };
+
+        let mut stream = host
+            .open_stream(&stream_cfg)
+            .map_err(|(_host, e)| EngineError::OpenStream(e.to_string()))?;
+
+        let info = {
+            let i = stream.info();
+            StreamInfoSnapshot {
+                sample_rate: i.sample_rate,
+                max_frames: i.max_frames,
+                in_channels: i.in_channels,
+                out_channels: i.out_channels,
+                deinterleaved: i.deinterleaved,
+                latency_frames: i.latency,
+            }
+        };
+
+        // Hard gate, not a warning: Schedule::run and the meter pass index
+        // buffers as planar. An interleaved stream would run fine and sound
+        // wrong — the worst failure mode. Refuse before the first callback.
+        if !info.deinterleaved {
+            return Err(EngineError::InterleavedNotSupported);
+        }
+
+        // Telemetry out to the UI. Latest-value-wins is right here: the UI
+        // redraws far slower than blocks arrive, and it wants the newest state,
+        // not a backlog.
+        let (mut telemetry_in, telemetry) = triple_buffer::triple_buffer(&BlockSnapshot::default());
+
+        // Schedule handoff. Capacity 4 is plenty: swaps happen at UI speed.
+        // Pushing a Box moves a pointer — the callback never allocates or frees.
+        let (schedule_tx, mut schedule_rx) = rtrb::RingBuffer::<Box<Schedule>>::new(4);
+        // 256 letters is ~1.4 blocks of continuous 60Hz knob-drag backlog —
+        // far more than the callback can fall behind by.
+        let (param_tx, mut param_rx) = rtrb::RingBuffer::<ParamChange>::new(256);
+        let (transport_tx, mut transport_rx) = rtrb::RingBuffer::<TransportCmd>::new(64);
+        let mut transport = Transport::new(cfg.sample_rate as f64);
+        let (mut trash_tx, trash_rx) = rtrb::RingBuffer::<Box<Schedule>>::new(4);
+        let mut schedule: Option<Box<Schedule>> = None;
+
+        let out_channels = info.out_channels.max(1);
+        let slot_capacity = info.max_frames;
+        let mut block: u64 = 0;
+        let mut oversized_blocks: u64 = 0;
+        let mut work_max_ns: u64 = 0;
+        let mut underflows: u64 = 0;
+        let mut overflows: u64 = 0;
+        let mut last_xrun_block: u64 = 0;
+
+        let mut denormals_flushed = false;
+
+        // Loud deaths: the backend's global error callback. Errors are stored
+        // and surfaced through health(); a broken stream has no deadline, so
+        // the alloc/lock here is fine.
+        rtaudio::set_error_callback(|e| {
+            if let Ok(mut errs) = STREAM_ERRORS.lock() {
+                errs.push(e.to_string());
+            }
+        });
+
+        // Wire our ports before the first callback ever runs: relinking a
+        // LIVE stream makes PipeWire reconfigure the graph mid-flight, which
+        // showed up as xruns. Ports exist once the stream is open; links made
+        // now are in place before processing begins.
+        connect_default_ports();
+
+        stream
+            .start(move |buffers, _info, status| {
+                // Once, on the callback thread itself — MXCSR is per-thread.
+                if !denormals_flushed {
+                    flush_denormals_to_zero();
+                    denormals_flushed = true;
+                }
+
+                // Instant::now() is CLOCK_MONOTONIC via the vDSO on Linux — a
+                // plain function call, not a syscall. Safe on this thread.
+                let t0 = Instant::now();
+
+                if status.contains(StreamStatus::OUTPUT_UNDERFLOW) {
+                    underflows += 1;
+                    last_xrun_block = block;
+                }
+                if status.contains(StreamStatus::INPUT_OVERFLOW) {
+                    overflows += 1;
+                    last_xrun_block = block;
+                }
+                // Everything past this point is red zone. assert_no_alloc aborts
+                // the process on any allocation here in debug builds; it compiles
+                // to a no-op in release.
+                assert_no_alloc(|| {
+                    let Buffers::Float32 { output, input } = buffers else {
+                        return;
+                    };
+
+                    // Swap in a newer schedule if one arrived. Pop and push are
+                    // lock-free and constant-time; the old Box goes back to the
+                    // UI thread to be dropped there.
+                    while let Ok(new_schedule) = schedule_rx.pop() {
+                        if let Some(old) = schedule.replace(new_schedule) {
+                            // If trash is somehow full the old schedule leaks
+                            // until stream teardown — still never freed here.
+                            let _ = trash_tx.push(old);
+                        }
+                    }
+
+                    // Drain parameter letters in arrival order. Bounded by ring
+                    // capacity; each apply is two indexes and a store.
+                    while let Ok(change) = param_rx.pop() {
+                        if let Some(s) = schedule.as_mut() {
+                            s.apply(change);
+                        }
+                    }
+                    // Drain transport commands, in order — the whole gesture
+                    // lands before any audio is produced, so N seeks in one
+                    // block collapse to the last.
+                    while let Ok(cmd) = transport_rx.pop() {
+                        transport.apply(cmd);
+                    }
+
+                    let frames = output.len() / out_channels;
+                    let in_channels = input.len().checked_div(frames).unwrap_or(0);
+
+                    if frames > slot_capacity {
+                        // Live quantum change beyond what the arena was sized
+                        // for: refuse loudly (silence + counter), never index
+                        // out of the slots. Time still advances.
+                        oversized_blocks += 1;
+                        output.fill(0.0);
+                        let mut left = frames;
+                        while left > 0 {
+                            left -= transport.next_segment(left).len;
+                        }
+                    } else {
+                        // Segment loop: split the block at transport events so
+                        // loop points are sample-accurate. Progress is proven
+                        // (every segment >= 1 frame); the bound is belt and
+                        // braces against the impossible.
+                        let mut done = 0usize;
+                        let mut segments = 0u32;
+                        while done < frames && segments < 64 {
+                            let seg = transport.next_segment(frames - done);
+                            let ctx = ProcessCtx {
+                                device_input: input,
+                                in_channels,
+                                block_frames: frames,
+                                offset: done,
+                                len: seg.len,
+                                playing: seg.playing,
+                                position: seg.position,
+                                beat: seg.beat,
+                                beats_per_sample: transport.map.beats_per_sample(),
+                                discontinuity: seg.discontinuity,
+                            };
+                            match schedule.as_mut() {
+                                Some(s) => s.run(output, &ctx),
+                                None => {
+                                    for ch in 0..out_channels {
+                                        let start = ch * frames + done;
+                                        output[start..start + seg.len].fill(0.0);
+                                    }
+                                }
+                            }
+                            done += seg.len;
+                            segments += 1;
+                        }
+                        if done < frames {
+                            // Segment bound tripped (cannot happen by proof):
+                            // fail to silence, not to stale buffer contents.
+                            for ch in 0..out_channels {
+                                let start = ch * frames + done;
+                                output[start..start + (frames - done)].fill(0.0);
+                            }
+                        }
+                    }
+                    // The mic is deliberately NOT routed to the output — that
+                    // would be a feedback loop. Input is only metered below.
+
+                    block = block.wrapping_add(1);
+
+                    // Bounded work: one pass for the peak, one fixed-length copy.
+                    // No indexing, so no path that can panic on a short buffer.
+                    let peak = input.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+                    let mut head = [0.0f32; SNAPSHOT_SAMPLES];
+                    for (dst, src) in head.iter_mut().zip(input.iter()) {
+                        *dst = *src;
+                    }
+
+                    // Stop the clock before publishing so the write itself is
+                    // not counted; the memcpy is ~100 bytes and constant.
+                    let work_ns = t0.elapsed().as_nanos() as u64;
+                    work_max_ns = work_max_ns.max(work_ns);
+
+                    telemetry_in.write(BlockSnapshot {
+                        block,
+                        frames: output.len() / out_channels,
+                        peak,
+                        head,
+                        work_ns,
+                        work_max_ns,
+                        underflows,
+                        overflows,
+                        last_xrun_block,
+                        playing: transport.playing(),
+                        position: transport.position(),
+                        beat: transport.map.samples_to_beats(transport.position()),
+                        oversized_blocks,
+                    });
+                });
+            })
+            .map_err(|e| EngineError::StartStream(e.to_string()))?;
+
+        Ok(Self {
+            _stream: stream,
+            info,
+            telemetry,
+            schedule_tx,
+            param_tx,
+            transport_tx,
+            trash_rx,
+            last_seen_block: 0,
+            last_advance: Instant::now(),
+        })
+    }
+
+    pub fn info(&self) -> StreamInfoSnapshot {
+        self.info
+    }
+
+    /// Most recent block the callback published. Cheap; call it once per frame.
+    pub fn latest_block(&mut self) -> BlockSnapshot {
+        *self.telemetry.read()
+    }
+
+    /// Judge the stream by two independent signals: reported errors (loud
+    /// deaths) and the block heartbeat (silent ones). Call at UI rate.
+    ///
+    /// Grace period: blocks arrive every 5.33ms, so 60x that (~320ms) of
+    /// silence is a stall beyond doubt, while scheduler hiccups stay invisible.
+    pub fn health(&mut self) -> StreamHealth {
+        if let Ok(mut errs) = STREAM_ERRORS.lock()
+            && let Some(err) = errs.pop()
+        {
+            errs.clear();
+            return StreamHealth::Errored(err);
+        }
+
+        let block = self.latest_block().block;
+        if block != self.last_seen_block {
+            self.last_seen_block = block;
+            self.last_advance = Instant::now();
+            return StreamHealth::Running;
+        }
+        let quiet = self.last_advance.elapsed();
+        if quiet.as_millis() > 320 {
+            StreamHealth::Stalled {
+                seconds: quiet.as_secs_f32(),
+            }
+        } else {
+            StreamHealth::Running
+        }
+    }
+
+    /// Hand the callback a new schedule. Also drains any retired schedules,
+    /// dropping them here on the UI thread. Call `collect_trash` periodically
+    /// too if schedules are swapped often.
+    pub fn set_schedule(&mut self, schedule: Box<Schedule>) -> Result<(), EngineError> {
+        self.collect_trash();
+        self.schedule_tx
+            .push(schedule)
+            .map_err(|_| EngineError::ScheduleQueueFull)
+    }
+
+    /// Drop any schedules the callback has retired. Cheap; call at UI rate.
+    pub fn collect_trash(&mut self) {
+        while self.trash_rx.pop().is_ok() {}
+    }
+
+    /// Send one transport command. Ring order makes multi-command gestures
+    /// (stop + seek + play) atomic with respect to audio.
+    pub fn transport(&mut self, cmd: TransportCmd) {
+        let _ = self.transport_tx.push(cmd);
+    }
+
+    /// Send one parameter change, addressed by the node's permanent name tag.
+    /// If the ring is momentarily full (a knob dragged faster than the
+    /// callback drains), the newest value is the one that matters — dropping
+    /// this letter is fine, the next one supersedes it.
+    pub fn set_param(&mut self, node: NodeId, param: u32, value: f32) {
+        let _ = self.param_tx.push(ParamChange {
+            node: node.to_bits(),
+            param,
+            value,
+        });
+    }
+}

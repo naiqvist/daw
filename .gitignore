@@ -1,0 +1,8 @@
+/target
+
+# notes/ is its own git repo (nb notebook) — tracked separately, not vendored here
+/notes
+
+# lab scratch artifacts
+/lab-bounce.wav
+/lab-session.ron
