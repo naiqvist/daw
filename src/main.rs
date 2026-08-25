@@ -1885,6 +1885,16 @@ struct ParameterRegistry {
     specs: Vec<ParameterSpec>,
 }
 
+/// The device targets: stable id, the group the picker shows, and the row
+/// of `daw::params` the range and default come from — the same table the
+/// widget and the engine read, so a spec cannot disagree with either.
+const SYNTH_GAIN_TARGET: &str = "synth.gain";
+const SYNTH_ATTACK_TARGET: &str = "synth.attack";
+const SYNTH_RELEASE_TARGET: &str = "synth.release";
+const REVERB_MIX_TARGET: &str = "reverb.mix";
+const REVERB_SIZE_TARGET: &str = "reverb.size";
+const REVERB_DAMP_TARGET: &str = "reverb.damp";
+
 impl Default for ParameterRegistry {
     fn default() -> Self {
         let mut registry = Self { specs: Vec::new() };
@@ -1908,6 +1918,77 @@ impl Default for ParameterRegistry {
             default: 0.0,
             stepped: false,
         });
+        // The device rows come straight from `daw::params` — range and
+        // default are the table's, never restated.
+        let mut from_table = |id: &str,
+                              group: &str,
+                              name: &str,
+                              unit: &str,
+                              table: &'static [daw::params::ParamDef],
+                              row: u32| {
+            let def = daw::params::def(table, row);
+            registry.register(ParameterSpec {
+                id: id.to_owned(),
+                group: group.to_owned(),
+                name: name.to_owned(),
+                unit: unit.to_owned(),
+                min: def.min,
+                max: def.max,
+                default: def.default,
+                stepped: false,
+            });
+        };
+        {
+            use daw::params::{reverb, seq};
+            from_table(
+                SYNTH_GAIN_TARGET,
+                "Synth",
+                "Gain",
+                "",
+                seq::TABLE,
+                seq::GAIN,
+            );
+            from_table(
+                SYNTH_ATTACK_TARGET,
+                "Synth",
+                "Attack",
+                "ms",
+                seq::TABLE,
+                seq::ATTACK,
+            );
+            from_table(
+                SYNTH_RELEASE_TARGET,
+                "Synth",
+                "Release",
+                "ms",
+                seq::TABLE,
+                seq::RELEASE,
+            );
+            from_table(
+                REVERB_MIX_TARGET,
+                "Reverb",
+                "Mix",
+                "",
+                reverb::TABLE,
+                reverb::MIX,
+            );
+            from_table(
+                REVERB_SIZE_TARGET,
+                "Reverb",
+                "Size",
+                "",
+                reverb::TABLE,
+                reverb::SIZE,
+            );
+            from_table(
+                REVERB_DAMP_TARGET,
+                "Reverb",
+                "Damp",
+                "",
+                reverb::TABLE,
+                reverb::DAMP,
+            );
+        }
         registry
     }
 }
@@ -4583,7 +4664,58 @@ fn parameter_base(track: &Track, target: &str, spec: &ParameterSpec) -> f32 {
     match target {
         TRACK_VOLUME_TARGET => track.volume,
         TRACK_PAN_TARGET => track.pan,
+        SYNTH_GAIN_TARGET => track.params.gain,
+        SYNTH_ATTACK_TARGET => track.params.attack_ms,
+        SYNTH_RELEASE_TARGET => track.params.release_ms,
+        REVERB_MIX_TARGET => track.reverb.mix,
+        REVERB_SIZE_TARGET => track.reverb.size,
+        REVERB_DAMP_TARGET => track.reverb.damp,
         _ => spec.default,
+    }
+}
+
+/// Whether a target means anything ON THIS TRACK: a synth curve on a track
+/// with no synth would automate silence, and the picker should not offer
+/// it. Track-group targets apply everywhere.
+fn target_applies(track: &Track, target: &str) -> bool {
+    match target {
+        SYNTH_GAIN_TARGET | SYNTH_ATTACK_TARGET | SYNTH_RELEASE_TARGET => {
+            track.device == Some(DeviceKind::SineSynth)
+        }
+        REVERB_MIX_TARGET | REVERB_SIZE_TARGET | REVERB_DAMP_TARGET => {
+            track.fx == Some(DeviceKind::Reverb)
+        }
+        _ => true,
+    }
+}
+
+/// Where a target's automated value lands in the ENGINE: which of the
+/// app's per-track node id vecs, and which ParamChange id on that node.
+/// One function, total over the registry, so playback dispatch cannot
+/// silently miss a registered target — the test walks every spec through
+/// it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TargetNode {
+    /// The track's output stage (`pan_ids`).
+    Output,
+    /// The track's instrument (`seq_ids`).
+    Instrument,
+    /// The track's effect (`fx_ids`).
+    Effect,
+}
+
+fn target_binding(target: &str) -> Option<(TargetNode, u32)> {
+    use daw::params::{pan, reverb, seq};
+    match target {
+        TRACK_VOLUME_TARGET => Some((TargetNode::Output, pan::GAIN)),
+        TRACK_PAN_TARGET => Some((TargetNode::Output, pan::PAN)),
+        SYNTH_GAIN_TARGET => Some((TargetNode::Instrument, seq::GAIN)),
+        SYNTH_ATTACK_TARGET => Some((TargetNode::Instrument, seq::ATTACK)),
+        SYNTH_RELEASE_TARGET => Some((TargetNode::Instrument, seq::RELEASE)),
+        REVERB_MIX_TARGET => Some((TargetNode::Effect, reverb::MIX)),
+        REVERB_SIZE_TARGET => Some((TargetNode::Effect, reverb::SIZE)),
+        REVERB_DAMP_TARGET => Some((TargetNode::Effect, reverb::DAMP)),
+        _ => None,
     }
 }
 
@@ -4595,6 +4727,10 @@ fn automation_target_picker(
     id: egui::Id,
     prefix: &str,
     registry: &ParameterRegistry,
+    // The track the picker is choosing FOR, when one is under the hand:
+    // targets whose device the track does not carry are not offered — a
+    // synth curve on a synthless track automates silence.
+    track: Option<&Track>,
     target: &mut String,
 ) {
     let selected = registry
@@ -4605,19 +4741,30 @@ fn automation_target_picker(
             .max_rect(rect)
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
-    let response = child.add_sized(rect.size(), egui::Button::new(format!("{prefix}{selected} ▾")));
-    egui::Popup::menu(&response).id(id.with("popup")).show(|ui| {
+    let response = child.add_sized(
+        rect.size(),
+        egui::Button::new(format!("{prefix}{selected} ▾")),
+    );
+    egui::Popup::menu(&response)
+        .id(id.with("popup"))
+        .show(|ui| {
             let query_id = id.with("query");
-            let mut query: String = ui.ctx().data(|data| data.get_temp(query_id).unwrap_or_default());
+            let mut query: String = ui
+                .ctx()
+                .data(|data| data.get_temp(query_id).unwrap_or_default());
             ui.add(
                 egui::TextEdit::singleline(&mut query)
                     .hint_text("Search parameters")
                     .desired_width(210.0),
             );
-            ui.ctx().data_mut(|data| data.insert_temp(query_id, query.clone()));
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(query_id, query.clone()));
             let query = query.trim().to_lowercase();
             let mut last_group = "";
             for spec in &registry.specs {
+                if track.is_some_and(|track| !target_applies(track, &spec.id)) {
+                    continue;
+                }
                 if !query.is_empty()
                     && !spec.name.to_lowercase().contains(&query)
                     && !spec.group.to_lowercase().contains(&query)
@@ -4715,6 +4862,7 @@ fn automation_editor_body(
             ui.id().with("automation_editor_target"),
             "",
             registry,
+            arr.tracks.get(track_index),
             automation_target,
         );
         ui.painter().text(
@@ -5471,6 +5619,7 @@ fn arrangement_body(
             ui.id().with("automation_target"),
             "AUTO: ",
             registry,
+            arr.selected.and_then(|track| arr.tracks.get(track)),
             automation_target,
         );
     }
@@ -5601,9 +5750,7 @@ fn arrangement_body(
                 .rect_filled(band.intersect(body), 0.0, theme.selection);
         }
 
-        if shows_automation
-            && let Some(spec) = registry.spec(automation_target)
-        {
+        if shows_automation && let Some(spec) = registry.spec(automation_target) {
             let base = parameter_base(&arr.tracks[i], automation_target, spec);
             automation_hovered |= automation_lane(
                 ui,
@@ -9611,6 +9758,10 @@ struct App {
     /// project all reconcile through one door — whoever moved pan, the
     /// letter goes out once and only on a real change.
     sent_pan: Vec<f32>,
+    /// Last-sent automated device values, per track by target id. Cleared
+    /// on every schedule swap with the other sent caches: fresh ids mean
+    /// nothing has been sent to anyone.
+    sent_automation: Vec<HashMap<String, f32>>,
     /// The same, for the fader. Separate vec rather than a pair, so a
     /// resize on either cannot silently reset the other.
     sent_volume: Vec<f32>,
@@ -9727,6 +9878,7 @@ impl App {
             fx_ids: Vec::new(),
             pan_ids: Vec::new(),
             sent_pan: Vec::new(),
+            sent_automation: Vec::new(),
             sent_volume: Vec::new(),
             meters: Vec::new(),
             compiled_clips: Vec::new(),
@@ -10725,6 +10877,7 @@ impl App {
                         // compiled-in default while the knob says otherwise.
                         self.sent_pan.clear();
                         self.sent_volume.clear();
+                        self.sent_automation.clear();
                         self.compiled_clips = playing;
                         self.graph_key = (
                             self.transport.metronome,
@@ -10959,6 +11112,63 @@ impl App {
             if volume != self.sent_volume[i] {
                 engine.set_param(node, daw::params::pan::GAIN, volume);
                 self.sent_volume[i] = volume;
+            }
+        }
+        self.sync_device_automation(beat);
+    }
+
+    /// The generic half of playback dispatch: every OTHER envelope a track
+    /// carries, resolved through `target_binding` to the node vec and
+    /// ParamChange id it drives. Volume and pan keep their dedicated path
+    /// above — they exist on every track and earn their two flat vecs —
+    /// while device targets ride this map, which only holds what is
+    /// actually automated.
+    fn sync_device_automation(&mut self, beat: f32) {
+        let n = self.arrangement.tracks.len();
+        self.sent_automation.resize_with(n, HashMap::new);
+        for i in 0..n {
+            let track = &self.arrangement.tracks[i];
+            let mut sends: Vec<(NodeId, u32, String, f32)> = Vec::new();
+            for envelope in &track.automation.envelopes {
+                let target = envelope.target.as_str();
+                let Some((node_kind, param)) = target_binding(target) else {
+                    continue;
+                };
+                if node_kind == TargetNode::Output {
+                    continue; // volume and pan: the dedicated path above
+                }
+                // A curve for a device the track does not carry automates
+                // nothing — and must not letter some other node.
+                if !target_applies(track, target) {
+                    continue;
+                }
+                let Some(spec) = self.parameter_registry.spec(target) else {
+                    continue;
+                };
+                let base = parameter_base(track, target, spec);
+                let value = track
+                    .automation
+                    .value_at(target, beat, base)
+                    .clamp(spec.min, spec.max);
+                if self.sent_automation[i].get(target) == Some(&value) {
+                    continue;
+                }
+                let ids = match node_kind {
+                    TargetNode::Instrument => &self.seq_ids,
+                    TargetNode::Effect => &self.fx_ids,
+                    TargetNode::Output => unreachable!("filtered above"),
+                };
+                let Some(Some(node)) = ids.get(i).copied() else {
+                    continue;
+                };
+                sends.push((node, param, envelope.target.clone(), value));
+            }
+            for (node, param, target, value) in sends {
+                let Some(engine) = &mut self.engine else {
+                    return;
+                };
+                engine.set_param(node, param, value);
+                self.sent_automation[i].insert(target, value);
             }
         }
     }
@@ -14415,6 +14625,74 @@ mod tests {
             ],
         );
         assert_eq!(arr.pending_seek.take(), Some(7.0), "the ruler scrubs");
+    }
+
+    /// Every registered target resolves to an engine binding, its base is
+    /// readable off a track, and its range comes from the ONE params table
+    /// the widget and the engine already share — the registry cannot
+    /// drift from either.
+    #[test]
+    fn every_registered_target_is_bound_and_based() {
+        let registry = ParameterRegistry::default();
+        assert!(registry.specs.len() >= 8, "track pair plus two devices");
+        let mut track = Track::new(TrackKind::Midi, "t".to_owned());
+        track.device = Some(DeviceKind::SineSynth);
+        track.fx = Some(DeviceKind::Reverb);
+        for spec in &registry.specs {
+            assert!(
+                target_binding(&spec.id).is_some(),
+                "{} has no engine binding — playback would silently skip it",
+                spec.id
+            );
+            let base = parameter_base(&track, &spec.id, spec);
+            assert!(
+                (spec.min..=spec.max).contains(&base),
+                "{}'s base {base} sits outside its own range",
+                spec.id
+            );
+            assert!(
+                target_applies(&track, &spec.id),
+                "{} should apply to a fully-equipped track",
+                spec.id
+            );
+        }
+        // The table is the source: a spot check that the spec did not
+        // restate a range.
+        let mix = registry.spec(REVERB_MIX_TARGET).unwrap();
+        let row = daw::params::def(daw::params::reverb::TABLE, daw::params::reverb::MIX);
+        assert_eq!(
+            (mix.min, mix.max, mix.default),
+            (row.min, row.max, row.default)
+        );
+
+        // And applicability: strip the devices and the device targets
+        // stand down while the track pair stays.
+        let bare = Track::new(TrackKind::Midi, "bare".to_owned());
+        assert!(target_applies(&bare, TRACK_VOLUME_TARGET));
+        assert!(!target_applies(&bare, SYNTH_GAIN_TARGET));
+        assert!(!target_applies(&bare, REVERB_DAMP_TARGET));
+    }
+
+    /// A project written BEFORE target ids became generic — envelopes as
+    /// bare `volume`/`pan` arrays — loads into the generic model whole.
+    #[test]
+    fn old_automation_projects_migrate_into_envelopes() {
+        let old = r#"(
+            volume: [(beat: 0.0, value: 1.0, bend: 0.0), (beat: 4.0, value: 0.5, bend: 0.0)],
+            pan: [(beat: 2.0, value: -1.0, bend: 0.2)],
+        )"#;
+        let migrated: TrackAutomation = ron::from_str(old).unwrap();
+        assert_eq!(migrated.points(TRACK_VOLUME_TARGET).len(), 2);
+        assert_eq!(migrated.points(TRACK_PAN_TARGET).len(), 1);
+        assert_eq!(migrated.points(TRACK_PAN_TARGET)[0].bend, 0.2);
+
+        // And the modern shape round-trips through itself unchanged.
+        let mut modern = TrackAutomation::default();
+        modern.insert(REVERB_MIX_TARGET, 0.0, 0.1);
+        modern.insert(REVERB_MIX_TARGET, 8.0, 0.9);
+        let text = ron::ser::to_string(&modern).unwrap();
+        let back: TrackAutomation = ron::from_str(&text).unwrap();
+        assert_eq!(back, modern);
     }
 
     /// The focused automation editor pans with the wheel and zooms
