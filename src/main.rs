@@ -2196,6 +2196,21 @@ fn wire_contribution(
     previous + (target - previous) * alpha.clamp(0.0, 1.0)
 }
 
+/// The matrix's column list: every (track, parameter) pair that CAN be
+/// modulated, in track order — the applicability rule keeps a synthless
+/// track's synth columns out. Pure, so the matrix's shape is testable.
+fn matrix_columns(tracks: &[Track], registry: &ParameterRegistry) -> Vec<(usize, String)> {
+    let mut columns = Vec::new();
+    for (index, track) in tracks.iter().enumerate() {
+        for spec in &registry.specs {
+            if target_applies(track, &spec.id) {
+                columns.push((index, spec.id.clone()));
+            }
+        }
+    }
+    columns
+}
+
 /// Sum the wire outputs landing on one (track, target). `outputs` is this
 /// frame's per-wire chain results by wire id.
 fn sum_wires(wires: &[ModWire], outputs: &HashMap<u64, f32>, track: usize, target: &str) -> f32 {
@@ -3801,6 +3816,30 @@ impl Arrangement {
             kind: ModKind::Follower { track },
         });
         id
+    }
+
+    /// The matrix's one-click verb: wire `source` to (track, target) if no
+    /// such wire exists. Returns the new wire's id, or None when one is
+    /// already there — the matrix never doubles a relationship silently.
+    fn add_wire(&mut self, source: u64, track: usize, target: &str) -> Option<u64> {
+        if self
+            .mod_wires
+            .iter()
+            .any(|wire| wire.source == source && wire.track == track && wire.target == target)
+        {
+            return None;
+        }
+        let id = self.next_modulator_id;
+        self.next_modulator_id += 1;
+        self.mod_wires.push(ModWire {
+            id,
+            source,
+            track,
+            target: target.to_owned(),
+            depth: 0.25,
+            ..Default::default()
+        });
+        Some(id)
     }
 
     /// Remove a modulator AND every wire hanging from it: a wire whose
@@ -10938,6 +10977,8 @@ struct App {
     wire_scopes: HashMap<u64, std::collections::VecDeque<f32>>,
     /// The wire whose row is unfolded into curve/steps/lag and the scope.
     expanded_wire: Option<u64>,
+    /// The unified modulation matrix window. Ctrl+M.
+    matrix_open: bool,
     /// Last-sent automated device values, per track by target id. Cleared
     /// on every schedule swap with the other sent caches: fresh ids mean
     /// nothing has been sent to anyone.
@@ -11063,6 +11104,7 @@ impl App {
             wire_outputs: HashMap::new(),
             wire_scopes: HashMap::new(),
             expanded_wire: None,
+            matrix_open: false,
             sent_automation: Vec::new(),
             sent_volume: Vec::new(),
             meters: Vec::new(),
@@ -11144,6 +11186,7 @@ impl App {
             PaletteCommand::new("project.open", "project", "open project…").hint("ctrl+O"),
             PaletteCommand::new("project.new", "project", "new project"),
             // --- modulation --------------------------------------------
+            PaletteCommand::new("mod.matrix", "mod", "modulation matrix").hint("ctrl+M"),
             PaletteCommand::new("mod.lfo", "mod", "add LFO"),
             PaletteCommand::new("mod.follower", "mod", "add follower of selected track")
                 .enabled(self.arrangement.selected.is_some()),
@@ -11275,6 +11318,7 @@ impl App {
             "project.saveas" => actions.push(UiAction::SaveProjectAs),
             "project.open" => actions.push(UiAction::OpenProjectWindow),
             "project.new" => actions.push(UiAction::NewProject),
+            "mod.matrix" => self.matrix_open = !self.matrix_open,
             "mod.lfo" => {
                 self.arrangement.add_lfo();
             }
@@ -11526,6 +11570,211 @@ impl App {
                 }
             }
             BrowserEvent::Rescan => self.request_library_scan(),
+        }
+    }
+
+    /// The unified modulation matrix: every source in the project as a
+    /// row, every parameter that can be modulated as a column, grouped by
+    /// track. A wire is one click; its depth is a vertical drag on the
+    /// cell; a double-click removes it. Non-modal on purpose — a matrix is
+    /// a thing you play while the song runs.
+    fn draw_matrix_window(&mut self, ctx: &egui::Context) {
+        if !self.matrix_open {
+            return;
+        }
+        let mut open = self.matrix_open;
+        let columns = matrix_columns(&self.arrangement.tracks, &self.parameter_registry);
+        egui::Window::new("matrix")
+            .open(&mut open)
+            .default_width(520.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                if self.arrangement.modulators.is_empty() {
+                    ui.label("no modulators yet — add an LFO or follower in the rack's MOD strip");
+                    return;
+                }
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.matrix_grid(ui, &columns);
+                    });
+            });
+        self.matrix_open = open;
+    }
+
+    fn matrix_grid(&mut self, ui: &mut egui::Ui, columns: &[(usize, String)]) {
+        const CELL_W: f32 = 26.0;
+        const CELL_H: f32 = 22.0;
+        const HEAD_W: f32 = 74.0;
+        const HEAD_H: f32 = 32.0;
+        let theme = &self.theme;
+        let font = egui::FontId::proportional(9.0);
+        let rows = self.arrangement.modulators.len();
+        let size = egui::vec2(
+            HEAD_W + columns.len() as f32 * CELL_W + 4.0,
+            HEAD_H + rows as f32 * CELL_H + 4.0,
+        );
+        let (area, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+        let painter = ui.painter().clone();
+
+        // Column headers: the track name over its group, the parameter
+        // under it, a hairline where one track's group begins.
+        let mut last_track = usize::MAX;
+        for (at, (track, target)) in columns.iter().enumerate() {
+            let x = area.left() + HEAD_W + at as f32 * CELL_W;
+            if *track != last_track {
+                last_track = *track;
+                painter.line_segment(
+                    [
+                        egui::pos2(x - 1.0, area.top()),
+                        egui::pos2(x - 1.0, area.bottom()),
+                    ],
+                    egui::Stroke::new(1.0, theme.divider),
+                );
+                painter.with_clip_rect(area).text(
+                    egui::pos2(x + 2.0, area.top() + 2.0),
+                    egui::Align2::LEFT_TOP,
+                    self.arrangement
+                        .tracks
+                        .get(*track)
+                        .map_or("?", |track| track.name.as_str()),
+                    font.clone(),
+                    theme.text,
+                );
+            }
+            let short = self
+                .parameter_registry
+                .spec(target)
+                .map_or_else(|| target.clone(), |spec| spec.name.clone());
+            painter.with_clip_rect(area).text(
+                egui::pos2(x + CELL_W * 0.5, area.top() + HEAD_H - 4.0),
+                egui::Align2::CENTER_BOTTOM,
+                short.chars().take(4).collect::<String>().to_lowercase(),
+                font.clone(),
+                theme.text_muted,
+            );
+        }
+
+        // Rows and cells.
+        let mut lfo_no = 0;
+        let mut clicked: Option<(u64, usize, String)> = None;
+        let mut remove: Option<u64> = None;
+        let mut depth_drag: Option<(u64, f32)> = None;
+        for (row, modulator) in self.arrangement.modulators.iter().enumerate() {
+            let y = area.top() + HEAD_H + row as f32 * CELL_H;
+            let name = match &modulator.kind {
+                ModKind::Lfo { .. } => {
+                    lfo_no += 1;
+                    format!("LFO {lfo_no}")
+                }
+                ModKind::Follower { track } => format!(
+                    "FLW {}",
+                    self.arrangement
+                        .tracks
+                        .get(*track)
+                        .map_or("?", |track| track.name.as_str())
+                ),
+            };
+            painter.with_clip_rect(area).text(
+                egui::pos2(area.left() + 2.0, y + CELL_H * 0.5),
+                egui::Align2::LEFT_CENTER,
+                &name,
+                font.clone(),
+                theme.text,
+            );
+            // The row's live value, one small tick beside the name.
+            let live = self.mod_values.get(&modulator.id).copied().unwrap_or(0.0);
+            painter.rect_filled(
+                egui::Rect::from_two_pos(
+                    egui::pos2(area.left() + HEAD_W - 6.0, y + CELL_H * 0.5),
+                    egui::pos2(
+                        area.left() + HEAD_W - 4.0,
+                        y + CELL_H * 0.5 - live.clamp(-1.0, 1.0) * (CELL_H * 0.4),
+                    ),
+                ),
+                0.0,
+                theme.accent_muted,
+            );
+
+            for (at, (track, target)) in columns.iter().enumerate() {
+                let cell = egui::Rect::from_min_size(
+                    egui::pos2(area.left() + HEAD_W + at as f32 * CELL_W, y),
+                    egui::vec2(CELL_W, CELL_H),
+                );
+                let id = ui.id().with(("matrix", modulator.id, at));
+                let response = ui.interact(cell, id, egui::Sense::click_and_drag());
+                let wire = self.arrangement.mod_wires.iter().find(|wire| {
+                    wire.source == modulator.id && wire.track == *track && wire.target == *target
+                });
+                match wire {
+                    Some(wire) => {
+                        // Size says depth, colour says sign, the ring says
+                        // it is sounding right now.
+                        let radius = 2.0 + wire.depth.abs() * 5.0;
+                        let colour = if wire.depth >= 0.0 {
+                            theme.accent
+                        } else {
+                            theme.warn
+                        };
+                        painter.circle_filled(
+                            cell.center(),
+                            radius,
+                            if wire.enabled {
+                                colour
+                            } else {
+                                colour.gamma_multiply(0.3)
+                            },
+                        );
+                        let output = self.wire_outputs.get(&wire.id).copied().unwrap_or(0.0);
+                        if output.abs() > 1e-4 {
+                            painter.circle_stroke(
+                                cell.center(),
+                                radius + 2.0,
+                                egui::Stroke::new(1.0, theme.text),
+                            );
+                        }
+                        if response.double_clicked() {
+                            remove = Some(wire.id);
+                        } else if response.dragged() {
+                            depth_drag = Some((wire.id, response.drag_delta().y / 60.0));
+                        }
+                        response.on_hover_text(format!(
+                            "depth {:+.0}% — drag to adjust, double-click to remove",
+                            wire.depth * 100.0
+                        ));
+                    }
+                    None => {
+                        painter.circle_filled(
+                            cell.center(),
+                            1.0,
+                            if response.hovered() {
+                                theme.text
+                            } else {
+                                theme.divider
+                            },
+                        );
+                        if response.clicked() {
+                            clicked = Some((modulator.id, *track, target.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((source, track, target)) = clicked {
+            self.arrangement.add_wire(source, track, &target);
+        }
+        if let Some(id) = remove {
+            self.arrangement.mod_wires.retain(|wire| wire.id != id);
+        }
+        if let Some((id, delta)) = depth_drag
+            && let Some(wire) = self
+                .arrangement
+                .mod_wires
+                .iter_mut()
+                .find(|wire| wire.id == id)
+        {
+            // Vertical drag, up = more: the axis every knob already uses.
+            wire.depth = (wire.depth - delta).clamp(-1.0, 1.0);
         }
     }
 
@@ -12615,11 +12864,13 @@ impl eframe::App for App {
         // zero. Skipped while a text field, the palette or the theme window
         // owns the keyboard — a space typed into a search box is a space,
         // not a play command, and getting that wrong is the classic DAW bug.
+        let mut matrix_toggle = false;
         if !palette_open
             && !skin_open
             && !self.project.open
             && !ui.ctx().egui_wants_keyboard_input()
         {
+            let matrix = &mut matrix_toggle;
             ui.ctx().input_mut(|i| {
                 // MODIFIED SPACE FIRST: `consume_key` ignores an extra
                 // Shift, so the plain gesture checked first would swallow
@@ -12647,6 +12898,9 @@ impl eframe::App for App {
                 }
                 if i.consume_key(egui::Modifiers::COMMAND, egui::Key::O) {
                     actions.push(UiAction::OpenProjectWindow);
+                }
+                if i.consume_key(egui::Modifiers::COMMAND, egui::Key::M) {
+                    *matrix = true;
                 }
             });
         }
@@ -12688,7 +12942,11 @@ impl eframe::App for App {
         {
             self.automation_editor = false;
         }
+        if matrix_toggle {
+            self.matrix_open = !self.matrix_open;
+        }
         self.draw_project_window(ui.ctx());
+        self.draw_matrix_window(ui.ctx());
 
         if !palette_open && !skin_open && self.bottom_view == BottomView::ClipEditor {
             match clip_editor_kind(&self.arrangement) {
@@ -15979,6 +16237,43 @@ mod tests {
         };
         assert_eq!(modulator_value(&square, 0.5, 0.0, &meters), 1.0);
         assert_eq!(modulator_value(&square, 1.5, 0.0, &meters), -1.0);
+    }
+
+    /// The matrix's shape and its one-click verb: columns are exactly the
+    /// applicable (track, parameter) pairs, a click wires once, and the
+    /// same click can never silently double a relationship.
+    #[test]
+    fn the_matrix_columns_and_one_click_wire() {
+        let registry = ParameterRegistry::default();
+        let mut arr = Arrangement::default();
+        let audio = arr.add_track(TrackKind::Audio);
+        let columns = matrix_columns(&arr.tracks, &registry);
+        // Deviceless tracks offer exactly volume and pan each.
+        assert_eq!(columns.len(), arr.tracks.len() * 2);
+        assert!(
+            columns
+                .iter()
+                .all(|(_, target)| { target == TRACK_VOLUME_TARGET || target == TRACK_PAN_TARGET })
+        );
+        assert!(
+            columns.iter().any(|(track, _)| *track == audio),
+            "every track has its columns"
+        );
+
+        let lfo = arr.add_lfo();
+        let id = arr.add_wire(lfo, audio, TRACK_PAN_TARGET);
+        assert!(id.is_some(), "one click, one wire");
+        assert_eq!(
+            arr.add_wire(lfo, audio, TRACK_PAN_TARGET),
+            None,
+            "the same click cannot double it"
+        );
+        assert_eq!(arr.mod_wires.len(), 1);
+        assert_eq!(arr.mod_wires[0].depth, 0.25, "born at a modest depth");
+        assert!(
+            arr.mod_wires[0].id >= lfo,
+            "wire ids come from the same mint as modulators"
+        );
     }
 
     /// FREE mode rides the clock, not the beat: the beat can stand still
