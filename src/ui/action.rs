@@ -65,7 +65,16 @@ pub enum UiAction {
     /// Restore the arrangement view saved by the last clip zoom. Ableton's X.
     ZoomBack,
 
+    // --- history ---
+    /// Step the arrangement back to before the last edit. Ctrl+Z.
+    Undo,
+    /// Step forward again through an undone edit. Ctrl+Shift+Z, Ctrl+Y.
+    Redo,
+
     // --- tracks ---
+    /// Move the selected track this many places in the stack, clamped at
+    /// the ends. The keyboard's route to what a header drag does.
+    MoveTrack(i32),
     /// Append a track of this kind and select it. Ctrl+T / Ctrl+Shift+T.
     AddTrack(TrackKind),
     /// Drop the selected track, its clips with it. The last track is never
@@ -117,6 +126,9 @@ impl UiAction {
             Self::DuplicateClip => "Duplicate clip",
             Self::ZoomSelectedAudioClip => "Zoom to selected audio clip",
             Self::ZoomBack => "Zoom back",
+            Self::Undo => "Undo",
+            Self::Redo => "Redo",
+            Self::MoveTrack(_) => "Move track",
             Self::AddTrack(kind) => match kind {
                 TrackKind::Midi => "New MIDI track",
                 TrackKind::Audio => "New audio track",
@@ -160,6 +172,9 @@ impl UiAction {
             | Self::DuplicateClip
             | Self::ZoomSelectedAudioClip
             | Self::ZoomBack
+            | Self::Undo
+            | Self::Redo
+            | Self::MoveTrack(_)
             | Self::AddTrack(_)
             | Self::RemoveTrack
             | Self::ToggleTrackMute

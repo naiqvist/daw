@@ -57,6 +57,17 @@ impl Default for Keymap {
             Binding::new(Modifiers::COMMAND, Key::C, UiAction::CopyClip),
             Binding::new(Modifiers::COMMAND, Key::V, UiAction::PasteClip),
             Binding::new(Modifiers::COMMAND, Key::D, UiAction::DuplicateClip),
+            // Ctrl+Shift+Z before Ctrl+Z, for the reason spelled out above
+            // the track pair: the plain gesture would otherwise match the
+            // shifted one and undo when asked to redo. Ctrl+Y is the second
+            // redo gesture, so `shortcut_for` reports the first one listed.
+            Binding::new(
+                Modifiers::COMMAND.plus(Modifiers::SHIFT),
+                Key::Z,
+                UiAction::Redo,
+            ),
+            Binding::new(Modifiers::COMMAND, Key::Z, UiAction::Undo),
+            Binding::new(Modifiers::COMMAND, Key::Y, UiAction::Redo),
         ])
     }
 }

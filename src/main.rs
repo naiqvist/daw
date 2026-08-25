@@ -586,6 +586,19 @@ fn arrangement_keys(ctx: &egui::Context, arr: &Arrangement, out: &mut Vec<UiActi
         if i.consume_key(egui::Modifiers::COMMAND, egui::Key::D) {
             out.push(UiAction::DuplicateClip);
         }
+        // History. SHIFT FIRST, for the reason spelled out on the arrows:
+        // `consume_key` ignores an extra Shift, so a plain Ctrl+Z checked
+        // first would swallow Ctrl+Shift+Z and undo when asked to redo.
+        // Ctrl+Y is the second redo binding, for the hands that reach there.
+        if i.consume_key(
+            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+            egui::Key::Z,
+        ) || i.consume_key(egui::Modifiers::COMMAND, egui::Key::Y)
+        {
+            out.push(UiAction::Redo);
+        } else if i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z) {
+            out.push(UiAction::Undo);
+        }
         if i.consume_key(egui::Modifiers::NONE, egui::Key::Z) {
             out.push(UiAction::ZoomSelectedAudioClip);
         }
@@ -1511,6 +1524,9 @@ fn perform(actions: &[UiAction], transport: &mut Transport, arrangement: &mut Ar
             UiAction::AddTrack(kind) => {
                 arrangement.add_track(*kind);
             }
+            UiAction::MoveTrack(delta) => {
+                arrangement.nudge_track(*delta);
+            }
             UiAction::RemoveTrack => {
                 if let Some(t) = arrangement.active_track() {
                     arrangement.remove_track(t);
@@ -1610,6 +1626,7 @@ impl DeviceKind {
     }
 }
 
+#[derive(Clone, PartialEq)]
 struct Track {
     /// What the lane carries. Fixed at creation: changing a track's kind
     /// would change what every clip on it means, which is a conversion,
@@ -1784,6 +1801,19 @@ struct Rename {
     focused: bool,
 }
 
+/// A track header being dragged to a new position in the stack. The lane
+/// stays put while the drag is in flight — an insertion line shows where it
+/// would land — and the move happens on release, so a drag that wanders
+/// costs nothing until it is committed.
+struct TrackDrag {
+    /// The lane being carried, by its CURRENT index. Nothing moves until
+    /// release, so this stays valid for the drag's lifetime.
+    from: usize,
+    /// Where a release would put it: an insertion point in `0..=tracks`,
+    /// counted in gaps between lanes rather than in lanes.
+    insertion: usize,
+}
+
 /// An inline track rename in flight: which lane, and the text being
 /// edited. Separate from `Rename` (clips) because the two can never be
 /// open at once but their identities differ — a lane is an index, a clip
@@ -1855,6 +1885,16 @@ struct Arrangement {
     next_track_no: [u32; TrackKind::ALL.len()],
     /// The header rename, while one is open.
     track_rename: Option<TrackRename>,
+    /// The header drag, while one is in flight.
+    track_drag: Option<TrackDrag>,
+    /// Set by `move_track` and cleared by the app once it has recompiled.
+    ///
+    /// A reorder renumbers every per-track thing the app holds by INDEX —
+    /// the schedule's node ids and the pan values last sent to them — and
+    /// two lanes can swap without changing the graph's shape or any clip,
+    /// so neither existing dirty check would notice. This flag is how a
+    /// reorder says "the indices moved" out loud.
+    tracks_reordered: bool,
 }
 
 /// A note, spelled out. Only the tests build notes by hand — the app builds
@@ -1866,6 +1906,138 @@ const fn note(pitch: u8, start: f64, len: f64, vel: u8) -> Note {
         start,
         len,
         vel,
+    }
+}
+
+/// The undoable half of the arrangement: everything an edit can change
+/// that is not a view. Compared, frame by frame, to notice that an edit
+/// happened at all — which is why every field here is one an edit owns.
+///
+/// The view is deliberately absent. Scroll, zoom, grid and the saved Z
+/// view are how you are LOOKING at the arrangement, not what it is;
+/// yanking the viewport on Ctrl+Z is a thing users hate, and it would also
+/// make every pan a history entry.
+#[derive(Clone, PartialEq)]
+struct Content {
+    tracks: Vec<Track>,
+    clips: Vec<Vec<Clip>>,
+    loop_range: Option<(f32, f32)>,
+    /// The id counters ride along, so an undone clip's id is free again and
+    /// a redo re-creates the very same clip rather than a renamed twin.
+    next_clip_id: u64,
+    next_track_no: [u32; TrackKind::ALL.len()],
+}
+
+/// Where the user was pointing when a snapshot was taken. Carried so an
+/// undo puts the selection back too — but NOT compared, so that moving the
+/// cursor is never itself an undoable edit.
+#[derive(Clone)]
+struct Marks {
+    selected: Option<usize>,
+    selected_clip: Option<(usize, usize)>,
+    selection: Option<(f32, f32)>,
+    cursor: Option<(usize, f32)>,
+    anchor: f32,
+}
+
+#[derive(Clone)]
+struct Snapshot {
+    content: Content,
+    marks: Marks,
+}
+
+/// How many edits back the history reaches. Snapshots are whole-model
+/// clones, so this is also the memory bound; deep enough that no real
+/// session hits it, shallow enough that a project full of long MIDI clips
+/// cannot grow without limit.
+const HISTORY_DEPTH: usize = 128;
+
+/// Undo/redo over whole-model snapshots.
+///
+/// Snapshots rather than inverse operations because the arrangement is
+/// plain green-zone data with one owner: a clone is cheap, always correct,
+/// and cannot drift from the edit that produced it the way a hand-written
+/// inverse can. The cost is memory, which `HISTORY_DEPTH` bounds.
+///
+/// Entries are found by WATCHING rather than by being told. `sync` compares
+/// the model against the baseline once a frame and banks the difference —
+/// so every edit path is covered by construction: the ones that exist now,
+/// the piano roll's note editing, and any that arrive later without
+/// remembering to call anything.
+struct History {
+    past: Vec<Snapshot>,
+    future: Vec<Snapshot>,
+    /// The state as of the last banked edit — what the next entry pushed
+    /// will contain, and what the comparison is against.
+    baseline: Snapshot,
+}
+
+impl History {
+    fn new(arr: &Arrangement) -> Self {
+        Self {
+            past: Vec::new(),
+            future: Vec::new(),
+            baseline: arr.snapshot(),
+        }
+    }
+
+    /// Bank an edit if one finished this frame.
+    ///
+    /// `settled` is the caller's answer to "is a gesture still in flight?".
+    /// A drag changes the model on every one of sixty frames and must land
+    /// as ONE entry, so while anything is being dragged, typed or held,
+    /// nothing is banked — the comparison simply waits for the hand to
+    /// come off.
+    fn sync(&mut self, arr: &Arrangement, settled: bool) {
+        if !settled {
+            return;
+        }
+        let now = arr.snapshot();
+        if now.content == self.baseline.content {
+            // No edit — but keep the marks fresh, so when an edit DOES
+            // land, the entry it pushes remembers the selection the user
+            // had just before it, not the one from the previous edit.
+            self.baseline.marks = now.marks;
+            return;
+        }
+        self.past.push(std::mem::replace(&mut self.baseline, now));
+        if self.past.len() > HISTORY_DEPTH {
+            self.past.remove(0);
+        }
+        // A fresh edit is a new branch: what was undone is now unreachable.
+        self.future.clear();
+    }
+
+    /// Step back one edit. Returns whether anything moved.
+    fn can_undo(&self) -> bool {
+        !self.past.is_empty()
+    }
+
+    fn can_redo(&self) -> bool {
+        !self.future.is_empty()
+    }
+
+    fn undo(&mut self, arr: &mut Arrangement) -> bool {
+        let Some(previous) = self.past.pop() else {
+            return false;
+        };
+        // The baseline is the state being LEFT, so it is what redo returns
+        // to — and it must be re-read from the model first, because the
+        // marks may have moved since the entry was banked.
+        self.future
+            .push(std::mem::replace(&mut self.baseline, previous));
+        arr.restore(&self.baseline);
+        true
+    }
+
+    /// Step forward through an undone edit. Returns whether anything moved.
+    fn redo(&mut self, arr: &mut Arrangement) -> bool {
+        let Some(next) = self.future.pop() else {
+            return false;
+        };
+        self.past.push(std::mem::replace(&mut self.baseline, next));
+        arr.restore(&self.baseline);
+        true
     }
 }
 
@@ -1901,6 +2073,8 @@ impl Default for Arrangement {
             // The default session's four lanes have already taken 1..=4.
             next_track_no: [TRACK_COUNT as u32 + 1, 1],
             track_rename: None,
+            track_drag: None,
+            tracks_reordered: false,
         }
     }
 }
@@ -1908,6 +2082,116 @@ impl Default for Arrangement {
 impl Arrangement {
     fn grid_beats(&self) -> f32 {
         GRID_BEATS[self.grid.min(GRID_BEATS.len() - 1)]
+    }
+
+    /// The model as history sees it: content plus where the user was.
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            content: Content {
+                tracks: self.tracks.clone(),
+                clips: self.clips.clone(),
+                loop_range: self.loop_range,
+                next_clip_id: self.next_clip_id,
+                next_track_no: self.next_track_no,
+            },
+            marks: Marks {
+                selected: self.selected,
+                selected_clip: self.selected_clip,
+                selection: self.selection,
+                cursor: self.cursor,
+                anchor: self.anchor,
+            },
+        }
+    }
+
+    /// Put a snapshot back. Anything in flight — a ghost mid-drag, an open
+    /// rename — is dropped: it belongs to a gesture over a model that no
+    /// longer exists, and finishing it would write into the wrong state.
+    /// The clipboard survives, because a copy is not part of the timeline.
+    fn restore(&mut self, snapshot: &Snapshot) {
+        self.tracks = snapshot.content.tracks.clone();
+        self.clips = snapshot.content.clips.clone();
+        self.loop_range = snapshot.content.loop_range;
+        self.next_clip_id = snapshot.content.next_clip_id;
+        self.next_track_no = snapshot.content.next_track_no;
+        self.selected = snapshot.marks.selected;
+        self.selected_clip = snapshot.marks.selected_clip;
+        self.selection = snapshot.marks.selection;
+        self.cursor = snapshot.marks.cursor;
+        self.anchor = snapshot.marks.anchor;
+        self.ghost = None;
+        self.rename = None;
+        self.track_rename = None;
+        // A restored selection must still point at something that exists:
+        // undoing back past a track's creation would otherwise leave the
+        // selection addressing a lane that is gone.
+        if self.selected.is_some_and(|t| t >= self.tracks.len()) {
+            self.selected = None;
+        }
+        if !self
+            .selected_clip
+            .is_some_and(|(t, i)| self.clips.get(t).is_some_and(|track| i < track.len()))
+        {
+            self.selected_clip = None;
+        }
+        if self.cursor.is_some_and(|(t, _)| t >= self.tracks.len()) {
+            self.cursor = None;
+        }
+    }
+
+    /// Move the lane at `from` so that it ends up at index `to`, carrying
+    /// its clips with it. The one door every reorder walks through — the
+    /// header drag and the palette's move verbs both land here, so lanes,
+    /// clips and every index the user is pointing at move together.
+    ///
+    /// Returns whether anything moved.
+    fn move_track(&mut self, from: usize, to: usize) -> bool {
+        if from >= self.tracks.len() || to >= self.tracks.len() || from == to {
+            return false;
+        }
+        let track = self.tracks.remove(from);
+        self.tracks.insert(to, track);
+        // The clip vecs are parallel to the tracks, and nothing else keeps
+        // them in step: they move in the same breath or not at all.
+        let clips = self.clips.remove(from);
+        self.clips.insert(to, clips);
+
+        // Every lane between the two ends shifts by one to make room; the
+        // marks the user is pointing at follow the lane they meant, not the
+        // index that lane used to sit at.
+        let shifted = |index: usize| {
+            if index == from {
+                to
+            } else if from < to && index > from && index <= to {
+                index - 1
+            } else if to < from && index >= to && index < from {
+                index + 1
+            } else {
+                index
+            }
+        };
+        self.selected = self.selected.map(shifted);
+        self.selected_clip = self.selected_clip.map(|(t, i)| (shifted(t), i));
+        self.cursor = self.cursor.map(|(t, beat)| (shifted(t), beat));
+        if let Some(ghost) = &mut self.ghost {
+            ghost.track = shifted(ghost.track);
+        }
+        if let Some(rename) = &mut self.rename {
+            rename.track = shifted(rename.track);
+        }
+        self.tracks_reordered = true;
+        true
+    }
+
+    /// Move the selected lane `delta` places, clamped at the ends: the
+    /// palette's route to what the header drag does with the mouse.
+    fn nudge_track(&mut self, delta: i32) -> bool {
+        let Some(from) = self.active_track() else {
+            return false;
+        };
+        let last = self.tracks.len().saturating_sub(1);
+        let to = (from as i64 + i64::from(delta)).clamp(0, last as i64) as usize;
+        self.move_track(from, to)
     }
 
     /// Append a track of `kind`, named from that kind's own counter, and
@@ -2691,6 +2975,10 @@ fn track_headers(
     let mut rename_open: Option<usize> = None;
     let mut pan_edit: Option<(usize, f32)> = None;
     let renaming = arr.track_rename.as_ref().map(|r| r.track);
+    // The reorder drag rides out of `arr` for the draw and is handed back
+    // at the end, the same way the clip ghost does.
+    let mut drag = arr.track_drag.take();
+    let mut reorder: Option<(usize, usize)> = None;
 
     for (i, lane) in lanes.iter().enumerate() {
         if lane.top() > column.bottom() {
@@ -2712,6 +3000,55 @@ fn track_headers(
         // excluded reads as silent here rather than looking live.
         let audible = track_audible(&arr.tracks, i);
 
+        // The header BODY, created before every control on it so that the
+        // name, the two toggles and the pan knob — all made after this —
+        // win the pointer where they overlap. Dragging it reorders the
+        // stack; clicking anywhere on it selects the lane.
+        let body = ui.interact(head, wid.with("body"), egui::Sense::click_and_drag());
+        if body.drag_started() {
+            drag = Some(TrackDrag {
+                from: i,
+                insertion: i,
+            });
+            select = Some(i);
+        }
+        if body.clicked() {
+            select = Some(i);
+        }
+        if body.dragged()
+            && let Some(d) = &mut drag
+            && d.from == i
+            && let Some(pos) = body.interact_pointer_pos()
+        {
+            // Where the release would land, counted in the gaps between
+            // lanes: every lane whose middle the pointer has passed is a
+            // lane the carried one now sits after.
+            d.insertion = lanes.iter().filter(|lane| pos.y > lane.center().y).count();
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        } else if body.hovered() && drag.is_none() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        }
+        if body.drag_stopped()
+            && let Some(d) = &drag
+            && d.from == i
+        {
+            // An insertion point counts gaps; an index counts lanes. Past
+            // its own position the carried lane has already vacated one, so
+            // the two differ by exactly that lane.
+            let to = d
+                .insertion
+                .saturating_sub(usize::from(d.insertion > d.from))
+                .min(arr.tracks.len().saturating_sub(1));
+            reorder = Some((d.from, to));
+            drag = None;
+        }
+
+        // The carried lane reads as lifted: washed, so the eye can follow
+        // which header the insertion line belongs to.
+        if drag.as_ref().is_some_and(|d| d.from == i) {
+            ui.painter()
+                .rect_filled(head, 0.0, theme.accent_muted.gamma_multiply(0.35));
+        }
         if arr.selected == Some(i) {
             ui.painter().rect_filled(head, 0.0, theme.surface);
             // A selected lane gets a spine in the accent, so which track
@@ -2855,6 +3192,29 @@ fn track_headers(
         egui::Stroke::new(stroke::HAIR, theme.divider),
     );
 
+    // Escape abandons a reorder: the stack never moved, so there is
+    // nothing to put back.
+    if drag.is_some() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        drag = None;
+    }
+
+    // The insertion line: where a release would put the carried lane, drawn
+    // in the gap it would open rather than on top of a header.
+    if let Some(d) = &drag {
+        let y = lanes
+            .get(d.insertion)
+            .map(egui::Rect::top)
+            .or_else(|| lanes.last().map(egui::Rect::bottom))
+            .unwrap_or(column.top())
+            .clamp(column.top(), column.bottom());
+        ui.painter().line_segment(
+            [egui::pos2(column.left(), y), egui::pos2(column.right(), y)],
+            egui::Stroke::new(2.0, theme.accent),
+        );
+    }
+
+    arr.track_drag = drag;
+
     if let Some(i) = select {
         arr.selected = Some(i);
         arr.selected_clip = None;
@@ -2884,6 +3244,13 @@ fn track_headers(
             original: t.name.clone(),
             focused: false,
         });
+    }
+
+    // The reorder LAST: every intent above carries an index from before the
+    // move, and `move_track` renumbers the marks itself. Applying it first
+    // would let a stale index overwrite what it had just corrected.
+    if let Some((from, to)) = reorder {
+        arr.move_track(from, to);
     }
 }
 
@@ -5214,6 +5581,9 @@ struct App {
     transport: Transport,
     browser: Browser,
     arrangement: Arrangement,
+    /// Undo/redo over the arrangement. Fed by watching the model at the end
+    /// of every frame rather than by each edit reporting itself.
+    history: History,
     /// The piano roll's VIEW state — cursor, grid rung, scroll, selection.
     /// The notes it edits live in the selected clip, not here.
     piano_roll: piano_roll::PianoRoll,
@@ -5322,6 +5692,9 @@ impl App {
             waveform_cache: HashMap::new(),
             waveform_pending: HashSet::new(),
             waveform_failed: HashSet::new(),
+            // The session's starting point is the baseline: undo can walk
+            // back to the empty arrangement, and no further.
+            history: History::new(&Arrangement::default()),
             arrangement: Arrangement::default(),
             piano_roll: piano_roll::PianoRoll::default(),
             waveform: waveform::Editor::default(),
@@ -5392,6 +5765,13 @@ impl App {
             PaletteCommand::new("clip.duplicate", "clip", "duplicate clip").enabled(has_clip),
             PaletteCommand::new("clip.delete", "clip", "delete clip").enabled(has_clip),
             PaletteCommand::new("clip.loop", "clip", "loop the selection"),
+            // --- history -----------------------------------------------
+            PaletteCommand::new("edit.undo", "edit", "undo")
+                .hint("ctrl+Z")
+                .enabled(self.history.can_undo()),
+            PaletteCommand::new("edit.redo", "edit", "redo")
+                .hint("ctrl+shift+Z")
+                .enabled(self.history.can_redo()),
             // --- tracks ------------------------------------------------
             PaletteCommand::new("track.new.audio", "track", "new audio track").hint("ctrl+T"),
             PaletteCommand::new("track.new.midi", "track", "new MIDI track").hint("ctrl+shift+T"),
@@ -5403,6 +5783,13 @@ impl App {
             PaletteCommand::new("track.pan.left", "track", "pan left").enabled(has_track),
             PaletteCommand::new("track.pan.right", "track", "pan right").enabled(has_track),
             PaletteCommand::new("track.pan.center", "track", "center pan").enabled(has_track),
+            PaletteCommand::new("track.move.up", "track", "move track up")
+                .enabled(has_track && self.arrangement.active_track() != Some(0)),
+            PaletteCommand::new("track.move.down", "track", "move track down").enabled(
+                has_track
+                    && self.arrangement.active_track()
+                        != Some(self.arrangement.tracks.len().saturating_sub(1)),
+            ),
             PaletteCommand::new("track.delete", "track", "delete track")
                 .enabled(has_track && self.arrangement.tracks.len() > 1),
             // --- notes: write at the piano roll's cursor ---------------
@@ -5481,6 +5868,8 @@ impl App {
             }
             "clip.duplicate" => actions.push(UiAction::DuplicateClip),
             "clip.delete" => actions.push(UiAction::DeleteSelected),
+            "edit.undo" => actions.push(UiAction::Undo),
+            "edit.redo" => actions.push(UiAction::Redo),
             "clip.loop" => actions.push(UiAction::LoopFromSelection),
 
             "track.new.audio" => actions.push(UiAction::AddTrack(TrackKind::Audio)),
@@ -5490,6 +5879,8 @@ impl App {
             "track.pan.left" => actions.push(UiAction::NudgeTrackPan(-PAN_STEP)),
             "track.pan.right" => actions.push(UiAction::NudgeTrackPan(PAN_STEP)),
             "track.pan.center" => actions.push(UiAction::CenterTrackPan),
+            "track.move.up" => actions.push(UiAction::MoveTrack(-1)),
+            "track.move.down" => actions.push(UiAction::MoveTrack(1)),
             "track.delete" => actions.push(UiAction::RemoveTrack),
             "track.rename" => {
                 // The palette opens the SAME inline editor a double-click
@@ -6097,6 +6488,17 @@ impl App {
 
         self.sync_pans();
 
+        // A reorder swaps NOW, and unconditionally. Two lanes can trade
+        // places without changing the graph's shape or any clip — same
+        // kinds, same devices, same (or no) clips — so neither check below
+        // would fire, while `seq_ids`, `fx_ids`, `pan_ids` and `sent_pan`
+        // are all indexed by a track number that just moved. Recompiling
+        // re-captures every id and clears `sent_pan`, which is the only way
+        // back into step.
+        if std::mem::take(&mut self.arrangement.tracks_reordered) {
+            self.push_graph();
+            return;
+        }
         // Shape changes (metronome, loop length, track count) swap now: they
         // add or remove nodes, which no letter can express. Clip edits are
         // debounced so a drag lands as one swap, not sixty.
@@ -6607,6 +7009,33 @@ impl eframe::App for App {
             match action {
                 UiAction::StartEngine => self.start_engine(),
                 UiAction::StopEngine => self.stop_engine(),
+                // History is the app's own: `perform` is pure over the
+                // arrangement and cannot reach the stacks, and a restore
+                // has an engine consequence that a pure verb must not have.
+                UiAction::Undo | UiAction::Redo => {
+                    let stepped = if matches!(action, UiAction::Undo) {
+                        self.history.undo(&mut self.arrangement)
+                    } else {
+                        self.history.redo(&mut self.arrangement)
+                    };
+                    if stepped {
+                        // A restore can move anything — clips, devices, the
+                        // knob values a track's nodes were compiled with —
+                        // and the letters that carried those knobs have
+                        // already been sent. One swap rebuilt from the
+                        // restored model is the only way back into step.
+                        self.push_graph();
+                    } else {
+                        self.notice = Some(
+                            if matches!(action, UiAction::Undo) {
+                                "nothing to undo"
+                            } else {
+                                "nothing to redo"
+                            }
+                            .to_owned(),
+                        );
+                    }
+                }
                 // Density is the theme's packing AND a machine-local
                 // preference: apply both, and the next `save` carries it.
                 UiAction::SetDensity(density) => {
@@ -6638,6 +7067,20 @@ impl eframe::App for App {
         }
         perform(&wishes, &mut self.transport, &mut self.arrangement);
         self.sync_engine();
+
+        // History last, after every edit path this frame has run. A gesture
+        // in flight defers the entry, so a drag lands as one step rather
+        // than sixty — the same coalescing the schedule recompile does, for
+        // the same reason.
+        let settled = !ui.ctx().input(|i| i.pointer.any_down())
+            && !ui.ctx().egui_is_using_pointer()
+            && self.arrangement.ghost.is_none()
+            && self.arrangement.rename.is_none()
+            && self.arrangement.track_rename.is_none()
+            && self.drag_import.is_none()
+            && self.wav_import_pending == 0
+            && !ui.ctx().egui_wants_keyboard_input();
+        self.history.sync(&self.arrangement, settled);
 
         // Roll the stand-in clock, and keep frames coming while it runs.
         // Only while no stream runs: with an engine up, the sample counter is
@@ -8996,6 +9439,444 @@ mod tests {
 
             assert_eq!(actions, vec![expected]);
         }
+    }
+
+    /// A reorder carries the lane's clips with it, shifts everything
+    /// between the two ends by one, and keeps every mark pointing at the
+    /// lane the user meant rather than at the index it used to occupy.
+    #[test]
+    fn moving_a_track_carries_its_clips_and_its_marks() {
+        let mut arr = Arrangement::default();
+        // One clip per lane, named for the lane it started on.
+        for t in 0..4 {
+            arr.create_clip(t, t as f32 * 8.0, 4.0).unwrap();
+        }
+        let ids: Vec<u64> = (0..4).map(|t| arr.clips[t][0].id).collect();
+
+        // Downwards: lane 0 to the end. 1, 2 and 3 each shift up one.
+        arr.selected = Some(0);
+        arr.selected_clip = Some((0, 0));
+        arr.cursor = Some((2, 4.0));
+        assert!(arr.move_track(0, 3));
+        assert_eq!(arr.clips[3][0].id, ids[0], "the clips came along");
+        assert_eq!(arr.clips[0][0].id, ids[1]);
+        assert_eq!(arr.selected, Some(3), "the selection followed its lane");
+        assert_eq!(arr.selected_clip, Some((3, 0)));
+        assert_eq!(arr.cursor, Some((1, 4.0)), "a lane between shifted up");
+        assert!(arr.tracks_reordered, "the app is told the indices moved");
+
+        // And back up: the arrangement returns to where it started.
+        assert!(arr.move_track(3, 0));
+        let back: Vec<u64> = (0..4).map(|t| arr.clips[t][0].id).collect();
+        assert_eq!(back, ids, "a move and its reverse cancel out");
+        assert_eq!(arr.selected, Some(0));
+        assert_eq!(arr.cursor, Some((2, 4.0)));
+
+        // Nothing to do is not a move: the flag stays where it was.
+        arr.tracks_reordered = false;
+        assert!(!arr.move_track(1, 1));
+        assert!(
+            !arr.move_track(9, 0),
+            "out of range is refused, not clamped"
+        );
+        assert!(!arr.tracks_reordered);
+    }
+
+    /// The palette's route: nudging clamps at the ends instead of wrapping
+    /// or refusing to move at all.
+    #[test]
+    fn nudging_a_track_clamps_at_the_ends() {
+        let mut arr = Arrangement::default();
+        arr.selected = Some(0);
+        assert!(!arr.nudge_track(-1), "the top lane cannot go higher");
+        assert!(arr.nudge_track(1));
+        assert_eq!(arr.selected, Some(1));
+
+        let last = arr.tracks.len() - 1;
+        arr.selected = Some(last);
+        assert!(!arr.nudge_track(1), "the bottom lane cannot go lower");
+        assert!(arr.nudge_track(-1));
+        assert_eq!(arr.selected, Some(last - 1));
+    }
+
+    /// Dragging a header past the lane below it reorders the stack on
+    /// release — through the real header widgets, and as one undo step.
+    #[test]
+    fn dragging_a_header_reorders_the_stack() {
+        let ctx = egui::Context::default();
+        let mut arr = Arrangement::default();
+        arr.create_clip(0, 0.0, 4.0).unwrap();
+        let moved = arr.tracks[0].name.clone();
+        let displaced = arr.tracks[1].name.clone();
+        arrangement_pass(&ctx, &mut arr, vec![]);
+        let mut history = History::new(&arr);
+
+        // Press on lane 0's header — x inside the column, left of TL — and
+        // pull down past the middle of lane 1.
+        let press = pos2(HEADER_W * 0.5, LANES_TOP + TRACK_H * 0.5);
+        let over = pos2(HEADER_W * 0.5, LANES_TOP + TRACK_H * 1.6);
+        arrangement_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::PointerMoved(press),
+                Event::PointerButton {
+                    pos: press,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        arrangement_pass(&ctx, &mut arr, vec![Event::PointerMoved(over)]);
+        assert!(arr.track_drag.is_some(), "the drag is in flight");
+        assert_eq!(arr.tracks[0].name, moved, "nothing moves until the release");
+
+        arrangement_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::PointerMoved(over),
+                Event::PointerButton {
+                    pos: over,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        assert!(arr.track_drag.is_none(), "the drag is done");
+        assert_eq!(arr.tracks[0].name, displaced, "lane 1 came up");
+        assert_eq!(arr.tracks[1].name, moved, "the carried lane landed below");
+        assert_eq!(arr.clips[1].len(), 1, "its clip came with it");
+        assert!(arr.clips[0].is_empty());
+
+        // And the whole drag is one step of history.
+        arrangement_pass(&ctx, &mut arr, vec![]);
+        history.sync(&arr, true);
+        assert_eq!(history.past.len(), 1);
+        assert!(history.undo(&mut arr));
+        assert_eq!(arr.tracks[0].name, moved, "undo puts the stack back");
+        assert_eq!(arr.clips[0].len(), 1);
+    }
+
+    /// The header's controls are created AFTER the draggable body, so they
+    /// win the pointer where they overlap it. Without that ordering the
+    /// reorder drag would swallow mute, solo, pan and rename — every
+    /// control on the header — so this pins it.
+    #[test]
+    fn the_header_controls_still_win_the_pointer() {
+        let ctx = egui::Context::default();
+        let mut arr = Arrangement::default();
+        arrangement_pass(&ctx, &mut arr, vec![]);
+
+        // The mute button of lane 0, from the same metrics the header
+        // lays it out with.
+        let row_y = LANES_TOP + HEADER_PAD + HEADER_NAME_H;
+        let mute = pos2(HEADER_PAD + HEADER_BTN * 0.5, row_y + HEADER_BTN * 0.5);
+        let click = |ctx: &egui::Context, arr: &mut Arrangement, pos: egui::Pos2| {
+            arrangement_pass(
+                ctx,
+                arr,
+                vec![
+                    Event::PointerMoved(pos),
+                    Event::PointerButton {
+                        pos,
+                        button: PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Default::default(),
+                    },
+                    Event::PointerButton {
+                        pos,
+                        button: PointerButton::Primary,
+                        pressed: false,
+                        modifiers: Default::default(),
+                    },
+                ],
+            );
+        };
+
+        click(&ctx, &mut arr, mute);
+        assert!(arr.tracks[0].mute, "the mute button took the click");
+        assert!(arr.track_drag.is_none(), "and no reorder drag began");
+
+        // The solo button sits one slot to its right.
+        let solo = pos2(mute.x + HEADER_BTN + 3.0, mute.y);
+        click(&ctx, &mut arr, solo);
+        assert!(arr.tracks[0].solo, "the solo button took its click too");
+
+        // And the stack never moved through any of it.
+        assert_eq!(arr.tracks.len(), TRACK_COUNT);
+        assert!(!arr.tracks_reordered);
+    }
+
+    /// The name row keeps its double-click through the draggable body: a
+    /// rename must still be reachable with the mouse. Its own context,
+    /// because a double-click has to be the FIRST click pair egui sees —
+    /// headless frames carry no wall-clock gap, so earlier clicks would
+    /// still be counted as part of one long sequence.
+    #[test]
+    fn the_header_name_still_opens_a_rename() {
+        let ctx = egui::Context::default();
+        let mut arr = Arrangement::default();
+        arrangement_pass(&ctx, &mut arr, vec![]);
+        let name = pos2(HEADER_PAD + 20.0, LANES_TOP + HEADER_PAD);
+        for _ in 0..2 {
+            arrangement_pass(
+                &ctx,
+                &mut arr,
+                vec![
+                    Event::PointerMoved(name),
+                    Event::PointerButton {
+                        pos: name,
+                        button: PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Default::default(),
+                    },
+                    Event::PointerButton {
+                        pos: name,
+                        button: PointerButton::Primary,
+                        pressed: false,
+                        modifiers: Default::default(),
+                    },
+                ],
+            );
+        }
+        assert!(arr.track_rename.is_some(), "the name row opened a rename");
+        assert!(arr.track_drag.is_none(), "and no reorder drag began");
+    }
+
+    /// The history keys, including the one that is easy to get wrong:
+    /// `consume_key` matches modifiers logically, so a plain Ctrl+Z checked
+    /// first would swallow Ctrl+Shift+Z and undo when asked to redo.
+    #[test]
+    fn the_history_keys_reach_undo_and_redo() {
+        let ctrl = egui::Modifiers::COMMAND;
+        let ctrl_shift = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
+        for (key, modifiers, expected) in [
+            (egui::Key::Z, ctrl, UiAction::Undo),
+            (egui::Key::Z, ctrl_shift, UiAction::Redo),
+            (egui::Key::Y, ctrl, UiAction::Redo),
+        ] {
+            let ctx = egui::Context::default();
+            let mut actions = Vec::new();
+            let mut out = ctx.run_ui(
+                input(vec![
+                    Event::ModifiersChanged(modifiers),
+                    Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                    },
+                ]),
+                |_ui| {},
+            );
+            out.textures_delta.clear();
+
+            arrangement_keys(&ctx, &Arrangement::default(), &mut actions);
+
+            assert_eq!(actions, vec![expected], "{key:?} with {modifiers:?}");
+        }
+    }
+
+    /// One edit is one entry, however many frames the gesture took, and the
+    /// round trip puts back exactly what was there — selection included.
+    #[test]
+    fn history_banks_one_entry_per_settled_edit() {
+        let mut arr = Arrangement::default();
+        let mut history = History::new(&arr);
+        assert!(!history.can_undo() && !history.can_redo());
+
+        // A gesture in flight: the model changes every frame, and nothing
+        // is banked while the hand is still down.
+        arr.create_clip(0, 0.0, 4.0).unwrap();
+        for start in [1.0, 2.0, 3.0] {
+            arr.clips[0][0].start = start;
+            history.sync(&arr, false);
+        }
+        assert!(!history.can_undo(), "an unsettled gesture banks nothing");
+
+        // The hand comes off: the whole gesture is ONE entry.
+        history.sync(&arr, true);
+        assert!(history.can_undo());
+        assert_eq!(history.past.len(), 1);
+
+        // Moving the cursor is not an edit, however settled it is.
+        arr.cursor = Some((1, 8.0));
+        arr.selected = Some(1);
+        history.sync(&arr, true);
+        assert_eq!(history.past.len(), 1, "marks alone are not an edit");
+
+        // Undo puts back the empty arrangement, with the marks that entry
+        // was banked with — undo restores a past state whole.
+        assert!(history.undo(&mut arr));
+        assert!(arr.clips[0].is_empty());
+        assert_eq!(arr.cursor, None, "the entry's own marks came back");
+        assert!(history.can_redo());
+
+        // Redo returns the clip exactly as it was left — and lands the
+        // marks the user had when they left it, which is what keeping the
+        // baseline's marks fresh buys.
+        assert!(history.redo(&mut arr));
+        assert_eq!(arr.clips[0].len(), 1);
+        assert_eq!(arr.clips[0][0].start, 3.0);
+        assert_eq!(arr.cursor, Some((1, 8.0)), "back where the user was");
+        assert!(!history.can_redo());
+        assert!(!history.redo(&mut arr), "an empty future is a no-op");
+    }
+
+    /// The coalescing gate against REAL egui pointer state: a clip dragged
+    /// across many frames must bank exactly one entry, and undo must put it
+    /// back where the drag started. The unit tests above pin the history's
+    /// own logic; this pins the predicate the app feeds it.
+    #[test]
+    fn a_whole_drag_undoes_as_one_step() {
+        let ctx = egui::Context::default();
+        let mut arr = Arrangement::default();
+        arr.create_clip(0, 0.0, 4.0).unwrap();
+        arrangement_pass(&ctx, &mut arr, vec![]);
+        let mut history = History::new(&arr);
+
+        // The app's gate, minus the fields only App owns.
+        let settled = |ctx: &egui::Context, arr: &Arrangement| {
+            !ctx.input(|i| i.pointer.any_down())
+                && !ctx.egui_is_using_pointer()
+                && arr.ghost.is_none()
+                && arr.rename.is_none()
+                && arr.track_rename.is_none()
+                && !ctx.egui_wants_keyboard_input()
+        };
+
+        let y = LANES_TOP + TRACK_H * 0.5;
+        let press = pos2(TL + 48.0, y);
+        arrangement_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::PointerMoved(press),
+                Event::PointerButton {
+                    pos: press,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        history.sync(&arr, settled(&ctx, &arr));
+        for step in 1..=8 {
+            let pos = pos2(press.x + step as f32 * 6.0, y);
+            arrangement_pass(&ctx, &mut arr, vec![Event::PointerMoved(pos)]);
+            history.sync(&arr, settled(&ctx, &arr));
+        }
+        assert!(
+            !history.can_undo(),
+            "nothing banks while the hand is still down"
+        );
+
+        let release = pos2(press.x + 48.0, y);
+        arrangement_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::PointerMoved(release),
+                Event::PointerButton {
+                    pos: release,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        history.sync(&arr, settled(&ctx, &arr));
+        // The release frame itself may still read as in-flight; the next
+        // idle frame is the one that banks. Either way it is ONE entry.
+        arrangement_pass(&ctx, &mut arr, vec![]);
+        history.sync(&arr, settled(&ctx, &arr));
+
+        assert_eq!(arr.clips[0][0].start, 2.0, "the drag landed");
+        assert_eq!(history.past.len(), 1, "a whole drag is one entry");
+        assert!(history.undo(&mut arr));
+        assert_eq!(arr.clips[0][0].start, 0.0, "undo returns it whole");
+        assert!(!history.can_undo(), "and there was only the one step");
+    }
+
+    /// Editing after an undo abandons the branch that was undone, and the
+    /// stack never grows past its bound.
+    #[test]
+    fn a_fresh_edit_clears_the_redo_branch() {
+        let mut arr = Arrangement::default();
+        let mut history = History::new(&arr);
+        arr.create_clip(0, 0.0, 4.0).unwrap();
+        history.sync(&arr, true);
+        assert!(history.undo(&mut arr));
+        assert!(history.can_redo());
+
+        arr.create_clip(0, 16.0, 4.0).unwrap();
+        history.sync(&arr, true);
+        assert!(!history.can_redo(), "the undone branch is unreachable");
+
+        // The depth bound holds, and the newest edit is still the one undo
+        // reaches first.
+        for beat in 0..(HISTORY_DEPTH + 20) {
+            arr.create_clip(0, 100.0 + beat as f32 * 8.0, 4.0).unwrap();
+            history.sync(&arr, true);
+        }
+        assert_eq!(history.past.len(), HISTORY_DEPTH);
+        let clips = arr.clips[0].len();
+        assert!(history.undo(&mut arr));
+        assert_eq!(arr.clips[0].len(), clips - 1);
+    }
+
+    /// A restore whose selection no longer addresses anything drops it,
+    /// rather than handing the rest of the app an index into a lane or a
+    /// clip that the undo removed.
+    #[test]
+    fn a_restore_drops_a_selection_that_no_longer_exists() {
+        let mut arr = Arrangement::default();
+        let mut history = History::new(&arr);
+        let track = arr.add_track(TrackKind::Audio);
+        arr.create_clip(0, 0.0, 4.0).unwrap();
+        arr.selected = Some(track);
+        arr.selected_clip = Some((0, 0));
+        arr.cursor = Some((track, 4.0));
+        history.sync(&arr, true);
+
+        // Undo removes both the track and the clip the marks point at.
+        assert!(history.undo(&mut arr));
+        assert_eq!(arr.tracks.len(), TRACK_COUNT);
+        assert_eq!(arr.selected, None, "the selected lane is gone");
+        assert_eq!(arr.selected_clip, None, "the selected clip is gone");
+        assert_eq!(arr.cursor, None, "the cursor's lane is gone");
+    }
+
+    /// A restore cannot leave a gesture pointing at a model that no longer
+    /// exists: an in-flight ghost or open rename is dropped by the undo.
+    #[test]
+    fn a_restore_abandons_gestures_in_flight() {
+        let mut arr = Arrangement::default();
+        let mut history = History::new(&arr);
+        arr.create_clip(0, 0.0, 4.0).unwrap();
+        history.sync(&arr, true);
+        let clip = arr.clips[0][0].clone();
+        arr.ghost = Some(Ghost {
+            track: 0,
+            clip: clip.clone(),
+            grab: 0.0,
+            copy: false,
+        });
+        arr.rename = Some(Rename {
+            track: 0,
+            id: clip.id,
+            text: "half typed".into(),
+            original: clip.name.clone(),
+            focused: true,
+        });
+
+        assert!(history.undo(&mut arr));
+        assert!(arr.ghost.is_none(), "the ghost belonged to the old model");
+        assert!(arr.rename.is_none(), "so did the open rename");
     }
 
     /// `arrangement_keys` must get first refusal on the arrows. `Focus`
