@@ -10,7 +10,7 @@
 //! the keyboard.
 
 use crate::ui::action::UiAction;
-use crate::ui::vm::ViewState;
+use crate::ui::vm::{TrackKind, ViewState};
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers};
 
 #[derive(Debug, Clone, Copy)]
@@ -35,7 +35,22 @@ pub struct Keymap {
 
 impl Default for Keymap {
     fn default() -> Self {
+        // ORDER IS LOAD-BEARING for the two Ctrl+T bindings. egui's
+        // `consume_shortcut` matches modifiers LOGICALLY — an extra Shift
+        // is ignored — so a plain Ctrl+T pattern also matches Ctrl+Shift+T.
+        // The more specific gesture must therefore be listed (and consumed)
+        // first, or Ctrl+Shift+T would make an audio track.
         Self::new(vec![
+            Binding::new(
+                Modifiers::COMMAND.plus(Modifiers::SHIFT),
+                Key::T,
+                UiAction::AddTrack(TrackKind::Midi),
+            ),
+            Binding::new(
+                Modifiers::COMMAND,
+                Key::T,
+                UiAction::AddTrack(TrackKind::Audio),
+            ),
             Binding::new(Modifiers::NONE, Key::Space, UiAction::TogglePlay),
             Binding::new(Modifiers::NONE, Key::Home, UiAction::Return),
             Binding::new(Modifiers::COMMAND, Key::M, UiAction::ToggleMetronome),
@@ -116,6 +131,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The two track gestures share a key, and `consume_shortcut` ignores
+    /// an EXTRA Shift — so Ctrl+Shift+T also matches the plain Ctrl+T
+    /// pattern. The only thing that keeps them apart is list order: the
+    /// specific gesture must be offered (and consume the press) first.
+    ///
+    /// This pins that order. Swap the two bindings and Ctrl+Shift+T makes
+    /// an audio track, which is exactly the kind of bug nobody thinks to
+    /// look for in a table.
+    #[test]
+    fn shift_specific_track_gesture_wins() {
+        let map = Keymap::default();
+        let pos = |action: UiAction| {
+            map.bindings()
+                .iter()
+                .position(|b| b.action == action)
+                .expect("both track gestures are bound")
+        };
+        let midi = pos(UiAction::AddTrack(TrackKind::Midi));
+        let audio = pos(UiAction::AddTrack(TrackKind::Audio));
+        assert!(
+            midi < audio,
+            "Ctrl+Shift+T must be checked before Ctrl+T, or it never fires"
+        );
+        let shortcut = map
+            .shortcut_for(UiAction::AddTrack(TrackKind::Midi))
+            .unwrap();
+        assert_eq!(shortcut.logical_key, Key::T);
+        assert!(shortcut.modifiers.shift, "the MIDI gesture carries Shift");
+        assert!(
+            !map.shortcut_for(UiAction::AddTrack(TrackKind::Audio))
+                .unwrap()
+                .modifiers
+                .shift,
+            "the audio gesture does not"
+        );
     }
 
     #[test]

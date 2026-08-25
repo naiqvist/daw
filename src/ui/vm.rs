@@ -55,3 +55,48 @@ impl ViewState {
         }
     }
 }
+
+/// What a track carries.
+///
+/// The arrangement draws both lanes identically — what differs is what a
+/// clip on the lane MEANS: notes the built-in synth plays, or audio
+/// streamed from disk. It lives here, beside `ViewState`, because the
+/// action vocabulary must be able to name it and `action` may not import
+/// the app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum TrackKind {
+    /// Notes. A clip holds a pattern; the track's instrument plays it.
+    #[default]
+    Midi,
+    /// Recorded or imported audio. No instrument slot — the material IS
+    /// the sound.
+    Audio,
+}
+
+impl TrackKind {
+    pub const ALL: [Self; 2] = [Self::Midi, Self::Audio];
+
+    /// The badge a track header shows.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Midi => "midi",
+            Self::Audio => "audio",
+        }
+    }
+
+    /// The word a fresh track's name is built from: "Audio 3".
+    pub fn stem(self) -> &'static str {
+        match self {
+            Self::Midi => "MIDI",
+            Self::Audio => "Audio",
+        }
+    }
+
+    /// Can this track hold an instrument? An audio track's sound is its
+    /// material, so loading a synth onto one is meaningless rather than
+    /// merely unusual — the browser refuses instead of silently filling a
+    /// slot nothing reads.
+    pub fn takes_instrument(self) -> bool {
+        matches!(self, Self::Midi)
+    }
+}

@@ -27,12 +27,13 @@ use daw::audio::{Engine, EngineConfig, StreamHealth};
 use daw::install_fonts;
 use daw::ui::action::UiAction;
 use daw::ui::device;
+use daw::ui::kit;
 use daw::ui::palette::{Command as PaletteCommand, Palette};
 use daw::ui::prefs::{STORAGE_KEY, UiPrefs};
 use daw::ui::skin::Skin;
 use daw::ui::theme::Theme;
-use daw::ui::tokens::Density;
-use daw::ui::vm::limits;
+use daw::ui::tokens::{Density, radius, stroke};
+use daw::ui::vm::{TrackKind, limits};
 use eframe::egui;
 use std::time::Instant;
 
@@ -235,6 +236,33 @@ const TRACK_H_RANGE: std::ops::RangeInclusive<f32> = 28.0..=240.0;
 /// How many lanes a fresh session opens with. Lanes are furniture — the
 /// clips on them are the content, and a new session has none.
 const TRACK_COUNT: usize = 4;
+
+// --- the track header column ---
+/// Width of the header strip down the arrangement's left edge. Wide enough
+/// for a name, a mute and solo pair, and a pan knob without any of them
+/// touching.
+const HEADER_W: f32 = 150.0;
+const HEADER_PAD: f32 = 6.0;
+/// The name row's height, at the top of every header.
+const HEADER_NAME_H: f32 = 15.0;
+const HEADER_NAME_TYPE: f32 = 12.0;
+/// The kind badge ("midi" / "audio"), right-aligned beside the name.
+const HEADER_KIND_TYPE: f32 = 9.0;
+/// Side of the square M and S buttons.
+const HEADER_BTN: f32 = 15.0;
+const HEADER_BTN_TYPE: f32 = 10.0;
+/// Diameter of the header's pan knob — smaller than `control::KNOB`,
+/// because this one sits inside a lane rather than on a device card.
+const HEADER_KNOB: f32 = 20.0;
+/// Below this lane height the controls row is DROPPED, name only: half a
+/// button is worse than no button, and a squeezed lane is a lane the user
+/// is not currently working on.
+const HEADER_ROWS_MIN_H: f32 = 44.0;
+/// How far one keyboard pan step moves, in `-1..=1` units.
+const PAN_STEP: f32 = 0.1;
+/// Half-width of the pan knob's center detent: inside this, pan snaps to
+/// exactly 0.0, so "back to the middle" is reachable by hand.
+const PAN_DETENT: f32 = 0.04;
 
 // --- the keyboard cursor ---
 
@@ -543,6 +571,19 @@ fn arrangement_keys(ctx: &egui::Context, arr: &Arrangement, out: &mut Vec<UiActi
         }
         if i.consume_key(egui::Modifiers::COMMAND, egui::Key::D) {
             out.push(UiAction::DuplicateClip);
+        }
+        // SHIFT FIRST, for the same reason as the arrows above:
+        // `consume_key` ignores an extra Shift, so a plain Ctrl+T check
+        // placed first would swallow Ctrl+Shift+T and make the wrong kind
+        // of track. The keymap table carries the same pair in the same
+        // order, and `shift_specific_track_gesture_wins` pins it there.
+        if i.consume_key(
+            egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
+            egui::Key::T,
+        ) {
+            out.push(UiAction::AddTrack(TrackKind::Midi));
+        } else if i.consume_key(egui::Modifiers::COMMAND, egui::Key::T) {
+            out.push(UiAction::AddTrack(TrackKind::Audio));
         }
     });
 }
@@ -1433,6 +1474,46 @@ fn perform(actions: &[UiAction], transport: &mut Transport, arrangement: &mut Ar
             UiAction::DuplicateClip => {
                 arrangement.duplicate_selected();
             }
+
+            // --- tracks. Every one of these acts on the SELECTED track,
+            // so the palette, the keyboard and the header buttons all
+            // agree on which lane they mean.
+            UiAction::AddTrack(kind) => {
+                arrangement.add_track(*kind);
+            }
+            UiAction::RemoveTrack => {
+                if let Some(t) = arrangement.active_track() {
+                    arrangement.remove_track(t);
+                }
+            }
+            UiAction::ToggleTrackMute => {
+                if let Some(t) = arrangement.active_track()
+                    && let Some(track) = arrangement.tracks.get_mut(t)
+                {
+                    track.mute = !track.mute;
+                }
+            }
+            UiAction::ToggleTrackSolo => {
+                if let Some(t) = arrangement.active_track()
+                    && let Some(track) = arrangement.tracks.get_mut(t)
+                {
+                    track.solo = !track.solo;
+                }
+            }
+            UiAction::NudgeTrackPan(delta) => {
+                if let Some(t) = arrangement.active_track()
+                    && let Some(track) = arrangement.tracks.get_mut(t)
+                {
+                    track.pan = (track.pan + delta).clamp(-1.0, 1.0);
+                }
+            }
+            UiAction::CenterTrackPan => {
+                if let Some(t) = arrangement.active_track()
+                    && let Some(track) = arrangement.tracks.get_mut(t)
+                {
+                    track.pan = 0.0;
+                }
+            }
             // The rest of the vocabulary exists but nothing emits it yet.
             other => debug_assert!(false, "unhandled action: {other:?}"),
         }
@@ -1494,7 +1575,25 @@ impl DeviceKind {
 }
 
 struct Track {
+    /// What the lane carries. Fixed at creation: changing a track's kind
+    /// would change what every clip on it means, which is a conversion,
+    /// not a toggle.
+    kind: TrackKind,
+    /// What the header shows and what a mixer strip will show later. Not
+    /// unique — two tracks may share a name, exactly as two files in
+    /// different folders may.
+    name: String,
     height: f32,
+    /// Silenced. A muted track leaves the SCHEDULE rather than being
+    /// multiplied by zero: the graph should be as small as what is
+    /// actually sounding.
+    mute: bool,
+    /// Soloed. While any track is soloed, only soloed tracks are wired —
+    /// solo-in-place, the meaning every DAW agrees on.
+    solo: bool,
+    /// Constant-power pan, `-1..=1`. Center is 0.0, and it is exact: the
+    /// knob snaps there so "back to the middle" is reachable by hand.
+    pan: f32,
     /// The instrument loaded on this track, if any. `None` is a real
     /// state, not a placeholder: an empty track compiles to NO sequencer
     /// node and is silent. Loading a device from the browser is what
@@ -1508,10 +1607,27 @@ struct Track {
     reverb: device::ReverbUi,
 }
 
+impl Track {
+    /// A fresh track of `kind`, named. The one door new tracks walk
+    /// through, so the default session and Ctrl+T build the same thing.
+    fn new(kind: TrackKind, name: String) -> Self {
+        Self {
+            kind,
+            name,
+            ..Self::default()
+        }
+    }
+}
+
 impl Default for Track {
     fn default() -> Self {
         Self {
+            kind: TrackKind::default(),
+            name: String::new(),
             height: TRACK_H,
+            mute: false,
+            solo: false,
+            pan: 0.0,
             // A fresh track has no instrument. Its knob state is still
             // here, ready, so loading a device shows sane values rather
             // than zeros.
@@ -1580,6 +1696,17 @@ struct Rename {
     focused: bool,
 }
 
+/// An inline track rename in flight: which lane, and the text being
+/// edited. Separate from `Rename` (clips) because the two can never be
+/// open at once but their identities differ — a lane is an index, a clip
+/// is an id.
+struct TrackRename {
+    track: usize,
+    text: String,
+    original: String,
+    focused: bool,
+}
+
 /// The arrangement's state.
 struct Arrangement {
     tracks: Vec<Track>,
@@ -1627,6 +1754,12 @@ struct Arrangement {
     rename: Option<Rename>,
     /// Monotonic id source — ids are also what the default clip names show.
     next_clip_id: u64,
+    /// Monotonic per-KIND numbering for fresh track names, so deleting
+    /// "Audio 2" never makes the next new track "Audio 2" again. Indexed
+    /// by `TrackKind::ALL` order.
+    next_track_no: [u32; TrackKind::ALL.len()],
+    /// The header rename, while one is open.
+    track_rename: Option<TrackRename>,
 }
 
 /// A note, spelled out. Only the tests build notes by hand — the app builds
@@ -1644,7 +1777,12 @@ const fn note(pitch: u8, start: f64, len: f64, vel: u8) -> Note {
 impl Default for Arrangement {
     fn default() -> Self {
         Self {
-            tracks: (0..TRACK_COUNT).map(|_| Track::default()).collect(),
+            tracks: (0..TRACK_COUNT)
+                .map(|i| {
+                    let kind = TrackKind::Midi;
+                    Track::new(kind, format!("{} {}", kind.stem(), i + 1))
+                })
+                .collect(),
             grid: GRID_DEFAULT,
             selected: None,
             selection: None,
@@ -1662,6 +1800,9 @@ impl Default for Arrangement {
             rename: None,
             key: Key::default(),
             next_clip_id: 1,
+            // The default session's four lanes have already taken 1..=4.
+            next_track_no: [TRACK_COUNT as u32 + 1, 1],
+            track_rename: None,
         }
     }
 }
@@ -1669,6 +1810,63 @@ impl Default for Arrangement {
 impl Arrangement {
     fn grid_beats(&self) -> f32 {
         GRID_BEATS[self.grid.min(GRID_BEATS.len() - 1)]
+    }
+
+    /// Append a track of `kind`, named from that kind's own counter, and
+    /// select it. The one door: Ctrl+T, the palette and any future menu
+    /// all arrive here, so a new lane is always fully formed — a name, a
+    /// clip vec, and the selection moved onto it.
+    ///
+    /// Returns its index.
+    fn add_track(&mut self, kind: TrackKind) -> usize {
+        let slot = Self::kind_slot(kind);
+        let no = self.next_track_no[slot];
+        self.next_track_no[slot] = no.saturating_add(1);
+        self.tracks
+            .push(Track::new(kind, format!("{} {no}", kind.stem())));
+        self.clips.push(Vec::new());
+        let i = self.tracks.len() - 1;
+        // A new track is what you are about to work on. Selecting it also
+        // means the device rack and the palette's track verbs point at it
+        // without a second click.
+        self.selected = Some(i);
+        self.selected_clip = None;
+        self.cursor = Some((i, self.cursor.map(|c| c.1).unwrap_or(0.0)));
+        i
+    }
+
+    /// Drop a track and its clips. The LAST track is never removed — an
+    /// arrangement with no lanes has nothing to click, and "undo" does not
+    /// exist yet to get back out of it.
+    fn remove_track(&mut self, track: usize) -> bool {
+        if self.tracks.len() <= 1 || track >= self.tracks.len() {
+            return false;
+        }
+        self.tracks.remove(track);
+        self.clips.remove(track);
+        // Every index pointing PAST the hole shifts down; every index AT
+        // it is now pointing at a different track, so it is dropped.
+        let fix = |i: usize| match i.cmp(&track) {
+            std::cmp::Ordering::Less => Some(i),
+            std::cmp::Ordering::Equal => None,
+            std::cmp::Ordering::Greater => Some(i - 1),
+        };
+        self.selected = self.selected.and_then(fix);
+        self.selected_clip = self.selected_clip.and_then(|(t, c)| Some((fix(t)?, c)));
+        self.cursor = self.cursor.and_then(|(t, b)| Some((fix(t)?, b)));
+        self.track_rename = None;
+        if self.selection.is_some() && self.selected.is_none() {
+            self.selection = None;
+        }
+        true
+    }
+
+    /// Where a kind's name counter lives.
+    fn kind_slot(kind: TrackKind) -> usize {
+        match kind {
+            TrackKind::Midi => 0,
+            TrackKind::Audio => 1,
+        }
     }
 
     /// A fresh id — also what the default clip name shows.
@@ -1959,6 +2157,49 @@ fn place_clip(track: &[Clip], at: f32, len: f32) -> (f32, usize) {
 /// Pure, so lane stacking and the resize maths are checkable without a
 /// window. Lanes past the bottom of the view are still returned — the caller
 /// decides what to draw.
+/// Does this track reach the mixer?
+///
+/// Solo-in-place: while ANYTHING is soloed, only soloed tracks sound. Mute
+/// wins over solo, so muting a soloed track still silences it — which is
+/// what both buttons being lit has to mean.
+///
+/// The one answer, used twice: `build_graph_spec` decides what to wire from
+/// it, and the header dims the tracks it says are silent. A header that
+/// disagreed with the schedule would be the worst possible bug here.
+/// Everything about the tracks that changes the graph's SHAPE, hashed.
+///
+/// Loading or removing a device adds or drops a node; so does muting a
+/// track, soloing one (which drops every other), or a track's KIND, since
+/// an audio track compiles to no sequencer at all. None of that can be
+/// expressed as a parameter letter, so a change here must swap the schedule
+/// immediately rather than wait for the clip debounce.
+///
+/// A hash rather than the bitmask this used to be: there is no longer a
+/// fixed number of bits per track, and the mask silently stopped covering
+/// tracks past the 32nd.
+///
+/// PAN IS NOT IN HERE, deliberately: every instrument track always carries
+/// a Pan node, so pan rides a letter and a knob drag costs nothing.
+fn shape_hash(tracks: &[Track]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for t in tracks {
+        t.kind.hash(&mut hasher);
+        t.device.is_some().hash(&mut hasher);
+        t.fx.is_some().hash(&mut hasher);
+        t.mute.hash(&mut hasher);
+        t.solo.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn track_audible(tracks: &[Track], i: usize) -> bool {
+    let any_solo = tracks.iter().any(|t| t.solo);
+    tracks
+        .get(i)
+        .is_some_and(|t| !t.mute && (!any_solo || t.solo))
+}
+
 fn lane_rects(area: egui::Rect, tracks: &[Track]) -> Vec<egui::Rect> {
     let mut y = area.top();
     tracks
@@ -2018,6 +2259,419 @@ fn beat_grid(
     }
 }
 
+/// A small bipolar pan knob, drawn into `rect`.
+///
+/// Deliberately not `kit::knob`: this one lives inside a lane rather than
+/// on a device card, so it is sized here rather than by the theme's control
+/// scale, and it has a center DETENT — pan's most-wanted value is exactly
+/// 0.0, and a knob you cannot return to center by hand is a knob you end up
+/// fighting. Double-click centers it outright.
+///
+/// `pan` is `-1..=1`. Returns true when the user moved it.
+fn pan_knob(ui: &mut egui::Ui, theme: &Theme, rect: egui::Rect, pan: &mut f32) -> bool {
+    let id = ui
+        .id()
+        .with(("pan", rect.left_top().x as i32, rect.top() as i32));
+    let response = ui.interact(rect, id, egui::Sense::click_and_drag());
+    let mut changed = false;
+
+    if response.double_clicked() {
+        if *pan != 0.0 {
+            *pan = 0.0;
+            changed = true;
+        }
+    } else if response.dragged() {
+        // Full travel over four knob-heights, tenth-speed with Shift —
+        // the same feel as every other knob in the app.
+        let fine = ui.input(|i| i.modifiers.shift);
+        let travel = rect.height() * 4.0 * if fine { 10.0 } else { 1.0 };
+        let delta = -response.drag_delta().y / travel * 2.0;
+        if delta != 0.0 {
+            let next = (*pan + delta).clamp(-1.0, 1.0);
+            // The detent: crossing the middle STICKS there for a moment
+            // instead of sliding through it.
+            let next = if next.abs() < PAN_DETENT { 0.0 } else { next };
+            if next != *pan {
+                *pan = next;
+                changed = true;
+            }
+        }
+    }
+    if response.hovered() || response.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+    }
+
+    // --- paint ------------------------------------------------------------
+    const START: f32 = std::f32::consts::PI * 0.75;
+    const SWEEP: f32 = std::f32::consts::PI * 1.5;
+    let center = rect.center();
+    let radius = rect.width() * 0.5 - stroke::BOLD;
+    let painter = ui.painter();
+    painter.circle_filled(center, radius, theme.surface_sunken);
+    painter.circle_stroke(
+        center,
+        radius,
+        egui::Stroke::new(stroke::HAIR, theme.outline),
+    );
+
+    let arc = |from: f32, to: f32, s: egui::Stroke| {
+        const STEPS: usize = 16;
+        let points: Vec<egui::Pos2> = (0..=STEPS)
+            .map(|i| {
+                let a = from + (to - from) * i as f32 / STEPS as f32;
+                center + kit::knob_dir(a) * radius
+            })
+            .collect();
+        painter.add(egui::Shape::line(points, s));
+    };
+
+    arc(
+        START,
+        START + SWEEP,
+        egui::Stroke::new(stroke::HAIR, theme.divider),
+    );
+    let mid = START + SWEEP * 0.5;
+    let at = START + SWEEP * ((*pan + 1.0) * 0.5).clamp(0.0, 1.0);
+    if (at - mid).abs() > f32::EPSILON {
+        arc(mid, at, egui::Stroke::new(stroke::BOLD, theme.accent));
+    }
+    let dir = kit::knob_dir(at);
+    painter.line_segment(
+        [center + dir * (radius * 0.35), center + dir * radius],
+        egui::Stroke::new(stroke::BOLD, theme.text),
+    );
+    // The 12-o'clock tick: where center IS, so the detent is visible.
+    painter.line_segment(
+        [
+            egui::pos2(center.x, rect.top() - 1.0),
+            egui::pos2(center.x, rect.top() + 1.0),
+        ],
+        egui::Stroke::new(stroke::HAIR, theme.text_muted),
+    );
+
+    changed
+}
+
+/// How pan reads out: "C" at center, "L42" / "R42" either side. Percent,
+/// because degrees would imply a precision constant-power panning does not
+/// have.
+fn pan_label(pan: f32) -> String {
+    let amount = (pan.abs() * 100.0).round() as i32;
+    if amount == 0 {
+        "C".to_owned()
+    } else if pan < 0.0 {
+        format!("L{amount}")
+    } else {
+        format!("R{amount}")
+    }
+}
+
+/// One small square toggle — the M and S of a track header.
+///
+/// Returns true when clicked. `on_fill` is the colour it takes while
+/// engaged; off, it is a hairline outline and nothing else, so a header
+/// with nothing engaged is quiet.
+fn header_toggle(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    rect: egui::Rect,
+    id: egui::Id,
+    letter: &str,
+    on: bool,
+    on_fill: egui::Color32,
+) -> bool {
+    let response = ui.interact(rect, id, egui::Sense::click());
+    let painter = ui.painter();
+    let fill = if on {
+        on_fill
+    } else if response.hovered() {
+        theme.surface_raised
+    } else {
+        theme.surface_sunken
+    };
+    painter.rect_filled(rect, radius::CTRL, fill);
+    painter.rect_stroke(
+        rect,
+        radius::CTRL,
+        egui::Stroke::new(stroke::HAIR, theme.outline),
+        egui::StrokeKind::Inside,
+    );
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        letter,
+        egui::FontId::proportional(HEADER_BTN_TYPE),
+        // Engaged, the fill carries the meaning and the letter sits on it
+        // in the page colour; idle, the letter is the only thing there.
+        if on { theme.bg } else { theme.text_muted },
+    );
+    response.clicked()
+}
+
+/// The header column down the arrangement's left edge: one header per lane,
+/// each with a name, a kind badge, mute, solo, and pan.
+///
+/// Headers are MOUSE-driven by design. Registering them with `Focus` would
+/// put them in the arrow-key graph immediately left of the lane cells, which
+/// already claim Left and Right for the grid — the ring could get in but
+/// never out. The keyboard reaches all of this through the palette's track
+/// verbs instead, which is why those exist.
+///
+/// `lanes` carries the y geometry (and only that); the x range is the
+/// column's.
+fn track_headers(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    arr: &mut Arrangement,
+    column: egui::Rect,
+    lanes: &[egui::Rect],
+) {
+    ui.painter().rect_filled(column, 0.0, theme.surface_sunken);
+
+    // Intents, applied after the loop: the closure body borrows `arr`
+    // immutably to read each track, so it cannot also write to it.
+    let mut select: Option<usize> = None;
+    let mut mute: Option<usize> = None;
+    let mut solo: Option<usize> = None;
+    let mut rename_open: Option<usize> = None;
+    let mut pan_edit: Option<(usize, f32)> = None;
+    let renaming = arr.track_rename.as_ref().map(|r| r.track);
+
+    for (i, lane) in lanes.iter().enumerate() {
+        if lane.top() > column.bottom() {
+            break;
+        }
+        let Some(track) = arr.tracks.get(i) else {
+            break;
+        };
+        let head = egui::Rect::from_min_max(
+            egui::pos2(column.left(), lane.top()),
+            egui::pos2(column.right(), lane.bottom()),
+        )
+        .intersect(column);
+        if head.height() <= 0.0 {
+            continue;
+        }
+        let wid = ui.id().with(("header", i));
+        // What the schedule will actually wire. A track the solo rule has
+        // excluded reads as silent here rather than looking live.
+        let audible = track_audible(&arr.tracks, i);
+
+        if arr.selected == Some(i) {
+            ui.painter().rect_filled(head, 0.0, theme.surface);
+            // A selected lane gets a spine in the accent, so which track
+            // the palette's verbs will hit is readable at a glance.
+            ui.painter().rect_filled(
+                egui::Rect::from_min_max(
+                    head.left_top(),
+                    egui::pos2(head.left() + stroke::FOCUS, head.bottom()),
+                ),
+                0.0,
+                theme.accent,
+            );
+        }
+
+        // --- the name row -------------------------------------------------
+        let name_row = egui::Rect::from_min_max(
+            egui::pos2(head.left() + HEADER_PAD, head.top() + HEADER_PAD * 0.5),
+            egui::pos2(
+                head.right() - HEADER_PAD,
+                (head.top() + HEADER_PAD * 0.5 + HEADER_NAME_H).min(head.bottom()),
+            ),
+        );
+        if name_row.height() > 1.0 {
+            let badge = track.kind.label();
+            let badge_w = badge.len() as f32 * HEADER_KIND_TYPE * 0.62;
+            let text_row = egui::Rect::from_min_max(
+                name_row.min,
+                egui::pos2(name_row.right() - badge_w - HEADER_PAD, name_row.bottom()),
+            );
+
+            if renaming == Some(i) {
+                // The edit box replaces the label in place. Escape and
+                // Enter are handled by the caller of this frame's rename
+                // state, below.
+                if let Some(rename) = arr.track_rename.as_mut() {
+                    let mut child = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(text_row)
+                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    );
+                    let field = child.add(
+                        egui::TextEdit::singleline(&mut rename.text)
+                            .desired_width(text_row.width())
+                            .font(egui::FontId::proportional(HEADER_NAME_TYPE)),
+                    );
+                    if !rename.focused {
+                        field.request_focus();
+                        rename.focused = true;
+                    }
+                }
+            } else {
+                let response = ui.interact(text_row, wid.with("name"), egui::Sense::click());
+                if response.double_clicked() {
+                    rename_open = Some(i);
+                } else if response.clicked() {
+                    select = Some(i);
+                }
+                ui.painter().text(
+                    text_row.left_center(),
+                    egui::Align2::LEFT_CENTER,
+                    &track.name,
+                    egui::FontId::proportional(HEADER_NAME_TYPE),
+                    match (audible, arr.selected == Some(i)) {
+                        (false, _) => theme.divider,
+                        (true, true) => theme.text,
+                        (true, false) => theme.text_muted,
+                    },
+                );
+            }
+
+            ui.painter().text(
+                name_row.right_center(),
+                egui::Align2::RIGHT_CENTER,
+                badge,
+                egui::FontId::proportional(HEADER_KIND_TYPE),
+                theme.text_muted,
+            );
+        }
+
+        // --- mute, solo, pan ------------------------------------------------
+        // Dropped entirely on a squeezed lane: half a button is worse than
+        // no button, and a lane pulled down to a sliver is not the one
+        // being worked on.
+        if head.height() < HEADER_ROWS_MIN_H {
+            continue;
+        }
+        let row_y = name_row.bottom() + HEADER_PAD * 0.5;
+        let btn = |n: f32| {
+            egui::Rect::from_min_size(
+                egui::pos2(head.left() + HEADER_PAD + n * (HEADER_BTN + 3.0), row_y),
+                egui::vec2(HEADER_BTN, HEADER_BTN),
+            )
+        };
+        if header_toggle(
+            ui,
+            theme,
+            btn(0.0),
+            wid.with("mute"),
+            "M",
+            track.mute,
+            theme.warn,
+        ) {
+            mute = Some(i);
+        }
+        if header_toggle(
+            ui,
+            theme,
+            btn(1.0),
+            wid.with("solo"),
+            "S",
+            track.solo,
+            theme.accent,
+        ) {
+            solo = Some(i);
+        }
+
+        let knob_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                head.right() - HEADER_PAD - HEADER_KNOB,
+                row_y + (HEADER_BTN - HEADER_KNOB) * 0.5,
+            ),
+            egui::vec2(HEADER_KNOB, HEADER_KNOB),
+        );
+        let mut pan = track.pan;
+        if pan_knob(ui, theme, knob_rect, &mut pan) {
+            pan_edit = Some((i, pan));
+        }
+        ui.painter().text(
+            egui::pos2(knob_rect.left() - HEADER_PAD * 0.5, knob_rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            pan_label(pan),
+            egui::FontId::monospace(HEADER_KIND_TYPE),
+            theme.text_value,
+        );
+    }
+
+    // The column's right edge, so the headers read as their own strip
+    // rather than as the first bar of the grid.
+    ui.painter().line_segment(
+        [column.right_top(), column.right_bottom()],
+        egui::Stroke::new(stroke::HAIR, theme.divider),
+    );
+
+    if let Some(i) = select {
+        arr.selected = Some(i);
+        arr.selected_clip = None;
+    }
+    if let Some(i) = mute
+        && let Some(t) = arr.tracks.get_mut(i)
+    {
+        t.mute = !t.mute;
+    }
+    if let Some(i) = solo
+        && let Some(t) = arr.tracks.get_mut(i)
+    {
+        t.solo = !t.solo;
+    }
+    if let Some((i, pan)) = pan_edit
+        && let Some(t) = arr.tracks.get_mut(i)
+    {
+        t.pan = pan;
+    }
+    if let Some(i) = rename_open
+        && let Some(t) = arr.tracks.get(i)
+    {
+        arr.selected = Some(i);
+        arr.track_rename = Some(TrackRename {
+            track: i,
+            text: t.name.clone(),
+            original: t.name.clone(),
+            focused: false,
+        });
+    }
+}
+
+/// Resolve an open track rename: Enter commits, Escape restores what was
+/// there, and losing the keyboard commits too (clicking away is not a
+/// cancel anywhere else in the app either).
+///
+/// Pure over UI state and called before anything else reads the keyboard,
+/// so a name being typed can never also be a shortcut.
+fn track_rename_keys(ctx: &egui::Context, arr: &mut Arrangement) {
+    let Some(rename) = arr.track_rename.as_ref() else {
+        return;
+    };
+    if !rename.focused {
+        return;
+    }
+    let (commit, cancel) = ctx.input_mut(|i| {
+        (
+            i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
+        )
+    });
+    let still_editing = ctx.memory(|m| m.focused()).is_some();
+    if !(commit || cancel || !still_editing) {
+        return;
+    }
+    // Take it out first: every path below ends with the rename closed.
+    let Some(rename) = arr.track_rename.take() else {
+        return;
+    };
+    let Some(track) = arr.tracks.get_mut(rename.track) else {
+        return;
+    };
+    let text = rename.text.trim();
+    // An empty name is not a name. Cancelling and emptying both restore
+    // what was there, so a track always has something to call itself.
+    track.name = if cancel || text.is_empty() {
+        rename.original
+    } else {
+        text.to_owned()
+    };
+}
+
 /// The arrangement: a loop ruler, then lanes stacked in a beat grid.
 ///
 /// Selection is click-and-drag inside a lane; it snaps to the grid and stays
@@ -2045,19 +2699,35 @@ fn arrangement_body(
 
     // Wheel panning. Follow is turned off by the caller on the return value,
     // not here — the arrangement does not own transport state.
+    // The header column owns the left edge; everything time-shaped lives to
+    // the right of it. Splitting HERE, before anything reads a rect, is what
+    // keeps `beat_at` / `x_at` honest: they measure from `content.left()`,
+    // so the timeline's beat 0 is the column's right edge and not the
+    // window's.
+    let column_w = HEADER_W.min(area.width() * 0.5);
+    let timeline_left = area.left() + column_w;
+
     let scroll = ui.input(|i| i.smooth_scroll_delta);
     let pan = scroll.x + scroll.y;
     let mut panned = false;
-    if pan != 0.0 && ui.ui_contains_pointer() {
+    let pointer_on_timeline = ui
+        .ctx()
+        .pointer_latest_pos()
+        .is_some_and(|p| p.x >= timeline_left);
+    if pan != 0.0 && ui.ui_contains_pointer() && pointer_on_timeline {
         arr.view_beats = (arr.view_beats + pan / PX_PER_BEAT).max(0.0);
         panned = true;
     }
 
     let ruler = egui::Rect::from_min_max(
-        area.min,
+        egui::pos2(timeline_left, area.top()),
         egui::pos2(area.right(), area.top() + LOOP_RULER_H),
     );
-    let content = egui::Rect::from_min_max(egui::pos2(area.left(), ruler.bottom()), area.max);
+    let content = egui::Rect::from_min_max(egui::pos2(timeline_left, ruler.bottom()), area.max);
+    let column = egui::Rect::from_min_max(
+        egui::pos2(area.left(), ruler.bottom()),
+        egui::pos2(timeline_left, area.bottom()),
+    );
     let grid = arr.grid_beats();
 
     // Follow pages the view BEFORE anything reads the offset, so the
@@ -2242,6 +2912,10 @@ fn arrangement_body(
 
     loop_brace(ui, theme, focus, ruler, content, arr, grid);
     clips_pass(ui, theme, content, arr, grid);
+
+    // The headers last of the lane furniture, so their fills and controls
+    // sit above the grid lines that run under the column's edge.
+    track_headers(ui, theme, arr, column, &lanes);
 
     // --- the playhead, above everything it passes over ---------------------
     let x = x_at(content, offset, playhead);
@@ -3208,22 +3882,49 @@ fn seq_notes(clips: &[Clip]) -> Vec<SeqNote> {
 /// node that plays track 2. A track with no clips still gets a Seq: a Seq
 /// with no events is silent, and keeping the shape stable means a track's
 /// letters have somewhere to land the moment it gains a clip.
+/// The addressable nodes a graph build hands back, each vec indexed BY
+/// TRACK with `None` where that track has no such node.
+///
+/// This is what makes a knob turn a letter instead of a recompile: a param
+/// change has to know which node belongs to which lane, and every swap
+/// mints fresh ids, so the mapping is re-captured with the schedule rather
+/// than derived later.
+#[derive(Debug, Default)]
+struct GraphNodes {
+    seqs: Vec<Option<NodeId>>,
+    fx: Vec<Option<NodeId>>,
+    pans: Vec<Option<NodeId>>,
+}
+
 fn build_graph_spec(
     tracks: &[Track],
     clips: &[Vec<Clip>],
     loop_len_beats: Option<f64>,
     metronome: bool,
-) -> (GraphSpec, Vec<Option<NodeId>>, Vec<Option<NodeId>>) {
+) -> (GraphSpec, GraphNodes) {
     let mut spec = GraphSpec::default();
     let mixer = spec.push(NodeSpec::Mixer { gain: 1.0 });
     // Only tracks holding an instrument become sequencer nodes. An empty
     // track is silent by ABSENCE rather than by a muted node — the graph
     // stays as small as the session really is.
     let mut fx_ids: Vec<Option<NodeId>> = vec![None; tracks.len()];
+    let mut pan_ids: Vec<Option<NodeId>> = vec![None; tracks.len()];
     let mut seqs: Vec<Option<NodeId>> = Vec::with_capacity(tracks.len());
     for (i, track) in tracks.iter().enumerate() {
         seqs.push((|| {
             track.device?;
+            // An AUDIO track has no instrument slot to fill, so it makes no
+            // sequencer either: its material is the sound, and streaming it
+            // is the AudioClip work that has not landed yet. Wiring one now
+            // would be a lane that looks live and is not.
+            if !track.kind.takes_instrument() {
+                return None;
+            }
+            // Silence is ABSENCE here too — a muted or solo-excluded track
+            // is left out of the schedule rather than multiplied by zero.
+            if !track_audible(tracks, i) {
+                return None;
+            }
             let seq = spec.push(NodeSpec::Seq {
                 notes: clips.get(i).map(|c| seq_notes(c)).unwrap_or_default(),
                 subloops: Vec::new(),
@@ -3233,7 +3934,7 @@ fn build_graph_spec(
             // The effect sits BETWEEN the instrument and the mixer, so the
             // track's own signal is what gets processed — not the sum of
             // every track, which is what a reverb on the master would be.
-            match track.fx {
+            let tail = match track.fx {
                 Some(DeviceKind::Reverb) => {
                     let rev = spec.push(NodeSpec::Reverb {
                         size: track.reverb.size,
@@ -3241,11 +3942,20 @@ fn build_graph_spec(
                         mix: track.reverb.mix,
                     });
                     spec.connect(seq, rev);
-                    spec.connect(rev, mixer);
                     fx_ids[i] = Some(rev);
+                    rev
                 }
-                _ => spec.connect(seq, mixer),
-            }
+                _ => seq,
+            };
+            // Pan is ALWAYS a node, even at dead center, and that is
+            // deliberate: it gives every track's pan a permanent address,
+            // so turning the header knob is a param letter rather than a
+            // schedule swap. A centered constant-power pan is two
+            // multiplies; a swap per mouse-move is a recompile per frame.
+            let pan = spec.push(NodeSpec::Pan { pan: track.pan });
+            spec.connect(tail, pan);
+            spec.connect(pan, mixer);
+            pan_ids[i] = Some(pan);
             Some(seq)
         })());
     }
@@ -3254,7 +3964,14 @@ fn build_graph_spec(
         spec.connect(click, mixer);
     }
     spec.set_output(mixer);
-    (spec, seqs, fx_ids)
+    (
+        spec,
+        GraphNodes {
+            seqs,
+            fx: fx_ids,
+            pans: pan_ids,
+        },
+    )
 }
 
 /// Should the schedule be rebuilt this frame? Only when what the graph is
@@ -3308,6 +4025,14 @@ struct App {
     /// Each track's EFFECT node in the current schedule, by track index.
     /// Re-captured on every swap, exactly like `seq_ids`.
     fx_ids: Vec<Option<NodeId>>,
+    /// Each track's PAN node, by track index. Every instrument track has
+    /// one, so a header knob is always addressable without a recompile.
+    pan_ids: Vec<Option<NodeId>>,
+    /// The pan value last SENT to each track's node. Comparing against it
+    /// is what makes the knob, the palette's nudge verbs and a loaded
+    /// project all reconcile through one door — whoever moved pan, the
+    /// letter goes out once and only on a real change.
+    sent_pan: Vec<f32>,
     /// The clips the current schedule was compiled from — the dirty check —
     /// and when it was compiled — the debounce clock.
     compiled_clips: Vec<Vec<Clip>>,
@@ -3361,6 +4086,8 @@ impl App {
             hud: None,
             seq_ids: Vec::new(),
             fx_ids: Vec::new(),
+            pan_ids: Vec::new(),
+            sent_pan: Vec::new(),
             compiled_clips: Vec::new(),
             last_compile: None,
             graph_key: (false, None, 0, 0),
@@ -3412,6 +4139,19 @@ impl App {
             PaletteCommand::new("clip.duplicate", "clip", "duplicate clip").enabled(has_clip),
             PaletteCommand::new("clip.delete", "clip", "delete clip").enabled(has_clip),
             PaletteCommand::new("clip.loop", "clip", "loop the selection"),
+            // --- tracks ------------------------------------------------
+            PaletteCommand::new("track.new.audio", "track", "new audio track").hint("ctrl+T"),
+            PaletteCommand::new("track.new.midi", "track", "new MIDI track").hint("ctrl+shift+T"),
+            PaletteCommand::new("track.rename", "track", "rename track").enabled(has_track),
+            PaletteCommand::new("track.mute", "track", "mute / unmute track").enabled(has_track),
+            PaletteCommand::new("track.solo", "track", "solo / unsolo track").enabled(has_track),
+            // Pan has no gesture of its own: the header knob is the mouse
+            // route, and these three are the keyboard's.
+            PaletteCommand::new("track.pan.left", "track", "pan left").enabled(has_track),
+            PaletteCommand::new("track.pan.right", "track", "pan right").enabled(has_track),
+            PaletteCommand::new("track.pan.center", "track", "center pan").enabled(has_track),
+            PaletteCommand::new("track.delete", "track", "delete track")
+                .enabled(has_track && self.arrangement.tracks.len() > 1),
             // --- notes: write at the piano roll's cursor ---------------
             PaletteCommand::new("note.chord.major", "chord", "major triad at cursor").enabled(roll),
             PaletteCommand::new("note.chord.minor", "chord", "minor triad at cursor").enabled(roll),
@@ -3485,6 +4225,31 @@ impl App {
             "clip.duplicate" => actions.push(UiAction::DuplicateClip),
             "clip.delete" => actions.push(UiAction::DeleteSelected),
             "clip.loop" => actions.push(UiAction::LoopFromSelection),
+
+            "track.new.audio" => actions.push(UiAction::AddTrack(TrackKind::Audio)),
+            "track.new.midi" => actions.push(UiAction::AddTrack(TrackKind::Midi)),
+            "track.mute" => actions.push(UiAction::ToggleTrackMute),
+            "track.solo" => actions.push(UiAction::ToggleTrackSolo),
+            "track.pan.left" => actions.push(UiAction::NudgeTrackPan(-PAN_STEP)),
+            "track.pan.right" => actions.push(UiAction::NudgeTrackPan(PAN_STEP)),
+            "track.pan.center" => actions.push(UiAction::CenterTrackPan),
+            "track.delete" => actions.push(UiAction::RemoveTrack),
+            "track.rename" => {
+                // The palette opens the SAME inline editor a double-click
+                // on the header does — one rename path, not two.
+                if let Some(i) = self.arrangement.active_track()
+                    && let Some(t) = self.arrangement.tracks.get(i)
+                {
+                    let name = t.name.clone();
+                    self.arrangement.selected = Some(i);
+                    self.arrangement.track_rename = Some(TrackRename {
+                        track: i,
+                        text: name.clone(),
+                        original: name,
+                        focused: false,
+                    });
+                }
+            }
 
             // Note verbs all act on the selected clip through the roll's
             // cursor and selection. Each rewrites the note list once, so
@@ -3635,6 +4400,14 @@ impl App {
         // Each device fills its own slot: an effect never displaces the
         // instrument that feeds it.
         if item.load.is_instrument() {
+            // An audio track's sound IS its material — an instrument on
+            // one would fill a slot the graph never reads. Refuse in
+            // words rather than silently.
+            if !t.kind.takes_instrument() {
+                let name = t.name.clone();
+                self.notice = Some(format!("{name} is an audio track — no instrument slot"));
+                return;
+            }
             t.device = Some(item.load);
             // Fresh knobs for a fresh instrument, and the engine hears them
             // on the next swap — which the shape change forces immediately.
@@ -3647,22 +4420,8 @@ impl App {
         self.arrangement.selected = Some(track);
     }
 
-    /// Which tracks hold an instrument, as a bitmask. Part of the graph's
-    /// SHAPE: loading or removing a device adds or drops a sequencer node,
-    /// which no parameter letter can express, so it must swap the schedule
-    /// immediately rather than wait for the clip debounce.
-    fn device_mask(&self) -> u64 {
-        // Two bits per track: instrument and effect. Both add or drop a
-        // node, so both belong in the graph's shape.
-        self.arrangement
-            .tracks
-            .iter()
-            .take(u64::BITS as usize / 2)
-            .enumerate()
-            .fold(0u64, |m, (i, t)| {
-                let bits = u64::from(t.device.is_some()) | (u64::from(t.fx.is_some()) << 1);
-                m | (bits << (i * 2))
-            })
+    fn shape_hash(&self) -> u64 {
+        shape_hash(&self.arrangement.tracks)
     }
 
     fn start_engine(&mut self) {
@@ -3700,7 +4459,7 @@ impl App {
             return;
         };
         let loop_len = self.loop_len_beats();
-        let (spec, seqs, fx) = build_graph_spec(
+        let (spec, nodes) = build_graph_spec(
             &self.arrangement.tracks,
             &self.arrangement.clips,
             loop_len,
@@ -3713,14 +4472,19 @@ impl App {
                 };
                 match engine.set_schedule(Box::new(sched)) {
                     Ok(()) => {
-                        self.seq_ids = seqs;
-                        self.fx_ids = fx;
+                        self.seq_ids = nodes.seqs;
+                        self.fx_ids = nodes.fx;
+                        self.pan_ids = nodes.pans;
+                        // Fresh ids: every track's pan must be re-sent, so
+                        // nothing survives a swap sitting at the node's
+                        // compiled-in default while the knob says otherwise.
+                        self.sent_pan.clear();
                         self.compiled_clips = self.arrangement.clips.clone();
                         self.graph_key = (
                             self.transport.metronome,
                             loop_len,
                             self.arrangement.tracks.len(),
-                            self.device_mask(),
+                            self.shape_hash(),
                         );
                         self.last_compile = Some(Instant::now());
                     }
@@ -3825,6 +4589,8 @@ impl App {
             self.sent_loop = want;
         }
 
+        self.sync_pans();
+
         // Shape changes (metronome, loop length, track count) swap now: they
         // add or remove nodes, which no letter can express. Clip edits are
         // debounced so a drag lands as one swap, not sixty.
@@ -3832,7 +4598,7 @@ impl App {
             self.transport.metronome,
             self.loop_len_beats(),
             self.arrangement.tracks.len(),
-            self.device_mask(),
+            self.shape_hash(),
         );
         if shape != self.graph_key {
             self.push_graph();
@@ -3859,6 +4625,32 @@ impl App {
     /// Reverb knob edits: stored on the track and sent to that track's
     /// EFFECT node. The two cards number their parameters the same way, so
     /// this deliberately does not share a path with the synth's letters.
+    /// Send a pan letter for every track whose pan has moved since the
+    /// last one. `NodeSpec::Pan` param 0 is pan, `-1..=1`.
+    ///
+    /// A LETTER, not a recompile: the node already exists on every
+    /// instrument track, so dragging the header knob costs one 16-byte
+    /// message per changed frame instead of a schedule swap per frame.
+    fn sync_pans(&mut self) {
+        let n = self.arrangement.tracks.len();
+        // `f32::NAN != NAN`, so a freshly grown slot always sends once.
+        self.sent_pan.resize(n, f32::NAN);
+        for i in 0..n {
+            let pan = self.arrangement.tracks[i].pan;
+            if pan == self.sent_pan[i] {
+                continue;
+            }
+            let Some(Some(node)) = self.pan_ids.get(i).copied() else {
+                continue;
+            };
+            let Some(engine) = &mut self.engine else {
+                return;
+            };
+            engine.set_param(node, 0, pan);
+            self.sent_pan[i] = pan;
+        }
+    }
+
     fn apply_fx_edits(&mut self, track: usize, edits: &[device::ParamEdit]) {
         let Some(t) = self.arrangement.tracks.get_mut(track) else {
             return;
@@ -3991,6 +4783,11 @@ impl eframe::App for App {
         if !palette_open && !skin_open {
             arrangement_keys(ui.ctx(), &self.arrangement, &mut actions);
         }
+        // An open header rename owns the keyboard outright, and this must
+        // run BEFORE `Focus::begin` — that consumes Escape to hand focus
+        // back from any text field, which would turn a cancel into a
+        // commit.
+        track_rename_keys(ui.ctx(), &mut self.arrangement);
         self.focus.begin(ui.ctx());
         let t = &self.theme;
 
@@ -5607,8 +6404,8 @@ mod tests {
         // Lane 0 spans y 14..78 (ruler above). The clip spans x 0..96.
         // Like the browser-drag test: press in one pass, then move — one
         // pass registers the drag, the next reads it back.
-        let press = pos2(48.0, 40.0);
-        let release = pos2(48.0 + PX_PER_BEAT, 40.0);
+        let press = pos2(TL + 48.0, 40.0);
+        let release = pos2(TL + 48.0 + PX_PER_BEAT, 40.0);
         arrangement_pass(
             &ctx,
             &mut arr,
@@ -5654,8 +6451,8 @@ mod tests {
         arrangement_pass(&ctx, &mut arr, vec![]);
 
         // The brace spans x 96..192 at y 2..12 (the ruler strip).
-        let press = pos2(120.0, 7.0);
-        let release = pos2(120.0 + PX_PER_BEAT, 7.0);
+        let press = pos2(TL + 120.0, 7.0);
+        let release = pos2(TL + 120.0 + PX_PER_BEAT, 7.0);
         arrangement_pass(
             &ctx,
             &mut arr,
@@ -5693,6 +6490,12 @@ mod tests {
     /// A harness that renders ONLY the arrangement into a headless context —
     /// no top bar, no browser, so the central panel starts at the window's
     /// origin and the lane coordinates above stay true.
+    /// The timeline's left edge inside the test window. The track header
+    /// column owns everything to the left of it, so every simulated
+    /// pointer x below is measured FROM here — a bare `x` would land on a
+    /// mute button instead of a clip.
+    const TL: f32 = HEADER_W;
+
     fn arrangement_pass(ctx: &egui::Context, arr: &mut Arrangement, events: Vec<Event>) {
         let mut out = ctx.run_ui(input(events), |ui| {
             let theme = Theme::dark();
@@ -5823,7 +6626,7 @@ mod tests {
 
         // Lane 2 spans y 142..206. Click at beat 2, twice — one pass per
         // click, so egui sees two clicks in a row at one position.
-        let pos = pos2(2.0 * PX_PER_BEAT, 170.0);
+        let pos = pos2(TL + 2.0 * PX_PER_BEAT, 170.0);
         for _ in 0..2 {
             arrangement_pass(
                 &ctx,
@@ -5866,8 +6669,8 @@ mod tests {
         // Press on the first clip (x 0..96, lane 0 y 14..78) with the
         // command modifier held (egui learns modifiers from
         // ModifiersChanged events), then drag 10 beats right.
-        let press = pos2(48.0, 40.0);
-        let release = pos2(48.0 + 10.0 * PX_PER_BEAT, 40.0);
+        let press = pos2(TL + 48.0, 40.0);
+        let release = pos2(TL + 48.0 + 10.0 * PX_PER_BEAT, 40.0);
         arrangement_pass(
             &ctx,
             &mut arr,
@@ -6451,8 +7254,9 @@ mod tests {
         }
     }
 
-    /// The graph the app builds actually compiles: one Seq per track, all
-    /// into the mixer, plus a Click when the metronome is on.
+    /// The graph the app builds actually compiles: one Seq per track, each
+    /// through its own Pan into the mixer, plus a Click when the metronome
+    /// is on.
     #[test]
     fn the_app_graph_compiles_with_and_without_the_click() {
         let mut a = Arrangement::default();
@@ -6464,30 +7268,41 @@ mod tests {
         }
 
         for (metronome, extra) in [(false, 0), (true, 1)] {
-            let (spec, seqs, _fx) = build_graph_spec(&a.tracks, &a.clips, Some(8.0), metronome);
+            let (spec, nodes) = build_graph_spec(&a.tracks, &a.clips, Some(8.0), metronome);
             assert_eq!(
-                seqs.iter().filter(|s| s.is_some()).count(),
+                nodes.seqs.iter().filter(|s| s.is_some()).count(),
                 TRACK_COUNT,
                 "one Seq per track holding a device, empty of clips or not"
             );
             assert_eq!(
+                nodes.pans.iter().filter(|p| p.is_some()).count(),
+                TRACK_COUNT,
+                "every instrument track carries a Pan, so pan is a letter"
+            );
+            // Two wires per track — seq -> pan, pan -> mixer — plus the
+            // click's one.
+            assert_eq!(
                 spec.wires().len(),
-                TRACK_COUNT + extra,
-                "every track and the click sum at the mixer"
+                TRACK_COUNT * 2 + extra,
+                "every track reaches the mixer through its own pan"
             );
             let output = spec.output().unwrap();
             assert!(
-                !seqs.contains(&Some(output)),
+                !nodes.seqs.contains(&Some(output)),
                 "the mixer, not a seq, feeds the speakers"
             );
-            assert!(
-                spec.wires().iter().all(|(_, to)| *to == output),
-                "every wire lands on the mixer"
-            );
-            for seq in &seqs {
+            for (seq, pan) in nodes.seqs.iter().zip(&nodes.pans) {
                 assert!(
-                    spec.wires().iter().any(|(from, _)| Some(*from) == *seq),
-                    "every track's seq feeds the mixer"
+                    spec.wires()
+                        .iter()
+                        .any(|(f, t)| Some(*f) == *seq && Some(*t) == *pan),
+                    "every track's seq feeds its own pan"
+                );
+                assert!(
+                    spec.wires()
+                        .iter()
+                        .any(|(f, t)| Some(*f) == *pan && *t == output),
+                    "every track's pan feeds the mixer"
                 );
             }
             assert!(
@@ -6510,21 +7325,24 @@ mod tests {
 
         // A fresh session has no INSTRUMENTS either, so no track becomes a
         // node — the graph is empty and still compiles.
-        let (spec, seqs, _fx) = build_graph_spec(&a.tracks, &a.clips, None, false);
-        assert!(seqs.iter().all(|s| s.is_none()), "no device, no node");
+        let (spec, nodes) = build_graph_spec(&a.tracks, &a.clips, None, false);
+        assert!(nodes.seqs.iter().all(|s| s.is_none()), "no device, no node");
         assert!(spec.compile(48_000, 256).is_ok());
 
         // Load an instrument on every track and each becomes one.
         for t in a.tracks.iter_mut() {
             t.device = Some(DeviceKind::SineSynth);
         }
-        let (spec, seqs, _fx) = build_graph_spec(&a.tracks, &a.clips, None, false);
-        assert_eq!(seqs.iter().filter(|s| s.is_some()).count(), TRACK_COUNT);
+        let (spec, nodes) = build_graph_spec(&a.tracks, &a.clips, None, false);
+        assert_eq!(
+            nodes.seqs.iter().filter(|s| s.is_some()).count(),
+            TRACK_COUNT
+        );
         assert!(spec.compile(48_000, 256).is_ok());
 
         // And so is one with no tracks at all.
-        let (spec, seqs, _fx) = build_graph_spec(&[], &[], None, true);
-        assert!(seqs.is_empty());
+        let (spec, nodes) = build_graph_spec(&[], &[], None, true);
+        assert!(nodes.seqs.is_empty());
         assert!(spec.compile(48_000, 256).is_ok());
     }
 
@@ -6548,9 +7366,311 @@ mod tests {
 
         // Only that track compiles to a node, and it lands at its own index
         // so `seq_ids[track]` stays the right address.
-        let (_, seqs, _fx) = build_graph_spec(&a.tracks, &a.clips, None, false);
-        assert!(seqs[2].is_some());
-        assert!(seqs[0].is_none() && seqs[1].is_none() && seqs[3].is_none());
+        let (_, nodes) = build_graph_spec(&a.tracks, &a.clips, None, false);
+        assert!(nodes.seqs[2].is_some());
+        assert!(nodes.seqs[0].is_none() && nodes.seqs[1].is_none() && nodes.seqs[3].is_none());
+    }
+
+    // --- tracks -----------------------------------------------------------
+
+    /// A fresh track is fully formed: kind, a name from that kind's own
+    /// counter, its own clip vec, and the selection moved onto it. Every
+    /// route in (Ctrl+T, the palette) goes through `add_track`, so getting
+    /// this right once is getting it right everywhere.
+    #[test]
+    fn adding_a_track_names_it_and_selects_it() {
+        let mut a = Arrangement::default();
+        let before = a.tracks.len();
+
+        let i = a.add_track(TrackKind::Audio);
+        assert_eq!(i, before, "the new lane is appended, not inserted");
+        assert_eq!(a.tracks.len(), before + 1);
+        assert_eq!(a.clips.len(), a.tracks.len(), "clips stay parallel");
+        assert_eq!(a.tracks[i].kind, TrackKind::Audio);
+        assert_eq!(a.tracks[i].name, "Audio 1", "audio numbering starts fresh");
+        assert_eq!(a.selected, Some(i), "a new track is what you work on next");
+        assert_eq!(a.selected_clip, None);
+
+        // The two kinds count separately: the default session's four MIDI
+        // lanes have taken 1..=4, so the next MIDI track is 5.
+        let m = a.add_track(TrackKind::Midi);
+        assert_eq!(a.tracks[m].name, "MIDI 5");
+        assert_eq!(a.add_track(TrackKind::Audio), m + 1);
+        assert_eq!(a.tracks[m + 1].name, "Audio 2");
+    }
+
+    /// Names come from a MONOTONIC counter, not from the track count.
+    /// Deleting "Audio 1" and adding another must not produce a second
+    /// "Audio 1" — two lanes with one name is a UI that lies.
+    #[test]
+    fn track_names_never_repeat_after_a_delete() {
+        let mut a = Arrangement::default();
+        let first = a.add_track(TrackKind::Audio);
+        assert_eq!(a.tracks[first].name, "Audio 1");
+        assert!(a.remove_track(first));
+        let second = a.add_track(TrackKind::Audio);
+        assert_eq!(a.tracks[second].name, "Audio 2", "the counter moved on");
+    }
+
+    /// Removing a track takes its clips with it and REPAIRS every index
+    /// pointing into the list. An index left pointing past the hole is the
+    /// bug that silently edits the wrong lane.
+    #[test]
+    fn removing_a_track_repairs_the_indices() {
+        let mut a = Arrangement::default();
+        a.create_clip(2, 0.0, 4.0).unwrap();
+        a.create_clip(3, 0.0, 4.0).unwrap();
+        a.selected_clip = Some((3, 0));
+        a.selected = Some(3);
+        a.cursor = Some((3, 8.0));
+
+        assert!(a.remove_track(1), "a middle track goes");
+        assert_eq!(a.tracks.len(), TRACK_COUNT - 1);
+        assert_eq!(a.clips.len(), a.tracks.len());
+        // Everything that pointed at 3 now points at 2, and the clip it
+        // named came with it.
+        assert_eq!(a.selected, Some(2));
+        assert_eq!(a.selected_clip, Some((2, 0)));
+        assert_eq!(a.cursor, Some((2, 8.0)));
+        assert_eq!(a.clips[2].len(), 1, "the clip followed its lane");
+
+        // Removing the SELECTED track drops the selection rather than
+        // silently moving it to whatever slid into the slot.
+        a.selected = Some(2);
+        a.selected_clip = Some((2, 0));
+        assert!(a.remove_track(2));
+        assert_eq!(a.selected, None);
+        assert_eq!(a.selected_clip, None);
+    }
+
+    /// The last lane is never removed: an arrangement with no tracks has
+    /// nothing to click, and there is no undo to get back out of it.
+    #[test]
+    fn the_last_track_stays() {
+        let mut a = Arrangement::default();
+        while a.tracks.len() > 1 {
+            assert!(a.remove_track(0));
+        }
+        assert!(!a.remove_track(0), "the last one is refused");
+        assert_eq!(a.tracks.len(), 1);
+    }
+
+    /// Solo-in-place, and mute beating solo. One rule, `track_audible`,
+    /// which both the schedule and the header dimming read — a header that
+    /// disagreed with what is wired would be the worst bug available here.
+    #[test]
+    fn mute_and_solo_decide_what_reaches_the_mixer() {
+        let mut a = Arrangement::default();
+        // Nothing engaged: everything sounds.
+        assert!((0..a.tracks.len()).all(|i| track_audible(&a.tracks, i)));
+
+        a.tracks[1].mute = true;
+        assert!(!track_audible(&a.tracks, 1));
+        assert!(track_audible(&a.tracks, 0), "muting one is not muting all");
+
+        // Solo anywhere silences every track that is not soloed.
+        a.tracks[2].solo = true;
+        assert!(track_audible(&a.tracks, 2));
+        assert!(!track_audible(&a.tracks, 0), "solo-in-place");
+        assert!(!track_audible(&a.tracks, 3));
+
+        // Mute wins over solo — both lit means silent, which is what the
+        // two buttons showing at once has to mean.
+        a.tracks[2].mute = true;
+        assert!(!track_audible(&a.tracks, 2));
+    }
+
+    /// A muted track leaves the SCHEDULE. Silence by absence, not by a
+    /// node multiplying by zero — the graph should be as small as what is
+    /// actually sounding.
+    #[test]
+    fn a_muted_track_is_not_compiled() {
+        let mut a = Arrangement::default();
+        for t in a.tracks.iter_mut() {
+            t.device = Some(DeviceKind::SineSynth);
+        }
+        let (_, all) = build_graph_spec(&a.tracks, &a.clips, None, false);
+        assert_eq!(all.seqs.iter().filter(|s| s.is_some()).count(), TRACK_COUNT);
+
+        a.tracks[1].mute = true;
+        let (_, muted) = build_graph_spec(&a.tracks, &a.clips, None, false);
+        assert!(muted.seqs[1].is_none(), "a muted track makes no node");
+        assert!(muted.pans[1].is_none(), "and no pan either");
+        assert_eq!(muted.seqs.iter().filter(|s| s.is_some()).count(), 3);
+
+        // Solo drops everything else the same way.
+        a.tracks[1].mute = false;
+        a.tracks[0].solo = true;
+        let (_, soloed) = build_graph_spec(&a.tracks, &a.clips, None, false);
+        assert!(soloed.seqs[0].is_some());
+        assert_eq!(soloed.seqs.iter().filter(|s| s.is_some()).count(), 1);
+    }
+
+    /// An audio track compiles to nothing: it has no instrument slot, and
+    /// its material is the sound. A lane that looked live and was silent
+    /// would be worse than one that plainly holds nothing yet.
+    #[test]
+    fn an_audio_track_makes_no_sequencer() {
+        let mut a = Arrangement::default();
+        let i = a.add_track(TrackKind::Audio);
+        // Even with a device somehow set on it, the kind decides.
+        a.tracks[i].device = Some(DeviceKind::SineSynth);
+        let (_, nodes) = build_graph_spec(&a.tracks, &a.clips, None, false);
+        assert!(nodes.seqs[i].is_none(), "no instrument on an audio track");
+        assert!(!TrackKind::Audio.takes_instrument());
+        assert!(TrackKind::Midi.takes_instrument());
+    }
+
+    /// Mute, solo and kind are graph SHAPE — they add or drop nodes, so
+    /// they must force an immediate swap. Pan is NOT: every instrument
+    /// track always carries a Pan node, so pan rides a letter and a knob
+    /// drag costs nothing.
+    #[test]
+    fn shape_hash_covers_mute_and_solo_but_not_pan() {
+        let mut a = Arrangement::default();
+        let base = shape_hash(&a.tracks);
+
+        a.tracks[0].pan = -0.8;
+        assert_eq!(
+            shape_hash(&a.tracks),
+            base,
+            "pan is a letter, never a recompile"
+        );
+
+        a.tracks[0].mute = true;
+        let muted = shape_hash(&a.tracks);
+        assert_ne!(muted, base, "mute drops a node");
+
+        a.tracks[0].mute = false;
+        a.tracks[0].solo = true;
+        assert_ne!(shape_hash(&a.tracks), base, "solo drops every other node");
+
+        a.tracks[0].solo = false;
+        assert_eq!(shape_hash(&a.tracks), base, "and back again");
+
+        let mut b = Arrangement::default();
+        b.add_track(TrackKind::Audio);
+        let mut c = Arrangement::default();
+        c.add_track(TrackKind::Midi);
+        assert_ne!(
+            shape_hash(&b.tracks),
+            shape_hash(&c.tracks),
+            "kind decides whether a sequencer exists, so it is shape"
+        );
+    }
+
+    /// The track verbs all act on the SELECTED track, so the palette, the
+    /// keyboard and the header buttons can never disagree about which lane
+    /// they mean.
+    #[test]
+    fn the_track_verbs_act_on_the_selected_track() {
+        let mut t = Transport::default();
+        let mut a = Arrangement {
+            selected: Some(2),
+            ..Default::default()
+        };
+
+        perform(&[UiAction::ToggleTrackMute], &mut t, &mut a);
+        assert!(a.tracks[2].mute);
+        assert!(!a.tracks[0].mute, "only the selected lane");
+        perform(&[UiAction::ToggleTrackMute], &mut t, &mut a);
+        assert!(!a.tracks[2].mute, "the same verb turns it back off");
+
+        perform(&[UiAction::ToggleTrackSolo], &mut t, &mut a);
+        assert!(a.tracks[2].solo);
+
+        perform(&[UiAction::NudgeTrackPan(-PAN_STEP)], &mut t, &mut a);
+        assert!(
+            (a.tracks[2].pan + PAN_STEP).abs() < 1e-6,
+            "left is negative"
+        );
+        perform(&[UiAction::CenterTrackPan], &mut t, &mut a);
+        assert_eq!(a.tracks[2].pan, 0.0, "center is EXACTLY zero");
+
+        // Pan clamps rather than running off the end.
+        for _ in 0..40 {
+            perform(&[UiAction::NudgeTrackPan(PAN_STEP)], &mut t, &mut a);
+        }
+        assert_eq!(a.tracks[2].pan, 1.0);
+    }
+
+    /// `AddTrack` through the action vocabulary builds the same thing
+    /// `add_track` does, and the two gestures pick different kinds.
+    #[test]
+    fn the_add_track_action_picks_the_kind() {
+        let mut t = Transport::default();
+        let mut a = Arrangement::default();
+        perform(&[UiAction::AddTrack(TrackKind::Audio)], &mut t, &mut a);
+        assert_eq!(a.tracks.last().map(|t| t.kind), Some(TrackKind::Audio));
+        perform(&[UiAction::AddTrack(TrackKind::Midi)], &mut t, &mut a);
+        assert_eq!(a.tracks.last().map(|t| t.kind), Some(TrackKind::Midi));
+        assert_eq!(a.tracks.len(), TRACK_COUNT + 2);
+        assert_eq!(a.selected, Some(TRACK_COUNT + 1), "the newest is selected");
+    }
+
+    /// Pan reads out in words the ear agrees with: C in the middle, L and
+    /// R either side, as a percentage.
+    #[test]
+    fn pan_reads_out_as_left_center_right() {
+        assert_eq!(pan_label(0.0), "C");
+        assert_eq!(pan_label(-1.0), "L100");
+        assert_eq!(pan_label(1.0), "R100");
+        assert_eq!(pan_label(-0.42), "L42");
+        assert_eq!(pan_label(0.42), "R42");
+        // Rounding must not produce "L0" — that is C, said badly.
+        assert_eq!(pan_label(-0.001), "C");
+    }
+
+    /// A header rename commits on Enter, restores on Escape, and refuses
+    /// to leave a track nameless.
+    #[test]
+    fn renaming_a_track_commits_or_restores() {
+        let commit = |text: &str, cancel: bool| {
+            let mut a = Arrangement::default();
+            let original = a.tracks[0].name.clone();
+            a.track_rename = Some(TrackRename {
+                track: 0,
+                text: text.to_owned(),
+                original: original.clone(),
+                focused: true,
+            });
+            let ctx = egui::Context::default();
+            let key = if cancel {
+                egui::Key::Escape
+            } else {
+                egui::Key::Enter
+            };
+            let mut out = ctx.run_ui(
+                input(vec![Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Default::default(),
+                }]),
+                |ui| {
+                    track_rename_keys(ui.ctx(), &mut a);
+                },
+            );
+            out.textures_delta.clear();
+            (a.tracks[0].name.clone(), a.track_rename.is_none(), original)
+        };
+
+        let (name, closed, _) = commit("Drums", false);
+        assert_eq!(name, "Drums", "Enter commits");
+        assert!(closed, "and closes the editor");
+
+        let (name, closed, original) = commit("Drums", true);
+        assert_eq!(name, original, "Escape restores");
+        assert!(closed);
+
+        // Whitespace is trimmed, and an empty name is not a name.
+        assert_eq!(commit("  Bass  ", false).0, "Bass");
+        let (name, _, original) = commit("   ", false);
+        assert_eq!(
+            name, original,
+            "a track always has something to call itself"
+        );
     }
 
     /// An effect sits between its track's instrument and the mixer — not
@@ -6562,25 +7682,29 @@ mod tests {
         a.tracks[1].device = Some(DeviceKind::SineSynth);
         a.tracks[1].fx = Some(DeviceKind::Reverb);
 
-        let (spec, seqs, fx) = build_graph_spec(&a.tracks, &a.clips, None, false);
+        let (spec, nodes) = build_graph_spec(&a.tracks, &a.clips, None, false);
         let out = spec.output().unwrap();
 
         // Only the track that loaded one has an effect node.
-        assert!(fx[0].is_none(), "track 0 loaded no effect");
-        let rev = fx[1].expect("track 1 loaded a reverb");
-        assert!(fx[2].is_none() && fx[3].is_none());
+        assert!(nodes.fx[0].is_none(), "track 0 loaded no effect");
+        let rev = nodes.fx[1].expect("track 1 loaded a reverb");
+        assert!(nodes.fx[2].is_none() && nodes.fx[3].is_none());
 
-        // Track 0: instrument straight to the mixer.
-        let seq0 = seqs[0].unwrap();
+        // Track 0: instrument -> pan -> mixer, no effect in between.
+        let seq0 = nodes.seqs[0].unwrap();
+        let pan0 = nodes.pans[0].unwrap();
         assert!(
-            spec.wires().iter().any(|(f, t)| *f == seq0 && *t == out),
-            "a track with no effect feeds the mixer directly"
+            spec.wires().iter().any(|(f, t)| *f == seq0 && *t == pan0),
+            "a track with no effect feeds its pan directly"
         );
-        // Track 1: instrument -> reverb -> mixer, and NOT instrument ->
-        // mixer, or the dry signal would bypass the effect.
-        let seq1 = seqs[1].unwrap();
+        assert!(spec.wires().iter().any(|(f, t)| *f == pan0 && *t == out));
+        // Track 1: instrument -> reverb -> pan -> mixer, and NOT
+        // instrument -> pan, or the dry signal would bypass the effect.
+        let seq1 = nodes.seqs[1].unwrap();
+        let pan1 = nodes.pans[1].unwrap();
         assert!(spec.wires().iter().any(|(f, t)| *f == seq1 && *t == rev));
-        assert!(spec.wires().iter().any(|(f, t)| *f == rev && *t == out));
+        assert!(spec.wires().iter().any(|(f, t)| *f == rev && *t == pan1));
+        assert!(spec.wires().iter().any(|(f, t)| *f == pan1 && *t == out));
         assert!(
             !spec.wires().iter().any(|(f, t)| *f == seq1 && *t == out),
             "the instrument must not also bypass its own effect"
@@ -6602,22 +7726,12 @@ mod tests {
         assert_eq!(a.tracks[0].device, Some(DeviceKind::SineSynth));
         assert_eq!(a.tracks[0].fx, Some(DeviceKind::Reverb));
 
-        // The shape mask distinguishes "instrument only" from "both", so
+        // The shape hash distinguishes "instrument only" from "both", so
         // loading an effect forces a schedule swap rather than being
         // mistaken for no change at all.
-        let mask = |a: &Arrangement| {
-            a.tracks
-                .iter()
-                .take(32)
-                .enumerate()
-                .fold(0u64, |m, (i, t)| {
-                    let bits = u64::from(t.device.is_some()) | (u64::from(t.fx.is_some()) << 1);
-                    m | (bits << (i * 2))
-                })
-        };
-        let both = mask(&a);
+        let both = shape_hash(&a.tracks);
         a.tracks[0].fx = None;
-        let instrument_only = mask(&a);
+        let instrument_only = shape_hash(&a.tracks);
         assert_ne!(both, instrument_only, "an effect changes the graph's shape");
     }
 
@@ -6675,19 +7789,20 @@ mod tests {
             track.params.gain = 0.1 * (i + 1) as f32;
             track.device = Some(DeviceKind::SineSynth);
         }
-        let (spec, seqs, _fx) = build_graph_spec(&a.tracks, &a.clips, None, false);
+        let (spec, nodes) = build_graph_spec(&a.tracks, &a.clips, None, false);
 
         // The ids are distinct and ordered by track, which is what makes
         // `seq_ids[track]` the right address.
-        assert_eq!(seqs.len(), TRACK_COUNT);
-        for (i, id) in seqs.iter().enumerate() {
-            for (j, other) in seqs.iter().enumerate() {
+        assert_eq!(nodes.seqs.len(), TRACK_COUNT);
+        for (i, id) in nodes.seqs.iter().enumerate() {
+            for (j, other) in nodes.seqs.iter().enumerate() {
                 assert!(i == j || id != other, "two tracks share a Seq id");
             }
         }
 
         // Each Seq carries its own track's params.
-        let gains: Vec<f32> = seqs
+        let gains: Vec<f32> = nodes
+            .seqs
             .iter()
             .map(|id| {
                 spec.iter_ordered()

@@ -10,6 +10,7 @@
 //! menu build itself from the panel registry.
 
 use crate::ui::tokens::Density;
+use crate::ui::vm::TrackKind;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum UiAction {
@@ -60,6 +61,23 @@ pub enum UiAction {
     PasteClip,
     DuplicateClip,
 
+    // --- tracks ---
+    /// Append a track of this kind and select it. Ctrl+T / Ctrl+Shift+T.
+    AddTrack(TrackKind),
+    /// Drop the selected track, its clips with it. The last track is never
+    /// removed: an arrangement with no lanes has nothing to click.
+    RemoveTrack,
+    /// Mute or solo the selected track. Both are graph SHAPE — a muted
+    /// track leaves the schedule — so they are actions, not knob turns.
+    ToggleTrackMute,
+    ToggleTrackSolo,
+    /// Step the selected track's pan by this much, in `-1..=1` units.
+    /// Negative is left. The header knob writes pan directly; this is how
+    /// the keyboard reaches it.
+    NudgeTrackPan(f32),
+    /// Return the selected track's pan to center.
+    CenterTrackPan,
+
     // --- view: the app's own furniture, no engine involved ---
     /// Show/hide a registered panel, by its `Panel::id()`.
     TogglePanel(&'static str),
@@ -93,6 +111,15 @@ impl UiAction {
             Self::CopyClip => "Copy clip",
             Self::PasteClip => "Paste clip",
             Self::DuplicateClip => "Duplicate clip",
+            Self::AddTrack(kind) => match kind {
+                TrackKind::Midi => "New MIDI track",
+                TrackKind::Audio => "New audio track",
+            },
+            Self::RemoveTrack => "Delete track",
+            Self::ToggleTrackMute => "Mute track",
+            Self::ToggleTrackSolo => "Solo track",
+            Self::NudgeTrackPan(_) => "Pan track",
+            Self::CenterTrackPan => "Center pan",
             Self::TogglePanel(id) => id,
             Self::FocusPanel(id) => id,
             Self::SetDensity(_) => "Density",
@@ -125,6 +152,12 @@ impl UiAction {
             | Self::CopyClip
             | Self::PasteClip
             | Self::DuplicateClip
+            | Self::AddTrack(_)
+            | Self::RemoveTrack
+            | Self::ToggleTrackMute
+            | Self::ToggleTrackSolo
+            | Self::NudgeTrackPan(_)
+            | Self::CenterTrackPan
             | Self::TogglePanel(_)
             | Self::FocusPanel(_)
             | Self::SetDensity(_) => false,
