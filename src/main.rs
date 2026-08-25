@@ -25,6 +25,9 @@ use daw::audio::graph::{GraphSpec, NodeId, NodeSpec, Note as SeqNote, SynthParam
 use daw::audio::transport::TransportCmd;
 use daw::audio::{Engine, EngineConfig, StreamHealth};
 use daw::install_fonts;
+use daw::library::{
+    self, ImportedWav, LibraryConfig, LibraryService, LibrarySnapshot, WavImportService,
+};
 use daw::ui::action::UiAction;
 use daw::ui::device;
 use daw::ui::kit;
@@ -35,9 +38,13 @@ use daw::ui::theme::Theme;
 use daw::ui::tokens::{Density, radius, stroke};
 use daw::ui::vm::{TrackKind, limits};
 use eframe::egui;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 mod piano_roll;
+mod waveform;
 
 /// UI zoom.
 ///
@@ -202,10 +209,16 @@ const GRID_LABEL_TYPE: f32 = 11.0;
 const GRID_LABEL_PAD: f32 = 8.0;
 /// Horizontal zoom.
 const PX_PER_BEAT: f32 = 24.0;
+const ARRANGEMENT_ZOOM_MIN: f32 = 4.0;
+const ARRANGEMENT_ZOOM_MAX: f32 = 1_024.0;
 /// Below this spacing subdivision lines stop being a grid and start being a
 /// smear, so they are dropped and only beats and bars are drawn.
 const GRID_MIN_PX: f32 = 5.0;
 
+/// The minimap: a strip above the loop ruler showing the whole arrangement
+/// at a glance — every clip a minified bar, the current view a draggable
+/// window.
+const MINIMAP_H: f32 = 40.0;
 /// The loop ruler: a strip above the lanes where the loop brace lives. The
 /// handles need somewhere to be grabbed that is not inside a track.
 const LOOP_RULER_H: f32 = 14.0;
@@ -509,8 +522,9 @@ impl Focus {
 }
 
 /// The arrangement's shortcuts. Ctrl+1 narrows the grid, Ctrl+2 widens it,
-/// Ctrl+L loops the selection — Ableton's bindings and Ableton's directions,
-/// so the muscle memory transfers.
+/// Ctrl+L loops the selection, Z frames selected audio and X restores the
+/// previous view — Ableton's bindings and Ableton's directions, so the muscle
+/// memory transfers.
 ///
 /// Stands down while a text field has the keyboard, for the same reason the
 /// arrows do: typing in the search box should not reshape the arrangement.
@@ -571,6 +585,12 @@ fn arrangement_keys(ctx: &egui::Context, arr: &Arrangement, out: &mut Vec<UiActi
         }
         if i.consume_key(egui::Modifiers::COMMAND, egui::Key::D) {
             out.push(UiAction::DuplicateClip);
+        }
+        if i.consume_key(egui::Modifiers::NONE, egui::Key::Z) {
+            out.push(UiAction::ZoomSelectedAudioClip);
+        }
+        if i.consume_key(egui::Modifiers::NONE, egui::Key::X) {
+            out.push(UiAction::ZoomBack);
         }
         // SHIFT FIRST, for the same reason as the arrows above:
         // `consume_key` ignores an extra Shift, so a plain Ctrl+T check
@@ -1474,6 +1494,16 @@ fn perform(actions: &[UiAction], transport: &mut Transport, arrangement: &mut Ar
             UiAction::DuplicateClip => {
                 arrangement.duplicate_selected();
             }
+            UiAction::ZoomSelectedAudioClip => {
+                if arrangement.zoom_selected_audio_clip() {
+                    // Follow would immediately page away from a clip that
+                    // does not contain the playhead, undoing the user's Z.
+                    transport.follow = false;
+                }
+            }
+            UiAction::ZoomBack => {
+                arrangement.zoom_back();
+            }
 
             // --- tracks. Every one of these acts on the SELECTED track,
             // so the palette, the keyboard and the header buttons all
@@ -1557,8 +1587,14 @@ impl Key {
     }
 }
 
-/// An instrument a track can hold. One variant today; the enum exists so
-/// adding the second is a match arm rather than a refactor.
+/// A device a track can hold: `SineSynth` makes sound, `Reverb` shapes it.
+///
+/// Temporary `dead_code` allow: the browser's built-in Sine Synth and Reverb
+/// rows were the only things that constructed these outside tests, and they
+/// were mockups. The rack, `load_device` and the graph builder all still work
+/// on them — nothing in the running app can reach a device until the library
+/// browser offers one. The allow goes away with the row that refills it.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeviceKind {
     SineSynth,
@@ -1656,6 +1692,19 @@ struct Note {
     vel: u8,
 }
 
+/// Green-zone metadata for an audio clip's source region. The path and
+/// musical placement persist; disk streams are created only while compiling
+/// a schedule and never enter the arrangement model.
+#[derive(Debug, Clone, PartialEq)]
+struct AudioSource {
+    path: std::path::PathBuf,
+    sample_rate: u32,
+    source_offset: u64,
+    source_frames: u64,
+    gain: f32,
+    looped: bool,
+}
+
 /// One clip on a lane. Positions are absolute beats.
 ///
 /// `id` is what selection tracks: indices shift whenever a clip moves past
@@ -1673,17 +1722,56 @@ struct Clip {
     start: f32,
     len: f32,
     notes: Vec<Note>,
+    /// Present only on audio tracks. MIDI clips carry notes instead.
+    audio: Option<AudioSource>,
 }
 
-/// A Ctrl+drag in flight: the copy rides the pointer as a translucent ghost
-/// and lands where it is released. The original never moves.
+/// A clip drag in flight: a translucent ghost rides the pointer — snapped
+/// to the grid, across any lane whose kind can hold the clip — and lands
+/// where it is released. A plain drag MOVES the original there; Ctrl+drag
+/// leaves the original and lands a copy.
 struct Ghost {
     track: usize,
     clip: Clip,
-    /// The original's start at press — the drag is measured from here, so
-    /// the ghost's position is absolute, not incremental.
-    start0: f32,
+    /// Beats between the grab point and the clip's start at press. The
+    /// ghost is placed absolutely from the pointer every frame, keeping its
+    /// grip point under the finger — per-frame deltas would snap to nothing
+    /// on a slow drag and the clip would stick.
+    grab: f32,
+    /// Ctrl held at press: the original stays and the landing is a copy
+    /// with an id of its own.
+    copy: bool,
 }
+
+/// An audio-file drag in flight over the window — an OS file hover or a
+/// browser sample row being pulled. The arrangement previews it as a ghost
+/// clip snapped to the grid and writes back where a release would land;
+/// the drop itself routes through the normal import pipeline.
+struct DragImport {
+    path: std::path::PathBuf,
+    name: String,
+    /// (sample rate, frames) read from the WAV header on hover, so the
+    /// ghost shows the file's true musical length before any import runs.
+    /// None when the header could not be read.
+    header: Option<(u32, u64)>,
+    /// Whether this is a file `place_sample` will accept. A drag is
+    /// previewed either way — an honest "this will not land" beats nothing.
+    accepted: bool,
+    /// Where the ghost sat last frame — the landing site of a release.
+    /// None while the pointer is off the timeline lanes.
+    spot: Option<DropSpot>,
+}
+
+/// A drop landing site: which lane, and the snapped beat aimed at.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DropSpot {
+    /// None means "below the last lane": the drop creates its own track.
+    track: Option<usize>,
+    beat: f32,
+}
+
+/// The egui drag-and-drop payload of a browser sample row.
+struct SampleDrag(std::path::PathBuf);
 
 /// An inline rename in flight: which clip, and the text being edited.
 /// `original` is what Escape restores.
@@ -1736,6 +1824,13 @@ struct Arrangement {
     /// scroll position, in absolute beats. Only ever advanced by panning and
     /// by follow chasing the playhead; never negative.
     view_beats: f32,
+    /// Horizontal timeline scale. Kept as view state: clip placement remains
+    /// absolute musical time regardless of how closely it is inspected.
+    pixels_per_beat: f32,
+    /// View saved by Z and consumed by X: (left beat, pixels per beat).
+    zoom_restore: Option<(f32, f32)>,
+    /// Last rendered timeline width, used to fit a selected clip exactly.
+    viewport_width: f32,
     /// The working key: what the piano roll shades against and what the
     /// diatonic verbs build from.
     key: Key,
@@ -1791,6 +1886,9 @@ impl Default for Arrangement {
             anchor: 0.0,
             owns_arrows: false,
             view_beats: 0.0,
+            pixels_per_beat: PX_PER_BEAT,
+            zoom_restore: None,
+            viewport_width: 0.0,
             // A fresh session is empty: lanes are structural furniture, the
             // clips on them are the user's.
             clips: (0..TRACK_COUNT).map(|_| Vec::new()).collect(),
@@ -1890,6 +1988,9 @@ impl Arrangement {
 
     /// Double-click on an empty lane: a one-bar clip at the click.
     fn create_clip(&mut self, track: usize, at: f32, len: f32) -> Option<usize> {
+        if !self.tracks.get(track)?.kind.takes_instrument() {
+            return None;
+        }
         let id = self.next_id();
         let name = format!("clip {id}");
         self.insert_clip(
@@ -1900,6 +2001,44 @@ impl Arrangement {
                 start: at,
                 len,
                 notes: vec![],
+                audio: None,
+            },
+            at,
+        )
+    }
+
+    /// Insert a WAV source on an audio track. Length is the file's native
+    /// duration expressed in musical time at the placement tempo; playback
+    /// itself remains one source frame per device frame.
+    fn insert_audio(
+        &mut self,
+        track: usize,
+        at: f32,
+        name: String,
+        source: AudioSource,
+        bpm: f64,
+    ) -> Option<usize> {
+        if self.tracks.get(track)?.kind != TrackKind::Audio
+            || source.sample_rate == 0
+            || source.source_frames == 0
+        {
+            return None;
+        }
+        let seconds = source.source_frames as f64 / f64::from(source.sample_rate);
+        let len = (seconds * bpm / 60.0) as f32;
+        if !len.is_finite() || len <= 0.0 {
+            return None;
+        }
+        let id = self.next_id();
+        self.insert_clip(
+            track,
+            Clip {
+                id,
+                name,
+                start: at,
+                len,
+                notes: Vec::new(),
+                audio: Some(source),
             },
             at,
         )
@@ -1964,13 +2103,78 @@ impl Arrangement {
     /// into the arrangement, never into a copy.
     fn active_clip(&mut self) -> Option<&mut Clip> {
         let (t, i) = self.selected_clip?;
+        if self.tracks.get(t)?.kind != TrackKind::Midi {
+            return None;
+        }
         self.clips.get_mut(t)?.get_mut(i)
     }
 
     /// Its id, for the roll's clip-change reset.
     fn active_clip_id(&self) -> Option<u64> {
         let (t, i) = self.selected_clip?;
+        if self.tracks.get(t)?.kind != TrackKind::Midi {
+            return None;
+        }
         self.clips.get(t)?.get(i).map(|c| c.id)
+    }
+
+    /// The selected audio clip, if the active lane is actually an audio
+    /// lane. The waveform editor borrows this in place; it owns only view
+    /// state and peak analysis, never a second copy of clip metadata.
+    fn active_audio_clip(&self) -> Option<&Clip> {
+        let (track, clip) = self.selected_clip?;
+        if self.tracks.get(track)?.kind != TrackKind::Audio {
+            return None;
+        }
+        self.clips
+            .get(track)?
+            .get(clip)
+            .filter(|clip| clip.audio.is_some())
+    }
+
+    fn active_audio_clip_id(&self) -> Option<u64> {
+        self.active_audio_clip().map(|clip| clip.id)
+    }
+
+    fn active_track_kind(&self) -> Option<TrackKind> {
+        self.tracks
+            .get(self.active_track()?)
+            .map(|track| track.kind)
+    }
+
+    fn zoom_selected_audio_clip(&mut self) -> bool {
+        let Some((track, clip)) = self.selected_clip else {
+            return false;
+        };
+        if self.tracks.get(track).map(|track| track.kind) != Some(TrackKind::Audio) {
+            return false;
+        }
+        let Some(clip) = self.clips.get(track).and_then(|clips| clips.get(clip)) else {
+            return false;
+        };
+        if clip.audio.is_none() || clip.len <= 0.0 || self.viewport_width <= 0.0 {
+            return false;
+        }
+        let margin = (clip.len * 0.05).max(0.25);
+        let span = clip.len + margin * 2.0;
+        let scale = (self.viewport_width / span).clamp(ARRANGEMENT_ZOOM_MIN, ARRANGEMENT_ZOOM_MAX);
+        // Repeated Z keeps the original view as X's destination instead of
+        // replacing it with the already-zoomed view.
+        if self.zoom_restore.is_none() {
+            self.zoom_restore = Some((self.view_beats, self.pixels_per_beat));
+        }
+        self.view_beats = (clip.start - margin).max(0.0);
+        self.pixels_per_beat = scale;
+        true
+    }
+
+    fn zoom_back(&mut self) -> bool {
+        let Some((view_beats, pixels_per_beat)) = self.zoom_restore.take() else {
+            return false;
+        };
+        self.view_beats = view_beats;
+        self.pixels_per_beat = pixels_per_beat;
+        true
     }
 
     /// The beat a paste lands on: the cell cursor, else the selection's
@@ -1991,12 +2195,12 @@ impl Arrangement {
 /// `offset` is the beat shown at the area's left edge — where the view has
 /// been panned to. Beats are absolute musical time; the offset is only
 /// where the window sits. Both functions are inverses at any offset.
-fn beat_at(area: egui::Rect, offset: f32, x: f32) -> f32 {
-    (offset + (x - area.left()) / PX_PER_BEAT).max(0.0)
+fn beat_at(area: egui::Rect, offset: f32, pixels_per_beat: f32, x: f32) -> f32 {
+    (offset + (x - area.left()) / pixels_per_beat.max(ARRANGEMENT_ZOOM_MIN)).max(0.0)
 }
 
-fn x_at(area: egui::Rect, offset: f32, beat: f32) -> f32 {
-    area.left() + (beat - offset) * PX_PER_BEAT
+fn x_at(area: egui::Rect, offset: f32, pixels_per_beat: f32, beat: f32) -> f32 {
+    area.left() + (beat - offset) * pixels_per_beat
 }
 
 fn snap(beat: f32, grid: f32) -> f32 {
@@ -2025,13 +2229,17 @@ fn span(a: f32, b: f32, grid: f32) -> (f32, f32) {
 fn cell_rect(
     content: egui::Rect,
     offset: f32,
+    pixels_per_beat: f32,
     lane: egui::Rect,
     beat: f32,
     grid: f32,
 ) -> egui::Rect {
     egui::Rect::from_min_max(
-        egui::pos2(x_at(content, offset, beat), lane.top()),
-        egui::pos2(x_at(content, offset, beat + grid), lane.bottom()),
+        egui::pos2(x_at(content, offset, pixels_per_beat, beat), lane.top()),
+        egui::pos2(
+            x_at(content, offset, pixels_per_beat, beat + grid),
+            lane.bottom(),
+        ),
     )
 }
 
@@ -2061,10 +2269,22 @@ fn step_grid(grid: usize, finer: bool) -> usize {
 // --- clips: geometry and overlap clamps, all pure -------------------------
 
 /// A clip's rect in its lane. The caller clips it to the visible area.
-fn clip_rect(content: egui::Rect, offset: f32, lane: egui::Rect, clip: &Clip) -> egui::Rect {
+fn clip_rect(
+    content: egui::Rect,
+    offset: f32,
+    pixels_per_beat: f32,
+    lane: egui::Rect,
+    clip: &Clip,
+) -> egui::Rect {
     egui::Rect::from_min_max(
-        egui::pos2(x_at(content, offset, clip.start), lane.top()),
-        egui::pos2(x_at(content, offset, clip.start + clip.len), lane.bottom()),
+        egui::pos2(
+            x_at(content, offset, pixels_per_beat, clip.start),
+            lane.top(),
+        ),
+        egui::pos2(
+            x_at(content, offset, pixels_per_beat, clip.start + clip.len),
+            lane.bottom(),
+        ),
     )
 }
 
@@ -2124,8 +2344,32 @@ fn clamp_clip_len(clips: &[Clip], idx: usize, want: f32, grid: f32) -> f32 {
     want.clamp(grid, hi)
 }
 
+/// Apply a non-destructive left trim. Moving the arrangement edge right
+/// advances the source region by the same real-time duration; moving it back
+/// reveals frames up to file frame zero. The source END stays invariant, so
+/// a later expansion can restore audio that an earlier trim hid.
+fn trim_clip_left(clip: &mut Clip, start: f32, bpm: f64) {
+    let old_start = clip.start;
+    let end = clip.start + clip.len;
+    clip.start = start;
+    clip.len = end - start;
+    if let Some(audio) = &mut clip.audio {
+        let delta_beats = f64::from(start - old_start);
+        let delta_frames =
+            (delta_beats * 60.0 / bpm.max(1.0) * f64::from(audio.sample_rate)).round() as i128;
+        let source_end = audio.source_offset.saturating_add(audio.source_frames);
+        let offset = (i128::from(audio.source_offset) + delta_frames)
+            .clamp(0, i128::from(source_end)) as u64;
+        audio.source_offset = offset;
+        audio.source_frames = source_end - offset;
+    }
+}
+
 /// Keep a track's clips sorted by start after an edit. Order is what the
-/// clamp functions assume — this is the function that restores it.
+/// clamp functions assume — this is the function that restores it. Every
+/// live edit now lands through `place_clip`, which inserts in order; the
+/// tests keep exercising the invariant directly.
+#[cfg_attr(not(test), allow(dead_code))]
 fn resort(track: &mut [Clip]) {
     track.sort_by(|a, b| a.start.total_cmp(&b.start));
 }
@@ -2200,6 +2444,17 @@ fn track_audible(tracks: &[Track], i: usize) -> bool {
         .is_some_and(|t| !t.mute && (!any_solo || t.solo))
 }
 
+/// Whether a lane's kind can hold a clip: audio clips ride audio tracks,
+/// note clips ride instrument tracks. What a cross-lane drag checks before
+/// letting the ghost change lanes.
+fn lane_accepts(track: &Track, clip: &Clip) -> bool {
+    if clip.audio.is_some() {
+        track.kind == TrackKind::Audio
+    } else {
+        track.kind.takes_instrument()
+    }
+}
+
 fn lane_rects(area: egui::Rect, tracks: &[Track]) -> Vec<egui::Rect> {
     let mut y = area.top();
     tracks
@@ -2230,7 +2485,7 @@ fn beat_grid(
 ) {
     let painter = ui.painter();
     let sub = arr.grid_beats();
-    let sub_px = sub * PX_PER_BEAT;
+    let sub_px = sub * arr.pixels_per_beat;
     let step = if sub_px < GRID_MIN_PX { 1.0 } else { sub };
     let per_bar = beats_per_bar.max(1) as f32;
 
@@ -2238,7 +2493,7 @@ fn beat_grid(
     // absolute beat/bar boundaries no matter where the view is panned.
     let mut beat = (arr.view_beats / step).floor() * step;
     loop {
-        let x = x_at(area, arr.view_beats, beat);
+        let x = x_at(area, arr.view_beats, arr.pixels_per_beat, beat);
         if x > area.right() {
             break;
         }
@@ -2685,15 +2940,29 @@ fn track_rename_keys(ctx: &egui::Context, arr: &mut Arrangement) {
 ///
 /// `playhead` is the transport position in beats; it is drawn above the
 /// clips, and `follow` pages the view to keep it on screen.
+#[derive(Clone, Copy)]
+struct ArrangementTransportView {
+    beats_per_bar: u32,
+    bpm: f64,
+    playhead: f32,
+    follow: bool,
+}
+
 fn arrangement_body(
     ui: &mut egui::Ui,
     focus: &mut Focus,
     theme: &Theme,
     arr: &mut Arrangement,
-    beats_per_bar: u32,
-    playhead: f32,
-    follow: bool,
+    transport: ArrangementTransportView,
+    waveform_cache: &HashMap<PathBuf, Arc<waveform::Peaks>>,
+    drag: Option<&mut DragImport>,
 ) -> bool {
+    let ArrangementTransportView {
+        beats_per_bar,
+        bpm,
+        playhead,
+        follow,
+    } = transport;
     let area = ui.max_rect();
     claim(ui);
 
@@ -2715,15 +2984,42 @@ fn arrangement_body(
         .pointer_latest_pos()
         .is_some_and(|p| p.x >= timeline_left);
     if pan != 0.0 && ui.ui_contains_pointer() && pointer_on_timeline {
-        arr.view_beats = (arr.view_beats + pan / PX_PER_BEAT).max(0.0);
+        arr.view_beats = (arr.view_beats + pan / arr.pixels_per_beat).max(0.0);
         panned = true;
     }
 
-    let ruler = egui::Rect::from_min_max(
+    // Ctrl+scroll (and pinch) zooms, anchored under the pointer: the beat
+    // being pointed at stays put while the scale changes around it. egui
+    // folds ctrl+scroll into `zoom_delta` and out of the scroll delta, so
+    // a zoom is never also a pan.
+    let zoom = ui.input(|i| i.zoom_delta());
+    if zoom != 1.0
+        && ui.ui_contains_pointer()
+        && pointer_on_timeline
+        && let Some(pos) = ui.ctx().pointer_latest_pos()
+    {
+        let old = arr.pixels_per_beat;
+        let new = (old * zoom).clamp(ARRANGEMENT_ZOOM_MIN, ARRANGEMENT_ZOOM_MAX);
+        if new != old {
+            let anchor = arr.view_beats + (pos.x - timeline_left) / old;
+            arr.pixels_per_beat = new;
+            arr.view_beats = (anchor - (pos.x - timeline_left) / new).max(0.0);
+            // Zooming is the user taking the wheel the same way panning is;
+            // follow would page the anchored view right back out.
+            panned = true;
+        }
+    }
+
+    let minimap = egui::Rect::from_min_max(
         egui::pos2(timeline_left, area.top()),
-        egui::pos2(area.right(), area.top() + LOOP_RULER_H),
+        egui::pos2(area.right(), area.top() + MINIMAP_H),
+    );
+    let ruler = egui::Rect::from_min_max(
+        egui::pos2(timeline_left, minimap.bottom()),
+        egui::pos2(area.right(), minimap.bottom() + LOOP_RULER_H),
     );
     let content = egui::Rect::from_min_max(egui::pos2(timeline_left, ruler.bottom()), area.max);
+    arr.viewport_width = content.width();
     let column = egui::Rect::from_min_max(
         egui::pos2(area.left(), ruler.bottom()),
         egui::pos2(timeline_left, area.bottom()),
@@ -2735,9 +3031,15 @@ fn arrangement_body(
     arr.view_beats = follow_view(
         arr.view_beats,
         playhead,
-        content.width() / PX_PER_BEAT,
+        content.width() / arr.pixels_per_beat,
         follow,
     );
+
+    // The minimap runs BEFORE `offset` is read: a jump or scrub there must
+    // move the content this same frame, not one frame late.
+    if minimap_pass(ui, theme, minimap, arr, content.width(), playhead) {
+        panned = true;
+    }
     let offset = arr.view_beats;
 
     beat_grid(ui, content, theme, arr, beats_per_bar);
@@ -2753,8 +3055,14 @@ fn arrangement_body(
     // --- the loop region, under everything it covers ----------------------
     if let Some((from, to)) = arr.loop_range {
         let band = egui::Rect::from_min_max(
-            egui::pos2(x_at(content, offset, from), content.top()),
-            egui::pos2(x_at(content, offset, to), content.bottom()),
+            egui::pos2(
+                x_at(content, offset, arr.pixels_per_beat, from),
+                content.top(),
+            ),
+            egui::pos2(
+                x_at(content, offset, arr.pixels_per_beat, to),
+                content.bottom(),
+            ),
         );
         ui.painter()
             .rect_filled(band.intersect(content), 0.0, theme.loop_region);
@@ -2781,7 +3089,14 @@ fn arrangement_body(
         // The focusable rect is the CELL, not the lane. Cells in different
         // lanes share an x, so Up and Down keep your place in time while the
         // generic spatial navigation does the work.
-        let cell = cell_rect(content, offset, visible, cursor_beat, grid);
+        let cell = cell_rect(
+            content,
+            offset,
+            arr.pixels_per_beat,
+            visible,
+            cursor_beat,
+            grid,
+        );
         let wid = ui.id().with(("lane", i));
         if focus.register(wid, cell.intersect(visible)) {
             focused_lane = Some(i);
@@ -2804,7 +3119,7 @@ fn arrangement_body(
         let anchor_id = wid.with("anchor");
         let picked = ui.interact(body, wid.with("body"), egui::Sense::click_and_drag());
         if let Some(pos) = picked.interact_pointer_pos() {
-            let here = snap(beat_at(content, offset, pos.x), grid);
+            let here = snap(beat_at(content, offset, arr.pixels_per_beat, pos.x), grid);
             if picked.drag_started() || picked.clicked() {
                 ui.ctx().data_mut(|d| d.insert_temp(anchor_id, here));
                 select = Some((i, here, here));
@@ -2819,11 +3134,14 @@ fn arrangement_body(
         if picked.double_clicked()
             && let Some(pos) = picked.interact_pointer_pos()
         {
-            create_req = Some((i, snap(beat_at(content, offset, pos.x), grid)));
+            create_req = Some((
+                i,
+                snap(beat_at(content, offset, arr.pixels_per_beat, pos.x), grid),
+            ));
         }
         let menu_beat = picked
             .interact_pointer_pos()
-            .map(|p| snap(beat_at(content, offset, p.x), grid))
+            .map(|p| snap(beat_at(content, offset, arr.pixels_per_beat, p.x), grid))
             .unwrap_or(cursor_beat);
         picked.context_menu(|ui| {
             if ui.button("New clip").clicked() {
@@ -2837,8 +3155,14 @@ fn arrangement_body(
             && let Some((from, to)) = arr.selection
         {
             let band = egui::Rect::from_min_max(
-                egui::pos2(x_at(content, offset, from), visible.top()),
-                egui::pos2(x_at(content, offset, to), visible.bottom()),
+                egui::pos2(
+                    x_at(content, offset, arr.pixels_per_beat, from),
+                    visible.top(),
+                ),
+                egui::pos2(
+                    x_at(content, offset, arr.pixels_per_beat, to),
+                    visible.bottom(),
+                ),
             );
             ui.painter()
                 .rect_filled(band.intersect(visible), 0.0, theme.selection);
@@ -2911,14 +3235,31 @@ fn arrangement_body(
     }
 
     loop_brace(ui, theme, focus, ruler, content, arr, grid);
-    clips_pass(ui, theme, content, arr, grid);
+    clips_pass(ui, theme, content, arr, grid, bpm, waveform_cache);
+
+    // The drop ghost, above the clips it would join and under the playhead.
+    // The spot it lands on rides back out on the drag, where the app reads
+    // it when the file is released.
+    if let Some(drag) = drag {
+        drag.spot = drop_preview(
+            ui,
+            theme,
+            content,
+            arr,
+            grid,
+            beats_per_bar,
+            bpm,
+            waveform_cache,
+            drag,
+        );
+    }
 
     // The headers last of the lane furniture, so their fills and controls
     // sit above the grid lines that run under the column's edge.
     track_headers(ui, theme, arr, column, &lanes);
 
     // --- the playhead, above everything it passes over ---------------------
-    let x = x_at(content, offset, playhead);
+    let x = x_at(content, offset, arr.pixels_per_beat, playhead);
     if x >= content.left() && x <= content.right() {
         let painter = ui.painter();
         painter.line_segment(
@@ -2941,6 +3282,307 @@ fn arrangement_body(
     }
 
     panned
+}
+
+/// The minimap: the whole arrangement mapped into one strip, every clip a
+/// minified bar on its lane's row, the loop region and playhead behind and
+/// through them, and the current view as a window on top.
+///
+/// A press inside the window grabs it and drags it — absolute from the
+/// pointer, keeping the grip point, like every other drag here. A press
+/// outside centres the window on the pointer and scrubs from there.
+/// Returns true when the user moved the view; the caller treats that like
+/// a pan and releases playhead follow.
+fn minimap_pass(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    strip: egui::Rect,
+    arr: &mut Arrangement,
+    content_width: f32,
+    playhead: f32,
+) -> bool {
+    if strip.width() <= 0.0 || strip.height() <= 0.0 {
+        return false;
+    }
+    // The window the timeline currently shows, in beats.
+    let viewport = content_width / arr.pixels_per_beat;
+    // The mapped span: everything that exists plus headroom, and never less
+    // than the current window — the window must always fit inside the map.
+    let clips_end = arr
+        .clips
+        .iter()
+        .flatten()
+        .map(|clip| clip.start + clip.len)
+        .fold(0.0f32, f32::max);
+    let loop_end = arr.loop_range.map_or(0.0, |(_, to)| to);
+    let span = (clips_end.max(loop_end).max(playhead) * 1.05)
+        .max(arr.view_beats + viewport)
+        .max(viewport);
+    let scale = strip.width() / span;
+
+    // Interact before painting, so the drawn window is where this frame's
+    // grab put it.
+    let id = ui.id().with("minimap");
+    let resp = ui.interact(strip, id, egui::Sense::click_and_drag());
+    if resp.hovered() && !resp.is_pointer_button_down_on() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+    }
+    let mut moved = false;
+    if resp.is_pointer_button_down_on()
+        && let Some(pos) = resp.interact_pointer_pos()
+    {
+        let beat = (pos.x - strip.left()) / scale;
+        if ui.input(|i| i.pointer.primary_pressed()) {
+            // Where in the window the press landed — the grip the whole
+            // drag keeps. A press outside grips the window's centre, which
+            // is what centres it on the pointer.
+            let inside = (arr.view_beats..arr.view_beats + viewport).contains(&beat);
+            let grab = if inside {
+                beat - arr.view_beats
+            } else {
+                viewport * 0.5
+            };
+            ui.data_mut(|d| d.insert_temp(id, grab));
+        }
+        let grab = ui.data(|d| d.get_temp::<f32>(id)).unwrap_or(viewport * 0.5);
+        let view = (beat - grab).clamp(0.0, (span - viewport).max(0.0));
+        if view != arr.view_beats {
+            arr.view_beats = view;
+            moved = true;
+        }
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+    }
+
+    // --- paint -------------------------------------------------------------
+    let painter = ui.painter();
+    painter.rect_filled(strip, 0.0, theme.surface_sunken);
+    if let Some((from, to)) = arr.loop_range {
+        let band = egui::Rect::from_min_max(
+            egui::pos2(strip.left() + from * scale, strip.top()),
+            egui::pos2(strip.left() + to * scale, strip.bottom()),
+        );
+        painter.rect_filled(band.intersect(strip), 0.0, theme.loop_region);
+    }
+    let row_h = strip.height() / arr.tracks.len().max(1) as f32;
+    let inset = (row_h * 0.2).clamp(0.5, 2.0);
+    for (t, track) in arr.clips.iter().enumerate() {
+        let top = strip.top() + t as f32 * row_h;
+        for (i, clip) in track.iter().enumerate() {
+            let x0 = strip.left() + clip.start * scale;
+            // A short clip keeps one visible pixel: an empty row would read
+            // as an empty lane.
+            let x1 = (x0 + clip.len * scale).max(x0 + 1.0);
+            let bar = egui::Rect::from_min_max(
+                egui::pos2(x0, top + inset),
+                egui::pos2(x1, top + row_h - inset),
+            );
+            let color = if arr.selected_clip == Some((t, i)) {
+                theme.clip_selected
+            } else {
+                theme.clip_body
+            };
+            painter.rect_filled(bar.intersect(strip), 1.0, color);
+        }
+    }
+    let x = strip.left() + playhead * scale;
+    painter.line_segment(
+        [egui::pos2(x, strip.top()), egui::pos2(x, strip.bottom())],
+        egui::Stroke::new(1.0, theme.playhead),
+    );
+
+    // The view window, above everything it frames.
+    let window = egui::Rect::from_min_max(
+        egui::pos2(strip.left() + arr.view_beats * scale, strip.top()),
+        egui::pos2(
+            strip.left() + (arr.view_beats + viewport) * scale,
+            strip.bottom(),
+        ),
+    )
+    .intersect(strip);
+    painter.rect_filled(window, 2.0, theme.accent_muted.gamma_multiply(0.35));
+    painter.rect_stroke(
+        window,
+        2.0,
+        egui::Stroke::new(
+            1.0,
+            if resp.hovered() || resp.is_pointer_button_down_on() {
+                theme.accent
+            } else {
+                theme.outline
+            },
+        ),
+        egui::StrokeKind::Inside,
+    );
+    painter.line_segment(
+        [strip.left_bottom(), strip.right_bottom()],
+        egui::Stroke::new(1.0, theme.divider),
+    );
+    moved
+}
+
+/// Preview an audio-file drag as a ghost clip: the lane under the pointer
+/// washed as the target, the file at its true length for the session tempo,
+/// snapped to the nearest grid line — and, below the last lane, the phantom
+/// strip of the audio track a drop there would create. The ghost sits where
+/// the clip will actually land (first-fit from the snapped beat), so it
+/// never promises a spot the placement rules would refuse.
+///
+/// Returns where a release right now would land; None when it would not.
+#[allow(clippy::too_many_arguments)]
+fn drop_preview(
+    ui: &egui::Ui,
+    theme: &Theme,
+    content: egui::Rect,
+    arr: &Arrangement,
+    grid: f32,
+    beats_per_bar: u32,
+    bpm: f64,
+    waveform_cache: &HashMap<PathBuf, Arc<waveform::Peaks>>,
+    drag: &DragImport,
+) -> Option<DropSpot> {
+    let pos = ui.ctx().pointer_latest_pos()?;
+    if !content.contains(pos) {
+        return None;
+    }
+    let hint = |text: &str, color: egui::Color32| {
+        ui.painter().text(
+            pos + egui::vec2(14.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            text,
+            egui::FontId::new(11.0, egui::FontFamily::Proportional),
+            color,
+        );
+    };
+    if !drag.accepted {
+        hint("WAV files only", theme.warn);
+        return None;
+    }
+
+    let offset = arr.view_beats;
+    let ppb = arr.pixels_per_beat;
+    let lanes = lane_rects(content, &arr.tracks);
+    let below = lanes.last().map_or(content.top(), egui::Rect::bottom);
+    let hovered = lanes
+        .iter()
+        .position(|lane| (lane.top()..lane.bottom()).contains(&pos.y));
+    let (lane, track) = match hovered {
+        Some(t) if arr.tracks[t].kind == TrackKind::Audio => (lanes[t], Some(t)),
+        Some(_) => {
+            hint("audio tracks only", theme.text_muted);
+            return None;
+        }
+        // The empty space below the lanes, all of it: the phantom strip is
+        // drawn where the new track will actually appear, not at the
+        // pointer, so the preview and the outcome are the same picture.
+        None => (
+            egui::Rect::from_min_max(
+                egui::pos2(content.left(), below),
+                egui::pos2(content.right(), (below + TRACK_H).min(content.bottom())),
+            ),
+            None,
+        ),
+    };
+
+    // The file's musical length — honest when the header could be read,
+    // one bar as a stand-in when it could not.
+    let len = drag
+        .header
+        .map(|(rate, frames)| (frames as f64 / f64::from(rate.max(1)) * bpm / 60.0) as f32)
+        .filter(|len| len.is_finite() && *len > 0.0)
+        .unwrap_or(beats_per_bar as f32);
+    let at = snap(beat_at(content, offset, ppb, pos.x), grid);
+    let start = match track {
+        Some(t) => place_clip(&arr.clips[t], at, len).0,
+        None => at,
+    };
+    let ghost = Clip {
+        id: u64::MAX,
+        name: drag.name.clone(),
+        start,
+        len,
+        notes: Vec::new(),
+        audio: drag.header.map(|(sample_rate, source_frames)| AudioSource {
+            path: drag.path.clone(),
+            sample_rate,
+            source_offset: 0,
+            source_frames,
+            gain: 1.0,
+            looped: false,
+        }),
+    };
+
+    let painter = ui.painter();
+    let visible_lane = lane.intersect(content);
+    painter.rect_filled(visible_lane, 0.0, theme.accent_muted.gamma_multiply(0.25));
+    if track.is_none() && visible_lane.height() > 0.0 {
+        painter.rect_stroke(
+            visible_lane,
+            0.0,
+            egui::Stroke::new(1.0, theme.divider),
+            egui::StrokeKind::Inside,
+        );
+        if visible_lane.height() >= 20.0 {
+            painter.text(
+                egui::pos2(
+                    visible_lane.right() - CLIP_LABEL_PAD,
+                    visible_lane.top() + CLIP_LABEL_PAD,
+                ),
+                egui::Align2::RIGHT_TOP,
+                "new audio track",
+                egui::FontId::new(11.0, egui::FontFamily::Proportional),
+                theme.text_muted,
+            );
+        }
+    }
+
+    let full_r = clip_rect(content, offset, ppb, lane, &ghost);
+    let r = full_r.intersect(content);
+    painter.rect_filled(r, 3.0, theme.clip_body.gamma_multiply(0.55));
+    if ghost.audio.is_some()
+        && let Some(peaks) = waveform_cache.get(&drag.path)
+    {
+        waveform::paint_clip_thumbnail(
+            ui,
+            theme,
+            waveform::ClipThumbnail {
+                full_clip: full_r,
+                visible_clip: r,
+                clip: &ghost,
+                peaks,
+                bpm,
+                opacity: 0.45,
+            },
+        );
+    }
+    let painter = ui.painter();
+    painter.rect_stroke(
+        r,
+        3.0,
+        egui::Stroke::new(1.0, theme.clip_selected),
+        egui::StrokeKind::Middle,
+    );
+    // The landing line: the full lane height at the landing beat, so the
+    // grid position reads even when the ghost runs past the view.
+    let x = x_at(content, offset, ppb, start);
+    if x >= content.left() && x <= content.right() {
+        painter.line_segment(
+            [
+                egui::pos2(x, visible_lane.top()),
+                egui::pos2(x, visible_lane.bottom()),
+            ],
+            egui::Stroke::new(1.5, theme.accent),
+        );
+    }
+    if r.width() >= CLIP_LABEL_MIN_W {
+        painter.text(
+            egui::pos2(r.left() + CLIP_LABEL_PAD, r.top() + CLIP_LABEL_PAD),
+            egui::Align2::LEFT_TOP,
+            &ghost.name,
+            egui::FontId::new(11.0, egui::FontFamily::Proportional),
+            theme.text,
+        );
+    }
+    Some(DropSpot { track, beat: at })
 }
 
 /// What the clip context menu asked for.
@@ -2966,8 +3608,11 @@ fn clips_pass(
     content: egui::Rect,
     arr: &mut Arrangement,
     grid: f32,
+    bpm: f64,
+    waveform_cache: &HashMap<PathBuf, Arc<waveform::Peaks>>,
 ) {
     let offset = arr.view_beats;
+    let pixels_per_beat = arr.pixels_per_beat;
     let lanes = lane_rects(content, &arr.tracks);
     // The rename and the ghost ride out of `arr` for the draw — both are
     // frame-to-frame state the pass either finishes or hands back.
@@ -2975,10 +3620,11 @@ fn clips_pass(
     let mut ghost = arr.ghost.take();
 
     let mut select: Option<(usize, u64)> = None;
-    let mut move_to: Option<(usize, u64, f32)> = None;
     let mut left_to: Option<(usize, u64, f32)> = None;
     let mut right_to: Option<(usize, u64, f32)> = None;
-    let mut ghost_finalize: Option<Ghost> = None;
+    // The released ghost and the lane its ORIGINAL lives on — a move must
+    // vacate that one, wherever the ghost itself has wandered.
+    let mut ghost_finalize: Option<(Ghost, usize)> = None;
     // A Cell, because one context-menu closure is created per clip per
     // frame and they all need to reach the same slot.
     let menu: std::cell::Cell<Option<(usize, u64, ClipMenu)>> = std::cell::Cell::new(None);
@@ -2988,7 +3634,8 @@ fn clips_pass(
     for (t, track) in arr.clips.iter().enumerate() {
         let Some(lane) = lanes.get(t) else { break };
         for (i, clip) in track.iter().enumerate() {
-            let rect = clip_rect(content, offset, *lane, clip).intersect(content);
+            let full_rect = clip_rect(content, offset, pixels_per_beat, *lane, clip);
+            let rect = full_rect.intersect(content);
             if rect.width() <= 0.0 {
                 continue;
             }
@@ -3001,17 +3648,21 @@ fn clips_pass(
             let body = ui.interact(rect, body_id, egui::Sense::click_and_drag());
             let command = ui.input(|i| i.modifiers.command);
             if body.drag_started() {
-                if command {
-                    // Ctrl+drag: the original stays, a ghost copy rides the
-                    // pointer and lands on release.
-                    ghost = Some(Ghost {
-                        track: t,
-                        clip: clip.clone(),
-                        start0: clip.start,
-                    });
-                } else {
-                    select = Some((t, clip.id));
-                }
+                // Every drag rides a ghost. Plain drag moves the original
+                // to wherever the ghost lands; Ctrl+drag leaves it and
+                // lands a copy. The grip is measured from the PRESS origin:
+                // drag_started only fires once the drag threshold is passed,
+                // so the pointer has already left the grab point by then.
+                let grab = ui.input(|i| i.pointer.press_origin()).map_or(0.0, |pos| {
+                    beat_at(content, offset, pixels_per_beat, pos.x) - clip.start
+                });
+                ghost = Some(Ghost {
+                    track: t,
+                    clip: clip.clone(),
+                    grab,
+                    copy: command,
+                });
+                select = Some((t, clip.id));
             }
             if body.clicked() || body.secondary_clicked() {
                 select = Some((t, clip.id));
@@ -3026,28 +3677,34 @@ fn clips_pass(
                     focused: false,
                 });
             }
-            if body.dragged() {
-                if let Some(g) = &mut ghost
-                    && g.track == t
-                    && g.clip.id == clip.id
+            if body.dragged()
+                && let Some(g) = &mut ghost
+                && g.clip.id == clip.id
+                && let Some(pos) = body.interact_pointer_pos()
+            {
+                // Absolute from the pointer, not accumulated deltas: the
+                // grip point stays under the finger, and snapping cannot
+                // eat the motion a frame at a time.
+                let want = beat_at(content, offset, pixels_per_beat, pos.x) - g.grab;
+                g.clip.start = snap(want, grid);
+                // Cross-lane: the ghost follows the pointer onto any lane
+                // whose kind can hold the clip, and keeps its last lane
+                // while the pointer is over one that cannot.
+                if let Some(target) = lanes
+                    .iter()
+                    .position(|lane| (lane.top()..lane.bottom()).contains(&pos.y))
+                    && lane_accepts(&arr.tracks[target], &g.clip)
                 {
-                    let want = g.start0 + body.drag_delta().x / PX_PER_BEAT;
-                    g.clip.start = snap(want, grid);
-                } else {
-                    // drag_delta is measured from the press origin, so this
-                    // is absolute, not incremental — no drift accumulates.
-                    move_to = Some((t, clip.id, clip.start + body.drag_delta().x / PX_PER_BEAT));
+                    g.track = target;
                 }
             }
             if body.drag_stopped() {
                 // The ghost lands: place it wherever the first fitting gap
                 // is, like any other new clip. Deferred to the apply
                 // section — the draw loop still holds `arr.clips` borrowed.
-                let active = ghost
-                    .as_ref()
-                    .is_some_and(|g| g.track == t && g.clip.id == clip.id);
+                let active = ghost.as_ref().is_some_and(|g| g.clip.id == clip.id);
                 if active {
-                    ghost_finalize = ghost.take();
+                    ghost_finalize = ghost.take().map(|g| (g, t));
                 }
             }
             if body.dragged() {
@@ -3093,7 +3750,7 @@ fn clips_pass(
                     if resp.dragged()
                         && let Some(pos) = resp.interact_pointer_pos()
                     {
-                        let beat = beat_at(content, offset, pos.x);
+                        let beat = beat_at(content, offset, pixels_per_beat, pos.x);
                         if side == 0 {
                             left_to = Some((t, clip.id, beat));
                         } else {
@@ -3104,8 +3761,43 @@ fn clips_pass(
             }
 
             // --- paint ---------------------------------------------------
+            // A clip whose move-ghost is in flight is lifted: it stays
+            // visible where it was, dimmed, until the ghost lands.
+            let lifted = ghost
+                .as_ref()
+                .is_some_and(|g| !g.copy && g.clip.id == clip.id);
             let painter = ui.painter();
-            painter.rect_filled(rect, 3.0, theme.clip_body);
+            painter.rect_filled(
+                rect,
+                3.0,
+                if lifted {
+                    theme.clip_body.gamma_multiply(0.35)
+                } else {
+                    theme.clip_body
+                },
+            );
+            if let Some(audio) = &clip.audio
+                && let Some(peaks) = waveform_cache.get(&audio.path)
+            {
+                waveform::paint_clip_thumbnail(
+                    ui,
+                    theme,
+                    waveform::ClipThumbnail {
+                        full_clip: full_rect,
+                        visible_clip: rect,
+                        clip,
+                        peaks,
+                        bpm,
+                        opacity: if lifted {
+                            0.25
+                        } else if selected {
+                            0.95
+                        } else {
+                            0.72
+                        },
+                    },
+                );
+            }
             if selected {
                 painter.rect_stroke(
                     rect,
@@ -3161,13 +3853,43 @@ fn clips_pass(
         }
     }
 
+    // An in-flight ghost is cancelled by Escape: the drag goes dead and the
+    // original stays exactly where it was.
+    if ghost.is_some() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        ghost = None;
+    }
+
     // --- the ghost, drawn above everything it might land on ---------------
     if let Some(g) = &ghost
         && let Some(lane) = lanes.get(g.track)
     {
-        let r = clip_rect(content, offset, *lane, &g.clip).intersect(content);
+        // The target lane washed like a drop target, so a cross-lane drag
+        // says where it is aimed even before the ghost is looked at.
+        ui.painter().rect_filled(
+            lane.intersect(content),
+            0.0,
+            theme.accent_muted.gamma_multiply(0.25),
+        );
+        let full_r = clip_rect(content, offset, pixels_per_beat, *lane, &g.clip);
+        let r = full_r.intersect(content);
         let painter = ui.painter();
         painter.rect_filled(r, 3.0, theme.clip_body.gamma_multiply(0.55));
+        if let Some(audio) = &g.clip.audio
+            && let Some(peaks) = waveform_cache.get(&audio.path)
+        {
+            waveform::paint_clip_thumbnail(
+                ui,
+                theme,
+                waveform::ClipThumbnail {
+                    full_clip: full_r,
+                    visible_clip: r,
+                    clip: &g.clip,
+                    peaks,
+                    bpm,
+                    opacity: 0.45,
+                },
+            );
+        }
         painter.rect_stroke(
             r,
             3.0,
@@ -3250,33 +3972,45 @@ fn clips_pass(
     {
         arr.selected_clip = Some((t, i));
     }
-    if let Some((t, id, want)) = move_to
-        && let Some(i) = index_of(&arr.clips[t], id)
-    {
-        arr.clips[t][i].start = clamp_clip_start(&arr.clips[t], i, snap(want, grid));
-        resort(&mut arr.clips[t]);
-        if let Some(i) = index_of(&arr.clips[t], id) {
-            arr.selected_clip = Some((t, i));
-        }
-    }
     if let Some((t, id, want)) = left_to
         && let Some(i) = index_of(&arr.clips[t], id)
     {
-        let start = clamp_clip_start(&arr.clips[t], i, snap(want, grid));
-        let end = arr.clips[t][i].start + arr.clips[t][i].len;
-        arr.clips[t][i].len = end - start;
-        arr.clips[t][i].start = start;
+        let old_start = arr.clips[t][i].start;
+        let mut want = snap(want, grid);
+        if let Some(audio) = &arr.clips[t][i].audio {
+            let available_beats =
+                audio.source_offset as f64 / f64::from(audio.sample_rate) * bpm.max(1.0) / 60.0;
+            want = want.max(old_start - available_beats as f32);
+        }
+        let start = clamp_clip_start(&arr.clips[t], i, want);
+        trim_clip_left(&mut arr.clips[t][i], start, bpm);
     }
     if let Some((t, id, want)) = right_to
         && let Some(i) = index_of(&arr.clips[t], id)
     {
-        arr.clips[t][i].len = clamp_clip_len(&arr.clips[t], i, snap(want, grid), grid);
+        let mut len = snap(want, grid);
+        if let Some(audio) = &arr.clips[t][i].audio
+            && !audio.looped
+        {
+            let source_beats =
+                audio.source_frames as f64 / f64::from(audio.sample_rate) * bpm.max(1.0) / 60.0;
+            len = len.min(source_beats as f32);
+        }
+        arr.clips[t][i].len = clamp_clip_len(&arr.clips[t], i, len, grid);
     }
 
     // The released ghost becomes a real clip: first fitting gap, selected.
-    if let Some(g) = ghost_finalize {
-        let (start, idx) = place_clip(&arr.clips[g.track], g.clip.start, g.clip.len);
+    // A move vacates its original FIRST, so the landing can take the very
+    // spot the original held; a copy keeps it and lands under a fresh id —
+    // ids are identity, and identity is never in two places.
+    if let Some((g, src)) = ghost_finalize {
         let mut placed = g.clip;
+        if g.copy {
+            placed.id = arr.next_id();
+        } else if let Some(i) = index_of(&arr.clips[src], placed.id) {
+            arr.clips[src].remove(i);
+        }
+        let (start, idx) = place_clip(&arr.clips[g.track], placed.start, placed.len);
         placed.start = start;
         arr.clips[g.track].insert(idx, placed);
         arr.selected_clip = Some((g.track, idx));
@@ -3313,7 +4047,11 @@ fn loop_brace(
         return;
     };
     let offset = arr.view_beats;
-    let (x0, x1) = (x_at(content, offset, from), x_at(content, offset, to));
+    let pixels_per_beat = arr.pixels_per_beat;
+    let (x0, x1) = (
+        x_at(content, offset, pixels_per_beat, from),
+        x_at(content, offset, pixels_per_beat, to),
+    );
     let brace = egui::Rect::from_min_max(
         egui::pos2(x0, ruler.top() + 2.0),
         egui::pos2(x1, ruler.bottom() - 2.0),
@@ -3321,16 +4059,31 @@ fn loop_brace(
 
     // The brace body carries the WHOLE loop. Created before the handles, so
     // the handles win the pointer wherever they overlap the body.
-    let body = ui.interact(brace, ui.id().with("loop_body"), egui::Sense::drag());
+    let body_id = ui.id().with("loop_body");
+    let body = ui.interact(brace, body_id, egui::Sense::drag());
     if body.hovered() || body.dragged() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
     }
 
     let mut next = (from, to);
-    if body.dragged() {
-        next = loop_move(next, snap(body.drag_delta().x / PX_PER_BEAT, grid));
+    if body.drag_started() {
+        // The loop's start at press, kept for the drag's lifetime: the body
+        // drag is absolute from here. Snapping a per-frame delta would eat
+        // slow motion a frame at a time and the brace would stick.
+        ui.data_mut(|d| d.insert_temp(body_id, from));
     }
-    let (hx0, hx1) = (x_at(content, offset, next.0), x_at(content, offset, next.1));
+    if body.dragged()
+        && let Some(pos) = body.interact_pointer_pos()
+        && let Some(origin) = ui.input(|i| i.pointer.press_origin())
+        && let Some(from0) = ui.data(|d| d.get_temp::<f32>(body_id))
+    {
+        let want = from0 + (pos.x - origin.x) / pixels_per_beat;
+        next = loop_move((from, to), snap(want, grid) - from);
+    }
+    let (hx0, hx1) = (
+        x_at(content, offset, pixels_per_beat, next.0),
+        x_at(content, offset, pixels_per_beat, next.1),
+    );
     for (which, x) in [(0usize, hx0), (1usize, hx1)] {
         let handle = egui::Rect::from_min_max(
             egui::pos2(x - LOOP_HANDLE_W * 0.5, ruler.top()),
@@ -3345,7 +4098,7 @@ fn loop_brace(
         if let Some(pos) = response.interact_pointer_pos()
             && response.dragged()
         {
-            let at = snap(beat_at(content, offset, pos.x), grid);
+            let at = snap(beat_at(content, offset, pixels_per_beat, pos.x), grid);
             if which == 0 {
                 next.0 = at.min(next.1 - grid).max(0.0);
             } else {
@@ -3357,7 +4110,10 @@ fn loop_brace(
 
     // Paint the brace LAST, at its final position for this frame — so both
     // handle drags and body drags feed back live instead of one frame late.
-    let (nx0, nx1) = (x_at(content, offset, next.0), x_at(content, offset, next.1));
+    let (nx0, nx1) = (
+        x_at(content, offset, pixels_per_beat, next.0),
+        x_at(content, offset, pixels_per_beat, next.1),
+    );
     ui.painter().rect_filled(
         egui::Rect::from_min_max(
             egui::pos2(nx0, ruler.top() + 2.0),
@@ -3386,55 +4142,72 @@ struct Folder {
     open: bool,
 }
 
-/// The instruments the app can actually build. Not a catalogue of
-/// intentions — every row here loads.
-const INSTRUMENTS: &[BrowserItem] = &[BrowserItem {
-    name: "Sine Synth",
-    load: DeviceKind::SineSynth,
-}];
-
-/// Effects: they shape whatever the track's instrument makes.
-const FX: &[BrowserItem] = &[BrowserItem {
-    name: "Reverb",
-    load: DeviceKind::Reverb,
-}];
-
 /// Everything the browser owns that outlives a frame.
 struct Browser {
     /// Where the two bands meet, as a fraction of panel height.
     split: f32,
     query: String,
     folders: Vec<Folder>,
+    /// None is the Ableton-style All view; otherwise this is a configured
+    /// catalog location id, never an arbitrary filesystem path.
+    location: Option<String>,
+    /// Root-relative folder selected inside `location`.
+    folder: Option<std::path::PathBuf>,
+    /// Whether the `All samples` root is open. The root is a singleton with an
+    /// obvious default, so it is a bool and starts open; everything below it
+    /// lives in `expanded` and starts closed.
+    root_open: bool,
+    /// Which catalog locations and folders are open, keyed by [`folder_key`]
+    /// (a location uses the empty relative path). A row is drawn only when
+    /// every ancestor of it is in here, so the tree opens one level at a time
+    /// instead of listing the whole library at once.
+    expanded: std::collections::HashSet<String>,
+    /// Pixel offset for the combined location, folder, and result list.
+    catalog_scroll: f32,
+    user_library_path: String,
+    sample_folder_path: String,
 }
 
 impl Default for Browser {
     fn default() -> Self {
-        // One folder, holding the instruments that really exist. Open,
-        // because a browser whose only content is folded shut reads as
-        // empty.
+        // No built-in device folders: the Sine Synth and Reverb rows were
+        // mockups standing in for a library, and the library is what fills
+        // this now. The tree renders whatever it is given, so an empty
+        // browser is a browser waiting on the catalog, not a broken one.
         Self {
             split: BROWSER_LOWER_FRAC,
             query: String::new(),
-            folders: vec![
-                Folder {
-                    name: "Instruments",
-                    items: INSTRUMENTS,
-                    open: true,
-                },
-                Folder {
-                    name: "Fx",
-                    items: FX,
-                    open: true,
-                },
-            ],
+            location: None,
+            folder: None,
+            root_open: true,
+            expanded: std::collections::HashSet::new(),
+            catalog_scroll: 0.0,
+            user_library_path: String::new(),
+            sample_folder_path: String::new(),
+            folders: Vec::new(),
         }
     }
 }
 
-/// What the browser shows with nothing in it. The app's muted empty-state
-/// line (`kit::empty_state`), painted rather than laid out because this
-/// region draws with a painter throughout.
-const BROWSER_EMPTY: &str = "no library yet";
+/// Identifies one catalog folder across a location and its root-relative
+/// path. A plain string so the open-set is a `HashSet<String>` and lookups
+/// need no tuple juggling; the NUL keeps a location id from colliding with a
+/// path that happens to start the same way.
+fn folder_key(location_id: &str, relative: &std::path::Path) -> String {
+    format!("{location_id}\u{0}{}", relative.display())
+}
+
+/// Browser requests stay in the app shell: rendering never scans or mutates
+/// the filesystem, and sample activation does not touch the audio callback.
+#[derive(Debug, Clone)]
+enum BrowserEvent {
+    LoadDevice(BrowserItem),
+    SelectSample(std::path::PathBuf),
+    SetUserLibrary(std::path::PathBuf),
+    AddSampleFolder(std::path::PathBuf),
+    RemoveSampleFolder(std::path::PathBuf),
+    Rescan,
+}
 
 /// The rows the tree currently shows, as (indent depth, text, is_folder).
 ///
@@ -3484,15 +4257,9 @@ fn tree(
     let top = upper.top() + SEARCH_H + TREE_TOP_GAP;
     let rows = tree_rows(folders);
 
-    // An empty browser must not look like a broken one.
+    // The catalog owns the empty state, because the device tree can be empty
+    // while configured library folders are already present.
     if rows.is_empty() {
-        ui.painter().text(
-            egui::pos2(upper.center().x, top + TREE_ROW_H),
-            egui::Align2::CENTER_TOP,
-            BROWSER_EMPTY,
-            font,
-            theme.text_muted,
-        );
         return None;
     }
     let targets = tree_targets(folders);
@@ -3565,6 +4332,375 @@ fn tree(
     load
 }
 
+/// Draw the configured catalog beneath the built-in device tree. The catalog
+/// is already an immutable snapshot: this function does no filesystem work.
+fn catalog_tree(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    focus: &mut Focus,
+    upper: egui::Rect,
+    browser: &mut Browser,
+    snapshot: &LibrarySnapshot,
+) -> Option<BrowserEvent> {
+    let font = egui::FontId::new(TREE_TYPE, egui::FontFamily::Monospace);
+    let device_rows = tree_rows(&browser.folders).len();
+    let mut row_index = device_rows;
+    let content_top = upper.top() + SEARCH_H + TREE_TOP_GAP;
+    let results = library::query_at(
+        snapshot,
+        browser.location.as_deref(),
+        browser.folder.as_deref(),
+        &browser.query,
+    );
+    // A folder shows only when every ancestor of it is open. Without this the
+    // pane draws every folder in the library before the first sample row, so
+    // a library of any size buries its own audio files below the fold.
+    let has_children: std::collections::HashSet<String> = snapshot
+        .folders
+        .iter()
+        .filter_map(|folder| {
+            folder
+                .relative_path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .map(|parent| folder_key(&folder.location_id, parent))
+        })
+        .collect();
+    let root_open = browser.root_open;
+    let location_open: Vec<bool> = snapshot
+        .locations
+        .iter()
+        .map(|location| {
+            browser
+                .expanded
+                .contains(&folder_key(&location.id, std::path::Path::new("")))
+        })
+        .collect();
+    let visible_folders: Vec<&library::LibraryFolder> = if !root_open {
+        Vec::new()
+    } else {
+        snapshot
+            .folders
+            .iter()
+            .filter(|folder| {
+                if !browser
+                    .expanded
+                    .contains(&folder_key(&folder.location_id, std::path::Path::new("")))
+                {
+                    return false;
+                }
+                let mut ancestor = folder.relative_path.parent();
+                while let Some(path) = ancestor {
+                    if path.as_os_str().is_empty() {
+                        break;
+                    }
+                    if !browser
+                        .expanded
+                        .contains(&folder_key(&folder.location_id, path))
+                    {
+                        return false;
+                    }
+                    ancestor = path.parent();
+                }
+                true
+            })
+            .collect()
+    };
+    let location_rows = if root_open {
+        snapshot.locations.len()
+    } else {
+        0
+    };
+    let total_rows = device_rows + 1 + location_rows + visible_folders.len() + results.len().max(1);
+    let viewport_height = (upper.bottom() - content_top).max(0.0);
+    let max_scroll = (total_rows as f32 * TREE_ROW_H - viewport_height).max(0.0);
+    if ui.rect_contains_pointer(upper) {
+        let scroll = ui.input(|input| input.smooth_scroll_delta.y);
+        browser.catalog_scroll = (browser.catalog_scroll - scroll).clamp(0.0, max_scroll);
+    } else {
+        browser.catalog_scroll = browser.catalog_scroll.min(max_scroll);
+    }
+    let top = content_top - browser.catalog_scroll;
+    let mut event = None;
+
+    let mut draw_location = |label: String, id: Option<&str>, open: bool| {
+        let y = top + row_index as f32 * TREE_ROW_H;
+        row_index += 1;
+        if y + TREE_ROW_H <= content_top || y + TREE_ROW_H > upper.bottom() {
+            return;
+        }
+        let row = egui::Rect::from_min_size(
+            egui::pos2(upper.left(), y),
+            egui::vec2(upper.width(), TREE_ROW_H),
+        );
+        let wid = ui.id().with(("catalog_location", id));
+        focus.register(wid, row);
+        let active = browser.location.as_deref() == id;
+        let response = ui.interact(row, wid, egui::Sense::click());
+        if response.hovered() || active {
+            ui.painter().rect_filled(
+                row,
+                0.0,
+                if active {
+                    theme.accent_muted
+                } else {
+                    theme.surface_raised
+                },
+            );
+        }
+        if response.clicked() || focus.activated(wid) {
+            // Same one-click rule as a folder row: it selects, and it opens or
+            // closes. Closing the root folds the whole catalog away; the sample
+            // list below is unaffected, because it answers to the search and the
+            // selected location, not to what is open.
+            match id {
+                None => browser.root_open = !browser.root_open,
+                Some(id) => {
+                    let key = folder_key(id, std::path::Path::new(""));
+                    if !browser.expanded.remove(&key) {
+                        browser.expanded.insert(key);
+                    }
+                }
+            }
+            browser.location = id.map(str::to_owned);
+            browser.folder = None;
+        }
+        let arrow = if open { "\u{25be}" } else { "\u{25b8}" };
+        ui.painter().text(
+            egui::pos2(row.left() + TREE_PAD_X, row.center().y),
+            egui::Align2::LEFT_CENTER,
+            format!("{arrow} {label}"),
+            font.clone(),
+            theme.text,
+        );
+    };
+
+    draw_location("All samples".to_owned(), None, root_open);
+    if root_open {
+        for (location, open) in snapshot.locations.iter().zip(location_open) {
+            let label = if location.user_library {
+                format!("  User: {}", location.label)
+            } else {
+                format!("  {}", location.label)
+            };
+            draw_location(label, Some(&location.id), open);
+        }
+    }
+    for folder in visible_folders.iter().copied() {
+        let y = top + row_index as f32 * TREE_ROW_H;
+        row_index += 1;
+        if y + TREE_ROW_H <= content_top {
+            continue;
+        }
+        if y + TREE_ROW_H > upper.bottom() {
+            break;
+        }
+        let row = egui::Rect::from_min_size(
+            egui::pos2(upper.left(), y),
+            egui::vec2(upper.width(), TREE_ROW_H),
+        );
+        let wid = ui
+            .id()
+            .with(("catalog_folder", &folder.location_id, &folder.relative_path));
+        focus.register(wid, row);
+        let active = browser.location.as_deref() == Some(&folder.location_id)
+            && browser.folder.as_deref() == Some(folder.relative_path.as_path());
+        let response = ui.interact(row, wid, egui::Sense::click());
+        if response.hovered() || active {
+            ui.painter().rect_filled(
+                row,
+                0.0,
+                if active {
+                    theme.accent_muted
+                } else {
+                    theme.surface_raised
+                },
+            );
+        }
+        let key = folder_key(&folder.location_id, &folder.relative_path);
+        let parent = has_children.contains(&key);
+        let open = parent && browser.expanded.contains(&key);
+        if response.clicked() || focus.activated(wid) {
+            // One click both filters to the folder and, when it has children,
+            // opens or closes it — the arrow is what the row looked like it
+            // did all along.
+            if parent && !browser.expanded.remove(&key) {
+                browser.expanded.insert(key);
+            }
+            browser.location = Some(folder.location_id.clone());
+            browser.folder = Some(folder.relative_path.clone());
+        }
+        let depth = folder.relative_path.components().count().saturating_sub(1);
+        let arrow = if !parent {
+            " "
+        } else if open {
+            "\u{25be}"
+        } else {
+            "\u{25b8}"
+        };
+        ui.painter().text(
+            egui::pos2(
+                row.left() + TREE_PAD_X * (2.0 + depth as f32),
+                row.center().y,
+            ),
+            egui::Align2::LEFT_CENTER,
+            format!("{arrow} {}", folder.name),
+            font.clone(),
+            theme.text,
+        );
+    }
+
+    if results.is_empty() {
+        let y = top + row_index as f32 * TREE_ROW_H;
+        if y + TREE_ROW_H > content_top && y + TREE_ROW_H <= upper.bottom() {
+            ui.painter().text(
+                egui::pos2(upper.left() + TREE_PAD_X * 2.0, y + TREE_ROW_H * 0.5),
+                egui::Align2::LEFT_CENTER,
+                if snapshot.locations.is_empty() {
+                    "Set a library folder below to index samples"
+                } else if browser.query.is_empty() {
+                    "No supported audio files in this location"
+                } else {
+                    "No samples match this search"
+                },
+                font.clone(),
+                theme.text_muted,
+            );
+        }
+    }
+    for asset in results {
+        let y = top + row_index as f32 * TREE_ROW_H;
+        row_index += 1;
+        if y + TREE_ROW_H <= content_top {
+            continue;
+        }
+        if y + TREE_ROW_H > upper.bottom() {
+            break;
+        }
+        let row = egui::Rect::from_min_size(
+            egui::pos2(upper.left(), y),
+            egui::vec2(upper.width(), TREE_ROW_H),
+        );
+        let wid = ui.id().with(("catalog_asset", &asset.path));
+        focus.register(wid, row);
+        let response = ui.interact(row, wid, egui::Sense::click_and_drag());
+        // A row can be pulled straight onto the timeline. The arrangement's
+        // drop ghost is the drag visual, so the row itself stays put.
+        response.dnd_set_drag_payload(SampleDrag(asset.path.clone()));
+        if response.hovered() {
+            ui.painter().rect_filled(row, 0.0, theme.accent_muted);
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if response.double_clicked() || focus.activated(wid) {
+            event = Some(BrowserEvent::SelectSample(asset.path.clone()));
+        }
+        ui.painter().text(
+            egui::pos2(row.left() + TREE_PAD_X * 2.0, row.center().y),
+            egui::Align2::LEFT_CENTER,
+            format!("{} .{}", asset.name, asset.extension),
+            font.clone(),
+            theme.text_muted,
+        );
+    }
+    event
+}
+
+/// Folder management lives in the lower browser band. Paths are text fields
+/// rather than a native chooser, so adding folders needs no new dependency.
+fn library_manager(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    lower: egui::Rect,
+    browser: &mut Browser,
+    config: &LibraryConfig,
+    scanning: bool,
+) -> Option<BrowserEvent> {
+    let mut event = None;
+    let font = egui::FontId::new(SEARCH_TYPE, egui::FontFamily::Proportional);
+    let pad = SEARCH_PAD;
+    let row = SEARCH_H.min(TREE_ROW_H);
+    let width = lower.width() - pad * 2.0;
+    if width <= 0.0 || lower.height() < row {
+        return None;
+    }
+    let mut y = lower.top() + pad;
+    ui.painter().text(
+        egui::pos2(lower.left() + pad, y),
+        egui::Align2::LEFT_TOP,
+        if scanning {
+            "scanning library…"
+        } else {
+            "library folders"
+        },
+        font.clone(),
+        theme.text,
+    );
+    y += row * 0.75;
+
+    let button_w = 48.0;
+    let field = egui::Rect::from_min_size(
+        egui::pos2(lower.left() + pad, y),
+        egui::vec2((width - button_w).max(1.0), row),
+    );
+    let set = egui::Rect::from_min_size(egui::pos2(field.right(), y), egui::vec2(button_w, row));
+    ui.put(
+        field,
+        egui::TextEdit::singleline(&mut browser.user_library_path)
+            .hint_text("User Library path")
+            .font(font.clone()),
+    );
+    if ui.put(set, egui::Button::new("set")).clicked() && !browser.user_library_path.is_empty() {
+        event = Some(BrowserEvent::SetUserLibrary(std::path::PathBuf::from(
+            browser.user_library_path.clone(),
+        )));
+    }
+    y += row + 2.0;
+
+    let field = egui::Rect::from_min_size(
+        egui::pos2(lower.left() + pad, y),
+        egui::vec2((width - button_w).max(1.0), row),
+    );
+    let add = egui::Rect::from_min_size(egui::pos2(field.right(), y), egui::vec2(button_w, row));
+    ui.put(
+        field,
+        egui::TextEdit::singleline(&mut browser.sample_folder_path)
+            .hint_text("Sample folder path")
+            .font(font.clone()),
+    );
+    if ui.put(add, egui::Button::new("add")).clicked() && !browser.sample_folder_path.is_empty() {
+        event = Some(BrowserEvent::AddSampleFolder(std::path::PathBuf::from(
+            browser.sample_folder_path.clone(),
+        )));
+    }
+    y += row + 2.0;
+
+    let rescan =
+        egui::Rect::from_min_size(egui::pos2(lower.left() + pad, y), egui::vec2(70.0, row));
+    if ui.put(rescan, egui::Button::new("rescan")).clicked() {
+        event = Some(BrowserEvent::Rescan);
+    }
+    y += row + 2.0;
+    for root in &config.sample_folders {
+        if y + row > lower.bottom() {
+            break;
+        }
+        let remove =
+            egui::Rect::from_min_size(egui::pos2(lower.left() + pad, y), egui::vec2(48.0, row));
+        if ui.put(remove, egui::Button::new("remove")).clicked() {
+            event = Some(BrowserEvent::RemoveSampleFolder(root.clone()));
+        }
+        ui.painter().text(
+            egui::pos2(remove.right() + pad, remove.center().y),
+            egui::Align2::LEFT_CENTER,
+            root.display().to_string(),
+            font.clone(),
+            theme.text_muted,
+        );
+        y += row;
+    }
+    event
+}
+
 /// The search well at the top of the upper band: a darker rectangle holding
 /// the magnifying glass and the field.
 fn search_bar(
@@ -3610,6 +4746,7 @@ fn search_bar(
         field,
         egui::TextEdit::singleline(query)
             .id(wid.with("edit"))
+            .hint_text("Search samples or #tags")
             // The well is the background; a second frame on top of it would
             // read as a box inside a box, so hand it an empty one.
             .frame(egui::Frame::NONE)
@@ -3642,7 +4779,10 @@ fn browser_body(
     theme: &Theme,
     focus: &mut Focus,
     browser: &mut Browser,
-) -> Option<BrowserItem> {
+    snapshot: &LibrarySnapshot,
+    config: &LibraryConfig,
+    scanning: bool,
+) -> Option<BrowserEvent> {
     let area = ui.max_rect();
     claim(ui);
 
@@ -3672,6 +4812,8 @@ fn browser_body(
 
     search_bar(ui, theme, focus, upper, &mut browser.query);
     let load = tree(ui, theme, focus, upper, &mut browser.folders);
+    let catalog = catalog_tree(ui, theme, focus, upper, browser, snapshot);
+    let manager = library_manager(ui, theme, lower, browser, config, scanning);
 
     let painter = ui.painter();
     // Same affordance as the panel edges: the divider is invisible until you
@@ -3686,7 +4828,7 @@ fn browser_body(
             SEAM,
         );
     }
-    load
+    manager.or(catalog).or(load.map(BrowserEvent::LoadDevice))
 }
 
 /// A region's body: claim the whole area, draw nothing.
@@ -3818,30 +4960,48 @@ fn seam(ui: &egui::Ui, panel_id: &str, rect: egui::Rect) {
     }
 }
 
-/// What the bottom region shows. Shift+Tab flips it. Two panel IDS, not
-/// one: egui persists a panel's size under its id, and the piano roll wants
-/// far more height than the rack — sharing an id would make each mode
-/// inherit the other's size every switch.
+/// What the bottom region shows. Shift+Tab flips between the device rack and
+/// a clip editor; the selected track decides which clip editor is present.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum BottomView {
     Rack,
-    PianoRoll,
+    ClipEditor,
 }
 
 impl BottomView {
     fn toggled(self) -> Self {
         match self {
-            Self::Rack => Self::PianoRoll,
-            Self::PianoRoll => Self::Rack,
+            Self::Rack => Self::ClipEditor,
+            Self::ClipEditor => Self::Rack,
         }
     }
 
-    /// The panel id the current mode draws (and persists its size) under.
-    fn panel_id(self) -> &'static str {
+    /// Every editor keeps its own persisted height. A comfortable waveform
+    /// height should not silently resize the piano roll or the device rack.
+    fn panel_id(self, editor: ClipEditorKind) -> &'static str {
         match self {
             Self::Rack => "device",
-            Self::PianoRoll => "piano_roll",
+            Self::ClipEditor => match editor {
+                ClipEditorKind::Midi => "piano_roll",
+                ClipEditorKind::Audio => "waveform_editor",
+                ClipEditorKind::Empty => "clip_editor",
+            },
         }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ClipEditorKind {
+    Midi,
+    Audio,
+    Empty,
+}
+
+fn clip_editor_kind(arrangement: &Arrangement) -> ClipEditorKind {
+    match arrangement.active_track_kind() {
+        Some(TrackKind::Midi) => ClipEditorKind::Midi,
+        Some(TrackKind::Audio) => ClipEditorKind::Audio,
+        None => ClipEditorKind::Empty,
     }
 }
 
@@ -3896,6 +5056,29 @@ struct GraphNodes {
     pans: Vec<Option<NodeId>>,
 }
 
+/// Reduce arbitrarily many sources through bounded-input mixers. Graph
+/// compile caps fan-in at `MAX_NODE_INPUTS`; a library-sized arrangement
+/// must not become un-compilable merely because one track has many clips.
+fn mix_sources(spec: &mut GraphSpec, mut sources: Vec<NodeId>) -> Option<NodeId> {
+    while sources.len() > 1 {
+        let mut next =
+            Vec::with_capacity(sources.len().div_ceil(daw::audio::graph::MAX_NODE_INPUTS));
+        for group in sources.chunks(daw::audio::graph::MAX_NODE_INPUTS) {
+            if let [only] = group {
+                next.push(*only);
+                continue;
+            }
+            let bus = spec.push(NodeSpec::Mixer { gain: 1.0 });
+            for source in group {
+                spec.connect(*source, bus);
+            }
+            next.push(bus);
+        }
+        sources = next;
+    }
+    sources.pop()
+}
+
 fn build_graph_spec(
     tracks: &[Track],
     clips: &[Vec<Clip>],
@@ -3904,60 +5087,73 @@ fn build_graph_spec(
 ) -> (GraphSpec, GraphNodes) {
     let mut spec = GraphSpec::default();
     let mixer = spec.push(NodeSpec::Mixer { gain: 1.0 });
-    // Only tracks holding an instrument become sequencer nodes. An empty
-    // track is silent by ABSENCE rather than by a muted node — the graph
-    // stays as small as the session really is.
     let mut fx_ids: Vec<Option<NodeId>> = vec![None; tracks.len()];
     let mut pan_ids: Vec<Option<NodeId>> = vec![None; tracks.len()];
-    let mut seqs: Vec<Option<NodeId>> = Vec::with_capacity(tracks.len());
+    let mut seqs: Vec<Option<NodeId>> = vec![None; tracks.len()];
     for (i, track) in tracks.iter().enumerate() {
-        seqs.push((|| {
-            track.device?;
-            // An AUDIO track has no instrument slot to fill, so it makes no
-            // sequencer either: its material is the sound, and streaming it
-            // is the AudioClip work that has not landed yet. Wiring one now
-            // would be a lane that looks live and is not.
-            if !track.kind.takes_instrument() {
-                return None;
-            }
-            // Silence is ABSENCE here too — a muted or solo-excluded track
-            // is left out of the schedule rather than multiplied by zero.
-            if !track_audible(tracks, i) {
-                return None;
-            }
-            let seq = spec.push(NodeSpec::Seq {
-                notes: clips.get(i).map(|c| seq_notes(c)).unwrap_or_default(),
-                subloops: Vec::new(),
-                loop_len_beats,
-                params: track.params,
-            });
-            // The effect sits BETWEEN the instrument and the mixer, so the
-            // track's own signal is what gets processed — not the sum of
-            // every track, which is what a reverb on the master would be.
-            let tail = match track.fx {
-                Some(DeviceKind::Reverb) => {
-                    let rev = spec.push(NodeSpec::Reverb {
-                        size: track.reverb.size,
-                        damp: track.reverb.damp,
-                        mix: track.reverb.mix,
-                    });
-                    spec.connect(seq, rev);
-                    fx_ids[i] = Some(rev);
-                    rev
+        if !track_audible(tracks, i) {
+            continue;
+        }
+        let mut sources = Vec::new();
+        match track.kind {
+            TrackKind::Midi => {
+                if track.device.is_none() {
+                    continue;
                 }
-                _ => seq,
-            };
-            // Pan is ALWAYS a node, even at dead center, and that is
-            // deliberate: it gives every track's pan a permanent address,
-            // so turning the header knob is a param letter rather than a
-            // schedule swap. A centered constant-power pan is two
-            // multiplies; a swap per mouse-move is a recompile per frame.
-            let pan = spec.push(NodeSpec::Pan { pan: track.pan });
-            spec.connect(tail, pan);
-            spec.connect(pan, mixer);
-            pan_ids[i] = Some(pan);
-            Some(seq)
-        })());
+                let seq = spec.push(NodeSpec::Seq {
+                    notes: clips
+                        .get(i)
+                        .map(|clips| seq_notes(clips))
+                        .unwrap_or_default(),
+                    subloops: Vec::new(),
+                    loop_len_beats,
+                    params: track.params,
+                });
+                seqs[i] = Some(seq);
+                sources.push(seq);
+            }
+            TrackKind::Audio => {
+                for clip in clips.get(i).into_iter().flatten() {
+                    let Some(audio) = &clip.audio else { continue };
+                    sources.push(spec.push(NodeSpec::AudioClip {
+                        path: audio.path.clone(),
+                        start_beats: f64::from(clip.start),
+                        length_beats: Some(f64::from(clip.len)),
+                        source_offset_frames: audio.source_offset,
+                        source_frames: Some(audio.source_frames),
+                        loop_clip: audio.looped,
+                        gain: audio.gain,
+                    }));
+                }
+            }
+        }
+        let Some(source) = mix_sources(&mut spec, sources) else {
+            continue;
+        };
+        // The effect sits between this track's private source bus and pan;
+        // the master never leaks into a track insert.
+        let tail = match track.fx {
+            Some(DeviceKind::Reverb) => {
+                let rev = spec.push(NodeSpec::Reverb {
+                    size: track.reverb.size,
+                    damp: track.reverb.damp,
+                    mix: track.reverb.mix,
+                });
+                spec.connect(source, rev);
+                fx_ids[i] = Some(rev);
+                rev
+            }
+            _ => source,
+        };
+        // Pan is ALWAYS a node, even at dead center, and that is
+        // deliberate: it gives every track's pan a permanent address,
+        // so turning the header knob is a param letter rather than a
+        // schedule swap. A centered constant-power pan is two
+        // multiplies; a swap per mouse-move is a recompile per frame.
+        let pan = spec.push(NodeSpec::Pan { pan: track.pan });
+        spec.connect(tail, pan);
+        spec.connect(pan, mixer);
+        pan_ids[i] = Some(pan);
     }
     if metronome {
         let click = spec.push(NodeSpec::Click);
@@ -3990,6 +5186,28 @@ struct App {
     /// eframe on `save` — density lives here, so a packing choice survives
     /// the session.
     prefs: UiPrefs,
+    /// Machine-local catalog roots and tags. Samples referenced by projects
+    /// will remain project data when AudioClip arrangement wiring arrives.
+    library_config: LibraryConfig,
+    /// Last complete green-zone scan, rendered by the browser without locks.
+    library_snapshot: LibrarySnapshot,
+    library_service: LibraryService,
+    library_scanning: bool,
+    wav_import_service: WavImportService,
+    wav_import_pending: usize,
+    /// The audio-file drag in flight over the window, if any. Rebuilt from
+    /// the hover each frame; carries the header probe and the ghost's spot.
+    drag_import: Option<DragImport>,
+    /// Landing sites waiting for their WAV import to finish, keyed by the
+    /// canonicalized path handed to the importer. Cleared whenever nothing
+    /// is pending, so a stale aim can never steer a later import.
+    pending_drop_spots: Vec<(PathBuf, DropSpot)>,
+    /// Green-zone waveform analysis and immutable views keyed by the exact
+    /// playback path. Duplicated clips share one analysis.
+    waveform_service: waveform::Service,
+    waveform_cache: HashMap<PathBuf, Arc<waveform::Peaks>>,
+    waveform_pending: HashSet<PathBuf>,
+    waveform_failed: HashSet<PathBuf>,
     /// Transport state. The engine's transport is the master while a stream
     /// runs (the mirror is refreshed from telemetry each frame); with the
     /// engine off this is the stand-in the app falls back to.
@@ -3999,6 +5217,8 @@ struct App {
     /// The piano roll's VIEW state — cursor, grid rung, scroll, selection.
     /// The notes it edits live in the selected clip, not here.
     piano_roll: piano_roll::PianoRoll,
+    /// The audio editor's view state; source and placement remain in Clip.
+    waveform: waveform::Editor,
     /// Which face the bottom region shows.
     bottom_view: BottomView,
     /// Which region the keyboard is pointing at.
@@ -4040,7 +5260,7 @@ struct App {
     /// The graph's SHAPE as compiled: (metronome, loop_len_beats, tracks).
     /// A change here swaps the schedule immediately, no debounce — the graph
     /// gained or lost a node, which no param letter can express.
-    graph_key: (bool, Option<f64>, usize, u64),
+    graph_key: (bool, Option<f64>, usize, u64, u64),
     /// The transport loop last sent, in samples — resent only on change, so
     /// brace drags, Ctrl+L and tempo changes all reconcile through one door.
     sent_loop: Option<(u64, u64)>,
@@ -4061,6 +5281,21 @@ impl App {
             .storage
             .and_then(|storage| eframe::get_value(storage, STORAGE_KEY))
             .unwrap_or_default();
+        let library_config: LibraryConfig = cc
+            .storage
+            .and_then(|storage| eframe::get_value(storage, library::CONFIG_STORAGE_KEY))
+            .unwrap_or_default();
+        let library_snapshot: LibrarySnapshot = cc
+            .storage
+            .and_then(|storage| eframe::get_value(storage, library::CACHE_STORAGE_KEY))
+            .unwrap_or_default();
+        let library_service = LibraryService::start(library_config.clone());
+        let wav_import_service = WavImportService::start();
+        let waveform_service = waveform::Service::start();
+        let mut browser = Browser::default();
+        if let Some(root) = &library_config.user_library {
+            browser.user_library_path = root.display().to_string();
+        }
         let mut theme = Theme::dark();
         let mut skin = Skin::default();
         // The kept theme, if any, is restored before anything draws:
@@ -4074,9 +5309,22 @@ impl App {
             theme,
             prefs,
             transport: Transport::default(),
-            browser: Browser::default(),
+            browser,
+            library_config,
+            library_snapshot,
+            library_service,
+            library_scanning: true,
+            wav_import_service,
+            wav_import_pending: 0,
+            drag_import: None,
+            pending_drop_spots: Vec::new(),
+            waveform_service,
+            waveform_cache: HashMap::new(),
+            waveform_pending: HashSet::new(),
+            waveform_failed: HashSet::new(),
             arrangement: Arrangement::default(),
             piano_roll: piano_roll::PianoRoll::default(),
+            waveform: waveform::Editor::default(),
             bottom_view: BottomView::Rack,
             focus: Focus::default(),
             palette: Palette::default(),
@@ -4090,7 +5338,7 @@ impl App {
             sent_pan: Vec::new(),
             compiled_clips: Vec::new(),
             last_compile: None,
-            graph_key: (false, None, 0, 0),
+            graph_key: (false, None, 0, 0, 0),
             sent_loop: None,
         }
     }
@@ -4125,7 +5373,12 @@ impl App {
         let on = self.engine.is_some();
         let has_track = self.arrangement.active_track().is_some();
         let has_clip = self.arrangement.selected_clip.is_some();
-        let roll = self.bottom_view == BottomView::PianoRoll;
+        let editor = self.bottom_view == BottomView::ClipEditor;
+        let kind = clip_editor_kind(&self.arrangement);
+        let roll = editor && kind == ClipEditorKind::Midi;
+        let waveform = editor
+            && kind == ClipEditorKind::Audio
+            && self.arrangement.active_audio_clip().is_some();
         vec![
             // --- transport ---------------------------------------------
             PaletteCommand::new("transport.play", "transport", "play / stop").hint("space"),
@@ -4167,6 +5420,10 @@ impl App {
             PaletteCommand::new("roll.zoom.in", "zoom", "zoom in").enabled(roll),
             PaletteCommand::new("roll.zoom.out", "zoom", "zoom out").enabled(roll),
             PaletteCommand::new("roll.zoom.reset", "zoom", "reset zoom").enabled(roll),
+            PaletteCommand::new("waveform.zoom.in", "zoom", "zoom into waveform").enabled(waveform),
+            PaletteCommand::new("waveform.zoom.out", "zoom", "zoom out of waveform")
+                .enabled(waveform),
+            PaletteCommand::new("waveform.zoom.fit", "zoom", "fit waveform").enabled(waveform),
             // --- key ---------------------------------------------------
             PaletteCommand::new("key.tonic", "key", "set tonic from cursor").enabled(roll),
             PaletteCommand::new("key.major", "key", "scale: major"),
@@ -4188,8 +5445,8 @@ impl App {
             PaletteCommand::new("grid.narrow", "grid", "narrow grid"),
             PaletteCommand::new("grid.widen", "grid", "widen grid"),
             // --- view --------------------------------------------------
-            PaletteCommand::new("view.roll", "view", "show piano roll").enabled(!roll),
-            PaletteCommand::new("view.rack", "view", "show device rack").enabled(roll),
+            PaletteCommand::new("view.roll", "view", "show clip editor").enabled(!editor),
+            PaletteCommand::new("view.rack", "view", "show device rack").enabled(editor),
             PaletteCommand::new("view.compact", "view", "density: compact"),
             PaletteCommand::new("view.comfortable", "view", "density: comfortable"),
             PaletteCommand::new("view.theme", "view", "change theme"),
@@ -4259,6 +5516,9 @@ impl App {
             "roll.zoom.in" => self.piano_roll.zoom = self.piano_roll.zoom.stepped(2),
             "roll.zoom.out" => self.piano_roll.zoom = self.piano_roll.zoom.stepped(-2),
             "roll.zoom.reset" => self.piano_roll.zoom = piano_roll::Zoom::default(),
+            "waveform.zoom.in" => self.waveform.step_zoom(2),
+            "waveform.zoom.out" => self.waveform.step_zoom(-2),
+            "waveform.zoom.fit" => self.waveform.fit(),
 
             "key.major" => self.arrangement.key.scale = daw::theory::Scale::Major,
             "key.minor" => self.arrangement.key.scale = daw::theory::Scale::NaturalMinor,
@@ -4285,7 +5545,7 @@ impl App {
             "grid.narrow" => actions.push(UiAction::NarrowGrid),
             "grid.widen" => actions.push(UiAction::WidenGrid),
 
-            "view.roll" => self.bottom_view = BottomView::PianoRoll,
+            "view.roll" => self.bottom_view = BottomView::ClipEditor,
             "view.rack" => self.bottom_view = BottomView::Rack,
             "view.compact" => actions.push(UiAction::SetDensity(Density::Compact)),
             "view.comfortable" => actions.push(UiAction::SetDensity(Density::Comfortable)),
@@ -4420,6 +5680,251 @@ impl App {
         self.arrangement.selected = Some(track);
     }
 
+    /// Apply a browser request in the green-zone app shell. Catalog changes
+    /// only enqueue a worker scan; they never reach the audio engine.
+    fn handle_browser_event(&mut self, event: BrowserEvent) {
+        match event {
+            BrowserEvent::LoadDevice(item) => self.load_device(item),
+            BrowserEvent::SelectSample(path) => self.place_sample(path, None),
+            BrowserEvent::SetUserLibrary(path) => match self.library_config.set_user_library(&path)
+            {
+                Ok(()) => {
+                    self.browser.user_library_path = path.display().to_string();
+                    self.request_library_scan();
+                }
+                Err(error) => self.notice = Some(error.to_string()),
+            },
+            BrowserEvent::AddSampleFolder(path) => {
+                match self.library_config.add_sample_folder(&path) {
+                    Ok(()) => {
+                        self.browser.sample_folder_path.clear();
+                        self.request_library_scan();
+                    }
+                    Err(error) => self.notice = Some(error.to_string()),
+                }
+            }
+            BrowserEvent::RemoveSampleFolder(path) => {
+                if self.library_config.remove_sample_folder(&path) {
+                    self.request_library_scan();
+                }
+            }
+            BrowserEvent::Rescan => self.request_library_scan(),
+        }
+    }
+
+    fn request_library_scan(&mut self) {
+        self.library_service.rescan(self.library_config.clone());
+        self.library_scanning = true;
+    }
+
+    /// Track an audio-file drag over the window — an OS hover or a browser
+    /// sample being pulled — so the arrangement can preview a truthful
+    /// ghost. The WAV header is probed once per dragged path (a green-zone
+    /// read of a few bytes), and peaks are requested so the ghost grows a
+    /// waveform while it is still being aimed.
+    fn pump_drag_import(&mut self, ctx: &egui::Context) {
+        let hovered = ctx.input(|i| {
+            i.raw
+                .hovered_files
+                .first()
+                .and_then(|file| file.path.clone())
+        });
+        let dragged = hovered
+            .or_else(|| egui::DragAndDrop::payload::<SampleDrag>(ctx).map(|drag| drag.0.clone()));
+        let Some(path) = dragged else {
+            // On the drop frame the hover is already gone; the drag state
+            // survives it so the release lands where the ghost stood, and
+            // the drop handler consumes it.
+            if ctx.input(|i| i.raw.dropped_files.is_empty()) {
+                self.drag_import = None;
+            }
+            return;
+        };
+        if self
+            .drag_import
+            .as_ref()
+            .is_some_and(|drag| drag.path == path)
+        {
+            return;
+        }
+        let accepted = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("wav") || extension.eq_ignore_ascii_case("wave")
+            });
+        let header = accepted
+            .then(|| hound::WavReader::open(&path).ok())
+            .flatten()
+            .map(|reader| (reader.spec().sample_rate, u64::from(reader.duration())));
+        // Peaks are analysed against the ORIGINAL path — a placed clip
+        // re-keys to the import cache path through the normal pump.
+        if header.is_some()
+            && !self.waveform_cache.contains_key(&path)
+            && !self.waveform_failed.contains(&path)
+            && self.waveform_pending.insert(path.clone())
+        {
+            self.waveform_service.request(path.clone());
+        }
+        let name = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("audio")
+            .to_owned();
+        self.drag_import = Some(DragImport {
+            path,
+            name,
+            header,
+            accepted,
+            spot: None,
+        });
+    }
+
+    /// Queue WAV validation/resampling off the UI thread. Completion is
+    /// polled at frame start and placed through `finish_sample_placement`.
+    /// A drop passes the spot its ghost showed; everything else passes None
+    /// and lands relative to the selection.
+    fn place_sample(&mut self, path: std::path::PathBuf, spot: Option<DropSpot>) {
+        let target_rate = self.engine.as_ref().map_or_else(
+            || EngineConfig::default().sample_rate,
+            |engine| engine.info().sample_rate,
+        );
+        let path = match path.canonicalize() {
+            Ok(path) => path,
+            Err(error) => {
+                self.notice = Some(format!("cannot open {}: {error}", path.display()));
+                return;
+            }
+        };
+        let is_wav = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("wav") || extension.eq_ignore_ascii_case("wave")
+            });
+        if !is_wav {
+            self.notice = Some("clip placement currently accepts WAV files".to_owned());
+            return;
+        }
+        self.wav_import_service.import(path.clone(), target_rate);
+        self.wav_import_pending = self.wav_import_pending.saturating_add(1);
+        if let Some(spot) = spot {
+            self.pending_drop_spots.push((path.clone(), spot));
+        }
+        self.notice = Some(format!("preparing {}…", path.display()));
+    }
+
+    fn finish_sample_placement(&mut self, imported: ImportedWav) {
+        // A drop remembered where it was aimed; consume the aim so a later
+        // import of the same file is its own decision.
+        let spot = self
+            .pending_drop_spots
+            .iter()
+            .position(|(path, _)| *path == imported.original_path)
+            .map(|i| self.pending_drop_spots.remove(i).1);
+        let track = match spot.map(|spot| spot.track) {
+            // Aimed below the lanes: the drop asked for a lane of its own.
+            Some(None) => self.arrangement.add_track(TrackKind::Audio),
+            Some(Some(track))
+                if self
+                    .arrangement
+                    .tracks
+                    .get(track)
+                    .is_some_and(|track| track.kind == TrackKind::Audio) =>
+            {
+                track
+            }
+            // No aim — or the aimed lane vanished while the import ran:
+            // the selected audio track, else a fresh one.
+            _ => self
+                .arrangement
+                .selected
+                .filter(|&track| {
+                    self.arrangement
+                        .tracks
+                        .get(track)
+                        .is_some_and(|track| track.kind == TrackKind::Audio)
+                })
+                .unwrap_or_else(|| self.arrangement.add_track(TrackKind::Audio)),
+        };
+        let playhead = (self.transport.position * self.transport.bpm / 60.0) as f32;
+        let at = spot.map(|spot| spot.beat).unwrap_or_else(|| {
+            self.arrangement
+                .cursor
+                .filter(|(cursor_track, _)| *cursor_track == track)
+                .map_or(playhead, |(_, beat)| beat)
+        });
+        let at = snap(at, self.arrangement.grid_beats());
+        let name = imported
+            .original_path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("audio")
+            .to_owned();
+        let source = AudioSource {
+            path: imported.path.clone(),
+            sample_rate: imported.sample_rate,
+            source_offset: 0,
+            source_frames: imported.frames,
+            gain: 1.0,
+            looped: false,
+        };
+        if self
+            .arrangement
+            .insert_audio(track, at, name, source, self.transport.bpm)
+            .is_some()
+        {
+            self.arrangement.selected = Some(track);
+            self.arrangement.cursor = Some((track, at));
+            let converted = imported.path != imported.original_path;
+            self.notice = Some(format!(
+                "placed {} at beat {at:.2}{}",
+                imported.original_path.display(),
+                if converted { " (resampled)" } else { "" }
+            ));
+        } else {
+            self.notice = Some(format!(
+                "could not place {}",
+                imported.original_path.display()
+            ));
+        }
+    }
+
+    /// Reconcile the selected audio clip with the green-zone peak cache.
+    /// One path is requested once; duplicated clips reuse the same Arc.
+    fn pump_waveforms(&mut self) {
+        while let Some(loaded) = self.waveform_service.try_result() {
+            self.waveform_pending.remove(&loaded.path);
+            match loaded.result {
+                Ok(peaks) => {
+                    self.waveform_failed.remove(&loaded.path);
+                    self.waveform_cache.insert(loaded.path, peaks);
+                }
+                Err(error) => {
+                    self.waveform_failed.insert(loaded.path);
+                    self.notice = Some(error.to_string());
+                }
+            }
+        }
+
+        self.waveform
+            .follow_clip(self.arrangement.active_audio_clip_id());
+        // Arrangement thumbnails need every placed source, not only the
+        // selected editor target. A duplicated path is inserted into
+        // `waveform_pending` once and shares the finished Arc everywhere.
+        for clip in self.arrangement.clips.iter().flatten() {
+            let Some(path) = clip.audio.as_ref().map(|audio| &audio.path) else {
+                continue;
+            };
+            if !self.waveform_cache.contains_key(path)
+                && !self.waveform_failed.contains(path)
+                && self.waveform_pending.insert(path.clone())
+            {
+                self.waveform_service.request(path.clone());
+            }
+        }
+    }
+
     fn shape_hash(&self) -> u64 {
         shape_hash(&self.arrangement.tracks)
     }
@@ -4465,7 +5970,7 @@ impl App {
             loop_len,
             self.transport.metronome,
         );
-        match spec.compile(info.sample_rate, info.max_frames) {
+        match spec.compile_at_tempo(info.sample_rate, info.max_frames, self.transport.bpm) {
             Ok(sched) => {
                 let Some(engine) = &mut self.engine else {
                     return;
@@ -4485,6 +5990,7 @@ impl App {
                             loop_len,
                             self.arrangement.tracks.len(),
                             self.shape_hash(),
+                            self.transport.bpm.to_bits(),
                         );
                         self.last_compile = Some(Instant::now());
                     }
@@ -4599,6 +6105,7 @@ impl App {
             self.loop_len_beats(),
             self.arrangement.tracks.len(),
             self.shape_hash(),
+            self.transport.bpm.to_bits(),
         );
         if shape != self.graph_key {
             self.push_graph();
@@ -4646,7 +6153,7 @@ impl App {
             let Some(engine) = &mut self.engine else {
                 return;
             };
-            engine.set_param(node, 0, pan);
+            engine.set_param(node, daw::params::pan::PAN, pan);
             self.sent_pan[i] = pan;
         }
     }
@@ -4657,9 +6164,9 @@ impl App {
         };
         for edit in edits {
             match edit.param {
-                0 => t.reverb.mix = edit.value,
-                1 => t.reverb.size = edit.value,
-                2 => t.reverb.damp = edit.value,
+                daw::params::reverb::MIX => t.reverb.mix = edit.value,
+                daw::params::reverb::SIZE => t.reverb.size = edit.value,
+                daw::params::reverb::DAMP => t.reverb.damp = edit.value,
                 _ => {}
             }
         }
@@ -4684,9 +6191,9 @@ impl App {
         };
         for edit in edits {
             match edit.param {
-                0 => params.gain = edit.value,
-                1 => params.attack_ms = edit.value,
-                2 => params.release_ms = edit.value,
+                daw::params::seq::GAIN => params.gain = edit.value,
+                daw::params::seq::ATTACK => params.attack_ms = edit.value,
+                daw::params::seq::RELEASE => params.release_ms = edit.value,
                 _ => {}
             }
             // Only the track's OWN node — a letter to the wrong Seq would
@@ -4704,8 +6211,67 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // The engine first, before anything draws from its numbers.
         self.pump_engine(ui.ctx());
+        if let Some(snapshot) = self.library_service.newest_snapshot() {
+            self.library_snapshot = snapshot;
+            self.library_scanning = false;
+        }
+        while let Some(result) = self.wav_import_service.try_result() {
+            self.wav_import_pending = self.wav_import_pending.saturating_sub(1);
+            match result {
+                Ok(imported) => self.finish_sample_placement(imported),
+                Err(error) => self.notice = Some(error.to_string()),
+            }
+        }
+        if self.wav_import_pending == 0 {
+            // No import in flight can claim an aim any more — a failed
+            // import must not leave one behind to steer a later drop of
+            // the same file.
+            self.pending_drop_spots.clear();
+        }
+        self.pump_waveforms();
 
-        // Shift+Tab flips the bottom region between rack and piano roll.
+        // Files released over the arrangement land where their ghost stood
+        // last frame — the spot the drop preview wrote back. Several files
+        // share one aim; first-fit placement stacks them end to end.
+        let dropped: Vec<std::path::PathBuf> = ui.ctx().input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .map(|file| file.path().to_path_buf())
+                .collect()
+        });
+        if !dropped.is_empty() {
+            let spot = self.drag_import.take().and_then(|drag| drag.spot);
+            if spot.is_some() {
+                for path in dropped {
+                    self.place_sample(path, spot);
+                }
+            } else {
+                self.notice =
+                    Some("drop on an audio lane — or below the lanes for a new track".to_owned());
+            }
+        }
+        // The browser drag's release. No spot means the pull was let go
+        // somewhere that is not a landing site: a cancel, not a request.
+        if egui::DragAndDrop::has_payload_of_type::<SampleDrag>(ui.ctx())
+            && ui.ctx().input(|i| i.pointer.any_released())
+        {
+            let payload = egui::DragAndDrop::take_payload::<SampleDrag>(ui.ctx());
+            let spot = self.drag_import.take().and_then(|drag| drag.spot);
+            if let (Some(payload), Some(spot)) = (payload, spot) {
+                self.place_sample(payload.0.clone(), Some(spot));
+            }
+        }
+        self.pump_drag_import(ui.ctx());
+        if self.library_scanning || self.wav_import_pending > 0 || !self.waveform_pending.is_empty()
+        {
+            // A worker completion has no UI event of its own; keep a small
+            // green-zone polling cadence only while work is outstanding.
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(50));
+        }
+
+        // Shift+Tab flips the bottom region between rack and clip editor.
         // Consumed first, so neither editor mistakes it for its own input.
         if !ui.ctx().egui_wants_keyboard_input()
             && !self.skin.is_open()
@@ -4714,8 +6280,9 @@ impl eframe::App for App {
                 .input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab))
         {
             self.bottom_view = self.bottom_view.toggled();
-            // Stale focus must not keep eating arrows once the roll is gone.
+            // Stale editor focus must not keep eating keys once it is gone.
             self.piano_roll.owns_keys = false;
+            self.waveform.owns_keys = false;
         }
 
         // ORDER MATTERS. `piano_roll::keys` and `arrangement_keys` must get
@@ -4771,14 +6338,31 @@ impl eframe::App for App {
             });
         }
 
-        if !palette_open && !skin_open && self.bottom_view == BottomView::PianoRoll {
-            // Point the roll at the selected clip BEFORE any key reaches it:
-            // an index from the previously shown clip must never survive
-            // into an edit on this one.
-            self.piano_roll
-                .follow_clip(self.arrangement.active_clip_id());
-            let notes = self.arrangement.active_clip().map(|c| &mut c.notes);
-            piano_roll::keys(ui.ctx(), &mut self.piano_roll, notes);
+        if !palette_open && !skin_open && self.bottom_view == BottomView::ClipEditor {
+            match clip_editor_kind(&self.arrangement) {
+                ClipEditorKind::Midi => {
+                    // Point the roll at the selected clip BEFORE any key
+                    // reaches it: an index from the previously shown clip
+                    // must never survive into an edit on this one.
+                    self.piano_roll
+                        .follow_clip(self.arrangement.active_clip_id());
+                    let notes = self.arrangement.active_clip().map(|c| &mut c.notes);
+                    piano_roll::keys(ui.ctx(), &mut self.piano_roll, notes);
+                    self.waveform.owns_keys = false;
+                }
+                ClipEditorKind::Audio => {
+                    waveform::keys(
+                        ui.ctx(),
+                        &mut self.waveform,
+                        self.arrangement.active_audio_clip().is_some(),
+                    );
+                    self.piano_roll.owns_keys = false;
+                }
+                ClipEditorKind::Empty => {
+                    self.piano_roll.owns_keys = false;
+                    self.waveform.owns_keys = false;
+                }
+            }
         }
         if !palette_open && !skin_open {
             arrangement_keys(ui.ctx(), &self.arrangement, &mut actions);
@@ -4812,13 +6396,21 @@ impl eframe::App for App {
                 )
             });
 
-        // Two panels, one slot: only the current mode's panel is shown, and
-        // each keeps its own persisted size — the rack stays rack-sized, the
-        // roll can be pulled most of the way up the window.
+        // Two faces, one slot. The clip-editor face resolves to MIDI, audio,
+        // or empty from the active track, and each concrete panel keeps its
+        // own persisted height.
         // The device rack belongs to the selected track, and its knob edits
         // are addressed to that track — captured here, not re-derived later,
         // so a selection change mid-frame cannot misdeliver them.
         let device_track = self.arrangement.active_track();
+        let editor_kind = clip_editor_kind(&self.arrangement);
+        let bottom_panel_id = self.bottom_view.panel_id(editor_kind);
+        let waveform_peaks = self
+            .arrangement
+            .active_audio_clip()
+            .and_then(|clip| clip.audio.as_ref())
+            .and_then(|source| self.waveform_cache.get(&source.path))
+            .cloned();
         // The frame is built BEFORE the field borrows below: `fill` takes
         // `&self`, and a whole-self borrow cannot coexist with them.
         let sunken = self.fill(t.surface_sunken);
@@ -4853,33 +6445,83 @@ impl eframe::App for App {
                     });
                 (out.response.rect, out.inner)
             }
-            BottomView::PianoRoll => {
-                let arrangement = &mut self.arrangement;
-                let piano_roll = &mut self.piano_roll;
-                let focus = &mut self.focus;
-                let beats_per_bar = self.transport.beats_per_bar;
-                let rect = egui::Panel::bottom("piano_roll")
-                    .resizable(true)
-                    .show_separator_line(false)
-                    .default_size(piano_roll::DEFAULT_H)
-                    .size_range(piano_roll::H_RANGE)
-                    .frame(sunken)
-                    .show(ui, |ui| {
-                        let key = arrangement.key;
-                        piano_roll::body(
-                            ui,
-                            focus,
-                            t,
-                            piano_roll,
-                            beats_per_bar,
-                            arrangement.active_clip(),
-                            key,
-                        )
-                    })
-                    .response
-                    .rect;
-                (rect, DeviceEdits::default())
-            }
+            BottomView::ClipEditor => match editor_kind {
+                ClipEditorKind::Midi => {
+                    let arrangement = &mut self.arrangement;
+                    let piano_roll = &mut self.piano_roll;
+                    let focus = &mut self.focus;
+                    let beats_per_bar = self.transport.beats_per_bar;
+                    let rect = egui::Panel::bottom("piano_roll")
+                        .resizable(true)
+                        .show_separator_line(false)
+                        .default_size(piano_roll::DEFAULT_H)
+                        .size_range(piano_roll::H_RANGE)
+                        .frame(sunken)
+                        .show(ui, |ui| {
+                            let key = arrangement.key;
+                            piano_roll::body(
+                                ui,
+                                focus,
+                                t,
+                                piano_roll,
+                                beats_per_bar,
+                                arrangement.active_clip(),
+                                key,
+                            )
+                        })
+                        .response
+                        .rect;
+                    (rect, DeviceEdits::default())
+                }
+                ClipEditorKind::Audio => {
+                    let arrangement = &self.arrangement;
+                    let waveform = &mut self.waveform;
+                    let focus = &mut self.focus;
+                    let playhead = (self.transport.position * self.transport.bpm / 60.0) as f32;
+                    let time = waveform::TimeView {
+                        bpm: self.transport.bpm,
+                        beats_per_bar: self.transport.beats_per_bar,
+                        playhead,
+                        grid_beats: arrangement.grid_beats(),
+                        grid_name: GRID_NAMES[arrangement.grid.min(GRID_NAMES.len() - 1)],
+                    };
+                    let rect = egui::Panel::bottom("waveform_editor")
+                        .resizable(true)
+                        .show_separator_line(false)
+                        .default_size(waveform::DEFAULT_H)
+                        .size_range(waveform::H_RANGE)
+                        .frame(sunken)
+                        .show(ui, |ui| {
+                            waveform::body(
+                                ui,
+                                focus,
+                                t,
+                                waveform,
+                                arrangement.active_audio_clip(),
+                                waveform_peaks.as_deref(),
+                                time,
+                            )
+                        })
+                        .response
+                        .rect;
+                    (rect, DeviceEdits::default())
+                }
+                ClipEditorKind::Empty => {
+                    let rect = egui::Panel::bottom("clip_editor")
+                        .resizable(true)
+                        .show_separator_line(false)
+                        .default_size(waveform::DEFAULT_H)
+                        .size_range(waveform::H_RANGE)
+                        .frame(sunken)
+                        .show(ui, |ui| {
+                            claim(ui);
+                            kit::empty_state(ui, t, "select a MIDI or audio track");
+                        })
+                        .response
+                        .rect;
+                    (rect, DeviceEdits::default())
+                }
+            },
         };
         // `edits` is applied at the end of the frame, once the theme borrow
         // the panels hold has ended.
@@ -4891,17 +6533,30 @@ impl eframe::App for App {
             .size_range(BROWSER_W_RANGE)
             .frame(self.fill(t.surface_sunken))
             .show(ui, |ui| {
-                browser_body(ui, t, &mut self.focus, &mut self.browser)
+                browser_body(
+                    ui,
+                    t,
+                    &mut self.focus,
+                    &mut self.browser,
+                    &self.library_snapshot,
+                    &self.library_config,
+                    self.library_scanning,
+                )
             });
         // Applied at the end of the frame with `edits`, for the same
         // reason: the panels still hold the theme borrow here.
-        let load_device = browser_panel.inner;
+        let browser_event = browser_panel.inner;
         let browser = browser_panel.response.rect;
 
         // The transport position in beats: what the arrangement draws its
         // playhead from. The stand-in clock ticks in seconds; the engine's
         // playhead will arrive in beats already.
-        let playhead = (self.transport.position * self.transport.bpm / 60.0) as f32;
+        let arrangement_transport = ArrangementTransportView {
+            beats_per_bar: self.transport.beats_per_bar,
+            bpm: self.transport.bpm,
+            playhead: (self.transport.position * self.transport.bpm / 60.0) as f32,
+            follow: self.transport.follow,
+        };
 
         let panned = egui::CentralPanel::default()
             .frame(self.fill(t.bg))
@@ -4911,9 +6566,9 @@ impl eframe::App for App {
                     &mut self.focus,
                     &self.theme,
                     &mut self.arrangement,
-                    self.transport.beats_per_bar,
-                    playhead,
-                    self.transport.follow,
+                    arrangement_transport,
+                    &self.waveform_cache,
+                    self.drag_import.as_mut(),
                 )
             })
             .inner;
@@ -4930,7 +6585,7 @@ impl eframe::App for App {
         // that is not there — and only while that seam is pointed at or
         // pulled, so an untouched window is fills and nothing else.
         seam(ui, "browser", vertical_seam(browser));
-        seam(ui, self.bottom_view.panel_id(), horizontal_seam(device));
+        seam(ui, bottom_panel_id, horizontal_seam(device));
 
         self.focus.end(ui, t);
 
@@ -4940,8 +6595,8 @@ impl eframe::App for App {
             self.apply_param_edits(track, &edits.synth);
             self.apply_fx_edits(track, &edits.fx);
         }
-        if let Some(item) = load_device {
-            self.load_device(item);
+        if let Some(event) = browser_event {
+            self.handle_browser_event(event);
         }
 
         // The power actions are the app's own — they own the Engine, which
@@ -5006,6 +6661,8 @@ impl eframe::App for App {
     /// the 30s auto-save, so a density choice made mid-session survives it.
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, STORAGE_KEY, &self.prefs);
+        eframe::set_value(storage, library::CONFIG_STORAGE_KEY, &self.library_config);
+        eframe::set_value(storage, library::CACHE_STORAGE_KEY, &self.library_snapshot);
     }
 }
 
@@ -5053,7 +6710,15 @@ mod tests {
                 .size_range(BROWSER_W_RANGE)
                 .frame(egui::Frame::new().fill(theme.surface))
                 .show(ui, |ui| {
-                    browser_body(ui, &theme, &mut Focus::default(), &mut Browser::default())
+                    browser_body(
+                        ui,
+                        &theme,
+                        &mut Focus::default(),
+                        &mut Browser::default(),
+                        &LibrarySnapshot::default(),
+                        &LibraryConfig::default(),
+                        false,
+                    )
                 })
                 .response
                 .rect
@@ -5313,7 +6978,15 @@ mod tests {
                     .size_range(BROWSER_W_RANGE)
                     .frame(egui::Frame::new().fill(theme.surface_sunken))
                     .show(ui, |ui| {
-                        browser_body(ui, &theme, &mut Focus::default(), &mut Browser::default())
+                        browser_body(
+                            ui,
+                            &theme,
+                            &mut Focus::default(),
+                            &mut Browser::default(),
+                            &LibrarySnapshot::default(),
+                            &LibraryConfig::default(),
+                            false,
+                        )
                     })
                     .response
                     .rect;
@@ -5384,8 +7057,11 @@ mod tests {
         assert_eq!((field.left(), field.right()), (30.0, 190.0));
     }
 
-    /// No invented library: every row the browser offers is something
-    /// `load_device` can really build, and both slots are represented.
+    /// No invented library: whatever rows the browser offers must each be
+    /// something `load_device` can really build and reach as a row. The
+    /// built-in Sine Synth and Reverb entries were mockups and are gone, so
+    /// this holds vacuously today — it is kept as the guard on whatever
+    /// refills the tree, which is the half that was ever load-bearing.
     #[test]
     fn the_browser_lists_only_devices_that_load() {
         let browser = Browser::default();
@@ -5394,16 +7070,7 @@ mod tests {
             .iter()
             .flat_map(|f| f.items.iter().copied())
             .collect();
-        assert!(!items.is_empty(), "loadable devices exist, so list them");
-        assert!(
-            items.iter().any(|i| i.load.is_instrument()),
-            "an instrument must be listed"
-        );
-        assert!(
-            items.iter().any(|i| !i.load.is_instrument()),
-            "an effect must be listed"
-        );
-        // And every item is reachable as a row, so it can be activated.
+        // Every item is reachable as a row, so it can be activated.
         assert_eq!(
             tree_targets(&browser.folders)
                 .iter()
@@ -6189,21 +7856,21 @@ mod tests {
     fn the_arrangement_maps_beats_to_pixels() {
         let area = Rect::from_min_size(pos2(40.0, 0.0), vec2(800.0, 400.0));
         for beat in [0.0, 1.0, 4.5, 37.25] {
-            let back = beat_at(area, 0.0, x_at(area, 0.0, beat));
+            let back = beat_at(area, 0.0, PX_PER_BEAT, x_at(area, 0.0, PX_PER_BEAT, beat));
             assert!((back - beat).abs() < 1e-3, "{beat} round-tripped to {back}");
         }
         // The offset is a view window, not a time change: the round trip
         // holds from anywhere in the song.
         for beat in [0.0, 1.0, 4.5, 37.25] {
-            let back = beat_at(area, 24.0, x_at(area, 24.0, beat));
+            let back = beat_at(area, 24.0, PX_PER_BEAT, x_at(area, 24.0, PX_PER_BEAT, beat));
             assert!((back - beat).abs() < 1e-3, "{beat} round-tripped to {back}");
         }
         // Nothing before the start of the timeline.
-        assert_eq!(beat_at(area, 0.0, area.left() - 500.0), 0.0);
+        assert_eq!(beat_at(area, 0.0, PX_PER_BEAT, area.left() - 500.0), 0.0);
         // A panned view puts absolute beats at the left edge and earlier
         // beats off-screen to the left.
-        assert_eq!(x_at(area, 24.0, 24.0), area.left());
-        assert!(x_at(area, 24.0, 0.0) < area.left());
+        assert_eq!(x_at(area, 24.0, PX_PER_BEAT, 24.0), area.left());
+        assert!(x_at(area, 24.0, PX_PER_BEAT, 0.0) < area.left());
 
         // Snapping lands on multiples of the grid, nearest wins.
         assert_eq!(snap(1.2, 1.0), 1.0);
@@ -6212,6 +7879,71 @@ mod tests {
         assert_eq!(snap(0.4, 4.0), 0.0);
         assert_eq!(snap(-3.0, 1.0), 0.0, "snapping cannot go negative");
         assert_eq!(snap(2.7, 0.0), 2.7, "a zero grid must not divide by zero");
+    }
+
+    #[test]
+    fn z_frames_selected_audio_and_x_restores_the_previous_view() {
+        let mut arrangement = Arrangement::default();
+        let track = arrangement.add_track(TrackKind::Audio);
+        let source = AudioSource {
+            path: std::path::PathBuf::from("kick.wav"),
+            sample_rate: 48_000,
+            source_offset: 0,
+            source_frames: 96_000,
+            gain: 1.0,
+            looped: false,
+        };
+        assert_eq!(
+            arrangement.insert_audio(track, 32.0, "kick".into(), source, 120.0),
+            Some(0)
+        );
+        arrangement.view_beats = 12.0;
+        arrangement.pixels_per_beat = 48.0;
+        arrangement.viewport_width = 900.0;
+        let original_view = (arrangement.view_beats, arrangement.pixels_per_beat);
+        let mut transport = Transport::default();
+
+        perform(
+            &[UiAction::ZoomSelectedAudioClip],
+            &mut transport,
+            &mut arrangement,
+        );
+
+        // Two seconds at 120 BPM is four beats. Five percent is smaller
+        // than the quarter-beat minimum margin, so Z frames 31.75..36.25.
+        assert!((arrangement.view_beats - 31.75).abs() < 1e-3);
+        assert!((arrangement.pixels_per_beat - 200.0).abs() < 1e-3);
+        assert_eq!(arrangement.zoom_restore, Some(original_view));
+        assert!(!transport.follow, "follow must not immediately page away");
+
+        // Repeating Z must not replace the view X returns to.
+        perform(
+            &[UiAction::ZoomSelectedAudioClip],
+            &mut transport,
+            &mut arrangement,
+        );
+        assert_eq!(arrangement.zoom_restore, Some(original_view));
+
+        perform(&[UiAction::ZoomBack], &mut transport, &mut arrangement);
+        assert_eq!(
+            (arrangement.view_beats, arrangement.pixels_per_beat),
+            original_view
+        );
+        assert_eq!(arrangement.zoom_restore, None);
+    }
+
+    #[test]
+    fn z_ignores_a_selected_midi_clip() {
+        let mut arrangement = Arrangement::default();
+        assert_eq!(arrangement.create_clip(0, 8.0, 4.0), Some(0));
+        arrangement.view_beats = 3.0;
+        arrangement.pixels_per_beat = 80.0;
+        arrangement.viewport_width = 900.0;
+
+        assert!(!arrangement.zoom_selected_audio_clip());
+        assert_eq!(arrangement.view_beats, 3.0);
+        assert_eq!(arrangement.pixels_per_beat, 80.0);
+        assert_eq!(arrangement.zoom_restore, None);
     }
 
     /// Clips can be moved and resized, but never through a neighbour and
@@ -6227,6 +7959,7 @@ mod tests {
                 start: 0.0,
                 len: 4.0,
                 notes: vec![],
+                audio: None,
             },
             Clip {
                 id: 2,
@@ -6234,6 +7967,7 @@ mod tests {
                 start: 4.0,
                 len: 4.0,
                 notes: vec![],
+                audio: None,
             },
             Clip {
                 id: 3,
@@ -6241,6 +7975,7 @@ mod tests {
                 start: 12.0,
                 len: 8.0,
                 notes: vec![],
+                audio: None,
             },
         ];
 
@@ -6277,6 +8012,7 @@ mod tests {
                 start: 0.0,
                 len: 0.75,
                 notes: vec![],
+                audio: None,
             },
             Clip {
                 id: 2,
@@ -6284,6 +8020,7 @@ mod tests {
                 start: 0.75,
                 len: 1.0,
                 notes: vec![],
+                audio: None,
             },
         ];
         assert_eq!(clamp_clip_len(&squeezed, 0, 4.0, 1.0), 0.75);
@@ -6305,6 +8042,41 @@ mod tests {
             vec![2, 1, 3],
             "a jumped to 6 must land between b (4) and c (12)"
         );
+    }
+
+    #[test]
+    fn audio_left_trim_moves_the_source_window_non_destructively() {
+        let mut clip = Clip {
+            id: 1,
+            name: "take".into(),
+            start: 4.0,
+            len: 8.0,
+            notes: Vec::new(),
+            audio: Some(AudioSource {
+                path: PathBuf::from("take.wav"),
+                sample_rate: 48_000,
+                source_offset: 0,
+                source_frames: 192_000,
+                gain: 1.0,
+                looped: false,
+            }),
+        };
+
+        trim_clip_left(&mut clip, 6.0, 120.0);
+        let audio = clip.audio.as_ref().expect("audio source");
+        assert_eq!((clip.start, clip.len), (6.0, 6.0));
+        assert_eq!(audio.source_offset, 48_000, "two beats are one second");
+        assert_eq!(audio.source_frames, 144_000);
+        assert_eq!(audio.source_offset + audio.source_frames, 192_000);
+
+        // Pulling the edge back reveals the original frames instead of
+        // stretching the already-trimmed waveform across the larger clip.
+        trim_clip_left(&mut clip, 5.0, 120.0);
+        let audio = clip.audio.as_ref().expect("audio source");
+        assert_eq!((clip.start, clip.len), (5.0, 7.0));
+        assert_eq!(audio.source_offset, 24_000);
+        assert_eq!(audio.source_frames, 168_000);
+        assert_eq!(audio.source_offset + audio.source_frames, 192_000);
     }
 
     /// Notes map pitch to y with the high notes on top, and a clip's time
@@ -6333,8 +8105,9 @@ mod tests {
             start: 2.0,
             len: 4.0,
             notes: vec![],
+            audio: None,
         };
-        let r = clip_rect(content, 0.0, lane, &clip);
+        let r = clip_rect(content, 0.0, PX_PER_BEAT, lane, &clip);
         assert_eq!(r.left(), 2.0 * PX_PER_BEAT);
         assert_eq!(r.width(), 4.0 * PX_PER_BEAT);
         assert_eq!(r.height(), lane.height());
@@ -6401,11 +8174,11 @@ mod tests {
         arrangement_pass(&ctx, &mut arr, vec![]);
         assert_eq!(arr.clips[0][0].start, 0.0, "the clip starts at beat 0");
 
-        // Lane 0 spans y 14..78 (ruler above). The clip spans x 0..96.
+        // The clip spans x 0..96 on lane 0, below the minimap and ruler.
         // Like the browser-drag test: press in one pass, then move — one
         // pass registers the drag, the next reads it back.
-        let press = pos2(TL + 48.0, 40.0);
-        let release = pos2(TL + 48.0 + PX_PER_BEAT, 40.0);
+        let press = pos2(TL + 48.0, LANES_TOP + TRACK_H * 0.5);
+        let release = pos2(TL + 48.0 + PX_PER_BEAT, LANES_TOP + TRACK_H * 0.5);
         arrangement_pass(
             &ctx,
             &mut arr,
@@ -6451,8 +8224,8 @@ mod tests {
         arrangement_pass(&ctx, &mut arr, vec![]);
 
         // The brace spans x 96..192 at y 2..12 (the ruler strip).
-        let press = pos2(TL + 120.0, 7.0);
-        let release = pos2(TL + 120.0 + PX_PER_BEAT, 7.0);
+        let press = pos2(TL + 120.0, MINIMAP_H + LOOP_RULER_H * 0.5);
+        let release = pos2(TL + 120.0 + PX_PER_BEAT, MINIMAP_H + LOOP_RULER_H * 0.5);
         arrangement_pass(
             &ctx,
             &mut arr,
@@ -6496,16 +8269,361 @@ mod tests {
     /// mute button instead of a clip.
     const TL: f32 = HEADER_W;
 
+    /// The y where the lanes start: below the minimap and the loop ruler.
+    const LANES_TOP: f32 = MINIMAP_H + LOOP_RULER_H;
+
     fn arrangement_pass(ctx: &egui::Context, arr: &mut Arrangement, events: Vec<Event>) {
         let mut out = ctx.run_ui(input(events), |ui| {
             let theme = Theme::dark();
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(theme.bg))
                 .show(ui, |ui| {
-                    arrangement_body(ui, &mut Focus::default(), &theme, arr, 4, 0.0, false);
+                    arrangement_body(
+                        ui,
+                        &mut Focus::default(),
+                        &theme,
+                        arr,
+                        ArrangementTransportView {
+                            beats_per_bar: 4,
+                            bpm: 120.0,
+                            playhead: 0.0,
+                            follow: false,
+                        },
+                        &HashMap::new(),
+                        None,
+                    );
                 });
         });
         out.textures_delta.clear();
+    }
+
+    /// A plain drag on a clip body lifts it onto a ghost that follows the
+    /// pointer across lanes; releasing lands the ORIGINAL there — same id,
+    /// vacated from the source lane. A lane whose kind cannot hold the clip
+    /// never captures the ghost.
+    #[test]
+    fn dragging_a_clip_moves_it_across_lanes() {
+        let ctx = egui::Context::default();
+        let mut arr = Arrangement::default();
+        arr.create_clip(0, 0.0, 4.0).unwrap();
+        let id = arr.clips[0][0].id;
+        arrangement_pass(&ctx, &mut arr, vec![]);
+
+        // Press mid-clip on lane 0, pull down into lane 1 (also MIDI).
+        let press = pos2(TL + 48.0, LANES_TOP + TRACK_H * 0.5);
+        let release = pos2(TL + 48.0, LANES_TOP + TRACK_H * 1.5);
+        arrangement_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::PointerMoved(press),
+                Event::PointerButton {
+                    pos: press,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        arrangement_pass(&ctx, &mut arr, vec![Event::PointerMoved(release)]);
+        arrangement_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::PointerMoved(release),
+                Event::PointerButton {
+                    pos: release,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        assert!(arr.clips[0].is_empty(), "the source lane is vacated");
+        assert_eq!(arr.clips[1].len(), 1, "the clip landed on lane 1");
+        assert_eq!(arr.clips[1][0].id, id, "a move keeps the clip's identity");
+        assert_eq!(arr.clips[1][0].start, 0.0, "no horizontal motion, no slide");
+        assert_eq!(arr.selected_clip, Some((1, 0)));
+    }
+
+    /// A slow drag — many small pointer steps, each under a grid step —
+    /// still moves the clip. Regression: position was once accumulated from
+    /// snapped per-frame deltas, so every step rounded back to the start
+    /// and the clip stuck.
+    #[test]
+    fn a_slow_drag_still_moves_the_clip() {
+        let ctx = egui::Context::default();
+        let mut arr = Arrangement::default();
+        arr.create_clip(0, 0.0, 4.0).unwrap();
+        arrangement_pass(&ctx, &mut arr, vec![]);
+
+        let y = LANES_TOP + TRACK_H * 0.5;
+        let press = pos2(TL + 48.0, y);
+        arrangement_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::PointerMoved(press),
+                Event::PointerButton {
+                    pos: press,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        // 8 steps of 6px: a quarter of a grid step (24px) per frame, two
+        // beats in total.
+        for step in 1..=8 {
+            let pos = pos2(press.x + step as f32 * 6.0, y);
+            arrangement_pass(&ctx, &mut arr, vec![Event::PointerMoved(pos)]);
+        }
+        let release = pos2(press.x + 48.0, y);
+        arrangement_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::PointerMoved(release),
+                Event::PointerButton {
+                    pos: release,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        assert_eq!(
+            arr.clips[0][0].start, 2.0,
+            "small steps accumulate into a two-beat move"
+        );
+    }
+
+    /// Ctrl+drag lands a copy under a fresh id — identity is never in two
+    /// places — and the original does not move.
+    #[test]
+    fn ctrl_dragging_a_clip_copies_it_under_a_fresh_id() {
+        let ctx = egui::Context::default();
+        let mut arr = Arrangement::default();
+        arr.create_clip(0, 0.0, 4.0).unwrap();
+        let id = arr.clips[0][0].id;
+        arrangement_pass(&ctx, &mut arr, vec![]);
+
+        let ctrl = egui::Modifiers {
+            command: true,
+            ..Default::default()
+        };
+        let press = pos2(TL + 48.0, LANES_TOP + TRACK_H * 0.5);
+        let release = pos2(TL + 48.0 + 8.0 * PX_PER_BEAT, LANES_TOP + TRACK_H * 0.5);
+        arrangement_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                // Modifiers are frame state, not per-event: the pass reads
+                // them from the input, so ctrl must be raised explicitly.
+                Event::ModifiersChanged(ctrl),
+                Event::PointerMoved(press),
+                Event::PointerButton {
+                    pos: press,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: ctrl,
+                },
+            ],
+        );
+        arrangement_pass(&ctx, &mut arr, vec![Event::PointerMoved(release)]);
+        arrangement_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::PointerMoved(release),
+                Event::PointerButton {
+                    pos: release,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: ctrl,
+                },
+            ],
+        );
+        assert_eq!(arr.clips[0].len(), 2, "the original stays, a copy lands");
+        assert_eq!(arr.clips[0][0].id, id, "the original is untouched");
+        assert_eq!(arr.clips[0][0].start, 0.0);
+        assert_ne!(arr.clips[0][1].id, id, "the copy has an id of its own");
+        assert_eq!(arr.clips[0][1].start, 8.0, "eight beats of drag, snapped");
+    }
+
+    /// A press on the minimap outside the view window centres the window on
+    /// the pointer — clamped so the view never runs past the mapped span —
+    /// and dragging scrubs it from there.
+    #[test]
+    fn the_minimap_jumps_the_view() {
+        let ctx = egui::Context::default();
+        let mut arr = Arrangement::default();
+        // Content out to beat 100, so the map spans well past the viewport.
+        arr.create_clip(0, 96.0, 4.0).unwrap();
+        arrangement_pass(&ctx, &mut arr, vec![]);
+        assert_eq!(arr.view_beats, 0.0);
+
+        // Press near the strip's right edge: the window centres there, but
+        // the clamp stops it where the view's end meets the span's end.
+        let pos = pos2(SCREEN.x - 2.0, MINIMAP_H * 0.5);
+        arrangement_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::PointerMoved(pos),
+                Event::PointerButton {
+                    pos,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        let viewport = (SCREEN.x - TL) / PX_PER_BEAT;
+        let span = (100.0f32 * 1.05).max(viewport);
+        let expected = (span - viewport).max(0.0);
+        assert!(
+            (arr.view_beats - expected).abs() < 0.01,
+            "the view is pinned to the span's end: {} vs {expected}",
+            arr.view_beats
+        );
+
+        // Releasing elsewhere does not move it further than the drag says.
+        arrangement_pass(
+            &ctx,
+            &mut arr,
+            vec![Event::PointerButton {
+                pos,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }],
+        );
+        assert!((arr.view_beats - expected).abs() < 0.01);
+    }
+
+    /// Ctrl+scroll zooms the timeline around the pointer: the beat under
+    /// it stays under it, and the scale respects its bounds.
+    #[test]
+    fn zooming_anchors_the_beat_under_the_pointer() {
+        let ctx = egui::Context::default();
+        let mut arr = Arrangement::default();
+        arr.view_beats = 4.0;
+        // The pointer sits 96px into the timeline: beat 4 + 96/24 = 8.
+        let pos = pos2(TL + 96.0, LANES_TOP + TRACK_H * 0.5);
+        arrangement_pass(
+            &ctx,
+            &mut arr,
+            vec![Event::PointerMoved(pos), Event::Zoom(2.0)],
+        );
+        assert_eq!(arr.pixels_per_beat, 2.0 * PX_PER_BEAT);
+        // Beat 8 must still be 96px from the left: view = 8 - 96/48 = 6.
+        assert_eq!(arr.view_beats, 6.0);
+
+        // Zooming out far past the floor clamps the scale, and the view
+        // stops at beat 0 — the anchor never pulls the timeline negative.
+        arrangement_pass(
+            &ctx,
+            &mut arr,
+            vec![Event::PointerMoved(pos), Event::Zoom(0.001)],
+        );
+        assert_eq!(arr.pixels_per_beat, ARRANGEMENT_ZOOM_MIN);
+        assert_eq!(
+            arr.view_beats, 0.0,
+            "keeping beat 8 at 96px would need a negative view"
+        );
+    }
+
+    /// Like `arrangement_pass`, but with an audio-file drag in flight —
+    /// the drop preview writes the landing spot back onto the drag.
+    fn arrangement_drag_pass(
+        ctx: &egui::Context,
+        arr: &mut Arrangement,
+        events: Vec<Event>,
+        drag: &mut DragImport,
+    ) {
+        let mut out = ctx.run_ui(input(events), |ui| {
+            let theme = Theme::dark();
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(theme.bg))
+                .show(ui, |ui| {
+                    arrangement_body(
+                        ui,
+                        &mut Focus::default(),
+                        &theme,
+                        arr,
+                        ArrangementTransportView {
+                            beats_per_bar: 4,
+                            bpm: 120.0,
+                            playhead: 0.0,
+                            follow: false,
+                        },
+                        &HashMap::new(),
+                        Some(drag),
+                    );
+                });
+        });
+        out.textures_delta.clear();
+    }
+
+    /// The drop preview aims at the nearest grid line of the lane under the
+    /// pointer — audio lanes only — and the empty space below the lanes
+    /// aims at a track of its own. A refused file aims nowhere.
+    #[test]
+    fn a_file_drag_lands_on_the_nearest_grid_line() {
+        let ctx = egui::Context::default();
+        let mut arr = Arrangement::default();
+        let audio = arr.add_track(TrackKind::Audio);
+        let audio_y = LANES_TOP
+            + arr.tracks[..audio].iter().map(|t| t.height).sum::<f32>()
+            + arr.tracks[audio].height * 0.5;
+        let mut drag = DragImport {
+            path: "/tmp/kick.wav".into(),
+            name: "kick".into(),
+            // One second at 48k: two beats at the pass's 120 bpm.
+            header: Some((48_000, 48_000)),
+            accepted: true,
+            spot: None,
+        };
+
+        // Beat 2.3 over the audio lane snaps to the nearest quarter, 2.0.
+        let over = pos2(TL + 2.3 * PX_PER_BEAT, audio_y);
+        arrangement_drag_pass(&ctx, &mut arr, vec![Event::PointerMoved(over)], &mut drag);
+        assert_eq!(
+            drag.spot,
+            Some(DropSpot {
+                track: Some(audio),
+                beat: 2.0
+            })
+        );
+
+        // Beat 2.7 rounds up, not down.
+        let over = pos2(TL + 2.7 * PX_PER_BEAT, audio_y);
+        arrangement_drag_pass(&ctx, &mut arr, vec![Event::PointerMoved(over)], &mut drag);
+        assert_eq!(drag.spot.map(|spot| spot.beat), Some(3.0));
+
+        // A MIDI lane refuses: no spot, so a release there places nothing.
+        let midi = pos2(TL + 2.3 * PX_PER_BEAT, LANES_TOP + TRACK_H * 0.5);
+        arrangement_drag_pass(&ctx, &mut arr, vec![Event::PointerMoved(midi)], &mut drag);
+        assert_eq!(drag.spot, None);
+
+        // The empty space below every lane aims at a new track.
+        let lanes_bottom = LANES_TOP + arr.tracks.iter().map(|t| t.height).sum::<f32>();
+        let below = pos2(TL + 4.1 * PX_PER_BEAT, lanes_bottom + 100.0);
+        arrangement_drag_pass(&ctx, &mut arr, vec![Event::PointerMoved(below)], &mut drag);
+        assert_eq!(
+            drag.spot,
+            Some(DropSpot {
+                track: None,
+                beat: 4.0
+            })
+        );
+
+        // A file the importer will refuse is previewed as refused.
+        drag.accepted = false;
+        let over = pos2(TL + 2.3 * PX_PER_BEAT, audio_y);
+        arrangement_drag_pass(&ctx, &mut arr, vec![Event::PointerMoved(over)], &mut drag);
+        assert_eq!(drag.spot, None);
     }
 
     /// `place_clip` is the placement policy behind create, paste, duplicate
@@ -6520,6 +8638,7 @@ mod tests {
                 start: 0.0,
                 len: 4.0,
                 notes: vec![],
+                audio: None,
             },
             Clip {
                 id: 2,
@@ -6527,6 +8646,7 @@ mod tests {
                 start: 8.0,
                 len: 2.0,
                 notes: vec![],
+                audio: None,
             },
         ];
         // A small clip fits in the 4..8 gap, exactly where asked.
@@ -6624,9 +8744,9 @@ mod tests {
             "a fresh session has no clips at all"
         );
 
-        // Lane 2 spans y 142..206. Click at beat 2, twice — one pass per
+        // Lane 2, below the minimap and ruler. Click at beat 2, twice — one pass per
         // click, so egui sees two clicks in a row at one position.
-        let pos = pos2(TL + 2.0 * PX_PER_BEAT, 170.0);
+        let pos = pos2(TL + 2.0 * PX_PER_BEAT, LANES_TOP + TRACK_H * 2.5);
         for _ in 0..2 {
             arrangement_pass(
                 &ctx,
@@ -6669,8 +8789,8 @@ mod tests {
         // Press on the first clip (x 0..96, lane 0 y 14..78) with the
         // command modifier held (egui learns modifiers from
         // ModifiersChanged events), then drag 10 beats right.
-        let press = pos2(TL + 48.0, 40.0);
-        let release = pos2(TL + 48.0 + 10.0 * PX_PER_BEAT, 40.0);
+        let press = pos2(TL + 48.0, LANES_TOP + TRACK_H * 0.5);
+        let release = pos2(TL + 48.0 + 10.0 * PX_PER_BEAT, LANES_TOP + TRACK_H * 0.5);
         arrangement_pass(
             &ctx,
             &mut arr,
@@ -6824,8 +8944,8 @@ mod tests {
         let lanes = lane_rects(content, &arr.tracks);
         let grid = arr.grid_beats();
 
-        let a = cell_rect(content, 0.0, lanes[0], 4.0, grid);
-        let b = cell_rect(content, 0.0, lanes[3], 4.0, grid);
+        let a = cell_rect(content, 0.0, PX_PER_BEAT, lanes[0], 4.0, grid);
+        let b = cell_rect(content, 0.0, PX_PER_BEAT, lanes[3], 4.0, grid);
         assert_eq!(a.left(), b.left(), "cells at the same beat must share an x");
         assert_eq!(a.width(), b.width());
         assert_eq!(
@@ -6842,7 +8962,7 @@ mod tests {
             .map(|(i, l)| {
                 (
                     egui::Id::new(("lane", i)),
-                    cell_rect(content, 0.0, *l, 4.0, grid),
+                    cell_rect(content, 0.0, PX_PER_BEAT, *l, 4.0, grid),
                 )
             })
             .collect();
@@ -6850,6 +8970,32 @@ mod tests {
             nearest(items[0].1, Dir::Down, &items, Some(items[0].0)),
             Some(items[1].0)
         );
+    }
+
+    #[test]
+    fn z_and_x_reach_the_arrangement_zoom_actions() {
+        for (key, expected) in [
+            (egui::Key::Z, UiAction::ZoomSelectedAudioClip),
+            (egui::Key::X, UiAction::ZoomBack),
+        ] {
+            let ctx = egui::Context::default();
+            let mut actions = Vec::new();
+            let mut out = ctx.run_ui(
+                input(vec![Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Default::default(),
+                }]),
+                |_ui| {},
+            );
+            out.textures_delta.clear();
+
+            arrangement_keys(&ctx, &Arrangement::default(), &mut actions);
+
+            assert_eq!(actions, vec![expected]);
+        }
     }
 
     /// `arrangement_keys` must get first refusal on the arrows. `Focus`
@@ -7149,6 +9295,7 @@ mod tests {
                 start: 4.0,
                 len: 2.0,
                 notes: vec![note(60, 0.0, 1.0, 100), note(62, 1.5, 0.5, 90)],
+                audio: None,
             },
             Clip {
                 id: 2,
@@ -7156,6 +9303,7 @@ mod tests {
                 start: 16.0,
                 len: 1.0,
                 notes: vec![note(48, 0.25, 0.25, 1)],
+                audio: None,
             },
         ];
         let out = seq_notes(&clips);
@@ -7188,6 +9336,7 @@ mod tests {
                 note(64, 1.0, 1.0, 100),
                 note(67, 8.0, 1.0, 100),
             ],
+            audio: None,
         }];
         let out = seq_notes(&hidden);
         assert_eq!(out.len(), 1, "only the note inside the clip sounds");
@@ -7200,6 +9349,7 @@ mod tests {
             start: 0.0,
             len: 1.0,
             notes: vec![note(60, 0.5, 4.0, 100)],
+            audio: None,
         }];
         assert_eq!(seq_notes(&ringing)[0].len_beats, 4.0);
 
@@ -7323,7 +9473,7 @@ mod tests {
             "a fresh session has no clips"
         );
 
-        // A fresh session has no INSTRUMENTS either, so no track becomes a
+        // A fresh session has no instrument loaded either, so no track becomes a
         // node — the graph is empty and still compiles.
         let (spec, nodes) = build_graph_spec(&a.tracks, &a.clips, None, false);
         assert!(nodes.seqs.iter().all(|s| s.is_none()), "no device, no node");
@@ -7372,6 +9522,44 @@ mod tests {
     }
 
     // --- tracks -----------------------------------------------------------
+
+    #[test]
+    fn clip_editor_follows_the_active_track_kind() {
+        let mut arrangement = Arrangement::default();
+        assert_eq!(clip_editor_kind(&arrangement), ClipEditorKind::Empty);
+
+        arrangement.selected = Some(0);
+        assert_eq!(clip_editor_kind(&arrangement), ClipEditorKind::Midi);
+
+        let audio = arrangement.add_track(TrackKind::Audio);
+        assert_eq!(arrangement.selected, Some(audio));
+        assert_eq!(clip_editor_kind(&arrangement), ClipEditorKind::Audio);
+
+        let source = AudioSource {
+            path: PathBuf::from("voice.wav"),
+            sample_rate: 48_000,
+            source_offset: 0,
+            source_frames: 48_000,
+            gain: 1.0,
+            looped: false,
+        };
+        assert_eq!(
+            arrangement.insert_audio(audio, 0.0, "voice".into(), source, 120.0),
+            Some(0)
+        );
+        arrangement.selected = Some(0);
+        assert_eq!(
+            clip_editor_kind(&arrangement),
+            ClipEditorKind::Audio,
+            "the selected clip owns the active-track decision"
+        );
+
+        assert_ne!(
+            BottomView::ClipEditor.panel_id(ClipEditorKind::Midi),
+            BottomView::ClipEditor.panel_id(ClipEditorKind::Audio),
+            "MIDI and audio editors remember independent heights"
+        );
+    }
 
     /// A fresh track is fully formed: kind, a name from that kind's own
     /// counter, its own clip vec, and the selection moved onto it. Every
@@ -7506,17 +9694,40 @@ mod tests {
         assert_eq!(soloed.seqs.iter().filter(|s| s.is_some()).count(), 1);
     }
 
-    /// An audio track compiles to nothing: it has no instrument slot, and
-    /// its material is the sound. A lane that looked live and was silent
-    /// would be worse than one that plainly holds nothing yet.
+    /// An empty audio track has no sequencer or pan. Once a source is placed,
+    /// it gains an AudioClip and the same post-track pan route as MIDI.
     #[test]
-    fn an_audio_track_makes_no_sequencer() {
+    fn an_audio_track_wires_placed_sources_without_a_sequencer() {
         let mut a = Arrangement::default();
         let i = a.add_track(TrackKind::Audio);
         // Even with a device somehow set on it, the kind decides.
         a.tracks[i].device = Some(DeviceKind::SineSynth);
         let (_, nodes) = build_graph_spec(&a.tracks, &a.clips, None, false);
         assert!(nodes.seqs[i].is_none(), "no instrument on an audio track");
+        assert!(nodes.pans[i].is_none(), "an empty audio lane is absent");
+
+        let source = AudioSource {
+            path: std::path::PathBuf::from("/missing/but-structurally-valid.wav"),
+            sample_rate: 48_000,
+            source_offset: 0,
+            source_frames: 48_000,
+            gain: 1.0,
+            looped: false,
+        };
+        a.insert_audio(i, 2.0, "sample".to_owned(), source, 120.0)
+            .unwrap();
+        assert_eq!(a.clips[i][0].start, 2.0);
+        assert_eq!(a.clips[i][0].len, 2.0, "one second is two beats at 120");
+        let (spec, nodes) = build_graph_spec(&a.tracks, &a.clips, None, false);
+        assert!(nodes.seqs[i].is_none());
+        assert!(nodes.pans[i].is_some());
+        assert_eq!(
+            spec.iter_ordered()
+                .filter(|(_, node)| matches!(node, NodeSpec::AudioClip { .. }))
+                .count(),
+            1
+        );
+        assert!(spec.compile_at_tempo(48_000, 256, 120.0).is_ok());
         assert!(!TrackKind::Audio.takes_instrument());
         assert!(TrackKind::Midi.takes_instrument());
     }
