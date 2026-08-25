@@ -16,9 +16,13 @@ use crate::ui::vm::TrackKind;
 pub enum UiAction {
     StartEngine,
     StopEngine,
-    /// Play if stopped, stop if playing — what the spacebar and the
-    /// transport button both mean.
+    /// Space: stop if playing; if stopped, play FROM THE INSERT MARKER —
+    /// restarting restarts, it does not resume.
     TogglePlay,
+    /// Shift+Space: resume from the stop point, or pause where you are.
+    ContinuePlay,
+    /// Ctrl+Space: play the arrangement selection and stop at its end.
+    PlaySelection,
     /// Halt playback, hold position.
     Pause,
     /// Halt playback AND return to zero — pause and return in one press.
@@ -132,6 +136,8 @@ impl UiAction {
             Self::StartEngine => "Start engine",
             Self::StopEngine => "Stop engine",
             Self::TogglePlay => "Play / stop",
+            Self::ContinuePlay => "Continue play",
+            Self::PlaySelection => "Play selection",
             Self::Pause => "Pause",
             Self::Stop => "Stop",
             Self::Return => "Return to zero",
@@ -187,6 +193,8 @@ impl UiAction {
     pub fn needs_engine(self) -> bool {
         match self {
             Self::TogglePlay
+            | Self::ContinuePlay
+            | Self::PlaySelection
             | Self::Pause
             | Self::Stop
             | Self::Return

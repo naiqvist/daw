@@ -51,6 +51,12 @@ impl Default for Keymap {
                 Key::T,
                 UiAction::AddTrack(TrackKind::Audio),
             ),
+            // Shift+Space and Ctrl+Space BEFORE plain Space, the same
+            // reasoning as the track pair above: `consume_shortcut` matches
+            // modifiers logically, and the plain gesture must not swallow
+            // the specific ones.
+            Binding::new(Modifiers::SHIFT, Key::Space, UiAction::ContinuePlay),
+            Binding::new(Modifiers::COMMAND, Key::Space, UiAction::PlaySelection),
             Binding::new(Modifiers::NONE, Key::Space, UiAction::TogglePlay),
             Binding::new(Modifiers::NONE, Key::Home, UiAction::Return),
             Binding::new(Modifiers::COMMAND, Key::M, UiAction::ToggleMetronome),

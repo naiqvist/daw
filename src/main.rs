@@ -1440,6 +1440,14 @@ struct Transport {
     loop_on: bool,
     metronome: bool,
     follow: bool,
+    /// The insert marker, in beats: where Space starts from. Every explicit
+    /// jump — a grid click, a ruler scrub, a locator — moves it, which is
+    /// what "start from the position you selected" means.
+    marker: f32,
+    /// Stop when the playhead passes this beat: Ctrl+Space's promise. Any
+    /// other transport verb clears it — an old fence must not ambush a new
+    /// playback.
+    play_until: Option<f32>,
 }
 
 impl Default for Transport {
@@ -1454,6 +1462,8 @@ impl Default for Transport {
             loop_on: false,
             metronome: false,
             follow: true,
+            marker: 0.0,
+            play_until: None,
         }
     }
 }
@@ -1473,7 +1483,36 @@ impl Transport {
 fn perform(actions: &[UiAction], transport: &mut Transport, arrangement: &mut Arrangement) {
     for action in actions {
         match action {
-            UiAction::TogglePlay => transport.playing = !transport.playing,
+            UiAction::TogglePlay => {
+                // Space: stop, or START FROM THE MARKER — not from wherever
+                // the transport happens to stand. Restarting restarts.
+                transport.play_until = None;
+                if transport.playing {
+                    transport.playing = false;
+                } else {
+                    arrangement.pending_seek = Some(transport.marker);
+                    transport.playing = true;
+                }
+            }
+            UiAction::ContinuePlay => {
+                // Shift+Space: the old toggle — resume from the stop point,
+                // pause where you are.
+                transport.play_until = None;
+                transport.playing = !transport.playing;
+            }
+            UiAction::PlaySelection => {
+                transport.play_until = None;
+                if let Some((from, to)) = arrangement.selection {
+                    arrangement.pending_seek = Some(from);
+                    transport.play_until = Some(to);
+                    transport.playing = true;
+                } else {
+                    // No selection: the fence has nothing to stand on, so
+                    // this is Space.
+                    arrangement.pending_seek = Some(transport.marker);
+                    transport.playing = true;
+                }
+            }
             UiAction::SetTempo(bpm) => {
                 transport.bpm = bpm.clamp(limits::BPM_MIN, limits::BPM_MAX);
             }
@@ -1486,14 +1525,24 @@ fn perform(actions: &[UiAction], transport: &mut Transport, arrangement: &mut Ar
             UiAction::ToggleMetronome => transport.metronome = !transport.metronome,
             UiAction::ToggleFollow => transport.follow = !transport.follow,
             // Halt, hold where you are.
-            UiAction::Pause => transport.playing = false,
-            // Halt AND rewind — pause and return in one press.
+            UiAction::Pause => {
+                transport.playing = false;
+                transport.play_until = None;
+            }
+            // Halt AND rewind — pause and return in one press. Rewinding is
+            // an explicit jump, so the marker comes home too.
             UiAction::Stop => {
                 transport.playing = false;
                 transport.position = 0.0;
+                transport.marker = 0.0;
+                transport.play_until = None;
             }
             // Rewind without touching whether we are rolling.
-            UiAction::Return => transport.position = 0.0,
+            UiAction::Return => {
+                transport.position = 0.0;
+                transport.marker = 0.0;
+                transport.play_until = None;
+            }
             UiAction::NarrowGrid => arrangement.grid = step_grid(arrangement.grid, true),
             UiAction::WidenGrid => arrangement.grid = step_grid(arrangement.grid, false),
             // Looping the selection also turns looping ON. Creating a loop
@@ -4384,6 +4433,7 @@ fn arrangement_body(
     let lanes = lane_rects(content, &arr.tracks);
     let mut resize: Option<(usize, f32)> = None;
     let mut select: Option<(usize, f32, f32)> = None;
+    let mut seek_req: Option<f32> = None;
     let mut create_req: Option<(usize, f32)> = None;
     // A Cell for the same reason as clips_pass's menu: one closure per lane
     // per frame, one shared slot.
@@ -4435,6 +4485,7 @@ fn arrangement_body(
             if picked.drag_started() || picked.clicked() {
                 ui.ctx().data_mut(|d| d.insert_temp(anchor_id, here));
                 select = Some((i, here, here));
+                seek_req = Some(here);
             } else if picked.dragged() {
                 let from: f32 = ui.ctx().data(|d| d.get_temp(anchor_id).unwrap_or(here));
                 select = Some((i, from, here));
@@ -4521,6 +4572,13 @@ fn arrangement_body(
         // from before is not part of it.
         arr.selected_clip = None;
     }
+    // The press IS the insert marker: the transport moves to the snapped
+    // beat, so Play starts where you pointed, and a click during playback
+    // jumps there. Press only — a drag-select must not scrub the song
+    // along behind the selection.
+    if let Some(beat) = seek_req {
+        arr.pending_seek = Some(beat);
+    }
 
     // Arrowing between lanes moves the cursor and takes the selection with
     // it — the cell you are on IS the selection.
@@ -4546,6 +4604,19 @@ fn arrangement_body(
         arr.selected = Some(t);
     }
 
+    // The scrub strip: the ruler's empty stretches jump the transport to
+    // the snapped click. Created BEFORE the brace and the locators, so
+    // both of those win the pointer where they overlap it — an empty
+    // stretch is exactly the part neither of them claims.
+    let scrub = ui.interact(ruler, ui.id().with("scrub"), egui::Sense::click());
+    if scrub.clicked()
+        && let Some(pos) = scrub.interact_pointer_pos()
+    {
+        arr.pending_seek = Some(snap(
+            beat_at(content, offset, arr.pixels_per_beat, pos.x),
+            grid,
+        ));
+    }
     loop_brace(ui, theme, focus, ruler, content, arr, grid);
     locators_pass(ui, theme, ruler, content, arr, grid);
     clips_pass(ui, theme, content, arr, grid, bpm, waveform_cache);
@@ -9340,11 +9411,17 @@ impl App {
         };
         for action in actions {
             match action {
-                UiAction::TogglePlay => engine.transport(if playing {
-                    TransportCmd::Stop
-                } else {
-                    TransportCmd::Play
-                }),
+                UiAction::TogglePlay | UiAction::ContinuePlay => {
+                    engine.transport(if playing {
+                        TransportCmd::Stop
+                    } else {
+                        TransportCmd::Play
+                    });
+                }
+                // The seek that aims it rides `pending_seek`, consumed just
+                // after; Play-while-playing is a no-op, so this is safe
+                // whatever state the engine is in.
+                UiAction::PlaySelection => engine.transport(TransportCmd::Play),
                 // Halt, hold — the engine's Stop.
                 UiAction::Pause => engine.transport(TransportCmd::Stop),
                 // Halt AND rewind — the engine's Return.
@@ -10031,9 +10108,24 @@ impl eframe::App for App {
         if let Some(beat) = self.arrangement.pending_seek.take() {
             let seconds = f64::from(beat) * 60.0 / self.transport.bpm.max(1.0);
             self.transport.position = seconds;
+            // Every explicit jump is also the new insert marker: Space
+            // starts from the last place the user pointed at.
+            self.transport.marker = beat;
             if let Some(engine) = &mut self.engine {
                 let sample = (seconds * f64::from(engine.info().sample_rate)) as u64;
                 engine.transport(TransportCmd::Seek(sample));
+            }
+        }
+        // Ctrl+Space's fence: playback stops when the playhead passes the
+        // selection's end. Checked against the mirror, engine or no engine.
+        if self.transport.playing
+            && let Some(end) = self.transport.play_until
+            && (self.transport.position * self.transport.bpm / 60.0) as f32 >= end
+        {
+            self.transport.playing = false;
+            self.transport.play_until = None;
+            if let Some(engine) = &mut self.engine {
+                engine.transport(TransportCmd::Stop);
             }
         }
         self.sync_engine();
@@ -12682,6 +12774,191 @@ mod tests {
             arr.session_scroll, 0.0,
             "two columns fit, so there is nowhere left to scroll to"
         );
+    }
+
+    /// A click in the grid IS the insert marker: the transport moves to
+    /// the snapped beat. A drag-select seeks once, at the press — the
+    /// selection must not scrub the song along behind it. The ruler's
+    /// empty stretches scrub too.
+    #[test]
+    fn clicking_the_grid_moves_the_transport() {
+        let ctx = egui::Context::default();
+        let mut arr = Arrangement::default();
+        arrangement_pass(&ctx, &mut arr, vec![]);
+
+        // A click at beat 3.2 on lane 0 seeks to the snapped beat 3.
+        let pos = pos2(TL + 3.2 * PX_PER_BEAT, LANES_TOP + TRACK_H * 0.5);
+        arrangement_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::PointerMoved(pos),
+                Event::PointerButton {
+                    pos,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+                Event::PointerButton {
+                    pos,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        assert_eq!(arr.pending_seek.take(), Some(3.0), "snapped to the grid");
+
+        // A drag-select: one seek when the drag registers, none while the
+        // selection grows. (egui reports a click on release and a drag on
+        // the first movement past the threshold, so the bare press frame
+        // itself sets nothing.)
+        let press = pos2(TL + 4.0 * PX_PER_BEAT, LANES_TOP + TRACK_H * 0.5);
+        arrangement_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::PointerMoved(press),
+                Event::PointerButton {
+                    pos: press,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        assert_eq!(
+            arr.pending_seek, None,
+            "the bare press is not yet a gesture"
+        );
+        arrangement_pass(
+            &ctx,
+            &mut arr,
+            vec![Event::PointerMoved(pos2(press.x + 24.0, press.y))],
+        );
+        assert!(
+            arr.pending_seek.take().is_some(),
+            "the drag's start seeks once"
+        );
+        for step in 2..=6 {
+            let to = pos2(press.x + step as f32 * 24.0, press.y);
+            arrangement_pass(&ctx, &mut arr, vec![Event::PointerMoved(to)]);
+            assert_eq!(arr.pending_seek, None, "the growing selection does not");
+        }
+        let release = pos2(press.x + 144.0, press.y);
+        arrangement_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::PointerMoved(release),
+                Event::PointerButton {
+                    pos: release,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        assert!(arr.selection.is_some(), "and the selection still happened");
+        assert_eq!(arr.pending_seek, None);
+
+        // The ruler's empty stretch scrubs.
+        let ruler = pos2(TL + 7.4 * PX_PER_BEAT, MINIMAP_H + LOOP_RULER_H * 0.5);
+        arrangement_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::PointerMoved(ruler),
+                Event::PointerButton {
+                    pos: ruler,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+                Event::PointerButton {
+                    pos: ruler,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        assert_eq!(arr.pending_seek.take(), Some(7.0), "the ruler scrubs");
+    }
+
+    /// The manual's three spacebars: Space restarts from the insert
+    /// marker, Shift+Space resumes from the stop point, Ctrl+Space plays
+    /// the selection and fences at its end.
+    #[test]
+    fn the_three_spacebars_mean_three_things() {
+        let mut transport = Transport::default();
+        let mut arr = Arrangement::default();
+
+        // A grid click moved the marker to beat 8 (the app consumes the
+        // pending seek; here the test plays that role).
+        transport.marker = 8.0;
+        transport.position = 123.0; // wherever playback last stopped
+
+        // Space: starts FROM THE MARKER, not from 123 seconds.
+        perform(&[UiAction::TogglePlay], &mut transport, &mut arr);
+        assert!(transport.playing);
+        assert_eq!(
+            arr.pending_seek.take(),
+            Some(8.0),
+            "Space asked for the marker"
+        );
+
+        // Space again: stop. Position untouched by the verb itself.
+        perform(&[UiAction::TogglePlay], &mut transport, &mut arr);
+        assert!(!transport.playing);
+        assert_eq!(arr.pending_seek, None, "stopping seeks nowhere");
+
+        // Shift+Space: resume — no seek, playing from where it stands.
+        perform(&[UiAction::ContinuePlay], &mut transport, &mut arr);
+        assert!(transport.playing);
+        assert_eq!(arr.pending_seek, None, "continue means continue");
+        perform(&[UiAction::ContinuePlay], &mut transport, &mut arr);
+        assert!(!transport.playing);
+
+        // Ctrl+Space: play the selection, fenced at its end.
+        arr.selection = Some((4.0, 6.0));
+        perform(&[UiAction::PlaySelection], &mut transport, &mut arr);
+        assert!(transport.playing);
+        assert_eq!(arr.pending_seek.take(), Some(4.0));
+        assert_eq!(transport.play_until, Some(6.0));
+
+        // Any other transport verb clears the fence.
+        perform(&[UiAction::TogglePlay], &mut transport, &mut arr);
+        assert_eq!(transport.play_until, None, "an old fence must not ambush");
+
+        // Without a selection, Ctrl+Space is Space.
+        arr.selection = None;
+        transport.marker = 2.0;
+        transport.playing = false;
+        perform(&[UiAction::PlaySelection], &mut transport, &mut arr);
+        assert_eq!(arr.pending_seek.take(), Some(2.0));
+        assert_eq!(transport.play_until, None);
+
+        // Stop and Return bring the marker home: restarting restarts from
+        // the beginning again.
+        perform(&[UiAction::Stop], &mut transport, &mut arr);
+        assert_eq!(transport.marker, 0.0);
+        assert!(!transport.playing);
+    }
+
+    /// The keymap's Space family: shift- and ctrl-variants are listed
+    /// before the plain gesture, or the plain one would swallow them.
+    #[test]
+    fn the_space_family_is_ordered_most_specific_first() {
+        let map = daw::ui::keymap::Keymap::default();
+        let pos = |action: UiAction| {
+            map.bindings()
+                .iter()
+                .position(|b| b.action == action)
+                .expect("all three spacebars are bound")
+        };
+        assert!(pos(UiAction::ContinuePlay) < pos(UiAction::TogglePlay));
+        assert!(pos(UiAction::PlaySelection) < pos(UiAction::TogglePlay));
     }
 
     /// A split divides a clip in place: notes follow the beat they sound
