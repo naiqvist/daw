@@ -128,9 +128,28 @@ impl DelayLine {
         self.write = 0;
     }
 
+    /// Crate-internal per-sample read, `behind` samples back from the
+    /// write head. For kernels that build ON the delay line inside their
+    /// own per-sample loops (the lookahead limiter) — the OnePole::
+    /// tick_lowpass precedent. Block callers use the process_* family.
     #[inline(always)]
-    fn tap(&self, buf: &[f32], behind: usize) -> f32 {
+    pub(crate) fn tap(&self, buf: &[f32], behind: usize) -> f32 {
         buf[(self.write.wrapping_sub(behind)) & self.mask]
+    }
+
+    /// Crate-internal: store one sample and advance. After a push the
+    /// pushed sample is `tap(buf, 1)`.
+    #[inline(always)]
+    pub(crate) fn push(&mut self, buf: &mut [f32], x: f32) {
+        buf[self.write & self.mask] = x;
+        self.write = self.write.wrapping_add(1);
+    }
+
+    /// Crate-internal: does this slice match what `prepare` promised?
+    /// The fail-open check, shared so builders cannot get it wrong.
+    #[inline(always)]
+    pub(crate) fn matches(&self, buf: &[f32]) -> bool {
+        buf.len() == self.expected && !buf.is_empty()
     }
 
     /// Red zone: integer-exact delay, in place. The delay is
