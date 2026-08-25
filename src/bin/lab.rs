@@ -1329,7 +1329,7 @@ fn sequencer_ui(ui: &mut egui::Ui, eng: &mut EngineBench) {
             } else {
                 ui.visuals().extreme_bg_color
             };
-            p.rect_filled(r, 2.0, fill);
+            p.rect_filled(r, 0.0, fill);
         }
     }
 

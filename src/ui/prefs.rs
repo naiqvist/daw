@@ -33,6 +33,9 @@ pub struct UiPrefs {
     pub hidden_panels: Vec<String>,
     /// Frontmost center tab, by id.
     pub focused_center: Option<String>,
+    /// Recently opened project files, newest first. Machine-local, like
+    /// everything here — a path means nothing on another machine.
+    pub recent_projects: Vec<String>,
 }
 
 impl UiPrefs {
@@ -58,6 +61,7 @@ mod tests {
             density: Density::Compact,
             hidden_panels: vec!["tree".to_owned()],
             focused_center: Some("arrange".to_owned()),
+            recent_projects: vec!["/tmp/a.daw.ron".to_owned()],
         };
         let back = UiPrefs::from_ron_or_default(&prefs.to_ron().unwrap());
         assert_eq!(prefs, back);

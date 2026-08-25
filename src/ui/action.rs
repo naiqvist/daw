@@ -121,6 +121,17 @@ pub enum UiAction {
     /// Return the selected track's pan to center.
     CenterTrackPan,
 
+    // --- the project file: owned by the app, never by `perform` ---
+    /// Save to the current file, or open the project window if there is
+    /// none yet. Ctrl+S.
+    SaveProject,
+    /// Open the project window pointed at saving. Ctrl+Shift+S.
+    SaveProjectAs,
+    /// Open the project window. Ctrl+O.
+    OpenProjectWindow,
+    /// A fresh, empty song.
+    NewProject,
+
     // --- view: the app's own furniture, no engine involved ---
     /// Show/hide a registered panel, by its `Panel::id()`.
     TogglePanel(&'static str),
@@ -181,6 +192,10 @@ impl UiAction {
             Self::ToggleTrackSolo => "Solo track",
             Self::NudgeTrackPan(_) => "Pan track",
             Self::CenterTrackPan => "Center pan",
+            Self::SaveProject => "Save project",
+            Self::SaveProjectAs => "Save project as",
+            Self::OpenProjectWindow => "Open project",
+            Self::NewProject => "New project",
             Self::TogglePanel(id) => id,
             Self::FocusPanel(id) => id,
             Self::SetDensity(_) => "Density",
@@ -237,6 +252,10 @@ impl UiAction {
             | Self::ToggleTrackSolo
             | Self::NudgeTrackPan(_)
             | Self::CenterTrackPan
+            | Self::SaveProject
+            | Self::SaveProjectAs
+            | Self::OpenProjectWindow
+            | Self::NewProject
             | Self::TogglePanel(_)
             | Self::FocusPanel(_)
             | Self::SetDensity(_) => false,

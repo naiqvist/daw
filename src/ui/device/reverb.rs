@@ -12,8 +12,10 @@ use crate::ui::device::{Param, Well, Wells, card, knob};
 use crate::ui::theme::Theme;
 use eframe::egui;
 
-/// Knob positions of one reverb, normalized.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Knob positions of one reverb, normalized. Serialized into project
+/// files, so knob positions survive a reload.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct ReverbUi {
     pub size: f32,
     pub damp: f32,

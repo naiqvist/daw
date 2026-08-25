@@ -22,7 +22,9 @@ pub struct ParamEdit {
 }
 
 /// UI state of one sine synth device: normalized positions of its knobs.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Serialized into project files, so knob positions survive a reload.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct SineSynthUi {
     pub gain: f32,
     pub attack: f32,

@@ -146,7 +146,7 @@ const DIVISIONS: u64 = 4;
 /// Editable fields: a recessed well with a value in it.
 const FIELD_H: f32 = 20.0;
 const FIELD_TYPE: f32 = 12.0;
-const FIELD_RADIUS: f32 = 2.0;
+const FIELD_RADIUS: f32 = 0.0;
 const TEMPO_W: f32 = 54.0;
 const TIMESIG_W: f32 = 22.0;
 /// BPM per pixel of horizontal drag.
@@ -286,7 +286,7 @@ const RING_STROKE: f32 = 2.0;
 /// How far the ring stands off the element, so it surrounds rather than
 /// covers it.
 const RING_PAD: f32 = 3.0;
-const RING_RADIUS: f32 = 3.0;
+const RING_RADIUS: f32 = 0.0;
 /// Stiffness of the ring's travel, radians per second. Critically damped, so
 /// it accelerates in and settles without overshoot.
 const RING_OMEGA: f32 = 34.0;
@@ -300,11 +300,6 @@ const CROSS_PENALTY: f32 = 2.5;
 /// Drag limits for the two resizable regions, so proportions can be found by
 /// feel rather than by guessing numbers.
 const BROWSER_W_RANGE: std::ops::RangeInclusive<f32> = 180.0..=560.0;
-/// The rack's ceiling is exactly one card plus its breathing room: cards
-/// are height-locked, so any taller region is dead space by construction.
-const DEVICE_H_RANGE: std::ops::RangeInclusive<f32> =
-    80.0..=(daw::ui::tokens::control::DEVICE_H + 2.0 * daw::ui::tokens::space::SM);
-
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -1762,7 +1757,7 @@ impl Key {
 /// on them — nothing in the running app can reach a device until the library
 /// browser offers one. The allow goes away with the row that refills it.
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum DeviceKind {
     SineSynth,
     Reverb,
@@ -1777,7 +1772,8 @@ impl DeviceKind {
     }
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 struct Track {
     /// What the lane carries. Fixed at creation: changing a track's kind
     /// would change what every clip on it means, which is a conversion,
@@ -1857,7 +1853,7 @@ impl Default for Track {
 /// are f64 to match `graph::Note`, which is what these become at compile;
 /// the clip's own placement stays f32 with the rest of the arrangement's
 /// geometry.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct Note {
     pitch: u8,
     start: f64,
@@ -1868,7 +1864,7 @@ struct Note {
 /// Green-zone metadata for an audio clip's source region. The path and
 /// musical placement persist; disk streams are created only while compiling
 /// a schedule and never enter the arrangement model.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct AudioSource {
     path: std::path::PathBuf,
     sample_rate: u32,
@@ -1888,7 +1884,8 @@ struct AudioSource {
 /// resizes the clip, and a note starting at or past `len` simply does not
 /// sound (see `seq_notes`). Shortening a clip therefore hides notes rather
 /// than destroying them, and lengthening it brings them back.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 struct Clip {
     id: u64,
     name: String,
@@ -1897,6 +1894,22 @@ struct Clip {
     notes: Vec<Note>,
     /// Present only on audio tracks. MIDI clips carry notes instead.
     audio: Option<AudioSource>,
+}
+
+impl Default for Clip {
+    /// The serde fallback for a partially written clip in a hand-edited
+    /// project file. Degenerate (zero length) on purpose: the load-time
+    /// sanitizer drops what a file did not actually describe.
+    fn default() -> Self {
+        Self {
+            id: 0,
+            name: String::new(),
+            start: 0.0,
+            len: 0.0,
+            notes: Vec::new(),
+            audio: None,
+        }
+    }
 }
 
 /// A clip drag in flight: a translucent ghost rides the pointer — snapped
@@ -1984,7 +1997,7 @@ impl MainView {
 /// One row of the session grid. A scene is a name and nothing else — what
 /// it PLAYS is whatever sits in its row, which is why launching a scene
 /// also stops the tracks whose slot in that row is empty.
-#[derive(Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct Scene {
     name: String,
 }
@@ -2154,7 +2167,7 @@ impl Session {
 
 /// A named point on the timeline — Ableton's locator. Click its flag to
 /// jump the playhead there; drag to move it; double-click to rename.
-#[derive(Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct Locator {
     beat: f32,
     name: String,
@@ -2331,7 +2344,7 @@ const fn note(pitch: u8, start: f64, len: f64, vel: u8) -> Note {
 /// view are how you are LOOKING at the arrangement, not what it is;
 /// yanking the viewport on Ctrl+Z is a thing users hate, and it would also
 /// make every pan a history entry.
-#[derive(Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 struct Content {
     tracks: Vec<Track>,
     clips: Vec<Vec<Clip>>,
@@ -2363,6 +2376,134 @@ struct Marks {
 struct Snapshot {
     content: Content,
     marks: Marks,
+}
+
+/// A project on disk: the content, the transport's musical settings, and
+/// nothing else. View state — scrolls, zooms, which face is showing — is
+/// how you were LOOKING at the song when you saved, and deliberately does
+/// not travel with it.
+///
+/// Every field is `serde(default)`-tolerant, so a file written by an older
+/// build (or trimmed by hand) loads with the missing parts at their
+/// defaults instead of refusing the whole song.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct ProjectDoc {
+    /// Format version, for the day a breaking change needs a migration.
+    version: u32,
+    bpm: f64,
+    beats_per_bar: u32,
+    beat_unit: u32,
+    metronome: bool,
+    loop_on: bool,
+    loop_range: Option<(f32, f32)>,
+    grid: usize,
+    tracks: Vec<Track>,
+    clips: Vec<Vec<Clip>>,
+    slots: Vec<Vec<Option<Clip>>>,
+    scenes: Vec<Scene>,
+    locators: Vec<Locator>,
+    next_clip_id: u64,
+    next_track_no: [u32; TrackKind::ALL.len()],
+}
+
+impl Default for ProjectDoc {
+    fn default() -> Self {
+        project_doc(&Arrangement::default(), &Transport::default())
+    }
+}
+
+/// The song as a document. Pure, so the round trip is testable without a
+/// window.
+fn project_doc(arr: &Arrangement, transport: &Transport) -> ProjectDoc {
+    ProjectDoc {
+        version: 1,
+        bpm: transport.bpm,
+        beats_per_bar: transport.beats_per_bar,
+        beat_unit: transport.beat_unit,
+        metronome: transport.metronome,
+        loop_on: transport.loop_on,
+        loop_range: arr.loop_range,
+        grid: arr.grid,
+        tracks: arr.tracks.clone(),
+        clips: arr.clips.clone(),
+        slots: arr.session.slots.clone(),
+        scenes: arr.session.scenes.clone(),
+        locators: arr.locators.clone(),
+        next_clip_id: arr.next_clip_id,
+        next_track_no: arr.next_track_no,
+    }
+}
+
+/// A document becomes the song. The arrangement comes back FRESH — no
+/// gesture, selection or performance state survives a load — and the doc
+/// is sanitized on the way in, because a file is input: parallel vecs are
+/// squared against the track list, degenerate clips are dropped, and the
+/// id counter is repaired past every id actually present, so the identity
+/// invariant holds whatever the file said.
+fn apply_project_doc(doc: ProjectDoc, arr: &mut Arrangement, transport: &mut Transport) {
+    let mut fresh = Arrangement::default();
+    let tracks = doc.tracks.len().max(1);
+    fresh.tracks = if doc.tracks.is_empty() {
+        vec![Track::new(TrackKind::Midi, "MIDI 1".to_owned())]
+    } else {
+        doc.tracks
+    };
+    let sane = |clip: &Clip| clip.len > 0.0 && clip.start >= 0.0 && clip.start.is_finite();
+    fresh.clips = doc.clips;
+    fresh.clips.resize(tracks, Vec::new());
+    for track in &mut fresh.clips {
+        track.retain(sane);
+        resort(track);
+    }
+    let scenes = doc.scenes.len().max(1);
+    fresh.session.scenes = if doc.scenes.is_empty() {
+        vec![Scene {
+            name: "Scene 1".to_owned(),
+        }]
+    } else {
+        doc.scenes
+    };
+    fresh.session.slots = doc.slots;
+    fresh.session.slots.resize(tracks, Vec::new());
+    for column in &mut fresh.session.slots {
+        column.resize(scenes, None);
+        for slot in column.iter_mut() {
+            if slot.as_ref().is_some_and(|clip| !sane(clip)) {
+                *slot = None;
+            }
+        }
+    }
+    fresh.session.playing = vec![None; tracks];
+    fresh.locators = doc
+        .locators
+        .into_iter()
+        .filter(|locator| locator.beat.is_finite() && locator.beat >= 0.0)
+        .collect();
+    fresh.loop_range = doc.loop_range.filter(|(a, b)| a.is_finite() && b > a);
+    fresh.grid = doc.grid.min(GRID_BEATS.len() - 1);
+    let highest = fresh
+        .clips
+        .iter()
+        .flatten()
+        .chain(fresh.session.slots.iter().flatten().flatten())
+        .map(|clip| clip.id)
+        .max()
+        .unwrap_or(0);
+    fresh.next_clip_id = doc.next_clip_id.max(highest + 1);
+    fresh.next_track_no = doc.next_track_no;
+    fresh.force_recompile = true;
+    *arr = fresh;
+
+    transport.bpm = doc.bpm.clamp(limits::BPM_MIN, limits::BPM_MAX);
+    transport.beats_per_bar = doc.beats_per_bar.clamp(1, 99);
+    transport.beat_unit = doc.beat_unit.clamp(1, 16);
+    transport.metronome = doc.metronome;
+    transport.loop_on = doc.loop_on;
+    transport.playing = false;
+    transport.position = 0.0;
+    transport.marker = 0.0;
+    transport.play_until = None;
 }
 
 /// How many edits back the history reaches. Snapshots are whole-model
@@ -4386,7 +4527,7 @@ fn arrangement_body(
         let painter = ui.painter();
         painter.rect_filled(
             chip,
-            3.0,
+            0.0,
             if response.hovered() {
                 theme.warn
             } else {
@@ -5052,7 +5193,7 @@ fn channel_fader(
 
     let painter = ui.painter();
     // The track: a sunken well the segments live in.
-    painter.rect_filled(rect, 3.0, theme.surface_sunken.gamma_multiply(0.9));
+    painter.rect_filled(rect, 0.0, theme.surface_sunken.gamma_multiply(0.9));
 
     // --- the LED ladder ---------------------------------------------------
     // Segments are placed on the FADER's dB scale, not the meter's, so the
@@ -5093,7 +5234,7 @@ fn channel_fader(
         let lit = level > 0.0 && seg_db <= lit_to.min(device::meter::CEILING_DB);
         painter.rect_filled(
             seg,
-            1.0,
+            0.0,
             if lit {
                 color
             } else {
@@ -5518,7 +5659,7 @@ fn session_body(
                 Some(clip) => {
                     painter.rect_filled(
                         rect,
-                        3.0,
+                        0.0,
                         if playing {
                             theme.clip_body
                         } else {
@@ -5544,7 +5685,7 @@ fn session_body(
                     if playing {
                         painter.rect_stroke(
                             rect,
-                            3.0,
+                            0.0,
                             egui::Stroke::new(1.5, theme.ok),
                             egui::StrokeKind::Middle,
                         );
@@ -5555,22 +5696,22 @@ fn session_body(
                     // should find the clips, not the gaps.
                     painter.rect_stroke(
                         rect,
-                        3.0,
+                        0.0,
                         egui::Stroke::new(1.0, theme.divider),
                         egui::StrokeKind::Inside,
                     );
                     if response.hovered() {
-                        painter.rect_filled(launch_rect, 3.0, theme.surface_raised);
+                        painter.rect_filled(launch_rect, 0.0, theme.surface_raised);
                         // The stop square, drawn only where it can be hit.
                         let stop = launch_rect.shrink(6.0);
-                        painter.rect_filled(stop, 1.0, theme.text_muted);
+                        painter.rect_filled(stop, 0.0, theme.text_muted);
                     }
                 }
             }
             if picked {
                 ui.painter().rect_stroke(
                     rect,
-                    3.0,
+                    0.0,
                     egui::Stroke::new(1.5, theme.clip_selected),
                     egui::StrokeKind::Middle,
                 );
@@ -5589,7 +5730,7 @@ fn session_body(
             let painter = ui.painter();
             painter.rect_filled(
                 stop,
-                3.0,
+                0.0,
                 if response.hovered() {
                     theme.surface_raised
                 } else {
@@ -5602,7 +5743,7 @@ fn session_body(
             );
             painter.rect_filled(
                 square,
-                1.0,
+                0.0,
                 if arr.session.playing.get(t).copied().flatten().is_some() {
                     theme.text
                 } else {
@@ -5697,7 +5838,7 @@ fn session_body(
                 ),
             );
             let painter = ui.painter();
-            painter.rect_filled(readout, 2.0, theme.surface_sunken);
+            painter.rect_filled(readout, 0.0, theme.surface_sunken);
             painter.with_clip_rect(readout).text(
                 readout.center(),
                 egui::Align2::CENTER_CENTER,
@@ -5749,10 +5890,10 @@ fn session_body(
                     {
                         let rect = layout.slot(track, scene).intersect(layout.rows_viewport());
                         let painter = ui.painter();
-                        painter.rect_filled(rect, 3.0, theme.accent_muted.gamma_multiply(0.35));
+                        painter.rect_filled(rect, 0.0, theme.accent_muted.gamma_multiply(0.35));
                         painter.rect_stroke(
                             rect,
-                            3.0,
+                            0.0,
                             egui::Stroke::new(1.5, theme.accent),
                             egui::StrokeKind::Middle,
                         );
@@ -5847,7 +5988,7 @@ fn session_body(
         let painter = ui.painter();
         painter.rect_filled(
             header,
-            3.0,
+            0.0,
             if response.hovered() {
                 theme.warn
             } else {
@@ -5932,9 +6073,9 @@ fn session_body(
 
         let painter = ui.painter();
         if selected {
-            painter.rect_filled(rect, 3.0, theme.accent_muted.gamma_multiply(0.3));
+            painter.rect_filled(rect, 0.0, theme.accent_muted.gamma_multiply(0.3));
         } else if response.hovered() {
-            painter.rect_filled(rect, 3.0, theme.surface_raised);
+            painter.rect_filled(rect, 0.0, theme.surface_raised);
         }
         launch_triangle(
             painter,
@@ -6009,7 +6150,7 @@ fn session_body(
         }
         let painter = ui.painter();
         if response.hovered() {
-            painter.rect_filled(stop_all, 3.0, theme.surface_raised);
+            painter.rect_filled(stop_all, 0.0, theme.surface_raised);
         }
         painter.rect_filled(
             egui::Rect::from_center_size(
@@ -6038,7 +6179,7 @@ fn session_body(
         }
         let painter = ui.painter();
         if response.hovered() {
-            painter.rect_filled(add, 3.0, theme.surface_raised);
+            painter.rect_filled(add, 0.0, theme.surface_raised);
         }
         painter.text(
             egui::pos2(add.left() + SLOT_LAUNCH_W, add.center().y),
@@ -6095,7 +6236,7 @@ fn session_body(
         if let Some(thumb) = moved.thumb() {
             painter.rect_filled(
                 thumb.shrink2(egui::vec2(0.0, 1.5)),
-                3.0,
+                0.0,
                 if response.hovered() || response.is_pointer_button_down_on() {
                     theme.accent
                 } else {
@@ -6264,10 +6405,10 @@ fn drop_slot(
                 return None;
             }
             let painter = ui.painter();
-            painter.rect_filled(rect, 3.0, theme.accent_muted.gamma_multiply(0.35));
+            painter.rect_filled(rect, 0.0, theme.accent_muted.gamma_multiply(0.35));
             painter.rect_stroke(
                 rect,
-                3.0,
+                0.0,
                 egui::Stroke::new(1.5, theme.accent),
                 egui::StrokeKind::Middle,
             );
@@ -6383,7 +6524,7 @@ fn minimap_pass(
             } else {
                 theme.clip_body
             };
-            painter.rect_filled(bar.intersect(strip), 1.0, color);
+            painter.rect_filled(bar.intersect(strip), 0.0, color);
         }
     }
     let x = strip.left() + playhead * scale;
@@ -6401,10 +6542,10 @@ fn minimap_pass(
         ),
     )
     .intersect(strip);
-    painter.rect_filled(window, 2.0, theme.accent_muted.gamma_multiply(0.35));
+    painter.rect_filled(window, 0.0, theme.accent_muted.gamma_multiply(0.35));
     painter.rect_stroke(
         window,
-        2.0,
+        0.0,
         egui::Stroke::new(
             1.0,
             if resp.hovered() || resp.is_pointer_button_down_on() {
@@ -6539,7 +6680,7 @@ fn drop_preview(
 
     let full_r = clip_rect(content, offset, ppb, lane, &ghost);
     let r = full_r.intersect(content);
-    painter.rect_filled(r, 3.0, theme.clip_body.gamma_multiply(0.55));
+    painter.rect_filled(r, 0.0, theme.clip_body.gamma_multiply(0.55));
     if ghost.audio.is_some()
         && let Some(peaks) = waveform_cache.get(&drag.path)
     {
@@ -6559,7 +6700,7 @@ fn drop_preview(
     let painter = ui.painter();
     painter.rect_stroke(
         r,
-        3.0,
+        0.0,
         egui::Stroke::new(1.0, theme.clip_selected),
         egui::StrokeKind::Middle,
     );
@@ -6774,7 +6915,7 @@ fn clips_pass(
             let painter = ui.painter();
             painter.rect_filled(
                 rect,
-                3.0,
+                0.0,
                 if lifted {
                     theme.clip_body.gamma_multiply(0.35)
                 } else {
@@ -6806,7 +6947,7 @@ fn clips_pass(
             if selected {
                 painter.rect_stroke(
                     rect,
-                    3.0,
+                    0.0,
                     egui::Stroke::new(1.5, theme.clip_selected),
                     egui::StrokeKind::Middle,
                 );
@@ -6826,7 +6967,7 @@ fn clips_pass(
                 let pitch_hi = clip.notes.iter().map(|n| n.pitch).max().unwrap_or(0);
                 for note in &clip.notes {
                     let r = note_rect(rect, note, pitch_lo, pitch_hi, clip.len).intersect(rect);
-                    painter.rect_filled(r, 1.0, theme.clip_note);
+                    painter.rect_filled(r, 0.0, theme.clip_note);
                 }
             }
 
@@ -6881,7 +7022,7 @@ fn clips_pass(
         let full_r = clip_rect(content, offset, pixels_per_beat, *lane, &g.clip);
         let r = full_r.intersect(content);
         let painter = ui.painter();
-        painter.rect_filled(r, 3.0, theme.clip_body.gamma_multiply(0.55));
+        painter.rect_filled(r, 0.0, theme.clip_body.gamma_multiply(0.55));
         if let Some(audio) = &g.clip.audio
             && let Some(peaks) = waveform_cache.get(&audio.path)
         {
@@ -6900,7 +7041,7 @@ fn clips_pass(
         }
         painter.rect_stroke(
             r,
-            3.0,
+            0.0,
             egui::Stroke::new(1.0, theme.clip_selected),
             egui::StrokeKind::Middle,
         );
@@ -7282,7 +7423,7 @@ fn loop_brace(
             egui::pos2(nx1, ruler.bottom() - 2.0),
         )
         .intersect(ruler),
-        2.0,
+        0.0,
         theme.loop_brace,
     );
 }
@@ -8412,6 +8553,11 @@ struct App {
     focus: Focus,
     /// The command palette. `:` opens it; while open it owns the keyboard.
     palette: Palette,
+    /// The project window: save, load, new, and the recent files.
+    project: ProjectWindow,
+    /// The file the song lives in, once it has one. Save goes here without
+    /// asking; Save As and Load change it.
+    project_path: Option<std::path::PathBuf>,
     /// The theme window: every Gogh scheme, picked live. Opened from the
     /// palette's "change theme"; while open it owns the keyboard the same
     /// way the palette does.
@@ -8459,6 +8605,17 @@ struct App {
     /// The transport loop last sent, in samples — resent only on change, so
     /// brace drags, Ctrl+L and tempo changes all reconcile through one door.
     sent_loop: Option<(u64, u64)>,
+}
+
+/// The project window's state: open or not, the path being typed, and the
+/// last thing that happened — kept ON the window, because "saved" and
+/// "that file would not parse" belong next to the buttons that caused
+/// them, not in the top bar's notice slot.
+#[derive(Default)]
+struct ProjectWindow {
+    open: bool,
+    path: String,
+    status: Option<String>,
 }
 
 /// What the device region shows when there is no device to show: no track
@@ -8526,6 +8683,8 @@ impl App {
             bottom_view: BottomView::Rack,
             focus: Focus::default(),
             palette: Palette::default(),
+            project: ProjectWindow::default(),
+            project_path: None,
             skin,
             engine: None,
             notice: None,
@@ -8607,6 +8766,12 @@ impl App {
                 .enabled(!self.arrangement.locators.is_empty()),
             PaletteCommand::new("locator.next", "locator", "next locator")
                 .enabled(!self.arrangement.locators.is_empty()),
+            // --- the project file --------------------------------------
+            PaletteCommand::new("project.save", "project", "save project").hint("ctrl+S"),
+            PaletteCommand::new("project.saveas", "project", "save project as")
+                .hint("ctrl+shift+S"),
+            PaletteCommand::new("project.open", "project", "open project…").hint("ctrl+O"),
+            PaletteCommand::new("project.new", "project", "new project"),
             // --- the session ------------------------------------------
             PaletteCommand::new("session.back", "session", "back to arrangement")
                 .enabled(self.arrangement.session.playing.iter().any(Option::is_some)),
@@ -8731,6 +8896,10 @@ impl App {
             "clip.duplicate" => actions.push(UiAction::DuplicateClip),
             "clip.delete" => actions.push(UiAction::DeleteSelected),
             "view.main" => actions.push(UiAction::ToggleMainView),
+            "project.save" => actions.push(UiAction::SaveProject),
+            "project.saveas" => actions.push(UiAction::SaveProjectAs),
+            "project.open" => actions.push(UiAction::OpenProjectWindow),
+            "project.new" => actions.push(UiAction::NewProject),
             "session.back" => actions.push(UiAction::BackToArrangement),
             "session.scene.insert" => actions.push(UiAction::InsertScene),
             "session.scene.capture" => actions.push(UiAction::CaptureScene),
@@ -8974,6 +9143,176 @@ impl App {
                 }
             }
             BrowserEvent::Rescan => self.request_library_scan(),
+        }
+    }
+
+    /// Save the song to `path`, or to the file it already lives in. With
+    /// neither, the project window opens instead — the app never invents a
+    /// filename.
+    fn save_project(&mut self, path: Option<std::path::PathBuf>) {
+        let Some(path) = path.or_else(|| self.project_path.clone()) else {
+            self.project.open = true;
+            self.project.status = Some("choose a file to save to".to_owned());
+            return;
+        };
+        let doc = project_doc(&self.arrangement, &self.transport);
+        let written = ron::ser::to_string_pretty(&doc, ron::ser::PrettyConfig::default())
+            .map_err(|error| error.to_string())
+            .and_then(|text| std::fs::write(&path, text).map_err(|error| error.to_string()));
+        match written {
+            Ok(()) => {
+                self.remember_project(&path);
+                self.project.status = Some(format!("saved {}", path.display()));
+                self.notice = Some(format!("saved {}", path.display()));
+                self.project_path = Some(path);
+            }
+            Err(error) => {
+                self.project.open = true;
+                self.project.status = Some(format!("could not save: {error}"));
+            }
+        }
+    }
+
+    /// Load a song. The current one is replaced whole: history restarts at
+    /// the loaded state (undo does not cross a load), playback stops, and
+    /// the schedule is rebuilt from what the file said. A file that does
+    /// not parse changes nothing.
+    fn load_project(&mut self, path: std::path::PathBuf) {
+        let doc = std::fs::read_to_string(&path)
+            .map_err(|error| error.to_string())
+            .and_then(|text| ron::from_str::<ProjectDoc>(&text).map_err(|error| error.to_string()));
+        let doc = match doc {
+            Ok(doc) => doc,
+            Err(error) => {
+                self.project.open = true;
+                self.project.status = Some(format!("could not load: {error}"));
+                return;
+            }
+        };
+        apply_project_doc(doc, &mut self.arrangement, &mut self.transport);
+        if let Some(engine) = &mut self.engine {
+            engine.transport(TransportCmd::Stop);
+            engine.transport(TransportCmd::Seek(0));
+            engine.transport(TransportCmd::SetTempo(self.transport.bpm));
+        }
+        // A loaded song is its own beginning: the baseline moves, so Ctrl+Z
+        // walks back to the loaded state and no further.
+        self.history = History::new(&self.arrangement);
+        self.remember_project(&path);
+        self.notice = Some(format!("loaded {}", path.display()));
+        self.project.status = Some(format!("loaded {}", path.display()));
+        self.project.open = false;
+        self.project_path = Some(path);
+    }
+
+    /// A fresh, empty song. The file stays where it is — New does not
+    /// delete anything — but the next Save will ask for a path.
+    fn new_project(&mut self) {
+        self.arrangement = Arrangement::default();
+        self.arrangement.force_recompile = true;
+        self.transport = Transport::default();
+        if let Some(engine) = &mut self.engine {
+            engine.transport(TransportCmd::Stop);
+            engine.transport(TransportCmd::Seek(0));
+        }
+        self.history = History::new(&self.arrangement);
+        self.project_path = None;
+        self.project.status = Some("new project".to_owned());
+        self.notice = Some("new project".to_owned());
+    }
+
+    /// Put `path` at the head of the recent list: newest first, no
+    /// duplicates, bounded — a menu, not an archive.
+    fn remember_project(&mut self, path: &std::path::Path) {
+        let entry = path.display().to_string();
+        self.prefs.recent_projects.retain(|known| *known != entry);
+        self.prefs.recent_projects.insert(0, entry);
+        self.prefs.recent_projects.truncate(8);
+    }
+
+    /// The project window: the current file, a path field, the four verbs
+    /// and the recent list. Drawn above everything, closable, and the
+    /// keyboard belongs to its text field while it is open.
+    fn draw_project_window(&mut self, ctx: &egui::Context) {
+        if !self.project.open {
+            return;
+        }
+        let mut open = self.project.open;
+        let mut save_as: Option<String> = None;
+        let mut load: Option<String> = None;
+        let mut save_current = false;
+        let mut fresh = false;
+        egui::Window::new("project")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(380.0)
+            .show(ctx, |ui| {
+                ui.label(match &self.project_path {
+                    Some(path) => format!("current: {}", path.display()),
+                    None => "current: unsaved".to_owned(),
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("path");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.project.path)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("/home/you/songs/song.daw.ron"),
+                    );
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("new").clicked() {
+                        fresh = true;
+                    }
+                    let has_path = !self.project.path.trim().is_empty();
+                    if ui
+                        .add_enabled(has_path, egui::Button::new("load"))
+                        .clicked()
+                    {
+                        load = Some(self.project.path.trim().to_owned());
+                    }
+                    if ui
+                        .add_enabled(self.project_path.is_some(), egui::Button::new("save"))
+                        .clicked()
+                    {
+                        save_current = true;
+                    }
+                    if ui
+                        .add_enabled(has_path, egui::Button::new("save as"))
+                        .clicked()
+                    {
+                        save_as = Some(self.project.path.trim().to_owned());
+                    }
+                });
+                if let Some(status) = &self.project.status {
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new(status).weak());
+                }
+                if !self.prefs.recent_projects.is_empty() {
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new("recent").weak());
+                    for recent in self.prefs.recent_projects.clone() {
+                        if ui.link(&recent).clicked() {
+                            load = Some(recent.clone());
+                        }
+                    }
+                }
+            });
+        self.project.open = open;
+        if fresh {
+            self.new_project();
+        }
+        if save_current {
+            self.save_project(None);
+        }
+        if let Some(path) = save_as {
+            self.save_project(Some(std::path::PathBuf::from(path)));
+        }
+        if let Some(path) = load {
+            self.project.path = path.clone();
+            self.load_project(std::path::PathBuf::from(path));
         }
     }
 
@@ -9736,14 +10075,36 @@ impl eframe::App for App {
         // not a play command, and getting that wrong is the classic DAW bug.
         if !palette_open && !skin_open && !ui.ctx().egui_wants_keyboard_input() {
             ui.ctx().input_mut(|i| {
+                // MODIFIED SPACE FIRST: `consume_key` ignores an extra
+                // Shift, so the plain gesture checked first would swallow
+                // Shift+Space and resume when asked to restart.
+                if i.consume_key(egui::Modifiers::COMMAND, egui::Key::Space) {
+                    actions.push(UiAction::PlaySelection);
+                }
+                if i.consume_key(egui::Modifiers::SHIFT, egui::Key::Space) {
+                    actions.push(UiAction::ContinuePlay);
+                }
                 if i.consume_key(egui::Modifiers::NONE, egui::Key::Space) {
                     actions.push(UiAction::TogglePlay);
                 }
                 if i.consume_key(egui::Modifiers::NONE, egui::Key::Home) {
                     actions.push(UiAction::Return);
                 }
+                // The project file. Shift-specific first, as everywhere.
+                if i.consume_key(
+                    egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                    egui::Key::S,
+                ) {
+                    actions.push(UiAction::SaveProjectAs);
+                } else if i.consume_key(egui::Modifiers::COMMAND, egui::Key::S) {
+                    actions.push(UiAction::SaveProject);
+                }
+                if i.consume_key(egui::Modifiers::COMMAND, egui::Key::O) {
+                    actions.push(UiAction::OpenProjectWindow);
+                }
             });
         }
+        self.draw_project_window(ui.ctx());
 
         if !palette_open && !skin_open && self.bottom_view == BottomView::ClipEditor {
             match clip_editor_kind(&self.arrangement) {
@@ -9797,7 +10158,7 @@ impl eframe::App for App {
         };
         egui::Panel::top("top_bar")
             .resizable(false)
-            .show_separator_line(false)
+            .show_separator_line(true)
             .exact_size(TOP_BAR_H)
             .frame(self.fill(t.surface_sunken))
             .show(ui, |ui| {
@@ -9833,10 +10194,9 @@ impl eframe::App for App {
             BottomView::Rack => {
                 let arrangement = &mut self.arrangement;
                 let out = egui::Panel::bottom("device")
-                    .resizable(true)
-                    .show_separator_line(false)
-                    .default_size(DEVICE_H)
-                    .size_range(DEVICE_H_RANGE)
+                    .resizable(false)
+                    .show_separator_line(true)
+                    .exact_size(DEVICE_H)
                     .frame(sunken)
                     .show(ui, |ui| {
                         // Only a track that HOLDS a device shows one. An
@@ -9868,7 +10228,7 @@ impl eframe::App for App {
                     let beats_per_bar = self.transport.beats_per_bar;
                     let rect = egui::Panel::bottom("piano_roll")
                         .resizable(true)
-                        .show_separator_line(false)
+                        .show_separator_line(true)
                         .default_size(piano_roll::DEFAULT_H)
                         .size_range(piano_roll::H_RANGE)
                         .frame(sunken)
@@ -9898,7 +10258,7 @@ impl eframe::App for App {
                     };
                     let rect = egui::Panel::bottom("waveform_editor")
                         .resizable(true)
-                        .show_separator_line(false)
+                        .show_separator_line(true)
                         .default_size(waveform::DEFAULT_H)
                         .size_range(waveform::H_RANGE)
                         .frame(sunken)
@@ -9920,7 +10280,7 @@ impl eframe::App for App {
                 ClipEditorKind::Empty => {
                     let rect = egui::Panel::bottom("clip_editor")
                         .resizable(true)
-                        .show_separator_line(false)
+                        .show_separator_line(true)
                         .default_size(waveform::DEFAULT_H)
                         .size_range(waveform::H_RANGE)
                         .frame(sunken)
@@ -9939,7 +10299,7 @@ impl eframe::App for App {
 
         let browser_panel = egui::Panel::left("browser")
             .resizable(true)
-            .show_separator_line(false)
+            .show_separator_line(true)
             .default_size(BROWSER_W)
             .size_range(BROWSER_W_RANGE)
             .frame(self.fill(t.surface_sunken))
@@ -10046,6 +10406,18 @@ impl eframe::App for App {
             match action {
                 UiAction::StartEngine => self.start_engine(),
                 UiAction::StopEngine => self.stop_engine(),
+                // The project verbs are the app's own: they touch the
+                // filesystem and the history, which no pure verb may.
+                UiAction::SaveProject => self.save_project(None),
+                UiAction::SaveProjectAs | UiAction::OpenProjectWindow => {
+                    if let Some(path) = &self.project_path
+                        && self.project.path.is_empty()
+                    {
+                        self.project.path = path.display().to_string();
+                    }
+                    self.project.open = true;
+                }
+                UiAction::NewProject => self.new_project(),
                 // History is the app's own: `perform` is pure over the
                 // arrangement and cannot reach the stacks, and a restore
                 // has an engine consequence that a pure verb must not have.
@@ -10206,9 +10578,8 @@ mod tests {
                 .show(ui, claim);
 
             egui::Panel::bottom("device")
-                .resizable(true)
-                .default_size(DEVICE_H)
-                .size_range(DEVICE_H_RANGE)
+                .resizable(false)
+                .exact_size(DEVICE_H)
                 .frame(egui::Frame::new().fill(theme.surface_sunken))
                 .show(ui, claim);
 
@@ -10466,22 +10837,21 @@ mod tests {
                 let theme = Theme::dark();
                 egui::Panel::top("top_bar")
                     .resizable(false)
-                    .show_separator_line(false)
+                    .show_separator_line(true)
                     .exact_size(TOP_BAR_H)
                     .frame(egui::Frame::new().fill(theme.surface_sunken))
                     .show(ui, claim);
                 let device = egui::Panel::bottom("device")
-                    .resizable(true)
-                    .show_separator_line(false)
-                    .default_size(DEVICE_H)
-                    .size_range(DEVICE_H_RANGE)
+                    .resizable(false)
+                    .show_separator_line(true)
+                    .exact_size(DEVICE_H)
                     .frame(egui::Frame::new().fill(theme.surface_sunken))
                     .show(ui, claim)
                     .response
                     .rect;
                 let browser = egui::Panel::left("browser")
                     .resizable(true)
-                    .show_separator_line(false)
+                    .show_separator_line(true)
                     .default_size(BROWSER_W)
                     .size_range(BROWSER_W_RANGE)
                     .frame(egui::Frame::new().fill(theme.surface_sunken))
@@ -12884,6 +13254,162 @@ mod tests {
             ],
         );
         assert_eq!(arr.pending_seek.take(), Some(7.0), "the ruler scrubs");
+    }
+
+    /// The whole song survives the file: content out, RON, content back,
+    /// byte-for-value equal — and what deliberately does NOT travel
+    /// (playing state, selection, view) comes back fresh.
+    #[test]
+    fn a_project_round_trips_through_its_file() {
+        let mut arr = Arrangement::default();
+        let mut transport = Transport {
+            bpm: 174.0,
+            beats_per_bar: 3,
+            metronome: true,
+            loop_on: true,
+            ..Default::default()
+        };
+        arr.tracks[1].name = "drums".to_owned();
+        arr.tracks[1].mute = true;
+        arr.tracks[1].pan = -0.4;
+        arr.tracks[1].volume = 0.5;
+        arr.tracks[1].device = Some(DeviceKind::SineSynth);
+        let audio = arr.add_track(TrackKind::Audio);
+        arr.create_clip(0, 4.0, 2.0).unwrap();
+        arr.clips[0][0].notes = vec![note(60, 0.5, 1.0, 90)];
+        let clip_id = arr.next_id();
+        arr.clips[audio].push(Clip {
+            id: clip_id,
+            name: "loop".to_owned(),
+            start: 8.0,
+            len: 4.0,
+            notes: Vec::new(),
+            audio: Some(AudioSource {
+                path: "/tmp/loop.wav".into(),
+                sample_rate: 48_000,
+                source_offset: 100,
+                source_frames: 96_000,
+                gain: 0.8,
+                looped: true,
+            }),
+        });
+        assert!(arr.create_slot_clip(0, 2, 4.0));
+        arr.session.scenes[2].name = "drop 174 bpm".to_owned();
+        arr.toggle_locator(16.0, 1.0);
+        arr.loop_range = Some((4.0, 12.0));
+        arr.grid = 3;
+        // Performance and view state, which must NOT travel.
+        assert!(arr.session.launch(0, 2));
+        arr.selected_clip = Some((0, 0));
+        transport.playing = true;
+        transport.position = 9.0;
+
+        let text = ron::ser::to_string_pretty(
+            &project_doc(&arr, &transport),
+            ron::ser::PrettyConfig::default(),
+        )
+        .unwrap();
+        let doc: ProjectDoc = ron::from_str(&text).unwrap();
+        let mut loaded = Arrangement::default();
+        let mut loaded_transport = Transport::default();
+        apply_project_doc(doc, &mut loaded, &mut loaded_transport);
+
+        assert_eq!(loaded.snapshot().content, arr.snapshot().content);
+        assert_eq!(loaded_transport.bpm, 174.0);
+        assert_eq!(loaded_transport.beats_per_bar, 3);
+        assert!(loaded_transport.metronome);
+        assert!(loaded_transport.loop_on);
+        assert_eq!(loaded.grid, 3);
+        assert!(!loaded_transport.playing, "playback does not travel");
+        assert_eq!(loaded_transport.position, 0.0);
+        assert!(
+            loaded.session.playing.iter().all(Option::is_none),
+            "nor does what was playing"
+        );
+        assert_eq!(loaded.selected_clip, None, "nor the selection");
+        assert!(loaded.force_recompile, "and the schedule rebuilds");
+    }
+
+    /// A file is input. Mismatched parallel vecs are squared against the
+    /// track list, degenerate clips are dropped, and the id counter is
+    /// repaired past every id present — the identity invariant holds
+    /// whatever the file said.
+    #[test]
+    fn a_hostile_project_file_is_sanitized() {
+        let doc = ProjectDoc {
+            version: 1,
+            bpm: 9_999.0,
+            beats_per_bar: 0,
+            tracks: vec![
+                Track::new(TrackKind::Midi, "a".to_owned()),
+                Track::new(TrackKind::Audio, "b".to_owned()),
+            ],
+            // Too few clip lanes, one degenerate clip, one good one with a
+            // HIGH id while the counter says 1.
+            clips: vec![vec![
+                Clip {
+                    id: 7,
+                    name: "bad".to_owned(),
+                    start: -3.0,
+                    len: 0.0,
+                    notes: Vec::new(),
+                    audio: None,
+                },
+                Clip {
+                    id: 40,
+                    name: "good".to_owned(),
+                    start: 0.0,
+                    len: 4.0,
+                    notes: Vec::new(),
+                    audio: None,
+                },
+            ]],
+            // Slot columns for FIVE tracks, rows longer than the scenes.
+            slots: vec![vec![None; 9]; 5],
+            scenes: vec![Scene {
+                name: "one".to_owned(),
+            }],
+            locators: vec![
+                Locator {
+                    beat: f32::NAN,
+                    name: "nan".to_owned(),
+                },
+                Locator {
+                    beat: 4.0,
+                    name: "ok".to_owned(),
+                },
+            ],
+            loop_range: Some((8.0, 2.0)),
+            next_clip_id: 1,
+            ..ProjectDoc::default()
+        };
+        let mut arr = Arrangement::default();
+        let mut transport = Transport::default();
+        apply_project_doc(doc, &mut arr, &mut transport);
+
+        assert_eq!(arr.tracks.len(), 2);
+        assert_eq!(arr.clips.len(), 2, "clip lanes squared to the tracks");
+        assert_eq!(arr.clips[0].len(), 1, "the degenerate clip is gone");
+        assert_eq!(arr.session.slots.len(), 2, "slot columns squared too");
+        assert!(
+            arr.session
+                .slots
+                .iter()
+                .all(|column| column.len() == arr.session.scenes.len()),
+            "every column matches the scenes"
+        );
+        assert_eq!(arr.session.playing.len(), 2);
+        assert_eq!(arr.locators.len(), 1, "the NaN locator is refused");
+        assert_eq!(arr.loop_range, None, "an inverted loop is no loop");
+        assert!(
+            arr.next_clip_id > 40,
+            "the id counter is repaired past every id present"
+        );
+        assert!(
+            (limits::BPM_MIN..=limits::BPM_MAX).contains(&transport.bpm),
+            "the tempo is clamped into the app's limits"
+        );
+        assert!(transport.beats_per_bar >= 1);
     }
 
     /// The manual's three spacebars: Space restarts from the insert

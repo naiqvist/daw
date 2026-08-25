@@ -125,7 +125,7 @@ impl FrameStats {
     pub fn sparkline(&self, ui: &mut egui::Ui, size: egui::Vec2) {
         let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
+        painter.rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
 
         if self.samples.len() < 2 {
             return;

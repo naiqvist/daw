@@ -28,10 +28,11 @@ pub mod space {
 }
 
 pub mod radius {
-    /// Buttons, sliders, cells.
-    pub const CTRL: f32 = 3.0;
-    /// Panels, windows, cards.
-    pub const PANEL: f32 = 6.0;
+    /// The UI uses square corners throughout.
+    pub const CTRL: f32 = 0.0;
+    /// Kept as a separate semantic token so callers still name their
+    /// surface role even though every rectangular surface is square.
+    pub const PANEL: f32 = 0.0;
 }
 
 pub mod stroke {

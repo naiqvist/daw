@@ -63,7 +63,9 @@ impl ViewState {
 /// streamed from disk. It lives here, beside `ViewState`, because the
 /// action vocabulary must be able to name it and `action` may not import
 /// the app.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 pub enum TrackKind {
     /// Notes. A clip holds a pattern; the track's instrument plays it.
     #[default]

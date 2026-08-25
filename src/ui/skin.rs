@@ -304,7 +304,7 @@ impl Skin {
                         Pos2::new(x + CHIP / 2.0, line.center().y),
                         Vec2::splat(CHIP),
                     ),
-                    1.0,
+                    0.0,
                     color,
                 );
                 x += CHIP + 2.0;
