@@ -36,6 +36,9 @@ pub struct UiPrefs {
     /// Recently opened project files, newest first. Machine-local, like
     /// everything here — a path means nothing on another machine.
     pub recent_projects: Vec<String>,
+    /// Whether the rack's modulation strip is folded to its tab. How the
+    /// workspace is arranged, so it rides the machine-local prefs.
+    pub mod_strip_collapsed: bool,
 }
 
 impl UiPrefs {
@@ -62,6 +65,7 @@ mod tests {
             hidden_panels: vec!["tree".to_owned()],
             focused_center: Some("arrange".to_owned()),
             recent_projects: vec!["/tmp/a.daw.ron".to_owned()],
+            mod_strip_collapsed: true,
         };
         let back = UiPrefs::from_ron_or_default(&prefs.to_ron().unwrap());
         assert_eq!(prefs, back);

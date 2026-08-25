@@ -9577,14 +9577,21 @@ struct ModStrip<'a> {
 /// are drawn anywhere — at rest a mixing decision reads better as a
 /// sentence than as a wire, and the animated graph overlay is a later,
 /// opt-in view.
-fn mod_strip(ui: &mut egui::Ui, theme: &Theme, strip: ModStrip<'_>) {
+fn mod_strip(ui: &mut egui::Ui, theme: &Theme, strip: ModStrip<'_>, collapsed: &mut bool) {
     const TILE: f32 = 54.0;
     const ROW_H: f32 = 20.0;
     let font = egui::FontId::proportional(9.0);
     ui.vertical(|ui| {
-        ui.set_width(320.0);
+        ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("MOD").small().color(theme.text_muted));
+            if ui
+                .small_button("»")
+                .on_hover_text("collapse the modulation strip")
+                .clicked()
+            {
+                *collapsed = true;
+            }
             if ui.small_button("+ lfo").clicked() {
                 let id = *strip.next_id;
                 *strip.next_id += 1;
@@ -9937,23 +9944,92 @@ struct DeviceEdits {
     fx: Vec<device::ParamEdit>,
 }
 
+/// The collapsed MOD strip's slim tab, and the expanded strip's width.
+const MOD_TAB_W: f32 = 22.0;
+const MOD_STRIP_W: f32 = 336.0;
+
 fn device_body(
     ui: &mut egui::Ui,
     theme: &Theme,
     synth: Option<&mut device::SineSynthUi>,
     fx: Option<&mut device::ReverbUi>,
     strip: ModStrip<'_>,
+    mod_collapsed: &mut bool,
 ) -> DeviceEdits {
     let mut edits = DeviceEdits::default();
+    // The MOD strip is PINNED at the panel's right edge, outside the
+    // rack's scroll: modulation must not live at the end of a hallway.
+    // Collapsed it folds to a slim tab, so a rack that needs the room can
+    // have it without the strip vanishing from the map.
+    let area = ui.max_rect();
+    let strip_w = if *mod_collapsed {
+        MOD_TAB_W
+    } else {
+        MOD_STRIP_W
+    };
+    let strip_rect =
+        egui::Rect::from_min_max(egui::pos2(area.right() - strip_w, area.top()), area.max);
+    let rack_rect =
+        egui::Rect::from_min_max(area.min, egui::pos2(strip_rect.left(), area.bottom()));
+    ui.painter().line_segment(
+        [strip_rect.left_top(), strip_rect.left_bottom()],
+        egui::Stroke::new(stroke::HAIR, theme.divider),
+    );
+
+    if *mod_collapsed {
+        // The tab: three stacked letters, a live dot when any modulator
+        // exists — collapsed must not mean forgotten — and one click to
+        // reopen.
+        let id = ui.id().with("mod_tab");
+        let response = ui.interact(strip_rect, id, egui::Sense::click());
+        if response.clicked() {
+            *mod_collapsed = false;
+        }
+        if response.hovered() {
+            ui.painter()
+                .rect_filled(strip_rect, 0.0, theme.surface_raised);
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let letters = ["M", "O", "D"];
+        for (index, letter) in letters.iter().enumerate() {
+            ui.painter().text(
+                egui::pos2(
+                    strip_rect.center().x,
+                    strip_rect.top() + 14.0 + index as f32 * 11.0,
+                ),
+                egui::Align2::CENTER_CENTER,
+                *letter,
+                egui::FontId::proportional(9.0),
+                theme.text_muted,
+            );
+        }
+        if !strip.modulators.is_empty() {
+            ui.painter().circle_filled(
+                egui::pos2(strip_rect.center().x, strip_rect.top() + 52.0),
+                2.0,
+                theme.accent,
+            );
+        }
+    } else {
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(strip_rect.shrink2(egui::vec2(6.0, 4.0)))
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        mod_strip(&mut child, theme, strip, mod_collapsed);
+    }
+
     // A rack grows rightward, so the region scrolls horizontally — and a
     // touchpad's two-finger VERTICAL swipe is translated onto that axis
     // too, because there is no vertical content to spend it on and "hover
     // the rack, swipe, it moves" is what the gesture means here. Wheel
     // users get the same courtesy for free.
-    // auto_shrink off does the claiming here: the scroll area fills the
-    // whole region, so the region keeps its size and its resize handle —
-    // a `claim` INSIDE the scroll content would instead ask for the
-    // content's available width, which is infinite on the scroll axis.
+    let mut rack = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rack_rect)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    let ui = &mut rack;
     egui::ScrollArea::horizontal()
         .id_salt("device_rack")
         .auto_shrink([false, false])
@@ -9978,11 +10054,6 @@ fn device_body(
                         if let Some(fx) = fx {
                             edits.fx = device::reverb_card(ui, theme, fx);
                         }
-                        // The MOD strip closes the rack. It exists even on
-                        // an empty track: volume and pan are targets a
-                        // track has before it has a device.
-                        ui.separator();
-                        mod_strip(ui, theme, strip);
                     });
                 });
             // Vertical wheel becomes horizontal rack scroll — read AFTER
@@ -12236,6 +12307,7 @@ impl eframe::App for App {
                     .map_or((None, None), |track| (track.device, track.fx));
                 let registry = &self.parameter_registry;
                 let mod_values = &self.mod_values;
+                let mod_collapsed = &mut self.prefs.mod_strip_collapsed;
                 let beat = (self.transport.position * self.transport.bpm / 60.0) as f32;
                 let out = egui::Panel::bottom("device")
                     .resizable(false)
@@ -12279,7 +12351,7 @@ impl eframe::App for App {
                             values: mod_values,
                             beat,
                         };
-                        device_body(ui, t, synth, fx, strip)
+                        device_body(ui, t, synth, fx, strip, mod_collapsed)
                     });
                 (out.response.rect, out.inner)
             }
