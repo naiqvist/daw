@@ -2065,6 +2065,10 @@ struct Arrangement {
     main_view: MainView,
     /// The clip launcher's grid. Parallel to `tracks`, like `clips`.
     session: Session,
+    /// How far the launcher's columns are scrolled, in pixels. View state,
+    /// like `view_beats` is for the timeline — and outside undo for the
+    /// same reason: where you are looking is not what the song is.
+    session_scroll: f32,
     /// The header drag, while one is in flight.
     track_drag: Option<TrackDrag>,
     /// "Recompile NOW, and do not wait for the dirty check to agree."
@@ -2261,6 +2265,7 @@ impl Default for Arrangement {
             track_rename: None,
             main_view: MainView::default(),
             session: Session::new(TRACK_COUNT),
+            session_scroll: 0.0,
             track_drag: None,
             force_recompile: false,
         }
@@ -3997,6 +4002,9 @@ const SCENE_COL_W: f32 = 128.0;
 const SESSION_HEAD_H: f32 = 22.0;
 /// The mixer strip under each column: mute, solo and pan.
 const SESSION_MIXER_H: f32 = 52.0;
+/// The horizontal scrollbar under the columns, shown only when the grid is
+/// wider than the window.
+const SESSION_BAR_H: f32 = 7.0;
 
 /// Where everything in the session grid sits.
 ///
@@ -4009,26 +4017,57 @@ struct SessionLayout {
     scenes: usize,
     /// Top of the first slot row — under the column headers.
     rows_top: f32,
+    /// How far the columns are scrolled left, in pixels. Every column rect
+    /// is shifted by it, so the hit tests scroll with the paint.
+    scroll: f32,
+    tracks: usize,
 }
 
 impl SessionLayout {
-    fn new(area: egui::Rect, tracks: usize, scenes: usize) -> Self {
+    fn new(area: egui::Rect, tracks: usize, scenes: usize, scroll: f32) -> Self {
         let lanes_w = (area.width() - SCENE_COL_W).max(0.0);
+        // Columns spread to fill the space they have, but never below a
+        // width a clip name can live in: past that they keep their size and
+        // the grid scrolls instead.
         let column_w = if tracks == 0 {
             SESSION_COL_MAX
         } else {
             (lanes_w / tracks as f32).clamp(SESSION_COL_MIN, SESSION_COL_MAX)
         };
-        Self {
+        let mut layout = Self {
             area,
             column_w,
             scenes,
             rows_top: area.top() + SESSION_HEAD_H,
-        }
+            scroll: 0.0,
+            tracks,
+        };
+        // Clamped on construction, so no caller can hold a scroll position
+        // that points past the end — including after a track is deleted.
+        layout.scroll = scroll.clamp(0.0, layout.max_scroll());
+        layout
+    }
+
+    /// The strip the columns live in: everything left of the scene column.
+    fn viewport(&self) -> egui::Rect {
+        egui::Rect::from_min_max(
+            self.area.min,
+            egui::pos2(self.area.right() - SCENE_COL_W, self.area.bottom()),
+        )
+    }
+
+    fn content_w(&self) -> f32 {
+        self.tracks as f32 * self.column_w
+    }
+
+    /// How far the grid can scroll before the last column's right edge
+    /// meets the scene column. Zero when everything already fits.
+    fn max_scroll(&self) -> f32 {
+        (self.content_w() - self.viewport().width()).max(0.0)
     }
 
     fn column(&self, track: usize) -> egui::Rect {
-        let left = self.area.left() + track as f32 * self.column_w;
+        let left = self.area.left() - self.scroll + track as f32 * self.column_w;
         egui::Rect::from_min_max(
             egui::pos2(left, self.area.top()),
             egui::pos2(left + self.column_w, self.area.bottom()),
@@ -4070,10 +4109,47 @@ impl SessionLayout {
     /// grid: the strips stay put as scenes are added.
     fn mixer(&self, track: usize) -> egui::Rect {
         let column = self.column(track);
+        let bottom = self.area.bottom() - SESSION_BAR_H;
         egui::Rect::from_min_max(
-            egui::pos2(column.left(), self.area.bottom() - SESSION_MIXER_H),
-            egui::pos2(column.right(), self.area.bottom()),
+            egui::pos2(column.left(), bottom - SESSION_MIXER_H),
+            egui::pos2(column.right(), bottom),
         )
+    }
+
+    /// The scrollbar's track, under the columns. Empty when nothing can
+    /// scroll — a bar that cannot move is furniture, not a control.
+    fn scrollbar(&self) -> Option<egui::Rect> {
+        if self.max_scroll() <= 0.0 {
+            return None;
+        }
+        let viewport = self.viewport();
+        Some(egui::Rect::from_min_max(
+            egui::pos2(viewport.left(), viewport.bottom() - SESSION_BAR_H),
+            viewport.max,
+        ))
+    }
+
+    /// The thumb inside it: as much of the track as is on screen, placed
+    /// where the scroll has got to.
+    fn thumb(&self) -> Option<egui::Rect> {
+        let bar = self.scrollbar()?;
+        let content = self.content_w();
+        if content <= 0.0 {
+            return None;
+        }
+        let width = (bar.width() * bar.width() / content)
+            .max(24.0)
+            .min(bar.width());
+        let travel = bar.width() - width;
+        let at = if self.max_scroll() > 0.0 {
+            travel * (self.scroll / self.max_scroll())
+        } else {
+            0.0
+        };
+        Some(egui::Rect::from_min_size(
+            egui::pos2(bar.left() + at, bar.top()),
+            egui::vec2(width, bar.height()),
+        ))
     }
 
     fn scene_column(&self) -> egui::Rect {
@@ -4156,13 +4232,41 @@ fn session_body(
     theme: &Theme,
     arr: &mut Arrangement,
     beats_per_bar: u32,
-    waveform_cache: &HashMap<PathBuf, Arc<waveform::Peaks>>,
     drag: Option<&mut DragImport>,
 ) {
     let area = ui.max_rect();
     claim(ui);
     ui.painter().rect_filled(area, 0.0, theme.bg);
-    let layout = SessionLayout::new(area, arr.tracks.len(), arr.session.scenes.len());
+    // The wheel scrolls the columns. Both axes drive it, like the
+    // timeline's pan: a plain wheel is the one every mouse has, and a
+    // trackpad's horizontal swipe lands in the same place.
+    let mut layout = SessionLayout::new(
+        area,
+        arr.tracks.len(),
+        arr.session.scenes.len(),
+        arr.session_scroll,
+    );
+    let wheel = ui.input(|i| i.smooth_scroll_delta);
+    let pan = wheel.x + wheel.y;
+    if pan != 0.0
+        && ui.ui_contains_pointer()
+        && ui
+            .ctx()
+            .pointer_latest_pos()
+            .is_some_and(|p| layout.viewport().contains(p))
+    {
+        arr.session_scroll = (arr.session_scroll - pan).clamp(0.0, layout.max_scroll());
+        layout = SessionLayout::new(
+            area,
+            arr.tracks.len(),
+            arr.session.scenes.len(),
+            arr.session_scroll,
+        );
+    }
+    // Whatever survived the clamp is the truth from here on — a stale
+    // position (a deleted track, a resized window) is corrected in the
+    // same frame it is noticed rather than one later.
+    arr.session_scroll = layout.scroll;
     let mut intent: Option<SessionIntent> = None;
     let mut pan_edit: Option<(usize, f32)> = None;
     let mut mute: Option<usize> = None;
@@ -4175,10 +4279,14 @@ fn session_body(
 
     for (t, track) in arr.tracks.iter().enumerate() {
         let column = layout.column(t);
+        if column.right() <= area.left() {
+            // Scrolled off to the left: nothing to draw, and nothing that
+            // should answer a click either.
+            continue;
+        }
         if column.left() >= layout.scene_column().left() {
-            // Past the scene column: the grid has outrun the window. The
-            // remaining tracks are still reachable from the timeline, and
-            // drawing them here would draw them UNDER the scene buttons.
+            // Past the scene column: the rest is reachable by scrolling.
+            // Drawing it here would draw it UNDER the scene buttons.
             break;
         }
         let head = layout.head(t);
@@ -4193,7 +4301,7 @@ fn session_body(
                 theme.surface_sunken
             },
         );
-        painter.text(
+        painter.with_clip_rect(head).text(
             egui::pos2(head.left() + CLIP_LABEL_PAD, head.center().y),
             egui::Align2::LEFT_CENTER,
             &track.name,
@@ -4225,6 +4333,16 @@ fn session_body(
                 rect.min,
                 egui::pos2(
                     (rect.left() + SLOT_LAUNCH_W).min(rect.right()),
+                    rect.bottom(),
+                ),
+            );
+            // A slot at the right edge is half under the scene column; its
+            // name must stop where the slot visibly does.
+            let text_room = egui::Rect::from_min_max(
+                rect.min,
+                egui::pos2(
+                    rect.right()
+                        .min(layout.scene_column().left() - CLIP_LABEL_PAD),
                     rect.bottom(),
                 ),
             );
@@ -4273,34 +4391,15 @@ fn session_body(
                             theme.clip_body.gamma_multiply(0.75)
                         },
                     );
-                    if let Some(audio) = &clip.audio
-                        && let Some(peaks) = waveform_cache.get(&audio.path)
-                    {
-                        let body = egui::Rect::from_min_max(
-                            egui::pos2(launch_rect.right(), rect.top()),
-                            rect.max,
-                        );
-                        waveform::paint_clip_thumbnail(
-                            ui,
-                            theme,
-                            waveform::ClipThumbnail {
-                                full_clip: body,
-                                visible_clip: body,
-                                clip,
-                                peaks,
-                                bpm: 120.0,
-                                opacity: 0.5,
-                            },
-                        );
-                    }
-                    let painter = ui.painter();
                     launch_triangle(
                         painter,
                         launch_rect,
                         if playing { theme.ok } else { theme.text },
                     );
                     if rect.width() > SLOT_LAUNCH_W + CLIP_LABEL_MIN_W {
-                        painter.text(
+                        // Clipped to the slot: a long name is cut off at
+                        // the edge rather than spilling across the grid.
+                        painter.with_clip_rect(text_room).text(
                             egui::pos2(launch_rect.right(), rect.center().y),
                             egui::Align2::LEFT_CENTER,
                             &clip.name,
@@ -4474,7 +4573,7 @@ fn session_body(
             ),
             theme.text_muted,
         );
-        painter.text(
+        painter.with_clip_rect(rect).text(
             egui::pos2(rect.left() + SLOT_LAUNCH_W, rect.center().y),
             egui::Align2::LEFT_CENTER,
             &scene.name,
@@ -4531,6 +4630,60 @@ fn session_body(
             small,
             theme.text_muted,
         );
+    }
+
+    // --- the scrollbar ------------------------------------------------------
+    if let (Some(bar), Some(thumb)) = (layout.scrollbar(), layout.thumb()) {
+        let id = ui.id().with("session_scrollbar");
+        let response = ui.interact(bar, id, egui::Sense::click_and_drag());
+        if response.is_pointer_button_down_on()
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            // Where in the thumb the press landed, kept for the drag: a
+            // press outside it grips the middle, which is what makes a
+            // click on the track jump the thumb under the pointer.
+            if ui.input(|i| i.pointer.primary_pressed()) {
+                let grip = if thumb.contains(pos) {
+                    pos.x - thumb.left()
+                } else {
+                    thumb.width() * 0.5
+                };
+                ui.data_mut(|d| d.insert_temp(id, grip));
+            }
+            let grip = ui
+                .data(|d| d.get_temp::<f32>(id))
+                .unwrap_or(thumb.width() * 0.5);
+            let travel = bar.width() - thumb.width();
+            if travel > 0.0 {
+                let at = (pos.x - grip - bar.left()) / travel;
+                arr.session_scroll =
+                    (at.clamp(0.0, 1.0) * layout.max_scroll()).clamp(0.0, layout.max_scroll());
+            }
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        } else if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        }
+        let painter = ui.painter();
+        painter.rect_filled(bar, 0.0, theme.surface_sunken);
+        // Drawn from THIS frame's scroll, so a drag tracks the pointer
+        // instead of trailing it by a frame.
+        let moved = SessionLayout::new(
+            area,
+            arr.tracks.len(),
+            arr.session.scenes.len(),
+            arr.session_scroll,
+        );
+        if let Some(thumb) = moved.thumb() {
+            painter.rect_filled(
+                thumb.shrink2(egui::vec2(0.0, 1.5)),
+                3.0,
+                if response.hovered() || response.is_pointer_button_down_on() {
+                    theme.accent
+                } else {
+                    theme.outline
+                },
+            );
+        }
     }
 
     // --- a file being dragged in -------------------------------------------
@@ -4639,7 +4792,7 @@ fn drop_slot(
                 egui::StrokeKind::Middle,
             );
             if rect.width() > SLOT_LAUNCH_W + CLIP_LABEL_MIN_W {
-                painter.text(
+                painter.with_clip_rect(rect).text(
                     egui::pos2(rect.left() + SLOT_LAUNCH_W, rect.center().y),
                     egui::Align2::LEFT_CENTER,
                     &drag.name,
@@ -4943,7 +5096,7 @@ fn drop_preview(
         );
     }
     if r.width() >= CLIP_LABEL_MIN_W {
-        painter.text(
+        painter.with_clip_rect(r).text(
             egui::pos2(r.left() + CLIP_LABEL_PAD, r.top() + CLIP_LABEL_PAD),
             egui::Align2::LEFT_TOP,
             &ghost.name,
@@ -5214,7 +5367,10 @@ fn clips_pass(
                     rename_commit = true;
                 }
             } else if rect.width() >= CLIP_LABEL_MIN_W {
-                painter.text(
+                // Clipped to the clip: a name longer than the box it names
+                // is cut off at the edge rather than running across its
+                // neighbours.
+                painter.with_clip_rect(rect).text(
                     egui::pos2(rect.left() + CLIP_LABEL_PAD, rect.top() + CLIP_LABEL_PAD),
                     egui::Align2::LEFT_TOP,
                     &clip.name,
@@ -5269,7 +5425,7 @@ fn clips_pass(
             egui::StrokeKind::Middle,
         );
         if r.width() >= CLIP_LABEL_MIN_W {
-            painter.text(
+            painter.with_clip_rect(r).text(
                 egui::pos2(r.left() + CLIP_LABEL_PAD, r.top() + CLIP_LABEL_PAD),
                 egui::Align2::LEFT_TOP,
                 &g.clip.name,
@@ -8088,7 +8244,6 @@ impl eframe::App for App {
                         &self.theme,
                         &mut self.arrangement,
                         self.transport.beats_per_bar,
-                        &self.waveform_cache,
                         self.drag_import.as_mut(),
                     );
                     // The launcher has no view to pan: nothing here can
@@ -10570,18 +10725,247 @@ mod tests {
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(theme.bg))
                 .show(ui, |ui| {
-                    session_body(
+                    session_body(ui, &mut Focus::default(), &theme, arr, 4, None);
+                });
+        });
+        out.textures_delta.clear();
+    }
+
+    /// A name longer than the box it names is CUT OFF at the edge rather
+    /// than spilling across its neighbours. Clipping is a paint-level
+    /// property, so this reads the tessellated output: the text shape's
+    /// clip rect must not reach past the thing it labels.
+    #[test]
+    fn a_long_clip_name_cannot_bleed_out_of_its_clip() {
+        let long = "a-really-quite-unreasonably-long-clip-name-".repeat(4);
+
+        // In the launcher.
+        let ctx = egui::Context::default();
+        let mut arr = Arrangement::default();
+        assert!(arr.create_slot_clip(0, 0, 4.0));
+        arr.session.slots[0][0].as_mut().unwrap().name = long.clone();
+        let mut out = ctx.run_ui(input(vec![]), |ui| {
+            let theme = Theme::dark();
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(theme.bg))
+                .show(ui, |ui| {
+                    session_body(ui, &mut Focus::default(), &theme, &mut arr, 4, None);
+                });
+        });
+        let layout = SessionLayout::new(
+            Rect::from_min_size(pos2(0.0, 0.0), SCREEN),
+            arr.tracks.len(),
+            arr.session.scenes.len(),
+            0.0,
+        );
+        let slot = layout.slot(0, 0);
+        let painted = out
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == long => Some(shape.clip_rect),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(painted.len(), 1, "the name is painted once");
+        assert!(
+            painted[0].right() <= slot.right() + 0.01,
+            "the slot's name is clipped to the slot: {:?} vs {:?}",
+            painted[0],
+            slot
+        );
+        out.textures_delta.clear();
+
+        // And on the timeline, where the clip is one grid step wide and the
+        // name is a hundred times that.
+        let ctx = egui::Context::default();
+        let mut arr = Arrangement::default();
+        arr.create_clip(0, 0.0, 4.0).unwrap();
+        arr.clips[0][0].name = long.clone();
+        let mut out = ctx.run_ui(input(vec![]), |ui| {
+            let theme = Theme::dark();
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(theme.bg))
+                .show(ui, |ui| {
+                    arrangement_body(
                         ui,
                         &mut Focus::default(),
                         &theme,
-                        arr,
-                        4,
+                        &mut arr,
+                        ArrangementTransportView {
+                            beats_per_bar: 4,
+                            bpm: 120.0,
+                            playhead: 0.0,
+                            follow: false,
+                        },
                         &HashMap::new(),
                         None,
                     );
                 });
         });
+        let clip_right = TL + 4.0 * PX_PER_BEAT;
+        let painted = out
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == long => Some(shape.clip_rect),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(painted.len(), 1);
+        assert!(
+            painted[0].right() <= clip_right + 0.01,
+            "the clip's name is clipped to the clip: {:?} ends past {clip_right}",
+            painted[0]
+        );
         out.textures_delta.clear();
+    }
+
+    /// Columns spread to fill the space they have, and stop shrinking at a
+    /// width a clip name can live in — past that the grid scrolls. The
+    /// scroll is clamped on construction, so no caller can hold a position
+    /// that points past the end.
+    #[test]
+    fn the_session_grid_scrolls_once_its_columns_stop_shrinking() {
+        let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, 400.0));
+        let viewport_w = 600.0 - SCENE_COL_W;
+
+        // Few tracks: everything fits, so there is nothing to scroll and no
+        // scrollbar to show.
+        let roomy = SessionLayout::new(area, 3, 8, 0.0);
+        assert!(roomy.column_w > SESSION_COL_MIN);
+        assert_eq!(roomy.max_scroll(), 0.0);
+        assert!(
+            roomy.scrollbar().is_none(),
+            "a bar that cannot move is not shown"
+        );
+
+        // Many tracks: the columns hold their minimum and the grid scrolls.
+        let packed = SessionLayout::new(area, 20, 8, 0.0);
+        assert_eq!(packed.column_w, SESSION_COL_MIN);
+        assert_eq!(packed.content_w(), 20.0 * SESSION_COL_MIN);
+        assert!((packed.max_scroll() - (20.0 * SESSION_COL_MIN - viewport_w)).abs() < 0.01);
+        assert!(packed.scrollbar().is_some());
+        assert_eq!(
+            packed.column(0).left(),
+            area.left(),
+            "unscrolled starts flush"
+        );
+
+        // Scrolling shifts every column left by exactly the scroll.
+        let scrolled = SessionLayout::new(area, 20, 8, 100.0);
+        assert_eq!(scrolled.column(0).left(), area.left() - 100.0);
+        assert_eq!(scrolled.slot(5, 2).left(), packed.slot(5, 2).left() - 100.0);
+
+        // And it cannot run past the end, or before the start.
+        let over = SessionLayout::new(area, 20, 8, 99_999.0);
+        assert_eq!(over.scroll, over.max_scroll());
+        assert!(
+            (over.column(19).right() - over.viewport().right()).abs() < 0.01,
+            "the last column ends exactly at the scene column"
+        );
+        assert_eq!(SessionLayout::new(area, 20, 8, -50.0).scroll, 0.0);
+    }
+
+    /// The wheel scrolls the grid, and the hit tests scroll with it: a slot
+    /// answers where it is DRAWN, not where it started.
+    #[test]
+    fn scrolling_the_grid_moves_what_a_click_hits() {
+        let ctx = egui::Context::default();
+        let mut arr = Arrangement::default();
+        // Enough tracks that the grid is wider than the window.
+        while arr.tracks.len() < 20 {
+            arr.add_track(TrackKind::Midi);
+        }
+        assert!(arr.create_slot_clip(12, 1, 4.0));
+        arr.session.selected = None;
+        session_pass(&ctx, &mut arr, vec![]);
+        assert_eq!(arr.session_scroll, 0.0);
+
+        let area = Rect::from_min_size(pos2(0.0, 0.0), SCREEN);
+        let unscrolled = SessionLayout::new(area, arr.tracks.len(), arr.session.scenes.len(), 0.0);
+        assert!(unscrolled.max_scroll() > 0.0, "the grid overflows");
+
+        // A wheel scroll over the grid moves the columns.
+        let over = unscrolled.slot(0, 0).center();
+        session_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::PointerMoved(over),
+                Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: vec2(-200.0, 0.0),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        // egui smooths a wheel over several frames, so the columns are
+        // still moving here: let it settle before measuring where they
+        // ended up.
+        for _ in 0..30 {
+            session_pass(&ctx, &mut arr, vec![]);
+        }
+        let scroll = arr.session_scroll;
+        assert!(scroll > 0.0, "the wheel scrolled the grid");
+
+        // Track 12's slot now sits somewhere new — and clicking it there
+        // launches it, which is the whole point of the hit tests moving.
+        let layout = SessionLayout::new(area, arr.tracks.len(), arr.session.scenes.len(), scroll);
+        let triangle = pos2(
+            layout.slot(12, 1).left() + SLOT_LAUNCH_W * 0.5,
+            layout.slot(12, 1).center().y,
+        );
+        assert!(layout.viewport().contains(triangle), "it is on screen");
+        session_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::PointerMoved(triangle),
+                Event::PointerButton {
+                    pos: triangle,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+                Event::PointerButton {
+                    pos: triangle,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        assert_eq!(
+            arr.session.playing[12],
+            Some(1),
+            "the scrolled slot took the click"
+        );
+        assert_eq!(arr.session_scroll, scroll, "and clicking did not scroll");
+    }
+
+    /// Deleting tracks until the grid fits again pulls the scroll back:
+    /// a stale position is corrected the frame it is noticed.
+    #[test]
+    fn the_scroll_is_pulled_back_when_the_grid_shrinks() {
+        let ctx = egui::Context::default();
+        let mut arr = Arrangement::default();
+        while arr.tracks.len() < 20 {
+            arr.add_track(TrackKind::Midi);
+        }
+        arr.session_scroll = 400.0;
+        session_pass(&ctx, &mut arr, vec![]);
+        assert!(arr.session_scroll > 0.0);
+
+        while arr.tracks.len() > 2 {
+            arr.remove_track(arr.tracks.len() - 1);
+        }
+        session_pass(&ctx, &mut arr, vec![]);
+        assert_eq!(
+            arr.session_scroll, 0.0,
+            "two columns fit, so there is nowhere left to scroll to"
+        );
     }
 
     /// A file dragged over the launcher aims at the slot under it — audio
@@ -10605,15 +10989,7 @@ mod tests {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(theme.bg))
                     .show(ui, |ui| {
-                        session_body(
-                            ui,
-                            &mut Focus::default(),
-                            &theme,
-                            arr,
-                            4,
-                            &HashMap::new(),
-                            Some(drag),
-                        );
+                        session_body(ui, &mut Focus::default(), &theme, arr, 4, Some(drag));
                     });
             });
             out.textures_delta.clear();
@@ -10623,6 +10999,7 @@ mod tests {
             Rect::from_min_size(pos2(0.0, 0.0), SCREEN),
             arr.tracks.len(),
             arr.session.scenes.len(),
+            arr.session_scroll,
         );
         drag_pass(&ctx, &mut arr, &mut drag, layout.slot(audio, 3).center());
         assert_eq!(
@@ -10687,6 +11064,7 @@ mod tests {
             Rect::from_min_size(pos2(0.0, 0.0), SCREEN),
             arr.tracks.len(),
             arr.session.scenes.len(),
+            arr.session_scroll,
         );
         let slot = layout.slot(0, 1);
         let click = |ctx: &egui::Context, arr: &mut Arrangement, pos: egui::Pos2| {
@@ -10747,6 +11125,7 @@ mod tests {
             Rect::from_min_size(pos2(0.0, 0.0), SCREEN),
             arr.tracks.len(),
             arr.session.scenes.len(),
+            arr.session_scroll,
         );
         let click = |ctx: &egui::Context, arr: &mut Arrangement, pos: egui::Pos2| {
             session_pass(
