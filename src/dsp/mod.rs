@@ -21,7 +21,8 @@
 //!   3. ramps & envelopes ← [`ramps`] (ADSR still pending)
 //!   4. LFOs & mod
 //!   5. delay family    ← [`reverb`] (the first effect built on it)
-//!   6. filters
+//!   6. filters         ← [`filters`] (one-pole, SVF, DC blocker,
+//!      Butterworth cascade; tilt still pending)
 //!   7. oscillators
 //!   8. nonlinearities
 //!   9. dynamics
@@ -30,6 +31,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 pub mod arith;
+pub mod filters;
 pub mod mem;
 pub mod ramps;
 pub mod reverb;
