@@ -143,6 +143,10 @@ impl OnePole {
     /// INSIDE a per-sample loop — a feedback delay's damping cannot be a
     /// block call, because each sample recirculates before the next
     /// exists. Everything else should use the block form below.
+    // TEMPORARY allow: the only caller is delay.rs, which stays
+    // undeclared in mod.rs until the post-ADSR tidy pass. Remove the
+    // allow when `pub mod delay;` lands.
+    #[allow(dead_code)]
     #[inline(always)]
     pub(crate) fn tick_lowpass(&mut self, x: f32) -> f32 {
         self.tick(x)
