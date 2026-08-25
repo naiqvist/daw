@@ -156,7 +156,7 @@ impl DelayLine {
     /// `set_delay` rounded to the nearest sample — an impulse in comes
     /// back bit-identical, exactly N samples later.
     pub fn process_exact(&mut self, io: &mut [f32], buf: &mut [f32]) {
-        if buf.len() != self.expected || buf.is_empty() {
+        if !self.matches(buf) {
             return; // fail open: io already holds the dry signal
         }
         let d = (self.delay.round() as usize).clamp(1, self.max as usize);
@@ -171,7 +171,7 @@ impl DelayLine {
     /// Red zone: fractional delay via Hermite, in place. The one to use
     /// whenever the delay time can move.
     pub fn process_smooth(&mut self, io: &mut [f32], buf: &mut [f32]) {
-        if buf.len() != self.expected || buf.is_empty() {
+        if !self.matches(buf) {
             return;
         }
         let d = self.delay.max(MIN_FRAC);
@@ -187,7 +187,7 @@ impl DelayLine {
     /// `delays` pairs with `io` (`zip` length rules); each entry clamps
     /// like `set_delay`.
     pub fn process_modulated(&mut self, io: &mut [f32], buf: &mut [f32], delays: &[f32]) {
-        if buf.len() != self.expected || buf.is_empty() {
+        if !self.matches(buf) {
             return;
         }
         let max = self.max.max(MIN_FRAC);
@@ -222,7 +222,7 @@ impl DelayLine {
     /// duller the shorter and higher the content — the measured baseline
     /// the module docs quote. For unmodulated lines only.
     pub fn process_linear(&mut self, io: &mut [f32], buf: &mut [f32]) {
-        if buf.len() != self.expected || buf.is_empty() {
+        if !self.matches(buf) {
             return;
         }
         let d = self.delay.max(MIN_FRAC);
@@ -319,7 +319,7 @@ impl FeedbackDelay {
 
     /// Red zone: replace `io` with the wet echo signal, any length.
     pub fn process(&mut self, io: &mut [f32], buf: &mut [f32]) {
-        if buf.len() != self.line.expected || buf.is_empty() {
+        if !self.line.matches(buf) {
             return; // fail open — io keeps the dry signal
         }
         let d = self.line.delay.max(MIN_FRAC);

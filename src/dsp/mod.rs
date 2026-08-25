@@ -18,24 +18,31 @@
 //! Roadmap (one family per change, in dependency order):
 //!   1. memory & move   ← [`mem`]
 //!   2. vector x vector ← [`arith`]
-//!   3. ramps & envelopes ← [`ramps`] (ADSR still pending)
-//!   4. LFOs & mod
-//!   5. delay family    ← [`reverb`] (the first effect built on it)
+//!   3. ramps & envelopes ← [`ramps`] + [`adsr`]
+//!   4. LFOs & mod       ← [`lfo`]
+//!   5. delay family    ← [`delay`] + [`reverb`] (the first effect built on it)
 //!   6. filters         ← [`filters`] (one-pole, SVF, DC blocker,
 //!      Butterworth cascade; tilt still pending)
 //!   7. oscillators     ← [`osc`] + [`noise`] (mip-mapped wavetables,
 //!      white/pink; polyBLEP deliberately skipped until a synth node
 //!      wants sync or PWM, wavetable playback pending)
-//!   8. nonlinearities
-//!   9. dynamics
-//!  10. FFT/spectral
+//!   8. nonlinearities  ← [`shaper`]
+//!   9. dynamics        ← [`dynamics`]
+//!  10. FFT/spectral    ← [`fft`] (real FFT, windows, frame cutter,
+//!      overlap-add, magnitude/phase conversion)
 
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
+pub mod adsr;
 pub mod arith;
+pub mod delay;
+pub mod dynamics;
+pub mod fft;
 pub mod filters;
+pub mod lfo;
 pub mod mem;
 pub mod noise;
 pub mod osc;
 pub mod ramps;
 pub mod reverb;
+pub mod shaper;
