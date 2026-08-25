@@ -1499,13 +1499,20 @@ fn perform(actions: &[UiAction], transport: &mut Transport, arrangement: &mut Ar
                 }
             }
             UiAction::DeleteSelected => {
+                // The most specific selection goes first: a clip or slot if
+                // one is selected, else the TRACK — in either view. Undo is
+                // what makes the track fall-through safe to offer.
                 if arrangement.main_view == MainView::Session {
                     if let Some((track, scene)) = arrangement.session.selected {
                         arrangement.force_recompile |= arrangement.clear_slot(track, scene);
+                    } else if let Some(track) = arrangement.selected {
+                        arrangement.remove_track(track);
                     }
                 } else if let Some((t, i)) = arrangement.selected_clip {
                     arrangement.clips[t].remove(i);
                     arrangement.selected_clip = None;
+                } else if let Some(track) = arrangement.selected {
+                    arrangement.remove_track(track);
                 }
             }
             UiAction::CopyClip => arrangement.copy_selected(),
@@ -4806,6 +4813,8 @@ enum SessionIntent {
     AddScene,
     SelectTrack(usize),
     SelectScene(usize),
+    RenameTrack(usize),
+    ReorderTrack(usize, usize),
     RenameScene(usize),
     InsertSceneBelow(usize),
     CaptureScene,
@@ -4907,6 +4916,11 @@ fn session_body(
     let mut volume_edit: Option<(usize, f32)> = None;
     let mut clear_clip: Option<usize> = None;
     let mut slot_drag = arr.slot_drag.take();
+    // The header rename and the reorder drag are the SAME state the
+    // timeline's header column uses — one rename, one drag, whichever
+    // view is showing. Ridden out for the draw and handed back.
+    let mut track_rename = arr.track_rename.take();
+    let mut track_drag = arr.track_drag.take();
     // A Cell for the same reason as the clip pass's menu: one closure per
     // slot per frame, all reaching one slot.
     let menu: std::cell::Cell<Option<SessionIntent>> = std::cell::Cell::new(None);
@@ -4937,20 +4951,76 @@ fn session_body(
                 theme.surface_sunken
             },
         );
-        painter.with_clip_rect(head).text(
-            egui::pos2(head.left() + CLIP_LABEL_PAD, head.center().y),
-            egui::Align2::LEFT_CENTER,
-            &track.name,
-            font.clone(),
-            if track_audible(&arr.tracks, t) {
-                theme.text
-            } else {
-                theme.divider
-            },
-        );
+        let renaming_this = track_rename.as_ref().is_some_and(|r| r.track == t);
+        if !renaming_this {
+            painter.with_clip_rect(head).text(
+                egui::pos2(head.left() + CLIP_LABEL_PAD, head.center().y),
+                egui::Align2::LEFT_CENTER,
+                &track.name,
+                font.clone(),
+                if track_audible(&arr.tracks, t) {
+                    theme.text
+                } else {
+                    theme.divider
+                },
+            );
+        }
         let head_id = ui.id().with(("session_head", t));
-        if ui.interact(head, head_id, egui::Sense::click()).clicked() {
+        let head_response = ui.interact(head, head_id, egui::Sense::click_and_drag());
+        if head_response.double_clicked() {
+            intent = Some(SessionIntent::RenameTrack(t));
+        } else if head_response.clicked() {
             intent = Some(SessionIntent::SelectTrack(t));
+        }
+        // The header drags horizontally to reorder the stack — the same
+        // gesture as the timeline's header column, turned on its side, and
+        // the same rules: an insertion line, nothing moves until release,
+        // Escape abandons.
+        if head_response.drag_started() {
+            track_drag = Some(TrackDrag {
+                from: t,
+                insertion: t,
+            });
+            intent = Some(SessionIntent::SelectTrack(t));
+        }
+        if head_response.dragged()
+            && let Some(d) = &mut track_drag
+            && d.from == t
+            && let Some(pos) = head_response.interact_pointer_pos()
+        {
+            d.insertion = (0..arr.tracks.len())
+                .filter(|&column| pos.x > layout.column(column).center().x)
+                .count();
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        }
+        if head_response.drag_stopped()
+            && let Some(d) = &track_drag
+            && d.from == t
+        {
+            let to = d
+                .insertion
+                .saturating_sub(usize::from(d.insertion > d.from))
+                .min(arr.tracks.len().saturating_sub(1));
+            intent = Some(SessionIntent::ReorderTrack(d.from, to));
+            track_drag = None;
+        }
+        // The rename replaces the name label in place, exactly like the
+        // timeline header's. Enter/Escape settlement is global — the app's
+        // `track_rename_keys` — so the edit behaves the same in both views.
+        if let Some(rename) = track_rename.as_mut().filter(|r| r.track == t) {
+            let edit = egui::Rect::from_min_max(
+                egui::pos2(head.left() + CLIP_LABEL_PAD, head.top() + 1.0),
+                egui::pos2(head.right() - CLIP_LABEL_PAD, head.bottom() - 1.0),
+            );
+            let field = ui.put(
+                edit,
+                egui::TextEdit::singleline(&mut rename.text)
+                    .font(egui::FontId::proportional(HEADER_NAME_TYPE)),
+            );
+            if !rename.focused {
+                field.request_focus();
+                rename.focused = true;
+            }
         }
 
         // --- the slots ----------------------------------------------------
@@ -5307,6 +5377,26 @@ fn session_body(
         }
     }
     arr.slot_drag = slot_drag;
+
+    // The reorder drag: Escape abandons, and the insertion line stands in
+    // the gap the release would open.
+    if track_drag.is_some() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        track_drag = None;
+    }
+    if let Some(d) = &track_drag {
+        let x = if d.insertion < arr.tracks.len() {
+            layout.column(d.insertion).left()
+        } else {
+            layout.column(arr.tracks.len().saturating_sub(1)).right()
+        }
+        .clamp(area.left(), layout.scene_column().left());
+        ui.painter().line_segment(
+            [egui::pos2(x, area.top()), egui::pos2(x, layout.mixer_top())],
+            egui::Stroke::new(2.0, theme.accent),
+        );
+    }
+    arr.track_drag = track_drag;
+    arr.track_rename = track_rename;
 
     // The seam's mark: quiet until pointed at, like the app's other seams.
     if seam_response.hovered() || seam_response.dragged() {
@@ -5683,6 +5773,20 @@ fn session_body(
         Some(SessionIntent::AddScene) => arr.add_scene(),
         Some(SessionIntent::SelectTrack(t)) => arr.selected = Some(t),
         Some(SessionIntent::SelectScene(s)) => arr.session.selected_scene = Some(s),
+        Some(SessionIntent::RenameTrack(t)) => {
+            if let Some(track) = arr.tracks.get(t) {
+                arr.selected = Some(t);
+                arr.track_rename = Some(TrackRename {
+                    track: t,
+                    text: track.name.clone(),
+                    original: track.name.clone(),
+                    focused: false,
+                });
+            }
+        }
+        Some(SessionIntent::ReorderTrack(from, to)) => {
+            arr.move_track(from, to);
+        }
         Some(SessionIntent::RenameScene(s)) => {
             if let Some(scene) = arr.session.scenes.get(s) {
                 arr.session.selected_scene = Some(s);
@@ -12052,6 +12156,154 @@ mod tests {
         assert_eq!(
             arr.session_scroll, 0.0,
             "two columns fit, so there is nowhere left to scroll to"
+        );
+    }
+
+    /// Delete removes the most specific selection: the clip or slot when
+    /// one is selected, else the TRACK — in either view.
+    #[test]
+    fn delete_falls_through_to_the_selected_track() {
+        let mut transport = Transport::default();
+
+        // Timeline: clip first, then the track.
+        let mut arr = Arrangement::default();
+        arr.create_clip(0, 0.0, 4.0).unwrap();
+        arr.selected = Some(0);
+        arr.selected_clip = Some((0, 0));
+        let tracks = arr.tracks.len();
+        perform(&[UiAction::DeleteSelected], &mut transport, &mut arr);
+        assert!(arr.clips[0].is_empty(), "the clip went first");
+        assert_eq!(arr.tracks.len(), tracks, "the track did not");
+        perform(&[UiAction::DeleteSelected], &mut transport, &mut arr);
+        assert_eq!(arr.tracks.len(), tracks - 1, "then the track");
+
+        // Session: slot first, then the track.
+        let mut arr = Arrangement {
+            main_view: MainView::Session,
+            ..Default::default()
+        };
+        assert!(arr.create_slot_clip(1, 0, 4.0));
+        arr.selected = Some(1);
+        let tracks = arr.tracks.len();
+        perform(&[UiAction::DeleteSelected], &mut transport, &mut arr);
+        assert!(arr.session.slot(1, 0).is_none(), "the slot went first");
+        assert_eq!(arr.tracks.len(), tracks);
+        assert_eq!(
+            arr.session.selected, None,
+            "clearing dropped the slot selection"
+        );
+        perform(&[UiAction::DeleteSelected], &mut transport, &mut arr);
+        assert_eq!(arr.tracks.len(), tracks - 1, "then the track");
+        assert_eq!(
+            arr.session.slots.len(),
+            arr.tracks.len(),
+            "and the grid followed"
+        );
+    }
+
+    /// The session column header renames on a double-click — the same
+    /// TrackRename state the timeline header uses, so Enter and Escape
+    /// mean the same thing in both views.
+    #[test]
+    fn the_session_header_opens_the_track_rename() {
+        let ctx = egui::Context::default();
+        let mut arr = Arrangement::default();
+        session_pass(&ctx, &mut arr, vec![]);
+        let layout = SessionLayout::new(
+            Rect::from_min_size(pos2(0.0, 0.0), SCREEN),
+            arr.tracks.len(),
+            arr.session.scenes.len(),
+            0.0,
+            0.0,
+            SESSION_MIXER_H,
+        );
+        let head = layout.head(1).center();
+        for _ in 0..2 {
+            session_pass(
+                &ctx,
+                &mut arr,
+                vec![
+                    Event::PointerMoved(head),
+                    Event::PointerButton {
+                        pos: head,
+                        button: PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Default::default(),
+                    },
+                    Event::PointerButton {
+                        pos: head,
+                        button: PointerButton::Primary,
+                        pressed: false,
+                        modifiers: Default::default(),
+                    },
+                ],
+            );
+        }
+        assert!(
+            arr.track_rename.as_ref().is_some_and(|r| r.track == 1),
+            "the double-click opened the rename on the right lane"
+        );
+    }
+
+    /// Dragging a session column header sideways reorders the tracks —
+    /// the timeline gesture turned on its side, through the same
+    /// `move_track` door, so clips, slots and playing state all follow.
+    #[test]
+    fn dragging_a_session_header_reorders_the_tracks() {
+        let ctx = egui::Context::default();
+        let mut arr = Arrangement::default();
+        assert!(arr.create_slot_clip(0, 0, 4.0));
+        assert!(arr.session.launch(0, 0));
+        let moved = arr.tracks[0].name.clone();
+        session_pass(&ctx, &mut arr, vec![]);
+
+        let layout = SessionLayout::new(
+            Rect::from_min_size(pos2(0.0, 0.0), SCREEN),
+            arr.tracks.len(),
+            arr.session.scenes.len(),
+            0.0,
+            0.0,
+            SESSION_MIXER_H,
+        );
+        let press = layout.head(0).center();
+        // Past the middle of column 2: the insertion counts two columns.
+        let over = pos2(layout.column(2).center().x + 4.0, press.y);
+        session_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::PointerMoved(press),
+                Event::PointerButton {
+                    pos: press,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        session_pass(&ctx, &mut arr, vec![Event::PointerMoved(over)]);
+        assert!(arr.track_drag.is_some(), "the drag is in flight");
+        assert_eq!(arr.tracks[0].name, moved, "nothing moves until release");
+        session_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::PointerMoved(over),
+                Event::PointerButton {
+                    pos: over,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        assert!(arr.track_drag.is_none());
+        assert_eq!(arr.tracks[2].name, moved, "the column landed at index 2");
+        assert!(arr.session.slot(2, 0).is_some(), "its slot went with it");
+        assert_eq!(
+            arr.session.playing[2],
+            Some(0),
+            "and it is still playing there"
         );
     }
 
