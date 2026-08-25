@@ -23,8 +23,9 @@
 //!   5. delay family    ← [`reverb`] (the first effect built on it)
 //!   6. filters         ← [`filters`] (one-pole, SVF, DC blocker,
 //!      Butterworth cascade; tilt still pending)
-//!   7. oscillators     ← [`osc`] (mip-mapped wavetables; noise,
-//!      polyBLEP and wavetable playback pending)
+//!   7. oscillators     ← [`osc`] + [`noise`] (mip-mapped wavetables,
+//!      white/pink; polyBLEP deliberately skipped until a synth node
+//!      wants sync or PWM, wavetable playback pending)
 //!   8. nonlinearities
 //!   9. dynamics
 //!  10. FFT/spectral
@@ -34,6 +35,7 @@
 pub mod arith;
 pub mod filters;
 pub mod mem;
+pub mod noise;
 pub mod osc;
 pub mod ramps;
 pub mod reverb;
