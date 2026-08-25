@@ -2067,9 +2067,30 @@ const MOD_RATES: [f32; 7] = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0];
 /// one track by another a single wire rather than a sidechain feature.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 enum ModKind {
-    Lfo { shape: ModShape, rate_beats: f32 },
-    Follower { track: usize },
+    Lfo {
+        shape: ModShape,
+        rate_beats: f32,
+        /// FREE runs on the wall clock — it breathes while the transport
+        /// stands still, and it is deliberately NOT deterministic across
+        /// bounces: that is what free means, and the sequencing contract's
+        /// free-running/timeline-locked split applies to modulators too.
+        #[serde(default)]
+        free: bool,
+        /// The free-mode rate, in cycles per second.
+        #[serde(default = "default_hz")]
+        hz: f32,
+    },
+    Follower {
+        track: usize,
+    },
 }
+
+fn default_hz() -> f32 {
+    1.0
+}
+
+/// The free-mode rate ladder, in Hz.
+const MOD_HZ: [f32; 7] = [0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0];
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 struct Modulator {
@@ -2188,11 +2209,26 @@ fn sum_wires(wires: &[ModWire], outputs: &HashMap<u64, f32>, track: usize, targe
 /// A modulator's value this frame: LFOs from the beat, followers from the
 /// meter ballistics the mixer already runs. Pure over its inputs, which is
 /// what the determinism test leans on.
-fn modulator_value(kind: &ModKind, beat: f32, meters: &[device::meter::Ballistics]) -> f32 {
+/// `beat` drives synced LFOs, `seconds` (the app's monotonic UI clock)
+/// drives free ones, and the meters drive followers.
+fn modulator_value(
+    kind: &ModKind,
+    beat: f32,
+    seconds: f32,
+    meters: &[device::meter::Ballistics],
+) -> f32 {
     match kind {
-        ModKind::Lfo { shape, rate_beats } => {
-            let rate = rate_beats.max(1e-3);
-            shape.wave(beat / rate)
+        ModKind::Lfo {
+            shape,
+            rate_beats,
+            free,
+            hz,
+        } => {
+            if *free {
+                shape.wave(seconds * hz.max(1e-3))
+            } else {
+                shape.wave(beat / rate_beats.max(1e-3))
+            }
         }
         ModKind::Follower { track } => meters
             .get(*track)
@@ -3170,7 +3206,9 @@ fn apply_project_doc(doc: ProjectDoc, arr: &mut Arrangement, transport: &mut Tra
         .into_iter()
         .filter(|modulator| match modulator.kind {
             ModKind::Follower { track } => track < tracks,
-            ModKind::Lfo { rate_beats, .. } => rate_beats.is_finite() && rate_beats > 0.0,
+            ModKind::Lfo { rate_beats, hz, .. } => {
+                rate_beats.is_finite() && rate_beats > 0.0 && hz.is_finite() && hz > 0.0
+            }
         })
         .collect();
     fresh.mod_wires = doc
@@ -3747,6 +3785,8 @@ impl Arrangement {
             kind: ModKind::Lfo {
                 shape: ModShape::Sine,
                 rate_beats: 4.0,
+                free: false,
+                hz: 1.0,
             },
         });
         id
@@ -9664,6 +9704,8 @@ struct ModStrip<'a> {
     values: &'a HashMap<u64, f32>,
     /// The playhead in beats: what an LFO's phase is a function of.
     beat: f32,
+    /// The app's monotonic clock: what a FREE LFO's phase is a function of.
+    seconds: f32,
     /// Each wire's chain output this frame, in target units.
     outputs: &'a HashMap<u64, f32>,
     /// Each wire's recent outputs, normalized to its target's range.
@@ -9682,545 +9724,653 @@ struct ModStrip<'a> {
 /// sentence than as a wire, and the animated graph overlay is a later,
 /// opt-in view.
 fn mod_strip(ui: &mut egui::Ui, theme: &Theme, strip: ModStrip<'_>, collapsed: &mut bool) {
-    const TILE: f32 = 54.0;
+    const TILE_W: f32 = 152.0;
+    const TILE_H: f32 = 88.0;
     const ROW_H: f32 = 20.0;
     let font = egui::FontId::proportional(9.0);
-    ui.vertical(|ui| {
-        ui.set_width(ui.available_width());
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("MOD").small().color(theme.text_muted));
-            if ui
-                .small_button("»")
-                .on_hover_text("collapse the modulation strip")
-                .clicked()
-            {
-                *collapsed = true;
-            }
-            if ui.small_button("+ lfo").clicked() {
-                let id = *strip.next_id;
-                *strip.next_id += 1;
-                strip.modulators.push(Modulator {
-                    id,
-                    kind: ModKind::Lfo {
-                        shape: ModShape::Sine,
-                        rate_beats: 4.0,
-                    },
-                });
-            }
-            if let Some(track) = strip.track
-                && ui
-                    .small_button("+ follow")
-                    .on_hover_text("a follower listening to the selected track's level")
-                    .clicked()
-            {
-                let id = *strip.next_id;
-                *strip.next_id += 1;
-                strip.modulators.push(Modulator {
-                    id,
-                    kind: ModKind::Follower { track },
-                });
-            }
-        });
-        let mut remove: Option<u64> = None;
-        let mut add_wire: Option<(u64, String)> = None;
-        ui.horizontal_wrapped(|ui| {
-            let mut lfo_no = 0;
-            for modulator in strip.modulators.iter_mut() {
-                let (rect, _) =
-                    ui.allocate_exact_size(egui::vec2(TILE, TILE), egui::Sense::hover());
-                let painter = ui.painter();
-                painter.rect_filled(rect, 3.0, theme.surface_sunken);
-                painter.rect_stroke(
-                    rect,
-                    3.0,
-                    egui::Stroke::new(1.0, theme.divider),
-                    egui::StrokeKind::Inside,
-                );
-                let value = strip.values.get(&modulator.id).copied().unwrap_or(0.0);
-                let inner = rect.shrink(6.0);
-                match &mut modulator.kind {
-                    ModKind::Lfo { shape, rate_beats } => {
-                        lfo_no += 1;
-                        painter.text(
-                            rect.left_top() + egui::vec2(4.0, 3.0),
-                            egui::Align2::LEFT_TOP,
-                            format!("LFO {lfo_no}"),
-                            font.clone(),
-                            theme.text_muted,
-                        );
-                        // The whole animation: one dot riding a static
-                        // cycle. Legible from the corner of the eye,
-                        // nothing flashes.
-                        let wave_rect = egui::Rect::from_min_max(
-                            egui::pos2(inner.left(), inner.top() + 10.0),
-                            egui::pos2(inner.right(), inner.bottom() - 10.0),
-                        );
-                        let points: Vec<_> = (0..=24)
-                            .map(|step| {
-                                let phase = step as f32 / 24.0;
-                                egui::pos2(
-                                    wave_rect.left() + phase * wave_rect.width(),
-                                    wave_rect.center().y
-                                        - shape.wave(phase) * wave_rect.height() * 0.5,
-                                )
-                            })
-                            .collect();
-                        painter.add(egui::Shape::line(
-                            points,
-                            egui::Stroke::new(1.0, theme.accent_muted),
-                        ));
-                        let phase = (strip.beat / rate_beats.max(1e-3)).rem_euclid(1.0);
-                        painter.circle_filled(
-                            egui::pos2(
-                                wave_rect.left() + phase * wave_rect.width(),
-                                wave_rect.center().y - value * wave_rect.height() * 0.5,
-                            ),
-                            2.5,
-                            theme.accent,
-                        );
-                        // Shape and rate are the tile's two buttons.
-                        let shape_rect = egui::Rect::from_min_size(
-                            egui::pos2(rect.left() + 3.0, rect.bottom() - 14.0),
-                            egui::vec2(24.0, 12.0),
-                        );
-                        let shape_id = ui.id().with(("mod_shape", modulator.id));
-                        if ui
-                            .interact(shape_rect, shape_id, egui::Sense::click())
-                            .clicked()
-                        {
-                            *shape = shape.next();
-                        }
-                        painter.text(
-                            shape_rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            shape.label(),
-                            font.clone(),
-                            theme.text,
-                        );
-                        let rate_rect = egui::Rect::from_min_size(
-                            egui::pos2(rect.right() - 27.0, rect.bottom() - 14.0),
-                            egui::vec2(24.0, 12.0),
-                        );
-                        let rate_id = ui.id().with(("mod_rate", modulator.id));
-                        if ui
-                            .interact(rate_rect, rate_id, egui::Sense::click())
-                            .clicked()
-                        {
-                            let at = MOD_RATES
-                                .iter()
-                                .position(|rate| (rate - *rate_beats).abs() < 1e-3)
-                                .unwrap_or(0);
-                            *rate_beats = MOD_RATES[(at + 1) % MOD_RATES.len()];
-                        }
-                        painter.text(
-                            rate_rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            rate_label(*rate_beats),
-                            font.clone(),
-                            theme.text,
-                        );
+    // The strip scrolls vertically once cards and wires outgrow the panel:
+    // nothing is ever hidden, it is just further down.
+    egui::ScrollArea::vertical()
+        .id_salt("mod_strip_scroll")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.vertical(|ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("MOD").small().color(theme.text_muted));
+                    if ui
+                        .small_button("»")
+                        .on_hover_text("collapse the modulation strip")
+                        .clicked()
+                    {
+                        *collapsed = true;
                     }
-                    ModKind::Follower { track } => {
-                        painter.text(
-                            rect.left_top() + egui::vec2(4.0, 3.0),
-                            egui::Align2::LEFT_TOP,
-                            "FLW",
-                            font.clone(),
-                            theme.text_muted,
-                        );
-                        painter.text(
-                            rect.left_bottom() + egui::vec2(4.0, -4.0),
-                            egui::Align2::LEFT_BOTTOM,
-                            strip
-                                .track_names
-                                .get(*track)
-                                .map_or("?", |name| name.as_str()),
-                            font.clone(),
-                            theme.text,
-                        );
-                        // One thin live bar, nothing else.
-                        let bar = egui::Rect::from_min_max(
-                            egui::pos2(rect.right() - 9.0, inner.top() + 8.0),
-                            egui::pos2(rect.right() - 5.0, inner.bottom() - 8.0),
-                        );
-                        painter.rect_filled(bar, 1.0, theme.surface);
-                        let level = value.clamp(0.0, 1.0);
-                        painter.rect_filled(
-                            egui::Rect::from_min_max(
-                                egui::pos2(bar.left(), bar.bottom() - bar.height() * level),
-                                bar.max,
-                            ),
-                            1.0,
-                            theme.meter_low,
-                        );
+                    if ui.small_button("+ lfo").clicked() {
+                        let id = *strip.next_id;
+                        *strip.next_id += 1;
+                        strip.modulators.push(Modulator {
+                            id,
+                            kind: ModKind::Lfo {
+                                shape: ModShape::Sine,
+                                rate_beats: 4.0,
+                                free: false,
+                                hz: 1.0,
+                            },
+                        });
                     }
-                }
-                // The wire verb: a popup of what the SELECTED track can
-                // take, one click per wire.
-                let wire_rect = egui::Rect::from_min_size(
-                    egui::pos2(rect.right() - 14.0, rect.top() + 2.0),
-                    egui::vec2(12.0, 12.0),
-                );
-                let wire_id = ui.id().with(("mod_wire", modulator.id));
-                let wire_response = ui.interact(wire_rect, wire_id, egui::Sense::click());
-                painter.text(
-                    wire_rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "→",
-                    font.clone(),
-                    if wire_response.hovered() {
-                        theme.accent
-                    } else {
-                        theme.text_muted
-                    },
-                );
-                egui::Popup::menu(&wire_response)
-                    .id(wire_id.with("popup"))
-                    .show(|ui| {
-                        for spec in &strip.registry.specs {
-                            if !target_applies_kinds(strip.device, strip.fx, &spec.id) {
-                                continue;
-                            }
-                            if ui.button(format!("{} {}", spec.group, spec.name)).clicked() {
-                                add_wire = Some((modulator.id, spec.id.clone()));
-                                egui::Popup::close_all(ui.ctx());
-                            }
-                        }
-                    });
-                // Delete, quietly in the corner.
-                let x_rect = egui::Rect::from_min_size(
-                    egui::pos2(rect.right() - 14.0, rect.bottom() - 14.0),
-                    egui::vec2(12.0, 12.0),
-                );
-                let x_id = ui.id().with(("mod_x", modulator.id));
-                let x_response = ui.interact(x_rect, x_id, egui::Sense::click());
-                if x_response.clicked() {
-                    remove = Some(modulator.id);
-                }
-                painter.text(
-                    x_rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "×",
-                    font.clone(),
-                    if x_response.hovered() {
-                        theme.danger
-                    } else {
-                        theme.text_muted
-                    },
-                );
-            }
-        });
-        if let Some(id) = remove {
-            strip.modulators.retain(|modulator| modulator.id != id);
-            strip.wires.retain(|wire| wire.source != id);
-        }
-        if let Some((source, target)) = add_wire
-            && let Some(track) = strip.track
-        {
-            let id = *strip.next_id;
-            *strip.next_id += 1;
-            strip.wires.push(ModWire {
-                id,
-                source,
-                track,
-                target,
-                depth: 0.25,
-                ..Default::default()
-            });
-        }
-
-        // --- this track's wires, as sentences -------------------------------
-        let Some(track) = strip.track else { return };
-        let mut remove_wire: Option<usize> = None;
-        let registry = strip.registry;
-        for (index, wire) in strip.wires.iter_mut().enumerate() {
-            if wire.track != track {
-                continue;
-            }
-            let spec = registry.spec(&wire.target);
-            let span = spec.map_or(0.0, |spec| spec.max - spec.min);
-            let name = spec.map_or(wire.target.clone(), |spec| {
-                format!("{} {}", spec.group, spec.name)
-            });
-            let source_name = strip
-                .modulators
-                .iter()
-                .position(|modulator| modulator.id == wire.source)
-                .map_or("?".to_owned(), |at| match strip.modulators[at].kind {
-                    ModKind::Lfo { .. } => format!("LFO {}", {
-                        strip.modulators[..=at]
+                    if let Some(track) = strip.track
+                        && ui
+                            .small_button("+ follow")
+                            .on_hover_text("a follower listening to the selected track's level")
+                            .clicked()
+                    {
+                        let id = *strip.next_id;
+                        *strip.next_id += 1;
+                        strip.modulators.push(Modulator {
+                            id,
+                            kind: ModKind::Follower { track },
+                        });
+                    }
+                });
+                let mut remove: Option<u64> = None;
+                let mut add_wire: Option<(u64, String)> = None;
+                ui.horizontal_wrapped(|ui| {
+                    let mut lfo_no = 0;
+                    for modulator in strip.modulators.iter_mut() {
+                        let (rect, _) = ui
+                            .allocate_exact_size(egui::vec2(TILE_W, TILE_H), egui::Sense::hover());
+                        // Owned, not borrowed: the chip helper needs `&mut ui`
+                        // while this painter is still in scope.
+                        let painter = ui.painter().clone();
+                        painter.rect_filled(rect, 3.0, theme.surface_sunken);
+                        painter.rect_stroke(
+                            rect,
+                            3.0,
+                            egui::Stroke::new(1.0, theme.divider),
+                            egui::StrokeKind::Inside,
+                        );
+                        let value = strip.values.get(&modulator.id).copied().unwrap_or(0.0);
+                        // The card's destinations, written on it: the first target
+                        // by name, the rest as a count. A source that drives
+                        // nothing says so.
+                        let mut targets = strip
+                            .wires
                             .iter()
-                            .filter(|m| matches!(m.kind, ModKind::Lfo { .. }))
-                            .count()
-                    }),
-                    ModKind::Follower { .. } => "FLW".to_owned(),
+                            .filter(|wire| wire.source == modulator.id)
+                            .map(|wire| {
+                                strip
+                                    .registry
+                                    .spec(&wire.target)
+                                    .map_or(wire.target.clone(), |spec| spec.name.clone())
+                            });
+                        let first_target = targets.next();
+                        let extra = targets.count();
+                        let destination = match (first_target, extra) {
+                            (None, _) => "→ unwired".to_owned(),
+                            (Some(name), 0) => format!("→ {name}"),
+                            (Some(name), extra) => format!("→ {name} +{extra}"),
+                        };
+                        let wired = destination != "→ unwired";
+
+                        // Header: name left, wire and delete right.
+                        let name = match &modulator.kind {
+                            ModKind::Lfo { .. } => {
+                                lfo_no += 1;
+                                format!("LFO {lfo_no}")
+                            }
+                            ModKind::Follower { track } => format!(
+                                "FLW {}",
+                                strip
+                                    .track_names
+                                    .get(*track)
+                                    .map_or("?", |name| name.as_str())
+                            ),
+                        };
+                        painter.with_clip_rect(rect).text(
+                            rect.left_top() + egui::vec2(5.0, 4.0),
+                            egui::Align2::LEFT_TOP,
+                            &name,
+                            egui::FontId::proportional(10.0),
+                            theme.text,
+                        );
+                        painter.with_clip_rect(rect).text(
+                            rect.left_top() + egui::vec2(5.0, 16.0),
+                            egui::Align2::LEFT_TOP,
+                            &destination,
+                            font.clone(),
+                            if wired {
+                                theme.accent
+                            } else {
+                                theme.text_muted
+                            },
+                        );
+
+                        match &mut modulator.kind {
+                            ModKind::Lfo {
+                                shape,
+                                rate_beats,
+                                free,
+                                hz,
+                            } => {
+                                // The waveform, with the one moving dot.
+                                let wave_rect = egui::Rect::from_min_max(
+                                    egui::pos2(rect.left() + 6.0, rect.top() + 30.0),
+                                    egui::pos2(rect.right() - 6.0, rect.bottom() - 22.0),
+                                );
+                                let points: Vec<_> = (0..=32)
+                                    .map(|step| {
+                                        let phase = step as f32 / 32.0;
+                                        egui::pos2(
+                                            wave_rect.left() + phase * wave_rect.width(),
+                                            wave_rect.center().y
+                                                - shape.wave(phase) * wave_rect.height() * 0.5,
+                                        )
+                                    })
+                                    .collect();
+                                painter.add(egui::Shape::line(
+                                    points,
+                                    egui::Stroke::new(1.0, theme.accent_muted),
+                                ));
+                                let phase = if *free {
+                                    (strip.seconds * hz.max(1e-3)).rem_euclid(1.0)
+                                } else {
+                                    (strip.beat / rate_beats.max(1e-3)).rem_euclid(1.0)
+                                };
+                                painter.circle_filled(
+                                    egui::pos2(
+                                        wave_rect.left() + phase * wave_rect.width(),
+                                        wave_rect.center().y - value * wave_rect.height() * 0.5,
+                                    ),
+                                    2.5,
+                                    theme.accent,
+                                );
+
+                                // The chip row: shape, rate, and the MODE — sync
+                                // rides the beat, free rides the clock.
+                                let chip = |n: f32| {
+                                    egui::Rect::from_min_size(
+                                        egui::pos2(
+                                            rect.left() + 5.0 + n * 46.0,
+                                            rect.bottom() - 18.0,
+                                        ),
+                                        egui::vec2(42.0, 14.0),
+                                    )
+                                };
+                                let draw_chip =
+                                    |ui: &mut egui::Ui,
+                                     rect: egui::Rect,
+                                     id: egui::Id,
+                                     text: String,
+                                     on: bool| {
+                                        let response = ui.interact(rect, id, egui::Sense::click());
+                                        let painter = ui.painter();
+                                        painter.rect_filled(
+                                            rect,
+                                            2.0,
+                                            if response.hovered() {
+                                                theme.surface_raised
+                                            } else {
+                                                theme.surface
+                                            },
+                                        );
+                                        painter.text(
+                                            rect.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            text,
+                                            egui::FontId::proportional(9.0),
+                                            if on { theme.text } else { theme.text_muted },
+                                        );
+                                        response.clicked()
+                                    };
+                                if draw_chip(
+                                    ui,
+                                    chip(0.0),
+                                    ui.id().with(("mod_shape", modulator.id)),
+                                    shape.label().to_owned(),
+                                    true,
+                                ) {
+                                    *shape = shape.next();
+                                }
+                                let rate_text = if *free {
+                                    format!("{hz}Hz")
+                                } else {
+                                    rate_label(*rate_beats)
+                                };
+                                if draw_chip(
+                                    ui,
+                                    chip(1.0),
+                                    ui.id().with(("mod_rate", modulator.id)),
+                                    rate_text,
+                                    true,
+                                ) {
+                                    if *free {
+                                        let at = MOD_HZ
+                                            .iter()
+                                            .position(|rate| (rate - *hz).abs() < 1e-3)
+                                            .unwrap_or(0);
+                                        *hz = MOD_HZ[(at + 1) % MOD_HZ.len()];
+                                    } else {
+                                        let at = MOD_RATES
+                                            .iter()
+                                            .position(|rate| (rate - *rate_beats).abs() < 1e-3)
+                                            .unwrap_or(0);
+                                        *rate_beats = MOD_RATES[(at + 1) % MOD_RATES.len()];
+                                    }
+                                }
+                                if draw_chip(
+                                    ui,
+                                    chip(2.0),
+                                    ui.id().with(("mod_mode", modulator.id)),
+                                    if *free { "free" } else { "sync" }.to_owned(),
+                                    *free,
+                                ) {
+                                    *free = !*free;
+                                }
+                            }
+                            ModKind::Follower { .. } => {
+                                // One thin live bar, tall through the card's body.
+                                let bar = egui::Rect::from_min_max(
+                                    egui::pos2(rect.right() - 12.0, rect.top() + 30.0),
+                                    egui::pos2(rect.right() - 7.0, rect.bottom() - 8.0),
+                                );
+                                painter.rect_filled(bar, 1.0, theme.surface);
+                                let level = value.clamp(0.0, 1.0);
+                                painter.rect_filled(
+                                    egui::Rect::from_min_max(
+                                        egui::pos2(bar.left(), bar.bottom() - bar.height() * level),
+                                        bar.max,
+                                    ),
+                                    1.0,
+                                    theme.meter_low,
+                                );
+                                painter.with_clip_rect(rect).text(
+                                    egui::pos2(rect.left() + 5.0, rect.bottom() - 11.0),
+                                    egui::Align2::LEFT_CENTER,
+                                    "level of the named track",
+                                    font.clone(),
+                                    theme.text_muted,
+                                );
+                            }
+                        }
+
+                        // The wire verb: a popup of what the SELECTED track can
+                        // take, one click per wire.
+                        let wire_rect = egui::Rect::from_min_size(
+                            egui::pos2(rect.right() - 30.0, rect.top() + 3.0),
+                            egui::vec2(13.0, 13.0),
+                        );
+                        let wire_id = ui.id().with(("mod_wire", modulator.id));
+                        let wire_response = ui.interact(wire_rect, wire_id, egui::Sense::click());
+                        painter.text(
+                            wire_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "→",
+                            egui::FontId::proportional(11.0),
+                            if wire_response.hovered() {
+                                theme.accent
+                            } else {
+                                theme.text_muted
+                            },
+                        );
+                        egui::Popup::menu(&wire_response)
+                            .id(wire_id.with("popup"))
+                            .show(|ui| {
+                                for spec in &strip.registry.specs {
+                                    if !target_applies_kinds(strip.device, strip.fx, &spec.id) {
+                                        continue;
+                                    }
+                                    if ui.button(format!("{} {}", spec.group, spec.name)).clicked()
+                                    {
+                                        add_wire = Some((modulator.id, spec.id.clone()));
+                                        egui::Popup::close_all(ui.ctx());
+                                    }
+                                }
+                            });
+                        // Delete, quietly in the corner.
+                        let x_rect = egui::Rect::from_min_size(
+                            egui::pos2(rect.right() - 16.0, rect.top() + 3.0),
+                            egui::vec2(13.0, 13.0),
+                        );
+                        let x_id = ui.id().with(("mod_x", modulator.id));
+                        let x_response = ui.interact(x_rect, x_id, egui::Sense::click());
+                        if x_response.clicked() {
+                            remove = Some(modulator.id);
+                        }
+                        painter.text(
+                            x_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "×",
+                            egui::FontId::proportional(11.0),
+                            if x_response.hovered() {
+                                theme.danger
+                            } else {
+                                theme.text_muted
+                            },
+                        );
+                    }
                 });
-            // Depth in something a musician can read: real units where the
-            // unit is real, percent of range where it is not.
-            let depth_text = match spec.map(|spec| spec.unit.as_str()) {
-                Some("ms") => format!("±{:.0}ms", (wire.depth * span).abs()),
-                _ => format!("±{:.0}%", (wire.depth * 100.0).abs()),
-            };
-            let (row, _) = ui.allocate_exact_size(
-                egui::vec2(ui.available_width().max(280.0), ROW_H),
-                egui::Sense::hover(),
-            );
-            let painter = ui.painter();
-
-            // Bypass and solo, leftmost: the A/B every relationship earns.
-            let dot = egui::Rect::from_center_size(
-                egui::pos2(row.left() + 6.0, row.center().y),
-                egui::vec2(9.0, 9.0),
-            );
-            let dot_id = ui.id().with(("wire_on", wire.id));
-            if ui.interact(dot, dot_id, egui::Sense::click()).clicked() {
-                wire.enabled = !wire.enabled;
-            }
-            if wire.enabled {
-                painter.circle_filled(dot.center(), 3.0, theme.accent);
-            } else {
-                painter.circle_stroke(dot.center(), 3.0, egui::Stroke::new(1.0, theme.text_muted));
-            }
-            let solo = egui::Rect::from_center_size(
-                egui::pos2(row.left() + 18.0, row.center().y),
-                egui::vec2(10.0, 11.0),
-            );
-            let solo_id = ui.id().with(("wire_solo", wire.id));
-            if ui.interact(solo, solo_id, egui::Sense::click()).clicked() {
-                wire.solo = !wire.solo;
-            }
-            painter.text(
-                solo.center(),
-                egui::Align2::CENTER_CENTER,
-                "S",
-                font.clone(),
-                if wire.solo {
-                    theme.accent
-                } else {
-                    theme.text_muted
-                },
-            );
-
-            // The sentence. Clicking it unfolds the wire's editor.
-            let label = egui::Rect::from_min_max(
-                egui::pos2(row.left() + 26.0, row.top()),
-                egui::pos2(row.left() + 150.0, row.bottom()),
-            );
-            let label_id = ui.id().with(("wire_label", wire.id));
-            let label_response = ui.interact(label, label_id, egui::Sense::click());
-            if label_response.clicked() {
-                *strip.expanded = if *strip.expanded == Some(wire.id) {
-                    None
-                } else {
-                    Some(wire.id)
-                };
-            }
-            let expanded = *strip.expanded == Some(wire.id);
-            painter.with_clip_rect(label).text(
-                egui::pos2(label.left(), row.center().y),
-                egui::Align2::LEFT_CENTER,
-                format!("{source_name} → {name}  {depth_text}"),
-                font.clone(),
-                match (wire.enabled, label_response.hovered() || expanded) {
-                    (false, _) => theme.text_muted,
-                    (true, true) => theme.accent,
-                    (true, false) => theme.text,
-                },
-            );
-
-            // The centre-zero depth slider, with a faint tick riding it to
-            // show the live contribution right now.
-            let slider = egui::Rect::from_min_max(
-                egui::pos2(row.left() + 152.0, row.top() + 5.0),
-                egui::pos2(row.right() - 18.0, row.bottom() - 5.0),
-            );
-            let slider_id = ui.id().with(("mod_depth", wire.id));
-            let response = ui.interact(slider, slider_id, egui::Sense::click_and_drag());
-            if response.double_clicked() {
-                wire.depth = 0.0;
-            } else if response.dragged()
-                && let Some(pos) = response.interact_pointer_pos()
-            {
-                wire.depth =
-                    (((pos.x - slider.left()) / slider.width()) * 2.0 - 1.0).clamp(-1.0, 1.0);
-            }
-            painter.rect_filled(slider, 2.0, theme.surface_sunken);
-            let centre = slider.center().x;
-            let depth_x = centre + wire.depth * slider.width() * 0.5;
-            painter.rect_filled(
-                egui::Rect::from_min_max(
-                    egui::pos2(centre.min(depth_x), slider.top() + 2.0),
-                    egui::pos2(centre.max(depth_x), slider.bottom() - 2.0),
-                ),
-                1.0,
-                theme.accent_muted,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(centre, slider.top()),
-                    egui::pos2(centre, slider.bottom()),
-                ],
-                egui::Stroke::new(1.0, theme.divider),
-            );
-            let live = if span > 0.0 {
-                strip.outputs.get(&wire.id).copied().unwrap_or(0.0) / span
-            } else {
-                0.0
-            };
-            let live_x = centre + live.clamp(-1.0, 1.0) * slider.width() * 0.5;
-            painter.line_segment(
-                [
-                    egui::pos2(live_x, slider.top() + 1.0),
-                    egui::pos2(live_x, slider.bottom() - 1.0),
-                ],
-                egui::Stroke::new(1.5, theme.accent),
-            );
-            let x_rect = egui::Rect::from_min_size(
-                egui::pos2(row.right() - 14.0, row.top() + 4.0),
-                egui::vec2(12.0, 12.0),
-            );
-            let x_id = ui.id().with(("mod_wire_x", wire.id));
-            let x_response = ui.interact(x_rect, x_id, egui::Sense::click());
-            if x_response.clicked() {
-                remove_wire = Some(index);
-            }
-            painter.text(
-                x_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "×",
-                font.clone(),
-                if x_response.hovered() {
-                    theme.danger
-                } else {
-                    theme.text_muted
-                },
-            );
-
-            // --- the unfolded editor: the scope, and the chain's three ---
-            if expanded {
-                let (panel, _) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width().max(280.0), 38.0),
-                    egui::Sense::hover(),
-                );
-                let painter = ui.painter();
-                // The scope: the wire's last few seconds, drawn from the
-                // ring buffer the pump keeps. Centre line is zero
-                // contribution; full height is the target's whole range.
-                let scope = egui::Rect::from_min_max(
-                    egui::pos2(panel.left() + 4.0, panel.top() + 2.0),
-                    egui::pos2(panel.left() + 152.0, panel.bottom() - 2.0),
-                );
-                painter.rect_filled(scope, 2.0, theme.surface_sunken);
-                painter.line_segment(
-                    [
-                        egui::pos2(scope.left(), scope.center().y),
-                        egui::pos2(scope.right(), scope.center().y),
-                    ],
-                    egui::Stroke::new(1.0, theme.divider),
-                );
-                if let Some(history) = strip.scopes.get(&wire.id)
-                    && history.len() > 1
+                if let Some(id) = remove {
+                    strip.modulators.retain(|modulator| modulator.id != id);
+                    strip.wires.retain(|wire| wire.source != id);
+                }
+                if let Some((source, target)) = add_wire
+                    && let Some(track) = strip.track
                 {
-                    let points: Vec<_> = history
+                    let id = *strip.next_id;
+                    *strip.next_id += 1;
+                    strip.wires.push(ModWire {
+                        id,
+                        source,
+                        track,
+                        target,
+                        depth: 0.25,
+                        ..Default::default()
+                    });
+                }
+
+                // --- this track's wires, as sentences -------------------------------
+                let Some(track) = strip.track else { return };
+                let mut remove_wire: Option<usize> = None;
+                let registry = strip.registry;
+                for (index, wire) in strip.wires.iter_mut().enumerate() {
+                    if wire.track != track {
+                        continue;
+                    }
+                    let spec = registry.spec(&wire.target);
+                    let span = spec.map_or(0.0, |spec| spec.max - spec.min);
+                    let name = spec.map_or(wire.target.clone(), |spec| {
+                        format!("{} {}", spec.group, spec.name)
+                    });
+                    let source_name = strip
+                        .modulators
                         .iter()
-                        .enumerate()
-                        .map(|(at, value)| {
-                            egui::pos2(
-                                scope.left()
-                                    + at as f32 / (history.len() - 1) as f32 * scope.width(),
-                                scope.center().y - value.clamp(-1.0, 1.0) * scope.height() * 0.5,
+                        .position(|modulator| modulator.id == wire.source)
+                        .map_or("?".to_owned(), |at| match strip.modulators[at].kind {
+                            ModKind::Lfo { .. } => format!("LFO {}", {
+                                strip.modulators[..=at]
+                                    .iter()
+                                    .filter(|m| matches!(m.kind, ModKind::Lfo { .. }))
+                                    .count()
+                            }),
+                            ModKind::Follower { .. } => "FLW".to_owned(),
+                        });
+                    // Depth in something a musician can read: real units where the
+                    // unit is real, percent of range where it is not.
+                    let depth_text = match spec.map(|spec| spec.unit.as_str()) {
+                        Some("ms") => format!("±{:.0}ms", (wire.depth * span).abs()),
+                        _ => format!("±{:.0}%", (wire.depth * 100.0).abs()),
+                    };
+                    let (row, _) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width().max(280.0), ROW_H),
+                        egui::Sense::hover(),
+                    );
+                    let painter = ui.painter();
+
+                    // Bypass and solo, leftmost: the A/B every relationship earns.
+                    let dot = egui::Rect::from_center_size(
+                        egui::pos2(row.left() + 6.0, row.center().y),
+                        egui::vec2(9.0, 9.0),
+                    );
+                    let dot_id = ui.id().with(("wire_on", wire.id));
+                    if ui.interact(dot, dot_id, egui::Sense::click()).clicked() {
+                        wire.enabled = !wire.enabled;
+                    }
+                    if wire.enabled {
+                        painter.circle_filled(dot.center(), 3.0, theme.accent);
+                    } else {
+                        painter.circle_stroke(
+                            dot.center(),
+                            3.0,
+                            egui::Stroke::new(1.0, theme.text_muted),
+                        );
+                    }
+                    let solo = egui::Rect::from_center_size(
+                        egui::pos2(row.left() + 18.0, row.center().y),
+                        egui::vec2(10.0, 11.0),
+                    );
+                    let solo_id = ui.id().with(("wire_solo", wire.id));
+                    if ui.interact(solo, solo_id, egui::Sense::click()).clicked() {
+                        wire.solo = !wire.solo;
+                    }
+                    painter.text(
+                        solo.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "S",
+                        font.clone(),
+                        if wire.solo {
+                            theme.accent
+                        } else {
+                            theme.text_muted
+                        },
+                    );
+
+                    // The sentence. Clicking it unfolds the wire's editor.
+                    let label = egui::Rect::from_min_max(
+                        egui::pos2(row.left() + 26.0, row.top()),
+                        egui::pos2(row.left() + 150.0, row.bottom()),
+                    );
+                    let label_id = ui.id().with(("wire_label", wire.id));
+                    let label_response = ui.interact(label, label_id, egui::Sense::click());
+                    if label_response.clicked() {
+                        *strip.expanded = if *strip.expanded == Some(wire.id) {
+                            None
+                        } else {
+                            Some(wire.id)
+                        };
+                    }
+                    let expanded = *strip.expanded == Some(wire.id);
+                    painter.with_clip_rect(label).text(
+                        egui::pos2(label.left(), row.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        format!("{source_name} → {name}  {depth_text}"),
+                        font.clone(),
+                        match (wire.enabled, label_response.hovered() || expanded) {
+                            (false, _) => theme.text_muted,
+                            (true, true) => theme.accent,
+                            (true, false) => theme.text,
+                        },
+                    );
+
+                    // The centre-zero depth slider, with a faint tick riding it to
+                    // show the live contribution right now.
+                    let slider = egui::Rect::from_min_max(
+                        egui::pos2(row.left() + 152.0, row.top() + 5.0),
+                        egui::pos2(row.right() - 18.0, row.bottom() - 5.0),
+                    );
+                    let slider_id = ui.id().with(("mod_depth", wire.id));
+                    let response = ui.interact(slider, slider_id, egui::Sense::click_and_drag());
+                    if response.double_clicked() {
+                        wire.depth = 0.0;
+                    } else if response.dragged()
+                        && let Some(pos) = response.interact_pointer_pos()
+                    {
+                        wire.depth = (((pos.x - slider.left()) / slider.width()) * 2.0 - 1.0)
+                            .clamp(-1.0, 1.0);
+                    }
+                    painter.rect_filled(slider, 2.0, theme.surface_sunken);
+                    let centre = slider.center().x;
+                    let depth_x = centre + wire.depth * slider.width() * 0.5;
+                    painter.rect_filled(
+                        egui::Rect::from_min_max(
+                            egui::pos2(centre.min(depth_x), slider.top() + 2.0),
+                            egui::pos2(centre.max(depth_x), slider.bottom() - 2.0),
+                        ),
+                        1.0,
+                        theme.accent_muted,
+                    );
+                    painter.line_segment(
+                        [
+                            egui::pos2(centre, slider.top()),
+                            egui::pos2(centre, slider.bottom()),
+                        ],
+                        egui::Stroke::new(1.0, theme.divider),
+                    );
+                    let live = if span > 0.0 {
+                        strip.outputs.get(&wire.id).copied().unwrap_or(0.0) / span
+                    } else {
+                        0.0
+                    };
+                    let live_x = centre + live.clamp(-1.0, 1.0) * slider.width() * 0.5;
+                    painter.line_segment(
+                        [
+                            egui::pos2(live_x, slider.top() + 1.0),
+                            egui::pos2(live_x, slider.bottom() - 1.0),
+                        ],
+                        egui::Stroke::new(1.5, theme.accent),
+                    );
+                    let x_rect = egui::Rect::from_min_size(
+                        egui::pos2(row.right() - 14.0, row.top() + 4.0),
+                        egui::vec2(12.0, 12.0),
+                    );
+                    let x_id = ui.id().with(("mod_wire_x", wire.id));
+                    let x_response = ui.interact(x_rect, x_id, egui::Sense::click());
+                    if x_response.clicked() {
+                        remove_wire = Some(index);
+                    }
+                    painter.text(
+                        x_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "×",
+                        font.clone(),
+                        if x_response.hovered() {
+                            theme.danger
+                        } else {
+                            theme.text_muted
+                        },
+                    );
+
+                    // --- the unfolded editor: the scope, and the chain's three ---
+                    if expanded {
+                        let (panel, _) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width().max(280.0), 38.0),
+                            egui::Sense::hover(),
+                        );
+                        let painter = ui.painter();
+                        // The scope: the wire's last few seconds, drawn from the
+                        // ring buffer the pump keeps. Centre line is zero
+                        // contribution; full height is the target's whole range.
+                        let scope = egui::Rect::from_min_max(
+                            egui::pos2(panel.left() + 4.0, panel.top() + 2.0),
+                            egui::pos2(panel.left() + 152.0, panel.bottom() - 2.0),
+                        );
+                        painter.rect_filled(scope, 2.0, theme.surface_sunken);
+                        painter.line_segment(
+                            [
+                                egui::pos2(scope.left(), scope.center().y),
+                                egui::pos2(scope.right(), scope.center().y),
+                            ],
+                            egui::Stroke::new(1.0, theme.divider),
+                        );
+                        if let Some(history) = strip.scopes.get(&wire.id)
+                            && history.len() > 1
+                        {
+                            let points: Vec<_> = history
+                                .iter()
+                                .enumerate()
+                                .map(|(at, value)| {
+                                    egui::pos2(
+                                        scope.left()
+                                            + at as f32 / (history.len() - 1) as f32
+                                                * scope.width(),
+                                        scope.center().y
+                                            - value.clamp(-1.0, 1.0) * scope.height() * 0.5,
+                                    )
+                                })
+                                .collect();
+                            painter.add(egui::Shape::line(
+                                points,
+                                egui::Stroke::new(1.0, theme.accent),
+                            ));
+                        }
+                        // crv / stp / lag — the chain, three micro controls.
+                        let micro = |n: usize| {
+                            egui::Rect::from_min_size(
+                                egui::pos2(
+                                    scope.right() + 6.0 + n as f32 * 54.0,
+                                    panel.top() + 10.0,
+                                ),
+                                egui::vec2(50.0, 16.0),
                             )
-                        })
-                        .collect();
-                    painter.add(egui::Shape::line(
-                        points,
-                        egui::Stroke::new(1.0, theme.accent),
-                    ));
+                        };
+                        let crv = micro(0);
+                        let crv_id = ui.id().with(("wire_crv", wire.id));
+                        let crv_response = ui.interact(crv, crv_id, egui::Sense::click_and_drag());
+                        if crv_response.double_clicked() {
+                            wire.curve = 0.0;
+                        } else if crv_response.dragged() {
+                            wire.curve =
+                                (wire.curve + crv_response.drag_delta().x / 80.0).clamp(-1.0, 1.0);
+                        }
+                        painter.rect_filled(crv, 2.0, theme.surface_sunken);
+                        painter.text(
+                            crv.center(),
+                            egui::Align2::CENTER_CENTER,
+                            format!("crv {:+.1}", wire.curve),
+                            font.clone(),
+                            if wire.curve != 0.0 {
+                                theme.text
+                            } else {
+                                theme.text_muted
+                            },
+                        );
+                        let stp = micro(1);
+                        let stp_id = ui.id().with(("wire_stp", wire.id));
+                        if ui.interact(stp, stp_id, egui::Sense::click()).clicked() {
+                            const LADDER: [u32; 6] = [0, 2, 3, 4, 8, 16];
+                            let at = LADDER
+                                .iter()
+                                .position(|steps| *steps == wire.steps)
+                                .unwrap_or(0);
+                            wire.steps = LADDER[(at + 1) % LADDER.len()];
+                        }
+                        painter.rect_filled(stp, 2.0, theme.surface_sunken);
+                        painter.text(
+                            stp.center(),
+                            egui::Align2::CENTER_CENTER,
+                            if wire.steps > 1 {
+                                format!("stp {}", wire.steps)
+                            } else {
+                                "stp —".to_owned()
+                            },
+                            font.clone(),
+                            if wire.steps > 1 {
+                                theme.text
+                            } else {
+                                theme.text_muted
+                            },
+                        );
+                        let lag = micro(2);
+                        let lag_id = ui.id().with(("wire_lag", wire.id));
+                        let lag_response = ui.interact(lag, lag_id, egui::Sense::click_and_drag());
+                        if lag_response.double_clicked() {
+                            wire.smooth_ms = 0.0;
+                        } else if lag_response.dragged() {
+                            wire.smooth_ms = (wire.smooth_ms + lag_response.drag_delta().x * 4.0)
+                                .clamp(0.0, 2_000.0);
+                        }
+                        painter.rect_filled(lag, 2.0, theme.surface_sunken);
+                        painter.text(
+                            lag.center(),
+                            egui::Align2::CENTER_CENTER,
+                            if wire.smooth_ms > 0.0 {
+                                format!("lag {:.0}ms", wire.smooth_ms)
+                            } else {
+                                "lag —".to_owned()
+                            },
+                            font.clone(),
+                            if wire.smooth_ms > 0.0 {
+                                theme.text
+                            } else {
+                                theme.text_muted
+                            },
+                        );
+                    }
                 }
-                // crv / stp / lag — the chain, three micro controls.
-                let micro = |n: usize| {
-                    egui::Rect::from_min_size(
-                        egui::pos2(scope.right() + 6.0 + n as f32 * 54.0, panel.top() + 10.0),
-                        egui::vec2(50.0, 16.0),
-                    )
-                };
-                let crv = micro(0);
-                let crv_id = ui.id().with(("wire_crv", wire.id));
-                let crv_response = ui.interact(crv, crv_id, egui::Sense::click_and_drag());
-                if crv_response.double_clicked() {
-                    wire.curve = 0.0;
-                } else if crv_response.dragged() {
-                    wire.curve = (wire.curve + crv_response.drag_delta().x / 80.0).clamp(-1.0, 1.0);
+                if let Some(index) = remove_wire {
+                    strip.wires.remove(index);
                 }
-                painter.rect_filled(crv, 2.0, theme.surface_sunken);
-                painter.text(
-                    crv.center(),
-                    egui::Align2::CENTER_CENTER,
-                    format!("crv {:+.1}", wire.curve),
-                    font.clone(),
-                    if wire.curve != 0.0 {
-                        theme.text
-                    } else {
-                        theme.text_muted
-                    },
-                );
-                let stp = micro(1);
-                let stp_id = ui.id().with(("wire_stp", wire.id));
-                if ui.interact(stp, stp_id, egui::Sense::click()).clicked() {
-                    const LADDER: [u32; 6] = [0, 2, 3, 4, 8, 16];
-                    let at = LADDER
-                        .iter()
-                        .position(|steps| *steps == wire.steps)
-                        .unwrap_or(0);
-                    wire.steps = LADDER[(at + 1) % LADDER.len()];
-                }
-                painter.rect_filled(stp, 2.0, theme.surface_sunken);
-                painter.text(
-                    stp.center(),
-                    egui::Align2::CENTER_CENTER,
-                    if wire.steps > 1 {
-                        format!("stp {}", wire.steps)
-                    } else {
-                        "stp —".to_owned()
-                    },
-                    font.clone(),
-                    if wire.steps > 1 {
-                        theme.text
-                    } else {
-                        theme.text_muted
-                    },
-                );
-                let lag = micro(2);
-                let lag_id = ui.id().with(("wire_lag", wire.id));
-                let lag_response = ui.interact(lag, lag_id, egui::Sense::click_and_drag());
-                if lag_response.double_clicked() {
-                    wire.smooth_ms = 0.0;
-                } else if lag_response.dragged() {
-                    wire.smooth_ms =
-                        (wire.smooth_ms + lag_response.drag_delta().x * 4.0).clamp(0.0, 2_000.0);
-                }
-                painter.rect_filled(lag, 2.0, theme.surface_sunken);
-                painter.text(
-                    lag.center(),
-                    egui::Align2::CENTER_CENTER,
-                    if wire.smooth_ms > 0.0 {
-                        format!("lag {:.0}ms", wire.smooth_ms)
-                    } else {
-                        "lag —".to_owned()
-                    },
-                    font.clone(),
-                    if wire.smooth_ms > 0.0 {
-                        theme.text
-                    } else {
-                        theme.text_muted
-                    },
-                );
-            }
-        }
-        if let Some(index) = remove_wire {
-            strip.wires.remove(index);
-        }
-    });
+            });
+        });
 }
 
 /// A rate as musicians say it: beats up to a bar, bars past it.
@@ -10773,6 +10923,9 @@ struct App {
     /// project all reconcile through one door — whoever moved pan, the
     /// letter goes out once and only on a real change.
     sent_pan: Vec<f32>,
+    /// The app's monotonic UI clock, in seconds — what FREE modulators run
+    /// on. Never rewinds, never follows the transport.
+    clock_seconds: f32,
     /// This frame's modulator values by id — LFOs from the beat, followers
     /// from the meters — evaluated once, read by playback dispatch and the
     /// MOD strip's animation alike.
@@ -10905,6 +11058,7 @@ impl App {
             fx_ids: Vec::new(),
             pan_ids: Vec::new(),
             sent_pan: Vec::new(),
+            clock_seconds: 0.0,
             mod_values: HashMap::new(),
             wire_outputs: HashMap::new(),
             wire_scopes: HashMap::new(),
@@ -11981,12 +12135,13 @@ impl App {
     /// mixer already runs. Runs engine on or off — the MOD strip's
     /// animation and playback dispatch read the same map.
     fn pump_modulators(&mut self, dt: f32) {
+        self.clock_seconds += dt.max(0.0);
         let beat = (self.transport.position * self.transport.bpm / 60.0) as f32;
         self.mod_values.clear();
         for modulator in &self.arrangement.modulators {
             self.mod_values.insert(
                 modulator.id,
-                modulator_value(&modulator.kind, beat, &self.meters),
+                modulator_value(&modulator.kind, beat, self.clock_seconds, &self.meters),
             );
         }
         // Every wire's chain, once per frame. Solo is global: while any
@@ -12637,6 +12792,7 @@ impl eframe::App for App {
                 let registry = &self.parameter_registry;
                 let mod_values = &self.mod_values;
                 let wire_outputs = &self.wire_outputs;
+                let clock_seconds = self.clock_seconds;
                 let wire_scopes = &self.wire_scopes;
                 let expanded_wire = &mut self.expanded_wire;
                 let mod_collapsed = &mut self.prefs.mod_strip_collapsed;
@@ -12682,6 +12838,7 @@ impl eframe::App for App {
                             registry,
                             values: mod_values,
                             beat,
+                            seconds: clock_seconds,
                             outputs: wire_outputs,
                             scopes: wire_scopes,
                             expanded: expanded_wire,
@@ -15789,14 +15946,16 @@ mod tests {
             let kind = ModKind::Lfo {
                 shape,
                 rate_beats: 4.0,
+                free: false,
+                hz: 1.0,
             };
             for step in 0..64 {
                 let beat = step as f32 * 0.37;
-                let a = modulator_value(&kind, beat, &meters);
-                let b = modulator_value(&kind, beat, &meters);
+                let a = modulator_value(&kind, beat, 0.0, &meters);
+                let b = modulator_value(&kind, beat, 0.0, &meters);
                 assert_eq!(a, b, "{shape:?} must be a function of the beat");
                 assert!((-1.0..=1.0).contains(&a), "{shape:?} out of range: {a}");
-                let next_cycle = modulator_value(&kind, beat + 4.0, &meters);
+                let next_cycle = modulator_value(&kind, beat + 4.0, 0.0, &meters);
                 assert!(
                     (a - next_cycle).abs() < 1e-3,
                     "{shape:?} must repeat at its rate"
@@ -15807,15 +15966,45 @@ mod tests {
         let sine = ModKind::Lfo {
             shape: ModShape::Sine,
             rate_beats: 4.0,
+            free: false,
+            hz: 1.0,
         };
-        assert!(modulator_value(&sine, 0.0, &meters).abs() < 1e-6);
-        assert!((modulator_value(&sine, 1.0, &meters) - 1.0).abs() < 1e-6);
+        assert!(modulator_value(&sine, 0.0, 0.0, &meters).abs() < 1e-6);
+        assert!((modulator_value(&sine, 1.0, 0.0, &meters) - 1.0).abs() < 1e-6);
         let square = ModKind::Lfo {
             shape: ModShape::Square,
             rate_beats: 2.0,
+            free: false,
+            hz: 1.0,
         };
-        assert_eq!(modulator_value(&square, 0.5, &meters), 1.0);
-        assert_eq!(modulator_value(&square, 1.5, &meters), -1.0);
+        assert_eq!(modulator_value(&square, 0.5, 0.0, &meters), 1.0);
+        assert_eq!(modulator_value(&square, 1.5, 0.0, &meters), -1.0);
+    }
+
+    /// FREE mode rides the clock, not the beat: the beat can stand still
+    /// and the wave still turns — and the same second gives the same value.
+    #[test]
+    fn free_lfos_ride_the_clock() {
+        let meters = [];
+        let free = ModKind::Lfo {
+            shape: ModShape::Sine,
+            rate_beats: 4.0,
+            free: true,
+            hz: 2.0,
+        };
+        // The beat is frozen; the clock moves the wave anyway.
+        let at_zero = modulator_value(&free, 7.0, 0.0, &meters);
+        let quarter = modulator_value(&free, 7.0, 0.125, &meters);
+        assert!(at_zero.abs() < 1e-6);
+        assert!(
+            (quarter - 1.0).abs() < 1e-6,
+            "2Hz peaks at 0.125s: {quarter}"
+        );
+        // And the clock is the whole story: any beat, same second, same value.
+        assert_eq!(
+            modulator_value(&free, 0.0, 3.3, &meters),
+            modulator_value(&free, 99.0, 3.3, &meters),
+        );
     }
 
     /// The wire chain: depth scales into the target's units, curve bends,
@@ -15986,6 +16175,8 @@ mod tests {
                     kind: ModKind::Lfo {
                         shape: ModShape::Sine,
                         rate_beats: f32::NAN,
+                        free: false,
+                        hz: 1.0,
                     },
                 },
                 Modulator {
@@ -15993,6 +16184,8 @@ mod tests {
                     kind: ModKind::Lfo {
                         shape: ModShape::Saw,
                         rate_beats: 2.0,
+                        free: false,
+                        hz: 1.0,
                     },
                 },
             ],
