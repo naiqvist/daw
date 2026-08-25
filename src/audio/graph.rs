@@ -169,17 +169,20 @@ impl Default for SynthParams {
     }
 }
 
-/// Per-sample envelope increment for an attack time. Clamps make the
+/// Per-sample envelope increment for an attack time. The clamp makes the
 /// division finite for any input — this also runs in the red zone when a
-/// ParamChange letter arrives.
+/// ParamChange letter arrives. The bounds are the param table's, so the
+/// widget's knob range and this floor are the same row.
 fn synth_attack_rate(attack_ms: f32, sample_rate: f32) -> f32 {
-    1.0 / (attack_ms.clamp(0.05, 5_000.0) * 1e-3 * sample_rate).max(1.0)
+    let def = crate::params::seq::TABLE[crate::params::seq::ATTACK as usize];
+    1.0 / (def.clamp(attack_ms) * 1e-3 * sample_rate).max(1.0)
 }
 
 /// Per-sample envelope multiplier that decays from 1.0 to [`ENV_FLOOR`]
 /// over the release time. `powf` is pure bounded math — red-zone legal.
 fn synth_release_coeff(release_ms: f32, sample_rate: f32) -> f32 {
-    ENV_FLOOR.powf(1.0 / (release_ms.clamp(1.0, 30_000.0) * 1e-3 * sample_rate).max(1.0))
+    let def = crate::params::seq::TABLE[crate::params::seq::RELEASE as usize];
+    ENV_FLOOR.powf(1.0 / (def.clamp(release_ms) * 1e-3 * sample_rate).max(1.0))
 }
 
 /// One synth voice: sine with a fast attack and exponential release.
@@ -252,6 +255,29 @@ impl Arena {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlotId(pub usize);
 
+/// How often the filter's coefficients follow its smoothed controls, in
+/// samples. Fast enough that a performed sweep has no audible steps, cheap
+/// enough (a handful of sin_cos per update, only while a knob is actually
+/// moving) to disappear in the block budget.
+const FILTER_COEFF_INTERVAL: usize = 16;
+
+/// Control smoothing for the filter's cutoff, resonance and drive, in ms.
+/// The declick layer the kernel contract says the caller wires in front.
+const FILTER_SMOOTH_MS: f32 = 15.0;
+
+/// The kernel chain of one [`Node::Filter`], boxed so the Node enum stays
+/// lean. Compile builds it in the green zone; the callback only calls
+/// prepare/process/reset on it — bounded pure math throughout.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct FilterCore {
+    cascade: crate::dsp::filters::Cascade,
+    svf: crate::dsp::filters::Svf,
+    shaper: crate::dsp::shaper::Waveshaper,
+    oversampler: crate::dsp::shaper::Oversampler2x,
+    dc: crate::dsp::filters::DcBlocker,
+}
+
 /// The fixed menu of workers. An enum, not a trait object: dispatch is one
 /// predictable branch instead of a vtable pointer chase per node.
 // Seq is much larger than Silence, and clippy wants it boxed. Deliberately
@@ -289,6 +315,14 @@ pub enum Node {
     AudioClip {
         stream: Option<ReadDiskStream<SymphoniaDecoder>>,
         file_frames: u64,
+        /// Timeline sample at which this clip becomes audible. Compiled from
+        /// musical time; runtime and callback state never store beats here.
+        timeline_start: u64,
+        /// Audible placement length on the timeline in device frames.
+        timeline_frames: u64,
+        /// First source-file frame and length of the playable source region.
+        source_start: u64,
+        source_frames: u64,
         loop_clip: bool,
         gain: f32,
         target_gain: f32,
@@ -349,6 +383,53 @@ pub enum Node {
         damp: f32,
         sample_rate: f32,
     },
+    /// Filter: the first kernel-backed effect. Sums its inputs to mono and
+    /// runs cutoff/resonance/drive over the `dsp::filters` family: a
+    /// Butterworth [`Cascade`](crate::dsp::filters::Cascade) (lp/hp, 6-48
+    /// dB/octave, resonance on the last section) or a single
+    /// [`Svf`](crate::dsp::filters::Svf) (bp/notch), then a soft-clip drive
+    /// stage run at 2x through the halfband oversampler, then a DC blocker.
+    ///
+    /// The drive stage is PERMANENTLY in the path: its half-band round trip
+    /// is the node's constant latency (`Oversampler2x::latency()`), because
+    /// a drive knob must never move a track in time. At drive 0 the shaper
+    /// is skipped entirely, so the stage is a linear-phase wire and the
+    /// default filter is transparent apart from that delay; the node owns
+    /// the dry/wet blend so the clean path keeps its float headroom. PDC does not exist yet — until
+    /// it does, a filtered track runs that many samples (~0.7 ms) late,
+    /// which is the documented cost of alias-free drive.
+    ///
+    /// Ids, ranges and the resonance/drive mapping come from
+    /// `crate::params::filter` — the same rows and the same `effective_q`
+    /// the display draws with, so the curve and the audio agree by
+    /// construction. Free-running; cuts state on discontinuity.
+    Filter {
+        core: Box<FilterCore>,
+        /// 2x scratch for the drive stage, `4 * block` floats (round-trip
+        /// lane + shaped lane), compile-owned.
+        scratch2x: Vec<f32>,
+        mode: u32,
+        slope: u32,
+        /// Letters land here; the switch happens at the next block edge with
+        /// filter state cleared, because a cascade carrying lowpass history
+        /// into a highpass is a thump.
+        pending_mode: u32,
+        pending_slope: u32,
+        cutoff: crate::dsp::ramps::Smoother,
+        res: crate::dsp::ramps::Smoother,
+        drive: crate::dsp::ramps::Smoother,
+        /// Shadow targets, because a discontinuity snaps the smoothers to
+        /// their destination (a seek must not glide old knob motion in) and
+        /// [`Smoother`](crate::dsp::ramps::Smoother) does not expose its.
+        cutoff_target: f32,
+        res_target: f32,
+        drive_target: f32,
+        /// What the kernel coefficients were last prepared with, so a
+        /// settled filter re-prepares nothing.
+        prepared_cutoff: f32,
+        prepared_q: f32,
+        sample_rate: f32,
+    },
     /// Metronome: a short decaying blip on every integer beat while the
     /// transport rolls. Timeline-locked: fires off an integer beat COUNTER,
     /// not a per-sample float comparison — a crossing that lands exactly on a
@@ -401,6 +482,7 @@ impl Node {
             | NodeSpec::Input { .. }
             | NodeSpec::Click
             | NodeSpec::Reverb { .. }
+            | NodeSpec::Filter { .. }
             | NodeSpec::Seq { .. } => 1,
             NodeSpec::Mixer { .. } | NodeSpec::AudioClip { .. } | NodeSpec::Pan { .. } => 2,
         }
@@ -429,10 +511,9 @@ impl Node {
                 *freq = *target_freq;
                 let step = *freq / *sample_rate;
                 // Linear amp ramp across the block: click-free by construction.
-                let amp_step = (*target_amp - *amp) / out_len.max(1) as f32;
+                let mut ramp = Ramp::across(*amp, *target_amp, out_len);
                 for s in out.l.iter_mut() {
-                    *s = (*phase * TAU).sin() * *amp;
-                    *amp += amp_step;
+                    *s = (*phase * TAU).sin() * ramp.next();
                     *phase += step;
                     if *phase >= 1.0 {
                         *phase -= 1.0;
@@ -469,40 +550,63 @@ impl Node {
                         *d += *s;
                     }
                 }
-                let gain_step = (*target_gain - *gain) / out_len.max(1) as f32;
-                let mut g = *gain;
+                let mut ramp = Ramp::across(*gain, *target_gain, out_len);
                 for s in out.l.iter_mut() {
-                    *s *= g;
-                    g += gain_step;
+                    *s *= ramp.next();
                 }
-                let mut g = *gain;
+                let mut ramp = Ramp::across(*gain, *target_gain, out_len);
                 for s in r.iter_mut() {
-                    *s *= g;
-                    g += gain_step;
+                    *s *= ramp.next();
                 }
-                *gain = *target_gain;
+                *gain = *target_gain; // land exactly, no float drift
             }
 
             Node::Pan { pan, target_pan } => {
-                // Constant-power pan of the first input's left channel.
-                let src = inputs.first().map(|i| i.l).unwrap_or(&[]);
+                // Mono uses constant-power placement. Stereo uses a balance
+                // law: centre preserves both channels, while either extreme
+                // attenuates only the opposite side.
+                let input = inputs.first();
+                let src = input.map(|input| input.l).unwrap_or(&[]);
+                let src_r = input.and_then(|input| input.r);
                 let r = out.r.as_deref_mut().unwrap_or(&mut []);
-                let pan_step = (*target_pan - *pan) / out_len.max(1) as f32;
+                let mut ramp = Ramp::across(*pan, *target_pan, out_len);
                 for i in 0..out_len {
-                    let s = src.get(i).copied().unwrap_or(0.0);
-                    let angle = (*pan + 1.0) * (std::f32::consts::FRAC_PI_4);
-                    out.l[i] = s * angle.cos();
-                    if let Some(rs) = r.get_mut(i) {
-                        *rs = s * angle.sin();
+                    let p = ramp.next();
+                    let left = src.get(i).copied().unwrap_or(0.0);
+                    if let Some(source_r) = src_r {
+                        let right = source_r.get(i).copied().unwrap_or(0.0);
+                        let left_gain = if p <= 0.0 {
+                            1.0
+                        } else {
+                            (p * std::f32::consts::FRAC_PI_2).cos()
+                        };
+                        let right_gain = if p >= 0.0 {
+                            1.0
+                        } else {
+                            (-p * std::f32::consts::FRAC_PI_2).cos()
+                        };
+                        out.l[i] = left * left_gain;
+                        if let Some(rs) = r.get_mut(i) {
+                            *rs = right * right_gain;
+                        }
+                    } else {
+                        let angle = (p + 1.0) * std::f32::consts::FRAC_PI_4;
+                        out.l[i] = left * angle.cos();
+                        if let Some(rs) = r.get_mut(i) {
+                            *rs = left * angle.sin();
+                        }
                     }
-                    *pan += pan_step;
                 }
-                *pan = *target_pan;
+                *pan = *target_pan; // land exactly, no float drift
             }
 
             Node::AudioClip {
                 stream,
                 file_frames,
+                timeline_start,
+                timeline_frames,
+                source_start,
+                source_frames,
                 loop_clip,
                 gain,
                 target_gain,
@@ -513,22 +617,47 @@ impl Node {
                 if let Some(r) = out.r.as_deref_mut() {
                     r.fill(0.0);
                 }
-                let gain_step = (*target_gain - *gain) / out_len.max(1) as f32;
                 let (Some(st), false, true) = (stream.as_mut(), *failed, ctx.playing) else {
-                    // Stopped, failed, or no stream: silence. Gain still ramps
-                    // toward target so a later start doesn't click.
+                    // Stopped, failed, or no stream: silence. A pause keeps
+                    // gain settled so resuming at the same position is
+                    // seamless; a discontinuity below starts a fresh ramp.
                     *gain = *target_gain;
                     return;
                 };
-                if *file_frames == 0 {
+                if *file_frames == 0 || *source_frames == 0 || *timeline_frames == 0 {
                     return;
                 }
+                if ctx.discontinuity {
+                    *gain = 0.0;
+                }
+
+                // Intersect this segment with the clip's stamped timeline
+                // interval. This handles a clip edge in the middle of a
+                // device block without asking the transport to split there.
+                let segment_end = ctx.position.saturating_add(out_len as u64);
+                let timeline_end = timeline_start.saturating_add(*timeline_frames);
+                let active_start = ctx.position.max(*timeline_start);
+                let mut active_end = segment_end.min(timeline_end);
+                if active_start >= active_end {
+                    return;
+                }
+                let local_frame = active_start - *timeline_start;
+                if !*loop_clip {
+                    active_end = active_end.min(
+                        active_start.saturating_add(source_frames.saturating_sub(local_frame)),
+                    );
+                    if active_start >= active_end || local_frame >= *source_frames {
+                        return;
+                    }
+                }
+                let write_start = (active_start - ctx.position) as usize;
+                let active_len = (active_end - active_start) as usize;
 
                 // Where the timeline says the file should be.
                 let want = if *loop_clip {
-                    ctx.position % *file_frames
+                    *source_start + local_frame % *source_frames
                 } else {
-                    ctx.position
+                    *source_start + local_frame
                 };
                 if ctx.discontinuity || want != *next_frame {
                     // Seek is an async request; until data is ready, reads
@@ -539,10 +668,6 @@ impl Node {
                     }
                     *next_frame = want;
                 }
-                if !*loop_clip && ctx.position >= *file_frames {
-                    return; // one-shot clip has ended: silence
-                }
-
                 // Read in runs, splitting at the loop wrap. HARD-BOUNDED:
                 // trusting read() to make progress is an unbounded-time path
                 // (buffering reads can advance creek's playhead while
@@ -551,32 +676,34 @@ impl Node {
                 // renders silence for the remainder of this block.
                 let mut done = 0usize;
                 let mut attempts = 0u32;
-                while done < out_len && attempts < 8 {
+                let source_end = source_start.saturating_add(*source_frames);
+                while done < active_len && attempts < 8 {
                     attempts += 1;
-                    let until_wrap = if *loop_clip {
-                        (*file_frames - *next_frame) as usize
-                    } else {
-                        usize::MAX
-                    };
-                    let want_now = (out_len - done).min(until_wrap);
+                    let until_wrap = source_end.saturating_sub(*next_frame) as usize;
+                    let want_now = (active_len - done).min(until_wrap);
                     if want_now == 0 {
-                        // Exactly at the wrap: request the file start again.
-                        if st.seek(0, SeekMode::Auto).is_err() {
+                        if !*loop_clip {
+                            break;
+                        }
+                        // Exactly at the wrap: request the source-region
+                        // start again, which need not be file frame zero.
+                        if st.seek(*source_start as usize, SeekMode::Auto).is_err() {
                             *failed = true;
                             return;
                         }
-                        *next_frame = 0;
+                        *next_frame = *source_start;
                         continue;
                     }
                     match st.read(want_now) {
                         Ok(data) => {
-                            let got = data.num_frames();
+                            let got = data.num_frames().min(want_now);
                             if got == 0 {
                                 break; // EOF or stalled: silence the rest
                             }
                             // ch0 -> L; ch1 -> R (mono files: same to both).
                             let src_l = data.read_channel(0);
-                            for (d, s) in out.l[done..done + got].iter_mut().zip(src_l.iter()) {
+                            let dst = write_start + done;
+                            for (d, s) in out.l[dst..dst + got].iter_mut().zip(src_l.iter()) {
                                 *d = *s;
                             }
                             if let Some(r) = out.r.as_deref_mut() {
@@ -585,7 +712,7 @@ impl Node {
                                 } else {
                                     src_l
                                 };
-                                for (d, s) in r[done..done + got].iter_mut().zip(src_r.iter()) {
+                                for (d, s) in r[dst..dst + got].iter_mut().zip(src_r.iter()) {
                                     *d = *s;
                                 }
                             }
@@ -593,12 +720,12 @@ impl Node {
                             // read can advance it without delivering frames,
                             // and a drifted mirror here means reading forever.
                             *next_frame = st.playhead() as u64;
-                            if *loop_clip && *next_frame >= *file_frames {
-                                if st.seek(0, SeekMode::Auto).is_err() {
+                            if *loop_clip && *next_frame >= source_end {
+                                if st.seek(*source_start as usize, SeekMode::Auto).is_err() {
                                     *failed = true;
                                     return;
                                 }
-                                *next_frame = 0;
+                                *next_frame = *source_start;
                             }
                             done += got;
                         }
@@ -610,14 +737,15 @@ impl Node {
                         }
                     }
                 }
+                let gain_step = (*target_gain - *gain) / active_len.max(1) as f32;
                 let mut g = *gain;
-                for s in out.l.iter_mut() {
+                for s in &mut out.l[write_start..write_start + active_len] {
                     *s *= g;
                     g += gain_step;
                 }
                 if let Some(r) = out.r.as_deref_mut() {
                     let mut g = *gain;
-                    for s in r.iter_mut() {
+                    for s in &mut r[write_start..write_start + active_len] {
                         *s *= g;
                         g += gain_step;
                     }
@@ -803,17 +931,7 @@ impl Node {
                 }
 
                 // Sum the wired inputs to mono, in place in the output.
-                out.l.fill(0.0);
-                for input in inputs {
-                    for (d, s) in out.l.iter_mut().zip(input.l.iter()) {
-                        *d += *s;
-                    }
-                    if let Some(r) = input.r.as_ref() {
-                        for (d, s) in out.l.iter_mut().zip(r.iter()) {
-                            *d += *s;
-                        }
-                    }
-                }
+                sum_inputs_mono(inputs, out.l);
 
                 // The kernel writes pure wet into the scratch; this node
                 // owns the blend. `wet` is one block long by construction,
@@ -826,12 +944,144 @@ impl Node {
 
                 // Linear mix ramp across the segment: a mix knob must not
                 // click, same rule as every other ramped parameter.
-                let step = (*target_mix - *mix) / n.max(1) as f32;
+                let mut ramp = Ramp::across(*mix, *target_mix, n);
                 for (d, w) in out.l.iter_mut().zip(wet.iter()).take(n) {
-                    *d = *d * (1.0 - *mix) + *w * *mix;
-                    *mix += step;
+                    let m = ramp.next();
+                    *d = *d * (1.0 - m) + *w * m;
                 }
                 *mix = *target_mix; // land exactly, no float drift
+            }
+
+            Node::Filter {
+                core,
+                scratch2x,
+                mode,
+                slope,
+                pending_mode,
+                pending_slope,
+                cutoff,
+                res,
+                drive,
+                cutoff_target,
+                res_target,
+                drive_target,
+                prepared_cutoff,
+                prepared_q,
+                sample_rate,
+            } => {
+                use crate::params::filter as fp;
+
+                sum_inputs_mono(inputs, out.l);
+
+                // A seek must not drag the old ring along, and must not
+                // glide old knob motion into the new position: clear the
+                // signal history, snap the controls.
+                if ctx.discontinuity {
+                    core.cascade.reset();
+                    core.svf.reset();
+                    core.oversampler.reset();
+                    core.dc.reset();
+                    cutoff.set_now(*cutoff_target);
+                    res.set_now(*res_target);
+                    drive.set_now(*drive_target);
+                }
+
+                // Mode/slope switches land on segment edges with state
+                // cleared — a cascade carrying lowpass history into a
+                // highpass is a thump, and a brief clean restart is not.
+                if *pending_mode != *mode || *pending_slope != *slope {
+                    *mode = *pending_mode;
+                    *slope = *pending_slope;
+                    core.cascade.reset();
+                    core.svf.reset();
+                    *prepared_cutoff = 0.0; // force the re-prepare below
+                }
+
+                // Where the drive blend starts this segment; it ramps to
+                // the smoother's end value across the 2x pass below.
+                let drive_start = drive.current();
+
+                // Coefficients follow the smoothed controls every
+                // FILTER_COEFF_INTERVAL samples — sub-block, so a performed
+                // sweep is stepless. prepare() is bounded pure math
+                // (sin_cos per stage), red-zone legal; a settled filter
+                // skips it entirely.
+                for chunk in out.l.chunks_mut(FILTER_COEFF_INTERVAL) {
+                    let mut ctrl = [0.0f32; FILTER_COEFF_INTERVAL];
+                    let n = chunk.len();
+                    cutoff.process(&mut ctrl[..n]);
+                    let cut_now = ctrl[n - 1];
+                    res.process(&mut ctrl[..n]);
+                    let res_now = ctrl[n - 1];
+                    drive.process(&mut ctrl[..n]);
+                    let drive_now = ctrl[n - 1];
+
+                    let q_eff = fp::effective_q(res_now, drive_now);
+                    let moved = (cut_now - *prepared_cutoff).abs() > *prepared_cutoff * 1e-4
+                        || (q_eff - *prepared_q).abs() > 1e-4;
+                    if moved {
+                        *prepared_cutoff = cut_now;
+                        *prepared_q = q_eff;
+                        match *mode {
+                            fp::MODE_BP | fp::MODE_NOTCH => {
+                                core.svf.prepare(*sample_rate, cut_now, q_eff);
+                            }
+                            _ => core.cascade.prepare(
+                                *sample_rate,
+                                cut_now,
+                                q_eff,
+                                fp::slope_order(*slope),
+                                *mode == fp::MODE_HP,
+                            ),
+                        }
+                    }
+                    match *mode {
+                        fp::MODE_BP => core
+                            .svf
+                            .process(chunk, crate::dsp::filters::Mode::BandpassUnity),
+                        fp::MODE_NOTCH => core.svf.process(chunk, crate::dsp::filters::Mode::Notch),
+                        _ => core.cascade.process(chunk),
+                    }
+                }
+
+                // Drive stage, permanently in the path so its half-band
+                // latency is CONSTANT — a drive knob must never move the
+                // track in time. The dry/wet blend is owned HERE, not by
+                // the shaper: the kernel's shape() rails its output to ±1
+                // even at mix 0 (the shaper device's contract), and a
+                // resonant filter legitimately rings past ±1 — the clean
+                // path must keep that float headroom. So the shaper runs
+                // pure (mix 1, tanh is its own rail) on a copy at 2x, and
+                // the node crossfades: drive 0 is bit-transparent apart
+                // from the round trip, full drive saturates the resonance
+                // for real, and everything between is continuous.
+                let drive_now = drive.current();
+                let n2 = out.l.len() * 2;
+                if scratch2x.len() >= n2 * 2 {
+                    let (up, shaped) = scratch2x.split_at_mut(n2);
+                    let up = &mut up[..n2];
+                    core.oversampler.up(out.l, up);
+                    if drive_now.max(drive_start) > 1e-6 {
+                        core.shaper.configure(
+                            crate::dsp::shaper::Mode::SoftClip,
+                            fp::shaper_drive(drive_now),
+                            0.0,
+                            1.0,
+                        );
+                        let shaped = &mut shaped[..n2];
+                        shaped.copy_from_slice(up);
+                        core.shaper.process(shaped);
+                        let mut ramp = Ramp::across(drive_start, drive_now, n2);
+                        for (d, w) in up.iter_mut().zip(shaped.iter()) {
+                            let m = ramp.next();
+                            *d = *d * (1.0 - m) + *w * m;
+                        }
+                    }
+                    core.oversampler.down(up, out.l);
+                }
+                // A driven signal can develop offset; five hertz of nothing
+                // keeps it out of everything downstream.
+                core.dc.process(out.l);
             }
 
             Node::Click {
@@ -885,20 +1135,33 @@ impl Node {
         if !value.is_finite() {
             return;
         }
+        // Ids and ranges come from crate::params — the same table the
+        // widgets draw from, so a knob cannot drift from what this arm
+        // accepts. params::clamp is a bounded scan of a static table:
+        // red-zone legal, and an unknown id comes back None (a stale or
+        // misrouted letter — binned, never applied).
+        use crate::params::{clip, filter, mixer, pan, reverb, seq, sine};
         match self {
             Node::Silence | Node::Input { .. } => {}
             Node::Sine {
                 target_freq,
                 target_amp,
                 ..
-            } => match param {
-                0 => *target_freq = value.clamp(1.0, 20_000.0),
-                1 => *target_amp = value.clamp(0.0, 1.0),
-                _ => {}
-            },
+            } => {
+                let Some(value) = crate::params::clamp(sine::TABLE, param, value) else {
+                    return;
+                };
+                match param {
+                    sine::FREQ => *target_freq = value,
+                    sine::AMP => *target_amp = value,
+                    _ => {}
+                }
+            }
             Node::Mixer { target_gain, .. } => {
-                if param == 0 {
-                    *target_gain = value.clamp(0.0, 2.0);
+                if let Some(value) = crate::params::clamp(mixer::TABLE, param, value)
+                    && param == mixer::GAIN
+                {
+                    *target_gain = value;
                 }
             }
             Node::Click { .. } => {}
@@ -908,41 +1171,87 @@ impl Node {
                 size,
                 damp,
                 ..
-            } => match param {
-                0 => *target_mix = value.clamp(0.0, 1.0),
-                1 => {
-                    *size = value.clamp(0.0, 1.0);
-                    // The kernel's decay control is not yet wired to a knob:
-                    // until it is, size drives the tail's length exactly as
-                    // it did before the two controls were split.
-                    core.set_room(*size, *size, *damp);
+            } => {
+                let Some(value) = crate::params::clamp(reverb::TABLE, param, value) else {
+                    return;
+                };
+                match param {
+                    reverb::MIX => *target_mix = value,
+                    reverb::SIZE => {
+                        *size = value;
+                        // The kernel's decay control is not yet wired to a
+                        // knob: until it is, size drives the tail's length
+                        // exactly as it did before the two controls split.
+                        core.set_room(*size, *size, *damp);
+                    }
+                    reverb::DAMP => {
+                        *damp = value;
+                        core.set_room(*size, *size, *damp);
+                    }
+                    _ => {}
                 }
-                2 => {
-                    *damp = value.clamp(0.0, 1.0);
-                    core.set_room(*size, *size, *damp);
+            }
+            Node::Filter {
+                pending_mode,
+                pending_slope,
+                cutoff,
+                res,
+                drive,
+                cutoff_target,
+                res_target,
+                drive_target,
+                ..
+            } => {
+                let Some(value) = crate::params::clamp(filter::TABLE, param, value) else {
+                    return;
+                };
+                match param {
+                    filter::MODE => *pending_mode = value.round() as u32,
+                    filter::SLOPE => *pending_slope = value.round() as u32,
+                    filter::CUTOFF => {
+                        *cutoff_target = value;
+                        cutoff.set_target(value);
+                    }
+                    filter::RES => {
+                        *res_target = value;
+                        res.set_target(value);
+                    }
+                    filter::DRIVE => {
+                        *drive_target = value;
+                        drive.set_target(value);
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
             Node::Seq {
                 target_gain,
                 attack_rate,
                 release_coeff,
                 sample_rate,
                 ..
-            } => match param {
-                0 => *target_gain = value.clamp(0.0, 2.0),
-                1 => *attack_rate = synth_attack_rate(value, *sample_rate),
-                2 => *release_coeff = synth_release_coeff(value, *sample_rate),
-                _ => {}
-            },
+            } => {
+                let Some(value) = crate::params::clamp(seq::TABLE, param, value) else {
+                    return;
+                };
+                match param {
+                    seq::GAIN => *target_gain = value,
+                    seq::ATTACK => *attack_rate = synth_attack_rate(value, *sample_rate),
+                    seq::RELEASE => *release_coeff = synth_release_coeff(value, *sample_rate),
+                    _ => {}
+                }
+            }
             Node::AudioClip { target_gain, .. } => {
-                if param == 0 {
-                    *target_gain = value.clamp(0.0, 2.0);
+                if let Some(value) = crate::params::clamp(clip::TABLE, param, value)
+                    && param == clip::GAIN
+                {
+                    *target_gain = value;
                 }
             }
             Node::Pan { target_pan, .. } => {
-                if param == 0 {
-                    *target_pan = value.clamp(-1.0, 1.0);
+                if let Some(value) = crate::params::clamp(pan::TABLE, param, value)
+                    && param == pan::PAN
+                {
+                    *target_pan = value;
                 }
             }
         }
@@ -972,6 +1281,54 @@ pub struct InRef<'a> {
 pub struct OutRef<'a> {
     pub l: &'a mut [f32],
     pub r: Option<&'a mut [f32]>,
+}
+
+/// Sum every wired input to mono, in place in `dst` — a stereo input folds
+/// its right channel in on top of its left. The front half of every mono
+/// effect: red-zone safe (zip-bounded, no alloc, no panic), and one place
+/// instead of a copy per node.
+fn sum_inputs_mono(inputs: &[InRef], dst: &mut [f32]) {
+    dst.fill(0.0);
+    for input in inputs {
+        for (d, s) in dst.iter_mut().zip(input.l.iter()) {
+            *d += *s;
+        }
+        if let Some(r) = input.r.as_ref() {
+            for (d, s) in dst.iter_mut().zip(r.iter()) {
+                *d += *s;
+            }
+        }
+    }
+}
+
+/// One block's walk of a ramped parameter: the declick rule every audible
+/// knob follows, written once. `next()` yields the value for the current
+/// sample and THEN steps — the same order every hand-rolled ramp here used,
+/// so adopting it is bit-exact. The walk never lands exactly (float drift),
+/// which is why every user ends its block with `*param = target`; forgetting
+/// that line is the classic drift bug, so it stays visible at the call site
+/// rather than hidden in here.
+#[derive(Debug, Clone, Copy)]
+struct Ramp {
+    value: f32,
+    step: f32,
+}
+
+impl Ramp {
+    #[inline]
+    fn across(from: f32, to: f32, samples: usize) -> Self {
+        Self {
+            value: from,
+            step: (to - from) / samples.max(1) as f32,
+        }
+    }
+
+    #[inline]
+    fn next(&mut self) -> f32 {
+        let value = self.value;
+        self.value += self.step;
+        value
+    }
 }
 
 /// A buffer reference of 1 or 2 arena slots (a mono or stereo edge). Stored
@@ -1186,10 +1543,19 @@ pub enum NodeSpec {
     },
     /// Metronome blip on every beat while the transport rolls.
     Click,
-    /// An audio file streamed from disk, playing 1:1 against the timeline
-    /// from position 0. `loop_clip` cycles the whole file forever. Stereo.
+    /// An audio file streamed from disk and placed in musical time. Compile
+    /// stamps the beat boundaries into device samples. `None` length/source
+    /// values preserve the old whole-file-from-zero behavior.
     AudioClip {
         path: std::path::PathBuf,
+        #[serde(default)]
+        start_beats: f64,
+        #[serde(default)]
+        length_beats: Option<f64>,
+        #[serde(default)]
+        source_offset_frames: u64,
+        #[serde(default)]
+        source_frames: Option<u64>,
         loop_clip: bool,
         gain: f32,
     },
@@ -1204,6 +1570,18 @@ pub enum NodeSpec {
         size: f32,
         damp: f32,
         mix: f32,
+    },
+    /// A resonant filter on whatever feeds it. `mode` and `slope` are
+    /// indices into `crate::params::filter`'s lists (lp/hp/bp/notch;
+    /// 6-48 dB/octave), `cutoff_hz` is Hz, `q` a resonance Q, `drive`
+    /// `0..=1` into the oversampled soft clipper. ParamChange ids and every
+    /// range are `crate::params::filter::TABLE`'s.
+    Filter {
+        mode: u32,
+        slope: u32,
+        cutoff_hz: f32,
+        q: f32,
+        drive: f32,
     },
     /// A pattern of notes played by the built-in 8-voice synth. Subloops
     /// unroll at compile — see `expand_subloops`. `loop_len_beats` makes it a
@@ -1271,6 +1649,24 @@ impl GraphSpec {
     /// assign one arena slot per node (reuse comes later), and build the
     /// name-tag directory. All allocation happens here, in the green zone.
     pub fn compile(&self, sample_rate: u32, block_frames: usize) -> Result<Schedule, CompileError> {
+        self.compile_at_tempo(sample_rate, block_frames, 120.0)
+    }
+
+    /// Compile musical placement into timeline-sample stamps at `bpm`.
+    /// Projects retain beats; only the immutable runtime schedule sees
+    /// samples, per the sequencing contract.
+    pub fn compile_at_tempo(
+        &self,
+        sample_rate: u32,
+        block_frames: usize,
+        bpm: f64,
+    ) -> Result<Schedule, CompileError> {
+        let bpm = if bpm.is_finite() && bpm > 0.0 {
+            bpm
+        } else {
+            120.0
+        };
+        let samples_per_beat = f64::from(sample_rate) * 60.0 / bpm;
         let n = self.order.len();
         let dense_of = |id: &NodeId| self.order.iter().position(|x| x == id);
 
@@ -1406,6 +1802,10 @@ impl GraphSpec {
                     }
                     Some(NodeSpec::AudioClip {
                         path,
+                        start_beats,
+                        length_beats,
+                        source_offset_frames,
+                        source_frames,
                         loop_clip,
                         gain,
                     }) => {
@@ -1418,6 +1818,22 @@ impl GraphSpec {
                         match ReadDiskStream::<SymphoniaDecoder>::new(path.clone(), 0, opts) {
                             Ok(mut st) => {
                                 let frames = st.info().num_frames as u64;
+                                let source_start = (*source_offset_frames).min(frames);
+                                let available = frames.saturating_sub(source_start);
+                                let source_frames =
+                                    (*source_frames).unwrap_or(available).min(available);
+                                let timeline_start =
+                                    ((*start_beats).max(0.0) * samples_per_beat).round() as u64;
+                                let timeline_frames = (*length_beats).map_or_else(
+                                    || {
+                                        if *loop_clip {
+                                            u64::MAX.saturating_sub(timeline_start)
+                                        } else {
+                                            source_frames
+                                        }
+                                    },
+                                    |beats| (beats.max(0.0) * samples_per_beat).round() as u64,
+                                );
                                 // Pin the default cache (index 0) at the file
                                 // start: loop wraps then serve from RAM
                                 // instead of waiting on a disk seek. The seek
@@ -1426,21 +1842,29 @@ impl GraphSpec {
                                 // examples do new -> cache -> seek), and
                                 // without it is_ready() stays false forever.
                                 // Green zone — this is compile.
-                                let _ = st.cache(0, 0);
-                                let _ = st.seek(0, SeekMode::Auto);
+                                let _ = st.cache(0, source_start as usize);
+                                let _ = st.seek(source_start as usize, SeekMode::Auto);
                                 Node::AudioClip {
                                     stream: Some(st),
                                     file_frames: frames,
+                                    timeline_start,
+                                    timeline_frames,
+                                    source_start,
+                                    source_frames,
                                     loop_clip: *loop_clip,
                                     gain: 0.0, // ramp in
                                     target_gain: *gain,
                                     failed: false,
-                                    next_frame: 0,
+                                    next_frame: source_start,
                                 }
                             }
                             Err(_) => Node::AudioClip {
                                 stream: None,
                                 file_frames: 0,
+                                timeline_start: 0,
+                                timeline_frames: 0,
+                                source_start: 0,
+                                source_frames: 0,
                                 loop_clip: *loop_clip,
                                 gain: 0.0,
                                 target_gain: *gain,
@@ -1472,6 +1896,77 @@ impl GraphSpec {
                             target_mix: mix.clamp(0.0, 1.0),
                             size: *size,
                             damp: *damp,
+                            sample_rate: sr,
+                        }
+                    }
+                    Some(NodeSpec::Filter {
+                        mode,
+                        slope,
+                        cutoff_hz,
+                        q,
+                        drive,
+                    }) => {
+                        use crate::params::filter as fp;
+                        // Green zone: everything heap-shaped is born here.
+                        // Values clamp through the same table rows the
+                        // letters will, so a stale project file cannot
+                        // smuggle an out-of-range coefficient in.
+                        let sr = sample_rate as f32;
+                        let mode = (*mode).min(fp::MODE_NOTCH);
+                        let slope = (*slope).min(fp::SLOPE_ORDERS.len() as u32 - 1);
+                        let cutoff_hz = fp::TABLE[fp::CUTOFF as usize].clamp(*cutoff_hz);
+                        let q = fp::TABLE[fp::RES as usize].clamp(*q);
+                        let drive = fp::TABLE[fp::DRIVE as usize].clamp(*drive);
+                        let mut core = Box::new(FilterCore {
+                            cascade: crate::dsp::filters::Cascade::new(),
+                            svf: crate::dsp::filters::Svf::new(),
+                            shaper: crate::dsp::shaper::Waveshaper::new(),
+                            oversampler: crate::dsp::shaper::Oversampler2x::new(),
+                            dc: crate::dsp::filters::DcBlocker::new(),
+                        });
+                        let q_eff = fp::effective_q(q, drive);
+                        match mode {
+                            fp::MODE_BP | fp::MODE_NOTCH => {
+                                core.svf.prepare(sr, cutoff_hz, q_eff);
+                            }
+                            _ => core.cascade.prepare(
+                                sr,
+                                cutoff_hz,
+                                q_eff,
+                                fp::slope_order(slope),
+                                mode == fp::MODE_HP,
+                            ),
+                        }
+                        core.dc.prepare(sr);
+                        core.shaper.configure(
+                            crate::dsp::shaper::Mode::SoftClip,
+                            fp::shaper_drive(drive),
+                            0.0,
+                            1.0, // pure: the node owns the dry/wet blend
+                        );
+                        let smoother = |value: f32| {
+                            let mut s = crate::dsp::ramps::Smoother::new();
+                            s.prepare(sr, FILTER_SMOOTH_MS);
+                            s.set_now(value);
+                            s
+                        };
+                        Node::Filter {
+                            core,
+                            // Two 2x lanes: the round-trip signal and the
+                            // shaped copy the node blends against.
+                            scratch2x: vec![0.0f32; block_frames * 4],
+                            mode,
+                            slope,
+                            pending_mode: mode,
+                            pending_slope: slope,
+                            cutoff: smoother(cutoff_hz),
+                            res: smoother(q),
+                            drive: smoother(drive),
+                            cutoff_target: cutoff_hz,
+                            res_target: q,
+                            drive_target: drive,
+                            prepared_cutoff: cutoff_hz,
+                            prepared_q: q_eff,
                             sample_rate: sr,
                         }
                     }
@@ -1758,6 +2253,247 @@ mod tests {
         assert!(
             held.contains(&68),
             "the newest note (68) must be sounding: {held:?}"
+        );
+    }
+
+    /// Build sine -> filter -> output at 48k/256.
+    fn filter_graph(freq: f32, spec_node: NodeSpec) -> (Schedule, NodeId) {
+        let mut spec = GraphSpec::default();
+        let src = spec.push(NodeSpec::Sine { freq, amp: 0.5 });
+        let flt = spec.push(spec_node);
+        spec.connect(src, flt);
+        spec.set_output(flt);
+        (spec.compile(48_000, 256).unwrap(), flt)
+    }
+
+    /// Steady-state gain of the filter at one frequency, in dB: run long,
+    /// measure the tail of the output against the tail of a filterless run.
+    fn filter_gain_db(freq: f32, spec_node: NodeSpec) -> f32 {
+        let (mut sched, _) = filter_graph(freq, spec_node);
+        let mut wet = Vec::new();
+        run_rolling(&mut sched, 40, &mut wet);
+
+        let mut dry_spec = GraphSpec::default();
+        let src = dry_spec.push(NodeSpec::Sine { freq, amp: 0.5 });
+        dry_spec.set_output(src);
+        let mut sched = dry_spec.compile(48_000, 256).unwrap();
+        let mut dry = Vec::new();
+        run_rolling(&mut sched, 40, &mut dry);
+
+        let tail = wet.len() / 2;
+        20.0 * (rms(&wet[tail..]) / rms(&dry[tail..])).log10()
+    }
+
+    /// THE test this node exists for: the audio's measured response and the
+    /// widget's drawn curve are the same curve. Cutoff accuracy, Butterworth
+    /// flatness, slope steepness and the resonant peak all ride on it.
+    #[test]
+    fn filter_node_tracks_the_display_curve() {
+        use crate::ui::device::filter as ui;
+        for (mode, ui_mode, q) in [
+            (crate::params::filter::MODE_LP, ui::Mode::Lowpass, 0.707),
+            (crate::params::filter::MODE_LP, ui::Mode::Lowpass, 8.0),
+            (crate::params::filter::MODE_HP, ui::Mode::Highpass, 0.707),
+        ] {
+            for freq in [250.0, 1_000.0, 4_000.0] {
+                let measured = filter_gain_db(
+                    freq,
+                    NodeSpec::Filter {
+                        mode,
+                        slope: 3, // 24 dB/octave
+                        cutoff_hz: 1_000.0,
+                        q,
+                        drive: 0.0,
+                    },
+                );
+                let drawn = ui::magnitude_db(
+                    &ui::Filter {
+                        mode: ui_mode,
+                        slope: ui::Slope::Db24,
+                        cutoff_hz: 1_000.0,
+                        q,
+                        drive: 0.0,
+                    },
+                    freq,
+                    48_000.0,
+                );
+                // Ignore what neither side claims to render: below the
+                // display floor both are "silent".
+                if drawn < -50.0 {
+                    assert!(measured < -40.0, "{mode}/{q}/{freq}: {measured}");
+                    continue;
+                }
+                assert!(
+                    (measured - drawn).abs() < 1.0,
+                    "mode {mode} q {q} at {freq} Hz: audio {measured:.2} dB, display {drawn:.2} dB"
+                );
+            }
+        }
+    }
+
+    /// The default filter (cutoff parked at 20 kHz, drive 0) is a wire
+    /// delayed by exactly the drive stage's constant half-band latency —
+    /// loading it changes nothing audible, and the latency is a known
+    /// number for PDC to absorb when it exists.
+    #[test]
+    fn default_filter_is_a_transparent_delayed_wire() {
+        let latency = crate::dsp::shaper::Oversampler2x::new().latency();
+        let spec_node = NodeSpec::Filter {
+            mode: 0,
+            slope: 3,
+            cutoff_hz: 20_000.0,
+            q: 0.707,
+            drive: 0.0,
+        };
+        let (mut sched, _) = filter_graph(440.0, spec_node);
+        let mut wet = Vec::new();
+        run_rolling(&mut sched, 20, &mut wet);
+
+        let mut dry_spec = GraphSpec::default();
+        let src = dry_spec.push(NodeSpec::Sine {
+            freq: 440.0,
+            amp: 0.5,
+        });
+        dry_spec.set_output(src);
+        let mut sched = dry_spec.compile(48_000, 256).unwrap();
+        let mut dry = Vec::new();
+        run_rolling(&mut sched, 20, &mut dry);
+
+        // Settle past the first block's amp ramp-in, then compare shifted.
+        let start = 1_000;
+        let worst = (start..4_000)
+            .map(|i| (wet[i + latency] - dry[i]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst < 0.01,
+            "default filter must be a delayed wire; worst error {worst}"
+        );
+    }
+
+    /// A seek must not drag a resonant ring into the new position — the
+    /// reverb's rule, applied to the filter's state and its smoothers.
+    #[test]
+    fn a_discontinuity_cuts_the_filter_ring() {
+        let (mut sched, id) = filter_graph(
+            500.0,
+            NodeSpec::Filter {
+                mode: 0,
+                slope: 3,
+                cutoff_hz: 500.0,
+                q: 24.0,
+                drive: 0.0,
+            },
+        );
+        // Charge the resonance.
+        let mut out = Vec::new();
+        run_rolling(&mut sched, 20, &mut out);
+        assert!(rms(&out[3_000..]) > 0.05, "resonant filter must ring");
+
+        // Silence the source, then seek: the first block after the
+        // discontinuity starts from cleared state and silent input.
+        sched.apply(ParamChange {
+            node: id.to_bits(),
+            param: 99, // unknown id: binned, a stale letter is harmless
+            value: 1.0,
+        });
+        let mut block = vec![0.0f32; 512];
+        let mut c = play_ctx(0.0, true);
+        c.position = 480_000;
+        sched.run(&mut block, &c);
+        // The sine source also resets its own amp ramp on nothing — it
+        // keeps playing, so only the FILTER state cut is visible in the
+        // first samples: no full-scale resonant carry-over.
+        assert!(
+            block[..64].iter().all(|s| s.abs() < 0.6),
+            "no resonant carry-over through a seek"
+        );
+        assert!(block.iter().all(|s| s.is_finite()));
+    }
+
+    /// Drive is audible as new harmonics — the soft clipper working at 2x —
+    /// and never as NaN or a blow-up. Third harmonic of 200 Hz, measured by
+    /// correlation, must grow by an order of magnitude against the clean run.
+    #[test]
+    fn filter_drive_grows_harmonics_and_stays_finite() {
+        let third_harmonic_level = |drive: f32| {
+            let (mut sched, _) = filter_graph(
+                200.0,
+                NodeSpec::Filter {
+                    mode: 0,
+                    slope: 3,
+                    cutoff_hz: 20_000.0,
+                    q: 0.707,
+                    drive,
+                },
+            );
+            let mut out = Vec::new();
+            run_rolling(&mut sched, 40, &mut out);
+            assert!(out.iter().all(|s| s.is_finite()));
+            let tail = &out[out.len() / 2..];
+            let w = std::f32::consts::TAU * 600.0 / 48_000.0;
+            let (mut re, mut im) = (0.0f64, 0.0f64);
+            for (i, s) in tail.iter().enumerate() {
+                re += (*s as f64) * (w * i as f32).cos() as f64;
+                im += (*s as f64) * (w * i as f32).sin() as f64;
+            }
+            ((re * re + im * im).sqrt() / tail.len() as f64) as f32
+        };
+        let clean = third_harmonic_level(0.0);
+        let driven = third_harmonic_level(1.0);
+        assert!(
+            driven > clean * 10.0 && driven > 1e-3,
+            "full drive must grow the third harmonic: clean {clean}, driven {driven}"
+        );
+    }
+
+    /// Letters through the table: a mode switch retargets the audio (bp at
+    /// the corner passes, lp far below cutoff still passes), and hostile
+    /// values clamp or bin instead of doing anything interesting.
+    #[test]
+    fn filter_letters_switch_modes_and_bin_nonsense() {
+        let (mut sched, id) = filter_graph(
+            1_000.0,
+            NodeSpec::Filter {
+                mode: 0,
+                slope: 3,
+                cutoff_hz: 1_000.0,
+                q: 4.0,
+                drive: 0.0,
+            },
+        );
+        let mut out = Vec::new();
+        run_rolling(&mut sched, 10, &mut out);
+
+        // Hostile letters first: NaN, an unknown id, an insane cutoff.
+        for (param, value) in [
+            (crate::params::filter::CUTOFF, f32::NAN),
+            (77, 1.0),
+            (crate::params::filter::CUTOFF, 1e12),
+        ] {
+            sched.apply(ParamChange {
+                node: id.to_bits(),
+                param,
+                value,
+            });
+        }
+        // The hostile cutoff clamped to 20 kHz — a legal value. Put the
+        // corner back on the tone, then switch to bandpass there.
+        sched.apply(ParamChange {
+            node: id.to_bits(),
+            param: crate::params::filter::CUTOFF,
+            value: 1_000.0,
+        });
+        sched.apply(ParamChange {
+            node: id.to_bits(),
+            param: crate::params::filter::MODE,
+            value: crate::params::filter::MODE_BP as f32,
+        });
+        let mut bp = Vec::new();
+        run_rolling(&mut sched, 20, &mut bp);
+        assert!(bp.iter().all(|s| s.is_finite()));
+        assert!(
+            rms(&bp[bp.len() / 2..]) > 0.05,
+            "bandpass at its own corner must pass the tone"
         );
     }
 
@@ -2773,10 +3509,30 @@ mod tests {
         path
     }
 
+    fn constant_test_wav(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("daw-test-{name}.wav"));
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        for _ in 0..1_024 {
+            writer.write_sample(i16::MAX / 2).unwrap();
+        }
+        writer.finalize().unwrap();
+        path
+    }
+
     fn clip_audio_sched(path: std::path::PathBuf, loop_clip: bool) -> Schedule {
         let mut spec = GraphSpec::default();
         let c = spec.push(NodeSpec::AudioClip {
             path,
+            start_beats: 0.0,
+            length_beats: None,
+            source_offset_frames: 0,
+            source_frames: None,
             loop_clip,
             gain: 1.0,
         });
@@ -2851,6 +3607,58 @@ mod tests {
             rms(&out[..256]) < 1e-4,
             "one-shot must be silent past its end"
         );
+    }
+
+    #[test]
+    fn placed_audio_clip_starts_and_ends_inside_a_block_exactly() {
+        // At 480 Hz / 120 bpm one beat is 240 device samples. The clip is
+        // beat 1..2, so a block at sample 200 contains 40 leading silent
+        // frames, 216 audio frames; a block at 400 contains 80 audio frames
+        // followed by silence.
+        let mut spec = GraphSpec::default();
+        let clip = spec.push(NodeSpec::AudioClip {
+            path: constant_test_wav("placed-boundaries"),
+            start_beats: 1.0,
+            length_beats: Some(1.0),
+            source_offset_frames: 0,
+            source_frames: Some(1_024),
+            loop_clip: false,
+            gain: 1.0,
+        });
+        spec.set_output(clip);
+        let mut sched = spec.compile_at_tempo(480, 256, 120.0).unwrap();
+        let mut out = vec![0.0f32; 512];
+
+        let run_until_audible = |sched: &mut Schedule, out: &mut [f32], position: u64| {
+            for _ in 0..500 {
+                let mut ctx = play_ctx(0.0, true);
+                ctx.position = position;
+                sched.run(out, &ctx);
+                if rms(&out[..256]) > 0.01 {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            panic!("placed audio never became ready");
+        };
+
+        run_until_audible(&mut sched, &mut out, 200);
+        assert!(out[..40].iter().all(|sample| *sample == 0.0));
+        assert!(rms(&out[41..256]) > 0.1);
+
+        run_until_audible(&mut sched, &mut out, 400);
+        assert!(rms(&out[..80]) > 0.1);
+        assert!(out[80..256].iter().all(|sample| *sample == 0.0));
+
+        let mut before = play_ctx(0.0, true);
+        before.position = 0;
+        before.len = 128;
+        sched.run(&mut out, &before);
+        assert!(out[..128].iter().all(|sample| *sample == 0.0));
+        let mut after = play_ctx(0.0, true);
+        after.position = 480;
+        sched.run(&mut out, &after);
+        assert!(out[..256].iter().all(|sample| *sample == 0.0));
     }
 
     #[test]

@@ -539,6 +539,10 @@ impl EngineBench {
         self.clip_id = (self.clip_on && !self.clip_path.is_empty()).then(|| {
             spec.push(NodeSpec::AudioClip {
                 path: PathBuf::from(&self.clip_path),
+                start_beats: 0.0,
+                length_beats: None,
+                source_offset_frames: 0,
+                source_frames: None,
                 loop_clip: self.clip_loop,
                 gain: self.clip_gain,
             })

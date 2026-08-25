@@ -3,13 +3,12 @@
 //!
 //! The device layer never imports the engine, so edits leave as plain
 //! `(param id, natural value)` data and the app layer translates them to
-//! engine letters. The id contract (kept in lockstep with
-//! `Node::Seq::apply` in `src/audio/graph.rs`):
-//!
-//! - `0` — gain, linear `0..=2`
-//! - `1` — attack, milliseconds
-//! - `2` — release, milliseconds
+//! engine letters. Ids, ranges and defaults come from [`crate::params::seq`]
+//! — the one table this widget, `Node::Seq::apply` and the app's edit
+//! routing all read.
 
+use crate::params::seq::{ATTACK, GAIN, RELEASE};
+use crate::params::{self, seq::TABLE};
 use crate::ui::device::{Well, Wells, card, knob, param::Param};
 use crate::ui::theme::Theme;
 use eframe::egui;
@@ -21,11 +20,6 @@ pub struct ParamEdit {
     pub param: u32,
     pub value: f32,
 }
-
-/// Engine param ids, named once.
-const P_GAIN: u32 = 0;
-const P_ATTACK: u32 = 1;
-const P_RELEASE: u32 = 2;
 
 /// UI state of one sine synth device: normalized positions of its knobs.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -53,17 +47,25 @@ struct Spec {
     release: Param,
 }
 
-/// The synth's parameter descriptions. Ranges mirror the engine clamps.
+/// The synth's parameter descriptions. Names, ranges and defaults are the
+/// table's — the engine clamps against the same rows, so the knobs cannot
+/// drift from what the engine accepts.
 fn spec() -> Spec {
+    let gain = params::def(TABLE, GAIN);
+    let attack = params::def(TABLE, ATTACK);
+    let release = params::def(TABLE, RELEASE);
     Spec {
         gain: Param::new(
-            "gain",
-            crate::ui::device::Mapping::Linear { min: 0.0, max: 2.0 },
+            gain.name,
+            crate::ui::device::Mapping::Linear {
+                min: gain.min,
+                max: gain.max,
+            },
             crate::ui::device::Unit::Plain,
         )
-        .with_default(1.0),
-        attack: Param::ms("attack", 0.05, 5_000.0).with_default(1.0),
-        release: Param::ms("release", 1.0, 30_000.0).with_default(640.0),
+        .with_default(gain.default),
+        attack: Param::ms(attack.name, attack.min, attack.max).with_default(attack.default),
+        release: Param::ms(release.name, release.min, release.max).with_default(release.default),
     }
 }
 
@@ -114,9 +116,9 @@ pub fn sine_synth_card(
         ]);
         card::wells(ui, theme, &layout, |ui, i| {
             let (param, value, id) = match i {
-                0 => (&s.gain, &mut state.gain, P_GAIN),
-                1 => (&s.attack, &mut state.attack, P_ATTACK),
-                _ => (&s.release, &mut state.release, P_RELEASE),
+                0 => (&s.gain, &mut state.gain, GAIN),
+                1 => (&s.attack, &mut state.attack, ATTACK),
+                _ => (&s.release, &mut state.release, RELEASE),
             };
             if knob::knob(ui, theme, param, value) {
                 edits.push(ParamEdit {
@@ -136,15 +138,15 @@ pub fn sine_synth_edits(state: &SineSynthUi) -> Vec<ParamEdit> {
     let s = spec();
     vec![
         ParamEdit {
-            param: P_GAIN,
+            param: GAIN,
             value: s.gain.value(state.gain),
         },
         ParamEdit {
-            param: P_ATTACK,
+            param: ATTACK,
             value: s.attack.value(state.attack),
         },
         ParamEdit {
-            param: P_RELEASE,
+            param: RELEASE,
             value: s.release.value(state.release),
         },
     ]
@@ -166,11 +168,14 @@ mod tests {
     }
 
     #[test]
-    fn param_ids_stay_stable() {
-        // The wire contract with Node::Seq::apply. Renumbering is a
-        // protocol break, not a refactor.
-        assert_eq!(P_GAIN, 0);
-        assert_eq!(P_ATTACK, 1);
-        assert_eq!(P_RELEASE, 2);
+    fn every_table_knob_leaves_as_an_edit() {
+        // The widget must cover the table exactly: an id the table knows
+        // but the card never emits is a knob that silently stopped working.
+        let edits = sine_synth_edits(&SineSynthUi::default());
+        let mut ids: Vec<u32> = edits.iter().map(|e| e.param).collect();
+        ids.sort_unstable();
+        let mut expect: Vec<u32> = TABLE.iter().map(|p| p.id).collect();
+        expect.sort_unstable();
+        assert_eq!(ids, expect);
     }
 }

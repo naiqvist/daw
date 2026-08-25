@@ -60,6 +60,10 @@ pub enum UiAction {
     CopyClip,
     PasteClip,
     DuplicateClip,
+    /// Frame the selected audio clip in the arrangement timeline. Ableton's Z.
+    ZoomSelectedAudioClip,
+    /// Restore the arrangement view saved by the last clip zoom. Ableton's X.
+    ZoomBack,
 
     // --- tracks ---
     /// Append a track of this kind and select it. Ctrl+T / Ctrl+Shift+T.
@@ -111,6 +115,8 @@ impl UiAction {
             Self::CopyClip => "Copy clip",
             Self::PasteClip => "Paste clip",
             Self::DuplicateClip => "Duplicate clip",
+            Self::ZoomSelectedAudioClip => "Zoom to selected audio clip",
+            Self::ZoomBack => "Zoom back",
             Self::AddTrack(kind) => match kind {
                 TrackKind::Midi => "New MIDI track",
                 TrackKind::Audio => "New audio track",
@@ -152,6 +158,8 @@ impl UiAction {
             | Self::CopyClip
             | Self::PasteClip
             | Self::DuplicateClip
+            | Self::ZoomSelectedAudioClip
+            | Self::ZoomBack
             | Self::AddTrack(_)
             | Self::RemoveTrack
             | Self::ToggleTrackMute

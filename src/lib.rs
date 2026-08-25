@@ -6,6 +6,8 @@
 
 pub mod audio;
 pub mod dsp;
+pub mod library;
+pub mod params;
 pub mod theory;
 pub mod ui;
 

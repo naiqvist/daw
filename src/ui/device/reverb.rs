@@ -1,21 +1,16 @@
 //! The reverb device card — the app's first effect.
 //!
 //! Same shape as the synth card: normalized knob state here, natural values
-//! out as [`ParamEdit`]s, and the param ids kept in lockstep with
-//! `Node::Reverb::apply` in `src/audio/graph.rs`:
-//!
-//! - `0` — mix, `0..=1` wet against dry
-//! - `1` — size, `0..=1` decay time
-//! - `2` — damp, `0..=1` how fast the tail loses its highs
+//! out as [`ParamEdit`]s. Ids, ranges and defaults come from
+//! [`crate::params::reverb`] — the one table the widget, `Node::Reverb::apply`
+//! and the app's edit routing all read.
 
+use crate::params::reverb::{DAMP, MIX, SIZE};
+use crate::params::{self, reverb::TABLE};
 use crate::ui::device::synth::ParamEdit;
 use crate::ui::device::{Param, Well, Wells, card, knob};
 use crate::ui::theme::Theme;
 use eframe::egui;
-
-const P_MIX: u32 = 0;
-const P_SIZE: u32 = 1;
-const P_DAMP: u32 = 2;
 
 /// Knob positions of one reverb, normalized.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -44,15 +39,17 @@ struct Spec {
 
 /// All three are plain 0-100% controls: the engine's ranges are already
 /// normalized, so a percentage is the honest unit rather than a fake one.
+/// Names and defaults come from the table; the engine's 0..=1 shows as
+/// percent, so a default is the table's times 100.
 fn spec() -> Spec {
+    let pct = |id: u32| {
+        let def = params::def(TABLE, id);
+        Param::percent(def.name).with_default(def.default * 100.0)
+    };
     Spec {
-        // A medium room, audible but not a cathedral, is the useful
-        // starting point for the first effect anyone loads.
-        size: Param::percent("size").with_default(60.0),
-        damp: Param::percent("damp").with_default(40.0),
-        // Default 25% wet: enough to hear it worked, little enough that
-        // loading a reverb never destroys a mix.
-        mix: Param::percent("mix").with_default(25.0),
+        size: pct(SIZE),
+        damp: pct(DAMP),
+        mix: pct(MIX),
     }
 }
 
@@ -67,15 +64,15 @@ fn natural(norm: f32) -> f32 {
 pub fn reverb_edits(state: &ReverbUi) -> Vec<ParamEdit> {
     vec![
         ParamEdit {
-            param: P_MIX,
+            param: MIX,
             value: natural(state.mix),
         },
         ParamEdit {
-            param: P_SIZE,
+            param: SIZE,
             value: natural(state.size),
         },
         ParamEdit {
-            param: P_DAMP,
+            param: DAMP,
             value: natural(state.damp),
         },
     ]
@@ -101,9 +98,9 @@ pub fn reverb_card(ui: &mut egui::Ui, theme: &Theme, state: &mut ReverbUi) -> Ve
             .titled("room", ui, theme)]);
         card::wells(ui, theme, &layout, |ui, i| {
             let (param, value, id) = match i {
-                0 => (&s.size, &mut state.size, P_SIZE),
-                1 => (&s.damp, &mut state.damp, P_DAMP),
-                _ => (&s.mix, &mut state.mix, P_MIX),
+                0 => (&s.size, &mut state.size, SIZE),
+                1 => (&s.damp, &mut state.damp, DAMP),
+                _ => (&s.mix, &mut state.mix, MIX),
             };
             if knob::knob(ui, theme, param, value) {
                 edits.push(ParamEdit {
@@ -121,12 +118,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn param_ids_match_the_engine() {
-        // The wire contract with Node::Reverb::apply. Renumbering these is
-        // a protocol break, not a refactor.
-        assert_eq!(P_MIX, 0);
-        assert_eq!(P_SIZE, 1);
-        assert_eq!(P_DAMP, 2);
+    fn every_table_knob_leaves_as_an_edit() {
+        // The widget must cover the table exactly: an id the table knows
+        // but the card never emits is a knob that silently stopped working.
+        let edits = reverb_edits(&ReverbUi::default());
+        let mut ids: Vec<u32> = edits.iter().map(|e| e.param).collect();
+        ids.sort_unstable();
+        let mut expect: Vec<u32> = TABLE.iter().map(|p| p.id).collect();
+        expect.sort_unstable();
+        assert_eq!(ids, expect);
     }
 
     #[test]
@@ -137,7 +137,7 @@ mod tests {
         // Every value the engine receives is inside its documented range.
         assert!(edits.iter().all(|e| (0.0..=1.0).contains(&e.value)));
         // Loading a reverb must never drown the track it lands on.
-        let mix = edits.iter().find(|e| e.param == P_MIX).map(|e| e.value);
+        let mix = edits.iter().find(|e| e.param == MIX).map(|e| e.value);
         assert!(mix.is_some_and(|m| m > 0.0 && m < 0.5), "mix {mix:?}");
     }
 }

@@ -43,7 +43,7 @@ impl Default for BounceOptions {
 /// Render `spec` from timeline zero for `length_beats`, writing a stereo
 /// 32-bit float wav.
 pub fn bounce(spec: &GraphSpec, opts: &BounceOptions, path: &Path) -> Result<(), BounceError> {
-    let mut sched = spec.compile(opts.sample_rate, opts.block_frames)?;
+    let mut sched = spec.compile_at_tempo(opts.sample_rate, opts.block_frames, opts.bpm)?;
     let mut transport = Transport::new(opts.sample_rate as f64);
     transport.apply(TransportCmd::SetTempo(opts.bpm));
     transport.apply(TransportCmd::Play);

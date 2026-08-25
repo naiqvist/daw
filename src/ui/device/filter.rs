@@ -68,12 +68,10 @@ const GRID_DB: [f32; 4] = [12.0, -12.0, -24.0, -36.0];
 /// that a 48 dB/octave corner is a corner and not a chamfer.
 const CURVE_STEP_PX: f32 = 2.0;
 
-/// Butterworth Q, which is where a cascade with no resonance sits.
-const FLAT_Q: f32 = std::f32::consts::FRAC_1_SQRT_2;
-
-/// How hard drive squashes resonance. At full drive a peak that would be
-/// +18 dB lands near +6 — the range an analogue ladder actually covers.
-const DRIVE_SQUASH: f32 = 3.0;
+/// Butterworth Q, which is where a cascade with no resonance sits. Shared
+/// with the engine through the param table so the drawing and the audio
+/// cannot disagree about where flat is.
+const FLAT_Q: f32 = crate::params::filter::FLAT_Q;
 /// Where the stopband floors out at full drive, in dB. Real driven
 /// filters measure somewhere around here; a clean one keeps falling.
 const DRIVE_FLOOR_DB: f32 = -42.0;
@@ -293,16 +291,11 @@ fn butterworth_q(order: u32, k: u32) -> f32 {
 }
 
 /// The resonant section's Q, after the user's resonance and the
-/// nonlinearity have both had their say.
-///
-/// Drive squashes only the part of the resonance ABOVE flat, because
-/// that is the part living in the feedback path where the saturation is.
-/// A gentle filter driven hard does not lose its corner.
+/// nonlinearity have both had their say. The mapping itself lives in
+/// [`crate::params::filter`], because the audio path applies the very same
+/// function to its resonant section — agreement by construction.
 fn resonant_q(q: f32, base: f32, drive: f32) -> f32 {
-    let asked = base * (q.max(0.05) / FLAT_Q);
-    let excess = (asked - base).max(0.0);
-    let squashed = excess / (1.0 + drive.clamp(0.0, 1.0) * DRIVE_SQUASH);
-    base + squashed
+    crate::params::filter::resonant_q(q, base, drive)
 }
 
 /// The filter's magnitude at `hz`, in dB.
@@ -488,8 +481,8 @@ pub fn filter_curve(
 
 /// Resonance as a `0..=1` position. Log-mapped: a Q control spends most
 /// of its travel between 0.5 and 2, and almost none of it above 10.
-const Q_MIN: f32 = 0.3;
-const Q_MAX: f32 = 24.0;
+const Q_MIN: f32 = crate::params::filter::TABLE[crate::params::filter::RES as usize].min;
+const Q_MAX: f32 = crate::params::filter::TABLE[crate::params::filter::RES as usize].max;
 
 fn q_to_norm(q: f32) -> f32 {
     let q = q.clamp(Q_MIN, Q_MAX);
