@@ -255,6 +255,35 @@ pub fn meter(ui: &mut egui::Ui, theme: &Theme, norm: f32) {
     painter.rect_filled(filled, radius::CTRL, color);
 }
 
+/// The knob sweep, shared by every rotary control in the app.
+///
+/// The 270-degree, gap-at-the-bottom convention: 0 sits at 7 o'clock, 0.5
+/// at 12, 1.0 at 5, turning CLOCKWISE as the value rises.
+pub const KNOB_START: f32 = std::f32::consts::PI * 0.75;
+pub const KNOB_SWEEP: f32 = std::f32::consts::PI * 1.5;
+
+/// The angle of a knob at normalized value `t`, for `knob_dir` and for
+/// drawing partial arcs.
+pub fn knob_angle(t: f32) -> f32 {
+    KNOB_START + KNOB_SWEEP * t.clamp(0.0, 1.0)
+}
+
+/// Which way a knob's pointer aims at angle `a`, as a unit vector in
+/// SCREEN space.
+///
+/// Screen y grows downward, which is exactly what makes `(cos, sin)`
+/// sweep clockwise — no correction is needed or wanted. This used to
+/// negate the x, which mirrors the whole sweep: the minimum landed at 5
+/// o'clock instead of 7 and every knob in the app turned anticlockwise as
+/// its value rose. It read as merely odd on a unipolar knob and as plainly
+/// wrong on the arrangement's bipolar pan, where "L40" pointed right.
+///
+/// One helper because it was the same eight lines of trigonometry in three
+/// files, and it was wrong in all three.
+pub fn knob_dir(a: f32) -> egui::Vec2 {
+    egui::vec2(a.cos(), a.sin())
+}
+
 /// Rotary control. Drag vertically to change; returns true on change.
 ///
 /// `value` is normalized 0..1 — the caller owns the mapping to Hz, dB, or
@@ -294,9 +323,7 @@ pub fn knob(ui: &mut egui::Ui, theme: &Theme, value: &mut f32) -> bool {
         let points: Vec<egui::Pos2> = (0..=STEPS)
             .map(|i| {
                 let a = from + (to - from) * i as f32 / STEPS as f32;
-                // Screen y grows downward; the angle is measured from the
-                // 9-o'clock direction, sweeping clockwise through the bottom.
-                center + egui::vec2(-a.cos(), a.sin()) * radius
+                center + knob_dir(a) * radius
             })
             .collect();
         painter.add(egui::Shape::line(points, s));
@@ -316,7 +343,7 @@ pub fn knob(ui: &mut egui::Ui, theme: &Theme, value: &mut f32) -> bool {
     }
     // The pointer.
     let a = START + SWEEP * value.clamp(0.0, 1.0);
-    let dir = egui::vec2(-a.cos(), a.sin());
+    let dir = knob_dir(a);
     painter.line_segment(
         [center + dir * (radius * 0.4), center + dir * radius],
         egui::Stroke::new(stroke::BOLD, theme.text),
@@ -340,4 +367,60 @@ pub fn mono_fixed(ui: &mut egui::Ui, theme: &Theme, text: &str, chars: usize) {
         ui.set_min_width(width);
         value(ui, theme, text);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The knob sweep runs 7 o'clock -> 12 -> 5 o'clock, CLOCKWISE.
+    ///
+    /// This is here because it was wrong, silently, in three files at once:
+    /// a negated x mirrored the whole sweep, so every knob turned
+    /// anticlockwise and the arrangement's pan knob pointed right while its
+    /// readout said "L40". Geometry that only a screenshot can falsify is
+    /// exactly the geometry to pin.
+    #[test]
+    fn the_knob_sweeps_clockwise_from_seven_oclock() {
+        let at = |t: f32| knob_dir(knob_angle(t));
+        let approx = |v: f32, want: f32| (v - want).abs() < 1e-4;
+
+        // Minimum: down and to the LEFT — 7 o'clock. Screen y grows down,
+        // so "down" is positive.
+        let min = at(0.0);
+        assert!(
+            min.x < 0.0 && min.y > 0.0,
+            "0.0 sits at 7 o'clock, got {min:?}"
+        );
+        // Middle: straight up.
+        let mid = at(0.5);
+        assert!(
+            approx(mid.x, 0.0) && mid.y < 0.0,
+            "0.5 points up, got {mid:?}"
+        );
+        // Maximum: down and to the RIGHT — 5 o'clock.
+        let max = at(1.0);
+        assert!(
+            max.x > 0.0 && max.y > 0.0,
+            "1.0 sits at 5 o'clock, got {max:?}"
+        );
+
+        // The two ends are mirror images, and the sweep is 270 degrees.
+        assert!(approx(min.x, -max.x) && approx(min.y, max.y));
+        assert!(approx(KNOB_SWEEP, std::f32::consts::PI * 1.5));
+
+        // Rising values move rightward from 12 o'clock to 3 — strictly
+        // increasing x over that quarter is what "clockwise" means here.
+        // Past 3 o'clock x turns back, so the check stops at t = 0.83,
+        // where the pointer reaches the 3-o'clock mark.
+        for i in 0..8 {
+            let a = at(0.5 + i as f32 * 0.04);
+            let b = at(0.5 + (i + 1) as f32 * 0.04);
+            assert!(b.x > a.x, "the pointer must travel clockwise");
+        }
+
+        // Out-of-range values clamp rather than spinning past the gap.
+        assert_eq!(at(-1.0), at(0.0));
+        assert_eq!(at(2.0), at(1.0));
+    }
 }
