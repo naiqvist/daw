@@ -105,7 +105,10 @@ mod tests {
             loop_len_beats: Some(4.0),
             params: Default::default(),
         });
-        let pan = spec.push(NodeSpec::Pan { pan: -0.3 });
+        let pan = spec.push(NodeSpec::Pan {
+            pan: -0.3,
+            gain: 1.0,
+        });
         let mix = spec.push(NodeSpec::Mixer { gain: 0.5 });
         spec.connect(seq, pan);
         spec.connect(pan, mix);

@@ -166,19 +166,35 @@ pub mod mixer {
     }];
 }
 
-/// `Node::Pan`.
+/// `Node::Pan` — the per-track output stage: placement AND level.
+///
+/// Volume lives here rather than in a node of its own for the reason pan
+/// does: every track already has this node, so a fader move is a param
+/// letter to a permanent address instead of a schedule swap. The ceiling is
+/// +6 dB in linear terms (1.995), the range every console's fader has above
+/// unity.
 pub mod pan {
     use super::ParamDef;
 
     pub const PAN: u32 = 0;
+    pub const GAIN: u32 = 1;
 
-    pub const TABLE: &[ParamDef] = &[ParamDef {
-        id: PAN,
-        name: "pan",
-        min: -1.0,
-        max: 1.0,
-        default: 0.0,
-    }];
+    pub const TABLE: &[ParamDef] = &[
+        ParamDef {
+            id: PAN,
+            name: "pan",
+            min: -1.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: GAIN,
+            name: "volume",
+            min: 0.0,
+            max: 1.995_262_3,
+            default: 1.0,
+        },
+    ];
 }
 
 /// `Node::AudioClip`.

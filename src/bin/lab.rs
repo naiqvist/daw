@@ -492,7 +492,10 @@ impl EngineBench {
         });
         // Tone A routes through a pan node — the audible stereo demo.
         self.id_pan_a = self.id_a.map(|a| {
-            let pan = spec.push(NodeSpec::Pan { pan: self.pan_a });
+            let pan = spec.push(NodeSpec::Pan {
+                pan: self.pan_a,
+                gain: 1.0,
+            });
             spec.connect(a, pan);
             pan
         });

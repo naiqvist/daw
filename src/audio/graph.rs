@@ -206,6 +206,13 @@ pub struct Voice {
 /// slices into a stack array — no allocation, bounded work.
 pub const MAX_NODE_INPUTS: usize = 8;
 
+/// How many meter taps a schedule reports to the UI.
+///
+/// Fixed, because the telemetry snapshot is a `Copy` struct riding a
+/// `triple_buffer` and a Vec cannot travel in one. Tracks past this many
+/// have no meter — they still sound.
+pub const MAX_METERS: usize = 32;
+
 /// One cache-line-sized, 64-byte-aligned chunk. The arena is a `Vec` of these
 /// so every slot starts on a cache-line (and AVX-512 register) boundary.
 #[derive(Clone, Copy)]
@@ -303,8 +310,15 @@ pub enum Node {
     /// Sums its wired inputs, then applies a ramped master gain
     /// (ParamChange 0 = gain). Stereo out; mono inputs are centered.
     Mixer { gain: f32, target_gain: f32 },
-    /// Constant-power pan: first input's mono signal -> stereo. Ramped.
-    Pan { pan: f32, target_pan: f32 },
+    /// The per-track output stage: constant-power pan (first input's mono
+    /// signal -> stereo) and the track's fader level. Both ramped.
+    /// ParamChange 0 = pan, 1 = gain.
+    Pan {
+        pan: f32,
+        target_pan: f32,
+        gain: f32,
+        target_gain: f32,
+    },
     /// Streams an audio file from disk (creek: decode on its own IO thread,
     /// RT-safe reads here). Timeline-locked: file frame N plays at timeline
     /// sample N (1:1 — no resampling yet, so a file at another rate plays
@@ -561,7 +575,12 @@ impl Node {
                 *gain = *target_gain; // land exactly, no float drift
             }
 
-            Node::Pan { pan, target_pan } => {
+            Node::Pan {
+                pan,
+                target_pan,
+                gain,
+                target_gain,
+            } => {
                 // Mono uses constant-power placement. Stereo uses a balance
                 // law: centre preserves both channels, while either extreme
                 // attenuates only the opposite side.
@@ -570,8 +589,20 @@ impl Node {
                 let src_r = input.and_then(|input| input.r);
                 let r = out.r.as_deref_mut().unwrap_or(&mut []);
                 let mut ramp = Ramp::across(*pan, *target_pan, out_len);
+                // The LEVEL ramps across what is left of the block, not
+                // across this segment. Letters are drained once per block,
+                // above the segment loop, so a fader jump is already in
+                // `target_gain` when segment 0 runs — and a block split at
+                // a loop point can make that segment one frame long. Spread
+                // over the segment, a 1.0 -> 0.0 move would then be a
+                // one-sample step, which is a click. Pan is left segment
+                // scoped on purpose: it redistributes bounded energy
+                // between two channels, where gain scales it without bound.
+                let remaining = ctx.block_frames.saturating_sub(ctx.offset).max(out_len);
+                let mut level = Ramp::across(*gain, *target_gain, remaining);
                 for i in 0..out_len {
                     let p = ramp.next();
+                    let g = level.next();
                     let left = src.get(i).copied().unwrap_or(0.0);
                     if let Some(source_r) = src_r {
                         let right = source_r.get(i).copied().unwrap_or(0.0);
@@ -585,19 +616,28 @@ impl Node {
                         } else {
                             (-p * std::f32::consts::FRAC_PI_2).cos()
                         };
-                        out.l[i] = left * left_gain;
+                        out.l[i] = left * left_gain * g;
                         if let Some(rs) = r.get_mut(i) {
-                            *rs = right * right_gain;
+                            *rs = right * right_gain * g;
                         }
                     } else {
                         let angle = (p + 1.0) * std::f32::consts::FRAC_PI_4;
-                        out.l[i] = left * angle.cos();
+                        out.l[i] = left * angle.cos() * g;
                         if let Some(rs) = r.get_mut(i) {
-                            *rs = left * angle.sin();
+                            *rs = left * angle.sin() * g;
                         }
                     }
                 }
-                *pan = *target_pan; // land exactly, no float drift
+                // Pan lands exactly at the end of every segment; the
+                // level lands exactly at the end of the BLOCK, and keeps
+                // where it got to in between — otherwise the block-long
+                // ramp above would be undone by every segment boundary.
+                *pan = *target_pan;
+                if ctx.offset + out_len >= ctx.block_frames {
+                    *gain = *target_gain; // land exactly, no float drift
+                } else {
+                    *gain = level.value;
+                }
             }
 
             Node::AudioClip {
@@ -1247,11 +1287,17 @@ impl Node {
                     *target_gain = value;
                 }
             }
-            Node::Pan { target_pan, .. } => {
-                if let Some(value) = crate::params::clamp(pan::TABLE, param, value)
-                    && param == pan::PAN
-                {
-                    *target_pan = value;
+            Node::Pan {
+                target_pan,
+                target_gain,
+                ..
+            } => {
+                if let Some(value) = crate::params::clamp(pan::TABLE, param, value) {
+                    match param {
+                        pan::PAN => *target_pan = value,
+                        pan::GAIN => *target_gain = value,
+                        _ => {}
+                    }
                 }
             }
         }
@@ -1331,6 +1377,12 @@ impl Ramp {
     }
 }
 
+/// Unity gain — the serde default for a `Pan` spec written before the
+/// fader existed.
+fn unity() -> f32 {
+    1.0
+}
+
 /// A buffer reference of 1 or 2 arena slots (a mono or stereo edge). Stored
 /// as a fixed pair so the hot loop never chases a Vec for channel data.
 /// Internally this is a slot LIST — widening past stereo later is a number
@@ -1363,7 +1415,19 @@ pub struct Schedule {
     /// guarantees real generations are never 0. Rebuilt from scratch every
     /// compile, so it can never drift from `nodes`.
     slot_table: Vec<(u32, u32)>,
+    /// Meter slot per step, or [`NO_METER`]. Indexed BY STEP, so the hot
+    /// loop answers "is this step metered?" with one bounded load and no
+    /// search. Built green-side at compile.
+    step_meter: Vec<u8>,
+    /// Peak per meter slot since the last reset, accumulated across the
+    /// segments of a block: `run` is called once per SEGMENT, so a block's
+    /// peak is the max over its segments.
+    peaks: [f32; MAX_METERS],
 }
+
+/// "This step is not metered." `MAX_METERS` is 32, so 255 cannot collide
+/// with a real slot.
+const NO_METER: u8 = u8::MAX;
 
 impl Schedule {
     /// GREEN ZONE ONLY — blocks, but never forever. Wait until every disk
@@ -1423,13 +1487,25 @@ impl Schedule {
         }
     }
 
+    /// Red zone: the peaks accumulated since the last [`Self::clear_peaks`],
+    /// one per meter slot. Linear amplitude, where 1.0 is full scale.
+    pub fn peaks(&self) -> &[f32; MAX_METERS] {
+        &self.peaks
+    }
+
+    /// Red zone: start a new measurement window. Called once per block,
+    /// before its segments run — a fixed-size fill, no allocation.
+    pub fn clear_peaks(&mut self) {
+        self.peaks = [0.0; MAX_METERS];
+    }
+
     /// Red zone: walk the chart in dependency order for ONE transport
     /// segment, then copy the output node's slot to every device channel.
     /// Buffers are planar; the segment is `ctx.offset..ctx.offset + ctx.len`
     /// within the block. All node buffers are `ctx.len` long.
     pub fn run(&mut self, output: &mut [f32], ctx: &ProcessCtx<'_>) {
         let len = ctx.len;
-        for step in &self.steps {
+        for (step_index, step) in self.steps.iter().enumerate() {
             // Gather input channel slices into a fixed stack array. compile()
             // caps inputs at MAX_NODE_INPUTS, and the slot allocator
             // guarantees no input slot aliases this step's output slots: the
@@ -1463,6 +1539,35 @@ impl Schedule {
             };
             let mut out = OutRef { l, r };
             self.nodes[step.node].process(&gathered[..n_inputs], &mut out, ctx);
+
+            // Metering happens HERE, not after the walk: the allocator
+            // recycles a node's slots as soon as its last consumer has run,
+            // so this is the only moment this step's output exists. Bounded
+            // by the slices themselves; `max` on every path, so a block's
+            // peak is the max over its segments.
+            //
+            // `f32::max` returns the OTHER operand for a NaN, which cuts
+            // both ways and is worth knowing: no NaN can ever lodge in
+            // `peaks` (good), but an all-NaN buffer meters as silence
+            // rather than as trouble (a diagnosis gap, not a hazard). The
+            // per-sample test that would catch it is not worth its cost in
+            // this loop — the compile and letter doors are both guarded
+            // instead, which is where a non-finite level can come from.
+            if let Some(&slot) = self.step_meter.get(step_index)
+                && slot != NO_METER
+                && let Some(peak) = self.peaks.get_mut(slot as usize)
+            {
+                let mut hot = *peak;
+                for sample in out.l.iter() {
+                    hot = hot.max(sample.abs());
+                }
+                if let Some(right) = out.r.as_deref() {
+                    for sample in right.iter() {
+                        hot = hot.max(sample.abs());
+                    }
+                }
+                *peak = hot;
+            }
         }
 
         let device_ch = output.len() / ctx.block_frames.max(1);
@@ -1524,6 +1629,10 @@ pub struct GraphSpec {
     output: Option<NodeId>,
     /// Insertion order, for stable dense layout across compiles.
     order: Vec<NodeId>,
+    /// Meter taps: (slot, node). The slot is the CALLER's index — a track
+    /// number — so a muted track that compiles to nothing leaves its meter
+    /// reading silence instead of shifting every meter after it.
+    meters: Vec<(usize, NodeId)>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -1559,9 +1668,15 @@ pub enum NodeSpec {
         loop_clip: bool,
         gain: f32,
     },
-    /// Constant-power pan: mono in -> stereo out. ParamChange 0 = pan, -1..1.
+    /// The per-track output stage: mono in -> stereo out, panned and
+    /// levelled. ParamChange 0 = pan (-1..1), 1 = gain (0..~+6 dB).
+    ///
+    /// `gain` defaults to unity when absent, so a project saved before the
+    /// fader existed loads at the level it was written with.
     Pan {
         pan: f32,
+        #[serde(default = "unity")]
+        gain: f32,
     },
     /// A reverb on whatever feeds it. `size` is decay, `damp` is how fast
     /// the tail loses its highs, `mix` is wet against dry — all `0..=1`.
@@ -1625,6 +1740,28 @@ impl GraphSpec {
     /// Declare which node feeds the speakers.
     pub fn set_output(&mut self, id: NodeId) {
         self.output = Some(id);
+    }
+
+    /// Report `node`'s output level to the UI under `slot`.
+    ///
+    /// The peak is taken where the node's own step writes it — for a
+    /// track's output stage that means POST-fader and post-pan, which is
+    /// what a mixer meter is expected to show. Slots past [`MAX_METERS`]
+    /// are ignored rather than clamped: silently metering the wrong track
+    /// would be worse than not metering it.
+    ///
+    /// # The invariant a tap depends on
+    ///
+    /// A tapped node's `process` MUST write its whole output buffer every
+    /// block. The meter reads the buffer after the step, and arena slots
+    /// are recycled between nodes — so a node that returns early without
+    /// filling would have the previous owner's samples metered as its own.
+    /// Every node fills unconditionally today; this is the note for the
+    /// next one that does not.
+    pub fn meter(&mut self, slot: usize, node: NodeId) {
+        if slot < MAX_METERS {
+            self.meters.push((slot, node));
+        }
     }
 
     /// Nodes in insertion order with their ids — for building a project doc.
@@ -1873,10 +2010,40 @@ impl GraphSpec {
                             },
                         }
                     }
-                    Some(NodeSpec::Pan { pan }) => Node::Pan {
-                        pan: *pan,
-                        target_pan: *pan,
-                    },
+                    Some(NodeSpec::Pan { pan, gain }) => {
+                        // Sanitised HERE, because this is the one door into
+                        // the node's state that the letter path's finiteness
+                        // guard does not cover: a spec comes from a project
+                        // file, and RON will happily parse `gain: NaN`. A
+                        // bare `clamp` would not do — `f32::clamp` returns
+                        // NaN for a NaN input, so the poison would arrive
+                        // wearing a clamp's clothes and then stick, since
+                        // every block copies target into current.
+                        // Non-finite is nonsense and becomes unity — a
+                        // corrupt file is not a request to be infinitely
+                        // loud. Merely out of range is a request, and gets
+                        // clamped.
+                        let level = if gain.is_finite() {
+                            gain.clamp(0.0, crate::params::pan::TABLE[1].max)
+                        } else {
+                            1.0
+                        };
+                        let placement = if pan.is_finite() {
+                            pan.clamp(-1.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        Node::Pan {
+                            pan: placement,
+                            target_pan: placement,
+                            // Unlike the master Mixer, a track's level does
+                            // NOT ramp in from zero: a schedule swap mid
+                            // playback would fade every track back in,
+                            // which reads as a glitch, not as politeness.
+                            gain: level,
+                            target_gain: level,
+                        }
+                    }
                     Some(NodeSpec::Reverb { size, damp, mix }) => {
                         // Green zone: this is where a reverb's memory is
                         // allowed to be born. The kernel only ever indexes
@@ -2076,12 +2243,34 @@ impl GraphSpec {
             slot_table[bits as u32 as usize] = ((bits >> 32) as u32, dense as u32);
         }
 
+        // Meter taps, resolved from node ids to STEP indices — the hot
+        // loop knows steps, not ids. A tap on a node that did not survive
+        // compilation (an unreachable branch, a removed node) simply finds
+        // no step and reports silence.
+        let mut step_meter = vec![NO_METER; steps.len()];
+        for (slot, node) in &self.meters {
+            if *slot >= MAX_METERS {
+                continue;
+            }
+            // `Step::node` is the DENSE index, and dense order is exactly
+            // `self.order` — the same correspondence `slot_table` is built
+            // from just below.
+            let Some(dense) = self.order.iter().position(|id| id == node) else {
+                continue;
+            };
+            if let Some(step) = steps.iter().position(|step| step.node == dense) {
+                step_meter[step] = *slot as u8;
+            }
+        }
+
         Ok(Schedule {
             nodes,
             steps,
             arena: Arena::new(num_slots.max(1), block_frames),
             output_slot,
             slot_table,
+            step_meter,
+            peaks: [0.0; MAX_METERS],
         })
     }
 }
@@ -3695,7 +3884,10 @@ mod tests {
             freq: 1_000.0,
             amp: 0.5,
         });
-        let p0 = spec.push(NodeSpec::Pan { pan: -1.0 });
+        let p0 = spec.push(NodeSpec::Pan {
+            pan: -1.0,
+            gain: 1.0,
+        });
         spec.connect(s0, p0);
         spec.set_output(p0);
         let mut sched = spec.compile(48_000, 256).unwrap();
@@ -3718,6 +3910,111 @@ mod tests {
         assert!(
             (0.9..1.1).contains(&ratio),
             "center must balance (ratio {ratio})"
+        );
+    }
+
+    /// The fader on the track's output stage: it scales, it takes a
+    /// letter, and it ramps rather than stepping — a level change must not
+    /// be a click.
+    #[test]
+    fn pan_node_carries_the_fader() {
+        let mut spec = GraphSpec::default();
+        let s0 = spec.push(NodeSpec::Sine {
+            freq: 1_000.0,
+            amp: 0.5,
+        });
+        let p0 = spec.push(NodeSpec::Pan {
+            pan: 0.0,
+            gain: 1.0,
+        });
+        spec.connect(s0, p0);
+        spec.set_output(p0);
+        let mut sched = spec.compile(48_000, 256).unwrap();
+        let mut out = vec![0.0f32; 512];
+        run(&mut sched, &mut out); // sine ramp-in
+        run(&mut sched, &mut out);
+        let unity = rms(&out[..256]);
+        assert!(unity > 0.2, "unity passes the signal");
+
+        // Half amplitude: −6 dB, and the letter is what carries it.
+        sched.apply(ParamChange {
+            node: p0.to_bits(),
+            param: crate::params::pan::GAIN,
+            value: 0.5,
+        });
+        run(&mut sched, &mut out); // the gain ramp
+        run(&mut sched, &mut out);
+        let halved = rms(&out[..256]);
+        let ratio = halved / unity.max(1e-9);
+        assert!(
+            (0.45..0.55).contains(&ratio),
+            "half gain must halve the level (ratio {ratio})"
+        );
+
+        // Silence at zero, and no step to get there: the ramp block must
+        // not contain a discontinuity bigger than the signal itself.
+        sched.apply(ParamChange {
+            node: p0.to_bits(),
+            param: crate::params::pan::GAIN,
+            value: 0.0,
+        });
+        run(&mut sched, &mut out);
+        let jumps = out[..256]
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            jumps < 0.1,
+            "the level ramps rather than stepping ({jumps})"
+        );
+        run(&mut sched, &mut out);
+        assert!(rms(&out[..256]) < 1e-4, "a closed fader is silent");
+    }
+
+    /// Meter taps report the level at the node they are attached to, per
+    /// block, and reset between blocks rather than latching.
+    #[test]
+    fn meter_taps_report_their_node_s_peak() {
+        let mut spec = GraphSpec::default();
+        let s0 = spec.push(NodeSpec::Sine {
+            freq: 1_000.0,
+            amp: 0.5,
+        });
+        let p0 = spec.push(NodeSpec::Pan {
+            pan: 0.0,
+            gain: 1.0,
+        });
+        spec.connect(s0, p0);
+        spec.set_output(p0);
+        spec.meter(3, p0);
+        let mut sched = spec.compile(48_000, 256).unwrap();
+        let mut out = vec![0.0f32; 512];
+
+        sched.clear_peaks();
+        run(&mut sched, &mut out); // sine ramps in
+        run(&mut sched, &mut out);
+        let peak = sched.peaks()[3];
+        assert!(peak > 0.2, "the tapped node's level is reported ({peak})");
+        assert!(peak <= 1.0, "and it is an amplitude, not a sum");
+        assert_eq!(
+            sched.peaks()[0],
+            0.0,
+            "an untapped slot stays silent — slots are the CALLER's index"
+        );
+
+        // A closed fader reads silence on the very next window: the meter
+        // reports what just happened, not what once did.
+        sched.apply(ParamChange {
+            node: p0.to_bits(),
+            param: crate::params::pan::GAIN,
+            value: 0.0,
+        });
+        run(&mut sched, &mut out); // ramp down
+        sched.clear_peaks();
+        run(&mut sched, &mut out);
+        assert!(
+            sched.peaks()[3] < 1e-4,
+            "peaks reset per window rather than latching"
         );
     }
 
@@ -3796,14 +4093,116 @@ mod tests {
         spec.connect(b, m);
         spec.connect(mic, m);
         spec.set_output(m);
+        // Metered, so the guard covers the peak fold as well as the walk —
+        // an untapped graph would exercise only the sentinel check.
+        spec.meter(0, m);
+        spec.meter(1, a);
         let mut sched = spec.compile(48_000, 256).unwrap();
         let mut out = vec![0.0f32; 512];
         // Same guard the real callback runs under: abort on any allocation.
         let c = ctx(NO_INPUT);
         assert_no_alloc::assert_no_alloc(|| {
             for _ in 0..100 {
+                sched.clear_peaks();
                 sched.run(&mut out, &c);
             }
         });
+        assert!(
+            sched.peaks()[0] > 0.0,
+            "the tap did its work under the guard"
+        );
+    }
+
+    /// A fader jump spreads over the whole BLOCK even when the transport
+    /// splits that block into segments. Regression: ramping across the
+    /// SEGMENT let a 1-frame leading segment complete the move in one
+    /// sample, which is a click.
+    #[test]
+    fn the_fader_ramps_across_the_block_not_the_segment() {
+        let mut spec = GraphSpec::default();
+        let s0 = spec.push(NodeSpec::Sine {
+            freq: 1_000.0,
+            amp: 0.5,
+        });
+        let p0 = spec.push(NodeSpec::Pan {
+            pan: 0.0,
+            gain: 1.0,
+        });
+        spec.connect(s0, p0);
+        spec.set_output(p0);
+        let mut sched = spec.compile(48_000, 256).unwrap();
+        let mut out = vec![0.0f32; 512];
+        run(&mut sched, &mut out); // sine ramp-in
+        run(&mut sched, &mut out);
+
+        // Close the fader, then run the block as a 1-frame segment
+        // followed by the remaining 255 — a loop point landing at the very
+        // start of a block.
+        sched.apply(ParamChange {
+            node: p0.to_bits(),
+            param: crate::params::pan::GAIN,
+            value: 0.0,
+        });
+        let mut first = ctx(NO_INPUT);
+        first.len = 1;
+        sched.run(&mut out, &first);
+        let Node::Pan { gain, .. } = sched.nodes[1] else {
+            panic!("node 1 is the pan");
+        };
+        assert!(
+            gain > 0.99,
+            "one frame of a 256-frame block moves the level by ~1/256, not all of it ({gain})"
+        );
+
+        let mut rest = ctx(NO_INPUT);
+        rest.offset = 1;
+        rest.len = 255;
+        sched.run(&mut out, &rest);
+        let Node::Pan { gain, .. } = sched.nodes[1] else {
+            panic!("node 1 is the pan");
+        };
+        assert_eq!(gain, 0.0, "and the block still lands exactly on target");
+    }
+
+    /// A project file can say anything. A non-finite or out-of-range level
+    /// must not become a permanent output multiplier: the letter door
+    /// guards itself, so the COMPILE door has to guard too.
+    #[test]
+    fn a_nonsense_level_in_a_spec_cannot_poison_the_output() {
+        // The rule: a NON-FINITE level is nonsense and becomes unity — a
+        // corrupt file is not a request to be infinitely loud — while a
+        // merely out-of-range one is a request that gets clamped.
+        for (written, expected) in [
+            (f32::NAN, 1.0),
+            (f32::INFINITY, 1.0),
+            (f32::NEG_INFINITY, 1.0),
+            (-5.0, 0.0),
+            (1e30, crate::params::pan::TABLE[1].max),
+        ] {
+            let mut spec = GraphSpec::default();
+            let s0 = spec.push(NodeSpec::Sine {
+                freq: 1_000.0,
+                amp: 0.5,
+            });
+            let p0 = spec.push(NodeSpec::Pan {
+                pan: 0.0,
+                gain: written,
+            });
+            spec.connect(s0, p0);
+            spec.set_output(p0);
+            let mut sched = spec.compile(48_000, 256).unwrap();
+            let Node::Pan { gain, .. } = sched.nodes[1] else {
+                panic!("node 1 is the pan");
+            };
+            assert_eq!(gain, expected, "a spec gain of {written}");
+
+            let mut out = vec![0.0f32; 512];
+            run(&mut sched, &mut out);
+            run(&mut sched, &mut out);
+            assert!(
+                out.iter().all(|s| s.is_finite()),
+                "and the output stays finite with {written}"
+            );
+        }
     }
 }

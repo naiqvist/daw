@@ -164,12 +164,20 @@ pub struct BlockSnapshot {
     pub block: u64,
     /// Frames in this block. Should equal the configured buffer size.
     pub frames: usize,
-    /// Largest absolute sample in the INPUT block. The output is silent by
-    /// design (no monitoring path yet — feedback), so metering the output
-    /// would only ever show zero.
+    /// Largest absolute sample in the INPUT block. This is the MIC, not the
+    /// mix — the output's levels are reported per track in `track_peaks`.
     pub peak: f32,
     /// Leading samples of input channel 0, as captured from the device.
     pub head: [f32; SNAPSHOT_SAMPLES],
+    /// Largest absolute sample this block at each of the schedule's meter
+    /// taps — for the daw, one per track, taken post-fader and post-pan.
+    /// Linear amplitude, where 1.0 is full scale.
+    ///
+    /// Fixed size on purpose: this whole struct is a memcpy into a
+    /// `triple_buffer`, and a Vec cannot ride in one. A slot with no tap
+    /// behind it reads 0.0, which is also what a silent track reads — the
+    /// meter cannot tell the difference and does not need to.
+    pub track_peaks: [f32; graph::MAX_METERS],
 
     /// How long the callback body took for this block, in nanoseconds.
     pub work_ns: u64,
@@ -202,6 +210,7 @@ impl Default for BlockSnapshot {
             frames: 0,
             peak: 0.0,
             head: [0.0; SNAPSHOT_SAMPLES],
+            track_peaks: [0.0; graph::MAX_METERS],
             work_ns: 0,
             work_max_ns: 0,
             underflows: 0,
@@ -422,6 +431,16 @@ impl Engine {
                     let frames = output.len() / out_channels;
                     let in_channels = input.len().checked_div(frames).unwrap_or(0);
 
+                    // A new measurement window for this block's meters, and
+                    // it happens for EVERY block — including the refused
+                    // one below. A block that produces silence must report
+                    // silence: leaving the array alone would freeze every
+                    // meter at the last good reading for as long as the
+                    // refusal lasts, which is precisely the lie the
+                    // snapshot's own doc says a meter must not tell.
+                    if let Some(s) = schedule.as_mut() {
+                        s.clear_peaks();
+                    }
                     if frames > slot_capacity {
                         // Live quantum change beyond what the arena was sized
                         // for: refuse loudly (silence + counter), never index
@@ -486,6 +505,13 @@ impl Engine {
                     for (dst, src) in head.iter_mut().zip(input.iter()) {
                         *dst = *src;
                     }
+                    // The meters, gathered by the walk itself. A silent
+                    // stretch with no schedule reports zeros rather than the
+                    // last block's levels — a meter frozen at its last
+                    // reading is worse than one that reads nothing.
+                    let track_peaks = schedule
+                        .as_ref()
+                        .map_or([0.0; graph::MAX_METERS], |s| *s.peaks());
 
                     // Stop the clock before publishing so the write itself is
                     // not counted; the memcpy is ~100 bytes and constant.
@@ -497,6 +523,7 @@ impl Engine {
                         frames: output.len() / out_channels,
                         peak,
                         head,
+                        track_peaks,
                         work_ns,
                         work_max_ns,
                         underflows,

@@ -1660,6 +1660,10 @@ struct Track {
     /// Constant-power pan, `-1..=1`. Center is 0.0, and it is exact: the
     /// knob snaps there so "back to the middle" is reachable by hand.
     pan: f32,
+    /// Fader level as LINEAR amplitude, 1.0 = unity. Stored linear because
+    /// that is what the engine multiplies by; the fader does the dB
+    /// mapping, which is the only place the curve belongs.
+    volume: f32,
     /// The instrument loaded on this track, if any. `None` is a real
     /// state, not a placeholder: an empty track compiles to NO sequencer
     /// node and is silent. Loading a device from the browser is what
@@ -1694,6 +1698,7 @@ impl Default for Track {
             mute: false,
             solo: false,
             pan: 0.0,
+            volume: 1.0,
             // A fresh track has no instrument. Its knob state is still
             // here, ready, so loading a device shows sane values rather
             // than zeros.
@@ -4000,8 +4005,13 @@ const SESSION_COL_MAX: f32 = 170.0;
 const SCENE_COL_W: f32 = 128.0;
 /// The column header, showing the track's name.
 const SESSION_HEAD_H: f32 = 22.0;
-/// The mixer strip under each column: mute, solo and pan.
-const SESSION_MIXER_H: f32 = 52.0;
+/// The mixer strip under each column: mute and solo, a pan knob, then the
+/// fader with its meter beside it and the level written underneath. Tall
+/// enough that the fader has travel worth having.
+const SESSION_MIXER_H: f32 = 116.0;
+/// The fader's width, and the meter's, inside that strip.
+const FADER_W: f32 = 16.0;
+const STRIP_METER_W: f32 = 7.0;
 /// The horizontal scrollbar under the columns, shown only when the grid is
 /// wider than the window.
 const SESSION_BAR_H: f32 = 7.0;
@@ -4189,6 +4199,196 @@ impl SessionLayout {
     }
 }
 
+/// The fader's travel, in dB. Unity sits where 0 dB falls on it, which is
+/// about four fifths of the way up — the same place it sits on a console,
+/// because the useful resolution belongs around unity and not at the
+/// bottom of a fade.
+const FADER_MIN_DB: f32 = -60.0;
+const FADER_MAX_DB: f32 = 6.0;
+
+/// Fader position (`0..=1`, bottom to top) to linear amplitude.
+///
+/// The taper is linear in DECIBELS, which is what makes a fader feel even
+/// under the hand: equal distances are equal dB, not equal amplitude. The
+/// bottom of the travel is silence outright rather than −60 dB, so a fader
+/// pulled all the way down is off and not merely quiet.
+fn fader_to_amp(position: f32) -> f32 {
+    let position = position.clamp(0.0, 1.0);
+    if position <= 0.0 {
+        return 0.0;
+    }
+    let db = FADER_MIN_DB + position * (FADER_MAX_DB - FADER_MIN_DB);
+    10.0f32.powf(db / 20.0)
+}
+
+/// The inverse: linear amplitude back to a position on the travel.
+fn amp_to_fader(amp: f32) -> f32 {
+    if amp <= 0.0 {
+        return 0.0;
+    }
+    let db = 20.0 * amp.log10();
+    ((db - FADER_MIN_DB) / (FADER_MAX_DB - FADER_MIN_DB)).clamp(0.0, 1.0)
+}
+
+/// A track's level, written the way a console writes it.
+fn volume_label(amp: f32) -> String {
+    if amp <= 0.0 {
+        return "-inf".to_owned();
+    }
+    let db = 20.0 * amp.log10();
+    if db >= 0.0 {
+        format!("+{db:.1}")
+    } else {
+        format!("{db:.1}")
+    }
+}
+
+/// A vertical fader. Drag to move, double-click to return to unity.
+///
+/// Returns the new amplitude when the user moved it.
+///
+/// The handle is wide and the track is thin, which is the shape every
+/// console uses: the thing you grab should be bigger than the thing it
+/// slides along.
+fn fader(ui: &mut egui::Ui, theme: &Theme, rect: egui::Rect, amp: f32) -> Option<f32> {
+    if rect.width() <= 0.0 || rect.height() <= 0.0 {
+        return None;
+    }
+    let id = ui
+        .id()
+        .with(("fader", rect.left() as i32, rect.top() as i32));
+    let response = ui.interact(rect, id, egui::Sense::click_and_drag());
+    let handle_h = 9.0f32.min(rect.height());
+    // The travel is shorter than the rect by the handle: the handle's
+    // CENTRE runs from half a handle below the top to half above the
+    // bottom, so neither end hangs off the strip.
+    let top = rect.top() + handle_h * 0.5;
+    let bottom = rect.bottom() - handle_h * 0.5;
+    let travel = (bottom - top).max(1.0);
+
+    let mut moved = None;
+    if response.double_clicked() {
+        moved = Some(1.0);
+    } else if response.dragged()
+        && let Some(pos) = response.interact_pointer_pos()
+    {
+        // Absolute from the pointer, like every other drag here: a
+        // position built from per-frame deltas sticks under a slow hand.
+        moved = Some(fader_to_amp((bottom - pos.y) / travel));
+    }
+    if response.hovered() || response.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+    }
+
+    let shown = moved.unwrap_or(amp);
+    let position = amp_to_fader(shown);
+    let painter = ui.painter();
+    let track = egui::Rect::from_center_size(
+        egui::pos2(rect.center().x, rect.center().y),
+        egui::vec2(3.0, rect.height()),
+    );
+    painter.rect_filled(track, 1.5, theme.surface_sunken);
+    // Filled from the bottom to the handle, so the level reads at a glance
+    // without finding the handle first.
+    let y = bottom - position * travel;
+    painter.rect_filled(
+        egui::Rect::from_min_max(egui::pos2(track.left(), y), track.right_bottom()),
+        1.5,
+        theme.accent_muted,
+    );
+    // The unity mark: a fader with no landmark cannot be set by eye.
+    let unity_y = bottom - amp_to_fader(1.0) * travel;
+    painter.line_segment(
+        [
+            egui::pos2(rect.left() + 1.0, unity_y),
+            egui::pos2(rect.right() - 1.0, unity_y),
+        ],
+        egui::Stroke::new(1.0, theme.divider),
+    );
+    let handle = egui::Rect::from_center_size(
+        egui::pos2(rect.center().x, y),
+        egui::vec2(rect.width(), handle_h),
+    );
+    painter.rect_filled(
+        handle,
+        2.0,
+        if response.dragged() || response.hovered() {
+            theme.accent
+        } else {
+            theme.text_muted
+        },
+    );
+    painter.line_segment(
+        [
+            egui::pos2(handle.left() + 2.0, handle.center().y),
+            egui::pos2(handle.right() - 2.0, handle.center().y),
+        ],
+        egui::Stroke::new(1.0, theme.surface_sunken),
+    );
+    moved
+}
+
+/// A slim vertical level meter beside a fader.
+///
+/// The dB mapping and the ballistics come from `ui::device::meter` — the
+/// module that already holds every opinion about how a meter should read.
+/// Only the geometry is local, because this one has to fit a mixer strip
+/// rather than a device panel.
+///
+/// Returns true when a latched clip light was cleared.
+fn strip_meter(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    rect: egui::Rect,
+    ballistics: &device::meter::Ballistics,
+) -> bool {
+    if rect.width() <= 0.0 || rect.height() <= 0.0 {
+        return false;
+    }
+    let id = ui
+        .id()
+        .with(("strip_meter", rect.left() as i32, rect.top() as i32));
+    let response = ui.interact(rect, id, egui::Sense::click());
+    let painter = ui.painter();
+    painter.rect_filled(rect, 1.0, theme.surface_sunken);
+
+    // The bar, coloured by HEADROOM rather than by fraction: green until
+    // the last 6 dB, amber through them, red at full scale.
+    let norm = device::meter::db_to_norm(ballistics.shown_db);
+    if norm > 0.0 {
+        let height = rect.height() * norm;
+        let bar =
+            egui::Rect::from_min_max(egui::pos2(rect.left(), rect.bottom() - height), rect.max);
+        let color = if ballistics.shown_db >= device::meter::CEILING_DB {
+            theme.meter_clip
+        } else if ballistics.shown_db >= device::meter::HOT_DB {
+            theme.meter_hot
+        } else {
+            theme.meter_low
+        };
+        painter.rect_filled(bar, 1.0, color);
+    }
+    // The peak marker: where the loudest recent moment was.
+    let peak = device::meter::db_to_norm(ballistics.peak_db);
+    if peak > 0.0 {
+        let y = rect.bottom() - rect.height() * peak;
+        painter.line_segment(
+            [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+            egui::Stroke::new(1.0, theme.text),
+        );
+    }
+    // The clip light LATCHES, and is cleared by a click — the whole point
+    // is to report an overload you were not watching.
+    if ballistics.clipped {
+        painter.rect_filled(
+            egui::Rect::from_min_max(rect.left_top(), egui::pos2(rect.right(), rect.top() + 3.0)),
+            1.0,
+            theme.meter_clip,
+        );
+    }
+    response.clicked() && ballistics.clipped
+}
+
 /// A launch triangle, pointing at the clip it would start.
 fn launch_triangle(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     let h = (rect.height() * 0.42).min(7.0);
@@ -4232,8 +4432,11 @@ fn session_body(
     theme: &Theme,
     arr: &mut Arrangement,
     beats_per_bar: u32,
+    // One per track, in track order. Short is fine: a track without an
+    // entry meters silence.
+    meters: &[device::meter::Ballistics],
     drag: Option<&mut DragImport>,
-) {
+) -> Option<usize> {
     let area = ui.max_rect();
     claim(ui);
     ui.painter().rect_filled(area, 0.0, theme.bg);
@@ -4271,6 +4474,8 @@ fn session_body(
     let mut pan_edit: Option<(usize, f32)> = None;
     let mut mute: Option<usize> = None;
     let mut solo: Option<usize> = None;
+    let mut volume_edit: Option<(usize, f32)> = None;
+    let mut clear_clip: Option<usize> = None;
     // A Cell for the same reason as the clip pass's menu: one closure per
     // slot per frame, all reaching one slot.
     let menu: std::cell::Cell<Option<SessionIntent>> = std::cell::Cell::new(None);
@@ -4530,16 +4735,51 @@ fn session_body(
         if knob.left() > solo_hit.right() && pan_knob(ui, theme, knob, &mut pan) {
             pan_edit = Some((t, pan));
         }
-        ui.painter().text(
-            egui::pos2(
-                mixer.left() + CLIP_LABEL_PAD,
-                mixer.bottom() - CLIP_LABEL_PAD,
-            ),
-            egui::Align2::LEFT_BOTTOM,
-            pan_label(pan),
-            egui::FontId::monospace(HEADER_KIND_TYPE),
-            theme.text_value,
+
+        // --- the fader, its meter, and the two numbers --------------------
+        // Laid out from the RIGHT: meter at the edge, fader beside it, the
+        // readouts filling what is left. A narrow column loses its numbers
+        // before it loses its controls.
+        let rows_bottom = mixer.bottom() - CLIP_LABEL_PAD;
+        let fader_top = btn_y + HEADER_BTN + CLIP_LABEL_PAD;
+        let readout_h = HEADER_KIND_TYPE + 3.0;
+        let meter_rect = egui::Rect::from_min_max(
+            egui::pos2(mixer.right() - CLIP_LABEL_PAD - STRIP_METER_W, fader_top),
+            egui::pos2(mixer.right() - CLIP_LABEL_PAD, rows_bottom - readout_h),
         );
+        let fader_rect = egui::Rect::from_min_max(
+            egui::pos2(meter_rect.left() - 4.0 - FADER_W, fader_top),
+            egui::pos2(meter_rect.left() - 4.0, rows_bottom - readout_h),
+        );
+        if fader_rect.left() > mixer.left() + CLIP_LABEL_PAD {
+            if let Some(amp) = fader(ui, theme, fader_rect, track.volume) {
+                volume_edit = Some((t, amp));
+            }
+            let ballistics = meters.get(t).copied().unwrap_or_default();
+            if strip_meter(ui, theme, meter_rect, &ballistics) {
+                clear_clip = Some(t);
+            }
+            // The two numbers a console writes under a strip: what the
+            // fader is set to, and where the signal is placed.
+            let shown = volume_edit
+                .filter(|(edited, _)| *edited == t)
+                .map_or(track.volume, |(_, amp)| amp);
+            let painter = ui.painter();
+            painter.with_clip_rect(mixer).text(
+                egui::pos2(mixer.left() + CLIP_LABEL_PAD, rows_bottom),
+                egui::Align2::LEFT_BOTTOM,
+                volume_label(shown),
+                egui::FontId::monospace(HEADER_KIND_TYPE),
+                theme.text_value,
+            );
+            painter.with_clip_rect(mixer).text(
+                egui::pos2(mixer.left() + CLIP_LABEL_PAD, fader_top + readout_h),
+                egui::Align2::LEFT_BOTTOM,
+                pan_label(pan),
+                egui::FontId::monospace(HEADER_KIND_TYPE),
+                theme.text_muted,
+            );
+        }
     }
 
     // --- the scene column -------------------------------------------------
@@ -4711,6 +4951,11 @@ fn session_body(
     {
         track.solo = !track.solo;
     }
+    if let Some((t, amp)) = volume_edit
+        && let Some(track) = arr.tracks.get_mut(t)
+    {
+        track.volume = amp;
+    }
     match intent.or(menu.get()) {
         Some(SessionIntent::Launch(t, s)) => {
             // Launching is an instrument, not a form: the swap happens on
@@ -4745,6 +4990,9 @@ fn session_body(
         Some(SessionIntent::SelectTrack(t)) => arr.selected = Some(t),
         None => {}
     }
+    // The one thing the grid cannot settle itself: a latched clip light
+    // lives with the meters, which belong to the app.
+    clear_clip
 }
 
 /// Highlight the slot a dragged audio file would drop into, and report it.
@@ -6691,10 +6939,19 @@ fn build_graph_spec(
         // so turning the header knob is a param letter rather than a
         // schedule swap. A centered constant-power pan is two
         // multiplies; a swap per mouse-move is a recompile per frame.
-        let pan = spec.push(NodeSpec::Pan { pan: track.pan });
+        let pan = spec.push(NodeSpec::Pan {
+            pan: track.pan,
+            gain: track.volume,
+        });
         spec.connect(tail, pan);
         spec.connect(pan, mixer);
         pan_ids[i] = Some(pan);
+        // The track's own output stage is where its meter is read: after
+        // the fader and the pan, which is what a mixer meter shows. The
+        // slot is the TRACK index, so a muted track — which compiles to
+        // nothing at all — leaves its meter reading silence rather than
+        // shifting every meter below it up one.
+        spec.meter(i, pan);
     }
     if metronome {
         let click = spec.push(NodeSpec::Click);
@@ -6797,6 +7054,14 @@ struct App {
     /// project all reconcile through one door — whoever moved pan, the
     /// letter goes out once and only on a real change.
     sent_pan: Vec<f32>,
+    /// The same, for the fader. Separate vec rather than a pair, so a
+    /// resize on either cannot silently reset the other.
+    sent_volume: Vec<f32>,
+    /// Meter ballistics per track: instant attack, slow release, peak hold
+    /// and a latched clip light. Fed from the engine's per-track peaks; the
+    /// numbers themselves live in `ui::device::meter`, which is where the
+    /// opinions about how a meter should move already are.
+    meters: Vec<device::meter::Ballistics>,
     /// The clips the current schedule was compiled from — the dirty check —
     /// and when it was compiled — the debounce clock.
     compiled_clips: Vec<Vec<Clip>>,
@@ -6883,6 +7148,8 @@ impl App {
             fx_ids: Vec::new(),
             pan_ids: Vec::new(),
             sent_pan: Vec::new(),
+            sent_volume: Vec::new(),
+            meters: Vec::new(),
             compiled_clips: Vec::new(),
             last_compile: None,
             graph_key: (false, None, 0, 0, 0),
@@ -7634,6 +7901,7 @@ impl App {
                         // nothing survives a swap sitting at the node's
                         // compiled-in default while the knob says otherwise.
                         self.sent_pan.clear();
+                        self.sent_volume.clear();
                         self.compiled_clips = playing;
                         self.graph_key = (
                             self.transport.metronome,
@@ -7661,12 +7929,14 @@ impl App {
         engine.collect_trash();
         let info = engine.info();
         let snap = engine.latest_block();
+        let peaks = snap.track_peaks;
         self.transport.playing = snap.playing;
         self.transport.position = snap.position as f64 / f64::from(info.sample_rate.max(1));
         self.hud = Some(EngineHud {
             load_pct: (snap.load(info.sample_rate, info.max_frames as u32) * 100.0) as f32,
             xruns: snap.underflows + snap.overflows,
         });
+
         match engine.health() {
             StreamHealth::Running => {}
             StreamHealth::Stalled { seconds } => {
@@ -7680,8 +7950,32 @@ impl App {
                 ));
             }
         }
+        // After the engine borrow is done with: the meters are UI state,
+        // fed from the block that was just read.
+        self.advance_meters(&peaks, ctx.input(|i| i.stable_dt));
         // Telemetry only moves if frames keep coming.
         ctx.request_repaint();
+    }
+
+    /// Walk every track's meter toward this block's peak.
+    ///
+    /// The engine reports one peak per block; the frame rate and the block
+    /// rate are unrelated, so the ballistics are advanced by the FRAME's
+    /// elapsed time — a meter is a thing the eye reads, and it should fall
+    /// at the same speed however the buffer size is set.
+    ///
+    /// With the engine off there is nothing to report, and the meters are
+    /// walked toward silence rather than frozen at their last reading.
+    fn advance_meters(&mut self, peaks: &[f32], dt: f32) {
+        self.meters
+            .resize_with(self.arrangement.tracks.len(), Default::default);
+        for (track, meter) in self.meters.iter_mut().enumerate() {
+            let peak = peaks.get(track).copied().unwrap_or(0.0);
+            meter.advance(
+                device::meter::amp_to_db(peak).max(device::meter::FLOOR_DB),
+                dt,
+            );
+        }
     }
 
     /// Translate this frame's transport wishes into engine commands. Runs
@@ -7805,9 +8099,11 @@ impl App {
         let n = self.arrangement.tracks.len();
         // `f32::NAN != NAN`, so a freshly grown slot always sends once.
         self.sent_pan.resize(n, f32::NAN);
+        self.sent_volume.resize(n, f32::NAN);
         for i in 0..n {
             let pan = self.arrangement.tracks[i].pan;
-            if pan == self.sent_pan[i] {
+            let volume = self.arrangement.tracks[i].volume;
+            if pan == self.sent_pan[i] && volume == self.sent_volume[i] {
                 continue;
             }
             let Some(Some(node)) = self.pan_ids.get(i).copied() else {
@@ -7816,8 +8112,17 @@ impl App {
             let Some(engine) = &mut self.engine else {
                 return;
             };
-            engine.set_param(node, daw::params::pan::PAN, pan);
-            self.sent_pan[i] = pan;
+            // Pan and volume live on the same node and reconcile through
+            // the same door, so a fader move and a knob turn are one
+            // comparison each and never a recompile.
+            if pan != self.sent_pan[i] {
+                engine.set_param(node, daw::params::pan::PAN, pan);
+                self.sent_pan[i] = pan;
+            }
+            if volume != self.sent_volume[i] {
+                engine.set_param(node, daw::params::pan::GAIN, volume);
+                self.sent_volume[i] = volume;
+            }
         }
     }
 
@@ -7874,6 +8179,11 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // The engine first, before anything draws from its numbers.
         self.pump_engine(ui.ctx());
+        if self.engine.is_none() {
+            // No engine, no blocks: the meters fall to silence instead of
+            // freezing at whatever was on screen when it stopped.
+            self.advance_meters(&[], ui.ctx().input(|i| i.stable_dt));
+        }
         if let Some(snapshot) = self.library_service.newest_snapshot() {
             self.library_snapshot = snapshot;
             self.library_scanning = false;
@@ -8225,6 +8535,9 @@ impl eframe::App for App {
             follow: self.transport.follow,
         };
 
+        // A clip light cleared this frame, if the launcher's meters were
+        // clicked. Settled after the panel, where `self.meters` is free.
+        let mut cleared_clip = None;
         let panned = egui::CentralPanel::default()
             .frame(self.fill(t.bg))
             .show(ui, |ui| match self.arrangement.main_view {
@@ -8238,12 +8551,13 @@ impl eframe::App for App {
                     self.drag_import.as_mut(),
                 ),
                 MainView::Session => {
-                    session_body(
+                    cleared_clip = session_body(
                         ui,
                         &mut self.focus,
                         &self.theme,
                         &mut self.arrangement,
                         self.transport.beats_per_bar,
+                        &self.meters,
                         self.drag_import.as_mut(),
                     );
                     // The launcher has no view to pan: nothing here can
@@ -8252,6 +8566,12 @@ impl eframe::App for App {
                 }
             })
             .inner;
+
+        if let Some(track) = cleared_clip
+            && let Some(meter) = self.meters.get_mut(track)
+        {
+            meter.clipped = false;
+        }
 
         // Panning by hand is the user taking the wheel: follow stays off
         // until they ask for it again.
@@ -10228,8 +10548,10 @@ mod tests {
     #[test]
     fn zooming_anchors_the_beat_under_the_pointer() {
         let ctx = egui::Context::default();
-        let mut arr = Arrangement::default();
-        arr.view_beats = 4.0;
+        let mut arr = Arrangement {
+            view_beats: 4.0,
+            ..Default::default()
+        };
         // The pointer sits 96px into the timeline: beat 4 + 96/24 = 8.
         let pos = pos2(TL + 96.0, LANES_TOP + TRACK_H * 0.5);
         arrangement_pass(
@@ -10725,7 +11047,7 @@ mod tests {
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(theme.bg))
                 .show(ui, |ui| {
-                    session_body(ui, &mut Focus::default(), &theme, arr, 4, None);
+                    session_body(ui, &mut Focus::default(), &theme, arr, 4, &[], None);
                 });
         });
         out.textures_delta.clear();
@@ -10749,7 +11071,7 @@ mod tests {
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(theme.bg))
                 .show(ui, |ui| {
-                    session_body(ui, &mut Focus::default(), &theme, &mut arr, 4, None);
+                    session_body(ui, &mut Focus::default(), &theme, &mut arr, 4, &[], None);
                 });
         });
         let layout = SessionLayout::new(
@@ -10968,6 +11290,127 @@ mod tests {
         );
     }
 
+    /// The fader's taper is linear in DECIBELS, which is what makes it feel
+    /// even under the hand, and the bottom of the travel is silence rather
+    /// than merely quiet.
+    #[test]
+    fn the_fader_is_linear_in_decibels() {
+        // Unity sits where 0 dB falls on the travel.
+        let unity = amp_to_fader(1.0);
+        assert!((fader_to_amp(unity) - 1.0).abs() < 1e-4);
+        assert!(
+            (0.85..0.95).contains(&unity),
+            "unity is near the top, where the resolution belongs: {unity}"
+        );
+
+        // Equal distances are equal dB, anywhere on the travel.
+        let db_at = |p: f32| 20.0 * fader_to_amp(p).log10();
+        let low = db_at(0.5) - db_at(0.4);
+        let high = db_at(0.9) - db_at(0.8);
+        assert!(
+            (low - high).abs() < 0.01,
+            "the same distance is the same dB: {low} vs {high}"
+        );
+
+        // The ends: silence at the bottom, +6 dB at the top.
+        assert_eq!(fader_to_amp(0.0), 0.0, "a closed fader is off, not quiet");
+        assert_eq!(amp_to_fader(0.0), 0.0);
+        assert!((20.0 * fader_to_amp(1.0).log10() - FADER_MAX_DB).abs() < 0.01);
+        // And the round trip holds across the range.
+        for step in 0..=10 {
+            let position = step as f32 / 10.0;
+            let back = amp_to_fader(fader_to_amp(position));
+            assert!((back - position).abs() < 1e-3, "round trip at {position}");
+        }
+
+        assert_eq!(volume_label(1.0), "+0.0");
+        assert_eq!(volume_label(0.0), "-inf");
+        assert_eq!(volume_label(0.5), "-6.0");
+    }
+
+    /// Dragging a strip's fader sets that track's volume and nobody
+    /// else's, and double-clicking returns it to unity.
+    #[test]
+    fn the_strip_fader_sets_its_own_track_s_volume() {
+        let ctx = egui::Context::default();
+        let mut arr = Arrangement::default();
+        session_pass(&ctx, &mut arr, vec![]);
+
+        let layout = SessionLayout::new(
+            Rect::from_min_size(pos2(0.0, 0.0), SCREEN),
+            arr.tracks.len(),
+            arr.session.scenes.len(),
+            0.0,
+        );
+        // The fader of track 1, from the same metrics the strip lays out.
+        let mixer = layout.mixer(1);
+        let rows_bottom = mixer.bottom() - CLIP_LABEL_PAD;
+        let fader_top = mixer.top() + CLIP_LABEL_PAD + HEADER_BTN + CLIP_LABEL_PAD;
+        let readout_h = HEADER_KIND_TYPE + 3.0;
+        let right = mixer.right() - CLIP_LABEL_PAD - STRIP_METER_W - 4.0;
+        let x = right - FADER_W * 0.5;
+        let top = fader_top;
+        let bottom = rows_bottom - readout_h;
+
+        // Press at unity, drag most of the way down.
+        let press = pos2(x, top + (bottom - top) * (1.0 - amp_to_fader(1.0)));
+        let to = pos2(x, bottom - 4.0);
+        session_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::PointerMoved(press),
+                Event::PointerButton {
+                    pos: press,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        session_pass(&ctx, &mut arr, vec![Event::PointerMoved(to)]);
+        assert!(
+            arr.tracks[1].volume < 0.5,
+            "the fader pulled the level down: {}",
+            arr.tracks[1].volume
+        );
+        assert_eq!(arr.tracks[0].volume, 1.0, "and nobody else's");
+        session_pass(
+            &ctx,
+            &mut arr,
+            vec![Event::PointerButton {
+                pos: to,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }],
+        );
+
+        // Double-click returns it to unity.
+        for _ in 0..2 {
+            session_pass(
+                &ctx,
+                &mut arr,
+                vec![
+                    Event::PointerMoved(press),
+                    Event::PointerButton {
+                        pos: press,
+                        button: PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Default::default(),
+                    },
+                    Event::PointerButton {
+                        pos: press,
+                        button: PointerButton::Primary,
+                        pressed: false,
+                        modifiers: Default::default(),
+                    },
+                ],
+            );
+        }
+        assert_eq!(arr.tracks[1].volume, 1.0, "double-click is back to unity");
+    }
+
     /// A file dragged over the launcher aims at the slot under it — audio
     /// tracks only. This is the only way an audio clip reaches a slot, so
     /// without it half the grid would be unfillable.
@@ -10989,7 +11432,7 @@ mod tests {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(theme.bg))
                     .show(ui, |ui| {
-                        session_body(ui, &mut Focus::default(), &theme, arr, 4, Some(drag));
+                        session_body(ui, &mut Focus::default(), &theme, arr, 4, &[], Some(drag));
                     });
             });
             out.textures_delta.clear();
@@ -11383,8 +11826,10 @@ mod tests {
     /// or refusing to move at all.
     #[test]
     fn nudging_a_track_clamps_at_the_ends() {
-        let mut arr = Arrangement::default();
-        arr.selected = Some(0);
+        let mut arr = Arrangement {
+            selected: Some(0),
+            ..Default::default()
+        };
         assert!(!arr.nudge_track(-1), "the top lane cannot go higher");
         assert!(arr.nudge_track(1));
         assert_eq!(arr.selected, Some(1));
