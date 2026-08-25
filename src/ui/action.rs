@@ -65,6 +65,9 @@ pub enum UiAction {
     /// Restore the arrangement view saved by the last clip zoom. Ableton's X.
     ZoomBack,
 
+    /// Flip the main area between the timeline and the clip launcher. Tab.
+    ToggleMainView,
+
     // --- history ---
     /// Step the arrangement back to before the last edit. Ctrl+Z.
     Undo,
@@ -126,6 +129,7 @@ impl UiAction {
             Self::DuplicateClip => "Duplicate clip",
             Self::ZoomSelectedAudioClip => "Zoom to selected audio clip",
             Self::ZoomBack => "Zoom back",
+            Self::ToggleMainView => "Timeline / Session",
             Self::Undo => "Undo",
             Self::Redo => "Redo",
             Self::MoveTrack(_) => "Move track",
@@ -172,6 +176,7 @@ impl UiAction {
             | Self::DuplicateClip
             | Self::ZoomSelectedAudioClip
             | Self::ZoomBack
+            | Self::ToggleMainView
             | Self::Undo
             | Self::Redo
             | Self::MoveTrack(_)

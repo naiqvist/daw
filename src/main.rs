@@ -586,6 +586,12 @@ fn arrangement_keys(ctx: &egui::Context, arr: &Arrangement, out: &mut Vec<UiActi
         if i.consume_key(egui::Modifiers::COMMAND, egui::Key::D) {
             out.push(UiAction::DuplicateClip);
         }
+        // Tab flips the main area. Plain Tab only: Shift+Tab already
+        // belongs to the bottom region, and it is consumed before this
+        // runs, so the two never see each other's press.
+        if i.consume_key(egui::Modifiers::NONE, egui::Key::Tab) {
+            out.push(UiAction::ToggleMainView);
+        }
         // History. SHIFT FIRST, for the reason spelled out on the arrows:
         // `consume_key` ignores an extra Shift, so a plain Ctrl+Z checked
         // first would swallow Ctrl+Shift+Z and undo when asked to redo.
@@ -1493,7 +1499,11 @@ fn perform(actions: &[UiAction], transport: &mut Transport, arrangement: &mut Ar
                 }
             }
             UiAction::DeleteSelected => {
-                if let Some((t, i)) = arrangement.selected_clip {
+                if arrangement.main_view == MainView::Session {
+                    if let Some((track, scene)) = arrangement.session.selected {
+                        arrangement.force_recompile |= arrangement.clear_slot(track, scene);
+                    }
+                } else if let Some((t, i)) = arrangement.selected_clip {
                     arrangement.clips[t].remove(i);
                     arrangement.selected_clip = None;
                 }
@@ -1523,6 +1533,9 @@ fn perform(actions: &[UiAction], transport: &mut Transport, arrangement: &mut Ar
             // agree on which lane they mean.
             UiAction::AddTrack(kind) => {
                 arrangement.add_track(*kind);
+            }
+            UiAction::ToggleMainView => {
+                arrangement.main_view = arrangement.main_view.toggled();
             }
             UiAction::MoveTrack(delta) => {
                 arrangement.nudge_track(*delta);
@@ -1779,12 +1792,16 @@ struct DragImport {
     spot: Option<DropSpot>,
 }
 
-/// A drop landing site: which lane, and the snapped beat aimed at.
+/// Where a dropped audio file would land.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct DropSpot {
-    /// None means "below the last lane": the drop creates its own track.
-    track: Option<usize>,
-    beat: f32,
+enum DropSpot {
+    /// On a lane of the timeline, at a snapped beat.
+    Timeline { track: usize, beat: f32 },
+    /// Below the last lane: the drop brings its own audio track with it.
+    NewTrack { beat: f32 },
+    /// In a slot of the session grid, where it plays on launch rather than
+    /// at a position.
+    Slot { track: usize, scene: usize },
 }
 
 /// The egui drag-and-drop payload of a browser sample row.
@@ -1799,6 +1816,165 @@ struct Rename {
     original: String,
     /// Set once the edit box has been given the keyboard.
     focused: bool,
+}
+
+/// Which face the main area shows. Tab flips between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum MainView {
+    /// The timeline: clips placed in absolute musical time.
+    #[default]
+    Timeline,
+    /// The clip launcher: the same tracks as columns, scenes as rows, and
+    /// clips that play where they are launched rather than where they sit.
+    Session,
+}
+
+impl MainView {
+    fn toggled(self) -> Self {
+        match self {
+            Self::Timeline => Self::Session,
+            Self::Session => Self::Timeline,
+        }
+    }
+}
+
+/// One row of the session grid. A scene is a name and nothing else — what
+/// it PLAYS is whatever sits in its row, which is why launching a scene
+/// also stops the tracks whose slot in that row is empty.
+#[derive(Clone, PartialEq)]
+struct Scene {
+    name: String,
+}
+
+/// The clip launcher's model: a grid of slots, and what is playing.
+///
+/// `slots` is parallel to `Arrangement::tracks`, exactly like `clips` —
+/// `slots[track][scene]`. Every track operation maintains all three or
+/// none of them, which is why they live in one struct together.
+#[derive(Clone)]
+struct Session {
+    slots: Vec<Vec<Option<Clip>>>,
+    scenes: Vec<Scene>,
+    /// The scene each track is currently playing, if any. Performance
+    /// state, not content: it is deliberately outside undo, because
+    /// stopping a clip is not an edit to take back.
+    playing: Vec<Option<usize>>,
+    /// The slot the clip editor follows while the session is showing.
+    selected: Option<(usize, usize)>,
+}
+
+/// How many scenes a fresh session offers. Eight rows is what fits without
+/// scrolling at the default track height and is Ableton's own starting
+/// point; more are appended on demand.
+const SCENE_COUNT: usize = 8;
+
+/// How far a launched clip is compiled forward, in beats.
+///
+/// Session playback rides the SAME compile-and-swap path as the timeline:
+/// a launched clip is repeated into ordinary timeline clips and handed to
+/// the existing graph builder. That keeps the red zone unchanged and the
+/// sequencing contract intact — but it means "forever" has to be a number.
+/// 512 beats is a bit over four minutes at 120, and a relaunch (or a loop)
+/// starts it again.
+const SESSION_HORIZON_BEATS: f32 = 512.0;
+
+impl Session {
+    /// A grid for `tracks` tracks: every track a column, `SCENE_COUNT`
+    /// empty rows, nothing playing.
+    fn new(tracks: usize) -> Self {
+        Self {
+            slots: vec![vec![None; SCENE_COUNT]; tracks],
+            scenes: (1..=SCENE_COUNT)
+                .map(|n| Scene {
+                    name: format!("Scene {n}"),
+                })
+                .collect(),
+            playing: vec![None; tracks],
+            selected: None,
+        }
+    }
+
+    fn slot(&self, track: usize, scene: usize) -> Option<&Clip> {
+        self.slots.get(track)?.get(scene)?.as_ref()
+    }
+
+    /// The clip a track is currently playing, if it is playing one. A
+    /// launched slot whose clip has since been deleted plays nothing —
+    /// the launch is not an error, there is simply no longer anything
+    /// there.
+    fn launched(&self, track: usize) -> Option<&Clip> {
+        self.slot(track, (*self.playing.get(track)?)?)
+    }
+
+    /// Launch a slot: that track plays that scene from now. An empty slot
+    /// stops the track instead, which is what makes a scene launch across
+    /// a row with holes in it do the obvious thing.
+    ///
+    /// Returns whether anything changed.
+    fn launch(&mut self, track: usize, scene: usize) -> bool {
+        let want = self.slot(track, scene).is_some().then_some(scene);
+        let Some(playing) = self.playing.get_mut(track) else {
+            return false;
+        };
+        if *playing == want {
+            return false;
+        }
+        *playing = want;
+        true
+    }
+
+    fn stop_track(&mut self, track: usize) -> bool {
+        let Some(playing) = self.playing.get_mut(track) else {
+            return false;
+        };
+        playing.take().is_some()
+    }
+
+    /// Launch a whole row. Tracks with a clip there start it; tracks
+    /// without one stop, so a scene is the state of every track and not
+    /// just of the ones it fills.
+    fn launch_scene(&mut self, scene: usize) -> bool {
+        (0..self.playing.len()).fold(false, |changed, track| self.launch(track, scene) | changed)
+    }
+
+    fn stop_all(&mut self) -> bool {
+        (0..self.playing.len()).fold(false, |changed, track| self.stop_track(track) | changed)
+    }
+
+    fn is_playing(&self, track: usize, scene: usize) -> bool {
+        self.playing.get(track).copied().flatten() == Some(scene)
+    }
+
+    /// A launched clip, expressed as ordinary timeline clips covering the
+    /// horizon — the whole of how session playback reaches the engine.
+    ///
+    /// Audio loops INSIDE one node (`looped`), because a repeat per bar
+    /// would be one disk stream per bar. Notes repeat as copies, which the
+    /// existing note compiler already knows how to place.
+    fn compiled(&self, track: usize) -> Option<Vec<Clip>> {
+        let clip = self.launched(track)?;
+        if clip.len <= 0.0 {
+            return Some(Vec::new());
+        }
+        if clip.audio.is_some() {
+            let mut looped = clip.clone();
+            looped.start = 0.0;
+            looped.len = SESSION_HORIZON_BEATS;
+            if let Some(audio) = &mut looped.audio {
+                audio.looped = true;
+            }
+            return Some(vec![looped]);
+        }
+        let repeats = (SESSION_HORIZON_BEATS / clip.len).ceil().max(1.0) as usize;
+        Some(
+            (0..repeats)
+                .map(|n| Clip {
+                    start: n as f32 * clip.len,
+                    ..clip.clone()
+                })
+                .collect(),
+        )
+    }
 }
 
 /// A track header being dragged to a new position in the stack. The lane
@@ -1885,16 +2061,22 @@ struct Arrangement {
     next_track_no: [u32; TrackKind::ALL.len()],
     /// The header rename, while one is open.
     track_rename: Option<TrackRename>,
+    /// Which face the main area shows: the timeline or the clip launcher.
+    main_view: MainView,
+    /// The clip launcher's grid. Parallel to `tracks`, like `clips`.
+    session: Session,
     /// The header drag, while one is in flight.
     track_drag: Option<TrackDrag>,
-    /// Set by `move_track` and cleared by the app once it has recompiled.
+    /// "Recompile NOW, and do not wait for the dirty check to agree."
+    /// Set by the edits whose consequences no other check can see, and
+    /// cleared by the app once it has swapped:
     ///
-    /// A reorder renumbers every per-track thing the app holds by INDEX —
-    /// the schedule's node ids and the pan values last sent to them — and
-    /// two lanes can swap without changing the graph's shape or any clip,
-    /// so neither existing dirty check would notice. This flag is how a
-    /// reorder says "the indices moved" out loud.
-    tracks_reordered: bool,
+    /// - a track reorder, which renumbers every per-track thing the app
+    ///   holds by INDEX (node ids, the pan values last sent to them) while
+    ///   two lanes can swap without changing the graph's shape or any clip;
+    /// - a session launch or stop, where the debounce is the difference
+    ///   between an instrument and a form to fill in.
+    force_recompile: bool,
 }
 
 /// A note, spelled out. Only the tests build notes by hand — the app builds
@@ -1921,6 +2103,10 @@ const fn note(pitch: u8, start: f64, len: f64, vel: u8) -> Note {
 struct Content {
     tracks: Vec<Track>,
     clips: Vec<Vec<Clip>>,
+    /// The launcher's grid. What is PLAYING is not here: stopping a clip
+    /// is a performance, not an edit to take back.
+    slots: Vec<Vec<Option<Clip>>>,
+    scenes: Vec<Scene>,
     loop_range: Option<(f32, f32)>,
     /// The id counters ride along, so an undone clip's id is free again and
     /// a redo re-creates the very same clip rather than a renamed twin.
@@ -2073,8 +2259,10 @@ impl Default for Arrangement {
             // The default session's four lanes have already taken 1..=4.
             next_track_no: [TRACK_COUNT as u32 + 1, 1],
             track_rename: None,
+            main_view: MainView::default(),
+            session: Session::new(TRACK_COUNT),
             track_drag: None,
-            tracks_reordered: false,
+            force_recompile: false,
         }
     }
 }
@@ -2090,6 +2278,8 @@ impl Arrangement {
             content: Content {
                 tracks: self.tracks.clone(),
                 clips: self.clips.clone(),
+                slots: self.session.slots.clone(),
+                scenes: self.session.scenes.clone(),
                 loop_range: self.loop_range,
                 next_clip_id: self.next_clip_id,
                 next_track_no: self.next_track_no,
@@ -2111,6 +2301,8 @@ impl Arrangement {
     fn restore(&mut self, snapshot: &Snapshot) {
         self.tracks = snapshot.content.tracks.clone();
         self.clips = snapshot.content.clips.clone();
+        self.session.slots = snapshot.content.slots.clone();
+        self.session.scenes = snapshot.content.scenes.clone();
         self.loop_range = snapshot.content.loop_range;
         self.next_clip_id = snapshot.content.next_clip_id;
         self.next_track_no = snapshot.content.next_track_no;
@@ -2122,6 +2314,25 @@ impl Arrangement {
         self.ghost = None;
         self.rename = None;
         self.track_rename = None;
+        self.track_drag = None;
+        // `playing` is not part of the snapshot, so it has to be made to
+        // fit the grid that just came back: one entry per track, and no
+        // track left playing a slot the undo emptied.
+        self.session.playing.resize(self.tracks.len(), None);
+        for track in 0..self.tracks.len() {
+            if let Some(scene) = self.session.playing[track]
+                && self.session.slot(track, scene).is_none()
+            {
+                self.session.playing[track] = None;
+            }
+        }
+        if !self
+            .session
+            .selected
+            .is_some_and(|(t, scene)| self.session.slots.get(t).is_some_and(|c| scene < c.len()))
+        {
+            self.session.selected = None;
+        }
         // A restored selection must still point at something that exists:
         // undoing back past a track's creation would otherwise leave the
         // selection addressing a lane that is gone.
@@ -2136,6 +2347,113 @@ impl Arrangement {
         }
         if self.cursor.is_some_and(|(t, _)| t >= self.tracks.len()) {
             self.cursor = None;
+        }
+    }
+
+    /// What the engine should actually play: the timeline, with every
+    /// track that has a session clip launched playing that instead.
+    ///
+    /// Per-track override, which is the whole of the session/timeline
+    /// relationship — a launched track ignores its own timeline, and a
+    /// stopped one goes straight back to it. One door: the compile path
+    /// and the dirty check both read this, so what is compared is always
+    /// what was compiled.
+    fn effective_clips(&self) -> Vec<Vec<Clip>> {
+        self.clips
+            .iter()
+            .enumerate()
+            .map(|(track, timeline)| {
+                self.session
+                    .compiled(track)
+                    .unwrap_or_else(|| timeline.clone())
+            })
+            .collect()
+    }
+
+    /// The session slot the clip editor is pointed at, for editing in
+    /// place — a launcher whose MIDI clips could not be filled with notes
+    /// would be a grid of permanent silence.
+    fn active_slot_clip(&mut self) -> Option<&mut Clip> {
+        let (track, scene) = self.session.selected?;
+        if self.tracks.get(track)?.kind != TrackKind::Midi {
+            return None;
+        }
+        self.session.slots.get_mut(track)?.get_mut(scene)?.as_mut()
+    }
+
+    fn active_slot_clip_id(&self) -> Option<u64> {
+        let (track, scene) = self.session.selected?;
+        Some(self.session.slot(track, scene)?.id)
+    }
+
+    /// Put a clip in a slot: the launcher's answer to double-clicking an
+    /// empty lane. Instrument tracks only, for the same reason the
+    /// timeline refuses — an audio track's clip needs a file, not a name.
+    fn create_slot_clip(&mut self, track: usize, scene: usize, len: f32) -> bool {
+        if !self
+            .tracks
+            .get(track)
+            .is_some_and(|track| track.kind.takes_instrument())
+            || self.session.slot(track, scene).is_some()
+        {
+            return false;
+        }
+        let id = self.next_id();
+        let Some(slot) = self
+            .session
+            .slots
+            .get_mut(track)
+            .and_then(|column| column.get_mut(scene))
+        else {
+            return false;
+        };
+        *slot = Some(Clip {
+            id,
+            name: format!("clip {id}"),
+            // A slot's clip has no timeline position: it plays where it is
+            // launched. `start` stays 0 so the compiled repeats can simply
+            // count from it.
+            start: 0.0,
+            len,
+            notes: Vec::new(),
+            audio: None,
+        });
+        self.session.selected = Some((track, scene));
+        true
+    }
+
+    /// Empty a slot. A playing slot stops as it goes — leaving a track
+    /// "playing" something that is no longer there would be a lie the
+    /// transport keeps telling.
+    fn clear_slot(&mut self, track: usize, scene: usize) -> bool {
+        let Some(slot) = self
+            .session
+            .slots
+            .get_mut(track)
+            .and_then(|column| column.get_mut(scene))
+        else {
+            return false;
+        };
+        if slot.take().is_none() {
+            return false;
+        }
+        if self.session.is_playing(track, scene) {
+            self.session.stop_track(track);
+        }
+        if self.session.selected == Some((track, scene)) {
+            self.session.selected = None;
+        }
+        true
+    }
+
+    /// Append a row to the grid.
+    fn add_scene(&mut self) {
+        let n = self.session.scenes.len() + 1;
+        self.session.scenes.push(Scene {
+            name: format!("Scene {n}"),
+        });
+        for column in &mut self.session.slots {
+            column.push(None);
         }
     }
 
@@ -2155,6 +2473,10 @@ impl Arrangement {
         // them in step: they move in the same breath or not at all.
         let clips = self.clips.remove(from);
         self.clips.insert(to, clips);
+        let slots = self.session.slots.remove(from);
+        self.session.slots.insert(to, slots);
+        let playing = self.session.playing.remove(from);
+        self.session.playing.insert(to, playing);
 
         // Every lane between the two ends shifts by one to make room; the
         // marks the user is pointing at follow the lane they meant, not the
@@ -2173,13 +2495,14 @@ impl Arrangement {
         self.selected = self.selected.map(shifted);
         self.selected_clip = self.selected_clip.map(|(t, i)| (shifted(t), i));
         self.cursor = self.cursor.map(|(t, beat)| (shifted(t), beat));
+        self.session.selected = self.session.selected.map(|(t, s)| (shifted(t), s));
         if let Some(ghost) = &mut self.ghost {
             ghost.track = shifted(ghost.track);
         }
         if let Some(rename) = &mut self.rename {
             rename.track = shifted(rename.track);
         }
-        self.tracks_reordered = true;
+        self.force_recompile = true;
         true
     }
 
@@ -2207,6 +2530,12 @@ impl Arrangement {
         self.tracks
             .push(Track::new(kind, format!("{} {no}", kind.stem())));
         self.clips.push(Vec::new());
+        // The session grid is parallel to the tracks: a new column of
+        // empty slots, and a track that is playing nothing.
+        self.session
+            .slots
+            .push(vec![None; self.session.scenes.len()]);
+        self.session.playing.push(None);
         let i = self.tracks.len() - 1;
         // A new track is what you are about to work on. Selecting it also
         // means the device rack and the palette's track verbs point at it
@@ -2226,6 +2555,8 @@ impl Arrangement {
         }
         self.tracks.remove(track);
         self.clips.remove(track);
+        self.session.slots.remove(track);
+        self.session.playing.remove(track);
         // Every index pointing PAST the hole shifts down; every index AT
         // it is now pointing at a different track, so it is dropped.
         let fix = |i: usize| match i.cmp(&track) {
@@ -2236,6 +2567,7 @@ impl Arrangement {
         self.selected = self.selected.and_then(fix);
         self.selected_clip = self.selected_clip.and_then(|(t, c)| Some((fix(t)?, c)));
         self.cursor = self.cursor.and_then(|(t, b)| Some((fix(t)?, b)));
+        self.session.selected = self.session.selected.and_then(|(t, s)| Some((fix(t)?, s)));
         self.track_rename = None;
         if self.selection.is_some() && self.selected.is_none() {
             self.selection = None;
@@ -3651,6 +3983,676 @@ fn arrangement_body(
     panned
 }
 
+/// Session grid metrics.
+const SLOT_H: f32 = 24.0;
+const SLOT_GAP: f32 = 2.0;
+/// The launch triangle's column inside a slot: the part that STARTS a clip,
+/// as against the rest of the slot, which selects it.
+const SLOT_LAUNCH_W: f32 = 18.0;
+const SESSION_COL_MIN: f32 = 78.0;
+const SESSION_COL_MAX: f32 = 170.0;
+/// The scene column down the right: launch buttons and row names.
+const SCENE_COL_W: f32 = 128.0;
+/// The column header, showing the track's name.
+const SESSION_HEAD_H: f32 = 22.0;
+/// The mixer strip under each column: mute, solo and pan.
+const SESSION_MIXER_H: f32 = 52.0;
+
+/// Where everything in the session grid sits.
+///
+/// Pure geometry, separate from the drawing, so the hit tests and the paint
+/// cannot drift apart and so the tests can point at a slot without going
+/// through a frame.
+struct SessionLayout {
+    area: egui::Rect,
+    column_w: f32,
+    scenes: usize,
+    /// Top of the first slot row — under the column headers.
+    rows_top: f32,
+}
+
+impl SessionLayout {
+    fn new(area: egui::Rect, tracks: usize, scenes: usize) -> Self {
+        let lanes_w = (area.width() - SCENE_COL_W).max(0.0);
+        let column_w = if tracks == 0 {
+            SESSION_COL_MAX
+        } else {
+            (lanes_w / tracks as f32).clamp(SESSION_COL_MIN, SESSION_COL_MAX)
+        };
+        Self {
+            area,
+            column_w,
+            scenes,
+            rows_top: area.top() + SESSION_HEAD_H,
+        }
+    }
+
+    fn column(&self, track: usize) -> egui::Rect {
+        let left = self.area.left() + track as f32 * self.column_w;
+        egui::Rect::from_min_max(
+            egui::pos2(left, self.area.top()),
+            egui::pos2(left + self.column_w, self.area.bottom()),
+        )
+    }
+
+    fn head(&self, track: usize) -> egui::Rect {
+        let column = self.column(track);
+        egui::Rect::from_min_max(
+            column.min,
+            egui::pos2(column.right(), self.area.top() + SESSION_HEAD_H),
+        )
+    }
+
+    fn row_y(&self, scene: usize) -> f32 {
+        self.rows_top + scene as f32 * (SLOT_H + SLOT_GAP)
+    }
+
+    fn slot(&self, track: usize, scene: usize) -> egui::Rect {
+        let column = self.column(track);
+        let y = self.row_y(scene);
+        egui::Rect::from_min_max(
+            egui::pos2(column.left() + SLOT_GAP, y),
+            egui::pos2(column.right() - SLOT_GAP, y + SLOT_H),
+        )
+    }
+
+    /// The stop button under a column: one row below the last scene.
+    fn stop(&self, track: usize) -> egui::Rect {
+        let column = self.column(track);
+        let y = self.row_y(self.scenes);
+        egui::Rect::from_min_max(
+            egui::pos2(column.left() + SLOT_GAP, y),
+            egui::pos2(column.right() - SLOT_GAP, y + SLOT_H),
+        )
+    }
+
+    /// The mixer strip, pinned to the bottom of the area rather than to the
+    /// grid: the strips stay put as scenes are added.
+    fn mixer(&self, track: usize) -> egui::Rect {
+        let column = self.column(track);
+        egui::Rect::from_min_max(
+            egui::pos2(column.left(), self.area.bottom() - SESSION_MIXER_H),
+            egui::pos2(column.right(), self.area.bottom()),
+        )
+    }
+
+    fn scene_column(&self) -> egui::Rect {
+        egui::Rect::from_min_max(
+            egui::pos2(self.area.right() - SCENE_COL_W, self.area.top()),
+            self.area.max,
+        )
+    }
+
+    fn scene(&self, scene: usize) -> egui::Rect {
+        let column = self.scene_column();
+        let y = self.row_y(scene);
+        egui::Rect::from_min_max(
+            egui::pos2(column.left() + SLOT_GAP, y),
+            egui::pos2(column.right() - SLOT_GAP, y + SLOT_H),
+        )
+    }
+
+    /// The stop-all button, at the foot of the scene column.
+    fn stop_all(&self) -> egui::Rect {
+        let column = self.scene_column();
+        let y = self.row_y(self.scenes);
+        egui::Rect::from_min_max(
+            egui::pos2(column.left() + SLOT_GAP, y),
+            egui::pos2(column.right() - SLOT_GAP, y + SLOT_H),
+        )
+    }
+
+    /// The "add a scene" button, one row below stop-all.
+    fn add_scene(&self) -> egui::Rect {
+        let column = self.scene_column();
+        let y = self.row_y(self.scenes + 1);
+        egui::Rect::from_min_max(
+            egui::pos2(column.left() + SLOT_GAP, y),
+            egui::pos2(column.right() - SLOT_GAP, y + SLOT_H),
+        )
+    }
+}
+
+/// A launch triangle, pointing at the clip it would start.
+fn launch_triangle(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let h = (rect.height() * 0.42).min(7.0);
+    let c = rect.center();
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(c.x - h * 0.6, c.y - h),
+            egui::pos2(c.x - h * 0.6, c.y + h),
+            egui::pos2(c.x + h * 0.9, c.y),
+        ],
+        color,
+        egui::Stroke::NONE,
+    ));
+}
+
+/// What the session grid was asked to do this frame. Collected while
+/// drawing and applied after, for the same reason the clip pass does it:
+/// the draw holds `arr` borrowed.
+#[derive(Clone, Copy)]
+enum SessionIntent {
+    Launch(usize, usize),
+    Select(usize, usize),
+    Create(usize, usize),
+    Clear(usize, usize),
+    StopTrack(usize),
+    LaunchScene(usize),
+    StopAll,
+    AddScene,
+    SelectTrack(usize),
+}
+
+/// The clip launcher: tracks as columns, scenes as rows, clips as slots.
+///
+/// The same tracks and the same clip type as the timeline — this is a
+/// different way to READ the song, not a different song. A slot's clip has
+/// no timeline position: it plays from wherever it is launched, which is
+/// what the whole grid means.
+fn session_body(
+    ui: &mut egui::Ui,
+    focus: &mut Focus,
+    theme: &Theme,
+    arr: &mut Arrangement,
+    beats_per_bar: u32,
+    waveform_cache: &HashMap<PathBuf, Arc<waveform::Peaks>>,
+    drag: Option<&mut DragImport>,
+) {
+    let area = ui.max_rect();
+    claim(ui);
+    ui.painter().rect_filled(area, 0.0, theme.bg);
+    let layout = SessionLayout::new(area, arr.tracks.len(), arr.session.scenes.len());
+    let mut intent: Option<SessionIntent> = None;
+    let mut pan_edit: Option<(usize, f32)> = None;
+    let mut mute: Option<usize> = None;
+    let mut solo: Option<usize> = None;
+    // A Cell for the same reason as the clip pass's menu: one closure per
+    // slot per frame, all reaching one slot.
+    let menu: std::cell::Cell<Option<SessionIntent>> = std::cell::Cell::new(None);
+    let font = egui::FontId::proportional(HEADER_NAME_TYPE);
+    let small = egui::FontId::proportional(HEADER_KIND_TYPE);
+
+    for (t, track) in arr.tracks.iter().enumerate() {
+        let column = layout.column(t);
+        if column.left() >= layout.scene_column().left() {
+            // Past the scene column: the grid has outrun the window. The
+            // remaining tracks are still reachable from the timeline, and
+            // drawing them here would draw them UNDER the scene buttons.
+            break;
+        }
+        let head = layout.head(t);
+        let selected = arr.selected == Some(t);
+        let painter = ui.painter();
+        painter.rect_filled(
+            head,
+            0.0,
+            if selected {
+                theme.surface
+            } else {
+                theme.surface_sunken
+            },
+        );
+        painter.text(
+            egui::pos2(head.left() + CLIP_LABEL_PAD, head.center().y),
+            egui::Align2::LEFT_CENTER,
+            &track.name,
+            font.clone(),
+            if track_audible(&arr.tracks, t) {
+                theme.text
+            } else {
+                theme.divider
+            },
+        );
+        let head_id = ui.id().with(("session_head", t));
+        if ui.interact(head, head_id, egui::Sense::click()).clicked() {
+            intent = Some(SessionIntent::SelectTrack(t));
+        }
+
+        // --- the slots ----------------------------------------------------
+        for scene in 0..arr.session.scenes.len() {
+            let rect = layout.slot(t, scene);
+            if rect.bottom() > layout.mixer(t).top() {
+                break;
+            }
+            let clip = arr.session.slot(t, scene);
+            let playing = arr.session.is_playing(t, scene);
+            let picked = arr.session.selected == Some((t, scene));
+            let wid = ui.id().with(("slot", t, scene));
+            focus.register(wid, rect);
+            let response = ui.interact(rect, wid, egui::Sense::click());
+            let launch_rect = egui::Rect::from_min_max(
+                rect.min,
+                egui::pos2(
+                    (rect.left() + SLOT_LAUNCH_W).min(rect.right()),
+                    rect.bottom(),
+                ),
+            );
+
+            if let Some(pos) = response.interact_pointer_pos() {
+                if response.double_clicked() && clip.is_none() {
+                    intent = Some(SessionIntent::Create(t, scene));
+                } else if response.clicked() {
+                    // The triangle starts it; the body selects it. An
+                    // empty slot's triangle is the track's stop button,
+                    // which is what Ableton puts there too.
+                    intent = Some(if launch_rect.contains(pos) {
+                        match clip {
+                            Some(_) => SessionIntent::Launch(t, scene),
+                            None => SessionIntent::StopTrack(t),
+                        }
+                    } else {
+                        SessionIntent::Select(t, scene)
+                    });
+                }
+            }
+            if focus.activated(wid) {
+                intent = Some(match clip {
+                    Some(_) => SessionIntent::Launch(t, scene),
+                    None => SessionIntent::Create(t, scene),
+                });
+            }
+            if clip.is_some() {
+                response.context_menu(|ui| {
+                    if ui.button("Delete").clicked() {
+                        menu.set(Some(SessionIntent::Clear(t, scene)));
+                        ui.close();
+                    }
+                });
+            }
+
+            let painter = ui.painter();
+            match clip {
+                Some(clip) => {
+                    painter.rect_filled(
+                        rect,
+                        3.0,
+                        if playing {
+                            theme.clip_body
+                        } else {
+                            theme.clip_body.gamma_multiply(0.75)
+                        },
+                    );
+                    if let Some(audio) = &clip.audio
+                        && let Some(peaks) = waveform_cache.get(&audio.path)
+                    {
+                        let body = egui::Rect::from_min_max(
+                            egui::pos2(launch_rect.right(), rect.top()),
+                            rect.max,
+                        );
+                        waveform::paint_clip_thumbnail(
+                            ui,
+                            theme,
+                            waveform::ClipThumbnail {
+                                full_clip: body,
+                                visible_clip: body,
+                                clip,
+                                peaks,
+                                bpm: 120.0,
+                                opacity: 0.5,
+                            },
+                        );
+                    }
+                    let painter = ui.painter();
+                    launch_triangle(
+                        painter,
+                        launch_rect,
+                        if playing { theme.ok } else { theme.text },
+                    );
+                    if rect.width() > SLOT_LAUNCH_W + CLIP_LABEL_MIN_W {
+                        painter.text(
+                            egui::pos2(launch_rect.right(), rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            &clip.name,
+                            small.clone(),
+                            theme.text,
+                        );
+                    }
+                    if playing {
+                        painter.rect_stroke(
+                            rect,
+                            3.0,
+                            egui::Stroke::new(1.5, theme.ok),
+                            egui::StrokeKind::Middle,
+                        );
+                    }
+                }
+                None => {
+                    // An empty slot is a hairline, not a box: the eye
+                    // should find the clips, not the gaps.
+                    painter.rect_stroke(
+                        rect,
+                        3.0,
+                        egui::Stroke::new(1.0, theme.divider),
+                        egui::StrokeKind::Inside,
+                    );
+                    if response.hovered() {
+                        painter.rect_filled(launch_rect, 3.0, theme.surface_raised);
+                        // The stop square, drawn only where it can be hit.
+                        let stop = launch_rect.shrink(6.0);
+                        painter.rect_filled(stop, 1.0, theme.text_muted);
+                    }
+                }
+            }
+            if picked {
+                ui.painter().rect_stroke(
+                    rect,
+                    3.0,
+                    egui::Stroke::new(1.5, theme.clip_selected),
+                    egui::StrokeKind::Middle,
+                );
+            }
+        }
+
+        // --- the track's stop button --------------------------------------
+        let stop = layout.stop(t);
+        if stop.bottom() <= layout.mixer(t).top() {
+            let wid = ui.id().with(("session_stop", t));
+            focus.register(wid, stop);
+            let response = ui.interact(stop, wid, egui::Sense::click());
+            if response.clicked() || focus.activated(wid) {
+                intent = Some(SessionIntent::StopTrack(t));
+            }
+            let painter = ui.painter();
+            painter.rect_filled(
+                stop,
+                3.0,
+                if response.hovered() {
+                    theme.surface_raised
+                } else {
+                    theme.surface_sunken
+                },
+            );
+            let square = egui::Rect::from_center_size(
+                egui::pos2(stop.left() + SLOT_LAUNCH_W * 0.5, stop.center().y),
+                egui::vec2(7.0, 7.0),
+            );
+            painter.rect_filled(
+                square,
+                1.0,
+                if arr.session.playing.get(t).copied().flatten().is_some() {
+                    theme.text
+                } else {
+                    theme.text_muted
+                },
+            );
+        }
+
+        // --- the mixer strip ----------------------------------------------
+        let mixer = layout.mixer(t);
+        let painter = ui.painter();
+        painter.rect_filled(mixer, 0.0, theme.surface_sunken);
+        painter.line_segment(
+            [mixer.left_top(), mixer.right_top()],
+            egui::Stroke::new(1.0, theme.divider),
+        );
+        let wid = ui.id().with(("session_mix", t));
+        let btn_y = mixer.top() + CLIP_LABEL_PAD;
+        let btn = |n: f32| {
+            egui::Rect::from_min_size(
+                egui::pos2(
+                    mixer.left() + CLIP_LABEL_PAD + n * (HEADER_BTN + 3.0),
+                    btn_y,
+                ),
+                egui::vec2(HEADER_BTN, HEADER_BTN),
+            )
+        };
+        let solo_hit = btn(1.0);
+        if header_toggle(
+            ui,
+            theme,
+            btn(0.0),
+            wid.with("mute"),
+            "M",
+            track.mute,
+            theme.warn,
+        ) {
+            mute = Some(t);
+        }
+        if header_toggle(
+            ui,
+            theme,
+            solo_hit,
+            wid.with("solo"),
+            "S",
+            track.solo,
+            theme.accent,
+        ) {
+            solo = Some(t);
+        }
+        let mut pan = track.pan;
+        let knob = egui::Rect::from_min_size(
+            egui::pos2(
+                mixer.right() - CLIP_LABEL_PAD - HEADER_KNOB,
+                btn_y + (HEADER_BTN - HEADER_KNOB) * 0.5,
+            ),
+            egui::vec2(HEADER_KNOB, HEADER_KNOB),
+        );
+        if knob.left() > solo_hit.right() && pan_knob(ui, theme, knob, &mut pan) {
+            pan_edit = Some((t, pan));
+        }
+        ui.painter().text(
+            egui::pos2(
+                mixer.left() + CLIP_LABEL_PAD,
+                mixer.bottom() - CLIP_LABEL_PAD,
+            ),
+            egui::Align2::LEFT_BOTTOM,
+            pan_label(pan),
+            egui::FontId::monospace(HEADER_KIND_TYPE),
+            theme.text_value,
+        );
+    }
+
+    // --- the scene column -------------------------------------------------
+    let scene_col = layout.scene_column();
+    ui.painter()
+        .rect_filled(scene_col, 0.0, theme.surface_sunken);
+    ui.painter().line_segment(
+        [scene_col.left_top(), scene_col.left_bottom()],
+        egui::Stroke::new(1.0, theme.divider),
+    );
+    for (s, scene) in arr.session.scenes.iter().enumerate() {
+        let rect = layout.scene(s);
+        if rect.bottom() > scene_col.bottom() {
+            break;
+        }
+        let wid = ui.id().with(("scene", s));
+        focus.register(wid, rect);
+        let response = ui.interact(rect, wid, egui::Sense::click());
+        if response.clicked() || focus.activated(wid) {
+            intent = Some(SessionIntent::LaunchScene(s));
+        }
+        let painter = ui.painter();
+        if response.hovered() {
+            painter.rect_filled(rect, 3.0, theme.surface_raised);
+        }
+        launch_triangle(
+            painter,
+            egui::Rect::from_min_max(
+                rect.min,
+                egui::pos2(rect.left() + SLOT_LAUNCH_W, rect.bottom()),
+            ),
+            theme.text_muted,
+        );
+        painter.text(
+            egui::pos2(rect.left() + SLOT_LAUNCH_W, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            &scene.name,
+            small.clone(),
+            theme.text_muted,
+        );
+    }
+
+    let stop_all = layout.stop_all();
+    if stop_all.bottom() <= scene_col.bottom() {
+        let wid = ui.id().with("session_stop_all");
+        focus.register(wid, stop_all);
+        let response = ui.interact(stop_all, wid, egui::Sense::click());
+        if response.clicked() || focus.activated(wid) {
+            intent = Some(SessionIntent::StopAll);
+        }
+        let painter = ui.painter();
+        if response.hovered() {
+            painter.rect_filled(stop_all, 3.0, theme.surface_raised);
+        }
+        painter.rect_filled(
+            egui::Rect::from_center_size(
+                egui::pos2(stop_all.left() + SLOT_LAUNCH_W * 0.5, stop_all.center().y),
+                egui::vec2(7.0, 7.0),
+            ),
+            1.0,
+            theme.text,
+        );
+        painter.text(
+            egui::pos2(stop_all.left() + SLOT_LAUNCH_W, stop_all.center().y),
+            egui::Align2::LEFT_CENTER,
+            "stop all",
+            small.clone(),
+            theme.text_muted,
+        );
+    }
+
+    let add = layout.add_scene();
+    if add.bottom() <= scene_col.bottom() {
+        let wid = ui.id().with("session_add_scene");
+        focus.register(wid, add);
+        let response = ui.interact(add, wid, egui::Sense::click());
+        if response.clicked() || focus.activated(wid) {
+            intent = Some(SessionIntent::AddScene);
+        }
+        let painter = ui.painter();
+        if response.hovered() {
+            painter.rect_filled(add, 3.0, theme.surface_raised);
+        }
+        painter.text(
+            egui::pos2(add.left() + SLOT_LAUNCH_W, add.center().y),
+            egui::Align2::LEFT_CENTER,
+            "+ scene",
+            small,
+            theme.text_muted,
+        );
+    }
+
+    // --- a file being dragged in -------------------------------------------
+    // The launcher's answer to the timeline's ghost clip: the slot under
+    // the pointer lights up, and the drop lands there. A slot takes a whole
+    // file, so there is no length or grid to preview — the highlight IS the
+    // preview.
+    if let Some(drag) = drag {
+        drag.spot = drop_slot(ui, theme, &layout, arr, drag);
+    }
+
+    // --- apply -------------------------------------------------------------
+    if let Some((t, pan)) = pan_edit
+        && let Some(track) = arr.tracks.get_mut(t)
+    {
+        track.pan = pan;
+    }
+    if let Some(t) = mute
+        && let Some(track) = arr.tracks.get_mut(t)
+    {
+        track.mute = !track.mute;
+    }
+    if let Some(t) = solo
+        && let Some(track) = arr.tracks.get_mut(t)
+    {
+        track.solo = !track.solo;
+    }
+    match intent.or(menu.get()) {
+        Some(SessionIntent::Launch(t, s)) => {
+            // Launching is an instrument, not a form: the swap happens on
+            // the press, not after the clip-edit debounce.
+            arr.force_recompile |= arr.session.launch(t, s);
+            arr.session.selected = Some((t, s));
+            arr.selected = Some(t);
+        }
+        Some(SessionIntent::Select(t, s)) => {
+            arr.session.selected = Some((t, s));
+            arr.selected = Some(t);
+        }
+        Some(SessionIntent::Create(t, s)) => {
+            arr.create_slot_clip(t, s, beats_per_bar as f32);
+            arr.selected = Some(t);
+        }
+        Some(SessionIntent::Clear(t, s)) => {
+            // Clearing a playing slot stops it, which the engine must hear
+            // now rather than at the next debounce.
+            arr.force_recompile |= arr.clear_slot(t, s);
+        }
+        Some(SessionIntent::StopTrack(t)) => {
+            arr.force_recompile |= arr.session.stop_track(t);
+        }
+        Some(SessionIntent::LaunchScene(s)) => {
+            arr.force_recompile |= arr.session.launch_scene(s);
+        }
+        Some(SessionIntent::StopAll) => {
+            arr.force_recompile |= arr.session.stop_all();
+        }
+        Some(SessionIntent::AddScene) => arr.add_scene(),
+        Some(SessionIntent::SelectTrack(t)) => arr.selected = Some(t),
+        None => {}
+    }
+}
+
+/// Highlight the slot a dragged audio file would drop into, and report it.
+///
+/// Audio tracks only, and only where the grid actually has a row: the
+/// launcher's slots are the one place an audio clip can be put that is not
+/// a position on the timeline.
+fn drop_slot(
+    ui: &egui::Ui,
+    theme: &Theme,
+    layout: &SessionLayout,
+    arr: &Arrangement,
+    drag: &DragImport,
+) -> Option<DropSpot> {
+    let pos = ui.ctx().pointer_latest_pos()?;
+    let hint = |text: &str, color: egui::Color32| {
+        ui.painter().text(
+            pos + egui::vec2(14.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            text,
+            egui::FontId::new(11.0, egui::FontFamily::Proportional),
+            color,
+        );
+    };
+    if !drag.accepted {
+        hint("WAV files only", theme.warn);
+        return None;
+    }
+    for track in 0..arr.tracks.len() {
+        for scene in 0..arr.session.scenes.len() {
+            let rect = layout.slot(track, scene);
+            if !rect.contains(pos) {
+                continue;
+            }
+            if arr.tracks[track].kind != TrackKind::Audio {
+                hint("audio tracks only", theme.text_muted);
+                return None;
+            }
+            let painter = ui.painter();
+            painter.rect_filled(rect, 3.0, theme.accent_muted.gamma_multiply(0.35));
+            painter.rect_stroke(
+                rect,
+                3.0,
+                egui::Stroke::new(1.5, theme.accent),
+                egui::StrokeKind::Middle,
+            );
+            if rect.width() > SLOT_LAUNCH_W + CLIP_LABEL_MIN_W {
+                painter.text(
+                    egui::pos2(rect.left() + SLOT_LAUNCH_W, rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    &drag.name,
+                    egui::FontId::proportional(HEADER_KIND_TYPE),
+                    theme.text,
+                );
+            }
+            return Some(DropSpot::Slot { track, scene });
+        }
+    }
+    None
+}
+
 /// The minimap: the whole arrangement mapped into one strip, every clip a
 /// minified bar on its lane's row, the loop region and playhead behind and
 /// through them, and the current view as a window on top.
@@ -3949,7 +4951,10 @@ fn drop_preview(
             theme.text,
         );
     }
-    Some(DropSpot { track, beat: at })
+    Some(match track {
+        Some(track) => DropSpot::Timeline { track, beat: at },
+        None => DropSpot::NewTrack { beat: at },
+    })
 }
 
 /// What the clip context menu asked for.
@@ -5365,6 +6370,19 @@ enum ClipEditorKind {
 }
 
 fn clip_editor_kind(arrangement: &Arrangement) -> ClipEditorKind {
+    // In the launcher the editor follows the SELECTED SLOT, so a slot on an
+    // instrument track opens the roll whether or not the timeline has a
+    // clip selected. A slot on an audio track has no editor yet — the
+    // waveform editor is a view over a timeline placement.
+    if arrangement.main_view == MainView::Session {
+        return match arrangement.session.selected {
+            Some((track, _)) => match arrangement.tracks.get(track).map(|t| t.kind) {
+                Some(TrackKind::Midi) => ClipEditorKind::Midi,
+                _ => ClipEditorKind::Empty,
+            },
+            None => ClipEditorKind::Empty,
+        };
+    }
     match arrangement.active_track_kind() {
         Some(TrackKind::Midi) => ClipEditorKind::Midi,
         Some(TrackKind::Audio) => ClipEditorKind::Audio,
@@ -5765,6 +6783,16 @@ impl App {
             PaletteCommand::new("clip.duplicate", "clip", "duplicate clip").enabled(has_clip),
             PaletteCommand::new("clip.delete", "clip", "delete clip").enabled(has_clip),
             PaletteCommand::new("clip.loop", "clip", "loop the selection"),
+            // --- the main area's two faces -----------------------------
+            PaletteCommand::new(
+                "view.main",
+                "view",
+                match self.arrangement.main_view {
+                    MainView::Timeline => "session view",
+                    MainView::Session => "timeline view",
+                },
+            )
+            .hint("tab"),
             // --- history -----------------------------------------------
             PaletteCommand::new("edit.undo", "edit", "undo")
                 .hint("ctrl+Z")
@@ -5868,6 +6896,7 @@ impl App {
             }
             "clip.duplicate" => actions.push(UiAction::DuplicateClip),
             "clip.delete" => actions.push(UiAction::DeleteSelected),
+            "view.main" => actions.push(UiAction::ToggleMainView),
             "edit.undo" => actions.push(UiAction::Undo),
             "edit.redo" => actions.push(UiAction::Redo),
             "clip.loop" => actions.push(UiAction::LoopFromSelection),
@@ -6213,16 +7242,33 @@ impl App {
             .iter()
             .position(|(path, _)| *path == imported.original_path)
             .map(|i| self.pending_drop_spots.remove(i).1);
-        let track = match spot.map(|spot| spot.track) {
+        let audio_track = |arrangement: &Arrangement, track: usize| {
+            arrangement
+                .tracks
+                .get(track)
+                .is_some_and(|track| track.kind == TrackKind::Audio)
+        };
+        // A slot aim is answered whole, here: it has no beat and no lane to
+        // fall back to, and a slot that went away while the import ran is a
+        // drop with nowhere to land rather than one to redirect.
+        if let Some(DropSpot::Slot { track, scene }) = spot {
+            let placed = audio_track(&self.arrangement, track)
+                && self.place_sample_in_slot(track, scene, &imported);
+            self.notice = Some(if placed {
+                format!(
+                    "{} is in slot {}",
+                    imported.original_path.display(),
+                    scene + 1
+                )
+            } else {
+                format!("could not place {}", imported.original_path.display())
+            });
+            return;
+        }
+        let track = match spot {
             // Aimed below the lanes: the drop asked for a lane of its own.
-            Some(None) => self.arrangement.add_track(TrackKind::Audio),
-            Some(Some(track))
-                if self
-                    .arrangement
-                    .tracks
-                    .get(track)
-                    .is_some_and(|track| track.kind == TrackKind::Audio) =>
-            {
+            Some(DropSpot::NewTrack { .. }) => self.arrangement.add_track(TrackKind::Audio),
+            Some(DropSpot::Timeline { track, .. }) if audio_track(&self.arrangement, track) => {
                 track
             }
             // No aim — or the aimed lane vanished while the import ran:
@@ -6230,21 +7276,18 @@ impl App {
             _ => self
                 .arrangement
                 .selected
-                .filter(|&track| {
-                    self.arrangement
-                        .tracks
-                        .get(track)
-                        .is_some_and(|track| track.kind == TrackKind::Audio)
-                })
+                .filter(|&track| audio_track(&self.arrangement, track))
                 .unwrap_or_else(|| self.arrangement.add_track(TrackKind::Audio)),
         };
         let playhead = (self.transport.position * self.transport.bpm / 60.0) as f32;
-        let at = spot.map(|spot| spot.beat).unwrap_or_else(|| {
-            self.arrangement
+        let at = match spot {
+            Some(DropSpot::Timeline { beat, .. } | DropSpot::NewTrack { beat }) => beat,
+            _ => self
+                .arrangement
                 .cursor
                 .filter(|(cursor_track, _)| *cursor_track == track)
-                .map_or(playhead, |(_, beat)| beat)
-        });
+                .map_or(playhead, |(_, beat)| beat),
+        };
         let at = snap(at, self.arrangement.grid_beats());
         let name = imported
             .original_path
@@ -6281,6 +7324,54 @@ impl App {
         }
     }
 
+    /// Put an imported file in a session slot. Length is the file's own
+    /// duration in musical time at the current tempo, exactly like a
+    /// timeline placement — a slot's clip is an ordinary clip that happens
+    /// to have no position.
+    fn place_sample_in_slot(&mut self, track: usize, scene: usize, imported: &ImportedWav) -> bool {
+        if imported.sample_rate == 0 || imported.frames == 0 {
+            return false;
+        }
+        let seconds = imported.frames as f64 / f64::from(imported.sample_rate);
+        let len = (seconds * self.transport.bpm / 60.0) as f32;
+        if !len.is_finite() || len <= 0.0 {
+            return false;
+        }
+        let id = self.arrangement.next_id();
+        let Some(slot) = self
+            .arrangement
+            .session
+            .slots
+            .get_mut(track)
+            .and_then(|column| column.get_mut(scene))
+        else {
+            return false;
+        };
+        *slot = Some(Clip {
+            id,
+            name: imported
+                .original_path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or("audio")
+                .to_owned(),
+            start: 0.0,
+            len,
+            notes: Vec::new(),
+            audio: Some(AudioSource {
+                path: imported.path.clone(),
+                sample_rate: imported.sample_rate,
+                source_offset: 0,
+                source_frames: imported.frames,
+                gain: 1.0,
+                looped: false,
+            }),
+        });
+        self.arrangement.session.selected = Some((track, scene));
+        self.arrangement.selected = Some(track);
+        true
+    }
+
     /// Reconcile the selected audio clip with the green-zone peak cache.
     /// One path is requested once; duplicated clips reuse the same Arc.
     fn pump_waveforms(&mut self) {
@@ -6303,7 +7394,15 @@ impl App {
         // Arrangement thumbnails need every placed source, not only the
         // selected editor target. A duplicated path is inserted into
         // `waveform_pending` once and shares the finished Arc everywhere.
-        for clip in self.arrangement.clips.iter().flatten() {
+        // Every placed source, wherever it is placed: the launcher's slots
+        // draw the same thumbnails the timeline's clips do.
+        let placed = self
+            .arrangement
+            .clips
+            .iter()
+            .flatten()
+            .chain(self.arrangement.session.slots.iter().flatten().flatten());
+        for clip in placed {
             let Some(path) = clip.audio.as_ref().map(|audio| &audio.path) else {
                 continue;
             };
@@ -6355,9 +7454,13 @@ impl App {
             return;
         };
         let loop_len = self.loop_len_beats();
+        // What plays, not what is drawn: a launched session clip overrides
+        // its track's timeline. `compiled_clips` stores the same thing, so
+        // the dirty check compares like with like.
+        let playing = self.arrangement.effective_clips();
         let (spec, nodes) = build_graph_spec(
             &self.arrangement.tracks,
-            &self.arrangement.clips,
+            &playing,
             loop_len,
             self.transport.metronome,
         );
@@ -6375,7 +7478,7 @@ impl App {
                         // nothing survives a swap sitting at the node's
                         // compiled-in default while the knob says otherwise.
                         self.sent_pan.clear();
-                        self.compiled_clips = self.arrangement.clips.clone();
+                        self.compiled_clips = playing;
                         self.graph_key = (
                             self.transport.metronome,
                             loop_len,
@@ -6488,14 +7591,13 @@ impl App {
 
         self.sync_pans();
 
-        // A reorder swaps NOW, and unconditionally. Two lanes can trade
-        // places without changing the graph's shape or any clip — same
-        // kinds, same devices, same (or no) clips — so neither check below
-        // would fire, while `seq_ids`, `fx_ids`, `pan_ids` and `sent_pan`
-        // are all indexed by a track number that just moved. Recompiling
-        // re-captures every id and clears `sent_pan`, which is the only way
-        // back into step.
-        if std::mem::take(&mut self.arrangement.tracks_reordered) {
+        // The edits that cannot wait, and cannot be inferred: a reorder
+        // (which renumbers the ids and pans the app holds by index, while
+        // two lanes can trade places without changing shape or clips) and
+        // a session launch (where waiting out the debounce would make the
+        // grid feel broken). Recompiling re-captures every id and clears
+        // `sent_pan`, which is the only way back into step.
+        if std::mem::take(&mut self.arrangement.force_recompile) {
             self.push_graph();
             return;
         }
@@ -6522,7 +7624,10 @@ impl App {
         // that have already landed, and a swap purely for a knob turn would
         // cut sounding voices. `push_graph` reads the tracks' current values,
         // so the next swap for any other reason bakes them in.
-        if recompile_due(self.arrangement.clips != self.compiled_clips, since) {
+        if recompile_due(
+            self.arrangement.effective_clips() != self.compiled_clips,
+            since,
+        ) {
             self.push_graph();
         }
     }
@@ -6746,9 +7851,17 @@ impl eframe::App for App {
                     // Point the roll at the selected clip BEFORE any key
                     // reaches it: an index from the previously shown clip
                     // must never survive into an edit on this one.
-                    self.piano_roll
-                        .follow_clip(self.arrangement.active_clip_id());
-                    let notes = self.arrangement.active_clip().map(|c| &mut c.notes);
+                    let (id, notes) = match self.arrangement.main_view {
+                        MainView::Session => (
+                            self.arrangement.active_slot_clip_id(),
+                            self.arrangement.active_slot_clip().map(|c| &mut c.notes),
+                        ),
+                        MainView::Timeline => (
+                            self.arrangement.active_clip_id(),
+                            self.arrangement.active_clip().map(|c| &mut c.notes),
+                        ),
+                    };
+                    self.piano_roll.follow_clip(id);
                     piano_roll::keys(ui.ctx(), &mut self.piano_roll, notes);
                     self.waveform.owns_keys = false;
                 }
@@ -6861,15 +7974,11 @@ impl eframe::App for App {
                         .frame(sunken)
                         .show(ui, |ui| {
                             let key = arrangement.key;
-                            piano_roll::body(
-                                ui,
-                                focus,
-                                t,
-                                piano_roll,
-                                beats_per_bar,
-                                arrangement.active_clip(),
-                                key,
-                            )
+                            let clip = match arrangement.main_view {
+                                MainView::Session => arrangement.active_slot_clip(),
+                                MainView::Timeline => arrangement.active_clip(),
+                            };
+                            piano_roll::body(ui, focus, t, piano_roll, beats_per_bar, clip, key)
                         })
                         .response
                         .rect;
@@ -6962,8 +8071,8 @@ impl eframe::App for App {
 
         let panned = egui::CentralPanel::default()
             .frame(self.fill(t.bg))
-            .show(ui, |ui| {
-                arrangement_body(
+            .show(ui, |ui| match self.arrangement.main_view {
+                MainView::Timeline => arrangement_body(
                     ui,
                     &mut self.focus,
                     &self.theme,
@@ -6971,7 +8080,21 @@ impl eframe::App for App {
                     arrangement_transport,
                     &self.waveform_cache,
                     self.drag_import.as_mut(),
-                )
+                ),
+                MainView::Session => {
+                    session_body(
+                        ui,
+                        &mut self.focus,
+                        &self.theme,
+                        &mut self.arrangement,
+                        self.transport.beats_per_bar,
+                        &self.waveform_cache,
+                        self.drag_import.as_mut(),
+                    );
+                    // The launcher has no view to pan: nothing here can
+                    // take the wheel from follow.
+                    false
+                }
             })
             .inner;
 
@@ -9034,8 +10157,8 @@ mod tests {
         arrangement_drag_pass(&ctx, &mut arr, vec![Event::PointerMoved(over)], &mut drag);
         assert_eq!(
             drag.spot,
-            Some(DropSpot {
-                track: Some(audio),
+            Some(DropSpot::Timeline {
+                track: audio,
                 beat: 2.0
             })
         );
@@ -9043,7 +10166,11 @@ mod tests {
         // Beat 2.7 rounds up, not down.
         let over = pos2(TL + 2.7 * PX_PER_BEAT, audio_y);
         arrangement_drag_pass(&ctx, &mut arr, vec![Event::PointerMoved(over)], &mut drag);
-        assert_eq!(drag.spot.map(|spot| spot.beat), Some(3.0));
+        assert!(
+            matches!(drag.spot, Some(DropSpot::Timeline { beat, .. }) if beat == 3.0),
+            "2.7 rounds up, not down: {:?}",
+            drag.spot
+        );
 
         // A MIDI lane refuses: no spot, so a release there places nothing.
         let midi = pos2(TL + 2.3 * PX_PER_BEAT, LANES_TOP + TRACK_H * 0.5);
@@ -9054,13 +10181,7 @@ mod tests {
         let lanes_bottom = LANES_TOP + arr.tracks.iter().map(|t| t.height).sum::<f32>();
         let below = pos2(TL + 4.1 * PX_PER_BEAT, lanes_bottom + 100.0);
         arrangement_drag_pass(&ctx, &mut arr, vec![Event::PointerMoved(below)], &mut drag);
-        assert_eq!(
-            drag.spot,
-            Some(DropSpot {
-                track: None,
-                beat: 4.0
-            })
-        );
+        assert_eq!(drag.spot, Some(DropSpot::NewTrack { beat: 4.0 }));
 
         // A file the importer will refuse is previewed as refused.
         drag.accepted = false;
@@ -9441,6 +10562,403 @@ mod tests {
         }
     }
 
+    /// Run one headless pass over the session grid, the way
+    /// `arrangement_pass` does for the timeline.
+    fn session_pass(ctx: &egui::Context, arr: &mut Arrangement, events: Vec<Event>) {
+        let mut out = ctx.run_ui(input(events), |ui| {
+            let theme = Theme::dark();
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(theme.bg))
+                .show(ui, |ui| {
+                    session_body(
+                        ui,
+                        &mut Focus::default(),
+                        &theme,
+                        arr,
+                        4,
+                        &HashMap::new(),
+                        None,
+                    );
+                });
+        });
+        out.textures_delta.clear();
+    }
+
+    /// A file dragged over the launcher aims at the slot under it — audio
+    /// tracks only. This is the only way an audio clip reaches a slot, so
+    /// without it half the grid would be unfillable.
+    #[test]
+    fn a_file_drag_aims_at_the_slot_under_it() {
+        let ctx = egui::Context::default();
+        let mut arr = Arrangement::default();
+        let audio = arr.add_track(TrackKind::Audio);
+        let mut drag = DragImport {
+            path: "/tmp/kick.wav".into(),
+            name: "kick".into(),
+            header: Some((48_000, 48_000)),
+            accepted: true,
+            spot: None,
+        };
+        let drag_pass = |ctx: &egui::Context, arr: &mut Arrangement, drag: &mut DragImport, pos| {
+            let mut out = ctx.run_ui(input(vec![Event::PointerMoved(pos)]), |ui| {
+                let theme = Theme::dark();
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::new().fill(theme.bg))
+                    .show(ui, |ui| {
+                        session_body(
+                            ui,
+                            &mut Focus::default(),
+                            &theme,
+                            arr,
+                            4,
+                            &HashMap::new(),
+                            Some(drag),
+                        );
+                    });
+            });
+            out.textures_delta.clear();
+        };
+
+        let layout = SessionLayout::new(
+            Rect::from_min_size(pos2(0.0, 0.0), SCREEN),
+            arr.tracks.len(),
+            arr.session.scenes.len(),
+        );
+        drag_pass(&ctx, &mut arr, &mut drag, layout.slot(audio, 3).center());
+        assert_eq!(
+            drag.spot,
+            Some(DropSpot::Slot {
+                track: audio,
+                scene: 3
+            })
+        );
+
+        // A MIDI column refuses: a slot there needs notes, not a file.
+        drag_pass(&ctx, &mut arr, &mut drag, layout.slot(0, 3).center());
+        assert_eq!(drag.spot, None);
+
+        // And so does a file the importer would refuse.
+        drag.accepted = false;
+        drag_pass(&ctx, &mut arr, &mut drag, layout.slot(audio, 3).center());
+        assert_eq!(drag.spot, None);
+    }
+
+    /// Tab flips the main area, and does not disturb Shift+Tab's meaning.
+    #[test]
+    fn tab_flips_the_main_area() {
+        let ctx = egui::Context::default();
+        let mut actions = Vec::new();
+        let mut out = ctx.run_ui(
+            input(vec![Event::Key {
+                key: egui::Key::Tab,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }]),
+            |_ui| {},
+        );
+        out.textures_delta.clear();
+        arrangement_keys(&ctx, &Arrangement::default(), &mut actions);
+        assert_eq!(actions, vec![UiAction::ToggleMainView]);
+
+        // And the verb itself flips, both ways.
+        let mut arr = Arrangement::default();
+        let mut transport = Transport::default();
+        assert_eq!(arr.main_view, MainView::Timeline);
+        perform(&actions, &mut transport, &mut arr);
+        assert_eq!(arr.main_view, MainView::Session);
+        perform(&actions, &mut transport, &mut arr);
+        assert_eq!(arr.main_view, MainView::Timeline);
+    }
+
+    /// The grid's two halves: a slot's triangle launches it, and the rest
+    /// of the slot selects it without starting anything. Run through the
+    /// real widgets, from the real layout's rects.
+    #[test]
+    fn a_slot_launches_from_its_triangle_and_selects_from_its_body() {
+        let ctx = egui::Context::default();
+        let mut arr = Arrangement::default();
+        assert!(arr.create_slot_clip(0, 1, 4.0));
+        arr.session.selected = None;
+        session_pass(&ctx, &mut arr, vec![]);
+
+        let layout = SessionLayout::new(
+            Rect::from_min_size(pos2(0.0, 0.0), SCREEN),
+            arr.tracks.len(),
+            arr.session.scenes.len(),
+        );
+        let slot = layout.slot(0, 1);
+        let click = |ctx: &egui::Context, arr: &mut Arrangement, pos: egui::Pos2| {
+            session_pass(
+                ctx,
+                arr,
+                vec![
+                    Event::PointerMoved(pos),
+                    Event::PointerButton {
+                        pos,
+                        button: PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Default::default(),
+                    },
+                    Event::PointerButton {
+                        pos,
+                        button: PointerButton::Primary,
+                        pressed: false,
+                        modifiers: Default::default(),
+                    },
+                ],
+            );
+        };
+
+        // The body: selects, launches nothing.
+        click(&ctx, &mut arr, slot.center());
+        assert_eq!(arr.session.selected, Some((0, 1)));
+        assert_eq!(arr.session.playing[0], None, "the body does not launch");
+        assert!(!arr.force_recompile);
+
+        // The triangle: launches.
+        let triangle = pos2(slot.left() + SLOT_LAUNCH_W * 0.5, slot.center().y);
+        click(&ctx, &mut arr, triangle);
+        assert_eq!(arr.session.playing[0], Some(1), "the triangle launched it");
+        assert!(
+            arr.force_recompile,
+            "and asked for the swap on the press, not after the debounce"
+        );
+
+        // The stop button under the column hands the track back.
+        arr.force_recompile = false;
+        click(&ctx, &mut arr, layout.stop(0).center());
+        assert_eq!(arr.session.playing[0], None);
+        assert!(arr.force_recompile);
+    }
+
+    /// The scene column launches a whole row, and "+ scene" grows the grid
+    /// without disturbing what is in it.
+    #[test]
+    fn the_scene_column_launches_a_row_and_grows_the_grid() {
+        let ctx = egui::Context::default();
+        let mut arr = Arrangement::default();
+        assert!(arr.create_slot_clip(0, 0, 4.0));
+        assert!(arr.create_slot_clip(2, 0, 4.0));
+        session_pass(&ctx, &mut arr, vec![]);
+
+        let layout = SessionLayout::new(
+            Rect::from_min_size(pos2(0.0, 0.0), SCREEN),
+            arr.tracks.len(),
+            arr.session.scenes.len(),
+        );
+        let click = |ctx: &egui::Context, arr: &mut Arrangement, pos: egui::Pos2| {
+            session_pass(
+                ctx,
+                arr,
+                vec![
+                    Event::PointerMoved(pos),
+                    Event::PointerButton {
+                        pos,
+                        button: PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Default::default(),
+                    },
+                    Event::PointerButton {
+                        pos,
+                        button: PointerButton::Primary,
+                        pressed: false,
+                        modifiers: Default::default(),
+                    },
+                ],
+            );
+        };
+
+        click(&ctx, &mut arr, layout.scene(0).center());
+        assert_eq!(arr.session.playing[0], Some(0));
+        assert_eq!(arr.session.playing[2], Some(0));
+        assert_eq!(arr.session.playing[1], None, "row 0 is empty on lane 1");
+
+        let scenes = arr.session.scenes.len();
+        click(&ctx, &mut arr, layout.add_scene().center());
+        assert_eq!(arr.session.scenes.len(), scenes + 1);
+        assert!(
+            arr.session.slots.iter().all(|c| c.len() == scenes + 1),
+            "every column grew a row"
+        );
+        assert!(arr.session.slot(0, 0).is_some(), "and kept what it had");
+
+        click(&ctx, &mut arr, layout.stop_all().center());
+        assert!(arr.session.playing.iter().all(Option::is_none));
+    }
+
+    /// Launching is per track: a launched clip overrides that track's
+    /// timeline and nothing else's, and stopping hands the track straight
+    /// back to it. An empty slot stops rather than launching, which is what
+    /// makes a scene launch across a row with holes do the obvious thing.
+    #[test]
+    fn a_launched_slot_overrides_only_its_own_track() {
+        let mut arr = Arrangement::default();
+        // Timeline content on lanes 0 and 1, a session clip on lane 0.
+        arr.create_clip(0, 12.0, 4.0).unwrap();
+        arr.create_clip(1, 20.0, 4.0).unwrap();
+        assert!(arr.create_slot_clip(0, 2, 4.0));
+
+        // Nothing launched: the timeline plays, untouched.
+        let idle = arr.effective_clips();
+        assert_eq!(idle[0].len(), 1);
+        assert_eq!(idle[0][0].start, 12.0);
+
+        assert!(arr.session.launch(0, 2));
+        let playing = arr.effective_clips();
+        assert!(
+            playing[0].len() > 1,
+            "the launched clip is repeated over the horizon"
+        );
+        assert_eq!(playing[0][0].start, 0.0, "it plays from the launch, not 12");
+        assert_eq!(playing[0][1].start, 4.0, "and repeats a clip-length later");
+        assert!(
+            playing[0]
+                .last()
+                .is_some_and(|c| c.start + c.len >= SESSION_HORIZON_BEATS),
+            "the repeats reach the horizon"
+        );
+        assert_eq!(
+            playing[1], idle[1],
+            "the other track still plays its timeline"
+        );
+
+        // Stopping hands the track back.
+        assert!(arr.session.stop_track(0));
+        assert_eq!(arr.effective_clips(), idle);
+
+        // An empty slot stops instead of launching.
+        assert!(arr.session.launch(0, 2));
+        assert!(arr.session.launch(0, 5), "an empty slot is a stop");
+        assert_eq!(arr.session.playing[0], None);
+        assert_eq!(arr.effective_clips(), idle);
+    }
+
+    /// An audio slot loops INSIDE one node rather than being repeated: a
+    /// repeat per bar would be one disk stream per bar.
+    #[test]
+    fn a_launched_audio_slot_loops_in_one_node() {
+        let mut arr = Arrangement::default();
+        let track = arr.add_track(TrackKind::Audio);
+        arr.session.slots[track][0] = Some(Clip {
+            id: 1,
+            name: "loop".into(),
+            start: 0.0,
+            len: 4.0,
+            notes: Vec::new(),
+            audio: Some(AudioSource {
+                path: "/tmp/loop.wav".into(),
+                sample_rate: 48_000,
+                source_offset: 0,
+                source_frames: 96_000,
+                gain: 1.0,
+                looped: false,
+            }),
+        });
+        assert!(arr.session.launch(track, 0));
+
+        let playing = arr.effective_clips();
+        assert_eq!(playing[track].len(), 1, "one node, not one per repeat");
+        assert_eq!(playing[track][0].len, SESSION_HORIZON_BEATS);
+        assert!(
+            playing[track][0].audio.as_ref().is_some_and(|a| a.looped),
+            "it loops rather than playing once and stopping"
+        );
+    }
+
+    /// A scene is the state of every track, not only of the ones it fills.
+    #[test]
+    fn launching_a_scene_stops_the_tracks_it_does_not_fill() {
+        let mut arr = Arrangement::default();
+        assert!(arr.create_slot_clip(0, 0, 4.0));
+        assert!(arr.create_slot_clip(1, 1, 4.0));
+
+        arr.session.launch_scene(0);
+        assert_eq!(arr.session.playing[0], Some(0));
+        assert_eq!(arr.session.playing[1], None, "lane 1 has nothing in row 0");
+
+        arr.session.launch_scene(1);
+        assert_eq!(arr.session.playing[0], None, "lane 0 has nothing in row 1");
+        assert_eq!(arr.session.playing[1], Some(1));
+
+        arr.session.launch_scene(0);
+        assert!(arr.session.stop_all());
+        assert!(arr.session.playing.iter().all(Option::is_none));
+    }
+
+    /// Emptying a slot that is playing stops it: a track left "playing"
+    /// something that is no longer there would be a lie the transport
+    /// keeps telling.
+    #[test]
+    fn clearing_a_playing_slot_stops_the_track() {
+        let mut arr = Arrangement::default();
+        assert!(arr.create_slot_clip(2, 3, 4.0));
+        assert!(arr.session.launch(2, 3));
+        assert_eq!(arr.session.selected, Some((2, 3)));
+
+        assert!(arr.clear_slot(2, 3));
+        assert_eq!(arr.session.playing[2], None);
+        assert_eq!(arr.session.selected, None);
+        assert!(!arr.clear_slot(2, 3), "a second clear is a clean no-op");
+
+        // Audio tracks refuse an empty clip: a slot there needs a file.
+        let audio = arr.add_track(TrackKind::Audio);
+        assert!(!arr.create_slot_clip(audio, 0, 4.0));
+    }
+
+    /// The grid is parallel to the tracks, exactly like the clips: every
+    /// track operation maintains all of them or the columns misaddress.
+    #[test]
+    fn the_session_grid_follows_its_tracks() {
+        let mut arr = Arrangement::default();
+        assert!(arr.create_slot_clip(0, 0, 4.0));
+        let id = arr.session.slot(0, 0).unwrap().id;
+        assert!(arr.session.launch(0, 0));
+
+        // A new track brings a column with it.
+        let added = arr.add_track(TrackKind::Midi);
+        assert_eq!(arr.session.slots.len(), arr.tracks.len());
+        assert_eq!(arr.session.playing.len(), arr.tracks.len());
+        assert!(arr.session.slots[added].iter().all(Option::is_none));
+
+        // A reorder carries the column AND what it is playing.
+        assert!(arr.move_track(0, 2));
+        assert_eq!(arr.session.slot(2, 0).map(|c| c.id), Some(id));
+        assert_eq!(arr.session.playing[2], Some(0), "still playing, new index");
+        assert!(arr.session.slot(0, 0).is_none());
+
+        // And a removal takes the column with it.
+        assert!(arr.remove_track(2));
+        assert_eq!(arr.session.slots.len(), arr.tracks.len());
+        assert_eq!(arr.session.playing.len(), arr.tracks.len());
+        assert!(
+            arr.session.slots.iter().flatten().all(Option::is_none),
+            "the only slot clip went with its track"
+        );
+    }
+
+    /// Slots are content, so they undo. What is PLAYING is not — but it
+    /// must still be made to fit a grid the undo changed under it.
+    #[test]
+    fn undo_reaches_the_session_grid() {
+        let mut arr = Arrangement::default();
+        let mut history = History::new(&arr);
+        assert!(arr.create_slot_clip(1, 2, 4.0));
+        history.sync(&arr, true);
+        assert!(arr.session.launch(1, 2));
+
+        assert!(history.undo(&mut arr));
+        assert!(arr.session.slot(1, 2).is_none(), "the slot is empty again");
+        assert_eq!(
+            arr.session.playing[1], None,
+            "and the track is not left playing what is no longer there"
+        );
+
+        assert!(history.redo(&mut arr));
+        assert!(arr.session.slot(1, 2).is_some(), "redo brings it back");
+    }
+
     /// A reorder carries the lane's clips with it, shifts everything
     /// between the two ends by one, and keeps every mark pointing at the
     /// lane the user meant rather than at the index it used to occupy.
@@ -9463,7 +10981,7 @@ mod tests {
         assert_eq!(arr.selected, Some(3), "the selection followed its lane");
         assert_eq!(arr.selected_clip, Some((3, 0)));
         assert_eq!(arr.cursor, Some((1, 4.0)), "a lane between shifted up");
-        assert!(arr.tracks_reordered, "the app is told the indices moved");
+        assert!(arr.force_recompile, "the app is told the indices moved");
 
         // And back up: the arrangement returns to where it started.
         assert!(arr.move_track(3, 0));
@@ -9473,13 +10991,13 @@ mod tests {
         assert_eq!(arr.cursor, Some((2, 4.0)));
 
         // Nothing to do is not a move: the flag stays where it was.
-        arr.tracks_reordered = false;
+        arr.force_recompile = false;
         assert!(!arr.move_track(1, 1));
         assert!(
             !arr.move_track(9, 0),
             "out of range is refused, not clamped"
         );
-        assert!(!arr.tracks_reordered);
+        assert!(!arr.force_recompile);
     }
 
     /// The palette's route: nudging clamps at the ends instead of wrapping
@@ -9607,7 +11125,7 @@ mod tests {
 
         // And the stack never moved through any of it.
         assert_eq!(arr.tracks.len(), TRACK_COUNT);
-        assert!(!arr.tracks_reordered);
+        assert!(!arr.force_recompile);
     }
 
     /// The name row keeps its double-click through the draggable body: a
