@@ -2074,6 +2074,11 @@ struct Arrangement {
     /// like `view_beats` is for the timeline — and outside undo for the
     /// same reason: where you are looking is not what the song is.
     session_scroll: f32,
+    /// How far the launcher's ROWS are scrolled, in pixels. Same nature.
+    session_scroll_y: f32,
+    /// The mixer section's height. View state too: dragging the seam is
+    /// arranging the workspace, not editing the song.
+    session_mixer_h: f32,
     /// The header drag, while one is in flight.
     track_drag: Option<TrackDrag>,
     /// "Recompile NOW, and do not wait for the dirty check to agree."
@@ -2271,6 +2276,8 @@ impl Default for Arrangement {
             main_view: MainView::default(),
             session: Session::new(TRACK_COUNT),
             session_scroll: 0.0,
+            session_scroll_y: 0.0,
+            session_mixer_h: SESSION_MIXER_H,
             track_drag: None,
             force_recompile: false,
         }
@@ -4016,6 +4023,11 @@ const SESSION_MIXER_H: f32 = 128.0;
 const ASSEMBLY_W: f32 = 26.0;
 /// The latched clip lamp above the assembly, clicked to clear.
 const CLIP_LAMP_H: f32 = 5.0;
+/// The mixer section's height range: enough for the buttons alone at the
+/// bottom end, a long-throw fader at the top.
+const SESSION_MIXER_H_RANGE: std::ops::RangeInclusive<f32> = 56.0..=280.0;
+/// The draggable seam on the mixer section's top edge.
+const MIXER_SEAM_H: f32 = 5.0;
 /// The horizontal scrollbar under the columns, shown only when the grid is
 /// wider than the window.
 const SESSION_BAR_H: f32 = 7.0;
@@ -4034,11 +4046,22 @@ struct SessionLayout {
     /// How far the columns are scrolled left, in pixels. Every column rect
     /// is shifted by it, so the hit tests scroll with the paint.
     scroll: f32,
+    /// How far the rows are scrolled up, in pixels. Same contract.
+    scroll_y: f32,
+    /// The mixer section's height, from the seam the user drags.
+    mixer_h: f32,
     tracks: usize,
 }
 
 impl SessionLayout {
-    fn new(area: egui::Rect, tracks: usize, scenes: usize, scroll: f32) -> Self {
+    fn new(
+        area: egui::Rect,
+        tracks: usize,
+        scenes: usize,
+        scroll: f32,
+        scroll_y: f32,
+        mixer_h: f32,
+    ) -> Self {
         let lanes_w = (area.width() - SCENE_COL_W).max(0.0);
         // Columns spread to fill the space they have, but never below a
         // width a clip name can live in: past that they keep their size and
@@ -4048,18 +4071,63 @@ impl SessionLayout {
         } else {
             (lanes_w / tracks as f32).clamp(SESSION_COL_MIN, SESSION_COL_MAX)
         };
+        // The mixer may take at most half the area: a seam dragged to the
+        // ceiling must not leave the grid without a grid.
+        let mixer_cap = (area.height() * 0.5).max(*SESSION_MIXER_H_RANGE.start());
         let mut layout = Self {
             area,
             column_w,
             scenes,
             rows_top: area.top() + SESSION_HEAD_H,
             scroll: 0.0,
+            scroll_y: 0.0,
+            mixer_h: mixer_h.clamp(*SESSION_MIXER_H_RANGE.start(), mixer_cap),
             tracks,
         };
-        // Clamped on construction, so no caller can hold a scroll position
-        // that points past the end — including after a track is deleted.
+        // Clamped on construction, so no caller can hold a position that
+        // points past the end — including after a track or scene is
+        // deleted, or the window resized.
         layout.scroll = scroll.clamp(0.0, layout.max_scroll());
+        layout.scroll_y = scroll_y.clamp(0.0, layout.max_scroll_y());
         layout
+    }
+
+    /// The strip the slot ROWS live in: under the headers, above the
+    /// mixer, left of the scene column. What vertical scrolling scrolls,
+    /// and what row drawing clips to.
+    fn rows_viewport(&self) -> egui::Rect {
+        egui::Rect::from_min_max(
+            egui::pos2(self.area.left(), self.rows_top),
+            egui::pos2(
+                self.area.right() - SCENE_COL_W,
+                self.mixer_top().max(self.rows_top),
+            ),
+        )
+    }
+
+    /// Where the mixer section begins — also where the seam lives.
+    fn mixer_top(&self) -> f32 {
+        self.area.bottom() - SESSION_BAR_H - self.mixer_h
+    }
+
+    /// The draggable seam on the mixer's top edge, spanning the lanes.
+    fn mixer_seam(&self) -> egui::Rect {
+        egui::Rect::from_min_max(
+            egui::pos2(self.area.left(), self.mixer_top() - MIXER_SEAM_H * 0.5),
+            egui::pos2(
+                self.area.right() - SCENE_COL_W,
+                self.mixer_top() + MIXER_SEAM_H * 0.5,
+            ),
+        )
+    }
+
+    /// How far the rows can scroll: every row — the scenes, the stop row,
+    /// and the scene column's stop-all and add-scene rows — reachable
+    /// above the mixer. Zero when they already fit.
+    fn max_scroll_y(&self) -> f32 {
+        let rows = self.scenes + 2;
+        let content = rows as f32 * (SLOT_H + SLOT_GAP);
+        (content - self.rows_viewport().height()).max(0.0)
     }
 
     /// The strip the columns live in: everything left of the scene column.
@@ -4097,7 +4165,7 @@ impl SessionLayout {
     }
 
     fn row_y(&self, scene: usize) -> f32 {
-        self.rows_top + scene as f32 * (SLOT_H + SLOT_GAP)
+        self.rows_top - self.scroll_y + scene as f32 * (SLOT_H + SLOT_GAP)
     }
 
     fn slot(&self, track: usize, scene: usize) -> egui::Rect {
@@ -4123,10 +4191,9 @@ impl SessionLayout {
     /// grid: the strips stay put as scenes are added.
     fn mixer(&self, track: usize) -> egui::Rect {
         let column = self.column(track);
-        let bottom = self.area.bottom() - SESSION_BAR_H;
         egui::Rect::from_min_max(
-            egui::pos2(column.left(), bottom - SESSION_MIXER_H),
-            egui::pos2(column.right(), bottom),
+            egui::pos2(column.left(), self.mixer_top()),
+            egui::pos2(column.right(), self.area.bottom() - SESSION_BAR_H),
         )
     }
 
@@ -4497,36 +4564,73 @@ fn session_body(
     let area = ui.max_rect();
     claim(ui);
     ui.painter().rect_filled(area, 0.0, theme.bg);
-    // The wheel scrolls the columns. Both axes drive it, like the
-    // timeline's pan: a plain wheel is the one every mouse has, and a
-    // trackpad's horizontal swipe lands in the same place.
+    // The wheel: the vertical axis scrolls the ROWS when there are rows
+    // to scroll, and falls back to the columns when there are not — so a
+    // plain mouse wheel always does something useful. The horizontal axis
+    // (a trackpad swipe, or shift+wheel, which egui folds into it) always
+    // drives the columns.
     let mut layout = SessionLayout::new(
         area,
         arr.tracks.len(),
         arr.session.scenes.len(),
         arr.session_scroll,
+        arr.session_scroll_y,
+        arr.session_mixer_h,
     );
     let wheel = ui.input(|i| i.smooth_scroll_delta);
-    let pan = wheel.x + wheel.y;
-    if pan != 0.0
+    if (wheel.x != 0.0 || wheel.y != 0.0)
         && ui.ui_contains_pointer()
         && ui
             .ctx()
             .pointer_latest_pos()
             .is_some_and(|p| layout.viewport().contains(p))
     {
-        arr.session_scroll = (arr.session_scroll - pan).clamp(0.0, layout.max_scroll());
+        let mut pan_x = wheel.x;
+        if layout.max_scroll_y() > 0.0 {
+            arr.session_scroll_y =
+                (arr.session_scroll_y - wheel.y).clamp(0.0, layout.max_scroll_y());
+        } else {
+            pan_x += wheel.y;
+        }
+        arr.session_scroll = (arr.session_scroll - pan_x).clamp(0.0, layout.max_scroll());
         layout = SessionLayout::new(
             area,
             arr.tracks.len(),
             arr.session.scenes.len(),
             arr.session_scroll,
+            arr.session_scroll_y,
+            arr.session_mixer_h,
         );
     }
-    // Whatever survived the clamp is the truth from here on — a stale
-    // position (a deleted track, a resized window) is corrected in the
-    // same frame it is noticed rather than one later.
+
+    // The seam on the mixer's top edge: drag to resize the section. The
+    // height is measured from the pointer absolutely, so it tracks the
+    // hand rather than accumulating deltas.
+    let seam = layout.mixer_seam();
+    let seam_id = ui.id().with("mixer_seam");
+    let seam_response = ui.interact(seam, seam_id, egui::Sense::drag());
+    if seam_response.hovered() || seam_response.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+    }
+    if seam_response.dragged()
+        && let Some(pos) = seam_response.interact_pointer_pos()
+    {
+        arr.session_mixer_h = area.bottom() - SESSION_BAR_H - pos.y;
+        layout = SessionLayout::new(
+            area,
+            arr.tracks.len(),
+            arr.session.scenes.len(),
+            arr.session_scroll,
+            arr.session_scroll_y,
+            arr.session_mixer_h,
+        );
+    }
+    // Whatever survived the clamps is the truth from here on — a stale
+    // position (a deleted track or scene, a resized window, a seam pulled
+    // past its range) is corrected the frame it is noticed, not one later.
     arr.session_scroll = layout.scroll;
+    arr.session_scroll_y = layout.scroll_y;
+    arr.session_mixer_h = layout.mixer_h;
     let mut intent: Option<SessionIntent> = None;
     let mut pan_edit: Option<(usize, f32)> = None;
     let mut mute: Option<usize> = None;
@@ -4580,10 +4684,20 @@ fn session_body(
         }
 
         // --- the slots ----------------------------------------------------
+        // Rows scroll, so a row can hang off either edge of the viewport.
+        // Its rect is truncated to the visible part — the paint and the
+        // hit test both live in the same truncated box, so a half-hidden
+        // slot neither draws over the mixer nor answers clicks from
+        // under it.
+        let rows_view = layout.rows_viewport();
         for scene in 0..arr.session.scenes.len() {
-            let rect = layout.slot(t, scene);
-            if rect.bottom() > layout.mixer(t).top() {
+            let full = layout.slot(t, scene);
+            if full.top() >= rows_view.bottom() {
                 break;
+            }
+            let rect = full.intersect(rows_view);
+            if rect.height() <= 1.0 || rect.width() <= 0.0 {
+                continue;
             }
             let clip = arr.session.slot(t, scene);
             let playing = arr.session.is_playing(t, scene);
@@ -4706,8 +4820,8 @@ fn session_body(
         }
 
         // --- the track's stop button --------------------------------------
-        let stop = layout.stop(t);
-        if stop.bottom() <= layout.mixer(t).top() {
+        let stop = layout.stop(t).intersect(layout.rows_viewport());
+        if stop.height() > 1.0 {
             let wid = ui.id().with(("session_stop", t));
             focus.register(wid, stop);
             let response = ui.interact(stop, wid, egui::Sense::click());
@@ -4845,6 +4959,17 @@ fn session_body(
         }
     }
 
+    // The seam's mark: quiet until pointed at, like the app's other seams.
+    if seam_response.hovered() || seam_response.dragged() {
+        ui.painter().line_segment(
+            [
+                egui::pos2(seam.left(), layout.mixer_top()),
+                egui::pos2(seam.right(), layout.mixer_top()),
+            ],
+            egui::Stroke::new(2.0, theme.accent),
+        );
+    }
+
     // --- the scene column -------------------------------------------------
     let scene_col = layout.scene_column();
     ui.painter()
@@ -4853,10 +4978,18 @@ fn session_body(
         [scene_col.left_top(), scene_col.left_bottom()],
         egui::Stroke::new(1.0, theme.divider),
     );
+    // The scene rows share the slots' scroll, and clip the same way — to
+    // their own column, which runs to the bottom (no mixer under it).
+    let scene_view =
+        egui::Rect::from_min_max(egui::pos2(scene_col.left(), layout.rows_top), scene_col.max);
     for (s, scene) in arr.session.scenes.iter().enumerate() {
-        let rect = layout.scene(s);
-        if rect.bottom() > scene_col.bottom() {
+        let full = layout.scene(s);
+        if full.top() >= scene_view.bottom() {
             break;
+        }
+        let rect = full.intersect(scene_view);
+        if rect.height() <= 1.0 {
+            continue;
         }
         let wid = ui.id().with(("scene", s));
         focus.register(wid, rect);
@@ -4885,8 +5018,8 @@ fn session_body(
         );
     }
 
-    let stop_all = layout.stop_all();
-    if stop_all.bottom() <= scene_col.bottom() {
+    let stop_all = layout.stop_all().intersect(scene_view);
+    if stop_all.height() > 1.0 {
         let wid = ui.id().with("session_stop_all");
         focus.register(wid, stop_all);
         let response = ui.interact(stop_all, wid, egui::Sense::click());
@@ -4914,8 +5047,8 @@ fn session_body(
         );
     }
 
-    let add = layout.add_scene();
-    if add.bottom() <= scene_col.bottom() {
+    let add = layout.add_scene().intersect(scene_view);
+    if add.height() > 1.0 {
         let wid = ui.id().with("session_add_scene");
         focus.register(wid, add);
         let response = ui.interact(add, wid, egui::Sense::click());
@@ -4975,6 +5108,8 @@ fn session_body(
             arr.tracks.len(),
             arr.session.scenes.len(),
             arr.session_scroll,
+            arr.session_scroll_y,
+            arr.session_mixer_h,
         );
         if let Some(thumb) = moved.thumb() {
             painter.rect_filled(
@@ -5082,6 +5217,11 @@ fn drop_slot(
     };
     if !drag.accepted {
         hint("WAV files only", theme.warn);
+        return None;
+    }
+    // Only slots actually on screen can be aimed at: the rows scroll, and
+    // a rect that extends under the mixer or the headers is not a target.
+    if !layout.rows_viewport().contains(pos) {
         return None;
     }
     for track in 0..arr.tracks.len() {
@@ -11148,6 +11288,8 @@ mod tests {
             arr.tracks.len(),
             arr.session.scenes.len(),
             0.0,
+            0.0,
+            SESSION_MIXER_H,
         );
         let slot = layout.slot(0, 0);
         let painted = out
@@ -11223,7 +11365,7 @@ mod tests {
 
         // Few tracks: everything fits, so there is nothing to scroll and no
         // scrollbar to show.
-        let roomy = SessionLayout::new(area, 3, 8, 0.0);
+        let roomy = SessionLayout::new(area, 3, 8, 0.0, 0.0, SESSION_MIXER_H);
         assert!(roomy.column_w > SESSION_COL_MIN);
         assert_eq!(roomy.max_scroll(), 0.0);
         assert!(
@@ -11232,7 +11374,7 @@ mod tests {
         );
 
         // Many tracks: the columns hold their minimum and the grid scrolls.
-        let packed = SessionLayout::new(area, 20, 8, 0.0);
+        let packed = SessionLayout::new(area, 20, 8, 0.0, 0.0, SESSION_MIXER_H);
         assert_eq!(packed.column_w, SESSION_COL_MIN);
         assert_eq!(packed.content_w(), 20.0 * SESSION_COL_MIN);
         assert!((packed.max_scroll() - (20.0 * SESSION_COL_MIN - viewport_w)).abs() < 0.01);
@@ -11244,18 +11386,21 @@ mod tests {
         );
 
         // Scrolling shifts every column left by exactly the scroll.
-        let scrolled = SessionLayout::new(area, 20, 8, 100.0);
+        let scrolled = SessionLayout::new(area, 20, 8, 100.0, 0.0, SESSION_MIXER_H);
         assert_eq!(scrolled.column(0).left(), area.left() - 100.0);
         assert_eq!(scrolled.slot(5, 2).left(), packed.slot(5, 2).left() - 100.0);
 
         // And it cannot run past the end, or before the start.
-        let over = SessionLayout::new(area, 20, 8, 99_999.0);
+        let over = SessionLayout::new(area, 20, 8, 99_999.0, 0.0, SESSION_MIXER_H);
         assert_eq!(over.scroll, over.max_scroll());
         assert!(
             (over.column(19).right() - over.viewport().right()).abs() < 0.01,
             "the last column ends exactly at the scene column"
         );
-        assert_eq!(SessionLayout::new(area, 20, 8, -50.0).scroll, 0.0);
+        assert_eq!(
+            SessionLayout::new(area, 20, 8, -50.0, 0.0, SESSION_MIXER_H).scroll,
+            0.0
+        );
     }
 
     /// The wheel scrolls the grid, and the hit tests scroll with it: a slot
@@ -11274,7 +11419,14 @@ mod tests {
         assert_eq!(arr.session_scroll, 0.0);
 
         let area = Rect::from_min_size(pos2(0.0, 0.0), SCREEN);
-        let unscrolled = SessionLayout::new(area, arr.tracks.len(), arr.session.scenes.len(), 0.0);
+        let unscrolled = SessionLayout::new(
+            area,
+            arr.tracks.len(),
+            arr.session.scenes.len(),
+            0.0,
+            0.0,
+            SESSION_MIXER_H,
+        );
         assert!(unscrolled.max_scroll() > 0.0, "the grid overflows");
 
         // A wheel scroll over the grid moves the columns.
@@ -11303,7 +11455,14 @@ mod tests {
 
         // Track 12's slot now sits somewhere new — and clicking it there
         // launches it, which is the whole point of the hit tests moving.
-        let layout = SessionLayout::new(area, arr.tracks.len(), arr.session.scenes.len(), scroll);
+        let layout = SessionLayout::new(
+            area,
+            arr.tracks.len(),
+            arr.session.scenes.len(),
+            scroll,
+            0.0,
+            SESSION_MIXER_H,
+        );
         let triangle = pos2(
             layout.slot(12, 1).left() + SLOT_LAUNCH_W * 0.5,
             layout.slot(12, 1).center().y,
@@ -11359,6 +11518,169 @@ mod tests {
         );
     }
 
+    /// The rows scroll when the scenes outgrow the space above the mixer:
+    /// the wheel's vertical axis drives them, hit tests move with the
+    /// paint, and a slot half under the mixer answers only for its
+    /// visible part.
+    #[test]
+    fn the_session_rows_scroll_vertically() {
+        let ctx = egui::Context::default();
+        let mut arr = Arrangement::default();
+        // Enough scenes that the rows overflow an 900px-tall window.
+        for _ in 0..40 {
+            arr.add_scene();
+        }
+        let last = arr.session.scenes.len() - 1;
+        assert!(arr.create_slot_clip(0, last, 4.0));
+        arr.session.selected = None;
+        session_pass(&ctx, &mut arr, vec![]);
+
+        let area = Rect::from_min_size(pos2(0.0, 0.0), SCREEN);
+        let flat = SessionLayout::new(
+            area,
+            arr.tracks.len(),
+            arr.session.scenes.len(),
+            0.0,
+            0.0,
+            SESSION_MIXER_H,
+        );
+        assert!(flat.max_scroll_y() > 0.0, "the rows overflow");
+        assert!(
+            flat.slot(0, last).top() > flat.rows_viewport().bottom(),
+            "the last scene starts off screen"
+        );
+
+        // Wheel down over the grid until the last row is in view.
+        let over = flat.slot(0, 0).center();
+        session_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::PointerMoved(over),
+                Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: vec2(0.0, -4000.0),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        for _ in 0..30 {
+            session_pass(&ctx, &mut arr, vec![]);
+        }
+        assert_eq!(
+            arr.session_scroll_y,
+            flat.max_scroll_y(),
+            "a big wheel lands at the bottom, clamped"
+        );
+        assert_eq!(arr.session_scroll, 0.0, "and the columns did not move");
+
+        // The last scene's slot is now on screen, and clicking its
+        // triangle launches it — the hit test scrolled with the paint.
+        let scrolled = SessionLayout::new(
+            area,
+            arr.tracks.len(),
+            arr.session.scenes.len(),
+            0.0,
+            arr.session_scroll_y,
+            SESSION_MIXER_H,
+        );
+        let slot = scrolled.slot(0, last);
+        assert!(scrolled.rows_viewport().contains(slot.center()));
+        let triangle = pos2(slot.left() + SLOT_LAUNCH_W * 0.5, slot.center().y);
+        session_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::PointerMoved(triangle),
+                Event::PointerButton {
+                    pos: triangle,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+                Event::PointerButton {
+                    pos: triangle,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        assert_eq!(
+            arr.session.playing[0],
+            Some(last),
+            "the scrolled slot launched"
+        );
+    }
+
+    /// Dragging the seam on the mixer's top edge resizes the section,
+    /// clamped to its range — and the rows' scroll bound follows the
+    /// space that is left.
+    #[test]
+    fn the_mixer_seam_resizes_the_section() {
+        let ctx = egui::Context::default();
+        let mut arr = Arrangement::default();
+        session_pass(&ctx, &mut arr, vec![]);
+        assert_eq!(arr.session_mixer_h, SESSION_MIXER_H);
+
+        let area = Rect::from_min_size(pos2(0.0, 0.0), SCREEN);
+        let layout = SessionLayout::new(
+            area,
+            arr.tracks.len(),
+            arr.session.scenes.len(),
+            0.0,
+            0.0,
+            arr.session_mixer_h,
+        );
+        let seam = layout.mixer_seam().center();
+        let up = pos2(seam.x, seam.y - 80.0);
+        session_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::PointerMoved(seam),
+                Event::PointerButton {
+                    pos: seam,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        session_pass(&ctx, &mut arr, vec![Event::PointerMoved(up)]);
+        assert!(
+            (arr.session_mixer_h - (SESSION_MIXER_H + 80.0)).abs() < 2.0,
+            "the seam followed the hand: {}",
+            arr.session_mixer_h
+        );
+        session_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::PointerMoved(up),
+                Event::PointerButton {
+                    pos: up,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+
+        // The clamp holds at both ends, wherever the pointer goes.
+        arr.session_mixer_h = 9_999.0;
+        session_pass(&ctx, &mut arr, vec![]);
+        assert!(
+            arr.session_mixer_h <= SCREEN.y * 0.5 + 1.0,
+            "the mixer may take at most half the area: {}",
+            arr.session_mixer_h
+        );
+        arr.session_mixer_h = 0.0;
+        session_pass(&ctx, &mut arr, vec![]);
+        assert_eq!(arr.session_mixer_h, *SESSION_MIXER_H_RANGE.start());
+    }
+
     /// The fader's taper is linear in DECIBELS, which is what makes it feel
     /// even under the hand, and the bottom of the travel is silence rather
     /// than merely quiet.
@@ -11410,6 +11732,8 @@ mod tests {
             arr.tracks.len(),
             arr.session.scenes.len(),
             0.0,
+            0.0,
+            SESSION_MIXER_H,
         );
         // The assembly of track 1, from the same helper the strip lays
         // out with — the test and the paint cannot disagree about where
@@ -11511,6 +11835,8 @@ mod tests {
             arr.tracks.len(),
             arr.session.scenes.len(),
             arr.session_scroll,
+            0.0,
+            SESSION_MIXER_H,
         );
         drag_pass(&ctx, &mut arr, &mut drag, layout.slot(audio, 3).center());
         assert_eq!(
@@ -11576,6 +11902,8 @@ mod tests {
             arr.tracks.len(),
             arr.session.scenes.len(),
             arr.session_scroll,
+            0.0,
+            SESSION_MIXER_H,
         );
         let slot = layout.slot(0, 1);
         let click = |ctx: &egui::Context, arr: &mut Arrangement, pos: egui::Pos2| {
@@ -11637,6 +11965,8 @@ mod tests {
             arr.tracks.len(),
             arr.session.scenes.len(),
             arr.session_scroll,
+            0.0,
+            SESSION_MIXER_H,
         );
         let click = |ctx: &egui::Context, arr: &mut Arrangement, pos: egui::Pos2| {
             session_pass(
