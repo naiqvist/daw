@@ -28,17 +28,39 @@
 //!
 //! - [`param`]  — `Param`/`Mapping`/`Unit`: the wiring vocabulary.
 //! - [`card`]   — the fixed-height, content-width container every device
-//!   UI lives in, and `sections`, which divides a card body into cols×rows
-//!   sub-panels with visible boundaries; a chain of cards is a device rack.
+//!   UI lives in, and the `Wells` layout that divides a card body into
+//!   weighted, exactly-tiling sub-panels — `sections` for a plain grid,
+//!   `sub_wells` for one more level of grouping inside a well. A chain of
+//!   cards is a device rack.
 //! - [`bezier`] — pure curve math (no egui): eval, y-at-x, polylines,
 //!   bendable segments. Shared by the envelope editor and any future
 //!   curve display.
+//! - [`metrics`] — `Footprint`: the SIZE CONTRACT every widget publishes,
+//!   so a container can reserve room for a control's text before the
+//!   control draws. Every widget module exposes a `footprint()` beside its
+//!   draw function, and the draw function allocates exactly that.
 //! - [`knob`]   — param-aware rotary, unipolar and bipolar.
 //! - [`fader`]  — vertical fader and horizontal slider.
 //! - [`xy`]     — XY pad over two params.
 //! - [`envelope`] — ADSR editor with draggable handles.
+//! - [`shaper`]   — waveshaper transfer curve: hard/soft clip, cubic,
+//!   wavefold and bitcrush, on linear axes. The one curve where folding
+//!   back is a feature rather than a bug.
 //! - [`spectrum`] — log-frequency spectrum grid display.
+//! - [`dynamics`] — the transfer curve a compressor, limiter, gate or
+//!   expander applies, plus the gain-reduction meter that goes beside it.
+//!   One widget: a limiter is a compressor with a high ratio, and a gate
+//!   is an expander with one.
+//! - [`filter`]   — filter response curve: cascaded Butterworth sections
+//!   at 6-48 dB/octave, drawn as the DIGITAL response, with a nonlinear
+//!   drive model that squashes resonance and floors the stopband.
 //! - [`readout`]  — typed value text: static and drag-editable.
+//! - [`field`]    — the value you can drag OR type into, with a
+//!   unit-aware parser: "250ms", "1.5k", "-6 dB".
+//! - [`switch`]   — the segmented DISCRETE control: filter modes, wave
+//!   shapes, sync divisions. Every other widget here is continuous.
+//! - [`meter`]    — dB-scaled peak meter: instant attack, slow release,
+//!   peak hold, latching clip light.
 //! - [`synth`]    — the sine synth device card, the first real device.
 //! - [`reverb`]   — the reverb device card, the first effect.
 
@@ -46,19 +68,27 @@ pub mod adjust;
 pub mod bezier;
 pub mod card;
 pub mod design;
+pub mod dynamics;
 pub mod envelope;
 pub mod fader;
+pub mod field;
+pub mod filter;
 pub mod knob;
+pub mod meter;
+pub mod metrics;
 pub mod param;
 pub mod readout;
 pub mod reverb;
+pub mod shaper;
 pub mod spectrum;
+pub mod switch;
 pub mod synth;
 pub mod xy;
 
 pub use bezier::{Cubic, Pt};
-pub use card::{card, empty_card, sections, tabbed_card};
+pub use card::{Well, Wells, card, empty_card, sections, sub_wells, tabbed_card, wells};
 pub use envelope::Adsr;
+pub use metrics::Footprint;
 pub use param::{Mapping, Param, Unit};
 pub use reverb::{ReverbUi, reverb_card, reverb_edits};
 pub use synth::{ParamEdit, SineSynthUi, sine_synth_card, sine_synth_edits};

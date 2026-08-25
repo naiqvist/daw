@@ -323,8 +323,8 @@ mod tests {
     }
 
     /// The design system's teeth: a device card CANNOT ship with ad-hoc
-    /// spacing, because no device file except `design.rs` may construct a
-    /// frame or name a margin. Every surface arrives from `device::design`
+    /// spacing OR shape, because no device file except `design.rs` may
+    /// construct a frame, name a margin, or reach for a radius token. Every surface arrives from `device::design`
     /// pre-margined on the 4px grid — which is what keeps card padding
     /// visually consistent across every device anyone ever writes.
     #[test]
@@ -332,13 +332,31 @@ mod tests {
         let mut violations: Vec<String> = Vec::new();
         for path in module_files("device") {
             let file = path.file_name().unwrap().to_string_lossy().to_string();
-            if file == "design.rs" {
+            // `grid.rs` is NOT declared in `device/mod.rs` and never has
+            // been: it references a `control::CELL` token that does not
+            // exist, so it has never compiled. It is exempt only so that
+            // a file which is not part of the build cannot fail a rule
+            // about the build — the exemption is a marker, not a pardon.
+            // It should be finished or deleted.
+            if file == "design.rs" || file == "grid.rs" {
                 continue;
             }
             let text = std::fs::read_to_string(&path).unwrap();
             for (ln, line) in text.lines().enumerate() {
                 let code = line.split("//").next().unwrap_or("");
-                for needle in ["Frame::new", "inner_margin(", "outer_margin(", "Margin::"] {
+                // `radius::` joins the list because it drifted exactly
+                // the way margins would have: the filter display had
+                // square corners while its own thumbnail had round ones,
+                // and nothing said which was right because nothing had
+                // said anything. Corner radius is spacing's sibling —
+                // shape decided per widget is shape decided nowhere.
+                for needle in [
+                    "Frame::new",
+                    "inner_margin(",
+                    "outer_margin(",
+                    "Margin::",
+                    "radius::",
+                ] {
                     if code.contains(needle) {
                         violations.push(format!(
                             "device/{file}:{}: `{needle}` — frames and margins come from \
@@ -356,8 +374,62 @@ mod tests {
         );
     }
 
+    /// The size contract's teeth: every device WIDGET module publishes a
+    /// `footprint`, beside the draw function it describes.
+    ///
+    /// A widget that draws without one cannot be laid out into an exact
+    /// rectangle — a container is left guessing how much room its label
+    /// and readout need, and guessing is what clips text. Adding a widget
+    /// module without a footprint fails here rather than at the far end,
+    /// where the symptom is a truncated word in one theme at one density.
+    ///
+    /// Only widget modules are asked. `design`, `metrics`, `param`,
+    /// `bezier` and `adjust` draw nothing; `card` is the container that
+    /// CONSUMES footprints; the device cards compose widgets and take
+    /// their size from what they hold.
+    #[test]
+    fn every_device_widget_publishes_a_footprint() {
+        // Everything that is not a widget, and why it is exempt.
+        const NOT_WIDGETS: &[&str] = &[
+            "mod.rs",     // the module's own doc
+            "design.rs",  // frames and spacing, no widget
+            "metrics.rs", // the contract vocabulary itself
+            "param.rs",   // the wiring vocabulary, no drawing
+            "bezier.rs",  // pure curve math, no egui at all
+            "adjust.rs",  // shared input helper, draws nothing
+            "card.rs",    // the container that consumes footprints
+            "grid.rs",    // squiggle block, sized by its own cell token
+            "synth.rs",   // a card: its size is the sum of what it holds
+            "reverb.rs",
+        ];
+        let mut missing: Vec<String> = Vec::new();
+        for path in module_files("device") {
+            let file = path.file_name().unwrap().to_string_lossy().to_string();
+            if NOT_WIDGETS.contains(&file.as_str()) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            if !text.contains("pub fn footprint(") {
+                missing.push(format!(
+                    "device/{file}: a widget module must publish `pub fn footprint(..)` \
+                     so a container can reserve room for its text before it draws"
+                ));
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "size contract violations:\n{}",
+            missing.join("\n")
+        );
+    }
+
     /// The margin rhythm itself: spacing tokens sit on the 4px grid and
     /// ascend strictly, so "one step roomier" always means something.
+    ///
+    /// `XXS` is deliberately NOT in this scale. It is a half-step for
+    /// compact chrome, and the exemption is written down here so that
+    /// adding a SECOND off-grid value has to argue with this comment
+    /// first — which is the whole point of having a grid.
     #[test]
     fn spacing_tokens_keep_the_grid() {
         use crate::ui::tokens::space;
@@ -383,6 +455,10 @@ mod tests {
                 w[1]
             );
         }
+        // The one exemption, pinned: a half-step, below the smallest
+        // scale value, and exactly half of it.
+        const { assert!(space::XXS * 2.0 == space::XS) };
+        const { assert!(space::XXS < space::XS) };
     }
 
     /// A `.rs` file in `panels/` that nobody declared compiles to nothing and

@@ -3,6 +3,8 @@
 //! attack/decay/release to real time (and can show it with `readout`).
 
 use crate::ui::device::bezier::{Cubic, Pt};
+use crate::ui::device::design;
+use crate::ui::device::metrics::Footprint;
 use crate::ui::theme::Theme;
 use crate::ui::tokens::{control, stroke};
 use eframe::egui;
@@ -39,9 +41,21 @@ const STEPS: usize = 24;
 
 /// Draw and edit the envelope across the available width. Returns true
 /// when any value changed.
+/// The envelope editor's size contract: [`control::ENV_H`] tall and at
+/// least an XY pad wide.
+///
+/// A MINIMUM, unlike the knob's exact figure — the editor is happy to
+/// stretch, and does, into whatever width its well gives it. What the
+/// contract promises is that below this it stops being editable: the
+/// handles need somewhere to go.
+pub fn footprint(theme: &Theme) -> Footprint {
+    Footprint::new(theme.sp(control::XY_PAD), theme.sp(control::ENV_H))
+}
+
 pub fn adsr(ui: &mut egui::Ui, theme: &Theme, env: &mut Adsr) -> bool {
-    let width = ui.available_width().max(theme.sp(control::XY_PAD));
-    let size = egui::vec2(width, theme.sp(control::ENV_H));
+    let min = footprint(theme);
+    let width = ui.available_width().max(min.width());
+    let size = egui::vec2(width, min.height());
     let (rect, env_response) = ui.allocate_exact_size(size, egui::Sense::hover());
     // Handle ids hang off THIS allocation's id, not the parent scope's:
     // two envelopes in one panel must never share an "env-a".
@@ -105,7 +119,7 @@ pub fn adsr(ui: &mut egui::Ui, theme: &Theme, env: &mut Adsr) -> bool {
 
     // --- paint ------------------------------------------------------------
     let painter = ui.painter();
-    painter.rect_filled(rect, 0.0, theme.surface_sunken);
+    painter.rect_filled(rect, design::box_radius(), theme.surface_sunken);
     painter.rect_stroke(
         rect,
         0.0,

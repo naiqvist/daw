@@ -2,13 +2,27 @@
 //! formats its natural value (Hz, dB, ms...), these render it — static,
 //! or drag-to-edit for panels that want a number instead of a control.
 
+use crate::ui::device::metrics::{self, Footprint};
 use crate::ui::device::param::Param;
 use crate::ui::theme::Theme;
-use crate::ui::tokens::control;
+use crate::ui::tokens::{control, font};
 use eframe::egui;
 
 /// Fine-drag multiplier while shift is held.
 const FINE: f32 = 0.1;
+
+/// The readout's size contract: the WIDEST value this param can format,
+/// not the one it currently holds.
+///
+/// A readout that reserves only its current text changes width as the
+/// value changes, and everything laid out beside it slides — under the
+/// pointer, while the user is dragging that very value.
+pub fn footprint(ui: &egui::Ui, param: &Param) -> Footprint {
+    Footprint::new(
+        metrics::mono_w(ui, &param.widest_text(), font::BODY),
+        metrics::line_h(ui, font::BODY),
+    )
+}
 
 /// Static formatted value: monospace, value color.
 pub fn readout(ui: &mut egui::Ui, theme: &Theme, param: &Param, norm: f32) {

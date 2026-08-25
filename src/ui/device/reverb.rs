@@ -9,7 +9,7 @@
 //! - `2` — damp, `0..=1` how fast the tail loses its highs
 
 use crate::ui::device::synth::ParamEdit;
-use crate::ui::device::{Param, card, knob};
+use crate::ui::device::{Param, Well, Wells, card, knob};
 use crate::ui::theme::Theme;
 use eframe::egui;
 
@@ -86,7 +86,20 @@ pub fn reverb_card(ui: &mut egui::Ui, theme: &Theme, state: &mut ReverbUi) -> Ve
     let s = spec();
     let mut edits = Vec::new();
     card::card(ui, theme, "reverb", |ui| {
-        card::sections(ui, theme, 3, 1, |ui, i| {
+        // One well divided in THREE — the reverb's parameters are peers
+        // and belong to one idea (the room), so they share a well rather
+        // than standing in three separate ones. `each` sizes a division
+        // from the widest of the three knobs, so all three are equal and
+        // every label and readout still fits.
+        let layout = Wells::new().row([Well::divided(3, 1)
+            .each(
+                knob::footprint(ui, theme, &s.size)
+                    .union(knob::footprint(ui, theme, &s.damp))
+                    .union(knob::footprint(ui, theme, &s.mix)),
+                theme,
+            )
+            .titled("room", ui, theme)]);
+        card::wells(ui, theme, &layout, |ui, i| {
             let (param, value, id) = match i {
                 0 => (&s.size, &mut state.size, P_SIZE),
                 1 => (&s.damp, &mut state.damp, P_DAMP),

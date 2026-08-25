@@ -4,14 +4,32 @@
 //! to the pointer — a fader is an absolute control, unlike the knob's
 //! relative drag. Double-click resets to the param default.
 
+use crate::ui::device::design;
+use crate::ui::device::metrics::Footprint;
 use crate::ui::device::param::Param;
 use crate::ui::theme::Theme;
-use crate::ui::tokens::{control, radius, stroke};
+use crate::ui::tokens::{control, stroke};
 use eframe::egui;
+
+/// The vertical fader's size contract.
+///
+/// A fader carries no label or readout of its own — its value lives in a
+/// hover tooltip — so the rail IS the footprint. A caller that wants a
+/// named fader stacks a label beside this one rather than the widget
+/// growing a second layout.
+pub fn footprint(theme: &Theme) -> Footprint {
+    Footprint::new(theme.sp(control::FADER_W), theme.sp(control::FADER_LEN))
+}
+
+/// The horizontal slider's size contract: the same rail, turned.
+pub fn slider_footprint(theme: &Theme) -> Footprint {
+    let f = footprint(theme);
+    Footprint::new(f.height(), f.width())
+}
 
 /// Vertical fader. Up is 1.0. Returns true when the user changed `norm`.
 pub fn fader(ui: &mut egui::Ui, theme: &Theme, param: &Param, norm: &mut f32) -> bool {
-    let size = egui::vec2(theme.sp(control::FADER_W), theme.sp(control::FADER_LEN));
+    let size = footprint(theme).size;
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
     let changed = edit(ui, &response, rect, param, norm, /* vertical */ true);
 
@@ -25,7 +43,7 @@ pub fn fader(ui: &mut egui::Ui, theme: &Theme, param: &Param, norm: &mut f32) ->
 /// Horizontal slider. Right is 1.0. Returns true when the user changed
 /// `norm`.
 pub fn slider(ui: &mut egui::Ui, theme: &Theme, param: &Param, norm: &mut f32) -> bool {
-    let size = egui::vec2(theme.sp(control::FADER_LEN), theme.sp(control::FADER_W));
+    let size = slider_footprint(theme).size;
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
     let changed = edit(ui, &response, rect, param, norm, /* vertical */ false);
 
@@ -109,10 +127,10 @@ fn paint(
     let norm = norm.clamp(0.0, 1.0);
 
     // Groove.
-    painter.rect_filled(rect, radius::CTRL, theme.surface_sunken);
+    painter.rect_filled(rect, design::box_radius(), theme.surface_sunken);
     painter.rect_stroke(
         rect,
-        radius::CTRL,
+        design::box_radius(),
         egui::Stroke::new(stroke::HAIR, theme.outline),
         egui::StrokeKind::Inside,
     );
@@ -137,7 +155,7 @@ fn paint(
         } else {
             egui::Rect::from_min_max(egui::pos2(lo, rect.top()), egui::pos2(hi, rect.bottom()))
         };
-        painter.rect_filled(fill, radius::CTRL, theme.accent_muted);
+        painter.rect_filled(fill, design::box_radius(), theme.accent_muted);
     }
 
     // Handle: a bold line across the rail at the value.
@@ -178,12 +196,7 @@ fn paint(
         }
     }
 
-    if response.has_focus() || response.dragged() {
-        painter.rect_stroke(
-            rect.expand(stroke::FOCUS),
-            radius::CTRL,
-            egui::Stroke::new(stroke::FOCUS, theme.focus),
-            egui::StrokeKind::Outside,
-        );
+    if response.has_focus() {
+        design::focus_ring(painter, theme, rect);
     }
 }

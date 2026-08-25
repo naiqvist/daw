@@ -41,6 +41,38 @@ pub struct Gallery {
     log: Vec<String>,
     // Device-widget playground state, all normalized.
     dev_cutoff: f32,
+    /// The segmented switch's normalized value — a discrete param is a
+    /// normalized value like any other, which is the point.
+    dev_mode: f32,
+    /// Phase of the meter demo's synthetic signal, in seconds. A meter is
+    /// the one widget you cannot judge from a still frame — its whole
+    /// character is how it MOVES — so the gallery feeds it something
+    /// alive rather than a fixed level.
+    dev_meter_t: f32,
+    /// The value fields' normalized values.
+    dev_field_hz: f32,
+    dev_field_ms: f32,
+    dev_field_db: f32,
+    /// The filter curve's state, and the two switches driving it.
+    dev_filter: device::filter::Filter,
+    dev_filter_mode: f32,
+    dev_filter_slope: f32,
+    dev_filter_drive: f32,
+    /// The compressor demo's settings, and the knob positions driving it.
+    dev_dyn: device::dynamics::Dynamics,
+    dev_dyn_mode: f32,
+    dev_dyn_threshold: f32,
+    dev_dyn_ratio: f32,
+    dev_dyn_knee: f32,
+    dev_dyn_attack: f32,
+    dev_dyn_release: f32,
+    /// The waveshaper demo.
+    dev_shaper: device::shaper::Shaper,
+    dev_shaper_mode: f32,
+    dev_shaper_drive: f32,
+    dev_shaper_bias: f32,
+    dev_shaper_mix: f32,
+    dev_sync: f32,
     dev_pan: f32,
     dev_gain: f32,
     dev_mix: f32,
@@ -66,6 +98,34 @@ impl Default for Gallery {
             density: Density::default(),
             log: Vec::new(),
             dev_cutoff: 0.5,
+            dev_mode: 0.0,
+            dev_meter_t: 0.0,
+            dev_field_hz: 0.5,
+            dev_field_ms: 0.4,
+            dev_field_db: 0.8,
+            // A resonant corner rather than a flat one: the gallery is
+            // where someone looks to see what the widget DOES.
+            dev_filter: device::filter::Filter {
+                cutoff_hz: 900.0,
+                q: 6.0,
+                ..device::filter::Filter::default()
+            },
+            dev_filter_mode: 0.0,
+            dev_filter_slope: 0.6,
+            dev_filter_drive: 0.0,
+            dev_dyn: device::dynamics::Dynamics::default(),
+            dev_dyn_mode: 0.0,
+            dev_dyn_threshold: 0.7,
+            dev_dyn_ratio: 0.35,
+            dev_dyn_knee: 0.25,
+            dev_dyn_attack: 0.35,
+            dev_dyn_release: 0.5,
+            dev_shaper: device::shaper::Shaper::default(),
+            dev_shaper_mode: 0.25,
+            dev_shaper_drive: 0.45,
+            dev_shaper_bias: 0.5,
+            dev_shaper_mix: 1.0,
+            dev_sync: 1.0,
             dev_pan: 0.5,
             dev_gain: 0.9,
             dev_mix: 1.0,
@@ -87,6 +147,8 @@ impl Gallery {
             self.widgets(ui, theme);
             kit::gap(ui, theme, space::LG);
             self.devices(ui, theme);
+            kit::gap(ui, theme, space::LG);
+            self.formations(ui, theme);
             kit::gap(ui, theme, space::LG);
             self.shortcuts(ui, theme);
             kit::gap(ui, theme, space::LG);
@@ -182,14 +244,90 @@ impl Gallery {
     /// The device-widget playground: every `ui::device` widget live, wired
     /// to real `Param`s, inside a real tabbed card — so a theme change or a
     /// widget tweak is judged on the whole family at once.
+    /// Well formations, side by side: what the card layout can be asked
+    /// for, with nothing in the wells to distract from the shape.
+    ///
+    /// Deliberately NOT drawn inside `device::card`. A card clamps its
+    /// locked height to whatever the region offers, and a scrolling
+    /// gallery section does not reserve it — every card in one renders as
+    /// a squashed strip with its wells spilling out the bottom. That is a
+    /// gallery problem worth fixing on its own; a diagram of layouts
+    /// should not be the thing that waits for it.
+    fn formations(&mut self, ui: &mut egui::Ui, theme: &Theme) {
+        // A modest stand-in for a control, so the shapes stay compact.
+        let leaf = device::Footprint::new(30.0, 26.0);
+        let samples: [(&str, device::Wells); 6] = [
+            (
+                "row of 3",
+                device::Wells::new().row([device::Well::divided(3, 1).each(leaf, theme)]),
+            ),
+            (
+                "2 x 2",
+                device::Wells::new().row([device::Well::divided(2, 2).each(leaf, theme)]),
+            ),
+            (
+                "3 over 4",
+                device::Wells::new().row([device::Well::rows_of([3, 4]).each(leaf, theme)]),
+            ),
+            (
+                "1 over 3",
+                device::Wells::new().row([device::Well::rows_of([1, 3]).each(leaf, theme)]),
+            ),
+            (
+                "2, 3, 4",
+                device::Wells::new().row([device::Well::rows_of([2, 3, 4]).each(leaf, theme)]),
+            ),
+            (
+                "well + 3 over 4",
+                device::Wells::new().row([
+                    device::Well::one().fits(leaf),
+                    device::Well::rows_of([3, 4]).each(leaf, theme),
+                ]),
+            ),
+        ];
+
+        kit::section(ui, theme, "well formations", |ui| {
+            // Explicit rows of two rather than `horizontal_wrapped`.
+            // Each sample is its own vertical (caption over shape), and a
+            // wrapped layout measures the cursor rather than the child it
+            // is about to add — so the last samples marched off the right
+            // edge instead of wrapping.
+            for chunk in samples.chunks(2) {
+                ui.horizontal(|ui| {
+                    for (name, spec) in chunk {
+                        ui.vertical(|ui| {
+                            kit::muted(ui, theme, name);
+                            // Each sample gets EXACTLY the size its own
+                            // contract asks for — which is also the proof
+                            // that the contract is right, since anything
+                            // clipped here was under-reserved.
+                            let size = egui::vec2(spec.min_width(theme), spec.min_height(theme));
+                            ui.allocate_ui_with_layout(
+                                size,
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| device::wells(ui, theme, spec, |_ui, _i| {}),
+                            );
+                        });
+                        kit::gap(ui, theme, space::MD);
+                    }
+                });
+                kit::gap(ui, theme, space::MD);
+            }
+        });
+    }
+
     fn devices(&mut self, ui: &mut egui::Ui, theme: &Theme) {
         let cutoff = device::Param::hz("cutoff", 20.0, 20_000.0).with_default(1_000.0);
         let pan = device::Param::percent("pan").bipolar().with_default(50.0);
         let gain = device::Param::db("gain", -60.0, 6.0).with_default(0.0);
         let mix = device::Param::percent("mix").with_default(100.0);
         let res = device::Param::percent("res");
+        // Discrete params: the step count comes from the name list, so the
+        // two can never disagree about how many settings there are.
+        let mode = device::Param::choice("mode", &["lp", "bp", "hp", "notch"]);
+        let sync = device::Param::choice("sync", &["free", "sync"]);
 
-        kit::section(ui, theme, "device widgets", |ui| {
+        kit::section(ui, theme, "controls and readouts", |ui| {
             ui.horizontal(|ui| {
                 device::knob::knob(ui, theme, &cutoff, &mut self.dev_cutoff);
                 device::knob::knob(ui, theme, &pan, &mut self.dev_pan);
@@ -207,20 +345,312 @@ impl Gallery {
             });
 
             kit::gap(ui, theme, space::SM);
+            kit::muted(
+                ui,
+                theme,
+                "value fields (drag to sweep, CLICK to type: \"1.5k\", \"250ms\", \"-6 dB\")",
+            );
+            ui.horizontal(|ui| {
+                let delay = device::Param::ms("delay", 1.0, 4_000.0).with_default(250.0);
+                for (param, value) in [
+                    (&cutoff, &mut self.dev_field_hz),
+                    (&delay, &mut self.dev_field_ms),
+                    (&gain, &mut self.dev_field_db),
+                ] {
+                    kit::muted(ui, theme, param.name);
+                    if device::field::field(ui, theme, param, value) {
+                        self.log
+                            .push(format!("{} -> {}", param.name, param.format(*value)));
+                    }
+                    kit::gap(ui, theme, space::MD);
+                }
+            });
+
+            kit::gap(ui, theme, space::SM);
+            kit::muted(ui, theme, "meter (click to clear the clip latch)");
+            ui.horizontal(|ui| {
+                self.dev_meter_t += ui.input(|i| i.stable_dt);
+                let (l, r) = demo_levels(self.dev_meter_t);
+                if device::meter::meter(ui, theme, &[l, r]) {
+                    self.log.push("clip cleared".to_owned());
+                }
+                kit::gap(ui, theme, space::MD);
+                // No side-by-side with `kit::meter`: it is a different
+                // LENGTH (a fader's, not a meter's), so putting the two
+                // together invites reading the difference as scale when
+                // half of it is geometry. The numbers make the point —
+                // -6 dB is near the top of a dB scale and halfway up a
+                // linear one.
+                kit::muted(
+                    ui,
+                    theme,
+                    &format!("L {:>6} dBFS    R {:>6} dBFS", fmt_db(l), fmt_db(r)),
+                );
+                ui.ctx().request_repaint();
+            });
+            kit::gap(ui, theme, space::SM);
+            kit::muted(ui, theme, "spectrum (tracks the cutoff knob)");
+            let bins = demo_spectrum(cutoff.value(self.dev_cutoff));
+            device::spectrum::spectrum(ui, theme, &bins, DEMO_NYQUIST_HZ);
+
+            kit::gap(ui, theme, space::SM);
+            kit::muted(
+                ui,
+                theme,
+                "segmented switch (click, drag across, wheel, arrows once clicked)",
+            );
+            ui.horizontal(|ui| {
+                if device::switch::switch(ui, theme, &mode, &mut self.dev_mode) {
+                    self.log
+                        .push(format!("mode -> {}", mode.format(self.dev_mode)));
+                }
+                kit::gap(ui, theme, space::MD);
+                if device::switch::switch(ui, theme, &sync, &mut self.dev_sync) {
+                    self.log
+                        .push(format!("sync -> {}", sync.format(self.dev_sync)));
+                }
+            });
+
+            kit::gap(ui, theme, space::SM);
             kit::row(ui, theme, "slider + readouts", |ui| {
                 device::readout::readout_drag(ui, theme, &mix, &mut self.dev_mix);
                 device::fader::slider(ui, theme, &mix, &mut self.dev_mix);
                 device::readout::readout(ui, theme, &gain, self.dev_gain);
             });
+        });
 
+        kit::section(ui, theme, "curves and responses", |ui| {
             kit::gap(ui, theme, space::SM);
             kit::muted(ui, theme, "adsr (drag the handles)");
             device::envelope::adsr(ui, theme, &mut self.dev_env);
 
             kit::gap(ui, theme, space::SM);
-            kit::muted(ui, theme, "spectrum (tracks the cutoff knob)");
-            let bins = demo_spectrum(cutoff.value(self.dev_cutoff));
-            device::spectrum::spectrum(ui, theme, &bins, DEMO_NYQUIST_HZ);
+            kit::muted(
+                ui,
+                theme,
+                "filter response (drag the node: across = cutoff, up = resonance)",
+            );
+            let mode = device::Param::choice("mode", device::filter::Mode::NAMES);
+            let slope = device::Param::choice("dB/oct", device::filter::Slope::NAMES);
+            let drive = device::Param::percent("drive");
+            ui.horizontal(|ui| {
+                device::switch::switch(ui, theme, &mode, &mut self.dev_filter_mode);
+                kit::gap(ui, theme, space::MD);
+                // The slope switch is greyed by its own contract when the
+                // mode does not use one — a notch has no 48 dB/octave.
+                let uses = self.dev_filter.mode.uses_slope();
+                ui.add_enabled_ui(uses, |ui| {
+                    device::switch::switch(ui, theme, &slope, &mut self.dev_filter_slope);
+                });
+                kit::gap(ui, theme, space::MD);
+                device::knob::knob(ui, theme, &drive, &mut self.dev_filter_drive);
+            });
+            self.dev_filter.mode =
+                device::filter::Mode::from_index(mode.index(self.dev_filter_mode));
+            self.dev_filter.slope =
+                device::filter::Slope::from_index(slope.index(self.dev_filter_slope));
+            self.dev_filter.drive = self.dev_filter_drive;
+            if device::filter::filter_curve(ui, theme, &mut self.dev_filter, DEMO_NYQUIST_HZ * 2.0)
+            {
+                self.log.push(format!(
+                    "filter -> {:.0} Hz  Q {:.2}",
+                    self.dev_filter.cutoff_hz, self.dev_filter.q
+                ));
+            }
+            kit::gap(ui, theme, space::SM);
+            kit::muted(
+                ui,
+                theme,
+                "waveshaper: every mode at once, then one you can drag",
+            );
+            {
+                use device::shaper;
+                // Every shape side by side. The comparison IS the point —
+                // these are five different sounds, and seeing them
+                // together is the fastest way to know which one you want.
+                ui.horizontal(|ui| {
+                    for (i, mode) in shaper::Mode::ALL.iter().enumerate() {
+                        ui.vertical(|ui| {
+                            kit::muted(ui, theme, shaper::Mode::NAMES[i]);
+                            shaper::mini(
+                                ui,
+                                theme,
+                                &shaper::Shaper {
+                                    mode: *mode,
+                                    drive: 6.0,
+                                    bias: 0.0,
+                                    mix: 1.0,
+                                },
+                            );
+                        });
+                        kit::gap(ui, theme, space::SM);
+                    }
+                });
+
+                kit::gap(ui, theme, space::SM);
+                let mode = device::Param::choice("mode", shaper::Mode::NAMES);
+                let drive = device::Param::new(
+                    "drive",
+                    device::Mapping::Log {
+                        min: shaper::DRIVE_MIN,
+                        max: shaper::DRIVE_MAX,
+                    },
+                    device::Unit::Plain,
+                );
+                let bias = device::Param::percent("bias").bipolar().with_default(50.0);
+                let mix = device::Param::percent("mix").with_default(100.0);
+                ui.horizontal(|ui| {
+                    device::switch::switch(ui, theme, &mode, &mut self.dev_shaper_mode);
+                    kit::gap(ui, theme, space::MD);
+                    device::knob::mini(ui, theme, &drive, &mut self.dev_shaper_drive);
+                    kit::gap(ui, theme, space::SM);
+                    device::knob::mini(ui, theme, &bias, &mut self.dev_shaper_bias);
+                    kit::gap(ui, theme, space::SM);
+                    device::knob::mini(ui, theme, &mix, &mut self.dev_shaper_mix);
+                });
+                self.dev_shaper.mode = shaper::Mode::from_index(mode.index(self.dev_shaper_mode));
+                self.dev_shaper.drive = drive.value(self.dev_shaper_drive);
+                // The bias knob is bipolar: 50% is centred, so it maps to
+                // -BIAS_MAX..BIAS_MAX rather than 0..1.
+                self.dev_shaper.bias = (self.dev_shaper_bias * 2.0 - 1.0) * shaper::BIAS_MAX;
+                self.dev_shaper.mix = self.dev_shaper_mix;
+                if shaper::transfer_curve(ui, theme, &mut self.dev_shaper) {
+                    self.log.push(format!(
+                        "shaper -> x{:.1} bias {:+.2}",
+                        self.dev_shaper.drive, self.dev_shaper.bias
+                    ));
+                }
+            }
+
+            kit::gap(ui, theme, space::SM);
+            kit::muted(
+                ui,
+                theme,
+                "dynamics: one curve for compressor, limiter, gate and expander",
+            );
+            {
+                use device::dynamics;
+                let mode = device::Param::choice("mode", dynamics::Mode::NAMES);
+                let thresh = device::Param::db("thresh", dynamics::VIEW_MIN_DB, 0.0);
+                let ratio = device::Param::new(
+                    "ratio",
+                    device::Mapping::Log {
+                        min: dynamics::RATIO_MIN,
+                        max: dynamics::RATIO_MAX,
+                    },
+                    device::Unit::Plain,
+                );
+                let knee = device::Param::db("knee", 0.0, 24.0);
+
+                ui.horizontal(|ui| {
+                    device::switch::switch(ui, theme, &mode, &mut self.dev_dyn_mode);
+                    kit::gap(ui, theme, space::MD);
+                    device::knob::mini(ui, theme, &thresh, &mut self.dev_dyn_threshold);
+                    kit::gap(ui, theme, space::SM);
+                    device::knob::mini(ui, theme, &ratio, &mut self.dev_dyn_ratio);
+                    kit::gap(ui, theme, space::SM);
+                    device::knob::mini(ui, theme, &knee, &mut self.dev_dyn_knee);
+                });
+                self.dev_dyn.mode = dynamics::Mode::from_index(mode.index(self.dev_dyn_mode));
+                self.dev_dyn.threshold_db = thresh.value(self.dev_dyn_threshold);
+                self.dev_dyn.ratio = ratio.value(self.dev_dyn_ratio);
+                self.dev_dyn.knee_db = knee.value(self.dev_dyn_knee);
+
+                // The live operating point rides the meter demo's signal,
+                // so the dot and the reduction reading actually move.
+                let (l, _) = demo_levels(self.dev_meter_t);
+                let level = device::meter::amp_to_db(l).max(dynamics::VIEW_MIN_DB);
+                // The BAR view, with attack and release beside it — the
+                // two settings a static transfer curve cannot show, next
+                // to the display that can.
+                let attack = device::Param::ms("attack", 0.1, 300.0);
+                let release = device::Param::ms("release", 5.0, 2_000.0);
+                ui.horizontal(|ui| {
+                    if device::knob::mini(ui, theme, &attack, &mut self.dev_dyn_attack) {
+                        self.dev_dyn.attack_ms = attack.value(self.dev_dyn_attack);
+                    }
+                    kit::gap(ui, theme, space::SM);
+                    if device::knob::mini(ui, theme, &release, &mut self.dev_dyn_release) {
+                        self.dev_dyn.release_ms = release.value(self.dev_dyn_release);
+                    }
+                    kit::gap(ui, theme, space::MD);
+                    dynamics::bars(ui, theme, &mut self.dev_dyn, level);
+                });
+                self.dev_dyn.attack_ms = attack.value(self.dev_dyn_attack);
+                self.dev_dyn.release_ms = release.value(self.dev_dyn_release);
+
+                ui.horizontal(|ui| {
+                    if dynamics::transfer_curve(ui, theme, &mut self.dev_dyn, Some(level)) {
+                        self.log.push(format!(
+                            "dyn -> {:.0} dB  {:.1}:1",
+                            self.dev_dyn.threshold_db, self.dev_dyn.ratio
+                        ));
+                    }
+                    kit::gap(ui, theme, space::SM);
+                    dynamics::reduction_meter(ui, theme, self.dev_dyn.reduction_db(level));
+                    kit::gap(ui, theme, space::MD);
+                    dynamics::mini(ui, theme, &self.dev_dyn);
+                });
+                ui.ctx().request_repaint();
+            }
+        });
+
+        kit::section(ui, theme, "device cards", |ui| {
+            kit::gap(ui, theme, space::SM);
+            kit::muted(ui, theme, "the mini curve, in a card beside its knobs");
+            device::card(ui, theme, "filter", |ui| {
+                // The first card built entirely from the new widgets, and
+                // the reason the mini is a fixed size: it declares a
+                // footprint like anything else, so the well holding it is
+                // sized by contract rather than by hope.
+                let res = device::Param::percent("res");
+                let drive = device::Param::percent("drive");
+                let mix = device::Param::percent("mix");
+                // A 2x2 of MINI knobs beside the thumbnail — a row split
+                // a card could not hold until the minis existed, and the
+                // reason they do.
+                let mini_fp = device::knob::footprint_mini(ui, theme, &cutoff)
+                    .union(device::knob::footprint_mini(ui, theme, &res))
+                    .union(device::knob::footprint_mini(ui, theme, &drive))
+                    .union(device::knob::footprint_mini(ui, theme, &mix));
+                // COMPACT, because everything in it is a mini: half-step
+                // padding, tighter gaps, no hairlines. The contract is
+                // built at the density it will be drawn at — `each` here
+                // instead of `each_compact` would reserve for chrome that
+                // never gets drawn.
+                let layout = device::Wells::new()
+                    .row([
+                        device::Well::span(2)
+                            .fits(device::filter::footprint_mini(theme))
+                            .titled("response", ui, theme),
+                        device::Well::divided(2, 2)
+                            .each_compact(mini_fp, theme)
+                            .titled("shape", ui, theme),
+                    ])
+                    .compact();
+                device::wells(ui, theme, &layout, |ui, i| match i {
+                    0 => device::filter::mini(ui, theme, &self.dev_filter, DEMO_NYQUIST_HZ * 2.0),
+                    1 => {
+                        if device::knob::mini(ui, theme, &cutoff, &mut self.dev_cutoff) {
+                            self.dev_filter.cutoff_hz = cutoff.value(self.dev_cutoff);
+                        }
+                    }
+                    2 => {
+                        let mut q = ((self.dev_filter.q - 0.3) / 23.7).clamp(0.0, 1.0);
+                        if device::knob::mini(ui, theme, &res, &mut q) {
+                            self.dev_filter.q = 0.3 + q * 23.7;
+                        }
+                    }
+                    3 => {
+                        if device::knob::mini(ui, theme, &drive, &mut self.dev_filter_drive) {
+                            self.dev_filter.drive = self.dev_filter_drive;
+                        }
+                    }
+                    _ => {
+                        device::knob::mini(ui, theme, &mix, &mut self.dev_mix);
+                    }
+                });
+            });
 
             kit::gap(ui, theme, space::SM);
             kit::muted(ui, theme, "sine synth — the first real device");
@@ -331,6 +761,35 @@ const DEMO_BINS: usize = 128;
 
 /// A plausible spectrum: a gentle pink-ish slope plus a resonant bump at
 /// `peak_hz`, so turning the cutoff knob visibly moves the trace.
+/// A synthetic stereo level: a slow swell that occasionally overshoots
+/// full scale, so the clip latch has something to catch.
+fn demo_levels(t: f32) -> (f32, f32) {
+    let swell = |phase: f32| {
+        let slow = (t * 0.9 + phase).sin() * 0.5 + 0.5;
+        // Cubed, so the quiet parts are genuinely quiet — a level that
+        // never leaves the top of the scale demonstrates nothing.
+        let base = slow * slow * slow;
+        // An occasional overshoot past 1.0.
+        let spike = if ((t * 0.37 + phase).sin()) > 0.985 {
+            0.4
+        } else {
+            0.0
+        };
+        (base * 1.05 + spike).clamp(0.0, 1.6)
+    };
+    (swell(0.0), swell(1.1))
+}
+
+/// The level as text, matching what the meter is showing.
+fn fmt_db(amp: f32) -> String {
+    let db = device::meter::amp_to_db(amp);
+    if db <= device::meter::FLOOR_DB {
+        "-inf".to_owned()
+    } else {
+        format!("{db:+.1}")
+    }
+}
+
 fn demo_spectrum(peak_hz: f32) -> Vec<f32> {
     (0..DEMO_BINS)
         .map(|i| {

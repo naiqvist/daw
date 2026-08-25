@@ -1,10 +1,20 @@
 //! XY pad: two params, one gesture. Filter cutoff/resonance, delay
 //! time/feedback — anywhere two parameters are really one movement.
 
+use crate::ui::device::design;
+use crate::ui::device::metrics::Footprint;
 use crate::ui::device::param::Param;
 use crate::ui::theme::Theme;
-use crate::ui::tokens::{control, radius, stroke};
+use crate::ui::tokens::{control, stroke};
 use eframe::egui;
+
+/// The XY pad's size contract: a square of [`control::XY_PAD`]. No text
+/// of its own — the two params are named by whatever labels the caller
+/// puts around it.
+pub fn footprint(theme: &Theme) -> Footprint {
+    let side = theme.sp(control::XY_PAD);
+    Footprint::new(side, side)
+}
 
 /// Square pad editing two normalized values. `x` runs left→right, `y` runs
 /// bottom→top (up is more, like the fader). Double-click resets both to
@@ -17,7 +27,7 @@ pub fn xy_pad(
     x: &mut f32,
     y: &mut f32,
 ) -> bool {
-    let side = theme.sp(control::XY_PAD);
+    let side = footprint(theme).width();
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::click_and_drag());
 
@@ -53,7 +63,7 @@ pub fn xy_pad(
     }
 
     let painter = ui.painter();
-    painter.rect_filled(rect, radius::CTRL, theme.surface_sunken);
+    painter.rect_filled(rect, design::box_radius(), theme.surface_sunken);
 
     // Quarter grid, center lines slightly stronger.
     for i in 1..4 {
@@ -77,7 +87,7 @@ pub fn xy_pad(
     }
     painter.rect_stroke(
         rect,
-        radius::CTRL,
+        design::box_radius(),
         egui::Stroke::new(stroke::HAIR, theme.outline),
         egui::StrokeKind::Inside,
     );
@@ -102,13 +112,8 @@ pub fn xy_pad(
         egui::Stroke::new(stroke::HAIR, theme.surface_sunken),
     );
 
-    if response.has_focus() || response.dragged() {
-        painter.rect_stroke(
-            rect.expand(stroke::FOCUS),
-            radius::CTRL,
-            egui::Stroke::new(stroke::FOCUS, theme.focus),
-            egui::StrokeKind::Outside,
-        );
+    if response.has_focus() {
+        design::focus_ring(painter, theme, rect);
     }
 
     if response.hovered() || response.dragged() {

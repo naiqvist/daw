@@ -19,6 +19,18 @@ pub enum Mapping {
     /// Linear in decibels. The natural value IS the dB figure; converting
     /// to amplitude is the engine's business.
     Db { min_db: f32, max_db: f32 },
+    /// A DISCRETE parameter: `count` choices, natural value `0..count-1`.
+    ///
+    /// Index `i` sits at `i / (count - 1)`, so the first choice is exactly
+    /// 0.0 and the last exactly 1.0. That is the convention CLAP and VST3
+    /// use for stepped parameters — min and max are real values and the
+    /// normalization is the plain span between them — and matching it
+    /// means a discrete param round-trips through a host without the
+    /// endpoints drifting inward.
+    ///
+    /// A single choice is legal (a parameter with one setting is a label,
+    /// not a bug) and pins to 0.0.
+    Steps { count: u32 },
 }
 
 impl Mapping {
@@ -29,6 +41,13 @@ impl Mapping {
             Self::Linear { min, max } => min + (max - min) * t,
             Self::Log { min, max } => min * (max / min).powf(t),
             Self::Db { min_db, max_db } => min_db + (max_db - min_db) * t,
+            // ROUND, not floor: the value halfway between two choices has
+            // to land on one of them, and floor would give the last choice
+            // a band of zero width — reachable only at exactly 1.0.
+            Self::Steps { count } => {
+                let last = count.max(1).saturating_sub(1) as f32;
+                (t * last).round()
+            }
         }
     }
 
@@ -53,6 +72,10 @@ impl Mapping {
                     (value / min).ln() / (max / min).ln()
                 }
             }
+            Self::Steps { count } => {
+                let last = count.max(1).saturating_sub(1) as f32;
+                if last <= 0.0 { 0.0 } else { value / last }
+            }
         };
         if t.is_nan() { 0.0 } else { t.clamp(0.0, 1.0) }
     }
@@ -71,6 +94,9 @@ pub enum Unit {
     Semitones,
     /// Bare number, two decimals.
     Plain,
+    /// A discrete parameter's choice names, indexed by the natural value.
+    /// Pair with [`Mapping::Steps`]; [`Param::choice`] builds both.
+    Choice(&'static [&'static str]),
 }
 
 impl Unit {
@@ -87,6 +113,16 @@ impl Unit {
             Self::Seconds => format!("{v:.2} s"),
             Self::Semitones => format!("{v:+.0} st"),
             Self::Plain => format!("{v:.2}"),
+            // Out of range prints the number rather than panicking: a
+            // choice list and a step count that disagree is a programming
+            // error, and showing "3" is a better way to find it than an
+            // index-out-of-bounds in a paint call.
+            Self::Choice(names) => {
+                let i = v.round().max(0.0) as usize;
+                names
+                    .get(i)
+                    .map_or_else(|| format!("{v:.0}"), |n| (*n).to_owned())
+            }
         }
     }
 }
@@ -144,6 +180,46 @@ impl Param {
         Self::new(name, Mapping::Log { min, max }, Unit::Ms)
     }
 
+    /// A DISCRETE parameter over named choices — a filter mode, a
+    /// waveform, a sync division.
+    ///
+    /// The step count comes FROM the list, so the mapping and the names
+    /// can never disagree about how many settings there are. That pairing
+    /// is the whole reason this is a constructor rather than two fields a
+    /// caller sets separately.
+    pub fn choice(name: &'static str, names: &'static [&'static str]) -> Self {
+        Self::new(
+            name,
+            Mapping::Steps {
+                count: names.len().max(1) as u32,
+            },
+            Unit::Choice(names),
+        )
+    }
+
+    /// How many settings this parameter has, if it is discrete.
+    pub fn choices(&self) -> Option<u32> {
+        match self.mapping {
+            Mapping::Steps { count } => Some(count.max(1)),
+            _ => None,
+        }
+    }
+
+    /// The choice index at this normalized position, for a discrete param.
+    pub fn index(&self, norm: f32) -> usize {
+        self.value(norm).max(0.0) as usize
+    }
+
+    /// The normalized position of choice `i`. Out-of-range indices clamp
+    /// to the ends rather than wrapping — a switch that jumps from the
+    /// last setting back to the first when you press Right is a switch
+    /// that loses your place.
+    pub fn at_index(&self, i: usize) -> f32 {
+        let count = self.choices().unwrap_or(1).max(1) as usize;
+        let i = i.min(count - 1);
+        self.mapping.to_norm(i as f32)
+    }
+
     /// Set the default from a NATURAL value (`440.0`, `-6.0`).
     pub fn with_default(mut self, value: f32) -> Self {
         self.default_norm = self.mapping.to_norm(value);
@@ -164,6 +240,27 @@ impl Param {
     /// Formatted natural value at this normalized position.
     pub fn format(&self, norm: f32) -> String {
         self.unit.format(self.mapping.to_value(norm))
+    }
+
+    /// The WIDEST text this parameter's readout can ever show.
+    ///
+    /// A control has to reserve room for its value before it knows the
+    /// value, or its column resizes as the user turns it — and a layout
+    /// that reflows under the pointer is a layout you cannot aim at.
+    /// Sampling the range is honest where guessing a character count is
+    /// not: "640 ms" and "1.05 ms" are different widths, and only the
+    /// formatter knows which wins.
+    ///
+    /// Sampled rather than exhaustive: `SAMPLES` points across the range,
+    /// which catches the digit-count and sign changes that actually move
+    /// the width. A mapping that hides its longest rendering between two
+    /// samples would be pathological.
+    pub fn widest_text(&self) -> String {
+        const SAMPLES: usize = 9;
+        (0..SAMPLES)
+            .map(|i| self.format(i as f32 / (SAMPLES - 1) as f32))
+            .max_by_key(String::len)
+            .unwrap_or_default()
     }
 }
 

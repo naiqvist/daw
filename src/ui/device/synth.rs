@@ -10,7 +10,7 @@
 //! - `1` — attack, milliseconds
 //! - `2` — release, milliseconds
 
-use crate::ui::device::{card, knob, param::Param};
+use crate::ui::device::{Well, Wells, card, knob, param::Param};
 use crate::ui::theme::Theme;
 use eframe::egui;
 
@@ -77,8 +77,42 @@ pub fn sine_synth_card(
     let s = spec();
     let mut edits = Vec::new();
     card::card(ui, theme, "sine synth", |ui| {
-        // Sections center their content; the knobs just get added.
-        card::sections(ui, theme, 3, 1, |ui, i| {
+        // The card says what belongs with what. Attack and release are
+        // one idea — the amplitude envelope — and gain is a different one,
+        // so the envelope times share a well, subdivided into a sub-well
+        // each, while gain stands alone in its own.
+        //
+        // Grouping by NESTING rather than by proximity means the grouping
+        // survives: a gap can be read as "these two happen to be next to
+        // each other", a shared well cannot.
+        // Wells of DIFFERENT sizes, evenly distributed: the envelope well
+        // takes two units to gain's one, and DIVIDES IN TWO — one
+        // sub-well per time. The row still tiles the card exactly, and
+        // each division reads as a sibling of the single-unit gain well
+        // rather than as a different size of thing.
+        //
+        // Every size here comes from a contract. `each` says what one
+        // division must hold, the well's own need becomes two of those
+        // side by side, and the card's width is what falls out — so
+        // "release" and "1.05 ms" have room reserved before either is
+        // drawn, at either level of nesting.
+        //
+        // The divisions are LEAVES, so the closure just sees 0, 1, 2. The
+        // nesting is layout; it is not something this code counts through.
+        //
+        // The tray is TITLED, because grouping the two times only says
+        // "these belong together" — the caption is the other half of the
+        // sentence, and it is what makes the grouping mean "envelope"
+        // rather than merely "not gain".
+        let envelope =
+            knob::footprint(ui, theme, &s.attack).union(knob::footprint(ui, theme, &s.release));
+        let layout = Wells::new().row([
+            Well::one().fits(knob::footprint(ui, theme, &s.gain)),
+            Well::divided(2, 1)
+                .each(envelope, theme)
+                .titled("envelope", ui, theme),
+        ]);
+        card::wells(ui, theme, &layout, |ui, i| {
             let (param, value, id) = match i {
                 0 => (&s.gain, &mut state.gain, P_GAIN),
                 1 => (&s.attack, &mut state.attack, P_ATTACK),
