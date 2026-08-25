@@ -2011,6 +2011,100 @@ impl ParameterRegistry {
     }
 }
 
+/// A modulation source's waveform. Timeline-locked on purpose: an LFO is
+/// a pure function of the BEAT, so it renders the same bytes every bounce
+/// and freezes honestly when the transport stops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum ModShape {
+    Sine,
+    Triangle,
+    Saw,
+    Square,
+}
+
+impl ModShape {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Sine => "sin",
+            Self::Triangle => "tri",
+            Self::Saw => "saw",
+            Self::Square => "sqr",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Sine => Self::Triangle,
+            Self::Triangle => Self::Saw,
+            Self::Saw => Self::Square,
+            Self::Square => Self::Sine,
+        }
+    }
+
+    /// One cycle, phase `0..1`, out `-1..=1`.
+    fn wave(self, phase: f32) -> f32 {
+        let phase = phase.rem_euclid(1.0);
+        match self {
+            Self::Sine => (phase * std::f32::consts::TAU).sin(),
+            Self::Triangle => 1.0 - 4.0 * (phase - 0.5).abs(),
+            Self::Saw => phase * 2.0 - 1.0,
+            Self::Square => {
+                if phase < 0.5 {
+                    1.0
+                } else {
+                    -1.0
+                }
+            }
+        }
+    }
+}
+
+/// The musical rate ladder an LFO cycles through, in beats per cycle.
+const MOD_RATES: [f32; 7] = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0];
+
+/// What a modulator IS. An LFO is a function of the beat; a follower is a
+/// function of another track's live level — which is what makes ducking
+/// one track by another a single wire rather than a sidechain feature.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+enum ModKind {
+    Lfo { shape: ModShape, rate_beats: f32 },
+    Follower { track: usize },
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct Modulator {
+    id: u64,
+    kind: ModKind,
+}
+
+/// One modulation relationship: a source, a (track, parameter) target, and
+/// a bipolar depth as a FRACTION of the parameter's range — negative depth
+/// is how a follower ducks. Modulation is RELATIVE: it rides on top of the
+/// knob-or-automation value and is clamped into the parameter's range at
+/// the end.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct ModWire {
+    source: u64,
+    track: usize,
+    target: String,
+    depth: f32,
+}
+
+/// A modulator's value this frame: LFOs from the beat, followers from the
+/// meter ballistics the mixer already runs. Pure over its inputs, which is
+/// what the determinism test leans on.
+fn modulator_value(kind: &ModKind, beat: f32, meters: &[device::meter::Ballistics]) -> f32 {
+    match kind {
+        ModKind::Lfo { shape, rate_beats } => {
+            let rate = rate_beats.max(1e-3);
+            shape.wave(beat / rate)
+        }
+        ModKind::Follower { track } => meters
+            .get(*track)
+            .map_or(0.0, |meter| device::meter::db_to_norm(meter.shown_db)),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 struct AutomationPoint {
@@ -2759,6 +2853,12 @@ struct Arrangement {
     next_track_no: [u32; TrackKind::ALL.len()],
     /// The header rename, while one is open.
     track_rename: Option<TrackRename>,
+    /// The modulation sources. Content: they undo and they save.
+    modulators: Vec<Modulator>,
+    /// The modulation wires: source -> (track, parameter), with depth.
+    mod_wires: Vec<ModWire>,
+    /// Monotonic id mint for modulators, like `next_clip_id` for clips.
+    next_modulator_id: u64,
     /// Named points on the timeline, drawn as flags in the ruler. Content:
     /// they undo. Unordered — jumps search by comparison, so a drag never
     /// reshuffles indices under an open rename.
@@ -2829,9 +2929,12 @@ struct Content {
     scenes: Vec<Scene>,
     loop_range: Option<(f32, f32)>,
     locators: Vec<Locator>,
+    modulators: Vec<Modulator>,
+    mod_wires: Vec<ModWire>,
     /// The id counters ride along, so an undone clip's id is free again and
     /// a redo re-creates the very same clip rather than a renamed twin.
     next_clip_id: u64,
+    next_modulator_id: u64,
     next_track_no: [u32; TrackKind::ALL.len()],
 }
 
@@ -2878,6 +2981,9 @@ struct ProjectDoc {
     slots: Vec<Vec<Option<Clip>>>,
     scenes: Vec<Scene>,
     locators: Vec<Locator>,
+    modulators: Vec<Modulator>,
+    mod_wires: Vec<ModWire>,
+    next_modulator_id: u64,
     next_clip_id: u64,
     next_track_no: [u32; TrackKind::ALL.len()],
 }
@@ -2905,6 +3011,9 @@ fn project_doc(arr: &Arrangement, transport: &Transport) -> ProjectDoc {
         slots: arr.session.slots.clone(),
         scenes: arr.session.scenes.clone(),
         locators: arr.locators.clone(),
+        modulators: arr.modulators.clone(),
+        mod_wires: arr.mod_wires.clone(),
+        next_modulator_id: arr.next_modulator_id,
         next_clip_id: arr.next_clip_id,
         next_track_no: arr.next_track_no,
     }
@@ -2957,6 +3066,41 @@ fn apply_project_doc(doc: ProjectDoc, arr: &mut Arrangement, transport: &mut Tra
         .filter(|locator| locator.beat.is_finite() && locator.beat >= 0.0)
         .collect();
     fresh.loop_range = doc.loop_range.filter(|(a, b)| a.is_finite() && b > a);
+    // Modulation, sanitized like everything else in a file: a follower of
+    // a track that does not exist, a wire from a source that does not
+    // exist or to a track that does not, and a runaway depth are all the
+    // file's problem, never the app's.
+    fresh.modulators = doc
+        .modulators
+        .into_iter()
+        .filter(|modulator| match modulator.kind {
+            ModKind::Follower { track } => track < tracks,
+            ModKind::Lfo { rate_beats, .. } => rate_beats.is_finite() && rate_beats > 0.0,
+        })
+        .collect();
+    fresh.mod_wires = doc
+        .mod_wires
+        .into_iter()
+        .filter(|wire| {
+            wire.track < tracks
+                && wire.depth.is_finite()
+                && fresh
+                    .modulators
+                    .iter()
+                    .any(|modulator| modulator.id == wire.source)
+        })
+        .map(|mut wire| {
+            wire.depth = wire.depth.clamp(-1.0, 1.0);
+            wire
+        })
+        .collect();
+    let highest_modulator = fresh
+        .modulators
+        .iter()
+        .map(|modulator| modulator.id)
+        .max()
+        .unwrap_or(0);
+    fresh.next_modulator_id = doc.next_modulator_id.max(highest_modulator + 1);
     fresh.grid = doc.grid.min(GRID_BEATS.len() - 1);
     let highest = fresh
         .clips
@@ -3109,6 +3253,9 @@ impl Default for Arrangement {
             // The default session's four lanes have already taken 1..=4.
             next_track_no: [TRACK_COUNT as u32 + 1, 1],
             track_rename: None,
+            modulators: Vec::new(),
+            mod_wires: Vec::new(),
+            next_modulator_id: 1,
             locators: Vec::new(),
             locator_rename: None,
             pending_seek: None,
@@ -3140,7 +3287,10 @@ impl Arrangement {
                 scenes: self.session.scenes.clone(),
                 loop_range: self.loop_range,
                 locators: self.locators.clone(),
+                modulators: self.modulators.clone(),
+                mod_wires: self.mod_wires.clone(),
                 next_clip_id: self.next_clip_id,
+                next_modulator_id: self.next_modulator_id,
                 next_track_no: self.next_track_no,
             },
             marks: Marks {
@@ -3165,6 +3315,9 @@ impl Arrangement {
         self.loop_range = snapshot.content.loop_range;
         self.locators = snapshot.content.locators.clone();
         self.locator_rename = None;
+        self.modulators = snapshot.content.modulators.clone();
+        self.mod_wires = snapshot.content.mod_wires.clone();
+        self.next_modulator_id = snapshot.content.next_modulator_id;
         self.next_clip_id = snapshot.content.next_clip_id;
         self.next_track_no = snapshot.content.next_track_no;
         self.selected = snapshot.marks.selected;
@@ -3469,6 +3622,61 @@ impl Arrangement {
         true
     }
 
+    /// Mint a modulator. LFOs arrive at a whole-bar rate, sine — the shape
+    /// everyone reaches for first.
+    fn add_lfo(&mut self) -> u64 {
+        let id = self.next_modulator_id;
+        self.next_modulator_id += 1;
+        self.modulators.push(Modulator {
+            id,
+            kind: ModKind::Lfo {
+                shape: ModShape::Sine,
+                rate_beats: 4.0,
+            },
+        });
+        id
+    }
+
+    /// A follower listening to `track`'s live level.
+    fn add_follower(&mut self, track: usize) -> u64 {
+        let id = self.next_modulator_id;
+        self.next_modulator_id += 1;
+        self.modulators.push(Modulator {
+            id,
+            kind: ModKind::Follower { track },
+        });
+        id
+    }
+
+    /// Remove a modulator AND every wire hanging from it: a wire whose
+    /// source is gone is not a relationship, it is a dangling pointer.
+    fn remove_modulator(&mut self, id: u64) -> bool {
+        let before = self.modulators.len();
+        self.modulators.retain(|modulator| modulator.id != id);
+        if self.modulators.len() == before {
+            return false;
+        }
+        self.mod_wires.retain(|wire| wire.source != id);
+        true
+    }
+
+    /// The summed modulation offset for one (track, target) this frame, in
+    /// the parameter's own units. `values` is this frame's per-modulator
+    /// evaluation; a wire whose source is missing contributes nothing.
+    fn modulation_offset(
+        &self,
+        track: usize,
+        target: &str,
+        span: f32,
+        values: &HashMap<u64, f32>,
+    ) -> f32 {
+        self.mod_wires
+            .iter()
+            .filter(|wire| wire.track == track && wire.target == target)
+            .map(|wire| values.get(&wire.source).copied().unwrap_or(0.0) * wire.depth * span)
+            .sum()
+    }
+
     /// Set a locator at `beat` — or, if one already stands within half a
     /// grid step, remove it: Ableton's Set/Delete toggle in one gesture.
     fn toggle_locator(&mut self, beat: f32, grid: f32) {
@@ -3768,6 +3976,15 @@ impl Arrangement {
         self.selected_clip = self.selected_clip.map(|(t, i)| (shifted(t), i));
         self.cursor = self.cursor.map(|(t, beat)| (shifted(t), beat));
         self.session.selected = self.session.selected.map(|(t, s)| (shifted(t), s));
+        // Followers listen to a LANE, wires land on one: both follow it.
+        for modulator in &mut self.modulators {
+            if let ModKind::Follower { track } = &mut modulator.kind {
+                *track = shifted(*track);
+            }
+        }
+        for wire in &mut self.mod_wires {
+            wire.track = shifted(wire.track);
+        }
         if let Some(ghost) = &mut self.ghost {
             ghost.track = shifted(ghost.track);
         }
@@ -3842,6 +4059,32 @@ impl Arrangement {
         self.selected_clip = self.selected_clip.and_then(|(t, c)| Some((fix(t)?, c)));
         self.cursor = self.cursor.and_then(|(t, b)| Some((fix(t)?, b)));
         self.session.selected = self.session.selected.and_then(|(t, s)| Some((fix(t)?, s)));
+        // A follower of the removed lane goes with it — and its wires go
+        // with the follower; a wire ONTO the removed lane just goes.
+        let orphaned: Vec<u64> = self
+            .modulators
+            .iter()
+            .filter(|modulator| {
+                matches!(modulator.kind, ModKind::Follower { track: t } if fix(t).is_none())
+            })
+            .map(|modulator| modulator.id)
+            .collect();
+        for id in orphaned {
+            self.remove_modulator(id);
+        }
+        for modulator in &mut self.modulators {
+            if let ModKind::Follower { track: t } = &mut modulator.kind
+                && let Some(kept) = fix(*t)
+            {
+                *t = kept;
+            }
+        }
+        self.mod_wires.retain(|wire| fix(wire.track).is_some());
+        for wire in &mut self.mod_wires {
+            if let Some(kept) = fix(wire.track) {
+                wire.track = kept;
+            }
+        }
         self.track_rename = None;
         if self.selection.is_some() && self.selected.is_none() {
             self.selection = None;
@@ -4678,12 +4921,18 @@ fn parameter_base(track: &Track, target: &str, spec: &ParameterSpec) -> f32 {
 /// with no synth would automate silence, and the picker should not offer
 /// it. Track-group targets apply everywhere.
 fn target_applies(track: &Track, target: &str) -> bool {
+    target_applies_kinds(track.device, track.fx, target)
+}
+
+/// The same rule over bare device kinds, for callers holding copies rather
+/// than the track itself.
+fn target_applies_kinds(device: Option<DeviceKind>, fx: Option<DeviceKind>, target: &str) -> bool {
     match target {
         SYNTH_GAIN_TARGET | SYNTH_ATTACK_TARGET | SYNTH_RELEASE_TARGET => {
-            track.device == Some(DeviceKind::SineSynth)
+            device == Some(DeviceKind::SineSynth)
         }
         REVERB_MIX_TARGET | REVERB_SIZE_TARGET | REVERB_DAMP_TARGET => {
-            track.fx == Some(DeviceKind::Reverb)
+            fx == Some(DeviceKind::Reverb)
         }
         _ => true,
     }
@@ -6955,6 +7204,19 @@ fn session_body(
                 egui::FontId::monospace(HEADER_KIND_TYPE),
                 theme.text_value,
             );
+            // The one pixel modulation is allowed outside its strip: a dot
+            // saying "something moves this", and nothing else.
+            if arr
+                .mod_wires
+                .iter()
+                .any(|wire| wire.track == t && wire.target == TRACK_VOLUME_TARGET)
+            {
+                painter.circle_filled(
+                    egui::pos2(readout.left() - 5.0, readout.center().y),
+                    2.0,
+                    theme.accent,
+                );
+            }
             // The pan value rides under the knob it belongs to, not in the
             // corner: label the control, not the strip.
             painter.with_clip_rect(mixer).text(
@@ -9286,6 +9548,389 @@ fn claim(ui: &mut egui::Ui) {
 /// What the device region produced this frame, kept apart by which device
 /// made it: the two cards share a parameter NUMBERING but not a node, and
 /// mixing them up would send a reverb's mix to a synth's gain.
+/// Everything the MOD strip needs, gathered by the caller so the strip
+/// itself never fights the rack's track borrow.
+struct ModStrip<'a> {
+    /// The selected track, if any — where new wires land.
+    track: Option<usize>,
+    /// All track names, for follower tiles and the follower verb.
+    track_names: &'a [String],
+    /// The selected track's device kinds, for target applicability.
+    device: Option<DeviceKind>,
+    fx: Option<DeviceKind>,
+    modulators: &'a mut Vec<Modulator>,
+    wires: &'a mut Vec<ModWire>,
+    next_id: &'a mut u64,
+    registry: &'a ParameterRegistry,
+    /// This frame's live values by modulator id — the animation.
+    values: &'a HashMap<u64, f32>,
+    /// The playhead in beats: what an LFO's phase is a function of.
+    beat: f32,
+}
+
+/// The modulation strip at the end of the rack: source tiles on the left,
+/// this track's wires as rows on the right.
+///
+/// Deliberately QUIET. Each tile's animation is one dot riding a static
+/// curve (or one thin level bar); a wire is a text row with a centre-zero
+/// depth slider and a faint tick showing the live contribution. No cables
+/// are drawn anywhere — at rest a mixing decision reads better as a
+/// sentence than as a wire, and the animated graph overlay is a later,
+/// opt-in view.
+fn mod_strip(ui: &mut egui::Ui, theme: &Theme, strip: ModStrip<'_>) {
+    const TILE: f32 = 54.0;
+    const ROW_H: f32 = 20.0;
+    let font = egui::FontId::proportional(9.0);
+    ui.vertical(|ui| {
+        ui.set_width(320.0);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("MOD").small().color(theme.text_muted));
+            if ui.small_button("+ lfo").clicked() {
+                let id = *strip.next_id;
+                *strip.next_id += 1;
+                strip.modulators.push(Modulator {
+                    id,
+                    kind: ModKind::Lfo {
+                        shape: ModShape::Sine,
+                        rate_beats: 4.0,
+                    },
+                });
+            }
+            if let Some(track) = strip.track
+                && ui
+                    .small_button("+ follow")
+                    .on_hover_text("a follower listening to the selected track's level")
+                    .clicked()
+            {
+                let id = *strip.next_id;
+                *strip.next_id += 1;
+                strip.modulators.push(Modulator {
+                    id,
+                    kind: ModKind::Follower { track },
+                });
+            }
+        });
+        let mut remove: Option<u64> = None;
+        let mut add_wire: Option<(u64, String)> = None;
+        ui.horizontal_wrapped(|ui| {
+            let mut lfo_no = 0;
+            for modulator in strip.modulators.iter_mut() {
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(TILE, TILE), egui::Sense::hover());
+                let painter = ui.painter();
+                painter.rect_filled(rect, 3.0, theme.surface_sunken);
+                painter.rect_stroke(
+                    rect,
+                    3.0,
+                    egui::Stroke::new(1.0, theme.divider),
+                    egui::StrokeKind::Inside,
+                );
+                let value = strip.values.get(&modulator.id).copied().unwrap_or(0.0);
+                let inner = rect.shrink(6.0);
+                match &mut modulator.kind {
+                    ModKind::Lfo { shape, rate_beats } => {
+                        lfo_no += 1;
+                        painter.text(
+                            rect.left_top() + egui::vec2(4.0, 3.0),
+                            egui::Align2::LEFT_TOP,
+                            format!("LFO {lfo_no}"),
+                            font.clone(),
+                            theme.text_muted,
+                        );
+                        // The whole animation: one dot riding a static
+                        // cycle. Legible from the corner of the eye,
+                        // nothing flashes.
+                        let wave_rect = egui::Rect::from_min_max(
+                            egui::pos2(inner.left(), inner.top() + 10.0),
+                            egui::pos2(inner.right(), inner.bottom() - 10.0),
+                        );
+                        let points: Vec<_> = (0..=24)
+                            .map(|step| {
+                                let phase = step as f32 / 24.0;
+                                egui::pos2(
+                                    wave_rect.left() + phase * wave_rect.width(),
+                                    wave_rect.center().y
+                                        - shape.wave(phase) * wave_rect.height() * 0.5,
+                                )
+                            })
+                            .collect();
+                        painter.add(egui::Shape::line(
+                            points,
+                            egui::Stroke::new(1.0, theme.accent_muted),
+                        ));
+                        let phase = (strip.beat / rate_beats.max(1e-3)).rem_euclid(1.0);
+                        painter.circle_filled(
+                            egui::pos2(
+                                wave_rect.left() + phase * wave_rect.width(),
+                                wave_rect.center().y - value * wave_rect.height() * 0.5,
+                            ),
+                            2.5,
+                            theme.accent,
+                        );
+                        // Shape and rate are the tile's two buttons.
+                        let shape_rect = egui::Rect::from_min_size(
+                            egui::pos2(rect.left() + 3.0, rect.bottom() - 14.0),
+                            egui::vec2(24.0, 12.0),
+                        );
+                        let shape_id = ui.id().with(("mod_shape", modulator.id));
+                        if ui
+                            .interact(shape_rect, shape_id, egui::Sense::click())
+                            .clicked()
+                        {
+                            *shape = shape.next();
+                        }
+                        painter.text(
+                            shape_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            shape.label(),
+                            font.clone(),
+                            theme.text,
+                        );
+                        let rate_rect = egui::Rect::from_min_size(
+                            egui::pos2(rect.right() - 27.0, rect.bottom() - 14.0),
+                            egui::vec2(24.0, 12.0),
+                        );
+                        let rate_id = ui.id().with(("mod_rate", modulator.id));
+                        if ui
+                            .interact(rate_rect, rate_id, egui::Sense::click())
+                            .clicked()
+                        {
+                            let at = MOD_RATES
+                                .iter()
+                                .position(|rate| (rate - *rate_beats).abs() < 1e-3)
+                                .unwrap_or(0);
+                            *rate_beats = MOD_RATES[(at + 1) % MOD_RATES.len()];
+                        }
+                        painter.text(
+                            rate_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            rate_label(*rate_beats),
+                            font.clone(),
+                            theme.text,
+                        );
+                    }
+                    ModKind::Follower { track } => {
+                        painter.text(
+                            rect.left_top() + egui::vec2(4.0, 3.0),
+                            egui::Align2::LEFT_TOP,
+                            "FLW",
+                            font.clone(),
+                            theme.text_muted,
+                        );
+                        painter.text(
+                            rect.left_bottom() + egui::vec2(4.0, -4.0),
+                            egui::Align2::LEFT_BOTTOM,
+                            strip
+                                .track_names
+                                .get(*track)
+                                .map_or("?", |name| name.as_str()),
+                            font.clone(),
+                            theme.text,
+                        );
+                        // One thin live bar, nothing else.
+                        let bar = egui::Rect::from_min_max(
+                            egui::pos2(rect.right() - 9.0, inner.top() + 8.0),
+                            egui::pos2(rect.right() - 5.0, inner.bottom() - 8.0),
+                        );
+                        painter.rect_filled(bar, 1.0, theme.surface);
+                        let level = value.clamp(0.0, 1.0);
+                        painter.rect_filled(
+                            egui::Rect::from_min_max(
+                                egui::pos2(bar.left(), bar.bottom() - bar.height() * level),
+                                bar.max,
+                            ),
+                            1.0,
+                            theme.meter_low,
+                        );
+                    }
+                }
+                // The wire verb: a popup of what the SELECTED track can
+                // take, one click per wire.
+                let wire_rect = egui::Rect::from_min_size(
+                    egui::pos2(rect.right() - 14.0, rect.top() + 2.0),
+                    egui::vec2(12.0, 12.0),
+                );
+                let wire_id = ui.id().with(("mod_wire", modulator.id));
+                let wire_response = ui.interact(wire_rect, wire_id, egui::Sense::click());
+                painter.text(
+                    wire_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "→",
+                    font.clone(),
+                    if wire_response.hovered() {
+                        theme.accent
+                    } else {
+                        theme.text_muted
+                    },
+                );
+                egui::Popup::menu(&wire_response)
+                    .id(wire_id.with("popup"))
+                    .show(|ui| {
+                        for spec in &strip.registry.specs {
+                            if !target_applies_kinds(strip.device, strip.fx, &spec.id) {
+                                continue;
+                            }
+                            if ui.button(format!("{} {}", spec.group, spec.name)).clicked() {
+                                add_wire = Some((modulator.id, spec.id.clone()));
+                                egui::Popup::close_all(ui.ctx());
+                            }
+                        }
+                    });
+                // Delete, quietly in the corner.
+                let x_rect = egui::Rect::from_min_size(
+                    egui::pos2(rect.right() - 14.0, rect.bottom() - 14.0),
+                    egui::vec2(12.0, 12.0),
+                );
+                let x_id = ui.id().with(("mod_x", modulator.id));
+                let x_response = ui.interact(x_rect, x_id, egui::Sense::click());
+                if x_response.clicked() {
+                    remove = Some(modulator.id);
+                }
+                painter.text(
+                    x_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "×",
+                    font.clone(),
+                    if x_response.hovered() {
+                        theme.danger
+                    } else {
+                        theme.text_muted
+                    },
+                );
+            }
+        });
+        if let Some(id) = remove {
+            strip.modulators.retain(|modulator| modulator.id != id);
+            strip.wires.retain(|wire| wire.source != id);
+        }
+        if let Some((source, target)) = add_wire
+            && let Some(track) = strip.track
+        {
+            strip.wires.push(ModWire {
+                source,
+                track,
+                target,
+                depth: 0.25,
+            });
+        }
+
+        // --- this track's wires, as sentences -------------------------------
+        let Some(track) = strip.track else { return };
+        let mut remove_wire: Option<usize> = None;
+        for (index, wire) in strip.wires.iter_mut().enumerate() {
+            if wire.track != track {
+                continue;
+            }
+            let name = strip
+                .registry
+                .spec(&wire.target)
+                .map_or(wire.target.clone(), |spec| {
+                    format!("{} {}", spec.group, spec.name)
+                });
+            let source_name = strip
+                .modulators
+                .iter()
+                .position(|modulator| modulator.id == wire.source)
+                .map_or("?".to_owned(), |at| match strip.modulators[at].kind {
+                    ModKind::Lfo { .. } => format!("LFO {}", {
+                        strip.modulators[..=at]
+                            .iter()
+                            .filter(|m| matches!(m.kind, ModKind::Lfo { .. }))
+                            .count()
+                    }),
+                    ModKind::Follower { .. } => "FLW".to_owned(),
+                });
+            let (row, _) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width().max(280.0), ROW_H),
+                egui::Sense::hover(),
+            );
+            let painter = ui.painter();
+            painter.text(
+                egui::pos2(row.left() + 2.0, row.center().y),
+                egui::Align2::LEFT_CENTER,
+                format!("{source_name} → {name}"),
+                font.clone(),
+                theme.text,
+            );
+            // The centre-zero depth slider, with a faint tick riding it to
+            // show the live contribution right now.
+            let slider = egui::Rect::from_min_max(
+                egui::pos2(row.left() + 150.0, row.top() + 5.0),
+                egui::pos2(row.right() - 18.0, row.bottom() - 5.0),
+            );
+            let slider_id = ui.id().with(("mod_depth", index));
+            let response = ui.interact(slider, slider_id, egui::Sense::click_and_drag());
+            if response.double_clicked() {
+                wire.depth = 0.0;
+            } else if response.dragged()
+                && let Some(pos) = response.interact_pointer_pos()
+            {
+                wire.depth =
+                    (((pos.x - slider.left()) / slider.width()) * 2.0 - 1.0).clamp(-1.0, 1.0);
+            }
+            painter.rect_filled(slider, 2.0, theme.surface_sunken);
+            let centre = slider.center().x;
+            let depth_x = centre + wire.depth * slider.width() * 0.5;
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(centre.min(depth_x), slider.top() + 2.0),
+                    egui::pos2(centre.max(depth_x), slider.bottom() - 2.0),
+                ),
+                1.0,
+                theme.accent_muted,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(centre, slider.top()),
+                    egui::pos2(centre, slider.bottom()),
+                ],
+                egui::Stroke::new(1.0, theme.divider),
+            );
+            let live = strip.values.get(&wire.source).copied().unwrap_or(0.0) * wire.depth;
+            let live_x = centre + live * slider.width() * 0.5;
+            painter.line_segment(
+                [
+                    egui::pos2(live_x, slider.top() + 1.0),
+                    egui::pos2(live_x, slider.bottom() - 1.0),
+                ],
+                egui::Stroke::new(1.5, theme.accent),
+            );
+            let x_rect = egui::Rect::from_min_size(
+                egui::pos2(row.right() - 14.0, row.top() + 4.0),
+                egui::vec2(12.0, 12.0),
+            );
+            let x_id = ui.id().with(("mod_wire_x", index));
+            let x_response = ui.interact(x_rect, x_id, egui::Sense::click());
+            if x_response.clicked() {
+                remove_wire = Some(index);
+            }
+            painter.text(
+                x_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "×",
+                font.clone(),
+                if x_response.hovered() {
+                    theme.danger
+                } else {
+                    theme.text_muted
+                },
+            );
+        }
+        if let Some(index) = remove_wire {
+            strip.wires.remove(index);
+        }
+    });
+}
+
+/// A rate as musicians say it: beats up to a bar, bars past it.
+fn rate_label(rate_beats: f32) -> String {
+    if rate_beats < 4.0 {
+        format!("{rate_beats}b")
+    } else {
+        format!("{}bar", rate_beats / 4.0)
+    }
+}
+
 #[derive(Default)]
 struct DeviceEdits {
     synth: Vec<device::ParamEdit>,
@@ -9297,6 +9942,7 @@ fn device_body(
     theme: &Theme,
     synth: Option<&mut device::SineSynthUi>,
     fx: Option<&mut device::ReverbUi>,
+    strip: ModStrip<'_>,
 ) -> DeviceEdits {
     let mut edits = DeviceEdits::default();
     // A rack grows rightward, so the region scrolls horizontally — and a
@@ -9325,7 +9971,6 @@ fn device_body(
                         // addressed to THIS track's nodes.
                         if synth.is_none() && fx.is_none() {
                             daw::ui::kit::empty_state(ui, theme, DEVICE_EMPTY);
-                            return;
                         }
                         if let Some(synth) = synth {
                             edits.synth = device::sine_synth_card(ui, theme, synth);
@@ -9333,6 +9978,11 @@ fn device_body(
                         if let Some(fx) = fx {
                             edits.fx = device::reverb_card(ui, theme, fx);
                         }
+                        // The MOD strip closes the rack. It exists even on
+                        // an empty track: volume and pan are targets a
+                        // track has before it has a device.
+                        ui.separator();
+                        mod_strip(ui, theme, strip);
                     });
                 });
             // Vertical wheel becomes horizontal rack scroll — read AFTER
@@ -9758,6 +10408,10 @@ struct App {
     /// project all reconcile through one door — whoever moved pan, the
     /// letter goes out once and only on a real change.
     sent_pan: Vec<f32>,
+    /// This frame's modulator values by id — LFOs from the beat, followers
+    /// from the meters — evaluated once, read by playback dispatch and the
+    /// MOD strip's animation alike.
+    mod_values: HashMap<u64, f32>,
     /// Last-sent automated device values, per track by target id. Cleared
     /// on every schedule swap with the other sent caches: fresh ids mean
     /// nothing has been sent to anyone.
@@ -9878,6 +10532,7 @@ impl App {
             fx_ids: Vec::new(),
             pan_ids: Vec::new(),
             sent_pan: Vec::new(),
+            mod_values: HashMap::new(),
             sent_automation: Vec::new(),
             sent_volume: Vec::new(),
             meters: Vec::new(),
@@ -9958,6 +10613,10 @@ impl App {
                 .hint("ctrl+shift+S"),
             PaletteCommand::new("project.open", "project", "open project…").hint("ctrl+O"),
             PaletteCommand::new("project.new", "project", "new project"),
+            // --- modulation --------------------------------------------
+            PaletteCommand::new("mod.lfo", "mod", "add LFO"),
+            PaletteCommand::new("mod.follower", "mod", "add follower of selected track")
+                .enabled(self.arrangement.selected.is_some()),
             // --- the session ------------------------------------------
             PaletteCommand::new("session.back", "session", "back to arrangement")
                 .enabled(self.arrangement.session.playing.iter().any(Option::is_some)),
@@ -10086,6 +10745,14 @@ impl App {
             "project.saveas" => actions.push(UiAction::SaveProjectAs),
             "project.open" => actions.push(UiAction::OpenProjectWindow),
             "project.new" => actions.push(UiAction::NewProject),
+            "mod.lfo" => {
+                self.arrangement.add_lfo();
+            }
+            "mod.follower" => {
+                if let Some(track) = self.arrangement.selected {
+                    self.arrangement.add_follower(track);
+                }
+            }
             "session.back" => actions.push(UiAction::BackToArrangement),
             "session.scene.insert" => actions.push(UiAction::InsertScene),
             "session.scene.capture" => actions.push(UiAction::CaptureScene),
@@ -10933,6 +11600,21 @@ impl App {
         ctx.request_repaint();
     }
 
+    /// Every modulator, evaluated ONCE for this frame: LFOs are pure
+    /// functions of the beat, followers read the meter ballistics the
+    /// mixer already runs. Runs engine on or off — the MOD strip's
+    /// animation and playback dispatch read the same map.
+    fn pump_modulators(&mut self) {
+        let beat = (self.transport.position * self.transport.bpm / 60.0) as f32;
+        self.mod_values.clear();
+        for modulator in &self.arrangement.modulators {
+            self.mod_values.insert(
+                modulator.id,
+                modulator_value(&modulator.kind, beat, &self.meters),
+            );
+        }
+    }
+
     /// Walk every track's meter toward this block's peak.
     ///
     /// The engine reports one peak per block; the frame rate and the block
@@ -11083,16 +11765,36 @@ impl App {
         self.sent_pan.resize(n, f32::NAN);
         self.sent_volume.resize(n, f32::NAN);
         let beat = (self.transport.position * self.transport.bpm / 60.0) as f32;
+        let registry = &self.parameter_registry;
+        let pan_span = registry
+            .spec(TRACK_PAN_TARGET)
+            .map_or(2.0, |spec| spec.max - spec.min);
+        let volume_span = registry
+            .spec(TRACK_VOLUME_TARGET)
+            .map_or(1.5, |spec| spec.max - spec.min);
         for i in 0..n {
             let track = &self.arrangement.tracks[i];
-            let pan = track
-                .automation
-                .value_at(TRACK_PAN_TARGET, beat, track.pan)
-                .clamp(-1.0, 1.0);
-            let volume = track
+            // Modulation rides ON TOP of the knob-or-automation value and
+            // clamps into the range at the end — relative, the way a wire
+            // should be, so the fader stays meaningful underneath it.
+            let pan = (track.automation.value_at(TRACK_PAN_TARGET, beat, track.pan)
+                + self.arrangement.modulation_offset(
+                    i,
+                    TRACK_PAN_TARGET,
+                    pan_span,
+                    &self.mod_values,
+                ))
+            .clamp(-1.0, 1.0);
+            let volume = (track
                 .automation
                 .value_at(TRACK_VOLUME_TARGET, beat, track.volume)
-                .max(0.0);
+                + self.arrangement.modulation_offset(
+                    i,
+                    TRACK_VOLUME_TARGET,
+                    volume_span,
+                    &self.mod_values,
+                ))
+            .max(0.0);
             if pan == self.sent_pan[i] && volume == self.sent_volume[i] {
                 continue;
             }
@@ -11146,10 +11848,14 @@ impl App {
                     continue;
                 };
                 let base = parameter_base(track, target, spec);
-                let value = track
-                    .automation
-                    .value_at(target, beat, base)
-                    .clamp(spec.min, spec.max);
+                let value = (track.automation.value_at(target, beat, base)
+                    + self.arrangement.modulation_offset(
+                        i,
+                        target,
+                        spec.max - spec.min,
+                        &self.mod_values,
+                    ))
+                .clamp(spec.min, spec.max);
                 if self.sent_automation[i].get(target) == Some(&value) {
                     continue;
                 }
@@ -11255,6 +11961,7 @@ impl eframe::App for App {
             self.pending_drop_spots.clear();
         }
         self.pump_waveforms();
+        self.pump_modulators();
 
         // Files released over the arrangement land where their ghost stood
         // last frame — the spot the drop preview wrote back. Several files
@@ -11516,16 +12223,37 @@ impl eframe::App for App {
         let (device, edits) = match self.bottom_view {
             BottomView::Rack => {
                 let arrangement = &mut self.arrangement;
+                // The MOD strip's inputs, copied out BEFORE the track's
+                // knob state is borrowed mutably: names and device kinds
+                // are cheap, and copies cannot fight the cards.
+                let track_names: Vec<String> = arrangement
+                    .tracks
+                    .iter()
+                    .map(|track| track.name.clone())
+                    .collect();
+                let (device_kind, fx_kind) = device_track
+                    .and_then(|i| arrangement.tracks.get(i))
+                    .map_or((None, None), |track| (track.device, track.fx));
+                let registry = &self.parameter_registry;
+                let mod_values = &self.mod_values;
+                let beat = (self.transport.position * self.transport.bpm / 60.0) as f32;
                 let out = egui::Panel::bottom("device")
                     .resizable(false)
                     .show_separator_line(true)
                     .exact_size(DEVICE_H)
                     .frame(sunken)
                     .show(ui, |ui| {
+                        let Arrangement {
+                            tracks,
+                            modulators,
+                            mod_wires,
+                            next_modulator_id,
+                            ..
+                        } = arrangement;
                         // Only a track that HOLDS a device shows one. An
                         // empty track's knob state exists but is not its
                         // instrument, so it must not be drawn as one.
-                        let track = device_track.and_then(|i| arrangement.tracks.get_mut(i));
+                        let track = device_track.and_then(|i| tracks.get_mut(i));
                         // Split the borrow: each card needs its own slot,
                         // and only the slots that are actually filled.
                         let (synth, fx) = match track {
@@ -11539,7 +12267,19 @@ impl eframe::App for App {
                             }
                             None => (None, None),
                         };
-                        device_body(ui, t, synth, fx)
+                        let strip = ModStrip {
+                            track: device_track,
+                            track_names: &track_names,
+                            device: device_kind,
+                            fx: fx_kind,
+                            modulators,
+                            wires: mod_wires,
+                            next_id: next_modulator_id,
+                            registry,
+                            values: mod_values,
+                            beat,
+                        };
+                        device_body(ui, t, synth, fx, strip)
                     });
                 (out.response.rect, out.inner)
             }
@@ -14625,6 +15365,223 @@ mod tests {
             ],
         );
         assert_eq!(arr.pending_seek.take(), Some(7.0), "the ruler scrubs");
+    }
+
+    /// An LFO is a pure function of the beat — same beat, same value,
+    /// every bounce — every shape stays inside ±1, and rate scales the
+    /// period exactly.
+    #[test]
+    fn lfos_are_deterministic_functions_of_the_beat() {
+        let meters = [];
+        for shape in [
+            ModShape::Sine,
+            ModShape::Triangle,
+            ModShape::Saw,
+            ModShape::Square,
+        ] {
+            let kind = ModKind::Lfo {
+                shape,
+                rate_beats: 4.0,
+            };
+            for step in 0..64 {
+                let beat = step as f32 * 0.37;
+                let a = modulator_value(&kind, beat, &meters);
+                let b = modulator_value(&kind, beat, &meters);
+                assert_eq!(a, b, "{shape:?} must be a function of the beat");
+                assert!((-1.0..=1.0).contains(&a), "{shape:?} out of range: {a}");
+                let next_cycle = modulator_value(&kind, beat + 4.0, &meters);
+                assert!(
+                    (a - next_cycle).abs() < 1e-3,
+                    "{shape:?} must repeat at its rate"
+                );
+            }
+        }
+        // The shapes are the shapes.
+        let sine = ModKind::Lfo {
+            shape: ModShape::Sine,
+            rate_beats: 4.0,
+        };
+        assert!(modulator_value(&sine, 0.0, &meters).abs() < 1e-6);
+        assert!((modulator_value(&sine, 1.0, &meters) - 1.0).abs() < 1e-6);
+        let square = ModKind::Lfo {
+            shape: ModShape::Square,
+            rate_beats: 2.0,
+        };
+        assert_eq!(modulator_value(&square, 0.5, &meters), 1.0);
+        assert_eq!(modulator_value(&square, 1.5, &meters), -1.0);
+    }
+
+    /// A wire's offset is depth × range, wires sum, negative depth ducks,
+    /// and a wire from a missing source contributes nothing.
+    #[test]
+    fn wires_scale_sum_and_duck() {
+        let mut arr = Arrangement::default();
+        let lfo = arr.add_lfo();
+        let follower = arr.add_follower(1);
+        arr.mod_wires.push(ModWire {
+            source: lfo,
+            track: 0,
+            target: REVERB_MIX_TARGET.to_owned(),
+            depth: 0.5,
+        });
+        arr.mod_wires.push(ModWire {
+            source: follower,
+            track: 0,
+            target: REVERB_MIX_TARGET.to_owned(),
+            depth: -1.0,
+        });
+        let mut values = HashMap::new();
+        values.insert(lfo, 1.0);
+        values.insert(follower, 0.5);
+        // Range 1.0: lfo contributes +0.5, follower ducks −0.5 → 0.
+        let offset = arr.modulation_offset(0, REVERB_MIX_TARGET, 1.0, &values);
+        assert!(
+            (offset - 0.0).abs() < 1e-6,
+            "sum of +0.5 and −0.5: {offset}"
+        );
+        // The other track hears nothing.
+        assert_eq!(
+            arr.modulation_offset(1, REVERB_MIX_TARGET, 1.0, &values),
+            0.0
+        );
+        // A missing source is silence, not a panic and not a stale value.
+        values.remove(&follower);
+        let offset = arr.modulation_offset(0, REVERB_MIX_TARGET, 1.0, &values);
+        assert!((offset - 0.5).abs() < 1e-6);
+
+        // Deleting a modulator takes its wires with it.
+        assert!(arr.remove_modulator(follower));
+        assert_eq!(arr.mod_wires.len(), 1, "the follower's wire went with it");
+        assert!(
+            !arr.remove_modulator(follower),
+            "a second delete is a no-op"
+        );
+    }
+
+    /// Followers listen to a LANE and wires land on one: track moves and
+    /// removals carry both, and removing the listened lane removes the
+    /// follower whole — with its wires.
+    #[test]
+    fn modulation_follows_track_surgery() {
+        let mut arr = Arrangement::default();
+        let follower = arr.add_follower(0);
+        arr.mod_wires.push(ModWire {
+            source: follower,
+            track: 2,
+            target: TRACK_VOLUME_TARGET.to_owned(),
+            depth: 0.3,
+        });
+
+        assert!(arr.move_track(0, 3));
+        let ModKind::Follower { track } = arr.modulators[0].kind else {
+            panic!("still a follower");
+        };
+        assert_eq!(track, 3, "the follower followed its lane");
+        assert_eq!(arr.mod_wires[0].track, 1, "the wire's lane shifted up");
+
+        assert!(arr.remove_track(1));
+        assert!(
+            arr.mod_wires.is_empty(),
+            "the wire's lane is gone, so is it"
+        );
+        assert_eq!(arr.modulators.len(), 1);
+        let ModKind::Follower { track } = arr.modulators[0].kind else {
+            panic!("still a follower");
+        };
+        assert_eq!(track, 2, "the follower's lane index closed the gap");
+
+        assert!(arr.remove_track(2), "now remove the listened lane itself");
+        assert!(
+            arr.modulators.is_empty(),
+            "a follower of a removed lane goes with it"
+        );
+    }
+
+    /// Modulation survives the project file, and a hostile file cannot
+    /// smuggle a dangling wire, an orphan follower or a runaway depth in.
+    #[test]
+    fn modulation_round_trips_and_sanitizes() {
+        let mut arr = Arrangement::default();
+        let mut transport = Transport::default();
+        let lfo = arr.add_lfo();
+        arr.mod_wires.push(ModWire {
+            source: lfo,
+            track: 1,
+            target: TRACK_PAN_TARGET.to_owned(),
+            depth: -0.4,
+        });
+        let text = ron::ser::to_string_pretty(
+            &project_doc(&arr, &transport),
+            ron::ser::PrettyConfig::default(),
+        )
+        .unwrap();
+        let doc: ProjectDoc = ron::from_str(&text).unwrap();
+        let mut loaded = Arrangement::default();
+        apply_project_doc(doc, &mut loaded, &mut transport);
+        assert_eq!(loaded.modulators, arr.modulators);
+        assert_eq!(loaded.mod_wires, arr.mod_wires);
+        assert!(loaded.next_modulator_id > lfo);
+
+        // The hostile file: everything wrong at once.
+        let hostile = ProjectDoc {
+            tracks: vec![Track::new(TrackKind::Midi, "only".to_owned())],
+            modulators: vec![
+                Modulator {
+                    id: 1,
+                    kind: ModKind::Follower { track: 9 },
+                },
+                Modulator {
+                    id: 2,
+                    kind: ModKind::Lfo {
+                        shape: ModShape::Sine,
+                        rate_beats: f32::NAN,
+                    },
+                },
+                Modulator {
+                    id: 3,
+                    kind: ModKind::Lfo {
+                        shape: ModShape::Saw,
+                        rate_beats: 2.0,
+                    },
+                },
+            ],
+            mod_wires: vec![
+                ModWire {
+                    source: 99,
+                    track: 0,
+                    target: TRACK_PAN_TARGET.to_owned(),
+                    depth: 0.5,
+                },
+                ModWire {
+                    source: 3,
+                    track: 5,
+                    target: TRACK_PAN_TARGET.to_owned(),
+                    depth: 0.5,
+                },
+                ModWire {
+                    source: 3,
+                    track: 0,
+                    target: TRACK_PAN_TARGET.to_owned(),
+                    depth: 7.0,
+                },
+            ],
+            next_modulator_id: 1,
+            ..ProjectDoc::default()
+        };
+        let mut loaded = Arrangement::default();
+        apply_project_doc(hostile, &mut loaded, &mut transport);
+        assert_eq!(
+            loaded.modulators.len(),
+            1,
+            "orphan follower and NaN LFO gone"
+        );
+        assert_eq!(
+            loaded.mod_wires.len(),
+            1,
+            "dangling and out-of-range wires gone"
+        );
+        assert_eq!(loaded.mod_wires[0].depth, 1.0, "runaway depth clamped");
+        assert!(loaded.next_modulator_id > 3, "the id mint repaired");
     }
 
     /// Every registered target resolves to an engine binding, its base is
