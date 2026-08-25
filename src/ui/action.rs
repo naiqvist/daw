@@ -67,6 +67,13 @@ pub enum UiAction {
 
     /// Flip the main area between the timeline and the clip launcher. Tab.
     ToggleMainView,
+    /// Stop every session clip: playback returns to the timeline whole.
+    /// Ableton's Back to Arrangement.
+    BackToArrangement,
+    /// Insert an empty scene below the selected one.
+    InsertScene,
+    /// Insert a scene holding copies of everything currently playing.
+    CaptureScene,
 
     // --- history ---
     /// Step the arrangement back to before the last edit. Ctrl+Z.
@@ -130,6 +137,9 @@ impl UiAction {
             Self::ZoomSelectedAudioClip => "Zoom to selected audio clip",
             Self::ZoomBack => "Zoom back",
             Self::ToggleMainView => "Timeline / Session",
+            Self::BackToArrangement => "Back to arrangement",
+            Self::InsertScene => "Insert scene",
+            Self::CaptureScene => "Capture and insert scene",
             Self::Undo => "Undo",
             Self::Redo => "Redo",
             Self::MoveTrack(_) => "Move track",
@@ -177,6 +187,9 @@ impl UiAction {
             | Self::ZoomSelectedAudioClip
             | Self::ZoomBack
             | Self::ToggleMainView
+            | Self::BackToArrangement
+            | Self::InsertScene
+            | Self::CaptureScene
             | Self::Undo
             | Self::Redo
             | Self::MoveTrack(_)

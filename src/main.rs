@@ -1537,6 +1537,19 @@ fn perform(actions: &[UiAction], transport: &mut Transport, arrangement: &mut Ar
             UiAction::ToggleMainView => {
                 arrangement.main_view = arrangement.main_view.toggled();
             }
+            UiAction::BackToArrangement => {
+                arrangement.force_recompile |= arrangement.session.stop_all();
+            }
+            UiAction::InsertScene => {
+                let at = arrangement
+                    .session
+                    .selected_scene
+                    .map_or(arrangement.session.scenes.len(), |scene| scene + 1);
+                arrangement.insert_scene(at);
+            }
+            UiAction::CaptureScene => {
+                arrangement.capture_scene();
+            }
             UiAction::MoveTrack(delta) => {
                 arrangement.nudge_track(*delta);
             }
@@ -1851,6 +1864,33 @@ struct Scene {
     name: String,
 }
 
+/// The tempo a scene name carries, if it carries one — Ableton's classic
+/// trick: a scene named "verse 128 bpm" sets the song to 128 when
+/// launched. The number must sit immediately before "bpm" (with or
+/// without a space) and land inside the app's tempo limits; anything else
+/// is just a name.
+fn scene_tempo(name: &str) -> Option<f64> {
+    let lower = name.to_lowercase();
+    let mut prev: Option<f64> = None;
+    for token in lower.split_whitespace() {
+        if token == "bpm" {
+            if let Some(bpm) = prev {
+                return (limits::BPM_MIN..=limits::BPM_MAX)
+                    .contains(&bpm)
+                    .then_some(bpm);
+            }
+        } else if let Some(number) = token.strip_suffix("bpm")
+            && let Ok(bpm) = number.parse::<f64>()
+        {
+            return (limits::BPM_MIN..=limits::BPM_MAX)
+                .contains(&bpm)
+                .then_some(bpm);
+        }
+        prev = token.parse::<f64>().ok();
+    }
+    None
+}
+
 /// The clip launcher's model: a grid of slots, and what is playing.
 ///
 /// `slots` is parallel to `Arrangement::tracks`, exactly like `clips` —
@@ -1866,6 +1906,10 @@ struct Session {
     playing: Vec<Option<usize>>,
     /// The slot the clip editor follows while the session is showing.
     selected: Option<(usize, usize)>,
+    /// The selected SCENE — what Enter launches and what insert-below
+    /// inserts below. Launching a scene selects the next one, Ableton's
+    /// default, so launching down a song is Enter, Enter, Enter.
+    selected_scene: Option<usize>,
 }
 
 /// How many scenes a fresh session offers. Eight rows is what fits without
@@ -1896,6 +1940,7 @@ impl Session {
                 .collect(),
             playing: vec![None; tracks],
             selected: None,
+            selected_scene: None,
         }
     }
 
@@ -1980,6 +2025,25 @@ impl Session {
                 .collect(),
         )
     }
+}
+
+/// An inline scene rename in flight, exactly the track rename's shape.
+struct SceneRename {
+    scene: usize,
+    text: String,
+    original: String,
+    focused: bool,
+}
+
+/// A slot's clip being dragged to another slot. Nothing moves until the
+/// release; Escape abandons it. Ctrl carries a copy, like the timeline's
+/// clip drag.
+struct SlotDrag {
+    from: (usize, usize),
+    copy: bool,
+    /// Where a release right now would land — a slot whose lane can hold
+    /// the clip. None over anything else.
+    target: Option<(usize, usize)>,
 }
 
 /// A track header being dragged to a new position in the stack. The lane
@@ -2081,6 +2145,10 @@ struct Arrangement {
     session_mixer_h: f32,
     /// The header drag, while one is in flight.
     track_drag: Option<TrackDrag>,
+    /// The scene rename, while one is open.
+    scene_rename: Option<SceneRename>,
+    /// The slot drag, while one is in flight.
+    slot_drag: Option<SlotDrag>,
     /// "Recompile NOW, and do not wait for the dirty check to agree."
     /// Set by the edits whose consequences no other check can see, and
     /// cleared by the app once it has swapped:
@@ -2279,6 +2347,8 @@ impl Default for Arrangement {
             session_scroll_y: 0.0,
             session_mixer_h: SESSION_MIXER_H,
             track_drag: None,
+            scene_rename: None,
+            slot_drag: None,
             force_recompile: false,
         }
     }
@@ -2332,6 +2402,8 @@ impl Arrangement {
         self.rename = None;
         self.track_rename = None;
         self.track_drag = None;
+        self.scene_rename = None;
+        self.slot_drag = None;
         // `playing` is not part of the snapshot, so it has to be made to
         // fit the grid that just came back: one entry per track, and no
         // track left playing a slot the undo emptied.
@@ -2349,6 +2421,13 @@ impl Arrangement {
             .is_some_and(|(t, scene)| self.session.slots.get(t).is_some_and(|c| scene < c.len()))
         {
             self.session.selected = None;
+        }
+        if self
+            .session
+            .selected_scene
+            .is_some_and(|scene| scene >= self.session.scenes.len())
+        {
+            self.session.selected_scene = None;
         }
         // A restored selection must still point at something that exists:
         // undoing back past a track's creation would otherwise leave the
@@ -2465,13 +2544,154 @@ impl Arrangement {
 
     /// Append a row to the grid.
     fn add_scene(&mut self) {
-        let n = self.session.scenes.len() + 1;
-        self.session.scenes.push(Scene {
-            name: format!("Scene {n}"),
-        });
+        let at = self.session.scenes.len();
+        self.insert_scene(at);
+    }
+
+    /// Insert an empty row at `at`, shifting everything at and below it
+    /// down one. Every index pointing into the shifted region follows its
+    /// row — a track playing scene 3 is playing scene 4 once a row lands
+    /// above it, and it must not notice.
+    fn insert_scene(&mut self, at: usize) {
+        let at = at.min(self.session.scenes.len());
+        self.session.scenes.insert(
+            at,
+            Scene {
+                name: format!("Scene {}", at + 1),
+            },
+        );
         for column in &mut self.session.slots {
-            column.push(None);
+            column.insert(at, None);
         }
+        for playing in self.session.playing.iter_mut().flatten() {
+            if *playing >= at {
+                *playing += 1;
+            }
+        }
+        if let Some((_, scene)) = self.session.selected.as_mut()
+            && *scene >= at
+        {
+            *scene += 1;
+        }
+        self.session.selected_scene = Some(at);
+    }
+
+    /// Ableton's Capture and Insert Scene: a new row below the selection,
+    /// holding COPIES of what every track is currently playing — fresh
+    /// ids, because identity is never in two places — and selected, ready
+    /// to launch.
+    ///
+    /// What is PLAYING is deliberately left alone: the copies are
+    /// identical to what already sounds, so relaunching them would buy a
+    /// schedule swap (and a disk-stream restart on audio tracks) for no
+    /// audible change. The captured scene launches like any other the
+    /// next time it is asked to.
+    fn capture_scene(&mut self) -> bool {
+        if self.session.playing.iter().all(Option::is_none) {
+            return false;
+        }
+        let at = self
+            .session
+            .selected_scene
+            .map_or(self.session.scenes.len(), |scene| scene + 1);
+        self.insert_scene(at);
+        for track in 0..self.tracks.len() {
+            let Some(playing) = self.session.playing.get(track).copied().flatten() else {
+                continue;
+            };
+            let Some(mut copy) = self.session.slot(track, playing).cloned() else {
+                continue;
+            };
+            copy.id = self.next_id();
+            self.session.slots[track][at] = Some(copy);
+        }
+        self.session.selected_scene = Some(at);
+        true
+    }
+
+    /// Remove a row. The last row stays — a launcher with no rows has
+    /// nothing to click — and a track playing the removed row stops,
+    /// which the engine must hear.
+    fn remove_scene(&mut self, at: usize) -> bool {
+        if self.session.scenes.len() <= 1 || at >= self.session.scenes.len() {
+            return false;
+        }
+        self.session.scenes.remove(at);
+        for column in &mut self.session.slots {
+            column.remove(at);
+        }
+        for playing in self.session.playing.iter_mut() {
+            *playing = match *playing {
+                Some(scene) if scene == at => {
+                    self.force_recompile = true;
+                    None
+                }
+                Some(scene) if scene > at => Some(scene - 1),
+                keep => keep,
+            };
+        }
+        self.session.selected =
+            self.session
+                .selected
+                .and_then(|(track, scene)| match scene.cmp(&at) {
+                    std::cmp::Ordering::Less => Some((track, scene)),
+                    std::cmp::Ordering::Equal => None,
+                    std::cmp::Ordering::Greater => Some((track, scene - 1)),
+                });
+        self.session.selected_scene =
+            self.session
+                .selected_scene
+                .and_then(|scene| match scene.cmp(&at) {
+                    std::cmp::Ordering::Less => Some(scene),
+                    std::cmp::Ordering::Equal => (at > 0).then(|| at - 1).or(Some(0)),
+                    std::cmp::Ordering::Greater => Some(scene - 1),
+                });
+        true
+    }
+
+    /// Move (or, with `copy`, duplicate) a slot's clip to another slot.
+    /// The landing replaces whatever was there — Ableton's rule, and the
+    /// undoable one. The target lane's kind must be able to hold the clip.
+    ///
+    /// Playing state follows the sound: a playing clip moved WITHIN its
+    /// track keeps playing from its new row (nothing audible changed); a
+    /// playing clip moved to another track stops its source, and a
+    /// playing TARGET that gets replaced is an audible change — both mark
+    /// the schedule dirty out loud.
+    fn move_slot(&mut self, from: (usize, usize), to: (usize, usize), copy: bool) -> bool {
+        if from == to || to.0 >= self.tracks.len() || to.1 >= self.session.scenes.len() {
+            return false;
+        }
+        let Some(clip) = self.session.slot(from.0, from.1).cloned() else {
+            return false;
+        };
+        if !lane_accepts(&self.tracks[to.0], &clip) {
+            return false;
+        }
+        let mut placed = clip;
+        if copy {
+            placed.id = self.next_id();
+        } else {
+            self.session.slots[from.0][from.1] = None;
+        }
+        let replaced_playing = self.session.is_playing(to.0, to.1);
+        self.session.slots[to.0][to.1] = Some(placed);
+        if replaced_playing {
+            self.force_recompile = true;
+        }
+        if !copy && self.session.playing.get(from.0).copied().flatten() == Some(from.1) {
+            if from.0 == to.0 {
+                // Same track: the playing clip just changed rows. Nothing
+                // audible moved, the pointer follows.
+                self.session.playing[from.0] = Some(to.1);
+            } else {
+                self.session.stop_track(from.0);
+                self.force_recompile = true;
+            }
+        }
+        self.session.selected = Some(to);
+        self.session.selected_scene = Some(to.1);
+        true
     }
 
     /// Move the lane at `from` so that it ends up at index `to`, carrying
@@ -3756,6 +3976,39 @@ fn arrangement_body(
     if minimap_pass(ui, theme, minimap, arr, content.width(), playhead) {
         panned = true;
     }
+
+    // While session clips override the timeline, the timeline says so — a
+    // lit chip over the minimap's corner, and clicking it is the way back.
+    // Created AFTER the minimap's interact, so the chip wins the pointer
+    // where they overlap.
+    if arr.session.playing.iter().any(Option::is_some) {
+        let chip = egui::Rect::from_min_size(
+            egui::pos2(minimap.right() - 118.0, minimap.top() + 2.0),
+            egui::vec2(116.0, 14.0),
+        );
+        let wid = ui.id().with("timeline_back_to_arr");
+        let response = ui.interact(chip, wid, egui::Sense::click());
+        if response.clicked() {
+            arr.force_recompile |= arr.session.stop_all();
+        }
+        let painter = ui.painter();
+        painter.rect_filled(
+            chip,
+            3.0,
+            if response.hovered() {
+                theme.warn
+            } else {
+                theme.warn.gamma_multiply(0.75)
+            },
+        );
+        painter.text(
+            chip.center(),
+            egui::Align2::CENTER_CENTER,
+            "session playing — click to return",
+            egui::FontId::proportional(9.0),
+            theme.bg,
+        );
+    }
     let offset = arr.view_beats;
 
     beat_grid(ui, content, theme, arr, beats_per_bar);
@@ -4528,6 +4781,16 @@ fn launch_triangle(painter: &egui::Painter, rect: egui::Rect, color: egui::Color
     ));
 }
 
+/// What the session pass hands back to the app: the things only the app
+/// can settle — a clip light lives with the meters, and a tempo change
+/// must reach the engine's transport.
+#[derive(Default)]
+struct SessionOutcome {
+    cleared_clip: Option<usize>,
+    /// A launched scene carried a tempo in its name.
+    tempo: Option<f64>,
+}
+
 /// What the session grid was asked to do this frame. Collected while
 /// drawing and applied after, for the same reason the clip pass does it:
 /// the draw holds `arr` borrowed.
@@ -4542,6 +4805,12 @@ enum SessionIntent {
     StopAll,
     AddScene,
     SelectTrack(usize),
+    SelectScene(usize),
+    RenameScene(usize),
+    InsertSceneBelow(usize),
+    CaptureScene,
+    RemoveScene(usize),
+    MoveSlot((usize, usize), (usize, usize), bool),
 }
 
 /// The clip launcher: tracks as columns, scenes as rows, clips as slots.
@@ -4560,7 +4829,7 @@ fn session_body(
     // entry meters silence.
     meters: &[device::meter::Ballistics],
     drag: Option<&mut DragImport>,
-) -> Option<usize> {
+) -> SessionOutcome {
     let area = ui.max_rect();
     claim(ui);
     ui.painter().rect_filled(area, 0.0, theme.bg);
@@ -4637,6 +4906,7 @@ fn session_body(
     let mut solo: Option<usize> = None;
     let mut volume_edit: Option<(usize, f32)> = None;
     let mut clear_clip: Option<usize> = None;
+    let mut slot_drag = arr.slot_drag.take();
     // A Cell for the same reason as the clip pass's menu: one closure per
     // slot per frame, all reaching one slot.
     let menu: std::cell::Cell<Option<SessionIntent>> = std::cell::Cell::new(None);
@@ -4704,7 +4974,17 @@ fn session_body(
             let picked = arr.session.selected == Some((t, scene));
             let wid = ui.id().with(("slot", t, scene));
             focus.register(wid, rect);
-            let response = ui.interact(rect, wid, egui::Sense::click());
+            let response = ui.interact(rect, wid, egui::Sense::click_and_drag());
+            if response.drag_started() && clip.is_some() {
+                // A slot's clip can be pulled to another slot. Ctrl
+                // carries a copy, like the timeline's clip drag; nothing
+                // moves until the release.
+                slot_drag = Some(SlotDrag {
+                    from: (t, scene),
+                    copy: ui.input(|i| i.modifiers.command),
+                    target: None,
+                });
+            }
             let launch_rect = egui::Rect::from_min_max(
                 rect.min,
                 egui::pos2(
@@ -4959,6 +5239,75 @@ fn session_body(
         }
     }
 
+    // --- the slot drag in flight -------------------------------------------
+    if let Some(drag) = &mut slot_drag {
+        // Escape abandons it; the grid never moved, so there is nothing
+        // to put back.
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            slot_drag = None;
+        } else {
+            let clip = arr.session.slot(drag.from.0, drag.from.1).cloned();
+            match (clip, ui.ctx().pointer_latest_pos()) {
+                (Some(clip), Some(pos)) => {
+                    // The slot under the pointer, if its lane can hold the
+                    // clip. Same rules as a drop from outside.
+                    drag.target = None;
+                    if layout.rows_viewport().contains(pos) {
+                        'aim: for track in 0..arr.tracks.len() {
+                            if !lane_accepts(&arr.tracks[track], &clip) {
+                                continue;
+                            }
+                            for scene in 0..arr.session.scenes.len() {
+                                let rect = layout.slot(track, scene);
+                                if rect.contains(pos) {
+                                    drag.target = Some((track, scene));
+                                    break 'aim;
+                                }
+                            }
+                        }
+                    }
+                    if let Some((track, scene)) = drag.target
+                        && (track, scene) != drag.from
+                    {
+                        let rect = layout.slot(track, scene).intersect(layout.rows_viewport());
+                        let painter = ui.painter();
+                        painter.rect_filled(rect, 3.0, theme.accent_muted.gamma_multiply(0.35));
+                        painter.rect_stroke(
+                            rect,
+                            3.0,
+                            egui::Stroke::new(1.5, theme.accent),
+                            egui::StrokeKind::Middle,
+                        );
+                    }
+                    // The clip's name rides the pointer, marked as a copy
+                    // when Ctrl says so.
+                    ui.painter().text(
+                        pos + egui::vec2(12.0, -10.0),
+                        egui::Align2::LEFT_CENTER,
+                        if drag.copy {
+                            format!("+ {}", clip.name)
+                        } else {
+                            clip.name.clone()
+                        },
+                        egui::FontId::proportional(HEADER_KIND_TYPE),
+                        theme.text,
+                    );
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                    if ui.input(|i| i.pointer.any_released()) {
+                        if let Some(target) = drag.target.filter(|target| *target != drag.from) {
+                            intent = Some(SessionIntent::MoveSlot(drag.from, target, drag.copy));
+                        }
+                        slot_drag = None;
+                    }
+                }
+                // The clip vanished under the drag (an undo mid-gesture):
+                // the drag is about a model that no longer exists.
+                _ => slot_drag = None,
+            }
+        }
+    }
+    arr.slot_drag = slot_drag;
+
     // The seam's mark: quiet until pointed at, like the app's other seams.
     if seam_response.hovered() || seam_response.dragged() {
         ui.painter().line_segment(
@@ -4978,10 +5327,58 @@ fn session_body(
         [scene_col.left_top(), scene_col.left_bottom()],
         egui::Stroke::new(1.0, theme.divider),
     );
+
+    // Back to Arrangement, in the column header: lit only while session
+    // clips are overriding the timeline, because that is the only time it
+    // means anything — Ableton's button, Ableton's rule.
+    let session_active = arr.session.playing.iter().any(Option::is_some);
+    let header = egui::Rect::from_min_max(
+        egui::pos2(scene_col.left() + SLOT_GAP, area.top() + 2.0),
+        egui::pos2(
+            scene_col.right() - SLOT_GAP,
+            area.top() + SESSION_HEAD_H - 2.0,
+        ),
+    );
+    if session_active {
+        let wid = ui.id().with("back_to_arrangement");
+        focus.register(wid, header);
+        let response = ui.interact(header, wid, egui::Sense::click());
+        if response.clicked() || focus.activated(wid) {
+            intent = Some(SessionIntent::StopAll);
+        }
+        let painter = ui.painter();
+        painter.rect_filled(
+            header,
+            3.0,
+            if response.hovered() {
+                theme.warn
+            } else {
+                theme.warn.gamma_multiply(0.75)
+            },
+        );
+        painter.text(
+            header.center(),
+            egui::Align2::CENTER_CENTER,
+            "back to arrangement",
+            egui::FontId::proportional(HEADER_KIND_TYPE),
+            theme.bg,
+        );
+    } else {
+        ui.painter().text(
+            header.center(),
+            egui::Align2::CENTER_CENTER,
+            "scenes",
+            egui::FontId::proportional(HEADER_KIND_TYPE),
+            theme.text_muted,
+        );
+    }
     // The scene rows share the slots' scroll, and clip the same way — to
     // their own column, which runs to the bottom (no mixer under it).
     let scene_view =
         egui::Rect::from_min_max(egui::pos2(scene_col.left(), layout.rows_top), scene_col.max);
+    let mut scene_rename = arr.scene_rename.take();
+    let mut scene_rename_commit = false;
+    let mut scene_rename_cancel = false;
     for (s, scene) in arr.session.scenes.iter().enumerate() {
         let full = layout.scene(s);
         if full.top() >= scene_view.bottom() {
@@ -4991,32 +5388,118 @@ fn session_body(
         if rect.height() <= 1.0 {
             continue;
         }
+        let selected = arr.session.selected_scene == Some(s);
         let wid = ui.id().with(("scene", s));
         focus.register(wid, rect);
+        // The TRIANGLE launches; the name selects (and renames on a
+        // double-click) — the same division the slots use, so a scene can
+        // be aimed at without firing it.
+        let launch_rect = egui::Rect::from_min_max(
+            rect.min,
+            egui::pos2(rect.left() + SLOT_LAUNCH_W, rect.bottom()),
+        );
         let response = ui.interact(rect, wid, egui::Sense::click());
-        if response.clicked() || focus.activated(wid) {
+        if let Some(pos) = response.interact_pointer_pos() {
+            if response.double_clicked() && !launch_rect.contains(pos) {
+                intent = Some(SessionIntent::RenameScene(s));
+            } else if response.clicked() {
+                intent = Some(if launch_rect.contains(pos) {
+                    SessionIntent::LaunchScene(s)
+                } else {
+                    SessionIntent::SelectScene(s)
+                });
+            }
+        }
+        if focus.activated(wid) {
             intent = Some(SessionIntent::LaunchScene(s));
         }
+        response.context_menu(|ui| {
+            if ui.button("Rename").clicked() {
+                menu.set(Some(SessionIntent::RenameScene(s)));
+                ui.close();
+            }
+            if ui.button("Insert scene below").clicked() {
+                menu.set(Some(SessionIntent::InsertSceneBelow(s)));
+                ui.close();
+            }
+            if ui.button("Capture and insert scene").clicked() {
+                menu.set(Some(SessionIntent::CaptureScene));
+                ui.close();
+            }
+            if ui.button("Delete").clicked() {
+                menu.set(Some(SessionIntent::RemoveScene(s)));
+                ui.close();
+            }
+        });
+
         let painter = ui.painter();
-        if response.hovered() {
+        if selected {
+            painter.rect_filled(rect, 3.0, theme.accent_muted.gamma_multiply(0.3));
+        } else if response.hovered() {
             painter.rect_filled(rect, 3.0, theme.surface_raised);
         }
         launch_triangle(
             painter,
-            egui::Rect::from_min_max(
-                rect.min,
-                egui::pos2(rect.left() + SLOT_LAUNCH_W, rect.bottom()),
-            ),
-            theme.text_muted,
+            launch_rect,
+            if selected {
+                theme.text
+            } else {
+                theme.text_muted
+            },
         );
-        painter.with_clip_rect(rect).text(
-            egui::pos2(rect.left() + SLOT_LAUNCH_W, rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            &scene.name,
-            small.clone(),
-            theme.text_muted,
-        );
+        if let Some(r) = scene_rename.as_mut().filter(|r| r.scene == s) {
+            // The name becomes an edit box in place, like every other
+            // rename here. Enter commits, Escape restores, clicking away
+            // commits.
+            let edit = egui::Rect::from_min_size(
+                egui::pos2(rect.left() + SLOT_LAUNCH_W, rect.top() + 1.0),
+                egui::vec2(
+                    (rect.width() - SLOT_LAUNCH_W - 2.0).max(40.0),
+                    rect.height() - 2.0,
+                ),
+            );
+            let field = ui.put(edit, egui::TextEdit::singleline(&mut r.text));
+            if !r.focused {
+                field.request_focus();
+                r.focused = true;
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                scene_rename_cancel = true;
+            } else if ui.input(|i| i.key_pressed(egui::Key::Enter)) || field.lost_focus() {
+                scene_rename_commit = true;
+            }
+        } else {
+            // A scene carrying a tempo announces it: the number is a
+            // control, not a caption, and it reads differently.
+            let named_tempo = scene_tempo(&scene.name);
+            painter.with_clip_rect(rect).text(
+                egui::pos2(rect.left() + SLOT_LAUNCH_W, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                &scene.name,
+                small.clone(),
+                match (selected, named_tempo.is_some()) {
+                    (_, true) => theme.accent,
+                    (true, false) => theme.text,
+                    (false, false) => theme.text_muted,
+                },
+            );
+        }
     }
+    // Rename settlement, after the borrow of `scenes` is done.
+    if scene_rename_cancel {
+        scene_rename = None;
+    } else if scene_rename_commit
+        && let Some(r) = scene_rename.take()
+        && let Some(scene) = arr.session.scenes.get_mut(r.scene)
+    {
+        let text = r.text.trim();
+        scene.name = if text.is_empty() {
+            r.original
+        } else {
+            text.to_owned()
+        };
+    }
+    arr.scene_rename = scene_rename;
 
     let stop_all = layout.stop_all().intersect(scene_view);
     if stop_all.height() > 1.0 {
@@ -5154,6 +5637,7 @@ fn session_body(
     {
         track.volume = amp;
     }
+    let mut outcome = SessionOutcome::default();
     match intent.or(menu.get()) {
         Some(SessionIntent::Launch(t, s)) => {
             // Launching is an instrument, not a form: the swap happens on
@@ -5180,17 +5664,50 @@ fn session_body(
         }
         Some(SessionIntent::LaunchScene(s)) => {
             arr.force_recompile |= arr.session.launch_scene(s);
+            // A scene named with a tempo IS a tempo change, and launching
+            // selects the NEXT scene — Ableton's default — so launching
+            // down a song is Enter, Enter, Enter.
+            outcome.tempo = scene_tempo(
+                arr.session
+                    .scenes
+                    .get(s)
+                    .map(|scene| scene.name.as_str())
+                    .unwrap_or(""),
+            );
+            arr.session.selected_scene =
+                Some((s + 1).min(arr.session.scenes.len().saturating_sub(1)));
         }
         Some(SessionIntent::StopAll) => {
             arr.force_recompile |= arr.session.stop_all();
         }
         Some(SessionIntent::AddScene) => arr.add_scene(),
         Some(SessionIntent::SelectTrack(t)) => arr.selected = Some(t),
+        Some(SessionIntent::SelectScene(s)) => arr.session.selected_scene = Some(s),
+        Some(SessionIntent::RenameScene(s)) => {
+            if let Some(scene) = arr.session.scenes.get(s) {
+                arr.session.selected_scene = Some(s);
+                arr.scene_rename = Some(SceneRename {
+                    scene: s,
+                    text: scene.name.clone(),
+                    original: scene.name.clone(),
+                    focused: false,
+                });
+            }
+        }
+        Some(SessionIntent::InsertSceneBelow(s)) => arr.insert_scene(s + 1),
+        Some(SessionIntent::CaptureScene) => {
+            arr.capture_scene();
+        }
+        Some(SessionIntent::RemoveScene(s)) => {
+            arr.remove_scene(s);
+        }
+        Some(SessionIntent::MoveSlot(from, to, copy)) => {
+            arr.move_slot(from, to, copy);
+        }
         None => {}
     }
-    // The one thing the grid cannot settle itself: a latched clip light
-    // lives with the meters, which belong to the app.
-    clear_clip
+    outcome.cleared_clip = clear_clip;
+    outcome
 }
 
 /// Highlight the slot a dragged audio file would drop into, and report it.
@@ -7409,6 +7926,16 @@ impl App {
             PaletteCommand::new("clip.duplicate", "clip", "duplicate clip").enabled(has_clip),
             PaletteCommand::new("clip.delete", "clip", "delete clip").enabled(has_clip),
             PaletteCommand::new("clip.loop", "clip", "loop the selection"),
+            // --- the session ------------------------------------------
+            PaletteCommand::new("session.back", "session", "back to arrangement")
+                .enabled(self.arrangement.session.playing.iter().any(Option::is_some)),
+            PaletteCommand::new("session.scene.insert", "session", "insert scene"),
+            PaletteCommand::new(
+                "session.scene.capture",
+                "session",
+                "capture and insert scene",
+            )
+            .enabled(self.arrangement.session.playing.iter().any(Option::is_some)),
             // --- the main area's two faces -----------------------------
             PaletteCommand::new(
                 "view.main",
@@ -7523,6 +8050,9 @@ impl App {
             "clip.duplicate" => actions.push(UiAction::DuplicateClip),
             "clip.delete" => actions.push(UiAction::DeleteSelected),
             "view.main" => actions.push(UiAction::ToggleMainView),
+            "session.back" => actions.push(UiAction::BackToArrangement),
+            "session.scene.insert" => actions.push(UiAction::InsertScene),
+            "session.scene.capture" => actions.push(UiAction::CaptureScene),
             "edit.undo" => actions.push(UiAction::Undo),
             "edit.redo" => actions.push(UiAction::Redo),
             "clip.loop" => actions.push(UiAction::LoopFromSelection),
@@ -8744,9 +9274,9 @@ impl eframe::App for App {
             follow: self.transport.follow,
         };
 
-        // A clip light cleared this frame, if the launcher's meters were
-        // clicked. Settled after the panel, where `self.meters` is free.
-        let mut cleared_clip = None;
+        // What the launcher hands back — settled after the panel, where
+        // `self.meters` and the transport are free again.
+        let mut session_outcome = SessionOutcome::default();
         let panned = egui::CentralPanel::default()
             .frame(self.fill(t.bg))
             .show(ui, |ui| match self.arrangement.main_view {
@@ -8760,7 +9290,7 @@ impl eframe::App for App {
                     self.drag_import.as_mut(),
                 ),
                 MainView::Session => {
-                    cleared_clip = session_body(
+                    session_outcome = session_body(
                         ui,
                         &mut self.focus,
                         &self.theme,
@@ -8776,10 +9306,15 @@ impl eframe::App for App {
             })
             .inner;
 
-        if let Some(track) = cleared_clip
+        if let Some(track) = session_outcome.cleared_clip
             && let Some(meter) = self.meters.get_mut(track)
         {
             meter.clipped = false;
+        }
+        // A scene's named tempo rides the same action road every other
+        // tempo change takes, so the engine and the mirror both hear it.
+        if let Some(bpm) = session_outcome.tempo {
+            actions.push(UiAction::SetTempo(bpm));
         }
 
         // Panning by hand is the user taking the wheel: follow stays off
@@ -8884,6 +9419,8 @@ impl eframe::App for App {
             && self.arrangement.ghost.is_none()
             && self.arrangement.rename.is_none()
             && self.arrangement.track_rename.is_none()
+            && self.arrangement.scene_rename.is_none()
+            && self.arrangement.slot_drag.is_none()
             && self.drag_import.is_none()
             && self.wav_import_pending == 0
             && !ui.ctx().egui_wants_keyboard_input();
@@ -11518,6 +12055,125 @@ mod tests {
         );
     }
 
+    /// A scene named with a tempo IS a tempo change — Ableton's classic
+    /// trick — and the parser takes only what it can take safely.
+    #[test]
+    fn a_scene_name_can_carry_a_tempo() {
+        assert_eq!(scene_tempo("verse 128 bpm"), Some(128.0));
+        assert_eq!(scene_tempo("128bpm"), Some(128.0));
+        assert_eq!(scene_tempo("Drop 174.5 BPM"), Some(174.5));
+        assert_eq!(scene_tempo("Scene 3"), None, "a bare number is a name");
+        assert_eq!(scene_tempo("bpm"), None);
+        assert_eq!(
+            scene_tempo("9999 bpm"),
+            None,
+            "outside the limits is a name"
+        );
+        assert_eq!(scene_tempo("10 bpm"), None);
+        assert_eq!(scene_tempo(""), None);
+    }
+
+    /// Insert shifts every pointer below it; capture copies what plays
+    /// under fresh ids and touches nothing audible; remove stops what it
+    /// removes and the last scene stays.
+    #[test]
+    fn scenes_insert_capture_and_remove() {
+        let mut arr = Arrangement::default();
+        assert!(arr.create_slot_clip(0, 1, 4.0));
+        assert!(arr.create_slot_clip(1, 3, 4.0));
+        assert!(arr.session.launch(0, 1));
+        assert!(arr.session.launch(1, 3));
+        let before = arr.effective_clips();
+        let scenes = arr.session.scenes.len();
+
+        // Insert above the playing rows: both pointers follow their rows.
+        arr.insert_scene(0);
+        assert_eq!(arr.session.scenes.len(), scenes + 1);
+        assert_eq!(arr.session.playing[0], Some(2), "playing followed its row");
+        assert_eq!(arr.session.playing[1], Some(4));
+        assert_eq!(arr.effective_clips(), before, "nothing audible moved");
+        assert_eq!(
+            arr.session.selected_scene,
+            Some(0),
+            "the new row is selected"
+        );
+
+        // Capture: a new row below the selection holding copies of what
+        // plays, fresh ids, playing untouched.
+        let ids: Vec<u64> = [arr.session.slot(0, 2), arr.session.slot(1, 4)]
+            .iter()
+            .map(|slot| slot.unwrap().id)
+            .collect();
+        assert!(arr.capture_scene());
+        let at = arr.session.selected_scene.unwrap();
+        assert_eq!(at, 1, "below the selected scene");
+        let captured0 = arr.session.slot(0, at).expect("track 0 captured");
+        let captured1 = arr.session.slot(1, at).expect("track 1 captured");
+        assert!(!ids.contains(&captured0.id), "a copy has an id of its own");
+        assert!(!ids.contains(&captured1.id));
+        assert_eq!(arr.session.playing[0], Some(3), "playing did not move");
+        assert_eq!(arr.effective_clips(), before, "and nothing audible changed");
+
+        // Remove the row track 0 is playing: that track stops, loudly.
+        arr.force_recompile = false;
+        assert!(arr.remove_scene(3));
+        assert_eq!(arr.session.playing[0], None, "its row is gone, it stops");
+        assert!(arr.force_recompile, "and the engine is told now");
+        assert_eq!(arr.session.playing[1], Some(4), "the other shifted down");
+
+        // The last scene stays.
+        while arr.session.scenes.len() > 1 {
+            assert!(arr.remove_scene(0));
+        }
+        assert!(!arr.remove_scene(0), "a launcher keeps at least one row");
+    }
+
+    /// Slots move and copy between compatible lanes, replacing what they
+    /// land on, with playing state following the sound.
+    #[test]
+    fn slots_move_between_compatible_lanes() {
+        let mut arr = Arrangement::default();
+        let audio = arr.add_track(TrackKind::Audio);
+        assert!(arr.create_slot_clip(0, 0, 4.0));
+        let id = arr.session.slot(0, 0).unwrap().id;
+
+        // Same track: a playing clip keeps playing from its new row.
+        assert!(arr.session.launch(0, 0));
+        arr.force_recompile = false;
+        assert!(arr.move_slot((0, 0), (0, 3), false));
+        assert!(arr.session.slot(0, 0).is_none(), "the source is vacated");
+        assert_eq!(
+            arr.session.slot(0, 3).map(|c| c.id),
+            Some(id),
+            "same identity"
+        );
+        assert_eq!(arr.session.playing[0], Some(3), "playing followed");
+        assert!(!arr.force_recompile, "nothing audible changed");
+
+        // A MIDI clip cannot land on an audio lane.
+        assert!(!arr.move_slot((0, 3), (audio, 0), false));
+        assert_eq!(
+            arr.session.slot(0, 3).map(|c| c.id),
+            Some(id),
+            "refused whole"
+        );
+
+        // A copy takes a fresh id and leaves the original.
+        assert!(arr.move_slot((0, 3), (1, 0), true));
+        let copy = arr.session.slot(1, 0).unwrap().id;
+        assert_ne!(copy, id);
+        assert!(
+            arr.session.slot(0, 3).is_some(),
+            "a copy leaves the original"
+        );
+
+        // Landing on a playing slot is audible: it replaces the sound.
+        assert!(arr.session.launch(1, 0));
+        arr.force_recompile = false;
+        assert!(arr.move_slot((0, 3), (1, 0), true));
+        assert!(arr.force_recompile, "replacing a playing clip is heard now");
+    }
+
     /// The rows scroll when the scenes outgrow the space above the mixer:
     /// the wheel's vertical axis drives them, hit tests move with the
     /// paint, and a slot half under the mixer answers only for its
@@ -11990,10 +12646,25 @@ mod tests {
             );
         };
 
-        click(&ctx, &mut arr, layout.scene(0).center());
+        // The row's TRIANGLE launches; the rest of the row selects. Same
+        // division as the slots.
+        let scene0 = layout.scene(0);
+        let triangle = pos2(scene0.left() + SLOT_LAUNCH_W * 0.5, scene0.center().y);
+        click(&ctx, &mut arr, triangle);
         assert_eq!(arr.session.playing[0], Some(0));
         assert_eq!(arr.session.playing[2], Some(0));
         assert_eq!(arr.session.playing[1], None, "row 0 is empty on lane 1");
+        assert_eq!(
+            arr.session.selected_scene,
+            Some(1),
+            "launching selects the NEXT scene, ready for the next Enter"
+        );
+        click(&ctx, &mut arr, scene0.center());
+        assert_eq!(
+            arr.session.selected_scene,
+            Some(0),
+            "the name selects without launching"
+        );
 
         let scenes = arr.session.scenes.len();
         click(&ctx, &mut arr, layout.add_scene().center());
