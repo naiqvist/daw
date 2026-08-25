@@ -60,6 +60,22 @@ pub enum UiAction {
     CopyClip,
     PasteClip,
     DuplicateClip,
+    /// Split the clip under the cell cursor at the cursor's beat. Ctrl+E.
+    SplitAtCursor,
+    /// Merge the MIDI clips under the time selection into one. Ctrl+J.
+    Consolidate,
+    /// Remove the selected span of time from EVERY track. Ctrl+Shift+Backspace.
+    DeleteTime,
+    /// Open a copy of the selected span after itself, on EVERY track.
+    /// Ctrl+Shift+D.
+    DuplicateTime,
+    /// Insert empty time: the selection's length at the selection, else one
+    /// bar at the cursor. Ctrl+I.
+    InsertSilence,
+    /// Set a locator at the cursor (or playhead), or remove the one there.
+    SetLocator,
+    /// Jump the playhead to the neighbouring locator. -1 or 1.
+    JumpLocator(i32),
     /// Frame the selected audio clip in the arrangement timeline. Ableton's Z.
     ZoomSelectedAudioClip,
     /// Restore the arrangement view saved by the last clip zoom. Ableton's X.
@@ -134,6 +150,13 @@ impl UiAction {
             Self::CopyClip => "Copy clip",
             Self::PasteClip => "Paste clip",
             Self::DuplicateClip => "Duplicate clip",
+            Self::SplitAtCursor => "Split clip",
+            Self::Consolidate => "Consolidate",
+            Self::DeleteTime => "Delete time",
+            Self::DuplicateTime => "Duplicate time",
+            Self::InsertSilence => "Insert silence",
+            Self::SetLocator => "Set / delete locator",
+            Self::JumpLocator(_) => "Jump to locator",
             Self::ZoomSelectedAudioClip => "Zoom to selected audio clip",
             Self::ZoomBack => "Zoom back",
             Self::ToggleMainView => "Timeline / Session",
@@ -184,6 +207,13 @@ impl UiAction {
             | Self::CopyClip
             | Self::PasteClip
             | Self::DuplicateClip
+            | Self::SplitAtCursor
+            | Self::Consolidate
+            | Self::DeleteTime
+            | Self::DuplicateTime
+            | Self::InsertSilence
+            | Self::SetLocator
+            | Self::JumpLocator(_)
             | Self::ZoomSelectedAudioClip
             | Self::ZoomBack
             | Self::ToggleMainView

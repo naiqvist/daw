@@ -583,8 +583,34 @@ fn arrangement_keys(ctx: &egui::Context, arr: &Arrangement, out: &mut Vec<UiActi
         if i.consume_key(egui::Modifiers::COMMAND, egui::Key::V) {
             out.push(UiAction::PasteClip);
         }
-        if i.consume_key(egui::Modifiers::COMMAND, egui::Key::D) {
+        // SHIFT FIRST: `consume_key` ignores an extra Shift, so plain
+        // Ctrl+D checked first would swallow Ctrl+Shift+D and duplicate a
+        // clip when asked to duplicate time.
+        if i.consume_key(
+            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+            egui::Key::D,
+        ) {
+            out.push(UiAction::DuplicateTime);
+        } else if i.consume_key(egui::Modifiers::COMMAND, egui::Key::D) {
             out.push(UiAction::DuplicateClip);
+        }
+        if i.consume_key(
+            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+            egui::Key::Backspace,
+        ) || i.consume_key(
+            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+            egui::Key::Delete,
+        ) {
+            out.push(UiAction::DeleteTime);
+        }
+        if i.consume_key(egui::Modifiers::COMMAND, egui::Key::E) {
+            out.push(UiAction::SplitAtCursor);
+        }
+        if i.consume_key(egui::Modifiers::COMMAND, egui::Key::J) {
+            out.push(UiAction::Consolidate);
+        }
+        if i.consume_key(egui::Modifiers::COMMAND, egui::Key::I) {
+            out.push(UiAction::InsertSilence);
         }
         // Tab flips the main area. Plain Tab only: Shift+Tab already
         // belongs to the bottom region, and it is consumed before this
@@ -1524,6 +1550,49 @@ fn perform(actions: &[UiAction], transport: &mut Transport, arrangement: &mut Ar
             UiAction::DuplicateClip => {
                 arrangement.duplicate_selected();
             }
+            UiAction::SplitAtCursor => {
+                if let Some((track, beat)) = arrangement.cursor {
+                    arrangement.split_at(track, beat, transport.bpm);
+                }
+            }
+            UiAction::Consolidate => {
+                if let (Some(track), Some((from, to))) =
+                    (arrangement.selected, arrangement.selection)
+                {
+                    arrangement.consolidate(track, from, to);
+                }
+            }
+            UiAction::DeleteTime => {
+                if let Some((from, to)) = arrangement.selection {
+                    arrangement.delete_time(from, to, transport.bpm);
+                }
+            }
+            UiAction::DuplicateTime => {
+                if let Some((from, to)) = arrangement.selection {
+                    arrangement.duplicate_time(from, to, transport.bpm);
+                }
+            }
+            UiAction::InsertSilence => {
+                // The selection's span at the selection; a bare cursor gets
+                // one bar, which is what "make room here" almost always is.
+                if let Some((from, to)) = arrangement.selection {
+                    arrangement.insert_time(from, to - from, transport.bpm);
+                } else if let Some((_, beat)) = arrangement.cursor {
+                    arrangement.insert_time(beat, transport.beats_per_bar as f32, transport.bpm);
+                }
+            }
+            UiAction::SetLocator => {
+                let grid = arrangement.grid_beats();
+                let playhead = (transport.position * transport.bpm / 60.0) as f32;
+                let beat = snap(arrangement.cursor.map_or(playhead, |(_, beat)| beat), grid);
+                arrangement.toggle_locator(beat, grid);
+            }
+            UiAction::JumpLocator(dir) => {
+                let playhead = (transport.position * transport.bpm / 60.0) as f32;
+                if let Some(beat) = arrangement.locator_jump(*dir, playhead) {
+                    arrangement.pending_seek = Some(beat);
+                }
+            }
             UiAction::ZoomSelectedAudioClip => {
                 if arrangement.zoom_selected_audio_clip() {
                     // Follow would immediately page away from a clip that
@@ -2034,6 +2103,22 @@ impl Session {
     }
 }
 
+/// A named point on the timeline — Ableton's locator. Click its flag to
+/// jump the playhead there; drag to move it; double-click to rename.
+#[derive(Clone, PartialEq)]
+struct Locator {
+    beat: f32,
+    name: String,
+}
+
+/// An inline locator rename in flight.
+struct LocatorRename {
+    index: usize,
+    text: String,
+    original: String,
+    focused: bool,
+}
+
 /// An inline scene rename in flight, exactly the track rename's shape.
 struct SceneRename {
     scene: usize,
@@ -2137,6 +2222,15 @@ struct Arrangement {
     next_track_no: [u32; TrackKind::ALL.len()],
     /// The header rename, while one is open.
     track_rename: Option<TrackRename>,
+    /// Named points on the timeline, drawn as flags in the ruler. Content:
+    /// they undo. Unordered — jumps search by comparison, so a drag never
+    /// reshuffles indices under an open rename.
+    locators: Vec<Locator>,
+    /// The locator rename, while one is open.
+    locator_rename: Option<LocatorRename>,
+    /// A jump the UI asked for, in beats. The app consumes it: the engine
+    /// seeks, the mirror follows. Not content — a seek is a performance.
+    pending_seek: Option<f32>,
     /// Which face the main area shows: the timeline or the clip launcher.
     main_view: MainView,
     /// The clip launcher's grid. Parallel to `tracks`, like `clips`.
@@ -2197,6 +2291,7 @@ struct Content {
     slots: Vec<Vec<Option<Clip>>>,
     scenes: Vec<Scene>,
     loop_range: Option<(f32, f32)>,
+    locators: Vec<Locator>,
     /// The id counters ride along, so an undone clip's id is free again and
     /// a redo re-creates the very same clip rather than a renamed twin.
     next_clip_id: u64,
@@ -2348,6 +2443,9 @@ impl Default for Arrangement {
             // The default session's four lanes have already taken 1..=4.
             next_track_no: [TRACK_COUNT as u32 + 1, 1],
             track_rename: None,
+            locators: Vec::new(),
+            locator_rename: None,
+            pending_seek: None,
             main_view: MainView::default(),
             session: Session::new(TRACK_COUNT),
             session_scroll: 0.0,
@@ -2375,6 +2473,7 @@ impl Arrangement {
                 slots: self.session.slots.clone(),
                 scenes: self.session.scenes.clone(),
                 loop_range: self.loop_range,
+                locators: self.locators.clone(),
                 next_clip_id: self.next_clip_id,
                 next_track_no: self.next_track_no,
             },
@@ -2398,6 +2497,8 @@ impl Arrangement {
         self.session.slots = snapshot.content.slots.clone();
         self.session.scenes = snapshot.content.scenes.clone();
         self.loop_range = snapshot.content.loop_range;
+        self.locators = snapshot.content.locators.clone();
+        self.locator_rename = None;
         self.next_clip_id = snapshot.content.next_clip_id;
         self.next_track_no = snapshot.content.next_track_no;
         self.selected = snapshot.marks.selected;
@@ -2698,6 +2799,244 @@ impl Arrangement {
         }
         self.session.selected = Some(to);
         self.session.selected_scene = Some(to.1);
+        true
+    }
+
+    /// Set a locator at `beat` — or, if one already stands within half a
+    /// grid step, remove it: Ableton's Set/Delete toggle in one gesture.
+    fn toggle_locator(&mut self, beat: f32, grid: f32) {
+        if let Some(index) = self
+            .locators
+            .iter()
+            .position(|locator| (locator.beat - beat).abs() < grid * 0.5)
+        {
+            self.locators.remove(index);
+            self.locator_rename = None;
+            return;
+        }
+        let n = self.locators.len() + 1;
+        self.locators.push(Locator {
+            beat,
+            name: format!("locator {n}"),
+        });
+    }
+
+    /// The nearest locator strictly before (dir < 0) or after (dir > 0)
+    /// `playhead`, as a jump. Ableton's Previous/Next Locator, with the
+    /// manual's fallback: past the last one, the ends of the arrangement.
+    fn locator_jump(&self, dir: i32, playhead: f32) -> Option<f32> {
+        const EPS: f32 = 1e-3;
+        let target = if dir < 0 {
+            self.locators
+                .iter()
+                .map(|locator| locator.beat)
+                .filter(|beat| *beat < playhead - EPS)
+                .fold(None::<f32>, |best, beat| {
+                    Some(best.map_or(beat, |best| best.max(beat)))
+                })
+                .or(Some(0.0))
+        } else {
+            self.locators
+                .iter()
+                .map(|locator| locator.beat)
+                .filter(|beat| *beat > playhead + EPS)
+                .fold(None::<f32>, |best, beat| {
+                    Some(best.map_or(beat, |best| best.min(beat)))
+                })
+        };
+        target.filter(|beat| (beat - playhead).abs() > EPS)
+    }
+
+    /// Split every clip on `track` that CONTAINS `at` — strictly inside,
+    /// because splitting at an edge would mint an empty clip. The left
+    /// half keeps the clip's identity; the right half is new.
+    ///
+    /// Notes follow the beat they sound on: a note starting at or past the
+    /// cut moves to the right half, re-based; a note starting before it
+    /// stays left and keeps its full length even if it rings past the cut,
+    /// exactly as it would ring past any clip end. Audio splits are
+    /// non-destructive: the right half's source window advances by the cut
+    /// (the same math as a left trim), so nothing is lost, only divided.
+    ///
+    /// Returns whether anything split.
+    fn split_at(&mut self, track: usize, at: f32, bpm: f64) -> bool {
+        let Some(clips) = self.clips.get_mut(track) else {
+            return false;
+        };
+        let Some(index) = clips
+            .iter()
+            .position(|clip| clip.start < at && at < clip.start + clip.len)
+        else {
+            return false;
+        };
+        let rel = at - clips[index].start;
+        let mut right = clips[index].clone();
+        right.id = self.next_clip_id;
+        self.next_clip_id += 1;
+        if right.audio.is_some() {
+            trim_clip_left(&mut right, at, bpm);
+        } else {
+            right.start = at;
+            right.len -= rel;
+            right.notes.retain(|note| note.start >= f64::from(rel));
+            for note in &mut right.notes {
+                note.start -= f64::from(rel);
+            }
+        }
+        let left = &mut clips[index];
+        left.len = rel;
+        if left.audio.is_none() {
+            left.notes.retain(|note| note.start < f64::from(rel));
+        }
+        clips.insert(index + 1, right);
+        // The split lands selected on the left half, whose identity the
+        // original kept.
+        self.selected_clip = Some((track, index));
+        true
+    }
+
+    /// Consolidate: the MIDI clips on `track` intersecting `from..to`
+    /// become ONE clip spanning them, notes re-based onto the new start.
+    /// Audio clips refuse — consolidating audio means rendering it, which
+    /// is a bounce, not an edit.
+    fn consolidate(&mut self, track: usize, from: f32, to: f32) -> bool {
+        let Some(clips) = self.clips.get(track) else {
+            return false;
+        };
+        let merging: Vec<usize> = clips
+            .iter()
+            .enumerate()
+            .filter(|(_, clip)| clip.start < to && clip.start + clip.len > from)
+            .map(|(i, _)| i)
+            .collect();
+        if merging.len() < 2 || merging.iter().any(|&i| clips[i].audio.is_some()) {
+            return false;
+        }
+        let start = merging
+            .iter()
+            .map(|&i| clips[i].start)
+            .fold(f32::MAX, f32::min);
+        let end = merging
+            .iter()
+            .map(|&i| clips[i].start + clips[i].len)
+            .fold(0.0f32, f32::max);
+        let mut notes = Vec::new();
+        for &i in &merging {
+            let offset = f64::from(clips[i].start - start);
+            notes.extend(clips[i].notes.iter().map(|note| Note {
+                start: note.start + offset,
+                ..*note
+            }));
+        }
+        notes.sort_by(|a, b| a.start.total_cmp(&b.start));
+        let id = self.next_id();
+        let clips = &mut self.clips[track];
+        for &i in merging.iter().rev() {
+            clips.remove(i);
+        }
+        let merged = Clip {
+            id,
+            name: format!("clip {id}"),
+            start,
+            len: end - start,
+            notes,
+            audio: None,
+        };
+        let at = clips.partition_point(|clip| clip.start < start);
+        clips.insert(at, merged);
+        self.selected_clip = Some((track, at));
+        true
+    }
+
+    /// Delete a span of time from EVERY track: clips inside it go, clips
+    /// straddling its edges are split first, and everything after moves
+    /// earlier by its length — the Arrangement gets shorter. The loop
+    /// brace rides along like any other timed thing.
+    fn delete_time(&mut self, from: f32, to: f32, bpm: f64) -> bool {
+        // Stated this way round so a NaN bound refuses instead of passing.
+        if to <= from || !to.is_finite() || !from.is_finite() {
+            return false;
+        }
+        let span = to - from;
+        for track in 0..self.tracks.len() {
+            self.split_at(track, from, bpm);
+            self.split_at(track, to, bpm);
+            let clips = &mut self.clips[track];
+            clips.retain(|clip| clip.start < from || clip.start >= to);
+            for clip in clips.iter_mut() {
+                if clip.start >= to {
+                    clip.start -= span;
+                }
+            }
+            resort(clips);
+        }
+        self.loop_range = self.loop_range.map(|(a, b)| {
+            let shift = |beat: f32| {
+                if beat >= to {
+                    beat - span
+                } else {
+                    beat.min(from)
+                }
+            };
+            (shift(a), shift(b))
+        });
+        self.selection = None;
+        self.selected_clip = None;
+        true
+    }
+
+    /// Insert empty time at `at` on EVERY track: clips straddling it are
+    /// split, and everything at or after it moves later — the Arrangement
+    /// gets longer. Ableton's Insert Silence.
+    fn insert_time(&mut self, at: f32, amount: f32, bpm: f64) -> bool {
+        if amount <= 0.0 {
+            return false;
+        }
+        for track in 0..self.tracks.len() {
+            self.split_at(track, at, bpm);
+            for clip in &mut self.clips[track] {
+                if clip.start >= at {
+                    clip.start += amount;
+                }
+            }
+        }
+        self.loop_range = self.loop_range.map(|(a, b)| {
+            let shift = |beat: f32| if beat >= at { beat + amount } else { beat };
+            (shift(a), shift(b))
+        });
+        self.selected_clip = None;
+        true
+    }
+
+    /// Duplicate a span of time on EVERY track: room is opened after it,
+    /// and a copy of everything inside it — fresh ids — lands in the room.
+    fn duplicate_time(&mut self, from: f32, to: f32, bpm: f64) -> bool {
+        // Stated this way round so a NaN bound refuses instead of passing.
+        if to <= from || !to.is_finite() || !from.is_finite() {
+            return false;
+        }
+        let span = to - from;
+        if !self.insert_time(to, span, bpm) {
+            return false;
+        }
+        for track in 0..self.tracks.len() {
+            // insert_time split at `to`; the from-edge still needs its cut
+            // so a straddling clip contributes only its inside part.
+            self.split_at(track, from, bpm);
+            let copies: Vec<Clip> = self.clips[track]
+                .iter()
+                .filter(|clip| clip.start >= from && clip.start < to)
+                .cloned()
+                .collect();
+            for mut copy in copies {
+                copy.id = self.next_id();
+                copy.start += span;
+                let clips = &mut self.clips[track];
+                let at = clips.partition_point(|clip| clip.start < copy.start);
+                clips.insert(at, copy);
+            }
+            resort(&mut self.clips[track]);
+        }
         true
     }
 
@@ -3226,10 +3565,7 @@ fn trim_clip_left(clip: &mut Clip, start: f32, bpm: f64) {
 }
 
 /// Keep a track's clips sorted by start after an edit. Order is what the
-/// clamp functions assume — this is the function that restores it. Every
-/// live edit now lands through `place_clip`, which inserts in order; the
-/// tests keep exercising the invariant directly.
-#[cfg_attr(not(test), allow(dead_code))]
+/// clamp functions assume — this is the function that restores it.
 fn resort(track: &mut [Clip]) {
     track.sort_by(|a, b| a.start.total_cmp(&b.start));
 }
@@ -4211,6 +4547,7 @@ fn arrangement_body(
     }
 
     loop_brace(ui, theme, focus, ruler, content, arr, grid);
+    locators_pass(ui, theme, ruler, content, arr, grid);
     clips_pass(ui, theme, content, arr, grid, bpm, waveform_cache);
 
     // The drop ghost, above the clips it would join and under the playhead.
@@ -6619,6 +6956,160 @@ fn clips_pass(
     arr.ghost = ghost;
 }
 
+/// The locators: flags in the ruler. Click a flag to jump the playhead to
+/// it, drag to move it (snapped), double-click to rename in place, and the
+/// context menu renames or deletes. Created AFTER the loop brace, so a
+/// flag wins the pointer where the two overlap.
+fn locators_pass(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    ruler: egui::Rect,
+    content: egui::Rect,
+    arr: &mut Arrangement,
+    grid: f32,
+) {
+    let offset = arr.view_beats;
+    let ppb = arr.pixels_per_beat;
+    let mut rename = arr.locator_rename.take();
+    let mut jump: Option<f32> = None;
+    let mut move_to: Option<(usize, f32)> = None;
+    let mut rename_open: Option<usize> = None;
+    let delete: std::cell::Cell<Option<usize>> = std::cell::Cell::new(None);
+    let mut rename_commit = false;
+    let mut rename_cancel = false;
+
+    for (index, locator) in arr.locators.iter().enumerate() {
+        let x = x_at(content, offset, ppb, locator.beat);
+        if x < content.left() - 8.0 || x > content.right() + 8.0 {
+            continue;
+        }
+        let flag = egui::Rect::from_min_max(
+            egui::pos2(x - 4.0, ruler.top()),
+            egui::pos2(x + 5.0, ruler.bottom()),
+        );
+        let wid = ui.id().with(("locator", index));
+        let response = ui.interact(flag, wid, egui::Sense::click_and_drag());
+        if response.double_clicked() {
+            rename_open = Some(index);
+        } else if response.clicked() {
+            jump = Some(locator.beat);
+        }
+        if response.dragged()
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            move_to = Some((index, snap(beat_at(content, offset, ppb, pos.x), grid)));
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        } else if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        }
+        response.context_menu(|ui| {
+            if ui.button("Rename").clicked() {
+                delete.set(None);
+                rename_open = Some(index);
+                ui.close();
+            }
+            if ui.button("Delete").clicked() {
+                delete.set(Some(index));
+                ui.close();
+            }
+        });
+
+        let painter = ui.painter();
+        let color = if response.hovered() || response.dragged() {
+            theme.accent
+        } else {
+            theme.text_muted
+        };
+        // The flag: a stem on the beat, a pennant to the right.
+        painter.line_segment(
+            [
+                egui::pos2(x, ruler.top() + 1.0),
+                egui::pos2(x, ruler.bottom()),
+            ],
+            egui::Stroke::new(1.5, color),
+        );
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                egui::pos2(x, ruler.top() + 1.0),
+                egui::pos2(x + 7.0, ruler.top() + 4.5),
+                egui::pos2(x, ruler.top() + 8.0),
+            ],
+            color,
+            egui::Stroke::NONE,
+        ));
+        if rename.as_ref().is_some_and(|r| r.index == index) {
+            if let Some(r) = rename.as_mut() {
+                let edit = egui::Rect::from_min_size(
+                    egui::pos2(x + 9.0, ruler.top()),
+                    egui::vec2(90.0, ruler.height()),
+                );
+                let field = ui.put(
+                    edit,
+                    egui::TextEdit::singleline(&mut r.text)
+                        .font(egui::FontId::proportional(HEADER_KIND_TYPE)),
+                );
+                if !r.focused {
+                    field.request_focus();
+                    r.focused = true;
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    rename_cancel = true;
+                } else if ui.input(|i| i.key_pressed(egui::Key::Enter)) || field.lost_focus() {
+                    rename_commit = true;
+                }
+            }
+        } else {
+            painter.with_clip_rect(ruler).text(
+                egui::pos2(x + 9.0, ruler.center().y),
+                egui::Align2::LEFT_CENTER,
+                &locator.name,
+                egui::FontId::proportional(HEADER_KIND_TYPE),
+                color,
+            );
+        }
+    }
+
+    // --- apply -------------------------------------------------------------
+    if rename_cancel {
+        rename = None;
+    } else if rename_commit
+        && let Some(r) = rename.take()
+        && let Some(locator) = arr.locators.get_mut(r.index)
+    {
+        let text = r.text.trim();
+        locator.name = if text.is_empty() {
+            r.original
+        } else {
+            text.to_owned()
+        };
+    }
+    if let Some(index) = rename_open
+        && let Some(locator) = arr.locators.get(index)
+    {
+        rename = Some(LocatorRename {
+            index,
+            text: locator.name.clone(),
+            original: locator.name.clone(),
+            focused: false,
+        });
+    }
+    arr.locator_rename = rename;
+    if let Some((index, beat)) = move_to
+        && let Some(locator) = arr.locators.get_mut(index)
+    {
+        locator.beat = beat;
+    }
+    if let Some(index) = delete.get()
+        && index < arr.locators.len()
+    {
+        arr.locators.remove(index);
+        arr.locator_rename = None;
+    }
+    if let Some(beat) = jump {
+        arr.pending_seek = Some(beat);
+    }
+}
+
 /// The loop brace and its two handles, in the ruler strip.
 ///
 /// Each end drags independently and snaps to the grid. They cannot be pulled
@@ -8030,6 +8521,21 @@ impl App {
             PaletteCommand::new("clip.duplicate", "clip", "duplicate clip").enabled(has_clip),
             PaletteCommand::new("clip.delete", "clip", "delete clip").enabled(has_clip),
             PaletteCommand::new("clip.loop", "clip", "loop the selection"),
+            PaletteCommand::new("clip.split", "clip", "split clip at cursor").hint("ctrl+E"),
+            PaletteCommand::new("clip.consolidate", "clip", "consolidate selection").hint("ctrl+J"),
+            // --- time: the all-track commands --------------------------
+            PaletteCommand::new("time.duplicate", "time", "duplicate time")
+                .hint("ctrl+shift+D")
+                .enabled(self.arrangement.selection.is_some()),
+            PaletteCommand::new("time.delete", "time", "delete time")
+                .hint("ctrl+shift+bksp")
+                .enabled(self.arrangement.selection.is_some()),
+            PaletteCommand::new("time.silence", "time", "insert silence").hint("ctrl+I"),
+            PaletteCommand::new("locator.set", "locator", "set / delete locator"),
+            PaletteCommand::new("locator.prev", "locator", "previous locator")
+                .enabled(!self.arrangement.locators.is_empty()),
+            PaletteCommand::new("locator.next", "locator", "next locator")
+                .enabled(!self.arrangement.locators.is_empty()),
             // --- the session ------------------------------------------
             PaletteCommand::new("session.back", "session", "back to arrangement")
                 .enabled(self.arrangement.session.playing.iter().any(Option::is_some)),
@@ -8157,6 +8663,14 @@ impl App {
             "session.back" => actions.push(UiAction::BackToArrangement),
             "session.scene.insert" => actions.push(UiAction::InsertScene),
             "session.scene.capture" => actions.push(UiAction::CaptureScene),
+            "clip.split" => actions.push(UiAction::SplitAtCursor),
+            "clip.consolidate" => actions.push(UiAction::Consolidate),
+            "time.duplicate" => actions.push(UiAction::DuplicateTime),
+            "time.delete" => actions.push(UiAction::DeleteTime),
+            "time.silence" => actions.push(UiAction::InsertSilence),
+            "locator.set" => actions.push(UiAction::SetLocator),
+            "locator.prev" => actions.push(UiAction::JumpLocator(-1)),
+            "locator.next" => actions.push(UiAction::JumpLocator(1)),
             "edit.undo" => actions.push(UiAction::Undo),
             "edit.redo" => actions.push(UiAction::Redo),
             "clip.loop" => actions.push(UiAction::LoopFromSelection),
@@ -9512,6 +10026,16 @@ impl eframe::App for App {
             }
         }
         perform(&wishes, &mut self.transport, &mut self.arrangement);
+        // A locator jump: the engine seeks, the mirror follows, and with
+        // the engine off the mirror alone is the whole transport.
+        if let Some(beat) = self.arrangement.pending_seek.take() {
+            let seconds = f64::from(beat) * 60.0 / self.transport.bpm.max(1.0);
+            self.transport.position = seconds;
+            if let Some(engine) = &mut self.engine {
+                let sample = (seconds * f64::from(engine.info().sample_rate)) as u64;
+                engine.transport(TransportCmd::Seek(sample));
+            }
+        }
         self.sync_engine();
 
         // History last, after every edit path this frame has run. A gesture
@@ -9524,6 +10048,7 @@ impl eframe::App for App {
             && self.arrangement.rename.is_none()
             && self.arrangement.track_rename.is_none()
             && self.arrangement.scene_rename.is_none()
+            && self.arrangement.locator_rename.is_none()
             && self.arrangement.slot_drag.is_none()
             && self.drag_import.is_none()
             && self.wav_import_pending == 0
@@ -12157,6 +12682,206 @@ mod tests {
             arr.session_scroll, 0.0,
             "two columns fit, so there is nowhere left to scroll to"
         );
+    }
+
+    /// A split divides a clip in place: notes follow the beat they sound
+    /// on, audio's source window advances non-destructively, and the left
+    /// half keeps the identity.
+    #[test]
+    fn splitting_divides_notes_and_audio_windows() {
+        let mut arr = Arrangement::default();
+        arr.create_clip(0, 2.0, 8.0).unwrap();
+        let id = arr.clips[0][0].id;
+        arr.clips[0][0].notes = vec![note(60, 0.0, 1.0, 100), note(64, 5.9, 4.0, 100)];
+
+        // Edges are not splits: nothing to divide there.
+        assert!(!arr.split_at(0, 2.0, 120.0));
+        assert!(!arr.split_at(0, 10.0, 120.0));
+        assert!(!arr.split_at(0, 1.0, 120.0));
+
+        assert!(arr.split_at(0, 6.0, 120.0));
+        assert_eq!(arr.clips[0].len(), 2);
+        let (left, right) = (&arr.clips[0][0], &arr.clips[0][1]);
+        assert_eq!(left.id, id, "the left half keeps the identity");
+        assert_eq!((left.start, left.len), (2.0, 4.0));
+        assert_eq!((right.start, right.len), (6.0, 4.0));
+        assert_eq!(left.notes.len(), 1, "the early note stays left");
+        assert_eq!(right.notes.len(), 1, "the late note moved right");
+        assert!(
+            (right.notes[0].start - 1.9).abs() < 1e-6,
+            "re-based onto the right half's start: {}",
+            right.notes[0].start
+        );
+        assert_eq!(arr.selected_clip, Some((0, 0)));
+
+        // Audio: the right half's source window advances by the cut. Four
+        // beats at 120 bpm is two seconds — 96k frames at 48k.
+        let audio = arr.add_track(TrackKind::Audio);
+        arr.clips[audio].push(Clip {
+            id: 999,
+            name: "wav".into(),
+            start: 0.0,
+            len: 8.0,
+            notes: Vec::new(),
+            audio: Some(AudioSource {
+                path: "/tmp/x.wav".into(),
+                sample_rate: 48_000,
+                source_offset: 0,
+                source_frames: 480_000,
+                gain: 1.0,
+                looped: false,
+            }),
+        });
+        assert!(arr.split_at(audio, 4.0, 120.0));
+        let right = arr.clips[audio][1].audio.as_ref().unwrap();
+        assert_eq!(
+            right.source_offset, 96_000,
+            "the window advanced by the cut"
+        );
+        assert_eq!(
+            right.source_frames,
+            480_000 - 96_000,
+            "the end is invariant"
+        );
+        assert_eq!(arr.clips[audio][0].len, 4.0);
+    }
+
+    /// Consolidate merges the selected span's MIDI clips into one, notes
+    /// re-based; audio in the span refuses the whole operation.
+    #[test]
+    fn consolidate_merges_midi_and_refuses_audio() {
+        let mut arr = Arrangement::default();
+        arr.create_clip(0, 0.0, 2.0).unwrap();
+        arr.create_clip(0, 4.0, 2.0).unwrap();
+        arr.clips[0][0].notes = vec![note(60, 0.5, 1.0, 100)];
+        arr.clips[0][1].notes = vec![note(64, 0.5, 1.0, 100)];
+
+        assert!(
+            !arr.consolidate(0, 0.0, 1.0),
+            "one clip is nothing to merge"
+        );
+        assert!(arr.consolidate(0, 0.0, 6.0));
+        assert_eq!(arr.clips[0].len(), 1);
+        let merged = &arr.clips[0][0];
+        assert_eq!((merged.start, merged.len), (0.0, 6.0), "spans both");
+        assert_eq!(merged.notes.len(), 2);
+        assert!(
+            (merged.notes[1].start - 4.5).abs() < 1e-9,
+            "the second clip's note re-based: {}",
+            merged.notes[1].start
+        );
+
+        let audio = arr.add_track(TrackKind::Audio);
+        arr.clips[audio].push(Clip {
+            id: 900,
+            name: "a".into(),
+            start: 0.0,
+            len: 2.0,
+            notes: Vec::new(),
+            audio: Some(AudioSource {
+                path: "/tmp/x.wav".into(),
+                sample_rate: 48_000,
+                source_offset: 0,
+                source_frames: 96_000,
+                gain: 1.0,
+                looped: false,
+            }),
+        });
+        let source = arr.clips[audio][0].audio.clone();
+        arr.clips[audio].push(Clip {
+            id: 901,
+            name: "b".into(),
+            start: 2.0,
+            len: 2.0,
+            notes: Vec::new(),
+            audio: source,
+        });
+        assert!(
+            !arr.consolidate(audio, 0.0, 4.0),
+            "consolidating audio would be a bounce, not an edit"
+        );
+        assert_eq!(arr.clips[audio].len(), 2, "refused whole");
+    }
+
+    /// The time commands work on EVERY track at once: delete closes the
+    /// gap, insert opens one, duplicate fills the one it opens — and clips
+    /// straddling the edges are split rather than dragged along.
+    #[test]
+    fn time_commands_cut_across_every_track() {
+        let mut arr = Arrangement::default();
+        // Track 0: one clip straddling the span's left edge and reaching
+        // into it. Track 1: a clip entirely after the span.
+        arr.create_clip(0, 0.0, 4.0).unwrap();
+        arr.create_clip(1, 8.0, 2.0).unwrap();
+        arr.loop_range = Some((8.0, 12.0));
+
+        // Delete beats 2..6: track 0's clip is cut at 2 and loses its
+        // inside; track 1's clip moves 4 earlier; so does the loop.
+        assert!(arr.delete_time(2.0, 6.0, 120.0));
+        assert_eq!(arr.clips[0].len(), 1);
+        assert_eq!(
+            (arr.clips[0][0].start, arr.clips[0][0].len),
+            (0.0, 2.0),
+            "the straddler was split at the edge, not dragged out"
+        );
+        assert_eq!(arr.clips[1][0].start, 4.0, "everything after moved earlier");
+        assert_eq!(arr.loop_range, Some((4.0, 8.0)), "the loop rode along");
+
+        // Insert two beats at 4: the gap reopens, on every track.
+        assert!(arr.insert_time(4.0, 2.0, 120.0));
+        assert_eq!(arr.clips[1][0].start, 6.0);
+        assert_eq!(arr.loop_range, Some((6.0, 10.0)));
+
+        // Duplicate beats 0..2: a copy of track 0's clip lands at 2..4,
+        // and track 1's clip moves right by the span.
+        let clips_before = arr.clips[0].len();
+        assert!(arr.duplicate_time(0.0, 2.0, 120.0));
+        assert_eq!(arr.clips[0].len(), clips_before + 1);
+        assert_eq!(arr.clips[0][1].start, 2.0, "the copy fills the opened room");
+        assert_ne!(
+            arr.clips[0][1].id, arr.clips[0][0].id,
+            "a copy has an id of its own"
+        );
+        assert_eq!(arr.clips[1][0].start, 8.0);
+        for track in &arr.clips {
+            assert!(
+                track.windows(2).all(|w| w[0].start <= w[1].start),
+                "every track stays sorted"
+            );
+            for pair in track.windows(2) {
+                assert!(
+                    pair[0].start + pair[0].len <= pair[1].start + 1e-4,
+                    "and no clips overlap"
+                );
+            }
+        }
+    }
+
+    /// Locators toggle at a beat, and the jumps land on neighbours — with
+    /// the manual's fallback to the arrangement's start.
+    #[test]
+    fn locators_toggle_and_jump() {
+        let mut arr = Arrangement::default();
+        arr.toggle_locator(8.0, 1.0);
+        arr.toggle_locator(16.0, 1.0);
+        assert_eq!(arr.locators.len(), 2);
+
+        // Setting near an existing one removes it: one gesture, both verbs.
+        arr.toggle_locator(8.2, 1.0);
+        assert_eq!(arr.locators.len(), 1);
+        assert_eq!(arr.locators[0].beat, 16.0);
+        arr.toggle_locator(8.0, 1.0);
+
+        assert_eq!(arr.locator_jump(1, 0.0), Some(8.0));
+        assert_eq!(arr.locator_jump(1, 8.0), Some(16.0));
+        assert_eq!(arr.locator_jump(1, 16.0), None, "nothing past the last");
+        assert_eq!(arr.locator_jump(-1, 16.0), Some(8.0));
+        assert_eq!(
+            arr.locator_jump(-1, 4.0),
+            Some(0.0),
+            "before the first, the fallback is the start"
+        );
+        assert_eq!(arr.locator_jump(-1, 0.0), None);
     }
 
     /// Delete removes the most specific selection: the clip or slot when
