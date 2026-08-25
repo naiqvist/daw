@@ -9247,6 +9247,10 @@ impl App {
             .collapsible(false)
             .resizable(false)
             .default_width(380.0)
+            // Opens centred: a modal-shaped window should arrive where the
+            // eyes already are, not wherever egui last remembered it.
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
             .show(ctx, |ui| {
                 ui.label(match &self.project_path {
                     Some(path) => format!("current: {}", path.display()),
