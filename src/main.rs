@@ -149,6 +149,7 @@ const FIELD_TYPE: f32 = 12.0;
 const FIELD_RADIUS: f32 = 0.0;
 const TEMPO_W: f32 = 54.0;
 const TIMESIG_W: f32 = 22.0;
+const QUANT_W: f32 = 46.0;
 /// BPM per pixel of horizontal drag.
 const TEMPO_PER_PX: f64 = 0.2;
 /// Pixels of vertical drag per step of the time-signature numerator.
@@ -1155,6 +1156,7 @@ fn top_bar_body(
     theme: &Theme,
     focus: &mut Focus,
     t: &Transport,
+    quantization: &mut LaunchQuantization,
     ev: EngineView<'_>,
     out: &mut Vec<UiAction>,
 ) {
@@ -1163,8 +1165,9 @@ fn top_bar_body(
 
     let verbs_w = buttons_width(5);
     let centre_w = fields_width(&[READOUT_W, TIMECODE_W, ENGINE_W]);
-    let right_w =
-        buttons_width(4) + TRANSPORT_GROUP_GAP + fields_width(&[TEMPO_W, TIMESIG_W, TIMESIG_W]);
+    let right_w = buttons_width(4)
+        + TRANSPORT_GROUP_GAP
+        + fields_width(&[QUANT_W, TEMPO_W, TIMESIG_W, TIMESIG_W]);
     let (verbs_x, centre_x, right_x, _) = bar_layout(area, verbs_w, centre_w, right_w);
 
     // --- verbs, holding the left edge -------------------------------------
@@ -1337,6 +1340,17 @@ fn top_bar_body(
     }
 
     bar.group();
+    let quant = field(
+        ui,
+        theme,
+        focus,
+        bar.field(QUANT_W),
+        "launch_quantization",
+        quantization.label(),
+    );
+    if quant.clicked() {
+        *quantization = quantization.next();
+    }
     let tempo = field(
         ui,
         theme,
@@ -1798,6 +1812,9 @@ struct Track {
     /// that is what the engine multiplies by; the fader does the dB
     /// mapping, which is the only place the curve belongs.
     volume: f32,
+    /// Persistent track envelopes. Their values are applied live to the
+    /// output node, so drawing a curve never requires a graph swap.
+    automation: TrackAutomation,
     /// The instrument loaded on this track, if any. `None` is a real
     /// state, not a placeholder: an empty track compiles to NO sequencer
     /// node and is silent. Loading a device from the browser is what
@@ -1833,6 +1850,7 @@ impl Default for Track {
             solo: false,
             pan: 0.0,
             volume: 1.0,
+            automation: TrackAutomation::default(),
             // A fresh track has no instrument. Its knob state is still
             // here, ready, so loading a device shows sane values rather
             // than zeros.
@@ -1842,6 +1860,358 @@ impl Default for Track {
             params: SynthParams::default(),
             reverb: device::ReverbUi::default(),
         }
+    }
+}
+
+const TRACK_VOLUME_TARGET: &str = "track.volume";
+const TRACK_PAN_TARGET: &str = "track.pan";
+
+/// Stable, content-independent metadata for an automatable parameter.
+/// Devices will register more specs; the timeline only speaks these ids.
+#[derive(Clone, Debug, PartialEq)]
+struct ParameterSpec {
+    id: String,
+    group: String,
+    name: String,
+    unit: String,
+    min: f32,
+    max: f32,
+    default: f32,
+    stepped: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ParameterRegistry {
+    specs: Vec<ParameterSpec>,
+}
+
+impl Default for ParameterRegistry {
+    fn default() -> Self {
+        let mut registry = Self { specs: Vec::new() };
+        registry.register(ParameterSpec {
+            id: TRACK_VOLUME_TARGET.to_owned(),
+            group: "Track".to_owned(),
+            name: "Volume".to_owned(),
+            unit: "dB".to_owned(),
+            min: 0.0,
+            max: 1.5,
+            default: 1.0,
+            stepped: false,
+        });
+        registry.register(ParameterSpec {
+            id: TRACK_PAN_TARGET.to_owned(),
+            group: "Track".to_owned(),
+            name: "Pan".to_owned(),
+            unit: "%".to_owned(),
+            min: -1.0,
+            max: 1.0,
+            default: 0.0,
+            stepped: false,
+        });
+        registry
+    }
+}
+
+impl ParameterRegistry {
+    fn spec(&self, id: &str) -> Option<&ParameterSpec> {
+        self.specs.iter().find(|spec| spec.id == id)
+    }
+
+    fn register(&mut self, spec: ParameterSpec) {
+        if let Some(existing) = self
+            .specs
+            .iter_mut()
+            .find(|existing| existing.id == spec.id)
+        {
+            *existing = spec;
+        } else {
+            self.specs.push(spec);
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct AutomationPoint {
+    beat: f32,
+    value: f32,
+    /// A continuous bend edited through Alt/Option-dragging the segment.
+    /// Zero is a straight line; positive and negative values bow it either
+    /// side without adding a visible handle or a competing curve menu.
+    bend: f32,
+}
+
+impl Default for AutomationPoint {
+    fn default() -> Self {
+        Self {
+            beat: 0.0,
+            value: 0.0,
+            bend: 0.0,
+        }
+    }
+}
+
+#[derive(Clone, Default, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct AutomationEnvelope {
+    target: String,
+    points: Vec<AutomationPoint>,
+}
+
+#[derive(Clone, Default, Debug, PartialEq, serde::Serialize)]
+struct TrackAutomation {
+    envelopes: Vec<AutomationEnvelope>,
+}
+
+/// Compatibility shape for projects written before target ids became
+/// generic. Unknown future fields remain harmless through serde defaults.
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+struct TrackAutomationWire {
+    envelopes: Vec<AutomationEnvelope>,
+    volume: Vec<AutomationPoint>,
+    pan: Vec<AutomationPoint>,
+}
+
+impl<'de> serde::Deserialize<'de> for TrackAutomation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let mut wire = TrackAutomationWire::deserialize(deserializer)?;
+        if !wire.volume.is_empty()
+            && !wire
+                .envelopes
+                .iter()
+                .any(|envelope| envelope.target == TRACK_VOLUME_TARGET)
+        {
+            wire.envelopes.push(AutomationEnvelope {
+                target: TRACK_VOLUME_TARGET.to_owned(),
+                points: wire.volume,
+            });
+        }
+        if !wire.pan.is_empty()
+            && !wire
+                .envelopes
+                .iter()
+                .any(|envelope| envelope.target == TRACK_PAN_TARGET)
+        {
+            wire.envelopes.push(AutomationEnvelope {
+                target: TRACK_PAN_TARGET.to_owned(),
+                points: wire.pan,
+            });
+        }
+        Ok(Self {
+            envelopes: wire.envelopes,
+        })
+    }
+}
+
+impl TrackAutomation {
+    fn points(&self, target: &str) -> &[AutomationPoint] {
+        self.envelopes
+            .iter()
+            .find(|envelope| envelope.target == target)
+            .map_or(&[], |envelope| envelope.points.as_slice())
+    }
+
+    fn points_mut(&mut self, target: &str) -> &mut Vec<AutomationPoint> {
+        if let Some(index) = self
+            .envelopes
+            .iter()
+            .position(|envelope| envelope.target == target)
+        {
+            return &mut self.envelopes[index].points;
+        }
+        self.envelopes.push(AutomationEnvelope {
+            target: target.to_owned(),
+            points: Vec::new(),
+        });
+        &mut self.envelopes.last_mut().expect("just inserted").points
+    }
+
+    /// Hold the manual value until the first point, follow each point's
+    /// outgoing curve, then hold the final value.
+    fn value_at(&self, target: &str, beat: f32, base: f32) -> f32 {
+        let points = self.points(target);
+        let Some(first) = points.first() else {
+            return base;
+        };
+        if beat < first.beat {
+            return base;
+        }
+        for pair in points.windows(2) {
+            let [a, b] = pair else { continue };
+            if beat <= b.beat {
+                let t = ((beat - a.beat) / (b.beat - a.beat).max(f32::EPSILON)).clamp(0.0, 1.0);
+                let bent = if a.bend >= 0.0 {
+                    t.powf(1.0 + a.bend * 5.0)
+                } else {
+                    1.0 - (1.0 - t).powf(1.0 + -a.bend * 5.0)
+                };
+                return a.value + (b.value - a.value) * bent;
+            }
+        }
+        points.last().map_or(base, |point| point.value)
+    }
+
+    fn insert(&mut self, target: &str, beat: f32, value: f32) {
+        let points = self.points_mut(target);
+        let at = points.partition_point(|point| point.beat < beat - 1e-3);
+        if points
+            .get(at)
+            .is_some_and(|point| (point.beat - beat).abs() < 1e-3)
+        {
+            points[at].value = value;
+        } else {
+            points.insert(
+                at,
+                AutomationPoint {
+                    beat,
+                    value,
+                    bend: 0.0,
+                },
+            );
+        }
+    }
+
+    /// Materialize a breakpoint where an edit cuts through an active
+    /// envelope. No point is invented before the envelope starts or after
+    /// it has finished changing.
+    fn split_at(&mut self, target: &str, beat: f32, base: f32) {
+        let points = self.points(target);
+        let Some(first) = points.first() else { return };
+        let Some(last) = points.last() else { return };
+        if beat <= first.beat || beat >= last.beat {
+            return;
+        }
+        let value = self.value_at(target, beat, base);
+        self.insert(target, beat, value);
+    }
+
+    fn insert_time(&mut self, target: &str, at: f32, amount: f32, base: f32) {
+        let points = self.points(target);
+        let Some(first) = points.first() else { return };
+        let Some(last) = points.last() else { return };
+        if at > last.beat {
+            return;
+        }
+        let value = (at >= first.beat).then(|| self.value_at(target, at, base));
+        for point in self.points_mut(target) {
+            if point.beat >= at {
+                point.beat += amount;
+            }
+        }
+        if let Some(value) = value {
+            self.insert(target, at, value);
+        }
+    }
+
+    fn delete_time(&mut self, target: &str, from: f32, to: f32, base: f32) {
+        let points = self.points(target);
+        let Some(first) = points.first() else { return };
+        let Some(last) = points.last() else { return };
+        let active_after_cut = first.beat <= to && last.beat >= to;
+        let value_after_cut = active_after_cut.then(|| self.value_at(target, to, base));
+        let span = to - from;
+        let points = self.points_mut(target);
+        points.retain(|point| point.beat < from || point.beat >= to);
+        for point in points {
+            if point.beat >= to {
+                point.beat -= span;
+            }
+        }
+        if let Some(value) = value_after_cut {
+            self.insert(target, from, value);
+        }
+    }
+
+    fn copy_span(&self, target: &str, from: f32, to: f32) -> Vec<AutomationPoint> {
+        self.points(target)
+            .iter()
+            .filter(|point| point.beat >= from && point.beat < to)
+            .cloned()
+            .collect()
+    }
+
+    fn insert_points(&mut self, target: &str, points: impl IntoIterator<Item = AutomationPoint>) {
+        let target_points = self.points_mut(target);
+        for point in points {
+            let at = target_points.partition_point(|existing| existing.beat < point.beat - 1e-3);
+            if target_points
+                .get(at)
+                .is_some_and(|existing| (existing.beat - point.beat).abs() < 1e-3)
+            {
+                target_points[at] = point;
+            } else {
+                target_points.insert(at, point);
+            }
+        }
+    }
+
+    fn targets(&self) -> Vec<String> {
+        self.envelopes
+            .iter()
+            .map(|envelope| envelope.target.clone())
+            .collect()
+    }
+
+    fn copy_all_span(&self, from: f32, to: f32) -> Vec<AutomationEnvelope> {
+        self.envelopes
+            .iter()
+            .filter_map(|envelope| {
+                let points = self.copy_span(&envelope.target, from, to);
+                (!points.is_empty()).then(|| AutomationEnvelope {
+                    target: envelope.target.clone(),
+                    points,
+                })
+            })
+            .collect()
+    }
+
+    fn insert_envelopes(&mut self, envelopes: Vec<AutomationEnvelope>, offset: f32) {
+        for envelope in envelopes {
+            self.insert_points(
+                &envelope.target,
+                envelope.points.into_iter().map(|mut point| {
+                    point.beat += offset;
+                    point
+                }),
+            );
+        }
+    }
+}
+
+fn split_track_automation_at(track: &mut Track, beat: f32) {
+    for target in track.automation.targets() {
+        let base = match target.as_str() {
+            TRACK_VOLUME_TARGET => track.volume,
+            TRACK_PAN_TARGET => track.pan,
+            _ => 0.0,
+        };
+        track.automation.split_at(&target, beat, base);
+    }
+}
+
+fn insert_track_automation_time(track: &mut Track, at: f32, amount: f32) {
+    for target in track.automation.targets() {
+        let base = match target.as_str() {
+            TRACK_VOLUME_TARGET => track.volume,
+            TRACK_PAN_TARGET => track.pan,
+            _ => 0.0,
+        };
+        track.automation.insert_time(&target, at, amount, base);
+    }
+}
+
+fn delete_track_automation_time(track: &mut Track, from: f32, to: f32) {
+    for target in track.automation.targets() {
+        let base = match target.as_str() {
+            TRACK_VOLUME_TARGET => track.volume,
+            TRACK_PAN_TARGET => track.pan,
+            _ => 0.0,
+        };
+        track.automation.delete_time(&target, from, to, base);
     }
 }
 
@@ -2042,6 +2412,10 @@ struct Session {
     /// state, not content: it is deliberately outside undo, because
     /// stopping a clip is not an edit to take back.
     playing: Vec<Option<usize>>,
+    /// Absolute beat at which each launched track enters. Keeping this
+    /// separate preserves `playing` as the compact scene-index model while
+    /// letting a fresh schedule contain silence up to the quantized edge.
+    launch_at: Vec<f32>,
     /// The slot the clip editor follows while the session is showing.
     selected: Option<(usize, usize)>,
     /// The selected SCENE — what Enter launches and what insert-below
@@ -2077,6 +2451,7 @@ impl Session {
                 })
                 .collect(),
             playing: vec![None; tracks],
+            launch_at: vec![0.0; tracks],
             selected: None,
             selected_scene: None,
         }
@@ -2099,15 +2474,26 @@ impl Session {
     /// a row with holes in it do the obvious thing.
     ///
     /// Returns whether anything changed.
+    #[cfg(test)]
     fn launch(&mut self, track: usize, scene: usize) -> bool {
+        self.launch_at(track, scene, 0.0)
+    }
+
+    /// Launch a slot at an absolute transport beat. The graph swap still
+    /// happens immediately; its placement simply has no material before
+    /// this edge.
+    fn launch_at(&mut self, track: usize, scene: usize, at: f32) -> bool {
         let want = self.slot(track, scene).is_some().then_some(scene);
         let Some(playing) = self.playing.get_mut(track) else {
             return false;
         };
-        if *playing == want {
+        if *playing == want && self.launch_at.get(track).copied() == Some(at) {
             return false;
         }
         *playing = want;
+        if let Some(launch_at) = self.launch_at.get_mut(track) {
+            *launch_at = at;
+        }
         true
     }
 
@@ -2121,8 +2507,15 @@ impl Session {
     /// Launch a whole row. Tracks with a clip there start it; tracks
     /// without one stop, so a scene is the state of every track and not
     /// just of the ones it fills.
+    #[cfg(test)]
     fn launch_scene(&mut self, scene: usize) -> bool {
         (0..self.playing.len()).fold(false, |changed, track| self.launch(track, scene) | changed)
+    }
+
+    fn launch_scene_at(&mut self, scene: usize, at: f32) -> bool {
+        (0..self.playing.len()).fold(false, |changed, track| {
+            self.launch_at(track, scene, at) | changed
+        })
     }
 
     fn stop_all(&mut self) -> bool {
@@ -2144,9 +2537,10 @@ impl Session {
         if clip.len <= 0.0 {
             return Some(Vec::new());
         }
+        let start = self.launch_at.get(track).copied().unwrap_or(0.0);
         if clip.audio.is_some() {
             let mut looped = clip.clone();
-            looped.start = 0.0;
+            looped.start = start;
             looped.len = SESSION_HORIZON_BEATS;
             if let Some(audio) = &mut looped.audio {
                 audio.looped = true;
@@ -2157,7 +2551,7 @@ impl Session {
         Some(
             (0..repeats)
                 .map(|n| Clip {
-                    start: n as f32 * clip.len,
+                    start: start + n as f32 * clip.len,
                     ..clip.clone()
                 })
                 .collect(),
@@ -2475,6 +2869,7 @@ fn apply_project_doc(doc: ProjectDoc, arr: &mut Arrangement, transport: &mut Tra
         }
     }
     fresh.session.playing = vec![None; tracks];
+    fresh.session.launch_at = vec![0.0; tracks];
     fresh.locators = doc
         .locators
         .into_iter()
@@ -2706,6 +3101,7 @@ impl Arrangement {
         // fit the grid that just came back: one entry per track, and no
         // track left playing a slot the undo emptied.
         self.session.playing.resize(self.tracks.len(), None);
+        self.session.launch_at.resize(self.tracks.len(), 0.0);
         for track in 0..self.tracks.len() {
             if let Some(scene) = self.session.playing[track]
                 && self.session.slot(track, scene).is_none()
@@ -3160,6 +3556,9 @@ impl Arrangement {
             }
             resort(clips);
         }
+        for track in &mut self.tracks {
+            delete_track_automation_time(track, from, to);
+        }
         self.loop_range = self.loop_range.map(|(a, b)| {
             let shift = |beat: f32| {
                 if beat >= to {
@@ -3190,6 +3589,9 @@ impl Arrangement {
                 }
             }
         }
+        for track in &mut self.tracks {
+            insert_track_automation_time(track, at, amount);
+        }
         self.loop_range = self.loop_range.map(|(a, b)| {
             let shift = |beat: f32| if beat >= at { beat + amount } else { beat };
             (shift(a), shift(b))
@@ -3206,6 +3608,17 @@ impl Arrangement {
             return false;
         }
         let span = to - from;
+        // Split before taking copies so a curve that crosses either edge
+        // yields a self-contained automation phrase, just like a clip.
+        for track in &mut self.tracks {
+            split_track_automation_at(track, from);
+            split_track_automation_at(track, to);
+        }
+        let automation_copies: Vec<_> = self
+            .tracks
+            .iter()
+            .map(|track| track.automation.copy_all_span(from, to))
+            .collect();
         if !self.insert_time(to, span, bpm) {
             return false;
         }
@@ -3226,6 +3639,9 @@ impl Arrangement {
                 clips.insert(at, copy);
             }
             resort(&mut self.clips[track]);
+        }
+        for (track, envelopes) in self.tracks.iter_mut().zip(automation_copies) {
+            track.automation.insert_envelopes(envelopes, span);
         }
         true
     }
@@ -3250,6 +3666,8 @@ impl Arrangement {
         self.session.slots.insert(to, slots);
         let playing = self.session.playing.remove(from);
         self.session.playing.insert(to, playing);
+        let launch_at = self.session.launch_at.remove(from);
+        self.session.launch_at.insert(to, launch_at);
 
         // Every lane between the two ends shifts by one to make room; the
         // marks the user is pointing at follow the lane they meant, not the
@@ -3309,6 +3727,7 @@ impl Arrangement {
             .slots
             .push(vec![None; self.session.scenes.len()]);
         self.session.playing.push(None);
+        self.session.launch_at.push(0.0);
         let i = self.tracks.len() - 1;
         // A new track is what you are about to work on. Selecting it also
         // means the device rack and the palette's track verbs point at it
@@ -3330,6 +3749,7 @@ impl Arrangement {
         self.clips.remove(track);
         self.session.slots.remove(track);
         self.session.playing.remove(track);
+        self.session.launch_at.remove(track);
         // Every index pointing PAST the hole shifts down; every index AT
         // it is now pointing at a different track, so it is dropped.
         let fix = |i: usize| match i.cmp(&track) {
@@ -3862,16 +4282,20 @@ fn lane_rects(area: egui::Rect, tracks: &[Track]) -> Vec<egui::Rect> {
 /// Subdivisions are dropped entirely when they would land closer together
 /// than `GRID_MIN_PX` — at 1/32 and this zoom that is 3px apart, which reads
 /// as a wash rather than a grid.
+/// `pixels_per_beat` is explicit rather than read from `arr`: the focused
+/// automation editor draws at a different scale than the timeline, and the
+/// grid must be at the same scale as the thing snapping to it.
 fn beat_grid(
     ui: &egui::Ui,
     area: egui::Rect,
     theme: &Theme,
     arr: &Arrangement,
     beats_per_bar: u32,
+    pixels_per_beat: f32,
 ) {
     let painter = ui.painter();
     let sub = arr.grid_beats();
-    let sub_px = sub * arr.pixels_per_beat;
+    let sub_px = sub * pixels_per_beat;
     let step = if sub_px < GRID_MIN_PX { 1.0 } else { sub };
     let per_bar = beats_per_bar.max(1) as f32;
 
@@ -3879,7 +4303,7 @@ fn beat_grid(
     // absolute beat/bar boundaries no matter where the view is panned.
     let mut beat = (arr.view_beats / step).floor() * step;
     loop {
-        let x = x_at(area, arr.view_beats, arr.pixels_per_beat, beat);
+        let x = x_at(area, arr.view_beats, pixels_per_beat, beat);
         if x > area.right() {
             break;
         }
@@ -3898,6 +4322,477 @@ fn beat_grid(
         );
         beat += step;
     }
+}
+
+// Automation is a real sublane, never an overlay on the clips. Keeping its
+// geometry in one place means the lane body, clip pass, and automation pass
+// agree about which pixels belong to which interaction.
+const AUTOMATION_LANE_H: f32 = 34.0;
+
+fn automation_rect(lane: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_max(
+        egui::pos2(
+            lane.left(),
+            (lane.bottom() - AUTOMATION_LANE_H).max(lane.top()),
+        ),
+        lane.right_bottom(),
+    )
+}
+
+/// The compact automation sublane shown below clips on the selected track.
+/// It deliberately edits one parameter at a time: touch a familiar target,
+/// then draw, instead of making every lane a wall of unrelated curves.
+// This is the rendering/input boundary for one envelope; its parameters are
+// deliberately explicit so the compact lane and focused editor share it.
+#[allow(clippy::too_many_arguments)]
+fn automation_lane(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    theme: &Theme,
+    view_beats: f32,
+    pixels_per_beat: f32,
+    grid: f32,
+    target: &str,
+    spec: &ParameterSpec,
+    automation: &mut TrackAutomation,
+    base: f32,
+) -> bool {
+    let painter = ui.painter();
+    painter.rect_filled(rect, 0.0, theme.surface_sunken.gamma_multiply(0.8));
+    painter.line_segment(
+        [rect.left_top(), rect.right_top()],
+        egui::Stroke::new(stroke::HAIR, theme.divider),
+    );
+    let lo = spec.min;
+    let hi = spec.max;
+    let point_pos = |beat: f32, value: f32| {
+        let x = x_at(rect, view_beats, pixels_per_beat, beat);
+        let y = rect.bottom() - ((value - lo) / (hi - lo)).clamp(0.0, 1.0) * rect.height();
+        egui::pos2(x, y)
+    };
+    let value_at_y = |y: f32| {
+        let value = (lo + (rect.bottom() - y) / rect.height() * (hi - lo)).clamp(lo, hi);
+        if spec.stepped { value.round() } else { value }
+    };
+    let start = view_beats;
+    let end = start + rect.width() / pixels_per_beat;
+    // Sample the evaluated curve rather than joining dots with straight
+    // strokes. This keeps the drawn line exactly faithful to playback for
+    // every segment shape, including a stepped hold.
+    let samples = (rect.width() / 6.0).ceil().clamp(2.0, 512.0) as usize;
+    let curve: Vec<_> = (0..=samples)
+        .map(|i| {
+            let beat = start + (end - start) * i as f32 / samples as f32;
+            point_pos(beat, automation.value_at(target, beat, base))
+        })
+        .collect();
+    painter.add(egui::Shape::line(
+        curve,
+        egui::Stroke::new(1.5, theme.accent),
+    ));
+
+    let id = ui.id().with(("automation_lane", target));
+    // The handle is deliberately invisible. The line itself is the target:
+    // when it is under the pointer it advertises a vertical curve gesture;
+    // holding Alt/Option turns that gesture into a bend edit for its source
+    // point, matching Live's envelope editing convention.
+    let hit_curve = |pointer: egui::Pos2| {
+        if !rect.contains(pointer) {
+            return None;
+        }
+        let mut best: Option<(usize, f32)> = None;
+        for (index, pair) in automation.points(target).windows(2).enumerate() {
+            let [a, b] = pair else { continue };
+            if pointer.x
+                < point_pos(a.beat, a.value)
+                    .x
+                    .min(point_pos(b.beat, b.value).x)
+                    - 6.0
+                || pointer.x
+                    > point_pos(a.beat, a.value)
+                        .x
+                        .max(point_pos(b.beat, b.value).x)
+                        + 6.0
+            {
+                continue;
+            }
+            let mut previous = point_pos(a.beat, a.value);
+            for step in 1..=24 {
+                let beat = a.beat + (b.beat - a.beat) * step as f32 / 24.0;
+                let next = point_pos(beat, automation.value_at(target, beat, base));
+                let segment = next - previous;
+                let length_sq = segment.length_sq().max(f32::EPSILON);
+                let t = ((pointer - previous).dot(segment) / length_sq).clamp(0.0, 1.0);
+                let distance_sq = (pointer - (previous + segment * t)).length_sq();
+                if distance_sq <= 49.0 && best.is_none_or(|(_, closest)| distance_sq < closest) {
+                    best = Some((index, distance_sq));
+                }
+                previous = next;
+            }
+        }
+        best.map(|(index, _)| index)
+    };
+    let curve_hit = ui.ctx().pointer_latest_pos().and_then(hit_curve);
+    let curve_press_hit = ui
+        .input(|input| input.pointer.press_origin())
+        .and_then(hit_curve);
+    let curve_modifier_held = ui.input(|i| i.modifiers.alt);
+    if let Some(index) = curve_hit {
+        let points = automation.points(target);
+        if let Some([a, b]) = points.get(index..=index + 1) {
+            let highlighted: Vec<_> = (0..=32)
+                .map(|step| {
+                    let beat = a.beat + (b.beat - a.beat) * step as f32 / 32.0;
+                    point_pos(beat, automation.value_at(target, beat, base))
+                })
+                .collect();
+            painter.add(egui::Shape::line(
+                highlighted,
+                egui::Stroke::new(3.0, theme.text),
+            ));
+        }
+    }
+    let response = ui.interact(rect, id, egui::Sense::click_and_drag());
+    let mut hovered = response.hovered();
+    if hovered {
+        painter.rect_stroke(
+            rect,
+            0.0,
+            egui::Stroke::new(1.5, theme.accent),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            rect.right_top() + egui::vec2(-5.0, 4.0),
+            egui::Align2::RIGHT_TOP,
+            "Z  focus automation",
+            egui::FontId::proportional(9.0),
+            theme.text,
+        );
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+    }
+    if response.clicked()
+        && !(curve_modifier_held && curve_hit.is_some())
+        && let Some(pos) = response.interact_pointer_pos()
+    {
+        let freehand = ui.input(|i| i.modifiers.alt);
+        let raw_beat = beat_at(rect, view_beats, pixels_per_beat, pos.x).max(0.0);
+        let beat = if freehand {
+            raw_beat
+        } else {
+            snap(raw_beat, grid)
+        };
+        let value = value_at_y(pos.y);
+        automation.insert(target, beat, value);
+    }
+    if curve_hit.is_some() {
+        hovered = true;
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+    }
+    // Keep the segment and its starting bend from the press onward. The
+    // primary lane response owns the pointer for the complete drag, so this
+    // cannot be lost to a second invisible interaction layer mid-gesture.
+    let curve_drag_id = id.with("curve_drag");
+    if response.drag_started() {
+        // Armed (or explicitly DISARMED) on every press: a stale segment
+        // from the last gesture must never answer a drag that started on
+        // empty lane space.
+        match curve_press_hit.filter(|_| curve_modifier_held) {
+            Some(index) => {
+                let bend = automation.points(target)[index].bend;
+                ui.ctx()
+                    .data_mut(|data| data.insert_temp(curve_drag_id, (index, bend)));
+            }
+            None => {
+                ui.ctx()
+                    .data_mut(|data| data.remove_temp::<(usize, f32)>(curve_drag_id));
+            }
+        }
+    }
+    let curve_drag: Option<(usize, f32)> = ui.ctx().data(|data| data.get_temp(curve_drag_id));
+    if curve_modifier_held
+        && response.dragged()
+        && let Some((index, initial)) = curve_drag
+        && let (Some(pos), Some(origin)) = (
+            response.interact_pointer_pos(),
+            ui.input(|i| i.pointer.press_origin()),
+        )
+    {
+        // Absolute from the press, like every drag here: `drag_delta` is
+        // the delta since the last FRAME, and rebuilding from `initial`
+        // each frame would throw the previous frames' movement away — a
+        // slow drag would twitch and stay flat.
+        automation.points_mut(target)[index].bend =
+            (initial - (pos.y - origin.y) / rect.height() * 2.0).clamp(-1.0, 1.0);
+    }
+    if curve_modifier_held
+        && response.double_clicked()
+        && let Some(index) = curve_hit
+    {
+        automation.points_mut(target)[index].bend = 0.0;
+    }
+    let delete_point = std::cell::Cell::new(None);
+    for (index, point) in automation.points_mut(target).iter_mut().enumerate() {
+        let pos = point_pos(point.beat, point.value);
+        let hit = egui::Rect::from_center_size(pos, egui::Vec2::splat(8.0));
+        let response = ui.interact(hit, id.with(index), egui::Sense::click_and_drag());
+        hovered |= response.hovered();
+        painter.circle_filled(
+            pos,
+            3.0,
+            if response.hovered() {
+                theme.text
+            } else {
+                theme.accent
+            },
+        );
+        if response.hovered() {
+            painter.circle_stroke(pos, 5.5, egui::Stroke::new(1.5, theme.text));
+            painter.text(
+                pos + egui::vec2(7.0, -7.0),
+                egui::Align2::LEFT_BOTTOM,
+                "double-click to delete",
+                egui::FontId::proportional(9.0),
+                theme.text,
+            );
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if response.dragged() {
+            let to = pos + response.drag_delta();
+            let freehand = ui.input(|i| i.modifiers.alt);
+            let raw_beat = beat_at(rect, view_beats, pixels_per_beat, to.x).max(0.0);
+            point.beat = if freehand {
+                raw_beat
+            } else {
+                snap(raw_beat, grid)
+            };
+            point.value = value_at_y(to.y);
+        }
+        if response.double_clicked() {
+            delete_point.set(Some(index));
+        }
+    }
+    let points = automation.points_mut(target);
+    if let Some(index) = delete_point.get() {
+        points.remove(index);
+    }
+    points.sort_by(|a, b| a.beat.total_cmp(&b.beat));
+    hovered
+}
+
+fn parameter_base(track: &Track, target: &str, spec: &ParameterSpec) -> f32 {
+    match target {
+        TRACK_VOLUME_TARGET => track.volume,
+        TRACK_PAN_TARGET => track.pan,
+        _ => spec.default,
+    }
+}
+
+/// Registry-backed chooser. Group headings and stable ids are already part
+/// of the contract; a future device only registers specs and appears here.
+fn automation_target_picker(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    id: egui::Id,
+    prefix: &str,
+    registry: &ParameterRegistry,
+    target: &mut String,
+) {
+    let selected = registry
+        .spec(target)
+        .map_or_else(|| target.clone(), |spec| spec.name.clone());
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    let response = child.add_sized(rect.size(), egui::Button::new(format!("{prefix}{selected} ▾")));
+    egui::Popup::menu(&response).id(id.with("popup")).show(|ui| {
+            let query_id = id.with("query");
+            let mut query: String = ui.ctx().data(|data| data.get_temp(query_id).unwrap_or_default());
+            ui.add(
+                egui::TextEdit::singleline(&mut query)
+                    .hint_text("Search parameters")
+                    .desired_width(210.0),
+            );
+            ui.ctx().data_mut(|data| data.insert_temp(query_id, query.clone()));
+            let query = query.trim().to_lowercase();
+            let mut last_group = "";
+            for spec in &registry.specs {
+                if !query.is_empty()
+                    && !spec.name.to_lowercase().contains(&query)
+                    && !spec.group.to_lowercase().contains(&query)
+                    && !spec.id.to_lowercase().contains(&query)
+                {
+                    continue;
+                }
+                if spec.group != last_group {
+                    if !last_group.is_empty() {
+                        ui.separator();
+                    }
+                    ui.label(&spec.group);
+                    last_group = &spec.group;
+                }
+                let suffix = if spec.unit.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {}", spec.unit)
+                };
+                if ui
+                    .selectable_label(target == &spec.id, format!("{}{}", spec.name, suffix))
+                    .clicked()
+                {
+                    *target = spec.id.clone();
+                    egui::Popup::close_all(ui.ctx());
+                }
+            }
+        });
+}
+
+/// A focused, full-height view of the automation currently under the hand.
+/// The compact track sublane is for quick moves; this is the place to make
+/// deliberate shapes without clips or track controls competing for space.
+fn automation_editor_body(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    arr: &mut Arrangement,
+    beats_per_bar: u32,
+    registry: &ParameterRegistry,
+    automation_target: &mut String,
+) -> bool {
+    let area = ui.max_rect();
+    claim(ui);
+    ui.painter().rect_filled(area, 0.0, theme.bg);
+
+    const HEADER_H: f32 = 30.0;
+    let header = egui::Rect::from_min_size(area.min, egui::vec2(area.width(), HEADER_H));
+    let editor = egui::Rect::from_min_max(
+        egui::pos2(area.left(), header.bottom()),
+        area.right_bottom(),
+    );
+    ui.painter().rect_filled(header, 0.0, theme.surface_sunken);
+    ui.painter().line_segment(
+        [header.left_bottom(), header.right_bottom()],
+        egui::Stroke::new(stroke::HAIR, theme.divider),
+    );
+
+    let close = egui::Rect::from_min_size(
+        egui::pos2(header.left() + 6.0, header.top() + 5.0),
+        egui::vec2(88.0, header.height() - 10.0),
+    );
+    let close_response = ui.interact(
+        close,
+        ui.id().with("close_automation_editor"),
+        egui::Sense::click(),
+    );
+    ui.painter().rect_filled(
+        close,
+        0.0,
+        if close_response.hovered() {
+            theme.surface
+        } else {
+            theme.surface_sunken
+        },
+    );
+    ui.painter().text(
+        close.center(),
+        egui::Align2::CENTER_CENTER,
+        "← TIMELINE",
+        egui::FontId::proportional(10.0),
+        theme.text,
+    );
+
+    let selected = arr
+        .selected
+        .and_then(|i| arr.tracks.get(i).map(|track| (i, track.name.clone())));
+    if let Some((track_index, track_name)) = selected {
+        let target_button = egui::Rect::from_min_size(
+            egui::pos2(close.right() + 8.0, close.top()),
+            egui::vec2(112.0, close.height()),
+        );
+        automation_target_picker(
+            ui,
+            target_button,
+            ui.id().with("automation_editor_target"),
+            "",
+            registry,
+            automation_target,
+        );
+        ui.painter().text(
+            egui::pos2(target_button.right() + 10.0, header.center().y),
+            egui::Align2::LEFT_CENTER,
+            format!(
+                "{}  —  click to add • ⌥ point drag: off-grid • ⌥ line drag: bend • ⌥ double-click: straighten • double-click point: delete",
+                track_name
+            ),
+            egui::FontId::proportional(11.0),
+            theme.text_muted,
+        );
+
+        // More pixels per beat and the whole central panel gives curves the
+        // working room they need, while the compact lane remains unchanged.
+        let focused_ppb =
+            |base: f32| (base * 2.0).clamp(ARRANGEMENT_ZOOM_MIN, ARRANGEMENT_ZOOM_MAX);
+        let mut focused_pixels_per_beat = focused_ppb(arr.pixels_per_beat);
+
+        // The editor is a view over the SAME time axis as the timeline: the
+        // wheel pans it and ctrl+scroll (or pinch) zooms it anchored under
+        // the pointer, and both write straight back to the shared view — so
+        // leaving focused mode lands the timeline where you left the curve.
+        let pointer_here = ui
+            .ctx()
+            .pointer_latest_pos()
+            .is_some_and(|pos| editor.contains(pos));
+        let scroll = ui.input(|i| i.smooth_scroll_delta);
+        let pan = scroll.x + scroll.y;
+        if pan != 0.0 && pointer_here {
+            arr.view_beats = (arr.view_beats + pan / focused_pixels_per_beat).max(0.0);
+        }
+        let zoom = ui.input(|i| i.zoom_delta());
+        if zoom != 1.0
+            && pointer_here
+            && let Some(pos) = ui.ctx().pointer_latest_pos()
+        {
+            let old = focused_pixels_per_beat;
+            arr.pixels_per_beat =
+                (arr.pixels_per_beat * zoom).clamp(ARRANGEMENT_ZOOM_MIN, ARRANGEMENT_ZOOM_MAX);
+            focused_pixels_per_beat = focused_ppb(arr.pixels_per_beat);
+            if focused_pixels_per_beat != old {
+                // The beat under the pointer stays under the pointer, at
+                // the FOCUSED scale on both sides of the change.
+                let anchor = arr.view_beats + (pos.x - editor.left()) / old;
+                arr.view_beats =
+                    (anchor - (pos.x - editor.left()) / focused_pixels_per_beat).max(0.0);
+            }
+        }
+
+        beat_grid(
+            ui,
+            editor,
+            theme,
+            arr,
+            beats_per_bar,
+            focused_pixels_per_beat,
+        );
+        let Some(spec) = registry.spec(automation_target) else {
+            return close_response.clicked();
+        };
+        let base = parameter_base(&arr.tracks[track_index], automation_target, spec);
+        automation_lane(
+            ui,
+            editor,
+            theme,
+            arr.view_beats,
+            focused_pixels_per_beat,
+            arr.grid_beats(),
+            automation_target,
+            spec,
+            &mut arr.tracks[track_index].automation,
+            base,
+        );
+    } else {
+        kit::empty_state(ui, theme, "select a track to edit automation");
+    }
+    close_response.clicked()
 }
 
 /// A small bipolar pan knob, drawn into `rect`.
@@ -4417,6 +5312,14 @@ struct ArrangementTransportView {
     follow: bool,
 }
 
+#[derive(Default)]
+struct ArrangementOutcome {
+    panned: bool,
+    automation_hovered: bool,
+}
+
+// The timeline composes independent UI services at the panel boundary.
+#[allow(clippy::too_many_arguments)]
 fn arrangement_body(
     ui: &mut egui::Ui,
     focus: &mut Focus,
@@ -4425,7 +5328,10 @@ fn arrangement_body(
     transport: ArrangementTransportView,
     waveform_cache: &HashMap<PathBuf, Arc<waveform::Peaks>>,
     drag: Option<&mut DragImport>,
-) -> bool {
+    automation_mode: bool,
+    registry: &ParameterRegistry,
+    automation_target: &mut String,
+) -> ArrangementOutcome {
     let ArrangementTransportView {
         beats_per_bar,
         bpm,
@@ -4448,6 +5354,7 @@ fn arrangement_body(
     let scroll = ui.input(|i| i.smooth_scroll_delta);
     let pan = scroll.x + scroll.y;
     let mut panned = false;
+    let mut automation_hovered = false;
     let pointer_on_timeline = ui
         .ctx()
         .pointer_latest_pos()
@@ -4544,7 +5451,7 @@ fn arrangement_body(
     }
     let offset = arr.view_beats;
 
-    beat_grid(ui, content, theme, arr, beats_per_bar);
+    beat_grid(ui, content, theme, arr, beats_per_bar, arr.pixels_per_beat);
 
     ui.painter().text(
         egui::pos2(area.right() - GRID_LABEL_PAD, ruler.center().y),
@@ -4553,6 +5460,20 @@ fn arrangement_body(
         egui::FontId::new(GRID_LABEL_TYPE, egui::FontFamily::Monospace),
         theme.text_muted,
     );
+    if automation_mode {
+        let badge = egui::Rect::from_min_size(
+            egui::pos2(ruler.left() + 4.0, ruler.top() + 2.0),
+            egui::vec2(124.0, ruler.height() - 4.0),
+        );
+        automation_target_picker(
+            ui,
+            badge,
+            ui.id().with("automation_target"),
+            "AUTO: ",
+            registry,
+            automation_target,
+        );
+    }
 
     // --- the loop region, under everything it covers ----------------------
     if let Some((from, to)) = arr.loop_range {
@@ -4606,18 +5527,26 @@ fn arrangement_body(
         }
 
         if arr.selected == Some(i) {
-            // The selected lane lifts one step off the canvas.
+            // The selected lane lifts one step off the canvas, then restores
+            // its beat grid. Painting the opaque lift after the global grid
+            // used to erase every timing reference in the active track.
             ui.painter().rect_filled(visible, 0.0, theme.surface);
+            beat_grid(ui, visible, theme, arr, beats_per_bar, arr.pixels_per_beat);
         }
+        let shows_automation = automation_mode && arr.selected == Some(i);
 
-        // The lane body, minus the strip the resize handle owns — otherwise
-        // reaching for the boundary would also start a selection.
+        // The lane body excludes both the automation sublane and the resize
+        // strip. An automation gesture therefore cannot also select time or
+        // create a clip on a double click.
+        let body_bottom = visible.bottom()
+            - if shows_automation {
+                AUTOMATION_LANE_H
+            } else {
+                0.0
+            };
         let body = egui::Rect::from_min_max(
             visible.min,
-            egui::pos2(
-                visible.right(),
-                (visible.bottom() - grab).max(visible.top()),
-            ),
+            egui::pos2(visible.right(), (body_bottom - grab).max(visible.top())),
         );
         let anchor_id = wid.with("anchor");
         let picked = ui.interact(body, wid.with("body"), egui::Sense::click_and_drag());
@@ -4669,7 +5598,25 @@ fn arrangement_body(
                 ),
             );
             ui.painter()
-                .rect_filled(band.intersect(visible), 0.0, theme.selection);
+                .rect_filled(band.intersect(body), 0.0, theme.selection);
+        }
+
+        if shows_automation
+            && let Some(spec) = registry.spec(automation_target)
+        {
+            let base = parameter_base(&arr.tracks[i], automation_target, spec);
+            automation_hovered |= automation_lane(
+                ui,
+                automation_rect(visible),
+                theme,
+                offset,
+                arr.pixels_per_beat,
+                grid,
+                automation_target,
+                spec,
+                &mut arr.tracks[i].automation,
+                base,
+            );
         }
 
         // The boundary below this lane resizes it.
@@ -4760,7 +5707,16 @@ fn arrangement_body(
     }
     loop_brace(ui, theme, focus, ruler, content, arr, grid);
     locators_pass(ui, theme, ruler, content, arr, grid);
-    clips_pass(ui, theme, content, arr, grid, bpm, waveform_cache);
+    clips_pass(
+        ui,
+        theme,
+        content,
+        arr,
+        grid,
+        bpm,
+        waveform_cache,
+        automation_mode,
+    );
 
     // The drop ghost, above the clips it would join and under the playhead.
     // The spot it lands on rides back out on the drag, where the app reads
@@ -4806,7 +5762,10 @@ fn arrangement_body(
         ));
     }
 
-    panned
+    ArrangementOutcome {
+        panned,
+        automation_hovered,
+    }
 }
 
 /// Session grid metrics.
@@ -5377,12 +6336,15 @@ enum SessionIntent {
 /// different way to READ the song, not a different song. A slot's clip has
 /// no timeline position: it plays from wherever it is launched, which is
 /// what the whole grid means.
+// Session owns its grid, mixer, transport launch edge, and external drag.
+#[allow(clippy::too_many_arguments)]
 fn session_body(
     ui: &mut egui::Ui,
     focus: &mut Focus,
     theme: &Theme,
     arr: &mut Arrangement,
     beats_per_bar: u32,
+    launch_at: f32,
     // One per track, in track order. Short is fine: a track without an
     // entry meters silence.
     meters: &[device::meter::Ballistics],
@@ -6281,7 +7243,7 @@ fn session_body(
         Some(SessionIntent::Launch(t, s)) => {
             // Launching is an instrument, not a form: the swap happens on
             // the press, not after the clip-edit debounce.
-            arr.force_recompile |= arr.session.launch(t, s);
+            arr.force_recompile |= arr.session.launch_at(t, s, launch_at);
             arr.session.selected = Some((t, s));
             arr.selected = Some(t);
         }
@@ -6302,7 +7264,7 @@ fn session_body(
             arr.force_recompile |= arr.session.stop_track(t);
         }
         Some(SessionIntent::LaunchScene(s)) => {
-            arr.force_recompile |= arr.session.launch_scene(s);
+            arr.force_recompile |= arr.session.launch_scene_at(s, launch_at);
             // A scene named with a tempo IS a tempo change, and launching
             // selects the NEXT scene — Ableton's default — so launching
             // down a song is Enter, Enter, Enter.
@@ -6748,6 +7710,8 @@ enum ClipMenu {
 /// time selection. Edits are collected while drawing and applied at the end:
 /// the draw borrow stays read-only, and a drag reads last frame's rects
 /// against this frame's delta — one frame of lag, invisible at 60fps.
+// Clip drawing needs the panel geometry, timeline scale, model, and cache.
+#[allow(clippy::too_many_arguments)]
 fn clips_pass(
     ui: &mut egui::Ui,
     theme: &Theme,
@@ -6756,6 +7720,7 @@ fn clips_pass(
     grid: f32,
     bpm: f64,
     waveform_cache: &HashMap<PathBuf, Arc<waveform::Peaks>>,
+    automation_mode: bool,
 ) {
     let offset = arr.view_beats;
     let pixels_per_beat = arr.pixels_per_beat;
@@ -6778,9 +7743,19 @@ fn clips_pass(
     let mut rename_cancel = false;
 
     for (t, track) in arr.clips.iter().enumerate() {
-        let Some(lane) = lanes.get(t) else { break };
+        let Some(full_lane) = lanes.get(t) else {
+            break;
+        };
+        // A selected automated track gives the clips the upper portion of
+        // its lane. The lower automation sublane is deliberately out of the
+        // clip pass altogether, for both paint and hit testing.
+        let lane = if automation_mode && arr.selected == Some(t) {
+            egui::Rect::from_min_max(full_lane.min, automation_rect(*full_lane).min)
+        } else {
+            *full_lane
+        };
         for (i, clip) in track.iter().enumerate() {
-            let full_rect = clip_rect(content, offset, pixels_per_beat, *lane, clip);
+            let full_rect = clip_rect(content, offset, pixels_per_beat, lane, clip);
             let rect = full_rect.intersect(content);
             if rect.width() <= 0.0 {
                 continue;
@@ -7010,8 +7985,13 @@ fn clips_pass(
 
     // --- the ghost, drawn above everything it might land on ---------------
     if let Some(g) = &ghost
-        && let Some(lane) = lanes.get(g.track)
+        && let Some(full_lane) = lanes.get(g.track)
     {
+        let lane = if automation_mode && arr.selected == Some(g.track) {
+            egui::Rect::from_min_max(full_lane.min, automation_rect(*full_lane).min)
+        } else {
+            *full_lane
+        };
         // The target lane washed like a drop target, so a cross-lane drag
         // says where it is aimed even before the ghost is looked at.
         ui.painter().rect_filled(
@@ -7019,7 +7999,7 @@ fn clips_pass(
             0.0,
             theme.accent_muted.gamma_multiply(0.25),
         );
-        let full_r = clip_rect(content, offset, pixels_per_beat, *lane, &g.clip);
+        let full_r = clip_rect(content, offset, pixels_per_beat, lane, &g.clip);
         let r = full_r.intersect(content);
         let painter = ui.painter();
         painter.rect_filled(r, 0.0, theme.clip_body.gamma_multiply(0.55));
@@ -8505,6 +9485,42 @@ fn recompile_due(dirty: bool, since_last_compile: f64) -> bool {
     dirty && since_last_compile >= RECOMPILE_MIN_SECS
 }
 
+/// The global grid for session launch placement.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum LaunchQuantization {
+    #[default]
+    Bar,
+    Beat,
+    Off,
+}
+
+impl LaunchQuantization {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Bar => "q bar",
+            Self::Beat => "q beat",
+            Self::Off => "q off",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Bar => Self::Beat,
+            Self::Beat => Self::Off,
+            Self::Off => Self::Bar,
+        }
+    }
+
+    fn launch_beat(self, now: f32, beats_per_bar: u32) -> f32 {
+        let unit = match self {
+            Self::Bar => beats_per_bar.max(1) as f32,
+            Self::Beat => 1.0,
+            Self::Off => return now,
+        };
+        (now / unit).floor().mul_add(unit, unit)
+    }
+}
+
 struct App {
     theme: Theme,
     /// Machine-local preferences, loaded at startup and handed back to
@@ -8537,6 +9553,15 @@ struct App {
     /// runs (the mirror is refreshed from telemetry each frame); with the
     /// engine off this is the stand-in the app falls back to.
     transport: Transport,
+    /// Global performance preference, independent of project content.
+    launch_quantization: LaunchQuantization,
+    automation_mode: bool,
+    parameter_registry: ParameterRegistry,
+    automation_target: String,
+    /// Set by the compact sublane during the preceding frame. It gates Z so
+    /// the familiar audio-clip zoom shortcut remains available elsewhere.
+    automation_hovered: bool,
+    automation_editor: bool,
     browser: Browser,
     arrangement: Arrangement,
     /// Undo/redo over the arrangement. Fed by watching the model at the end
@@ -8664,6 +9689,12 @@ impl App {
             theme,
             prefs,
             transport: Transport::default(),
+            launch_quantization: LaunchQuantization::default(),
+            automation_mode: false,
+            parameter_registry: ParameterRegistry::default(),
+            automation_target: TRACK_VOLUME_TARGET.to_owned(),
+            automation_hovered: false,
+            automation_editor: false,
             browser,
             library_config,
             library_snapshot,
@@ -9898,9 +10929,17 @@ impl App {
         // `f32::NAN != NAN`, so a freshly grown slot always sends once.
         self.sent_pan.resize(n, f32::NAN);
         self.sent_volume.resize(n, f32::NAN);
+        let beat = (self.transport.position * self.transport.bpm / 60.0) as f32;
         for i in 0..n {
-            let pan = self.arrangement.tracks[i].pan;
-            let volume = self.arrangement.tracks[i].volume;
+            let track = &self.arrangement.tracks[i];
+            let pan = track
+                .automation
+                .value_at(TRACK_PAN_TARGET, beat, track.pan)
+                .clamp(-1.0, 1.0);
+            let volume = track
+                .automation
+                .value_at(TRACK_VOLUME_TARGET, beat, track.volume)
+                .max(0.0);
             if pan == self.sent_pan[i] && volume == self.sent_volume[i] {
                 continue;
             }
@@ -10139,6 +11178,44 @@ impl eframe::App for App {
                 }
             });
         }
+        if !palette_open
+            && !skin_open
+            && !self.project.open
+            && !ui.ctx().egui_wants_keyboard_input()
+            && ui
+                .ctx()
+                .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::A))
+        {
+            self.automation_mode = !self.automation_mode;
+            if !self.automation_mode {
+                self.automation_editor = false;
+            }
+        }
+        // The compact automation lane advertises Z only while it is under
+        // the pointer. Consume that exact gesture before the arrangement's
+        // normal Z action (zoom selected audio clip) gets a chance to see it.
+        if !palette_open
+            && !skin_open
+            && !self.project.open
+            && !ui.ctx().egui_wants_keyboard_input()
+            && self.arrangement.main_view == MainView::Timeline
+            && self.automation_mode
+            && self.automation_hovered
+            && !self.automation_editor
+            && ui
+                .ctx()
+                .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Z))
+        {
+            self.automation_editor = true;
+        }
+        if self.automation_editor
+            && ui.ctx().input_mut(|i| {
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+                    || i.consume_key(egui::Modifiers::NONE, egui::Key::X)
+            })
+        {
+            self.automation_editor = false;
+        }
         self.draw_project_window(ui.ctx());
 
         if !palette_open && !skin_open && self.bottom_view == BottomView::ClipEditor {
@@ -10175,7 +11252,7 @@ impl eframe::App for App {
                 }
             }
         }
-        if !palette_open && !skin_open && !self.project.open {
+        if !palette_open && !skin_open && !self.project.open && !self.automation_editor {
             arrangement_keys(ui.ctx(), &self.arrangement, &mut actions);
         }
         // An open header rename owns the keyboard outright, and this must
@@ -10202,6 +11279,7 @@ impl eframe::App for App {
                     t,
                     &mut self.focus,
                     &self.transport,
+                    &mut self.launch_quantization,
                     engine_view,
                     &mut actions,
                 )
@@ -10367,9 +11445,22 @@ impl eframe::App for App {
         // What the launcher hands back — settled after the panel, where
         // `self.meters` and the transport are free again.
         let mut session_outcome = SessionOutcome::default();
-        let panned = egui::CentralPanel::default()
+        let arrangement_outcome = egui::CentralPanel::default()
             .frame(self.fill(t.bg))
             .show(ui, |ui| match self.arrangement.main_view {
+                MainView::Timeline if self.automation_editor => {
+                    if automation_editor_body(
+                        ui,
+                        &self.theme,
+                        &mut self.arrangement,
+                        self.transport.beats_per_bar,
+                        &self.parameter_registry,
+                        &mut self.automation_target,
+                    ) {
+                        self.automation_editor = false;
+                    }
+                    ArrangementOutcome::default()
+                }
                 MainView::Timeline => arrangement_body(
                     ui,
                     &mut self.focus,
@@ -10378,23 +11469,32 @@ impl eframe::App for App {
                     arrangement_transport,
                     &self.waveform_cache,
                     self.drag_import.as_mut(),
+                    self.automation_mode,
+                    &self.parameter_registry,
+                    &mut self.automation_target,
                 ),
                 MainView::Session => {
+                    let now = arrangement_transport.playhead;
+                    let launch_at = self
+                        .launch_quantization
+                        .launch_beat(now, self.transport.beats_per_bar);
                     session_outcome = session_body(
                         ui,
                         &mut self.focus,
                         &self.theme,
                         &mut self.arrangement,
                         self.transport.beats_per_bar,
+                        launch_at,
                         &self.meters,
                         self.drag_import.as_mut(),
                     );
                     // The launcher has no view to pan: nothing here can
                     // take the wheel from follow.
-                    false
+                    ArrangementOutcome::default()
                 }
             })
             .inner;
+        self.automation_hovered = arrangement_outcome.automation_hovered;
 
         if let Some(track) = session_outcome.cleared_clip
             && let Some(meter) = self.meters.get_mut(track)
@@ -10409,7 +11509,7 @@ impl eframe::App for App {
 
         // Panning by hand is the user taking the wheel: follow stays off
         // until they ask for it again.
-        if panned {
+        if arrangement_outcome.panned {
             self.transport.follow = false;
         }
 
@@ -11640,15 +12740,23 @@ mod tests {
             egui::Panel::top("top_bar")
                 .exact_size(TOP_BAR_H)
                 .show(ui, |ui| {
-                    top_bar_body(ui, &theme, &mut focus, &t, off, &mut actions)
+                    top_bar_body(
+                        ui,
+                        &theme,
+                        &mut focus,
+                        &t,
+                        &mut LaunchQuantization::default(),
+                        off,
+                        &mut actions,
+                    )
                 });
         });
         out.textures_delta.clear();
 
-        // 5 verbs + power + 3 toggles + tempo + numerator + denominator.
+        // 5 verbs + power + 3 toggles + quantization + tempo + time signature.
         assert_eq!(
             focus.items.len(),
-            12,
+            13,
             "expected every control to register; got {:?}",
             focus.items.len()
         );
@@ -11664,11 +12772,11 @@ mod tests {
         ) {
             at = next;
             seen += 1;
-            assert!(seen <= 12, "navigation looped instead of terminating");
+            assert!(seen <= 13, "navigation looped instead of terminating");
         }
         assert_eq!(
-            seen, 12,
-            "only {seen} of 12 controls are reachable rightwards"
+            seen, 13,
+            "only {seen} of 13 controls are reachable rightwards"
         );
     }
 
@@ -12204,6 +13312,9 @@ mod tests {
                         },
                         &HashMap::new(),
                         None,
+                        false,
+                        &ParameterRegistry::default(),
+                        &mut TRACK_VOLUME_TARGET.to_owned(),
                     );
                 });
         });
@@ -12475,6 +13586,9 @@ mod tests {
                         },
                         &HashMap::new(),
                         Some(drag),
+                        false,
+                        &ParameterRegistry::default(),
+                        &mut TRACK_VOLUME_TARGET.to_owned(),
                     );
                 });
         });
@@ -12919,7 +14033,7 @@ mod tests {
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(theme.bg))
                 .show(ui, |ui| {
-                    session_body(ui, &mut Focus::default(), &theme, arr, 4, &[], None);
+                    session_body(ui, &mut Focus::default(), &theme, arr, 4, 0.0, &[], None);
                 });
         });
         out.textures_delta.clear();
@@ -12943,7 +14057,16 @@ mod tests {
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(theme.bg))
                 .show(ui, |ui| {
-                    session_body(ui, &mut Focus::default(), &theme, &mut arr, 4, &[], None);
+                    session_body(
+                        ui,
+                        &mut Focus::default(),
+                        &theme,
+                        &mut arr,
+                        4,
+                        0.0,
+                        &[],
+                        None,
+                    );
                 });
         });
         let layout = SessionLayout::new(
@@ -12996,6 +14119,9 @@ mod tests {
                         },
                         &HashMap::new(),
                         None,
+                        false,
+                        &ParameterRegistry::default(),
+                        &mut TRACK_VOLUME_TARGET.to_owned(),
                     );
                 });
         });
@@ -13289,6 +14415,197 @@ mod tests {
             ],
         );
         assert_eq!(arr.pending_seek.take(), Some(7.0), "the ruler scrubs");
+    }
+
+    /// The focused automation editor pans with the wheel and zooms
+    /// anchored under the pointer — on the SAME view the timeline uses, so
+    /// leaving focused mode lands where the curve was left.
+    #[test]
+    fn the_focused_automation_editor_scrolls_and_zooms() {
+        let ctx = egui::Context::default();
+        let mut arr = Arrangement {
+            selected: Some(0),
+            ..Default::default()
+        };
+        let mut target = TRACK_VOLUME_TARGET.to_owned();
+        let pass = |arr: &mut Arrangement, target: &mut String, events: Vec<Event>| {
+            let mut out = ctx.run_ui(input(events), |ui| {
+                let theme = Theme::dark();
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::new().fill(theme.bg))
+                    .show(ui, |ui| {
+                        automation_editor_body(
+                            ui,
+                            &theme,
+                            arr,
+                            4,
+                            &ParameterRegistry::default(),
+                            target,
+                        );
+                    });
+            });
+            out.textures_delta.clear();
+        };
+        pass(&mut arr, &mut target, vec![]);
+        assert_eq!(arr.view_beats, 0.0);
+
+        // The wheel pans the shared view. The editor draws at twice the
+        // timeline scale, so 96px of wheel is 96 / (24*2) = 2 beats.
+        let over = pos2(400.0, 300.0);
+        pass(
+            &mut arr,
+            &mut target,
+            vec![
+                Event::PointerMoved(over),
+                Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    // The sign follows the TIMELINE's wheel, because they
+                    // are the same view: positive pans later.
+                    delta: vec2(96.0, 0.0),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        for _ in 0..30 {
+            pass(&mut arr, &mut target, vec![]);
+        }
+        assert!(
+            (arr.view_beats - 2.0).abs() < 0.01,
+            "96px at the focused scale is two beats: {}",
+            arr.view_beats
+        );
+
+        // Zoom doubles the shared scale and keeps the beat under the
+        // pointer under the pointer, measured at the focused scale.
+        let before = arr.pixels_per_beat;
+        let anchor_beat = arr.view_beats + over.x / (before * 2.0);
+        pass(
+            &mut arr,
+            &mut target,
+            vec![Event::PointerMoved(over), Event::Zoom(2.0)],
+        );
+        assert_eq!(arr.pixels_per_beat, before * 2.0, "the shared scale moved");
+        let after_beat = arr.view_beats + over.x / (arr.pixels_per_beat * 2.0);
+        assert!(
+            (after_beat - anchor_beat).abs() < 0.01,
+            "the anchored beat never leaves the pointer: {after_beat} vs {anchor_beat}"
+        );
+    }
+
+    /// A slow Alt-drag on a curve segment accumulates its bend instead of
+    /// twitching and staying flat. Regression: the bend was rebuilt each
+    /// frame from `drag_delta` — the delta since the last FRAME — so every
+    /// frame threw the previous frames' movement away. Same bug, same
+    /// pin, as `a_slow_drag_still_moves_the_clip`.
+    #[test]
+    fn a_slow_alt_drag_still_bends_the_segment() {
+        let ctx = egui::Context::default();
+        let mut automation = TrackAutomation::default();
+        automation.insert(TRACK_PAN_TARGET, 0.0, -1.0);
+        automation.insert(TRACK_PAN_TARGET, 8.0, 1.0);
+        let rect = Rect::from_min_size(pos2(0.0, 100.0), vec2(400.0, 100.0));
+        let alt = egui::Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        let pass = |automation: &mut TrackAutomation, events: Vec<Event>| {
+            let mut out = ctx.run_ui(input(events), |ui| {
+                let theme = Theme::dark();
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::new().fill(theme.bg))
+                    .show(ui, |ui| {
+                        automation_lane(
+                            ui,
+                            rect,
+                            &theme,
+                            0.0,
+                            24.0,
+                            1.0,
+                            TRACK_PAN_TARGET,
+                            ParameterRegistry::default().spec(TRACK_PAN_TARGET).unwrap(),
+                            automation,
+                            0.0,
+                        );
+                    });
+            });
+            out.textures_delta.clear();
+        };
+        pass(&mut automation, vec![]);
+
+        // Press ON the segment's midpoint (beat 4 -> x 96, value 0 -> the
+        // lane's vertical centre) with Alt held, then drag down in small
+        // steps — each below what a single frame's delta could bend far.
+        let press = pos2(96.0, 150.0);
+        pass(
+            &mut automation,
+            vec![
+                Event::ModifiersChanged(alt),
+                Event::PointerMoved(press),
+                Event::PointerButton {
+                    pos: press,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: alt,
+                },
+            ],
+        );
+        for step in 1..=5 {
+            let to = pos2(press.x, press.y + step as f32 * 8.0);
+            pass(&mut automation, vec![Event::PointerMoved(to)]);
+        }
+        let release = pos2(press.x, press.y + 40.0);
+        pass(
+            &mut automation,
+            vec![
+                Event::PointerMoved(release),
+                Event::PointerButton {
+                    pos: release,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: alt,
+                },
+            ],
+        );
+        let bend = automation.points(TRACK_PAN_TARGET)[0].bend;
+        assert!(
+            (bend - -0.8).abs() < 0.05,
+            "forty pixels of a 100px lane is a bend of -0.8, not a twitch: {bend}"
+        );
+
+        // And a fresh Alt-drag on EMPTY lane space bends nothing: the last
+        // gesture's segment must not answer a drag that missed.
+        let empty = pos2(320.0, 150.0);
+        pass(
+            &mut automation,
+            vec![
+                Event::PointerMoved(empty),
+                Event::PointerButton {
+                    pos: empty,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: alt,
+                },
+            ],
+        );
+        pass(
+            &mut automation,
+            vec![Event::PointerMoved(pos2(empty.x, empty.y + 30.0))],
+        );
+        pass(
+            &mut automation,
+            vec![
+                Event::PointerButton {
+                    pos: pos2(empty.x, empty.y + 30.0),
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: alt,
+                },
+                Event::ModifiersChanged(Default::default()),
+            ],
+        );
+        let after = automation.points(TRACK_PAN_TARGET)[0].bend;
+        assert_eq!(after, bend, "a drag that missed the curve bends nothing");
     }
 
     /// The whole song survives the file: content out, RON, content back,
@@ -13652,6 +14969,15 @@ mod tests {
         arr.create_clip(0, 0.0, 4.0).unwrap();
         arr.create_clip(1, 8.0, 2.0).unwrap();
         arr.loop_range = Some((8.0, 12.0));
+        arr.tracks[0]
+            .automation
+            .insert(TRACK_VOLUME_TARGET, 0.0, 0.2);
+        arr.tracks[0]
+            .automation
+            .insert(TRACK_VOLUME_TARGET, 4.0, 0.8);
+        arr.tracks[0]
+            .automation
+            .insert(TRACK_VOLUME_TARGET, 8.0, 1.2);
 
         // Delete beats 2..6: track 0's clip is cut at 2 and loses its
         // inside; track 1's clip moves 4 earlier; so does the loop.
@@ -13664,11 +14990,31 @@ mod tests {
         );
         assert_eq!(arr.clips[1][0].start, 4.0, "everything after moved earlier");
         assert_eq!(arr.loop_range, Some((4.0, 8.0)), "the loop rode along");
+        assert_eq!(
+            arr.tracks[0]
+                .automation
+                .points(TRACK_VOLUME_TARGET)
+                .iter()
+                .map(|point| (point.beat, point.value))
+                .collect::<Vec<_>>(),
+            vec![(0.0, 0.2), (2.0, 1.0), (4.0, 1.2)],
+            "the deleted span is replaced by the value at its far edge"
+        );
 
         // Insert two beats at 4: the gap reopens, on every track.
         assert!(arr.insert_time(4.0, 2.0, 120.0));
         assert_eq!(arr.clips[1][0].start, 6.0);
         assert_eq!(arr.loop_range, Some((6.0, 10.0)));
+        assert_eq!(
+            arr.tracks[0]
+                .automation
+                .points(TRACK_VOLUME_TARGET)
+                .iter()
+                .map(|point| (point.beat, point.value))
+                .collect::<Vec<_>>(),
+            vec![(0.0, 0.2), (2.0, 1.0), (4.0, 1.2), (6.0, 1.2)],
+            "inserting time holds the cut value through the new gap"
+        );
 
         // Duplicate beats 0..2: a copy of track 0's clip lands at 2..4,
         // and track 1's clip moves right by the span.
@@ -13681,6 +15027,16 @@ mod tests {
             "a copy has an id of its own"
         );
         assert_eq!(arr.clips[1][0].start, 8.0);
+        assert_eq!(
+            arr.tracks[0]
+                .automation
+                .points(TRACK_VOLUME_TARGET)
+                .iter()
+                .map(|point| (point.beat, point.value))
+                .collect::<Vec<_>>(),
+            vec![(0.0, 0.2), (2.0, 0.2), (4.0, 1.0), (6.0, 1.2), (8.0, 1.2)],
+            "duplicating time copies its automation phrase into the opening"
+        );
         for track in &arr.clips {
             assert!(
                 track.windows(2).all(|w| w[0].start <= w[1].start),
@@ -14295,7 +15651,16 @@ mod tests {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(theme.bg))
                     .show(ui, |ui| {
-                        session_body(ui, &mut Focus::default(), &theme, arr, 4, &[], Some(drag));
+                        session_body(
+                            ui,
+                            &mut Focus::default(),
+                            &theme,
+                            arr,
+                            4,
+                            0.0,
+                            &[],
+                            Some(drag),
+                        );
                     });
             });
             out.textures_delta.clear();
@@ -14539,6 +15904,48 @@ mod tests {
         assert!(arr.session.launch(0, 5), "an empty slot is a stop");
         assert_eq!(arr.session.playing[0], None);
         assert_eq!(arr.effective_clips(), idle);
+    }
+
+    #[test]
+    fn session_launches_are_placed_on_the_requested_quantized_edge() {
+        let mut arr = Arrangement::default();
+        assert!(arr.create_slot_clip(0, 0, 4.0));
+        assert!(arr.session.launch_at(0, 0, 12.0));
+        let clips = arr.effective_clips();
+        assert_eq!(clips[0][0].start, 12.0);
+        assert_eq!(clips[0][1].start, 16.0);
+
+        assert_eq!(LaunchQuantization::Bar.launch_beat(10.25, 4), 12.0);
+        assert_eq!(LaunchQuantization::Beat.launch_beat(10.25, 4), 11.0);
+        assert_eq!(LaunchQuantization::Off.launch_beat(10.25, 4), 10.25);
+    }
+
+    #[test]
+    fn track_automation_holds_then_interpolates_between_points() {
+        let mut automation = TrackAutomation::default();
+        automation.insert(TRACK_VOLUME_TARGET, 4.0, 0.25);
+        automation.insert(TRACK_VOLUME_TARGET, 8.0, 1.25);
+        assert_eq!(automation.value_at(TRACK_VOLUME_TARGET, 2.0, 1.0), 1.0);
+        assert_eq!(automation.value_at(TRACK_VOLUME_TARGET, 4.0, 1.0), 0.25);
+        assert_eq!(automation.value_at(TRACK_VOLUME_TARGET, 6.0, 1.0), 0.75);
+        assert_eq!(automation.value_at(TRACK_VOLUME_TARGET, 12.0, 1.0), 1.25);
+    }
+
+    #[test]
+    fn automation_points_shape_their_outgoing_segment() {
+        let mut automation = TrackAutomation::default();
+        automation.insert(TRACK_PAN_TARGET, 0.0, -1.0);
+        automation.insert(TRACK_PAN_TARGET, 4.0, 1.0);
+        automation.points_mut(TRACK_PAN_TARGET)[0].bend = 0.5;
+        assert!(
+            automation.value_at(TRACK_PAN_TARGET, 2.0, 0.0) < -0.45,
+            "a positive bend should stay close to its source at the midpoint"
+        );
+        automation.points_mut(TRACK_PAN_TARGET)[0].bend = -0.5;
+        assert!(
+            automation.value_at(TRACK_PAN_TARGET, 2.0, 0.0) > 0.45,
+            "a negative bend should bow above the line"
+        );
     }
 
     /// An audio slot loops INSIDE one node rather than being repeated: a
