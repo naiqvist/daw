@@ -4005,13 +4005,17 @@ const SESSION_COL_MAX: f32 = 170.0;
 const SCENE_COL_W: f32 = 128.0;
 /// The column header, showing the track's name.
 const SESSION_HEAD_H: f32 = 22.0;
-/// The mixer strip under each column: mute and solo, a pan knob, then the
-/// fader with its meter beside it and the level written underneath. Tall
-/// enough that the fader has travel worth having.
-const SESSION_MIXER_H: f32 = 116.0;
-/// The fader's width, and the meter's, inside that strip.
-const FADER_W: f32 = 16.0;
-const STRIP_METER_W: f32 = 7.0;
+/// The mixer strip under each column: mute and solo, a pan knob, and the
+/// channel assembly — the segmented meter living inside the fader's own
+/// track, the way Ableton's session mixer draws it — with the level in a
+/// readout box underneath. Tall enough that the fader has travel worth
+/// having.
+const SESSION_MIXER_H: f32 = 128.0;
+/// The channel assembly's width. Thick: the fader IS the meter's track,
+/// and both are the strip's centrepiece rather than furniture at its edge.
+const ASSEMBLY_W: f32 = 26.0;
+/// The latched clip lamp above the assembly, clicked to clear.
+const CLIP_LAMP_H: f32 = 5.0;
 /// The horizontal scrollbar under the columns, shown only when the grid is
 /// wider than the window.
 const SESSION_BAR_H: f32 = 7.0;
@@ -4243,25 +4247,58 @@ fn volume_label(amp: f32) -> String {
     }
 }
 
-/// A vertical fader. Drag to move, double-click to return to unity.
+/// Where the channel assembly sits inside a strip: the clip lamp, the
+/// fader/meter travel, and the readout row's baseline. One function, so
+/// the paint, the hit tests and the tests all measure the same rects.
+fn strip_assembly(mixer: egui::Rect) -> (egui::Rect, egui::Rect, f32) {
+    let pad = CLIP_LABEL_PAD;
+    let controls_bottom = mixer.top() + pad + HEADER_BTN;
+    let readout_h = HEADER_KIND_TYPE + 5.0;
+    let rows_bottom = mixer.bottom() - pad;
+    let center_x = mixer.center().x;
+    let lamp = egui::Rect::from_min_size(
+        egui::pos2(center_x - ASSEMBLY_W * 0.5, controls_bottom + pad),
+        egui::vec2(ASSEMBLY_W, CLIP_LAMP_H),
+    );
+    let travel = egui::Rect::from_min_max(
+        egui::pos2(center_x - ASSEMBLY_W * 0.5, lamp.bottom() + 2.0),
+        egui::pos2(center_x + ASSEMBLY_W * 0.5, rows_bottom - readout_h),
+    );
+    (lamp, travel, rows_bottom)
+}
+
+/// The channel assembly: a thick vertical track whose BACKGROUND is the
+/// level meter — a ladder of LED segments, unlit ones faintly visible the
+/// way a dark console's are — with the fader's wide flat handle riding
+/// over it and a latched clip lamp above. One element, because that is
+/// how Ableton draws it and it is the right call: the level you set and
+/// the level you get share an axis, so the eye compares them for free.
 ///
-/// Returns the new amplitude when the user moved it.
+/// The meter body and peak-hold line animate on the ballistics from
+/// `ui::device::meter`; segments are coloured by the dB zone they sit in
+/// (green to −6, amber to the top, red at full scale), and only LIGHT
+/// when the level reaches them.
 ///
-/// The handle is wide and the track is thin, which is the shape every
-/// console uses: the thing you grab should be bigger than the thing it
-/// slides along.
-fn fader(ui: &mut egui::Ui, theme: &Theme, rect: egui::Rect, amp: f32) -> Option<f32> {
-    if rect.width() <= 0.0 || rect.height() <= 0.0 {
-        return None;
+/// Drag to move the fader — absolute from the pointer, like every drag
+/// here. Double-click returns to unity. Click the lamp to clear a latched
+/// clip. Returns the new amplitude if moved, and whether a clip was
+/// cleared.
+fn channel_fader(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    lamp: egui::Rect,
+    rect: egui::Rect,
+    amp: f32,
+    ballistics: &device::meter::Ballistics,
+) -> (Option<f32>, bool) {
+    if rect.width() <= 0.0 || rect.height() <= 12.0 {
+        return (None, false);
     }
     let id = ui
         .id()
-        .with(("fader", rect.left() as i32, rect.top() as i32));
+        .with(("channel", rect.left() as i32, rect.top() as i32));
     let response = ui.interact(rect, id, egui::Sense::click_and_drag());
     let handle_h = 9.0f32.min(rect.height());
-    // The travel is shorter than the rect by the handle: the handle's
-    // CENTRE runs from half a handle below the top to half above the
-    // bottom, so neither end hangs off the strip.
     let top = rect.top() + handle_h * 0.5;
     let bottom = rect.bottom() - handle_h * 0.5;
     let travel = (bottom - top).max(1.0);
@@ -4272,121 +4309,141 @@ fn fader(ui: &mut egui::Ui, theme: &Theme, rect: egui::Rect, amp: f32) -> Option
     } else if response.dragged()
         && let Some(pos) = response.interact_pointer_pos()
     {
-        // Absolute from the pointer, like every other drag here: a
-        // position built from per-frame deltas sticks under a slow hand.
         moved = Some(fader_to_amp((bottom - pos.y) / travel));
     }
     if response.hovered() || response.dragged() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
     }
 
-    let shown = moved.unwrap_or(amp);
-    let position = amp_to_fader(shown);
     let painter = ui.painter();
-    let track = egui::Rect::from_center_size(
-        egui::pos2(rect.center().x, rect.center().y),
-        egui::vec2(3.0, rect.height()),
-    );
-    painter.rect_filled(track, 1.5, theme.surface_sunken);
-    // Filled from the bottom to the handle, so the level reads at a glance
-    // without finding the handle first.
-    let y = bottom - position * travel;
-    painter.rect_filled(
-        egui::Rect::from_min_max(egui::pos2(track.left(), y), track.right_bottom()),
-        1.5,
-        theme.accent_muted,
-    );
-    // The unity mark: a fader with no landmark cannot be set by eye.
-    let unity_y = bottom - amp_to_fader(1.0) * travel;
-    painter.line_segment(
-        [
-            egui::pos2(rect.left() + 1.0, unity_y),
-            egui::pos2(rect.right() - 1.0, unity_y),
-        ],
-        egui::Stroke::new(1.0, theme.divider),
-    );
-    let handle = egui::Rect::from_center_size(
-        egui::pos2(rect.center().x, y),
-        egui::vec2(rect.width(), handle_h),
-    );
-    painter.rect_filled(
-        handle,
-        2.0,
-        if response.dragged() || response.hovered() {
-            theme.accent
-        } else {
-            theme.text_muted
-        },
-    );
-    painter.line_segment(
-        [
-            egui::pos2(handle.left() + 2.0, handle.center().y),
-            egui::pos2(handle.right() - 2.0, handle.center().y),
-        ],
-        egui::Stroke::new(1.0, theme.surface_sunken),
-    );
-    moved
-}
+    // The track: a sunken well the segments live in.
+    painter.rect_filled(rect, 3.0, theme.surface_sunken.gamma_multiply(0.9));
 
-/// A slim vertical level meter beside a fader.
-///
-/// The dB mapping and the ballistics come from `ui::device::meter` — the
-/// module that already holds every opinion about how a meter should read.
-/// Only the geometry is local, because this one has to fit a mixer strip
-/// rather than a device panel.
-///
-/// Returns true when a latched clip light was cleared.
-fn strip_meter(
-    ui: &mut egui::Ui,
-    theme: &Theme,
-    rect: egui::Rect,
-    ballistics: &device::meter::Ballistics,
-) -> bool {
-    if rect.width() <= 0.0 || rect.height() <= 0.0 {
-        return false;
-    }
-    let id = ui
-        .id()
-        .with(("strip_meter", rect.left() as i32, rect.top() as i32));
-    let response = ui.interact(rect, id, egui::Sense::click());
-    let painter = ui.painter();
-    painter.rect_filled(rect, 1.0, theme.surface_sunken);
-
-    // The bar, coloured by HEADROOM rather than by fraction: green until
-    // the last 6 dB, amber through them, red at full scale.
-    let norm = device::meter::db_to_norm(ballistics.shown_db);
-    if norm > 0.0 {
-        let height = rect.height() * norm;
-        let bar =
-            egui::Rect::from_min_max(egui::pos2(rect.left(), rect.bottom() - height), rect.max);
-        let color = if ballistics.shown_db >= device::meter::CEILING_DB {
+    // --- the LED ladder ---------------------------------------------------
+    // Segments are placed on the FADER's dB scale, not the meter's, so the
+    // handle and the level it produces line up: unity on the fader faces
+    // the meter segment a 0 dBFS signal would light.
+    let seg_h = 3.0;
+    let seg_gap = 1.0;
+    let inner = rect.shrink2(egui::vec2(3.0, 2.0));
+    let count = ((inner.height() + seg_gap) / (seg_h + seg_gap))
+        .floor()
+        .max(1.0) as usize;
+    let level = device::meter::db_to_norm(ballistics.shown_db);
+    let span = FADER_MAX_DB - FADER_MIN_DB;
+    for i in 0..count {
+        let frac = i as f32 / count.max(1) as f32;
+        let y1 = inner.bottom() - frac * inner.height();
+        let seg = egui::Rect::from_min_max(
+            egui::pos2(inner.left(), y1 - seg_h),
+            egui::pos2(inner.right(), y1),
+        );
+        // The segment's own place on the scale decides its colour; whether
+        // the level has reached it decides whether it is LIT. Unlit
+        // segments stay faintly visible — the powered-down LED look that
+        // makes a ladder read as a ladder and not as a bar chart.
+        let seg_db = FADER_MIN_DB + frac * span;
+        let color = if seg_db >= device::meter::CEILING_DB - 0.5 {
             theme.meter_clip
-        } else if ballistics.shown_db >= device::meter::HOT_DB {
+        } else if seg_db >= device::meter::HOT_DB {
             theme.meter_hot
         } else {
             theme.meter_low
         };
-        painter.rect_filled(bar, 1.0, color);
+        // The meter maps its floor..ceiling onto the fader's min..0 dB
+        // portion of the ladder; the headroom above unity stays dark until
+        // something actually clips into it.
+        let lit_to =
+            device::meter::FLOOR_DB + level * (device::meter::CEILING_DB - device::meter::FLOOR_DB);
+        let lit = level > 0.0 && seg_db <= lit_to.min(device::meter::CEILING_DB);
+        painter.rect_filled(
+            seg,
+            1.0,
+            if lit {
+                color
+            } else {
+                color.gamma_multiply(0.13)
+            },
+        );
     }
-    // The peak marker: where the loudest recent moment was.
+
+    // The peak-hold line: the loudest recent moment, held long enough to
+    // read, sliding down after — pure ballistics, drawn as a bright tick.
     let peak = device::meter::db_to_norm(ballistics.peak_db);
     if peak > 0.0 {
-        let y = rect.bottom() - rect.height() * peak;
+        let peak_db =
+            device::meter::FLOOR_DB + peak * (device::meter::CEILING_DB - device::meter::FLOOR_DB);
+        let frac = ((peak_db - FADER_MIN_DB) / span).clamp(0.0, 1.0);
+        let y = inner.bottom() - frac * inner.height();
         painter.line_segment(
-            [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-            egui::Stroke::new(1.0, theme.text),
+            [egui::pos2(inner.left(), y), egui::pos2(inner.right(), y)],
+            egui::Stroke::new(1.5, theme.text),
         );
     }
-    // The clip light LATCHES, and is cleared by a click — the whole point
-    // is to report an overload you were not watching.
-    if ballistics.clipped {
-        painter.rect_filled(
-            egui::Rect::from_min_max(rect.left_top(), egui::pos2(rect.right(), rect.top() + 3.0)),
-            1.0,
-            theme.meter_clip,
-        );
+
+    // The unity line, across the whole track: the one landmark a fader
+    // cannot be set by eye without.
+    let unity_y = bottom - amp_to_fader(1.0) * travel;
+    painter.line_segment(
+        [
+            egui::pos2(rect.left() - 2.0, unity_y),
+            egui::pos2(rect.right() + 2.0, unity_y),
+        ],
+        egui::Stroke::new(1.0, theme.text_muted),
+    );
+
+    // --- the handle -------------------------------------------------------
+    // Wide and flat, overhanging the track on both sides — Bitwig's shape.
+    // Drawn as a plate with a centre groove, so it reads as a thing to
+    // grab rather than as another meter segment.
+    let shown = moved.unwrap_or(amp);
+    let y = bottom - amp_to_fader(shown) * travel;
+    let handle = egui::Rect::from_center_size(
+        egui::pos2(rect.center().x, y),
+        egui::vec2(rect.width() + 6.0, handle_h),
+    );
+    painter.rect_filled(
+        handle,
+        2.5,
+        if response.dragged() || response.hovered() {
+            theme.text
+        } else {
+            theme.text_muted
+        },
+    );
+    painter.rect_stroke(
+        handle,
+        2.5,
+        egui::Stroke::new(1.0, theme.surface_sunken),
+        egui::StrokeKind::Inside,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(handle.left() + 3.0, handle.center().y),
+            egui::pos2(handle.right() - 3.0, handle.center().y),
+        ],
+        egui::Stroke::new(1.5, theme.accent),
+    );
+
+    // --- the clip lamp ----------------------------------------------------
+    // Latched: it stays lit after the overload has passed, because the
+    // whole point is to report one you were not watching. Click to clear.
+    let lamp_id = id.with("lamp");
+    let lamp_response = ui.interact(lamp, lamp_id, egui::Sense::click());
+    painter.rect_filled(
+        lamp,
+        1.5,
+        if ballistics.clipped {
+            theme.meter_clip
+        } else {
+            theme.meter_clip.gamma_multiply(0.15)
+        },
+    );
+    if lamp_response.hovered() && ballistics.clipped {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    response.clicked() && ballistics.clipped
+    let cleared = lamp_response.clicked() && ballistics.clipped;
+    (moved, cleared)
 }
 
 /// A launch triangle, pointing at the clip it would start.
@@ -4736,47 +4793,53 @@ fn session_body(
             pan_edit = Some((t, pan));
         }
 
-        // --- the fader, its meter, and the two numbers --------------------
-        // Laid out from the RIGHT: meter at the edge, fader beside it, the
-        // readouts filling what is left. A narrow column loses its numbers
-        // before it loses its controls.
-        let rows_bottom = mixer.bottom() - CLIP_LABEL_PAD;
-        let fader_top = btn_y + HEADER_BTN + CLIP_LABEL_PAD;
-        let readout_h = HEADER_KIND_TYPE + 3.0;
-        let meter_rect = egui::Rect::from_min_max(
-            egui::pos2(mixer.right() - CLIP_LABEL_PAD - STRIP_METER_W, fader_top),
-            egui::pos2(mixer.right() - CLIP_LABEL_PAD, rows_bottom - readout_h),
-        );
-        let fader_rect = egui::Rect::from_min_max(
-            egui::pos2(meter_rect.left() - 4.0 - FADER_W, fader_top),
-            egui::pos2(meter_rect.left() - 4.0, rows_bottom - readout_h),
-        );
-        if fader_rect.left() > mixer.left() + CLIP_LABEL_PAD {
-            if let Some(amp) = fader(ui, theme, fader_rect, track.volume) {
+        // --- the channel assembly, centred ---------------------------------
+        // The strip's centrepiece rather than furniture at its edge: the
+        // fader whose track IS the meter, a clip lamp above, the level in
+        // a readout box underneath — the anatomy every console shares.
+        let (lamp, travel, rows_bottom) = strip_assembly(mixer);
+        if travel.height() > 12.0 && travel.left() > mixer.left() {
+            let ballistics = meters.get(t).copied().unwrap_or_default();
+            let (moved, cleared) =
+                channel_fader(ui, theme, lamp, travel, track.volume, &ballistics);
+            if let Some(amp) = moved {
                 volume_edit = Some((t, amp));
             }
-            let ballistics = meters.get(t).copied().unwrap_or_default();
-            if strip_meter(ui, theme, meter_rect, &ballistics) {
+            if cleared {
                 clear_clip = Some(t);
             }
-            // The two numbers a console writes under a strip: what the
-            // fader is set to, and where the signal is placed.
+
+            // The readout box: what the fader is set to, live while it is
+            // being dragged — a console's little dB window, not a caption.
             let shown = volume_edit
                 .filter(|(edited, _)| *edited == t)
                 .map_or(track.volume, |(_, amp)| amp);
+            let readout = egui::Rect::from_center_size(
+                egui::pos2(
+                    mixer.center().x,
+                    rows_bottom - (HEADER_KIND_TYPE + 5.0) * 0.5,
+                ),
+                egui::vec2(
+                    (ASSEMBLY_W + 14.0).min(mixer.width() - 4.0),
+                    HEADER_KIND_TYPE + 4.0,
+                ),
+            );
             let painter = ui.painter();
-            painter.with_clip_rect(mixer).text(
-                egui::pos2(mixer.left() + CLIP_LABEL_PAD, rows_bottom),
-                egui::Align2::LEFT_BOTTOM,
+            painter.rect_filled(readout, 2.0, theme.surface_sunken);
+            painter.with_clip_rect(readout).text(
+                readout.center(),
+                egui::Align2::CENTER_CENTER,
                 volume_label(shown),
                 egui::FontId::monospace(HEADER_KIND_TYPE),
                 theme.text_value,
             );
+            // The pan value rides under the knob it belongs to, not in the
+            // corner: label the control, not the strip.
             painter.with_clip_rect(mixer).text(
-                egui::pos2(mixer.left() + CLIP_LABEL_PAD, fader_top + readout_h),
-                egui::Align2::LEFT_BOTTOM,
+                egui::pos2(knob.center().x, knob.bottom() + 2.0),
+                egui::Align2::CENTER_TOP,
                 pan_label(pan),
-                egui::FontId::monospace(HEADER_KIND_TYPE),
+                egui::FontId::monospace(HEADER_KIND_TYPE - 1.0),
                 theme.text_muted,
             );
         }
@@ -8181,8 +8244,14 @@ impl eframe::App for App {
         self.pump_engine(ui.ctx());
         if self.engine.is_none() {
             // No engine, no blocks: the meters fall to silence instead of
-            // freezing at whatever was on screen when it stopped.
+            // freezing at whatever was on screen when it stopped — and the
+            // fall stays ANIMATED, so frames keep coming until every meter
+            // is at rest.
             self.advance_meters(&[], ui.ctx().input(|i| i.stable_dt));
+            if self.meters.iter().any(device::meter::Ballistics::moving) {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(16));
+            }
         }
         if let Some(snapshot) = self.library_service.newest_snapshot() {
             self.library_snapshot = snapshot;
@@ -11342,15 +11411,14 @@ mod tests {
             arr.session.scenes.len(),
             0.0,
         );
-        // The fader of track 1, from the same metrics the strip lays out.
-        let mixer = layout.mixer(1);
-        let rows_bottom = mixer.bottom() - CLIP_LABEL_PAD;
-        let fader_top = mixer.top() + CLIP_LABEL_PAD + HEADER_BTN + CLIP_LABEL_PAD;
-        let readout_h = HEADER_KIND_TYPE + 3.0;
-        let right = mixer.right() - CLIP_LABEL_PAD - STRIP_METER_W - 4.0;
-        let x = right - FADER_W * 0.5;
-        let top = fader_top;
-        let bottom = rows_bottom - readout_h;
+        // The assembly of track 1, from the same helper the strip lays
+        // out with — the test and the paint cannot disagree about where
+        // the fader is.
+        let (_, travel, _) = strip_assembly(layout.mixer(1));
+        let x = travel.center().x;
+        let handle_h = 9.0f32.min(travel.height());
+        let top = travel.top() + handle_h * 0.5;
+        let bottom = travel.bottom() - handle_h * 0.5;
 
         // Press at unity, drag most of the way down.
         let press = pos2(x, top + (bottom - top) * (1.0 - amp_to_fader(1.0)));
