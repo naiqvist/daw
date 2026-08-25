@@ -554,6 +554,96 @@ impl Cascade {
     }
 }
 
+// ----------------------------------------------------------------- tilt ---
+
+/// Tilt filter: a see-saw around a pivot — highs up and lows down by the
+/// same amount (or the reverse), unity AT the pivot.
+///
+/// Built on the [`OnePole`]'s exact complementary split: with
+/// `lp + hp = x`, the tilt is `g_lo·lp + g_hi·hp`, folded to
+/// `g_hi·x + (g_lo − g_hi)·lp` so it costs the one-pole plus two
+/// multiplies. First order, so the transition is a gentle 6 dB/octave —
+/// which is the sound tilt EQs are liked for.
+///
+/// The corner is NOT the pivot: a first-order see-saw's unity crossing
+/// sits at `corner / g_hi` (solve `|H(jw)|² = 1` with reciprocal gains),
+/// so `prepare` places the corner at `pivot × g_hi` and the crossing
+/// lands where the user pointed, at every tilt amount. Skipping that
+/// correction slides the pivot by an octave at ±6 dB — audible, and the
+/// kind of drift a magnitude test catches and an ear blames on the
+/// material.
+///
+/// State: 16 bytes. Per-sample cost: 4 mul + 4 add.
+/// Denormal-safe: relies on engine FTZ, as [`OnePole`].
+/// In-place safe: yes.
+/// Latency: 0 samples.
+#[derive(Debug, Clone, Copy)]
+pub struct Tilt {
+    pole: OnePole,
+    g_hi: f32,
+    /// `g_lo − g_hi`, precomputed.
+    g_delta: f32,
+}
+
+/// The steepest tilt accepted, in dB. Past this a first-order see-saw is
+/// the wrong tool and a shelf pair is the honest one.
+pub const TILT_MAX_DB: f32 = 24.0;
+
+impl Default for Tilt {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Tilt {
+    pub fn new() -> Self {
+        Self {
+            pole: OnePole::new(),
+            g_hi: 1.0,
+            g_delta: 0.0,
+        }
+    }
+
+    /// Green zone: sample rate, pivot frequency, and tilt in dB — the
+    /// gain reached at the HIGH extreme (+6 tilts bright, −6 tilts dark;
+    /// the low extreme mirrors it). Nonsense flattens to zero tilt
+    /// rather than poisoning the coefficients.
+    pub fn prepare(&mut self, sample_rate: f32, pivot_hz: f32, tilt_db: f32) {
+        let tilt = if tilt_db.is_finite() {
+            tilt_db.clamp(-TILT_MAX_DB, TILT_MAX_DB)
+        } else {
+            0.0
+        };
+        let g_hi = 10.0f32.powf(tilt / 20.0);
+        let g_lo = 1.0 / g_hi;
+        self.g_hi = g_hi;
+        self.g_delta = g_lo - g_hi;
+        // Corner at pivot·g_hi keeps the unity crossing at the pivot;
+        // prewarp's own clamps absorb whatever this pushes past Nyquist.
+        let pivot = if pivot_hz.is_finite() {
+            pivot_hz
+        } else {
+            1_000.0
+        };
+        self.pole.prepare(sample_rate, pivot * g_hi);
+    }
+
+    /// Green zone: zero the state, keep the coefficients.
+    pub fn reset(&mut self) {
+        self.pole.reset();
+    }
+
+    /// Red zone: tilt in place, any length.
+    pub fn process(&mut self, io: &mut [f32]) {
+        let (g_hi, g_delta) = (self.g_hi, self.g_delta);
+        for s in io.iter_mut() {
+            let x = *s;
+            let lp = self.pole.tick(x);
+            *s = g_hi * x + g_delta * lp;
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -775,6 +865,10 @@ mod tests {
         dc.prepare(FS);
         row("dc blocker", &mut |b| dc.process(b));
 
+        let mut tilt = Tilt::new();
+        tilt.prepare(FS, 1_000.0, 6.0);
+        row("tilt", &mut |b| tilt.process(b));
+
         for order in [2u32, 4, 8] {
             let mut c = Cascade::new();
             c.prepare(FS, 1_000.0, FLAT_Q, order, false);
@@ -965,6 +1059,135 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The tilt see-saws around its pivot: unity where the user pointed,
+    /// the full stated gain at the extremes, monotone in between — and
+    /// the negative tilt is the positive one's mirror.
+    #[test]
+    fn tilt_pivots_at_unity_and_reaches_its_extremes() {
+        let pivot = 1_000.0;
+        let at = |tilt_db: f32, hz: f32| {
+            let mut t = Tilt::new();
+            t.prepare(FS, pivot, tilt_db);
+            db(magnitude(&mut |b| t.process(b), hz))
+        };
+
+        for tilt in [6.0f32, -6.0, 12.0] {
+            assert!(
+                at(tilt, pivot).abs() < 0.4,
+                "tilt {tilt}: pivot should be unity, got {:.2} dB",
+                at(tilt, pivot)
+            );
+            let hi = at(tilt, pivot * 16.0);
+            let lo = at(tilt, pivot / 16.0);
+            assert!((hi - tilt).abs() < 0.5, "tilt {tilt}: top is {hi:.2} dB");
+            assert!((lo + tilt).abs() < 0.5, "tilt {tilt}: bottom is {lo:.2} dB");
+        }
+
+        // Monotone across the band for a positive tilt — a see-saw has
+        // no bumps.
+        let mut last = f32::NEG_INFINITY;
+        for hz in [
+            60.0f32, 125.0, 250.0, 500.0, 1_000.0, 2_000.0, 4_000.0, 8_000.0,
+        ] {
+            let g = at(6.0, hz) as f32;
+            assert!(g >= last - 0.1, "response dipped at {hz} Hz");
+            last = g;
+        }
+
+        // Mirror: +6 and -6 cancel.
+        for hz in [100.0f32, 1_000.0, 8_000.0] {
+            let sum = at(6.0, hz) + at(-6.0, hz);
+            assert!(
+                sum.abs() < 0.3,
+                "+6 and -6 should mirror at {hz} Hz: {sum:.2}"
+            );
+        }
+    }
+
+    /// Zero tilt is bit-exact passthrough — g_hi is 1 and the delta term
+    /// vanishes, so "no tilt" means NO tilt, not nearly none.
+    #[test]
+    fn tilt_zero_is_bit_exact_passthrough() {
+        let input: Vec<f32> = (0..256).map(|i| ((i as f32) * 0.17).sin()).collect();
+        let mut t = Tilt::new();
+        t.prepare(FS, 1_000.0, 0.0);
+        let mut buf = input.clone();
+        t.process(&mut buf);
+        assert!(
+            buf.iter()
+                .zip(&input)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "zero tilt must be the identity"
+        );
+    }
+
+    /// The contract set for Tilt: split-block bit-exact, any length,
+    /// silence in silence out, nonsense settings never invent NaN, and
+    /// no allocation on the process path.
+    #[test]
+    fn tilt_meets_the_contract() {
+        let input: Vec<f32> = (0..256).map(|i| ((i as f32) * 0.11).sin()).collect();
+
+        let mut a = Tilt::new();
+        a.prepare(FS, 800.0, 6.0);
+        let mut whole = input.clone();
+        a.process(&mut whole);
+        let mut b = Tilt::new();
+        b.prepare(FS, 800.0, 6.0);
+        let mut split = input.clone();
+        b.process(&mut split[..100]);
+        b.process(&mut split[100..]);
+        assert!(
+            whole
+                .iter()
+                .zip(&split)
+                .all(|(x, y)| x.to_bits() == y.to_bits()),
+            "256 must equal 100 + 156"
+        );
+
+        for len in [0usize, 1, 3, 63] {
+            let mut buf = vec![0.25f32; len];
+            let mut t = Tilt::new();
+            t.prepare(FS, 500.0, -9.0);
+            t.process(&mut buf);
+            assert!(buf.iter().all(|s| s.is_finite()), "len {len}");
+        }
+
+        let mut t = Tilt::new();
+        t.prepare(FS, 1_000.0, 6.0);
+        let mut silent = vec![0.0f32; 128];
+        t.process(&mut silent);
+        assert!(silent.iter().all(|s| *s == 0.0), "silence in, silence out");
+
+        for (fs, hz, tilt) in [
+            (FS, f32::NAN, 6.0),
+            (FS, -100.0, 6.0),
+            (FS, 1_000.0, f32::NAN),
+            (FS, 1_000.0, 1e9),
+            (0.0, 1_000.0, 6.0),
+            (f32::NAN, 1_000.0, -6.0),
+            (FS, 1e9, TILT_MAX_DB),
+        ] {
+            let mut t = Tilt::new();
+            t.prepare(fs, hz, tilt);
+            let mut buf = input.clone();
+            t.process(&mut buf);
+            assert!(
+                buf.iter().all(|s| s.is_finite()),
+                "fs {fs} hz {hz} tilt {tilt}"
+            );
+        }
+
+        let mut t = Tilt::new();
+        t.prepare(FS, 1_000.0, 6.0);
+        let mut buf = vec![0.1f32; 256];
+        assert_no_alloc::assert_no_alloc(|| {
+            for _ in 0..100 {
+                t.process(&mut buf);
+            }
+        });
     }
 
     // ------------------------------------------- split-block equivalence ---
