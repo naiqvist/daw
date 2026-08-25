@@ -8616,6 +8616,9 @@ struct ProjectWindow {
     open: bool,
     path: String,
     status: Option<String>,
+    /// The path field takes the keyboard once per opening, so the modal
+    /// arrives ready to type into — and never steals focus again after.
+    focused: bool,
 }
 
 /// What the device region shows when there is no device to show: no track
@@ -9230,81 +9233,105 @@ impl App {
         self.prefs.recent_projects.truncate(8);
     }
 
-    /// The project window: the current file, a path field, the four verbs
-    /// and the recent list. Drawn above everything, closable, and the
-    /// keyboard belongs to its text field while it is open.
+    /// The project MODAL: the current file, a path field, the four verbs
+    /// and the recent list, over a backdrop that blocks the app behind it.
+    ///
+    /// Built for the keyboard as much as the mouse: the path field takes
+    /// focus on opening, Tab (and the arrows) walk every control — egui's
+    /// own focus order — Enter activates the focused one, Enter IN THE
+    /// PATH FIELD does the obvious thing for the path typed (load a file
+    /// that exists, save-as one that does not), and Escape or a backdrop
+    /// click closes.
     fn draw_project_window(&mut self, ctx: &egui::Context) {
         if !self.project.open {
+            self.project.focused = false;
             return;
         }
-        let mut open = self.project.open;
         let mut save_as: Option<String> = None;
         let mut load: Option<String> = None;
         let mut save_current = false;
         let mut fresh = false;
-        egui::Window::new("project")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .default_width(380.0)
-            // Opens centred: a modal-shaped window should arrive where the
-            // eyes already are, not wherever egui last remembered it.
-            .pivot(egui::Align2::CENTER_CENTER)
-            .default_pos(ctx.content_rect().center())
-            .show(ctx, |ui| {
-                ui.label(match &self.project_path {
-                    Some(path) => format!("current: {}", path.display()),
-                    None => "current: unsaved".to_owned(),
-                });
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label("path");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.project.path)
-                            .desired_width(f32::INFINITY)
-                            .hint_text("/home/you/songs/song.daw.ron"),
-                    );
-                });
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui.button("new").clicked() {
-                        fresh = true;
-                    }
-                    let has_path = !self.project.path.trim().is_empty();
-                    if ui
-                        .add_enabled(has_path, egui::Button::new("load"))
-                        .clicked()
-                    {
-                        load = Some(self.project.path.trim().to_owned());
-                    }
-                    if ui
-                        .add_enabled(self.project_path.is_some(), egui::Button::new("save"))
-                        .clicked()
-                    {
-                        save_current = true;
-                    }
-                    if ui
-                        .add_enabled(has_path, egui::Button::new("save as"))
-                        .clicked()
-                    {
-                        save_as = Some(self.project.path.trim().to_owned());
-                    }
-                });
-                if let Some(status) = &self.project.status {
-                    ui.add_space(6.0);
-                    ui.label(egui::RichText::new(status).weak());
+        let modal = egui::Modal::new(egui::Id::new("project_modal")).show(ctx, |ui| {
+            ui.set_width(400.0);
+            ui.heading("project");
+            ui.add_space(4.0);
+            ui.label(match &self.project_path {
+                Some(path) => format!("current: {}", path.display()),
+                None => "current: unsaved".to_owned(),
+            });
+            ui.add_space(6.0);
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut self.project.path)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("/home/you/songs/song.daw.ron"),
+            );
+            if !self.project.focused {
+                field.request_focus();
+                self.project.focused = true;
+            }
+            let typed = self.project.path.trim().to_owned();
+            // Enter in the field: the obvious verb for the path typed. A
+            // file that exists loads; one that does not is saved to. Blank
+            // does nothing — Enter must never invent a filename.
+            if field.lost_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                && !typed.is_empty()
+            {
+                if std::path::Path::new(&typed).exists() {
+                    load = Some(typed.clone());
+                } else {
+                    save_as = Some(typed.clone());
                 }
-                if !self.prefs.recent_projects.is_empty() {
-                    ui.add_space(8.0);
-                    ui.label(egui::RichText::new("recent").weak());
-                    for recent in self.prefs.recent_projects.clone() {
-                        if ui.link(&recent).clicked() {
-                            load = Some(recent.clone());
-                        }
-                    }
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("new").clicked() {
+                    fresh = true;
+                }
+                let has_path = !typed.is_empty();
+                if ui
+                    .add_enabled(has_path, egui::Button::new("load"))
+                    .clicked()
+                {
+                    load = Some(typed.clone());
+                }
+                if ui
+                    .add_enabled(self.project_path.is_some(), egui::Button::new("save"))
+                    .clicked()
+                {
+                    save_current = true;
+                }
+                if ui
+                    .add_enabled(has_path, egui::Button::new("save as"))
+                    .clicked()
+                {
+                    save_as = Some(typed.clone());
                 }
             });
-        self.project.open = open;
+            if let Some(status) = &self.project.status {
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(status).weak());
+            }
+            if !self.prefs.recent_projects.is_empty() {
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("recent").weak());
+                for recent in self.prefs.recent_projects.clone() {
+                    if ui.link(&recent).clicked() {
+                        load = Some(recent.clone());
+                    }
+                }
+            }
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new("tab moves · enter activates · esc closes")
+                    .weak()
+                    .small(),
+            );
+        });
+        if modal.should_close() {
+            self.project.open = false;
+            self.project.focused = false;
+        }
         if fresh {
             self.new_project();
         }
@@ -10077,7 +10104,11 @@ impl eframe::App for App {
         // zero. Skipped while a text field, the palette or the theme window
         // owns the keyboard — a space typed into a search box is a space,
         // not a play command, and getting that wrong is the classic DAW bug.
-        if !palette_open && !skin_open && !ui.ctx().egui_wants_keyboard_input() {
+        if !palette_open
+            && !skin_open
+            && !self.project.open
+            && !ui.ctx().egui_wants_keyboard_input()
+        {
             ui.ctx().input_mut(|i| {
                 // MODIFIED SPACE FIRST: `consume_key` ignores an extra
                 // Shift, so the plain gesture checked first would swallow
@@ -10144,7 +10175,7 @@ impl eframe::App for App {
                 }
             }
         }
-        if !palette_open && !skin_open {
+        if !palette_open && !skin_open && !self.project.open {
             arrangement_keys(ui.ctx(), &self.arrangement, &mut actions);
         }
         // An open header rename owns the keyboard outright, and this must
