@@ -139,6 +139,15 @@ impl OnePole {
         lp
     }
 
+    /// Red zone: one lowpass sample. For kernels that need the pole
+    /// INSIDE a per-sample loop — a feedback delay's damping cannot be a
+    /// block call, because each sample recirculates before the next
+    /// exists. Everything else should use the block form below.
+    #[inline(always)]
+    pub(crate) fn tick_lowpass(&mut self, x: f32) -> f32 {
+        self.tick(x)
+    }
+
     /// Red zone: lowpass, in place, any length.
     pub fn process_lowpass(&mut self, io: &mut [f32]) {
         for s in io.iter_mut() {
@@ -1091,7 +1100,7 @@ mod tests {
         for hz in [
             60.0f32, 125.0, 250.0, 500.0, 1_000.0, 2_000.0, 4_000.0, 8_000.0,
         ] {
-            let g = at(6.0, hz) as f32;
+            let g = at(6.0, hz);
             assert!(g >= last - 0.1, "response dipped at {hz} Hz");
             last = g;
         }
