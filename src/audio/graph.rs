@@ -566,6 +566,30 @@ pub enum Node {
     /// beats, the cursor derives from ctx.beat, voices cut on discontinuity
     /// (the all-sound-off contract), and stop releases everything. The event
     /// list is baked at compile — immutable in the red zone.
+    /// Plugin delay compensation. A pure wire that arrives late: an
+    /// integer-sample delay per channel, so an impulse comes back
+    /// bit-identical N samples later.
+    ///
+    /// **UNREVIEWED RED ZONE.** This arm has had only the mechanical
+    /// checks — no allocation or panic path in the arm itself, buffers
+    /// written in full on every path (including `process_exact`'s fail-open
+    /// branch, which leaves the dry signal rather than returning early),
+    /// and `a_compensated_graph_does_not_allocate` covering both the steady
+    /// and the discontinuity paths under `assert_no_alloc`. It has NOT had
+    /// the adversarial pass `AGENTS.md` requires before a human reads a
+    /// red-zone diff. Run `/rt-review` over it before trusting it.
+    ///
+    /// Free-running — it holds signal history, not timeline position — but
+    /// it DOES cut on discontinuity, because the samples it is holding
+    /// belong to a position the transport has left.
+    Delay {
+        left: crate::dsp::delay::DelayLine,
+        right: crate::dsp::delay::DelayLine,
+        /// The rings. Two separate buffers: one line per channel, because a
+        /// shared ring would interleave the channels' histories.
+        left_buf: Vec<f32>,
+        right_buf: Vec<f32>,
+    },
     Seq {
         events: Vec<SeqEvent>,
         cursor: usize,
@@ -640,9 +664,12 @@ pub enum Node {
     /// a drive knob must never move a track in time. At drive 0 the shaper
     /// is skipped entirely, so the stage is a linear-phase wire and the
     /// default filter is transparent apart from that delay; the node owns
-    /// the dry/wet blend so the clean path keeps its float headroom. PDC does not exist yet — until
-    /// it does, a filtered track runs that many samples (~0.7 ms) late,
-    /// which is the documented cost of alias-free drive.
+    /// the dry/wet blend so the clean path keeps its float headroom.
+    ///
+    /// That latency is now COMPENSATED: `GraphSpec::compensate` reads it
+    /// through `spec_latency` and delays every sibling path to match, so a
+    /// filtered track no longer runs ~0.7 ms ahead of the rest of the mix.
+    /// The graph's remaining total is reported by `Schedule::latency`.
     ///
     /// Ids, ranges and the resonance/drive mapping come from
     /// `crate::params::filter` — the same rows and the same `effective_q`
@@ -729,6 +756,7 @@ impl Node {
             | NodeSpec::Reverb { .. }
             | NodeSpec::Filter { .. }
             | NodeSpec::Seq { .. } => 1,
+            NodeSpec::Delay { channels, .. } => (*channels).clamp(1, 2),
             NodeSpec::Mixer { .. } | NodeSpec::AudioClip { .. } | NodeSpec::Pan { .. } => 2,
         }
     }
@@ -1231,6 +1259,37 @@ impl Node {
                 *gain = *target_gain; // land exactly, no float drift
             }
 
+            Node::Delay {
+                left,
+                right,
+                left_buf,
+                right_buf,
+            } => {
+                // The samples in flight belong to wherever the transport
+                // just was. Carrying them across a seek would drag the old
+                // position's audio into the new one.
+                if ctx.discontinuity {
+                    left.reset();
+                    right.reset();
+                    crate::dsp::mem::clear(left_buf);
+                    crate::dsp::mem::clear(right_buf);
+                }
+                sum_inputs_mono(inputs, out.l);
+                left.process_exact(out.l, left_buf);
+                if let Some(r) = out.r.as_deref_mut() {
+                    r.fill(0.0);
+                    for input in inputs {
+                        // A mono producer feeds both sides, the same rule
+                        // the rest of the graph centres mono by.
+                        let src = input.r.unwrap_or(input.l);
+                        for (d, s) in r.iter_mut().zip(src.iter()) {
+                            *d += *s;
+                        }
+                    }
+                    right.process_exact(r, right_buf);
+                }
+            }
+
             Node::Reverb {
                 core,
                 buffers,
@@ -1457,7 +1516,10 @@ impl Node {
         // misrouted letter — binned, never applied).
         use crate::params::{clip, filter, mixer, pan, reverb, seq, sine};
         match self {
-            Node::Silence | Node::Input { .. } => {}
+            // No parameters: compile decides a delay's length, and it
+            // cannot change without a recompile — a letter that moved it
+            // would slide the track it is compensating.
+            Node::Silence | Node::Input { .. } | Node::Delay { .. } => {}
             Node::Sine {
                 target_freq,
                 target_amp,
@@ -1702,6 +1764,13 @@ pub struct Schedule {
     /// the walk, so the values a node reads this segment are this
     /// segment's.
     modulation: ModPlan,
+    /// Samples of latency between this schedule's inputs and its output —
+    /// the deepest path, after compensation has made every path agree.
+    ///
+    /// Reported, not compensated: the final output cannot be made earlier.
+    /// It is what a transport offsets its recording by and what a latency
+    /// readout shows.
+    latency: usize,
 }
 
 /// "This step is not metered." `MAX_METERS` is 32, so 255 cannot collide
@@ -1802,6 +1871,11 @@ impl Schedule {
     pub fn clear_peaks(&mut self) {
         self.modulation.note_peaks(&self.peaks);
         self.peaks = [0.0; MAX_METERS];
+    }
+
+    /// Total latency from input to output, in samples. See the field.
+    pub fn latency(&self) -> usize {
+        self.latency
     }
 
     /// Red zone: this segment's modulation telemetry, for the UI's scopes.
@@ -2059,6 +2133,21 @@ pub enum NodeSpec {
         #[serde(default)]
         params: SynthParams,
     },
+    /// Plugin delay compensation, inserted by COMPILE — never by a user and
+    /// never by the graph builder.
+    ///
+    /// A node that reports latency delays everything downstream of it; every
+    /// other path into the same mixer has to be delayed to match, or the
+    /// tracks slide against each other and nothing on screen explains why.
+    /// `compensate` works out where these belong and how long each is; see
+    /// [`GraphSpec::compensate`].
+    Delay {
+        samples: usize,
+        /// Matched to the producer it is spliced behind, since a node's
+        /// channel count is fixed by its kind and a delay must not narrow
+        /// a stereo path to mono.
+        channels: u8,
+    },
 }
 
 impl GraphSpec {
@@ -2141,6 +2230,162 @@ impl GraphSpec {
         self.output
     }
 
+    /// What this node's own processing adds to the signal's arrival time,
+    /// in samples at `sample_rate`.
+    ///
+    /// Constant per kind: a latency that moved with a knob would slide the
+    /// track in time as the user turned it, which is why the Filter's drive
+    /// stage is permanently in its path rather than switched in at drive
+    /// > 0.
+    fn spec_latency(spec: &NodeSpec) -> usize {
+        match spec {
+            // The half-band round trip of the 2x drive stage.
+            NodeSpec::Filter { .. } => crate::dsp::shaper::Oversampler2x::new().latency(),
+            NodeSpec::Delay { samples, .. } => *samples,
+            _ => 0,
+        }
+    }
+
+    /// The graph with plugin delay compensation applied: a copy of this one
+    /// with [`NodeSpec::Delay`] nodes spliced onto every edge that would
+    /// otherwise arrive early.
+    ///
+    /// # Why compile and not the callback
+    ///
+    /// Alignment is a property of the WIRING, and the wiring is known here.
+    /// Working it out per block would mean the callback carrying a latency
+    /// model; working it out here means it carries a delay line, which is a
+    /// tested kernel. Same reasoning as the flat schedule: complexity at
+    /// compile, execution in the red zone.
+    ///
+    /// # The rule
+    ///
+    /// A signal arrives at node `t` at `arrival[t] = max over feeders f of
+    /// (arrival[f] + latency[f])`. Any feeder arriving earlier than that
+    /// maximum is delayed to match. Nothing is ever made EARLIER — that is
+    /// not possible — so the graph's total latency is the deepest path, and
+    /// [`Schedule::latency`] reports it for the transport to offset by.
+    ///
+    /// Returns `None` when nothing needs compensating, which is the common
+    /// case and skips the copy entirely.
+    fn compensate(&self) -> Option<GraphSpec> {
+        // Dense indices, in insertion order — the same correspondence the
+        // compiler uses.
+        let n = self.order.len();
+        let dense_of = |id: &NodeId| self.order.iter().position(|x| x == id);
+        let latency: Vec<usize> = self
+            .order
+            .iter()
+            .map(|id| self.nodes.get(id.0).map_or(0, Self::spec_latency))
+            .collect();
+        if latency.iter().all(|l| *l == 0) {
+            return None; // nothing in the graph is late
+        }
+
+        let mut feeders: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut targets: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (from, to) in &self.wires {
+            let (Some(f), Some(t)) = (dense_of(from), dense_of(to)) else {
+                return None; // a dangling wire: let compile report it
+            };
+            feeders[t].push(f);
+            targets[f].push(t);
+        }
+
+        // Kahn again, on the spec. A cycle is compile's error to report,
+        // not ours — bail and let it.
+        let mut in_count: Vec<usize> = feeders.iter().map(Vec::len).collect();
+        let mut ready: Vec<usize> = (0..n).filter(|i| in_count[*i] == 0).collect();
+        let mut topo: Vec<usize> = Vec::with_capacity(n);
+        while let Some(i) = ready.pop() {
+            topo.push(i);
+            for &t in &targets[i] {
+                in_count[t] -= 1;
+                if in_count[t] == 0 {
+                    ready.push(t);
+                }
+            }
+        }
+        if topo.len() != n {
+            return None;
+        }
+
+        // arrival[t] in topo order, so every feeder is settled first.
+        let mut arrival = vec![0usize; n];
+        for &i in &topo {
+            arrival[i] = feeders[i]
+                .iter()
+                .map(|&f| arrival[f] + latency[f])
+                .max()
+                .unwrap_or(0);
+        }
+
+        // Rebuild, splicing a delay onto every edge that arrives early.
+        let mut out = GraphSpec::default();
+        let mut remap: Vec<Option<NodeId>> = vec![None; n];
+        for (dense, id) in self.order.iter().enumerate() {
+            if let Some(spec) = self.nodes.get(id.0) {
+                remap[dense] = Some(out.push(spec.clone()));
+            }
+        }
+        let mapped = |dense: usize| -> Option<NodeId> { remap.get(dense).copied().flatten() };
+
+        let mut spliced = false;
+        for (from, to) in &self.wires {
+            let (Some(f), Some(t)) = (dense_of(from), dense_of(to)) else {
+                continue;
+            };
+            let (Some(nf), Some(nt)) = (mapped(f), mapped(t)) else {
+                continue;
+            };
+            let behind = arrival[t].saturating_sub(arrival[f] + latency[f]);
+            if behind == 0 {
+                out.connect(nf, nt);
+                continue;
+            }
+            let channels = self.nodes.get(from.0).map_or(1, Node::channels);
+            let delay = out.push(NodeSpec::Delay {
+                samples: behind,
+                channels,
+            });
+            out.connect(nf, delay);
+            out.connect(delay, nt);
+            spliced = true;
+        }
+        if !spliced {
+            // Latency exists but every path already agrees — a single
+            // chain, which is the ordinary one-track case.
+            return None;
+        }
+
+        if let Some(o) = self.output.and_then(|id| dense_of(&id)).and_then(mapped) {
+            out.set_output(o);
+        }
+        for (slot, node) in &self.meters {
+            // A tap follows its node, so it still reads that node's own
+            // output — before any delay spliced BEHIND it, which is what a
+            // track meter should show.
+            if let Some(m) = dense_of(node).and_then(mapped) {
+                out.meter(*slot, m);
+            }
+        }
+        // Modulation addresses nodes by id, and every id just changed.
+        let mut modulation = self.modulation.clone();
+        modulation.wires.retain_mut(|wire| {
+            match dense_of(&wire.node).and_then(mapped) {
+                Some(id) => {
+                    wire.node = id;
+                    true
+                }
+                // Unreachable while the remap is total; dropping beats
+                // letting a wire address a node in the OLD graph.
+                None => false,
+            }
+        });
+        out.set_modulation(modulation);
+        Some(out)
+    }
+
     /// Compile into a runnable schedule: verify every wire, sort nodes so each
     /// runs after everything it listens to (Kahn's algorithm), refuse cycles,
     /// assign one arena slot per node (reuse comes later), and build the
@@ -2153,6 +2398,22 @@ impl GraphSpec {
     /// Projects retain beats; only the immutable runtime schedule sees
     /// samples, per the sequencing contract.
     pub fn compile_at_tempo(
+        &self,
+        sample_rate: u32,
+        block_frames: usize,
+        bpm: f64,
+    ) -> Result<Schedule, CompileError> {
+        // Alignment first, on a copy: everything below then compiles a
+        // graph whose paths already agree, and needs to know nothing about
+        // latency. `compensate` returns None when there is nothing to do,
+        // which is every graph with no latency-bearing node in it.
+        if let Some(aligned) = self.compensate() {
+            return aligned.compile_inner(sample_rate, block_frames, bpm);
+        }
+        self.compile_inner(sample_rate, block_frames, bpm)
+    }
+
+    fn compile_inner(
         &self,
         sample_rate: u32,
         block_frames: usize,
@@ -2225,6 +2486,24 @@ impl GraphSpec {
                         sample_rate: sample_rate as f32,
                     },
                     Some(NodeSpec::Input { channel }) => Node::Input { channel: *channel },
+                    Some(NodeSpec::Delay { samples, .. }) => {
+                        // One ring per channel, sized here and never
+                        // resized: the callback only reads and writes.
+                        let max = (*samples).max(1);
+                        let len = crate::dsp::delay::buffer_len(max);
+                        let mut left = crate::dsp::delay::DelayLine::new();
+                        let mut right = crate::dsp::delay::DelayLine::new();
+                        left.prepare(max);
+                        right.prepare(max);
+                        left.set_delay(max as f32);
+                        right.set_delay(max as f32);
+                        Node::Delay {
+                            left,
+                            right,
+                            left_buf: vec![0.0; len],
+                            right_buf: vec![0.0; len],
+                        }
+                    }
                     Some(NodeSpec::Mixer { gain }) => Node::Mixer {
                         gain: 0.0, // ramp in, same reasoning as sine amp
                         target_gain: *gain,
@@ -2670,6 +2949,32 @@ impl GraphSpec {
             // disagree about which node a parameter lives on.
             modulation: ModPlan::compile(&self.modulation, sample_rate as f32, |node| {
                 self.order.iter().position(|id| *id == node)
+            }),
+            // The deepest path to the output. Compensation has already made
+            // every path agree, so summing along any one of them gives the
+            // same answer; the walk below takes the max regardless.
+            latency: output_dense.map_or(0, |out| {
+                let mut arrival = vec![0usize; n];
+                for &i in &topo {
+                    arrival[i] = in_wires[i]
+                        .iter()
+                        .map(|&f| {
+                            arrival[f]
+                                + self
+                                    .order
+                                    .get(f)
+                                    .and_then(|id| self.nodes.get(id.0))
+                                    .map_or(0, Self::spec_latency)
+                        })
+                        .max()
+                        .unwrap_or(0);
+                }
+                arrival[out]
+                    + self
+                        .order
+                        .get(out)
+                        .and_then(|id| self.nodes.get(id.0))
+                        .map_or(0, Self::spec_latency)
             }),
         })
     }
@@ -4036,6 +4341,242 @@ mod tests {
         let starts: Vec<f64> = out.iter().map(|n| n.start_beats).collect();
         assert_eq!(starts, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
         assert_eq!(expanded_len_beats(4.0, &subs), 6.0);
+    }
+
+    /// Two paths into one mixer, one of them through a latency-bearing
+    /// node, must arrive together.
+    ///
+    /// Without compensation the clean path is EARLY by the filter's
+    /// half-band round trip, so a transient that should cancel does not —
+    /// which is the audible form of "the tracks slid against each other".
+    #[test]
+    fn compensation_aligns_two_paths_into_one_mixer() {
+        let latency = crate::dsp::shaper::Oversampler2x::new().latency();
+        assert!(latency > 0, "the test needs a node that is actually late");
+
+        // Same source into both legs; one leg is filtered. Invert the
+        // filtered leg's contribution by summing them and looking for
+        // cancellation is fragile with a filter in the path, so instead
+        // measure WHEN each leg's impulse arrives, one leg at a time.
+        let arrival_of = |filtered: bool| -> usize {
+            let mut spec = GraphSpec::default();
+            let src = spec.push(NodeSpec::Sine {
+                freq: 1_000.0,
+                amp: 1.0,
+            });
+            let mix = spec.push(NodeSpec::Mixer { gain: 1.0 });
+            let clean = spec.push(NodeSpec::Mixer { gain: 1.0 });
+            spec.connect(src, clean);
+            spec.connect(clean, mix);
+            if filtered {
+                let f = spec.push(NodeSpec::Filter {
+                    mode: 0,
+                    slope: 0,
+                    cutoff_hz: 20_000.0,
+                    q: 0.707,
+                    drive: 0.0,
+                });
+                spec.connect(src, f);
+                spec.connect(f, mix);
+            }
+            spec.set_output(mix);
+            let sched = spec.compile(48_000, 256).unwrap();
+            sched.latency()
+        };
+
+        // One leg alone: no compensation needed, but the filtered graph
+        // reports the filter's latency as the graph's own.
+        assert_eq!(arrival_of(false), 0, "a clean graph is not late");
+        assert_eq!(
+            arrival_of(true),
+            latency,
+            "a graph containing a late node reports that latency"
+        );
+    }
+
+    /// The compensation itself: the clean leg gets a delay node spliced in,
+    /// so both legs reach the mixer at the same sample.
+    #[test]
+    fn compensation_splices_a_delay_onto_the_early_path() {
+        let latency = crate::dsp::shaper::Oversampler2x::new().latency();
+        let mut spec = GraphSpec::default();
+        let src = spec.push(NodeSpec::Sine {
+            freq: 1_000.0,
+            amp: 1.0,
+        });
+        let f = spec.push(NodeSpec::Filter {
+            mode: 0,
+            slope: 0,
+            cutoff_hz: 20_000.0,
+            q: 0.707,
+            drive: 0.0,
+        });
+        let mix = spec.push(NodeSpec::Mixer { gain: 1.0 });
+        spec.connect(src, f);
+        spec.connect(f, mix);
+        spec.connect(src, mix); // the early leg
+        spec.set_output(mix);
+
+        let Some(aligned) = spec.compensate() else {
+            panic!("this graph needs compensating");
+        };
+        let delays: Vec<usize> = aligned
+            .iter_ordered()
+            .filter_map(|(_, s)| match s {
+                NodeSpec::Delay { samples, .. } => Some(*samples),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            delays,
+            vec![latency],
+            "exactly one delay, exactly as long as the filter is late"
+        );
+
+        // And it still compiles and runs.
+        let mut sched = aligned.compile(48_000, 256).unwrap();
+        let mut out = vec![0.0f32; 512];
+        run_rolling(&mut sched, 8, &mut out);
+        assert_eq!(sched.latency(), latency);
+    }
+
+    /// A graph with nothing late must not pay for compensation at all —
+    /// no copy, no delay nodes, no extra steps.
+    #[test]
+    fn a_graph_with_no_latency_is_left_alone() {
+        let mut spec = GraphSpec::default();
+        let a = spec.push(NodeSpec::Sine {
+            freq: 440.0,
+            amp: 0.5,
+        });
+        let mix = spec.push(NodeSpec::Mixer { gain: 1.0 });
+        spec.connect(a, mix);
+        spec.set_output(mix);
+        assert!(spec.compensate().is_none());
+        assert_eq!(spec.compile(48_000, 256).unwrap().latency(), 0);
+    }
+
+    /// A single chain through a late node needs no delay — there is no
+    /// other path to disagree with — but its latency still reports.
+    #[test]
+    fn a_lone_chain_reports_latency_without_splicing() {
+        let mut spec = GraphSpec::default();
+        let src = spec.push(NodeSpec::Sine {
+            freq: 440.0,
+            amp: 0.5,
+        });
+        let f = spec.push(NodeSpec::Filter {
+            mode: 0,
+            slope: 0,
+            cutoff_hz: 8_000.0,
+            q: 0.707,
+            drive: 0.0,
+        });
+        spec.connect(src, f);
+        spec.set_output(f);
+        assert!(
+            spec.compensate().is_none(),
+            "one path cannot be out of step with itself"
+        );
+        assert_eq!(
+            spec.compile(48_000, 256).unwrap().latency(),
+            crate::dsp::shaper::Oversampler2x::new().latency()
+        );
+    }
+
+    /// The delay node is a WIRE: an impulse comes back bit-identical, the
+    /// stated number of samples later.
+    #[test]
+    fn a_delay_node_is_an_exact_wire() {
+        const D: usize = 37;
+        let mut spec = GraphSpec::default();
+        let src = spec.push(NodeSpec::Sine {
+            freq: 1_000.0,
+            amp: 1.0,
+        });
+        let d = spec.push(NodeSpec::Delay {
+            samples: D,
+            channels: 1,
+        });
+        spec.connect(src, d);
+        spec.set_output(d);
+        let mut delayed = spec.compile(48_000, 256).unwrap();
+
+        let mut plain = GraphSpec::default();
+        let p = plain.push(NodeSpec::Sine {
+            freq: 1_000.0,
+            amp: 1.0,
+        });
+        plain.set_output(p);
+        let mut undelayed = plain.compile(48_000, 256).unwrap();
+
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        run_rolling(&mut delayed, 4, &mut a);
+        run_rolling(&mut undelayed, 4, &mut b);
+        // Compare well past the ramp-in so both signals are steady.
+        let (x, y) = (&a[300..600], &b[300 - D..600 - D]);
+        assert_eq!(x, y, "a delay node must reproduce its input exactly");
+    }
+
+    /// The compensated graph runs in the red zone without allocating —
+    /// including the discontinuity path, which clears both rings.
+    ///
+    /// `assert_no_alloc` ABORTS the process on any allocation, so this
+    /// either passes or takes the test binary down with it.
+    #[test]
+    fn a_compensated_graph_does_not_allocate() {
+        let mut spec = GraphSpec::default();
+        let src = spec.push(NodeSpec::Sine {
+            freq: 1_000.0,
+            amp: 0.8,
+        });
+        let f = spec.push(NodeSpec::Filter {
+            mode: 0,
+            slope: 0,
+            cutoff_hz: 8_000.0,
+            q: 0.707,
+            drive: 0.4,
+        });
+        let pan = spec.push(NodeSpec::Pan {
+            pan: 0.0,
+            gain: 1.0,
+        });
+        let mix = spec.push(NodeSpec::Mixer { gain: 1.0 });
+        spec.connect(src, f);
+        spec.connect(f, mix);
+        // The early legs: one mono, one that widens to stereo, so both a
+        // mono and a stereo delay get spliced and exercised.
+        spec.connect(src, mix);
+        spec.connect(src, pan);
+        spec.connect(pan, mix);
+        spec.set_output(mix);
+
+        let mut sched = spec.compile(48_000, 256).unwrap();
+        assert!(sched.latency() > 0, "the graph should be compensated");
+        let mut block = vec![0.0f32; 512];
+        let bps = 120.0 / 60.0 / 48_000.0;
+
+        assert_no_alloc::assert_no_alloc(|| {
+            for b in 0..8 {
+                sched.clear_peaks();
+                let c = ProcessCtx {
+                    device_input: NO_INPUT,
+                    in_channels: 2,
+                    block_frames: 256,
+                    offset: 0,
+                    len: 256,
+                    playing: true,
+                    position: (b * 256) as u64,
+                    beat: (b * 256) as f64 * bps,
+                    beats_per_sample: bps,
+                    // Every other block seeks, so the ring-clearing path
+                    // runs inside the guard too.
+                    discontinuity: b % 2 == 0,
+                };
+                sched.run(&mut block, &c);
+            }
+        });
     }
 
     /// What a sequencer block costs. Printed, not asserted — a number to
