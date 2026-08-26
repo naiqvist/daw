@@ -90,5 +90,7 @@ pub use card::{Well, Wells, card, empty_card, sections, sub_wells, tabbed_card, 
 pub use envelope::Adsr;
 pub use metrics::Footprint;
 pub use param::{Mapping, Param, Unit};
-pub use reverb::{ReverbUi, reverb_card, reverb_edits};
-pub use synth::{ParamEdit, SineSynthUi, sine_synth_card, sine_synth_edits};
+pub use reverb::{ReverbUi, reverb_card, reverb_edits, reverb_norm, reverb_value};
+pub use synth::{
+    ParamEdit, SineSynthUi, sine_synth_card, sine_synth_edits, sine_synth_norm, sine_synth_value,
+};

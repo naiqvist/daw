@@ -6,6 +6,7 @@
 //! over flat arrays: one `Vec<Step>` in dependency order, one arena of
 //! 64-byte-aligned slots indexed by number.
 
+use crate::audio::modulation::{ModEdit, ModPlan, ModSpec};
 use creek::{ReadDiskStream, SeekMode, SymphoniaDecoder};
 use std::f32::consts::TAU;
 
@@ -20,6 +21,13 @@ impl NodeId {
     /// generation (never 0) in the high 32 bits, slot in the low 32.
     pub fn to_bits(self) -> u64 {
         self.0.to_bits()
+    }
+
+    /// The inverse of [`Self::to_bits`]. `None` for a packed form thunderdome
+    /// would never mint — generation 0 — so a fabricated id cannot address a
+    /// live node.
+    pub fn from_bits(bits: u64) -> Option<Self> {
+        thunderdome::Index::from_bits(bits).map(Self)
     }
 }
 
@@ -1423,6 +1431,10 @@ pub struct Schedule {
     /// segments of a block: `run` is called once per SEGMENT, so a block's
     /// peak is the max over its segments.
     peaks: [f32; MAX_METERS],
+    /// Modulation, compiled. Evaluated at the top of every segment, before
+    /// the walk, so the values a node reads this segment are this
+    /// segment's.
+    modulation: ModPlan,
 }
 
 /// "This step is not metered." `MAX_METERS` is 32, so 255 cannot collide
@@ -1476,14 +1488,33 @@ impl Schedule {
     /// slot table, one generation compare. A letter for a departed node finds
     /// generation mismatch (or an empty slot) and is binned — misdelivery is
     /// structurally impossible.
+    /// A letter for a MODULATED parameter is diverted to its base value
+    /// instead: the node's value belongs to the modulation plan, which
+    /// rewrites it every segment, so a letter landing on the node directly
+    /// would be erased a moment later — the fader would go dead under a
+    /// running LFO. Setting the base is what "modulation is relative"
+    /// means in one line of code.
     pub fn apply(&mut self, change: ParamChange) {
+        // `Node::apply` bins non-finite letters, and a modulation base must
+        // be held to the same standard — it is the SAME letter, taking a
+        // different door. A NaN base is worse than a NaN node value: it
+        // cannot be clamped away downstream, so every later segment fails
+        // its finite check and pins the parameter to the bottom of its
+        // range. The track goes silent and STAYS silent, through a bypass,
+        // through a solo, until some other finite value happens to arrive.
+        if !change.value.is_finite() {
+            return;
+        }
         let slot = change.node as u32 as usize;
         let generation = (change.node >> 32) as u32;
         if let Some(&(g, dense)) = self.slot_table.get(slot)
             && g == generation
-            && let Some(node) = self.nodes.get_mut(dense as usize)
         {
-            node.apply(change.param, change.value);
+            if let Some(base) = self.modulation.base_slot(dense as usize, change.param) {
+                *base = change.value;
+            } else if let Some(node) = self.nodes.get_mut(dense as usize) {
+                node.apply(change.param, change.value);
+            }
         }
     }
 
@@ -1495,8 +1526,35 @@ impl Schedule {
 
     /// Red zone: start a new measurement window. Called once per block,
     /// before its segments run — a fixed-size fill, no allocation.
+    ///
+    /// The peaks are handed to the modulation plan on the way out, because
+    /// this is the last moment they exist: a follower detects the PREVIOUS
+    /// block's level, since the current one is not known until after the
+    /// walk. That is one block (~5ms at 256 frames) of detector latency,
+    /// which is what every sidechain has.
     pub fn clear_peaks(&mut self) {
+        self.modulation.note_peaks(&self.peaks);
         self.peaks = [0.0; MAX_METERS];
+    }
+
+    /// Red zone: this segment's modulation telemetry, for the UI's scopes.
+    pub fn modulation(&self) -> &ModPlan {
+        &self.modulation
+    }
+
+    /// Red zone: inherit the retiring schedule's modulation memory — free
+    /// LFO phase, wire lag, follower levels — so a recompile mid-playback
+    /// is not heard. Call this on the NEW schedule, with the old one, at
+    /// the moment of the swap.
+    pub fn adopt_modulation_continuity(&mut self, old: &Schedule) {
+        self.modulation.adopt_continuity(&old.modulation);
+    }
+
+    /// Red zone: deliver one modulation letter. The live door for knob
+    /// drags on a wire's depth or an LFO's rate, which must be heard now
+    /// rather than at the next debounced schedule swap.
+    pub fn apply_mod_edit(&mut self, edit: ModEdit) {
+        self.modulation.apply_edit(edit);
     }
 
     /// Red zone: walk the chart in dependency order for ONE transport
@@ -1505,6 +1563,25 @@ impl Schedule {
     /// within the block. All node buffers are `ctx.len` long.
     pub fn run(&mut self, output: &mut [f32], ctx: &ProcessCtx<'_>) {
         let len = ctx.len;
+
+        // Modulation first, so every node reads THIS segment's values. A
+        // segment is the right grain rather than a block: a loop wrap ends
+        // one segment and starts another, and a synced LFO reading
+        // `ctx.beat` therefore lands on the wrapped beat instead of
+        // sliding across the seam.
+        //
+        // The values go in through `Node::apply` — the same door letters
+        // use — so a modulated parameter keeps the per-block ramp that
+        // declicks it, and no node needs to know modulation exists.
+        if !self.modulation.is_empty() {
+            self.modulation.evaluate(ctx.beat as f32, len);
+            for (dense, param, value) in self.modulation.writes() {
+                if let Some(node) = self.nodes.get_mut(dense) {
+                    node.apply(param, value);
+                }
+            }
+        }
+
         for (step_index, step) in self.steps.iter().enumerate() {
             // Gather input channel slices into a fixed stack array. compile()
             // caps inputs at MAX_NODE_INPUTS, and the slot allocator
@@ -1633,6 +1710,10 @@ pub struct GraphSpec {
     /// number — so a muted track that compiles to nothing leaves its meter
     /// reading silence instead of shifting every meter after it.
     meters: Vec<(usize, NodeId)>,
+    /// Modulation, with each wire's `(track, parameter)` target already
+    /// resolved to a node and param id by whoever built the graph — the
+    /// only place that knows both halves.
+    modulation: ModSpec,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -1774,6 +1855,18 @@ impl GraphSpec {
     /// Wires as (from, to) pairs.
     pub fn wires(&self) -> &[(NodeId, NodeId)] {
         &self.wires
+    }
+
+    /// Hand the graph its modulation. Replaces whatever was set before —
+    /// the builder produces the whole picture in one pass, and a plan
+    /// assembled from two sources would be a plan nobody can reason about.
+    pub fn set_modulation(&mut self, modulation: ModSpec) {
+        self.modulation = modulation;
+    }
+
+    /// The modulation this graph will compile.
+    pub fn modulation(&self) -> &ModSpec {
+        &self.modulation
     }
 
     /// The declared output node, if any.
@@ -2271,6 +2364,12 @@ impl GraphSpec {
             slot_table,
             step_meter,
             peaks: [0.0; MAX_METERS],
+            // Wires resolve against the SAME dense correspondence the
+            // name-tag directory uses, so a wire and a letter can never
+            // disagree about which node a parameter lives on.
+            modulation: ModPlan::compile(&self.modulation, sample_rate as f32, |node| {
+                self.order.iter().position(|id| *id == node)
+            }),
         })
     }
 }
@@ -2323,6 +2422,229 @@ mod tests {
             sched.run(&mut block, &c);
             out.extend_from_slice(&block[..256]);
         }
+    }
+
+    /// The rule that outranks everything else, checked on the path this
+    /// change actually added: modulation is evaluated inside `run`, which
+    /// is the audio callback. `assert_no_alloc` ABORTS the process on any
+    /// allocation in the block, so this test either passes or takes the
+    /// test binary down with it — which is the point.
+    ///
+    /// The letter doors are exercised in the same block, because
+    /// `Schedule::apply` now searches the modulation targets first and
+    /// `apply_mod_edit` writes into the plan.
+    #[test]
+    fn modulated_blocks_do_not_allocate() {
+        use crate::audio::modulation::{
+            Chain, ModEdit, ModKind, ModShape, ModSpec, Modulator, WireEdit, WireSpec,
+        };
+
+        let mut spec = GraphSpec::default();
+        let sine = spec.push(NodeSpec::Sine {
+            freq: 220.0,
+            amp: 0.5,
+        });
+        let mix = spec.push(NodeSpec::Mixer { gain: 1.0 });
+        spec.connect(sine, mix);
+        spec.set_output(mix);
+        spec.meter(0, mix);
+
+        // Both source kinds, and a wire carrying every stage of the chain
+        // — curve (powf), quantize, and the lag (exp).
+        let sources = vec![
+            Modulator {
+                id: 1,
+                kind: ModKind::Lfo {
+                    shape: ModShape::Sine,
+                    rate_beats: 1.0,
+                    free: false,
+                    hz: 1.0,
+                },
+            },
+            Modulator {
+                id: 2,
+                kind: ModKind::Lfo {
+                    shape: ModShape::Triangle,
+                    rate_beats: 0.5,
+                    free: true,
+                    hz: 3.0,
+                },
+            },
+            Modulator {
+                id: 3,
+                kind: ModKind::Follower { track: 0 },
+            },
+        ];
+        let wire = |id: u64, source: u64| WireSpec {
+            id,
+            source,
+            node: mix,
+            param: crate::params::mixer::GAIN,
+            min: 0.0,
+            max: 2.0,
+            base: 1.0,
+            chain: Chain {
+                depth: 0.2,
+                curve: 0.4,
+                steps: 7,
+                smooth_ms: 15.0,
+            },
+            enabled: true,
+            solo: false,
+        };
+        spec.set_modulation(ModSpec {
+            sources,
+            wires: vec![wire(10, 1), wire(11, 2), wire(12, 3)],
+        });
+
+        let mut sched = spec.compile(48_000, 256).unwrap();
+        let mut block = vec![0.0f32; 512];
+        let bps = 120.0 / 60.0 / 48_000.0;
+
+        assert_no_alloc::assert_no_alloc(|| {
+            for b in 0..8 {
+                sched.clear_peaks();
+                // A base letter for a MODULATED parameter (diverted into
+                // the plan) and one for an unmodulated parameter (straight
+                // through to the node) — both doors, every block.
+                sched.apply(ParamChange {
+                    node: mix.to_bits(),
+                    param: crate::params::mixer::GAIN,
+                    value: 0.8,
+                });
+                sched.apply(ParamChange {
+                    node: sine.to_bits(),
+                    param: crate::params::sine::FREQ,
+                    value: 300.0,
+                });
+                sched.apply_mod_edit(ModEdit::Wire(WireEdit {
+                    id: 10,
+                    chain: Chain {
+                        depth: 0.3,
+                        curve: -0.2,
+                        steps: 0,
+                        smooth_ms: 5.0,
+                    },
+                    enabled: true,
+                    solo: false,
+                }));
+                sched.apply_mod_edit(ModEdit::Source {
+                    id: 2,
+                    kind: ModKind::Lfo {
+                        shape: ModShape::Square,
+                        rate_beats: 2.0,
+                        free: true,
+                        hz: 1.5,
+                    },
+                });
+                // Two segments per block, as a loop wrap would produce.
+                for (offset, len) in [(0usize, 128usize), (128, 128)] {
+                    let c = ProcessCtx {
+                        device_input: NO_INPUT,
+                        in_channels: 2,
+                        block_frames: 256,
+                        offset,
+                        len,
+                        playing: true,
+                        position: (b * 256 + offset) as u64,
+                        beat: (b * 256 + offset) as f64 * bps,
+                        beats_per_sample: bps,
+                        discontinuity: b == 0 && offset == 0,
+                    };
+                    sched.run(&mut block, &c);
+                }
+                let mut sources = [0.0; crate::audio::modulation::MAX_MOD_SOURCES];
+                let mut ids = [0; crate::audio::modulation::MAX_MOD_WIRES];
+                let mut outs = [0.0; crate::audio::modulation::MAX_MOD_WIRES];
+                sched.modulation().source_values(&mut sources);
+                sched.modulation().wire_outputs(&mut ids, &mut outs);
+            }
+        });
+
+        // And it actually modulated: the gain landed somewhere other than
+        // the 0.8 base the letters kept setting.
+        let peak = block[..256].iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(peak > 0.0, "the graph should still be making sound");
+    }
+
+    /// The diversion, end to end through a real schedule: a letter for a
+    /// MODULATED parameter must move the base and stay moved, rather than
+    /// being overwritten by the next segment's modulation write.
+    ///
+    /// The unit tests prove `ModPlan` does this; this proves the wiring in
+    /// `Schedule::apply` reaches it — the fader going dead under a running
+    /// LFO is exactly the bug that would slip past a plan-only test.
+    #[test]
+    fn a_letter_still_moves_a_modulated_parameter() {
+        use crate::audio::modulation::{Chain, ModKind, ModShape, ModSpec, Modulator, WireSpec};
+
+        let build = || {
+            let mut spec = GraphSpec::default();
+            let sine = spec.push(NodeSpec::Sine {
+                freq: 220.0,
+                amp: 0.5,
+            });
+            let mix = spec.push(NodeSpec::Mixer { gain: 1.0 });
+            spec.connect(sine, mix);
+            spec.set_output(mix);
+            spec.set_modulation(ModSpec {
+                sources: vec![Modulator {
+                    id: 1,
+                    // Square at a whole-beat rate: the modulation offset
+                    // is the same constant every block below, so any
+                    // difference between the two runs is the letter's.
+                    kind: ModKind::Lfo {
+                        shape: ModShape::Square,
+                        rate_beats: 4.0,
+                        free: false,
+                        hz: 1.0,
+                    },
+                }],
+                wires: vec![WireSpec {
+                    id: 10,
+                    source: 1,
+                    node: mix,
+                    param: crate::params::mixer::GAIN,
+                    min: 0.0,
+                    max: 2.0,
+                    base: 1.0,
+                    chain: Chain {
+                        depth: 0.25,
+                        curve: 0.0,
+                        steps: 0,
+                        smooth_ms: 0.0,
+                    },
+                    enabled: true,
+                    solo: false,
+                }],
+            });
+            (spec.compile(48_000, 256).unwrap(), mix)
+        };
+
+        // Render a few blocks so the gain ramp settles, then measure.
+        let render = |gain: Option<f32>| {
+            let (mut sched, mix) = build();
+            if let Some(g) = gain {
+                sched.apply(ParamChange {
+                    node: mix.to_bits(),
+                    param: crate::params::mixer::GAIN,
+                    value: g,
+                });
+            }
+            let mut out = Vec::new();
+            run_rolling(&mut sched, 6, &mut out);
+            out[out.len() - 256..]
+                .iter()
+                .fold(0.0f32, |m, s| m.max(s.abs()))
+        };
+
+        let at_base = render(None); // compiled base of 1.0
+        let quieter = render(Some(0.4));
+        assert!(
+            quieter < at_base * 0.8,
+            "a letter must still move a modulated parameter: {at_base} -> {quieter}"
+        );
+        assert!(quieter > 0.0, "and not silence it");
     }
 
     fn seq_graph(params: SynthParams) -> (Schedule, NodeId) {

@@ -61,23 +61,28 @@ fn natural(norm: f32) -> f32 {
     norm.clamp(0.0, 1.0)
 }
 
+/// The natural value at a normalized knob position, by param id. The
+/// reverb's engine ranges are already `0..=1`, so the two are the same
+/// number — the percent the knob shows is a rendering, not a unit.
+pub fn reverb_value(_param: u32, norm: f32) -> f32 {
+    natural(norm)
+}
+
+/// The inverse of [`reverb_value`], for a state stored in engine units.
+pub fn reverb_norm(_param: u32, value: f32) -> f32 {
+    value.clamp(0.0, 1.0)
+}
+
 /// Every parameter as an edit, whether or not it moved — for a reset, a
 /// preset recall, or the moment the device is first loaded.
 pub fn reverb_edits(state: &ReverbUi) -> Vec<ParamEdit> {
-    vec![
-        ParamEdit {
-            param: MIX,
-            value: natural(state.mix),
-        },
-        ParamEdit {
-            param: SIZE,
-            value: natural(state.size),
-        },
-        ParamEdit {
-            param: DAMP,
-            value: natural(state.damp),
-        },
-    ]
+    [(MIX, state.mix), (SIZE, state.size), (DAMP, state.damp)]
+        .into_iter()
+        .map(|(param, norm)| ParamEdit {
+            param,
+            value: reverb_value(param, norm),
+        })
+        .collect()
 }
 
 /// Draw the reverb card. Returns the edits the user just made.

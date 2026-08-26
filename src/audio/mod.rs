@@ -12,6 +12,7 @@
 
 pub mod bounce;
 pub mod graph;
+pub mod modulation;
 pub mod project;
 pub mod transport;
 
@@ -179,6 +180,20 @@ pub struct BlockSnapshot {
     /// meter cannot tell the difference and does not need to.
     pub track_peaks: [f32; graph::MAX_METERS],
 
+    /// Each modulation source's value as of this block's last segment, in
+    /// the arrangement's modulator order.
+    ///
+    /// The mod strip draws FROM HERE rather than from a copy of the maths
+    /// run in the frame loop: the engine is what is actually sounding, and
+    /// a scope that shows a parallel simulation is a scope that can lie.
+    pub mod_sources: [f32; modulation::MAX_MOD_SOURCES],
+    /// The wire each `mod_wires` reading belongs to. Wires whose target did
+    /// not survive compilation are absent, so the ID is what matches a
+    /// reading back to a wire — never the index. 0 marks an unused slot.
+    pub mod_wire_ids: [u64; modulation::MAX_MOD_WIRES],
+    /// Each wire's output after its whole chain, in the target's own units.
+    pub mod_wires: [f32; modulation::MAX_MOD_WIRES],
+
     /// How long the callback body took for this block, in nanoseconds.
     pub work_ns: u64,
     /// Worst callback duration since the stream started.
@@ -211,6 +226,9 @@ impl Default for BlockSnapshot {
             peak: 0.0,
             head: [0.0; SNAPSHOT_SAMPLES],
             track_peaks: [0.0; graph::MAX_METERS],
+            mod_sources: [0.0; modulation::MAX_MOD_SOURCES],
+            mod_wire_ids: [0; modulation::MAX_MOD_WIRES],
+            mod_wires: [0.0; modulation::MAX_MOD_WIRES],
             work_ns: 0,
             work_max_ns: 0,
             underflows: 0,
@@ -262,6 +280,9 @@ pub struct Engine {
     schedule_tx: rtrb::Producer<Box<Schedule>>,
     /// Parameter letters: 16-byte Copy structs, drained at each block start.
     param_tx: rtrb::Producer<ParamChange>,
+    /// Modulation letters: wire chains and source definitions, so a knob
+    /// drag is heard now instead of at the next debounced schedule swap.
+    mod_tx: rtrb::Producer<modulation::ModEdit>,
     /// Transport commands: one ring, so a stop+seek+play gesture is atomic
     /// by ring order.
     transport_tx: rtrb::Producer<TransportCmd>,
@@ -344,6 +365,9 @@ impl Engine {
         // 256 letters is ~1.4 blocks of continuous 60Hz knob-drag backlog —
         // far more than the callback can fall behind by.
         let (param_tx, mut param_rx) = rtrb::RingBuffer::<ParamChange>::new(256);
+        // Modulation edits are sent only on CHANGE, and there are far
+        // fewer wires than parameters, so 128 is generous.
+        let (mod_tx, mut mod_rx) = rtrb::RingBuffer::<modulation::ModEdit>::new(128);
         let (transport_tx, mut transport_rx) = rtrb::RingBuffer::<TransportCmd>::new(64);
         let mut transport = Transport::new(cfg.sample_rate as f64);
         let (mut trash_tx, trash_rx) = rtrb::RingBuffer::<Box<Schedule>>::new(4);
@@ -406,7 +430,14 @@ impl Engine {
                     // Swap in a newer schedule if one arrived. Pop and push are
                     // lock-free and constant-time; the old Box goes back to the
                     // UI thread to be dropped there.
-                    while let Ok(new_schedule) = schedule_rx.pop() {
+                    while let Ok(mut new_schedule) = schedule_rx.pop() {
+                        // Modulation memory rides across the seam: a
+                        // recompile happens for a clip drag or a tempo
+                        // nudge, once a second, while audio plays — and a
+                        // wire mid-glide must not restart it.
+                        if let Some(old) = schedule.as_ref() {
+                            new_schedule.adopt_modulation_continuity(old);
+                        }
                         if let Some(old) = schedule.replace(new_schedule) {
                             // If trash is somehow full the old schedule leaks
                             // until stream teardown — still never freed here.
@@ -419,6 +450,15 @@ impl Engine {
                     while let Ok(change) = param_rx.pop() {
                         if let Some(s) = schedule.as_mut() {
                             s.apply(change);
+                        }
+                    }
+                    // Modulation letters, after the parameter letters: both
+                    // can arrive in one frame, and a wire's new depth
+                    // should be applied against this block's base rather
+                    // than the last one's.
+                    while let Ok(edit) = mod_rx.pop() {
+                        if let Some(s) = schedule.as_mut() {
+                            s.apply_mod_edit(edit);
                         }
                     }
                     // Drain transport commands, in order — the whole gesture
@@ -513,6 +553,18 @@ impl Engine {
                         .as_ref()
                         .map_or([0.0; graph::MAX_METERS], |s| *s.peaks());
 
+                    // Modulation, as the engine just ran it. Three fixed
+                    // fills; no schedule reports zeros, which is the honest
+                    // reading for "nothing is modulating anything".
+                    let mut mod_sources = [0.0; modulation::MAX_MOD_SOURCES];
+                    let mut mod_wire_ids = [0; modulation::MAX_MOD_WIRES];
+                    let mut mod_wires = [0.0; modulation::MAX_MOD_WIRES];
+                    if let Some(s) = schedule.as_ref() {
+                        s.modulation().source_values(&mut mod_sources);
+                        s.modulation()
+                            .wire_outputs(&mut mod_wire_ids, &mut mod_wires);
+                    }
+
                     // Stop the clock before publishing so the write itself is
                     // not counted; the memcpy is ~100 bytes and constant.
                     let work_ns = t0.elapsed().as_nanos() as u64;
@@ -524,6 +576,9 @@ impl Engine {
                         peak,
                         head,
                         track_peaks,
+                        mod_sources,
+                        mod_wire_ids,
+                        mod_wires,
                         work_ns,
                         work_max_ns,
                         underflows,
@@ -544,6 +599,7 @@ impl Engine {
             telemetry,
             schedule_tx,
             param_tx,
+            mod_tx,
             transport_tx,
             trash_rx,
             last_seen_block: 0,
@@ -620,5 +676,12 @@ impl Engine {
             param,
             value,
         });
+    }
+
+    /// Send one modulation edit — a wire's chain, or a source's definition.
+    /// Dropped on a full ring for the same reason a parameter letter is:
+    /// these carry whole state, so the next one supersedes this one.
+    pub fn set_modulation(&mut self, edit: modulation::ModEdit) {
+        let _ = self.mod_tx.push(edit);
     }
 }

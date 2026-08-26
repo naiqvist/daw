@@ -22,6 +22,13 @@
 //! catch the swap.
 
 use daw::audio::graph::{GraphSpec, NodeId, NodeSpec, Note as SeqNote, SynthParams};
+// Modulation lives in the audio crate, not here: the ENGINE evaluates it
+// now, and the UI edits the same types rather than a parallel set that
+// could drift from what is actually sounding.
+use daw::audio::modulation::{
+    MAX_MOD_SOURCES, MAX_MOD_WIRES, MOD_HZ, MOD_RATES, ModKind, ModShape, ModSpec, ModWire,
+    Modulator, WireSpec, modulator_value, wire_contribution,
+};
 use daw::audio::transport::TransportCmd;
 use daw::audio::{Engine, EngineConfig, StreamHealth};
 use daw::install_fonts;
@@ -1771,23 +1778,291 @@ impl Key {
 /// on them — nothing in the running app can reach a device until the library
 /// browser offers one. The allow goes away with the row that refills it.
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 enum DeviceKind {
     SineSynth,
     Reverb,
 }
 
 impl DeviceKind {
-    /// Instruments MAKE sound, effects SHAPE it. A track holds one of each
-    /// slot, and loading a device fills the slot it belongs to — so
-    /// dropping a reverb on a track never displaces its instrument.
+    /// Instruments MAKE sound, effects SHAPE it. An instrument heads a
+    /// chain and there is at most one; effects follow it in order.
     fn is_instrument(self) -> bool {
-        matches!(self, Self::SineSynth)
+        self.spec().instrument
+    }
+
+    /// Everything the app knows about this kind of device. A linear scan of
+    /// `DEVICES`, which the tests walk to prove it is total.
+    fn spec(self) -> &'static DeviceSpec {
+        DEVICES
+            .iter()
+            .find(|spec| spec.kind == self)
+            .unwrap_or(&DEVICES[0])
     }
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+/// How one parameter PRESENTS itself: what the picker calls it, the unit a
+/// readout appends, and the group it is filed under. Parallel to the
+/// device's engine table — the numbers live there, the words live here.
+struct ParamLabel {
+    name: &'static str,
+    unit: &'static str,
+    group: &'static str,
+}
+
+/// Everything the app needs to know about a kind of device, in one place.
+/// Adding a device is a row here, a [`DeviceState`] variant and a node —
+/// not an edit in nine hardcoded matches.
+///
+/// `params` is `&'static` and stays that way: `daw::params::clamp` scans
+/// exactly this slice inside the audio callback, so anything heap-backed
+/// reaching it would be a red-zone allocation. Descriptive on this side,
+/// static on the engine's.
+struct DeviceSpec {
+    kind: DeviceKind,
+    name: &'static str,
+    /// Instruments MAKE sound and head the chain; effects SHAPE it.
+    instrument: bool,
+    /// Stable target-id prefix: "synth", "reverb". Part of the file
+    /// format — renaming one orphans every wire that names it.
+    prefix: &'static str,
+    /// The engine's own parameter table.
+    params: &'static [daw::params::ParamDef],
+    /// Presentation per parameter, parallel to `params`.
+    labels: &'static [ParamLabel],
+}
+
+static DEVICES: &[DeviceSpec] = &[
+    DeviceSpec {
+        kind: DeviceKind::SineSynth,
+        name: "sine synth",
+        instrument: true,
+        prefix: "synth",
+        params: daw::params::seq::TABLE,
+        labels: &[
+            ParamLabel {
+                name: "Gain",
+                unit: "",
+                group: "Synth",
+            },
+            ParamLabel {
+                name: "Attack",
+                unit: "ms",
+                group: "Synth",
+            },
+            ParamLabel {
+                name: "Release",
+                unit: "ms",
+                group: "Synth",
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Reverb,
+        name: "reverb",
+        instrument: false,
+        prefix: "reverb",
+        params: daw::params::reverb::TABLE,
+        labels: &[
+            ParamLabel {
+                name: "Mix",
+                unit: "",
+                group: "Reverb",
+            },
+            ParamLabel {
+                name: "Size",
+                unit: "",
+                group: "Reverb",
+            },
+            ParamLabel {
+                name: "Damp",
+                unit: "",
+                group: "Reverb",
+            },
+        ],
+    },
+];
+
+/// The device a target's prefix names, if any. The parse side of
+/// [`DeviceSpec::prefix`].
+fn device_by_prefix(prefix: &str) -> Option<&'static DeviceSpec> {
+    DEVICES.iter().find(|spec| spec.prefix == prefix)
+}
+
+/// The reverb's editable values in ENGINE units (`0..=1` each, the ranges
+/// `daw::params::reverb` declares). The synth's equivalent is
+/// `graph::SynthParams`, which the engine already owns.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
+struct ReverbParams {
+    mix: f32,
+    size: f32,
+    damp: f32,
+}
+
+impl Default for ReverbParams {
+    fn default() -> Self {
+        use daw::params::{def, reverb};
+        Self {
+            mix: def(reverb::TABLE, reverb::MIX).default,
+            size: def(reverb::TABLE, reverb::SIZE).default,
+            damp: def(reverb::TABLE, reverb::DAMP).default,
+        }
+    }
+}
+
+/// What a device IS, and its editable values — in ENGINE units, the same
+/// numbers `src/params.rs` declares. One stored copy of one truth: the card
+/// converts to normalized knob positions for drawing and back on the way
+/// out, and `parameter_base`, `build_graph_spec` and the modulation plan all
+/// read these directly.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+enum DeviceState {
+    SineSynth(SynthParams),
+    Reverb(ReverbParams),
+}
+
+impl DeviceState {
+    /// A device of `kind` at its table defaults.
+    fn new(kind: DeviceKind) -> Self {
+        match kind {
+            DeviceKind::SineSynth => Self::SineSynth(SynthParams::default()),
+            DeviceKind::Reverb => Self::Reverb(ReverbParams::default()),
+        }
+    }
+
+    fn kind(self) -> DeviceKind {
+        match self {
+            Self::SineSynth(_) => DeviceKind::SineSynth,
+            Self::Reverb(_) => DeviceKind::Reverb,
+        }
+    }
+
+    /// This device's value for `param`, or `None` for an id it does not
+    /// have — which is how a target aimed at the wrong kind is refused.
+    fn value(self, param: u32) -> Option<f32> {
+        use daw::params::{reverb, seq};
+        match self {
+            Self::SineSynth(p) => match param {
+                seq::GAIN => Some(p.gain),
+                seq::ATTACK => Some(p.attack_ms),
+                seq::RELEASE => Some(p.release_ms),
+                _ => None,
+            },
+            Self::Reverb(p) => match param {
+                reverb::MIX => Some(p.mix),
+                reverb::SIZE => Some(p.size),
+                reverb::DAMP => Some(p.damp),
+                _ => None,
+            },
+        }
+    }
+
+    /// Store an engine-unit value. Unknown ids are dropped, exactly as the
+    /// engine's own clamp drops them.
+    fn set(&mut self, param: u32, value: f32) {
+        use daw::params::{reverb, seq};
+        match self {
+            Self::SineSynth(p) => match param {
+                seq::GAIN => p.gain = value,
+                seq::ATTACK => p.attack_ms = value,
+                seq::RELEASE => p.release_ms = value,
+                _ => {}
+            },
+            Self::Reverb(p) => match param {
+                reverb::MIX => p.mix = value,
+                reverb::SIZE => p.size = value,
+                reverb::DAMP => p.damp = value,
+                _ => {}
+            },
+        }
+    }
+}
+
+/// One device on a track, with a STABLE identity.
+///
+/// Automation and modulation address a device by `id`, never by position:
+/// reordering the chain must not break a wire. The id is minted from the
+/// arrangement's one counter, so it is unique across the whole document.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+struct DeviceInstance {
+    id: u64,
+    state: DeviceState,
+    /// Bypassed devices stay in the chain and leave the SCHEDULE, the same
+    /// way a muted track does.
+    #[serde(default)]
+    bypass: bool,
+}
+
+impl DeviceInstance {
+    fn kind(&self) -> DeviceKind {
+        self.state.kind()
+    }
+}
+
+/// A synth's engine values as the card's KNOB POSITIONS. The mapping is the
+/// card's own in both directions, so what is drawn and what is stored
+/// cannot drift; `engine_values_survive_the_trip_through_the_knobs` pins
+/// the round trip.
+fn synth_knobs(params: SynthParams) -> device::SineSynthUi {
+    use daw::params::seq;
+    let at = |param, value| device_norm(DeviceKind::SineSynth, param, value);
+    device::SineSynthUi {
+        gain: at(seq::GAIN, params.gain),
+        attack: at(seq::ATTACK, params.attack_ms),
+        release: at(seq::RELEASE, params.release_ms),
+    }
+}
+
+fn reverb_knobs(params: ReverbParams) -> device::ReverbUi {
+    use daw::params::reverb;
+    let at = |param, value| device_norm(DeviceKind::Reverb, param, value);
+    device::ReverbUi {
+        mix: at(reverb::MIX, params.mix),
+        size: at(reverb::SIZE, params.size),
+        damp: at(reverb::DAMP, params.damp),
+    }
+}
+
+/// The knob position of one engine value, by device kind.
+fn device_norm(kind: DeviceKind, param: u32, value: f32) -> f32 {
+    match kind {
+        DeviceKind::SineSynth => device::sine_synth_norm(param, value),
+        DeviceKind::Reverb => device::reverb_norm(param, value),
+    }
+}
+
+/// The engine value at a knob position — the inverse of [`device_norm`],
+/// and the direction a card applies on the way out. The app never calls it
+/// (a card emits engine units itself), but the round trip is only a round
+/// trip if both halves are reachable.
+#[cfg(test)]
+fn device_value(kind: DeviceKind, param: u32, norm: f32) -> f32 {
+    match kind {
+        DeviceKind::SineSynth => device::sine_synth_value(param, norm),
+        DeviceKind::Reverb => device::reverb_value(param, norm),
+    }
+}
+
+/// Every parameter of a device state as an edit — what a reset, a preset
+/// recall or a freshly loaded device sends, since a card only emits what
+/// the user just moved.
+fn device_edits(state: DeviceState) -> Vec<device::ParamEdit> {
+    state
+        .kind()
+        .spec()
+        .params
+        .iter()
+        .filter_map(|def| {
+            state.value(def.id).map(|value| device::ParamEdit {
+                param: def.id,
+                value,
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 struct Track {
     /// What the lane carries. Fixed at creation: changing a track's kind
     /// would change what every clip on it means, which is a conversion,
@@ -1815,17 +2090,12 @@ struct Track {
     /// Persistent track envelopes. Their values are applied live to the
     /// output node, so drawing a curve never requires a graph swap.
     automation: TrackAutomation,
-    /// The instrument loaded on this track, if any. `None` is a real
-    /// state, not a placeholder: an empty track compiles to NO sequencer
-    /// node and is silent. Loading a device from the browser is what
-    /// gives a track a voice.
-    device: Option<DeviceKind>,
-    /// The effect after the instrument, if any. One slot for now; a chain
-    /// is a Vec of these once a second effect exists.
-    fx: Option<DeviceKind>,
-    synth: device::SineSynthUi,
-    params: SynthParams,
-    reverb: device::ReverbUi,
+    /// The devices on this lane, in SIGNAL order: at most one instrument,
+    /// at the head, then its effects. Empty is a real state, not a
+    /// placeholder — an empty track compiles to no nodes at all and is
+    /// silent. Loading a device from the browser is what gives a track a
+    /// voice.
+    chain: Vec<DeviceInstance>,
 }
 
 impl Track {
@@ -1838,6 +2108,52 @@ impl Track {
             ..Self::default()
         }
     }
+
+    /// The device with this instance id, if this track carries it.
+    fn device(&self, id: u64) -> Option<&DeviceInstance> {
+        self.chain.iter().find(|instance| instance.id == id)
+    }
+
+    fn device_mut(&mut self, id: u64) -> Option<&mut DeviceInstance> {
+        self.chain.iter_mut().find(|instance| instance.id == id)
+    }
+
+    /// The instrument at the head of the chain, if there is one.
+    fn instrument(&self) -> Option<&DeviceInstance> {
+        self.chain
+            .first()
+            .filter(|head| head.kind().is_instrument())
+    }
+
+    /// Put a device on this lane, honouring the ordering rule: AT MOST ONE
+    /// instrument and it heads the chain, effects following in the order
+    /// they were added. Returns the id of the instrument it displaced, if
+    /// any — its wires are dangling pointers and the caller must drop them.
+    fn insert_device(&mut self, instance: DeviceInstance) -> Option<u64> {
+        if !instance.kind().is_instrument() {
+            self.chain.push(instance);
+            return None;
+        }
+        let displaced = self.instrument().map(|old| old.id);
+        // Anything else calling itself an instrument goes too: the rule is
+        // one, not one at the head and others hiding behind it.
+        self.chain.retain(|other| !other.kind().is_instrument());
+        self.chain.insert(0, instance);
+        displaced
+    }
+}
+
+/// Force the ordering rule onto a chain that came from a FILE: keep the
+/// first instrument, move it to the head, drop any others. A hand-edited
+/// project is input like any other, and an instrument in the middle of a
+/// chain would compile to a source the effects before it never see.
+fn sanitize_chain(chain: &mut Vec<DeviceInstance>) {
+    let Some(at) = chain.iter().position(|d| d.kind().is_instrument()) else {
+        return;
+    };
+    let instrument = chain.remove(at);
+    chain.retain(|other| !other.kind().is_instrument());
+    chain.insert(0, instrument);
 }
 
 impl Default for Track {
@@ -1851,15 +2167,108 @@ impl Default for Track {
             pan: 0.0,
             volume: 1.0,
             automation: TrackAutomation::default(),
-            // A fresh track has no instrument. Its knob state is still
-            // here, ready, so loading a device shows sane values rather
-            // than zeros.
+            // A fresh track has no devices at all.
+            chain: Vec::new(),
+        }
+    }
+}
+
+/// Compatibility shape for projects written before a track's devices became
+/// a chain of identified instances.
+///
+/// A v1 track carried ONE instrument and ONE effect as named fields, plus
+/// two copies of the synth's values: `params` in engine units and `synth` as
+/// normalized knob positions. `params` is the one the engine ever read, so
+/// it is the one that survives; `synth` is simply not named here and serde
+/// skips it. The reverb's stored values were already engine units (its
+/// ranges are `0..=1` and the percent was a rendering), so they carry over
+/// as they are.
+///
+/// The instances land with id 0 — the document's id mint lives in
+/// `apply_project_doc`, which is also where the old targets are rewritten.
+#[derive(serde::Deserialize)]
+#[serde(default)]
+struct TrackWire {
+    kind: TrackKind,
+    name: String,
+    height: f32,
+    mute: bool,
+    solo: bool,
+    pan: f32,
+    volume: f32,
+    automation: TrackAutomation,
+    chain: Vec<DeviceInstance>,
+    device: Option<DeviceKind>,
+    fx: Option<DeviceKind>,
+    params: SynthParams,
+    reverb: device::ReverbUi,
+}
+
+impl Default for TrackWire {
+    fn default() -> Self {
+        let track = Track::default();
+        Self {
+            kind: track.kind,
+            name: track.name,
+            height: track.height,
+            mute: track.mute,
+            solo: track.solo,
+            pan: track.pan,
+            volume: track.volume,
+            automation: track.automation,
+            chain: track.chain,
             device: None,
             fx: None,
-            synth: device::SineSynthUi::default(),
             params: SynthParams::default(),
             reverb: device::ReverbUi::default(),
         }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Track {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = TrackWire::deserialize(deserializer)?;
+        let mut chain = wire.chain;
+        if chain.is_empty() {
+            if let Some(kind) = wire.device.filter(|kind| kind.is_instrument()) {
+                chain.push(DeviceInstance {
+                    id: 0,
+                    state: match kind {
+                        DeviceKind::SineSynth => DeviceState::SineSynth(wire.params),
+                        other => DeviceState::new(other),
+                    },
+                    bypass: false,
+                });
+            }
+            if let Some(kind) = wire.fx.filter(|kind| !kind.is_instrument()) {
+                chain.push(DeviceInstance {
+                    id: 0,
+                    state: match kind {
+                        DeviceKind::Reverb => DeviceState::Reverb(ReverbParams {
+                            mix: wire.reverb.mix,
+                            size: wire.reverb.size,
+                            damp: wire.reverb.damp,
+                        }),
+                        other => DeviceState::new(other),
+                    },
+                    bypass: false,
+                });
+            }
+        }
+        Ok(Self {
+            kind: wire.kind,
+            name: wire.name,
+            height: wire.height,
+            mute: wire.mute,
+            solo: wire.solo,
+            pan: wire.pan,
+            volume: wire.volume,
+            automation: wire.automation,
+            chain,
+        })
     }
 }
 
@@ -1885,15 +2294,27 @@ struct ParameterRegistry {
     specs: Vec<ParameterSpec>,
 }
 
-/// The device targets: stable id, the group the picker shows, and the row
-/// of `daw::params` the range and default come from — the same table the
-/// widget and the engine read, so a spec cannot disagree with either.
-const SYNTH_GAIN_TARGET: &str = "synth.gain";
-const SYNTH_ATTACK_TARGET: &str = "synth.attack";
-const SYNTH_RELEASE_TARGET: &str = "synth.release";
-const REVERB_MIX_TARGET: &str = "reverb.mix";
-const REVERB_SIZE_TARGET: &str = "reverb.size";
-const REVERB_DAMP_TARGET: &str = "reverb.damp";
+/// What every device target starts with. A target names an INSTANCE:
+/// `dev.7.reverb.mix` is the mix of the device with id 7, wherever it sits
+/// in whichever chain — which is what lets a chain be reordered without
+/// breaking a wire.
+const DEVICE_TARGET_PREFIX: &str = "dev.";
+
+/// The target id of one parameter of one device instance.
+fn device_target(id: u64, spec: &DeviceSpec, param: &'static str) -> String {
+    format!("{DEVICE_TARGET_PREFIX}{id}.{}.{param}", spec.prefix)
+}
+
+/// The kind-scoped tail of a target: `dev.7.reverb.mix` -> `reverb.mix`,
+/// and a track target is its own tail. What the registry is keyed by, since
+/// every instance of a kind has the same range, unit and name.
+fn target_tail(target: &str) -> &str {
+    target
+        .strip_prefix(DEVICE_TARGET_PREFIX)
+        .map_or(target, |rest| {
+            rest.split_once('.').map_or(rest, |(_, tail)| tail)
+        })
+}
 
 impl Default for ParameterRegistry {
     fn default() -> Self {
@@ -1918,84 +2339,35 @@ impl Default for ParameterRegistry {
             default: 0.0,
             stepped: false,
         });
-        // The device rows come straight from `daw::params` — range and
-        // default are the table's, never restated.
-        let mut from_table = |id: &str,
-                              group: &str,
-                              name: &str,
-                              unit: &str,
-                              table: &'static [daw::params::ParamDef],
-                              row: u32| {
-            let def = daw::params::def(table, row);
-            registry.register(ParameterSpec {
-                id: id.to_owned(),
-                group: group.to_owned(),
-                name: name.to_owned(),
-                unit: unit.to_owned(),
-                min: def.min,
-                max: def.max,
-                default: def.default,
-                stepped: false,
-            });
-        };
-        {
-            use daw::params::{reverb, seq};
-            from_table(
-                SYNTH_GAIN_TARGET,
-                "Synth",
-                "Gain",
-                "",
-                seq::TABLE,
-                seq::GAIN,
-            );
-            from_table(
-                SYNTH_ATTACK_TARGET,
-                "Synth",
-                "Attack",
-                "ms",
-                seq::TABLE,
-                seq::ATTACK,
-            );
-            from_table(
-                SYNTH_RELEASE_TARGET,
-                "Synth",
-                "Release",
-                "ms",
-                seq::TABLE,
-                seq::RELEASE,
-            );
-            from_table(
-                REVERB_MIX_TARGET,
-                "Reverb",
-                "Mix",
-                "",
-                reverb::TABLE,
-                reverb::MIX,
-            );
-            from_table(
-                REVERB_SIZE_TARGET,
-                "Reverb",
-                "Size",
-                "",
-                reverb::TABLE,
-                reverb::SIZE,
-            );
-            from_table(
-                REVERB_DAMP_TARGET,
-                "Reverb",
-                "Damp",
-                "",
-                reverb::TABLE,
-                reverb::DAMP,
-            );
+        // The device rows are walked out of DEVICES: range and default come
+        // from `daw::params`, words from the device's labels. Adding a
+        // device adds its rows here without an edit.
+        for device in DEVICES {
+            for (def, label) in device.params.iter().zip(device.labels) {
+                registry.register(ParameterSpec {
+                    id: format!("{}.{}", device.prefix, def.name),
+                    group: label.group.to_owned(),
+                    name: label.name.to_owned(),
+                    unit: label.unit.to_owned(),
+                    min: def.min,
+                    max: def.max,
+                    default: def.default,
+                    stepped: false,
+                });
+            }
         }
         registry
     }
 }
 
 impl ParameterRegistry {
+    /// The spec behind a target. Device targets are looked up by their
+    /// KIND-scoped tail: the registry holds one row per device parameter,
+    /// not one per instance, so a project with forty reverbs still has
+    /// three reverb specs.
     fn spec(&self, id: &str) -> Option<&ParameterSpec> {
-        self.specs.iter().find(|spec| spec.id == id)
+        let tail = target_tail(id);
+        self.specs.iter().find(|spec| spec.id == tail)
     }
 
     fn register(&mut self, spec: ParameterSpec) {
@@ -2011,244 +2383,88 @@ impl ParameterRegistry {
     }
 }
 
-/// A modulation source's waveform. Timeline-locked on purpose: an LFO is
-/// a pure function of the BEAT, so it renders the same bytes every bounce
-/// and freezes honestly when the transport stops.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-enum ModShape {
-    Sine,
-    Triangle,
-    Saw,
-    Square,
+/// What the user is told when the engine's fixed source or wire tables are
+/// full. Said out loud, because a modulation source that exists in the
+/// strip and drives nothing is the worst kind of bug: it looks like it
+/// works.
+const MOD_SOURCES_FULL: &str = "modulation is full — the engine carries 16 sources and 64 wires; \
+     delete one to add another";
+
+/// One block's modulation readings, lifted out of the engine's snapshot.
+/// The strip draws from HERE rather than from a copy of the same maths run
+/// in the frame loop: the engine is what is sounding, and a scope showing a
+/// parallel simulation is a scope that can lie.
+#[derive(Clone, Copy)]
+struct ModTelemetry {
+    sources: [f32; MAX_MOD_SOURCES],
+    wire_ids: [u64; MAX_MOD_WIRES],
+    wires: [f32; MAX_MOD_WIRES],
 }
 
-impl ModShape {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Sine => "sin",
-            Self::Triangle => "tri",
-            Self::Saw => "saw",
-            Self::Square => "sqr",
-        }
-    }
-
-    fn next(self) -> Self {
-        match self {
-            Self::Sine => Self::Triangle,
-            Self::Triangle => Self::Saw,
-            Self::Saw => Self::Square,
-            Self::Square => Self::Sine,
-        }
-    }
-
-    /// One cycle, phase `0..1`, out `-1..=1`.
-    fn wave(self, phase: f32) -> f32 {
-        let phase = phase.rem_euclid(1.0);
-        match self {
-            Self::Sine => (phase * std::f32::consts::TAU).sin(),
-            Self::Triangle => 1.0 - 4.0 * (phase - 0.5).abs(),
-            Self::Saw => phase * 2.0 - 1.0,
-            Self::Square => {
-                if phase < 0.5 {
-                    1.0
-                } else {
-                    -1.0
-                }
-            }
-        }
-    }
+/// One offerable target: what to send, and what to call it.
+#[derive(Clone, Debug, PartialEq)]
+struct TargetEntry {
+    id: String,
+    group: String,
+    name: String,
 }
 
-/// The musical rate ladder an LFO cycles through, in beats per cycle.
-const MOD_RATES: [f32; 7] = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0];
-
-/// What a modulator IS. An LFO is a function of the beat; a follower is a
-/// function of another track's live level — which is what makes ducking
-/// one track by another a single wire rather than a sidechain feature.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-enum ModKind {
-    Lfo {
-        shape: ModShape,
-        rate_beats: f32,
-        /// FREE runs on the wall clock — it breathes while the transport
-        /// stands still, and it is deliberately NOT deterministic across
-        /// bounces: that is what free means, and the sequencing contract's
-        /// free-running/timeline-locked split applies to modulators too.
-        #[serde(default)]
-        free: bool,
-        /// The free-mode rate, in cycles per second.
-        #[serde(default = "default_hz")]
-        hz: f32,
-    },
-    Follower {
-        track: usize,
-    },
-}
-
-fn default_hz() -> f32 {
-    1.0
-}
-
-/// The free-mode rate ladder, in Hz.
-const MOD_HZ: [f32; 7] = [0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0];
-
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-struct Modulator {
-    id: u64,
-    kind: ModKind,
-}
-
-/// One modulation relationship: a source, a (track, parameter) target, and
-/// a bipolar depth as a FRACTION of the parameter's range — negative depth
-/// is how a follower ducks. Modulation is RELATIVE: it rides on top of the
-/// knob-or-automation value and is clamped into the parameter's range at
-/// the end.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
-struct ModWire {
-    /// Identity, for the view state that follows a wire around — scopes,
-    /// smoothing memory, the expanded editor. Minted from the same counter
-    /// as modulators; a file that lacks ids gets fresh ones on load.
-    id: u64,
-    source: u64,
-    track: usize,
-    target: String,
-    depth: f32,
-    /// Off is BYPASS, not deletion: the relationship stays on the page,
-    /// silent — the A/B every mix decision deserves.
-    enabled: bool,
-    /// While ANY wire is soloed, only soloed wires sound: "what is this
-    /// one actually doing" answered by ear.
-    solo: bool,
-    /// The response curve, `-1..=1` — the same bend the automation editor
-    /// draws, applied to the source before depth.
-    curve: f32,
-    /// Quantize the response into this many steps. 0 or 1 is off; 2+ turns
-    /// a sweep into a ladder — sample-and-hold by shaping.
-    steps: u32,
-    /// One-pole lag toward the target, in milliseconds. 0 is off. Applied
-    /// LAST, so even a quantize ladder can glide between its rungs.
-    smooth_ms: f32,
-}
-
-impl Default for ModWire {
-    fn default() -> Self {
-        Self {
-            id: 0,
-            source: 0,
-            track: 0,
-            target: String::new(),
-            depth: 0.0,
-            enabled: true,
-            solo: false,
-            curve: 0.0,
-            steps: 0,
-            smooth_ms: 0.0,
-        }
-    }
-}
-
-/// The automation editor's bend, shared: `t` in `0..=1`, `bend` in
-/// `-1..=1`, out `0..=1`.
-fn bend_curve(t: f32, bend: f32) -> f32 {
-    let t = t.clamp(0.0, 1.0);
-    if bend >= 0.0 {
-        t.powf(1.0 + bend * 5.0)
-    } else {
-        1.0 - (1.0 - t).powf(1.0 + -bend * 5.0)
-    }
-}
-
-/// One wire's output this frame, in the target's own units: the whole
-/// transform chain, pure over its inputs so every stage is testable.
+/// Every target this track offers RIGHT NOW: the pair every track has,
+/// then one per parameter of every device in its chain, in chain order.
 ///
-/// `source` is the modulator's raw value (LFOs `-1..=1`, followers
-/// `0..=1`), `span` the target's range, `previous` the wire's last output
-/// (the smoothing memory), `dt` the frame time. `muted` — bypass, or
-/// standing down under someone else's solo — aims the chain at ZERO but
-/// still runs the smoothing, so switching a wire off is a glide, not a
-/// click.
-fn wire_contribution(
-    wire: &ModWire,
-    source: f32,
-    span: f32,
-    previous: Option<f32>,
-    dt: f32,
-    muted: bool,
-) -> f32 {
-    let target = if muted {
-        0.0
-    } else {
-        // Curve in normalized space, sign restored by the mapping.
-        let t = (source.clamp(-1.0, 1.0) + 1.0) * 0.5;
-        let mut curved = bend_curve(t, wire.curve);
-        if wire.steps > 1 {
-            let steps = (wire.steps - 1) as f32;
-            curved = (curved * steps).round() / steps;
+/// The picker, the matrix and the MOD strip all enumerate live instances
+/// through here rather than through a per-kind table, which is why a second
+/// reverb gets its own columns instead of sharing the first one's.
+fn track_targets(track: &Track, registry: &ParameterRegistry) -> Vec<TargetEntry> {
+    let mut out = Vec::new();
+    for target in [TRACK_VOLUME_TARGET, TRACK_PAN_TARGET] {
+        if let Some(spec) = registry.spec(target) {
+            out.push(TargetEntry {
+                id: target.to_owned(),
+                group: spec.group.clone(),
+                name: spec.name.clone(),
+            });
         }
-        (curved * 2.0 - 1.0) * wire.depth * span
-    };
-    if wire.smooth_ms <= 0.0 {
-        return target;
     }
-    let previous = previous.unwrap_or(target);
-    let alpha = 1.0 - (-dt * 1000.0 / wire.smooth_ms.max(1.0)).exp();
-    previous + (target - previous) * alpha.clamp(0.0, 1.0)
+    for (at, instance) in track.chain.iter().enumerate() {
+        let device = instance.kind().spec();
+        // Two reverbs on one lane must not read as one: the group carries
+        // a number as soon as the kind repeats, and only then.
+        let same: Vec<usize> = track
+            .chain
+            .iter()
+            .enumerate()
+            .filter(|(_, other)| other.kind() == instance.kind())
+            .map(|(index, _)| index)
+            .collect();
+        let ordinal = same.iter().position(|index| *index == at).unwrap_or(0) + 1;
+        for (def, label) in device.params.iter().zip(device.labels) {
+            out.push(TargetEntry {
+                id: device_target(instance.id, device, def.name),
+                group: if same.len() > 1 {
+                    format!("{} {ordinal}", label.group)
+                } else {
+                    label.group.to_owned()
+                },
+                name: label.name.to_owned(),
+            });
+        }
+    }
+    out
 }
 
 /// The matrix's column list: every (track, parameter) pair that CAN be
-/// modulated, in track order — the applicability rule keeps a synthless
-/// track's synth columns out. Pure, so the matrix's shape is testable.
+/// modulated, in track order. Pure, so the matrix's shape is testable.
 fn matrix_columns(tracks: &[Track], registry: &ParameterRegistry) -> Vec<(usize, String)> {
-    let mut columns = Vec::new();
-    for (index, track) in tracks.iter().enumerate() {
-        for spec in &registry.specs {
-            if target_applies(track, &spec.id) {
-                columns.push((index, spec.id.clone()));
-            }
-        }
-    }
-    columns
-}
-
-/// Sum the wire outputs landing on one (track, target). `outputs` is this
-/// frame's per-wire chain results by wire id.
-fn sum_wires(wires: &[ModWire], outputs: &HashMap<u64, f32>, track: usize, target: &str) -> f32 {
-    wires
+    tracks
         .iter()
-        .filter(|wire| wire.track == track && wire.target == target)
-        .map(|wire| outputs.get(&wire.id).copied().unwrap_or(0.0))
-        .sum()
-}
-
-/// A modulator's value this frame: LFOs from the beat, followers from the
-/// meter ballistics the mixer already runs. Pure over its inputs, which is
-/// what the determinism test leans on.
-/// `beat` drives synced LFOs, `seconds` (the app's monotonic UI clock)
-/// drives free ones, and the meters drive followers.
-fn modulator_value(
-    kind: &ModKind,
-    beat: f32,
-    seconds: f32,
-    meters: &[device::meter::Ballistics],
-) -> f32 {
-    match kind {
-        ModKind::Lfo {
-            shape,
-            rate_beats,
-            free,
-            hz,
-        } => {
-            if *free {
-                shape.wave(seconds * hz.max(1e-3))
-            } else {
-                shape.wave(beat / rate_beats.max(1e-3))
-            }
-        }
-        ModKind::Follower { track } => meters
-            .get(*track)
-            .map_or(0.0, |meter| device::meter::db_to_norm(meter.shown_db)),
-    }
+        .enumerate()
+        .flat_map(|(index, track)| {
+            track_targets(track, registry)
+                .into_iter()
+                .map(move |entry| (index, entry.id))
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -3134,6 +3350,12 @@ struct ProjectDoc {
     next_track_no: [u32; TrackKind::ALL.len()],
 }
 
+/// 2: a track's devices became a chain of identified instances, and targets
+/// became instance-scoped (`dev.7.reverb.mix`). Loading does not branch on
+/// this — the v1 fields are self-identifying and `Track`'s deserializer
+/// converts them — but a file says which shape it was written in.
+const PROJECT_VERSION: u32 = 2;
+
 impl Default for ProjectDoc {
     fn default() -> Self {
         project_doc(&Arrangement::default(), &Transport::default())
@@ -3144,7 +3366,7 @@ impl Default for ProjectDoc {
 /// window.
 fn project_doc(arr: &Arrangement, transport: &Transport) -> ProjectDoc {
     ProjectDoc {
-        version: 1,
+        version: PROJECT_VERSION,
         bpm: transport.bpm,
         beats_per_bar: transport.beats_per_bar,
         beat_unit: transport.beat_unit,
@@ -3163,6 +3385,85 @@ fn project_doc(arr: &Arrangement, transport: &Transport) -> ProjectDoc {
         next_clip_id: arr.next_clip_id,
         next_track_no: arr.next_track_no,
     }
+}
+
+/// Give every device an identity, and rewrite everything that named one the
+/// old way.
+///
+/// A v1 file addressed a device by KIND — `reverb.mix` — because a track
+/// could hold only one of each. v2 addresses an INSTANCE, so the ids are
+/// minted here (the document's counter lives in the caller) and every
+/// target that came in kind-scoped is rewritten to the instance the old
+/// name can only have meant: the track's first device of that kind.
+///
+/// Wires whose target still does not resolve after that are dropped. An
+/// instance id names a device that either exists or never will — unlike a
+/// kind, it cannot come back when the user loads something — so a wire that
+/// misses is a dangling pointer, not a wire waiting for its device.
+fn migrate_devices(fresh: &mut Arrangement) {
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut next = fresh.next_modulator_id;
+    for track in &mut fresh.tracks {
+        sanitize_chain(&mut track.chain);
+        for instance in &mut track.chain {
+            if instance.id == 0 || !seen.insert(instance.id) {
+                instance.id = next;
+                next += 1;
+                seen.insert(instance.id);
+            }
+        }
+    }
+    fresh.next_modulator_id = next;
+
+    // Per track, the first instance of each device prefix — which is
+    // exactly what a v1 kind-scoped target meant.
+    let firsts: Vec<HashMap<&'static str, u64>> = fresh
+        .tracks
+        .iter()
+        .map(|track| {
+            let mut first = HashMap::new();
+            for instance in &track.chain {
+                first
+                    .entry(instance.kind().spec().prefix)
+                    .or_insert(instance.id);
+            }
+            first
+        })
+        .collect();
+    let migrate = |target: &mut String, first: &HashMap<&'static str, u64>| {
+        if target_ref(target).is_some() {
+            return; // already a v2 target, or a track one
+        }
+        let Some((prefix, name)) = target.split_once('.') else {
+            return;
+        };
+        let Some(spec) = device_by_prefix(prefix) else {
+            return;
+        };
+        if let Some(id) = first.get(spec.prefix)
+            && let Some(def) = spec.params.iter().find(|def| def.name == name)
+        {
+            *target = device_target(*id, spec, def.name);
+        }
+    };
+    for (track, first) in fresh.tracks.iter_mut().zip(&firsts) {
+        for envelope in &mut track.automation.envelopes {
+            migrate(&mut envelope.target, first);
+        }
+    }
+    for wire in &mut fresh.mod_wires {
+        if let Some(first) = firsts.get(wire.track) {
+            migrate(&mut wire.target, first);
+        }
+    }
+    let mut wires = std::mem::take(&mut fresh.mod_wires);
+    wires.retain(|wire| {
+        fresh
+            .tracks
+            .get(wire.track)
+            .is_some_and(|track| target_applies(track, &wire.target))
+    });
+    fresh.mod_wires = wires;
 }
 
 /// A document becomes the song. The arrangement comes back FRESH — no
@@ -3254,10 +3555,20 @@ fn apply_project_doc(doc: ProjectDoc, arr: &mut Arrangement, transport: &mut Tra
         .map(|wire| wire.id)
         .max()
         .unwrap_or(0);
+    // Devices draw from the same mint, so the counter has to clear them too
+    // or a fresh source would be born with a device's id.
+    let highest_device = fresh
+        .tracks
+        .iter()
+        .flat_map(|track| &track.chain)
+        .map(|instance| instance.id)
+        .max()
+        .unwrap_or(0);
     fresh.next_modulator_id = doc
         .next_modulator_id
         .max(highest_modulator + 1)
-        .max(highest_wire + 1);
+        .max(highest_wire + 1)
+        .max(highest_device + 1);
     // Wires from before wires had identity (or a hand-edited file with
     // duplicates) get fresh ids: the view state that follows a wire around
     // must never follow two.
@@ -3269,6 +3580,7 @@ fn apply_project_doc(doc: ProjectDoc, arr: &mut Arrangement, transport: &mut Tra
             seen.insert(wire.id);
         }
     }
+    migrate_devices(&mut fresh);
     fresh.grid = doc.grid.min(GRID_BEATS.len() - 1);
     let highest = fresh
         .clips
@@ -3790,11 +4102,50 @@ impl Arrangement {
         true
     }
 
-    /// Mint a modulator. LFOs arrive at a whole-bar rate, sine — the shape
-    /// everyone reaches for first.
-    fn add_lfo(&mut self) -> u64 {
+    /// The document's ONE id mint. Devices, modulators and wires all draw
+    /// from it, so an id is unique across the whole document — which is
+    /// what lets a target name a device without naming its position.
+    fn mint_id(&mut self) -> u64 {
         let id = self.next_modulator_id;
         self.next_modulator_id += 1;
+        id
+    }
+
+    /// Drop everything that pointed at a device that is gone: its wires and
+    /// its automation. A wire to a retired instance is not a relationship,
+    /// it is a dangling pointer — the same rule `remove_modulator` follows.
+    fn forget_device(&mut self, track: usize, id: u64) {
+        let names_it = |target: &str| matches!(target_ref(target), Some(TargetRef::Device { id: at, .. }) if at == id);
+        self.mod_wires.retain(|wire| !names_it(&wire.target));
+        if let Some(t) = self.tracks.get_mut(track) {
+            t.automation
+                .envelopes
+                .retain(|envelope| !names_it(&envelope.target));
+        }
+    }
+
+    /// Whether another modulator would fit. The ENGINE carries a fixed
+    /// number of sources (its telemetry is a `Copy` array), and a source
+    /// past that cap would be silently dead — drawn in the strip, wired in
+    /// the matrix, driving nothing. Refusing at the door is the honest
+    /// failure; a cap nobody is told about is the dishonest one.
+    fn modulators_full(&self) -> bool {
+        self.modulators.len() >= MAX_MOD_SOURCES
+    }
+
+    /// Whether another wire would fit — the same cap story as
+    /// [`Self::modulators_full`], for the same reason.
+    fn wires_full(&self) -> bool {
+        self.mod_wires.len() >= MAX_MOD_WIRES
+    }
+
+    /// Mint a modulator. LFOs arrive at a whole-bar rate, sine — the shape
+    /// everyone reaches for first. `None` when the engine is full.
+    fn add_lfo(&mut self) -> Option<u64> {
+        if self.modulators_full() {
+            return None;
+        }
+        let id = self.mint_id();
         self.modulators.push(Modulator {
             id,
             kind: ModKind::Lfo {
@@ -3804,24 +4155,30 @@ impl Arrangement {
                 hz: 1.0,
             },
         });
-        id
+        Some(id)
     }
 
-    /// A follower listening to `track`'s live level.
-    fn add_follower(&mut self, track: usize) -> u64 {
-        let id = self.next_modulator_id;
-        self.next_modulator_id += 1;
+    /// A follower listening to `track`'s live level. `None` when full.
+    fn add_follower(&mut self, track: usize) -> Option<u64> {
+        if self.modulators_full() {
+            return None;
+        }
+        let id = self.mint_id();
         self.modulators.push(Modulator {
             id,
             kind: ModKind::Follower { track },
         });
-        id
+        Some(id)
     }
 
     /// The matrix's one-click verb: wire `source` to (track, target) if no
     /// such wire exists. Returns the new wire's id, or None when one is
-    /// already there — the matrix never doubles a relationship silently.
+    /// already there — the matrix never doubles a relationship silently —
+    /// or when the engine has no room for another wire.
     fn add_wire(&mut self, source: u64, track: usize, target: &str) -> Option<u64> {
+        if self.wires_full() {
+            return None;
+        }
         if self
             .mod_wires
             .iter()
@@ -3829,8 +4186,7 @@ impl Arrangement {
         {
             return None;
         }
-        let id = self.next_modulator_id;
-        self.next_modulator_id += 1;
+        let id = self.mint_id();
         self.mod_wires.push(ModWire {
             id,
             source,
@@ -4736,10 +5092,17 @@ fn shape_hash(tracks: &[Track]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for t in tracks {
         t.kind.hash(&mut hasher);
-        t.device.is_some().hash(&mut hasher);
-        t.fx.is_some().hash(&mut hasher);
         t.mute.hash(&mut hasher);
         t.solo.hash(&mut hasher);
+        // The chain by IDENTITY and order: adding, removing, reordering or
+        // bypassing a device all change which nodes exist and how they are
+        // wired, and none of that can travel as a parameter letter.
+        t.chain.len().hash(&mut hasher);
+        for instance in &t.chain {
+            instance.id.hash(&mut hasher);
+            instance.kind().hash(&mut hasher);
+            instance.bypass.hash(&mut hasher);
+        }
     }
     hasher.finish()
 }
@@ -5081,68 +5444,63 @@ fn automation_lane(
 }
 
 fn parameter_base(track: &Track, target: &str, spec: &ParameterSpec) -> f32 {
-    match target {
-        TRACK_VOLUME_TARGET => track.volume,
-        TRACK_PAN_TARGET => track.pan,
-        SYNTH_GAIN_TARGET => track.params.gain,
-        SYNTH_ATTACK_TARGET => track.params.attack_ms,
-        SYNTH_RELEASE_TARGET => track.params.release_ms,
-        REVERB_MIX_TARGET => track.reverb.mix,
-        REVERB_SIZE_TARGET => track.reverb.size,
-        REVERB_DAMP_TARGET => track.reverb.damp,
-        _ => spec.default,
+    use daw::params::pan;
+    match target_ref(target) {
+        Some(TargetRef::TrackOutput(pan::GAIN)) => track.volume,
+        Some(TargetRef::TrackOutput(_)) => track.pan,
+        Some(TargetRef::Device { id, param }) => track
+            .device(id)
+            .and_then(|instance| instance.state.value(param))
+            .unwrap_or(spec.default),
+        None => spec.default,
     }
 }
 
-/// Whether a target means anything ON THIS TRACK: a synth curve on a track
-/// with no synth would automate silence, and the picker should not offer
-/// it. Track-group targets apply everywhere.
+/// Whether a target means anything ON THIS TRACK: a curve aimed at a device
+/// this lane does not carry would automate silence, and the picker should
+/// not offer it. Track-group targets apply everywhere.
 fn target_applies(track: &Track, target: &str) -> bool {
-    target_applies_kinds(track.device, track.fx, target)
-}
-
-/// The same rule over bare device kinds, for callers holding copies rather
-/// than the track itself.
-fn target_applies_kinds(device: Option<DeviceKind>, fx: Option<DeviceKind>, target: &str) -> bool {
-    match target {
-        SYNTH_GAIN_TARGET | SYNTH_ATTACK_TARGET | SYNTH_RELEASE_TARGET => {
-            device == Some(DeviceKind::SineSynth)
-        }
-        REVERB_MIX_TARGET | REVERB_SIZE_TARGET | REVERB_DAMP_TARGET => {
-            fx == Some(DeviceKind::Reverb)
-        }
-        _ => true,
+    match target_ref(target) {
+        Some(TargetRef::TrackOutput(_)) => true,
+        Some(TargetRef::Device { id, param }) => track
+            .device(id)
+            .is_some_and(|instance| instance.state.value(param).is_some()),
+        None => false,
     }
 }
 
-/// Where a target's automated value lands in the ENGINE: which of the
-/// app's per-track node id vecs, and which ParamChange id on that node.
-/// One function, total over the registry, so playback dispatch cannot
-/// silently miss a registered target — the test walks every spec through
-/// it.
+/// Where a target's automated value lands in the ENGINE: which node, and
+/// which `ParamChange` id on it. One function, total over every target the
+/// app can build, so playback dispatch cannot silently miss one — the test
+/// walks the whole device table through it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum TargetNode {
-    /// The track's output stage (`pan_ids`).
-    Output,
-    /// The track's instrument (`seq_ids`).
-    Instrument,
-    /// The track's effect (`fx_ids`).
-    Effect,
+enum TargetRef {
+    /// The track's output stage (`pans`), which every audible track has.
+    TrackOutput(u32),
+    /// A device INSTANCE, by the id its target names.
+    Device { id: u64, param: u32 },
 }
 
-fn target_binding(target: &str) -> Option<(TargetNode, u32)> {
-    use daw::params::{pan, reverb, seq};
+fn target_ref(target: &str) -> Option<TargetRef> {
+    use daw::params::pan;
     match target {
-        TRACK_VOLUME_TARGET => Some((TargetNode::Output, pan::GAIN)),
-        TRACK_PAN_TARGET => Some((TargetNode::Output, pan::PAN)),
-        SYNTH_GAIN_TARGET => Some((TargetNode::Instrument, seq::GAIN)),
-        SYNTH_ATTACK_TARGET => Some((TargetNode::Instrument, seq::ATTACK)),
-        SYNTH_RELEASE_TARGET => Some((TargetNode::Instrument, seq::RELEASE)),
-        REVERB_MIX_TARGET => Some((TargetNode::Effect, reverb::MIX)),
-        REVERB_SIZE_TARGET => Some((TargetNode::Effect, reverb::SIZE)),
-        REVERB_DAMP_TARGET => Some((TargetNode::Effect, reverb::DAMP)),
-        _ => None,
+        TRACK_VOLUME_TARGET => return Some(TargetRef::TrackOutput(pan::GAIN)),
+        TRACK_PAN_TARGET => return Some(TargetRef::TrackOutput(pan::PAN)),
+        _ => {}
     }
+    // `dev.<id>.<prefix>.<param>`. A target the tables do not recognize is
+    // no target at all — a renamed prefix orphans its wires rather than
+    // aiming them at whatever now sits in that slot.
+    let (id, rest) = target.strip_prefix(DEVICE_TARGET_PREFIX)?.split_once('.')?;
+    let (prefix, name) = rest.split_once('.')?;
+    let param = device_by_prefix(prefix)?
+        .params
+        .iter()
+        .find(|def| def.name == name)?;
+    Some(TargetRef::Device {
+        id: id.parse().ok()?,
+        param: param.id,
+    })
 }
 
 /// Registry-backed chooser. Group headings and stable ids are already part
@@ -5186,35 +5544,51 @@ fn automation_target_picker(
             ui.ctx()
                 .data_mut(|data| data.insert_temp(query_id, query.clone()));
             let query = query.trim().to_lowercase();
-            let mut last_group = "";
-            for spec in &registry.specs {
-                if track.is_some_and(|track| !target_applies(track, &spec.id)) {
-                    continue;
-                }
+            // With a track under the hand the list is that lane's LIVE
+            // targets, instance ids and all. Without one there is no chain
+            // to name, so only the pair every track has can be offered.
+            let entries = match track {
+                Some(track) => track_targets(track, registry),
+                None => [TRACK_VOLUME_TARGET, TRACK_PAN_TARGET]
+                    .into_iter()
+                    .filter_map(|id| {
+                        registry.spec(id).map(|spec| TargetEntry {
+                            id: id.to_owned(),
+                            group: spec.group.clone(),
+                            name: spec.name.clone(),
+                        })
+                    })
+                    .collect(),
+            };
+            let mut last_group = String::new();
+            for entry in entries {
                 if !query.is_empty()
-                    && !spec.name.to_lowercase().contains(&query)
-                    && !spec.group.to_lowercase().contains(&query)
-                    && !spec.id.to_lowercase().contains(&query)
+                    && !entry.name.to_lowercase().contains(&query)
+                    && !entry.group.to_lowercase().contains(&query)
+                    && !entry.id.to_lowercase().contains(&query)
                 {
                     continue;
                 }
-                if spec.group != last_group {
+                if entry.group != last_group {
                     if !last_group.is_empty() {
                         ui.separator();
                     }
-                    ui.label(&spec.group);
-                    last_group = &spec.group;
+                    ui.label(&entry.group);
+                    last_group = entry.group.clone();
                 }
-                let suffix = if spec.unit.is_empty() {
+                let unit = registry
+                    .spec(&entry.id)
+                    .map_or_else(String::new, |spec| spec.unit.clone());
+                let suffix = if unit.is_empty() {
                     String::new()
                 } else {
-                    format!("  {}", spec.unit)
+                    format!("  {unit}")
                 };
                 if ui
-                    .selectable_label(target == &spec.id, format!("{}{}", spec.name, suffix))
+                    .selectable_label(target == &entry.id, format!("{}{}", entry.name, suffix))
                     .clicked()
                 {
-                    *target = spec.id.clone();
+                    *target = entry.id.clone();
                     egui::Popup::close_all(ui.ctx());
                 }
             }
@@ -9732,9 +10106,10 @@ struct ModStrip<'a> {
     track: Option<usize>,
     /// All track names, for follower tiles and the follower verb.
     track_names: &'a [String],
-    /// The selected track's device kinds, for target applicability.
-    device: Option<DeviceKind>,
-    fx: Option<DeviceKind>,
+    /// What the selected track can be wired TO, gathered by the caller for
+    /// the same reason the names are: enumerating it needs the track, and
+    /// the cards already hold it.
+    targets: Vec<TargetEntry>,
     modulators: &'a mut Vec<Modulator>,
     wires: &'a mut Vec<ModWire>,
     next_id: &'a mut u64,
@@ -10054,13 +10429,12 @@ fn mod_strip(ui: &mut egui::Ui, theme: &Theme, strip: ModStrip<'_>, collapsed: &
                         egui::Popup::menu(&wire_response)
                             .id(wire_id.with("popup"))
                             .show(|ui| {
-                                for spec in &strip.registry.specs {
-                                    if !target_applies_kinds(strip.device, strip.fx, &spec.id) {
-                                        continue;
-                                    }
-                                    if ui.button(format!("{} {}", spec.group, spec.name)).clicked()
+                                for entry in &strip.targets {
+                                    if ui
+                                        .button(format!("{} {}", entry.group, entry.name))
+                                        .clicked()
                                     {
-                                        add_wire = Some((modulator.id, spec.id.clone()));
+                                        add_wire = Some((modulator.id, entry.id.clone()));
                                         egui::Popup::close_all(ui.ctx());
                                     }
                                 }
@@ -10421,10 +10795,13 @@ fn rate_label(rate_beats: f32) -> String {
     }
 }
 
+/// What the device region produced this frame, by the INSTANCE that
+/// produced it. Two cards can share a parameter numbering without sharing a
+/// node, and an edit that lost its instance would send a reverb's mix to a
+/// synth's gain.
 #[derive(Default)]
 struct DeviceEdits {
-    synth: Vec<device::ParamEdit>,
-    fx: Vec<device::ParamEdit>,
+    edits: Vec<(u64, Vec<device::ParamEdit>)>,
 }
 
 /// The collapsed MOD strip's slim tab, and the expanded strip's width.
@@ -10434,8 +10811,7 @@ const MOD_STRIP_W: f32 = 336.0;
 fn device_body(
     ui: &mut egui::Ui,
     theme: &Theme,
-    synth: Option<&mut device::SineSynthUi>,
-    fx: Option<&mut device::ReverbUi>,
+    chain: &[DeviceInstance],
     strip: ModStrip<'_>,
     mod_collapsed: &mut bool,
 ) -> DeviceEdits {
@@ -10524,18 +10900,32 @@ fn device_body(
                 .show(ui, |ui| {
                     ui.horizontal_top(|ui| {
                         // The selected track's chain, left to right in
-                        // signal order: instrument first, then its effect.
-                        // Edits leave as (param id, natural value) data;
-                        // the app layer turns them into engine letters
-                        // addressed to THIS track's nodes.
-                        if synth.is_none() && fx.is_none() {
+                        // signal order: instrument first, then its effects.
+                        // Edits leave as (param id, natural value) data
+                        // tagged with the instance that made them; the app
+                        // layer turns them into engine letters.
+                        if chain.is_empty() {
                             daw::ui::kit::empty_state(ui, theme, DEVICE_EMPTY);
                         }
-                        if let Some(synth) = synth {
-                            edits.synth = device::sine_synth_card(ui, theme, synth);
-                        }
-                        if let Some(fx) = fx {
-                            edits.fx = device::reverb_card(ui, theme, fx);
+                        for instance in chain {
+                            // The card speaks normalized knob positions and
+                            // the instance stores engine units, so the
+                            // position is derived here and thrown away: the
+                            // stored value is the one truth, and the edit
+                            // coming back out is already in engine units.
+                            let made = match instance.state {
+                                DeviceState::SineSynth(params) => {
+                                    let mut knobs = synth_knobs(params);
+                                    device::sine_synth_card(ui, theme, &mut knobs)
+                                }
+                                DeviceState::Reverb(params) => {
+                                    let mut knobs = reverb_knobs(params);
+                                    device::reverb_card(ui, theme, &mut knobs)
+                                }
+                            };
+                            if !made.is_empty() {
+                                edits.edits.push((instance.id, made));
+                            }
                         }
                     });
                 });
@@ -10698,8 +11088,10 @@ fn seq_notes(clips: &[Clip]) -> Vec<SeqNote> {
 /// than derived later.
 #[derive(Debug, Default)]
 struct GraphNodes {
-    seqs: Vec<Option<NodeId>>,
-    fx: Vec<Option<NodeId>>,
+    /// Every device instance that reached the schedule, by INSTANCE id —
+    /// not by position, which is what lets a letter survive a chain
+    /// reorder. A bypassed device, or one on a muted track, is absent.
+    devices: HashMap<u64, NodeId>,
     pans: Vec<Option<NodeId>>,
 }
 
@@ -10734,9 +11126,8 @@ fn build_graph_spec(
 ) -> (GraphSpec, GraphNodes) {
     let mut spec = GraphSpec::default();
     let mixer = spec.push(NodeSpec::Mixer { gain: 1.0 });
-    let mut fx_ids: Vec<Option<NodeId>> = vec![None; tracks.len()];
     let mut pan_ids: Vec<Option<NodeId>> = vec![None; tracks.len()];
-    let mut seqs: Vec<Option<NodeId>> = vec![None; tracks.len()];
+    let mut devices: HashMap<u64, NodeId> = HashMap::new();
     for (i, track) in tracks.iter().enumerate() {
         if !track_audible(tracks, i) {
             continue;
@@ -10744,9 +11135,15 @@ fn build_graph_spec(
         let mut sources = Vec::new();
         match track.kind {
             TrackKind::Midi => {
-                if track.device.is_none() {
+                // The instrument heads the chain, so it is the only device
+                // that can be the lane's source. Absent or bypassed, the
+                // lane makes no sound and compiles to nothing at all.
+                let Some(head) = track.instrument().filter(|head| !head.bypass) else {
                     continue;
-                }
+                };
+                let DeviceState::SineSynth(params) = head.state else {
+                    continue;
+                };
                 let seq = spec.push(NodeSpec::Seq {
                     notes: clips
                         .get(i)
@@ -10754,9 +11151,9 @@ fn build_graph_spec(
                         .unwrap_or_default(),
                     subloops: Vec::new(),
                     loop_len_beats,
-                    params: track.params,
+                    params,
                 });
-                seqs[i] = Some(seq);
+                devices.insert(head.id, seq);
                 sources.push(seq);
             }
             TrackKind::Audio => {
@@ -10777,21 +11174,31 @@ fn build_graph_spec(
         let Some(source) = mix_sources(&mut spec, sources) else {
             continue;
         };
-        // The effect sits between this track's private source bus and pan;
-        // the master never leaks into a track insert.
-        let tail = match track.fx {
-            Some(DeviceKind::Reverb) => {
-                let rev = spec.push(NodeSpec::Reverb {
-                    size: track.reverb.size,
-                    damp: track.reverb.damp,
-                    mix: track.reverb.mix,
-                });
-                spec.connect(source, rev);
-                fx_ids[i] = Some(rev);
-                rev
+        // The effects sit between this track's private source bus and pan,
+        // each chaining onto the one before; the master never leaks into a
+        // track insert. A bypassed effect leaves the schedule the way a
+        // muted track does, and the chain closes over it.
+        let mut tail = source;
+        for instance in &track.chain {
+            if instance.bypass {
+                continue;
             }
-            _ => source,
-        };
+            match instance.state {
+                // The instrument is already the source, and an instrument
+                // anywhere else in a chain shapes nothing.
+                DeviceState::SineSynth(_) => {}
+                DeviceState::Reverb(params) => {
+                    let rev = spec.push(NodeSpec::Reverb {
+                        size: params.size,
+                        damp: params.damp,
+                        mix: params.mix,
+                    });
+                    spec.connect(tail, rev);
+                    devices.insert(instance.id, rev);
+                    tail = rev;
+                }
+            }
+        }
         // Pan is ALWAYS a node, even at dead center, and that is
         // deliberate: it gives every track's pan a permanent address,
         // so turning the header knob is a param letter rather than a
@@ -10819,11 +11226,84 @@ fn build_graph_spec(
     (
         spec,
         GraphNodes {
-            seqs,
-            fx: fx_ids,
+            devices,
             pans: pan_ids,
         },
     )
+}
+
+/// Resolve the arrangement's modulation into the form the ENGINE runs:
+/// every wire's `(track, parameter)` target turned into a concrete node and
+/// `ParamChange` id, with the parameter's range and its base value along
+/// for the ride.
+///
+/// This is the only place that knows both halves — the wire's target string
+/// and the node ids `build_graph_spec` just minted — so it is where the two
+/// meet. The same applicability rules the picker enforces apply here: a
+/// wire aimed at a device its track does not carry compiles to nothing
+/// rather than lettering some other node.
+///
+/// Every modulator is carried, wired or not, so telemetry indices line up
+/// with the strip's list.
+fn build_mod_spec(
+    tracks: &[Track],
+    modulators: &[Modulator],
+    wires: &[ModWire],
+    registry: &ParameterRegistry,
+    nodes: &GraphNodes,
+) -> ModSpec {
+    let mut out = Vec::new();
+    for wire in wires {
+        let Some(track) = tracks.get(wire.track) else {
+            continue;
+        };
+        let target = wire.target.as_str();
+        let Some(binding) = target_ref(target) else {
+            continue;
+        };
+        if !target_applies(track, target) {
+            continue;
+        }
+        let Some(spec) = registry.spec(target) else {
+            continue;
+        };
+        // A muted track compiles to no nodes at all, and so does a
+        // bypassed device; their wires go with them.
+        let (node, param) = match binding {
+            TargetRef::TrackOutput(param) => {
+                let Some(Some(node)) = nodes.pans.get(wire.track).copied() else {
+                    continue;
+                };
+                (node, param)
+            }
+            TargetRef::Device { id, param } => {
+                let Some(node) = nodes.devices.get(&id).copied() else {
+                    continue;
+                };
+                (node, param)
+            }
+        };
+        out.push(WireSpec {
+            id: wire.id,
+            source: wire.source,
+            node,
+            param,
+            min: spec.min,
+            max: spec.max,
+            // The knob-or-automation value as of this compile. Letters
+            // replace it live, so this only has to be right for the first
+            // block after a swap — but being wrong for one block is an
+            // audible jump, so it is seeded properly.
+            base: parameter_base(track, target, spec),
+            chain: wire.chain(),
+            enabled: wire.enabled,
+            solo: wire.solo,
+        });
+    }
+    ModSpec {
+        sources: modulators.to_vec(),
+        wires: out,
+    }
 }
 
 /// Should the schedule be rebuilt this frame? Only when what the graph is
@@ -10947,13 +11427,12 @@ struct App {
     notice: Option<String>,
     /// Live numbers for the bar, refreshed from telemetry each frame.
     hud: Option<EngineHud>,
-    /// The Seq node of each track in the CURRENT schedule, by track index.
-    /// Every recompile yields fresh ids, so this is re-captured on every
-    /// swap — a letter must never be addressed to a retired node.
-    seq_ids: Vec<Option<NodeId>>,
-    /// Each track's EFFECT node in the current schedule, by track index.
-    /// Re-captured on every swap, exactly like `seq_ids`.
-    fx_ids: Vec<Option<NodeId>>,
+    /// The node each DEVICE INSTANCE compiled to in the current schedule,
+    /// by instance id. Every recompile yields fresh ids, so this is
+    /// re-captured on every swap — a letter must never be addressed to a
+    /// retired node — and a device that left the schedule (bypassed, or on
+    /// a muted track) is simply absent.
+    device_nodes: HashMap<u64, NodeId>,
     /// Each track's PAN node, by track index. Every instrument track has
     /// one, so a header knob is always addressable without a recompile.
     pan_ids: Vec<Option<NodeId>>,
@@ -10962,16 +11441,27 @@ struct App {
     /// project all reconcile through one door — whoever moved pan, the
     /// letter goes out once and only on a real change.
     sent_pan: Vec<f32>,
-    /// The app's monotonic UI clock, in seconds — what FREE modulators run
-    /// on. Never rewinds, never follows the transport.
+    /// The app's monotonic UI clock, in seconds — what free modulators run
+    /// on WHEN THE ENGINE IS OFF. With a stream up, free modulators ride the
+    /// engine's sample clock instead, which is what makes a bounce of one
+    /// repeat.
     clock_seconds: f32,
-    /// This frame's modulator values by id — LFOs from the beat, followers
-    /// from the meters — evaluated once, read by playback dispatch and the
-    /// MOD strip's animation alike.
+    /// This frame's modulator values by id, for the strip's animation.
+    /// Read from engine telemetry while a stream runs, and evaluated here
+    /// only when there is no engine to ask.
     mod_values: HashMap<u64, f32>,
-    /// Each wire's chain output this frame, by wire id — also the
-    /// smoothing memory, which is why it persists across frames.
+    /// Each wire's chain output this frame, by wire id — what the scopes
+    /// draw. Engine-fed while a stream runs.
     wire_outputs: HashMap<u64, f32>,
+    /// This block's modulation telemetry, picked up by `pump_engine` and
+    /// consumed by `pump_modulators` a moment later. `None` means no engine
+    /// answered this frame, and the strip falls back to drawing its own
+    /// arithmetic so it still moves with the stream powered off.
+    mod_telemetry: Option<ModTelemetry>,
+    /// The wire chains and source definitions last SENT to the engine —
+    /// the same only-on-change door `sent_pan` is, for the same reason.
+    sent_mod_wires: HashMap<u64, daw::audio::modulation::WireEdit>,
+    sent_mod_sources: HashMap<u64, ModKind>,
     /// A few seconds of each wire's output, for the scope in its expanded
     /// row. View state; pruned when the wire goes.
     wire_scopes: HashMap<u64, std::collections::VecDeque<f32>>,
@@ -10998,7 +11488,7 @@ struct App {
     /// The graph's SHAPE as compiled: (metronome, loop_len_beats, tracks).
     /// A change here swaps the schedule immediately, no debounce — the graph
     /// gained or lost a node, which no param letter can express.
-    graph_key: (bool, Option<f64>, usize, u64, u64),
+    graph_key: (bool, Option<f64>, usize, u64, u64, u64),
     /// The transport loop last sent, in samples — resent only on change, so
     /// brace drags, Ctrl+L and tempo changes all reconcile through one door.
     sent_loop: Option<(u64, u64)>,
@@ -11095,13 +11585,15 @@ impl App {
             engine: None,
             notice: None,
             hud: None,
-            seq_ids: Vec::new(),
-            fx_ids: Vec::new(),
+            device_nodes: HashMap::new(),
             pan_ids: Vec::new(),
             sent_pan: Vec::new(),
             clock_seconds: 0.0,
             mod_values: HashMap::new(),
             wire_outputs: HashMap::new(),
+            mod_telemetry: None,
+            sent_mod_wires: HashMap::new(),
+            sent_mod_sources: HashMap::new(),
             wire_scopes: HashMap::new(),
             expanded_wire: None,
             matrix_open: false,
@@ -11110,7 +11602,7 @@ impl App {
             meters: Vec::new(),
             compiled_clips: Vec::new(),
             last_compile: None,
-            graph_key: (false, None, 0, 0, 0),
+            graph_key: (false, None, 0, 0, 0, 0),
             sent_loop: None,
         }
     }
@@ -11320,11 +11812,15 @@ impl App {
             "project.new" => actions.push(UiAction::NewProject),
             "mod.matrix" => self.matrix_open = !self.matrix_open,
             "mod.lfo" => {
-                self.arrangement.add_lfo();
+                if self.arrangement.add_lfo().is_none() {
+                    self.notice = Some(MOD_SOURCES_FULL.to_owned());
+                }
             }
             "mod.follower" => {
-                if let Some(track) = self.arrangement.selected {
-                    self.arrangement.add_follower(track);
+                if let Some(track) = self.arrangement.selected
+                    && self.arrangement.add_follower(track).is_none()
+                {
+                    self.notice = Some(MOD_SOURCES_FULL.to_owned());
                 }
             }
             "session.back" => actions.push(UiAction::BackToArrangement),
@@ -11413,11 +11909,13 @@ impl App {
             "view.theme" => self.skin.open(),
 
             "device.reset" => {
-                if let Some(t) = self.arrangement.active_track() {
-                    let fresh = device::SineSynthUi::default();
-                    self.arrangement.tracks[t].synth = fresh;
-                    let edits = device::sine_synth_edits(&fresh);
-                    self.apply_param_edits(t, &edits);
+                // The lane's instrument, which is the card the verb has
+                // always meant: the head of the chain.
+                if let Some(t) = self.arrangement.active_track()
+                    && let Some(instance) = self.arrangement.tracks[t].instrument().copied()
+                {
+                    let fresh = DeviceState::new(instance.kind());
+                    self.apply_device_edits(t, instance.id, &device_edits(fresh));
                 }
             }
 
@@ -11515,28 +12013,35 @@ impl App {
     /// visible and undoable by loading it somewhere else.
     fn load_device(&mut self, item: BrowserItem) {
         let track = self.arrangement.active_track().unwrap_or(0);
+        let Some(t) = self.arrangement.tracks.get(track) else {
+            return;
+        };
+        // An audio track's sound IS its material — an instrument on one
+        // would head a chain the graph never reads. Refuse in words rather
+        // than silently.
+        if item.load.is_instrument() && !t.kind.takes_instrument() {
+            let name = t.name.clone();
+            self.notice = Some(format!(
+                "{name} is an audio track — no slot for a {}",
+                item.load.spec().name
+            ));
+            return;
+        }
+        // Fresh knobs for a fresh device, and the engine hears them on the
+        // next swap — which the shape change forces immediately.
+        let instance = DeviceInstance {
+            id: self.arrangement.mint_id(),
+            state: DeviceState::new(item.load),
+            bypass: false,
+        };
         let Some(t) = self.arrangement.tracks.get_mut(track) else {
             return;
         };
-        // Each device fills its own slot: an effect never displaces the
-        // instrument that feeds it.
-        if item.load.is_instrument() {
-            // An audio track's sound IS its material — an instrument on
-            // one would fill a slot the graph never reads. Refuse in
-            // words rather than silently.
-            if !t.kind.takes_instrument() {
-                let name = t.name.clone();
-                self.notice = Some(format!("{name} is an audio track — no instrument slot"));
-                return;
-            }
-            t.device = Some(item.load);
-            // Fresh knobs for a fresh instrument, and the engine hears them
-            // on the next swap — which the shape change forces immediately.
-            t.synth = device::SineSynthUi::default();
-            t.params = SynthParams::default();
-        } else {
-            t.fx = Some(item.load);
-            t.reverb = device::ReverbUi::default();
+        // An effect joins the end of the chain; an instrument takes the
+        // head, displacing whatever instrument was there. What the old one
+        // was wired to is now a dangling pointer, so it goes with it.
+        if let Some(displaced) = t.insert_device(instance) {
+            self.arrangement.forget_device(track, displaced);
         }
         self.arrangement.selected = Some(track);
     }
@@ -12263,6 +12768,30 @@ impl App {
         shape_hash(&self.arrangement.tracks)
     }
 
+    /// The SHAPE of the modulation: which wires exist, what each drives,
+    /// which sources exist and of what kind. Not the continuous values —
+    /// depth, curve, steps, lag and an LFO's rate all ride live letters, so
+    /// folding them in here would swap the whole schedule on every frame of
+    /// a knob drag.
+    fn mod_shape_hash(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for wire in &self.arrangement.mod_wires {
+            wire.id.hash(&mut hasher);
+            wire.source.hash(&mut hasher);
+            wire.track.hash(&mut hasher);
+            wire.target.hash(&mut hasher);
+        }
+        // Ids in ORDER: telemetry lines sources up by position, so a
+        // reorder has to reach the engine even though no source changed.
+        // What a source IS travels as a live letter, follower track and
+        // all, so it is deliberately not hashed.
+        for modulator in &self.arrangement.modulators {
+            modulator.id.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
     fn start_engine(&mut self) {
         if self.engine.is_some() {
             return;
@@ -12284,8 +12813,7 @@ impl App {
     fn stop_engine(&mut self) {
         self.engine = None;
         self.hud = None;
-        self.seq_ids.clear();
-        self.fx_ids.clear();
+        self.device_nodes.clear();
         self.sent_loop = None;
         self.last_compile = None;
         self.transport.playing = false;
@@ -12302,12 +12830,21 @@ impl App {
         // its track's timeline. `compiled_clips` stores the same thing, so
         // the dirty check compares like with like.
         let playing = self.arrangement.effective_clips();
-        let (spec, nodes) = build_graph_spec(
+        let (mut spec, nodes) = build_graph_spec(
             &self.arrangement.tracks,
             &playing,
             loop_len,
             self.transport.metronome,
         );
+        // Modulation rides INSIDE the schedule, so it reaches the callback
+        // and the offline renderer by the same road the audio does.
+        spec.set_modulation(build_mod_spec(
+            &self.arrangement.tracks,
+            &self.arrangement.modulators,
+            &self.arrangement.mod_wires,
+            &self.parameter_registry,
+            &nodes,
+        ));
         match spec.compile_at_tempo(info.sample_rate, info.max_frames, self.transport.bpm) {
             Ok(sched) => {
                 let Some(engine) = &mut self.engine else {
@@ -12315,8 +12852,7 @@ impl App {
                 };
                 match engine.set_schedule(Box::new(sched)) {
                     Ok(()) => {
-                        self.seq_ids = nodes.seqs;
-                        self.fx_ids = nodes.fx;
+                        self.device_nodes = nodes.devices;
                         self.pan_ids = nodes.pans;
                         // Fresh ids: every track's pan must be re-sent, so
                         // nothing survives a swap sitting at the node's
@@ -12331,6 +12867,7 @@ impl App {
                             self.arrangement.tracks.len(),
                             self.shape_hash(),
                             self.transport.bpm.to_bits(),
+                            self.mod_shape_hash(),
                         );
                         self.last_compile = Some(Instant::now());
                     }
@@ -12352,6 +12889,11 @@ impl App {
         let info = engine.info();
         let snap = engine.latest_block();
         let peaks = snap.track_peaks;
+        self.mod_telemetry = Some(ModTelemetry {
+            sources: snap.mod_sources,
+            wire_ids: snap.mod_wire_ids,
+            wires: snap.mod_wires,
+        });
         self.transport.playing = snap.playing;
         self.transport.position = snap.position as f64 / f64::from(info.sample_rate.max(1));
         self.hud = Some(EngineHud {
@@ -12379,34 +12921,26 @@ impl App {
         ctx.request_repaint();
     }
 
-    /// Every modulator, evaluated ONCE for this frame: LFOs are pure
-    /// functions of the beat, followers read the meter ballistics the
-    /// mixer already runs. Runs engine on or off — the MOD strip's
-    /// animation and playback dispatch read the same map.
+    /// This frame's modulation readings, for the strip's animation and the
+    /// scopes.
+    ///
+    /// The engine EVALUATES modulation now — this only reports it. While a
+    /// stream runs, the values come back through telemetry, so what a scope
+    /// draws is what a node actually received. With no engine there is
+    /// nothing to report, so the same arithmetic runs here instead and the
+    /// strip keeps moving with the stream powered off.
     fn pump_modulators(&mut self, dt: f32) {
         self.clock_seconds += dt.max(0.0);
-        let beat = (self.transport.position * self.transport.bpm / 60.0) as f32;
-        self.mod_values.clear();
-        for modulator in &self.arrangement.modulators {
-            self.mod_values.insert(
-                modulator.id,
-                modulator_value(&modulator.kind, beat, self.clock_seconds, &self.meters),
-            );
+        match self.mod_telemetry.take() {
+            Some(telemetry) => self.read_modulation_telemetry(&telemetry),
+            None => self.simulate_modulation(dt),
         }
-        // Every wire's chain, once per frame. Solo is global: while any
-        // wire is soloed, the others aim at zero — through their own
-        // smoothing, so an audition switch is a glide, not a click.
-        let any_solo = self.arrangement.mod_wires.iter().any(|wire| wire.solo);
         for wire in &self.arrangement.mod_wires {
-            let muted = !wire.enabled || (any_solo && !wire.solo);
             let span = self
                 .parameter_registry
                 .spec(&wire.target)
                 .map_or(0.0, |spec| spec.max - spec.min);
-            let source = self.mod_values.get(&wire.source).copied().unwrap_or(0.0);
-            let previous = self.wire_outputs.get(&wire.id).copied();
-            let output = wire_contribution(wire, source, span, previous, dt, muted);
-            self.wire_outputs.insert(wire.id, output);
+            let output = self.wire_outputs.get(&wire.id).copied().unwrap_or(0.0);
             let scope = self.wire_scopes.entry(wire.id).or_default();
             // ~4 seconds at 60fps, normalized to the target's range so the
             // scope reads the same for a dB wire and a percent one.
@@ -12426,6 +12960,119 @@ impl App {
         self.wire_scopes.retain(|id, _| alive.contains(id));
         if self.expanded_wire.is_some_and(|id| !alive.contains(&id)) {
             self.expanded_wire = None;
+        }
+    }
+
+    /// Take the engine's readings. Sources arrive in the arrangement's
+    /// order; wires arrive with their ids, because a wire whose target did
+    /// not compile is absent and index alignment would silently attribute
+    /// one wire's motion to another.
+    fn read_modulation_telemetry(&mut self, telemetry: &ModTelemetry) {
+        self.mod_values.clear();
+        for (modulator, value) in self
+            .arrangement
+            .modulators
+            .iter()
+            .zip(telemetry.sources.iter())
+        {
+            self.mod_values.insert(modulator.id, *value);
+        }
+        self.wire_outputs.clear();
+        for (id, value) in telemetry.wire_ids.iter().zip(telemetry.wires.iter()) {
+            if *id != 0 {
+                self.wire_outputs.insert(*id, *value);
+            }
+        }
+    }
+
+    /// The engine-off fallback: the same chain the engine runs, on the UI
+    /// clock. Nothing is sounding, so this drives the animation only —
+    /// which is why free modulators may use the wall clock here without
+    /// costing anyone a reproducible render.
+    fn simulate_modulation(&mut self, dt: f32) {
+        let beat = (self.transport.position * self.transport.bpm / 60.0) as f32;
+        let levels: Vec<f32> = self
+            .meters
+            .iter()
+            .map(|m| device::meter::db_to_norm(m.shown_db))
+            .collect();
+        self.mod_values.clear();
+        for modulator in &self.arrangement.modulators {
+            self.mod_values.insert(
+                modulator.id,
+                modulator_value(&modulator.kind, beat, self.clock_seconds, &levels),
+            );
+        }
+        // Solo is global: while any wire is soloed, the others aim at zero
+        // — through their own smoothing, so an audition switch is a glide.
+        let any_solo = self.arrangement.mod_wires.iter().any(|wire| wire.solo);
+        for wire in &self.arrangement.mod_wires {
+            let muted = !wire.enabled || (any_solo && !wire.solo);
+            let span = self
+                .parameter_registry
+                .spec(&wire.target)
+                .map_or(0.0, |spec| spec.max - spec.min);
+            let source = self.mod_values.get(&wire.source).copied().unwrap_or(0.0);
+            let previous = self.wire_outputs.get(&wire.id).copied();
+            let output = wire_contribution(wire, source, span, previous, dt, muted);
+            self.wire_outputs.insert(wire.id, output);
+        }
+    }
+
+    /// Send the engine any wire chain or source definition that has moved
+    /// since the last frame. Only-on-change, like every other letter: a
+    /// still modulation matrix costs nothing, and a knob under the hand
+    /// costs one small message per changed frame instead of a debounced
+    /// schedule swap a second later.
+    ///
+    /// STRUCTURE is not sent here — adding, deleting or retargeting a wire
+    /// changes the plan's shape and rides a recompile, which is what
+    /// `mod_shape_hash` makes the dirty check notice.
+    fn sync_modulation(&mut self) {
+        use daw::audio::modulation::{ModEdit, WireEdit};
+
+        // Prune first, and unconditionally: a re-used id must never find a
+        // stale "already sent" entry waiting for it.
+        let wires: std::collections::HashSet<u64> =
+            self.arrangement.mod_wires.iter().map(|w| w.id).collect();
+        let sources: std::collections::HashSet<u64> =
+            self.arrangement.modulators.iter().map(|m| m.id).collect();
+        self.sent_mod_wires.retain(|id, _| wires.contains(id));
+        self.sent_mod_sources.retain(|id, _| sources.contains(id));
+
+        // With no engine there is nobody to tell, and recording these as
+        // sent would swallow every edit made while the stream was off.
+        if self.engine.is_none() {
+            return;
+        }
+
+        let mut edits: Vec<ModEdit> = Vec::new();
+        for wire in &self.arrangement.mod_wires {
+            let edit = WireEdit {
+                id: wire.id,
+                chain: wire.chain(),
+                enabled: wire.enabled,
+                solo: wire.solo,
+            };
+            if self.sent_mod_wires.get(&wire.id) != Some(&edit) {
+                edits.push(ModEdit::Wire(edit));
+                self.sent_mod_wires.insert(wire.id, edit);
+            }
+        }
+        for modulator in &self.arrangement.modulators {
+            if self.sent_mod_sources.get(&modulator.id) != Some(&modulator.kind) {
+                edits.push(ModEdit::Source {
+                    id: modulator.id,
+                    kind: modulator.kind,
+                });
+                self.sent_mod_sources.insert(modulator.id, modulator.kind);
+            }
+        }
+        let Some(engine) = &mut self.engine else {
+            return;
+        };
+        for edit in edits {
+            engine.set_modulation(edit);
         }
     }
 
@@ -12518,6 +13165,9 @@ impl App {
         }
 
         self.sync_pans();
+        // The wires' own knobs, on the live door — a depth drag must be
+        // heard now, and a schedule swap is debounced to once a second.
+        self.sync_modulation();
 
         // The edits that cannot wait, and cannot be inferred: a reorder
         // (which renumbers the ids and pans the app holds by index, while
@@ -12538,6 +13188,7 @@ impl App {
             self.arrangement.tracks.len(),
             self.shape_hash(),
             self.transport.bpm.to_bits(),
+            self.mod_shape_hash(),
         );
         if shape != self.graph_key {
             self.push_graph();
@@ -12581,29 +13232,18 @@ impl App {
         let beat = (self.transport.position * self.transport.bpm / 60.0) as f32;
         for i in 0..n {
             let track = &self.arrangement.tracks[i];
-            // Modulation rides ON TOP of the knob-or-automation value and
-            // clamps into the range at the end — relative, the way a wire
-            // should be, so the fader stays meaningful underneath it. The
-            // wire outputs were chained (curved, quantized, smoothed) in
-            // `pump_modulators`; here they only sum.
-            let pan = (track.automation.value_at(TRACK_PAN_TARGET, beat, track.pan)
-                + sum_wires(
-                    &self.arrangement.mod_wires,
-                    &self.wire_outputs,
-                    i,
-                    TRACK_PAN_TARGET,
-                ))
-            .clamp(-1.0, 1.0);
-            let volume = (track
+            // The BASE only. Modulation rides on top of this inside the
+            // engine, which is what lets a fader stay meaningful under a
+            // running LFO — and what stops this loop sending a letter per
+            // frame per modulated track. A still fader now sends nothing.
+            let pan = track
+                .automation
+                .value_at(TRACK_PAN_TARGET, beat, track.pan)
+                .clamp(-1.0, 1.0);
+            let volume = track
                 .automation
                 .value_at(TRACK_VOLUME_TARGET, beat, track.volume)
-                + sum_wires(
-                    &self.arrangement.mod_wires,
-                    &self.wire_outputs,
-                    i,
-                    TRACK_VOLUME_TARGET,
-                ))
-            .max(0.0);
+                .max(0.0);
             if pan == self.sent_pan[i] && volume == self.sent_volume[i] {
                 continue;
             }
@@ -12642,12 +13282,10 @@ impl App {
             let mut sends: Vec<(NodeId, u32, String, f32)> = Vec::new();
             for envelope in &track.automation.envelopes {
                 let target = envelope.target.as_str();
-                let Some((node_kind, param)) = target_binding(target) else {
+                // Volume and pan keep the dedicated path above.
+                let Some(TargetRef::Device { id, param }) = target_ref(target) else {
                     continue;
                 };
-                if node_kind == TargetNode::Output {
-                    continue; // volume and pan: the dedicated path above
-                }
                 // A curve for a device the track does not carry automates
                 // nothing — and must not letter some other node.
                 if !target_applies(track, target) {
@@ -12657,18 +13295,15 @@ impl App {
                     continue;
                 };
                 let base = parameter_base(track, target, spec);
-                let value = (track.automation.value_at(target, beat, base)
-                    + sum_wires(&self.arrangement.mod_wires, &self.wire_outputs, i, target))
-                .clamp(spec.min, spec.max);
+                // The base only; the engine adds modulation on top.
+                let value = track
+                    .automation
+                    .value_at(target, beat, base)
+                    .clamp(spec.min, spec.max);
                 if self.sent_automation[i].get(target) == Some(&value) {
                     continue;
                 }
-                let ids = match node_kind {
-                    TargetNode::Instrument => &self.seq_ids,
-                    TargetNode::Effect => &self.fx_ids,
-                    TargetNode::Output => unreachable!("filtered above"),
-                };
-                let Some(Some(node)) = ids.get(i).copied() else {
+                let Some(node) = self.device_nodes.get(&id).copied() else {
                     continue;
                 };
                 sends.push((node, param, envelope.target.clone(), value));
@@ -12683,50 +13318,31 @@ impl App {
         }
     }
 
-    fn apply_fx_edits(&mut self, track: usize, edits: &[device::ParamEdit]) {
-        let Some(t) = self.arrangement.tracks.get_mut(track) else {
+    /// Knob edits from one device's card: remembered on that instance so
+    /// the next recompile preserves them, and sent live to the node that
+    /// instance compiled to. The instance id is what keeps a letter on its
+    /// own device — the two cards number their parameters the same way, and
+    /// a misrouted letter would send a reverb's mix to a synth's gain.
+    fn apply_device_edits(&mut self, track: usize, device: u64, edits: &[device::ParamEdit]) {
+        let Some(instance) = self
+            .arrangement
+            .tracks
+            .get_mut(track)
+            .and_then(|t| t.device_mut(device))
+        else {
             return;
         };
         for edit in edits {
-            match edit.param {
-                daw::params::reverb::MIX => t.reverb.mix = edit.value,
-                daw::params::reverb::SIZE => t.reverb.size = edit.value,
-                daw::params::reverb::DAMP => t.reverb.damp = edit.value,
-                _ => {}
-            }
+            instance.state.set(edit.param, edit.value);
         }
-        let Some(Some(node)) = self.fx_ids.get(track).copied() else {
+        // A device that is not in the schedule — bypassed, or on a muted
+        // track — has nowhere to send to. The next swap bakes the values in.
+        let Some(node) = self.device_nodes.get(&device).copied() else {
             return;
         };
         if let Some(engine) = &mut self.engine {
             for edit in edits {
                 engine.set_param(node, edit.param, edit.value);
-            }
-        }
-    }
-
-    fn apply_param_edits(&mut self, track: usize, edits: &[device::ParamEdit]) {
-        let Some(params) = self
-            .arrangement
-            .tracks
-            .get_mut(track)
-            .map(|t| &mut t.params)
-        else {
-            return;
-        };
-        for edit in edits {
-            match edit.param {
-                daw::params::seq::GAIN => params.gain = edit.value,
-                daw::params::seq::ATTACK => params.attack_ms = edit.value,
-                daw::params::seq::RELEASE => params.release_ms = edit.value,
-                _ => {}
-            }
-            // Only the track's OWN node — a letter to the wrong Seq would
-            // retune a different instrument.
-            if let (Some(engine), Some(Some(seq))) =
-                (&mut self.engine, self.seq_ids.get(track).copied())
-            {
-                engine.set_param(seq, edit.param, edit.value);
             }
         }
     }
@@ -13044,10 +13660,17 @@ impl eframe::App for App {
                     .iter()
                     .map(|track| track.name.clone())
                     .collect();
-                let (device_kind, fx_kind) = device_track
-                    .and_then(|i| arrangement.tracks.get(i))
-                    .map_or((None, None), |track| (track.device, track.fx));
                 let registry = &self.parameter_registry;
+                // The strip's target list, and the chain it belongs to,
+                // read out before the rack borrows the track: enumerating
+                // targets needs the chain, and a clone of two Strings per
+                // parameter is cheaper than fighting the borrow.
+                let (mod_targets, chain) = device_track
+                    .and_then(|i| arrangement.tracks.get(i))
+                    .map_or_else(
+                        || (Vec::new(), Vec::new()),
+                        |track| (track_targets(track, registry), track.chain.clone()),
+                    );
                 let mod_values = &self.mod_values;
                 let wire_outputs = &self.wire_outputs;
                 let clock_seconds = self.clock_seconds;
@@ -13062,34 +13685,15 @@ impl eframe::App for App {
                     .frame(sunken)
                     .show(ui, |ui| {
                         let Arrangement {
-                            tracks,
                             modulators,
                             mod_wires,
                             next_modulator_id,
                             ..
                         } = arrangement;
-                        // Only a track that HOLDS a device shows one. An
-                        // empty track's knob state exists but is not its
-                        // instrument, so it must not be drawn as one.
-                        let track = device_track.and_then(|i| tracks.get_mut(i));
-                        // Split the borrow: each card needs its own slot,
-                        // and only the slots that are actually filled.
-                        let (synth, fx) = match track {
-                            Some(t) => {
-                                let has_dev = t.device.is_some();
-                                let has_fx = t.fx.is_some();
-                                (
-                                    has_dev.then_some(&mut t.synth),
-                                    has_fx.then_some(&mut t.reverb),
-                                )
-                            }
-                            None => (None, None),
-                        };
                         let strip = ModStrip {
                             track: device_track,
                             track_names: &track_names,
-                            device: device_kind,
-                            fx: fx_kind,
+                            targets: mod_targets,
                             modulators,
                             wires: mod_wires,
                             next_id: next_modulator_id,
@@ -13101,7 +13705,7 @@ impl eframe::App for App {
                             scopes: wire_scopes,
                             expanded: expanded_wire,
                         };
-                        device_body(ui, t, synth, fx, strip, mod_collapsed)
+                        device_body(ui, t, &chain, strip, mod_collapsed)
                     });
                 (out.response.rect, out.inner)
             }
@@ -13298,8 +13902,9 @@ impl eframe::App for App {
         // Knob edits leave the card as (param id, natural value); they land
         // on the track that drew the card and, live, on that track's Seq.
         if let Some(track) = device_track {
-            self.apply_param_edits(track, &edits.synth);
-            self.apply_fx_edits(track, &edits.fx);
+            for (instance, made) in &edits.edits {
+                self.apply_device_edits(track, *instance, made);
+            }
         }
         if let Some(event) = browser_event {
             self.handle_browser_event(event);
@@ -13471,6 +14076,39 @@ mod tests {
             events,
             ..Default::default()
         }
+    }
+
+    /// Put a device on a track the way the app does — through the one id
+    /// mint and the ordering rule — and hand back its instance id.
+    fn load(arr: &mut Arrangement, track: usize, kind: DeviceKind) -> u64 {
+        let id = arr.mint_id();
+        arr.tracks[track].insert_device(DeviceInstance {
+            id,
+            state: DeviceState::new(kind),
+            bypass: false,
+        });
+        id
+    }
+
+    /// The node a lane's instrument compiled to, for the tests that think
+    /// in lanes rather than in instance ids.
+    fn instrument_node(nodes: &GraphNodes, track: &Track) -> Option<NodeId> {
+        nodes.devices.get(&track.instrument()?.id).copied()
+    }
+
+    /// A device target spelled out: `dev.7.reverb.mix`.
+    fn aimed(id: u64, kind: DeviceKind, param: &'static str) -> String {
+        device_target(id, kind.spec(), param)
+    }
+
+    /// The same for a bare `Track`, for the tests that hold one alone.
+    fn fit(track: &mut Track, id: u64, kind: DeviceKind) -> u64 {
+        track.insert_device(DeviceInstance {
+            id,
+            state: DeviceState::new(kind),
+            bypass: false,
+        });
+        id
     }
 
     /// Run one headless pass, returning the browser region's rendered width.
@@ -16260,7 +16898,7 @@ mod tests {
             "every track has its columns"
         );
 
-        let lfo = arr.add_lfo();
+        let lfo = arr.add_lfo().unwrap();
         let id = arr.add_wire(lfo, audio, TRACK_PAN_TARGET);
         assert!(id.is_some(), "one click, one wire");
         assert_eq!(
@@ -16311,7 +16949,7 @@ mod tests {
             id: 1,
             source: 1,
             track: 0,
-            target: REVERB_MIX_TARGET.to_owned(),
+            target: aimed(7, DeviceKind::Reverb, "mix"),
             depth: 0.5,
             ..Default::default()
         };
@@ -16364,29 +17002,57 @@ mod tests {
             "a muted wire glides down through its own lag"
         );
 
-        // Summing: two wires on one target add; other targets hear nothing.
-        let mut second = duck;
-        second.id = 2;
-        let wires = [wire.clone(), second];
-        let mut outputs = HashMap::new();
-        outputs.insert(1, 0.5);
-        outputs.insert(2, -0.2);
-        assert!((sum_wires(&wires, &outputs, 0, REVERB_MIX_TARGET) - 0.3).abs() < 1e-6);
-        assert_eq!(sum_wires(&wires, &outputs, 1, REVERB_MIX_TARGET), 0.0);
+        // Summing several wires onto one parameter is the ENGINE's job now
+        // — `wires_onto_one_parameter_sum_and_clamp_once` in
+        // `audio::modulation` is where it is tested.
 
         // Deleting a modulator takes its wires with it.
         let mut arr = Arrangement::default();
-        let lfo = arr.add_lfo();
+        let lfo = arr.add_lfo().unwrap();
         arr.mod_wires.push(ModWire {
             id: 9,
             source: lfo,
             track: 0,
-            target: REVERB_MIX_TARGET.to_owned(),
+            target: aimed(7, DeviceKind::Reverb, "mix"),
             depth: 0.5,
             ..Default::default()
         });
         assert!(arr.remove_modulator(lfo));
         assert!(arr.mod_wires.is_empty(), "the wire went with its source");
+    }
+
+    /// The engine's tables are fixed size, so the UI must refuse rather
+    /// than let the user build a source that exists on screen and drives
+    /// nothing. A silent cap is worse than a full one.
+    #[test]
+    fn modulation_refuses_to_overfill_the_engine() {
+        let mut arr = Arrangement::default();
+        for i in 0..MAX_MOD_SOURCES {
+            assert!(arr.add_lfo().is_some(), "source {i} should fit");
+        }
+        assert!(arr.add_lfo().is_none(), "one past the cap must be refused");
+        assert!(arr.add_follower(0).is_none());
+        assert_eq!(arr.modulators.len(), MAX_MOD_SOURCES);
+
+        // Deleting one makes room again — the cap is a wall, not a latch.
+        let first = arr.modulators[0].id;
+        assert!(arr.remove_modulator(first));
+        assert!(arr.add_lfo().is_some(), "room reopens after a deletion");
+
+        // Wires have their own cap, enforced at the same door.
+        arr.tracks.push(Track::default());
+        let source = arr.modulators[0].id;
+        arr.mod_wires = (0..MAX_MOD_WIRES as u64)
+            .map(|id| ModWire {
+                id: 1_000 + id,
+                source,
+                ..Default::default()
+            })
+            .collect();
+        assert!(
+            arr.add_wire(source, 0, TRACK_VOLUME_TARGET).is_none(),
+            "a wire past the cap must be refused, not silently dropped"
+        );
     }
 
     /// Followers listen to a LANE and wires land on one: track moves and
@@ -16395,7 +17061,7 @@ mod tests {
     #[test]
     fn modulation_follows_track_surgery() {
         let mut arr = Arrangement::default();
-        let follower = arr.add_follower(0);
+        let follower = arr.add_follower(0).unwrap();
         arr.mod_wires.push(ModWire {
             id: 50,
             source: follower,
@@ -16436,7 +17102,7 @@ mod tests {
     fn modulation_round_trips_and_sanitizes() {
         let mut arr = Arrangement::default();
         let mut transport = Transport::default();
-        let lfo = arr.add_lfo();
+        let lfo = arr.add_lfo().unwrap();
         arr.mod_wires.push(ModWire {
             id: 51,
             source: lfo,
@@ -16529,50 +17195,151 @@ mod tests {
         assert!(loaded.next_modulator_id > 3, "the id mint repaired");
     }
 
-    /// Every registered target resolves to an engine binding, its base is
-    /// readable off a track, and its range comes from the ONE params table
-    /// the widget and the engine already share — the registry cannot
-    /// drift from either.
+    /// EVERY parameter of every device in the table resolves through the
+    /// whole target machinery: it is offered, it parses back to the right
+    /// instance and param id, its base reads off the device, and its range
+    /// comes from the ONE params table the widget and the engine share. A
+    /// device whose row exists but whose targets do not resolve is a knob
+    /// that silently does nothing.
     #[test]
-    fn every_registered_target_is_bound_and_based() {
+    fn every_device_parameter_resolves_through_the_target_machinery() {
         let registry = ParameterRegistry::default();
-        assert!(registry.specs.len() >= 8, "track pair plus two devices");
         let mut track = Track::new(TrackKind::Midi, "t".to_owned());
-        track.device = Some(DeviceKind::SineSynth);
-        track.fx = Some(DeviceKind::Reverb);
-        for spec in &registry.specs {
-            assert!(
-                target_binding(&spec.id).is_some(),
-                "{} has no engine binding — playback would silently skip it",
-                spec.id
+        // One instance of every kind there is, so the walk covers DEVICES.
+        let ids: Vec<(u64, &'static DeviceSpec)> = DEVICES
+            .iter()
+            .enumerate()
+            .map(|(at, device)| {
+                let id = 100 + at as u64;
+                fit(&mut track, id, device.kind);
+                (id, device)
+            })
+            .collect();
+        let offered = track_targets(&track, &registry);
+        for (at, device) in DEVICES.iter().enumerate() {
+            assert_eq!(
+                device.params.len(),
+                device.labels.len(),
+                "{}'s labels do not cover its table — the registry zips them \
+                 and would drop the difference silently",
+                device.prefix
             );
-            let base = parameter_base(&track, &spec.id, spec);
-            assert!(
-                (spec.min..=spec.max).contains(&base),
-                "{}'s base {base} sits outside its own range",
-                spec.id
-            );
-            assert!(
-                target_applies(&track, &spec.id),
-                "{} should apply to a fully-equipped track",
-                spec.id
-            );
+            for other in &DEVICES[at + 1..] {
+                assert_ne!(device.prefix, other.prefix, "two devices, one prefix");
+            }
         }
-        // The table is the source: a spot check that the spec did not
-        // restate a range.
-        let mix = registry.spec(REVERB_MIX_TARGET).unwrap();
-        let row = daw::params::def(daw::params::reverb::TABLE, daw::params::reverb::MIX);
-        assert_eq!(
-            (mix.min, mix.max, mix.default),
-            (row.min, row.max, row.default)
-        );
+        for (id, device) in &ids {
+            for def in device.params {
+                // Every id the table declares is both readable and writable
+                // on the state: a variant that forgets one drops knob edits
+                // and reads a stale base, both without a word.
+                let mid = def.min + (def.max - def.min) * 0.3;
+                let mut state = DeviceState::new(device.kind);
+                state.set(def.id, mid);
+                assert_eq!(
+                    state.value(def.id),
+                    Some(mid),
+                    "{}:{} does not survive a set",
+                    device.prefix,
+                    def.name
+                );
+                let target = device_target(*id, device, def.name);
+                assert_eq!(
+                    target_ref(&target),
+                    Some(TargetRef::Device {
+                        id: *id,
+                        param: def.id
+                    }),
+                    "{target} does not parse back to its own device"
+                );
+                assert!(
+                    target_applies(&track, &target),
+                    "{target} should apply to the track carrying it"
+                );
+                assert!(
+                    offered.iter().any(|entry| entry.id == target),
+                    "{target} is never offered"
+                );
+                let spec = registry.spec(&target).expect("a registered spec");
+                assert_eq!(
+                    (spec.min, spec.max, spec.default),
+                    (def.min, def.max, def.default),
+                    "{target} restated its range instead of reading the table"
+                );
+                let base = parameter_base(&track, &target, spec);
+                assert!(
+                    (spec.min..=spec.max).contains(&base),
+                    "{target}'s base {base} sits outside its own range"
+                );
+            }
+        }
+        // The track pair resolves too, and is offered whatever is loaded.
+        for target in [TRACK_VOLUME_TARGET, TRACK_PAN_TARGET] {
+            assert!(matches!(
+                target_ref(target),
+                Some(TargetRef::TrackOutput(_))
+            ));
+            assert!(target_applies(&track, target));
+        }
 
-        // And applicability: strip the devices and the device targets
-        // stand down while the track pair stays.
+        // And applicability is by INSTANCE: the same spelling against a
+        // lane that does not carry that device is refused, while the track
+        // pair stays.
         let bare = Track::new(TrackKind::Midi, "bare".to_owned());
         assert!(target_applies(&bare, TRACK_VOLUME_TARGET));
-        assert!(!target_applies(&bare, SYNTH_GAIN_TARGET));
-        assert!(!target_applies(&bare, REVERB_DAMP_TARGET));
+        for (id, device) in &ids {
+            for def in device.params {
+                assert!(!target_applies(
+                    &bare,
+                    &device_target(*id, device, def.name)
+                ));
+            }
+        }
+        // Junk is not a target: a garbled id, an unknown device, a
+        // parameter that device does not have.
+        assert_eq!(target_ref("dev.x.reverb.mix"), None);
+        assert_eq!(target_ref("dev.1.chorus.mix"), None);
+        assert_eq!(target_ref("dev.1.reverb.width"), None);
+        assert_eq!(target_ref("reverb.mix"), None, "v1 spellings are not v2");
+    }
+
+    /// The two directions of the card's mapping are one mapping: a stored
+    /// engine value drawn as a knob position and read back must be the same
+    /// number. It has to be — the rack derives the position from the stored
+    /// value on every frame of a drag, so a lossy trip would walk a knob
+    /// across the range while the user holds it still.
+    #[test]
+    fn engine_values_survive_the_trip_through_the_knobs() {
+        for device in DEVICES {
+            for def in device.params {
+                // The ends and the inside: a mapping that only round-trips
+                // at its endpoints is still broken.
+                for at in [0.0f32, 0.05, 0.25, 0.5, 0.75, 0.95, 1.0] {
+                    let value = def.min + (def.max - def.min) * at;
+                    let there = device_norm(device.kind, def.id, value);
+                    let back = device_value(device.kind, def.id, there);
+                    assert!(
+                        (back - value).abs() <= value.abs() * 1e-4 + 1e-4,
+                        "{}:{} {value} -> {there} -> {back}",
+                        device.prefix,
+                        def.name
+                    );
+                    assert!(
+                        (0.0..=1.0).contains(&there),
+                        "{}:{} maps {value} outside the knob",
+                        device.prefix,
+                        def.name
+                    );
+                }
+                // And the default, which is what a fresh device shows.
+                let back = device_value(
+                    device.kind,
+                    def.id,
+                    device_norm(device.kind, def.id, def.default),
+                );
+                assert!((back - def.default).abs() <= def.default.abs() * 1e-4 + 1e-4);
+            }
+        }
     }
 
     /// A project written BEFORE target ids became generic — envelopes as
@@ -16590,8 +17357,9 @@ mod tests {
 
         // And the modern shape round-trips through itself unchanged.
         let mut modern = TrackAutomation::default();
-        modern.insert(REVERB_MIX_TARGET, 0.0, 0.1);
-        modern.insert(REVERB_MIX_TARGET, 8.0, 0.9);
+        let mix = aimed(3, DeviceKind::Reverb, "mix");
+        modern.insert(&mix, 0.0, 0.1);
+        modern.insert(&mix, 8.0, 0.9);
         let text = ron::ser::to_string(&modern).unwrap();
         let back: TrackAutomation = ron::from_str(&text).unwrap();
         assert_eq!(back, modern);
@@ -16805,7 +17573,7 @@ mod tests {
         arr.tracks[1].mute = true;
         arr.tracks[1].pan = -0.4;
         arr.tracks[1].volume = 0.5;
-        arr.tracks[1].device = Some(DeviceKind::SineSynth);
+        load(&mut arr, 1, DeviceKind::SineSynth);
         let audio = arr.add_track(TrackKind::Audio);
         arr.create_clip(0, 4.0, 2.0).unwrap();
         arr.clips[0][0].notes = vec![note(60, 0.5, 1.0, 90)];
@@ -19107,14 +19875,19 @@ mod tests {
         a.create_clip(0, 0.0, 4.0).unwrap();
         a.clips[0][0].notes.push(note(60, 0.0, 1.0, 100));
         // Only tracks holding an instrument become nodes.
-        for t in a.tracks.iter_mut() {
-            t.device = Some(DeviceKind::SineSynth);
+        for i in 0..a.tracks.len() {
+            load(&mut a, i, DeviceKind::SineSynth);
         }
 
         for (metronome, extra) in [(false, 0), (true, 1)] {
             let (spec, nodes) = build_graph_spec(&a.tracks, &a.clips, Some(8.0), metronome);
+            let seqs: Vec<Option<NodeId>> = a
+                .tracks
+                .iter()
+                .map(|track| instrument_node(&nodes, track))
+                .collect();
             assert_eq!(
-                nodes.seqs.iter().filter(|s| s.is_some()).count(),
+                seqs.iter().filter(|s| s.is_some()).count(),
                 TRACK_COUNT,
                 "one Seq per track holding a device, empty of clips or not"
             );
@@ -19132,10 +19905,10 @@ mod tests {
             );
             let output = spec.output().unwrap();
             assert!(
-                !nodes.seqs.contains(&Some(output)),
+                !seqs.contains(&Some(output)),
                 "the mixer, not a seq, feeds the speakers"
             );
-            for (seq, pan) in nodes.seqs.iter().zip(&nodes.pans) {
+            for (seq, pan) in seqs.iter().zip(&nodes.pans) {
                 assert!(
                     spec.wires()
                         .iter()
@@ -19170,23 +19943,20 @@ mod tests {
         // A fresh session has no instrument loaded either, so no track becomes a
         // node — the graph is empty and still compiles.
         let (spec, nodes) = build_graph_spec(&a.tracks, &a.clips, None, false);
-        assert!(nodes.seqs.iter().all(|s| s.is_none()), "no device, no node");
+        assert!(nodes.devices.is_empty(), "no device, no node");
         assert!(spec.compile(48_000, 256).is_ok());
 
         // Load an instrument on every track and each becomes one.
-        for t in a.tracks.iter_mut() {
-            t.device = Some(DeviceKind::SineSynth);
+        for i in 0..a.tracks.len() {
+            load(&mut a, i, DeviceKind::SineSynth);
         }
         let (spec, nodes) = build_graph_spec(&a.tracks, &a.clips, None, false);
-        assert_eq!(
-            nodes.seqs.iter().filter(|s| s.is_some()).count(),
-            TRACK_COUNT
-        );
+        assert_eq!(nodes.devices.len(), TRACK_COUNT);
         assert!(spec.compile(48_000, 256).is_ok());
 
         // And so is one with no tracks at all.
         let (spec, nodes) = build_graph_spec(&[], &[], None, true);
-        assert!(nodes.seqs.is_empty());
+        assert!(nodes.devices.is_empty());
         assert!(spec.compile(48_000, 256).is_ok());
     }
 
@@ -19200,19 +19970,19 @@ mod tests {
             a.tracks
                 .iter()
                 .enumerate()
-                .filter(|(_, t)| t.device.is_some())
+                .filter(|(_, t)| t.instrument().is_some())
                 .fold(0u64, |m, (i, _)| m | (1 << i))
         };
         assert_eq!(mask(&a), 0, "a fresh session holds no instruments");
 
-        a.tracks[2].device = Some(DeviceKind::SineSynth);
+        let id = load(&mut a, 2, DeviceKind::SineSynth);
         assert_eq!(mask(&a), 1 << 2, "the mask names WHICH track, not how many");
 
-        // Only that track compiles to a node, and it lands at its own index
-        // so `seq_ids[track]` stays the right address.
+        // Only that track compiles to a node, and it is addressed by the
+        // instance's id, which is what a letter carries.
         let (_, nodes) = build_graph_spec(&a.tracks, &a.clips, None, false);
-        assert!(nodes.seqs[2].is_some());
-        assert!(nodes.seqs[0].is_none() && nodes.seqs[1].is_none() && nodes.seqs[3].is_none());
+        assert_eq!(nodes.devices.len(), 1);
+        assert!(nodes.devices.contains_key(&id));
     }
 
     // --- tracks -----------------------------------------------------------
@@ -19368,24 +20138,27 @@ mod tests {
     #[test]
     fn a_muted_track_is_not_compiled() {
         let mut a = Arrangement::default();
-        for t in a.tracks.iter_mut() {
-            t.device = Some(DeviceKind::SineSynth);
-        }
+        let ids: Vec<u64> = (0..a.tracks.len())
+            .map(|i| load(&mut a, i, DeviceKind::SineSynth))
+            .collect();
         let (_, all) = build_graph_spec(&a.tracks, &a.clips, None, false);
-        assert_eq!(all.seqs.iter().filter(|s| s.is_some()).count(), TRACK_COUNT);
+        assert_eq!(all.devices.len(), TRACK_COUNT);
 
         a.tracks[1].mute = true;
         let (_, muted) = build_graph_spec(&a.tracks, &a.clips, None, false);
-        assert!(muted.seqs[1].is_none(), "a muted track makes no node");
+        assert!(
+            !muted.devices.contains_key(&ids[1]),
+            "a muted track makes no node"
+        );
         assert!(muted.pans[1].is_none(), "and no pan either");
-        assert_eq!(muted.seqs.iter().filter(|s| s.is_some()).count(), 3);
+        assert_eq!(muted.devices.len(), 3);
 
         // Solo drops everything else the same way.
         a.tracks[1].mute = false;
         a.tracks[0].solo = true;
         let (_, soloed) = build_graph_spec(&a.tracks, &a.clips, None, false);
-        assert!(soloed.seqs[0].is_some());
-        assert_eq!(soloed.seqs.iter().filter(|s| s.is_some()).count(), 1);
+        assert!(soloed.devices.contains_key(&ids[0]));
+        assert_eq!(soloed.devices.len(), 1);
     }
 
     /// An empty audio track has no sequencer or pan. Once a source is placed,
@@ -19394,10 +20167,10 @@ mod tests {
     fn an_audio_track_wires_placed_sources_without_a_sequencer() {
         let mut a = Arrangement::default();
         let i = a.add_track(TrackKind::Audio);
-        // Even with a device somehow set on it, the kind decides.
-        a.tracks[i].device = Some(DeviceKind::SineSynth);
+        // Even with an instrument somehow in its chain, the kind decides.
+        load(&mut a, i, DeviceKind::SineSynth);
         let (_, nodes) = build_graph_spec(&a.tracks, &a.clips, None, false);
-        assert!(nodes.seqs[i].is_none(), "no instrument on an audio track");
+        assert!(nodes.devices.is_empty(), "no instrument on an audio track");
         assert!(nodes.pans[i].is_none(), "an empty audio lane is absent");
 
         let source = AudioSource {
@@ -19413,7 +20186,7 @@ mod tests {
         assert_eq!(a.clips[i][0].start, 2.0);
         assert_eq!(a.clips[i][0].len, 2.0, "one second is two beats at 120");
         let (spec, nodes) = build_graph_spec(&a.tracks, &a.clips, None, false);
-        assert!(nodes.seqs[i].is_none());
+        assert!(nodes.devices.is_empty());
         assert!(nodes.pans[i].is_some());
         assert_eq!(
             spec.iter_ordered()
@@ -19583,20 +20356,19 @@ mod tests {
     #[test]
     fn an_effect_is_wired_into_its_own_track() {
         let mut a = Arrangement::default();
-        a.tracks[0].device = Some(DeviceKind::SineSynth);
-        a.tracks[1].device = Some(DeviceKind::SineSynth);
-        a.tracks[1].fx = Some(DeviceKind::Reverb);
+        load(&mut a, 0, DeviceKind::SineSynth);
+        load(&mut a, 1, DeviceKind::SineSynth);
+        let reverb = load(&mut a, 1, DeviceKind::Reverb);
 
         let (spec, nodes) = build_graph_spec(&a.tracks, &a.clips, None, false);
         let out = spec.output().unwrap();
 
         // Only the track that loaded one has an effect node.
-        assert!(nodes.fx[0].is_none(), "track 0 loaded no effect");
-        let rev = nodes.fx[1].expect("track 1 loaded a reverb");
-        assert!(nodes.fx[2].is_none() && nodes.fx[3].is_none());
+        let rev = nodes.devices[&reverb];
+        assert_eq!(nodes.devices.len(), 3, "two instruments and one reverb");
 
         // Track 0: instrument -> pan -> mixer, no effect in between.
-        let seq0 = nodes.seqs[0].unwrap();
+        let seq0 = instrument_node(&nodes, &a.tracks[0]).unwrap();
         let pan0 = nodes.pans[0].unwrap();
         assert!(
             spec.wires().iter().any(|(f, t)| *f == seq0 && *t == pan0),
@@ -19605,7 +20377,7 @@ mod tests {
         assert!(spec.wires().iter().any(|(f, t)| *f == pan0 && *t == out));
         // Track 1: instrument -> reverb -> pan -> mixer, and NOT
         // instrument -> pan, or the dry signal would bypass the effect.
-        let seq1 = nodes.seqs[1].unwrap();
+        let seq1 = instrument_node(&nodes, &a.tracks[1]).unwrap();
         let pan1 = nodes.pans[1].unwrap();
         assert!(spec.wires().iter().any(|(f, t)| *f == seq1 && *t == rev));
         assert!(spec.wires().iter().any(|(f, t)| *f == rev && *t == pan1));
@@ -19617,27 +20389,300 @@ mod tests {
         assert!(spec.compile(48_000, 256).is_ok());
     }
 
-    /// Loading a device fills its own SLOT: an effect never displaces the
-    /// instrument that feeds it, and the graph key notices both.
+    /// A v1 project — one instrument and one effect as named fields, and
+    /// targets spelled by KIND — loads into a chain with its automation and
+    /// its wires still bound to the right devices.
+    ///
+    /// This is the easiest thing in the whole change to get silently wrong:
+    /// a wire whose target no longer resolves compiles to nothing, which
+    /// sounds exactly like a wire at depth zero.
     #[test]
-    fn instrument_and_effect_slots_are_independent() {
+    fn a_v1_project_loads_into_a_chain_with_its_wires_still_bound() {
+        let v1 = r#"(
+            version: 1,
+            bpm: 128.0,
+            tracks: [
+                (
+                    kind: Midi,
+                    name: "lead",
+                    volume: 0.8,
+                    device: Some(SineSynth),
+                    fx: Some(Reverb),
+                    synth: (gain: 0.9, attack: 0.1, release: 0.9),
+                    params: (gain: 0.5, attack_ms: 12.0, release_ms: 300.0),
+                    reverb: (size: 0.8, damp: 0.2, mix: 0.4),
+                    automation: (envelopes: [
+                        (target: "synth.gain", points: [
+                            (beat: 0.0, value: 0.2, bend: 0.0),
+                            (beat: 4.0, value: 1.5, bend: 0.0),
+                        ]),
+                    ]),
+                ),
+            ],
+            modulators: [(id: 1, kind: Lfo(shape: Sine, rate_beats: 4.0, free: false, hz: 1.0))],
+            mod_wires: [(id: 2, source: 1, track: 0, target: "reverb.mix", depth: 0.5)],
+            next_modulator_id: 3,
+        )"#;
+        let doc: ProjectDoc = ron::from_str(v1).unwrap();
+        let mut arr = Arrangement::default();
+        let mut transport = Transport::default();
+        apply_project_doc(doc, &mut arr, &mut transport);
+
+        // The two named fields became a chain, in signal order, with the
+        // ENGINE-unit values the v1 file carried.
+        let chain = &arr.tracks[0].chain;
+        assert_eq!(chain.len(), 2);
+        assert_eq!(
+            chain[0].state,
+            DeviceState::SineSynth(SynthParams {
+                gain: 0.5,
+                attack_ms: 12.0,
+                release_ms: 300.0
+            }),
+            "the synth's engine-unit copy is the one that survives"
+        );
+        assert_eq!(
+            chain[1].state,
+            DeviceState::Reverb(ReverbParams {
+                mix: 0.4,
+                size: 0.8,
+                damp: 0.2
+            })
+        );
+        let (synth, reverb) = (chain[0].id, chain[1].id);
+        assert_ne!(synth, reverb, "each device got its own identity");
+        assert!(
+            arr.next_modulator_id > synth.max(reverb),
+            "the mint clears the ids it just handed out"
+        );
+
+        // Both target spellings were rewritten to name their instance.
+        assert_eq!(
+            arr.tracks[0].automation.envelopes[0].target,
+            aimed(synth, DeviceKind::SineSynth, "gain")
+        );
+        assert_eq!(arr.mod_wires.len(), 1, "the wire survived the migration");
+        assert_eq!(
+            arr.mod_wires[0].target,
+            aimed(reverb, DeviceKind::Reverb, "mix")
+        );
+
+        // And it is still WIRED: it compiles onto the reverb node, at the
+        // reverb's mix param, riding the base the file carried.
+        let (_, nodes) = build_graph_spec(&arr.tracks, &arr.clips, None, false);
+        let registry = ParameterRegistry::default();
+        let plan = build_mod_spec(
+            &arr.tracks,
+            &arr.modulators,
+            &arr.mod_wires,
+            &registry,
+            &nodes,
+        );
+        assert_eq!(plan.wires.len(), 1);
+        assert_eq!(plan.wires[0].node, nodes.devices[&reverb]);
+        assert_eq!(plan.wires[0].param, daw::params::reverb::MIX);
+        assert_eq!(
+            plan.wires[0].base, 0.4,
+            "the base is the device's own value"
+        );
+
+        // A v1 wire pointing at a device the track never had is a dangling
+        // pointer once ids exist, and is dropped rather than left to bind
+        // to whatever loads next.
+        let orphan = r#"(
+            version: 1,
+            tracks: [(kind: Midi, name: "bare")],
+            modulators: [(id: 1, kind: Lfo(shape: Sine, rate_beats: 4.0, free: false, hz: 1.0))],
+            mod_wires: [(id: 2, source: 1, track: 0, target: "reverb.mix", depth: 0.5)],
+        )"#;
+        let doc: ProjectDoc = ron::from_str(orphan).unwrap();
+        let mut arr = Arrangement::default();
+        apply_project_doc(doc, &mut arr, &mut transport);
+        assert!(arr.tracks[0].chain.is_empty());
+        assert!(arr.mod_wires.is_empty());
+    }
+
+    /// A chain is a CHAIN: two effects on one track both reach the graph,
+    /// in the order they sit in, each feeding the next. This is the thing a
+    /// single `fx` slot made impossible rather than merely unimplemented.
+    #[test]
+    fn two_effects_on_one_track_reach_the_graph_in_order() {
         let mut a = Arrangement::default();
-        a.tracks[0].device = Some(DeviceKind::SineSynth);
-        a.tracks[0].fx = Some(DeviceKind::Reverb);
+        load(&mut a, 0, DeviceKind::SineSynth);
+        let first = load(&mut a, 0, DeviceKind::Reverb);
+        let second = load(&mut a, 0, DeviceKind::Reverb);
+
+        let (spec, nodes) = build_graph_spec(&a.tracks, &a.clips, None, false);
+        let seq = instrument_node(&nodes, &a.tracks[0]).unwrap();
+        let one = nodes.devices[&first];
+        let two = nodes.devices[&second];
+        let pan = nodes.pans[0].unwrap();
+        assert_ne!(one, two, "two devices, two nodes");
+
+        // seq -> reverb 1 -> reverb 2 -> pan, and nothing skipping ahead.
+        let wired =
+            |from: NodeId, to: NodeId| spec.wires().iter().any(|(f, t)| *f == from && *t == to);
+        assert!(wired(seq, one) && wired(one, two) && wired(two, pan));
+        assert!(
+            !wired(seq, two) && !wired(seq, pan) && !wired(one, pan),
+            "nothing may bypass a device in the middle of the chain"
+        );
+        assert!(spec.compile(48_000, 256).is_ok());
+
+        // Both are addressable, and each by its OWN id.
+        assert_eq!(nodes.devices.len(), 3);
+        assert_eq!(a.tracks[0].device(second).map(|d| d.id), Some(second));
+    }
+
+    /// A bypassed device stays in the chain and leaves the SCHEDULE — the
+    /// same rule a muted track follows — and the chain closes over it.
+    #[test]
+    fn a_bypassed_device_leaves_the_schedule() {
+        let mut a = Arrangement::default();
+        load(&mut a, 0, DeviceKind::SineSynth);
+        let first = load(&mut a, 0, DeviceKind::Reverb);
+        let second = load(&mut a, 0, DeviceKind::Reverb);
+
+        a.tracks[0].device_mut(first).unwrap().bypass = true;
+        let (spec, nodes) = build_graph_spec(&a.tracks, &a.clips, None, false);
+        assert!(
+            !nodes.devices.contains_key(&first),
+            "a bypassed device makes no node"
+        );
+        assert_eq!(a.tracks[0].chain.len(), 3, "but it is still in the chain");
+        let seq = instrument_node(&nodes, &a.tracks[0]).unwrap();
+        let two = nodes.devices[&second];
+        assert!(
+            spec.wires().iter().any(|(f, t)| *f == seq && *t == two),
+            "the chain closes over the bypassed device"
+        );
+        assert!(spec.compile(48_000, 256).is_ok());
+
+        // The instrument bypassed silences the lane entirely, exactly as an
+        // empty chain does: no source, no pan, no meter.
+        a.tracks[0].chain[0].bypass = true;
+        let (_, nodes) = build_graph_spec(&a.tracks, &a.clips, None, false);
+        assert!(nodes.devices.is_empty());
+        assert!(nodes.pans[0].is_none());
+    }
+
+    /// Reordering a chain must not break a wire. Automation and modulation
+    /// address a device by ID, so moving it changes where the audio flows
+    /// and nothing else — the whole reason instances are identified.
+    #[test]
+    fn reordering_a_chain_does_not_break_a_wire() {
+        let registry = ParameterRegistry::default();
+        let mut a = Arrangement::default();
+        load(&mut a, 0, DeviceKind::SineSynth);
+        let first = load(&mut a, 0, DeviceKind::Reverb);
+        let second = load(&mut a, 0, DeviceKind::Reverb);
+        let lfo = a.add_lfo().unwrap();
+        let target = aimed(second, DeviceKind::Reverb, "mix");
+        a.add_wire(lfo, 0, &target).unwrap();
+
+        let bound = |a: &Arrangement| {
+            let (_, nodes) = build_graph_spec(&a.tracks, &a.clips, None, false);
+            let plan = build_mod_spec(&a.tracks, &a.modulators, &a.mod_wires, &registry, &nodes);
+            assert_eq!(plan.wires.len(), 1, "the wire compiles");
+            (
+                plan.wires[0].node == nodes.devices[&second],
+                plan.wires[0].param,
+            )
+        };
+        let before = bound(&a);
+        assert!(before.0, "the wire drives the device it names");
+
+        // Swap the two reverbs. The wire still names the same instance.
+        a.tracks[0].chain.swap(1, 2);
+        assert_eq!(a.tracks[0].chain[1].id, second);
+        assert_eq!(a.mod_wires[0].target, target, "the target did not move");
+        assert_eq!(bound(&a), before, "and it still binds to the same device");
+
+        // Removing the OTHER device leaves it alone too.
+        a.tracks[0].chain.retain(|d| d.id != first);
+        assert!(bound(&a).0);
+    }
+
+    /// The ordering rule: AT MOST ONE instrument, and it heads the chain.
+    /// An effect never displaces the instrument that feeds it, a second
+    /// instrument replaces the first rather than joining it, and the graph
+    /// key notices every one of those.
+    #[test]
+    fn an_instrument_always_heads_the_chain() {
+        let mut a = Arrangement::default();
         assert!(DeviceKind::SineSynth.is_instrument());
         assert!(!DeviceKind::Reverb.is_instrument());
 
-        // Both slots survive together.
-        assert_eq!(a.tracks[0].device, Some(DeviceKind::SineSynth));
-        assert_eq!(a.tracks[0].fx, Some(DeviceKind::Reverb));
+        // An effect FIRST, then the instrument: the instrument still ends
+        // up at the head, because that is signal order, not arrival order.
+        let verb = load(&mut a, 0, DeviceKind::Reverb);
+        let synth = load(&mut a, 0, DeviceKind::SineSynth);
+        assert_eq!(
+            a.tracks[0].chain.iter().map(|d| d.id).collect::<Vec<u64>>(),
+            vec![synth, verb]
+        );
+        assert_eq!(a.tracks[0].instrument().map(|d| d.id), Some(synth));
 
-        // The shape hash distinguishes "instrument only" from "both", so
-        // loading an effect forces a schedule swap rather than being
-        // mistaken for no change at all.
-        let both = shape_hash(&a.tracks);
-        a.tracks[0].fx = None;
-        let instrument_only = shape_hash(&a.tracks);
-        assert_ne!(both, instrument_only, "an effect changes the graph's shape");
+        // More effects join the END, in the order they arrive.
+        let second = load(&mut a, 0, DeviceKind::Reverb);
+        assert_eq!(
+            a.tracks[0].chain.iter().map(|d| d.id).collect::<Vec<u64>>(),
+            vec![synth, verb, second]
+        );
+
+        // A second instrument REPLACES the first — one voice per lane —
+        // and the effects stay where they were.
+        let replacement = load(&mut a, 0, DeviceKind::SineSynth);
+        assert_eq!(
+            a.tracks[0].chain.iter().map(|d| d.id).collect::<Vec<u64>>(),
+            vec![replacement, verb, second]
+        );
+        assert_eq!(
+            a.tracks[0]
+                .chain
+                .iter()
+                .filter(|d| d.kind().is_instrument())
+                .count(),
+            1
+        );
+
+        // A file can still say otherwise, and is corrected on the way in.
+        let mut hostile = vec![
+            DeviceInstance {
+                id: 1,
+                state: DeviceState::new(DeviceKind::Reverb),
+                bypass: false,
+            },
+            DeviceInstance {
+                id: 2,
+                state: DeviceState::new(DeviceKind::SineSynth),
+                bypass: false,
+            },
+            DeviceInstance {
+                id: 3,
+                state: DeviceState::new(DeviceKind::SineSynth),
+                bypass: false,
+            },
+        ];
+        sanitize_chain(&mut hostile);
+        assert_eq!(
+            hostile.iter().map(|d| d.id).collect::<Vec<u64>>(),
+            vec![2, 1],
+            "the first instrument heads the chain and the second is dropped"
+        );
+
+        // The shape hash distinguishes every one of those arrangements, so
+        // a chain edit forces a schedule swap rather than being mistaken
+        // for no change at all.
+        let mut seen = std::collections::HashSet::new();
+        let full = shape_hash(&a.tracks);
+        assert!(seen.insert(full));
+        a.tracks[0].chain.pop();
+        assert!(seen.insert(shape_hash(&a.tracks)), "an effect left");
+        a.tracks[0].chain.swap(0, 1);
+        assert!(seen.insert(shape_hash(&a.tracks)), "the order changed");
+        a.tracks[0].chain[0].bypass = true;
+        assert!(seen.insert(shape_hash(&a.tracks)), "one is bypassed");
     }
 
     /// Ctrl+1 and Ctrl+2 move BOTH grids. They are the shared grid keys —
@@ -19683,35 +20728,43 @@ mod tests {
     }
 
     /// A knob turn must reach the Seq of the track whose card drew it — the
-    /// ids are position-dependent, and getting this wrong retunes somebody
-    /// else's instrument.
+    /// nodes are addressed by instance id, and getting this wrong retunes
+    /// somebody else's instrument.
     #[test]
     fn params_route_to_their_own_track() {
         let mut a = Arrangement::default();
         // Give each track a different gain, then check the compiled specs
         // carry them per track rather than sharing one.
-        for (i, track) in a.tracks.iter_mut().enumerate() {
-            track.params.gain = 0.1 * (i + 1) as f32;
-            track.device = Some(DeviceKind::SineSynth);
-        }
+        let ids: Vec<u64> = (0..a.tracks.len())
+            .map(|i| {
+                let id = load(&mut a, i, DeviceKind::SineSynth);
+                a.tracks[i].chain[0]
+                    .state
+                    .set(daw::params::seq::GAIN, 0.1 * (i + 1) as f32);
+                id
+            })
+            .collect();
         let (spec, nodes) = build_graph_spec(&a.tracks, &a.clips, None, false);
 
-        // The ids are distinct and ordered by track, which is what makes
-        // `seq_ids[track]` the right address.
-        assert_eq!(nodes.seqs.len(), TRACK_COUNT);
-        for (i, id) in nodes.seqs.iter().enumerate() {
-            for (j, other) in nodes.seqs.iter().enumerate() {
-                assert!(i == j || id != other, "two tracks share a Seq id");
+        // The ids are distinct per track, which is what makes
+        // `device_nodes[id]` the right address.
+        assert_eq!(nodes.devices.len(), TRACK_COUNT);
+        for (i, id) in ids.iter().enumerate() {
+            for (j, other) in ids.iter().enumerate() {
+                assert!(
+                    i == j || nodes.devices[id] != nodes.devices[other],
+                    "two tracks share a Seq id"
+                );
             }
         }
 
         // Each Seq carries its own track's params.
-        let gains: Vec<f32> = nodes
-            .seqs
+        let gains: Vec<f32> = ids
             .iter()
             .map(|id| {
+                let node = nodes.devices[id];
                 spec.iter_ordered()
-                    .find(|(nid, _)| Some(*nid) == *id)
+                    .find(|(nid, _)| *nid == node)
                     .map(|(_, node)| match node {
                         NodeSpec::Seq { params, .. } => params.gain,
                         _ => f32::NAN,

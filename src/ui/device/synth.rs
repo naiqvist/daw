@@ -133,25 +133,45 @@ pub fn sine_synth_card(
     edits
 }
 
+/// The natural value at a normalized knob position, by param id — the
+/// mapping the card itself applies, reachable without drawing one.
+pub fn sine_synth_value(param: u32, norm: f32) -> f32 {
+    let s = spec();
+    match param {
+        ATTACK => s.attack.value(norm),
+        RELEASE => s.release.value(norm),
+        _ => s.gain.value(norm),
+    }
+}
+
+/// The inverse: where a NATURAL value sits on the knob. A device's stored
+/// state is engine units, so this is the door back to what the card draws,
+/// and it is the same `Param` in both directions — the round trip cannot
+/// drift because there is only one mapping.
+pub fn sine_synth_norm(param: u32, value: f32) -> f32 {
+    let s = spec();
+    match param {
+        ATTACK => s.attack.mapping.to_norm(value),
+        RELEASE => s.release.mapping.to_norm(value),
+        _ => s.gain.mapping.to_norm(value),
+    }
+}
+
 /// Every parameter of `state` as an edit, whether or not it just changed.
 /// What a caller needs after setting the knobs itself — a reset, a preset
 /// recall, a project load — since the card only emits on user movement.
 pub fn sine_synth_edits(state: &SineSynthUi) -> Vec<ParamEdit> {
-    let s = spec();
-    vec![
-        ParamEdit {
-            param: GAIN,
-            value: s.gain.value(state.gain),
-        },
-        ParamEdit {
-            param: ATTACK,
-            value: s.attack.value(state.attack),
-        },
-        ParamEdit {
-            param: RELEASE,
-            value: s.release.value(state.release),
-        },
+    [
+        (GAIN, state.gain),
+        (ATTACK, state.attack),
+        (RELEASE, state.release),
     ]
+    .into_iter()
+    .map(|(param, norm)| ParamEdit {
+        param,
+        value: sine_synth_value(param, norm),
+    })
+    .collect()
 }
 
 #[cfg(test)]
