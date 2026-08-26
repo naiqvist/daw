@@ -17,6 +17,17 @@
 /// the callback bounds segments per block).
 pub const MIN_LOOP_LEN: u64 = 64;
 
+/// The tempo range the ENGINE will accept, wider than the range the UI
+/// offers. Anything outside it is a corrupt project or a caller bug, not a
+/// musical choice.
+///
+/// It is a real bound, not decoration: `samples_per_beat` is derived from
+/// bpm and compiled into every sequencer event stamp, so a bpm near zero
+/// produces stamps that saturate `u64` and a position that overflows when
+/// advanced. Every door that accepts a tempo clamps to this.
+pub const BPM_MIN: f64 = 1.0;
+pub const BPM_MAX: f64 = 999.0;
+
 /// The single authority for converting between musical and sample time.
 /// Both directions live here and nowhere else — two call sites rounding
 /// differently is a one-sample click that reproduces only at certain tempos.
@@ -140,7 +151,7 @@ impl Transport {
             TransportCmd::ClearLoop => self.loop_region = None,
             TransportCmd::SetTempo(bpm) => {
                 if bpm.is_finite() && bpm > 0.0 {
-                    self.map.bpm = bpm.clamp(1.0, 999.0);
+                    self.map.bpm = bpm.clamp(BPM_MIN, BPM_MAX);
                 }
             }
         }

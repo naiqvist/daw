@@ -132,13 +132,24 @@ pub fn expanded_len_beats(nominal: f64, subloops: &[SubLoop]) -> f64 {
             .sum::<f64>()
 }
 
-/// One compiled sequencer event. Sorted by (beat, rank) — rank 0 = note-off,
-/// rank 1 = note-on, so an off at the same beat as an on always lands first
-/// (the same-pitch back-to-back case must not have the off kill the new note).
+/// One compiled sequencer event, SAMPLE-stamped.
+///
+/// Sequencing contract rule 1: "Every event is timeline-sample-stamped
+/// (u64). No block-relative events." The stamp is pattern-relative in clip
+/// mode and timeline-absolute otherwise; either way it is an integer at the
+/// compiled tempo, which is what `compile_at_tempo` exists to produce.
+///
+/// Beats were the previous stamp, and they cost a float multiply-add, a
+/// division and a `floor` PER SAMPLE to compare against. Integers cost a
+/// compare, and only at event boundaries.
+///
+/// Sorted by (sample, rank) — rank 0 = note-off, rank 1 = note-on, so an
+/// off at the same sample as an on always lands first (contract rule 3: the
+/// same-pitch back-to-back case must not have the off kill the new note).
 #[derive(Debug, Clone, Copy)]
 #[doc(hidden)]
 pub struct SeqEvent {
-    beat: f64,
+    sample: u64,
     rank: u8,
     pitch: u8,
     vel: u8,
@@ -193,21 +204,219 @@ fn synth_release_coeff(release_ms: f32, sample_rate: f32) -> f32 {
     ENV_FLOOR.powf(1.0 / (def.clamp(release_ms) * 1e-3 * sample_rate).max(1.0))
 }
 
-/// One synth voice: sine with a fast attack and exponential release.
-#[derive(Debug, Clone, Copy, Default)]
-#[doc(hidden)]
-pub struct Voice {
-    pitch: u8,
-    phase: f32,
-    freq: f32,
-    env: f32,
-    amp: f32,
-    gate: bool,
-    /// When this voice was triggered, as a monotonic stamp. Stealing has
-    /// to know which note is OLDEST, and envelope level cannot say: a note
+/// The polyphony, as parallel arrays rather than an array of structs.
+///
+/// Structure-of-arrays because the per-sample loop touches every voice's
+/// `phase`, `step`, `env` and `amp` and nothing else: as SoA those are four
+/// contiguous runs of `SEQ_VOICES` floats, which is what a vector unit
+/// wants. `[f32; 8]` is exactly one AVX2 register, and `.cargo/config.toml`
+/// sets `target-cpu=native`. As AoS the same loop strides over eight
+/// structs, touching a different cache line each time and vectorizing
+/// nothing.
+///
+/// The split that makes this work: CONTROL is scalar and happens per EVENT
+/// (allocate a voice, steal one, release one), while the dense per-sample
+/// arithmetic is uniform across voices. Events are sparse — a handful in a
+/// block — and samples are not, so the scalar half is nearly free.
+///
+/// `step` is the per-sample phase increment, computed once at note-on. The
+/// previous shape stored `freq` and divided by the sample rate inside the
+/// inner loop: a division per voice per sample, for a value that only
+/// changes when a note starts.
+///
+/// This layout is deliberately settled BEFORE there is more than one
+/// instrument. Converting AoS to SoA after three exist is three rewrites.
+#[derive(Debug, Clone, Copy)]
+pub struct VoiceBank {
+    phase: [f32; SEQ_VOICES],
+    step: [f32; SEQ_VOICES],
+    env: [f32; SEQ_VOICES],
+    amp: [f32; SEQ_VOICES],
+    gate: [bool; SEQ_VOICES],
+    pitch: [u8; SEQ_VOICES],
+    /// When each voice was triggered, as a monotonic stamp. Stealing has to
+    /// know which note is OLDEST, and envelope level cannot say: a note
     /// that just started is the quietest thing on the keyboard, so
     /// "steal the quietest" steals the note you are still playing.
-    age: u64,
+    age: [u64; SEQ_VOICES],
+}
+
+impl Default for VoiceBank {
+    fn default() -> Self {
+        Self {
+            phase: [0.0; SEQ_VOICES],
+            step: [0.0; SEQ_VOICES],
+            env: [0.0; SEQ_VOICES],
+            amp: [0.0; SEQ_VOICES],
+            gate: [false; SEQ_VOICES],
+            pitch: [0; SEQ_VOICES],
+            age: [0; SEQ_VOICES],
+        }
+    }
+}
+
+impl VoiceBank {
+    /// The pitches currently gated. Tests only — voice allocation is not
+    /// observable from outside the node, and the stealing rules are worth
+    /// asserting on directly.
+    #[cfg(test)]
+    fn held(&self) -> impl Iterator<Item = u8> + '_ {
+        (0..SEQ_VOICES)
+            .filter(|&v| self.gate[v])
+            .map(|v| self.pitch[v])
+    }
+
+    /// Red zone. Silence everything, now — what a discontinuity demands.
+    fn all_sound_off(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Red zone. Release every gate without cutting the tails, which is
+    /// what stopping the transport means.
+    fn release_all(&mut self) {
+        self.gate = [false; SEQ_VOICES];
+    }
+
+    /// Red zone. Release the first voice gated on `pitch`. One voice, not
+    /// all of them: two note-ons of one pitch are two voices, and one
+    /// note-off should end one of them.
+    fn note_off(&mut self, pitch: u8) {
+        for v in 0..SEQ_VOICES {
+            if self.gate[v] && self.pitch[v] == pitch {
+                self.gate[v] = false;
+                break;
+            }
+        }
+    }
+
+    /// Red zone. Start `pitch` on a free voice, or steal one. Bounded: two
+    /// passes over a fixed-size array, no allocation, no panic path.
+    fn note_on(&mut self, pitch: u8, vel: u8, age: u64, sample_rate: f32) {
+        // A free voice is one that is BOTH ungated and faded out. Testing
+        // the envelope alone hands back the voice allocated one event
+        // earlier at this very sample (its env is still 0.0), which is how
+        // a chord collapses onto one voice.
+        let slot = (0..SEQ_VOICES)
+            .find(|&v| !self.gate[v] && self.env[v] < ENV_FLOOR)
+            .unwrap_or_else(|| {
+                // Everything is sounding: steal a releasing voice before a
+                // held one, and the oldest before the newest. `(gate, age)`
+                // orders exactly that — false sorts before true.
+                let mut best = 0usize;
+                let mut key = (true, u64::MAX);
+                for v in 0..SEQ_VOICES {
+                    if (self.gate[v], self.age[v]) < key {
+                        key = (self.gate[v], self.age[v]);
+                        best = v;
+                    }
+                }
+                best
+            });
+        let freq = 440.0 * ((pitch as f32 - 69.0) / 12.0).exp2();
+        self.phase[slot] = 0.0;
+        self.step[slot] = freq / sample_rate.max(1.0);
+        self.env[slot] = 0.0;
+        self.amp[slot] = vel as f32 / 127.0;
+        self.gate[slot] = true;
+        self.pitch[slot] = pitch;
+        self.age[slot] = age;
+    }
+
+    /// Red zone. Render `out` samples, summing every voice.
+    ///
+    /// Which lanes are worth stepping is decided ONCE per run, not per
+    /// sample. Voices only start at events, and a run is bounded by
+    /// events, so the active set cannot GROW inside a run — it can only
+    /// shrink as tails decay, and stepping a lane briefly past its death
+    /// is far cheaper than asking every lane every sample.
+    ///
+    /// The uniform, branchless version — step all eight always — was tried
+    /// and MEASURED, because `sin` is a scalar libm call and paying eight
+    /// of them to avoid a branch is a bad trade when one voice sounds.
+    /// `report_seq_cost_per_sample`, release, ns/sample:
+    ///
+    /// ```text
+    ///                      beat-stamped   branchless   per-run lanes
+    ///   silent                    10.38        20.85            1.67
+    ///   sparse (1 note/beat)      12.92        38.76            6.62
+    ///   clip loop (1 bar)         21.48        29.72           14.11
+    ///   dense (8 voices held)     85.63        63.71           87.71
+    /// ```
+    ///
+    /// One run each, and they move a few percent between runs — the shape
+    /// is the point, not the digits.
+    ///
+    /// So: branchless wins only when every lane is already sounding, and
+    /// loses badly everywhere else. The dense column is the one that sets
+    /// the deadline margin, and 20 ns/sample there is ~5us of a 5333us
+    /// block budget — immaterial, where the sparse column is the case
+    /// every real arrangement spends its time in.
+    ///
+    /// This inverts once the oscillator becomes vectorizable (`dsp::osc`,
+    /// per the synth brief): then the lane loop is a vector step and the
+    /// gather is the cost. The layout is already right for it; only this
+    /// loop changes.
+    ///
+    /// `gain` ramps linearly across the run and must advance once per
+    /// sample on EVERY path, including silence, or it lands in the wrong
+    /// place and the caller's exact-landing assignment hides the drift.
+    fn render(&mut self, out: &mut [f32], attack: f32, release: f32, gain: &mut Ramp) {
+        let mut lanes = [0usize; SEQ_VOICES];
+        let mut live = 0usize;
+        for v in 0..SEQ_VOICES {
+            if self.gate[v] || self.env[v] >= ENV_FLOOR {
+                lanes[live] = v;
+                live += 1;
+            } else {
+                // Settle a lane the moment it drops out rather than
+                // leaving its envelope frozen wherever the run ended.
+                // A frozen value is state that depends on where run
+                // boundaries fell, and run boundaries depend on block
+                // size; zero does not.
+                self.env[v] = 0.0;
+            }
+        }
+        if live == 0 {
+            for s in out.iter_mut() {
+                *s = 0.0;
+                gain.next();
+            }
+            return;
+        }
+        for s in out.iter_mut() {
+            let mut acc = 0.0f32;
+            for &v in &lanes[..live] {
+                self.env[v] = if self.gate[v] {
+                    (self.env[v] + attack).min(1.0)
+                } else {
+                    self.env[v] * release
+                };
+                acc += (self.phase[v] * TAU).sin() * self.env[v] * self.amp[v];
+                self.phase[v] = (self.phase[v] + self.step[v]).fract();
+            }
+            *s = acc * 0.25 * gain.next(); // headroom across 8 voices
+        }
+    }
+}
+
+/// Red zone. End a pattern cycle: release everything the pattern still owes
+/// a note-off, then rewind the cursor.
+///
+/// Every off is at or before the loop length by the compile clamp, so
+/// nothing can hang. Note-ons still ahead of the cursor would be
+/// zero-length at this point and are skipped rather than retriggered.
+///
+/// A free function because it needs the voices, the event list and the
+/// cursor at once, and those are three separate bindings destructured out
+/// of the node.
+fn flush_cycle(voices: &mut VoiceBank, events: &[SeqEvent], cursor: &mut usize) {
+    while let Some(ev) = events.get(*cursor).copied() {
+        *cursor += 1;
+        if ev.rank == 0 {
+            voices.note_off(ev.pitch);
+        }
+    }
+    *cursor = 0;
 }
 
 /// Most inputs one node may have. Fixed so the callback can gather input
@@ -360,7 +569,7 @@ pub enum Node {
     Seq {
         events: Vec<SeqEvent>,
         cursor: usize,
-        voices: [Voice; SEQ_VOICES],
+        voices: VoiceBank,
         /// Stamp handed to the next triggered voice; only ever increases.
         next_age: u64,
         sample_rate: f32,
@@ -371,19 +580,33 @@ pub enum Node {
         target_gain: f32,
         attack_rate: f32,
         release_coeff: f32,
-        /// Clip mode: the pattern cycles every this many beats, forever, while
-        /// the timeline rolls forward (Ableton-style). None = one-shot linear.
-        /// Event beats are pattern-relative in clip mode; note ends are
-        /// clamped to the loop length at compile, so the off-flush at each
-        /// wrap can never leave a hanging note.
-        loop_len: Option<f64>,
+        /// Clip mode: the pattern cycles every this many SAMPLES at the
+        /// compiled tempo, forever, while the timeline rolls forward
+        /// (Ableton-style). 0 = one-shot linear, never wraps.
+        ///
+        /// The single clock. The beat-valued length it is derived from is
+        /// deliberately NOT kept alongside it: the cycle a segment belongs
+        /// to is derived by integer division on this same modulus, and a
+        /// float copy of the same fact would disagree by up to half a
+        /// sample at any tempo whose samples-per-beat is not integral.
+        ///
+        /// Event stamps are pattern-relative samples in this mode; note ends
+        /// are clamped to the loop length at compile, so the off-flush at
+        /// each wrap can never leave a hanging note.
+        loop_samples: u64,
+        /// Samples per beat at the COMPILED tempo. Event stamps are in this
+        /// space, so the phase must be derived in it too; a live tempo
+        /// would silently disagree with every stamp in the list.
+        samples_per_beat: f64,
         /// Cycle number of the last processed sample (clip mode). An integer
         /// counter, not a float comparison — wrap detection at segment
         /// boundaries must not be a rounding coin flip (see Click).
         last_cycle: i64,
-        /// Pattern-relative phase of the last processed sample, to detect
-        /// backward jumps from tempo drops within a cycle.
-        prev_phase: f64,
+        /// Pattern-relative sample of the last processed segment. Each
+        /// segment re-derives its position from `ctx.beat` rather than
+        /// accumulating, so this exists to keep that derivation MONOTONIC:
+        /// a float rounding that stepped backward would fire an event twice.
+        prev_phase: u64,
     },
     /// Reverb: the first effect. Sums its inputs to mono, runs the
     /// `dsp::reverb` kernel over them, and crossfades wet against dry.
@@ -807,160 +1030,204 @@ impl Node {
                 voices,
                 next_age,
                 sample_rate,
+                samples_per_beat,
                 gain,
                 target_gain,
                 attack_rate,
                 release_coeff,
-                loop_len,
+                loop_samples,
                 last_cycle,
                 prev_phase,
             } => {
-                let seg_beat = ctx.beat;
-                let bps = ctx.beats_per_sample;
-                // Map a timeline beat to (cycle, pattern-relative beat).
-                let ll: Option<f64> = *loop_len;
-                let locate = |beat: f64| -> (i64, f64) {
-                    match ll {
-                        Some(len) => {
-                            let cyc = (beat / len).floor();
-                            (cyc as i64, beat - cyc * len)
-                        }
-                        None => (0, beat),
-                    }
+                // Where this segment starts, as a PATTERN-RELATIVE sample.
+                //
+                // Derived from `ctx.beat` once per segment rather than
+                // accumulated per sample: accumulating drifts, and rounding
+                // the loop length to whole samples would drift the pattern
+                // against the timeline over a long take. One float divide
+                // and one multiply per segment buys exactness, and every
+                // comparison after this is an integer.
+                // The COMPILED samples-per-beat, not the live one. Event
+                // stamps and `loop_samples` were both frozen at compile, so
+                // deriving the phase with a live tempo would put it in
+                // different units from the thing it is compared against:
+                // a tempo raised after compile makes the live cycle shorter
+                // than `loop_samples` and the wrap becomes unreachable;
+                // lowered, the phase overshoots and the whole pattern fires
+                // at one sample. Using the compiled figure keeps everything
+                // in one space, so events land on their correct BEATS and a
+                // tempo change is merely un-recompiled until the swap
+                // arrives — which is what "compiled at tempo" already means
+                // for every audio clip in the graph.
+                let spb = *samples_per_beat;
+                // The cycle is derived with the SAME modulus the walk wraps
+                // on, by integer division — not by a float `beat / len`.
+                //
+                // Two clocks that mean the same thing must be one clock.
+                // `loop_samples` is `round(len * spb)`, so a float
+                // derivation disagrees with the walk by up to half a sample
+                // whenever `len * spb` is not integral — which is most
+                // tempos: 130bpm at 48kHz gives 22153.846 samples a beat.
+                // The walk would wrap one sample early, the derivation
+                // would still report the old cycle, and the mismatch
+                // handler below would "reconcile" by killing the voices the
+                // new cycle had just started. Deriving both from
+                // `loop_samples` makes them agree by construction.
+                let absolute = (ctx.beat * spb).max(0.0) as u64;
+                let (mut cycle, mut phase) = match absolute.checked_div(*loop_samples) {
+                    Some(cyc) => (cyc as i64, absolute % *loop_samples),
+                    // No loop: one linear pass, position is the phase.
+                    None => (0, absolute),
                 };
 
                 if ctx.discontinuity {
-                    // All-sound-off, hard: a wrap/seek must never leave a
-                    // hanging note. Then reseek the cursor. partition_point is
-                    // a bounded binary search — no allocation.
-                    for v in voices.iter_mut() {
-                        *v = Voice::default();
-                    }
-                    let (cyc, phase) = locate(seg_beat);
-                    *cursor = events.partition_point(|e| e.beat < phase);
-                    *last_cycle = cyc;
+                    // All-sound-off, hard: contract rule 2. A wrap or seek
+                    // must never leave a hanging note. Then reseek — a
+                    // bounded binary search, no allocation.
+                    voices.all_sound_off();
+                    *cursor = events.partition_point(|e| e.sample < phase);
+                    *last_cycle = cycle;
                     *prev_phase = phase;
-                } else {
-                    let (_, phase) = locate(seg_beat);
-                    if phase < *prev_phase - 1e-9 && locate(seg_beat).0 == *last_cycle {
-                        // Tempo drop teleported beat backward within a cycle.
-                        // Reseek; voices keep ringing (position never moved).
-                        *cursor = events.partition_point(|e| e.beat < phase);
-                    }
+                } else if cycle > *last_cycle {
+                    // A cycle boundary landed exactly on the PREVIOUS
+                    // segment's last sample, so the walk below never saw
+                    // it: it stops as soon as the output is full, and the
+                    // wrap sits one iteration past that. Reconcile here.
+                    //
+                    // Whole-bar clips hit this constantly — one bar at
+                    // 120bpm/48kHz is 96000 samples, an exact multiple of
+                    // every ordinary block size — and the symptom is a clip
+                    // that plays once and then goes silent forever, with
+                    // any note-off clamped to the clip end left hanging.
+                    //
+                    // Strictly GREATER, not merely different: the walk can
+                    // legitimately be a cycle ahead of the derivation for
+                    // one segment (it wraps the instant phase reaches the
+                    // boundary; the derivation only reports the new cycle
+                    // once the beat crosses it). Flushing on that would cut
+                    // the notes the new cycle just started.
+                    flush_cycle(voices, events, cursor);
+                } else if cycle == *last_cycle && phase < *prev_phase {
+                    // The derivation stepped backward within a cycle — a
+                    // tempo change moved the beat under us. Hold position
+                    // rather than replaying events already fired.
+                    phase = *prev_phase;
                 }
                 if !ctx.playing {
-                    // Stop: release everything (gate off). No note chase on
-                    // resume yet — a note straddling the stop point will not
-                    // re-sound; its on-event has already passed the cursor.
-                    for v in voices.iter_mut() {
-                        v.gate = false;
-                    }
+                    // Stop: release everything. No note chase on resume — a
+                    // note straddling the stop point does not re-sound, its
+                    // on-event is already behind the cursor.
+                    voices.release_all();
+                    // Record where we are before leaving, or the branch
+                    // above never converges: scrubbing the playhead to
+                    // another cycle while paused would re-detect the same
+                    // mismatch and re-walk the whole event list every
+                    // block, forever, on a transport that should cost
+                    // nothing.
+                    *last_cycle = cycle;
+                    *prev_phase = phase;
+                    let mut ramp = Ramp::across(*gain, *target_gain, out_len);
+                    voices.render(out.l, *attack_rate, *release_coeff, &mut ramp);
+                    *gain = *target_gain;
+                    return;
                 }
 
-                // Linear gain ramp across the segment: click-free by
-                // construction, same shape as Sine's amp ramp.
-                let gain_step = (*target_gain - *gain) / out_len.max(1) as f32;
-                for (i, s) in out.l.iter_mut().enumerate() {
-                    if ctx.playing {
-                        let beat_i = seg_beat + i as f64 * bps;
-                        let (cyc, phase) = locate(beat_i);
-                        if cyc != *last_cycle {
-                            // Crossed a clip wrap: flush every remaining event
-                            // of the old cycle (all offs are <= loop length by
-                            // the compile clamp), then restart the pattern.
-                            while *cursor < events.len() {
-                                let ev = events[*cursor];
-                                *cursor += 1;
-                                if ev.rank == 0 {
-                                    for v in voices.iter_mut() {
-                                        if v.gate && v.pitch == ev.pitch {
-                                            v.gate = false;
-                                            break;
-                                        }
-                                    }
-                                }
-                                // note-ons at the very end of a cycle would be
-                                // zero-length here; skip rather than retrigger.
+                // Walk the segment in RUNS between events. Events are
+                // sparse — a handful per block — and samples are not, so
+                // the scalar event work happens a few times and the dense
+                // arithmetic runs uniformly in between. This is the same
+                // shape as the transport's own segment loop, one level
+                // down, and it is what makes note timing sample-accurate
+                // without a per-sample branch asking "is there an event
+                // here?".
+                //
+                // Progress is proven: every pass either renders at least one
+                // sample, consumes at least one event, or wraps (which
+                // resets the cursor and moves the phase off the boundary),
+                // and both the event list and the sample count are finite.
+                // The `steps` bound is belt and braces against the
+                // impossible — the same guard the callback's own segment
+                // loop carries, for the same reason: an unbounded path in
+                // the red zone is a hung render, not a wrong sample.
+                let mut ramp = Ramp::across(*gain, *target_gain, out_len);
+                let mut done = 0usize;
+                let mut steps = 0usize;
+                // A cycle costs at most one wrap, one event pass and one
+                // render pass; a segment can hold at most `out_len` cycles
+                // because a wrap always leaves at least one sample to
+                // render (`loop_samples` is either 0, meaning never wrap,
+                // or >= 1). Budgeting the event list ONCE was wrong: the
+                // cursor rewinds every wrap, so a pattern shorter than a
+                // block re-walks it each cycle.
+                let step_bound = (out_len + 1).saturating_mul(events.len().saturating_mul(2) + 2);
+                while done < out_len && steps < step_bound {
+                    steps += 1;
+                    let remaining = (out_len - done) as u64;
+
+                    // A clip wrap ends the run: flush the tail of the
+                    // cycle, restart the pattern, and carry on.
+                    let to_wrap = if *loop_samples > 0 {
+                        loop_samples.saturating_sub(phase)
+                    } else {
+                        u64::MAX
+                    };
+
+                    // The next event bounds the run too. Zero-length runs
+                    // are normal: several events can share one sample.
+                    let to_event = events
+                        .get(*cursor)
+                        .map(|e| e.sample.saturating_sub(phase))
+                        .unwrap_or(u64::MAX);
+
+                    let run = remaining.min(to_wrap).min(to_event) as usize;
+                    if run > 0 {
+                        voices.render(
+                            &mut out.l[done..done + run],
+                            *attack_rate,
+                            *release_coeff,
+                            &mut ramp,
+                        );
+                        done += run;
+                        phase += run as u64;
+                    }
+                    if done >= out_len {
+                        break;
+                    }
+
+                    if to_event <= to_wrap && *cursor < events.len() {
+                        // Fire every event stamped at this exact sample, in
+                        // compiled order — off before on, so a same-pitch
+                        // back-to-back pair does not kill its successor.
+                        while let Some(ev) = events.get(*cursor).copied() {
+                            if ev.sample > phase {
+                                break;
                             }
-                            *cursor = 0;
-                            *last_cycle = cyc;
-                        }
-                        *prev_phase = phase;
-                        // Fire every event at or before this sample's phase.
-                        while *cursor < events.len() && events[*cursor].beat <= phase {
-                            let ev = events[*cursor];
                             *cursor += 1;
                             if ev.rank == 0 {
-                                // note-off: release the matching gated voice
-                                for v in voices.iter_mut() {
-                                    if v.gate && v.pitch == ev.pitch {
-                                        v.gate = false;
-                                        break;
-                                    }
-                                }
+                                voices.note_off(ev.pitch);
                             } else {
-                                // note-on. A free voice is one that is BOTH
-                                // ungated and faded out — testing the
-                                // envelope alone hands back the voice
-                                // allocated one event earlier at this very
-                                // sample (its env is still 0.0), which is
-                                // how a chord collapses onto one voice.
-                                let slot = match voices
-                                    .iter()
-                                    .position(|v| !v.gate && v.env < ENV_FLOOR)
-                                {
-                                    Some(i) => i,
-                                    None => {
-                                        // Everything is sounding: steal a
-                                        // releasing voice before a held one,
-                                        // and the oldest before the newest.
-                                        // `(gate, age)` orders exactly that —
-                                        // false sorts before true.
-                                        let mut best = 0usize;
-                                        let mut key = (true, u64::MAX);
-                                        for (vi, v) in voices.iter().enumerate() {
-                                            if (v.gate, v.age) < key {
-                                                key = (v.gate, v.age);
-                                                best = vi;
-                                            }
-                                        }
-                                        best
-                                    }
-                                };
-                                // Wrapping is unreachable in practice: one
-                                // stamp per note-on, so 2^64 notes.
                                 let age = *next_age;
                                 *next_age = next_age.wrapping_add(1);
-                                voices[slot] = Voice {
-                                    pitch: ev.pitch,
-                                    phase: 0.0,
-                                    freq: 440.0 * ((ev.pitch as f32 - 69.0) / 12.0).exp2(),
-                                    env: 0.0,
-                                    amp: ev.vel as f32 / 127.0,
-                                    gate: true,
-                                    age,
-                                };
+                                voices.note_on(ev.pitch, ev.vel, age, *sample_rate);
                             }
                         }
+                    } else {
+                        // The wrap, seen mid-segment.
+                        flush_cycle(voices, events, cursor);
+                        phase = 0;
+                        cycle += 1;
                     }
-
-                    // Render voices at the compiled attack/release rates.
-                    let mut acc = 0.0f32;
-                    for v in voices.iter_mut() {
-                        if v.env < ENV_FLOOR && !v.gate {
-                            continue;
-                        }
-                        if v.gate {
-                            v.env = (v.env + *attack_rate).min(1.0);
-                        } else {
-                            v.env *= *release_coeff;
-                        }
-                        acc += (v.phase * TAU).sin() * v.env * v.amp;
-                        v.phase = (v.phase + v.freq / *sample_rate).fract();
-                    }
-                    *s = acc * 0.25 * *gain; // headroom across 8 voices
-                    *gain += gain_step;
                 }
+                if done < out_len {
+                    // The bound tripped, which the proof above says cannot
+                    // happen. Fail to SILENCE rather than to whatever the
+                    // arena slot held last: a metered node must fill its
+                    // whole buffer, and the allocator recycles slots
+                    // between nodes.
+                    out.l[done..].fill(0.0);
+                }
+                *last_cycle = cycle;
+                *prev_phase = phase;
                 *gain = *target_gain; // land exactly, no float drift
             }
 
@@ -1891,8 +2158,17 @@ impl GraphSpec {
         block_frames: usize,
         bpm: f64,
     ) -> Result<Schedule, CompileError> {
+        // Clamped to the same range the transport accepts, not merely
+        // tested for positivity. The node now trusts the COMPILED tempo
+        // rather than the live one, so this is the only thing standing
+        // between a caller's tempo and a `samples_per_beat` large enough to
+        // saturate every event stamp to `u64::MAX`. `bounce` takes its bpm
+        // from a public field with no invariant.
         let bpm = if bpm.is_finite() && bpm > 0.0 {
-            bpm
+            bpm.clamp(
+                crate::audio::transport::BPM_MIN,
+                crate::audio::transport::BPM_MAX,
+            )
         } else {
             120.0
         };
@@ -1982,29 +2258,48 @@ impl GraphSpec {
                                 }
                                 end = end.min(*len);
                             }
+                            // Musical time becomes SAMPLES here and only
+                            // here — the contract's rule 1, and the whole
+                            // reason `compile_at_tempo` takes a tempo.
+                            // Rounding is to nearest so a note does not
+                            // consistently land early.
+                            let stamp = |beats: f64| -> u64 {
+                                (beats * samples_per_beat).round().max(0.0) as u64
+                            };
+                            let on = stamp(n.start_beats);
+                            // The drop test above is in BEATS but the stamp
+                            // rounds to SAMPLES, so a note within half a
+                            // sample of the clip end survives the first
+                            // check and lands exactly ON the loop boundary.
+                            // The wrap flush is already past that point, so
+                            // such a note-on would gate a voice nothing
+                            // ever releases — a hanging note from a note
+                            // too short to hear.
+                            if let Some(len) = loop_len_beats
+                                && on >= stamp(*len)
+                            {
+                                continue;
+                            }
                             events.push(SeqEvent {
-                                beat: n.start_beats,
+                                sample: on,
                                 rank: 1,
                                 pitch: n.pitch,
                                 vel: n.vel,
                             });
                             events.push(SeqEvent {
-                                beat: end,
+                                sample: stamp(end),
                                 rank: 0,
                                 pitch: n.pitch,
                                 vel: 0,
                             });
                         }
-                        events.sort_by(|a, b| {
-                            a.beat
-                                .partial_cmp(&b.beat)
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                                .then(a.rank.cmp(&b.rank))
-                        });
+                        // (sample, rank): rank 0 = off, so an off at the
+                        // same sample as an on always lands first.
+                        events.sort_by(|a, b| a.sample.cmp(&b.sample).then(a.rank.cmp(&b.rank)));
                         Node::Seq {
                             events,
                             cursor: 0,
-                            voices: [Voice::default(); SEQ_VOICES],
+                            voices: VoiceBank::default(),
                             next_age: 0,
                             sample_rate: sample_rate as f32,
                             // RON round-trips NaN literals, so a hand-edited
@@ -2025,9 +2320,15 @@ impl GraphSpec {
                                 params.release_ms,
                                 sample_rate as f32,
                             ),
-                            loop_len: *loop_len_beats,
+                            // The pattern's length in samples at this
+                            // tempo. Zero when there is no loop, which the
+                            // walk reads as "never wrap".
+                            loop_samples: loop_len_beats
+                                .map(|len| (len * samples_per_beat).round().max(0.0) as u64)
+                                .unwrap_or(0),
+                            samples_per_beat,
                             last_cycle: 0,
-                            prev_phase: 0.0,
+                            prev_phase: 0,
                         }
                     }
                     Some(NodeSpec::AudioClip {
@@ -2755,7 +3056,7 @@ mod tests {
         let Some(Node::Seq { voices, .. }) = sched.nodes.first() else {
             panic!("the graph should hold one Seq");
         };
-        let held: Vec<u8> = voices.iter().filter(|v| v.gate).map(|v| v.pitch).collect();
+        let held: Vec<u8> = voices.held().collect();
         assert_eq!(held.len(), SEQ_VOICES, "all eight voices are held");
         assert!(
             !held.contains(&60),
@@ -3735,6 +4036,248 @@ mod tests {
         let starts: Vec<f64> = out.iter().map(|n| n.start_beats).collect();
         assert_eq!(starts, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
         assert_eq!(expanded_len_beats(4.0, &subs), 6.0);
+    }
+
+    /// What a sequencer block costs. Printed, not asserted — a number to
+    /// argue with, following the `dsp::noise` cost-report idiom.
+    ///
+    /// The interesting comparison is a DENSE pattern against a sparse one.
+    /// The old consumer did per-sample float work regardless of how many
+    /// notes existed, so both cost the same; the run-based walk should make
+    /// the sparse case cheaper, because event handling is per event rather
+    /// than per sample.
+    #[test]
+    fn report_seq_cost_per_sample() {
+        use std::time::Instant;
+        const REPS: usize = 4_000;
+
+        let row = |name: &str, notes: Vec<Note>, loop_len: Option<f64>| {
+            let mut spec = GraphSpec::default();
+            let q = spec.push(NodeSpec::Seq {
+                notes,
+                subloops: Vec::new(),
+                loop_len_beats: loop_len,
+                params: Default::default(),
+            });
+            spec.set_output(q);
+            let Ok(mut sched) = spec.compile(48_000, 256) else {
+                return;
+            };
+            let mut out = vec![0.0f32; 512];
+            let bps = 120.0 / 60.0 / 48_000.0;
+            let mut beat = 0.0;
+            let step = |sched: &mut Schedule, out: &mut Vec<f32>, beat: &mut f64| {
+                sched.run(out, &play_ctx(*beat, false));
+                *beat += 256.0 * bps;
+                // Without this the optimizer can delete the whole loop —
+                // the noise bench reported 0.00 ns/sample before it learned
+                // this the hard way.
+                std::hint::black_box(out);
+            };
+            for _ in 0..200 {
+                step(&mut sched, &mut out, &mut beat);
+            }
+            let t = Instant::now();
+            for _ in 0..REPS {
+                step(&mut sched, &mut out, &mut beat);
+            }
+            let ns = t.elapsed().as_nanos() as f64 / (REPS * 256) as f64;
+            println!("{name:<24} {ns:6.2} ns/sample");
+        };
+
+        row("silent (no notes)", Vec::new(), None);
+        row(
+            "sparse (1 note/beat)",
+            (0..16)
+                .map(|i| Note {
+                    start_beats: f64::from(i),
+                    len_beats: 0.5,
+                    pitch: 60 + (i % 12) as u8,
+                    vel: 100,
+                })
+                .collect(),
+            None,
+        );
+        row(
+            "dense (16ths, 8 voices)",
+            (0..256)
+                .map(|i| Note {
+                    start_beats: f64::from(i) * 0.25,
+                    len_beats: 2.0, // overlapping: keeps all 8 voices busy
+                    pitch: 48 + (i % 24) as u8,
+                    vel: 100,
+                })
+                .collect(),
+            None,
+        );
+        row(
+            "clip loop (1 bar)",
+            (0..4)
+                .map(|i| Note {
+                    start_beats: f64::from(i),
+                    len_beats: 0.5,
+                    pitch: 60,
+                    vel: 100,
+                })
+                .collect(),
+            Some(4.0),
+        );
+    }
+
+    /// A clip whose cycle length is an exact multiple of the block size.
+    ///
+    /// The wrap is detected while walking a segment, so a boundary landing
+    /// exactly on a segment END was skipped by the "done, stop walking"
+    /// exit — the pattern never rewound, and any note-off clamped to the
+    /// clip end never fired. One bar at 120bpm/48kHz is 96000 samples and
+    /// the default block is 256: 375 blocks exactly. Ordinary clip lengths
+    /// hit this, and the existing clip tests all used one beat (93.75
+    /// blocks), which never aligns.
+    #[test]
+    fn a_clip_wrapping_on_a_block_edge_still_repeats() {
+        // Four beats, a note on each: cycle length 96000 samples. The
+        // last note runs a full beat so its off is CLAMPED to the clip
+        // end and lands exactly on the wrap — that off is the hanging-note
+        // half of the bug, and a shorter note would never test it.
+        let notes: Vec<Note> = (0..4)
+            .map(|i| Note {
+                start_beats: f64::from(i),
+                len_beats: if i == 3 { 1.0 } else { 0.5 },
+                pitch: 60,
+                vel: 110,
+            })
+            .collect();
+        let mut spec = GraphSpec::default();
+        let q = spec.push(NodeSpec::Seq {
+            notes,
+            subloops: Vec::new(),
+            loop_len_beats: Some(4.0),
+            params: Default::default(),
+        });
+        spec.set_output(q);
+        let mut sched = spec.compile(48_000, 256).unwrap();
+
+        // Drive from the TimeMap, not an accumulated float: the aligned
+        // case only appears when the beat is derived exactly, which is
+        // what bounce and the live callback both do.
+        let map = crate::audio::transport::TimeMap {
+            bpm: 120.0,
+            sample_rate: 48_000.0,
+        };
+        let level_of_cycle = |sched: &mut Schedule, cycle: u64| -> f32 {
+            let mut peak = 0.0f32;
+            let mut out = vec![0.0f32; 512];
+            // Blocks 0..375 of this cycle.
+            for b in 0..375u64 {
+                let pos = cycle * 96_000 + b * 256;
+                let mut c = play_ctx(map.samples_to_beats(pos), false);
+                c.discontinuity = cycle == 0 && b == 0;
+                sched.run(&mut out, &c);
+                peak = peak.max(out[..256].iter().fold(0.0f32, |m, s| m.max(s.abs())));
+            }
+            peak
+        };
+
+        let first = level_of_cycle(&mut sched, 0);
+        assert!(first > 0.05, "the first cycle should sound ({first})");
+        let second = level_of_cycle(&mut sched, 1);
+        assert!(
+            second > 0.05,
+            "a clip must keep repeating across an aligned wrap \
+             (first {first}, second {second})"
+        );
+        let third = level_of_cycle(&mut sched, 2);
+        assert!(third > 0.05, "and keep going ({third})");
+    }
+
+    /// Contract rule 1, made observable: a note starts at an exact SAMPLE,
+    /// and moving its start by one sample moves the onset by one sample.
+    ///
+    /// The old beat-stamped consumer compared an f64 phase per sample, so
+    /// onsets landed wherever the accumulated float said; this asserts the
+    /// integer stamp instead. A note's first sample is silent by
+    /// construction (phase starts at 0, and sin(0) is 0), so the onset is
+    /// read as the first sample that moves.
+    #[test]
+    fn a_note_starts_on_its_exact_sample() {
+        const SPB: f64 = 24_000.0; // samples per beat at 120bpm / 48kHz
+
+        let onset_for = |start_sample: u64| -> usize {
+            let mut sched = seq_sched(vec![Note {
+                start_beats: start_sample as f64 / SPB,
+                len_beats: 1.0,
+                pitch: 69,
+                vel: 127,
+            }]);
+            let mut out = vec![0.0f32; 512];
+            sched.run(&mut out, &play_ctx(0.0, true));
+            out[..256]
+                .iter()
+                .position(|s| s.abs() > 0.0)
+                .unwrap_or(usize::MAX)
+        };
+
+        let a = onset_for(100);
+        assert!(
+            (100..=102).contains(&a),
+            "a note stamped at sample 100 should start there, not at {a}"
+        );
+
+        // The real claim: sample resolution, not block or beat resolution.
+        let b = onset_for(110);
+        assert_eq!(
+            b - a,
+            10,
+            "moving the note 10 samples must move the onset 10 samples \
+             ({a} -> {b})"
+        );
+
+        // And everything before the onset is exactly silent, not merely
+        // quiet — nothing may leak from before a note begins.
+        let mut sched = seq_sched(vec![Note {
+            start_beats: 100.0 / SPB,
+            len_beats: 1.0,
+            pitch: 69,
+            vel: 127,
+        }]);
+        let mut out = vec![0.0f32; 512];
+        sched.run(&mut out, &play_ctx(0.0, true));
+        assert!(
+            out[..100].iter().all(|s| *s == 0.0),
+            "silence before a note must be exact"
+        );
+    }
+
+    /// Several events landing on ONE sample all fire there, in compiled
+    /// order. The run-based walk emits zero-length runs for this, and a
+    /// walk that skipped them would drop every event after the first.
+    #[test]
+    fn stacked_events_on_one_sample_all_fire() {
+        // A chord: three notes at the same beat, so six events share two
+        // sample stamps.
+        let notes: Vec<Note> = [60, 64, 67]
+            .into_iter()
+            .map(|pitch| Note {
+                start_beats: 0.25,
+                len_beats: 0.5,
+                pitch,
+                vel: 100,
+            })
+            .collect();
+        let mut sched = seq_sched(notes);
+        let mut out = Vec::new();
+        run_rolling(&mut sched, 40, &mut out);
+
+        let Some(Node::Seq { voices, .. }) = sched.nodes.first() else {
+            panic!("the graph should hold one Seq");
+        };
+        let mut held: Vec<u8> = voices.held().collect();
+        held.sort_unstable();
+        assert_eq!(
+            held,
+            vec![60, 64, 67],
+            "every note of a chord stamped at one sample must sound"
+        );
     }
 
     #[test]

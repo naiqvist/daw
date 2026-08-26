@@ -51,6 +51,14 @@ note-off before note-on on ties, sequences ride compiled immutable chunks
 (never streamed from UI), every node classified free-running vs
 timeline-locked.
 
+## Before writing instrument / synth nodes
+
+Read `notes/20260825-synth-brief.md` FIRST: the workhorse synth spec, the
+audio-rate modulation matrix (per-sample, per-voice, lane-major, baked at
+compile, no feedback), and the UI ease-mechanics. Voices are lane-major SoA
+(`[f32; LANES]` per parameter), never `[Voice; N]` structs.
+
+
 ## Project facts worth not re-deriving
 
 - The empty `[workspace]` stanza in Cargo.toml blocks cargo's upward walk to
