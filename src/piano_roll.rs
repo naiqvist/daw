@@ -173,7 +173,7 @@ use eframe::egui;
 use std::collections::HashSet;
 
 use crate::{Clip, Focus, GRID_BEATS, GRID_DEFAULT, GRID_NAMES, Key, Note, claim};
-use daw::theory::{ChordSymbol, Voicing};
+use daw::theory::{self, ChordSymbol, Voicing};
 
 /// One lockable parameter of the track's instrument, as the plock editor
 /// lists it: the table id the engine understands, the words the user
@@ -232,7 +232,6 @@ impl PlockParam {
         }
     }
 }
-use daw::theory;
 
 // --- geometry, all in logical points -----------------------------------
 
@@ -945,6 +944,280 @@ fn append_entry(entry: &mut ChordEntry, text: &str) {
     }
 }
 
+/// A shipped harmonic idiom: one symbol standing for a whole gesture.
+///
+/// The catalogue is chromatic ninth-chord vamps, which is a specific thing
+/// a specific music does — two chords a semitone apart, the fifth omitted,
+/// voiced as a cluster. A chord symbol cannot say that. `!fm9` names five
+/// intervals and is silent about the two things that make the sound: how
+/// the voices are spaced, and what the next chord is.
+///
+/// Names are DESCRIPTIONS. `m9` says what it builds and cannot be wrong
+/// about it. Genre names live in [`IDIOM_ALIASES`] instead, because
+/// "house" is a citation rather than a definition — there are many houses,
+/// and someone is entitled to disagree that this is the one.
+struct Idiom {
+    name: &'static str,
+    /// Cycled over the generated chords, so a two-quality entry alternates
+    /// and a one-quality entry repeats. `--q a,b` overrides it.
+    qualities: &'static [&'static str],
+    /// Semitones from each chord to the next. Chromatic means one.
+    step: i16,
+    gloss: &'static str,
+}
+
+/// Twelve, one per ninth-chord quality worth vamping on. Direction, length,
+/// register, count and spacing are modifiers rather than more entries —
+/// otherwise the catalogue is a hundred rows and none of them teach you the
+/// axis they vary along.
+const IDIOMS: &[Idiom] = &[
+    Idiom {
+        name: "m9",
+        qualities: &["m9no5"],
+        step: -1,
+        gloss: "minor 9th — the deep-house vamp",
+    },
+    Idiom {
+        name: "maj9",
+        qualities: &["M9no5"],
+        step: -1,
+        gloss: "major 9th — lush, lifted",
+    },
+    Idiom {
+        name: "dom9",
+        qualities: &["9no5"],
+        step: -1,
+        gloss: "dominant 9th — the funk slide",
+    },
+    Idiom {
+        name: "sus9",
+        qualities: &["9sus4no5"],
+        step: -1,
+        gloss: "9sus4 — no third to commit you",
+    },
+    Idiom {
+        name: "m11",
+        qualities: &["m11no5"],
+        step: -1,
+        gloss: "minor 11th — wider, hazier",
+    },
+    Idiom {
+        name: "m13",
+        qualities: &["m13no5"],
+        step: -1,
+        gloss: "minor 13th — the whole stack",
+    },
+    Idiom {
+        name: "add9",
+        qualities: &["add9"],
+        step: -1,
+        gloss: "triad plus 9 — no seventh, bright",
+    },
+    Idiom {
+        name: "six9",
+        qualities: &["6add9"],
+        step: -1,
+        gloss: "6/9 — landed, going nowhere",
+    },
+    Idiom {
+        name: "m69",
+        qualities: &["m6add9no5"],
+        step: -1,
+        gloss: "minor 6/9 — dorian, not aeolian",
+    },
+    Idiom {
+        name: "mmaj9",
+        qualities: &["minMaj9no5"],
+        step: -1,
+        gloss: "minor-major 9th — the uneasy one",
+    },
+    Idiom {
+        name: "alt9",
+        qualities: &["7#9no5"],
+        step: -1,
+        gloss: "7#9 — grit inside the vamp",
+    },
+    Idiom {
+        name: "half9",
+        qualities: &["m9b5"],
+        step: -1,
+        gloss: "half-diminished 9th — unresolved",
+    },
+];
+
+/// Genre names, kept apart from the catalogue on purpose. An alias is a
+/// citation: it points at a practice rather than describing an interval, so
+/// it is the part of this vocabulary that can be argued with.
+const IDIOM_ALIASES: &[(&str, &str, i16)] = &[
+    ("house", "m9", -1),
+    ("lift", "m9", 1),
+    ("deep", "maj9", -1),
+    ("garage", "sus9", -1),
+];
+
+const IDIOM_MAX_CHORDS: usize = 8;
+
+fn find_idiom(name: &str) -> Option<(&'static Idiom, i16)> {
+    if let Some(idiom) = IDIOMS.iter().find(|idiom| idiom.name == name) {
+        return Some((idiom, idiom.step));
+    }
+    let (_, target, step) = IDIOM_ALIASES.iter().find(|(alias, ..)| *alias == name)?;
+    IDIOMS
+        .iter()
+        .find(|idiom| idiom.name == *target)
+        .map(|idiom| (idiom, *step))
+}
+
+/// Expand every `@idiom` in the entry into the chord language proper.
+///
+/// The rule that makes this a shorthand rather than a black box: an idiom
+/// emits tokens the user could have typed themselves. `@house f` becomes
+/// `4 !fm9no5:1bar 3 !em9no5:1bar cluster`, the preview line shows exactly
+/// that, and every part of it is then editable by hand. A symbol that
+/// cannot be unfolded teaches nothing and varies only in the ways it was
+/// told to vary.
+fn expand_idioms(source: &str, cursor_pitch: u8) -> Result<String, String> {
+    let tokens: Vec<&str> = source.split_whitespace().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut cursor = 0;
+    // Clustering is a property of the whole entry, not of one idiom, because
+    // that is how `cluster` and `voicelead` already work. So two idioms that
+    // disagree about it is a question with no answer, and the entry says so
+    // rather than quietly clustering something that asked not to be.
+    let mut wants_cluster: Option<bool> = None;
+
+    while cursor < tokens.len() {
+        let Some(name) = tokens[cursor].strip_prefix('@') else {
+            out.push(tokens[cursor].to_owned());
+            cursor += 1;
+            continue;
+        };
+        let (idiom, default_step) = find_idiom(name).ok_or_else(|| {
+            let known: Vec<&str> = IDIOMS.iter().map(|idiom| idiom.name).collect();
+            format!("unknown idiom `@{name}`; try @{}", known.join(", @"))
+        })?;
+        cursor += 1;
+
+        // Register and root both default to wherever the cursor is parked,
+        // which is what every other head in this language does. A root that
+        // spells its own octave (`@house f3`) outranks both.
+        let mut octave = i16::from(cursor_pitch / 12) - 1;
+        let mut root_pc = cursor_pitch % 12;
+        if let Some(token) = tokens.get(cursor)
+            && !token.starts_with(['-', '!', '@', '|', ':'])
+        {
+            let root = ChordSymbol::parse(token).map_err(|_| {
+                format!("`@{name}` wants a note name such as f or c#, not `{token}`")
+            })?;
+            root_pc = root.root_pc;
+            if let Some(spelled) = root.root_octave {
+                octave = spelled;
+            }
+            cursor += 1;
+        }
+
+        let mut step = default_step;
+        let mut chords = 2usize;
+        let mut duration = "1bar".to_owned();
+        let mut qualities: Vec<String> = idiom
+            .qualities
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect();
+        let mut clustered = true;
+
+        while let Some(&modifier) = tokens.get(cursor) {
+            if modifier == "--nocluster" {
+                clustered = false;
+                cursor += 1;
+                continue;
+            }
+            if !matches!(
+                modifier,
+                "--step" | "--n" | "--dur" | "--len" | "--oct" | "--q"
+            ) {
+                break;
+            }
+            let value = tokens
+                .get(cursor + 1)
+                .ok_or_else(|| format!("`{modifier}` needs a value"))?;
+            match modifier {
+                "--step" => {
+                    step = value
+                        .parse::<i16>()
+                        .ok()
+                        .filter(|step| (-12..=12).contains(step))
+                        .ok_or_else(|| {
+                            format!("`--step` is semitones between -12 and 12, not `{value}`")
+                        })?;
+                }
+                "--n" => {
+                    chords = value
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|count| (1..=IDIOM_MAX_CHORDS).contains(count))
+                        .ok_or_else(|| {
+                            format!("`--n` is 1 to {IDIOM_MAX_CHORDS} chords, not `{value}`")
+                        })?;
+                }
+                "--dur" | "--len" => duration = (*value).to_owned(),
+                "--oct" => {
+                    octave = value
+                        .parse::<i16>()
+                        .map_err(|_| format!("invalid octave `{value}`"))?;
+                }
+                "--q" => {
+                    qualities = value
+                        .split(',')
+                        .filter(|quality| !quality.is_empty())
+                        .map(|quality| quality.to_owned())
+                        .collect();
+                    if qualities.is_empty() {
+                        return Err("`--q` needs a chord quality such as m9no5".to_owned());
+                    }
+                }
+                _ => unreachable!(),
+            }
+            cursor += 2;
+        }
+
+        let base = (octave + 1) * 12 + i16::from(root_pc);
+        for index in 0..chords {
+            let pitch = base + step * index as i16;
+            if !(0..=i16::from(theory::MAX_PITCH)).contains(&pitch) {
+                return Err(format!(
+                    "`@{name}` walks off the keyboard after {index} chords; try a smaller --n or --step"
+                ));
+            }
+            let quality = &qualities[index % qualities.len()];
+            out.push(format!("{}", pitch / 12 - 1));
+            out.push(format!(
+                "!{}{quality}:{duration}",
+                theory::pitch_class_name((pitch % 12) as u8).to_lowercase()
+            ));
+        }
+        if wants_cluster.is_some_and(|wish| wish != clustered) {
+            return Err(
+                "`--nocluster` applies to the whole entry, so every idiom in it must agree"
+                    .to_owned(),
+            );
+        }
+        wants_cluster = Some(clustered);
+    }
+
+    match wants_cluster {
+        Some(true) if !out.iter().any(|token| token == "cluster") => {
+            out.push("cluster".to_owned());
+        }
+        Some(false) if out.iter().any(|token| token == "cluster") => {
+            return Err("this entry both asks for `cluster` and passes `--nocluster`".to_owned());
+        }
+        _ => {}
+    }
+
+    Ok(out.join(" "))
+}
+
 /// Parse the terse chord-entry language into ordinary clip notes.
 ///
 /// Supported first slice:
@@ -966,12 +1239,27 @@ fn parse_chord_entry(
     key: Key,
     beats_per_bar: u32,
 ) -> Result<ChordEntryPlan, String> {
+    // Idioms expand FIRST, into tokens the rest of this function already
+    // knows how to read. There is no second parser and no privileged path:
+    // `@house f` is exactly as powerful as what it unfolds to, which is the
+    // whole point of it unfolding.
+    let source = expand_idioms(source, cursor_pitch)?;
+    let source = source.as_str();
+
     let voice_lead = source
         .split_whitespace()
         .any(|token| matches!(token, "voicelead" | "--voicelead"));
+    let clustered = source
+        .split_whitespace()
+        .any(|token| matches!(token, "cluster" | "--cluster"));
     let tokens: Vec<&str> = source
         .split_whitespace()
-        .filter(|token| !matches!(*token, "voicelead" | "--voicelead"))
+        .filter(|token| {
+            !matches!(
+                *token,
+                "voicelead" | "--voicelead" | "cluster" | "--cluster"
+            )
+        })
         .collect();
     if tokens.is_empty() {
         return Err("type a chord, for example 2 !cM9 i 2".to_owned());
@@ -1168,11 +1456,48 @@ fn parse_chord_entry(
     if voice_lead {
         voice_lead_progression(&mut notes);
     }
+    if clustered {
+        cluster_progression(&mut notes);
+    }
     Ok(ChordEntryPlan {
         notes,
         advance: at - cursor_beat,
         clip_length,
     })
+}
+
+/// Re-voice every simultaneity as a cluster.
+///
+/// Runs AFTER `voicelead` deliberately. Voice leading chooses a register by
+/// rotating inversions, and a cluster then discards that spacing; doing it
+/// in this order means the two compose — voicelead picks the octave,
+/// cluster picks the spacing — instead of the second silently undoing the
+/// first.
+///
+/// Rebuilt rather than mutated in place because a cluster collapses
+/// doublings, so a chord can come out with FEWER notes than it went in
+/// with. Every voice of one chord shares its length, velocity and
+/// probability, so the group's first note serves as the template.
+fn cluster_progression(notes: &mut Vec<Note>) {
+    let mut starts: Vec<f64> = notes.iter().map(|note| note.start).collect();
+    starts.sort_by(f64::total_cmp);
+    starts.dedup_by(|a, b| a.total_cmp(b).is_eq());
+
+    let mut voiced: Vec<Note> = Vec::with_capacity(notes.len());
+    for start in starts {
+        let group: Vec<&Note> = notes.iter().filter(|note| note.start == start).collect();
+        let Some(template) = group.first().copied().cloned() else {
+            continue;
+        };
+        let pitches: Vec<u8> = group.iter().map(|note| note.pitch).collect();
+        for pitch in theory::cluster(&pitches) {
+            voiced.push(Note {
+                pitch,
+                ..template.clone()
+            });
+        }
+    }
+    *notes = voiced;
 }
 
 fn parse_percent(value: &str, name: &str) -> Result<f64, String> {
@@ -2010,11 +2335,40 @@ fn script_help(ui: &mut egui::Ui, theme: &Theme, rect: egui::Rect) {
                 "EXPRESSION",
                 "--vel 110   --gate 75%   --dur 1bar   --len 1/8",
             );
+            // Written from the catalogue rather than beside it: a row added
+            // to IDIOMS shows up here, and a name on this page always names
+            // something that parses.
+            let idioms = IDIOMS
+                .iter()
+                .map(|idiom| format!("@{} — {}", idiom.name, idiom.gloss))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let aliases = IDIOM_ALIASES
+                .iter()
+                .map(|(alias, target, step)| {
+                    format!("@{alias} = @{target} {step:+}")
+                })
+                .collect::<Vec<_>>()
+                .join(" · ");
+            help_group(
+                ui,
+                theme,
+                "IDIOMS",
+                &format!(
+                    "@house f = two clustered minor 9ths a semitone apart\n{idioms}\n{aliases}"
+                ),
+            );
+            help_group(
+                ui,
+                theme,
+                "IDIOM OPTIONS",
+                "--step -2   --n 4   --q m9no5,M9no5   --oct 3   --dur 1bar   --nocluster",
+            );
             help_group(
                 ui,
                 theme,
                 "STRUCTURE",
-                "Space separates events · | is a visual separator · voicelead revoices the progression",
+                "Space separates events · | is a visual separator\nvoicelead revoices the progression · cluster packs it into seconds",
             );
             help_group(
                 ui,
@@ -2026,7 +2380,7 @@ fn script_help(ui: &mut egui::Ui, theme: &Theme, rect: egui::Rect) {
                 ui,
                 theme,
                 "EXAMPLE",
-                "3 !vi7:1bar 3 !Imaj7:1bar | voicelead",
+                "3 !vi7:1bar 3 !Imaj7:1bar | voicelead\n@house f --dur 2beat --n 4",
             );
         });
 }
@@ -6098,6 +6452,180 @@ mod tests {
         assert_eq!(plan.notes[0].len, 3.0);
         assert_eq!(plan.notes[4].start, 3.0);
         assert_eq!(plan.advance, 5.0);
+    }
+
+    // ------------------------------------------------------------ idioms ---
+
+    fn idiom_pitches(source: &str) -> Vec<Vec<u8>> {
+        let plan = parse_chord_entry(source, C4, 0.0, 0.25, Key::default(), 4)
+            .unwrap_or_else(|why| panic!("`{source}`: {why}"));
+        let mut starts: Vec<f64> = plan.notes.iter().map(|note| note.start).collect();
+        starts.sort_by(f64::total_cmp);
+        starts.dedup_by(|a, b| a.total_cmp(b).is_eq());
+        starts
+            .into_iter()
+            .map(|start| {
+                let mut chord: Vec<u8> = plan
+                    .notes
+                    .iter()
+                    .filter(|note| note.start == start)
+                    .map(|note| note.pitch)
+                    .collect();
+                chord.sort_unstable();
+                chord
+            })
+            .collect()
+    }
+
+    /// The promise the whole design rests on: an idiom is a shorthand, not a
+    /// second language. It expands into tokens the user could have typed.
+    #[test]
+    fn an_idiom_unfolds_into_the_chord_language() {
+        assert_eq!(
+            expand_idioms("@house f", C4).unwrap(),
+            "4 !fm9no5:1bar 4 !em9no5:1bar cluster"
+        );
+        // No root: the cursor's pitch class, exactly like every other head.
+        // Note the octave: a chromatic descent from C4 lands on B3, because
+        // the step is arithmetic on pitch and not on a letter name.
+        assert_eq!(
+            expand_idioms("@m9", C4).unwrap(),
+            "4 !cm9no5:1bar 3 !bm9no5:1bar cluster"
+        );
+        // A root may spell its own octave, and then it wins.
+        assert_eq!(
+            expand_idioms("@lift a2 --n 3", C4).unwrap(),
+            "2 !am9no5:1bar 2 !a#m9no5:1bar 2 !bm9no5:1bar cluster"
+        );
+        // Idioms compose with hand-written events rather than replacing them.
+        assert_eq!(
+            expand_idioms("!cM9:q @house f", C4).unwrap(),
+            "!cM9:q 4 !fm9no5:1bar 4 !em9no5:1bar cluster"
+        );
+    }
+
+    /// The gesture itself: two minor ninths a semitone apart, fifth gone,
+    /// voiced as stacks of seconds rather than stacks of thirds.
+    #[test]
+    fn the_house_vamp_is_two_clustered_ninths_a_semitone_apart() {
+        let chords = idiom_pitches("@house f");
+        assert_eq!(chords.len(), 2);
+        // Eb F G Ab, then D E F# G — secundal, not tertian.
+        assert_eq!(chords[0], vec![63, 65, 67, 68]);
+        assert_eq!(chords[1], vec![62, 64, 66, 67]);
+        for chord in &chords {
+            let span = chord[chord.len() - 1] - chord[0];
+            assert!(span <= 11, "{chord:?} is not a cluster");
+            // The fifth is what the idiom omits; nothing sits 7 above the root.
+            assert!(!chord.iter().any(|pitch| chord.contains(&(pitch + 7))));
+        }
+    }
+
+    /// Every row of the catalogue and every alias builds something playable.
+    /// A shipped name that does not parse is a broken promise on the help
+    /// page, and the help page is where people learn this vocabulary.
+    #[test]
+    fn every_shipped_idiom_builds_a_playable_vamp() {
+        let names = IDIOMS
+            .iter()
+            .map(|idiom| idiom.name)
+            .chain(IDIOM_ALIASES.iter().map(|(alias, ..)| *alias));
+        for name in names {
+            let chords = idiom_pitches(&format!("@{name} f"));
+            assert_eq!(chords.len(), 2, "@{name} should be a two-chord vamp");
+            for chord in &chords {
+                assert!(chord.len() >= 3, "@{name} built {chord:?}");
+                let span = chord[chord.len() - 1] - chord[0];
+                assert!(span <= 11, "@{name} built {chord:?}, which is no cluster");
+            }
+            // Chromatic: the two roots are a semitone apart as pitch-class sets.
+            assert_ne!(chords[0], chords[1], "@{name} repeats one chord");
+        }
+    }
+
+    #[test]
+    fn idiom_modifiers_change_step_count_length_and_quality() {
+        // Four chords descending by whole tones, a bar each.
+        let wide = idiom_pitches("@m9 c --step -2 --n 4");
+        assert_eq!(wide.len(), 4);
+
+        // Alternating qualities, cycled over the chords.
+        assert_eq!(
+            expand_idioms("@m9 c --q m9no5,M9no5 --n 4", C4).unwrap(),
+            "4 !cm9no5:1bar 3 !bM9no5:1bar 3 !a#m9no5:1bar 3 !aM9no5:1bar cluster"
+        );
+
+        // Register and length are the idiom's, not the cursor's, when asked.
+        assert_eq!(
+            expand_idioms("@house f --oct 2 --dur q", C4).unwrap(),
+            "2 !fm9no5:q 2 !em9no5:q cluster"
+        );
+
+        // The help page's own example, kept honest: a page that teaches a
+        // line this language cannot read is worse than no page.
+        assert_eq!(idiom_pitches("@house f --dur 2beat --n 4").len(), 4);
+
+        // Two idioms in one entry must agree about it, since the transform
+        // is entry-wide.
+        assert!(
+            expand_idioms("@house f @m9 c --nocluster", C4)
+                .unwrap_err()
+                .contains("whole entry")
+        );
+        assert!(
+            expand_idioms("@house f --nocluster cluster", C4)
+                .unwrap_err()
+                .contains("nocluster")
+        );
+
+        // Opting out of the cluster leaves the chord's own spacing alone.
+        let open = idiom_pitches("@house f --nocluster");
+        assert_eq!(open[0], vec![65, 68, 75, 79]);
+    }
+
+    /// `cluster` is a voicing transform in its own right, not idiom-only
+    /// machinery — it works on anything the chord language can spell.
+    #[test]
+    fn cluster_stands_alone_as_a_voicing_transform() {
+        assert_eq!(idiom_pitches("4 !cm9no5 cluster")[0], vec![58, 60, 62, 63]);
+        // A doubled root collapses: a cluster has no doublings.
+        assert_eq!(idiom_pitches("4 !cmaj cluster")[0].len(), 3);
+        // Composes with voicelead, and clustering wins the spacing argument.
+        for chord in idiom_pitches("4 !am9no5:1bar 4 !dm9no5:1bar voicelead cluster") {
+            assert!(chord[chord.len() - 1] - chord[0] <= 11);
+        }
+    }
+
+    #[test]
+    fn an_idiom_that_cannot_be_built_says_so_instead_of_guessing() {
+        let why = expand_idioms("@techno f", C4).unwrap_err();
+        assert!(
+            why.contains("@m9"),
+            "an unknown idiom should list the real ones: {why}"
+        );
+
+        assert!(
+            expand_idioms("@house 9", C4)
+                .unwrap_err()
+                .contains("note name")
+        );
+        assert!(
+            expand_idioms("@house f --n 99", C4)
+                .unwrap_err()
+                .contains("--n")
+        );
+        assert!(
+            expand_idioms("@house f --step 40", C4)
+                .unwrap_err()
+                .contains("--step")
+        );
+        // Walking off the bottom of the keyboard refuses rather than wrapping
+        // an octave up, which would be a different progression.
+        assert!(
+            expand_idioms("@house c-1 --n 8 --step -12", C4)
+                .unwrap_err()
+                .contains("keyboard")
+        );
     }
 
     #[test]
