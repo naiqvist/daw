@@ -546,6 +546,92 @@ impl ChordSymbol {
     }
 }
 
+// -------------------------------------------------------- voicing transforms ---
+
+/// Fold a chord into its tightest voicing: every pitch class stacked inside
+/// the smallest span that can hold them.
+///
+/// This is the transform that makes seconds out of thirds. `Fm9no5` —
+/// F A♭ E♭ G — clusters to E♭ F G A♭, a four-note secundal stack, and that
+/// voicing rather than the `m9` label is what the record is actually built
+/// from. Chord symbols name intervals; this names a sound.
+///
+/// A cluster has no doublings by definition, so duplicate pitch classes
+/// collapse and the result can be SHORTER than the input.
+///
+/// Register is preserved rather than chosen: of the octave placements the
+/// stack could take, this returns the one whose centre sits nearest the
+/// original chord's, so clustering re-voices without also transposing. Ties
+/// go to the lower placement.
+///
+/// There is no looser variant, because a loose cluster is just a close
+/// voicing and we already have one. `cluster` means minimal, always.
+pub fn cluster(pitches: &[u8]) -> Vec<u8> {
+    if pitches.is_empty() {
+        return Vec::new();
+    }
+
+    let mut classes: Vec<i32> = pitches.iter().map(|pitch| i32::from(*pitch) % 12).collect();
+    classes.sort_unstable();
+    classes.dedup();
+    let voices = classes.len();
+
+    // The tightest rotation, found by stacking from each pitch class in turn
+    // and measuring. Exhaustive over a set of at most twelve is cheaper than
+    // being clever, and it cannot get the answer subtly wrong.
+    let mut best: Vec<i32> = Vec::new();
+    for start in 0..voices {
+        let mut stack = Vec::with_capacity(voices);
+        let mut last = classes[start];
+        stack.push(last);
+        for step in 1..voices {
+            let mut next = classes[(start + step) % voices];
+            while next <= last {
+                next += 12;
+            }
+            stack.push(next);
+            last = next;
+        }
+        if best.is_empty() || stack[voices - 1] - stack[0] < best[voices - 1] - best[0] {
+            best = stack;
+        }
+    }
+
+    // Nearest octave placement, compared as means. Scaled to integers rather
+    // than divided: `sum * len` on both sides keeps the comparison exact, and
+    // an exact comparison is what makes the tie-break reproducible.
+    let original: i32 = pitches.iter().map(|pitch| i32::from(*pitch)).sum();
+    let original_voices = pitches.len() as i32;
+    let unit = 12 * voices as i32 * original_voices;
+    let target = original * voices as i32;
+    let base = best.iter().sum::<i32>() * original_voices;
+    let mut shift = 0;
+    let mut closest = i32::MAX;
+    for octaves in -12..=12 {
+        let error = (base + octaves * unit - target).abs();
+        if error < closest {
+            closest = error;
+            shift = octaves;
+        }
+    }
+
+    let mut stack: Vec<i32> = best.iter().map(|pitch| pitch + shift * 12).collect();
+    // Walked into range rather than clamped: clamping would collapse two
+    // voices onto one pitch and stop being a cluster. A stack of at most
+    // twelve distinct classes spans at most 11 semitones, so it always fits.
+    while stack[0] < 0 {
+        stack.iter_mut().for_each(|pitch| *pitch += 12);
+    }
+    while stack[voices - 1] > i32::from(MAX_PITCH) {
+        stack.iter_mut().for_each(|pitch| *pitch -= 12);
+    }
+
+    stack
+        .into_iter()
+        .map(|pitch| pitch.clamp(0, i32::from(MAX_PITCH)) as u8)
+        .collect()
+}
+
 /// Drop `pitch` by octaves until it sits strictly under `floor`.
 fn below(mut pitch: i16, floor: i16) -> i16 {
     while pitch >= floor {
@@ -785,6 +871,105 @@ pub fn motion(prev: (u8, u8), now: (u8, u8)) -> Motion {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------ cluster ---
+
+    /// The voicing the whole idea exists for: `Fm9no5` becomes a stack of
+    /// seconds, not a stack of thirds.
+    #[test]
+    fn a_cluster_makes_seconds_out_of_thirds() {
+        // F4 m9 no5 as the symbol realises it: F Ab Eb G, spread over a 14th.
+        let voiced = vec![65, 68, 75, 79];
+        // Eb4 F4 G4 Ab4 — whole, whole, half.
+        assert_eq!(cluster(&voiced), vec![63, 65, 67, 68]);
+    }
+
+    #[test]
+    fn a_cluster_is_the_tightest_arrangement_available() {
+        for chord in [
+            vec![65, 68, 75, 79],
+            vec![60, 64, 67],
+            vec![60, 62, 65, 69, 74],
+            vec![60, 61, 62, 63, 64, 65, 66],
+        ] {
+            let clustered = cluster(&chord);
+            let span = clustered[clustered.len() - 1] - clustered[0];
+            // No rotation of the same pitch classes can do better.
+            let mut classes: Vec<i32> = chord.iter().map(|pitch| i32::from(*pitch) % 12).collect();
+            classes.sort_unstable();
+            classes.dedup();
+            for start in 0..classes.len() {
+                let low = classes[start];
+                let mut last = low;
+                for step in 1..classes.len() {
+                    let mut next = classes[(start + step) % classes.len()];
+                    while next <= last {
+                        next += 12;
+                    }
+                    last = next;
+                }
+                assert!(
+                    i32::from(span) <= last - low,
+                    "{chord:?} clustered to {clustered:?}, span {span}, but a rotation spans {}",
+                    last - low
+                );
+            }
+        }
+    }
+
+    /// A cluster is a re-voicing, not a transposition: it stays where the
+    /// chord already was.
+    #[test]
+    fn a_cluster_keeps_its_register() {
+        for chord in [
+            vec![65, 68, 75, 79],
+            vec![36, 43, 52],
+            vec![84, 88, 91, 95],
+            vec![60, 64, 67],
+        ] {
+            let clustered = cluster(&chord);
+            let mean = |voices: &[u8]| {
+                voices.iter().map(|pitch| i32::from(*pitch)).sum::<i32>() / voices.len() as i32
+            };
+            assert!(
+                (mean(&clustered) - mean(&chord)).abs() <= 6,
+                "{chord:?} clustered to {clustered:?} — that is a transposition"
+            );
+        }
+    }
+
+    /// Doublings are what a cluster has none of, so they collapse.
+    #[test]
+    fn a_cluster_has_no_doublings() {
+        // C major with the root doubled two octaves up.
+        assert_eq!(cluster(&[48, 52, 55, 72]).len(), 3);
+        assert_eq!(cluster(&[60, 60, 60]), vec![60]);
+    }
+
+    /// Total, like everything else here: every input shape answers.
+    #[test]
+    fn a_cluster_answers_for_every_chord() {
+        assert_eq!(cluster(&[]), Vec::<u8>::new());
+        assert_eq!(cluster(&[60]), vec![60]);
+        for low in 0..=127u8 {
+            let chord = vec![low, low.saturating_add(4), low.saturating_add(7)];
+            let clustered = cluster(&chord);
+            assert!(!clustered.is_empty());
+            for pair in clustered.windows(2) {
+                assert!(
+                    pair[0] < pair[1],
+                    "{chord:?} -> {clustered:?} is not ascending"
+                );
+            }
+            for pitch in &clustered {
+                assert!(*pitch <= MAX_PITCH);
+                assert!(
+                    chord.iter().any(|other| other % 12 == pitch % 12),
+                    "{chord:?} -> {clustered:?} invented a pitch class"
+                );
+            }
+        }
+    }
 
     #[test]
     fn chords_are_built_from_the_root_up() {
