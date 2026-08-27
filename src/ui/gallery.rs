@@ -86,6 +86,7 @@ pub struct Gallery {
     dev_sheen: device::SheenUi,
     dev_disperser: device::DisperserUi,
     dev_tilt: device::TiltUi,
+    dev_phaser: device::PhaserUi,
 }
 
 impl Default for Gallery {
@@ -147,6 +148,7 @@ impl Default for Gallery {
             // `params::tilt`. A preview of a corrective device sitting at
             // its neutral setting is a preview of a straight line, so the
             // gallery leans this one over to show what the card draws.
+            dev_phaser: device::PhaserUi::default(),
             dev_tilt: device::TiltUi {
                 tilt: device::tilt_norm(params::tilt::TILT, 6.0),
                 ..device::TiltUi::default()
@@ -768,6 +770,19 @@ impl Gallery {
             for edit in device::tilt_card(ui, theme, &mut self.dev_tilt) {
                 self.log
                     .push(format!("TiltEdit(param {}, {:.2})", edit.param, edit.value));
+            }
+
+            kit::gap(ui, theme, space::SM);
+            kit::muted(
+                ui,
+                theme,
+                "phaser — the notches, and the ghosts are where the sweep takes them",
+            );
+            for edit in device::phaser_card(ui, theme, &mut self.dev_phaser) {
+                self.log.push(format!(
+                    "PhaserEdit(param {}, {:.2})",
+                    edit.param, edit.value
+                ));
             }
 
             kit::gap(ui, theme, space::SM);

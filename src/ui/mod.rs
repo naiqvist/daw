@@ -415,6 +415,7 @@ mod tests {
             "sheen.rs",     // ditto
             "disperser.rs", // ditto
             "tilt.rs",      // ditto
+            "phaser.rs",    // ditto
             "modulato.rs",  // ditto
             "sampler.rs",   // ditto
             "snare.rs",     // ditto

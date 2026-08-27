@@ -95,6 +95,7 @@ pub mod meter;
 pub mod metrics;
 pub mod modulato;
 pub mod param;
+pub mod phaser;
 pub mod poly;
 pub mod poly_widgets;
 /// NOT `#[cfg(test)]`, and deliberately.
@@ -156,6 +157,10 @@ pub use lofi::{
 };
 pub use metrics::Footprint;
 pub use param::{Mapping, Param, Unit};
+pub use phaser::{
+    PhaserUi, phaser_card, phaser_edits, phaser_is_discrete, phaser_is_log, phaser_norm,
+    phaser_value,
+};
 pub use poly::{
     OscUi, PolyUi, poly_card, poly_choices, poly_edits, poly_format, poly_is_discrete, poly_is_log,
     poly_norm, poly_value,

@@ -68,8 +68,8 @@ use focus::Focus;
 mod device_state;
 use device_state::{
     DeviceInstance, DeviceState, EchoParams, device_edits, device_is_discrete, device_is_log,
-    disperser_knobs, echo_knobs, eq_knobs, glue_knobs, lofi_knobs, poly_knobs, reverb_knobs,
-    sat_knobs, sheen_knobs, synth_knobs, tilt_knobs, unit_zoom, utility_knobs,
+    disperser_knobs, echo_knobs, eq_knobs, glue_knobs, lofi_knobs, phaser_knobs, poly_knobs,
+    reverb_knobs, sat_knobs, sheen_knobs, synth_knobs, tilt_knobs, unit_zoom, utility_knobs,
 };
 mod devices;
 use bar::{Bar, TRANSPORT_GAP, TRANSPORT_GROUP_GAP, bar_layout, buttons_width, fields_width};
@@ -9904,6 +9904,10 @@ impl Default for Browser {
                             load: DeviceKind::Tilt,
                         },
                         BrowserItem {
+                            name: "Phaser",
+                            load: DeviceKind::Phaser,
+                        },
+                        BrowserItem {
                             name: "Delay",
                             load: DeviceKind::Echo,
                         },
@@ -11691,6 +11695,10 @@ fn device_body(
                                     let mut knobs = tilt_knobs(params);
                                     device::tilt_card(ui, theme, &mut knobs)
                                 }
+                                DeviceState::Phaser(params) => {
+                                    let mut knobs = phaser_knobs(params);
+                                    device::phaser_card(ui, theme, &mut knobs)
+                                }
                                 DeviceState::Echo(params) => {
                                     let mut knobs = echo_knobs(params);
                                     device::echo_card(ui, theme, &mut knobs)
@@ -11925,6 +11933,7 @@ fn plockable_params(track: &Track) -> Vec<piano_roll::PlockParam> {
         | DeviceKind::Sheen
         | DeviceKind::Disperser
         | DeviceKind::Tilt
+        | DeviceKind::Phaser
         | DeviceKind::Echo
         | DeviceKind::Eq
         | DeviceKind::Filter
@@ -12194,6 +12203,18 @@ fn compile_chain(
                 }
                 tail = glue;
             }
+            DeviceState::Phaser(params) => {
+                let node = spec.push(NodeSpec::Phaser {
+                    amount: params.amount,
+                    centre_hz: params.centre,
+                    depth_oct: params.depth,
+                    rate_hz: params.rate,
+                    mix: params.mix,
+                });
+                spec.connect(tail, node);
+                devices.insert(instance.id, node);
+                tail = node;
+            }
             DeviceState::Tilt(params) => {
                 let node = spec.push(NodeSpec::Tilt {
                     tilt_db: params.tilt,
@@ -12303,6 +12324,7 @@ fn build_graph_spec(
                     | DeviceState::Sheen(_)
                     | DeviceState::Disperser(_)
                     | DeviceState::Tilt(_)
+                    | DeviceState::Phaser(_)
                     | DeviceState::Limiter(_) => continue,
                     DeviceState::SineSynth(params) => NodeSpec::Seq {
                         notes,

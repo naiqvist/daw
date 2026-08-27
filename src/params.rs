@@ -3839,6 +3839,115 @@ pub mod sampler {
 /// Flat here is the kernel's exact wire — zero tilt is `g_hi = 1` and
 /// `g_delta = 0`, which is `x` — so the off setting is exact in the way
 /// [`lofi`](super::lofi) and [`sheen`](super::sheen) both insist on.
+/// The phaser — the disperser's allpass chain, swept and MIXED.
+///
+/// [`disperser`](super::disperser) refuses a mix knob, and its module
+/// says exactly why: summing a phase-shifted copy with the dry is a comb
+/// filter whose notches move with the frequency, which breaks the flat
+/// magnitude that device promises. "That is a phaser, and a good one, but
+/// it is a different device."
+///
+/// This is that device. Same kernel, same sections; the mix is the point
+/// rather than the mistake, and an LFO walks the corner so the notches
+/// sweep.
+///
+/// # What it does not expose
+///
+/// The sections' Q. The disperser offers it as `pinch` because a
+/// disperser is a tuning instrument — you aim it at a harmonic. A phaser
+/// is a sweep, and a narrow Q turns the notches into a ringing pitch that
+/// fights the sweep rather than riding it. It is fixed at
+/// `audio::graph`'s `PHASER_Q`.
+///
+/// # Zero stages is the off switch
+///
+/// With no sections the wet path IS the dry path, so the blend has
+/// nothing to cancel against and the device passes through whatever the
+/// mix says. The same exact-off the rest of these devices insist on,
+/// arriving for free out of the kernel's own wire.
+pub mod phaser {
+    use super::ParamDef;
+
+    pub const AMOUNT: u32 = 0;
+    pub const CENTRE: u32 = 1;
+    pub const DEPTH: u32 = 2;
+    pub const RATE: u32 = 3;
+    pub const MIX: u32 = 4;
+
+    /// The most sections a phaser runs.
+    ///
+    /// Sixteen, not the disperser's thirty-two. Past this the notches are
+    /// packed closer than a sweep can separate them and the effect stops
+    /// being a phaser and starts being the disperser next door — which is
+    /// available, and better at it.
+    pub const AMOUNT_MAX: f32 = 16.0;
+
+    /// Where the sweep is centred.
+    pub const CENTRE_MIN_HZ: f32 = 100.0;
+    pub const CENTRE_MAX_HZ: f32 = 4_000.0;
+
+    /// How far the corner travels either side of centre, in OCTAVES.
+    ///
+    /// Octaves and not hertz, because that is what the ear hears and what
+    /// the log-mapped centre knob already speaks. A depth in hertz would
+    /// mean a different sweep at every centre setting.
+    pub const DEPTH_MAX_OCT: f32 = 4.0;
+
+    /// The sweep's speed. Slow enough at the bottom to take half a minute
+    /// over one pass, fast enough at the top to wobble.
+    pub const RATE_MIN_HZ: f32 = 0.02;
+    pub const RATE_MAX_HZ: f32 = 8.0;
+
+    pub const TABLE: &[ParamDef] = &[
+        ParamDef {
+            id: AMOUNT,
+            name: "amount",
+            min: 0.0,
+            max: AMOUNT_MAX,
+            // Four sections: two notches, which is the classic phaser and
+            // the one everybody has heard.
+            default: 4.0,
+        },
+        ParamDef {
+            id: CENTRE,
+            name: "centre",
+            min: CENTRE_MIN_HZ,
+            max: CENTRE_MAX_HZ,
+            default: 800.0,
+        },
+        ParamDef {
+            id: DEPTH,
+            name: "depth",
+            min: 0.0,
+            max: DEPTH_MAX_OCT,
+            // Two octaves either side. Wide enough to hear the notches
+            // travel, narrow enough that they stay in the band the centre
+            // knob was pointed at.
+            default: 2.0,
+        },
+        ParamDef {
+            id: RATE,
+            name: "rate",
+            min: RATE_MIN_HZ,
+            max: RATE_MAX_HZ,
+            default: 0.4,
+        },
+        ParamDef {
+            id: MIX,
+            name: "mix",
+            min: 0.0,
+            max: 1.0,
+            // HALF, and this one is not a shrug. A phaser's notch is the
+            // dry and the wet cancelling, and cancellation is deepest
+            // when the two are equal. Fully wet is an allpass — flat, and
+            // silent as an effect. The knob's TOP is the setting that
+            // does nothing here, which is the reverse of every other mix
+            // in the rack and worth knowing before you reach for it.
+            default: 0.5,
+        },
+    ];
+}
+
 pub mod tilt {
     use super::ParamDef;
 
@@ -4144,6 +4253,7 @@ mod tests {
         ("sheen", sheen::TABLE),
         ("disperser", disperser::TABLE),
         ("tilt", tilt::TABLE),
+        ("phaser", phaser::TABLE),
     ];
 
     /// The invariant `def()` and every `TABLE[FOO as usize]` rely on.

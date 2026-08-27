@@ -209,6 +209,31 @@ impl Default for TiltParams {
     }
 }
 
+/// The phaser's editable values in ENGINE units, exactly as
+/// [`daw::params::phaser`] declares them.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct PhaserParams {
+    pub amount: f32,
+    pub centre: f32,
+    pub depth: f32,
+    pub rate: f32,
+    pub mix: f32,
+}
+
+impl Default for PhaserParams {
+    fn default() -> Self {
+        use daw::params::{def, phaser};
+        Self {
+            amount: def(phaser::TABLE, phaser::AMOUNT).default,
+            centre: def(phaser::TABLE, phaser::CENTRE).default,
+            depth: def(phaser::TABLE, phaser::DEPTH).default,
+            rate: def(phaser::TABLE, phaser::RATE).default,
+            mix: def(phaser::TABLE, phaser::MIX).default,
+        }
+    }
+}
+
 /// What a device IS, and its editable values — in ENGINE units, the same
 /// numbers `src/params.rs` declares. One stored copy of one truth: the card
 /// converts to normalized knob positions for drawing and back on the way
@@ -230,6 +255,7 @@ pub enum DeviceState {
     Sheen(SheenParams),
     Disperser(DisperserParams),
     Tilt(TiltParams),
+    Phaser(PhaserParams),
     Echo(EchoParams),
     Eq(daw::audio::eq::EqParams),
     Filter(daw::audio::filter::FilterParams),
@@ -257,6 +283,7 @@ impl DeviceState {
             DeviceKind::Sheen => Self::Sheen(SheenParams::default()),
             DeviceKind::Disperser => Self::Disperser(DisperserParams::default()),
             DeviceKind::Tilt => Self::Tilt(TiltParams::default()),
+            DeviceKind::Phaser => Self::Phaser(PhaserParams::default()),
             DeviceKind::Echo => Self::Echo(EchoParams::default()),
             DeviceKind::Eq => Self::Eq(daw::audio::eq::EqParams::default()),
             DeviceKind::Filter => Self::Filter(daw::audio::filter::FilterParams::default()),
@@ -283,6 +310,7 @@ impl DeviceState {
             Self::Sheen(_) => DeviceKind::Sheen,
             Self::Disperser(_) => DeviceKind::Disperser,
             Self::Tilt(_) => DeviceKind::Tilt,
+            Self::Phaser(_) => DeviceKind::Phaser,
             Self::Echo(_) => DeviceKind::Echo,
             Self::Eq(_) => DeviceKind::Eq,
             Self::Filter(_) => DeviceKind::Filter,
@@ -296,7 +324,7 @@ impl DeviceState {
     /// This device's value for `param`, or `None` for an id it does not
     /// have — which is how a target aimed at the wrong kind is refused.
     pub fn value(self, param: u32) -> Option<f32> {
-        use daw::params::{disperser, echo, lofi, reverb, sat, seq, sheen, tilt};
+        use daw::params::{disperser, echo, lofi, phaser, reverb, sat, seq, sheen, tilt};
         match self {
             Self::SineSynth(p) => match param {
                 seq::GAIN => Some(p.gain),
@@ -360,6 +388,14 @@ impl DeviceState {
                 tilt::PIVOT => Some(p.pivot),
                 _ => None,
             },
+            Self::Phaser(p) => match param {
+                phaser::AMOUNT => Some(p.amount),
+                phaser::CENTRE => Some(p.centre),
+                phaser::DEPTH => Some(p.depth),
+                phaser::RATE => Some(p.rate),
+                phaser::MIX => Some(p.mix),
+                _ => None,
+            },
             Self::Sat(p) => match param {
                 sat::MODE => Some(p.mode),
                 sat::DRIVE => Some(p.drive),
@@ -402,7 +438,7 @@ impl DeviceState {
     /// Store an engine-unit value. Unknown ids are dropped, exactly as the
     /// engine's own clamp drops them.
     pub fn set(&mut self, param: u32, value: f32) {
-        use daw::params::{disperser, echo, lofi, reverb, sat, seq, sheen, tilt};
+        use daw::params::{disperser, echo, lofi, phaser, reverb, sat, seq, sheen, tilt};
         match self {
             Self::SineSynth(p) => match param {
                 seq::GAIN => p.gain = value,
@@ -452,6 +488,14 @@ impl DeviceState {
             Self::Tilt(p) => match param {
                 tilt::TILT => p.tilt = value,
                 tilt::PIVOT => p.pivot = value,
+                _ => {}
+            },
+            Self::Phaser(p) => match param {
+                phaser::AMOUNT => p.amount = value,
+                phaser::CENTRE => p.centre = value,
+                phaser::DEPTH => p.depth = value,
+                phaser::RATE => p.rate = value,
+                phaser::MIX => p.mix = value,
                 _ => {}
             },
             Self::Sat(p) => match param {
@@ -593,6 +637,18 @@ pub fn reverb_knobs(params: ReverbParams) -> device::ReverbUi {
     })
 }
 
+pub fn phaser_knobs(params: PhaserParams) -> device::PhaserUi {
+    use daw::params::phaser;
+    let at = |param, value| device_norm(DeviceKind::Phaser, param, value);
+    device::PhaserUi {
+        amount: at(phaser::AMOUNT, params.amount),
+        centre: at(phaser::CENTRE, params.centre),
+        depth: at(phaser::DEPTH, params.depth),
+        rate: at(phaser::RATE, params.rate),
+        mix: at(phaser::MIX, params.mix),
+    }
+}
+
 pub fn tilt_knobs(params: TiltParams) -> device::TiltUi {
     use daw::params::tilt;
     let at = |param, value| device_norm(DeviceKind::Tilt, param, value);
@@ -716,6 +772,7 @@ pub fn device_norm(kind: DeviceKind, param: u32, value: f32) -> f32 {
         DeviceKind::Sheen => device::sheen_norm(param, value),
         DeviceKind::Disperser => device::disperser_norm(param, value),
         DeviceKind::Tilt => device::tilt_norm(param, value),
+        DeviceKind::Phaser => device::phaser_norm(param, value),
         DeviceKind::Echo => device::echo_norm(param, value),
         DeviceKind::Eq => device::eq_norm(param, value),
         DeviceKind::Filter => device::filter_norm(param, value),
@@ -750,6 +807,7 @@ pub fn device_is_discrete(kind: DeviceKind, param: u32) -> bool {
         DeviceKind::Sheen => device::sheen_is_discrete(param),
         DeviceKind::Disperser => device::disperser_is_discrete(param),
         DeviceKind::Tilt => device::tilt_is_discrete(param),
+        DeviceKind::Phaser => device::phaser_is_discrete(param),
         DeviceKind::Echo => device::echo_is_discrete(param),
         DeviceKind::Eq => device::eq_is_discrete(param),
         DeviceKind::Filter => device::filter_is_discrete(param),
@@ -779,6 +837,7 @@ pub fn device_is_log(kind: DeviceKind, param: u32) -> bool {
         DeviceKind::Sheen => device::sheen_is_log(param),
         DeviceKind::Disperser => device::disperser_is_log(param),
         DeviceKind::Tilt => device::tilt_is_log(param),
+        DeviceKind::Phaser => device::phaser_is_log(param),
         DeviceKind::Echo => device::echo_is_log(param),
         DeviceKind::Eq => device::eq_is_log(param),
         DeviceKind::Filter => device::filter_is_log(param),
@@ -811,6 +870,7 @@ pub fn device_value(kind: DeviceKind, param: u32, norm: f32) -> f32 {
         DeviceKind::Sheen => device::sheen_value(param, norm),
         DeviceKind::Disperser => device::disperser_value(param, norm),
         DeviceKind::Tilt => device::tilt_value(param, norm),
+        DeviceKind::Phaser => device::phaser_value(param, norm),
         DeviceKind::Echo => device::echo_value(param, norm),
         DeviceKind::Eq => device::eq_value(param, norm),
         DeviceKind::Filter => device::filter_value(param, norm),

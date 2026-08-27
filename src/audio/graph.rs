@@ -1244,6 +1244,20 @@ const LOFI_SMOOTH_MS: f32 = 15.0;
 /// that the two stack buffers stay cheap.
 const LOFI_CHUNK: usize = 16;
 
+/// The Q every phaser section runs at.
+///
+/// Broad. `params::phaser` says why it is not a knob: a narrow Q turns
+/// the notches into a ringing pitch that fights the sweep instead of
+/// riding it, and the disperser next door is the device for aiming a
+/// narrow one at a harmonic.
+const PHASER_Q: f32 = 0.7;
+
+/// Control smoothing for the phaser's blend, in ms, and how many samples
+/// share one step of the sweep. The lo-fi's figures for the blend; the
+/// chunk is what makes the corner control-rate rather than per-sample.
+const PHASER_SMOOTH_MS: f32 = 15.0;
+const PHASER_CHUNK: usize = 32;
+
 /// Control smoothing for the sheen's blend and trim, in ms, and how many
 /// samples share one walk of those ramps. The lo-fi's figures, for the
 /// lo-fi's reasons — and, like the lo-fi, the two knobs that reconfigure
@@ -1756,6 +1770,37 @@ pub enum Node {
     ///
     /// One filter per channel, for the reason every device here gives —
     /// a shared pole is the two channels leaking into each other.
+    /// The phaser — the disperser's chain, swept and blended.
+    ///
+    /// Same kernel as `Node::Disperser`; what makes it a different device
+    /// is the two things that one refuses. The blend turns the flat
+    /// allpass into a comb, and the LFO walks the corner so the notches
+    /// travel.
+    ///
+    /// FREE-RUNNING, and pointedly so: the sweep rides the sample clock,
+    /// not the transport, the way `Node::Modulato`'s does. On a
+    /// discontinuity the filters reset — sixty-four integrators' worth of
+    /// history belongs to a position the transport has left — but THE LFO
+    /// DOES NOT. Its phase belongs to the device, not to the timeline,
+    /// and snapping it on every seek would be a click the user never
+    /// asked for.
+    ///
+    /// Boxed for the reason `Node::Disperser` is.
+    Phaser {
+        core: Box<[crate::dsp::filters::Disperser; 2]>,
+        lfo: crate::dsp::lfo::Lfo,
+        /// The dry copy the blend runs against, because the kernel works
+        /// in place — `2 * block` floats, compile-owned.
+        dry: Vec<f32>,
+        sample_rate: f32,
+        stages: u32,
+        centre_hz: f32,
+        depth_oct: f32,
+        mix: crate::dsp::ramps::Smoother,
+        /// Shadow target, because a discontinuity snaps the smoother to
+        /// its destination and `Smoother` does not expose its own.
+        mix_target: f32,
+    },
     Tilt {
         core: [crate::dsp::filters::Tilt; 2],
         /// Kept because `Tilt::prepare` takes the rate, the pivot and the
@@ -1983,7 +2028,8 @@ impl Node {
             | NodeSpec::Lofi { .. }
             | NodeSpec::Sheen { .. }
             | NodeSpec::Disperser { .. }
-            | NodeSpec::Tilt { .. } => 2,
+            | NodeSpec::Tilt { .. }
+            | NodeSpec::Phaser { .. } => 2,
             NodeSpec::Delay { channels, .. } => (*channels).clamp(1, 2),
             NodeSpec::Mixer { .. } | NodeSpec::AudioClip { .. } | NodeSpec::Pan { .. } => 2,
         }
@@ -2733,6 +2779,97 @@ impl Node {
                 }
             }
 
+            Node::Phaser {
+                core,
+                lfo,
+                dry,
+                sample_rate,
+                stages,
+                centre_hz,
+                depth_oct,
+                mix,
+                mix_target,
+            } => {
+                // `out.l` and `out.r` are separate fields, so this borrows
+                // only the right channel and the left stays reachable.
+                let right = out.r.as_deref_mut().unwrap_or(&mut []);
+                sum_inputs_stereo(inputs, out.l, right);
+
+                // The filters forget; the SWEEP does not. See
+                // `Node::Phaser` — the integrators belong to a position
+                // the transport has left, the LFO's phase belongs to the
+                // device.
+                if ctx.discontinuity {
+                    for ch in core.iter_mut() {
+                        ch.reset();
+                    }
+                    mix.set_now(*mix_target);
+                }
+
+                let n = out.l.len();
+                // Compile fixes the channel count at 2, so this is true;
+                // it is checked rather than assumed because the check
+                // costs nothing and an assumption costs a panic.
+                let stereo = right.len() == n;
+
+                // Fail open exactly as the lo-fi and the sheen do.
+                if dry.len() >= n * 2 {
+                    let (dry_l, rest) = dry.split_at_mut(n);
+                    let dry_r = &mut rest[..n];
+                    dry_l.copy_from_slice(out.l);
+                    if stereo {
+                        dry_r.copy_from_slice(right);
+                    }
+
+                    // The corner moves at CONTROL rate, one step per
+                    // chunk, because moving it costs a `prepare` — one
+                    // transcendental — and a phaser sweeping at a few
+                    // hertz cannot tell the difference between a corner
+                    // that steps fifteen hundred times a second and one
+                    // that glides. Per-sample would be the same picture
+                    // for forty times the arithmetic.
+                    let mut start = 0;
+                    while start < n {
+                        let k = PHASER_CHUNK.min(n - start);
+                        let mut sweep = [0.0f32; PHASER_CHUNK];
+                        let mut mixr = [0.0f32; PHASER_CHUNK];
+                        lfo.process(&mut sweep[..k]);
+                        mix.process(&mut mixr[..k]);
+
+                        // Depth is in OCTAVES either side of centre, so
+                        // the sweep is the same musical distance wherever
+                        // the centre knob is.
+                        let corner =
+                            (*centre_hz * (*depth_oct * sweep[k - 1]).exp2()).clamp(20.0, 20_000.0);
+                        for ch in core.iter_mut() {
+                            ch.prepare(*sample_rate, corner, PHASER_Q, *stages);
+                        }
+
+                        let end = start + k;
+                        core[0].process(&mut out.l[start..end]);
+                        if stereo {
+                            core[1].process(&mut right[start..end]);
+                        }
+
+                        // The blend is what makes the notch: the allpass
+                        // alone is flat, and only summing it with the dry
+                        // turns a phase turn into a cancellation.
+                        for j in 0..k {
+                            let i = start + j;
+                            let d = dry_l[i];
+                            out.l[i] = d + (out.l[i] - d) * mixr[j];
+                        }
+                        if stereo {
+                            for j in 0..k {
+                                let i = start + j;
+                                let d = dry_r[i];
+                                right[i] = d + (right[i] - d) * mixr[j];
+                            }
+                        }
+                        start = end;
+                    }
+                }
+            }
             Node::Tilt { core, .. } => {
                 // `out.l` and `out.r` are separate fields, so this borrows
                 // only the right channel and the left stays reachable.
@@ -3356,7 +3493,8 @@ impl Node {
         // red-zone legal, and an unknown id comes back None (a stale or
         // misrouted letter — binned, never applied).
         use crate::params::{
-            clip, disperser, echo, filter, lofi, mixer, pan, reverb, sat, seq, sheen, sine, tilt,
+            clip, disperser, echo, filter, lofi, mixer, pan, phaser, reverb, sat, seq, sheen, sine,
+            tilt,
         };
         match self {
             // No parameters: compile decides a delay's length, and it
@@ -3682,6 +3820,34 @@ impl Node {
                 // property `Node::Disperser` leans on.
                 for ch in core.iter_mut() {
                     ch.prepare(*sample_rate, *pivot_hz, *tilt_db);
+                }
+            }
+            Node::Phaser {
+                lfo,
+                stages,
+                centre_hz,
+                depth_oct,
+                mix,
+                mix_target,
+                ..
+            } => {
+                let Some(value) = crate::params::clamp(phaser::TABLE, param, value) else {
+                    return;
+                };
+                match param {
+                    // The three that shape the sweep are read by the
+                    // process arm every chunk, so they need no smoother
+                    // and no re-prepare here — unlike the disperser's,
+                    // whose corner is the only thing it has.
+                    phaser::AMOUNT => *stages = value.round().max(0.0) as u32,
+                    phaser::CENTRE => *centre_hz = value,
+                    phaser::DEPTH => *depth_oct = value,
+                    phaser::RATE => lfo.set_rate(value),
+                    phaser::MIX => {
+                        *mix_target = value;
+                        mix.set_target(value);
+                    }
+                    _ => {}
                 }
             }
             Node::Sat {
@@ -4604,6 +4770,21 @@ pub enum NodeSpec {
     Tilt {
         tilt_db: f32,
         pivot_hz: f32,
+    },
+    /// A swept phaser on whatever feeds it. `amount` is how many allpass
+    /// sections run, `centre_hz` where the sweep is centred, `depth_oct`
+    /// how far the corner travels either side of it, `rate_hz` how fast,
+    /// and `mix` how much wet is summed with the dry — which is what
+    /// makes the notches. ParamChange ids and every range are
+    /// `crate::params::phaser::TABLE`'s.
+    ///
+    /// Stereo in, stereo out.
+    Phaser {
+        amount: f32,
+        centre_hz: f32,
+        depth_oct: f32,
+        rate_hz: f32,
+        mix: f32,
     },
     /// An analogue delay on whatever feeds it. `sync` is an index into
     /// `crate::params::echo::SYNC_NAMES` (0 = free, and only then is
@@ -5907,6 +6088,50 @@ impl GraphSpec {
                             sample_rate: sr,
                             pivot_hz,
                             tilt_db,
+                        }
+                    }
+                    Some(NodeSpec::Phaser {
+                        amount,
+                        centre_hz,
+                        depth_oct,
+                        rate_hz,
+                        mix,
+                    }) => {
+                        use crate::params::phaser as pp;
+                        // Green zone: the box and the scratch are born
+                        // here, and every value clamps through the same
+                        // table rows the letters will.
+                        let sr = sample_rate as f32;
+                        let stages = pp::TABLE[pp::AMOUNT as usize]
+                            .clamp(*amount)
+                            .round()
+                            .max(0.0) as u32;
+                        let centre_hz = pp::TABLE[pp::CENTRE as usize].clamp(*centre_hz);
+                        let depth_oct = pp::TABLE[pp::DEPTH as usize].clamp(*depth_oct);
+                        let rate_hz = pp::TABLE[pp::RATE as usize].clamp(*rate_hz);
+                        let mix = pp::TABLE[pp::MIX as usize].clamp(*mix);
+                        let mut core = Box::new([crate::dsp::filters::Disperser::new(); 2]);
+                        for ch in core.iter_mut() {
+                            ch.prepare(sr, centre_hz, PHASER_Q, stages);
+                        }
+                        let mut lfo = crate::dsp::lfo::Lfo::new();
+                        lfo.prepare(sr);
+                        lfo.set_shape(crate::dsp::lfo::LfoShape::Sine);
+                        lfo.set_rate(rate_hz);
+                        let mut smoother = crate::dsp::ramps::Smoother::new();
+                        smoother.prepare(sr, PHASER_SMOOTH_MS);
+                        smoother.set_now(mix);
+                        Node::Phaser {
+                            core,
+                            lfo,
+                            // Two lanes of dry, left and right.
+                            dry: vec![0.0f32; block_frames * 2],
+                            sample_rate: sr,
+                            stages,
+                            centre_hz,
+                            depth_oct,
+                            mix: smoother,
+                            mix_target: mix,
                         }
                     }
                     Some(NodeSpec::Echo {

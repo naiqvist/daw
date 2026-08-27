@@ -32,6 +32,7 @@ pub enum DeviceKind {
     Sheen,
     Disperser,
     Tilt,
+    Phaser,
     Echo,
     Eq,
     Filter,
@@ -1588,6 +1589,43 @@ pub static DEVICES: &[DeviceSpec] = &[
                 name: "Pivot",
                 unit: "",
                 group: "Tilt",
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Phaser,
+        name: "phaser",
+        instrument: false,
+        prefix: "phaser",
+        params: daw::params::phaser::TABLE,
+        // Units blank for the reason the others' are: the card prints
+        // "4", "800 Hz", "2.00", "0.40 Hz" and "50 %" through its own
+        // `Unit`.
+        labels: &[
+            ParamLabel {
+                name: "Amount",
+                unit: "",
+                group: "Phaser",
+            },
+            ParamLabel {
+                name: "Centre",
+                unit: "",
+                group: "Phaser",
+            },
+            ParamLabel {
+                name: "Depth",
+                unit: "",
+                group: "Phaser",
+            },
+            ParamLabel {
+                name: "Rate",
+                unit: "",
+                group: "Phaser",
+            },
+            ParamLabel {
+                name: "Mix",
+                unit: "",
+                group: "Phaser",
             },
         ],
     },
