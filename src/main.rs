@@ -67,10 +67,10 @@ mod focus;
 use focus::Focus;
 mod device_state;
 use device_state::{
-    DeviceInstance, DeviceState, EchoParams, device_edits, device_is_discrete, device_is_log,
-    disperser_knobs, echo_knobs, eq_knobs, gate_knobs, glue_knobs, lofi_knobs, phaser_knobs,
-    poly_knobs, resyn_knobs, reverb_knobs, sat_knobs, sheen_knobs, strip_knobs, synth_knobs,
-    tilt_knobs, unit_zoom, utility_knobs,
+    DeviceInstance, DeviceState, EchoParams, acid_knobs, device_edits, device_is_discrete,
+    device_is_log, disperser_knobs, echo_knobs, eq_knobs, gate_knobs, glue_knobs, lofi_knobs,
+    phaser_knobs, poly_knobs, resyn_knobs, reverb_knobs, sat_knobs, sheen_knobs, strip_knobs,
+    synth_knobs, tilt_knobs, unit_zoom, utility_knobs,
 };
 mod devices;
 use bar::{Bar, TRANSPORT_GAP, TRANSPORT_GROUP_GAP, bar_layout, buttons_width, fields_width};
@@ -9851,6 +9851,10 @@ impl Default for Browser {
                             load: DeviceKind::Sampler,
                         },
                         BrowserItem {
+                            name: "Acid",
+                            load: DeviceKind::Acid,
+                        },
+                        BrowserItem {
                             name: "Kick",
                             load: DeviceKind::Kick,
                         },
@@ -11648,6 +11652,10 @@ fn device_body(
                                         });
                                     device::modulato::modulato_card(ui, theme, &mut knobs)
                                 }
+                                DeviceState::Acid(params) => {
+                                    let mut knobs = acid_knobs(params);
+                                    device::acid_card(ui, theme, &mut knobs)
+                                }
                                 DeviceState::Kick(params) => {
                                     // The app is the layer that knows
                                     // both sides, so the conversion
@@ -11955,6 +11963,7 @@ fn plockable_params(track: &Track) -> Vec<piano_roll::PlockParam> {
         DeviceKind::Sampler => daw::params::sampler::GAIN,
         DeviceKind::SineSynth => daw::params::seq::GAIN,
         DeviceKind::Kick => daw::params::kick::GAIN,
+        DeviceKind::Acid => daw::params::acid::LEVEL,
         DeviceKind::Snare => daw::params::snare::GAIN,
         DeviceKind::Tom => daw::params::tom::GAIN,
         DeviceKind::Hat => daw::params::hat::GAIN,
@@ -12155,7 +12164,8 @@ fn compile_chain(
             | DeviceState::Snare(_)
             | DeviceState::Tom(_)
             | DeviceState::Hat(_)
-            | DeviceState::Handclap(_) => {}
+            | DeviceState::Handclap(_)
+            | DeviceState::Acid(_) => {}
             DeviceState::Utility(params) => {
                 let node = spec.push(NodeSpec::Utility { params });
                 spec.connect(tail, node);
@@ -12412,6 +12422,12 @@ fn build_graph_spec(
                             slices: source.map(|s| s.slices.clone()).unwrap_or_default(),
                         }
                     }
+                    DeviceState::Acid(params) => NodeSpec::Acid {
+                        notes,
+                        subloops: Vec::new(),
+                        loop_len_beats,
+                        params,
+                    },
                     DeviceState::Kick(params) => NodeSpec::Kick {
                         notes,
                         subloops: Vec::new(),

@@ -685,6 +685,43 @@ macro_rules! one_shot_drum_voices {
     };
 }
 
+/// The acid mono as an instrument the pattern clock can play.
+///
+/// Unlike the drums this is a GATED instrument, so `note_off` and
+/// `release_all` both do real work — and unlike the poly synth there is
+/// no voice to steal, so `note_on` never has to choose. `age` is ignored
+/// for exactly that reason.
+impl Voices for crate::audio::acid::AcidVoice {
+    fn all_sound_off(&mut self) {
+        // The transport moved: nothing from before it may still sound.
+        crate::audio::acid::AcidVoice::reset(self);
+    }
+    fn release_all(&mut self) {
+        // The transport stopped: let the gate down and let the tail ring.
+        crate::audio::acid::AcidVoice::release_all(self);
+    }
+    fn note_off(&mut self, pitch: u8) {
+        crate::audio::acid::AcidVoice::note_off(self, pitch);
+    }
+    fn note_on(&mut self, pitch: u8, vel: u8, _age: u64) {
+        crate::audio::acid::AcidVoice::note_on(self, pitch, vel);
+    }
+    fn plock(&mut self, param: u32, value: Option<f32>) {
+        crate::audio::acid::AcidVoice::plock(self, param, value);
+    }
+    fn render(&mut self, out: &mut [f32], _at: usize, gain: &mut Ramp) {
+        // The trait's contract is WRITE, not add: clear, fill, then ride
+        // the ramp — which is where the LEVEL knob lives.
+        for sample in out.iter_mut() {
+            *sample = 0.0;
+        }
+        crate::audio::acid::AcidVoice::render_add(self, out, 1.0);
+        for sample in out.iter_mut() {
+            *sample *= gain.next();
+        }
+    }
+}
+
 one_shot_drum_voices!(crate::audio::snare::SnareVoice);
 one_shot_drum_voices!(crate::audio::tom::TomVoice);
 one_shot_drum_voices!(crate::audio::hat::HatVoice);
@@ -1483,6 +1520,21 @@ pub enum Node {
         gain: f32,
         target_gain: f32,
     },
+    /// The acid mono — one voice, and the instrument is that it has one.
+    ///
+    /// Timeline-locked, sharing `PatternClock` with `Seq`/`Poly`/`Kick`,
+    /// and it CUTS on discontinuity: a note sounding here belongs to the
+    /// position the transport has left.
+    ///
+    /// Mono out. The machine is mono and the track's pan stage is what
+    /// places it, the same argument `Node::Kick` makes.
+    Acid {
+        events: Vec<SeqEvent>,
+        clock: PatternClock,
+        voices: Box<crate::audio::acid::AcidVoice>,
+        gain: f32,
+        target_gain: f32,
+    },
     /// The sampler: a file in RAM, eight voices reading it, and the
     /// machine's output stage after the sum.
     ///
@@ -2049,6 +2101,7 @@ impl Node {
             | NodeSpec::Click
             | NodeSpec::Reverb { .. }
             | NodeSpec::Kick { .. }
+            | NodeSpec::Acid { .. }
             | NodeSpec::Snare { .. }
             | NodeSpec::Tom { .. }
             | NodeSpec::Hat { .. }
@@ -2522,6 +2575,20 @@ impl Node {
                 let mut ramp = Ramp::across(*gain, *target_gain, out_len);
                 clock.run(voices, events, out.l, ctx, &mut ramp);
                 *gain = *target_gain; // land exactly, no float drift
+            }
+
+            Node::Acid {
+                events,
+                clock,
+                voices,
+                gain,
+                target_gain,
+            } => {
+                // `Kick`'s shape, a gated instrument along. Mono, so there
+                // is no right channel to read back.
+                let mut ramp = Ramp::across(*gain, *target_gain, out_len);
+                clock.run(voices.as_mut(), events, out.l, ctx, &mut ramp);
+                *gain = *target_gain;
             }
 
             Node::Kick {
@@ -3597,6 +3664,25 @@ impl Node {
                 };
                 voices.set_param(param, value);
                 if param == crate::params::kick::GAIN {
+                    *target_gain = value;
+                }
+            }
+
+            // Every knob is a live letter, and the LEVEL is the node's own
+            // gain ramp rather than a multiply inside the voice — so
+            // moving it glides across the segment instead of stepping at
+            // its edge.
+            Node::Acid {
+                voices,
+                target_gain,
+                ..
+            } => {
+                let Some(value) = crate::params::clamp(crate::params::acid::TABLE, param, value)
+                else {
+                    return;
+                };
+                voices.set_param(param, value);
+                if param == crate::params::acid::LEVEL {
                     *target_gain = value;
                 }
             }
@@ -5003,6 +5089,16 @@ pub enum NodeSpec {
         #[serde(default)]
         params: crate::audio::kick::KickParams,
     },
+    /// The acid mono: one pattern, one voice, and a slide that is two
+    /// notes overlapping rather than a flag.
+    Acid {
+        notes: Vec<Note>,
+        subloops: Vec<SubLoop>,
+        loop_len_beats: Option<f64>,
+        /// The 10-row `params::acid` patch, in engine units.
+        #[serde(default)]
+        params: crate::audio::acid::AcidParams,
+    },
     /// The sampler: one pattern, a file, and eight voices reading it.
     ///
     /// The PATH is part of the spec rather than the params because
@@ -5521,6 +5617,38 @@ impl GraphSpec {
                             ),
                             voices,
                             gain,
+                            target_gain: gain,
+                        }
+                    }
+                    Some(NodeSpec::Acid {
+                        notes,
+                        subloops,
+                        loop_len_beats,
+                        params,
+                    }) => {
+                        let events =
+                            compile_events(notes, subloops, *loop_len_beats, samples_per_beat)?;
+                        // Green zone: builds both wavetable sets and the
+                        // chunk buffer; nothing allocates afterwards.
+                        let mut voices = crate::audio::acid::AcidVoice::new();
+                        voices.prepare(sample_rate as f32, *params);
+                        // RON round-trips NaN literals, so a hand-edited
+                        // or corrupt project could smuggle one in.
+                        let gain = if params.level.is_finite() {
+                            params.level.clamp(0.0, 2.0)
+                        } else {
+                            crate::audio::acid::AcidParams::default().level
+                        };
+                        Node::Acid {
+                            events,
+                            clock: PatternClock::new(
+                                loop_len_beats
+                                    .map(|len| (len * samples_per_beat).round().max(0.0) as u64)
+                                    .unwrap_or(0),
+                                samples_per_beat,
+                            ),
+                            voices: Box::new(voices),
+                            gain: 0.0,
                             target_gain: gain,
                         }
                     }

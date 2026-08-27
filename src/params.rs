@@ -3968,6 +3968,176 @@ pub mod sampler {
 /// the hop the output is buffered by. The graph's PDC compensates it, and
 /// `audio::resyn`'s `the_reported_latency_is_the_real_one` measures where
 /// an impulse actually comes out rather than trusting the arithmetic.
+/// The acid mono — a classic hardware monosynth, emulated.
+///
+/// One oscillator, an eighteen-decibel resonant lowpass, one envelope
+/// pointed at the filter, and a sequencer that can slide and accent. The
+/// machine everybody means by "acid".
+///
+/// # Why this one, and why it is MONO on purpose
+///
+/// The rack already has a sixteen-voice workhorse. What it did not have
+/// is an instrument whose character comes from having exactly one voice:
+/// on this synth a slide is what happens when two notes overlap, and an
+/// accent is what happens when one is louder than its neighbours. Both
+/// are properties of a single voice being handed a queue of notes, and
+/// neither survives being made polyphonic.
+///
+/// Our `Note` already carries `vel` and a length that can run past the
+/// next note's start, so both gestures were already expressible before
+/// this device existed. That is the whole reason it is worth building.
+///
+/// # The slope
+///
+/// Eighteen decibels per octave, which is the machine's own and is not a
+/// number a Butterworth cascade offers: `dsp::filters::Svf` gives twelve
+/// with the resonance, and `dsp::filters::OnePole` adds the other six.
+/// Two kernels, no new arithmetic, the right slope.
+///
+/// # What is deliberately NOT a knob
+///
+/// The amplifier's envelope. The original has none — the VCA opens fast
+/// when the gate does and shuts fast when it lets go, and the knob
+/// labelled DECAY is the FILTER's. Exposing an amp ADSR would make this a
+/// generic monosynth wearing the name.
+pub mod acid {
+    use super::ParamDef;
+
+    pub const WAVE: u32 = 0;
+    pub const TUNE: u32 = 1;
+    pub const CUTOFF: u32 = 2;
+    pub const RESONANCE: u32 = 3;
+    pub const ENV_MOD: u32 = 4;
+    pub const DECAY: u32 = 5;
+    pub const ACCENT: u32 = 6;
+    pub const GLIDE: u32 = 7;
+    pub const DRIVE: u32 = 8;
+    pub const LEVEL: u32 = 9;
+
+    pub const WAVE_SAW: u32 = 0;
+    pub const WAVE_SQUARE: u32 = 1;
+    /// The two shapes, in wire order. The machine had exactly these and
+    /// a switch between them.
+    pub const WAVE_NAMES: &[&str] = &["saw", "square"];
+
+    /// Coarse tuning, in semitones.
+    pub const TUNE_MAX_ST: f32 = 24.0;
+
+    /// The filter's window. The floor is low enough to close the sound
+    /// almost entirely, which is half of what the knob is for.
+    pub const CUTOFF_MIN_HZ: f32 = 60.0;
+    pub const CUTOFF_MAX_HZ: f32 = 12_000.0;
+
+    /// How far a full envelope at full depth opens the filter, in
+    /// octaves. Five, which is a sweep from a closed thump to an open
+    /// buzz — the range the squelch lives in.
+    pub const ENV_OCTAVES: f32 = 5.0;
+
+    /// The filter envelope's decay, in ms.
+    pub const DECAY_MIN_MS: f32 = 30.0;
+    pub const DECAY_MAX_MS: f32 = 2_000.0;
+
+    /// The slide's time, in ms. Only a SLID note glides — see
+    /// `audio::acid`; a note arriving on its own snaps to pitch, because
+    /// a portamento that applied to every note would be a different
+    /// instrument.
+    pub const GLIDE_MIN_MS: f32 = 1.0;
+    pub const GLIDE_MAX_MS: f32 = 300.0;
+
+    /// Above this velocity a note is ACCENTED. The original had a switch
+    /// per step rather than a continuum; a velocity threshold is the same
+    /// gesture in a sequencer that already stores one.
+    pub const ACCENT_VEL: u8 = 100;
+
+    /// The amplifier's fixed edges, in ms. Not knobs — see the module
+    /// header.
+    pub const AMP_ATTACK_MS: f32 = 3.0;
+    pub const AMP_RELEASE_MS: f32 = 12.0;
+
+    pub const TABLE: &[ParamDef] = &[
+        ParamDef {
+            id: WAVE,
+            name: "wave",
+            min: WAVE_SAW as f32,
+            max: WAVE_SQUARE as f32,
+            // The saw. Both are canonical, and the saw is the one on the
+            // records.
+            default: WAVE_SAW as f32,
+        },
+        ParamDef {
+            id: TUNE,
+            name: "tune",
+            min: -TUNE_MAX_ST,
+            max: TUNE_MAX_ST,
+            default: 0.0,
+        },
+        ParamDef {
+            id: CUTOFF,
+            name: "cutoff",
+            min: CUTOFF_MIN_HZ,
+            max: CUTOFF_MAX_HZ,
+            // Low, because the envelope opens it. A cutoff parked high
+            // leaves the env mod nothing to do, which is the commonest
+            // way this instrument gets set up to sound like nothing.
+            default: 400.0,
+        },
+        ParamDef {
+            id: RESONANCE,
+            name: "resonance",
+            min: 0.0,
+            max: 1.0,
+            // High. The squelch IS the resonance, and a cautious default
+            // here would be a cautious default on the one control the
+            // device exists for.
+            default: 0.65,
+        },
+        ParamDef {
+            id: ENV_MOD,
+            name: "env mod",
+            min: 0.0,
+            max: 1.0,
+            default: 0.55,
+        },
+        ParamDef {
+            id: DECAY,
+            name: "decay",
+            min: DECAY_MIN_MS,
+            max: DECAY_MAX_MS,
+            default: 300.0,
+        },
+        ParamDef {
+            id: ACCENT,
+            name: "accent",
+            min: 0.0,
+            max: 1.0,
+            default: 0.5,
+        },
+        ParamDef {
+            id: GLIDE,
+            name: "glide",
+            min: GLIDE_MIN_MS,
+            max: GLIDE_MAX_MS,
+            default: 60.0,
+        },
+        ParamDef {
+            id: DRIVE,
+            name: "drive",
+            min: 0.0,
+            max: 1.0,
+            // A little. The filter's own saturation is part of the
+            // character; the rack's saturator is where a lot of it lives.
+            default: 0.15,
+        },
+        ParamDef {
+            id: LEVEL,
+            name: "level",
+            min: 0.0,
+            max: 2.0,
+            default: 0.8,
+        },
+    ];
+}
+
 pub mod resyn {
     use super::ParamDef;
 
@@ -4741,6 +4911,7 @@ mod tests {
         ("gate", gate::TABLE),
         ("strip", strip::TABLE),
         ("resyn", resyn::TABLE),
+        ("acid", acid::TABLE),
     ];
 
     /// The invariant `def()` and every `TABLE[FOO as usize]` rely on.

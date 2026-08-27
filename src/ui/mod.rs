@@ -419,6 +419,7 @@ mod tests {
             "gate.rs",      // ditto
             "strip.rs",     // ditto
             "resyn.rs",     // ditto
+            "acid.rs",      // ditto
             "modulato.rs",  // ditto
             "sampler.rs",   // ditto
             "snare.rs",     // ditto

@@ -36,6 +36,7 @@ pub enum DeviceKind {
     Gate,
     Strip,
     Resyn,
+    Acid,
     Echo,
     Eq,
     Filter,
@@ -1783,6 +1784,67 @@ pub static DEVICES: &[DeviceSpec] = &[
                 name: "Band 8",
                 unit: "",
                 group: "Resyn",
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Acid,
+        name: "acid",
+        instrument: true,
+        prefix: "acid",
+        params: daw::params::acid::TABLE,
+        // Units blank for the reason the others' are: the card prints
+        // "saw", "+0 st", "400 Hz" and "65 %" through its own `Unit`.
+        labels: &[
+            ParamLabel {
+                name: "Wave",
+                unit: "",
+                group: "Acid",
+            },
+            ParamLabel {
+                name: "Tune",
+                unit: "",
+                group: "Acid",
+            },
+            ParamLabel {
+                name: "Cutoff",
+                unit: "",
+                group: "Acid",
+            },
+            ParamLabel {
+                name: "Resonance",
+                unit: "",
+                group: "Acid",
+            },
+            ParamLabel {
+                name: "Env mod",
+                unit: "",
+                group: "Acid",
+            },
+            ParamLabel {
+                name: "Decay",
+                unit: "",
+                group: "Acid",
+            },
+            ParamLabel {
+                name: "Accent",
+                unit: "",
+                group: "Acid",
+            },
+            ParamLabel {
+                name: "Glide",
+                unit: "",
+                group: "Acid",
+            },
+            ParamLabel {
+                name: "Drive",
+                unit: "",
+                group: "Acid",
+            },
+            ParamLabel {
+                name: "Level",
+                unit: "",
+                group: "Acid",
             },
         ],
     },

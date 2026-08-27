@@ -263,6 +263,7 @@ pub enum DeviceState {
     Gate(daw::audio::gate::GateParams),
     Strip(daw::audio::strip::StripParams),
     Resyn(daw::audio::resyn::ResynParams),
+    Acid(daw::audio::acid::AcidParams),
     Limiter(daw::audio::limiter::LimiterParams),
     Modulato(daw::audio::modulato::ModulatoParams),
     Utility(daw::audio::utility::UtilityParams),
@@ -294,6 +295,7 @@ impl DeviceState {
             DeviceKind::Gate => Self::Gate(daw::audio::gate::GateParams::default()),
             DeviceKind::Strip => Self::Strip(daw::audio::strip::StripParams::default()),
             DeviceKind::Resyn => Self::Resyn(daw::audio::resyn::ResynParams::default()),
+            DeviceKind::Acid => Self::Acid(daw::audio::acid::AcidParams::default()),
             DeviceKind::Limiter => Self::Limiter(daw::audio::limiter::LimiterParams::default()),
             DeviceKind::Modulato => Self::Modulato(daw::audio::modulato::ModulatoParams::default()),
             DeviceKind::Utility => Self::Utility(daw::audio::utility::UtilityParams::default()),
@@ -324,6 +326,7 @@ impl DeviceState {
             Self::Gate(_) => DeviceKind::Gate,
             Self::Strip(_) => DeviceKind::Strip,
             Self::Resyn(_) => DeviceKind::Resyn,
+            Self::Acid(_) => DeviceKind::Acid,
             Self::Limiter(_) => DeviceKind::Limiter,
             Self::Modulato(_) => DeviceKind::Modulato,
             Self::Utility(_) => DeviceKind::Utility,
@@ -436,6 +439,7 @@ impl DeviceState {
             Self::Gate(p) => p.get(param),
             Self::Strip(p) => p.get(param),
             Self::Resyn(p) => p.get(param),
+            Self::Acid(p) => p.get(param),
             // Its own reader beside its own writer, in the struct that
             // owns them — spelling seven rows out again here is how the
             // two halves drift.
@@ -536,6 +540,7 @@ impl DeviceState {
             Self::Gate(p) => p.set(param, value),
             Self::Strip(p) => p.set(param, value),
             Self::Resyn(p) => p.set(param, value),
+            Self::Acid(p) => p.set(param, value),
             Self::Limiter(p) => p.set(param, value),
             Self::Modulato(p) => p.set(param, value),
             Self::Utility(p) => p.set(param, value),
@@ -727,6 +732,18 @@ pub fn utility_knobs(params: daw::audio::utility::UtilityParams) -> device::Util
     knobs
 }
 
+pub fn acid_knobs(params: daw::audio::acid::AcidParams) -> device::AcidUi {
+    let mut knobs = device::AcidUi::default();
+    for def in daw::params::acid::TABLE {
+        if let Some(value) = params.get(def.id)
+            && let Some(slot) = knobs.slot_mut(def.id)
+        {
+            *slot = device_norm(DeviceKind::Acid, def.id, value);
+        }
+    }
+    knobs
+}
+
 pub fn resyn_knobs(params: daw::audio::resyn::ResynParams, page: u8) -> device::ResynUi {
     let mut knobs = device::ResynUi::default();
     for def in daw::params::resyn::TABLE {
@@ -834,6 +851,7 @@ pub fn device_norm(kind: DeviceKind, param: u32, value: f32) -> f32 {
         DeviceKind::Gate => device::gate_norm(param, value),
         DeviceKind::Strip => device::strip_norm(param, value),
         DeviceKind::Resyn => device::resyn_norm(param, value),
+        DeviceKind::Acid => device::acid_norm(param, value),
         DeviceKind::Modulato => device::modulato::modulato_norm(param, value),
         DeviceKind::Utility => device::utility_norm(param, value),
     }
@@ -872,6 +890,7 @@ pub fn device_is_discrete(kind: DeviceKind, param: u32) -> bool {
         DeviceKind::Gate => device::gate_is_discrete(param),
         DeviceKind::Strip => device::strip_is_discrete(param),
         DeviceKind::Resyn => device::resyn_is_discrete(param),
+        DeviceKind::Acid => device::acid_is_discrete(param),
         DeviceKind::Modulato => device::modulato::modulato_is_discrete(param),
         DeviceKind::Utility => device::utility_is_discrete(param),
         DeviceKind::SineSynth | DeviceKind::Reverb => false,
@@ -905,6 +924,7 @@ pub fn device_is_log(kind: DeviceKind, param: u32) -> bool {
         DeviceKind::Gate => device::gate_is_log(param),
         DeviceKind::Strip => device::strip_is_log(param),
         DeviceKind::Resyn => device::resyn_is_log(param),
+        DeviceKind::Acid => device::acid_is_log(param),
         DeviceKind::Modulato => device::modulato::modulato_is_log(param),
         DeviceKind::Utility => device::utility_is_log(param),
         DeviceKind::Reverb => false,
@@ -941,6 +961,7 @@ pub fn device_value(kind: DeviceKind, param: u32, norm: f32) -> f32 {
         DeviceKind::Gate => device::gate_value(param, norm),
         DeviceKind::Strip => device::strip_value(param, norm),
         DeviceKind::Resyn => device::resyn_value(param, norm),
+        DeviceKind::Acid => device::acid_value(param, norm),
         DeviceKind::Modulato => device::modulato::modulato_value(param, norm),
         DeviceKind::Utility => device::utility_value(param, norm),
     }

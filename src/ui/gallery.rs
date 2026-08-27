@@ -90,6 +90,7 @@ pub struct Gallery {
     dev_gate: device::GateUi,
     dev_strip: device::StripUi,
     dev_resyn: device::ResynUi,
+    dev_acid: device::AcidUi,
 }
 
 impl Default for Gallery {
@@ -158,6 +159,7 @@ impl Default for Gallery {
             // a nearly straight line.
             // Some bands moved, so the preview shows eight bars rather
             // than a flat row of ticks.
+            dev_acid: device::AcidUi::default(),
             dev_resyn: device::ResynUi {
                 bands: [
                     device::resyn_norm(params::resyn::BAND0, 3.0),
@@ -845,6 +847,17 @@ impl Gallery {
                     "ResynEdit(param {}, {:.2})",
                     edit.param, edit.value
                 ));
+            }
+
+            kit::gap(ui, theme, space::SM);
+            kit::muted(
+                ui,
+                theme,
+                "acid — the filter, and how far the envelope opens it",
+            );
+            for edit in device::acid_card(ui, theme, &mut self.dev_acid) {
+                self.log
+                    .push(format!("AcidEdit(param {}, {:.2})", edit.param, edit.value));
             }
 
             kit::gap(ui, theme, space::SM);

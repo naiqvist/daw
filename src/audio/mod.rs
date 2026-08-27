@@ -10,6 +10,7 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
+pub mod acid;
 pub mod bounce;
 pub mod eq;
 pub mod filter;

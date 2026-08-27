@@ -72,6 +72,7 @@
 //!   decays for the snare, the oscillator bank and its filter window for
 //!   the 808 hat, the burst pattern for the clap.
 
+pub mod acid;
 pub mod adjust;
 pub mod bezier;
 pub mod card;
@@ -128,6 +129,9 @@ pub mod tom;
 pub mod utility;
 pub mod xy;
 
+pub use acid::{
+    AcidUi, acid_card, acid_edits, acid_is_discrete, acid_is_log, acid_norm, acid_value,
+};
 pub use bezier::{Cubic, Pt};
 pub use card::{Well, Wells, card, empty_card, sections, sub_wells, tabbed_card, wells};
 pub use disperser::{
