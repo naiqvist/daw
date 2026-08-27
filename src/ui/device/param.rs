@@ -92,8 +92,20 @@ pub enum Unit {
     Ms,
     Seconds,
     Semitones,
+    /// A multiplication factor: `x4.0`. The unit a drive control wants —
+    /// a saturator's drive is input gain into a curve, and "four times
+    /// in" is what the shape it draws actually shows. dB would be equally
+    /// true and less legible against a picture of the curve.
+    Ratio,
     /// Bare number, two decimals.
     Plain,
+    /// A MIDI note number, printed as a name: `C3`, `F#5`.
+    ///
+    /// A real unit rather than a `Choice` list of 128 strings: the value
+    /// is a number the engine uses as a number, and the naming is
+    /// arithmetic. Middle C is C4 here, so note 60 prints `C4` — the
+    /// convention the piano roll already draws.
+    Note,
     /// A discrete parameter's choice names, indexed by the natural value.
     /// Pair with [`Mapping::Steps`]; [`Param::choice`] builds both.
     Choice(&'static [&'static str]),
@@ -112,7 +124,17 @@ impl Unit {
             Self::Ms => format!("{v:.1} ms"),
             Self::Seconds => format!("{v:.2} s"),
             Self::Semitones => format!("{v:+.0} st"),
+            // TRAILING, like every other unit here — and not merely for
+            // consistency: a field seeds its editor with this exact
+            // string, and a leading "x" is not a number, so "x4.0" would
+            // fail to parse back the moment anyone clicked the value.
+            Self::Ratio => format!("{v:.1}x"),
             Self::Plain => format!("{v:.2}"),
+            Self::Note => {
+                let midi = v.round().clamp(0.0, 127.0) as u8;
+                let octave = i32::from(midi / 12) - 1;
+                format!("{}{octave}", crate::theory::pitch_class_name(midi))
+            }
             // Out of range prints the number rather than panicking: a
             // choice list and a step count that disagree is a programming
             // error, and showing "3" is a better way to find it than an

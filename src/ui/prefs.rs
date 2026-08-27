@@ -39,6 +39,23 @@ pub struct UiPrefs {
     /// Whether the rack's modulation strip is folded to its tab. How the
     /// workspace is arranged, so it rides the machine-local prefs.
     pub mod_strip_collapsed: bool,
+    /// The frame regions the user has folded away.
+    ///
+    /// Stored as HIDDEN rather than shown, for the reason
+    /// `Registry::hidden_ids` gives about panels: a region added in a
+    /// later version then defaults to visible instead of invisible.
+    #[serde(default)]
+    pub browser_hidden: bool,
+    #[serde(default)]
+    pub lower_hidden: bool,
+    /// Whether the welcome screen stays down at launch.
+    ///
+    /// Stored as the NEGATIVE for the reason the hidden sets are: a
+    /// preference added in a later version then defaults to the friendly
+    /// answer, and for a screen that offers you your own songs back the
+    /// friendly answer is to show it.
+    #[serde(default)]
+    pub skip_splash: bool,
 }
 
 impl UiPrefs {
@@ -66,6 +83,9 @@ mod tests {
             focused_center: Some("arrange".to_owned()),
             recent_projects: vec!["/tmp/a.daw.ron".to_owned()],
             mod_strip_collapsed: true,
+            browser_hidden: true,
+            lower_hidden: true,
+            skip_splash: true,
         };
         let back = UiPrefs::from_ron_or_default(&prefs.to_ron().unwrap());
         assert_eq!(prefs, back);
@@ -78,6 +98,11 @@ mod tests {
         assert_eq!(prefs.density, Density::Compact);
         assert!(prefs.hidden_panels.is_empty());
         assert_eq!(prefs.focused_center, None);
+        // A frame region added later defaults to SHOWN: the field stores
+        // hidden, so a file that never heard of it opens with everything
+        // visible rather than with the app apparently missing its chrome.
+        assert!(!prefs.browser_hidden);
+        assert!(!prefs.lower_hidden);
     }
 
     /// A file written by a NEWER build carries fields we do not know.

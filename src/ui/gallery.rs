@@ -15,6 +15,7 @@
 //!
 //! Dev-facing, hosted by the `lab` binary. Not shipped in the app's shell.
 
+use crate::params;
 use crate::ui::action::UiAction;
 use crate::ui::device;
 use crate::ui::host::{Panel, PanelCx};
@@ -80,6 +81,7 @@ pub struct Gallery {
     dev_env: device::Adsr,
     dev_page: usize,
     dev_synth: device::SineSynthUi,
+    dev_poly: device::PolyUi,
 }
 
 impl Default for Gallery {
@@ -133,6 +135,7 @@ impl Default for Gallery {
             dev_env: device::Adsr::default(),
             dev_page: 0,
             dev_synth: device::SineSynthUi::default(),
+            dev_poly: device::PolyUi::default(),
         }
     }
 }
@@ -597,6 +600,42 @@ impl Gallery {
 
         kit::section(ui, theme, "device cards", |ui| {
             kit::gap(ui, theme, space::SM);
+            kit::muted(
+                ui,
+                theme,
+                "poly synth studies — the picture is the control (drag, wheel, arrows)",
+            );
+            ui.horizontal(|ui| {
+                if device::poly_widgets::wave_picker(ui, theme, &mut self.dev_poly.osc_a.wave) {
+                    self.log.push("PolyWave changed".to_owned());
+                }
+                kit::gap(ui, theme, space::MD);
+                if device::poly_widgets::pitch_stack(
+                    ui,
+                    theme,
+                    &mut self.dev_poly.osc_a.octave,
+                    &mut self.dev_poly.osc_a.semi,
+                    &mut self.dev_poly.osc_a.fine,
+                ) {
+                    self.log.push("PolyPitch changed".to_owned());
+                }
+                kit::gap(ui, theme, space::MD);
+                let unison_norm = self.dev_poly.unison.clamp(0.0, 1.0);
+                let last = device::poly_widgets::UNISON_MAX - 1;
+                let voices =
+                    params::poly::unison((unison_norm * last as f32).round() as u32) as usize;
+                if device::poly_widgets::unison_field(
+                    ui,
+                    theme,
+                    voices,
+                    &mut self.dev_poly.spread,
+                    &mut self.dev_poly.detune,
+                ) {
+                    self.log.push("PolyUnison changed".to_owned());
+                }
+            });
+
+            kit::gap(ui, theme, space::SM);
             kit::muted(ui, theme, "the mini curve, in a card beside its knobs");
             device::card(ui, theme, "filter", |ui| {
                 // The first card built entirely from the new widgets, and
@@ -659,6 +698,17 @@ impl Gallery {
                     "SynthEdit(param {}, {:.2})",
                     edit.param, edit.value
                 ));
+            }
+
+            kit::gap(ui, theme, space::SM);
+            kit::muted(
+                ui,
+                theme,
+                "poly synth — one tab page per section of the voice path",
+            );
+            for edit in device::poly_card(ui, theme, &mut self.dev_poly) {
+                self.log
+                    .push(format!("PolyEdit(param {}, {:.2})", edit.param, edit.value));
             }
 
             kit::gap(ui, theme, space::SM);

@@ -12,12 +12,57 @@ use std::path::Path;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BounceError {
+    #[error("cancelled")]
+    Cancelled,
     #[error("compile: {0}")]
     Compile(#[from] CompileError),
     #[error("wav: {0}")]
     Wav(#[from] hound::Error),
     #[error("a disk stream did not become ready within {0:?} — stalled or unreadable file")]
     StreamTimeout(std::time::Duration),
+}
+
+/// What the samples are written as.
+///
+/// Float32 is the render's own arithmetic written down unchanged — nothing
+/// is scaled, rounded or clipped, so a bounce that overshoots can still be
+/// pulled back. The integer formats are the ones a mix is DELIVERED in, and
+/// they clip: there is no headroom above full scale to keep.
+///
+/// Neither integer format dithers. At 24 bits the truncation floor sits
+/// below any room's, and at 16 it is a known, deliberate omission rather
+/// than an oversight — dither is a decision with a sound, and it belongs
+/// beside a mastering stage rather than inside a file writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BounceFormat {
+    #[default]
+    Float32,
+    Int24,
+    Int16,
+}
+
+impl BounceFormat {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Float32 => "32-bit float",
+            Self::Int24 => "24-bit",
+            Self::Int16 => "16-bit",
+        }
+    }
+
+    fn wav_spec(self, sample_rate: u32) -> hound::WavSpec {
+        let (bits, sample_format) = match self {
+            Self::Float32 => (32, hound::SampleFormat::Float),
+            Self::Int24 => (24, hound::SampleFormat::Int),
+            Self::Int16 => (16, hound::SampleFormat::Int),
+        };
+        hound::WavSpec {
+            channels: 2,
+            sample_rate,
+            bits_per_sample: bits,
+            sample_format,
+        }
+    }
 }
 
 pub struct BounceOptions {
@@ -27,6 +72,16 @@ pub struct BounceOptions {
     /// Render length in beats (converted through the transport's TimeMap —
     /// the same conversion the engine uses everywhere).
     pub length_beats: f64,
+    /// Where the WRITTEN file starts, in beats.
+    ///
+    /// The render always runs from timeline zero and the head is thrown
+    /// away, which is not laziness: a delay, a reverb or a compressor
+    /// arriving at bar 9 sounds the way it does because of bars 1 to 8,
+    /// and a render that began there would be a different piece of audio
+    /// from the one the transport plays. Exporting the tail of a long song
+    /// therefore costs the whole song's render time.
+    pub start_beats: f64,
+    pub format: BounceFormat,
 }
 
 impl Default for BounceOptions {
@@ -36,34 +91,81 @@ impl Default for BounceOptions {
             block_frames: 256,
             bpm: 120.0,
             length_beats: 8.0,
+            start_beats: 0.0,
+            format: BounceFormat::Float32,
         }
     }
 }
 
-/// Render `spec` from timeline zero for `length_beats`, writing a stereo
-/// 32-bit float wav.
+/// Render `spec` from timeline zero, writing the stereo wav `opts` asks
+/// for. See [`BounceOptions::start_beats`] on why a later start still
+/// renders from the top.
 pub fn bounce(spec: &GraphSpec, opts: &BounceOptions, path: &Path) -> Result<(), BounceError> {
+    bounce_with(spec, opts, path, |_| true)
+}
+
+/// The same, reporting how far along it is as a fraction in `0..=1`.
+///
+/// The hook runs once per block on the rendering thread, and returns
+/// whether to carry on: `false` abandons the render with
+/// [`BounceError::Cancelled`] and REMOVES the part-written file, because a
+/// truncated wav is not a shorter song — it is a broken one, and leaving it
+/// on disk under the name the user chose is worse than leaving nothing.
+pub fn bounce_with(
+    spec: &GraphSpec,
+    opts: &BounceOptions,
+    path: &Path,
+    progress: impl FnMut(f32) -> bool,
+) -> Result<(), BounceError> {
+    bounce_automated(spec, opts, path, |_, _| {}, progress)
+}
+
+/// The same again, with a hand on the parameters.
+///
+/// `letters` is called once per block with the beat that block STARTS at,
+/// and everything it pushes is applied before the block runs. This is how
+/// automation reaches an offline render: live, an envelope is a stream of
+/// parameter letters from the UI thread, and a render with no UI thread
+/// would otherwise hear every fader parked at its written-down value —
+/// silently, which is the worst way for a mix to be wrong.
+///
+/// Per BLOCK rather than per sample: a letter is smoothed by the node that
+/// receives it, exactly as a live one is, so the two paths hear the same
+/// ramp shape.
+pub fn bounce_automated(
+    spec: &GraphSpec,
+    opts: &BounceOptions,
+    path: &Path,
+    mut letters: impl FnMut(f64, &mut Vec<crate::audio::graph::ParamChange>),
+    mut progress: impl FnMut(f32) -> bool,
+) -> Result<(), BounceError> {
     let mut sched = spec.compile_at_tempo(opts.sample_rate, opts.block_frames, opts.bpm)?;
     let mut transport = Transport::new(opts.sample_rate as f64);
     transport.apply(TransportCmd::SetTempo(opts.bpm));
     transport.apply(TransportCmd::Play);
-    let total_samples = transport.map.beats_to_samples(opts.length_beats);
+    let total_samples = transport.map.beats_to_samples(opts.length_beats.max(0.0));
+    // The head that is rendered and thrown away, never written.
+    let skip_samples = transport
+        .map
+        .beats_to_samples(opts.start_beats.max(0.0))
+        .min(total_samples);
 
-    let wav_spec = hound::WavSpec {
-        channels: 2,
-        sample_rate: opts.sample_rate,
-        bits_per_sample: 32,
-        sample_format: hound::SampleFormat::Float,
-    };
-    let mut writer = hound::WavWriter::create(path, wav_spec)?;
+    let mut writer = hound::WavWriter::create(path, opts.format.wav_spec(opts.sample_rate))?;
 
     let frames = opts.block_frames;
     let mut block = vec![0.0f32; frames * 2]; // planar L then R
     let no_input = vec![0.0f32; frames * 2];
     let mut rendered: u64 = 0;
 
+    let mut pending: Vec<crate::audio::graph::ParamChange> = Vec::new();
     while rendered < total_samples {
         let want = frames.min((total_samples - rendered) as usize);
+        // Automation for the block about to run, before it runs.
+        pending.clear();
+        letters(transport.map.samples_to_beats(rendered), &mut pending);
+        for change in pending.drain(..) {
+            sched.apply(change);
+        }
         // Offline luxury: wait for disk streams before every block — but
         // with a deadline. A stalled stream is an error, not a hang.
         let timeout = std::time::Duration::from_secs(5);
@@ -99,13 +201,67 @@ pub fn bounce(spec: &GraphSpec, opts: &BounceOptions, path: &Path) -> Result<(),
         }
 
         for i in 0..want {
-            writer.write_sample(block[i])?; // L
-            writer.write_sample(block[frames + i])?; // R
+            if rendered + i as u64 >= skip_samples {
+                write_frame(&mut writer, opts.format, block[i], block[frames + i])?;
+            }
         }
         rendered += want as u64;
+        let at = if total_samples > 0 {
+            rendered as f32 / total_samples as f32
+        } else {
+            1.0
+        };
+        if !progress(at) {
+            // The writer is dropped without finalizing, then the file goes
+            // with it: nothing on disk is better than a wav with a header
+            // that lies about its length.
+            drop(writer);
+            let _ = std::fs::remove_file(path);
+            return Err(BounceError::Cancelled);
+        }
     }
     writer.finalize()?;
     Ok(())
+}
+
+/// One stereo frame, in the format asked for.
+fn write_frame<W: std::io::Write + std::io::Seek>(
+    writer: &mut hound::WavWriter<W>,
+    format: BounceFormat,
+    l: f32,
+    r: f32,
+) -> Result<(), hound::Error> {
+    match format {
+        BounceFormat::Float32 => {
+            writer.write_sample(l)?;
+            writer.write_sample(r)?;
+        }
+        // Full scale is one bit short of the positive ceiling so that -1.0
+        // and +1.0 are symmetric: the alternative rounds +1.0 up past what
+        // the format can hold and wraps it to silence.
+        BounceFormat::Int24 => {
+            writer.write_sample(to_int(l, 23))?;
+            writer.write_sample(to_int(r, 23))?;
+        }
+        BounceFormat::Int16 => {
+            writer.write_sample(to_int(l, 15) as i16)?;
+            writer.write_sample(to_int(r, 15) as i16)?;
+        }
+    }
+    Ok(())
+}
+
+/// A sample as a `bits`-plus-sign integer, CLIPPED at full scale. A mix
+/// that overshoots must arrive as a flat top, which is audible, rather than
+/// wrapping to the opposite rail, which is a bang.
+fn to_int(sample: f32, bits: u32) -> i32 {
+    let scale = ((1u32 << bits) - 1) as f32;
+    let clipped = if sample.is_finite() {
+        sample.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
+    (clipped * scale).round() as i32
 }
 
 #[cfg(test)]
@@ -113,6 +269,231 @@ pub fn bounce(spec: &GraphSpec, opts: &BounceOptions, path: &Path) -> Result<(),
 mod tests {
     use super::*;
     use crate::audio::graph::{NodeSpec, Note};
+
+    fn ping(gain: f32) -> GraphSpec {
+        let mut spec = GraphSpec::default();
+        let seq = spec.push(NodeSpec::Seq {
+            notes: vec![Note {
+                start_beats: 0.0,
+                len_beats: 0.5,
+                pitch: 69,
+                vel: 110,
+                plocks: Vec::new(),
+                prob: 1.0,
+                cond: None,
+            }],
+            subloops: Vec::new(),
+            loop_len_beats: Some(1.0),
+            params: Default::default(),
+        });
+        let mix = spec.push(NodeSpec::Mixer { gain });
+        spec.connect(seq, mix);
+        spec.set_output(mix);
+        spec
+    }
+
+    fn frames(path: &Path) -> u64 {
+        let reader = hound::WavReader::open(path).unwrap();
+        u64::from(reader.duration())
+    }
+
+    /// A later start writes a shorter file, and what it writes is the TAIL
+    /// of the same render — not a fresh one begun at that beat.
+    #[test]
+    fn a_start_beat_trims_the_head_off_the_same_render() {
+        let spec = ping(0.6);
+        let whole = std::env::temp_dir().join("daw-test-range-whole.wav");
+        let tail = std::env::temp_dir().join("daw-test-range-tail.wav");
+        bounce(
+            &spec,
+            &BounceOptions {
+                length_beats: 4.0,
+                ..Default::default()
+            },
+            &whole,
+        )
+        .unwrap();
+        bounce(
+            &spec,
+            &BounceOptions {
+                length_beats: 4.0,
+                start_beats: 3.0,
+                ..Default::default()
+            },
+            &tail,
+        )
+        .unwrap();
+
+        let (whole_n, tail_n) = (frames(&whole), frames(&tail));
+        assert_eq!(tail_n * 4, whole_n, "one beat of four");
+
+        // Sample for sample, the tail IS the end of the whole render.
+        let all: Vec<f32> = hound::WavReader::open(&whole)
+            .unwrap()
+            .samples::<f32>()
+            .map(Result::unwrap)
+            .collect();
+        let end: Vec<f32> = hound::WavReader::open(&tail)
+            .unwrap()
+            .samples::<f32>()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(&all[all.len() - end.len()..], &end[..]);
+    }
+
+    /// The integer formats land where they say they do, and CLIP rather
+    /// than wrap when the mix is over.
+    #[test]
+    fn integer_formats_are_scaled_and_clipped() {
+        assert_eq!(to_int(1.0, 15), 32_767);
+        assert_eq!(to_int(-1.0, 15), -32_767);
+        assert_eq!(to_int(0.0, 15), 0);
+        assert_eq!(to_int(4.0, 15), 32_767, "an overshoot flattens, not wraps");
+        assert_eq!(to_int(-4.0, 15), -32_767);
+        assert_eq!(to_int(f32::NAN, 15), 0, "and a NaN is silence, not noise");
+        assert_eq!(to_int(1.0, 23), 8_388_607);
+
+        // And the file says what it is.
+        let path = std::env::temp_dir().join("daw-test-int16.wav");
+        bounce(
+            &ping(0.6),
+            &BounceOptions {
+                length_beats: 1.0,
+                format: BounceFormat::Int16,
+                ..Default::default()
+            },
+            &path,
+        )
+        .unwrap();
+        let spec = hound::WavReader::open(&path).unwrap().spec();
+        assert_eq!(spec.bits_per_sample, 16);
+        assert_eq!(spec.sample_format, hound::SampleFormat::Int);
+        assert_eq!(spec.channels, 2);
+    }
+
+    /// Automation reaches an offline render: the same song, rendered once
+    /// with a fader letter arriving mid-way and once without, must differ.
+    #[test]
+    fn automation_letters_reach_the_render() {
+        use crate::audio::graph::ParamChange;
+
+        let mut spec = GraphSpec::default();
+        let seq = spec.push(NodeSpec::Seq {
+            notes: vec![Note {
+                start_beats: 0.0,
+                len_beats: 4.0,
+                pitch: 69,
+                vel: 110,
+                plocks: Vec::new(),
+                prob: 1.0,
+                cond: None,
+            }],
+            subloops: Vec::new(),
+            loop_len_beats: None,
+            params: Default::default(),
+        });
+        let pan = spec.push(NodeSpec::Pan {
+            pan: 0.0,
+            gain: 1.0,
+        });
+        spec.connect(seq, pan);
+        spec.set_output(pan);
+
+        let opts = BounceOptions {
+            length_beats: 4.0,
+            ..Default::default()
+        };
+        let plain = std::env::temp_dir().join("daw-test-auto-off.wav");
+        let faded = std::env::temp_dir().join("daw-test-auto-on.wav");
+        bounce(&spec, &opts, &plain).unwrap();
+        bounce_automated(
+            &spec,
+            &opts,
+            &faded,
+            |beat, out| {
+                // Silence from the halfway mark on.
+                if beat >= 2.0 {
+                    out.push(ParamChange {
+                        node: pan.to_bits(),
+                        param: crate::params::pan::GAIN,
+                        value: 0.0,
+                    });
+                }
+            },
+            |_| true,
+        )
+        .unwrap();
+
+        let tail_peak = |path: &Path| {
+            let mut reader = hound::WavReader::open(path).unwrap();
+            let all: Vec<f32> = reader.samples::<f32>().map(Result::unwrap).collect();
+            // The last quarter: well past the fader move and past its ramp.
+            all[all.len() * 3 / 4..]
+                .iter()
+                .fold(0.0f32, |peak, s| peak.max(s.abs()))
+        };
+        assert!(
+            tail_peak(&plain) > 0.01,
+            "the unautomated render must still be sounding at the end"
+        );
+        assert!(
+            tail_peak(&faded) < 0.001,
+            "a fader pulled to silence must be HEARD to be pulled: {}",
+            tail_peak(&faded)
+        );
+    }
+
+    /// A cancelled render leaves NOTHING behind: a truncated wav under the
+    /// name the user chose is worse than no file at all.
+    #[test]
+    fn cancelling_removes_the_part_written_file() {
+        let path = std::env::temp_dir().join("daw-test-cancelled.wav");
+        let _ = std::fs::remove_file(&path);
+        let mut blocks = 0;
+        let outcome = bounce_with(
+            &ping(0.6),
+            &BounceOptions {
+                length_beats: 64.0,
+                ..Default::default()
+            },
+            &path,
+            |_| {
+                blocks += 1;
+                blocks < 3
+            },
+        );
+        assert!(
+            matches!(outcome, Err(BounceError::Cancelled)),
+            "{outcome:?}"
+        );
+        assert!(!path.exists(), "the half-written file must not survive");
+    }
+
+    /// Progress runs from something to exactly one, so a bar cannot stall
+    /// short of the end of a render that has finished.
+    #[test]
+    fn progress_reaches_the_end() {
+        let mut seen: Vec<f32> = Vec::new();
+        bounce_with(
+            &ping(0.6),
+            &BounceOptions {
+                length_beats: 4.0,
+                ..Default::default()
+            },
+            &std::env::temp_dir().join("daw-test-progress.wav"),
+            |at| {
+                seen.push(at);
+                true
+            },
+        )
+        .unwrap();
+        assert!(
+            seen.len() > 1,
+            "a multi-block render reports more than once"
+        );
+        assert!(seen.windows(2).all(|w| w[1] >= w[0]), "and never goes back");
+        assert_eq!(seen.last().copied(), Some(1.0));
+    }
 
     #[test]
     fn bounce_is_deterministic_and_audible() {
@@ -123,6 +504,9 @@ mod tests {
                 len_beats: 0.5,
                 pitch: 69,
                 vel: 110,
+                plocks: Vec::new(),
+                prob: 1.0,
+                cond: None,
             }],
             subloops: Vec::new(),
             loop_len_beats: Some(1.0),
@@ -190,6 +574,7 @@ mod tests {
                 param: crate::params::mixer::GAIN,
                 min: 0.0,
                 max: 2.0,
+                log: false,
                 base: 1.0,
                 chain: Chain {
                     depth: 0.5,
@@ -225,6 +610,9 @@ mod tests {
                 len_beats: 0.25,
                 pitch: 69,
                 vel: 127,
+                plocks: Vec::new(),
+                prob: 1.0,
+                cond: None,
             }],
             subloops: Vec::new(),
             loop_len_beats: Some(1.0),
@@ -248,6 +636,7 @@ mod tests {
                 param: crate::params::mixer::GAIN,
                 min: 0.0,
                 max: 2.0,
+                log: false,
                 base: 1.0,
                 chain: Chain {
                     depth: 0.9,
@@ -368,6 +757,7 @@ mod tests {
             bpm: 120.0,
             sample_rate: 48_000,
             block_frames: 256,
+            ..Default::default()
         };
         let w = std::env::temp_dir().join("daw-test-len.wav");
         bounce(&spec, &opts, &w).unwrap();

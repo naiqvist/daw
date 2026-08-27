@@ -63,34 +63,108 @@
 //!   peak hold, latching clip light.
 //! - [`synth`]    — the sine synth device card, the first real device.
 //! - [`reverb`]   — the reverb device card, the first effect.
+//! - [`poly`]     — the workhorse poly synth's single tabbed instrument,
+//!   with oscillator, filter, amp and modulation screens.
+//! - [`kick`], [`snare`], [`tom`], [`hat`], [`handclap`] — the drum rack.
+//!   Each is a card in the same shape: one hero display of the thing that
+//!   IS the drum, over a strip of labelled cells. The hero differs
+//!   because the drums do — a pitch trajectory for the kick and tom, two
+//!   decays for the snare, the oscillator bank and its filter window for
+//!   the 808 hat, the burst pattern for the clap.
 
 pub mod adjust;
 pub mod bezier;
 pub mod card;
 pub mod design;
 pub mod dynamics;
+pub mod echo;
 pub mod envelope;
+pub mod eq;
 pub mod fader;
 pub mod field;
 pub mod filter;
+pub mod glue;
+pub mod handclap;
+pub mod hat;
+pub mod kick;
 pub mod knob;
+pub mod limiter;
 pub mod meter;
 pub mod metrics;
+pub mod modulato;
 pub mod param;
+pub mod poly;
+pub mod poly_widgets;
+/// NOT `#[cfg(test)]`, and deliberately.
+///
+/// The device UI contract requires a pointer test for every draggable
+/// target, and some of those targets live in the BINARY crate — the
+/// waveform editor's selection edges, the piano roll. A `cfg(test)`
+/// module here is invisible to them: when the binary's tests build, this
+/// library is an ordinary dependency compiled without `cfg(test)`, so
+/// the contract would be unenforceable exactly where it has already been
+/// broken once. Nothing references it outside tests, so it costs a
+/// release build nothing.
+pub mod probe;
 pub mod readout;
 pub mod reverb;
+pub mod sampler;
+pub mod sat;
+pub mod scope;
 pub mod shaper;
+pub mod snare;
 pub mod spectrum;
 pub mod switch;
 pub mod synth;
+pub mod tom;
+pub mod utility;
 pub mod xy;
 
 pub use bezier::{Cubic, Pt};
 pub use card::{Well, Wells, card, empty_card, sections, sub_wells, tabbed_card, wells};
+pub use echo::{
+    EchoUi, echo_card, echo_edits, echo_is_discrete, echo_is_log, echo_norm, echo_value,
+};
 pub use envelope::Adsr;
+pub use eq::{EqUi, eq_card, eq_edits, eq_is_discrete, eq_is_log, eq_norm, eq_value};
+pub use filter::{
+    FilterUi, filter_card, filter_choices, filter_edits, filter_format, filter_is_discrete,
+    filter_is_log, filter_norm, filter_value,
+};
+pub use glue::{
+    GlueUi, glue_card, glue_edits, glue_is_discrete, glue_is_log, glue_norm, glue_value,
+};
+pub use handclap::{
+    HandclapUi, handclap_card, handclap_edits, handclap_is_discrete, handclap_is_log,
+    handclap_norm, handclap_value,
+};
+pub use hat::{HatUi, hat_card, hat_edits, hat_is_discrete, hat_is_log, hat_norm, hat_value};
+pub use limiter::{
+    LimiterUi, limiter_card, limiter_choices, limiter_edits, limiter_format, limiter_is_discrete,
+    limiter_is_log, limiter_norm, limiter_value,
+};
 pub use metrics::Footprint;
 pub use param::{Mapping, Param, Unit};
+pub use poly::{
+    OscUi, PolyUi, poly_card, poly_choices, poly_edits, poly_format, poly_is_discrete, poly_is_log,
+    poly_norm, poly_value,
+};
 pub use reverb::{ReverbUi, reverb_card, reverb_edits, reverb_norm, reverb_value};
+pub use sampler::{
+    SamplerOutcome, SamplerUi, SamplerView, WaveColumn, sampler_card, sampler_choices,
+    sampler_edits, sampler_expanded, sampler_format, sampler_is_discrete, sampler_is_log,
+    sampler_norm, sampler_value,
+};
+pub use sat::{SatUi, sat_card, sat_edits, sat_is_discrete, sat_is_log, sat_norm, sat_value};
+pub use snare::{
+    SnareUi, snare_card, snare_edits, snare_is_discrete, snare_is_log, snare_norm, snare_value,
+};
 pub use synth::{
-    ParamEdit, SineSynthUi, sine_synth_card, sine_synth_edits, sine_synth_norm, sine_synth_value,
+    ParamEdit, SineSynthUi, sine_synth_card, sine_synth_edits, sine_synth_format,
+    sine_synth_is_log, sine_synth_norm, sine_synth_value,
+};
+pub use tom::{TomUi, tom_card, tom_edits, tom_is_discrete, tom_is_log, tom_norm, tom_value};
+pub use utility::{
+    UtilityUi, utility_card, utility_edits, utility_is_discrete, utility_is_log, utility_norm,
+    utility_value,
 };

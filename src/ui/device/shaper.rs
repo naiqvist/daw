@@ -42,7 +42,7 @@
 //! knob that does nothing.
 
 use crate::ui::device::metrics::Footprint;
-use crate::ui::device::{adjust, design};
+use crate::ui::device::{Unit, adjust, design};
 use crate::ui::theme::Theme;
 use crate::ui::tokens::{control, font, stroke};
 use eframe::egui;
@@ -278,6 +278,53 @@ fn draw_ground(painter: &egui::Painter, theme: &Theme, rect: egui::Rect, detail:
 pub fn transfer_curve(ui: &mut egui::Ui, theme: &Theme, shaper: &mut Shaper) -> bool {
     let (rect, response) =
         ui.allocate_exact_size(footprint(theme).size, egui::Sense::click_and_drag());
+    draw_transfer(ui, theme, shaper, rect, &response, true)
+}
+
+/// The curve ALONE, at the largest square its container will hold, with
+/// no ground and no outline of its own.
+///
+/// For a plot region inside a screen that has already painted itself —
+/// `poly_widgets::dark_curve_panel` and anything like it. A second filled
+/// rect inside that panel would draw a box around nothing, which is the
+/// note the poly oscillator screen makes about the same mistake.
+///
+/// The square is not negotiable: the unity diagonal has to read as 45
+/// degrees or the plot lies about how much is being taken off. So the
+/// smaller dimension wins and the leftover is empty ground — the honest
+/// outcome, rather than a curve stretched into a banner because the panel
+/// was wide.
+pub fn transfer_plot(ui: &mut egui::Ui, theme: &Theme, shaper: &mut Shaper) -> bool {
+    let avail = ui.available_size();
+    let side = avail.x.min(avail.y).max(0.0);
+    // Claim the WHOLE well, then centre the square in it. Allocating only
+    // the square would leave the spare width as a margin on one side,
+    // which reads as a misaligned plot rather than as breathing room —
+    // the leftover has to be symmetric to look deliberate.
+    let (outer, _) = ui.allocate_exact_size(avail, egui::Sense::hover());
+    let rect = egui::Rect::from_center_size(outer.center(), egui::vec2(side, side));
+    // Interaction follows the SQUARE, not the well: the empty ground
+    // beside it is not part of the control.
+    let response = ui.interact(
+        rect,
+        ui.id().with("transfer-curve"),
+        egui::Sense::click_and_drag(),
+    );
+    draw_transfer(ui, theme, shaper, rect, &response, false)
+}
+
+/// The display itself, given the rectangle it lives in and the response
+/// that drives it. One drawing, whether the caller sized it from a token
+/// or from what its panel had left — `ground` only decides whether it
+/// paints a screen of its own or sits on one it was handed.
+fn draw_transfer(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    shaper: &mut Shaper,
+    rect: egui::Rect,
+    response: &egui::Response,
+    ground: bool,
+) -> bool {
     let mut changed = false;
 
     if response.dragged() {
@@ -300,7 +347,7 @@ pub fn transfer_curve(ui: &mut egui::Ui, theme: &Theme, shaper: &mut Shaper) -> 
             }
         }
     }
-    let nudge = adjust::nudge(ui, &response);
+    let nudge = adjust::nudge(ui, response);
     if nudge != 0.0 {
         let next = norm_to_drive(drive_to_norm(shaper.drive) + nudge);
         if next != shaper.drive {
@@ -313,20 +360,33 @@ pub fn transfer_curve(ui: &mut egui::Ui, theme: &Theme, shaper: &mut Shaper) -> 
     }
 
     let painter = ui.painter();
-    painter.rect_filled(rect, design::box_radius(), theme.surface_sunken);
+    if ground {
+        // A HARDWARE-STYLE DISPLAY: square, sunken, per
+        // `design::screen_radius` — this box is pretending to be a
+        // screen, and a rounded corner is the loudest tell that it is
+        // drawn by a compositor instead.
+        painter.rect_filled(rect, design::screen_radius(), theme.surface_sunken);
+    }
     draw_ground(painter, theme, rect, true);
+    // `role_mod`, not `accent`: the four role colours are the screen
+    // language, and drive is the role's own headline example — "modulation
+    // and the destructive edge". An accent here would be atmosphere, which
+    // is the one thing colour is not allowed to be.
     painter.add(egui::Shape::line(
         curve_points(rect, shaper),
-        egui::Stroke::new(stroke::BOLD, theme.accent),
+        egui::Stroke::new(stroke::BOLD, theme.role_mod),
     ));
 
+    // Through `Unit::Ratio`, which is what the drive KNOB prints too: the
+    // value at the display edge and the value under the dial are the same
+    // string built by the same code, so they cannot drift apart.
     let mut text = format!(
-        "{}  x{:.1}",
+        "{}  {}",
         Mode::NAMES[Mode::ALL
             .iter()
             .position(|m| *m == shaper.mode)
             .unwrap_or(0)],
-        shaper.drive.clamp(DRIVE_MIN, DRIVE_MAX)
+        Unit::Ratio.format(shaper.drive.clamp(DRIVE_MIN, DRIVE_MAX))
     );
     if shaper.bias.abs() > 0.005 {
         text.push_str(&format!("  bias {:+.2}", shaper.bias));
@@ -342,12 +402,14 @@ pub fn transfer_curve(ui: &mut egui::Ui, theme: &Theme, shaper: &mut Shaper) -> 
         theme.text_muted,
     );
 
-    painter.rect_stroke(
-        rect,
-        design::box_radius(),
-        egui::Stroke::new(stroke::HAIR, theme.outline),
-        egui::StrokeKind::Inside,
-    );
+    if ground {
+        painter.rect_stroke(
+            rect,
+            design::screen_radius(),
+            egui::Stroke::new(stroke::HAIR, theme.outline),
+            egui::StrokeKind::Inside,
+        );
+    }
     if response.has_focus() {
         design::focus_ring(painter, theme, rect);
     }
@@ -358,18 +420,21 @@ pub fn transfer_curve(ui: &mut egui::Ui, theme: &Theme, shaper: &mut Shaper) -> 
 pub fn mini(ui: &mut egui::Ui, theme: &Theme, shaper: &Shaper) {
     let (rect, _) = ui.allocate_exact_size(footprint_mini(theme).size, egui::Sense::hover());
     let painter = ui.painter();
-    painter.rect_filled(rect, design::box_radius(), theme.surface_sunken);
+    // Square and `role_mod` like the display it is a thumbnail OF. The
+    // drift `design::box_radius` documents — a display with square corners
+    // whose own thumbnail had round ones — is exactly this pair.
+    painter.rect_filled(rect, design::screen_radius(), theme.surface_sunken);
     // No quarter grid at this size — the crosshair and the diagonal are
     // all that survive being this small, and they are the two that carry
     // the meaning.
     draw_ground(painter, theme, rect, false);
     painter.add(egui::Shape::line(
         curve_points(rect, shaper),
-        egui::Stroke::new(stroke::HAIR, theme.accent),
+        egui::Stroke::new(stroke::HAIR, theme.role_mod),
     ));
     painter.rect_stroke(
         rect,
-        design::box_radius(),
+        design::screen_radius(),
         egui::Stroke::new(stroke::HAIR, theme.outline),
         egui::StrokeKind::Inside,
     );

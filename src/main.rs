@@ -42,7 +42,7 @@ use daw::ui::palette::{Command as PaletteCommand, Palette};
 use daw::ui::prefs::{STORAGE_KEY, UiPrefs};
 use daw::ui::skin::Skin;
 use daw::ui::theme::Theme;
-use daw::ui::tokens::{Density, radius, stroke};
+use daw::ui::tokens::{Density, control, font, radius, space, stroke};
 use daw::ui::vm::{TrackKind, limits};
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
@@ -51,6 +51,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 mod piano_roll;
+mod session_bridge;
 mod waveform;
 
 /// UI zoom.
@@ -69,10 +70,13 @@ const ZOOM: f32 = 1.75;
 
 /// Height of the top bar.
 const TOP_BAR_H: f32 = 36.0;
-/// Width of the left browser region.
-const BROWSER_W: f32 = 240.0;
-/// Height of the bottom device region.
-const DEVICE_H: f32 = 180.0;
+/// Width of the left browser region — and, through the token, of every
+/// other side column, so the two never drift apart on screen.
+const BROWSER_W: f32 = control::SIDE_COLUMN_W;
+/// Height of the bottom device region — enough for the tall instrument
+/// card (`control::DEVICE_TALL_H`) plus the rack's own padding, so a
+/// freshly loaded poly synth is not born clipped.
+const DEVICE_H: f32 = 248.0;
 
 /// The drag seams. `#4797f5` is the exact inversion of the ground tint: the
 /// warm ramp sits at hue 32.5deg, so its complement is 212.5deg — brought up to
@@ -242,6 +246,21 @@ const CLIP_EDGE_W: f32 = 6.0;
 /// block is worse than none.
 const CLIP_LABEL_MIN_W: f32 = 34.0;
 const CLIP_LABEL_PAD: f32 = 4.0;
+/// Air between a clip and its lane edges. Clips are objects placed on the
+/// timeline, not paint poured into a row; this gap is what makes that
+/// distinction visible and leaves the resize seam legible.
+const CLIP_LANE_PAD_Y: f32 = 3.0;
+/// The title rail owns identity while the lower field owns musical content.
+const CLIP_TITLE_H: f32 = 17.0;
+/// Type metadata appears only when it cannot crowd the clip name.
+const CLIP_TYPE_MIN_W: f32 = 88.0;
+/// Selected edge grips are visible objects, not merely invisible hit zones.
+const CLIP_GRIP_W: f32 = 3.0;
+/// How wide a fade handle's grab is on a timeline clip. Wider than the
+/// trim grip beside it because it is aimed at with the clip's own corner
+/// as the only landmark, where a trim edge has the whole edge.
+const CLIP_FADE_GRIP: f32 = 9.0;
+const CLIP_GRIP_H: f32 = 12.0;
 /// The shortest note bar drawn, whatever the pitch span: a note must read
 /// as present, not as a hairline.
 const NOTE_MIN_H: f32 = 3.0;
@@ -272,9 +291,31 @@ const HEADER_KIND_TYPE: f32 = 9.0;
 /// Side of the square M and S buttons.
 const HEADER_BTN: f32 = 15.0;
 const HEADER_BTN_TYPE: f32 = 10.0;
+/// Stable horizontal distance between the M and S cells.
+const HEADER_CONTROL_GAP: f32 = 3.0;
+/// A shared metadata column wide enough for either MIDI or AUDIO.
+const HEADER_KIND_W: f32 = 38.0;
 /// Diameter of the header's pan knob — smaller than `control::KNOB`,
 /// because this one sits inside a lane rather than on a device card.
 const HEADER_KNOB: f32 = 20.0;
+/// The master fader's ceiling as linear amplitude: unity plus six dB. A
+/// master that can be pushed further is a master that can be pushed into
+/// the limiter by accident.
+const MASTER_GAIN_MAX: f32 = 2.0;
+/// How close to unity the level knob sticks, in the same amplitude units.
+const GAIN_DETENT: f32 = 0.02;
+/// The activity rail at the header's far edge. It is deliberately narrower
+/// than a rack meter: the arrangement only needs to answer "is this track
+/// alive, and did it clip?", not become a second mixer.
+const HEADER_METER_W: f32 = 6.0;
+/// Space that keeps the identity/control zones off the meter rail.
+const HEADER_METER_GAP: f32 = 5.0;
+/// The clip latch at the top of the activity rail.
+const HEADER_METER_CLIP_H: f32 = 3.0;
+/// Segmented like an Elektron ladder, but fine enough to remain a peripheral
+/// signal rather than the loudest object in a sixty-four-point lane.
+const HEADER_METER_SEG_H: f32 = 2.0;
+const HEADER_METER_SEG_GAP: f32 = 1.0;
 /// Below this lane height the controls row is DROPPED, name only: half a
 /// button is worse than no button, and a squeezed lane is a lane the user
 /// is not currently working on.
@@ -457,6 +498,20 @@ impl Focus {
         self.at == Some(id)
     }
 
+    /// Put the keyboard on `id` because the POINTER went there.
+    ///
+    /// Focus otherwise only moves by arrow key, which left the roll — or
+    /// any other region you can work in with the mouse — visibly the thing
+    /// being edited while its verbs went to whatever the ring was last
+    /// parked on. Claiming beats a pending arrow: the hand that just
+    /// pressed a button is more recent than the key that started the frame.
+    fn claim(&mut self, id: egui::Id) {
+        if self.at != Some(id) {
+            self.at = Some(id);
+            self.pending = None;
+        }
+    }
+
     /// Focused AND the user pressed Enter.
     fn activated(&self, id: egui::Id) -> bool {
         self.activate && self.at == Some(id)
@@ -576,8 +631,37 @@ fn arrangement_keys(ctx: &egui::Context, arr: &Arrangement, out: &mut Vec<UiActi
         if i.consume_key(egui::Modifiers::COMMAND, egui::Key::Num2) {
             out.push(UiAction::WidenGrid);
         }
+        // THE FRAME REGIONS, and they go BEFORE the loop's Ctrl+L.
+        //
+        // `consume_key` ignores an EXTRA modifier, so the loop check
+        // swallows Ctrl+Alt+L and the panel never toggles — the same trap
+        // the arrows, the track pair and the history pair each carry a
+        // paragraph about. Most specific first; the test
+        // `the_lower_panel_gesture_survives_the_loop_binding` is what
+        // holds it here.
+        //
+        // Alt is on this one because Ctrl+L was taken. It is also what
+        // Ableton puts on the same panel.
+        if i.consume_key(
+            egui::Modifiers::COMMAND | egui::Modifiers::ALT,
+            egui::Key::L,
+        ) {
+            out.push(UiAction::ToggleLower);
+        }
+        if i.consume_key(egui::Modifiers::COMMAND, egui::Key::B) {
+            out.push(UiAction::ToggleBrowser);
+        }
+        if i.consume_key(
+            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+            egui::Key::F,
+        ) {
+            out.push(UiAction::ToggleChrome);
+        }
         if i.consume_key(egui::Modifiers::COMMAND, egui::Key::L) {
             out.push(UiAction::LoopFromSelection);
+        }
+        if i.consume_key(egui::Modifiers::COMMAND, egui::Key::M) {
+            out.push(UiAction::CreateClip);
         }
         // The clipboard verbs, everywhere a clip can be selected.
         if i.consume_key(egui::Modifiers::COMMAND, egui::Key::C) {
@@ -1493,6 +1577,30 @@ impl Transport {
 
 /// The translation step: where UI wishes become app state.
 ///
+/// Move the insert point to `beat` — the piano roll's ruler asking the app
+/// for a locate, in absolute timeline beats.
+///
+/// The seek rides `pending_seek`, which is the ONE road to the engine: a
+/// locate has to move the playhead, the marker and the engine together, and
+/// setting the marker alone left a click in the roll unable to move a
+/// transport that was already rolling. The marker is set here as well as on
+/// the way through, so a Space in the SAME frame still starts from the click.
+///
+/// Pure over UI state, for the same reason [`perform`] is.
+fn locate_transport(
+    beat: f32,
+    track: usize,
+    transport: &mut Transport,
+    arrangement: &mut Arrangement,
+) {
+    let grid = arrangement.grid_beats();
+    arrangement.cursor = Some((track, beat));
+    arrangement.anchor = beat;
+    arrangement.selection = Some(span(beat, beat, grid));
+    transport.marker = beat;
+    arrangement.pending_seek = Some(beat);
+}
+
 /// Pure over UI state on purpose: engine side effects live in
 /// `App::route_transport` and friends, so this stays headless-testable and
 /// is the whole transport when the engine is off.
@@ -1572,7 +1680,7 @@ fn perform(actions: &[UiAction], transport: &mut Transport, arrangement: &mut Ar
                 // Plain movement drops the anchor here, collapsing the
                 // selection to the one cell under the cursor.
                 arrangement.anchor = beat;
-                arrangement.selected = Some(track);
+                arrangement.select_track(track);
                 arrangement.selection = Some(span(beat, beat, grid));
             }
             UiAction::ExtendCell(delta) => {
@@ -1580,7 +1688,7 @@ fn perform(actions: &[UiAction], transport: &mut Transport, arrangement: &mut Ar
                 let (track, beat) = arrangement.cursor.unwrap_or((0, 0.0));
                 let beat = (beat + *delta as f32 * grid).max(0.0);
                 arrangement.cursor = Some((track, beat));
-                arrangement.selected = Some(track);
+                arrangement.select_track(track);
                 arrangement.selection = Some(extended(arrangement.anchor, beat, grid));
             }
             UiAction::LoopFromSelection => {
@@ -1604,6 +1712,21 @@ fn perform(actions: &[UiAction], transport: &mut Transport, arrangement: &mut Ar
                     arrangement.selected_clip = None;
                 } else if let Some(track) = arrangement.selected {
                     arrangement.remove_track(track);
+                }
+            }
+            UiAction::CreateClip => {
+                let playhead = (transport.position * transport.bpm / 60.0) as f32;
+                let (track, beat) = arrangement.cursor.unwrap_or_else(|| {
+                    (
+                        arrangement.paste_track(),
+                        snap(playhead, arrangement.grid_beats()),
+                    )
+                });
+                if arrangement
+                    .create_clip(track, beat, transport.beats_per_bar as f32)
+                    .is_some()
+                {
+                    arrangement.select_track(track);
                 }
             }
             UiAction::CopyClip => arrangement.copy_selected(),
@@ -1659,7 +1782,7 @@ fn perform(actions: &[UiAction], transport: &mut Transport, arrangement: &mut Ar
                 }
             }
             UiAction::ZoomSelectedAudioClip => {
-                if arrangement.zoom_selected_audio_clip() {
+                if arrangement.focus_selected_clip() {
                     // Follow would immediately page away from a clip that
                     // does not contain the playhead, undoing the user's Z.
                     transport.follow = false;
@@ -1772,16 +1895,28 @@ impl Key {
 
 /// A device a track can hold: `SineSynth` makes sound, `Reverb` shapes it.
 ///
-/// Temporary `dead_code` allow: the browser's built-in Sine Synth and Reverb
-/// rows were the only things that constructed these outside tests, and they
-/// were mockups. The rack, `load_device` and the graph builder all still work
-/// on them — nothing in the running app can reach a device until the library
-/// browser offers one. The allow goes away with the row that refills it.
-#[allow(dead_code)]
+/// What a device IS. Every variant is a real node with a real parameter
+/// table; the browser's Instruments and Audio Effects folders are how one
+/// reaches a track.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 enum DeviceKind {
     SineSynth,
+    Poly,
+    Sampler,
+    Kick,
+    Snare,
+    Tom,
+    Hat,
+    Handclap,
     Reverb,
+    Sat,
+    Echo,
+    Eq,
+    Filter,
+    Glue,
+    Modulato,
+    Utility,
+    Limiter,
 }
 
 impl DeviceKind {
@@ -1858,26 +1993,1368 @@ static DEVICES: &[DeviceSpec] = &[
         ],
     },
     DeviceSpec {
+        kind: DeviceKind::Sampler,
+        name: "sampler",
+        instrument: true,
+        prefix: "sampler",
+        params: daw::params::sampler::TABLE,
+        // Grouped the way the card's five pages are, so a modulation
+        // target reads "Filter / Cutoff" rather than an id. THIRTY-SIX,
+        // exactly as many as the table has: the registry zips the two
+        // and would drop the difference in silence.
+        labels: &[
+            ParamLabel {
+                name: "Mode",
+                unit: "",
+                group: "Sample",
+            },
+            ParamLabel {
+                name: "Start",
+                unit: " %",
+                group: "Sample",
+            },
+            ParamLabel {
+                name: "End",
+                unit: " %",
+                group: "Sample",
+            },
+            ParamLabel {
+                name: "Reverse",
+                unit: "",
+                group: "Sample",
+            },
+            ParamLabel {
+                name: "Fade In",
+                unit: " ms",
+                group: "Sample",
+            },
+            ParamLabel {
+                name: "Fade Out",
+                unit: " ms",
+                group: "Sample",
+            },
+            ParamLabel {
+                name: "Root",
+                unit: "",
+                group: "Pitch",
+            },
+            ParamLabel {
+                name: "Tune",
+                unit: " st",
+                group: "Pitch",
+            },
+            ParamLabel {
+                name: "Fine",
+                unit: " ct",
+                group: "Pitch",
+            },
+            ParamLabel {
+                name: "Mode",
+                unit: "",
+                group: "Loop",
+            },
+            ParamLabel {
+                name: "Start",
+                unit: " %",
+                group: "Loop",
+            },
+            ParamLabel {
+                name: "Crossfade",
+                unit: " ms",
+                group: "Loop",
+            },
+            ParamLabel {
+                name: "Slices",
+                unit: "",
+                group: "Slice",
+            },
+            ParamLabel {
+                name: "Source",
+                unit: "",
+                group: "Slice",
+            },
+            ParamLabel {
+                name: "Choke",
+                unit: "",
+                group: "Slice",
+            },
+            ParamLabel {
+                name: "Attack",
+                unit: " ms",
+                group: "Amp",
+            },
+            ParamLabel {
+                name: "Decay",
+                unit: " ms",
+                group: "Amp",
+            },
+            ParamLabel {
+                name: "Sustain",
+                unit: " %",
+                group: "Amp",
+            },
+            ParamLabel {
+                name: "Release",
+                unit: " ms",
+                group: "Amp",
+            },
+            ParamLabel {
+                name: "Mode",
+                unit: "",
+                group: "Filter",
+            },
+            ParamLabel {
+                name: "Cutoff",
+                unit: " Hz",
+                group: "Filter",
+            },
+            ParamLabel {
+                name: "Resonance",
+                unit: "",
+                group: "Filter",
+            },
+            ParamLabel {
+                name: "Keytrack",
+                unit: " %",
+                group: "Filter",
+            },
+            ParamLabel {
+                name: "Attack",
+                unit: " ms",
+                group: "Mod",
+            },
+            ParamLabel {
+                name: "Decay",
+                unit: " ms",
+                group: "Mod",
+            },
+            ParamLabel {
+                name: "Sustain",
+                unit: " %",
+                group: "Mod",
+            },
+            ParamLabel {
+                name: "Release",
+                unit: " ms",
+                group: "Mod",
+            },
+            ParamLabel {
+                name: "Destination",
+                unit: "",
+                group: "Mod",
+            },
+            ParamLabel {
+                name: "Depth",
+                unit: " %",
+                group: "Mod",
+            },
+            ParamLabel {
+                name: "Velocity",
+                unit: " %",
+                group: "Mod",
+            },
+            ParamLabel {
+                name: "Drive",
+                unit: " %",
+                group: "Dirt",
+            },
+            ParamLabel {
+                name: "Rate",
+                unit: " Hz",
+                group: "Dirt",
+            },
+            ParamLabel {
+                name: "Bits",
+                unit: "",
+                group: "Dirt",
+            },
+            ParamLabel {
+                name: "Pre-amp",
+                unit: " %",
+                group: "Dirt",
+            },
+            ParamLabel {
+                name: "Gain",
+                unit: " dB",
+                group: "Out",
+            },
+            ParamLabel {
+                name: "Pan",
+                unit: " %",
+                group: "Out",
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Kick,
+        name: "kick",
+        instrument: true,
+        prefix: "kick",
+        params: daw::params::kick::TABLE,
+        // Grouped the way the card's sections are, so a modulation
+        // target reads "Punch / Depth" rather than an id.
+        labels: &[
+            ParamLabel {
+                name: "Tune",
+                unit: " Hz",
+                group: "Body",
+            },
+            ParamLabel {
+                name: "Decay",
+                unit: " ms",
+                group: "Body",
+            },
+            ParamLabel {
+                name: "Depth",
+                unit: " st",
+                group: "Punch",
+            },
+            ParamLabel {
+                name: "Time",
+                unit: " ms",
+                group: "Punch",
+            },
+            ParamLabel {
+                name: "Depth",
+                unit: " st",
+                group: "Sweep",
+            },
+            ParamLabel {
+                name: "Time",
+                unit: " ms",
+                group: "Sweep",
+            },
+            ParamLabel {
+                name: "Level",
+                unit: "",
+                group: "Click",
+            },
+            ParamLabel {
+                name: "Time",
+                unit: " ms",
+                group: "Click",
+            },
+            ParamLabel {
+                name: "Stages",
+                unit: "",
+                group: "Disperse",
+            },
+            ParamLabel {
+                name: "Harmonic",
+                unit: "",
+                group: "Disperse",
+            },
+            ParamLabel {
+                name: "Spread",
+                unit: "",
+                group: "Disperse",
+            },
+            ParamLabel {
+                name: "Drive",
+                unit: "",
+                group: "Out",
+            },
+            ParamLabel {
+                name: "Gain",
+                unit: "",
+                group: "Out",
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Poly,
+        name: "poly synth",
+        instrument: true,
+        prefix: "poly",
+        params: daw::params::poly::TABLE,
+        // Thirty-four rows, grouped the way the card's sections are, so a
+        // modulation target reads "Filter / Cutoff" rather than an id.
+        labels: &[
+            ParamLabel {
+                name: "Wave",
+                unit: "",
+                group: "Osc A",
+            },
+            ParamLabel {
+                name: "Octave",
+                unit: "",
+                group: "Osc A",
+            },
+            ParamLabel {
+                name: "Semitone",
+                unit: "st",
+                group: "Osc A",
+            },
+            ParamLabel {
+                name: "Fine",
+                unit: "ct",
+                group: "Osc A",
+            },
+            ParamLabel {
+                name: "Level",
+                unit: "%",
+                group: "Osc A",
+            },
+            ParamLabel {
+                name: "Pitch Env",
+                unit: "st",
+                group: "Osc A",
+            },
+            ParamLabel {
+                name: "Wave",
+                unit: "",
+                group: "Osc B",
+            },
+            ParamLabel {
+                name: "Octave",
+                unit: "",
+                group: "Osc B",
+            },
+            ParamLabel {
+                name: "Semitone",
+                unit: "st",
+                group: "Osc B",
+            },
+            ParamLabel {
+                name: "Fine",
+                unit: "ct",
+                group: "Osc B",
+            },
+            ParamLabel {
+                name: "Level",
+                unit: "%",
+                group: "Osc B",
+            },
+            ParamLabel {
+                name: "Pitch Env",
+                unit: "st",
+                group: "Osc B",
+            },
+            ParamLabel {
+                name: "Color",
+                unit: "",
+                group: "Noise",
+            },
+            ParamLabel {
+                name: "Level",
+                unit: "%",
+                group: "Noise",
+            },
+            ParamLabel {
+                name: "Decay",
+                unit: "ms",
+                group: "Noise",
+            },
+            ParamLabel {
+                name: "Mode",
+                unit: "",
+                group: "Filter",
+            },
+            ParamLabel {
+                name: "Slope",
+                unit: "dB/oct",
+                group: "Filter",
+            },
+            ParamLabel {
+                name: "Cutoff",
+                unit: "Hz",
+                group: "Filter",
+            },
+            ParamLabel {
+                name: "Resonance",
+                unit: "",
+                group: "Filter",
+            },
+            ParamLabel {
+                name: "Env Amount",
+                unit: "%",
+                group: "Filter",
+            },
+            ParamLabel {
+                name: "Keytrack",
+                unit: "%",
+                group: "Filter",
+            },
+            ParamLabel {
+                name: "Drive",
+                unit: "%",
+                group: "Filter",
+            },
+            ParamLabel {
+                name: "Drive Position",
+                unit: "",
+                group: "Filter",
+            },
+            ParamLabel {
+                name: "Attack",
+                unit: "ms",
+                group: "Amp",
+            },
+            ParamLabel {
+                name: "Decay",
+                unit: "ms",
+                group: "Amp",
+            },
+            ParamLabel {
+                name: "Sustain",
+                unit: "%",
+                group: "Amp",
+            },
+            ParamLabel {
+                name: "Release",
+                unit: "ms",
+                group: "Amp",
+            },
+            ParamLabel {
+                name: "Gain",
+                unit: "",
+                group: "Amp",
+            },
+            ParamLabel {
+                name: "Velocity",
+                unit: "%",
+                group: "Amp",
+            },
+            ParamLabel {
+                name: "Mode",
+                unit: "",
+                group: "Voices",
+            },
+            ParamLabel {
+                name: "Glide",
+                unit: "ms",
+                group: "Voices",
+            },
+            ParamLabel {
+                name: "Unison",
+                unit: "",
+                group: "Voices",
+            },
+            ParamLabel {
+                name: "Detune",
+                unit: "%",
+                group: "Voices",
+            },
+            ParamLabel {
+                name: "Spread",
+                unit: "%",
+                group: "Voices",
+            },
+            ParamLabel {
+                name: "Attack",
+                unit: "ms",
+                group: "Filter Env",
+            },
+            ParamLabel {
+                name: "Decay",
+                unit: "ms",
+                group: "Filter Env",
+            },
+            ParamLabel {
+                name: "Sustain",
+                unit: "%",
+                group: "Filter Env",
+            },
+            ParamLabel {
+                name: "Release",
+                unit: "ms",
+                group: "Filter Env",
+            },
+            ParamLabel {
+                name: "Decay",
+                unit: "ms",
+                group: "Pitch Env",
+            },
+            ParamLabel {
+                name: "Wire 1 Source",
+                unit: "",
+                group: "Matrix",
+            },
+            ParamLabel {
+                name: "Wire 1 Dest",
+                unit: "",
+                group: "Matrix",
+            },
+            ParamLabel {
+                name: "Wire 1 Depth",
+                unit: "%",
+                group: "Matrix",
+            },
+            ParamLabel {
+                name: "Wire 2 Source",
+                unit: "",
+                group: "Matrix",
+            },
+            ParamLabel {
+                name: "Wire 2 Dest",
+                unit: "",
+                group: "Matrix",
+            },
+            ParamLabel {
+                name: "Wire 2 Depth",
+                unit: "%",
+                group: "Matrix",
+            },
+            ParamLabel {
+                name: "Wire 3 Source",
+                unit: "",
+                group: "Matrix",
+            },
+            ParamLabel {
+                name: "Wire 3 Dest",
+                unit: "",
+                group: "Matrix",
+            },
+            ParamLabel {
+                name: "Wire 3 Depth",
+                unit: "%",
+                group: "Matrix",
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Snare,
+        name: "snare",
+        instrument: true,
+        prefix: "snare",
+        params: daw::params::snare::TABLE,
+        // Grouped as the card's two halves are: the SHELL and the WIRES, so a
+        // modulation target reads "Wires / Decay" rather than an id.
+        labels: &[
+            ParamLabel {
+                name: "Tune",
+                unit: " Hz",
+                group: "Shell",
+            },
+            ParamLabel {
+                name: "Ratio",
+                unit: "",
+                group: "Shell",
+            },
+            ParamLabel {
+                name: "Decay",
+                unit: " ms",
+                group: "Shell",
+            },
+            ParamLabel {
+                name: "Bend",
+                unit: " st",
+                group: "Shell",
+            },
+            ParamLabel {
+                name: "Bend Time",
+                unit: " ms",
+                group: "Shell",
+            },
+            ParamLabel {
+                name: "Level",
+                unit: "",
+                group: "Wires",
+            },
+            ParamLabel {
+                name: "Decay",
+                unit: " ms",
+                group: "Wires",
+            },
+            ParamLabel {
+                name: "Tone",
+                unit: " Hz",
+                group: "Wires",
+            },
+            ParamLabel {
+                name: "Width",
+                unit: "",
+                group: "Wires",
+            },
+            ParamLabel {
+                name: "Drive",
+                unit: "",
+                group: "Out",
+            },
+            ParamLabel {
+                name: "Gain",
+                unit: "",
+                group: "Out",
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Tom,
+        name: "tom",
+        instrument: true,
+        prefix: "tom",
+        params: daw::params::tom::TABLE,
+        // Grouped as the card's rows are.
+        labels: &[
+            ParamLabel {
+                name: "Tune",
+                unit: " Hz",
+                group: "Body",
+            },
+            ParamLabel {
+                name: "Decay",
+                unit: " ms",
+                group: "Body",
+            },
+            ParamLabel {
+                name: "Bend",
+                unit: " st",
+                group: "Body",
+            },
+            ParamLabel {
+                name: "Bend Time",
+                unit: " ms",
+                group: "Body",
+            },
+            ParamLabel {
+                name: "Level",
+                unit: "",
+                group: "Stick",
+            },
+            ParamLabel {
+                name: "Decay",
+                unit: " ms",
+                group: "Stick",
+            },
+            ParamLabel {
+                name: "Tone",
+                unit: " Hz",
+                group: "Skin",
+            },
+            ParamLabel {
+                name: "Drive",
+                unit: "",
+                group: "Out",
+            },
+            ParamLabel {
+                name: "Gain",
+                unit: "",
+                group: "Out",
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Hat,
+        name: "808 hat",
+        instrument: true,
+        prefix: "hat",
+        params: daw::params::hat::TABLE,
+        // Grouped as the card's plot is: the BANK, and the WINDOW it is
+        // heard through.
+        labels: &[
+            ParamLabel {
+                name: "Tune",
+                unit: "",
+                group: "Bank",
+            },
+            ParamLabel {
+                name: "Closed",
+                unit: " ms",
+                group: "Bank",
+            },
+            ParamLabel {
+                name: "Open",
+                unit: " ms",
+                group: "Bank",
+            },
+            ParamLabel {
+                name: "Band",
+                unit: " Hz",
+                group: "Window",
+            },
+            ParamLabel {
+                name: "Width",
+                unit: "",
+                group: "Window",
+            },
+            ParamLabel {
+                name: "Highpass",
+                unit: " Hz",
+                group: "Window",
+            },
+            ParamLabel {
+                name: "Drive",
+                unit: "",
+                group: "Out",
+            },
+            ParamLabel {
+                name: "Gain",
+                unit: "",
+                group: "Out",
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Handclap,
+        name: "clap",
+        instrument: true,
+        prefix: "clap",
+        params: daw::params::handclap::TABLE,
+        // Grouped as the card's two rows are: the HANDS, then the ROOM and
+        // the colour they are heard in.
+        labels: &[
+            ParamLabel {
+                name: "Hands",
+                unit: "",
+                group: "Hands",
+            },
+            ParamLabel {
+                name: "Spread",
+                unit: " ms",
+                group: "Hands",
+            },
+            ParamLabel {
+                name: "Snap",
+                unit: " ms",
+                group: "Hands",
+            },
+            ParamLabel {
+                name: "Level",
+                unit: "",
+                group: "Room",
+            },
+            ParamLabel {
+                name: "Tail",
+                unit: " ms",
+                group: "Room",
+            },
+            ParamLabel {
+                name: "Tone",
+                unit: " Hz",
+                group: "Colour",
+            },
+            ParamLabel {
+                name: "Width",
+                unit: "",
+                group: "Colour",
+            },
+            ParamLabel {
+                name: "Highpass",
+                unit: " Hz",
+                group: "Colour",
+            },
+            ParamLabel {
+                name: "Drive",
+                unit: "",
+                group: "Out",
+            },
+            ParamLabel {
+                name: "Gain",
+                unit: "",
+                group: "Out",
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Utility,
+        name: "utility",
+        instrument: false,
+        prefix: "util",
+        params: daw::params::utility::TABLE,
+        // Seven rows, in the table's order. Two groups, because the card
+        // reads as two: what the device does to the LEVEL and where it
+        // puts the track, then the three repairs.
+        //
+        // The units a MODULATION READOUT appends. Pan, width and the
+        // three switches are blank for the reason the saturator's are:
+        // the card prints "L35", "120 %" and "swap" through its own
+        // formatters, and a second opinion here would be a second answer
+        // to the same question.
+        labels: &[
+            ParamLabel {
+                name: "Gain",
+                unit: " dB",
+                group: "Level",
+            },
+            ParamLabel {
+                name: "Pan",
+                unit: "",
+                group: "Level",
+            },
+            ParamLabel {
+                name: "Width",
+                unit: "",
+                group: "Image",
+            },
+            ParamLabel {
+                name: "Mono",
+                unit: " Hz",
+                group: "Image",
+            },
+            ParamLabel {
+                name: "Phase",
+                unit: "",
+                group: "Repair",
+            },
+            ParamLabel {
+                name: "Channel",
+                unit: "",
+                group: "Repair",
+            },
+            ParamLabel {
+                name: "DC",
+                unit: "",
+                group: "Repair",
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Modulato,
+        name: "modulato",
+        instrument: false,
+        prefix: "modulato",
+        params: daw::params::modulato::TABLE,
+        // Seven rows, in the table's order. Grouped as the card reads:
+        // what KIND of movement, then its shape, then how it lands.
+        labels: &[
+            ParamLabel {
+                name: "Mode",
+                unit: "",
+                group: "Modulato",
+            },
+            ParamLabel {
+                name: "Rate",
+                unit: " Hz",
+                group: "Movement",
+            },
+            ParamLabel {
+                name: "Depth",
+                unit: " ms",
+                group: "Movement",
+            },
+            ParamLabel {
+                name: "Delay",
+                unit: "",
+                group: "Movement",
+            },
+            ParamLabel {
+                name: "Feedback",
+                unit: "",
+                group: "Voice",
+            },
+            ParamLabel {
+                name: "Spread",
+                unit: "",
+                group: "Voice",
+            },
+            ParamLabel {
+                name: "Mix",
+                unit: "",
+                group: "Voice",
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Filter,
+        name: "filter",
+        instrument: false,
+        prefix: "filter",
+        params: daw::params::filter::TABLE,
+        // Grouped as the card's two rows are: what SHAPE the filter is,
+        // then what it does to the sound on the way through — so a
+        // modulation target reads "Colour / Drive" rather than an id.
+        labels: &[
+            ParamLabel {
+                name: "Mode",
+                unit: "",
+                group: "Shape",
+            },
+            ParamLabel {
+                name: "Slope",
+                unit: " dB/oct",
+                group: "Shape",
+            },
+            ParamLabel {
+                name: "Cutoff",
+                unit: " Hz",
+                group: "Shape",
+            },
+            ParamLabel {
+                name: "Res",
+                unit: "",
+                group: "Shape",
+            },
+            ParamLabel {
+                name: "Drive",
+                unit: "",
+                group: "Colour",
+            },
+            ParamLabel {
+                name: "Character",
+                unit: "",
+                group: "Colour",
+            },
+            ParamLabel {
+                name: "Spread",
+                unit: " st",
+                group: "Colour",
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Limiter,
+        name: "limiter",
+        instrument: false,
+        prefix: "limiter",
+        params: daw::params::limiter::TABLE,
+        // Grouped as the card's two rows are: what it does to the LEVEL,
+        // then what it does to the SOUND — so a modulation target reads
+        // "Colour / Warmth" rather than an id.
+        labels: &[
+            ParamLabel {
+                name: "Push",
+                unit: " dB",
+                group: "Level",
+            },
+            ParamLabel {
+                name: "Ceiling",
+                unit: " dB",
+                group: "Level",
+            },
+            ParamLabel {
+                name: "Style",
+                unit: "",
+                group: "Level",
+            },
+            ParamLabel {
+                name: "Release",
+                unit: " ms",
+                group: "Level",
+            },
+            ParamLabel {
+                name: "Warmth",
+                unit: "",
+                group: "Colour",
+            },
+            ParamLabel {
+                name: "Fuzz",
+                unit: "",
+                group: "Colour",
+            },
+            ParamLabel {
+                name: "Brighten",
+                unit: "",
+                group: "Colour",
+            },
+        ],
+    },
+    DeviceSpec {
         kind: DeviceKind::Reverb,
         name: "reverb",
         instrument: false,
         prefix: "reverb",
         params: daw::params::reverb::TABLE,
+        // Nine rows, in the table's order, grouped the way the card's
+        // two strips are: the SPACE, then how it is PRESENTED.
         labels: &[
             ParamLabel {
-                name: "Mix",
-                unit: "",
-                group: "Reverb",
+                name: "Pre-delay",
+                unit: " ms",
+                group: "Space",
             },
             ParamLabel {
                 name: "Size",
                 unit: "",
-                group: "Reverb",
+                group: "Space",
             },
             ParamLabel {
-                name: "Damp",
+                name: "Decay",
+                unit: " s",
+                group: "Space",
+            },
+            ParamLabel {
+                name: "Damping",
+                unit: " Hz",
+                group: "Space",
+            },
+            ParamLabel {
+                name: "Low cut",
+                unit: " Hz",
+                group: "Space",
+            },
+            ParamLabel {
+                name: "Diffusion",
                 unit: "",
-                group: "Reverb",
+                group: "Character",
+            },
+            ParamLabel {
+                name: "Modulation",
+                unit: "",
+                group: "Character",
+            },
+            ParamLabel {
+                name: "Width",
+                unit: "",
+                group: "Character",
+            },
+            ParamLabel {
+                name: "Mix",
+                unit: "",
+                group: "Character",
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Echo,
+        name: "delay",
+        instrument: false,
+        prefix: "echo",
+        params: daw::params::echo::TABLE,
+        labels: &[
+            ParamLabel {
+                name: "Sync",
+                unit: "",
+                group: "Delay",
+            },
+            ParamLabel {
+                name: "Time",
+                unit: "ms",
+                group: "Delay",
+            },
+            ParamLabel {
+                name: "Feedback",
+                unit: "%",
+                group: "Delay",
+            },
+            ParamLabel {
+                name: "Tone",
+                unit: "Hz",
+                group: "Delay",
+            },
+            ParamLabel {
+                name: "Drive",
+                unit: "%",
+                group: "Delay",
+            },
+            ParamLabel {
+                name: "Wow",
+                unit: "%",
+                group: "Delay",
+            },
+            ParamLabel {
+                name: "Spread",
+                unit: "%",
+                group: "Delay",
+            },
+            ParamLabel {
+                name: "Mix",
+                unit: "%",
+                group: "Delay",
+            },
+            ParamLabel {
+                name: "Send",
+                unit: "%",
+                group: "Delay",
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Glue,
+        name: "glue",
+        instrument: false,
+        prefix: "glue",
+        params: daw::params::glue::TABLE,
+        labels: &[
+            ParamLabel {
+                name: "Threshold",
+                unit: "dB",
+                group: "Glue",
+            },
+            ParamLabel {
+                name: "Ratio",
+                unit: "",
+                group: "Glue",
+            },
+            ParamLabel {
+                name: "Attack",
+                unit: "ms",
+                group: "Glue",
+            },
+            ParamLabel {
+                name: "Release",
+                unit: "s",
+                group: "Glue",
+            },
+            ParamLabel {
+                name: "Makeup",
+                unit: "dB",
+                group: "Glue",
+            },
+            ParamLabel {
+                name: "Dry/Wet",
+                unit: "%",
+                group: "Glue",
+            },
+            ParamLabel {
+                name: "Range",
+                unit: "dB",
+                group: "Glue",
+            },
+            ParamLabel {
+                name: "Clip",
+                unit: "",
+                group: "Glue",
+            },
+            ParamLabel {
+                name: "SC HP",
+                unit: "Hz",
+                group: "Glue",
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Eq,
+        name: "eq",
+        instrument: false,
+        prefix: "eq",
+        params: daw::params::eq::TABLE,
+        // One group per BAND, so a modulation picker offering forty-one
+        // rows offers them as eight small families rather than as one
+        // list nobody can find anything in. The group is what carries
+        // which band a row belongs to; the name says only which slot.
+        labels: &[
+            ParamLabel {
+                name: "On",
+                unit: "",
+                group: "EQ band 1",
+            },
+            ParamLabel {
+                name: "Type",
+                unit: "",
+                group: "EQ band 1",
+            },
+            ParamLabel {
+                name: "Freq",
+                unit: "Hz",
+                group: "EQ band 1",
+            },
+            ParamLabel {
+                name: "Gain",
+                unit: "dB",
+                group: "EQ band 1",
+            },
+            ParamLabel {
+                name: "Q",
+                unit: "",
+                group: "EQ band 1",
+            },
+            ParamLabel {
+                name: "On",
+                unit: "",
+                group: "EQ band 2",
+            },
+            ParamLabel {
+                name: "Type",
+                unit: "",
+                group: "EQ band 2",
+            },
+            ParamLabel {
+                name: "Freq",
+                unit: "Hz",
+                group: "EQ band 2",
+            },
+            ParamLabel {
+                name: "Gain",
+                unit: "dB",
+                group: "EQ band 2",
+            },
+            ParamLabel {
+                name: "Q",
+                unit: "",
+                group: "EQ band 2",
+            },
+            ParamLabel {
+                name: "On",
+                unit: "",
+                group: "EQ band 3",
+            },
+            ParamLabel {
+                name: "Type",
+                unit: "",
+                group: "EQ band 3",
+            },
+            ParamLabel {
+                name: "Freq",
+                unit: "Hz",
+                group: "EQ band 3",
+            },
+            ParamLabel {
+                name: "Gain",
+                unit: "dB",
+                group: "EQ band 3",
+            },
+            ParamLabel {
+                name: "Q",
+                unit: "",
+                group: "EQ band 3",
+            },
+            ParamLabel {
+                name: "On",
+                unit: "",
+                group: "EQ band 4",
+            },
+            ParamLabel {
+                name: "Type",
+                unit: "",
+                group: "EQ band 4",
+            },
+            ParamLabel {
+                name: "Freq",
+                unit: "Hz",
+                group: "EQ band 4",
+            },
+            ParamLabel {
+                name: "Gain",
+                unit: "dB",
+                group: "EQ band 4",
+            },
+            ParamLabel {
+                name: "Q",
+                unit: "",
+                group: "EQ band 4",
+            },
+            ParamLabel {
+                name: "On",
+                unit: "",
+                group: "EQ band 5",
+            },
+            ParamLabel {
+                name: "Type",
+                unit: "",
+                group: "EQ band 5",
+            },
+            ParamLabel {
+                name: "Freq",
+                unit: "Hz",
+                group: "EQ band 5",
+            },
+            ParamLabel {
+                name: "Gain",
+                unit: "dB",
+                group: "EQ band 5",
+            },
+            ParamLabel {
+                name: "Q",
+                unit: "",
+                group: "EQ band 5",
+            },
+            ParamLabel {
+                name: "On",
+                unit: "",
+                group: "EQ band 6",
+            },
+            ParamLabel {
+                name: "Type",
+                unit: "",
+                group: "EQ band 6",
+            },
+            ParamLabel {
+                name: "Freq",
+                unit: "Hz",
+                group: "EQ band 6",
+            },
+            ParamLabel {
+                name: "Gain",
+                unit: "dB",
+                group: "EQ band 6",
+            },
+            ParamLabel {
+                name: "Q",
+                unit: "",
+                group: "EQ band 6",
+            },
+            ParamLabel {
+                name: "On",
+                unit: "",
+                group: "EQ band 7",
+            },
+            ParamLabel {
+                name: "Type",
+                unit: "",
+                group: "EQ band 7",
+            },
+            ParamLabel {
+                name: "Freq",
+                unit: "Hz",
+                group: "EQ band 7",
+            },
+            ParamLabel {
+                name: "Gain",
+                unit: "dB",
+                group: "EQ band 7",
+            },
+            ParamLabel {
+                name: "Q",
+                unit: "",
+                group: "EQ band 7",
+            },
+            ParamLabel {
+                name: "On",
+                unit: "",
+                group: "EQ band 8",
+            },
+            ParamLabel {
+                name: "Type",
+                unit: "",
+                group: "EQ band 8",
+            },
+            ParamLabel {
+                name: "Freq",
+                unit: "Hz",
+                group: "EQ band 8",
+            },
+            ParamLabel {
+                name: "Gain",
+                unit: "dB",
+                group: "EQ band 8",
+            },
+            ParamLabel {
+                name: "Q",
+                unit: "",
+                group: "EQ band 8",
+            },
+            ParamLabel {
+                name: "Out",
+                unit: "dB",
+                group: "EQ",
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Sat,
+        name: "saturator",
+        instrument: false,
+        prefix: "sat",
+        params: daw::params::sat::TABLE,
+        // The units a MODULATION READOUT appends, which is why drive and
+        // bias are blank: the card shows "4.0x" and "+25 %" through its
+        // own `Unit`, and a second opinion here would be a second answer
+        // to the same question.
+        labels: &[
+            ParamLabel {
+                name: "Mode",
+                unit: "",
+                group: "Saturator",
+            },
+            ParamLabel {
+                name: "Drive",
+                unit: "",
+                group: "Saturator",
+            },
+            ParamLabel {
+                name: "Bias",
+                unit: "",
+                group: "Saturator",
+            },
+            ParamLabel {
+                name: "Mix",
+                unit: "",
+                group: "Saturator",
+            },
+            ParamLabel {
+                name: "Out",
+                unit: "",
+                group: "Saturator",
             },
         ],
     },
@@ -1895,18 +3372,96 @@ fn device_by_prefix(prefix: &str) -> Option<&'static DeviceSpec> {
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 struct ReverbParams {
-    mix: f32,
+    predelay_ms: f32,
     size: f32,
+    decay: f32,
     damp: f32,
+    low_cut: f32,
+    diffusion: f32,
+    modulation: f32,
+    width: f32,
+    mix: f32,
 }
 
 impl Default for ReverbParams {
     fn default() -> Self {
         use daw::params::{def, reverb};
+        let at = |id: u32| def(reverb::TABLE, id).default;
         Self {
-            mix: def(reverb::TABLE, reverb::MIX).default,
-            size: def(reverb::TABLE, reverb::SIZE).default,
-            damp: def(reverb::TABLE, reverb::DAMP).default,
+            predelay_ms: at(reverb::PREDELAY),
+            size: at(reverb::SIZE),
+            decay: at(reverb::DECAY),
+            damp: at(reverb::DAMP),
+            low_cut: at(reverb::LOWCUT),
+            diffusion: at(reverb::DIFFUSION),
+            modulation: at(reverb::MODULATION),
+            width: at(reverb::WIDTH),
+            mix: at(reverb::MIX),
+        }
+    }
+}
+
+/// The saturator's editable values in ENGINE units — the kernel's own
+/// (`1..32` of drive, `-0.9..0.9` of bias, `0..4` of linear gain), as
+/// `daw::params::sat` declares them.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct EchoParams {
+    sync: f32,
+    time_ms: f32,
+    feedback: f32,
+    tone_hz: f32,
+    drive: f32,
+    wow: f32,
+    spread: f32,
+    mix: f32,
+    /// 0 = an insert; above 0 the delay is an aux at this level. See
+    /// `params::echo::SEND` — the knob decides the TOPOLOGY, so
+    /// `shape_hash` watches whether it is zero.
+    send: f32,
+}
+
+impl Default for EchoParams {
+    fn default() -> Self {
+        use daw::params::{def, echo};
+        Self {
+            sync: def(echo::TABLE, echo::SYNC).default,
+            time_ms: def(echo::TABLE, echo::TIME).default,
+            feedback: def(echo::TABLE, echo::FEEDBACK).default,
+            tone_hz: def(echo::TABLE, echo::TONE).default,
+            drive: def(echo::TABLE, echo::DRIVE).default,
+            wow: def(echo::TABLE, echo::WOW).default,
+            spread: def(echo::TABLE, echo::SPREAD).default,
+            mix: def(echo::TABLE, echo::MIX).default,
+            send: def(echo::TABLE, echo::SEND).default,
+        }
+    }
+}
+
+/// The saturator's editable values in ENGINE units.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct SatParams {
+    /// The mode as its wire INDEX, kept as f32 like every other engine
+    /// value here. A `u32` field would round on the way in, and a device
+    /// state that cannot hand back exactly what was set to it is a device
+    /// whose automation and modulation quietly disagree with its knobs.
+    mode: f32,
+    drive: f32,
+    bias: f32,
+    mix: f32,
+    out: f32,
+}
+
+impl Default for SatParams {
+    fn default() -> Self {
+        use daw::params::{def, sat};
+        Self {
+            mode: def(sat::TABLE, sat::MODE).default,
+            drive: def(sat::TABLE, sat::DRIVE).default,
+            bias: def(sat::TABLE, sat::BIAS).default,
+            mix: def(sat::TABLE, sat::MIX).default,
+            out: def(sat::TABLE, sat::OUT).default,
         }
     }
 }
@@ -1919,7 +3474,22 @@ impl Default for ReverbParams {
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 enum DeviceState {
     SineSynth(SynthParams),
+    Poly(daw::audio::poly::PolyParams),
+    Sampler(daw::audio::sampler::SamplerParams),
+    Kick(daw::audio::kick::KickParams),
+    Snare(daw::audio::snare::SnareParams),
+    Tom(daw::audio::tom::TomParams),
+    Hat(daw::audio::hat::HatParams),
+    Handclap(daw::audio::handclap::HandclapParams),
     Reverb(ReverbParams),
+    Sat(SatParams),
+    Echo(EchoParams),
+    Eq(daw::audio::eq::EqParams),
+    Filter(daw::audio::filter::FilterParams),
+    Glue(daw::audio::glue::GlueParams),
+    Limiter(daw::audio::limiter::LimiterParams),
+    Modulato(daw::audio::modulato::ModulatoParams),
+    Utility(daw::audio::utility::UtilityParams),
 }
 
 impl DeviceState {
@@ -1927,21 +3497,51 @@ impl DeviceState {
     fn new(kind: DeviceKind) -> Self {
         match kind {
             DeviceKind::SineSynth => Self::SineSynth(SynthParams::default()),
+            DeviceKind::Poly => Self::Poly(daw::audio::poly::PolyParams::default()),
+            DeviceKind::Sampler => Self::Sampler(daw::audio::sampler::SamplerParams::default()),
+            DeviceKind::Kick => Self::Kick(daw::audio::kick::KickParams::default()),
+            DeviceKind::Snare => Self::Snare(daw::audio::snare::SnareParams::default()),
+            DeviceKind::Tom => Self::Tom(daw::audio::tom::TomParams::default()),
+            DeviceKind::Hat => Self::Hat(daw::audio::hat::HatParams::default()),
+            DeviceKind::Handclap => Self::Handclap(daw::audio::handclap::HandclapParams::default()),
             DeviceKind::Reverb => Self::Reverb(ReverbParams::default()),
+            DeviceKind::Sat => Self::Sat(SatParams::default()),
+            DeviceKind::Echo => Self::Echo(EchoParams::default()),
+            DeviceKind::Eq => Self::Eq(daw::audio::eq::EqParams::default()),
+            DeviceKind::Filter => Self::Filter(daw::audio::filter::FilterParams::default()),
+            DeviceKind::Glue => Self::Glue(daw::audio::glue::GlueParams::default()),
+            DeviceKind::Limiter => Self::Limiter(daw::audio::limiter::LimiterParams::default()),
+            DeviceKind::Modulato => Self::Modulato(daw::audio::modulato::ModulatoParams::default()),
+            DeviceKind::Utility => Self::Utility(daw::audio::utility::UtilityParams::default()),
         }
     }
 
     fn kind(self) -> DeviceKind {
         match self {
             Self::SineSynth(_) => DeviceKind::SineSynth,
+            Self::Poly(_) => DeviceKind::Poly,
+            Self::Sampler(_) => DeviceKind::Sampler,
+            Self::Kick(_) => DeviceKind::Kick,
+            Self::Snare(_) => DeviceKind::Snare,
+            Self::Tom(_) => DeviceKind::Tom,
+            Self::Hat(_) => DeviceKind::Hat,
+            Self::Handclap(_) => DeviceKind::Handclap,
             Self::Reverb(_) => DeviceKind::Reverb,
+            Self::Sat(_) => DeviceKind::Sat,
+            Self::Echo(_) => DeviceKind::Echo,
+            Self::Eq(_) => DeviceKind::Eq,
+            Self::Filter(_) => DeviceKind::Filter,
+            Self::Glue(_) => DeviceKind::Glue,
+            Self::Limiter(_) => DeviceKind::Limiter,
+            Self::Modulato(_) => DeviceKind::Modulato,
+            Self::Utility(_) => DeviceKind::Utility,
         }
     }
 
     /// This device's value for `param`, or `None` for an id it does not
     /// have — which is how a target aimed at the wrong kind is refused.
     fn value(self, param: u32) -> Option<f32> {
-        use daw::params::{reverb, seq};
+        use daw::params::{echo, reverb, sat, seq};
         match self {
             Self::SineSynth(p) => match param {
                 seq::GAIN => Some(p.gain),
@@ -1949,19 +3549,80 @@ impl DeviceState {
                 seq::RELEASE => Some(p.release_ms),
                 _ => None,
             },
+            // The poly synth has thirty-four rows and its own reader,
+            // beside its writer, in the engine struct that owns them —
+            // spelling them out twice here is how the two halves drift.
+            Self::Poly(p) => p.get(param),
+            // Thirty-six rows, with a reader beside their writer in the
+            // struct that owns them — spelling them out again here is how
+            // the two halves drift.
+            Self::Sampler(p) => p.get(param),
+            // The kick has its own reader beside its writer, in the
+            // struct that owns them — spelling thirteen rows out again
+            // here is how the two halves drift.
+            Self::Kick(p) => Some(p.get(param)),
+            // Every drum after the kick keeps a reader beside its writer
+            // in the struct that owns them, for the same reason: spelling
+            // the rows out again here is how the two halves drift.
+            Self::Snare(p) => Some(p.get(param)),
+            Self::Tom(p) => Some(p.get(param)),
+            Self::Hat(p) => Some(p.get(param)),
+            Self::Handclap(p) => Some(p.get(param)),
             Self::Reverb(p) => match param {
-                reverb::MIX => Some(p.mix),
+                reverb::PREDELAY => Some(p.predelay_ms),
                 reverb::SIZE => Some(p.size),
+                reverb::DECAY => Some(p.decay),
                 reverb::DAMP => Some(p.damp),
+                reverb::LOWCUT => Some(p.low_cut),
+                reverb::DIFFUSION => Some(p.diffusion),
+                reverb::MODULATION => Some(p.modulation),
+                reverb::WIDTH => Some(p.width),
+                reverb::MIX => Some(p.mix),
                 _ => None,
             },
+            Self::Sat(p) => match param {
+                sat::MODE => Some(p.mode),
+                sat::DRIVE => Some(p.drive),
+                sat::BIAS => Some(p.bias),
+                sat::MIX => Some(p.mix),
+                sat::OUT => Some(p.out),
+                _ => None,
+            },
+            Self::Echo(p) => match param {
+                echo::SYNC => Some(p.sync),
+                echo::TIME => Some(p.time_ms),
+                echo::FEEDBACK => Some(p.feedback),
+                echo::TONE => Some(p.tone_hz),
+                echo::DRIVE => Some(p.drive),
+                echo::WOW => Some(p.wow),
+                echo::SPREAD => Some(p.spread),
+                echo::MIX => Some(p.mix),
+                echo::SEND => Some(p.send),
+                _ => None,
+            },
+            // Forty-one rows with their own reader, beside their own
+            // writer, in the struct that owns them — spelling them out
+            // twice here is how the two halves drift.
+            Self::Eq(p) => p.get(param),
+            // Seven rows with their own reader beside their own writer,
+            // in the struct that owns them.
+            Self::Filter(p) => Some(p.get(param)),
+            Self::Glue(p) => p.get(param),
+            // Its own reader beside its own writer, in the struct that
+            // owns them — spelling seven rows out again here is how the
+            // two halves drift.
+            Self::Limiter(p) => Some(p.get(param)),
+            Self::Modulato(p) => Some(p.get(param)),
+            // Seven rows with their own reader beside their own writer,
+            // in the struct that owns them.
+            Self::Utility(p) => p.get(param),
         }
     }
 
     /// Store an engine-unit value. Unknown ids are dropped, exactly as the
     /// engine's own clamp drops them.
     fn set(&mut self, param: u32, value: f32) {
-        use daw::params::{reverb, seq};
+        use daw::params::{echo, reverb, sat, seq};
         match self {
             Self::SineSynth(p) => match param {
                 seq::GAIN => p.gain = value,
@@ -1969,12 +3630,51 @@ impl DeviceState {
                 seq::RELEASE => p.release_ms = value,
                 _ => {}
             },
+            Self::Poly(p) => p.set(param, value),
+            Self::Sampler(p) => p.set(param, value),
+            Self::Kick(p) => p.set(param, value),
+            Self::Snare(p) => p.set(param, value),
+            Self::Tom(p) => p.set(param, value),
+            Self::Hat(p) => p.set(param, value),
+            Self::Handclap(p) => p.set(param, value),
             Self::Reverb(p) => match param {
-                reverb::MIX => p.mix = value,
+                reverb::PREDELAY => p.predelay_ms = value,
                 reverb::SIZE => p.size = value,
+                reverb::DECAY => p.decay = value,
                 reverb::DAMP => p.damp = value,
+                reverb::LOWCUT => p.low_cut = value,
+                reverb::DIFFUSION => p.diffusion = value,
+                reverb::MODULATION => p.modulation = value,
+                reverb::WIDTH => p.width = value,
+                reverb::MIX => p.mix = value,
                 _ => {}
             },
+            Self::Sat(p) => match param {
+                sat::MODE => p.mode = value,
+                sat::DRIVE => p.drive = value,
+                sat::BIAS => p.bias = value,
+                sat::MIX => p.mix = value,
+                sat::OUT => p.out = value,
+                _ => {}
+            },
+            Self::Echo(p) => match param {
+                echo::SYNC => p.sync = value,
+                echo::TIME => p.time_ms = value,
+                echo::FEEDBACK => p.feedback = value,
+                echo::TONE => p.tone_hz = value,
+                echo::DRIVE => p.drive = value,
+                echo::WOW => p.wow = value,
+                echo::SPREAD => p.spread = value,
+                echo::MIX => p.mix = value,
+                echo::SEND => p.send = value,
+                _ => {}
+            },
+            Self::Eq(p) => p.set(param, value),
+            Self::Filter(p) => p.set(param, value),
+            Self::Glue(p) => p.set(param, value),
+            Self::Limiter(p) => p.set(param, value),
+            Self::Modulato(p) => p.set(param, value),
+            Self::Utility(p) => p.set(param, value),
         }
     }
 }
@@ -1988,10 +3688,43 @@ impl DeviceState {
 struct DeviceInstance {
     id: u64,
     state: DeviceState,
+    /// Which page of this device's card is open — the poly synth's tab,
+    /// and the equaliser's SELECTED BAND, which is the same idea wearing
+    /// a different hat: the one part of a card that is about where you
+    /// are working rather than about the sound.
+    ///
+    /// It lives on the INSTANCE because a card is rebuilt from engine
+    /// units every frame, so anything the card alone remembers is
+    /// forgotten before the next one. And it is stored, because which
+    /// section you were working in is part of the patch you come back to.
+    #[serde(default)]
+    page: u8,
+    /// How far a card's display is zoomed in, as a multiple of the whole
+    /// thing, and where its left edge sits as a fraction of it.
+    ///
+    /// On the INSTANCE for the reason `page` is: a card is rebuilt from
+    /// engine units every frame, so anything it alone remembered would be
+    /// forgotten before the next frame drew. Zoom is not a parameter —
+    /// nothing engine-facing changes — but it IS part of where you were
+    /// working, which is worth coming back to.
+    ///
+    /// Only the sampler reads them today. They are named for what they
+    /// are rather than for it, because the next display that needs to be
+    /// looked into closely will want exactly this pair.
+    #[serde(default = "unit_zoom")]
+    view_zoom: f32,
+    #[serde(default)]
+    view_scroll: f32,
     /// Bypassed devices stay in the chain and leave the SCHEDULE, the same
     /// way a muted track does.
     #[serde(default)]
     bypass: bool,
+}
+
+/// A display showing all of itself. The serde default, so a project
+/// written before zoom existed opens zoomed out rather than at 0x.
+fn unit_zoom() -> f32 {
+    1.0
 }
 
 impl DeviceInstance {
@@ -2014,13 +3747,108 @@ fn synth_knobs(params: SynthParams) -> device::SineSynthUi {
     }
 }
 
+/// A poly patch's engine values as the card's KNOB POSITIONS.
+///
+/// Built by walking the TABLE and writing through the card's own slot map,
+/// rather than by naming thirty-four fields: the card already knows which
+/// field each id belongs to, and a second copy of that map is a second
+/// thing to get wrong.
+fn poly_knobs(params: daw::audio::poly::PolyParams, page: u8) -> device::PolyUi {
+    let mut ui = device::PolyUi {
+        page: usize::from(page),
+        ..device::PolyUi::default()
+    };
+    for def in daw::params::poly::TABLE {
+        let Some(value) = params.get(def.id) else {
+            continue;
+        };
+        let norm = device_norm(DeviceKind::Poly, def.id, value);
+        if let Some(slot) = ui.slot(def.id) {
+            *slot = norm;
+        }
+    }
+    ui
+}
+
 fn reverb_knobs(params: ReverbParams) -> device::ReverbUi {
     use daw::params::reverb;
-    let at = |param, value| device_norm(DeviceKind::Reverb, param, value);
-    device::ReverbUi {
-        mix: at(reverb::MIX, params.mix),
-        size: at(reverb::SIZE, params.size),
-        damp: at(reverb::DAMP, params.damp),
+    // The card reads through a closure rather than being handed the
+    // engine's struct: a widget module must not know `crate::audio`, and
+    // the app is the layer that knows both sides.
+    device::ReverbUi::from_engine(|id| match id {
+        reverb::PREDELAY => params.predelay_ms,
+        reverb::SIZE => params.size,
+        reverb::DECAY => params.decay,
+        reverb::DAMP => params.damp,
+        reverb::LOWCUT => params.low_cut,
+        reverb::DIFFUSION => params.diffusion,
+        reverb::MODULATION => params.modulation,
+        reverb::WIDTH => params.width,
+        _ => params.mix,
+    })
+}
+
+fn sat_knobs(params: SatParams) -> device::SatUi {
+    use daw::params::sat;
+    let at = |param, value| device_norm(DeviceKind::Sat, param, value);
+    device::SatUi {
+        mode: at(sat::MODE, params.mode),
+        drive: at(sat::DRIVE, params.drive),
+        bias: at(sat::BIAS, params.bias),
+        mix: at(sat::MIX, params.mix),
+        out: at(sat::OUT, params.out),
+    }
+}
+
+fn utility_knobs(params: daw::audio::utility::UtilityParams) -> device::UtilityUi {
+    let mut knobs = device::UtilityUi::default();
+    for def in daw::params::utility::TABLE {
+        if let Some(value) = params.get(def.id) {
+            knobs.set_norm(def.id, device_norm(DeviceKind::Utility, def.id, value));
+        }
+    }
+    knobs
+}
+
+fn glue_knobs(params: daw::audio::glue::GlueParams) -> device::GlueUi {
+    let mut knobs = device::GlueUi::default();
+    for def in daw::params::glue::TABLE {
+        if let Some(value) = params.get(def.id) {
+            knobs.set_norm(def.id, device_norm(DeviceKind::Glue, def.id, value));
+        }
+    }
+    knobs
+}
+
+fn eq_knobs(params: daw::audio::eq::EqParams, page: u8) -> device::EqUi {
+    let mut knobs = device::EqUi {
+        selected: usize::from(page).min(daw::params::eq::BANDS - 1),
+        ..device::EqUi::default()
+    };
+    // Straight off the table: every row the engine has, put where the
+    // card's own mapping says that value lives. One loop rather than
+    // forty-one lines, and it cannot miss a row.
+    for def in daw::params::eq::TABLE {
+        if let Some(value) = params.get(def.id) {
+            knobs.set_norm(def.id, device_norm(DeviceKind::Eq, def.id, value));
+        }
+    }
+    knobs
+}
+
+fn echo_knobs(params: EchoParams) -> device::EchoUi {
+    use daw::params::echo;
+    let at = |param, value| device_norm(DeviceKind::Echo, param, value);
+    device::EchoUi {
+        sync: at(echo::SYNC, params.sync),
+        time: at(echo::TIME, params.time_ms),
+        feedback: at(echo::FEEDBACK, params.feedback),
+        tone: at(echo::TONE, params.tone_hz),
+        drive: at(echo::DRIVE, params.drive),
+        wow: at(echo::WOW, params.wow),
+        spread: at(echo::SPREAD, params.spread),
+        mix: at(echo::MIX, params.mix),
+        send: at(echo::SEND, params.send),
     }
 }
 
@@ -2028,7 +3856,78 @@ fn reverb_knobs(params: ReverbParams) -> device::ReverbUi {
 fn device_norm(kind: DeviceKind, param: u32, value: f32) -> f32 {
     match kind {
         DeviceKind::SineSynth => device::sine_synth_norm(param, value),
+        DeviceKind::Poly => device::poly_norm(param, value),
+        DeviceKind::Sampler => device::sampler_norm(param, value),
+        DeviceKind::Kick => device::kick::kick_norm(param, value),
+        DeviceKind::Snare => device::snare_norm(param, value),
+        DeviceKind::Tom => device::tom_norm(param, value),
+        DeviceKind::Hat => device::hat_norm(param, value),
+        DeviceKind::Handclap => device::handclap_norm(param, value),
+        DeviceKind::Limiter => device::limiter_norm(param, value),
         DeviceKind::Reverb => device::reverb_norm(param, value),
+        DeviceKind::Sat => device::sat_norm(param, value),
+        DeviceKind::Echo => device::echo_norm(param, value),
+        DeviceKind::Eq => device::eq_norm(param, value),
+        DeviceKind::Filter => device::filter_norm(param, value),
+        DeviceKind::Glue => device::glue_norm(param, value),
+        DeviceKind::Modulato => device::modulato::modulato_norm(param, value),
+        DeviceKind::Utility => device::utility_norm(param, value),
+    }
+}
+
+/// Whether a parameter snaps to segments rather than moving continuously.
+///
+/// The tables `seq` and `reverb` are continuous end to end; the poly
+/// synth is the first device with choices in it, so it is the first that
+/// can answer anything but `false`.
+///
+/// A card picks its own widget from the `Param` directly, so most of the
+/// app never asks. What needs the answer is anything working from OUTSIDE
+/// a card: the round-trip tests, and the parameter-lock editor — which
+/// has to know whether a row steps whole choices or sweeps.
+fn device_is_discrete(kind: DeviceKind, param: u32) -> bool {
+    match kind {
+        DeviceKind::Poly => device::poly_is_discrete(param),
+        DeviceKind::Sampler => device::sampler_is_discrete(param),
+        DeviceKind::Kick => device::kick::kick_is_discrete(param),
+        DeviceKind::Snare => device::snare_is_discrete(param),
+        DeviceKind::Tom => device::tom_is_discrete(param),
+        DeviceKind::Hat => device::hat_is_discrete(param),
+        DeviceKind::Handclap => device::handclap_is_discrete(param),
+        DeviceKind::Limiter => device::limiter_is_discrete(param),
+        DeviceKind::Sat => device::sat_is_discrete(param),
+        DeviceKind::Echo => device::echo_is_discrete(param),
+        DeviceKind::Eq => device::eq_is_discrete(param),
+        DeviceKind::Filter => device::filter_is_discrete(param),
+        DeviceKind::Glue => device::glue_is_discrete(param),
+        DeviceKind::Modulato => device::modulato::modulato_is_discrete(param),
+        DeviceKind::Utility => device::utility_is_discrete(param),
+        DeviceKind::SineSynth | DeviceKind::Reverb => false,
+    }
+}
+
+/// Whether a parameter lives on a LOG scale, by device kind — asked of
+/// the card's own mapping, so the modulation plan sweeps cutoffs and
+/// times in OCTAVES exactly where the knob does.
+fn device_is_log(kind: DeviceKind, param: u32) -> bool {
+    match kind {
+        DeviceKind::Poly => device::poly_is_log(param),
+        DeviceKind::Sampler => device::sampler_is_log(param),
+        DeviceKind::Kick => device::kick::kick_is_log(param),
+        DeviceKind::Snare => device::snare_is_log(param),
+        DeviceKind::Tom => device::tom_is_log(param),
+        DeviceKind::Hat => device::hat_is_log(param),
+        DeviceKind::Handclap => device::handclap_is_log(param),
+        DeviceKind::Limiter => device::limiter_is_log(param),
+        DeviceKind::SineSynth => device::sine_synth_is_log(param),
+        DeviceKind::Sat => device::sat_is_log(param),
+        DeviceKind::Echo => device::echo_is_log(param),
+        DeviceKind::Eq => device::eq_is_log(param),
+        DeviceKind::Filter => device::filter_is_log(param),
+        DeviceKind::Glue => device::glue_is_log(param),
+        DeviceKind::Modulato => device::modulato::modulato_is_log(param),
+        DeviceKind::Utility => device::utility_is_log(param),
+        DeviceKind::Reverb => false,
     }
 }
 
@@ -2040,7 +3939,22 @@ fn device_norm(kind: DeviceKind, param: u32, value: f32) -> f32 {
 fn device_value(kind: DeviceKind, param: u32, norm: f32) -> f32 {
     match kind {
         DeviceKind::SineSynth => device::sine_synth_value(param, norm),
+        DeviceKind::Poly => device::poly_value(param, norm),
+        DeviceKind::Sampler => device::sampler_value(param, norm),
+        DeviceKind::Kick => device::kick::kick_value(param, norm),
+        DeviceKind::Snare => device::snare_value(param, norm),
+        DeviceKind::Tom => device::tom_value(param, norm),
+        DeviceKind::Hat => device::hat_value(param, norm),
+        DeviceKind::Handclap => device::handclap_value(param, norm),
+        DeviceKind::Limiter => device::limiter_value(param, norm),
         DeviceKind::Reverb => device::reverb_value(param, norm),
+        DeviceKind::Sat => device::sat_value(param, norm),
+        DeviceKind::Echo => device::echo_value(param, norm),
+        DeviceKind::Eq => device::eq_value(param, norm),
+        DeviceKind::Filter => device::filter_value(param, norm),
+        DeviceKind::Glue => device::glue_value(param, norm),
+        DeviceKind::Modulato => device::modulato::modulato_value(param, norm),
+        DeviceKind::Utility => device::utility_value(param, norm),
     }
 }
 
@@ -2096,6 +4010,34 @@ struct Track {
     /// silent. Loading a device from the browser is what gives a track a
     /// voice.
     chain: Vec<DeviceInstance>,
+    /// The FILE and slice table of every sampler on this lane, keyed by
+    /// device instance id.
+    ///
+    /// Beside the devices rather than inside `DeviceState`, and that is a
+    /// deliberate trade: `DeviceState` is `Copy` — one stored copy of one
+    /// truth, cheap to pass by value, and half this file passes it by
+    /// value — while a path and a slice list are neither. Putting them in
+    /// the enum would cost `Copy` everywhere for the sake of one device.
+    ///
+    /// Keyed by instance id rather than by position, for the reason
+    /// automation is: reordering a chain must not repoint a sample.
+    #[serde(default)]
+    sampler_sources: std::collections::BTreeMap<u64, SamplerSource>,
+}
+
+/// A sampler's file and the slices cut from it.
+///
+/// Green-zone document data. The path persists; the decoded audio never
+/// does — it is rebuilt at compile from the path, through the loader's
+/// cache.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct SamplerSource {
+    path: std::path::PathBuf,
+    /// Boundaries in SOURCE frames, sorted, first is always 0. Empty
+    /// means "not authored yet", which compiles to the grid the `slices`
+    /// knob asks for.
+    slices: Vec<u64>,
 }
 
 impl Track {
@@ -2143,6 +4085,61 @@ impl Track {
     }
 }
 
+/// The bus every track lands on: one fader, one pan, one chain of effects,
+/// and the last thing the speakers hear.
+///
+/// A separate type rather than another [`Track`] in the stack, and that is
+/// the whole design. A master carries no clips, no kind, no mute and no
+/// solo — a muted master is just a fader at the bottom — and above all it
+/// has no INDEX. Half this file addresses a track by its position, and a
+/// master that could be at position 3 would put a bus in the middle of the
+/// song. Giving it its own field keeps every one of those loops honest.
+///
+/// An instrument dropped here is refused rather than silently placed: the
+/// master has no notes to give it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct MasterTrack {
+    /// Fader level as LINEAR amplitude, exactly as a track's is.
+    volume: f32,
+    /// Constant-power pan over the whole mix. Rarely moved, and present
+    /// for the same reason a console's master pan is: it exists.
+    pan: f32,
+    /// The master chain, in signal order. Effects only.
+    chain: Vec<DeviceInstance>,
+}
+
+impl Default for MasterTrack {
+    fn default() -> Self {
+        Self {
+            volume: 1.0,
+            pan: 0.0,
+            chain: Vec::new(),
+        }
+    }
+}
+
+impl MasterTrack {
+    /// The name every surface shows. Not a field: renaming the master
+    /// would only ever make a mix harder to read out loud.
+    const NAME: &'static str = "MASTER";
+
+    fn device_mut(&mut self, id: u64) -> Option<&mut DeviceInstance> {
+        self.chain.iter_mut().find(|instance| instance.id == id)
+    }
+
+    /// Put an effect on the master. Instruments are refused — there is
+    /// nothing here for one to play — and the caller is told so it can say
+    /// why rather than dropping the device into silence.
+    fn insert_device(&mut self, instance: DeviceInstance) -> bool {
+        if instance.kind().is_instrument() {
+            return false;
+        }
+        self.chain.push(instance);
+        true
+    }
+}
+
 /// Force the ordering rule onto a chain that came from a FILE: keep the
 /// first instrument, move it to the head, drop any others. A hand-edited
 /// project is input like any other, and an instrument in the middle of a
@@ -2169,6 +4166,7 @@ impl Default for Track {
             automation: TrackAutomation::default(),
             // A fresh track has no devices at all.
             chain: Vec::new(),
+            sampler_sources: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -2198,6 +4196,7 @@ struct TrackWire {
     volume: f32,
     automation: TrackAutomation,
     chain: Vec<DeviceInstance>,
+    sampler_sources: std::collections::BTreeMap<u64, SamplerSource>,
     device: Option<DeviceKind>,
     fx: Option<DeviceKind>,
     params: SynthParams,
@@ -2217,6 +4216,7 @@ impl Default for TrackWire {
             volume: track.volume,
             automation: track.automation,
             chain: track.chain,
+            sampler_sources: track.sampler_sources,
             device: None,
             fx: None,
             params: SynthParams::default(),
@@ -2241,20 +4241,33 @@ impl<'de> serde::Deserialize<'de> for Track {
                         other => DeviceState::new(other),
                     },
                     bypass: false,
+                    page: 0,
+                    view_zoom: unit_zoom(),
+                    view_scroll: 0.0,
                 });
             }
             if let Some(kind) = wire.fx.filter(|kind| !kind.is_instrument()) {
                 chain.push(DeviceInstance {
                     id: 0,
                     state: match kind {
+                        // A project written before the network replaced
+                        // the Freeverb carries three numbers. The rest
+                        // come from the table's defaults, which is what
+                        // `..Default::default()` is for — the old file
+                        // never knew about pre-delay or width and must
+                        // not be made to guess.
                         DeviceKind::Reverb => DeviceState::Reverb(ReverbParams {
                             mix: wire.reverb.mix,
                             size: wire.reverb.size,
                             damp: wire.reverb.damp,
+                            ..ReverbParams::default()
                         }),
                         other => DeviceState::new(other),
                     },
                     bypass: false,
+                    page: 0,
+                    view_zoom: unit_zoom(),
+                    view_scroll: 0.0,
                 });
             }
         }
@@ -2268,6 +4281,7 @@ impl<'de> serde::Deserialize<'de> for Track {
             volume: wire.volume,
             automation: wire.automation,
             chain,
+            sampler_sources: wire.sampler_sources,
         })
     }
 }
@@ -2766,6 +4780,28 @@ struct Note {
     start: f64,
     len: f64,
     vel: u8,
+    /// Deactivated, Ableton's `0`: the note stays in the clip, drawn
+    /// hollow, and never reaches the engine — a way to try an arrangement
+    /// without one voice that beats deleting and regretting.
+    #[serde(default)]
+    muted: bool,
+    /// Parameter LOCKS, Elektron's idea: `(instrument param id, engine
+    /// value)` overrides that fire with this note. A lock overwrites the
+    /// knob for its note; the next unlocked note resumes the knob. The
+    /// ids are the track instrument's own table rows.
+    #[serde(default)]
+    plocks: Vec<(u32, f32)>,
+    /// Trig probability, `0..=1` — deterministic per (note, cycle) so a
+    /// bounce reproduces; 1.0 is a plain note.
+    #[serde(default = "prob_default")]
+    prob: f32,
+    /// Elektron A:B trig condition — fire on pass A of every B cycles.
+    #[serde(default)]
+    cond: Option<(u8, u8)>,
+}
+
+fn prob_default() -> f32 {
+    1.0
 }
 
 /// Green-zone metadata for an audio clip's source region. The path and
@@ -2779,6 +4815,82 @@ struct AudioSource {
     source_frames: u64,
     gain: f32,
     looped: bool,
+    /// Frames in the WHOLE FILE, which `source_offset`/`source_frames`
+    /// name a region of.
+    ///
+    /// Needed to play backwards: the region `[o, o + n)` of a file is
+    /// `[F - o - n, F - o)` of its reversal, and there is no way to work
+    /// that out without `F`. Zero means "not recorded" — a project
+    /// written before this existed — and is read as the region's own end,
+    /// which is exact for the untrimmed clip that most of them are.
+    #[serde(default)]
+    file_frames: u64,
+    /// Plays backwards. The FILE is reversed into a cache and the clip
+    /// points at it; nothing in the audio callback knows, which is why
+    /// this costs the red zone nothing at all.
+    #[serde(default)]
+    reversed: bool,
+    /// A gain ramp at each end of the clip, in FRAMES of its timeline
+    /// span — the same units the node applies them in, so the handle you
+    /// drag and the envelope you hear are the same number.
+    #[serde(default)]
+    fade_in: u64,
+    #[serde(default)]
+    fade_out: u64,
+    /// Each fade's SHAPE, in `-1..=1`; zero is linear.
+    ///
+    /// Defaulted, so a project written before shapes existed loads with
+    /// the straight ramps it was made with and sounds identical.
+    #[serde(default)]
+    fade_in_curve: f32,
+    #[serde(default)]
+    fade_out_curve: f32,
+    /// A gain ride over the clip's timeline span: `(frame, dB)`, sorted.
+    ///
+    /// dB in the MODEL and linear in the node, because dB is what a
+    /// fader is marked in and what a breakpoint should be read as, while
+    /// the callback wants a number it can multiply by. The conversion is
+    /// one place: the graph builder.
+    ///
+    /// Empty is no envelope, which is what every clip written before this
+    /// carries — so a project from before it loads sounding identical.
+    #[serde(default)]
+    envelope: Vec<(u64, f32)>,
+}
+
+impl AudioSource {
+    /// The file's length, falling back to this region's end for a
+    /// project written before the field existed.
+    fn file_frames(&self) -> u64 {
+        if self.file_frames > 0 {
+            self.file_frames
+        } else {
+            self.source_offset.saturating_add(self.source_frames)
+        }
+    }
+
+    /// Where this clip's region starts in whichever file will actually be
+    /// streamed — the original, or its reversal.
+    fn playing_offset(&self) -> u64 {
+        if self.reversed {
+            self.file_frames()
+                .saturating_sub(self.source_offset.saturating_add(self.source_frames))
+        } else {
+            self.source_offset
+        }
+    }
+
+    /// The file the node should open. `None` while a reversal has been
+    /// asked for and not yet built — the caller decides what silence
+    /// means, rather than this quietly handing back the forward file and
+    /// playing the clip the wrong way round.
+    fn playing_path(&self) -> Option<std::path::PathBuf> {
+        if !self.reversed {
+            return Some(self.path.clone());
+        }
+        let cache = daw::library::reverse_cache_path(&self.path)?;
+        cache.exists().then_some(cache)
+    }
 }
 
 /// One clip on a lane. Positions are absolute beats.
@@ -2801,6 +4913,166 @@ struct Clip {
     notes: Vec<Note>,
     /// Present only on audio tracks. MIDI clips carry notes instead.
     audio: Option<AudioSource>,
+    /// The clip's INTERNAL loop: a region of its own content that repeats
+    /// to fill it.
+    ///
+    /// Off by default, and `loop_len` of zero also means off — which is
+    /// what every clip written before this carries, so a project from
+    /// before loops sounds exactly as it did.
+    ///
+    /// Both are clip-relative beats. Playback runs from the clip's origin
+    /// to the loop's END, then jumps back to the loop's START and repeats
+    /// for as long as the clip lasts. That is Ableton's brace: anything
+    /// before `loop_start` is an up-beat played once, and the common case
+    /// — `loop_start` at zero — is a plain repeating bar.
+    #[serde(default)]
+    loop_on: bool,
+    #[serde(default)]
+    loop_start: f32,
+    #[serde(default)]
+    loop_len: f32,
+}
+
+/// How long one pass of a clip's content is, and where it repeats from.
+///
+/// `None` when the clip does not loop — which is both the switch being
+/// off and a degenerate brace, because a loop of no length is not a loop
+/// and silently doing nothing beats dividing by zero in a compile.
+fn clip_loop(clip: &Clip) -> Option<(f32, f32)> {
+    if !clip.loop_on {
+        return None;
+    }
+    let start = clip.loop_start.max(0.0);
+    let len = clip.loop_len;
+    (len > MIN_LOOP_BEATS).then_some((start, len))
+}
+
+/// The loop a clip plays by when LAUNCHED.
+///
+/// A launcher clip repeats by definition, so one with no brace of its own
+/// loops its whole length. That is exactly what the session did before
+/// braces existed, which is why a project written then still sounds the
+/// same.
+fn launch_loop(clip: &Clip) -> (f32, f32) {
+    clip_loop(clip).unwrap_or((0.0, clip.len))
+}
+
+/// The shortest loop a clip may have, in beats. A 64th note at any tempo
+/// is already absurd; below this a horizon-filling unroll would be
+/// hundreds of thousands of copies and the compile would stall.
+const MIN_LOOP_BEATS: f32 = 1.0 / 16.0;
+
+/// The most times a clip's loop will be unrolled into one compile.
+///
+/// A ceiling rather than a guess: the session horizon divided by the
+/// shortest legal loop is four thousand passes, and a pattern that long
+/// is a runaway rather than a performance.
+const MAX_LOOP_PASSES: usize = 4_096;
+
+/// One clip's notes as they actually sound over `span` beats, in
+/// CLIP-RELATIVE time.
+///
+/// The single definition of what a clip's internal loop means. Both the
+/// timeline and the session launcher go through it — the launcher used to
+/// carry its own copy of "repeat the whole clip", and two definitions of
+/// looping is one more than a project can survive.
+///
+/// A note that STARTS inside a pass keeps its full length even if it
+/// rings past the loop's end: once struck it belongs to the timeline, the
+/// same rule a clip's own end already keeps. Muted notes never reach
+/// here — deactivation is decided one layer up, where beats become the
+/// engine's business.
+fn clip_notes(clip: &Clip, span: f32) -> Vec<Note> {
+    let span = f64::from(span.max(0.0));
+    let Some((loop_start, loop_len)) = clip_loop(clip) else {
+        // No loop: the notes as written, out to the span.
+        return clip
+            .notes
+            .iter()
+            .filter(|n| n.start < span)
+            .cloned()
+            .collect();
+    };
+    let (loop_start, loop_len) = (f64::from(loop_start), f64::from(loop_len));
+    let loop_end = loop_start + loop_len;
+
+    // The head: everything before the loop ends, played once. With the
+    // brace at the clip's origin this is the first pass and nothing else.
+    let mut out: Vec<Note> = clip
+        .notes
+        .iter()
+        .filter(|n| n.start < loop_end.min(span))
+        .cloned()
+        .collect();
+    out.extend(loop_repeats(
+        &clip.notes,
+        loop_start,
+        loop_len,
+        span,
+        MAX_LOOP_PASSES,
+    ));
+    out
+}
+
+/// Where a position INSIDE a looping clip actually reads from.
+///
+/// The inverse of the unroll, and it has to be: the notes are placed by
+/// `loop_repeats` and the playhead is folded by this, so if the two
+/// disagree the marker sits somewhere the sound is not. Before the loop's
+/// end nothing has repeated yet and the position is itself; after it, the
+/// clip has jumped back to the brace's start and is going round again.
+///
+/// A brace of no length cannot fold anything and the position passes
+/// through — the same "not a loop" answer every other layer gives.
+pub(crate) fn loop_position(at: f64, loop_start: f64, loop_len: f64) -> f64 {
+    let loop_end = loop_start + loop_len;
+    if loop_len <= 0.0 || at < loop_end {
+        return at;
+    }
+    loop_start + (at - loop_end) % loop_len
+}
+
+/// The REPEATS a brace makes over `span`, without the head pass.
+///
+/// Split out because two things want it and only one of them wants the
+/// head: the compile takes head-plus-repeats as one list, and the piano
+/// roll draws the head as editable notes and the repeats as ghosts. Two
+/// copies of this arithmetic would be two answers to "where does the
+/// third pass start", and the picture would drift from the sound.
+///
+/// `max_passes` is the caller's ceiling — the compile bounds a runaway,
+/// the roll bounds what is worth drawing — and it is a parameter rather
+/// than a constant because those are different numbers for good reasons.
+pub(crate) fn loop_repeats(
+    notes: &[Note],
+    loop_start: f64,
+    loop_len: f64,
+    span: f64,
+    max_passes: usize,
+) -> Vec<Note> {
+    if loop_len <= 0.0 {
+        return Vec::new();
+    }
+    let loop_end = loop_start + loop_len;
+    let mut out = Vec::new();
+    let mut at = loop_end;
+    let mut passes = 0usize;
+    while at < span && passes < max_passes {
+        let shift = at - loop_start;
+        out.extend(
+            notes
+                .iter()
+                .filter(|n| n.start >= loop_start && n.start < loop_end)
+                .filter(|n| n.start + shift < span)
+                .map(|n| Note {
+                    start: n.start + shift,
+                    ..n.clone()
+                }),
+        );
+        at += loop_len;
+        passes += 1;
+    }
+    out
 }
 
 impl Default for Clip {
@@ -2815,6 +5087,9 @@ impl Default for Clip {
             len: 0.0,
             notes: Vec::new(),
             audio: None,
+            loop_on: false,
+            loop_start: 0.0,
+            loop_len: 0.0,
         }
     }
 }
@@ -3075,24 +5350,37 @@ impl Session {
             return Some(Vec::new());
         }
         let start = self.launch_at.get(track).copied().unwrap_or(0.0);
+        // A LAUNCHED clip repeats — that is what launching means — so one
+        // with no brace of its own loops the whole of itself, which is
+        // what the launcher did before braces existed.
+        let (loop_start, loop_len) = launch_loop(clip);
         if clip.audio.is_some() {
             let mut looped = clip.clone();
             looped.start = start;
             looped.len = SESSION_HORIZON_BEATS;
+            looped.loop_on = true;
+            looped.loop_start = loop_start;
+            looped.loop_len = loop_len;
             if let Some(audio) = &mut looped.audio {
+                // The SOURCE says it loops too. The node reads either, but
+                // everything green-side that asks "is this clip looping?"
+                // asks the source, and one of the two answering `false`
+                // would be a lie waiting to be read.
                 audio.looped = true;
             }
             return Some(vec![looped]);
         }
-        let repeats = (SESSION_HORIZON_BEATS / clip.len).ceil().max(1.0) as usize;
-        Some(
-            (0..repeats)
-                .map(|n| Clip {
-                    start: start + n as f32 * clip.len,
-                    ..clip.clone()
-                })
-                .collect(),
-        )
+        // The notes, unrolled across the horizon by the ONE definition of
+        // what a clip's loop means. This used to be a second copy of that
+        // rule — "repeat the whole clip" — and two definitions of looping
+        // is one more than a project can survive.
+        let mut filled = clip.clone();
+        filled.start = start;
+        filled.len = SESSION_HORIZON_BEATS;
+        filled.loop_on = true;
+        filled.loop_start = loop_start;
+        filled.loop_len = loop_len;
+        Some(vec![filled])
     }
 }
 
@@ -3158,6 +5446,15 @@ struct TrackRename {
 /// The arrangement's state.
 struct Arrangement {
     tracks: Vec<Track>,
+    /// The bus they all land on. One, always present, never in the stack —
+    /// see [`MasterTrack`] on why it is not simply the last track.
+    master: MasterTrack,
+    /// Whether the MASTER is the thing being edited, rather than the
+    /// selected lane. View state, not saved: reopening a song should show
+    /// you the song, not whichever strip you were poking at when you shut
+    /// it. `selected` keeps its lane underneath, so leaving the master
+    /// puts you back where you were.
+    master_selected: bool,
     /// Index into `GRID_BEATS`.
     grid: usize,
     /// The selected track. Time selection belongs to it and only it — one
@@ -3191,6 +5488,20 @@ struct Arrangement {
     zoom_restore: Option<(f32, f32)>,
     /// Last rendered timeline width, used to fit a selected clip exactly.
     viewport_width: f32,
+    /// Last rendered timeline height, for the same reason vertically.
+    viewport_height: f32,
+    /// How far the lane stack is scrolled DOWN, in points. Zero is the
+    /// top, which is where it has always been — this is the first thing
+    /// that moves it.
+    ///
+    /// Driven by the focus gesture ONLY, deliberately: the wheel already
+    /// means horizontal pan here (`scroll.x + scroll.y`), and quietly
+    /// giving the vertical half a second meaning would change a gesture
+    /// under the hands of anyone already using it.
+    view_tracks_y: f32,
+    /// The lane the focus gesture grew, and what it grew FROM: (track,
+    /// its height, the scroll offset). X puts all three back.
+    focus_restore: Option<(usize, f32, f32)>,
     /// The working key: what the piano roll shades against and what the
     /// diatonic verbs build from.
     key: Key,
@@ -3264,12 +5575,16 @@ struct Arrangement {
 /// A note, spelled out. Only the tests build notes by hand — the app builds
 /// them through the piano roll.
 #[cfg(test)]
-const fn note(pitch: u8, start: f64, len: f64, vel: u8) -> Note {
+fn note(pitch: u8, start: f64, len: f64, vel: u8) -> Note {
     Note {
         pitch,
         start,
         len,
         vel,
+        muted: false,
+        plocks: Vec::new(),
+        prob: 1.0,
+        cond: None,
     }
 }
 
@@ -3339,6 +5654,11 @@ struct ProjectDoc {
     loop_range: Option<(f32, f32)>,
     grid: usize,
     tracks: Vec<Track>,
+    /// Absent in a file written before the master existed; a default
+    /// master is unity gain, centre pan and no effects, which is exactly
+    /// what such a project sounded like.
+    #[serde(default)]
+    master: MasterTrack,
     clips: Vec<Vec<Clip>>,
     slots: Vec<Vec<Option<Clip>>>,
     scenes: Vec<Scene>,
@@ -3375,6 +5695,7 @@ fn project_doc(arr: &Arrangement, transport: &Transport) -> ProjectDoc {
         loop_range: arr.loop_range,
         grid: arr.grid,
         tracks: arr.tracks.clone(),
+        master: arr.master.clone(),
         clips: arr.clips.clone(),
         slots: arr.session.slots.clone(),
         scenes: arr.session.scenes.clone(),
@@ -3480,6 +5801,13 @@ fn apply_project_doc(doc: ProjectDoc, arr: &mut Arrangement, transport: &mut Tra
     } else {
         doc.tracks
     };
+    fresh.master = doc.master;
+    // A hand-edited file is input like any other: an instrument on the
+    // master would compile to a source nothing plays.
+    fresh
+        .master
+        .chain
+        .retain(|device| !device.kind().is_instrument());
     let sane = |clip: &Clip| clip.len > 0.0 && clip.start >= 0.0 && clip.start.is_finite();
     fresh.clips = doc.clips;
     fresh.clips.resize(tracks, Vec::new());
@@ -3710,6 +6038,8 @@ impl Default for Arrangement {
                     Track::new(kind, format!("{} {}", kind.stem(), i + 1))
                 })
                 .collect(),
+            master: MasterTrack::default(),
+            master_selected: false,
             grid: GRID_DEFAULT,
             selected: None,
             selection: None,
@@ -3721,6 +6051,9 @@ impl Default for Arrangement {
             pixels_per_beat: PX_PER_BEAT,
             zoom_restore: None,
             viewport_width: 0.0,
+            viewport_height: 0.0,
+            view_tracks_y: 0.0,
+            focus_restore: None,
             // A fresh session is empty: lanes are structural furniture, the
             // clips on them are the user's.
             clips: (0..TRACK_COUNT).map(|_| Vec::new()).collect(),
@@ -3753,6 +6086,24 @@ impl Default for Arrangement {
 }
 
 impl Arrangement {
+    /// Point the rack and the strips at a lane.
+    ///
+    /// The master is a separate PLACE to be, so choosing a track is also
+    /// leaving it: two strips cannot both be the thing being edited. The
+    /// lane underneath is kept either way, which is what lets a trip to
+    /// the master come back to where you were.
+    fn select_track(&mut self, track: usize) {
+        self.selected = Some(track);
+        self.master_selected = false;
+    }
+
+    /// Point them at the master instead. The lane stays selected
+    /// underneath: clips, automation and the piano roll still belong to
+    /// it, and only the rack and the strip highlight move.
+    fn select_master(&mut self) {
+        self.master_selected = true;
+    }
+
     fn grid_beats(&self) -> f32 {
         GRID_BEATS[self.grid.min(GRID_BEATS.len() - 1)]
     }
@@ -3921,6 +6272,12 @@ impl Arrangement {
             len,
             notes: Vec::new(),
             audio: None,
+            // A launcher clip repeats by definition, so a fresh one comes
+            // with its brace round the whole of itself. Moving it is then
+            // an edit rather than a discovery.
+            loop_on: true,
+            loop_start: 0.0,
+            loop_len: len,
         });
         self.session.selected = Some((track, scene));
         true
@@ -4333,7 +6690,7 @@ impl Arrangement {
             let offset = f64::from(clips[i].start - start);
             notes.extend(clips[i].notes.iter().map(|note| Note {
                 start: note.start + offset,
-                ..*note
+                ..note.clone()
             }));
         }
         notes.sort_by(|a, b| a.start.total_cmp(&b.start));
@@ -4349,6 +6706,9 @@ impl Arrangement {
             len: end - start,
             notes,
             audio: None,
+            loop_on: false,
+            loop_start: 0.0,
+            loop_len: 0.0,
         };
         let at = clips.partition_point(|clip| clip.start < start);
         clips.insert(at, merged);
@@ -4563,7 +6923,7 @@ impl Arrangement {
         // A new track is what you are about to work on. Selecting it also
         // means the device rack and the palette's track verbs point at it
         // without a second click.
-        self.selected = Some(i);
+        self.select_track(i);
         self.selected_clip = None;
         self.cursor = Some((i, self.cursor.map(|c| c.1).unwrap_or(0.0)));
         i
@@ -4668,6 +7028,9 @@ impl Arrangement {
                 len,
                 notes: vec![],
                 audio: None,
+                loop_on: false,
+                loop_start: 0.0,
+                loop_len: 0.0,
             },
             at,
         )
@@ -4705,6 +7068,9 @@ impl Arrangement {
                 len,
                 notes: Vec::new(),
                 audio: Some(source),
+                loop_on: false,
+                loop_start: 0.0,
+                loop_len: 0.0,
             },
             at,
         )
@@ -4767,6 +7133,14 @@ impl Arrangement {
 
     /// The clip the piano roll edits, borrowed in place — the roll writes
     /// into the arrangement, never into a copy.
+    /// The edited clip, read-only. The mutable twin below is what edits
+    /// go through; this is for the callers that only need to ask where it
+    /// starts, and that would otherwise take a mutable borrow to do it.
+    fn active_clip_ref(&self) -> Option<&Clip> {
+        let (track, index) = self.selected_clip?;
+        self.clips.get(track)?.get(index)
+    }
+
     fn active_clip(&mut self) -> Option<&mut Clip> {
         let (t, i) = self.selected_clip?;
         if self.tracks.get(t)?.kind != TrackKind::Midi {
@@ -4834,9 +7208,93 @@ impl Arrangement {
         true
     }
 
-    fn zoom_back(&mut self) -> bool {
-        let Some((view_beats, pixels_per_beat)) = self.zoom_restore.take() else {
+    /// The total height of every lane, stacked.
+    fn lane_stack_height(&self) -> f32 {
+        self.tracks.iter().map(|t| t.height).sum()
+    }
+
+    /// The furthest the lane stack may be scrolled down: what does not
+    /// fit, and nothing when it all does. Never negative, so a short
+    /// project cannot be scrolled off its own top.
+    fn max_tracks_scroll(&self) -> f32 {
+        (self.lane_stack_height() - self.viewport_height).max(0.0)
+    }
+
+    /// Put the lane stack where `y` asks, within what there is to see.
+    fn scroll_tracks_to(&mut self, y: f32) {
+        self.view_tracks_y = y.clamp(0.0, self.max_tracks_scroll());
+    }
+
+    /// Where a lane's top edge sits in the stack, ignoring scroll.
+    fn lane_top(&self, track: usize) -> f32 {
+        self.tracks.iter().take(track).map(|t| t.height).sum()
+    }
+
+    /// STEP TWO of the focus gesture: grow the selected clip's lane to
+    /// its full height and bring it to the middle of the view.
+    ///
+    /// Only the ONE lane changes height. Collapsing its neighbours would
+    /// read as tidier and would be throwing away heights the user set by
+    /// hand — the scroll is what makes room, which is what a scroll is
+    /// for.
+    fn expand_selected_lane(&mut self) -> bool {
+        let Some((track, _)) = self.selected_clip else {
             return false;
+        };
+        let tallest = *TRACK_H_RANGE.end();
+        let Some(lane) = self.tracks.get_mut(track) else {
+            return false;
+        };
+        if self.focus_restore.is_none() {
+            self.focus_restore = Some((track, lane.height, self.view_tracks_y));
+        }
+        lane.height = tallest;
+        // Centred on the LANE, not on the clip: a clip is as tall as its
+        // lane, so its middle is the lane's middle, and the arithmetic
+        // that says so out loud is the arithmetic that stays right when
+        // clips stop filling their lanes.
+        let middle = self.lane_top(track) + tallest * 0.5;
+        self.scroll_tracks_to(middle - self.viewport_height * 0.5);
+        true
+    }
+
+    /// Z: focus the selected clip, one step further with each press.
+    ///
+    /// First press fits it across the width; second press gives it the
+    /// height and the middle of the view. X walks all of it back.
+    fn focus_selected_clip(&mut self) -> bool {
+        // Already fitted across? Then this press is the second one.
+        if self.zoom_restore.is_some() {
+            return self.expand_selected_lane();
+        }
+        if self.zoom_selected_audio_clip() {
+            return true;
+        }
+        // A MIDI clip has no waveform to fit across the width, so step
+        // one has nothing to do for it — but the press still counts, or
+        // its second press would never come. The restore point is the
+        // view unchanged, which X puts back harmlessly.
+        if self.selected_clip.is_some() {
+            self.zoom_restore = Some((self.view_beats, self.pixels_per_beat));
+            return true;
+        }
+        false
+    }
+
+    fn zoom_back(&mut self) -> bool {
+        // The lane first, so a stack that is about to get shorter is
+        // measured against the height it will actually have.
+        let restored_lane = if let Some((track, height, tracks_y)) = self.focus_restore.take() {
+            if let Some(lane) = self.tracks.get_mut(track) {
+                lane.height = height;
+            }
+            self.scroll_tracks_to(tracks_y);
+            true
+        } else {
+            false
+        };
+        let Some((view_beats, pixels_per_beat)) = self.zoom_restore.take() else {
+            return restored_lane;
         };
         self.view_beats = view_beats;
         self.pixels_per_beat = pixels_per_beat;
@@ -4954,6 +7412,50 @@ fn clip_rect(
     )
 }
 
+/// The visual zones inside a timeline clip. `clip_rect` remains the exact
+/// musical extent; this helper adds only presentation insets, so snapping,
+/// overlap and edge arithmetic never inherit decorative padding.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ClipCanvasRects {
+    outer: egui::Rect,
+    title: egui::Rect,
+    content: egui::Rect,
+    left_grip: egui::Rect,
+    right_grip: egui::Rect,
+}
+
+fn clip_canvas_rects(full: egui::Rect) -> ClipCanvasRects {
+    let pad_y = CLIP_LANE_PAD_Y.min((full.height() - 1.0).max(0.0) * 0.5);
+    let outer = egui::Rect::from_min_max(
+        egui::pos2(full.left(), full.top() + pad_y),
+        egui::pos2(full.right(), full.bottom() - pad_y),
+    );
+    let title_h = CLIP_TITLE_H.min(outer.height());
+    let title =
+        egui::Rect::from_min_max(outer.min, egui::pos2(outer.right(), outer.top() + title_h));
+    let content = egui::Rect::from_min_max(
+        egui::pos2(outer.left(), title.bottom()),
+        outer.right_bottom(),
+    );
+    let grip_h = CLIP_GRIP_H.min(outer.height());
+    let grip_y = outer.center().y - grip_h * 0.5;
+    let left_grip = egui::Rect::from_min_size(
+        egui::pos2(outer.left(), grip_y),
+        egui::vec2(CLIP_GRIP_W.min(outer.width()), grip_h),
+    );
+    let right_grip = egui::Rect::from_min_size(
+        egui::pos2((outer.right() - CLIP_GRIP_W).max(outer.left()), grip_y),
+        egui::vec2(CLIP_GRIP_W.min(outer.width()), grip_h),
+    );
+    ClipCanvasRects {
+        outer,
+        title,
+        content,
+        left_grip,
+        right_grip,
+    }
+}
+
 /// Where a note's bar goes inside a clip's rect, given the clip's pitch
 /// range. Higher pitches sit higher in the block, the way a piano roll
 /// reads, and every bar is at least `NOTE_MIN_H` tall so quiet notes do not
@@ -5008,6 +7510,33 @@ fn clamp_clip_len(clips: &[Clip], idx: usize, want: f32, grid: f32) -> f32 {
         return clips[idx].len;
     }
     want.clamp(grid, hi)
+}
+
+fn scripted_clip_len(clip: &Clip, edit: piano_roll::ClipLengthEdit, grid: f32) -> f32 {
+    let fit = || {
+        clip.notes
+            .iter()
+            .map(|note| (note.start + note.len) as f32)
+            .fold(grid, f32::max)
+    };
+    match edit {
+        piano_roll::ClipLengthEdit::Set(length) => length,
+        piano_roll::ClipLengthEdit::Extend(length) => clip.len + length,
+        piano_roll::ClipLengthEdit::Trim(length) => clip.len - length,
+        piano_roll::ClipLengthEdit::Fit => fit(),
+    }
+    .max(grid)
+}
+
+fn set_scripted_clip_len(clip: &mut Clip, length: f32) {
+    clip.len = length;
+    if clip.loop_on {
+        clip.loop_start = clip.loop_start.min(length);
+        clip.loop_len = clip.loop_len.min((length - clip.loop_start).max(0.0));
+        if clip.loop_len <= 0.0 {
+            clip.loop_on = false;
+        }
+    }
 }
 
 /// Apply a non-destructive left trim. Moving the arrangement edge right
@@ -5087,9 +7616,21 @@ fn place_clip(track: &[Clip], at: f32, len: f32) -> (f32, usize) {
 ///
 /// PAN IS NOT IN HERE, deliberately: every instrument track always carries
 /// a Pan node, so pan rides a letter and a knob drag costs nothing.
-fn shape_hash(tracks: &[Track]) -> u64 {
+fn shape_hash(tracks: &[Track], master: &MasterTrack) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // The master's chain is shape for exactly the reasons a lane's is: its
+    // devices are nodes, and no letter can add one. Its LEVEL is not —
+    // that rides `sync_master`, like every other fader.
+    master.chain.len().hash(&mut hasher);
+    for instance in &master.chain {
+        instance.id.hash(&mut hasher);
+        instance.kind().hash(&mut hasher);
+        instance.bypass.hash(&mut hasher);
+        if let DeviceState::Echo(params) = instance.state {
+            (params.send > 0.0).hash(&mut hasher);
+        }
+    }
     for t in tracks {
         t.kind.hash(&mut hasher);
         t.mute.hash(&mut hasher);
@@ -5102,6 +7643,15 @@ fn shape_hash(tracks: &[Track]) -> u64 {
             instance.id.hash(&mut hasher);
             instance.kind().hash(&mut hasher);
             instance.bypass.hash(&mut hasher);
+            // A delay's SEND is a shape the moment it leaves zero: an
+            // insert stands in the signal path, an aux hangs off the
+            // output stage, and no letter can move a node from one to
+            // the other. The LEVEL is not in here — only which side of
+            // zero it is on — so riding an established send costs a
+            // letter, exactly like riding a fader.
+            if let DeviceState::Echo(params) = instance.state {
+                (params.send > 0.0).hash(&mut hasher);
+            }
         }
     }
     hasher.finish()
@@ -5125,8 +7675,29 @@ fn lane_accepts(track: &Track, clip: &Clip) -> bool {
     }
 }
 
-fn lane_rects(area: egui::Rect, tracks: &[Track]) -> Vec<egui::Rect> {
-    let mut y = area.top();
+/// What a wheel gesture asks the timeline for: beats SIDEWAYS, points
+/// DOWN.
+///
+/// Pure, because the two signs are the whole thing that can be wrong
+/// here and neither is visible in a screenshot until you are already
+/// scrolling the wrong way.
+///
+/// egui's convention is a scroll area's: a positive delta means the
+/// CONTENT moves down, so the offset into it goes down too — hence the
+/// negation on the vertical. The horizontal keeps the sign the timeline
+/// has always panned by, so Shift+wheel now does exactly what a bare
+/// wheel did before this change.
+fn wheel_axes(scroll: egui::Vec2, pixels_per_beat: f32) -> (f32, f32) {
+    let per_beat = if pixels_per_beat.is_finite() && pixels_per_beat > 0.0 {
+        pixels_per_beat
+    } else {
+        return (0.0, 0.0);
+    };
+    (scroll.x / per_beat, -scroll.y)
+}
+
+fn lane_rects(area: egui::Rect, tracks: &[Track], scroll_y: f32) -> Vec<egui::Rect> {
+    let mut y = area.top() - scroll_y;
     tracks
         .iter()
         .map(|t| {
@@ -5138,6 +7709,89 @@ fn lane_rects(area: egui::Rect, tracks: &[Track]) -> Vec<egui::Rect> {
             rect
         })
         .collect()
+}
+
+/// Give the canvas a quiet row rhythm before the timing grid is painted.
+/// Selection changes the ground by one authored step; it does not erase the
+/// grid or flood the lane with the global focus colour.
+fn paint_lane_bands(
+    ui: &egui::Ui,
+    content: egui::Rect,
+    lanes: &[egui::Rect],
+    selected: Option<usize>,
+    theme: &Theme,
+) {
+    let painter = ui.painter();
+    painter.rect_filled(content, 0.0, theme.timeline_lane);
+    for (i, lane) in lanes.iter().enumerate() {
+        let visible = lane.intersect(content);
+        if visible.height() <= 0.0 {
+            continue;
+        }
+        let fill = if selected == Some(i) {
+            theme.timeline_lane_selected
+        } else if i % 2 == 0 {
+            theme.timeline_lane
+        } else {
+            theme.timeline_lane_alt
+        };
+        painter.rect_filled(visible, 0.0, fill);
+    }
+}
+
+/// The compact Arrangement ruler: bars are numbered, beats are ticks, and
+/// subdivisions stay in the canvas. This preserves hierarchy at any zoom
+/// instead of turning the ruler into a duplicate of the full-height grid.
+fn arrangement_ruler(
+    ui: &egui::Ui,
+    ruler: egui::Rect,
+    content: egui::Rect,
+    theme: &Theme,
+    arr: &Arrangement,
+    beats_per_bar: u32,
+    pixels_per_beat: f32,
+) {
+    let painter = ui.painter();
+    painter.rect_filled(ruler, 0.0, theme.surface_sunken);
+    painter.line_segment(
+        [ruler.left_bottom(), ruler.right_bottom()],
+        egui::Stroke::new(stroke::HAIR, theme.divider),
+    );
+
+    let per_bar = beats_per_bar.max(1) as f32;
+    let mut beat = arr.view_beats.floor();
+    while x_at(content, arr.view_beats, pixels_per_beat, beat) <= ruler.right() {
+        let x = x_at(content, arr.view_beats, pixels_per_beat, beat);
+        if x >= ruler.left() {
+            let on_bar = (beat % per_bar).abs() < 1e-3;
+            let tick_h = if on_bar { ruler.height() } else { space::XS };
+            painter.line_segment(
+                [
+                    egui::pos2(x, ruler.bottom() - tick_h),
+                    egui::pos2(x, ruler.bottom()),
+                ],
+                egui::Stroke::new(
+                    stroke::HAIR,
+                    if on_bar {
+                        theme.grid_bar
+                    } else {
+                        theme.grid_beat
+                    },
+                ),
+            );
+            if on_bar && pixels_per_beat * per_bar >= 36.0 {
+                let bar = (beat / per_bar).floor() as i64 + 1;
+                painter.text(
+                    egui::pos2(x + space::XS, ruler.top() + 1.0),
+                    egui::Align2::LEFT_TOP,
+                    bar.to_string(),
+                    egui::FontId::new(font::MICRO_LABEL, egui::FontFamily::Monospace),
+                    theme.text_muted,
+                );
+            }
+        }
+        beat += 1.0;
+    }
 }
 
 /// Paint the beat grid across `area`.
@@ -5743,6 +8397,105 @@ fn automation_editor_body(
     close_response.clicked()
 }
 
+/// The exact tiles of one arrangement track header.
+///
+/// Kept pure and shared by paint, hit-testing and tests: the easiest way for
+/// a dense header to look homemade is for its name, badge, controls and meter
+/// to each have a slightly different idea of where the available space ends.
+#[derive(Clone, Copy, Debug)]
+struct TrackHeaderLayout {
+    identity: egui::Rect,
+    name: egui::Rect,
+    kind: egui::Rect,
+    meter: egui::Rect,
+    controls: Option<TrackHeaderControls>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TrackHeaderControls {
+    mute: egui::Rect,
+    solo: egui::Rect,
+    pan_value: egui::Rect,
+    pan: egui::Rect,
+}
+
+fn track_header_layout(head: egui::Rect) -> TrackHeaderLayout {
+    let meter = egui::Rect::from_min_max(
+        egui::pos2(
+            (head.right() - HEADER_METER_W).max(head.left()),
+            (head.top() + space::XXS).min(head.bottom()),
+        ),
+        egui::pos2(head.right(), (head.bottom() - space::XXS).max(head.top())),
+    );
+    let content_right = (meter.left() - HEADER_METER_GAP).max(head.left());
+    let identity = egui::Rect::from_min_max(
+        egui::pos2(
+            (head.left() + HEADER_PAD).min(content_right),
+            (head.top() + HEADER_PAD * 0.5).min(head.bottom()),
+        ),
+        egui::pos2(
+            content_right,
+            (head.top() + HEADER_PAD * 0.5 + HEADER_NAME_H).min(head.bottom()),
+        ),
+    );
+
+    // MIDI is shorter than AUDIO, but the cell is not: the badge column is
+    // stable across the stack, which is what lets the names form one clean
+    // left-aligned list instead of ragging around their metadata.
+    let kind_w = HEADER_KIND_W;
+    let kind = egui::Rect::from_min_max(
+        egui::pos2(
+            (identity.right() - kind_w).max(identity.left()),
+            identity.top(),
+        ),
+        identity.max,
+    );
+    let name = egui::Rect::from_min_max(
+        identity.min,
+        egui::pos2(
+            (kind.left() - HEADER_PAD).max(identity.left()),
+            identity.bottom(),
+        ),
+    );
+
+    let controls = (head.height() >= HEADER_ROWS_MIN_H).then(|| {
+        let row_y = identity.bottom() + HEADER_PAD * 0.5;
+        let mute = egui::Rect::from_min_size(
+            egui::pos2(head.left() + HEADER_PAD, row_y),
+            egui::vec2(HEADER_BTN, HEADER_BTN),
+        );
+        let solo = mute.translate(egui::vec2(HEADER_BTN + HEADER_CONTROL_GAP, 0.0));
+        let pan = egui::Rect::from_min_size(
+            egui::pos2(
+                content_right - HEADER_KNOB,
+                row_y + (HEADER_BTN - HEADER_KNOB) * 0.5,
+            ),
+            egui::vec2(HEADER_KNOB, HEADER_KNOB),
+        );
+        let pan_value = egui::Rect::from_min_max(
+            egui::pos2(solo.right() + space::XS, row_y),
+            egui::pos2(
+                (pan.left() - space::XS).max(solo.right()),
+                row_y + HEADER_BTN,
+            ),
+        );
+        TrackHeaderControls {
+            mute,
+            solo,
+            pan_value,
+            pan,
+        }
+    });
+
+    TrackHeaderLayout {
+        identity,
+        name,
+        kind,
+        meter,
+        controls,
+    }
+}
+
 /// A small bipolar pan knob, drawn into `rect`.
 ///
 /// Deliberately not `kit::knob`: this one lives inside a lane rather than
@@ -5752,38 +8505,78 @@ fn automation_editor_body(
 /// fighting. Double-click centers it outright.
 ///
 /// `pan` is `-1..=1`. Returns true when the user moved it.
-fn pan_knob(ui: &mut egui::Ui, theme: &Theme, rect: egui::Rect, pan: &mut f32) -> bool {
+#[derive(Clone, Copy, Debug, Default)]
+struct PanOutcome {
+    changed: bool,
+    engaged: bool,
+}
+
+fn pan_knob(ui: &mut egui::Ui, theme: &Theme, rect: egui::Rect, pan: &mut f32) -> PanOutcome {
     let id = ui
         .id()
         .with(("pan", rect.left_top().x as i32, rect.top() as i32));
     let response = ui.interact(rect, id, egui::Sense::click_and_drag());
     let mut changed = false;
 
+    if response.drag_started() {
+        ui.data_mut(|data| {
+            data.insert_temp(id.with("origin"), *pan);
+            data.remove::<bool>(id.with("cancelled"));
+        });
+    }
+    let cancelled = ui
+        .data(|data| data.get_temp::<bool>(id.with("cancelled")))
+        .unwrap_or(false);
+
     if response.double_clicked() {
         if *pan != 0.0 {
             *pan = 0.0;
             changed = true;
         }
-    } else if response.dragged() {
+    } else if response.dragged() && !cancelled {
         // Full travel over four knob-heights, tenth-speed with Shift —
-        // the same feel as every other knob in the app.
+        // the same feel as every other knob in the app. Absolute from the
+        // press-time value: accumulated drag_delta applied to an already
+        // changed value accelerates once per frame and makes a knob depend
+        // on refresh rate.
         let fine = ui.input(|i| i.modifiers.shift);
         let travel = rect.height() * 4.0 * if fine { 10.0 } else { 1.0 };
         let delta = -response.drag_delta().y / travel * 2.0;
-        if delta != 0.0 {
-            let next = (*pan + delta).clamp(-1.0, 1.0);
-            // The detent: crossing the middle STICKS there for a moment
-            // instead of sliding through it.
-            let next = if next.abs() < PAN_DETENT { 0.0 } else { next };
-            if next != *pan {
-                *pan = next;
-                changed = true;
-            }
+        let origin = ui
+            .data(|data| data.get_temp::<f32>(id.with("origin")))
+            .unwrap_or(*pan);
+        let next = (origin + delta).clamp(-1.0, 1.0);
+        // The detent: crossing the middle STICKS there for a moment instead
+        // of sliding through it.
+        let next = if next.abs() < PAN_DETENT { 0.0 } else { next };
+        if next != *pan {
+            *pan = next;
+            changed = true;
         }
+    }
+
+    // Escape is gesture-local: restore the value from the press, consume the
+    // key, and leave no edit for history to bank.
+    if let Some(origin) = ui.data(|data| data.get_temp::<f32>(id.with("origin")))
+        && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+    {
+        changed |= *pan != origin;
+        *pan = origin;
+        ui.data_mut(|data| data.insert_temp(id.with("cancelled"), true));
+    }
+    if response.drag_stopped() {
+        ui.data_mut(|data| {
+            data.remove::<f32>(id.with("origin"));
+            data.remove::<bool>(id.with("cancelled"));
+        });
     }
     if response.hovered() || response.dragged() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
     }
+    response.clone().on_hover_text(format!(
+        "Pan {}\nDrag vertically · Shift for fine adjustment · Double-click to center",
+        pan_label(*pan)
+    ));
 
     // --- paint ------------------------------------------------------------
     const START: f32 = std::f32::consts::PI * 0.75;
@@ -5833,7 +8626,132 @@ fn pan_knob(ui: &mut egui::Ui, theme: &Theme, rect: egui::Rect, pan: &mut f32) -
         egui::Stroke::new(stroke::HAIR, theme.text_muted),
     );
 
-    changed
+    PanOutcome {
+        changed,
+        engaged: response.clicked() || response.drag_started() || response.dragged(),
+    }
+}
+
+/// A unipolar level knob: silence at the bottom, unity at twelve o'clock,
+/// `MASTER_GAIN_MAX` at the top.
+///
+/// The pan knob's twin in feel — same travel, same fine modifier, same
+/// escape-cancels-the-gesture rule — because a hand that has learned one
+/// knob in this app has learned all of them. What differs is the DETENT:
+/// pan sticks at centre, a fader sticks at unity, which is the value each
+/// one has to be able to find without looking.
+fn gain_knob(ui: &mut egui::Ui, theme: &Theme, rect: egui::Rect, amp: &mut f32) -> PanOutcome {
+    let id = ui
+        .id()
+        .with(("gain", rect.left_top().x as i32, rect.top() as i32));
+    let response = ui.interact(rect, id, egui::Sense::click_and_drag());
+    let mut changed = false;
+
+    if response.drag_started() {
+        ui.data_mut(|data| {
+            data.insert_temp(id.with("origin"), *amp);
+            data.remove::<bool>(id.with("cancelled"));
+        });
+    }
+    let cancelled = ui
+        .data(|data| data.get_temp::<bool>(id.with("cancelled")))
+        .unwrap_or(false);
+
+    if response.double_clicked() {
+        if *amp != 1.0 {
+            *amp = 1.0;
+            changed = true;
+        }
+    } else if response.dragged() && !cancelled {
+        let fine = ui.input(|i| i.modifiers.shift);
+        let travel = rect.height() * 4.0 * if fine { 10.0 } else { 1.0 };
+        let delta = -response.drag_delta().y / travel * MASTER_GAIN_MAX;
+        let origin = ui
+            .data(|data| data.get_temp::<f32>(id.with("origin")))
+            .unwrap_or(*amp);
+        let next = (origin + delta).clamp(0.0, MASTER_GAIN_MAX);
+        let next = if (next - 1.0).abs() < GAIN_DETENT {
+            1.0
+        } else {
+            next
+        };
+        if next != *amp {
+            *amp = next;
+            changed = true;
+        }
+    }
+
+    if let Some(origin) = ui.data(|data| data.get_temp::<f32>(id.with("origin")))
+        && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+    {
+        changed |= *amp != origin;
+        *amp = origin;
+        ui.data_mut(|data| data.insert_temp(id.with("cancelled"), true));
+    }
+    if response.drag_stopped() {
+        ui.data_mut(|data| {
+            data.remove::<f32>(id.with("origin"));
+            data.remove::<bool>(id.with("cancelled"));
+        });
+    }
+    if response.hovered() || response.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+    }
+    response.clone().on_hover_text(format!(
+        "Level {} dB\nDrag vertically · Shift for fine adjustment · Double-click for unity",
+        volume_label(*amp)
+    ));
+
+    const START: f32 = std::f32::consts::PI * 0.75;
+    const SWEEP: f32 = std::f32::consts::PI * 1.5;
+    let center = rect.center();
+    let radius = rect.width() * 0.5 - stroke::BOLD;
+    let painter = ui.painter();
+    painter.circle_filled(center, radius, theme.surface_sunken);
+    painter.circle_stroke(
+        center,
+        radius,
+        egui::Stroke::new(stroke::HAIR, theme.outline),
+    );
+    let arc = |from: f32, to: f32, s: egui::Stroke| {
+        const STEPS: usize = 16;
+        let points: Vec<egui::Pos2> = (0..=STEPS)
+            .map(|i| {
+                let a = from + (to - from) * i as f32 / STEPS as f32;
+                center + kit::knob_dir(a) * radius
+            })
+            .collect();
+        painter.add(egui::Shape::line(points, s));
+    };
+    arc(
+        START,
+        START + SWEEP,
+        egui::Stroke::new(stroke::HAIR, theme.divider),
+    );
+    let at = START + SWEEP * (*amp / MASTER_GAIN_MAX).clamp(0.0, 1.0);
+    if at > START + f32::EPSILON {
+        arc(START, at, egui::Stroke::new(stroke::BOLD, theme.accent));
+    }
+    let dir = kit::knob_dir(at);
+    painter.line_segment(
+        [center + dir * (radius * 0.35), center + dir * radius],
+        egui::Stroke::new(stroke::BOLD, theme.text),
+    );
+    // The unity tick, where the detent is — at twelve o'clock, exactly as
+    // pan's centre tick is.
+    let unity = kit::knob_dir(START + SWEEP * (1.0 / MASTER_GAIN_MAX));
+    painter.line_segment(
+        [
+            center + unity * (radius * 0.9),
+            center + unity * (radius + 2.0),
+        ],
+        egui::Stroke::new(stroke::HAIR, theme.text_muted),
+    );
+
+    PanOutcome {
+        changed,
+        engaged: response.clicked() || response.drag_started() || response.dragged(),
+    }
 }
 
 /// How pan reads out: "C" at center, "L42" / "R42" either side. Percent,
@@ -5852,7 +8770,7 @@ fn pan_label(pan: f32) -> String {
 
 /// One small square toggle — the M and S of a track header.
 ///
-/// Returns true when clicked. `on_fill` is the colour it takes while
+/// Returns its response. `on_fill` is the colour it takes while
 /// engaged; off, it is a hairline outline and nothing else, so a header
 /// with nothing engaged is quiet.
 fn header_toggle(
@@ -5863,10 +8781,12 @@ fn header_toggle(
     letter: &str,
     on: bool,
     on_fill: egui::Color32,
-) -> bool {
+) -> egui::Response {
     let response = ui.interact(rect, id, egui::Sense::click());
     let painter = ui.painter();
-    let fill = if on {
+    let fill = if response.is_pointer_button_down_on() {
+        on_fill.gamma_multiply(0.72)
+    } else if on {
         on_fill
     } else if response.hovered() {
         theme.surface_raised
@@ -5889,7 +8809,307 @@ fn header_toggle(
         // in the page colour; idle, the letter is the only thing there.
         if on { theme.bg } else { theme.text_muted },
     );
-    response.clicked()
+    response
+}
+
+/// The arrangement header's peripheral activity rail.
+///
+/// This consumes the ballistics the Session mixer already advances from the
+/// engine's per-track telemetry. It is paint only: no new callback message,
+/// no query, and no invented stereo information.
+fn header_meter(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    rect: egui::Rect,
+    meter: Option<&mut device::meter::Ballistics>,
+    audible: bool,
+    id: egui::Id,
+) {
+    if rect.width() <= 0.0 || rect.height() <= 0.0 {
+        return;
+    }
+    let response = ui.interact(rect, id, egui::Sense::click());
+    let meter = meter.map(|meter| {
+        if response.clicked() {
+            meter.clipped = false;
+        }
+        *meter
+    });
+    let shown_db = meter.map_or(device::meter::FLOOR_DB, |meter| meter.shown_db);
+    let peak_db = meter.map_or(device::meter::FLOOR_DB, |meter| meter.peak_db);
+    let clipped = meter.is_some_and(|meter| meter.clipped);
+
+    let clip = egui::Rect::from_min_size(
+        rect.min,
+        egui::vec2(rect.width(), HEADER_METER_CLIP_H.min(rect.height())),
+    );
+    let rail = egui::Rect::from_min_max(
+        egui::pos2(
+            rect.left(),
+            (clip.bottom() + stroke::HAIR).min(rect.bottom()),
+        ),
+        rect.max,
+    );
+    ui.painter().rect_filled(
+        clip,
+        0.0,
+        if clipped {
+            theme.meter_clip
+        } else {
+            theme.surface_sunken
+        },
+    );
+    ui.painter().rect_filled(rail, 0.0, theme.surface_sunken);
+
+    let shown = device::meter::db_to_norm(shown_db);
+    let count = ((rail.height() + HEADER_METER_SEG_GAP)
+        / (HEADER_METER_SEG_H + HEADER_METER_SEG_GAP))
+        .floor()
+        .max(1.0) as usize;
+    for index in 0..count {
+        let from_bottom = index as f32 * (HEADER_METER_SEG_H + HEADER_METER_SEG_GAP);
+        let y = rail.bottom() - from_bottom;
+        let segment = egui::Rect::from_min_max(
+            egui::pos2(
+                rail.left() + stroke::HAIR,
+                (y - HEADER_METER_SEG_H).max(rail.top()),
+            ),
+            egui::pos2(rail.right() - stroke::HAIR, y.min(rail.bottom())),
+        );
+        let threshold = (index + 1) as f32 / count as f32;
+        let lit = shown >= threshold;
+        let db = device::meter::FLOOR_DB
+            + threshold * (device::meter::CEILING_DB - device::meter::FLOOR_DB);
+        let color = if !lit {
+            theme.divider.gamma_multiply(0.55)
+        } else if db > device::meter::HOT_DB {
+            theme.meter_hot
+        } else {
+            theme.meter_low
+        };
+        ui.painter().rect_filled(
+            segment,
+            0.0,
+            if audible {
+                color
+            } else {
+                color.gamma_multiply(0.45)
+            },
+        );
+    }
+
+    if peak_db > device::meter::FLOOR_DB && rail.height() > 0.0 {
+        let y = rail.bottom() - rail.height() * device::meter::db_to_norm(peak_db);
+        let color = if peak_db > device::meter::HOT_DB {
+            theme.meter_hot
+        } else {
+            theme.meter_low
+        };
+        ui.painter().hline(
+            rail.x_range(),
+            y.clamp(rail.top(), rail.bottom()),
+            egui::Stroke::new(stroke::HAIR, color),
+        );
+    }
+    ui.painter().rect_stroke(
+        rect,
+        0.0,
+        egui::Stroke::new(stroke::HAIR, theme.outline),
+        egui::StrokeKind::Inside,
+    );
+
+    let value = if shown_db <= device::meter::FLOOR_DB {
+        "-inf".to_owned()
+    } else {
+        format!("{shown_db:.1} dBFS")
+    };
+    response.on_hover_text(if clipped {
+        format!("Track peak {value}\nClipped · click to clear")
+    } else {
+        format!("Track peak {value}")
+    });
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TrackHeaderMenu {
+    Rename,
+    MoveUp,
+    MoveDown,
+    Mute,
+    Solo,
+    Delete,
+}
+
+/// How tall the master's row is, pinned at the foot of the arrangement.
+const MASTER_HEAD_H: f32 = 46.0;
+
+/// The exact tiles of the master's header, kept pure and shared by paint,
+/// hit-testing and tests for the same reason [`track_header_layout`] is: a
+/// control drawn in one place and reached for in another answers nothing.
+#[derive(Clone, Copy, Debug)]
+struct MasterHeaderLayout {
+    /// The header itself: the header column's width, no more.
+    head: egui::Rect,
+    /// The rest of the row, beside it.
+    beside: egui::Rect,
+    meter: egui::Rect,
+    gain: egui::Rect,
+    pan: egui::Rect,
+    /// Whether the two knobs fit at all. A window squeezed narrow keeps
+    /// the name and the meter and drops them, rather than drawing knobs
+    /// on top of the name.
+    knobs: bool,
+}
+
+fn master_header_layout(row: egui::Rect, column_right: f32) -> MasterHeaderLayout {
+    let head = egui::Rect::from_min_max(
+        row.min,
+        egui::pos2(column_right.clamp(row.left(), row.right()), row.bottom()),
+    );
+    let beside = egui::Rect::from_min_max(egui::pos2(head.right(), row.top()), row.max);
+    // The meter keeps the lanes' geometry exactly, so every meter in the
+    // window reads as one column rather than as a stack plus an oddity.
+    let meter = egui::Rect::from_min_max(
+        egui::pos2(
+            (head.right() - HEADER_METER_W).max(head.left()),
+            head.top() + space::XXS + 1.0,
+        ),
+        egui::pos2(head.right(), (head.bottom() - space::XXS).max(head.top())),
+    );
+    let content_right = (meter.left() - HEADER_METER_GAP).max(head.left());
+    // Level then pan, right to left, each with room for its value under it.
+    let knob_y = head.bottom() - HEADER_PAD * 0.5 - HEADER_KIND_TYPE - HEADER_KNOB;
+    let pan = egui::Rect::from_min_size(
+        egui::pos2(content_right - HEADER_KNOB, knob_y),
+        egui::vec2(HEADER_KNOB, HEADER_KNOB),
+    );
+    let gain = egui::Rect::from_min_size(
+        egui::pos2(pan.left() - HEADER_PAD - HEADER_KNOB, knob_y),
+        egui::vec2(HEADER_KNOB, HEADER_KNOB),
+    );
+    MasterHeaderLayout {
+        head,
+        beside,
+        meter,
+        gain,
+        pan,
+        knobs: gain.left() > head.left() + HEADER_PAD,
+    }
+}
+
+/// The MASTER row: the strip every lane lands on, pinned below them.
+///
+/// Pinned rather than stacked, and that is the point — scrolling a long
+/// song must never take the mix's last stage off screen. It carries no
+/// mute, no solo and no clips: a muted master is a fader at the bottom,
+/// and there is nothing above it to solo against.
+///
+/// Clicking it points the rack at the master chain; clicking a lane header
+/// points it back.
+fn master_header(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    arr: &mut Arrangement,
+    row: egui::Rect,
+    column_right: f32,
+    meter: &mut device::meter::Ballistics,
+) {
+    if row.height() <= 0.0 || row.width() <= 0.0 {
+        return;
+    }
+    let layout = master_header_layout(row, column_right);
+    let rect = layout.head;
+    let wid = ui.id().with("master_header");
+    let selected = arr.master_selected;
+    let body = ui.interact(rect, wid.with("body"), egui::Sense::click());
+    if body.clicked() {
+        arr.select_master();
+    }
+
+    let painter = ui.painter().with_clip_rect(rect);
+    painter.rect_filled(
+        rect,
+        0.0,
+        if selected {
+            theme.surface
+        } else {
+            theme.surface_raised
+        },
+    );
+    // A rule along the top: the master is not the next lane down, it is
+    // what the lanes arrive at.
+    painter.line_segment(
+        [rect.left_top(), rect.right_top()],
+        egui::Stroke::new(stroke::BOLD, theme.divider),
+    );
+    painter.text(
+        egui::pos2(rect.left() + HEADER_PAD, rect.top() + HEADER_PAD * 0.5),
+        egui::Align2::LEFT_TOP,
+        MasterTrack::NAME,
+        egui::FontId::proportional(HEADER_NAME_TYPE),
+        if selected { theme.accent } else { theme.text },
+    );
+    if !arr.master.chain.is_empty() {
+        painter.text(
+            egui::pos2(
+                rect.left() + HEADER_PAD,
+                rect.top() + HEADER_PAD * 0.5 + 13.0,
+            ),
+            egui::Align2::LEFT_TOP,
+            format!("{} fx", arr.master.chain.len()),
+            egui::FontId::monospace(HEADER_KIND_TYPE),
+            theme.text_muted,
+        );
+    }
+
+    if layout.knobs {
+        let mut volume = arr.master.volume;
+        if gain_knob(ui, theme, layout.gain, &mut volume).changed {
+            arr.master.volume = volume;
+        }
+        let mut pan = arr.master.pan;
+        if pan_knob(ui, theme, layout.pan, &mut pan).changed {
+            arr.master.pan = pan;
+        }
+        let painter = ui.painter().with_clip_rect(rect);
+        let small = egui::FontId::monospace(HEADER_KIND_TYPE - 1.0);
+        painter.text(
+            egui::pos2(layout.gain.center().x, layout.gain.bottom() + 1.0),
+            egui::Align2::CENTER_TOP,
+            volume_label(arr.master.volume),
+            small.clone(),
+            theme.text_muted,
+        );
+        painter.text(
+            egui::pos2(layout.pan.center().x, layout.pan.bottom() + 1.0),
+            egui::Align2::CENTER_TOP,
+            pan_label(arr.master.pan),
+            small,
+            theme.text_muted,
+        );
+    }
+
+    // Always audible: there is no mute and no solo rule up here.
+    header_meter(
+        ui,
+        theme,
+        layout.meter,
+        Some(meter),
+        true,
+        wid.with("meter"),
+    );
+
+    // The strip beside it: the master's own lane, quiet until it has
+    // automation to draw. Painted rather than left transparent so the row
+    // reads as one thing across the window.
+    if layout.beside.width() > 0.0 {
+        let painter = ui.painter().with_clip_rect(layout.beside);
+        painter.rect_filled(layout.beside, 0.0, theme.surface_sunken);
+        painter.line_segment(
+            [layout.beside.left_top(), layout.beside.right_top()],
+            egui::Stroke::new(stroke::BOLD, theme.divider),
+        );
+    }
 }
 
 /// The header column down the arrangement's left edge: one header per lane,
@@ -5909,8 +9129,10 @@ fn track_headers(
     arr: &mut Arrangement,
     column: egui::Rect,
     lanes: &[egui::Rect],
+    meters: &mut Vec<device::meter::Ballistics>,
 ) {
     ui.painter().rect_filled(column, 0.0, theme.surface_sunken);
+    meters.resize_with(arr.tracks.len(), Default::default);
 
     // Intents, applied after the loop: the closure body borrows `arr`
     // immutably to read each track, so it cannot also write to it.
@@ -5919,6 +9141,8 @@ fn track_headers(
     let mut solo: Option<usize> = None;
     let mut rename_open: Option<usize> = None;
     let mut pan_edit: Option<(usize, f32)> = None;
+    let mut delete: Option<usize> = None;
+    let menu: std::cell::Cell<Option<(usize, TrackHeaderMenu)>> = std::cell::Cell::new(None);
     let renaming = arr.track_rename.as_ref().map(|r| r.track);
     // The reorder drag rides out of `arr` for the draw and is handed back
     // at the end, the same way the clip ghost does.
@@ -5960,6 +9184,62 @@ fn track_headers(
         if body.clicked() {
             select = Some(i);
         }
+        if body.secondary_clicked() {
+            // The menu belongs to the track it names, not whichever track
+            // happened to be active before the secondary click.
+            select = Some(i);
+        }
+        body.context_menu(|ui| {
+            if ui.button("Rename track").clicked() {
+                menu.set(Some((i, TrackHeaderMenu::Rename)));
+                ui.close();
+            }
+            if ui
+                .add_enabled(i > 0, egui::Button::new("Move up"))
+                .clicked()
+            {
+                menu.set(Some((i, TrackHeaderMenu::MoveUp)));
+                ui.close();
+            }
+            if ui
+                .add_enabled(i + 1 < arr.tracks.len(), egui::Button::new("Move down"))
+                .clicked()
+            {
+                menu.set(Some((i, TrackHeaderMenu::MoveDown)));
+                ui.close();
+            }
+            ui.separator();
+            if ui
+                .button(if track.mute {
+                    "Unmute track"
+                } else {
+                    "Mute track"
+                })
+                .clicked()
+            {
+                menu.set(Some((i, TrackHeaderMenu::Mute)));
+                ui.close();
+            }
+            if ui
+                .button(if track.solo {
+                    "Unsolo track"
+                } else {
+                    "Solo track"
+                })
+                .clicked()
+            {
+                menu.set(Some((i, TrackHeaderMenu::Solo)));
+                ui.close();
+            }
+            ui.separator();
+            if ui
+                .add_enabled(arr.tracks.len() > 1, egui::Button::new("Delete track"))
+                .clicked()
+            {
+                menu.set(Some((i, TrackHeaderMenu::Delete)));
+                ui.close();
+            }
+        });
         if body.dragged()
             && let Some(d) = &mut drag
             && d.from == i
@@ -5988,14 +9268,27 @@ fn track_headers(
             drag = None;
         }
 
+        let layout = track_header_layout(head);
+
+        // One machined strip, three surface states. Hover is local and one
+        // step quieter than selection; neither borrows the accent fill.
+        let selected = arr.selected == Some(i);
+        let base_fill = if selected {
+            theme.surface
+        } else if body.hovered() && drag.is_none() {
+            theme.surface_raised.gamma_multiply(0.72)
+        } else {
+            theme.surface_sunken
+        };
+        ui.painter().rect_filled(head, 0.0, base_fill);
+
         // The carried lane reads as lifted: washed, so the eye can follow
         // which header the insertion line belongs to.
         if drag.as_ref().is_some_and(|d| d.from == i) {
             ui.painter()
                 .rect_filled(head, 0.0, theme.accent_muted.gamma_multiply(0.35));
         }
-        if arr.selected == Some(i) {
-            ui.painter().rect_filled(head, 0.0, theme.surface);
+        if selected {
             // A selected lane gets a spine in the accent, so which track
             // the palette's verbs will hit is readable at a glance.
             ui.painter().rect_filled(
@@ -6009,21 +9302,7 @@ fn track_headers(
         }
 
         // --- the name row -------------------------------------------------
-        let name_row = egui::Rect::from_min_max(
-            egui::pos2(head.left() + HEADER_PAD, head.top() + HEADER_PAD * 0.5),
-            egui::pos2(
-                head.right() - HEADER_PAD,
-                (head.top() + HEADER_PAD * 0.5 + HEADER_NAME_H).min(head.bottom()),
-            ),
-        );
-        if name_row.height() > 1.0 {
-            let badge = track.kind.label();
-            let badge_w = badge.len() as f32 * HEADER_KIND_TYPE * 0.62;
-            let text_row = egui::Rect::from_min_max(
-                name_row.min,
-                egui::pos2(name_row.right() - badge_w - HEADER_PAD, name_row.bottom()),
-            );
-
+        if layout.identity.height() > 1.0 {
             if renaming == Some(i) {
                 // The edit box replaces the label in place. Escape and
                 // Enter are handled by the caller of this frame's rename
@@ -6031,12 +9310,12 @@ fn track_headers(
                 if let Some(rename) = arr.track_rename.as_mut() {
                     let mut child = ui.new_child(
                         egui::UiBuilder::new()
-                            .max_rect(text_row)
+                            .max_rect(layout.name)
                             .layout(egui::Layout::left_to_right(egui::Align::Center)),
                     );
                     let field = child.add(
                         egui::TextEdit::singleline(&mut rename.text)
-                            .desired_width(text_row.width())
+                            .desired_width(layout.name.width())
                             .font(egui::FontId::proportional(HEADER_NAME_TYPE)),
                     );
                     if !rename.focused {
@@ -6045,18 +9324,18 @@ fn track_headers(
                     }
                 }
             } else {
-                let response = ui.interact(text_row, wid.with("name"), egui::Sense::click());
+                let response = ui.interact(layout.name, wid.with("name"), egui::Sense::click());
                 if response.double_clicked() {
                     rename_open = Some(i);
                 } else if response.clicked() {
                     select = Some(i);
                 }
-                ui.painter().text(
-                    text_row.left_center(),
+                ui.painter().with_clip_rect(layout.name).text(
+                    layout.name.left_center(),
                     egui::Align2::LEFT_CENTER,
                     &track.name,
                     egui::FontId::proportional(HEADER_NAME_TYPE),
-                    match (audible, arr.selected == Some(i)) {
+                    match (audible, selected) {
                         (false, _) => theme.divider,
                         (true, true) => theme.text,
                         (true, false) => theme.text_muted,
@@ -6064,69 +9343,102 @@ fn track_headers(
                 );
             }
 
-            ui.painter().text(
-                name_row.right_center(),
-                egui::Align2::RIGHT_CENTER,
-                badge,
-                egui::FontId::proportional(HEADER_KIND_TYPE),
-                theme.text_muted,
+            let kind = match track.kind {
+                TrackKind::Midi => "MIDI",
+                TrackKind::Audio => "AUDIO",
+            };
+            // A square metadata cell, closer to a panel annotation than a
+            // web badge. Its fill step does the grouping; another outline
+            // here would put a box inside every box in the strip.
+            ui.painter().rect_filled(
+                layout.kind,
+                0.0,
+                if selected {
+                    theme.surface_raised
+                } else {
+                    theme.surface
+                },
             );
+            let kind_response = ui.interact(layout.kind, wid.with("kind"), egui::Sense::hover());
+            ui.painter().text(
+                layout.kind.center(),
+                egui::Align2::CENTER_CENTER,
+                kind,
+                egui::FontId::proportional(HEADER_KIND_TYPE),
+                if audible {
+                    theme.text_muted
+                } else {
+                    theme.divider
+                },
+            );
+            kind_response.on_hover_text(match track.kind {
+                TrackKind::Midi => "MIDI track",
+                TrackKind::Audio => "Audio track",
+            });
         }
 
         // --- mute, solo, pan ------------------------------------------------
         // Dropped entirely on a squeezed lane: half a button is worse than
         // no button, and a lane pulled down to a sliver is not the one
         // being worked on.
-        if head.height() < HEADER_ROWS_MIN_H {
-            continue;
-        }
-        let row_y = name_row.bottom() + HEADER_PAD * 0.5;
-        let btn = |n: f32| {
-            egui::Rect::from_min_size(
-                egui::pos2(head.left() + HEADER_PAD + n * (HEADER_BTN + 3.0), row_y),
-                egui::vec2(HEADER_BTN, HEADER_BTN),
+        if let Some(controls) = layout.controls {
+            let mute_response = header_toggle(
+                ui,
+                theme,
+                controls.mute,
+                wid.with("mute"),
+                "M",
+                track.mute,
+                theme.warn,
             )
-        };
-        if header_toggle(
-            ui,
-            theme,
-            btn(0.0),
-            wid.with("mute"),
-            "M",
-            track.mute,
-            theme.warn,
-        ) {
-            mute = Some(i);
-        }
-        if header_toggle(
-            ui,
-            theme,
-            btn(1.0),
-            wid.with("solo"),
-            "S",
-            track.solo,
-            theme.accent,
-        ) {
-            solo = Some(i);
+            .on_hover_text("Mute track");
+            if mute_response.clicked() {
+                mute = Some(i);
+                select = Some(i);
+            }
+            let solo_response = header_toggle(
+                ui,
+                theme,
+                controls.solo,
+                wid.with("solo"),
+                "S",
+                track.solo,
+                theme.accent,
+            )
+            .on_hover_text("Solo track");
+            if solo_response.clicked() {
+                solo = Some(i);
+                select = Some(i);
+            }
+
+            let mut pan = track.pan;
+            let pan_outcome = pan_knob(ui, theme, controls.pan, &mut pan);
+            if pan_outcome.changed {
+                pan_edit = Some((i, pan));
+            }
+            if pan_outcome.engaged {
+                select = Some(i);
+            }
+            ui.painter().with_clip_rect(controls.pan_value).text(
+                controls.pan_value.right_center(),
+                egui::Align2::RIGHT_CENTER,
+                pan_label(pan),
+                egui::FontId::monospace(HEADER_KIND_TYPE),
+                if audible {
+                    theme.text_value
+                } else {
+                    theme.divider
+                },
+            );
         }
 
-        let knob_rect = egui::Rect::from_min_size(
-            egui::pos2(
-                head.right() - HEADER_PAD - HEADER_KNOB,
-                row_y + (HEADER_BTN - HEADER_KNOB) * 0.5,
-            ),
-            egui::vec2(HEADER_KNOB, HEADER_KNOB),
-        );
-        let mut pan = track.pan;
-        if pan_knob(ui, theme, knob_rect, &mut pan) {
-            pan_edit = Some((i, pan));
-        }
-        ui.painter().text(
-            egui::pos2(knob_rect.left() - HEADER_PAD * 0.5, knob_rect.center().y),
-            egui::Align2::RIGHT_CENTER,
-            pan_label(pan),
-            egui::FontId::monospace(HEADER_KIND_TYPE),
-            theme.text_value,
+        header_meter(
+            ui,
+            theme,
+            layout.meter,
+            meters.get_mut(i),
+            audible,
+            wid.with("meter"),
         );
     }
 
@@ -6160,8 +9472,23 @@ fn track_headers(
 
     arr.track_drag = drag;
 
+    if let Some((i, action)) = menu.get() {
+        select = Some(i);
+        match action {
+            TrackHeaderMenu::Rename => rename_open = Some(i),
+            TrackHeaderMenu::MoveUp if i > 0 => reorder = Some((i, i - 1)),
+            TrackHeaderMenu::MoveDown if i + 1 < arr.tracks.len() => {
+                reorder = Some((i, i + 1));
+            }
+            TrackHeaderMenu::Mute => mute = Some(i),
+            TrackHeaderMenu::Solo => solo = Some(i),
+            TrackHeaderMenu::Delete => delete = Some(i),
+            TrackHeaderMenu::MoveUp | TrackHeaderMenu::MoveDown => {}
+        }
+    }
+
     if let Some(i) = select {
-        arr.selected = Some(i);
+        arr.select_track(i);
         arr.selected_clip = None;
     }
     if let Some(i) = mute
@@ -6180,13 +9507,13 @@ fn track_headers(
         t.pan = pan;
     }
     if let Some(i) = rename_open
-        && let Some(t) = arr.tracks.get(i)
+        && let Some(name) = arr.tracks.get(i).map(|t| t.name.clone())
     {
-        arr.selected = Some(i);
+        arr.select_track(i);
         arr.track_rename = Some(TrackRename {
             track: i,
-            text: t.name.clone(),
-            original: t.name.clone(),
+            original: name.clone(),
+            text: name,
             focused: false,
         });
     }
@@ -6194,8 +9521,19 @@ fn track_headers(
     // The reorder LAST: every intent above carries an index from before the
     // move, and `move_track` renumbers the marks itself. Applying it first
     // would let a stale index overwrite what it had just corrected.
-    if let Some((from, to)) = reorder {
-        arr.move_track(from, to);
+    if let Some((from, to)) = reorder
+        && arr.move_track(from, to)
+        && from < meters.len()
+        && to < meters.len()
+    {
+        let meter = meters.remove(from);
+        meters.insert(to, meter);
+    }
+    if let Some(i) = delete
+        && arr.remove_track(i)
+        && i < meters.len()
+    {
+        meters.remove(i);
     }
 }
 
@@ -6264,6 +9602,11 @@ struct ArrangementTransportView {
 struct ArrangementOutcome {
     panned: bool,
     automation_hovered: bool,
+    /// A clip body was double-clicked and the lower region should switch
+    /// from the rack to the editor appropriate for that clip's track.
+    open_clip_editor: bool,
+    /// A fade handle on a timeline clip was dragged: (clip id, the edit).
+    clip_fade: Option<(u64, waveform::ClipEdit)>,
 }
 
 // The timeline composes independent UI services at the panel boundary.
@@ -6279,6 +9622,8 @@ fn arrangement_body(
     automation_mode: bool,
     registry: &ParameterRegistry,
     automation_target: &mut String,
+    meters: &mut Vec<device::meter::Ballistics>,
+    master_meter: &mut device::meter::Ballistics,
 ) -> ArrangementOutcome {
     let ArrangementTransportView {
         beats_per_bar,
@@ -6300,16 +9645,30 @@ fn arrangement_body(
     let timeline_left = area.left() + column_w;
 
     let scroll = ui.input(|i| i.smooth_scroll_delta);
-    let pan = scroll.x + scroll.y;
     let mut panned = false;
     let mut automation_hovered = false;
     let pointer_on_timeline = ui
         .ctx()
         .pointer_latest_pos()
         .is_some_and(|p| p.x >= timeline_left);
-    if pan != 0.0 && ui.ui_contains_pointer() && pointer_on_timeline {
-        arr.view_beats = (arr.view_beats + pan / arr.pixels_per_beat).max(0.0);
+    let on_timeline = ui.ui_contains_pointer() && pointer_on_timeline;
+    // ONE AXIS EACH, where both used to fold into the horizontal pan.
+    //
+    // egui has already sorted the axes out by the time this reads them:
+    // it folds a wheel into `x` while the horizontal modifier is held
+    // (Shift, by default) and into `y` otherwise, and Ctrl+wheel it takes
+    // away entirely as `zoom_delta`. So the wheel is vertical, Shift+wheel
+    // is horizontal, and neither has to know about the other.
+    let (sideways, down) = wheel_axes(scroll, arr.pixels_per_beat);
+    if sideways != 0.0 && on_timeline {
+        arr.view_beats = (arr.view_beats + sideways).max(0.0);
         panned = true;
+    }
+    if down != 0.0 && on_timeline {
+        // NOT `panned`: that turns FOLLOW off, and follow is about
+        // keeping the playhead on screen as time passes. Scrolling to
+        // another lane is not taking the wheel away from it.
+        arr.scroll_tracks_to(arr.view_tracks_y + down);
     }
 
     // Ctrl+scroll (and pinch) zooms, anchored under the pointer: the beat
@@ -6342,11 +9701,28 @@ fn arrangement_body(
         egui::pos2(timeline_left, minimap.bottom()),
         egui::pos2(area.right(), minimap.bottom() + LOOP_RULER_H),
     );
-    let content = egui::Rect::from_min_max(egui::pos2(timeline_left, ruler.bottom()), area.max);
+    // The master takes a row across the FOOT of the arrangement — header
+    // on the left, an empty strip beside it where its own automation will
+    // go. Reserved before anything else measures, so the lane stack and
+    // the header column agree about where the lanes stop: a lane visible
+    // in the grid with its header hidden under the master is the kind of
+    // mismatch that reads as a drawing bug.
+    let lanes_bottom = (area.bottom() - MASTER_HEAD_H).max(ruler.bottom());
+    let master_row = egui::Rect::from_min_max(egui::pos2(area.left(), lanes_bottom), area.max);
+    let content = egui::Rect::from_min_max(
+        egui::pos2(timeline_left, ruler.bottom()),
+        egui::pos2(area.right(), lanes_bottom),
+    );
     arr.viewport_width = content.width();
+    arr.viewport_height = content.height();
+    // The wheel above ran against LAST frame's height — on the very first
+    // frame there was none, and a clamp against a zero viewport would let
+    // the stack scroll clean off its own bottom. Re-clamping here is
+    // idempotent once the figure is right.
+    arr.scroll_tracks_to(arr.view_tracks_y);
     let column = egui::Rect::from_min_max(
         egui::pos2(area.left(), ruler.bottom()),
-        egui::pos2(timeline_left, area.bottom()),
+        egui::pos2(timeline_left, lanes_bottom),
     );
     let grid = arr.grid_beats();
 
@@ -6399,7 +9775,18 @@ fn arrangement_body(
     }
     let offset = arr.view_beats;
 
+    let lanes = lane_rects(content, &arr.tracks, arr.view_tracks_y);
+    paint_lane_bands(ui, content, &lanes, arr.selected, theme);
     beat_grid(ui, content, theme, arr, beats_per_bar, arr.pixels_per_beat);
+    arrangement_ruler(
+        ui,
+        ruler,
+        content,
+        theme,
+        arr,
+        beats_per_bar,
+        arr.pixels_per_beat,
+    );
 
     ui.painter().text(
         egui::pos2(area.right() - GRID_LABEL_PAD, ruler.center().y),
@@ -6441,7 +9828,6 @@ fn arrangement_body(
     }
 
     let grab = ui.style().interaction.resize_grab_radius_side;
-    let lanes = lane_rects(content, &arr.tracks);
     let mut resize: Option<(usize, f32)> = None;
     let mut select: Option<(usize, f32, f32)> = None;
     let mut seek_req: Option<f32> = None;
@@ -6475,13 +9861,6 @@ fn arrangement_body(
             focused_lane = Some(i);
         }
 
-        if arr.selected == Some(i) {
-            // The selected lane lifts one step off the canvas, then restores
-            // its beat grid. Painting the opaque lift after the global grid
-            // used to erase every timing reference in the active track.
-            ui.painter().rect_filled(visible, 0.0, theme.surface);
-            beat_grid(ui, visible, theme, arr, beats_per_bar, arr.pixels_per_beat);
-        }
         let shows_automation = automation_mode && arr.selected == Some(i);
 
         // The lane body excludes both the automation sublane and the resize
@@ -6548,6 +9927,15 @@ fn arrangement_body(
             );
             ui.painter()
                 .rect_filled(band.intersect(body), 0.0, theme.selection);
+            for beat in [from, to] {
+                let x = x_at(content, offset, arr.pixels_per_beat, beat);
+                if body.left() <= x && x <= body.right() {
+                    ui.painter().line_segment(
+                        [egui::pos2(x, body.top()), egui::pos2(x, body.bottom())],
+                        egui::Stroke::new(stroke::HAIR, theme.accent),
+                    );
+                }
+            }
         }
 
         if shows_automation && let Some(spec) = registry.spec(automation_target) {
@@ -6583,7 +9971,7 @@ fn arrangement_body(
                     egui::pos2(lane.right(), lane.bottom()),
                 ),
                 0.0,
-                SEAM,
+                theme.focus,
             );
         } else {
             ui.painter().line_segment(
@@ -6597,7 +9985,7 @@ fn arrangement_body(
     }
 
     if let Some((i, from, to)) = select {
-        arr.selected = Some(i);
+        arr.select_track(i);
         arr.selection = Some(span(from, to, grid));
         // Keep the keyboard where the mouse just went, so arrowing carries
         // on from where you clicked instead of jumping back.
@@ -6623,7 +10011,7 @@ fn arrangement_body(
     {
         arr.cursor = Some((i, cursor_beat));
         arr.anchor = cursor_beat;
-        arr.selected = Some(i);
+        arr.select_track(i);
         arr.selection = Some(span(cursor_beat, cursor_beat, grid));
     }
     if let Some((i, height)) = resize {
@@ -6636,7 +10024,7 @@ fn arrangement_body(
     if let Some((t, at)) = create_req.or(menu_create.get())
         && arr.create_clip(t, at, beats_per_bar as f32).is_some()
     {
-        arr.selected = Some(t);
+        arr.select_track(t);
     }
 
     // The scrub strip: the ruler's empty stretches jump the transport to
@@ -6654,7 +10042,7 @@ fn arrangement_body(
     }
     loop_brace(ui, theme, focus, ruler, content, arr, grid);
     locators_pass(ui, theme, ruler, content, arr, grid);
-    clips_pass(
+    let clips = clips_pass(
         ui,
         theme,
         content,
@@ -6684,12 +10072,20 @@ fn arrangement_body(
 
     // The headers last of the lane furniture, so their fills and controls
     // sit above the grid lines that run under the column's edge.
-    track_headers(ui, theme, arr, column, &lanes);
+    track_headers(ui, theme, arr, column, &lanes, meters);
+    master_header(ui, theme, arr, master_row, timeline_left, master_meter);
 
     // --- the playhead, above everything it passes over ---------------------
     let x = x_at(content, offset, arr.pixels_per_beat, playhead);
     if x >= content.left() && x <= content.right() {
         let painter = ui.painter();
+        painter.line_segment(
+            [
+                egui::pos2(x + 1.0, content.top()),
+                egui::pos2(x + 1.0, content.bottom()),
+            ],
+            egui::Stroke::new(stroke::BOLD, theme.bg.gamma_multiply(0.65)),
+        );
         painter.line_segment(
             [
                 egui::pos2(x, content.top()),
@@ -6712,6 +10108,8 @@ fn arrangement_body(
     ArrangementOutcome {
         panned,
         automation_hovered,
+        open_clip_editor: clips.open_editor,
+        clip_fade: clips.fade,
     }
 }
 
@@ -6725,6 +10123,10 @@ const SESSION_COL_MIN: f32 = 78.0;
 const SESSION_COL_MAX: f32 = 170.0;
 /// The scene column down the right: launch buttons and row names.
 const SCENE_COL_W: f32 = 128.0;
+/// The master strip's column, pinned between the lanes and the scenes.
+/// Narrower than a lane on purpose: it holds one fader and one meter, and
+/// the space it takes is space the song does not get.
+const MASTER_COL_W: f32 = 92.0;
 /// The column header, showing the track's name.
 const SESSION_HEAD_H: f32 = 22.0;
 /// The mixer strip under each column: mute and solo, a pan knob, and the
@@ -6777,7 +10179,7 @@ impl SessionLayout {
         scroll_y: f32,
         mixer_h: f32,
     ) -> Self {
-        let lanes_w = (area.width() - SCENE_COL_W).max(0.0);
+        let lanes_w = (area.width() - SCENE_COL_W - MASTER_COL_W).max(0.0);
         // Columns spread to fill the space they have, but never below a
         // width a clip name can live in: past that they keep their size and
         // the grid scrolls instead.
@@ -6813,10 +10215,7 @@ impl SessionLayout {
     fn rows_viewport(&self) -> egui::Rect {
         egui::Rect::from_min_max(
             egui::pos2(self.area.left(), self.rows_top),
-            egui::pos2(
-                self.area.right() - SCENE_COL_W,
-                self.mixer_top().max(self.rows_top),
-            ),
+            egui::pos2(self.lanes_right(), self.mixer_top().max(self.rows_top)),
         )
     }
 
@@ -6829,10 +10228,7 @@ impl SessionLayout {
     fn mixer_seam(&self) -> egui::Rect {
         egui::Rect::from_min_max(
             egui::pos2(self.area.left(), self.mixer_top() - MIXER_SEAM_H * 0.5),
-            egui::pos2(
-                self.area.right() - SCENE_COL_W,
-                self.mixer_top() + MIXER_SEAM_H * 0.5,
-            ),
+            egui::pos2(self.lanes_right(), self.mixer_top() + MIXER_SEAM_H * 0.5),
         )
     }
 
@@ -6849,7 +10245,7 @@ impl SessionLayout {
     fn viewport(&self) -> egui::Rect {
         egui::Rect::from_min_max(
             self.area.min,
-            egui::pos2(self.area.right() - SCENE_COL_W, self.area.bottom()),
+            egui::pos2(self.lanes_right(), self.area.bottom()),
         )
     }
 
@@ -6946,6 +10342,41 @@ impl SessionLayout {
             egui::pos2(bar.left() + at, bar.top()),
             egui::vec2(width, bar.height()),
         ))
+    }
+
+    /// Where the scrolling lanes stop: the master column's left edge.
+    fn lanes_right(&self) -> f32 {
+        self.master_column().left()
+    }
+
+    /// The master's column, pinned beside the scenes. It does not scroll —
+    /// the one strip you must always be able to reach is the one every
+    /// other strip lands on.
+    fn master_column(&self) -> egui::Rect {
+        let right = self.area.right() - SCENE_COL_W;
+        egui::Rect::from_min_max(
+            egui::pos2(
+                (right - MASTER_COL_W).max(self.area.left()),
+                self.area.top(),
+            ),
+            egui::pos2(right, self.area.bottom()),
+        )
+    }
+
+    fn master_head(&self) -> egui::Rect {
+        let column = self.master_column();
+        egui::Rect::from_min_max(
+            column.min,
+            egui::pos2(column.right(), self.area.top() + SESSION_HEAD_H),
+        )
+    }
+
+    fn master_mixer(&self) -> egui::Rect {
+        let column = self.master_column();
+        egui::Rect::from_min_max(
+            egui::pos2(column.left(), self.mixer_top()),
+            egui::pos2(column.right(), self.area.bottom() - SESSION_BAR_H),
+        )
     }
 
     fn scene_column(&self) -> egui::Rect {
@@ -7392,9 +10823,10 @@ fn session_body(
             // should answer a click either.
             continue;
         }
-        if column.left() >= layout.scene_column().left() {
-            // Past the scene column: the rest is reachable by scrolling.
-            // Drawing it here would draw it UNDER the scene buttons.
+        if column.left() >= layout.lanes_right() {
+            // Past the pinned columns: the rest is reachable by scrolling.
+            // Drawing it here would draw it UNDER the master and the
+            // scene buttons.
             break;
         }
         let head = layout.head(t);
@@ -7674,7 +11106,7 @@ fn session_body(
         let btn = |n: f32| {
             egui::Rect::from_min_size(
                 egui::pos2(
-                    mixer.left() + CLIP_LABEL_PAD + n * (HEADER_BTN + 3.0),
+                    mixer.left() + CLIP_LABEL_PAD + n * (HEADER_BTN + HEADER_CONTROL_GAP),
                     btn_y,
                 ),
                 egui::vec2(HEADER_BTN, HEADER_BTN),
@@ -7689,7 +11121,9 @@ fn session_body(
             "M",
             track.mute,
             theme.warn,
-        ) {
+        )
+        .clicked()
+        {
             mute = Some(t);
         }
         if header_toggle(
@@ -7700,7 +11134,9 @@ fn session_body(
             "S",
             track.solo,
             theme.accent,
-        ) {
+        )
+        .clicked()
+        {
             solo = Some(t);
         }
         let mut pan = track.pan;
@@ -7711,8 +11147,11 @@ fn session_body(
             ),
             egui::vec2(HEADER_KNOB, HEADER_KNOB),
         );
-        if knob.left() > solo_hit.right() && pan_knob(ui, theme, knob, &mut pan) {
-            pan_edit = Some((t, pan));
+        if knob.left() > solo_hit.right() {
+            let pan_outcome = pan_knob(ui, theme, knob, &mut pan);
+            if pan_outcome.changed {
+                pan_edit = Some((t, pan));
+            }
         }
 
         // --- the channel assembly, centred ---------------------------------
@@ -8205,15 +11644,15 @@ fn session_body(
             // the press, not after the clip-edit debounce.
             arr.force_recompile |= arr.session.launch_at(t, s, launch_at);
             arr.session.selected = Some((t, s));
-            arr.selected = Some(t);
+            arr.select_track(t);
         }
         Some(SessionIntent::Select(t, s)) => {
             arr.session.selected = Some((t, s));
-            arr.selected = Some(t);
+            arr.select_track(t);
         }
         Some(SessionIntent::Create(t, s)) => {
             arr.create_slot_clip(t, s, beats_per_bar as f32);
-            arr.selected = Some(t);
+            arr.select_track(t);
         }
         Some(SessionIntent::Clear(t, s)) => {
             // Clearing a playing slot stops it, which the engine must hear
@@ -8242,7 +11681,7 @@ fn session_body(
             arr.force_recompile |= arr.session.stop_all();
         }
         Some(SessionIntent::AddScene) => arr.add_scene(),
-        Some(SessionIntent::SelectTrack(t)) => arr.selected = Some(t),
+        Some(SessionIntent::SelectTrack(t)) => arr.select_track(t),
         Some(SessionIntent::SelectScene(s)) => arr.session.selected_scene = Some(s),
         Some(SessionIntent::RenameTrack(t)) => {
             if let Some(track) = arr.tracks.get(t) {
@@ -8525,7 +11964,7 @@ fn drop_preview(
 
     let offset = arr.view_beats;
     let ppb = arr.pixels_per_beat;
-    let lanes = lane_rects(content, &arr.tracks);
+    let lanes = lane_rects(content, &arr.tracks, arr.view_tracks_y);
     let below = lanes.last().map_or(content.top(), egui::Rect::bottom);
     let hovered = lanes
         .iter()
@@ -8573,12 +12012,31 @@ fn drop_preview(
             source_frames,
             gain: 1.0,
             looped: false,
+            file_frames: source_frames,
+            reversed: false,
+            fade_in: 0,
+            fade_out: 0,
+            fade_in_curve: 0.0,
+            fade_out_curve: 0.0,
+            envelope: Vec::new(),
         }),
+        loop_on: false,
+        loop_start: 0.0,
+        loop_len: 0.0,
     };
 
     let painter = ui.painter();
     let visible_lane = lane.intersect(content);
-    painter.rect_filled(visible_lane, 0.0, theme.accent_muted.gamma_multiply(0.25));
+    painter.rect_filled(
+        visible_lane,
+        0.0,
+        egui::Color32::from_rgba_unmultiplied(
+            theme.accent.r(),
+            theme.accent.g(),
+            theme.accent.b(),
+            28,
+        ),
+    );
     if track.is_none() && visible_lane.height() > 0.0 {
         painter.rect_stroke(
             visible_lane,
@@ -8600,9 +12058,15 @@ fn drop_preview(
         }
     }
 
-    let full_r = clip_rect(content, offset, ppb, lane, &ghost);
-    let r = full_r.intersect(content);
-    painter.rect_filled(r, 0.0, theme.clip_body.gamma_multiply(0.55));
+    let musical_r = clip_rect(content, offset, ppb, lane, &ghost);
+    let visual = clip_canvas_rects(musical_r);
+    let r = visual.outer.intersect(content);
+    painter.rect_filled(r, 0.0, theme.clip_audio.gamma_multiply(0.72));
+    painter.rect_filled(
+        visual.title.intersect(content),
+        0.0,
+        theme.clip_audio_header.gamma_multiply(0.82),
+    );
     if ghost.audio.is_some()
         && let Some(peaks) = waveform_cache.get(&drag.path)
     {
@@ -8610,7 +12074,7 @@ fn drop_preview(
             ui,
             theme,
             waveform::ClipThumbnail {
-                full_clip: full_r,
+                full_clip: visual.outer,
                 visible_clip: r,
                 clip: &ghost,
                 peaks,
@@ -8623,7 +12087,7 @@ fn drop_preview(
     painter.rect_stroke(
         r,
         0.0,
-        egui::Stroke::new(1.0, theme.clip_selected),
+        egui::Stroke::new(stroke::BOLD, theme.clip_selected),
         egui::StrokeKind::Middle,
     );
     // The landing line: the full lane height at the landing beat, so the
@@ -8639,11 +12103,12 @@ fn drop_preview(
         );
     }
     if r.width() >= CLIP_LABEL_MIN_W {
-        painter.with_clip_rect(r).text(
-            egui::pos2(r.left() + CLIP_LABEL_PAD, r.top() + CLIP_LABEL_PAD),
-            egui::Align2::LEFT_TOP,
+        let title = visual.title.intersect(content);
+        painter.with_clip_rect(title).text(
+            egui::pos2(title.left() + CLIP_LABEL_PAD, title.center().y),
+            egui::Align2::LEFT_CENTER,
             &ghost.name,
-            egui::FontId::new(11.0, egui::FontFamily::Proportional),
+            egui::FontId::new(font::LABEL, egui::FontFamily::Proportional),
             theme.text,
         );
     }
@@ -8651,6 +12116,18 @@ fn drop_preview(
         Some(track) => DropSpot::Timeline { track, beat: at },
         None => DropSpot::NewTrack { beat: at },
     })
+}
+
+/// What the clip pass hands back to the app.
+#[derive(Default)]
+struct ClipsOutcome {
+    /// A clip body was double-clicked; the lower region should show its
+    /// editor.
+    open_editor: bool,
+    /// A fade handle was dragged. Carried out rather than written here,
+    /// because a fade rides a LETTER to the clip's node — and letters are
+    /// the app's to send, the same as the editor's own fade drag.
+    fade: Option<(u64, waveform::ClipEdit)>,
 }
 
 /// What the clip context menu asked for.
@@ -8681,10 +12158,10 @@ fn clips_pass(
     bpm: f64,
     waveform_cache: &HashMap<PathBuf, Arc<waveform::Peaks>>,
     automation_mode: bool,
-) {
+) -> ClipsOutcome {
     let offset = arr.view_beats;
     let pixels_per_beat = arr.pixels_per_beat;
-    let lanes = lane_rects(content, &arr.tracks);
+    let lanes = lane_rects(content, &arr.tracks, arr.view_tracks_y);
     // The rename and the ghost ride out of `arr` for the draw — both are
     // frame-to-frame state the pass either finishes or hands back.
     let mut rename = arr.rename.take();
@@ -8701,6 +12178,8 @@ fn clips_pass(
     let menu: std::cell::Cell<Option<(usize, u64, ClipMenu)>> = std::cell::Cell::new(None);
     let mut rename_commit = false;
     let mut rename_cancel = false;
+    let mut open_editor = false;
+    let mut fade: Option<(u64, waveform::ClipEdit)> = None;
 
     for (t, track) in arr.clips.iter().enumerate() {
         let Some(full_lane) = lanes.get(t) else {
@@ -8715,8 +12194,9 @@ fn clips_pass(
             *full_lane
         };
         for (i, clip) in track.iter().enumerate() {
-            let full_rect = clip_rect(content, offset, pixels_per_beat, lane, clip);
-            let rect = full_rect.intersect(content);
+            let musical_rect = clip_rect(content, offset, pixels_per_beat, lane, clip);
+            let visual = clip_canvas_rects(musical_rect);
+            let rect = visual.outer.intersect(content);
             if rect.width() <= 0.0 {
                 continue;
             }
@@ -8750,13 +12230,7 @@ fn clips_pass(
             }
             if body.double_clicked() {
                 select = Some((t, clip.id));
-                rename = Some(Rename {
-                    track: t,
-                    id: clip.id,
-                    text: clip.name.clone(),
-                    original: clip.name.clone(),
-                    focused: false,
-                });
+                open_editor = true;
             }
             if body.dragged()
                 && let Some(g) = &mut ghost
@@ -8839,6 +12313,57 @@ fn clips_pass(
                         }
                     }
                 }
+
+                // The FADE handles, on audio clips only and AFTER the trim
+                // strips so they win the pointer where the two meet — a
+                // fade at zero sits exactly on the clip's edge, and the
+                // top corner is the half of that edge Ableton gives to
+                // fading rather than to trimming.
+                if let Some(audio) = &clip.audio
+                    && let Some(span) = waveform::fade_span_beats(clip, audio, bpm)
+                {
+                    for leading in [true, false] {
+                        let at = if leading {
+                            clip.start + span * audio.fade_in as f32
+                        } else {
+                            clip.start + clip.len - span * audio.fade_out as f32
+                        };
+                        let x = x_at(content, offset, pixels_per_beat, at);
+                        if x < content.left() || x > content.right() {
+                            continue;
+                        }
+                        let grip = egui::Rect::from_center_size(
+                            egui::pos2(x, visual.title.center().y),
+                            egui::vec2(CLIP_FADE_GRIP, visual.title.height()),
+                        );
+                        let wid = ui.id().with(("clip_fade", clip.id, leading));
+                        let resp = ui.interact(grip, wid, egui::Sense::drag());
+                        if resp.hovered() || resp.dragged() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                        }
+                        if resp.dragged()
+                            && let Some(pos) = resp.interact_pointer_pos()
+                        {
+                            let beat = beat_at(content, offset, pixels_per_beat, pos.x);
+                            let from_edge = if leading {
+                                beat - clip.start
+                            } else {
+                                clip.start + clip.len - beat
+                            };
+                            let frames = (from_edge.max(0.0) / span).round().max(0.0) as u64;
+                            let frames = frames.min((clip.len / span).round().max(0.0) as u64);
+                            fade = Some((
+                                clip.id,
+                                if leading {
+                                    waveform::ClipEdit::FadeIn(frames)
+                                } else {
+                                    waveform::ClipEdit::FadeOut(frames)
+                                },
+                            ));
+                            select = Some((t, clip.id));
+                        }
+                    }
+                }
             }
 
             // --- paint ---------------------------------------------------
@@ -8848,15 +12373,28 @@ fn clips_pass(
                 .as_ref()
                 .is_some_and(|g| !g.copy && g.clip.id == clip.id);
             let painter = ui.painter();
-            painter.rect_filled(
-                rect,
-                0.0,
-                if lifted {
-                    theme.clip_body.gamma_multiply(0.35)
-                } else {
-                    theme.clip_body
-                },
-            );
+            let audible = track_audible(&arr.tracks, t);
+            let (body_colour, title_colour, type_name) = if clip.audio.is_some() {
+                (theme.clip_audio, theme.clip_audio_header, "AUDIO")
+            } else {
+                (theme.clip_midi, theme.clip_midi_header, "MIDI")
+            };
+            let strength = if lifted {
+                0.35
+            } else if audible {
+                1.0
+            } else {
+                0.5
+            };
+            painter.rect_filled(rect, 0.0, body_colour.gamma_multiply(strength));
+            let title_visible = visual.title.intersect(content);
+            painter.rect_filled(title_visible, 0.0, title_colour.gamma_multiply(strength));
+            if title_visible.height() > 2.0 {
+                painter.line_segment(
+                    [title_visible.left_bottom(), title_visible.right_bottom()],
+                    egui::Stroke::new(stroke::HAIR, theme.divider.gamma_multiply(strength)),
+                );
+            }
             if let Some(audio) = &clip.audio
                 && let Some(peaks) = waveform_cache.get(&audio.path)
             {
@@ -8864,7 +12402,7 @@ fn clips_pass(
                     ui,
                     theme,
                     waveform::ClipThumbnail {
-                        full_clip: full_rect,
+                        full_clip: visual.outer,
                         visible_clip: rect,
                         clip,
                         peaks,
@@ -8873,44 +12411,140 @@ fn clips_pass(
                             0.25
                         } else if selected {
                             0.95
+                        } else if !audible {
+                            0.35
                         } else {
                             0.72
                         },
                     },
                 );
             }
-            if selected {
+            if selected || body.hovered() {
                 painter.rect_stroke(
                     rect,
                     0.0,
-                    egui::Stroke::new(1.5, theme.clip_selected),
+                    egui::Stroke::new(
+                        if selected {
+                            stroke::FOCUS
+                        } else {
+                            stroke::HAIR
+                        },
+                        if selected {
+                            theme.clip_selected
+                        } else {
+                            theme.clip_hover
+                        },
+                    ),
                     egui::StrokeKind::Middle,
                 );
-                // The edge strips, made visible only now they mean something.
-                painter.line_segment(
-                    [rect.left_top(), rect.left_bottom()],
-                    egui::Stroke::new(1.5, theme.clip_selected),
+            }
+            if selected {
+                // The invisible edge strips get small physical grips once
+                // selected, so resize is discoverable without permanent
+                // handles cluttering every clip.
+                painter.rect_filled(
+                    visual.left_grip.intersect(content),
+                    0.0,
+                    theme.clip_selected,
                 );
-                painter.line_segment(
-                    [rect.right_top(), rect.right_bottom()],
-                    egui::Stroke::new(1.5, theme.clip_selected),
+                painter.rect_filled(
+                    visual.right_grip.intersect(content),
+                    0.0,
+                    theme.clip_selected,
                 );
+            }
+
+            if let Some(audio) = &clip.audio
+                && let Some(span) = waveform::fade_span_beats(clip, audio, bpm)
+                && (audio.fade_in > 0 || audio.fade_out > 0)
+            {
+                let body = visual.outer.intersect(content);
+                let ink = theme.clip_selected.gamma_multiply(0.9);
+                if audio.fade_in > 0 {
+                    let to = x_at(
+                        content,
+                        offset,
+                        pixels_per_beat,
+                        clip.start + span * audio.fade_in as f32,
+                    );
+                    painter.line_segment(
+                        [
+                            egui::pos2(body.left(), body.bottom()),
+                            egui::pos2(to.min(body.right()), body.top()),
+                        ],
+                        egui::Stroke::new(stroke::HAIR, ink),
+                    );
+                }
+                if audio.fade_out > 0 {
+                    let from = x_at(
+                        content,
+                        offset,
+                        pixels_per_beat,
+                        clip.start + clip.len - span * audio.fade_out as f32,
+                    );
+                    painter.line_segment(
+                        [
+                            egui::pos2(from.max(body.left()), body.top()),
+                            egui::pos2(body.right(), body.bottom()),
+                        ],
+                        egui::Stroke::new(stroke::HAIR, ink),
+                    );
+                }
             }
 
             if !clip.notes.is_empty() {
                 let pitch_lo = clip.notes.iter().map(|n| n.pitch).min().unwrap_or(0);
                 let pitch_hi = clip.notes.iter().map(|n| n.pitch).max().unwrap_or(0);
-                for note in &clip.notes {
-                    let r = note_rect(rect, note, pitch_lo, pitch_hi, clip.len).intersect(rect);
-                    painter.rect_filled(r, 0.0, theme.clip_note);
+                // The notes AS THEY SOUND, brace and all — the same
+                // unroll the engine compiles. Drawing the stored notes
+                // instead showed a looping clip playing its pattern once
+                // and then apparently nothing, which is a picture of a
+                // different clip from the one you can hear.
+                //
+                // Borrowed where the clip does not loop, so the common
+                // case still costs no allocation.
+                let sounding: std::borrow::Cow<'_, [Note]> = if clip.loop_on {
+                    std::borrow::Cow::Owned(clip_notes(clip, clip.len))
+                } else {
+                    std::borrow::Cow::Borrowed(&clip.notes)
+                };
+                for note in sounding.iter() {
+                    // Map time against the WHOLE clip, then crop it to the
+                    // visible fragment. Mapping against `rect` would
+                    // stretch every note across whatever remained after
+                    // follow/panning moved part of the clip off screen.
+                    let r = note_rect(visual.content, note, pitch_lo, pitch_hi, clip.len)
+                        .intersect(rect);
+                    if r.width() > 0.0 && r.height() > 0.0 {
+                        let colour =
+                            theme
+                                .clip_note
+                                .gamma_multiply(if audible { 0.9 } else { 0.4 });
+                        if note.muted {
+                            painter.rect_stroke(
+                                r,
+                                0.0,
+                                egui::Stroke::new(stroke::HAIR, colour.gamma_multiply(0.55)),
+                                egui::StrokeKind::Inside,
+                            );
+                        } else {
+                            painter.rect_filled(r, 0.0, colour);
+                        }
+                    }
                 }
             }
 
             if let Some(r) = rename.as_mut().filter(|r| r.track == t && r.id == clip.id) {
                 // The name label becomes the edit box, in place.
                 let edit = egui::Rect::from_min_size(
-                    egui::pos2(rect.left() + CLIP_LABEL_PAD, rect.top() + CLIP_LABEL_PAD),
-                    egui::vec2((rect.width() - 2.0 * CLIP_LABEL_PAD).max(80.0), 20.0),
+                    egui::pos2(
+                        title_visible.left() + CLIP_LABEL_PAD,
+                        title_visible.top() + 1.0,
+                    ),
+                    egui::vec2(
+                        (title_visible.width() - 2.0 * CLIP_LABEL_PAD).max(20.0),
+                        (title_visible.height() - 2.0).max(1.0),
+                    ),
                 );
                 let resp = ui.put(edit, egui::TextEdit::singleline(&mut r.text));
                 if !r.focused {
@@ -8922,17 +12556,48 @@ fn clips_pass(
                 } else if ui.input(|i| i.key_pressed(egui::Key::Enter)) || resp.lost_focus() {
                     rename_commit = true;
                 }
-            } else if rect.width() >= CLIP_LABEL_MIN_W {
+            } else if title_visible.width() >= CLIP_LABEL_MIN_W {
                 // Clipped to the clip: a name longer than the box it names
                 // is cut off at the edge rather than running across its
                 // neighbours.
-                painter.with_clip_rect(rect).text(
-                    egui::pos2(rect.left() + CLIP_LABEL_PAD, rect.top() + CLIP_LABEL_PAD),
-                    egui::Align2::LEFT_TOP,
-                    &clip.name,
-                    egui::FontId::new(11.0, egui::FontFamily::Proportional),
-                    theme.text,
+                let metadata_w = if visual.outer.width() >= CLIP_TYPE_MIN_W {
+                    36.0
+                } else {
+                    0.0
+                };
+                let name_room = egui::Rect::from_min_max(
+                    title_visible.min,
+                    egui::pos2(
+                        (title_visible.right() - metadata_w).max(title_visible.left()),
+                        title_visible.bottom(),
+                    ),
                 );
+                painter.with_clip_rect(name_room).text(
+                    egui::pos2(
+                        title_visible.left() + CLIP_LABEL_PAD,
+                        title_visible.center().y,
+                    ),
+                    egui::Align2::LEFT_CENTER,
+                    &clip.name,
+                    egui::FontId::new(font::LABEL, egui::FontFamily::Proportional),
+                    if audible {
+                        theme.text
+                    } else {
+                        theme.text_muted
+                    },
+                );
+                if metadata_w > 0.0 {
+                    painter.with_clip_rect(title_visible).text(
+                        egui::pos2(
+                            title_visible.right() - CLIP_LABEL_PAD,
+                            title_visible.center().y,
+                        ),
+                        egui::Align2::RIGHT_CENTER,
+                        type_name,
+                        egui::FontId::new(font::MICRO_LABEL, egui::FontFamily::Monospace),
+                        theme.text_muted,
+                    );
+                }
             }
         }
     }
@@ -8941,6 +12606,45 @@ fn clips_pass(
     // original stays exactly where it was.
     if ghost.is_some() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
         ghost = None;
+    }
+
+    // An incompatible lane is marked where the pointer actually is. The
+    // ghost deliberately remains on its last valid lane, while this local
+    // refusal explains why it did not follow.
+    if let Some(g) = &ghost
+        && let Some(pos) = ui.ctx().pointer_latest_pos()
+        && let Some((target, lane)) = lanes
+            .iter()
+            .enumerate()
+            .find(|(_, lane)| (lane.top()..lane.bottom()).contains(&pos.y))
+        && !lane_accepts(&arr.tracks[target], &g.clip)
+    {
+        let visible = lane.intersect(content);
+        ui.painter().rect_filled(
+            visible,
+            0.0,
+            egui::Color32::from_rgba_unmultiplied(
+                theme.danger.r(),
+                theme.danger.g(),
+                theme.danger.b(),
+                if theme.light { 24 } else { 34 },
+            ),
+        );
+        ui.painter().line_segment(
+            [visible.left_top(), visible.right_top()],
+            egui::Stroke::new(stroke::BOLD, theme.danger),
+        );
+        ui.painter().text(
+            pos + egui::vec2(space::SM, -space::SM),
+            egui::Align2::LEFT_BOTTOM,
+            if g.clip.audio.is_some() {
+                "AUDIO TRACK ONLY"
+            } else {
+                "MIDI TRACK ONLY"
+            },
+            egui::FontId::new(font::MICRO_LABEL, egui::FontFamily::Monospace),
+            theme.danger,
+        );
     }
 
     // --- the ghost, drawn above everything it might land on ---------------
@@ -8957,12 +12661,28 @@ fn clips_pass(
         ui.painter().rect_filled(
             lane.intersect(content),
             0.0,
-            theme.accent_muted.gamma_multiply(0.25),
+            egui::Color32::from_rgba_unmultiplied(
+                theme.accent.r(),
+                theme.accent.g(),
+                theme.accent.b(),
+                24,
+            ),
         );
-        let full_r = clip_rect(content, offset, pixels_per_beat, lane, &g.clip);
-        let r = full_r.intersect(content);
+        let musical_r = clip_rect(content, offset, pixels_per_beat, lane, &g.clip);
+        let visual = clip_canvas_rects(musical_r);
+        let r = visual.outer.intersect(content);
+        let (body_colour, title_colour) = if g.clip.audio.is_some() {
+            (theme.clip_audio, theme.clip_audio_header)
+        } else {
+            (theme.clip_midi, theme.clip_midi_header)
+        };
         let painter = ui.painter();
-        painter.rect_filled(r, 0.0, theme.clip_body.gamma_multiply(0.55));
+        painter.rect_filled(r, 0.0, body_colour.gamma_multiply(0.7));
+        painter.rect_filled(
+            visual.title.intersect(content),
+            0.0,
+            title_colour.gamma_multiply(0.8),
+        );
         if let Some(audio) = &g.clip.audio
             && let Some(peaks) = waveform_cache.get(&audio.path)
         {
@@ -8970,7 +12690,7 @@ fn clips_pass(
                 ui,
                 theme,
                 waveform::ClipThumbnail {
-                    full_clip: full_r,
+                    full_clip: visual.outer,
                     visible_clip: r,
                     clip: &g.clip,
                     peaks,
@@ -8982,16 +12702,29 @@ fn clips_pass(
         painter.rect_stroke(
             r,
             0.0,
-            egui::Stroke::new(1.0, theme.clip_selected),
+            egui::Stroke::new(stroke::BOLD, theme.clip_selected),
             egui::StrokeKind::Middle,
         );
+        // A full-height snap guide ties the floating object to its exact
+        // landing beat before release.
+        let landing_x = x_at(content, offset, pixels_per_beat, g.clip.start);
+        if content.left() <= landing_x && landing_x <= content.right() {
+            painter.line_segment(
+                [
+                    egui::pos2(landing_x, lane.top().max(content.top())),
+                    egui::pos2(landing_x, lane.bottom().min(content.bottom())),
+                ],
+                egui::Stroke::new(stroke::FOCUS, theme.accent),
+            );
+        }
         if r.width() >= CLIP_LABEL_MIN_W {
-            painter.with_clip_rect(r).text(
-                egui::pos2(r.left() + CLIP_LABEL_PAD, r.top() + CLIP_LABEL_PAD),
-                egui::Align2::LEFT_TOP,
+            let title = visual.title.intersect(content);
+            painter.with_clip_rect(title).text(
+                egui::pos2(title.left() + CLIP_LABEL_PAD, title.center().y),
+                egui::Align2::LEFT_CENTER,
                 &g.clip.name,
-                egui::FontId::new(11.0, egui::FontFamily::Proportional),
-                theme.text_muted,
+                egui::FontId::new(font::LABEL, egui::FontFamily::Proportional),
+                theme.text,
             );
         }
     }
@@ -9106,6 +12839,7 @@ fn clips_pass(
     }
 
     arr.ghost = ghost;
+    ClipsOutcome { open_editor, fade }
 }
 
 /// The locators: flags in the ruler. Click a flag to jump the playhead to
@@ -9413,10 +13147,11 @@ struct Browser {
 
 impl Default for Browser {
     fn default() -> Self {
-        // No built-in device folders: the Sine Synth and Reverb rows were
-        // mockups standing in for a library, and the library is what fills
-        // this now. The tree renders whatever it is given, so an empty
-        // browser is a browser waiting on the catalog, not a broken one.
+        // The built-in devices, which are NOT mockups any more: every row
+        // here is a real node with a real parameter table behind it, and
+        // dragging one in is how a track gets an instrument. The sample
+        // library fills the lower band; this band is what the app itself
+        // ships with, so it is built in rather than scanned.
         Self {
             split: BROWSER_LOWER_FRAC,
             query: String::new(),
@@ -9427,7 +13162,88 @@ impl Default for Browser {
             catalog_scroll: 0.0,
             user_library_path: String::new(),
             sample_folder_path: String::new(),
-            folders: Vec::new(),
+            folders: vec![
+                Folder {
+                    name: "Instruments",
+                    items: &[
+                        BrowserItem {
+                            name: "Poly Synth",
+                            load: DeviceKind::Poly,
+                        },
+                        BrowserItem {
+                            name: "Sampler",
+                            load: DeviceKind::Sampler,
+                        },
+                        BrowserItem {
+                            name: "Kick",
+                            load: DeviceKind::Kick,
+                        },
+                        BrowserItem {
+                            name: "Snare",
+                            load: DeviceKind::Snare,
+                        },
+                        BrowserItem {
+                            name: "Tom",
+                            load: DeviceKind::Tom,
+                        },
+                        BrowserItem {
+                            name: "808 Hat",
+                            load: DeviceKind::Hat,
+                        },
+                        BrowserItem {
+                            name: "Clap",
+                            load: DeviceKind::Handclap,
+                        },
+                        BrowserItem {
+                            name: "Sine Synth",
+                            load: DeviceKind::SineSynth,
+                        },
+                    ],
+                    open: true,
+                },
+                Folder {
+                    name: "Audio Effects",
+                    items: &[
+                        BrowserItem {
+                            name: "Reverb",
+                            load: DeviceKind::Reverb,
+                        },
+                        BrowserItem {
+                            name: "Saturator",
+                            load: DeviceKind::Sat,
+                        },
+                        BrowserItem {
+                            name: "Delay",
+                            load: DeviceKind::Echo,
+                        },
+                        BrowserItem {
+                            name: "EQ",
+                            load: DeviceKind::Eq,
+                        },
+                        BrowserItem {
+                            name: "Filter",
+                            load: DeviceKind::Filter,
+                        },
+                        BrowserItem {
+                            name: "Glue",
+                            load: DeviceKind::Glue,
+                        },
+                        BrowserItem {
+                            name: "Limiter",
+                            load: DeviceKind::Limiter,
+                        },
+                        BrowserItem {
+                            name: "Modulato",
+                            load: DeviceKind::Modulato,
+                        },
+                        BrowserItem {
+                            name: "Utility",
+                            load: DeviceKind::Utility,
+                        },
+                    ],
+                    open: true,
+                },
+            ],
         }
     }
 }
@@ -9556,7 +13372,7 @@ fn tree(
             }
         }
 
-        ui.painter().text(
+        ui.painter().with_clip_rect(row).text(
             egui::pos2(row.left() + TREE_PAD_X, row.center().y),
             egui::Align2::LEFT_CENTER,
             text,
@@ -9575,6 +13391,15 @@ fn tree(
     load
 }
 
+/// The sample catalog scrolls in the space left below the fixed device tree.
+/// Keeping this boundary explicit prevents a scrolled sample row from being
+/// painted over Instruments or Audio Effects.
+fn catalog_viewport(upper: egui::Rect, device_rows: usize) -> egui::Rect {
+    let top = (upper.top() + SEARCH_H + TREE_TOP_GAP + device_rows as f32 * TREE_ROW_H)
+        .min(upper.bottom());
+    egui::Rect::from_min_max(egui::pos2(upper.left(), top), upper.right_bottom())
+}
+
 /// Draw the configured catalog beneath the built-in device tree. The catalog
 /// is already an immutable snapshot: this function does no filesystem work.
 fn catalog_tree(
@@ -9587,8 +13412,9 @@ fn catalog_tree(
 ) -> Option<BrowserEvent> {
     let font = egui::FontId::new(TREE_TYPE, egui::FontFamily::Monospace);
     let device_rows = tree_rows(&browser.folders).len();
-    let mut row_index = device_rows;
-    let content_top = upper.top() + SEARCH_H + TREE_TOP_GAP;
+    let viewport = catalog_viewport(upper, device_rows);
+    let mut row_index = 0;
+    let content_top = viewport.top();
     let results = library::query_at(
         snapshot,
         browser.location.as_deref(),
@@ -9654,8 +13480,8 @@ fn catalog_tree(
     } else {
         0
     };
-    let total_rows = device_rows + 1 + location_rows + visible_folders.len() + results.len().max(1);
-    let viewport_height = (upper.bottom() - content_top).max(0.0);
+    let total_rows = 1 + location_rows + visible_folders.len() + results.len().max(1);
+    let viewport_height = viewport.height();
     let max_scroll = (total_rows as f32 * TREE_ROW_H - viewport_height).max(0.0);
     if ui.rect_contains_pointer(upper) {
         let scroll = ui.input(|input| input.smooth_scroll_delta.y);
@@ -9669,20 +13495,21 @@ fn catalog_tree(
     let mut draw_location = |label: String, id: Option<&str>, open: bool| {
         let y = top + row_index as f32 * TREE_ROW_H;
         row_index += 1;
-        if y + TREE_ROW_H <= content_top || y + TREE_ROW_H > upper.bottom() {
+        if y + TREE_ROW_H <= content_top || y + TREE_ROW_H > viewport.bottom() {
             return;
         }
         let row = egui::Rect::from_min_size(
             egui::pos2(upper.left(), y),
             egui::vec2(upper.width(), TREE_ROW_H),
         );
+        let visible = row.intersect(viewport);
         let wid = ui.id().with(("catalog_location", id));
-        focus.register(wid, row);
+        focus.register(wid, visible);
         let active = browser.location.as_deref() == id;
-        let response = ui.interact(row, wid, egui::Sense::click());
+        let response = ui.interact(visible, wid, egui::Sense::click());
         if response.hovered() || active {
             ui.painter().rect_filled(
-                row,
+                visible,
                 0.0,
                 if active {
                     theme.accent_muted
@@ -9709,7 +13536,7 @@ fn catalog_tree(
             browser.folder = None;
         }
         let arrow = if open { "\u{25be}" } else { "\u{25b8}" };
-        ui.painter().text(
+        ui.painter().with_clip_rect(visible).text(
             egui::pos2(row.left() + TREE_PAD_X, row.center().y),
             egui::Align2::LEFT_CENTER,
             format!("{arrow} {label}"),
@@ -9735,23 +13562,24 @@ fn catalog_tree(
         if y + TREE_ROW_H <= content_top {
             continue;
         }
-        if y + TREE_ROW_H > upper.bottom() {
+        if y + TREE_ROW_H > viewport.bottom() {
             break;
         }
         let row = egui::Rect::from_min_size(
             egui::pos2(upper.left(), y),
             egui::vec2(upper.width(), TREE_ROW_H),
         );
+        let visible = row.intersect(viewport);
         let wid = ui
             .id()
             .with(("catalog_folder", &folder.location_id, &folder.relative_path));
-        focus.register(wid, row);
+        focus.register(wid, visible);
         let active = browser.location.as_deref() == Some(&folder.location_id)
             && browser.folder.as_deref() == Some(folder.relative_path.as_path());
-        let response = ui.interact(row, wid, egui::Sense::click());
+        let response = ui.interact(visible, wid, egui::Sense::click());
         if response.hovered() || active {
             ui.painter().rect_filled(
-                row,
+                visible,
                 0.0,
                 if active {
                     theme.accent_muted
@@ -9781,7 +13609,7 @@ fn catalog_tree(
         } else {
             "\u{25b8}"
         };
-        ui.painter().text(
+        ui.painter().with_clip_rect(visible).text(
             egui::pos2(
                 row.left() + TREE_PAD_X * (2.0 + depth as f32),
                 row.center().y,
@@ -9795,8 +13623,12 @@ fn catalog_tree(
 
     if results.is_empty() {
         let y = top + row_index as f32 * TREE_ROW_H;
-        if y + TREE_ROW_H > content_top && y + TREE_ROW_H <= upper.bottom() {
-            ui.painter().text(
+        if y + TREE_ROW_H > content_top && y + TREE_ROW_H <= viewport.bottom() {
+            let row = egui::Rect::from_min_size(
+                egui::pos2(viewport.left(), y),
+                egui::vec2(viewport.width(), TREE_ROW_H),
+            );
+            ui.painter().with_clip_rect(row.intersect(viewport)).text(
                 egui::pos2(upper.left() + TREE_PAD_X * 2.0, y + TREE_ROW_H * 0.5),
                 egui::Align2::LEFT_CENTER,
                 if snapshot.locations.is_empty() {
@@ -9817,27 +13649,28 @@ fn catalog_tree(
         if y + TREE_ROW_H <= content_top {
             continue;
         }
-        if y + TREE_ROW_H > upper.bottom() {
+        if y + TREE_ROW_H > viewport.bottom() {
             break;
         }
         let row = egui::Rect::from_min_size(
             egui::pos2(upper.left(), y),
             egui::vec2(upper.width(), TREE_ROW_H),
         );
+        let visible = row.intersect(viewport);
         let wid = ui.id().with(("catalog_asset", &asset.path));
-        focus.register(wid, row);
-        let response = ui.interact(row, wid, egui::Sense::click_and_drag());
+        focus.register(wid, visible);
+        let response = ui.interact(visible, wid, egui::Sense::click_and_drag());
         // A row can be pulled straight onto the timeline. The arrangement's
         // drop ghost is the drag visual, so the row itself stays put.
         response.dnd_set_drag_payload(SampleDrag(asset.path.clone()));
         if response.hovered() {
-            ui.painter().rect_filled(row, 0.0, theme.accent_muted);
+            ui.painter().rect_filled(visible, 0.0, theme.accent_muted);
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
         if response.double_clicked() || focus.activated(wid) {
             event = Some(BrowserEvent::SelectSample(asset.path.clone()));
         }
-        ui.painter().text(
+        ui.painter().with_clip_rect(visible).text(
             egui::pos2(row.left() + TREE_PAD_X * 2.0, row.center().y),
             egui::Align2::LEFT_CENTER,
             format!("{} .{}", asset.name, asset.extension),
@@ -9932,7 +13765,11 @@ fn library_manager(
         if ui.put(remove, egui::Button::new("remove")).clicked() {
             event = Some(BrowserEvent::RemoveSampleFolder(root.clone()));
         }
-        ui.painter().text(
+        let text_clip = egui::Rect::from_min_max(
+            egui::pos2(remove.right() + pad, remove.top()),
+            egui::pos2(lower.right() - pad, remove.bottom()),
+        );
+        ui.painter().with_clip_rect(text_clip).text(
             egui::pos2(remove.right() + pad, remove.center().y),
             egui::Align2::LEFT_CENTER,
             root.display().to_string(),
@@ -10802,11 +14639,108 @@ fn rate_label(rate_beats: f32) -> String {
 #[derive(Default)]
 struct DeviceEdits {
     edits: Vec<(u64, Vec<device::ParamEdit>)>,
+    /// Where a card's display is looking now: `(instance, zoom, scroll)`.
+    views: Vec<(u64, f32, f32)>,
+    /// A card asked for its display FULL SIZE.
+    expand: Option<u64>,
+    /// A sampler's slice marker was dragged: `(instance, index, frame)`.
+    ///
+    /// NOT an edit: a slice table is compiled data, not a parameter, and
+    /// routing it through the letter path would mean inventing a wire id
+    /// for every marker.
+    slice_moves: Vec<(u64, usize, u64)>,
+    /// Samplers whose slice table should be rebuilt from their current
+    /// `slices` / `slicefrom` settings.
+    reslice: Vec<u64>,
+    /// The sampler the pointer is over while a browser drag is live.
+    ///
+    /// REPORTED, not consumed. The release handler runs EARLIER in the
+    /// frame than the rack draws, so a card that tried to take the
+    /// payload itself would always be too late — by the time it drew, the
+    /// drag was already over and the payload gone. This is the same shape
+    /// `DragImport::spot` uses for the timeline: note where the pointer
+    /// is, and let the next frame's release read it.
+    hover_sampler: Option<u64>,
+    /// Which page of a tabbed card the user turned to, by instance.
+    ///
+    /// Not a parameter — nothing engine-facing changes — but it is part of
+    /// the patch, so it rides back the same way an edit does rather than
+    /// through a side channel the project file cannot see.
+    pages: Vec<(u64, u8)>,
 }
 
 /// The collapsed MOD strip's slim tab, and the expanded strip's width.
 const MOD_TAB_W: f32 = 22.0;
 const MOD_STRIP_W: f32 = 336.0;
+
+/// How many columns a sampler's waveform picture is reduced to.
+///
+/// Four thousand and ninety-six is about eight times what the plot has
+/// pixels, which is what keeps the waveform sharp rather than blocky when
+/// the display is zoomed in — and the picture never has to be rebuilt as
+/// the zoom moves, which matters because rebuilding it is a scan of the
+/// whole file. Past 8x it does go blocky; that is the trade, and 48 KB a
+/// sampler is what it costs.
+const SAMPLER_WAVE_COLUMNS: usize = 4_096;
+
+/// A sampler's file, reduced to what the card draws.
+///
+/// Cached on the app and rebuilt only when the PATH changes, because
+/// building it is a linear scan of up to five minutes of audio and the
+/// card is redrawn sixty times a second.
+#[derive(Debug, Default, Clone)]
+struct SamplerFace {
+    /// What it was built from, so a stale picture is detectable.
+    path: PathBuf,
+    /// The file's own name, which is what the plot prints.
+    name: String,
+    wave: Vec<device::WaveColumn>,
+    /// Frames at the DEVICE rate — the same units the slice table is in,
+    /// so a marker drawn at `slice / frames` lands where it plays. The
+    /// source file's own length would be wrong by the resampling ratio.
+    frames: u64,
+    truncated: bool,
+    original_rate: u32,
+}
+
+/// Reduce loaded material to [`SAMPLER_WAVE_COLUMNS`] columns.
+///
+/// Min, max and RMS per column. The RMS is carried rather than derived
+/// because it cannot be: two columns with the same extremes can hold
+/// wildly different energy, and that difference is what makes a quiet
+/// passage inside a loud file legible at card size.
+fn sampler_wave(material: &daw::audio::material::Material) -> Vec<device::WaveColumn> {
+    let frames = material.frames;
+    if frames == 0 {
+        return Vec::new();
+    }
+    (0..SAMPLER_WAVE_COLUMNS)
+        .map(|column| {
+            let from = (frames * column as u64 / SAMPLER_WAVE_COLUMNS as u64) as usize;
+            let to = ((frames * (column + 1) as u64 / SAMPLER_WAVE_COLUMNS as u64) as usize)
+                .max(from + 1)
+                .min(frames as usize);
+            let mut out = device::WaveColumn::default();
+            let mut energy = 0.0f64;
+            let mut counted = 0usize;
+            for channel in 0..material.channels {
+                let Some(span) = material.channel(channel).get(from..to) else {
+                    continue;
+                };
+                for s in span {
+                    out.min = out.min.min(*s);
+                    out.max = out.max.max(*s);
+                    energy += f64::from(*s) * f64::from(*s);
+                }
+                counted += span.len();
+            }
+            if counted > 0 {
+                out.rms = (energy / counted as f64).sqrt() as f32;
+            }
+            out
+        })
+        .collect()
+}
 
 fn device_body(
     ui: &mut egui::Ui,
@@ -10814,6 +14748,14 @@ fn device_body(
     chain: &[DeviceInstance],
     strip: ModStrip<'_>,
     mod_collapsed: &mut bool,
+    sample_rate: f32,
+    histories: &HashMap<u64, device::scope::History>,
+    // `samplers` is every sampler's loaded file by instance id — the
+    // half of a sampler's card that its own parameters cannot supply.
+    // `slices` is its slice table, separate because that changes without
+    // the file changing.
+    samplers: &HashMap<u64, SamplerFace>,
+    slices: &HashMap<u64, Vec<u64>>,
 ) -> DeviceEdits {
     let mut edits = DeviceEdits::default();
     // The MOD strip is PINNED at the panel's right edge, outside the
@@ -10913,16 +14855,187 @@ fn device_body(
                             // position is derived here and thrown away: the
                             // stored value is the one truth, and the edit
                             // coming back out is already in engine units.
-                            let made = match instance.state {
+                            // The card's own rect, so a file dropped on
+                            // THIS card lands on THIS device. Taken from a
+                            // scope rather than from the card, because a
+                            // card returns what the user changed and its
+                            // geometry is the rack's business.
+                            let drawn = ui.scope(|ui| match instance.state {
+                                DeviceState::Sampler(params) => {
+                                    let mut knobs = device::SamplerUi::from_engine(|id| {
+                                        params.get(id).unwrap_or_default()
+                                    });
+                                    let face = samplers.get(&instance.id);
+                                    let view = device::SamplerView {
+                                        name: face.map_or("", |f| f.name.as_str()),
+                                        wave: face.map_or(&[][..], |f| f.wave.as_slice()),
+                                        frames: face.map_or(0, |f| f.frames),
+                                        slices: slices
+                                            .get(&instance.id)
+                                            .map_or(&[][..], Vec::as_slice),
+                                        // The engine does not report read
+                                        // positions yet, so the plot draws
+                                        // no playheads. The field exists
+                                        // so adding the telemetry is a
+                                        // wiring change and not a shape
+                                        // change.
+                                        voices: &[],
+                                        truncated: face.is_some_and(|f| f.truncated),
+                                        original_rate: face.map_or(0, |f| f.original_rate),
+                                    };
+                                    let out = device::sampler_card(
+                                        ui,
+                                        theme,
+                                        &mut knobs,
+                                        instance.page,
+                                        instance.view_zoom,
+                                        instance.view_scroll,
+                                        &view,
+                                    );
+                                    if out.page != instance.page {
+                                        edits.pages.push((instance.id, out.page));
+                                    }
+                                    // Where the display is looking rides
+                                    // the instance beside `page`, for the
+                                    // same reason: a card is rebuilt every
+                                    // frame and forgets everything.
+                                    if out.zoom != instance.view_zoom
+                                        || out.scroll != instance.view_scroll
+                                    {
+                                        edits.views.push((instance.id, out.zoom, out.scroll));
+                                    }
+                                    if let Some((index, frame)) = out.slice_moved {
+                                        edits.slice_moves.push((instance.id, index, frame));
+                                    }
+                                    if out.reslice {
+                                        edits.reslice.push(instance.id);
+                                    }
+                                    if out.expand {
+                                        edits.expand = Some(instance.id);
+                                    }
+                                    out.edits
+                                }
                                 DeviceState::SineSynth(params) => {
                                     let mut knobs = synth_knobs(params);
                                     device::sine_synth_card(ui, theme, &mut knobs)
+                                }
+                                DeviceState::Utility(params) => {
+                                    let mut knobs = utility_knobs(params);
+                                    device::utility_card(ui, theme, &mut knobs)
+                                }
+                                DeviceState::Limiter(params) => {
+                                    let mut knobs =
+                                        device::LimiterUi::from_engine(|id| params.get(id));
+                                    device::limiter_card(ui, theme, &mut knobs)
+                                }
+                                DeviceState::Filter(params) => {
+                                    let mut knobs =
+                                        device::FilterUi::from_engine(|id| params.get(id));
+                                    device::filter_card(ui, theme, &mut knobs, sample_rate)
+                                }
+                                DeviceState::Modulato(params) => {
+                                    let mut knobs =
+                                        device::modulato::ModulatoUi::from_engine(|id| {
+                                            params.get(id)
+                                        });
+                                    device::modulato::modulato_card(ui, theme, &mut knobs)
+                                }
+                                DeviceState::Kick(params) => {
+                                    // The app is the layer that knows
+                                    // both sides, so the conversion
+                                    // happens here rather than inside a
+                                    // widget that must not see the
+                                    // engine.
+                                    let mut knobs =
+                                        device::kick::KickUi::from_engine(|id| params.get(id));
+                                    device::kick::kick_card(ui, theme, &mut knobs)
+                                }
+                                DeviceState::Snare(params) => {
+                                    let mut knobs =
+                                        device::SnareUi::from_engine(|id| params.get(id));
+                                    device::snare_card(ui, theme, &mut knobs)
+                                }
+                                DeviceState::Tom(params) => {
+                                    let mut knobs = device::TomUi::from_engine(|id| params.get(id));
+                                    device::tom_card(ui, theme, &mut knobs)
+                                }
+                                DeviceState::Hat(params) => {
+                                    let mut knobs = device::HatUi::from_engine(|id| params.get(id));
+                                    device::hat_card(ui, theme, &mut knobs)
+                                }
+                                DeviceState::Handclap(params) => {
+                                    let mut knobs =
+                                        device::HandclapUi::from_engine(|id| params.get(id));
+                                    device::handclap_card(ui, theme, &mut knobs)
+                                }
+                                DeviceState::Poly(params) => {
+                                    let mut knobs = poly_knobs(params, instance.page);
+                                    let made = device::poly_card(ui, theme, &mut knobs);
+                                    // The tab dots are part of the card, so
+                                    // the page it came back on is what the
+                                    // instance should remember.
+                                    let page = knobs.page.min(u8::MAX as usize) as u8;
+                                    if page != instance.page {
+                                        edits.pages.push((instance.id, page));
+                                    }
+                                    made
+                                }
+                                DeviceState::Sat(params) => {
+                                    let mut knobs = sat_knobs(params);
+                                    device::sat_card(ui, theme, &mut knobs)
+                                }
+                                DeviceState::Echo(params) => {
+                                    let mut knobs = echo_knobs(params);
+                                    device::echo_card(ui, theme, &mut knobs)
                                 }
                                 DeviceState::Reverb(params) => {
                                     let mut knobs = reverb_knobs(params);
                                     device::reverb_card(ui, theme, &mut knobs)
                                 }
-                            };
+                                DeviceState::Glue(params) => {
+                                    let mut knobs = glue_knobs(params);
+                                    let history =
+                                        histories.get(&instance.id).cloned().unwrap_or_default();
+                                    device::glue_card(ui, theme, &mut knobs, &history)
+                                }
+                                DeviceState::Eq(params) => {
+                                    let mut knobs = eq_knobs(params, instance.page);
+                                    let made = device::eq_card(ui, theme, &mut knobs, sample_rate);
+                                    // Clicking a handle picks the band the
+                                    // cell row edits, so the band it came
+                                    // back on is what the instance should
+                                    // remember — the same road the poly
+                                    // synth's tab takes, and for the same
+                                    // reason: the card itself is a
+                                    // temporary and forgets everything.
+                                    let band = knobs.selected.min(u8::MAX as usize) as u8;
+                                    if band != instance.page {
+                                        edits.pages.push((instance.id, band));
+                                    }
+                                    made
+                                }
+                            });
+                            let made = drawn.inner;
+                            // Is a browser drag hovering THIS sampler? Only
+                            // NOTED, never taken — see `hover_sampler`.
+                            if instance.kind() == DeviceKind::Sampler
+                                && egui::DragAndDrop::has_payload_of_type::<SampleDrag>(ui.ctx())
+                                && ui
+                                    .ctx()
+                                    .pointer_latest_pos()
+                                    .is_some_and(|at| drawn.response.rect.contains(at))
+                            {
+                                edits.hover_sampler = Some(instance.id);
+                                // And say so. A drop target that looks
+                                // exactly like everything else is a drop
+                                // target nobody finds.
+                                ui.painter().rect_stroke(
+                                    drawn.response.rect,
+                                    0.0,
+                                    egui::Stroke::new(stroke::BOLD, theme.accent),
+                                    egui::StrokeKind::Inside,
+                                );
+                            }
                             if !made.is_empty() {
                                 edits.edits.push((instance.id, made));
                             }
@@ -11054,20 +15167,121 @@ fn seq_notes(clips: &[Clip]) -> Vec<SeqNote> {
     let mut out = Vec::new();
     for clip in clips {
         let start = f64::from(clip.start);
-        let len = f64::from(clip.len);
+        // The clip's content as it actually SOUNDS, internal loop and
+        // all, still in clip-relative time. One definition, shared with
+        // the launcher.
         out.extend(
-            clip.notes
+            clip_notes(clip, clip.len)
                 .iter()
-                .filter(|n| n.start < len)
+                // Muted notes stay in the clip and never reach the wire —
+                // deactivation is an ARRANGEMENT fact, so it is decided
+                // here, where beats become the engine's business.
+                .filter(|n| !n.muted)
                 .map(|n| SeqNote {
                     start_beats: start + n.start,
                     len_beats: n.len,
                     pitch: n.pitch,
                     vel: n.vel,
+                    plocks: n.plocks.clone(),
+                    prob: n.prob,
+                    cond: n.cond,
                 }),
         );
     }
     out
+}
+
+/// The parameters a note on this track can LOCK: the instrument's own
+/// table rows, spelled with the app's labels, minus gain — gain is the
+/// node's ramped output stage, and a per-note jump on it is a click, not
+/// a lock. `base` is the knob's current value, refreshed every frame the
+/// editor draws, so a fresh lock starts where the sound already is.
+fn plockable_params(track: &Track) -> Vec<piano_roll::PlockParam> {
+    let Some(head) = track.instrument() else {
+        return Vec::new();
+    };
+    let spec = head.kind().spec();
+    let excluded = match head.kind() {
+        DeviceKind::Poly => daw::params::poly::GAIN,
+        DeviceKind::Sampler => daw::params::sampler::GAIN,
+        DeviceKind::SineSynth => daw::params::seq::GAIN,
+        DeviceKind::Kick => daw::params::kick::GAIN,
+        DeviceKind::Snare => daw::params::snare::GAIN,
+        DeviceKind::Tom => daw::params::tom::GAIN,
+        DeviceKind::Hat => daw::params::hat::GAIN,
+        DeviceKind::Handclap => daw::params::handclap::GAIN,
+        // No id: an effect never heads a chain, so nothing here is
+        // p-lockable and there is nothing to exclude.
+        DeviceKind::Reverb
+        | DeviceKind::Sat
+        | DeviceKind::Echo
+        | DeviceKind::Eq
+        | DeviceKind::Filter
+        | DeviceKind::Glue
+        | DeviceKind::Modulato
+        | DeviceKind::Utility
+        | DeviceKind::Limiter => u32::MAX,
+    };
+    let kind = head.kind();
+    spec.params
+        .iter()
+        .zip(spec.labels)
+        .filter(|(def, _)| def.id != excluded)
+        .map(|(def, label)| {
+            let id = def.id;
+            let unit = label.unit;
+            piano_roll::PlockParam {
+                id,
+                name: if label.group.is_empty() {
+                    label.name.to_owned()
+                } else {
+                    format!("{} {}", label.group, label.name)
+                },
+                min: def.min,
+                max: def.max,
+                base: head.state.value(id).unwrap_or(def.default),
+                choices: device_choices(kind, def),
+                format: std::sync::Arc::new(move |value| device_format(kind, id, value, unit)),
+            }
+        })
+        .collect()
+}
+
+/// How many whole choices a parameter has — 0 for a continuous one.
+///
+/// Asked of the CARD's own mapping rather than guessed from the range, so
+/// a stepper and a knob cannot disagree about what kind of number this
+/// is. Discrete tables here run over whole numbers, so the count is the
+/// span plus one.
+///
+/// This used to answer 0 for every device except the poly synth, which
+/// meant every OTHER instrument's mode switches were treated as
+/// continuous: a nudge moved them by a hundredth of a choice, so pressing
+/// down at the bottom of a two-choice switch appeared to do nothing at
+/// all. It did nothing at all.
+fn device_choices(kind: DeviceKind, def: &daw::params::ParamDef) -> u32 {
+    if device_is_discrete(kind, def.id) {
+        ((def.max - def.min).round().max(0.0) as u32).saturating_add(1)
+    } else {
+        0
+    }
+}
+
+/// A value in the parameter's own words, for whichever device owns it.
+///
+/// Every card that has a formatter gets asked; the rest fall back to the
+/// registry's own unit, which is at least the right suffix on the right
+/// number. Previously they all got the SINE SYNTH's formatter, which was
+/// the right shape and the wrong device.
+fn device_format(kind: DeviceKind, param: u32, value: f32, unit: &'static str) -> String {
+    match kind {
+        DeviceKind::Poly => device::poly_format(param, value),
+        DeviceKind::Sampler => device::sampler_format(param, value),
+        DeviceKind::Limiter => device::limiter_format(param, value),
+        DeviceKind::Filter => device::filter_format(param, value),
+        DeviceKind::SineSynth => device::sine_synth_format(param, value),
+        _ => format!("{value:.2}{unit}"),
+    }
 }
 
 /// The app's graph: one Seq per track carrying that track's clips and its
@@ -11086,13 +15300,23 @@ fn seq_notes(clips: &[Clip]) -> Vec<SeqNote> {
 /// change has to know which node belongs to which lane, and every swap
 /// mints fresh ids, so the mapping is re-captured with the schedule rather
 /// than derived later.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct GraphNodes {
+    /// Which readout slot each tapped device was given, by INSTANCE id.
+    /// Only devices with something to say about themselves are in here —
+    /// a compressor is, an equaliser is not.
+    readouts: HashMap<u64, usize>,
     /// Every device instance that reached the schedule, by INSTANCE id —
     /// not by position, which is what lets a letter survive a chain
     /// reorder. A bypassed device, or one on a muted track, is absent.
     devices: HashMap<u64, NodeId>,
+    /// Every AUDIO CLIP that reached the schedule, by clip id. What lets
+    /// the clip editor's gain ride a letter instead of a recompile.
+    audio_clips: HashMap<u64, NodeId>,
     pans: Vec<Option<NodeId>>,
+    /// The master's output stage — the fader every lane arrives at. One,
+    /// not a vec, because there is one master.
+    master_out: Option<NodeId>,
 }
 
 /// Reduce arbitrarily many sources through bounded-input mixers. Graph
@@ -11118,16 +15342,183 @@ fn mix_sources(spec: &mut GraphSpec, mut sources: Vec<NodeId>) -> Option<NodeId>
     sources.pop()
 }
 
+/// Wire one chain of effects onto `source`, in signal order, and return
+/// what the last of them left behind.
+///
+/// Shared by every lane and by the master, which is the point: an effect
+/// has to mean the same thing wherever it is dropped, and two copies of
+/// this match would drift the first time one of them gained a device.
+///
+/// A bypassed effect leaves the schedule the way a muted track does, and
+/// the chain closes over it. Instruments are skipped: at the head of a
+/// lane one is already the source, and anywhere else it shapes nothing.
+///
+/// Delays on a SEND are not wired here. An aux is fed from the OUTPUT
+/// stage, which does not exist until the chain has been walked, so they
+/// are collected into `auxes` for the caller to hang off its own fader.
+#[allow(clippy::too_many_lines)]
+/// Which chain a rack edit belongs to.
+///
+/// The rack draws one chain at a time and does not care whose it is; the
+/// app very much does, because a lane is addressed by index and the master
+/// is not addressed at all. Naming the two makes every edit path say which
+/// it meant instead of passing a `usize` that might be neither.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ChainOwner {
+    Track(usize),
+    Master,
+}
+
+/// The master's meter slot, reserved at the top of the range. Track meters
+/// are handed out by lane index from the bottom, so the two can only meet
+/// in a project with thirty-two lanes — and there the master keeps its
+/// reading and the last lane loses one, which is the right way round.
+const MASTER_METER: usize = daw::audio::graph::MAX_METERS - 1;
+
+fn compile_chain(
+    spec: &mut GraphSpec,
+    source: NodeId,
+    chain: &[DeviceInstance],
+    devices: &mut HashMap<u64, NodeId>,
+    readouts: &mut HashMap<u64, usize>,
+    auxes: &mut Vec<(u64, EchoParams)>,
+) -> NodeId {
+    let mut tail = source;
+    for instance in chain {
+        if instance.bypass {
+            continue;
+        }
+        match instance.state {
+            // The instrument is already the source, and an instrument
+            // anywhere else in a chain shapes nothing.
+            DeviceState::SineSynth(_)
+            | DeviceState::Poly(_)
+            | DeviceState::Sampler(_)
+            | DeviceState::Kick(_)
+            | DeviceState::Snare(_)
+            | DeviceState::Tom(_)
+            | DeviceState::Hat(_)
+            | DeviceState::Handclap(_) => {}
+            DeviceState::Utility(params) => {
+                let node = spec.push(NodeSpec::Utility { params });
+                spec.connect(tail, node);
+                devices.insert(instance.id, node);
+                tail = node;
+            }
+            DeviceState::Modulato(params) => {
+                let node = spec.push(NodeSpec::Modulato { params });
+                spec.connect(tail, node);
+                devices.insert(instance.id, node);
+                tail = node;
+            }
+            DeviceState::Filter(params) => {
+                let node = spec.push(NodeSpec::Filter { params });
+                spec.connect(tail, node);
+                devices.insert(instance.id, node);
+                tail = node;
+            }
+            DeviceState::Limiter(params) => {
+                let node = spec.push(NodeSpec::Limiter { params });
+                spec.connect(tail, node);
+                devices.insert(instance.id, node);
+                tail = node;
+            }
+            DeviceState::Reverb(params) => {
+                let rev = spec.push(NodeSpec::Reverb {
+                    predelay_ms: params.predelay_ms,
+                    size: params.size,
+                    decay: params.decay,
+                    damp: params.damp,
+                    low_cut: params.low_cut,
+                    diffusion: params.diffusion,
+                    modulation: params.modulation,
+                    width: params.width,
+                    mix: params.mix,
+                });
+                spec.connect(tail, rev);
+                devices.insert(instance.id, rev);
+                tail = rev;
+            }
+            DeviceState::Echo(params) => {
+                // Above zero the delay is not in the signal path at
+                // all: it hangs off the track's output instead, and
+                // the chain closes over it exactly as a bypass does.
+                if params.send > 0.0 {
+                    auxes.push((instance.id, params));
+                    continue;
+                }
+                let echo = spec.push(NodeSpec::Echo {
+                    sync: params.sync.round().max(0.0) as u32,
+                    time_ms: params.time_ms,
+                    feedback: params.feedback,
+                    tone_hz: params.tone_hz,
+                    drive: params.drive,
+                    wow: params.wow,
+                    spread: params.spread,
+                    mix: params.mix,
+                    send: params.send,
+                });
+                spec.connect(tail, echo);
+                devices.insert(instance.id, echo);
+                tail = echo;
+            }
+            DeviceState::Eq(params) => {
+                let eq = spec.push(NodeSpec::Eq { params });
+                spec.connect(tail, eq);
+                devices.insert(instance.id, eq);
+                tail = eq;
+            }
+            DeviceState::Glue(params) => {
+                let glue = spec.push(NodeSpec::Glue { params });
+                spec.connect(tail, glue);
+                devices.insert(instance.id, glue);
+                // A compressor has something to SAY, and its card is
+                // most of a display for it. The slot is handed out
+                // here, in device order, so a chain that gains a
+                // device does not shuffle everyone else's readings.
+                if readouts.len() < daw::audio::graph::MAX_METERS {
+                    let slot = readouts.len();
+                    spec.tap(slot, glue);
+                    readouts.insert(instance.id, slot);
+                }
+                tail = glue;
+            }
+            DeviceState::Sat(params) => {
+                let sat = spec.push(NodeSpec::Sat {
+                    // The one place the index stops being a float:
+                    // the spec wants a choice, and rounding is that
+                    // single arithmetic step.
+                    mode: params.mode.round().max(0.0) as u32,
+                    drive: params.drive,
+                    bias: params.bias,
+                    mix: params.mix,
+                    out: params.out,
+                });
+                spec.connect(tail, sat);
+                devices.insert(instance.id, sat);
+                tail = sat;
+            }
+        }
+    }
+    tail
+}
+
 fn build_graph_spec(
     tracks: &[Track],
+    bus: &MasterTrack,
     clips: &[Vec<Clip>],
     loop_len_beats: Option<f64>,
     metronome: bool,
 ) -> (GraphSpec, GraphNodes) {
     let mut spec = GraphSpec::default();
     let mixer = spec.push(NodeSpec::Mixer { gain: 1.0 });
+    // Everything that reaches the master: one output stage per audible
+    // track, every send return, and the click.
+    let mut master: Vec<NodeId> = Vec::new();
     let mut pan_ids: Vec<Option<NodeId>> = vec![None; tracks.len()];
     let mut devices: HashMap<u64, NodeId> = HashMap::new();
+    let mut readouts: HashMap<u64, usize> = HashMap::new();
+    let mut audio_clips: HashMap<u64, NodeId> = HashMap::new();
     for (i, track) in tracks.iter().enumerate() {
         if !track_audible(tracks, i) {
             continue;
@@ -11141,33 +15532,155 @@ fn build_graph_spec(
                 let Some(head) = track.instrument().filter(|head| !head.bypass) else {
                     continue;
                 };
-                let DeviceState::SineSynth(params) = head.state else {
-                    continue;
+                let notes = clips
+                    .get(i)
+                    .map(|clips| seq_notes(clips))
+                    .unwrap_or_default();
+                // Which instrument heads the chain decides which node the
+                // lane's pattern compiles into. The pattern itself is the
+                // same either way — same notes, same clip length — which
+                // is exactly what `PatternClock` being instrument-agnostic
+                // bought.
+                let node = match head.state {
+                    // An effect at the head is not an instrument; the
+                    // lane has nothing to make sound with.
+                    DeviceState::Modulato(_)
+                    | DeviceState::Utility(_)
+                    | DeviceState::Filter(_)
+                    | DeviceState::Limiter(_) => continue,
+                    DeviceState::SineSynth(params) => NodeSpec::Seq {
+                        notes,
+                        subloops: Vec::new(),
+                        loop_len_beats,
+                        params,
+                    },
+                    DeviceState::Poly(params) => NodeSpec::Poly {
+                        notes,
+                        subloops: Vec::new(),
+                        loop_len_beats,
+                        params,
+                    },
+                    // The sampler's FILE and slice table live beside the
+                    // chain rather than inside the device's params — see
+                    // `Track::sampler_sources` for why — so they are
+                    // fetched by instance id here and travel into the
+                    // spec together with the knobs.
+                    DeviceState::Sampler(params) => {
+                        let source = track.sampler_sources.get(&head.id);
+                        NodeSpec::Sampler {
+                            notes,
+                            subloops: Vec::new(),
+                            loop_len_beats,
+                            path: source.map(|s| s.path.clone()).unwrap_or_default(),
+                            params,
+                            slices: source.map(|s| s.slices.clone()).unwrap_or_default(),
+                        }
+                    }
+                    DeviceState::Kick(params) => NodeSpec::Kick {
+                        notes,
+                        subloops: Vec::new(),
+                        loop_len_beats,
+                        params,
+                    },
+                    DeviceState::Snare(params) => NodeSpec::Snare {
+                        notes,
+                        subloops: Vec::new(),
+                        loop_len_beats,
+                        params,
+                    },
+                    DeviceState::Tom(params) => NodeSpec::Tom {
+                        notes,
+                        subloops: Vec::new(),
+                        loop_len_beats,
+                        params,
+                    },
+                    DeviceState::Hat(params) => NodeSpec::Hat {
+                        notes,
+                        subloops: Vec::new(),
+                        loop_len_beats,
+                        params,
+                    },
+                    DeviceState::Handclap(params) => NodeSpec::Handclap {
+                        notes,
+                        subloops: Vec::new(),
+                        loop_len_beats,
+                        params,
+                    },
+                    // An effect at the head is not an instrument; the lane
+                    // has nothing to make sound with.
+                    DeviceState::Reverb(_)
+                    | DeviceState::Sat(_)
+                    | DeviceState::Echo(_)
+                    | DeviceState::Eq(_)
+                    | DeviceState::Glue(_) => {
+                        continue;
+                    }
                 };
-                let seq = spec.push(NodeSpec::Seq {
-                    notes: clips
-                        .get(i)
-                        .map(|clips| seq_notes(clips))
-                        .unwrap_or_default(),
-                    subloops: Vec::new(),
-                    loop_len_beats,
-                    params,
-                });
-                devices.insert(head.id, seq);
-                sources.push(seq);
+                let source = spec.push(node);
+                devices.insert(head.id, source);
+                sources.push(source);
             }
             TrackKind::Audio => {
                 for clip in clips.get(i).into_iter().flatten() {
                     let Some(audio) = &clip.audio else { continue };
-                    sources.push(spec.push(NodeSpec::AudioClip {
-                        path: audio.path.clone(),
+                    // A clip whose reversal is still being written has
+                    // no file to open yet. It compiles to nothing rather
+                    // than to the forward file, because playing it the
+                    // right way round for half a second and then
+                    // switching is worse than a moment of silence.
+                    let Some(path) = audio.playing_path() else {
+                        continue;
+                    };
+                    // The clip's BRACE, in source frames.
+                    //
+                    // No tempo needed: the clip spans `len` beats and
+                    // `source_frames` frames, so a fraction of it in beats
+                    // is the same fraction of its region. That also means
+                    // the brace survives a tempo change exactly as the
+                    // clip does, rather than drifting against it.
+                    let (played, loop_from) = match clip_loop(clip) {
+                        Some((loop_start, loop_len)) if clip.len > 0.0 => {
+                            let per_beat = audio.source_frames as f64 / f64::from(clip.len);
+                            let end = ((f64::from(loop_start) + f64::from(loop_len)) * per_beat)
+                                .round()
+                                .clamp(1.0, audio.source_frames as f64)
+                                as u64;
+                            let from = (f64::from(loop_start) * per_beat)
+                                .round()
+                                .clamp(0.0, end.saturating_sub(1) as f64)
+                                as u64;
+                            (end, from)
+                        }
+                        // No brace: the whole region, wrapping to its own
+                        // start — which is what `looped` always meant.
+                        _ => (audio.source_frames, 0),
+                    };
+                    let node = spec.push(NodeSpec::AudioClip {
+                        path,
                         start_beats: f64::from(clip.start),
                         length_beats: Some(f64::from(clip.len)),
-                        source_offset_frames: audio.source_offset,
-                        source_frames: Some(audio.source_frames),
-                        loop_clip: audio.looped,
+                        source_offset_frames: audio.playing_offset(),
+                        source_frames: Some(played),
+                        loop_clip: audio.looped || clip.loop_on,
+                        loop_start_frames: loop_from,
                         gain: audio.gain,
-                    }));
+                        fade_in_frames: audio.fade_in,
+                        fade_out_frames: audio.fade_out,
+                        fade_in_shape: audio.fade_in_curve,
+                        fade_out_shape: audio.fade_out_curve,
+                        envelope: audio
+                            .envelope
+                            .iter()
+                            .map(|(at, db)| (*at, envelope_gain(*db)))
+                            .collect(),
+                    });
+                    // By CLIP ID, so the editor's gain can reach the node
+                    // that is already playing instead of waiting for the
+                    // debounced recompile every other clip edit rides.
+                    // `Node::AudioClip` ramps its gain, so the letter is
+                    // click-free and a drag is heard as it happens.
+                    audio_clips.insert(clip.id, node);
+                    sources.push(node);
                 }
             }
         }
@@ -11176,29 +15689,19 @@ fn build_graph_spec(
         };
         // The effects sit between this track's private source bus and pan,
         // each chaining onto the one before; the master never leaks into a
-        // track insert. A bypassed effect leaves the schedule the way a
-        // muted track does, and the chain closes over it.
-        let mut tail = source;
-        for instance in &track.chain {
-            if instance.bypass {
-                continue;
-            }
-            match instance.state {
-                // The instrument is already the source, and an instrument
-                // anywhere else in a chain shapes nothing.
-                DeviceState::SineSynth(_) => {}
-                DeviceState::Reverb(params) => {
-                    let rev = spec.push(NodeSpec::Reverb {
-                        size: params.size,
-                        damp: params.damp,
-                        mix: params.mix,
-                    });
-                    spec.connect(tail, rev);
-                    devices.insert(instance.id, rev);
-                    tail = rev;
-                }
-            }
-        }
+        // track insert.
+        //
+        // The aux delays come back out rather than being wired here: they
+        // hang off the output stage, which does not exist yet.
+        let mut auxes: Vec<(u64, EchoParams)> = Vec::new();
+        let tail = compile_chain(
+            &mut spec,
+            source,
+            &track.chain,
+            &mut devices,
+            &mut readouts,
+            &mut auxes,
+        );
         // Pan is ALWAYS a node, even at dead center, and that is
         // deliberate: it gives every track's pan a permanent address,
         // so turning the header knob is a param letter rather than a
@@ -11209,27 +15712,197 @@ fn build_graph_spec(
             gain: track.volume,
         });
         spec.connect(tail, pan);
-        spec.connect(pan, mixer);
+        master.push(pan);
         pan_ids[i] = Some(pan);
+        // The sends, now that there is an output stage to tap. POST-FADER,
+        // which is the tap every console defaults to and the only one that
+        // behaves the way a mixed track should: pull the fader down and its
+        // delay goes with it, instead of the repeats hanging on over a
+        // track that has left.
+        //
+        // The return lands at the MASTER, beside the dry — not back through
+        // the pan, which would send it round the fader a second time and,
+        // worse, would be silently dropped: `Node::Pan` reads its FIRST
+        // input and no other.
+        for (id, params) in auxes {
+            let echo = spec.push(NodeSpec::Echo {
+                sync: params.sync.round().max(0.0) as u32,
+                time_ms: params.time_ms,
+                feedback: params.feedback,
+                tone_hz: params.tone_hz,
+                drive: params.drive,
+                wow: params.wow,
+                spread: params.spread,
+                mix: params.mix,
+                // The node scales its own tap, so the send costs no node
+                // of its own and the parameter keeps ONE address: a knob,
+                // an automation lane and a modulation wire all letter the
+                // echo at `echo::SEND`, in percent, like every other row.
+                send: params.send,
+            });
+            spec.connect(pan, echo);
+            devices.insert(id, echo);
+            master.push(echo);
+        }
         // The track's own output stage is where its meter is read: after
         // the fader and the pan, which is what a mixer meter shows. The
         // slot is the TRACK index, so a muted track — which compiles to
         // nothing at all — leaves its meter reading silence rather than
-        // shifting every meter below it up one.
-        spec.meter(i, pan);
+        // shifting every meter below it up one. The master's slot is
+        // reserved above them all, so lanes stop one short of the ceiling.
+        if i < MASTER_METER {
+            spec.meter(i, pan);
+        }
     }
     if metronome {
         let click = spec.push(NodeSpec::Click);
-        spec.connect(click, mixer);
+        master.push(click);
     }
-    spec.set_output(mixer);
+    // Fan-in at the master is capped like every other node's, and returns
+    // push against that ceiling from a second direction. Past the cap the
+    // inputs are reduced through a tree of buses; at or under it they are
+    // wired straight in, so an ordinary project compiles to exactly the
+    // graph it did before sends existed.
+    if master.len() > daw::audio::graph::MAX_NODE_INPUTS {
+        if let Some(bus) = mix_sources(&mut spec, master) {
+            spec.connect(bus, mixer);
+        }
+    } else {
+        for node in master {
+            spec.connect(node, mixer);
+        }
+    }
+
+    // --- the master ------------------------------------------------------
+    // The sum feeds the master's own chain, and the master fader is the
+    // LAST thing before the speakers. Its effects are compiled by the same
+    // function every lane's are, so a compressor means the same thing here
+    // as it does on a track.
+    let mut master_auxes: Vec<(u64, EchoParams)> = Vec::new();
+    let mut tail = compile_chain(
+        &mut spec,
+        mixer,
+        &bus.chain,
+        &mut devices,
+        &mut readouts,
+        &mut master_auxes,
+    );
+    // A send on the master has nowhere further to go, so its return lands
+    // beside the dry on a bus of its own, BEFORE the fader — pulling the
+    // master down has to take the repeats with it.
+    if !master_auxes.is_empty() {
+        let mut returns = vec![tail];
+        for (id, params) in master_auxes {
+            let echo = spec.push(NodeSpec::Echo {
+                sync: params.sync.round().max(0.0) as u32,
+                time_ms: params.time_ms,
+                feedback: params.feedback,
+                tone_hz: params.tone_hz,
+                drive: params.drive,
+                wow: params.wow,
+                spread: params.spread,
+                mix: params.mix,
+                send: params.send,
+            });
+            spec.connect(tail, echo);
+            devices.insert(id, echo);
+            returns.push(echo);
+        }
+        if let Some(summed) = mix_sources(&mut spec, returns) {
+            tail = summed;
+        }
+    }
+    // Always a node, at unity and centre exactly as a track's pan is: it
+    // gives the master fader a permanent address, so moving it is a param
+    // letter rather than a recompile per mouse-move.
+    let master_out = spec.push(NodeSpec::Pan {
+        pan: bus.pan,
+        gain: bus.volume,
+    });
+    spec.connect(tail, master_out);
+    // The master's meter slot is RESERVED at the top of the range rather
+    // than handed out after the tracks: a project with thirty-two lanes
+    // must not be the one where the master stops reading.
+    spec.meter(MASTER_METER, master_out);
+    spec.set_output(master_out);
     (
         spec,
         GraphNodes {
             devices,
+            readouts,
+            audio_clips,
             pans: pan_ids,
+            master_out: Some(master_out),
         },
     )
+}
+
+/// Every automated parameter's value at `beat`, as engine letters.
+///
+/// The offline half of what `sync_engine` does live. Live, an envelope is a
+/// stream of letters from the UI thread; a render has no UI thread, so the
+/// same values have to be handed to `bounce_automated` block by block or
+/// the export hears every fader parked at its written-down value.
+///
+/// Only tracks that ACTUALLY carry an envelope for a target contribute: a
+/// letter per block per unautomated fader would be work with no effect,
+/// and the compiled-in value is already right.
+fn automation_letters(
+    tracks: &[Track],
+    nodes: &GraphNodes,
+    registry: &ParameterRegistry,
+    beat: f64,
+    out: &mut Vec<daw::audio::graph::ParamChange>,
+) {
+    let beat = beat as f32;
+    for (i, track) in tracks.iter().enumerate() {
+        for envelope in &track.automation.envelopes {
+            let target = envelope.target.as_str();
+            if envelope.points.is_empty() || !target_applies(track, target) {
+                continue;
+            }
+            // Volume and pan live on the track's output stage; everything
+            // else resolves through the registry to a device node.
+            let (node, param, value) = match target {
+                TRACK_VOLUME_TARGET | TRACK_PAN_TARGET => {
+                    let Some(Some(node)) = nodes.pans.get(i).copied() else {
+                        continue;
+                    };
+                    let volume = target == TRACK_VOLUME_TARGET;
+                    let base = if volume { track.volume } else { track.pan };
+                    let value = track.automation.value_at(target, beat, base);
+                    let (param, value) = if volume {
+                        (daw::params::pan::GAIN, value.max(0.0))
+                    } else {
+                        (daw::params::pan::PAN, value.clamp(-1.0, 1.0))
+                    };
+                    (node, param, value)
+                }
+                _ => {
+                    let Some(TargetRef::Device { id, param }) = target_ref(target) else {
+                        continue;
+                    };
+                    let Some(spec) = registry.spec(target) else {
+                        continue;
+                    };
+                    let Some(node) = nodes.devices.get(&id).copied() else {
+                        continue;
+                    };
+                    let base = parameter_base(track, target, spec);
+                    let value = track
+                        .automation
+                        .value_at(target, beat, base)
+                        .clamp(spec.min, spec.max);
+                    (node, param, value)
+                }
+            };
+            out.push(daw::audio::graph::ParamChange {
+                node: node.to_bits(),
+                param,
+                value,
+            });
+        }
+    }
 }
 
 /// Resolve the arrangement's modulation into the form the ENGINE runs:
@@ -11283,6 +15956,17 @@ fn build_mod_spec(
                 (node, param)
             }
         };
+        // A log-scaled target takes its modulation in octaves; the card's
+        // mapping is the authority on which parameters those are. Track
+        // outputs (pan, volume) stay linear.
+        let log = match binding {
+            TargetRef::Device { id, param } => track
+                .chain
+                .iter()
+                .find(|d| d.id == id)
+                .is_some_and(|d| device_is_log(d.kind(), param)),
+            TargetRef::TrackOutput(_) => false,
+        };
         out.push(WireSpec {
             id: wire.id,
             source: wire.source,
@@ -11290,6 +15974,7 @@ fn build_mod_spec(
             param,
             min: spec.min,
             max: spec.max,
+            log,
             // The knob-or-automation value as of this compile. Letters
             // replace it live, so this only has to be right for the first
             // block after a swap — but being wrong for one block is an
@@ -11386,6 +16071,19 @@ struct App {
     transport: Transport,
     /// Global performance preference, independent of project content.
     launch_quantization: LaunchQuantization,
+    /// The replacement Session surface's four pieces.
+    ///
+    /// The DOCUMENT holds what the project schema has nowhere to put —
+    /// per-clip launch rules, scene properties, the two performance
+    /// memories — and is reconciled with the arrangement's content once a
+    /// frame by `session_bridge::sync_document`. The RUNTIME is the
+    /// planner's own state: what is queued and what is playing. The VIEW
+    /// state is selection, scroll and gesture ownership, which never
+    /// leaves the screen. The CLIPBOARD is Lift/Drop.
+    session_doc: daw::ui::session_next::SessionDocument,
+    session_runtime: daw::ui::session_next::SessionRuntime,
+    session_view: daw::ui::session_next::SessionViewState,
+    session_clipboard: daw::ui::session_next::SessionClipboard,
     automation_mode: bool,
     parameter_registry: ParameterRegistry,
     automation_target: String,
@@ -11403,6 +16101,23 @@ struct App {
     piano_roll: piano_roll::PianoRoll,
     /// The audio editor's view state; source and placement remain in Clip.
     waveform: waveform::Editor,
+    /// The audio selection last projected onto the arrangement's time
+    /// selection. Compared rather than written every frame, so an
+    /// arrangement drag is not overwritten by a stale editor range on
+    /// the very next frame.
+    mirrored_audio_selection: Option<waveform::Selection>,
+    /// The destructive edit currently with the worker. One at a time, and
+    /// a second ask for the same clip is refused rather than queued: two
+    /// renders racing to repoint one clip is two answers to "what file is
+    /// this now?", and the loser would silently win.
+    render_job: Option<RenderRequest>,
+    /// Audio taken off a clip, waiting to be pasted.
+    ///
+    /// Beside the arrangement's clip clipboard rather than inside it:
+    /// pasting a CLIP and pasting AUDIO are different verbs with
+    /// different targets, and one slot holding either would make Ctrl+V
+    /// mean whichever you copied last.
+    audio_clipboard: Option<daw::render::Extract>,
     /// Which face the bottom region shows.
     bottom_view: BottomView,
     /// Which region the keyboard is pointing at.
@@ -11411,12 +16126,17 @@ struct App {
     palette: Palette,
     /// The project window: save, load, new, and the recent files.
     project: ProjectWindow,
+    splash: Splash,
+    export: ExportWindow,
+    /// The render in flight, if any. One at a time: two exports would
+    /// fight over nothing except the user's attention, and the second
+    /// would finish looking like the first.
+    export_job: Option<ExportJob>,
     /// The file the song lives in, once it has one. Save goes here without
     /// asking; Save As and Load change it.
     project_path: Option<std::path::PathBuf>,
-    /// The theme window: every Gogh scheme, picked live. Opened from the
-    /// palette's "change theme"; while open it owns the keyboard the same
-    /// way the palette does.
+    /// The dark/light theme window, previewed live. Opened from the palette's
+    /// "change theme"; while open it owns the keyboard like the palette.
     skin: Skin,
 
     // --- the engine, owned here and nowhere else ---------------------------
@@ -11433,6 +16153,52 @@ struct App {
     /// retired node — and a device that left the schedule (bypassed, or on
     /// a muted track) is simply absent.
     device_nodes: HashMap<u64, NodeId>,
+    /// The readout slot each tapped device holds in the current
+    /// schedule, by instance id. Re-captured on every swap, exactly as
+    /// `device_nodes` is: a slot from a retired schedule would read some
+    /// other device's working.
+    readout_slots: HashMap<u64, usize>,
+    /// The node each AUDIO CLIP compiled to, by clip id. Re-captured on
+    /// every swap for the reason `device_nodes` is: a letter addressed to
+    /// a retired node is a letter delivered to whoever moved in.
+    clip_nodes: HashMap<u64, NodeId>,
+    /// Files whose REVERSAL we asked the sample worker for.
+    ///
+    /// The worker hands back one result type for every job it does, so
+    /// without this a finished reversal would look exactly like a
+    /// finished import — and `finish_sample_placement` would drop a
+    /// second copy of the sample onto the timeline.
+    pending_reversals: std::collections::HashSet<std::path::PathBuf>,
+    /// The rolling scope history of each tapped device, by instance id.
+    ///
+    /// Kept by the APP because a card is rebuilt from engine units every
+    /// frame — a history the card owned would be forgotten before the
+    /// next frame drew it. Survives a schedule swap on purpose: the
+    /// picture should not blank when a track is muted.
+    device_histories: HashMap<u64, device::scope::History>,
+    /// Each sampler's loaded file reduced to a picture, by instance id.
+    /// Derived from the document, never saved: it is a cache of what the
+    /// file looks like, and the file is the truth.
+    sampler_faces: HashMap<u64, SamplerFace>,
+    /// Each sampler's slice table, by instance id — a flat copy of what
+    /// lives on the track, so the rack can be drawn without borrowing the
+    /// arrangement while it draws.
+    sampler_slices: HashMap<u64, Vec<u64>>,
+    /// `(track, instance)` of the sampler being edited full size, if any.
+    ///
+    /// View state, so it is deliberately NOT saved with the project —
+    /// which surface you had open is how you were LOOKING at the song,
+    /// not part of it. Same rule the scrolls and zooms of the arrangement
+    /// keep.
+    expanded_sampler: Option<(usize, u64)>,
+    /// `(track, instance)` of the sampler a browser drag was over when the
+    /// rack last drew, or `None`.
+    ///
+    /// Read by the release handler, which runs BEFORE the rack in a
+    /// frame — so this is deliberately one frame old, exactly as
+    /// `DragImport::spot` is. A pointer moving faster than a frame is not
+    /// a pointer anybody dropped on purpose.
+    sampler_drop_target: Option<(usize, u64)>,
     /// Each track's PAN node, by track index. Every instrument track has
     /// one, so a header knob is always addressable without a recompile.
     pan_ids: Vec<Option<NodeId>>,
@@ -11441,6 +16207,12 @@ struct App {
     /// project all reconcile through one door — whoever moved pan, the
     /// letter goes out once and only on a real change.
     sent_pan: Vec<f32>,
+    /// The master's output node and the last level and pan sent to it —
+    /// the same only-on-change door the lanes use, and for the same
+    /// reason: a fader that is not moving must not cost a letter a frame.
+    master_out: Option<NodeId>,
+    sent_master_pan: f32,
+    sent_master_volume: f32,
     /// The app's monotonic UI clock, in seconds — what free modulators run
     /// on WHEN THE ENGINE IS OFF. With a stream up, free modulators ride the
     /// engine's sample clock instead, which is what makes a bounce of one
@@ -11467,7 +16239,7 @@ struct App {
     wire_scopes: HashMap<u64, std::collections::VecDeque<f32>>,
     /// The wire whose row is unfolded into curve/steps/lag and the scope.
     expanded_wire: Option<u64>,
-    /// The unified modulation matrix window. Ctrl+M.
+    /// The unified modulation matrix window.
     matrix_open: bool,
     /// Last-sent automated device values, per track by target id. Cleared
     /// on every schedule swap with the other sent caches: fresh ids mean
@@ -11481,14 +16253,21 @@ struct App {
     /// numbers themselves live in `ui::device::meter`, which is where the
     /// opinions about how a meter should move already are.
     meters: Vec<device::meter::Ballistics>,
+    /// The master's meter, kept apart from the lanes' because it is not
+    /// one of them: `meters` is indexed BY TRACK, and a master squeezed
+    /// onto the end of that vec would be track `n` to every loop that
+    /// walks it.
+    master_meter: device::meter::Ballistics,
     /// The clips the current schedule was compiled from — the dirty check —
     /// and when it was compiled — the debounce clock.
     compiled_clips: Vec<Vec<Clip>>,
     last_compile: Option<Instant>,
-    /// The graph's SHAPE as compiled: (metronome, loop_len_beats, tracks).
-    /// A change here swaps the schedule immediately, no debounce — the graph
-    /// gained or lost a node, which no param letter can express.
-    graph_key: (bool, Option<f64>, usize, u64, u64, u64),
+    /// The graph's SHAPE as compiled: (metronome, tracks, ...). A change
+    /// here swaps the schedule immediately, no debounce — the graph gained
+    /// or lost a node, which no param letter can express. The transport
+    /// loop is deliberately NOT part of the shape: patterns compile
+    /// one-shot, so moving the brace changes nothing a recompile would.
+    graph_key: (bool, usize, u64, u64, u64),
     /// The transport loop last sent, in samples — resent only on change, so
     /// brace drags, Ctrl+L and tempo changes all reconcile through one door.
     sent_loop: Option<(u64, u64)>,
@@ -11508,6 +16287,162 @@ struct ProjectWindow {
     focused: bool,
 }
 
+/// The welcome screen's state.
+///
+/// A screen rather than a dialog: it is the first thing the app says, and
+/// what it says is "here are your songs". It owns no project state — every
+/// button on it goes through the same `new_project` / `load_project` the
+/// palette does, so there is one way to open a song and the splash is not
+/// a second one.
+#[derive(Default)]
+struct Splash {
+    open: bool,
+    path: String,
+    status: Option<String>,
+}
+
+/// One line of the recent list, resolved for drawing.
+///
+/// A recent entry is a path written down on a previous run, and the file
+/// under it may have been moved, renamed or deleted since. Saying so in the
+/// list is the difference between "that song is gone" and a modal that
+/// refuses when clicked.
+struct RecentEntry {
+    /// The file's own name, without the `.daw.ron` tail.
+    title: String,
+    /// The folder it lives in, for telling two songs of the same name apart.
+    folder: String,
+    path: String,
+    missing: bool,
+}
+
+/// Resolve the remembered paths into what the splash draws.
+fn recent_entries(paths: &[String]) -> Vec<RecentEntry> {
+    paths
+        .iter()
+        .map(|path| {
+            let file = std::path::Path::new(path);
+            let mut title = file
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.clone());
+            // `song.daw.ron` is one song called "song", not "song.daw".
+            while let Some(stem) = std::path::Path::new(&title)
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .filter(|stem| *stem != title)
+            {
+                title = stem;
+            }
+            RecentEntry {
+                title,
+                folder: file
+                    .parent()
+                    .map(|parent| parent.display().to_string())
+                    .unwrap_or_default(),
+                path: path.clone(),
+                missing: !file.exists(),
+            }
+        })
+        .collect()
+}
+
+/// What part of the song an export writes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum ExportRange {
+    /// Timeline zero to the end of the last clip, plus a tail.
+    #[default]
+    Song,
+    /// The loop brace.
+    Loop,
+    /// The time selection.
+    Selection,
+}
+
+impl ExportRange {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Song => "song",
+            Self::Loop => "loop",
+            Self::Selection => "selection",
+        }
+    }
+
+    /// The beats this range covers, or `None` when there is nothing to
+    /// render — no clips, no loop, no selection. A range that resolves to
+    /// nothing is refused before a file is created, not after.
+    fn beats(self, arr: &Arrangement, tail: f64) -> Option<(f64, f64)> {
+        let (start, end) = match self {
+            Self::Song => (0.0, song_end_beats(arr)),
+            Self::Loop => {
+                let (from, to) = arr.loop_range?;
+                (f64::from(from), f64::from(to))
+            }
+            Self::Selection => {
+                let (from, to) = arr.selection?;
+                (f64::from(from), f64::from(to))
+            }
+        };
+        // The tail is room for what is still ringing when the last note
+        // ends — a reverb cut off at the final bar line is the commonest
+        // way for an export to sound wrong.
+        let end = end + tail;
+        (end > start).then_some((start, end))
+    }
+}
+
+/// Where the last thing in the arrangement finishes, in beats.
+fn song_end_beats(arr: &Arrangement) -> f64 {
+    arr.clips
+        .iter()
+        .flatten()
+        .map(|clip| f64::from(clip.start + clip.len))
+        .fold(0.0, f64::max)
+}
+
+/// The export modal's state. A sibling of [`ProjectWindow`], and deliberately
+/// the same shape: a path to type, a couple of choices, and a status line
+/// next to the button that caused it.
+struct ExportWindow {
+    open: bool,
+    path: String,
+    range: ExportRange,
+    format: daw::audio::bounce::BounceFormat,
+    /// Extra beats written after the range ends, for tails.
+    tail_beats: f64,
+    status: Option<String>,
+    focused: bool,
+}
+
+impl Default for ExportWindow {
+    fn default() -> Self {
+        Self {
+            open: false,
+            path: String::new(),
+            range: ExportRange::default(),
+            format: daw::audio::bounce::BounceFormat::default(),
+            tail_beats: 4.0,
+            status: None,
+            focused: false,
+        }
+    }
+}
+
+/// A render in flight on a worker thread.
+///
+/// Off the UI thread because a render is unbounded work: a five-minute song
+/// is a few seconds of arithmetic, and a frozen window during it reads as a
+/// crash. Nothing about it touches the audio callback — an offline render
+/// compiles its own schedule and never meets the live one.
+struct ExportJob {
+    /// Thousandths, so the bar can be read with one atomic load and no lock.
+    progress: Arc<std::sync::atomic::AtomicU32>,
+    /// Set by the cancel button, read by the worker once per block.
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    done: crossbeam_channel::Receiver<Result<PathBuf, String>>,
+    range: String,
+}
+
 /// What the device region shows when there is no device to show: no track
 /// selected, or a selected track with nothing loaded on it. One line for
 /// both, because the fix is the same — pick a track, load an instrument.
@@ -11523,6 +16458,8 @@ impl App {
             .storage
             .and_then(|storage| eframe::get_value(storage, STORAGE_KEY))
             .unwrap_or_default();
+        // Read before `prefs` is moved into the app.
+        let show_splash = !prefs.skip_splash;
         let library_config: LibraryConfig = cc
             .storage
             .and_then(|storage| eframe::get_value(storage, library::CONFIG_STORAGE_KEY))
@@ -11552,6 +16489,10 @@ impl App {
             prefs,
             transport: Transport::default(),
             launch_quantization: LaunchQuantization::default(),
+            session_doc: daw::ui::session_next::SessionDocument::default(),
+            session_runtime: daw::ui::session_next::SessionRuntime::default(),
+            session_view: daw::ui::session_next::SessionViewState::default(),
+            session_clipboard: daw::ui::session_next::SessionClipboard::default(),
             automation_mode: false,
             parameter_registry: ParameterRegistry::default(),
             automation_target: TRACK_VOLUME_TARGET.to_owned(),
@@ -11576,18 +16517,41 @@ impl App {
             arrangement: Arrangement::default(),
             piano_roll: piano_roll::PianoRoll::default(),
             waveform: waveform::Editor::default(),
+            mirrored_audio_selection: None,
+            render_job: None,
+            audio_clipboard: None,
             bottom_view: BottomView::Rack,
             focus: Focus::default(),
             palette: Palette::default(),
             project: ProjectWindow::default(),
+            // The first thing the app says, unless the user has asked it
+            // not to. Set from the stored preference so a launch either
+            // offers the songs or goes straight to work.
+            splash: Splash {
+                open: show_splash,
+                ..Splash::default()
+            },
+            export: ExportWindow::default(),
+            export_job: None,
             project_path: None,
             skin,
             engine: None,
             notice: None,
             hud: None,
             device_nodes: HashMap::new(),
+            readout_slots: HashMap::new(),
+            clip_nodes: HashMap::new(),
+            pending_reversals: std::collections::HashSet::new(),
+            device_histories: HashMap::new(),
+            sampler_faces: HashMap::new(),
+            sampler_slices: HashMap::new(),
+            sampler_drop_target: None,
+            expanded_sampler: None,
             pan_ids: Vec::new(),
             sent_pan: Vec::new(),
+            master_out: None,
+            sent_master_pan: f32::NAN,
+            sent_master_volume: f32::NAN,
             clock_seconds: 0.0,
             mod_values: HashMap::new(),
             wire_outputs: HashMap::new(),
@@ -11600,9 +16564,10 @@ impl App {
             sent_automation: Vec::new(),
             sent_volume: Vec::new(),
             meters: Vec::new(),
+            master_meter: device::meter::Ballistics::default(),
             compiled_clips: Vec::new(),
             last_compile: None,
-            graph_key: (false, None, 0, 0, 0, 0),
+            graph_key: (false, 0, 0, 0, 0),
             sent_loop: None,
         }
     }
@@ -11611,16 +16576,6 @@ impl App {
     /// edge to edge — no inner margin, so the boxes read as boxes.
     fn fill(&self, color: egui::Color32) -> egui::Frame {
         egui::Frame::new().fill(color)
-    }
-
-    /// The Seq's clip length: the loop region's END beat while looping is on,
-    /// so the pattern's cycle and the transport's wrap agree; None otherwise
-    /// (one-shot against the rolling timeline).
-    fn loop_len_beats(&self) -> Option<f64> {
-        if !self.transport.loop_on {
-            return None;
-        }
-        self.arrangement.loop_range.map(|(_, to)| f64::from(to))
     }
 
     /// Open the stream and put the current graph on it. Failure lands in the
@@ -11636,6 +16591,17 @@ impl App {
     fn commands(&self) -> Vec<PaletteCommand> {
         let on = self.engine.is_some();
         let has_track = self.arrangement.active_track().is_some();
+        let create_track = self
+            .arrangement
+            .cursor
+            .map(|(track, _)| track)
+            .or_else(|| self.arrangement.active_track())
+            .unwrap_or(0);
+        let can_create_clip = self
+            .arrangement
+            .tracks
+            .get(create_track)
+            .is_some_and(|track| track.kind.takes_instrument());
         let has_clip = self.arrangement.selected_clip.is_some();
         let editor = self.bottom_view == BottomView::ClipEditor;
         let kind = clip_editor_kind(&self.arrangement);
@@ -11643,6 +16609,17 @@ impl App {
         let waveform = editor
             && kind == ClipEditorKind::Audio
             && self.arrangement.active_audio_clip().is_some();
+        // A destructive verb needs a selection that names ONE stretch of
+        // one file, and needs the worker free. Both are shown as disabled
+        // rather than hidden: a verb that vanishes teaches nothing about
+        // why, and "your selection crosses a loop seam" is worth learning
+        // once rather than wondering about forever.
+        let destructive =
+            waveform && self.render_job.is_none() && self.audio_edit_target().is_some();
+        // The channel verbs are whole-file: they need a clip and a free
+        // worker, and nothing else. Requiring a selection for them would
+        // be a rule with no reason behind it.
+        let whole_file = waveform && self.render_job.is_none();
         vec![
             // --- transport ---------------------------------------------
             PaletteCommand::new("transport.play", "transport", "play / stop").hint("space"),
@@ -11652,8 +16629,10 @@ impl App {
             PaletteCommand::new("transport.follow", "transport", "toggle follow playhead"),
             // --- clip --------------------------------------------------
             PaletteCommand::new("clip.new", "clip", "new clip at cursor")
-                .enabled(self.arrangement.cursor.is_some()),
+                .hint("ctrl+M")
+                .enabled(can_create_clip),
             PaletteCommand::new("clip.duplicate", "clip", "duplicate clip").enabled(has_clip),
+            PaletteCommand::new("clip.rename", "clip", "rename clip").enabled(has_clip),
             PaletteCommand::new("clip.delete", "clip", "delete clip").enabled(has_clip),
             PaletteCommand::new("clip.loop", "clip", "loop the selection"),
             PaletteCommand::new("clip.split", "clip", "split clip at cursor").hint("ctrl+E"),
@@ -11677,8 +16656,10 @@ impl App {
                 .hint("ctrl+shift+S"),
             PaletteCommand::new("project.open", "project", "open project…").hint("ctrl+O"),
             PaletteCommand::new("project.new", "project", "new project"),
+            PaletteCommand::new("project.export", "project", "export audio…"),
+            PaletteCommand::new("project.splash", "project", "welcome screen"),
             // --- modulation --------------------------------------------
-            PaletteCommand::new("mod.matrix", "mod", "modulation matrix").hint("ctrl+M"),
+            PaletteCommand::new("mod.matrix", "mod", "modulation matrix"),
             PaletteCommand::new("mod.lfo", "mod", "add LFO"),
             PaletteCommand::new("mod.follower", "mod", "add follower of selected track")
                 .enabled(self.arrangement.selected.is_some()),
@@ -11748,6 +16729,128 @@ impl App {
             PaletteCommand::new("waveform.zoom.out", "zoom", "zoom out of waveform")
                 .enabled(waveform),
             PaletteCommand::new("waveform.zoom.fit", "zoom", "fit waveform").enabled(waveform),
+            // --- audio: what a selection is, and how it lands ----------
+            PaletteCommand::new("audio.select_all", "audio", "select whole clip")
+                .hint("ctrl+A")
+                .enabled(waveform),
+            PaletteCommand::new("audio.select_none", "audio", "clear audio selection")
+                .hint("esc")
+                .enabled(waveform && self.waveform.selection().is_some()),
+            PaletteCommand::new("audio.snap_zero", "audio", "snap to zero crossings")
+                .hint("Z")
+                .enabled(waveform),
+            PaletteCommand::new("audio.db_scale", "audio", "waveform amplitude in dB")
+                .hint("D")
+                .enabled(waveform),
+            PaletteCommand::new("audio.zoom_selection", "audio", "zoom to audio selection")
+                .hint("ctrl+F")
+                .enabled(waveform && self.waveform.selection().is_some()),
+            // --- audio: the destructive verbs --------------------------
+            //
+            // Disabled rather than hidden when they cannot apply. A verb
+            // that vanishes teaches nothing; one that is greyed out with
+            // a reason teaches what a selection has to be.
+            PaletteCommand::new("audio.silence", "audio", "silence selection").enabled(destructive),
+            PaletteCommand::new("audio.gain", "audio", "apply gain to selection")
+                .enabled(destructive),
+            PaletteCommand::new("audio.normalize", "audio", "normalize selection")
+                .enabled(destructive),
+            PaletteCommand::new("audio.normalize_rms", "audio", "normalize selection (RMS)")
+                .enabled(destructive),
+            PaletteCommand::new("audio.reverse_sel", "audio", "reverse selection")
+                .enabled(destructive),
+            PaletteCommand::new("audio.invert", "audio", "invert polarity of selection")
+                .enabled(destructive),
+            PaletteCommand::new(
+                "audio.remove_dc",
+                "audio",
+                "remove DC offset from selection",
+            )
+            .enabled(destructive),
+            PaletteCommand::new("audio.fade_in", "audio", "fade in over selection")
+                .enabled(destructive),
+            PaletteCommand::new("audio.fade_out", "audio", "fade out over selection")
+                .enabled(destructive),
+            // --- audio: the clipboard and the structural edits ---------
+            PaletteCommand::new("audio.copy", "audio", "copy audio selection")
+                .hint("ctrl+C")
+                .enabled(waveform && self.audio_edit_target().is_some()),
+            PaletteCommand::new("audio.cut", "audio", "cut audio selection")
+                .hint("ctrl+X")
+                .enabled(destructive),
+            PaletteCommand::new(
+                "audio.delete",
+                "audio",
+                "silence selection, keep the length",
+            )
+            .hint("del")
+            .enabled(destructive),
+            PaletteCommand::new("audio.paste", "audio", "paste audio at the cursor")
+                .hint("ctrl+V")
+                .enabled(waveform && self.render_job.is_none() && self.audio_clipboard.is_some()),
+            PaletteCommand::new("audio.crop", "audio", "crop clip to selection")
+                .enabled(destructive),
+            PaletteCommand::new(
+                "audio.insert_silence",
+                "audio",
+                "insert silence at the cursor",
+            )
+            .enabled(waveform && self.render_job.is_none() && self.waveform.selection().is_some()),
+            PaletteCommand::new("audio.ripple", "audio", "ripple length changes").enabled(waveform),
+            PaletteCommand::new("audio.envelope", "audio", "show the clip gain envelope")
+                .enabled(waveform),
+            PaletteCommand::new(
+                "audio.envelope_clear",
+                "audio",
+                "clear the clip gain envelope",
+            )
+            .enabled(
+                waveform
+                    && self
+                        .arrangement
+                        .active_audio_clip()
+                        .and_then(|clip| clip.audio.as_ref())
+                        .is_some_and(|audio| !audio.envelope.is_empty()),
+            ),
+            // --- audio: the channel operations -------------------------
+            //
+            // Whole-file, every one of them, so they need no selection —
+            // only a clip and a free worker.
+            PaletteCommand::new("audio.swap_channels", "audio", "swap left and right")
+                .enabled(whole_file && self.audio_channels() == 2),
+            PaletteCommand::new("audio.mono", "audio", "fold to mono")
+                .enabled(whole_file && self.audio_channels() > 1),
+            PaletteCommand::new("audio.mono_left", "audio", "fold to mono (keep left)")
+                .enabled(whole_file && self.audio_channels() > 1),
+            PaletteCommand::new("audio.mono_right", "audio", "fold to mono (keep right)")
+                .enabled(whole_file && self.audio_channels() > 1),
+            PaletteCommand::new("audio.extract_left", "audio", "extract left to a new clip")
+                .enabled(whole_file && self.audio_channels() > 1),
+            PaletteCommand::new(
+                "audio.extract_right",
+                "audio",
+                "extract right to a new clip",
+            )
+            .enabled(whole_file && self.audio_channels() > 1),
+            // --- audio: flatten and transpose --------------------------
+            PaletteCommand::new("audio.flatten", "audio", "flatten clip to a plain file")
+                .enabled(whole_file),
+            PaletteCommand::new("audio.transpose_up", "audio", "transpose up a semitone")
+                .enabled(whole_file),
+            PaletteCommand::new("audio.transpose_down", "audio", "transpose down a semitone")
+                .enabled(whole_file),
+            PaletteCommand::new(
+                "audio.transpose_octave_up",
+                "audio",
+                "transpose up an octave",
+            )
+            .enabled(whole_file),
+            PaletteCommand::new(
+                "audio.transpose_octave_down",
+                "audio",
+                "transpose down an octave",
+            )
+            .enabled(whole_file),
             // --- key ---------------------------------------------------
             PaletteCommand::new("key.tonic", "key", "set tonic from cursor").enabled(roll),
             PaletteCommand::new("key.major", "key", "scale: major"),
@@ -11765,12 +16868,56 @@ impl App {
                 .enabled(roll),
             PaletteCommand::new("note.counter.below", "counterpoint", "counter-melody below")
                 .enabled(roll),
+            // --- notes: the transforms ---------------------------------
+            //
+            // Each acts on the selection, or on the note under the cursor
+            // when nothing is selected — `PianoRoll::acting_on` decides
+            // that once so the palette and the keyboard cannot disagree.
+            PaletteCommand::new("note.quantize.full", "note", "quantize selection").enabled(roll),
+            PaletteCommand::new("note.quantize.half", "note", "quantize selection halfway")
+                .enabled(roll),
+            PaletteCommand::new("note.quantize.swing", "note", "quantize with swing").enabled(roll),
+            PaletteCommand::new("note.humanize", "note", "humanize selection").enabled(roll),
+            PaletteCommand::new("note.legato", "note", "legato selection").enabled(roll),
+            PaletteCommand::new("note.strum", "note", "strum selection down").enabled(roll),
+            PaletteCommand::new("note.strum.back", "note", "strum selection up").enabled(roll),
+            PaletteCommand::new("note.retrograde", "note", "reverse selection in time")
+                .enabled(roll),
+            PaletteCommand::new("note.invert", "note", "invert selection around its middle")
+                .enabled(roll),
+            PaletteCommand::new("note.scale.force", "note", "force selection into key")
+                .enabled(roll),
+            PaletteCommand::new("note.time.double", "note", "double selection's length")
+                .enabled(roll),
+            PaletteCommand::new("note.time.halve", "note", "halve selection's length")
+                .enabled(roll),
+            PaletteCommand::new(
+                "note.ramp.vel.up",
+                "note",
+                "ramp velocity up across selection",
+            )
+            .enabled(roll),
+            PaletteCommand::new(
+                "note.ramp.vel.down",
+                "note",
+                "ramp velocity down across selection",
+            )
+            .enabled(roll),
+            PaletteCommand::new(
+                "note.ramp.prob.down",
+                "note",
+                "ramp probability down across selection",
+            )
+            .enabled(roll),
             // --- grid --------------------------------------------------
             PaletteCommand::new("grid.narrow", "grid", "narrow grid"),
             PaletteCommand::new("grid.widen", "grid", "widen grid"),
             // --- view --------------------------------------------------
             PaletteCommand::new("view.roll", "view", "show clip editor").enabled(!editor),
             PaletteCommand::new("view.rack", "view", "show device rack").enabled(editor),
+            PaletteCommand::new("view.browser", "view", "show / hide browser").hint("ctrl+B"),
+            PaletteCommand::new("view.lower", "view", "show / hide lower panel").hint("ctrl+alt+L"),
+            PaletteCommand::new("view.chrome", "view", "hide everything").hint("ctrl+shift+F"),
             PaletteCommand::new("view.compact", "view", "density: compact"),
             PaletteCommand::new("view.comfortable", "view", "density: comfortable"),
             PaletteCommand::new("view.theme", "view", "change theme"),
@@ -11795,21 +16942,41 @@ impl App {
             "transport.loop" => actions.push(UiAction::ToggleLoop),
             "transport.follow" => actions.push(UiAction::ToggleFollow),
 
-            "clip.new" => {
-                // At the arrangement's keyboard cursor, one bar long — the
-                // create path the palette exists to give an empty session.
-                if let Some((track, beat)) = self.arrangement.cursor {
-                    let len = self.transport.beats_per_bar as f32;
-                    self.arrangement.create_clip(track, beat, len);
+            "clip.new" => actions.push(UiAction::CreateClip),
+            "clip.duplicate" => actions.push(UiAction::DuplicateClip),
+            "clip.rename" => {
+                // The palette opens the SAME inline editor the context
+                // menu does — one rename path, not two, exactly as
+                // `track.rename` above.
+                //
+                // It exists because double-clicking a clip stopped
+                // renaming it and started opening its editor. That left
+                // the context menu as the only way in, which is to say:
+                // no way in at all without a mouse.
+                if let Some((t, i)) = self.arrangement.selected_clip
+                    && let Some(clip) = self.arrangement.clips.get(t).and_then(|c| c.get(i))
+                {
+                    let name = clip.name.clone();
+                    self.arrangement.rename = Some(Rename {
+                        track: t,
+                        id: clip.id,
+                        text: name.clone(),
+                        original: name,
+                        focused: false,
+                    });
                 }
             }
-            "clip.duplicate" => actions.push(UiAction::DuplicateClip),
             "clip.delete" => actions.push(UiAction::DeleteSelected),
             "view.main" => actions.push(UiAction::ToggleMainView),
             "project.save" => actions.push(UiAction::SaveProject),
             "project.saveas" => actions.push(UiAction::SaveProjectAs),
             "project.open" => actions.push(UiAction::OpenProjectWindow),
             "project.new" => actions.push(UiAction::NewProject),
+            "project.export" => self.open_export_window(),
+            "project.splash" => {
+                self.splash.status = None;
+                self.splash.open = true;
+            }
             "mod.matrix" => self.matrix_open = !self.matrix_open,
             "mod.lfo" => {
                 if self.arrangement.add_lfo().is_none() {
@@ -11855,7 +17022,7 @@ impl App {
                     && let Some(t) = self.arrangement.tracks.get(i)
                 {
                     let name = t.name.clone();
-                    self.arrangement.selected = Some(i);
+                    self.arrangement.select_track(i);
                     self.arrangement.track_rename = Some(TrackRename {
                         track: i,
                         text: name.clone(),
@@ -11876,6 +17043,11 @@ impl App {
             "waveform.zoom.in" => self.waveform.step_zoom(2),
             "waveform.zoom.out" => self.waveform.step_zoom(-2),
             "waveform.zoom.fit" => self.waveform.fit(),
+            // View operations, every one of them: nothing here touches
+            // the model, so nothing here banks an undo step.
+            // Destructive: a render to a NEW file and the clip repointed
+            // at it. The old file stays, which is what makes undo exact.
+            id if id.starts_with("audio.") => self.run_audio_command(id),
 
             "key.major" => self.arrangement.key.scale = daw::theory::Scale::Major,
             "key.minor" => self.arrangement.key.scale = daw::theory::Scale::NaturalMinor,
@@ -11904,6 +17076,9 @@ impl App {
 
             "view.roll" => self.bottom_view = BottomView::ClipEditor,
             "view.rack" => self.bottom_view = BottomView::Rack,
+            "view.browser" => actions.push(UiAction::ToggleBrowser),
+            "view.lower" => actions.push(UiAction::ToggleLower),
+            "view.chrome" => actions.push(UiAction::ToggleChrome),
             "view.compact" => actions.push(UiAction::SetDensity(Density::Compact)),
             "view.comfortable" => actions.push(UiAction::SetDensity(Density::Comfortable)),
             "view.theme" => self.skin.open(),
@@ -11915,7 +17090,11 @@ impl App {
                     && let Some(instance) = self.arrangement.tracks[t].instrument().copied()
                 {
                     let fresh = DeviceState::new(instance.kind());
-                    self.apply_device_edits(t, instance.id, &device_edits(fresh));
+                    self.apply_device_edits(
+                        ChainOwner::Track(t),
+                        instance.id,
+                        &device_edits(fresh),
+                    );
                 }
             }
 
@@ -11966,6 +17145,10 @@ impl App {
                         start: beat,
                         len: grid,
                         vel: 100,
+                        muted: false,
+                        plocks: Vec::new(),
+                        prob: 1.0,
+                        cond: None,
                     });
                     notes.len() - 1
                 })
@@ -12000,7 +17183,56 @@ impl App {
                 let added = piano_roll::counterpoint(notes, &selected, above, key);
                 self.piano_roll.selected = added.into_iter().collect();
             }
-            _ => {}
+            // The TRANSFORMS. Every one is a pure function over the note
+            // list and a selection, and `acting_on` decides that
+            // selection ONCE — the roll's own rule, so a verb from the
+            // palette and the same verb from the keyboard act on exactly
+            // the same notes.
+            id => {
+                let sel = self.piano_roll.acting_on(notes);
+                if sel.is_empty() {
+                    return;
+                }
+                let seed = self.piano_roll.seed;
+                match id {
+                    "note.quantize.full" => piano_roll::quantize(notes, &sel, grid, 1.0, 0.0),
+                    "note.quantize.half" => piano_roll::quantize(notes, &sel, grid, 0.5, 0.0),
+                    "note.quantize.swing" => piano_roll::quantize(notes, &sel, grid, 1.0, 0.54),
+                    "note.humanize" => piano_roll::humanize(notes, &sel, grid * 0.08, 12, seed),
+                    "note.legato" => piano_roll::legato(notes, &sel),
+                    "note.strum" => piano_roll::strum(notes, &sel, grid * 0.25),
+                    "note.strum.back" => piano_roll::strum(notes, &sel, grid * -0.25),
+                    "note.retrograde" => piano_roll::retrograde(notes, &sel),
+                    "note.invert" => {
+                        let pivot = piano_roll::pivot_of(notes, &sel);
+                        piano_roll::invert(notes, &sel, pivot);
+                    }
+                    "note.scale.force" => piano_roll::force_to_scale(notes, &sel, key),
+                    "note.time.double" => piano_roll::scale_time(notes, &sel, 2.0),
+                    "note.time.halve" => piano_roll::scale_time(notes, &sel, 0.5),
+                    // A ramp runs ACROSS THE SELECTION, so the two ends
+                    // are the first and last selected note rather than
+                    // the clip's own edges — ramping four notes in the
+                    // middle of a bar should use all of the range, not
+                    // the sliver of it they happen to occupy.
+                    id if id.starts_with("note.ramp.") => {
+                        let (from, to) = sel
+                            .iter()
+                            .filter_map(|i| notes.get(*i))
+                            .fold((f64::MAX, f64::MIN), |(lo, hi), note| {
+                                (lo.min(note.start), hi.max(note.start))
+                            });
+                        let (lane, v0, v1) = match id {
+                            "note.ramp.vel.up" => (piano_roll::Lane::Velocity, 0.4, 1.0),
+                            "note.ramp.vel.down" => (piano_roll::Lane::Velocity, 1.0, 0.4),
+                            "note.ramp.prob.down" => (piano_roll::Lane::Probability, 1.0, 0.3),
+                            _ => return,
+                        };
+                        piano_roll::lane_ramp(notes, &sel, lane, from, to, v0, v1, grid);
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -12012,6 +17244,28 @@ impl App {
     /// broken, and "it went to track 1, which is now selected" is both
     /// visible and undoable by loading it somewhere else.
     fn load_device(&mut self, item: BrowserItem) {
+        // The master, when it is the thing selected: an effect joins its
+        // chain, an instrument is refused in words. A master has no notes
+        // to give one, and dropping it into silence would look like a bug.
+        if self.arrangement.master_selected {
+            if item.load.is_instrument() {
+                self.notice = Some(format!(
+                    "the master is a bus — no slot for a {}",
+                    item.load.spec().name
+                ));
+                return;
+            }
+            let instance = DeviceInstance {
+                id: self.arrangement.mint_id(),
+                state: DeviceState::new(item.load),
+                bypass: false,
+                page: 0,
+                view_zoom: unit_zoom(),
+                view_scroll: 0.0,
+            };
+            self.arrangement.master.insert_device(instance);
+            return;
+        }
         let track = self.arrangement.active_track().unwrap_or(0);
         let Some(t) = self.arrangement.tracks.get(track) else {
             return;
@@ -12033,6 +17287,9 @@ impl App {
             id: self.arrangement.mint_id(),
             state: DeviceState::new(item.load),
             bypass: false,
+            page: 0,
+            view_zoom: unit_zoom(),
+            view_scroll: 0.0,
         };
         let Some(t) = self.arrangement.tracks.get_mut(track) else {
             return;
@@ -12043,7 +17300,7 @@ impl App {
         if let Some(displaced) = t.insert_device(instance) {
             self.arrangement.forget_device(track, displaced);
         }
-        self.arrangement.selected = Some(track);
+        self.arrangement.select_track(track);
     }
 
     /// Apply a browser request in the green-zone app shell. Catalog changes
@@ -12283,6 +17540,454 @@ impl App {
         }
     }
 
+    /// The welcome screen: start something, or pick up where you left off.
+    ///
+    /// Deliberately not a file browser. It offers the three things anyone
+    /// opens a DAW to do — a new song, a song they were working on, a path
+    /// they can type or paste — and gets out of the way. Escape dismisses
+    /// it and leaves the empty song already loaded, so it can never stand
+    /// between the user and the app.
+    fn draw_splash(&mut self, ctx: &egui::Context) {
+        if !self.splash.open {
+            return;
+        }
+        let mut load: Option<String> = None;
+        let mut fresh = false;
+        let mut forget: Option<String> = None;
+        let recents = recent_entries(&self.prefs.recent_projects);
+        let modal = egui::Modal::new(egui::Id::new("splash")).show(ctx, |ui| {
+            ui.set_width(460.0);
+            // Centred as a whole rather than line by line: a welcome
+            // screen is a poster, not a form, and a ragged left edge under
+            // a centred heading is the thing that makes one look homemade.
+            // Every row below therefore lays itself out inside a centred
+            // strip of the same width.
+            ui.vertical_centered(|ui| {
+                ui.heading("daw");
+                ui.label(
+                    egui::RichText::new(concat!("version ", env!("CARGO_PKG_VERSION")))
+                        .weak()
+                        .small(),
+                );
+                ui.add_space(10.0);
+                if ui.button("new song").clicked() {
+                    fresh = true;
+                }
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new("recent").weak());
+            });
+
+            if recents.is_empty() {
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        egui::RichText::new("nothing yet — the songs you save turn up here")
+                            .weak()
+                            .small(),
+                    );
+                });
+            }
+            for entry in &recents {
+                // Each song is a small stack rather than a row: a centred
+                // column can only centre ONE widget per line, and stacking
+                // the name over its folder centres cleanly at any width —
+                // where a horizontal row would sit stubbornly at the left.
+                ui.vertical_centered(|ui| {
+                    // A song whose file has gone is shown, not hidden: it
+                    // is how you find out it moved. It cannot be opened,
+                    // and it can be forgotten from here.
+                    let opened = ui
+                        .add_enabled(!entry.missing, egui::Button::new(&entry.title).frame(false))
+                        .on_hover_text(&entry.path)
+                        .clicked();
+                    if opened {
+                        load = Some(entry.path.clone());
+                    }
+                    if entry.missing {
+                        ui.label(egui::RichText::new("missing").weak().small());
+                        if ui.small_button("forget").clicked() {
+                            forget = Some(entry.path.clone());
+                        }
+                    } else {
+                        ui.label(egui::RichText::new(&entry.folder).weak().small());
+                    }
+                    ui.add_space(4.0);
+                });
+            }
+
+            ui.vertical_centered(|ui| {
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new("open a file").weak());
+            });
+            // The field keeps the modal's full width — a centred text box
+            // narrower than its own screen would be a different control
+            // from the one the project window has.
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut self.splash.path)
+                    .desired_width(f32::INFINITY)
+                    .horizontal_align(egui::Align::Center)
+                    .hint_text("/home/you/songs/song.daw.ron"),
+            );
+            let typed = self.splash.path.trim().to_owned();
+            let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let clicked = ui
+                .vertical_centered(|ui| {
+                    ui.add_enabled(!typed.is_empty(), egui::Button::new("open"))
+                        .clicked()
+                })
+                .inner;
+            if (entered || clicked) && !typed.is_empty() {
+                load = Some(typed);
+            }
+
+            ui.vertical_centered(|ui| {
+                if let Some(status) = &self.splash.status {
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new(status).weak());
+                }
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+                let mut show = !self.prefs.skip_splash;
+                if ui.checkbox(&mut show, "show this at startup").changed() {
+                    self.prefs.skip_splash = !show;
+                }
+                ui.label(
+                    egui::RichText::new("esc starts an empty song · the palette has it back")
+                        .weak()
+                        .small(),
+                );
+            });
+        });
+
+        if modal.should_close() {
+            self.splash.open = false;
+        }
+        if let Some(gone) = forget {
+            self.prefs.recent_projects.retain(|path| *path != gone);
+        }
+        if fresh {
+            self.new_project();
+            self.splash.open = false;
+        }
+        if let Some(path) = load {
+            match self.load_project(PathBuf::from(&path)) {
+                Ok(()) => {
+                    self.splash.open = false;
+                    self.splash.status = None;
+                }
+                // The screen stays up and says why: a mistyped path should
+                // leave you where you can fix it.
+                Err(error) => self.splash.status = Some(error),
+            }
+        }
+    }
+
+    /// Open the export modal, with a filename derived from the project's
+    /// own so the common case is one keystroke — Enter.
+    fn open_export_window(&mut self) {
+        if self.export.path.trim().is_empty() {
+            self.export.path = self
+                .project_path
+                .as_ref()
+                .map(|path| {
+                    let mut wav = path.clone();
+                    // `song.daw.ron` becomes `song.wav`, not `song.daw.wav`.
+                    while wav.extension().is_some() {
+                        wav.set_extension("");
+                    }
+                    wav.set_extension("wav");
+                    wav.display().to_string()
+                })
+                .unwrap_or_default();
+        }
+        self.export.status = None;
+        self.export.open = true;
+    }
+
+    /// Start a render on a worker thread.
+    ///
+    /// The spec is built exactly as `push_graph` builds the live one, with
+    /// two deliberate differences: the TIMELINE's clips rather than
+    /// whatever the launcher is holding — an export is of the song as
+    /// arranged — and no metronome, ever.
+    fn start_export(&mut self, path: PathBuf, ctx: &egui::Context) {
+        if self.export_job.is_some() {
+            self.export.status = Some("a render is already running".to_owned());
+            return;
+        }
+        let tail = self.export.tail_beats.max(0.0);
+        let Some((start, end)) = self.export.range.beats(&self.arrangement, tail) else {
+            self.export.status = Some(match self.export.range {
+                ExportRange::Song => "nothing to export — the timeline is empty".to_owned(),
+                ExportRange::Loop => "no loop brace to export".to_owned(),
+                ExportRange::Selection => "no time selection to export".to_owned(),
+            });
+            return;
+        };
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+            && !parent.is_dir()
+        {
+            self.export.status = Some(format!("no such folder: {}", parent.display()));
+            return;
+        }
+
+        let (mut spec, nodes) = build_graph_spec(
+            &self.arrangement.tracks,
+            &self.arrangement.master,
+            &self.arrangement.clips,
+            None,
+            false,
+        );
+        spec.set_modulation(build_mod_spec(
+            &self.arrangement.tracks,
+            &self.arrangement.modulators,
+            &self.arrangement.mod_wires,
+            &self.parameter_registry,
+            &nodes,
+        ));
+
+        // The render's own sample rate follows the device when there is
+        // one, so what is exported matches what was heard.
+        let sample_rate = self
+            .engine
+            .as_ref()
+            .map_or(48_000, |engine| engine.info().sample_rate);
+        let opts = daw::audio::bounce::BounceOptions {
+            sample_rate,
+            block_frames: 256,
+            bpm: self.transport.bpm,
+            length_beats: end,
+            start_beats: start,
+            format: self.export.format,
+        };
+
+        // Owned copies for the worker: the arrangement keeps being edited
+        // while a render runs, and a render must be of the song as it was
+        // when the button was pressed.
+        let tracks = self.arrangement.tracks.clone();
+        let registry = self.parameter_registry.clone();
+        let progress = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let reported = Arc::clone(&progress);
+        let stop = Arc::clone(&cancel);
+        let repaint = ctx.clone();
+        let job_path = path.clone();
+        std::thread::spawn(move || {
+            let outcome = daw::audio::bounce::bounce_automated(
+                &spec,
+                &opts,
+                &job_path,
+                |beat, out| automation_letters(&tracks, &nodes, &registry, beat, out),
+                |at| {
+                    reported.store(
+                        (at.clamp(0.0, 1.0) * 1000.0) as u32,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    // A progress bar nobody repaints is a frozen progress
+                    // bar: the window may have nothing else asking for
+                    // frames while a render runs.
+                    repaint.request_repaint();
+                    !stop.load(std::sync::atomic::Ordering::Relaxed)
+                },
+            );
+            let _ = tx.send(
+                outcome
+                    .map(|()| job_path)
+                    .map_err(|error| error.to_string()),
+            );
+        });
+
+        self.export.status = Some(format!(
+            "rendering {} — {:.1} bars",
+            self.export.range.label(),
+            (end - start) / f64::from(self.transport.beats_per_bar.max(1))
+        ));
+        self.export_job = Some(ExportJob {
+            progress,
+            cancel,
+            done: rx,
+            range: self.export.range.label().to_owned(),
+        });
+    }
+
+    /// Collect a finished render. Called once a frame; does nothing while
+    /// one is still going.
+    fn poll_export(&mut self) {
+        let Some(job) = &self.export_job else {
+            return;
+        };
+        let Ok(outcome) = job.done.try_recv() else {
+            return;
+        };
+        let range = job.range.clone();
+        self.export_job = None;
+        match outcome {
+            Ok(path) => {
+                let done = format!("exported {range} to {}", path.display());
+                self.export.status = Some(done.clone());
+                self.notice = Some(done);
+                self.export.open = false;
+            }
+            // Cancelling is a choice, not a fault: it says so plainly and
+            // leaves the modal as it was, ready to try a smaller range.
+            Err(error) if error == "cancelled" => {
+                self.export.status = Some("export cancelled".to_owned());
+            }
+            Err(error) => {
+                self.export.status = Some(format!("export failed: {error}"));
+                self.export.open = true;
+            }
+        }
+    }
+
+    /// The export modal: where the file goes, how much of the song, and in
+    /// what format. Keyboard-first, exactly as the project window is —
+    /// Enter in the path field renders.
+    fn draw_export_window(&mut self, ctx: &egui::Context) {
+        if !self.export.open {
+            self.export.focused = false;
+            return;
+        }
+        use daw::audio::bounce::BounceFormat;
+        let mut go: Option<PathBuf> = None;
+        let running = self.export_job.is_some();
+        let bars = |beats: f64| beats / f64::from(self.transport.beats_per_bar.max(1));
+        let modal = egui::Modal::new(egui::Id::new("export_modal")).show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.heading("export audio");
+            ui.add_space(4.0);
+
+            let field = ui.add_enabled(
+                !running,
+                egui::TextEdit::singleline(&mut self.export.path)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("/home/you/songs/song.wav"),
+            );
+            if !self.export.focused {
+                field.request_focus();
+                self.export.focused = true;
+            }
+            let typed = self.export.path.trim().to_owned();
+            if field.lost_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                && !typed.is_empty()
+            {
+                go = Some(PathBuf::from(&typed));
+            }
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("range").weak());
+                for range in [ExportRange::Song, ExportRange::Loop, ExportRange::Selection] {
+                    // A range with nothing in it cannot be chosen: better
+                    // an unavailable button than a refusal after the click.
+                    let available = range
+                        .beats(&self.arrangement, self.export.tail_beats)
+                        .is_some();
+                    let chosen = self.export.range == range;
+                    let clicked = ui
+                        .add_enabled_ui(available && !running, |ui| {
+                            ui.selectable_label(chosen, range.label()).clicked()
+                        })
+                        .inner;
+                    if clicked {
+                        self.export.range = range;
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("format").weak());
+                for format in [
+                    BounceFormat::Float32,
+                    BounceFormat::Int24,
+                    BounceFormat::Int16,
+                ] {
+                    let chosen = self.export.format == format;
+                    let clicked = ui
+                        .add_enabled_ui(!running, |ui| {
+                            ui.selectable_label(chosen, format.label()).clicked()
+                        })
+                        .inner;
+                    if clicked {
+                        self.export.format = format;
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("tail").weak());
+                ui.add_enabled(
+                    !running,
+                    egui::DragValue::new(&mut self.export.tail_beats)
+                        .speed(0.5)
+                        .range(0.0..=64.0)
+                        .suffix(" beats"),
+                );
+            });
+
+            ui.add_space(6.0);
+            // What is about to be written, in the units the ruler uses.
+            match self
+                .export
+                .range
+                .beats(&self.arrangement, self.export.tail_beats)
+            {
+                Some((from, to)) => {
+                    let seconds = (to - from) * 60.0 / self.transport.bpm.max(1.0);
+                    ui.label(format!(
+                        "{:.1} → {:.1} bars · {:.1}s · {}",
+                        bars(from),
+                        bars(to),
+                        seconds,
+                        self.export.format.label()
+                    ));
+                }
+                None => {
+                    ui.label(egui::RichText::new("this range is empty").weak());
+                }
+            }
+
+            ui.add_space(6.0);
+            if let Some(job) = &self.export_job {
+                let at = job.progress.load(std::sync::atomic::Ordering::Relaxed);
+                ui.horizontal(|ui| {
+                    if ui.button("cancel").clicked() {
+                        job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    ui.add(
+                        egui::ProgressBar::new(at as f32 / 1000.0)
+                            .desired_width(f32::INFINITY)
+                            .show_percentage(),
+                    );
+                });
+            } else if ui
+                .add_enabled(!typed.is_empty(), egui::Button::new("export"))
+                .clicked()
+            {
+                go = Some(PathBuf::from(&typed));
+            }
+
+            if let Some(status) = &self.export.status {
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(status).weak());
+            }
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new("enter renders · esc closes · the render keeps going")
+                    .weak()
+                    .small(),
+            );
+        });
+        if modal.should_close() {
+            self.export.open = false;
+            self.export.focused = false;
+        }
+        if let Some(path) = go {
+            self.start_export(path, ctx);
+        }
+    }
+
     /// Save the song to `path`, or to the file it already lives in. With
     /// neither, the project window opens instead — the app never invents a
     /// filename.
@@ -12314,17 +18019,19 @@ impl App {
     /// the loaded state (undo does not cross a load), playback stops, and
     /// the schedule is rebuilt from what the file said. A file that does
     /// not parse changes nothing.
-    fn load_project(&mut self, path: std::path::PathBuf) {
+    /// Load a song, and say whether it loaded.
+    ///
+    /// The ERROR comes back rather than opening a window from in here: two
+    /// surfaces now ask for a load — the project window and the splash —
+    /// and a failed load should report itself where it was asked for, not
+    /// pop a second modal over the first.
+    fn load_project(&mut self, path: std::path::PathBuf) -> Result<(), String> {
         let doc = std::fs::read_to_string(&path)
             .map_err(|error| error.to_string())
             .and_then(|text| ron::from_str::<ProjectDoc>(&text).map_err(|error| error.to_string()));
         let doc = match doc {
             Ok(doc) => doc,
-            Err(error) => {
-                self.project.open = true;
-                self.project.status = Some(format!("could not load: {error}"));
-                return;
-            }
+            Err(error) => return Err(format!("could not load: {error}")),
         };
         apply_project_doc(doc, &mut self.arrangement, &mut self.transport);
         if let Some(engine) = &mut self.engine {
@@ -12340,6 +18047,7 @@ impl App {
         self.project.status = Some(format!("loaded {}", path.display()));
         self.project.open = false;
         self.project_path = Some(path);
+        Ok(())
     }
 
     /// A fresh, empty song. The file stays where it is — New does not
@@ -12477,7 +18185,10 @@ impl App {
         }
         if let Some(path) = load {
             self.project.path = path.clone();
-            self.load_project(std::path::PathBuf::from(path));
+            if let Err(error) = self.load_project(std::path::PathBuf::from(path)) {
+                self.project.open = true;
+                self.project.status = Some(error);
+            }
         }
     }
 
@@ -12547,6 +18258,400 @@ impl App {
             accepted,
             spot: None,
         });
+    }
+
+    /// Carry out what the Session surface asked for.
+    ///
+    /// The split the handoff draws is the one that matters here: content
+    /// changes go through the arrangement, where the snapshot history
+    /// sees them and they become undo steps; PERFORMANCE changes go to
+    /// the planner and never enter undo, because stopping a clip is not
+    /// an edit to take back.
+    fn run_session_intents(
+        &mut self,
+        intents: Vec<daw::ui::session_next::SessionIntent>,
+        clock: daw::ui::session_next::TransportClock,
+    ) {
+        use daw::ui::session_next as sx;
+        for intent in intents {
+            match intent {
+                // ---- selection: view state that the rest of the app
+                // also reads, so it is written through to the model's
+                // marks rather than kept twice.
+                sx::SessionIntent::SelectTrack(track) => {
+                    self.arrangement.select_track(track);
+                }
+                sx::SessionIntent::SelectSlot { track, scene } => {
+                    self.arrangement.select_track(track);
+                    self.arrangement.session.selected = Some((track, scene));
+                    self.arrangement.session.selected_scene = Some(scene);
+                }
+                sx::SessionIntent::SelectScene(scene) => {
+                    self.arrangement.session.selected_scene = Some(scene);
+                }
+                sx::SessionIntent::ClearSelection => {
+                    self.arrangement.session.selected = None;
+                }
+
+                // ---- performance: the planner decides, and the mirror
+                // turns its decision into audio.
+                sx::SessionIntent::LaunchSlot { track, scene } => {
+                    // DIRECT: a manual press bypasses Fill and every
+                    // condition. The spec is explicit that a performer's
+                    // press must be trustworthy.
+                    if let Err(refusal) = self.session_runtime.queue_clip(
+                        &self.session_doc,
+                        track,
+                        scene,
+                        clock,
+                        true,
+                    ) {
+                        self.notice = Some(session_refusal(refusal));
+                    }
+                }
+                sx::SessionIntent::LaunchScene(scene) => {
+                    match self
+                        .session_runtime
+                        .queue_scene(&self.session_doc, scene, clock)
+                    {
+                        Ok(launch) => {
+                            // A scene's tempo rides the same action road
+                            // every other tempo change takes.
+                            if let Some(bpm) = launch.tempo {
+                                self.transport.bpm = bpm.clamp(limits::BPM_MIN, limits::BPM_MAX);
+                            }
+                            // Launching a scene selects the NEXT one, so
+                            // playing down a song is Enter, Enter, Enter.
+                            let next = (scene + 1).min(self.session_doc.scenes.len() - 1);
+                            self.arrangement.session.selected_scene = Some(next);
+                        }
+                        Err(refusal) => self.notice = Some(session_refusal(refusal)),
+                    }
+                }
+                sx::SessionIntent::StopTrack { track, immediate } => {
+                    let _ = self.session_runtime.queue_stop_track(
+                        &self.session_doc,
+                        track,
+                        clock,
+                        immediate,
+                    );
+                }
+                sx::SessionIntent::StopAll => {
+                    self.session_runtime
+                        .queue_stop_all(&self.session_doc, clock, false);
+                }
+                sx::SessionIntent::BackToArrangement => {
+                    self.session_runtime
+                        .queue_stop_all(&self.session_doc, clock, true);
+                }
+                sx::SessionIntent::SetFill(state) => self.session_runtime.fill = state,
+                sx::SessionIntent::SetGlobalQuantization(quantization) => {
+                    self.session_doc.global_quantization = quantization;
+                    // The transport bar's own coarse control is a
+                    // PROJECTION of this, so the two cannot disagree
+                    // about what the next launch will do.
+                    self.launch_quantization = match quantization {
+                        sx::Quantization::None => LaunchQuantization::Off,
+                        sx::Quantization::Sixteenth
+                        | sx::Quantization::Eighth
+                        | sx::Quantization::Quarter
+                        | sx::Quantization::Half => LaunchQuantization::Beat,
+                        _ => LaunchQuantization::Bar,
+                    };
+                }
+
+                // ---- Lift and Drop: Lift only reads, so it is a
+                // performance verb; Drop authors a scene, so it is an
+                // edit.
+                sx::SessionIntent::Lift => {
+                    let name = self
+                        .session_runtime
+                        .active_scene
+                        .and_then(|id| self.session_doc.scene_index(id))
+                        .and_then(|index| self.session_doc.scenes.get(index))
+                        .map_or_else(|| "Lifted".to_owned(), |scene| scene.name.clone());
+                    if !self
+                        .session_clipboard
+                        .lift(&self.session_doc, &self.session_runtime, name)
+                    {
+                        self.notice = Some("nothing is playing to lift".into());
+                    }
+                }
+                sx::SessionIntent::Drop => {
+                    let below = self
+                        .arrangement
+                        .session
+                        .selected_scene
+                        .unwrap_or(self.session_doc.scenes.len().saturating_sub(1));
+                    match self
+                        .session_clipboard
+                        .drop_into(&mut self.session_doc, below)
+                    {
+                        // The document grew a row; the project has to
+                        // grow the same row or the two fall out of step
+                        // on the very next sync.
+                        Some(at) => {
+                            self.arrangement.insert_scene(at);
+                            // The dropped row names clips that already
+                            // exist elsewhere in the grid. Copying the
+                            // CLIP rather than minting an empty slot is
+                            // what makes Drop reproduce what was playing.
+                            for track in 0..self.arrangement.tracks.len() {
+                                let Some(sx::Slot::Clip(clip)) = self.session_doc.slot(track, at)
+                                else {
+                                    continue;
+                                };
+                                let id = clip.id.0;
+                                let source = self
+                                    .arrangement
+                                    .session
+                                    .slots
+                                    .iter()
+                                    .flatten()
+                                    .flatten()
+                                    .find(|candidate| candidate.id == id)
+                                    .cloned();
+                                if let Some(mut copy) = source {
+                                    copy.id = self.arrangement.next_id();
+                                    if let Some(slot) = self
+                                        .arrangement
+                                        .session
+                                        .slots
+                                        .get_mut(track)
+                                        .and_then(|column| column.get_mut(at))
+                                    {
+                                        *slot = Some(copy);
+                                    }
+                                }
+                            }
+                            self.arrangement.session.selected_scene = Some(at);
+                        }
+                        None => self.notice = Some("lift a scene before dropping one".into()),
+                    }
+                }
+                sx::SessionIntent::RecallMemory { index, pressed } => {
+                    if pressed && let Some(memory) = self.session_doc.memories.get(index) {
+                        let _ = memory;
+                        self.notice = Some(format!("memory {} recalled", index + 1));
+                    }
+                }
+                sx::SessionIntent::MorphMemories(_) => {}
+
+                // ---- content: these are edits, and the history banks
+                // each of them on the frame the gesture settles.
+                sx::SessionIntent::CreateMidiClip { track, scene } => {
+                    let bar = self.transport.beats_per_bar as f32;
+                    if self.arrangement.create_slot_clip(track, scene, bar) {
+                        self.arrangement.session.selected = Some((track, scene));
+                    }
+                }
+                sx::SessionIntent::MoveSlots { from, to, copy } => {
+                    self.arrangement.move_slot(from, to, copy);
+                }
+                sx::SessionIntent::DeleteSelection => {
+                    if let Some((track, scene)) = self.arrangement.session.selected {
+                        self.arrangement.force_recompile |=
+                            self.arrangement.clear_slot(track, scene);
+                    }
+                }
+                sx::SessionIntent::InsertSceneBelow(scene) => {
+                    let at = scene + 1;
+                    self.arrangement.insert_scene(at);
+                    self.session_doc.insert_scene(
+                        at,
+                        sx::Scene::default(),
+                        vec![
+                            sx::Slot::Empty(sx::EmptyBehavior::Stop);
+                            self.session_doc.tracks.len()
+                        ],
+                    );
+                }
+                sx::SessionIntent::ReorderTrack { from, to } => {
+                    if self.arrangement.move_track(from, to) {
+                        self.session_doc.move_track(from, to);
+                    }
+                }
+                sx::SessionIntent::ReorderScene { from, to } => {
+                    if self.move_project_scene(from, to) {
+                        self.session_doc.move_scene(from, to);
+                    }
+                }
+                sx::SessionIntent::CaptureScene => {
+                    // Honest refusal rather than a button that looks like
+                    // it worked: capture has to write launch decisions
+                    // into Arrangement documents, which the merge has not
+                    // built yet.
+                    self.notice = Some("capture is not wired to the arrangement yet".into());
+                }
+
+                // ---- the mixer strip.
+                sx::SessionIntent::ToggleTrackMute(track) => {
+                    if let Some(track) = self.arrangement.tracks.get_mut(track) {
+                        track.mute = !track.mute;
+                        self.arrangement.force_recompile = true;
+                    }
+                }
+                sx::SessionIntent::ToggleTrackSolo(track) => {
+                    if let Some(track) = self.arrangement.tracks.get_mut(track) {
+                        track.solo = !track.solo;
+                        self.arrangement.force_recompile = true;
+                    }
+                }
+                // Pan and volume are applied live to the output node, so
+                // neither needs a recompile — the same road the old strip
+                // took.
+                sx::SessionIntent::SetTrackPan { track, value } => {
+                    if let Some(track) = self.arrangement.tracks.get_mut(track) {
+                        track.pan = value.clamp(-1.0, 1.0);
+                    }
+                }
+                sx::SessionIntent::SetTrackVolume { track, value } => {
+                    if let Some(track) = self.arrangement.tracks.get_mut(track) {
+                        track.volume = value.max(0.0);
+                    }
+                }
+                sx::SessionIntent::ClearClipHold(track) => {
+                    if let Some(meter) = self.meters.get_mut(track) {
+                        meter.clipped = false;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Where a dragged audio file would land in the Session grid.
+    ///
+    /// The old view drew its own drop feedback because it owned its own
+    /// geometry. The replacement hands its layout back instead, so this
+    /// does the aiming from outside — which keeps file import, a purely
+    /// app-side concern, out of a view whose job is to draw a grid.
+    ///
+    /// AUDIO TRACKS ONLY, and the refusal is decided before the release
+    /// rather than discovered after it: `DragImport::spot` staying `None`
+    /// is what the drop handler reads as "nothing to do here".
+    fn aim_session_drop(
+        &mut self,
+        layout: Option<daw::ui::session_next::SessionLayout>,
+        ctx: &egui::Context,
+    ) {
+        let Some(drag) = self.drag_import.as_mut() else {
+            return;
+        };
+        drag.spot = None;
+        let (Some(layout), Some(position)) = (layout, ctx.pointer_latest_pos()) else {
+            return;
+        };
+        if !drag.accepted {
+            return;
+        }
+        let Some((track, scene)) = layout.slot_at(position) else {
+            return;
+        };
+        if self
+            .arrangement
+            .tracks
+            .get(track)
+            .is_none_or(|target| target.kind != TrackKind::Audio)
+        {
+            return;
+        }
+        drag.spot = Some(DropSpot::Slot { track, scene });
+        // A drop with no feedback is a guess. Painted on a foreground
+        // layer rather than inside the view, because by the time the app
+        // knows where the drop lands the view's Ui is finished — and
+        // because the view must not grow a notion of file dragging.
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("session_drop_target"),
+        ));
+        let rect = layout.slot(track, scene);
+        painter.rect_filled(rect, 0.0, self.theme.accent_muted.gamma_multiply(0.35));
+        painter.rect_stroke(
+            rect,
+            0.0,
+            egui::Stroke::new(2.0, self.theme.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
+
+    /// Move a scene row in the PROJECT.
+    ///
+    /// The arrangement has `insert_scene` and `remove_scene` but no
+    /// mover, and this is the one place that wants one. Written as
+    /// remove-then-insert of the row's whole contents so every parallel
+    /// vector — scenes, every track's slot column — moves together or
+    /// none of them does.
+    fn move_project_scene(&mut self, from: usize, to: usize) -> bool {
+        let scenes = self.arrangement.session.scenes.len();
+        if from >= scenes || to >= scenes || from == to {
+            return false;
+        }
+        let scene = self.arrangement.session.scenes.remove(from);
+        self.arrangement.session.scenes.insert(to, scene);
+        for column in &mut self.arrangement.session.slots {
+            if from < column.len() {
+                let slot = column.remove(from);
+                column.insert(to.min(column.len()), slot);
+            }
+        }
+        // A track playing a row that moved is still playing THAT row.
+        for playing in self.arrangement.session.playing.iter_mut().flatten() {
+            *playing = shifted_index(*playing, from, to);
+        }
+        if let Some((_, scene)) = &mut self.arrangement.session.selected {
+            *scene = shifted_index(*scene, from, to);
+        }
+        if let Some(scene) = &mut self.arrangement.session.selected_scene {
+            *scene = shifted_index(*scene, from, to);
+        }
+        self.arrangement.force_recompile = true;
+        true
+    }
+
+    /// The other clips on the edited clip's track, as ghost notes.
+    ///
+    /// REBASED onto the edited clip's own beat 0, because that is the
+    /// coordinate the roll draws in: a clip starting two bars later has
+    /// its notes two bars to the right, which is where they actually
+    /// sound relative to what is being written.
+    ///
+    /// Timeline only. In the launcher the other clips in a column are
+    /// alternatives to this one rather than material beside it, so
+    /// drawing them would be drawing several futures at once.
+    fn roll_ghost_notes(&self) -> Vec<Note> {
+        if self.arrangement.main_view != MainView::Timeline {
+            return Vec::new();
+        }
+        let Some((track, index)) = self.arrangement.selected_clip else {
+            return Vec::new();
+        };
+        let Some(clips) = self.arrangement.clips.get(track) else {
+            return Vec::new();
+        };
+        let Some(edited) = clips.get(index) else {
+            return Vec::new();
+        };
+        let origin = f64::from(edited.start);
+        clips
+            .iter()
+            .enumerate()
+            .filter(|(other, clip)| *other != index && !clip.notes.is_empty())
+            .flat_map(|(_, clip)| {
+                let offset = f64::from(clip.start) - origin;
+                clip.notes.iter().map(move |note| Note {
+                    start: note.start + offset,
+                    ..note.clone()
+                })
+            })
+            .collect()
+    }
+
+    /// The device's sample rate, or the default before an engine exists.
+    fn engine_sample_rate(&self) -> u32 {
+        self.engine.as_ref().map_or_else(
+            || EngineConfig::default().sample_rate,
+            |engine| engine.info().sample_rate,
+        )
     }
 
     /// Queue WAV validation/resampling off the UI thread. Completion is
@@ -12651,13 +18756,20 @@ impl App {
             source_frames: imported.frames,
             gain: 1.0,
             looped: false,
+            file_frames: imported.frames,
+            reversed: false,
+            fade_in: 0,
+            fade_out: 0,
+            fade_in_curve: 0.0,
+            fade_out_curve: 0.0,
+            envelope: Vec::new(),
         };
         if self
             .arrangement
             .insert_audio(track, at, name, source, self.transport.bpm)
             .is_some()
         {
-            self.arrangement.selected = Some(track);
+            self.arrangement.select_track(track);
             self.arrangement.cursor = Some((track, at));
             let converted = imported.path != imported.original_path;
             self.notice = Some(format!(
@@ -12714,11 +18826,814 @@ impl App {
                 source_frames: imported.frames,
                 gain: 1.0,
                 looped: false,
+                file_frames: imported.frames,
+                reversed: false,
+                fade_in: 0,
+                fade_out: 0,
+                fade_in_curve: 0.0,
+                fade_out_curve: 0.0,
+                envelope: Vec::new(),
             }),
+            // A launcher clip repeats, so the brace arrives round the
+            // whole file — the same rule a fresh MIDI slot keeps.
+            loop_on: true,
+            loop_start: 0.0,
+            loop_len: len,
         });
         self.arrangement.session.selected = Some((track, scene));
-        self.arrangement.selected = Some(track);
+        self.arrangement.select_track(track);
         true
+    }
+
+    /// Project the audio editor's selection onto the arrangement's time
+    /// selection.
+    ///
+    /// They ARE the same thing — a snapped range on the active lane — so
+    /// loop-from-selection and play-selection stay one pair of verbs
+    /// rather than growing a second pair that only work in one region.
+    /// It also means the timeline shows what was selected in the editor,
+    /// which is how you find out where you are.
+    ///
+    /// Written only when the editor's selection CHANGES: writing it every
+    /// frame would stamp on a selection dragged in the arrangement before
+    /// the pointer had come up.
+    fn mirror_audio_selection(&mut self) {
+        let current = self.waveform.selection();
+        if current == self.mirrored_audio_selection {
+            return;
+        }
+        self.mirrored_audio_selection = current;
+        let bpm = self.transport.bpm;
+        let Some(clip) = self.arrangement.active_audio_clip() else {
+            return;
+        };
+        let Some(audio) = clip.audio.as_ref() else {
+            return;
+        };
+        let Some(selection) = current else {
+            self.arrangement.selection = None;
+            return;
+        };
+        self.arrangement.selection = Some(selection_beats(clip, audio, bpm, selection));
+    }
+}
+
+/// A destructive edit in flight: which clip asked, and what its length
+/// will be when the answer comes back.
+///
+/// The clip is named by ID rather than by index, because a clip that
+/// moved past a neighbour while the render ran has a different index and
+/// the same identity — and repointing the wrong clip at a rendered file
+/// would be silent and permanent.
+struct RenderRequest {
+    clip: u64,
+    /// A verb that changes the file's length says so here: where the
+    /// change lands in source frames, and by how much. `None` means the
+    /// file keeps its length and the clip's region is untouched.
+    length_change: Option<(u64, i64)>,
+    /// What to call the edit in the status line and, later, in the undo
+    /// history.
+    verb: &'static str,
+    /// The render printed everything the clip's parameters were doing,
+    /// so they all go back to neutral when it lands. Anything less would
+    /// apply them twice.
+    flatten: bool,
+    /// A varispeed transpose's frequency ratio. The clip's fades and
+    /// envelope are in FRAMES, so they have to be scaled by the same
+    /// amount or they would land somewhere else in the shorter file.
+    rescale: Option<f32>,
+    /// The render's output becomes a NEW clip beside the original rather
+    /// than replacing it. Extract-channel is the only verb that does
+    /// this, and it is why the request carries it rather than the op.
+    as_new_clip: bool,
+    /// Ripple was on when the edit was asked for. Remembered rather than
+    /// re-read on arrival: the toggle is a tool setting the user may well
+    /// flip while the render runs, and an edit must land the way it was
+    /// asked for.
+    ripple: bool,
+}
+
+/// Take a length change through to the TIMELINE: the clip's span, and
+/// everything after it on the lane.
+///
+/// Pure over the lane, because "and everything after it" is the part that
+/// can quietly damage work somewhere the user is not looking.
+fn ripple_lane(clips: &mut [Clip], index: usize, delta_beats: f32) {
+    if delta_beats == 0.0 || !delta_beats.is_finite() {
+        return;
+    }
+    let Some(clip) = clips.get_mut(index) else {
+        return;
+    };
+    // A clip cannot ripple away to nothing: a zero-length clip is one
+    // that has vanished, and removing a clip is a different verb.
+    clip.len = (clip.len + delta_beats).max(f32::MIN_POSITIVE);
+    let after = clip.start + clip.len;
+    let moved = delta_beats;
+    for later in clips.iter_mut().skip(index + 1) {
+        later.start = (later.start + moved).max(after);
+    }
+}
+
+/// The lowest an envelope point can be dragged, in dB. Below this it is
+/// silence, and a control that kept going would be asking for a level
+/// nobody can hear the difference between.
+const ENVELOPE_FLOOR_DB: f32 = -60.0;
+/// The highest. Six dB of lift is what a clip gain ride is for; more than
+/// that is a gain stage, and the clip already has one.
+const ENVELOPE_CEIL_DB: f32 = 6.0;
+
+/// An envelope point's dB as the linear gain the node multiplies by.
+fn envelope_gain(db: f32) -> f32 {
+    if !db.is_finite() || db <= ENVELOPE_FLOOR_DB {
+        0.0
+    } else {
+        10f32.powf(db.min(ENVELOPE_CEIL_DB) / 20.0)
+    }
+}
+
+/// Where an index lands once the row at `from` has moved to `to`.
+///
+/// Pure, because "everything that pointed at a row still points at it"
+/// is the whole correctness of a reorder, and it is off by one in three
+/// different directions if written by eye.
+fn shifted_index(index: usize, from: usize, to: usize) -> usize {
+    if index == from {
+        to
+    } else if from < to && index > from && index <= to {
+        index - 1
+    } else if to < from && index >= to && index < from {
+        index + 1
+    } else {
+        index
+    }
+}
+
+/// A launch the planner would not take, in words.
+fn session_refusal(refusal: daw::ui::session_next::QueueRefusal) -> String {
+    use daw::ui::session_next::QueueRefusal;
+    match refusal {
+        QueueRefusal::MissingTrack => "that track is gone".to_owned(),
+        QueueRefusal::MissingScene => "that scene is gone".to_owned(),
+        QueueRefusal::IncompatibleClip => {
+            "that clip does not belong on this track's kind".to_owned()
+        }
+        QueueRefusal::NothingToLaunch => "there is nothing in that slot".to_owned(),
+    }
+}
+
+/// Where an audio selection sits on the ARRANGEMENT's timeline, in
+/// absolute beats.
+///
+/// Pure, because it is the join between two coordinate systems and a
+/// join is exactly the sort of arithmetic that is wrong by a clip start
+/// or a factor of sixty until something checks it.
+fn selection_beats(
+    clip: &Clip,
+    audio: &AudioSource,
+    bpm: f64,
+    selection: waveform::Selection,
+) -> (f32, f32) {
+    let rate = f64::from(audio.sample_rate.max(1));
+    let beat = |frames: u64| clip.start + (frames as f64 / rate * bpm.max(1.0) / 60.0) as f32;
+    (beat(selection.from), beat(selection.to))
+}
+
+/// Everything a clip's parameters were doing is now printed into the
+/// file, so they all go back to neutral.
+///
+/// Anything left set would be applied a SECOND time — a flattened clip
+/// that kept its fades would fade twice, and one that kept its gain would
+/// be quiet by the square of it.
+fn neutralise_after_flatten(clip: &mut Clip, rendered: &daw::render::Rendered) {
+    let Some(audio) = clip.audio.as_mut() else {
+        return;
+    };
+    audio.gain = 1.0;
+    audio.looped = false;
+    audio.reversed = false;
+    audio.fade_in = 0;
+    audio.fade_out = 0;
+    audio.fade_in_curve = 0.0;
+    audio.fade_out_curve = 0.0;
+    audio.envelope.clear();
+    audio.source_offset = 0;
+    audio.source_frames = rendered.frames;
+    audio.file_frames = rendered.frames;
+}
+
+/// A varispeed transpose made the file shorter or longer, so the things
+/// measured in FRAMES have to move with it.
+///
+/// A fade left at its old frame count would cover a different fraction of
+/// a clip that is now half as long, and an envelope point would land
+/// somewhere else entirely.
+fn rescale_after_transpose(clip: &mut Clip, ratio: f32) {
+    let Some(audio) = clip.audio.as_mut() else {
+        return;
+    };
+    if !ratio.is_finite() || ratio <= 0.0 {
+        return;
+    }
+    let scale = |frames: u64| (frames as f32 / ratio).round().max(0.0) as u64;
+    audio.fade_in = scale(audio.fade_in);
+    audio.fade_out = scale(audio.fade_out);
+    for (at, _) in &mut audio.envelope {
+        *at = scale(*at);
+    }
+}
+
+/// Point a clip at a freshly rendered file.
+///
+/// Pure over the clip, so the region arithmetic can be checked without a
+/// worker, a disk, or an app: it is the one step that can quietly ruin a
+/// clip, by leaving a region that names frames the new file does not have.
+fn repoint_clip(clip: &mut Clip, rendered: &daw::render::Rendered, change: Option<(u64, i64)>) {
+    let Some(audio) = clip.audio.as_mut() else {
+        return;
+    };
+    audio.path = rendered.path.clone();
+    audio.file_frames = rendered.frames;
+    if let Some((at, delta)) = change {
+        // Material inserted or removed BEFORE the region slides it; a
+        // change inside the region resizes it; one after it does neither.
+        let end = audio.source_offset.saturating_add(audio.source_frames);
+        if at <= audio.source_offset {
+            audio.source_offset =
+                (i128::from(audio.source_offset) + i128::from(delta)).max(0) as u64;
+        } else if at < end {
+            audio.source_frames =
+                (i128::from(audio.source_frames) + i128::from(delta)).max(0) as u64;
+        }
+    }
+    // Whatever the arithmetic said, the region has to name frames the file
+    // actually has. A clamp here is the last line before a clip that plays
+    // silence and cannot say why.
+    audio.source_offset = audio.source_offset.min(rendered.frames);
+    audio.source_frames = audio
+        .source_frames
+        .min(rendered.frames - audio.source_offset);
+}
+
+impl App {
+    /// What a destructive verb would act on: a range of SOURCE frames in
+    /// the clip's forward file, and the channels it covers.
+    ///
+    /// `None` when there is nothing selected, or when the selection
+    /// crosses a looped clip's seam — where the material either side is
+    /// two different stretches of the file and there is no honest single
+    /// range. Every verb asks this, and every verb is disabled with that
+    /// reason when it comes back empty.
+    fn audio_edit_target(&self) -> Option<(u64, u64, daw::render::Channels)> {
+        let selection = self.waveform.selection()?;
+        let audio = self.arrangement.active_audio_clip()?.audio.as_ref()?;
+        let end = waveform::region_end(audio, audio.file_frames());
+        let (from, to) = waveform::source_span(audio, end, selection.from, selection.to)?;
+        Some((from, to, selection.channels.into()))
+    }
+
+    /// The destructive verbs, all of which are one render of one job.
+    ///
+    /// Gathered rather than spread through the palette's match for the
+    /// same reason the note commands are: they share a target, a refusal
+    /// and a shape, and a reader looking for "what can this do to audio?"
+    /// should find the list in one place.
+    fn run_audio_command(&mut self, id: &str) {
+        use daw::render::{FadeDir, Normalize, Op};
+        // View verbs first: they need no target and must work with
+        // nothing selected.
+        match id {
+            "audio.select_all" => return self.waveform.select_all(),
+            "audio.select_none" => return self.waveform.select_none(),
+            "audio.snap_zero" => return self.waveform.toggle_snap_zero(),
+            "audio.db_scale" => return self.waveform.toggle_decibels(),
+            "audio.zoom_selection" => return self.waveform.zoom_to_selection(),
+            "audio.ripple" => return self.waveform.toggle_ripple(),
+            "audio.envelope" => return self.waveform.toggle_envelope(),
+            "audio.envelope_clear" => {
+                return self.apply_clip_edit(waveform::ClipEdit::Envelope(Vec::new()));
+            }
+            _ => {}
+        }
+        if matches!(
+            id,
+            "audio.swap_channels"
+                | "audio.mono"
+                | "audio.mono_left"
+                | "audio.mono_right"
+                | "audio.extract_left"
+                | "audio.extract_right"
+        ) {
+            return self.run_audio_channel_command(id);
+        }
+        if id == "audio.flatten" {
+            return self.flatten_audio_clip();
+        }
+        if let Some(semitones) = match id {
+            "audio.transpose_up" => Some(1.0),
+            "audio.transpose_down" => Some(-1.0),
+            "audio.transpose_octave_up" => Some(12.0),
+            "audio.transpose_octave_down" => Some(-12.0),
+            _ => None,
+        } {
+            return self.transpose_audio_clip(semitones);
+        }
+        // The structural verbs change the file's LENGTH, so they carry
+        // consequences for the clip's placement that the level verbs do
+        // not. They are handled apart for that reason, not for tidiness.
+        if matches!(
+            id,
+            "audio.copy"
+                | "audio.cut"
+                | "audio.paste"
+                | "audio.crop"
+                | "audio.insert_silence"
+                | "audio.delete"
+        ) {
+            return self.run_audio_structural_command(id);
+        }
+        let Some((from, to, channels)) = self.audio_edit_target() else {
+            self.notice =
+                Some("nothing to edit: select a range inside one pass of the clip".into());
+            return;
+        };
+        let curve = daw::params::clip::Curve::LINEAR;
+        let (verb, op) = match id {
+            "audio.silence" => ("silence", Op::Silence { from, to, channels }),
+            "audio.gain" => (
+                "gain",
+                Op::Gain {
+                    from,
+                    to,
+                    channels,
+                    db: self.waveform.edit_gain_db(),
+                },
+            ),
+            // −0.1 dBFS rather than 0: a file normalized to exactly full
+            // scale has inter-sample peaks above it, and every converter
+            // and lossy encoder downstream will find them.
+            "audio.normalize" => (
+                "normalize",
+                Op::Norm {
+                    from,
+                    to,
+                    channels,
+                    target_db: -0.1,
+                    mode: Normalize::Peak,
+                    allow_clipping: false,
+                },
+            ),
+            "audio.normalize_rms" => (
+                "normalize",
+                Op::Norm {
+                    from,
+                    to,
+                    channels,
+                    target_db: -18.0,
+                    mode: Normalize::Rms,
+                    allow_clipping: false,
+                },
+            ),
+            "audio.reverse_sel" => ("reverse", Op::Reverse { from, to, channels }),
+            "audio.invert" => ("invert", Op::Invert { from, to, channels }),
+            "audio.remove_dc" => ("DC removal", Op::RemoveDc { from, to, channels }),
+            "audio.fade_in" => (
+                "fade in",
+                Op::Fade {
+                    from,
+                    to,
+                    channels,
+                    dir: FadeDir::In,
+                    curve,
+                },
+            ),
+            "audio.fade_out" => (
+                "fade out",
+                Op::Fade {
+                    from,
+                    to,
+                    channels,
+                    dir: FadeDir::Out,
+                    curve,
+                },
+            ),
+            _ => return,
+        };
+        if !self.request_render(verb, vec![op], None) {
+            self.notice = Some(format!("{verb} refused: a render is already running"));
+        }
+    }
+
+    /// Print the clip's non-destructive state into a plain file.
+    ///
+    /// Everything the node does at playback — the region, the reversal,
+    /// the loop's repeats, the envelope, both fades with their shapes,
+    /// and the gain — becomes samples on disk, and every parameter goes
+    /// back to neutral. Afterwards the file IS what you hear, which is
+    /// the point: a flattened clip can be handed to anything.
+    ///
+    /// The ORDER below is the node's order. Get it wrong and the result
+    /// is plausible and different: fading before the loop repeats would
+    /// fade the first pass instead of the clip.
+    fn flatten_audio_clip(&mut self) {
+        use daw::params::clip::Curve;
+        use daw::render::{FadeDir, Op};
+        let Some(clip) = self.arrangement.active_audio_clip() else {
+            return;
+        };
+        let Some(audio) = clip.audio.as_ref() else {
+            return;
+        };
+        let span = waveform::clip_span_frames(clip, audio, self.transport.bpm);
+        if span == 0 {
+            self.notice = Some("a clip with no length has nothing to flatten".into());
+            return;
+        }
+        let region_end = audio.source_offset.saturating_add(audio.source_frames);
+        let region = audio.source_frames;
+        let mut ops = vec![Op::Crop {
+            from: audio.source_offset,
+            to: region_end,
+        }];
+        if audio.reversed {
+            ops.push(Op::Reverse {
+                from: 0,
+                to: region,
+                channels: daw::render::Channels::all(),
+            });
+        }
+        ops.push(Op::Fit {
+            frames: span,
+            looped: audio.looped,
+        });
+        if !audio.envelope.is_empty() {
+            ops.push(Op::Envelope(std::sync::Arc::new(
+                audio
+                    .envelope
+                    .iter()
+                    .map(|(at, db)| (*at, envelope_gain(*db)))
+                    .collect(),
+            )));
+        }
+        // The fades AFTER the fit, because a fade is measured against the
+        // clip's timeline span and not against one pass of its material.
+        if audio.fade_in > 0 {
+            ops.push(Op::Fade {
+                from: 0,
+                to: audio.fade_in.min(span),
+                channels: daw::render::Channels::all(),
+                dir: FadeDir::In,
+                curve: Curve::new(audio.fade_in_curve),
+            });
+        }
+        if audio.fade_out > 0 {
+            ops.push(Op::Fade {
+                from: span.saturating_sub(audio.fade_out),
+                to: span,
+                channels: daw::render::Channels::all(),
+                dir: FadeDir::Out,
+                curve: Curve::new(audio.fade_out_curve),
+            });
+        }
+        if (audio.gain - 1.0).abs() > 1e-6 {
+            ops.push(Op::Gain {
+                from: 0,
+                to: span,
+                channels: daw::render::Channels::all(),
+                db: if audio.gain > 0.0 {
+                    20.0 * audio.gain.log10()
+                } else {
+                    -200.0
+                },
+            });
+        }
+        if !self.request_render("flatten", ops, None) {
+            self.notice = Some("flatten refused: a render is already running".into());
+            return;
+        }
+        if let Some(request) = self.render_job.as_mut() {
+            request.flatten = true;
+        }
+    }
+
+    /// Transpose by resampling — a tape machine, so the clip gets shorter
+    /// as it gets higher.
+    ///
+    /// It CANNOT be previewed: there is no live resampler in the node, so
+    /// this is a render like any other destructive verb, and the button
+    /// says what it will do rather than pretending to be a knob.
+    fn transpose_audio_clip(&mut self, semitones: f32) {
+        let Some(audio) = self
+            .arrangement
+            .active_audio_clip()
+            .and_then(|clip| clip.audio.as_ref())
+        else {
+            return;
+        };
+        let before = audio.file_frames();
+        let ratio = daw::render::Op::transpose_ratio(semitones);
+        let after = (before as f32 / ratio).round().max(1.0) as u64;
+        // The whole file changes length, so the region change lands at
+        // frame zero — and the clip's own span follows it under ripple.
+        let change = Some((0u64, after as i64 - before as i64));
+        if !self.request_render(
+            "transpose",
+            vec![daw::render::Op::Transpose { semitones }],
+            change,
+        ) {
+            self.notice = Some("transpose refused: a render is already running".into());
+            return;
+        }
+        if let Some(request) = self.render_job.as_mut() {
+            request.rescale = Some(ratio);
+        }
+    }
+
+    /// Swap, fold and extract.
+    ///
+    /// Whole-file operations, so they take no selection. Extract is the
+    /// odd one: it leaves the original alone and puts its output in a NEW
+    /// clip on the same lane, which is what "extract" means everywhere
+    /// else and what makes it non-destructive despite being a render.
+    fn run_audio_channel_command(&mut self, id: &str) {
+        use daw::render::{Mono, Op};
+        let (verb, op, as_new) = match id {
+            "audio.swap_channels" => ("swap channels", Op::SwapChannels, false),
+            "audio.mono" => ("fold to mono", Op::ToMono(Mono::Average), false),
+            "audio.mono_left" => ("fold to mono", Op::ToMono(Mono::Left), false),
+            "audio.mono_right" => ("fold to mono", Op::ToMono(Mono::Right), false),
+            "audio.extract_left" => ("extract left", Op::TakeChannel(0), true),
+            "audio.extract_right" => ("extract right", Op::TakeChannel(1), true),
+            _ => return,
+        };
+        if !self.request_render(verb, vec![op], None) {
+            self.notice = Some(format!("{verb} refused: a render is already running"));
+            return;
+        }
+        if let Some(request) = self.render_job.as_mut() {
+            request.as_new_clip = as_new;
+        }
+    }
+
+    /// Cut, copy, paste, delete, crop and insert-silence.
+    ///
+    /// Copy reads the file on the worker rather than the UI thread, and a
+    /// CUT sends the read and the render together: they both read the
+    /// file as it is now, the worker runs them in order, and the
+    /// clipboard is therefore filled from the material the cut is about
+    /// to remove.
+    fn run_audio_structural_command(&mut self, id: &str) {
+        use daw::render::Op;
+        let Some((from, to, channels)) = self.audio_edit_target() else {
+            self.notice =
+                Some("nothing to edit: select a range inside one pass of the clip".into());
+            return;
+        };
+        let Some(audio) = self
+            .arrangement
+            .active_audio_clip()
+            .and_then(|clip| clip.audio.as_ref())
+        else {
+            return;
+        };
+        let path = audio.path.clone();
+        let source_channels = usize::from(self.audio_channels());
+        let cursor_source = self.cursor_source_frame();
+
+        match id {
+            "audio.copy" => {
+                self.wav_import_service.extract(path, from, to);
+            }
+            "audio.delete" => {
+                // Silence in place: the length holds and nothing else on
+                // the lane moves. Ctrl+X is the one that removes.
+                self.request_render("delete", vec![Op::Silence { from, to, channels }], None);
+            }
+            "audio.cut" => {
+                // A CHANNEL-MASKED CUT IS REFUSED. Making one side of a
+                // stereo file shorter than the other is not a file.
+                if channels != daw::render::Channels::all()
+                    && source_channels > 1
+                    && channels.0.count_ones() < source_channels as u32
+                {
+                    self.notice =
+                        Some("cut needs every channel: silence is what one channel can do".into());
+                    return;
+                }
+                self.wav_import_service.extract(path, from, to);
+                let op = Op::Cut { from, to };
+                let change = op.length_change(source_channels);
+                self.request_render("cut", vec![op], change);
+            }
+            "audio.crop" => {
+                let op = Op::Crop { from, to };
+                let change = op.length_change(source_channels);
+                self.request_render("crop", vec![op], change);
+            }
+            "audio.insert_silence" => {
+                let Some(at) = cursor_source else {
+                    self.notice = Some("the cursor is not over this clip's material".into());
+                    return;
+                };
+                let op = Op::InsertSilence {
+                    at,
+                    frames: to.saturating_sub(from),
+                };
+                let change = op.length_change(source_channels);
+                self.request_render("insert silence", vec![op], change);
+            }
+            "audio.paste" => {
+                let Some(clipboard) = self.audio_clipboard.clone() else {
+                    return;
+                };
+                if usize::from(clipboard.channels) != source_channels {
+                    self.notice = Some(format!(
+                        "paste refused: {} channels into {source_channels}",
+                        clipboard.channels
+                    ));
+                    return;
+                }
+                let Some(at) = cursor_source else {
+                    self.notice = Some("the cursor is not over this clip's material".into());
+                    return;
+                };
+                let op = Op::Insert {
+                    at,
+                    material: clipboard.samples,
+                    material_rate: clipboard.sample_rate,
+                };
+                let change = op.length_change(source_channels);
+                self.request_render("paste", vec![op], change);
+            }
+            _ => {}
+        }
+    }
+
+    /// How many channels the selected clip's file has, off the peak
+    /// analysis — the only thing that has actually read the file.
+    fn audio_channels(&self) -> u16 {
+        self.arrangement
+            .active_audio_clip()
+            .and_then(|clip| clip.audio.as_ref())
+            .and_then(|audio| self.waveform_cache.get(&audio.path))
+            .map_or(1, |peaks| peaks.channels() as u16)
+    }
+
+    /// The edit cursor as a SOURCE frame, or `None` when it is not over
+    /// this clip's material at all.
+    fn cursor_source_frame(&self) -> Option<u64> {
+        let audio = self.arrangement.active_audio_clip()?.audio.as_ref()?;
+        let end = waveform::region_end(audio, audio.file_frames());
+        let cursor = self
+            .waveform
+            .selection()
+            .map_or(0, |selection| selection.from);
+        waveform::source_frame_of(audio, end, cursor)
+    }
+
+    /// Ask for a destructive edit on the selected audio clip.
+    ///
+    /// Returns whether the ask was taken. It is refused when there is no
+    /// audio clip, when a render is already in flight, or when the ops
+    /// list is empty — a verb that would do nothing should say so rather
+    /// than spend a second proving it.
+    fn request_render(
+        &mut self,
+        verb: &'static str,
+        ops: Vec<daw::render::Op>,
+        length_change: Option<(u64, i64)>,
+    ) -> bool {
+        if ops.is_empty() || self.render_job.is_some() {
+            return false;
+        }
+        let Some(clip) = self.arrangement.active_audio_clip() else {
+            return false;
+        };
+        let Some(audio) = clip.audio.as_ref() else {
+            return false;
+        };
+        // The FORWARD file, always. A reversed clip plays a cached
+        // reversal, but the edit belongs to the material the project
+        // actually owns — and `waveform::source_span` already hands back
+        // forward-file frames for exactly this reason.
+        let job = daw::render::Job {
+            source: audio.path.clone(),
+            ops,
+        };
+        self.render_job = Some(RenderRequest {
+            clip: clip.id,
+            length_change,
+            verb,
+            flatten: false,
+            rescale: None,
+            as_new_clip: false,
+            ripple: self.waveform.ripple(),
+        });
+        self.wav_import_service.render(job);
+        true
+    }
+
+    /// Take the worker's answers: a rendered file to repoint a clip at,
+    /// or material for the clipboard.
+    fn pump_renders(&mut self) {
+        while let Some(result) = self.wav_import_service.try_offline() {
+            let rendered = match result {
+                Ok(daw::library::Offline::Extracted(extract)) => {
+                    self.notice = Some(format!("copied {} frames", extract.frames()));
+                    self.audio_clipboard = Some(extract);
+                    continue;
+                }
+                Ok(daw::library::Offline::Rendered(rendered)) => rendered,
+                Err(error) => {
+                    // The clip is untouched and still playing the file it
+                    // was: a failed edit costs nothing but the message.
+                    let verb = self
+                        .render_job
+                        .as_ref()
+                        .map_or("audio edit", |request| request.verb);
+                    self.notice = Some(format!("{verb} failed: {error}"));
+                    self.render_job = None;
+                    continue;
+                }
+            };
+            let Some(request) = self.render_job.take() else {
+                continue;
+            };
+            // On a LANE first, where a ripple has neighbours to move.
+            let placed = self
+                .arrangement
+                .clips
+                .iter()
+                .enumerate()
+                .find_map(|(track, clips)| {
+                    clips
+                        .iter()
+                        .position(|clip| clip.id == request.clip)
+                        .map(|index| (track, index))
+                });
+            match placed {
+                Some((track, index)) if request.as_new_clip => {
+                    // EXTRACT: the original is left exactly as it was and
+                    // the render lands in a clip of its own, placed by
+                    // the same gap-finding rule every other new clip uses.
+                    let id = self.arrangement.next_id();
+                    let clips = &mut self.arrangement.clips[track];
+                    let mut fresh = clips[index].clone();
+                    let (start, at) = place_clip(clips, clips[index].start, fresh.len);
+                    fresh.id = id;
+                    fresh.name = format!("{} {}", clips[index].name, request.verb);
+                    fresh.start = start;
+                    repoint_clip(&mut fresh, &rendered, request.length_change);
+                    clips.insert(at, fresh);
+                    self.arrangement.selected_clip = Some((track, at));
+                }
+                Some((track, index)) => {
+                    let bpm = self.transport.bpm;
+                    let clips = &mut self.arrangement.clips[track];
+                    repoint_clip(&mut clips[index], &rendered, request.length_change);
+                    if let Some(ratio) = request.rescale {
+                        rescale_after_transpose(&mut clips[index], ratio);
+                    }
+                    if request.flatten {
+                        neutralise_after_flatten(&mut clips[index], &rendered);
+                        clips[index].name = format!("{} flat", clips[index].name);
+                    }
+                    if request.ripple
+                        && let Some((_, delta)) = request.length_change
+                        && delta != 0
+                    {
+                        let rate = f64::from(rendered.sample_rate.max(1));
+                        let beats = (delta as f64 / rate * bpm / 60.0) as f32;
+                        ripple_lane(clips, index, beats);
+                    }
+                    resort(clips);
+                }
+                None => {
+                    // A launcher slot, or nothing at all. A slot has no
+                    // neighbours to ripple into; a clip that was deleted
+                    // while the render ran leaves the file on disk, which
+                    // is cheap and is what an undo would want back.
+                    let slot = self
+                        .arrangement
+                        .session
+                        .slots
+                        .iter_mut()
+                        .flatten()
+                        .flatten()
+                        .find(|clip| clip.id == request.clip);
+                    let Some(clip) = slot else { continue };
+                    repoint_clip(clip, &rendered, request.length_change);
+                    if let Some(ratio) = request.rescale {
+                        rescale_after_transpose(clip, ratio);
+                    }
+                    if request.flatten {
+                        neutralise_after_flatten(clip, &rendered);
+                    }
+                }
+            }
+            self.arrangement.force_recompile = true;
+            self.notice = Some(format!("{} rendered", request.verb));
+        }
     }
 
     /// Reconcile the selected audio clip with the green-zone peak cache.
@@ -12738,6 +19653,21 @@ impl App {
             }
         }
 
+        // The sample windows the editor asks for when it is zoomed past
+        // what the peak pyramid can honestly draw. The editor holds no
+        // handle to the service — it states a wish and this reconciles
+        // it, exactly as `apply_clip_edit` does for its controls.
+        while let Some(window) = self.waveform_service.try_window() {
+            if let Err(error) = &window.result {
+                self.notice = Some(error.to_string());
+            }
+            self.waveform.accept_window(window);
+        }
+        if let Some(key) = self.waveform.take_window_request() {
+            self.waveform_service.request_window(key);
+        }
+
+        self.pump_renders();
         self.waveform
             .follow_clip(self.arrangement.active_audio_clip_id());
         // Arrangement thumbnails need every placed source, not only the
@@ -12765,7 +19695,7 @@ impl App {
     }
 
     fn shape_hash(&self) -> u64 {
-        shape_hash(&self.arrangement.tracks)
+        shape_hash(&self.arrangement.tracks, &self.arrangement.master)
     }
 
     /// The SHAPE of the modulation: which wires exist, what each drives,
@@ -12814,6 +19744,8 @@ impl App {
         self.engine = None;
         self.hud = None;
         self.device_nodes.clear();
+        self.readout_slots.clear();
+        self.clip_nodes.clear();
         self.sent_loop = None;
         self.last_compile = None;
         self.transport.playing = false;
@@ -12825,15 +19757,30 @@ impl App {
         let Some(info) = self.engine.as_ref().map(|e| e.info()) else {
             return;
         };
-        let loop_len = self.loop_len_beats();
+        // The transport loop is the TRANSPORT's business, never the
+        // pattern's: patterns compile ONE-SHOT against the timeline, and a
+        // loop wrap reaches every node as a discontinuity, which cuts its
+        // voices and reseeks its cursor — the same machinery a seek uses.
+        //
+        // This used to pass the loop region's end as the pattern's clip
+        // length "so the cycle and the wrap agree", and that coupling WAS
+        // the bug it looks like: clip mode cycles `position % len`
+        // wherever the playhead is, so parking the playhead past the
+        // brace and pressing play replayed the loop's material over what
+        // should be silence — and notes AFTER the loop end were dropped
+        // from the compile entirely while looping was on. Clip mode
+        // remains what it was built for: session clips, which unroll as
+        // timeline copies in `Session::compiled` anyway.
+        //
         // What plays, not what is drawn: a launched session clip overrides
         // its track's timeline. `compiled_clips` stores the same thing, so
         // the dirty check compares like with like.
         let playing = self.arrangement.effective_clips();
         let (mut spec, nodes) = build_graph_spec(
             &self.arrangement.tracks,
+            &self.arrangement.master,
             &playing,
-            loop_len,
+            None,
             self.transport.metronome,
         );
         // Modulation rides INSIDE the schedule, so it reaches the callback
@@ -12853,17 +19800,24 @@ impl App {
                 match engine.set_schedule(Box::new(sched)) {
                     Ok(()) => {
                         self.device_nodes = nodes.devices;
+                        self.readout_slots = nodes.readouts;
+                        self.clip_nodes = nodes.audio_clips;
                         self.pan_ids = nodes.pans;
+                        self.master_out = nodes.master_out;
                         // Fresh ids: every track's pan must be re-sent, so
                         // nothing survives a swap sitting at the node's
                         // compiled-in default while the knob says otherwise.
                         self.sent_pan.clear();
                         self.sent_volume.clear();
+                        // A fresh swap mints fresh ids: what was sent to
+                        // the old master node was sent to a node that no
+                        // longer exists.
+                        self.sent_master_pan = f32::NAN;
+                        self.sent_master_volume = f32::NAN;
                         self.sent_automation.clear();
                         self.compiled_clips = playing;
                         self.graph_key = (
                             self.transport.metronome,
-                            loop_len,
                             self.arrangement.tracks.len(),
                             self.shape_hash(),
                             self.transport.bpm.to_bits(),
@@ -12889,6 +19843,22 @@ impl App {
         let info = engine.info();
         let snap = engine.latest_block();
         let peaks = snap.track_peaks;
+        // One reading per device per FRAME, from the block the engine
+        // just finished. The engine reports the block's extremes rather
+        // than its newest sample, so a transient between two repaints is
+        // still in here — see `graph::Readout`.
+        for (id, slot) in &self.readout_slots {
+            let Some(said) = snap.device_readouts.get(*slot) else {
+                continue;
+            };
+            self.device_histories
+                .entry(*id)
+                .or_default()
+                .push(device::scope::Reading {
+                    level_db: said.level_db,
+                    reduction_db: said.reduction_db,
+                });
+        }
         self.mod_telemetry = Some(ModTelemetry {
             sources: snap.mod_sources,
             wire_ids: snap.mod_wire_ids,
@@ -13085,6 +20055,366 @@ impl App {
     ///
     /// With the engine off there is nothing to report, and the meters are
     /// walked toward silence rather than frozen at their last reading.
+    /// Rebuild the sampler pictures the rack is about to draw.
+    ///
+    /// A picture is rebuilt only when its PATH changes, because building
+    /// one decodes a file and scans every sample of it. Everything else a
+    /// sampler's card shows — the region, the loop, the markers — comes
+    /// from parameters and is free.
+    ///
+    /// Faces for devices that no longer exist are dropped here rather
+    /// than on delete: a device can leave through half a dozen doors and
+    /// only one of them would be remembered.
+    /// Point a sampler at a file.
+    ///
+    /// A RECOMPILE, not a letter: letters carry an `f32` and a sample is
+    /// megabytes, so the new material arrives the way every other
+    /// compiled allocation does — through a schedule swap.
+    ///
+    /// The slice table is cleared with it. Markers cut from one file mean
+    /// nothing in another, and carrying them over would leave a chopped
+    /// break sliced at the old file's transients — which sounds like a
+    /// bug and reads like one.
+    fn load_sample_into(&mut self, track: usize, instance: u64, path: PathBuf) {
+        let Some(track) = self.arrangement.tracks.get_mut(track) else {
+            return;
+        };
+        if !track
+            .chain
+            .iter()
+            .any(|d| d.id == instance && d.kind() == DeviceKind::Sampler)
+        {
+            return;
+        }
+        let source = track.sampler_sources.entry(instance).or_default();
+        if source.path == path {
+            return;
+        }
+        source.path = path;
+        source.slices.clear();
+        self.arrangement.force_recompile = true;
+    }
+
+    /// Move one slice marker, keeping the table sorted.
+    ///
+    /// Sorted HERE, green side, for the reason a clip's envelope is: the
+    /// callback walks the table assuming it rises, and sorting it there
+    /// would be both an allocation and an unbounded path.
+    fn move_slice(&mut self, track: usize, instance: u64, index: usize, frame: u64) {
+        let Some(track) = self.arrangement.tracks.get_mut(track) else {
+            return;
+        };
+        let Some(source) = track.sampler_sources.get_mut(&instance) else {
+            return;
+        };
+        let Some(slot) = source.slices.get_mut(index) else {
+            return;
+        };
+        *slot = frame;
+        source.slices.sort_unstable();
+        source.slices.dedup();
+        // LATCH the table. The grid is re-derived from the count on every
+        // frame it is in force, so without this the drag would be undone
+        // before it was drawn — the marker would spring back and the
+        // gesture would look broken when it was in fact working.
+        if let Some(device) = track.chain.iter_mut().find(|d| d.id == instance)
+            && let DeviceState::Sampler(params) = &mut device.state
+            && params.slice_source.round() == daw::params::sampler::SLICE_GRID
+        {
+            params.slice_source = daw::params::sampler::SLICE_CUSTOM;
+        }
+        self.arrangement.force_recompile = true;
+    }
+
+    /// Cut the file up again, from the knobs.
+    ///
+    /// A grid is arithmetic and instant. Detection is a scan of the whole
+    /// file, which is why it happens HERE — on an explicit ask — rather
+    /// than every time the slice count moves.
+    fn rebuild_slices(&mut self, track: usize, instance: u64) {
+        let rate = self
+            .engine
+            .as_ref()
+            .map(|engine| engine.info().sample_rate)
+            .unwrap_or(48_000);
+        let Some(lane) = self.arrangement.tracks.get(track) else {
+            return;
+        };
+        let Some(device) = lane.chain.iter().find(|d| d.id == instance) else {
+            return;
+        };
+        let DeviceState::Sampler(params) = device.state else {
+            return;
+        };
+        let Some(path) = lane
+            .sampler_sources
+            .get(&instance)
+            .map(|s| s.path.clone())
+            .filter(|p| !p.as_os_str().is_empty())
+        else {
+            return;
+        };
+        let Ok(material) = daw::audio::material::load_cached(&path, rate) else {
+            return;
+        };
+        let slices = match params.slice_source.round() {
+            s if s == daw::params::sampler::SLICE_TRANSIENTS => {
+                daw::slice::transients(&material, 0.5)
+            }
+            // A table the user has edited is not re-cut on a whim. Asking
+            // for a grid again is a matter of turning the cell back to
+            // `grid`, which is one click and is undoable.
+            s if s == daw::params::sampler::SLICE_CUSTOM => return,
+            _ => daw::slice::grid(material.frames, params.slices.round().max(1.0) as usize),
+        };
+        if let Some(source) = self
+            .arrangement
+            .tracks
+            .get_mut(track)
+            .and_then(|t| t.sampler_sources.get_mut(&instance))
+        {
+            source.slices = slices;
+        }
+        self.arrangement.force_recompile = true;
+    }
+
+    /// The sampler's display at full size, over everything else.
+    ///
+    /// An OVERLAY rather than a fourth bottom-panel face: what makes this
+    /// worth having is room, and a region that shares the window with the
+    /// arrangement has exactly as little of it as the rack did.
+    ///
+    /// Everything it returns goes down the same roads a card's edits do —
+    /// this is the same plot given space, not a second editor with a
+    /// second set of gestures to learn.
+    fn expanded_sampler_overlay(&mut self, ctx: &egui::Context) {
+        let Some((track, instance)) = self.expanded_sampler else {
+            return;
+        };
+        // The device may have been deleted, bypassed away, or the track
+        // removed while this was open. Close rather than draw a ghost.
+        let Some(DeviceState::Sampler(params)) = self
+            .arrangement
+            .tracks
+            .get(track)
+            .and_then(|t| t.chain.iter().find(|d| d.id == instance))
+            .map(|d| d.state)
+        else {
+            self.expanded_sampler = None;
+            return;
+        };
+        let (page, zoom, scroll) = self
+            .arrangement
+            .tracks
+            .get(track)
+            .and_then(|t| t.chain.iter().find(|d| d.id == instance))
+            .map_or((0, 1.0, 0.0), |d| (d.page, d.view_zoom, d.view_scroll));
+
+        let theme = self.theme.clone();
+        let face = self
+            .sampler_faces
+            .get(&instance)
+            .cloned()
+            .unwrap_or_default();
+        let slices = self
+            .sampler_slices
+            .get(&instance)
+            .cloned()
+            .unwrap_or_default();
+        let mut knobs = device::SamplerUi::from_engine(|id| params.get(id).unwrap_or_default());
+
+        let screen = ctx.content_rect();
+        let frame = egui::Frame::new()
+            .fill(theme.surface_sunken)
+            .inner_margin(egui::Margin::same(theme.sp(space::SM) as i8));
+        let mut out = None;
+        egui::Area::new(egui::Id::new("sampler_expanded"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                ui.set_width(screen.width());
+                ui.set_height(screen.height());
+                frame.show(ui, |ui| {
+                    ui.set_height(ui.available_height());
+                    let view = device::SamplerView {
+                        name: &face.name,
+                        wave: &face.wave,
+                        frames: face.frames,
+                        slices: &slices,
+                        voices: &[],
+                        truncated: face.truncated,
+                        original_rate: face.original_rate,
+                    };
+                    out = Some(device::sampler_expanded(
+                        ui, &theme, &mut knobs, page, zoom, scroll, &view,
+                    ));
+                });
+            });
+
+        let Some(out) = out else { return };
+        if out.collapse || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.expanded_sampler = None;
+        }
+        if let Some(device) = self
+            .arrangement
+            .tracks
+            .get_mut(track)
+            .and_then(|t| t.chain.iter_mut().find(|d| d.id == instance))
+        {
+            device.page = out.page;
+            device.view_zoom = out.zoom;
+            device.view_scroll = out.scroll;
+        }
+        if !out.edits.is_empty() {
+            self.apply_device_edits(ChainOwner::Track(track), instance, &out.edits);
+        }
+        if let Some((index, frame)) = out.slice_moved {
+            self.move_slice(track, instance, index, frame);
+        }
+        if out.reslice {
+            self.rebuild_slices(track, instance);
+        }
+    }
+
+    fn refresh_sampler_faces(&mut self) {
+        let rate = self
+            .engine
+            .as_ref()
+            .map(|engine| engine.info().sample_rate)
+            .unwrap_or(48_000);
+        // Collected first: the loop below decodes, and it cannot hold a
+        // borrow of the arrangement while it does.
+        let wanted: Vec<(usize, u64, PathBuf)> = self
+            .arrangement
+            .tracks
+            .iter()
+            .enumerate()
+            .flat_map(|(t, track)| {
+                track
+                    .chain
+                    .iter()
+                    .filter(|device| device.kind() == DeviceKind::Sampler)
+                    .map(move |device| {
+                        (
+                            t,
+                            device.id,
+                            track
+                                .sampler_sources
+                                .get(&device.id)
+                                .map(|s| s.path.clone())
+                                .unwrap_or_default(),
+                        )
+                    })
+            })
+            .collect();
+
+        let live: HashSet<u64> = wanted.iter().map(|(_, id, _)| *id).collect();
+        self.sampler_faces.retain(|id, _| live.contains(id));
+
+        // --- 1. the pictures, rebuilt only when a PATH changes ---------
+        for (_, id, path) in &wanted {
+            if self
+                .sampler_faces
+                .get(id)
+                .is_some_and(|face| face.path == *path)
+            {
+                continue;
+            }
+            if path.as_os_str().is_empty() {
+                self.sampler_faces.insert(*id, SamplerFace::default());
+                continue;
+            }
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let face = match daw::audio::material::load_cached(path, rate) {
+                Ok(material) => SamplerFace {
+                    name,
+                    wave: sampler_wave(&material),
+                    frames: material.frames,
+                    truncated: material.truncated,
+                    original_rate: material.original_rate,
+                    path: path.clone(),
+                },
+                // An unreadable file gets a face with its NAME and no
+                // picture, rather than no face at all: "this file will
+                // not open" is a thing the card should be able to say.
+                Err(_) => SamplerFace {
+                    name,
+                    path: path.clone(),
+                    ..SamplerFace::default()
+                },
+            };
+            self.sampler_faces.insert(*id, face);
+        }
+
+        // --- 2. the GRID, authored HERE and not left to the engine -----
+        //
+        // `Node::Sampler`'s compile falls back to a grid when the table is
+        // empty, which keeps an old project playing — but a fallback the
+        // document never sees is a fallback the CARD cannot draw, and that
+        // is exactly why the markers were invisible. So the document owns
+        // the table: while the source is `grid` it is re-authored from the
+        // count, which is a handful of integer divisions and makes the
+        // knob RE-CUT the file as you turn it.
+        //
+        // Detected onsets are deliberately NOT re-authored. They cost a
+        // scan of the whole file, and they are ordinary editable data once
+        // they exist — walking over them here would throw away every
+        // marker the user had dragged.
+        //
+        // After the pictures, because the grid is computed from the frame
+        // count a picture just established.
+        for (t, id, _) in &wanted {
+            let Some(device) = self
+                .arrangement
+                .tracks
+                .get(*t)
+                .and_then(|track| track.chain.iter().find(|d| d.id == *id))
+            else {
+                continue;
+            };
+            let DeviceState::Sampler(params) = device.state else {
+                continue;
+            };
+            if params.slice_source.round() != daw::params::sampler::SLICE_GRID {
+                continue;
+            }
+            let frames = self.sampler_faces.get(id).map_or(0, |face| face.frames);
+            if frames == 0 {
+                continue;
+            }
+            let grid = daw::slice::grid(frames, params.slices.round().max(1.0) as usize);
+            if let Some(source) = self
+                .arrangement
+                .tracks
+                .get_mut(*t)
+                .and_then(|track| track.sampler_sources.get_mut(id))
+                && source.slices != grid
+            {
+                source.slices = grid;
+                self.arrangement.force_recompile = true;
+            }
+        }
+
+        // --- 3. the flat copy the rack draws from ---------------------
+        //
+        // Last, so it carries the grid authored above rather than the
+        // table as it was before this frame started.
+        self.sampler_slices.clear();
+        for (t, id, _) in &wanted {
+            let slices = self
+                .arrangement
+                .tracks
+                .get(*t)
+                .and_then(|track| track.sampler_sources.get(id))
+                .map(|source| source.slices.clone())
+                .unwrap_or_default();
+            self.sampler_slices.insert(*id, slices);
+        }
+    }
+
     fn advance_meters(&mut self, peaks: &[f32], dt: f32) {
         self.meters
             .resize_with(self.arrangement.tracks.len(), Default::default);
@@ -13095,6 +20425,12 @@ impl App {
                 dt,
             );
         }
+        // The master reads its reserved slot, not a lane's.
+        let peak = peaks.get(MASTER_METER).copied().unwrap_or(0.0);
+        self.master_meter.advance(
+            device::meter::amp_to_db(peak).max(device::meter::FLOOR_DB),
+            dt,
+        );
     }
 
     /// Translate this frame's transport wishes into engine commands. Runs
@@ -13184,7 +20520,6 @@ impl App {
         // debounced so a drag lands as one swap, not sixty.
         let shape = (
             self.transport.metronome,
-            self.loop_len_beats(),
             self.arrangement.tracks.len(),
             self.shape_hash(),
             self.transport.bpm.to_bits(),
@@ -13265,7 +20600,33 @@ impl App {
                 self.sent_volume[i] = volume;
             }
         }
+        self.sync_master(beat);
         self.sync_device_automation(beat);
+    }
+
+    /// The master fader and pan, through the same only-on-change door the
+    /// lanes use. It carries no automation of its own yet, so the values
+    /// are the ones on the strip.
+    fn sync_master(&mut self, _beat: f32) {
+        let pan = self.arrangement.master.pan.clamp(-1.0, 1.0);
+        let volume = self.arrangement.master.volume.max(0.0);
+        if pan == self.sent_master_pan && volume == self.sent_master_volume {
+            return;
+        }
+        let Some(node) = self.master_out else {
+            return;
+        };
+        let Some(engine) = &mut self.engine else {
+            return;
+        };
+        if pan != self.sent_master_pan {
+            engine.set_param(node, daw::params::pan::PAN, pan);
+            self.sent_master_pan = pan;
+        }
+        if volume != self.sent_master_volume {
+            engine.set_param(node, daw::params::pan::GAIN, volume);
+            self.sent_master_volume = volume;
+        }
     }
 
     /// The generic half of playback dispatch: every OTHER envelope a track
@@ -13323,17 +20684,201 @@ impl App {
     /// instance compiled to. The instance id is what keeps a letter on its
     /// own device — the two cards number their parameters the same way, and
     /// a misrouted letter would send a reverb's mix to a synth's gain.
-    fn apply_device_edits(&mut self, track: usize, device: u64, edits: &[device::ParamEdit]) {
-        let Some(instance) = self
+    /// What the clip editor's controls changed, written down and — where
+    /// the engine can hear it without a rebuild — sent.
+    ///
+    /// GAIN rides a letter. `Node::AudioClip` ramps its own gain, so the
+    /// change is click-free and a drag is heard AS IT HAPPENS rather than
+    /// when the debounced recompile catches up; that debounce exists so a
+    /// clip drag lands as one swap instead of sixty, and it would make a
+    /// gain fader feel like it was underwater.
+    ///
+    /// LOOPING cannot: whether a clip repeats is baked into the node at
+    /// compile, so it takes the ordinary road and the dirty check swaps
+    /// the schedule. That is one swap for a switch you flip occasionally,
+    /// which is the right trade in the other direction.
+    fn apply_clip_edit(&mut self, edit: waveform::ClipEdit) {
+        let Some((track, index)) = self.arrangement.selected_clip else {
+            return;
+        };
+        let Some(clip) = self
             .arrangement
-            .tracks
+            .clips
             .get_mut(track)
-            .and_then(|t| t.device_mut(device))
+            .and_then(|clips| clips.get_mut(index))
         else {
             return;
         };
+        let id = clip.id;
+        let Some(audio) = clip.audio.as_mut() else {
+            return;
+        };
+        match edit {
+            waveform::ClipEdit::Gain(gain) => {
+                let gain =
+                    daw::params::def(daw::params::clip::TABLE, daw::params::clip::GAIN).clamp(gain);
+                audio.gain = gain;
+                if let Some(node) = self.clip_nodes.get(&id).copied()
+                    && let Some(engine) = &mut self.engine
+                {
+                    engine.set_param(node, daw::params::clip::GAIN, gain);
+                }
+            }
+            waveform::ClipEdit::Looped(looped) => {
+                audio.looped = looped;
+                // No letter for this one — the next dirty check rebuilds.
+                self.arrangement.force_recompile = true;
+            }
+            // SLIDES the window: the clip keeps its duration in frames
+            // and its length on the timeline, and a different stretch of
+            // the file lands inside it. Resizing is what the clip's own
+            // edges are for — `trim_clip_left` owns that rule, and it
+            // holds the source END invariant, which this deliberately
+            // does not.
+            waveform::ClipEdit::SourceOffset(frames) => {
+                audio.source_offset = frames;
+                self.arrangement.force_recompile = true;
+            }
+            // The FILE is reversed into a cache and the clip points at
+            // it; the node streams forward through it exactly as before,
+            // so the audio callback learns nothing new. The work is a
+            // decode and a write, so it goes to the same worker every
+            // other sample-file job uses — and the clip is silent until
+            // the file lands, which `playing_path` decides rather than
+            // this.
+            //
+            // Turning it OFF is free: the forward file is already there.
+            waveform::ClipEdit::Reversed(reversed) => {
+                audio.reversed = reversed;
+                let path = audio.path.clone();
+                let ready = audio.playing_path().is_some();
+                self.arrangement.force_recompile = true;
+                if reversed && !ready {
+                    let asked = path.canonicalize().unwrap_or(path.clone());
+                    self.pending_reversals.insert(asked);
+                    self.wav_import_service.reverse(path);
+                    self.wav_import_pending = self.wav_import_pending.saturating_add(1);
+                }
+            }
+            // Fades ride LETTERS, like gain: the node keeps them as
+            // fields and applies them per sample, so dragging a handle is
+            // heard while it is dragged. Clamped to the clip's span here
+            // as well as in the node — the panel should not be able to
+            // ask for a fade the engine will quietly cut down.
+            waveform::ClipEdit::FadeIn(frames) | waveform::ClipEdit::FadeOut(frames) => {
+                let leading = matches!(edit, waveform::ClipEdit::FadeIn(_));
+                if leading {
+                    audio.fade_in = frames;
+                } else {
+                    audio.fade_out = frames;
+                }
+                let param = if leading {
+                    daw::params::clip::FADE_IN
+                } else {
+                    daw::params::clip::FADE_OUT
+                };
+                if let Some(node) = self.clip_nodes.get(&id).copied()
+                    && let Some(engine) = &mut self.engine
+                {
+                    engine.set_param(node, param, frames as f32);
+                }
+            }
+            // The SHAPES ride letters exactly as the lengths do, so
+            // dragging a curve is heard while it is dragged. Clamped
+            // here as well as in `Curve::new` — the panel should not be
+            // able to ask for a shape the node will quietly cut down.
+            waveform::ClipEdit::FadeInCurve(shape) | waveform::ClipEdit::FadeOutCurve(shape) => {
+                let leading = matches!(edit, waveform::ClipEdit::FadeInCurve(_));
+                let shape = if shape.is_finite() {
+                    shape.clamp(-1.0, 1.0)
+                } else {
+                    0.0
+                };
+                let param = if leading {
+                    audio.fade_in_curve = shape;
+                    daw::params::clip::FADE_IN_CURVE
+                } else {
+                    audio.fade_out_curve = shape;
+                    daw::params::clip::FADE_OUT_CURVE
+                };
+                if let Some(node) = self.clip_nodes.get(&id).copied()
+                    && let Some(engine) = &mut self.engine
+                {
+                    engine.set_param(node, param, shape);
+                }
+            }
+            // A LIST CANNOT RIDE A LETTER, so the envelope takes the
+            // ordinary road and the debounced dirty check swaps the
+            // schedule. That debounce is what makes a drag one swap
+            // rather than sixty — and an envelope point is dragged for a
+            // moment, not ridden like a fader.
+            waveform::ClipEdit::Envelope(points) => {
+                let mut points: Vec<(u64, f32)> = points
+                    .into_iter()
+                    .filter(|(_, db)| db.is_finite())
+                    .map(|(at, db)| (at, db.clamp(ENVELOPE_FLOOR_DB, ENVELOPE_CEIL_DB)))
+                    .collect();
+                points.sort_by_key(|(at, _)| *at);
+                points.dedup_by_key(|(at, _)| *at);
+                // A flat unity envelope is NO envelope. Storing one would
+                // cost the node a per-sample multiply to change nothing,
+                // and would make "has an envelope" untrue of a clip that
+                // does not.
+                let flat = points.iter().all(|(_, db)| db.abs() < 1e-4);
+                audio.envelope = if flat { Vec::new() } else { points };
+                self.arrangement.force_recompile = true;
+            }
+            waveform::ClipEdit::Rename(name) => {
+                // Never empty: the panel refuses one, and so does this,
+                // because a clip with no name cannot be found in a list.
+                if !name.trim().is_empty() {
+                    clip.name = name;
+                }
+            }
+        }
+    }
+
+    /// One device out of whichever chain owns it.
+    fn chain_device_mut(&mut self, owner: ChainOwner, device: u64) -> Option<&mut DeviceInstance> {
+        match owner {
+            ChainOwner::Track(track) => self
+                .arrangement
+                .tracks
+                .get_mut(track)
+                .and_then(|t| t.device_mut(device)),
+            ChainOwner::Master => self.arrangement.master.device_mut(device),
+        }
+    }
+
+    fn apply_device_edits(&mut self, owner: ChainOwner, device: u64, edits: &[device::ParamEdit]) {
+        let Some(instance) = (match owner {
+            ChainOwner::Track(track) => self
+                .arrangement
+                .tracks
+                .get_mut(track)
+                .and_then(|t| t.device_mut(device)),
+            ChainOwner::Master => self.arrangement.master.device_mut(device),
+        }) else {
+            return;
+        };
+        // Whether this device is an insert or an aux, BEFORE the edits
+        // land: a send that crosses zero rewires the track, and the
+        // letters below would be addressed to a node that is about to be
+        // retired. The recompile carries the new value instead — see
+        // `shape_hash`.
+        let was_aux = match instance.state {
+            DeviceState::Echo(params) => Some(params.send > 0.0),
+            _ => None,
+        };
         for edit in edits {
             instance.state.set(edit.param, edit.value);
+        }
+        let reshaped = match (was_aux, instance.state) {
+            (Some(before), DeviceState::Echo(params)) => before != (params.send > 0.0),
+            _ => false,
+        };
+        if reshaped {
+            return;
         }
         // A device that is not in the schedule — bypassed, or on a muted
         // track — has nowhere to send to. The next swap bakes the values in.
@@ -13358,7 +20903,9 @@ impl eframe::App for App {
             // fall stays ANIMATED, so frames keep coming until every meter
             // is at rest.
             self.advance_meters(&[], ui.ctx().input(|i| i.stable_dt));
-            if self.meters.iter().any(device::meter::Ballistics::moving) {
+            if self.master_meter.moving()
+                || self.meters.iter().any(device::meter::Ballistics::moving)
+            {
                 ui.ctx()
                     .request_repaint_after(std::time::Duration::from_millis(16));
             }
@@ -13370,6 +20917,12 @@ impl eframe::App for App {
         while let Some(result) = self.wav_import_service.try_result() {
             self.wav_import_pending = self.wav_import_pending.saturating_sub(1);
             match result {
+                // A reversal is a job about a clip that already exists,
+                // not a sample arriving: it recompiles and places
+                // nothing.
+                Ok(imported) if self.pending_reversals.remove(&imported.original_path) => {
+                    self.arrangement.force_recompile = true;
+                }
                 Ok(imported) => self.finish_sample_placement(imported),
                 Err(error) => self.notice = Some(error.to_string()),
             }
@@ -13410,9 +20963,23 @@ impl eframe::App for App {
             && ui.ctx().input(|i| i.pointer.any_released())
         {
             let payload = egui::DragAndDrop::take_payload::<SampleDrag>(ui.ctx());
+            // A SAMPLER first: dropping a file on a sampler's card loads
+            // it into that device, and only a release that was over no
+            // card at all falls through to the timeline. Taken rather
+            // than peeked, so one release cannot both load a device and
+            // make a clip.
+            let onto_device = self.sampler_drop_target.take();
             let spot = self.drag_import.take().and_then(|drag| drag.spot);
-            if let (Some(payload), Some(spot)) = (payload, spot) {
-                self.place_sample(payload.0.clone(), Some(spot));
+            match (payload, onto_device) {
+                (Some(payload), Some((track, instance))) => {
+                    self.load_sample_into(track, instance, payload.0.clone());
+                }
+                (Some(payload), None) => {
+                    if let Some(spot) = spot {
+                        self.place_sample(payload.0.clone(), Some(spot));
+                    }
+                }
+                (None, _) => {}
             }
         }
         self.pump_drag_import(ui.ctx());
@@ -13424,9 +20991,16 @@ impl eframe::App for App {
                 .request_repaint_after(std::time::Duration::from_millis(50));
         }
 
+        // A piano-roll command line owns EVERY printable key, including
+        // Space and `:`. These global readers run before `piano_roll::keys`,
+        // so they must stand down explicitly rather than expecting the roll
+        // to consume an event that has already fired here.
+        let piano_roll_modal = self.piano_roll.owns_modal_input();
+
         // Shift+Tab flips the bottom region between rack and clip editor.
         // Consumed first, so neither editor mistakes it for its own input.
-        if !ui.ctx().egui_wants_keyboard_input()
+        if !piano_roll_modal
+            && !ui.ctx().egui_wants_keyboard_input()
             && !self.skin.is_open()
             && ui
                 .ctx()
@@ -13451,10 +21025,16 @@ impl eframe::App for App {
         // it owns the arrows and Enter (it consumes what it uses), so a
         // command list can never be navigated and an arrangement cell moved
         // by the same keystroke.
+        // Over everything the panels drew, and BEFORE the palette takes
+        // the keyboard — Escape closes this, and the palette consumes it
+        // when open.
+        self.expanded_sampler_overlay(ui.ctx());
+
         let cmds = self.commands();
         if let Some(id) = self.palette.show(ui.ctx(), &self.theme, &cmds) {
             self.run_command(id, &mut actions);
-        } else if !self.palette.is_open()
+        } else if !piano_roll_modal
+            && !self.palette.is_open()
             && !self.skin.is_open()
             && ui
                 .ctx()
@@ -13480,13 +21060,14 @@ impl eframe::App for App {
         // zero. Skipped while a text field, the palette or the theme window
         // owns the keyboard — a space typed into a search box is a space,
         // not a play command, and getting that wrong is the classic DAW bug.
-        let mut matrix_toggle = false;
-        if !palette_open
+        if !piano_roll_modal
+            && !palette_open
             && !skin_open
             && !self.project.open
+            && !self.export.open
+            && !self.splash.open
             && !ui.ctx().egui_wants_keyboard_input()
         {
-            let matrix = &mut matrix_toggle;
             ui.ctx().input_mut(|i| {
                 // MODIFIED SPACE FIRST: `consume_key` ignores an extra
                 // Shift, so the plain gesture checked first would swallow
@@ -13515,14 +21096,14 @@ impl eframe::App for App {
                 if i.consume_key(egui::Modifiers::COMMAND, egui::Key::O) {
                     actions.push(UiAction::OpenProjectWindow);
                 }
-                if i.consume_key(egui::Modifiers::COMMAND, egui::Key::M) {
-                    *matrix = true;
-                }
             });
         }
-        if !palette_open
+        if !piano_roll_modal
+            && !palette_open
             && !skin_open
             && !self.project.open
+            && !self.export.open
+            && !self.splash.open
             && !ui.ctx().egui_wants_keyboard_input()
             && ui
                 .ctx()
@@ -13536,9 +21117,12 @@ impl eframe::App for App {
         // The compact automation lane advertises Z only while it is under
         // the pointer. Consume that exact gesture before the arrangement's
         // normal Z action (zoom selected audio clip) gets a chance to see it.
-        if !palette_open
+        if !piano_roll_modal
+            && !palette_open
             && !skin_open
             && !self.project.open
+            && !self.export.open
+            && !self.splash.open
             && !ui.ctx().egui_wants_keyboard_input()
             && self.arrangement.main_view == MainView::Timeline
             && self.automation_mode
@@ -13550,7 +21134,8 @@ impl eframe::App for App {
         {
             self.automation_editor = true;
         }
-        if self.automation_editor
+        if !piano_roll_modal
+            && self.automation_editor
             && ui.ctx().input_mut(|i| {
                 i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
                     || i.consume_key(egui::Modifiers::NONE, egui::Key::X)
@@ -13558,10 +21143,12 @@ impl eframe::App for App {
         {
             self.automation_editor = false;
         }
-        if matrix_toggle {
-            self.matrix_open = !self.matrix_open;
-        }
+        self.draw_splash(ui.ctx());
         self.draw_project_window(ui.ctx());
+        // A finished render before its window draws, so the modal that
+        // shows the progress bar is the one that shows the result.
+        self.poll_export();
+        self.draw_export_window(ui.ctx());
         self.draw_matrix_window(ui.ctx());
 
         if !palette_open && !skin_open && self.bottom_view == BottomView::ClipEditor {
@@ -13570,6 +21157,15 @@ impl eframe::App for App {
                     // Point the roll at the selected clip BEFORE any key
                     // reaches it: an index from the previously shown clip
                     // must never survive into an edit on this one.
+                    // The lock list reads the track IMMUTABLY, so it is
+                    // built before the clip's notes are borrowed mutably.
+                    let plocks = self
+                        .arrangement
+                        .selected_clip
+                        .and_then(|(t, _)| self.arrangement.tracks.get(t))
+                        .map(plockable_params)
+                        .unwrap_or_default();
+                    let key = self.arrangement.key;
                     let (id, notes) = match self.arrangement.main_view {
                         MainView::Session => (
                             self.arrangement.active_slot_clip_id(),
@@ -13581,14 +21177,70 @@ impl eframe::App for App {
                         ),
                     };
                     self.piano_roll.follow_clip(id);
-                    piano_roll::keys(ui.ctx(), &mut self.piano_roll, notes);
+                    piano_roll::keys(
+                        ui.ctx(),
+                        &mut self.piano_roll,
+                        notes,
+                        &plocks,
+                        key,
+                        self.transport.beats_per_bar,
+                    );
+                    if let Some(edit) = self.piano_roll.take_clip_length_edit() {
+                        let grid = self.arrangement.grid_beats();
+                        match self.arrangement.main_view {
+                            MainView::Timeline => {
+                                if let Some((track, index)) = self.arrangement.selected_clip {
+                                    let want = scripted_clip_len(
+                                        &self.arrangement.clips[track][index],
+                                        edit,
+                                        grid,
+                                    );
+                                    let length = clamp_clip_len(
+                                        &self.arrangement.clips[track],
+                                        index,
+                                        want,
+                                        grid,
+                                    );
+                                    set_scripted_clip_len(
+                                        &mut self.arrangement.clips[track][index],
+                                        length,
+                                    );
+                                }
+                            }
+                            MainView::Session => {
+                                if let Some(clip) = self.arrangement.active_slot_clip() {
+                                    let length = scripted_clip_len(clip, edit, grid);
+                                    set_scripted_clip_len(clip, length);
+                                }
+                            }
+                        }
+                    }
                     self.waveform.owns_keys = false;
                 }
                 ClipEditorKind::Audio => {
+                    // One grid unit in the CLIP's own frames, which is
+                    // what an arrow key moves the cursor by. Zero when
+                    // there is no audio clip, and the editor falls back.
+                    let grid_frames = self
+                        .arrangement
+                        .active_audio_clip()
+                        .and_then(|clip| clip.audio.as_ref())
+                        .map(|audio| {
+                            (f64::from(self.arrangement.grid_beats()) * 60.0
+                                / self.transport.bpm.max(1.0)
+                                * f64::from(audio.sample_rate.max(1)))
+                            .round()
+                            .max(0.0) as u64
+                        })
+                        .unwrap_or(0);
                     waveform::keys(
                         ui.ctx(),
                         &mut self.waveform,
-                        self.arrangement.active_audio_clip().is_some(),
+                        waveform::KeyContext {
+                            has_clip: self.arrangement.active_audio_clip().is_some(),
+                            grid_frames,
+                            can_paste: self.audio_clipboard.is_some(),
+                        },
                     );
                     self.piano_roll.owns_keys = false;
                 }
@@ -13607,6 +21259,10 @@ impl eframe::App for App {
         // commit.
         track_rename_keys(ui.ctx(), &mut self.arrangement);
         self.focus.begin(ui.ctx());
+        // The samplers' pictures, refreshed BEFORE any field of `self`
+        // is lent out: rebuilding one decodes a file, and that needs the
+        // whole of `self` mutably.
+        self.refresh_sampler_faces();
         let t = &self.theme;
 
         let engine_view = EngineView {
@@ -13637,7 +21293,28 @@ impl eframe::App for App {
         // The device rack belongs to the selected track, and its knob edits
         // are addressed to that track — captured here, not re-derived later,
         // so a selection change mid-frame cannot misdeliver them.
+        // The response an equaliser draws is a function of the sample
+        // rate, so the rack needs to know it. With no stream open the
+        // card falls back to the rate the project targets — a curve has
+        // to be drawn either way, and a card that showed nothing until
+        // the engine started would be worse than one drawn at 48 kHz.
+        let device_rate = self
+            .engine
+            .as_ref()
+            .map(|engine| engine.info().sample_rate as f32)
+            .unwrap_or(device::eq::ASSUMED_RATE);
+        let sampler_faces = &self.sampler_faces;
+        let sampler_slices = &self.sampler_slices;
+        let device_histories = &self.device_histories;
         let device_track = self.arrangement.active_track();
+        // Which chain the rack is showing. The master wins when it is the
+        // thing selected — the lane stays selected underneath it, which is
+        // what lets the clips and the roll carry on belonging to it.
+        let device_owner = if self.arrangement.master_selected {
+            Some(ChainOwner::Master)
+        } else {
+            device_track.map(ChainOwner::Track)
+        };
         let editor_kind = clip_editor_kind(&self.arrangement);
         let bottom_panel_id = self.bottom_view.panel_id(editor_kind);
         let waveform_peaks = self
@@ -13649,164 +21326,233 @@ impl eframe::App for App {
         // The frame is built BEFORE the field borrows below: `fill` takes
         // `&self`, and a whole-self borrow cannot coexist with them.
         let sunken = self.fill(t.surface_sunken);
-        let (device, edits) = match self.bottom_view {
-            BottomView::Rack => {
-                let arrangement = &mut self.arrangement;
-                // The MOD strip's inputs, copied out BEFORE the track's
-                // knob state is borrowed mutably: names and device kinds
-                // are cheap, and copies cannot fight the cards.
-                let track_names: Vec<String> = arrangement
-                    .tracks
-                    .iter()
-                    .map(|track| track.name.clone())
-                    .collect();
-                let registry = &self.parameter_registry;
-                // The strip's target list, and the chain it belongs to,
-                // read out before the rack borrows the track: enumerating
-                // targets needs the chain, and a clone of two Strings per
-                // parameter is cheaper than fighting the borrow.
-                let (mod_targets, chain) = device_track
-                    .and_then(|i| arrangement.tracks.get(i))
-                    .map_or_else(
-                        || (Vec::new(), Vec::new()),
-                        |track| (track_targets(track, registry), track.chain.clone()),
-                    );
-                let mod_values = &self.mod_values;
-                let wire_outputs = &self.wire_outputs;
-                let clock_seconds = self.clock_seconds;
-                let wire_scopes = &self.wire_scopes;
-                let expanded_wire = &mut self.expanded_wire;
-                let mod_collapsed = &mut self.prefs.mod_strip_collapsed;
-                let beat = (self.transport.position * self.transport.bpm / 60.0) as f32;
-                let out = egui::Panel::bottom("device")
-                    .resizable(false)
-                    .show_separator_line(true)
-                    .exact_size(DEVICE_H)
-                    .frame(sunken)
-                    .show(ui, |ui| {
-                        let Arrangement {
-                            modulators,
-                            mod_wires,
-                            next_modulator_id,
-                            ..
-                        } = arrangement;
-                        let strip = ModStrip {
-                            track: device_track,
-                            track_names: &track_names,
-                            targets: mod_targets,
-                            modulators,
-                            wires: mod_wires,
-                            next_id: next_modulator_id,
-                            registry,
-                            values: mod_values,
-                            beat,
-                            seconds: clock_seconds,
-                            outputs: wire_outputs,
-                            scopes: wire_scopes,
-                            expanded: expanded_wire,
-                        };
-                        device_body(ui, t, &chain, strip, mod_collapsed)
-                    });
-                (out.response.rect, out.inner)
-            }
-            BottomView::ClipEditor => match editor_kind {
-                ClipEditorKind::Midi => {
+        // A HIDDEN region is not drawn at all — not drawn at zero height,
+        // not drawn behind something. An egui panel that shows claims its
+        // space and runs its whole body, so "hidden" has to mean the
+        // `show` never happens, or the cost of a region nobody can see is
+        // paid on every frame it is folded away.
+        //
+        // `Rect::NOTHING` stands in for the rect the seam below would have
+        // used; a seam with no panel to drag is not drawn either.
+        // What the clip editor asked for, settled after the panels give
+        // the theme borrow back.
+        let mut clip_edit: Option<waveform::ClipEdit> = None;
+        let (device, edits) = if self.prefs.lower_hidden {
+            (egui::Rect::NOTHING, DeviceEdits::default())
+        } else {
+            match self.bottom_view {
+                BottomView::Rack => {
                     let arrangement = &mut self.arrangement;
-                    let piano_roll = &mut self.piano_roll;
-                    let focus = &mut self.focus;
-                    let beats_per_bar = self.transport.beats_per_bar;
-                    let rect = egui::Panel::bottom("piano_roll")
-                        .resizable(true)
-                        .show_separator_line(true)
-                        .default_size(piano_roll::DEFAULT_H)
-                        .size_range(piano_roll::H_RANGE)
-                        .frame(sunken)
-                        .show(ui, |ui| {
-                            let key = arrangement.key;
-                            let clip = match arrangement.main_view {
-                                MainView::Session => arrangement.active_slot_clip(),
-                                MainView::Timeline => arrangement.active_clip(),
-                            };
-                            piano_roll::body(ui, focus, t, piano_roll, beats_per_bar, clip, key)
-                        })
-                        .response
-                        .rect;
-                    (rect, DeviceEdits::default())
-                }
-                ClipEditorKind::Audio => {
-                    let arrangement = &self.arrangement;
-                    let waveform = &mut self.waveform;
-                    let focus = &mut self.focus;
-                    let playhead = (self.transport.position * self.transport.bpm / 60.0) as f32;
-                    let time = waveform::TimeView {
-                        bpm: self.transport.bpm,
-                        beats_per_bar: self.transport.beats_per_bar,
-                        playhead,
-                        grid_beats: arrangement.grid_beats(),
-                        grid_name: GRID_NAMES[arrangement.grid.min(GRID_NAMES.len() - 1)],
+                    // The MOD strip's inputs, copied out BEFORE the track's
+                    // knob state is borrowed mutably: names and device kinds
+                    // are cheap, and copies cannot fight the cards.
+                    let track_names: Vec<String> = arrangement
+                        .tracks
+                        .iter()
+                        .map(|track| track.name.clone())
+                        .collect();
+                    let registry = &self.parameter_registry;
+                    // The strip's target list, and the chain it belongs to,
+                    // read out before the rack borrows the track: enumerating
+                    // targets needs the chain, and a clone of two Strings per
+                    // parameter is cheaper than fighting the borrow.
+                    // The master's chain has no modulation targets yet:
+                    // a `ModWire` is addressed to a LANE, and inventing a
+                    // lane number for the master would aim its wires at
+                    // whatever track happened to hold that index.
+                    let (mod_targets, chain) = match device_owner {
+                        Some(ChainOwner::Master) => (Vec::new(), arrangement.master.chain.clone()),
+                        Some(ChainOwner::Track(i)) => arrangement.tracks.get(i).map_or_else(
+                            || (Vec::new(), Vec::new()),
+                            |track| (track_targets(track, registry), track.chain.clone()),
+                        ),
+                        None => (Vec::new(), Vec::new()),
                     };
-                    let rect = egui::Panel::bottom("waveform_editor")
-                        .resizable(true)
+                    let mod_values = &self.mod_values;
+                    let wire_outputs = &self.wire_outputs;
+                    let clock_seconds = self.clock_seconds;
+                    let wire_scopes = &self.wire_scopes;
+                    let expanded_wire = &mut self.expanded_wire;
+                    let mod_collapsed = &mut self.prefs.mod_strip_collapsed;
+                    let beat = (self.transport.position * self.transport.bpm / 60.0) as f32;
+                    let out = egui::Panel::bottom("device")
+                        .resizable(false)
                         .show_separator_line(true)
-                        .default_size(waveform::DEFAULT_H)
-                        .size_range(waveform::H_RANGE)
+                        .exact_size(DEVICE_H)
                         .frame(sunken)
                         .show(ui, |ui| {
-                            waveform::body(
+                            let Arrangement {
+                                modulators,
+                                mod_wires,
+                                next_modulator_id,
+                                ..
+                            } = arrangement;
+                            let strip = ModStrip {
+                                track: device_track,
+                                track_names: &track_names,
+                                targets: mod_targets,
+                                modulators,
+                                wires: mod_wires,
+                                next_id: next_modulator_id,
+                                registry,
+                                values: mod_values,
+                                beat,
+                                seconds: clock_seconds,
+                                outputs: wire_outputs,
+                                scopes: wire_scopes,
+                                expanded: expanded_wire,
+                            };
+                            device_body(
                                 ui,
-                                focus,
                                 t,
-                                waveform,
-                                arrangement.active_audio_clip(),
-                                waveform_peaks.as_deref(),
-                                time,
+                                &chain,
+                                strip,
+                                mod_collapsed,
+                                device_rate,
+                                device_histories,
+                                sampler_faces,
+                                sampler_slices,
                             )
-                        })
-                        .response
-                        .rect;
-                    (rect, DeviceEdits::default())
+                        });
+                    (out.response.rect, out.inner)
                 }
-                ClipEditorKind::Empty => {
-                    let rect = egui::Panel::bottom("clip_editor")
-                        .resizable(true)
-                        .show_separator_line(true)
-                        .default_size(waveform::DEFAULT_H)
-                        .size_range(waveform::H_RANGE)
-                        .frame(sunken)
-                        .show(ui, |ui| {
-                            claim(ui);
-                            kit::empty_state(ui, t, "select a MIDI or audio track");
-                        })
-                        .response
-                        .rect;
-                    (rect, DeviceEdits::default())
-                }
-            },
+                BottomView::ClipEditor => match editor_kind {
+                    ClipEditorKind::Midi => {
+                        // The transport, as the roll's own view of time.
+                        // Built here rather than inside the panel because
+                        // it reads `self` and the closure below takes the
+                        // arrangement mutably.
+                        let roll_time = piano_roll::TimeView {
+                            beats_per_bar: self.transport.beats_per_bar,
+                            // ABSOLUTE beats. The roll subtracts the
+                            // clip's own start, so a clip at bar 5 still
+                            // shows bar 1 at its own beat 0.
+                            playhead: Some(self.transport.position * self.transport.bpm / 60.0),
+                            playing: self.transport.playing,
+                            follow: self.transport.playing && self.transport.follow,
+                        };
+                        // GHOSTS: the other clips on this track, drawn for
+                        // reference. Writing a part against another part
+                        // should not mean remembering it.
+                        let roll_ghosts = self.roll_ghost_notes();
+                        let arrangement = &mut self.arrangement;
+                        let piano_roll = &mut self.piano_roll;
+                        let focus = &mut self.focus;
+                        let rect = egui::Panel::bottom("piano_roll")
+                            .resizable(true)
+                            .show_separator_line(true)
+                            .default_size(piano_roll::DEFAULT_H)
+                            .size_range(piano_roll::H_RANGE)
+                            .frame(sunken)
+                            .show(ui, |ui| {
+                                let key = arrangement.key;
+                                let plocks = arrangement
+                                    .selected_clip
+                                    .and_then(|(track, _)| arrangement.tracks.get(track))
+                                    .map(plockable_params)
+                                    .unwrap_or_default();
+                                let clip = match arrangement.main_view {
+                                    MainView::Session => arrangement.active_slot_clip(),
+                                    MainView::Timeline => arrangement.active_clip(),
+                                };
+                                piano_roll::body_at(
+                                    ui,
+                                    focus,
+                                    t,
+                                    piano_roll,
+                                    roll_time,
+                                    clip,
+                                    key,
+                                    &plocks,
+                                    &roll_ghosts,
+                                )
+                            })
+                            .response
+                            .rect;
+                        (rect, DeviceEdits::default())
+                    }
+                    ClipEditorKind::Audio => {
+                        let arrangement = &self.arrangement;
+                        let waveform = &mut self.waveform;
+                        let focus = &mut self.focus;
+                        let playhead = (self.transport.position * self.transport.bpm / 60.0) as f32;
+                        let time = waveform::TimeView {
+                            bpm: self.transport.bpm,
+                            beats_per_bar: self.transport.beats_per_bar,
+                            playhead,
+                            grid_beats: arrangement.grid_beats(),
+                            grid_name: GRID_NAMES[arrangement.grid.min(GRID_NAMES.len() - 1)],
+                            follow: self.transport.playing && self.transport.follow,
+                        };
+                        let panel = egui::Panel::bottom("waveform_editor")
+                            .resizable(true)
+                            .show_separator_line(true)
+                            .default_size(waveform::DEFAULT_H)
+                            .size_range(waveform::H_RANGE)
+                            .frame(sunken)
+                            .show(ui, |ui| {
+                                waveform::body(
+                                    ui,
+                                    focus,
+                                    t,
+                                    waveform,
+                                    arrangement.active_audio_clip(),
+                                    waveform_peaks.as_deref(),
+                                    time,
+                                )
+                            });
+                        // The editor is a VIEW: it hands its wishes back
+                        // and the app is what writes them down and tells
+                        // the engine, the same road every other region
+                        // takes.
+                        clip_edit = panel.inner;
+                        (panel.response.rect, DeviceEdits::default())
+                    }
+                    ClipEditorKind::Empty => {
+                        let rect = egui::Panel::bottom("clip_editor")
+                            .resizable(true)
+                            .show_separator_line(true)
+                            .default_size(waveform::DEFAULT_H)
+                            .size_range(waveform::H_RANGE)
+                            .frame(sunken)
+                            .show(ui, |ui| {
+                                claim(ui);
+                                kit::empty_state(ui, t, "select a MIDI or audio track");
+                            })
+                            .response
+                            .rect;
+                        (rect, DeviceEdits::default())
+                    }
+                },
+            }
         };
         // `edits` is applied at the end of the frame, once the theme borrow
         // the panels hold has ended.
 
-        let browser_panel = egui::Panel::left("browser")
-            .resizable(true)
-            .show_separator_line(true)
-            .default_size(BROWSER_W)
-            .size_range(BROWSER_W_RANGE)
-            .frame(self.fill(t.surface_sunken))
-            .show(ui, |ui| {
-                browser_body(
-                    ui,
-                    t,
-                    &mut self.focus,
-                    &mut self.browser,
-                    &self.library_snapshot,
-                    &self.library_config,
-                    self.library_scanning,
-                )
-            });
-        // Applied at the end of the frame with `edits`, for the same
-        // reason: the panels still hold the theme borrow here.
-        let browser_event = browser_panel.inner;
-        let browser = browser_panel.response.rect;
+        let (browser_event, browser) = if self.prefs.browser_hidden {
+            (None, egui::Rect::NOTHING)
+        } else {
+            let browser_panel = egui::Panel::left("browser")
+                .resizable(true)
+                .show_separator_line(true)
+                .default_size(BROWSER_W)
+                .size_range(BROWSER_W_RANGE)
+                .frame(self.fill(t.surface_sunken))
+                .show(ui, |ui| {
+                    browser_body(
+                        ui,
+                        t,
+                        &mut self.focus,
+                        &mut self.browser,
+                        &self.library_snapshot,
+                        &self.library_config,
+                        self.library_scanning,
+                    )
+                });
+            // Applied at the end of the frame with `edits`, for the same
+            // reason: the panels still hold the theme borrow here.
+            (browser_panel.inner, browser_panel.response.rect)
+        };
 
         // The transport position in beats: what the arrangement draws its
         // playhead from. The stand-in clock ticks in seconds; the engine's
@@ -13820,67 +21566,95 @@ impl eframe::App for App {
 
         // What the launcher hands back — settled after the panel, where
         // `self.meters` and the transport are free again.
-        let mut session_outcome = SessionOutcome::default();
-        let arrangement_outcome = egui::CentralPanel::default()
-            .frame(self.fill(t.bg))
-            .show(ui, |ui| match self.arrangement.main_view {
-                MainView::Timeline if self.automation_editor => {
-                    if automation_editor_body(
-                        ui,
-                        &self.theme,
-                        &mut self.arrangement,
-                        self.transport.beats_per_bar,
-                        &self.parameter_registry,
-                        &mut self.automation_target,
-                    ) {
-                        self.automation_editor = false;
-                    }
-                    ArrangementOutcome::default()
-                }
-                MainView::Timeline => arrangement_body(
-                    ui,
-                    &mut self.focus,
-                    &self.theme,
-                    &mut self.arrangement,
-                    arrangement_transport,
-                    &self.waveform_cache,
-                    self.drag_import.as_mut(),
-                    self.automation_mode,
-                    &self.parameter_registry,
-                    &mut self.automation_target,
-                ),
-                MainView::Session => {
-                    let now = arrangement_transport.playhead;
-                    let launch_at = self
-                        .launch_quantization
-                        .launch_beat(now, self.transport.beats_per_bar);
-                    session_outcome = session_body(
-                        ui,
-                        &mut self.focus,
-                        &self.theme,
-                        &mut self.arrangement,
-                        self.transport.beats_per_bar,
-                        launch_at,
-                        &self.meters,
-                        self.drag_import.as_mut(),
-                    );
-                    // The launcher has no view to pan: nothing here can
-                    // take the wheel from follow.
-                    ArrangementOutcome::default()
-                }
-            })
-            .inner;
-        self.automation_hovered = arrangement_outcome.automation_hovered;
-
-        if let Some(track) = session_outcome.cleared_clip
-            && let Some(meter) = self.meters.get_mut(track)
-        {
-            meter.clipped = false;
+        // Prepared BEFORE the panel closure, which borrows `self` for the
+        // arrangement: the theme and the transport are read-only here and
+        // holding them as values keeps the borrow checker out of the way.
+        let mut session_intents: Vec<daw::ui::session_next::SessionIntent> = Vec::new();
+        // The view hands its geometry back, which is what lets a file
+        // dropped from the OS or the browser find a slot WITHOUT the
+        // view having to know that dragging files is a thing. It draws
+        // the grid; the app owns import.
+        let mut session_layout: Option<daw::ui::session_next::SessionLayout> = None;
+        let session_colors = session_bridge::colors(&self.theme);
+        let session_clock = session_bridge::clock(&self.transport, self.engine_sample_rate());
+        // The document is reconciled with the project before it is drawn,
+        // so a clip created a moment ago is on screen this frame rather
+        // than the next one.
+        if self.arrangement.main_view == MainView::Session {
+            session_bridge::sync_document(&mut self.session_doc, &self.arrangement);
         }
-        // A scene's named tempo rides the same action road every other
-        // tempo change takes, so the engine and the mirror both hear it.
-        if let Some(bpm) = session_outcome.tempo {
-            actions.push(UiAction::SetTempo(bpm));
+        let arrangement_panel =
+            egui::CentralPanel::default()
+                .frame(self.fill(t.bg))
+                .show(ui, |ui| {
+                    // The music-script surface is modal. The arrangement stays
+                    // visible behind it, but a tab click must never also move a
+                    // clip or timeline cursor underneath the palette.
+                    if piano_roll_modal {
+                        ui.disable();
+                    }
+                    match self.arrangement.main_view {
+                        MainView::Timeline if self.automation_editor => {
+                            if automation_editor_body(
+                                ui,
+                                &self.theme,
+                                &mut self.arrangement,
+                                self.transport.beats_per_bar,
+                                &self.parameter_registry,
+                                &mut self.automation_target,
+                            ) {
+                                self.automation_editor = false;
+                            }
+                            ArrangementOutcome::default()
+                        }
+                        MainView::Timeline => arrangement_body(
+                            ui,
+                            &mut self.focus,
+                            &self.theme,
+                            &mut self.arrangement,
+                            arrangement_transport,
+                            &self.waveform_cache,
+                            self.drag_import.as_mut(),
+                            self.automation_mode,
+                            &self.parameter_registry,
+                            &mut self.automation_target,
+                            &mut self.meters,
+                            &mut self.master_meter,
+                        ),
+                        MainView::Session => {
+                            // The replacement surface. It is a VIEW in the same
+                            // sense the audio editor is: it reads a document and
+                            // a runtime, and hands its wishes back as intents for
+                            // the app to carry out.
+                            let output = daw::ui::session_next::show_session(
+                                ui,
+                                &self.session_doc,
+                                &self.session_runtime,
+                                session_clock,
+                                &self.session_clipboard,
+                                &mut self.session_view,
+                                &session_colors,
+                            );
+                            session_intents = output.intents;
+                            session_layout = Some(output.layout);
+                            // The launcher has no view to pan: nothing here can
+                            // take the wheel from follow.
+                            ArrangementOutcome::default()
+                        }
+                    }
+                });
+        let arrangement_rect = arrangement_panel.response.rect;
+        let arrangement_outcome = arrangement_panel.inner;
+        self.piano_roll.chord_palette(
+            ui.ctx(),
+            &self.theme,
+            arrangement_rect,
+            self.arrangement.key,
+            self.transport.beats_per_bar,
+        );
+        self.automation_hovered = arrangement_outcome.automation_hovered;
+        if arrangement_outcome.open_clip_editor {
+            self.bottom_view = BottomView::ClipEditor;
         }
 
         // Panning by hand is the user taking the wheel: follow stays off
@@ -13894,16 +21668,119 @@ impl eframe::App for App {
         // bar's lower edge is fixed, so marking it would advertise a handle
         // that is not there — and only while that seam is pointed at or
         // pulled, so an untouched window is fills and nothing else.
-        seam(ui, "browser", vertical_seam(browser));
-        seam(ui, bottom_panel_id, horizontal_seam(device));
+        if !self.prefs.browser_hidden {
+            seam(ui, "browser", vertical_seam(browser));
+        }
+        if !self.prefs.lower_hidden {
+            seam(ui, bottom_panel_id, horizontal_seam(device));
+        }
 
         self.focus.end(ui, t);
 
+        // Both fade drags take the same road — the editor's and the
+        // timeline's — so the two cannot end up with different ideas
+        // about clamping or about who tells the engine.
+        // A locate the roll's ruler asked for. CLIP-RELATIVE on the way
+        // out, so the clip's own start is what turns it back into a
+        // position on the timeline — a clip at bar 5 must not send the
+        // marker to bar 1 because that is where its ruler says 1.
+        if let Some(beat) = self.piano_roll.take_locate() {
+            let start = match self.arrangement.main_view {
+                MainView::Session => 0.0,
+                MainView::Timeline => self
+                    .arrangement
+                    .active_clip_ref()
+                    .map_or(0.0, |clip| f64::from(clip.start)),
+            };
+            let absolute = (beat + start).max(0.0) as f32;
+            let track = self
+                .arrangement
+                .selected_clip
+                .map(|(track, _)| track)
+                .or(self.arrangement.selected)
+                .unwrap_or(0);
+            locate_transport(absolute, track, &mut self.transport, &mut self.arrangement);
+        }
+
+        // The Session's turn of the crank, in the order the pieces
+        // depend on each other: what the user asked for, then which
+        // queued boundaries have arrived, then the telemetry the next
+        // frame draws, then the audio.
+        if self.arrangement.main_view == MainView::Session {
+            self.aim_session_drop(session_layout, ui.ctx());
+            self.run_session_intents(session_intents, session_clock);
+            // DUE ONLY WHILE RUNNING. A queued launch waits for the
+            // transport to reach its boundary; applying it with the
+            // transport stopped would fire everything at once the moment
+            // the user queued it.
+            if self.transport.playing {
+                self.session_runtime.apply_due(session_clock.sample);
+            }
+            session_bridge::sync_runtime(
+                &mut self.session_runtime,
+                &self.arrangement,
+                &self.meters,
+                session_clock,
+                self.transport.playing,
+            );
+            if session_bridge::mirror_playback(
+                &self.session_runtime,
+                &self.session_doc,
+                &mut self.arrangement,
+                session_clock,
+            ) {
+                self.arrangement.force_recompile = true;
+            }
+        }
+
+        // AFTER the panels, where the theme is no longer borrowed: the
+        // editor has drawn and settled on a selection by now, which is
+        // the only moment there is one worth projecting.
+        self.mirror_audio_selection();
+        // A verb chosen from the display's context menu. It goes through
+        // the same dispatch the palette uses, so there is one definition
+        // of what each one does and one place it can be wrong.
+        if let Some(command) = self.waveform.take_command() {
+            self.run_audio_command(command);
+        }
+        if let Some(edit) = clip_edit.or_else(|| arrangement_outcome.clip_fade.map(|(_, e)| e)) {
+            self.apply_clip_edit(edit);
+        }
+
+        // Refreshed unconditionally, so a pointer that has left the card —
+        // or a rack that is no longer on screen at all — stops being a
+        // drop target rather than staying one forever.
+        self.sampler_drop_target = device_track.zip(edits.hover_sampler);
+
         // Knob edits leave the card as (param id, natural value); they land
-        // on the track that drew the card and, live, on that track's Seq.
-        if let Some(track) = device_track {
+        // on whichever chain drew the card and, live, on its node.
+        if let Some(owner) = device_owner {
             for (instance, made) in &edits.edits {
-                self.apply_device_edits(track, *instance, made);
+                self.apply_device_edits(owner, *instance, made);
+            }
+            for (instance, page) in &edits.pages {
+                if let Some(dev) = self.chain_device_mut(owner, *instance) {
+                    dev.page = *page;
+                }
+            }
+            for (instance, zoom, scroll) in &edits.views {
+                if let Some(dev) = self.chain_device_mut(owner, *instance) {
+                    dev.view_zoom = *zoom;
+                    dev.view_scroll = *scroll;
+                }
+            }
+        }
+        // The sampler's own edits are lane-only: the master carries no
+        // instrument, so it can carry no slice table either.
+        if let Some(track) = device_track.filter(|_| !self.arrangement.master_selected) {
+            for (instance, index, frame) in &edits.slice_moves {
+                self.move_slice(track, *instance, *index, *frame);
+            }
+            for instance in &edits.reslice {
+                self.rebuild_slices(track, *instance);
+            }
+            if let Some(instance) = edits.expand {
+                self.expanded_sampler = Some((track, instance));
             }
         }
         if let Some(event) = browser_event {
@@ -13963,6 +21840,26 @@ impl eframe::App for App {
                     self.theme.set_density(density);
                     self.prefs.density = density;
                     self.theme.apply(ui.ctx());
+                }
+                // The frame regions are the app's own, for the same
+                // reason density is: they are a machine-local preference,
+                // and `perform` is pure over the arrangement.
+                UiAction::ToggleBrowser => {
+                    self.prefs.browser_hidden = !self.prefs.browser_hidden;
+                }
+                UiAction::ToggleLower => {
+                    self.prefs.lower_hidden = !self.prefs.lower_hidden;
+                }
+                // ALL OR NOTHING, and it always does something: with any
+                // region still showing, this clears the frame; with none,
+                // it brings everything back. A toggle that flipped each
+                // region independently would land on "one of the two is
+                // showing" half the time, which is not a state anyone
+                // presses a key to reach.
+                UiAction::ToggleChrome => {
+                    let clearing = !self.prefs.browser_hidden || !self.prefs.lower_hidden;
+                    self.prefs.browser_hidden = clearing;
+                    self.prefs.lower_hidden = clearing;
                 }
                 other => wishes.push(other),
             }
@@ -14086,6 +21983,9 @@ mod tests {
             id,
             state: DeviceState::new(kind),
             bypass: false,
+            page: 0,
+            view_zoom: unit_zoom(),
+            view_scroll: 0.0,
         });
         id
     }
@@ -14094,6 +21994,23 @@ mod tests {
     /// in lanes rather than in instance ids.
     fn instrument_node(nodes: &GraphNodes, track: &Track) -> Option<NodeId> {
         nodes.devices.get(&track.instrument()?.id).copied()
+    }
+
+    /// The bus every lane lands on: the node feeding the graph's output.
+    ///
+    /// The output itself is the MASTER's fader, which is one hop further
+    /// along than it used to be. Tests that mean "where the tracks sum"
+    /// ask for it by shape rather than naming a node, so they keep meaning
+    /// that when the master grows a chain.
+    fn sum_bus(spec: &GraphSpec) -> NodeId {
+        let out = spec.output().expect("a graph has an output");
+        let mut feeds = spec.wires().iter().filter(|(_, t)| *t == out);
+        let (from, _) = feeds.next().expect("the output is fed by something");
+        assert!(
+            feeds.next().is_none(),
+            "the master fader reads its first input only, so it takes exactly one"
+        );
+        *from
     }
 
     /// A device target spelled out: `dev.7.reverb.mix`.
@@ -14107,6 +22024,9 @@ mod tests {
             id,
             state: DeviceState::new(kind),
             bypass: false,
+            page: 0,
+            view_zoom: unit_zoom(),
+            view_scroll: 0.0,
         });
         id
     }
@@ -14338,6 +22258,27 @@ mod tests {
         assert!(browser_bands(flat, BROWSER_LOWER_FRAC).is_none());
         let sliver = Rect::from_min_size(pos2(0.0, 0.0), vec2(BROWSER_INSET_X * 2.0, 500.0));
         assert!(browser_bands(sliver, BROWSER_LOWER_FRAC).is_none());
+    }
+
+    /// Built-in devices are a fixed header for the scrolling sample catalog.
+    /// Its viewport therefore starts after their final row, never at the
+    /// search bar where samples could paint over Instruments and FX.
+    #[test]
+    fn the_sample_catalog_begins_below_the_device_tree() {
+        let upper = Rect::from_min_size(pos2(10.0, 20.0), vec2(240.0, 300.0));
+        let rows = 5;
+        let viewport = catalog_viewport(upper, rows);
+        assert_eq!(viewport.left(), upper.left());
+        assert_eq!(viewport.right(), upper.right());
+        assert_eq!(
+            viewport.top(),
+            upper.top() + SEARCH_H + TREE_TOP_GAP + rows as f32 * TREE_ROW_H
+        );
+        assert_eq!(viewport.bottom(), upper.bottom());
+
+        let crowded = catalog_viewport(upper, 10_000);
+        assert_eq!(crowded.top(), upper.bottom());
+        assert_eq!(crowded.height(), 0.0);
     }
 
     /// Dragging the inner divider maps pointer position to split, and cannot
@@ -15249,7 +23190,7 @@ mod tests {
         let mut arr = Arrangement::default();
         arr.tracks[1].height = 120.0;
 
-        let lanes = lane_rects(area, &arr.tracks);
+        let lanes = lane_rects(area, &arr.tracks, arr.view_tracks_y);
         assert_eq!(lanes.len(), TRACK_COUNT);
         assert_eq!(
             lanes[0].top(),
@@ -15312,6 +23253,144 @@ mod tests {
         assert_eq!(snap(2.7, 0.0), 2.7, "a zero grid must not divide by zero");
     }
 
+    /// Z A SECOND TIME gives the clip's lane its full height and puts it
+    /// in the middle of the view; X walks both steps back.
+    #[test]
+    fn a_second_z_expands_the_lane_and_centres_it() {
+        let mut arrangement = Arrangement::default();
+        // A tall stack, so there is something to scroll through and a
+        // middle that is not simply the top.
+        for _ in 0..7 {
+            arrangement.add_track(TrackKind::Midi);
+        }
+        arrangement.viewport_width = 900.0;
+        arrangement.viewport_height = 300.0;
+        let track = 5;
+        assert_eq!(arrangement.create_clip(track, 8.0, 4.0), Some(0));
+        arrangement.selected_clip = Some((track, 0));
+        let was_height = arrangement.tracks[track].height;
+        let was_scroll = arrangement.view_tracks_y;
+
+        // First press: a MIDI clip has no waveform to fit across, but the
+        // press counts, or the second one would never arrive.
+        assert!(arrangement.focus_selected_clip());
+        assert_eq!(
+            arrangement.tracks[track].height, was_height,
+            "step one must not touch the lane"
+        );
+
+        // Second press: full height, and centred.
+        assert!(arrangement.focus_selected_clip());
+        let tallest = *TRACK_H_RANGE.end();
+        assert_eq!(arrangement.tracks[track].height, tallest);
+        let middle = arrangement.lane_top(track) + tallest * 0.5;
+        let centre_of_view = arrangement.view_tracks_y + arrangement.viewport_height * 0.5;
+        assert!(
+            (middle - centre_of_view).abs() < 0.01,
+            "the lane's middle sits at {middle}, the view's at {centre_of_view}"
+        );
+
+        // Only that lane grew.
+        for (i, lane) in arrangement.tracks.iter().enumerate() {
+            if i != track {
+                assert_eq!(lane.height, was_height, "lane {i} was not asked to move");
+            }
+        }
+
+        // X puts back the height AND the scroll.
+        assert!(arrangement.zoom_back());
+        assert_eq!(arrangement.tracks[track].height, was_height);
+        assert_eq!(arrangement.view_tracks_y, was_scroll);
+        assert_eq!(arrangement.focus_restore, None);
+    }
+
+    /// THE WHEEL GOES DOWN AND SHIFT GOES SIDEWAYS, and each stays out
+    /// of the other's axis.
+    ///
+    /// Both signs live in one small function precisely because neither is
+    /// visible until you are already scrolling the wrong way — and the
+    /// two used to be added together into a single horizontal pan, so
+    /// getting this backwards would look exactly like the old behaviour.
+    #[test]
+    fn the_wheel_scrolls_down_and_shift_pans_sideways() {
+        let ppb = 24.0;
+
+        // A bare wheel: egui puts it on y, and it must move the LANES,
+        // not the beats.
+        let (sideways, down) = wheel_axes(egui::vec2(0.0, -50.0), ppb);
+        assert_eq!(sideways, 0.0, "a bare wheel must not pan sideways");
+        assert!(down > 0.0, "wheel down must scroll further down the stack");
+        let (_, up) = wheel_axes(egui::vec2(0.0, 50.0), ppb);
+        assert!(up < 0.0, "and wheel up must come back");
+        assert_eq!(down, -up, "the two directions must mirror");
+
+        // Shift+wheel: egui folds it onto x, and it must move the BEATS,
+        // in the direction the timeline has always panned.
+        let (sideways, down) = wheel_axes(egui::vec2(48.0, 0.0), ppb);
+        assert_eq!(down, 0.0, "a sideways gesture must not move the lanes");
+        assert_eq!(sideways, 2.0, "48 points at 24 per beat is two beats");
+
+        // A nonsense scale cannot divide by zero or hand back a NaN that
+        // would poison the view offset for the rest of the session.
+        for bad in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            let (sideways, down) = wheel_axes(egui::vec2(10.0, 10.0), bad);
+            assert_eq!((sideways, down), (0.0, 0.0), "pixels_per_beat {bad}");
+        }
+    }
+
+    /// Centring CLAMPS: the first lane cannot pull the stack off its own
+    /// top, and the last cannot pull it past its bottom.
+    #[test]
+    fn centring_a_lane_stays_inside_the_stack() {
+        let mut arrangement = Arrangement::default();
+        for _ in 0..7 {
+            arrangement.add_track(TrackKind::Midi);
+        }
+        arrangement.viewport_height = 300.0;
+
+        // The FIRST lane: its middle is above the view's middle, so
+        // centring it would ask for a negative offset.
+        assert_eq!(arrangement.create_clip(0, 0.0, 4.0), Some(0));
+        arrangement.selected_clip = Some((0, 0));
+        assert!(arrangement.expand_selected_lane());
+        assert_eq!(arrangement.view_tracks_y, 0.0, "the top is the top");
+        assert!(arrangement.zoom_back());
+
+        // The LAST lane: centring it would scroll past the end of the
+        // stack, which would leave empty space under the final lane.
+        let last = arrangement.tracks.len() - 1;
+        assert_eq!(arrangement.create_clip(last, 0.0, 4.0), Some(0));
+        arrangement.selected_clip = Some((last, 0));
+        assert!(arrangement.expand_selected_lane());
+        assert_eq!(
+            arrangement.view_tracks_y,
+            arrangement.max_tracks_scroll(),
+            "the bottom is the bottom"
+        );
+
+        // And a stack that fits does not scroll at all.
+        arrangement.viewport_height = 10_000.0;
+        arrangement.scroll_tracks_to(500.0);
+        assert_eq!(arrangement.view_tracks_y, 0.0);
+    }
+
+    /// The lane rects move with the scroll — the whole point of the
+    /// offset is that what is drawn agrees with what is selected.
+    #[test]
+    fn the_lanes_move_with_the_scroll() {
+        let mut arrangement = Arrangement::default();
+        arrangement.add_track(TrackKind::Midi);
+        let area = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 400.0));
+        let at_rest = lane_rects(area, &arrangement.tracks, 0.0);
+        let scrolled = lane_rects(area, &arrangement.tracks, 40.0);
+        assert_eq!(
+            at_rest[0].top() - scrolled[0].top(),
+            40.0,
+            "scrolling down moves the lanes up"
+        );
+        assert_eq!(at_rest[0].height(), scrolled[0].height());
+    }
+
     #[test]
     fn z_frames_selected_audio_and_x_restores_the_previous_view() {
         let mut arrangement = Arrangement::default();
@@ -15323,6 +23402,13 @@ mod tests {
             source_frames: 96_000,
             gain: 1.0,
             looped: false,
+            file_frames: 0,
+            reversed: false,
+            fade_in: 0,
+            fade_out: 0,
+            fade_in_curve: 0.0,
+            fade_out_curve: 0.0,
+            envelope: Vec::new(),
         };
         assert_eq!(
             arrangement.insert_audio(track, 32.0, "kick".into(), source, 120.0),
@@ -15391,6 +23477,7 @@ mod tests {
                 len: 4.0,
                 notes: vec![],
                 audio: None,
+                ..Clip::default()
             },
             Clip {
                 id: 2,
@@ -15399,6 +23486,7 @@ mod tests {
                 len: 4.0,
                 notes: vec![],
                 audio: None,
+                ..Clip::default()
             },
             Clip {
                 id: 3,
@@ -15407,6 +23495,7 @@ mod tests {
                 len: 8.0,
                 notes: vec![],
                 audio: None,
+                ..Clip::default()
             },
         ];
 
@@ -15444,6 +23533,7 @@ mod tests {
                 len: 0.75,
                 notes: vec![],
                 audio: None,
+                ..Clip::default()
             },
             Clip {
                 id: 2,
@@ -15452,6 +23542,7 @@ mod tests {
                 len: 1.0,
                 notes: vec![],
                 audio: None,
+                ..Clip::default()
             },
         ];
         assert_eq!(clamp_clip_len(&squeezed, 0, 4.0, 1.0), 0.75);
@@ -15490,7 +23581,15 @@ mod tests {
                 source_frames: 192_000,
                 gain: 1.0,
                 looped: false,
+                file_frames: 0,
+                reversed: false,
+                fade_in: 0,
+                fade_out: 0,
+                fade_in_curve: 0.0,
+                fade_out_curve: 0.0,
+                envelope: Vec::new(),
             }),
+            ..Clip::default()
         };
 
         trim_clip_left(&mut clip, 6.0, 120.0);
@@ -15537,11 +23636,66 @@ mod tests {
             len: 4.0,
             notes: vec![],
             audio: None,
+            ..Clip::default()
         };
         let r = clip_rect(content, 0.0, PX_PER_BEAT, lane, &clip);
         assert_eq!(r.left(), 2.0 * PX_PER_BEAT);
         assert_eq!(r.width(), 4.0 * PX_PER_BEAT);
         assert_eq!(r.height(), lane.height());
+    }
+
+    /// A partially hidden MIDI clip keeps its note geometry tied to the
+    /// whole clip. Cropping the first half must hide an early note, not
+    /// remap it into the visible half and stretch it there.
+    #[test]
+    fn clipped_midi_notes_still_map_against_the_full_clip() {
+        let full = Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 100.0));
+        let visible = full.intersect(Rect::from_min_max(pos2(200.0, -100.0), pos2(500.0, 200.0)));
+        let early = note(60, 0.0, 1.0, 100);
+        let late = note(60, 3.0, 1.0, 100);
+
+        let early_visible = note_rect(full, &early, 60, 60, 4.0).intersect(visible);
+        let late_visible = note_rect(full, &late, 60, 60, 4.0).intersect(visible);
+        assert!(
+            early_visible.width() <= 0.0,
+            "the hidden note leaked into view"
+        );
+        assert_eq!((late_visible.left(), late_visible.right()), (300.0, 400.0));
+    }
+
+    /// Canvas chrome is presentation only: it creates air around a clip and
+    /// a stable title/content split without changing its musical x extent.
+    #[test]
+    fn clip_canvas_geometry_preserves_time_and_exposes_real_grips() {
+        let musical = Rect::from_min_size(pos2(20.0, 40.0), vec2(160.0, 64.0));
+        let visual = clip_canvas_rects(musical);
+
+        assert_eq!(visual.outer.left(), musical.left());
+        assert_eq!(visual.outer.right(), musical.right());
+        assert_eq!(visual.outer.top(), musical.top() + CLIP_LANE_PAD_Y);
+        assert_eq!(visual.outer.bottom(), musical.bottom() - CLIP_LANE_PAD_Y);
+        assert_eq!(visual.title.top(), visual.outer.top());
+        assert_eq!(visual.title.height(), CLIP_TITLE_H);
+        assert_eq!(visual.content.top(), visual.title.bottom());
+        assert_eq!(visual.content.bottom(), visual.outer.bottom());
+        assert_eq!(visual.left_grip.left(), visual.outer.left());
+        assert_eq!(visual.right_grip.right(), visual.outer.right());
+        assert_eq!(visual.left_grip.center().y, visual.outer.center().y);
+        assert_eq!(visual.right_grip.center().y, visual.outer.center().y);
+    }
+
+    /// A maximally collapsed lane still produces valid, ordered rectangles;
+    /// the visual system degrades as one unit rather than drawing inverted
+    /// title rails or handles outside the clip.
+    #[test]
+    fn clip_canvas_geometry_degrades_safely_at_tiny_heights() {
+        let tiny = Rect::from_min_size(pos2(0.0, 0.0), vec2(8.0, 2.0));
+        let visual = clip_canvas_rects(tiny);
+        assert!(visual.outer.top() <= visual.outer.bottom());
+        assert!(visual.title.top() <= visual.title.bottom());
+        assert!(visual.content.top() <= visual.content.bottom());
+        assert!(visual.left_grip.height() <= visual.outer.height());
+        assert!(visual.right_grip.height() <= visual.outer.height());
     }
 
     /// Follow pages the view: it only moves when the playhead leaves the
@@ -15703,13 +23857,18 @@ mod tests {
     /// The y where the lanes start: below the minimap and the loop ruler.
     const LANES_TOP: f32 = MINIMAP_H + LOOP_RULER_H;
 
-    fn arrangement_pass(ctx: &egui::Context, arr: &mut Arrangement, events: Vec<Event>) {
+    fn arrangement_pass(
+        ctx: &egui::Context,
+        arr: &mut Arrangement,
+        events: Vec<Event>,
+    ) -> ArrangementOutcome {
+        let mut outcome = ArrangementOutcome::default();
         let mut out = ctx.run_ui(input(events), |ui| {
             let theme = Theme::dark();
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(theme.bg))
                 .show(ui, |ui| {
-                    arrangement_body(
+                    outcome = arrangement_body(
                         ui,
                         &mut Focus::default(),
                         &theme,
@@ -15725,10 +23884,13 @@ mod tests {
                         false,
                         &ParameterRegistry::default(),
                         &mut TRACK_VOLUME_TARGET.to_owned(),
+                        &mut Vec::new(),
+                        &mut device::meter::Ballistics::default(),
                     );
                 });
         });
         out.textures_delta.clear();
+        outcome
     }
 
     /// A plain drag on a clip body lifts it onto a ghost that follows the
@@ -15999,6 +24161,8 @@ mod tests {
                         false,
                         &ParameterRegistry::default(),
                         &mut TRACK_VOLUME_TARGET.to_owned(),
+                        &mut Vec::new(),
+                        &mut device::meter::Ballistics::default(),
                     );
                 });
         });
@@ -16076,6 +24240,7 @@ mod tests {
                 len: 4.0,
                 notes: vec![],
                 audio: None,
+                ..Clip::default()
             },
             Clip {
                 id: 2,
@@ -16084,6 +24249,7 @@ mod tests {
                 len: 2.0,
                 notes: vec![],
                 audio: None,
+                ..Clip::default()
             },
         ];
         // A small clip fits in the 4..8 gap, exactly where asked.
@@ -16100,6 +24266,48 @@ mod tests {
         assert_eq!(place_clip(&track, -3.0, 1.0), (4.0, 1));
         assert_eq!(place_clip(&[], -3.0, 1.0), (0.0, 0));
         assert_eq!(place_clip(&[], 3.0, 4.0), (3.0, 0));
+    }
+
+    /// Ctrl+M creates one bar at the QWERTY cell when it exists; without
+    /// one, it uses the active lane and snapped transport playhead.
+    #[test]
+    fn ctrl_m_creates_a_clip_at_the_keyboard_cursor_or_playhead() {
+        let ctx = egui::Context::default();
+        let mut actions = Vec::new();
+        let mut out = ctx.run_ui(
+            input(vec![
+                Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                Event::Key {
+                    key: egui::Key::M,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::COMMAND,
+                },
+            ]),
+            |_ui| {},
+        );
+        out.textures_delta.clear();
+        arrangement_keys(&ctx, &Arrangement::default(), &mut actions);
+        assert_eq!(actions, vec![UiAction::CreateClip]);
+
+        let mut transport = Transport {
+            position: 3.1,
+            beats_per_bar: 3,
+            ..Default::default()
+        };
+        let mut arrangement = Arrangement {
+            selected: Some(2),
+            ..Default::default()
+        };
+        perform(&actions, &mut transport, &mut arrangement);
+        assert_eq!(arrangement.clips[2][0].start, 6.0, "playhead is snapped");
+        assert_eq!(arrangement.clips[2][0].len, 3.0, "one current bar");
+
+        arrangement.cursor = Some((1, 11.0));
+        perform(&actions, &mut transport, &mut arrangement);
+        assert_eq!(arrangement.clips[1][0].start, 11.0, "QWERTY cursor wins");
+        assert_eq!(arrangement.selected_clip, Some((1, 0)));
     }
 
     /// The whole lifecycle, in order: create, copy, paste, duplicate,
@@ -16378,7 +24586,7 @@ mod tests {
     fn cells_line_up_across_lanes() {
         let content = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 400.0));
         let arr = Arrangement::default();
-        let lanes = lane_rects(content, &arr.tracks);
+        let lanes = lane_rects(content, &arr.tracks, arr.view_tracks_y);
         let grid = arr.grid_beats();
 
         let a = cell_rect(content, 0.0, PX_PER_BEAT, lanes[0], 4.0, grid);
@@ -16532,6 +24740,8 @@ mod tests {
                         false,
                         &ParameterRegistry::default(),
                         &mut TRACK_VOLUME_TARGET.to_owned(),
+                        &mut Vec::new(),
+                        &mut device::meter::Ballistics::default(),
                     );
                 });
         });
@@ -16560,7 +24770,9 @@ mod tests {
     #[test]
     fn the_session_grid_scrolls_once_its_columns_stop_shrinking() {
         let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, 400.0));
-        let viewport_w = 600.0 - SCENE_COL_W;
+        // The lanes stop short of BOTH pinned columns: the scenes and,
+        // now, the master.
+        let viewport_w = 600.0 - SCENE_COL_W - MASTER_COL_W;
 
         // Few tracks: everything fits, so there is nothing to scroll and no
         // scrollbar to show.
@@ -17204,18 +25416,25 @@ mod tests {
     #[test]
     fn every_device_parameter_resolves_through_the_target_machinery() {
         let registry = ParameterRegistry::default();
+        // One track PER DEVICE, not one track carrying all of them: a
+        // chain holds at most one instrument (`insert_device` displaces
+        // any other), so two instruments on one lane would leave the first
+        // unreachable and the walk would quietly stop covering it.
         let mut track = Track::new(TrackKind::Midi, "t".to_owned());
-        // One instance of every kind there is, so the walk covers DEVICES.
-        let ids: Vec<(u64, &'static DeviceSpec)> = DEVICES
+        let ids: Vec<(u64, &'static DeviceSpec, Track)> = DEVICES
             .iter()
             .enumerate()
             .map(|(at, device)| {
+                let mut lane = Track::new(TrackKind::Midi, "t".to_owned());
                 let id = 100 + at as u64;
+                fit(&mut lane, id, device.kind);
+                // The shared track still carries every EFFECT, plus the
+                // last instrument, so the track-level assertions below have
+                // something loaded.
                 fit(&mut track, id, device.kind);
-                (id, device)
+                (id, device, lane)
             })
             .collect();
-        let offered = track_targets(&track, &registry);
         for (at, device) in DEVICES.iter().enumerate() {
             assert_eq!(
                 device.params.len(),
@@ -17228,7 +25447,8 @@ mod tests {
                 assert_ne!(device.prefix, other.prefix, "two devices, one prefix");
             }
         }
-        for (id, device) in &ids {
+        for (id, device, lane) in &ids {
+            let offered = track_targets(lane, &registry);
             for def in device.params {
                 // Every id the table declares is both readable and writable
                 // on the state: a variant that forgets one drops knob edits
@@ -17253,7 +25473,7 @@ mod tests {
                     "{target} does not parse back to its own device"
                 );
                 assert!(
-                    target_applies(&track, &target),
+                    target_applies(lane, &target),
                     "{target} should apply to the track carrying it"
                 );
                 assert!(
@@ -17266,7 +25486,7 @@ mod tests {
                     (def.min, def.max, def.default),
                     "{target} restated its range instead of reading the table"
                 );
-                let base = parameter_base(&track, &target, spec);
+                let base = parameter_base(lane, &target, spec);
                 assert!(
                     (spec.min..=spec.max).contains(&base),
                     "{target}'s base {base} sits outside its own range"
@@ -17287,7 +25507,7 @@ mod tests {
         // pair stays.
         let bare = Track::new(TrackKind::Midi, "bare".to_owned());
         assert!(target_applies(&bare, TRACK_VOLUME_TARGET));
-        for (id, device) in &ids {
+        for (id, device, _) in &ids {
             for def in device.params {
                 assert!(!target_applies(
                     &bare,
@@ -17299,7 +25519,10 @@ mod tests {
         // parameter that device does not have.
         assert_eq!(target_ref("dev.x.reverb.mix"), None);
         assert_eq!(target_ref("dev.1.chorus.mix"), None);
-        assert_eq!(target_ref("dev.1.reverb.width"), None);
+        // `width` used to be the example here, until the reverb grew
+        // one. The point is a name the device does NOT have, so it has
+        // to be a name the device does not have.
+        assert_eq!(target_ref("dev.1.reverb.shimmer"), None);
         assert_eq!(target_ref("reverb.mix"), None, "v1 spellings are not v2");
     }
 
@@ -17318,12 +25541,32 @@ mod tests {
                     let value = def.min + (def.max - def.min) * at;
                     let there = device_norm(device.kind, def.id, value);
                     let back = device_value(device.kind, def.id, there);
-                    assert!(
-                        (back - value).abs() <= value.abs() * 1e-4 + 1e-4,
-                        "{}:{} {value} -> {there} -> {back}",
-                        device.prefix,
-                        def.name
-                    );
+                    if device_is_discrete(device.kind, def.id) {
+                        // A choice SNAPS, and must not creep: the second
+                        // trip has to be a no-op, or a wave selection would
+                        // walk one segment along every save and reload.
+                        let again = device_norm(device.kind, def.id, back);
+                        assert_eq!(
+                            device_value(device.kind, def.id, again),
+                            back,
+                            "{}:{} kept moving after it snapped",
+                            device.prefix,
+                            def.name
+                        );
+                        assert!(
+                            (back - back.round()).abs() < 1e-4,
+                            "{}:{} snapped to {back}, which is not a segment",
+                            device.prefix,
+                            def.name
+                        );
+                    } else {
+                        assert!(
+                            (back - value).abs() <= value.abs() * 1e-4 + 1e-4,
+                            "{}:{} {value} -> {there} -> {back}",
+                            device.prefix,
+                            def.name
+                        );
+                    }
                     assert!(
                         (0.0..=1.0).contains(&there),
                         "{}:{} maps {value} outside the knob",
@@ -17591,7 +25834,15 @@ mod tests {
                 source_frames: 96_000,
                 gain: 0.8,
                 looped: true,
+                file_frames: 0,
+                reversed: false,
+                fade_in: 0,
+                fade_out: 0,
+                fade_in_curve: 0.0,
+                fade_out_curve: 0.0,
+                envelope: Vec::new(),
             }),
+            ..Clip::default()
         });
         assert!(arr.create_slot_clip(0, 2, 4.0));
         arr.session.scenes[2].name = "drop 174 bpm".to_owned();
@@ -17654,6 +25905,7 @@ mod tests {
                     len: 0.0,
                     notes: Vec::new(),
                     audio: None,
+                    ..Clip::default()
                 },
                 Clip {
                     id: 40,
@@ -17662,6 +25914,7 @@ mod tests {
                     len: 4.0,
                     notes: Vec::new(),
                     audio: None,
+                    ..Clip::default()
                 },
             ]],
             // Slot columns for FIVE tracks, rows longer than the scenes.
@@ -17772,6 +26025,35 @@ mod tests {
         assert!(!transport.playing);
     }
 
+    /// A click in the piano roll's ruler must move a ROLLING transport, not
+    /// merely aim the next Space.
+    #[test]
+    fn a_locate_from_the_roll_moves_the_playhead_and_the_marker() {
+        let mut transport = Transport {
+            playing: true,
+            position: 123.0,
+            ..Transport::default()
+        };
+        let mut arr = Arrangement::default();
+
+        locate_transport(7.0, 0, &mut transport, &mut arr);
+
+        assert_eq!(
+            arr.pending_seek.take(),
+            Some(7.0),
+            "the seek is what actually moves the engine and the mirror"
+        );
+        assert_eq!(transport.marker, 7.0, "and Space now starts from there");
+        assert!(transport.playing, "a locate does not stop playback");
+        assert_eq!(arr.cursor, Some((0, 7.0)));
+        assert_eq!(arr.anchor, 7.0);
+
+        // Same frame: a Space arriving with the click still starts from it.
+        transport.playing = false;
+        perform(&[UiAction::TogglePlay], &mut transport, &mut arr);
+        assert_eq!(arr.pending_seek.take(), Some(7.0));
+    }
+
     /// The keymap's Space family: shift- and ctrl-variants are listed
     /// before the plain gesture, or the plain one would swallow them.
     #[test]
@@ -17833,7 +26115,15 @@ mod tests {
                 source_frames: 480_000,
                 gain: 1.0,
                 looped: false,
+                file_frames: 0,
+                reversed: false,
+                fade_in: 0,
+                fade_out: 0,
+                fade_in_curve: 0.0,
+                fade_out_curve: 0.0,
+                envelope: Vec::new(),
             }),
+            ..Clip::default()
         });
         assert!(arr.split_at(audio, 4.0, 120.0));
         let right = arr.clips[audio][1].audio.as_ref().unwrap();
@@ -17851,6 +26141,283 @@ mod tests {
 
     /// Consolidate merges the selected span's MIDI clips into one, notes
     /// re-based; audio in the span refuses the whole operation.
+    /// The audio editor's selection and the arrangement's time selection
+    /// are the SAME range seen from two places. If this conversion is
+    /// wrong, looping a selection loops the wrong bar and playing it
+    /// plays the wrong audio — and both would look right in their own
+    /// region.
+    #[test]
+    fn an_audio_selection_maps_onto_absolute_beats() {
+        let audio = AudioSource {
+            path: std::path::PathBuf::from("s.wav"),
+            sample_rate: 48_000,
+            source_offset: 0,
+            source_frames: 96_000,
+            gain: 1.0,
+            looped: false,
+            file_frames: 96_000,
+            reversed: false,
+            fade_in: 0,
+            fade_out: 0,
+            fade_in_curve: 0.0,
+            fade_out_curve: 0.0,
+            envelope: Vec::new(),
+        };
+        // A clip that does NOT start on a bar, so a missing `clip.start`
+        // cannot pass by accident.
+        let clip = Clip {
+            id: 1,
+            name: "s".to_owned(),
+            start: 6.5,
+            len: 4.0,
+            notes: Vec::new(),
+            audio: Some(audio.clone()),
+            ..Clip::default()
+        };
+        let whole = waveform::Selection {
+            from: 0,
+            to: 96_000,
+            channels: waveform::ChannelMask::all(1),
+        };
+        // Two seconds at 120 BPM is four beats.
+        let (from, to) = selection_beats(&clip, &audio, 120.0, whole);
+        assert!((from - 6.5).abs() < 1e-3, "{from}");
+        assert!((to - 10.5).abs() < 1e-3, "{to}");
+
+        // Half of it is half as many beats.
+        let half = waveform::Selection {
+            from: 24_000,
+            to: 48_000,
+            channels: waveform::ChannelMask::all(1),
+        };
+        let (from, to) = selection_beats(&clip, &audio, 120.0, half);
+        assert!((from - 7.5).abs() < 1e-3, "{from}");
+        assert!((to - 8.5).abs() < 1e-3, "{to}");
+
+        // And the tempo is honoured: at 60 BPM the same frames are half
+        // as many beats.
+        let (from, to) = selection_beats(&clip, &audio, 60.0, half);
+        assert!((from - 7.0).abs() < 1e-3, "{from}");
+        assert!((to - 7.5).abs() < 1e-3, "{to}");
+
+        // A clip at another rate measures in ITS frames, not the device's.
+        let slow = AudioSource {
+            sample_rate: 24_000,
+            ..audio.clone()
+        };
+        let (_, to) = selection_beats(&clip, &slow, 120.0, half);
+        assert!((to - 10.5).abs() < 1e-3, "{to}");
+    }
+
+    /// REPOINTING IS THE STEP THAT CAN QUIETLY RUIN A CLIP: leave a
+    /// region naming frames the new file has not got and the clip plays
+    /// silence with nothing to explain it.
+    #[test]
+    fn repointing_a_clip_keeps_its_region_inside_the_new_file() {
+        let audio = AudioSource {
+            path: std::path::PathBuf::from("old.wav"),
+            sample_rate: 48_000,
+            source_offset: 1_000,
+            source_frames: 2_000,
+            gain: 1.0,
+            looped: false,
+            file_frames: 10_000,
+            reversed: false,
+            fade_in: 0,
+            fade_out: 0,
+            fade_in_curve: 0.0,
+            fade_out_curve: 0.0,
+            envelope: Vec::new(),
+        };
+        let base = Clip {
+            id: 1,
+            name: "c".to_owned(),
+            start: 0.0,
+            len: 1.0,
+            notes: Vec::new(),
+            audio: Some(audio),
+            ..Clip::default()
+        };
+        let rendered = |frames: u64| daw::render::Rendered {
+            source: std::path::PathBuf::from("old.wav"),
+            path: std::path::PathBuf::from("new.wav"),
+            sample_rate: 48_000,
+            channels: 1,
+            frames,
+        };
+
+        // A same-length render moves nothing but the path.
+        let mut clip = base.clone();
+        repoint_clip(&mut clip, &rendered(10_000), None);
+        let after = clip.audio.expect("audio");
+        assert_eq!(after.path, std::path::PathBuf::from("new.wav"));
+        assert_eq!((after.source_offset, after.source_frames), (1_000, 2_000));
+        assert_eq!(after.file_frames, 10_000);
+
+        // Material removed BEFORE the region slides it earlier.
+        let mut clip = base.clone();
+        repoint_clip(&mut clip, &rendered(9_500), Some((0, -500)));
+        let after = clip.audio.expect("audio");
+        assert_eq!((after.source_offset, after.source_frames), (500, 2_000));
+
+        // Material removed INSIDE the region shortens it, and leaves the
+        // offset where it was.
+        let mut clip = base.clone();
+        repoint_clip(&mut clip, &rendered(9_500), Some((1_500, -500)));
+        let after = clip.audio.expect("audio");
+        assert_eq!((after.source_offset, after.source_frames), (1_000, 1_500));
+
+        // Material added AFTER the region touches neither.
+        let mut clip = base.clone();
+        repoint_clip(&mut clip, &rendered(10_500), Some((9_000, 500)));
+        let after = clip.audio.expect("audio");
+        assert_eq!((after.source_offset, after.source_frames), (1_000, 2_000));
+
+        // AND WHATEVER THE ARITHMETIC SAID, the region fits the file. A
+        // render that came back far shorter than anyone expected must
+        // leave a clip that plays what is there, not one that reads past
+        // the end.
+        let mut clip = base;
+        repoint_clip(&mut clip, &rendered(1_200), None);
+        let after = clip.audio.expect("audio");
+        assert_eq!(after.source_offset, 1_000);
+        assert_eq!(after.source_frames, 200, "clamped to what the file has");
+        assert!(after.source_offset + after.source_frames <= after.file_frames);
+    }
+
+    /// RIPPLE MOVES WORK THE USER IS NOT LOOKING AT, which is exactly why
+    /// it is off by default and exactly why it needs a test.
+    #[test]
+    fn ripple_takes_the_clip_span_and_the_lane_with_it() {
+        let clip = |id: u64, start: f32, len: f32| Clip {
+            id,
+            name: format!("c{id}"),
+            start,
+            len,
+            notes: Vec::new(),
+            audio: None,
+            ..Clip::default()
+        };
+        let mut lane = vec![clip(1, 0.0, 4.0), clip(2, 4.0, 4.0), clip(3, 8.0, 4.0)];
+
+        // A cut of one beat: the edited clip shortens, and everything
+        // after it moves earlier by the same amount.
+        ripple_lane(&mut lane, 0, -1.0);
+        assert_eq!(lane[0].len, 3.0);
+        assert_eq!(lane[1].start, 3.0);
+        assert_eq!(lane[2].start, 7.0);
+
+        // An insert lengthens and pushes later clips out.
+        ripple_lane(&mut lane, 0, 2.0);
+        assert_eq!(lane[0].len, 5.0);
+        assert_eq!(lane[1].start, 5.0);
+        assert_eq!(lane[2].start, 9.0);
+
+        // A ripple in the middle leaves what came BEFORE alone.
+        ripple_lane(&mut lane, 1, -1.0);
+        assert_eq!(lane[0].start, 0.0);
+        assert_eq!(lane[0].len, 5.0);
+        assert_eq!(lane[1].len, 3.0);
+        assert_eq!(lane[2].start, 8.0);
+
+        // A clip cannot ripple away to nothing, and no clip is ever
+        // pushed back over the one it follows.
+        ripple_lane(&mut lane, 1, -999.0);
+        assert!(lane[1].len > 0.0);
+        assert!(lane[2].start >= lane[1].start + lane[1].len);
+
+        // Nonsense is refused rather than propagated into every start on
+        // the lane.
+        let before = lane[2].start;
+        ripple_lane(&mut lane, 1, f32::NAN);
+        assert_eq!(lane[2].start, before);
+        ripple_lane(&mut lane, 99, 1.0);
+        assert_eq!(lane[2].start, before);
+    }
+
+    /// A FILE FINDS A SLOT, and only a slot that can hold it.
+    ///
+    /// The replacement view knows nothing about dragging files — it hands
+    /// its geometry back and the app aims. This is the test that says the
+    /// aiming still obeys the two rules the old view enforced: audio
+    /// tracks only, and only where the grid is actually drawn.
+    #[test]
+    fn a_dragged_file_aims_at_audio_slots_only() {
+        use daw::ui::session_next as sx;
+        let view = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 600.0));
+        let state = sx::SessionViewState::default();
+        let layout = sx::SessionLayout::new(view, 2, 8, &state);
+
+        // Track 0 MIDI, track 1 audio.
+        let midi = layout.slot(0, 0).center();
+        let audio = layout.slot(1, 0).center();
+        assert_eq!(layout.slot_at(midi), Some((0, 0)));
+        assert_eq!(layout.slot_at(audio), Some((1, 0)));
+
+        // Outside the rows viewport there is no slot at all — the
+        // control strip and the mixer are not drop targets.
+        assert_eq!(layout.slot_at(layout.control_strip().center()), None);
+        assert_eq!(
+            layout.slot_at(egui::pos2(view.right() + 50.0, view.center().y)),
+            None
+        );
+    }
+
+    /// A DEVICE NOBODY CAN LOAD DOES NOT EXIST.
+    ///
+    /// The browser's folders are a hand-written list beside `DEVICES`,
+    /// and a second list is a list that drifts — the kick shipped with a
+    /// node, a parameter table, a card and eighteen tests, and no row in
+    /// the browser, so the only way to reach it was to already know it
+    /// was there. Every kind has to be loadable from the tree.
+    #[test]
+    fn every_device_kind_is_reachable_from_the_browser() {
+        let browser = Browser::default();
+        let listed: Vec<DeviceKind> = browser
+            .folders
+            .iter()
+            .flat_map(|folder| folder.items.iter().map(|item| item.load))
+            .collect();
+        let missing: Vec<&'static str> = DEVICES
+            .iter()
+            .filter(|spec| !listed.contains(&spec.kind))
+            .map(|spec| spec.name)
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "devices with no browser row — unreachable unless you already know they exist: {missing:?}"
+        );
+
+        // And the other way: no row may name a kind that is not a device.
+        assert_eq!(
+            listed.len(),
+            DEVICES.len(),
+            "the browser lists {} rows for {} devices",
+            listed.len(),
+            DEVICES.len()
+        );
+
+        // Instruments are filed under Instruments and effects are not —
+        // the tree's one structural promise.
+        for folder in &browser.folders {
+            for item in folder.items {
+                if folder.name == "Instruments" {
+                    assert!(
+                        item.load.is_instrument(),
+                        "{} is not an instrument",
+                        item.name
+                    );
+                } else if folder.name == "Audio Effects" {
+                    assert!(
+                        !item.load.is_instrument(),
+                        "{} is an instrument, not an effect",
+                        item.name
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn consolidate_merges_midi_and_refuses_audio() {
         let mut arr = Arrangement::default();
@@ -17888,7 +26455,15 @@ mod tests {
                 source_frames: 96_000,
                 gain: 1.0,
                 looped: false,
+                file_frames: 0,
+                reversed: false,
+                fade_in: 0,
+                fade_out: 0,
+                fade_in_curve: 0.0,
+                fade_out_curve: 0.0,
+                envelope: Vec::new(),
             }),
+            ..Clip::default()
         });
         let source = arr.clips[audio][0].audio.clone();
         arr.clips[audio].push(Clip {
@@ -17898,6 +26473,7 @@ mod tests {
             len: 2.0,
             notes: Vec::new(),
             audio: source,
+            ..Clip::default()
         });
         assert!(
             !arr.consolidate(audio, 0.0, 4.0),
@@ -18035,7 +26611,7 @@ mod tests {
         // Timeline: clip first, then the track.
         let mut arr = Arrangement::default();
         arr.create_clip(0, 0.0, 4.0).unwrap();
-        arr.selected = Some(0);
+        arr.select_track(0);
         arr.selected_clip = Some((0, 0));
         let tracks = arr.tracks.len();
         perform(&[UiAction::DeleteSelected], &mut transport, &mut arr);
@@ -18050,7 +26626,7 @@ mod tests {
             ..Default::default()
         };
         assert!(arr.create_slot_clip(1, 0, 4.0));
-        arr.selected = Some(1);
+        arr.select_track(1);
         let tracks = arr.tracks.len();
         perform(&[UiAction::DeleteSelected], &mut transport, &mut arr);
         assert!(arr.session.slot(1, 0).is_none(), "the slot went first");
@@ -18826,16 +27402,19 @@ mod tests {
 
         assert!(arr.session.launch(0, 2));
         let playing = arr.effective_clips();
-        assert!(
-            playing[0].len() > 1,
-            "the launched clip is repeated over the horizon"
-        );
+        // ONE clip carrying a brace, rather than one copy per repeat.
+        // The repeats used to be spelled out as clips; they are now the
+        // clip's own internal loop, which is the same sound and the same
+        // rule the timeline uses.
+        assert_eq!(playing[0].len(), 1, "the launcher built copies again");
         assert_eq!(playing[0][0].start, 0.0, "it plays from the launch, not 12");
-        assert_eq!(playing[0][1].start, 4.0, "and repeats a clip-length later");
+        assert_eq!(
+            clip_loop(&playing[0][0]),
+            Some((0.0, 4.0)),
+            "it repeats a clip-length later"
+        );
         assert!(
-            playing[0]
-                .last()
-                .is_some_and(|c| c.start + c.len >= SESSION_HORIZON_BEATS),
+            playing[0][0].start + playing[0][0].len >= SESSION_HORIZON_BEATS,
             "the repeats reach the horizon"
         );
         assert_eq!(
@@ -18860,8 +27439,10 @@ mod tests {
         assert!(arr.create_slot_clip(0, 0, 4.0));
         assert!(arr.session.launch_at(0, 0, 12.0));
         let clips = arr.effective_clips();
+        // One clip from the launch edge, repeating every clip length —
+        // the repeats are the clip's own brace now, not a row of copies.
         assert_eq!(clips[0][0].start, 12.0);
-        assert_eq!(clips[0][1].start, 16.0);
+        assert_eq!(clip_loop(&clips[0][0]), Some((0.0, 4.0)));
 
         assert_eq!(LaunchQuantization::Bar.launch_beat(10.25, 4), 12.0);
         assert_eq!(LaunchQuantization::Beat.launch_beat(10.25, 4), 11.0);
@@ -18915,7 +27496,15 @@ mod tests {
                 source_frames: 96_000,
                 gain: 1.0,
                 looped: false,
+                file_frames: 0,
+                reversed: false,
+                fade_in: 0,
+                fade_out: 0,
+                fade_in_curve: 0.0,
+                fade_out_curve: 0.0,
+                envelope: Vec::new(),
             }),
+            ..Clip::default()
         });
         assert!(arr.session.launch(track, 0));
 
@@ -19033,7 +27622,7 @@ mod tests {
         let ids: Vec<u64> = (0..4).map(|t| arr.clips[t][0].id).collect();
 
         // Downwards: lane 0 to the end. 1, 2 and 3 each shift up one.
-        arr.selected = Some(0);
+        arr.select_track(0);
         arr.selected_clip = Some((0, 0));
         arr.cursor = Some((2, 4.0));
         assert!(arr.move_track(0, 3));
@@ -19074,7 +27663,7 @@ mod tests {
         assert_eq!(arr.selected, Some(1));
 
         let last = arr.tracks.len() - 1;
-        arr.selected = Some(last);
+        arr.select_track(last);
         assert!(!arr.nudge_track(1), "the bottom lane cannot go lower");
         assert!(arr.nudge_track(-1));
         assert_eq!(arr.selected, Some(last - 1));
@@ -19179,16 +27768,218 @@ mod tests {
 
         click(&ctx, &mut arr, mute);
         assert!(arr.tracks[0].mute, "the mute button took the click");
+        assert!(!arr.tracks[0].solo, "mute changed only mute");
         assert!(arr.track_drag.is_none(), "and no reorder drag began");
 
         // The solo button sits one slot to its right.
-        let solo = pos2(mute.x + HEADER_BTN + 3.0, mute.y);
+        let solo = pos2(mute.x + HEADER_BTN + HEADER_CONTROL_GAP, mute.y);
         click(&ctx, &mut arr, solo);
         assert!(arr.tracks[0].solo, "the solo button took its click too");
+        assert!(
+            arr.tracks[0].mute,
+            "solo did not clear or otherwise mutate mute"
+        );
 
         // And the stack never moved through any of it.
         assert_eq!(arr.tracks.len(), TRACK_COUNT);
         assert!(!arr.force_recompile);
+    }
+
+    /// One pure layout owns both paint and hit testing. It must degrade as a
+    /// unit: at the threshold every control exists and immediately below it
+    /// none does, while identity and activity keep their permanent address.
+    #[test]
+    fn track_header_layout_is_stable_and_degrades_as_one_unit() {
+        let normal =
+            track_header_layout(Rect::from_min_size(pos2(0.0, 0.0), vec2(HEADER_W, TRACK_H)));
+        let controls = normal.controls.expect("default height has controls");
+        assert!(normal.name.right() <= normal.kind.left());
+        assert!(normal.kind.right() <= normal.meter.left());
+        assert!(controls.mute.right() <= controls.solo.left());
+        assert!(controls.solo.right() <= controls.pan_value.left());
+        assert!(controls.pan_value.right() <= controls.pan.left());
+        assert!(controls.pan.right() <= normal.meter.left());
+
+        let at = track_header_layout(Rect::from_min_size(
+            pos2(0.0, 0.0),
+            vec2(HEADER_W, HEADER_ROWS_MIN_H),
+        ));
+        assert!(at.controls.is_some(), "the threshold is inclusive");
+        let below = track_header_layout(Rect::from_min_size(
+            pos2(0.0, 0.0),
+            vec2(HEADER_W, HEADER_ROWS_MIN_H - 0.01),
+        ));
+        assert!(below.controls.is_none(), "the whole row disappears");
+        assert!(below.identity.is_positive());
+        assert!(below.meter.is_positive());
+    }
+
+    /// Double-click is the hardware-panel route back to the pan detent. It
+    /// must land on exact floating-point zero, not merely draw a centred
+    /// needle over a residual value.
+    #[test]
+    fn header_pan_double_click_returns_to_exact_center() {
+        let ctx = egui::Context::default();
+        let mut arr = Arrangement::default();
+        arr.tracks[0].pan = 0.73;
+        arrangement_pass(&ctx, &mut arr, vec![]);
+        let head = Rect::from_min_size(pos2(0.0, LANES_TOP), vec2(HEADER_W, TRACK_H));
+        let pan = track_header_layout(head)
+            .controls
+            .expect("default controls")
+            .pan
+            .center();
+        for _ in 0..2 {
+            arrangement_pass(
+                &ctx,
+                &mut arr,
+                vec![
+                    Event::PointerMoved(pan),
+                    Event::PointerButton {
+                        pos: pan,
+                        button: PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Default::default(),
+                    },
+                    Event::PointerButton {
+                        pos: pan,
+                        button: PointerButton::Primary,
+                        pressed: false,
+                        modifiers: Default::default(),
+                    },
+                ],
+            );
+        }
+        assert_eq!(arr.tracks[0].pan, 0.0);
+        assert_eq!(
+            arr.selected,
+            Some(0),
+            "the control also activates its track"
+        );
+        assert!(arr.track_drag.is_none());
+    }
+
+    /// Escape cancels the entire gesture, not just one frame of it. Pointer
+    /// motion after the cancel remains inert until release.
+    #[test]
+    fn header_pan_escape_restores_and_cancels_the_drag() {
+        let ctx = egui::Context::default();
+        let mut arr = Arrangement::default();
+        arr.tracks[0].pan = 0.25;
+        arrangement_pass(&ctx, &mut arr, vec![]);
+        let center = track_header_layout(Rect::from_min_size(
+            pos2(0.0, LANES_TOP),
+            vec2(HEADER_W, TRACK_H),
+        ))
+        .controls
+        .expect("default controls")
+        .pan
+        .center();
+        let moved = center - vec2(0.0, 18.0);
+        arrangement_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::PointerMoved(center),
+                Event::PointerButton {
+                    pos: center,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        arrangement_pass(&ctx, &mut arr, vec![Event::PointerMoved(moved)]);
+        assert_ne!(arr.tracks[0].pan, 0.25, "the drag first moved the value");
+
+        arrangement_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::PointerMoved(moved),
+                Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        assert_eq!(arr.tracks[0].pan, 0.25, "Escape restored the origin");
+
+        let farther = center - vec2(0.0, 30.0);
+        arrangement_pass(&ctx, &mut arr, vec![Event::PointerMoved(farther)]);
+        assert_eq!(
+            arr.tracks[0].pan, 0.25,
+            "the cancelled gesture stayed inert before release"
+        );
+        arrangement_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::PointerMoved(farther),
+                Event::PointerButton {
+                    pos: farther,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        assert_eq!(arr.tracks[0].pan, 0.25);
+    }
+
+    /// The header rail reads the Session mixer's existing ballistics, and a
+    /// person can acknowledge its latch without touching project content.
+    #[test]
+    fn header_meter_click_clears_its_existing_clip_latch() {
+        let ctx = egui::Context::default();
+        let rect = Rect::from_min_size(pos2(12.0, 12.0), vec2(HEADER_METER_W, TRACK_H));
+        let mut meter = device::meter::Ballistics {
+            clipped: true,
+            ..Default::default()
+        };
+        let mut warm = ctx.run_ui(input(vec![]), |ui| {
+            header_meter(
+                ui,
+                &Theme::dark(),
+                rect,
+                Some(&mut meter),
+                true,
+                ui.id().with("header_meter_test"),
+            );
+        });
+        warm.textures_delta.clear();
+        let mut out = ctx.run_ui(
+            input(vec![
+                Event::PointerMoved(rect.center()),
+                Event::PointerButton {
+                    pos: rect.center(),
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+                Event::PointerButton {
+                    pos: rect.center(),
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ]),
+            |ui| {
+                header_meter(
+                    ui,
+                    &Theme::dark(),
+                    rect,
+                    Some(&mut meter),
+                    true,
+                    ui.id().with("header_meter_test"),
+                );
+            },
+        );
+        out.textures_delta.clear();
+        assert!(!meter.clipped);
     }
 
     /// The name row keeps its double-click through the draggable body: a
@@ -19286,7 +28077,7 @@ mod tests {
 
         // Moving the cursor is not an edit, however settled it is.
         arr.cursor = Some((1, 8.0));
-        arr.selected = Some(1);
+        arr.select_track(1);
         history.sync(&arr, true);
         assert_eq!(history.past.len(), 1, "marks alone are not an edit");
 
@@ -19419,7 +28210,7 @@ mod tests {
         let mut history = History::new(&arr);
         let track = arr.add_track(TrackKind::Audio);
         arr.create_clip(0, 0.0, 4.0).unwrap();
-        arr.selected = Some(track);
+        arr.select_track(track);
         arr.selected_clip = Some((0, 0));
         arr.cursor = Some((track, 4.0));
         history.sync(&arr, true);
@@ -19758,6 +28549,7 @@ mod tests {
                 len: 2.0,
                 notes: vec![note(60, 0.0, 1.0, 100), note(62, 1.5, 0.5, 90)],
                 audio: None,
+                ..Clip::default()
             },
             Clip {
                 id: 2,
@@ -19766,6 +28558,7 @@ mod tests {
                 len: 1.0,
                 notes: vec![note(48, 0.25, 0.25, 1)],
                 audio: None,
+                ..Clip::default()
             },
         ];
         let out = seq_notes(&clips);
@@ -19799,6 +28592,7 @@ mod tests {
                 note(67, 8.0, 1.0, 100),
             ],
             audio: None,
+            ..Clip::default()
         }];
         let out = seq_notes(&hidden);
         assert_eq!(out.len(), 1, "only the note inside the clip sounds");
@@ -19812,6 +28606,7 @@ mod tests {
             len: 1.0,
             notes: vec![note(60, 0.5, 4.0, 100)],
             audio: None,
+            ..Clip::default()
         }];
         assert_eq!(seq_notes(&ringing)[0].len_beats, 4.0);
 
@@ -19880,7 +28675,8 @@ mod tests {
         }
 
         for (metronome, extra) in [(false, 0), (true, 1)] {
-            let (spec, nodes) = build_graph_spec(&a.tracks, &a.clips, Some(8.0), metronome);
+            let (spec, nodes) =
+                build_graph_spec(&a.tracks, &a.master, &a.clips, Some(8.0), metronome);
             let seqs: Vec<Option<NodeId>> = a
                 .tracks
                 .iter()
@@ -19897,17 +28693,19 @@ mod tests {
                 "every instrument track carries a Pan, so pan is a letter"
             );
             // Two wires per track — seq -> pan, pan -> mixer — plus the
-            // click's one.
+            // click's one, plus the mixer's own hop into the master fader.
             assert_eq!(
                 spec.wires().len(),
-                TRACK_COUNT * 2 + extra,
+                TRACK_COUNT * 2 + extra + 1,
                 "every track reaches the mixer through its own pan"
             );
             let output = spec.output().unwrap();
             assert!(
                 !seqs.contains(&Some(output)),
-                "the mixer, not a seq, feeds the speakers"
+                "the master fader, not a seq, feeds the speakers"
             );
+            // The lanes sum one hop short of the speakers now.
+            let output = sum_bus(&spec);
             for (seq, pan) in seqs.iter().zip(&nodes.pans) {
                 assert!(
                     spec.wires()
@@ -19942,7 +28740,7 @@ mod tests {
 
         // A fresh session has no instrument loaded either, so no track becomes a
         // node — the graph is empty and still compiles.
-        let (spec, nodes) = build_graph_spec(&a.tracks, &a.clips, None, false);
+        let (spec, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
         assert!(nodes.devices.is_empty(), "no device, no node");
         assert!(spec.compile(48_000, 256).is_ok());
 
@@ -19950,12 +28748,12 @@ mod tests {
         for i in 0..a.tracks.len() {
             load(&mut a, i, DeviceKind::SineSynth);
         }
-        let (spec, nodes) = build_graph_spec(&a.tracks, &a.clips, None, false);
+        let (spec, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
         assert_eq!(nodes.devices.len(), TRACK_COUNT);
         assert!(spec.compile(48_000, 256).is_ok());
 
         // And so is one with no tracks at all.
-        let (spec, nodes) = build_graph_spec(&[], &[], None, true);
+        let (spec, nodes) = build_graph_spec(&[], &MasterTrack::default(), &[], None, true);
         assert!(nodes.devices.is_empty());
         assert!(spec.compile(48_000, 256).is_ok());
     }
@@ -19980,19 +28778,439 @@ mod tests {
 
         // Only that track compiles to a node, and it is addressed by the
         // instance's id, which is what a letter carries.
-        let (_, nodes) = build_graph_spec(&a.tracks, &a.clips, None, false);
+        let (_, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
         assert_eq!(nodes.devices.len(), 1);
         assert!(nodes.devices.contains_key(&id));
     }
 
     // --- tracks -----------------------------------------------------------
 
+    /// A fade sits at the SAME PLACE in the timeline as in the editor.
+    ///
+    /// Both draw the same fade on the same clip, from the same frame
+    /// count, through one shared function — because two that merely
+    /// agreed today could disagree tomorrow, and the symptom would be one
+    /// fade drawn twice, differently, in the same session.
+    #[test]
+    fn a_fade_lands_at_the_same_beat_in_both_editors() {
+        let audio = AudioSource {
+            path: std::path::PathBuf::from("stab.wav"),
+            sample_rate: 48_000,
+            source_offset: 0,
+            source_frames: 96_000,
+            gain: 1.0,
+            looped: false,
+            file_frames: 96_000,
+            reversed: false,
+            fade_in: 24_000,
+            fade_out: 0,
+            fade_in_curve: 0.0,
+            fade_out_curve: 0.0,
+            envelope: Vec::new(),
+        };
+        let clip = Clip {
+            id: 1,
+            name: "stab".to_owned(),
+            start: 8.0,
+            len: 4.0,
+            notes: Vec::new(),
+            audio: Some(audio.clone()),
+            ..Clip::default()
+        };
+
+        // Four beats at 120 is two seconds; the clip's span is that many
+        // frames whichever side asks.
+        let span = waveform::clip_span_frames(&clip, &audio, 120.0);
+        assert_eq!(span, 96_000);
+
+        // A half-second fade is a quarter of a two-second clip, which is
+        // one beat of four.
+        let per_frame = waveform::fade_span_beats(&clip, &audio, 120.0).unwrap();
+        let beats = per_frame * audio.fade_in as f32;
+        assert!(
+            (beats - 1.0).abs() < 1e-4,
+            "24000 frames should be one beat, got {beats}"
+        );
+
+        // A clip with no length has no fade geometry rather than an
+        // infinity: dividing by its span is what this guards.
+        let empty = Clip { len: 0.0, ..clip };
+        assert_eq!(waveform::fade_span_beats(&empty, &audio, 120.0), None);
+        assert_eq!(waveform::clip_span_frames(&empty, &audio, 120.0), 0);
+    }
+
+    /// PLAYING A CLIP BACKWARDS moves its region to the other end of the
+    /// file, and the arithmetic that says so is the only thing here that
+    /// can be silently wrong: get it inverted and you hear the wrong part
+    /// of the sample, backwards, which sounds like a bug in the reversal
+    /// rather than in the offset.
+    #[test]
+    fn a_reversed_clip_reads_the_mirrored_region() {
+        // A ten-second file at 48k; the clip plays seconds 2..3.
+        let mut source = AudioSource {
+            path: std::path::PathBuf::from("loop.wav"),
+            sample_rate: 48_000,
+            source_offset: 96_000,
+            source_frames: 48_000,
+            gain: 1.0,
+            looped: false,
+            file_frames: 480_000,
+            reversed: false,
+            fade_in: 0,
+            fade_out: 0,
+            fade_in_curve: 0.0,
+            fade_out_curve: 0.0,
+            envelope: Vec::new(),
+        };
+        assert_eq!(source.playing_offset(), 96_000, "forwards is untouched");
+
+        source.reversed = true;
+        // The region [2 s, 3 s) of a ten-second file is [7 s, 8 s) of its
+        // reversal — the far edge measured from the other end.
+        assert_eq!(source.playing_offset(), 480_000 - 96_000 - 48_000);
+        assert_eq!(source.playing_offset(), 336_000);
+
+        // Reversing twice is where it began.
+        source.reversed = false;
+        assert_eq!(source.playing_offset(), 96_000);
+
+        // A clip that plays the WHOLE file starts at zero either way.
+        let whole = AudioSource {
+            source_offset: 0,
+            source_frames: 480_000,
+            reversed: true,
+            ..source
+        };
+        assert_eq!(whole.playing_offset(), 0);
+    }
+
+    /// A project written before `file_frames` existed still reverses
+    /// sensibly: the field reads as the region's own end, which is exact
+    /// for the untrimmed clip that most of them are.
+    #[test]
+    fn an_old_project_without_a_file_length_still_reverses() {
+        let untrimmed = AudioSource {
+            path: std::path::PathBuf::from("loop.wav"),
+            sample_rate: 48_000,
+            source_offset: 0,
+            source_frames: 480_000,
+            gain: 1.0,
+            looped: false,
+            file_frames: 0,
+            reversed: true,
+            fade_in: 0,
+            fade_out: 0,
+            fade_in_curve: 0.0,
+            fade_out_curve: 0.0,
+            envelope: Vec::new(),
+        };
+        assert_eq!(untrimmed.file_frames(), 480_000);
+        assert_eq!(untrimmed.playing_offset(), 0, "the whole file, mirrored");
+    }
+
+    /// A reversal that has not been written yet has NO FILE, and the clip
+    /// compiles to nothing rather than to the forward one — half a second
+    /// of the sample playing the right way round and then switching is
+    /// worse than a moment of silence.
+    #[test]
+    fn a_clip_waiting_for_its_reversal_has_no_file_to_play() {
+        let source = AudioSource {
+            path: std::path::PathBuf::from("/nowhere/loop.wav"),
+            sample_rate: 48_000,
+            source_offset: 0,
+            source_frames: 100,
+            gain: 1.0,
+            looped: false,
+            file_frames: 100,
+            reversed: true,
+            fade_in: 0,
+            fade_out: 0,
+            fade_in_curve: 0.0,
+            fade_out_curve: 0.0,
+            envelope: Vec::new(),
+        };
+        assert_eq!(source.playing_path(), None);
+
+        let forward = AudioSource {
+            reversed: false,
+            ..source
+        };
+        assert_eq!(
+            forward.playing_path(),
+            Some(std::path::PathBuf::from("/nowhere/loop.wav")),
+            "forwards always has its file"
+        );
+    }
+
+    /// THE VIEW KEYS REACH THE APP.
+    ///
+    /// Not "are they in the keymap table" — they were, and none of them
+    /// worked, because `Keymap` is not drained at runtime at all. The
+    /// live handler is `arrangement_keys`, and this presses the gestures
+    /// against it the way every other key test here does.
+    #[test]
+    fn the_view_keys_come_out_of_the_live_handler() {
+        for (modifiers, key, want) in [
+            (
+                egui::Modifiers::COMMAND,
+                egui::Key::B,
+                UiAction::ToggleBrowser,
+            ),
+            (
+                egui::Modifiers::COMMAND | egui::Modifiers::ALT,
+                egui::Key::L,
+                UiAction::ToggleLower,
+            ),
+            (
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                egui::Key::F,
+                UiAction::ToggleChrome,
+            ),
+        ] {
+            let ctx = egui::Context::default();
+            let mut actions = Vec::new();
+            let mut out = ctx.run_ui(
+                input(vec![
+                    Event::ModifiersChanged(modifiers),
+                    Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                    },
+                ]),
+                |_ui| {},
+            );
+            out.textures_delta.clear();
+            arrangement_keys(&ctx, &Arrangement::default(), &mut actions);
+            assert_eq!(actions, vec![want], "{key:?} did not reach the app");
+        }
+    }
+
+    /// Ctrl+Alt+L must not be swallowed by the LOOP on Ctrl+L, which is
+    /// checked first — `consume_key` ignores an EXTRA modifier, so the
+    /// order of these two is load-bearing.
+    #[test]
+    fn the_lower_panel_gesture_survives_the_loop_binding() {
+        let ctx = egui::Context::default();
+        let mut actions = Vec::new();
+        let modifiers = egui::Modifiers::COMMAND | egui::Modifiers::ALT;
+        let mut out = ctx.run_ui(
+            input(vec![
+                Event::ModifiersChanged(modifiers),
+                Event::Key {
+                    key: egui::Key::L,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                },
+            ]),
+            |_ui| {},
+        );
+        out.textures_delta.clear();
+        arrangement_keys(&ctx, &Arrangement::default(), &mut actions);
+        assert!(
+            !actions.contains(&UiAction::LoopFromSelection),
+            "the loop binding ate the lower-panel gesture: {actions:?}"
+        );
+        assert_eq!(actions, vec![UiAction::ToggleLower]);
+    }
+
+    /// HIDING EVERYTHING ALWAYS DOES SOMETHING, and showing it again
+    /// brings back exactly what was there.
+    ///
+    /// The all-or-nothing rule: with any region still showing, the key
+    /// clears the frame; with none showing, it restores. A toggle that
+    /// flipped each region on its own would land on "one of the two"
+    /// half the time, which is not a state anyone presses a key to reach.
+    #[test]
+    fn the_chrome_key_is_all_or_nothing() {
+        // The rule, stated once here the way the arm states it.
+        let step = |browser: bool, lower: bool| {
+            let clearing = !browser || !lower;
+            (clearing, clearing)
+        };
+
+        // Everything showing -> everything hidden.
+        assert_eq!(step(false, false), (true, true));
+        // Everything hidden -> everything back.
+        assert_eq!(step(true, true), (false, false));
+        // HALF hidden -> hide the rest, rather than un-hiding the other
+        // half and leaving the frame exactly as cluttered as it was.
+        assert_eq!(step(true, false), (true, true));
+        assert_eq!(step(false, true), (true, true));
+
+        // And it always moves: no starting state is a no-op.
+        for (browser, lower) in [(false, false), (true, true), (true, false), (false, true)] {
+            assert_ne!(
+                step(browser, lower),
+                (browser, lower),
+                "hiding the chrome did nothing from ({browser}, {lower})"
+            );
+        }
+    }
+
+    /// The three view toggles are bound AND named. A region you can fold
+    /// away with no way to bring it back is a region you have lost.
+    #[test]
+    fn the_frame_regions_are_reachable_by_key_and_by_name() {
+        use daw::ui::keymap::Keymap;
+        let keymap = Keymap::default();
+        for action in [
+            UiAction::ToggleBrowser,
+            UiAction::ToggleLower,
+            UiAction::ToggleChrome,
+        ] {
+            assert!(
+                keymap.shortcut_for(action).is_some(),
+                "{action:?} has no key"
+            );
+            assert!(!action.label().is_empty(), "{action:?} has no name");
+        }
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+            .expect("main.rs reads");
+        for id in ["view.browser", "view.lower", "view.chrome"] {
+            assert!(
+                src.contains(&format!("PaletteCommand::new(\"{id}\"")),
+                "{id} is not in the palette"
+            );
+        }
+    }
+
+    /// EVERY PALETTE COMMAND DOES SOMETHING.
+    ///
+    /// The palette offers a list and a `match` dispatches it, and nothing
+    /// holds the two together: a command added to the list without an arm
+    /// compiles, ranks, shows up under its own name, and then silently
+    /// does nothing when chosen. That is the worst failure a command
+    /// palette has, because the user cannot tell it from "it didn't
+    /// work".
+    ///
+    /// Source-level, like `ui::mod`'s design-system checks, because
+    /// `commands` and the dispatch both hang off `App` and no test can
+    /// build one.
+    #[test]
+    fn every_palette_command_has_a_handler() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+            .expect("main.rs reads");
+
+        // Ids the palette OFFERS.
+        let mut offered: Vec<String> = Vec::new();
+        for (at, _) in src.match_indices("PaletteCommand::new(\"") {
+            let rest = &src[at + "PaletteCommand::new(\"".len()..];
+            if let Some(end) = rest.find('"') {
+                offered.push(rest[..end].to_owned());
+            }
+        }
+        assert!(
+            offered.len() > 20,
+            "the scan found only {} commands — it has stopped matching",
+            offered.len()
+        );
+
+        // Prefixes handled wholesale, e.g. `id if id.starts_with("note.")`.
+        let mut families: Vec<String> = Vec::new();
+        for (at, _) in src.match_indices("starts_with(\"") {
+            let rest = &src[at + "starts_with(\"".len()..];
+            if let Some(end) = rest.find('"') {
+                families.push(rest[..end].to_owned());
+            }
+        }
+
+        let orphans: Vec<&String> = offered
+            .iter()
+            .filter(|id| {
+                !src.contains(&format!("\"{id}\" =>"))
+                    && !families.iter().any(|family| id.starts_with(family))
+            })
+            .collect();
+        assert!(
+            orphans.is_empty(),
+            "palette commands with no handler — they would rank, show, and do nothing: {orphans:?}"
+        );
+    }
+
+    /// A FAMILY HANDLER IS NOT A HANDLER.
+    ///
+    /// `every_palette_command_has_a_handler` is satisfied by
+    /// `id if id.starts_with("note.")`, which means a mistyped transform
+    /// id passes it and still does nothing — the exact failure that test
+    /// exists to prevent, hiding behind the catch-all that routes to
+    /// `run_note_command`. So every `note.` id the palette offers has to
+    /// be matched INSIDE that function too.
+    #[test]
+    fn every_note_command_is_matched_inside_its_dispatch() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+            .expect("main.rs reads");
+        let at = src
+            .find("fn run_note_command")
+            .expect("the note dispatch is still called that");
+        // To the next top-level `fn` at the same indentation, which is
+        // where the function ends.
+        let body = &src[at..];
+        let end = body[1..]
+            .find("\n    fn ")
+            .map_or(body.len(), |offset| offset + 1);
+        let body = &body[..end];
+
+        let mut offered: Vec<String> = Vec::new();
+        for (at, _) in src.match_indices("PaletteCommand::new(\"note.") {
+            let rest = &src[at + "PaletteCommand::new(\"".len()..];
+            if let Some(stop) = rest.find('"') {
+                offered.push(rest[..stop].to_owned());
+            }
+        }
+        assert!(offered.len() > 15, "found only {}", offered.len());
+
+        let prefixes: Vec<String> = body
+            .match_indices("starts_with(\"")
+            .filter_map(|(at, _)| {
+                let rest = &body[at + "starts_with(\"".len()..];
+                rest.find('"').map(|stop| rest[..stop].to_owned())
+            })
+            .collect();
+
+        let silent: Vec<&String> = offered
+            .iter()
+            .filter(|id| {
+                !body.contains(&format!("\"{id}\""))
+                    && !prefixes.iter().any(|prefix| id.starts_with(prefix))
+            })
+            .collect();
+        assert!(
+            silent.is_empty(),
+            "note commands the dispatch never matches — they rank, show, and do nothing: {silent:?}"
+        );
+    }
+
+    /// Renaming a clip is reachable WITHOUT A MOUSE.
+    ///
+    /// Double-clicking a clip opens its editor rather than renaming it,
+    /// which left the context menu as the only way in — that is to say,
+    /// no way in at all for a keyboard. The palette carries the verb, the
+    /// way it already does for a track.
+    #[test]
+    fn a_clip_can_be_renamed_from_the_palette() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+            .expect("main.rs reads");
+        assert!(
+            src.contains("PaletteCommand::new(\"clip.rename\""),
+            "the palette must offer a clip rename"
+        );
+        assert!(
+            src.contains("\"clip.rename\" =>"),
+            "and something must answer it"
+        );
+    }
+
     #[test]
     fn clip_editor_follows_the_active_track_kind() {
         let mut arrangement = Arrangement::default();
         assert_eq!(clip_editor_kind(&arrangement), ClipEditorKind::Empty);
 
-        arrangement.selected = Some(0);
+        arrangement.select_track(0);
         assert_eq!(clip_editor_kind(&arrangement), ClipEditorKind::Midi);
 
         let audio = arrangement.add_track(TrackKind::Audio);
@@ -20006,12 +29224,19 @@ mod tests {
             source_frames: 48_000,
             gain: 1.0,
             looped: false,
+            file_frames: 0,
+            reversed: false,
+            fade_in: 0,
+            fade_out: 0,
+            fade_in_curve: 0.0,
+            fade_out_curve: 0.0,
+            envelope: Vec::new(),
         };
         assert_eq!(
             arrangement.insert_audio(audio, 0.0, "voice".into(), source, 120.0),
             Some(0)
         );
-        arrangement.selected = Some(0);
+        arrangement.select_track(0);
         assert_eq!(
             clip_editor_kind(&arrangement),
             ClipEditorKind::Audio,
@@ -20141,11 +29366,11 @@ mod tests {
         let ids: Vec<u64> = (0..a.tracks.len())
             .map(|i| load(&mut a, i, DeviceKind::SineSynth))
             .collect();
-        let (_, all) = build_graph_spec(&a.tracks, &a.clips, None, false);
+        let (_, all) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
         assert_eq!(all.devices.len(), TRACK_COUNT);
 
         a.tracks[1].mute = true;
-        let (_, muted) = build_graph_spec(&a.tracks, &a.clips, None, false);
+        let (_, muted) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
         assert!(
             !muted.devices.contains_key(&ids[1]),
             "a muted track makes no node"
@@ -20156,7 +29381,7 @@ mod tests {
         // Solo drops everything else the same way.
         a.tracks[1].mute = false;
         a.tracks[0].solo = true;
-        let (_, soloed) = build_graph_spec(&a.tracks, &a.clips, None, false);
+        let (_, soloed) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
         assert!(soloed.devices.contains_key(&ids[0]));
         assert_eq!(soloed.devices.len(), 1);
     }
@@ -20169,7 +29394,7 @@ mod tests {
         let i = a.add_track(TrackKind::Audio);
         // Even with an instrument somehow in its chain, the kind decides.
         load(&mut a, i, DeviceKind::SineSynth);
-        let (_, nodes) = build_graph_spec(&a.tracks, &a.clips, None, false);
+        let (_, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
         assert!(nodes.devices.is_empty(), "no instrument on an audio track");
         assert!(nodes.pans[i].is_none(), "an empty audio lane is absent");
 
@@ -20180,12 +29405,19 @@ mod tests {
             source_frames: 48_000,
             gain: 1.0,
             looped: false,
+            file_frames: 0,
+            reversed: false,
+            fade_in: 0,
+            fade_out: 0,
+            fade_in_curve: 0.0,
+            fade_out_curve: 0.0,
+            envelope: Vec::new(),
         };
         a.insert_audio(i, 2.0, "sample".to_owned(), source, 120.0)
             .unwrap();
         assert_eq!(a.clips[i][0].start, 2.0);
         assert_eq!(a.clips[i][0].len, 2.0, "one second is two beats at 120");
-        let (spec, nodes) = build_graph_spec(&a.tracks, &a.clips, None, false);
+        let (spec, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
         assert!(nodes.devices.is_empty());
         assert!(nodes.pans[i].is_some());
         assert_eq!(
@@ -20206,33 +29438,37 @@ mod tests {
     #[test]
     fn shape_hash_covers_mute_and_solo_but_not_pan() {
         let mut a = Arrangement::default();
-        let base = shape_hash(&a.tracks);
+        let base = shape_hash(&a.tracks, &a.master);
 
         a.tracks[0].pan = -0.8;
         assert_eq!(
-            shape_hash(&a.tracks),
+            shape_hash(&a.tracks, &a.master),
             base,
             "pan is a letter, never a recompile"
         );
 
         a.tracks[0].mute = true;
-        let muted = shape_hash(&a.tracks);
+        let muted = shape_hash(&a.tracks, &a.master);
         assert_ne!(muted, base, "mute drops a node");
 
         a.tracks[0].mute = false;
         a.tracks[0].solo = true;
-        assert_ne!(shape_hash(&a.tracks), base, "solo drops every other node");
+        assert_ne!(
+            shape_hash(&a.tracks, &a.master),
+            base,
+            "solo drops every other node"
+        );
 
         a.tracks[0].solo = false;
-        assert_eq!(shape_hash(&a.tracks), base, "and back again");
+        assert_eq!(shape_hash(&a.tracks, &a.master), base, "and back again");
 
         let mut b = Arrangement::default();
         b.add_track(TrackKind::Audio);
         let mut c = Arrangement::default();
         c.add_track(TrackKind::Midi);
         assert_ne!(
-            shape_hash(&b.tracks),
-            shape_hash(&c.tracks),
+            shape_hash(&b.tracks, &b.master),
+            shape_hash(&c.tracks, &c.master),
             "kind decides whether a sequencer exists, so it is shape"
         );
     }
@@ -20360,8 +29596,9 @@ mod tests {
         load(&mut a, 1, DeviceKind::SineSynth);
         let reverb = load(&mut a, 1, DeviceKind::Reverb);
 
-        let (spec, nodes) = build_graph_spec(&a.tracks, &a.clips, None, false);
-        let out = spec.output().unwrap();
+        let (spec, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
+        // Where the lanes sum — one hop before the master's own fader.
+        let out = sum_bus(&spec);
 
         // Only the track that loaded one has an effect node.
         let rev = nodes.devices[&reverb];
@@ -20387,6 +29624,501 @@ mod tests {
             "the instrument must not also bypass its own effect"
         );
         assert!(spec.compile(48_000, 256).is_ok());
+    }
+
+    /// Put an effect on the master, the way the browser does.
+    fn load_master(arr: &mut Arrangement, kind: DeviceKind) -> u64 {
+        let id = arr.mint_id();
+        assert!(
+            arr.master.insert_device(DeviceInstance {
+                id,
+                state: DeviceState::new(kind),
+                bypass: false,
+                page: 0,
+                view_zoom: unit_zoom(),
+                view_scroll: 0.0,
+            }),
+            "the master takes effects"
+        );
+        id
+    }
+
+    /// The master fader is the LAST thing before the speakers, and it
+    /// carries the master's own level and pan.
+    #[test]
+    fn every_lane_lands_on_the_master_fader() {
+        let mut a = Arrangement::default();
+        load(&mut a, 0, DeviceKind::SineSynth);
+        load(&mut a, 1, DeviceKind::SineSynth);
+        a.master.volume = 0.5;
+        a.master.pan = -0.25;
+
+        let (spec, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
+        let out = spec.output().unwrap();
+        let sum = sum_bus(&spec);
+
+        // Both lanes reach the sum, and the sum reaches the fader. Neither
+        // lane touches the output directly — that is what a master IS.
+        for pan in nodes.pans.iter().flatten() {
+            assert!(spec.wires().iter().any(|(f, t)| *f == *pan && *t == sum));
+            assert!(
+                !spec.wires().iter().any(|(f, t)| *f == *pan && *t == out),
+                "a lane must not bypass the master"
+            );
+        }
+
+        let fader = spec
+            .iter_ordered()
+            .find(|(id, _)| *id == out)
+            .map(|(_, node)| node.clone())
+            .unwrap();
+        assert_eq!(
+            fader,
+            NodeSpec::Pan {
+                pan: -0.25,
+                gain: 0.5
+            },
+            "the output stage carries the master's own level and pan"
+        );
+        assert!(spec.compile(48_000, 256).is_ok());
+    }
+
+    /// The recent list is resolved for reading, not just printed: a song
+    /// is named by its file, its folder tells two of the same name apart,
+    /// and a file that has gone says so instead of failing when clicked.
+    #[test]
+    fn the_recent_list_says_what_each_entry_is() {
+        let dir = std::env::temp_dir().join("daw-test-recent");
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("nightwork.daw.ron");
+        std::fs::write(&real, "()").unwrap();
+        let gone = dir.join("lost.daw.ron");
+        let _ = std::fs::remove_file(&gone);
+
+        let entries = recent_entries(&[real.display().to_string(), gone.display().to_string()]);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0].title, "nightwork",
+            "`song.daw.ron` is one song called `song`"
+        );
+        assert_eq!(entries[0].folder, dir.display().to_string());
+        assert!(!entries[0].missing);
+        assert_eq!(entries[1].title, "lost");
+        assert!(
+            entries[1].missing,
+            "a file that has gone is marked, not hidden"
+        );
+
+        std::fs::remove_file(&real).unwrap();
+    }
+
+    /// The splash is a preference, and the preference is stored as the
+    /// NEGATIVE — so a build that gains it shows the screen rather than
+    /// silently keeping it down.
+    #[test]
+    fn the_splash_defaults_to_showing() {
+        let fresh = daw::ui::prefs::UiPrefs::default();
+        assert!(!fresh.skip_splash, "a new install is welcomed");
+        let older: daw::ui::prefs::UiPrefs =
+            daw::ui::prefs::UiPrefs::from_ron_or_default("(density: Comfortable)");
+        assert!(
+            !older.skip_splash,
+            "and so is one whose prefs predate the screen"
+        );
+    }
+
+    /// What each range covers, and what it refuses. A range that resolves
+    /// to nothing must be refused BEFORE a file is created — an empty wav
+    /// on disk is worse than an error next to the button.
+    #[test]
+    fn an_export_range_covers_what_it_says() {
+        let mut a = Arrangement::default();
+        assert_eq!(
+            ExportRange::Song.beats(&a, 0.0),
+            None,
+            "an empty timeline is nothing to export"
+        );
+        assert_eq!(
+            ExportRange::Loop.beats(&a, 0.0),
+            None,
+            "no brace, no export"
+        );
+        assert_eq!(ExportRange::Selection.beats(&a, 0.0), None);
+
+        // Two clips, the later one ending at bar 3.
+        a.create_clip(0, 0.0, 4.0).unwrap();
+        a.create_clip(1, 4.0, 4.0).unwrap();
+        assert_eq!(song_end_beats(&a), 8.0);
+        assert_eq!(ExportRange::Song.beats(&a, 0.0), Some((0.0, 8.0)));
+        assert_eq!(
+            ExportRange::Song.beats(&a, 4.0),
+            Some((0.0, 12.0)),
+            "the tail is written after the last clip, not inside it"
+        );
+
+        a.loop_range = Some((4.0, 8.0));
+        assert_eq!(ExportRange::Loop.beats(&a, 0.0), Some((4.0, 8.0)));
+        a.selection = Some((2.0, 3.0));
+        assert_eq!(ExportRange::Selection.beats(&a, 1.0), Some((2.0, 4.0)));
+    }
+
+    /// An export is of the SONG: the timeline's clips, at the master's
+    /// level, and never the metronome.
+    #[test]
+    fn an_export_renders_the_timeline_through_the_master() {
+        use daw::audio::bounce::{BounceFormat, BounceOptions, bounce_automated};
+
+        let mut a = Arrangement::default();
+        load(&mut a, 0, DeviceKind::SineSynth);
+        a.create_clip(0, 0.0, 4.0).unwrap();
+        a.clips[0][0].notes.push(note(60, 0.0, 2.0, 100));
+        // An envelope that closes the fader halfway through.
+        a.tracks[0].automation.envelopes.push(AutomationEnvelope {
+            target: TRACK_VOLUME_TARGET.to_owned(),
+            points: vec![
+                AutomationPoint {
+                    beat: 0.0,
+                    value: 1.0,
+                    ..Default::default()
+                },
+                AutomationPoint {
+                    beat: 1.0,
+                    value: 0.0,
+                    ..Default::default()
+                },
+            ],
+        });
+
+        let (mut spec, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
+        spec.set_modulation(build_mod_spec(
+            &a.tracks,
+            &a.modulators,
+            &a.mod_wires,
+            &ParameterRegistry::default(),
+            &nodes,
+        ));
+        let registry = ParameterRegistry::default();
+        let tracks = a.tracks.clone();
+        let path = std::env::temp_dir().join("daw-test-export.wav");
+        let opts = BounceOptions {
+            length_beats: 4.0,
+            format: BounceFormat::Int24,
+            ..Default::default()
+        };
+        bounce_automated(
+            &spec,
+            &opts,
+            &path,
+            |beat, out| automation_letters(&tracks, &nodes, &registry, beat, out),
+            |_| true,
+        )
+        .unwrap();
+
+        let reader = hound::WavReader::open(&path).unwrap();
+        assert_eq!(reader.spec().bits_per_sample, 24);
+        assert_eq!(reader.spec().channels, 2);
+        let all: Vec<i32> = hound::WavReader::open(&path)
+            .unwrap()
+            .samples::<i32>()
+            .map(Result::unwrap)
+            .collect();
+        let peak = |half: &[i32]| half.iter().fold(0, |peak: i32, s| peak.max(s.abs()));
+        let (head, tail) = all.split_at(all.len() / 2);
+        assert!(peak(head) > 0, "the song must be audible in the export");
+        assert!(
+            peak(tail) < peak(head) / 8,
+            "and the fader envelope must be heard closing: {} then {}",
+            peak(head),
+            peak(tail)
+        );
+    }
+
+    /// The end-to-end proof: the master fader is HEARD. Two renders of the
+    /// same song, one with the master pulled to half, and the audio is
+    /// half as loud — which no amount of graph-shape assertion shows.
+    #[test]
+    fn the_master_fader_is_audible_in_a_bounce() {
+        use daw::audio::bounce::{BounceOptions, bounce};
+
+        let mut a = Arrangement::default();
+        load(&mut a, 0, DeviceKind::SineSynth);
+        a.create_clip(0, 0.0, 4.0).unwrap();
+        a.clips[0][0].notes.push(note(60, 0.0, 2.0, 100));
+
+        let opts = BounceOptions {
+            length_beats: 2.0,
+            ..Default::default()
+        };
+        let peak_of = |arr: &Arrangement, name: &str| {
+            let (spec, _) = build_graph_spec(&arr.tracks, &arr.master, &arr.clips, None, false);
+            let path = std::env::temp_dir().join(name);
+            bounce(&spec, &opts, &path).unwrap();
+            let mut reader = hound::WavReader::open(&path).unwrap();
+            reader
+                .samples::<f32>()
+                .map(|s| s.unwrap().abs())
+                .fold(0.0f32, f32::max)
+        };
+
+        let unity = peak_of(&a, "daw-master-unity.wav");
+        assert!(unity > 0.01, "the song must actually make a sound: {unity}");
+
+        a.master.volume = 0.5;
+        let halved = peak_of(&a, "daw-master-half.wav");
+        assert!(
+            (halved - unity * 0.5).abs() < unity * 0.05,
+            "half the master is half the sound: {halved} vs {unity}"
+        );
+    }
+
+    /// A master effect stands between the sum and the fader — every lane
+    /// through it, and post-fader nothing.
+    #[test]
+    fn a_master_effect_stands_between_the_sum_and_the_fader() {
+        let mut a = Arrangement::default();
+        load(&mut a, 0, DeviceKind::SineSynth);
+        let glue = load_master(&mut a, DeviceKind::Glue);
+
+        let (spec, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
+        let out = spec.output().unwrap();
+        let comp = nodes.devices[&glue];
+        let lane = nodes.pans[0].unwrap();
+
+        assert_eq!(
+            sum_bus(&spec),
+            comp,
+            "the master's own chain is the last thing before its fader"
+        );
+        assert!(
+            spec.wires()
+                .iter()
+                .any(|(f, t)| *f == lane && *t != out && *t != comp),
+            "the lane lands on the sum, not on the master's compressor directly"
+        );
+        assert!(
+            spec.wires().iter().any(|(_, t)| *t == comp),
+            "and the sum feeds it"
+        );
+        assert!(spec.compile(48_000, 256).is_ok());
+
+        // Bypassed, the chain closes over it exactly as a track's does.
+        a.master.device_mut(glue).unwrap().bypass = true;
+        let (spec, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
+        assert!(!nodes.devices.contains_key(&glue));
+        assert!(spec.compile(48_000, 256).is_ok());
+    }
+
+    /// The master has no notes to give an instrument, so it refuses one
+    /// rather than swallowing it into silence.
+    #[test]
+    fn the_master_refuses_an_instrument() {
+        let mut master = MasterTrack::default();
+        let instrument = DeviceInstance {
+            id: 1,
+            state: DeviceState::new(DeviceKind::Poly),
+            bypass: false,
+            page: 0,
+            view_zoom: unit_zoom(),
+            view_scroll: 0.0,
+        };
+        assert!(!master.insert_device(instrument));
+        assert!(master.chain.is_empty());
+
+        // And one that arrives from a hand-edited FILE is dropped on load.
+        let mut arr = Arrangement::default();
+        let mut doc = project_doc(&arr, &Transport::default());
+        doc.master.chain.push(DeviceInstance {
+            id: 9,
+            state: DeviceState::new(DeviceKind::Poly),
+            bypass: false,
+            page: 0,
+            view_zoom: unit_zoom(),
+            view_scroll: 0.0,
+        });
+        let mut transport = Transport::default();
+        apply_project_doc(doc, &mut arr, &mut transport);
+        assert!(arr.master.chain.is_empty());
+    }
+
+    /// The master header answers the pointer where it is drawn: at the foot
+    /// of the arrangement, in the header column's width.
+    ///
+    /// A pointer test rather than a model one, because the thing that can
+    /// break here is GEOMETRY — a row reserved in one place and drawn in
+    /// another answers no click at all.
+    #[test]
+    fn clicking_the_master_row_selects_the_master() {
+        let ctx = egui::Context::default();
+        let mut arr = Arrangement::default();
+        arr.select_track(0);
+
+        // Asked of the layout, not written down twice: a test holding its
+        // own copy of the geometry stops testing the geometry.
+        let row = egui::Rect::from_min_max(
+            pos2(0.0, SCREEN.y - MASTER_HEAD_H),
+            pos2(SCREEN.x, SCREEN.y),
+        );
+        let layout = master_header_layout(row, HEADER_W);
+        // Clear of the two knobs at the right of the header.
+        let at = pos2(layout.head.left() + HEADER_PAD, layout.head.center().y);
+        arrangement_pass(&ctx, &mut arr, vec![Event::PointerMoved(at)]);
+        assert!(!arr.master_selected, "hovering chooses nothing");
+
+        arrangement_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::PointerMoved(at),
+                Event::PointerButton {
+                    pos: at,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+                Event::PointerButton {
+                    pos: at,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        assert!(arr.master_selected, "the master row takes the click");
+        assert_eq!(arr.selected, Some(0), "and the lane is still selected");
+    }
+
+    /// The master fader is a draggable target, so it gets a pointer: drag
+    /// down and the level falls, and a double-click puts it back at unity.
+    #[test]
+    fn the_master_fader_answers_a_drag() {
+        let ctx = egui::Context::default();
+        let mut arr = Arrangement::default();
+        let row = egui::Rect::from_min_max(
+            pos2(0.0, SCREEN.y - MASTER_HEAD_H),
+            pos2(SCREEN.x, SCREEN.y),
+        );
+        let knob = master_header_layout(row, HEADER_W).gain.center();
+        assert_eq!(arr.master.volume, 1.0);
+        // One frame first, so the knob exists to be pressed.
+        arrangement_pass(&ctx, &mut arr, vec![]);
+
+        let to = knob + vec2(0.0, 12.0);
+        arrangement_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::PointerMoved(knob),
+                Event::PointerButton {
+                    pos: knob,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        // Downward is quieter, the same direction every other knob here
+        // reads.
+        arrangement_pass(&ctx, &mut arr, vec![Event::PointerMoved(to)]);
+        arrangement_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::PointerMoved(to),
+                Event::PointerButton {
+                    pos: to,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        assert!(
+            arr.master.volume < 1.0,
+            "dragging down pulls the master down, not up: {}",
+            arr.master.volume
+        );
+        assert!(arr.master.volume >= 0.0, "and never past silence");
+    }
+
+    /// Selecting the master points the rack at it without disturbing the
+    /// lane underneath — the clips, the roll and the automation all still
+    /// belong to that lane while its effects are being set up.
+    #[test]
+    fn the_master_is_a_place_to_be_without_losing_the_lane() {
+        let mut arr = Arrangement::default();
+        arr.select_track(2);
+        assert!(!arr.master_selected);
+
+        arr.select_master();
+        assert!(arr.master_selected);
+        assert_eq!(arr.selected, Some(2), "the lane is kept underneath");
+
+        arr.select_track(1);
+        assert!(
+            !arr.master_selected,
+            "choosing a lane is leaving the master"
+        );
+        assert_eq!(arr.selected, Some(1));
+    }
+
+    /// The master's level and its effects survive the disk; a project
+    /// written before it existed loads at unity with an empty chain.
+    #[test]
+    fn the_master_survives_save_and_load() {
+        let mut arr = Arrangement::default();
+        let glue = load_master(&mut arr, DeviceKind::Glue);
+        arr.master.volume = 0.62;
+        arr.master.pan = 0.3;
+
+        let doc = project_doc(&arr, &Transport::default());
+        let text = ron::ser::to_string_pretty(&doc, ron::ser::PrettyConfig::default()).unwrap();
+        let read: ProjectDoc = ron::from_str(&text).unwrap();
+        let mut back = Arrangement::default();
+        let mut transport = Transport::default();
+        apply_project_doc(read, &mut back, &mut transport);
+
+        assert_eq!(back.master.volume, 0.62);
+        assert_eq!(back.master.pan, 0.3);
+        assert_eq!(back.master.chain.len(), 1);
+        assert_eq!(
+            back.master.chain.first().map(|d| (d.id, d.kind())),
+            Some((glue, DeviceKind::Glue))
+        );
+
+        // A file from before the master: the field is simply absent, and
+        // the song still loads — at unity, centre and no effects, which is
+        // exactly what such a project sounded like.
+        let older: ProjectDoc = ron::from_str("(version: 2, bpm: 128.0)").unwrap();
+        assert_eq!(older.master, MasterTrack::default(), "unity, centre, empty");
+        assert_eq!(older.bpm, 128.0, "and the rest of the file still reads");
+    }
+
+    /// Adding an effect to the master is a SHAPE change: no letter can add
+    /// a node, so the graph has to be rebuilt. Moving its fader is not.
+    #[test]
+    fn the_master_chain_reshapes_the_graph_but_its_fader_does_not() {
+        let mut a = Arrangement::default();
+        load(&mut a, 0, DeviceKind::SineSynth);
+        let base = shape_hash(&a.tracks, &a.master);
+
+        a.master.volume = 0.4;
+        a.master.pan = -0.6;
+        assert_eq!(
+            shape_hash(&a.tracks, &a.master),
+            base,
+            "a fader move rides a letter, exactly as a lane's does"
+        );
+
+        let glue = load_master(&mut a, DeviceKind::Glue);
+        let with_effect = shape_hash(&a.tracks, &a.master);
+        assert_ne!(with_effect, base, "a new node cannot travel as a letter");
+
+        a.master.device_mut(glue).unwrap().bypass = true;
+        assert_ne!(
+            shape_hash(&a.tracks, &a.master),
+            with_effect,
+            "bypass removes the node, so it is shape too"
+        );
     }
 
     /// A v1 project — one instrument and one effect as named fields, and
@@ -20446,7 +30178,8 @@ mod tests {
             DeviceState::Reverb(ReverbParams {
                 mix: 0.4,
                 size: 0.8,
-                damp: 0.2
+                damp: 0.2,
+                ..ReverbParams::default()
             })
         );
         let (synth, reverb) = (chain[0].id, chain[1].id);
@@ -20469,7 +30202,7 @@ mod tests {
 
         // And it is still WIRED: it compiles onto the reverb node, at the
         // reverb's mix param, riding the base the file carried.
-        let (_, nodes) = build_graph_spec(&arr.tracks, &arr.clips, None, false);
+        let (_, nodes) = build_graph_spec(&arr.tracks, &arr.master, &arr.clips, None, false);
         let registry = ParameterRegistry::default();
         let plan = build_mod_spec(
             &arr.tracks,
@@ -20512,7 +30245,7 @@ mod tests {
         let first = load(&mut a, 0, DeviceKind::Reverb);
         let second = load(&mut a, 0, DeviceKind::Reverb);
 
-        let (spec, nodes) = build_graph_spec(&a.tracks, &a.clips, None, false);
+        let (spec, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
         let seq = instrument_node(&nodes, &a.tracks[0]).unwrap();
         let one = nodes.devices[&first];
         let two = nodes.devices[&second];
@@ -20534,6 +30267,254 @@ mod tests {
         assert_eq!(a.tracks[0].device(second).map(|d| d.id), Some(second));
     }
 
+    /// The band the equaliser's row is editing SURVIVES A FRAME.
+    ///
+    /// A card is rebuilt from engine units every frame, so anything the
+    /// card alone remembers is forgotten before the next one draws — the
+    /// selected band went back to its default on every repaint, and
+    /// clicking a handle looked like it did nothing at all. It rides the
+    /// instance's `page`, the same road the poly synth's tab takes, and
+    /// this is the test that says so.
+    #[test]
+    fn the_selected_band_rides_the_instance_and_not_the_card() {
+        let params = daw::audio::eq::EqParams::default();
+        for band in 0..daw::params::eq::BANDS {
+            let knobs = eq_knobs(params, band as u8);
+            assert_eq!(
+                knobs.selected,
+                band,
+                "band {} did not reach the card",
+                band + 1
+            );
+        }
+        // A page from a project written by some other device, or by a
+        // future one with more bands, must not index off the end.
+        assert_eq!(
+            eq_knobs(params, u8::MAX).selected,
+            daw::params::eq::BANDS - 1
+        );
+
+        // And the instance is what a page edit lands on.
+        let mut a = Arrangement::default();
+        load(&mut a, 0, DeviceKind::SineSynth);
+        let eq = load(&mut a, 0, DeviceKind::Eq);
+        assert_eq!(a.tracks[0].device(eq).map(|d| d.page), Some(0));
+        a.tracks[0].device_mut(eq).unwrap().page = 5;
+        assert_eq!(
+            eq_knobs(params, a.tracks[0].device(eq).unwrap().page).selected,
+            5
+        );
+    }
+
+    /// The compressor reaches the graph, and it gets a READOUT SLOT —
+    /// the card is most of a display for a number the engine alone
+    /// knows, so a compressor with no slot is a compressor with a dead
+    /// scope.
+    #[test]
+    fn a_compressor_reaches_the_graph_with_a_readout_slot() {
+        let mut a = Arrangement::default();
+        load(&mut a, 0, DeviceKind::SineSynth);
+        let glue = load(&mut a, 0, DeviceKind::Glue);
+        let eq = load(&mut a, 0, DeviceKind::Eq);
+
+        let (spec, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
+        let seq = instrument_node(&nodes, &a.tracks[0]).unwrap();
+        let node = nodes.devices[&glue];
+        let wired =
+            |from: NodeId, to: NodeId| spec.wires().iter().any(|(f, t)| *f == from && *t == to);
+        assert!(
+            wired(seq, node) && wired(node, nodes.devices[&eq]),
+            "the compressor sits where the chain put it"
+        );
+        assert!(spec.compile(48_000, 256).is_ok());
+
+        // It has a slot; the equaliser, which has nothing to say about
+        // itself, does not.
+        assert!(
+            nodes.readouts.contains_key(&glue),
+            "the compressor was given no readout slot"
+        );
+        assert!(
+            !nodes.readouts.contains_key(&eq),
+            "an equaliser has nothing to report and must not hold a slot"
+        );
+
+        // Every row is addressable at the instance that carries it.
+        let registry = ParameterRegistry::default();
+        let device = DeviceKind::Glue.spec();
+        assert_eq!(
+            device.params.len(),
+            device.labels.len(),
+            "glue's labels do not cover its table — the registry zips them"
+        );
+        for def in daw::params::glue::TABLE {
+            let probe = def.min + (def.max - def.min) * 0.42;
+            let instance = a.tracks[0].device_mut(glue).unwrap();
+            instance.state.set(def.id, probe);
+            assert_eq!(instance.state.value(def.id), Some(probe), "{}", def.name);
+            let target = device_target(glue, device, def.name);
+            assert!(
+                registry.spec(&target).is_some(),
+                "{target} is not a target the registry knows"
+            );
+        }
+    }
+
+    /// Two compressors on one chain get DIFFERENT slots, or they would
+    /// both draw the same needle.
+    #[test]
+    fn every_tapped_device_gets_its_own_slot() {
+        let mut a = Arrangement::default();
+        load(&mut a, 0, DeviceKind::SineSynth);
+        let first = load(&mut a, 0, DeviceKind::Glue);
+        let second = load(&mut a, 0, DeviceKind::Glue);
+        let (_, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
+        let a_slot = nodes.readouts[&first];
+        let b_slot = nodes.readouts[&second];
+        assert_ne!(a_slot, b_slot, "two compressors, one slot");
+    }
+
+    /// The equaliser reaches the graph as one node in chain order, and
+    /// its forty-one rows are all addressable at the instance that
+    /// carries them — which is what an automation lane and a modulation
+    /// wire both resolve through.
+    #[test]
+    fn an_eq_reaches_the_graph_and_every_row_is_addressable() {
+        let mut a = Arrangement::default();
+        load(&mut a, 0, DeviceKind::SineSynth);
+        let eq = load(&mut a, 0, DeviceKind::Eq);
+        let after = load(&mut a, 0, DeviceKind::Reverb);
+
+        let (spec, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
+        let seq = instrument_node(&nodes, &a.tracks[0]).unwrap();
+        let node = nodes.devices[&eq];
+        let wired =
+            |from: NodeId, to: NodeId| spec.wires().iter().any(|(f, t)| *f == from && *t == to);
+        assert!(
+            wired(seq, node) && wired(node, nodes.devices[&after]),
+            "the eq sits where the chain put it"
+        );
+        assert!(spec.compile(48_000, 256).is_ok());
+
+        // Every row round-trips through the instance, and every row is a
+        // target the registry knows.
+        let registry = ParameterRegistry::default();
+        let device = DeviceKind::Eq.spec();
+        assert_eq!(
+            device.params.len(),
+            device.labels.len(),
+            "eq's labels do not cover its table — the registry zips them"
+        );
+        for def in daw::params::eq::TABLE {
+            let probe = def.min + (def.max - def.min) * 0.42;
+            let instance = a.tracks[0].device_mut(eq).unwrap();
+            instance.state.set(def.id, probe);
+            assert_eq!(instance.state.value(def.id), Some(probe), "{}", def.name);
+            let target = device_target(eq, device, def.name);
+            assert!(
+                registry.spec(&target).is_some(),
+                "{target} is not a target the registry knows"
+            );
+        }
+    }
+
+    /// A delay with its send up leaves the SIGNAL PATH: the chain closes
+    /// over it exactly as a bypass does, it is fed from the track's output
+    /// stage instead, and its own output reaches the master beside the dry
+    /// rather than through the fader a second time.
+    #[test]
+    fn a_delay_on_a_send_hangs_off_the_track_instead_of_standing_in_it() {
+        let mut a = Arrangement::default();
+        load(&mut a, 0, DeviceKind::SineSynth);
+        let echo = load(&mut a, 0, DeviceKind::Echo);
+        let after = load(&mut a, 0, DeviceKind::Reverb);
+
+        // As an INSERT first: the baseline every existing project has.
+        let (spec, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
+        let wired = |spec: &GraphSpec, from: NodeId, to: NodeId| {
+            spec.wires().iter().any(|(f, t)| *f == from && *t == to)
+        };
+        let seq = instrument_node(&nodes, &a.tracks[0]).unwrap();
+        assert!(
+            wired(&spec, seq, nodes.devices[&echo])
+                && wired(&spec, nodes.devices[&echo], nodes.devices[&after]),
+            "at send 0 the delay stands in the chain"
+        );
+
+        // Now put it on a send.
+        a.tracks[0]
+            .device_mut(echo)
+            .unwrap()
+            .state
+            .set(daw::params::echo::SEND, 40.0);
+        let (spec, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
+        let seq = instrument_node(&nodes, &a.tracks[0]).unwrap();
+        let echo_node = nodes.devices[&echo];
+        let reverb = nodes.devices[&after];
+        let pan = nodes.pans[0].unwrap();
+
+        assert!(
+            wired(&spec, seq, reverb),
+            "the chain must close over a delay that left it"
+        );
+        assert!(
+            !wired(&spec, seq, echo_node) && !wired(&spec, echo_node, reverb),
+            "a delay on a send is not in the signal path"
+        );
+        assert!(
+            wired(&spec, pan, echo_node),
+            "the tap is POST-fader, off the track's output stage"
+        );
+        assert!(
+            !wired(&spec, echo_node, pan),
+            "the return must not go back through the fader — and Pan reads \
+             only its first input, so it would be dropped"
+        );
+        // Both the dry and the return reach the master bus.
+        let output = sum_bus(&spec);
+        assert!(
+            wired(&spec, pan, output) && wired(&spec, echo_node, output),
+            "dry and return both land at the master"
+        );
+        assert!(spec.compile(48_000, 256).is_ok());
+    }
+
+    /// Crossing zero is a SHAPE — no letter can move a node from one side
+    /// of the split to the other — while riding an established send is
+    /// not, so it stays a letter and costs no recompile.
+    #[test]
+    fn only_crossing_zero_reshapes_a_send() {
+        let mut a = Arrangement::default();
+        load(&mut a, 0, DeviceKind::SineSynth);
+        let echo = load(&mut a, 0, DeviceKind::Echo);
+        let insert = shape_hash(&a.tracks, &a.master);
+
+        let set = |a: &mut Arrangement, v: f32| {
+            a.tracks[0]
+                .device_mut(echo)
+                .unwrap()
+                .state
+                .set(daw::params::echo::SEND, v);
+        };
+        set(&mut a, 25.0);
+        let aux = shape_hash(&a.tracks, &a.master);
+        assert_ne!(aux, insert, "leaving zero rewires the track");
+
+        set(&mut a, 80.0);
+        assert_eq!(
+            shape_hash(&a.tracks, &a.master),
+            aux,
+            "riding a send that is already up is a letter, not a swap"
+        );
+
+        set(&mut a, 0.0);
+        assert_eq!(
+            shape_hash(&a.tracks, &a.master),
+            insert,
+            "and back to an insert"
+        );
+    }
+
     /// A bypassed device stays in the chain and leaves the SCHEDULE — the
     /// same rule a muted track follows — and the chain closes over it.
     #[test]
@@ -20544,7 +30525,7 @@ mod tests {
         let second = load(&mut a, 0, DeviceKind::Reverb);
 
         a.tracks[0].device_mut(first).unwrap().bypass = true;
-        let (spec, nodes) = build_graph_spec(&a.tracks, &a.clips, None, false);
+        let (spec, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
         assert!(
             !nodes.devices.contains_key(&first),
             "a bypassed device makes no node"
@@ -20561,7 +30542,7 @@ mod tests {
         // The instrument bypassed silences the lane entirely, exactly as an
         // empty chain does: no source, no pan, no meter.
         a.tracks[0].chain[0].bypass = true;
-        let (_, nodes) = build_graph_spec(&a.tracks, &a.clips, None, false);
+        let (_, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
         assert!(nodes.devices.is_empty());
         assert!(nodes.pans[0].is_none());
     }
@@ -20581,7 +30562,7 @@ mod tests {
         a.add_wire(lfo, 0, &target).unwrap();
 
         let bound = |a: &Arrangement| {
-            let (_, nodes) = build_graph_spec(&a.tracks, &a.clips, None, false);
+            let (_, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
             let plan = build_mod_spec(&a.tracks, &a.modulators, &a.mod_wires, &registry, &nodes);
             assert_eq!(plan.wires.len(), 1, "the wire compiles");
             (
@@ -20652,16 +30633,25 @@ mod tests {
                 id: 1,
                 state: DeviceState::new(DeviceKind::Reverb),
                 bypass: false,
+                page: 0,
+                view_zoom: unit_zoom(),
+                view_scroll: 0.0,
             },
             DeviceInstance {
                 id: 2,
                 state: DeviceState::new(DeviceKind::SineSynth),
                 bypass: false,
+                page: 0,
+                view_zoom: unit_zoom(),
+                view_scroll: 0.0,
             },
             DeviceInstance {
                 id: 3,
                 state: DeviceState::new(DeviceKind::SineSynth),
                 bypass: false,
+                page: 0,
+                view_zoom: unit_zoom(),
+                view_scroll: 0.0,
             },
         ];
         sanitize_chain(&mut hostile);
@@ -20675,14 +30665,23 @@ mod tests {
         // a chain edit forces a schedule swap rather than being mistaken
         // for no change at all.
         let mut seen = std::collections::HashSet::new();
-        let full = shape_hash(&a.tracks);
+        let full = shape_hash(&a.tracks, &a.master);
         assert!(seen.insert(full));
         a.tracks[0].chain.pop();
-        assert!(seen.insert(shape_hash(&a.tracks)), "an effect left");
+        assert!(
+            seen.insert(shape_hash(&a.tracks, &a.master)),
+            "an effect left"
+        );
         a.tracks[0].chain.swap(0, 1);
-        assert!(seen.insert(shape_hash(&a.tracks)), "the order changed");
+        assert!(
+            seen.insert(shape_hash(&a.tracks, &a.master)),
+            "the order changed"
+        );
         a.tracks[0].chain[0].bypass = true;
-        assert!(seen.insert(shape_hash(&a.tracks)), "one is bypassed");
+        assert!(
+            seen.insert(shape_hash(&a.tracks, &a.master)),
+            "one is bypassed"
+        );
     }
 
     /// Ctrl+1 and Ctrl+2 move BOTH grids. They are the shared grid keys —
@@ -20744,7 +30743,7 @@ mod tests {
                 id
             })
             .collect();
-        let (spec, nodes) = build_graph_spec(&a.tracks, &a.clips, None, false);
+        let (spec, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
 
         // The ids are distinct per track, which is what makes
         // `device_nodes[id]` the right address.
@@ -20784,5 +30783,519 @@ mod tests {
         assert_eq!(ellipsize("", 4), "");
         // Exactly at the limit is untouched.
         assert_eq!(ellipsize("abcd", 4), "abcd");
+    }
+    /// A muted note stays in the clip and never reaches the engine —
+    /// Ableton's deactivate, decided where beats become wire.
+    #[test]
+    fn muted_notes_never_reach_the_engine() {
+        let mut clip = Clip {
+            id: 7,
+            name: "t".to_owned(),
+            start: 0.0,
+            len: 4.0,
+            notes: vec![note(60, 0.0, 1.0, 100), note(64, 1.0, 1.0, 100)],
+            audio: None,
+            ..Clip::default()
+        };
+        clip.notes[1].muted = true;
+        let compiled = seq_notes(&[clip]);
+        assert_eq!(compiled.len(), 1, "the muted note leaked to the wire");
+        assert_eq!(compiled[0].pitch, 60);
+    }
+
+    /// The poly synth reaches a track from the browser, compiles into a
+    /// `NodeSpec::Poly`, and the whole graph makes sound.
+    ///
+    /// This is the END TO END check: browser row -> chain -> graph -> a
+    /// schedule that renders. Every piece has its own test; this is the
+    /// one that fails if they are each right and the seam between them is
+    /// not.
+    #[test]
+    fn a_poly_synth_loads_from_the_browser_and_compiles() {
+        let mut a = Arrangement::default();
+        a.create_clip(0, 0.0, 4.0).unwrap();
+        a.clips[0][0].notes.push(note(60, 0.0, 2.0, 100));
+        load(&mut a, 0, DeviceKind::Poly);
+
+        // It is the track's instrument, and it heads the chain.
+        let head = a.tracks[0].instrument().expect("an instrument");
+        assert_eq!(head.kind(), DeviceKind::Poly);
+        assert!(matches!(head.state, DeviceState::Poly(_)));
+
+        let (spec, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, Some(8.0), false);
+        let node = instrument_node(&nodes, &a.tracks[0]).expect("a node for the poly track");
+        assert!(
+            spec.iter_ordered()
+                .any(|(id, n)| id == node && matches!(n, NodeSpec::Poly { .. })),
+            "a poly instrument must compile to a Poly node, not a Seq"
+        );
+
+        // And it renders: compile the real schedule and pull a block.
+        let mut sched = spec.compile(48_000, 256).expect("the graph compiles");
+        let mut out = vec![0.0f32; 512];
+        sched.run(&mut out, &poly_ctx());
+        assert!(out.iter().all(|s| s.is_finite()));
+        let level = (out.iter().map(|s| s * s).sum::<f32>() / out.len() as f32).sqrt();
+        assert!(level > 1e-4, "the poly track was silent (rms {level})");
+    }
+
+    /// The sampler reaches a track from the browser, compiles into a
+    /// `NodeSpec::Sampler`, and the whole graph renders — with a real
+    /// file behind it, written here so the test owns its own material.
+    ///
+    /// The END TO END check for this device: browser row -> chain -> the
+    /// file on the track -> graph -> a schedule that makes sound. Every
+    /// piece has its own test; this is the one that fails if they are
+    /// each right and the seam between them is not.
+    #[test]
+    fn a_sampler_loads_a_file_from_the_browser_and_compiles() {
+        let path = std::env::temp_dir().join(format!(
+            "daw-sampler-e2e-{}-{}.wav",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        {
+            let mut w = hound::WavWriter::create(
+                &path,
+                hound::WavSpec {
+                    channels: 1,
+                    sample_rate: 48_000,
+                    bits_per_sample: 32,
+                    sample_format: hound::SampleFormat::Float,
+                },
+            )
+            .expect("scratch WAV");
+            for i in 0..24_000 {
+                let t = i as f32 / 48_000.0;
+                w.write_sample((std::f32::consts::TAU * 220.0 * t).sin() * 0.7)
+                    .expect("write");
+            }
+            w.finalize().expect("finalize");
+        }
+
+        let mut a = Arrangement::default();
+        a.create_clip(0, 0.0, 4.0).unwrap();
+        a.clips[0][0].notes.push(note(60, 0.0, 2.0, 100));
+        load(&mut a, 0, DeviceKind::Sampler);
+
+        let head = a.tracks[0].instrument().expect("an instrument");
+        assert_eq!(head.kind(), DeviceKind::Sampler);
+        let id = head.id;
+        // The file arrives the way a drop delivers it: on the track,
+        // keyed by the device that plays it.
+        a.tracks[0].sampler_sources.insert(
+            id,
+            SamplerSource {
+                path: path.clone(),
+                slices: Vec::new(),
+            },
+        );
+
+        let (spec, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, Some(8.0), false);
+        let node = instrument_node(&nodes, &a.tracks[0]).expect("a node for the sampler track");
+        assert!(
+            spec.iter_ordered().any(|(nid, n)| nid == node
+                && matches!(n, NodeSpec::Sampler { path: p, .. } if *p == path)),
+            "a sampler must compile to a Sampler node carrying its file"
+        );
+
+        let mut sched = spec.compile(48_000, 256).expect("the graph compiles");
+        let mut out = vec![0.0f32; 512];
+        sched.run(&mut out, &poly_ctx());
+        assert!(out.iter().all(|s| s.is_finite()));
+        let level = (out.iter().map(|s| s * s).sum::<f32>() / out.len() as f32).sqrt();
+        assert!(level > 1e-4, "the sampler track was silent (rms {level})");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A sampler with NO file compiles and is silent — not a panic, not a
+    /// refused graph. A missing sample must never mute a project, which is
+    /// the same rule an audio clip already keeps.
+    #[test]
+    fn a_sampler_with_no_file_compiles_to_silence() {
+        let mut a = Arrangement::default();
+        a.create_clip(0, 0.0, 4.0).unwrap();
+        a.clips[0][0].notes.push(note(60, 0.0, 2.0, 100));
+        load(&mut a, 0, DeviceKind::Sampler);
+
+        let (spec, _) = build_graph_spec(&a.tracks, &a.master, &a.clips, Some(8.0), false);
+        let mut sched = spec.compile(48_000, 256).expect("the graph compiles");
+        let mut out = vec![0.0f32; 512];
+        sched.run(&mut out, &poly_ctx());
+        assert!(out.iter().all(|s| *s == 0.0), "an empty sampler sounded");
+    }
+
+    /// Every INSTRUMENT's discrete parameters reach the lock editor AS
+    /// discrete, and its values print in that device's own words.
+    ///
+    /// This is the regression guard for a real bug: the editor was handed
+    /// one formatter and a choice count that answered zero for every
+    /// device except the poly synth. A sampler's `mode` — three choices,
+    /// sitting at the first — was therefore treated as continuous, so a
+    /// nudge moved it by a hundredth of a choice and pressing DOWN at the
+    /// bottom did nothing at all, forever.
+    #[test]
+    fn every_instruments_switches_reach_the_lock_editor_as_switches() {
+        for kind in DEVICES.iter().filter(|d| d.instrument).map(|d| d.kind) {
+            let mut a = Arrangement::default();
+            load(&mut a, 0, kind);
+            let params = plockable_params(&a.tracks[0]);
+            assert!(!params.is_empty(), "{kind:?} offers nothing to lock");
+            for p in &params {
+                let discrete = device_is_discrete(kind, p.id);
+                assert_eq!(
+                    p.choices > 0,
+                    discrete,
+                    "{kind:?} {} says choices={} but discrete={discrete}",
+                    p.name,
+                    p.choices
+                );
+                if discrete {
+                    // A switch has at least the two choices that make it
+                    // one, so a nudge has somewhere to go.
+                    assert!(
+                        p.choices >= 2,
+                        "{kind:?} {} is a switch with {} choices",
+                        p.name,
+                        p.choices
+                    );
+                }
+                // And it speaks the device's own language rather than
+                // another device's. A formatter aimed at the wrong table
+                // answers for ids it does not have, which is how this went
+                // unnoticed: it returned a plausible string every time.
+                assert!(
+                    !p.face(p.base).is_empty(),
+                    "{kind:?} {} printed nothing",
+                    p.name
+                );
+            }
+        }
+    }
+
+    // -------------------------------------------- clip internal loops ---
+
+    fn looped_clip(len: f32, loop_start: f32, loop_len: f32, starts: &[f64]) -> Clip {
+        Clip {
+            id: 1,
+            name: "c".into(),
+            start: 0.0,
+            len,
+            notes: starts
+                .iter()
+                .map(|at| Note {
+                    pitch: 60,
+                    start: *at,
+                    len: 0.25,
+                    vel: 100,
+                    muted: false,
+                    plocks: Vec::new(),
+                    prob: 1.0,
+                    cond: None,
+                })
+                .collect(),
+            audio: None,
+            loop_on: loop_len > 0.0,
+            loop_start,
+            loop_len,
+        }
+    }
+
+    /// A one-bar brace inside a four-bar clip plays four times, and every
+    /// pass is the same bar shifted by a whole loop.
+    #[test]
+    fn a_brace_repeats_to_fill_its_clip() {
+        let clip = looped_clip(16.0, 0.0, 4.0, &[0.0, 1.5]);
+        let out = clip_notes(&clip, clip.len);
+        let mut starts: Vec<f64> = out.iter().map(|n| n.start).collect();
+        starts.sort_by(f64::total_cmp);
+        assert_eq!(
+            starts,
+            vec![0.0, 1.5, 4.0, 5.5, 8.0, 9.5, 12.0, 13.5],
+            "four passes of a two-note bar"
+        );
+    }
+
+    /// Anything BEFORE the brace is an up-beat: played once, never
+    /// repeated. That is the whole reason the brace has a start as well
+    /// as a length.
+    #[test]
+    fn the_head_before_a_brace_plays_once() {
+        // Brace over beats 2..4 of a 10-beat clip; the note at 0.5 is the
+        // up-beat and must appear exactly once.
+        let clip = looped_clip(10.0, 2.0, 2.0, &[0.5, 2.0, 3.0]);
+        let out = clip_notes(&clip, clip.len);
+        let ups = out.iter().filter(|n| n.start < 1.0).count();
+        assert_eq!(ups, 1, "the up-beat repeated");
+        let mut starts: Vec<f64> = out.iter().map(|n| n.start).collect();
+        starts.sort_by(f64::total_cmp);
+        assert_eq!(starts, vec![0.5, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
+    }
+
+    /// A clip with no brace is EXACTLY what it was before braces existed:
+    /// its notes, once, clipped to its length.
+    #[test]
+    fn a_clip_without_a_brace_is_unchanged() {
+        let mut clip = looped_clip(4.0, 0.0, 0.0, &[0.0, 1.0, 2.0, 9.0]);
+        clip.loop_on = false;
+        let out = clip_notes(&clip, clip.len);
+        let starts: Vec<f64> = out.iter().map(|n| n.start).collect();
+        assert_eq!(starts, vec![0.0, 1.0, 2.0], "the note past the end sounds");
+    }
+
+    /// Degenerate braces do nothing rather than dividing by zero or
+    /// unrolling forever.
+    #[test]
+    fn a_degenerate_brace_is_no_brace() {
+        for (loop_start, loop_len) in [(0.0f32, 0.0f32), (0.0, -4.0), (2.0, 0.001)] {
+            let mut clip = looped_clip(64.0, loop_start, loop_len, &[0.0, 1.0]);
+            clip.loop_on = true;
+            let out = clip_notes(&clip, clip.len);
+            assert!(
+                out.len() <= 2,
+                "brace {loop_start}/{loop_len} unrolled {} notes",
+                out.len()
+            );
+        }
+    }
+
+    /// The unroll is BOUNDED. A very short brace across the session
+    /// horizon must stop at the cap rather than build a million notes and
+    /// stall the compile.
+    #[test]
+    fn the_unroll_is_bounded() {
+        let clip = looped_clip(SESSION_HORIZON_BEATS, 0.0, MIN_LOOP_BEATS * 1.01, &[0.0]);
+        let out = clip_notes(&clip, clip.len);
+        assert!(
+            out.len() <= MAX_LOOP_PASSES + 1,
+            "unrolled {} notes, cap is {MAX_LOOP_PASSES}",
+            out.len()
+        );
+    }
+
+    /// A LAUNCHED clip repeats whether or not it has a brace — that is
+    /// what launching means — and a clip written before braces existed
+    /// still fills the horizon exactly as it used to.
+    #[test]
+    fn a_launched_clip_without_a_brace_still_repeats() {
+        let mut a = Arrangement::default();
+        let mut clip = looped_clip(2.0, 0.0, 0.0, &[0.0, 1.0]);
+        clip.loop_on = false;
+        a.session.slots[0][0] = Some(clip);
+        a.session.playing[0] = Some(0);
+
+        let compiled = a.session.compiled(0).expect("a launched clip");
+        let notes = seq_notes(&compiled);
+        assert!(
+            notes.len() > 100,
+            "the horizon was filled with {} notes",
+            notes.len()
+        );
+        // Every pass is two beats apart, forever.
+        let mut starts: Vec<f64> = notes.iter().map(|n| n.start_beats).collect();
+        starts.sort_by(f64::total_cmp);
+        assert_eq!(starts[0], 0.0);
+        assert_eq!(starts[2], 2.0, "the second pass is one loop later");
+    }
+
+    /// And a launched clip WITH a brace repeats the brace, not the clip.
+    #[test]
+    fn a_launched_clip_repeats_its_brace() {
+        let mut a = Arrangement::default();
+        // Eight beats long, but the brace is the first two.
+        a.session.slots[0][0] = Some(looped_clip(8.0, 0.0, 2.0, &[0.0]));
+        a.session.playing[0] = Some(0);
+
+        let compiled = a.session.compiled(0).expect("a launched clip");
+        let notes = seq_notes(&compiled);
+        let mut starts: Vec<f64> = notes.iter().map(|n| n.start_beats).collect();
+        starts.sort_by(f64::total_cmp);
+        assert_eq!(starts[1], 2.0, "it repeated the clip, not the brace");
+    }
+
+    /// A TIMELINE clip's brace reaches the engine: an eight-beat clip
+    /// looping its first two beats plays its pattern four times, at
+    /// absolute timeline beats.
+    #[test]
+    fn a_timeline_clips_brace_repeats_into_the_seq() {
+        let mut clip = looped_clip(8.0, 0.0, 2.0, &[0.0, 1.0]);
+        clip.start = 4.0;
+        let notes = seq_notes(std::slice::from_ref(&clip));
+        let mut starts: Vec<f64> = notes.iter().map(|n| n.start_beats).collect();
+        starts.sort_by(f64::total_cmp);
+        assert_eq!(
+            starts,
+            vec![4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0],
+            "the brace did not repeat across the clip"
+        );
+    }
+
+    /// And what the ARRANGEMENT draws is what the engine plays.
+    ///
+    /// The two used to disagree: the lane drew the stored notes once and
+    /// the engine played them four times, so a looping clip looked like
+    /// it was doing nothing after its first pass. This is the property
+    /// that says the picture and the sound come from one list.
+    #[test]
+    fn the_lane_draws_every_note_the_engine_plays() {
+        let clip = looped_clip(8.0, 0.0, 2.0, &[0.0, 1.0]);
+        let drawn = clip_notes(&clip, clip.len);
+        let played = seq_notes(std::slice::from_ref(&clip));
+        assert_eq!(
+            drawn.len(),
+            played.len(),
+            "the lane draws {} notes and the engine plays {}",
+            drawn.len(),
+            played.len()
+        );
+        let mut a: Vec<f64> = drawn.iter().map(|n| n.start).collect();
+        let mut b: Vec<f64> = played.iter().map(|n| n.start_beats - 0.0).collect();
+        a.sort_by(f64::total_cmp);
+        b.sort_by(f64::total_cmp);
+        assert_eq!(a, b);
+    }
+
+    /// The roll's ghosts and the engine's notes come from ONE function.
+    ///
+    /// The roll draws the head as editable notes and the repeats as
+    /// ghosts; the compile takes both as one list. Different callers,
+    /// same arithmetic — which is the only thing that keeps the picture
+    /// and the sound agreeing about where the third pass starts.
+    #[test]
+    fn the_rolls_ghosts_are_the_engines_repeats() {
+        let clip = looped_clip(9.0, 1.0, 2.0, &[1.0, 2.5]);
+        let whole = clip_notes(&clip, clip.len);
+        let repeats = loop_repeats(&clip.notes, 1.0, 2.0, f64::from(clip.len), 512);
+        let head = whole.len() - repeats.len();
+        assert!(head > 0, "the head vanished");
+        // Every ghost is a note the engine plays, at the same beat.
+        let played: Vec<f64> = whole.iter().map(|n| n.start).collect();
+        for ghost in &repeats {
+            assert!(
+                played.iter().any(|at| (at - ghost.start).abs() < 1e-9),
+                "the roll would draw a ghost at {} that nothing plays",
+                ghost.start
+            );
+        }
+    }
+
+    /// A brace covering the whole clip draws no repeats — there is
+    /// nowhere for them to go, and a row of ghosts on top of the real
+    /// notes would just make the clip look muddy.
+    #[test]
+    fn a_brace_the_size_of_its_clip_repeats_nothing() {
+        let clip = looped_clip(4.0, 0.0, 4.0, &[0.0, 2.0]);
+        assert!(loop_repeats(&clip.notes, 0.0, 4.0, f64::from(clip.len), 512).is_empty());
+    }
+
+    /// The playhead folds into the brace, and folds to exactly where the
+    /// note it is over was placed.
+    ///
+    /// This is the pair that has to agree: `loop_repeats` puts the third
+    /// pass at some beat, and `loop_position` says a playhead there is
+    /// really at the brace's start. If they drift, the marker in the roll
+    /// sits somewhere the sound is not — which is what a looping clip
+    /// looked like before this existed.
+    #[test]
+    fn the_playhead_folds_where_the_repeats_were_placed() {
+        let (loop_start, loop_len) = (1.0f64, 2.0f64);
+        // Inside the head: untouched.
+        assert_eq!(loop_position(0.5, loop_start, loop_len), 0.5);
+        assert_eq!(loop_position(2.5, loop_start, loop_len), 2.5);
+        // Exactly at the loop's end it has just wrapped.
+        assert_eq!(loop_position(3.0, loop_start, loop_len), 1.0);
+        // And a long way in, it is still inside the brace.
+        for at in [5.0, 7.0, 9.0, 101.0] {
+            let folded = loop_position(at, loop_start, loop_len);
+            assert!(
+                folded >= loop_start && folded < loop_start + loop_len,
+                "{at} folded to {folded}, outside the brace"
+            );
+        }
+
+        // The agreement itself: a repeat placed at beat B, folded, lands
+        // on the source note it was copied from.
+        let notes = vec![Note {
+            pitch: 60,
+            start: 1.25,
+            len: 0.25,
+            vel: 100,
+            muted: false,
+            plocks: Vec::new(),
+            prob: 1.0,
+            cond: None,
+        }];
+        for copy in loop_repeats(&notes, loop_start, loop_len, 40.0, 512) {
+            let folded = loop_position(copy.start, loop_start, loop_len);
+            assert!(
+                (folded - 1.25).abs() < 1e-9,
+                "a copy at {} folded to {folded}, not to its source at 1.25",
+                copy.start
+            );
+        }
+    }
+
+    /// A clip with no brace does not fold: the position passes through,
+    /// which is what every non-looping clip has always done.
+    #[test]
+    fn a_clip_without_a_brace_does_not_fold() {
+        for at in [0.0, 3.0, 99.0] {
+            assert_eq!(loop_position(at, 0.0, 0.0), at);
+            assert_eq!(loop_position(at, 2.0, -1.0), at);
+        }
+    }
+
+    /// Every browser row loads onto a track and comes back as the device
+    /// it named. A row pointing at a kind the chain refuses is a row that
+    /// does nothing when clicked.
+    #[test]
+    fn every_browser_row_loads_what_it_offers() {
+        let browser = Browser::default();
+        assert!(
+            !browser.folders.is_empty(),
+            "the browser offers no devices at all"
+        );
+        for folder in &browser.folders {
+            for item in folder.items {
+                let mut a = Arrangement::default();
+                load(&mut a, 0, item.load);
+                let found = a.tracks[0].chain.iter().any(|d| d.kind() == item.load);
+                assert!(found, "{} did not load onto a track", item.name);
+            }
+        }
+        // Instruments and effects are filed under the right heading.
+        for folder in &browser.folders {
+            let instruments = folder.name == "Instruments";
+            for item in folder.items {
+                assert_eq!(
+                    item.load.is_instrument(),
+                    instruments,
+                    "{} is filed under {}",
+                    item.name,
+                    folder.name
+                );
+            }
+        }
+    }
+
+    /// A whole-block context with the transport rolling, for the graph
+    /// tests above.
+    fn poly_ctx() -> daw::audio::graph::ProcessCtx<'static> {
+        const NO_INPUT: &[f32] = &[0.0; 512];
+        daw::audio::graph::ProcessCtx {
+            device_input: NO_INPUT,
+            in_channels: 2,
+            block_frames: 256,
+            offset: 0,
+            len: 256,
+            playing: true,
+            position: 0,
+            beat: 0.0,
+            beats_per_sample: 120.0 / 60.0 / 48_000.0,
+            discontinuity: false,
+        }
     }
 }

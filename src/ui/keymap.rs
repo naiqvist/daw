@@ -59,7 +59,7 @@ impl Default for Keymap {
             Binding::new(Modifiers::COMMAND, Key::Space, UiAction::PlaySelection),
             Binding::new(Modifiers::NONE, Key::Space, UiAction::TogglePlay),
             Binding::new(Modifiers::NONE, Key::Home, UiAction::Return),
-            Binding::new(Modifiers::COMMAND, Key::M, UiAction::ToggleMetronome),
+            Binding::new(Modifiers::COMMAND, Key::M, UiAction::CreateClip),
             Binding::new(Modifiers::COMMAND, Key::C, UiAction::CopyClip),
             Binding::new(Modifiers::COMMAND, Key::V, UiAction::PasteClip),
             Binding::new(Modifiers::COMMAND, Key::D, UiAction::DuplicateClip),
@@ -74,6 +74,22 @@ impl Default for Keymap {
             ),
             Binding::new(Modifiers::COMMAND, Key::Z, UiAction::Undo),
             Binding::new(Modifiers::COMMAND, Key::Y, UiAction::Redo),
+            // The frame regions. MODIFIED gestures, not bare letters,
+            // deliberately: the plan is for bare letters to become notes
+            // when musical typing lands, and a view toggle that stopped
+            // working the day the keyboard became an instrument would be
+            // a binding chosen for today only.
+            Binding::new(Modifiers::COMMAND, Key::B, UiAction::ToggleBrowser),
+            Binding::new(
+                Modifiers::COMMAND.plus(Modifiers::ALT),
+                Key::L,
+                UiAction::ToggleLower,
+            ),
+            Binding::new(
+                Modifiers::COMMAND.plus(Modifiers::SHIFT),
+                Key::F,
+                UiAction::ToggleChrome,
+            ),
         ])
     }
 }
@@ -192,6 +208,9 @@ mod tests {
         let map = Keymap::default();
         let sc = map.shortcut_for(UiAction::TogglePlay).unwrap();
         assert_eq!(sc.logical_key, Key::Space);
+        let create = map.shortcut_for(UiAction::CreateClip).unwrap();
+        assert_eq!(create.logical_key, Key::M);
+        assert!(create.modifiers.command);
         assert!(map.shortcut_for(UiAction::StartEngine).is_none());
     }
 }

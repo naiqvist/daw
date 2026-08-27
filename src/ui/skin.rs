@@ -1,13 +1,10 @@
-//! The theme window: every Gogh palette, picked by ear rather than by name.
+//! The theme window: authored schemes, previewed in place.
 //!
-//! Ported from audio-workstation. Previewing IS the interface — a swatch
-//! strip cannot tell you whether a scheme makes the grid readable or a
-//! playhead findable, so moving the cursor applies the scheme immediately
-//! and the answer is the window you are sitting in. Nothing is committed
-//! until the choice is kept, and leaving puts back whatever you arrived
-//! with.
+//! Previewing IS the interface — a swatch strip cannot tell you whether a
+//! scheme makes the grid readable or a playhead findable, so moving the
+//! cursor applies the scheme immediately. Nothing is committed until the
+//! choice is kept, and leaving puts back whatever you arrived with.
 
-use crate::ui::gogh::{SCHEMES, Scheme};
 use crate::ui::theme::Theme;
 use crate::ui::tokens::{font, radius, space, stroke};
 use eframe::egui::{
@@ -16,34 +13,32 @@ use eframe::egui::{
 
 const WIDTH: f32 = 320.0;
 const ROW: f32 = 24.0;
-/// Rows visible at once. The list scrolls under the cursor rather than
-/// paging, so the choice either side of yours stays on screen.
-const ROWS: usize = 14;
+const ROWS: usize = 3;
 const SEARCH: f32 = 28.0;
 /// The colour chips beside each name.
 const CHIP: f32 = 6.0;
 
-/// One row of the picker. The app's own theme comes first, then the
-/// vendored terminal schemes — one list, because the question a person is
-/// asking is "which theme", not "which kind of theme".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pick {
-    House(usize),
-    Gogh(usize),
+    Dark,
+    Light,
+    Cyberpunk,
 }
 
 impl Pick {
     fn name(self) -> &'static str {
         match self {
-            Pick::House(_) => "House dark",
-            Pick::Gogh(i) => SCHEMES[i].name,
+            Pick::Dark => "Dark",
+            Pick::Light => "Light",
+            Pick::Cyberpunk => "Cyberpunk",
         }
     }
 
     fn tokens(self) -> Theme {
         match self {
-            Pick::House(_) => Theme::dark(),
-            Pick::Gogh(i) => from_scheme(&SCHEMES[i]),
+            Pick::Dark => Theme::dark(),
+            Pick::Light => Theme::light(),
+            Pick::Cyberpunk => Theme::cyberpunk(),
         }
     }
 
@@ -51,25 +46,24 @@ impl Pick {
     /// theme is actually made of.
     fn chips(self) -> [Color32; 4] {
         match self {
-            Pick::House(_) => {
+            Pick::Dark => {
                 let t = Theme::dark();
                 [t.bg, t.accent, t.ok, t.warn]
             }
-            Pick::Gogh(i) => {
-                let s = &SCHEMES[i];
-                [rgb(s.bg), rgb(s.ansi[1]), rgb(s.ansi[2]), rgb(s.ansi[4])]
+            Pick::Light => {
+                let t = Theme::light();
+                [t.bg, t.accent, t.ok, t.warn]
+            }
+            Pick::Cyberpunk => {
+                let t = Theme::cyberpunk();
+                [t.bg, t.accent, t.role_time, t.warn]
             }
         }
     }
 }
 
-/// Every theme, the app's own first. Built once per call; the list is
-/// small and the window is not a hot path.
 fn every() -> Vec<Pick> {
-    (0..1)
-        .map(Pick::House)
-        .chain((0..SCHEMES.len()).map(Pick::Gogh))
-        .collect()
+    vec![Pick::Dark, Pick::Light, Pick::Cyberpunk]
 }
 
 #[derive(Default)]
@@ -112,7 +106,7 @@ impl Skin {
     /// the house theme, which is what a fresh install sees.
     pub fn restore(&mut self, theme: &mut Theme) {
         self.chosen = load_choice();
-        self.apply(self.chosen.unwrap_or(Pick::House(0)), theme);
+        self.apply(self.chosen.unwrap_or(Pick::Dark), theme);
     }
 
     fn matches(&self) -> Vec<Pick> {
@@ -133,13 +127,13 @@ impl Skin {
 
     /// Paint the theme under the cursor, without keeping it.
     fn preview(&self, hits: &[Pick], theme: &mut Theme) {
-        let pick = hits.get(self.cursor).copied().unwrap_or(Pick::House(0));
+        let pick = hits.get(self.cursor).copied().unwrap_or(Pick::Dark);
         self.apply(pick, theme);
     }
 
     /// Put back whatever the window was entered with.
     fn revert(&self, theme: &mut Theme) {
-        let pick = self.arrived_with.unwrap_or(Pick::House(0));
+        let pick = self.arrived_with.unwrap_or(Pick::Dark);
         self.apply(pick, theme);
     }
 
@@ -348,143 +342,6 @@ impl Skin {
     }
 }
 
-fn rgb(bits: u32) -> Color32 {
-    Color32::from_rgb((bits >> 16) as u8, (bits >> 8) as u8, bits as u8)
-}
-
-/// Turn a terminal scheme into this app's roles.
-///
-/// Only the colours change. Spacing, radii, type and density are the app's
-/// own and no scheme gets a say in them.
-pub fn from_scheme(scheme: &Scheme) -> Theme {
-    let bg = rgb(scheme.bg);
-    let fg = rgb(scheme.fg);
-    let toward = |amount: f32| mix(bg, fg, amount);
-    let light = is_light(scheme.bg);
-    let accent = pick_accent(scheme).unwrap_or(fg);
-    // Red, yellow and green mean the same things here as in a terminal, so
-    // they come straight across rather than being invented.
-    let danger = visible(scheme, [9, 1]).unwrap_or(accent);
-    let warn = visible(scheme, [11, 3]).unwrap_or(accent);
-    let ok = visible(scheme, [10, 2]).unwrap_or(accent);
-    // The meter zones are the status colours, hotter.
-    let hot = |c: Color32| mix(c, Color32::WHITE, if light { 0.08 } else { 0.22 });
-
-    Theme {
-        light,
-        bg,
-        surface: toward(0.05),
-        surface_raised: toward(0.10),
-        // A well is deeper than its ground in a dark theme and in shadow in
-        // a light one — darker than the ground either way.
-        surface_sunken: mix(bg, Color32::BLACK, if light { 0.10 } else { 0.35 }),
-        text: toward(0.80),
-        text_muted: toward(0.45),
-        text_value: fg,
-        outline: toward(0.22),
-        divider: toward(0.12),
-        focus: accent,
-        accent,
-        accent_muted: mix(accent, bg, 0.55),
-        ok,
-        warn,
-        danger,
-        red_zone: hot(danger),
-        green_zone: hot(ok),
-        playhead: hot(warn),
-        loop_region: Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 0x22),
-        // The brace is the region's own colour at full strength, pushed a
-        // little toward the ink so it stands off a light ground as well as
-        // a dark one.
-        loop_brace: mix(accent, fg, 0.25),
-        selection: Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 0x38),
-        grid_beat: toward(0.06),
-        grid_bar: toward(0.13),
-        grid_sub: toward(0.03),
-        clip_body: toward(0.15),
-        clip_selected: accent,
-        clip_note: toward(0.90),
-        meter_low: ok,
-        meter_hot: warn,
-        meter_clip: danger,
-        density: 1.0,
-    }
-}
-
-/// The most saturated colour the scheme carries, brights first — a
-/// terminal's accent is whichever hue it is proudest of. Greys are skipped
-/// rather than averaged in, or a monochrome scheme picks its own background
-/// and disappears.
-fn pick_accent(scheme: &Scheme) -> Option<Color32> {
-    scheme.ansi[8..]
-        .iter()
-        .chain(scheme.ansi[..8].iter())
-        .copied()
-        .filter(|bits| off_ground(scheme.bg, *bits) && saturation(*bits) > 0.08)
-        .max_by(|a, b| saturation(*a).total_cmp(&saturation(*b)))
-        .map(rgb)
-}
-
-/// The first of `slots` that stands off the ground, so a red that happens
-/// to be the background is not used to mean "recording".
-fn visible(scheme: &Scheme, slots: [usize; 2]) -> Option<Color32> {
-    slots
-        .into_iter()
-        .map(|slot| scheme.ansi[slot])
-        .find(|bits| off_ground(scheme.bg, *bits))
-        .map(rgb)
-}
-
-fn saturation(bits: u32) -> f32 {
-    let (r, g, b) = (
-        (bits >> 16) as f32 / 255.0,
-        ((bits >> 8) & 0xff) as f32 / 255.0,
-        (bits & 0xff) as f32 / 255.0,
-    );
-    let high = r.max(g).max(b);
-    let low = r.min(g).min(b);
-    if high <= 0.0 {
-        0.0
-    } else {
-        (high - low) / high * high
-    }
-}
-
-/// Whether a colour is far enough from the ground to be seen against it.
-/// Some schemes take their background straight out of their own palette —
-/// the C64's is its famous blue, which is also its most saturated colour —
-/// and picking it would paint every accent the colour of the thing behind.
-fn off_ground(ground: u32, bits: u32) -> bool {
-    let split = |v: u32| {
-        (
-            (v >> 16) as i32,
-            ((v >> 8) & 0xff) as i32,
-            (v & 0xff) as i32,
-        )
-    };
-    let (gr, gg, gb) = split(ground);
-    let (r, g, b) = split(bits);
-    (r - gr).abs() + (g - gg).abs() + (b - gb).abs() > 90
-}
-
-/// Rec.601 luma, which is what the eye does with the three channels.
-fn is_light(bits: u32) -> bool {
-    let r = (bits >> 16) as f32;
-    let g = ((bits >> 8) & 0xff) as f32;
-    let b = (bits & 0xff) as f32;
-    0.299 * r + 0.587 * g + 0.114 * b > 128.0
-}
-
-fn mix(from: Color32, to: Color32, amount: f32) -> Color32 {
-    let amount = amount.clamp(0.0, 1.0);
-    let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * amount).round() as u8;
-    Color32::from_rgb(
-        lerp(from.r(), to.r()),
-        lerp(from.g(), to.g()),
-        lerp(from.b(), to.b()),
-    )
-}
-
 fn choice_path() -> Option<std::path::PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
@@ -494,9 +351,8 @@ fn choice_path() -> Option<std::path::PathBuf> {
     Some(base.join("daw").join("theme"))
 }
 
-/// The kept scheme is stored by name, not index: the table is generated
-/// and its order is free to change — a number written last week would name
-/// a different theme this week.
+/// The kept scheme is stored by name, not index, so the preference remains
+/// readable and stable if the picker order changes.
 fn save_choice(pick: Option<Pick>) {
     let Some(path) = choice_path() else { return };
     let _ = std::fs::create_dir_all(path.parent().unwrap());
@@ -508,8 +364,23 @@ fn save_choice(pick: Option<Pick>) {
 
 fn load_choice() -> Option<Pick> {
     let text = std::fs::read_to_string(choice_path()?).ok()?;
-    let name = text.trim();
-    every().into_iter().find(|p| p.name() == name)
+    parse_choice(text.trim())
+}
+
+fn parse_choice(name: &str) -> Option<Pick> {
+    every().into_iter().find(|p| p.name() == name).or_else(|| {
+        // Builds before the two-theme reset stored one of hundreds of Gogh
+        // names. Preserve the broad side of that choice: explicitly light
+        // palettes migrate to Light; every dark or unknown palette returns
+        // to the house Dark scheme.
+        (!name.is_empty()).then(|| {
+            if name.to_ascii_lowercase().contains("light") {
+                Pick::Light
+            } else {
+                Pick::Dark
+            }
+        })
+    })
 }
 
 #[cfg(test)]
@@ -518,45 +389,60 @@ mod tests {
     use super::*;
     use crate::ui::tokens::Density;
 
-    fn scheme(name: &str) -> &'static Scheme {
-        SCHEMES.iter().find(|s| s.name == name).unwrap()
+    fn luminance(color: Color32) -> f32 {
+        let channel = |value: u8| {
+            let value = f32::from(value) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(color.r()) + 0.7152 * channel(color.g()) + 0.0722 * channel(color.b())
+    }
+
+    fn contrast(a: Color32, b: Color32) -> f32 {
+        let (bright, dark) = if luminance(a) >= luminance(b) {
+            (luminance(a), luminance(b))
+        } else {
+            (luminance(b), luminance(a))
+        };
+        (bright + 0.05) / (dark + 0.05)
     }
 
     #[test]
-    fn dark_and_light_grounds_are_detected() {
-        assert!(!from_scheme(scheme("Nord")).light);
-        assert!(from_scheme(scheme("Solarized Light")).light);
+    fn authored_schemes_have_the_expected_grounds_and_distinct_roles() {
+        let dark = Theme::dark();
+        let light = Theme::light();
+        let cyberpunk = Theme::cyberpunk();
+        assert!(!dark.light);
+        assert!(light.light);
+        assert!(!cyberpunk.light);
+        for theme in [dark, light, cyberpunk] {
+            assert_ne!(theme.surface, theme.bg);
+            assert_ne!(theme.surface_raised, theme.bg);
+            assert_ne!(theme.surface_sunken, theme.bg);
+            assert_ne!(theme.text, theme.bg);
+            assert_ne!(theme.accent, theme.bg);
+            assert_ne!(theme.clip_body, theme.clip_note);
+            assert_ne!(theme.grid_bar, theme.grid_beat);
+            assert_ne!(theme.grid_beat, theme.grid_sub);
+        }
     }
 
     #[test]
-    fn a_scheme_keeps_its_ground_and_ink() {
-        let s = scheme("Gruvbox Dark");
-        let t = from_scheme(s);
-        assert_eq!(t.bg, rgb(s.bg));
-        assert_eq!(t.text_value, rgb(s.fg));
-    }
+    fn dark_schemes_have_readable_text_and_ordered_elevations() {
+        for theme in [Theme::dark(), Theme::cyberpunk()] {
+            assert!(contrast(theme.text, theme.bg) >= 7.0);
+            assert!(contrast(theme.text_muted, theme.bg) >= 4.5);
+            assert!(contrast(theme.text, theme.surface_raised) >= 7.0);
 
-    #[test]
-    fn the_accent_never_becomes_the_background() {
-        // The C64 scheme takes its background out of its own palette —
-        // its most saturated colour — so a naive pick paints every accent
-        // the colour of the thing behind.
-        let t = from_scheme(scheme("C64"));
-        assert_ne!(t.accent, t.bg);
-    }
-
-    #[test]
-    fn a_scheme_does_not_move_the_furniture() {
-        let house = Theme::dark();
-        let t = from_scheme(scheme("Tokyo Night"));
-        assert_eq!(t.density, house.density);
-        // The scheme decides colours, never how tightly the UI packs.
-        for (a, b) in [
-            (t.surface, t.bg),
-            (t.surface_raised, t.bg),
-            (t.clip_body, t.bg),
-        ] {
-            assert_ne!(a, b, "roles must stay distinct");
+            assert!(luminance(theme.surface_sunken) < luminance(theme.bg));
+            assert!(luminance(theme.bg) < luminance(theme.surface));
+            assert!(luminance(theme.surface) < luminance(theme.surface_raised));
+            assert!(luminance(theme.grid_sub) < luminance(theme.grid_beat));
+            assert!(luminance(theme.grid_beat) < luminance(theme.grid_bar));
+            assert!(luminance(theme.surface_raised) < luminance(theme.clip_body));
         }
     }
 
@@ -564,29 +450,34 @@ mod tests {
     fn the_density_preference_survives_a_theme_swap() {
         let mut theme = Theme::dark().with_density(Density::Compact);
         let skin = Skin::default();
-        skin.apply(Pick::Gogh(0), &mut theme);
+        skin.apply(Pick::Light, &mut theme);
         assert_eq!(theme.density, Density::Compact.scale());
+        assert!(theme.light);
     }
 
     #[test]
     fn search_filters_by_name() {
         let skin = Skin {
             open: true,
-            query: "nord".to_owned(),
+            query: "light".to_owned(),
             ..Skin::default()
         };
         let hits = skin.matches();
-        assert!(!hits.is_empty());
-        assert!(
-            hits.iter()
-                .all(|p| p.name().to_lowercase().contains("nord"))
-        );
+        assert_eq!(hits, vec![Pick::Light]);
     }
 
     #[test]
-    fn every_list_starts_with_the_house_theme() {
+    fn the_picker_contains_all_authored_themes() {
         let all = every();
-        assert_eq!(all.first(), Some(&Pick::House(0)));
-        assert_eq!(all.len(), SCHEMES.len() + 1);
+        assert_eq!(all, vec![Pick::Dark, Pick::Light, Pick::Cyberpunk]);
+    }
+
+    #[test]
+    fn old_theme_names_migrate_to_their_broad_side() {
+        assert_eq!(parse_choice("Cyberpunk"), Some(Pick::Cyberpunk));
+        assert_eq!(parse_choice("Solarized Light"), Some(Pick::Light));
+        assert_eq!(parse_choice("Gruvbox Dark"), Some(Pick::Dark));
+        assert_eq!(parse_choice("Nord"), Some(Pick::Dark));
+        assert_eq!(parse_choice(""), None);
     }
 }

@@ -18,7 +18,10 @@ assert_no_alloc   = "1.1.2"
 
 # --- streaming & media ---
 creek             = "1.2.3"
-symphonium        = "0.12.2"
+# `flac`/`mp3`/`aiff` on top of the default wav+ogg: a sample library is
+# made of exactly those, and the sampler loads whole files rather than
+# streaming them, so this is the only decoder that sees them.
+symphonium        = { version = "0.12.2", features = ["flac", "mp3", "aiff"] }
 fixed-resample    = "0.12.1"
 hound             = "3.5.1"
 

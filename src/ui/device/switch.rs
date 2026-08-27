@@ -105,13 +105,57 @@ fn choices(param: &Param) -> Vec<String> {
 /// widget's; the segment it lands on is the one drawn selected. Returns
 /// true when the user changed it.
 pub fn switch(ui: &mut egui::Ui, theme: &Theme, param: &Param, norm: &mut f32) -> bool {
-    let fp = footprint(ui, theme, param);
+    let w = footprint(ui, theme, param).width();
+    switch_sized(ui, theme, param, norm, w)
+}
+
+/// The smallest width a switch may be drawn at without its segments
+/// falling under the interaction floor.
+///
+/// A rail is a row of TARGETS as much as it is a row of labels: squeeze
+/// it far enough and every segment becomes a coin flip, which is the
+/// exact failure the module header says a switch exists to avoid.
+pub fn min_width(_ui: &egui::Ui, param: &Param) -> f32 {
+    let count = param.choices().unwrap_or(1).max(1) as f32;
+    MIN_SEGMENT_W * count
+}
+
+/// One segment's floor, in points.
+///
+/// Narrower than egui's interaction minimum ON PURPOSE, and this is the
+/// whole reason the constant exists: that figure is forty points, meant
+/// for a lone control with empty ground around it. A seven-position rail
+/// held to it is two hundred and eighty points wide before a single
+/// label is measured, and two of those do not fit on any card here.
+///
+/// A segment inside a rail is aimed at with its neighbours as context
+/// and its label as the target, which is what makes twenty-four honest.
+const MIN_SEGMENT_W: f32 = 24.0;
+
+/// Draw the switch at a GIVEN width, dividing it evenly between the
+/// segments.
+///
+/// A rail's natural width is the widest label times the count, which is
+/// right when it can have the room and wrong when it cannot: a card
+/// narrower than that gets a rail running off its edge, with the last
+/// position — often the one that matters, like a release's AUTO —
+/// clipped away entirely. Given a width, the segments share it.
+///
+/// Never below [`min_width`], because a rail that fits by becoming
+/// unclickable has not fitted.
+pub fn switch_sized(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    param: &Param,
+    norm: &mut f32,
+    width: f32,
+) -> bool {
     let mut changed = false;
 
-    // Claim exactly the contract's width in a centred column, the same
+    // Claim exactly the width asked for in a centred column, the same
     // shape `knob` uses — so a switch and a knob in neighbouring wells
     // line up on their labels instead of drifting apart.
-    let w = fp.width();
+    let w = width.max(min_width(ui, param));
     ui.allocate_ui_with_layout(
         egui::vec2(w, 0.0),
         egui::Layout::top_down(egui::Align::Center),
@@ -129,8 +173,8 @@ pub fn switch(ui: &mut egui::Ui, theme: &Theme, param: &Param, norm: &mut f32) -
 
             let labels = choices(param);
             let count = labels.len().max(1);
-            let (rect, response) =
-                ui.allocate_exact_size(track_size(ui, theme, param), egui::Sense::click_and_drag());
+            let track = egui::vec2(w, track_size(ui, theme, param).y);
+            let (rect, response) = ui.allocate_exact_size(track, egui::Sense::click_and_drag());
 
             let current = param.index(*norm).min(count - 1);
             let mut want = current;

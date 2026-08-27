@@ -3,7 +3,6 @@
 //! attack/decay/release to real time (and can show it with `readout`).
 
 use crate::ui::device::bezier::{Cubic, Pt};
-use crate::ui::device::design;
 use crate::ui::device::metrics::Footprint;
 use crate::ui::theme::Theme;
 use crate::ui::tokens::{control, stroke};
@@ -53,7 +52,34 @@ pub fn footprint(theme: &Theme) -> Footprint {
 }
 
 pub fn adsr(ui: &mut egui::Ui, theme: &Theme, env: &mut Adsr) -> bool {
-    let min = footprint(theme);
+    adsr_with_footprint(ui, theme, env, footprint(theme))
+}
+
+/// The envelope editor compressed for an instrument face. It is the same
+/// three-handle editor as [`adsr`], not a thumbnail: the larger invisible
+/// grab regions stay intact even though the curve itself is shorter.
+pub fn footprint_compact(theme: &Theme) -> Footprint {
+    Footprint::new(
+        theme.sp(control::CURVE_MINI_W),
+        theme.sp(control::ENV_COMPACT_H),
+    )
+}
+
+pub fn adsr_compact(ui: &mut egui::Ui, theme: &Theme, env: &mut Adsr) -> bool {
+    adsr_with_footprint(ui, theme, env, footprint_compact(theme))
+}
+
+/// The compact editor stretched into an exact parent surface.
+///
+/// Composite synth widgets use this when the envelope graph and its value
+/// cells share one dark panel. The handles keep their normal interaction
+/// floor; only the curve receives the space its parent reclaimed.
+pub fn adsr_fill(ui: &mut egui::Ui, theme: &Theme, env: &mut Adsr) -> bool {
+    let size = egui::vec2(ui.available_width(), ui.available_height());
+    adsr_with_footprint(ui, theme, env, Footprint::from_size(size))
+}
+
+fn adsr_with_footprint(ui: &mut egui::Ui, theme: &Theme, env: &mut Adsr, min: Footprint) -> bool {
     let width = ui.available_width().max(min.width());
     let size = egui::vec2(width, min.height());
     let (rect, env_response) = ui.allocate_exact_size(size, egui::Sense::hover());
@@ -119,25 +145,40 @@ pub fn adsr(ui: &mut egui::Ui, theme: &Theme, env: &mut Adsr) -> bool {
 
     // --- paint ------------------------------------------------------------
     let painter = ui.painter();
-    painter.rect_filled(rect, design::box_radius(), theme.surface_sunken);
-    painter.rect_stroke(
-        rect,
-        0.0,
-        egui::Stroke::new(stroke::HAIR, theme.outline),
-        egui::StrokeKind::Inside,
-    );
+    // NO ground and NO border of its own. TE's envelope screen is a
+    // curve on the same black field as everything else — the border and
+    // the second grey were a panel-stack habit, and on a display they
+    // draw a box around a shape that is already legible.
+    let _ = rect;
 
-    // Level quarter-lines.
-    for i in 1..4 {
-        let gy = y_at(i as f32 / 4.0);
+    // The BASELINE and the stage boundaries, dim — the OP-1's envelope
+    // screen draws exactly these and nothing else behind the curve. The
+    // old quarter-lines went with them: four horizontal rules across a
+    // shape whose whole job is to be read as a shape is noise, and TE
+    // draws none.
+    painter.line_segment(
+        [
+            egui::pos2(area.left(), y_at(0.0)),
+            egui::pos2(area.right(), y_at(0.0)),
+        ],
+        egui::Stroke::new(stroke::HAIR, theme.role_time_dim),
+    );
+    for f in [fa, fd, fs] {
         painter.line_segment(
-            [egui::pos2(area.left(), gy), egui::pos2(area.right(), gy)],
-            egui::Stroke::new(stroke::HAIR, theme.grid_beat),
+            [
+                egui::pos2(x_at(f), y_at(0.0)),
+                egui::pos2(x_at(f), y_at(1.0)),
+            ],
+            egui::Stroke::new(stroke::HAIR, theme.role_time_dim),
         );
     }
 
-    let curve_stroke = egui::Stroke::new(stroke::BOLD, theme.accent);
-    let draw_segment = |seg: Cubic| {
+    // THIN strokes, coloured by what the stage IS: the rising and falling
+    // TIMES are blue, the DECAY toward a level is ochre. The colour says
+    // "this is a time" or "this is a level" before the shape says how
+    // much — TE's whole point, and why their screens need no labels.
+    let draw_segment = |seg: Cubic, color: egui::Color32| {
+        let curve_stroke = egui::Stroke::new(stroke::HAIR, color);
         let mut pts: Vec<Pt> = Vec::new();
         seg.polyline(STEPS, &mut pts);
         let points: Vec<egui::Pos2> = pts
@@ -147,33 +188,45 @@ pub fn adsr(ui: &mut egui::Ui, theme: &Theme, env: &mut Adsr) -> bool {
         painter.add(egui::Shape::line(points, curve_stroke));
     };
 
-    draw_segment(Cubic::segment(0.0, 0.0, fa, 1.0, BEND));
-    draw_segment(Cubic::segment(fa, 1.0, fd, env.sustain, BEND));
-    // Sustain plateau: a straight hold, drawn quieter than the moving
-    // stages.
+    draw_segment(Cubic::segment(0.0, 0.0, fa, 1.0, BEND), theme.role_time);
+    draw_segment(
+        Cubic::segment(fa, 1.0, fd, env.sustain, BEND),
+        theme.role_level,
+    );
+    // The sustain plateau is a HOLD, not a move: flat, blue, thin.
     painter.line_segment(
         [
             egui::pos2(x_at(fd), y_at(env.sustain)),
             egui::pos2(x_at(fs), y_at(env.sustain)),
         ],
-        egui::Stroke::new(stroke::BOLD, theme.accent_muted),
+        egui::Stroke::new(stroke::HAIR, theme.role_time),
     );
-    draw_segment(Cubic::segment(fs, env.sustain, fr, 0.0, BEND));
+    draw_segment(
+        Cubic::segment(fs, env.sustain, fr, 0.0, BEND),
+        theme.role_time,
+    );
 
-    // Handles on top.
-    for (tag, center) in [
-        ("env-a", egui::pos2(x_at(fa), y_at(1.0))),
-        ("env-d", egui::pos2(x_at(fd), y_at(env.sustain))),
-        ("env-r", egui::pos2(x_at(fr), y_at(0.0))),
+    // The DOTS are the handles — the affordance TE actually uses. Their
+    // colour says which family the drag belongs to: the peak and the
+    // sustain corner set LEVELS (ochre), the release foot sets a TIME
+    // (blue). A dot at the origin anchors the shape, undraggable.
+    painter.circle_filled(
+        egui::pos2(x_at(0.0), y_at(0.0)),
+        handle_r * 0.75,
+        theme.role_time,
+    );
+    for (tag, center, color) in [
+        ("env-a", egui::pos2(x_at(fa), y_at(1.0)), theme.role_level),
+        (
+            "env-d",
+            egui::pos2(x_at(fd), y_at(env.sustain)),
+            theme.role_level,
+        ),
+        ("env-r", egui::pos2(x_at(fr), y_at(0.0)), theme.role_time),
     ] {
         let id = base_id.with(tag);
         let active = ui.ctx().is_being_dragged(id);
-        painter.circle_filled(center, handle_r, theme.accent);
-        painter.circle_stroke(
-            center,
-            handle_r,
-            egui::Stroke::new(stroke::HAIR, theme.surface_sunken),
-        );
+        painter.circle_filled(center, handle_r, color);
         if active {
             painter.circle_stroke(
                 center,

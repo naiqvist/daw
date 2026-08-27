@@ -89,12 +89,18 @@ mod tests {
                     len_beats: 0.4,
                     pitch: 60,
                     vel: 100,
+                    plocks: Vec::new(),
+                    prob: 1.0,
+                    cond: None,
                 },
                 Note {
                     start_beats: 1.0,
                     len_beats: 0.4,
                     pitch: 64,
                     vel: 90,
+                    plocks: Vec::new(),
+                    prob: 1.0,
+                    cond: None,
                 },
             ],
             subloops: vec![SubLoop {

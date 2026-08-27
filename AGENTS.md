@@ -51,12 +51,40 @@ note-off before note-on on ties, sequences ride compiled immutable chunks
 (never streamed from UI), every node classified free-running vs
 timeline-locked.
 
+## Before writing a draggable control or a device card
+
+Read `notes/20260826-device-ui-contract.md` FIRST. Four rules, all
+written after the same bug shipped three times in one afternoon: one
+draggable target = one egui interaction (never a nearest-handle search
+over one big widget); a control drawn over a display guards its own
+geometry; a card owns no state the instance cannot hand back, because a
+card is rebuilt from engine units every frame; and every draggable target
+gets a pointer test through `ui::device::probe`. The five standing card
+tests do not cover gestures — only a pointer does.
+
+Then read `notes/20260827-device-card-layout.md` for SIZE, which is the
+other half and took the kick's card three attempts. Four rules: a
+labelled cell is TWO `POLY_CELL_H` units tall (glue and sat both draw one
+row of cells and reserve two); row height comes off the footer with the
+gaps subtracted first; a card must declare its width through the well's
+footprint or it crams; and a row shares its width progressively, cell by
+cell, never divided up in advance.
+
 ## Before writing instrument / synth nodes
 
 Read `notes/20260825-synth-brief.md` FIRST: the workhorse synth spec, the
 audio-rate modulation matrix (per-sample, per-voice, lane-major, baked at
 compile, no feedback), and the UI ease-mechanics. Voices are lane-major SoA
 (`[f32; LANES]` per parameter), never `[Voice; N]` structs.
+
+The SAMPLER is the one signed-off exception to the lane rule, and
+`notes/20260827-sampler-brief.md` is its spec: a sampler voice's inner
+loop is a gather over eight unrelated addresses, which vectorises on no
+axis SoA offers. Read that brief before touching `src/audio/sampler.rs`,
+`src/audio/material.rs`, `src/audio/preamp.rs`, `src/dsp/lofi.rs` or
+`src/dsp/interp.rs` — it also carries the device's one load-bearing
+promise, that every colour stage reaches an EXACT bypass at the bottom of
+its range so the colour can be measured rather than merely asserted.
 
 
 ## Project facts worth not re-deriving

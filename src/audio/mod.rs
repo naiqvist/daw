@@ -11,10 +11,25 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 pub mod bounce;
+pub mod eq;
+pub mod filter;
+pub mod glue;
 pub mod graph;
+pub mod handclap;
+pub mod hat;
+pub mod kick;
+pub mod limiter;
+pub mod material;
 pub mod modulation;
+pub mod modulato;
+pub mod poly;
+pub mod preamp;
 pub mod project;
+pub mod sampler;
+pub mod snare;
+pub mod tom;
 pub mod transport;
+pub mod utility;
 
 use assert_no_alloc::assert_no_alloc;
 use rtaudio::{
@@ -180,6 +195,17 @@ pub struct BlockSnapshot {
     /// meter cannot tell the difference and does not need to.
     pub track_peaks: [f32; graph::MAX_METERS],
 
+    /// What each TAPPED DEVICE said about itself this block — how loud
+    /// its detector heard, and how hard it worked.
+    ///
+    /// The same slot space as `track_peaks` and the same fixed size, for
+    /// the same reason: this whole struct is a memcpy into a
+    /// `triple_buffer`, and a Vec cannot ride in one. A slot with no tap
+    /// behind it reads its default, which is silence and no reduction —
+    /// exactly what a device that is not working reads, and the display
+    /// cannot tell the difference and does not need to.
+    pub device_readouts: [graph::Readout; graph::MAX_METERS],
+
     /// Each modulation source's value as of this block's last segment, in
     /// the arrangement's modulator order.
     ///
@@ -226,6 +252,7 @@ impl Default for BlockSnapshot {
             peak: 0.0,
             head: [0.0; SNAPSHOT_SAMPLES],
             track_peaks: [0.0; graph::MAX_METERS],
+            device_readouts: [graph::Readout::default(); graph::MAX_METERS],
             mod_sources: [0.0; modulation::MAX_MOD_SOURCES],
             mod_wire_ids: [0; modulation::MAX_MOD_WIRES],
             mod_wires: [0.0; modulation::MAX_MOD_WIRES],
@@ -549,6 +576,11 @@ impl Engine {
                     // stretch with no schedule reports zeros rather than the
                     // last block's levels — a meter frozen at its last
                     // reading is worse than one that reads nothing.
+                    let device_readouts = schedule
+                        .as_ref()
+                        .map_or([graph::Readout::default(); graph::MAX_METERS], |s| {
+                            *s.readouts()
+                        });
                     let track_peaks = schedule
                         .as_ref()
                         .map_or([0.0; graph::MAX_METERS], |s| *s.peaks());
@@ -576,6 +608,7 @@ impl Engine {
                         peak,
                         head,
                         track_peaks,
+                        device_readouts,
                         mod_sources,
                         mod_wire_ids,
                         mod_wires,

@@ -138,8 +138,15 @@ fn scale_for(unit: Unit, suffix: &str) -> Option<f32> {
             _ => None,
         },
         Unit::Db => matches!(suffix, "db").then_some(1.0),
+        // A note number takes a bare number and nothing else. "60 C" is
+        // not a unit, and accepting a name here would need a parser that
+        // knows about sharps, octaves, and which C is middle C — a field
+        // is not where that argument belongs.
+        Unit::Note => None,
         Unit::Percent => matches!(suffix, "%" | "pct").then_some(1.0),
         Unit::Semitones => matches!(suffix, "st" | "semi" | "semitones").then_some(1.0),
+        // "4x" and a bare "4" mean the same factor.
+        Unit::Ratio => matches!(suffix, "x").then_some(1.0),
         Unit::Plain | Unit::Choice(_) => None,
     }
 }
@@ -478,6 +485,17 @@ mod tests {
                 Unit::Semitones,
             ),
             Param::new("x", Mapping::Linear { min: 0.0, max: 2.0 }, Unit::Plain),
+            // Log-mapped, as a drive control actually is — so the
+            // round trip is tested through the mapping that can lose
+            // precision, not only through a linear one.
+            Param::new(
+                "drive",
+                Mapping::Log {
+                    min: 1.0,
+                    max: 32.0,
+                },
+                Unit::Ratio,
+            ),
             Param::choice("mode", &["lp", "bp", "hp", "notch"]),
         ];
         for param in &params {

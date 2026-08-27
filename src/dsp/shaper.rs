@@ -29,6 +29,8 @@
 //! this and the lookahead limiter are why the contract makes every
 //! kernel answer for its latency.
 
+use crate::dsp::{LANES, LaneFrame};
+
 /// Full length of the halfband FIR. Odd; centre = (N−1)/2. Sized so the
 /// Kaiser transition (≈ 8 kHz at 96 k) puts the stopband where content
 /// would fold below ~20 kHz.
@@ -308,6 +310,159 @@ impl Oversampler2x {
     /// (an impulse came back at 0.63 instead of ~0.95, which is how the
     /// impulse test caught it).
     pub fn down(&mut self, in2x: &[f32], out: &mut [f32]) {
+        if in2x.len() != out.len() * 2 {
+            return;
+        }
+        for (pair, y) in in2x.as_chunks::<2>().0.iter().zip(out.iter_mut()) {
+            self.down_pos = self.down_pos.wrapping_add(1);
+            self.down_hist[self.down_pos & (RING - 1)] = pair[0];
+            *y = Self::fir(&self.down_hist, self.down_pos, &self.coeffs);
+            self.down_pos = self.down_pos.wrapping_add(1);
+            self.down_hist[self.down_pos & (RING - 1)] = pair[1];
+        }
+    }
+}
+
+// ------------------------------------------------------------- lanes ---
+
+impl Waveshaper {
+    /// Red zone: shape a whole voice group in place, any length.
+    ///
+    /// A method rather than a `LaneWaveshaper` type, and that is not an
+    /// inconsistency with the other lane kernels: this one is STATELESS.
+    /// [`Waveshaper::shape`] is a pure function of a sample, so there is
+    /// nothing per-lane to keep and nothing to get wrong — the curve is
+    /// the patch's, shared, exactly as the coefficients are elsewhere.
+    pub fn process_lanes(&self, io: &mut [LaneFrame]) {
+        for frame in io.iter_mut() {
+            for s in frame.iter_mut() {
+                *s = self.shape(*s);
+            }
+        }
+    }
+}
+
+/// [`Oversampler2x`] for a whole voice group.
+///
+/// The halfband taps are shared — one patch, one filter — and the two
+/// delay rings are per lane, stored RING-SLOT MAJOR (`[[f32; LANES];
+/// RING]`) so one tap of the FIR reads every lane's history from one
+/// contiguous, register-shaped slot. Stored the other way round, each of
+/// the 71 taps would stride across [`LANES`] separate histories.
+///
+/// State: 2 × RING × [`LANES`] floats + the taps.
+/// Per-sample-per-lane cost: the scalar's — HB_LEN multiply-adds per 2x
+/// slot, twice up and once down.
+/// Denormal-safe: an FIR cannot recirculate, so a decayed tail leaves the
+/// ring after RING samples rather than lingering.
+/// In-place safe: no — `up` and `down` read one buffer and write another.
+/// Latency: [`Self::latency`] samples, the same as the scalar kernel's,
+/// and the constant-latency rule applies — a node reporting this feeds
+/// plugin delay compensation.
+#[derive(Debug, Clone, Copy)]
+pub struct LaneOversampler2x {
+    coeffs: [f32; HB_LEN],
+    up_hist: [[f32; LANES]; RING],
+    down_hist: [[f32; LANES]; RING],
+    up_pos: usize,
+    down_pos: usize,
+}
+
+impl Default for LaneOversampler2x {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LaneOversampler2x {
+    pub fn new() -> Self {
+        let mut o = Self {
+            coeffs: [0.0; HB_LEN],
+            up_hist: [[0.0; LANES]; RING],
+            down_hist: [[0.0; LANES]; RING],
+            up_pos: 0,
+            down_pos: 0,
+        };
+        o.prepare();
+        o
+    }
+
+    /// Frames of scratch `up` needs for a block: twice the block.
+    pub fn scratch_len(block: usize) -> usize {
+        block * 2
+    }
+
+    /// Green zone: take the halfband from a prepared SCALAR oversampler,
+    /// so there is one Kaiser window in this file and not two.
+    pub fn prepare(&mut self) {
+        let o = Oversampler2x::new();
+        self.coeffs = o.coeffs;
+    }
+
+    pub fn reset(&mut self) {
+        self.up_hist = [[0.0; LANES]; RING];
+        self.down_hist = [[0.0; LANES]; RING];
+        self.up_pos = 0;
+        self.down_pos = 0;
+    }
+
+    /// Green zone: clear ONE lane's history through both rings.
+    pub fn reset_lane(&mut self, lane: usize) {
+        for slot in self.up_hist.iter_mut().chain(self.down_hist.iter_mut()) {
+            if let Some(v) = slot.get_mut(lane) {
+                *v = 0.0;
+            }
+        }
+    }
+
+    /// The round trip's group delay, in input samples. Identical to the
+    /// scalar kernel's, because the taps are identical.
+    pub fn latency(&self) -> usize {
+        Oversampler2x::new().latency()
+    }
+
+    /// One FIR tap sweep across every lane.
+    #[inline(always)]
+    fn fir(hist: &[[f32; LANES]; RING], pos: usize, coeffs: &[f32; HB_LEN]) -> [f32; LANES] {
+        let mut acc = [0.0f32; LANES];
+        for (k, c) in coeffs.iter().enumerate() {
+            let slot = &hist[pos.wrapping_sub(k) & (RING - 1)];
+            for (a, h) in acc.iter_mut().zip(slot.iter()) {
+                *a += c * *h;
+            }
+        }
+        acc
+    }
+
+    /// Red zone: upsample `input` into `out2x`, which must be exactly
+    /// twice as long. Wrong sizes fail open — nothing written.
+    pub fn up(&mut self, input: &[LaneFrame], out2x: &mut [LaneFrame]) {
+        if out2x.len() != input.len() * 2 {
+            return;
+        }
+        for (x, pair) in input.iter().zip(out2x.as_chunks_mut::<2>().0) {
+            // Zero-stuff, filter, x2 to preserve amplitude — the scalar
+            // kernel's sequence, one frame at a time.
+            let zero = [0.0f32; LANES];
+            for (slot, sample) in pair.iter_mut().zip([*x, zero]) {
+                self.up_pos = self.up_pos.wrapping_add(1);
+                self.up_hist[self.up_pos & (RING - 1)] = sample;
+                let filtered = Self::fir(&self.up_hist, self.up_pos, &self.coeffs);
+                for (o, f) in slot.iter_mut().zip(filtered.iter()) {
+                    *o = 2.0 * *f;
+                }
+            }
+        }
+    }
+
+    /// Red zone: filter and decimate `in2x` back into `out`, which must
+    /// be exactly half as long. Wrong sizes fail open.
+    ///
+    /// The kept phase is the FIRST slot of each pair, for the same reason
+    /// the scalar kernel keeps it: the cascade's group delay is an even
+    /// number of 2x slots, so sampling the odd phase reads every peak
+    /// half a sample off.
+    pub fn down(&mut self, in2x: &[LaneFrame], out: &mut [LaneFrame]) {
         if in2x.len() != out.len() * 2 {
             return;
         }
@@ -660,5 +815,212 @@ mod tests {
             os.down(&up, &mut io);
             std::hint::black_box(&mut io);
         });
+    }
+    // --------------------------------------------------------- lanes ---
+
+    fn lane_column(frames: &[LaneFrame], lane: usize) -> Vec<f32> {
+        frames.iter().map(|f| f[lane]).collect()
+    }
+
+    fn spread(signal: &[f32]) -> Vec<LaneFrame> {
+        signal.iter().map(|s| [*s; LANES]).collect()
+    }
+
+    fn ramp(n: usize) -> Vec<f32> {
+        (0..n).map(|i| (i as f32 / n as f32) * 4.0 - 2.0).collect()
+    }
+
+    /// REFERENCE. Every lane of the shaper is BIT-IDENTICAL to the
+    /// scalar curve, in every mode.
+    #[test]
+    fn every_shaper_lane_is_bit_identical_to_the_scalar_curve() {
+        let signal = ramp(1_024);
+        for mode in [
+            Mode::HardClip,
+            Mode::SoftClip,
+            Mode::Cubic,
+            Mode::Fold,
+            Mode::Crush,
+        ] {
+            for drive in [1.0f32, 4.0, 32.0] {
+                let mut ws = Waveshaper::new();
+                ws.configure(mode, drive, 0.2, 0.8);
+
+                let mut want = signal.clone();
+                ws.process(&mut want);
+
+                let mut got = spread(&signal);
+                ws.process_lanes(&mut got);
+
+                for lane in 0..LANES {
+                    assert_eq!(
+                        lane_column(&got, lane),
+                        want,
+                        "{mode:?} drive {drive} lane {lane}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// REFERENCE. The lane oversampler's round trip is bit-identical to
+    /// the scalar one, so its measured transparency and latency carry
+    /// over unchanged.
+    #[test]
+    fn the_lane_oversampler_matches_the_scalar_round_trip() {
+        const N: usize = 512;
+        let signal = ramp(N);
+
+        let mut sc = Oversampler2x::new();
+        let mut up = vec![0.0f32; Oversampler2x::scratch_len(N)];
+        let mut want = vec![0.0f32; N];
+        sc.up(&signal, &mut up);
+        sc.down(&up, &mut want);
+
+        let mut la = LaneOversampler2x::new();
+        let mut lane_up = vec![[0.0f32; LANES]; LaneOversampler2x::scratch_len(N)];
+        let mut got = vec![[0.0f32; LANES]; N];
+        la.up(&spread(&signal), &mut lane_up);
+        la.down(&lane_up, &mut got);
+
+        assert_eq!(la.latency(), sc.latency());
+        for lane in 0..LANES {
+            assert_eq!(lane_column(&got, lane), want, "oversampler lane {lane}");
+        }
+    }
+
+    /// LANE INDEPENDENCE. The mandatory sixth test, for the stateful half
+    /// — the oversampler's two delay rings.
+    #[test]
+    fn driving_one_oversampler_lane_leaves_the_others_silent() {
+        const N: usize = 256;
+        let signal = ramp(N);
+        let mut sc = Oversampler2x::new();
+        let mut up = vec![0.0f32; Oversampler2x::scratch_len(N)];
+        let mut want = vec![0.0f32; N];
+        sc.up(&signal, &mut up);
+        sc.down(&up, &mut want);
+
+        for lane in 0..LANES {
+            let input: Vec<LaneFrame> = signal
+                .iter()
+                .map(|s| {
+                    let mut f = [0.0f32; LANES];
+                    f[lane] = *s;
+                    f
+                })
+                .collect();
+            let mut la = LaneOversampler2x::new();
+            let mut scratch = vec![[0.0f32; LANES]; LaneOversampler2x::scratch_len(N)];
+            let mut got = vec![[0.0f32; LANES]; N];
+            la.up(&input, &mut scratch);
+            la.down(&scratch, &mut got);
+            for other in 0..LANES {
+                if other == lane {
+                    assert_eq!(lane_column(&got, other), want, "driven lane {lane}");
+                } else {
+                    assert!(
+                        lane_column(&got, other).iter().all(|s| *s == 0.0),
+                        "lane {other} rang while only {lane} was driven"
+                    );
+                }
+            }
+        }
+    }
+
+    /// SPLIT-BLOCK EQUIVALENCE, bit-exact, through the whole chain.
+    #[test]
+    fn lane_shaping_splits_bit_exactly() {
+        const N: usize = 256;
+        const CUT: usize = 100;
+        let signal = ramp(N);
+        let mut ws = Waveshaper::new();
+        ws.configure(Mode::SoftClip, 8.0, 0.0, 1.0);
+
+        let run = |cut: Option<usize>| {
+            let mut la = LaneOversampler2x::new();
+            let mut io = spread(&signal);
+            let mut scratch = vec![[0.0f32; LANES]; LaneOversampler2x::scratch_len(N)];
+            match cut {
+                None => {
+                    la.up(&io, &mut scratch);
+                    ws.process_lanes(&mut scratch);
+                    la.down(&scratch, &mut io);
+                }
+                Some(c) => {
+                    let (head, tail) = io.split_at_mut(c);
+                    let (s_head, s_tail) = scratch.split_at_mut(c * 2);
+                    la.up(head, s_head);
+                    ws.process_lanes(s_head);
+                    la.down(s_head, head);
+                    la.up(tail, s_tail);
+                    ws.process_lanes(s_tail);
+                    la.down(s_tail, tail);
+                }
+            }
+            io
+        };
+        assert_eq!(run(Some(CUT)), run(None));
+    }
+
+    /// NO-ALLOC on the process path.
+    #[test]
+    fn lane_shaping_does_not_allocate() {
+        let mut ws = Waveshaper::new();
+        ws.configure(Mode::SoftClip, 6.0, 0.1, 1.0);
+        let mut la = LaneOversampler2x::new();
+        let mut io = vec![[0.3f32; LANES]; 256];
+        let mut scratch = vec![[0.0f32; LANES]; LaneOversampler2x::scratch_len(256)];
+        assert_no_alloc::assert_no_alloc(|| {
+            la.up(&io, &mut scratch);
+            ws.process_lanes(&mut scratch);
+            la.down(&scratch, &mut io);
+        });
+    }
+
+    /// EDGE LENGTHS: 0, 1 and a non-power-of-two, and mismatched scratch
+    /// fails open rather than panicking.
+    #[test]
+    fn lane_shaping_takes_any_block_length() {
+        let ws = Waveshaper::new();
+        for n in [0usize, 1, 3, 97] {
+            let mut io = vec![[0.5f32; LANES]; n];
+            ws.process_lanes(&mut io);
+            assert_eq!(io.len(), n);
+
+            let mut la = LaneOversampler2x::new();
+            let mut scratch = vec![[0.0f32; LANES]; LaneOversampler2x::scratch_len(n)];
+            la.up(&io, &mut scratch);
+            la.down(&scratch, &mut io);
+        }
+        // Wrong-sized scratch writes nothing at all.
+        let mut la = LaneOversampler2x::new();
+        let io = vec![[1.0f32; LANES]; 16];
+        let mut wrong = vec![[7.0f32; LANES]; 5];
+        la.up(&io, &mut wrong);
+        assert!(wrong.iter().flatten().all(|s| *s == 7.0));
+    }
+
+    /// SILENCE IN, SILENCE OUT, and no invented NaN from a hard drive.
+    #[test]
+    fn lane_shaping_keeps_silence_silent_and_stays_finite() {
+        let mut ws = Waveshaper::new();
+        ws.configure(Mode::HardClip, DRIVE_MAX, 0.0, 1.0);
+        let mut quiet = vec![[0.0f32; LANES]; 256];
+        ws.process_lanes(&mut quiet);
+        assert!(quiet.iter().flatten().all(|s| *s == 0.0));
+
+        let mut la = LaneOversampler2x::new();
+        let mut scratch = vec![[0.0f32; LANES]; LaneOversampler2x::scratch_len(256)];
+        la.up(&quiet, &mut scratch);
+        la.down(&scratch, &mut quiet);
+        assert!(quiet.iter().flatten().all(|s| *s == 0.0));
+
+        // Extreme input must saturate, never go non-finite.
+        let mut hot = vec![[1e6f32; LANES]; 128];
+        ws.process_lanes(&mut hot);
+        for s in hot.iter().flatten() {
+            assert!(s.is_finite(), "hard drive produced {s}");
+        }
     }
 }

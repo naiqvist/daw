@@ -56,6 +56,8 @@
 //! not time, which is why the arena is laid out the way it is. Scalar
 //! first, per the contract; wide variants follow profiling.
 
+use crate::dsp::{LANES, LaneFrame};
+
 /// The lowest cutoff a filter will accept, in Hz.
 const MIN_HZ: f32 = 1.0;
 /// How close to Nyquist a cutoff may sit, as a fraction of the sample
@@ -159,11 +161,24 @@ impl OnePole {
         }
     }
 
+    /// Red zone: ONE sample of highpass — what the lowpass did not pass.
+    ///
+    /// Per sample as well as per block, for the reason
+    /// [`RmsDetector::tick`] gives: a FEEDBACK compressor's sidechain
+    /// filter sits inside a loop that reads the compressor's own output,
+    /// so it has to be advanced one sample at a time and a block-only
+    /// door would force the topology to be feedforward.
+    ///
+    /// [`RmsDetector::tick`]: crate::dsp::dynamics::RmsDetector::tick
+    #[inline(always)]
+    pub fn tick_highpass(&mut self, x: f32) -> f32 {
+        x - self.tick(x)
+    }
+
     /// Red zone: highpass, in place, any length.
     pub fn process_highpass(&mut self, io: &mut [f32]) {
         for s in io.iter_mut() {
-            let x = *s;
-            *s = x - self.tick(x);
+            *s = self.tick_highpass(*s);
         }
     }
 }
@@ -322,6 +337,220 @@ impl Svf {
             Mode::Allpass => self.run(io, |_, lp, bp, hp| lp + hp - k * bp),
         }
     }
+}
+
+// --------------------------------------------------------------- eq band ---
+
+/// Which gain-bearing shape an [`EqBand`] takes.
+///
+/// The three an equaliser needs and [`Svf`] cannot make: its outputs are
+/// all unity-gain, and a bell or a shelf is defined by the gain it
+/// applies. Cuts and notches are NOT here — a cut is [`Cascade`] and a
+/// notch is [`Svf::process`] with [`Mode::Notch`], both already unity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BandShape {
+    /// A symmetric boost or cut around the centre frequency.
+    Bell,
+    /// Everything below the corner lifted or dropped, flat above.
+    LowShelf,
+    /// Everything above the corner lifted or dropped, flat below.
+    HighShelf,
+}
+
+/// One peaking or shelving equaliser section — the same trapezoidal
+/// structure as [`Svf`], with the output mix that carries gain.
+///
+/// The structure is identical; what differs is that `k` absorbs the gain
+/// for a bell, `g` absorbs it for a shelf, and the output is a weighted
+/// sum of the input and two integrator outputs rather than a bare pick.
+/// That is the whole trick: `m0·v0 + m1·bandpass + m2·lowpass` spans
+/// every second-order response there is, gain included.
+///
+/// Everything [`Svf`]'s header says about topology-preserving transforms
+/// applies here and is the reason an EQ band built this way survives a
+/// swept frequency. A direct-form biquad at 30 Hz in single precision is
+/// exactly the case that goes wrong.
+///
+/// State: 8 bytes (two integrators) + 32 bytes of coefficients.
+/// Per-sample cost: 5 mul + 6 add for the core, plus 2 mul + 2 add for
+/// the output mix.
+/// Denormal-safe: relies on engine FTZ — integrator charge decays through
+/// the denormal range on a fading tail. Never invents NaN from finite
+/// input and settings.
+/// In-place safe: yes.
+/// Latency: 0 samples.
+#[derive(Debug, Clone, Copy)]
+pub struct EqBand {
+    ic1: f32,
+    ic2: f32,
+    a1: f32,
+    a2: f32,
+    a3: f32,
+    /// The prewarped integrator gain, and `1/Q` after the shape has had
+    /// its say. Kept rather than folded away because [`EqBand::coeffs`]
+    /// needs them to state this section's transfer function, and a
+    /// display deriving the curve from anything else would be a second
+    /// opinion about what the filter does.
+    g: f32,
+    k: f32,
+    m0: f32,
+    m1: f32,
+    m2: f32,
+}
+
+impl Default for EqBand {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EqBand {
+    pub fn new() -> Self {
+        let mut band = Self {
+            ic1: 0.0,
+            ic2: 0.0,
+            a1: 0.0,
+            a2: 0.0,
+            a3: 0.0,
+            g: 0.0,
+            k: 0.0,
+            m0: 1.0,
+            m1: 0.0,
+            m2: 0.0,
+        };
+        // A band that has never been prepared passes signal, for the
+        // reason `Svf::new` gives: an unprepared kernel in a chain is a
+        // bug, and silence hides it while a wire does not.
+        band.prepare(
+            48_000.0,
+            1_000.0,
+            core::f32::consts::FRAC_1_SQRT_2,
+            0.0,
+            BandShape::Bell,
+        );
+        band
+    }
+
+    /// Green zone: sample rate, centre or corner, Q, and the gain in dB.
+    ///
+    /// `gain_db` is the full boost or cut the band applies — +6 means the
+    /// bell peaks at +6 dB and the shelf settles at +6 dB. The internal
+    /// `A` is its SQUARE ROOT in linear terms, which is the convention
+    /// every cookbook uses and the one that makes a bell's skirt and a
+    /// shelf's midpoint land where a musician expects.
+    pub fn prepare(&mut self, sample_rate: f32, hz: f32, q: f32, gain_db: f32, shape: BandShape) {
+        let db = if gain_db.is_finite() { gain_db } else { 0.0 };
+        // `A` is the HALF-gain: the linear gain is `A²`.
+        let a = powf10(db / 40.0);
+        let q = if q.is_finite() { q.max(MIN_Q) } else { MIN_Q };
+        let base = prewarp(sample_rate, hz);
+        // The square root that turns a bell's structure into a shelf's:
+        // moving the corner by `sqrt(A)` is what makes the transition
+        // symmetric about the half-gain point instead of hanging off one
+        // end of it.
+        let root = a.max(f32::MIN_POSITIVE).sqrt();
+        let (g, k, m0, m1, m2) = match shape {
+            // The gain rides the DAMPING: a bell is the input with its
+            // own bandpass added back, and how much is added is what the
+            // boost is.
+            BandShape::Bell => {
+                let k = 1.0 / (q * a.max(f32::MIN_POSITIVE));
+                (base, k, 1.0, k * (a * a - 1.0), 0.0)
+            }
+            BandShape::LowShelf => {
+                let k = 1.0 / q;
+                (base / root, k, 1.0, k * (a - 1.0), a * a - 1.0)
+            }
+            BandShape::HighShelf => {
+                let k = 1.0 / q;
+                (base * root, k, a * a, k * (1.0 - a) * a, 1.0 - a * a)
+            }
+        };
+        self.g = if g.is_finite() { g.max(0.0) } else { 0.0 };
+        self.k = if k.is_finite() {
+            k.clamp(0.0, 1.0 / MIN_Q)
+        } else {
+            1.0
+        };
+        self.m0 = finite(m0, 1.0);
+        self.m1 = finite(m1, 0.0);
+        self.m2 = finite(m2, 0.0);
+        let g = self.g;
+        let denom = 1.0 + g * (g + self.k);
+        let a1 = if denom.abs() > f32::MIN_POSITIVE {
+            1.0 / denom
+        } else {
+            0.0
+        };
+        self.a1 = a1;
+        self.a2 = g * a1;
+        self.a3 = g * self.a2;
+    }
+
+    /// Green zone: zero the integrators, keep the coefficients.
+    pub fn reset(&mut self) {
+        self.ic1 = 0.0;
+        self.ic2 = 0.0;
+    }
+
+    /// Latency: none. Stated because the contract requires every kernel
+    /// to answer, and because plugin delay compensation reads it.
+    pub fn latency(&self) -> usize {
+        0
+    }
+
+    /// This section as a normalised biquad: `[b0, b1, b2, a1, a2]`, with
+    /// `a0` divided out.
+    ///
+    /// Green zone, and the reason a curve on screen cannot disagree with
+    /// the audio: it is derived from the coefficients this instance is
+    /// ACTUALLY running, by the bilinear substitution the trapezoidal
+    /// integrators already are — not from a parallel analogue formula
+    /// that happens to be nearby.
+    ///
+    /// Substituting `s -> (1/g)·(1-z⁻¹)/(1+z⁻¹)` into the section gives
+    /// the denominator `(1+kg+g²) + (2g²-2)z⁻¹ + (1-kg+g²)z⁻²`, with the
+    /// bandpass contributing `g(1-z⁻²)` and the lowpass `g²(1+z⁻¹)²`.
+    pub fn coeffs(&self) -> [f32; 5] {
+        let (g, k) = (self.g, self.k);
+        let gg = g * g;
+        let a0 = 1.0 + k * g + gg;
+        let a1 = 2.0 * gg - 2.0;
+        let a2 = 1.0 - k * g + gg;
+        let b0 = self.m0 * a0 + self.m1 * g + self.m2 * gg;
+        let b1 = self.m0 * a1 + 2.0 * self.m2 * gg;
+        let b2 = self.m0 * a2 - self.m1 * g + self.m2 * gg;
+        if a0.abs() <= f32::MIN_POSITIVE {
+            return [1.0, 0.0, 0.0, 0.0, 0.0];
+        }
+        let n = 1.0 / a0;
+        [b0 * n, b1 * n, b2 * n, a1 * n, a2 * n]
+    }
+
+    /// Red zone: filter in place, any length.
+    pub fn process(&mut self, io: &mut [f32]) {
+        for s in io.iter_mut() {
+            let v0 = *s;
+            let v3 = v0 - self.ic2;
+            let v1 = self.a1 * self.ic1 + self.a2 * v3;
+            let v2 = self.ic2 + self.a2 * self.ic1 + self.a3 * v3;
+            self.ic1 = 2.0 * v1 - self.ic1;
+            self.ic2 = 2.0 * v2 - self.ic2;
+            *s = self.m0 * v0 + self.m1 * v1 + self.m2 * v2;
+        }
+    }
+}
+
+/// `10^x` without `f32::powf`'s generality — one `exp2`, and finite for
+/// every input a decibel figure can be.
+fn powf10(x: f32) -> f32 {
+    let y = (x * core::f32::consts::LOG2_10).exp2();
+    if y.is_finite() { y.max(0.0) } else { 1.0 }
+}
+
+/// `v`, or `fallback` when the arithmetic went somewhere it should not.
+fn finite(v: f32, fallback: f32) -> f32 {
+    if v.is_finite() { v } else { fallback }
 }
 
 // ------------------------------------------------------------ DC blocker ---
@@ -567,6 +796,139 @@ impl Cascade {
     }
 }
 
+// ------------------------------------------------------------ disperser ---
+
+/// The most allpass sections a disperser will run.
+///
+/// Thirty-two second-order sections is 64 poles of phase — well past the
+/// point where the smear becomes a distinct pitched "pew" rather than a
+/// softened transient, which is what the control is for. Bounded because
+/// the contract requires every loop's count to come from a slice length
+/// or a compile-time constant, and because a fixed array is what keeps
+/// this allocation-free.
+pub const DISPERSER_MAX_STAGES: usize = 32;
+
+/// A chain of second-order allpasses: flat magnitude, enormous phase.
+///
+/// Every section passes every frequency at unity gain and does nothing
+/// but delay it — by an amount that depends on frequency. Stack enough of
+/// them and a transient stops arriving all at once: the highs come
+/// through first and the lows trail, so a click turns into a descending
+/// chirp. On a kick that is the "pew", and tuning it to a harmonic of the
+/// note is what stops it sounding like a separate laser effect glued to
+/// the front of a drum.
+///
+/// WIRING, NOT NEW ARITHMETIC. Each section is an [`Svf`] in
+/// [`Mode::Allpass`], which is already the tested workhorse; this type
+/// owns how many there are, how they are tuned, and nothing else. That is
+/// the kernel contract's whole thesis — a new effect should be a new
+/// arrangement of loops that already exist.
+///
+/// `q` sets how tightly the phase turns around the corner. Low Q spreads
+/// the group delay over octaves and reads as a soft smear; high Q packs
+/// it into a narrow band and reads as a ringing pitch. Neither changes
+/// the magnitude response, which stays flat to within float error at
+/// every setting — that is what makes this safe to put across a drum.
+///
+/// State: 32 × 40 bytes. No allocation: the sections are a fixed array
+/// and `count` selects how many run.
+/// Per-sample cost: `count` × the SVF cost — 8 sections is about
+/// 40 multiplies and 48 adds.
+/// Denormal-safe: inherits [`Svf`]'s; the integrators decay through the
+/// denormal range on a fading tail and rely on engine FTZ.
+/// In-place safe: yes.
+/// Latency: 0 samples. The delay is dispersive, not a fixed offset, so
+/// there is nothing for compensation to subtract — an impulse's ENERGY
+/// spreads later in time but its onset does not move.
+#[derive(Debug, Clone, Copy)]
+pub struct Disperser {
+    sections: [Svf; DISPERSER_MAX_STAGES],
+    count: usize,
+}
+
+impl Default for Disperser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Disperser {
+    pub fn new() -> Self {
+        Self {
+            sections: [Svf::new(); DISPERSER_MAX_STAGES],
+            count: 0,
+        }
+    }
+
+    /// Tune every running section to the same corner.
+    ///
+    /// `stages` is clamped rather than refused, the way [`Cascade`] treats
+    /// its order: a caller asking for more smear than exists wants the
+    /// most available, not silence. Zero stages is legal and is a wire.
+    ///
+    /// Every section shares one corner and one Q on purpose. Staggering
+    /// them would widen the affected band, which sounds like a filter
+    /// sweep; stacking them at one frequency multiplies the phase turn at
+    /// that frequency, which is the effect being asked for.
+    ///
+    /// ONE TRANSCENDENTAL, whatever the stage count. The sections are
+    /// identical by construction, so the coefficients are computed once
+    /// and copied — thirty-two `tan` calls for one corner would be
+    /// thirty-one of them computing a number that is already known. That
+    /// is what makes this cheap enough to re-tune from the audio thread
+    /// when a knob moves or a note arrives, which is the same thing the
+    /// Filter node already does with its cascade.
+    ///
+    /// The STATE is deliberately left alone: only the coefficients are
+    /// copied. Clearing the integrators on a re-tune would click on every
+    /// note of a tuned disperser, which is exactly the case this exists
+    /// for.
+    pub fn prepare(&mut self, sample_rate: f32, hz: f32, q: f32, stages: u32) {
+        self.count = (stages as usize).min(DISPERSER_MAX_STAGES);
+        let q = if q.is_finite() { q.max(MIN_Q) } else { MIN_Q };
+        let mut tuned = Svf::new();
+        tuned.prepare(sample_rate, hz, q);
+        for section in self.sections.iter_mut().take(self.count) {
+            section.k = tuned.k;
+            section.a1 = tuned.a1;
+            section.a2 = tuned.a2;
+            section.a3 = tuned.a3;
+        }
+    }
+
+    /// Green zone: zero every section's state, keep the tuning.
+    pub fn reset(&mut self) {
+        for section in self.sections.iter_mut() {
+            section.reset();
+        }
+    }
+
+    /// How many sections are running.
+    pub fn stages(&self) -> usize {
+        self.count
+    }
+
+    /// Latency: none, and this one is worth stating plainly because the
+    /// effect IS a delay. It is a FREQUENCY-DEPENDENT delay with no
+    /// common offset to remove, so plugin delay compensation has nothing
+    /// to compensate.
+    pub fn latency(&self) -> usize {
+        0
+    }
+
+    /// Red zone: run the chain in place, any length.
+    ///
+    /// Section by section over the whole block rather than all sections
+    /// per sample — the same choice [`Cascade`] makes, and for the same
+    /// reason: one section's coefficients and state stay in registers for
+    /// a block instead of thirty-two sets being reloaded every sample.
+    pub fn process(&mut self, io: &mut [f32]) {
+        for section in self.sections.iter_mut().take(self.count) {
+            section.process(io, Mode::Allpass);
+        }
+    }
+}
+
 // ----------------------------------------------------------------- tilt ---
 
 /// Tilt filter: a see-saw around a pivot — highs up and lows down by the
@@ -653,6 +1015,381 @@ impl Tilt {
             let x = *s;
             let lp = self.pole.tick(x);
             *s = g_hi * x + g_delta * lp;
+        }
+    }
+}
+
+// ------------------------------------------------------------- lanes ---
+
+/// [`OnePole`] for a whole voice group. Coefficient shared, state per lane.
+///
+/// State: 32 bytes + 4. Per-sample-per-lane cost: the scalar's.
+/// Denormal-safe: relies on engine FTZ. In-place safe: yes. Latency: 0.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LaneOnePole {
+    z: [f32; LANES],
+    coeff: [f32; LANES],
+}
+
+impl LaneOnePole {
+    pub fn new() -> Self {
+        let mut p = Self {
+            z: [0.0; LANES],
+            coeff: [0.0; LANES],
+        };
+        p.prepare(48_000.0, 20_000.0);
+        p
+    }
+
+    /// Green zone. The coefficient is taken from a prepared SCALAR
+    /// [`OnePole`] rather than recomputed, so the two kernels cannot
+    /// drift apart in their tuning — there is only one prewarp in the
+    /// file, and this is not a second copy of it.
+    pub fn prepare(&mut self, sample_rate: f32, cutoff_hz: f32) {
+        self.prepare_lanes(sample_rate, &[cutoff_hz; LANES]);
+    }
+
+    /// Green zone: a DIFFERENT corner per lane — what keytrack and a
+    /// per-voice filter envelope need.
+    ///
+    /// One scalar `OnePole::prepare` per lane, and its coefficient copied
+    /// across. Eight prewarps rather than one, which at control-chunk
+    /// rate is a rounding error against the per-sample cost, and it keeps
+    /// the promise that there is exactly one prewarp in this file.
+    pub fn prepare_lanes(&mut self, sample_rate: f32, cutoff_hz: &[f32; LANES]) {
+        for (dst, hz) in self.coeff.iter_mut().zip(cutoff_hz.iter()) {
+            let mut p = OnePole::new();
+            p.prepare(sample_rate, *hz);
+            *dst = p.coeff;
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.z = [0.0; LANES];
+    }
+
+    pub fn reset_lane(&mut self, lane: usize) {
+        if let Some(z) = self.z.get_mut(lane) {
+            *z = 0.0;
+        }
+    }
+
+    /// Red zone: lowpass in place, any length.
+    pub fn process_lowpass(&mut self, io: &mut [LaneFrame]) {
+        let coeff = self.coeff;
+        for frame in io.iter_mut() {
+            for ((s, z), c) in frame.iter_mut().zip(self.z.iter_mut()).zip(coeff.iter()) {
+                let v = (*s - *z) * *c;
+                let lp = v + *z;
+                *z = lp + v;
+                *s = lp;
+            }
+        }
+    }
+
+    /// Red zone: highpass in place, any length.
+    pub fn process_highpass(&mut self, io: &mut [LaneFrame]) {
+        let coeff = self.coeff;
+        for frame in io.iter_mut() {
+            for ((s, z), c) in frame.iter_mut().zip(self.z.iter_mut()).zip(coeff.iter()) {
+                let x = *s;
+                let v = (x - *z) * *c;
+                let lp = v + *z;
+                *z = lp + v;
+                *s = x - lp;
+            }
+        }
+    }
+}
+
+/// [`Svf`] for a whole voice group: coefficients shared, the two
+/// integrator states per lane.
+///
+/// This is the family that needs lanes most. A stateful filter cannot
+/// vectorize across TIME — sample n+1 depends on sample n — so voices are
+/// the only axis it has, and eight of them is one register's worth of
+/// integrator.
+///
+/// Per-lane CUTOFF is deliberately not here yet: keytrack and the filter
+/// envelope want it, and it turns the shared `a1/a2/a3` into three more
+/// lane arrays plus a per-lane prewarp. Shared coefficients first, and
+/// the node runs keytrack at 0 % until the per-lane variant lands. See
+/// `notes/20260825-poly-kernel-commission.md`.
+///
+/// State: 64 bytes + 16 of shape.
+/// Per-sample-per-lane cost: the scalar's — 4 mul + 6 add.
+/// Denormal-safe: relies on engine FTZ. In-place safe: yes. Latency: 0.
+#[derive(Debug, Clone, Copy)]
+pub struct LaneSvf {
+    ic1: [f32; LANES],
+    ic2: [f32; LANES],
+    k: [f32; LANES],
+    a1: [f32; LANES],
+    a2: [f32; LANES],
+    a3: [f32; LANES],
+}
+
+impl Default for LaneSvf {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LaneSvf {
+    pub fn new() -> Self {
+        let mut f = Self {
+            ic1: [0.0; LANES],
+            ic2: [0.0; LANES],
+            k: [0.0; LANES],
+            a1: [0.0; LANES],
+            a2: [0.0; LANES],
+            a3: [0.0; LANES],
+        };
+        f.prepare(48_000.0, 20_000.0, core::f32::consts::FRAC_1_SQRT_2);
+        f
+    }
+
+    /// Green zone: sample rate, cutoff and resonance — the scalar
+    /// [`Svf`]'s exact meaning, because the coefficients ARE the scalar
+    /// kernel's, copied from a prepared instance. One coefficient
+    /// derivation in this file, used twice.
+    pub fn prepare(&mut self, sample_rate: f32, cutoff_hz: f32, q: f32) {
+        let mut f = Svf::new();
+        f.prepare(sample_rate, cutoff_hz, q);
+        self.set_coeffs(&f);
+    }
+
+    /// Green zone: a DIFFERENT cutoff per lane.
+    ///
+    /// This is what a per-voice filter envelope and keytrack need: two
+    /// voices in the same group are at different points in their
+    /// envelopes and on different keys, so they cannot share a corner.
+    /// Resonance stays shared — it is a patch setting, not a per-voice
+    /// one.
+    pub fn prepare_lanes(&mut self, sample_rate: f32, cutoff_hz: &[f32; LANES], q: f32) {
+        for lane in 0..LANES {
+            let mut f = Svf::new();
+            f.prepare(sample_rate, cutoff_hz.get(lane).copied().unwrap_or(0.0), q);
+            self.set_lane_coeffs(lane, &f);
+        }
+    }
+
+    /// Adopt a prepared scalar filter's coefficients for EVERY lane,
+    /// leaving state alone.
+    fn set_coeffs(&mut self, from: &Svf) {
+        self.k = [from.k; LANES];
+        self.a1 = [from.a1; LANES];
+        self.a2 = [from.a2; LANES];
+        self.a3 = [from.a3; LANES];
+    }
+
+    /// Adopt a prepared scalar filter's coefficients for ONE lane.
+    fn set_lane_coeffs(&mut self, lane: usize, from: &Svf) {
+        if let (Some(k), Some(a1), Some(a2), Some(a3)) = (
+            self.k.get_mut(lane),
+            self.a1.get_mut(lane),
+            self.a2.get_mut(lane),
+            self.a3.get_mut(lane),
+        ) {
+            *k = from.k;
+            *a1 = from.a1;
+            *a2 = from.a2;
+            *a3 = from.a3;
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.ic1 = [0.0; LANES];
+        self.ic2 = [0.0; LANES];
+    }
+
+    /// Green zone: zero ONE lane's integrators — stealing a voice must
+    /// not drag the previous note's filter state into the new one.
+    pub fn reset_lane(&mut self, lane: usize) {
+        if let (Some(a), Some(b)) = (self.ic1.get_mut(lane), self.ic2.get_mut(lane)) {
+            *a = 0.0;
+            *b = 0.0;
+        }
+    }
+
+    /// Red zone: filter in place, any length. The mode is matched ONCE,
+    /// outside the loop, exactly as the scalar kernel does it.
+    pub fn process(&mut self, io: &mut [LaneFrame], mode: Mode) {
+        // `k` reaches the mixer as an argument rather than a capture,
+        // because it is per lane now.
+        match mode {
+            Mode::Lowpass => self.run(io, |_, lp, _, _, _| lp),
+            Mode::Highpass => self.run(io, |_, _, _, hp, _| hp),
+            Mode::Bandpass => self.run(io, |_, _, bp, _, _| bp),
+            Mode::BandpassUnity => self.run(io, |_, _, bp, _, k| k * bp),
+            Mode::Notch => self.run(io, |_, lp, _, hp, _| lp + hp),
+            Mode::Peak => self.run(io, |_, lp, _, hp, _| lp - hp),
+            Mode::Allpass => self.run(io, |_, lp, bp, hp, k| lp + hp - k * bp),
+        }
+    }
+
+    fn run(&mut self, io: &mut [LaneFrame], mix: impl Fn(f32, f32, f32, f32, f32) -> f32) {
+        let (k, a1, a2, a3) = (self.k, self.a1, self.a2, self.a3);
+        for frame in io.iter_mut() {
+            let lanes = frame
+                .iter_mut()
+                .zip(self.ic1.iter_mut())
+                .zip(self.ic2.iter_mut())
+                .zip(k.iter())
+                .zip(a1.iter())
+                .zip(a2.iter())
+                .zip(a3.iter());
+            for ((((((s, ic1), ic2), k), a1), a2), a3) in lanes {
+                let v0 = *s;
+                let v3 = v0 - *ic2;
+                let v1 = *a1 * *ic1 + *a2 * v3;
+                let v2 = *ic2 + *a2 * *ic1 + *a3 * v3;
+                *ic1 = 2.0 * v1 - *ic1;
+                *ic2 = 2.0 * v2 - *ic2;
+                let hp = v0 - *k * v1 - v2;
+                *s = mix(v0, v2, v1, hp, *k);
+            }
+        }
+    }
+}
+
+/// [`Cascade`] for a whole voice group: 6 to 48 dB per octave across
+/// [`LANES`] voices.
+///
+/// The SHAPE — how many biquads, whether a one-pole runs, the Butterworth
+/// Q per stage and where the resonance rides — is not restated here. It
+/// is taken from a prepared scalar [`Cascade`], so the two kernels agree
+/// on every stage by construction rather than by a test noticing later.
+///
+/// State: 4 × 80 bytes + 36.
+/// Per-sample-per-lane cost: the scalar's.
+/// Denormal-safe: inherits the stages'. In-place safe: yes. Latency: 0.
+#[derive(Debug, Clone, Copy)]
+pub struct LaneCascade {
+    stages: [LaneSvf; MAX_STAGES],
+    pole: LaneOnePole,
+    biquads: usize,
+    has_pole: bool,
+    highpass: bool,
+}
+
+impl Default for LaneCascade {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LaneCascade {
+    pub fn new() -> Self {
+        Self {
+            stages: [LaneSvf::new(); MAX_STAGES],
+            pole: LaneOnePole::new(),
+            biquads: 0,
+            has_pole: false,
+            highpass: false,
+        }
+    }
+
+    /// Green zone: configure the whole cascade. Same argument meaning and
+    /// same clamping as [`Cascade::prepare`], because it IS that function
+    /// — this only copies the result across.
+    pub fn prepare(
+        &mut self,
+        sample_rate: f32,
+        cutoff_hz: f32,
+        q: f32,
+        order: u32,
+        highpass: bool,
+    ) {
+        let mut c = Cascade::new();
+        c.prepare(sample_rate, cutoff_hz, q, order, highpass);
+        self.biquads = c.biquads;
+        self.has_pole = c.has_pole;
+        self.highpass = c.highpass;
+        for (dst, src) in self.stages.iter_mut().zip(c.stages.iter()) {
+            dst.set_coeffs(src);
+        }
+        self.pole.coeff = [c.pole.coeff; LANES];
+    }
+
+    /// Green zone: a DIFFERENT cutoff per lane, same shape for all.
+    ///
+    /// One scalar cascade prepared per lane, each lane taking its own
+    /// stage coefficients out of it. The SHAPE — stage count, Butterworth
+    /// Qs, where the resonance rides — is identical across lanes because
+    /// it comes from the same arguments; only the corner moves.
+    pub fn prepare_lanes(
+        &mut self,
+        sample_rate: f32,
+        cutoff_hz: &[f32; LANES],
+        q: f32,
+        order: u32,
+        highpass: bool,
+    ) {
+        for lane in 0..LANES {
+            let mut c = Cascade::new();
+            c.prepare(
+                sample_rate,
+                cutoff_hz.get(lane).copied().unwrap_or(0.0),
+                q,
+                order,
+                highpass,
+            );
+            self.biquads = c.biquads;
+            self.has_pole = c.has_pole;
+            self.highpass = c.highpass;
+            for (dst, src) in self.stages.iter_mut().zip(c.stages.iter()) {
+                dst.set_lane_coeffs(lane, src);
+            }
+            if let Some(co) = self.pole.coeff.get_mut(lane) {
+                *co = c.pole.coeff;
+            }
+        }
+    }
+
+    /// Green zone: zero every stage's state in every lane.
+    pub fn reset(&mut self) {
+        for stage in self.stages.iter_mut() {
+            stage.reset();
+        }
+        self.pole.reset();
+    }
+
+    /// Green zone: zero ONE lane through the whole cascade.
+    pub fn reset_lane(&mut self, lane: usize) {
+        for stage in self.stages.iter_mut() {
+            stage.reset_lane(lane);
+        }
+        self.pole.reset_lane(lane);
+    }
+
+    /// The advertised steepness, in dB per octave.
+    pub fn db_per_octave(&self) -> f32 {
+        (self.biquads * 2 + usize::from(self.has_pole)) as f32 * 6.0
+    }
+
+    /// Latency: none.
+    pub fn latency(&self) -> usize {
+        0
+    }
+
+    /// Red zone: run the cascade in place, any length. Stage-sweeps-block,
+    /// like the scalar kernel, for the same cache reason.
+    pub fn process(&mut self, io: &mut [LaneFrame]) {
+        let mode = if self.highpass {
+            Mode::Highpass
+        } else {
+            Mode::Lowpass
+        };
+        for stage in self.stages.iter_mut().take(self.biquads) {
+            stage.process(io, mode);
+        }
+        if self.has_pole {
+            if self.highpass {
+                self.pole.process_highpass(io);
+            } else {
+                self.pole.process_lowpass(io);
+            }
         }
     }
 }
@@ -1052,6 +1789,7 @@ mod tests {
                         cutoff_hz: corner,
                         q: FLAT_Q,
                         drive: 0.0,
+                        character: crate::params::filter::CHAR_CLEAN,
                     },
                     hz,
                     FS,
@@ -1203,6 +1941,306 @@ mod tests {
         });
     }
 
+    // ---------------------------------------------------------- disperser ---
+
+    /// A disperser's magnitude, measured after it has actually settled.
+    ///
+    /// The shared [`magnitude`] helper warms up for a fixed 8 192 samples,
+    /// which is plenty for one ordinary filter and nowhere near enough
+    /// here: an allpass section rings for roughly `2Q / 2πf` seconds, and
+    /// this kernel stacks up to thirty-two of them. Thirty-two sections
+    /// at Q 20 and 40 Hz need over five seconds to settle, and measuring
+    /// before then reads the transient as a dip — which looks exactly
+    /// like a kernel that is not flat.
+    ///
+    /// So the warm-up is DERIVED from the settings rather than fixed. The
+    /// kernel is flat; the measurement has to be long enough to see it.
+    ///
+    /// `2Q / 2πf` is the PEAK GROUP DELAY, not the ring-down — the tail
+    /// takes several of those to fall into the noise. Measured: at twelve
+    /// sections, Q 20 and the corner, one settle reads −1.12 dB, four
+    /// read −0.01 and sixteen read +0.01. Eight is the factor used here,
+    /// comfortably past where it converges.
+    const SETTLE_FACTOR: usize = 8;
+
+    fn disperser_magnitude(stages: u32, q: f32, hz: f32) -> f32 {
+        let settle = (stages as f32 * 2.0 * q / (core::f32::consts::TAU * hz) * FS) as usize;
+        let window = 8_192usize;
+        let n = settle.saturating_mul(SETTLE_FACTOR).max(window * 2) + window;
+        let mut buf: Vec<f32> = (0..n)
+            .map(|i| (i as f32 / FS * hz * core::f32::consts::TAU).sin())
+            .collect();
+        let mut d = Disperser::new();
+        d.prepare(FS, 200.0, q, stages);
+        d.process(&mut buf);
+        let tail = &buf[n - window..];
+        let rms = (tail.iter().map(|s| s * s).sum::<f32>() / tail.len() as f32).sqrt();
+        rms * core::f32::consts::SQRT_2
+    }
+
+    /// A DISPERSER MUST NOT BE AUDIBLE AS A FILTER.
+    ///
+    /// Flat magnitude is the whole licence for putting thirty-two
+    /// second-order sections across a drum. If any of them coloured the
+    /// level the effect would be a resonant sweep wearing a phase
+    /// effect's name — and it would be blamed on the drum, not on this.
+    #[test]
+    fn a_disperser_is_flat_at_every_setting() {
+        for stages in [1u32, 4, 12, 32] {
+            for q in [0.3f32, FLAT_Q, 4.0, 20.0] {
+                for hz in [40.0f32, 120.0, 200.0, 400.0, 2_000.0, 9_000.0] {
+                    let level = db(disperser_magnitude(stages, q, hz));
+                    assert!(
+                        level.abs() < 0.35,
+                        "{stages} stages, q {q}, {hz} Hz: {level:.3} dB — not flat"
+                    );
+                }
+            }
+        }
+        // Zero stages is a WIRE, bit for bit. A disperser turned all the
+        // way down must be indistinguishable from not being there.
+        let input: Vec<f32> = (0..128).map(|i| ((i as f32) * 0.37).sin()).collect();
+        let mut d = Disperser::new();
+        d.prepare(FS, 200.0, FLAT_Q, 0);
+        let mut buf = input.clone();
+        d.process(&mut buf);
+        assert!(
+            buf.iter()
+                .zip(&input)
+                .all(|(x, y)| x.to_bits() == y.to_bits()),
+            "no stages must be a bit-exact wire"
+        );
+        assert_eq!(d.stages(), 0);
+        assert_eq!(d.latency(), 0);
+    }
+
+    /// THE PHASE IS THE POINT, and it has to grow with the stage count —
+    /// otherwise the control does nothing and the flatness test above
+    /// would happily pass a chain that was silently bypassed.
+    ///
+    /// Measured as group delay: how much later the energy of an impulse
+    /// arrives, as a centre of mass. One section already smears; more
+    /// sections must smear strictly more.
+    #[test]
+    fn more_stages_disperse_more() {
+        let centroid = |stages: u32| {
+            let mut d = Disperser::new();
+            d.prepare(FS, 300.0, 2.0, stages);
+            let mut buf = vec![0.0f32; 4_096];
+            if let Some(first) = buf.first_mut() {
+                *first = 1.0;
+            }
+            d.process(&mut buf);
+            let energy: f64 = buf.iter().map(|s| f64::from(*s) * f64::from(*s)).sum();
+            if energy <= 0.0 {
+                return 0.0;
+            }
+            let weighted: f64 = buf
+                .iter()
+                .enumerate()
+                .map(|(i, s)| i as f64 * f64::from(*s) * f64::from(*s))
+                .sum();
+            weighted / energy
+        };
+        let none = centroid(0);
+        assert!(none < 0.5, "no stages: the impulse stays put ({none})");
+        let mut previous = none;
+        for stages in [1u32, 2, 4, 8, 16, 32] {
+            let now = centroid(stages);
+            assert!(
+                now > previous,
+                "{stages} stages smeared to {now:.1}, no further than {previous:.1}"
+            );
+            previous = now;
+        }
+        // And it is a real amount of smear, not a rounding difference.
+        assert!(
+            previous > 20.0,
+            "32 sections barely moved anything: {previous}"
+        );
+    }
+
+    /// An impulse's ONSET does not move, which is why `latency()` is zero.
+    /// The energy spreads later; nothing arrives earlier and nothing is
+    /// delayed by a fixed offset for compensation to remove.
+    #[test]
+    fn a_disperser_reports_no_latency_because_it_has_none() {
+        let mut d = Disperser::new();
+        d.prepare(FS, 300.0, 2.0, 16);
+        let mut buf = vec![0.0f32; 512];
+        if let Some(first) = buf.first_mut() {
+            *first = 1.0;
+        }
+        d.process(&mut buf);
+        assert_eq!(d.latency(), 0);
+        assert!(
+            buf.first().is_some_and(|s| s.abs() > 1e-6),
+            "the first sample is already non-zero: the onset did not move"
+        );
+    }
+
+    /// RE-TUNING MUST NOT CLICK, because a tuned disperser is re-tuned on
+    /// every note. Only the coefficients move; the integrators keep their
+    /// charge, so the output stays continuous across the change.
+    ///
+    /// Also the check that computing the coefficients once and copying
+    /// them really does give every section the same tuning — a copy that
+    /// missed a field would leave sections silently detuned, which sounds
+    /// like a wider effect rather than a bug.
+    #[test]
+    fn retuning_keeps_the_state_and_reaches_every_section() {
+        // Every section identical: preparing the chain and preparing one
+        // lone SVF the ordinary way must agree, bit for bit.
+        let input: Vec<f32> = (0..256).map(|i| ((i as f32) * 0.23).sin()).collect();
+        let mut chain = Disperser::new();
+        chain.prepare(FS, 450.0, 3.0, 3);
+        let mut chained = input.clone();
+        chain.process(&mut chained);
+
+        let mut manual = input.clone();
+        for _ in 0..3 {
+            let mut one = Svf::new();
+            one.prepare(FS, 450.0, 3.0);
+            one.process(&mut manual, Mode::Allpass);
+        }
+        assert!(
+            chained
+                .iter()
+                .zip(&manual)
+                .all(|(x, y)| x.to_bits() == y.to_bits()),
+            "the copied coefficients differ from a plainly prepared section"
+        );
+
+        // Re-tuning mid-signal leaves no discontinuity: the sample after
+        // the change is close to the one before it, where a state reset
+        // would jump.
+        let mut d = Disperser::new();
+        d.prepare(FS, 200.0, 4.0, 8);
+        let mut warm: Vec<f32> = (0..1_024)
+            .map(|i| ((i as f32) * 0.05).sin() * 0.5)
+            .collect();
+        d.process(&mut warm);
+        let last = warm.last().copied().unwrap_or(0.0);
+        d.prepare(FS, 260.0, 4.0, 8);
+        let mut next: Vec<f32> = (1_024..1_040)
+            .map(|i| ((i as f32) * 0.05).sin() * 0.5)
+            .collect();
+        d.process(&mut next);
+        let first = next.first().copied().unwrap_or(0.0);
+        assert!(
+            (first - last).abs() < 0.25,
+            "re-tune jumped from {last:.4} to {first:.4} — the state was cleared"
+        );
+    }
+
+    /// The contract's remaining four, on one kernel.
+    #[test]
+    fn a_disperser_survives_split_blocks_edges_and_nonsense() {
+        let input: Vec<f32> = (0..256).map(|i| ((i as f32) * 0.11).sin()).collect();
+
+        // Split-block equivalence, bit for bit.
+        for stages in [1u32, 5, 32] {
+            let mut a = Disperser::new();
+            a.prepare(FS, 640.0, 1.7, stages);
+            let mut whole = input.clone();
+            a.process(&mut whole);
+
+            let mut b = Disperser::new();
+            b.prepare(FS, 640.0, 1.7, stages);
+            let mut split = input.clone();
+            b.process(&mut split[..100]);
+            b.process(&mut split[100..]);
+            assert!(
+                whole
+                    .iter()
+                    .zip(&split)
+                    .all(|(x, y)| x.to_bits() == y.to_bits()),
+                "{stages} stages: 256 must equal 100 + 156"
+            );
+        }
+
+        // Edge lengths, including zero and a non-power-of-two.
+        for len in [0usize, 1, 3, 63] {
+            let mut d = Disperser::new();
+            d.prepare(FS, 300.0, 2.0, 8);
+            let mut buf = vec![0.25f32; len];
+            d.process(&mut buf);
+            assert!(buf.iter().all(|s| s.is_finite()), "len {len}");
+        }
+
+        // Silence in, silence out.
+        let mut d = Disperser::new();
+        d.prepare(FS, 300.0, 2.0, 8);
+        let mut silent = vec![0.0f32; 128];
+        d.process(&mut silent);
+        assert!(silent.iter().all(|s| *s == 0.0), "silence in, silence out");
+
+        // A decaying tail stays finite and lands on exact zero rather
+        // than grinding through denormals forever.
+        let mut d = Disperser::new();
+        d.prepare(FS, 120.0, 6.0, 32);
+        let mut tail: Vec<f32> = (0..2_048)
+            .map(|i| (-(i as f32) / 200.0).exp() * ((i as f32) * 0.2).sin())
+            .collect();
+        d.process(&mut tail);
+        assert!(
+            tail.iter().all(|s| s.is_finite()),
+            "the tail went non-finite"
+        );
+
+        // Nonsense settings are clamped, never propagated as NaN.
+        for (fs, hz, q, stages) in [
+            (FS, f32::NAN, 2.0, 8u32),
+            (FS, -100.0, 2.0, 8),
+            (FS, 300.0, f32::NAN, 8),
+            (FS, 300.0, 0.0, 8),
+            (FS, 300.0, 2.0, 9_999),
+            (FS, 1e9, 2.0, 8),
+            (0.0, 300.0, 2.0, 8),
+            (f32::NAN, 300.0, 2.0, 8),
+        ] {
+            let mut d = Disperser::new();
+            d.prepare(fs, hz, q, stages);
+            assert!(d.stages() <= DISPERSER_MAX_STAGES);
+            let mut buf = input.clone();
+            d.process(&mut buf);
+            assert!(
+                buf.iter().all(|s| s.is_finite()),
+                "fs {fs} hz {hz} q {q} stages {stages}"
+            );
+        }
+
+        // Reset clears the state without losing the tuning.
+        let mut d = Disperser::new();
+        d.prepare(FS, 300.0, 2.0, 8);
+        let mut warm = input.clone();
+        d.process(&mut warm);
+        d.reset();
+        let mut after = input.clone();
+        d.process(&mut after);
+        let mut fresh_kernel = Disperser::new();
+        fresh_kernel.prepare(FS, 300.0, 2.0, 8);
+        let mut fresh = input.clone();
+        fresh_kernel.process(&mut fresh);
+        assert!(
+            after
+                .iter()
+                .zip(&fresh)
+                .all(|(x, y)| x.to_bits() == y.to_bits()),
+            "reset must leave the kernel exactly as new"
+        );
+
+        // No allocation on the process path.
+        let mut d = Disperser::new();
+        d.prepare(FS, 300.0, 2.0, 32);
+        let mut buf = vec![0.1f32; 256];
+        assert_no_alloc::assert_no_alloc(|| {
+            for _ in 0..100 {
+                d.process(&mut buf);
+            }
+        });
+    }
+
     // ------------------------------------------- split-block equivalence ---
 
     #[test]
@@ -1227,6 +2265,25 @@ mod tests {
                     .zip(&split)
                     .all(|(x, y)| x.to_bits() == y.to_bits()),
                 "cascade order {order}: 256 must equal 100 + 156"
+            );
+        }
+        for shape in [BandShape::Bell, BandShape::LowShelf, BandShape::HighShelf] {
+            let mut a = EqBand::new();
+            a.prepare(FS, 700.0, 1.3, 8.0, shape);
+            let mut whole = input.clone();
+            a.process(&mut whole);
+
+            let mut b = EqBand::new();
+            b.prepare(FS, 700.0, 1.3, 8.0, shape);
+            let mut split = input.clone();
+            b.process(&mut split[..100]);
+            b.process(&mut split[100..]);
+            assert!(
+                whole
+                    .iter()
+                    .zip(&split)
+                    .all(|(x, y)| x.to_bits() == y.to_bits()),
+                "eq band {shape:?}: 256 must equal 100 + 156"
             );
         }
         {
@@ -1308,10 +2365,21 @@ mod tests {
         cascade.prepare(FS, 1_000.0, 2.0, 7, false);
         let mut dc = DcBlocker::new();
         dc.prepare(FS);
+        let mut bands = [EqBand::new(); 3];
+        for (band, shape) in
+            bands
+                .iter_mut()
+                .zip([BandShape::Bell, BandShape::LowShelf, BandShape::HighShelf])
+        {
+            band.prepare(FS, 1_000.0, 1.2, 6.0, shape);
+        }
         let mut buf = vec![0.1f32; 256];
 
         assert_no_alloc::assert_no_alloc(|| {
             for _ in 0..100 {
+                for band in bands.iter_mut() {
+                    band.process(&mut buf);
+                }
                 cascade.process(&mut buf);
                 dc.process(&mut buf);
                 pole.process_lowpass(&mut buf);
@@ -1344,6 +2412,8 @@ mod tests {
         cascade.prepare(FS, 1_000.0, 2.0, 5, true);
         let mut dc = DcBlocker::new();
         dc.prepare(FS);
+        let mut band = EqBand::new();
+        band.prepare(FS, 1_000.0, 1.5, -9.0, BandShape::Bell);
 
         for len in [0usize, 1, 3, 7, 63, 100] {
             let mut buf = vec![0.25f32; len];
@@ -1353,6 +2423,7 @@ mod tests {
             svf.process(&mut buf, Mode::Allpass);
             cascade.process(&mut buf);
             dc.process(&mut buf);
+            band.process(&mut buf);
             assert!(buf.iter().all(|s| s.is_finite()), "len {len}");
         }
     }
@@ -1408,6 +2479,175 @@ mod tests {
                     );
                     assert_eq!(c.latency(), 0);
                 }
+            }
+        }
+    }
+
+    // --------------------------------------------------------- eq band ---
+
+    /// The three numbers an equaliser band is bought for: a bell hits its
+    /// stated gain at its centre and is flat far from it, a low shelf
+    /// settles at that gain below the corner and unity above, and a high
+    /// shelf does the mirror image.
+    ///
+    /// Measured through the running filter, not restated from its
+    /// coefficients — the point is what the audio gets.
+    #[test]
+    fn an_eq_band_applies_the_gain_it_was_asked_for() {
+        let at = |shape: BandShape, gain_db: f32, q: f32, hz: f32| {
+            let mut band = EqBand::new();
+            band.prepare(FS, 1_000.0, q, gain_db, shape);
+            db(magnitude(&mut |b| band.process(b), hz))
+        };
+
+        for gain in [-12.0f32, -6.0, 6.0, 12.0] {
+            // A bell peaks at its centre, whatever the sign.
+            let peak = at(BandShape::Bell, gain, 2.0, 1_000.0);
+            assert!(
+                (peak - gain).abs() < 0.25,
+                "bell {gain:+} dB measured {peak:+.2} at its centre"
+            );
+            // ...and leaves the rest of the spectrum alone. Three octaves
+            // out at Q = 2 there is nothing left of it.
+            let away = at(BandShape::Bell, gain, 2.0, 125.0);
+            assert!(
+                away.abs() < 0.6,
+                "bell {gain:+} dB moved 125 Hz by {away:+.2}"
+            );
+
+            // A low shelf reaches the gain below and unity above.
+            let below = at(BandShape::LowShelf, gain, FLAT_Q, 40.0);
+            let above = at(BandShape::LowShelf, gain, FLAT_Q, 12_000.0);
+            assert!(
+                (below - gain).abs() < 0.3,
+                "low shelf {gain:+} dB settled at {below:+.2}"
+            );
+            assert!(
+                above.abs() < 0.5,
+                "low shelf must be flat above: {above:+.2}"
+            );
+
+            // And a high shelf is its mirror.
+            let above = at(BandShape::HighShelf, gain, FLAT_Q, 12_000.0);
+            let below = at(BandShape::HighShelf, gain, FLAT_Q, 40.0);
+            assert!(
+                (above - gain).abs() < 0.6,
+                "high shelf {gain:+} dB settled at {above:+.2}"
+            );
+            assert!(
+                below.abs() < 0.3,
+                "high shelf must be flat below: {below:+.2}"
+            );
+        }
+
+        // Zero gain is a wire, in every shape.
+        for shape in [BandShape::Bell, BandShape::LowShelf, BandShape::HighShelf] {
+            for hz in [50.0f32, 1_000.0, 9_000.0] {
+                let flat = at(shape, 0.0, 1.4, hz);
+                assert!(
+                    flat.abs() < 0.02,
+                    "{shape:?} at 0 dB moved {hz} Hz by {flat:+.3}"
+                );
+            }
+        }
+    }
+
+    /// The curve a display draws and the filter the audio hears are the
+    /// same object.
+    ///
+    /// [`EqBand::coeffs`] is what the EQ card evaluates to paint its
+    /// response, so it has to be this instance's own transfer function
+    /// rather than a nearby analogue formula. Measured against the
+    /// running filter at a spread of frequencies, for every shape.
+    #[test]
+    fn the_stated_transfer_function_is_the_one_that_runs() {
+        /// `|H(e^{jw})|` from a normalised biquad — the same evaluation a
+        /// response display does.
+        fn magnitude_of(c: [f32; 5], w: f32) -> f32 {
+            let (c1, s1) = (w.cos(), w.sin());
+            let (c2, s2) = ((2.0 * w).cos(), (2.0 * w).sin());
+            let num_re = c[0] + c[1] * c1 + c[2] * c2;
+            let num_im = -(c[1] * s1 + c[2] * s2);
+            let den_re = 1.0 + c[3] * c1 + c[4] * c2;
+            let den_im = -(c[3] * s1 + c[4] * s2);
+            let num = (num_re * num_re + num_im * num_im).sqrt();
+            let den = (den_re * den_re + den_im * den_im).sqrt();
+            if den <= f32::MIN_POSITIVE {
+                0.0
+            } else {
+                num / den
+            }
+        }
+
+        for shape in [BandShape::Bell, BandShape::LowShelf, BandShape::HighShelf] {
+            for (corner, q, gain) in [
+                (100.0f32, 0.7f32, 9.0f32),
+                (1_000.0, 2.5, -9.0),
+                (6_000.0, 1.0, 4.5),
+            ] {
+                let mut band = EqBand::new();
+                band.prepare(FS, corner, q, gain, shape);
+                let coeffs = band.coeffs();
+                for hz in [30.0f32, 120.0, 500.0, 1_000.0, 3_000.0, 9_000.0] {
+                    let mut run = EqBand::new();
+                    run.prepare(FS, corner, q, gain, shape);
+                    let measured = db(magnitude(&mut |b| run.process(b), hz));
+                    let stated = db(magnitude_of(coeffs, core::f32::consts::TAU * hz / FS));
+                    assert!(
+                        (measured - stated).abs() < 0.15,
+                        "{shape:?} {corner} Hz Q{q} {gain:+} dB at {hz} Hz: \
+                         the filter does {measured:+.2}, the curve says {stated:+.2}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Silence in, silence out, a tail that stays finite, and every silly
+    /// setting a caller can reach refused into something inert rather
+    /// than into a NaN that poisons the chain forever.
+    #[test]
+    fn an_eq_band_survives_silence_tails_and_nonsense() {
+        let mut band = EqBand::new();
+        band.prepare(FS, 200.0, 8.0, 18.0, BandShape::Bell);
+        let mut buf = vec![0.0f32; 512];
+        band.process(&mut buf);
+        assert!(buf.iter().all(|s| *s == 0.0), "silence in, silence out");
+
+        let mut tail = vec![0.0f32; 256];
+        tail[0] = 1.0;
+        band.process(&mut tail);
+        for _ in 0..2_000 {
+            let mut quiet = vec![0.0f32; 256];
+            band.process(&mut quiet);
+            assert!(
+                quiet.iter().all(|s| s.is_finite()),
+                "a decaying tail must stay finite"
+            );
+        }
+
+        let input: Vec<f32> = (0..64).map(|i| (i as f32 * 0.3).sin()).collect();
+        for shape in [BandShape::Bell, BandShape::LowShelf, BandShape::HighShelf] {
+            for (fs, hz, q, gain) in [
+                (FS, 0.0, FLAT_Q, 6.0),
+                (FS, 1e9, FLAT_Q, 6.0),
+                (0.0, 1_000.0, 1.0, 6.0),
+                (FS, 1_000.0, -1.0, 6.0),
+                (FS, 1_000.0, 0.0, 6.0),
+                (FS, 1_000.0, 1.0, f32::NAN),
+                (FS, 1_000.0, f32::NAN, 6.0),
+                (FS, f32::INFINITY, 1.0, -600.0),
+            ] {
+                let mut b = EqBand::new();
+                b.prepare(fs, hz, q, gain, shape);
+                let mut buf = input.clone();
+                b.process(&mut buf);
+                assert!(
+                    buf.iter().all(|s| s.is_finite()),
+                    "{shape:?} fs {fs} hz {hz} q {q} gain {gain}"
+                );
+                assert!(b.coeffs().iter().all(|c| c.is_finite()));
+                assert_eq!(b.latency(), 0);
             }
         }
     }
@@ -1489,5 +2729,346 @@ mod tests {
                 .zip(&copy)
                 .all(|(x, y)| x.to_bits() == y.to_bits())
         );
+    }
+    // --------------------------------------------------------- lanes ---
+
+    fn lane_column(frames: &[LaneFrame], lane: usize) -> Vec<f32> {
+        frames.iter().map(|f| f[lane]).collect()
+    }
+
+    fn spread(signal: &[f32]) -> Vec<LaneFrame> {
+        signal.iter().map(|s| [*s; LANES]).collect()
+    }
+
+    /// A short deterministic test signal: an impulse, then a chirp-ish
+    /// mix. Enough transient to excite the states and enough tail to
+    /// expose a stuck integrator.
+    fn probe(n: usize) -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                let t = i as f32 / 48_000.0;
+                let impulse = if i == 0 { 1.0 } else { 0.0 };
+                impulse
+                    + 0.3 * (core::f32::consts::TAU * 220.0 * t).sin()
+                    + 0.2 * (core::f32::consts::TAU * 3_500.0 * t).sin()
+            })
+            .collect()
+    }
+
+    /// REFERENCE. Every lane is BIT-IDENTICAL to the scalar filter, in
+    /// every mode, at several tunings.
+    ///
+    /// The scalar `Svf` is already tested against measured magnitude
+    /// responses, so bit-equality inherits the whole frequency-response
+    /// claim instead of re-measuring it through a second kernel.
+    #[test]
+    fn every_svf_lane_is_bit_identical_to_the_scalar_filter() {
+        const N: usize = 2_048;
+        let signal = probe(N);
+        for (hz, q) in [(200.0f32, 0.707f32), (1_000.0, 4.0), (12_000.0, 0.5)] {
+            for mode in [
+                Mode::Lowpass,
+                Mode::Highpass,
+                Mode::Bandpass,
+                Mode::BandpassUnity,
+                Mode::Notch,
+                Mode::Peak,
+                Mode::Allpass,
+            ] {
+                let mut want = signal.clone();
+                let mut sc = Svf::new();
+                sc.prepare(48_000.0, hz, q);
+                sc.process(&mut want, mode);
+
+                let mut got = spread(&signal);
+                let mut la = LaneSvf::new();
+                la.prepare(48_000.0, hz, q);
+                la.process(&mut got, mode);
+
+                for lane in 0..LANES {
+                    assert_eq!(
+                        lane_column(&got, lane),
+                        want,
+                        "svf lane {lane} {hz} {mode:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// REFERENCE. The same, for the cascade — every order, both
+    /// directions, so the odd-order one-pole and the resonant last stage
+    /// are both covered.
+    #[test]
+    fn every_cascade_lane_is_bit_identical_to_the_scalar_cascade() {
+        const N: usize = 2_048;
+        let signal = probe(N);
+        for order in 1..=8u32 {
+            for highpass in [false, true] {
+                let mut want = signal.clone();
+                let mut sc = Cascade::new();
+                sc.prepare(48_000.0, 800.0, 2.0, order, highpass);
+                sc.process(&mut want);
+
+                let mut got = spread(&signal);
+                let mut la = LaneCascade::new();
+                la.prepare(48_000.0, 800.0, 2.0, order, highpass);
+                la.process(&mut got);
+
+                assert_eq!(la.db_per_octave(), sc.db_per_octave(), "order {order}");
+                assert_eq!(la.latency(), sc.latency());
+                for lane in 0..LANES {
+                    assert_eq!(
+                        lane_column(&got, lane),
+                        want,
+                        "cascade lane {lane} order {order} hp={highpass}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// LANE INDEPENDENCE. The mandatory sixth test.
+    ///
+    /// Drive ONE lane, silence the rest: the others must be exactly 0.0
+    /// and the driven lane must equal the scalar result. Then move which
+    /// lane is driven and get the same signal in the new position.
+    ///
+    /// This is the test that catches the classic port bug — an
+    /// integrator left scalar, so every lane shares one state and eight
+    /// voices filter each other. Every other test in this file passes
+    /// happily while that is true, because they drive all lanes alike.
+    #[test]
+    fn driving_one_lane_leaves_the_others_silent() {
+        const N: usize = 1_024;
+        let signal = probe(N);
+        let mut want = signal.clone();
+        let mut sc = Svf::new();
+        sc.prepare(48_000.0, 900.0, 3.0);
+        sc.process(&mut want, Mode::Lowpass);
+
+        for lane in 0..LANES {
+            let mut io: Vec<LaneFrame> = signal
+                .iter()
+                .map(|s| {
+                    let mut f = [0.0f32; LANES];
+                    f[lane] = *s;
+                    f
+                })
+                .collect();
+            let mut la = LaneSvf::new();
+            la.prepare(48_000.0, 900.0, 3.0);
+            la.process(&mut io, Mode::Lowpass);
+            for other in 0..LANES {
+                if other == lane {
+                    assert_eq!(lane_column(&io, other), want, "driven lane {lane}");
+                } else {
+                    assert!(
+                        lane_column(&io, other).iter().all(|s| *s == 0.0),
+                        "lane {other} rang while only {lane} was driven"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Resetting one lane leaves the rest of the group filtering.
+    #[test]
+    fn resetting_one_lane_leaves_the_others_ringing() {
+        let signal = probe(512);
+        let mut io = spread(&signal);
+        let mut la = LaneCascade::new();
+        la.prepare(48_000.0, 700.0, 2.0, 4, false);
+        la.process(&mut io);
+
+        let mut cleared = la;
+        cleared.reset_lane(3);
+        let (mut a, mut b) = (spread(&signal), spread(&signal));
+        la.process(&mut a);
+        cleared.process(&mut b);
+        for lane in 0..LANES {
+            if lane == 3 {
+                assert_ne!(
+                    lane_column(&b, lane),
+                    lane_column(&a, lane),
+                    "lane 3 kept state"
+                );
+            } else {
+                assert_eq!(
+                    lane_column(&b, lane),
+                    lane_column(&a, lane),
+                    "lane {lane} hit"
+                );
+            }
+        }
+    }
+
+    /// SPLIT-BLOCK EQUIVALENCE, bit-exact.
+    #[test]
+    fn lane_filters_split_bit_exactly() {
+        const N: usize = 256;
+        const CUT: usize = 100;
+        let signal = probe(N);
+
+        let mut whole = spread(&signal);
+        let mut a = LaneSvf::new();
+        a.prepare(48_000.0, 1_000.0, 2.0);
+        a.process(&mut whole, Mode::Lowpass);
+
+        let mut split = spread(&signal);
+        let mut b = LaneSvf::new();
+        b.prepare(48_000.0, 1_000.0, 2.0);
+        let (head, tail) = split.split_at_mut(CUT);
+        b.process(head, Mode::Lowpass);
+        b.process(tail, Mode::Lowpass);
+        assert_eq!(split, whole, "svf");
+
+        let mut whole = spread(&signal);
+        let mut a = LaneCascade::new();
+        a.prepare(48_000.0, 1_000.0, 2.0, 5, false);
+        a.process(&mut whole);
+
+        let mut split = spread(&signal);
+        let mut b = LaneCascade::new();
+        b.prepare(48_000.0, 1_000.0, 2.0, 5, false);
+        let (head, tail) = split.split_at_mut(CUT);
+        b.process(head);
+        b.process(tail);
+        assert_eq!(split, whole, "cascade");
+    }
+
+    /// NO-ALLOC on the process path.
+    #[test]
+    fn lane_filters_do_not_allocate() {
+        let mut svf = LaneSvf::new();
+        svf.prepare(48_000.0, 1_000.0, 1.0);
+        let mut casc = LaneCascade::new();
+        casc.prepare(48_000.0, 1_000.0, 1.0, 4, false);
+        let mut pole = LaneOnePole::new();
+        pole.prepare(48_000.0, 1_000.0);
+        let mut buf = vec![[0.1f32; LANES]; 512];
+        assert_no_alloc::assert_no_alloc(|| {
+            svf.process(&mut buf, Mode::Lowpass);
+            casc.process(&mut buf);
+            pole.process_lowpass(&mut buf);
+            pole.process_highpass(&mut buf);
+        });
+    }
+
+    /// EDGE LENGTHS: 0, 1, and a non-power-of-two; a zero-length block
+    /// must not advance any state.
+    #[test]
+    fn lane_filters_take_any_block_length() {
+        for n in [0usize, 1, 3, 97] {
+            let mut svf = LaneSvf::new();
+            svf.prepare(48_000.0, 1_000.0, 1.0);
+            let mut buf = vec![[0.5f32; LANES]; n];
+            svf.process(&mut buf, Mode::Lowpass);
+            assert_eq!(buf.len(), n);
+
+            let mut casc = LaneCascade::new();
+            casc.prepare(48_000.0, 1_000.0, 1.0, 3, true);
+            let mut buf = vec![[0.5f32; LANES]; n];
+            casc.process(&mut buf);
+            assert_eq!(buf.len(), n);
+        }
+        let mut svf = LaneSvf::new();
+        svf.prepare(48_000.0, 1_000.0, 1.0);
+        let untouched = svf.ic1;
+        svf.process(&mut [], Mode::Lowpass);
+        assert_eq!(svf.ic1, untouched);
+    }
+
+    /// SILENCE IN, SILENCE OUT and a finite denormal tail: a decaying
+    /// input never becomes NaN and never rings forever.
+    #[test]
+    fn lane_filters_settle_to_silence() {
+        let mut casc = LaneCascade::new();
+        casc.prepare(48_000.0, 500.0, 6.0, 4, false);
+        // Excite hard, then feed pure silence for a long time.
+        let mut hit = vec![[1.0f32; LANES]; 64];
+        casc.process(&mut hit);
+        let mut tail = vec![[0.0f32; LANES]; 1 << 15];
+        casc.process(&mut tail);
+        for frame in &tail {
+            for s in frame {
+                assert!(s.is_finite(), "cascade tail went non-finite: {s}");
+            }
+        }
+        if let Some(last) = tail.last() {
+            for s in last {
+                assert!(s.abs() < 1e-6, "cascade still ringing at {s}");
+            }
+        }
+        // Silence into a freshly reset filter stays exactly silent.
+        casc.reset();
+        let mut quiet = vec![[0.0f32; LANES]; 256];
+        casc.process(&mut quiet);
+        assert!(quiet.iter().flatten().all(|s| *s == 0.0));
+    }
+    /// PER-LANE CUTOFF: each lane filters at its OWN corner, and each
+    /// matches the scalar filter tuned to that corner.
+    ///
+    /// This is what a per-voice filter envelope and keytrack ride on —
+    /// two voices in a group are at different points in their envelopes,
+    /// so a shared corner would make one voice's envelope audible on the
+    /// other's note.
+    #[test]
+    fn each_lane_filters_at_its_own_cutoff() {
+        const N: usize = 1_024;
+        let signal = probe(N);
+        let cutoffs: [f32; LANES] = [
+            80.0, 160.0, 320.0, 640.0, 1_280.0, 2_560.0, 5_120.0, 10_240.0,
+        ];
+
+        let mut svf = LaneSvf::new();
+        svf.prepare_lanes(48_000.0, &cutoffs, 2.0);
+        let mut got = spread(&signal);
+        svf.process(&mut got, Mode::Lowpass);
+        for (lane, hz) in cutoffs.iter().enumerate() {
+            let mut want = signal.clone();
+            let mut sc = Svf::new();
+            sc.prepare(48_000.0, *hz, 2.0);
+            sc.process(&mut want, Mode::Lowpass);
+            assert_eq!(lane_column(&got, lane), want, "svf lane {lane} at {hz} Hz");
+        }
+
+        let mut casc = LaneCascade::new();
+        casc.prepare_lanes(48_000.0, &cutoffs, 3.0, 4, false);
+        let mut got = spread(&signal);
+        casc.process(&mut got);
+        for (lane, hz) in cutoffs.iter().enumerate() {
+            let mut want = signal.clone();
+            let mut sc = Cascade::new();
+            sc.prepare(48_000.0, *hz, 3.0, 4, false);
+            sc.process(&mut want);
+            assert_eq!(
+                lane_column(&got, lane),
+                want,
+                "cascade lane {lane} at {hz} Hz"
+            );
+        }
+    }
+
+    /// An odd-order cascade uses its one-pole, and that must be per lane
+    /// too — the stage most likely to be left shared by a port.
+    #[test]
+    fn the_odd_order_pole_is_per_lane() {
+        const N: usize = 512;
+        let signal = probe(N);
+        let cutoffs: [f32; LANES] = [100.0, 300.0, 900.0, 2_700.0, 8_100.0, 200.0, 600.0, 1_800.0];
+        for order in [1u32, 3, 5, 7] {
+            let mut casc = LaneCascade::new();
+            casc.prepare_lanes(48_000.0, &cutoffs, 1.0, order, false);
+            let mut got = spread(&signal);
+            casc.process(&mut got);
+            for (lane, hz) in cutoffs.iter().enumerate() {
+                let mut want = signal.clone();
+                let mut sc = Cascade::new();
+                sc.prepare(48_000.0, *hz, 1.0, order, false);
+                sc.process(&mut want);
+                assert_eq!(lane_column(&got, lane), want, "order {order} lane {lane}");
+            }
+        }
     }
 }

@@ -331,6 +331,13 @@ pub struct WireSpec {
     /// final clamp.
     pub min: f32,
     pub max: f32,
+    /// Whether the parameter lives on a LOG scale (cutoff, times). A log
+    /// target takes its modulation in OCTAVES: depth 1.0 spans the whole
+    /// range as a RATIO, symmetric around the base. Applied linearly, a
+    /// bipolar source on a cutoff spends half its cycle pinned at the
+    /// 20 Hz floor — which the ear reports as the track being GATED, not
+    /// filtered. Equal travel must mean equal ratio on a ratio scale.
+    pub log: bool,
     /// The knob-or-automation value this wire rides on top of, at compile
     /// time. Letters for this parameter replace it live.
     pub base: f32,
@@ -413,6 +420,8 @@ struct PlanTarget {
     param: u32,
     min: f32,
     max: f32,
+    /// See [`WireSpec::log`]: sum in octaves, apply as a ratio.
+    log: bool,
     /// Set by `ParamChange` letters — modulation rides on top of it.
     base: f32,
     value: f32,
@@ -514,6 +523,10 @@ impl ModPlan {
                         param: wire.param,
                         min: wire.min,
                         max: wire.max,
+                        // Log needs a positive floor to be a ratio scale
+                        // at all; a table row that says otherwise falls
+                        // back to linear rather than to NaN.
+                        log: wire.log && wire.min > 0.0,
                         base,
                         value: base,
                         written: f32::NAN,
@@ -689,14 +702,30 @@ impl ModPlan {
             let Some(target) = self.targets.get_mut(wire.target) else {
                 continue;
             };
-            let span = target.max - target.min;
+            // A log target's span is its range in OCTAVES, so depth is a
+            // fraction of the range as a RATIO — the same meaning depth
+            // has on a linear span, moved to the scale the ear uses for
+            // this parameter.
+            let span = if target.log {
+                (target.max / target.min).log2()
+            } else {
+                target.max - target.min
+            };
             let output = wire_chain(wire.chain, source.value, span, wire.previous, dt, muted);
             wire.previous = Some(output);
             wire.output = output;
             target.value += output;
         }
         for target in &mut self.targets {
-            let value = target.base + target.value;
+            // Linear rides ON the base; log MULTIPLIES it — the sum of
+            // wire outputs is octaves, and `base × 2^octaves` is what
+            // "±2 octaves of wobble around the knob" means. Same clamp
+            // either way.
+            let value = if target.log {
+                target.base * target.value.exp2()
+            } else {
+                target.base + target.value
+            };
             // The last door before a node. A non-finite base (from a
             // letter carrying junk) would otherwise walk straight through
             // `clamp`, which returns NaN for NaN.
@@ -785,6 +814,7 @@ mod tests {
                 param: 0,
                 min: 0.0,
                 max: 2.0,
+                log: false,
                 base: 1.0,
                 chain: Chain {
                     depth,
@@ -1147,5 +1177,77 @@ mod tests {
         p.evaluate(f32::NAN, 0);
         let value = p.values().next().unwrap().2;
         assert!(value.is_finite(), "junk in must not put junk on a node");
+    }
+    /// THE gating fix, pinned. A bipolar LFO on a LOG target (a filter
+    /// cutoff) modulates in OCTAVES around the base: symmetric as a
+    /// RATIO, never slammed against the floor for half its cycle. The
+    /// same wire applied linearly spent half its time hard at 20 Hz —
+    /// which the ear reports as the track being gated, not filtered.
+    #[test]
+    fn a_log_target_wobbles_in_octaves_instead_of_gating() {
+        let cutoff_spec = |log: bool| ModSpec {
+            sources: vec![Modulator {
+                id: 1,
+                kind: lfo(ModShape::Sine, 4.0),
+            }],
+            wires: vec![WireSpec {
+                id: 10,
+                source: 1,
+                node: NodeId::from_bits(0x0000_0001_0000_0000).unwrap(),
+                param: 2,
+                min: 20.0,
+                max: 20_000.0,
+                log,
+                base: 1_000.0,
+                chain: Chain {
+                    depth: 0.3,
+                    curve: 0.0,
+                    steps: 0,
+                    smooth_ms: 0.0,
+                },
+                enabled: true,
+                solo: false,
+            }],
+        };
+
+        let sweep = |log: bool| -> Vec<f32> {
+            let mut plan = plan(&cutoff_spec(log));
+            (0..64)
+                .map(|i| {
+                    plan.evaluate(i as f32 / 16.0, 256);
+                    plan.values().next().map(|(_, _, v)| v).unwrap_or(0.0)
+                })
+                .collect()
+        };
+
+        // Linear at this depth digs 5,994 Hz below a 1 kHz base: pinned
+        // at the floor for a large slice of the cycle. That behaviour is
+        // WHY the flag exists — assert it so the contrast stays measured
+        // rather than remembered.
+        let linear = sweep(false);
+        let floored = linear.iter().filter(|v| **v <= 20.0 + 1e-3).count();
+        assert!(
+            floored > linear.len() / 5,
+            "linear no longer pins ({floored} floored) — update this story"
+        );
+
+        // Log never touches either wall at the same depth, and it is
+        // ratio-symmetric: the peak and the trough multiply back to the
+        // base squared.
+        let log_sweep = sweep(true);
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for v in &log_sweep {
+            lo = lo.min(*v);
+            hi = hi.max(*v);
+            assert!(*v > 20.0 && *v < 20_000.0, "log sweep hit a wall at {v}");
+        }
+        let sym = (lo * hi) / (1_000.0f32 * 1_000.0);
+        assert!(
+            (0.8..1.25).contains(&sym),
+            "octave wobble is not ratio-symmetric: lo {lo} hi {hi}"
+        );
+        // And the swing is real, not a flatline: ±30 % of ~10 octaves is
+        // about ±3 octaves.
+        assert!(hi / lo > 30.0, "swing {} too small", hi / lo);
     }
 }

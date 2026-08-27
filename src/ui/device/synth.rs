@@ -157,6 +157,28 @@ pub fn sine_synth_norm(param: u32, value: f32) -> f32 {
     }
 }
 
+/// An engine value in the card's own words — see `poly_format`.
+pub fn sine_synth_format(param: u32, value: f32) -> String {
+    let s = spec();
+    let p = match param {
+        ATTACK => &s.attack,
+        RELEASE => &s.release,
+        _ => &s.gain,
+    };
+    p.format(p.mapping.to_norm(value))
+}
+
+/// Whether a parameter lives on a LOG scale — see `poly_is_log`.
+pub fn sine_synth_is_log(param: u32) -> bool {
+    let s = spec();
+    let p = match param {
+        ATTACK => &s.attack,
+        RELEASE => &s.release,
+        _ => &s.gain,
+    };
+    matches!(p.mapping, crate::ui::device::Mapping::Log { .. })
+}
+
 /// Every parameter of `state` as an edit, whether or not it just changed.
 /// What a caller needs after setting the knobs itself — a reset, a preset
 /// recall, a project load — since the card only emits on user movement.

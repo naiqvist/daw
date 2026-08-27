@@ -58,6 +58,10 @@ pub enum UiAction {
     ExtendCell(i32),
     /// Remove the selected clip. The mouse selects, this disposes.
     DeleteSelected,
+    /// Create a one-bar MIDI clip at the keyboard cursor, or on the active
+    /// track at the transport playhead when there is no keyboard cursor.
+    /// Ableton's Ctrl+M.
+    CreateClip,
     /// The clipboard verbs. Copy stashes the selected clip; paste places it
     /// at the cursor (or selection, or playhead); duplicate places a copy
     /// directly after the original — Ableton's Ctrl+D.
@@ -135,6 +139,18 @@ pub enum UiAction {
     // --- view: the app's own furniture, no engine involved ---
     /// Show/hide a registered panel, by its `Panel::id()`.
     TogglePanel(&'static str),
+    /// Show/hide the BROWSER — a frame region, not a registered panel.
+    ToggleBrowser,
+    /// Show/hide the LOWER REGION: the device rack, or whichever clip
+    /// editor is showing there. One verb, because it is one slot — what
+    /// it happens to contain is not what you are hiding.
+    ToggleLower,
+    /// Hide every frame region at once, or bring them all back.
+    ///
+    /// The one that earns a key: getting the chrome out of the way to
+    /// look at the timeline is a thing you do constantly, and doing it
+    /// with two gestures is doing it with one too many.
+    ToggleChrome,
     /// Bring a center-dock panel to the front of its tab strip.
     FocusPanel(&'static str),
     SetDensity(Density),
@@ -164,6 +180,7 @@ impl UiAction {
             Self::MoveCell(_) => "Move cursor",
             Self::ExtendCell(_) => "Extend selection",
             Self::DeleteSelected => "Delete selected clip",
+            Self::CreateClip => "Create MIDI clip",
             Self::CopyClip => "Copy clip",
             Self::PasteClip => "Paste clip",
             Self::DuplicateClip => "Duplicate clip",
@@ -176,6 +193,9 @@ impl UiAction {
             Self::JumpLocator(_) => "Jump to locator",
             Self::ZoomSelectedAudioClip => "Zoom to selected audio clip",
             Self::ZoomBack => "Zoom back",
+            Self::ToggleBrowser => "Browser",
+            Self::ToggleLower => "Lower panel",
+            Self::ToggleChrome => "Hide everything",
             Self::ToggleMainView => "Timeline / Session",
             Self::BackToArrangement => "Back to arrangement",
             Self::InsertScene => "Insert scene",
@@ -227,6 +247,7 @@ impl UiAction {
             | Self::MoveCell(_)
             | Self::ExtendCell(_)
             | Self::DeleteSelected
+            | Self::CreateClip
             | Self::CopyClip
             | Self::PasteClip
             | Self::DuplicateClip
@@ -240,6 +261,9 @@ impl UiAction {
             | Self::ZoomSelectedAudioClip
             | Self::ZoomBack
             | Self::ToggleMainView
+            | Self::ToggleBrowser
+            | Self::ToggleLower
+            | Self::ToggleChrome
             | Self::BackToArrangement
             | Self::InsertScene
             | Self::CaptureScene

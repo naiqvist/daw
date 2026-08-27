@@ -178,6 +178,21 @@ pub enum WavImportError {
 
 enum WavImportCommand {
     Import { path: PathBuf, target_rate: u32 },
+    Reverse { path: PathBuf },
+    Render(crate::render::Job),
+    Extract { path: PathBuf, from: u64, to: u64 },
+}
+
+/// What the offline worker produced.
+///
+/// One channel for both, because they are the same kind of answer to the
+/// same kind of ask, and they must arrive in the ORDER they were asked
+/// for: a cut sends an extract and a render together, and the clipboard
+/// must be filled from the file as it was before the cut repointed it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Offline {
+    Rendered(crate::render::Rendered),
+    Extracted(crate::render::Extract),
 }
 
 /// Green-zone worker for sample-rate conversion. The callback only ever sees
@@ -185,23 +200,48 @@ enum WavImportCommand {
 pub struct WavImportService {
     commands: Sender<WavImportCommand>,
     results: Receiver<Result<ImportedWav, WavImportError>>,
+    renders: Receiver<Result<Offline, WavImportError>>,
 }
 
 impl WavImportService {
     pub fn start() -> Self {
         let (commands, command_rx) = crossbeam_channel::unbounded();
         let (result_tx, results) = crossbeam_channel::unbounded();
+        let (render_tx, renders) = crossbeam_channel::unbounded();
         std::thread::Builder::new()
             .name("wav-import".to_owned())
             .spawn(move || {
-                while let Ok(WavImportCommand::Import { path, target_rate }) = command_rx.recv() {
-                    if result_tx.send(import_wav(&path, target_rate)).is_err() {
+                while let Ok(command) = command_rx.recv() {
+                    // Renders share this thread with imports and
+                    // reversals rather than getting one of their own.
+                    // They are all the same work — decode a file, write a
+                    // file — and a second thread would only put two heads
+                    // on one disk.
+                    let sent = match command {
+                        WavImportCommand::Import { path, target_rate } => {
+                            result_tx.send(import_wav(&path, target_rate)).is_ok()
+                        }
+                        WavImportCommand::Reverse { path } => {
+                            result_tx.send(reverse_wav(&path)).is_ok()
+                        }
+                        WavImportCommand::Render(job) => render_tx
+                            .send(crate::render::render(&job).map(Offline::Rendered))
+                            .is_ok(),
+                        WavImportCommand::Extract { path, from, to } => render_tx
+                            .send(crate::render::extract(&path, from, to).map(Offline::Extracted))
+                            .is_ok(),
+                    };
+                    if !sent {
                         return;
                     }
                 }
             })
             .expect("WAV import thread must start");
-        Self { commands, results }
+        Self {
+            commands,
+            results,
+            renders,
+        }
     }
 
     pub fn import(&self, path: PathBuf, target_rate: u32) {
@@ -210,9 +250,192 @@ impl WavImportService {
             .send(WavImportCommand::Import { path, target_rate });
     }
 
+    /// Ask for `path`'s reversed twin. Idempotent: an already-built cache
+    /// comes straight back.
+    pub fn reverse(&self, path: PathBuf) {
+        let _ = self.commands.send(WavImportCommand::Reverse { path });
+    }
+
+    /// Run a destructive edit offline. The answer names a NEW file; the
+    /// caller repoints the clip at it, and the old file stays where it is
+    /// so undo has something to go back to.
+    pub fn render(&self, job: crate::render::Job) {
+        let _ = self.commands.send(WavImportCommand::Render(job));
+    }
+
     pub fn try_result(&self) -> Option<Result<ImportedWav, WavImportError>> {
         self.results.try_recv().ok()
     }
+
+    /// Take a stretch of a file for the clipboard.
+    pub fn extract(&self, path: PathBuf, from: u64, to: u64) {
+        let _ = self
+            .commands
+            .send(WavImportCommand::Extract { path, from, to });
+    }
+
+    pub fn try_offline(&self) -> Option<Result<Offline, WavImportError>> {
+        self.renders.try_recv().ok()
+    }
+}
+
+/// Where `path`'s reversed twin lives.
+///
+/// DETERMINISTIC, and that is what makes the whole feature cheap: the
+/// graph builder can name the file it wants without being told, and a
+/// clip stores nothing but a `reversed` flag. Keyed by the source's
+/// identity AND its size and mtime, so editing the file underneath
+/// produces a different name rather than a stale reversal.
+pub fn reverse_cache_path(path: &Path) -> Option<PathBuf> {
+    let metadata = path.metadata().ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    metadata.len().hash(&mut hasher);
+    metadata.modified().ok().hash(&mut hasher);
+    let directory = std::env::temp_dir().join("daw-reversed");
+    std::fs::create_dir_all(&directory).ok()?;
+    Some(directory.join(format!("{:016x}-rev.wav", hasher.finish())))
+}
+
+/// Write `path` backwards into the cache, and hand back what plays.
+///
+/// BY FRAME, never by sample: reversing the interleaved buffer itself
+/// would also swap left with right, which is a channel flip wearing a
+/// reversal's clothes and sounds almost right, which is worse.
+///
+/// The whole FILE is reversed, not the clip's region, so trimming a
+/// reversed clip afterwards needs no new cache — the region simply maps
+/// onto the other end, which is arithmetic the graph builder does.
+///
+/// Public for deterministic offline tests; the app uses the worker.
+pub fn reverse_wav(path: &Path) -> Result<ImportedWav, WavImportError> {
+    let original_path = path
+        .canonicalize()
+        .map_err(|source| WavImportError::Access {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let cache = reverse_cache_path(&original_path).ok_or_else(|| WavImportError::Access {
+        path: original_path.clone(),
+        source: std::io::Error::other("no cache directory"),
+    })?;
+
+    let mut reader =
+        hound::WavReader::open(&original_path).map_err(|source| WavImportError::Decode {
+            path: original_path.clone(),
+            source,
+        })?;
+    let spec = reader.spec();
+    let frames = u64::from(reader.duration());
+    if spec.channels == 0 || spec.sample_rate == 0 || frames == 0 {
+        return Err(WavImportError::Unsupported(
+            "zero channels, sample rate, or frames".to_owned(),
+        ));
+    }
+
+    // Already built, and still the right shape? Then this is free.
+    if let Ok(cached) = hound::WavReader::open(&cache)
+        && cached.spec().channels == spec.channels
+        && cached.spec().sample_rate == spec.sample_rate
+        && u64::from(cached.duration()) == frames
+    {
+        return Ok(ImportedWav {
+            original_path,
+            path: cache,
+            sample_rate: spec.sample_rate,
+            frames,
+        });
+    }
+
+    let channels = usize::from(spec.channels);
+    let samples = read_wav_f32(&mut reader, &original_path)?;
+    let output_spec = hound::WavSpec {
+        channels: spec.channels,
+        sample_rate: spec.sample_rate,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    let mut writer =
+        hound::WavWriter::create(&cache, output_spec).map_err(|source| WavImportError::Decode {
+            path: cache.clone(),
+            source,
+        })?;
+    for frame in samples.chunks_exact(channels).rev() {
+        for sample in frame {
+            writer
+                .write_sample(*sample)
+                .map_err(|source| WavImportError::Decode {
+                    path: cache.clone(),
+                    source,
+                })?;
+        }
+    }
+    writer.finalize().map_err(|source| WavImportError::Decode {
+        path: cache.clone(),
+        source,
+    })?;
+    Ok(ImportedWav {
+        original_path,
+        path: cache,
+        sample_rate: spec.sample_rate,
+        frames,
+    })
+}
+
+/// Convert interleaved `f32` from one sample rate to another.
+///
+/// Lifted out of [`import_wav`] so pasting audio between clips at
+/// different rates goes through the SAME resampler an import does. Two
+/// resampling paths is two sets of filter characteristics, and a paste
+/// that sounded subtly unlike the file it came from would be very hard to
+/// account for.
+///
+/// A no-op when the rates match, which is the common case: the importer
+/// has already brought every file in the project to the device rate.
+pub(crate) fn resample_interleaved(
+    samples: &[f32],
+    channels: usize,
+    from_rate: u32,
+    to_rate: u32,
+) -> Result<Vec<f32>, WavImportError> {
+    let channels = channels.max(1);
+    if from_rate == to_rate || from_rate == 0 || to_rate == 0 {
+        return Ok(samples.to_vec());
+    }
+    let input_frames = (samples.len() / channels) as u64;
+    if input_frames == 0 {
+        return Ok(Vec::new());
+    }
+    let adapter = fixed_resample::audioadapter_buffers::direct::InterleavedSlice::new(
+        samples,
+        channels,
+        input_frames as usize,
+    )
+    .map_err(|_| WavImportError::ResamplerBuffer)?;
+    let mut resampler =
+        fixed_resample::PacketResampler::<f32, fixed_resample::Interleaved<f32>>::new(
+            channels,
+            from_rate,
+            to_rate,
+            Default::default(),
+        );
+    let output_frames = resampler.out_alloc_frames(input_frames);
+    let output_samples = output_frames
+        .checked_mul(channels as u64)
+        .and_then(|samples| usize::try_from(samples).ok())
+        .ok_or_else(|| WavImportError::Unsupported("WAV is too large".to_owned()))?;
+    let mut output = Vec::with_capacity(output_samples);
+    resampler.process(
+        &adapter,
+        None,
+        None,
+        |packet, _| output.extend_from_slice(packet),
+        Some(fixed_resample::LastPacketInfo {
+            desired_output_frames: Some(output_frames),
+        }),
+        true,
+    );
+    Ok(output)
 }
 
 /// Decode and, when needed, resample a WAV into the machine-local temporary
@@ -261,35 +484,8 @@ pub fn import_wav(path: &Path, target_rate: u32) -> Result<ImportedWav, WavImpor
 
     let channels = usize::from(spec.channels);
     let samples = read_wav_f32(&mut reader, &original_path)?;
-    let adapter = fixed_resample::audioadapter_buffers::direct::InterleavedSlice::new(
-        &samples,
-        channels,
-        input_frames as usize,
-    )
-    .map_err(|_| WavImportError::ResamplerBuffer)?;
-    let mut resampler =
-        fixed_resample::PacketResampler::<f32, fixed_resample::Interleaved<f32>>::new(
-            channels,
-            spec.sample_rate,
-            target_rate,
-            Default::default(),
-        );
-    let output_frames = resampler.out_alloc_frames(input_frames);
-    let output_samples = output_frames
-        .checked_mul(channels as u64)
-        .and_then(|samples| usize::try_from(samples).ok())
-        .ok_or_else(|| WavImportError::Unsupported("WAV is too large".to_owned()))?;
-    let mut output = Vec::with_capacity(output_samples);
-    resampler.process(
-        &adapter,
-        None,
-        None,
-        |packet, _| output.extend_from_slice(packet),
-        Some(fixed_resample::LastPacketInfo {
-            desired_output_frames: Some(output_frames),
-        }),
-        true,
-    );
+    let output = resample_interleaved(&samples, channels, spec.sample_rate, target_rate)?;
+    let output_frames = (output.len() / channels) as u64;
 
     let output_spec = hound::WavSpec {
         channels: spec.channels,
@@ -340,7 +536,12 @@ fn wav_cache_path(path: &Path, target_rate: u32) -> Result<PathBuf, WavImportErr
     Ok(directory.join(format!("{:016x}-{target_rate}.wav", hasher.finish())))
 }
 
-fn read_wav_f32<R: std::io::Read>(
+/// Decode a WAV's samples as interleaved `f32`, whatever its bit depth.
+///
+/// `pub(crate)` for `render`, which must decode exactly the way the
+/// importer does: two decoders that scaled 24-bit audio differently would
+/// make a destructive edit change the level of everything it touched.
+pub(crate) fn read_wav_f32<R: std::io::Read>(
     reader: &mut hound::WavReader<R>,
     path: &Path,
 ) -> Result<Vec<f32>, WavImportError> {
@@ -751,6 +952,51 @@ mod tests {
         let snapshot = scan(&config, 1);
         assert!(snapshot.assets.is_empty());
         assert_eq!(snapshot.warnings.len(), 1);
+    }
+
+    /// Reversal is BY FRAME, and the test proves it by reversing a file
+    /// whose two channels differ: reversing the interleaved buffer itself
+    /// would also swap left with right, which sounds almost right and is
+    /// therefore the worst way to be wrong.
+    #[test]
+    fn reversing_a_wav_flips_time_and_not_the_channels() {
+        let root = temp_root("reverse");
+        let source = root.join("stereo.wav");
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 48_000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut writer = hound::WavWriter::create(&source, spec).unwrap();
+        // Left counts up, right counts down: every frame is identifiable
+        // and the two channels are never the same value.
+        let frames = 64usize;
+        for frame in 0..frames {
+            writer.write_sample(frame as f32).unwrap();
+            writer.write_sample(-(frame as f32)).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        let reversed = reverse_wav(&source).unwrap();
+        assert_eq!(reversed.frames, frames as u64);
+        assert_eq!(reversed.sample_rate, 48_000);
+        assert_ne!(reversed.path, reversed.original_path, "it is a new file");
+
+        let mut back = hound::WavReader::open(&reversed.path).unwrap();
+        let samples: Vec<f32> = back.samples::<f32>().map(Result::unwrap).collect();
+        assert_eq!(samples.len(), frames * 2);
+        for (i, frame) in samples.chunks_exact(2).enumerate() {
+            let want = (frames - 1 - i) as f32;
+            assert_eq!(frame[0], want, "left, frame {i}");
+            assert_eq!(frame[1], -want, "right stayed right, frame {i}");
+        }
+
+        // Asking again is free and answers with the same file.
+        let again = reverse_wav(&source).unwrap();
+        assert_eq!(again.path, reversed.path);
+        std::fs::remove_file(&reversed.path).ok();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

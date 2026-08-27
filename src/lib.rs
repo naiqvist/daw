@@ -8,6 +8,8 @@ pub mod audio;
 pub mod dsp;
 pub mod library;
 pub mod params;
+pub mod render;
+pub mod slice;
 pub mod theory;
 pub mod ui;
 

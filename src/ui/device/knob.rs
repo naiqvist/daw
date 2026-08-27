@@ -75,21 +75,52 @@ fn drive(
         let fine = ui.input(|i| i.modifiers.shift);
         let travel = diameter * TRAVEL_KNOBS / if fine { FINE } else { 1.0 };
         let delta = -response.drag_delta().y / travel;
-        if delta != 0.0 {
-            let next = (*norm + delta).clamp(0.0, 1.0);
+        // The drag rides its OWN accumulator, not `*norm`. The rack
+        // derives every knob position from the stored engine value each
+        // frame, and a DISCRETE param's stored value has snapped to its
+        // nearest choice — so accumulating on `*norm` throws away any
+        // frame's movement that does not cross half a step by itself,
+        // and a careful drag (a few px per frame) sticks forever. The
+        // accumulator keeps the unsnapped position for the drag's whole
+        // life; the caller may quantize what leaves, and the next frame
+        // continues from where the FINGER is, not where the value
+        // snapped to.
+        let id = response.id.with("drag_acc");
+        let mut acc: f32 = if response.drag_started() {
+            *norm
+        } else {
+            ui.data(|d| d.get_temp(id)).unwrap_or(*norm)
+        };
+        acc = (acc + delta).clamp(0.0, 1.0);
+        ui.data_mut(|d| d.insert_temp(id, acc));
+        if acc != *norm {
+            *norm = acc;
+            changed = true;
+        }
+    }
+    if param.choices().is_some() {
+        // A discrete knob steps by CHOICES: one wheel notch or arrow
+        // press is one setting. The continuous nudge below moves 0.01 of
+        // the range — less than half a step of any list this app has, so
+        // on a knob whose stored value snaps it would move NOTHING, ever.
+        let steps = crate::ui::device::adjust::steps(ui, response);
+        if steps != 0 {
+            let at = param.index(*norm) as i32 + steps;
+            let next = param.at_index(at.max(0) as usize);
             if next != *norm {
                 *norm = next;
                 changed = true;
             }
         }
-    }
-    // Wheel while hovered, arrows once clicked; Shift is fine.
-    let nudge = crate::ui::device::adjust::nudge(ui, response);
-    if nudge != 0.0 {
-        let next = (*norm + nudge).clamp(0.0, 1.0);
-        if next != *norm {
-            *norm = next;
-            changed = true;
+    } else {
+        // Wheel while hovered, arrows once clicked; Shift is fine.
+        let nudge = crate::ui::device::adjust::nudge(ui, response);
+        if nudge != 0.0 {
+            let next = (*norm + nudge).clamp(0.0, 1.0);
+            if next != *norm {
+                *norm = next;
+                changed = true;
+            }
         }
     }
     changed
@@ -122,9 +153,15 @@ pub fn footprint_mini(ui: &egui::Ui, theme: &Theme, param: &Param) -> Footprint 
 
 /// The caption a mini shows: its name at rest, its value while touched.
 ///
+/// EXCEPT for a discrete parameter, which shows its selected choice both
+/// ways: "saw" tells you what the oscillator is doing, "wave" only tells
+/// you what the knob is called, and the knob's position in its titled
+/// well already says that. A continuous value at rest would be noise; a
+/// choice at rest is the one fact the control exists to show.
+///
 /// Pure, so the swap is testable without a pointer.
 pub fn caption(param: &Param, norm: f32, engaged: bool) -> String {
-    if engaged {
+    if engaged || matches!(param.unit, crate::ui::device::param::Unit::Choice(_)) {
         param.format(norm)
     } else {
         param.name.to_owned()
@@ -419,5 +456,157 @@ mod tests {
                 "two rows of MINI knobs should fit: needs {small:.0}, body {body:.0}"
             );
         });
+    }
+    /// A choice knob's caption is its selection at rest, not its name:
+    /// the selection is the fact the control exists to show.
+    #[test]
+    fn a_choice_mini_shows_its_selection_at_rest() {
+        let wave = Param::choice("wave", &["sine", "tri", "saw", "square"]);
+        assert_eq!(caption(&wave, 0.0, false), "sine");
+        assert_eq!(caption(&wave, 1.0, false), "square");
+        assert_eq!(caption(&wave, 1.0, true), "square");
+        // A continuous knob still rests on its name.
+        let cutoff = Param::hz("cutoff", 20.0, 20_000.0);
+        assert_eq!(caption(&cutoff, 0.5, false), "cutoff");
+    }
+
+    /// THE stuck-knob regression, reproduced the way the app produces it.
+    ///
+    /// The rack stores ENGINE values and derives every knob position from
+    /// them each frame, so between frames a discrete knob's norm snaps to
+    /// its nearest choice. A drag accumulated on `*norm` then loses every
+    /// frame's movement that does not cross half a step by itself — a
+    /// slow drag of a few px per frame advances NEVER. This test drags an
+    /// eight-way choice knob 3 px per frame, quantizing between frames
+    /// exactly as the rack does, and requires the selection to move.
+    /// (Verified against the pre-fix accumulate-on-norm code: it fails
+    /// there with "moved by 0 steps".)
+    #[test]
+    fn a_slow_drag_turns_a_discrete_knob_despite_quantized_storage() {
+        let param = Param::choice(
+            "wave",
+            &[
+                "sine", "tri", "saw", "square", "bell", "glass", "metal", "air",
+            ],
+        );
+        let ctx = egui::Context::default();
+        let d = crate::ui::theme::Theme::dark().sp(crate::ui::tokens::control::KNOB_MINI);
+
+        let mut norm = param.at_index(1); // start on "tri"
+        let start = param.index(norm);
+
+        let run = |events: Vec<egui::Event>, norm: &mut f32| {
+            let mut input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(400.0, 200.0),
+                )),
+                ..Default::default()
+            };
+            input.events = events;
+            let mut out = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
+                        let theme = crate::ui::theme::Theme::dark();
+                        mini(ui, &theme, &param, norm);
+                    });
+            });
+            out.textures_delta.clear();
+        };
+
+        // The dial is centred in the mini's column; press in its middle.
+        let w = ctx_ui(|ui| {
+            let theme = crate::ui::theme::Theme::dark();
+            footprint_mini(ui, &theme, &param).width()
+        });
+        let center = egui::pos2(w / 2.0, d / 2.0);
+
+        // Hover, then press.
+        run(vec![egui::Event::PointerMoved(center)], &mut norm);
+        run(
+            vec![egui::Event::PointerButton {
+                pos: center,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            &mut norm,
+        );
+        // Twelve slow frames, 3 px each — and after every one, the
+        // rack's quantization: the stored value is the snapped choice.
+        let mut at = center;
+        for _ in 0..12 {
+            at.y -= 3.0;
+            run(vec![egui::Event::PointerMoved(at)], &mut norm);
+            norm = param.at_index(param.index(norm));
+        }
+        run(
+            vec![egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            &mut norm,
+        );
+
+        let moved = param.index(norm) as i32 - start as i32;
+        assert!(
+            moved >= 2,
+            "36 px of slow upward drag moved the choice by {moved} steps"
+        );
+    }
+
+    /// One wheel notch on a discrete knob is one choice. The continuous
+    /// nudge is a hundredth of the range — less than half a step of any
+    /// list in the app — so routing a choice knob through it means the
+    /// wheel does nothing, forever, without an error anywhere.
+    #[test]
+    fn a_wheel_notch_moves_a_discrete_knob_one_choice() {
+        let param = Param::choice("mode", &["lp", "hp", "bp", "notch"]);
+        let ctx = egui::Context::default();
+        let d = crate::ui::theme::Theme::dark().sp(crate::ui::tokens::control::KNOB_MINI);
+        let mut norm = param.at_index(1);
+
+        let run = |events: Vec<egui::Event>, norm: &mut f32| {
+            let mut input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(400.0, 200.0),
+                )),
+                ..Default::default()
+            };
+            input.events = events;
+            let mut out = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
+                        let theme = crate::ui::theme::Theme::dark();
+                        mini(ui, &theme, &param, norm);
+                    });
+            });
+            out.textures_delta.clear();
+        };
+
+        let w = ctx_ui(|ui| {
+            let theme = crate::ui::theme::Theme::dark();
+            footprint_mini(ui, &theme, &param).width()
+        });
+        let center = egui::pos2(w / 2.0, d / 2.0);
+        run(vec![egui::Event::PointerMoved(center)], &mut norm);
+        run(
+            vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::vec2(0.0, 1.0),
+                modifiers: egui::Modifiers::NONE,
+                phase: egui::TouchPhase::Move,
+            }],
+            &mut norm,
+        );
+        assert_eq!(param.index(norm), 2, "one notch, one choice");
+        // And the storage quantization cannot eat it: the step LANDS on a
+        // choice already.
+        assert_eq!(param.at_index(param.index(norm)), norm);
     }
 }

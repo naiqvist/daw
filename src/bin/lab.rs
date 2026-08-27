@@ -518,6 +518,9 @@ impl EngineBench {
                             len_beats: 0.2,
                             pitch,
                             vel: 100,
+                            plocks: Vec::new(),
+                            prob: 1.0,
+                            cond: None,
                         });
                     }
                 }
@@ -547,7 +550,13 @@ impl EngineBench {
                 source_offset_frames: 0,
                 source_frames: None,
                 loop_clip: self.clip_loop,
+                loop_start_frames: 0,
                 gain: self.clip_gain,
+                fade_in_frames: 0,
+                fade_out_frames: 0,
+                fade_in_shape: 0.0,
+                fade_out_shape: 0.0,
+                envelope: Vec::new(),
             })
         });
         let click = self.metronome.then(|| spec.push(NodeSpec::Click));

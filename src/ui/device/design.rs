@@ -6,14 +6,13 @@
 //!
 //! The spacing rhythm, stated once:
 //!
-//! - **Card**: no inner margin of its own — its title strip and body carry
-//!   the padding, so the outline hugs the silhouette.
+//! - **Card**: no inner margin of its own — its outline hugs the silhouette.
 //! - **Title strip**: SM horizontal / XS vertical — wide enough to breathe,
 //!   shallow enough to read as a label, not a toolbar.
-//! - **Body**: SM all around — content never touches the card edge or the
-//!   title rule.
-//! - **Well**: XS all around — tight, because a well already sits inside
-//!   the body's SM and nested padding compounds.
+//! - **Body**: no inset — the wells ARE the device face and tile every point
+//!   below the title rule. An outer margin here only frames a frame.
+//! - **Well**: XS all around — the one intentional breathing space between
+//!   a section's edge and the control standing in it.
 //!
 //! Every value is a density-scaled token; nothing here invents a number.
 
@@ -45,9 +44,14 @@ pub fn title_strip(theme: &Theme) -> egui::Frame {
     ))
 }
 
-/// The card body's padding: SM all around.
-pub fn body(theme: &Theme) -> egui::Frame {
-    egui::Frame::new().inner_margin(egui::Margin::same(theme.sp(space::SM) as i8))
+/// The card body is deliberately marginless.
+///
+/// Wells already provide their own internal padding. Insetting the body as
+/// well created an empty rail around every device and paid for the same
+/// breathing room twice. The title is the card's only chrome; below its rule,
+/// the content owns the whole face.
+pub fn body(_theme: &Theme) -> egui::Frame {
+    egui::Frame::new()
 }
 
 /// A section well: recessed, hairline-divided, control radius, XS padding.
@@ -151,6 +155,22 @@ pub fn field_margin(theme: &Theme) -> egui::Margin {
 /// at this one radius.
 pub fn box_radius() -> f32 {
     radius::CTRL
+}
+
+/// The radius of a HARDWARE-STYLE DISPLAY: none.
+///
+/// The ladder above is right for a rack of software cards, and wrong for
+/// the one card that is pretending to be a screen. Elektron's panel is a
+/// 128×64 bitmap — it has no radii because it has no pixels to spare for
+/// them — and every box inside a TE engine screen is square too. A
+/// rounded corner is the single loudest tell that a display is drawn by
+/// a compositor rather than lit by an LCD.
+///
+/// A separate function rather than a parameter on `box_radius`, so the
+/// departure has a NAME and a reason attached to it, and so grepping for
+/// "who is pretending to be hardware" returns an answer.
+pub fn screen_radius() -> f32 {
+    0.0
 }
 
 /// Draw the focus ring for a rectangular control.

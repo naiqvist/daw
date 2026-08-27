@@ -15,7 +15,6 @@
 //!    One-way flow; panels are pure functions of state.
 //! 1. `tokens` depends on nothing. Pure consts (plus `Density`, which is a
 //!    style scale both `theme` and `action` must be able to name).
-//!    `gogh` sits beside it: the vendored Gogh scheme table, pure data.
 //! 2. `theme` may use tokens + egui types. Never kit, never panels.
 //!    `prefs` is plain serde data at the same level: no egui, no engine.
 //! 3. `kit` may use tokens + theme + egui. Never panels. It is the ONLY
@@ -25,8 +24,8 @@
 //!    widgets (knobs, faders, XY pads, envelopes, spectra) and may call
 //!    `kit`; `kit` must never know `device`. `keymap` sits beside them:
 //!    the key-gesture table, egui types in, `UiAction`s out. `skin`, the
-//!    theme window, is another sibling at this layer: it turns a `gogh`
-//!    scheme into a `Theme` and paints the picker.
+//!    theme window, is another sibling at this layer: it previews the two
+//!    authored house schemes and paints the picker.
 //! 4. `host` owns the panel registry, dock layout, and `PanelCx`. It knows
 //!    the `Panel` TRAIT; it must never name a concrete panel.
 //! 5. `panels` speak tokens/theme/kit/host + egui *layout* (Ui, horizontal,
@@ -67,13 +66,16 @@
 pub mod action;
 pub mod device;
 pub mod gallery;
-pub mod gogh;
 pub mod host;
 pub mod keymap;
 pub mod kit;
 pub mod palette;
 pub mod panels;
 pub mod prefs;
+/// The replacement Session surface. Registered now that `session_bridge`
+/// exists to adapt it — before the adapters, this would have been a
+/// second authority for what plays.
+pub mod session_next;
 pub mod skin;
 pub mod theme;
 pub mod tokens;
@@ -401,6 +403,21 @@ mod tests {
             "grid.rs",    // squiggle block, sized by its own cell token
             "synth.rs",   // a card: its size is the sum of what it holds
             "reverb.rs",
+            "poly.rs",
+            "sat.rs",
+            "echo.rs",
+            "eq.rs",
+            "probe.rs",    // the headless pointer harness: test-only, draws nothing
+            "glue.rs",     // a card: its size is the sum of what it holds
+            "kick.rs",     // ditto
+            "limiter.rs",  // ditto
+            "modulato.rs", // ditto
+            "sampler.rs",  // ditto
+            "snare.rs",    // ditto
+            "tom.rs",      // ditto
+            "hat.rs",      // ditto
+            "handclap.rs", // ditto
+            "utility.rs",  // ditto
         ];
         let mut missing: Vec<String> = Vec::new();
         for path in module_files("device") {

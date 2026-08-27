@@ -46,6 +46,34 @@ pub fn tabbed_card<R>(
     page: &mut usize,
     add: impl FnOnce(&mut egui::Ui, usize) -> R,
 ) -> R {
+    tabbed_card_sized(ui, theme, name, control::DEVICE_H, pages, page, add)
+}
+
+/// A card at its own HEIGHT TOKEN — [`control::DEVICE_TALL_H`] for an
+/// instrument, [`control::DEVICE_H`] for everything else. The token, not
+/// a free number: two heights is a design system, N heights is a mess.
+pub fn card_sized<R>(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    name: &str,
+    height: f32,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let mut page = 0;
+    tabbed_card_sized(ui, theme, name, height, 1, &mut page, |ui, _page| add(ui))
+}
+
+/// [`tabbed_card`] with the height spelled out. `height` is a token value
+/// (pre-`sp` scaling), matching how the fixed variant reads its own.
+pub fn tabbed_card_sized<R>(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    name: &str,
+    height: f32,
+    pages: usize,
+    page: &mut usize,
+    add: impl FnOnce(&mut egui::Ui, usize) -> R,
+) -> R {
     let pages = pages.max(1);
     *page = (*page).min(pages - 1);
 
@@ -62,10 +90,14 @@ pub fn tabbed_card<R>(
         // is fixed-height by definition; if the region is too short the
         // honest outcome is a card clipped by its container, not a card
         // that lies about its size and takes the next widget with it.
-        ui.set_height(theme.sp(control::DEVICE_H));
+        ui.set_height(theme.sp(height));
         ui.set_min_width(theme.sp(control::DEVICE_W_MIN));
 
         ui.vertical(|ui| {
+            // The title and body are the two exact tiles of the card.
+            // egui's ordinary vertical item gap would leave an unowned
+            // strip between them, which reads as yet another body margin.
+            ui.spacing_mut().item_spacing.y = 0.0;
             // Title strip: tab dots first (top-left), then the name.
             let strip = design::title_strip(theme).show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -86,11 +118,11 @@ pub fn tabbed_card<R>(
             // whole rack — one rule call and the card balloons.
             rule_y = strip.response.rect.bottom();
 
-            // Body: whatever remains of the locked height. Top-anchored,
-            // NOT centered: sections size themselves from the remaining
-            // height, and centering a child that is about to claim the
-            // full height just shoves it downward by half the estimate
-            // error. Wells center their own content; the body stays put.
+            // Body: every point below the title rule. Top-anchored, NOT
+            // centered: sections size themselves from the remaining height,
+            // and centering a child that is about to claim the full height
+            // just shoves it downward by half the estimate error. Wells
+            // supply their own INTERNAL padding; the body has no outer inset.
             design::body(theme)
                 .show(ui, |ui| {
                     ui.set_height(ui.available_height());
@@ -927,6 +959,21 @@ mod tests {
             });
         }
         rects
+    }
+
+    /// The title strip is the card's only outer chrome. Wells already pad
+    /// their controls, so a body inset would create the empty perimeter the
+    /// card contract explicitly removes.
+    #[test]
+    fn the_body_adds_no_second_margin_around_its_wells() {
+        let theme = Theme::dark();
+        let no_margin: egui::Margin = Default::default();
+        assert_eq!(design::body(&theme).inner_margin, no_margin);
+        assert_ne!(
+            design::title_strip(&theme).inner_margin,
+            no_margin,
+            "the title keeps its own readable inset"
+        );
     }
 
     /// THE distribution guarantee: a span-2 well is exactly twice a

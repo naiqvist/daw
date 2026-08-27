@@ -33,7 +33,7 @@ impl NodeId {
 
 /// A note in a pattern. MUSICAL time (beats, f64) per the serialization rule
 /// in transport.rs — sample positions are runtime-only, derived at compile.
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Note {
     pub start_beats: f64,
     pub len_beats: f64,
@@ -41,6 +41,29 @@ pub struct Note {
     pub pitch: u8,
     /// MIDI velocity, 1-127.
     pub vel: u8,
+    /// Parameter LOCKS: `(param id, engine value)` overrides that apply
+    /// the moment this note fires. A lock OVERWRITES the knob for its
+    /// note; a later note without a lock on that param RESUMES the knob —
+    /// the live knob, not a snapshot, so turning it mid-playback is heard
+    /// on every unlocked note. Compile turns these into events; the walk
+    /// never sees the notes.
+    #[serde(default)]
+    pub plocks: Vec<(u32, f32)>,
+    /// TRIG probability, `0..=1`. Deterministic by DESIGN: the decision
+    /// is a hash of the note's identity and the pattern cycle, so it
+    /// feels random across cycles while a bounce reproduces the take
+    /// bit for bit — the engine's flagship guarantee outranks dice.
+    #[serde(default = "prob_default")]
+    pub prob: f32,
+    /// An Elektron A:B condition: fire only on pass A of every B cycles
+    /// (`(1,2)` = first of every two, `(4,4)` = last of every four).
+    /// `None` fires every cycle.
+    #[serde(default)]
+    pub cond: Option<(u8, u8)>,
+}
+
+fn prob_default() -> f32 {
+    1.0
 }
 
 /// A region of a pattern that plays several times before the rest continues.
@@ -103,7 +126,7 @@ pub fn expand_subloops(notes: &[Note], subloops: &[SubLoop]) -> Result<Vec<Note>
                 for r in 0..l.repeats {
                     out.push(Note {
                         start_beats: n.start_beats + shift + r as f64 * period,
-                        ..*n
+                        ..n.clone()
                     });
                 }
                 placed = true;
@@ -115,7 +138,7 @@ pub fn expand_subloops(notes: &[Note], subloops: &[SubLoop]) -> Result<Vec<Note>
         if !placed {
             out.push(Note {
                 start_beats: n.start_beats + shift,
-                ..*n
+                ..n.clone()
             });
         }
     }
@@ -153,6 +176,46 @@ pub struct SeqEvent {
     rank: u8,
     pitch: u8,
     vel: u8,
+    /// Rank-1 (plock) events only: which parameter, and the locked value
+    /// — or a RESTORE (`value` NaN never travels; `restore` says it) that
+    /// puts the parameter back to the instrument's live base.
+    param: u32,
+    value: f32,
+    restore: bool,
+    /// Trig condition, carried by the note's ON and OFF alike: both make
+    /// the SAME deterministic decision, so a skipped note's off cannot
+    /// release some other voice of the same pitch.
+    prob: f32,
+    cond: (u8, u8),
+    /// The note's identity for the probability hash — its on-sample's
+    /// low bits, fixed at compile.
+    trig_key: u32,
+}
+
+/// Does this event's note FIRE on `cycle`? Pure and deterministic: the
+/// A:B condition is arithmetic on the cycle number, and probability is a
+/// HASH of (note identity, cycle) mapped to `[0, 1)` — the same take
+/// every playback and every bounce, varied across cycles.
+fn trig_fires(prob: f32, cond: (u8, u8), trig_key: u32, cycle: i64) -> bool {
+    let (a, b) = cond;
+    if b > 0 && (cycle.rem_euclid(i64::from(b)) + 1) != i64::from(a) {
+        return false;
+    }
+    if prob >= 1.0 {
+        return true;
+    }
+    if prob <= 0.0 {
+        return false;
+    }
+    // SplitMix-style avalanche over the pair; top 24 bits become the
+    // unit float, the same mantissa-exact trick the noise kernel uses.
+    let mut x = u64::from(trig_key) ^ (cycle as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^= x >> 31;
+    (((x >> 40) as f32) / 16_777_216.0) < prob
 }
 
 /// Polyphony of the built-in sequencer synth.
@@ -239,10 +302,25 @@ pub struct VoiceBank {
     /// that just started is the quietest thing on the keyboard, so
     /// "steal the quietest" steals the note you are still playing.
     age: [u64; SEQ_VOICES],
+
+    // The voice's own settings. These live HERE rather than beside the
+    // pattern clock because the clock is an instrument-agnostic walk over
+    // stamped events — it decides WHEN a note starts, and has no business
+    // knowing what an attack rate is. That split is what lets one walk
+    // drive more than one instrument.
+    sample_rate: f32,
+    attack_rate: f32,
+    release_coeff: f32,
+    /// The KNOB values, in ms — what letters set, and what a plock
+    /// restore returns to. The rates above are the LIVE values, which a
+    /// parameter lock may have overridden for the current note.
+    base_attack_ms: f32,
+    base_release_ms: f32,
 }
 
 impl Default for VoiceBank {
     fn default() -> Self {
+        let p = SynthParams::default();
         Self {
             phase: [0.0; SEQ_VOICES],
             step: [0.0; SEQ_VOICES],
@@ -251,6 +329,11 @@ impl Default for VoiceBank {
             gate: [false; SEQ_VOICES],
             pitch: [0; SEQ_VOICES],
             age: [0; SEQ_VOICES],
+            sample_rate: 48_000.0,
+            attack_rate: synth_attack_rate(p.attack_ms, 48_000.0),
+            release_coeff: synth_release_coeff(p.release_ms, 48_000.0),
+            base_attack_ms: p.attack_ms,
+            base_release_ms: p.release_ms,
         }
     }
 }
@@ -266,9 +349,60 @@ impl VoiceBank {
             .map(|v| self.pitch[v])
     }
 
+    /// Green zone. Sample rate and voice times, from the spec's params.
+    fn prepare(&mut self, sample_rate: f32, params: SynthParams) {
+        self.sample_rate = sample_rate;
+        self.attack_rate = synth_attack_rate(params.attack_ms, sample_rate);
+        self.release_coeff = synth_release_coeff(params.release_ms, sample_rate);
+        self.base_attack_ms = params.attack_ms;
+        self.base_release_ms = params.release_ms;
+    }
+
+    /// Red zone. Attack time, in ms, as a ParamChange letter delivers it.
+    /// A LETTER is the knob: it moves the base a plock restore returns
+    /// to, as well as the live rate.
+    fn set_attack_ms(&mut self, ms: f32) {
+        self.base_attack_ms = ms;
+        self.attack_rate = synth_attack_rate(ms, self.sample_rate);
+    }
+
+    /// Red zone. Release time, in ms.
+    fn set_release_ms(&mut self, ms: f32) {
+        self.base_release_ms = ms;
+        self.release_coeff = synth_release_coeff(ms, self.sample_rate);
+    }
+
+    /// Red zone. A parameter lock: override the LIVE value for the note
+    /// about to fire, or restore the knob. Only the voice's own times
+    /// answer; gain is the node's and a lock on it is dropped here.
+    fn plock(&mut self, param: u32, value: Option<f32>) {
+        use crate::params::seq;
+        match param {
+            seq::ATTACK => {
+                let ms = value.unwrap_or(self.base_attack_ms);
+                self.attack_rate = synth_attack_rate(ms, self.sample_rate);
+            }
+            seq::RELEASE => {
+                let ms = value.unwrap_or(self.base_release_ms);
+                self.release_coeff = synth_release_coeff(ms, self.sample_rate);
+            }
+            _ => {}
+        }
+    }
+
     /// Red zone. Silence everything, now — what a discontinuity demands.
+    ///
+    /// Clears the VOICES, not the settings. `*self = default()` would take
+    /// the sample rate and the envelope times with it, so every seek would
+    /// silently re-tune the synth to 48 kHz and the table defaults.
     fn all_sound_off(&mut self) {
-        *self = Self::default();
+        self.phase = [0.0; SEQ_VOICES];
+        self.step = [0.0; SEQ_VOICES];
+        self.env = [0.0; SEQ_VOICES];
+        self.amp = [0.0; SEQ_VOICES];
+        self.gate = [false; SEQ_VOICES];
+        self.pitch = [0; SEQ_VOICES];
+        self.age = [0; SEQ_VOICES];
     }
 
     /// Red zone. Release every gate without cutting the tails, which is
@@ -291,7 +425,7 @@ impl VoiceBank {
 
     /// Red zone. Start `pitch` on a free voice, or steal one. Bounded: two
     /// passes over a fixed-size array, no allocation, no panic path.
-    fn note_on(&mut self, pitch: u8, vel: u8, age: u64, sample_rate: f32) {
+    fn note_on(&mut self, pitch: u8, vel: u8, age: u64) {
         // A free voice is one that is BOTH ungated and faded out. Testing
         // the envelope alone hands back the voice allocated one event
         // earlier at this very sample (its env is still 0.0), which is how
@@ -314,7 +448,7 @@ impl VoiceBank {
             });
         let freq = 440.0 * ((pitch as f32 - 69.0) / 12.0).exp2();
         self.phase[slot] = 0.0;
-        self.step[slot] = freq / sample_rate.max(1.0);
+        self.step[slot] = freq / self.sample_rate.max(1.0);
         self.env[slot] = 0.0;
         self.amp[slot] = vel as f32 / 127.0;
         self.gate[slot] = true;
@@ -360,7 +494,8 @@ impl VoiceBank {
     /// `gain` ramps linearly across the run and must advance once per
     /// sample on EVERY path, including silence, or it lands in the wrong
     /// place and the caller's exact-landing assignment hides the drift.
-    fn render(&mut self, out: &mut [f32], attack: f32, release: f32, gain: &mut Ramp) {
+    fn render(&mut self, out: &mut [f32], gain: &mut Ramp) {
+        let (attack, release) = (self.attack_rate, self.release_coeff);
         let mut lanes = [0usize; SEQ_VOICES];
         let mut live = 0usize;
         for v in 0..SEQ_VOICES {
@@ -399,6 +534,607 @@ impl VoiceBank {
     }
 }
 
+/// What the pattern walk needs of an instrument, and nothing more.
+///
+/// The walk in [`PatternClock::run`] is entirely instrument-agnostic: it
+/// decides WHEN a note starts, wraps a clip, and reconciles the cycle
+/// against the transport. It has no opinion about oscillators, envelopes
+/// or voice counts. Five methods is the whole surface, which is what lets
+/// one heavily-reasoned walk drive both the 8-voice `Seq` synth and the
+/// lane-major poly synth instead of the two carrying a copy each.
+///
+/// Static dispatch — `run` is generic, never `dyn` — so this costs
+/// nothing in the callback: it monomorphises to exactly the code the
+/// hand-written version was.
+trait Voices {
+    fn all_sound_off(&mut self);
+    fn release_all(&mut self);
+    fn note_off(&mut self, pitch: u8);
+    fn note_on(&mut self, pitch: u8, vel: u8, age: u64);
+    /// A parameter LOCK firing at a note boundary: `Some(value)` is a
+    /// note's own override, `None` restores the instrument's LIVE base —
+    /// the knob as letters have most recently set it, not a compile-time
+    /// snapshot, so a knob turned mid-playback is heard on every
+    /// unlocked note.
+    fn plock(&mut self, param: u32, value: Option<f32>);
+    /// Render `out.len()` samples of the LEFT (or mono) channel.
+    ///
+    /// `at` is where this run starts within the segment. A mono
+    /// instrument ignores it; a STEREO one uses it to place its right
+    /// channel in a buffer of its own, which the node reads back after
+    /// the walk. The clock stays mono-shaped on purpose — it schedules
+    /// notes, and how many channels an instrument has is none of its
+    /// business.
+    fn render(&mut self, out: &mut [f32], at: usize, gain: &mut Ramp);
+}
+
+impl Voices for VoiceBank {
+    fn all_sound_off(&mut self) {
+        VoiceBank::all_sound_off(self);
+    }
+    fn release_all(&mut self) {
+        VoiceBank::release_all(self);
+    }
+    fn note_off(&mut self, pitch: u8) {
+        VoiceBank::note_off(self, pitch);
+    }
+    fn note_on(&mut self, pitch: u8, vel: u8, age: u64) {
+        VoiceBank::note_on(self, pitch, vel, age);
+    }
+    fn plock(&mut self, param: u32, value: Option<f32>) {
+        VoiceBank::plock(self, param, value);
+    }
+    fn render(&mut self, out: &mut [f32], _at: usize, gain: &mut Ramp) {
+        VoiceBank::render(self, out, gain);
+    }
+}
+
+/// The kick as an instrument the pattern clock can play.
+///
+/// A ONE-SHOT drum, so half this trait is deliberately empty. A kick has
+/// no sustain stage to release and no note to hold: the strike is the
+/// whole gesture, and `note_off` arriving a beat later must not cut a
+/// tail that is still decaying. `all_sound_off` DOES silence it, because
+/// that is the transport saying the position has moved and nothing from
+/// before it should still be sounding — the sequencing contract's second
+/// rule.
+impl Voices for crate::audio::kick::KickVoice {
+    fn all_sound_off(&mut self) {
+        crate::audio::kick::KickVoice::reset(self);
+    }
+    fn release_all(&mut self) {
+        // Nothing to release. The decay is the sound.
+    }
+    fn note_off(&mut self, _pitch: u8) {
+        // Ditto: a one-shot ignores the gate going down.
+    }
+    fn note_on(&mut self, pitch: u8, vel: u8, _age: u64) {
+        crate::audio::kick::KickVoice::trigger(self, pitch, vel);
+    }
+    fn plock(&mut self, param: u32, value: Option<f32>) {
+        // `None` restores the instrument's live base, which for a kick is
+        // simply the knob — there is no per-voice state to unwind.
+        if let Some(value) = value {
+            crate::audio::kick::KickVoice::set_param(self, param, value);
+        }
+    }
+    fn render(&mut self, out: &mut [f32], _at: usize, gain: &mut Ramp) {
+        // The trait's contract is WRITE, not add: clear, fill, then ride
+        // the ramp. The voice itself adds, because that is what a bank of
+        // them would need.
+        for sample in out.iter_mut() {
+            *sample = 0.0;
+        }
+        crate::audio::kick::KickVoice::render_add(self, out, 1.0);
+        for sample in out.iter_mut() {
+            *sample *= gain.next();
+        }
+    }
+}
+
+/// The one-shot drums as instruments the pattern clock can play.
+///
+/// Four identical trait impls, written once. Every drum in the rack after
+/// the kick has exactly the shape the kick's own impl documents — no
+/// sustain stage to release, no gate to drop, a strike that IS the whole
+/// gesture, and an `all_sound_off` that really does silence it because a
+/// seek must leave nothing from before it sounding. Spelling that out
+/// four times would be four chances for one of them to drift, and the
+/// drift would be silent: a drum that ignored `all_sound_off` would only
+/// misbehave after a seek, which is not where anybody looks.
+///
+/// The kick keeps its own hand-written impl. It is the one with the prose
+/// explaining WHY the empty halves are empty, and that explanation is
+/// worth more where it is than folded into a macro.
+macro_rules! one_shot_drum_voices {
+    ($voice:ty) => {
+        impl Voices for $voice {
+            fn all_sound_off(&mut self) {
+                <$voice>::reset(self);
+            }
+            fn release_all(&mut self) {
+                // Nothing to release. The decay is the sound.
+            }
+            fn note_off(&mut self, _pitch: u8) {
+                // Ditto: a one-shot ignores the gate going down.
+            }
+            fn note_on(&mut self, pitch: u8, vel: u8, _age: u64) {
+                <$voice>::trigger(self, pitch, vel);
+            }
+            fn plock(&mut self, param: u32, value: Option<f32>) {
+                // `None` restores the instrument's live base, which for a
+                // one-shot drum is simply the knob — there is no
+                // per-voice state to unwind.
+                if let Some(value) = value {
+                    <$voice>::set_param(self, param, value);
+                }
+            }
+            fn render(&mut self, out: &mut [f32], _at: usize, gain: &mut Ramp) {
+                // The trait's contract is WRITE, not add: clear, fill,
+                // then ride the ramp. The voice itself adds, because that
+                // is what a bank of them would need.
+                for sample in out.iter_mut() {
+                    *sample = 0.0;
+                }
+                <$voice>::render_add(self, out, 1.0);
+                for sample in out.iter_mut() {
+                    *sample *= gain.next();
+                }
+            }
+        }
+    };
+}
+
+one_shot_drum_voices!(crate::audio::snare::SnareVoice);
+one_shot_drum_voices!(crate::audio::tom::TomVoice);
+one_shot_drum_voices!(crate::audio::hat::HatVoice);
+one_shot_drum_voices!(crate::audio::handclap::HandclapVoice);
+
+impl Voices for crate::audio::poly::PolyVoices {
+    fn all_sound_off(&mut self) {
+        crate::audio::poly::PolyVoices::all_sound_off(self);
+    }
+    fn release_all(&mut self) {
+        crate::audio::poly::PolyVoices::release_all(self);
+    }
+    fn note_off(&mut self, pitch: u8) {
+        crate::audio::poly::PolyVoices::note_off(self, pitch);
+    }
+    fn note_on(&mut self, pitch: u8, vel: u8, age: u64) {
+        crate::audio::poly::PolyVoices::note_on(self, pitch, vel, age);
+    }
+    fn plock(&mut self, param: u32, value: Option<f32>) {
+        crate::audio::poly::PolyVoices::plock(self, param, value);
+    }
+    fn render(&mut self, out: &mut [f32], at: usize, gain: &mut Ramp) {
+        crate::audio::poly::PolyVoices::render(self, out, at, gain);
+    }
+}
+
+/// The sampler as an instrument the pattern clock can play.
+///
+/// Unlike the one-shot drums, half of this is NOT empty: a sampler in
+/// classic mode has a gate to drop and a release to run. One-shot and
+/// slice modes ignore note-off, and they do it INSIDE the bank rather
+/// than here, because which of the three you are in is a parameter the
+/// bank owns.
+impl Voices for crate::audio::sampler::SamplerVoices {
+    fn all_sound_off(&mut self) {
+        crate::audio::sampler::SamplerVoices::all_sound_off(self);
+    }
+    fn release_all(&mut self) {
+        crate::audio::sampler::SamplerVoices::release_all(self);
+    }
+    fn note_off(&mut self, pitch: u8) {
+        crate::audio::sampler::SamplerVoices::note_off(self, pitch);
+    }
+    fn note_on(&mut self, pitch: u8, vel: u8, age: u64) {
+        crate::audio::sampler::SamplerVoices::note_on(self, pitch, vel, age);
+    }
+    fn plock(&mut self, param: u32, value: Option<f32>) {
+        crate::audio::sampler::SamplerVoices::plock(self, param, value);
+    }
+    fn render(&mut self, out: &mut [f32], at: usize, gain: &mut Ramp) {
+        crate::audio::sampler::SamplerVoices::render(self, out, at, gain);
+    }
+}
+
+/// Where a pattern is, and how it maps onto the timeline.
+///
+/// Everything about playing a compiled event list that is NOT about the
+/// instrument playing it: the cursor into the list, the clip modulus, the
+/// cycle counter, and the two guards that keep the derivation honest
+/// against a moving tempo.
+///
+/// Extracted so the poly synth does not carry a second copy. The
+/// reasoning in `run` below — integer cycle derivation, the
+/// strictly-greater wrap reconciliation, the monotonic phase guard — is
+/// the most expensively-earned code in this file, and two copies of it
+/// would drift the first time one was fixed.
+#[derive(Debug, Clone, Copy)]
+pub struct PatternClock {
+    /// Index into the compiled event list.
+    cursor: usize,
+    /// Stamp handed to the next triggered voice; only ever increases.
+    next_age: u64,
+    /// Clip mode: the pattern cycles every this many SAMPLES at the
+    /// compiled tempo, forever, while the timeline rolls forward
+    /// (Ableton-style). 0 = one-shot linear, never wraps.
+    ///
+    /// The single clock. The beat-valued length it is derived from is
+    /// deliberately NOT kept alongside it: the cycle a segment belongs
+    /// to is derived by integer division on this same modulus, and a
+    /// float copy of the same fact would disagree by up to half a
+    /// sample at any tempo whose samples-per-beat is not integral.
+    loop_samples: u64,
+    /// Samples per beat at the COMPILED tempo. Event stamps are in this
+    /// space, so the phase must be derived in it too; a live tempo
+    /// would silently disagree with every stamp in the list.
+    samples_per_beat: f64,
+    /// Cycle number of the last processed sample (clip mode). An integer
+    /// counter, not a float comparison — wrap detection at segment
+    /// boundaries must not be a rounding coin flip (see Click).
+    last_cycle: i64,
+    /// Pattern-relative sample of the last processed segment. Each
+    /// segment re-derives its position from `ctx.beat` rather than
+    /// accumulating, so this exists to keep that derivation MONOTONIC:
+    /// a float rounding that stepped backward would fire an event twice.
+    prev_phase: u64,
+}
+
+impl PatternClock {
+    fn new(loop_samples: u64, samples_per_beat: f64) -> Self {
+        Self {
+            cursor: 0,
+            next_age: 0,
+            loop_samples,
+            samples_per_beat,
+            last_cycle: 0,
+            prev_phase: 0,
+        }
+    }
+
+    /// Red zone. Play `events` into `out` for this segment, gating
+    /// `voices` as the stamps say.
+    ///
+    /// `gain` is the caller's ramp, already spanning the segment; it must
+    /// advance once per sample on EVERY path, silence included, which the
+    /// instrument's `render` is responsible for.
+    fn run<V: Voices>(
+        &mut self,
+        voices: &mut V,
+        events: &[SeqEvent],
+        out: &mut [f32],
+        ctx: &ProcessCtx<'_>,
+        gain: &mut Ramp,
+    ) {
+        // Where this segment starts, as a PATTERN-RELATIVE sample.
+        //
+        // Derived from `ctx.beat` once per segment rather than
+        // accumulated per sample: accumulating drifts, and rounding
+        // the loop length to whole samples would drift the pattern
+        // against the timeline over a long take. One float divide
+        // and one multiply per segment buys exactness, and every
+        // comparison after this is an integer.
+        // The COMPILED samples-per-beat, not the live one. Event
+        // stamps and `loop_samples` were both frozen at compile, so
+        // deriving the phase with a live tempo would put it in
+        // different units from the thing it is compared against:
+        // a tempo raised after compile makes the live cycle shorter
+        // than `loop_samples` and the wrap becomes unreachable;
+        // lowered, the phase overshoots and the whole pattern fires
+        // at one sample. Using the compiled figure keeps everything
+        // in one space, so events land on their correct BEATS and a
+        // tempo change is merely un-recompiled until the swap
+        // arrives — which is what "compiled at tempo" already means
+        // for every audio clip in the graph.
+        let spb = self.samples_per_beat;
+        // The cycle is derived with the SAME modulus the walk wraps
+        // on, by integer division — not by a float `beat / len`.
+        //
+        // Two clocks that mean the same thing must be one clock.
+        // `loop_samples` is `round(len * spb)`, so a float
+        // derivation disagrees with the walk by up to half a sample
+        // whenever `len * spb` is not integral — which is most
+        // tempos: 130bpm at 48kHz gives 22153.846 samples a beat.
+        // The walk would wrap one sample early, the derivation
+        // would still report the old cycle, and the mismatch
+        // handler below would "reconcile" by killing the voices the
+        // new cycle had just started. Deriving both from
+        // `loop_samples` makes them agree by construction.
+        let absolute = (ctx.beat * spb).max(0.0) as u64;
+        let (mut cycle, mut phase) = match absolute.checked_div(self.loop_samples) {
+            Some(cyc) => (cyc as i64, absolute % self.loop_samples),
+            // No loop: one linear pass, position is the phase.
+            None => (0, absolute),
+        };
+
+        if ctx.discontinuity {
+            // All-sound-off, hard: contract rule 2. A wrap or seek
+            // must never leave a hanging note. Then reseek — a
+            // bounded binary search, no allocation.
+            voices.all_sound_off();
+            self.cursor = events.partition_point(|e| e.sample < phase);
+            self.last_cycle = cycle;
+            self.prev_phase = phase;
+        } else if cycle > self.last_cycle {
+            // A cycle boundary landed exactly on the PREVIOUS
+            // segment's last sample, so the walk below never saw
+            // it: it stops as soon as the output is full, and the
+            // wrap sits one iteration past that. Reconcile here.
+            //
+            // Whole-bar clips hit this constantly — one bar at
+            // 120bpm/48kHz is 96000 samples, an exact multiple of
+            // every ordinary block size — and the symptom is a clip
+            // that plays once and then goes silent forever, with
+            // any note-off clamped to the clip end left hanging.
+            //
+            // Strictly GREATER, not merely different: the walk can
+            // legitimately be a cycle ahead of the derivation for
+            // one segment (it wraps the instant phase reaches the
+            // boundary; the derivation only reports the new cycle
+            // once the beat crosses it). Flushing on that would cut
+            // the notes the new cycle just started.
+            flush_cycle(voices, events, &mut self.cursor);
+        } else if cycle == self.last_cycle && phase < self.prev_phase {
+            // The derivation stepped backward within a cycle — a
+            // tempo change moved the beat under us. Hold position
+            // rather than replaying events already fired.
+            phase = self.prev_phase;
+        }
+        if !ctx.playing {
+            // Stop: release everything. No note chase on resume — a
+            // note straddling the stop point does not re-sound, its
+            // on-event is already behind the cursor.
+            voices.release_all();
+            // Record where we are before leaving, or the branch
+            // above never converges: scrubbing the playhead to
+            // another cycle while paused would re-detect the same
+            // mismatch and re-walk the whole event list every
+            // block, forever, on a transport that should cost
+            // nothing.
+            self.last_cycle = cycle;
+            self.prev_phase = phase;
+            voices.render(out, 0, gain);
+            return;
+        }
+
+        // Walk the segment in RUNS between events. Events are
+        // sparse — a handful per block — and samples are not, so
+        // the scalar event work happens a few times and the dense
+        // arithmetic runs uniformly in between. This is the same
+        // shape as the transport's own segment loop, one level
+        // down, and it is what makes note timing sample-accurate
+        // without a per-sample branch asking "is there an event
+        // here?".
+        //
+        // Progress is proven: every pass either renders at least one
+        // sample, consumes at least one event, or wraps (which
+        // resets the cursor and moves the phase off the boundary),
+        // and both the event list and the sample count are finite.
+        // The `steps` bound is belt and braces against the
+        // impossible — the same guard the callback's own segment
+        // loop carries, for the same reason: an unbounded path in
+        // the red zone is a hung render, not a wrong sample.
+        let mut done = 0usize;
+        let mut steps = 0usize;
+        // A cycle costs at most one wrap, one event pass and one
+        // render pass; a segment can hold at most `out.len()` cycles
+        // because a wrap always leaves at least one sample to
+        // render (`loop_samples` is either 0, meaning never wrap,
+        // or >= 1). Budgeting the event list ONCE was wrong: the
+        // cursor rewinds every wrap, so a pattern shorter than a
+        // block re-walks it each cycle.
+        let step_bound = (out.len() + 1).saturating_mul(events.len().saturating_mul(2) + 2);
+        while done < out.len() && steps < step_bound {
+            steps += 1;
+            let remaining = (out.len() - done) as u64;
+
+            // A clip wrap ends the run: flush the tail of the
+            // cycle, restart the pattern, and carry on.
+            let to_wrap = if self.loop_samples > 0 {
+                self.loop_samples.saturating_sub(phase)
+            } else {
+                u64::MAX
+            };
+
+            // The next event bounds the run too. Zero-length runs
+            // are normal: several events can share one sample.
+            let to_event = events
+                .get(self.cursor)
+                .map(|e| e.sample.saturating_sub(phase))
+                .unwrap_or(u64::MAX);
+
+            let run = remaining.min(to_wrap).min(to_event) as usize;
+            if run > 0 {
+                voices.render(&mut out[done..done + run], done, gain);
+                done += run;
+                phase += run as u64;
+            }
+            if done >= out.len() {
+                break;
+            }
+
+            if to_event <= to_wrap && self.cursor < events.len() {
+                // Fire every event stamped at this exact sample, in
+                // compiled order — off before on, so a same-pitch
+                // back-to-back pair does not kill its successor.
+                while let Some(ev) = events.get(self.cursor).copied() {
+                    if ev.sample > phase {
+                        break;
+                    }
+                    self.cursor += 1;
+                    // The trig decision, made IDENTICALLY by the on,
+                    // the off, and the plocks of one note: pure over
+                    // (identity, cycle), so no event of a skipped note
+                    // can act while the others stand down.
+                    if !trig_fires(ev.prob, ev.cond, ev.trig_key, cycle) {
+                        continue;
+                    }
+                    match ev.rank {
+                        0 => voices.note_off(ev.pitch),
+                        1 => voices.plock(ev.param, if ev.restore { None } else { Some(ev.value) }),
+                        _ => {
+                            let age = self.next_age;
+                            self.next_age = self.next_age.wrapping_add(1);
+                            voices.note_on(ev.pitch, ev.vel, age);
+                        }
+                    }
+                }
+            } else {
+                // The wrap, seen mid-segment.
+                flush_cycle(voices, events, &mut self.cursor);
+                phase = 0;
+                cycle += 1;
+            }
+        }
+        if done < out.len() {
+            // The bound tripped, which the proof above says cannot
+            // happen. Fail to SILENCE rather than to whatever the
+            // arena slot held last: a metered node must fill its
+            // whole buffer, and the allocator recycles slots
+            // between nodes.
+            out[done..].fill(0.0);
+        }
+        self.last_cycle = cycle;
+        self.prev_phase = phase;
+    }
+}
+
+/// Bake a pattern's notes into one sorted, sample-stamped event list.
+///
+/// Instrument-agnostic, like the walk that consumes it: this turns musical
+/// time into samples and nothing else, so `Seq` and `Poly` share it rather
+/// than each carrying a copy of the clip-clamping rules — every one of
+/// which exists because of a specific hanging-note bug, and none of which
+/// should have to be fixed twice.
+fn compile_events(
+    notes: &[Note],
+    subloops: &[SubLoop],
+    loop_len_beats: Option<f64>,
+    samples_per_beat: f64,
+) -> Result<Vec<SeqEvent>, CompileError> {
+    if let Some(len) = loop_len_beats
+        && !(len.is_finite() && len > 0.0)
+    {
+        return Err(CompileError::BadClipLen);
+    }
+    let notes = expand_subloops(notes, subloops)?;
+    // Which parameters are locked ANYWHERE in the pattern. The lock rule
+    // needs both halves of the story: a locked note-on sets its value,
+    // and every UNLOCKED note-on on a locked-anywhere parameter emits a
+    // RESTORE, so the knob comes back the moment a plain note plays —
+    // "a non-locked note resumes the defined position", verbatim.
+    let mut locked_anywhere: Vec<u32> = notes
+        .iter()
+        .flat_map(|n| n.plocks.iter().map(|(id, _)| *id))
+        .collect();
+    locked_anywhere.sort_unstable();
+    locked_anywhere.dedup();
+    // Bake note starts/ends into one sorted event list.
+    // Sort by (beat, rank): offs before ons on exact ties.
+    let mut events = Vec::with_capacity(notes.len() * 2);
+    for n in &notes {
+        if n.len_beats <= 0.0 || n.vel == 0 {
+            continue; // degenerate notes never enter the engine
+        }
+        // Clip mode: a note starting past the loop is
+        // dropped; one ringing past it is cut at the wrap
+        // (off clamped), so the wrap flush can never miss.
+        let mut end = n.start_beats + n.len_beats;
+        if let Some(len) = loop_len_beats {
+            if n.start_beats >= len {
+                continue;
+            }
+            end = end.min(len);
+        }
+        // Musical time becomes SAMPLES here and only
+        // here — the contract's rule 1, and the whole
+        // reason `compile_at_tempo` takes a tempo.
+        // Rounding is to nearest so a note does not
+        // consistently land early.
+        let stamp = |beats: f64| -> u64 { (beats * samples_per_beat).round().max(0.0) as u64 };
+        let on = stamp(n.start_beats);
+        // The drop test above is in BEATS but the stamp
+        // rounds to SAMPLES, so a note within half a
+        // sample of the clip end survives the first
+        // check and lands exactly ON the loop boundary.
+        // The wrap flush is already past that point, so
+        // such a note-on would gate a voice nothing
+        // ever releases — a hanging note from a note
+        // too short to hear.
+        if let Some(len) = loop_len_beats
+            && on >= stamp(len)
+        {
+            continue;
+        }
+        // Parameter locks fire BETWEEN the off and the on at this
+        // sample (rank 1 of 0..=2): after the off so a same-sample
+        // release still hears the old value's tail settings, before the
+        // on so THIS note's attack, filter and pitch start under the
+        // locked values rather than catching them a sample late.
+        let prob = if n.prob.is_finite() {
+            n.prob.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        // A:B sanitized at compile: A clamped into 1..=B, B into 1..=8.
+        // Junk from a hand-edited file becomes the nearest real
+        // condition rather than one that can never fire.
+        let cond = match n.cond {
+            Some((a, b)) => {
+                let b = b.clamp(1, 8);
+                (a.clamp(1, b), b)
+            }
+            None => (0, 0),
+        };
+        let trig_key = (on as u32) ^ (u32::from(n.pitch) << 24);
+        for &param in &locked_anywhere {
+            let lock = n.plocks.iter().find(|(id, _)| *id == param);
+            events.push(SeqEvent {
+                sample: on,
+                rank: 1,
+                pitch: n.pitch,
+                vel: 0,
+                param,
+                value: lock.map(|(_, v)| *v).unwrap_or(0.0),
+                restore: lock.is_none(),
+                prob,
+                cond,
+                trig_key,
+            });
+        }
+        events.push(SeqEvent {
+            sample: on,
+            rank: 2,
+            pitch: n.pitch,
+            vel: n.vel,
+            param: 0,
+            value: 0.0,
+            restore: false,
+            prob,
+            cond,
+            trig_key,
+        });
+        events.push(SeqEvent {
+            sample: stamp(end),
+            rank: 0,
+            pitch: n.pitch,
+            vel: 0,
+            param: 0,
+            value: 0.0,
+            restore: false,
+            prob,
+            cond,
+            trig_key,
+        });
+    }
+    // (sample, rank): off < plock < on on exact ties — see the plock
+    // comment above for why the locks ride the middle.
+    events.sort_by(|a, b| a.sample.cmp(&b.sample).then(a.rank.cmp(&b.rank)));
+    Ok(events)
+}
+
 /// Red zone. End a pattern cycle: release everything the pattern still owes
 /// a note-off, then rewind the cursor.
 ///
@@ -409,7 +1145,7 @@ impl VoiceBank {
 /// A free function because it needs the voices, the event list and the
 /// cursor at once, and those are three separate bindings destructured out
 /// of the node.
-fn flush_cycle(voices: &mut VoiceBank, events: &[SeqEvent], cursor: &mut usize) {
+fn flush_cycle<V: Voices>(voices: &mut V, events: &[SeqEvent], cursor: &mut usize) {
     while let Some(ev) = events.get(*cursor).copied() {
         *cursor += 1;
         if ev.rank == 0 {
@@ -479,27 +1215,99 @@ impl Arena {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlotId(pub usize);
 
-/// How often the filter's coefficients follow its smoothed controls, in
-/// samples. Fast enough that a performed sweep has no audible steps, cheap
-/// enough (a handful of sin_cos per update, only while a knob is actually
-/// moving) to disappear in the block budget.
-const FILTER_COEFF_INTERVAL: usize = 16;
+/// Control smoothing for the saturator's drive, bias, mix and trim, in ms.
+/// The filter's figure, for the filter's reason — this is the declick
+/// layer the kernel contract says the caller wires in front, and two
+/// devices in one rack smoothing at different speeds is a difference you
+/// would hear without being able to name.
+const SAT_SMOOTH_MS: f32 = 15.0;
 
-/// Control smoothing for the filter's cutoff, resonance and drive, in ms.
-/// The declick layer the kernel contract says the caller wires in front.
-const FILTER_SMOOTH_MS: f32 = 15.0;
+/// How many ORIGINAL-rate samples one setting of the curve covers.
+///
+/// The filter re-derives coefficients every `FILTER_COEFF_INTERVAL`
+/// samples so a performed sweep is stepless; this is the same trick for
+/// the same reason, one size finer. It has to be finer: a filter's
+/// coefficient step changes a slope, while a drive step changes a GAIN,
+/// and the ear finds a gain step first. At 48 kHz this is a third of a
+/// millisecond, and `configure()` is a handful of clamps — the walk costs
+/// less than the shaping does.
+const SAT_CHUNK: usize = 16;
 
-/// The kernel chain of one [`Node::Filter`], boxed so the Node enum stays
+/// The kernel chain of one [`Node::Sat`], boxed so the Node enum stays
 /// lean. Compile builds it in the green zone; the callback only calls
-/// prepare/process/reset on it — bounded pure math throughout.
+/// configure/process/reset on it.
+///
+/// # Why the curve is shared and the rest is per channel
+///
+/// A [`Waveshaper`](crate::dsp::shaper::Waveshaper) is STATELESS — its
+/// own docs say so, and that is the whole reason it needs no lane-major
+/// twin — so one curve serves both channels and there is nothing to keep
+/// in step. The half-band's polyphase history and the DC blocker's
+/// one-pole state ARE memory, and memory shared between two channels is
+/// the two channels leaking into each other.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy)]
-pub struct FilterCore {
-    cascade: crate::dsp::filters::Cascade,
-    svf: crate::dsp::filters::Svf,
+pub struct SatCore {
     shaper: crate::dsp::shaper::Waveshaper,
-    oversampler: crate::dsp::shaper::Oversampler2x,
-    dc: crate::dsp::filters::DcBlocker,
+    oversampler: [crate::dsp::shaper::Oversampler2x; 2],
+    dc: [crate::dsp::filters::DcBlocker; 2],
+}
+
+/// Control smoothing for the echo's feedback, tone, drive, wow, spread
+/// and mix, in ms. The filter's figure, for the filter's reason.
+const ECHO_SMOOTH_MS: f32 = 15.0;
+
+/// Control smoothing for the echo TIME, in ms — much slower than the
+/// rest, and audibly so on purpose.
+///
+/// A delay whose time moves does not crossfade, it GLIDES: the read
+/// pointer walks to its new distance and everything in the buffer bends
+/// pitch on the way, which is the sound of a tape machine changing
+/// speed. That is the effect people reach a delay's time knob for, so the
+/// glide is long enough to hear. Fifteen milliseconds would be a
+/// perfectly clean, perfectly characterless jump.
+const ECHO_GLIDE_MS: f32 = 120.0;
+
+/// How far the wow LFO can pull the echo time, as a fraction, at full
+/// depth.
+///
+/// One percent. Tape wow is a pitch wobble of a fraction of a percent and
+/// flutter less again; at ten percent it stops being a machine and starts
+/// being a chorus pedal. The knob spends its whole travel inside the
+/// range where the answer is "warmth" rather than "effect".
+const ECHO_WOW_MAX: f32 = 0.01;
+
+/// How fast that wobble is, in Hz, and how far apart the two channels
+/// run it.
+///
+/// Slow, and NOT the same phase on both sides: two channels wobbling
+/// together is a mono pitch wobble, while a quarter turn apart is the
+/// drifting stereo image a pair of tape machines has. The rate is fixed
+/// rather than exposed — a wow-rate knob is a control nobody sets twice,
+/// and the depth is the part that matters.
+const ECHO_WOW_HZ: f32 = 0.7;
+const ECHO_WOW_SPREAD_TURNS: f32 = 0.25;
+
+/// What a full drive knob hands the kernel's loop saturator.
+///
+/// The kernel's `drive` is the tanh gain above unity, and it has no
+/// ceiling of its own because the curve cannot run away. Twelve is where
+/// a repeat has clearly been through something and is not yet a fuzz
+/// pedal — the top of the useful range, so the knob spends its travel
+/// inside it.
+const ECHO_DRIVE_MAX: f32 = 12.0;
+
+/// The kernel chain of one [`Node::Echo`], boxed so the Node enum stays
+/// lean.
+///
+/// Two independent echoes, because the two channels must not share a
+/// history — and two independent wobbles, because they must not share a
+/// phase either.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct EchoCore {
+    line: [crate::dsp::delay::FeedbackDelay; 2],
+    wow: [crate::dsp::lfo::Lfo; 2],
 }
 
 /// The fixed menu of workers. An enum, not a trait object: dispatch is one
@@ -555,8 +1363,31 @@ pub enum Node {
         source_start: u64,
         source_frames: u64,
         loop_clip: bool,
+        /// The ABSOLUTE file frame a wrap returns to. Equal to
+        /// `source_start` when the clip has no brace of its own, which is
+        /// what makes the plain case cost nothing.
+        loop_from: u64,
         gain: f32,
         target_gain: f32,
+        /// A gain ramp at each end of the clip's timeline span, in
+        /// frames. Letters move them, so dragging a fade handle is heard
+        /// while it is dragged rather than when the schedule next swaps.
+        fade_in: u64,
+        fade_out: u64,
+        /// The shape each ramp follows. A rational curve, one multiply
+        /// and one divide per sample — see `params::clip::Curve` for why
+        /// it is not a `powf`.
+        fade_in_curve: crate::params::clip::Curve,
+        fade_out_curve: crate::params::clip::Curve,
+        /// The clip's gain envelope: `(frame, linear gain)`, sorted,
+        /// COMPILED — allocated green-side and read-only here, exactly
+        /// as `Node::Seq`'s event list is. Sequencing contract rule 4.
+        envelope: Vec<(u64, f32)>,
+        /// Where in `envelope` the last sample looked. Amortised O(1)
+        /// while the transport runs forward; re-found by binary search on
+        /// a discontinuity, which is bounded `log n` and is the only
+        /// search on this path.
+        envelope_cursor: usize,
         failed: bool,
         /// File frame the NEXT read will produce, mirrored here because a
         /// creek seek is asynchronous.
@@ -592,48 +1423,99 @@ pub enum Node {
     },
     Seq {
         events: Vec<SeqEvent>,
-        cursor: usize,
+        /// Where the pattern is and how it maps onto the timeline.
+        clock: PatternClock,
+        /// The instrument the clock plays.
         voices: VoiceBank,
-        /// Stamp handed to the next triggered voice; only ever increases.
-        next_age: u64,
-        sample_rate: f32,
         /// Post-sum gain, ramped per segment like Sine's amp (ParamChange
         /// 0). Attack/release arrive as ms (ParamChange 1/2) and are
-        /// converted to per-sample rates on arrival.
+        /// converted to per-sample rates by the voice bank on arrival.
         gain: f32,
         target_gain: f32,
-        attack_rate: f32,
-        release_coeff: f32,
-        /// Clip mode: the pattern cycles every this many SAMPLES at the
-        /// compiled tempo, forever, while the timeline rolls forward
-        /// (Ableton-style). 0 = one-shot linear, never wraps.
-        ///
-        /// The single clock. The beat-valued length it is derived from is
-        /// deliberately NOT kept alongside it: the cycle a segment belongs
-        /// to is derived by integer division on this same modulus, and a
-        /// float copy of the same fact would disagree by up to half a
-        /// sample at any tempo whose samples-per-beat is not integral.
-        ///
-        /// Event stamps are pattern-relative samples in this mode; note ends
-        /// are clamped to the loop length at compile, so the off-flush at
-        /// each wrap can never leave a hanging note.
-        loop_samples: u64,
-        /// Samples per beat at the COMPILED tempo. Event stamps are in this
-        /// space, so the phase must be derived in it too; a live tempo
-        /// would silently disagree with every stamp in the list.
-        samples_per_beat: f64,
-        /// Cycle number of the last processed sample (clip mode). An integer
-        /// counter, not a float comparison — wrap detection at segment
-        /// boundaries must not be a rounding coin flip (see Click).
-        last_cycle: i64,
-        /// Pattern-relative sample of the last processed segment. Each
-        /// segment re-derives its position from `ctx.beat` rather than
-        /// accumulating, so this exists to keep that derivation MONOTONIC:
-        /// a float rounding that stepped backward would fire an event twice.
-        prev_phase: u64,
+    },
+    Poly {
+        events: Vec<SeqEvent>,
+        /// Where the pattern is — the SAME clock `Seq` uses.
+        clock: PatternClock,
+        /// The instrument the clock plays.
+        voices: Box<crate::audio::poly::PolyVoices>,
+        gain: f32,
+        target_gain: f32,
+    },
+    /// The kick drum synth. Same clock as `Seq` and `Poly`, a one-shot
+    /// drum voice instead of a bank.
+    Kick {
+        events: Vec<SeqEvent>,
+        clock: PatternClock,
+        voices: Box<crate::audio::kick::KickVoice>,
+        gain: f32,
+        target_gain: f32,
+    },
+    /// The sampler: a file in RAM, eight voices reading it, and the
+    /// machine's output stage after the sum.
+    ///
+    /// Timeline-locked, sharing `PatternClock` with `Seq`/`Poly`/`Kick`,
+    /// and it CUTS on discontinuity — a sounding note belongs to the
+    /// position the transport has left.
+    ///
+    /// STEREO, so the walk reads the bank's right channel back once the
+    /// segment is done, exactly as `Poly` does.
+    ///
+    /// The material is an `Arc<Vec<f32>>` loaded green-side at compile.
+    /// It is immutable here and is retired through the schedule-disposal
+    /// path like every other compiled allocation — the same status
+    /// `Seq`'s event list has.
+    Sampler {
+        events: Vec<SeqEvent>,
+        clock: PatternClock,
+        voices: Box<crate::audio::sampler::SamplerVoices>,
+        /// The output stage. One per device, applied after the voices
+        /// sum, because that is what an output stage IS — see
+        /// `crate::audio::preamp`.
+        preamp: crate::audio::preamp::Preamp,
+        gain: f32,
+        target_gain: f32,
+    },
+    /// The snare drum synth. The kick's shape, a different drum.
+    Snare {
+        events: Vec<SeqEvent>,
+        clock: PatternClock,
+        voices: Box<crate::audio::snare::SnareVoice>,
+        gain: f32,
+        target_gain: f32,
+    },
+    /// The tom synth. The kick's shape, a different drum.
+    Tom {
+        events: Vec<SeqEvent>,
+        clock: PatternClock,
+        voices: Box<crate::audio::tom::TomVoice>,
+        gain: f32,
+        target_gain: f32,
+    },
+    /// The 808 hi-hat. The kick's shape, and the note picks open or
+    /// closed rather than a pitch.
+    Hat {
+        events: Vec<SeqEvent>,
+        clock: PatternClock,
+        voices: Box<crate::audio::hat::HatVoice>,
+        gain: f32,
+        target_gain: f32,
+    },
+    /// The hand clap. The kick's shape, a different drum.
+    Handclap {
+        events: Vec<SeqEvent>,
+        clock: PatternClock,
+        voices: Box<crate::audio::handclap::HandclapVoice>,
+        gain: f32,
+        target_gain: f32,
+    },
+    /// Modulato. Everything it owns is inside the effect; this arm is a
+    /// wire and a discontinuity cut.
+    Modulato {
+        core: Box<crate::audio::modulato::Modulato>,
     },
     /// Reverb: the first effect. Sums its inputs to mono, runs the
-    /// `dsp::reverb` kernel over them, and crossfades wet against dry.
+    /// `dsp::fdn` network over them, and crossfades wet against dry.
     /// Free-running: its tail is wall-history, not timeline position — but
     /// it CUTS on discontinuity, because a seek must not drag the old
     /// room's tail into the new position.
@@ -641,66 +1523,249 @@ pub enum Node {
     /// The delay memory is a plain Vec owned here and allocated at compile
     /// (green zone). The kernel never touches its length.
     Reverb {
-        core: crate::dsp::reverb::Reverb,
+        core: crate::dsp::fdn::Fdn,
         buffers: Vec<f32>,
-        /// Wet scratch, one block long — the kernel writes pure wet and
-        /// this node does the mixing.
-        wet: Vec<f32>,
+        /// The pre-delay, and its own line memory. Node-side rather than
+        /// in the kernel: the network's job is to be a room, and how long
+        /// you wait before hearing it is a placement decision.
+        predelay: crate::dsp::delay::DelayLine,
+        predelay_buf: Vec<f32>,
+        /// The pre-delayed input, kept apart because the kernel reads its
+        /// input and writes its outputs and the three may not overlap.
+        fed: Vec<f32>,
+        /// Wet scratch, one block long per side — the kernel writes pure
+        /// wet and this node does the mixing.
+        wet_l: Vec<f32>,
+        wet_r: Vec<f32>,
+        /// A highpass on the WET only, so the tail stops carrying the low
+        /// end of everything fed to it. On the wet alone, because cutting
+        /// the dry would be an EQ the user did not ask for.
+        low_cut_l: crate::dsp::filters::OnePole,
+        low_cut_r: crate::dsp::filters::OnePole,
         mix: f32,
         target_mix: f32,
-        size: f32,
-        damp: f32,
+        width: f32,
         sample_rate: f32,
     },
-    /// Filter: the first kernel-backed effect. Sums its inputs to mono and
-    /// runs cutoff/resonance/drive over the `dsp::filters` family: a
-    /// Butterworth [`Cascade`](crate::dsp::filters::Cascade) (lp/hp, 6-48
-    /// dB/octave, resonance on the last section) or a single
-    /// [`Svf`](crate::dsp::filters::Svf) (bp/notch), then a soft-clip drive
-    /// stage run at 2x through the halfband oversampler, then a DC blocker.
+    /// The character filter. Cutoff, resonance, slope and a drive stage
+    /// over the `dsp::filters` family — see `crate::audio::filter` for
+    /// the signal path, the character voicings and why it is stereo.
     ///
-    /// The drive stage is PERMANENTLY in the path: its half-band round trip
-    /// is the node's constant latency (`Oversampler2x::latency()`), because
-    /// a drive knob must never move a track in time. At drive 0 the shaper
-    /// is skipped entirely, so the stage is a linear-phase wire and the
-    /// default filter is transparent apart from that delay; the node owns
-    /// the dry/wet blend so the clean path keeps its float headroom.
+    /// STEREO, and that is a change from the version that had no card:
+    /// this lives in a track chain where every other effect is stereo,
+    /// and a mono node in the middle of one folds everything downstream
+    /// of it. Being stereo is also what makes `spread` possible.
     ///
-    /// That latency is now COMPENSATED: `GraphSpec::compensate` reads it
-    /// through `spec_latency` and delays every sibling path to match, so a
-    /// filtered track no longer runs ~0.7 ms ahead of the rest of the mix.
-    /// The graph's remaining total is reported by `Schedule::latency`.
-    ///
-    /// Ids, ranges and the resonance/drive mapping come from
-    /// `crate::params::filter` — the same rows and the same `effective_q`
-    /// the display draws with, so the curve and the audio agree by
-    /// construction. Free-running; cuts state on discontinuity.
+    /// Free-running; cuts every history on discontinuity. Its latency —
+    /// the drive stage's half-band round trip — is CONSTANT and reported
+    /// through `spec_latency`, so plugin delay compensation absorbs it
+    /// and no knob on the device can slide the track in time.
     Filter {
-        core: Box<FilterCore>,
-        /// 2x scratch for the drive stage, `4 * block` floats (round-trip
-        /// lane + shaped lane), compile-owned.
+        core: Box<crate::audio::filter::FilterCore>,
+        /// Four 2x lanes of block scratch, compile-owned.
+        scratch: Vec<f32>,
+    },
+    /// The character limiter: loudness, a ceiling, and a voice.
+    ///
+    /// NOT a transparent one — see `crate::audio::limiter` for the whole
+    /// argument and the signal path. Stereo, and LINKED: one detector
+    /// fed both channels, because a level difference between left and
+    /// right is the stereo image and two independent limiters make it
+    /// wander on every peak.
+    ///
+    /// Free-running; cuts every history on discontinuity. Its latency —
+    /// the lookahead plus two half-band round trips — is CONSTANT and
+    /// reported through `spec_latency`, so plugin delay compensation
+    /// absorbs it and no knob on the device can slide the track in time.
+    Limiter {
+        core: Box<crate::audio::limiter::LimiterCore>,
+        /// Six 2x lanes of block scratch, compile-owned.
+        scratch: Vec<f32>,
+        /// The limiter's three delay lines: the detector's key, and one
+        /// per channel. Compile-owned and zeroed; the kernel never
+        /// touches their length.
+        key: Vec<f32>,
+        line_l: Vec<f32>,
+        line_r: Vec<f32>,
+    },
+    /// Saturator: a transfer curve, oversampled. The second kernel-backed
+    /// effect, and the one that is nothing BUT the drive stage the filter
+    /// carries as a seasoning.
+    ///
+    /// Five shapes from `dsp::shaper` — hard clip, soft clip, cubic, fold,
+    /// crush — run at 2x through the same half-band round trip, then a DC
+    /// blocker, then an output trim. Ids and ranges are
+    /// `crate::params::sat`'s, in the kernel's own units, so the curve the
+    /// widget draws and the curve the audio runs are chosen by the same
+    /// number.
+    ///
+    /// STEREO, unlike the filter: this device's natural place is behind
+    /// the poly synth, and a mono-summing effect there would fold the
+    /// unison spread the synth exists to make. The curve is shared (it is
+    /// stateless); the history is not — see [`SatCore`].
+    ///
+    /// # The oversampler is permanently in the path
+    ///
+    /// The filter's rule, for the filter's reason: a latency that moved
+    /// with a knob would slide the track in time as the user turned it.
+    /// In hard clip at drive 1 the curve is the identity inside the
+    /// rails, so the device is then a wire delayed by exactly
+    /// `Oversampler2x::latency()` — a constant `spec_latency` reports and
+    /// `GraphSpec::compensate` absorbs. That case is the one the round
+    /// trip is measured against; the other shapes are not transparent at
+    /// unity drive and are not meant to be.
+    ///
+    /// The dry/wet blend is owned HERE rather than by the shaper's own
+    /// `mix`, for the reason the filter documents: `shape()` rails its
+    /// output to ±1 even at mix 0, and the clean path must keep its float
+    /// headroom. The shaper runs pure on a copy at 2x and this node
+    /// crossfades.
+    ///
+    /// **UNREVIEWED RED ZONE.** Mechanical checks only so far — no
+    /// allocation or panic path in the arm, every output buffer written
+    /// on every path including the fail-open scratch branch. It has NOT
+    /// had the adversarial pass `AGENTS.md` requires. Run `/rt-review`
+    /// over it before a human reads the diff.
+    ///
+    /// Free-running — it holds signal history, not timeline position —
+    /// but it CUTS on discontinuity, because the half-band's history
+    /// belongs to a position the transport has left.
+    Sat {
+        core: Box<SatCore>,
+        /// Three 2x lanes — left, right, and the shaped copy the node
+        /// blends against — so `6 * block` floats, compile-owned.
         scratch2x: Vec<f32>,
         mode: u32,
-        slope: u32,
-        /// Letters land here; the switch happens at the next block edge with
-        /// filter state cleared, because a cascade carrying lowpass history
-        /// into a highpass is a thump.
+        /// Letters land here; the switch happens at the next segment edge.
         pending_mode: u32,
-        pending_slope: u32,
-        cutoff: crate::dsp::ramps::Smoother,
-        res: crate::dsp::ramps::Smoother,
         drive: crate::dsp::ramps::Smoother,
+        bias: crate::dsp::ramps::Smoother,
+        mix: crate::dsp::ramps::Smoother,
+        /// Output trim. Named `trim` and not `out` because the process
+        /// arm already has an `out`, and a shadowed buffer is a bug
+        /// waiting for a careless edit; the wire id is still
+        /// `params::sat::OUT`.
+        trim: crate::dsp::ramps::Smoother,
         /// Shadow targets, because a discontinuity snaps the smoothers to
-        /// their destination (a seek must not glide old knob motion in) and
-        /// [`Smoother`](crate::dsp::ramps::Smoother) does not expose its.
-        cutoff_target: f32,
-        res_target: f32,
+        /// their destination and `Smoother` does not expose its own.
         drive_target: f32,
-        /// What the kernel coefficients were last prepared with, so a
-        /// settled filter re-prepares nothing.
-        prepared_cutoff: f32,
-        prepared_q: f32,
+        bias_target: f32,
+        mix_target: f32,
+        trim_target: f32,
+    },
+    /// Analogue delay — the musical one, as opposed to [`Node::Delay`],
+    /// which is compensation wiring.
+    ///
+    /// A stereo pair of `dsp::delay::FeedbackDelay` echoes, each with
+    /// damping, saturation and a wow wobble INSIDE its feedback loop, so
+    /// every repeat is darker, dirtier and further out of tune than the
+    /// one before it. That compounding is the whole difference between an
+    /// analogue delay and a delay with a filter after it.
+    ///
+    /// Stereo, and `spread` walks the right channel's time away from the
+    /// left's — a stereo picture out of one control, mono-compatible at
+    /// zero.
+    ///
+    /// TIME is either a division of the transport or a number of
+    /// milliseconds, decided by `sync`; `params::echo::time_samples` is
+    /// the only place that knows which, and it converts against the
+    /// tempo of the SEGMENT being rendered, so a tempo ramp drags the
+    /// repeats along with it.
+    ///
+    /// Time changes GLIDE rather than jump (`ECHO_GLIDE_MS`), which is
+    /// what bends the pitch of everything already in the buffer — the
+    /// sound a delay's time knob is reached for.
+    ///
+    /// **UNREVIEWED RED ZONE.** Mechanical checks only: no allocation or
+    /// panic path in the arm, every output buffer written on every path
+    /// including the fail-open branches, and a no-alloc test over the
+    /// steady and discontinuity paths. It has NOT had the adversarial
+    /// pass `AGENTS.md` requires. Run `/rt-review` before a human reads
+    /// it.
+    ///
+    /// Free-running — it holds signal history, not timeline position —
+    /// but it CUTS on discontinuity: the repeats in the buffer belong to
+    /// a position the transport has left.
+    Echo {
+        core: Box<EchoCore>,
+        /// One ring per channel, each exactly the length the kernel was
+        /// prepared for. Separate buffers, because a shared ring would
+        /// interleave the two channels' histories.
+        rings: [Vec<f32>; 2],
+        /// Four block-long lanes: the base time, the modulated time, the
+        /// wobble, and the wet copy the node blends against.
+        scratch: Vec<f32>,
+        sync: u32,
+        /// Letters land here; the switch happens at the next segment
+        /// edge, where the glide picks it up like any other time change.
+        pending_sync: u32,
+        /// The echo time IN SAMPLES, glided. What the smoother chases
+        /// is recomputed every segment, because a synced time depends on
+        /// the tempo the segment is playing at.
+        time: crate::dsp::ramps::Smoother,
+        /// The free-running time as the user set it. Read only when
+        /// `sync` is 0 — but kept always, so switching back out of sync
+        /// returns to the time that was there.
+        time_ms: f32,
+        feedback: crate::dsp::ramps::Smoother,
+        tone: crate::dsp::ramps::Smoother,
+        drive: crate::dsp::ramps::Smoother,
+        wow: crate::dsp::ramps::Smoother,
+        spread: crate::dsp::ramps::Smoother,
+        mix: crate::dsp::ramps::Smoother,
+        /// Whether this echo is an AUX rather than an insert: fed by a
+        /// tap off its track instead of standing in the signal path.
+        ///
+        /// Compile decides it and the node never changes its mind —
+        /// which side of the split an echo is on is a shape, and a shape
+        /// is a recompile. It is here because it is the one thing
+        /// `in_gain` cannot express: an insert must ignore the send
+        /// entirely, so that automating the send to zero silences an aux
+        /// and CANNOT mute an insert.
+        aux: bool,
+        /// The send level as a LINEAR gain, and its letter target. A
+        /// level, so it ramps across the block the way the fader in
+        /// [`Node::Pan`] does rather than per segment. Unity on an
+        /// insert, where nothing reads it.
+        in_gain: f32,
+        in_target: f32,
+        /// Shadow targets, because a discontinuity snaps the smoothers
+        /// to their destination and `Smoother` does not expose its own.
+        /// The time's is in SAMPLES and is derived per segment, not set
+        /// by a letter.
+        time_target: f32,
+        feedback_target: f32,
+        tone_target: f32,
+        drive_target: f32,
+        wow_target: f32,
+        spread_target: f32,
+        mix_target: f32,
         sample_rate: f32,
+    },
+    /// The eight-band equaliser. Every band, every coefficient and the
+    /// output trim live in the core; this variant is the handle.
+    ///
+    /// Stereo in, stereo out — an equaliser that summed to mono would
+    /// undo whatever placed the track, and it sits wherever a user drops
+    /// it in a chain.
+    Eq { core: Box<crate::audio::eq::EqCore> },
+    /// The bus compressor. A FEEDBACK topology, so the whole loop lives
+    /// in the core and is closed per sample — see `crate::audio::glue`.
+    ///
+    /// Stereo in, stereo out, and LINKED: one detector hears both sides,
+    /// because a compressor that ducked each channel on its own would
+    /// walk the image about whenever the mix leaned one way.
+    Glue {
+        core: Box<crate::audio::glue::GlueCore>,
+    },
+    /// Gain, placement and the stereo field — see
+    /// `crate::audio::utility`. The device with no tone of its own.
+    ///
+    /// Stereo in, stereo out, and it must be: width, phase and channel
+    /// mode are all statements about two channels, and a mono node
+    /// carrying them would be a card of controls that do nothing.
+    Utility {
+        core: Box<crate::audio::utility::UtilityCore>,
     },
     /// Metronome: a short decaying blip on every integer beat while the
     /// transport rolls. Timeline-locked: fires off an integer beat COUNTER,
@@ -754,10 +1819,42 @@ impl Node {
             | NodeSpec::Input { .. }
             | NodeSpec::Click
             | NodeSpec::Reverb { .. }
-            | NodeSpec::Filter { .. }
+            | NodeSpec::Kick { .. }
+            | NodeSpec::Snare { .. }
+            | NodeSpec::Tom { .. }
+            | NodeSpec::Hat { .. }
+            | NodeSpec::Handclap { .. }
             | NodeSpec::Seq { .. } => 1,
+            // Stereo: unison spread is a stereo idea, and a node's channel
+            // count is fixed by its kind.
+            // Stereo for the same reason, one device downstream: a
+            // saturator that summed to mono would undo the spread.
+            NodeSpec::Poly { .. }
+            | NodeSpec::Sampler { .. }
+            | NodeSpec::Modulato { .. }
+            | NodeSpec::Sat { .. }
+            | NodeSpec::Echo { .. }
+            | NodeSpec::Eq { .. }
+            | NodeSpec::Filter { .. }
+            | NodeSpec::Glue { .. }
+            | NodeSpec::Limiter { .. }
+            | NodeSpec::Utility { .. } => 2,
             NodeSpec::Delay { channels, .. } => (*channels).clamp(1, 2),
             NodeSpec::Mixer { .. } | NodeSpec::AudioClip { .. } | NodeSpec::Pan { .. } => 2,
+        }
+    }
+
+    /// What this node has to say about itself, if anything.
+    ///
+    /// Almost nothing does: a node's output level is already metered, and
+    /// a node with no opinion about how hard it is working has nothing to
+    /// add. A dynamics processor does — see [`Readout`].
+    ///
+    /// Red zone: a field read, called once per step.
+    fn readout(&self) -> Option<Readout> {
+        match self {
+            Node::Glue { core } => Some(core.readout()),
+            _ => None,
         }
     }
 
@@ -901,12 +1998,19 @@ impl Node {
 
             Node::AudioClip {
                 stream,
+                fade_in,
+                fade_out,
+                fade_in_curve,
+                fade_out_curve,
+                envelope: envelope_points,
+                envelope_cursor,
                 file_frames,
                 timeline_start,
                 timeline_frames,
                 source_start,
                 source_frames,
                 loop_clip,
+                loop_from,
                 gain,
                 target_gain,
                 failed,
@@ -953,8 +2057,21 @@ impl Node {
                 let active_len = (active_end - active_start) as usize;
 
                 // Where the timeline says the file should be.
+                //
+                // A looping clip has a HEAD — everything before the brace
+                // — that plays once, and a tail that repeats. With the
+                // brace at the region's start the head is empty and this
+                // is the plain modulus it always was.
                 let want = if *loop_clip {
-                    *source_start + local_frame % *source_frames
+                    let head = loop_from.saturating_sub(*source_start);
+                    let tail = source_start
+                        .saturating_add(*source_frames)
+                        .saturating_sub(*loop_from);
+                    if local_frame < head || tail == 0 {
+                        *source_start + local_frame
+                    } else {
+                        *loop_from + (local_frame - head) % tail
+                    }
                 } else {
                     *source_start + local_frame
                 };
@@ -984,13 +2101,14 @@ impl Node {
                         if !*loop_clip {
                             break;
                         }
-                        // Exactly at the wrap: request the source-region
-                        // start again, which need not be file frame zero.
-                        if st.seek(*source_start as usize, SeekMode::Auto).is_err() {
+                        // Exactly at the wrap: request the BRACE's start
+                        // again, which need not be the region's start and
+                        // need not be file frame zero.
+                        if st.seek(*loop_from as usize, SeekMode::Auto).is_err() {
                             *failed = true;
                             return;
                         }
-                        *next_frame = *source_start;
+                        *next_frame = *loop_from;
                         continue;
                     }
                     match st.read(want_now) {
@@ -1020,11 +2138,11 @@ impl Node {
                             // and a drifted mirror here means reading forever.
                             *next_frame = st.playhead() as u64;
                             if *loop_clip && *next_frame >= source_end {
-                                if st.seek(*source_start as usize, SeekMode::Auto).is_err() {
+                                if st.seek(*loop_from as usize, SeekMode::Auto).is_err() {
                                     *failed = true;
                                     return;
                                 }
-                                *next_frame = *source_start;
+                                *next_frame = *loop_from;
                             }
                             done += got;
                         }
@@ -1036,227 +2154,261 @@ impl Node {
                         }
                     }
                 }
+                // The FADES, folded into the gain pass rather than given
+                // one of their own: both are a per-sample multiply over
+                // the same span, and two passes would read the buffer
+                // twice to do one thing.
+                //
+                // Measured against the clip's TIMELINE span, which is
+                // what a fade handle is dragged along — not against the
+                // source region, which a looped clip runs through many
+                // times.
+                let fade_in = *fade_in;
+                let fade_out = *fade_out;
+                let fade_in_curve = *fade_in_curve;
+                let fade_out_curve = *fade_out_curve;
+                let span = *timeline_frames;
+                // The SHAPE is applied to the linear position, not to the
+                // level afterwards: the curve is the map from "how far
+                // along" to "how loud", and running the two ends through
+                // their own curves before taking the quieter of them is
+                // what makes an overlap behave.
+                let envelope = |pos: u64| -> f32 {
+                    let mut level = 1.0f32;
+                    if fade_in > 0 && pos < fade_in {
+                        level = fade_in_curve.at(pos as f32 / fade_in as f32);
+                    }
+                    if fade_out > 0 {
+                        let left = span.saturating_sub(pos);
+                        if left <= fade_out {
+                            level = level.min(fade_out_curve.at(left as f32 / fade_out as f32));
+                        }
+                    }
+                    level
+                };
+                let faded = fade_in > 0 || fade_out > 0;
+
+                // THE GAIN ENVELOPE, in the same pass. Its cursor is
+                // re-found here rather than per sample: the playhead is
+                // monotonic within a block, so a walk forward is enough
+                // once the starting point is right.
+                //
+                // A DISCONTINUITY has just moved the playhead somewhere
+                // the cursor knows nothing about, so the search is the
+                // only honest option — and a binary search is bounded
+                // `log n`, which is not an unbounded path.
+                let points: &[(u64, f32)] = envelope_points;
+                if !points.is_empty() && (ctx.discontinuity || *envelope_cursor >= points.len()) {
+                    *envelope_cursor = points.partition_point(|(at, _)| *at <= local_frame);
+                    *envelope_cursor = envelope_cursor.saturating_sub(1);
+                }
+                let mut cursor = *envelope_cursor;
+                // Linear in dB between points is what a fader ride sounds
+                // like; the compile has already converted each point to a
+                // linear gain, so the interpolation here is over the log
+                // of them — one `exp2` per SEGMENT would be a
+                // transcendental per sample, so the points are stored
+                // pre-converted and interpolated linearly in amplitude
+                // between neighbours that are close together anyway.
+                let envelope_at = |pos: u64, cursor: &mut usize| -> f32 {
+                    if points.is_empty() {
+                        return 1.0;
+                    }
+                    while *cursor + 1 < points.len() && points[*cursor + 1].0 <= pos {
+                        *cursor += 1;
+                    }
+                    let (at, gain) = points[*cursor];
+                    let Some(&(next_at, next_gain)) = points.get(*cursor + 1) else {
+                        return gain;
+                    };
+                    if pos <= at || next_at <= at {
+                        return gain;
+                    }
+                    let along = (pos - at) as f32 / (next_at - at) as f32;
+                    gain + (next_gain - gain) * along
+                };
+                let rode = !points.is_empty();
+
                 let gain_step = (*target_gain - *gain) / active_len.max(1) as f32;
                 let mut g = *gain;
-                for s in &mut out.l[write_start..write_start + active_len] {
+                // The right channel repeats the walk from the same
+                // starting cursor rather than sharing one: the two are
+                // the same monotonic walk over the same points, and a
+                // shared cursor would leave the second channel starting
+                // where the first finished.
+                let cursor_at_start = cursor;
+                for (i, s) in out.l[write_start..write_start + active_len]
+                    .iter_mut()
+                    .enumerate()
+                {
+                    let pos = local_frame + i as u64;
                     *s *= g;
+                    if faded {
+                        *s *= envelope(pos);
+                    }
+                    if rode {
+                        *s *= envelope_at(pos, &mut cursor);
+                    }
                     g += gain_step;
                 }
                 if let Some(r) = out.r.as_deref_mut() {
                     let mut g = *gain;
-                    for s in &mut r[write_start..write_start + active_len] {
+                    let mut right_cursor = cursor_at_start;
+                    for (i, s) in r[write_start..write_start + active_len]
+                        .iter_mut()
+                        .enumerate()
+                    {
+                        let pos = local_frame + i as u64;
+                        *s *= if faded { envelope(pos) } else { 1.0 };
+                        if rode {
+                            *s *= envelope_at(pos, &mut right_cursor);
+                        }
                         *s *= g;
                         g += gain_step;
                     }
                 }
+                *envelope_cursor = cursor;
                 *gain = *target_gain;
             }
 
             Node::Seq {
                 events,
-                cursor,
+                clock,
                 voices,
-                next_age,
-                sample_rate,
-                samples_per_beat,
                 gain,
                 target_gain,
-                attack_rate,
-                release_coeff,
-                loop_samples,
-                last_cycle,
-                prev_phase,
             } => {
-                // Where this segment starts, as a PATTERN-RELATIVE sample.
-                //
-                // Derived from `ctx.beat` once per segment rather than
-                // accumulated per sample: accumulating drifts, and rounding
-                // the loop length to whole samples would drift the pattern
-                // against the timeline over a long take. One float divide
-                // and one multiply per segment buys exactness, and every
-                // comparison after this is an integer.
-                // The COMPILED samples-per-beat, not the live one. Event
-                // stamps and `loop_samples` were both frozen at compile, so
-                // deriving the phase with a live tempo would put it in
-                // different units from the thing it is compared against:
-                // a tempo raised after compile makes the live cycle shorter
-                // than `loop_samples` and the wrap becomes unreachable;
-                // lowered, the phase overshoots and the whole pattern fires
-                // at one sample. Using the compiled figure keeps everything
-                // in one space, so events land on their correct BEATS and a
-                // tempo change is merely un-recompiled until the swap
-                // arrives — which is what "compiled at tempo" already means
-                // for every audio clip in the graph.
-                let spb = *samples_per_beat;
-                // The cycle is derived with the SAME modulus the walk wraps
-                // on, by integer division — not by a float `beat / len`.
-                //
-                // Two clocks that mean the same thing must be one clock.
-                // `loop_samples` is `round(len * spb)`, so a float
-                // derivation disagrees with the walk by up to half a sample
-                // whenever `len * spb` is not integral — which is most
-                // tempos: 130bpm at 48kHz gives 22153.846 samples a beat.
-                // The walk would wrap one sample early, the derivation
-                // would still report the old cycle, and the mismatch
-                // handler below would "reconcile" by killing the voices the
-                // new cycle had just started. Deriving both from
-                // `loop_samples` makes them agree by construction.
-                let absolute = (ctx.beat * spb).max(0.0) as u64;
-                let (mut cycle, mut phase) = match absolute.checked_div(*loop_samples) {
-                    Some(cyc) => (cyc as i64, absolute % *loop_samples),
-                    // No loop: one linear pass, position is the phase.
-                    None => (0, absolute),
-                };
-
-                if ctx.discontinuity {
-                    // All-sound-off, hard: contract rule 2. A wrap or seek
-                    // must never leave a hanging note. Then reseek — a
-                    // bounded binary search, no allocation.
-                    voices.all_sound_off();
-                    *cursor = events.partition_point(|e| e.sample < phase);
-                    *last_cycle = cycle;
-                    *prev_phase = phase;
-                } else if cycle > *last_cycle {
-                    // A cycle boundary landed exactly on the PREVIOUS
-                    // segment's last sample, so the walk below never saw
-                    // it: it stops as soon as the output is full, and the
-                    // wrap sits one iteration past that. Reconcile here.
-                    //
-                    // Whole-bar clips hit this constantly — one bar at
-                    // 120bpm/48kHz is 96000 samples, an exact multiple of
-                    // every ordinary block size — and the symptom is a clip
-                    // that plays once and then goes silent forever, with
-                    // any note-off clamped to the clip end left hanging.
-                    //
-                    // Strictly GREATER, not merely different: the walk can
-                    // legitimately be a cycle ahead of the derivation for
-                    // one segment (it wraps the instant phase reaches the
-                    // boundary; the derivation only reports the new cycle
-                    // once the beat crosses it). Flushing on that would cut
-                    // the notes the new cycle just started.
-                    flush_cycle(voices, events, cursor);
-                } else if cycle == *last_cycle && phase < *prev_phase {
-                    // The derivation stepped backward within a cycle — a
-                    // tempo change moved the beat under us. Hold position
-                    // rather than replaying events already fired.
-                    phase = *prev_phase;
-                }
-                if !ctx.playing {
-                    // Stop: release everything. No note chase on resume — a
-                    // note straddling the stop point does not re-sound, its
-                    // on-event is already behind the cursor.
-                    voices.release_all();
-                    // Record where we are before leaving, or the branch
-                    // above never converges: scrubbing the playhead to
-                    // another cycle while paused would re-detect the same
-                    // mismatch and re-walk the whole event list every
-                    // block, forever, on a transport that should cost
-                    // nothing.
-                    *last_cycle = cycle;
-                    *prev_phase = phase;
-                    let mut ramp = Ramp::across(*gain, *target_gain, out_len);
-                    voices.render(out.l, *attack_rate, *release_coeff, &mut ramp);
-                    *gain = *target_gain;
-                    return;
-                }
-
-                // Walk the segment in RUNS between events. Events are
-                // sparse — a handful per block — and samples are not, so
-                // the scalar event work happens a few times and the dense
-                // arithmetic runs uniformly in between. This is the same
-                // shape as the transport's own segment loop, one level
-                // down, and it is what makes note timing sample-accurate
-                // without a per-sample branch asking "is there an event
-                // here?".
-                //
-                // Progress is proven: every pass either renders at least one
-                // sample, consumes at least one event, or wraps (which
-                // resets the cursor and moves the phase off the boundary),
-                // and both the event list and the sample count are finite.
-                // The `steps` bound is belt and braces against the
-                // impossible — the same guard the callback's own segment
-                // loop carries, for the same reason: an unbounded path in
-                // the red zone is a hung render, not a wrong sample.
+                // The whole walk lives in `PatternClock::run` — the node's
+                // job here is only to say which instrument plays and to
+                // own the gain ramp across the segment.
                 let mut ramp = Ramp::across(*gain, *target_gain, out_len);
-                let mut done = 0usize;
-                let mut steps = 0usize;
-                // A cycle costs at most one wrap, one event pass and one
-                // render pass; a segment can hold at most `out_len` cycles
-                // because a wrap always leaves at least one sample to
-                // render (`loop_samples` is either 0, meaning never wrap,
-                // or >= 1). Budgeting the event list ONCE was wrong: the
-                // cursor rewinds every wrap, so a pattern shorter than a
-                // block re-walks it each cycle.
-                let step_bound = (out_len + 1).saturating_mul(events.len().saturating_mul(2) + 2);
-                while done < out_len && steps < step_bound {
-                    steps += 1;
-                    let remaining = (out_len - done) as u64;
-
-                    // A clip wrap ends the run: flush the tail of the
-                    // cycle, restart the pattern, and carry on.
-                    let to_wrap = if *loop_samples > 0 {
-                        loop_samples.saturating_sub(phase)
-                    } else {
-                        u64::MAX
-                    };
-
-                    // The next event bounds the run too. Zero-length runs
-                    // are normal: several events can share one sample.
-                    let to_event = events
-                        .get(*cursor)
-                        .map(|e| e.sample.saturating_sub(phase))
-                        .unwrap_or(u64::MAX);
-
-                    let run = remaining.min(to_wrap).min(to_event) as usize;
-                    if run > 0 {
-                        voices.render(
-                            &mut out.l[done..done + run],
-                            *attack_rate,
-                            *release_coeff,
-                            &mut ramp,
-                        );
-                        done += run;
-                        phase += run as u64;
-                    }
-                    if done >= out_len {
-                        break;
-                    }
-
-                    if to_event <= to_wrap && *cursor < events.len() {
-                        // Fire every event stamped at this exact sample, in
-                        // compiled order — off before on, so a same-pitch
-                        // back-to-back pair does not kill its successor.
-                        while let Some(ev) = events.get(*cursor).copied() {
-                            if ev.sample > phase {
-                                break;
-                            }
-                            *cursor += 1;
-                            if ev.rank == 0 {
-                                voices.note_off(ev.pitch);
-                            } else {
-                                let age = *next_age;
-                                *next_age = next_age.wrapping_add(1);
-                                voices.note_on(ev.pitch, ev.vel, age, *sample_rate);
-                            }
-                        }
-                    } else {
-                        // The wrap, seen mid-segment.
-                        flush_cycle(voices, events, cursor);
-                        phase = 0;
-                        cycle += 1;
-                    }
-                }
-                if done < out_len {
-                    // The bound tripped, which the proof above says cannot
-                    // happen. Fail to SILENCE rather than to whatever the
-                    // arena slot held last: a metered node must fill its
-                    // whole buffer, and the allocator recycles slots
-                    // between nodes.
-                    out.l[done..].fill(0.0);
-                }
-                *last_cycle = cycle;
-                *prev_phase = phase;
+                clock.run(voices, events, out.l, ctx, &mut ramp);
                 *gain = *target_gain; // land exactly, no float drift
+            }
+
+            Node::Kick {
+                events,
+                clock,
+                voices,
+                gain,
+                target_gain,
+            } => {
+                // Identical to `Seq`, a different instrument along — which
+                // is the whole point of having extracted the clock. Mono,
+                // so there is no right channel to read back.
+                let mut ramp = Ramp::across(*gain, *target_gain, out_len);
+                clock.run(voices.as_mut(), events, out.l, ctx, &mut ramp);
+                *gain = *target_gain;
+            }
+
+            Node::Snare {
+                events,
+                clock,
+                voices,
+                gain,
+                target_gain,
+            } => {
+                // As `Kick`, a different drum along.
+                let mut ramp = Ramp::across(*gain, *target_gain, out_len);
+                clock.run(voices.as_mut(), events, out.l, ctx, &mut ramp);
+                *gain = *target_gain;
+            }
+
+            Node::Tom {
+                events,
+                clock,
+                voices,
+                gain,
+                target_gain,
+            } => {
+                // As `Kick`, a different drum along.
+                let mut ramp = Ramp::across(*gain, *target_gain, out_len);
+                clock.run(voices.as_mut(), events, out.l, ctx, &mut ramp);
+                *gain = *target_gain;
+            }
+
+            Node::Hat {
+                events,
+                clock,
+                voices,
+                gain,
+                target_gain,
+            } => {
+                // As `Kick`, a different drum along.
+                let mut ramp = Ramp::across(*gain, *target_gain, out_len);
+                clock.run(voices.as_mut(), events, out.l, ctx, &mut ramp);
+                *gain = *target_gain;
+            }
+
+            Node::Handclap {
+                events,
+                clock,
+                voices,
+                gain,
+                target_gain,
+            } => {
+                // As `Kick`, a different drum along.
+                let mut ramp = Ramp::across(*gain, *target_gain, out_len);
+                clock.run(voices.as_mut(), events, out.l, ctx, &mut ramp);
+                *gain = *target_gain;
+            }
+
+            Node::Poly {
+                events,
+                clock,
+                voices,
+                gain,
+                target_gain,
+            } => {
+                // Identical to `Seq` above, one instrument along — which is
+                // the entire point of having extracted the clock. The only
+                // extra step is stereo: the walk is mono-shaped, so the
+                // bank stashes its right channel and the node reads it back
+                // once the segment is done.
+                let mut ramp = Ramp::across(*gain, *target_gain, out_len);
+                clock.run(voices.as_mut(), events, out.l, ctx, &mut ramp);
+                *gain = *target_gain;
+                if let Some(r) = out.r.as_deref_mut() {
+                    let right = voices.right(out_len);
+                    for (d, s) in r.iter_mut().zip(right.iter()) {
+                        *d = *s;
+                    }
+                }
+            }
+
+            Node::Sampler {
+                events,
+                clock,
+                voices,
+                preamp,
+                gain,
+                target_gain,
+            } => {
+                // `Poly`'s shape, plus the output stage. The voices sum
+                // into the walk's mono buffer and the bank's own right
+                // channel; the pre-amp runs across BOTH once, after the
+                // sum, because there is one output stage and eight
+                // voices.
+                if ctx.discontinuity {
+                    preamp.reset();
+                }
+                let mut ramp = Ramp::across(*gain, *target_gain, out_len);
+                clock.run(voices.as_mut(), events, out.l, ctx, &mut ramp);
+                *gain = *target_gain;
+                if let Some(r) = out.r.as_deref_mut() {
+                    let right = voices.right(out_len);
+                    for (d, s) in r.iter_mut().zip(right.iter()) {
+                        *d = *s;
+                    }
+                    preamp.process(out.l, r);
+                } else {
+                    // No right slot to write into. The pre-amp still runs
+                    // on the left, over a throwaway right, so a mono
+                    // wiring sounds like the same device rather than like
+                    // a different one.
+                    let mut discard = [0.0f32; 0];
+                    preamp.process(out.l, &mut discard);
+                }
             }
 
             Node::Delay {
@@ -1293,28 +2445,75 @@ impl Node {
             Node::Reverb {
                 core,
                 buffers,
-                wet,
+                predelay,
+                predelay_buf,
+                fed,
+                wet_l,
+                wet_r,
+                low_cut_l,
+                low_cut_r,
                 mix,
                 target_mix,
+                width,
                 ..
             } => {
                 // A seek must not drag the old room along: cut the tail on
                 // discontinuity, exactly as a sounding voice does.
                 if ctx.discontinuity {
                     core.reset(buffers);
+                    predelay.reset();
+                    low_cut_l.reset();
+                    low_cut_r.reset();
                 }
 
                 // Sum the wired inputs to mono, in place in the output.
                 sum_inputs_mono(inputs, out.l);
 
-                // The kernel writes pure wet into the scratch; this node
-                // owns the blend. `wet` is one block long by construction,
-                // but a short segment is normal — zip truncates.
-                let n = out.l.len().min(wet.len());
-                let (dry_src, wet_dst) = (&out.l[..n], &mut wet[..n]);
-                // Copy dry aside: the kernel reads input and writes wet,
-                // and both live in this node's own slices.
-                core.process(dry_src, wet_dst, buffers);
+                let n = out.l.len().min(wet_l.len()).min(wet_r.len()).min(fed.len());
+                // PRE-DELAY FIRST, into its own scratch: the ROOM hears a
+                // delayed source while the listener still hears the dry
+                // one on time, which is the whole point of the control.
+                let (Some(feed), Some(dry_src)) = (fed.get_mut(..n), out.l.get(..n)) else {
+                    return;
+                };
+                feed.copy_from_slice(dry_src);
+                predelay.process_smooth(feed, predelay_buf);
+
+                // The kernel reads its input and writes its two outputs,
+                // and the three slices may not overlap — which is why the
+                // feed has a buffer of its own.
+                let (Some(input), Some(left), Some(right)) =
+                    (fed.get(..n), wet_l.get_mut(..n), wet_r.get_mut(..n))
+                else {
+                    return;
+                };
+                core.process(input, left, right, buffers);
+                // The tail's low end, cut on the wet alone.
+                for sample in wet_l[..n].iter_mut() {
+                    *sample = low_cut_l.tick_highpass(*sample);
+                }
+                for sample in wet_r[..n].iter_mut() {
+                    *sample = low_cut_r.tick_highpass(*sample);
+                }
+                // WIDTH as mid/side on the wet: 0 collapses the room to
+                // the centre, 1 is the network's own spread, 2 pushes the
+                // sides out past it.
+                let spread = *width;
+                for index in 0..n {
+                    let (Some(l), Some(r)) = (wet_l.get(index).copied(), wet_r.get(index).copied())
+                    else {
+                        continue;
+                    };
+                    let mid = (l + r) * 0.5;
+                    let side = (l - r) * 0.5 * spread;
+                    if let Some(slot) = wet_l.get_mut(index) {
+                        *slot = mid + side;
+                    }
+                    if let Some(slot) = wet_r.get_mut(index) {
+                        *slot = mid - side;
+                    }
+                }
+                let wet = &*wet_l;
 
                 // Linear mix ramp across the segment: a mix knob must not
                 // click, same rule as every other ramped parameter.
@@ -1326,136 +2525,424 @@ impl Node {
                 *mix = *target_mix; // land exactly, no float drift
             }
 
-            Node::Filter {
+            Node::Filter { core, scratch } => {
+                // `out.l` and `out.r` are separate fields, so this borrows
+                // only the right channel and the left stays reachable.
+                let right = out.r.as_deref_mut().unwrap_or(&mut []);
+                sum_inputs_stereo(inputs, out.l, right);
+
+                // A seek must not drag the old ring along, and must not
+                // glide old knob motion into the new position.
+                if ctx.discontinuity {
+                    core.reset();
+                }
+
+                // Compile fixes the channel count at 2, so this holds; it
+                // is checked rather than assumed because the check costs
+                // nothing and an assumption costs a panic. A mismatch
+                // leaves the summed dry signal standing.
+                if right.len() == out.l.len() {
+                    core.process(out.l, right, scratch);
+                }
+            }
+
+            Node::Modulato { core } => {
+                let right = out.r.as_deref_mut().unwrap_or(&mut []);
+                sum_inputs_stereo(inputs, out.l, right);
+                // A seek must not drag the old wobble along.
+                if ctx.discontinuity {
+                    core.reset();
+                }
+                core.process(out.l, right);
+            }
+
+            Node::Limiter {
+                core,
+                scratch,
+                key,
+                line_l,
+                line_r,
+            } => {
+                // `out.l` and `out.r` are separate fields, so this borrows
+                // only the right channel and the left stays reachable.
+                let right = out.r.as_deref_mut().unwrap_or(&mut []);
+                sum_inputs_stereo(inputs, out.l, right);
+
+                // A seek must not drag the half-bands' history, the
+                // limiter's gain or the brightener's envelope across the
+                // jump — and the delay lines are the CALLER'S to clear,
+                // which the kernel's contract says in as many words.
+                if ctx.discontinuity {
+                    core.reset();
+                    crate::dsp::mem::clear(key);
+                    crate::dsp::mem::clear(line_l);
+                    crate::dsp::mem::clear(line_r);
+                }
+
+                // Compile fixes the channel count at 2, so this holds; it
+                // is checked rather than assumed because the check costs
+                // nothing and an assumption costs a panic. A mismatch
+                // leaves the summed dry signal standing.
+                if right.len() == out.l.len() {
+                    core.process(out.l, right, scratch, key, line_l, line_r);
+                }
+            }
+
+            Node::Sat {
                 core,
                 scratch2x,
                 mode,
-                slope,
                 pending_mode,
-                pending_slope,
-                cutoff,
-                res,
                 drive,
-                cutoff_target,
-                res_target,
+                bias,
+                mix,
+                trim,
                 drive_target,
-                prepared_cutoff,
-                prepared_q,
+                bias_target,
+                mix_target,
+                trim_target,
+            } => {
+                // `out.l` and `out.r` are separate fields, so this borrows
+                // only the right channel and the left stays reachable.
+                let right = out.r.as_deref_mut().unwrap_or(&mut []);
+                sum_inputs_stereo(inputs, out.l, right);
+
+                // A seek must not drag the half-band's history along, and
+                // must not glide old knob motion into the new position.
+                if ctx.discontinuity {
+                    for os in core.oversampler.iter_mut() {
+                        os.reset();
+                    }
+                    for dc in core.dc.iter_mut() {
+                        dc.reset();
+                    }
+                    drive.set_now(*drive_target);
+                    bias.set_now(*bias_target);
+                    mix.set_now(*mix_target);
+                    trim.set_now(*trim_target);
+                }
+
+                // A mode switch lands on the segment edge and clears
+                // NOTHING. The filter resets its cascade here because a
+                // lowpass's history inside a highpass is a thump; a
+                // transfer curve has no history to carry, so there is
+                // nothing to clear and nothing gained by pretending
+                // otherwise. The step in the curve is inherent to having
+                // asked for a different curve.
+                *mode = *pending_mode;
+
+                let n = out.l.len();
+                let n2 = n * 2;
+                // Compile fixes the channel count at 2, so this is true;
+                // it is checked rather than assumed because the check
+                // costs nothing and an assumption costs a panic.
+                let stereo = right.len() == n;
+                let trim_start = trim.current();
+
+                // Fail open exactly as the filter's drive stage does: too
+                // little scratch leaves the dry signal standing, never an
+                // early return that would hand the graph a buffer nobody
+                // wrote.
+                if scratch2x.len() >= n2 * 3 {
+                    let (up_l, rest) = scratch2x.split_at_mut(n2);
+                    let (up_r, shaped) = rest.split_at_mut(n2);
+                    let shaped = &mut shaped[..n2];
+                    core.oversampler[0].up(out.l, up_l);
+                    if stereo {
+                        core.oversampler[1].up(right, up_r);
+                    }
+
+                    // The controls walk at the ORIGINAL rate in short
+                    // chunks, and each chunk's settled value configures
+                    // the curve for the 2x samples that chunk owns. At 1x
+                    // because that is the rate the smoothers were
+                    // prepared for: walking them at 2x would silently
+                    // halve every smoothing time in the device.
+                    let mut mix_prev = mix.current();
+                    for start in (0..n).step_by(SAT_CHUNK) {
+                        let k = SAT_CHUNK.min(n - start);
+                        let mut ctrl = [0.0f32; SAT_CHUNK];
+                        drive.process(&mut ctrl[..k]);
+                        let drive_now = ctrl[k - 1];
+                        bias.process(&mut ctrl[..k]);
+                        let bias_now = ctrl[k - 1];
+                        mix.process(&mut ctrl[..k]);
+                        let mix_now = ctrl[k - 1];
+                        // Advances with the rest so its ramp below spans
+                        // the same segment; applied at 1x after the round
+                        // trip, where a gain change cannot alias.
+                        trim.process(&mut ctrl[..k]);
+
+                        core.shaper.configure(
+                            crate::params::sat::mode(*mode),
+                            drive_now,
+                            bias_now,
+                            1.0, // pure: the node owns the blend
+                        );
+                        let (a, b) = (start * 2, (start + k) * 2);
+                        sat_chunk(
+                            &core.shaper,
+                            &mut up_l[a..b],
+                            &mut shaped[a..b],
+                            mix_prev,
+                            mix_now,
+                        );
+                        if stereo {
+                            sat_chunk(
+                                &core.shaper,
+                                &mut up_r[a..b],
+                                &mut shaped[a..b],
+                                mix_prev,
+                                mix_now,
+                            );
+                        }
+                        mix_prev = mix_now;
+                    }
+
+                    core.oversampler[0].down(up_l, out.l);
+                    if stereo {
+                        core.oversampler[1].down(up_r, right);
+                    }
+                }
+
+                // Output trim, ramped across the segment like every other
+                // audible gain here. On the fail-open path the smoothers
+                // never advanced, so start == now and this is a no-op.
+                let trim_now = trim.current();
+                let mut ramp = Ramp::across(trim_start, trim_now, n);
+                for s in out.l.iter_mut() {
+                    *s *= ramp.next();
+                }
+                if stereo {
+                    let mut ramp = Ramp::across(trim_start, trim_now, n);
+                    for s in right.iter_mut() {
+                        *s *= ramp.next();
+                    }
+                }
+
+                // A biased curve HAS an offset — that is what bias means —
+                // and offset downstream is headroom spent on nothing.
+                core.dc[0].process(out.l);
+                if stereo {
+                    core.dc[1].process(right);
+                }
+            }
+
+            Node::Echo {
+                core,
+                rings,
+                scratch,
+                sync,
+                pending_sync,
+                time,
+                time_ms,
+                feedback,
+                tone,
+                drive,
+                wow,
+                spread,
+                mix,
+                aux,
+                in_gain,
+                in_target,
+                time_target,
+                feedback_target,
+                tone_target,
+                drive_target,
+                wow_target,
+                spread_target,
+                mix_target,
                 sample_rate,
             } => {
-                use crate::params::filter as fp;
+                use crate::params::echo as ep;
 
-                sum_inputs_mono(inputs, out.l);
+                let right = out.r.as_deref_mut().unwrap_or(&mut []);
+                sum_inputs_stereo(inputs, out.l, right);
 
-                // A seek must not drag the old ring along, and must not
-                // glide old knob motion into the new position: clear the
-                // signal history, snap the controls.
-                if ctx.discontinuity {
-                    core.cascade.reset();
-                    core.svf.reset();
-                    core.oversampler.reset();
-                    core.dc.reset();
-                    cutoff.set_now(*cutoff_target);
-                    res.set_now(*res_target);
-                    drive.set_now(*drive_target);
-                }
-
-                // Mode/slope switches land on segment edges with state
-                // cleared — a cascade carrying lowpass history into a
-                // highpass is a thump, and a brief clean restart is not.
-                if *pending_mode != *mode || *pending_slope != *slope {
-                    *mode = *pending_mode;
-                    *slope = *pending_slope;
-                    core.cascade.reset();
-                    core.svf.reset();
-                    *prepared_cutoff = 0.0; // force the re-prepare below
-                }
-
-                // Where the drive blend starts this segment; it ramps to
-                // the smoother's end value across the 2x pass below.
-                let drive_start = drive.current();
-
-                // Coefficients follow the smoothed controls every
-                // FILTER_COEFF_INTERVAL samples — sub-block, so a performed
-                // sweep is stepless. prepare() is bounded pure math
-                // (sin_cos per stage), red-zone legal; a settled filter
-                // skips it entirely.
-                for chunk in out.l.chunks_mut(FILTER_COEFF_INTERVAL) {
-                    let mut ctrl = [0.0f32; FILTER_COEFF_INTERVAL];
-                    let n = chunk.len();
-                    cutoff.process(&mut ctrl[..n]);
-                    let cut_now = ctrl[n - 1];
-                    res.process(&mut ctrl[..n]);
-                    let res_now = ctrl[n - 1];
-                    drive.process(&mut ctrl[..n]);
-                    let drive_now = ctrl[n - 1];
-
-                    let q_eff = fp::effective_q(res_now, drive_now);
-                    let moved = (cut_now - *prepared_cutoff).abs() > *prepared_cutoff * 1e-4
-                        || (q_eff - *prepared_q).abs() > 1e-4;
-                    if moved {
-                        *prepared_cutoff = cut_now;
-                        *prepared_q = q_eff;
-                        match *mode {
-                            fp::MODE_BP | fp::MODE_NOTCH => {
-                                core.svf.prepare(*sample_rate, cut_now, q_eff);
-                            }
-                            _ => core.cascade.prepare(
-                                *sample_rate,
-                                cut_now,
-                                q_eff,
-                                fp::slope_order(*slope),
-                                *mode == fp::MODE_HP,
-                            ),
+                // THE SEND, applied to the tap before the delay sees it.
+                //
+                // Ahead of the fail-open branch below on purpose: when
+                // the scratch is too small this arm passes its input
+                // through untouched, and an aux's input is a COPY of a
+                // track that is already reaching the master by its own
+                // path. Scaled here, a failed aux leaks the tap at the
+                // send's level; unscaled, it would leak it at full and
+                // the track would arrive at the master twice.
+                //
+                // The ramp spans the BLOCK, not the segment, for the
+                // reason the fader in `Node::Pan` does: letters drain
+                // once per block, so a send move already sits in
+                // `in_target` when segment 0 runs, and a block split at
+                // a loop point can make that segment a single frame —
+                // long enough to turn a level move into a click.
+                if *aux {
+                    // Ahead of the ramp, not with the smoothers further
+                    // down: a seek must LAND on the send rather than
+                    // glide in from wherever the last position left it,
+                    // and a letter that arrived before the first block
+                    // ever ran must be in force for that block.
+                    if ctx.discontinuity {
+                        *in_gain = *in_target;
+                    }
+                    let remaining = ctx.block_frames.saturating_sub(ctx.offset).max(out_len);
+                    let mut level = Ramp::across(*in_gain, *in_target, remaining);
+                    for i in 0..out_len {
+                        let g = level.next();
+                        out.l[i] *= g;
+                        if let Some(r) = right.get_mut(i) {
+                            *r *= g;
                         }
                     }
-                    match *mode {
-                        fp::MODE_BP => core
-                            .svf
-                            .process(chunk, crate::dsp::filters::Mode::BandpassUnity),
-                        fp::MODE_NOTCH => core.svf.process(chunk, crate::dsp::filters::Mode::Notch),
-                        _ => core.cascade.process(chunk),
+                    if ctx.offset + out_len >= ctx.block_frames {
+                        *in_gain = *in_target; // land exactly, no float drift
+                    } else {
+                        *in_gain = level.value;
                     }
                 }
 
-                // Drive stage, permanently in the path so its half-band
-                // latency is CONSTANT — a drive knob must never move the
-                // track in time. The dry/wet blend is owned HERE, not by
-                // the shaper: the kernel's shape() rails its output to ±1
-                // even at mix 0 (the shaper device's contract), and a
-                // resonant filter legitimately rings past ±1 — the clean
-                // path must keep that float headroom. So the shaper runs
-                // pure (mix 1, tanh is its own rail) on a copy at 2x, and
-                // the node crossfades: drive 0 is bit-transparent apart
-                // from the round trip, full drive saturates the resonance
-                // for real, and everything between is continuous.
-                let drive_now = drive.current();
-                let n2 = out.l.len() * 2;
-                if scratch2x.len() >= n2 * 2 {
-                    let (up, shaped) = scratch2x.split_at_mut(n2);
-                    let up = &mut up[..n2];
-                    core.oversampler.up(out.l, up);
-                    if drive_now.max(drive_start) > 1e-6 {
-                        core.shaper.configure(
-                            crate::dsp::shaper::Mode::SoftClip,
-                            fp::shaper_drive(drive_now),
-                            0.0,
-                            1.0,
-                        );
-                        let shaped = &mut shaped[..n2];
-                        shaped.copy_from_slice(up);
-                        core.shaper.process(shaped);
-                        let mut ramp = Ramp::across(drive_start, drive_now, n2);
-                        for (d, w) in up.iter_mut().zip(shaped.iter()) {
+                // A sync change is just a time change: it lands on the
+                // segment edge and the glide carries it, which is why
+                // switching from an eighth to a quarter swoops rather
+                // than jumps.
+                *sync = *pending_sync;
+                // The time in SAMPLES, derived HERE and every segment,
+                // because a synced echo's length is a property of the
+                // tempo this segment is playing at — a tempo ramp has to
+                // drag the repeats with it, and a stored sample count
+                // would hold them at the old speed.
+                *time_target =
+                    ep::time_samples(*sync, *time_ms, *sample_rate, ctx.beats_per_sample);
+                time.set_target(*time_target);
+
+                // A seek must not ring the old position's repeats into
+                // the new one, and must not glide old knob motion in.
+                if ctx.discontinuity {
+                    for (line, ring) in core.line.iter_mut().zip(rings.iter_mut()) {
+                        line.reset();
+                        // The kernel owns the pointer, the caller owns
+                        // the memory — so clearing the ring is this
+                        // arm's job, and `fill` is not an allocation.
+                        ring.fill(0.0);
+                    }
+                    for w in core.wow.iter_mut() {
+                        w.reset();
+                    }
+                    time.set_now(*time_target);
+                    feedback.set_now(*feedback_target);
+                    tone.set_now(*tone_target);
+                    drive.set_now(*drive_target);
+                    wow.set_now(*wow_target);
+                    spread.set_now(*spread_target);
+                    mix.set_now(*mix_target);
+                }
+
+                let n = out.l.len();
+                let stereo = right.len() == n;
+                let mix_start = mix.current();
+
+                // Fail open exactly as the filter and saturator do: too
+                // little scratch leaves the dry signal standing.
+                if scratch.len() >= n * 4 && n > 0 {
+                    let (base, rest) = scratch.split_at_mut(n);
+                    let (times, rest) = rest.split_at_mut(n);
+                    let (wobble, wet) = rest.split_at_mut(n);
+                    let wet = &mut wet[..n];
+
+                    // The BASE time, per sample, so a moving time bends
+                    // the pitch of what is already in the buffer.
+                    time.process(base);
+
+                    // Everything else settles once per segment. These
+                    // are loop settings rather than sample values — a
+                    // segment is a few milliseconds, and the smoothers
+                    // in front of them are what keep a turned knob from
+                    // stepping.
+                    feedback.process(times);
+                    let fb_now = times[n - 1];
+                    tone.process(times);
+                    let tone_now = times[n - 1];
+                    drive.process(times);
+                    let drive_now = times[n - 1];
+                    wow.process(times);
+                    let wow_now = times[n - 1];
+                    spread.process(times);
+                    let spread_now = times[n - 1];
+                    mix.process(times);
+                    let mix_now = times[n - 1];
+
+                    let depth = wow_now * 0.01 * ECHO_WOW_MAX;
+                    for (ch, (line, ring)) in core.line.iter_mut().zip(rings.iter_mut()).enumerate()
+                    {
+                        if ch == 1 && !stereo {
+                            break;
+                        }
+                        line.set_feedback(fb_now * 0.01);
+                        line.set_drive(drive_now * 0.01 * ECHO_DRIVE_MAX);
+                        line.set_damp(*sample_rate, tone_now);
+
+                        // The right channel's echo runs LATER by a
+                        // fraction of the time: one control, a stereo
+                        // picture, and mono-compatible at zero.
+                        let stretch = if ch == 1 {
+                            1.0 + spread_now * 0.01
+                        } else {
+                            1.0
+                        };
+                        core.wow[ch].process(wobble);
+                        for ((t, b), w) in times.iter_mut().zip(base.iter()).zip(wobble.iter()) {
+                            *t = *b * stretch * (1.0 + depth * *w);
+                        }
+
+                        let dry = if ch == 0 { &*out.l } else { &*right };
+                        wet.copy_from_slice(dry);
+                        line.process_modulated(wet, ring, times);
+
+                        // The node owns the blend, so the dry path keeps
+                        // its float headroom whatever the loop does.
+                        let dst = if ch == 0 { &mut *out.l } else { &mut *right };
+                        let mut ramp = Ramp::across(mix_start * 0.01, mix_now * 0.01, n);
+                        for (d, w) in dst.iter_mut().zip(wet.iter()) {
                             let m = ramp.next();
                             *d = *d * (1.0 - m) + *w * m;
                         }
                     }
-                    core.oversampler.down(up, out.l);
                 }
-                // A driven signal can develop offset; five hertz of nothing
-                // keeps it out of everything downstream.
-                core.dc.process(out.l);
+            }
+
+            Node::Eq { core } => {
+                let right = out.r.as_deref_mut().unwrap_or(&mut []);
+                sum_inputs_stereo(inputs, out.l, right);
+                // A seek must not ring the old position's filters into
+                // the new one, and must not glide old knob motion in.
+                if ctx.discontinuity {
+                    core.snap();
+                }
+                core.process(out.l, right);
+            }
+
+            Node::Glue { core } => {
+                let right = out.r.as_deref_mut().unwrap_or(&mut []);
+                sum_inputs_stereo(inputs, out.l, right);
+                // A seek must not carry the old position's gain
+                // reduction into the new one: the compressor arrives
+                // open, exactly as it would if the transport had just
+                // started there.
+                if ctx.discontinuity {
+                    core.snap();
+                }
+                core.process(out.l, right);
+            }
+
+            Node::Utility { core } => {
+                let right = out.r.as_deref_mut().unwrap_or(&mut []);
+                sum_inputs_stereo(inputs, out.l, right);
+                // A seek must not ring the crossover or the DC blocker
+                // into the new position, and must not glide the old
+                // one's knob motion in.
+                if ctx.discontinuity {
+                    core.snap();
+                }
+                core.process(out.l, right);
             }
 
             Node::Click {
@@ -1514,12 +3001,120 @@ impl Node {
         // accepts. params::clamp is a bounded scan of a static table:
         // red-zone legal, and an unknown id comes back None (a stale or
         // misrouted letter — binned, never applied).
-        use crate::params::{clip, filter, mixer, pan, reverb, seq, sine};
+        use crate::params::{clip, echo, filter, mixer, pan, reverb, sat, seq, sine};
         match self {
             // No parameters: compile decides a delay's length, and it
             // cannot change without a recompile — a letter that moved it
             // would slide the track it is compensating.
             Node::Silence | Node::Input { .. } | Node::Delay { .. } => {}
+            // Every knob is a live letter, including the two pitch
+            // envelopes' times — the voice rebuilds its envelope timings
+            // when one moves, so a decay turned mid-pattern is heard on
+            // the next hit rather than at the next recompile.
+            Node::Kick {
+                voices,
+                target_gain,
+                ..
+            } => {
+                let Some(value) = crate::params::clamp(crate::params::kick::TABLE, param, value)
+                else {
+                    return;
+                };
+                voices.set_param(param, value);
+                if param == crate::params::kick::GAIN {
+                    *target_gain = value;
+                }
+            }
+
+            // Every knob is a live letter except the FILE, which is not a
+            // knob: it is a recompile, and it arrives as a new spec.
+            Node::Sampler {
+                voices,
+                preamp,
+                target_gain,
+                ..
+            } => {
+                let Some(value) = crate::params::clamp(crate::params::sampler::TABLE, param, value)
+                else {
+                    return;
+                };
+                voices.set_param(param, value);
+                match param {
+                    // Decibels on the knob, linear on the wire.
+                    crate::params::sampler::GAIN => {
+                        *target_gain = 10f32.powf(value / 20.0);
+                    }
+                    // The output stage is the node's, not the bank's, so
+                    // its letter lands here.
+                    crate::params::sampler::PREAMP => preamp.set_amount(value),
+                    _ => {}
+                }
+            }
+            Node::Snare {
+                voices,
+                target_gain,
+                ..
+            } => {
+                let Some(value) = crate::params::clamp(crate::params::snare::TABLE, param, value)
+                else {
+                    return;
+                };
+                voices.set_param(param, value);
+                if param == crate::params::snare::GAIN {
+                    *target_gain = value;
+                }
+            }
+            Node::Tom {
+                voices,
+                target_gain,
+                ..
+            } => {
+                let Some(value) = crate::params::clamp(crate::params::tom::TABLE, param, value)
+                else {
+                    return;
+                };
+                voices.set_param(param, value);
+                if param == crate::params::tom::GAIN {
+                    *target_gain = value;
+                }
+            }
+            Node::Hat {
+                voices,
+                target_gain,
+                ..
+            } => {
+                let Some(value) = crate::params::clamp(crate::params::hat::TABLE, param, value)
+                else {
+                    return;
+                };
+                voices.set_param(param, value);
+                if param == crate::params::hat::GAIN {
+                    *target_gain = value;
+                }
+            }
+            Node::Handclap {
+                voices,
+                target_gain,
+                ..
+            } => {
+                let Some(value) =
+                    crate::params::clamp(crate::params::handclap::TABLE, param, value)
+                else {
+                    return;
+                };
+                voices.set_param(param, value);
+                if param == crate::params::handclap::GAIN {
+                    *target_gain = value;
+                }
+            }
+            // Every knob is a live letter. Rate, spread and feedback
+            // rebuild a coefficient apiece, which is a bounded handful of
+            // arithmetic — the same cost the Filter node pays.
+            Node::Modulato { core } => {
+                if crate::params::clamp(crate::params::modulato::TABLE, param, value).is_some() {
+                    core.set_param(param, value);
+                }
+            }
             Node::Sine {
                 target_freq,
                 target_amp,
@@ -1544,67 +3139,179 @@ impl Node {
             Node::Click { .. } => {}
             Node::Reverb {
                 core,
+                predelay,
+                low_cut_l,
+                low_cut_r,
                 target_mix,
-                size,
-                damp,
+                width,
+                sample_rate,
                 ..
             } => {
                 let Some(value) = crate::params::clamp(reverb::TABLE, param, value) else {
                     return;
                 };
+                // Every row is a live letter. Size and decay rebuild the
+                // per-line gains, which is a handful of `powf` on a knob
+                // move — the same bounded cost the Filter node pays to
+                // re-prepare its cascade.
                 match param {
                     reverb::MIX => *target_mix = value,
-                    reverb::SIZE => {
-                        *size = value;
-                        // The kernel's decay control is not yet wired to a
-                        // knob: until it is, size drives the tail's length
-                        // exactly as it did before the two controls split.
-                        core.set_room(*size, *size, *damp);
+                    reverb::PREDELAY => {
+                        predelay.set_delay(value * 0.001 * *sample_rate);
                     }
-                    reverb::DAMP => {
-                        *damp = value;
-                        core.set_room(*size, *size, *damp);
+                    reverb::SIZE => core.set_size(value),
+                    reverb::DECAY => core.set_decay(value),
+                    reverb::DAMP => core.set_damping(value),
+                    reverb::LOWCUT => {
+                        low_cut_l.prepare(*sample_rate, value);
+                        low_cut_r.prepare(*sample_rate, value);
                     }
+                    reverb::DIFFUSION => core.set_diffusion(value),
+                    reverb::MODULATION => core.set_modulation(value),
+                    reverb::WIDTH => *width = value,
                     _ => {}
                 }
             }
-            Node::Filter {
-                pending_mode,
-                pending_slope,
-                cutoff,
-                res,
-                drive,
-                cutoff_target,
-                res_target,
-                drive_target,
-                ..
-            } => {
+            // Every knob is a live letter. The core decides for itself
+            // which of them costs a coefficient rebuild and which has to
+            // wait for a block edge — a mode or character switch clears
+            // filter state, and a cleared cascade mid-block is a click.
+            Node::Filter { core, .. } => {
                 let Some(value) = crate::params::clamp(filter::TABLE, param, value) else {
                     return;
                 };
+                core.set_param(param, value);
+            }
+            // Every knob is a live letter. The core decides for itself
+            // which of them costs a coefficient rebuild, so a settled
+            // device re-derives nothing — and the release in particular
+            // moves WITHOUT clearing the delay line, which is why the
+            // kernel has a setter for it separate from `prepare`.
+            Node::Limiter { core, .. } => {
+                let Some(value) = crate::params::clamp(crate::params::limiter::TABLE, param, value)
+                else {
+                    return;
+                };
+                core.set_param(param, value);
+            }
+            Node::Sat {
+                pending_mode,
+                drive,
+                bias,
+                mix,
+                trim,
+                drive_target,
+                bias_target,
+                mix_target,
+                trim_target,
+                ..
+            } => {
+                let Some(value) = crate::params::clamp(sat::TABLE, param, value) else {
+                    return;
+                };
+                // Every row is a smoothed control except the mode, which
+                // is a choice and cannot be interpolated toward.
+                let set = |target: &mut f32, s: &mut crate::dsp::ramps::Smoother| {
+                    *target = value;
+                    s.set_target(value);
+                };
                 match param {
-                    filter::MODE => *pending_mode = value.round() as u32,
-                    filter::SLOPE => *pending_slope = value.round() as u32,
-                    filter::CUTOFF => {
-                        *cutoff_target = value;
-                        cutoff.set_target(value);
-                    }
-                    filter::RES => {
-                        *res_target = value;
-                        res.set_target(value);
-                    }
-                    filter::DRIVE => {
-                        *drive_target = value;
-                        drive.set_target(value);
-                    }
+                    sat::MODE => *pending_mode = value.round() as u32,
+                    sat::DRIVE => set(drive_target, drive),
+                    sat::BIAS => set(bias_target, bias),
+                    sat::MIX => set(mix_target, mix),
+                    sat::OUT => set(trim_target, trim),
                     _ => {}
                 }
             }
+            Node::Echo {
+                pending_sync,
+                time_ms,
+                feedback,
+                tone,
+                drive,
+                wow,
+                spread,
+                mix,
+                feedback_target,
+                tone_target,
+                drive_target,
+                wow_target,
+                spread_target,
+                mix_target,
+                aux,
+                in_target,
+                ..
+            } => {
+                let Some(value) = crate::params::clamp(echo::TABLE, param, value) else {
+                    return;
+                };
+                let set = |target: &mut f32, s: &mut crate::dsp::ramps::Smoother| {
+                    *target = value;
+                    s.set_target(value);
+                };
+                match param {
+                    echo::SYNC => *pending_sync = value.round() as u32,
+                    // The one row with no smoother of its own: the time
+                    // is glided in SAMPLES by the process arm, which
+                    // recomputes its target every segment. Storing the
+                    // millisecond here and converting there is what lets
+                    // a synced echo follow the tempo without a letter.
+                    echo::TIME => *time_ms = value,
+                    echo::FEEDBACK => set(feedback_target, feedback),
+                    echo::TONE => set(tone_target, tone),
+                    echo::DRIVE => set(drive_target, drive),
+                    echo::WOW => set(wow_target, wow),
+                    echo::SPREAD => set(spread_target, spread),
+                    echo::MIX => set(mix_target, mix),
+                    // IGNORED ON AN INSERT, and that is the whole reason
+                    // `aux` is a field rather than `in_gain > 0.0`: an
+                    // insert's gain is unity and nothing may write it,
+                    // so an automation lane that sweeps the send to zero
+                    // silences an aux — correctly — and cannot mute a
+                    // delay that is standing in the signal path.
+                    //
+                    // Crossing zero is a SHAPE change, which no letter
+                    // can express: the graph builder rewires the track
+                    // and this node is rebuilt with the answer.
+                    echo::SEND if *aux => *in_target = value * 0.01,
+                    _ => {}
+                }
+            }
+            // The whole table, straight through: every range, every
+            // clamp and the band an id belongs to are the core's own
+            // business, and one door means a letter cannot be routed by
+            // two different opinions about what id 17 is.
+            Node::Eq { core } => core.set_param(param, value),
+            // The whole table, straight through: the core owns every
+            // range and every clamp, so a letter cannot be routed by two
+            // different opinions about what id 4 is.
+            Node::Glue { core } => core.set_param(param, value),
+            // The whole table, straight through, for the reason the two
+            // arms above give: one door, so a letter cannot be routed by
+            // two different opinions about what id 4 is.
+            Node::Utility { core } => core.set_param(param, value),
+            Node::Poly {
+                target_gain,
+                voices,
+                ..
+            } => {
+                let Some(value) = crate::params::clamp(crate::params::poly::TABLE, param, value)
+                else {
+                    return;
+                };
+                // Gain is the node's, because the node owns the ramp; every
+                // other row belongs to the instrument and goes straight
+                // there. One table, one clamp, no second opinion about
+                // ranges anywhere in this arm.
+                if param == crate::params::poly::GAIN {
+                    *target_gain = value;
+                }
+                voices.set_param(param, value);
+            }
             Node::Seq {
                 target_gain,
-                attack_rate,
-                release_coeff,
-                sample_rate,
+                voices,
                 ..
             } => {
                 let Some(value) = crate::params::clamp(seq::TABLE, param, value) else {
@@ -1612,16 +3319,38 @@ impl Node {
                 };
                 match param {
                     seq::GAIN => *target_gain = value,
-                    seq::ATTACK => *attack_rate = synth_attack_rate(value, *sample_rate),
-                    seq::RELEASE => *release_coeff = synth_release_coeff(value, *sample_rate),
+                    // The times belong to the instrument, so the letter
+                    // goes to the instrument. The node no longer holds a
+                    // sample rate to convert against — the voice bank
+                    // does, which is the only place it was ever used.
+                    seq::ATTACK => voices.set_attack_ms(value),
+                    seq::RELEASE => voices.set_release_ms(value),
                     _ => {}
                 }
             }
-            Node::AudioClip { target_gain, .. } => {
-                if let Some(value) = crate::params::clamp(clip::TABLE, param, value)
-                    && param == clip::GAIN
-                {
-                    *target_gain = value;
+            Node::AudioClip {
+                target_gain,
+                fade_in,
+                fade_out,
+                fade_in_curve,
+                fade_out_curve,
+                timeline_frames,
+                ..
+            } => {
+                let Some(value) = crate::params::clamp(clip::TABLE, param, value) else {
+                    return;
+                };
+                // A fade arrives in FRAMES and is clamped to the span it
+                // lives on, for the reason compile clamps it: a fade
+                // longer than its clip never reaches full level.
+                let frames = |value: f32| (value.max(0.0) as u64).min(*timeline_frames);
+                match param {
+                    clip::GAIN => *target_gain = value,
+                    clip::FADE_IN => *fade_in = frames(value),
+                    clip::FADE_OUT => *fade_out = frames(value),
+                    clip::FADE_IN_CURVE => *fade_in_curve = clip::Curve::new(value),
+                    clip::FADE_OUT_CURVE => *fade_out_curve = clip::Curve::new(value),
+                    _ => {}
                 }
             }
             Node::Pan {
@@ -1684,6 +3413,49 @@ fn sum_inputs_mono(inputs: &[InRef], dst: &mut [f32]) {
     }
 }
 
+/// Sum every wired input to STEREO, in place — stereo inputs go L->L and
+/// R->R, mono inputs are centered (the same signal to both sides). The
+/// stereo twin of [`sum_inputs_mono`], and the front half of every stereo
+/// effect. Red-zone safe: zip-bounded, no alloc, no panic.
+fn sum_inputs_stereo(inputs: &[InRef], l: &mut [f32], r: &mut [f32]) {
+    l.fill(0.0);
+    r.fill(0.0);
+    for input in inputs {
+        for (d, s) in l.iter_mut().zip(input.l.iter()) {
+            *d += *s;
+        }
+        for (d, s) in r.iter_mut().zip(input.r.unwrap_or(input.l).iter()) {
+            *d += *s;
+        }
+    }
+}
+
+/// One 2x chunk of a saturator lane: shape a copy, blend it back over the
+/// dry across the chunk. `from`/`to` are the wet amount at the chunk's
+/// first and last sample, so a mix move is stepless across chunk edges.
+///
+/// A free function rather than a closure because it is called once per
+/// channel with disjoint slices, which a closure capturing the core could
+/// not express. Red zone: bounded, allocation-free, no panic path — the
+/// lengths are minned rather than asserted.
+fn sat_chunk(
+    shaper: &crate::dsp::shaper::Waveshaper,
+    buf: &mut [f32],
+    shaped: &mut [f32],
+    from: f32,
+    to: f32,
+) {
+    let len = buf.len().min(shaped.len());
+    let (buf, shaped) = (&mut buf[..len], &mut shaped[..len]);
+    shaped.copy_from_slice(buf);
+    shaper.process(shaped);
+    let mut ramp = Ramp::across(from, to, len);
+    for (d, w) in buf.iter_mut().zip(shaped.iter()) {
+        let m = ramp.next();
+        *d = *d * (1.0 - m) + *w * m;
+    }
+}
+
 /// One block's walk of a ramped parameter: the declick rule every audible
 /// knob follows, written once. `next()` yields the value for the current
 /// sample and THEN steps — the same order every hand-rolled ramp here used,
@@ -1692,22 +3464,27 @@ fn sum_inputs_mono(inputs: &[InRef], dst: &mut [f32]) {
 /// that line is the classic drift bug, so it stays visible at the call site
 /// rather than hidden in here.
 #[derive(Debug, Clone, Copy)]
-struct Ramp {
+pub struct Ramp {
     value: f32,
     step: f32,
 }
 
 impl Ramp {
     #[inline]
-    fn across(from: f32, to: f32, samples: usize) -> Self {
+    pub fn across(from: f32, to: f32, samples: usize) -> Self {
         Self {
             value: from,
             step: (to - from) / samples.max(1) as f32,
         }
     }
 
+    // Named `next` because that is what it does, and it long predates
+    // being public. It is not an iterator and never will be: an iterator
+    // would be fused and optional, and the whole contract here is that it
+    // advances exactly once per sample on every path.
+    #[allow(clippy::should_implement_trait)]
     #[inline]
-    fn next(&mut self) -> f32 {
+    pub fn next(&mut self) -> f32 {
         let value = self.value;
         self.value += self.step;
         value
@@ -1716,6 +3493,38 @@ impl Ramp {
 
 /// Unity gain — the serde default for a `Pan` spec written before the
 /// fader existed.
+/// A clip's envelope, made safe for the callback to walk.
+///
+/// GREEN SIDE, at compile: the node's walk assumes the points rise and
+/// stay inside the clip, and both sorting and clamping there would be an
+/// allocation and an unbounded path on the audio thread. Doing it here
+/// means the callback's loop is a comparison and an add.
+///
+/// Points past the clip's span are dropped rather than clamped onto its
+/// end, where they would pile up and make the last segment's
+/// interpolation divide by zero.
+fn sorted_envelope(points: &[(u64, f32)], span: u64) -> Vec<(u64, f32)> {
+    let mut out: Vec<(u64, f32)> = points
+        .iter()
+        .filter(|(at, gain)| *at <= span && gain.is_finite())
+        .map(|(at, gain)| (*at, gain.clamp(0.0, 4.0)))
+        .collect();
+    out.sort_by_key(|(at, _)| *at);
+    out.dedup_by_key(|(at, _)| *at);
+    out
+}
+
+/// Serde fallbacks for a reverb written before the network replaced the
+/// Freeverb. A project from then has a size, a damp and a mix and knows
+/// nothing else; these are what the rest becomes.
+fn reverb_decay_default() -> f32 {
+    1.8
+}
+
+fn reverb_diffusion_default() -> f32 {
+    0.8
+}
+
 fn unity() -> f32 {
     1.0
 }
@@ -1760,6 +3569,12 @@ pub struct Schedule {
     /// segments of a block: `run` is called once per SEGMENT, so a block's
     /// peak is the max over its segments.
     peaks: [f32; MAX_METERS],
+    /// Tap slot per step, or [`NO_METER`]. The readout twin of
+    /// `step_meter`, and read the same way: one bounded load per step,
+    /// no search.
+    step_tap: Vec<u8>,
+    /// What each tapped device said this block.
+    readouts: [Readout; MAX_METERS],
     /// Modulation, compiled. Evaluated at the top of every segment, before
     /// the walk, so the values a node reads this segment are this
     /// segment's.
@@ -1771,6 +3586,37 @@ pub struct Schedule {
     /// It is what a transport offsets its recording by and what a latency
     /// readout shows.
     latency: usize,
+}
+
+/// What one device has to say about itself over a block.
+///
+/// A meter reports a node's OUTPUT LEVEL, which is what a mixer strip
+/// wants and what every track already gets. A dynamics processor has a
+/// second thing to say that no output level can carry: how much it is
+/// working. That is this.
+///
+/// Both figures are the BLOCK's extreme, not its last sample. The UI
+/// reads these at frame rate and the engine computes them per sample, so
+/// reporting the newest value would miss exactly the fast transient a
+/// compressor exists to catch — a 3 ms grab between two repaints would
+/// simply never be drawn.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Readout {
+    /// The loudest the device heard this block, in dBFS.
+    pub level_db: f32,
+    /// The MOST gain reduction it applied this block, in dB. Zero is
+    /// none and negative is reduction, the same sign the gain computer
+    /// works in.
+    pub reduction_db: f32,
+}
+
+impl Default for Readout {
+    fn default() -> Self {
+        Self {
+            level_db: crate::dsp::dynamics::FLOOR_DB,
+            reduction_db: 0.0,
+        }
+    }
 }
 
 /// "This step is not metered." `MAX_METERS` is 32, so 255 cannot collide
@@ -1860,6 +3706,11 @@ impl Schedule {
         &self.peaks
     }
 
+    /// What every tapped device said this block.
+    pub fn readouts(&self) -> &[Readout; MAX_METERS] {
+        &self.readouts
+    }
+
     /// Red zone: start a new measurement window. Called once per block,
     /// before its segments run — a fixed-size fill, no allocation.
     ///
@@ -1871,6 +3722,7 @@ impl Schedule {
     pub fn clear_peaks(&mut self) {
         self.modulation.note_peaks(&self.peaks);
         self.peaks = [0.0; MAX_METERS];
+        self.readouts = [Readout::default(); MAX_METERS];
     }
 
     /// Total latency from input to output, in samples. See the field.
@@ -1986,6 +3838,22 @@ impl Schedule {
                 }
                 *peak = hot;
             }
+
+            // And what the device itself has to say, if it is tapped and
+            // has anything. Accumulated across the block's segments the
+            // way the peak above is: the LOUDEST it heard and the MOST it
+            // reduced, so a transient inside one segment survives to the
+            // frame that draws it.
+            if let Some(&slot) = self.step_tap.get(step_index)
+                && slot != NO_METER
+                && let Some(readout) = self.readouts.get_mut(slot as usize)
+                && let Some(node) = self.nodes.get(step.node)
+                && let Some(said) = node.readout()
+            {
+                readout.level_db = readout.level_db.max(said.level_db);
+                // Reduction is negative, so "most" is the minimum.
+                readout.reduction_db = readout.reduction_db.min(said.reduction_db);
+            }
         }
 
         let device_ch = output.len() / ctx.block_frames.max(1);
@@ -2051,6 +3919,10 @@ pub struct GraphSpec {
     /// number — so a muted track that compiles to nothing leaves its meter
     /// reading silence instead of shifting every meter after it.
     meters: Vec<(usize, NodeId)>,
+    /// Device readout taps: (slot, node), in the meters' slot space. What
+    /// a dynamics processor reports about ITSELF rather than about its
+    /// output — see [`Readout`].
+    taps: Vec<(usize, NodeId)>,
     /// Modulation, with each wire's `(track, parameter)` target already
     /// resolved to a node and param id by whoever built the graph — the
     /// only place that knows both halves.
@@ -2088,7 +3960,38 @@ pub enum NodeSpec {
         #[serde(default)]
         source_frames: Option<u64>,
         loop_clip: bool,
+        /// Where a LOOPING clip wraps back to, as frames past
+        /// `source_offset_frames`.
+        ///
+        /// Zero — the default, and what every clip written before braces
+        /// carries — wraps to the start of the played region, which is
+        /// what looping meant before a clip could loop a part of itself.
+        /// Anything else is a head that plays once and a tail that
+        /// repeats: the clip's own loop brace, in source frames.
+        #[serde(default)]
+        loop_start_frames: u64,
         gain: f32,
+        /// A gain ramp at each end, in FRAMES of the clip's timeline
+        /// span. Zero is no fade, which is what every clip written
+        /// before these existed carries.
+        #[serde(default)]
+        fade_in_frames: u64,
+        #[serde(default)]
+        fade_out_frames: u64,
+        /// Each fade's SHAPE, in `-1..=1`. Zero is linear, which is what
+        /// every clip written before shapes existed carries — so a
+        /// project loaded from before this sounds exactly as it did.
+        #[serde(default)]
+        fade_in_shape: f32,
+        #[serde(default)]
+        fade_out_shape: f32,
+        /// A breakpoint gain envelope over the clip's timeline span:
+        /// `(frame, linear gain)`, sorted, held flat past the last point.
+        ///
+        /// Empty is no envelope and costs the node nothing — which is
+        /// what every clip written before this carries.
+        #[serde(default)]
+        envelope: Vec<(u64, f32)>,
     },
     /// The per-track output stage: mono in -> stereo out, panned and
     /// levelled. ParamChange 0 = pan (-1..1), 1 = gain (0..~+6 dB).
@@ -2104,8 +4007,25 @@ pub enum NodeSpec {
     /// the tail loses its highs, `mix` is wet against dry — all `0..=1`.
     /// ParamChange: 0 = mix, 1 = size, 2 = damp.
     Reverb {
+        /// Milliseconds before the room answers.
+        #[serde(default)]
+        predelay_ms: f32,
         size: f32,
+        /// RT60 in seconds — how long the tail rings, which is a
+        /// different thing from how big the room is.
+        #[serde(default = "reverb_decay_default")]
+        decay: f32,
+        /// The corner of the damping one-pole, in Hz.
         damp: f32,
+        /// A highpass on the wet only, in Hz.
+        #[serde(default)]
+        low_cut: f32,
+        #[serde(default = "reverb_diffusion_default")]
+        diffusion: f32,
+        #[serde(default)]
+        modulation: f32,
+        #[serde(default = "unity")]
+        width: f32,
         mix: f32,
     },
     /// A resonant filter on whatever feeds it. `mode` and `slope` are
@@ -2114,11 +4034,91 @@ pub enum NodeSpec {
     /// `0..=1` into the oversampled soft clipper. ParamChange ids and every
     /// range are `crate::params::filter::TABLE`'s.
     Filter {
+        /// The 7-row `params::filter` patch, in engine units.
+        #[serde(default)]
+        params: crate::audio::filter::FilterParams,
+    },
+    /// The character limiter on whatever feeds it. Every id and range is
+    /// `crate::params::limiter::TABLE`'s, in the same engine units the
+    /// card speaks.
+    ///
+    /// Stereo in, stereo out, and the one node in the tree that reports a
+    /// latency it did not inherit from an oversampler.
+    Limiter {
+        /// The 7-row `params::limiter` patch, in engine units.
+        #[serde(default)]
+        params: crate::audio::limiter::LimiterParams,
+    },
+    /// A saturator on whatever feeds it: `mode` is an index into
+    /// `crate::params::sat`'s five shapes, `drive` and `bias` are the
+    /// kernel's own units (`1..32`, `-0.9..0.9`), `mix` is wet against
+    /// dry and `out` a linear output trim. ParamChange ids and every
+    /// range are `crate::params::sat::TABLE`'s.
+    ///
+    /// Stereo in, stereo out — it belongs behind the poly synth, and
+    /// mono-summing there would fold the spread away.
+    Sat {
         mode: u32,
-        slope: u32,
-        cutoff_hz: f32,
-        q: f32,
         drive: f32,
+        bias: f32,
+        mix: f32,
+        out: f32,
+    },
+    /// An analogue delay on whatever feeds it. `sync` is an index into
+    /// `crate::params::echo::SYNC_NAMES` (0 = free, and only then is
+    /// `time_ms` read); `feedback`, `drive`, `wow`, `spread` and `mix`
+    /// are percentages and `tone_hz` is the damping corner inside the
+    /// feedback loop. ParamChange ids and every range are
+    /// `crate::params::echo::TABLE`'s.
+    ///
+    /// Stereo in, stereo out.
+    Echo {
+        sync: u32,
+        time_ms: f32,
+        feedback: f32,
+        tone_hz: f32,
+        drive: f32,
+        wow: f32,
+        spread: f32,
+        mix: f32,
+        /// The SEND, as a percentage — and with it, which side of the
+        /// split this delay is on.
+        ///
+        /// Zero is an INSERT: the whole track runs through the delay,
+        /// `mix` blends, and this is what every echo was before the
+        /// parameter existed (hence the serde default — an old project
+        /// opens as the insert it was saved as). Above zero it is an
+        /// AUX: the graph builder taps its track at this level and
+        /// returns the delay's output beside the dry instead of through
+        /// it, and this is the tap's gain.
+        #[serde(default)]
+        send: f32,
+    },
+    /// An eight-band equaliser on whatever feeds it. Every range and
+    /// every `ParamChange` id is `crate::params::eq::TABLE`'s; the band
+    /// a row belongs to is `eq::split`'s answer.
+    ///
+    /// Stereo in, stereo out.
+    Eq {
+        #[serde(default)]
+        params: crate::audio::eq::EqParams,
+    },
+    /// A bus compressor on whatever feeds it. Every range and every
+    /// `ParamChange` id is `crate::params::glue::TABLE`'s.
+    ///
+    /// Stereo in, stereo out.
+    Glue {
+        #[serde(default)]
+        params: crate::audio::glue::GlueParams,
+    },
+    /// Gain, pan, width, bass mono, phase and channel mode on whatever
+    /// feeds it. Every range and every `ParamChange` id is
+    /// `crate::params::utility::TABLE`'s.
+    ///
+    /// Stereo in, stereo out.
+    Utility {
+        #[serde(default)]
+        params: crate::audio::utility::UtilityParams,
     },
     /// A pattern of notes played by the built-in 8-voice synth. Subloops
     /// unroll at compile — see `expand_subloops`. `loop_len_beats` makes it a
@@ -2132,6 +4132,124 @@ pub enum NodeSpec {
         /// this field existed still open.
         #[serde(default)]
         params: SynthParams,
+    },
+    /// A pattern of notes played by the poly synth — the workhorse
+    /// instrument of `notes/20260825-synth-brief.md`. Same pattern shape
+    /// as [`NodeSpec::Seq`] (subloops unroll at compile, `loop_len_beats`
+    /// makes it a clip); a different instrument plays it.
+    ///
+    /// Stereo out, because unison spread is a stereo idea.
+    ///
+    /// TIMELINE-LOCKED, exactly as `Seq` is: its events are stamped
+    /// against the compiled tempo and it CUTS on discontinuity, so an
+    /// offline bounce reproduces a live take sample for sample.
+    Poly {
+        notes: Vec<Note>,
+        subloops: Vec<SubLoop>,
+        loop_len_beats: Option<f64>,
+        /// The 34-row `params::poly` patch, in engine units.
+        #[serde(default)]
+        params: crate::audio::poly::PolyParams,
+    },
+    /// The kick drum synth: one pattern, one one-shot voice.
+    ///
+    /// The same pattern shape as [`NodeSpec::Seq`] and [`NodeSpec::Poly`],
+    /// a third instrument playing it. Mono out — a kick belongs in the
+    /// middle, and the track's own pan stage is what moves it if anyone
+    /// insists.
+    ///
+    /// TIMELINE-LOCKED, exactly as its siblings: events are stamped
+    /// against the compiled tempo and it CUTS on discontinuity, so an
+    /// offline bounce reproduces a live take sample for sample.
+    Kick {
+        notes: Vec<Note>,
+        subloops: Vec<SubLoop>,
+        loop_len_beats: Option<f64>,
+        /// The 13-row `params::kick` patch, in engine units.
+        #[serde(default)]
+        params: crate::audio::kick::KickParams,
+    },
+    /// The sampler: one pattern, a file, and eight voices reading it.
+    ///
+    /// The PATH is part of the spec rather than the params because
+    /// changing it is a recompile and not a letter — letters carry an
+    /// `f32` and a sample is megabytes. Everything else about the device
+    /// is a letter, so dragging a start marker is heard while it is
+    /// dragged.
+    Sampler {
+        notes: Vec<Note>,
+        subloops: Vec<SubLoop>,
+        loop_len_beats: Option<f64>,
+        /// The file to play. Empty means nothing loaded, which compiles
+        /// to a silent sampler rather than to a refused graph — a
+        /// missing sample must not mute the project.
+        #[serde(default)]
+        path: std::path::PathBuf,
+        /// The 36-row `params::sampler` patch, in engine units.
+        #[serde(default)]
+        params: crate::audio::sampler::SamplerParams,
+        /// Slice boundaries in SOURCE frames. Authored green-side (a
+        /// grid, detected onsets, or dragged markers) and baked here, for
+        /// the reason a clip's envelope is sorted at compile: the
+        /// callback walks it assuming it rises.
+        #[serde(default)]
+        slices: Vec<u64>,
+    },
+    /// The snare drum synth: one pattern, one one-shot voice.
+    ///
+    /// [`NodeSpec::Kick`]'s shape exactly, and TIMELINE-LOCKED for the
+    /// same reason — events are stamped against the compiled tempo and it
+    /// cuts on discontinuity, so an offline bounce reproduces a live take
+    /// sample for sample.
+    Snare {
+        notes: Vec<Note>,
+        subloops: Vec<SubLoop>,
+        loop_len_beats: Option<f64>,
+        /// The 11-row `params::snare` patch, in engine units.
+        #[serde(default)]
+        params: crate::audio::snare::SnareParams,
+    },
+    /// The tom synth: one pattern, one one-shot voice.
+    Tom {
+        notes: Vec<Note>,
+        subloops: Vec<SubLoop>,
+        loop_len_beats: Option<f64>,
+        /// The 9-row `params::tom` patch, in engine units.
+        #[serde(default)]
+        params: crate::audio::tom::TomParams,
+    },
+    /// The 808 hi-hat: one pattern, one one-shot voice.
+    ///
+    /// The note picks OPEN or CLOSED rather than a pitch — see
+    /// [`params::hat::OPEN_NOTE`](crate::params::hat::OPEN_NOTE).
+    Hat {
+        notes: Vec<Note>,
+        subloops: Vec<SubLoop>,
+        loop_len_beats: Option<f64>,
+        /// The 8-row `params::hat` patch, in engine units.
+        #[serde(default)]
+        params: crate::audio::hat::HatParams,
+    },
+    /// The hand clap: one pattern, one one-shot voice.
+    Handclap {
+        notes: Vec<Note>,
+        subloops: Vec<SubLoop>,
+        loop_len_beats: Option<f64>,
+        /// The 10-row `params::handclap` patch, in engine units.
+        #[serde(default)]
+        params: crate::audio::handclap::HandclapParams,
+    },
+    /// Modulato: chorus, flanger and vibrato, which are one effect.
+    ///
+    /// Stereo in, stereo out — the two sides run their own line and their
+    /// own oscillator, and the phase between them is what widens it.
+    ///
+    /// FREE-RUNNING: its delay memory is signal history, not timeline
+    /// position. It CUTS on discontinuity all the same, because the
+    /// samples it is holding belong to a position the transport has left.
+    Modulato {
+        #[serde(default)]
+        params: crate::audio::modulato::ModulatoParams,
     },
     /// Plugin delay compensation, inserted by COMPILE — never by a user and
     /// never by the graph builder.
@@ -2177,6 +4295,20 @@ impl GraphSpec {
     /// Declare which node feeds the speakers.
     pub fn set_output(&mut self, id: NodeId) {
         self.output = Some(id);
+    }
+
+    /// Ask `node` for its READOUT under `slot` — what it is doing, as
+    /// opposed to how loud its output is.
+    ///
+    /// Slots are the meter's slots and the same size table; a node with
+    /// nothing to say simply never reports. Slots past [`MAX_METERS`]
+    /// are ignored rather than clamped, for the reason `meter` gives:
+    /// silently reporting the wrong device would be worse than not
+    /// reporting it.
+    pub fn tap(&mut self, slot: usize, node: NodeId) {
+        if slot < MAX_METERS {
+            self.taps.push((slot, node));
+        }
     }
 
     /// Report `node`'s output level to the UI under `slot`.
@@ -2240,7 +4372,18 @@ impl GraphSpec {
     fn spec_latency(spec: &NodeSpec) -> usize {
         match spec {
             // The half-band round trip of the 2x drive stage.
-            NodeSpec::Filter { .. } => crate::dsp::shaper::Oversampler2x::new().latency(),
+            // Both run their shaping at 2x, and both keep the round
+            // trip permanently in the path so the figure is constant.
+            NodeSpec::Sat { .. } => crate::dsp::shaper::Oversampler2x::new().latency(),
+            // Stated by the device itself, so the figure the graph
+            // compensates for and the delay the device actually holds
+            // cannot drift apart.
+            NodeSpec::Filter { .. } => crate::audio::filter::latency(),
+            // The lookahead plus BOTH half-band round trips. Constant,
+            // and stated by the device itself so the figure the graph
+            // compensates for and the delay the device actually holds
+            // cannot drift apart.
+            NodeSpec::Limiter { .. } => crate::audio::limiter::latency(),
             NodeSpec::Delay { samples, .. } => *samples,
             _ => 0,
         }
@@ -2514,100 +4657,303 @@ impl GraphSpec {
                         loop_len_beats,
                         params,
                     }) => {
-                        if let Some(len) = loop_len_beats
-                            && !(len.is_finite() && *len > 0.0)
-                        {
-                            return Err(CompileError::BadClipLen);
-                        }
-                        let notes = expand_subloops(notes, subloops)?;
-                        // Bake note starts/ends into one sorted event list.
-                        // Sort by (beat, rank): offs before ons on exact ties.
-                        let mut events = Vec::with_capacity(notes.len() * 2);
-                        for n in &notes {
-                            if n.len_beats <= 0.0 || n.vel == 0 {
-                                continue; // degenerate notes never enter the engine
-                            }
-                            // Clip mode: a note starting past the loop is
-                            // dropped; one ringing past it is cut at the wrap
-                            // (off clamped), so the wrap flush can never miss.
-                            let mut end = n.start_beats + n.len_beats;
-                            if let Some(len) = loop_len_beats {
-                                if n.start_beats >= *len {
-                                    continue;
-                                }
-                                end = end.min(*len);
-                            }
-                            // Musical time becomes SAMPLES here and only
-                            // here — the contract's rule 1, and the whole
-                            // reason `compile_at_tempo` takes a tempo.
-                            // Rounding is to nearest so a note does not
-                            // consistently land early.
-                            let stamp = |beats: f64| -> u64 {
-                                (beats * samples_per_beat).round().max(0.0) as u64
-                            };
-                            let on = stamp(n.start_beats);
-                            // The drop test above is in BEATS but the stamp
-                            // rounds to SAMPLES, so a note within half a
-                            // sample of the clip end survives the first
-                            // check and lands exactly ON the loop boundary.
-                            // The wrap flush is already past that point, so
-                            // such a note-on would gate a voice nothing
-                            // ever releases — a hanging note from a note
-                            // too short to hear.
-                            if let Some(len) = loop_len_beats
-                                && on >= stamp(*len)
-                            {
-                                continue;
-                            }
-                            events.push(SeqEvent {
-                                sample: on,
-                                rank: 1,
-                                pitch: n.pitch,
-                                vel: n.vel,
-                            });
-                            events.push(SeqEvent {
-                                sample: stamp(end),
-                                rank: 0,
-                                pitch: n.pitch,
-                                vel: 0,
-                            });
-                        }
-                        // (sample, rank): rank 0 = off, so an off at the
-                        // same sample as an on always lands first.
-                        events.sort_by(|a, b| a.sample.cmp(&b.sample).then(a.rank.cmp(&b.rank)));
+                        let events =
+                            compile_events(notes, subloops, *loop_len_beats, samples_per_beat)?;
+                        let mut voices = VoiceBank::default();
+                        voices.prepare(sample_rate as f32, *params);
+                        // RON round-trips NaN literals, so a hand-edited
+                        // or corrupt project could smuggle one in; the
+                        // default is the sane fallback.
+                        let gain = if params.gain.is_finite() {
+                            params.gain.clamp(0.0, 2.0)
+                        } else {
+                            SynthParams::default().gain
+                        };
                         Node::Seq {
                             events,
-                            cursor: 0,
-                            voices: VoiceBank::default(),
-                            next_age: 0,
-                            sample_rate: sample_rate as f32,
-                            // RON round-trips NaN literals, so a hand-edited
-                            // or corrupt project could smuggle one in; the
-                            // default is the sane fallback.
-                            gain: if params.gain.is_finite() {
-                                params.gain.clamp(0.0, 2.0)
-                            } else {
-                                SynthParams::default().gain
-                            },
-                            target_gain: if params.gain.is_finite() {
-                                params.gain.clamp(0.0, 2.0)
-                            } else {
-                                SynthParams::default().gain
-                            },
-                            attack_rate: synth_attack_rate(params.attack_ms, sample_rate as f32),
-                            release_coeff: synth_release_coeff(
-                                params.release_ms,
-                                sample_rate as f32,
-                            ),
                             // The pattern's length in samples at this
                             // tempo. Zero when there is no loop, which the
                             // walk reads as "never wrap".
-                            loop_samples: loop_len_beats
-                                .map(|len| (len * samples_per_beat).round().max(0.0) as u64)
-                                .unwrap_or(0),
-                            samples_per_beat,
-                            last_cycle: 0,
-                            prev_phase: 0,
+                            clock: PatternClock::new(
+                                loop_len_beats
+                                    .map(|len| (len * samples_per_beat).round().max(0.0) as u64)
+                                    .unwrap_or(0),
+                                samples_per_beat,
+                            ),
+                            voices,
+                            gain,
+                            target_gain: gain,
+                        }
+                    }
+                    Some(NodeSpec::Kick {
+                        notes,
+                        subloops,
+                        loop_len_beats,
+                        params,
+                    }) => {
+                        let events =
+                            compile_events(notes, subloops, *loop_len_beats, samples_per_beat)?;
+                        // Green zone: builds the sine tables the callback
+                        // will read and nothing else allocates afterwards.
+                        let mut voices = crate::audio::kick::KickVoice::new();
+                        voices.prepare(sample_rate as f32, *params);
+                        // RON round-trips NaN literals, so a hand-edited
+                        // or corrupt project could smuggle one in.
+                        let gain = if params.gain.is_finite() {
+                            params.gain.clamp(0.0, 2.0)
+                        } else {
+                            crate::audio::kick::KickParams::default().gain
+                        };
+                        Node::Kick {
+                            events,
+                            clock: PatternClock::new(
+                                loop_len_beats
+                                    .map(|len| (len * samples_per_beat).round().max(0.0) as u64)
+                                    .unwrap_or(0),
+                                samples_per_beat,
+                            ),
+                            voices: Box::new(voices),
+                            gain: 0.0,
+                            target_gain: gain,
+                        }
+                    }
+                    Some(NodeSpec::Sampler {
+                        notes,
+                        subloops,
+                        loop_len_beats,
+                        path,
+                        params,
+                        slices,
+                    }) => {
+                        let events =
+                            compile_events(notes, subloops, *loop_len_beats, samples_per_beat)?;
+                        // GREEN ZONE: the file is decoded and resampled to
+                        // the device rate HERE, once, behind a cache. An
+                        // unreadable or absent file compiles to a SILENT
+                        // sampler rather than refusing the whole graph —
+                        // the same rule `AudioClip` keeps, because a
+                        // missing sample should not mute a project.
+                        let material = if path.as_os_str().is_empty() {
+                            crate::audio::material::Material::empty()
+                        } else {
+                            crate::audio::material::load_cached(path, sample_rate)
+                                .unwrap_or_else(|_| crate::audio::material::Material::empty())
+                        };
+                        // The slice table, made safe for the callback to
+                        // walk: sorted, deduplicated, inside the file, and
+                        // capped. Exactly what `sorted_envelope` does for a
+                        // clip, and for the same reason.
+                        let mut table: Vec<u64> = slices
+                            .iter()
+                            .copied()
+                            .filter(|at| *at < material.frames)
+                            .collect();
+                        table.sort_unstable();
+                        table.dedup();
+                        table.truncate(crate::audio::sampler::MAX_SLICES);
+                        // Nothing authored yet: fall back to the grid the
+                        // knob asks for, so dropping a break on the device
+                        // and switching to slice mode plays slices instead
+                        // of silence.
+                        if table.is_empty() && material.frames > 0 {
+                            table = crate::slice::grid(
+                                material.frames,
+                                params.slices.round().max(1.0) as usize,
+                            );
+                        }
+                        let mut voices = crate::audio::sampler::SamplerVoices::new(
+                            sample_rate as f32,
+                            block_frames,
+                            *params,
+                            material,
+                        );
+                        voices.set_slices(&table);
+                        let mut preamp = crate::audio::preamp::Preamp::new();
+                        preamp.prepare(sample_rate as f32);
+                        preamp.set_amount(params.preamp);
+                        // RON round-trips NaN literals, so a hand-edited or
+                        // corrupt project could smuggle one in.
+                        let gain = if params.gain_db.is_finite() {
+                            10f32.powf(params.gain_db.clamp(-60.0, 12.0) / 20.0)
+                        } else {
+                            1.0
+                        };
+                        Node::Sampler {
+                            events,
+                            clock: PatternClock::new(
+                                loop_len_beats
+                                    .map(|len| (len * samples_per_beat).round().max(0.0) as u64)
+                                    .unwrap_or(0),
+                                samples_per_beat,
+                            ),
+                            voices: Box::new(voices),
+                            preamp,
+                            gain: 0.0,
+                            target_gain: gain,
+                        }
+                    }
+                    Some(NodeSpec::Snare {
+                        notes,
+                        subloops,
+                        loop_len_beats,
+                        params,
+                    }) => {
+                        let events =
+                            compile_events(notes, subloops, *loop_len_beats, samples_per_beat)?;
+                        // Green zone: whatever this voice needs to
+                        // allocate, it allocates here and never again.
+                        let mut voices = crate::audio::snare::SnareVoice::new();
+                        voices.prepare(sample_rate as f32, *params);
+                        // RON round-trips NaN literals, so a hand-edited
+                        // or corrupt project could smuggle one in.
+                        let gain = if params.gain.is_finite() {
+                            params.gain.clamp(0.0, 2.0)
+                        } else {
+                            crate::audio::snare::SnareParams::default().gain
+                        };
+                        Node::Snare {
+                            events,
+                            clock: PatternClock::new(
+                                loop_len_beats
+                                    .map(|len| (len * samples_per_beat).round().max(0.0) as u64)
+                                    .unwrap_or(0),
+                                samples_per_beat,
+                            ),
+                            voices: Box::new(voices),
+                            gain: 0.0,
+                            target_gain: gain,
+                        }
+                    }
+                    Some(NodeSpec::Tom {
+                        notes,
+                        subloops,
+                        loop_len_beats,
+                        params,
+                    }) => {
+                        let events =
+                            compile_events(notes, subloops, *loop_len_beats, samples_per_beat)?;
+                        // Green zone: whatever this voice needs to
+                        // allocate, it allocates here and never again.
+                        let mut voices = crate::audio::tom::TomVoice::new();
+                        voices.prepare(sample_rate as f32, *params);
+                        // RON round-trips NaN literals, so a hand-edited
+                        // or corrupt project could smuggle one in.
+                        let gain = if params.gain.is_finite() {
+                            params.gain.clamp(0.0, 2.0)
+                        } else {
+                            crate::audio::tom::TomParams::default().gain
+                        };
+                        Node::Tom {
+                            events,
+                            clock: PatternClock::new(
+                                loop_len_beats
+                                    .map(|len| (len * samples_per_beat).round().max(0.0) as u64)
+                                    .unwrap_or(0),
+                                samples_per_beat,
+                            ),
+                            voices: Box::new(voices),
+                            gain: 0.0,
+                            target_gain: gain,
+                        }
+                    }
+                    Some(NodeSpec::Hat {
+                        notes,
+                        subloops,
+                        loop_len_beats,
+                        params,
+                    }) => {
+                        let events =
+                            compile_events(notes, subloops, *loop_len_beats, samples_per_beat)?;
+                        // Green zone: whatever this voice needs to
+                        // allocate, it allocates here and never again.
+                        let mut voices = crate::audio::hat::HatVoice::new();
+                        voices.prepare(sample_rate as f32, *params);
+                        // RON round-trips NaN literals, so a hand-edited
+                        // or corrupt project could smuggle one in.
+                        let gain = if params.gain.is_finite() {
+                            params.gain.clamp(0.0, 2.0)
+                        } else {
+                            crate::audio::hat::HatParams::default().gain
+                        };
+                        Node::Hat {
+                            events,
+                            clock: PatternClock::new(
+                                loop_len_beats
+                                    .map(|len| (len * samples_per_beat).round().max(0.0) as u64)
+                                    .unwrap_or(0),
+                                samples_per_beat,
+                            ),
+                            voices: Box::new(voices),
+                            gain: 0.0,
+                            target_gain: gain,
+                        }
+                    }
+                    Some(NodeSpec::Handclap {
+                        notes,
+                        subloops,
+                        loop_len_beats,
+                        params,
+                    }) => {
+                        let events =
+                            compile_events(notes, subloops, *loop_len_beats, samples_per_beat)?;
+                        // Green zone: whatever this voice needs to
+                        // allocate, it allocates here and never again.
+                        let mut voices = crate::audio::handclap::HandclapVoice::new();
+                        voices.prepare(sample_rate as f32, *params);
+                        // RON round-trips NaN literals, so a hand-edited
+                        // or corrupt project could smuggle one in.
+                        let gain = if params.gain.is_finite() {
+                            params.gain.clamp(0.0, 2.0)
+                        } else {
+                            crate::audio::handclap::HandclapParams::default().gain
+                        };
+                        Node::Handclap {
+                            events,
+                            clock: PatternClock::new(
+                                loop_len_beats
+                                    .map(|len| (len * samples_per_beat).round().max(0.0) as u64)
+                                    .unwrap_or(0),
+                                samples_per_beat,
+                            ),
+                            voices: Box::new(voices),
+                            gain: 0.0,
+                            target_gain: gain,
+                        }
+                    }
+                    Some(NodeSpec::Poly {
+                        notes,
+                        subloops,
+                        loop_len_beats,
+                        params,
+                    }) => {
+                        let events =
+                            compile_events(notes, subloops, *loop_len_beats, samples_per_beat)?;
+                        // Green zone: this builds every waveform table and
+                        // every scratch buffer the callback will ever need.
+                        // `block_frames` is the longest segment there can be.
+                        let voices = crate::audio::poly::PolyVoices::new(
+                            sample_rate as f32,
+                            block_frames,
+                            *params,
+                        );
+                        // RON round-trips NaN literals, so a hand-edited or
+                        // corrupt project could smuggle one in.
+                        let gain = if params.gain.is_finite() {
+                            params.gain.clamp(0.0, 2.0)
+                        } else {
+                            crate::audio::poly::PolyParams::default().gain
+                        };
+                        Node::Poly {
+                            events,
+                            clock: PatternClock::new(
+                                loop_len_beats
+                                    .map(|len| (len * samples_per_beat).round().max(0.0) as u64)
+                                    .unwrap_or(0),
+                                samples_per_beat,
+                            ),
+                            voices: Box::new(voices),
+                            gain,
+                            target_gain: gain,
                         }
                     }
                     Some(NodeSpec::AudioClip {
@@ -2617,7 +4963,13 @@ impl GraphSpec {
                         source_offset_frames,
                         source_frames,
                         loop_clip,
+                        loop_start_frames,
                         gain,
+                        fade_in_frames,
+                        fade_out_frames,
+                        fade_in_shape,
+                        fade_out_shape,
+                        envelope,
                     }) => {
                         // Green zone: opening spawns creek's IO thread and
                         // touches the filesystem — compile is where that lives.
@@ -2662,8 +5014,33 @@ impl GraphSpec {
                                     source_start,
                                     source_frames,
                                     loop_clip: *loop_clip,
+                                    // Clamped into the played region, and
+                                    // NEVER onto its end: a brace of zero
+                                    // length would be a modulus by zero in
+                                    // the callback, which is a panic on the
+                                    // audio thread.
+                                    loop_from: source_start.saturating_add(
+                                        (*loop_start_frames).min(source_frames.saturating_sub(1)),
+                                    ),
                                     gain: 0.0, // ramp in
                                     target_gain: *gain,
+                                    // Clamped to the span they live on:
+                                    // a fade longer than its clip would
+                                    // never reach full level, and two
+                                    // that overlap would fight.
+                                    fade_in: (*fade_in_frames).min(timeline_frames),
+                                    fade_out: (*fade_out_frames).min(timeline_frames),
+                                    fade_in_curve: crate::params::clip::Curve::new(*fade_in_shape),
+                                    fade_out_curve: crate::params::clip::Curve::new(
+                                        *fade_out_shape,
+                                    ),
+                                    // Sorted and clamped HERE, green
+                                    // side: the callback walks this list
+                                    // assuming it rises, and sorting it
+                                    // there would be both an allocation
+                                    // and an unbounded path.
+                                    envelope: sorted_envelope(envelope, timeline_frames),
+                                    envelope_cursor: 0,
                                     failed: false,
                                     next_frame: source_start,
                                 }
@@ -2676,8 +5053,15 @@ impl GraphSpec {
                                 source_start: 0,
                                 source_frames: 0,
                                 loop_clip: *loop_clip,
+                                loop_from: 0,
                                 gain: 0.0,
                                 target_gain: *gain,
+                                fade_in: 0,
+                                fade_out: 0,
+                                fade_in_curve: crate::params::clip::Curve::LINEAR,
+                                fade_out_curve: crate::params::clip::Curve::LINEAR,
+                                envelope: Vec::new(),
+                                envelope_cursor: 0,
                                 failed: true,
                                 next_frame: 0,
                             },
@@ -2717,99 +5101,264 @@ impl GraphSpec {
                             target_gain: level,
                         }
                     }
-                    Some(NodeSpec::Reverb { size, damp, mix }) => {
+                    Some(NodeSpec::Reverb {
+                        predelay_ms,
+                        size,
+                        decay,
+                        damp,
+                        low_cut,
+                        diffusion,
+                        modulation,
+                        width,
+                        mix,
+                    }) => {
                         // Green zone: this is where a reverb's memory is
                         // allowed to be born. The kernel only ever indexes
                         // inside it.
                         let sr = sample_rate as f32;
-                        let mut buffers = vec![0.0f32; crate::dsp::reverb::Reverb::buffer_len(sr)];
-                        let mut core = crate::dsp::reverb::Reverb::new();
+                        let mut buffers = vec![0.0f32; crate::dsp::fdn::Fdn::buffer_len(sr)];
+                        let mut core = crate::dsp::fdn::Fdn::new();
                         core.prepare(sr, &mut buffers);
-                        // Decay rides size until the kernel's split control
-                        // gets a knob of its own — the pre-split behaviour.
-                        core.set_room(*size, *size, *damp);
+                        core.set_size(*size);
+                        core.set_decay(*decay);
+                        core.set_damping(*damp);
+                        core.set_diffusion(*diffusion);
+                        core.set_modulation(*modulation);
+                        // Green zone: every buffer the callback will ever
+                        // need, allocated once at compile.
+                        let mut predelay = crate::dsp::delay::DelayLine::new();
+                        let max_predelay =
+                            (crate::params::reverb::PREDELAY_MAX * 0.001 * sr).ceil() as usize;
+                        let mut predelay_buf =
+                            vec![0.0f32; crate::dsp::delay::buffer_len(max_predelay)];
+                        predelay.prepare(max_predelay);
+                        predelay.set_delay(*predelay_ms * 0.001 * sr);
+                        let mut low_cut_l = crate::dsp::filters::OnePole::new();
+                        let mut low_cut_r = crate::dsp::filters::OnePole::new();
+                        low_cut_l.prepare(sr, *low_cut);
+                        low_cut_r.prepare(sr, *low_cut);
+                        let _ = &mut predelay_buf;
                         Node::Reverb {
                             core,
                             buffers,
-                            wet: vec![0.0f32; block_frames],
+                            predelay,
+                            predelay_buf,
+                            fed: vec![0.0f32; block_frames],
+                            wet_l: vec![0.0f32; block_frames],
+                            wet_r: vec![0.0f32; block_frames],
+                            low_cut_l,
+                            low_cut_r,
                             mix: mix.clamp(0.0, 1.0),
                             target_mix: mix.clamp(0.0, 1.0),
-                            size: *size,
-                            damp: *damp,
+                            width: *width,
                             sample_rate: sr,
                         }
                     }
-                    Some(NodeSpec::Filter {
-                        mode,
-                        slope,
-                        cutoff_hz,
-                        q,
-                        drive,
-                    }) => {
-                        use crate::params::filter as fp;
-                        // Green zone: everything heap-shaped is born here.
-                        // Values clamp through the same table rows the
-                        // letters will, so a stale project file cannot
-                        // smuggle an out-of-range coefficient in.
-                        let sr = sample_rate as f32;
-                        let mode = (*mode).min(fp::MODE_NOTCH);
-                        let slope = (*slope).min(fp::SLOPE_ORDERS.len() as u32 - 1);
-                        let cutoff_hz = fp::TABLE[fp::CUTOFF as usize].clamp(*cutoff_hz);
-                        let q = fp::TABLE[fp::RES as usize].clamp(*q);
-                        let drive = fp::TABLE[fp::DRIVE as usize].clamp(*drive);
-                        let mut core = Box::new(FilterCore {
-                            cascade: crate::dsp::filters::Cascade::new(),
-                            svf: crate::dsp::filters::Svf::new(),
-                            shaper: crate::dsp::shaper::Waveshaper::new(),
-                            oversampler: crate::dsp::shaper::Oversampler2x::new(),
-                            dc: crate::dsp::filters::DcBlocker::new(),
-                        });
-                        let q_eff = fp::effective_q(q, drive);
-                        match mode {
-                            fp::MODE_BP | fp::MODE_NOTCH => {
-                                core.svf.prepare(sr, cutoff_hz, q_eff);
-                            }
-                            _ => core.cascade.prepare(
-                                sr,
-                                cutoff_hz,
-                                q_eff,
-                                fp::slope_order(slope),
-                                mode == fp::MODE_HP,
-                            ),
+                    Some(NodeSpec::Filter { params }) => {
+                        // Green zone: everything heap-shaped is born
+                        // here. The core itself allocates nothing — the
+                        // scratch below is every buffer it touches, and
+                        // it clamps each value through the same table
+                        // rows the letters will, so a stale project file
+                        // cannot smuggle an out-of-range setting in.
+                        let mut core = Box::new(crate::audio::filter::FilterCore::new());
+                        core.prepare(sample_rate as f32, *params);
+                        Node::Filter {
+                            core,
+                            scratch: vec![0.0f32; crate::audio::filter::scratch_len(block_frames)],
                         }
-                        core.dc.prepare(sr);
-                        core.shaper.configure(
-                            crate::dsp::shaper::Mode::SoftClip,
-                            fp::shaper_drive(drive),
-                            0.0,
-                            1.0, // pure: the node owns the dry/wet blend
-                        );
+                    }
+                    Some(NodeSpec::Modulato { params }) => {
+                        // Green zone: every delay line and scratch the
+                        // callback will ever need, born here.
+                        Node::Modulato {
+                            core: Box::new(crate::audio::modulato::Modulato::new(
+                                sample_rate as f32,
+                                block_frames,
+                                *params,
+                            )),
+                        }
+                    }
+                    Some(NodeSpec::Limiter { params }) => {
+                        // Green zone: everything heap-shaped is born
+                        // here. The core itself allocates nothing — every
+                        // buffer it reads or writes is one of these.
+                        let mut core = Box::new(crate::audio::limiter::LimiterCore::new());
+                        core.prepare(sample_rate as f32, *params);
+                        let line = crate::audio::limiter::line_len();
+                        Node::Limiter {
+                            core,
+                            scratch: vec![0.0f32; crate::audio::limiter::scratch_len(block_frames)],
+                            key: vec![0.0f32; line],
+                            line_l: vec![0.0f32; line],
+                            line_r: vec![0.0f32; line],
+                        }
+                    }
+                    Some(NodeSpec::Sat {
+                        mode,
+                        drive,
+                        bias,
+                        mix,
+                        out,
+                    }) => {
+                        use crate::params::sat as sp;
+                        // Green zone: everything heap-shaped is born here,
+                        // and every value clamps through the same table
+                        // rows the letters will — a stale project file
+                        // cannot smuggle an out-of-range setting in.
+                        let sr = sample_rate as f32;
+                        let mode = (*mode).min(sp::MODE_MAX);
+                        let drive = sp::TABLE[sp::DRIVE as usize].clamp(*drive);
+                        let bias = sp::TABLE[sp::BIAS as usize].clamp(*bias);
+                        let mix = sp::TABLE[sp::MIX as usize].clamp(*mix);
+                        let trim = sp::TABLE[sp::OUT as usize].clamp(*out);
+                        let mut core = Box::new(SatCore {
+                            shaper: crate::dsp::shaper::Waveshaper::new(),
+                            oversampler: [crate::dsp::shaper::Oversampler2x::new(); 2],
+                            dc: [crate::dsp::filters::DcBlocker::new(); 2],
+                        });
+                        core.shaper.configure(sp::mode(mode), drive, bias, 1.0);
+                        for dc in core.dc.iter_mut() {
+                            dc.prepare(sr);
+                        }
                         let smoother = |value: f32| {
                             let mut s = crate::dsp::ramps::Smoother::new();
-                            s.prepare(sr, FILTER_SMOOTH_MS);
+                            s.prepare(sr, SAT_SMOOTH_MS);
                             s.set_now(value);
                             s
                         };
-                        Node::Filter {
+                        Node::Sat {
                             core,
-                            // Two 2x lanes: the round-trip signal and the
-                            // shaped copy the node blends against.
-                            scratch2x: vec![0.0f32; block_frames * 4],
+                            // Three 2x lanes: left, right, and the shaped
+                            // copy the node blends against.
+                            scratch2x: vec![0.0f32; block_frames * 6],
                             mode,
-                            slope,
                             pending_mode: mode,
-                            pending_slope: slope,
-                            cutoff: smoother(cutoff_hz),
-                            res: smoother(q),
                             drive: smoother(drive),
-                            cutoff_target: cutoff_hz,
-                            res_target: q,
+                            bias: smoother(bias),
+                            mix: smoother(mix),
+                            trim: smoother(trim),
                             drive_target: drive,
-                            prepared_cutoff: cutoff_hz,
-                            prepared_q: q_eff,
+                            bias_target: bias,
+                            mix_target: mix,
+                            trim_target: trim,
+                        }
+                    }
+                    Some(NodeSpec::Echo {
+                        sync,
+                        time_ms,
+                        feedback,
+                        tone_hz,
+                        drive,
+                        wow,
+                        spread,
+                        mix,
+                        send,
+                    }) => {
+                        use crate::params::echo as ep;
+                        // Green zone: the rings are born here, once, at
+                        // the longest echo the table allows. The red zone
+                        // never asks for more than this, because
+                        // `time_samples` clamps to the same figure.
+                        let sr = sample_rate as f32;
+                        let clamp = |id: u32, v: f32| ep::TABLE[id as usize].clamp(v);
+                        let sync = (*sync).min(ep::SYNC_NAMES.len() as u32 - 1);
+                        let time_ms = clamp(ep::TIME, *time_ms);
+                        let feedback = clamp(ep::FEEDBACK, *feedback);
+                        let tone_hz = clamp(ep::TONE, *tone_hz);
+                        let drive = clamp(ep::DRIVE, *drive);
+                        let wow = clamp(ep::WOW, *wow);
+                        let spread = clamp(ep::SPREAD, *spread);
+                        let mix = clamp(ep::MIX, *mix);
+                        // An aux by the same rule the graph builder used
+                        // when it decided how to wire this node — one
+                        // rule, read twice, so the topology and the gain
+                        // cannot disagree about which side it is on.
+                        let send = clamp(ep::SEND, *send);
+                        let aux = send > 0.0;
+
+                        let max_samples = (ep::MAX_MS * 1e-3 * sr).ceil() as usize;
+                        let ring_len = crate::dsp::delay::FeedbackDelay::needed_len(max_samples);
+                        let mut core = Box::new(EchoCore {
+                            line: [crate::dsp::delay::FeedbackDelay::new(); 2],
+                            wow: [crate::dsp::lfo::Lfo::new(); 2],
+                        });
+                        for line in core.line.iter_mut() {
+                            line.prepare(sr, max_samples, tone_hz);
+                            line.set_feedback(feedback * 0.01);
+                            line.set_drive(drive * 0.01 * ECHO_DRIVE_MAX);
+                        }
+                        for (i, w) in core.wow.iter_mut().enumerate() {
+                            w.prepare(sr);
+                            w.set_shape(crate::dsp::lfo::LfoShape::Sine);
+                            w.set_rate(ECHO_WOW_HZ);
+                            // The two sides wobble a quarter turn apart,
+                            // so the image drifts instead of the pitch
+                            // moving in mono.
+                            w.set_phase(i as f32 * ECHO_WOW_SPREAD_TURNS);
+                        }
+                        let smoother = |value: f32, ms: f32| {
+                            let mut s = crate::dsp::ramps::Smoother::new();
+                            s.prepare(sr, ms);
+                            s.set_now(value);
+                            s
+                        };
+                        // The first segment recomputes this against the
+                        // real tempo; starting the glide already there
+                        // means a freshly loaded echo does not swoop.
+                        let start = ep::time_samples(sync, time_ms, sr, 0.0);
+                        Node::Echo {
+                            core,
+                            rings: [vec![0.0f32; ring_len], vec![0.0f32; ring_len]],
+                            scratch: vec![0.0f32; block_frames * 4],
+                            sync,
+                            pending_sync: sync,
+                            time: smoother(start, ECHO_GLIDE_MS),
+                            time_ms,
+                            feedback: smoother(feedback, ECHO_SMOOTH_MS),
+                            tone: smoother(tone_hz, ECHO_SMOOTH_MS),
+                            drive: smoother(drive, ECHO_SMOOTH_MS),
+                            wow: smoother(wow, ECHO_SMOOTH_MS),
+                            spread: smoother(spread, ECHO_SMOOTH_MS),
+                            mix: smoother(mix, ECHO_SMOOTH_MS),
+                            aux,
+                            // An insert reads unity and never looks
+                            // again; only an aux carries the tap's gain.
+                            in_gain: if aux { send * 0.01 } else { 1.0 },
+                            in_target: if aux { send * 0.01 } else { 1.0 },
+                            time_target: start,
+                            feedback_target: feedback,
+                            tone_target: tone_hz,
+                            drive_target: drive,
+                            wow_target: wow,
+                            spread_target: spread,
+                            mix_target: mix,
                             sample_rate: sr,
                         }
                     }
+                    Some(NodeSpec::Eq { params }) => Node::Eq {
+                        // Green zone: every smoother, every coefficient
+                        // and the one scratch lane the callback will use.
+                        core: Box::new(crate::audio::eq::EqCore::new(
+                            sample_rate as f32,
+                            block_frames,
+                            params,
+                        )),
+                    },
+                    Some(NodeSpec::Glue { params }) => Node::Glue {
+                        // Green zone: every kernel the callback will use.
+                        core: Box::new(crate::audio::glue::GlueCore::new(
+                            sample_rate as f32,
+                            params,
+                        )),
+                    },
+                    Some(NodeSpec::Utility { params }) => Node::Utility {
+                        // Green zone: both filters, prepared here.
+                        core: Box::new(crate::audio::utility::UtilityCore::new(
+                            sample_rate as f32,
+                            params,
+                        )),
+                    },
                     Some(NodeSpec::Click) => Node::Click {
                         phase: 0.0,
                         env: 0.0,
@@ -2920,6 +5469,22 @@ impl GraphSpec {
         // loop knows steps, not ids. A tap on a node that did not survive
         // compilation (an unreachable branch, a removed node) simply finds
         // no step and reports silence.
+        // The readout taps, resolved the same way and into the same slot
+        // space. A tap on a node that did not survive compilation simply
+        // finds no step and reports nothing.
+        let mut step_tap = vec![NO_METER; steps.len()];
+        for (slot, node) in &self.taps {
+            if *slot >= MAX_METERS {
+                continue;
+            }
+            let Some(dense) = self.order.iter().position(|id| id == node) else {
+                continue;
+            };
+            if let Some(step) = steps.iter().position(|step| step.node == dense) {
+                step_tap[step] = *slot as u8;
+            }
+        }
+
         let mut step_meter = vec![NO_METER; steps.len()];
         for (slot, node) in &self.meters {
             if *slot >= MAX_METERS {
@@ -2943,6 +5508,8 @@ impl GraphSpec {
             output_slot,
             slot_table,
             step_meter,
+            step_tap,
+            readouts: [Readout::default(); MAX_METERS],
             peaks: [0.0; MAX_METERS],
             // Wires resolve against the SAME dense correspondence the
             // name-tag directory uses, so a wire and a letter can never
@@ -3088,6 +5655,7 @@ mod tests {
             param: crate::params::mixer::GAIN,
             min: 0.0,
             max: 2.0,
+            log: false,
             base: 1.0,
             chain: Chain {
                 depth: 0.2,
@@ -3213,6 +5781,7 @@ mod tests {
                     param: crate::params::mixer::GAIN,
                     min: 0.0,
                     max: 2.0,
+                    log: false,
                     base: 1.0,
                     chain: Chain {
                         depth: 0.25,
@@ -3261,6 +5830,9 @@ mod tests {
                 len_beats: 1.0,
                 pitch: 69,
                 vel: 127,
+                plocks: Vec::new(),
+                prob: 1.0,
+                cond: None,
             }],
             subloops: vec![],
             loop_len_beats: None,
@@ -3286,6 +5858,9 @@ mod tests {
                         len_beats: 4.0,
                         pitch: *p,
                         vel: 127,
+                        plocks: Vec::new(),
+                        prob: 1.0,
+                        cond: None,
                     })
                     .collect(),
                 subloops: vec![],
@@ -3343,6 +5918,9 @@ mod tests {
                 len_beats: 16.0,
                 pitch: 60 + i as u8,
                 vel: 127,
+                plocks: Vec::new(),
+                prob: 1.0,
+                cond: None,
             })
             .collect();
         let id = spec.push(NodeSpec::Seq {
@@ -3406,21 +5984,33 @@ mod tests {
     /// flatness, slope steepness and the resonant peak all ride on it.
     #[test]
     fn filter_node_tracks_the_display_curve() {
+        use crate::params::filter as fp;
         use crate::ui::device::filter as ui;
-        for (mode, ui_mode, q) in [
-            (crate::params::filter::MODE_LP, ui::Mode::Lowpass, 0.707),
-            (crate::params::filter::MODE_LP, ui::Mode::Lowpass, 8.0),
-            (crate::params::filter::MODE_HP, ui::Mode::Highpass, 0.707),
+        // The CHARACTER rides along, because it is the one setting that
+        // moves the audio without moving a coefficient: a ladder gives up
+        // a decibel of level at Q 8 that a clean filter keeps, and before
+        // the two sides shared `resonance_loss` the display drew the
+        // clean number for every voicing.
+        for (mode, ui_mode, q, character) in [
+            (fp::MODE_LP, ui::Mode::Lowpass, 0.707, fp::CHAR_CLEAN),
+            (fp::MODE_LP, ui::Mode::Lowpass, 8.0, fp::CHAR_CLEAN),
+            (fp::MODE_LP, ui::Mode::Lowpass, 8.0, fp::CHAR_LADDER),
+            (fp::MODE_LP, ui::Mode::Lowpass, 8.0, fp::CHAR_DIODE),
+            (fp::MODE_HP, ui::Mode::Highpass, 0.707, fp::CHAR_LADDER),
         ] {
             for freq in [250.0, 1_000.0, 4_000.0] {
                 let measured = filter_gain_db(
                     freq,
                     NodeSpec::Filter {
-                        mode,
-                        slope: 3, // 24 dB/octave
-                        cutoff_hz: 1_000.0,
-                        q,
-                        drive: 0.0,
+                        params: crate::audio::filter::FilterParams {
+                            mode: mode as f32,
+                            slope: 3.0,
+                            cutoff_hz: 1_000.0,
+                            res: q,
+                            drive: 0.0,
+                            character: character as f32,
+                            ..Default::default()
+                        },
                     },
                 );
                 let drawn = ui::magnitude_db(
@@ -3430,6 +6020,7 @@ mod tests {
                         cutoff_hz: 1_000.0,
                         q,
                         drive: 0.0,
+                        character,
                     },
                     freq,
                     48_000.0,
@@ -3442,7 +6033,8 @@ mod tests {
                 }
                 assert!(
                     (measured - drawn).abs() < 1.0,
-                    "mode {mode} q {q} at {freq} Hz: audio {measured:.2} dB, display {drawn:.2} dB"
+                    "mode {mode} q {q} character {character} at {freq} Hz: \
+                     audio {measured:.2} dB, display {drawn:.2} dB"
                 );
             }
         }
@@ -3456,11 +6048,14 @@ mod tests {
     fn default_filter_is_a_transparent_delayed_wire() {
         let latency = crate::dsp::shaper::Oversampler2x::new().latency();
         let spec_node = NodeSpec::Filter {
-            mode: 0,
-            slope: 3,
-            cutoff_hz: 20_000.0,
-            q: 0.707,
-            drive: 0.0,
+            params: crate::audio::filter::FilterParams {
+                mode: 0.0,
+                slope: 3.0,
+                cutoff_hz: 20_000.0,
+                res: 0.707,
+                drive: 0.0,
+                ..Default::default()
+            },
         };
         let (mut sched, _) = filter_graph(440.0, spec_node);
         let mut wet = Vec::new();
@@ -3494,11 +6089,14 @@ mod tests {
         let (mut sched, id) = filter_graph(
             500.0,
             NodeSpec::Filter {
-                mode: 0,
-                slope: 3,
-                cutoff_hz: 500.0,
-                q: 24.0,
-                drive: 0.0,
+                params: crate::audio::filter::FilterParams {
+                    mode: 0.0,
+                    slope: 3.0,
+                    cutoff_hz: 500.0,
+                    res: 24.0,
+                    drive: 0.0,
+                    ..Default::default()
+                },
             },
         );
         // Charge the resonance.
@@ -3536,11 +6134,14 @@ mod tests {
             let (mut sched, _) = filter_graph(
                 200.0,
                 NodeSpec::Filter {
-                    mode: 0,
-                    slope: 3,
-                    cutoff_hz: 20_000.0,
-                    q: 0.707,
-                    drive,
+                    params: crate::audio::filter::FilterParams {
+                        mode: 0.0,
+                        slope: 3.0,
+                        cutoff_hz: 20_000.0,
+                        res: 0.707,
+                        drive,
+                        ..Default::default()
+                    },
                 },
             );
             let mut out = Vec::new();
@@ -3571,11 +6172,14 @@ mod tests {
         let (mut sched, id) = filter_graph(
             1_000.0,
             NodeSpec::Filter {
-                mode: 0,
-                slope: 3,
-                cutoff_hz: 1_000.0,
-                q: 4.0,
-                drive: 0.0,
+                params: crate::audio::filter::FilterParams {
+                    mode: 0.0,
+                    slope: 3.0,
+                    cutoff_hz: 1_000.0,
+                    res: 4.0,
+                    drive: 0.0,
+                    ..Default::default()
+                },
             },
         );
         let mut out = Vec::new();
@@ -3625,8 +6229,14 @@ mod tests {
                 amp: 0.5,
             });
             let rev = spec.push(NodeSpec::Reverb {
+                predelay_ms: 0.0,
                 size: 0.9,
-                damp: 0.1,
+                decay: 1.8,
+                damp: 5_000.0,
+                low_cut: 20.0,
+                diffusion: 0.8,
+                modulation: 2.0,
+                width: 1.0,
                 mix,
             });
             spec.connect(src, rev);
@@ -3668,8 +6278,14 @@ mod tests {
             amp: 0.5,
         });
         let rev = spec.push(NodeSpec::Reverb {
+            predelay_ms: 0.0,
             size: 0.95,
+            decay: 1.8,
             damp: 0.0,
+            low_cut: 20.0,
+            diffusion: 0.8,
+            modulation: 2.0,
+            width: 1.0,
             mix: 1.0,
         });
         spec.connect(src, rev);
@@ -3773,6 +6389,9 @@ mod tests {
                 len_beats: 8.0,
                 pitch: 69,
                 vel: 127,
+                plocks: Vec::new(),
+                prob: 1.0,
+                cond: None,
             }],
             subloops: vec![],
             loop_len_beats: None,
@@ -4226,6 +6845,9 @@ mod tests {
                 len_beats: 0.5,
                 pitch: 60 + i,
                 vel: 100,
+                plocks: Vec::new(),
+                prob: 1.0,
+                cond: None,
             })
             .collect();
         let subs = [SubLoop {
@@ -4258,6 +6880,9 @@ mod tests {
             len_beats: 2.0,
             pitch: 60,
             vel: 100,
+            plocks: Vec::new(),
+            prob: 1.0,
+            cond: None,
         }];
         let subs = [SubLoop {
             start_beats: 1.0,
@@ -4276,6 +6901,9 @@ mod tests {
             len_beats: 1.0,
             pitch: 60,
             vel: 100,
+            plocks: Vec::new(),
+            prob: 1.0,
+            cond: None,
         }];
         for subs in [
             vec![SubLoop {
@@ -4323,6 +6951,9 @@ mod tests {
                 len_beats: 0.5,
                 pitch: 60 + i,
                 vel: 100,
+                plocks: Vec::new(),
+                prob: 1.0,
+                cond: None,
             })
             .collect();
         let subs = [
@@ -4370,11 +7001,14 @@ mod tests {
             spec.connect(clean, mix);
             if filtered {
                 let f = spec.push(NodeSpec::Filter {
-                    mode: 0,
-                    slope: 0,
-                    cutoff_hz: 20_000.0,
-                    q: 0.707,
-                    drive: 0.0,
+                    params: crate::audio::filter::FilterParams {
+                        mode: 0.0,
+                        slope: 0.0,
+                        cutoff_hz: 20_000.0,
+                        res: 0.707,
+                        drive: 0.0,
+                        ..Default::default()
+                    },
                 });
                 spec.connect(src, f);
                 spec.connect(f, mix);
@@ -4394,6 +7028,74 @@ mod tests {
         );
     }
 
+    /// THE LIMITER'S LATENCY IS REAL, REPORTED AND COMPENSATED.
+    ///
+    /// The device that made the compensation machinery worth having: it
+    /// is the only node whose delay is not an oversampler's, and the
+    /// figure it states is a lookahead it genuinely holds. A limiter on
+    /// one track and not another is exactly the case plugin delay
+    /// compensation exists for, so this walks the whole way round —
+    /// what the device says, what the graph reports, and what an
+    /// unlimited sibling path is delayed by to match.
+    #[test]
+    fn a_limiter_reports_its_lookahead_and_the_graph_absorbs_it() {
+        let latency = crate::audio::limiter::latency();
+        // The lookahead is a real part of it, not just the oversamplers —
+        // otherwise this device is telling the graph the filter's story.
+        assert!(
+            latency > 2 * crate::dsp::shaper::Oversampler2x::new().latency(),
+            "the reported latency has no lookahead in it: {latency}"
+        );
+
+        let mut spec = GraphSpec::default();
+        let src = spec.push(NodeSpec::Sine {
+            freq: 1_000.0,
+            amp: 1.0,
+        });
+        let lim = spec.push(NodeSpec::Limiter {
+            params: crate::audio::limiter::LimiterParams::default(),
+        });
+        let mix = spec.push(NodeSpec::Mixer { gain: 1.0 });
+        spec.connect(src, lim);
+        spec.connect(lim, mix);
+        spec.connect(src, mix); // the early leg
+        spec.set_output(mix);
+
+        let Some(aligned) = spec.compensate() else {
+            panic!("a graph with a limiter in one leg needs compensating");
+        };
+        let delays: Vec<usize> = aligned
+            .iter_ordered()
+            .filter_map(|(_, node)| match node {
+                NodeSpec::Delay { samples, .. } => Some(*samples),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            delays,
+            vec![latency],
+            "the early leg was not delayed to match the limiter"
+        );
+
+        // And the compiled graph owns up to the total.
+        let sched = spec.compile(48_000, 256).unwrap();
+        assert_eq!(sched.latency(), latency);
+
+        // A graph whose ONLY path runs through the limiter needs no
+        // splice — there is no sibling to align with — but still reports.
+        let mut alone = GraphSpec::default();
+        let src = alone.push(NodeSpec::Sine {
+            freq: 1_000.0,
+            amp: 1.0,
+        });
+        let lim = alone.push(NodeSpec::Limiter {
+            params: crate::audio::limiter::LimiterParams::default(),
+        });
+        alone.connect(src, lim);
+        alone.set_output(lim);
+        assert_eq!(alone.compile(48_000, 256).unwrap().latency(), latency);
+    }
+
     /// The compensation itself: the clean leg gets a delay node spliced in,
     /// so both legs reach the mixer at the same sample.
     #[test]
@@ -4405,11 +7107,14 @@ mod tests {
             amp: 1.0,
         });
         let f = spec.push(NodeSpec::Filter {
-            mode: 0,
-            slope: 0,
-            cutoff_hz: 20_000.0,
-            q: 0.707,
-            drive: 0.0,
+            params: crate::audio::filter::FilterParams {
+                mode: 0.0,
+                slope: 0.0,
+                cutoff_hz: 20_000.0,
+                res: 0.707,
+                drive: 0.0,
+                ..Default::default()
+            },
         });
         let mix = spec.push(NodeSpec::Mixer { gain: 1.0 });
         spec.connect(src, f);
@@ -4466,11 +7171,14 @@ mod tests {
             amp: 0.5,
         });
         let f = spec.push(NodeSpec::Filter {
-            mode: 0,
-            slope: 0,
-            cutoff_hz: 8_000.0,
-            q: 0.707,
-            drive: 0.0,
+            params: crate::audio::filter::FilterParams {
+                mode: 0.0,
+                slope: 0.0,
+                cutoff_hz: 8_000.0,
+                res: 0.707,
+                drive: 0.0,
+                ..Default::default()
+            },
         });
         spec.connect(src, f);
         spec.set_output(f);
@@ -4532,11 +7240,14 @@ mod tests {
             amp: 0.8,
         });
         let f = spec.push(NodeSpec::Filter {
-            mode: 0,
-            slope: 0,
-            cutoff_hz: 8_000.0,
-            q: 0.707,
-            drive: 0.4,
+            params: crate::audio::filter::FilterParams {
+                mode: 0.0,
+                slope: 0.0,
+                cutoff_hz: 8_000.0,
+                res: 0.707,
+                drive: 0.4,
+                ..Default::default()
+            },
         });
         let pan = spec.push(NodeSpec::Pan {
             pan: 0.0,
@@ -4577,6 +7288,1133 @@ mod tests {
                 sched.run(&mut block, &c);
             }
         });
+    }
+
+    // ------------------------------------------------------------ sat ---
+
+    /// Build sine -> sat -> output at 48k/256, and the matching dry
+    /// reference. Returns both renders, the sat one shifted back by the
+    /// node's constant latency so sample `i` of each is the same instant.
+    fn sat_render(freq: f32, amp: f32, spec_node: NodeSpec, blocks: usize) -> (Vec<f32>, Vec<f32>) {
+        let latency = crate::dsp::shaper::Oversampler2x::new().latency();
+
+        let mut spec = GraphSpec::default();
+        let src = spec.push(NodeSpec::Sine { freq, amp });
+        let sat = spec.push(spec_node);
+        spec.connect(src, sat);
+        spec.set_output(sat);
+        let mut sched = spec.compile(48_000, 256).unwrap();
+        let mut wet = Vec::new();
+        run_rolling(&mut sched, blocks, &mut wet);
+
+        let mut dry_spec = GraphSpec::default();
+        let src = dry_spec.push(NodeSpec::Sine { freq, amp });
+        dry_spec.set_output(src);
+        let mut sched = dry_spec.compile(48_000, 256).unwrap();
+        let mut dry = Vec::new();
+        run_rolling(&mut sched, blocks, &mut dry);
+
+        (wet.split_off(latency), dry)
+    }
+
+    /// A settled window, past the sine's amp ramp-in and the half-band's
+    /// fill, and short of the end so the latency shift cannot run off it.
+    const SAT_WINDOW: std::ops::Range<usize> = 2_000..4_000;
+
+    /// THE test this node exists for, and the filter's test ported: the
+    /// audio runs the curve the widget draws.
+    ///
+    /// Compared as RMS rather than sample by sample, because these curves
+    /// are not bandlimited — hard clip at drive 8 asks for harmonics past
+    /// Nyquist, and what comes back is the oversampler's best answer, not
+    /// the algebraic one. A sample-wise assert would be measuring Gibbs
+    /// ringing at the corners rather than agreement. RMS over a settled
+    /// window is blind to that and still moves hard the moment the node
+    /// picks a different shape, reads drive in different units, or blends
+    /// the wrong way — which are the mistakes this wiring can actually
+    /// make.
+    #[test]
+    fn sat_node_runs_the_curve_the_widget_draws() {
+        use crate::params::sat as sp;
+        use crate::ui::device::shaper as ui;
+
+        for (mode, ui_mode) in [
+            (sp::MODE_HARD, ui::Mode::HardClip),
+            (sp::MODE_SOFT, ui::Mode::SoftClip),
+            (sp::MODE_CUBIC, ui::Mode::Cubic),
+            (sp::MODE_FOLD, ui::Mode::Fold),
+            (sp::MODE_CRUSH, ui::Mode::Crush),
+        ] {
+            for (drive, bias, mix) in [
+                (1.0, 0.0, 1.0),
+                (4.0, 0.0, 1.0),
+                (12.0, 0.25, 1.0),
+                (8.0, 0.0, 0.35),
+            ] {
+                let (wet, dry) = sat_render(
+                    500.0,
+                    0.5,
+                    NodeSpec::Sat {
+                        mode,
+                        drive,
+                        bias,
+                        mix,
+                        out: 1.0,
+                    },
+                    24,
+                );
+                let drawn = ui::Shaper {
+                    mode: ui_mode,
+                    drive,
+                    bias,
+                    mix,
+                };
+                // The widget's curve applied to the same dry signal is
+                // the reference. Its DC component is removed the way the
+                // node removes it — a biased curve has an offset, and
+                // the node's blocker takes it out.
+                let mut want: Vec<f32> = dry[SAT_WINDOW].iter().map(|x| drawn.shape(*x)).collect();
+                let mean = want.iter().sum::<f32>() / want.len() as f32;
+                for s in want.iter_mut() {
+                    *s -= mean;
+                }
+                let got = rms(&wet[SAT_WINDOW]);
+                let want = rms(&want);
+                let error = (got - want).abs() / want.max(1e-6);
+                assert!(
+                    error < 0.05,
+                    "mode {mode} drive {drive} bias {bias} mix {mix}: \
+                     audio {got:.4} rms, display {want:.4} rms ({:.1}% off)",
+                    error * 100.0
+                );
+            }
+        }
+    }
+
+    /// The identity case: hard clip at unity drive passes everything
+    /// inside the rails, so the whole device collapses to a wire delayed
+    /// by exactly the figure `spec_latency` reports. This is what holds
+    /// the oversampler round trip to unity gain and linear phase — if the
+    /// half-band drifted, or the decimation phase flipped, every other
+    /// test here would still pass and this one would not.
+    #[test]
+    fn a_transparent_saturator_is_a_delayed_wire() {
+        let (wet, dry) = sat_render(
+            440.0,
+            0.5,
+            NodeSpec::Sat {
+                mode: crate::params::sat::MODE_HARD,
+                drive: 1.0,
+                bias: 0.0,
+                mix: 1.0,
+                out: 1.0,
+            },
+            24,
+        );
+        let worst = SAT_WINDOW
+            .map(|i| (wet[i] - dry[i]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst < 0.01,
+            "an untouched hard clip must be a delayed wire; worst error {worst}"
+        );
+    }
+
+    /// The device is STEREO, and the two channels are independent: a
+    /// shared half-band history or a shared DC blocker would leak one
+    /// side into the other, and nothing else here would notice — every
+    /// other test drives both channels with the same signal.
+    ///
+    /// The lane-independence test from the poly kernels, in its
+    /// two-channel form, for exactly the same reason.
+    #[test]
+    fn sat_channels_do_not_leak_into_each_other() {
+        let mut spec = GraphSpec::default();
+        // Pan hard left: a stereo source with silence on one side.
+        let src = spec.push(NodeSpec::Sine {
+            freq: 300.0,
+            amp: 0.8,
+        });
+        let pan = spec.push(NodeSpec::Pan {
+            pan: -1.0,
+            gain: 1.0,
+        });
+        let sat = spec.push(NodeSpec::Sat {
+            mode: crate::params::sat::MODE_FOLD,
+            drive: 16.0,
+            // NO bias, and that is the test's subject matter, not an
+            // oversight: bias offsets the CURVE, so a biased shaper turns
+            // a silent channel into a constant one — `shape(0)` is the
+            // bias itself. That is the parameter working, not the
+            // channels leaking, and a test that cannot tell the two apart
+            // is not testing independence.
+            bias: 0.0,
+            mix: 1.0,
+            out: 1.0,
+        });
+        spec.connect(src, pan);
+        spec.connect(pan, sat);
+        spec.set_output(sat);
+        let mut sched = spec.compile(48_000, 256).unwrap();
+
+        let bps = 120.0 / 60.0 / 48_000.0;
+        let mut worst_right = 0.0f32;
+        let mut peak_left = 0.0f32;
+        for b in 0..24 {
+            let mut block = vec![0.0f32; 512];
+            let c = ProcessCtx {
+                device_input: NO_INPUT,
+                in_channels: 2,
+                block_frames: 256,
+                offset: 0,
+                len: 256,
+                playing: true,
+                position: (b * 256) as u64,
+                beat: (b * 256) as f64 * bps,
+                beats_per_sample: bps,
+                discontinuity: b == 0,
+            };
+            sched.run(&mut block, &c);
+            for s in &block[..256] {
+                peak_left = peak_left.max(s.abs());
+            }
+            for s in &block[256..] {
+                worst_right = worst_right.max(s.abs());
+            }
+        }
+        assert!(peak_left > 0.1, "the driven side must actually sound");
+        assert!(
+            worst_right < 1e-6,
+            "the silent channel must stay silent; leaked {worst_right}"
+        );
+    }
+
+    /// A seek must not drag the half-band's history into the new
+    /// position — and the contract is stronger than "goes quiet", which
+    /// is why this does not test for quiet.
+    ///
+    /// A node that has just cut is INDISTINGUISHABLE from one that was
+    /// compiled a moment ago: same cleared rings, same snapped smoothers.
+    /// So charge one saturator for twenty blocks, seek it, and compare
+    /// that block against the FIRST block of a freshly compiled twin fed
+    /// the identical input. Any history that survived the cut shows up as
+    /// a difference, and no other assertion has to guess how loud a
+    /// leftover tail would be.
+    ///
+    /// The source is `Input` rather than `Sine` precisely so the two runs
+    /// can be handed the same samples: a sine node carries a phase, and
+    /// phase is state a discontinuity does not reset (correctly — it is
+    /// free-running), which would show up here as a difference that is
+    /// not a bug.
+    #[test]
+    fn a_discontinuity_cuts_the_saturator() {
+        /// One loud block of planar stereo input, both channels alike.
+        fn input_block() -> Vec<f32> {
+            let mut buf = vec![0.0f32; 512];
+            for i in 0..256 {
+                let s = (i as f32 * 0.13).sin() * 0.9;
+                buf[i] = s;
+                buf[256 + i] = s;
+            }
+            buf
+        }
+
+        fn saturator_graph() -> Schedule {
+            let mut spec = GraphSpec::default();
+            let src = spec.push(NodeSpec::Input { channel: 0 });
+            let sat = spec.push(NodeSpec::Sat {
+                mode: crate::params::sat::MODE_HARD,
+                drive: 24.0,
+                bias: 0.0,
+                mix: 1.0,
+                out: 1.0,
+            });
+            spec.connect(src, sat);
+            spec.set_output(sat);
+            spec.compile(48_000, 256).unwrap()
+        }
+
+        let signal = input_block();
+        let bps = 120.0 / 60.0 / 48_000.0;
+        let ctx_at = |position: u64, discontinuity: bool| ProcessCtx {
+            device_input: &signal,
+            in_channels: 2,
+            block_frames: 256,
+            offset: 0,
+            len: 256,
+            playing: true,
+            position,
+            beat: position as f64 * bps,
+            beats_per_sample: bps,
+            discontinuity,
+        };
+
+        // The charged one: twenty blocks of history, then a seek.
+        let mut charged = saturator_graph();
+        let mut block = vec![0.0f32; 512];
+        for b in 0..20 {
+            charged.run(&mut block, &ctx_at(b * 256, b == 0));
+        }
+        assert!(
+            block[..256].iter().any(|s| s.abs() > 0.1),
+            "a driven clipper must sound"
+        );
+        charged.run(&mut block, &ctx_at(96_000, true));
+
+        // The fresh one, at the same place, seeing the same samples.
+        let mut fresh = saturator_graph();
+        let mut reference = vec![0.0f32; 512];
+        fresh.run(&mut reference, &ctx_at(96_000, true));
+
+        let worst = block
+            .iter()
+            .zip(reference.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst < 1e-6,
+            "a seek must leave the saturator as new; worst difference {worst}"
+        );
+    }
+
+    /// The red-zone contract, under the guard: both the steady path and
+    /// the discontinuity path, in stereo, with every control moving —
+    /// a moving control is what walks the chunk loop, and the chunk loop
+    /// is where a `Vec` would be easiest to reach for.
+    #[test]
+    fn sat_run_does_not_allocate() {
+        let mut spec = GraphSpec::default();
+        let src = spec.push(NodeSpec::Sine {
+            freq: 1_000.0,
+            amp: 0.8,
+        });
+        let sat = spec.push(NodeSpec::Sat {
+            mode: crate::params::sat::MODE_SOFT,
+            drive: 6.0,
+            bias: 0.0,
+            mix: 1.0,
+            out: 1.0,
+        });
+        spec.connect(src, sat);
+        spec.set_output(sat);
+        let mut sched = spec.compile(48_000, 256).unwrap();
+        let mut block = vec![0.0f32; 512];
+        let bps = 120.0 / 60.0 / 48_000.0;
+        let node = sat.to_bits();
+
+        assert_no_alloc::assert_no_alloc(|| {
+            for b in 0..8 {
+                use crate::params::sat as sp;
+                // Letters land mid-run, including the mode switch.
+                for (param, value) in [
+                    (sp::MODE, (b % 5) as f32),
+                    (sp::DRIVE, 1.0 + b as f32),
+                    (sp::BIAS, 0.1 * b as f32),
+                    (sp::MIX, 0.1 * b as f32),
+                    (sp::OUT, 0.5 + 0.1 * b as f32),
+                ] {
+                    sched.apply(ParamChange { node, param, value });
+                }
+                let c = ProcessCtx {
+                    device_input: NO_INPUT,
+                    in_channels: 2,
+                    block_frames: 256,
+                    offset: 0,
+                    len: 256,
+                    playing: true,
+                    position: (b * 256) as u64,
+                    beat: (b * 256) as f64 * bps,
+                    beats_per_sample: bps,
+                    // Every other block seeks, so the cut path runs
+                    // inside the guard too.
+                    discontinuity: b % 2 == 0,
+                };
+                sched.run(&mut block, &c);
+            }
+        });
+    }
+
+    /// A block whose length is not a multiple of `SAT_CHUNK`, and a
+    /// zero-length one: the chunk walk must handle the ragged tail and
+    /// the empty case without an index off the end. The kernel
+    /// contract's edge-lengths test, at the node.
+    #[test]
+    fn sat_survives_ragged_and_empty_segments() {
+        let mut spec = GraphSpec::default();
+        let src = spec.push(NodeSpec::Sine {
+            freq: 700.0,
+            amp: 0.7,
+        });
+        let sat = spec.push(NodeSpec::Sat {
+            mode: crate::params::sat::MODE_FOLD,
+            drive: 9.0,
+            bias: 0.2,
+            mix: 0.8,
+            out: 1.2,
+        });
+        spec.connect(src, sat);
+        spec.set_output(sat);
+        let mut sched = spec.compile(48_000, 256).unwrap();
+
+        let mut block = vec![0.0f32; 512];
+        let bps = 120.0 / 60.0 / 48_000.0;
+        // 0 and 1 are the degenerate cases; 17 and 251 are lengths no
+        // chunk size divides.
+        for (i, len) in [0usize, 1, 17, 251, 256].into_iter().enumerate() {
+            let c = ProcessCtx {
+                device_input: NO_INPUT,
+                in_channels: 2,
+                block_frames: 256,
+                offset: 0,
+                len,
+                playing: true,
+                position: (i * 256) as u64,
+                beat: (i * 256) as f64 * bps,
+                beats_per_sample: bps,
+                discontinuity: i == 0,
+            };
+            sched.run(&mut block, &c);
+        }
+        assert!(
+            block.iter().all(|s| s.is_finite()),
+            "a ragged segment must not produce NaN"
+        );
+    }
+    // ----------------------------------------------------------- echo ---
+
+    /// One loud block of planar stereo input, both channels alike.
+    fn echo_input() -> Vec<f32> {
+        let mut buf = vec![0.0f32; 512];
+        // A single click, so a repeat is a thing you can find by index.
+        buf[0] = 1.0;
+        buf[256] = 1.0;
+        buf
+    }
+
+    fn echo_graph(spec_node: NodeSpec) -> Schedule {
+        let mut spec = GraphSpec::default();
+        let src = spec.push(NodeSpec::Input { channel: 0 });
+        let echo = spec.push(spec_node);
+        spec.connect(src, echo);
+        spec.set_output(echo);
+        spec.compile(48_000, 256).unwrap()
+    }
+
+    /// Render `blocks` blocks, feeding the click only in the first, and
+    /// return channel 0 concatenated.
+    fn echo_render(spec_node: NodeSpec, blocks: usize, bpm: f64) -> Vec<f32> {
+        let mut sched = echo_graph(spec_node);
+        let signal = echo_input();
+        let silence = vec![0.0f32; 512];
+        let bps = bpm / 60.0 / 48_000.0;
+        let mut out = Vec::new();
+        for b in 0..blocks {
+            let mut block = vec![0.0f32; 512];
+            let c = ProcessCtx {
+                device_input: if b == 0 { &signal } else { &silence },
+                in_channels: 2,
+                block_frames: 256,
+                offset: 0,
+                len: 256,
+                playing: true,
+                position: (b * 256) as u64,
+                beat: (b * 256) as f64 * bps,
+                beats_per_sample: bps,
+                discontinuity: b == 0,
+            };
+            sched.run(&mut block, &c);
+            out.extend_from_slice(&block[..256]);
+        }
+        out
+    }
+
+    /// Where the loudest repeat after the dry click lands, in samples.
+    ///
+    /// Panics if there is no repeat to find. Deliberately: `max_by` over
+    /// a silent buffer returns its LAST index, which is a plausible
+    /// sample number and a completely wrong answer — the first draft of
+    /// these tests rendered a window shorter than the echo it was
+    /// measuring and got "10239" twice, which reads as a repeat in the
+    /// wrong place rather than as no repeat at all.
+    fn first_repeat_at(out: &[f32], skip: usize) -> usize {
+        let (at, peak) = out
+            .iter()
+            .enumerate()
+            .skip(skip)
+            .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+            .map(|(i, s)| (i, s.abs()))
+            .unwrap_or((0, 0.0));
+        assert!(
+            peak > 0.05,
+            "no repeat in {} samples — the window is shorter than the echo",
+            out.len()
+        );
+        at
+    }
+
+    /// Long enough to contain any echo these tests ask for: a quarter
+    /// note at the slowest tempo used here is two thirds of a second.
+    const ECHO_BLOCKS: usize = 200;
+
+    /// THE test this node exists for: a SYNCED echo repeats on the
+    /// division, at the tempo the transport is actually playing.
+    ///
+    /// Checked at two tempos, because a delay that merely lands on the
+    /// right sample at 120 BPM might be reading a constant. The whole
+    /// point of deriving the time from `ctx.beats_per_sample` every
+    /// segment is that the answer moves when the tempo does.
+    #[test]
+    fn a_synced_echo_repeats_on_the_division() {
+        use crate::params::echo as ep;
+        for (bpm, sync, beats) in [
+            (120.0f64, 3u32, 1.0f64), // 1/4 at 120 = 0.5 s
+            (120.0, 4, 0.5),          // 1/8 at 120 = 0.25 s
+            (90.0, 3, 1.0),           // 1/4 at 90  = 0.667 s
+        ] {
+            let out = echo_render(
+                NodeSpec::Echo {
+                    sync,
+                    time_ms: 350.0,
+                    feedback: 0.0, // one repeat, nothing to confuse it
+                    tone_hz: 20_000.0,
+                    drive: 0.0,
+                    wow: 0.0, // a still tape, so the peak is where it is
+                    spread: 0.0,
+                    mix: 100.0,
+                    send: 0.0,
+                },
+                ECHO_BLOCKS,
+                bpm,
+            );
+            let want = (beats * 60.0 / bpm * 48_000.0) as usize;
+            // Skip past the dry click and the glide settling.
+            let got = first_repeat_at(&out, 64);
+            let err = got.abs_diff(want);
+            assert!(
+                err < 400,
+                "{sync} at {bpm} BPM: repeat at {got}, expected {want} \
+                 ({} names it {})",
+                ep::SYNC_NAMES[sync as usize],
+                want
+            );
+        }
+    }
+
+    /// A FREE echo repeats at the millisecond it was given, and ignores
+    /// the tempo entirely.
+    #[test]
+    fn a_free_echo_repeats_at_its_millisecond() {
+        for bpm in [120.0f64, 200.0] {
+            let out = echo_render(
+                NodeSpec::Echo {
+                    sync: 0,
+                    time_ms: 250.0,
+                    feedback: 0.0,
+                    tone_hz: 20_000.0,
+                    drive: 0.0,
+                    wow: 0.0,
+                    spread: 0.0,
+                    mix: 100.0,
+                    send: 0.0,
+                },
+                ECHO_BLOCKS,
+                bpm,
+            );
+            let want = (0.250 * 48_000.0) as usize;
+            let got = first_repeat_at(&out, 64);
+            assert!(
+                got.abs_diff(want) < 400,
+                "free echo at {bpm} BPM repeated at {got}, expected {want}"
+            );
+        }
+    }
+
+    /// Spread walks the right channel's echo later than the left's, and
+    /// zero leaves them together — the mono-compatible case.
+    #[test]
+    fn spread_separates_the_two_channels() {
+        let render = |spread: f32| {
+            let mut sched = echo_graph(NodeSpec::Echo {
+                sync: 0,
+                time_ms: 100.0,
+                feedback: 0.0,
+                tone_hz: 20_000.0,
+                drive: 0.0,
+                wow: 0.0,
+                spread,
+                mix: 100.0,
+                send: 0.0,
+            });
+            let signal = echo_input();
+            let silence = vec![0.0f32; 512];
+            let bps = 120.0 / 60.0 / 48_000.0;
+            let (mut l, mut r) = (Vec::new(), Vec::new());
+            for b in 0..ECHO_BLOCKS {
+                let mut block = vec![0.0f32; 512];
+                let c = ProcessCtx {
+                    device_input: if b == 0 { &signal } else { &silence },
+                    in_channels: 2,
+                    block_frames: 256,
+                    offset: 0,
+                    len: 256,
+                    playing: true,
+                    position: (b * 256) as u64,
+                    beat: (b * 256) as f64 * bps,
+                    beats_per_sample: bps,
+                    discontinuity: b == 0,
+                };
+                sched.run(&mut block, &c);
+                l.extend_from_slice(&block[..256]);
+                r.extend_from_slice(&block[256..]);
+            }
+            (first_repeat_at(&l, 64), first_repeat_at(&r, 64))
+        };
+        let (l0, r0) = render(0.0);
+        assert_eq!(l0, r0, "at spread 0 the channels must be together");
+        let (l1, r1) = render(50.0);
+        assert!(
+            r1 > l1 + 1_000,
+            "spread 50% should put the right channel well behind: {l1} vs {r1}"
+        );
+    }
+
+    /// A seek must not ring the old position's repeats into the new one:
+    /// a cut echo is indistinguishable from a freshly compiled one.
+    #[test]
+    fn a_discontinuity_cuts_the_echo() {
+        let spec_node = || NodeSpec::Echo {
+            sync: 0,
+            time_ms: 200.0,
+            feedback: 80.0,
+            tone_hz: 12_000.0,
+            drive: 30.0,
+            wow: 0.0,
+            spread: 0.0,
+            mix: 100.0,
+            send: 0.0,
+        };
+        let signal = echo_input();
+        let bps = 120.0 / 60.0 / 48_000.0;
+        let ctx_at = |input: &'static [f32], position: u64, discontinuity: bool| ProcessCtx {
+            device_input: input,
+            in_channels: 2,
+            block_frames: 256,
+            offset: 0,
+            len: 256,
+            playing: true,
+            position,
+            beat: position as f64 * bps,
+            beats_per_sample: bps,
+            discontinuity,
+        };
+        let leaked: &'static [f32] = Box::leak(signal.into_boxed_slice());
+
+        let mut charged = echo_graph(spec_node());
+        let mut block = vec![0.0f32; 512];
+        for b in 0..20 {
+            charged.run(&mut block, &ctx_at(leaked, b * 256, b == 0));
+        }
+        charged.run(&mut block, &ctx_at(leaked, 96_000, true));
+
+        let mut fresh = echo_graph(spec_node());
+        let mut reference = vec![0.0f32; 512];
+        fresh.run(&mut reference, &ctx_at(leaked, 96_000, true));
+
+        let worst = block
+            .iter()
+            .zip(reference.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst < 1e-6,
+            "a seek must leave the echo as new; worst difference {worst}"
+        );
+    }
+
+    /// The red-zone contract under the guard, with every control moving
+    /// and the transport seeking — including the ring-clearing path.
+    #[test]
+    fn echo_run_does_not_allocate() {
+        // An AUX, so the send's own per-sample loop runs inside the guard
+        // below: an insert never reads it and would leave it untested.
+        let mut sched = echo_graph(NodeSpec::Echo {
+            sync: 4,
+            time_ms: 300.0,
+            feedback: 60.0,
+            tone_hz: 6_000.0,
+            drive: 20.0,
+            wow: 30.0,
+            spread: 25.0,
+            mix: 50.0,
+            send: 40.0,
+        });
+        let node = {
+            // The echo is the second node pushed; its id is what the
+            // graph handed back, so rebuild the spec to learn it.
+            let mut spec = GraphSpec::default();
+            let src = spec.push(NodeSpec::Input { channel: 0 });
+            let echo = spec.push(NodeSpec::Echo {
+                sync: 4,
+                time_ms: 300.0,
+                feedback: 60.0,
+                tone_hz: 6_000.0,
+                drive: 20.0,
+                wow: 30.0,
+                spread: 25.0,
+                mix: 50.0,
+                send: 0.0,
+            });
+            spec.connect(src, echo);
+            echo.to_bits()
+        };
+        let mut block = vec![0.0f32; 512];
+        let bps = 120.0 / 60.0 / 48_000.0;
+
+        assert_no_alloc::assert_no_alloc(|| {
+            for b in 0..8 {
+                use crate::params::echo as ep;
+                for (param, value) in [
+                    (ep::SYNC, (b % 5) as f32),
+                    (ep::TIME, 100.0 + b as f32 * 50.0),
+                    (ep::FEEDBACK, 10.0 * b as f32),
+                    (ep::TONE, 1_000.0 + b as f32 * 500.0),
+                    (ep::DRIVE, 10.0 * b as f32),
+                    (ep::WOW, 10.0 * b as f32),
+                    (ep::SPREAD, 5.0 * b as f32),
+                    (ep::MIX, 10.0 * b as f32),
+                    (ep::SEND, 10.0 * b as f32),
+                ] {
+                    sched.apply(ParamChange { node, param, value });
+                }
+                let c = ProcessCtx {
+                    device_input: NO_INPUT,
+                    in_channels: 2,
+                    block_frames: 256,
+                    offset: 0,
+                    len: 256,
+                    playing: true,
+                    position: (b * 256) as u64,
+                    beat: (b * 256) as f64 * bps,
+                    beats_per_sample: bps,
+                    discontinuity: b % 2 == 0,
+                };
+                sched.run(&mut block, &c);
+            }
+        });
+    }
+
+    /// The send is the level the tap is fed at — on an AUX. On an insert
+    /// the whole track is the input by definition, so nothing may scale
+    /// it, and a letter aimed at the send must be ignored rather than
+    /// obeyed: automation that sweeps a send to zero has to silence an
+    /// aux without ever being able to mute a delay in the signal path.
+    #[test]
+    fn a_send_scales_an_aux_and_cannot_touch_an_insert() {
+        let echo = |send: f32| NodeSpec::Echo {
+            sync: 0,
+            time_ms: 200.0,
+            feedback: 0.0, // one repeat, nothing recirculating to confuse it
+            tone_hz: 20_000.0,
+            drive: 0.0,
+            wow: 0.0,
+            spread: 0.0,
+            mix: 100.0, // pure wet, which is what a return carries
+            send,
+        };
+        let peak = |out: Vec<f32>| out.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        let full = peak(echo_render(echo(100.0), ECHO_BLOCKS, 120.0));
+        let half = peak(echo_render(echo(50.0), ECHO_BLOCKS, 120.0));
+        let quiet = peak(echo_render(echo(1.0), ECHO_BLOCKS, 120.0));
+        assert!(full > 0.1, "a send at full must pass the tap: {full}");
+        assert!(
+            (half / full - 0.5).abs() < 0.01,
+            "half the send is half the level: {half} against {full}"
+        );
+        assert!(quiet < full * 0.02, "a send at 1% is nearly nothing");
+
+        // An INSERT, lettered to zero: it must not budge.
+        let letter = |send: NodeSpec, value: f32| {
+            let mut spec = GraphSpec::default();
+            let src = spec.push(NodeSpec::Input { channel: 0 });
+            let node = spec.push(send);
+            spec.connect(src, node);
+            spec.set_output(node);
+            let mut sched = spec.compile(48_000, 256).unwrap();
+            sched.apply(ParamChange {
+                node: node.to_bits(),
+                param: crate::params::echo::SEND,
+                value,
+            });
+            let signal = echo_input();
+            let silence = vec![0.0f32; 512];
+            let bps = 120.0 / 60.0 / 48_000.0;
+            let mut out = Vec::new();
+            for b in 0..ECHO_BLOCKS {
+                let mut block = vec![0.0f32; 512];
+                sched.run(
+                    &mut block,
+                    &ProcessCtx {
+                        device_input: if b == 0 { &signal } else { &silence },
+                        in_channels: 2,
+                        block_frames: 256,
+                        offset: 0,
+                        len: 256,
+                        playing: true,
+                        position: (b * 256) as u64,
+                        beat: (b * 256) as f64 * bps,
+                        beats_per_sample: bps,
+                        discontinuity: b == 0,
+                    },
+                );
+                out.extend_from_slice(&block[..256]);
+            }
+            out
+        };
+        let insert = peak(letter(echo(0.0), 0.0));
+        assert!(
+            insert > 0.1,
+            "a send letter must not mute an insert: {insert}"
+        );
+        // And the same letter DOES move an aux.
+        let aux = peak(letter(echo(100.0), 0.0));
+        assert!(
+            aux < insert * 0.02,
+            "the same letter silences an aux: {aux}"
+        );
+    }
+
+    /// The compressor reaches the graph as a node like any other: it
+    /// compiles, it takes letters at the ids its table declares, and a
+    /// discontinuity opens it up rather than carrying the old
+    /// position's gain reduction across the seek.
+    #[test]
+    fn glue_runs_in_a_schedule_and_a_seek_opens_it() {
+        use crate::params::glue as gp;
+
+        let mut spec = GraphSpec::default();
+        let src = spec.push(NodeSpec::Input { channel: 0 });
+        let glue = spec.push(NodeSpec::Glue {
+            params: crate::audio::glue::GlueParams {
+                threshold_db: -40.0,
+                attack: 0.0,
+                release: 0.0,
+                ..Default::default()
+            },
+        });
+        spec.connect(src, glue);
+        spec.set_output(glue);
+        let node = glue.to_bits();
+        let mut sched = spec.compile(48_000, 256).unwrap();
+
+        // A loud input, run until the compressor has grabbed.
+        let loud: Vec<f32> = (0..512).map(|i| (i as f32 * 0.2).sin() * 0.9).collect();
+        let bps = 120.0 / 60.0 / 48_000.0;
+        let ctx = |b: usize, discontinuity: bool| ProcessCtx {
+            device_input: &loud,
+            in_channels: 2,
+            block_frames: 256,
+            offset: 0,
+            len: 256,
+            playing: true,
+            position: (b * 256) as u64,
+            beat: (b * 256) as f64 * bps,
+            beats_per_sample: bps,
+            discontinuity,
+        };
+        let mut block = vec![0.0f32; 512];
+        for b in 0..40 {
+            sched.run(&mut block, &ctx(b, b == 0));
+        }
+        let squashed = block[..256].iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(
+            squashed < 0.8,
+            "the compressor should have grabbed by now: peak {squashed:.3}"
+        );
+
+        // A letter reaches it: threshold out of the way opens it up.
+        sched.apply(ParamChange {
+            node,
+            param: gp::THRESHOLD,
+            value: 10.0,
+        });
+        for b in 40..80 {
+            sched.run(&mut block, &ctx(b, false));
+        }
+        let opened = block[..256].iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(
+            opened > squashed,
+            "a threshold letter never landed: {opened:.3} against {squashed:.3}"
+        );
+
+        // A stale id is binned rather than guessed at.
+        sched.apply(ParamChange {
+            node,
+            param: 9_999,
+            value: 1.0,
+        });
+        sched.run(&mut block, &ctx(80, false));
+        assert!(block.iter().all(|s| s.is_finite()));
+    }
+
+    #[test]
+    fn glue_run_does_not_allocate() {
+        use crate::params::glue as gp;
+        let mut spec = GraphSpec::default();
+        let src = spec.push(NodeSpec::Input { channel: 0 });
+        let glue = spec.push(NodeSpec::Glue {
+            params: Default::default(),
+        });
+        spec.connect(src, glue);
+        spec.set_output(glue);
+        let node = glue.to_bits();
+        let mut sched = spec.compile(48_000, 256).unwrap();
+        let mut block = vec![0.0f32; 512];
+        let bps = 120.0 / 60.0 / 48_000.0;
+
+        assert_no_alloc::assert_no_alloc(|| {
+            for b in 0..8 {
+                for (param, value) in [
+                    (gp::THRESHOLD, -30.0 + b as f32),
+                    (gp::RATIO, (b % 3) as f32),
+                    (gp::ATTACK, (b % 7) as f32),
+                    (gp::RELEASE, (b % 7) as f32),
+                    (gp::MAKEUP, b as f32),
+                    (gp::DRY_WET, (b * 10) as f32),
+                    (gp::RANGE, (b * 5) as f32),
+                    (gp::CLIP, (b % 2) as f32),
+                    (gp::SC_HP, 20.0 + b as f32 * 50.0),
+                ] {
+                    sched.apply(ParamChange { node, param, value });
+                }
+                sched.run(
+                    &mut block,
+                    &ProcessCtx {
+                        device_input: NO_INPUT,
+                        in_channels: 2,
+                        block_frames: 256,
+                        offset: 0,
+                        len: 256,
+                        playing: true,
+                        position: (b * 256) as u64,
+                        beat: (b * 256) as f64 * bps,
+                        beats_per_sample: bps,
+                        discontinuity: b % 2 == 0,
+                    },
+                );
+            }
+        });
+    }
+
+    /// The utility reaches the graph as a node like any other: it
+    /// compiles, it takes letters at the ids its table declares, and a
+    /// stale id is binned rather than guessed at.
+    ///
+    /// The property being watched is the one the device exists for —
+    /// inserted at its defaults it is a WIRE, so what comes out of the
+    /// schedule is what the input node put in.
+    #[test]
+    fn utility_runs_in_a_schedule_and_passes_its_input_through() {
+        use crate::params::utility as up;
+
+        let mut spec = GraphSpec::default();
+        let src = spec.push(NodeSpec::Input { channel: 0 });
+        let util = spec.push(NodeSpec::Utility {
+            params: Default::default(),
+        });
+        spec.connect(src, util);
+        spec.set_output(util);
+        let node = util.to_bits();
+        let mut sched = spec.compile(48_000, 256).unwrap();
+
+        // Interleaved stereo device input, as `Input` reads it.
+        let input: Vec<f32> = (0..512).map(|i| (i as f32 * 0.2).sin() * 0.7).collect();
+        let bps = 120.0 / 60.0 / 48_000.0;
+        let ctx = |b: usize, discontinuity: bool| ProcessCtx {
+            device_input: &input,
+            in_channels: 2,
+            block_frames: 256,
+            offset: 0,
+            len: 256,
+            playing: true,
+            position: (b * 256) as u64,
+            beat: (b * 256) as f64 * bps,
+            beats_per_sample: bps,
+            discontinuity,
+        };
+        let mut block = vec![0.0f32; 512];
+        sched.run(&mut block, &ctx(0, true));
+        let passed = block[..256].iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(passed > 0.5, "the input never arrived: peak {passed:.3}");
+
+        // A letter reaches it: the trim at its floor takes the level
+        // down, which no other row on this table could be mistaken for.
+        sched.apply(ParamChange {
+            node,
+            param: up::GAIN,
+            value: up::GAIN_MIN_DB,
+        });
+        for b in 1..8 {
+            sched.run(&mut block, &ctx(b, false));
+        }
+        let trimmed = block[..256].iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(
+            trimmed < passed * 0.1,
+            "a gain letter never landed: {trimmed:.4} against {passed:.3}"
+        );
+
+        // A stale id is binned rather than guessed at.
+        sched.apply(ParamChange {
+            node,
+            param: 9_999,
+            value: 1.0,
+        });
+        sched.run(&mut block, &ctx(8, false));
+        assert!(block.iter().all(|s| s.is_finite()));
+    }
+
+    #[test]
+    fn utility_run_does_not_allocate() {
+        use crate::params::utility as up;
+        let mut spec = GraphSpec::default();
+        let src = spec.push(NodeSpec::Input { channel: 0 });
+        let util = spec.push(NodeSpec::Utility {
+            params: Default::default(),
+        });
+        spec.connect(src, util);
+        spec.set_output(util);
+        let node = util.to_bits();
+        let mut sched = spec.compile(48_000, 256).unwrap();
+        let mut block = vec![0.0f32; 512];
+        let bps = 120.0 / 60.0 / 48_000.0;
+
+        assert_no_alloc::assert_no_alloc(|| {
+            for b in 0..8 {
+                for (param, value) in [
+                    (up::GAIN, -12.0 + b as f32),
+                    (up::PAN, (b as f32 / 8.0) * 2.0 - 1.0),
+                    (up::WIDTH, (b % 3) as f32),
+                    // Every corner INCLUDING the floor, so the segment
+                    // that switches the crossover out is inside the
+                    // no-alloc window as well as the ones that rebuild it.
+                    (up::MONO_HZ, 20.0 + (b % 4) as f32 * 120.0),
+                    (up::PHASE, (b % 4) as f32),
+                    (up::CHANNEL, (b % 4) as f32),
+                    (up::DC, (b % 2) as f32),
+                ] {
+                    sched.apply(ParamChange { node, param, value });
+                }
+                sched.run(
+                    &mut block,
+                    &ProcessCtx {
+                        device_input: NO_INPUT,
+                        in_channels: 2,
+                        block_frames: 256,
+                        offset: 0,
+                        len: 256,
+                        playing: true,
+                        position: (b * 256) as u64,
+                        beat: (b * 256) as f64 * bps,
+                        beats_per_sample: bps,
+                        discontinuity: b % 2 == 0,
+                    },
+                );
+            }
+        });
+    }
+
+    /// THE FADES DO WHAT THEIR NAME SAYS: silence at the clip's edges,
+    /// full level in the middle, and a straight line between.
+    ///
+    /// Stated over the ENVELOPE rather than over a rendered clip, because
+    /// a rendered clip needs a file on disk and this is the arithmetic
+    /// that can be wrong — an inverted ramp fades in at the end, which is
+    /// audible immediately and invisible in a waveform drawn from the
+    /// same wrong number.
+    #[test]
+    fn a_fade_is_silent_at_the_edge_and_whole_in_the_middle() {
+        // The node's own expression, lifted out so the test can state it.
+        let envelope = |pos: u64, fade_in: u64, fade_out: u64, span: u64| -> f32 {
+            let mut level = 1.0f32;
+            if fade_in > 0 && pos < fade_in {
+                level = pos as f32 / fade_in as f32;
+            }
+            if fade_out > 0 {
+                let left = span.saturating_sub(pos);
+                if left <= fade_out {
+                    level = level.min(left as f32 / fade_out as f32);
+                }
+            }
+            level
+        };
+        let span = 1_000u64;
+
+        // A fade IN: silent at the very first frame, whole once past it.
+        assert_eq!(envelope(0, 100, 0, span), 0.0, "the first frame is silent");
+        assert!((envelope(50, 100, 0, span) - 0.5).abs() < 1e-6, "halfway");
+        assert_eq!(envelope(100, 100, 0, span), 1.0, "and whole at the end");
+        assert_eq!(envelope(500, 100, 0, span), 1.0, "and stays whole");
+
+        // A fade OUT is its mirror, measured from the clip's end.
+        assert_eq!(
+            envelope(span, 0, 100, span),
+            0.0,
+            "the last frame is silent"
+        );
+        assert!((envelope(span - 50, 0, 100, span) - 0.5).abs() < 1e-6);
+        assert_eq!(envelope(span - 100, 0, 100, span), 1.0);
+        assert_eq!(envelope(0, 0, 100, span), 1.0, "and the start is untouched");
+
+        // No fades is a wire, at every position.
+        for pos in [0u64, 1, 500, 999, 1_000] {
+            assert_eq!(envelope(pos, 0, 0, span), 1.0);
+        }
+
+        // OVERLAPPING fades take the QUIETER of the two rather than
+        // multiplying — a clip shorter than its own fades should dip in
+        // the middle, not vanish.
+        let both = envelope(500, 800, 800, span);
+        assert!(both > 0.0, "a clip covered by both fades still sounds");
+        assert!(both < 1.0, "but never reaches full level");
+        assert_eq!(envelope(0, 800, 800, span), 0.0, "and its edges are silent");
+        assert_eq!(envelope(span, 800, 800, span), 0.0);
+    }
+
+    /// Ragged and empty segments: the block walk must handle a length no
+    /// chunk divides, and a zero-length one, without an index off the end.
+    #[test]
+    fn echo_survives_ragged_and_empty_segments() {
+        let mut sched = echo_graph(NodeSpec::Echo {
+            sync: 0,
+            time_ms: 120.0,
+            feedback: 50.0,
+            tone_hz: 8_000.0,
+            drive: 40.0,
+            wow: 50.0,
+            spread: 30.0,
+            mix: 60.0,
+            send: 0.0,
+        });
+        let mut block = vec![0.0f32; 512];
+        let bps = 120.0 / 60.0 / 48_000.0;
+        for (i, len) in [0usize, 1, 17, 251, 256].into_iter().enumerate() {
+            let c = ProcessCtx {
+                device_input: NO_INPUT,
+                in_channels: 2,
+                block_frames: 256,
+                offset: 0,
+                len,
+                playing: true,
+                position: (i * 256) as u64,
+                beat: (i * 256) as f64 * bps,
+                beats_per_sample: bps,
+                discontinuity: i == 0,
+            };
+            sched.run(&mut block, &c);
+        }
+        assert!(
+            block.iter().all(|s| s.is_finite()),
+            "a ragged segment must not produce NaN"
+        );
     }
 
     /// What a sequencer block costs. Printed, not asserted — a number to
@@ -4635,6 +8473,9 @@ mod tests {
                     len_beats: 0.5,
                     pitch: 60 + (i % 12) as u8,
                     vel: 100,
+                    plocks: Vec::new(),
+                    prob: 1.0,
+                    cond: None,
                 })
                 .collect(),
             None,
@@ -4647,6 +8488,9 @@ mod tests {
                     len_beats: 2.0, // overlapping: keeps all 8 voices busy
                     pitch: 48 + (i % 24) as u8,
                     vel: 100,
+                    plocks: Vec::new(),
+                    prob: 1.0,
+                    cond: None,
                 })
                 .collect(),
             None,
@@ -4659,6 +8503,9 @@ mod tests {
                     len_beats: 0.5,
                     pitch: 60,
                     vel: 100,
+                    plocks: Vec::new(),
+                    prob: 1.0,
+                    cond: None,
                 })
                 .collect(),
             Some(4.0),
@@ -4686,6 +8533,9 @@ mod tests {
                 len_beats: if i == 3 { 1.0 } else { 0.5 },
                 pitch: 60,
                 vel: 110,
+                plocks: Vec::new(),
+                prob: 1.0,
+                cond: None,
             })
             .collect();
         let mut spec = GraphSpec::default();
@@ -4749,6 +8599,9 @@ mod tests {
                 len_beats: 1.0,
                 pitch: 69,
                 vel: 127,
+                plocks: Vec::new(),
+                prob: 1.0,
+                cond: None,
             }]);
             let mut out = vec![0.0f32; 512];
             sched.run(&mut out, &play_ctx(0.0, true));
@@ -4780,6 +8633,9 @@ mod tests {
             len_beats: 1.0,
             pitch: 69,
             vel: 127,
+            plocks: Vec::new(),
+            prob: 1.0,
+            cond: None,
         }]);
         let mut out = vec![0.0f32; 512];
         sched.run(&mut out, &play_ctx(0.0, true));
@@ -4803,6 +8659,9 @@ mod tests {
                 len_beats: 0.5,
                 pitch,
                 vel: 100,
+                plocks: Vec::new(),
+                prob: 1.0,
+                cond: None,
             })
             .collect();
         let mut sched = seq_sched(notes);
@@ -4829,6 +8688,9 @@ mod tests {
             len_beats: 1.0,
             pitch: 69,
             vel: 100,
+            plocks: Vec::new(),
+            prob: 1.0,
+            cond: None,
         }]);
         let bps = 120.0 / 60.0 / 48_000.0;
         let mut out = vec![0.0f32; 512];
@@ -4868,12 +8730,18 @@ mod tests {
                 len_beats: 1.0,
                 pitch: 60,
                 vel: 100,
+                plocks: Vec::new(),
+                prob: 1.0,
+                cond: None,
             },
             Note {
                 start_beats: 1.0,
                 len_beats: 1.0,
                 pitch: 60,
                 vel: 100,
+                plocks: Vec::new(),
+                prob: 1.0,
+                cond: None,
             },
         ]);
         let bps = 120.0 / 60.0 / 48_000.0;
@@ -4905,6 +8773,9 @@ mod tests {
             len_beats: 16.0,
             pitch: 57,
             vel: 127,
+            plocks: Vec::new(),
+            prob: 1.0,
+            cond: None,
         }]);
         let bps = 120.0 / 60.0 / 48_000.0;
         let mut out = vec![0.0f32; 512];
@@ -4942,6 +8813,9 @@ mod tests {
                 len_beats: 0.3,
                 pitch: 69,
                 vel: 100,
+                plocks: Vec::new(),
+                prob: 1.0,
+                cond: None,
             }],
             1.0,
         );
@@ -4978,6 +8852,9 @@ mod tests {
                 len_beats: 5.0,
                 pitch: 45,
                 vel: 127,
+                plocks: Vec::new(),
+                prob: 1.0,
+                cond: None,
             }],
             1.0,
         );
@@ -5014,6 +8891,9 @@ mod tests {
                 len_beats: 0.5,
                 pitch: 60,
                 vel: 100,
+                plocks: Vec::new(),
+                prob: 1.0,
+                cond: None,
             }],
             1.0,
         );
@@ -5046,6 +8926,9 @@ mod tests {
                 len_beats: 8.0,
                 pitch: 60 + i as u8,
                 vel: 100,
+                plocks: Vec::new(),
+                prob: 1.0,
+                cond: None,
             })
             .collect();
         let mut sched = seq_sched(notes);
@@ -5062,6 +8945,123 @@ mod tests {
         });
     }
 
+    fn kick_sched(params: crate::audio::kick::KickParams) -> Schedule {
+        let notes: Vec<Note> = (0..4)
+            .map(|i| Note {
+                start_beats: i as f64,
+                len_beats: 0.1,
+                // The drum machine C, so the tune knob means what it says.
+                pitch: 36,
+                vel: 110,
+                plocks: Vec::new(),
+                prob: 1.0,
+                cond: None,
+            })
+            .collect();
+        let mut spec = GraphSpec::default();
+        let k = spec.push(NodeSpec::Kick {
+            notes,
+            subloops: Vec::new(),
+            loop_len_beats: None,
+            params,
+        });
+        spec.set_output(k);
+        spec.compile(48_000, 256).unwrap()
+    }
+
+    /// The kick reaches the output through the ordinary schedule, on the
+    /// beat, and stops when the pattern does.
+    #[test]
+    fn a_kick_pattern_sounds_through_the_graph() {
+        let mut sched = kick_sched(crate::audio::kick::KickParams::default());
+        let bps = 120.0 / 60.0 / 48_000.0;
+        let mut out = vec![0.0f32; 512];
+        let mut beat = 0.0;
+        let mut loudest = 0.0f32;
+        for i in 0..64 {
+            let mut c = play_ctx(beat, i == 0);
+            c.beats_per_sample = bps;
+            sched.run(&mut out, &c);
+            loudest = loudest.max(out[..256].iter().fold(0.0f32, |p, s| p.max(s.abs())));
+            beat += 256.0 * bps;
+        }
+        assert!(loudest > 0.05, "the pattern made no sound: {loudest}");
+        assert!(loudest.is_finite());
+    }
+
+    /// A LETTER MOVES THE KICK while it is playing — including the two
+    /// pitch envelopes' times, which rebuild the voice's envelope
+    /// coefficients rather than waiting for a recompile.
+    #[test]
+    fn kick_letters_reach_the_voice() {
+        use crate::params::kick as kp;
+        let mut spec = GraphSpec::default();
+        let k = spec.push(NodeSpec::Kick {
+            notes: vec![Note {
+                start_beats: 0.0,
+                len_beats: 0.1,
+                pitch: 36,
+                vel: 110,
+                plocks: Vec::new(),
+                prob: 1.0,
+                cond: None,
+            }],
+            subloops: Vec::new(),
+            loop_len_beats: None,
+            params: crate::audio::kick::KickParams::default(),
+        });
+        spec.set_output(k);
+        let mut sched = spec.compile(48_000, 256).unwrap();
+
+        // Every row of the table, applied as a letter, lands in range and
+        // leaves the graph rendering finite audio.
+        let mut out = vec![0.0f32; 512];
+        let bps = 120.0 / 60.0 / 48_000.0;
+        for def in kp::TABLE {
+            for value in [def.min, def.max, (def.min + def.max) * 0.5] {
+                sched.apply(ParamChange {
+                    node: k.to_bits(),
+                    param: def.id,
+                    value,
+                });
+                let mut c = play_ctx(0.0, true);
+                c.beats_per_sample = bps;
+                sched.run(&mut out, &c);
+                assert!(
+                    out.iter().all(|s| s.is_finite()),
+                    "{} at {value} produced a non-finite sample",
+                    def.name
+                );
+            }
+        }
+    }
+
+    /// The whole kick path — two pitch envelopes, a noise click, a
+    /// thirty-two section disperser and a saturator — allocates nothing
+    /// in the callback, including across the note boundaries where the
+    /// voice re-tunes its disperser.
+    #[test]
+    fn kick_run_does_not_allocate() {
+        let params = crate::audio::kick::KickParams {
+            disperse_stages: crate::params::kick::DISP_STAGES_MAX,
+            click_level: 1.0,
+            drive: 6.0,
+            ..crate::audio::kick::KickParams::default()
+        };
+        let mut sched = kick_sched(params);
+        let bps = 120.0 / 60.0 / 48_000.0;
+        let mut out = vec![0.0f32; 512];
+        assert_no_alloc::assert_no_alloc(|| {
+            let mut beat = 0.0;
+            for i in 0..200 {
+                let mut c = play_ctx(beat, i == 0);
+                c.beats_per_sample = bps;
+                sched.run(&mut out, &c);
+                beat += 256.0 * bps;
+            }
+        });
+    }
+
     #[test]
     fn seq_run_does_not_allocate() {
         let notes: Vec<Note> = (0..16)
@@ -5070,6 +9070,9 @@ mod tests {
                 len_beats: 0.2,
                 pitch: 60 + (i % 12) as u8,
                 vel: 100,
+                plocks: Vec::new(),
+                prob: 1.0,
+                cond: None,
             })
             .collect();
         let mut sched = seq_sched(notes);
@@ -5129,7 +9132,13 @@ mod tests {
             source_offset_frames: 0,
             source_frames: None,
             loop_clip,
+            loop_start_frames: 0,
             gain: 1.0,
+            fade_in_frames: 0,
+            fade_out_frames: 0,
+            fade_in_shape: 0.0,
+            fade_out_shape: 0.0,
+            envelope: Vec::new(),
         });
         spec.set_output(c);
         spec.compile(48_000, 256).unwrap()
@@ -5218,7 +9227,13 @@ mod tests {
             source_offset_frames: 0,
             source_frames: Some(1_024),
             loop_clip: false,
+            loop_start_frames: 0,
             gain: 1.0,
+            fade_in_frames: 0,
+            fade_out_frames: 0,
+            fade_in_shape: 0.0,
+            fade_out_shape: 0.0,
+            envelope: Vec::new(),
         });
         spec.set_output(clip);
         let mut sched = spec.compile_at_tempo(480, 256, 120.0).unwrap();
@@ -5265,6 +9280,295 @@ mod tests {
         assert!(out[..256].iter().all(|s| *s == 0.0));
     }
 
+    /// THE SHAPED ENVELOPE IS THE SHARED CURVE, and a shape of zero is
+    /// EXACTLY the straight ramp this node applied before shapes existed.
+    ///
+    /// Stated over the arithmetic rather than over a rendered clip for
+    /// the same reason its linear sibling above is: the fade a file
+    /// exercises is the fade that already worked, and it is the numbers
+    /// that can be wrong.
+    #[test]
+    fn a_shaped_fade_follows_the_shared_curve() {
+        use crate::params::clip::Curve;
+        let envelope = |pos: u64,
+                        fade_in: u64,
+                        fade_out: u64,
+                        span: u64,
+                        in_curve: Curve,
+                        out_curve: Curve| {
+            let mut level = 1.0f32;
+            if fade_in > 0 && pos < fade_in {
+                level = in_curve.at(pos as f32 / fade_in as f32);
+            }
+            if fade_out > 0 {
+                let left = span.saturating_sub(pos);
+                if left <= fade_out {
+                    level = level.min(out_curve.at(left as f32 / fade_out as f32));
+                }
+            }
+            level
+        };
+        let span = 1_000u64;
+        let flat = Curve::LINEAR;
+
+        // A shape of zero is the old straight ramp, to the bit.
+        for pos in [0u64, 1, 37, 50, 99, 100, 500, 999, 1_000] {
+            let straight = {
+                let mut level = 1.0f32;
+                if pos < 100 {
+                    level = pos as f32 / 100.0;
+                }
+                let left = span.saturating_sub(pos);
+                if left <= 100 {
+                    level = level.min(left as f32 / 100.0);
+                }
+                level
+            };
+            assert_eq!(envelope(pos, 100, 100, span, flat, flat), straight, "{pos}");
+        }
+
+        // A shaped fade still starts silent and ends whole, whatever the
+        // shape — the two properties that make it a fade at all.
+        for shape in [-1.0f32, -0.5, 0.0, 0.5, 1.0] {
+            let curve = Curve::new(shape);
+            assert_eq!(envelope(0, 100, 0, span, curve, flat), 0.0, "shape {shape}");
+            assert!(
+                (envelope(100, 100, 0, span, curve, flat) - 1.0).abs() < 1e-5,
+                "shape {shape}"
+            );
+            assert_eq!(envelope(span, 0, 100, span, flat, curve), 0.0);
+            assert!((envelope(span - 100, 0, 100, span, flat, curve) - 1.0).abs() < 1e-5);
+        }
+
+        // And the two ends carry their OWN shapes: a clip fading in fast
+        // and out slow is two different curves on one clip.
+        let fast = Curve::new(0.8);
+        let slow = Curve::new(-0.8);
+        let rising = envelope(50, 100, 0, span, fast, flat);
+        let falling = envelope(span - 50, 0, 100, span, flat, slow);
+        assert!(rising > 0.5, "the fast end is past halfway at halfway");
+        assert!(falling < 0.5, "and the slow one is not");
+    }
+
+    /// The envelope is SORTED AND CLAMPED GREEN-SIDE, because the
+    /// callback's walk assumes it rises and stays inside the clip.
+    #[test]
+    fn a_compiled_envelope_is_sorted_and_inside_the_clip() {
+        let messy = [
+            (500u64, 1.0f32),
+            (0, 0.5),
+            // Past the span: dropped, not clamped onto the end, where it
+            // would pile up and give the last segment a zero-length gap
+            // to interpolate across.
+            (9_000, 0.25),
+            (200, 2.0),
+            // A duplicate frame, which would be a vertical step.
+            (200, 0.75),
+            // Nonsense, which would poison every sample after it.
+            (300, f32::NAN),
+            (400, f32::INFINITY),
+        ];
+        let out = sorted_envelope(&messy, 1_000);
+        assert_eq!(
+            out.iter().map(|(at, _)| *at).collect::<Vec<_>>(),
+            vec![0, 200, 500],
+            "sorted, deduped, inside the clip, and finite"
+        );
+        assert!(out.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        assert!(out.iter().all(|(_, gain)| gain.is_finite()));
+
+        // An empty envelope stays empty — that is the free case, and it
+        // must not acquire a point from nowhere.
+        assert!(sorted_envelope(&[], 1_000).is_empty());
+    }
+
+    /// THE ENVELOPE IS A RAMP, and it lands on its points.
+    ///
+    /// Stated over the walk rather than over a rendered clip, for the
+    /// reason the fades' own test gives: the arithmetic is what can be
+    /// wrong, and a file only makes it slower to find out.
+    #[test]
+    fn the_envelope_interpolates_between_its_points() {
+        let points = sorted_envelope(&[(0, 1.0), (1_000, 0.0)], 2_000);
+        let mut cursor = 0usize;
+        let at = |pos: u64, cursor: &mut usize| -> f32 {
+            while *cursor + 1 < points.len() && points[*cursor + 1].0 <= pos {
+                *cursor += 1;
+            }
+            let (at, gain) = points[*cursor];
+            let Some(&(next_at, next_gain)) = points.get(*cursor + 1) else {
+                return gain;
+            };
+            if pos <= at || next_at <= at {
+                return gain;
+            }
+            gain + (next_gain - gain) * ((pos - at) as f32 / (next_at - at) as f32)
+        };
+        assert_eq!(at(0, &mut cursor), 1.0);
+        assert!((at(500, &mut cursor) - 0.5).abs() < 1e-6);
+        assert_eq!(at(1_000, &mut cursor), 0.0);
+        // HELD FLAT past the last point, which is what the picture draws.
+        assert_eq!(at(1_500, &mut cursor), 0.0);
+
+        // A single point is a constant, not a ramp to nowhere.
+        let one = sorted_envelope(&[(500, 0.25)], 2_000);
+        let mut cursor = 0usize;
+        let at_one = |pos: u64, cursor: &mut usize| -> f32 {
+            while *cursor + 1 < one.len() && one[*cursor + 1].0 <= pos {
+                *cursor += 1;
+            }
+            one[*cursor].1
+        };
+        for pos in [0u64, 499, 500, 1_999] {
+            assert_eq!(at_one(pos, &mut cursor), 0.25);
+        }
+    }
+
+    /// A DISCONTINUITY RE-FINDS THE CURSOR. Locating into the middle of a
+    /// clip must land on the right gain on the FIRST sample after the
+    /// jump — a cursor left where the last block finished would ramp from
+    /// the wrong place, audibly.
+    #[test]
+    fn a_discontinuity_re_finds_the_envelope_cursor() {
+        let points = sorted_envelope(
+            &[(0, 1.0), (1_000, 0.5), (2_000, 0.25), (3_000, 0.125)],
+            4_000,
+        );
+        // The node's own expression for the re-find.
+        let refind = |local: u64| {
+            points
+                .partition_point(|(at, _)| *at <= local)
+                .saturating_sub(1)
+        };
+        assert_eq!(refind(0), 0);
+        assert_eq!(refind(999), 0);
+        // Landing exactly ON a point starts from that point, so the
+        // first sample reads its gain and then ramps towards the next —
+        // not from the segment before it.
+        assert_eq!(refind(1_000), 1);
+        assert_eq!(refind(1_001), 1);
+        assert_eq!(refind(2_500), 2);
+        assert_eq!(refind(9_999), 3, "past the end holds the last point");
+
+        // And from any of them, the very next sample reads the right
+        // gain rather than the one the previous block left behind.
+        for local in [0u64, 1_500, 2_999, 3_500] {
+            let mut cursor = refind(local);
+            while cursor + 1 < points.len() && points[cursor + 1].0 <= local {
+                cursor += 1;
+            }
+            let (at, gain) = points[cursor];
+            assert!(at <= local, "the cursor is never ahead of the playhead");
+            assert!(gain > 0.0);
+        }
+    }
+
+    /// AN EMPTY ENVELOPE IS A NO-OP, and so is a flat unity one. A clip
+    /// written before envelopes existed must sound exactly as it did.
+    ///
+    /// Asserted over the ARITHMETIC rather than over two rendered clips.
+    /// The first version of this test compiled two schedules over the
+    /// same WAV, warmed each with `wait_for_audio`, and compared them
+    /// sample by sample — and it was racy by construction: that warm-up
+    /// loops until audio appears, creek decodes on its own thread, and
+    /// the two streams end up at different playheads. It passed most
+    /// runs and failed some, which is worse than not existing.
+    ///
+    /// What the node actually promises is that the envelope multiply is
+    /// SKIPPED when there are no points, and is a multiply by exactly one
+    /// when the points are all unity. Both are checkable without a file.
+    #[test]
+    fn an_empty_envelope_changes_nothing() {
+        // Nothing in, nothing compiled — so `rode` is false and the
+        // per-sample multiply never runs at all.
+        assert!(sorted_envelope(&[], 96_000).is_empty());
+
+        // A flat unity envelope reads exactly 1.0 everywhere, so the
+        // multiply that does run changes nothing.
+        let flat = sorted_envelope(&[(0, 1.0), (96_000, 1.0)], 96_000);
+        assert_eq!(flat.len(), 2);
+        let mut cursor = 0usize;
+        let at = |pos: u64, cursor: &mut usize| -> f32 {
+            while *cursor + 1 < flat.len() && flat[*cursor + 1].0 <= pos {
+                *cursor += 1;
+            }
+            let (at, gain) = flat[*cursor];
+            let Some(&(next_at, next_gain)) = flat.get(*cursor + 1) else {
+                return gain;
+            };
+            if pos <= at || next_at <= at {
+                return gain;
+            }
+            gain + (next_gain - gain) * ((pos - at) as f32 / (next_at - at) as f32)
+        };
+        for pos in [0u64, 1, 12_345, 48_000, 95_999, 96_000, 200_000] {
+            assert_eq!(at(pos, &mut cursor), 1.0, "unity is unity at {pos}");
+        }
+
+        // And a NON-unity envelope does change something, so the test
+        // above is not passing because nothing is wired up.
+        let ramp = sorted_envelope(&[(0, 1.0), (96_000, 0.0)], 96_000);
+        let mut cursor = 0usize;
+        let at = |pos: u64, cursor: &mut usize| -> f32 {
+            while *cursor + 1 < ramp.len() && ramp[*cursor + 1].0 <= pos {
+                *cursor += 1;
+            }
+            let (at, gain) = ramp[*cursor];
+            let Some(&(next_at, next_gain)) = ramp.get(*cursor + 1) else {
+                return gain;
+            };
+            if pos <= at || next_at <= at {
+                return gain;
+            }
+            gain + (next_gain - gain) * ((pos - at) as f32 / (next_at - at) as f32)
+        };
+        assert!((at(48_000, &mut cursor) - 0.5).abs() < 1e-4);
+    }
+
+    /// The envelope allocates nothing, including across a discontinuity —
+    /// where the cursor is re-found, which is the only search on the
+    /// path and the place a `Vec` would be easiest to reach for.
+    #[test]
+    fn an_enveloped_clip_does_not_allocate() {
+        let path = test_wav("envnoalloc");
+        let mut spec = GraphSpec::default();
+        let c = spec.push(NodeSpec::AudioClip {
+            path,
+            start_beats: 0.0,
+            length_beats: None,
+            source_offset_frames: 0,
+            source_frames: None,
+            loop_clip: true,
+            loop_start_frames: 0,
+            gain: 1.0,
+            fade_in_frames: 0,
+            fade_out_frames: 0,
+            fade_in_shape: 0.0,
+            fade_out_shape: 0.0,
+            envelope: (0..64).map(|i| (i * 700, 1.0 - i as f32 / 128.0)).collect(),
+        });
+        spec.set_output(c);
+        let mut sched = spec.compile(48_000, 256).unwrap();
+        let mut out = vec![0.0f32; 512];
+        wait_for_audio(&mut sched, &mut out);
+        let mut pos = 0u64;
+        assert_no_alloc::assert_no_alloc(|| {
+            for _ in 0..80 {
+                let mut ctx = play_ctx(0.0, false);
+                ctx.position = pos;
+                sched.run(&mut out, &ctx);
+                pos += 256;
+            }
+            // And the re-find path: a discontinuity at a position well
+            // past where the walk had got to.
+            for jump in [30_000u64, 1_000, 44_000, 200] {
+                let mut ctx = play_ctx(0.0, true);
+                ctx.position = jump;
+                sched.run(&mut out, &ctx);
+            }
+        });
+    }
+
     #[test]
     fn audio_clip_read_does_not_allocate() {
         let mut sched = clip_audio_sched(test_wav("noalloc"), true);
@@ -5276,6 +9580,77 @@ mod tests {
                 let mut c = play_ctx(0.0, false);
                 c.position = pos;
                 sched.run(&mut out, &c);
+                pos += 256;
+            }
+        });
+    }
+
+    /// A CURVED FADE ALLOCATES NOTHING. The curve is a multiply and a
+    /// divide per sample and must stay that way: this is the test that
+    /// notices if it ever grows a table, a `Vec`, or a `powf` behind a
+    /// feature flag that pulls one in.
+    #[test]
+    fn a_curved_fade_does_not_allocate() {
+        let path = test_wav("curvednoalloc");
+        let mut spec = GraphSpec::default();
+        let c = spec.push(NodeSpec::AudioClip {
+            path,
+            start_beats: 0.0,
+            length_beats: None,
+            source_offset_frames: 0,
+            source_frames: None,
+            loop_clip: true,
+            loop_start_frames: 0,
+            gain: 1.0,
+            // The fade OUT covers most of the clip, so the blocks below
+            // land inside it. The fade IN starts at zero and is turned on
+            // by a letter further down — warming the stream needs an
+            // audible first block, and a clip that starts inside a long
+            // fade in has not got one.
+            fade_in_frames: 0,
+            fade_out_frames: 40_000,
+            fade_in_shape: 0.7,
+            fade_out_shape: -0.7,
+            envelope: Vec::new(),
+        });
+        spec.set_output(c);
+        let mut sched = spec.compile(48_000, 256).unwrap();
+        let mut out = vec![0.0f32; 512];
+        wait_for_audio(&mut sched, &mut out);
+        let mut pos: u64 = 0;
+        assert_no_alloc::assert_no_alloc(|| {
+            for _ in 0..100 {
+                let mut c = play_ctx(0.0, false);
+                c.position = pos;
+                sched.run(&mut out, &c);
+                pos += 256;
+            }
+        });
+
+        // The fade IN, its shape, and both arriving as LETTERS mid-run:
+        // that is the whole reason they are letters, and it is where an
+        // allocation would hide if one ever crept in.
+        assert_no_alloc::assert_no_alloc(|| {
+            sched.apply(ParamChange {
+                node: c.to_bits(),
+                param: crate::params::clip::FADE_IN,
+                value: 20_000.0,
+            });
+            let mut pos: u64 = 0;
+            for step in 0..40 {
+                sched.apply(ParamChange {
+                    node: c.to_bits(),
+                    param: crate::params::clip::FADE_IN_CURVE,
+                    value: step as f32 / 40.0 - 0.5,
+                });
+                sched.apply(ParamChange {
+                    node: c.to_bits(),
+                    param: crate::params::clip::FADE_OUT_CURVE,
+                    value: 0.5 - step as f32 / 40.0,
+                });
+                let mut ctx = play_ctx(0.0, false);
+                ctx.position = pos;
+                sched.run(&mut out, &ctx);
                 pos += 256;
             }
         });
@@ -5610,5 +9985,861 @@ mod tests {
                 "and the output stays finite with {written}"
             );
         }
+    }
+    // ------------------------------------------- the extracted clock ---
+
+    /// A second, entirely unrelated instrument. Records what the clock
+    /// asked of it and renders a constant, so a test can assert on the
+    /// GATING rather than on any audio.
+    #[derive(Default)]
+    struct Probe {
+        log: Vec<String>,
+        rendered: usize,
+    }
+
+    impl Voices for Probe {
+        fn all_sound_off(&mut self) {
+            self.log.push("cut".to_owned());
+        }
+        fn release_all(&mut self) {
+            self.log.push("release".to_owned());
+        }
+        fn note_off(&mut self, pitch: u8) {
+            self.log.push(format!("off {pitch}"));
+        }
+        fn note_on(&mut self, pitch: u8, vel: u8, age: u64) {
+            self.log.push(format!("on {pitch} v{vel} a{age}"));
+        }
+        fn plock(&mut self, param: u32, value: Option<f32>) {
+            match value {
+                Some(v) => self.log.push(format!("lock {param}={v}")),
+                None => self.log.push(format!("unlock {param}")),
+            }
+        }
+        fn render(&mut self, out: &mut [f32], _at: usize, gain: &mut Ramp) {
+            self.rendered += out.len();
+            for s in out.iter_mut() {
+                *s = gain.next();
+            }
+        }
+    }
+
+    /// THE POINT OF THE EXTRACTION: the pattern walk drives an instrument
+    /// it has never heard of.
+    ///
+    /// If this compiles and passes, `Node::Poly` does not need a second
+    /// copy of the clip/loop/cycle machinery — it needs five methods. The
+    /// walk's expensive reasoning (integer cycle derivation, the
+    /// strictly-greater wrap reconciliation, the monotonic phase guard)
+    /// stays in exactly one place.
+    #[test]
+    fn the_pattern_clock_drives_an_instrument_it_does_not_know() {
+        // Two notes, the second an off at the same sample as an on — the
+        // tie-order rule from the sequencing contract.
+        let events = vec![
+            SeqEvent {
+                sample: 0,
+                rank: 2,
+                pitch: 60,
+                vel: 100,
+                param: 0,
+                value: 0.0,
+                restore: false,
+                prob: 1.0,
+                cond: (0, 0),
+                trig_key: 0,
+            },
+            SeqEvent {
+                sample: 128,
+                rank: 0,
+                pitch: 60,
+                vel: 0,
+                param: 0,
+                value: 0.0,
+                restore: false,
+                prob: 1.0,
+                cond: (0, 0),
+                trig_key: 0,
+            },
+            SeqEvent {
+                sample: 128,
+                rank: 2,
+                pitch: 67,
+                vel: 90,
+                param: 0,
+                value: 0.0,
+                restore: false,
+                prob: 1.0,
+                cond: (0, 0),
+                trig_key: 0,
+            },
+        ];
+        let mut clock = PatternClock::new(0, 24_000.0);
+        let mut probe = Probe::default();
+        let mut out = [0.0f32; 256];
+        let mut ramp = Ramp::across(1.0, 1.0, out.len());
+        clock.run(&mut probe, &events, &mut out, &ctx(NO_INPUT), &mut ramp);
+
+        assert_eq!(probe.rendered, 256, "every sample must be rendered");
+        assert_eq!(
+            probe.log,
+            ["on 60 v100 a0", "off 60", "on 67 v90 a1"],
+            "off must land before the on at the same sample"
+        );
+    }
+
+    /// The clock cuts an unknown instrument on a discontinuity, exactly as
+    /// it cuts the built-in one — contract rule 2, inherited for free.
+    #[test]
+    fn the_pattern_clock_cuts_any_instrument_on_a_discontinuity() {
+        let events = vec![SeqEvent {
+            sample: 0,
+            rank: 2,
+            pitch: 60,
+            vel: 100,
+            param: 0,
+            value: 0.0,
+            restore: false,
+            prob: 1.0,
+            cond: (0, 0),
+            trig_key: 0,
+        }];
+        let mut clock = PatternClock::new(0, 24_000.0);
+        let mut probe = Probe::default();
+        let mut out = [0.0f32; 256];
+        let mut ramp = Ramp::across(1.0, 1.0, out.len());
+        let seek = ProcessCtx {
+            discontinuity: true,
+            ..ctx(NO_INPUT)
+        };
+        clock.run(&mut probe, &events, &mut out, &seek, &mut ramp);
+        assert_eq!(probe.log.first().map(String::as_str), Some("cut"));
+    }
+
+    /// A stopped transport releases rather than cuts, and still fills the
+    /// whole buffer — a metered node may never leave a slot unwritten.
+    #[test]
+    fn the_pattern_clock_releases_when_the_transport_stops() {
+        let events = vec![SeqEvent {
+            sample: 0,
+            rank: 2,
+            pitch: 60,
+            vel: 100,
+            param: 0,
+            value: 0.0,
+            restore: false,
+            prob: 1.0,
+            cond: (0, 0),
+            trig_key: 0,
+        }];
+        let mut clock = PatternClock::new(0, 24_000.0);
+        let mut probe = Probe::default();
+        let mut out = [0.0f32; 256];
+        let mut ramp = Ramp::across(1.0, 1.0, out.len());
+        let stopped = ProcessCtx {
+            playing: false,
+            ..ctx(NO_INPUT)
+        };
+        clock.run(&mut probe, &events, &mut out, &stopped, &mut ramp);
+        assert_eq!(probe.log, ["release"]);
+        assert_eq!(probe.rendered, 256);
+    }
+
+    /// A clip shorter than the block wraps repeatedly inside one segment,
+    /// flushing the cycle's owed note-offs at every wrap — the hanging
+    /// note the contract forbids, for an instrument the walk never saw.
+    #[test]
+    fn a_short_clip_wraps_and_flushes_within_one_segment() {
+        let events = vec![
+            SeqEvent {
+                sample: 0,
+                rank: 2,
+                pitch: 60,
+                vel: 100,
+                param: 0,
+                value: 0.0,
+                restore: false,
+                prob: 1.0,
+                cond: (0, 0),
+                trig_key: 0,
+            },
+            SeqEvent {
+                sample: 63,
+                rank: 0,
+                pitch: 60,
+                vel: 0,
+                param: 0,
+                value: 0.0,
+                restore: false,
+                prob: 1.0,
+                cond: (0, 0),
+                trig_key: 0,
+            },
+        ];
+        // 64-sample clip inside a 256-sample segment: four cycles.
+        let mut clock = PatternClock::new(64, 24_000.0);
+        let mut probe = Probe::default();
+        let mut out = [0.0f32; 256];
+        let mut ramp = Ramp::across(1.0, 1.0, out.len());
+        clock.run(&mut probe, &events, &mut out, &ctx(NO_INPUT), &mut ramp);
+
+        assert_eq!(probe.rendered, 256);
+        let ons = probe.log.iter().filter(|l| l.starts_with("on ")).count();
+        let offs = probe.log.iter().filter(|l| l.starts_with("off ")).count();
+        assert_eq!(ons, 4, "four cycles, four note-ons: {:?}", probe.log);
+        assert_eq!(offs, ons, "every note-on is matched: {:?}", probe.log);
+    }
+    // ------------------------------------------------- the poly synth ---
+
+    use crate::audio::poly::{PolyParams, PolyVoices};
+    use crate::params::poly as pp;
+
+    /// A poly synth playing one held note, compiled and run for one block.
+    fn poly_graph(params: PolyParams, pitches: &[u8]) -> (Schedule, NodeId) {
+        let mut spec = GraphSpec::default();
+        let id = spec.push(NodeSpec::Poly {
+            notes: pitches
+                .iter()
+                .map(|p| Note {
+                    start_beats: 0.0,
+                    len_beats: 1.0,
+                    pitch: *p,
+                    vel: 127,
+                    plocks: Vec::new(),
+                    prob: 1.0,
+                    cond: None,
+                })
+                .collect(),
+            subloops: vec![],
+            loop_len_beats: None,
+            params,
+        });
+        spec.set_output(id);
+        (spec.compile(48_000, 256).unwrap(), id)
+    }
+
+    /// It makes a sound. The first thing to know about an instrument, and
+    /// the one no unit test of a kernel can tell you.
+    #[test]
+    fn the_poly_synth_sounds_a_note() {
+        let (mut sched, _) = poly_graph(PolyParams::default(), &[69]);
+        let mut out = vec![0.0f32; 512];
+        run(&mut sched, &mut out);
+        let level = rms(&out);
+        assert!(level > 1e-3, "poly synth was silent (rms {level})");
+        assert!(
+            out.iter().all(|s| s.is_finite()),
+            "poly synth went non-finite"
+        );
+        assert!(
+            out.iter().all(|s| s.abs() <= 1.5),
+            "poly synth clipped hard"
+        );
+    }
+
+    /// It is STEREO, and silence stays silent — the two halves of "the
+    /// node fills every sample of every channel it claims".
+    #[test]
+    fn the_poly_synth_fills_both_channels() {
+        let (mut sched, _) = poly_graph(PolyParams::default(), &[69]);
+        let mut out = vec![0.0f32; 512];
+        run(&mut sched, &mut out);
+        let (l, r) = out.split_at(256);
+        assert!(rms(l) > 1e-3, "left silent");
+        assert!(rms(r) > 1e-3, "right silent");
+
+        // No notes at all: every sample of both channels is exactly zero.
+        let (mut sched, _) = poly_graph(PolyParams::default(), &[]);
+        let mut out = vec![0.0f32; 512];
+        run(&mut sched, &mut out);
+        assert!(out.iter().all(|s| *s == 0.0), "an empty pattern made sound");
+    }
+
+    /// A chord sounds as a chord — the same regression the Seq synth
+    /// carries, re-asserted for an allocator that now hands out unison
+    /// stacks as well as single voices.
+    #[test]
+    fn poly_simultaneous_notes_get_their_own_voices() {
+        let one = {
+            let (mut s, _) = poly_graph(PolyParams::default(), &[60]);
+            let mut o = vec![0.0f32; 512];
+            run(&mut s, &mut o);
+            rms(&o[..256])
+        };
+        let three = {
+            let (mut s, _) = poly_graph(PolyParams::default(), &[60, 64, 67]);
+            let mut o = vec![0.0f32; 512];
+            run(&mut s, &mut o);
+            rms(&o[..256])
+        };
+        assert!(three > one * 1.4, "triad {three} vs single {one}");
+    }
+
+    /// EVERY row of the table reaches the instrument and is clamped by it.
+    ///
+    /// The wire contract, end to end: the widget emits ids from
+    /// `params::poly`, the node clamps against the same rows, and the
+    /// instrument stores what came through. An id the table knows that the
+    /// node drops is a knob that silently does nothing.
+    #[test]
+    fn every_poly_param_reaches_the_instrument() {
+        let (mut sched, id) = poly_graph(PolyParams::default(), &[69]);
+        for def in pp::TABLE {
+            // Deliberately out of range on both sides: the node must clamp
+            // rather than store nonsense or drop the letter.
+            for raw in [def.min - 1_000.0, def.max + 1_000.0, f32::NAN] {
+                sched.apply(ParamChange {
+                    node: id.to_bits(),
+                    param: def.id,
+                    value: raw,
+                });
+            }
+            let mut out = vec![0.0f32; 512];
+            run(&mut sched, &mut out);
+            assert!(
+                out.iter().all(|s| s.is_finite()),
+                "{} at its extremes made the synth non-finite",
+                def.name
+            );
+        }
+    }
+
+    /// A ParamChange letter actually changes the sound. Gain to zero is
+    /// the one every device must honour.
+    #[test]
+    fn poly_gain_letters_are_heard() {
+        let (mut sched, id) = poly_graph(PolyParams::default(), &[69]);
+        let mut loud = vec![0.0f32; 512];
+        run(&mut sched, &mut loud);
+        sched.apply(ParamChange {
+            node: id.to_bits(),
+            param: pp::GAIN,
+            value: 0.0,
+        });
+        // Two blocks: the first ramps down, the second is silent.
+        let mut fading = vec![0.0f32; 512];
+        run(&mut sched, &mut fading);
+        let mut quiet = vec![0.0f32; 512];
+        run(&mut sched, &mut quiet);
+        assert!(rms(&loud) > 1e-3);
+        assert!(rms(&quiet) < 1e-5, "gain 0 still sounded: {}", rms(&quiet));
+    }
+
+    /// Contract rule 2: a discontinuity cuts every sounding voice. The
+    /// poly synth inherits this from the shared clock, so the test is
+    /// really asking whether the inheritance works.
+    #[test]
+    fn a_discontinuity_cuts_the_poly_synth() {
+        let (mut sched, _) = poly_graph(PolyParams::default(), &[69]);
+        let mut out = vec![0.0f32; 512];
+        run(&mut sched, &mut out);
+        assert!(rms(&out) > 1e-3);
+
+        // A seek: the note is behind the cursor, so nothing re-sounds.
+        let seek = ProcessCtx {
+            position: 48_000,
+            beat: 2.0,
+            discontinuity: true,
+            ..ctx(NO_INPUT)
+        };
+        let mut after = vec![0.0f32; 512];
+        sched.run(&mut after, &seek);
+        assert!(
+            rms(&after) < 1e-5,
+            "the seek left a hanging voice: {}",
+            rms(&after)
+        );
+    }
+
+    /// Unison takes more voices and spreads them: eight-voice unison with
+    /// full spread must decorrelate the channels, where a single voice
+    /// sits dead centre.
+    #[test]
+    fn unison_spread_widens_the_image() {
+        let width = |unison: f32, spread: f32| {
+            let params = PolyParams {
+                unison,
+                spread,
+                detune: 25.0,
+                ..PolyParams::default()
+            };
+            let (mut s, _) = poly_graph(params, &[60]);
+            let mut o = vec![0.0f32; 512];
+            // Several blocks: a unison stack widens from its spread start
+            // phases AND from the detune beating the voices apart, and the
+            // second of those needs more than one 5 ms block to show.
+            for _ in 0..8 {
+                run(&mut s, &mut o);
+            }
+            let (l, r) = o.split_at(256);
+            // Side energy against mid energy.
+            let side: Vec<f32> = l.iter().zip(r).map(|(a, b)| a - b).collect();
+            let mid: Vec<f32> = l.iter().zip(r).map(|(a, b)| a + b).collect();
+            rms(&side) / rms(&mid).max(1e-9)
+        };
+        let mono = width(0.0, 0.0);
+        let wide = width(7.0, 100.0);
+        assert!(mono < 1e-4, "a single voice was not centred: {mono}");
+        assert!(wide > 0.05, "unison spread did not widen: {wide}");
+    }
+
+    /// The filter envelope is AUDIBLE, which is only possible because the
+    /// lane filters take a cutoff per lane. With a low cutoff and a full
+    /// positive envelope the note is brighter than with none.
+    #[test]
+    fn the_filter_envelope_opens_the_filter() {
+        let brightness = |env: f32| {
+            let params = PolyParams {
+                cutoff: 200.0,
+                filter_env: env,
+                amp_d: 400.0,
+                ..PolyParams::default()
+            };
+            let (mut s, _) = poly_graph(params, &[48]);
+            let mut o = vec![0.0f32; 512];
+            run(&mut s, &mut o);
+            rms(&o[..256])
+        };
+        let closed = brightness(0.0);
+        let open = brightness(100.0);
+        assert!(
+            open > closed * 1.2,
+            "filter env inaudible: {open} vs {closed}"
+        );
+    }
+
+    /// The instrument allocates nothing once it is built — the rule that
+    /// outranks everything else, checked on the real render path.
+    #[test]
+    fn the_poly_synth_does_not_allocate_while_rendering() {
+        let mut voices = PolyVoices::new(48_000.0, 256, PolyParams::default());
+        // Wires live, both directions asked for (one gets dropped), and a
+        // chunk-rate destination too: the matrix is the newest red-zone
+        // path and the one this test most needs to walk.
+        for (row, (src, dst, amt)) in [
+            (pp::SRC_OSC_B, pp::DST_A_PHASE, 60.0f32),
+            (pp::SRC_FENV, pp::DST_CUTOFF, 50.0),
+            (pp::SRC_VEL, pp::DST_PAN, 30.0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (s_id, d_id, a_id) = pp::WIRE_IDS[row];
+            voices.set_param(s_id, src as f32);
+            voices.set_param(d_id, dst as f32);
+            voices.set_param(a_id, amt);
+        }
+        let mut out = vec![0.0f32; 256];
+        voices.note_on(69, 100, 0);
+        assert_no_alloc::assert_no_alloc(|| {
+            let mut ramp = Ramp::across(1.0, 1.0, out.len());
+            voices.render(&mut out, 0, &mut ramp);
+            voices.note_off(69);
+            let mut ramp = Ramp::across(1.0, 1.0, out.len());
+            voices.render(&mut out, 0, &mut ramp);
+            voices.all_sound_off();
+        });
+    }
+
+    /// Stealing is age-based and never leaves a voice gated to nothing:
+    /// more notes than voices must still end up silent after their offs.
+    #[test]
+    fn over_subscribing_the_polyphony_still_settles_to_silence() {
+        let mut voices = PolyVoices::new(48_000.0, 256, PolyParams::default());
+        let mut out = vec![0.0f32; 256];
+        for i in 0..40u8 {
+            voices.note_on(40 + i, 100, u64::from(i));
+        }
+        for i in 0..40u8 {
+            voices.note_off(40 + i);
+        }
+        // Long enough for every release to finish.
+        for _ in 0..400 {
+            let mut ramp = Ramp::across(1.0, 1.0, out.len());
+            voices.render(&mut out, 0, &mut ramp);
+        }
+        let level = rms(&out);
+        assert!(level < 1e-5, "voices hung after their note-offs: {level}");
+    }
+    /// One wire per test would be a manual; this is the matrix's own
+    /// contract: a live wire CHANGES the sound, an "off" wire does not,
+    /// and nothing a wire can say makes the synth non-finite.
+    #[test]
+    fn matrix_wires_are_audible_and_safe() {
+        let base = |wires: [[f32; 3]; 3]| {
+            let params = PolyParams {
+                osc: [
+                    crate::audio::poly::OscParams {
+                        level: 100.0,
+                        ..PolyParams::default().osc[0]
+                    },
+                    crate::audio::poly::OscParams {
+                        level: 0.0,
+                        semi: 7.0,
+                        ..PolyParams::default().osc[1]
+                    },
+                ],
+                wires,
+                ..PolyParams::default()
+            };
+            let (mut s, _) = poly_graph(params, &[57]);
+            let mut o = vec![0.0f32; 512];
+            for _ in 0..4 {
+                run(&mut s, &mut o);
+            }
+            o
+        };
+        let none = [[0.0; 3]; 3];
+        let dry = base(none);
+
+        // B -> A phase: FM from a silent modulator — the classic patch,
+        // and the proof the RAW (pre-level) output is the source.
+        let mut fm = none;
+        fm[0] = [pp::SRC_OSC_B as f32, pp::DST_A_PHASE as f32, 80.0];
+        let wet = base(fm);
+        assert_ne!(dry, wet, "a phase wire changed nothing");
+        assert!(wet.iter().all(|s| s.is_finite()));
+
+        // Amp env -> a level: no change in WHETHER it sounds, a change in
+        // HOW it moves.
+        let mut am = none;
+        am[1] = [pp::SRC_AMP as f32, pp::DST_A_LEVEL as f32, -60.0];
+        let wet = base(am);
+        assert_ne!(dry, wet, "a level wire changed nothing");
+
+        // A depth of zero IS an off wire, whatever src/dst say.
+        let mut idle = none;
+        idle[2] = [pp::SRC_OSC_B as f32, pp::DST_A_PHASE as f32, 0.0];
+        assert_eq!(dry, base(idle), "a zero-depth wire made sound");
+
+        // Both cross-osc directions at once: the A->B direction wins,
+        // the render stays finite, and something still sounds.
+        let mut both = none;
+        both[0] = [pp::SRC_OSC_B as f32, pp::DST_A_PHASE as f32, 90.0];
+        both[1] = [pp::SRC_OSC_A as f32, pp::DST_B_PHASE as f32, 90.0];
+        let wet = base(both);
+        assert!(wet.iter().all(|s| s.is_finite()));
+        assert!(rms(&wet[..256]) > 1e-4, "the tie silenced the synth");
+    }
+
+    /// A chunk-rate wire moves a coefficient: filter env -> cutoff on a
+    /// nearly-closed filter is audibly brighter than no wire, through the
+    /// MATRIX rather than the dedicated env-amount knob.
+    #[test]
+    fn a_cutoff_wire_opens_the_filter() {
+        let brightness = |depth: f32| {
+            let mut wires = [[0.0; 3]; 3];
+            wires[0] = [pp::SRC_FENV as f32, pp::DST_CUTOFF as f32, depth];
+            let params = PolyParams {
+                cutoff: 150.0,
+                fenv_d: 400.0,
+                wires,
+                ..PolyParams::default()
+            };
+            let (mut s, _) = poly_graph(params, &[48]);
+            let mut o = vec![0.0f32; 512];
+            run(&mut s, &mut o);
+            rms(&o[..256])
+        };
+        let (closed, open) = (brightness(0.0), brightness(100.0));
+        assert!(
+            open > closed * 1.2,
+            "cutoff wire inaudible: {open} vs {closed}"
+        );
+    }
+
+    /// The filter envelope has its OWN times now. Stretching its decay
+    /// changes the sound; the amp envelope's length does not move.
+    #[test]
+    fn the_filter_envelope_times_are_its_own() {
+        let render = |fenv_d: f32| {
+            let params = PolyParams {
+                cutoff: 200.0,
+                filter_env: 100.0,
+                fenv_d,
+                amp_d: 150.0,
+                amp_s: 0.0,
+                wires: [[0.0; 3]; 3],
+                ..PolyParams::default()
+            };
+            let (mut s, _) = poly_graph(params, &[48]);
+            // Far enough in that a 30 ms contour has closed and an 800 ms
+            // one is still open — the window where the difference lives.
+            let mut o = vec![0.0f32; 512];
+            for _ in 0..8 {
+                run(&mut s, &mut o);
+            }
+            o
+        };
+        let short = render(30.0);
+        let long = render(800.0);
+        assert_ne!(short, long, "fenv decay is still borrowed from the amp");
+    }
+
+    /// The kick recipe, end to end: sine osc, the pitch envelope's own
+    /// decay row sweeping +48 semitones down. Early cycles are FAST,
+    /// late cycles are slow — measured as zero crossings, not asserted
+    /// from the wiring.
+    #[test]
+    fn the_kick_recipe_drops_in_pitch() {
+        let params = PolyParams {
+            osc: [
+                crate::audio::poly::OscParams {
+                    wave: 0.0,
+                    pitch_env: 48.0,
+                    ..PolyParams::default().osc[0]
+                },
+                crate::audio::poly::OscParams {
+                    level: 0.0,
+                    ..PolyParams::default().osc[1]
+                },
+            ],
+            penv_d: 50.0,
+            amp_d: 300.0,
+            amp_s: 0.0,
+            wires: [[0.0; 3]; 3],
+            ..PolyParams::default()
+        };
+        let (mut sched, _) = poly_graph(params, &[36]);
+        let mut all = Vec::new();
+        for _ in 0..16 {
+            let mut o = vec![0.0f32; 512];
+            run(&mut sched, &mut o);
+            all.extend_from_slice(&o[..256]);
+        }
+        let zcr = |w: &[f32]| {
+            w.windows(2)
+                .filter(|p| (p[0] < 0.0) != (p[1] < 0.0))
+                .count() as f32
+                * 48_000.0
+                / (2.0 * w.len() as f32)
+        };
+        let early = zcr(&all[..480]);
+        let late = zcr(&all[2880..3840]);
+        assert!(
+            early > late * 2.0,
+            "no pitch drop: {early:.0} Hz early vs {late:.0} Hz late"
+        );
+        assert!(all.iter().all(|s| s.is_finite()));
+    }
+    /// The transport-loop contract the app leans on since it stopped
+    /// compiling patterns in clip mode: a ONE-SHOT pattern under a
+    /// wrapping transport re-sounds on every pass — the wrap is a
+    /// discontinuity, which cuts the voices and reseeks the cursor — and
+    /// a playhead parked PAST the material is exact silence, loop brace
+    /// or no loop brace.
+    ///
+    /// The second half is the reported bug: with the pattern compiled in
+    /// clip mode (`loop_len_beats` set), its phase was
+    /// `position % loop_samples`, so material inside the brace replayed
+    /// forever wherever the playhead actually was. One shared
+    /// `PatternClock` walk, so this pins `Seq` too.
+    #[test]
+    fn a_one_shot_pattern_wraps_with_the_transport_and_is_silent_beyond_it() {
+        let (mut sched, _) = poly_graph(PolyParams::default(), &[60]);
+        let bps = 120.0 / 60.0 / 48_000.0;
+        let at = |position: u64, discontinuity: bool| ProcessCtx {
+            position,
+            beat: position as f64 * bps,
+            discontinuity,
+            ..ctx(NO_INPUT)
+        };
+        let level = |sched: &mut Schedule, c: &ProcessCtx<'_>| {
+            let mut out = vec![0.0f32; 512];
+            sched.run(&mut out, c);
+            rms(&out[..256])
+        };
+
+        // First pass: the note at beat 0 sounds (first play is itself a
+        // discontinuity).
+        assert!(level(&mut sched, &at(0, true)) > 1e-4, "first pass silent");
+        // The transport wraps to the loop start: position jumps back with
+        // the discontinuity flag, and the note fires AGAIN.
+        assert!(level(&mut sched, &at(256, false)) > 1e-4);
+        assert!(
+            level(&mut sched, &at(0, true)) > 1e-4,
+            "the wrap did not re-sound the pattern"
+        );
+
+        // Park the playhead sixteen beats out — far past the one-beat
+        // note — and roll. EXACT silence, every sample: nothing wraps the
+        // pattern back into range any more.
+        let far = (16.0 / bps) as u64;
+        let mut out = vec![0.0f32; 512];
+        sched.run(&mut out, &at(far, true));
+        assert!(
+            out.iter().all(|s| *s == 0.0),
+            "the pattern sounded past its own material"
+        );
+        for block in 1..4u64 {
+            let mut out = vec![0.0f32; 512];
+            sched.run(&mut out, &at(far + block * 256, false));
+            assert!(out.iter().all(|s| *s == 0.0), "block {block} not silent");
+        }
+    }
+    /// Parameter locks, end to end on the poly synth: a locked note-on
+    /// OVERRIDES the knob, the next unlocked note-on RESUMES it — and
+    /// "the knob" is live, so a letter turned mid-pattern is what an
+    /// unlocked note comes back to.
+    #[test]
+    fn plocks_override_and_unlocked_notes_resume_the_knob() {
+        let mut spec = GraphSpec::default();
+        let dark = vec![(pp::F_CUTOFF, 150.0f32)];
+        // A SAW, not the default sine: a 130 Hz sine barely notices a
+        // 150 Hz lowpass, and this test's whole measurement is that the
+        // cutoff moves the level.
+        let params = PolyParams {
+            osc: [
+                crate::audio::poly::OscParams {
+                    wave: 2.0,
+                    ..PolyParams::default().osc[0]
+                },
+                PolyParams::default().osc[1],
+            ],
+            ..PolyParams::default()
+        };
+        let id = spec.push(NodeSpec::Poly {
+            notes: vec![
+                Note {
+                    start_beats: 0.0,
+                    len_beats: 0.9,
+                    pitch: 48,
+                    vel: 110,
+                    plocks: Vec::new(),
+                    prob: 1.0,
+                    cond: None,
+                },
+                Note {
+                    start_beats: 1.0,
+                    len_beats: 0.9,
+                    pitch: 48,
+                    vel: 110,
+                    plocks: dark.clone(),
+                    prob: 1.0,
+                    cond: None,
+                },
+                Note {
+                    start_beats: 2.0,
+                    len_beats: 0.9,
+                    pitch: 48,
+                    vel: 110,
+                    plocks: Vec::new(),
+                    prob: 1.0,
+                    cond: None,
+                },
+            ],
+            subloops: vec![],
+            loop_len_beats: None,
+            params,
+        });
+        spec.set_output(id);
+        let mut sched = spec.compile(48_000, 256).unwrap();
+
+        // One beat at 120 bpm is 24_000 samples = ~94 blocks of 256.
+        let bps = 120.0 / 60.0 / 48_000.0;
+        let mut note_rms = [0.0f32; 3];
+        for block in 0..282u64 {
+            let position = block * 256;
+            let c = ProcessCtx {
+                position,
+                beat: position as f64 * bps,
+                discontinuity: block == 0,
+                ..ctx(NO_INPUT)
+            };
+            let mut out = vec![0.0f32; 512];
+            sched.run(&mut out, &c);
+            let note = (position / 24_000).min(2) as usize;
+            note_rms[note] += rms(&out[..256]);
+        }
+        let [bright, locked, resumed] = note_rms;
+        assert!(
+            locked < bright * 0.6,
+            "the cutoff lock did not darken its note: {locked} vs {bright}"
+        );
+        assert!(
+            resumed > locked * 1.5,
+            "the unlocked note did not resume the knob: {resumed} vs {locked}"
+        );
+
+        // The knob moved mid-life: darken the BASE by letter, recompile
+        // nothing — the same unlocked notes must now resume the letter's
+        // value, because the base is live, not a compile snapshot.
+        sched.apply(ParamChange {
+            node: id.to_bits(),
+            param: pp::F_CUTOFF,
+            value: 150.0,
+        });
+        let mut out = vec![0.0f32; 512];
+        let seek = ProcessCtx {
+            position: 0,
+            beat: 0.0,
+            discontinuity: true,
+            ..ctx(NO_INPUT)
+        };
+        sched.run(&mut out, &seek);
+        let darkened_base = rms(&out[..256]);
+        assert!(
+            darkened_base < bright * 0.6,
+            "the letter did not move the restore base: {darkened_base} vs first pass {bright}"
+        );
+    }
+    /// Trig conditions, on the shared clock: an A:B note fires only on
+    /// pass A of every B cycles, its OFF stands down with it (no orphan
+    /// off releasing someone else's voice), and probability is
+    /// DETERMINISTIC — the same take twice, varied across cycles.
+    #[test]
+    fn trig_conditions_gate_notes_per_cycle() {
+        let mk = |cond: Option<(u8, u8)>, prob: f32| {
+            let notes = vec![Note {
+                start_beats: 0.0,
+                len_beats: 0.5,
+                pitch: 60,
+                vel: 100,
+                plocks: Vec::new(),
+                prob,
+                cond,
+            }];
+            compile_events(&notes, &[], Some(1.0), 1_000.0).unwrap()
+        };
+        let run_cycles = |events: &[SeqEvent], cycles: u64| -> Vec<String> {
+            let mut clock = PatternClock::new(1_000, 1_000.0);
+            let mut probe = Probe::default();
+            for block in 0..(cycles * 4) {
+                let position = block * 250;
+                let c = ProcessCtx {
+                    position,
+                    beat: position as f64 / 1_000.0,
+                    discontinuity: block == 0,
+                    ..ctx(NO_INPUT)
+                };
+                let mut out = [0.0f32; 250];
+                let mut ramp = Ramp::across(1.0, 1.0, out.len());
+                clock.run(&mut probe, events, &mut out, &c, &mut ramp);
+            }
+            probe.log
+        };
+
+        // 1:2 fires on even cycles, 2:2 on odd — together they tile.
+        let first = run_cycles(&mk(Some((1, 2)), 1.0), 4);
+        let ons = |log: &[String]| log.iter().filter(|l| l.starts_with("on ")).count();
+        let offs = |log: &[String]| log.iter().filter(|l| l.starts_with("off ")).count();
+        assert_eq!(ons(&first), 2, "1:2 over four cycles: {first:?}");
+        assert_eq!(offs(&first), ons(&first), "an off fired without its on");
+        let second = run_cycles(&mk(Some((2, 2)), 1.0), 4);
+        assert_eq!(ons(&second), 2, "2:2 over four cycles: {second:?}");
+        let last_of_four = run_cycles(&mk(Some((4, 4)), 1.0), 8);
+        assert_eq!(ons(&last_of_four), 2, "4:4 over eight cycles");
+
+        // Probability: 0 never, 1 always, and one-half is DETERMINISTIC —
+        // two runs agree exactly, and across sixteen cycles it neither
+        // always fires nor never does.
+        assert_eq!(ons(&run_cycles(&mk(None, 0.0), 8)), 0);
+        assert_eq!(ons(&run_cycles(&mk(None, 1.0), 8)), 8);
+        let a = run_cycles(&mk(None, 0.5), 16);
+        let b = run_cycles(&mk(None, 0.5), 16);
+        assert_eq!(a, b, "probability must reproduce — bounces depend on it");
+        let n = ons(&a);
+        assert!((1..16).contains(&n), "half-probability fired {n}/16");
+        assert_eq!(offs(&a), n, "every fired note kept its off");
     }
 }

@@ -241,15 +241,32 @@ impl DelayLine {
 
 // ------------------------------------------------------- feedback delay ---
 
-/// An echo: a fractional delay recirculating through a damping one-pole.
+/// An echo: a fractional delay recirculating through a damping one-pole
+/// and, optionally, a saturator.
 ///
 /// The output is the UNDAMPED read — the first echo arrives bright and
 /// the darkening compounds per trip, which is how analogue repeats die.
 /// Dry/wet is the caller's business (`arith::crossfade`); this emits
 /// wet only, in place.
 ///
-/// State: 40 bytes. Per-sample cost: one Hermite read + the one-pole
-/// (≈ 15 flops) + 1 write.
+/// # What makes it analogue
+///
+/// Three things live INSIDE the loop, because that is the only place
+/// they compound: the damping ([`set_damp`](Self::set_damp)), the
+/// saturation ([`set_drive`](Self::set_drive)), and the time itself
+/// ([`process_modulated`](Self::process_modulated)). A tape echo does not
+/// darken, squash and waver once on the way out — it does all three a
+/// little more on every trip, and a repeat that has been round eight
+/// times has been through them eight times. Putting any of them outside
+/// the recirculation gives an echo of a processed signal instead of a
+/// processed echo, which sounds tidy and wrong.
+///
+/// Drive `0` is BYPASS and bit-exact, so an echo nobody has driven is
+/// arithmetically the plain damped delay it was before saturation
+/// existed.
+///
+/// State: 44 bytes. Per-sample cost: one Hermite read + the one-pole
+/// (≈ 15 flops) + 1 write, plus one `tanh` when driven.
 /// Denormal-safe: the decaying recirculation is the classic denormal
 /// factory; relies on engine FTZ, and the tail test runs it far past
 /// audibility to prove finiteness.
@@ -260,6 +277,38 @@ pub struct FeedbackDelay {
     line: DelayLine,
     damp: OnePole,
     feedback: f32,
+    drive: f32,
+}
+
+/// The loop's saturator: `tanh` normalised to UNITY SMALL-SIGNAL GAIN.
+///
+/// Which normalisation is not a detail — it decides whether drive is a
+/// tone control or a broken feedback control, and both obvious choices
+/// are wrong in opposite directions.
+///
+/// A bare `tanh(g·x)` divides the loop gain by roughly `g` for everything
+/// quiet, so the tail dies faster and faster as drive comes up. Dividing
+/// by `tanh(g)` instead — pinning full scale to full scale — has the
+/// mirror problem: near the origin `tanh(g·x)/tanh(g) ≈ x·g/tanh(g)`, a
+/// gain of nearly `g`, so a driven loop gets LOUDER as it recirculates.
+/// The first draft did that and the tail came back twenty times hotter
+/// than the clean one.
+///
+/// Dividing by `g` pins the SLOPE AT THE ORIGIN to 1. A quiet repeat
+/// recirculates at exactly the gain the feedback knob asked for, so the
+/// decay rate belongs to feedback alone; a loud one is squashed toward
+/// the `1/g` ceiling. Drive shapes, feedback decides how long — which is
+/// what the two knobs claim to do.
+///
+/// `drive = 0` returns `x` untouched, which is what makes an undriven
+/// echo bit-exact.
+#[inline(always)]
+fn saturate(x: f32, drive: f32) -> f32 {
+    if drive <= 0.0 {
+        return x;
+    }
+    let g = 1.0 + drive;
+    (x * g).tanh() / g
 }
 
 /// The loop gain ceiling. At 1.0 an echo never dies and the buffer
@@ -279,6 +328,7 @@ impl FeedbackDelay {
             line: DelayLine::new(),
             damp: OnePole::new(),
             feedback: 0.0,
+            drive: 0.0,
         }
     }
 
@@ -300,6 +350,32 @@ impl FeedbackDelay {
         self.line.set_delay(samples.max(MIN_FRAC));
     }
 
+    /// Move the damping corner without disturbing the echo.
+    ///
+    /// Separate from [`prepare`](Self::prepare) because prepare re-lays
+    /// the delay LINE, which throws away the write position and with it
+    /// everything currently flying around the loop. A tone control has
+    /// to be able to move while the echo is sounding, and
+    /// `OnePole::prepare` only recomputes a coefficient — no state, no
+    /// allocation, bounded arithmetic — so this is legal to call per
+    /// block from the audio thread.
+    pub fn set_damp(&mut self, sample_rate: f32, damp_hz: f32) {
+        self.damp.prepare(sample_rate, damp_hz);
+    }
+
+    /// Set the saturation in the loop. `0` is bypass, and bit-exact.
+    ///
+    /// Not clamped to a ceiling because [`saturate`] cannot run away:
+    /// its output is bounded by ±1 for any finite drive. Non-finite
+    /// input becomes bypass rather than poison.
+    pub fn set_drive(&mut self, drive: f32) {
+        self.drive = if drive.is_finite() {
+            drive.max(0.0)
+        } else {
+            0.0
+        };
+    }
+
     /// Set the loop gain, `0..=`[`FEEDBACK_MAX`]. Negative flips the
     /// repeat's polarity (the flanger convention) and clamps the same.
     pub fn set_feedback(&mut self, feedback: f32) {
@@ -317,23 +393,55 @@ impl FeedbackDelay {
         self.damp.reset();
     }
 
+    /// One sample of the loop: read at `d`, recirculate, emit the bright
+    /// read. The whole echo, written once, so the fixed-time and
+    /// modulated paths cannot drift apart.
+    #[inline(always)]
+    fn tick(&mut self, x: f32, buf: &mut [f32], d: f32) -> f32 {
+        let wet = self.line.read_frac(buf, d);
+        // Damping and saturation live INSIDE the loop: each round trip
+        // darkens and squashes the repeat again, which is the analogue
+        // behaviour. The output is the bright, clean pre-loop read.
+        let recirculated = saturate(self.damp.tick_lowpass(wet), self.drive);
+        buf[self.line.write & self.line.mask] = x + recirculated * self.feedback;
+        self.line.write = self.line.write.wrapping_add(1);
+        wet
+    }
+
     /// Red zone: replace `io` with the wet echo signal, any length.
     pub fn process(&mut self, io: &mut [f32], buf: &mut [f32]) {
         if !self.line.matches(buf) {
             return; // fail open — io keeps the dry signal
         }
         let d = self.line.delay.max(MIN_FRAC);
-        let fb = self.feedback;
         for s in io.iter_mut() {
-            let x = *s;
-            let wet = self.line.read_frac(buf, d);
-            // Damping lives INSIDE the loop: each round trip darkens the
-            // repeat again, which is the analogue behaviour. The output
-            // is the bright pre-damping read.
-            let recirculated = self.damp.tick_lowpass(wet);
-            buf[self.line.write & self.line.mask] = x + recirculated * fb;
-            *s = wet;
-            self.line.write = self.line.write.wrapping_add(1);
+            *s = self.tick(*s, buf, d);
+        }
+    }
+
+    /// Red zone: as [`process`](Self::process), with a PER-SAMPLE echo
+    /// time — the wow-and-flutter primitive.
+    ///
+    /// `delays` pairs with `io` by `zip` length rules and each entry
+    /// clamps exactly as [`set_delay`](Self::set_delay) does. The stored
+    /// delay is left alone, so a caller can modulate around it and then
+    /// go back to [`process`](Self::process) without restating the time.
+    ///
+    /// Modulating the time of a line that is FEEDING ITSELF is the whole
+    /// point: the wobble compounds per trip, so the eighth repeat wavers
+    /// eight times as much as the first, exactly as a tape's does.
+    pub fn process_modulated(&mut self, io: &mut [f32], buf: &mut [f32], delays: &[f32]) {
+        if !self.line.matches(buf) {
+            return;
+        }
+        let max = self.line.max.max(MIN_FRAC);
+        for (s, want) in io.iter_mut().zip(delays.iter()) {
+            let d = if want.is_finite() {
+                want.clamp(MIN_FRAC, max)
+            } else {
+                MIN_FRAC
+            };
+            *s = self.tick(*s, buf, d);
         }
     }
 }
@@ -675,6 +783,253 @@ mod tests {
     }
 
     // ---------------------------------------------------------------- cost ---
+
+    // --------------------------------------------- the analogue loop ---
+
+    /// An echo at a chosen drive, ready to run.
+    fn echo(max: usize, delay: f32, feedback: f32, drive: f32) -> (FeedbackDelay, Vec<f32>) {
+        let mut e = FeedbackDelay::new();
+        e.prepare(FS, max, 20_000.0);
+        e.set_delay(delay);
+        e.set_feedback(feedback);
+        e.set_drive(drive);
+        (e, vec![0.0f32; FeedbackDelay::needed_len(max)])
+    }
+
+    /// REFERENCE, and the test the whole saturator design turns on:
+    /// drive is a shape, not a second feedback knob.
+    ///
+    /// Stated as a DECAY RATE and not as a level, because saturation is
+    /// entitled to change the level — squashing a full-scale impulse is
+    /// its job — but not entitled to change how fast the repeats die.
+    /// The ratio between one repeat and the next belongs to the feedback
+    /// knob, and it must read the same whether the loop is clean or
+    /// driven into the rails.
+    ///
+    /// Both plausible normalisations fail this. Dividing by `tanh(g)`
+    /// makes quiet repeats grow (the first draft's tail came back 20x
+    /// hot); not normalising at all makes them shrink. Only unity gain
+    /// at the origin leaves the decay to feedback.
+    #[test]
+    fn drive_shapes_the_loop_without_changing_its_decay() {
+        // A full-scale impulse, so the saturator is working where it
+        // actually differs from a wire.
+        let decay = |drive: f32| {
+            let (mut e, mut buf) = echo(100, 100.0, 0.8, drive);
+            let mut io = vec![0.0f32; 1_000];
+            io[0] = 1.0;
+            e.process(&mut io, &mut buf);
+            // Two repeats far enough down the tail to be small signals,
+            // where the loop gain is the thing being measured.
+            (io[700].abs(), io[800].abs())
+        };
+        // The CLEAN run is the reference, not the feedback figure. An
+        // impulse is broadband and the damping one-pole takes a bite out
+        // of it every trip, so the peak-to-peak ratio is never the raw
+        // loop gain — which is fine, because what has to hold is that
+        // drive does not move it.
+        let (a, b) = decay(0.0);
+        assert!(a > 1e-4, "nothing left to measure ({a})");
+        let clean = b / a;
+        for drive in [1.0f32, 4.0, 12.0] {
+            let (a, b) = decay(drive);
+            assert!(a > 1e-4, "drive {drive}: nothing left to measure ({a})");
+            let rate = b / a;
+            assert!(
+                (rate - clean).abs() < 0.05,
+                "drive {drive} decays at {rate} per repeat against the clean \
+                 {clean} — it is acting as feedback"
+            );
+        }
+    }
+
+    /// And it does actually saturate: a loop driven hard cannot exceed
+    /// the rails however hot the input, while an undriven one is free to.
+    #[test]
+    fn a_driven_loop_cannot_run_away() {
+        let (mut e, mut buf) = echo(64, 64.0, FEEDBACK_MAX, 8.0);
+        // Sustained full scale into an almost-unity loop: the classic
+        // way to integrate a delay buffer into the rails.
+        let mut io = vec![1.0f32; 20_000];
+        e.process(&mut io, &mut buf);
+        let peak = io.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(peak.is_finite(), "a driven loop produced {peak}");
+        // The saturator bounds the RECIRCULATION at ±1, so what comes
+        // back can only be the input plus a bounded loop.
+        assert!(peak < 4.0, "a driven loop reached {peak}");
+    }
+
+    /// Drive 0 is BYPASS, to the bit. The property that lets this kernel
+    /// grow a saturator without every existing echo changing.
+    #[test]
+    fn undriven_is_bit_exact_bypass() {
+        let signal: Vec<f32> = (0..2_000).map(|i| (i as f32 * 0.05).sin() * 0.9).collect();
+        let run = |drive: f32| {
+            let (mut e, mut buf) = echo(128, 128.0, 0.7, drive);
+            let mut io = signal.clone();
+            e.process(&mut io, &mut buf);
+            io
+        };
+        // set_drive(0) and never calling it at all must be the same run.
+        let never = {
+            let mut e = FeedbackDelay::new();
+            e.prepare(FS, 128, 20_000.0);
+            e.set_delay(128.0);
+            e.set_feedback(0.7);
+            let mut buf = vec![0.0f32; FeedbackDelay::needed_len(128)];
+            let mut io = signal.clone();
+            e.process(&mut io, &mut buf);
+            io
+        };
+        for (i, (a, b)) in run(0.0).iter().zip(never.iter()).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "sample {i} differs at drive 0");
+        }
+    }
+
+    /// The tone control moves while the echo is flying, and does not
+    /// drop what is in the air. `prepare` would — it re-lays the line.
+    #[test]
+    fn set_damp_moves_the_corner_without_dropping_the_echo() {
+        let (mut e, mut buf) = echo(200, 200.0, 0.85, 0.0);
+        let mut io = vec![0.0f32; 400];
+        io[0] = 1.0;
+        e.process(&mut io, &mut buf);
+        // Something is in the loop now. Darken it hard, mid-flight.
+        e.set_damp(FS, 400.0);
+        let mut more = vec![0.0f32; 1_600];
+        e.process(&mut more, &mut buf);
+        let sounding = more.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(
+            sounding > 1e-3,
+            "the echo in the loop was dropped by a tone change: {sounding}"
+        );
+        assert!(more.iter().all(|s| s.is_finite()));
+    }
+
+    /// SPLIT-BLOCK EQUIVALENCE for both new paths, bit-exact — the
+    /// property the segmented transport depends on.
+    #[test]
+    fn the_analogue_paths_split_bit_exactly() {
+        let signal: Vec<f32> = (0..512).map(|i| (i as f32 * 0.11).sin() * 0.8).collect();
+        let wow: Vec<f32> = (0..512)
+            .map(|i| 200.0 + (i as f32 * 0.01).sin() * 8.0)
+            .collect();
+
+        for modulated in [false, true] {
+            let whole = {
+                let (mut e, mut buf) = echo(256, 200.0, 0.75, 3.0);
+                let mut io = signal.clone();
+                if modulated {
+                    e.process_modulated(&mut io, &mut buf, &wow);
+                } else {
+                    e.process(&mut io, &mut buf);
+                }
+                io
+            };
+            let split = {
+                let (mut e, mut buf) = echo(256, 200.0, 0.75, 3.0);
+                let mut io = signal.clone();
+                let (a, b) = io.split_at_mut(200);
+                if modulated {
+                    e.process_modulated(a, &mut buf, &wow[..200]);
+                    e.process_modulated(b, &mut buf, &wow[200..]);
+                } else {
+                    e.process(a, &mut buf);
+                    e.process(b, &mut buf);
+                }
+                io
+            };
+            for (i, (a, b)) in whole.iter().zip(split.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "modulated={modulated}, sample {i}"
+                );
+            }
+        }
+    }
+
+    /// A modulated echo still returns the impulse where the modulation
+    /// says, and a FLAT modulation is the fixed-time path exactly.
+    #[test]
+    fn a_flat_modulation_is_the_fixed_path() {
+        let (mut fixed, mut fbuf) = echo(300, 250.0, 0.6, 2.0);
+        let (mut moved, mut mbuf) = echo(300, 250.0, 0.6, 2.0);
+        let mut a = vec![0.0f32; 1_200];
+        let mut b = vec![0.0f32; 1_200];
+        a[0] = 1.0;
+        b[0] = 1.0;
+        fixed.process(&mut a, &mut fbuf);
+        moved.process_modulated(&mut b, &mut mbuf, &vec![250.0f32; 1_200]);
+        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            assert_eq!(x.to_bits(), y.to_bits(), "sample {i}");
+        }
+        // And the echo is where it was asked for.
+        assert!(a[250] > 0.5, "the first repeat is not at 250: {}", a[250]);
+    }
+
+    /// NO-ALLOC, on both new paths and with the controls moving.
+    #[test]
+    fn the_analogue_paths_do_not_allocate() {
+        let (mut e, mut buf) = echo(256, 128.0, 0.8, 4.0);
+        let mut io = vec![0.5f32; 256];
+        let wow = vec![130.0f32; 256];
+        assert_no_alloc::assert_no_alloc(|| {
+            for i in 0..8 {
+                e.set_delay(120.0 + i as f32);
+                e.set_feedback(0.5 + i as f32 * 0.05);
+                e.set_drive(i as f32);
+                e.set_damp(FS, 2_000.0 + i as f32 * 100.0);
+                e.process(&mut io, &mut buf);
+                e.process_modulated(&mut io, &mut buf, &wow);
+            }
+        });
+    }
+
+    /// EDGE LENGTHS: nothing, one sample, and a length no power of two
+    /// divides — including a `delays` slice SHORTER than the block,
+    /// which `zip` must stop on rather than run off.
+    #[test]
+    fn the_analogue_paths_take_any_length() {
+        let (mut e, mut buf) = echo(128, 64.0, 0.5, 2.0);
+        for len in [0usize, 1, 3, 37, 128] {
+            let mut io = vec![0.25f32; len];
+            e.process(&mut io, &mut buf);
+            assert!(io.iter().all(|s| s.is_finite()), "len {len}");
+            let mut io = vec![0.25f32; len];
+            let short = vec![64.0f32; len / 2];
+            e.process_modulated(&mut io, &mut buf, &short);
+            assert!(io.iter().all(|s| s.is_finite()), "len {len}, short delays");
+        }
+    }
+
+    /// DENORMAL TAIL and nonsense resistance: a hard-driven loop at the
+    /// feedback ceiling stays finite forever, and a NaN handed to the
+    /// controls becomes a sane setting rather than poison.
+    #[test]
+    fn a_driven_tail_dies_and_nonsense_cannot_poison_it() {
+        let (mut e, mut buf) = echo(64, 64.0, FEEDBACK_MAX, 6.0);
+        let mut io = vec![0.0f32; 64];
+        io[0] = 1.0;
+        e.process(&mut io, &mut buf);
+        for _ in 0..2_000 {
+            let mut block = vec![0.0f32; 64];
+            e.process(&mut block, &mut buf);
+            assert!(block.iter().all(|s| s.is_finite()));
+        }
+
+        e.set_drive(f32::NAN);
+        e.set_damp(FS, 5_000.0);
+        let mut block = vec![1.0f32; 64];
+        e.process(&mut block, &mut buf);
+        assert!(
+            block.iter().all(|s| s.is_finite()),
+            "a NaN drive poisoned the loop"
+        );
+        // NaN drive fell back to bypass, not to silence.
+        let nan_free = vec![0.0f32; 64];
+        assert!(block != nan_free);
+    }
 
     /// What a sample costs. Printed, not asserted.
     #[test]
