@@ -420,6 +420,7 @@ mod tests {
             "strip.rs",     // ditto
             "resyn.rs",     // ditto
             "acid.rs",      // ditto
+            "rack.rs",      // a container: its size is what it holds
             "modulato.rs",  // ditto
             "sampler.rs",   // ditto
             "snare.rs",     // ditto

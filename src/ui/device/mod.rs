@@ -111,6 +111,7 @@ pub mod poly_widgets;
 /// broken once. Nothing references it outside tests, so it costs a
 /// release build nothing.
 pub mod probe;
+pub mod rack;
 pub mod readout;
 pub mod resyn;
 pub mod reverb;
@@ -175,6 +176,7 @@ pub use poly::{
     OscUi, PolyUi, poly_card, poly_choices, poly_edits, poly_format, poly_is_discrete, poly_is_log,
     poly_norm, poly_value,
 };
+pub use rack::{MacroKnob, MacroMove, MacroTarget, RackOutcome, RackUi, Touched, rack_card};
 pub use resyn::{
     ResynUi, resyn_card, resyn_edits, resyn_is_discrete, resyn_is_log, resyn_norm, resyn_value,
 };

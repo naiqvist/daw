@@ -91,6 +91,7 @@ pub struct Gallery {
     dev_strip: device::StripUi,
     dev_resyn: device::ResynUi,
     dev_acid: device::AcidUi,
+    dev_rack: device::RackUi,
 }
 
 impl Default for Gallery {
@@ -160,6 +161,10 @@ impl Default for Gallery {
             // Some bands moved, so the preview shows eight bars rather
             // than a flat row of ticks.
             dev_acid: device::AcidUi::default(),
+            dev_rack: device::RackUi {
+                name: "instrument rack".to_owned(),
+                ..device::RackUi::default()
+            },
             dev_resyn: device::ResynUi {
                 bands: [
                     device::resyn_norm(params::resyn::BAND0, 3.0),
@@ -858,6 +863,49 @@ impl Gallery {
             for edit in device::acid_card(ui, theme, &mut self.dev_acid) {
                 self.log
                     .push(format!("AcidEdit(param {}, {:.2})", edit.param, edit.value));
+            }
+
+            kit::gap(ui, theme, space::SM);
+            kit::muted(
+                ui,
+                theme,
+                "rack — cards inside a card; press a macro's map, then move anything",
+            );
+            // The chain reports what was touched, which is the same list
+            // the app already sends to the engine — see `device::rack`.
+            // Two real cards, so the layout is proven against real widths
+            // rather than against a placeholder.
+            let acid = &mut self.dev_acid;
+            let lofi = &mut self.dev_lofi;
+            let out = device::rack_card(ui, theme, &mut self.dev_rack, |ui| {
+                let mut touched = Vec::new();
+                for edit in device::acid_card(ui, theme, acid) {
+                    touched.push(device::Touched {
+                        device: 1,
+                        param: edit.param,
+                        label: params::def(params::acid::TABLE, edit.param).name.to_owned(),
+                    });
+                }
+                for edit in device::lofi_card(ui, theme, lofi) {
+                    touched.push(device::Touched {
+                        device: 2,
+                        param: edit.param,
+                        label: params::def(params::lofi::TABLE, edit.param).name.to_owned(),
+                    });
+                }
+                touched
+            });
+            for m in out.moves {
+                self.log.push(format!(
+                    "Macro {} -> {} {:.2}",
+                    m.index + 1,
+                    m.target.label,
+                    m.norm
+                ));
+            }
+            if let Some((index, target)) = out.mapped {
+                self.log
+                    .push(format!("Macro {} mapped to {}", index + 1, target.label));
             }
 
             kit::gap(ui, theme, space::SM);
