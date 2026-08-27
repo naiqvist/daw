@@ -69,7 +69,7 @@ mod device_state;
 use device_state::{
     DeviceInstance, DeviceState, EchoParams, device_edits, device_is_discrete, device_is_log,
     disperser_knobs, echo_knobs, eq_knobs, glue_knobs, lofi_knobs, poly_knobs, reverb_knobs,
-    sat_knobs, sheen_knobs, synth_knobs, unit_zoom, utility_knobs,
+    sat_knobs, sheen_knobs, synth_knobs, tilt_knobs, unit_zoom, utility_knobs,
 };
 mod devices;
 use bar::{Bar, TRANSPORT_GAP, TRANSPORT_GROUP_GAP, bar_layout, buttons_width, fields_width};
@@ -9900,6 +9900,10 @@ impl Default for Browser {
                             load: DeviceKind::Disperser,
                         },
                         BrowserItem {
+                            name: "Tilt",
+                            load: DeviceKind::Tilt,
+                        },
+                        BrowserItem {
                             name: "Delay",
                             load: DeviceKind::Echo,
                         },
@@ -11683,6 +11687,10 @@ fn device_body(
                                     let mut knobs = disperser_knobs(params);
                                     device::disperser_card(ui, theme, &mut knobs)
                                 }
+                                DeviceState::Tilt(params) => {
+                                    let mut knobs = tilt_knobs(params);
+                                    device::tilt_card(ui, theme, &mut knobs)
+                                }
                                 DeviceState::Echo(params) => {
                                     let mut knobs = echo_knobs(params);
                                     device::echo_card(ui, theme, &mut knobs)
@@ -11916,6 +11924,7 @@ fn plockable_params(track: &Track) -> Vec<piano_roll::PlockParam> {
         | DeviceKind::Lofi
         | DeviceKind::Sheen
         | DeviceKind::Disperser
+        | DeviceKind::Tilt
         | DeviceKind::Echo
         | DeviceKind::Eq
         | DeviceKind::Filter
@@ -12185,6 +12194,15 @@ fn compile_chain(
                 }
                 tail = glue;
             }
+            DeviceState::Tilt(params) => {
+                let node = spec.push(NodeSpec::Tilt {
+                    tilt_db: params.tilt,
+                    pivot_hz: params.pivot,
+                });
+                spec.connect(tail, node);
+                devices.insert(instance.id, node);
+                tail = node;
+            }
             DeviceState::Disperser(params) => {
                 let disp = spec.push(NodeSpec::Disperser {
                     amount: params.amount,
@@ -12284,6 +12302,7 @@ fn build_graph_spec(
                     | DeviceState::Lofi(_)
                     | DeviceState::Sheen(_)
                     | DeviceState::Disperser(_)
+                    | DeviceState::Tilt(_)
                     | DeviceState::Limiter(_) => continue,
                     DeviceState::SineSynth(params) => NodeSpec::Seq {
                         notes,

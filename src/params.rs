@@ -3808,6 +3808,113 @@ pub mod sampler {
 /// the reason [`lofi`](super::lofi) and [`sheen`](super::sheen) both give:
 /// a colour you cannot remove is a colour you cannot measure. The
 /// reference starts at one section; we start at none, because ours can.
+/// The tilt — a see-saw around a pivot, as a device.
+///
+/// `dsp::filters::Tilt` owns the whole idea: highs up and lows down by
+/// the same amount, or the reverse, and unity exactly AT the pivot. One
+/// gesture for "brighter" or "darker" that keeps the level where it was.
+///
+/// The kernel has been in the tree since the sampler's preamp, which uses
+/// it with the pivot nailed to 1 kHz and the direction fixed. This table
+/// is what it takes to hand both to the user.
+///
+/// # Two rows, and why there is no third
+///
+/// No output trim, unlike every other colour device here. A see-saw is
+/// unity at its pivot and moves the two ends in opposite directions, so
+/// broadband material comes out at about the level it went in — there is
+/// no make-up to make up. A third row would be a third thing to set on a
+/// device whose entire appeal is that it is one gesture.
+///
+/// # Flat is the DEFAULT, which is the opposite of the lo-fi's argument
+///
+/// [`lofi`](super::lofi) opens audibly coloured, because a colour device
+/// that does nothing until you turn a knob is a surprise. This one opens
+/// FLAT, and the difference is what the device is for. You reach for a
+/// tilt to make a decision about a track; a tilt that arrived having
+/// already made one would be making it on your behalf, and you would
+/// have to undo it before you could start. Corrective devices open
+/// neutral. Colouring devices open coloured.
+///
+/// Flat here is the kernel's exact wire — zero tilt is `g_hi = 1` and
+/// `g_delta = 0`, which is `x` — so the off setting is exact in the way
+/// [`lofi`](super::lofi) and [`sheen`](super::sheen) both insist on.
+pub mod tilt {
+    use super::ParamDef;
+
+    pub const TILT: u32 = 0;
+    pub const PIVOT: u32 = 1;
+
+    /// How far the see-saw leans, in dB at the HIGH extreme; the low end
+    /// mirrors it.
+    ///
+    /// TWELVE, and not the kernel's own twenty-four. This is the one
+    /// place in the rack where the device's range is deliberately
+    /// narrower than the kernel's, and the reason is measured rather
+    /// than tasteful — see [`PIVOT_MAX_HZ`].
+    pub const TILT_MAX_DB: f32 = 12.0;
+
+    /// Where the plank balances, and the other half of one decision.
+    ///
+    /// # Why both ranges stop short of the kernel's
+    ///
+    /// `Tilt::prepare` puts the unity crossing on the pivot by placing
+    /// the one-pole's corner at `pivot × g_hi`. That correction is what
+    /// makes the pivot mean anything — without it the crossing slides an
+    /// octave at ±6 dB — but it walks the corner UP as the lean
+    /// increases, and a bilinear corner loses accuracy as it approaches
+    /// Nyquist. At a high pivot and a big positive lean the two multiply
+    /// and the crossing comes off the pivot after all.
+    ///
+    /// Measured, at 48 kHz, as the crossing's error in dB:
+    ///
+    /// ```text
+    ///   pivot:    200    500   1000   2000   3000   4000   8000
+    ///  +24 dB:  -0.12  -0.86  -4.22 -20.82 -18.69 -16.60 -10.58
+    ///  +12 dB:  -0.01  -0.07  -0.18  -0.70  -1.83  -3.55 -11.65
+    ///   +6 dB:  -0.00  -0.03  -0.03  -0.09  -0.29  -0.37  -2.00
+    /// ```
+    ///
+    /// So the ranges are drawn around the region where the promise
+    /// HOLDS: ±12 dB and a pivot up to 2 kHz keeps the crossing within
+    /// 0.7 dB of where the knob points, and within 0.2 dB over most of
+    /// it. That is a conventional tilt anyway — most are ±6 — and the
+    /// alternative was shipping two knobs that combine into a lie.
+    ///
+    /// The failure is not the kernel's: its doc already says a
+    /// first-order see-saw is the wrong tool past its ceiling, and this
+    /// is the same argument arriving one stage earlier. Nothing here
+    /// clamps behind the user's back, which would be the other way to
+    /// hide it and a worse one — a knob that silently stops moving is
+    /// harder to diagnose than one that was never offered.
+    pub const PIVOT_MIN_HZ: f32 = 100.0;
+    pub const PIVOT_MAX_HZ: f32 = 2_000.0;
+
+    pub const TABLE: &[ParamDef] = &[
+        ParamDef {
+            id: TILT,
+            name: "tilt",
+            min: -TILT_MAX_DB,
+            max: TILT_MAX_DB,
+            // FLAT. See the module header: this one is corrective, and a
+            // corrective device that opens with an opinion is a device
+            // you have to argue with before you can use it.
+            default: 0.0,
+        },
+        ParamDef {
+            id: PIVOT,
+            name: "pivot",
+            min: PIVOT_MIN_HZ,
+            max: PIVOT_MAX_HZ,
+            // A kilohertz: the preamp's own figure, and where a tilt
+            // pivot conventionally sits — near enough the middle of the
+            // band by ear that leaning either way reads as "brighter" or
+            // "darker" rather than as a bass or a treble control.
+            default: 1_000.0,
+        },
+    ];
+}
+
 pub mod disperser {
     use super::ParamDef;
 
@@ -4036,6 +4143,7 @@ mod tests {
         ("lofi", lofi::TABLE),
         ("sheen", sheen::TABLE),
         ("disperser", disperser::TABLE),
+        ("tilt", tilt::TABLE),
     ];
 
     /// The invariant `def()` and every `TABLE[FOO as usize]` rely on.

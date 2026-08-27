@@ -1741,6 +1741,29 @@ pub enum Node {
     /// Free-running, and it CUTS on discontinuity — sixty-four
     /// integrators' worth of history belongs to a position the transport
     /// has left.
+    /// The tilt — `dsp::filters::Tilt`, as a device.
+    ///
+    /// A first-order see-saw: highs up and lows down by the same amount,
+    /// unity exactly at the pivot.
+    ///
+    /// As small as `Node::Disperser` and for the same reason — no mix and
+    /// no trim means no dry buffer and no smoothers. Not boxed, though:
+    /// a `Tilt` is a one-pole and two gains, so two of them are forty
+    /// bytes and nowhere near what sizes the `Node` enum.
+    ///
+    /// Free-running, and it CUTS on discontinuity: the pole's state
+    /// belongs to a position the transport has left.
+    ///
+    /// One filter per channel, for the reason every device here gives —
+    /// a shared pole is the two channels leaking into each other.
+    Tilt {
+        core: [crate::dsp::filters::Tilt; 2],
+        /// Kept because `Tilt::prepare` takes the rate, the pivot and the
+        /// amount together, so moving either knob restates all three.
+        sample_rate: f32,
+        pivot_hz: f32,
+        tilt_db: f32,
+    },
     Disperser {
         core: Box<[crate::dsp::filters::Disperser; 2]>,
         /// Kept because `Disperser::prepare` takes the rate, the corner,
@@ -1959,7 +1982,8 @@ impl Node {
             | NodeSpec::Utility { .. }
             | NodeSpec::Lofi { .. }
             | NodeSpec::Sheen { .. }
-            | NodeSpec::Disperser { .. } => 2,
+            | NodeSpec::Disperser { .. }
+            | NodeSpec::Tilt { .. } => 2,
             NodeSpec::Delay { channels, .. } => (*channels).clamp(1, 2),
             NodeSpec::Mixer { .. } | NodeSpec::AudioClip { .. } | NodeSpec::Pan { .. } => 2,
         }
@@ -2709,6 +2733,32 @@ impl Node {
                 }
             }
 
+            Node::Tilt { core, .. } => {
+                // `out.l` and `out.r` are separate fields, so this borrows
+                // only the right channel and the left stays reachable.
+                let right = out.r.as_deref_mut().unwrap_or(&mut []);
+                sum_inputs_stereo(inputs, out.l, right);
+
+                // A seek must not drag the pole's history into the new
+                // position. There are no smoothers to snap: this device
+                // has nothing a wire can glide.
+                if ctx.discontinuity {
+                    for ch in core.iter_mut() {
+                        ch.reset();
+                    }
+                }
+
+                // In place, one filter per channel, and that is the whole
+                // node — no blend to compute and so no scratch to run out
+                // of, which is why this one has no fail-open branch.
+                core[0].process(out.l);
+                // Compile fixes the channel count at 2, so this is true;
+                // it is checked rather than assumed because the check
+                // costs nothing and an assumption costs a panic.
+                if right.len() == out.l.len() {
+                    core[1].process(right);
+                }
+            }
             Node::Disperser { core, .. } => {
                 // `out.l` and `out.r` are separate fields, so this borrows
                 // only the right channel and the left stays reachable.
@@ -3306,7 +3356,7 @@ impl Node {
         // red-zone legal, and an unknown id comes back None (a stale or
         // misrouted letter — binned, never applied).
         use crate::params::{
-            clip, disperser, echo, filter, lofi, mixer, pan, reverb, sat, seq, sheen, sine,
+            clip, disperser, echo, filter, lofi, mixer, pan, reverb, sat, seq, sheen, sine, tilt,
         };
         match self {
             // No parameters: compile decides a delay's length, and it
@@ -3610,6 +3660,28 @@ impl Node {
                 // it exists for.
                 for ch in core.iter_mut() {
                     ch.prepare(*sample_rate, *freq_hz, *pinch, *stages);
+                }
+            }
+            Node::Tilt {
+                core,
+                sample_rate,
+                pivot_hz,
+                tilt_db,
+            } => {
+                let Some(value) = crate::params::clamp(tilt::TABLE, param, value) else {
+                    return;
+                };
+                match param {
+                    tilt::TILT => *tilt_db = value,
+                    tilt::PIVOT => *pivot_hz = value,
+                    _ => return,
+                }
+                // Re-tuned immediately and unsmoothed. `prepare` recomputes
+                // two gains and one pole coefficient and leaves the pole's
+                // STATE alone, so a moving knob cannot click — the same
+                // property `Node::Disperser` leans on.
+                for ch in core.iter_mut() {
+                    ch.prepare(*sample_rate, *pivot_hz, *tilt_db);
                 }
             }
             Node::Sat {
@@ -4520,6 +4592,18 @@ pub enum NodeSpec {
         amount: f32,
         freq_hz: f32,
         pinch: f32,
+    },
+    /// A tilt on whatever feeds it. `tilt_db` is the gain reached at the
+    /// high extreme — the low end mirrors it — and `pivot_hz` is where
+    /// the plank balances. ParamChange ids and every range are
+    /// `crate::params::tilt::TABLE`'s.
+    ///
+    /// No mix and no trim: see `Node::Tilt`.
+    ///
+    /// Stereo in, stereo out.
+    Tilt {
+        tilt_db: f32,
+        pivot_hz: f32,
     },
     /// An analogue delay on whatever feeds it. `sync` is an index into
     /// `crate::params::echo::SYNC_NAMES` (0 = free, and only then is
@@ -5805,6 +5889,24 @@ impl GraphSpec {
                             freq_hz,
                             pinch,
                             stages,
+                        }
+                    }
+                    Some(NodeSpec::Tilt { tilt_db, pivot_hz }) => {
+                        use crate::params::tilt as tp;
+                        // Green zone: every value clamps through the same
+                        // table rows the letters will.
+                        let sr = sample_rate as f32;
+                        let tilt_db = tp::TABLE[tp::TILT as usize].clamp(*tilt_db);
+                        let pivot_hz = tp::TABLE[tp::PIVOT as usize].clamp(*pivot_hz);
+                        let mut core = [crate::dsp::filters::Tilt::new(); 2];
+                        for ch in core.iter_mut() {
+                            ch.prepare(sr, pivot_hz, tilt_db);
+                        }
+                        Node::Tilt {
+                            core,
+                            sample_rate: sr,
+                            pivot_hz,
+                            tilt_db,
                         }
                     }
                     Some(NodeSpec::Echo {

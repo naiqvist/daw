@@ -31,6 +31,7 @@ pub enum DeviceKind {
     Lofi,
     Sheen,
     Disperser,
+    Tilt,
     Echo,
     Eq,
     Filter,
@@ -1566,6 +1567,27 @@ pub static DEVICES: &[DeviceSpec] = &[
                 name: "Pinch",
                 unit: "",
                 group: "Disperser",
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Tilt,
+        name: "tilt",
+        instrument: false,
+        prefix: "tilt",
+        params: daw::params::tilt::TABLE,
+        // Units blank for the reason the others' are: the card prints
+        // "+6.0 dB" and "1.00 kHz" through its own `Unit`.
+        labels: &[
+            ParamLabel {
+                name: "Tilt",
+                unit: "",
+                group: "Tilt",
+            },
+            ParamLabel {
+                name: "Pivot",
+                unit: "",
+                group: "Tilt",
             },
         ],
     },

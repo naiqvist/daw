@@ -85,6 +85,7 @@ pub struct Gallery {
     dev_lofi: device::LofiUi,
     dev_sheen: device::SheenUi,
     dev_disperser: device::DisperserUi,
+    dev_tilt: device::TiltUi,
 }
 
 impl Default for Gallery {
@@ -142,6 +143,14 @@ impl Default for Gallery {
             dev_lofi: device::LofiUi::default(),
             dev_sheen: device::SheenUi::default(),
             dev_disperser: device::DisperserUi::default(),
+            // NOT the device's default, which is flat — deliberately, see
+            // `params::tilt`. A preview of a corrective device sitting at
+            // its neutral setting is a preview of a straight line, so the
+            // gallery leans this one over to show what the card draws.
+            dev_tilt: device::TiltUi {
+                tilt: device::tilt_norm(params::tilt::TILT, 6.0),
+                ..device::TiltUi::default()
+            },
         }
     }
 }
@@ -752,6 +761,13 @@ impl Gallery {
                     "DisperserEdit(param {}, {:.2})",
                     edit.param, edit.value
                 ));
+            }
+
+            kit::gap(ui, theme, space::SM);
+            kit::muted(ui, theme, "tilt — the see-saw, measured through a real FFT");
+            for edit in device::tilt_card(ui, theme, &mut self.dev_tilt) {
+                self.log
+                    .push(format!("TiltEdit(param {}, {:.2})", edit.param, edit.value));
             }
 
             kit::gap(ui, theme, space::SM);

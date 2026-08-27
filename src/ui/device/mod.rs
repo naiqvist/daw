@@ -119,6 +119,7 @@ pub mod snare;
 pub mod spectrum;
 pub mod switch;
 pub mod synth;
+pub mod tilt;
 pub mod tom;
 pub mod utility;
 pub mod xy;
@@ -175,6 +176,9 @@ pub use snare::{
 pub use synth::{
     ParamEdit, SineSynthUi, sine_synth_card, sine_synth_edits, sine_synth_format,
     sine_synth_is_log, sine_synth_norm, sine_synth_value,
+};
+pub use tilt::{
+    TiltUi, tilt_card, tilt_edits, tilt_is_discrete, tilt_is_log, tilt_norm, tilt_value,
 };
 pub use tom::{TomUi, tom_card, tom_edits, tom_is_discrete, tom_is_log, tom_norm, tom_value};
 pub use utility::{
