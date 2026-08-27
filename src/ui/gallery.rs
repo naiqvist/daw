@@ -84,6 +84,7 @@ pub struct Gallery {
     dev_poly: device::PolyUi,
     dev_lofi: device::LofiUi,
     dev_sheen: device::SheenUi,
+    dev_disperser: device::DisperserUi,
 }
 
 impl Default for Gallery {
@@ -140,6 +141,7 @@ impl Default for Gallery {
             dev_poly: device::PolyUi::default(),
             dev_lofi: device::LofiUi::default(),
             dev_sheen: device::SheenUi::default(),
+            dev_disperser: device::DisperserUi::default(),
         }
     }
 }
@@ -735,6 +737,19 @@ impl Gallery {
             for edit in device::sheen_card(ui, theme, &mut self.dev_sheen) {
                 self.log.push(format!(
                     "SheenEdit(param {}, {:.2})",
+                    edit.param, edit.value
+                ));
+            }
+
+            kit::gap(ui, theme, space::SM);
+            kit::muted(
+                ui,
+                theme,
+                "disperser — a click, and what the allpass chain makes of it",
+            );
+            for edit in device::disperser_card(ui, theme, &mut self.dev_disperser) {
+                self.log.push(format!(
+                    "DisperserEdit(param {}, {:.2})",
                     edit.param, edit.value
                 ));
             }

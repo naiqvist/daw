@@ -76,6 +76,7 @@ pub mod adjust;
 pub mod bezier;
 pub mod card;
 pub mod design;
+pub mod disperser;
 pub mod dynamics;
 pub mod echo;
 pub mod envelope;
@@ -124,6 +125,10 @@ pub mod xy;
 
 pub use bezier::{Cubic, Pt};
 pub use card::{Well, Wells, card, empty_card, sections, sub_wells, tabbed_card, wells};
+pub use disperser::{
+    DisperserUi, disperser_card, disperser_edits, disperser_is_discrete, disperser_is_log,
+    disperser_norm, disperser_value,
+};
 pub use echo::{
     EchoUi, echo_card, echo_edits, echo_is_discrete, echo_is_log, echo_norm, echo_value,
 };

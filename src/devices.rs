@@ -30,6 +30,7 @@ pub enum DeviceKind {
     Sat,
     Lofi,
     Sheen,
+    Disperser,
     Echo,
     Eq,
     Filter,
@@ -1539,6 +1540,32 @@ pub static DEVICES: &[DeviceSpec] = &[
                 name: "Out",
                 unit: "",
                 group: "Sheen",
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Disperser,
+        name: "disperser",
+        instrument: false,
+        prefix: "disp",
+        params: daw::params::disperser::TABLE,
+        // Units blank for the reason the others' are: the card prints
+        // "8", "500 Hz" and "1.00" through its own `Unit`.
+        labels: &[
+            ParamLabel {
+                name: "Amount",
+                unit: "",
+                group: "Disperser",
+            },
+            ParamLabel {
+                name: "Freq",
+                unit: "",
+                group: "Disperser",
+            },
+            ParamLabel {
+                name: "Pinch",
+                unit: "",
+                group: "Disperser",
             },
         ],
     },

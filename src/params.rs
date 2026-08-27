@@ -3780,6 +3780,95 @@ pub mod sampler {
 /// the kernel's doc argues each figure. A device that exposed them would
 /// be offering the user a way to turn it into the harshness it exists to
 /// avoid.
+/// The disperser — a chain of allpasses, as a device.
+///
+/// `dsp::filters::Disperser` owns the whole idea: sections that pass every
+/// frequency at unity gain and do nothing but delay each one differently,
+/// so a transient stops arriving all at once and a click becomes a
+/// descending chirp. This table only says what a musician may ask for.
+///
+/// Modelled on Kilohearts' Disperser, which is the reference everyone has
+/// heard, and whose three controls map exactly onto what our kernel
+/// already takes: how many sections, where they are tuned, and how
+/// tightly the phase turns there.
+///
+/// # There is no MIX, and that is the device
+///
+/// Every other effect here blends against the dry. This one must not.
+/// The kernel's load-bearing property is that its magnitude response is
+/// FLAT at every setting — that is what makes it safe across a drum — and
+/// flatness is a property of the wet signal alone. Sum it with the dry
+/// and the two disagree in phase, which is a comb filter: notches that
+/// move with the frequency knob. That is a phaser, and a good one, but it
+/// is a different device and it does not keep this one's promise.
+///
+/// # Zero stages is the off switch
+///
+/// The kernel says so plainly, and the range starts there on purpose, for
+/// the reason [`lofi`](super::lofi) and [`sheen`](super::sheen) both give:
+/// a colour you cannot remove is a colour you cannot measure. The
+/// reference starts at one section; we start at none, because ours can.
+pub mod disperser {
+    use super::ParamDef;
+
+    pub const AMOUNT: u32 = 0;
+    pub const FREQ: u32 = 1;
+    pub const PINCH: u32 = 2;
+
+    /// The most sections on offer, and the kernel's own ceiling —
+    /// `dsp::filters::DISPERSER_MAX_STAGES`, not a second opinion about
+    /// it. Restated as an f32 because a TABLE row is f32.
+    pub const AMOUNT_MAX: f32 = crate::dsp::filters::DISPERSER_MAX_STAGES as f32;
+
+    /// Where the sections are tuned. The full audible span, because the
+    /// whole gesture with this device is sweeping the smear from a
+    /// sub-bass boing up to a metallic tick.
+    pub const FREQ_MIN_HZ: f32 = 20.0;
+    pub const FREQ_MAX_HZ: f32 = 20_000.0;
+
+    /// How tightly the phase turns at the corner — the sections' Q.
+    ///
+    /// Low spreads the group delay over octaves and reads as a soft
+    /// smear; high packs it into a narrow band and reads as a ringing
+    /// pitch. The floor stays clear of the filter module's own `MIN_Q` so
+    /// no setting here lands on a clamp.
+    pub const PINCH_MIN: f32 = 0.1;
+    pub const PINCH_MAX: f32 = 8.0;
+
+    pub const TABLE: &[ParamDef] = &[
+        ParamDef {
+            id: AMOUNT,
+            name: "amount",
+            min: 0.0,
+            max: AMOUNT_MAX,
+            // Eight sections: sixteen poles of phase. Unmistakably the
+            // effect and still a smeared transient rather than the
+            // pitched "pew" the top of the range gives, which is a sound
+            // you go looking for rather than one you want on load.
+            default: 8.0,
+        },
+        ParamDef {
+            id: FREQ,
+            name: "freq",
+            min: FREQ_MIN_HZ,
+            max: FREQ_MAX_HZ,
+            // Low-mid, where a kick's body lives — the case the kernel's
+            // own doc is written around.
+            default: 500.0,
+        },
+        ParamDef {
+            id: PINCH,
+            name: "pinch",
+            min: PINCH_MIN,
+            max: PINCH_MAX,
+            // The neutral turn. Butterworth-ish, and the setting at which
+            // the smear reads as a softened transient rather than as a
+            // note of its own.
+            default: 1.0,
+        },
+    ];
+}
+
 pub mod sheen {
     use super::ParamDef;
 
@@ -3946,6 +4035,7 @@ mod tests {
         ("limiter", limiter::TABLE),
         ("lofi", lofi::TABLE),
         ("sheen", sheen::TABLE),
+        ("disperser", disperser::TABLE),
     ];
 
     /// The invariant `def()` and every `TABLE[FOO as usize]` rely on.

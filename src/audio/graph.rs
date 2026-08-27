@@ -1722,6 +1722,35 @@ pub enum Node {
     /// `SatCore` both give — the pole, the previous sample and the
     /// envelope are memory, and memory shared between two channels is the
     /// two channels leaking into each other.
+    /// The disperser — `dsp::filters::Disperser`, as a device.
+    ///
+    /// A chain of allpasses: unity gain at every frequency, and nothing
+    /// but a frequency-dependent delay. A transient stops arriving all at
+    /// once and becomes a descending chirp.
+    ///
+    /// THE SIMPLEST NODE HERE, and the reason is the device's own: it has
+    /// no mix and no trim, because its promise is a flat magnitude and
+    /// summing a phase-shifted copy with the dry would comb it into a
+    /// phaser. No blend means no dry buffer and no smoothers — the node
+    /// is the kernel, two channels of it, and the wiring.
+    ///
+    /// BOXED, for the reason `SatCore` is: thirty-two SVF sections per
+    /// channel is a couple of kilobytes, and `Node` is sized by its
+    /// largest variant.
+    ///
+    /// Free-running, and it CUTS on discontinuity — sixty-four
+    /// integrators' worth of history belongs to a position the transport
+    /// has left.
+    Disperser {
+        core: Box<[crate::dsp::filters::Disperser; 2]>,
+        /// Kept because `Disperser::prepare` takes the rate, the corner,
+        /// the Q and the count together, so moving ANY of the three knobs
+        /// has to restate all four.
+        sample_rate: f32,
+        freq_hz: f32,
+        pinch: f32,
+        stages: u32,
+    },
     Sheen {
         core: [crate::dsp::dynamics::SlewBrighten; 2],
         /// The dry copy the blend runs against, because the kernel works
@@ -1929,7 +1958,8 @@ impl Node {
             | NodeSpec::Limiter { .. }
             | NodeSpec::Utility { .. }
             | NodeSpec::Lofi { .. }
-            | NodeSpec::Sheen { .. } => 2,
+            | NodeSpec::Sheen { .. }
+            | NodeSpec::Disperser { .. } => 2,
             NodeSpec::Delay { channels, .. } => (*channels).clamp(1, 2),
             NodeSpec::Mixer { .. } | NodeSpec::AudioClip { .. } | NodeSpec::Pan { .. } => 2,
         }
@@ -2679,6 +2709,32 @@ impl Node {
                 }
             }
 
+            Node::Disperser { core, .. } => {
+                // `out.l` and `out.r` are separate fields, so this borrows
+                // only the right channel and the left stays reachable.
+                let right = out.r.as_deref_mut().unwrap_or(&mut []);
+                sum_inputs_stereo(inputs, out.l, right);
+
+                // A seek must not drag sixty-four integrators' worth of
+                // history into the new position. There are no smoothers to
+                // snap: this device has nothing a wire can glide.
+                if ctx.discontinuity {
+                    for ch in core.iter_mut() {
+                        ch.reset();
+                    }
+                }
+
+                // In place, one chain per channel, and that is the whole
+                // node — no blend to compute and so no scratch to run out
+                // of, which is why this one has no fail-open branch.
+                core[0].process(out.l);
+                // Compile fixes the channel count at 2, so this is true;
+                // it is checked rather than assumed because the check
+                // costs nothing and an assumption costs a panic.
+                if right.len() == out.l.len() {
+                    core[1].process(right);
+                }
+            }
             Node::Sheen {
                 core,
                 dry,
@@ -3249,7 +3305,9 @@ impl Node {
         // accepts. params::clamp is a bounded scan of a static table:
         // red-zone legal, and an unknown id comes back None (a stale or
         // misrouted letter — binned, never applied).
-        use crate::params::{clip, echo, filter, lofi, mixer, pan, reverb, sat, seq, sheen, sine};
+        use crate::params::{
+            clip, disperser, echo, filter, lofi, mixer, pan, reverb, sat, seq, sheen, sine,
+        };
         match self {
             // No parameters: compile decides a delay's length, and it
             // cannot change without a recompile — a letter that moved it
@@ -3525,6 +3583,33 @@ impl Node {
                     sheen::MIX => set(mix_target, mix),
                     sheen::OUT => set(trim_target, trim),
                     _ => {}
+                }
+            }
+            Node::Disperser {
+                core,
+                sample_rate,
+                freq_hz,
+                pinch,
+                stages,
+            } => {
+                let Some(value) = crate::params::clamp(disperser::TABLE, param, value) else {
+                    return;
+                };
+                match param {
+                    disperser::AMOUNT => *stages = value.round().max(0.0) as u32,
+                    disperser::FREQ => *freq_hz = value,
+                    disperser::PINCH => *pinch = value,
+                    _ => return,
+                }
+                // Re-tuned immediately rather than parked for the segment
+                // edge, and with no smoother on any of the three. The
+                // kernel is built for exactly this: one transcendental
+                // whatever the stage count, and the integrator STATE is
+                // deliberately left alone, so a re-tune cannot click. Its
+                // own doc says re-tuning from the audio thread is the case
+                // it exists for.
+                for ch in core.iter_mut() {
+                    ch.prepare(*sample_rate, *freq_hz, *pinch, *stages);
                 }
             }
             Node::Sat {
@@ -4422,6 +4507,19 @@ pub enum NodeSpec {
         edge_hz: f32,
         mix: f32,
         out: f32,
+    },
+    /// An allpass disperser on whatever feeds it. `amount` is how many
+    /// sections run, `freq_hz` where they are tuned and `pinch` how
+    /// tightly the phase turns there. ParamChange ids and every range are
+    /// `crate::params::disperser::TABLE`'s.
+    ///
+    /// No mix and no trim: see `Node::Disperser`.
+    ///
+    /// Stereo in, stereo out.
+    Disperser {
+        amount: f32,
+        freq_hz: f32,
+        pinch: f32,
     },
     /// An analogue delay on whatever feeds it. `sync` is an index into
     /// `crate::params::echo::SYNC_NAMES` (0 = free, and only then is
@@ -5679,6 +5777,34 @@ impl GraphSpec {
                             trim: smoother(trim),
                             mix_target: mix,
                             trim_target: trim,
+                        }
+                    }
+                    Some(NodeSpec::Disperser {
+                        amount,
+                        freq_hz,
+                        pinch,
+                    }) => {
+                        use crate::params::disperser as dp;
+                        // Green zone: the box is born here, and every
+                        // value clamps through the same table rows the
+                        // letters will.
+                        let sr = sample_rate as f32;
+                        let stages = dp::TABLE[dp::AMOUNT as usize]
+                            .clamp(*amount)
+                            .round()
+                            .max(0.0) as u32;
+                        let freq_hz = dp::TABLE[dp::FREQ as usize].clamp(*freq_hz);
+                        let pinch = dp::TABLE[dp::PINCH as usize].clamp(*pinch);
+                        let mut core = Box::new([crate::dsp::filters::Disperser::new(); 2]);
+                        for ch in core.iter_mut() {
+                            ch.prepare(sr, freq_hz, pinch, stages);
+                        }
+                        Node::Disperser {
+                            core,
+                            sample_rate: sr,
+                            freq_hz,
+                            pinch,
+                            stages,
                         }
                     }
                     Some(NodeSpec::Echo {

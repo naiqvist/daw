@@ -407,19 +407,20 @@ mod tests {
             "sat.rs",
             "echo.rs",
             "eq.rs",
-            "probe.rs",    // the headless pointer harness: test-only, draws nothing
-            "glue.rs",     // a card: its size is the sum of what it holds
-            "kick.rs",     // ditto
-            "limiter.rs",  // ditto
-            "lofi.rs",     // ditto
-            "sheen.rs",    // ditto
-            "modulato.rs", // ditto
-            "sampler.rs",  // ditto
-            "snare.rs",    // ditto
-            "tom.rs",      // ditto
-            "hat.rs",      // ditto
-            "handclap.rs", // ditto
-            "utility.rs",  // ditto
+            "probe.rs",     // the headless pointer harness: test-only, draws nothing
+            "glue.rs",      // a card: its size is the sum of what it holds
+            "kick.rs",      // ditto
+            "limiter.rs",   // ditto
+            "lofi.rs",      // ditto
+            "sheen.rs",     // ditto
+            "disperser.rs", // ditto
+            "modulato.rs",  // ditto
+            "sampler.rs",   // ditto
+            "snare.rs",     // ditto
+            "tom.rs",       // ditto
+            "hat.rs",       // ditto
+            "handclap.rs",  // ditto
+            "utility.rs",   // ditto
         ];
         let mut missing: Vec<String> = Vec::new();
         for path in module_files("device") {

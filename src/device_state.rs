@@ -161,6 +161,32 @@ impl Default for SheenParams {
     }
 }
 
+/// The disperser's editable values in ENGINE units — a section count, a
+/// corner in hertz and a Q, exactly as [`daw::params::disperser`]
+/// declares them.
+///
+/// No mix and no trim, which is the device: see the params module for why
+/// blending this one against the dry would break its flat-magnitude
+/// promise.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct DisperserParams {
+    pub amount: f32,
+    pub freq: f32,
+    pub pinch: f32,
+}
+
+impl Default for DisperserParams {
+    fn default() -> Self {
+        use daw::params::{def, disperser};
+        Self {
+            amount: def(disperser::TABLE, disperser::AMOUNT).default,
+            freq: def(disperser::TABLE, disperser::FREQ).default,
+            pinch: def(disperser::TABLE, disperser::PINCH).default,
+        }
+    }
+}
+
 /// What a device IS, and its editable values — in ENGINE units, the same
 /// numbers `src/params.rs` declares. One stored copy of one truth: the card
 /// converts to normalized knob positions for drawing and back on the way
@@ -180,6 +206,7 @@ pub enum DeviceState {
     Sat(SatParams),
     Lofi(LofiParams),
     Sheen(SheenParams),
+    Disperser(DisperserParams),
     Echo(EchoParams),
     Eq(daw::audio::eq::EqParams),
     Filter(daw::audio::filter::FilterParams),
@@ -205,6 +232,7 @@ impl DeviceState {
             DeviceKind::Sat => Self::Sat(SatParams::default()),
             DeviceKind::Lofi => Self::Lofi(LofiParams::default()),
             DeviceKind::Sheen => Self::Sheen(SheenParams::default()),
+            DeviceKind::Disperser => Self::Disperser(DisperserParams::default()),
             DeviceKind::Echo => Self::Echo(EchoParams::default()),
             DeviceKind::Eq => Self::Eq(daw::audio::eq::EqParams::default()),
             DeviceKind::Filter => Self::Filter(daw::audio::filter::FilterParams::default()),
@@ -229,6 +257,7 @@ impl DeviceState {
             Self::Sat(_) => DeviceKind::Sat,
             Self::Lofi(_) => DeviceKind::Lofi,
             Self::Sheen(_) => DeviceKind::Sheen,
+            Self::Disperser(_) => DeviceKind::Disperser,
             Self::Echo(_) => DeviceKind::Echo,
             Self::Eq(_) => DeviceKind::Eq,
             Self::Filter(_) => DeviceKind::Filter,
@@ -242,7 +271,7 @@ impl DeviceState {
     /// This device's value for `param`, or `None` for an id it does not
     /// have — which is how a target aimed at the wrong kind is refused.
     pub fn value(self, param: u32) -> Option<f32> {
-        use daw::params::{echo, lofi, reverb, sat, seq, sheen};
+        use daw::params::{disperser, echo, lofi, reverb, sat, seq, sheen};
         match self {
             Self::SineSynth(p) => match param {
                 seq::GAIN => Some(p.gain),
@@ -295,6 +324,12 @@ impl DeviceState {
                 sheen::OUT => Some(p.out),
                 _ => None,
             },
+            Self::Disperser(p) => match param {
+                disperser::AMOUNT => Some(p.amount),
+                disperser::FREQ => Some(p.freq),
+                disperser::PINCH => Some(p.pinch),
+                _ => None,
+            },
             Self::Sat(p) => match param {
                 sat::MODE => Some(p.mode),
                 sat::DRIVE => Some(p.drive),
@@ -337,7 +372,7 @@ impl DeviceState {
     /// Store an engine-unit value. Unknown ids are dropped, exactly as the
     /// engine's own clamp drops them.
     pub fn set(&mut self, param: u32, value: f32) {
-        use daw::params::{echo, lofi, reverb, sat, seq, sheen};
+        use daw::params::{disperser, echo, lofi, reverb, sat, seq, sheen};
         match self {
             Self::SineSynth(p) => match param {
                 seq::GAIN => p.gain = value,
@@ -376,6 +411,12 @@ impl DeviceState {
                 sheen::EDGE => p.edge = value,
                 sheen::MIX => p.mix = value,
                 sheen::OUT => p.out = value,
+                _ => {}
+            },
+            Self::Disperser(p) => match param {
+                disperser::AMOUNT => p.amount = value,
+                disperser::FREQ => p.freq = value,
+                disperser::PINCH => p.pinch = value,
                 _ => {}
             },
             Self::Sat(p) => match param {
@@ -517,6 +558,16 @@ pub fn reverb_knobs(params: ReverbParams) -> device::ReverbUi {
     })
 }
 
+pub fn disperser_knobs(params: DisperserParams) -> device::DisperserUi {
+    use daw::params::disperser;
+    let at = |param, value| device_norm(DeviceKind::Disperser, param, value);
+    device::DisperserUi {
+        amount: at(disperser::AMOUNT, params.amount),
+        freq: at(disperser::FREQ, params.freq),
+        pinch: at(disperser::PINCH, params.pinch),
+    }
+}
+
 pub fn sheen_knobs(params: SheenParams) -> device::SheenUi {
     use daw::params::sheen;
     let at = |param, value| device_norm(DeviceKind::Sheen, param, value);
@@ -619,6 +670,7 @@ pub fn device_norm(kind: DeviceKind, param: u32, value: f32) -> f32 {
         DeviceKind::Sat => device::sat_norm(param, value),
         DeviceKind::Lofi => device::lofi_norm(param, value),
         DeviceKind::Sheen => device::sheen_norm(param, value),
+        DeviceKind::Disperser => device::disperser_norm(param, value),
         DeviceKind::Echo => device::echo_norm(param, value),
         DeviceKind::Eq => device::eq_norm(param, value),
         DeviceKind::Filter => device::filter_norm(param, value),
@@ -651,6 +703,7 @@ pub fn device_is_discrete(kind: DeviceKind, param: u32) -> bool {
         DeviceKind::Sat => device::sat_is_discrete(param),
         DeviceKind::Lofi => device::lofi_is_discrete(param),
         DeviceKind::Sheen => device::sheen_is_discrete(param),
+        DeviceKind::Disperser => device::disperser_is_discrete(param),
         DeviceKind::Echo => device::echo_is_discrete(param),
         DeviceKind::Eq => device::eq_is_discrete(param),
         DeviceKind::Filter => device::filter_is_discrete(param),
@@ -678,6 +731,7 @@ pub fn device_is_log(kind: DeviceKind, param: u32) -> bool {
         DeviceKind::Sat => device::sat_is_log(param),
         DeviceKind::Lofi => device::lofi_is_log(param),
         DeviceKind::Sheen => device::sheen_is_log(param),
+        DeviceKind::Disperser => device::disperser_is_log(param),
         DeviceKind::Echo => device::echo_is_log(param),
         DeviceKind::Eq => device::eq_is_log(param),
         DeviceKind::Filter => device::filter_is_log(param),
@@ -708,6 +762,7 @@ pub fn device_value(kind: DeviceKind, param: u32, norm: f32) -> f32 {
         DeviceKind::Sat => device::sat_value(param, norm),
         DeviceKind::Lofi => device::lofi_value(param, norm),
         DeviceKind::Sheen => device::sheen_value(param, norm),
+        DeviceKind::Disperser => device::disperser_value(param, norm),
         DeviceKind::Echo => device::echo_value(param, norm),
         DeviceKind::Eq => device::eq_value(param, norm),
         DeviceKind::Filter => device::filter_value(param, norm),

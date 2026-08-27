@@ -68,8 +68,8 @@ use focus::Focus;
 mod device_state;
 use device_state::{
     DeviceInstance, DeviceState, EchoParams, device_edits, device_is_discrete, device_is_log,
-    echo_knobs, eq_knobs, glue_knobs, lofi_knobs, poly_knobs, reverb_knobs, sat_knobs, sheen_knobs,
-    synth_knobs, unit_zoom, utility_knobs,
+    disperser_knobs, echo_knobs, eq_knobs, glue_knobs, lofi_knobs, poly_knobs, reverb_knobs,
+    sat_knobs, sheen_knobs, synth_knobs, unit_zoom, utility_knobs,
 };
 mod devices;
 use bar::{Bar, TRANSPORT_GAP, TRANSPORT_GROUP_GAP, bar_layout, buttons_width, fields_width};
@@ -9896,6 +9896,10 @@ impl Default for Browser {
                             load: DeviceKind::Sheen,
                         },
                         BrowserItem {
+                            name: "Disperser",
+                            load: DeviceKind::Disperser,
+                        },
+                        BrowserItem {
                             name: "Delay",
                             load: DeviceKind::Echo,
                         },
@@ -11675,6 +11679,10 @@ fn device_body(
                                     let mut knobs = sheen_knobs(params);
                                     device::sheen_card(ui, theme, &mut knobs)
                                 }
+                                DeviceState::Disperser(params) => {
+                                    let mut knobs = disperser_knobs(params);
+                                    device::disperser_card(ui, theme, &mut knobs)
+                                }
                                 DeviceState::Echo(params) => {
                                     let mut knobs = echo_knobs(params);
                                     device::echo_card(ui, theme, &mut knobs)
@@ -11907,6 +11915,7 @@ fn plockable_params(track: &Track) -> Vec<piano_roll::PlockParam> {
         | DeviceKind::Sat
         | DeviceKind::Lofi
         | DeviceKind::Sheen
+        | DeviceKind::Disperser
         | DeviceKind::Echo
         | DeviceKind::Eq
         | DeviceKind::Filter
@@ -12176,6 +12185,16 @@ fn compile_chain(
                 }
                 tail = glue;
             }
+            DeviceState::Disperser(params) => {
+                let disp = spec.push(NodeSpec::Disperser {
+                    amount: params.amount,
+                    freq_hz: params.freq,
+                    pinch: params.pinch,
+                });
+                spec.connect(tail, disp);
+                devices.insert(instance.id, disp);
+                tail = disp;
+            }
             DeviceState::Sheen(params) => {
                 let sheen = spec.push(NodeSpec::Sheen {
                     amount: params.amount,
@@ -12264,6 +12283,7 @@ fn build_graph_spec(
                     | DeviceState::Filter(_)
                     | DeviceState::Lofi(_)
                     | DeviceState::Sheen(_)
+                    | DeviceState::Disperser(_)
                     | DeviceState::Limiter(_) => continue,
                     DeviceState::SineSynth(params) => NodeSpec::Seq {
                         notes,
