@@ -51,6 +51,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 mod bar;
+mod focus;
+use focus::Focus;
 mod device_state;
 use device_state::{
     DeviceInstance, DeviceState, EchoParams, ReverbParams, device_edits, device_is_discrete,
@@ -306,26 +308,6 @@ const PAN_STEP: f32 = 0.1;
 /// exactly 0.0, so "back to the middle" is reachable by hand.
 const PAN_DETENT: f32 = 0.04;
 
-// --- the keyboard cursor ---
-
-/// The cursor is a RING around the focused element, not a box floating in a
-/// region. Once the keyboard can reach individual buttons, a marker sitting
-/// in the middle of a panel cannot say WHICH button it means.
-const RING_STROKE: f32 = 2.0;
-/// How far the ring stands off the element, so it surrounds rather than
-/// covers it.
-const RING_PAD: f32 = 3.0;
-const RING_RADIUS: f32 = 0.0;
-/// Stiffness of the ring's travel, radians per second. Critically damped, so
-/// it accelerates in and settles without overshoot.
-const RING_OMEGA: f32 = 34.0;
-/// Below this the spring is done and we stop asking for frames.
-const RING_SETTLED_PX: f32 = 0.25;
-/// How much a candidate is penalised for being off the axis you pressed.
-/// Above 1.0 this prefers the element you are lined up with over one merely
-/// closer — which is what makes arrowing along a row of buttons work.
-const CROSS_PENALTY: f32 = 2.5;
-
 /// Drag limits for the two resizable regions, so proportions can be found by
 /// feel rather than by guessing numbers.
 const BROWSER_W_RANGE: std::ops::RangeInclusive<f32> = 180.0..=560.0;
@@ -340,54 +322,6 @@ fn main() -> eframe::Result {
     };
 
     eframe::run_native("daw", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Dir {
-    Up,
-    Down,
-    Left,
-    Right,
-}
-
-impl Dir {
-    const ALL: [Self; 4] = [Self::Up, Self::Down, Self::Left, Self::Right];
-
-    fn key(self) -> egui::Key {
-        match self {
-            Self::Up => egui::Key::ArrowUp,
-            Self::Down => egui::Key::ArrowDown,
-            Self::Left => egui::Key::ArrowLeft,
-            Self::Right => egui::Key::ArrowRight,
-        }
-    }
-}
-
-/// One step of a critically damped spring, solved implicitly.
-///
-/// Implicit rather than the obvious `vel += accel * dt`, because the explicit
-/// form blows up when a frame runs long — exactly when a dropped frame would
-/// otherwise fling the cursor off screen. This form is unconditionally
-/// stable at any `dt`, and being critically damped it never overshoots, so
-/// the box arrives without a wobble.
-///
-/// Pure, so `the_cursor_springs_without_overshooting` can check it with no
-/// window in sight.
-fn spring_step(
-    pos: egui::Vec2,
-    vel: egui::Vec2,
-    target: egui::Vec2,
-    dt: f32,
-) -> (egui::Vec2, egui::Vec2) {
-    let omega = RING_OMEGA;
-    let f = 1.0 + 2.0 * dt * omega;
-    let oo = omega * omega;
-    let hoo = dt * oo;
-    let hhoo = dt * hoo;
-    let det_inv = 1.0 / (f + hhoo);
-    let det_x = f * pos + dt * vel + hhoo * target;
-    let det_v = vel + hoo * (target - pos);
-    (det_x * det_inv, det_v * det_inv)
 }
 
 /// Split the browser's interior into the two bands, inset so the panel's own
@@ -426,137 +360,6 @@ fn split_from_pointer(area: egui::Rect, y: f32) -> f32 {
     let seam_top = area.bottom() - BROWSER_INSET_Y;
     let frac = (seam_top - y) / area.height().max(1.0);
     frac.clamp(*BROWSER_SPLIT_RANGE.start(), *BROWSER_SPLIT_RANGE.end())
-}
-
-/// Which element the keyboard is on, and where the ring is on its way there.
-///
-/// Elements register themselves as they are drawn, so the focusable set is
-/// exactly the set of things that exist this frame. A control that is not
-/// drawn cannot be focused, and one that is drawn cannot be missed.
-#[derive(Default)]
-struct Focus {
-    at: Option<egui::Id>,
-    items: Vec<(egui::Id, egui::Rect)>,
-    /// The direction pressed this frame, resolved only once every element has
-    /// registered — moving mid-frame would navigate a half-built list.
-    pending: Option<Dir>,
-    activate: bool,
-    ring: Option<egui::Rect>,
-    v_min: egui::Vec2,
-    v_max: egui::Vec2,
-}
-
-impl Focus {
-    /// Take this frame's keyboard input and start collecting elements.
-    fn begin(&mut self, ctx: &egui::Context) {
-        self.items.clear();
-        self.pending = None;
-        self.activate = false;
-
-        // A focused text field owns the keyboard outright. Escape hands it
-        // back — without that you would be stuck inside the search box.
-        if ctx.egui_wants_keyboard_input() {
-            let escape = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
-            if escape && let Some(id) = ctx.memory(|m| m.focused()) {
-                ctx.memory_mut(|m| m.surrender_focus(id));
-            }
-            return;
-        }
-        ctx.input_mut(|i| {
-            for dir in Dir::ALL {
-                if i.consume_key(egui::Modifiers::NONE, dir.key()) {
-                    self.pending = Some(dir);
-                }
-            }
-            self.activate = i.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
-        });
-    }
-
-    /// Declare an element focusable. Returns true if the keyboard is on it.
-    fn register(&mut self, id: egui::Id, rect: egui::Rect) -> bool {
-        self.items.push((id, rect));
-        self.at == Some(id)
-    }
-
-    /// Put the keyboard on `id` because the POINTER went there.
-    ///
-    /// Focus otherwise only moves by arrow key, which left the roll — or
-    /// any other region you can work in with the mouse — visibly the thing
-    /// being edited while its verbs went to whatever the ring was last
-    /// parked on. Claiming beats a pending arrow: the hand that just
-    /// pressed a button is more recent than the key that started the frame.
-    fn claim(&mut self, id: egui::Id) {
-        if self.at != Some(id) {
-            self.at = Some(id);
-            self.pending = None;
-        }
-    }
-
-    /// Focused AND the user pressed Enter.
-    fn activated(&self, id: egui::Id) -> bool {
-        self.activate && self.at == Some(id)
-    }
-
-    /// Resolve movement, then ease the ring toward the focused element.
-    fn end(&mut self, ui: &egui::Ui, theme: &Theme) {
-        if self.items.is_empty() {
-            return;
-        }
-        // Land somewhere on the first frame, and recover if whatever was
-        // focused stopped being drawn — a folder collapsing under it, say.
-        if !self.items.iter().any(|(id, _)| Some(*id) == self.at) {
-            self.at = self.items.first().map(|(id, _)| *id);
-            self.ring = None;
-        }
-        if let (Some(dir), Some(from)) = (self.pending, self.rect_of(self.at))
-            && let Some(next) = nearest(from, dir, &self.items, self.at)
-        {
-            self.at = Some(next);
-        }
-
-        let Some(target) = self.rect_of(self.at) else {
-            return;
-        };
-        let target = target.expand(RING_PAD);
-        let ring = match self.ring {
-            None => target,
-            Some(ring) => {
-                let dt = ui.ctx().input(|i| i.stable_dt);
-                let (min, v_min) =
-                    spring_step(ring.min.to_vec2(), self.v_min, target.min.to_vec2(), dt);
-                let (max, v_max) =
-                    spring_step(ring.max.to_vec2(), self.v_max, target.max.to_vec2(), dt);
-                let next = egui::Rect::from_min_max(min.to_pos2(), max.to_pos2());
-                let settled = (next.min - target.min).length() < RING_SETTLED_PX
-                    && (next.max - target.max).length() < RING_SETTLED_PX;
-                if settled {
-                    self.v_min = egui::Vec2::ZERO;
-                    self.v_max = egui::Vec2::ZERO;
-                    target
-                } else {
-                    self.v_min = v_min;
-                    self.v_max = v_max;
-                    ui.ctx().request_repaint();
-                    next
-                }
-            }
-        };
-        self.ring = Some(ring);
-
-        ui.painter().rect_stroke(
-            ring,
-            RING_RADIUS,
-            egui::Stroke::new(RING_STROKE, theme.focus),
-            egui::StrokeKind::Middle,
-        );
-    }
-
-    fn rect_of(&self, id: Option<egui::Id>) -> Option<egui::Rect> {
-        self.items
-            .iter()
-            .find(|(i, _)| Some(*i) == id)
-            .map(|(_, r)| *r)
-    }
 }
 
 /// The arrangement's shortcuts. Ctrl+1 narrows the grid, Ctrl+2 widens it,
@@ -718,44 +521,6 @@ fn arrangement_keys(ctx: &egui::Context, arr: &Arrangement, out: &mut Vec<UiActi
             out.push(UiAction::AddTrack(TrackKind::Audio));
         }
     });
-}
-
-/// The element an arrow key should land on.
-///
-/// Candidates must lie genuinely in the pressed direction; among those the
-/// winner is closest along that axis, penalised for being off it. That
-/// penalty is what makes a row of buttons arrow left-to-right instead of
-/// diving at whatever is nearest in a straight line.
-///
-/// Pure, so the whole navigation model is testable without a window.
-fn nearest(
-    from: egui::Rect,
-    dir: Dir,
-    items: &[(egui::Id, egui::Rect)],
-    current: Option<egui::Id>,
-) -> Option<egui::Id> {
-    let a = from.center();
-    let mut best: Option<(egui::Id, f32)> = None;
-    for (id, rect) in items {
-        if Some(*id) == current {
-            continue;
-        }
-        let b = rect.center();
-        let (along, across) = match dir {
-            Dir::Left => (a.x - b.x, (b.y - a.y).abs()),
-            Dir::Right => (b.x - a.x, (b.y - a.y).abs()),
-            Dir::Up => (a.y - b.y, (b.x - a.x).abs()),
-            Dir::Down => (b.y - a.y, (b.x - a.x).abs()),
-        };
-        if along <= 0.5 {
-            continue; // not actually that way
-        }
-        let score = along + across * CROSS_PENALTY;
-        if best.is_none_or(|(_, s)| score < s) {
-            best = Some((*id, score));
-        }
-    }
-    best.map(|(id, _)| id)
 }
 
 /// One transport button: hover wash, icon, click. Returns true when pressed,
@@ -19564,6 +19329,7 @@ impl eframe::App for App {
 mod tests {
     use super::bar::{TRANSPORT_BTN, TRANSPORT_PAD};
     use super::device_state::{device_norm, device_value};
+    use super::focus::{Dir, RING_SETTLED_PX, nearest, spring_step};
     use super::icon::{ICON, PAUSE_BAR, PAUSE_GAP};
     use super::timecode::bars_beats;
     use super::*;
