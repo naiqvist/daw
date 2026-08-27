@@ -113,6 +113,7 @@ pub mod sampler;
 pub mod sat;
 pub mod scope;
 pub mod shaper;
+pub mod sheen;
 pub mod snare;
 pub mod spectrum;
 pub mod switch;
@@ -160,6 +161,9 @@ pub use sampler::{
     sampler_norm, sampler_value,
 };
 pub use sat::{SatUi, sat_card, sat_edits, sat_is_discrete, sat_is_log, sat_norm, sat_value};
+pub use sheen::{
+    SheenUi, sheen_card, sheen_edits, sheen_is_discrete, sheen_is_log, sheen_norm, sheen_value,
+};
 pub use snare::{
     SnareUi, snare_card, snare_edits, snare_is_discrete, snare_is_log, snare_norm, snare_value,
 };

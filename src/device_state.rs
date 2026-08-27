@@ -137,6 +137,30 @@ impl Default for LofiParams {
     }
 }
 
+/// The sheen's editable values in ENGINE units — the kernel's own
+/// multiplier, a corner in hertz, a fraction and a linear gain, exactly
+/// as [`daw::params::sheen`] declares them.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct SheenParams {
+    pub amount: f32,
+    pub edge: f32,
+    pub mix: f32,
+    pub out: f32,
+}
+
+impl Default for SheenParams {
+    fn default() -> Self {
+        use daw::params::{def, sheen};
+        Self {
+            amount: def(sheen::TABLE, sheen::AMOUNT).default,
+            edge: def(sheen::TABLE, sheen::EDGE).default,
+            mix: def(sheen::TABLE, sheen::MIX).default,
+            out: def(sheen::TABLE, sheen::OUT).default,
+        }
+    }
+}
+
 /// What a device IS, and its editable values — in ENGINE units, the same
 /// numbers `src/params.rs` declares. One stored copy of one truth: the card
 /// converts to normalized knob positions for drawing and back on the way
@@ -155,6 +179,7 @@ pub enum DeviceState {
     Reverb(ReverbParams),
     Sat(SatParams),
     Lofi(LofiParams),
+    Sheen(SheenParams),
     Echo(EchoParams),
     Eq(daw::audio::eq::EqParams),
     Filter(daw::audio::filter::FilterParams),
@@ -179,6 +204,7 @@ impl DeviceState {
             DeviceKind::Reverb => Self::Reverb(ReverbParams::default()),
             DeviceKind::Sat => Self::Sat(SatParams::default()),
             DeviceKind::Lofi => Self::Lofi(LofiParams::default()),
+            DeviceKind::Sheen => Self::Sheen(SheenParams::default()),
             DeviceKind::Echo => Self::Echo(EchoParams::default()),
             DeviceKind::Eq => Self::Eq(daw::audio::eq::EqParams::default()),
             DeviceKind::Filter => Self::Filter(daw::audio::filter::FilterParams::default()),
@@ -202,6 +228,7 @@ impl DeviceState {
             Self::Reverb(_) => DeviceKind::Reverb,
             Self::Sat(_) => DeviceKind::Sat,
             Self::Lofi(_) => DeviceKind::Lofi,
+            Self::Sheen(_) => DeviceKind::Sheen,
             Self::Echo(_) => DeviceKind::Echo,
             Self::Eq(_) => DeviceKind::Eq,
             Self::Filter(_) => DeviceKind::Filter,
@@ -215,7 +242,7 @@ impl DeviceState {
     /// This device's value for `param`, or `None` for an id it does not
     /// have — which is how a target aimed at the wrong kind is refused.
     pub fn value(self, param: u32) -> Option<f32> {
-        use daw::params::{echo, lofi, reverb, sat, seq};
+        use daw::params::{echo, lofi, reverb, sat, seq, sheen};
         match self {
             Self::SineSynth(p) => match param {
                 seq::GAIN => Some(p.gain),
@@ -261,6 +288,13 @@ impl DeviceState {
                 lofi::OUT => Some(p.out),
                 _ => None,
             },
+            Self::Sheen(p) => match param {
+                sheen::AMOUNT => Some(p.amount),
+                sheen::EDGE => Some(p.edge),
+                sheen::MIX => Some(p.mix),
+                sheen::OUT => Some(p.out),
+                _ => None,
+            },
             Self::Sat(p) => match param {
                 sat::MODE => Some(p.mode),
                 sat::DRIVE => Some(p.drive),
@@ -303,7 +337,7 @@ impl DeviceState {
     /// Store an engine-unit value. Unknown ids are dropped, exactly as the
     /// engine's own clamp drops them.
     pub fn set(&mut self, param: u32, value: f32) {
-        use daw::params::{echo, lofi, reverb, sat, seq};
+        use daw::params::{echo, lofi, reverb, sat, seq, sheen};
         match self {
             Self::SineSynth(p) => match param {
                 seq::GAIN => p.gain = value,
@@ -335,6 +369,13 @@ impl DeviceState {
                 lofi::BITS => p.bits = value,
                 lofi::MIX => p.mix = value,
                 lofi::OUT => p.out = value,
+                _ => {}
+            },
+            Self::Sheen(p) => match param {
+                sheen::AMOUNT => p.amount = value,
+                sheen::EDGE => p.edge = value,
+                sheen::MIX => p.mix = value,
+                sheen::OUT => p.out = value,
                 _ => {}
             },
             Self::Sat(p) => match param {
@@ -476,6 +517,17 @@ pub fn reverb_knobs(params: ReverbParams) -> device::ReverbUi {
     })
 }
 
+pub fn sheen_knobs(params: SheenParams) -> device::SheenUi {
+    use daw::params::sheen;
+    let at = |param, value| device_norm(DeviceKind::Sheen, param, value);
+    device::SheenUi {
+        amount: at(sheen::AMOUNT, params.amount),
+        edge: at(sheen::EDGE, params.edge),
+        mix: at(sheen::MIX, params.mix),
+        out: at(sheen::OUT, params.out),
+    }
+}
+
 pub fn lofi_knobs(params: LofiParams) -> device::LofiUi {
     use daw::params::lofi;
     let at = |param, value| device_norm(DeviceKind::Lofi, param, value);
@@ -566,6 +618,7 @@ pub fn device_norm(kind: DeviceKind, param: u32, value: f32) -> f32 {
         DeviceKind::Reverb => device::reverb_norm(param, value),
         DeviceKind::Sat => device::sat_norm(param, value),
         DeviceKind::Lofi => device::lofi_norm(param, value),
+        DeviceKind::Sheen => device::sheen_norm(param, value),
         DeviceKind::Echo => device::echo_norm(param, value),
         DeviceKind::Eq => device::eq_norm(param, value),
         DeviceKind::Filter => device::filter_norm(param, value),
@@ -597,6 +650,7 @@ pub fn device_is_discrete(kind: DeviceKind, param: u32) -> bool {
         DeviceKind::Limiter => device::limiter_is_discrete(param),
         DeviceKind::Sat => device::sat_is_discrete(param),
         DeviceKind::Lofi => device::lofi_is_discrete(param),
+        DeviceKind::Sheen => device::sheen_is_discrete(param),
         DeviceKind::Echo => device::echo_is_discrete(param),
         DeviceKind::Eq => device::eq_is_discrete(param),
         DeviceKind::Filter => device::filter_is_discrete(param),
@@ -623,6 +677,7 @@ pub fn device_is_log(kind: DeviceKind, param: u32) -> bool {
         DeviceKind::SineSynth => device::sine_synth_is_log(param),
         DeviceKind::Sat => device::sat_is_log(param),
         DeviceKind::Lofi => device::lofi_is_log(param),
+        DeviceKind::Sheen => device::sheen_is_log(param),
         DeviceKind::Echo => device::echo_is_log(param),
         DeviceKind::Eq => device::eq_is_log(param),
         DeviceKind::Filter => device::filter_is_log(param),
@@ -652,6 +707,7 @@ pub fn device_value(kind: DeviceKind, param: u32, norm: f32) -> f32 {
         DeviceKind::Reverb => device::reverb_value(param, norm),
         DeviceKind::Sat => device::sat_value(param, norm),
         DeviceKind::Lofi => device::lofi_value(param, norm),
+        DeviceKind::Sheen => device::sheen_value(param, norm),
         DeviceKind::Echo => device::echo_value(param, norm),
         DeviceKind::Eq => device::eq_value(param, norm),
         DeviceKind::Filter => device::filter_value(param, norm),

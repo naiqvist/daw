@@ -68,8 +68,8 @@ use focus::Focus;
 mod device_state;
 use device_state::{
     DeviceInstance, DeviceState, EchoParams, device_edits, device_is_discrete, device_is_log,
-    echo_knobs, eq_knobs, glue_knobs, lofi_knobs, poly_knobs, reverb_knobs, sat_knobs, synth_knobs,
-    unit_zoom, utility_knobs,
+    echo_knobs, eq_knobs, glue_knobs, lofi_knobs, poly_knobs, reverb_knobs, sat_knobs, sheen_knobs,
+    synth_knobs, unit_zoom, utility_knobs,
 };
 mod devices;
 use bar::{Bar, TRANSPORT_GAP, TRANSPORT_GROUP_GAP, bar_layout, buttons_width, fields_width};
@@ -9892,6 +9892,10 @@ impl Default for Browser {
                             load: DeviceKind::Lofi,
                         },
                         BrowserItem {
+                            name: "Sheen",
+                            load: DeviceKind::Sheen,
+                        },
+                        BrowserItem {
                             name: "Delay",
                             load: DeviceKind::Echo,
                         },
@@ -11667,6 +11671,10 @@ fn device_body(
                                     let mut knobs = lofi_knobs(params);
                                     device::lofi_card(ui, theme, &mut knobs)
                                 }
+                                DeviceState::Sheen(params) => {
+                                    let mut knobs = sheen_knobs(params);
+                                    device::sheen_card(ui, theme, &mut knobs)
+                                }
                                 DeviceState::Echo(params) => {
                                     let mut knobs = echo_knobs(params);
                                     device::echo_card(ui, theme, &mut knobs)
@@ -11898,6 +11906,7 @@ fn plockable_params(track: &Track) -> Vec<piano_roll::PlockParam> {
         DeviceKind::Reverb
         | DeviceKind::Sat
         | DeviceKind::Lofi
+        | DeviceKind::Sheen
         | DeviceKind::Echo
         | DeviceKind::Eq
         | DeviceKind::Filter
@@ -12167,6 +12176,17 @@ fn compile_chain(
                 }
                 tail = glue;
             }
+            DeviceState::Sheen(params) => {
+                let sheen = spec.push(NodeSpec::Sheen {
+                    amount: params.amount,
+                    edge_hz: params.edge,
+                    mix: params.mix,
+                    out: params.out,
+                });
+                spec.connect(tail, sheen);
+                devices.insert(instance.id, sheen);
+                tail = sheen;
+            }
             DeviceState::Lofi(params) => {
                 let lofi = spec.push(NodeSpec::Lofi {
                     rate: params.rate,
@@ -12243,6 +12263,7 @@ fn build_graph_spec(
                     | DeviceState::Utility(_)
                     | DeviceState::Filter(_)
                     | DeviceState::Lofi(_)
+                    | DeviceState::Sheen(_)
                     | DeviceState::Limiter(_) => continue,
                     DeviceState::SineSynth(params) => NodeSpec::Seq {
                         notes,

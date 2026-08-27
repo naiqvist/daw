@@ -3757,6 +3757,100 @@ pub mod sampler {
 /// and a bound that moved with the device's preparation could not be.
 /// At any session rate at or below 48 kHz the top of the knob is at or
 /// above it, so the off switch stays reachable.
+/// The sheen — a slew-driven brightener, as a device.
+///
+/// `dsp::dynamics::SlewBrighten` owns the whole idea: a high-frequency
+/// lift whose size is driven by how fast the signal is actually MOVING,
+/// so a snare edge gets it and a held pad does not. This table only says
+/// what a musician is allowed to ask for.
+///
+/// # The bottom of `AMOUNT` is off, and exactly off
+///
+/// The kernel promises that amount 0 is a bit-exact wire rather than
+/// merely a quiet one, which is what lets a device leave the stage
+/// permanently in its path. That end is reachable here on purpose, for
+/// the reason [`lofi`](super::lofi)'s two off switches are: a colour you
+/// cannot remove is a colour you cannot measure.
+///
+/// # What is NOT here
+///
+/// The envelope's attack and release, and the knee that decides where
+/// "fast" starts, are the kernel's own constants and stay there. They are
+/// what make this a brightener rather than a general-purpose exciter, and
+/// the kernel's doc argues each figure. A device that exposed them would
+/// be offering the user a way to turn it into the harshness it exists to
+/// avoid.
+pub mod sheen {
+    use super::ParamDef;
+
+    pub const AMOUNT: u32 = 0;
+    pub const EDGE: u32 = 1;
+    pub const MIX: u32 = 2;
+    pub const OUT: u32 = 3;
+
+    /// The kernel's own ceiling on how much a fully-triggered lift adds.
+    /// Taken from `SlewBrighten::prepare`'s clamp rather than invented
+    /// here, so the top of the knob is the top of the kernel.
+    pub const AMOUNT_MAX: f32 = 4.0;
+
+    /// The edge band's corner: everything above it is what gets lifted.
+    ///
+    /// The floor is well clear of the kernel's own 20 Hz minimum because
+    /// a brightener whose band starts in the bass is a volume knob with
+    /// extra steps.
+    pub const EDGE_MIN_HZ: f32 = 200.0;
+    pub const EDGE_MAX_HZ: f32 = 8_000.0;
+
+    /// The output trim's window, in dB, and the same figures as linear
+    /// gain — both forms written down for the reason
+    /// [`sat::OUT_MIN_DB`](super::sat::OUT_MIN_DB) gives.
+    pub const OUT_MIN_DB: f32 = -24.0;
+    pub const OUT_MAX_DB: f32 = 12.0;
+    /// `10^(-24/20)` and `10^(12/20)`, to f32 precision.
+    pub const OUT_MIN: f32 = 0.063_095_73;
+    pub const OUT_MAX: f32 = 3.981_072;
+
+    pub const TABLE: &[ParamDef] = &[
+        ParamDef {
+            id: AMOUNT,
+            name: "amount",
+            min: 0.0,
+            max: AMOUNT_MAX,
+            // The figure the limiter's own brighten knob reaches at full
+            // travel (`audio::limiter::BRIGHTEN_AMOUNT`). Known-good and
+            // clearly audible, and well short of the kernel's ceiling —
+            // a device that opens at its maximum leaves nowhere to go.
+            default: 1.2,
+        },
+        ParamDef {
+            id: EDGE,
+            name: "edge",
+            min: EDGE_MIN_HZ,
+            max: EDGE_MAX_HZ,
+            // `SlewBrighten`'s own default corner, and near the 1.8 kHz
+            // the limiter picked: presence rather than air.
+            default: 1_500.0,
+        },
+        ParamDef {
+            id: MIX,
+            name: "mix",
+            min: 0.0,
+            max: 1.0,
+            // Fully wet. The amount knob is already the "how much" — a
+            // second one at less than full would mean the device opens
+            // quieter than either control admits.
+            default: 1.0,
+        },
+        ParamDef {
+            id: OUT,
+            name: "out",
+            min: OUT_MIN,
+            max: OUT_MAX,
+            default: 1.0,
+        },
+    ];
+}
+
 pub mod lofi {
     use super::ParamDef;
 
@@ -3851,6 +3945,7 @@ mod tests {
         ("handclap", handclap::TABLE),
         ("limiter", limiter::TABLE),
         ("lofi", lofi::TABLE),
+        ("sheen", sheen::TABLE),
     ];
 
     /// The invariant `def()` and every `TABLE[FOO as usize]` rely on.

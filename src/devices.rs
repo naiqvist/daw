@@ -29,6 +29,7 @@ pub enum DeviceKind {
     Reverb,
     Sat,
     Lofi,
+    Sheen,
     Echo,
     Eq,
     Filter,
@@ -1506,6 +1507,38 @@ pub static DEVICES: &[DeviceSpec] = &[
                 name: "Out",
                 unit: "",
                 group: "Lo-fi",
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Sheen,
+        name: "sheen",
+        instrument: false,
+        prefix: "sheen",
+        params: daw::params::sheen::TABLE,
+        // Units blank for the reason the saturator's and the lo-fi's are:
+        // the card prints "30 %", "1.50 kHz" and "-6.0 dB" through its own
+        // `Unit`, and a second opinion here would be a second answer.
+        labels: &[
+            ParamLabel {
+                name: "Amount",
+                unit: "",
+                group: "Sheen",
+            },
+            ParamLabel {
+                name: "Edge",
+                unit: "",
+                group: "Sheen",
+            },
+            ParamLabel {
+                name: "Mix",
+                unit: "",
+                group: "Sheen",
+            },
+            ParamLabel {
+                name: "Out",
+                unit: "",
+                group: "Sheen",
             },
         ],
     },

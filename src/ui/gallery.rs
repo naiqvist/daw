@@ -83,6 +83,7 @@ pub struct Gallery {
     dev_synth: device::SineSynthUi,
     dev_poly: device::PolyUi,
     dev_lofi: device::LofiUi,
+    dev_sheen: device::SheenUi,
 }
 
 impl Default for Gallery {
@@ -138,6 +139,7 @@ impl Default for Gallery {
             dev_synth: device::SineSynthUi::default(),
             dev_poly: device::PolyUi::default(),
             dev_lofi: device::LofiUi::default(),
+            dev_sheen: device::SheenUi::default(),
         }
     }
 }
@@ -722,6 +724,19 @@ impl Gallery {
             for edit in device::lofi_card(ui, theme, &mut self.dev_lofi) {
                 self.log
                     .push(format!("LofiEdit(param {}, {:.2})", edit.param, edit.value));
+            }
+
+            kit::gap(ui, theme, space::SM);
+            kit::muted(
+                ui,
+                theme,
+                "sheen — what the brightener adds, on two synthetic hits",
+            );
+            for edit in device::sheen_card(ui, theme, &mut self.dev_sheen) {
+                self.log.push(format!(
+                    "SheenEdit(param {}, {:.2})",
+                    edit.param, edit.value
+                ));
             }
 
             kit::gap(ui, theme, space::SM);

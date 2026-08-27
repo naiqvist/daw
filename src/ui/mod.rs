@@ -412,6 +412,7 @@ mod tests {
             "kick.rs",     // ditto
             "limiter.rs",  // ditto
             "lofi.rs",     // ditto
+            "sheen.rs",    // ditto
             "modulato.rs", // ditto
             "sampler.rs",  // ditto
             "snare.rs",    // ditto
