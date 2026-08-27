@@ -68,9 +68,9 @@ use focus::Focus;
 mod device_state;
 use device_state::{
     DeviceInstance, DeviceState, EchoParams, acid_knobs, device_edits, device_is_discrete,
-    device_is_log, disperser_knobs, echo_knobs, eq_knobs, gate_knobs, glue_knobs, lofi_knobs,
-    phaser_knobs, poly_knobs, resyn_knobs, reverb_knobs, sat_knobs, sheen_knobs, strip_knobs,
-    synth_knobs, tilt_knobs, unit_zoom, utility_knobs,
+    device_is_log, device_value, disperser_knobs, echo_knobs, eq_knobs, gate_knobs, glue_knobs,
+    lofi_knobs, phaser_knobs, poly_knobs, resyn_knobs, reverb_knobs, sat_knobs, sheen_knobs,
+    strip_knobs, synth_knobs, tilt_knobs, unit_zoom, utility_knobs,
 };
 mod devices;
 use bar::{Bar, TRANSPORT_GAP, TRANSPORT_GROUP_GAP, bar_layout, buttons_width, fields_width};
@@ -9901,6 +9901,10 @@ impl Default for Browser {
                             load: DeviceKind::Sheen,
                         },
                         BrowserItem {
+                            name: "Rack",
+                            load: DeviceKind::Rack,
+                        },
+                        BrowserItem {
                             name: "Disperser",
                             load: DeviceKind::Disperser,
                         },
@@ -11351,6 +11355,19 @@ fn rate_label(rate_beats: f32) -> String {
 #[derive(Default)]
 struct DeviceEdits {
     edits: Vec<(u64, Vec<device::ParamEdit>)>,
+    /// A rack whose name or macro assignments changed: `(instance, state)`.
+    ///
+    /// NOT an edit: a macro assignment is not a parameter and has no wire
+    /// id — it is the half of a rack that its (empty) parameter table
+    /// cannot supply, and it lands in `Track::racks` beside the chain.
+    racks: Vec<(u64, device::RackUi)>,
+    /// A macro was turned: the parameter it drives, already in engine
+    /// units. `(target instance, edit)`.
+    ///
+    /// Resolved HERE rather than by the caller because the rack knows
+    /// which device the target is — it has the chain in front of it — and
+    /// the value cannot be computed without knowing the device's kind.
+    macro_moves: Vec<(u64, device::ParamEdit)>,
     /// Where a card's display is looking now: `(instance, zoom, scroll)`.
     views: Vec<(u64, f32, f32)>,
     /// A card asked for its display FULL SIZE.
@@ -11454,6 +11471,269 @@ fn sampler_wave(material: &daw::audio::material::Material) -> Vec<device::WaveCo
         .collect()
 }
 
+/// What a macro should print for the parameter it drives.
+///
+/// The device's own label table, which is the same list the modulation
+/// matrix reads — so a macro and a mod wire pointed at one parameter
+/// call it the same thing.
+fn param_label(kind: DeviceKind, param: u32) -> String {
+    let spec = kind.spec();
+    spec.params
+        .iter()
+        .position(|def| def.id == param)
+        .and_then(|at| spec.labels.get(at))
+        .map(|label| label.name.to_lowercase())
+        .unwrap_or_else(|| format!("param {param}"))
+}
+
+/// Draw ONE device's card, and everything that happens around it.
+///
+/// Lifted out of `device_body`'s chain loop UNCHANGED, so that a rack can
+/// call it for its children while the loop calls it for everything else.
+/// A rack draws cards inside a card, and the alternative to one function
+/// was the same two hundred lines written twice.
+///
+/// Returns the edits the card made, which the caller pushes to the engine
+/// — and which a rack ALSO reads, because "the parameter the user last
+/// touched" is how a macro is mapped.
+#[allow(clippy::too_many_arguments)]
+fn draw_device_card(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    instance: &DeviceInstance,
+    sample_rate: f32,
+    histories: &HashMap<u64, device::scope::History>,
+    samplers: &HashMap<u64, SamplerFace>,
+    slices: &HashMap<u64, Vec<u64>>,
+    edits: &mut DeviceEdits,
+) -> Vec<device::ParamEdit> {
+    // The card speaks normalized knob positions and
+    // the instance stores engine units, so the
+    // position is derived here and thrown away: the
+    // stored value is the one truth, and the edit
+    // coming back out is already in engine units.
+    // The card's own rect, so a file dropped on
+    // THIS card lands on THIS device. Taken from a
+    // scope rather than from the card, because a
+    // card returns what the user changed and its
+    // geometry is the rack's business.
+    let drawn = ui.scope(|ui| match instance.state {
+        // A rack has no card of its own: it IS a card, drawn by the chain
+        // loop with its children inside it. Reaching here would mean a
+        // rack had been asked to draw itself as a leaf, which is a bug in
+        // the caller rather than something to render.
+        DeviceState::Rack => Vec::new(),
+        DeviceState::Sampler(params) => {
+            let mut knobs = device::SamplerUi::from_engine(|id| params.get(id).unwrap_or_default());
+            let face = samplers.get(&instance.id);
+            let view = device::SamplerView {
+                name: face.map_or("", |f| f.name.as_str()),
+                wave: face.map_or(&[][..], |f| f.wave.as_slice()),
+                frames: face.map_or(0, |f| f.frames),
+                slices: slices.get(&instance.id).map_or(&[][..], Vec::as_slice),
+                // The engine does not report read
+                // positions yet, so the plot draws
+                // no playheads. The field exists
+                // so adding the telemetry is a
+                // wiring change and not a shape
+                // change.
+                voices: &[],
+                truncated: face.is_some_and(|f| f.truncated),
+                original_rate: face.map_or(0, |f| f.original_rate),
+            };
+            let out = device::sampler_card(
+                ui,
+                theme,
+                &mut knobs,
+                instance.page,
+                instance.view_zoom,
+                instance.view_scroll,
+                &view,
+            );
+            if out.page != instance.page {
+                edits.pages.push((instance.id, out.page));
+            }
+            // Where the display is looking rides
+            // the instance beside `page`, for the
+            // same reason: a card is rebuilt every
+            // frame and forgets everything.
+            if out.zoom != instance.view_zoom || out.scroll != instance.view_scroll {
+                edits.views.push((instance.id, out.zoom, out.scroll));
+            }
+            if let Some((index, frame)) = out.slice_moved {
+                edits.slice_moves.push((instance.id, index, frame));
+            }
+            if out.reslice {
+                edits.reslice.push(instance.id);
+            }
+            if out.expand {
+                edits.expand = Some(instance.id);
+            }
+            out.edits
+        }
+        DeviceState::SineSynth(params) => {
+            let mut knobs = synth_knobs(params);
+            device::sine_synth_card(ui, theme, &mut knobs)
+        }
+        DeviceState::Utility(params) => {
+            let mut knobs = utility_knobs(params);
+            device::utility_card(ui, theme, &mut knobs)
+        }
+        DeviceState::Limiter(params) => {
+            let mut knobs = device::LimiterUi::from_engine(|id| params.get(id));
+            device::limiter_card(ui, theme, &mut knobs)
+        }
+        DeviceState::Filter(params) => {
+            let mut knobs = device::FilterUi::from_engine(|id| params.get(id));
+            device::filter_card(ui, theme, &mut knobs, sample_rate)
+        }
+        DeviceState::Modulato(params) => {
+            let mut knobs = device::modulato::ModulatoUi::from_engine(|id| params.get(id));
+            device::modulato::modulato_card(ui, theme, &mut knobs)
+        }
+        DeviceState::Acid(params) => {
+            let mut knobs = acid_knobs(params);
+            device::acid_card(ui, theme, &mut knobs)
+        }
+        DeviceState::Kick(params) => {
+            // The app is the layer that knows
+            // both sides, so the conversion
+            // happens here rather than inside a
+            // widget that must not see the
+            // engine.
+            let mut knobs = device::kick::KickUi::from_engine(|id| params.get(id));
+            device::kick::kick_card(ui, theme, &mut knobs)
+        }
+        DeviceState::Snare(params) => {
+            let mut knobs = device::SnareUi::from_engine(|id| params.get(id));
+            device::snare_card(ui, theme, &mut knobs)
+        }
+        DeviceState::Tom(params) => {
+            let mut knobs = device::TomUi::from_engine(|id| params.get(id));
+            device::tom_card(ui, theme, &mut knobs)
+        }
+        DeviceState::Hat(params) => {
+            let mut knobs = device::HatUi::from_engine(|id| params.get(id));
+            device::hat_card(ui, theme, &mut knobs)
+        }
+        DeviceState::Handclap(params) => {
+            let mut knobs = device::HandclapUi::from_engine(|id| params.get(id));
+            device::handclap_card(ui, theme, &mut knobs)
+        }
+        DeviceState::Poly(params) => {
+            let mut knobs = poly_knobs(params, instance.page);
+            let made = device::poly_card(ui, theme, &mut knobs);
+            // The tab dots are part of the card, so
+            // the page it came back on is what the
+            // instance should remember.
+            let page = knobs.page.min(u8::MAX as usize) as u8;
+            if page != instance.page {
+                edits.pages.push((instance.id, page));
+            }
+            made
+        }
+        DeviceState::Sat(params) => {
+            let mut knobs = sat_knobs(params);
+            device::sat_card(ui, theme, &mut knobs)
+        }
+        DeviceState::Lofi(params) => {
+            let mut knobs = lofi_knobs(params);
+            device::lofi_card(ui, theme, &mut knobs)
+        }
+        DeviceState::Sheen(params) => {
+            let mut knobs = sheen_knobs(params);
+            device::sheen_card(ui, theme, &mut knobs)
+        }
+        DeviceState::Disperser(params) => {
+            let mut knobs = disperser_knobs(params);
+            device::disperser_card(ui, theme, &mut knobs)
+        }
+        DeviceState::Tilt(params) => {
+            let mut knobs = tilt_knobs(params);
+            device::tilt_card(ui, theme, &mut knobs)
+        }
+        DeviceState::Phaser(params) => {
+            let mut knobs = phaser_knobs(params);
+            device::phaser_card(ui, theme, &mut knobs)
+        }
+        DeviceState::Echo(params) => {
+            let mut knobs = echo_knobs(params);
+            device::echo_card(ui, theme, &mut knobs)
+        }
+        DeviceState::Reverb(params) => {
+            let mut knobs = reverb_knobs(params);
+            device::reverb_card(ui, theme, &mut knobs)
+        }
+        DeviceState::Gate(params) => {
+            let mut knobs = gate_knobs(params);
+            device::gate_card(ui, theme, &mut knobs)
+        }
+        DeviceState::Strip(params) => {
+            let mut knobs = strip_knobs(params);
+            device::strip_card(ui, theme, &mut knobs)
+        }
+        DeviceState::Resyn(params) => {
+            let mut knobs = resyn_knobs(params, instance.page);
+            let made = device::resyn_card(ui, theme, &mut knobs);
+            // The picked band is UI state the card
+            // forgets every frame, so the instance
+            // remembers it — the eq's road, and the
+            // device-UI contract's rule 3.
+            let band = knobs.selected.min(u8::MAX as usize) as u8;
+            if band != instance.page {
+                edits.pages.push((instance.id, band));
+            }
+            made
+        }
+        DeviceState::Glue(params) => {
+            let mut knobs = glue_knobs(params);
+            let history = histories.get(&instance.id).cloned().unwrap_or_default();
+            device::glue_card(ui, theme, &mut knobs, &history)
+        }
+        DeviceState::Eq(params) => {
+            let mut knobs = eq_knobs(params, instance.page);
+            let made = device::eq_card(ui, theme, &mut knobs, sample_rate);
+            // Clicking a handle picks the band the
+            // cell row edits, so the band it came
+            // back on is what the instance should
+            // remember — the same road the poly
+            // synth's tab takes, and for the same
+            // reason: the card itself is a
+            // temporary and forgets everything.
+            let band = knobs.selected.min(u8::MAX as usize) as u8;
+            if band != instance.page {
+                edits.pages.push((instance.id, band));
+            }
+            made
+        }
+    });
+    let made = drawn.inner;
+    // Is a browser drag hovering THIS sampler? Only
+    // NOTED, never taken — see `hover_sampler`.
+    if instance.kind() == DeviceKind::Sampler
+        && egui::DragAndDrop::has_payload_of_type::<SampleDrag>(ui.ctx())
+        && ui
+            .ctx()
+            .pointer_latest_pos()
+            .is_some_and(|at| drawn.response.rect.contains(at))
+    {
+        edits.hover_sampler = Some(instance.id);
+        // And say so. A drop target that looks
+        // exactly like everything else is a drop
+        // target nobody finds.
+        ui.painter().rect_stroke(
+            drawn.response.rect,
+            0.0,
+            egui::Stroke::new(stroke::BOLD, theme.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
+    if !made.is_empty() {
+        edits.edits.push((instance.id, made.clone()));
+    }
+    made
+}
+
 fn device_body(
     ui: &mut egui::Ui,
     theme: &Theme,
@@ -11468,6 +11748,9 @@ fn device_body(
     // the file changing.
     samplers: &HashMap<u64, SamplerFace>,
     slices: &HashMap<u64, Vec<u64>>,
+    // Each rack's name and macros, by instance id — the half of a rack
+    // its empty parameter table cannot supply.
+    racks: &std::collections::BTreeMap<u64, device::RackUi>,
 ) -> DeviceEdits {
     let mut edits = DeviceEdits::default();
     // The MOD strip is PINNED at the panel's right edge, outside the
@@ -11561,240 +11844,79 @@ fn device_body(
                         if chain.is_empty() {
                             daw::ui::kit::empty_state(ui, theme, DEVICE_EMPTY);
                         }
-                        for instance in chain {
-                            // The card speaks normalized knob positions and
-                            // the instance stores engine units, so the
-                            // position is derived here and thrown away: the
-                            // stored value is the one truth, and the edit
-                            // coming back out is already in engine units.
-                            // The card's own rect, so a file dropped on
-                            // THIS card lands on THIS device. Taken from a
-                            // scope rather than from the card, because a
-                            // card returns what the user changed and its
-                            // geometry is the rack's business.
-                            let drawn = ui.scope(|ui| match instance.state {
-                                DeviceState::Sampler(params) => {
-                                    let mut knobs = device::SamplerUi::from_engine(|id| {
-                                        params.get(id).unwrap_or_default()
-                                    });
-                                    let face = samplers.get(&instance.id);
-                                    let view = device::SamplerView {
-                                        name: face.map_or("", |f| f.name.as_str()),
-                                        wave: face.map_or(&[][..], |f| f.wave.as_slice()),
-                                        frames: face.map_or(0, |f| f.frames),
-                                        slices: slices
-                                            .get(&instance.id)
-                                            .map_or(&[][..], Vec::as_slice),
-                                        // The engine does not report read
-                                        // positions yet, so the plot draws
-                                        // no playheads. The field exists
-                                        // so adding the telemetry is a
-                                        // wiring change and not a shape
-                                        // change.
-                                        voices: &[],
-                                        truncated: face.is_some_and(|f| f.truncated),
-                                        original_rate: face.map_or(0, |f| f.original_rate),
-                                    };
-                                    let out = device::sampler_card(
+                        // TOP LEVEL ONLY: a device inside a rack is
+                        // drawn by its rack, not here. The chain stays
+                        // flat and the nesting is read off `parent`,
+                        // which is what made a rack affordable at all.
+                        for instance in chain.iter().filter(|d| d.parent.is_none()) {
+                            if !matches!(instance.state, DeviceState::Rack) {
+                                draw_device_card(
+                                    ui,
+                                    theme,
+                                    instance,
+                                    sample_rate,
+                                    histories,
+                                    samplers,
+                                    slices,
+                                    &mut edits,
+                                );
+                                continue;
+                            }
+                            let before = racks.get(&instance.id).cloned().unwrap_or_default();
+                            let mut rack = before.clone();
+                            let out = device::rack_card(ui, theme, &mut rack, |ui| {
+                                let mut touched = Vec::new();
+                                for child in chain.iter().filter(|d| d.parent == Some(instance.id))
+                                {
+                                    let made = draw_device_card(
                                         ui,
                                         theme,
-                                        &mut knobs,
-                                        instance.page,
-                                        instance.view_zoom,
-                                        instance.view_scroll,
-                                        &view,
+                                        child,
+                                        sample_rate,
+                                        histories,
+                                        samplers,
+                                        slices,
+                                        &mut edits,
                                     );
-                                    if out.page != instance.page {
-                                        edits.pages.push((instance.id, out.page));
-                                    }
-                                    // Where the display is looking rides
-                                    // the instance beside `page`, for the
-                                    // same reason: a card is rebuilt every
-                                    // frame and forgets everything.
-                                    if out.zoom != instance.view_zoom
-                                        || out.scroll != instance.view_scroll
-                                    {
-                                        edits.views.push((instance.id, out.zoom, out.scroll));
-                                    }
-                                    if let Some((index, frame)) = out.slice_moved {
-                                        edits.slice_moves.push((instance.id, index, frame));
-                                    }
-                                    if out.reslice {
-                                        edits.reslice.push(instance.id);
-                                    }
-                                    if out.expand {
-                                        edits.expand = Some(instance.id);
-                                    }
-                                    out.edits
-                                }
-                                DeviceState::SineSynth(params) => {
-                                    let mut knobs = synth_knobs(params);
-                                    device::sine_synth_card(ui, theme, &mut knobs)
-                                }
-                                DeviceState::Utility(params) => {
-                                    let mut knobs = utility_knobs(params);
-                                    device::utility_card(ui, theme, &mut knobs)
-                                }
-                                DeviceState::Limiter(params) => {
-                                    let mut knobs =
-                                        device::LimiterUi::from_engine(|id| params.get(id));
-                                    device::limiter_card(ui, theme, &mut knobs)
-                                }
-                                DeviceState::Filter(params) => {
-                                    let mut knobs =
-                                        device::FilterUi::from_engine(|id| params.get(id));
-                                    device::filter_card(ui, theme, &mut knobs, sample_rate)
-                                }
-                                DeviceState::Modulato(params) => {
-                                    let mut knobs =
-                                        device::modulato::ModulatoUi::from_engine(|id| {
-                                            params.get(id)
+                                    // The same edits the engine is about
+                                    // to be sent, read a second time —
+                                    // which is the whole trick behind
+                                    // mapping a macro to the last thing
+                                    // touched.
+                                    for edit in made {
+                                        touched.push(device::Touched {
+                                            device: child.id,
+                                            param: edit.param,
+                                            label: param_label(child.kind(), edit.param),
                                         });
-                                    device::modulato::modulato_card(ui, theme, &mut knobs)
-                                }
-                                DeviceState::Acid(params) => {
-                                    let mut knobs = acid_knobs(params);
-                                    device::acid_card(ui, theme, &mut knobs)
-                                }
-                                DeviceState::Kick(params) => {
-                                    // The app is the layer that knows
-                                    // both sides, so the conversion
-                                    // happens here rather than inside a
-                                    // widget that must not see the
-                                    // engine.
-                                    let mut knobs =
-                                        device::kick::KickUi::from_engine(|id| params.get(id));
-                                    device::kick::kick_card(ui, theme, &mut knobs)
-                                }
-                                DeviceState::Snare(params) => {
-                                    let mut knobs =
-                                        device::SnareUi::from_engine(|id| params.get(id));
-                                    device::snare_card(ui, theme, &mut knobs)
-                                }
-                                DeviceState::Tom(params) => {
-                                    let mut knobs = device::TomUi::from_engine(|id| params.get(id));
-                                    device::tom_card(ui, theme, &mut knobs)
-                                }
-                                DeviceState::Hat(params) => {
-                                    let mut knobs = device::HatUi::from_engine(|id| params.get(id));
-                                    device::hat_card(ui, theme, &mut knobs)
-                                }
-                                DeviceState::Handclap(params) => {
-                                    let mut knobs =
-                                        device::HandclapUi::from_engine(|id| params.get(id));
-                                    device::handclap_card(ui, theme, &mut knobs)
-                                }
-                                DeviceState::Poly(params) => {
-                                    let mut knobs = poly_knobs(params, instance.page);
-                                    let made = device::poly_card(ui, theme, &mut knobs);
-                                    // The tab dots are part of the card, so
-                                    // the page it came back on is what the
-                                    // instance should remember.
-                                    let page = knobs.page.min(u8::MAX as usize) as u8;
-                                    if page != instance.page {
-                                        edits.pages.push((instance.id, page));
                                     }
-                                    made
                                 }
-                                DeviceState::Sat(params) => {
-                                    let mut knobs = sat_knobs(params);
-                                    device::sat_card(ui, theme, &mut knobs)
-                                }
-                                DeviceState::Lofi(params) => {
-                                    let mut knobs = lofi_knobs(params);
-                                    device::lofi_card(ui, theme, &mut knobs)
-                                }
-                                DeviceState::Sheen(params) => {
-                                    let mut knobs = sheen_knobs(params);
-                                    device::sheen_card(ui, theme, &mut knobs)
-                                }
-                                DeviceState::Disperser(params) => {
-                                    let mut knobs = disperser_knobs(params);
-                                    device::disperser_card(ui, theme, &mut knobs)
-                                }
-                                DeviceState::Tilt(params) => {
-                                    let mut knobs = tilt_knobs(params);
-                                    device::tilt_card(ui, theme, &mut knobs)
-                                }
-                                DeviceState::Phaser(params) => {
-                                    let mut knobs = phaser_knobs(params);
-                                    device::phaser_card(ui, theme, &mut knobs)
-                                }
-                                DeviceState::Echo(params) => {
-                                    let mut knobs = echo_knobs(params);
-                                    device::echo_card(ui, theme, &mut knobs)
-                                }
-                                DeviceState::Reverb(params) => {
-                                    let mut knobs = reverb_knobs(params);
-                                    device::reverb_card(ui, theme, &mut knobs)
-                                }
-                                DeviceState::Gate(params) => {
-                                    let mut knobs = gate_knobs(params);
-                                    device::gate_card(ui, theme, &mut knobs)
-                                }
-                                DeviceState::Strip(params) => {
-                                    let mut knobs = strip_knobs(params);
-                                    device::strip_card(ui, theme, &mut knobs)
-                                }
-                                DeviceState::Resyn(params) => {
-                                    let mut knobs = resyn_knobs(params, instance.page);
-                                    let made = device::resyn_card(ui, theme, &mut knobs);
-                                    // The picked band is UI state the card
-                                    // forgets every frame, so the instance
-                                    // remembers it — the eq's road, and the
-                                    // device-UI contract's rule 3.
-                                    let band = knobs.selected.min(u8::MAX as usize) as u8;
-                                    if band != instance.page {
-                                        edits.pages.push((instance.id, band));
-                                    }
-                                    made
-                                }
-                                DeviceState::Glue(params) => {
-                                    let mut knobs = glue_knobs(params);
-                                    let history =
-                                        histories.get(&instance.id).cloned().unwrap_or_default();
-                                    device::glue_card(ui, theme, &mut knobs, &history)
-                                }
-                                DeviceState::Eq(params) => {
-                                    let mut knobs = eq_knobs(params, instance.page);
-                                    let made = device::eq_card(ui, theme, &mut knobs, sample_rate);
-                                    // Clicking a handle picks the band the
-                                    // cell row edits, so the band it came
-                                    // back on is what the instance should
-                                    // remember — the same road the poly
-                                    // synth's tab takes, and for the same
-                                    // reason: the card itself is a
-                                    // temporary and forgets everything.
-                                    let band = knobs.selected.min(u8::MAX as usize) as u8;
-                                    if band != instance.page {
-                                        edits.pages.push((instance.id, band));
-                                    }
-                                    made
-                                }
+                                touched
                             });
-                            let made = drawn.inner;
-                            // Is a browser drag hovering THIS sampler? Only
-                            // NOTED, never taken — see `hover_sampler`.
-                            if instance.kind() == DeviceKind::Sampler
-                                && egui::DragAndDrop::has_payload_of_type::<SampleDrag>(ui.ctx())
-                                && ui
-                                    .ctx()
-                                    .pointer_latest_pos()
-                                    .is_some_and(|at| drawn.response.rect.contains(at))
-                            {
-                                edits.hover_sampler = Some(instance.id);
-                                // And say so. A drop target that looks
-                                // exactly like everything else is a drop
-                                // target nobody finds.
-                                ui.painter().rect_stroke(
-                                    drawn.response.rect,
-                                    0.0,
-                                    egui::Stroke::new(stroke::BOLD, theme.accent),
-                                    egui::StrokeKind::Inside,
-                                );
+                            // A macro turn becomes an ordinary parameter
+                            // edit on the device it points at. No second
+                            // mechanism: a macro is a remote control, not
+                            // a new kind of value.
+                            for moved in out.moves {
+                                let Some(target) =
+                                    chain.iter().find(|d| d.id == moved.target.device)
+                                else {
+                                    continue;
+                                };
+                                edits.macro_moves.push((
+                                    moved.target.device,
+                                    device::ParamEdit {
+                                        param: moved.target.param,
+                                        value: device_value(
+                                            target.kind(),
+                                            moved.target.param,
+                                            moved.norm,
+                                        ),
+                                    },
+                                ));
                             }
-                            if !made.is_empty() {
-                                edits.edits.push((instance.id, made));
+                            if rack != before {
+                                edits.racks.push((instance.id, rack));
                             }
                         }
                     });
@@ -11974,6 +12096,7 @@ fn plockable_params(track: &Track) -> Vec<piano_roll::PlockParam> {
         | DeviceKind::Sat
         | DeviceKind::Lofi
         | DeviceKind::Sheen
+        | DeviceKind::Rack
         | DeviceKind::Disperser
         | DeviceKind::Tilt
         | DeviceKind::Phaser
@@ -12235,6 +12358,11 @@ fn compile_chain(
                 devices.insert(instance.id, eq);
                 tail = eq;
             }
+            // A RACK IS NOT A NODE. Its children sit beside it in this
+            // same flat chain, in the order they run, so building it is
+            // building nothing — the container is an idea the UI has
+            // about the chain, and the audio path never learns of it.
+            DeviceState::Rack => {}
             DeviceState::Resyn(params) => {
                 let node = spec.push(NodeSpec::Resyn { params });
                 spec.connect(tail, node);
@@ -12390,6 +12518,9 @@ fn build_graph_spec(
                     | DeviceState::Disperser(_)
                     | DeviceState::Tilt(_)
                     | DeviceState::Phaser(_)
+                    // A rack at the head is not an instrument either: it
+                    // is a container, and what it contains is beside it.
+                    | DeviceState::Rack
                     | DeviceState::Gate(_)
                     | DeviceState::Strip(_)
                     | DeviceState::Resyn(_)
@@ -13531,6 +13662,10 @@ impl App {
             PaletteCommand::new("project.export", "project", "export audio…"),
             PaletteCommand::new("project.splash", "project", "welcome screen"),
             PaletteCommand::new("app.preferences", "app", "audio preferences…"),
+            PaletteCommand::new("device.group", "device", "group devices into a rack")
+                .hint("ctrl+G"),
+            PaletteCommand::new("device.ungroup", "device", "ungroup the rack")
+                .hint("ctrl+shift+G"),
             // --- modulation --------------------------------------------
             PaletteCommand::new("mod.matrix", "mod", "modulation matrix"),
             PaletteCommand::new("mod.lfo", "mod", "add LFO"),
@@ -13847,6 +13982,8 @@ impl App {
             "project.new" => actions.push(UiAction::NewProject),
             "project.export" => self.open_export_window(),
             "app.preferences" => self.open_preferences(),
+            "device.group" => self.group_devices(),
+            "device.ungroup" => self.ungroup_devices(),
             "project.splash" => {
                 self.splash.status = None;
                 self.splash.open = true;
@@ -14131,6 +14268,7 @@ impl App {
             }
             let instance = DeviceInstance {
                 id: self.arrangement.mint_id(),
+                parent: None,
                 state: DeviceState::new(item.load),
                 bypass: false,
                 page: 0,
@@ -14159,6 +14297,7 @@ impl App {
         // next swap — which the shape change forces immediately.
         let instance = DeviceInstance {
             id: self.arrangement.mint_id(),
+            parent: None,
             state: DeviceState::new(item.load),
             bypass: false,
             page: 0,
@@ -14553,6 +14692,54 @@ impl App {
                 // leave you where you can fix it.
                 Err(error) => self.splash.status = Some(error),
             }
+        }
+    }
+
+    /// Ableton's Ctrl+G: wrap the selected track's devices in a rack.
+    ///
+    /// The whole chain, because this app has no per-device selection yet
+    /// — a track's rack is what you are looking at when you press it. The
+    /// day devices can be selected, this takes a list instead and nothing
+    /// else about grouping changes.
+    fn group_devices(&mut self) {
+        let id = self.arrangement.mint_id();
+        let Some(track) = self.arrangement.selected else {
+            return;
+        };
+        let Some(lane) = self.arrangement.tracks.get_mut(track) else {
+            return;
+        };
+        let name = format!("{} rack", lane.name);
+        match lane.group_into_rack(id, &name) {
+            Some(_) => {
+                self.arrangement.force_recompile = true;
+                self.notice = Some("grouped".to_owned());
+            }
+            None => self.notice = Some("nothing to group".to_owned()),
+        }
+    }
+
+    /// Ctrl+Shift+G: take the track's rack apart, leaving its devices in
+    /// place and in order.
+    fn ungroup_devices(&mut self) {
+        let Some(track) = self.arrangement.selected else {
+            return;
+        };
+        let Some(lane) = self.arrangement.tracks.get_mut(track) else {
+            return;
+        };
+        let Some(rack) = lane
+            .chain
+            .iter()
+            .find(|d| matches!(d.state, DeviceState::Rack))
+            .map(|d| d.id)
+        else {
+            self.notice = Some("no rack to ungroup".to_owned());
+            return;
+        };
+        if lane.ungroup_rack(rack) {
+            self.arrangement.force_recompile = true;
+            self.notice = Some("ungrouped".to_owned());
         }
     }
 
@@ -18500,13 +18687,23 @@ impl eframe::App for App {
                     // a `ModWire` is addressed to a LANE, and inventing a
                     // lane number for the master would aim its wires at
                     // whatever track happened to hold that index.
-                    let (mod_targets, chain) = match device_owner {
-                        Some(ChainOwner::Master) => (Vec::new(), arrangement.master.chain.clone()),
-                        Some(ChainOwner::Track(i)) => arrangement.tracks.get(i).map_or_else(
-                            || (Vec::new(), Vec::new()),
-                            |track| (track_targets(track, registry), track.chain.clone()),
+                    let (mod_targets, chain, racks) = match device_owner {
+                        Some(ChainOwner::Master) => (
+                            Vec::new(),
+                            arrangement.master.chain.clone(),
+                            arrangement.master.racks.clone(),
                         ),
-                        None => (Vec::new(), Vec::new()),
+                        Some(ChainOwner::Track(i)) => arrangement.tracks.get(i).map_or_else(
+                            || (Vec::new(), Vec::new(), Default::default()),
+                            |track| {
+                                (
+                                    track_targets(track, registry),
+                                    track.chain.clone(),
+                                    track.racks.clone(),
+                                )
+                            },
+                        ),
+                        None => (Vec::new(), Vec::new(), Default::default()),
                     };
                     let mod_values = &self.mod_values;
                     let wire_outputs = &self.wire_outputs;
@@ -18552,6 +18749,7 @@ impl eframe::App for App {
                                 device_histories,
                                 sampler_faces,
                                 sampler_slices,
+                                &racks,
                             )
                         });
                     (out.response.rect, out.inner)
@@ -18898,6 +19096,29 @@ impl eframe::App for App {
             for (instance, made) in &edits.edits {
                 self.apply_device_edits(owner, *instance, made);
             }
+            // A macro turn is an ordinary edit on the device it points at
+            // — the rack already resolved it into engine units, because
+            // only the rack knew which device that was.
+            for (instance, made) in &edits.macro_moves {
+                self.apply_device_edits(owner, *instance, std::slice::from_ref(made));
+            }
+            // A rack's name and macro assignments, which are not
+            // parameters and have no wire id.
+            for (instance, rack) in &edits.racks {
+                match owner {
+                    ChainOwner::Master => {
+                        self.arrangement
+                            .master
+                            .racks
+                            .insert(*instance, rack.clone());
+                    }
+                    ChainOwner::Track(i) => {
+                        if let Some(track) = self.arrangement.tracks.get_mut(i) {
+                            track.racks.insert(*instance, rack.clone());
+                        }
+                    }
+                }
+            }
             for (instance, page) in &edits.pages {
                 if let Some(dev) = self.chain_device_mut(owner, *instance) {
                     dev.page = *page;
@@ -19101,7 +19322,7 @@ mod tests {
     use super::automation::{AutomationEnvelope, AutomationPoint};
     use super::bar::{TRANSPORT_BTN, TRANSPORT_PAD};
     use super::device_state::ReverbParams;
-    use super::device_state::{device_norm, device_value};
+    use super::device_state::device_norm;
     use super::devices::{DEVICES, DeviceSpec};
     use super::focus::{Dir, RING_SETTLED_PX, nearest, spring_step};
     use super::icon::{ICON, PAUSE_BAR, PAUSE_GAP};
@@ -19131,6 +19352,7 @@ mod tests {
         let id = arr.mint_id();
         arr.tracks[track].insert_device(DeviceInstance {
             id,
+            parent: None,
             state: DeviceState::new(kind),
             bypass: false,
             page: 0,
@@ -19172,6 +19394,7 @@ mod tests {
     fn fit(track: &mut Track, id: u64, kind: DeviceKind) -> u64 {
         track.insert_device(DeviceInstance {
             id,
+            parent: None,
             state: DeviceState::new(kind),
             bypass: false,
             page: 0,
@@ -26782,6 +27005,7 @@ mod tests {
         assert!(
             arr.master.insert_device(DeviceInstance {
                 id,
+                parent: None,
                 state: DeviceState::new(kind),
                 bypass: false,
                 page: 0,
@@ -27065,6 +27289,7 @@ mod tests {
         let mut master = MasterTrack::default();
         let instrument = DeviceInstance {
             id: 1,
+            parent: None,
             state: DeviceState::new(DeviceKind::Poly),
             bypass: false,
             page: 0,
@@ -27079,6 +27304,7 @@ mod tests {
         let mut doc = project_doc(&arr, &Transport::default());
         doc.master.chain.push(DeviceInstance {
             id: 9,
+            parent: None,
             state: DeviceState::new(DeviceKind::Poly),
             bypass: false,
             page: 0,
@@ -27781,6 +28007,7 @@ mod tests {
         let mut hostile = vec![
             DeviceInstance {
                 id: 1,
+                parent: None,
                 state: DeviceState::new(DeviceKind::Reverb),
                 bypass: false,
                 page: 0,
@@ -27789,6 +28016,7 @@ mod tests {
             },
             DeviceInstance {
                 id: 2,
+                parent: None,
                 state: DeviceState::new(DeviceKind::SineSynth),
                 bypass: false,
                 page: 0,
@@ -27797,6 +28025,7 @@ mod tests {
             },
             DeviceInstance {
                 id: 3,
+                parent: None,
                 state: DeviceState::new(DeviceKind::SineSynth),
                 bypass: false,
                 page: 0,

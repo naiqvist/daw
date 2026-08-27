@@ -37,6 +37,7 @@ pub enum DeviceKind {
     Strip,
     Resyn,
     Acid,
+    Rack,
     Echo,
     Eq,
     Filter,
@@ -1847,6 +1848,18 @@ pub static DEVICES: &[DeviceSpec] = &[
                 group: "Acid",
             },
         ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Rack,
+        name: "rack",
+        instrument: false,
+        prefix: "rack",
+        // EMPTY, and that is the device: a rack is a container with no
+        // sound and no settings of its own. Its macros are not parameters
+        // either — they point at other devices' parameters, and live on
+        // the track beside the chain.
+        params: &[],
+        labels: &[],
     },
 ];
 

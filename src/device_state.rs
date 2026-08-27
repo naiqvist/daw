@@ -264,6 +264,18 @@ pub enum DeviceState {
     Strip(daw::audio::strip::StripParams),
     Resyn(daw::audio::resyn::ResynParams),
     Acid(daw::audio::acid::AcidParams),
+    /// A RACK: a container, and nothing else.
+    ///
+    /// It has no parameters and makes no sound. Its children sit beside
+    /// it in the same flat chain, pointing at it through
+    /// `DeviceInstance::parent`, and the graph builder simply skips it —
+    /// so a rack costs the audio path exactly one match arm that does
+    /// nothing.
+    ///
+    /// Its macros are not here either: they carry a name and a list of
+    /// targets, neither of which is `Copy`, so they live on the track in
+    /// `Track::racks` the way a sampler's file does.
+    Rack,
     Limiter(daw::audio::limiter::LimiterParams),
     Modulato(daw::audio::modulato::ModulatoParams),
     Utility(daw::audio::utility::UtilityParams),
@@ -296,6 +308,7 @@ impl DeviceState {
             DeviceKind::Strip => Self::Strip(daw::audio::strip::StripParams::default()),
             DeviceKind::Resyn => Self::Resyn(daw::audio::resyn::ResynParams::default()),
             DeviceKind::Acid => Self::Acid(daw::audio::acid::AcidParams::default()),
+            DeviceKind::Rack => Self::Rack,
             DeviceKind::Limiter => Self::Limiter(daw::audio::limiter::LimiterParams::default()),
             DeviceKind::Modulato => Self::Modulato(daw::audio::modulato::ModulatoParams::default()),
             DeviceKind::Utility => Self::Utility(daw::audio::utility::UtilityParams::default()),
@@ -327,6 +340,7 @@ impl DeviceState {
             Self::Strip(_) => DeviceKind::Strip,
             Self::Resyn(_) => DeviceKind::Resyn,
             Self::Acid(_) => DeviceKind::Acid,
+            Self::Rack => DeviceKind::Rack,
             Self::Limiter(_) => DeviceKind::Limiter,
             Self::Modulato(_) => DeviceKind::Modulato,
             Self::Utility(_) => DeviceKind::Utility,
@@ -440,6 +454,8 @@ impl DeviceState {
             Self::Strip(p) => p.get(param),
             Self::Resyn(p) => p.get(param),
             Self::Acid(p) => p.get(param),
+            // A rack has no parameters, so every id is unknown to it.
+            Self::Rack => None,
             // Its own reader beside its own writer, in the struct that
             // owns them — spelling seven rows out again here is how the
             // two halves drift.
@@ -541,6 +557,7 @@ impl DeviceState {
             Self::Strip(p) => p.set(param, value),
             Self::Resyn(p) => p.set(param, value),
             Self::Acid(p) => p.set(param, value),
+            Self::Rack => {}
             Self::Limiter(p) => p.set(param, value),
             Self::Modulato(p) => p.set(param, value),
             Self::Utility(p) => p.set(param, value),
@@ -557,6 +574,20 @@ impl DeviceState {
 pub struct DeviceInstance {
     pub id: u64,
     pub state: DeviceState,
+    /// The RACK this device lives inside, if any.
+    ///
+    /// The chain stays a flat `Vec` and nesting is a pointer upward, not
+    /// a `Vec` downward. That is the whole reason a rack was affordable:
+    /// `DeviceInstance` and `DeviceState` are both `Copy`, and putting a
+    /// list of children inside either would have rippled through every
+    /// `match instance.state` in the app. An `Option<u64>` is `Copy`, and
+    /// the order a rack's devices run in is the order they already sit in
+    /// the chain.
+    ///
+    /// A rack's own instance carries `None` — racks do not nest yet, and
+    /// the day they do this field is already the shape for it.
+    #[serde(default)]
+    pub parent: Option<u64>,
     /// Which page of this device's card is open — the poly synth's tab,
     /// and the equaliser's SELECTED BAND, which is the same idea wearing
     /// a different hat: the one part of a card that is about where you
@@ -852,6 +883,9 @@ pub fn device_norm(kind: DeviceKind, param: u32, value: f32) -> f32 {
         DeviceKind::Strip => device::strip_norm(param, value),
         DeviceKind::Resyn => device::resyn_norm(param, value),
         DeviceKind::Acid => device::acid_norm(param, value),
+        // A rack has no parameters; nothing ever asks, and this is what
+        // it would be told if it did.
+        DeviceKind::Rack => 0.0,
         DeviceKind::Modulato => device::modulato::modulato_norm(param, value),
         DeviceKind::Utility => device::utility_norm(param, value),
     }
@@ -891,6 +925,9 @@ pub fn device_is_discrete(kind: DeviceKind, param: u32) -> bool {
         DeviceKind::Strip => device::strip_is_discrete(param),
         DeviceKind::Resyn => device::resyn_is_discrete(param),
         DeviceKind::Acid => device::acid_is_discrete(param),
+        // A rack has no parameters; nothing ever asks, and this is what
+        // it would be told if it did.
+        DeviceKind::Rack => false,
         DeviceKind::Modulato => device::modulato::modulato_is_discrete(param),
         DeviceKind::Utility => device::utility_is_discrete(param),
         DeviceKind::SineSynth | DeviceKind::Reverb => false,
@@ -925,6 +962,9 @@ pub fn device_is_log(kind: DeviceKind, param: u32) -> bool {
         DeviceKind::Strip => device::strip_is_log(param),
         DeviceKind::Resyn => device::resyn_is_log(param),
         DeviceKind::Acid => device::acid_is_log(param),
+        // A rack has no parameters; nothing ever asks, and this is what
+        // it would be told if it did.
+        DeviceKind::Rack => false,
         DeviceKind::Modulato => device::modulato::modulato_is_log(param),
         DeviceKind::Utility => device::utility_is_log(param),
         DeviceKind::Reverb => false,
@@ -932,10 +972,12 @@ pub fn device_is_log(kind: DeviceKind, param: u32) -> bool {
 }
 
 /// The engine value at a knob position — the inverse of [`device_norm`],
-/// and the direction a card applies on the way out. The app never calls it
-/// (a card emits engine units itself), but the round trip is only a round
-/// trip if both halves are reachable.
-#[cfg(test)]
+/// and the direction a card applies on the way out.
+///
+/// It was `#[cfg(test)]` until racks arrived, because a card emits engine
+/// units itself and nothing in the app needed the other direction. A
+/// MACRO does: it is a position pointed at somebody else's parameter, and
+/// turning it means asking that device what its own units call this much.
 pub fn device_value(kind: DeviceKind, param: u32, norm: f32) -> f32 {
     match kind {
         DeviceKind::SineSynth => device::sine_synth_value(param, norm),
@@ -962,6 +1004,9 @@ pub fn device_value(kind: DeviceKind, param: u32, norm: f32) -> f32 {
         DeviceKind::Strip => device::strip_value(param, norm),
         DeviceKind::Resyn => device::resyn_value(param, norm),
         DeviceKind::Acid => device::acid_value(param, norm),
+        // A rack has no parameters; nothing ever asks, and this is what
+        // it would be told if it did.
+        DeviceKind::Rack => 0.0,
         DeviceKind::Modulato => device::modulato::modulato_value(param, norm),
         DeviceKind::Utility => device::utility_value(param, norm),
     }
