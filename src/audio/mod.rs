@@ -124,9 +124,99 @@ fn flush_denormals_to_zero() {
     }
 }
 
+/// Which backend the engine talks to.
+///
+/// Our own enum rather than `rtaudio::Api` so the app can offer a choice,
+/// persist it and print it without any layer above this one naming the
+/// backend crate. `AGENTS.md` says JACK is the one that matters here; the
+/// other two exist because a machine without a JACK server should still
+/// be able to make a sound rather than refuse to start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum AudioApi {
+    #[default]
+    Jack,
+    Alsa,
+    Pulse,
+}
+
+impl AudioApi {
+    pub const ALL: [Self; 3] = [Self::Jack, Self::Alsa, Self::Pulse];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Jack => "JACK",
+            Self::Alsa => "ALSA",
+            Self::Pulse => "PulseAudio",
+        }
+    }
+
+    fn to_rt(self) -> Api {
+        match self {
+            Self::Jack => Api::UnixJack,
+            Self::Alsa => Api::LinuxALSA,
+            Self::Pulse => Api::LinuxPulse,
+        }
+    }
+
+    /// Whether rtaudio was actually built with this backend. A build
+    /// missing one succeeds silently, which is the failure `AGENTS.md`
+    /// warns about, so the UI asks rather than assumes.
+    pub fn compiled(self) -> bool {
+        rtaudio::compiled_apis().contains(&self.to_rt())
+    }
+}
+
+/// One device the app may be pointed at.
+///
+/// A flattened copy of rtaudio's own, for the same reason [`AudioApi`] is
+/// ours: nothing above this module should have to name the backend crate
+/// to draw a device list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AudioDevice {
+    /// The device's name, which is also how a CHOICE is remembered.
+    ///
+    /// rtaudio's `DeviceID` carries a session id as well, and its own doc
+    /// says that half does not survive a reboot. The name does, so the
+    /// name is what a preference stores and what `Engine::start` resolves
+    /// against — falling back to the default if the device has gone.
+    pub name: String,
+    pub output_channels: u32,
+    pub input_channels: u32,
+    pub is_default_output: bool,
+    pub preferred_sample_rate: u32,
+    pub sample_rates: Vec<u32>,
+}
+
+/// Green zone: every output device this backend can see.
+///
+/// Empty when the backend is not compiled in or the host will not open —
+/// which is a real answer for the UI to draw, not an error to propagate.
+pub fn output_devices(api: AudioApi) -> Vec<AudioDevice> {
+    if !api.compiled() {
+        return Vec::new();
+    }
+    let Ok(host) = rtaudio::Host::new(api.to_rt()) else {
+        return Vec::new();
+    };
+    host.iter_output_devices()
+        .map(|d| AudioDevice {
+            name: d.id.name.clone(),
+            output_channels: d.output_channels,
+            input_channels: d.input_channels,
+            is_default_output: d.is_default_output,
+            preferred_sample_rate: d.preferred_sample_rate,
+            sample_rates: d.sample_rates.clone(),
+        })
+        .collect()
+}
+
 /// What the engine was asked to open with.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EngineConfig {
+    pub api: AudioApi,
+    /// The output device by NAME, or `None` for the backend's default.
+    /// See [`AudioDevice::name`] for why a name and not an id.
+    pub output_device: Option<String>,
     pub sample_rate: u32,
     pub buffer_frames: u32,
     pub channels: u32,
@@ -135,6 +225,8 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
+            api: AudioApi::Jack,
+            output_device: None,
             sample_rate: 48_000,
             buffer_frames: 256,
             channels: 2,
@@ -144,11 +236,12 @@ impl Default for EngineConfig {
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
-    /// rtaudio was built without the JACK backend — see AGENTS.md. A build
-    /// missing it succeeds silently and runs through the ALSA/Pulse compat
-    /// layer instead.
-    #[error("rtaudio was compiled without the JACK backend (need features = [\"jack_linux\"])")]
-    NoJackBackend,
+    /// rtaudio was built without the backend that was asked for — see
+    /// AGENTS.md. A build missing JACK succeeds silently and runs through
+    /// the ALSA/Pulse compat layer instead, which is why this is an error
+    /// and not a fallback.
+    #[error("rtaudio was compiled without the {0} backend")]
+    BackendMissing(&'static str),
 
     #[error("could not open JACK host: {0}")]
     Host(String),
@@ -329,16 +422,26 @@ impl Engine {
     /// JACK is requested explicitly: `Api::Unspecified` resolves to ALSA on this
     /// machine even when JACK is compiled in.
     pub fn start(cfg: EngineConfig) -> Result<Self, EngineError> {
-        if !rtaudio::compiled_apis().contains(&Api::UnixJack) {
-            return Err(EngineError::NoJackBackend);
+        if !cfg.api.compiled() {
+            return Err(EngineError::BackendMissing(cfg.api.label()));
         }
 
         let mut host =
-            rtaudio::Host::new(Api::UnixJack).map_err(|e| EngineError::Host(e.to_string()))?;
+            rtaudio::Host::new(cfg.api.to_rt()).map_err(|e| EngineError::Host(e.to_string()))?;
         host.show_warnings(false);
 
+        // The chosen device, resolved by NAME. A device that has been
+        // unplugged since the preference was written falls back to the
+        // default rather than refusing to start — a missing interface
+        // should cost you your choice, not your session.
+        let chosen = cfg.output_device.as_ref().and_then(|want| {
+            host.iter_output_devices()
+                .find(|d| d.id.name == *want)
+                .map(|d| d.id.clone())
+        });
         let device = |ch| {
             Some(DeviceParams {
+                device_id: chosen.clone(),
                 num_channels: Some(ch),
                 ..Default::default()
             })
@@ -720,5 +823,35 @@ impl Engine {
     /// these carry whole state, so the next one supersedes this one.
     pub fn set_modulation(&mut self, edit: modulation::ModEdit) {
         let _ = self.mod_tx.push(edit);
+    }
+}
+
+#[cfg(test)]
+mod device_tests {
+    use super::*;
+
+    /// A DIAGNOSTIC, not a check: it prints what this machine can see, so
+    /// "the device picker is empty" can be answered without a GUI.
+    ///
+    /// `#[ignore]` because it talks to real hardware — the answer depends
+    /// on what is plugged in and whether a JACK server is up, which is
+    /// not something a test suite should have an opinion about. Run it
+    /// with `cargo test -- --ignored --nocapture list_the_output_devices`.
+    #[test]
+    #[ignore]
+    fn list_the_output_devices() {
+        for api in AudioApi::ALL {
+            println!("{} compiled: {}", api.label(), api.compiled());
+            for d in output_devices(api) {
+                println!(
+                    "  {:<40} out {:>2}  in {:>2}  default {}  rates {:?}",
+                    d.name,
+                    d.output_channels,
+                    d.input_channels,
+                    d.is_default_output,
+                    d.sample_rates
+                );
+            }
+        }
     }
 }

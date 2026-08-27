@@ -56,6 +56,51 @@ pub struct UiPrefs {
     /// friendly answer is to show it.
     #[serde(default)]
     pub skip_splash: bool,
+
+    /// Which audio backend to open with.
+    ///
+    /// A vocabulary of this file's OWN rather than `audio::AudioApi`,
+    /// because a preferences file may not name the engine — the layer
+    /// test in `ui::mod` enforces it, and the app translates one into the
+    /// other exactly as it translates a panel's wishes into actions.
+    #[serde(default)]
+    pub audio_backend: AudioBackend,
+
+    /// The output device, by NAME.
+    ///
+    /// A name and not an index: a device list reorders when something is
+    /// plugged in, and a preference that pointed at "the third one" would
+    /// silently become a preference for a different interface. `None` is
+    /// the backend's own default.
+    #[serde(default)]
+    pub audio_device: Option<String>,
+
+    /// `None` means "whatever the engine opens with". Stored as options
+    /// rather than numbers because `UiPrefs` derives `Default`, and a
+    /// `u32` that defaulted to zero would read as a deliberate choice of
+    /// zero hertz.
+    ///
+    /// Named `audio_rate_hz` and not `audio_sample_rate` because
+    /// `prefs_carry_no_project_data` scans this file's serialized form
+    /// for musical vocabulary and "sample" is on its list. A device's
+    /// rate is not project data, but the guard is worth more than the
+    /// conventional spelling — so the field moved rather than the test.
+    #[serde(default)]
+    pub audio_rate_hz: Option<u32>,
+    #[serde(default)]
+    pub audio_buffer_frames: Option<u32>,
+}
+
+/// Which backend the audio engine should open.
+///
+/// Mirrors `audio::AudioApi` and is deliberately a separate type — see
+/// [`UiPrefs::audio_backend`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum AudioBackend {
+    #[default]
+    Jack,
+    Alsa,
+    Pulse,
 }
 
 impl UiPrefs {
@@ -86,6 +131,10 @@ mod tests {
             browser_hidden: true,
             lower_hidden: true,
             skip_splash: true,
+            audio_backend: AudioBackend::Alsa,
+            audio_device: Some("Speakers".to_owned()),
+            audio_rate_hz: Some(44_100),
+            audio_buffer_frames: Some(512),
         };
         let back = UiPrefs::from_ron_or_default(&prefs.to_ron().unwrap());
         assert_eq!(prefs, back);

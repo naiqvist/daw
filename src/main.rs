@@ -12979,6 +12979,7 @@ struct App {
     /// The project window: save, load, new, and the recent files.
     project: ProjectWindow,
     splash: Splash,
+    preferences: Preferences,
     export: ExportWindow,
     /// The render in flight, if any. One at a time: two exports would
     /// fight over nothing except the user's attention, and the second
@@ -13137,6 +13138,24 @@ struct ProjectWindow {
     /// The path field takes the keyboard once per opening, so the modal
     /// arrives ready to type into — and never steals focus again after.
     focused: bool,
+}
+
+/// The audio preferences window's state.
+///
+/// STAGED, not live: the pickers write here and nothing reaches the
+/// engine until Apply. Opening a stream is not something to do on every
+/// frame a combo box is hovered, and a half-chosen configuration —
+/// a device picked before its rate — would be a stream that fails to
+/// open for a reason the user did not cause.
+#[derive(Default)]
+struct Preferences {
+    open: bool,
+    backend: daw::ui::prefs::AudioBackend,
+    device: Option<String>,
+    rate_hz: Option<u32>,
+    buffer_frames: Option<u32>,
+    /// What went wrong the last time Apply was pressed, if anything.
+    status: Option<String>,
 }
 
 /// The welcome screen's state.
@@ -13383,6 +13402,7 @@ impl App {
                 open: show_splash,
                 ..Splash::default()
             },
+            preferences: Preferences::default(),
             export: ExportWindow::default(),
             export_job: None,
             project_path: None,
@@ -13510,6 +13530,7 @@ impl App {
             PaletteCommand::new("project.new", "project", "new project"),
             PaletteCommand::new("project.export", "project", "export audio…"),
             PaletteCommand::new("project.splash", "project", "welcome screen"),
+            PaletteCommand::new("app.preferences", "app", "audio preferences…"),
             // --- modulation --------------------------------------------
             PaletteCommand::new("mod.matrix", "mod", "modulation matrix"),
             PaletteCommand::new("mod.lfo", "mod", "add LFO"),
@@ -13825,6 +13846,7 @@ impl App {
             "project.open" => actions.push(UiAction::OpenProjectWindow),
             "project.new" => actions.push(UiAction::NewProject),
             "project.export" => self.open_export_window(),
+            "app.preferences" => self.open_preferences(),
             "project.splash" => {
                 self.splash.status = None;
                 self.splash.open = true;
@@ -14531,6 +14553,245 @@ impl App {
                 // leave you where you can fix it.
                 Err(error) => self.splash.status = Some(error),
             }
+        }
+    }
+
+    /// Open the audio preferences, staged from what is in force now.
+    fn open_preferences(&mut self) {
+        self.preferences = Preferences {
+            open: true,
+            backend: self.prefs.audio_backend,
+            device: self.prefs.audio_device.clone(),
+            rate_hz: self.prefs.audio_rate_hz,
+            buffer_frames: self.prefs.audio_buffer_frames,
+            status: None,
+        };
+    }
+
+    /// The audio preferences: which backend, which device, how fast, and
+    /// how big a block.
+    ///
+    /// The window this app most needed. Until it existed the engine
+    /// opened `EngineConfig::default()` — JACK, 48 kHz, 256 frames — with
+    /// no way to change any of it, so an interface that was busy or was
+    /// not the default left the app silent AND offered no way to fix it.
+    /// That is the difference between a tool and a demo.
+    ///
+    /// Every choice is STAGED and applied together, for the reason
+    /// [`Preferences`] gives. Applying restarts the stream, which is the
+    /// only way a device change can take effect.
+    fn draw_preferences(&mut self, ctx: &egui::Context) {
+        if !self.preferences.open {
+            return;
+        }
+        use daw::ui::prefs::AudioBackend;
+        let backends = [
+            (AudioBackend::Jack, daw::audio::AudioApi::Jack),
+            (AudioBackend::Alsa, daw::audio::AudioApi::Alsa),
+            (AudioBackend::Pulse, daw::audio::AudioApi::Pulse),
+        ];
+        let api = match self.preferences.backend {
+            AudioBackend::Jack => daw::audio::AudioApi::Jack,
+            AudioBackend::Alsa => daw::audio::AudioApi::Alsa,
+            AudioBackend::Pulse => daw::audio::AudioApi::Pulse,
+        };
+        // Enumerated per frame. A device list is a dozen strings and the
+        // window is open for seconds, so the cost is nothing against the
+        // alternative — a cached list that does not notice an interface
+        // being plugged in while the user is looking at it.
+        let devices = daw::audio::output_devices(api);
+        let mut apply = false;
+
+        let modal = egui::Modal::new(egui::Id::new("preferences")).show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.heading("audio");
+            ui.add_space(8.0);
+
+            egui::Grid::new("prefs.audio")
+                .num_columns(2)
+                .spacing([12.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label("backend");
+                    egui::ComboBox::from_id_salt("prefs.backend")
+                        .selected_text(api.label())
+                        .show_ui(ui, |ui| {
+                            for (pref, which) in backends {
+                                // A backend rtaudio was not built with is
+                                // shown and disabled rather than hidden:
+                                // "JACK is missing from this build" is the
+                                // answer to a question somebody is about
+                                // to ask, and AGENTS.md says a silently
+                                // absent JACK is the failure to watch for.
+                                let label = if which.compiled() {
+                                    which.label().to_owned()
+                                } else {
+                                    format!("{} — not in this build", which.label())
+                                };
+                                ui.add_enabled_ui(which.compiled(), |ui| {
+                                    ui.selectable_value(&mut self.preferences.backend, pref, label);
+                                });
+                            }
+                        });
+                    ui.end_row();
+
+                    ui.label("output");
+                    let shown = self
+                        .preferences
+                        .device
+                        .clone()
+                        .unwrap_or_else(|| "system default".to_owned());
+                    egui::ComboBox::from_id_salt("prefs.device")
+                        .selected_text(shown)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.preferences.device,
+                                None,
+                                "system default",
+                            );
+                            for device in &devices {
+                                ui.selectable_value(
+                                    &mut self.preferences.device,
+                                    Some(device.name.clone()),
+                                    &device.name,
+                                );
+                            }
+                        });
+                    ui.end_row();
+
+                    ui.label("sample rate");
+                    // The rates this DEVICE says it supports, not a list
+                    // of round numbers: offering 96 kHz on an interface
+                    // that cannot do it is offering a failure.
+                    let rates: Vec<u32> = self
+                        .preferences
+                        .device
+                        .as_ref()
+                        .and_then(|want| devices.iter().find(|d| d.name == *want))
+                        .or_else(|| devices.iter().find(|d| d.is_default_output))
+                        .map(|d| d.sample_rates.clone())
+                        .unwrap_or_else(|| vec![44_100, 48_000, 88_200, 96_000]);
+                    let shown = self
+                        .preferences
+                        .rate_hz
+                        .map(|hz| format!("{hz} Hz"))
+                        .unwrap_or_else(|| "device default".to_owned());
+                    egui::ComboBox::from_id_salt("prefs.rate")
+                        .selected_text(shown)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.preferences.rate_hz,
+                                None,
+                                "device default",
+                            );
+                            for hz in rates {
+                                ui.selectable_value(
+                                    &mut self.preferences.rate_hz,
+                                    Some(hz),
+                                    format!("{hz} Hz"),
+                                );
+                            }
+                        });
+                    ui.end_row();
+
+                    ui.label("buffer");
+                    let shown = self
+                        .preferences
+                        .buffer_frames
+                        .map(|n| format!("{n} frames"))
+                        .unwrap_or_else(|| "engine default".to_owned());
+                    egui::ComboBox::from_id_salt("prefs.buffer")
+                        .selected_text(shown)
+                        .show_ui(ui, |ui| {
+                            for n in [64u32, 128, 256, 512, 1024, 2048] {
+                                // The round-trip this block size costs, at
+                                // the rate that is actually selected —
+                                // which is the number anybody choosing a
+                                // buffer size is really choosing.
+                                let hz = self.preferences.rate_hz.unwrap_or(48_000).max(1);
+                                let ms = n as f32 * 1000.0 / hz as f32;
+                                ui.selectable_value(
+                                    &mut self.preferences.buffer_frames,
+                                    Some(n),
+                                    format!("{n} frames · {ms:.1} ms"),
+                                );
+                            }
+                        });
+                    ui.end_row();
+                });
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(6.0);
+
+            // What is ACTUALLY running, which is not always what was
+            // asked for: a backend negotiates, and the difference between
+            // the request and the result is exactly what a preferences
+            // window is for showing.
+            match self.engine.as_ref().map(|e| e.info()) {
+                Some(info) => {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "running · {} Hz · {} frames in, {} out",
+                            info.sample_rate, info.in_channels, info.out_channels
+                        ))
+                        .weak(),
+                    );
+                    // The backend does not always know. Saying so is
+                    // better than printing a zero somebody would then
+                    // believe — a latency readout is only worth having if
+                    // it is trustworthy.
+                    let text = match info.latency_frames {
+                        Some(frames) => {
+                            let ms = frames as f32 * 1000.0 / (info.sample_rate as f32).max(1.0);
+                            format!("stream latency · {frames} frames · {ms:.1} ms")
+                        }
+                        None => "stream latency · not reported by this backend".to_owned(),
+                    };
+                    ui.label(egui::RichText::new(text).weak());
+                }
+                None => {
+                    ui.label(egui::RichText::new("the engine is not running").weak());
+                }
+            }
+            if let Some(status) = &self.preferences.status {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(status).weak());
+            }
+
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button("apply and restart").clicked() {
+                    apply = true;
+                }
+                if ui.button("close").clicked() {
+                    self.preferences.open = false;
+                }
+            });
+        });
+
+        if modal.should_close() {
+            self.preferences.open = false;
+        }
+        if apply {
+            self.prefs.audio_backend = self.preferences.backend;
+            self.prefs.audio_device = self.preferences.device.clone();
+            self.prefs.audio_rate_hz = self.preferences.rate_hz;
+            self.prefs.audio_buffer_frames = self.preferences.buffer_frames;
+            // A device change only takes effect on a new stream, so the
+            // old one goes first. `start_engine` re-pushes the graph.
+            self.stop_engine();
+            self.start_engine();
+            self.preferences.status = Some(match self.engine {
+                Some(_) => "started".to_owned(),
+                // The failure stays ON SCREEN rather than in the corner
+                // notice: the window that caused it is the window you fix
+                // it in, and closing it to read why would be the fault
+                // this whole feature exists to remove.
+                None => self
+                    .notice
+                    .clone()
+                    .unwrap_or_else(|| "the stream would not open".to_owned()),
+            });
         }
     }
 
@@ -16574,11 +16835,37 @@ impl App {
         hasher.finish()
     }
 
+    /// The stream to open, from the machine-local preferences.
+    ///
+    /// The one place `ui::prefs`' vocabulary becomes the engine's. Prefs
+    /// may not name `crate::audio` — `ui::mod`'s layer test enforces it —
+    /// so the translation lives here, in the app, exactly as a panel's
+    /// wishes are translated here rather than performed by the panel.
+    ///
+    /// Every field falls back to the engine's own default, so a
+    /// preferences file that predates this window opens what it always
+    /// opened.
+    fn engine_config(&self) -> EngineConfig {
+        use daw::ui::prefs::AudioBackend;
+        let base = EngineConfig::default();
+        EngineConfig {
+            api: match self.prefs.audio_backend {
+                AudioBackend::Jack => daw::audio::AudioApi::Jack,
+                AudioBackend::Alsa => daw::audio::AudioApi::Alsa,
+                AudioBackend::Pulse => daw::audio::AudioApi::Pulse,
+            },
+            output_device: self.prefs.audio_device.clone(),
+            sample_rate: self.prefs.audio_rate_hz.unwrap_or(base.sample_rate),
+            buffer_frames: self.prefs.audio_buffer_frames.unwrap_or(base.buffer_frames),
+            channels: base.channels,
+        }
+    }
+
     fn start_engine(&mut self) {
         if self.engine.is_some() {
             return;
         }
-        match Engine::start(EngineConfig::default()) {
+        match Engine::start(self.engine_config()) {
             Ok(mut engine) => {
                 engine.transport(TransportCmd::SetTempo(self.transport.bpm));
                 self.engine = Some(engine);
@@ -17996,6 +18283,7 @@ impl eframe::App for App {
             self.automation_editor = false;
         }
         self.draw_splash(ui.ctx());
+        self.draw_preferences(ui.ctx());
         self.draw_project_window(ui.ctx());
         // A finished render before its window draws, so the modal that
         // shows the progress bar is the one that shows the result.
