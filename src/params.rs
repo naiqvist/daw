@@ -3735,6 +3735,98 @@ pub mod sampler {
     ];
 }
 
+/// The lo-fi converter — an early sampler's front end, as a device.
+///
+/// Two knobs of real character and two of housekeeping. `RATE` is the
+/// converter's own clock and `BITS` its word length, and both are the
+/// kernel's: `dsp::lofi::Downsampler` owns the tracking anti-alias
+/// filter, the zero-order hold and the quantiser, and this table only
+/// says what a musician is allowed to ask for.
+///
+/// # The top of each range is OFF, and exactly off
+///
+/// The kernel promises an EXACT identity at `rate >= sample_rate` and at
+/// `bits >= 16`, checked per block rather than per sample. Both ends are
+/// reachable here on purpose, so "how much of this is the device?" is
+/// answerable by turning two knobs to their stops rather than by
+/// bypassing the card. A colour you cannot remove is a colour you cannot
+/// measure.
+///
+/// [`RATE_MAX`] is 48 kHz rather than the running sample rate because a
+/// TABLE is `&'static` — `params::clamp` scans it inside the callback —
+/// and a bound that moved with the device's preparation could not be.
+/// At any session rate at or below 48 kHz the top of the knob is at or
+/// above it, so the off switch stays reachable.
+pub mod lofi {
+    use super::ParamDef;
+
+    pub const RATE: u32 = 0;
+    pub const BITS: u32 = 1;
+    pub const MIX: u32 = 2;
+    pub const OUT: u32 = 3;
+
+    /// The converter clock's window. The floor is the kernel's own
+    /// [`RATE_MIN`](crate::dsp::lofi::RATE_MIN) — below about a kilohertz
+    /// the hold period is heard as a buzz at its own pitch rather than as
+    /// a texture — and the ceiling is where the hold switches off.
+    pub const RATE_MAX: f32 = 48_000.0;
+
+    /// The output trim's window, in dB, and the same figures as linear
+    /// gain. Both forms are written down for the reason
+    /// [`sat::OUT_MIN_DB`](super::sat::OUT_MIN_DB) gives: the TABLE is in
+    /// linear gain and the KNOB is in dB, and a widget deriving one from
+    /// the other by hand is how the two ends of one range drift apart.
+    pub const OUT_MIN_DB: f32 = -24.0;
+    pub const OUT_MAX_DB: f32 = 12.0;
+    /// `10^(-24/20)` and `10^(12/20)`, to f32 precision.
+    pub const OUT_MIN: f32 = 0.063_095_73;
+    pub const OUT_MAX: f32 = 3.981_072;
+
+    pub const TABLE: &[ParamDef] = &[
+        ParamDef {
+            id: RATE,
+            name: "rate",
+            min: crate::dsp::lofi::RATE_MIN,
+            max: RATE_MAX,
+            // Half of CD, which is the rate the twelve-bit machines
+            // people mean by "lo-fi" actually ran near. Audibly the
+            // device rather than a polite nod at it: you add this
+            // because you want the grain, and one that does nothing
+            // until you turn a knob is the surprise the saturator's
+            // table already argues against.
+            default: 22_050.0,
+        },
+        ParamDef {
+            id: BITS,
+            name: "bits",
+            min: crate::dsp::lofi::BITS_MIN,
+            max: crate::dsp::lofi::BITS_MAX,
+            // TWELVE. The number in every advert for the machines this
+            // models, and far enough from the kernel's sixteen-bit off
+            // switch to be heard.
+            default: 12.0,
+        },
+        ParamDef {
+            id: MIX,
+            name: "mix",
+            min: 0.0,
+            max: 1.0,
+            // Fully wet. A converter is a thing signal goes THROUGH, and
+            // parallel lo-fi is the special case rather than the default
+            // — unlike the reverb, which parks itself out of the way
+            // because a reverb nobody asked for drowns a mix.
+            default: 1.0,
+        },
+        ParamDef {
+            id: OUT,
+            name: "out",
+            min: OUT_MIN,
+            max: OUT_MAX,
+            default: 1.0,
+        },
+    ];
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3758,6 +3850,7 @@ mod tests {
         ("hat", hat::TABLE),
         ("handclap", handclap::TABLE),
         ("limiter", limiter::TABLE),
+        ("lofi", lofi::TABLE),
     ];
 
     /// The invariant `def()` and every `TABLE[FOO as usize]` rely on.

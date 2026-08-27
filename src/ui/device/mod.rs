@@ -89,6 +89,7 @@ pub mod hat;
 pub mod kick;
 pub mod knob;
 pub mod limiter;
+pub mod lofi;
 pub mod meter;
 pub mod metrics;
 pub mod modulato;
@@ -142,6 +143,9 @@ pub use hat::{HatUi, hat_card, hat_edits, hat_is_discrete, hat_is_log, hat_norm,
 pub use limiter::{
     LimiterUi, limiter_card, limiter_choices, limiter_edits, limiter_format, limiter_is_discrete,
     limiter_is_log, limiter_norm, limiter_value,
+};
+pub use lofi::{
+    LofiUi, lofi_card, lofi_edits, lofi_is_discrete, lofi_is_log, lofi_norm, lofi_value,
 };
 pub use metrics::Footprint;
 pub use param::{Mapping, Param, Unit};

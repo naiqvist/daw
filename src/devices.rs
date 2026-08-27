@@ -28,6 +28,7 @@ pub enum DeviceKind {
     Handclap,
     Reverb,
     Sat,
+    Lofi,
     Echo,
     Eq,
     Filter,
@@ -1473,6 +1474,38 @@ pub static DEVICES: &[DeviceSpec] = &[
                 name: "Out",
                 unit: "",
                 group: "Saturator",
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Lofi,
+        name: "lo-fi",
+        instrument: false,
+        prefix: "lofi",
+        params: daw::params::lofi::TABLE,
+        // Units blank for the reason the saturator's are: the card prints
+        // "22.05 kHz", "12" and "-6.0 dB" through its own `Unit`, and a
+        // second opinion here would be a second answer to one question.
+        labels: &[
+            ParamLabel {
+                name: "Rate",
+                unit: "",
+                group: "Lo-fi",
+            },
+            ParamLabel {
+                name: "Bits",
+                unit: "",
+                group: "Lo-fi",
+            },
+            ParamLabel {
+                name: "Mix",
+                unit: "",
+                group: "Lo-fi",
+            },
+            ParamLabel {
+                name: "Out",
+                unit: "",
+                group: "Lo-fi",
             },
         ],
     },

@@ -82,6 +82,7 @@ pub struct Gallery {
     dev_page: usize,
     dev_synth: device::SineSynthUi,
     dev_poly: device::PolyUi,
+    dev_lofi: device::LofiUi,
 }
 
 impl Default for Gallery {
@@ -136,6 +137,7 @@ impl Default for Gallery {
             dev_page: 0,
             dev_synth: device::SineSynthUi::default(),
             dev_poly: device::PolyUi::default(),
+            dev_lofi: device::LofiUi::default(),
         }
     }
 }
@@ -709,6 +711,17 @@ impl Gallery {
             for edit in device::poly_card(ui, theme, &mut self.dev_poly) {
                 self.log
                     .push(format!("PolyEdit(param {}, {:.2})", edit.param, edit.value));
+            }
+
+            kit::gap(ui, theme, space::SM);
+            kit::muted(
+                ui,
+                theme,
+                "lo-fi — the staircase is the real kernel, run on a real sine",
+            );
+            for edit in device::lofi_card(ui, theme, &mut self.dev_lofi) {
+                self.log
+                    .push(format!("LofiEdit(param {}, {:.2})", edit.param, edit.value));
             }
 
             kit::gap(ui, theme, space::SM);

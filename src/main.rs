@@ -68,8 +68,8 @@ use focus::Focus;
 mod device_state;
 use device_state::{
     DeviceInstance, DeviceState, EchoParams, device_edits, device_is_discrete, device_is_log,
-    echo_knobs, eq_knobs, glue_knobs, poly_knobs, reverb_knobs, sat_knobs, synth_knobs, unit_zoom,
-    utility_knobs,
+    echo_knobs, eq_knobs, glue_knobs, lofi_knobs, poly_knobs, reverb_knobs, sat_knobs, synth_knobs,
+    unit_zoom, utility_knobs,
 };
 mod devices;
 use bar::{Bar, TRANSPORT_GAP, TRANSPORT_GROUP_GAP, bar_layout, buttons_width, fields_width};
@@ -9888,6 +9888,10 @@ impl Default for Browser {
                             load: DeviceKind::Sat,
                         },
                         BrowserItem {
+                            name: "Lo-fi",
+                            load: DeviceKind::Lofi,
+                        },
+                        BrowserItem {
                             name: "Delay",
                             load: DeviceKind::Echo,
                         },
@@ -11659,6 +11663,10 @@ fn device_body(
                                     let mut knobs = sat_knobs(params);
                                     device::sat_card(ui, theme, &mut knobs)
                                 }
+                                DeviceState::Lofi(params) => {
+                                    let mut knobs = lofi_knobs(params);
+                                    device::lofi_card(ui, theme, &mut knobs)
+                                }
                                 DeviceState::Echo(params) => {
                                     let mut knobs = echo_knobs(params);
                                     device::echo_card(ui, theme, &mut knobs)
@@ -11889,6 +11897,7 @@ fn plockable_params(track: &Track) -> Vec<piano_roll::PlockParam> {
         // p-lockable and there is nothing to exclude.
         DeviceKind::Reverb
         | DeviceKind::Sat
+        | DeviceKind::Lofi
         | DeviceKind::Echo
         | DeviceKind::Eq
         | DeviceKind::Filter
@@ -12158,6 +12167,17 @@ fn compile_chain(
                 }
                 tail = glue;
             }
+            DeviceState::Lofi(params) => {
+                let lofi = spec.push(NodeSpec::Lofi {
+                    rate: params.rate,
+                    bits: params.bits,
+                    mix: params.mix,
+                    out: params.out,
+                });
+                spec.connect(tail, lofi);
+                devices.insert(instance.id, lofi);
+                tail = lofi;
+            }
             DeviceState::Sat(params) => {
                 let sat = spec.push(NodeSpec::Sat {
                     // The one place the index stops being a float:
@@ -12222,6 +12242,7 @@ fn build_graph_spec(
                     DeviceState::Modulato(_)
                     | DeviceState::Utility(_)
                     | DeviceState::Filter(_)
+                    | DeviceState::Lofi(_)
                     | DeviceState::Limiter(_) => continue,
                     DeviceState::SineSynth(params) => NodeSpec::Seq {
                         notes,

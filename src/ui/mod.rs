@@ -411,6 +411,7 @@ mod tests {
             "glue.rs",     // a card: its size is the sum of what it holds
             "kick.rs",     // ditto
             "limiter.rs",  // ditto
+            "lofi.rs",     // ditto
             "modulato.rs", // ditto
             "sampler.rs",  // ditto
             "snare.rs",    // ditto

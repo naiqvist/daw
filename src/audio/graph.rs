@@ -1233,6 +1233,17 @@ const SAT_SMOOTH_MS: f32 = 15.0;
 /// less than the shaping does.
 const SAT_CHUNK: usize = 16;
 
+/// Control smoothing for the lo-fi blend and trim, in ms. The
+/// saturator's figure, for the saturator's reason — these are the two
+/// rows a wire can move continuously, and the rate and the word length
+/// deliberately have no smoother at all.
+const LOFI_SMOOTH_MS: f32 = 15.0;
+
+/// How many samples of the lo-fi blend share one walk of the control
+/// ramps. Small enough that a moving mix is continuous, large enough
+/// that the two stack buffers stay cheap.
+const LOFI_CHUNK: usize = 16;
+
 /// The kernel chain of one [`Node::Sat`], boxed so the Node enum stays
 /// lean. Compile builds it in the green zone; the callback only calls
 /// configure/process/reset on it.
@@ -1653,6 +1664,41 @@ pub enum Node {
         mix_target: f32,
         trim_target: f32,
     },
+    /// The lo-fi converter — sample-rate reduction and bit reduction, in
+    /// the order and with the filtering an early hardware sampler had.
+    /// `dsp::lofi::Downsampler` owns all three; this node owns the blend,
+    /// the trim and the wiring.
+    ///
+    /// Free-running — it holds signal history, not timeline position —
+    /// but it CUTS on discontinuity, because the tracking filter's poles
+    /// and the hold's latched sample belong to a position the transport
+    /// has left.
+    ///
+    /// ONE CONVERTER PER CHANNEL, not one shared. `SatCore`'s doc makes
+    /// the same argument about its half-band: the two poles and the held
+    /// sample are memory, and memory shared between two channels is the
+    /// two channels leaking into each other.
+    Lofi {
+        core: [crate::dsp::lofi::Downsampler; 2],
+        /// The dry copy the blend runs against, because the kernel works
+        /// in place — `2 * block` floats, compile-owned.
+        dry: Vec<f32>,
+        /// Converter clock and word length, as last set. Held so a
+        /// discontinuity has something to restate and so the node can be
+        /// read back; the kernel is the one that acts on them.
+        rate: f32,
+        bits: f32,
+        mix: crate::dsp::ramps::Smoother,
+        /// Output trim. Named `trim` and not `out` for the reason
+        /// `Node::Sat`'s is: the process arm already has an `out`, and a
+        /// shadowed buffer is a bug waiting for a careless edit. The wire
+        /// id is still `params::lofi::OUT`.
+        trim: crate::dsp::ramps::Smoother,
+        /// Shadow targets, because a discontinuity snaps the smoothers to
+        /// their destination and `Smoother` does not expose its own.
+        mix_target: f32,
+        trim_target: f32,
+    },
     /// Analogue delay — the musical one, as opposed to [`Node::Delay`],
     /// which is compensation wiring.
     ///
@@ -1838,7 +1884,8 @@ impl Node {
             | NodeSpec::Filter { .. }
             | NodeSpec::Glue { .. }
             | NodeSpec::Limiter { .. }
-            | NodeSpec::Utility { .. } => 2,
+            | NodeSpec::Utility { .. }
+            | NodeSpec::Lofi { .. } => 2,
             NodeSpec::Delay { channels, .. } => (*channels).clamp(1, 2),
             NodeSpec::Mixer { .. } | NodeSpec::AudioClip { .. } | NodeSpec::Pan { .. } => 2,
         }
@@ -2588,6 +2635,89 @@ impl Node {
                 }
             }
 
+            Node::Lofi {
+                core,
+                dry,
+                mix,
+                trim,
+                mix_target,
+                trim_target,
+                ..
+            } => {
+                // `out.l` and `out.r` are separate fields, so this borrows
+                // only the right channel and the left stays reachable.
+                let right = out.r.as_deref_mut().unwrap_or(&mut []);
+                sum_inputs_stereo(inputs, out.l, right);
+
+                // A seek must not drag the hold's latched sample or the
+                // tracking filter's poles along, and must not glide old
+                // knob motion into the new position.
+                if ctx.discontinuity {
+                    for ch in core.iter_mut() {
+                        ch.reset();
+                    }
+                    mix.set_now(*mix_target);
+                    trim.set_now(*trim_target);
+                }
+
+                let n = out.l.len();
+                // Compile fixes the channel count at 2, so this is true;
+                // it is checked rather than assumed because the check
+                // costs nothing and an assumption costs a panic.
+                let stereo = right.len() == n;
+
+                // Fail open exactly as the saturator does: too little
+                // scratch leaves the dry signal standing, never an early
+                // return that would hand the graph a buffer nobody wrote.
+                if dry.len() >= n * 2 {
+                    let (dry_l, rest) = dry.split_at_mut(n);
+                    let dry_r = &mut rest[..n];
+                    dry_l.copy_from_slice(out.l);
+                    if stereo {
+                        dry_r.copy_from_slice(right);
+                    }
+
+                    // In place, one converter per channel — the kernel is
+                    // documented in-place safe, and its own bypass checks
+                    // make a clean setting cost a compare rather than a
+                    // pass over the block.
+                    core[0].process(out.l);
+                    if stereo {
+                        core[1].process(right);
+                    }
+
+                    // The blend and the trim walk PER SAMPLE, in chunks,
+                    // for the reason `Node::Sat` walks its controls that
+                    // way: a gain applied once per block steps audibly at
+                    // the segment edge when a wire is moving it.
+                    //
+                    // Both channels read the SAME chunk of ramp rather
+                    // than each advancing the smoothers, which would run
+                    // them at twice the rate they were prepared for and
+                    // silently halve every smoothing time in the device.
+                    let mut start = 0;
+                    while start < n {
+                        let k = LOFI_CHUNK.min(n - start);
+                        let mut mixr = [0.0f32; LOFI_CHUNK];
+                        let mut trimr = [0.0f32; LOFI_CHUNK];
+                        mix.process(&mut mixr[..k]);
+                        trim.process(&mut trimr[..k]);
+                        for j in 0..k {
+                            let i = start + j;
+                            let d = dry_l[i];
+                            out.l[i] = (d + (out.l[i] - d) * mixr[j]) * trimr[j];
+                        }
+                        if stereo {
+                            for j in 0..k {
+                                let i = start + j;
+                                let d = dry_r[i];
+                                right[i] = (d + (right[i] - d) * mixr[j]) * trimr[j];
+                            }
+                        }
+                        start += k;
+                    }
+                }
+            }
             Node::Sat {
                 core,
                 scratch2x,
@@ -3001,7 +3131,7 @@ impl Node {
         // accepts. params::clamp is a bounded scan of a static table:
         // red-zone legal, and an unknown id comes back None (a stale or
         // misrouted letter — binned, never applied).
-        use crate::params::{clip, echo, filter, mixer, pan, reverb, sat, seq, sine};
+        use crate::params::{clip, echo, filter, lofi, mixer, pan, reverb, sat, seq, sine};
         match self {
             // No parameters: compile decides a delay's length, and it
             // cannot change without a recompile — a letter that moved it
@@ -3193,6 +3323,49 @@ impl Node {
                     return;
                 };
                 core.set_param(param, value);
+            }
+            Node::Lofi {
+                core,
+                rate,
+                bits,
+                mix,
+                trim,
+                mix_target,
+                trim_target,
+                ..
+            } => {
+                let Some(value) = crate::params::clamp(lofi::TABLE, param, value) else {
+                    return;
+                };
+                let set = |target: &mut f32, s: &mut crate::dsp::ramps::Smoother| {
+                    *target = value;
+                    s.set_target(value);
+                };
+                match param {
+                    // Handed to the kernel HERE rather than parked for the
+                    // segment edge, and NOT smoothed. Both are coefficient
+                    // work — a filter corner and a lattice step — rather
+                    // than something a sample is multiplied by, and the
+                    // kernel reads them once per block to decide whether
+                    // it is bypassed at all. A smoother on either would
+                    // buy nothing and would blur the two exact off
+                    // switches into approximate ones.
+                    lofi::RATE => {
+                        *rate = value;
+                        for ch in core.iter_mut() {
+                            ch.set_rate(value);
+                        }
+                    }
+                    lofi::BITS => {
+                        *bits = value;
+                        for ch in core.iter_mut() {
+                            ch.set_bits(value);
+                        }
+                    }
+                    lofi::MIX => set(mix_target, mix),
+                    lofi::OUT => set(trim_target, trim),
+                    _ => {}
+                }
             }
             Node::Sat {
                 pending_mode,
@@ -4061,6 +4234,19 @@ pub enum NodeSpec {
         mode: u32,
         drive: f32,
         bias: f32,
+        mix: f32,
+        out: f32,
+    },
+    /// A lo-fi converter on whatever feeds it. `rate` is the converter's
+    /// own clock in Hz and `bits` its word length; `mix` blends against
+    /// the dry and `out` is a linear output trim. ParamChange ids and
+    /// every range are `crate::params::lofi::TABLE`'s.
+    ///
+    /// Stereo in, stereo out — it stands in the same chains the saturator
+    /// does, and mono-summing there would fold a spread away.
+    Lofi {
+        rate: f32,
+        bits: f32,
         mix: f32,
         out: f32,
     },
@@ -5240,6 +5426,46 @@ impl GraphSpec {
                             trim: smoother(trim),
                             drive_target: drive,
                             bias_target: bias,
+                            mix_target: mix,
+                            trim_target: trim,
+                        }
+                    }
+                    Some(NodeSpec::Lofi {
+                        rate,
+                        bits,
+                        mix,
+                        out,
+                    }) => {
+                        use crate::params::lofi as lp;
+                        // Green zone: the scratch is born here, once, and
+                        // every value clamps through the same table rows
+                        // the letters will — a stale project file cannot
+                        // smuggle an out-of-range setting in.
+                        let sr = sample_rate as f32;
+                        let rate = lp::TABLE[lp::RATE as usize].clamp(*rate);
+                        let bits = lp::TABLE[lp::BITS as usize].clamp(*bits);
+                        let mix = lp::TABLE[lp::MIX as usize].clamp(*mix);
+                        let trim = lp::TABLE[lp::OUT as usize].clamp(*out);
+                        let mut core = [crate::dsp::lofi::Downsampler::new(); 2];
+                        for ch in core.iter_mut() {
+                            ch.prepare(sr);
+                            ch.set_rate(rate);
+                            ch.set_bits(bits);
+                        }
+                        let smoother = |value: f32| {
+                            let mut s = crate::dsp::ramps::Smoother::new();
+                            s.prepare(sr, LOFI_SMOOTH_MS);
+                            s.set_now(value);
+                            s
+                        };
+                        Node::Lofi {
+                            core,
+                            // Two lanes of dry, left and right.
+                            dry: vec![0.0f32; block_frames * 2],
+                            rate,
+                            bits,
+                            mix: smoother(mix),
+                            trim: smoother(trim),
                             mix_target: mix,
                             trim_target: trim,
                         }

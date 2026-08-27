@@ -113,6 +113,30 @@ impl Default for SatParams {
     }
 }
 
+/// The lo-fi converter's editable values in ENGINE units — hertz, a bit
+/// count, a fraction and a linear gain, exactly as
+/// [`daw::params::lofi`] declares them.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct LofiParams {
+    pub rate: f32,
+    pub bits: f32,
+    pub mix: f32,
+    pub out: f32,
+}
+
+impl Default for LofiParams {
+    fn default() -> Self {
+        use daw::params::{def, lofi};
+        Self {
+            rate: def(lofi::TABLE, lofi::RATE).default,
+            bits: def(lofi::TABLE, lofi::BITS).default,
+            mix: def(lofi::TABLE, lofi::MIX).default,
+            out: def(lofi::TABLE, lofi::OUT).default,
+        }
+    }
+}
+
 /// What a device IS, and its editable values — in ENGINE units, the same
 /// numbers `src/params.rs` declares. One stored copy of one truth: the card
 /// converts to normalized knob positions for drawing and back on the way
@@ -130,6 +154,7 @@ pub enum DeviceState {
     Handclap(daw::audio::handclap::HandclapParams),
     Reverb(ReverbParams),
     Sat(SatParams),
+    Lofi(LofiParams),
     Echo(EchoParams),
     Eq(daw::audio::eq::EqParams),
     Filter(daw::audio::filter::FilterParams),
@@ -153,6 +178,7 @@ impl DeviceState {
             DeviceKind::Handclap => Self::Handclap(daw::audio::handclap::HandclapParams::default()),
             DeviceKind::Reverb => Self::Reverb(ReverbParams::default()),
             DeviceKind::Sat => Self::Sat(SatParams::default()),
+            DeviceKind::Lofi => Self::Lofi(LofiParams::default()),
             DeviceKind::Echo => Self::Echo(EchoParams::default()),
             DeviceKind::Eq => Self::Eq(daw::audio::eq::EqParams::default()),
             DeviceKind::Filter => Self::Filter(daw::audio::filter::FilterParams::default()),
@@ -175,6 +201,7 @@ impl DeviceState {
             Self::Handclap(_) => DeviceKind::Handclap,
             Self::Reverb(_) => DeviceKind::Reverb,
             Self::Sat(_) => DeviceKind::Sat,
+            Self::Lofi(_) => DeviceKind::Lofi,
             Self::Echo(_) => DeviceKind::Echo,
             Self::Eq(_) => DeviceKind::Eq,
             Self::Filter(_) => DeviceKind::Filter,
@@ -188,7 +215,7 @@ impl DeviceState {
     /// This device's value for `param`, or `None` for an id it does not
     /// have — which is how a target aimed at the wrong kind is refused.
     pub fn value(self, param: u32) -> Option<f32> {
-        use daw::params::{echo, reverb, sat, seq};
+        use daw::params::{echo, lofi, reverb, sat, seq};
         match self {
             Self::SineSynth(p) => match param {
                 seq::GAIN => Some(p.gain),
@@ -225,6 +252,13 @@ impl DeviceState {
                 reverb::MODULATION => Some(p.modulation),
                 reverb::WIDTH => Some(p.width),
                 reverb::MIX => Some(p.mix),
+                _ => None,
+            },
+            Self::Lofi(p) => match param {
+                lofi::RATE => Some(p.rate),
+                lofi::BITS => Some(p.bits),
+                lofi::MIX => Some(p.mix),
+                lofi::OUT => Some(p.out),
                 _ => None,
             },
             Self::Sat(p) => match param {
@@ -269,7 +303,7 @@ impl DeviceState {
     /// Store an engine-unit value. Unknown ids are dropped, exactly as the
     /// engine's own clamp drops them.
     pub fn set(&mut self, param: u32, value: f32) {
-        use daw::params::{echo, reverb, sat, seq};
+        use daw::params::{echo, lofi, reverb, sat, seq};
         match self {
             Self::SineSynth(p) => match param {
                 seq::GAIN => p.gain = value,
@@ -294,6 +328,13 @@ impl DeviceState {
                 reverb::MODULATION => p.modulation = value,
                 reverb::WIDTH => p.width = value,
                 reverb::MIX => p.mix = value,
+                _ => {}
+            },
+            Self::Lofi(p) => match param {
+                lofi::RATE => p.rate = value,
+                lofi::BITS => p.bits = value,
+                lofi::MIX => p.mix = value,
+                lofi::OUT => p.out = value,
                 _ => {}
             },
             Self::Sat(p) => match param {
@@ -435,6 +476,17 @@ pub fn reverb_knobs(params: ReverbParams) -> device::ReverbUi {
     })
 }
 
+pub fn lofi_knobs(params: LofiParams) -> device::LofiUi {
+    use daw::params::lofi;
+    let at = |param, value| device_norm(DeviceKind::Lofi, param, value);
+    device::LofiUi {
+        rate: at(lofi::RATE, params.rate),
+        bits: at(lofi::BITS, params.bits),
+        mix: at(lofi::MIX, params.mix),
+        out: at(lofi::OUT, params.out),
+    }
+}
+
 pub fn sat_knobs(params: SatParams) -> device::SatUi {
     use daw::params::sat;
     let at = |param, value| device_norm(DeviceKind::Sat, param, value);
@@ -513,6 +565,7 @@ pub fn device_norm(kind: DeviceKind, param: u32, value: f32) -> f32 {
         DeviceKind::Limiter => device::limiter_norm(param, value),
         DeviceKind::Reverb => device::reverb_norm(param, value),
         DeviceKind::Sat => device::sat_norm(param, value),
+        DeviceKind::Lofi => device::lofi_norm(param, value),
         DeviceKind::Echo => device::echo_norm(param, value),
         DeviceKind::Eq => device::eq_norm(param, value),
         DeviceKind::Filter => device::filter_norm(param, value),
@@ -543,6 +596,7 @@ pub fn device_is_discrete(kind: DeviceKind, param: u32) -> bool {
         DeviceKind::Handclap => device::handclap_is_discrete(param),
         DeviceKind::Limiter => device::limiter_is_discrete(param),
         DeviceKind::Sat => device::sat_is_discrete(param),
+        DeviceKind::Lofi => device::lofi_is_discrete(param),
         DeviceKind::Echo => device::echo_is_discrete(param),
         DeviceKind::Eq => device::eq_is_discrete(param),
         DeviceKind::Filter => device::filter_is_discrete(param),
@@ -568,6 +622,7 @@ pub fn device_is_log(kind: DeviceKind, param: u32) -> bool {
         DeviceKind::Limiter => device::limiter_is_log(param),
         DeviceKind::SineSynth => device::sine_synth_is_log(param),
         DeviceKind::Sat => device::sat_is_log(param),
+        DeviceKind::Lofi => device::lofi_is_log(param),
         DeviceKind::Echo => device::echo_is_log(param),
         DeviceKind::Eq => device::eq_is_log(param),
         DeviceKind::Filter => device::filter_is_log(param),
@@ -596,6 +651,7 @@ pub fn device_value(kind: DeviceKind, param: u32, norm: f32) -> f32 {
         DeviceKind::Limiter => device::limiter_value(param, norm),
         DeviceKind::Reverb => device::reverb_value(param, norm),
         DeviceKind::Sat => device::sat_value(param, norm),
+        DeviceKind::Lofi => device::lofi_value(param, norm),
         DeviceKind::Echo => device::echo_value(param, norm),
         DeviceKind::Eq => device::eq_value(param, norm),
         DeviceKind::Filter => device::filter_value(param, norm),
