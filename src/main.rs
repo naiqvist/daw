@@ -50,6 +50,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+mod bar;
+use bar::{Bar, TRANSPORT_GAP, TRANSPORT_GROUP_GAP, bar_layout, buttons_width, fields_width};
 mod icon;
 mod piano_roll;
 mod session_bridge;
@@ -123,17 +125,6 @@ const SEARCH_ICON: &str = "\u{f002}";
 const SEARCH_TYPE: f32 = 12.0;
 
 // --- transport ---
-
-/// Square hit area for one transport button.
-const TRANSPORT_BTN: f32 = 26.0;
-/// Gap from the bar's left edge.
-const TRANSPORT_PAD: f32 = 10.0;
-/// Gap between adjacent buttons.
-const TRANSPORT_GAP: f32 = 4.0;
-/// Space between GROUPS of controls. Groups are separated by air, not by
-/// rules — this window is fills only, and a divider on the bar would be the
-/// first line anywhere in it.
-const TRANSPORT_GROUP_GAP: f32 = 18.0;
 
 /// Editable fields: a recessed well with a value in it.
 const FIELD_H: f32 = 20.0;
@@ -757,91 +748,6 @@ fn nearest(
         }
     }
     best.map(|(id, _)| id)
-}
-
-/// Lays the bar out left to right, everything vertically centred.
-///
-/// A cursor rather than indexed slots, because the bar mixes square buttons,
-/// wider fields and readouts, and groups separated by air. Pure — it never
-/// touches a `Ui` — so the whole rhythm is checkable.
-struct Bar {
-    x: f32,
-    mid: f32,
-}
-
-impl Bar {
-    /// A cursor starting at an arbitrary x, for anchoring a group to the
-    /// centre or the right edge instead of running everything off the left.
-    fn at(area: egui::Rect, x: f32) -> Self {
-        Self {
-            x,
-            mid: area.center().y,
-        }
-    }
-
-    fn button(&mut self) -> egui::Rect {
-        let rect = egui::Rect::from_center_size(
-            egui::pos2(self.x + TRANSPORT_BTN * 0.5, self.mid),
-            egui::Vec2::splat(TRANSPORT_BTN),
-        );
-        self.x += TRANSPORT_BTN + TRANSPORT_GAP;
-        rect
-    }
-
-    fn field(&mut self, width: f32) -> egui::Rect {
-        let rect = egui::Rect::from_min_size(
-            egui::pos2(self.x, self.mid - FIELD_H * 0.5),
-            egui::vec2(width, FIELD_H),
-        );
-        self.x += width + TRANSPORT_GAP;
-        rect
-    }
-
-    /// Air between groups, in place of a divider.
-    fn group(&mut self) {
-        self.x += TRANSPORT_GROUP_GAP - TRANSPORT_GAP;
-    }
-}
-
-/// Width of `n` buttons laid in a row, gaps included.
-fn buttons_width(n: usize) -> f32 {
-    n as f32 * TRANSPORT_BTN + n.saturating_sub(1) as f32 * TRANSPORT_GAP
-}
-
-/// Width of a run of fields, gaps included.
-fn fields_width(widths: &[f32]) -> f32 {
-    widths.iter().sum::<f32>() + widths.len().saturating_sub(1) as f32 * TRANSPORT_GAP
-}
-
-/// Where each group starts, given the bar's width.
-///
-/// Three anchors: the verbs hold the left edge so muscle memory has somewhere
-/// fixed to aim, the readouts sit dead centre because they are what you look
-/// at, and the settings hold the right edge. Each anchor is stable under
-/// resize — the middle stays middle, the ends stay at their ends.
-///
-/// If the three would collide, everything falls back to packed-left in the
-/// same order. Pure, so both branches are checkable.
-fn bar_layout(area: egui::Rect, verbs: f32, centre: f32, right: f32) -> (f32, f32, f32, bool) {
-    let left_x = area.left() + TRANSPORT_PAD;
-    let left_end = left_x + verbs;
-    let right_x = area.right() - TRANSPORT_PAD - right;
-    let centre_x = area.center().x - centre * 0.5;
-
-    let spread = centre_x > left_end + TRANSPORT_GROUP_GAP
-        && centre_x + centre < right_x - TRANSPORT_GROUP_GAP;
-
-    if spread {
-        (left_x, centre_x, right_x, true)
-    } else {
-        let centre_x = left_end + TRANSPORT_GROUP_GAP;
-        (
-            left_x,
-            centre_x,
-            centre_x + centre + TRANSPORT_GROUP_GAP,
-            false,
-        )
-    }
 }
 
 /// One transport button: hover wash, icon, click. Returns true when pressed,
@@ -21731,6 +21637,7 @@ impl eframe::App for App {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use super::bar::{TRANSPORT_BTN, TRANSPORT_PAD};
     use super::icon::{ICON, PAUSE_BAR, PAUSE_GAP};
     use super::timecode::bars_beats;
     use super::*;
