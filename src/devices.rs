@@ -34,6 +34,7 @@ pub enum DeviceKind {
     Tilt,
     Phaser,
     Gate,
+    Strip,
     Echo,
     Eq,
     Filter,
@@ -1664,6 +1665,42 @@ pub static DEVICES: &[DeviceSpec] = &[
                 name: "Range",
                 unit: "",
                 group: "Gate",
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Strip,
+        name: "strip",
+        instrument: false,
+        prefix: "strip",
+        params: daw::params::strip::TABLE,
+        // Units blank for the reason the others' are: the card prints
+        // "+3.0 dB", "35 %" and "on" through its own `Unit`.
+        labels: &[
+            ParamLabel {
+                name: "Low",
+                unit: "",
+                group: "Strip",
+            },
+            ParamLabel {
+                name: "High",
+                unit: "",
+                group: "Strip",
+            },
+            ParamLabel {
+                name: "Drive",
+                unit: "",
+                group: "Strip",
+            },
+            ParamLabel {
+                name: "Warm",
+                unit: "",
+                group: "Strip",
+            },
+            ParamLabel {
+                name: "Out",
+                unit: "",
+                group: "Strip",
             },
         ],
     },

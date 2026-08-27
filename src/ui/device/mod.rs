@@ -119,6 +119,7 @@ pub mod shaper;
 pub mod sheen;
 pub mod snare;
 pub mod spectrum;
+pub mod strip;
 pub mod switch;
 pub mod synth;
 pub mod tilt;
@@ -181,6 +182,9 @@ pub use sheen::{
 };
 pub use snare::{
     SnareUi, snare_card, snare_edits, snare_is_discrete, snare_is_log, snare_norm, snare_value,
+};
+pub use strip::{
+    StripUi, strip_card, strip_edits, strip_is_discrete, strip_is_log, strip_norm, strip_value,
 };
 pub use synth::{
     ParamEdit, SineSynthUi, sine_synth_card, sine_synth_edits, sine_synth_format,

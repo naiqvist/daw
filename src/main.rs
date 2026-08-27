@@ -69,8 +69,8 @@ mod device_state;
 use device_state::{
     DeviceInstance, DeviceState, EchoParams, device_edits, device_is_discrete, device_is_log,
     disperser_knobs, echo_knobs, eq_knobs, gate_knobs, glue_knobs, lofi_knobs, phaser_knobs,
-    poly_knobs, reverb_knobs, sat_knobs, sheen_knobs, synth_knobs, tilt_knobs, unit_zoom,
-    utility_knobs,
+    poly_knobs, reverb_knobs, sat_knobs, sheen_knobs, strip_knobs, synth_knobs, tilt_knobs,
+    unit_zoom, utility_knobs,
 };
 mod devices;
 use bar::{Bar, TRANSPORT_GAP, TRANSPORT_GROUP_GAP, bar_layout, buttons_width, fields_width};
@@ -9913,6 +9913,10 @@ impl Default for Browser {
                             load: DeviceKind::Gate,
                         },
                         BrowserItem {
+                            name: "Strip",
+                            load: DeviceKind::Strip,
+                        },
+                        BrowserItem {
                             name: "Delay",
                             load: DeviceKind::Echo,
                         },
@@ -11716,6 +11720,10 @@ fn device_body(
                                     let mut knobs = gate_knobs(params);
                                     device::gate_card(ui, theme, &mut knobs)
                                 }
+                                DeviceState::Strip(params) => {
+                                    let mut knobs = strip_knobs(params);
+                                    device::strip_card(ui, theme, &mut knobs)
+                                }
                                 DeviceState::Glue(params) => {
                                     let mut knobs = glue_knobs(params);
                                     let history =
@@ -11944,6 +11952,7 @@ fn plockable_params(track: &Track) -> Vec<piano_roll::PlockParam> {
         | DeviceKind::Tilt
         | DeviceKind::Phaser
         | DeviceKind::Gate
+        | DeviceKind::Strip
         | DeviceKind::Echo
         | DeviceKind::Eq
         | DeviceKind::Filter
@@ -12198,6 +12207,12 @@ fn compile_chain(
                 devices.insert(instance.id, eq);
                 tail = eq;
             }
+            DeviceState::Strip(params) => {
+                let node = spec.push(NodeSpec::Strip { params });
+                spec.connect(tail, node);
+                devices.insert(instance.id, node);
+                tail = node;
+            }
             DeviceState::Gate(params) => {
                 let node = spec.push(NodeSpec::Gate { params });
                 spec.connect(tail, node);
@@ -12342,6 +12357,7 @@ fn build_graph_spec(
                     | DeviceState::Tilt(_)
                     | DeviceState::Phaser(_)
                     | DeviceState::Gate(_)
+                    | DeviceState::Strip(_)
                     | DeviceState::Limiter(_) => continue,
                     DeviceState::SineSynth(params) => NodeSpec::Seq {
                         notes,

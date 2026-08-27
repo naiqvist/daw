@@ -1958,6 +1958,19 @@ pub enum Node {
     Gate {
         core: Box<crate::audio::gate::GateCore>,
     },
+    /// A mini channel strip — see `crate::audio::strip`. Two shelves, an
+    /// optional warm pair, and `audio::preamp::Preamp` whole, in that
+    /// order: everything is pre-drive, which is the device's character
+    /// rather than an accident of wiring.
+    ///
+    /// Boxed for the reason the glue's core is: `Node` is sized by its
+    /// largest variant.
+    ///
+    /// Free-running — it holds filter state and a noise source, not a
+    /// timeline position — and it CUTS on discontinuity.
+    Strip {
+        core: Box<crate::audio::strip::StripCore>,
+    },
     /// Gain, placement and the stereo field — see
     /// `crate::audio::utility`. The device with no tone of its own.
     ///
@@ -2038,6 +2051,7 @@ impl Node {
             | NodeSpec::Filter { .. }
             | NodeSpec::Glue { .. }
             | NodeSpec::Gate { .. }
+            | NodeSpec::Strip { .. }
             | NodeSpec::Limiter { .. }
             | NodeSpec::Utility { .. }
             | NodeSpec::Lofi { .. }
@@ -3427,6 +3441,16 @@ impl Node {
                 core.process(out.l, right);
             }
 
+            Node::Strip { core } => {
+                let right = out.r.as_deref_mut().unwrap_or(&mut []);
+                sum_inputs_stereo(inputs, out.l, right);
+                // A seek must not ring the four shelves into the new
+                // position, nor carry the output stage's state across it.
+                if ctx.discontinuity {
+                    core.reset();
+                }
+                core.process(out.l, right);
+            }
             Node::Gate { core } => {
                 let right = out.r.as_deref_mut().unwrap_or(&mut []);
                 sum_inputs_stereo(inputs, out.l, right);
@@ -3976,6 +4000,7 @@ impl Node {
             // does it: the core owns every range and every clamp, so a
             // letter cannot be routed by two opinions about what id 3 is.
             Node::Gate { core } => core.set_param(param, value),
+            Node::Strip { core } => core.set_param(param, value),
             // The whole table, straight through, for the reason the two
             // arms above give: one door, so a letter cannot be routed by
             // two different opinions about what id 4 is.
@@ -4874,6 +4899,14 @@ pub enum NodeSpec {
     Gate {
         #[serde(default)]
         params: crate::audio::gate::GateParams,
+    },
+    /// A mini channel strip on whatever feeds it. Every range and every
+    /// `ParamChange` id is `crate::params::strip::TABLE`'s.
+    ///
+    /// Stereo in, stereo out.
+    Strip {
+        #[serde(default)]
+        params: crate::audio::strip::StripParams,
     },
     /// Gain, pan, width, bass mono, phase and channel mode on whatever
     /// feeds it. Every range and every `ParamChange` id is
@@ -6274,6 +6307,13 @@ impl GraphSpec {
                         core: Box::new(crate::audio::eq::EqCore::new(
                             sample_rate as f32,
                             block_frames,
+                            params,
+                        )),
+                    },
+                    Some(NodeSpec::Strip { params }) => Node::Strip {
+                        // Green zone: every kernel the callback will use.
+                        core: Box::new(crate::audio::strip::StripCore::new(
+                            sample_rate as f32,
                             params,
                         )),
                     },

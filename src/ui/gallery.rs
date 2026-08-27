@@ -88,6 +88,7 @@ pub struct Gallery {
     dev_tilt: device::TiltUi,
     dev_phaser: device::PhaserUi,
     dev_gate: device::GateUi,
+    dev_strip: device::StripUi,
 }
 
 impl Default for Gallery {
@@ -151,6 +152,15 @@ impl Default for Gallery {
             // gallery leans this one over to show what the card draws.
             dev_phaser: device::PhaserUi::default(),
             dev_gate: device::GateUi::default(),
+            // Leaning, and warm on: the strip's defaults are flat shelves
+            // and a switch off, so a preview at rest would be a preview of
+            // a nearly straight line.
+            dev_strip: device::StripUi {
+                low: device::strip_norm(params::strip::LOW, 5.0),
+                high: device::strip_norm(params::strip::HIGH, -3.0),
+                warm: device::strip_norm(params::strip::WARM, params::strip::WARM_ON as f32),
+                ..device::StripUi::default()
+            },
             dev_tilt: device::TiltUi {
                 tilt: device::tilt_norm(params::tilt::TILT, 6.0),
                 ..device::TiltUi::default()
@@ -792,6 +802,19 @@ impl Gallery {
             for edit in device::gate_card(ui, theme, &mut self.dev_gate) {
                 self.log
                     .push(format!("GateEdit(param {}, {:.2})", edit.param, edit.value));
+            }
+
+            kit::gap(ui, theme, space::SM);
+            kit::muted(
+                ui,
+                theme,
+                "strip — the whole chain's tone, measured where the stage is linear",
+            );
+            for edit in device::strip_card(ui, theme, &mut self.dev_strip) {
+                self.log.push(format!(
+                    "StripEdit(param {}, {:.2})",
+                    edit.param, edit.value
+                ));
             }
 
             kit::gap(ui, theme, space::SM);

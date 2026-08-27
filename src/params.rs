@@ -3890,6 +3890,151 @@ pub mod sampler {
 /// made, decide the signal was still below the threshold, and stay shut
 /// forever. Feed-forward is not a preference here, it is the only
 /// topology that reopens.
+/// The strip — a mini channel: two shelves, an output stage, and a
+/// switch.
+///
+/// Three things that already exist, in one device and in one order:
+/// `dsp::filters::EqBand` for the tone, `audio::preamp::Preamp` for the
+/// colour, and a second pair of fixed shelves behind [`WARM`].
+///
+/// `preamp.rs`'s own header predicted this device — "it lives in its own
+/// file rather than inside `sampler.rs` because it is a stage a future
+/// effect device would want whole" — and this is that effect device. Its
+/// character is not invented here: a tilt at 1 kHz, an asymmetric soft
+/// clip reached through headroom so the second harmonic sits above the
+/// third, a DC blocker, and hiss gated by the programme. All measured,
+/// all already tested.
+///
+/// # The character: EVERYTHING IS PRE-DRIVE
+///
+/// This is the one thing that makes the strip more than its three parts
+/// bolted together, and it is deliberate. The shelves and the warm switch
+/// all sit BEFORE the output stage, so they do not merely shape the tone
+/// — they change what the non-linearity is fed. Lift the low shelf and
+/// the bottom end drives the clip harder, which is more second harmonic
+/// ON THE BASS specifically. That is what a console does and why its EQ
+/// sounds different from the same curve applied afterwards.
+///
+/// It also means the two halves are not independent, and the card says so
+/// rather than hiding it: at zero drive the strip IS just an equaliser,
+/// and every dB of shelf is worth more the further the drive is up.
+///
+/// # What [`WARM`] is, and what it is not
+///
+/// A fixed pair of shelves — a lift at the bottom, a gentle softening at
+/// the very top — engaged before the output stage. The transformer curve,
+/// roughly.
+///
+/// It is NOT a second copy of the preamp's own tilt, which is a see-saw
+/// across the whole band pivoting at 1 kHz. This touches only the
+/// extremes and leaves the mids alone, so the two stack rather than
+/// duplicate: the tilt changes the balance, the switch changes the ends.
+///
+/// And because it is pre-drive, the button does more than an EQ curve
+/// could. With the drive down it is a couple of dB at the edges; with the
+/// drive up it is also a louder bottom end arriving at the clip.
+///
+/// # Zero drive is exactly off
+///
+/// `Preamp` promises a bit-exact bypass at `amount == 0`, checked per
+/// block. The strip's drive reaches that floor, so "how much of this is
+/// the colour?" is answerable by turning one knob down rather than by
+/// bypassing the card — the same promise [`lofi`](super::lofi) and
+/// [`sheen`](super::sheen) make. The shelves keep working, which is the
+/// point: at zero drive this is a clean two-band EQ.
+pub mod strip {
+    use super::ParamDef;
+
+    pub const LOW: u32 = 0;
+    pub const HIGH: u32 = 1;
+    pub const DRIVE: u32 = 2;
+    pub const WARM: u32 = 3;
+    pub const OUT: u32 = 4;
+
+    /// The shelves' window, in dB. Modest on purpose: a channel strip's
+    /// tone controls are for leaning on a source, and the eight-band EQ
+    /// next door is the device for surgery.
+    pub const SHELF_MAX_DB: f32 = 12.0;
+
+    /// Where the user's shelves sit. Fixed, because two knobs that also
+    /// chose their own corners would be four knobs.
+    pub const LOW_HZ: f32 = 120.0;
+    pub const HIGH_HZ: f32 = 8_000.0;
+
+    /// The shelves' Q. Gentle — a shelf that resonates at its corner is a
+    /// bell wearing a shelf's name.
+    pub const SHELF_Q: f32 = 0.7;
+
+    /// The warm switch's own curve: a lift at the bottom and a softening
+    /// at the top, both fixed. Small figures, because the button is meant
+    /// to be reached for and left on rather than auditioned.
+    pub const WARM_LOW_HZ: f32 = 100.0;
+    pub const WARM_LOW_DB: f32 = 2.0;
+    pub const WARM_HIGH_HZ: f32 = 10_000.0;
+    pub const WARM_HIGH_DB: f32 = -1.5;
+
+    /// The output trim's window, in dB, and the same figures as linear
+    /// gain — both forms written down for the reason
+    /// [`sat::OUT_MIN_DB`](super::sat::OUT_MIN_DB) gives.
+    pub const OUT_MIN_DB: f32 = -24.0;
+    pub const OUT_MAX_DB: f32 = 12.0;
+    /// `10^(-24/20)` and `10^(12/20)`, to f32 precision.
+    pub const OUT_MIN: f32 = 0.063_095_73;
+    pub const OUT_MAX: f32 = 3.981_072;
+
+    pub const WARM_OFF: u32 = 0;
+    pub const WARM_ON: u32 = 1;
+    /// What the switch prints, indexed by [`WARM`].
+    pub const WARM_NAMES: &[&str] = &["off", "on"];
+
+    pub const TABLE: &[ParamDef] = &[
+        ParamDef {
+            id: LOW,
+            name: "low",
+            min: -SHELF_MAX_DB,
+            max: SHELF_MAX_DB,
+            default: 0.0,
+        },
+        ParamDef {
+            id: HIGH,
+            name: "high",
+            min: -SHELF_MAX_DB,
+            max: SHELF_MAX_DB,
+            default: 0.0,
+        },
+        ParamDef {
+            id: DRIVE,
+            name: "drive",
+            min: 0.0,
+            max: 1.0,
+            // Coloured on arrival, for the reason `lofi`'s table gives:
+            // you add an analogue strip because you want the analogue,
+            // and one that does nothing until you turn a knob is the
+            // surprise. A third of the way up is where the preamp's
+            // second harmonic is audible and its hiss is not.
+            default: 0.35,
+        },
+        ParamDef {
+            id: WARM,
+            name: "warm",
+            min: WARM_OFF as f32,
+            max: WARM_ON as f32,
+            // OFF. The shelves default flat and so does this: the strip
+            // arrives with a colour (the drive) and no TONE decision,
+            // because a tone decision is about the source and the device
+            // has not heard it yet.
+            default: WARM_OFF as f32,
+        },
+        ParamDef {
+            id: OUT,
+            name: "out",
+            min: OUT_MIN,
+            max: OUT_MAX,
+            default: 1.0,
+        },
+    ];
+}
+
 pub mod gate {
     use super::ParamDef;
 
@@ -4392,6 +4537,7 @@ mod tests {
         ("tilt", tilt::TABLE),
         ("phaser", phaser::TABLE),
         ("gate", gate::TABLE),
+        ("strip", strip::TABLE),
     ];
 
     /// The invariant `def()` and every `TABLE[FOO as usize]` rely on.

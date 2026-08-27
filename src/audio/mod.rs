@@ -28,6 +28,7 @@ pub mod preamp;
 pub mod project;
 pub mod sampler;
 pub mod snare;
+pub mod strip;
 pub mod tom;
 pub mod transport;
 pub mod utility;
