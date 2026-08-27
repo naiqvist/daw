@@ -51,6 +51,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 mod bar;
+mod targets;
+use targets::{
+    DEVICE_TARGET_PREFIX, ParameterRegistry, ParameterSpec, TRACK_PAN_TARGET, TRACK_VOLUME_TARGET,
+    device_target,
+};
 mod focus;
 use focus::Focus;
 mod device_state;
@@ -61,7 +66,7 @@ use device_state::{
 };
 mod devices;
 use bar::{Bar, TRANSPORT_GAP, TRANSPORT_GROUP_GAP, bar_layout, buttons_width, fields_width};
-use devices::{DEVICES, DeviceKind, DeviceSpec, device_by_prefix};
+use devices::{DeviceKind, device_by_prefix};
 mod icon;
 mod piano_roll;
 mod session_bridge;
@@ -1652,117 +1657,6 @@ impl<'de> serde::Deserialize<'de> for Track {
             chain,
             sampler_sources: wire.sampler_sources,
         })
-    }
-}
-
-const TRACK_VOLUME_TARGET: &str = "track.volume";
-const TRACK_PAN_TARGET: &str = "track.pan";
-
-/// Stable, content-independent metadata for an automatable parameter.
-/// Devices will register more specs; the timeline only speaks these ids.
-#[derive(Clone, Debug, PartialEq)]
-struct ParameterSpec {
-    id: String,
-    group: String,
-    name: String,
-    unit: String,
-    min: f32,
-    max: f32,
-    default: f32,
-    stepped: bool,
-}
-
-#[derive(Clone, Debug)]
-struct ParameterRegistry {
-    specs: Vec<ParameterSpec>,
-}
-
-/// What every device target starts with. A target names an INSTANCE:
-/// `dev.7.reverb.mix` is the mix of the device with id 7, wherever it sits
-/// in whichever chain — which is what lets a chain be reordered without
-/// breaking a wire.
-const DEVICE_TARGET_PREFIX: &str = "dev.";
-
-/// The target id of one parameter of one device instance.
-fn device_target(id: u64, spec: &DeviceSpec, param: &'static str) -> String {
-    format!("{DEVICE_TARGET_PREFIX}{id}.{}.{param}", spec.prefix)
-}
-
-/// The kind-scoped tail of a target: `dev.7.reverb.mix` -> `reverb.mix`,
-/// and a track target is its own tail. What the registry is keyed by, since
-/// every instance of a kind has the same range, unit and name.
-fn target_tail(target: &str) -> &str {
-    target
-        .strip_prefix(DEVICE_TARGET_PREFIX)
-        .map_or(target, |rest| {
-            rest.split_once('.').map_or(rest, |(_, tail)| tail)
-        })
-}
-
-impl Default for ParameterRegistry {
-    fn default() -> Self {
-        let mut registry = Self { specs: Vec::new() };
-        registry.register(ParameterSpec {
-            id: TRACK_VOLUME_TARGET.to_owned(),
-            group: "Track".to_owned(),
-            name: "Volume".to_owned(),
-            unit: "dB".to_owned(),
-            min: 0.0,
-            max: 1.5,
-            default: 1.0,
-            stepped: false,
-        });
-        registry.register(ParameterSpec {
-            id: TRACK_PAN_TARGET.to_owned(),
-            group: "Track".to_owned(),
-            name: "Pan".to_owned(),
-            unit: "%".to_owned(),
-            min: -1.0,
-            max: 1.0,
-            default: 0.0,
-            stepped: false,
-        });
-        // The device rows are walked out of DEVICES: range and default come
-        // from `daw::params`, words from the device's labels. Adding a
-        // device adds its rows here without an edit.
-        for device in DEVICES {
-            for (def, label) in device.params.iter().zip(device.labels) {
-                registry.register(ParameterSpec {
-                    id: format!("{}.{}", device.prefix, def.name),
-                    group: label.group.to_owned(),
-                    name: label.name.to_owned(),
-                    unit: label.unit.to_owned(),
-                    min: def.min,
-                    max: def.max,
-                    default: def.default,
-                    stepped: false,
-                });
-            }
-        }
-        registry
-    }
-}
-
-impl ParameterRegistry {
-    /// The spec behind a target. Device targets are looked up by their
-    /// KIND-scoped tail: the registry holds one row per device parameter,
-    /// not one per instance, so a project with forty reverbs still has
-    /// three reverb specs.
-    fn spec(&self, id: &str) -> Option<&ParameterSpec> {
-        let tail = target_tail(id);
-        self.specs.iter().find(|spec| spec.id == tail)
-    }
-
-    fn register(&mut self, spec: ParameterSpec) {
-        if let Some(existing) = self
-            .specs
-            .iter_mut()
-            .find(|existing| existing.id == spec.id)
-        {
-            *existing = spec;
-        } else {
-            self.specs.push(spec);
-        }
     }
 }
 
@@ -19329,6 +19223,7 @@ impl eframe::App for App {
 mod tests {
     use super::bar::{TRANSPORT_BTN, TRANSPORT_PAD};
     use super::device_state::{device_norm, device_value};
+    use super::devices::{DEVICES, DeviceSpec};
     use super::focus::{Dir, RING_SETTLED_PX, nearest, spring_step};
     use super::icon::{ICON, PAUSE_BAR, PAUSE_GAP};
     use super::timecode::bars_beats;
