@@ -87,6 +87,7 @@ pub struct Gallery {
     dev_disperser: device::DisperserUi,
     dev_tilt: device::TiltUi,
     dev_phaser: device::PhaserUi,
+    dev_gate: device::GateUi,
 }
 
 impl Default for Gallery {
@@ -149,6 +150,7 @@ impl Default for Gallery {
             // its neutral setting is a preview of a straight line, so the
             // gallery leans this one over to show what the card draws.
             dev_phaser: device::PhaserUi::default(),
+            dev_gate: device::GateUi::default(),
             dev_tilt: device::TiltUi {
                 tilt: device::tilt_norm(params::tilt::TILT, 6.0),
                 ..device::TiltUi::default()
@@ -783,6 +785,13 @@ impl Gallery {
                     "PhaserEdit(param {}, {:.2})",
                     edit.param, edit.value
                 ));
+            }
+
+            kit::gap(ui, theme, space::SM);
+            kit::muted(ui, theme, "gate — the transfer curve, and it drags");
+            for edit in device::gate_card(ui, theme, &mut self.dev_gate) {
+                self.log
+                    .push(format!("GateEdit(param {}, {:.2})", edit.param, edit.value));
             }
 
             kit::gap(ui, theme, space::SM);

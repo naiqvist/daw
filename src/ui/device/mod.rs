@@ -84,6 +84,7 @@ pub mod eq;
 pub mod fader;
 pub mod field;
 pub mod filter;
+pub mod gate;
 pub mod glue;
 pub mod handclap;
 pub mod hat;
@@ -139,6 +140,9 @@ pub use eq::{EqUi, eq_card, eq_edits, eq_is_discrete, eq_is_log, eq_norm, eq_val
 pub use filter::{
     FilterUi, filter_card, filter_choices, filter_edits, filter_format, filter_is_discrete,
     filter_is_log, filter_norm, filter_value,
+};
+pub use gate::{
+    GateUi, gate_card, gate_edits, gate_is_discrete, gate_is_log, gate_norm, gate_value,
 };
 pub use glue::{
     GlueUi, glue_card, glue_edits, glue_is_discrete, glue_is_log, glue_norm, glue_value,

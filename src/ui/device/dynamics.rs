@@ -321,8 +321,33 @@ pub fn transfer_curve(
     dyn_: &mut Dynamics,
     level_db: Option<f32>,
 ) -> bool {
+    transfer_curve_sized(ui, theme, dyn_, level_db, footprint(theme).size.y)
+}
+
+/// The same display, at a size the caller chooses. Square, like the
+/// footprint version — `side` is both dimensions.
+///
+/// Added for the gate's card, which draws this inside
+/// `poly_widgets::dark_curve_panel`. That panel pays for its footer rows
+/// first and hands the plot whatever is left, which on a tall card is
+/// about 130 points — less than [`footprint`]'s 160. Allocating the fixed
+/// square there overflowed the region and printed the curve through the
+/// value strip underneath it, which is mistake one in
+/// `notes/20260827-device-card-layout.md`, arriving from the widget's end
+/// rather than the card's.
+///
+/// [`transfer_curve`] is unchanged and still takes the footprint, so the
+/// size contract every other caller relies on is intact.
+pub fn transfer_curve_sized(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    dyn_: &mut Dynamics,
+    level_db: Option<f32>,
+    side: f32,
+) -> bool {
+    let side = side.max(1.0);
     let (rect, response) =
-        ui.allocate_exact_size(footprint(theme).size, egui::Sense::click_and_drag());
+        ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::click_and_drag());
     let mut changed = false;
 
     if response.dragged() {

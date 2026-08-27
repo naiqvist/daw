@@ -13,6 +13,7 @@
 pub mod bounce;
 pub mod eq;
 pub mod filter;
+pub mod gate;
 pub mod glue;
 pub mod graph;
 pub mod handclap;

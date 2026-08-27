@@ -3865,6 +3865,143 @@ pub mod sampler {
 /// nothing to cancel against and the device passes through whatever the
 /// mix says. The same exact-off the rest of these devices insist on,
 /// arriving for free out of the kernel's own wire.
+/// The gate — downward expansion, as a device.
+///
+/// `dsp::dynamics::Mode::Expand` has existed since the dynamics family
+/// landed, and its own doc calls it "a gate at high ratio". Until now
+/// nothing in the audio path used it: `audio::glue` is a compressor, and
+/// the only caller of `Expand` anywhere was the display widget that draws
+/// its curve. This table is what it takes to make it a device.
+///
+/// # Attack and release mean the opposite of what they mean on the glue
+///
+/// A compressor ATTACKS by pulling the gain DOWN. A gate attacks by
+/// letting it UP — the signal crossed the threshold and the gate opens.
+/// `dsp::dynamics::Ballistics` uses the compressor's convention (attack
+/// is whichever direction adds reduction), so `audio::gate` hands it the
+/// two times SWAPPED. See `GateCore::process`; a test measures the
+/// opening and closing times so the swap cannot quietly come undone.
+///
+/// # And it listens to its INPUT, not its output
+///
+/// The glue is a feedback compressor: its detector reads its own output,
+/// which is what gives it its character. A gate must not be. Once a
+/// feedback gate closed, its detector would hear the silence it had just
+/// made, decide the signal was still below the threshold, and stay shut
+/// forever. Feed-forward is not a preference here, it is the only
+/// topology that reopens.
+pub mod gate {
+    use super::ParamDef;
+
+    pub const THRESHOLD: u32 = 0;
+    pub const RATIO: u32 = 1;
+    pub const ATTACK: u32 = 2;
+    pub const RELEASE: u32 = 3;
+    pub const RANGE: u32 = 4;
+
+    /// Where the gate decides, in dBFS.
+    ///
+    /// # These two ranges are the DISPLAY's, deliberately
+    ///
+    /// `ui::device::dynamics` draws its transfer curve across
+    /// `VIEW_MIN_DB..VIEW_MAX_DB` with a ratio axis of
+    /// `RATIO_MIN..RATIO_MAX`, and on the gate's card that curve is not
+    /// an illustration — it is the control, dragged to set both. A knob
+    /// that reached past the axis it is drawn on would put the threshold
+    /// cell and the threshold handle in disagreement, and the card's
+    /// whole premise is that they cannot disagree.
+    ///
+    /// So the table takes the widget's figures rather than the kernel's
+    /// wider ones. Nothing is lost that a gate wants: a threshold under
+    /// -60 dBFS is below the noise it would be gating, and 60:1 is
+    /// already a closed door — `dsp::dynamics`' own doc says past about a
+    /// hundred the curve is "a gate to more digits than a float holds".
+    pub const THRESHOLD_MIN_DB: f32 = crate::ui::device::dynamics::VIEW_MIN_DB;
+    pub const THRESHOLD_MAX_DB: f32 = crate::ui::device::dynamics::VIEW_MAX_DB;
+
+    /// How steeply it expands below the threshold. The display's axis —
+    /// see [`THRESHOLD_MIN_DB`].
+    pub const RATIO_MIN: f32 = crate::ui::device::dynamics::RATIO_MIN;
+    pub const RATIO_MAX: f32 = crate::ui::device::dynamics::RATIO_MAX;
+
+    /// How fast it OPENS, in ms. Fast at the bottom, because a gate that
+    /// takes even a millisecond to open has already eaten the transient
+    /// it was let through for.
+    pub const ATTACK_MIN_MS: f32 = 0.05;
+    pub const ATTACK_MAX_MS: f32 = 100.0;
+
+    /// How fast it CLOSES, in ms.
+    pub const RELEASE_MIN_MS: f32 = 5.0;
+    pub const RELEASE_MAX_MS: f32 = 2_000.0;
+
+    /// The most it will ever shut, in dB.
+    ///
+    /// A gate that closes completely is the special case, not the
+    /// default: leaving a little of the room in is what makes gated drums
+    /// sound gated rather than chopped. Zero range is the device switched
+    /// off in all but name, which is what the bottom of the control is
+    /// for — and it is exact, because a range of nothing is a gain of
+    /// one.
+    pub const RANGE_MAX_DB: f32 = 80.0;
+
+    /// The detector's window, in ms. Not a knob: a gate is a decision
+    /// about whether a sound has started, and a slow window blurs the one
+    /// question it exists to answer. Fast enough to catch a stick, slow
+    /// enough not to chatter on a waveform's own zero crossings.
+    pub const WINDOW_MS: f32 = 3.0;
+
+    /// The knee, in dB, centred on the threshold. Not a knob either —
+    /// five rows is already the biggest of the small devices, and a
+    /// gate's knee is a refinement rather than a decision. Soft enough
+    /// that programme sitting near the threshold breathes instead of
+    /// stuttering.
+    pub const KNEE_DB: f32 = 6.0;
+
+    pub const TABLE: &[ParamDef] = &[
+        ParamDef {
+            id: THRESHOLD,
+            name: "threshold",
+            min: THRESHOLD_MIN_DB,
+            max: THRESHOLD_MAX_DB,
+            default: -40.0,
+        },
+        ParamDef {
+            id: RATIO,
+            name: "ratio",
+            min: RATIO_MIN,
+            max: RATIO_MAX,
+            // Eight to one. Unmistakably a gate and still an EXPANDER —
+            // it leans on quiet material rather than deleting it, which
+            // is the setting that flatters most sources. The top of the
+            // range is there for when you want the chop.
+            default: 8.0,
+        },
+        ParamDef {
+            id: ATTACK,
+            name: "attack",
+            min: ATTACK_MIN_MS,
+            max: ATTACK_MAX_MS,
+            default: 1.0,
+        },
+        ParamDef {
+            id: RELEASE,
+            name: "release",
+            min: RELEASE_MIN_MS,
+            max: RELEASE_MAX_MS,
+            default: 150.0,
+        },
+        ParamDef {
+            id: RANGE,
+            name: "range",
+            min: 0.0,
+            max: RANGE_MAX_DB,
+            // Sixty dB down is closed to any ear, and still short of the
+            // silence that makes a gate sound like an edit.
+            default: 60.0,
+        },
+    ];
+}
+
 pub mod phaser {
     use super::ParamDef;
 
@@ -4254,6 +4391,7 @@ mod tests {
         ("disperser", disperser::TABLE),
         ("tilt", tilt::TABLE),
         ("phaser", phaser::TABLE),
+        ("gate", gate::TABLE),
     ];
 
     /// The invariant `def()` and every `TABLE[FOO as usize]` rely on.

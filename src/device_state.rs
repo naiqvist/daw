@@ -260,6 +260,7 @@ pub enum DeviceState {
     Eq(daw::audio::eq::EqParams),
     Filter(daw::audio::filter::FilterParams),
     Glue(daw::audio::glue::GlueParams),
+    Gate(daw::audio::gate::GateParams),
     Limiter(daw::audio::limiter::LimiterParams),
     Modulato(daw::audio::modulato::ModulatoParams),
     Utility(daw::audio::utility::UtilityParams),
@@ -288,6 +289,7 @@ impl DeviceState {
             DeviceKind::Eq => Self::Eq(daw::audio::eq::EqParams::default()),
             DeviceKind::Filter => Self::Filter(daw::audio::filter::FilterParams::default()),
             DeviceKind::Glue => Self::Glue(daw::audio::glue::GlueParams::default()),
+            DeviceKind::Gate => Self::Gate(daw::audio::gate::GateParams::default()),
             DeviceKind::Limiter => Self::Limiter(daw::audio::limiter::LimiterParams::default()),
             DeviceKind::Modulato => Self::Modulato(daw::audio::modulato::ModulatoParams::default()),
             DeviceKind::Utility => Self::Utility(daw::audio::utility::UtilityParams::default()),
@@ -315,6 +317,7 @@ impl DeviceState {
             Self::Eq(_) => DeviceKind::Eq,
             Self::Filter(_) => DeviceKind::Filter,
             Self::Glue(_) => DeviceKind::Glue,
+            Self::Gate(_) => DeviceKind::Gate,
             Self::Limiter(_) => DeviceKind::Limiter,
             Self::Modulato(_) => DeviceKind::Modulato,
             Self::Utility(_) => DeviceKind::Utility,
@@ -424,6 +427,7 @@ impl DeviceState {
             // in the struct that owns them.
             Self::Filter(p) => Some(p.get(param)),
             Self::Glue(p) => p.get(param),
+            Self::Gate(p) => p.get(param),
             // Its own reader beside its own writer, in the struct that
             // owns them — spelling seven rows out again here is how the
             // two halves drift.
@@ -521,6 +525,7 @@ impl DeviceState {
             Self::Eq(p) => p.set(param, value),
             Self::Filter(p) => p.set(param, value),
             Self::Glue(p) => p.set(param, value),
+            Self::Gate(p) => p.set(param, value),
             Self::Limiter(p) => p.set(param, value),
             Self::Modulato(p) => p.set(param, value),
             Self::Utility(p) => p.set(param, value),
@@ -712,6 +717,18 @@ pub fn utility_knobs(params: daw::audio::utility::UtilityParams) -> device::Util
     knobs
 }
 
+pub fn gate_knobs(params: daw::audio::gate::GateParams) -> device::GateUi {
+    let mut knobs = device::GateUi::default();
+    for def in daw::params::gate::TABLE {
+        if let Some(value) = params.get(def.id)
+            && let Some(slot) = knobs.slot_mut(def.id)
+        {
+            *slot = device_norm(DeviceKind::Gate, def.id, value);
+        }
+    }
+    knobs
+}
+
 pub fn glue_knobs(params: daw::audio::glue::GlueParams) -> device::GlueUi {
     let mut knobs = device::GlueUi::default();
     for def in daw::params::glue::TABLE {
@@ -777,6 +794,7 @@ pub fn device_norm(kind: DeviceKind, param: u32, value: f32) -> f32 {
         DeviceKind::Eq => device::eq_norm(param, value),
         DeviceKind::Filter => device::filter_norm(param, value),
         DeviceKind::Glue => device::glue_norm(param, value),
+        DeviceKind::Gate => device::gate_norm(param, value),
         DeviceKind::Modulato => device::modulato::modulato_norm(param, value),
         DeviceKind::Utility => device::utility_norm(param, value),
     }
@@ -812,6 +830,7 @@ pub fn device_is_discrete(kind: DeviceKind, param: u32) -> bool {
         DeviceKind::Eq => device::eq_is_discrete(param),
         DeviceKind::Filter => device::filter_is_discrete(param),
         DeviceKind::Glue => device::glue_is_discrete(param),
+        DeviceKind::Gate => device::gate_is_discrete(param),
         DeviceKind::Modulato => device::modulato::modulato_is_discrete(param),
         DeviceKind::Utility => device::utility_is_discrete(param),
         DeviceKind::SineSynth | DeviceKind::Reverb => false,
@@ -842,6 +861,7 @@ pub fn device_is_log(kind: DeviceKind, param: u32) -> bool {
         DeviceKind::Eq => device::eq_is_log(param),
         DeviceKind::Filter => device::filter_is_log(param),
         DeviceKind::Glue => device::glue_is_log(param),
+        DeviceKind::Gate => device::gate_is_log(param),
         DeviceKind::Modulato => device::modulato::modulato_is_log(param),
         DeviceKind::Utility => device::utility_is_log(param),
         DeviceKind::Reverb => false,
@@ -875,6 +895,7 @@ pub fn device_value(kind: DeviceKind, param: u32, norm: f32) -> f32 {
         DeviceKind::Eq => device::eq_value(param, norm),
         DeviceKind::Filter => device::filter_value(param, norm),
         DeviceKind::Glue => device::glue_value(param, norm),
+        DeviceKind::Gate => device::gate_value(param, norm),
         DeviceKind::Modulato => device::modulato::modulato_value(param, norm),
         DeviceKind::Utility => device::utility_value(param, norm),
     }

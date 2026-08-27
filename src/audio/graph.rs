@@ -1944,6 +1944,20 @@ pub enum Node {
     Glue {
         core: Box<crate::audio::glue::GlueCore>,
     },
+    /// Downward expansion — see `crate::audio::gate`. The glue's three
+    /// kernels with the computer's mode flipped, plus the two things a
+    /// gate must do differently: hear its own INPUT, and cross its
+    /// attack and release on the way to the ballistics.
+    ///
+    /// Boxed for the reason the glue's core is: `Node` is sized by its
+    /// largest variant.
+    ///
+    /// Free-running — it holds a detector's history and a gain, not a
+    /// timeline position — and it REOPENS on discontinuity, exactly as
+    /// the glue arrives un-compressed.
+    Gate {
+        core: Box<crate::audio::gate::GateCore>,
+    },
     /// Gain, placement and the stereo field — see
     /// `crate::audio::utility`. The device with no tone of its own.
     ///
@@ -2023,6 +2037,7 @@ impl Node {
             | NodeSpec::Eq { .. }
             | NodeSpec::Filter { .. }
             | NodeSpec::Glue { .. }
+            | NodeSpec::Gate { .. }
             | NodeSpec::Limiter { .. }
             | NodeSpec::Utility { .. }
             | NodeSpec::Lofi { .. }
@@ -2045,6 +2060,7 @@ impl Node {
     fn readout(&self) -> Option<Readout> {
         match self {
             Node::Glue { core } => Some(core.readout()),
+            Node::Gate { core } => Some(core.readout()),
             _ => None,
         }
     }
@@ -3411,6 +3427,19 @@ impl Node {
                 core.process(out.l, right);
             }
 
+            Node::Gate { core } => {
+                let right = out.r.as_deref_mut().unwrap_or(&mut []);
+                sum_inputs_stereo(inputs, out.l, right);
+                // A seek must not carry the old position's gain into the
+                // new one — and the gate REOPENS rather than staying
+                // shut, so a transport landing mid-phrase hears the
+                // phrase rather than the tail of a decision made
+                // somewhere else.
+                if ctx.discontinuity {
+                    core.reset();
+                }
+                core.process(out.l, right);
+            }
             Node::Glue { core } => {
                 let right = out.r.as_deref_mut().unwrap_or(&mut []);
                 sum_inputs_stereo(inputs, out.l, right);
@@ -3943,6 +3972,10 @@ impl Node {
             // range and every clamp, so a letter cannot be routed by two
             // different opinions about what id 4 is.
             Node::Glue { core } => core.set_param(param, value),
+            // The whole table, straight through, for the reason the glue
+            // does it: the core owns every range and every clamp, so a
+            // letter cannot be routed by two opinions about what id 3 is.
+            Node::Gate { core } => core.set_param(param, value),
             // The whole table, straight through, for the reason the two
             // arms above give: one door, so a letter cannot be routed by
             // two different opinions about what id 4 is.
@@ -4832,6 +4865,15 @@ pub enum NodeSpec {
     Glue {
         #[serde(default)]
         params: crate::audio::glue::GlueParams,
+    },
+    /// A gate on whatever feeds it. Every range and every `ParamChange`
+    /// id is `crate::params::gate::TABLE`'s.
+    ///
+    /// Stereo in, stereo out — a gate that summed to mono would decide
+    /// on one channel and act on two.
+    Gate {
+        #[serde(default)]
+        params: crate::audio::gate::GateParams,
     },
     /// Gain, pan, width, bass mono, phase and channel mode on whatever
     /// feeds it. Every range and every `ParamChange` id is
@@ -6232,6 +6274,13 @@ impl GraphSpec {
                         core: Box::new(crate::audio::eq::EqCore::new(
                             sample_rate as f32,
                             block_frames,
+                            params,
+                        )),
+                    },
+                    Some(NodeSpec::Gate { params }) => Node::Gate {
+                        // Green zone: every kernel the callback will use.
+                        core: Box::new(crate::audio::gate::GateCore::new(
+                            sample_rate as f32,
                             params,
                         )),
                     },

@@ -33,6 +33,7 @@ pub enum DeviceKind {
     Disperser,
     Tilt,
     Phaser,
+    Gate,
     Echo,
     Eq,
     Filter,
@@ -1626,6 +1627,43 @@ pub static DEVICES: &[DeviceSpec] = &[
                 name: "Mix",
                 unit: "",
                 group: "Phaser",
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Gate,
+        name: "gate",
+        instrument: false,
+        prefix: "gate",
+        params: daw::params::gate::TABLE,
+        // Units blank for the reason the others' are: the card prints
+        // "-40.0 dB", "8.00", "1.00 ms" and "-60.0 dB" through its own
+        // `Unit`.
+        labels: &[
+            ParamLabel {
+                name: "Threshold",
+                unit: "",
+                group: "Gate",
+            },
+            ParamLabel {
+                name: "Ratio",
+                unit: "",
+                group: "Gate",
+            },
+            ParamLabel {
+                name: "Attack",
+                unit: "",
+                group: "Gate",
+            },
+            ParamLabel {
+                name: "Release",
+                unit: "",
+                group: "Gate",
+            },
+            ParamLabel {
+                name: "Range",
+                unit: "",
+                group: "Gate",
             },
         ],
     },
