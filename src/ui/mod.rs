@@ -418,6 +418,7 @@ mod tests {
             "phaser.rs",    // ditto
             "gate.rs",      // ditto
             "strip.rs",     // ditto
+            "resyn.rs",     // ditto
             "modulato.rs",  // ditto
             "sampler.rs",   // ditto
             "snare.rs",     // ditto

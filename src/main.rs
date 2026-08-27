@@ -69,8 +69,8 @@ mod device_state;
 use device_state::{
     DeviceInstance, DeviceState, EchoParams, device_edits, device_is_discrete, device_is_log,
     disperser_knobs, echo_knobs, eq_knobs, gate_knobs, glue_knobs, lofi_knobs, phaser_knobs,
-    poly_knobs, reverb_knobs, sat_knobs, sheen_knobs, strip_knobs, synth_knobs, tilt_knobs,
-    unit_zoom, utility_knobs,
+    poly_knobs, resyn_knobs, reverb_knobs, sat_knobs, sheen_knobs, strip_knobs, synth_knobs,
+    tilt_knobs, unit_zoom, utility_knobs,
 };
 mod devices;
 use bar::{Bar, TRANSPORT_GAP, TRANSPORT_GROUP_GAP, bar_layout, buttons_width, fields_width};
@@ -9917,6 +9917,10 @@ impl Default for Browser {
                             load: DeviceKind::Strip,
                         },
                         BrowserItem {
+                            name: "Resyn",
+                            load: DeviceKind::Resyn,
+                        },
+                        BrowserItem {
                             name: "Delay",
                             load: DeviceKind::Echo,
                         },
@@ -11724,6 +11728,19 @@ fn device_body(
                                     let mut knobs = strip_knobs(params);
                                     device::strip_card(ui, theme, &mut knobs)
                                 }
+                                DeviceState::Resyn(params) => {
+                                    let mut knobs = resyn_knobs(params, instance.page);
+                                    let made = device::resyn_card(ui, theme, &mut knobs);
+                                    // The picked band is UI state the card
+                                    // forgets every frame, so the instance
+                                    // remembers it — the eq's road, and the
+                                    // device-UI contract's rule 3.
+                                    let band = knobs.selected.min(u8::MAX as usize) as u8;
+                                    if band != instance.page {
+                                        edits.pages.push((instance.id, band));
+                                    }
+                                    made
+                                }
                                 DeviceState::Glue(params) => {
                                     let mut knobs = glue_knobs(params);
                                     let history =
@@ -11953,6 +11970,7 @@ fn plockable_params(track: &Track) -> Vec<piano_roll::PlockParam> {
         | DeviceKind::Phaser
         | DeviceKind::Gate
         | DeviceKind::Strip
+        | DeviceKind::Resyn
         | DeviceKind::Echo
         | DeviceKind::Eq
         | DeviceKind::Filter
@@ -12207,6 +12225,12 @@ fn compile_chain(
                 devices.insert(instance.id, eq);
                 tail = eq;
             }
+            DeviceState::Resyn(params) => {
+                let node = spec.push(NodeSpec::Resyn { params });
+                spec.connect(tail, node);
+                devices.insert(instance.id, node);
+                tail = node;
+            }
             DeviceState::Strip(params) => {
                 let node = spec.push(NodeSpec::Strip { params });
                 spec.connect(tail, node);
@@ -12358,6 +12382,7 @@ fn build_graph_spec(
                     | DeviceState::Phaser(_)
                     | DeviceState::Gate(_)
                     | DeviceState::Strip(_)
+                    | DeviceState::Resyn(_)
                     | DeviceState::Limiter(_) => continue,
                     DeviceState::SineSynth(params) => NodeSpec::Seq {
                         notes,

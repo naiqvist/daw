@@ -3942,6 +3942,208 @@ pub mod sampler {
 /// bypassing the card — the same promise [`lofi`](super::lofi) and
 /// [`sheen`](super::sheen) make. The shelves keep working, which is the
 /// point: at zero drive this is a clean two-band EQ.
+/// The resynthesiser — the spectrum taken apart and put back together.
+///
+/// The first device in the tree to run `dsp::fft` in the AUDIO PATH.
+/// Until the tilt card measured a curve with it, nothing outside
+/// `src/dsp/` had called that module at all; this is the other half of
+/// paying it off.
+///
+/// Sound goes in, is cut into overlapping frames, transformed, altered as
+/// a MAGNITUDE SPECTRUM, and rebuilt. Everything the device does happens
+/// to that spectrum, which is why the controls are the ones they are: a
+/// gain per band, a formant shift, a spectral shift, and an envelope with
+/// its own attack and release.
+///
+/// # It is a resynthesiser, and that is a promise about the sound
+///
+/// The phase is left where it was found and only the magnitudes are
+/// moved. That is what makes this a resynthesis rather than a clean
+/// pitch or frequency shifter: it smears, and the smearing is the sound.
+/// A device that hid it would be a worse version of a different device.
+///
+/// # Latency
+///
+/// Real, constant, and reported: `SIZE` samples — the frame overlap plus
+/// the hop the output is buffered by. The graph's PDC compensates it, and
+/// `audio::resyn`'s `the_reported_latency_is_the_real_one` measures where
+/// an impulse actually comes out rather than trusting the arithmetic.
+pub mod resyn {
+    use super::ParamDef;
+
+    pub const FORMANT: u32 = 0;
+    pub const SHIFT: u32 = 1;
+    pub const ATTACK: u32 = 2;
+    pub const RELEASE: u32 = 3;
+    pub const WARM: u32 = 4;
+    pub const MIX: u32 = 5;
+    /// The first of [`BAND_COUNT`] consecutive per-band gain ids.
+    pub const BAND0: u32 = 6;
+
+    /// How many bands the spectrum is divided into for the gain rows.
+    ///
+    /// Eight, log-spaced. Enough to be a tone control with real reach and
+    /// few enough that one row of the card can pick between them, which
+    /// is the trade `eq.rs` already made and argued.
+    pub const BAND_COUNT: usize = 8;
+
+    /// The band edges, in Hz: `BAND_COUNT + 1` of them, log-spaced.
+    pub const BAND_EDGES: [f32; BAND_COUNT + 1] = [
+        20.0, 80.0, 200.0, 450.0, 1_000.0, 2_200.0, 4_800.0, 10_000.0, 20_000.0,
+    ];
+
+    /// A band gain's window, in dB. The floor is a real cut rather than
+    /// silence: a band switched entirely off is a hole a resynthesis
+    /// cannot fill, and the result reads as a fault rather than a
+    /// setting.
+    pub const BAND_MIN_DB: f32 = -24.0;
+    pub const BAND_MAX_DB: f32 = 12.0;
+
+    /// The formant shift, in semitones. The spectral ENVELOPE moves and
+    /// the fine structure stays, which is what separates a voice's
+    /// character from its pitch.
+    pub const FORMANT_MAX_ST: f32 = 12.0;
+
+    /// The spectral shift, in Hz. ADDITIVE, not a ratio — every partial
+    /// moves by the same number of hertz, so their ratios change and the
+    /// result is inharmonic. That is the classic spectral shift and it is
+    /// deliberately not a pitch shift.
+    pub const SHIFT_MAX_HZ: f32 = 500.0;
+
+    /// The per-bin envelope's times, in ms. The attack is how fast a
+    /// partial is allowed to appear and the release how fast it may
+    /// leave; long releases are what turn programme into a pad.
+    pub const ATTACK_MIN_MS: f32 = 1.0;
+    pub const ATTACK_MAX_MS: f32 = 500.0;
+    pub const RELEASE_MIN_MS: f32 = 1.0;
+    pub const RELEASE_MAX_MS: f32 = 4_000.0;
+
+    pub const WARM_OFF: u32 = 0;
+    pub const WARM_ON: u32 = 1;
+    pub const WARM_NAMES: &[&str] = &["off", "on"];
+
+    /// The warm mode's spectral tilt, in dB at the top of the band.
+    ///
+    /// Distinct from [`strip`](super::strip)'s warm switch, which is a
+    /// pair of shelves in the time domain. This one is a tilt applied to
+    /// the MAGNITUDES, and it comes with the half a time-domain filter
+    /// cannot do: a gentle compression of each bin, which lifts quiet
+    /// partials toward the loud ones. That is what thickens a
+    /// resynthesis, and it has no equivalent as an EQ curve.
+    pub const WARM_TILT_DB: f32 = -6.0;
+    /// The exponent each magnitude is raised to in warm mode. Below one,
+    /// so quiet partials come up.
+    pub const WARM_EXPONENT: f32 = 0.85;
+
+    pub const TABLE: &[ParamDef] = &[
+        ParamDef {
+            id: FORMANT,
+            name: "formant",
+            min: -FORMANT_MAX_ST,
+            max: FORMANT_MAX_ST,
+            default: 0.0,
+        },
+        ParamDef {
+            id: SHIFT,
+            name: "shift",
+            min: -SHIFT_MAX_HZ,
+            max: SHIFT_MAX_HZ,
+            default: 0.0,
+        },
+        ParamDef {
+            id: ATTACK,
+            name: "attack",
+            min: ATTACK_MIN_MS,
+            max: ATTACK_MAX_MS,
+            // Fast enough to keep a transient recognisable. The device is
+            // already smearing; an attack that smeared further by default
+            // would make it sound broken rather than spectral.
+            default: 5.0,
+        },
+        ParamDef {
+            id: RELEASE,
+            name: "release",
+            min: RELEASE_MIN_MS,
+            max: RELEASE_MAX_MS,
+            default: 80.0,
+        },
+        ParamDef {
+            id: WARM,
+            name: "warm",
+            min: WARM_OFF as f32,
+            max: WARM_ON as f32,
+            default: WARM_OFF as f32,
+        },
+        ParamDef {
+            id: MIX,
+            name: "mix",
+            min: 0.0,
+            max: 1.0,
+            // Fully wet. A resynthesis blended with its own dry is a comb
+            // filter on everything the two still agree about, which is
+            // most of the signal at rest — audible, unwanted, and the
+            // reason this opens at the top rather than in the middle.
+            default: 1.0,
+        },
+        ParamDef {
+            id: BAND0 + 0,
+            name: "band 0",
+            min: -BAND_MIN_DB.abs(),
+            max: BAND_MAX_DB,
+            default: 0.0,
+        },
+        ParamDef {
+            id: BAND0 + 1,
+            name: "band 1",
+            min: -BAND_MIN_DB.abs(),
+            max: BAND_MAX_DB,
+            default: 0.0,
+        },
+        ParamDef {
+            id: BAND0 + 2,
+            name: "band 2",
+            min: -BAND_MIN_DB.abs(),
+            max: BAND_MAX_DB,
+            default: 0.0,
+        },
+        ParamDef {
+            id: BAND0 + 3,
+            name: "band 3",
+            min: -BAND_MIN_DB.abs(),
+            max: BAND_MAX_DB,
+            default: 0.0,
+        },
+        ParamDef {
+            id: BAND0 + 4,
+            name: "band 4",
+            min: -BAND_MIN_DB.abs(),
+            max: BAND_MAX_DB,
+            default: 0.0,
+        },
+        ParamDef {
+            id: BAND0 + 5,
+            name: "band 5",
+            min: -BAND_MIN_DB.abs(),
+            max: BAND_MAX_DB,
+            default: 0.0,
+        },
+        ParamDef {
+            id: BAND0 + 6,
+            name: "band 6",
+            min: -BAND_MIN_DB.abs(),
+            max: BAND_MAX_DB,
+            default: 0.0,
+        },
+        ParamDef {
+            id: BAND0 + 7,
+            name: "band 7",
+            min: -BAND_MIN_DB.abs(),
+            max: BAND_MAX_DB,
+            default: 0.0,
+        },
+    ];
+}
+
 pub mod strip {
     use super::ParamDef;
 
@@ -4538,6 +4740,7 @@ mod tests {
         ("phaser", phaser::TABLE),
         ("gate", gate::TABLE),
         ("strip", strip::TABLE),
+        ("resyn", resyn::TABLE),
     ];
 
     /// The invariant `def()` and every `TABLE[FOO as usize]` rely on.

@@ -89,6 +89,7 @@ pub struct Gallery {
     dev_phaser: device::PhaserUi,
     dev_gate: device::GateUi,
     dev_strip: device::StripUi,
+    dev_resyn: device::ResynUi,
 }
 
 impl Default for Gallery {
@@ -155,6 +156,22 @@ impl Default for Gallery {
             // Leaning, and warm on: the strip's defaults are flat shelves
             // and a switch off, so a preview at rest would be a preview of
             // a nearly straight line.
+            // Some bands moved, so the preview shows eight bars rather
+            // than a flat row of ticks.
+            dev_resyn: device::ResynUi {
+                bands: [
+                    device::resyn_norm(params::resyn::BAND0, 3.0),
+                    device::resyn_norm(params::resyn::BAND0, -6.0),
+                    device::resyn_norm(params::resyn::BAND0, 8.0),
+                    device::resyn_norm(params::resyn::BAND0, 5.0),
+                    device::resyn_norm(params::resyn::BAND0, -2.0),
+                    device::resyn_norm(params::resyn::BAND0, -10.0),
+                    device::resyn_norm(params::resyn::BAND0, 2.0),
+                    device::resyn_norm(params::resyn::BAND0, -4.0),
+                ],
+                selected: 2,
+                ..device::ResynUi::default()
+            },
             dev_strip: device::StripUi {
                 low: device::strip_norm(params::strip::LOW, 5.0),
                 high: device::strip_norm(params::strip::HIGH, -3.0),
@@ -813,6 +830,19 @@ impl Gallery {
             for edit in device::strip_card(ui, theme, &mut self.dev_strip) {
                 self.log.push(format!(
                     "StripEdit(param {}, {:.2})",
+                    edit.param, edit.value
+                ));
+            }
+
+            kit::gap(ui, theme, space::SM);
+            kit::muted(
+                ui,
+                theme,
+                "resyn — eight bands at once, one of them under the cells",
+            );
+            for edit in device::resyn_card(ui, theme, &mut self.dev_resyn) {
+                self.log.push(format!(
+                    "ResynEdit(param {}, {:.2})",
                     edit.param, edit.value
                 ));
             }

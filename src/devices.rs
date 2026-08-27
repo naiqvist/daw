@@ -35,6 +35,7 @@ pub enum DeviceKind {
     Phaser,
     Gate,
     Strip,
+    Resyn,
     Echo,
     Eq,
     Filter,
@@ -1701,6 +1702,87 @@ pub static DEVICES: &[DeviceSpec] = &[
                 name: "Out",
                 unit: "",
                 group: "Strip",
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Resyn,
+        name: "resyn",
+        instrument: false,
+        prefix: "resyn",
+        params: daw::params::resyn::TABLE,
+        // Units blank for the reason the others' are: the card prints
+        // "+2 st", "200 Hz", "80 ms" and "on" through its own `Unit`.
+        labels: &[
+            ParamLabel {
+                name: "Formant",
+                unit: "",
+                group: "Resyn",
+            },
+            ParamLabel {
+                name: "Shift",
+                unit: "",
+                group: "Resyn",
+            },
+            ParamLabel {
+                name: "Attack",
+                unit: "",
+                group: "Resyn",
+            },
+            ParamLabel {
+                name: "Release",
+                unit: "",
+                group: "Resyn",
+            },
+            ParamLabel {
+                name: "Warm",
+                unit: "",
+                group: "Resyn",
+            },
+            ParamLabel {
+                name: "Mix",
+                unit: "",
+                group: "Resyn",
+            },
+            ParamLabel {
+                name: "Band 1",
+                unit: "",
+                group: "Resyn",
+            },
+            ParamLabel {
+                name: "Band 2",
+                unit: "",
+                group: "Resyn",
+            },
+            ParamLabel {
+                name: "Band 3",
+                unit: "",
+                group: "Resyn",
+            },
+            ParamLabel {
+                name: "Band 4",
+                unit: "",
+                group: "Resyn",
+            },
+            ParamLabel {
+                name: "Band 5",
+                unit: "",
+                group: "Resyn",
+            },
+            ParamLabel {
+                name: "Band 6",
+                unit: "",
+                group: "Resyn",
+            },
+            ParamLabel {
+                name: "Band 7",
+                unit: "",
+                group: "Resyn",
+            },
+            ParamLabel {
+                name: "Band 8",
+                unit: "",
+                group: "Resyn",
             },
         ],
     },

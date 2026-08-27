@@ -111,6 +111,7 @@ pub mod poly_widgets;
 /// release build nothing.
 pub mod probe;
 pub mod readout;
+pub mod resyn;
 pub mod reverb;
 pub mod sampler;
 pub mod sat;
@@ -169,6 +170,9 @@ pub use phaser::{
 pub use poly::{
     OscUi, PolyUi, poly_card, poly_choices, poly_edits, poly_format, poly_is_discrete, poly_is_log,
     poly_norm, poly_value,
+};
+pub use resyn::{
+    ResynUi, resyn_card, resyn_edits, resyn_is_discrete, resyn_is_log, resyn_norm, resyn_value,
 };
 pub use reverb::{ReverbUi, reverb_card, reverb_edits, reverb_norm, reverb_value};
 pub use sampler::{

@@ -1971,6 +1971,22 @@ pub enum Node {
     Strip {
         core: Box<crate::audio::strip::StripCore>,
     },
+    /// The spectral resynthesiser — see `crate::audio::resyn`. The first
+    /// node in the tree to run an FFT in the callback.
+    ///
+    /// Boxed, and this one is not a nicety: the frame buffers, the
+    /// per-bin state and the output FIFO are a few tens of kilobytes, and
+    /// `Node` is sized by its largest variant.
+    ///
+    /// Free-running, and it CUTS on discontinuity — a frame half-filled
+    /// from before the seek would be reconstructed across the join.
+    ///
+    /// IT HAS REAL LATENCY, which is why `spec_latency` names it: PDC
+    /// delays every sibling path to match, and the device's own test
+    /// measures the figure rather than trusting it.
+    Resyn {
+        core: Box<crate::audio::resyn::ResynCore>,
+    },
     /// Gain, placement and the stereo field — see
     /// `crate::audio::utility`. The device with no tone of its own.
     ///
@@ -2052,6 +2068,7 @@ impl Node {
             | NodeSpec::Glue { .. }
             | NodeSpec::Gate { .. }
             | NodeSpec::Strip { .. }
+            | NodeSpec::Resyn { .. }
             | NodeSpec::Limiter { .. }
             | NodeSpec::Utility { .. }
             | NodeSpec::Lofi { .. }
@@ -3441,6 +3458,17 @@ impl Node {
                 core.process(out.l, right);
             }
 
+            Node::Resyn { core } => {
+                let right = out.r.as_deref_mut().unwrap_or(&mut []);
+                sum_inputs_stereo(inputs, out.l, right);
+                // A seek must not reconstruct a frame half-filled from
+                // before it, and must not carry the output FIFO's
+                // contents across the join.
+                if ctx.discontinuity {
+                    core.reset();
+                }
+                core.process(out.l, right);
+            }
             Node::Strip { core } => {
                 let right = out.r.as_deref_mut().unwrap_or(&mut []);
                 sum_inputs_stereo(inputs, out.l, right);
@@ -4001,6 +4029,7 @@ impl Node {
             // letter cannot be routed by two opinions about what id 3 is.
             Node::Gate { core } => core.set_param(param, value),
             Node::Strip { core } => core.set_param(param, value),
+            Node::Resyn { core } => core.set_param(param, value),
             // The whole table, straight through, for the reason the two
             // arms above give: one door, so a letter cannot be routed by
             // two different opinions about what id 4 is.
@@ -4908,6 +4937,14 @@ pub enum NodeSpec {
         #[serde(default)]
         params: crate::audio::strip::StripParams,
     },
+    /// A spectral resynthesiser on whatever feeds it. Every range and
+    /// every `ParamChange` id is `crate::params::resyn::TABLE`'s.
+    ///
+    /// Stereo in, stereo out.
+    Resyn {
+        #[serde(default)]
+        params: crate::audio::resyn::ResynParams,
+    },
     /// Gain, pan, width, bass mono, phase and channel mode on whatever
     /// feeds it. Every range and every `ParamChange` id is
     /// `crate::params::utility::TABLE`'s.
@@ -5181,6 +5218,11 @@ impl GraphSpec {
             // compensates for and the delay the device actually holds
             // cannot drift apart.
             NodeSpec::Limiter { .. } => crate::audio::limiter::latency(),
+            // Stated by the device itself, so the figure the graph
+            // compensates for and the delay it actually holds cannot
+            // drift apart — and `audio::resyn` MEASURES that figure
+            // rather than asserting it.
+            NodeSpec::Resyn { .. } => crate::audio::resyn::LATENCY,
             NodeSpec::Delay { samples, .. } => *samples,
             _ => 0,
         }
@@ -6307,6 +6349,14 @@ impl GraphSpec {
                         core: Box::new(crate::audio::eq::EqCore::new(
                             sample_rate as f32,
                             block_frames,
+                            params,
+                        )),
+                    },
+                    Some(NodeSpec::Resyn { params }) => Node::Resyn {
+                        // Green zone: every buffer the callback will use,
+                        // and there are a lot of them.
+                        core: Box::new(crate::audio::resyn::ResynCore::new(
+                            sample_rate as f32,
                             params,
                         )),
                     },

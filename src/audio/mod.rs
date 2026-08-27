@@ -26,6 +26,7 @@ pub mod modulato;
 pub mod poly;
 pub mod preamp;
 pub mod project;
+pub mod resyn;
 pub mod sampler;
 pub mod snare;
 pub mod strip;
