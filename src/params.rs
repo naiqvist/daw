@@ -4810,6 +4810,257 @@ pub mod sheen {
     ];
 }
 
+/// HAZE — the pad synth's table.
+///
+/// Nineteen knobs, and the count is a decision rather than an accident.
+/// The synth brief's thesis is that deep sound design should be a
+/// NAVIGATION problem and not a construction one, and a pad is the case
+/// where that bites hardest: the sound is slow, so every knob is a slow
+/// experiment, and sixty of them is an afternoon spent finding out that
+/// fifty-five did not matter.
+///
+/// So the axes here are the ones a pad is actually made of, and several
+/// knobs drive more than one thing underneath — `GRAIN` moves bit depth
+/// and sample rate together because "how lo-fi" is one question, and
+/// splitting it in two would be the construction problem wearing a
+/// disguise.
+pub mod haze {
+    use super::ParamDef;
+
+    pub const SPREAD: u32 = 0;
+    pub const SHAPE: u32 = 1;
+    pub const SUB: u32 = 2;
+    pub const DRIFT: u32 = 3;
+    pub const CUTOFF: u32 = 4;
+    pub const RESONANCE: u32 = 5;
+    pub const TRACK: u32 = 6;
+    pub const ENV: u32 = 7;
+    pub const ATTACK: u32 = 8;
+    pub const DECAY: u32 = 9;
+    pub const SUSTAIN: u32 = 10;
+    pub const RELEASE: u32 = 11;
+    pub const FILTER_ATTACK: u32 = 12;
+    pub const FILTER_DECAY: u32 = 13;
+    pub const ENSEMBLE: u32 = 14;
+    pub const WOW: u32 = 15;
+    pub const GRAIN: u32 = 16;
+    pub const WARMTH: u32 = 17;
+    pub const LEVEL: u32 = 18;
+
+    /// Voices. Two lane groups, which is where the SoA layout wants to
+    /// land, and enough that a held eight-note chord can be played over
+    /// without stealing from itself while the first one is still
+    /// releasing — a pad releases for seconds, so the release IS the
+    /// polyphony requirement.
+    pub const VOICES: usize = 16;
+    /// The detuned copies each note is played by.
+    pub const STACK: usize = 3;
+
+    /// The longest attack and release, in seconds.
+    ///
+    /// A pad synth whose attack stops at a second is not a pad synth.
+    /// Eight seconds in and sixteen out is the range the string machines
+    /// had, and the reason theirs went that far is that a chord change
+    /// under a long release is the sound the whole instrument exists for.
+    pub const ATTACK_MAX: f32 = 8.0;
+    pub const RELEASE_MAX: f32 = 16.0;
+
+    /// Detune between the stacked copies, in cents at full spread.
+    ///
+    /// Fifty is wide. At the top this is an ensemble rather than a
+    /// unison, which is what a pad wants — the beating between copies is
+    /// the movement, and a synth that only ever detunes by five cents
+    /// makes a chorus pedal necessary.
+    pub const SPREAD_MAX: f32 = 50.0;
+
+    pub const CUTOFF_MIN: f32 = 20.0;
+    pub const CUTOFF_MAX: f32 = 20_000.0;
+
+    pub const TABLE: &[ParamDef] = &[
+        ParamDef {
+            id: SPREAD,
+            name: "spread",
+            min: 0.0,
+            max: SPREAD_MAX,
+            // Open, because the stack IS the instrument. At zero the
+            // three copies are one oscillator and the whole analog
+            // argument collapses to a saw.
+            default: 14.0,
+        },
+        ParamDef {
+            id: SHAPE,
+            name: "shape",
+            min: 0.0,
+            max: 1.0,
+            // Between triangle and saw rather than at either: a pad
+            // wants more than a sine's nothing and less than a saw's
+            // everything, and the interesting half of this knob is the
+            // middle.
+            default: 0.55,
+        },
+        ParamDef {
+            id: SUB,
+            name: "sub",
+            min: 0.0,
+            max: 1.0,
+            // Present but under. A pad without weight sits on top of a
+            // mix instead of under it, and the sub octave is the
+            // cheapest weight there is.
+            default: 0.3,
+        },
+        ParamDef {
+            id: DRIFT,
+            name: "drift",
+            min: 0.0,
+            max: 1.0,
+            // THE ANALOG KNOB, and it defaults ON. Voices that are never
+            // quite in tune with each other and never quite steady is
+            // the whole of what "analog" means to an ear; a digital
+            // polysynth is one where every voice is identical, and that
+            // is exactly what it sounds like.
+            default: 0.35,
+        },
+        ParamDef {
+            id: CUTOFF,
+            name: "cutoff",
+            min: CUTOFF_MIN,
+            max: CUTOFF_MAX,
+            // Closed enough to be a pad on the first note. An
+            // instrument that opens fully bright has thrown away the
+            // gesture it is for.
+            default: 2_200.0,
+        },
+        ParamDef {
+            id: RESONANCE,
+            name: "reso",
+            min: 0.0,
+            max: 1.0,
+            // A touch, not a whistle. Resonance on a slow chord is a
+            // formant; past about a third it is a sine playing over the
+            // top of the pad.
+            default: 0.15,
+        },
+        ParamDef {
+            id: TRACK,
+            name: "track",
+            min: 0.0,
+            max: 1.0,
+            // Most of the way, and this is the pad-specific choice on
+            // this knob. Without keytracking a wide chord has its top
+            // notes filtered into nothing while the bottom ones stay
+            // bright, which is how a pad turns to mud as it climbs.
+            default: 0.7,
+        },
+        ParamDef {
+            id: ENV,
+            name: "env",
+            min: -1.0,
+            max: 1.0,
+            // Opening, gently. The slow filter rise under a long attack
+            // is the pad gesture; making it the default is making the
+            // instrument what it says it is.
+            default: 0.35,
+        },
+        ParamDef {
+            id: ATTACK,
+            name: "attack",
+            min: 0.0,
+            max: ATTACK_MAX,
+            default: 0.9,
+        },
+        ParamDef {
+            id: DECAY,
+            name: "decay",
+            min: 0.0,
+            max: ATTACK_MAX,
+            default: 1.5,
+        },
+        ParamDef {
+            id: SUSTAIN,
+            name: "sustain",
+            min: 0.0,
+            max: 1.0,
+            // High. A pad is a held sound; a low sustain makes it a
+            // plucked one, and there are other devices for that.
+            default: 0.8,
+        },
+        ParamDef {
+            id: RELEASE,
+            name: "release",
+            min: 0.0,
+            max: RELEASE_MAX,
+            // Long enough that a chord change overlaps itself, which is
+            // the sound the instrument exists for.
+            default: 2.4,
+        },
+        ParamDef {
+            id: FILTER_ATTACK,
+            name: "f.atk",
+            min: 0.0,
+            max: ATTACK_MAX,
+            // SLOWER than the amp's, deliberately. The note arrives and
+            // then opens: that lag is the whole gesture, and equal times
+            // would hide it.
+            default: 1.8,
+        },
+        ParamDef {
+            id: FILTER_DECAY,
+            name: "f.dec",
+            min: 0.0,
+            max: ATTACK_MAX,
+            default: 2.5,
+        },
+        ParamDef {
+            id: ENSEMBLE,
+            name: "ens",
+            min: 0.0,
+            max: 1.0,
+            // On. The string machines this instrument is descended from
+            // had the chorus wired in and no way to switch it off,
+            // because without it they were thin — and the reason a
+            // three-tap ensemble reads as "lush" is that it is three
+            // more detunings on top of the stack's own.
+            default: 0.45,
+        },
+        ParamDef {
+            id: WOW,
+            name: "wow",
+            min: 0.0,
+            max: 1.0,
+            // A little. Wow is the tape half of the lo-fi story and the
+            // half that works on slow material: a pitch that is never
+            // quite still is what separates a recording from a render.
+            default: 0.2,
+        },
+        ParamDef {
+            id: GRAIN,
+            name: "grain",
+            min: 0.0,
+            max: 1.0,
+            // ONE knob over bit depth and sample rate together, because
+            // "how lo-fi" is one question. Bypasses EXACTLY at zero, the
+            // promise every colour stage in this codebase makes.
+            default: 0.25,
+        },
+        ParamDef {
+            id: WARMTH,
+            name: "warmth",
+            min: 0.0,
+            max: 1.0,
+            // The output stage: tilt, soft clip, a gated hiss. Exact
+            // bypass at zero, same promise.
+            default: 0.35,
+        },
+        ParamDef {
+            id: LEVEL,
+            name: "level",
+            min: 0.0,
+            max: 2.0,
+            default: 0.8,
+        },
+    ];
+}
+
 pub mod lofi {
     use super::ParamDef;
 
@@ -4895,6 +5146,7 @@ mod tests {
         ("sat", sat::TABLE),
         ("echo", echo::TABLE),
         ("poly", poly::TABLE),
+        ("haze", haze::TABLE),
         ("eq", eq::TABLE),
         ("glue", glue::TABLE),
         ("kick", kick::TABLE),
