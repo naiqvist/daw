@@ -46,6 +46,19 @@ pub struct Track {
     /// its source is the sum of the lanes nested under it.
     #[serde(default)]
     pub is_group: bool,
+    /// A group drawn CLOSED: its members are hidden from both views.
+    ///
+    /// Saved with the project rather than kept as machine-local view
+    /// state, and that is the deliberate choice: which parts of a mix
+    /// are put away is a fact about the arrangement — the drums are
+    /// finished, so they are closed — and it should survive being
+    /// emailed to someone else along with the song.
+    ///
+    /// A folded group still SOUNDS. Hiding is not muting, and a lane
+    /// that fell silent because it was tidied away would be the worst
+    /// bug this feature could have.
+    #[serde(default)]
+    pub folded: bool,
     /// How deeply nested in the stack. Zero is top level; a lane at
     /// depth `d` belongs to the nearest group above it at depth `d - 1`.
     ///
@@ -480,6 +493,31 @@ pub fn solo_in_scope(tracks: &[Track], index: usize) -> bool {
     group_members(tracks, index).any(|member| solo_in_scope(tracks, member))
 }
 
+/// Is this lane inside a folded group?
+///
+/// Walks the stack rather than the parent chain, because a fold hides a
+/// contiguous RUN: everything under the folded lane until the stack
+/// comes back up to its level. Reading it forwards means one pass says
+/// the answer for every lane, which is what the layouts want.
+///
+/// Nested folds need no special case — once a run is hiding, a folded
+/// group inside it is hidden along with everything it holds.
+pub fn hidden_by_fold(tracks: &[Track], index: usize) -> bool {
+    let mut hiding: Option<u8> = None;
+    for (at, track) in tracks.iter().enumerate() {
+        if hiding.is_some_and(|depth| track.depth <= depth) {
+            hiding = None;
+        }
+        if at == index {
+            return hiding.is_some();
+        }
+        if hiding.is_none() && track.is_group && track.folded {
+            hiding = Some(track.depth);
+        }
+    }
+    false
+}
+
 /// Force the nesting rule onto a stack that came from a FILE.
 ///
 /// The rule is one line: a lane may sit one level deeper than what came
@@ -491,6 +529,9 @@ pub fn sanitize_nesting(tracks: &mut [Track]) {
     let mut allowed = 0;
     for track in tracks.iter_mut() {
         track.depth = track.depth.min(allowed).min(MAX_GROUP_DEPTH);
+        // A lane that is not a group has nothing to fold, and a stray
+        // flag on one would hide the lanes after it forever.
+        track.folded &= track.is_group;
         allowed = if track.is_group {
             track.depth.saturating_add(1)
         } else {
@@ -612,6 +653,7 @@ impl Default for Track {
             pan: 0.0,
             volume: 1.0,
             is_group: false,
+            folded: false,
             depth: 0,
             input: TrackInput::default(),
             monitor: Monitor::default(),
@@ -653,6 +695,8 @@ pub struct TrackWire {
     #[serde(default)]
     pub is_group: bool,
     #[serde(default)]
+    pub folded: bool,
+    #[serde(default)]
     pub depth: u8,
     /// Absent from a project written before routing existed, which loads
     /// as a lane that is its clips and nothing else — exactly how it
@@ -691,6 +735,7 @@ impl Default for TrackWire {
             pan: track.pan,
             volume: track.volume,
             is_group: track.is_group,
+            folded: track.folded,
             depth: track.depth,
             input: track.input,
             monitor: track.monitor,
@@ -768,6 +813,7 @@ impl<'de> serde::Deserialize<'de> for Track {
             pan: wire.pan,
             volume: wire.volume,
             is_group: wire.is_group,
+            folded: wire.folded,
             depth: wire.depth,
             input: wire.input,
             monitor: wire.monitor,

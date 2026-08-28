@@ -3752,6 +3752,23 @@ impl Arrangement {
         true
     }
 
+    /// Open or close the selected group.
+    ///
+    /// Only a group can be folded — a lane with nothing under it has
+    /// nothing to put away — and the refusal is the caller's to report.
+    fn fold_track(&mut self) -> bool {
+        let Some(at) = self.selected else {
+            return false;
+        };
+        let Some(lane) = self.tracks.get_mut(at).filter(|lane| lane.is_group) else {
+            return false;
+        };
+        lane.folded = !lane.folded;
+        // NOT a recompile: folding hides lanes, it does not silence
+        // them, and the schedule has no opinion about what is on screen.
+        true
+    }
+
     /// Dissolve the selected group: the lane goes, its members come up a
     /// level and stay exactly where they are.
     fn ungroup_track(&mut self) -> bool {
@@ -4120,7 +4137,15 @@ impl Arrangement {
 
     /// The total height of every lane, stacked.
     fn lane_stack_height(&self) -> f32 {
-        self.tracks.iter().map(|t| t.height).sum()
+        self.visible_lanes().map(|(_, t)| t.height).sum()
+    }
+
+    /// The lanes a fold is not hiding, with their indices.
+    fn visible_lanes(&self) -> impl Iterator<Item = (usize, &Track)> {
+        self.tracks
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !track::hidden_by_fold(&self.tracks, *index))
     }
 
     /// The furthest the lane stack may be scrolled down: what does not
@@ -4137,7 +4162,10 @@ impl Arrangement {
 
     /// Where a lane's top edge sits in the stack, ignoring scroll.
     fn lane_top(&self, track: usize) -> f32 {
-        self.tracks.iter().take(track).map(|t| t.height).sum()
+        self.visible_lanes()
+            .take_while(|(index, _)| *index < track)
+            .map(|(_, t)| t.height)
+            .sum()
     }
 
     /// STEP TWO of the focus gesture: grow the selected clip's lane to
@@ -4656,12 +4684,25 @@ fn lane_rects(area: egui::Rect, tracks: &[Track], scroll_y: f32) -> Vec<egui::Re
     let mut y = area.top() - scroll_y;
     tracks
         .iter()
-        .map(|t| {
+        .enumerate()
+        .map(|(index, t)| {
+            // A lane inside a folded group gets a rect of ZERO HEIGHT
+            // where the next visible lane begins — not `Rect::NOTHING`.
+            // Every reader of this list either skips an empty lane or
+            // asks whether the pointer is inside it, and both answer
+            // correctly for an empty rect; a rect at infinity would make
+            // the "past the bottom, stop drawing" test fire on the first
+            // hidden lane and take every lane after it down too.
+            let height = if track::hidden_by_fold(tracks, index) {
+                0.0
+            } else {
+                t.height
+            };
             let rect = egui::Rect::from_min_max(
                 egui::pos2(area.left(), y),
-                egui::pos2(area.right(), y + t.height),
+                egui::pos2(area.right(), y + height),
             );
-            y += t.height;
+            y += height;
             rect
         })
         .collect()
@@ -5889,6 +5930,7 @@ fn header_meter(
 #[derive(Clone, Copy, Debug)]
 enum TrackHeaderMenu {
     Rename,
+    Fold,
     MoveUp,
     MoveDown,
     Mute,
@@ -6096,6 +6138,7 @@ fn track_headers(
     let mut mute: Option<usize> = None;
     let mut solo: Option<usize> = None;
     let mut rename_open: Option<usize> = None;
+    let mut fold: Option<usize> = None;
     let mut pan_edit: Option<(usize, f32)> = None;
     let mut delete: Option<usize> = None;
     let menu: std::cell::Cell<Option<(usize, TrackHeaderMenu)>> = std::cell::Cell::new(None);
@@ -6162,6 +6205,18 @@ fn track_headers(
                 .clicked()
             {
                 menu.set(Some((i, TrackHeaderMenu::MoveDown)));
+                ui.close();
+            }
+            if track.is_group
+                && ui
+                    .button(if track.folded {
+                        "Unfold group"
+                    } else {
+                        "Fold group"
+                    })
+                    .clicked()
+            {
+                menu.set(Some((i, TrackHeaderMenu::Fold)));
                 ui.close();
             }
             ui.separator();
@@ -6441,6 +6496,7 @@ fn track_headers(
         select = Some(i);
         match action {
             TrackHeaderMenu::Rename => rename_open = Some(i),
+            TrackHeaderMenu::Fold => fold = Some(i),
             TrackHeaderMenu::MoveUp if i > 0 => reorder = Some((i, i - 1)),
             TrackHeaderMenu::MoveDown if i + 1 < arr.tracks.len() => {
                 reorder = Some((i, i + 1));
@@ -6455,6 +6511,13 @@ fn track_headers(
     if let Some(i) = select {
         arr.select_track(i);
         arr.selected_clip = None;
+    }
+    // Folding is not muting: the lane goes away, the sound does not, so
+    // this is the one header intent that never touches the schedule.
+    if let Some(i) = fold
+        && let Some(t) = arr.tracks.get_mut(i).filter(|lane| lane.is_group)
+    {
+        t.folded = !t.folded;
     }
     if let Some(i) = mute
         && let Some(t) = arr.tracks.get_mut(i)
@@ -14295,6 +14358,11 @@ impl App {
                     .active_track()
                     .is_some_and(|at| self.arrangement.tracks[at].is_group),
             ),
+            PaletteCommand::new("track.fold", "track", "fold / unfold group").enabled(
+                self.arrangement
+                    .active_track()
+                    .is_some_and(|at| self.arrangement.tracks[at].is_group),
+            ),
             PaletteCommand::new("track.nest", "track", "move track into the group above")
                 .enabled(has_track),
             PaletteCommand::new("track.unnest", "track", "take track out of its group")
@@ -14631,6 +14699,11 @@ impl App {
             }
             "track.ungroup" => {
                 if !self.arrangement.ungroup_track() {
+                    self.notice = Some("the selected lane is not a group".into());
+                }
+            }
+            "track.fold" => {
+                if !self.arrangement.fold_track() {
                     self.notice = Some("the selected lane is not a group".into());
                 }
             }
@@ -16533,6 +16606,19 @@ impl App {
                     {
                         track.input = track.input.cycled(channels, back);
                         self.arrangement.force_recompile = true;
+                    }
+                }
+                // No recompile: folding hides lanes and the schedule
+                // keeps playing them. A fold that fell silent would be
+                // the worst bug this feature could have.
+                sx::SessionIntent::ToggleTrackFold(track) => {
+                    if let Some(track) = self
+                        .arrangement
+                        .tracks
+                        .get_mut(track)
+                        .filter(|lane| lane.is_group)
+                    {
+                        track.folded = !track.folded;
                     }
                 }
                 sx::SessionIntent::ToggleTrackMonitor(track) => {
@@ -24602,7 +24688,7 @@ mod tests {
         use daw::ui::session_next as sx;
         let view = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 600.0));
         let state = sx::SessionViewState::default();
-        let layout = sx::SessionLayout::new(view, 2, 0, 8, &state);
+        let layout = sx::SessionLayout::new(view, sx::SessionShape::flat(2, 0, 8), &state);
 
         // Track 0 MIDI, track 1 audio.
         let midi = layout.slot(0, 0).center();
@@ -28203,6 +28289,113 @@ mod tests {
                 .iter()
                 .all(|track| !track.is_group && track.depth == 0)
         );
+    }
+
+    /// A FOLD HIDES LANES; IT DOES NOT SILENCE THEM.
+    ///
+    /// The worst bug this feature could have is a group that stops
+    /// sounding when it is tidied away, so that is the first thing
+    /// pinned — the graph must not be able to tell.
+    #[test]
+    fn folding_a_group_hides_its_lanes_and_changes_nothing_it_hears() {
+        let mut a = grouped();
+        let before = shape_hash(&a.tracks, &a.master, &a.returns);
+        let (heard, _) = build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
+
+        a.select_track(1);
+        assert!(a.fold_track());
+        assert!(a.tracks[1].folded);
+        assert!(
+            !track::hidden_by_fold(&a.tracks, 1),
+            "the group itself stays: it is what you unfold"
+        );
+        assert!(track::hidden_by_fold(&a.tracks, 2) && track::hidden_by_fold(&a.tracks, 3));
+        assert!(!track::hidden_by_fold(&a.tracks, 0));
+
+        assert_eq!(
+            shape_hash(&a.tracks, &a.master, &a.returns),
+            before,
+            "a fold is not shape — nothing about the wiring moved"
+        );
+        let (still, _) = build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
+        assert_eq!(
+            still.wires().len(),
+            heard.wires().len(),
+            "the folded group's lanes left the schedule"
+        );
+        for index in 0..a.tracks.len() {
+            assert!(track_audible(&a.tracks, index), "lane {index} fell silent");
+        }
+
+        // And it opens again.
+        assert!(a.fold_track());
+        assert!((0..a.tracks.len()).all(|i| !track::hidden_by_fold(&a.tracks, i)));
+        // Only a group can be folded.
+        a.select_track(0);
+        assert!(!a.fold_track());
+    }
+
+    /// A FOLDED LANE TAKES NO ROOM IN THE STACK.
+    ///
+    /// Zero height where the next visible lane begins, so the lanes that
+    /// are still shown meet exactly — and the scroll extent shrinks with
+    /// them, or a folded project could be scrolled into empty space.
+    #[test]
+    fn a_folded_lane_takes_no_room_in_the_arrangement() {
+        let mut a = grouped();
+        let area = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(600.0, 800.0));
+        let open = a.lane_stack_height();
+        let heights: Vec<f32> = a.tracks[2..4].iter().map(|lane| lane.height).collect();
+
+        a.select_track(1);
+        assert!(a.fold_track());
+        assert_eq!(
+            a.lane_stack_height(),
+            open - heights.iter().sum::<f32>(),
+            "the folded lanes still took up the stack"
+        );
+
+        let lanes = lane_rects(area, &a.tracks, 0.0);
+        assert_eq!(lanes.len(), a.tracks.len(), "every lane keeps its slot");
+        assert_eq!(lanes[2].height(), 0.0);
+        assert_eq!(lanes[3].height(), 0.0);
+        // The visible ones still meet exactly, which is what stops a gap
+        // appearing where the fold was.
+        assert_eq!(lanes[0].bottom(), lanes[1].top());
+        assert_eq!(lanes[1].bottom(), lanes[2].top());
+        assert_eq!(lanes[2].top(), lanes[3].top());
+        // A pointer cannot land on a lane with no height, so nothing
+        // hidden can be hit.
+        for hidden in [2, 3] {
+            assert!(!(lanes[hidden].top()..lanes[hidden].bottom()).contains(&lanes[hidden].top()));
+        }
+        assert_eq!(
+            a.lane_top(3),
+            a.lane_top(2),
+            "a hidden lane advances nothing"
+        );
+    }
+
+    /// A fold survives the disk, and a stray one on a lane that is not a
+    /// group is dropped — it would hide the lanes after it forever.
+    #[test]
+    fn a_fold_is_saved_and_a_stray_one_is_dropped() {
+        let mut arr = grouped();
+        arr.tracks[1].folded = true;
+        arr.tracks[0].folded = true;
+        let mut back = Arrangement::default();
+        let mut transport = Transport::default();
+        apply_project_doc(
+            project_doc(&arr, &Transport::default()),
+            &mut back,
+            &mut transport,
+        );
+        assert!(back.tracks[1].folded, "the group came back open");
+        assert!(
+            !back.tracks[0].folded,
+            "a lane with nothing under it cannot be folded"
+        );
+        assert!(track::hidden_by_fold(&back.tracks, 2));
     }
 
     // ------------------------------------------------- input routing ---

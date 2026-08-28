@@ -61,6 +61,11 @@ pub struct SessionTrack {
     /// carries no clips of its own.
     #[serde(default)]
     pub is_group: bool,
+    /// A group drawn CLOSED. Its members are not laid out at all —
+    /// see [`SessionShape`] — and they are still sounding: folding is
+    /// not muting.
+    #[serde(default)]
+    pub folded: bool,
     /// How deeply nested. Drawn as indentation, which is the whole of
     /// what the view needs to know about it — where a lane's signal
     /// actually goes is the graph's business, not the grid's.
@@ -92,6 +97,7 @@ impl Default for SessionTrack {
             volume: 1.0,
             pan: 0.0,
             is_group: false,
+            folded: false,
             depth: 0,
             input: "—".to_owned(),
             monitoring: false,
@@ -1503,6 +1509,9 @@ pub enum SessionIntent {
         back: bool,
     },
     ToggleTrackMonitor(usize),
+    /// Open or close a group. Not a mute: folding hides lanes and the
+    /// schedule keeps playing them.
+    ToggleTrackFold(usize),
     SelectReturn(usize),
     ToggleReturnMute(usize),
     SetReturnVolume {
@@ -1618,6 +1627,8 @@ const SEND_LETTER_WIDTH: f32 = 9.0;
 const RETURN_HOLD_BASE: usize = 4096;
 /// How far one level of nesting shifts a label.
 const NEST_INDENT: f32 = 7.0;
+/// The square a group's fold triangle is drawn and clicked in.
+const FOLD_HANDLE: f32 = 11.0;
 /// The fader's top. A console's fader runs a little past unity so a mix
 /// can be pushed as well as pulled; +6 dB is where this one stops.
 const MAX_FADER_GAIN: f32 = 2.0;
@@ -1632,6 +1643,76 @@ const LABEL_FONT: f32 = 10.0;
 const BODY_FONT: f32 = 11.0;
 const REORDER_GRIP_WIDTH: f32 = 14.0;
 
+/// How many of each thing the grid is laying out, and which lanes a fold
+/// is hiding.
+///
+/// A struct because `SessionLayout::new` had grown four counts and a
+/// fifth would have been unreadable — and because the hidden set has to
+/// arrive WITH the counts rather than after them: how wide a column is
+/// depends on how many are visible, so the layout cannot be built and
+/// then told.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SessionShape {
+    pub tracks: usize,
+    /// Lanes hidden inside a folded group, as a bitmask over track index.
+    ///
+    /// A mask and not a `Vec` because [`SessionLayout`] is `Copy` and is
+    /// threaded through every geometry call. Sixty-four is far past the
+    /// meter table's thirty-two lanes, and a project deeper than that
+    /// shows its extra lanes rather than hiding them — being visible is
+    /// the failure a person can notice and work around.
+    pub hidden: u64,
+    pub returns: usize,
+    pub scenes: usize,
+}
+
+impl SessionShape {
+    /// The shape of a document, with the fold worked out.
+    pub fn of(document: &SessionDocument) -> Self {
+        Self {
+            tracks: document.tracks.len(),
+            hidden: folded_mask(&document.tracks),
+            returns: document.returns.len(),
+            scenes: document.scenes.len(),
+        }
+    }
+
+    /// A stack with nothing folded — what every layout was before there
+    /// was anything to fold.
+    pub fn flat(tracks: usize, returns: usize, scenes: usize) -> Self {
+        Self {
+            tracks,
+            hidden: 0,
+            returns,
+            scenes,
+        }
+    }
+}
+
+/// Which lanes a folded group is hiding.
+///
+/// Read forwards in one pass, because a fold hides a contiguous RUN:
+/// everything under the folded lane until the stack comes back up to its
+/// level. Nested folds need no special case — once a run is hiding, a
+/// folded group inside it is hidden along with what it holds.
+pub fn folded_mask(tracks: &[SessionTrack]) -> u64 {
+    let mut mask = 0;
+    let mut hiding: Option<u8> = None;
+    for (index, track) in tracks.iter().enumerate().take(64) {
+        if hiding.is_some_and(|depth| track.depth <= depth) {
+            hiding = None;
+        }
+        if hiding.is_some() {
+            mask |= 1 << index;
+            continue;
+        }
+        if track.is_group && track.folded {
+            hiding = Some(track.depth);
+        }
+    }
+    mask
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SessionLayout {
     pub area: egui::Rect,
@@ -1641,6 +1722,12 @@ pub struct SessionLayout {
     pub scroll_y: f32,
     pub mixer_height: f32,
     tracks: usize,
+    /// Lanes a fold is hiding — see [`SessionShape::hidden`]. A hidden
+    /// lane has no column, and every rectangle asked for one comes back
+    /// `Rect::NOTHING`, which every painter here already skips.
+    hidden: u64,
+    /// How many lanes actually take a column.
+    visible: usize,
     /// Return columns, drawn after the tracks in the MIXER BAND only.
     ///
     /// A return has no clip slots, exactly as it has none in Live: the
@@ -1651,18 +1738,20 @@ pub struct SessionLayout {
 }
 
 impl SessionLayout {
-    pub fn new(
-        area: egui::Rect,
-        tracks: usize,
-        returns: usize,
-        scenes: usize,
-        state: &SessionViewState,
-    ) -> Self {
+    pub fn new(area: egui::Rect, shape: SessionShape, state: &SessionViewState) -> Self {
+        let SessionShape {
+            tracks,
+            hidden,
+            returns,
+            scenes,
+        } = shape;
+        let visible = tracks.saturating_sub(hidden.count_ones() as usize);
         let lane_width = (area.width() - SCENE_WIDTH).max(0.0);
-        // Columns, not tracks: a return takes a column's width in the
-        // mixer band, so it has to be one of the shares the width is cut
-        // into or the returns would sit off the right edge.
-        let columns = tracks + returns;
+        // VISIBLE columns: a return takes a column's width in the mixer
+        // band and a folded lane takes none, so the share the width is
+        // cut into is what is actually drawn — otherwise folding a group
+        // would leave its gap behind.
+        let columns = visible + returns;
         let track_width = if columns == 0 {
             TRACK_WIDTH_DEFAULT
         } else {
@@ -1677,6 +1766,8 @@ impl SessionLayout {
             scroll_y: 0.0,
             mixer_height: state.mixer_height.clamp(MIXER_HEIGHT_MIN, mixer_cap),
             tracks,
+            hidden,
+            visible,
             returns,
             scenes,
         };
@@ -1744,7 +1835,9 @@ impl SessionLayout {
     }
 
     pub fn header(self, track: usize) -> egui::Rect {
-        let left = self.track_left(track);
+        let Some(left) = self.track_left(track) else {
+            return egui::Rect::NOTHING;
+        };
         egui::Rect::from_min_max(
             egui::pos2(left, self.area.top() + CONTROL_HEIGHT),
             egui::pos2(
@@ -1756,6 +1849,9 @@ impl SessionLayout {
 
     pub fn track_grip(self, track: usize) -> egui::Rect {
         let header = self.header(track);
+        if !header.is_positive() {
+            return egui::Rect::NOTHING;
+        }
         egui::Rect::from_min_max(
             egui::pos2(header.right() - REORDER_GRIP_WIDTH, header.top()),
             header.max,
@@ -1763,7 +1859,10 @@ impl SessionLayout {
     }
 
     pub fn slot(self, track: usize, scene: usize) -> egui::Rect {
-        let left = self.track_left(track) + SLOT_GAP;
+        let Some(left) = self.track_left(track) else {
+            return egui::Rect::NOTHING;
+        };
+        let left = left + SLOT_GAP;
         let top = self.area.top() + CONTROL_HEIGHT + HEADER_HEIGHT - self.scroll_y
             + scene as f32 * (self.slot_height + SLOT_GAP);
         egui::Rect::from_min_size(
@@ -1774,6 +1873,9 @@ impl SessionLayout {
 
     pub fn slot_launch(self, track: usize, scene: usize) -> egui::Rect {
         let slot = self.slot(track, scene);
+        if !slot.is_positive() {
+            return egui::Rect::NOTHING;
+        }
         egui::Rect::from_min_max(
             slot.min,
             egui::pos2(slot.left() + LAUNCH_WIDTH, slot.bottom()),
@@ -1782,6 +1884,9 @@ impl SessionLayout {
 
     pub fn slot_body(self, track: usize, scene: usize) -> egui::Rect {
         let slot = self.slot(track, scene);
+        if !slot.is_positive() {
+            return egui::Rect::NOTHING;
+        }
         egui::Rect::from_min_max(egui::pos2(slot.left() + LAUNCH_WIDTH, slot.top()), slot.max)
     }
 
@@ -1816,7 +1921,16 @@ impl SessionLayout {
     }
 
     pub fn mixer(self, track: usize) -> egui::Rect {
-        let left = self.track_left(track);
+        match self.column(track) {
+            Some(column) => self.mixer_column(column),
+            None => egui::Rect::NOTHING,
+        }
+    }
+
+    /// One mixer strip by COLUMN. The returns are columns past the last
+    /// visible lane, so they address the band the same way.
+    fn mixer_column(self, column: usize) -> egui::Rect {
+        let left = self.column_left(column);
         egui::Rect::from_min_max(
             egui::pos2(left, self.mixer_top()),
             egui::pos2(
@@ -1828,7 +1942,7 @@ impl SessionLayout {
 
     /// One return's strip, in the mixer band after the last track.
     pub fn return_mixer(self, index: usize) -> egui::Rect {
-        self.mixer(self.tracks + index)
+        self.mixer_column(self.visible + index)
     }
 
     /// The seam between the last track's strip and the first return's —
@@ -1836,7 +1950,7 @@ impl SessionLayout {
     /// what it is sent to begins.
     pub fn return_divider(self) -> Option<egui::Rect> {
         (self.returns > 0).then(|| {
-            let left = self.track_left(self.tracks);
+            let left = self.column_left(self.visible);
             egui::Rect::from_min_max(
                 egui::pos2(left - 1.0, self.mixer_top()),
                 egui::pos2(left + 1.0, self.area.bottom() - SCROLLBAR_HEIGHT),
@@ -1860,7 +1974,7 @@ impl SessionLayout {
     pub fn max_scroll_x(self) -> f32 {
         // The return columns count: a mixer you cannot scroll to is a
         // mixer that does not have them.
-        ((self.tracks + self.returns) as f32 * self.track_width - self.tracks_viewport().width())
+        ((self.visible + self.returns) as f32 * self.track_width - self.tracks_viewport().width())
             .max(0.0)
     }
 
@@ -1884,8 +1998,45 @@ impl SessionLayout {
         None
     }
 
-    fn track_left(self, track: usize) -> f32 {
-        self.area.left() - self.scroll_x + track as f32 * self.track_width
+    /// Which column a lane is drawn in, or `None` if a fold is hiding it.
+    ///
+    /// The one place index and position are told apart. Every rectangle
+    /// below asks this first, so a hidden lane is drawn nowhere by
+    /// construction rather than by each painter remembering to check.
+    pub fn column(self, track: usize) -> Option<usize> {
+        if track >= self.tracks {
+            return None;
+        }
+        // Past the mask's width a lane is simply never hidden — see
+        // `SessionShape::hidden` on why visible is the safe failure.
+        let before = if track >= 64 {
+            self.hidden.count_ones() as usize
+        } else {
+            if self.hidden & (1 << track) != 0 {
+                return None;
+            }
+            (self.hidden & ((1 << track) - 1)).count_ones() as usize
+        };
+        Some(track - before)
+    }
+
+    /// Which lane is drawn in this column, if any. The inverse of
+    /// [`Self::column`], and what a drag over the header row needs: a
+    /// pointer lands on a POSITION and has to be told whose it is.
+    pub fn track_at_column(self, column: usize) -> Option<usize> {
+        (0..self.tracks).find(|track| self.column(*track) == Some(column))
+    }
+
+    /// Where a COLUMN starts. Public because a test that wants the
+    /// ground past the last lane has to be able to name it — and past
+    /// the last lane there is no track to ask through.
+    pub fn column_left(self, column: usize) -> f32 {
+        self.area.left() - self.scroll_x + column as f32 * self.track_width
+    }
+
+    /// Where a lane's column starts, or `None` while it is folded away.
+    fn track_left(self, track: usize) -> Option<f32> {
+        self.column(track).map(|column| self.column_left(column))
     }
 }
 
@@ -1910,13 +2061,7 @@ pub fn show_session(
     colors: &SessionColors,
 ) -> SessionViewOutput {
     let area = ui.max_rect();
-    let mut layout = SessionLayout::new(
-        area,
-        document.tracks.len(),
-        document.returns.len(),
-        document.scenes.len(),
-        state,
-    );
+    let mut layout = SessionLayout::new(area, SessionShape::of(document), state);
     let mut intents = Vec::new();
 
     ui.painter().rect_filled(area, 0.0, colors.bg);
@@ -1931,13 +2076,7 @@ pub fn show_session(
             } else {
                 state.scroll_y = (state.scroll_y - scroll.y).clamp(0.0, layout.max_scroll_y());
             }
-            layout = SessionLayout::new(
-                area,
-                document.tracks.len(),
-                document.returns.len(),
-                document.scenes.len(),
-                state,
-            );
+            layout = SessionLayout::new(area, SessionShape::of(document), state);
         }
     }
 
@@ -1963,13 +2102,7 @@ pub fn show_session(
     {
         state.mixer_height = (area.bottom() - SCROLLBAR_HEIGHT - position.y)
             .clamp(MIXER_HEIGHT_MIN, MIXER_HEIGHT_MAX);
-        layout = SessionLayout::new(
-            area,
-            document.tracks.len(),
-            document.returns.len(),
-            document.scenes.len(),
-            state,
-        );
+        layout = SessionLayout::new(area, SessionShape::of(document), state);
     }
 
     let track_clip = layout.tracks_viewport();
@@ -2331,10 +2464,67 @@ fn paint_track_header(
         );
     }
     let text_rect = rect.shrink2(egui::vec2(6.0, 4.0));
+    // The fold handle, on the group lane itself and nowhere else. It
+    // sits before the name at the lane's own indentation, so the
+    // triangle and what it opens line up down the column.
+    if track.is_group {
+        let handle = egui::Rect::from_min_size(
+            egui::pos2(
+                text_rect.left() + f32::from(track.depth) * NEST_INDENT,
+                text_rect.top(),
+            ),
+            egui::vec2(FOLD_HANDLE, FOLD_HANDLE),
+        );
+        let response = ui.interact(
+            handle,
+            ui.id().with(("session_next_fold", track_index)),
+            egui::Sense::click(),
+        );
+        if response.clicked() {
+            intents.push(SessionIntent::ToggleTrackFold(track_index));
+        }
+        let tint = if response.hovered() {
+            colors.text
+        } else {
+            colors.muted
+        };
+        // Pointing RIGHT when closed and DOWN when open, which is the
+        // one convention every file tree already taught everybody.
+        let middle = handle.center();
+        let arm = FOLD_HANDLE * 0.32;
+        let points = if track.folded {
+            vec![
+                egui::pos2(middle.x - arm, middle.y - arm * 1.4),
+                egui::pos2(middle.x - arm, middle.y + arm * 1.4),
+                egui::pos2(middle.x + arm * 1.2, middle.y),
+            ]
+        } else {
+            vec![
+                egui::pos2(middle.x - arm * 1.4, middle.y - arm),
+                egui::pos2(middle.x + arm * 1.4, middle.y - arm),
+                egui::pos2(middle.x, middle.y + arm * 1.2),
+            ]
+        };
+        ui.painter().add(egui::Shape::convex_polygon(
+            points,
+            tint,
+            egui::Stroke::NONE,
+        ));
+        response.on_hover_text(if track.folded {
+            "open this group"
+        } else {
+            "fold this group away — its lanes keep playing"
+        });
+    }
     // Nesting is drawn as INDENTATION and nothing else. A lane's depth
     // is a fact about where its signal goes, and the one thing a reader
     // needs from it here is the shape of the stack at a glance.
-    let indent = f32::from(track.depth) * NEST_INDENT;
+    let indent = f32::from(track.depth) * NEST_INDENT
+        + if track.is_group {
+            FOLD_HANDLE + 2.0
+        } else {
+            0.0
+        };
     ui.painter().text(
         text_rect.left_top() + egui::vec2(indent, 0.0),
         egui::Align2::LEFT_TOP,
@@ -4163,12 +4353,20 @@ fn settle_track_drag(
         return;
     };
     if let Some(position) = ui.ctx().pointer_latest_pos()
-        && layout.tracks > 0
+        && layout.visible > 0
     {
+        // The pointer lands on a COLUMN; the reorder means a lane. With
+        // a group folded the two have stopped being the same number, so
+        // the column is translated back rather than used raw — otherwise
+        // dropping past a fold would move whichever lane happened to
+        // sit at that index.
         let local = position.x + layout.scroll_x - layout.area.left();
-        drag.target = (local / layout.track_width)
+        let column = (local / layout.track_width)
             .floor()
-            .clamp(0.0, layout.tracks.saturating_sub(1) as f32) as usize;
+            .clamp(0.0, layout.visible.saturating_sub(1) as f32) as usize;
+        if let Some(track) = layout.track_at_column(column) {
+            drag.target = track;
+        }
     }
     let target = layout.header(drag.target);
     ui.painter().line_segment(
@@ -4896,13 +5094,7 @@ mod tests {
     fn layout_keeps_scene_and_slot_rows_aligned() {
         let document = document();
         let state = SessionViewState::default();
-        let layout = SessionLayout::new(
-            view(),
-            document.tracks.len(),
-            document.returns.len(),
-            document.scenes.len(),
-            &state,
-        );
+        let layout = SessionLayout::new(view(), SessionShape::of(&document), &state);
         for scene in 0..document.scenes.len() {
             assert_eq!(layout.slot(0, scene).top(), layout.scene(scene).top());
             assert_eq!(layout.slot(0, scene).bottom(), layout.scene(scene).bottom());
@@ -4913,13 +5105,7 @@ mod tests {
     fn launch_and_body_targets_are_disjoint() {
         let document = document();
         let state = SessionViewState::default();
-        let layout = SessionLayout::new(
-            view(),
-            document.tracks.len(),
-            document.returns.len(),
-            document.scenes.len(),
-            &state,
-        );
+        let layout = SessionLayout::new(view(), SessionShape::of(&document), &state);
         let launch = layout.slot_launch(0, 0);
         let body = layout.slot_body(0, 0);
         assert_eq!(launch.right(), body.left());
@@ -4933,20 +5119,8 @@ mod tests {
         let comfortable = SessionViewState::default();
         let mut compact = comfortable.clone();
         compact.density = SessionDensity::Compact;
-        let a = SessionLayout::new(
-            view(),
-            document.tracks.len(),
-            document.returns.len(),
-            document.scenes.len(),
-            &comfortable,
-        );
-        let b = SessionLayout::new(
-            view(),
-            document.tracks.len(),
-            document.returns.len(),
-            document.scenes.len(),
-            &compact,
-        );
+        let a = SessionLayout::new(view(), SessionShape::of(&document), &comfortable);
+        let b = SessionLayout::new(view(), SessionShape::of(&document), &compact);
         assert!(b.slot_height < a.slot_height);
         assert_eq!(b.slot_launch(0, 0).width(), LAUNCH_WIDTH);
     }
@@ -4958,13 +5132,7 @@ mod tests {
             mixer_height: 10_000.0,
             ..SessionViewState::default()
         };
-        let layout = SessionLayout::new(
-            view(),
-            document.tracks.len(),
-            document.returns.len(),
-            document.scenes.len(),
-            &state,
-        );
+        let layout = SessionLayout::new(view(), SessionShape::of(&document), &state);
         assert!(layout.mixer_height <= view().height() * 0.55 + f32::EPSILON);
         assert!(layout.rows_viewport().height() > 0.0);
     }
@@ -4973,13 +5141,7 @@ mod tests {
     fn slot_hit_testing_respects_the_rows_viewport() {
         let document = document();
         let state = SessionViewState::default();
-        let layout = SessionLayout::new(
-            view(),
-            document.tracks.len(),
-            document.returns.len(),
-            document.scenes.len(),
-            &state,
-        );
+        let layout = SessionLayout::new(view(), SessionShape::of(&document), &state);
         assert_eq!(
             layout.slot_at(layout.slot_body(1, 2).center()),
             Some((1, 2))
@@ -5358,7 +5520,11 @@ mod tests {
     fn launching_without_select_on_launch_leaves_the_selection_alone() {
         let document = document();
         let runtime = SessionRuntime::new(document.tracks.len());
-        let layout = SessionLayout::new(view(), 2, 0, DEFAULT_SCENES, &SessionViewState::default());
+        let layout = SessionLayout::new(
+            view(),
+            SessionShape::flat(2, 0, DEFAULT_SCENES),
+            &SessionViewState::default(),
+        );
         // Track 0 scene 1 holds a real clip; the Continue slot beside it
         // would refuse the launch for an unrelated reason.
         let rail = layout.slot_launch(0, 1).center();
@@ -5403,7 +5569,7 @@ mod tests {
         let document = document();
         let runtime = SessionRuntime::new(document.tracks.len());
         let mut state = SessionViewState::default();
-        let at = SessionLayout::new(view(), 2, 0, DEFAULT_SCENES, &state)
+        let at = SessionLayout::new(view(), SessionShape::flat(2, 0, DEFAULT_SCENES), &state)
             .slot_body(0, 0)
             .center();
         let frames = render_path(&document, &runtime, &mut state, &[probe::Step::moved(at)]);
@@ -5415,7 +5581,7 @@ mod tests {
         let document = document();
         let runtime = SessionRuntime::new(document.tracks.len());
         let mut state = SessionViewState::default();
-        let layout = SessionLayout::new(view(), 2, 0, DEFAULT_SCENES, &state);
+        let layout = SessionLayout::new(view(), SessionShape::flat(2, 0, DEFAULT_SCENES), &state);
         let frames = render_path(
             &document,
             &runtime,
@@ -5432,7 +5598,7 @@ mod tests {
         let document = document();
         let runtime = SessionRuntime::new(document.tracks.len());
         let mut state = SessionViewState::default();
-        let layout = SessionLayout::new(view(), 2, 0, DEFAULT_SCENES, &state);
+        let layout = SessionLayout::new(view(), SessionShape::flat(2, 0, DEFAULT_SCENES), &state);
         let frames = render_path(
             &document,
             &runtime,
@@ -5449,7 +5615,7 @@ mod tests {
         let document = document();
         let runtime = SessionRuntime::new(document.tracks.len());
         let mut state = SessionViewState::default();
-        let layout = SessionLayout::new(view(), 2, 0, DEFAULT_SCENES, &state);
+        let layout = SessionLayout::new(view(), SessionShape::flat(2, 0, DEFAULT_SCENES), &state);
         let frames = render_path(
             &document,
             &runtime,
@@ -5464,7 +5630,7 @@ mod tests {
         let document = document();
         let runtime = SessionRuntime::new(document.tracks.len());
         let mut state = SessionViewState::default();
-        let layout = SessionLayout::new(view(), 2, 0, DEFAULT_SCENES, &state);
+        let layout = SessionLayout::new(view(), SessionShape::flat(2, 0, DEFAULT_SCENES), &state);
         let frames = render_path(
             &document,
             &runtime,
@@ -5482,7 +5648,7 @@ mod tests {
         let document = document();
         let runtime = SessionRuntime::new(document.tracks.len());
         let mut state = SessionViewState::default();
-        let layout = SessionLayout::new(view(), 2, 0, DEFAULT_SCENES, &state);
+        let layout = SessionLayout::new(view(), SessionShape::flat(2, 0, DEFAULT_SCENES), &state);
         let body = render_path(
             &document,
             &runtime,
@@ -5506,7 +5672,7 @@ mod tests {
         let document = document();
         let runtime = SessionRuntime::new(document.tracks.len());
         let mut state = SessionViewState::default();
-        let layout = SessionLayout::new(view(), 2, 0, DEFAULT_SCENES, &state);
+        let layout = SessionLayout::new(view(), SessionShape::flat(2, 0, DEFAULT_SCENES), &state);
         let frames = render_path(
             &document,
             &runtime,
@@ -5527,7 +5693,7 @@ mod tests {
         let document = document();
         let runtime = SessionRuntime::new(document.tracks.len());
         let mut state = SessionViewState::default();
-        let layout = SessionLayout::new(view(), 2, 0, DEFAULT_SCENES, &state);
+        let layout = SessionLayout::new(view(), SessionShape::flat(2, 0, DEFAULT_SCENES), &state);
         let frames = render_path(
             &document,
             &runtime,
@@ -5549,7 +5715,7 @@ mod tests {
         let document = document();
         let runtime = SessionRuntime::new(document.tracks.len());
         let mut state = SessionViewState::default();
-        let layout = SessionLayout::new(view(), 2, 0, DEFAULT_SCENES, &state);
+        let layout = SessionLayout::new(view(), SessionShape::flat(2, 0, DEFAULT_SCENES), &state);
         let frames = render_path(
             &document,
             &runtime,
@@ -5578,7 +5744,7 @@ mod tests {
         let document = document();
         let runtime = SessionRuntime::new(document.tracks.len());
         let mut state = SessionViewState::default();
-        let layout = SessionLayout::new(view(), 2, 0, DEFAULT_SCENES, &state);
+        let layout = SessionLayout::new(view(), SessionShape::flat(2, 0, DEFAULT_SCENES), &state);
         let pan = MixerStrip::new(layout.mixer(0), StripContent::default())
             .pan
             .expect("the default strip is tall enough for a pan bar");
@@ -5606,7 +5772,7 @@ mod tests {
     fn strip() -> MixerStrip {
         let state = SessionViewState::default();
         MixerStrip::new(
-            SessionLayout::new(view(), 2, 0, DEFAULT_SCENES, &state).mixer(0),
+            SessionLayout::new(view(), SessionShape::flat(2, 0, DEFAULT_SCENES), &state).mixer(0),
             StripContent::default(),
         )
     }
@@ -5919,13 +6085,7 @@ mod tests {
     }
 
     fn layout_of(document: &SessionDocument, state: &SessionViewState) -> SessionLayout {
-        SessionLayout::new(
-            view(),
-            document.tracks.len(),
-            document.returns.len(),
-            DEFAULT_SCENES,
-            state,
-        )
+        SessionLayout::new(view(), SessionShape::of(document), state)
     }
 
     /// A SEND ROW PER RETURN, AND A COUNT FOR THE ONES THAT DO NOT FIT.
@@ -6084,9 +6244,7 @@ mod tests {
         // mixer that does not have them.
         let narrow = SessionLayout::new(
             egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 620.0)),
-            8,
-            4,
-            DEFAULT_SCENES,
+            SessionShape::flat(8, 4, DEFAULT_SCENES),
             &state,
         );
         assert!(narrow.max_scroll_x() > 0.0);
@@ -6192,6 +6350,173 @@ mod tests {
         );
     }
 
+    // --------------------------------------------------------- folds ---
+
+    /// A group holding both lanes of `document()`, closed or open.
+    fn folded_document(folded: bool) -> SessionDocument {
+        let mut document = document();
+        document.tracks.insert(
+            0,
+            SessionTrack {
+                id: TrackId(1),
+                name: "DRUMS".to_owned(),
+                is_group: true,
+                folded,
+                ..SessionTrack::default()
+            },
+        );
+        for track in &mut document.tracks[1..] {
+            track.depth = 1;
+        }
+        document
+            .slots
+            .insert(0, vec![Slot::default(); document.scenes.len()]);
+        document
+    }
+
+    /// THE MASK IS THE RUN A FOLD HIDES, AND NESTING NEEDS NO SPECIAL
+    /// CASE.
+    #[test]
+    fn a_fold_hides_the_run_beneath_it() {
+        let open = folded_document(false);
+        assert_eq!(folded_mask(&open.tracks), 0);
+
+        let shut = folded_document(true);
+        assert_eq!(
+            folded_mask(&shut.tracks),
+            0b110,
+            "the group itself must stay — it is what you unfold"
+        );
+
+        // A fold inside a fold hides once, not twice: the outer run
+        // swallows the inner group along with what it holds.
+        let mut nested = folded_document(true);
+        nested.tracks.insert(
+            1,
+            SessionTrack {
+                id: TrackId(9),
+                is_group: true,
+                folded: true,
+                depth: 1,
+                ..SessionTrack::default()
+            },
+        );
+        for track in &mut nested.tracks[2..] {
+            track.depth = 2;
+        }
+        assert_eq!(folded_mask(&nested.tracks), 0b1110);
+        // And opening the outer one leaves the inner one closed.
+        nested.tracks[0].folded = false;
+        assert_eq!(folded_mask(&nested.tracks), 0b1100);
+    }
+
+    /// A FOLDED LANE HAS NO COLUMN, AND THE ONES AFTER IT CLOSE THE GAP.
+    ///
+    /// The whole point of the index-to-column mapping: a fold must not
+    /// leave a hole in the mixer where the lanes used to be.
+    #[test]
+    fn folded_lanes_leave_no_gap_in_the_grid() {
+        let state = SessionViewState::default();
+        let document = folded_document(true);
+        let layout = SessionLayout::new(view(), SessionShape::of(&document), &state);
+
+        assert_eq!(layout.column(0), Some(0));
+        assert_eq!(layout.column(1), None);
+        assert_eq!(layout.column(2), None);
+        assert_eq!(layout.track_at_column(0), Some(0));
+        assert_eq!(layout.track_at_column(1), None);
+
+        // Nothing hidden is drawn ANYWHERE — and every one of these is a
+        // rectangle some painter or hit test would otherwise act on.
+        for track in [1, 2] {
+            assert!(!layout.header(track).is_positive(), "header {track}");
+            assert!(!layout.mixer(track).is_positive(), "mixer {track}");
+            assert!(!layout.slot(track, 0).is_positive(), "slot {track}");
+            assert!(!layout.slot_body(track, 0).is_positive(), "body {track}");
+            assert!(
+                !layout.slot_launch(track, 0).is_positive(),
+                "launch {track}"
+            );
+            assert!(!layout.track_grip(track).is_positive(), "grip {track}");
+            assert!(!layout.stop_track(track).is_positive(), "stop {track}");
+        }
+        assert_eq!(
+            layout.slot_at(layout.slot(0, 0).center()),
+            Some((0, 0)),
+            "the visible lane lost its own slot"
+        );
+
+        // The group sits in the first column and nothing else takes one,
+        // so a return would land immediately beside it.
+        let mut with_return = folded_document(true);
+        with_return.returns = vec![SessionReturn::default()];
+        let layout = SessionLayout::new(view(), SessionShape::of(&with_return), &state);
+        assert!(
+            (layout.return_mixer(0).left() - layout.mixer(0).right()).abs() < 0.01,
+            "the fold left a hole before the returns"
+        );
+    }
+
+    /// THE TRIANGLE IS THE GESTURE, AND IT IS ONLY ON A GROUP.
+    #[test]
+    fn the_fold_handle_opens_and_shuts_a_group() {
+        let grouped = folded_document(false);
+        let runtime = SessionRuntime::new(grouped.tracks.len());
+        let mut state = SessionViewState::default();
+        let layout = SessionLayout::new(view(), SessionShape::of(&grouped), &state);
+        let header = layout.header(0);
+        let handle = egui::pos2(
+            header.left() + 6.0 + FOLD_HANDLE * 0.5,
+            header.top() + 4.0 + FOLD_HANDLE * 0.5,
+        );
+
+        let shut = flattened(&render_path(
+            &grouped,
+            &runtime,
+            &mut state,
+            &probe::click_path(handle),
+        ));
+        assert!(
+            shut.contains(&SessionIntent::ToggleTrackFold(0)),
+            "{shut:?}"
+        );
+        // ONE TARGET, ONE ACTION. The handle is drawn over the header
+        // body, which selects — the device UI contract's second rule,
+        // and the bug it names is a control that lets the display
+        // underneath take the same press.
+        assert!(
+            !shut.contains(&SessionIntent::SelectTrack(0)),
+            "the fold handle leaked into the header beneath it: {shut:?}"
+        );
+        assert!(!shut.iter().any(|intent| matches!(
+            intent,
+            SessionIntent::ToggleTrackFold(1) | SessionIntent::ToggleTrackFold(2)
+        )));
+
+        // The same spot on a lane that is not a group belongs to the
+        // header, not to a fold that is not there.
+        let plain = document();
+        let runtime = SessionRuntime::new(plain.tracks.len());
+        let mut state = SessionViewState::default();
+        let layout = SessionLayout::new(view(), SessionShape::of(&plain), &state);
+        let header = layout.header(0);
+        let intents = flattened(&render_path(
+            &plain,
+            &runtime,
+            &mut state,
+            &probe::click_path(egui::pos2(
+                header.left() + 6.0 + FOLD_HANDLE * 0.5,
+                header.top() + 4.0 + FOLD_HANDLE * 0.5,
+            )),
+        ));
+        assert!(
+            !intents
+                .iter()
+                .any(|intent| matches!(intent, SessionIntent::ToggleTrackFold(_))),
+            "a lane with nothing under it offered a fold: {intents:?}"
+        );
+    }
+
     // ------------------------------------------------- input routing ---
 
     /// A note lane has no input path in the engine at all, so it gets no
@@ -6291,7 +6616,7 @@ mod tests {
         let runtime = SessionRuntime::new(document.tracks.len());
         let mut state = SessionViewState::default();
         let before = state.mixer_height;
-        let layout = SessionLayout::new(view(), 2, 0, DEFAULT_SCENES, &state);
+        let layout = SessionLayout::new(view(), SessionShape::flat(2, 0, DEFAULT_SCENES), &state);
         let seam = layout.mixer_seam().center();
         let intents = flattened(&render_path(
             &document,
@@ -6328,11 +6653,11 @@ mod tests {
             selection: Some(selected),
             ..SessionViewState::default()
         };
-        let layout = SessionLayout::new(view(), 2, 0, DEFAULT_SCENES, &state);
+        let layout = SessionLayout::new(view(), SessionShape::flat(2, 0, DEFAULT_SCENES), &state);
         // The gutter to the right of the last track column and left of
         // the scene column: drawn ground, owned by nothing.
         let empty = egui::pos2(
-            layout.track_left(2) + 4.0,
+            layout.column_left(2) + 4.0,
             layout.slot_body(0, 0).center().y,
         );
         let scroll_before = (state.scroll_x, state.scroll_y);
@@ -6366,7 +6691,8 @@ mod tests {
         let document = document();
         let runtime = SessionRuntime::new(document.tracks.len());
         let mut state = SessionViewState::default();
-        let strip = SessionLayout::new(view(), 2, 0, DEFAULT_SCENES, &state).control_strip();
+        let strip = SessionLayout::new(view(), SessionShape::flat(2, 0, DEFAULT_SCENES), &state)
+            .control_strip();
         let m1_left = strip.right() - 4.0 - 36.0 * 2.0 - 4.0;
         let morph = egui::Rect::from_min_max(
             egui::pos2(m1_left - 74.0, strip.top() + 4.0),

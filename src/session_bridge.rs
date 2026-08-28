@@ -176,6 +176,7 @@ pub fn sync_document(document: &mut sx::SessionDocument, arrangement: &Arrangeme
         target.pan = track.pan;
         target.volume = track.volume;
         target.is_group = track.is_group;
+        target.folded = track.folded;
         target.depth = track.depth;
         target.input = track.input.label();
         target.monitoring = track.monitor.hears();
