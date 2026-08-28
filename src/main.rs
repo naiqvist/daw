@@ -15797,6 +15797,28 @@ impl App {
                         self.arrangement.force_recompile = true;
                     }
                 }
+                // Exclusive solo, and the third state is the one that
+                // makes it usable: soloing the track that is ALREADY the
+                // only soloed one clears the solo instead of doing
+                // nothing, so the same button both enters and leaves.
+                sx::SessionIntent::SoloTrackExclusive(track) => {
+                    let alone = self
+                        .arrangement
+                        .tracks
+                        .get(track)
+                        .is_some_and(|lane| lane.solo)
+                        && self
+                            .arrangement
+                            .tracks
+                            .iter()
+                            .filter(|lane| lane.solo)
+                            .count()
+                            == 1;
+                    for (index, lane) in self.arrangement.tracks.iter_mut().enumerate() {
+                        lane.solo = index == track && !alone;
+                    }
+                    self.arrangement.force_recompile = true;
+                }
                 // Pan and volume are applied live to the output node, so
                 // neither needs a recompile — the same road the old strip
                 // took.

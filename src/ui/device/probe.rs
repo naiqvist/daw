@@ -107,6 +107,26 @@ pub fn click_path(at: egui::Pos2) -> Vec<Step> {
     vec![Step::moved(at), Step::press(at), Step::release(at)]
 }
 
+/// Two clicks in a row at one place — the gesture egui reports as a
+/// DOUBLE CLICK, which is how a control is told to go back to its
+/// default. egui decides this from the time between the two, and the
+/// harness advances time by one frame per step, so four frames is well
+/// inside the window.
+pub fn double_click_path(at: egui::Pos2) -> Vec<Step> {
+    let mut path = click_path(at);
+    path.push(Step::press(at));
+    path.push(Step::release(at));
+    path
+}
+
+/// The same gesture with something held for its whole length.
+pub fn click_path_holding(at: egui::Pos2, mods: egui::Modifiers) -> Vec<Step> {
+    click_path(at)
+        .into_iter()
+        .map(|s| s.holding(mods))
+        .collect()
+}
+
 /// Run `f` once per step, inside a ui whose rectangle is exactly `rect`,
 /// and collect what it returned each frame.
 ///
