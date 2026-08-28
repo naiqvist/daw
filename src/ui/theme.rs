@@ -284,6 +284,68 @@ impl Theme {
         }
     }
 
+    /// A dark industrial scheme: blue-black steel grounds, cool concrete
+    /// text and restrained blue-green illumination. Saturation is reserved
+    /// for interaction and musical material, so a busy project still reads
+    /// like a tool rather than a wall of status lights.
+    pub fn industrial() -> Self {
+        Self {
+            light: false,
+            bg: Color32::from_rgb(0x0d, 0x12, 0x14),
+            surface: Color32::from_rgb(0x15, 0x1c, 0x1f),
+            surface_raised: Color32::from_rgb(0x20, 0x2a, 0x2e),
+            surface_sunken: Color32::from_rgb(0x07, 0x0b, 0x0d),
+            text: Color32::from_rgb(0xdc, 0xe8, 0xe8),
+            text_muted: Color32::from_rgb(0x8d, 0xa0, 0xa2),
+            text_value: Color32::from_rgb(0xa9, 0xd8, 0xd3),
+            outline: Color32::from_rgb(0x3d, 0x51, 0x54),
+            divider: Color32::from_rgb(0x29, 0x38, 0x3b),
+            focus: Color32::from_rgb(0x9a, 0xf0, 0xe4),
+            accent: Color32::from_rgb(0x42, 0xc7, 0xbb),
+            accent_muted: Color32::from_rgb(0x23, 0x5e, 0x5d),
+            role_time: Color32::from_rgb(0x65, 0xa9, 0xd8),
+            role_time_dim: Color32::from_rgb(0x35, 0x55, 0x67),
+            role_level: Color32::from_rgb(0x80, 0xc9, 0x9c),
+            role_level_dim: Color32::from_rgb(0x36, 0x59, 0x49),
+            role_shape: Color32::from_rgb(0xb8, 0xc8, 0xc6),
+            role_shape_dim: Color32::from_rgb(0x5d, 0x70, 0x70),
+            role_mod: Color32::from_rgb(0x8c, 0x9f, 0xdf),
+            role_mod_dim: Color32::from_rgb(0x3e, 0x48, 0x69),
+            ok: Color32::from_rgb(0x58, 0xbf, 0x8b),
+            warn: Color32::from_rgb(0xd4, 0xa5, 0x5d),
+            danger: Color32::from_rgb(0xd7, 0x68, 0x66),
+            red_zone: Color32::from_rgb(0xe4, 0x77, 0x70),
+            green_zone: Color32::from_rgb(0x69, 0xcb, 0x9e),
+            playhead: Color32::from_rgb(0x73, 0xe3, 0xd5),
+            loop_region: Color32::from_rgba_unmultiplied(0x42, 0xc7, 0xbb, 0x24),
+            loop_brace: Color32::from_rgb(0x56, 0xb5, 0xae),
+            selection: Color32::from_rgba_unmultiplied(0x62, 0xcf, 0xc4, 0x32),
+            grid_beat: Color32::from_rgb(0x25, 0x34, 0x37),
+            grid_bar: Color32::from_rgb(0x3c, 0x52, 0x55),
+            grid_sub: Color32::from_rgb(0x19, 0x24, 0x27),
+            timeline_lane: Color32::from_rgb(0x0e, 0x14, 0x16),
+            timeline_lane_alt: Color32::from_rgb(0x11, 0x19, 0x1c),
+            timeline_lane_selected: Color32::from_rgb(0x18, 0x29, 0x2b),
+            clip_body: Color32::from_rgb(0x2c, 0x3b, 0x3e),
+            clip_midi: Color32::from_rgb(0x25, 0x50, 0x4a),
+            clip_midi_header: Color32::from_rgb(0x36, 0x72, 0x69),
+            clip_audio: Color32::from_rgb(0x29, 0x46, 0x58),
+            clip_audio_header: Color32::from_rgb(0x3b, 0x68, 0x80),
+            clip_hover: Color32::from_rgb(0x83, 0xaf, 0xaf),
+            clip_selected: Color32::from_rgb(0x85, 0xe0, 0xd5),
+            clip_note: Color32::from_rgb(0xc2, 0xe5, 0xe0),
+            note_fill: Color32::from_rgb(0x55, 0xb8, 0xac),
+            note_fill_selected: Color32::from_rgb(0x60, 0xca, 0xbd),
+            note_edge: Color32::from_rgb(0x0b, 0x20, 0x21),
+            note_hover: Color32::from_rgb(0x5b, 0xc1, 0xb5),
+            note_ghost: Color32::from_rgb(0x66, 0x70, 0x70),
+            meter_low: Color32::from_rgb(0x4f, 0xb9, 0x88),
+            meter_hot: Color32::from_rgb(0xd8, 0xad, 0x62),
+            meter_clip: Color32::from_rgb(0xe0, 0x5e, 0x60),
+            density: 1.0,
+        }
+    }
+
     /// A neon night scheme: violet-black grounds with cyan and magenta
     /// identity colours. The saturated accents stay on controls and musical
     /// content; panel grounds remain quiet enough for long sessions.
@@ -473,7 +535,12 @@ mod tests {
     /// by a well-meaning eyedropper. See the `note_*` field comments.
     #[test]
     fn unselected_notes_are_not_greyed() {
-        for theme in [Theme::dark(), Theme::light(), Theme::cyberpunk()] {
+        for theme in [
+            Theme::dark(),
+            Theme::light(),
+            Theme::industrial(),
+            Theme::cyberpunk(),
+        ] {
             let (h_plain, s_plain, v_plain) = hsv(theme.note_fill);
             let (h_sel, s_sel, v_sel) = hsv(theme.note_fill_selected);
             let (h_hover, s_hover, v_hover) = hsv(theme.note_hover);
@@ -552,7 +619,12 @@ mod tests {
             let (hi, lo) = if x > y { (x, y) } else { (y, x) };
             (hi + 0.05) / (lo + 0.05)
         }
-        for theme in [Theme::dark(), Theme::light(), Theme::cyberpunk()] {
+        for theme in [
+            Theme::dark(),
+            Theme::light(),
+            Theme::industrial(),
+            Theme::cyberpunk(),
+        ] {
             // Against both row grounds: white keys and the recessed
             // black-key rows. A note must be obvious on either.
             assert!(

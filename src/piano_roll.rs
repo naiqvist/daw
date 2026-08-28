@@ -142,8 +142,9 @@
 //!                   leaves. A conditional note wears a hollow ring
 //! Shift+Enter       open/close the PARAMETER-LOCK editor on the held
 //!                   note; inside it, arrows walk rows and set values
-//!                   (Shift is fine), Enter locks a row at the knob,
-//!                   Delete clears it, Escape leaves. The mouse clicks
+//!                   (Shift is fine), Enter keeps and closes, Delete
+//!                   clears, Escape cancels, and N / Shift+N keeps the
+//!                   editor open while walking notes. The mouse clicks
 //!                   a row to hold it and drags to set it; a locked
 //!                   note wears a dot
 //!
@@ -175,6 +176,47 @@ use std::collections::HashSet;
 
 use crate::{Clip, Focus, GRID_BEATS, GRID_DEFAULT, GRID_NAMES, Key, Note, claim};
 use daw::theory::{self, ChordSymbol, Voicing};
+
+/// What a lock verb does to the selection.
+///
+/// Named rather than passed as closures so the key map, the panel's hint
+/// strip and the tests all refer to the same nine things by the same
+/// nine names.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PlockVerb {
+    /// A straight line across the phrase, corner to corner of the range.
+    Ramp {
+        rising: bool,
+    },
+    /// A line from where the selection starts to the top or bottom.
+    Crescendo {
+        rising: bool,
+    },
+    Randomize {
+        amount: f32,
+    },
+    /// Away from the selection's own average, or back toward it.
+    Spread {
+        factor: f32,
+    },
+    Rotate {
+        by: i32,
+    },
+    /// The selection's own extremes, laid A B A B.
+    Alternate,
+    /// Keep a lock on every `n`th note and clear the rest.
+    EveryNth {
+        n: usize,
+    },
+    /// Blend toward the knob's current value; `t` of one flattens onto
+    /// it, which is how a shape is taken off again.
+    TowardKnob {
+        t: f32,
+    },
+    Quantize {
+        divisions: u32,
+    },
+}
 
 /// One lockable parameter of the track's instrument, as the plock editor
 /// lists it: the table id the engine understands, the words the user
@@ -1888,6 +1930,21 @@ pub struct PianoRoll {
     /// The parameter-lock editor: which note it is open on, and which
     /// row of the parameter list the keyboard is holding. `None` closed.
     plock_view: Option<(usize, usize)>,
+    /// The note's locks when the editor opened. Parameter-lock editing is a
+    /// small transaction: Enter keeps the current state, Escape restores
+    /// this one. UI state only; compiled sequence data never sees it.
+    plock_before: Option<(usize, Vec<(u32, f32)>)>,
+    /// The scatter's seed, advanced on every randomise so a second press
+    /// gives a different one — which is what pressing it again means —
+    /// while any single press stays reproducible for undo.
+    plock_seed: u64,
+    /// The bar graph's DISPLAYED values, easing toward the real ones.
+    ///
+    /// Motion that carries information: a verb rewrites eight numbers at
+    /// once, and watching them travel is how you see WHAT it did rather
+    /// than only what it left. It settles and stops — the house style
+    /// bans idle animation, and this is a transition, not a decoration.
+    plock_anim: Vec<f32>,
     /// The first row the lock panel is showing. Kept so the list scrolls
     /// only when the selection would leave the window, rather than every
     /// time it moves.
@@ -2004,6 +2061,9 @@ impl Default for PianoRoll {
             shown_clip: None,
             anchor: None,
             plock_view: None,
+            plock_before: None,
+            plock_seed: 0x2545_F491_4F6C_DD1D,
+            plock_anim: Vec::new(),
             plock_scroll: 0,
             trig_view: None,
             chord_entry: None,
@@ -2417,7 +2477,18 @@ impl PianoRoll {
     /// `keys` alone cannot stop Space, `:`, or `a` leaking into transport,
     /// palette, or automation actions.
     pub fn owns_modal_input(&self) -> bool {
-        self.chord_entry.is_some()
+        // The LOCK AND TRIG EDITORS COUNT. Both take bare letters — R,
+        // C, Z, S, O, A, K, Q and the digits — and the app's global
+        // shortcuts run BEFORE `keys` does, so consuming an event inside
+        // the editor cannot stop one that was taken upstream.
+        //
+        // `O` is what found this: it rotates the selection's locks in
+        // the editor and toggles the metronome globally, and the
+        // metronome won every time. Any bare letter the editor uses has
+        // the same problem, so the fix is the general one — while a
+        // floating editor is open it owns the keyboard, which is what
+        // its own documentation already claimed.
+        self.chord_entry.is_some() || self.plock_view.is_some() || self.trig_view.is_some()
     }
 
     pub fn take_clip_length_edit(&mut self) -> Option<ClipLengthEdit> {
@@ -2646,6 +2717,7 @@ impl PianoRoll {
         self.anchor = None;
         self.drag = None;
         self.plock_view = None;
+        self.plock_before = None;
         self.trig_view = None;
         self.chord_entry = None;
         self.cursor_beat = 0.0;
@@ -2802,6 +2874,7 @@ impl PianoRoll {
     fn plock_toggle_view(&mut self, notes: &[Note]) {
         if self.plock_view.is_some() {
             self.plock_view = None;
+            self.plock_before = None;
             return;
         }
         let target = self.note_at_cursor(notes).or_else(|| {
@@ -2809,6 +2882,7 @@ impl PianoRoll {
         });
         if let Some(note) = target.filter(|&i| i < notes.len()) {
             self.plock_view = Some((note, 0));
+            self.plock_before = Some((note, notes[note].plocks.clone()));
         }
     }
 
@@ -2819,9 +2893,161 @@ impl PianoRoll {
             Some((note, row)) if note < notes.len() => Some((note, row)),
             _ => {
                 self.plock_view = None;
+                self.plock_before = None;
                 None
             }
         }
+    }
+
+    /// The notes the lock editor acts on, in TIME ORDER.
+    ///
+    /// The selection when there is one, otherwise the note the editor
+    /// was opened on. Single-note editing is the one-element case of the
+    /// same thing rather than a separate path — which is what stops the
+    /// verbs needing two implementations, one of which would rot.
+    ///
+    /// Sorted by start and then pitch: the verbs are index-ordered, and
+    /// "first to last" has to mean along the phrase rather than however
+    /// the note vector happens to be arranged. A chord's notes share a
+    /// beat and get a stable order from their pitch.
+    fn plock_targets(&self, notes: &[Note]) -> Vec<usize> {
+        let Some((anchor, _)) = self.plock_view else {
+            return Vec::new();
+        };
+        let mut targets: Vec<usize> = if self.selected.len() > 1 {
+            self.selected
+                .iter()
+                .copied()
+                .filter(|i| *i < notes.len())
+                .collect()
+        } else {
+            vec![anchor]
+        };
+        targets.retain(|i| *i < notes.len());
+        targets.sort_by(|a, b| {
+            notes[*a]
+                .start
+                .total_cmp(&notes[*b].start)
+                .then(notes[*a].pitch.cmp(&notes[*b].pitch))
+        });
+        targets.dedup();
+        targets
+    }
+
+    /// What those notes currently hold for `param` — the lock if there
+    /// is one, the knob's own value if there is not.
+    ///
+    /// An unlocked note reads as the base rather than being skipped, so
+    /// a verb applied across a half-locked phrase produces a shape over
+    /// all of it instead of a shape with holes.
+    fn plock_values(&self, notes: &[Note], targets: &[usize], param: &PlockParam) -> Vec<f32> {
+        targets
+            .iter()
+            .map(|i| {
+                notes[*i]
+                    .plocks
+                    .iter()
+                    .find(|(id, _)| *id == param.id)
+                    .map_or(param.base, |(_, v)| *v)
+            })
+            .collect()
+    }
+
+    /// Write values back as locks. `keep` is `every_nth`'s mask: a note
+    /// it excludes loses its lock rather than gaining a duplicate of the
+    /// knob's value, because that verb is about PRESENCE.
+    fn plock_write(
+        &mut self,
+        notes: &mut [Note],
+        targets: &[usize],
+        param: &PlockParam,
+        values: &[f32],
+        keep: Option<&[bool]>,
+    ) {
+        for (slot, note) in targets.iter().enumerate() {
+            let Some(n) = notes.get_mut(*note) else {
+                continue;
+            };
+            let wanted = keep.is_none_or(|mask| mask.get(slot).copied().unwrap_or(true));
+            if !wanted {
+                n.plocks.retain(|(id, _)| *id != param.id);
+                continue;
+            }
+            let Some(value) = values.get(slot).copied() else {
+                continue;
+            };
+            match n.plocks.iter_mut().find(|(id, _)| *id == param.id) {
+                Some((_, held)) => *held = value,
+                None => n.plocks.push((param.id, value)),
+            }
+        }
+    }
+
+    /// The range a verb may write into, taken from the parameter itself
+    /// — including its steps, when it has them.
+    fn plock_range(param: &PlockParam) -> crate::plock_ops::Range {
+        if param.choices > 1 {
+            crate::plock_ops::Range::stepped(param.min, param.max, param.choices)
+        } else {
+            crate::plock_ops::Range::new(param.min, param.max)
+        }
+    }
+
+    /// Apply one verb across the selection, on the held row.
+    ///
+    /// Every verb goes through here, so the target list, the read, the
+    /// range and the write-back are decided once. A verb that reached
+    /// into the notes itself would be a second copy of all four.
+    fn plock_verb(&mut self, notes: &mut [Note], params: &[PlockParam], verb: PlockVerb) {
+        let Some((_, row)) = self.plock_at(notes) else {
+            return;
+        };
+        let Some(param) = params.get(row) else {
+            return;
+        };
+        let targets = self.plock_targets(notes);
+        if targets.is_empty() {
+            return;
+        }
+        let range = Self::plock_range(param);
+        let mut values = self.plock_values(notes, &targets, param);
+        let mut keep: Option<Vec<bool>> = None;
+
+        use crate::plock_ops as ops;
+        match verb {
+            PlockVerb::Ramp { rising } => {
+                let (a, b) = if rising {
+                    (range.min, range.max)
+                } else {
+                    (range.max, range.min)
+                };
+                ops::ramp(&mut values, a, b, range);
+            }
+            PlockVerb::Crescendo { rising } => ops::crescendo(&mut values, range, rising),
+            PlockVerb::Randomize { amount } => {
+                // The seed moves with the selection, so pressing it twice
+                // gives a different scatter — which is what anyone
+                // pressing "randomise" again is asking for — while a
+                // single press stays reproducible for undo.
+                self.plock_seed = self
+                    .plock_seed
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                ops::randomize(&mut values, amount, range, self.plock_seed);
+            }
+            PlockVerb::Spread { factor } => ops::spread(&mut values, factor, range),
+            PlockVerb::Rotate { by } => ops::rotate(&mut values, by),
+            PlockVerb::Alternate => {
+                let s = ops::summarise(&values, range);
+                ops::alternate(&mut values, s.min, s.max, range);
+            }
+            PlockVerb::EveryNth { n } => {
+                keep = Some(ops::every_nth(values.len(), n, 0));
+            }
+            PlockVerb::TowardKnob { t } => ops::scale_toward(&mut values, param.base, t, range),
+            PlockVerb::Quantize { divisions } => ops::quantize(&mut values, divisions, range),
+        }
+        self.plock_write(notes, &targets, param, &values, keep.as_deref());
     }
 
     /// Move the editor's row cursor.
@@ -2833,21 +3059,55 @@ impl PianoRoll {
         }
     }
 
-    /// Enter on a row: lock it at the KNOB's value, or unlock it. A
-    /// fresh lock starting anywhere but the base would jump the sound on
-    /// a key whose meaning is "hold this parameter here".
-    fn plock_toggle_row(&mut self, notes: &mut [Note], params: &[PlockParam]) {
+    /// Enter keeps the edit and closes the panel. If nothing was adjusted,
+    /// it still has one useful meaning: lock the held row at the knob's
+    /// current value. It never removes a lock; Delete is the only removal
+    /// verb, so confirmation cannot unexpectedly undo the work it confirms.
+    fn plock_commit(&mut self, notes: &mut [Note], params: &[PlockParam]) {
         let Some((note, row)) = self.plock_at(notes) else {
             return;
         };
         let (Some(n), Some(p)) = (notes.get_mut(note), params.get(row)) else {
             return;
         };
-        if let Some(at) = n.plocks.iter().position(|(id, _)| *id == p.id) {
-            n.plocks.remove(at);
-        } else {
+        let unchanged = self
+            .plock_before
+            .as_ref()
+            .is_some_and(|(before_note, before)| *before_note == note && *before == n.plocks);
+        if unchanged && !n.plocks.iter().any(|(id, _)| *id == p.id) {
             n.plocks.push((p.id, p.base));
         }
+        self.plock_view = None;
+        self.plock_before = None;
+    }
+
+    /// Escape abandons every lock edit made since the panel opened, then
+    /// closes it. A missing/deleted note simply closes; there is no successor
+    /// mutation to guess at.
+    fn plock_cancel(&mut self, notes: &mut [Note]) {
+        if let Some((note, before)) = self.plock_before.take()
+            && let Some(n) = notes.get_mut(note)
+        {
+            n.plocks = before;
+        }
+        self.plock_view = None;
+    }
+
+    /// Keep the current note's edits and carry the open editor to the next
+    /// or previous note. The destination gets its own fresh Escape baseline,
+    /// so cancelling there never rolls back a note already left behind.
+    fn plock_jump_note(&mut self, notes: &[Note], forward: bool) {
+        let Some((from, row)) = self.plock_view else {
+            return;
+        };
+        let Some(to) = self.jump_to_note(notes, forward) else {
+            return;
+        };
+        if to == from {
+            return;
+        }
+        self.plock_view = Some((to, row));
+        self.plock_before = Some((to, notes[to].plocks.clone()));
     }
 
     /// Adjust the row's lock by a fraction of its range, creating the
@@ -2931,6 +3191,7 @@ impl PianoRoll {
             return;
         }
         self.plock_view = None;
+        self.plock_before = None;
         let target = self.note_at_cursor(notes).or_else(|| {
             (self.selected.len() == 1).then(|| *self.selected.iter().next().unwrap_or(&0))
         });
@@ -3018,7 +3279,7 @@ impl PianoRoll {
     /// N / Shift+N: the cursor jumps to the next (or previous) note start
     /// and selects that note alone — walking the material note by note,
     /// each stop ready for [ ] , . or a nudge.
-    fn jump_to_note(&mut self, notes: &[Note], forward: bool) {
+    fn jump_to_note(&mut self, notes: &[Note], forward: bool) -> Option<usize> {
         let best = notes
             .iter()
             .enumerate()
@@ -3041,6 +3302,9 @@ impl PianoRoll {
             self.selected.clear();
             self.selected.insert(i);
             self.anchor = None;
+            Some(i)
+        } else {
+            None
         }
     }
 
@@ -3336,6 +3600,73 @@ pub fn keys(
             return;
         }
         if pr.plock_view.is_some() {
+            // Moving between notes keeps the edits on the note being left
+            // and starts a fresh Escape transaction at the destination.
+            if i.consume_key(Modifiers::SHIFT, Key::N) {
+                pr.plock_jump_note(notes, false);
+            } else if i.consume_key(Modifiers::NONE, Key::N) {
+                pr.plock_jump_note(notes, true);
+            }
+            // THE NINE VERBS. Shift is the opposite of each, as it is
+            // everywhere else in this editor: fine against coarse, up
+            // against down, forward against back.
+            for (chord, verb) in [
+                (Modifiers::SHIFT, PlockVerb::Ramp { rising: false }),
+                (Modifiers::NONE, PlockVerb::Ramp { rising: true }),
+            ] {
+                if i.consume_key(chord, Key::R) {
+                    pr.plock_verb(notes, plocks, verb);
+                }
+            }
+            for (chord, verb) in [
+                (Modifiers::SHIFT, PlockVerb::Crescendo { rising: false }),
+                (Modifiers::NONE, PlockVerb::Crescendo { rising: true }),
+            ] {
+                if i.consume_key(chord, Key::C) {
+                    pr.plock_verb(notes, plocks, verb);
+                }
+            }
+            for (chord, amount) in [(Modifiers::SHIFT, 0.12), (Modifiers::NONE, 0.35)] {
+                if i.consume_key(chord, Key::Z) {
+                    pr.plock_verb(notes, plocks, PlockVerb::Randomize { amount });
+                }
+            }
+            for (chord, factor) in [(Modifiers::SHIFT, 0.7), (Modifiers::NONE, 1.4)] {
+                if i.consume_key(chord, Key::S) {
+                    pr.plock_verb(notes, plocks, PlockVerb::Spread { factor });
+                }
+            }
+            for (chord, by) in [(Modifiers::SHIFT, -1), (Modifiers::NONE, 1)] {
+                if i.consume_key(chord, Key::O) {
+                    pr.plock_verb(notes, plocks, PlockVerb::Rotate { by });
+                }
+            }
+            if i.consume_key(Modifiers::NONE, Key::A) {
+                pr.plock_verb(notes, plocks, PlockVerb::Alternate);
+            }
+            // Every second, third or fourth — the number IS the key, so
+            // there is nothing to remember.
+            for (key, n) in [
+                (Key::Num1, 1),
+                (Key::Num2, 2),
+                (Key::Num3, 3),
+                (Key::Num4, 4),
+            ] {
+                if i.consume_key(Modifiers::NONE, key) {
+                    pr.plock_verb(notes, plocks, PlockVerb::EveryNth { n });
+                }
+            }
+            for (chord, t) in [(Modifiers::SHIFT, 1.0), (Modifiers::NONE, 0.35)] {
+                if i.consume_key(chord, Key::K) {
+                    pr.plock_verb(notes, plocks, PlockVerb::TowardKnob { t });
+                }
+            }
+            for (chord, divisions) in [(Modifiers::SHIFT, 5), (Modifiers::NONE, 13)] {
+                if i.consume_key(chord, Key::Q) {
+                    pr.plock_verb(notes, plocks, PlockVerb::Quantize { divisions });
+                }
+            }
+
             if i.consume_key(Modifiers::NONE, Key::ArrowUp) {
                 pr.plock_nav(-1, plocks.len());
             }
@@ -3369,7 +3700,7 @@ pub fn keys(
                 pr.plock_adjust(notes, plocks, f32::INFINITY);
             }
             if i.consume_key(Modifiers::NONE, Key::Enter) {
-                pr.plock_toggle_row(notes, plocks);
+                pr.plock_commit(notes, plocks);
             }
             if i.consume_key(Modifiers::NONE, Key::Delete)
                 || i.consume_key(Modifiers::NONE, Key::Backspace)
@@ -3377,7 +3708,7 @@ pub fn keys(
                 pr.plock_remove(notes, plocks);
             }
             if i.consume_key(Modifiers::NONE, Key::Escape) {
-                pr.plock_view = None;
+                pr.plock_cancel(notes);
             }
             return;
         }
@@ -3609,25 +3940,56 @@ fn plock_overlay(
     let Some((note_idx, row_sel)) = pr.plock_at(notes) else {
         return;
     };
-    if plocks.is_empty() {
-        return;
-    }
     let Some(anchor_note) = notes.get(note_idx) else {
         return;
     };
 
     const ROW_H_PX: f32 = 15.0;
+    /// One note's panel: a list of rows and a line of help.
     const PANEL_W: f32 = 190.0;
-    let panel_h = (ROW_H_PX * plocks.len() as f32 + 8.0).min(grid.height() - 8.0);
+    /// The selection's panel is WIDER because it has more to say — a
+    /// shape, three numbers and nine verbs. Squeezing those into the
+    /// single-note width is what made the head unreadable: the
+    /// parameter's name and its min/mean/max met in the middle, and a
+    /// seventy-character hint strip ran off both ends.
+    const PANEL_W_MULTI: f32 = 268.0;
+    /// How tall the selection's bar graph is.
+    const GRAPH_H: f32 = 26.0;
+    /// How fast the bars travel, as a share of the distance left each
+    /// frame. Quick enough to be over before it is in the way, slow
+    /// enough that the eye catches WHICH bars moved and how far.
+    const GRAPH_EASE: f32 = 0.28;
+    /// Below this the bars have arrived and the panel stops asking for
+    /// frames. The house rule is no idle animation, and a transition
+    /// that never finishes is idle animation with extra steps.
+    const GRAPH_SETTLED: f32 = 0.002;
+    // MULTI MODE. More than one note selected and the panel gains a
+    // head: what the whole selection looks like on the held row, as a
+    // shape and as three numbers. One note is the same panel with a
+    // selection of one, which is why there is no second code path.
+    let targets = pr.plock_targets(notes);
+    let multi = targets.len() > 1;
+    let head_h = if multi { GRAPH_H + ROW_H_PX } else { 0.0 };
+    let panel_w = if multi { PANEL_W_MULTI } else { PANEL_W };
+    // Nine verbs do not fit on one line at any width this panel should
+    // be, so multi mode spends a second row on them rather than printing
+    // a strip nobody can read.
+    let hint_rows = if multi { 2.0 } else { 1.0 };
+
+    // At least one row's worth, so the "nothing to lock" line below has
+    // somewhere to be said. Sized from an empty list the panel is eight
+    // points tall, which is indistinguishable from not drawing one.
+    let panel_h = (ROW_H_PX * (plocks.len().max(1) as f32 + hint_rows - 1.0) + head_h + 8.0)
+        .min(grid.height() - 8.0);
     let nr = g.note_rect(anchor_note);
     let mut origin = egui::pos2(nr.right() + 8.0, nr.top());
-    if origin.x + PANEL_W > grid.right() {
-        origin.x = (nr.left() - PANEL_W - 8.0).max(grid.left());
+    if origin.x + panel_w > grid.right() {
+        origin.x = (nr.left() - panel_w - 8.0).max(grid.left());
     }
     origin.y = origin
         .y
         .clamp(grid.top(), (grid.bottom() - panel_h).max(grid.top()));
-    let panel = egui::Rect::from_min_size(origin, egui::vec2(PANEL_W, panel_h));
+    let panel = egui::Rect::from_min_size(origin, egui::vec2(panel_w, panel_h));
 
     let painter = ui.painter();
     painter.rect_filled(panel, 3.0, theme.surface);
@@ -3638,11 +4000,132 @@ fn plock_overlay(
         egui::StrokeKind::Inside,
     );
 
-    let inner = panel.shrink(4.0);
-    // One row of the panel is spent on the key legend, which is worth it
-    // exactly once: nobody guesses "left and right change the value" from
-    // a vertical list.
-    let rows_h = (inner.height() - ROW_H_PX).max(ROW_H_PX);
+    // NOTHING TO LOCK IS AN ANSWER, not an absence.
+    //
+    // This used to return before painting anything, so on a track with
+    // no instrument the key opened an editor that drew nothing at all —
+    // the state said open, the screen said the shortcut was broken, and
+    // from a chair there was no way to tell those apart.
+    //
+    // The same rule the browser's empty catalog and the arrangement's
+    // empty search follow: say WHY there is nothing, because an empty
+    // panel and a missing panel want completely different things from
+    // whoever is looking at one.
+    if plocks.is_empty() {
+        painter.text(
+            panel.shrink(6.0).left_top(),
+            egui::Align2::LEFT_TOP,
+            "no instrument on this track",
+            egui::FontId::proportional(9.0),
+            theme.text_muted,
+        );
+        return;
+    }
+
+    let mut inner = panel.shrink(4.0);
+
+    // --- the selection's shape ---------------------------------------
+    if multi && let Some(param) = plocks.get(row_sel) {
+        let head = egui::Rect::from_min_size(inner.min, egui::vec2(inner.width(), head_h));
+        inner = egui::Rect::from_min_max(egui::pos2(inner.left(), head.bottom()), inner.max);
+        let range = PianoRoll::plock_range(param);
+        let values = pr.plock_values(notes, &targets, param);
+
+        // EASE, and only while there is somewhere to go. A verb rewrites
+        // every value at once, and watching them travel is how you see
+        // what it DID rather than only what it left behind.
+        if pr.plock_anim.len() != values.len() {
+            pr.plock_anim = values.clone();
+        }
+        let mut moving = false;
+        for (shown, real) in pr.plock_anim.iter_mut().zip(values.iter()) {
+            let gap = *real - *shown;
+            if gap.abs() > range.span() * GRAPH_SETTLED {
+                *shown += gap * GRAPH_EASE;
+                moving = true;
+            } else {
+                *shown = *real;
+            }
+        }
+        if moving {
+            ui.ctx().request_repaint();
+        }
+
+        let bars = egui::Rect::from_min_size(head.min, egui::vec2(head.width(), GRAPH_H));
+        let n = pr.plock_anim.len().max(1);
+        let step = bars.width() / n as f32;
+        let painter = ui.painter();
+        // A floor line, so a bar at the bottom of the range is still a
+        // bar rather than an absence.
+        painter.line_segment(
+            [bars.left_bottom(), bars.right_bottom()],
+            egui::Stroke::new(stroke::HAIR, theme.divider),
+        );
+        for (i, shown) in pr.plock_anim.iter().enumerate() {
+            let t = if range.span() > 0.0 {
+                ((*shown - range.min) / range.span()).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let x = bars.left() + i as f32 * step;
+            let bar = egui::Rect::from_min_max(
+                egui::pos2(x + 0.5, bars.bottom() - (GRAPH_H - 2.0) * t - 1.0),
+                egui::pos2(x + step - 0.5, bars.bottom()),
+            );
+            // The note the editor is ANCHORED on reads brightest: the
+            // graph shows the whole selection, and it still has to say
+            // which of them the numbers underneath belong to.
+            let anchor = targets.get(i).copied() == pr.plock_view.map(|(note, _)| note);
+            painter.rect_filled(
+                bar,
+                0.0,
+                if anchor {
+                    theme.accent
+                } else {
+                    theme.accent_muted
+                },
+            );
+        }
+
+        // THREE NUMBERS. The shape says how the selection moves; these
+        // say where it actually is, which a normalised graph cannot.
+        let s = crate::plock_ops::summarise(&values, range);
+        let legend = egui::Rect::from_min_size(
+            egui::pos2(head.left(), bars.bottom()),
+            egui::vec2(head.width(), ROW_H_PX),
+        );
+        painter.text(
+            legend.left_center(),
+            egui::Align2::LEFT_CENTER,
+            // NOT the parameter's name: it is already the highlighted
+            // row in the list below, and printing it twice is what
+            // pushed the numbers into it. What the head adds is how
+            // many notes the shape is made of.
+            format!("{} notes", targets.len()),
+            egui::FontId::proportional(font::MINI_LABEL),
+            theme.text,
+        );
+        painter.text(
+            legend.right_center(),
+            egui::Align2::RIGHT_CENTER,
+            format!(
+                "{} / {} / {}",
+                (param.format)(s.min),
+                (param.format)(s.mean),
+                (param.format)(s.max)
+            ),
+            egui::FontId::monospace(font::MICRO_LABEL),
+            theme.text_muted,
+        );
+    }
+
+    // The key legend costs a row, and is worth it exactly once: nobody
+    // guesses "left and right change the value" from a vertical list.
+    //
+    // TWO rows in multi mode, and the list has to know — reserving one
+    // while the legend prints two puts the second line straight through
+    // the bottom parameter.
+    let rows_h = (inner.height() - ROW_H_PX * hint_rows).max(ROW_H_PX);
     let visible = ((rows_h / ROW_H_PX) as usize).max(1);
 
     // Scroll only when the selection would LEAVE the window, and keep it
@@ -3790,17 +4273,30 @@ fn plock_overlay(
     // The legend, once, along the bottom. Nobody guesses that a VERTICAL
     // list is adjusted with the HORIZONTAL arrows, and the alternative to
     // saying so is every user finding out the way this one did.
-    let legend = egui::Rect::from_min_size(
-        egui::pos2(inner.left(), inner.bottom() - ROW_H_PX),
-        egui::vec2(inner.width(), ROW_H_PX),
-    );
-    ui.painter().text(
-        legend.center(),
-        egui::Align2::CENTER_CENTER,
-        "↑↓ row  ←→ value  ⇧ fine  ⏎ lock  ⌫ clear",
-        egui::FontId::proportional(font::MINI_LABEL),
-        theme.text_muted,
-    );
+    // The help, on as many lines as it needs. Nine verbs on one row is
+    // a strip nobody reads; two rows of five is a list.
+    let hints: &[&str] = if multi {
+        &[
+            "R ramp   C cresc   Z rand   S spread   O rot",
+            "A alt   1-4 nth   K knob   Q quant   ⇧ inverts",
+        ]
+    } else {
+        &["↑↓ row  ←→ value  ⇧ fine  ⏎ keep  esc cancel  ⌫ clear"]
+    };
+    for (line, text) in hints.iter().enumerate() {
+        let from_bottom = (hints.len() - line) as f32;
+        let legend = egui::Rect::from_min_size(
+            egui::pos2(inner.left(), inner.bottom() - ROW_H_PX * from_bottom),
+            egui::vec2(inner.width(), ROW_H_PX),
+        );
+        ui.painter().text(
+            legend.center(),
+            egui::Align2::CENTER_CENTER,
+            *text,
+            egui::FontId::proportional(font::MICRO_LABEL),
+            theme.text_muted,
+        );
+    }
 }
 
 /// The trig editor: two rows beside the note — probability, and the A:B
@@ -7695,6 +8191,207 @@ mod tests {
 
     // ------------------------------------------ parameter locks ---
 
+    /// THE PANEL ACTUALLY DRAWS.
+    ///
+    /// Every other plock test asserts STATE — that `plock_view` holds the
+    /// right note and row. None of them asks whether anything reached the
+    /// screen, which is the one thing a floating editor has to do, and it
+    /// is exactly the gap a rewrite of the open/commit paths can fall
+    /// through: the transaction can be perfect and the panel still never
+    /// be painted.
+    ///
+    /// Drives `plock_overlay` directly and counts what it emitted.
+    #[test]
+    fn the_open_plock_editor_paints_a_panel() {
+        let params = plist();
+        let (mut pr, mut notes) = roll_with(vec![note(60, 0.0, 1.0, 100)]);
+        pr.cursor_pitch = 60;
+        pr.plock_toggle_view(&notes);
+        assert!(pr.plock_view.is_some(), "the editor did not open");
+
+        let ctx = egui::Context::default();
+        let view = Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 520.0));
+        let shapes = |pr: &mut PianoRoll, notes: &mut Vec<Note>, params: &[PlockParam]| {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(view),
+                    ..Default::default()
+                },
+                |ui| {
+                    let lay = layout(view, &pr.lanes);
+                    let g = Geom::new(lay.grid, pr.scroll_beats, pr.scroll_y, pr.zoom, Fold::ALL);
+                    plock_overlay(ui, &Theme::dark(), pr, notes, params, g);
+                },
+            );
+            let count = out.shapes.len();
+            out.textures_delta.clear();
+            count
+        };
+
+        let drawn = shapes(&mut pr, &mut notes, &params);
+        assert!(
+            drawn > 2,
+            "an open editor painted {drawn} shapes — the panel is not on screen"
+        );
+
+        // And the guards it is allowed to bail on, so a future change
+        // cannot quietly turn "no panel" into the normal case.
+        // NOTHING TO LOCK STILL SAYS SO. An editor that opened and drew
+        // nothing read as a broken shortcut — the state said open and
+        // the screen said nothing had happened, and from a chair those
+        // are the same thing.
+        let empty: Vec<PlockParam> = Vec::new();
+        assert!(
+            shapes(&mut pr, &mut notes, &empty) > 0,
+            "a track with nothing lockable drew no panel and no reason"
+        );
+        // A CLOSED editor draws nothing at all, which is the one case
+        // where an empty screen is the right answer.
+        pr.plock_view = None;
+        assert_eq!(shapes(&mut pr, &mut notes, &params), 0);
+    }
+
+    /// THE VERBS REACH THE NOTES, in time order, across the selection.
+    ///
+    /// `plock_ops` proves the arithmetic; this proves the wiring —
+    /// which notes are chosen, that they are ordered along the phrase
+    /// rather than by however the vector happens to be arranged, and
+    /// that the results come back as locks.
+    #[test]
+    fn a_verb_shapes_the_whole_selection_in_time_order() {
+        let params = plist();
+        // Deliberately out of order in the vector: the phrase is
+        // 0, 1, 2, 3 in TIME, and the verbs must not care about storage.
+        let (mut pr, mut notes) = roll_with(vec![
+            note(60, 3.0, 1.0, 100),
+            note(60, 0.0, 1.0, 100),
+            note(60, 2.0, 1.0, 100),
+            note(60, 1.0, 1.0, 100),
+        ]);
+        pr.cursor_pitch = 60;
+        pr.cursor_beat = 0.0;
+        pr.plock_toggle_view(&notes);
+        assert!(pr.plock_view.is_some());
+        pr.selected = (0..4).collect();
+
+        let id = params[0].id;
+        let read = |notes: &[Note]| -> Vec<f32> {
+            let mut by_time: Vec<&Note> = notes.iter().collect();
+            by_time.sort_by(|a, b| a.start.total_cmp(&b.start));
+            by_time
+                .iter()
+                .map(|n| {
+                    n.plocks
+                        .iter()
+                        .find(|(pid, _)| *pid == id)
+                        .map_or(f32::NAN, |(_, v)| *v)
+                })
+                .collect()
+        };
+
+        pr.plock_verb(&mut notes, &params, PlockVerb::Ramp { rising: true });
+        let ramped = read(&notes);
+        assert!(
+            ramped.windows(2).all(|w| w[1] > w[0]),
+            "a rising ramp came out as {ramped:?} — not ordered along the phrase"
+        );
+        assert!((ramped[0] - params[0].min).abs() < 1.0);
+        assert!((ramped[3] - params[0].max).abs() < 1.0);
+
+        // ROTATE moves the values and keeps the multiset — the one verb
+        // that can neither invent nor lose a value.
+        pr.plock_verb(&mut notes, &params, PlockVerb::Rotate { by: 1 });
+        let mut before = ramped.clone();
+        let mut after = read(&notes);
+        assert_eq!(after[0], ramped[3], "rotate did not wrap");
+        before.sort_by(f32::total_cmp);
+        after.sort_by(f32::total_cmp);
+        assert_eq!(before, after, "rotate changed the set of values");
+
+        // EVERY NTH is about presence: half the notes keep a lock.
+        pr.plock_verb(&mut notes, &params, PlockVerb::EveryNth { n: 2 });
+        let held = notes
+            .iter()
+            .filter(|n| n.plocks.iter().any(|(pid, _)| *pid == id))
+            .count();
+        assert_eq!(held, 2, "every-2nd left {held} locks");
+
+        // TOWARD KNOB all the way flattens onto the base, which is how a
+        // shape is taken off again.
+        pr.selected = (0..4).collect();
+        pr.plock_verb(&mut notes, &params, PlockVerb::Ramp { rising: true });
+        pr.plock_verb(&mut notes, &params, PlockVerb::TowardKnob { t: 1.0 });
+        for value in read(&notes) {
+            assert!(
+                (value - params[0].base).abs() < 1e-2,
+                "{value} did not land on the knob"
+            );
+        }
+    }
+
+    /// AN OPEN EDITOR OWNS THE KEYBOARD, which is what stops its bare
+    /// letters reaching the app's global shortcuts.
+    ///
+    /// `O` found this: it rotates the selection's locks in the editor
+    /// and toggles the metronome globally — and the metronome won every
+    /// time, because the app's shortcuts run BEFORE `keys` does and
+    /// consuming an event inside the editor cannot take back one that
+    /// was already claimed upstream.
+    ///
+    /// Every bare letter the editor uses has the same exposure, so the
+    /// guard is the general one rather than a rebinding of the key that
+    /// happened to collide first.
+    #[test]
+    fn an_open_editor_claims_the_bare_letters_it_uses() {
+        let params = plist();
+        let (mut pr, notes) = roll_with(vec![note(60, 0.0, 1.0, 100)]);
+        pr.cursor_pitch = 60;
+        assert!(!pr.owns_modal_input(), "a closed roll owns nothing");
+
+        pr.plock_toggle_view(&notes);
+        assert!(
+            pr.owns_modal_input(),
+            "the lock editor is open and the app's shortcuts still run"
+        );
+        pr.plock_view = None;
+        assert!(!pr.owns_modal_input());
+
+        pr.trig_toggle_view(&notes);
+        assert!(
+            pr.owns_modal_input(),
+            "the trig editor takes bare letters too"
+        );
+        pr.trig_view = None;
+        assert!(!pr.owns_modal_input());
+        let _ = params;
+    }
+
+    /// A SINGLE NOTE IS THE ONE-ELEMENT CASE, not a separate path.
+    ///
+    /// The whole reason the verbs take a slice: if single-note editing
+    /// had its own implementation, it would be the one that rotted.
+    #[test]
+    fn the_verbs_work_on_a_selection_of_one() {
+        let params = plist();
+        let (mut pr, mut notes) = roll_with(vec![note(60, 0.0, 1.0, 100)]);
+        pr.cursor_pitch = 60;
+        pr.plock_toggle_view(&notes);
+        pr.selected.clear();
+
+        pr.plock_verb(&mut notes, &params, PlockVerb::Crescendo { rising: true });
+        let locked = notes[0]
+            .plocks
+            .iter()
+            .find(|(id, _)| *id == params[0].id)
+            .map(|(_, v)| *v);
+        assert_eq!(locked, Some(params[0].base), "a lone note should not jump");
+
+        // And a verb with nothing open changes nothing rather than
+        // panicking on an empty target list.
+        pr.plock_view = None;
+        pr.plock_verb(&mut notes, &params, PlockVerb::Ramp { rising: true });
+    }
+
     fn plist() -> Vec<PlockParam> {
         let face = || -> std::sync::Arc<dyn Fn(f32) -> String + Send + Sync> {
             std::sync::Arc::new(|v: f32| format!("{v:.2}"))
@@ -7753,9 +8450,9 @@ mod tests {
         assert_eq!(pr.plock_view, None);
     }
 
-    /// The editing verbs: toggle locks at the KNOB's value, adjust
-    /// creates-then-moves, delete removes — and every value stays inside
-    /// the parameter's range.
+    /// The editing verbs: commit locks at the KNOB's value without ever
+    /// toggling one away, adjust creates-then-moves, delete removes — and
+    /// every value stays inside the parameter's range.
     #[test]
     fn plock_verbs_edit_the_note() {
         let (mut pr, mut notes) = roll_with(vec![note(60, 0.0, 1.0, 100)]);
@@ -7763,15 +8460,20 @@ mod tests {
         pr.cursor_pitch = 60;
         pr.plock_toggle_view(&notes);
 
-        // Enter: lock at base.
-        pr.plock_toggle_row(&mut notes, &params);
+        // Enter: lock at base and close.
+        pr.plock_commit(&mut notes, &params);
         assert_eq!(notes[0].plocks, vec![(17, 1_000.0)]);
-        // Enter again: unlock.
-        pr.plock_toggle_row(&mut notes, &params);
-        assert!(notes[0].plocks.is_empty());
+        assert!(pr.plock_view.is_none());
+
+        // Enter on an existing lock keeps it. It can never mean remove.
+        pr.plock_toggle_view(&notes);
+        pr.plock_commit(&mut notes, &params);
+        assert_eq!(notes[0].plocks, vec![(17, 1_000.0)]);
 
         // Adjust on an UNLOCKED row: the lock begins at the base and
         // moves — turning the value is how a lock starts.
+        notes[0].plocks.clear();
+        pr.plock_toggle_view(&notes);
         pr.plock_adjust(&mut notes, &params, 0.01);
         let v = notes[0].plocks[0].1;
         assert!((v - (1_000.0 + 0.01 * 19_980.0)).abs() < 0.5);
@@ -7789,6 +8491,108 @@ mod tests {
         // Delete removes only the held row's lock.
         pr.plock_remove(&mut notes, &params);
         assert_eq!(notes[0].plocks, vec![(17, 20_000.0)]);
+    }
+
+    /// The panel behaves like a conventional edit transaction: Enter keeps
+    /// the changed value, Escape puts back exactly what was there on open.
+    #[test]
+    fn plock_enter_keeps_and_escape_cancels() {
+        fn press(ctx: &egui::Context, key: egui::Key) {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))),
+                    events: vec![egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                },
+                |_ui| {},
+            );
+            out.textures_delta.clear();
+        }
+
+        let ctx = egui::Context::default();
+        let params = plist();
+        let (mut pr, mut notes) = roll_with(vec![note(60, 0.0, 1.0, 100)]);
+        pr.owns_keys = true;
+        pr.cursor_pitch = 60;
+
+        pr.plock_toggle_view(&notes);
+        press(&ctx, egui::Key::ArrowRight);
+        keys(&ctx, &mut pr, Some(&mut notes), &params, Key::default(), 4);
+        let kept = notes[0].plocks.clone();
+        press(&ctx, egui::Key::Enter);
+        keys(&ctx, &mut pr, Some(&mut notes), &params, Key::default(), 4);
+        assert!(pr.plock_view.is_none());
+        assert_eq!(notes[0].plocks, kept, "Enter discarded the edited lock");
+
+        pr.plock_toggle_view(&notes);
+        press(&ctx, egui::Key::ArrowRight);
+        keys(&ctx, &mut pr, Some(&mut notes), &params, Key::default(), 4);
+        assert_ne!(notes[0].plocks, kept);
+        press(&ctx, egui::Key::Escape);
+        keys(&ctx, &mut pr, Some(&mut notes), &params, Key::default(), 4);
+        assert!(pr.plock_view.is_none());
+        assert_eq!(notes[0].plocks, kept, "Escape kept an abandoned edit");
+    }
+
+    #[test]
+    fn an_open_plock_editor_walks_notes_without_losing_edits() {
+        fn press(ctx: &egui::Context, key: egui::Key, modifiers: egui::Modifiers) {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))),
+                    events: vec![egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                    }],
+                    ..Default::default()
+                },
+                |_ui| {},
+            );
+            out.textures_delta.clear();
+        }
+
+        let ctx = egui::Context::default();
+        let params = plist();
+        let (mut pr, mut notes) = roll_with(vec![note(60, 0.0, 1.0, 100), note(64, 2.0, 1.0, 100)]);
+        pr.owns_keys = true;
+        pr.cursor_pitch = 60;
+        pr.plock_toggle_view(&notes);
+
+        press(&ctx, egui::Key::ArrowRight, egui::Modifiers::NONE);
+        keys(&ctx, &mut pr, Some(&mut notes), &params, Key::default(), 4);
+        let first_edit = notes[0].plocks.clone();
+
+        press(&ctx, egui::Key::N, egui::Modifiers::NONE);
+        keys(&ctx, &mut pr, Some(&mut notes), &params, Key::default(), 4);
+        assert_eq!(pr.plock_view, Some((1, 0)));
+        assert_eq!(pr.selected, HashSet::from([1]));
+        assert_eq!((pr.cursor_beat, pr.cursor_pitch), (2.0, 64));
+        assert_eq!(notes[0].plocks, first_edit, "leaving discarded the edit");
+
+        // Escape belongs only to the destination's fresh transaction.
+        press(&ctx, egui::Key::ArrowRight, egui::Modifiers::NONE);
+        keys(&ctx, &mut pr, Some(&mut notes), &params, Key::default(), 4);
+        assert!(!notes[1].plocks.is_empty());
+        press(&ctx, egui::Key::Escape, egui::Modifiers::NONE);
+        keys(&ctx, &mut pr, Some(&mut notes), &params, Key::default(), 4);
+        assert!(notes[1].plocks.is_empty());
+        assert_eq!(notes[0].plocks, first_edit);
+
+        // Shift+N walks in the other direction and keeps the panel open.
+        pr.plock_toggle_view(&notes);
+        press(&ctx, egui::Key::N, egui::Modifiers::SHIFT);
+        keys(&ctx, &mut pr, Some(&mut notes), &params, Key::default(), 4);
+        assert_eq!(pr.plock_view, Some((0, 0)));
+        assert_eq!(pr.selected, HashSet::from([0]));
     }
 
     /// Drive the REAL key path for the lock editor, both directions.

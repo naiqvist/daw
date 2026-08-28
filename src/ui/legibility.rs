@@ -223,6 +223,7 @@ mod tests {
         for (name, theme) in [
             ("dark", Theme::dark()),
             ("light", Theme::light()),
+            ("industrial", Theme::industrial()),
             ("cyberpunk", Theme::cyberpunk()),
         ] {
             for (one, two, apart) in collisions(&theme_palette(&theme)) {

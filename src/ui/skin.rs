@@ -13,7 +13,7 @@ use eframe::egui::{
 
 const WIDTH: f32 = 320.0;
 const ROW: f32 = 24.0;
-const ROWS: usize = 3;
+const ROWS: usize = 4;
 const SEARCH: f32 = 28.0;
 /// The colour chips beside each name.
 const CHIP: f32 = 6.0;
@@ -22,6 +22,7 @@ const CHIP: f32 = 6.0;
 enum Pick {
     Dark,
     Light,
+    Industrial,
     Cyberpunk,
 }
 
@@ -30,6 +31,7 @@ impl Pick {
         match self {
             Pick::Dark => "Dark",
             Pick::Light => "Light",
+            Pick::Industrial => "Industrial",
             Pick::Cyberpunk => "Cyberpunk",
         }
     }
@@ -38,6 +40,7 @@ impl Pick {
         match self {
             Pick::Dark => Theme::dark(),
             Pick::Light => Theme::light(),
+            Pick::Industrial => Theme::industrial(),
             Pick::Cyberpunk => Theme::cyberpunk(),
         }
     }
@@ -54,6 +57,10 @@ impl Pick {
                 let t = Theme::light();
                 [t.bg, t.accent, t.ok, t.warn]
             }
+            Pick::Industrial => {
+                let t = Theme::industrial();
+                [t.bg, t.accent, t.clip_audio_header, t.playhead]
+            }
             Pick::Cyberpunk => {
                 let t = Theme::cyberpunk();
                 [t.bg, t.accent, t.role_time, t.warn]
@@ -63,7 +70,7 @@ impl Pick {
 }
 
 fn every() -> Vec<Pick> {
-    vec![Pick::Dark, Pick::Light, Pick::Cyberpunk]
+    vec![Pick::Dark, Pick::Light, Pick::Industrial, Pick::Cyberpunk]
 }
 
 #[derive(Default)]
@@ -415,10 +422,12 @@ mod tests {
         let dark = Theme::dark();
         let light = Theme::light();
         let cyberpunk = Theme::cyberpunk();
+        let industrial = Theme::industrial();
         assert!(!dark.light);
         assert!(light.light);
+        assert!(!industrial.light);
         assert!(!cyberpunk.light);
-        for theme in [dark, light, cyberpunk] {
+        for theme in [dark, light, industrial, cyberpunk] {
             assert_ne!(theme.surface, theme.bg);
             assert_ne!(theme.surface_raised, theme.bg);
             assert_ne!(theme.surface_sunken, theme.bg);
@@ -432,7 +441,7 @@ mod tests {
 
     #[test]
     fn dark_schemes_have_readable_text_and_ordered_elevations() {
-        for theme in [Theme::dark(), Theme::cyberpunk()] {
+        for theme in [Theme::dark(), Theme::industrial(), Theme::cyberpunk()] {
             assert!(contrast(theme.text, theme.bg) >= 7.0);
             assert!(contrast(theme.text_muted, theme.bg) >= 4.5);
             assert!(contrast(theme.text, theme.surface_raised) >= 7.0);
@@ -469,12 +478,16 @@ mod tests {
     #[test]
     fn the_picker_contains_all_authored_themes() {
         let all = every();
-        assert_eq!(all, vec![Pick::Dark, Pick::Light, Pick::Cyberpunk]);
+        assert_eq!(
+            all,
+            vec![Pick::Dark, Pick::Light, Pick::Industrial, Pick::Cyberpunk]
+        );
     }
 
     #[test]
     fn old_theme_names_migrate_to_their_broad_side() {
         assert_eq!(parse_choice("Cyberpunk"), Some(Pick::Cyberpunk));
+        assert_eq!(parse_choice("Industrial"), Some(Pick::Industrial));
         assert_eq!(parse_choice("Solarized Light"), Some(Pick::Light));
         assert_eq!(parse_choice("Gruvbox Dark"), Some(Pick::Dark));
         assert_eq!(parse_choice("Nord"), Some(Pick::Dark));

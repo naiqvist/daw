@@ -84,6 +84,15 @@ pub enum UiAction {
     /// Open a copy of the selected span after itself, on EVERY track.
     /// Ctrl+Shift+D.
     DuplicateTime,
+    /// Lift the selected span of the song onto the time clipboard and
+    /// close the gap. Live's Cut Time, Ctrl+Shift+X.
+    CutTime,
+    /// Make room for the carried span at the insert marker and put it
+    /// back. Live's Paste Time, Ctrl+Shift+V.
+    ///
+    /// Room FIRST — nothing is overwritten. That is the difference from
+    /// pasting clips, and the reason the two have separate clipboards.
+    PasteTime,
     /// Insert empty time: the selection's length at the selection, else one
     /// bar at the cursor. Ctrl+I.
     InsertSilence,
@@ -215,6 +224,8 @@ impl UiAction {
             Self::Consolidate => "Consolidate",
             Self::DeleteTime => "Delete time",
             Self::DuplicateTime => "Duplicate time",
+            Self::CutTime => "Cut time",
+            Self::PasteTime => "Paste time",
             Self::InsertSilence => "Insert silence",
             Self::SetLocator => "Set / delete locator",
             Self::JumpLocator(_) => "Jump to locator",
@@ -289,6 +300,8 @@ impl UiAction {
             | Self::Consolidate
             | Self::DeleteTime
             | Self::DuplicateTime
+            | Self::CutTime
+            | Self::PasteTime
             | Self::InsertSilence
             | Self::SetLocator
             | Self::JumpLocator(_)

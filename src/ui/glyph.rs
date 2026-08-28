@@ -55,6 +55,17 @@ pub enum Glyph {
     /// A stack. For a container of families rather than a family: it is
     /// the only mark with no signal in it, which is the point.
     Stack,
+    /// A sawtooth. The oscillator families — a shape that is GENERATED
+    /// rather than a response to something arriving, which is the
+    /// difference between a synth and everything else in the browser.
+    Saw,
+    /// A strike and its decay. Percussion: one event, gone.
+    Transient,
+    /// A recorded burst, drawn about its own centre line the way a
+    /// waveform is. The only mark with a signal on both sides of an
+    /// axis, which is what a sample looks like and a synth voice does
+    /// not.
+    Sample,
 }
 
 /// Points on the unit square, `(0,0)` top-left, as the mark is drawn.
@@ -122,6 +133,38 @@ pub fn strokes(glyph: Glyph) -> Vec<Vec<(f32, f32)>> {
             vec![(0.05, 0.5), (0.95, 0.5)],
             vec![(0.05, 0.76), (0.95, 0.76)],
         ],
+        // Two ramps and the drops between them. Deliberately hard-edged
+        // — the periodic marks are otherwise all curves, and a sawtooth
+        // that was drawn smoothly would read as another one of them.
+        Glyph::Saw => vec![vec![
+            (0.0, 0.86),
+            (0.44, 0.1),
+            (0.44, 0.86),
+            (0.92, 0.1),
+            (0.92, 0.86),
+            (1.0, 0.72),
+        ]],
+        // A strike, and what is left of it a moment later.
+        Glyph::Transient => vec![
+            vec![(0.1, 1.0), (0.1, 0.04)],
+            (0..=10)
+                .map(|i| {
+                    let t = i as f32 / 10.0;
+                    (0.1 + t * 0.9, 0.04 + (1.0 - (-t * 3.4).exp()) * 0.96)
+                })
+                .collect(),
+        ],
+        // A burst about its own centre line: the top outline, and the
+        // bottom mirrored under it.
+        Glyph::Sample => {
+            let top: Vec<(f32, f32)> = [0.62, 0.18, 0.44, 0.06, 0.34, 0.5, 0.2, 0.46]
+                .into_iter()
+                .enumerate()
+                .map(|(i, y)| (i as f32 / 7.0, y))
+                .collect();
+            let bottom = top.iter().map(|(x, y)| (*x, 1.0 - y)).collect();
+            vec![top, bottom, vec![(0.0, 0.5), (1.0, 0.5)]]
+        }
     }
 }
 
@@ -159,7 +202,7 @@ pub fn ink(theme: &Theme, open: bool) -> egui::Color32 {
 mod tests {
     use super::*;
 
-    const ALL: [Glyph; 9] = [
+    const ALL: [Glyph; 12] = [
         Glyph::Dynamics,
         Glyph::Filter,
         Glyph::Time,
@@ -169,6 +212,9 @@ mod tests {
         Glyph::Utility,
         Glyph::Instrument,
         Glyph::Stack,
+        Glyph::Saw,
+        Glyph::Transient,
+        Glyph::Sample,
     ];
 
     /// Every mark is inside the box it is given.

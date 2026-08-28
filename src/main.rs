@@ -82,6 +82,7 @@ use daw::ui::glyph::Glyph;
 use devices::{DeviceKind, device_by_prefix};
 mod icon;
 mod piano_roll;
+mod plock_ops;
 mod session_bridge;
 use icon::{
     Icon, follow_icon, loop_icon, metronome_icon, pause_icon, play_icon, power_icon, record_icon,
@@ -228,9 +229,98 @@ const GRID_LABEL_PAD: f32 = 8.0;
 const PX_PER_BEAT: f32 = 24.0;
 const ARRANGEMENT_ZOOM_MIN: f32 = 4.0;
 const ARRANGEMENT_ZOOM_MAX: f32 = 1_024.0;
-/// Below this spacing subdivision lines stop being a grid and start being a
-/// smear, so they are dropped and only beats and bars are drawn.
+/// Below this spacing a line stops being a grid and starts being a smear,
+/// so the grid steps up a level instead of drawing it.
+///
+/// It applies at EVERY level, not just to subdivisions. It used to guard
+/// the sub lines alone and then fall back to whole beats — which at a
+/// zoom of eight pixels a beat is a line every eight pixels, and further
+/// out a line every two. That is not a grid, it is a grey wash over the
+/// whole arrangement, and it was the loudest thing on a screen whose
+/// actual content is the clips.
+///
+/// Ink where there is something to read, and none where there is not.
 const GRID_MIN_PX: f32 = 5.0;
+
+/// The selection tag's inset from the band's corner, and the smallest
+/// band worth printing one in — under that it would be a label wider
+/// than the thing it labels.
+const BAND_TAG_PAD: f32 = 4.0;
+const BAND_TAG_MIN_W: f32 = 44.0;
+const BAND_TAG_MIN_H: f32 = 22.0;
+
+/// A length in beats, said the way a musician counts it.
+///
+/// Bars and beats, and the beat only when there is one — "4" reads as
+/// four bars at a glance where "4.0" makes you check whether the zero is
+/// a beat or a tick. A span shorter than a bar is beats alone, because
+/// "0.3" is a worse answer than "3 beats" to the question being asked.
+///
+/// Pure, so the formatting is testable without a window.
+fn beats_as_bars(beats: f32, beats_per_bar: u32) -> String {
+    let per_bar = beats_per_bar.max(1) as f32;
+    if !beats.is_finite() || beats <= 0.0 {
+        return "0".to_owned();
+    }
+    // A hair under a whole bar IS a whole bar: the grid rounds, and a
+    // selection dragged onto a bar line should not read as "3.4".
+    let bars = (beats / per_bar + 1e-3).floor();
+    let rest = (beats - bars * per_bar).max(0.0);
+    match (bars as u32, rest < 1e-3) {
+        // Under a bar, counted in beats: "0.3" is a worse answer than
+        // "3 beats" to the question actually being asked.
+        (0, _) => {
+            if (rest - rest.round()).abs() < 1e-3 {
+                format!("{} beats", rest.round() as u32)
+            } else {
+                format!("{rest:.1} beats")
+            }
+        }
+        (n, true) => format!("{n} bar{}", if n == 1 { "" } else { "s" }),
+        (n, false) => format!("{n}.{}", rest.round() as u32),
+    }
+}
+
+/// How far a corner notch cuts into a clip, at most.
+///
+/// It is a mark on an edge, not a feature of the clip: on a tall lane a
+/// notch scaled to the height alone would start to read as a shape the
+/// clip has rather than a note about where it stops.
+const NOTCH_MAX: f32 = 7.0;
+
+/// How many BARS the grid steps out to once beats stop fitting.
+///
+/// Powers of two, because that is how music is counted and how anyone
+/// reading a timeline expects the numbers to go.
+const GRID_BARS: [f32; 6] = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
+
+/// The finest step whose lines are still at least [`GRID_MIN_PX`] apart.
+///
+/// Climbs from the subdivision the user chose, through whole beats, then
+/// out in bars. It only climbs as far as it has to — a fine grid at a
+/// close zoom is still a fine grid — and every rung is something you
+/// could count out loud, which is what stops the timeline gaining lines
+/// at "seven beats".
+///
+/// Pure, so the whole ink budget is testable without a window.
+fn grid_step(sub: f32, beats_per_bar: f32, pixels_per_beat: f32) -> f32 {
+    let readable = |step: f32| step * pixels_per_beat >= GRID_MIN_PX;
+    if readable(sub) {
+        return sub;
+    }
+    if readable(1.0) {
+        return 1.0;
+    }
+    let bar = beats_per_bar.max(1.0);
+    for bars in GRID_BARS {
+        if readable(bars * bar) {
+            return bars * bar;
+        }
+    }
+    // Zoomed out past even that: the coarsest rung is still better than
+    // a solid fill.
+    GRID_BARS[GRID_BARS.len() - 1] * bar
+}
 
 /// The minimap: a strip above the loop ruler showing the whole arrangement
 /// at a glance — every clip a minified bar, the current view a draggable
@@ -496,15 +586,34 @@ fn arrangement_keys(ctx: &egui::Context, arr: &Arrangement, out: &mut Vec<UiActi
         if i.consume_key(egui::Modifiers::COMMAND, egui::Key::A) {
             out.push(UiAction::SelectAllClips);
         }
-        if i.consume_key(egui::Modifiers::COMMAND, egui::Key::X) {
-            out.push(UiAction::CutClip);
-        }
-        if i.consume_key(egui::Modifiers::COMMAND, egui::Key::C) {
-            out.push(UiAction::CopyClip);
-        }
-        if i.consume_key(egui::Modifiers::COMMAND, egui::Key::V) {
-            out.push(UiAction::PasteClip);
-        }
+        // CUT, COPY AND PASTE ARE EVENTS, NOT KEYS — and this never
+        // worked as a binding.
+        //
+        // `egui-winit` turns Ctrl+X/C/V into `Event::Cut` / `Event::Copy`
+        // / `Event::Paste` and RETURNS without emitting the key at all,
+        // so `consume_key(COMMAND, Key::C)` can never fire. Three
+        // bindings that read correctly, tested green as bindings, and
+        // did nothing on a keyboard.
+        //
+        // Consumed here rather than merely read, so nothing downstream
+        // sees a clipboard verb the arrangement has already answered.
+        // The text-field guard at the top of this function is what keeps
+        // Ctrl+C in the search box out of here.
+        i.events.retain(|event| match event {
+            egui::Event::Cut => {
+                out.push(UiAction::CutClip);
+                false
+            }
+            egui::Event::Copy => {
+                out.push(UiAction::CopyClip);
+                false
+            }
+            egui::Event::Paste(_) => {
+                out.push(UiAction::PasteClip);
+                false
+            }
+            _ => true,
+        });
         // SHIFT FIRST: `consume_key` ignores an extra Shift, so plain
         // Ctrl+D checked first would swallow Ctrl+Shift+D and duplicate a
         // clip when asked to duplicate time.
@@ -1278,6 +1387,9 @@ fn locate_transport(
     arrangement.cursor = Some((track, beat));
     arrangement.anchor = beat;
     arrangement.selection = Some(span(beat, beat, grid));
+    // A locate is one point in time on one track — see `select_track`
+    // for why a band left over from a drag has to go.
+    arrangement.selection_tracks = None;
     transport.marker = beat;
     arrangement.pending_seek = Some(beat);
 }
@@ -1433,9 +1545,7 @@ fn perform(actions: &[UiAction], transport: &mut Transport, arrangement: &mut Ar
                 }
             }
             UiAction::SplitAtCursor => {
-                if let Some((track, beat)) = arrangement.cursor {
-                    arrangement.split_at(track, beat, transport.bpm);
-                }
+                arrangement.split_selection(transport.marker, transport.bpm);
             }
             UiAction::Consolidate => {
                 if let (Some(track), Some((from, to))) =
@@ -1443,6 +1553,23 @@ fn perform(actions: &[UiAction], transport: &mut Transport, arrangement: &mut Ar
                 {
                     arrangement.consolidate(track, from, to);
                 }
+            }
+            UiAction::CutTime => {
+                if let Some((from, to)) = arrangement.selection
+                    && to > from
+                {
+                    arrangement.cut_time(from, to, transport.bpm);
+                }
+            }
+            UiAction::PasteTime => {
+                // At the insert marker, which is where every other time
+                // operation starts from.
+                let at = arrangement
+                    .selection
+                    .map(|(from, _)| from)
+                    .or_else(|| arrangement.cursor.map(|(_, beat)| beat))
+                    .unwrap_or(transport.marker);
+                arrangement.paste_time(at, transport.bpm);
             }
             UiAction::DeleteTime => {
                 if let Some((from, to)) = arrangement.selection {
@@ -1796,6 +1923,25 @@ impl AudioSource {
         }
     }
 
+    /// Is there more of the file BEFORE this clip's left edge, and after
+    /// its right?
+    ///
+    /// Invisible until now, and it is the one thing about an audio clip
+    /// you cannot work out by looking: a clip trimmed to a quarter of
+    /// its file and one that IS its file are drawn identically, so
+    /// "can I pull this edge out further" was a question you answered by
+    /// trying.
+    ///
+    /// A looped clip is never trimmed in this sense — it repeats its
+    /// region rather than running out of one.
+    fn spare(&self) -> (bool, bool) {
+        if self.looped {
+            return (false, false);
+        }
+        let end = self.source_offset.saturating_add(self.source_frames);
+        (self.source_offset > 0, end < self.file_frames())
+    }
+
     /// Where this clip's region starts in whichever file will actually be
     /// streamed — the original, or its reversal.
     fn playing_offset(&self) -> u64 {
@@ -2036,6 +2182,40 @@ struct Ghost {
     /// Ctrl held at press: the original stays and the landing is a copy
     /// with an id of its own.
     copy: bool,
+    /// Where the dragged clip started, so the distance it actually
+    /// travelled can be measured at the landing and applied to everyone
+    /// it brought with it.
+    ///
+    /// The ghost's own `clip.start` is the PROPOSAL and moves every
+    /// frame, so it cannot answer this.
+    from_start: f32,
+    /// THE REST OF THE SELECTION, carried along: `(id, lanes away)`
+    /// measured from the dragged clip at the press.
+    ///
+    /// Dragging one clip out of a selection of six used to move that
+    /// one and leave the other five behind — so a marquee could gather
+    /// a phrase and then not move it, which is most of what a marquee
+    /// is for.
+    ///
+    /// Only the LANE offset is kept. A rider's distance in time is
+    /// already recorded in its own `start`; adding however far the
+    /// dragged clip actually travelled preserves the group's shape
+    /// without storing the same fact twice.
+    followers: Vec<(u64, isize)>,
+}
+
+/// A stretch of the arrangement, lifted whole.
+///
+/// `length` is the stretch's own duration and is the whole reason this
+/// is not just a list of clips: pasting it has to make exactly that much
+/// room, silences and all, or everything after the paste lands at the
+/// wrong bar.
+#[derive(Clone, Default)]
+struct TimeSpan {
+    length: f32,
+    /// `(track, clip)` with every start measured from the stretch's
+    /// beginning, so it can be put back anywhere.
+    clips: Vec<(usize, Clip)>,
 }
 
 /// One item in a multi-clip clipboard. Time and lane are relative to the
@@ -2463,11 +2643,34 @@ struct Arrangement {
     /// primary item for editors and old single-clip commands; this list is
     /// what makes Ctrl+A / Ctrl-click and group clipboard edits honest.
     selected_clip_ids: Vec<u64>,
+    /// The LANES the time selection covers, inclusive and ordered.
+    ///
+    /// A time selection was one lane's; dragging down a second lane
+    /// simply moved it. Live's arrangement selection is two-dimensional
+    /// — a rectangle of tracks and time — and every time operation it
+    /// offers is defined over that rectangle rather than over a strip.
+    /// So the band and the marquee are the same object, and this is its
+    /// other axis.
+    ///
+    /// `None` when `selection` is, and a single lane when a drag never
+    /// left the one it started on.
+    selection_tracks: Option<(usize, usize)>,
     /// The clipboard: a whole clip, notes and all. `Ctrl+C` fills it,
     /// `Ctrl+V` reads it without emptying it.
     clipboard: Option<Clip>,
     /// Structured clipboard used when more than one clip was copied.
     clipboard_clips: Vec<ClipboardClip>,
+    /// A span of the arrangement, lifted whole: Live's Cut Time, and
+    /// what Paste Time puts back.
+    ///
+    /// SEPARATE from the clip clipboard, and deliberately. Copying
+    /// clips takes objects and pastes them where you point; cutting
+    /// time takes a stretch of the SONG — every track at once, its
+    /// silences included — and pasting it makes room and puts the
+    /// stretch back. One of those is about things and the other about
+    /// duration, and a single clipboard holding both would have to
+    /// guess which you meant.
+    time_clipboard: Option<TimeSpan>,
     /// The Ctrl+drag ghost, while one is in flight.
     ghost: Option<Ghost>,
     /// The inline rename, while one is open.
@@ -2495,6 +2698,19 @@ struct Arrangement {
     /// A jump the UI asked for, in beats. The app consumes it: the engine
     /// seeks, the mirror follows. Not content — a seek is a performance.
     pending_seek: Option<f32>,
+    /// Where a POINTER PRESS in the lanes asked the insert marker to go.
+    ///
+    /// Separate from `pending_seek`, which is an explicit locate — a
+    /// locator, a return to start, the ruler being scrubbed — and must
+    /// move the playhead whatever the transport is doing.
+    ///
+    /// A press is not that. While the song is rolling, clicking about
+    /// the arrangement is how you choose where to work next, and having
+    /// the playhead jump to every one of those was the transport
+    /// following the mouse. So this sets the marker, and only moves the
+    /// playhead when the transport is stopped — where "start from where
+    /// I pointed" is exactly what is wanted.
+    pending_point: Option<f32>,
     /// Which face the main area shows: the timeline or the clip launcher.
     main_view: MainView,
     /// The clip launcher's grid. Parallel to `tracks`, like `clips`.
@@ -2578,6 +2794,7 @@ struct Marks {
     selected_clip: Option<(usize, usize)>,
     selected_clip_ids: Vec<u64>,
     selection: Option<(f32, f32)>,
+    selection_tracks: Option<(usize, usize)>,
     cursor: Option<(usize, f32)>,
     anchor: f32,
 }
@@ -3050,8 +3267,10 @@ impl Default for Arrangement {
             clips: (0..TRACK_COUNT).map(|_| Vec::new()).collect(),
             selected_clip: None,
             selected_clip_ids: Vec::new(),
+            selection_tracks: None,
             clipboard: None,
             clipboard_clips: Vec::new(),
+            time_clipboard: None,
             ghost: None,
             rename: None,
             key: Key::default(),
@@ -3065,6 +3284,7 @@ impl Default for Arrangement {
             locators: Vec::new(),
             locator_rename: None,
             pending_seek: None,
+            pending_point: None,
             main_view: MainView::default(),
             session: Session::new(TRACK_COUNT),
             session_scroll: 0.0,
@@ -3089,6 +3309,30 @@ impl Arrangement {
         self.selected = Some(track);
         self.master_selected = false;
         self.return_selected = None;
+        // THE BAND IS FORGOTTEN HERE, and the band's own gesture puts it
+        // back immediately afterwards.
+        //
+        // Two fields that have to agree are two fields that can drift,
+        // and the way they drifted was this: drag a marquee three lanes
+        // deep, then arrow up. The arrow sets a one-cell selection and
+        // moves the track, and a band left over from the drag would wash
+        // three lanes for a selection that covers one.
+        //
+        // Every route that changes which track is current comes through
+        // here, so this is the one place that has to remember.
+        self.selection_tracks = None;
+    }
+
+    /// The lanes the time selection covers.
+    ///
+    /// A band if a drag drew one, the selected lane alone otherwise, and
+    /// nothing at all when there is no selection to cover lanes with —
+    /// which is what stops a stale range washing lanes after the
+    /// selection it belonged to has gone.
+    fn selection_band(&self) -> Option<(usize, usize)> {
+        self.selection?;
+        self.selection_tracks
+            .or_else(|| self.selected.map(|track| (track, track)))
     }
 
     /// Point them at the master instead. The lane stays selected
@@ -3166,6 +3410,7 @@ impl Arrangement {
                 selected: self.selected,
                 selected_clip: self.selected_clip,
                 selected_clip_ids: self.selected_clip_ids.clone(),
+                selection_tracks: self.selection_tracks,
                 selection: self.selection,
                 cursor: self.cursor,
                 anchor: self.anchor,
@@ -3193,6 +3438,7 @@ impl Arrangement {
         self.selected = snapshot.marks.selected;
         self.selected_clip = snapshot.marks.selected_clip;
         self.selected_clip_ids = snapshot.marks.selected_clip_ids.clone();
+        self.selection_tracks = snapshot.marks.selection_tracks;
         self.selection = snapshot.marks.selection;
         self.cursor = snapshot.marks.cursor;
         self.anchor = snapshot.marks.anchor;
@@ -3767,6 +4013,147 @@ impl Arrangement {
     /// straddling its edges are split first, and everything after moves
     /// earlier by its length — the Arrangement gets shorter. The loop
     /// brace rides along like any other timed thing.
+    /// Live's SPLIT: Ctrl+E, at the insert marker.
+    ///
+    /// Three things this did not do, and each of them made the gesture
+    /// useless for a job people reach for constantly.
+    ///
+    /// IT NEEDED THE TRACK SELECTED. It cut `cursor`'s lane, so
+    /// selecting a clip on a track you were not "on" and pressing Split
+    /// cut a different track — or nothing. Selecting a clip IS saying
+    /// which clip you mean; having to also make its lane current is
+    /// asking the same question twice.
+    ///
+    /// IT CUT ONE POINT. A stretch drawn across the middle of a clip
+    /// gave you the front and everything else, never the piece you had
+    /// drawn a box around. A range cuts at BOTH edges, which is what
+    /// isolates the middle.
+    ///
+    /// IT CUT ONE TRACK. A band dragged down four tracks split one.
+    ///
+    /// `at` is the insert marker, which is what a click on a clip or on
+    /// empty lane moves — and therefore what "here" means when there is
+    /// no range to speak of.
+    fn split_selection(&mut self, at: f32, bpm: f64) -> bool {
+        // WHICH TRACKS. Selected clips first: they are the most specific
+        // thing the user can have said. Then the band, then the lane the
+        // cursor is on, which is the old behaviour and still right when
+        // nothing else has been asked for.
+        let mut tracks: Vec<usize> = self
+            .selected_clip_refs()
+            .into_iter()
+            .map(|(track, _)| track)
+            .collect();
+        tracks.sort_unstable();
+        tracks.dedup();
+        if tracks.is_empty() {
+            let (first, last) = self
+                .selection_band()
+                .or_else(|| self.cursor.map(|(track, _)| (track, track)))
+                .unwrap_or((0, 0));
+            tracks = (first..=last).collect();
+        }
+
+        // WHERE. A range cuts at both ends; a bare marker cuts once.
+        let range = self.selection.filter(|(from, to)| to - from > 1e-4);
+        let mut cut = false;
+        for track in tracks {
+            if track >= self.tracks.len() {
+                continue;
+            }
+            match range {
+                // Later edge FIRST: splitting at `from` inserts a clip
+                // before `to`, and doing it the other way round would
+                // have the second cut hunting through a list that had
+                // just changed under it.
+                Some((from, to)) => {
+                    cut |= self.split_at(track, to, bpm);
+                    cut |= self.split_at(track, from, bpm);
+                }
+                None => cut |= self.split_at(track, at, bpm),
+            }
+        }
+        cut
+    }
+
+    /// Live's CUT TIME: take the stretch onto the time clipboard, then
+    /// close the gap.
+    ///
+    /// The capture happens after the same two splits `delete_time`
+    /// makes, so what is carried is exactly what is removed — a clip
+    /// straddling an edge is cut there, and the piece inside the
+    /// selection is the piece that travels.
+    fn cut_time(&mut self, from: f32, to: f32, bpm: f64) -> bool {
+        if to <= from || !to.is_finite() || !from.is_finite() {
+            return false;
+        }
+        for track in 0..self.tracks.len() {
+            self.split_at(track, from, bpm);
+            self.split_at(track, to, bpm);
+        }
+        self.time_clipboard = Some(self.capture_time(from, to));
+        self.delete_time(from, to, bpm)
+    }
+
+    /// What is inside `from..to` right now, with starts measured from
+    /// `from`. Assumes the edges have already been split.
+    fn capture_time(&self, from: f32, to: f32) -> TimeSpan {
+        let mut clips = Vec::new();
+        for (track, lane) in self.clips.iter().enumerate() {
+            for clip in lane {
+                if clip.start >= from && clip.start < to {
+                    let mut taken = clip.clone();
+                    taken.start -= from;
+                    clips.push((track, taken));
+                }
+            }
+        }
+        TimeSpan {
+            length: to - from,
+            clips,
+        }
+    }
+
+    /// Live's PASTE TIME: make room for the carried stretch at `at`, and
+    /// put it back.
+    ///
+    /// Room FIRST, and that is the difference from pasting clips.
+    /// Nothing is overwritten: everything from `at` onward moves later
+    /// by exactly the stretch's length, so the song after the paste is
+    /// the song that was there, further along.
+    fn paste_time(&mut self, at: f32, bpm: f64) -> bool {
+        let Some(span) = self.time_clipboard.clone() else {
+            return false;
+        };
+        if span.length <= 0.0 || !at.is_finite() {
+            return false;
+        }
+        self.insert_time(at, span.length, bpm);
+        for (track, clip) in span.clips {
+            // A stretch cut from a wider arrangement than the one it is
+            // pasted into keeps what fits. Dropping the rest is the only
+            // honest option — there is no lane to put them on.
+            if track >= self.clips.len() {
+                continue;
+            }
+            let mut placed = clip;
+            placed.id = self.next_id();
+            placed.start += at;
+            let index = self.clips[track]
+                .iter()
+                .position(|c| c.start > placed.start)
+                .unwrap_or(self.clips[track].len());
+            self.clips[track].insert(index, placed);
+        }
+        for track in 0..self.clips.len() {
+            resort(&mut self.clips[track]);
+        }
+        self.selection = Some((at, at + span.length));
+        self.selected_clip = None;
+        self.selected_clip_ids.clear();
+        true
+    }
+
     fn delete_time(&mut self, from: f32, to: f32, bpm: f64) -> bool {
         // Stated this way round so a NaN bound refuses instead of passing.
         if to <= from || !to.is_finite() || !from.is_finite() {
@@ -4308,6 +4695,123 @@ impl Arrangement {
                 .get(track)
                 .and_then(|clips| clips.get(index))
                 .is_some_and(|clip| self.selected_clip_ids.contains(&clip.id))
+    }
+
+    /// Put a released drag down: the clip under the pointer, and every
+    /// other clip the selection brought with it.
+    ///
+    /// A move VACATES EVERYTHING FIRST. Placing as it went would leave
+    /// each clip's own old slot in the way of the next one, so a group
+    /// shuffled one lane over would scatter as it landed.
+    ///
+    /// A copy leaves the originals and lands under fresh ids — ids are
+    /// identity, and identity is never in two places.
+    fn land_ghost(&mut self, ghost: Ghost, src: usize) -> Vec<(usize, usize)> {
+        let lanes = self.clips.len();
+        if lanes == 0 || ghost.track >= lanes {
+            return Vec::new();
+        }
+        let find = |clips: &[Vec<Clip>], id: u64| {
+            clips
+                .iter()
+                .enumerate()
+                .find_map(|(track, lane)| lane.iter().position(|c| c.id == id).map(|i| (track, i)))
+        };
+
+        // Where each rider is going, resolved BEFORE anything moves:
+        // once lanes start changing, an index means nothing.
+        let mut riders: Vec<(usize, Clip)> = Vec::new();
+        for (id, lane_offset) in &ghost.followers {
+            let Some((track, index)) = find(&self.clips, *id) else {
+                continue;
+            };
+            // Its own offset from the dragged clip, carried to wherever
+            // that clip ended up. Clamped, so a group dragged against
+            // the top of the arrangement keeps its shape instead of
+            // losing its upper members off the end.
+            let target = (ghost.track as isize + lane_offset).clamp(0, lanes as isize - 1) as usize;
+            riders.push((target, self.clips[track][index].clone()));
+        }
+
+        if !ghost.copy {
+            let mut leaving: Vec<(usize, usize)> = Vec::new();
+            if let Some(found) = find(&self.clips, ghost.clip.id) {
+                leaving.push(found);
+            }
+            for (id, _) in &ghost.followers {
+                if let Some(found) = find(&self.clips, *id) {
+                    leaving.push(found);
+                }
+            }
+            leaving.sort_unstable();
+            leaving.dedup();
+            for (track, index) in leaving.into_iter().rev() {
+                self.clips[track].remove(index);
+            }
+        }
+        let _ = src;
+
+        let mut placed = ghost.clip;
+        if ghost.copy {
+            placed.id = self.next_id();
+        }
+        let (start, _) = place_clip(&self.clips[ghost.track], placed.start, placed.len);
+        // How far it ACTUALLY went. `place_clip` finds the first gap
+        // that fits, which is not always the one asked for, and the
+        // group has to follow where it landed rather than where it was
+        // aimed — otherwise the shape survives the drag and not the drop.
+        let travelled = start - ghost.from_start;
+        let primary = placed.id;
+        placed.start = start;
+        let at = place_clip(&self.clips[ghost.track], start, placed.len).1;
+        self.clips[ghost.track].insert(at, placed);
+
+        let mut ids = vec![primary];
+        for (target, mut rider) in riders {
+            if ghost.copy {
+                rider.id = self.next_id();
+            }
+            let want = (rider.start + travelled).max(0.0);
+            let (start, index) = place_clip(&self.clips[target], want, rider.len);
+            rider.start = start;
+            ids.push(rider.id);
+            self.clips[target].insert(index, rider);
+        }
+
+        // THE WHOLE GROUP STAYS SELECTED. A move that dropped everything
+        // but the clip under the pointer would make a second nudge
+        // impossible without gathering the selection again.
+        //
+        // By id, and resolved after every insertion: an insert below an
+        // earlier landing in the same lane shifts that landing along.
+        let landed: Vec<(usize, usize)> =
+            ids.iter().filter_map(|id| find(&self.clips, *id)).collect();
+        if let Some((track, index)) = landed.first().copied() {
+            self.select_only_clip(track, index);
+            self.selected_clip_ids = ids.into_iter().skip(1).collect();
+        }
+        landed
+    }
+
+    /// What the clip clipboard is holding, in words.
+    ///
+    /// Written to the SYSTEM clipboard on every copy — see the note at
+    /// the call site. Two jobs: it tells you what you are carrying, and
+    /// it is what makes the next Ctrl+V produce an event at all.
+    fn clipboard_summary(&self) -> String {
+        let names: Vec<&str> = if self.clipboard_clips.is_empty() {
+            self.clipboard.iter().map(|c| c.name.as_str()).collect()
+        } else {
+            self.clipboard_clips
+                .iter()
+                .map(|c| c.clip.name.as_str())
+                .collect()
+        };
+        match names.len() {
+            0 => String::new(),
+            1 => names[0].to_owned(),
+            n => format!("{n} clips: {}", names.join(", ")),
+        }
     }
 
     fn select_only_clip(&mut self, track: usize, index: usize) {
@@ -4956,6 +5460,26 @@ fn clamp_clip_start(clips: &[Clip], idx: usize, want: f32) -> f32 {
 
 /// The bounds a clip's length must respect while its start stays put: one
 /// grid unit minimum, the gap to the next clip maximum.
+/// The LENGTH a right-edge drag is asking for, from the beat under the
+/// pointer.
+///
+/// Trivial arithmetic, and it was wrong for months: the caller passed
+/// the pointer's absolute beat straight into a parameter that means
+/// length, so a clip grew by exactly its own start every time an edge
+/// was dragged. A clip at bar three pulled to bar four became seven
+/// bars long.
+///
+/// It survived because a clip at beat zero gets the right answer by
+/// coincidence — and a clip at beat zero is what almost every fixture
+/// is. Pulled out here so the one line can be held by a test that puts
+/// the clip somewhere else.
+fn drag_len(want: f32, start: f32, grid: f32) -> f32 {
+    // The END is snapped, not the length: a clip that begins off the
+    // grid should still be draggable onto a grid line, and snapping the
+    // length instead would carry its offset into every edge it ever has.
+    snap(want, grid) - start
+}
+
 fn clamp_clip_len(clips: &[Clip], idx: usize, want: f32, grid: f32) -> f32 {
     let hi = clips
         .get(idx + 1)
@@ -5229,6 +5753,70 @@ fn wheel_axes(scroll: egui::Vec2, pixels_per_beat: f32) -> (f32, f32) {
     (scroll.x / per_beat, -scroll.y)
 }
 
+/// Which lane a point falls in, or the nearest one when it falls past
+/// the ends.
+///
+/// NEAREST rather than `None`, because this answers "which track is the
+/// marquee reaching?" — and a drag that runs off the bottom of the last
+/// lane plainly means that lane, not "no selection". A folded lane has
+/// zero height and can never be the answer, which is correct: it is not
+/// on screen to be dragged over.
+fn lane_at(lanes: &[egui::Rect], y: f32) -> Option<usize> {
+    let mut nearest: Option<(usize, f32)> = None;
+    for (index, lane) in lanes.iter().enumerate() {
+        if lane.height() <= 0.0 {
+            continue;
+        }
+        if (lane.top()..lane.bottom()).contains(&y) {
+            return Some(index);
+        }
+        let gap = if y < lane.top() {
+            lane.top() - y
+        } else {
+            y - lane.bottom()
+        };
+        if nearest.is_none_or(|(_, best)| gap < best) {
+            nearest = Some((index, gap));
+        }
+    }
+    nearest.map(|(index, _)| index)
+}
+
+/// Every clip inside the band: tracks `lanes.0..=lanes.1`, and any part
+/// of the clip inside `from..to`.
+///
+/// TOUCHING counts, not containment. Live selects a clip the marquee
+/// merely crosses, and the alternative is a band that has to be drawn
+/// exactly around a clip to take it — which on a timeline you have
+/// scrolled and zoomed is a gesture nobody lands.
+///
+/// Pure, so the whole rule is testable without a window.
+fn clips_in_band(
+    clips: &[Vec<Clip>],
+    lanes: (usize, usize),
+    from: f32,
+    to: f32,
+) -> Vec<(usize, usize)> {
+    let (first, last) = (lanes.0.min(lanes.1), lanes.0.max(lanes.1));
+    let (start, end) = (from.min(to), from.max(to));
+    let mut hits = Vec::new();
+    for track in first..=last {
+        let Some(lane) = clips.get(track) else {
+            continue;
+        };
+        for (index, clip) in lane.iter().enumerate() {
+            // A zero-width band still takes what it lands on: dragging
+            // out a selection and coming back to the start is not the
+            // same gesture as never having pressed.
+            let touches = clip.start < end || (start == end && clip.start <= end);
+            if touches && clip.start + clip.len > start {
+                hits.push((track, index));
+            }
+        }
+    }
+    hits
+}
+
 fn lane_rects(area: egui::Rect, tracks: &[Track], scroll_y: f32) -> Vec<egui::Rect> {
     let mut y = area.top() - scroll_y;
     tracks
@@ -5359,9 +5947,8 @@ fn beat_grid(
 ) {
     let painter = ui.painter();
     let sub = arr.grid_beats();
-    let sub_px = sub * pixels_per_beat;
-    let step = if sub_px < GRID_MIN_PX { 1.0 } else { sub };
     let per_bar = beats_per_bar.max(1) as f32;
+    let step = grid_step(sub, per_bar, pixels_per_beat);
 
     // Start at the first line at or before the left edge, so lines land on
     // absolute beat/bar boundaries no matter where the view is panned.
@@ -7448,7 +8035,11 @@ fn arrangement_body(
 
     let grab = ui.style().interaction.resize_grab_radius_side;
     let mut resize: Option<(usize, f32)> = None;
+    // The anchor lane, the lane the pointer is over now, and the span:
+    // a band is a RECTANGLE of tracks and time, so the drag reports both
+    // axes and the anchor is what the second one is measured from.
     let mut select: Option<(usize, f32, f32)> = None;
+    let mut band_to: Option<usize> = None;
     let mut seek_req: Option<f32> = None;
     let mut create_req: Option<(usize, f32)> = None;
     // A Cell for the same reason as clips_pass's menu: one closure per lane
@@ -7504,10 +8095,18 @@ fn arrangement_body(
             if picked.drag_started() || picked.clicked() {
                 ui.ctx().data_mut(|d| d.insert_temp(anchor_id, here));
                 select = Some((i, here, here));
+                band_to = Some(i);
                 seek_req = Some(here);
             } else if picked.dragged() {
                 let from: f32 = ui.ctx().data(|d| d.get_temp(anchor_id).unwrap_or(here));
                 select = Some((i, from, here));
+                // WHICH LANE THE POINTER IS OVER, not which lane owns
+                // the drag. egui keeps the interaction with the lane the
+                // press landed on — which is what makes the gesture
+                // survive leaving it — so the second axis has to come
+                // from geometry or the band could never grow past one
+                // track.
+                band_to = lane_at(&lanes, pos.y).or(Some(i));
             }
         }
 
@@ -7532,10 +8131,16 @@ fn arrangement_body(
             }
         });
 
-        // The selection wash, inside its lane only.
-        if arr.selected == Some(i)
-            && let Some((from, to)) = arr.selection
-        {
+        // The selection wash, on every lane the band covers.
+        //
+        // It used to be `arr.selected == Some(i)` — the anchor lane
+        // alone — so a marquee dragged down three tracks selected their
+        // clips and showed a wash on one. The band is a rectangle now,
+        // and it has to look like one.
+        let in_band = arr
+            .selection_band()
+            .is_some_and(|(first, last)| (first..=last).contains(&i));
+        if in_band && let Some((from, to)) = arr.selection {
             let band = egui::Rect::from_min_max(
                 egui::pos2(
                     x_at(content, offset, arr.pixels_per_beat, from),
@@ -7607,24 +8212,91 @@ fn arrangement_body(
         }
     }
 
+    // THE BAND'S OWN EDGE, drawn once around the whole rectangle rather
+    // than per lane.
+    //
+    // The wash says which time and which tracks; the corners say where
+    // the gesture ENDS, which a wash bleeding off the top and bottom of
+    // the screen cannot. Brackets rather than a closed box for the
+    // reason `ui::hud` gives: a rectangle drawn around a region covers
+    // the region's own edges, and here those are the lane rules the
+    // arrangement is read by.
+    if let (Some((from, to)), Some((first, last))) = (arr.selection, arr.selection_band())
+        && to > from
+        && let (Some(top), Some(bottom)) = (lanes.get(first), lanes.get(last))
+    {
+        let band = egui::Rect::from_min_max(
+            egui::pos2(x_at(content, offset, arr.pixels_per_beat, from), top.top()),
+            egui::pos2(
+                x_at(content, offset, arr.pixels_per_beat, to),
+                bottom.bottom(),
+            ),
+        )
+        .intersect(content);
+        if band.width() > 0.0 && band.height() > 0.0 {
+            daw::ui::hud::brackets(
+                ui.painter(),
+                band,
+                egui::Stroke::new(stroke::BOLD, theme.accent),
+            );
+            // HOW LONG IT IS.
+            //
+            // The one number a selection owes you and the only one it
+            // could not give: every time operation is defined over this
+            // span, and working out "is that four bars or five" by
+            // counting grid lines is the sort of arithmetic an interface
+            // is supposed to have already done.
+            //
+            // Inside the band's own top-left corner, because that is
+            // where the gesture began and where the eye already is.
+            let text = beats_as_bars(to - from, beats_per_bar);
+            let at = egui::pos2(band.left() + BAND_TAG_PAD, band.top() + BAND_TAG_PAD);
+            if band.width() > BAND_TAG_MIN_W && band.height() > BAND_TAG_MIN_H {
+                ui.painter().text(
+                    at,
+                    egui::Align2::LEFT_TOP,
+                    text,
+                    egui::FontId::monospace(font::MINI_LABEL),
+                    theme.accent,
+                );
+            }
+        }
+    }
+
     if let Some((i, from, to)) = select {
         arr.select_track(i);
-        arr.selection = Some(span(from, to, grid));
+        let span = span(from, to, grid);
+        arr.selection = Some(span);
+        let reach = band_to.unwrap_or(i);
+        arr.selection_tracks = Some((i.min(reach), i.max(reach)));
         // Keep the keyboard where the mouse just went, so arrowing carries
         // on from where you clicked instead of jumping back.
-        arr.cursor = Some((i, span(from, to, grid).0));
-        arr.anchor = span(from, to, grid).0;
+        arr.cursor = Some((i, span.0));
+        arr.anchor = span.0;
         // A drag on empty lane is a new intention; a clip left selected
         // from before is not part of it.
+        //
+        // What the band DOES cover becomes the selection, so every
+        // clip command already built — delete, copy, nudge, group drag —
+        // works on a marquee without knowing one exists.
         arr.selected_clip = None;
         arr.selected_clip_ids.clear();
+        let caught = clips_in_band(&arr.clips, (i.min(reach), i.max(reach)), span.0, span.1);
+        if let Some((track, index)) = caught.first().copied() {
+            arr.selected_clip = Some((track, index));
+            arr.selected_clip_ids = caught
+                .iter()
+                .skip(1)
+                .filter_map(|(track, index)| arr.clips.get(*track)?.get(*index).map(|c| c.id))
+                .collect();
+        }
     }
-    // The press IS the insert marker: the transport moves to the snapped
-    // beat, so Play starts where you pointed, and a click during playback
-    // jumps there. Press only — a drag-select must not scrub the song
-    // along behind the selection.
+    // The press IS the insert marker: Play starts where you pointed.
+    // Press only — a drag-select must not scrub the song along behind
+    // the selection — and it moves the PLAYHEAD only when the transport
+    // is stopped, which is what `pending_point` is for.
     if let Some(beat) = seek_req {
-        arr.pending_seek = Some(beat);
+        arr.pending_point = Some(beat);
     }
 
     // Arrowing between lanes moves the cursor and takes the selection with
@@ -9857,6 +10529,18 @@ fn clips_pass(
     let mut rename_cancel = false;
     let mut open_editor = false;
     let mut fade: Option<(u64, waveform::ClipEdit)> = None;
+    // WHERE THE INSERT MARKER GOES when a clip is clicked.
+    //
+    // Empty lane ground has always moved it — "the press IS the insert
+    // marker" — but a clip swallowed the press and left the transport
+    // where it was. On a song whose tracks are covered in clips, which
+    // is most songs, that made whole regions of the timeline impossible
+    // to point at: you could not put the marker on beat one if a clip
+    // started there.
+    //
+    // Collected rather than written, because the loop below holds `arr`
+    // immutably while it draws.
+    let mut seek_req: Option<f32> = None;
 
     for (t, track) in arr.clips.iter().enumerate() {
         let Some(full_lane) = lanes.get(t) else {
@@ -9897,11 +10581,29 @@ fn clips_pass(
                 let grab = ui.input(|i| i.pointer.press_origin()).map_or(0.0, |pos| {
                     beat_at(content, offset, pixels_per_beat, pos.x) - clip.start
                 });
+                // Everything else that is selected comes too — but
+                // only if THIS clip is part of the selection. Dragging
+                // an unselected clip is a fresh gesture about that clip
+                // alone, and taking a stale selection with it would move
+                // things the user had forgotten were chosen.
+                let followers: Vec<(u64, isize)> = if selected {
+                    arr.selected_clip_refs()
+                        .into_iter()
+                        .filter_map(|(ft, fi)| {
+                            let other = arr.clips.get(ft)?.get(fi)?;
+                            (other.id != clip.id).then_some((other.id, ft as isize - t as isize))
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 ghost = Some(Ghost {
                     track: t,
                     clip: clip.clone(),
                     grab,
                     copy: command,
+                    from_start: clip.start,
+                    followers,
                 });
                 if !selected {
                     select = Some((t, clip.id, false, false));
@@ -9909,6 +10611,14 @@ fn clips_pass(
             }
             if body.clicked() {
                 select = Some((t, clip.id, command, shift));
+                // A CLICK, and deliberately not a drag: dragging a clip
+                // is moving it, and scrubbing the song along behind
+                // every move would make the transport follow the mouse
+                // whenever anyone rearranged anything. The lane pass
+                // draws the same line for the same reason.
+                if let Some(pos) = body.interact_pointer_pos() {
+                    seek_req = Some(snap(beat_at(content, offset, pixels_per_beat, pos.x), grid));
+                }
             }
             if body.secondary_clicked() && !selected {
                 select = Some((t, clip.id, false, false));
@@ -10068,16 +10778,72 @@ fn clips_pass(
             } else {
                 (theme.clip_midi, theme.clip_midi_header, "MIDI")
             };
-            let strength = if lifted {
-                0.35
-            } else if audible {
-                1.0
-            } else {
-                0.5
-            };
+            // TWO STATES, TWO CHANNELS.
+            //
+            // These both used to ride opacity — mid-drag at 0.35, muted
+            // at 0.5, audible at 1.0 — so three states sat on one axis
+            // separable only by degree, and "is that clip muted or just
+            // the one I am dragging?" was answerable by remembering
+            // which number was which.
+            //
+            // Opacity now means IN FLIGHT and nothing else: a clip being
+            // carried is a ghost of itself, which is what a proposal
+            // looks like. Muted is a hatch — present, and not in the
+            // path — which is the same mark the mixer's refused route
+            // wears, for the same reason. See `ui::hud`.
+            let strength = if lifted { 0.35 } else { 1.0 };
             painter.rect_filled(rect, 0.0, body_colour.gamma_multiply(strength));
             let title_visible = visual.title.intersect(content);
             painter.rect_filled(title_visible, 0.0, title_colour.gamma_multiply(strength));
+            if !audible {
+                daw::ui::hud::hatch(
+                    &painter.with_clip_rect(rect),
+                    rect,
+                    egui::Stroke::new(stroke::HAIR, theme.bg.gamma_multiply(0.7 * strength)),
+                );
+            }
+
+            // MORE OF THE FILE PAST THIS EDGE.
+            //
+            // A clip trimmed to a quarter of its file and one that IS
+            // its file were drawn identically, so "can I pull this edge
+            // out further" was a question you answered by trying. A
+            // notch cut out of the corner says there is more where that
+            // came from — on the side it is on, which is the half a
+            // single marker could not say.
+            //
+            // Cut INTO the clip rather than drawn beside it: the mark
+            // belongs to the edge it describes, and a triangle sitting
+            // outside would read as something in the lane.
+            if let Some(audio) = &clip.audio {
+                let (before, after) = audio.spare();
+                let notch = (rect.height() * 0.28).min(NOTCH_MAX);
+                let ink = theme.bg.gamma_multiply(0.85 * strength);
+                if rect.width() > notch * 2.0 {
+                    if before {
+                        painter.add(egui::Shape::convex_polygon(
+                            vec![
+                                rect.left_bottom(),
+                                egui::pos2(rect.left() + notch, rect.bottom()),
+                                egui::pos2(rect.left(), rect.bottom() - notch),
+                            ],
+                            ink,
+                            egui::Stroke::NONE,
+                        ));
+                    }
+                    if after {
+                        painter.add(egui::Shape::convex_polygon(
+                            vec![
+                                rect.right_bottom(),
+                                egui::pos2(rect.right() - notch, rect.bottom()),
+                                egui::pos2(rect.right(), rect.bottom() - notch),
+                            ],
+                            ink,
+                            egui::Stroke::NONE,
+                        ));
+                    }
+                }
+            }
             if title_visible.height() > 2.0 {
                 painter.line_segment(
                     [title_visible.left_bottom(), title_visible.right_bottom()],
@@ -10108,6 +10874,31 @@ fn clips_pass(
                     },
                 );
             }
+            // WHERE THIS CLIP BEGINS, always.
+            //
+            // A clip's boundary carried no ink at all unless it happened
+            // to be selected or under the pointer — so two clips sharing
+            // an edge, which is exactly what splitting one produces, drew
+            // as a single block. The one operation whose whole purpose is
+            // to make two things out of one left no evidence it had run.
+            //
+            // The LEADING edge, not both: an object needs a mark where it
+            // starts, and marking both ends would draw every boundary
+            // twice wherever clips abut — which is most of a finished
+            // arrangement. In the clip's own header colour, so the line
+            // reads as belonging to the clip that starts there rather
+            // than as a rule in the lane.
+            let start_x = rect.left();
+            if start_x >= content.left() && start_x <= content.right() {
+                painter.line_segment(
+                    [
+                        egui::pos2(start_x, rect.top()),
+                        egui::pos2(start_x, rect.bottom()),
+                    ],
+                    egui::Stroke::new(stroke::HAIR, title_colour.gamma_multiply(strength)),
+                );
+            }
+
             if selected || body.hovered() {
                 painter.rect_stroke(
                     rect,
@@ -10488,6 +11279,11 @@ fn clips_pass(
     }
     arr.rename = rename;
 
+    // The clips pass runs after the lanes', so this wins over a marker
+    // the lane below the clip might have asked for.
+    if let Some(beat) = seek_req {
+        arr.pending_point = Some(beat);
+    }
     if let Some((t, id, additive, extend)) = select
         && let Some(i) = index_of(&arr.clips[t], id)
     {
@@ -10515,7 +11311,20 @@ fn clips_pass(
     if let Some((t, id, want)) = right_to
         && let Some(i) = index_of(&arr.clips[t], id)
     {
-        let mut len = snap(want, grid);
+        // `want` is the BEAT UNDER THE POINTER; `len` is a length. The
+        // clip's start has to come off, and it did not — so the new
+        // length was the absolute end position and every clip grew by
+        // exactly its own start beat. A clip at bar three dragged to
+        // bar four became seven bars long.
+        //
+        // It survived because a clip at beat zero gets the right answer
+        // by coincidence, which is what most fixtures are.
+        //
+        // The END is snapped, not the length: a clip that begins off the
+        // grid should still be draggable to a grid line, and snapping
+        // its length instead would carry the offset into every edge it
+        // ever has.
+        let mut len = drag_len(want, arr.clips[t][i].start, grid);
         if let Some(audio) = &arr.clips[t][i].audio
             && !audio.looped
         {
@@ -10531,18 +11340,8 @@ fn clips_pass(
     // spot the original held; a copy keeps it and lands under a fresh id —
     // ids are identity, and identity is never in two places.
     if let Some((g, src)) = ghost_finalize {
-        let mut placed = g.clip;
-        if g.copy {
-            placed.id = arr.next_id();
-        } else if let Some(i) = index_of(&arr.clips[src], placed.id) {
-            arr.clips[src].remove(i);
-        }
-        let (start, idx) = place_clip(&arr.clips[g.track], placed.start, placed.len);
-        placed.start = start;
-        arr.clips[g.track].insert(idx, placed);
-        arr.select_only_clip(g.track, idx);
+        arr.land_ghost(g, src);
     }
-
     arr.ghost = ghost;
     ClipsOutcome { open_editor, fade }
 }
@@ -10906,50 +11705,77 @@ impl Default for Browser {
                 Folder {
                     name: "Instruments",
                     mark: Glyph::Instrument,
-                    // ONE LIST, on purpose. Eleven instruments read as
-                    // eleven instruments; the effects folder was split
-                    // because twenty rows of unlike things do not.
-                    groups: Vec::new(),
-                    items: &[
-                        BrowserItem {
-                            name: "Poly Synth",
-                            load: DeviceKind::Poly,
+                    // SPLIT, the way the effects are. Ten was already
+                    // more than a glance takes, and the three families
+                    // underneath answer different questions: what plays
+                    // a note, what plays a hit, and what plays a file.
+                    //
+                    // Nothing loose — a device sitting outside the
+                    // headings would read as the odd one out rather than
+                    // as the uncategorised one.
+                    items: &[],
+                    groups: vec![
+                        Group {
+                            // voices built from nothing.
+                            name: "Synths",
+                            mark: Glyph::Saw,
+                            items: &[
+                                BrowserItem {
+                                    name: "Poly Synth",
+                                    load: DeviceKind::Poly,
+                                },
+                                BrowserItem {
+                                    name: "Haze",
+                                    load: DeviceKind::Haze,
+                                },
+                                BrowserItem {
+                                    name: "Acid",
+                                    load: DeviceKind::Acid,
+                                },
+                                BrowserItem {
+                                    name: "Sine Synth",
+                                    load: DeviceKind::SineSynth,
+                                },
+                            ],
+                            open: false,
                         },
-                        BrowserItem {
-                            name: "Haze",
-                            load: DeviceKind::Haze,
+                        Group {
+                            // one strike each, and gone.
+                            name: "Drums",
+                            mark: Glyph::Transient,
+                            items: &[
+                                BrowserItem {
+                                    name: "Kick",
+                                    load: DeviceKind::Kick,
+                                },
+                                BrowserItem {
+                                    name: "Snare",
+                                    load: DeviceKind::Snare,
+                                },
+                                BrowserItem {
+                                    name: "Tom",
+                                    load: DeviceKind::Tom,
+                                },
+                                BrowserItem {
+                                    name: "808 Hat",
+                                    load: DeviceKind::Hat,
+                                },
+                                BrowserItem {
+                                    name: "Clap",
+                                    load: DeviceKind::Handclap,
+                                },
+                            ],
+                            open: false,
                         },
-                        BrowserItem {
-                            name: "Sampler",
-                            load: DeviceKind::Sampler,
-                        },
-                        BrowserItem {
-                            name: "Acid",
-                            load: DeviceKind::Acid,
-                        },
-                        BrowserItem {
-                            name: "Kick",
-                            load: DeviceKind::Kick,
-                        },
-                        BrowserItem {
-                            name: "Snare",
-                            load: DeviceKind::Snare,
-                        },
-                        BrowserItem {
-                            name: "Tom",
-                            load: DeviceKind::Tom,
-                        },
-                        BrowserItem {
-                            name: "808 Hat",
-                            load: DeviceKind::Hat,
-                        },
-                        BrowserItem {
-                            name: "Clap",
-                            load: DeviceKind::Handclap,
-                        },
-                        BrowserItem {
-                            name: "Sine Synth",
-                            load: DeviceKind::SineSynth,
+                        Group {
+                            // voices built from a recording.
+                            name: "Sampling",
+                            mark: Glyph::Sample,
+                            items: &[BrowserItem {
+                                name: "Sampler",
+                                load: DeviceKind::Sampler,
+                            }],
+                            open: false,
                         },
                     ],
                     open: true,
@@ -22046,10 +22872,47 @@ impl shell::Host for App {
                 _ => {}
             }
         }
+        // A COPY HAS TO LEAVE SOMETHING ON THE SYSTEM CLIPBOARD.
+        //
+        // `egui-winit` only emits `Event::Paste` when the OS clipboard
+        // holds text — with an empty one, Ctrl+V produces no event at
+        // all. Our clip clipboard is our own, so copying a clip and then
+        // pressing Ctrl+V on a fresh login pasted nothing and looked
+        // like the paste was broken.
+        //
+        // So a copy says what it took, in words. It makes the paste
+        // fire, and it is worth having on its own: the clipboard is
+        // the one place you can check what you are carrying.
+        let took = wishes
+            .iter()
+            .any(|a| matches!(a, UiAction::CopyClip | UiAction::CutClip));
         perform(&wishes, &mut self.transport, &mut self.arrangement);
+        if took {
+            let carried = self.arrangement.clipboard_summary();
+            if !carried.is_empty() {
+                ui.ctx().copy_text(carried);
+            }
+        }
         // A locator jump: the engine seeks, the mirror follows, and with
         // the engine off the mirror alone is the whole transport.
-        if let Some(beat) = self.arrangement.pending_seek.take() {
+        // A POINTER PRESS in the lanes. It always moves the marker, and
+        // it moves the playhead only when the song is stopped: while it
+        // is rolling, clicking around the arrangement is choosing where
+        // to work next, and jumping the playhead to each of those made
+        // the transport follow the mouse.
+        //
+        // Folded into the same road rather than given its own, so there
+        // is still exactly one place a locate happens.
+        let pointed = self.arrangement.pending_point.take();
+        if let Some(beat) = pointed {
+            self.transport.marker = beat;
+        }
+        let locate = self
+            .arrangement
+            .pending_seek
+            .take()
+            .or_else(|| pointed.filter(|_| !self.transport.playing));
+        if let Some(beat) = locate {
             let seconds = f64::from(beat) * 60.0 / self.transport.bpm.max(1.0);
             self.transport.position = seconds;
             // Every explicit jump is also the new insert marker: Space
@@ -25426,6 +26289,53 @@ mod tests {
         }
     }
 
+    /// THE CLIPBOARD VERBS ARRIVE AS EVENTS, NOT KEYS.
+    ///
+    /// `egui-winit` turns Ctrl+X/C/V into `Event::Cut` / `Event::Copy` /
+    /// `Event::Paste` and returns WITHOUT emitting the key, so the three
+    /// `consume_key(COMMAND, Key::C)` bindings that used to be here
+    /// could never fire. They read correctly and did nothing.
+    ///
+    /// This test drives the events a real keyboard produces, which is
+    /// the only version that would have caught it.
+    #[test]
+    fn the_clipboard_verbs_answer_the_events_a_keyboard_sends() {
+        for (event, expected) in [
+            (Event::Copy, UiAction::CopyClip),
+            (Event::Cut, UiAction::CutClip),
+            (Event::Paste("anything".to_owned()), UiAction::PasteClip),
+        ] {
+            let ctx = egui::Context::default();
+            let mut actions = Vec::new();
+            let mut out = ctx.run_ui(input(vec![event.clone()]), |_ui| {});
+            out.textures_delta.clear();
+            arrangement_keys(&ctx, &Arrangement::default(), &mut actions);
+            assert_eq!(actions, vec![expected], "{event:?} was not answered");
+        }
+
+        // And the KEY on its own is not a clipboard verb — if egui ever
+        // starts emitting it alongside the event, this must not fire
+        // twice.
+        let ctx = egui::Context::default();
+        let mut actions = Vec::new();
+        let mut out = ctx.run_ui(
+            input(vec![Event::Key {
+                key: egui::Key::C,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::COMMAND,
+            }]),
+            |_ui| {},
+        );
+        out.textures_delta.clear();
+        arrangement_keys(&ctx, &Arrangement::default(), &mut actions);
+        assert!(
+            !actions.contains(&UiAction::CopyClip),
+            "the bare key answered as well as the event"
+        );
+    }
+
     #[test]
     fn session_view_keeps_timeline_edit_keys_out() {
         let key = |key, modifiers| {
@@ -25773,10 +26683,531 @@ mod tests {
         );
     }
 
+    /// A PRESS MOVES THE MARKER; ONLY A STOPPED TRANSPORT FOLLOWS IT.
+    ///
+    /// Clicking around the arrangement while the song rolls is how you
+    /// choose where to work next, and jumping the playhead to each of
+    /// those made the transport follow the mouse. Stopped, the same
+    /// press means "start from here", which is the whole point of an
+    /// insert marker.
+    ///
+    /// An explicit locate — a locator, a return to start, the ruler
+    /// being scrubbed — is a different intent on the same road, and it
+    /// moves the playhead whatever the transport is doing.
+    #[test]
+    fn a_press_moves_the_playhead_only_while_stopped() {
+        let seek = |playing: bool, point: Option<f32>, explicit: Option<f32>| {
+            // The consumer's rule, stated the way `App::ui` applies it.
+            explicit.or_else(|| point.filter(|_| !playing))
+        };
+
+        // Stopped: the press is a locate.
+        assert_eq!(seek(false, Some(8.0), None), Some(8.0));
+        // Rolling: it is not.
+        assert_eq!(
+            seek(true, Some(8.0), None),
+            None,
+            "a click dragged the playhead out from under a running song"
+        );
+        // But an explicit locate lands either way.
+        assert_eq!(seek(true, None, Some(0.0)), Some(0.0));
+        assert_eq!(seek(false, None, Some(0.0)), Some(0.0));
+        // And an explicit locate outranks a press in the same frame:
+        // pressing Home while clicking should go home.
+        assert_eq!(seek(true, Some(8.0), Some(0.0)), Some(0.0));
+    }
+
+    /// A DRAG TAKES THE WHOLE SELECTION WITH IT.
+    ///
+    /// Dragging one clip out of a selection of six used to move that one
+    /// and leave the other five behind — so a marquee could gather a
+    /// phrase and then not move it, which is most of what a marquee is
+    /// for. What has to survive is the SHAPE of the group: the same
+    /// spacing in time, the same distance apart in lanes.
+    #[test]
+    fn a_group_drag_carries_the_shape_of_the_selection() {
+        let mut arr = Arrangement::default();
+        while arr.tracks.len() < 3 {
+            arr.add_track(TrackKind::Midi);
+        }
+        // A phrase: two clips on lane 0, one under them on lane 1.
+        let a = arr.create_clip(0, 0.0, 2.0).unwrap();
+        let b = arr.create_clip(0, 4.0, 2.0).unwrap();
+        let c = arr.create_clip(1, 1.0, 2.0).unwrap();
+        let ids = |arr: &Arrangement, track: usize| -> Vec<(u64, f32)> {
+            arr.clips[track].iter().map(|c| (c.id, c.start)).collect()
+        };
+        let (id_a, id_b, id_c) = (arr.clips[0][a].id, arr.clips[0][b].id, arr.clips[1][c].id);
+
+        // Drag `a` four beats later and one lane down, with the other
+        // two selected alongside it.
+        let dragged = arr.clips[0][a].clone();
+        let ghost = Ghost {
+            track: 1,
+            clip: Clip {
+                start: 4.0,
+                ..dragged.clone()
+            },
+            grab: 0.0,
+            copy: false,
+            from_start: dragged.start,
+            followers: vec![(id_b, 0), (id_c, 1)],
+        };
+        arr.land_ghost(ghost, 0);
+
+        // Lane 0 is empty: everything moved down one.
+        assert!(ids(&arr, 0).is_empty(), "the group left a clip behind");
+        // The phrase kept its shape — four beats later, one lane down.
+        let lane1 = ids(&arr, 1);
+        assert_eq!(lane1.len(), 2, "lane 1 should hold `a` and `b`");
+        assert_eq!(lane1[0], (id_a, 4.0));
+        assert_eq!(lane1[1], (id_b, 8.0));
+        assert_eq!(ids(&arr, 2), vec![(id_c, 5.0)], "`c` kept its offset");
+
+        // AND THE GROUP IS STILL SELECTED. A move that dropped
+        // everything but the clip under the pointer would make a second
+        // nudge impossible without gathering the selection again.
+        assert_eq!(arr.selected_clip_refs().len(), 3);
+    }
+
+    /// A COPY LEAVES THE ORIGINALS, and lands under fresh ids.
+    #[test]
+    fn a_group_copy_leaves_the_originals_where_they_are() {
+        let mut arr = Arrangement::default();
+        while arr.tracks.len() < 2 {
+            arr.add_track(TrackKind::Midi);
+        }
+        let a = arr.create_clip(0, 0.0, 2.0).unwrap();
+        let b = arr.create_clip(0, 4.0, 2.0).unwrap();
+        let (id_a, id_b) = (arr.clips[0][a].id, arr.clips[0][b].id);
+
+        let dragged = arr.clips[0][a].clone();
+        arr.land_ghost(
+            Ghost {
+                track: 1,
+                clip: Clip {
+                    start: 8.0,
+                    ..dragged.clone()
+                },
+                grab: 0.0,
+                copy: true,
+                from_start: dragged.start,
+                followers: vec![(id_b, 0)],
+            },
+            0,
+        );
+
+        // Both originals are untouched.
+        assert_eq!(arr.clips[0].len(), 2);
+        assert_eq!(arr.clips[0][0].id, id_a);
+        assert_eq!(arr.clips[0][1].id, id_b);
+        // And two copies landed, keeping their spacing, under ids of
+        // their own — identity is never in two places.
+        assert_eq!(arr.clips[1].len(), 2);
+        assert_eq!(arr.clips[1][0].start, 8.0);
+        assert_eq!(arr.clips[1][1].start, 12.0);
+        for clip in &arr.clips[1] {
+            assert!(clip.id != id_a && clip.id != id_b, "a copy reused an id");
+        }
+    }
+
+    /// A group dragged against the top keeps its shape rather than
+    /// losing its upper members off the end.
+    #[test]
+    fn a_group_dragged_off_the_top_is_clamped_not_dropped() {
+        let mut arr = Arrangement::default();
+        while arr.tracks.len() < 2 {
+            arr.add_track(TrackKind::Midi);
+        }
+        let a = arr.create_clip(1, 0.0, 2.0).unwrap();
+        let b = arr.create_clip(0, 0.0, 2.0).unwrap();
+        let id_b = arr.clips[0][b].id;
+        let dragged = arr.clips[1][a].clone();
+
+        // Drag the lower clip up to lane 0; its follower is a lane
+        // ABOVE it, which does not exist.
+        arr.land_ghost(
+            Ghost {
+                track: 0,
+                clip: dragged.clone(),
+                grab: 0.0,
+                copy: false,
+                from_start: dragged.start,
+                followers: vec![(id_b, -1)],
+            },
+            1,
+        );
+        let total: usize = arr.clips.iter().map(Vec::len).sum();
+        assert_eq!(total, 2, "a clip fell off the arrangement");
+    }
+
+    /// A RESIZE ENDS WHERE THE POINTER IS, wherever the clip starts.
+    ///
+    /// The caller handed a pointer's absolute beat to a parameter that
+    /// means LENGTH, so every clip grew by its own start beat when an
+    /// edge was dragged. Every existing fixture put its clip at beat
+    /// zero, where the two happen to be the same number — so a whole
+    /// suite passed over it.
+    #[test]
+    fn dragging_an_edge_ends_the_clip_under_the_pointer() {
+        let grid = 1.0;
+        // A clip at bar three, dragged to bar four: four bars long, not
+        // seven.
+        assert_eq!(drag_len(16.0, 12.0, grid), 4.0);
+        // The same drag on a clip at zero — the case that hid it.
+        assert_eq!(drag_len(16.0, 0.0, grid), 16.0);
+
+        // The END lands on the grid, even from an off-grid start, so a
+        // clip can always be pulled onto a bar line.
+        let start = 2.5;
+        for (pointer, expect_end) in [(7.4, 7.0), (7.6, 8.0), (12.2, 12.0)] {
+            let end = start + drag_len(pointer, start, grid);
+            assert!(
+                (end - expect_end).abs() < 1e-4,
+                "a drag to {pointer} ended at {end}, not {expect_end}"
+            );
+        }
+
+        // A finer grid follows the pointer more closely; a coarser one
+        // rounds further. Both still end where they say.
+        assert_eq!(drag_len(9.3, 1.0, 0.25), 8.25);
+        assert_eq!(drag_len(9.3, 1.0, 4.0), 7.0);
+    }
+
+    /// SPLIT FOLLOWS THE SELECTION, not the cursor's lane.
+    ///
+    /// Selecting a clip IS saying which clip you mean. Needing to also
+    /// make its track current was asking the same question twice, and
+    /// on the wrong answer it cut a different track — or nothing.
+    #[test]
+    fn split_cuts_the_selected_clips_whatever_track_is_current() {
+        let mut arr = Arrangement::default();
+        while arr.tracks.len() < 3 {
+            arr.add_track(TrackKind::Midi);
+        }
+        arr.create_clip(0, 0.0, 8.0).unwrap();
+        arr.create_clip(2, 0.0, 8.0).unwrap();
+
+        // Select the clip on track 2, and leave the cursor on track 0 —
+        // which is exactly the state a click on a clip leaves behind.
+        arr.select_only_clip(2, 0);
+        arr.cursor = Some((0, 0.0));
+        arr.selection = None;
+
+        assert!(arr.split_selection(4.0, 120.0), "nothing was cut");
+        assert_eq!(arr.clips[2].len(), 2, "the selected clip was not cut");
+        assert_eq!(arr.clips[2][0].len, 4.0);
+        assert_eq!(arr.clips[2][1].start, 4.0);
+        assert_eq!(arr.clips[0].len(), 1, "an unselected track was cut");
+    }
+
+    /// A RANGE CUTS AT BOTH EDGES, which is what isolates its middle.
+    ///
+    /// Cutting only at the start gave the front and everything else —
+    /// never the piece the box was drawn around, which is the whole
+    /// reason for drawing one.
+    #[test]
+    fn a_range_split_isolates_the_piece_it_covers() {
+        let mut arr = Arrangement::default();
+        while arr.tracks.is_empty() {
+            arr.add_track(TrackKind::Midi);
+        }
+        arr.create_clip(0, 0.0, 8.0).unwrap();
+        arr.select_only_clip(0, 0);
+        arr.selection = Some((2.0, 5.0));
+
+        assert!(arr.split_selection(0.0, 120.0));
+        let spans: Vec<(f32, f32)> = arr.clips[0].iter().map(|c| (c.start, c.len)).collect();
+        assert_eq!(
+            spans,
+            vec![(0.0, 2.0), (2.0, 3.0), (5.0, 3.0)],
+            "the middle was not isolated"
+        );
+    }
+
+    /// AND IT CUTS EVERY TRACK THE BAND COVERS.
+    #[test]
+    fn a_band_split_cuts_every_track_it_spans() {
+        let mut arr = Arrangement::default();
+        while arr.tracks.len() < 3 {
+            arr.add_track(TrackKind::Midi);
+        }
+        for track in 0..3 {
+            arr.create_clip(track, 0.0, 8.0).unwrap();
+        }
+        // A band over the first two lanes, no clips selected.
+        arr.selected_clip = None;
+        arr.selected_clip_ids.clear();
+        arr.selected = Some(0);
+        arr.selection = Some((4.0, 4.0));
+        arr.selection_tracks = Some((0, 1));
+
+        assert!(arr.split_selection(4.0, 120.0));
+        assert_eq!(arr.clips[0].len(), 2);
+        assert_eq!(arr.clips[1].len(), 2);
+        assert_eq!(arr.clips[2].len(), 1, "a track outside the band was cut");
+    }
+
+    /// THE GRID ONLY DRAWS LINES YOU CAN TELL APART.
+    ///
+    /// It guarded subdivisions and then fell back to whole beats — so at
+    /// eight pixels a beat it drew a line every eight pixels, and
+    /// further out one every two. That is not a grid, it is a grey wash
+    /// over the arrangement, and it was the loudest thing on a screen
+    /// whose actual content is the clips.
+    ///
+    /// Ink where there is something to read, and none where there is
+    /// not.
+    #[test]
+    fn the_grid_never_draws_lines_closer_than_it_can_resolve() {
+        for ppb in [512.0f32, 256.0, 64.0, 24.0, 8.0, 4.0, 2.0, 1.0, 0.5, 0.1] {
+            for sub in [0.25f32, 0.5, 1.0] {
+                for per_bar in [3.0f32, 4.0, 7.0] {
+                    let step = grid_step(sub, per_bar, ppb);
+                    let apart = step * ppb;
+                    assert!(
+                        apart >= GRID_MIN_PX - 1e-3 || step >= 32.0 * per_bar,
+                        "at {ppb} px/beat the grid draws every {apart} px"
+                    );
+                    // And it never coarsens what was already readable —
+                    // a fine grid at a close zoom is still a fine grid.
+                    if sub * ppb >= GRID_MIN_PX {
+                        assert_eq!(step, sub, "a readable grid was thrown away");
+                    }
+                }
+            }
+        }
+
+        // Every rung is something you could count out loud: a
+        // subdivision, a beat, or a whole number of bars. A timeline
+        // that gained lines at "seven beats" would be unreadable in a
+        // different way.
+        for ppb in [8.0f32, 4.0, 2.0, 1.0, 0.5] {
+            let step = grid_step(0.25, 4.0, ppb);
+            assert!(
+                step == 1.0 || (step / 4.0).fract().abs() < 1e-3,
+                "the grid stepped to {step} beats, which is not a musical rung"
+            );
+        }
+    }
+
+    /// A SELECTION SAYS HOW LONG IT IS, the way a musician counts.
+    #[test]
+    fn a_span_is_said_in_bars_and_beats() {
+        assert_eq!(beats_as_bars(16.0, 4), "4 bars");
+        assert_eq!(beats_as_bars(4.0, 4), "1 bar");
+        assert_eq!(beats_as_bars(18.0, 4), "4.2");
+        // Under a bar is counted in beats: "0.3" is a worse answer than
+        // "3 beats" to the question being asked.
+        assert_eq!(beats_as_bars(3.0, 4), "3 beats");
+        assert_eq!(beats_as_bars(1.5, 4), "1.5 beats");
+        // A hair under a bar line reads as the bar: the grid rounds, and
+        // a selection dragged onto a bar should not say "3.4".
+        assert_eq!(beats_as_bars(15.9999, 4), "4 bars");
+        // Odd metres count in their own bars.
+        assert_eq!(beats_as_bars(14.0, 7), "2 bars");
+        // And nothing is not a crash.
+        assert_eq!(beats_as_bars(0.0, 4), "0");
+        assert_eq!(beats_as_bars(f32::NAN, 4), "0");
+        assert_eq!(beats_as_bars(-4.0, 4), "0");
+    }
+
+    /// CUT TIME LIFTS THE SONG AND CLOSES THE GAP; PASTE TIME MAKES
+    /// ROOM AND PUTS IT BACK.
+    ///
+    /// The pair Live has that this did not. `DeleteTime` already closed
+    /// a gap and `InsertSilence` already opened one — what was missing
+    /// was carrying the stretch between them, which is what makes
+    /// "move this section eight bars later" one gesture instead of six.
+    #[test]
+    fn cut_time_and_paste_time_move_a_stretch_of_the_song() {
+        let mut arr = Arrangement::default();
+        while arr.tracks.len() < 2 {
+            arr.add_track(TrackKind::Midi);
+        }
+        // Two lanes, a clip on each inside 4..8, and one after it that
+        // has to ripple.
+        arr.create_clip(0, 4.0, 2.0).unwrap();
+        arr.create_clip(1, 6.0, 2.0).unwrap();
+        arr.create_clip(0, 12.0, 2.0).unwrap();
+
+        assert!(arr.cut_time(4.0, 8.0, 120.0));
+        // The gap closed: everything after came back four beats.
+        assert_eq!(arr.clips[0].len(), 1);
+        assert_eq!(arr.clips[0][0].start, 8.0);
+        assert!(arr.clips[1].is_empty());
+
+        // And the stretch is being carried, its own length included —
+        // the silence between the two clips is part of what was cut.
+        let carried = arr.time_clipboard.clone().expect("cut took nothing");
+        assert_eq!(carried.length, 4.0);
+        assert_eq!(carried.clips.len(), 2);
+        // Starts are relative to the cut, so it can go back anywhere.
+        assert_eq!(carried.clips[0].1.start, 0.0);
+        assert_eq!(carried.clips[1].1.start, 2.0);
+
+        // Paste it at 16: room is MADE, so the clip at 8 is untouched
+        // and nothing is overwritten.
+        assert!(arr.paste_time(16.0, 120.0));
+        assert_eq!(
+            arr.clips[0][0].start, 8.0,
+            "the paste overwrote earlier work"
+        );
+        assert_eq!(arr.clips[0][1].start, 16.0);
+        assert_eq!(arr.clips[1][0].start, 18.0, "the stretch lost its shape");
+        // Fresh ids: identity is never in two places.
+        assert_ne!(arr.clips[0][1].id, arr.clips[0][0].id);
+    }
+
+    /// PASTE TIME PUSHES, IT DOES NOT PAINT OVER.
+    ///
+    /// That is the whole difference from pasting clips, and the reason
+    /// the two keep separate clipboards: one is about objects and lands
+    /// where you point, the other is about duration and moves whatever
+    /// was already there out of its way.
+    #[test]
+    fn paste_time_makes_room_rather_than_overwriting() {
+        let mut arr = Arrangement::default();
+        while arr.tracks.is_empty() {
+            arr.add_track(TrackKind::Midi);
+        }
+        arr.create_clip(0, 0.0, 2.0).unwrap();
+        arr.cut_time(0.0, 4.0, 120.0);
+        // A clip sitting exactly where the paste lands.
+        arr.create_clip(0, 0.0, 2.0).unwrap();
+        let sitting = arr.clips[0][0].id;
+
+        arr.paste_time(0.0, 120.0);
+        // The one that was there moved along by the pasted length.
+        let moved = arr.clips[0].iter().find(|c| c.id == sitting).expect("lost");
+        assert_eq!(moved.start, 4.0);
+        assert_eq!(arr.clips[0].len(), 2);
+    }
+
+    /// An empty time clipboard pastes nothing, and says so rather than
+    /// opening a gap of zero beats.
+    #[test]
+    fn pasting_time_with_nothing_carried_does_nothing() {
+        let mut arr = Arrangement::default();
+        while arr.tracks.is_empty() {
+            arr.add_track(TrackKind::Midi);
+        }
+        arr.create_clip(0, 0.0, 2.0).unwrap();
+        assert!(!arr.paste_time(0.0, 120.0));
+        assert_eq!(arr.clips[0][0].start, 0.0);
+    }
+
+    /// A BAND LEFT OVER FROM A DRAG DOES NOT WASH LANES IT NO LONGER
+    /// COVERS.
+    ///
+    /// Two fields that have to agree can drift, and this was how: drag a
+    /// marquee three lanes deep, then arrow up. The arrow sets a
+    /// one-cell selection and moves the track — and the band, if nobody
+    /// forgot it, would still be washing three lanes.
+    #[test]
+    fn changing_track_forgets_the_band() {
+        let mut arr = Arrangement::default();
+        while arr.tracks.len() < 3 {
+            arr.add_track(TrackKind::Midi);
+        }
+        arr.selection = Some((0.0, 4.0));
+        arr.selection_tracks = Some((0, 2));
+        assert_eq!(arr.selection_band(), Some((0, 2)));
+
+        arr.select_track(1);
+        assert_eq!(
+            arr.selection_band(),
+            Some((1, 1)),
+            "the band outlived the gesture that drew it"
+        );
+
+        // And no selection means no band at all, however stale the
+        // range is.
+        arr.selection_tracks = Some((0, 2));
+        arr.selection = None;
+        assert_eq!(arr.selection_band(), None);
+    }
+
+    /// A BAND IS A RECTANGLE — tracks and time — and it takes every clip
+    /// it touches.
+    ///
+    /// Touching rather than containing: Live selects a clip the marquee
+    /// merely crosses, and the alternative is a band that has to be
+    /// drawn exactly around a clip to take it, which on a timeline you
+    /// have scrolled and zoomed is a gesture nobody lands.
+    #[test]
+    fn a_band_takes_every_clip_it_touches() {
+        let clip = |id: u64, start: f32, len: f32| Clip {
+            id,
+            start,
+            len,
+            ..Clip::default()
+        };
+        // Three lanes; the middle one has two clips.
+        let clips = vec![
+            vec![clip(1, 0.0, 4.0)],
+            vec![clip(2, 0.0, 2.0), clip(3, 8.0, 4.0)],
+            vec![clip(4, 4.0, 4.0)],
+        ];
+
+        // A band over the first two lanes, beats 1..3: it crosses clip 1
+        // and clip 2, and reaches neither of the others.
+        assert_eq!(
+            clips_in_band(&clips, (0, 1), 1.0, 3.0),
+            vec![(0, 0), (1, 0)]
+        );
+
+        // Backwards is the same band — a marquee dragged up and left is
+        // still a marquee.
+        assert_eq!(
+            clips_in_band(&clips, (1, 0), 3.0, 1.0),
+            vec![(0, 0), (1, 0)]
+        );
+
+        // A band that touches only the very edge of a clip still takes
+        // it: overlap is overlap.
+        assert_eq!(clips_in_band(&clips, (2, 2), 7.9, 12.0), vec![(2, 0)]);
+        // ...and one that stops exactly where a clip begins does not.
+        assert!(clips_in_band(&clips, (2, 2), 0.0, 4.0).is_empty());
+
+        // Every lane it spans, including ones it only passes through.
+        assert_eq!(clips_in_band(&clips, (0, 2), 0.0, 16.0).len(), 4);
+        // And nothing outside the lanes it names.
+        assert_eq!(clips_in_band(&clips, (0, 0), 0.0, 16.0), vec![(0, 0)]);
+        // A track range past the end is not a panic.
+        assert!(clips_in_band(&clips, (5, 9), 0.0, 16.0).is_empty());
+    }
+
+    /// THE BAND FINDS THE LANE UNDER THE POINTER, and the nearest one
+    /// when the drag has run off the ends.
+    ///
+    /// Nearest rather than nothing: a marquee dragged past the last lane
+    /// plainly means that lane, and a `None` there would make the band
+    /// collapse the moment the gesture left the track area.
+    #[test]
+    fn the_band_reaches_the_lane_under_the_pointer() {
+        let lane = |top: f32, h: f32| {
+            egui::Rect::from_min_size(egui::pos2(0.0, top), egui::vec2(100.0, h))
+        };
+        // The middle lane is folded away: zero height, and never the
+        // answer, because it is not on screen to be dragged over.
+        let lanes = [lane(0.0, 20.0), lane(20.0, 0.0), lane(20.0, 20.0)];
+
+        assert_eq!(lane_at(&lanes, 5.0), Some(0));
+        assert_eq!(lane_at(&lanes, 25.0), Some(2));
+        // Past either end: the nearest real lane.
+        assert_eq!(lane_at(&lanes, -100.0), Some(0));
+        assert_eq!(lane_at(&lanes, 900.0), Some(2));
+        // A folded lane is never chosen, even pointing straight at it.
+        assert_ne!(lane_at(&lanes, 20.0), Some(1));
+        // No lanes at all is the one honest `None`.
+        assert_eq!(lane_at(&[], 5.0), None);
+    }
+
     /// A click in the grid IS the insert marker: the transport moves to
-    /// the snapped beat. A drag-select seeks once, at the press — the
-    /// selection must not scrub the song along behind it. The ruler's
-    /// empty stretches scrub too.
+    /// the snapped beat when stopped. A drag-select marks once, at the
+    /// press — the selection must not scrub the song along behind it.
+    /// The ruler's empty stretches scrub too.
     #[test]
     fn clicking_the_grid_moves_the_transport() {
         let ctx = egui::Context::default();
@@ -25804,7 +27235,7 @@ mod tests {
                 },
             ],
         );
-        assert_eq!(arr.pending_seek.take(), Some(3.0), "snapped to the grid");
+        assert_eq!(arr.pending_point.take(), Some(3.0), "snapped to the grid");
 
         // A drag-select: one seek when the drag registers, none while the
         // selection grows. (egui reports a click on release and a drag on
@@ -25825,7 +27256,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            arr.pending_seek, None,
+            arr.pending_point, None,
             "the bare press is not yet a gesture"
         );
         arrangement_pass(
@@ -25834,13 +27265,13 @@ mod tests {
             vec![Event::PointerMoved(pos2(press.x + 24.0, press.y))],
         );
         assert!(
-            arr.pending_seek.take().is_some(),
+            arr.pending_point.take().is_some(),
             "the drag's start seeks once"
         );
         for step in 2..=6 {
             let to = pos2(press.x + step as f32 * 24.0, press.y);
             arrangement_pass(&ctx, &mut arr, vec![Event::PointerMoved(to)]);
-            assert_eq!(arr.pending_seek, None, "the growing selection does not");
+            assert_eq!(arr.pending_point, None, "the growing selection does not");
         }
         let release = pos2(press.x + 144.0, press.y);
         arrangement_pass(
@@ -25857,7 +27288,7 @@ mod tests {
             ],
         );
         assert!(arr.selection.is_some(), "and the selection still happened");
-        assert_eq!(arr.pending_seek, None);
+        assert_eq!(arr.pending_point, None);
 
         // The ruler's empty stretch scrubs.
         let ruler = pos2(TL + 7.4 * PX_PER_BEAT, MINIMAP_H + LOOP_RULER_H * 0.5);
@@ -25880,6 +27311,9 @@ mod tests {
                 },
             ],
         );
+        // THE RULER STILL SEEKS. It is an explicit scrub, not a press
+        // in the lanes — dragging the ruler is asking the playhead to
+        // move, and it must do so while the song is rolling.
         assert_eq!(arr.pending_seek.take(), Some(7.0), "the ruler scrubs");
     }
 
@@ -29080,6 +30514,8 @@ mod tests {
             clip: clip.clone(),
             grab: 0.0,
             copy: false,
+            from_start: clip.start,
+            followers: Vec::new(),
         });
         arr.rename = Some(Rename {
             track: 0,
