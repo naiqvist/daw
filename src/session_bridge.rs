@@ -175,6 +175,8 @@ pub fn sync_document(document: &mut sx::SessionDocument, arrangement: &Arrangeme
         target.solo = track.solo;
         target.pan = track.pan;
         target.volume = track.volume;
+        target.input = track.input.label();
+        target.monitoring = track.monitor.hears();
         target.sends.clone_from(&track.sends);
         // A send list is allowed to be SHORT — that is how a track says
         // it has never been asked about a return — but never long, or a

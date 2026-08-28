@@ -55,8 +55,8 @@ mod bar;
 use automation::TrackAutomation;
 mod track;
 use track::{
-    MasterTrack, ReturnTrack, Track, delete_track_automation_time, insert_track_automation_time,
-    sanitize_chain, split_track_automation_at,
+    MasterTrack, ReturnTrack, Track, TrackInput, delete_track_automation_time,
+    insert_track_automation_time, sanitize_chain, split_track_automation_at,
 };
 mod targets;
 use targets::{
@@ -4408,6 +4408,22 @@ fn shape_hash(tracks: &[Track], master: &MasterTrack, returns: &[ReturnTrack]) -
     // A SEND LEVEL IS NOT SHAPE EITHER, and that is the whole point of
     // compiling a gain node for every pair: opening a send from silence
     // is a letter, so a drag from zero costs no recompile.
+    // A route and its monitor are SHAPE: they add or drop input nodes,
+    // which no parameter letter can do. The monitor especially — it is
+    // the difference between a node in the schedule and no node at all,
+    // and it must take effect the moment it is switched.
+    for track in tracks {
+        std::mem::discriminant(&track.input).hash(&mut hasher);
+        match track.input {
+            TrackInput::None => {}
+            TrackInput::Mono(channel) => channel.hash(&mut hasher),
+            TrackInput::Stereo(left, right) => {
+                left.hash(&mut hasher);
+                right.hash(&mut hasher);
+            }
+        }
+        track.monitor.hash(&mut hasher);
+    }
     returns.len().hash(&mut hasher);
     for bus in returns {
         bus.mute.hash(&mut hasher);
@@ -12606,6 +12622,32 @@ fn compile_chain(
     tail
 }
 
+/// Compile a lane's live input into source nodes.
+///
+/// A mono route is one `Input` node, which the mixers below it will
+/// centre. A stereo pair is two, each placed hard to its own side by a
+/// `Pan` — mono placement at the extremes is unity on one channel and
+/// silence on the other, which is exactly what a pair means.
+fn push_input_sources(spec: &mut GraphSpec, input: TrackInput, sources: &mut Vec<NodeId>) {
+    match input {
+        TrackInput::None => {}
+        TrackInput::Mono(channel) => {
+            sources.push(spec.push(NodeSpec::Input { channel }));
+        }
+        TrackInput::Stereo(left, right) => {
+            for (channel, side) in [(left, -1.0), (right, 1.0)] {
+                let node = spec.push(NodeSpec::Input { channel });
+                let placed = spec.push(NodeSpec::Pan {
+                    pan: side,
+                    gain: 1.0,
+                });
+                spec.connect(node, placed);
+                sources.push(placed);
+            }
+        }
+    }
+}
+
 fn build_graph_spec(
     tracks: &[Track],
     bus: &MasterTrack,
@@ -12752,6 +12794,17 @@ fn build_graph_spec(
                 sources.push(source);
             }
             TrackKind::Audio => {
+                // The live input, beside the clips rather than instead of
+                // them: an audio lane monitoring a microphone is still an
+                // audio lane, and a clip on it still plays.
+                //
+                // Only when MONITORING. A route with the monitor off is a
+                // choice remembered, not a signal — and the default being
+                // off is what stops picking an input from putting the
+                // speakers into the microphone.
+                if track.monitor.hears() {
+                    push_input_sources(&mut spec, track.input, &mut sources);
+                }
                 for clip in clips.get(i).into_iter().flatten() {
                     let Some(audio) = &clip.audio else { continue };
                     // A clip whose reversal is still being written has
@@ -16153,6 +16206,25 @@ impl App {
                         track.sends[index] = value.clamp(0.0, 1.0);
                     }
                 }
+                // A route and its monitor both add or drop input nodes,
+                // so both force the swap rather than waiting out the
+                // clip debounce — a monitor switch that took a second to
+                // take effect would be pressed twice.
+                sx::SessionIntent::CycleTrackInput { track, back } => {
+                    let channels = self.input_channels();
+                    if let Some(track) = self.arrangement.tracks.get_mut(track)
+                        && channels > 0
+                    {
+                        track.input = track.input.cycled(channels, back);
+                        self.arrangement.force_recompile = true;
+                    }
+                }
+                sx::SessionIntent::ToggleTrackMonitor(track) => {
+                    if let Some(track) = self.arrangement.tracks.get_mut(track) {
+                        track.monitor = track.monitor.toggled();
+                        self.arrangement.force_recompile = true;
+                    }
+                }
                 sx::SessionIntent::SelectReturn(index) => {
                     self.arrangement.select_return(index);
                 }
@@ -17352,6 +17424,18 @@ impl App {
                 self.waveform_service.request(path.clone());
             }
         }
+    }
+
+    /// How many hardware inputs there are to route from.
+    ///
+    /// Zero when the engine is off, and that is the honest answer rather
+    /// than a remembered one: a route can only be chosen against an
+    /// interface that is actually open, and offering channels from the
+    /// last session would offer channels that may not exist.
+    fn input_channels(&self) -> u32 {
+        self.engine
+            .as_ref()
+            .map_or(0, |engine| engine.info().in_channels as u32)
     }
 
     fn shape_hash(&self) -> u64 {
@@ -19394,6 +19478,9 @@ impl eframe::App for App {
         // than the next one.
         if self.arrangement.main_view == MainView::Session {
             session_bridge::sync_document(&mut self.session_doc, &self.arrangement);
+            // What there is to route FROM comes off the open stream, not
+            // off the document — see `input_channels`.
+            self.session_doc.input_channels = self.input_channels();
         }
         let arrangement_panel =
             egui::CentralPanel::default()
@@ -27521,6 +27608,153 @@ mod tests {
         assert!(spec.compile(48_000, 256).is_ok());
     }
 
+    // ------------------------------------------------- input routing ---
+
+    // Only the tests name the monitor as a VALUE — the graph asks it a
+    // question (`hears`) instead, which is the whole of what it needs.
+    use crate::track::Monitor;
+
+    fn inputs(spec: &GraphSpec) -> Vec<u32> {
+        spec.iter_ordered()
+            .filter_map(|(_, node)| match node {
+                NodeSpec::Input { channel } => Some(*channel),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// THE CYCLE IS EVERY ROUTE AND NOTHING ELSE.
+    ///
+    /// Mono before stereo, because one microphone is the common case and
+    /// the pairs are for a stereo synth. Shift walks it backwards, which
+    /// is what makes a cycle usable rather than a hunt.
+    #[test]
+    fn a_route_cycles_through_every_channel_and_pair() {
+        assert_eq!(
+            TrackInput::routes(2),
+            vec![
+                TrackInput::None,
+                TrackInput::Mono(0),
+                TrackInput::Mono(1),
+                TrackInput::Stereo(0, 1)
+            ]
+        );
+        assert_eq!(TrackInput::routes(0), vec![TrackInput::None]);
+        assert_eq!(
+            TrackInput::routes(1),
+            vec![TrackInput::None, TrackInput::Mono(0)],
+            "one channel cannot make a pair"
+        );
+
+        let mut route = TrackInput::None;
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            route = route.cycled(2, false);
+            seen.push(route);
+        }
+        assert_eq!(
+            seen,
+            TrackInput::routes(2)[1..]
+                .iter()
+                .copied()
+                .chain([TrackInput::None])
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            TrackInput::None.cycled(2, true),
+            TrackInput::Stereo(0, 1),
+            "backwards from nothing is the last route"
+        );
+        // The labels a musician reads count from one; the engine counts
+        // from zero, and exactly one place does that arithmetic.
+        assert_eq!(TrackInput::None.label(), "—");
+        assert_eq!(TrackInput::Mono(0).label(), "1");
+        assert_eq!(TrackInput::Stereo(0, 1).label(), "1/2");
+    }
+
+    /// A ROUTE IS REMEMBERED; A MONITOR IS WHAT MAKES IT A SOUND.
+    ///
+    /// The default being off is a safety default, not a tidiness one —
+    /// an input wired to the speakers is a feedback loop on a laptop —
+    /// so this test pins that choosing a source is silent until it is
+    /// asked to be heard.
+    #[test]
+    fn a_routed_input_is_silent_until_it_is_monitored() {
+        let mut a = Arrangement::default();
+        a.add_track(TrackKind::Audio);
+        let lane = a.tracks.len() - 1;
+        a.tracks[lane].input = TrackInput::Mono(1);
+
+        let (spec, _) = build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
+        assert!(
+            inputs(&spec).is_empty(),
+            "an unmonitored route reached the schedule"
+        );
+
+        a.tracks[lane].monitor = Monitor::In;
+        let (spec, _) = build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
+        assert_eq!(inputs(&spec), vec![1], "the monitored route did not");
+        assert!(spec.compile(48_000, 256).is_ok());
+
+        // Both halves are SHAPE: each adds or drops a node, and no
+        // parameter letter can do that.
+        let base = shape_hash(&a.tracks, &a.master, &a.returns);
+        a.tracks[lane].monitor = Monitor::Off;
+        assert_ne!(shape_hash(&a.tracks, &a.master, &a.returns), base);
+        a.tracks[lane].monitor = Monitor::In;
+        a.tracks[lane].input = TrackInput::Mono(0);
+        assert_ne!(shape_hash(&a.tracks, &a.master, &a.returns), base);
+    }
+
+    /// A STEREO ROUTE IS TWO INPUTS PLACED HARD APART.
+    ///
+    /// The engine's input node is one channel wide, so a pair is built
+    /// rather than read: two nodes, each panned to its own side, where
+    /// mono placement at the extremes is unity on one channel and
+    /// silence on the other.
+    #[test]
+    fn a_stereo_route_is_two_inputs_placed_hard_apart() {
+        let mut a = Arrangement::default();
+        a.add_track(TrackKind::Audio);
+        let lane = a.tracks.len() - 1;
+        a.tracks[lane].input = TrackInput::Stereo(0, 1);
+        a.tracks[lane].monitor = Monitor::In;
+
+        let (spec, nodes) =
+            build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
+        assert_eq!(inputs(&spec), vec![0, 1]);
+        let placed: Vec<f32> = spec
+            .iter_ordered()
+            .filter_map(|(_, node)| match node {
+                NodeSpec::Pan { pan, .. } => Some(*pan),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            placed.contains(&-1.0) && placed.contains(&1.0),
+            "the pair was not placed apart: {placed:?}"
+        );
+        // And a lane with no clips at all still compiles, because the
+        // live input IS its material.
+        assert!(a.clips[lane].is_empty());
+        assert!(nodes.pans[lane].is_some(), "a monitoring lane must sound");
+        assert!(spec.compile(48_000, 256).is_ok());
+    }
+
+    /// A NOTE LANE IS NOT ROUTED, and not because it is refused — there
+    /// is no MIDI input path in the engine at all, so the value is
+    /// simply never read.
+    #[test]
+    fn a_note_lane_ignores_a_route_it_should_never_have_been_given() {
+        let mut a = Arrangement::default();
+        load(&mut a, 0, DeviceKind::SineSynth);
+        a.tracks[0].input = TrackInput::Mono(0);
+        a.tracks[0].monitor = Monitor::In;
+        let (spec, _) = build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
+        assert!(inputs(&spec).is_empty());
+        assert!(spec.compile(48_000, 256).is_ok());
+    }
+
     /// DELETING A RETURN SHIFTS EVERY SEND DOWN, IT DOES NOT CLEAR THEM.
     ///
     /// The list is positional: `sends[1]` means "return B" only because
@@ -28275,6 +28509,8 @@ mod tests {
         arr.returns[0].volume = 0.7;
         arr.returns[1].mute = true;
         arr.tracks[0].sends = vec![0.25, 0.9];
+        arr.tracks[1].input = TrackInput::Stereo(2, 3);
+        arr.tracks[1].monitor = Monitor::In;
 
         let doc = project_doc(&arr, &Transport::default());
         let text = ron::ser::to_string_pretty(&doc, ron::ser::PrettyConfig::default()).unwrap();
@@ -28288,11 +28524,23 @@ mod tests {
         assert_eq!(back.returns[0].volume, 0.7);
         assert!(back.returns[1].mute);
         assert_eq!(back.tracks[0].sends, vec![0.25, 0.9]);
+        // A route is stored by CHANNEL INDEX and not clamped on load:
+        // the number of inputs belongs to whatever is plugged in today,
+        // and a channel that is not there reads as silence at the node.
+        assert_eq!(back.tracks[1].input, TrackInput::Stereo(2, 3));
+        assert_eq!(back.tracks[1].monitor, Monitor::In);
 
         // A file from before returns: both fields are simply absent.
         let older: ProjectDoc = ron::from_str("(version: 2, bpm: 128.0)").unwrap();
         assert!(older.returns.is_empty(), "no returns, and no guessing");
         assert!(older.tracks.iter().all(|track| track.sends.is_empty()));
+        assert!(
+            older
+                .tracks
+                .iter()
+                .all(|track| track.input == TrackInput::None && track.monitor == Monitor::Off),
+            "a project from before routing must open silent, not listening"
+        );
 
         // A HAND-EDITED file is input like any other: too many returns,
         // an instrument on a bus, and a send list that points past the

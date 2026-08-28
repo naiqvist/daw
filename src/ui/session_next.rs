@@ -57,6 +57,13 @@ pub struct SessionTrack {
     pub solo: bool,
     pub volume: f32,
     pub pan: f32,
+    /// The lane's live input, as a LABEL and a state — the view has no
+    /// business knowing what a channel index means, only what to draw
+    /// and what to ask for next.
+    #[serde(default)]
+    pub input: String,
+    #[serde(default)]
+    pub monitoring: bool,
     /// How much of this track each return gets, in return order. Shorter
     /// than the return list means zero, exactly as the project's own
     /// send list does: adding a return must not have to write a silence
@@ -75,6 +82,8 @@ impl Default for SessionTrack {
             solo: false,
             volume: 1.0,
             pan: 0.0,
+            input: "—".to_owned(),
+            monitoring: false,
             sends: Vec::new(),
         }
     }
@@ -399,6 +408,12 @@ pub struct SessionDocument {
     /// before returns existed, which reads as a song with none.
     #[serde(default)]
     pub returns: Vec<SessionReturn>,
+    /// How many hardware inputs there are to route from, as the engine
+    /// last reported. Zero means there is nothing to offer — the engine
+    /// is off, or the interface has none — and the strip says so rather
+    /// than cycling through routes that are all silence.
+    #[serde(default)]
+    pub input_channels: u32,
     pub scenes: Vec<Scene>,
     /// Track-major: `slots[track][scene]`.
     pub slots: Vec<Vec<Slot>>,
@@ -427,6 +442,7 @@ impl SessionDocument {
         Self {
             tracks,
             returns: Vec::new(),
+            input_channels: 0,
             scenes,
             slots,
             global_quantization: Quantization::Bar,
@@ -1469,6 +1485,13 @@ pub enum SessionIntent {
         index: usize,
         value: f32,
     },
+    /// Step this track's input route. `back` walks the cycle the other
+    /// way, which is what makes a cycle usable rather than a hunt.
+    CycleTrackInput {
+        track: usize,
+        back: bool,
+    },
+    ToggleTrackMonitor(usize),
     SelectReturn(usize),
     ToggleReturnMute(usize),
     SetReturnVolume {
@@ -1572,6 +1595,8 @@ const FADER_MIN_HEIGHT: f32 = 26.0;
 const METER_WIDTH: f32 = 9.0;
 const SCALE_MIN_WIDTH: f32 = 20.0;
 const SEND_HEIGHT: f32 = 11.0;
+const IO_HEIGHT: f32 = 13.0;
+const MONITOR_WIDTH: f32 = 20.0;
 const SEND_LETTER_WIDTH: f32 = 9.0;
 /// Where return peak holds live in the strip's hold table.
 ///
@@ -1995,6 +2020,7 @@ pub fn show_session(
                 track,
                 track_index,
                 &document.returns,
+                document.input_channels,
                 runtime.tracks.get(track_index),
                 state,
                 mixer,
@@ -2747,12 +2773,33 @@ fn paint_stop_track(
 /// so they only begin once every fixed row is already there — from which
 /// point the block can only grow, because nothing above it can still
 /// arrive and take its space back.
+/// What a strip has been asked to hold, beside its fixed furniture.
+///
+/// A struct and not two more positional arguments: `new(rect, 2, true)`
+/// reads as nothing at a call site, and both of these decide whether a
+/// ROW EXISTS, which is the thing a reader of the layout most needs to
+/// see named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StripContent {
+    /// How many sends this strip can show — one per return.
+    pub sends: usize,
+    /// Whether this lane can be routed at all. Audio lanes can; a note
+    /// lane has no input path, so it is offered no control rather than a
+    /// dead one.
+    pub io: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MixerStrip {
     pub rect: egui::Rect,
     pub mute: egui::Rect,
     pub solo: egui::Rect,
     pub pan: Option<egui::Rect>,
+    /// The monitor switch and the route it names. Both or neither: a
+    /// route you cannot hear and a monitor with nothing to hear are each
+    /// half a control.
+    pub monitor: Option<egui::Rect>,
+    pub route: Option<egui::Rect>,
     /// One row per send that fits, in send order.
     pub sends: Vec<egui::Rect>,
     /// How many sends did not fit. Drawn as a count, never silently
@@ -2770,7 +2817,8 @@ pub struct MixerStrip {
 }
 
 impl MixerStrip {
-    pub fn new(rect: egui::Rect, sends: usize) -> Self {
+    pub fn new(rect: egui::Rect, content: StripContent) -> Self {
+        let StripContent { sends, io } = content;
         let content_left = rect.left() + STRIP_PAD_X;
         let content_right = (rect.right() - STRIP_PAD_X).max(content_left + 8.0);
 
@@ -2789,6 +2837,7 @@ impl MixerStrip {
             }
         };
         let wants_pan = afford(PAN_HEIGHT + STRIP_GAP);
+        let wants_io = io && wants_pan && afford(IO_HEIGHT + STRIP_GAP);
         let wants_readout = wants_pan && afford(READOUT_HEIGHT + 2.0);
         let wants_peak = wants_readout && afford(PEAK_HEIGHT + 1.0);
         // Only once everything fixed is in place, for the reason above.
@@ -2806,6 +2855,29 @@ impl MixerStrip {
         );
         let solo = mute.translate(egui::vec2(TRACK_BUTTON_WIDTH + 4.0, 0.0));
         top += TRACK_BUTTON_HEIGHT + STRIP_GAP;
+        // The I/O row sits at the TOP, under the buttons, which is where
+        // a console puts it and where a signal actually enters: read the
+        // strip downwards and you read the path.
+        let (monitor, route) = if wants_io {
+            let row = egui::Rect::from_min_max(
+                egui::pos2(content_left, top),
+                egui::pos2(content_right, top + IO_HEIGHT),
+            );
+            top += IO_HEIGHT + STRIP_GAP;
+            let split = (row.left() + MONITOR_WIDTH).min(row.right());
+            (
+                Some(egui::Rect::from_min_max(
+                    row.min,
+                    egui::pos2(split, row.bottom()),
+                )),
+                Some(egui::Rect::from_min_max(
+                    egui::pos2(split + 2.0, row.top()),
+                    row.max,
+                )),
+            )
+        } else {
+            (None, None)
+        };
         let pan = wants_pan.then(|| {
             let bar = egui::Rect::from_min_max(
                 egui::pos2(content_left, top),
@@ -2872,6 +2944,8 @@ impl MixerStrip {
             mute,
             solo,
             pan,
+            monitor,
+            route,
             sends: send_rects,
             sends_hidden: sends - send_rows,
             fader,
@@ -3230,13 +3304,22 @@ fn paint_mixer(
     track: &SessionTrack,
     track_index: usize,
     returns: &[SessionReturn],
+    returns_or_inputs: u32,
     runtime: Option<&TrackRuntime>,
     state: &mut SessionViewState,
     rect: egui::Rect,
     colors: &SessionColors,
     intents: &mut Vec<SessionIntent>,
 ) {
-    let strip = MixerStrip::new(rect, returns.len());
+    let strip = MixerStrip::new(
+        rect,
+        StripContent {
+            sends: returns.len(),
+            // A note lane has no input path at all, so it is offered no
+            // control rather than one that could only ever be silence.
+            io: matches!(track.kind, TrackKind::Audio),
+        },
+    );
     ui.painter().rect_filled(rect, 0.0, colors.surface);
     ui.painter().line_segment(
         [rect.right_top(), rect.right_bottom()],
@@ -3279,6 +3362,72 @@ fn paint_mixer(
         });
     }
     solo.on_hover_text("solo · ctrl-click to add to the solo set");
+
+    // ---- the input route.
+    if let Some(button) = strip.monitor
+        && let Some(route) = strip.route
+    {
+        let routable = returns_or_inputs > 0;
+        let monitor = control_button(
+            ui,
+            button,
+            ui.id().with(("session_next_monitor", track_index)),
+            "IN",
+            track.monitoring,
+            colors.ok,
+            colors,
+        );
+        if monitor.clicked() {
+            intents.push(SessionIntent::ToggleTrackMonitor(track_index));
+        }
+        monitor.on_hover_text(if track.monitoring {
+            "stop monitoring this input"
+        } else {
+            // Said before it happens, because the thing it can do is
+            // put the speakers into the microphone.
+            "hear this input through the lane's chain — headphones first"
+        });
+
+        let response = ui.interact(
+            route,
+            ui.id().with(("session_next_route", track_index)),
+            egui::Sense::click(),
+        );
+        if response.clicked() {
+            intents.push(SessionIntent::CycleTrackInput {
+                track: track_index,
+                back: ui.input(|input| input.modifiers.shift),
+            });
+        }
+        ui.painter().rect_filled(
+            route,
+            0.0,
+            if response.hovered() && routable {
+                colors.raised
+            } else {
+                colors.sunken
+            },
+        );
+        ui.painter().text(
+            route.center(),
+            egui::Align2::CENTER_CENTER,
+            &track.input,
+            egui::FontId::monospace(MICRO_FONT),
+            if routable {
+                colors.text
+            } else {
+                colors.divider
+            },
+        );
+        response.on_hover_text(if routable {
+            format!(
+                "input {} · click for the next route · shift-click for the last",
+                track.input
+            )
+        } else {
+            "no inputs to route from — start the engine, or the interface has none".to_owned()
+        });
+    }
 
     // ---- pan.
     if let Some(pan_rect) = strip.pan
@@ -3456,7 +3605,7 @@ fn paint_return_strip(
     colors: &SessionColors,
     intents: &mut Vec<SessionIntent>,
 ) {
-    let strip = MixerStrip::new(rect, 0);
+    let strip = MixerStrip::new(rect, StripContent::default());
     ui.painter().rect_filled(rect, 0.0, colors.surface);
     ui.painter().line_segment(
         [rect.right_top(), rect.right_bottom()],
@@ -5374,7 +5523,7 @@ mod tests {
         let runtime = SessionRuntime::new(document.tracks.len());
         let mut state = SessionViewState::default();
         let layout = SessionLayout::new(view(), 2, 0, DEFAULT_SCENES, &state);
-        let pan = MixerStrip::new(layout.mixer(0), 0)
+        let pan = MixerStrip::new(layout.mixer(0), StripContent::default())
             .pan
             .expect("the default strip is tall enough for a pan bar");
         let frames = render_path(
@@ -5402,7 +5551,7 @@ mod tests {
         let state = SessionViewState::default();
         MixerStrip::new(
             SessionLayout::new(view(), 2, 0, DEFAULT_SCENES, &state).mixer(0),
-            0,
+            StripContent::default(),
         )
     }
 
@@ -5492,7 +5641,7 @@ mod tests {
         let mut height = MIXER_HEIGHT_MIN;
         while height <= MIXER_HEIGHT_MAX {
             let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(112.0, height));
-            let strip = MixerStrip::new(rect, 0);
+            let strip = MixerStrip::new(rect, StripContent::default());
             assert!(
                 strip.fader.height() >= FADER_MIN_HEIGHT - 0.01,
                 "at {height}"
@@ -5528,7 +5677,7 @@ mod tests {
         // And the floor really is lean: something had to go.
         let floor = MixerStrip::new(
             egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(112.0, MIXER_HEIGHT_MIN)),
-            0,
+            StripContent::default(),
         );
         assert!(floor.peak.is_none() && floor.pan.is_none());
     }
@@ -5734,7 +5883,13 @@ mod tests {
             for height in [MIXER_HEIGHT_MIN, 120.0, 156.0, 240.0, MIXER_HEIGHT_MAX] {
                 let rect =
                     egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(112.0, height));
-                let strip = MixerStrip::new(rect, count);
+                let strip = MixerStrip::new(
+                    rect,
+                    StripContent {
+                        sends: count,
+                        io: false,
+                    },
+                );
                 assert_eq!(
                     strip.sends.len() + strip.sends_hidden,
                     count,
@@ -5764,7 +5919,15 @@ mod tests {
         let mut height = MIXER_HEIGHT_MIN;
         while height <= MIXER_HEIGHT_MAX {
             let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(112.0, height));
-            let rows = MixerStrip::new(rect, 8).sends.len();
+            let rows = MixerStrip::new(
+                rect,
+                StripContent {
+                    sends: 8,
+                    io: false,
+                },
+            )
+            .sends
+            .len();
             assert!(
                 rows >= previous,
                 "the send block lost a row at height {height}: {previous} then {rows}"
@@ -5782,7 +5945,13 @@ mod tests {
         let runtime = SessionRuntime::new(document.tracks.len());
         let mut state = SessionViewState::default();
         let layout = layout_of(&document, &state);
-        let strip = MixerStrip::new(layout.mixer(0), document.returns.len());
+        let strip = MixerStrip::new(
+            layout.mixer(0),
+            StripContent {
+                sends: document.returns.len(),
+                io: false,
+            },
+        );
         let row = *strip.sends.first().expect("two returns, so a send row");
 
         let opened = flattened(&render_path(
@@ -5878,7 +6047,7 @@ mod tests {
         runtime.returns = vec![TrackRuntime::default()];
         let mut state = SessionViewState::default();
         let layout = layout_of(&document, &state);
-        let strip = MixerStrip::new(layout.return_mixer(0), 0);
+        let strip = MixerStrip::new(layout.return_mixer(0), StripContent::default());
         assert!(strip.sends.is_empty() && strip.sends_hidden == 0);
 
         let muted = flattened(&render_path(
@@ -5965,6 +6134,94 @@ mod tests {
                 .is_some_and(|hold| (*hold - 0.8).abs() < 1e-5),
             "the return's hold is not where the strip looks for it"
         );
+    }
+
+    // ------------------------------------------------- input routing ---
+
+    /// A note lane has no input path in the engine at all, so it gets no
+    /// control rather than one that could only ever be silence.
+    #[test]
+    fn only_an_audio_lane_carries_an_io_row() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(112.0, 200.0));
+        let audio = MixerStrip::new(rect, StripContent { sends: 0, io: true });
+        assert!(audio.monitor.is_some() && audio.route.is_some());
+        assert!(!audio.monitor.unwrap().intersects(audio.route.unwrap()));
+        assert!(audio.rect.contains_rect(audio.route.unwrap()));
+        // Both or neither: a route you cannot hear and a monitor with
+        // nothing to hear are each half a control.
+        let note = MixerStrip::new(rect, StripContent::default());
+        assert!(note.monitor.is_none() && note.route.is_none());
+        for height in [MIXER_HEIGHT_MIN, 96.0, 130.0, MIXER_HEIGHT_MAX] {
+            let strip = MixerStrip::new(
+                egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(112.0, height)),
+                StripContent { sends: 2, io: true },
+            );
+            assert_eq!(
+                strip.monitor.is_some(),
+                strip.route.is_some(),
+                "half an I/O row at height {height}"
+            );
+        }
+    }
+
+    /// THE ROUTE CYCLES FORWARD, AND SHIFT WALKS IT BACK.
+    #[test]
+    fn the_route_cell_cycles_and_the_monitor_toggles() {
+        let mut document = document();
+        document.input_channels = 2;
+        // The second lane is the audio one; the first is notes and has
+        // no row at all.
+        let runtime = SessionRuntime::new(document.tracks.len());
+        let mut state = SessionViewState::default();
+        let layout = layout_of(&document, &state);
+        let strip = MixerStrip::new(layout.mixer(1), StripContent { sends: 0, io: true });
+        let route = strip.route.expect("an audio lane is routable");
+
+        let forward = flattened(&render_path(
+            &document,
+            &runtime,
+            &mut state,
+            &probe::click_path(route.center()),
+        ));
+        assert!(
+            forward.contains(&SessionIntent::CycleTrackInput {
+                track: 1,
+                back: false
+            }),
+            "{forward:?}"
+        );
+
+        let mut state = SessionViewState::default();
+        let back = flattened(&render_path(
+            &document,
+            &runtime,
+            &mut state,
+            &probe::click_path_holding(route.center(), egui::Modifiers::SHIFT),
+        ));
+        assert!(
+            back.contains(&SessionIntent::CycleTrackInput {
+                track: 1,
+                back: true
+            }),
+            "{back:?}"
+        );
+
+        let mut state = SessionViewState::default();
+        let monitored = flattened(&render_path(
+            &document,
+            &runtime,
+            &mut state,
+            &probe::click_path(strip.monitor.unwrap().center()),
+        ));
+        assert!(
+            monitored.contains(&SessionIntent::ToggleTrackMonitor(1)),
+            "{monitored:?}"
+        );
+        // And the note lane beside it was not routed by any of that.
+        assert!(!monitored.iter().any(|intent| matches!(
+            intent,
+            SessionIntent::ToggleTrackMonitor(0) | SessionIntent::CycleTrackInput { track: 0, .. }
+        )));
     }
 
     /// A SEAM IS NOT A BUTTON. Dragging the mixer's resize seam must

@@ -42,6 +42,12 @@ pub struct Track {
     /// that is what the engine multiplies by; the fader does the dB
     /// mapping, which is the only place the curve belongs.
     pub volume: f32,
+    /// Where this lane's LIVE signal comes from, beside its clips.
+    #[serde(default)]
+    pub input: TrackInput,
+    /// Whether that live signal is HEARD.
+    #[serde(default)]
+    pub monitor: Monitor,
     /// How much of this track each RETURN gets, as linear gain, indexed
     /// by return. Shorter than the return list is normal and means zero:
     /// adding a return must not have to walk every track to write a
@@ -84,6 +90,103 @@ pub struct Track {
     /// reason: reordering a chain must not repoint a macro.
     #[serde(default)]
     pub racks: std::collections::BTreeMap<u64, device::RackUi>,
+}
+
+/// Where a lane's LIVE signal comes from, beside its clips.
+///
+/// AUDIO ONLY, deliberately. The engine's input node reads device audio
+/// channels and there is no MIDI input path at all, so a note lane would
+/// be offered a control that could not work. Saying nothing is kinder
+/// than a routing menu whose every entry is silence.
+///
+/// Channels are stored as INDICES and not clamped on load, because the
+/// number of them belongs to whatever interface is plugged in today. A
+/// channel that is not there reads as silence at the node — see
+/// `Node::Input` — so a project written on an eight-in desk opens on a
+/// laptop quiet rather than wrong.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TrackInput {
+    /// Nothing. The lane is its clips and only its clips.
+    #[default]
+    None,
+    /// One channel, centred. The engine's input node is one channel
+    /// wide, so this is the shape everything else is built from.
+    Mono(u32),
+    /// A pair, hard left and hard right.
+    Stereo(u32, u32),
+}
+
+impl TrackInput {
+    /// The label a strip shows: `—`, `1`, `1/2`.
+    ///
+    /// One-based, because a musician counts inputs from one and the
+    /// engine counts them from zero, and exactly one of those is the
+    /// place to do the arithmetic.
+    pub fn label(self) -> String {
+        match self {
+            Self::None => "—".to_owned(),
+            Self::Mono(channel) => format!("{}", channel + 1),
+            Self::Stereo(left, right) => format!("{}/{}", left + 1, right + 1),
+        }
+    }
+
+    /// Every route an interface with `channels` inputs can offer, in the
+    /// order a click cycles through them: nothing, each channel alone,
+    /// then each adjacent pair.
+    ///
+    /// Mono before stereo because a single input is the common case —
+    /// one microphone, one instrument — and the pairs are what a stereo
+    /// synth or a pair of overheads wants.
+    pub fn routes(channels: u32) -> Vec<Self> {
+        let mut out = vec![Self::None];
+        out.extend((0..channels).map(Self::Mono));
+        out.extend(
+            (0..channels.saturating_sub(1))
+                .step_by(2)
+                .map(|left| Self::Stereo(left, left + 1)),
+        );
+        out
+    }
+
+    /// The next route after this one, wrapping. `back` walks the other
+    /// way, which is what makes a cycle usable rather than a hunt.
+    pub fn cycled(self, channels: u32, back: bool) -> Self {
+        let routes = Self::routes(channels);
+        let at = routes.iter().position(|route| *route == self).unwrap_or(0);
+        let step = if back { routes.len() - 1 } else { 1 };
+        routes[(at + step) % routes.len()]
+    }
+}
+
+/// Whether a routed input is HEARD.
+///
+/// Two states and not Live's three. The third — `Auto` — means "in while
+/// armed", and there is no record arm yet; offering it would be offering
+/// a state that behaves like one of the other two and says it is not.
+///
+/// `Off` is the default, and that is a SAFETY default rather than a
+/// tidiness one: an input wired to the speakers is a feedback loop on a
+/// laptop, so choosing a source must not by itself make a noise.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub enum Monitor {
+    #[default]
+    Off,
+    In,
+}
+
+impl Monitor {
+    pub fn hears(self) -> bool {
+        matches!(self, Self::In)
+    }
+
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Off => Self::In,
+            Self::In => Self::Off,
+        }
+    }
 }
 
 /// A sampler's file and the slices cut from it.
@@ -385,6 +488,8 @@ impl Default for Track {
             solo: false,
             pan: 0.0,
             volume: 1.0,
+            input: TrackInput::default(),
+            monitor: Monitor::default(),
             sends: Vec::new(),
             automation: TrackAutomation::default(),
             // A fresh track has no devices at all.
@@ -418,6 +523,13 @@ pub struct TrackWire {
     pub solo: bool,
     pub pan: f32,
     pub volume: f32,
+    /// Absent from a project written before routing existed, which loads
+    /// as a lane that is its clips and nothing else — exactly how it
+    /// sounded.
+    #[serde(default)]
+    pub input: TrackInput,
+    #[serde(default)]
+    pub monitor: Monitor,
     /// `#[serde(default)]` so a project written before returns existed
     /// loads with a track that sends nowhere — which is exactly how it
     /// sounded.
@@ -447,6 +559,8 @@ impl Default for TrackWire {
             solo: track.solo,
             pan: track.pan,
             volume: track.volume,
+            input: track.input,
+            monitor: track.monitor,
             sends: track.sends,
             automation: track.automation,
             chain: track.chain,
@@ -520,6 +634,8 @@ impl<'de> serde::Deserialize<'de> for Track {
             solo: wire.solo,
             pan: wire.pan,
             volume: wire.volume,
+            input: wire.input,
+            monitor: wire.monitor,
             sends: wire.sends,
             automation: wire.automation,
             chain,
