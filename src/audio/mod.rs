@@ -413,6 +413,24 @@ pub struct Engine {
     /// Retired schedules come back here so they are dropped on THIS thread,
     /// never freed inside the callback.
     trash_rx: rtrb::Consumer<Box<Schedule>>,
+    /// Captured input, waiting to be written to disk. Taken ONCE by
+    /// whoever is going to drain it — see [`Engine::take_capture`].
+    capture_rx: Option<rtrb::Consumer<f32>>,
+    /// Whether the callback is filling that ring. An atomic and not a
+    /// command, because it is one bit that must be readable by the
+    /// callback without draining anything.
+    capturing: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The transport sample the current capture began at, stamped by the
+    /// callback on the first block it captures.
+    ///
+    /// Stamped THERE and not here, because only the callback knows which
+    /// block actually caught the flag — the difference between the two
+    /// is where a take lands against the grid.
+    capture_start: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Blocks of input the callback could not fit into the ring. Nonzero
+    /// means the recording has a HOLE in it, which the user must be told
+    /// about — it is not a dropout that can be heard and shrugged off.
+    capture_overruns: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Engine {
@@ -506,6 +524,23 @@ impl Engine {
         let mut transport = Transport::new(cfg.sample_rate as f64);
         let (mut trash_tx, trash_rx) = rtrb::RingBuffer::<Box<Schedule>>::new(4);
         let mut schedule: Option<Box<Schedule>> = None;
+
+        // Captured input on its way to a file. Sized for four seconds of
+        // every input channel, which is far more backlog than a green
+        // thread that drains once per frame can build up — and it is the
+        // one place a recording can lose samples, so it is generous
+        // rather than tight.
+        let capture_slots = (info.in_channels.max(1) * cfg.sample_rate as usize * 4).max(1);
+        let (mut capture_tx, capture_rx) = rtrb::RingBuffer::<f32>::new(capture_slots);
+        let capturing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let capture_start = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let capture_overruns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let callback_capturing = std::sync::Arc::clone(&capturing);
+        let callback_capture_start = std::sync::Arc::clone(&capture_start);
+        let callback_overruns = std::sync::Arc::clone(&capture_overruns);
+        // Whether the run in progress has already stamped its start. Owned
+        // by the callback alone, so it needs no atomic.
+        let mut capture_stamped = false;
 
         let out_channels = info.out_channels.max(1);
         let slot_capacity = info.max_frames;
@@ -604,6 +639,11 @@ impl Engine {
 
                     let frames = output.len() / out_channels;
                     let in_channels = input.len().checked_div(frames).unwrap_or(0);
+                    // Where this block starts on the timeline, read BEFORE
+                    // the segment walk advances it. A capture stamps its
+                    // start from here, so a take lands against the same
+                    // clock the sequencer placed notes against.
+                    let block_position = transport.position();
 
                     // A new measurement window for this block's meters, and
                     // it happens for EVERY block — including the refused
@@ -668,7 +708,52 @@ impl Engine {
                         }
                     }
                     // The mic is deliberately NOT routed to the output — that
-                    // would be a feedback loop. Input is only metered below.
+                    // would be a feedback loop. Input is only metered below,
+                    // and captured to the ring above if someone is recording.
+
+                    // --- capture ------------------------------------------
+                    //
+                    // The whole block or none of it. A partial write would
+                    // misalign the interleave for everything after it, so a
+                    // ring with no room loses one block cleanly and says so
+                    // rather than corrupting the rest of the take.
+                    //
+                    // Nothing here allocates: `write_chunk_uninit` reserves
+                    // space that already exists and `fill_from_iter` walks
+                    // it once.
+                    if callback_capturing.load(std::sync::atomic::Ordering::Acquire) {
+                        if !capture_stamped {
+                            // The transport sample this block starts at,
+                            // which is where the take belongs on the
+                            // timeline. Taken from the segment walk's own
+                            // definition, so it is the same clock the
+                            // sequencer placed notes against.
+                            callback_capture_start
+                                .store(block_position, std::sync::atomic::Ordering::Release);
+                            capture_stamped = true;
+                        }
+                        let wanted = frames * in_channels;
+                        match capture_tx.write_chunk_uninit(wanted) {
+                            Ok(chunk) => {
+                                // Planar in, INTERLEAVED out: the writer on
+                                // the other end demultiplexes by channel,
+                                // and one frame's channels sitting together
+                                // is what lets it do that without a second
+                                // buffer.
+                                chunk.fill_from_iter((0..frames).flat_map(|frame| {
+                                    (0..in_channels).map(move |channel| {
+                                        input.get(channel * frames + frame).copied().unwrap_or(0.0)
+                                    })
+                                }));
+                            }
+                            Err(_) => {
+                                callback_overruns
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                    } else {
+                        capture_stamped = false;
+                    }
 
                     block = block.wrapping_add(1);
 
@@ -742,6 +827,10 @@ impl Engine {
             mod_tx,
             transport_tx,
             trash_rx,
+            capture_rx: Some(capture_rx),
+            capturing,
+            capture_start,
+            capture_overruns,
             last_seen_block: 0,
             last_advance: Instant::now(),
         })
@@ -749,6 +838,36 @@ impl Engine {
 
     pub fn info(&self) -> StreamInfoSnapshot {
         self.info
+    }
+
+    /// Take the capture ring's reading end. Once — a second caller gets
+    /// `None`, because two drains of one ring would each get half the
+    /// samples and neither would know.
+    pub fn take_capture(&mut self) -> Option<rtrb::Consumer<f32>> {
+        self.capture_rx.take()
+    }
+
+    /// Start or stop filling the capture ring.
+    ///
+    /// The caller must have drained whatever was left in it BEFORE
+    /// starting: the ring is a pipe, not a session, and stale samples in
+    /// front of a new take would shift the whole take late.
+    pub fn set_capturing(&self, on: bool) {
+        self.capturing
+            .store(on, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The transport sample the capture in progress began at.
+    pub fn capture_start(&self) -> u64 {
+        self.capture_start
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Blocks of input the callback could not fit into the ring since the
+    /// stream started. Nonzero means a recording has a HOLE in it.
+    pub fn capture_overruns(&self) -> u64 {
+        self.capture_overruns
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Most recent block the callback published. Cheap; call it once per frame.

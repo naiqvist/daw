@@ -58,6 +58,7 @@ use track::{
     MasterTrack, ReturnTrack, Track, TrackInput, delete_track_automation_time,
     insert_track_automation_time, sanitize_chain, split_track_automation_at,
 };
+mod record;
 mod targets;
 use targets::{
     DEVICE_TARGET_PREFIX, ParameterRegistry, ParameterSpec, TRACK_PAN_TARGET, TRACK_VOLUME_TARGET,
@@ -2535,6 +2536,13 @@ fn apply_project_doc(doc: ProjectDoc, arr: &mut Arrangement, transport: &mut Tra
     for bus in &mut fresh.returns {
         bus.chain.retain(|device| !device.kind().is_instrument());
     }
+    // An arm is a thing you are DOING, so nothing that arrives from
+    // outside carries one. The file cannot — `Track::armed` is
+    // `serde(skip)` — and clearing it here means the guarantee holds
+    // however a document was built, not only when it came off a disk.
+    for track in &mut fresh.tracks {
+        track.armed = false;
+    }
     // Nesting is input like everything else: a depth that outruns what
     // the stack above it allows names a group that is not there.
     track::sanitize_nesting(&mut fresh.tracks);
@@ -4580,6 +4588,9 @@ fn shape_hash(tracks: &[Track], master: &MasterTrack, returns: &[ReturnTrack]) -
             }
         }
         track.monitor.hash(&mut hasher);
+        // The ARM is shape under `Monitor::Auto`, where it is the whole
+        // of what decides whether an input node exists.
+        track.armed.hash(&mut hasher);
     }
     returns.len().hash(&mut hasher);
     for bus in returns {
@@ -4632,6 +4643,35 @@ fn shape_hash(tracks: &[Track], master: &MasterTrack, returns: &[ReturnTrack]) -
         }
     }
     hasher.finish()
+}
+
+/// Which lanes have something to record, and from where.
+///
+/// A free function over the lanes, so the rule can be read and tested
+/// without an app around it — it is the one decision that turns a
+/// pressed record button into files.
+///
+/// An armed lane with no input route is skipped rather than given a file
+/// of silence: being armed says what you INTEND, and the route is what
+/// makes it possible. A group is skipped because its sound is the lanes
+/// under it, which are recording themselves.
+fn record_routes(tracks: &[Track]) -> Vec<record::RecordRoute> {
+    tracks
+        .iter()
+        .enumerate()
+        .filter(|(_, track)| track.armed && track.kind == TrackKind::Audio && !track.is_group)
+        .filter_map(|(index, track)| {
+            let channels = match track.input {
+                TrackInput::None => return None,
+                TrackInput::Mono(channel) => vec![channel],
+                TrackInput::Stereo(left, right) => vec![left, right],
+            };
+            Some(record::RecordRoute {
+                track: index,
+                channels,
+            })
+        })
+        .collect()
 }
 
 fn track_audible(tracks: &[Track], i: usize) -> bool {
@@ -13124,7 +13164,7 @@ fn build_graph_spec(
                 // choice remembered, not a signal — and the default being
                 // off is what stops picking an input from putting the
                 // speakers into the microphone.
-                if track.monitor.hears() {
+                if track.monitor.hears(track.armed) {
                     push_input_sources(&mut spec, track.input, &mut sources);
                 }
                 for clip in clips.get(i).into_iter().flatten() {
@@ -13822,6 +13862,14 @@ struct App {
     /// the same only-on-change door the lanes use, and for the same
     /// reason: a fader that is not moving must not cost a letter a frame.
     master_out: Option<NodeId>,
+    /// Drains the engine's capture ring to disk. `None` until the engine
+    /// starts, because the ring belongs to a stream.
+    recorder: Option<record::Recorder>,
+    /// The transport sample the take in progress began at.
+    recording_from: u64,
+    /// Capture overruns as of the moment the take began, so the count a
+    /// finished take reports is ITS holes and not the session's.
+    recording_overruns: u64,
     /// One meter per return, in return order.
     return_meters: Vec<device::meter::Ballistics>,
     /// Every send's gain node, `[track][return]`, as the last compile
@@ -14192,6 +14240,9 @@ impl App {
             pan_ids: Vec::new(),
             sent_pan: Vec::new(),
             master_out: None,
+            recorder: None,
+            recording_from: 0,
+            recording_overruns: 0,
             return_meters: Vec::new(),
             send_ids: Vec::new(),
             return_ids: Vec::new(),
@@ -16621,9 +16672,19 @@ impl App {
                         track.folded = !track.folded;
                     }
                 }
+                // Arming is shape only under `Monitor::Auto`, where it
+                // decides whether an input node exists — but it always
+                // could be, so it always swaps. A monitor that took a
+                // second to follow the arm would be pressed twice.
+                sx::SessionIntent::ToggleTrackArm(track) => {
+                    if let Some(track) = self.arrangement.tracks.get_mut(track) {
+                        track.armed = !track.armed;
+                        self.arrangement.force_recompile = true;
+                    }
+                }
                 sx::SessionIntent::ToggleTrackMonitor(track) => {
                     if let Some(track) = self.arrangement.tracks.get_mut(track) {
-                        track.monitor = track.monitor.toggled();
+                        track.monitor = track.monitor.cycled();
                         self.arrangement.force_recompile = true;
                     }
                 }
@@ -17828,6 +17889,219 @@ impl App {
         }
     }
 
+    // ---- recording -----------------------------------------------------
+
+    /// Whether a take should be running right now.
+    ///
+    /// Rolling is `armed && playing`, exactly as the action vocabulary
+    /// says — one derived answer rather than a third piece of state that
+    /// could disagree with the two it is made of.
+    fn should_record(&self) -> bool {
+        self.transport.armed && self.transport.playing
+    }
+
+    /// Start, feed and stop the take, once per frame.
+    ///
+    /// The order is the whole of the correctness here: drain BEFORE
+    /// stopping the callback and once more after, or the tail of every
+    /// recording is left in the ring and every take ends early.
+    fn drive_recording(&mut self) {
+        let want = self.should_record();
+        let running = self
+            .recorder
+            .as_ref()
+            .is_some_and(record::Recorder::recording);
+        if want && !running {
+            self.begin_recording();
+        } else if !want && running {
+            self.finish_recording();
+        } else if running && let Some(recorder) = &mut self.recorder {
+            recorder.poll();
+        }
+    }
+
+    /// Which lanes have something to record, and from where.
+    ///
+    /// An armed lane with no input route is skipped rather than given a
+    /// file of silence — being armed says what you INTEND, and the route
+    /// is what makes it possible.
+    fn record_routes(&self) -> Vec<record::RecordRoute> {
+        record_routes(&self.arrangement.tracks)
+    }
+
+    /// Where takes are written.
+    ///
+    /// Beside the project when there is one, so a song and its
+    /// recordings move together — and in the system's temp directory
+    /// when there is not, which is said out loud rather than hidden,
+    /// because a take in a temp directory is a take you will lose.
+    fn recording_dir(&self) -> std::path::PathBuf {
+        match self.project_path.as_ref().and_then(|path| path.parent()) {
+            Some(beside) => beside.join("Recorded"),
+            None => std::env::temp_dir().join("daw-recorded"),
+        }
+    }
+
+    fn begin_recording(&mut self) {
+        let routes = self.record_routes();
+        if routes.is_empty() {
+            // Said once, and it stops the transport asking again every
+            // frame: nothing is armed, or what is armed has no input.
+            self.transport.armed = false;
+            self.notice =
+                Some("nothing to record — arm an audio lane and give it an input".to_owned());
+            return;
+        }
+        let dir = self.recording_dir();
+        let Some(recorder) = &mut self.recorder else {
+            self.transport.armed = false;
+            self.notice = Some("the engine is not running".to_owned());
+            return;
+        };
+        if let Err(why) = recorder.begin(&routes, &dir) {
+            self.transport.armed = false;
+            self.notice = Some(why.to_string());
+            return;
+        }
+        // The callback starts filling only AFTER the ring is drained and
+        // the files are open, so the first sample written is the first
+        // sample of the take.
+        if let Some(engine) = &self.engine {
+            engine.set_capturing(true);
+            self.recording_overruns = engine.capture_overruns();
+        }
+        self.recording_from = 0;
+        if self.project_path.is_none() {
+            self.notice = Some(format!(
+                "recording to {} — save the project to keep takes beside it",
+                dir.display()
+            ));
+        }
+    }
+
+    /// Close the take and put what was captured on the timeline.
+    fn finish_recording(&mut self) {
+        if !self
+            .recorder
+            .as_ref()
+            .is_some_and(record::Recorder::recording)
+        {
+            return;
+        }
+        // Where it began, and how badly. Read before the flag drops, so
+        // the stamp belongs to the run that is ending.
+        let (started_at, overruns, latency) = match &self.engine {
+            Some(engine) => (
+                engine.capture_start(),
+                engine
+                    .capture_overruns()
+                    .saturating_sub(self.recording_overruns),
+                engine.info().latency_frames.unwrap_or(0) as u64,
+            ),
+            None => (self.recording_from, 0, 0),
+        };
+        if let Some(engine) = &self.engine {
+            // The flag drops and the drain follows. A block already
+            // inside the callback when the flag flips still commits, and
+            // the poll below collects it — but one that commits AFTER
+            // that poll is lost, so a take can end up to one block short
+            // of where the transport stopped. Five milliseconds at 256
+            // frames, and closing it properly wants a generation
+            // handshake rather than a bool; the honest note is cheaper
+            // than the machinery until someone can hear the difference.
+            engine.set_capturing(false);
+        }
+        let (takes, errors, frames) = match &mut self.recorder {
+            // One last drain: whatever is in the ring at this moment is
+            // the TAIL of the take, and dropping it would clip the end
+            // off every recording by a frame's worth of backlog.
+            Some(recorder) => {
+                recorder.poll();
+                // Read BEFORE finishing, which empties the list.
+                let frames = recorder.frames();
+                let (takes, errors) = recorder.finish();
+                (takes, errors, frames)
+            }
+            None => (Vec::new(), Vec::new(), 0),
+        };
+        if let Some(why) = errors.first() {
+            self.notice = Some(why.to_string());
+        }
+        self.place_takes(takes, started_at, latency, overruns, frames);
+    }
+
+    /// Put finished takes on their lanes.
+    fn place_takes(
+        &mut self,
+        takes: Vec<record::Take>,
+        started_at: u64,
+        latency: u64,
+        overruns: u64,
+        frames: u64,
+    ) {
+        if takes.is_empty() {
+            return;
+        }
+        let rate = self
+            .engine
+            .as_ref()
+            .map_or(48_000, |engine| engine.info().sample_rate);
+        // A take arrives LATE by the round trip the player was hearing
+        // through, so it is pulled back by what the backend reports.
+        //
+        // The backend's figure, not a measured one — a loopback
+        // measurement is the honest way to get this and is its own piece
+        // of work. Stated here so the next person knows the number is a
+        // claim rather than an observation.
+        let at_sample = started_at.saturating_sub(latency);
+        let beat = at_sample as f64 / f64::from(rate.max(1)) * self.transport.bpm / 60.0;
+        let at = beat as f32;
+        let mut placed = 0;
+        for take in takes {
+            let name = take
+                .path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or("take")
+                .to_owned();
+            let source = AudioSource {
+                path: take.path.clone(),
+                sample_rate: take.sample_rate,
+                source_offset: 0,
+                source_frames: take.frames,
+                gain: 1.0,
+                looped: false,
+                file_frames: take.frames,
+                reversed: false,
+                fade_in: 0,
+                fade_out: 0,
+                fade_in_curve: 0.0,
+                fade_out_curve: 0.0,
+                envelope: Vec::new(),
+            };
+            if self
+                .arrangement
+                .insert_audio(take.track, at.max(0.0), name, source, self.transport.bpm)
+                .is_some()
+            {
+                placed += 1;
+            }
+        }
+        if placed > 0 {
+            self.arrangement.force_recompile = true;
+            // A hole is not a dropout to shrug off: the file is missing
+            // samples and the take after the hole is early. Say so.
+            let seconds = frames as f64 / f64::from(rate.max(1));
+            self.notice = Some(if overruns > 0 {
+                format!(
+                    "recorded {placed} take(s), {seconds:.1}s at beat {at:.2} — {overruns} block(s) were LOST, the audio has holes"
+                )
+            } else {
+                format!("recorded {placed} take(s), {seconds:.1}s at beat {at:.2}")
+            });
+        }
+    }
+
     /// How many hardware inputs there are to route from.
     ///
     /// Zero when the engine is off, and that is the honest answer rather
@@ -17905,6 +18179,14 @@ impl App {
         match Engine::start(self.engine_config()) {
             Ok(mut engine) => {
                 engine.transport(TransportCmd::SetTempo(self.transport.bpm));
+                // The capture ring belongs to this stream and is taken
+                // once. A recorder made here dies with the stream, which
+                // is right: a take cannot outlive the clock it was
+                // stamped against.
+                let info = engine.info();
+                self.recorder = engine
+                    .take_capture()
+                    .map(|ring| record::Recorder::new(ring, info.in_channels, info.sample_rate));
                 self.engine = Some(engine);
                 self.notice = None;
                 self.sent_loop = None;
@@ -17917,6 +18199,11 @@ impl App {
     /// Close the stream. Dropping the Engine stops it; the transport mirror
     /// halts so the stand-in clock does not sprint off from where audio died.
     fn stop_engine(&mut self) {
+        // Close the take before the stream goes: a half-written wav with
+        // no header is not a recording, and the ring is about to be
+        // dropped along with everything still in it.
+        self.finish_recording();
+        self.recorder = None;
         self.engine = None;
         self.hud = None;
         self.device_nodes.clear();
@@ -20239,6 +20526,10 @@ impl eframe::App for App {
                 engine.transport(TransportCmd::Stop);
             }
         }
+        // BEFORE the engine sync, so a take that just ended has its clips
+        // on the timeline in time for the recompile it asks for. After,
+        // the new audio would sit silent until the next frame.
+        self.drive_recording();
         self.sync_engine();
 
         // History last, after every edit path this frame has run. A gesture
@@ -28289,6 +28580,115 @@ mod tests {
                 .iter()
                 .all(|track| !track.is_group && track.depth == 0)
         );
+    }
+
+    // ---------------------------------------------------- recording ---
+
+    /// WHAT IS ARMED IS NOT THE SAME AS WHAT CAN BE RECORDED.
+    ///
+    /// The rule that turns a pressed record button into files, and every
+    /// clause of it is a lane somebody would otherwise get an empty take
+    /// for: a note lane has no input path, a group's sound is the lanes
+    /// under it, and an armed lane with no route has said what it INTENDS
+    /// without saying from where.
+    #[test]
+    fn only_an_armed_audio_lane_with_a_route_records() {
+        let mut a = Arrangement::default();
+        while a.tracks.len() < 5 {
+            a.add_track(TrackKind::Audio);
+        }
+        // A note lane, armed and routed: no input path exists for one.
+        a.tracks[0].kind = TrackKind::Midi;
+        a.tracks[0].armed = true;
+        a.tracks[0].input = TrackInput::Mono(0);
+        // Armed, no route.
+        a.tracks[1].kind = TrackKind::Audio;
+        a.tracks[1].armed = true;
+        // Routed, not armed.
+        a.tracks[2].kind = TrackKind::Audio;
+        a.tracks[2].input = TrackInput::Mono(1);
+        // Both, and stereo.
+        a.tracks[3].kind = TrackKind::Audio;
+        a.tracks[3].armed = true;
+        a.tracks[3].input = TrackInput::Stereo(2, 3);
+        // A group, armed and routed.
+        a.tracks[4].kind = TrackKind::Audio;
+        a.tracks[4].is_group = true;
+        a.tracks[4].armed = true;
+        a.tracks[4].input = TrackInput::Mono(0);
+
+        assert_eq!(
+            record_routes(&a.tracks),
+            vec![record::RecordRoute {
+                track: 3,
+                channels: vec![2, 3],
+            }]
+        );
+
+        // And a mono route is one channel, in the engine's numbering.
+        a.tracks[2].armed = true;
+        let routes = record_routes(&a.tracks);
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0].channels, vec![1]);
+    }
+
+    /// AN ARM IS NOT SAVED WITH THE SONG.
+    ///
+    /// An arm is a thing you are doing right now. A project that opened
+    /// with three lanes live and listening could start recording over
+    /// itself before anybody looked at it.
+    #[test]
+    fn an_arm_does_not_survive_the_disk() {
+        let mut arr = Arrangement::default();
+        arr.tracks[0].armed = true;
+        arr.tracks[0].input = TrackInput::Mono(0);
+        arr.tracks[0].monitor = crate::track::Monitor::Auto;
+        // Through the FILE, not just through the struct: the arm's
+        // absence is a serde promise, and only a round trip that
+        // actually writes and reads can hold it to one.
+        let text = ron::ser::to_string_pretty(
+            &project_doc(&arr, &Transport::default()),
+            ron::ser::PrettyConfig::default(),
+        )
+        .unwrap();
+        assert!(!text.contains("armed"), "the arm reached the file");
+        let read: ProjectDoc = ron::from_str(&text).unwrap();
+        let mut back = Arrangement::default();
+        let mut transport = Transport::default();
+        apply_project_doc(read, &mut back, &mut transport);
+        assert!(!back.tracks[0].armed, "the song opened armed");
+        // The route and the monitor DO survive: those are how the lane
+        // is set up, not what it is doing.
+        assert_eq!(back.tracks[0].input, TrackInput::Mono(0));
+        assert_eq!(back.tracks[0].monitor, crate::track::Monitor::Auto);
+    }
+
+    /// AUTO IS WHAT MAKES ARMING ONE GESTURE.
+    ///
+    /// Under `Auto` the arm is the whole of what decides whether an input
+    /// node exists — so it is graph shape, and disarming has to take the
+    /// monitoring away with it or the room stays live.
+    #[test]
+    fn an_auto_monitor_follows_the_arm_into_the_graph() {
+        let mut a = Arrangement::default();
+        a.add_track(TrackKind::Audio);
+        let lane = a.tracks.len() - 1;
+        a.tracks[lane].input = TrackInput::Mono(1);
+        a.tracks[lane].monitor = crate::track::Monitor::Auto;
+
+        let (spec, _) = build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
+        assert!(inputs(&spec).is_empty(), "an unarmed lane was listening");
+        let quiet = shape_hash(&a.tracks, &a.master, &a.returns);
+
+        a.tracks[lane].armed = true;
+        let (spec, _) = build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
+        assert_eq!(inputs(&spec), vec![1], "arming did not open the input");
+        assert_ne!(
+            shape_hash(&a.tracks, &a.master, &a.returns),
+            quiet,
+            "the arm must swap the schedule, not wait for a debounce"
+        );
+        assert!(spec.compile(48_000, 256).is_ok());
     }
 
     /// A FOLD HIDES LANES; IT DOES NOT SILENCE THEM.

@@ -78,6 +78,13 @@ pub struct SessionTrack {
     pub input: String,
     #[serde(default)]
     pub monitoring: bool,
+    /// What the monitor button says: the state's own label, so the view
+    /// never has to know how many states there are.
+    #[serde(default)]
+    pub monitor: String,
+    /// Armed to record.
+    #[serde(default)]
+    pub armed: bool,
     /// How much of this track each return gets, in return order. Shorter
     /// than the return list means zero, exactly as the project's own
     /// send list does: adding a return must not have to write a silence
@@ -101,6 +108,8 @@ impl Default for SessionTrack {
             depth: 0,
             input: "—".to_owned(),
             monitoring: false,
+            monitor: "IN".to_owned(),
+            armed: false,
             sends: Vec::new(),
         }
     }
@@ -1508,6 +1517,8 @@ pub enum SessionIntent {
         track: usize,
         back: bool,
     },
+    ToggleTrackArm(usize),
+    /// Step the monitor: off, in, auto.
     ToggleTrackMonitor(usize),
     /// Open or close a group. Not a mute: folding hides lanes and the
     /// schedule keeps playing them.
@@ -3007,13 +3018,19 @@ pub struct StripContent {
     pub sends: usize,
     /// Whether this lane can be routed at all. Audio lanes can; a note
     /// lane has no input path, so it is offered no control rather than a
-    /// dead one.
+    /// dead one. The arm rides the same answer: a lane with no input to
+    /// route has nothing to record either.
     pub io: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MixerStrip {
     pub rect: egui::Rect,
+    /// The arm, first in the row and only on a lane that can record.
+    /// First because it is the one control here that WRITES something:
+    /// the eye should meet it before the two that only change what is
+    /// heard.
+    pub arm: Option<egui::Rect>,
     pub mute: egui::Rect,
     pub solo: egui::Rect,
     pub pan: Option<egui::Rect>,
@@ -3069,13 +3086,20 @@ impl MixerStrip {
             0
         };
 
-        let row_width = TRACK_BUTTON_WIDTH * 2.0 + 4.0;
+        let buttons = if io { 3.0 } else { 2.0 };
+        let row_width = TRACK_BUTTON_WIDTH * buttons + 4.0 * (buttons - 1.0);
         let mut top = rect.top() + STRIP_PAD_Y;
-        let mute = egui::Rect::from_min_size(
+        let first = egui::Rect::from_min_size(
             egui::pos2(rect.center().x - row_width * 0.5, top),
             egui::vec2(TRACK_BUTTON_WIDTH, TRACK_BUTTON_HEIGHT),
         );
-        let solo = mute.translate(egui::vec2(TRACK_BUTTON_WIDTH + 4.0, 0.0));
+        let step = egui::vec2(TRACK_BUTTON_WIDTH + 4.0, 0.0);
+        let (arm, mute) = if io {
+            (Some(first), first.translate(step))
+        } else {
+            (None, first)
+        };
+        let solo = mute.translate(step);
         top += TRACK_BUTTON_HEIGHT + STRIP_GAP;
         // The I/O row sits at the TOP, under the buttons, which is where
         // a console puts it and where a signal actually enters: read the
@@ -3163,6 +3187,7 @@ impl MixerStrip {
 
         Self {
             rect,
+            arm,
             mute,
             solo,
             pan,
@@ -3572,7 +3597,26 @@ fn paint_mixer(
         );
     }
 
-    // ---- mute and solo.
+    // ---- arm, mute and solo.
+    if let Some(rect) = strip.arm {
+        let arm = control_button(
+            ui,
+            rect,
+            ui.id().with(("session_next_arm", track_index)),
+            "●",
+            track.armed,
+            colors.danger,
+            colors,
+        );
+        if arm.clicked() {
+            intents.push(SessionIntent::ToggleTrackArm(track_index));
+        }
+        arm.on_hover_text(if track.armed {
+            "disarm — this lane stops recording when the transport rolls"
+        } else {
+            "arm to record · the transport's record button starts the take"
+        });
+    }
     let mute = control_button(
         ui,
         strip.mute,
@@ -3618,7 +3662,7 @@ fn paint_mixer(
             ui,
             button,
             ui.id().with(("session_next_monitor", track_index)),
-            "IN",
+            &track.monitor,
             track.monitoring,
             colors.ok,
             colors,
@@ -3626,13 +3670,11 @@ fn paint_mixer(
         if monitor.clicked() {
             intents.push(SessionIntent::ToggleTrackMonitor(track_index));
         }
-        monitor.on_hover_text(if track.monitoring {
-            "stop monitoring this input"
-        } else {
-            // Said before it happens, because the thing it can do is
-            // put the speakers into the microphone.
-            "hear this input through the lane's chain — headphones first"
-        });
+        // Said before it happens, because the thing this can do is put
+        // the speakers into the microphone.
+        monitor.on_hover_text(
+            "monitor: off, in, auto · auto hears the input while the lane is armed · headphones first",
+        );
 
         let response = ui.interact(
             route,
@@ -6348,6 +6390,89 @@ mod tests {
                 .is_some_and(|hold| (*hold - 0.8).abs() < 1e-5),
             "the return's hold is not where the strip looks for it"
         );
+    }
+
+    // ----------------------------------------------------- recording ---
+
+    /// THE ARM IS ONLY ON A LANE THAT COULD RECORD, AND IT IS ITS OWN
+    /// BUTTON.
+    ///
+    /// It sits first in a row it now shares with mute and solo, which is
+    /// exactly the arrangement that lets a press land on the wrong one —
+    /// so the press is tested, not the layout's intention.
+    #[test]
+    fn the_arm_is_its_own_button_and_only_where_it_could_work() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(112.0, 200.0));
+        let audio = MixerStrip::new(rect, StripContent { sends: 0, io: true });
+        let arm = audio.arm.expect("an audio lane can be armed");
+        assert!(!arm.intersects(audio.mute) && !arm.intersects(audio.solo));
+        assert!(!audio.mute.intersects(audio.solo));
+        assert!(audio.rect.contains_rect(arm));
+        // A note lane has no input path, so nothing to arm.
+        assert!(MixerStrip::new(rect, StripContent::default()).arm.is_none());
+
+        // The audio lane in the fixture is the second one.
+        let mut document = document();
+        document.input_channels = 2;
+        let runtime = SessionRuntime::new(document.tracks.len());
+        let mut state = SessionViewState::default();
+        let layout = layout_of(&document, &state);
+        let strip = MixerStrip::new(layout.mixer(1), StripContent { sends: 0, io: true });
+        let intents = flattened(&render_path(
+            &document,
+            &runtime,
+            &mut state,
+            &probe::click_path(strip.arm.unwrap().center()),
+        ));
+        assert!(
+            intents.contains(&SessionIntent::ToggleTrackArm(1)),
+            "{intents:?}"
+        );
+        // The neighbours it shares a row with stayed out of it.
+        assert!(!intents.iter().any(|intent| matches!(
+            intent,
+            SessionIntent::ToggleTrackMute(_)
+                | SessionIntent::ToggleTrackSolo(_)
+                | SessionIntent::SoloTrackExclusive(_)
+        )));
+    }
+
+    /// Adding the arm must not have moved mute or solo off their own
+    /// targets — the row grew from two buttons to three, and every strip
+    /// test written before this one assumed the old centring.
+    #[test]
+    fn mute_and_solo_still_answer_on_an_armable_lane() {
+        let mut document = document();
+        document.input_channels = 2;
+        let runtime = SessionRuntime::new(document.tracks.len());
+        let mut state = SessionViewState::default();
+        let layout = layout_of(&document, &state);
+        let strip = MixerStrip::new(layout.mixer(1), StripContent { sends: 0, io: true });
+
+        let muted = flattened(&render_path(
+            &document,
+            &runtime,
+            &mut state,
+            &probe::click_path(strip.mute.center()),
+        ));
+        assert!(
+            muted.contains(&SessionIntent::ToggleTrackMute(1)),
+            "{muted:?}"
+        );
+        assert!(!muted.contains(&SessionIntent::ToggleTrackArm(1)));
+
+        let mut state = SessionViewState::default();
+        let soloed = flattened(&render_path(
+            &document,
+            &runtime,
+            &mut state,
+            &probe::click_path(strip.solo.center()),
+        ));
+        assert!(
+            soloed.contains(&SessionIntent::SoloTrackExclusive(1)),
+            "{soloed:?}"
+        );
+        assert!(!soloed.contains(&SessionIntent::ToggleTrackArm(1)));
     }
 
     // --------------------------------------------------------- folds ---

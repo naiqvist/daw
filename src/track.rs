@@ -75,6 +75,16 @@ pub struct Track {
     /// Whether that live signal is HEARD.
     #[serde(default)]
     pub monitor: Monitor,
+    /// Armed to RECORD. What decides whether a rolling transport writes
+    /// this lane's input to a file — and, under `Monitor::Auto`, whether
+    /// it is heard at all.
+    ///
+    /// Not saved with the project. An arm is a thing you are doing right
+    /// now, and a song that opened with three lanes live and listening
+    /// would be a song that could start recording over itself before
+    /// anybody looked at it.
+    #[serde(skip)]
+    pub armed: bool,
     /// How much of this track each RETURN gets, as linear gain, indexed
     /// by return. Shorter than the return list is normal and means zero:
     /// adding a return must not have to walk every track to write a
@@ -187,32 +197,90 @@ impl TrackInput {
 
 /// Whether a routed input is HEARD.
 ///
-/// Two states and not Live's three. The third — `Auto` — means "in while
-/// armed", and there is no record arm yet; offering it would be offering
-/// a state that behaves like one of the other two and says it is not.
-///
 /// `Off` is the default, and that is a SAFETY default rather than a
 /// tidiness one: an input wired to the speakers is a feedback loop on a
 /// laptop, so choosing a source must not by itself make a noise.
+///
+/// `Auto` is the one that makes arming a single gesture — arm the lane
+/// and you hear what you are about to record, disarm it and the room
+/// goes quiet again without a second switch to remember.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
 )]
 pub enum Monitor {
     #[default]
     Off,
+    /// Heard whenever there is a route, armed or not.
     In,
+    /// Heard while the lane is armed.
+    Auto,
 }
 
 impl Monitor {
-    pub fn hears(self) -> bool {
-        matches!(self, Self::In)
+    /// Does this lane hear its input right now?
+    ///
+    /// Takes the arm rather than reading it from a track, so the rule
+    /// stays a property of the three states and can be tested without
+    /// building a lane around it.
+    pub fn hears(self, armed: bool) -> bool {
+        match self {
+            Self::Off => false,
+            Self::In => true,
+            Self::Auto => armed,
+        }
     }
 
-    pub fn toggled(self) -> Self {
+    /// The next state, wrapping. Off, in, auto — quietest first, so a
+    /// press from the default is always toward hearing something.
+    pub fn cycled(self) -> Self {
         match self {
             Self::Off => Self::In,
-            Self::In => Self::Off,
+            Self::In => Self::Auto,
+            Self::Auto => Self::Off,
         }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "IN",
+            Self::In => "IN",
+            Self::Auto => "AU",
+        }
+    }
+}
+
+#[cfg(test)]
+mod monitor_tests {
+    use super::*;
+
+    /// THE THREE STATES, AND THE ONE THAT READS THE ARM.
+    ///
+    /// `Auto` is what makes arming a single gesture — arm the lane and
+    /// you hear what you are about to record, disarm it and the room
+    /// goes quiet without a second switch to remember. `Off` staying
+    /// silent under an arm is the safety half of the same rule.
+    #[test]
+    fn a_monitor_hears_by_state_and_by_arm() {
+        assert!(!Monitor::Off.hears(false));
+        assert!(!Monitor::Off.hears(true), "off means off, armed or not");
+        assert!(Monitor::In.hears(false), "in means in, armed or not");
+        assert!(Monitor::In.hears(true));
+        assert!(!Monitor::Auto.hears(false));
+        assert!(Monitor::Auto.hears(true));
+    }
+
+    /// The cycle starts quiet and comes back to quiet, so a press from
+    /// the default is always toward hearing something.
+    #[test]
+    fn the_monitor_cycle_starts_and_ends_silent() {
+        assert_eq!(Monitor::default(), Monitor::Off);
+        let mut seen = Vec::new();
+        let mut state = Monitor::default();
+        for _ in 0..3 {
+            state = state.cycled();
+            seen.push(state);
+        }
+        assert_eq!(seen, vec![Monitor::In, Monitor::Auto, Monitor::Off]);
     }
 }
 
@@ -657,6 +725,7 @@ impl Default for Track {
             depth: 0,
             input: TrackInput::default(),
             monitor: Monitor::default(),
+            armed: false,
             sends: Vec::new(),
             automation: TrackAutomation::default(),
             // A fresh track has no devices at all.
@@ -817,6 +886,8 @@ impl<'de> serde::Deserialize<'de> for Track {
             depth: wire.depth,
             input: wire.input,
             monitor: wire.monitor,
+            // Deliberately not from the file — see `Track::armed`.
+            armed: false,
             sends: wire.sends,
             automation: wire.automation,
             chain,
