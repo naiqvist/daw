@@ -55,8 +55,8 @@ mod bar;
 use automation::TrackAutomation;
 mod track;
 use track::{
-    MasterTrack, Track, delete_track_automation_time, insert_track_automation_time, sanitize_chain,
-    split_track_automation_at,
+    MasterTrack, ReturnTrack, Track, delete_track_automation_time, insert_track_automation_time,
+    sanitize_chain, split_track_automation_at,
 };
 mod targets;
 use targets::{
@@ -2125,6 +2125,14 @@ struct Arrangement {
     /// The bus they all land on. One, always present, never in the stack —
     /// see [`MasterTrack`] on why it is not simply the last track.
     master: MasterTrack,
+    /// The return buses, in send order: `sends[0]` feeds `returns[0]`,
+    /// which is the one a strip labels `A`.
+    ///
+    /// A project starts with NONE. A reverb bus nobody asked for is a
+    /// node in every compile and a row in every strip, and the send that
+    /// would justify it is at zero — so the first one is made when it is
+    /// wanted, and the vocabulary is there the moment it is.
+    returns: Vec<ReturnTrack>,
     /// Whether the MASTER is the thing being edited, rather than the
     /// selected lane. View state, not saved: reopening a song should show
     /// you the song, not whichever strip you were poking at when you shut
@@ -2335,6 +2343,11 @@ struct ProjectDoc {
     /// what such a project sounded like.
     #[serde(default)]
     master: MasterTrack,
+    /// Absent in a file written before returns existed, which loads as a
+    /// project with none — and every track's `sends` is absent too, so
+    /// nothing is pointing at a bus that is not there.
+    #[serde(default)]
+    returns: Vec<ReturnTrack>,
     clips: Vec<Vec<Clip>>,
     slots: Vec<Vec<Option<Clip>>>,
     scenes: Vec<Scene>,
@@ -2372,6 +2385,7 @@ fn project_doc(arr: &Arrangement, transport: &Transport) -> ProjectDoc {
         grid: arr.grid,
         tracks: arr.tracks.clone(),
         master: arr.master.clone(),
+        returns: arr.returns.clone(),
         clips: arr.clips.clone(),
         slots: arr.session.slots.clone(),
         scenes: arr.session.scenes.clone(),
@@ -2484,6 +2498,24 @@ fn apply_project_doc(doc: ProjectDoc, arr: &mut Arrangement, transport: &mut Tra
         .master
         .chain
         .retain(|device| !device.kind().is_instrument());
+    // Returns are input too, and in three ways: a file may carry more
+    // than the letters can name, an instrument may have been hand-edited
+    // onto a bus, and a track's send list may point past the end of the
+    // return list. All three are trimmed here rather than guarded at
+    // every reader — the last one especially, since a send with no
+    // return is not an error, it is simply nothing.
+    fresh.returns = doc.returns;
+    fresh.returns.truncate(ReturnTrack::MAX);
+    for bus in &mut fresh.returns {
+        bus.chain.retain(|device| !device.kind().is_instrument());
+    }
+    let returns = fresh.returns.len();
+    for track in &mut fresh.tracks {
+        track.sends.truncate(returns);
+        for send in &mut track.sends {
+            *send = send.clamp(0.0, 1.0);
+        }
+    }
     let sane = |clip: &Clip| clip.len > 0.0 && clip.start >= 0.0 && clip.start.is_finite();
     fresh.clips = doc.clips;
     fresh.clips.resize(tracks, Vec::new());
@@ -2715,6 +2747,7 @@ impl Default for Arrangement {
                 })
                 .collect(),
             master: MasterTrack::default(),
+            returns: Vec::new(),
             master_selected: false,
             grid: GRID_DEFAULT,
             selected: None,
@@ -4292,9 +4325,28 @@ fn place_clip(track: &[Clip], at: f32, len: f32) -> (f32, usize) {
 ///
 /// PAN IS NOT IN HERE, deliberately: every instrument track always carries
 /// a Pan node, so pan rides a letter and a knob drag costs nothing.
-fn shape_hash(tracks: &[Track], master: &MasterTrack) -> u64 {
+fn shape_hash(tracks: &[Track], master: &MasterTrack, returns: &[ReturnTrack]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // A return is a bus of nodes, and its MUTE removes the bus entirely
+    // along with every send that fed it — so both are shape. Its level
+    // and pan are not, for the reason a lane's are not: they ride the
+    // output stage every return always has.
+    //
+    // A SEND LEVEL IS NOT SHAPE EITHER, and that is the whole point of
+    // compiling a gain node for every pair: opening a send from silence
+    // is a letter, so a drag from zero costs no recompile.
+    returns.len().hash(&mut hasher);
+    for bus in returns {
+        bus.mute.hash(&mut hasher);
+        bus.chain.len().hash(&mut hasher);
+        for instance in &bus.chain {
+            instance.id.hash(&mut hasher);
+            std::mem::discriminant(&instance.state).hash(&mut hasher);
+            instance.bypass.hash(&mut hasher);
+            instance.parent.hash(&mut hasher);
+        }
+    }
     // The master's chain is shape for exactly the reasons a lane's is: its
     // devices are nodes, and no letter can add one. Its LEVEL is not —
     // that rides `sync_master`, like every other fader.
@@ -12203,6 +12255,18 @@ struct GraphNodes {
     /// the clip editor's gain ride a letter instead of a recompile.
     audio_clips: HashMap<u64, NodeId>,
     pans: Vec<Option<NodeId>>,
+    /// Every send's gain node, `[track][return]`. `None` where the track
+    /// did not reach the schedule or the return is muted — the same
+    /// meaning `pans` gives it, and the same reason: a letter addressed
+    /// to a node that was never compiled has nowhere to go.
+    ///
+    /// A node PER PAIR, at gain zero as readily as at unity, and that is
+    /// the deliberate cost: a send that only existed once it was open
+    /// could not be opened by a drag, only by a recompile per frame of
+    /// one.
+    sends: Vec<Vec<Option<NodeId>>>,
+    /// Each return's output stage, in return order.
+    returns: Vec<Option<NodeId>>,
     /// The master's output stage — the fader every lane arrives at. One,
     /// not a vec, because there is one master.
     master_out: Option<NodeId>,
@@ -12255,6 +12319,7 @@ fn mix_sources(spec: &mut GraphSpec, mut sources: Vec<NodeId>) -> Option<NodeId>
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ChainOwner {
     Track(usize),
+    Return(usize),
     Master,
 }
 
@@ -12472,6 +12537,7 @@ fn compile_chain(
 fn build_graph_spec(
     tracks: &[Track],
     bus: &MasterTrack,
+    returns: &[ReturnTrack],
     clips: &[Vec<Clip>],
     loop_len_beats: Option<f64>,
     metronome: bool,
@@ -12482,6 +12548,16 @@ fn build_graph_spec(
     // track, every send return, and the click.
     let mut master: Vec<NodeId> = Vec::new();
     let mut pan_ids: Vec<Option<NodeId>> = vec![None; tracks.len()];
+    // The return buses come FIRST, because a send needs somewhere to
+    // land before the lane that feeds it is built. A muted return is not
+    // built at all — the same rule a muted track gets, and for the same
+    // reason: the graph should be as small as what is actually sounding.
+    let return_buses: Vec<Option<NodeId>> = returns
+        .iter()
+        .map(|bus| (!bus.mute).then(|| spec.push(NodeSpec::Mixer { gain: 1.0 })))
+        .collect();
+    let mut send_ids: Vec<Vec<Option<NodeId>>> = vec![vec![None; returns.len()]; tracks.len()];
+    let mut return_ids: Vec<Option<NodeId>> = vec![None; returns.len()];
     let mut devices: HashMap<u64, NodeId> = HashMap::new();
     let mut readouts: HashMap<u64, usize> = HashMap::new();
     let mut audio_clips: HashMap<u64, NodeId> = HashMap::new();
@@ -12697,6 +12773,29 @@ fn build_graph_spec(
         spec.connect(tail, pan);
         master.push(pan);
         pan_ids[i] = Some(pan);
+        // The sends, tapped POST-FADER off the output stage — the tap
+        // every console defaults to and the only one that behaves the
+        // way a mixed track should: pull the fader down and the reverb
+        // goes with it, instead of a tail hanging on over a track that
+        // has left.
+        //
+        // A gain node per pair, always, even at zero. That is what lets
+        // a send be OPENED by a drag: the node has an address, so moving
+        // the control is a param letter, and the alternative is a graph
+        // swap per frame of the same gesture.
+        for (index, bus) in return_buses.iter().enumerate() {
+            let Some(bus) = *bus else { continue };
+            let level = track
+                .sends
+                .get(index)
+                .copied()
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
+            let send = spec.push(NodeSpec::Mixer { gain: level });
+            spec.connect(pan, send);
+            spec.connect(send, bus);
+            send_ids[i][index] = Some(send);
+        }
         // The sends, now that there is an output stage to tap. POST-FADER,
         // which is the tap every console defaults to and the only one that
         // behaves the way a mixed track should: pull the fader down and its
@@ -12735,6 +12834,74 @@ fn build_graph_spec(
         // reserved above them all, so lanes stop one short of the ceiling.
         if i < MASTER_METER {
             spec.meter(i, pan);
+        }
+    }
+    // --- the returns ---------------------------------------------------
+    // Each return's own chain, then its fader, then onto the master
+    // beside the dry tracks. Compiled AFTER the lanes because that is
+    // when every send that feeds it exists; wired to buses that were
+    // made before them, because a wire does not care which end was
+    // created first.
+    //
+    // A return is built whether or not anything sends to it. That is the
+    // opposite of the rule a lane gets, and it is the right way round: a
+    // send is a live gain, so a return that only existed once a send was
+    // open could not be opened without a recompile.
+    for (index, ret) in returns.iter().enumerate() {
+        let Some(bus_node) = return_buses[index] else {
+            continue;
+        };
+        let mut auxes: Vec<(u64, EchoParams)> = Vec::new();
+        let mut tail = compile_chain(
+            &mut spec,
+            bus_node,
+            &ret.chain,
+            &mut devices,
+            &mut readouts,
+            &mut auxes,
+        );
+        // An echo's own aux on a return has nowhere further to go, so it
+        // lands beside the dry BEFORE this return's fader — exactly the
+        // shape the master gives one.
+        if !auxes.is_empty() {
+            let mut summed = vec![tail];
+            for (id, params) in auxes {
+                let echo = spec.push(NodeSpec::Echo {
+                    sync: params.sync.round().max(0.0) as u32,
+                    time_ms: params.time_ms,
+                    feedback: params.feedback,
+                    tone_hz: params.tone_hz,
+                    drive: params.drive,
+                    wow: params.wow,
+                    spread: params.spread,
+                    mix: params.mix,
+                    send: params.send,
+                });
+                spec.connect(tail, echo);
+                devices.insert(id, echo);
+                summed.push(echo);
+            }
+            if let Some(node) = mix_sources(&mut spec, summed) {
+                tail = node;
+            }
+        }
+        let out = spec.push(NodeSpec::Pan {
+            pan: ret.pan,
+            gain: ret.volume,
+        });
+        spec.connect(tail, out);
+        master.push(out);
+        return_ids[index] = Some(out);
+        // Return meters are handed out DOWNWARDS from just under the
+        // master's reserved slot, while lanes are handed out upwards
+        // from zero. The two can only meet in a project with thirty-two
+        // lanes AND eight returns, and there the return loses its
+        // reading rather than stealing a lane's — a lane that stopped
+        // metering would look broken, a return that does not is merely
+        // quiet.
+        let slot = MASTER_METER.saturating_sub(1 + index);
+        if slot > tracks.len() {
+            spec.meter(slot, out);
         }
     }
     if metronome {
@@ -12815,6 +12982,8 @@ fn build_graph_spec(
             readouts,
             audio_clips,
             pans: pan_ids,
+            sends: send_ids,
+            returns: return_ids,
             master_out: Some(master_out),
         },
     )
@@ -13195,6 +13364,16 @@ struct App {
     /// the same only-on-change door the lanes use, and for the same
     /// reason: a fader that is not moving must not cost a letter a frame.
     master_out: Option<NodeId>,
+    /// Every send's gain node, `[track][return]`, as the last compile
+    /// handed them over.
+    send_ids: Vec<Vec<Option<NodeId>>>,
+    /// Each return's output stage, in return order.
+    return_ids: Vec<Option<NodeId>>,
+    /// What was last SENT for each send and each return fader, so a still
+    /// control letters nothing. `NAN` means "never sent", since `NAN` is
+    /// equal to nothing including itself.
+    sent_send: Vec<Vec<f32>>,
+    sent_return: Vec<(f32, f32)>,
     sent_master_pan: f32,
     sent_master_volume: f32,
     /// The app's monotonic UI clock, in seconds — what free modulators run
@@ -13553,6 +13732,10 @@ impl App {
             pan_ids: Vec::new(),
             sent_pan: Vec::new(),
             master_out: None,
+            send_ids: Vec::new(),
+            return_ids: Vec::new(),
+            sent_send: Vec::new(),
+            sent_return: Vec::new(),
             sent_master_pan: f32::NAN,
             sent_master_volume: f32::NAN,
             clock_seconds: 0.0,
@@ -15035,6 +15218,7 @@ impl App {
         let (mut spec, nodes) = build_graph_spec(
             &self.arrangement.tracks,
             &self.arrangement.master,
+            &self.arrangement.returns,
             &self.arrangement.clips,
             None,
             false,
@@ -17017,7 +17201,11 @@ impl App {
     }
 
     fn shape_hash(&self) -> u64 {
-        shape_hash(&self.arrangement.tracks, &self.arrangement.master)
+        shape_hash(
+            &self.arrangement.tracks,
+            &self.arrangement.master,
+            &self.arrangement.returns,
+        )
     }
 
     /// The SHAPE of the modulation: which wires exist, what each drives,
@@ -17127,6 +17315,7 @@ impl App {
         let (mut spec, nodes) = build_graph_spec(
             &self.arrangement.tracks,
             &self.arrangement.master,
+            &self.arrangement.returns,
             &playing,
             None,
             self.transport.metronome,
@@ -17151,6 +17340,8 @@ impl App {
                         self.readout_slots = nodes.readouts;
                         self.clip_nodes = nodes.audio_clips;
                         self.pan_ids = nodes.pans;
+                        self.send_ids = nodes.sends;
+                        self.return_ids = nodes.returns;
                         self.master_out = nodes.master_out;
                         // Fresh ids: every track's pan must be re-sent, so
                         // nothing survives a swap sitting at the node's
@@ -17162,6 +17353,8 @@ impl App {
                         // longer exists.
                         self.sent_master_pan = f32::NAN;
                         self.sent_master_volume = f32::NAN;
+                        self.sent_send.clear();
+                        self.sent_return.clear();
                         self.sent_automation.clear();
                         self.compiled_clips = playing;
                         self.graph_key = (
@@ -17948,8 +18141,80 @@ impl App {
                 self.sent_volume[i] = volume;
             }
         }
+        self.sync_sends();
+        self.sync_returns();
         self.sync_master(beat);
         self.sync_device_automation(beat);
+    }
+
+    /// Every send level, through the same only-on-change door the faders
+    /// use.
+    ///
+    /// This is what the per-pair gain node bought: a send opens, closes
+    /// and rides an automation curve as a stream of letters, and the
+    /// schedule never moves. A send with no compiled node — a muted
+    /// return, a silent lane — is skipped rather than queued, because a
+    /// letter to a node that does not exist has nowhere to arrive.
+    fn sync_sends(&mut self) {
+        let tracks = self.arrangement.tracks.len();
+        let returns = self.arrangement.returns.len();
+        self.sent_send.resize(tracks, Vec::new());
+        for row in &mut self.sent_send {
+            row.resize(returns, f32::NAN);
+        }
+        for track in 0..tracks {
+            for index in 0..returns {
+                let level = self.arrangement.tracks[track]
+                    .sends
+                    .get(index)
+                    .copied()
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0);
+                if level == self.sent_send[track][index] {
+                    continue;
+                }
+                let Some(Some(node)) = self
+                    .send_ids
+                    .get(track)
+                    .and_then(|row| row.get(index))
+                    .copied()
+                else {
+                    continue;
+                };
+                let Some(engine) = &mut self.engine else {
+                    return;
+                };
+                engine.set_param(node, daw::params::mixer::GAIN, level);
+                self.sent_send[track][index] = level;
+            }
+        }
+    }
+
+    /// Each return's own fader and pan, on the same door.
+    fn sync_returns(&mut self) {
+        let returns = self.arrangement.returns.len();
+        self.sent_return.resize(returns, (f32::NAN, f32::NAN));
+        for index in 0..returns {
+            let bus = &self.arrangement.returns[index];
+            let pan = bus.pan.clamp(-1.0, 1.0);
+            let volume = bus.volume.max(0.0);
+            if (pan, volume) == self.sent_return[index] {
+                continue;
+            }
+            let Some(Some(node)) = self.return_ids.get(index).copied() else {
+                continue;
+            };
+            let Some(engine) = &mut self.engine else {
+                return;
+            };
+            if pan != self.sent_return[index].0 {
+                engine.set_param(node, daw::params::pan::PAN, pan);
+            }
+            if volume != self.sent_return[index].1 {
+                engine.set_param(node, daw::params::pan::GAIN, volume);
+            }
+            self.sent_return[index] = (pan, volume);
+        }
     }
 
     /// The master fader and pan, through the same only-on-change door the
@@ -18194,6 +18459,11 @@ impl App {
                 .tracks
                 .get_mut(track)
                 .and_then(|t| t.device_mut(device)),
+            ChainOwner::Return(bus) => self
+                .arrangement
+                .returns
+                .get_mut(bus)
+                .and_then(|bus| bus.device_mut(device)),
             ChainOwner::Master => self.arrangement.master.device_mut(device),
         }
     }
@@ -18205,6 +18475,11 @@ impl App {
                 .tracks
                 .get_mut(track)
                 .and_then(|t| t.device_mut(device)),
+            ChainOwner::Return(bus) => self
+                .arrangement
+                .returns
+                .get_mut(bus)
+                .and_then(|bus| bus.device_mut(device)),
             ChainOwner::Master => self.arrangement.master.device_mut(device),
         }) else {
             return;
@@ -18715,6 +18990,13 @@ impl eframe::App for App {
                             arrangement.master.chain.clone(),
                             arrangement.master.racks.clone(),
                         ),
+                        // A return's chain has no modulation targets for
+                        // the reason the master's has none: a `ModWire` is
+                        // addressed to a LANE, and a return is not one.
+                        Some(ChainOwner::Return(i)) => arrangement.returns.get(i).map_or_else(
+                            || (Vec::new(), Vec::new(), Default::default()),
+                            |bus| (Vec::new(), bus.chain.clone(), bus.racks.clone()),
+                        ),
                         Some(ChainOwner::Track(i)) => arrangement.tracks.get(i).map_or_else(
                             || (Vec::new(), Vec::new(), Default::default()),
                             |track| {
@@ -19133,6 +19415,11 @@ impl eframe::App for App {
                             .master
                             .racks
                             .insert(*instance, rack.clone());
+                    }
+                    ChainOwner::Return(i) => {
+                        if let Some(bus) = self.arrangement.returns.get_mut(i) {
+                            bus.racks.insert(*instance, rack.clone());
+                        }
                     }
                     ChainOwner::Track(i) => {
                         if let Some(track) = self.arrangement.tracks.get_mut(i) {
@@ -26070,8 +26357,14 @@ mod tests {
         }
 
         for (metronome, extra) in [(false, 0), (true, 1)] {
-            let (spec, nodes) =
-                build_graph_spec(&a.tracks, &a.master, &a.clips, Some(8.0), metronome);
+            let (spec, nodes) = build_graph_spec(
+                &a.tracks,
+                &a.master,
+                &a.returns,
+                &a.clips,
+                Some(8.0),
+                metronome,
+            );
             let seqs: Vec<Option<NodeId>> = a
                 .tracks
                 .iter()
@@ -26135,7 +26428,8 @@ mod tests {
 
         // A fresh session has no instrument loaded either, so no track becomes a
         // node — the graph is empty and still compiles.
-        let (spec, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
+        let (spec, nodes) =
+            build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
         assert!(nodes.devices.is_empty(), "no device, no node");
         assert!(spec.compile(48_000, 256).is_ok());
 
@@ -26143,12 +26437,13 @@ mod tests {
         for i in 0..a.tracks.len() {
             load(&mut a, i, DeviceKind::SineSynth);
         }
-        let (spec, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
+        let (spec, nodes) =
+            build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
         assert_eq!(nodes.devices.len(), TRACK_COUNT);
         assert!(spec.compile(48_000, 256).is_ok());
 
         // And so is one with no tracks at all.
-        let (spec, nodes) = build_graph_spec(&[], &MasterTrack::default(), &[], None, true);
+        let (spec, nodes) = build_graph_spec(&[], &MasterTrack::default(), &[], &[], None, true);
         assert!(nodes.devices.is_empty());
         assert!(spec.compile(48_000, 256).is_ok());
     }
@@ -26173,7 +26468,7 @@ mod tests {
 
         // Only that track compiles to a node, and it is addressed by the
         // instance's id, which is what a letter carries.
-        let (_, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
+        let (_, nodes) = build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
         assert_eq!(nodes.devices.len(), 1);
         assert!(nodes.devices.contains_key(&id));
     }
@@ -26761,11 +27056,11 @@ mod tests {
         let ids: Vec<u64> = (0..a.tracks.len())
             .map(|i| load(&mut a, i, DeviceKind::SineSynth))
             .collect();
-        let (_, all) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
+        let (_, all) = build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
         assert_eq!(all.devices.len(), TRACK_COUNT);
 
         a.tracks[1].mute = true;
-        let (_, muted) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
+        let (_, muted) = build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
         assert!(
             !muted.devices.contains_key(&ids[1]),
             "a muted track makes no node"
@@ -26776,7 +27071,7 @@ mod tests {
         // Solo drops everything else the same way.
         a.tracks[1].mute = false;
         a.tracks[0].solo = true;
-        let (_, soloed) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
+        let (_, soloed) = build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
         assert!(soloed.devices.contains_key(&ids[0]));
         assert_eq!(soloed.devices.len(), 1);
     }
@@ -26789,7 +27084,7 @@ mod tests {
         let i = a.add_track(TrackKind::Audio);
         // Even with an instrument somehow in its chain, the kind decides.
         load(&mut a, i, DeviceKind::SineSynth);
-        let (_, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
+        let (_, nodes) = build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
         assert!(nodes.devices.is_empty(), "no instrument on an audio track");
         assert!(nodes.pans[i].is_none(), "an empty audio lane is absent");
 
@@ -26812,7 +27107,8 @@ mod tests {
             .unwrap();
         assert_eq!(a.clips[i][0].start, 2.0);
         assert_eq!(a.clips[i][0].len, 2.0, "one second is two beats at 120");
-        let (spec, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
+        let (spec, nodes) =
+            build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
         assert!(nodes.devices.is_empty());
         assert!(nodes.pans[i].is_some());
         assert_eq!(
@@ -26826,6 +27122,234 @@ mod tests {
         assert!(TrackKind::Midi.takes_instrument());
     }
 
+    // ------------------------------------------------ sends and returns ---
+
+    /// An arrangement with `returns` returns, every track voiced.
+    fn with_returns(returns: usize) -> Arrangement {
+        let mut a = Arrangement {
+            returns: (0..returns).map(ReturnTrack::new).collect(),
+            ..Arrangement::default()
+        };
+        for i in 0..a.tracks.len() {
+            load(&mut a, i, DeviceKind::SineSynth);
+        }
+        a
+    }
+
+    /// Who feeds `node`, by id.
+    fn feeders(spec: &GraphSpec, node: NodeId) -> Vec<NodeId> {
+        spec.wires()
+            .iter()
+            .filter(|(_, to)| *to == node)
+            .map(|(from, _)| *from)
+            .collect()
+    }
+
+    fn fed_by(spec: &GraphSpec, node: NodeId) -> Vec<NodeId> {
+        spec.wires()
+            .iter()
+            .filter(|(from, _)| *from == node)
+            .map(|(_, to)| *to)
+            .collect()
+    }
+
+    /// A SEND IS POST-FADER, AND IT LANDS ON ITS RETURN.
+    ///
+    /// Both halves in one test because they are one claim: the send hangs
+    /// off the track's output stage — the node the fader and the pan live
+    /// on — and its other end is the return's bus. Tapped pre-fader
+    /// instead, pulling a track down would leave its reverb hanging over
+    /// a track that had left, which is the bug this shape prevents.
+    #[test]
+    fn a_send_is_post_fader_and_lands_on_its_return() {
+        let mut a = with_returns(1);
+        a.tracks[0].sends = vec![0.5];
+        let (spec, nodes) =
+            build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
+
+        let pan = nodes.pans[0].expect("a voiced track has an output stage");
+        let send = nodes.sends[0][0].expect("a return exists, so the send node does");
+        assert_eq!(
+            feeders(&spec, send),
+            vec![pan],
+            "the send is not post-fader"
+        );
+        assert_eq!(
+            spec.iter_ordered()
+                .find(|(id, _)| *id == send)
+                .map(|(_, node)| node.clone()),
+            Some(NodeSpec::Mixer { gain: 0.5 }),
+            "the send node did not take the level"
+        );
+
+        // And the far end: the send feeds a bus, that bus reaches this
+        // return's fader, and that fader reaches the master.
+        let bus = fed_by(&spec, send);
+        assert_eq!(bus.len(), 1, "a send feeds exactly one bus");
+        let out = nodes.returns[0].expect("a return has an output stage");
+        assert!(
+            spec.compile(48_000, 256).is_ok(),
+            "the returns graph must compile"
+        );
+        assert!(
+            !fed_by(&spec, out).is_empty(),
+            "the return's fader goes nowhere"
+        );
+    }
+
+    /// EVERY PAIR GETS A NODE, EVEN AT SILENCE — and that is the whole
+    /// reason a send level is not shape.
+    ///
+    /// A send that only existed once it was open could only be opened by
+    /// a recompile, which during a drag means a schedule swap per frame.
+    /// The cost is one mixer per track per return; the thing bought is
+    /// that opening a send is a letter.
+    #[test]
+    fn a_send_level_rides_a_letter_and_never_a_recompile() {
+        let mut a = with_returns(2);
+        let base = shape_hash(&a.tracks, &a.master, &a.returns);
+        let (_, closed) = build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
+        assert!(
+            closed.sends[0].iter().all(|node| node.is_some()),
+            "a shut send still needs an address"
+        );
+
+        a.tracks[0].sends = vec![0.0, 0.9];
+        assert_eq!(
+            shape_hash(&a.tracks, &a.master, &a.returns),
+            base,
+            "opening a send must not swap the schedule"
+        );
+
+        // What IS shape: how many returns there are, and whether one is
+        // muted — both add or drop nodes no letter could.
+        a.returns.push(ReturnTrack::new(2));
+        let three = shape_hash(&a.tracks, &a.master, &a.returns);
+        assert_ne!(three, base, "a new return is a new bus");
+        a.returns[0].mute = true;
+        assert_ne!(
+            shape_hash(&a.tracks, &a.master, &a.returns),
+            three,
+            "muting a return drops its bus"
+        );
+    }
+
+    /// A MUTED RETURN TAKES ITS SENDS WITH IT.
+    ///
+    /// Not merely silenced: the bus leaves the schedule, and so does
+    /// every gain node that fed it. A send pointing at a bus nobody
+    /// processes is work done for no listener.
+    #[test]
+    fn a_muted_return_takes_its_sends_with_it() {
+        let mut a = with_returns(2);
+        for track in &mut a.tracks {
+            track.sends = vec![0.4, 0.4];
+        }
+        let (_, live) = build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
+        assert!(live.sends[0][0].is_some() && live.sends[0][1].is_some());
+        assert!(live.returns.iter().all(|node| node.is_some()));
+
+        a.returns[0].mute = true;
+        let (spec, muted) =
+            build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
+        assert!(muted.returns[0].is_none(), "the muted bus still compiled");
+        assert!(muted.returns[1].is_some(), "and it took the other one down");
+        assert!(
+            muted.sends.iter().all(|row| row[0].is_none()),
+            "a send to a muted return is a node with nowhere to go"
+        );
+        assert!(muted.sends.iter().all(|row| row[1].is_some()));
+        assert!(spec.compile(48_000, 256).is_ok());
+    }
+
+    /// A RETURN SURVIVES A SOLO.
+    ///
+    /// Solo-in-place drops every other lane from the schedule. The return
+    /// must stay, because the soloed lane is still sending to it — the
+    /// alternative is that soloing a track silences its own reverb, which
+    /// is not what anyone means by "let me hear just this".
+    #[test]
+    fn a_return_survives_a_solo() {
+        let mut a = with_returns(1);
+        for track in &mut a.tracks {
+            track.sends = vec![0.7];
+        }
+        a.tracks[1].solo = true;
+        let (spec, nodes) =
+            build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
+        assert!(nodes.returns[0].is_some(), "the return went with the solo");
+        assert!(
+            nodes.sends[1][0].is_some(),
+            "the soloed lane stopped sending"
+        );
+        assert!(
+            nodes.sends[0][0].is_none(),
+            "a lane that is not sounding cannot send"
+        );
+        assert!(spec.compile(48_000, 256).is_ok());
+    }
+
+    /// A SEND WITH NO RETURN IS NOTHING, not a panic.
+    ///
+    /// A file can say anything, and a track's send list is written
+    /// independently of the return list — so a list that runs past the
+    /// end has to mean silence.
+    #[test]
+    fn sends_past_the_end_of_the_return_list_are_simply_nothing() {
+        let mut a = with_returns(1);
+        a.tracks[0].sends = vec![1.0, 1.0, 1.0, 1.0];
+        let (spec, nodes) =
+            build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
+        assert_eq!(nodes.sends[0].len(), 1, "one return, one send node");
+        assert!(spec.compile(48_000, 256).is_ok());
+
+        // And a track shorter than the return list sends nothing, rather
+        // than needing a zero written into it when a return is added.
+        let mut a = with_returns(3);
+        a.tracks[0].sends = vec![0.5];
+        let (spec, nodes) =
+            build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
+        assert_eq!(nodes.sends[0].len(), 3);
+        assert!(spec.compile(48_000, 256).is_ok());
+    }
+
+    /// A return's chain compiles by the same road a lane's does.
+    #[test]
+    fn a_return_carries_effects_and_refuses_instruments() {
+        let mut a = with_returns(1);
+        a.tracks[0].sends = vec![0.6];
+        let id = a.mint_id();
+        assert!(a.returns[0].insert_device(DeviceInstance {
+            id,
+            parent: None,
+            state: DeviceState::new(DeviceKind::Reverb),
+            bypass: false,
+            page: 0,
+            view_zoom: unit_zoom(),
+            view_scroll: 0.0,
+        }));
+        let synth = a.mint_id();
+        assert!(
+            !a.returns[0].insert_device(DeviceInstance {
+                id: synth,
+                parent: None,
+                state: DeviceState::new(DeviceKind::SineSynth),
+                bypass: false,
+                page: 0,
+                view_zoom: unit_zoom(),
+                view_scroll: 0.0,
+            }),
+            "a bus has nothing for an instrument to play"
+        );
+        let (spec, nodes) =
+            build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
+        assert!(
+            nodes.devices.contains_key(&id),
+            "the return's reverb never reached the schedule"
+        );
+        assert!(spec.compile(48_000, 256).is_ok());
+    }
+
     /// Mute, solo and kind are graph SHAPE — they add or drop nodes, so
     /// they must force an immediate swap. Pan is NOT: every instrument
     /// track always carries a Pan node, so pan rides a letter and a knob
@@ -26833,37 +27357,41 @@ mod tests {
     #[test]
     fn shape_hash_covers_mute_and_solo_but_not_pan() {
         let mut a = Arrangement::default();
-        let base = shape_hash(&a.tracks, &a.master);
+        let base = shape_hash(&a.tracks, &a.master, &a.returns);
 
         a.tracks[0].pan = -0.8;
         assert_eq!(
-            shape_hash(&a.tracks, &a.master),
+            shape_hash(&a.tracks, &a.master, &a.returns),
             base,
             "pan is a letter, never a recompile"
         );
 
         a.tracks[0].mute = true;
-        let muted = shape_hash(&a.tracks, &a.master);
+        let muted = shape_hash(&a.tracks, &a.master, &a.returns);
         assert_ne!(muted, base, "mute drops a node");
 
         a.tracks[0].mute = false;
         a.tracks[0].solo = true;
         assert_ne!(
-            shape_hash(&a.tracks, &a.master),
+            shape_hash(&a.tracks, &a.master, &a.returns),
             base,
             "solo drops every other node"
         );
 
         a.tracks[0].solo = false;
-        assert_eq!(shape_hash(&a.tracks, &a.master), base, "and back again");
+        assert_eq!(
+            shape_hash(&a.tracks, &a.master, &a.returns),
+            base,
+            "and back again"
+        );
 
         let mut b = Arrangement::default();
         b.add_track(TrackKind::Audio);
         let mut c = Arrangement::default();
         c.add_track(TrackKind::Midi);
         assert_ne!(
-            shape_hash(&b.tracks, &b.master),
-            shape_hash(&c.tracks, &c.master),
+            shape_hash(&b.tracks, &b.master, &b.returns),
+            shape_hash(&c.tracks, &c.master, &c.returns),
             "kind decides whether a sequencer exists, so it is shape"
         );
     }
@@ -26991,7 +27519,8 @@ mod tests {
         load(&mut a, 1, DeviceKind::SineSynth);
         let reverb = load(&mut a, 1, DeviceKind::Reverb);
 
-        let (spec, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
+        let (spec, nodes) =
+            build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
         // Where the lanes sum — one hop before the master's own fader.
         let out = sum_bus(&spec);
 
@@ -27049,7 +27578,8 @@ mod tests {
         a.master.volume = 0.5;
         a.master.pan = -0.25;
 
-        let (spec, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
+        let (spec, nodes) =
+            build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
         let out = spec.output().unwrap();
         let sum = sum_bus(&spec);
 
@@ -27185,7 +27715,8 @@ mod tests {
             ],
         });
 
-        let (mut spec, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
+        let (mut spec, nodes) =
+            build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
         spec.set_modulation(build_mod_spec(
             &a.tracks,
             &a.modulators,
@@ -27246,7 +27777,14 @@ mod tests {
             ..Default::default()
         };
         let peak_of = |arr: &Arrangement, name: &str| {
-            let (spec, _) = build_graph_spec(&arr.tracks, &arr.master, &arr.clips, None, false);
+            let (spec, _) = build_graph_spec(
+                &arr.tracks,
+                &arr.master,
+                &arr.returns,
+                &arr.clips,
+                None,
+                false,
+            );
             let path = std::env::temp_dir().join(name);
             bounce(&spec, &opts, &path).unwrap();
             let mut reader = hound::WavReader::open(&path).unwrap();
@@ -27275,7 +27813,8 @@ mod tests {
         load(&mut a, 0, DeviceKind::SineSynth);
         let glue = load_master(&mut a, DeviceKind::Glue);
 
-        let (spec, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
+        let (spec, nodes) =
+            build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
         let out = spec.output().unwrap();
         let comp = nodes.devices[&glue];
         let lane = nodes.pans[0].unwrap();
@@ -27299,7 +27838,8 @@ mod tests {
 
         // Bypassed, the chain closes over it exactly as a track's does.
         a.master.device_mut(glue).unwrap().bypass = true;
-        let (spec, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
+        let (spec, nodes) =
+            build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
         assert!(!nodes.devices.contains_key(&glue));
         assert!(spec.compile(48_000, 256).is_ok());
     }
@@ -27491,29 +28031,80 @@ mod tests {
         assert_eq!(older.bpm, 128.0, "and the rest of the file still reads");
     }
 
+    /// Returns and their sends survive the disk — and a project written
+    /// before either existed loads as a song that sends nowhere, which is
+    /// exactly how it sounded.
+    #[test]
+    fn returns_and_sends_survive_save_and_load() {
+        let mut arr = Arrangement {
+            returns: vec![ReturnTrack::new(0), ReturnTrack::new(1)],
+            ..Arrangement::default()
+        };
+        arr.returns[0].name = "Plate".to_owned();
+        arr.returns[0].volume = 0.7;
+        arr.returns[1].mute = true;
+        arr.tracks[0].sends = vec![0.25, 0.9];
+
+        let doc = project_doc(&arr, &Transport::default());
+        let text = ron::ser::to_string_pretty(&doc, ron::ser::PrettyConfig::default()).unwrap();
+        let read: ProjectDoc = ron::from_str(&text).unwrap();
+        let mut back = Arrangement::default();
+        let mut transport = Transport::default();
+        apply_project_doc(read, &mut back, &mut transport);
+
+        assert_eq!(back.returns.len(), 2);
+        assert_eq!(back.returns[0].name, "Plate");
+        assert_eq!(back.returns[0].volume, 0.7);
+        assert!(back.returns[1].mute);
+        assert_eq!(back.tracks[0].sends, vec![0.25, 0.9]);
+
+        // A file from before returns: both fields are simply absent.
+        let older: ProjectDoc = ron::from_str("(version: 2, bpm: 128.0)").unwrap();
+        assert!(older.returns.is_empty(), "no returns, and no guessing");
+        assert!(older.tracks.iter().all(|track| track.sends.is_empty()));
+
+        // A HAND-EDITED file is input like any other: too many returns,
+        // an instrument on a bus, and a send list that points past the
+        // end of the return list all come back sane rather than trusted.
+        let mut wild = Arrangement {
+            returns: (0..ReturnTrack::MAX + 3).map(ReturnTrack::new).collect(),
+            ..Arrangement::default()
+        };
+        wild.tracks[0].sends = vec![4.0; 32];
+        let mut back = Arrangement::default();
+        apply_project_doc(
+            project_doc(&wild, &Transport::default()),
+            &mut back,
+            &mut transport,
+        );
+        assert_eq!(back.returns.len(), ReturnTrack::MAX);
+        assert_eq!(back.tracks[0].sends.len(), ReturnTrack::MAX);
+        assert!(back.tracks[0].sends.iter().all(|send| *send <= 1.0));
+    }
+
     /// Adding an effect to the master is a SHAPE change: no letter can add
     /// a node, so the graph has to be rebuilt. Moving its fader is not.
     #[test]
     fn the_master_chain_reshapes_the_graph_but_its_fader_does_not() {
         let mut a = Arrangement::default();
         load(&mut a, 0, DeviceKind::SineSynth);
-        let base = shape_hash(&a.tracks, &a.master);
+        let base = shape_hash(&a.tracks, &a.master, &a.returns);
 
         a.master.volume = 0.4;
         a.master.pan = -0.6;
         assert_eq!(
-            shape_hash(&a.tracks, &a.master),
+            shape_hash(&a.tracks, &a.master, &a.returns),
             base,
             "a fader move rides a letter, exactly as a lane's does"
         );
 
         let glue = load_master(&mut a, DeviceKind::Glue);
-        let with_effect = shape_hash(&a.tracks, &a.master);
+        let with_effect = shape_hash(&a.tracks, &a.master, &a.returns);
         assert_ne!(with_effect, base, "a new node cannot travel as a letter");
 
         a.master.device_mut(glue).unwrap().bypass = true;
         assert_ne!(
-            shape_hash(&a.tracks, &a.master),
+            shape_hash(&a.tracks, &a.master, &a.returns),
             with_effect,
             "bypass removes the node, so it is shape too"
         );
@@ -27600,7 +28191,14 @@ mod tests {
 
         // And it is still WIRED: it compiles onto the reverb node, at the
         // reverb's mix param, riding the base the file carried.
-        let (_, nodes) = build_graph_spec(&arr.tracks, &arr.master, &arr.clips, None, false);
+        let (_, nodes) = build_graph_spec(
+            &arr.tracks,
+            &arr.master,
+            &arr.returns,
+            &arr.clips,
+            None,
+            false,
+        );
         let registry = ParameterRegistry::default();
         let plan = build_mod_spec(
             &arr.tracks,
@@ -27643,7 +28241,8 @@ mod tests {
         let first = load(&mut a, 0, DeviceKind::Reverb);
         let second = load(&mut a, 0, DeviceKind::Reverb);
 
-        let (spec, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
+        let (spec, nodes) =
+            build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
         let seq = instrument_node(&nodes, &a.tracks[0]).unwrap();
         let one = nodes.devices[&first];
         let two = nodes.devices[&second];
@@ -27715,7 +28314,8 @@ mod tests {
         let glue = load(&mut a, 0, DeviceKind::Glue);
         let eq = load(&mut a, 0, DeviceKind::Eq);
 
-        let (spec, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
+        let (spec, nodes) =
+            build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
         let seq = instrument_node(&nodes, &a.tracks[0]).unwrap();
         let node = nodes.devices[&glue];
         let wired =
@@ -27766,7 +28366,7 @@ mod tests {
         load(&mut a, 0, DeviceKind::SineSynth);
         let first = load(&mut a, 0, DeviceKind::Glue);
         let second = load(&mut a, 0, DeviceKind::Glue);
-        let (_, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
+        let (_, nodes) = build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
         let a_slot = nodes.readouts[&first];
         let b_slot = nodes.readouts[&second];
         assert_ne!(a_slot, b_slot, "two compressors, one slot");
@@ -27783,7 +28383,8 @@ mod tests {
         let eq = load(&mut a, 0, DeviceKind::Eq);
         let after = load(&mut a, 0, DeviceKind::Reverb);
 
-        let (spec, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
+        let (spec, nodes) =
+            build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
         let seq = instrument_node(&nodes, &a.tracks[0]).unwrap();
         let node = nodes.devices[&eq];
         let wired =
@@ -27828,7 +28429,8 @@ mod tests {
         let after = load(&mut a, 0, DeviceKind::Reverb);
 
         // As an INSERT first: the baseline every existing project has.
-        let (spec, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
+        let (spec, nodes) =
+            build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
         let wired = |spec: &GraphSpec, from: NodeId, to: NodeId| {
             spec.wires().iter().any(|(f, t)| *f == from && *t == to)
         };
@@ -27845,7 +28447,8 @@ mod tests {
             .unwrap()
             .state
             .set(daw::params::echo::SEND, 40.0);
-        let (spec, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
+        let (spec, nodes) =
+            build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
         let seq = instrument_node(&nodes, &a.tracks[0]).unwrap();
         let echo_node = nodes.devices[&echo];
         let reverb = nodes.devices[&after];
@@ -27885,7 +28488,7 @@ mod tests {
         let mut a = Arrangement::default();
         load(&mut a, 0, DeviceKind::SineSynth);
         let echo = load(&mut a, 0, DeviceKind::Echo);
-        let insert = shape_hash(&a.tracks, &a.master);
+        let insert = shape_hash(&a.tracks, &a.master, &a.returns);
 
         let set = |a: &mut Arrangement, v: f32| {
             a.tracks[0]
@@ -27895,19 +28498,19 @@ mod tests {
                 .set(daw::params::echo::SEND, v);
         };
         set(&mut a, 25.0);
-        let aux = shape_hash(&a.tracks, &a.master);
+        let aux = shape_hash(&a.tracks, &a.master, &a.returns);
         assert_ne!(aux, insert, "leaving zero rewires the track");
 
         set(&mut a, 80.0);
         assert_eq!(
-            shape_hash(&a.tracks, &a.master),
+            shape_hash(&a.tracks, &a.master, &a.returns),
             aux,
             "riding a send that is already up is a letter, not a swap"
         );
 
         set(&mut a, 0.0);
         assert_eq!(
-            shape_hash(&a.tracks, &a.master),
+            shape_hash(&a.tracks, &a.master, &a.returns),
             insert,
             "and back to an insert"
         );
@@ -27923,7 +28526,8 @@ mod tests {
         let second = load(&mut a, 0, DeviceKind::Reverb);
 
         a.tracks[0].device_mut(first).unwrap().bypass = true;
-        let (spec, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
+        let (spec, nodes) =
+            build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
         assert!(
             !nodes.devices.contains_key(&first),
             "a bypassed device makes no node"
@@ -27940,7 +28544,7 @@ mod tests {
         // The instrument bypassed silences the lane entirely, exactly as an
         // empty chain does: no source, no pan, no meter.
         a.tracks[0].chain[0].bypass = true;
-        let (_, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
+        let (_, nodes) = build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
         assert!(nodes.devices.is_empty());
         assert!(nodes.pans[0].is_none());
     }
@@ -27960,7 +28564,8 @@ mod tests {
         a.add_wire(lfo, 0, &target).unwrap();
 
         let bound = |a: &Arrangement| {
-            let (_, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
+            let (_, nodes) =
+                build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
             let plan = build_mod_spec(&a.tracks, &a.modulators, &a.mod_wires, &registry, &nodes);
             assert_eq!(plan.wires.len(), 1, "the wire compiles");
             (
@@ -28066,21 +28671,21 @@ mod tests {
         // a chain edit forces a schedule swap rather than being mistaken
         // for no change at all.
         let mut seen = std::collections::HashSet::new();
-        let full = shape_hash(&a.tracks, &a.master);
+        let full = shape_hash(&a.tracks, &a.master, &a.returns);
         assert!(seen.insert(full));
         a.tracks[0].chain.pop();
         assert!(
-            seen.insert(shape_hash(&a.tracks, &a.master)),
+            seen.insert(shape_hash(&a.tracks, &a.master, &a.returns)),
             "an effect left"
         );
         a.tracks[0].chain.swap(0, 1);
         assert!(
-            seen.insert(shape_hash(&a.tracks, &a.master)),
+            seen.insert(shape_hash(&a.tracks, &a.master, &a.returns)),
             "the order changed"
         );
         a.tracks[0].chain[0].bypass = true;
         assert!(
-            seen.insert(shape_hash(&a.tracks, &a.master)),
+            seen.insert(shape_hash(&a.tracks, &a.master, &a.returns)),
             "one is bypassed"
         );
     }
@@ -28144,7 +28749,8 @@ mod tests {
                 id
             })
             .collect();
-        let (spec, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, None, false);
+        let (spec, nodes) =
+            build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
 
         // The ids are distinct per track, which is what makes
         // `device_nodes[id]` the right address.
@@ -28223,7 +28829,8 @@ mod tests {
         assert_eq!(head.kind(), DeviceKind::Poly);
         assert!(matches!(head.state, DeviceState::Poly(_)));
 
-        let (spec, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, Some(8.0), false);
+        let (spec, nodes) =
+            build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, Some(8.0), false);
         let node = instrument_node(&nodes, &a.tracks[0]).expect("a node for the poly track");
         assert!(
             spec.iter_ordered()
@@ -28294,7 +28901,8 @@ mod tests {
             },
         );
 
-        let (spec, nodes) = build_graph_spec(&a.tracks, &a.master, &a.clips, Some(8.0), false);
+        let (spec, nodes) =
+            build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, Some(8.0), false);
         let node = instrument_node(&nodes, &a.tracks[0]).expect("a node for the sampler track");
         assert!(
             spec.iter_ordered().any(|(nid, n)| nid == node
@@ -28322,7 +28930,8 @@ mod tests {
         a.clips[0][0].notes.push(note(60, 0.0, 2.0, 100));
         load(&mut a, 0, DeviceKind::Sampler);
 
-        let (spec, _) = build_graph_spec(&a.tracks, &a.master, &a.clips, Some(8.0), false);
+        let (spec, _) =
+            build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, Some(8.0), false);
         let mut sched = spec.compile(48_000, 256).expect("the graph compiles");
         let mut out = vec![0.0f32; 512];
         sched.run(&mut out, &poly_ctx());

@@ -42,6 +42,15 @@ pub struct Track {
     /// that is what the engine multiplies by; the fader does the dB
     /// mapping, which is the only place the curve belongs.
     pub volume: f32,
+    /// How much of this track each RETURN gets, as linear gain, indexed
+    /// by return. Shorter than the return list is normal and means zero:
+    /// adding a return must not have to walk every track to write a
+    /// silence into it.
+    ///
+    /// POST-FADER, decided at the graph and not here — see the send
+    /// nodes in the graph builder. What lives here is only how much.
+    #[serde(default)]
+    pub sends: Vec<f32>,
     /// Persistent track envelopes. Their values are applied live to the
     /// output node, so drawing a curve never requires a graph swap.
     pub automation: TrackAutomation,
@@ -264,6 +273,99 @@ impl MasterTrack {
     }
 }
 
+/// A RETURN: a bus every track can feed, which lands on the master.
+///
+/// Shaped like [`MasterTrack`] rather than like [`Track`], because that
+/// is what it is — a chain, a fader, a pan, and no clips of its own.
+/// What it adds over the master is a NAME, since a project has one
+/// master and may have several returns, and a MUTE, since a reverb is a
+/// thing you switch off to hear what is underneath it.
+///
+/// # A return does not send
+///
+/// Deliberately, and it is the one place this differs from a console.
+/// Returns feeding returns is how a desk makes a feedback loop, and this
+/// graph has no cycle detector — the schedule is a flat topological
+/// order compiled once, so a cycle is not a howl, it is a graph that
+/// will not compile. The vocabulary simply does not contain the move.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ReturnTrack {
+    /// What the strip shows. Beside the letter, not instead of it: a
+    /// send row says `A`, and `A` is a position, so the name is free to
+    /// say what the return actually IS.
+    pub name: String,
+    pub mute: bool,
+    /// Fader level as LINEAR amplitude, exactly as a track's is.
+    pub volume: f32,
+    pub pan: f32,
+    /// Effects only, in signal order — a return has nothing for an
+    /// instrument to play.
+    pub chain: Vec<DeviceInstance>,
+    #[serde(default)]
+    pub sampler_sources: std::collections::BTreeMap<u64, SamplerSource>,
+    #[serde(default)]
+    pub racks: std::collections::BTreeMap<u64, device::RackUi>,
+}
+
+impl Default for ReturnTrack {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            mute: false,
+            volume: 1.0,
+            pan: 0.0,
+            chain: Vec::new(),
+            sampler_sources: std::collections::BTreeMap::new(),
+            racks: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+impl ReturnTrack {
+    /// How many returns a project may hold: A through H, which is the
+    /// count every desk and every DAW settled on, and the count a send
+    /// column can label without a second character.
+    pub const MAX: usize = 8;
+
+    /// The letter at position `index`: `A`, `B`, … Past `MAX` it is `?`,
+    /// which cannot happen and is still not a panic.
+    pub fn letter(index: usize) -> char {
+        if index < Self::MAX {
+            (b'A' + index as u8) as char
+        } else {
+            '?'
+        }
+    }
+
+    /// A fresh return, named for where it sits.
+    pub fn new(index: usize) -> Self {
+        Self {
+            name: format!("Return {}", Self::letter(index)),
+            ..Self::default()
+        }
+    }
+
+    pub fn device(&self, id: u64) -> Option<&DeviceInstance> {
+        self.chain.iter().find(|instance| instance.id == id)
+    }
+
+    pub fn device_mut(&mut self, id: u64) -> Option<&mut DeviceInstance> {
+        self.chain.iter_mut().find(|instance| instance.id == id)
+    }
+
+    /// Put an effect on this return. Instruments are refused for the
+    /// reason the master refuses them, and the caller is told so it can
+    /// say why rather than dropping a synth into a bus.
+    pub fn insert_device(&mut self, instance: DeviceInstance) -> bool {
+        if instance.kind().is_instrument() {
+            return false;
+        }
+        self.chain.push(instance);
+        true
+    }
+}
+
 /// Force the ordering rule onto a chain that came from a FILE: keep the
 /// first instrument, move it to the head, drop any others. A hand-edited
 /// project is input like any other, and an instrument in the middle of a
@@ -287,6 +389,7 @@ impl Default for Track {
             solo: false,
             pan: 0.0,
             volume: 1.0,
+            sends: Vec::new(),
             automation: TrackAutomation::default(),
             // A fresh track has no devices at all.
             chain: Vec::new(),
@@ -319,6 +422,11 @@ pub struct TrackWire {
     pub solo: bool,
     pub pan: f32,
     pub volume: f32,
+    /// `#[serde(default)]` so a project written before returns existed
+    /// loads with a track that sends nowhere — which is exactly how it
+    /// sounded.
+    #[serde(default)]
+    pub sends: Vec<f32>,
     pub automation: TrackAutomation,
     pub chain: Vec<DeviceInstance>,
     pub sampler_sources: std::collections::BTreeMap<u64, SamplerSource>,
@@ -343,6 +451,7 @@ impl Default for TrackWire {
             solo: track.solo,
             pan: track.pan,
             volume: track.volume,
+            sends: track.sends,
             automation: track.automation,
             chain: track.chain,
             sampler_sources: track.sampler_sources,
@@ -415,6 +524,7 @@ impl<'de> serde::Deserialize<'de> for Track {
             solo: wire.solo,
             pan: wire.pan,
             volume: wire.volume,
+            sends: wire.sends,
             automation: wire.automation,
             chain,
             sampler_sources: wire.sampler_sources,
