@@ -2535,6 +2535,9 @@ fn apply_project_doc(doc: ProjectDoc, arr: &mut Arrangement, transport: &mut Tra
     for bus in &mut fresh.returns {
         bus.chain.retain(|device| !device.kind().is_instrument());
     }
+    // Nesting is input like everything else: a depth that outruns what
+    // the stack above it allows names a group that is not there.
+    track::sanitize_nesting(&mut fresh.tracks);
     let returns = fresh.returns.len();
     for track in &mut fresh.tracks {
         track.sends.truncate(returns);
@@ -3710,6 +3713,132 @@ impl Arrangement {
         i
     }
 
+    /// Wrap the selected lane — and everything nested under it, if it is
+    /// itself a group — in a new group above it.
+    ///
+    /// The group takes the wrapped lane's own depth, and the span goes
+    /// one deeper. Nothing moves, which is what makes this safe: a group
+    /// and its members are contiguous, and wrapping a contiguous span in
+    /// a lane inserted at its head keeps it contiguous.
+    fn group_track(&mut self) -> bool {
+        let Some(at) = self.selected else {
+            return false;
+        };
+        let Some(lane) = self.tracks.get(at) else {
+            return false;
+        };
+        if lane.depth >= track::MAX_GROUP_DEPTH {
+            return false;
+        }
+        // The whole span, measured BEFORE anything is inserted: after
+        // the insert every index past `at` has moved.
+        let span = 1 + track::group_members(&self.tracks, at).len();
+        let no = self.tracks.iter().filter(|track| track.is_group).count() + 1;
+        let depth = lane.depth;
+
+        // Built at the end and moved into place, so `move_track` does the
+        // index bookkeeping — the selection, the cursor, the modulation
+        // wires and the parallel vecs all follow one lane's arrival by
+        // the one road that already knows how.
+        self.push_lane(Track::group(format!("Group {no}")));
+        let last = self.tracks.len() - 1;
+        self.move_track(last, at);
+        self.tracks[at].depth = depth;
+        for member in self.tracks[at + 1..at + 1 + span].iter_mut() {
+            member.depth = member.depth.saturating_add(1);
+        }
+        self.select_track(at);
+        self.force_recompile = true;
+        true
+    }
+
+    /// Dissolve the selected group: the lane goes, its members come up a
+    /// level and stay exactly where they are.
+    fn ungroup_track(&mut self) -> bool {
+        let Some(at) = self.selected else {
+            return false;
+        };
+        if !self.tracks.get(at).is_some_and(|track| track.is_group) {
+            return false;
+        }
+        let members = track::group_members(&self.tracks, at);
+        if !self.remove_track(at) {
+            return false;
+        }
+        // Everything shifted down by the removed lane.
+        for member in self.tracks[members.start - 1..members.end - 1].iter_mut() {
+            member.depth = member.depth.saturating_sub(1);
+        }
+        self.force_recompile = true;
+        true
+    }
+
+    /// Put the selected lane into the group the lane above it belongs to,
+    /// or take it back out.
+    ///
+    /// The whole span moves together: nesting a group takes its members
+    /// with it, because a group that left its own contents behind would
+    /// not be the thing that was nested.
+    ///
+    /// Leaving is only offered to the LAST lane in a group, and that is a
+    /// deliberate restriction rather than an oversight: a lane in the
+    /// middle cannot leave without MOVING, since a group's members are
+    /// the contiguous run beneath it — and moving it is a separate verb
+    /// the user already has.
+    fn nest_track(&mut self, deeper: bool) -> Result<(), &'static str> {
+        let Some(at) = self.selected else {
+            return Err("no lane is selected");
+        };
+        let span = 1 + track::group_members(&self.tracks, at).len();
+        let depth = self.tracks[at].depth;
+        if deeper {
+            let Some(above) = at.checked_sub(1).map(|index| &self.tracks[index]) else {
+                return Err("the top lane has nothing to join");
+            };
+            let allowed = if above.is_group {
+                above.depth + 1
+            } else {
+                above.depth
+            };
+            if depth >= allowed {
+                return Err("the lane above is not in a group this one could join");
+            }
+            if depth + 1 > track::MAX_GROUP_DEPTH {
+                return Err("that is as deep as groups nest");
+            }
+            for lane in self.tracks[at..at + span].iter_mut() {
+                lane.depth += 1;
+            }
+        } else {
+            if depth == 0 {
+                return Err("this lane is not in a group");
+            }
+            let Some(parent) = track::parent_group(&self.tracks, at) else {
+                return Err("this lane is not in a group");
+            };
+            if track::group_members(&self.tracks, parent).end != at + span {
+                return Err("only the last lane in a group can leave it — move it down first");
+            }
+            for lane in self.tracks[at..at + span].iter_mut() {
+                lane.depth -= 1;
+            }
+        }
+        self.force_recompile = true;
+        Ok(())
+    }
+
+    /// Append a lane and everything parallel to it, without touching the
+    /// name counters or the selection. The shared half of `add_track`.
+    fn push_lane(&mut self, track: Track) {
+        self.tracks.push(track);
+        self.clips.push(Vec::new());
+        self.session
+            .slots
+            .push(vec![None; self.session.scenes.len()]);
+        self.session.playing.push(None);
+        self.session.launch_at.push(0.0);
+    }
+
     /// Drop a track and its clips. The LAST track is never removed — an
     /// arrangement with no lanes has nothing to click, and "undo" does not
     /// exist yet to get back out of it.
@@ -4451,6 +4580,10 @@ fn shape_hash(tracks: &[Track], master: &MasterTrack, returns: &[ReturnTrack]) -
         t.kind.hash(&mut hasher);
         t.mute.hash(&mut hasher);
         t.solo.hash(&mut hasher);
+        // Nesting is WIRING: which bus a lane lands on, and whether it
+        // is a bus at all. Neither can travel as a parameter letter.
+        t.is_group.hash(&mut hasher);
+        t.depth.hash(&mut hasher);
         // The chain by IDENTITY and order: adding, removing, reordering or
         // bypassing a device all change which nodes exist and how they are
         // wired, and none of that can travel as a parameter letter.
@@ -4474,10 +4607,17 @@ fn shape_hash(tracks: &[Track], master: &MasterTrack, returns: &[ReturnTrack]) -
 }
 
 fn track_audible(tracks: &[Track], i: usize) -> bool {
+    if i >= tracks.len() {
+        return false;
+    }
+    // Mute and solo both read through the GROUPS above the lane: a
+    // group's switch is the whole point of a group, one control that
+    // takes the drums out however many lanes the drums are.
+    if track::muted_in_place(tracks, i) {
+        return false;
+    }
     let any_solo = tracks.iter().any(|t| t.solo);
-    tracks
-        .get(i)
-        .is_some_and(|t| !t.mute && (!any_solo || t.solo))
+    !any_solo || track::solo_in_scope(tracks, i)
 }
 
 /// Whether a lane's kind can hold a clip: audio clips ride audio tracks,
@@ -6146,8 +6286,13 @@ fn track_headers(
                 } else if response.clicked() {
                     select = Some(i);
                 }
+                // Nesting is drawn as INDENTATION here exactly as it is
+                // in the session's headers: one fact, said the same way
+                // in both places, so a stack read in one view is the
+                // stack the other view shows.
                 ui.painter().with_clip_rect(layout.name).text(
-                    layout.name.left_center(),
+                    layout.name.left_center()
+                        + egui::vec2(f32::from(track.depth) * NEST_INDENT, 0.0),
                     egui::Align2::LEFT_CENTER,
                     &track.name,
                     egui::FontId::proportional(HEADER_NAME_TYPE),
@@ -6159,9 +6304,13 @@ fn track_headers(
                 );
             }
 
-            let kind = match track.kind {
-                TrackKind::Midi => "MIDI",
-                TrackKind::Audio => "AUDIO",
+            let kind = if track.is_group {
+                "GROUP"
+            } else {
+                match track.kind {
+                    TrackKind::Midi => "MIDI",
+                    TrackKind::Audio => "AUDIO",
+                }
             };
             // A square metadata cell, closer to a panel annotation than a
             // web badge. Its fill step does the grouping; another outline
@@ -12417,6 +12566,13 @@ enum ChainOwner {
 /// reading and the last lane loses one, which is the right way round.
 const MASTER_METER: usize = daw::audio::graph::MAX_METERS - 1;
 
+/// How far one level of nesting shifts a lane's name.
+///
+/// The arrangement's own copy of the session view's constant, because
+/// this file may not read that module's private constants — and the two
+/// being equal is what makes a stack look the same in both views.
+const NEST_INDENT: f32 = 7.0;
+
 fn compile_chain(
     spec: &mut GraphSpec,
     source: NodeId,
@@ -12648,6 +12804,49 @@ fn push_input_sources(spec: &mut GraphSpec, input: TrackInput, sources: &mut Vec
     }
 }
 
+/// Send `node` where this lane's output belongs: into a group's bus, or
+/// onto the master's own input list.
+///
+/// One function because a lane's dry output, its aux returns and — once
+/// groups nest — a group's own output all have to arrive at the SAME
+/// place. Three copies of that decision is three chances for one of them
+/// to keep going to the master.
+fn land(
+    master: &mut Vec<NodeId>,
+    group_inputs: &mut [Vec<NodeId>],
+    destination: Option<usize>,
+    node: NodeId,
+) {
+    match destination {
+        // Collected against the GROUP, not wired straight into its bus,
+        // so the fan-in can be capped once the list is complete. A group
+        // whose bus was never built — because the group is muted — keeps
+        // its list and it is thrown away, which is what a muted group
+        // means: the signal goes nowhere, rather than to the master.
+        Some(parent) => group_inputs[parent].push(node),
+        None => master.push(node),
+    }
+}
+
+/// One aux echo, from a device's parameters.
+///
+/// A function because three places build the same node — a lane, a
+/// group, the master — and a fourth would have been a copy of the
+/// eight-field literal with one field quietly different.
+fn echo_node(spec: &mut GraphSpec, params: EchoParams) -> NodeId {
+    spec.push(NodeSpec::Echo {
+        sync: params.sync.round().max(0.0) as u32,
+        time_ms: params.time_ms,
+        feedback: params.feedback,
+        tone_hz: params.tone_hz,
+        drive: params.drive,
+        wow: params.wow,
+        spread: params.spread,
+        mix: params.mix,
+        send: params.send,
+    })
+}
+
 fn build_graph_spec(
     tracks: &[Track],
     bus: &MasterTrack,
@@ -12672,11 +12871,71 @@ fn build_graph_spec(
         .collect();
     let mut send_ids: Vec<Vec<Option<NodeId>>> = vec![vec![None; returns.len()]; tracks.len()];
     let mut return_ids: Vec<Option<NodeId>> = vec![None; returns.len()];
+    // A group's summing bus, and what feeds it. The bus exists as soon
+    // as the group lane is reached, which is BEFORE its members — the
+    // stack puts a group above what it holds, so by the time a member
+    // needs somewhere to land, the somewhere is there.
+    let mut group_bus: Vec<Option<NodeId>> = vec![None; tracks.len()];
+    // Collected rather than wired as we go, so a group's fan-in can be
+    // reduced through the same tree of buses the master's is. A group
+    // with more than `MAX_NODE_INPUTS` members is an ordinary drum bus,
+    // not an exotic case.
+    let mut group_inputs: Vec<Vec<NodeId>> = vec![Vec::new(); tracks.len()];
     let mut devices: HashMap<u64, NodeId> = HashMap::new();
     let mut readouts: HashMap<u64, usize> = HashMap::new();
     let mut audio_clips: HashMap<u64, NodeId> = HashMap::new();
     for (i, track) in tracks.iter().enumerate() {
         if !track_audible(tracks, i) {
+            continue;
+        }
+        // Where this lane's output lands: the bus of the group holding
+        // it, or the master. Resolved BEFORE the lane is built, so the
+        // aux returns below land in the same place the dry signal does.
+        let destination = track::parent_group(tracks, i);
+        // A GROUP has no clips and no instrument. Its source is the sum
+        // of what is nested under it, which is a node its members wire
+        // themselves into after this.
+        if track.is_group {
+            let bus = spec.push(NodeSpec::Mixer { gain: 1.0 });
+            group_bus[i] = Some(bus);
+            let mut auxes: Vec<(u64, EchoParams)> = Vec::new();
+            let tail = compile_chain(
+                &mut spec,
+                bus,
+                &track.chain,
+                &mut devices,
+                &mut readouts,
+                &mut auxes,
+            );
+            let pan = spec.push(NodeSpec::Pan {
+                pan: track.pan,
+                gain: track.volume,
+            });
+            spec.connect(tail, pan);
+            pan_ids[i] = Some(pan);
+            land(&mut master, &mut group_inputs, destination, pan);
+            for (id, params) in auxes {
+                let echo = echo_node(&mut spec, params);
+                spec.connect(pan, echo);
+                devices.insert(id, echo);
+                land(&mut master, &mut group_inputs, destination, echo);
+            }
+            for (index, bus) in return_buses.iter().enumerate() {
+                let Some(bus) = *bus else { continue };
+                let level = track
+                    .sends
+                    .get(index)
+                    .copied()
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0);
+                let send = spec.push(NodeSpec::Mixer { gain: level });
+                spec.connect(pan, send);
+                spec.connect(send, bus);
+                send_ids[i][index] = Some(send);
+            }
+            if i < MASTER_METER {
+                spec.meter(i, pan);
+            }
             continue;
         }
         let mut sources = Vec::new();
@@ -12896,7 +13155,7 @@ fn build_graph_spec(
             gain: track.volume,
         });
         spec.connect(tail, pan);
-        master.push(pan);
+        land(&mut master, &mut group_inputs, destination, pan);
         pan_ids[i] = Some(pan);
         // The sends, tapped POST-FADER off the output stage — the tap
         // every console defaults to and the only one that behaves the
@@ -12932,24 +13191,14 @@ fn build_graph_spec(
         // worse, would be silently dropped: `Node::Pan` reads its FIRST
         // input and no other.
         for (id, params) in auxes {
-            let echo = spec.push(NodeSpec::Echo {
-                sync: params.sync.round().max(0.0) as u32,
-                time_ms: params.time_ms,
-                feedback: params.feedback,
-                tone_hz: params.tone_hz,
-                drive: params.drive,
-                wow: params.wow,
-                spread: params.spread,
-                mix: params.mix,
-                // The node scales its own tap, so the send costs no node
-                // of its own and the parameter keeps ONE address: a knob,
-                // an automation lane and a modulation wire all letter the
-                // echo at `echo::SEND`, in percent, like every other row.
-                send: params.send,
-            });
+            // The node scales its own tap, so the send costs no node of
+            // its own and the parameter keeps ONE address: a knob, an
+            // automation lane and a modulation wire all letter the echo
+            // at `echo::SEND`, in percent, like every other row.
+            let echo = echo_node(&mut spec, params);
             spec.connect(pan, echo);
             devices.insert(id, echo);
-            master.push(echo);
+            land(&mut master, &mut group_inputs, destination, echo);
         }
         // The track's own output stage is where its meter is read: after
         // the fader and the pan, which is what a mixer meter shows. The
@@ -12961,6 +13210,27 @@ fn build_graph_spec(
             spec.meter(i, pan);
         }
     }
+    // --- the group buses -------------------------------------------------
+    // Wired here rather than as each member was built, so a group's
+    // fan-in is capped exactly as the master's is: past the ceiling the
+    // members are reduced through a tree, at or under it they go
+    // straight in, and a project with no groups compiles to the graph it
+    // did before groups existed.
+    for (index, inputs) in std::mem::take(&mut group_inputs).into_iter().enumerate() {
+        let Some(bus) = group_bus[index] else {
+            continue;
+        };
+        if inputs.len() > daw::audio::graph::MAX_NODE_INPUTS {
+            if let Some(reduced) = mix_sources(&mut spec, inputs) {
+                spec.connect(reduced, bus);
+            }
+        } else {
+            for node in inputs {
+                spec.connect(node, bus);
+            }
+        }
+    }
+
     // --- the returns ---------------------------------------------------
     // Each return's own chain, then its fader, then onto the master
     // beside the dry tracks. Compiled AFTER the lanes because that is
@@ -14013,6 +14283,22 @@ impl App {
             PaletteCommand::new("track.new.audio", "track", "new audio track").hint("ctrl+T"),
             PaletteCommand::new("track.new.midi", "track", "new MIDI track").hint("ctrl+shift+T"),
             PaletteCommand::new("track.rename", "track", "rename track").enabled(has_track),
+            // --- groups ------------------------------------------------
+            //
+            // No key chords: Ctrl+G already means "put these devices in a
+            // rack", and one chord that meant two different kinds of
+            // grouping depending on where the focus was would be worse
+            // than typing the word.
+            PaletteCommand::new("track.group", "track", "group track").enabled(has_track),
+            PaletteCommand::new("track.ungroup", "track", "ungroup").enabled(
+                self.arrangement
+                    .active_track()
+                    .is_some_and(|at| self.arrangement.tracks[at].is_group),
+            ),
+            PaletteCommand::new("track.nest", "track", "move track into the group above")
+                .enabled(has_track),
+            PaletteCommand::new("track.unnest", "track", "take track out of its group")
+                .enabled(has_track),
             // --- returns -----------------------------------------------
             PaletteCommand::new("return.new", "return", "add return bus")
                 .enabled(self.arrangement.returns.len() < ReturnTrack::MAX),
@@ -14334,6 +14620,30 @@ impl App {
 
             "track.new.audio" => actions.push(UiAction::AddTrack(TrackKind::Audio)),
             "track.new.midi" => actions.push(UiAction::AddTrack(TrackKind::Midi)),
+            // Said in words rather than dropped, because every refusal
+            // here is about the SHAPE of the stack — which lane is where
+            // — and a verb that quietly did nothing would look like a
+            // broken command instead of a stack that cannot do that.
+            "track.group" => {
+                if !self.arrangement.group_track() {
+                    self.notice = Some("nothing selected to group".into());
+                }
+            }
+            "track.ungroup" => {
+                if !self.arrangement.ungroup_track() {
+                    self.notice = Some("the selected lane is not a group".into());
+                }
+            }
+            "track.nest" => {
+                if let Err(why) = self.arrangement.nest_track(true) {
+                    self.notice = Some(why.into());
+                }
+            }
+            "track.unnest" => {
+                if let Err(why) = self.arrangement.nest_track(false) {
+                    self.notice = Some(why.into());
+                }
+            }
             "return.new" => actions.push(UiAction::AddReturn),
             "return.remove" => actions.push(UiAction::RemoveReturn),
             "track.mute" => actions.push(UiAction::ToggleTrackMute),
@@ -14628,13 +14938,19 @@ impl App {
         let Some(t) = self.arrangement.tracks.get(track) else {
             return;
         };
-        // An audio track's sound IS its material — an instrument on one
-        // would head a chain the graph never reads. Refuse in words rather
-        // than silently.
+        // An audio track's sound IS its material, and a group's sound is
+        // the lanes under it — an instrument on either would head a chain
+        // the graph never reads. Refuse in words rather than silently,
+        // and in the words that fit the lane it was aimed at.
         if item.load.is_instrument() && !t.kind.takes_instrument() {
             let name = t.name.clone();
+            let what = if t.is_group {
+                "a group"
+            } else {
+                "an audio track"
+            };
             self.notice = Some(format!(
-                "{name} is an audio track — no slot for a {}",
+                "{name} is {what} — no slot for a {}",
                 item.load.spec().name
             ));
             return;
@@ -27606,6 +27922,287 @@ mod tests {
             "the return's reverb never reached the schedule"
         );
         assert!(spec.compile(48_000, 256).is_ok());
+    }
+
+    // ------------------------------------------------------- groups ---
+
+    /// The stack as a shape: `"G>a b"` is a group holding two lanes.
+    fn nesting(tracks: &[Track]) -> String {
+        tracks
+            .iter()
+            .map(|track| {
+                let mark = if track.is_group { "G" } else { "." };
+                format!("{}{mark}", "  ".repeat(usize::from(track.depth)))
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Three voiced lanes, the middle two grouped.
+    fn grouped() -> Arrangement {
+        let mut a = Arrangement::default();
+        while a.tracks.len() > 3 {
+            a.remove_track(a.tracks.len() - 1);
+        }
+        for i in 0..a.tracks.len() {
+            load(&mut a, i, DeviceKind::SineSynth);
+        }
+        a.select_track(1);
+        assert!(a.group_track(), "the wrap was refused");
+        // The group landed at 1; lane 2 is the one it wrapped. Put the
+        // lane below it in as well.
+        a.select_track(3);
+        assert_eq!(a.nest_track(true), Ok(()));
+        a
+    }
+
+    /// A GROUP AND ITS MEMBERS ARE CONTIGUOUS, AND MEMBERSHIP IS READ OFF
+    /// THE STACK.
+    ///
+    /// Position and not a pointer, so the thing to pin is that the reads
+    /// agree with each other: what a group says it holds is exactly the
+    /// set of lanes that say they belong to it.
+    #[test]
+    fn membership_is_readable_off_the_stack() {
+        let a = grouped();
+        assert_eq!(nesting(&a.tracks), ". G   .   .", "{}", nesting(&a.tracks));
+        assert_eq!(track::group_members(&a.tracks, 1), 2..4);
+        assert_eq!(track::parent_group(&a.tracks, 2), Some(1));
+        assert_eq!(track::parent_group(&a.tracks, 3), Some(1));
+        assert_eq!(track::parent_group(&a.tracks, 0), None);
+        assert_eq!(track::parent_group(&a.tracks, 1), None);
+        // A lane that is not a group holds nothing.
+        assert!(track::group_members(&a.tracks, 0).is_empty());
+
+        // Grouping always wraps the selected lane, so a group is never
+        // born empty — but an empty one is still a real state rather
+        // than a broken one, and it is what the LAST lane leaving makes.
+        let mut lone = Arrangement::default();
+        lone.select_track(0);
+        assert!(lone.group_track());
+        assert_eq!(track::group_members(&lone.tracks, 0), 1..2);
+        lone.select_track(1);
+        assert_eq!(lone.nest_track(false), Ok(()));
+        assert!(
+            track::group_members(&lone.tracks, 0).is_empty(),
+            "the group did not notice its last lane leaving"
+        );
+        assert!(lone.tracks[0].is_group);
+    }
+
+    /// A GROUP'S SWITCH IS THE WHOLE POINT OF A GROUP.
+    ///
+    /// One mute that takes the drums out, however many lanes the drums
+    /// are — and a solo that keeps the bus its members have to get out
+    /// through, because otherwise soloing a lane would silence itself.
+    #[test]
+    fn mute_and_solo_read_through_the_group_above() {
+        let mut a = grouped();
+        assert!((0..4).all(|i| track_audible(&a.tracks, i)));
+
+        a.tracks[1].mute = true;
+        assert!(track_audible(&a.tracks, 0), "an outside lane is untouched");
+        assert!(!track_audible(&a.tracks, 1));
+        assert!(
+            !track_audible(&a.tracks, 2) && !track_audible(&a.tracks, 3),
+            "a muted group must take its members with it"
+        );
+        a.tracks[1].mute = false;
+
+        // Soloing a MEMBER keeps the bus it lives on, or its signal has
+        // nowhere to get out through.
+        a.tracks[2].solo = true;
+        assert!(track_audible(&a.tracks, 2));
+        assert!(
+            track_audible(&a.tracks, 1),
+            "the group carrying the soloed lane was dropped"
+        );
+        assert!(
+            !track_audible(&a.tracks, 0),
+            "an unsoloed lane still sounded"
+        );
+        assert!(!track_audible(&a.tracks, 3), "so did its sibling");
+        a.tracks[2].solo = false;
+
+        // Soloing the GROUP sounds everything in it.
+        a.tracks[1].solo = true;
+        assert!(track_audible(&a.tracks, 1));
+        assert!(track_audible(&a.tracks, 2) && track_audible(&a.tracks, 3));
+        assert!(!track_audible(&a.tracks, 0));
+    }
+
+    /// MEMBERS LAND ON THE GROUP'S BUS, AND THE GROUP LANDS ON THE MASTER.
+    ///
+    /// The claim a group is for: one fader, one chain, one place every
+    /// member's signal passes through.
+    #[test]
+    fn a_group_sums_its_members_and_carries_them_to_the_master() {
+        let a = grouped();
+        let (spec, nodes) =
+            build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
+        let group = nodes.pans[1].expect("a group has an output stage");
+        let members: Vec<NodeId> = [2, 3].iter().map(|i| nodes.pans[*i].unwrap()).collect();
+
+        // Each member reaches the group's bus, and the bus reaches the
+        // group's own chain — so following any member forward arrives at
+        // the group's fader.
+        for member in &members {
+            let bus = fed_by(&spec, *member);
+            assert_eq!(bus.len(), 1, "a member fans out somewhere unexpected");
+            assert!(
+                !fed_by(&spec, bus[0]).is_empty(),
+                "the group's bus goes nowhere"
+            );
+        }
+        // The lane OUTSIDE the group did not join it.
+        let outside = nodes.pans[0].unwrap();
+        assert!(
+            fed_by(&spec, outside) != fed_by(&spec, members[0]),
+            "a lane outside the group landed on its bus"
+        );
+        assert!(
+            !fed_by(&spec, group).is_empty(),
+            "the group reaches nothing"
+        );
+        assert!(spec.compile(48_000, 256).is_ok());
+
+        // And nesting is SHAPE: it is wiring, which no letter can move.
+        let mut flat = a.tracks.clone();
+        for track in &mut flat {
+            track.depth = 0;
+            track.is_group = false;
+        }
+        assert_ne!(
+            shape_hash(&a.tracks, &a.master, &a.returns),
+            shape_hash(&flat, &a.master, &a.returns)
+        );
+    }
+
+    /// A GROUP WITH MORE MEMBERS THAN A NODE HAS INPUTS STILL COMPILES.
+    ///
+    /// Fan-in is capped at eight, and a drum bus with a dozen lanes on it
+    /// is an ordinary thing rather than an exotic one — so a group's
+    /// members are reduced through the same tree the master's are.
+    #[test]
+    fn a_group_wider_than_the_fan_in_cap_compiles() {
+        let mut a = Arrangement::default();
+        while a.tracks.len() < daw::audio::graph::MAX_NODE_INPUTS + 4 {
+            a.add_track(TrackKind::Midi);
+        }
+        for i in 0..a.tracks.len() {
+            load(&mut a, i, DeviceKind::SineSynth);
+        }
+        a.select_track(0);
+        assert!(a.group_track());
+        for lane in a.tracks[1..].iter_mut() {
+            lane.depth = 1;
+        }
+        assert!(track::group_members(&a.tracks, 0).len() > daw::audio::graph::MAX_NODE_INPUTS);
+        let (spec, _) = build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
+        assert!(
+            spec.compile(48_000, 256).is_ok(),
+            "a wide group must reduce through a tree, not refuse"
+        );
+    }
+
+    /// GROUPING NESTS, UNGROUPING LIFTS, AND NEITHER MOVES ANYTHING.
+    #[test]
+    fn grouping_and_ungrouping_leave_the_stack_where_it_was() {
+        let mut a = grouped();
+        let names: Vec<String> = a.tracks.iter().map(|track| track.name.clone()).collect();
+
+        // A group can be wrapped in a group, and its members go with it.
+        a.select_track(1);
+        assert!(a.group_track());
+        assert_eq!(
+            nesting(&a.tracks),
+            ". G   G     .     .",
+            "{}",
+            nesting(&a.tracks)
+        );
+
+        a.select_track(1);
+        assert!(a.ungroup_track());
+        assert_eq!(nesting(&a.tracks), ". G   .   .");
+        assert_eq!(
+            a.tracks.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
+            names,
+            "the lanes moved"
+        );
+
+        // Only a group can be dissolved.
+        a.select_track(0);
+        assert!(!a.ungroup_track());
+    }
+
+    /// LEAVING A GROUP IS OFFERED TO ITS LAST LANE AND REFUSED IN WORDS
+    /// TO THE OTHERS.
+    ///
+    /// A lane in the middle cannot leave without MOVING, since a group's
+    /// members are the contiguous run beneath it — and moving is a verb
+    /// the user already has, so the refusal points at it.
+    #[test]
+    fn only_the_last_lane_in_a_group_can_leave_it() {
+        let mut a = grouped();
+        a.select_track(2);
+        assert!(
+            a.nest_track(false)
+                .is_err_and(|why| why.contains("move it down")),
+            "a lane in the middle left without moving"
+        );
+        assert_eq!(nesting(&a.tracks), ". G   .   .");
+
+        a.select_track(3);
+        assert_eq!(a.nest_track(false), Ok(()));
+        assert_eq!(nesting(&a.tracks), ". G   . .");
+        assert_eq!(track::group_members(&a.tracks, 1), 2..3);
+
+        // And a lane at the top level has nothing to leave.
+        a.select_track(0);
+        assert!(a.nest_track(false).is_err());
+        // Nor can the top lane join anything above it.
+        assert!(a.nest_track(true).is_err());
+    }
+
+    /// A FILE IS INPUT: a depth that outruns the stack above it names a
+    /// group that is not there, and is pulled back to something the
+    /// stack can actually mean.
+    #[test]
+    fn nesting_that_names_no_group_is_flattened_on_load() {
+        let mut arr = Arrangement::default();
+        arr.tracks[0].depth = 4;
+        arr.tracks[1].depth = 7;
+        arr.tracks[2].is_group = true;
+        arr.tracks[2].depth = 9;
+        let mut back = Arrangement::default();
+        let mut transport = Transport::default();
+        apply_project_doc(
+            project_doc(&arr, &Transport::default()),
+            &mut back,
+            &mut transport,
+        );
+        assert_eq!(
+            back.tracks[0].depth, 0,
+            "the first lane is always top level"
+        );
+        assert_eq!(back.tracks[1].depth, 0, "no group above it to belong to");
+        assert_eq!(back.tracks[2].depth, 0);
+        for index in 0..back.tracks.len() {
+            let depth = back.tracks[index].depth;
+            assert!(
+                depth == 0 || track::parent_group(&back.tracks, index).is_some(),
+                "lane {index} claims a group that is not there"
+            );
+        }
+        // And a project from before groups is a flat stack, which is what
+        // it was.
+        let older: ProjectDoc = ron::from_str("(version: 2, bpm: 128.0)").unwrap();
+        assert!(
+            older
+                .tracks
+                .iter()
+                .all(|track| !track.is_group && track.depth == 0)
+        );
     }
 
     // ------------------------------------------------- input routing ---

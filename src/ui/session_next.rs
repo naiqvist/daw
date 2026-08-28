@@ -57,6 +57,15 @@ pub struct SessionTrack {
     pub solo: bool,
     pub volume: f32,
     pub pan: f32,
+    /// This lane is a group bus: it sums the lanes nested under it and
+    /// carries no clips of its own.
+    #[serde(default)]
+    pub is_group: bool,
+    /// How deeply nested. Drawn as indentation, which is the whole of
+    /// what the view needs to know about it — where a lane's signal
+    /// actually goes is the graph's business, not the grid's.
+    #[serde(default)]
+    pub depth: u8,
     /// The lane's live input, as a LABEL and a state — the view has no
     /// business knowing what a channel index means, only what to draw
     /// and what to ask for next.
@@ -82,6 +91,8 @@ impl Default for SessionTrack {
             solo: false,
             volume: 1.0,
             pan: 0.0,
+            is_group: false,
+            depth: 0,
             input: "—".to_owned(),
             monitoring: false,
             sends: Vec::new(),
@@ -1605,6 +1616,8 @@ const SEND_LETTER_WIDTH: f32 = 9.0;
 /// that grows on demand, so the gap costs a few zeroed floats and buys
 /// an index space that needs no bookkeeping.
 const RETURN_HOLD_BASE: usize = 4096;
+/// How far one level of nesting shifts a label.
+const NEST_INDENT: f32 = 7.0;
 /// The fader's top. A console's fader runs a little past unity so a mix
 /// can be pushed as well as pulled; +6 dB is where this one stops.
 const MAX_FADER_GAIN: f32 = 2.0;
@@ -2318,17 +2331,36 @@ fn paint_track_header(
         );
     }
     let text_rect = rect.shrink2(egui::vec2(6.0, 4.0));
+    // Nesting is drawn as INDENTATION and nothing else. A lane's depth
+    // is a fact about where its signal goes, and the one thing a reader
+    // needs from it here is the shape of the stack at a glance.
+    let indent = f32::from(track.depth) * NEST_INDENT;
     ui.painter().text(
-        text_rect.left_top(),
+        text_rect.left_top() + egui::vec2(indent, 0.0),
         egui::Align2::LEFT_TOP,
         &track.name,
         egui::FontId::proportional(BODY_FONT),
         colors.text,
     );
+    if track.depth > 0 {
+        // The rule down the left says which group the lane is in without
+        // making the reader count the indent.
+        ui.painter().line_segment(
+            [
+                egui::pos2(text_rect.left() + indent - 3.0, rect.top() + 3.0),
+                egui::pos2(text_rect.left() + indent - 3.0, rect.bottom() - 3.0),
+            ],
+            egui::Stroke::new(1.0, colors.outline),
+        );
+    }
     ui.painter().text(
-        text_rect.left_bottom(),
+        text_rect.left_bottom() + egui::vec2(indent, 0.0),
         egui::Align2::LEFT_BOTTOM,
-        track.kind.label(),
+        if track.is_group {
+            "group"
+        } else {
+            track.kind.label()
+        },
         egui::FontId::monospace(MICRO_FONT),
         colors.muted,
     );
@@ -3317,7 +3349,10 @@ fn paint_mixer(
             sends: returns.len(),
             // A note lane has no input path at all, so it is offered no
             // control rather than one that could only ever be silence.
-            io: matches!(track.kind, TrackKind::Audio),
+            // Nor does a group: its source is the lanes under it, and
+            // the only thing that could be routed into one is what is
+            // already there.
+            io: matches!(track.kind, TrackKind::Audio) && !track.is_group,
         },
     );
     ui.painter().rect_filled(rect, 0.0, colors.surface);
@@ -3325,6 +3360,27 @@ fn paint_mixer(
         [rect.right_top(), rect.right_bottom()],
         egui::Stroke::new(1.0, colors.divider),
     );
+    // The nesting, drawn down the strip's own left edge. A mixer read
+    // without its headers must still say which lanes are a group and
+    // which are its members, or a fader move lands on the wrong bus.
+    if track.depth > 0 || track.is_group {
+        let rule = egui::Rect::from_min_max(
+            rect.left_top(),
+            egui::pos2(
+                rect.left() + (f32::from(track.depth) + 1.0).min(3.0),
+                rect.bottom(),
+            ),
+        );
+        ui.painter().rect_filled(
+            rule,
+            0.0,
+            if track.is_group {
+                colors.selected
+            } else {
+                colors.outline
+            },
+        );
+    }
 
     // ---- mute and solo.
     let mute = control_button(

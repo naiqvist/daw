@@ -42,6 +42,20 @@ pub struct Track {
     /// that is what the engine multiplies by; the fader does the dB
     /// mapping, which is the only place the curve belongs.
     pub volume: f32,
+    /// This lane is a GROUP: it carries no clips and no instrument, and
+    /// its source is the sum of the lanes nested under it.
+    #[serde(default)]
+    pub is_group: bool,
+    /// How deeply nested in the stack. Zero is top level; a lane at
+    /// depth `d` belongs to the nearest group above it at depth `d - 1`.
+    ///
+    /// POSITION, not a pointer. A group and its members are contiguous —
+    /// the model every desk with groups uses — so membership is readable
+    /// off the stack and cannot go stale when a lane moves. The cost is
+    /// that a lane cannot belong to a group it is not next to, which is
+    /// also true of the thing it models.
+    #[serde(default)]
+    pub depth: u8,
     /// Where this lane's LIVE signal comes from, beside its clips.
     #[serde(default)]
     pub input: TrackInput,
@@ -215,6 +229,15 @@ impl Track {
         }
     }
 
+    /// A fresh GROUP lane. Audio-kinded because it holds no notes and
+    /// takes no instrument, which is what that kind already means here.
+    pub fn group(name: String) -> Self {
+        Self {
+            is_group: true,
+            ..Self::new(TrackKind::Audio, name)
+        }
+    }
+
     /// The device with this instance id, if this track carries it.
     pub fn device(&self, id: u64) -> Option<&DeviceInstance> {
         self.chain.iter().find(|instance| instance.id == id)
@@ -376,6 +399,106 @@ impl MasterTrack {
     }
 }
 
+// ------------------------------------------------------------- groups ---
+
+/// How deeply groups may nest. Eight, which is more than a mix has ever
+/// needed and small enough that the recursive walks below cannot run
+/// away on a hand-edited file.
+pub const MAX_GROUP_DEPTH: u8 = 8;
+
+/// The lanes nested under the group at `index`.
+///
+/// Empty for a lane that is not a group, and empty for a group nobody
+/// has put anything in yet — which is a real state, not a broken one: a
+/// group is made before it is filled.
+pub fn group_members(tracks: &[Track], index: usize) -> std::ops::Range<usize> {
+    let Some(group) = tracks.get(index).filter(|track| track.is_group) else {
+        return index..index;
+    };
+    let mut end = index + 1;
+    while tracks
+        .get(end)
+        .is_some_and(|track| track.depth > group.depth)
+    {
+        end += 1;
+    }
+    (index + 1)..end
+}
+
+/// The group `index` belongs to, if any.
+///
+/// The nearest lane ABOVE it that is a group one level shallower. The
+/// nesting rule `sanitize_nesting` enforces guarantees there is exactly
+/// one, or none at depth zero.
+pub fn parent_group(tracks: &[Track], index: usize) -> Option<usize> {
+    let depth = tracks.get(index)?.depth;
+    if depth == 0 {
+        return None;
+    }
+    tracks[..index]
+        .iter()
+        .rposition(|track| track.is_group && track.depth + 1 == depth)
+}
+
+/// Silenced by its own switch, or by a group above it.
+///
+/// A group's mute is the whole point of a group: one switch that takes
+/// the drums out, however many lanes the drums are.
+pub fn muted_in_place(tracks: &[Track], index: usize) -> bool {
+    let mut at = index;
+    loop {
+        if tracks.get(at).is_some_and(|track| track.mute) {
+            return true;
+        }
+        match parent_group(tracks, at) {
+            Some(parent) => at = parent,
+            None => return false,
+        }
+    }
+}
+
+/// Whether this lane belongs in a solo that is running somewhere.
+///
+/// Three ways in: it is soloed itself; a group ABOVE it is soloed, since
+/// soloing the drums means hearing the drums; or it is a group holding
+/// something soloed, since the soloed lane's signal has to get out
+/// through the bus it lives on.
+pub fn solo_in_scope(tracks: &[Track], index: usize) -> bool {
+    let Some(track) = tracks.get(index) else {
+        return false;
+    };
+    if track.solo {
+        return true;
+    }
+    let mut at = index;
+    while let Some(parent) = parent_group(tracks, at) {
+        if tracks[parent].solo {
+            return true;
+        }
+        at = parent;
+    }
+    group_members(tracks, index).any(|member| solo_in_scope(tracks, member))
+}
+
+/// Force the nesting rule onto a stack that came from a FILE.
+///
+/// The rule is one line: a lane may sit one level deeper than what came
+/// before it allows, and no deeper. A lane whose depth outruns that has
+/// no group above it to belong to, and `parent_group` would answer
+/// `None` for a lane the stack claims is nested — so the depth is
+/// pulled back to something the stack can actually mean.
+pub fn sanitize_nesting(tracks: &mut [Track]) {
+    let mut allowed = 0;
+    for track in tracks.iter_mut() {
+        track.depth = track.depth.min(allowed).min(MAX_GROUP_DEPTH);
+        allowed = if track.is_group {
+            track.depth.saturating_add(1)
+        } else {
+            track.depth
+        };
+    }
+}
+
 /// A RETURN: a bus every track can feed, which lands on the master.
 ///
 /// Shaped like [`MasterTrack`] rather than like [`Track`], because that
@@ -488,6 +611,8 @@ impl Default for Track {
             solo: false,
             pan: 0.0,
             volume: 1.0,
+            is_group: false,
+            depth: 0,
             input: TrackInput::default(),
             monitor: Monitor::default(),
             sends: Vec::new(),
@@ -523,6 +648,12 @@ pub struct TrackWire {
     pub solo: bool,
     pub pan: f32,
     pub volume: f32,
+    /// Absent from a project written before groups existed, which loads
+    /// as a flat stack — which is what it was.
+    #[serde(default)]
+    pub is_group: bool,
+    #[serde(default)]
+    pub depth: u8,
     /// Absent from a project written before routing existed, which loads
     /// as a lane that is its clips and nothing else — exactly how it
     /// sounded.
@@ -559,6 +690,8 @@ impl Default for TrackWire {
             solo: track.solo,
             pan: track.pan,
             volume: track.volume,
+            is_group: track.is_group,
+            depth: track.depth,
             input: track.input,
             monitor: track.monitor,
             sends: track.sends,
@@ -634,6 +767,8 @@ impl<'de> serde::Deserialize<'de> for Track {
             solo: wire.solo,
             pan: wire.pan,
             volume: wire.volume,
+            is_group: wire.is_group,
+            depth: wire.depth,
             input: wire.input,
             monitor: wire.monitor,
             sends: wire.sends,
