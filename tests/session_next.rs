@@ -12,6 +12,10 @@ mod ui {
     // The affordance rule is the app's, not this module's — the same
     // shim the probe rides, for the same reason.
     pub use daw::ui::affordance;
+    // And the HUD marks: a refused control is struck through with the
+    // same hatch everywhere, or "refused" means one thing here and
+    // another in the rack.
+    pub use daw::ui::hud;
 }
 
 #[test]

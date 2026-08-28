@@ -457,6 +457,13 @@ pub fn sampler_edits(state: &SamplerUi) -> Vec<ParamEdit> {
 /// the sound comes from, how it repeats, what shapes it, what moves it,
 /// what dirties it. The order inside a row is the order you would set
 /// them in.
+/// How many pages this card has, for whoever needs to keep clear of its
+/// tab dots — see `card::tabs_width`. Derived from `PAGES` rather than
+/// stated again, so the two cannot disagree.
+pub fn pages() -> usize {
+    PAGES.len()
+}
+
 const PAGES: [&[&[u32]]; 5] = [
     // sample: what plays, and at what pitch.
     &[&[

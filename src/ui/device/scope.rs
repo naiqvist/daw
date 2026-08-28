@@ -104,6 +104,10 @@ pub struct Reading {
     /// Reduction, in dB. Zero is none, negative is reduction — the gain
     /// computer's own sign, carried all the way to the paint.
     pub reduction_db: f32,
+    /// Per-band gain movement, for a multiband device — see
+    /// [`crate::audio::graph::Readout::bands`]. Zero for everything
+    /// else, which draws nothing.
+    pub bands: [f32; 3],
 }
 
 impl Default for Reading {
@@ -111,6 +115,7 @@ impl Default for Reading {
         Self {
             level_db: LEVEL_FLOOR_DB,
             reduction_db: 0.0,
+            bands: [0.0; 3],
         }
     }
 }
@@ -144,9 +149,14 @@ impl Default for History {
 impl History {
     /// Add this frame's reading.
     pub fn push(&mut self, reading: Reading) {
+        let mut bands = reading.bands;
+        for band in bands.iter_mut() {
+            *band = finite(*band, 0.0);
+        }
         let reading = Reading {
             level_db: finite(reading.level_db, LEVEL_FLOOR_DB),
             reduction_db: finite(reading.reduction_db, 0.0).min(0.0),
+            bands,
         };
         if let Some(slot) = self.ring.get_mut(self.head) {
             *slot = reading;
@@ -436,6 +446,7 @@ mod tests {
             history.push(Reading {
                 level_db: -60.0 + i as f32,
                 reduction_db: 0.0,
+                bands: [0.0; 3],
             });
         }
         let seen: Vec<f32> = history.iter().map(|r| r.level_db).collect();
@@ -457,6 +468,7 @@ mod tests {
             history.push(Reading {
                 level_db: -12.0,
                 reduction_db: db,
+                bands: [0.0; 3],
             });
         }
         assert_eq!(history.peak_db(), -6.5);
@@ -464,6 +476,7 @@ mod tests {
         history.push(Reading {
             level_db: -12.0,
             reduction_db: 0.0,
+            bands: [0.0; 3],
         });
         assert_eq!(history.peak_db(), -6.5);
         history.clear_peak();
@@ -478,6 +491,7 @@ mod tests {
         history.push(Reading {
             level_db: f32::NAN,
             reduction_db: f32::NAN,
+            bands: [0.0; 3],
         });
         assert!(history.latest().level_db.is_finite());
         assert!(history.latest().reduction_db.is_finite());
@@ -486,6 +500,7 @@ mod tests {
         history.push(Reading {
             level_db: -6.0,
             reduction_db: 12.0,
+            bands: [0.0; 3],
         });
         assert!(history.latest().reduction_db <= 0.0);
     }

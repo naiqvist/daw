@@ -56,6 +56,9 @@ pub enum UiAction {
     /// Move the cursor the same way, but keep the selection's anchor — so
     /// the selection grows or shrinks instead of collapsing. Shift+arrow.
     ExtendCell(i32),
+    /// Move every selected timeline clip by this many grid divisions.
+    /// Ableton's plain Left / Right nudge while clips own the selection.
+    NudgeSelectedClips(i32),
     /// Remove the selected clip. The mouse selects, this disposes.
     DeleteSelected,
     /// Create a one-bar MIDI clip at the keyboard cursor, or on the active
@@ -66,8 +69,12 @@ pub enum UiAction {
     /// at the cursor (or selection, or playhead); duplicate places a copy
     /// directly after the original — Ableton's Ctrl+D.
     CopyClip,
+    /// Cut the selected clip set to the Arrangement clipboard. Ctrl+X.
+    CutClip,
     PasteClip,
     DuplicateClip,
+    /// Select every timeline clip. Ctrl+A while Arrangement owns keys.
+    SelectAllClips,
     /// Split the clip under the cell cursor at the cursor's beat. Ctrl+E.
     SplitAtCursor,
     /// Merge the MIDI clips under the time selection into one. Ctrl+J.
@@ -196,11 +203,14 @@ impl UiAction {
             Self::LoopFromSelection => "Loop selection",
             Self::MoveCell(_) => "Move cursor",
             Self::ExtendCell(_) => "Extend selection",
+            Self::NudgeSelectedClips(_) => "Nudge selected clips",
             Self::DeleteSelected => "Delete selected clip",
             Self::CreateClip => "Create MIDI clip",
             Self::CopyClip => "Copy clip",
+            Self::CutClip => "Cut clip",
             Self::PasteClip => "Paste clip",
             Self::DuplicateClip => "Duplicate clip",
+            Self::SelectAllClips => "Select all clips",
             Self::SplitAtCursor => "Split clip",
             Self::Consolidate => "Consolidate",
             Self::DeleteTime => "Delete time",
@@ -267,11 +277,14 @@ impl UiAction {
             | Self::LoopFromSelection
             | Self::MoveCell(_)
             | Self::ExtendCell(_)
+            | Self::NudgeSelectedClips(_)
             | Self::DeleteSelected
             | Self::CreateClip
             | Self::CopyClip
+            | Self::CutClip
             | Self::PasteClip
             | Self::DuplicateClip
+            | Self::SelectAllClips
             | Self::SplitAtCursor
             | Self::Consolidate
             | Self::DeleteTime

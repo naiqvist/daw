@@ -105,6 +105,40 @@ pub struct Handle<'a> {
     /// What the ghost says while it is in the air.
     pub name: &'a str,
     pub selected: bool,
+    /// How much of the title band's LEFT EDGE the grip must not claim,
+    /// in points — the page dots, when the card has them.
+    ///
+    /// The grip is allocated after the card's face, and egui gives a
+    /// press to the LAST widget added at a position, so without this
+    /// the strip swallows every dot underneath it. That is rule 2 of
+    /// `notes/20260826-device-ui-contract.md` — a control drawn over
+    /// another states its own geometry — read the other way round: the
+    /// thing on top is the one that has to know where not to listen.
+    ///
+    /// Use [`tabs_width`]; the test beside it holds that figure to
+    /// where the dots actually land.
+    pub keep_clear: f32,
+}
+
+/// How wide a card's page dots are, from the left edge of its title
+/// band.
+///
+/// Derived from the same numbers [`dot_row`] lays out with, and held to
+/// what it ACTUALLY draws by
+/// `the_dot_row_is_as_wide_as_this_says_it_is` — the same arrangement
+/// `title_band` has with `tabbed_card_gripped`, and for the same
+/// reason: a second copy of a layout is a copy that drifts.
+///
+/// Zero for a card with one page, which has no dots at all.
+pub fn tabs_width(ui: &egui::Ui, theme: &Theme, pages: usize) -> f32 {
+    if pages < 2 {
+        return 0.0;
+    }
+    let dot = theme.sp(space::SM);
+    let gap = ui.spacing().item_spacing.x;
+    // The strip's own left inset, then the dots, then the space the
+    // card puts between the last dot and its name.
+    theme.sp(space::SM) + pages as f32 * dot + (pages - 1) as f32 * gap + theme.sp(space::XS)
 }
 
 /// Claim a card's title strip as its handle.
@@ -121,8 +155,19 @@ pub struct Handle<'a> {
 pub fn grip(ui: &mut egui::Ui, theme: &Theme, handle: Handle<'_>) -> Grip {
     use crate::ui::affordance::{Afford, Affords};
 
+    // The strip MINUS its page dots. See `Handle::keep_clear`: the grip
+    // is added after the card, so it would otherwise take every press
+    // meant for a tab — which is what it did, and made the sampler's
+    // pages unreachable by pointer.
+    let band = egui::Rect::from_min_max(
+        egui::pos2(
+            (handle.title.left() + handle.keep_clear).min(handle.title.right()),
+            handle.title.top(),
+        ),
+        handle.title.max,
+    );
     let response = ui
-        .interact(handle.title, handle.id, egui::Sense::click_and_drag())
+        .interact(band, handle.id, egui::Sense::click_and_drag())
         .affords(Affords::Carry);
     let mut out = Grip {
         clicked: response.clicked(),
@@ -1265,6 +1310,7 @@ pub(crate) mod grip_tests {
                         index: index as usize - 1,
                         name: "filter",
                         selected: false,
+                        keep_clear: 0.0,
                     },
                 ));
             }
@@ -1314,6 +1360,7 @@ pub(crate) mod grip_tests {
                     index: 0,
                     name: "filter",
                     selected: false,
+                    keep_clear: 0.0,
                 },
             )
         });
@@ -1321,6 +1368,144 @@ pub(crate) mod grip_tests {
         assert!(
             !frames.iter().any(|grip| grip.carrying),
             "a click picked the card up"
+        );
+    }
+
+    /// A PRESS ON A PAGE DOT REACHES THE DOT, not the grip over it.
+    ///
+    /// This shipped broken: the grip is claimed after the card's face,
+    /// egui gives a press to the LAST widget added at a position, and
+    /// the strip therefore swallowed every tab underneath it. On the
+    /// sampler — five pages — that meant the card's pages could not be
+    /// changed by pointer at all.
+    ///
+    /// None of the standing card tests could see it. They drive the
+    /// card; this one drives the card AND the grip that goes over it,
+    /// which is the arrangement the app actually builds.
+    #[test]
+    fn a_press_on_a_page_dot_is_not_taken_by_the_grip() {
+        let theme = Theme::dark();
+        let context = egui::Context::default();
+        let view = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(420.0, 260.0));
+        const PAGES: usize = 5;
+
+        // Where the second dot sits: the strip's inset, one dot and one
+        // gap along, then half a dot in.
+        let dot = theme.sp(space::SM);
+        let mut page = 0usize;
+        let mut card = egui::Rect::NOTHING;
+        let mut at = egui::Pos2::ZERO;
+        let mut lead = 0.0f32;
+        let mut run = context.run_ui(egui::RawInput::default(), |ui| {
+            let gap = ui.spacing().item_spacing.x;
+            let (_, title) = tabbed_card_gripped(
+                ui,
+                &theme,
+                "sampler",
+                control::DEVICE_H,
+                PAGES,
+                &mut page,
+                |ui, _| ui.label("body"),
+            );
+            card = title.union(egui::Rect::from_min_size(
+                title.min,
+                egui::vec2(title.width(), theme.sp(control::DEVICE_H)),
+            ));
+            at = egui::pos2(
+                title.left() + theme.sp(space::SM) + dot + gap + dot * 0.5,
+                title.center().y,
+            );
+            lead = tabs_width(ui, &theme, PAGES);
+        });
+        run.textures_delta.clear();
+
+        // The grip must not even claim that point.
+        assert!(
+            at.x < card.left() + lead,
+            "the dot at {:.1} is outside the {:.1} pt the grip keeps clear",
+            at.x - card.left(),
+            lead
+        );
+
+        let title = egui::Rect::from_min_max(
+            card.min,
+            egui::pos2(card.right(), card.top() + theme.sp(control::POLY_CELL_H)),
+        );
+        let mut chose = 0usize;
+        let frames = probe::run(&context, view, &probe::click_path(at), |ui| {
+            let mut page = 0usize;
+            let keep_clear = tabs_width(ui, &theme, PAGES);
+            let (_, band) = tabbed_card_gripped(
+                ui,
+                &theme,
+                "sampler",
+                control::DEVICE_H,
+                PAGES,
+                &mut page,
+                |ui, _| ui.label("body"),
+            );
+            chose = page;
+            let _ = title;
+            grip(
+                ui,
+                &theme,
+                Handle {
+                    id: egui::Id::new("grip_over_dots"),
+                    card: band,
+                    title: band,
+                    instance: 1,
+                    index: 0,
+                    name: "sampler",
+                    selected: false,
+                    keep_clear,
+                },
+            )
+        });
+
+        assert_eq!(chose, 1, "the press did not reach the second page dot");
+        assert!(
+            !frames.iter().any(|grip| grip.clicked),
+            "the grip took a press meant for a tab"
+        );
+    }
+
+    /// AND THE GRIP IS STILL A GRIP. Keeping clear of the dots must not
+    /// cost the rest of the strip — a card you cannot pick up is a worse
+    /// bug than a tab you cannot press.
+    #[test]
+    fn the_grip_still_takes_the_rest_of_the_strip() {
+        let theme = Theme::dark();
+        let context = egui::Context::default();
+        let view = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 240.0));
+        let card = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(160.0, 200.0));
+        let title = title_band(&theme, card);
+        let mut lead = 0.0f32;
+        let mut run = context.run_ui(egui::RawInput::default(), |ui| {
+            lead = tabs_width(ui, &theme, 5);
+        });
+        run.textures_delta.clear();
+        // Just past the dots, and the name is there — so is the grip.
+        let at = egui::pos2(title.left() + lead + 4.0, title.center().y);
+
+        let frames = probe::run(&context, view, &probe::click_path(at), |ui| {
+            grip(
+                ui,
+                &theme,
+                Handle {
+                    id: egui::Id::new("grip_past_dots"),
+                    card,
+                    title,
+                    instance: 1,
+                    index: 0,
+                    name: "sampler",
+                    selected: false,
+                    keep_clear: lead,
+                },
+            )
+        });
+        assert!(
+            frames.iter().any(|grip| grip.clicked),
+            "the strip stopped being a handle"
         );
     }
 

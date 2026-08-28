@@ -2030,6 +2030,27 @@ pub enum Node {
     Glue {
         core: Box<crate::audio::glue::GlueCore>,
     },
+    /// The surgical compressor — see `crate::audio::clamp`. A FEEDFORWARD
+    /// peak/RMS design with a fast floor, where the glue is a feedback
+    /// bus box: this one is meant to catch a transient, not to breathe
+    /// with a mix.
+    ///
+    /// Stereo in, stereo out, and LINKED for the same reason the glue is:
+    /// one detector over both sides, so the image does not walk.
+    Clamp {
+        core: Box<crate::audio::clamp::Clamp>,
+    },
+    /// Three-band dynamics — see `crate::audio::prism`. A Linkwitz–Riley
+    /// split, three of the same detector/computer/ballistics trio, and a
+    /// saturation on each band whose amount is that band's own gain
+    /// movement.
+    ///
+    /// Stereo in, stereo out, and each band's detector hears both sides
+    /// — three independent stereo compressors would walk the image three
+    /// different ways at once.
+    Prism {
+        core: Box<crate::audio::prism::Prism>,
+    },
     /// Downward expansion — see `crate::audio::gate`. The glue's three
     /// kernels with the computer's mode flipped, plus the two things a
     /// gate must do differently: hear its own INPUT, and cross its
@@ -2154,6 +2175,8 @@ impl Node {
             | NodeSpec::Eq { .. }
             | NodeSpec::Filter { .. }
             | NodeSpec::Glue { .. }
+            | NodeSpec::Clamp { .. }
+            | NodeSpec::Prism { .. }
             | NodeSpec::Gate { .. }
             | NodeSpec::Strip { .. }
             | NodeSpec::Resyn { .. }
@@ -2179,6 +2202,8 @@ impl Node {
     fn readout(&self) -> Option<Readout> {
         match self {
             Node::Glue { core } => Some(core.readout()),
+            Node::Clamp { core } => Some(core.readout()),
+            Node::Prism { core } => Some(core.readout()),
             Node::Gate { core } => Some(core.readout()),
             _ => None,
         }
@@ -3627,6 +3652,28 @@ impl Node {
                 }
                 core.process(out.l, right);
             }
+            Node::Prism { core } => {
+                let right = out.r.as_deref_mut().unwrap_or(&mut []);
+                sum_inputs_stereo(inputs, out.l, right);
+                // A seek must not ring the crossover into the new
+                // position, nor carry three bands' worth of gain
+                // reduction across with it.
+                if ctx.discontinuity {
+                    core.reset();
+                }
+                core.process(out.l, right);
+            }
+            Node::Clamp { core } => {
+                let right = out.r.as_deref_mut().unwrap_or(&mut []);
+                sum_inputs_stereo(inputs, out.l, right);
+                // Same reason as the glue's: arrive open, so the seek
+                // does not hand the new position a gain reduction that
+                // belonged to the old one.
+                if ctx.discontinuity {
+                    core.reset();
+                }
+                core.process(out.l, right);
+            }
 
             Node::Utility { core } => {
                 let right = out.r.as_deref_mut().unwrap_or(&mut []);
@@ -4166,6 +4213,8 @@ impl Node {
             // range and every clamp, so a letter cannot be routed by two
             // different opinions about what id 4 is.
             Node::Glue { core } => core.set_param(param, value),
+            Node::Clamp { core } => core.set_param(param, value),
+            Node::Prism { core } => core.set_param(param, value),
             // The whole table, straight through, for the reason the glue
             // does it: the core owns every range and every clamp, so a
             // letter cannot be routed by two opinions about what id 3 is.
@@ -4506,6 +4555,13 @@ pub struct Readout {
     /// none and negative is reduction, the same sign the gain computer
     /// works in.
     pub reduction_db: f32,
+    /// Up to three BANDS' worth of the same figure, for a device that
+    /// has bands — negative for reduction, positive for lift.
+    ///
+    /// Zero on everything else, and that is not a special case: a device
+    /// with one band has already said everything it has to say in
+    /// `reduction_db`, and three zeroes draw nothing.
+    pub bands: [f32; 3],
 }
 
 impl Default for Readout {
@@ -4513,6 +4569,7 @@ impl Default for Readout {
         Self {
             level_db: crate::dsp::dynamics::FLOOR_DB,
             reduction_db: 0.0,
+            bands: [0.0; 3],
         }
     }
 }
@@ -5074,6 +5131,22 @@ pub enum NodeSpec {
     Glue {
         #[serde(default)]
         params: crate::audio::glue::GlueParams,
+    },
+    /// A surgical compressor on whatever feeds it. Every range and every
+    /// `ParamChange` id is `crate::params::clamp::TABLE`'s.
+    ///
+    /// Stereo in, stereo out.
+    Clamp {
+        #[serde(default)]
+        params: crate::audio::clamp::ClampParams,
+    },
+    /// Three-band dynamics on whatever feeds it. Every range and every
+    /// `ParamChange` id is `crate::params::prism::TABLE`'s.
+    ///
+    /// Stereo in, stereo out.
+    Prism {
+        #[serde(default)]
+        params: crate::audio::prism::PrismParams,
     },
     /// A gate on whatever feeds it. Every range and every `ParamChange`
     /// id is `crate::params::gate::TABLE`'s.
@@ -6620,6 +6693,15 @@ impl GraphSpec {
                             sample_rate as f32,
                             params,
                         )),
+                    },
+                    Some(NodeSpec::Prism { params }) => Node::Prism {
+                        // Green zone: the crossover, three sets of
+                        // dynamics, and the band buffers.
+                        core: Box::new(crate::audio::prism::Prism::new(sample_rate as f32, params)),
+                    },
+                    Some(NodeSpec::Clamp { params }) => Node::Clamp {
+                        // Green zone: every kernel the callback will use.
+                        core: Box::new(crate::audio::clamp::Clamp::new(sample_rate as f32, params)),
                     },
                     Some(NodeSpec::Glue { params }) => Node::Glue {
                         // Green zone: every kernel the callback will use.

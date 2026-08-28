@@ -294,6 +294,13 @@ fn seesaw(ui: &mut egui::Ui, theme: &Theme, state: &TiltUi) {
             ],
             egui::Stroke::new(stroke::HAIR, theme.grid_sub),
         );
+        painter.text(
+            egui::pos2(field.left(), y_of(db)),
+            egui::Align2::LEFT_BOTTOM,
+            format!("{db:+.0}"),
+            egui::FontId::monospace(font::MICRO_LABEL),
+            theme.text_muted,
+        );
     }
 
     // Unity. The line the plank pivots about, so it is drawn brighter
@@ -308,6 +315,18 @@ fn seesaw(ui: &mut egui::Ui, theme: &Theme, state: &TiltUi) {
 
     let points = curve(state);
     if !points.is_empty() {
+        // A one-pixel blue registration beneath the red response gives the
+        // measured line a crisp two-ink edge. It is the same response twice,
+        // never a second or inferred curve.
+        painter.add(egui::Shape::line(
+            points
+                .iter()
+                .map(|(hz, db)| {
+                    egui::pos2(x_of(*hz), y_of(*db)) + egui::vec2(0.0, theme.sp(stroke::HAIR))
+                })
+                .collect(),
+            egui::Stroke::new(stroke::BOLD, theme.role_time_dim),
+        ));
         painter.add(egui::Shape::line(
             points
                 .iter()
@@ -323,15 +342,28 @@ fn seesaw(ui: &mut egui::Ui, theme: &Theme, state: &TiltUi) {
     // how that promise becomes visible instead of merely true.
     let pivot_x = x_of(tilt_value(PIVOT, state.pivot));
     let w = theme.sp(space::SM);
+    painter.vline(
+        pivot_x,
+        field.y_range(),
+        egui::Stroke::new(stroke::HAIR, theme.role_time_dim.gamma_multiply(0.8)),
+    );
     painter.add(egui::Shape::convex_polygon(
         vec![
             egui::pos2(pivot_x, mid + 1.0),
             egui::pos2(pivot_x - w * 0.5, mid + 1.0 + w),
             egui::pos2(pivot_x + w * 0.5, mid + 1.0 + w),
         ],
-        theme.text_muted,
+        theme.role_time_dim,
         egui::Stroke::NONE,
     ));
+    painter.rect_filled(
+        egui::Rect::from_center_size(
+            egui::pos2(pivot_x, mid),
+            egui::vec2(theme.sp(space::XXS), theme.sp(space::XXS)),
+        ),
+        0.0,
+        theme.role_mod,
+    );
 
     // The corner tag: the whole span the plank covers, which is twice the
     // lean and the number neither cell shows.
@@ -350,6 +382,15 @@ fn seesaw(ui: &mut egui::Ui, theme: &Theme, state: &TiltUi) {
         egui::FontId::proportional(font::MICRO_LABEL),
         theme.text_muted,
     );
+    if let (Some(low), Some(high)) = (points.first(), points.last()) {
+        painter.text(
+            egui::pos2(field.left(), field.top()),
+            egui::Align2::LEFT_TOP,
+            format!("LOW {:+.1} // HIGH {:+.1}", low.1, high.1),
+            egui::FontId::monospace(font::MICRO_LABEL),
+            theme.role_time_dim,
+        );
+    }
 }
 
 /// What ONE cell needs: room for the widest thing it will ever print.

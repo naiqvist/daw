@@ -902,14 +902,9 @@ pub fn wave_hero(
         }
     }
     let painter = ui.painter();
-    // NO ground of its own. An OP-1 engine screen is one black field
-    // with a drawing on it — the well behind this already IS that field,
-    // and a second filled rect inside it only draws a box around
-    // nothing. The curve sits directly on the dark.
-    //
-    // The plot is inset HARD: TE spends most of the screen on emptiness
-    // and lets one thin line carry it. That margin is the design, not
-    // leftover space.
+    // The well behind this is the display. A sparse phase graticule gives
+    // the table a technical frame without pretending to be an input scope:
+    // every stem and point below is sampled from the selected DSP table.
     let plot = rect.shrink2(egui::vec2(theme.sp(space::LG), theme.sp(space::XS)));
     let curve = |wave: usize| -> Vec<egui::Pos2> {
         (0..=64)
@@ -923,17 +918,70 @@ pub fn wave_hero(
             })
             .collect()
     };
-    // ONLY the selected oscillator draws — one hero, one curve. The
-    // other's tag in the corner still says what it is set to; the ghost
-    // overlay was tried and read as clutter rather than context.
     let front = if selected == 0 { a } else { b };
-    // ONE thin stroke. TE draws every waveform, envelope and meter at
-    // hair weight; the boldness came from a plugin idiom, and at this
-    // size it reads as a marker pen next to their needle.
+
+    let baseline = plot.center().y;
+    painter.hline(
+        plot.x_range(),
+        baseline,
+        egui::Stroke::new(stroke::HAIR, theme.divider),
+    );
+    for phase in 0..=8 {
+        let x = egui::lerp(plot.x_range(), phase as f32 / 8.0);
+        let major = phase % 2 == 0;
+        let tick_h = theme.sp(if major { space::XS } else { space::XXS });
+        painter.line_segment(
+            [
+                egui::pos2(x, baseline - tick_h),
+                egui::pos2(x, baseline + tick_h),
+            ],
+            egui::Stroke::new(stroke::HAIR, theme.divider),
+        );
+    }
+
+    // Sixteen table-address stems make the drawing feel sampled rather than
+    // ornamental. The continuous line remains the strongest reading.
+    for sample in 0..=16 {
+        let phase = sample as f32 / 16.0;
+        let x = egui::lerp(plot.x_range(), phase);
+        let y = baseline - wave_sample(front.min(WAVE_COUNT - 1), phase) * plot.height() * 0.42;
+        painter.line_segment(
+            [egui::pos2(x, baseline), egui::pos2(x, y)],
+            egui::Stroke::new(stroke::HAIR, theme.role_shape_dim.gamma_multiply(0.55)),
+        );
+        painter.circle_filled(
+            egui::pos2(x, y),
+            theme.sp(stroke::HAIR),
+            theme.role_shape_dim,
+        );
+    }
     painter.add(egui::Shape::line(
         curve(front),
-        egui::Stroke::new(stroke::HAIR, theme.role_shape),
+        egui::Stroke::new(stroke::BOLD, theme.role_shape),
     ));
+
+    let phase_font = egui::FontId::monospace(font::MICRO_LABEL);
+    painter.text(
+        plot.left_bottom(),
+        egui::Align2::LEFT_BOTTOM,
+        "0",
+        phase_font.clone(),
+        theme.text_muted,
+    );
+    painter.text(
+        plot.center_bottom(),
+        egui::Align2::CENTER_BOTTOM,
+        "PHASE .5",
+        phase_font.clone(),
+        theme.text_muted,
+    );
+    painter.text(
+        plot.right_bottom(),
+        egui::Align2::RIGHT_BOTTOM,
+        "1",
+        phase_font,
+        theme.text_muted,
+    );
 
     // The corner tags ARE the oscillator switch — they already name the
     // two curves, so they carry the click instead of a tab strip above
@@ -2127,8 +2175,9 @@ pub fn level_rail(ui: &mut egui::Ui, theme: &Theme, param: &Param, norm: &mut f3
 
 /// The poly synth's one top-level navigation rail.
 ///
-/// Four named tabs follow the signal path, each carrying the parameter-family
-/// colour of the screen it opens. The whole rail is one keyboard target:
+/// Four numbered stations follow the signal path, each carrying the
+/// parameter-family colour of the screen it opens. The whole rail is one
+/// keyboard target:
 /// arrows and the wheel traverse it, while a click lands directly on a page.
 /// `badges` reports quiet persistent state such as live modulation routes.
 pub fn instrument_tabs(
@@ -2177,6 +2226,14 @@ pub fn instrument_tabs(
         egui::StrokeKind::Inside,
     );
 
+    let rail_y = rect.bottom() - theme.sp(space::XS);
+    let rail_start = rect.left() + cell_w * 0.5;
+    let rail_end = rect.right() - cell_w * 0.5;
+    painter.line_segment(
+        [egui::pos2(rail_start, rail_y), egui::pos2(rail_end, rail_y)],
+        egui::Stroke::new(stroke::HAIR, theme.divider),
+    );
+
     for (i, label) in LABELS.iter().enumerate() {
         let tab = egui::Rect::from_min_size(
             rect.min + egui::vec2(cell_w * i as f32, 0.0),
@@ -2190,22 +2247,48 @@ pub fn instrument_tabs(
             );
         }
         if i == *selected {
-            painter.rect_filled(tab.shrink(stroke::HAIR), design::screen_radius(), dim[i]);
+            painter.rect_filled(
+                tab.shrink(stroke::HAIR),
+                design::screen_radius(),
+                dim[i].gamma_multiply(0.72),
+            );
             painter.hline(
                 tab.x_range(),
                 tab.bottom() - stroke::HAIR,
                 egui::Stroke::new(stroke::BOLD, bright[i]),
             );
         }
-        let text = if badges[i] > 0 {
-            format!("{label} {}", badges[i])
-        } else {
-            (*label).to_owned()
-        };
+
+        let node = egui::pos2(tab.center().x, rail_y);
+        painter.circle_filled(
+            node,
+            theme.sp(if i == *selected {
+                space::XXS
+            } else {
+                stroke::HAIR
+            }),
+            if i == *selected {
+                bright[i]
+            } else {
+                theme.outline
+            },
+        );
+        let number_at = egui::pos2(tab.left() + theme.sp(space::XS), tab.center().y);
         painter.text(
-            tab.center(),
+            number_at,
+            egui::Align2::LEFT_CENTER,
+            format!("{:02}", i + 1),
+            egui::FontId::monospace(font::MICRO_LABEL),
+            if i == *selected {
+                bright[i]
+            } else {
+                theme.outline
+            },
+        );
+        painter.text(
+            egui::pos2(tab.center().x, tab.center().y),
             egui::Align2::CENTER_CENTER,
-            text,
+            *label,
             egui::FontId::proportional(font::MINI_LABEL),
             if i == *selected {
                 bright[i]
@@ -2213,6 +2296,15 @@ pub fn instrument_tabs(
                 theme.text_muted
             },
         );
+        if badges[i] > 0 {
+            painter.text(
+                egui::pos2(tab.right() - theme.sp(space::XS), tab.center().y),
+                egui::Align2::RIGHT_CENTER,
+                format!("×{}", badges[i]),
+                egui::FontId::monospace(font::MICRO_LABEL),
+                bright[i],
+            );
+        }
     }
     if response.has_focus() {
         design::focus_ring(painter, theme, rect);

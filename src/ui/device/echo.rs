@@ -352,18 +352,76 @@ fn taps(ui: &mut egui::Ui, theme: &Theme, state: &mut EchoUi) -> Vec<u32> {
     // field, and a second filled rect inside it draws a box around
     // nothing.
     let axis_y = rect.center().y;
+
+    // Fixed time-address grid. The hero already promises a literal two-second
+    // window, so these divisions are calibration marks rather than decorative
+    // scope furniture. Half-seconds carry numbers; quarter-seconds stay quiet.
+    for division in 0..=8 {
+        let along = division as f32 / 8.0;
+        let x = egui::lerp(rect.x_range(), along);
+        let major = division % 2 == 0;
+        painter.vline(
+            x,
+            rect.y_range(),
+            egui::Stroke::new(
+                stroke::HAIR,
+                if major {
+                    theme.grid_beat
+                } else {
+                    theme.grid_sub
+                },
+            ),
+        );
+        if major {
+            let seconds = along * WINDOW_S;
+            painter.text(
+                egui::pos2(x, rect.bottom() - theme.sp(space::XXS)),
+                if division == 0 {
+                    egui::Align2::LEFT_BOTTOM
+                } else if division == 8 {
+                    egui::Align2::RIGHT_BOTTOM
+                } else {
+                    egui::Align2::CENTER_BOTTOM
+                },
+                format!("{seconds:.1}"),
+                egui::FontId::monospace(font::MICRO_LABEL),
+                theme.text_muted,
+            );
+        }
+    }
     painter.line_segment(
         [
             egui::pos2(rect.left(), axis_y),
             egui::pos2(rect.right(), axis_y),
         ],
-        egui::Stroke::new(stroke::HAIR, theme.grid_beat),
+        egui::Stroke::new(stroke::BOLD, theme.grid_beat),
+    );
+
+    // Two tiny lane registrations explain the up/down grammar without a
+    // legend. They sit on the shared zero line, like channel markings on a
+    // piece of test equipment.
+    let lane_font = egui::FontId::monospace(font::MICRO_LABEL);
+    let lane_x = rect.left() + theme.sp(space::XS);
+    painter.text(
+        egui::pos2(lane_x, axis_y - theme.sp(space::XXS)),
+        egui::Align2::LEFT_BOTTOM,
+        "L",
+        lane_font.clone(),
+        theme.role_time_dim,
+    );
+    painter.text(
+        egui::pos2(lane_x, axis_y + theme.sp(space::XXS)),
+        egui::Align2::LEFT_TOP,
+        "R",
+        lane_font,
+        theme.role_time_dim,
     );
 
     let time = time_seconds(state).max(1e-4);
     let feedback = echo_value(FEEDBACK, state.feedback) * 0.01;
     let spread = echo_value(SPREAD, state.spread) * 0.01;
     let mix = echo_value(MIX, state.mix) * 0.01;
+    let drive = echo_value(DRIVE, state.drive) * 0.01;
     // Height is the WET level, so turning the mix down shrinks the marks
     // — the picture is of what you will hear, not of what the loop is
     // doing privately. The SQUARE ROOT of the mix, not the mix: level is
@@ -393,12 +451,31 @@ fn taps(ui: &mut egui::Ui, theme: &Theme, state: &mut EchoUi) -> Vec<u32> {
                 continue;
             }
             let x = rect.left() + rect.width() * (when / WINDOW_S);
+            let end = egui::pos2(x, axis_y + dir * h);
             painter.line_segment(
-                [egui::pos2(x, axis_y), egui::pos2(x, axis_y + dir * h)],
+                [egui::pos2(x, axis_y), end],
                 // `role_time`: a repeat's position IS a time, and the
                 // blue family is what names time everywhere else.
                 egui::Stroke::new(stroke::MARK, theme.role_time),
             );
+            // A short terminal cap makes each impulse read as a measured
+            // event instead of an anonymous bar. Its width is constant; only
+            // the bar height continues to report level.
+            let cap = theme.sp(space::XXS);
+            painter.line_segment(
+                [end - egui::vec2(cap, 0.0), end + egui::vec2(cap, 0.0)],
+                egui::Stroke::new(stroke::BOLD, theme.role_time),
+            );
+            if drive > 0.001 {
+                // Drive colours the repeats in the DSP. A red registration
+                // point grows with that amount, but does not claim to be a
+                // second waveform or another tap.
+                painter.circle_filled(
+                    end,
+                    theme.sp(stroke::HAIR) + theme.sp(space::XXS) * drive,
+                    theme.role_mod_dim.lerp_to_gamma(theme.role_mod, drive),
+                );
+            }
         }
         // AFTER the mark, not before it: `tick` emits the pre-loop read,
         // so the first repeat leaves at unity and only the ones behind
@@ -423,6 +500,13 @@ fn taps(ui: &mut egui::Ui, theme: &Theme, state: &mut EchoUi) -> Vec<u32> {
         format!("{label}  {}", param_of(FEEDBACK).format(state.feedback)),
         egui::FontId::monospace(font::LABEL),
         theme.text_muted,
+    );
+    painter.text(
+        egui::pos2(rect.center().x, rect.top() + design::gap(theme)),
+        egui::Align2::CENTER_TOP,
+        "STEREO REPEAT FIELD // 2.0 S",
+        egui::FontId::proportional(font::MICRO_LABEL),
+        theme.role_time_dim,
     );
     if response.has_focus() {
         design::focus_ring(painter, theme, rect);

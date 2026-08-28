@@ -309,6 +309,25 @@ fn staircase(ui: &mut egui::Ui, theme: &Theme, state: &LofiUi) {
 
     let (dry, wet, clean) = trace(state);
 
+    // One-cycle address lattice. These eight columns are fixed fractions of
+    // the 500 Hz reference cycle, so the converter's changing tread width
+    // always has a stable clock face behind it.
+    for phase in 0..=8 {
+        let x = egui::lerp(plot.x_range(), phase as f32 / 8.0);
+        painter.vline(
+            x,
+            plot.y_range(),
+            egui::Stroke::new(
+                stroke::HAIR,
+                if phase % 2 == 0 {
+                    theme.grid_beat
+                } else {
+                    theme.grid_sub
+                },
+            ),
+        );
+    }
+
     // The lattice, when it is coarse enough to read: the levels the
     // quantiser is allowed to land on, which is what "4 levels" means as
     // a picture rather than as a number.
@@ -341,7 +360,7 @@ fn staircase(ui: &mut egui::Ui, theme: &Theme, state: &LofiUi) {
         (0..PLOT_N)
             .map(|i| egui::pos2(x_of(i), y_of(dry[i])))
             .collect(),
-        egui::Stroke::new(stroke::HAIR, theme.text_muted),
+        egui::Stroke::new(stroke::HAIR, theme.role_time_dim),
     ));
 
     // The body: one hairline per sample, from the centre out to the held
@@ -366,10 +385,34 @@ fn staircase(ui: &mut egui::Ui, theme: &Theme, state: &LofiUi) {
             steps.push(egui::pos2(x_of(i + 1), y));
         }
     }
+    // The same staircase offset by a physical pixel supplies the cold blue
+    // registration edge; the red trace remains the only signal being drawn.
+    painter.add(egui::Shape::line(
+        steps
+            .iter()
+            .map(|point| *point + egui::vec2(0.0, theme.sp(stroke::HAIR)))
+            .collect(),
+        egui::Stroke::new(stroke::BOLD, theme.role_time_dim),
+    ));
     painter.add(egui::Shape::line(
         steps,
         egui::Stroke::new(stroke::BOLD, theme.role_mod),
     ));
+
+    // Square zero-cross registrations pin the exact processed samples where
+    // the converter changes polarity. Unlike an ornamental scope marker,
+    // these move only when the trace itself moves.
+    for i in 1..PLOT_N {
+        if wet[i - 1].is_sign_negative() != wet[i].is_sign_negative() {
+            let point = egui::pos2(x_of(i), y_of(wet[i]));
+            let size = theme.sp(space::XXS);
+            painter.rect_filled(
+                egui::Rect::from_center_size(point, egui::vec2(size, size)),
+                0.0,
+                theme.role_mod,
+            );
+        }
+    }
 
     // The corner tag. `clean` is the kernel's own answer, not a guess
     // from the knob positions: `Downsampler::is_bypassed` is what decides
@@ -387,6 +430,14 @@ fn staircase(ui: &mut egui::Ui, theme: &Theme, state: &LofiUi) {
         tag,
         egui::FontId::proportional(font::MICRO_LABEL),
         theme.text_muted,
+    );
+    let rate = lofi_value(RATE, state.rate);
+    painter.text(
+        egui::pos2(plot.right(), plot.top()),
+        egui::Align2::RIGHT_TOP,
+        format!("500 HZ REF // CLK ÷{:.1}", PLOT_SR / rate.max(1.0)),
+        egui::FontId::monospace(font::MICRO_LABEL),
+        theme.role_time_dim,
     );
 }
 

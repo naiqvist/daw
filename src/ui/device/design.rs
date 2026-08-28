@@ -183,13 +183,27 @@ pub fn screen_radius() -> f32 {
 ///
 /// The rule is the first one. A mouse drag has the pointer for feedback;
 /// the ring is how a control says the arrow keys will now reach it.
+///
+/// # It is CORNERS, not a box
+///
+/// A closed rectangle drawn around a control covers the control's own
+/// outline, so on a dense surface "focused" and "selected" arrive as the
+/// same closed box in two colours — and in greyscale as one box. Corner
+/// brackets fix the same rectangle with a fifth of the ink at the four
+/// points that define it, which makes focus a different SHAPE rather
+/// than a different colour. See `ui::hud`.
+///
+/// Below `hud::BRACKET_FLOOR` the brackets would be four dots, and the
+/// closed ring says it better; that fallback is the one place the two
+/// marks are allowed to be the same.
 pub fn focus_ring(painter: &egui::Painter, theme: &Theme, rect: egui::Rect) {
-    painter.rect_stroke(
-        rect.expand(stroke::FOCUS),
-        box_radius(),
-        egui::Stroke::new(stroke::FOCUS, theme.focus),
-        egui::StrokeKind::Outside,
-    );
+    let marked = rect.expand(stroke::FOCUS);
+    let ink = egui::Stroke::new(stroke::FOCUS, theme.focus);
+    if crate::ui::hud::is_bracketed(marked) {
+        crate::ui::hud::brackets(painter, marked, ink);
+    } else {
+        painter.rect_stroke(marked, box_radius(), ink, egui::StrokeKind::Outside);
+    }
 }
 
 // ------------------------------------------------------------- compact ---

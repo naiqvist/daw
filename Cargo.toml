@@ -34,8 +34,15 @@ clack-host        = "0.1.1"
 eframe            = { version = "0.36.1", features = ["persistence"] }
 egui              = "0.36.1"
 wgpu              = "30.0.1"
+# We own the render loop rather than eframe, so that a pass can run AFTER
+# egui has drawn — see src/shell.rs. These are the versions eframe 0.36.1
+# already resolved to, pinned so the two cannot drift apart.
+winit             = "0.30.13"
+egui-winit        = "0.36.1"
+egui-wgpu         = "0.36.1"
+pollster          = "1.0.1"
 lyon              = "1.0.19"
-bytemuck          = "1.25.2"
+bytemuck          = { version = "1.25.2", features = ["derive"] }
 glam              = "0.33.5"
 
 # --- state & general ---

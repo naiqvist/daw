@@ -293,7 +293,11 @@ fn trajectory(ui: &mut egui::Ui, theme: &Theme, state: &KickUi) {
         return;
     }
     let painter = ui.painter_at(rect);
-    let columns = (rect.width().ceil() as usize).clamp(2, 1_024);
+    let plot = egui::Rect::from_min_max(
+        rect.min + egui::vec2(theme.sp(space::SM), theme.sp(space::LG)),
+        rect.max - egui::vec2(theme.sp(space::SM), theme.sp(space::SM)),
+    );
+    let columns = (plot.width().ceil() as usize).clamp(2, 1_024);
 
     // The vertical scale: the two depths as they are now, with a floor so
     // an all-zero kick still draws a flat line at the bottom rather than
@@ -302,15 +306,74 @@ fn trajectory(ui: &mut egui::Ui, theme: &Theme, state: &KickUi) {
         + kick_value(kp::PITCH_B_DEPTH, state.sweep_depth))
     .max(1.0);
 
+    // A time-addressed drafting grid: denser around the transient where
+    // milliseconds matter, wider over the body where tens of milliseconds
+    // are the useful unit. These are the actual 400 ms plot coordinates,
+    // not an ornamental scope grid.
+    for ms in [0.0, 10.0, 25.0, 50.0, 100.0, 200.0, PLOT_MS] {
+        let x = egui::lerp(plot.x_range(), ms / PLOT_MS);
+        painter.vline(
+            x,
+            plot.y_range(),
+            egui::Stroke::new(
+                stroke::HAIR,
+                if ms == 0.0 || ms == PLOT_MS {
+                    theme.grid_beat
+                } else {
+                    theme.grid_sub
+                },
+            ),
+        );
+        if matches!(ms as u32, 0 | 50 | 100 | 200 | 400) {
+            painter.text(
+                egui::pos2(x, plot.bottom()),
+                if ms == 0.0 {
+                    egui::Align2::LEFT_BOTTOM
+                } else if ms == PLOT_MS {
+                    egui::Align2::RIGHT_BOTTOM
+                } else {
+                    egui::Align2::CENTER_BOTTOM
+                },
+                format!("{ms:.0}"),
+                egui::FontId::monospace(font::MICRO_LABEL),
+                theme.text_muted,
+            );
+        }
+    }
+    for level in [0.25, 0.5, 0.75] {
+        let y = egui::lerp(plot.y_range(), 1.0 - level);
+        painter.hline(
+            plot.x_range(),
+            y,
+            egui::Stroke::new(stroke::HAIR, theme.grid_sub.gamma_multiply(0.7)),
+        );
+    }
+
+    let tune = kick_value(kp::TUNE, state.tune);
+    painter.text(
+        plot.left_top(),
+        egui::Align2::LEFT_BOTTOM,
+        format!("PITCH DROP // +{ceiling:.0} ST"),
+        egui::FontId::proportional(font::MICRO_LABEL),
+        theme.role_time,
+    );
+    painter.text(
+        plot.right_top(),
+        egui::Align2::RIGHT_BOTTOM,
+        format!("{tune:.1} HZ // {PLOT_MS:.0} MS"),
+        egui::FontId::monospace(font::MICRO_LABEL),
+        theme.text_value,
+    );
+
     // The tuned note's line, which the pitch falls onto — the thing the
     // whole drop is aimed at.
-    let base_y = rect.bottom() - stroke::HAIR;
+    let base_y = plot.bottom() - stroke::HAIR;
     painter.line_segment(
         [
-            egui::pos2(rect.left(), base_y),
-            egui::pos2(rect.right(), base_y),
+            egui::pos2(plot.left(), base_y),
+            egui::pos2(plot.right(), base_y),
         ],
-        egui::Stroke::new(stroke::HAIR, theme.grid_beat),
+        egui::Stroke::new(stroke::BOLD, theme.grid_beat),
     );
 
     let mut amp = Vec::with_capacity(columns);
@@ -318,22 +381,73 @@ fn trajectory(ui: &mut egui::Ui, theme: &Theme, state: &KickUi) {
     for column in 0..columns {
         let along = column as f32 / (columns - 1).max(1) as f32;
         let ms = along * PLOT_MS;
-        let x = rect.left() + along * rect.width();
+        let x = plot.left() + along * plot.width();
         amp.push(egui::pos2(
             x,
-            rect.bottom() - amp_at(state, ms) * rect.height() * 0.9,
+            plot.bottom() - amp_at(state, ms) * plot.height() * 0.84,
         ));
         let up = (semitones_at(state, ms) / ceiling).clamp(0.0, 1.0);
-        pitch.push(egui::pos2(x, rect.bottom() - up * rect.height() * 0.9));
+        pitch.push(egui::pos2(x, plot.bottom() - up * plot.height() * 0.84));
     }
     painter.add(egui::Shape::line(
         amp,
-        egui::Stroke::new(stroke::HAIR, theme.role_level_dim),
+        egui::Stroke::new(stroke::BOLD, theme.role_level_dim),
+    ));
+    // A dark red registration line under the blue trace gives the trajectory
+    // the crisp two-ink print character of the rest of the face. It is the
+    // same DSP curve, offset by one physical pixel — never a second signal.
+    painter.add(egui::Shape::line(
+        pitch
+            .iter()
+            .map(|point| *point + egui::vec2(theme.sp(stroke::HAIR), 0.0))
+            .collect(),
+        egui::Stroke::new(stroke::BOLD, theme.role_mod_dim),
     ));
     painter.add(egui::Shape::line(
         pitch,
         egui::Stroke::new(stroke::BOLD, theme.role_time),
     ));
+
+    // The two pitch-envelope endpoints and click window are the moments the
+    // transient changes construction. Small hardware-like registration marks
+    // expose them without creating another control or inventing telemetry.
+    let marker = |ms: f32, color: egui::Color32| {
+        let clamped = ms.clamp(0.0, PLOT_MS);
+        let x = egui::lerp(plot.x_range(), clamped / PLOT_MS);
+        let up = (semitones_at(state, clamped) / ceiling).clamp(0.0, 1.0);
+        let y = plot.bottom() - up * plot.height() * 0.84;
+        let r = theme.sp(space::XXS);
+        let points = [
+            egui::pos2(x, y - r),
+            egui::pos2(x + r, y),
+            egui::pos2(x, y + r),
+            egui::pos2(x - r, y),
+        ];
+        for edge in 0..points.len() {
+            painter.line_segment(
+                [points[edge], points[(edge + 1) % points.len()]],
+                egui::Stroke::new(stroke::HAIR, color),
+            );
+        }
+    };
+    marker(
+        kick_value(kp::PITCH_A_DECAY, state.punch_time),
+        theme.role_mod,
+    );
+    marker(
+        kick_value(kp::PITCH_B_DECAY, state.sweep_time),
+        theme.role_time,
+    );
+
+    let click_ms = kick_value(kp::CLICK_DECAY, state.click_time).clamp(0.0, PLOT_MS);
+    let click_x = egui::lerp(plot.x_range(), click_ms / PLOT_MS);
+    painter.line_segment(
+        [
+            egui::pos2(click_x, plot.top()),
+            egui::pos2(click_x, plot.top() + theme.sp(space::SM)),
+        ],
+        egui::Stroke::new(stroke::BOLD, theme.role_mod),
+    );
 }
 
 /// The value strip's rows, grouped the way the signal flows: what the

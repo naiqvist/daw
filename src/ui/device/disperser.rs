@@ -51,7 +51,7 @@
 //! measure.
 
 use crate::params::disperser::{
-    AMOUNT, FREQ, FREQ_MAX_HZ, FREQ_MIN_HZ, PINCH, PINCH_MAX, PINCH_MIN, TABLE,
+    AMOUNT, AMOUNT_MAX, FREQ, FREQ_MAX_HZ, FREQ_MIN_HZ, PINCH, PINCH_MAX, PINCH_MIN, TABLE,
 };
 use crate::params::{self};
 use crate::ui::device::synth::ParamEdit;
@@ -237,11 +237,84 @@ const TAIL_FLOOR: f32 = 0.02;
 /// the smear grows is one of the two things the amount knob does.
 const PLOT_GAIN: f32 = 4.0;
 
+/// Millisecond divisions engraved into the fixed 25 ms window. They are
+/// deliberately unlabeled: the corner tag carries the exact duration and
+/// four numbers along the floor would compete with the impulse.
+const TIME_GRID_MS: [f32; 4] = [5.0, 10.0, 15.0, 20.0];
+
+/// The stage rail occupies the quiet upper-left of the display, leaving the
+/// upper-right to the duration tag. Thirty-two cells across the whole width
+/// would read as a ruler rather than a bank of allpasses.
+const STAGE_RAIL_FRAC: f32 = 0.62;
+
+/// Every fourth allpass gets a taller tooth, so a dense rail can be counted
+/// in groups without printing another number on the screen.
+const STAGE_GROUP: usize = 4;
+
+/// The broad impulse body is quieter than its bright contour. Named here so
+/// its weight remains one authored part of this display rather than a magic
+/// alpha inside the paint loop.
+const TRACE_BODY_ALPHA: f32 = 0.72;
+
 /// One column of the picture.
 #[derive(Clone, Copy, Default)]
 struct Column {
     lo: f32,
     hi: f32,
+}
+
+/// Draw the fixed time divisions behind the response. A phase effect is
+/// understood in milliseconds; these turn the screen from a loose waveform
+/// thumbnail into a small instrument face without adding another readout.
+fn time_grid(painter: &egui::Painter, theme: &Theme, plot: egui::Rect) {
+    for ms in TIME_GRID_MS {
+        let x = plot.left() + plot.width() * ms / PLOT_MS;
+        painter.line_segment(
+            [egui::pos2(x, plot.top()), egui::pos2(x, plot.bottom())],
+            egui::Stroke::new(stroke::HAIR, theme.grid_sub),
+        );
+        let tick = theme.sp(space::XXS);
+        painter.line_segment(
+            [
+                egui::pos2(x, plot.bottom() - tick),
+                egui::pos2(x, plot.bottom()),
+            ],
+            egui::Stroke::new(stroke::HAIR, theme.text_muted),
+        );
+    }
+}
+
+/// Thirty-two little phase cells, filled from left to right by Amount.
+/// Their geometry is visual telemetry only: the value strip remains the one
+/// and only control for the parameter.
+fn stage_rail(painter: &egui::Painter, theme: &Theme, plot: egui::Rect, active: usize) {
+    let count = AMOUNT_MAX as usize;
+    if count == 0 {
+        return;
+    }
+    let rail_w = plot.width() * STAGE_RAIL_FRAC;
+    let gap = theme.sp(space::XXS);
+    let tooth_w = ((rail_w - gap * (count - 1) as f32) / count as f32).max(stroke::HAIR);
+    let short = theme.sp(space::XXS);
+    let tall = theme.sp(space::XS);
+    for stage in 0..count {
+        let h = if (stage + 1) % STAGE_GROUP == 0 {
+            tall
+        } else {
+            short
+        };
+        let left = plot.left() + stage as f32 * (tooth_w + gap);
+        let tooth = egui::Rect::from_min_size(egui::pos2(left, plot.top()), egui::vec2(tooth_w, h));
+        painter.rect_filled(
+            tooth,
+            0.0,
+            if stage < active {
+                theme.role_mod
+            } else {
+                theme.divider
+            },
+        );
+    }
 }
 
 /// Run the real kernel on a real impulse and reduce it to columns.
@@ -299,12 +372,20 @@ fn impulse(ui: &mut egui::Ui, theme: &Theme, state: &DisperserUi) {
 
     let (columns, smear) = trace(state);
 
+    time_grid(&painter, theme, plot);
+
     // Zero, so the chirp has something to sit on.
     painter.line_segment(
         [egui::pos2(plot.left(), mid), egui::pos2(plot.right(), mid)],
         egui::Stroke::new(stroke::HAIR, theme.surface_sunken),
     );
 
+    // A dim body gives the response some material weight; the two bright
+    // contours laid over it keep every transient edge precise. Both are
+    // derived from the same min/max columns the old hairline used, so this
+    // adds character without flattering or changing the data.
+    let mut upper = Vec::with_capacity(columns.len());
+    let mut lower = Vec::with_capacity(columns.len());
     for (c, column) in columns.iter().enumerate() {
         let x = plot.left() + plot.width() * c as f32 / (PLOT_COLS - 1) as f32;
         let y0 = mid - (column.hi * PLOT_GAIN).clamp(-1.0, 1.0) * half;
@@ -313,9 +394,22 @@ fn impulse(ui: &mut egui::Ui, theme: &Theme, state: &DisperserUi) {
         // reads as a line rather than as a gap in the drawing.
         painter.line_segment(
             [egui::pos2(x, y0), egui::pos2(x, y1.max(y0 + 0.5))],
-            egui::Stroke::new(stroke::HAIR, theme.role_mod),
+            egui::Stroke::new(
+                stroke::BOLD,
+                theme.role_mod_dim.gamma_multiply(TRACE_BODY_ALPHA),
+            ),
         );
+        upper.push(egui::pos2(x, y0));
+        lower.push(egui::pos2(x, y1));
     }
+    painter.add(egui::Shape::line(
+        upper,
+        egui::Stroke::new(stroke::HAIR, theme.role_mod),
+    ));
+    painter.add(egui::Shape::line(
+        lower,
+        egui::Stroke::new(stroke::HAIR, theme.role_mod),
+    ));
 
     // The corner tag, top RIGHT: the impulse lands at the very left, and
     // a left-anchored tag would print through the one moment the picture
@@ -328,10 +422,14 @@ fn impulse(ui: &mut egui::Ui, theme: &Theme, state: &DisperserUi) {
         "wire".to_owned()
     } else {
         match smear {
-            Some(ms) => format!("{ms:.0} ms smear"),
-            None => format!("> {PLOT_MS:.0} ms smear"),
+            Some(ms) => format!("{stages}× · {ms:.0} ms smear"),
+            None => format!("{stages}× · > {PLOT_MS:.0} ms smear"),
         }
     };
+
+    // Drawn after the response so these cells retain the crisp, physical
+    // presence of a stage bank even when a loud onset passes behind them.
+    stage_rail(&painter, theme, plot, stages as usize);
     painter.text(
         egui::pos2(plot.right(), plot.top()),
         egui::Align2::RIGHT_TOP,

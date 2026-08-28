@@ -269,6 +269,36 @@ fn draw_ground(painter: &egui::Painter, theme: &Theme, rect: egui::Rect, detail:
         [rect.left_bottom(), rect.right_top()],
         egui::Stroke::new(stroke::HAIR, theme.grid_bar),
     );
+    if detail {
+        let tick = theme.sp(stroke::BOLD);
+        // Bipolar rail registrations: the transfer is bounded to these exact
+        // values, so the marks are calibration rather than decoration.
+        painter.line_segment(
+            [
+                rect.left_bottom(),
+                rect.left_bottom() + egui::vec2(tick, 0.0),
+            ],
+            egui::Stroke::new(stroke::BOLD, theme.role_time_dim),
+        );
+        painter.line_segment(
+            [rect.right_top() - egui::vec2(tick, 0.0), rect.right_top()],
+            egui::Stroke::new(stroke::BOLD, theme.role_time_dim),
+        );
+        painter.text(
+            rect.left_bottom(),
+            egui::Align2::LEFT_BOTTOM,
+            "−1",
+            egui::FontId::monospace(font::MICRO_LABEL),
+            theme.text_muted,
+        );
+        painter.text(
+            rect.right_top(),
+            egui::Align2::RIGHT_TOP,
+            "+1",
+            egui::FontId::monospace(font::MICRO_LABEL),
+            theme.text_muted,
+        );
+    }
 }
 
 /// Draw the transfer curve.
@@ -375,10 +405,37 @@ fn draw_transfer(
     // language, and drive is the role's own headline example — "modulation
     // and the destructive edge". An accent here would be atmosphere, which
     // is the one thing colour is not allowed to be.
+    let points = curve_points(rect, shaper);
+    // A cold one-pixel registration beneath the destructive red trace gives
+    // the transfer a sharper two-ink edge. Both lines are the same sampled
+    // function; this does not invent a second response.
     painter.add(egui::Shape::line(
-        curve_points(rect, shaper),
+        points
+            .iter()
+            .map(|point| *point + egui::vec2(0.0, theme.sp(stroke::HAIR)))
+            .collect(),
+        egui::Stroke::new(stroke::BOLD, theme.role_time_dim),
+    ));
+    painter.add(egui::Shape::line(
+        points,
         egui::Stroke::new(stroke::BOLD, theme.role_mod),
     ));
+
+    // Seven exact transfer samples make the curve read like a calibrated
+    // nonlinear function rather than a freehand illustration. Square marks
+    // suit clipping and quantisation better than scope-like dots.
+    for input in [-0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75] {
+        let point = egui::pos2(
+            rect.left() + rect.width() * amp_to_norm(input),
+            rect.bottom() - rect.height() * amp_to_norm(shaper.shape(input)),
+        );
+        let size = theme.sp(stroke::BOLD);
+        painter.rect_filled(
+            egui::Rect::from_center_size(point, egui::vec2(size, size)),
+            0.0,
+            theme.role_mod,
+        );
+    }
 
     // Through `Unit::Ratio`, which is what the drive KNOB prints too: the
     // value at the display edge and the value under the dial are the same
@@ -403,6 +460,13 @@ fn draw_transfer(
         text,
         egui::FontId::monospace(font::LABEL),
         theme.text_muted,
+    );
+    painter.text(
+        rect.center_bottom() - egui::vec2(0.0, design::gap(theme)),
+        egui::Align2::CENTER_BOTTOM,
+        "X BIAS // Y DRIVE",
+        egui::FontId::monospace(font::MICRO_LABEL),
+        theme.role_time_dim,
     );
 
     if ground {
@@ -431,8 +495,16 @@ pub fn mini(ui: &mut egui::Ui, theme: &Theme, shaper: &Shaper) {
     // all that survive being this small, and they are the two that carry
     // the meaning.
     draw_ground(painter, theme, rect, false);
+    let points = curve_points(rect, shaper);
     painter.add(egui::Shape::line(
-        curve_points(rect, shaper),
+        points
+            .iter()
+            .map(|point| *point + egui::vec2(0.0, theme.sp(stroke::HAIR)))
+            .collect(),
+        egui::Stroke::new(stroke::HAIR, theme.role_time_dim),
+    ));
+    painter.add(egui::Shape::line(
+        points,
         egui::Stroke::new(stroke::HAIR, theme.role_mod),
     ));
     painter.rect_stroke(

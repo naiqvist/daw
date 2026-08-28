@@ -1,4 +1,4 @@
-//! The sheen device card — what the brightener ADDS, as an instrument
+//! The sheen device card — the brightener's response field as an instrument
 //! screen.
 //!
 //! Same shape as the lo-fi card: normalized knob state here, natural
@@ -10,41 +10,38 @@
 //!
 //! ```text
 //! ┌ sheen ──────────────────────────────────┐
-//! │ +38 % edge                              │
-//! │ in     ╷▁▁▁▁▁▁      ╷▁▁▁▁▁▁             │
-//! │ added   ▚▂▁          ▚▂▁                │  ← hero
-//! │                                         │
+//! │ SLEW × EDGE                    edge ×1.2│
+//! │ fast  ░░▒▒▓▓████████████████           │
+//! │ ½lift ┄┄┄┄┄┄┄┄┄┄┄│┄┄┄┄┄┄┄┄           │  ← hero
+//! │ slow  ·······░░▒▒▒│▓▓██████            │
+//! │        low       1.5 kHz       high     │
 //! │  amount   edge      mix       out       │
 //! └─────────────────────────────────────────┘
 //! ```
 //!
-//! # Why the hero is the DIFFERENCE
+//! # Why the hero is a response field
 //!
-//! The obvious picture — input against output — is the wrong one here,
-//! and the kernel's own shape says why. A slew brightener adds a little
-//! high-frequency energy on the edges and nothing anywhere else, so an
-//! overlay of the two waveforms is two lines on top of each other with a
-//! disagreement too small to see. Plotting `wet - dry` puts the whole
-//! plot on the only thing the device does.
+//! This device has no signal display. Drawing a waveform here would imply it
+//! came from the input when the card has never received input telemetry. A
+//! synthetic drum hit may exercise the kernel honestly, but it still reads as
+//! programme material, which makes the screen tell the wrong story.
 //!
-//! It is also the only framing in which every knob moves the picture. The
-//! kernel's `lift()` is a function of the signal's slew and its own fixed
-//! knee, so a lift curve would sit there unchanged while the user turned
-//! `amount` — a display that ignores its own controls. The difference
-//! scales with `amount`, changes texture with `edge`, and scales again
-//! with `mix`.
+//! The field shows the algorithm instead. Frequency runs left to right; input
+//! slew runs slow to fast from bottom to top. Each cell is the product the DSP
+//! actually adds:
 //!
-//! # The picture is the kernel, not a drawing of it
+//! ```text
+//! edge-band magnitude × saturating slew lift × amount × mix
+//! ```
 //!
-//! [`trace`] runs a real
-//! [`SlewBrighten`](crate::dsp::dynamics::SlewBrighten) over a synthetic
-//! pair of drum hits and plots what comes back — the same move the lo-fi
-//! card makes with its converter. The two hits are there because the
-//! device's whole claim is that the lift ARRIVES with a transient and
-//! LEAVES with it, and one hit cannot show "and leaves".
+//! The vertical marker is the edge-band corner. The horizontal marker is the
+//! kernel's fixed knee, where a full-scale sine drives half lift. Brightness is
+//! the current Amount and Mix, normalised only against the kernel's authored
+//! maximum — never auto-fitted — so a stronger setting produces a stronger
+//! field and zero produces an exact `edge off` state.
 //!
 //! The output trim is deliberately not in the picture: it is a level, and
-//! the plot is about a shape.
+//! the field is about where and when colour is added.
 //!
 //! # Every value is in a unit you could say out loud
 //!
@@ -64,7 +61,6 @@ use crate::ui::device::{
 use crate::ui::theme::Theme;
 use crate::ui::tokens::{control, font, space, stroke};
 use eframe::egui;
-use std::f32::consts::TAU;
 
 /// Knob positions of one sheen, normalized. Serialized into project
 /// files, so knob positions survive a reload.
@@ -221,149 +217,81 @@ pub fn sheen_edits(state: &SheenUi) -> Vec<ParamEdit> {
     .collect()
 }
 
-/// The reference rate the picture is drawn at.
-///
-/// A fixed figure and not the engine's, because the card is drawn in the
-/// UI and has no engine to ask. It has to be a real audio rate rather
-/// than a convenient small one: the kernel's knee is 3 kHz, and at any
-/// rate low enough to plot sample-by-sample that knee would be above
-/// Nyquist and the picture would be of a device that cannot exist.
+/// The reference rate the response field is calculated at. The node's real
+/// rate is not UI telemetry; 48 kHz is the project's reference and is also the
+/// rate the kernel uses when constructed without a stream.
 const PLOT_SR: f32 = 48_000.0;
 
-/// How long a window the picture covers, in seconds. Long enough to hold
-/// two hits and the gap between them, which is what shows the lift
-/// leaving as well as arriving.
-const PLOT_SECS: f32 = 0.2;
+/// The response field's frequency span. It extends beyond the Edge knob at
+/// both ends so the marker is never pinned to the frame and the high-pass
+/// transition remains visible at either stop.
+const VIEW_MIN_HZ: f32 = 40.0;
+const VIEW_MAX_HZ: f32 = 20_000.0;
 
-/// Samples the kernel actually runs over.
-const PLOT_N: usize = (PLOT_SR * PLOT_SECS) as usize;
+/// The vertical field is envelope slew relative to the kernel's knee. A
+/// symmetric four octaves either side puts the exact half-lift line in the
+/// middle while still showing the saturating ceiling and the quiet floor.
+const SLEW_RATIO_MIN: f32 = 1.0 / 16.0;
+const SLEW_RATIO_MAX: f32 = 16.0;
 
-/// Columns drawn. Far fewer than [`PLOT_N`], so each column is a
-/// min/max over its bucket — the way any waveform overview is drawn, and
-/// the only honest way to put 9,600 samples on 300 pixels.
-const PLOT_COLS: usize = 300;
+/// A deliberately discrete data surface: enough cells to read a smooth
+/// transition, few enough to look authored rather than like a decorative
+/// gradient.
+const FIELD_COLS: usize = 32;
+const FIELD_ROWS: usize = 12;
 
-/// Where the two hits start, in seconds.
-const HITS: [f32; 2] = [0.015, 0.105];
-
-/// The test hit: a low body and a high edge, each with its own decay.
-///
-/// Deliberately a pair of decaying sines rather than filtered noise. Noise
-/// would be a more realistic drum and a worse PICTURE — at three hundred
-/// columns it reads as a grey block, and the point of the plot is the
-/// SHAPE of what the device adds.
-fn hit(t: f32) -> f32 {
-    if t < 0.0 {
-        return 0.0;
-    }
-    let body = (TAU * 90.0 * t).sin() * (-t * 25.0).exp();
-    let edge = (TAU * 3_200.0 * t).sin() * (-t * 120.0).exp();
-    0.5 * body + 0.5 * edge
+/// Log frequency geometry, shared by the cells and the corner marker.
+fn hz_at(t: f32) -> f32 {
+    VIEW_MIN_HZ * (VIEW_MAX_HZ / VIEW_MIN_HZ).powf(t.clamp(0.0, 1.0))
 }
 
-/// One column of the picture: the input's extent, and the added signal's.
-#[derive(Clone, Copy, Default)]
-struct Column {
-    dry_lo: f32,
-    dry_hi: f32,
-    add_lo: f32,
-    add_hi: f32,
+fn hz_to_x(hz: f32) -> f32 {
+    (hz.clamp(VIEW_MIN_HZ, VIEW_MAX_HZ) / VIEW_MIN_HZ).ln() / (VIEW_MAX_HZ / VIEW_MIN_HZ).ln()
 }
 
-/// Run the real kernel and reduce it to columns.
-///
-/// Returns the columns and the peak of the added signal as a fraction of
-/// the input's peak — the corner tag's number.
-fn trace(state: &SheenUi) -> (Vec<Column>, f32) {
-    let mut dry = vec![0.0f32; PLOT_N];
-    for (i, s) in dry.iter_mut().enumerate() {
-        let t = i as f32 / PLOT_SR;
-        *s = HITS.iter().map(|start| hit(t - start)).sum();
-    }
-
-    let amount = sheen_value(AMOUNT, state.amount);
-    let mut wet = dry.clone();
-    let mut brighten = crate::dsp::dynamics::SlewBrighten::new();
-    brighten.prepare(PLOT_SR, sheen_value(EDGE, state.edge), amount);
-    brighten.process(&mut wet);
-
-    // The blend, so the picture answers "how much of this am I hearing"
-    // and not only "what would it do fully wet".
-    let mix = sheen_value(MIX, state.mix);
-
-    let mut columns = vec![Column::default(); PLOT_COLS];
-    let mut peak_dry = 0.0f32;
-    let mut peak_add = 0.0f32;
-    for (c, column) in columns.iter_mut().enumerate() {
-        let from = c * PLOT_N / PLOT_COLS;
-        let to = ((c + 1) * PLOT_N / PLOT_COLS).min(PLOT_N).max(from + 1);
-        for i in from..to {
-            let d = dry[i];
-            let a = (wet[i] - d) * mix;
-            column.dry_lo = column.dry_lo.min(d);
-            column.dry_hi = column.dry_hi.max(d);
-            column.add_lo = column.add_lo.min(a);
-            column.add_hi = column.add_hi.max(a);
-            peak_dry = peak_dry.max(d.abs());
-            peak_add = peak_add.max(a.abs());
-        }
-    }
-    let ratio = if peak_dry > 0.0 {
-        peak_add / peak_dry
-    } else {
+/// The magnitude of `x - lowpass(x)` at `hz`, using the exact exponential
+/// one-pole coefficient in `SlewBrighten::prepare` rather than a generic
+/// high-pass approximation.
+fn edge_magnitude(hz: f32, corner_hz: f32) -> f32 {
+    let corner = corner_hz.clamp(20.0, PLOT_SR * 0.45);
+    let g = 1.0 - (-core::f32::consts::TAU * corner / PLOT_SR).exp();
+    let a = 1.0 - g;
+    let w = core::f32::consts::TAU * hz.clamp(0.0, PLOT_SR * 0.5) / PLOT_SR;
+    let (cos, sin) = (w.cos(), w.sin());
+    let num_re = a * (1.0 - cos);
+    let num_im = a * sin;
+    let den_re = 1.0 - a * cos;
+    let den_im = a * sin;
+    let den = (den_re * den_re + den_im * den_im).sqrt();
+    if den <= f32::MIN_POSITIVE {
         0.0
-    };
-    (columns, ratio)
-}
-
-/// How much of the plot's height the input strip takes.
-///
-/// Half. The added signal is the hero, but it is also the SMALLER of the
-/// two by a factor of several, so giving it the larger lane bought
-/// nothing but empty air above and below it — the height it needed was
-/// never the height it had.
-const IN_LANE_FRAC: f32 = 0.5;
-
-/// How much the added lane is magnified.
-///
-/// The two lanes cannot share a scale: what this device adds is a few
-/// tens of a percent of what goes in, so at the input's scale the hero
-/// would be a thick line. Three, and the lane says so, because a plot
-/// that quietly rescales itself is a plot that cannot be compared with
-/// the one beside it.
-///
-/// A FIXED figure rather than an auto-fit, which is the important part:
-/// auto-fitting would make the hero fill its lane at every setting, and a
-/// display that looks identical whatever the knob does is not a display.
-const ADD_GAIN: f32 = 3.0;
-
-/// Draw one lane of min/max columns around its own centre line.
-fn lane(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    columns: &[Column],
-    pick: impl Fn(&Column) -> (f32, f32),
-    colour: egui::Color32,
-    width: f32,
-) {
-    let mid = rect.center().y;
-    let half = rect.height() * 0.5;
-    for (c, column) in columns.iter().enumerate() {
-        let x = rect.left() + rect.width() * c as f32 / (columns.len() - 1).max(1) as f32;
-        let (lo, hi) = pick(column);
-        let y0 = mid - hi.clamp(-1.0, 1.0) * half;
-        let y1 = mid - lo.clamp(-1.0, 1.0) * half;
-        // A column that reduces to nothing still gets a mark, so silence
-        // reads as a line rather than as a gap in the drawing.
-        painter.line_segment(
-            [egui::pos2(x, y0), egui::pos2(x, y1.max(y0 + 0.5))],
-            egui::Stroke::new(width, colour),
-        );
+    } else {
+        (num_re * num_re + num_im * num_im).sqrt() / den
     }
 }
 
-/// The hero: two hits, and what the sheen adds to them.
-fn lanes(ui: &mut egui::Ui, theme: &Theme, state: &SheenUi) {
+/// The kernel's saturating lift, stated against its knee. At ratio 1 the
+/// answer is exactly one half; it approaches one but can never run away.
+fn slew_lift(ratio: f32) -> f32 {
+    let ratio = ratio.max(0.0);
+    ratio / (ratio + 1.0)
+}
+
+/// What fraction of the kernel's authored maximum this cell adds. This is
+/// not output gain: it is the multiplier on the edge band at one frequency
+/// and one envelope slew.
+fn response_strength(state: &SheenUi, hz: f32, slew_ratio: f32) -> f32 {
+    let amount = sheen_value(AMOUNT, state.amount);
+    let mix = sheen_value(MIX, state.mix);
+    (amount / AMOUNT_MAX
+        * mix
+        * edge_magnitude(hz, sheen_value(EDGE, state.edge))
+        * slew_lift(slew_ratio))
+    .clamp(0.0, 1.0)
+}
+
+/// The new hero: a signal-independent map of the actual DSP relationship.
+fn response_field(ui: &mut egui::Ui, theme: &Theme, state: &SheenUi) {
     let (rect, _) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
     if !ui.is_rect_visible(rect) {
         return;
@@ -371,78 +299,127 @@ fn lanes(ui: &mut egui::Ui, theme: &Theme, state: &SheenUi) {
     let painter = ui.painter_at(rect);
     let pad = theme.sp(space::XS);
     let plot = rect.shrink(pad);
-    let split = plot.top() + plot.height() * IN_LANE_FRAC;
-    let in_lane = egui::Rect::from_min_max(plot.min, egui::pos2(plot.right(), split));
-    let add_lane = egui::Rect::from_min_max(egui::pos2(plot.left(), split), plot.max);
 
-    let (columns, ratio) = trace(state);
-
-    // The seam between the lanes, so the hero has a floor to stand on.
-    painter.line_segment(
-        [
-            egui::pos2(plot.left(), split),
-            egui::pos2(plot.right(), split),
-        ],
-        egui::Stroke::new(stroke::HAIR, theme.surface_sunken),
+    let label_h = theme.sp(font::MICRO_LABEL) + theme.sp(space::XXS);
+    let field = egui::Rect::from_min_max(
+        egui::pos2(plot.left(), plot.top() + label_h),
+        egui::pos2(plot.right(), plot.bottom() - label_h),
     );
+    let cell_w = field.width() / FIELD_COLS as f32;
+    let cell_h = field.height() / FIELD_ROWS as f32;
+    let cell_inset = stroke::HAIR * 0.5;
 
-    // What went in: quiet, because it is the reference and not the
-    // subject.
-    lane(
-        &painter,
-        in_lane,
-        &columns,
-        |c| (c.dry_lo, c.dry_hi),
-        theme.text_muted,
-        stroke::HAIR,
-    );
-
-    // What the sheen adds. The only bold stroke on the card.
-    lane(
-        &painter,
-        add_lane,
-        &columns,
-        |c| (c.add_lo * ADD_GAIN, c.add_hi * ADD_GAIN),
-        theme.role_mod,
-        stroke::HAIR,
-    );
-
-    // Which lane is which. Two words, in the smallest type the kit has,
-    // because the drawing carries the meaning and the words only confirm
-    // it — the corner-tag convention `font::MICRO_LABEL` exists for.
-    for (at, text) in [
-        (in_lane.left_bottom(), "in".to_owned()),
-        (add_lane.left_bottom(), format!("added ×{ADD_GAIN:.0}")),
-    ] {
-        painter.text(
-            at,
-            egui::Align2::LEFT_BOTTOM,
-            text,
-            egui::FontId::proportional(font::MICRO_LABEL),
-            theme.text_muted,
-        );
+    for row in 0..FIELD_ROWS {
+        // Top is FAST. The ratio scale is logarithmic, so the fixed knee
+        // (ratio 1) lands exactly halfway up the field.
+        let y_t = 1.0 - (row as f32 + 0.5) / FIELD_ROWS as f32;
+        let ratio = SLEW_RATIO_MIN * (SLEW_RATIO_MAX / SLEW_RATIO_MIN).powf(y_t);
+        for col in 0..FIELD_COLS {
+            let x_t = (col as f32 + 0.5) / FIELD_COLS as f32;
+            let strength = response_strength(state, hz_at(x_t), ratio);
+            let cell = egui::Rect::from_min_size(
+                egui::pos2(
+                    field.left() + col as f32 * cell_w,
+                    field.top() + row as f32 * cell_h,
+                ),
+                egui::vec2(cell_w, cell_h),
+            )
+            .shrink(cell_inset);
+            let ink = if strength <= f32::EPSILON {
+                theme.surface
+            } else {
+                // Square root gives low-but-real activity enough light to
+                // read; the data still owns the intensity and is never fit
+                // to the strongest cell in the current frame.
+                theme.role_mod.gamma_multiply(0.18 + strength.sqrt() * 0.82)
+            };
+            painter.rect_filled(cell, 0.0, ink);
+        }
     }
 
-    // The corner tag. `wire` is the kernel's own promise made visible:
-    // `SlewBrighten` guarantees amount 0 is BIT-EXACT rather than merely
-    // quiet, which is what lets a device leave the stage permanently in
-    // its path — and a colour that cannot be removed is a colour that
-    // cannot be measured.
-    let tag = if ratio <= 0.0 {
-        "wire".to_owned()
-    } else {
-        format!("+{:.0} % edge", ratio * 100.0)
-    };
-    // Top RIGHT, not left: the input lane starts at the very top of the
-    // plot and its first hit lands at the very left, so a left-anchored
-    // tag prints straight through the loudest part of the picture.
-    painter.text(
-        egui::pos2(plot.right(), plot.top()),
-        egui::Align2::RIGHT_TOP,
-        tag,
-        egui::FontId::proportional(font::MICRO_LABEL),
-        theme.text_muted,
+    // The fixed half-lift knee: `env == knee`, therefore lift == 0.5.
+    let knee_y = field.center().y;
+    painter.line_segment(
+        [
+            egui::pos2(field.left(), knee_y),
+            egui::pos2(field.right(), knee_y),
+        ],
+        egui::Stroke::new(stroke::HAIR, theme.role_level),
     );
+
+    // The moving edge-band corner. It changes the field too, but the line
+    // makes the knob's precise authority readable before the colour settles.
+    let edge_hz = sheen_value(EDGE, state.edge);
+    let edge_x = field.left() + field.width() * hz_to_x(edge_hz);
+    painter.line_segment(
+        [
+            egui::pos2(edge_x, field.top()),
+            egui::pos2(edge_x, field.bottom()),
+        ],
+        egui::Stroke::new(stroke::BOLD, theme.role_shape),
+    );
+
+    let effective = sheen_value(AMOUNT, state.amount) * sheen_value(MIX, state.mix);
+    let tag = if effective <= f32::EPSILON {
+        // The colour path is exact-off. Do not say `wire`: output trim is
+        // deliberately outside this field and may still change level.
+        "edge off".to_owned()
+    } else {
+        format!("edge ×{effective:.2}")
+    };
+    let micro = egui::FontId::proportional(font::MICRO_LABEL);
+    for (at, align, text, colour) in [
+        (
+            plot.left_top(),
+            egui::Align2::LEFT_TOP,
+            "SLEW × EDGE".to_owned(),
+            theme.text_muted,
+        ),
+        (
+            plot.right_top(),
+            egui::Align2::RIGHT_TOP,
+            tag,
+            theme.text_muted,
+        ),
+        (
+            egui::pos2(field.left(), knee_y),
+            egui::Align2::LEFT_CENTER,
+            " ½ LIFT ".to_owned(),
+            theme.role_level,
+        ),
+        (
+            field.left_top(),
+            egui::Align2::LEFT_TOP,
+            "FAST".to_owned(),
+            theme.text_muted,
+        ),
+        (
+            field.left_bottom(),
+            egui::Align2::LEFT_BOTTOM,
+            "SLOW".to_owned(),
+            theme.text_muted,
+        ),
+        (
+            plot.left_bottom(),
+            egui::Align2::LEFT_BOTTOM,
+            "LOW".to_owned(),
+            theme.text_muted,
+        ),
+        (
+            plot.right_bottom(),
+            egui::Align2::RIGHT_BOTTOM,
+            "HIGH".to_owned(),
+            theme.text_muted,
+        ),
+        (
+            egui::pos2(edge_x, plot.bottom()),
+            egui::Align2::CENTER_BOTTOM,
+            param_of(EDGE).format(state.edge),
+            theme.role_shape,
+        ),
+    ] {
+        painter.text(at, align, text, micro.clone(), colour);
+    }
 }
 
 /// What ONE cell needs: room for the widest thing it will ever print,
@@ -500,7 +477,7 @@ pub fn sheen_card(ui: &mut egui::Ui, theme: &Theme, state: &mut SheenUi) -> Vec<
                     // and a drag here could only mean "amount or edge,
                     // depending which way I moved" — exactly the shape
                     // that note exists to prevent.
-                    poly_widgets::CurveRegion::Plot => lanes(ui, theme, state),
+                    poly_widgets::CurveRegion::Plot => response_field(ui, theme, state),
                     poly_widgets::CurveRegion::Footer => {
                         let h = ui.available_height();
                         ui.horizontal(|ui| {
@@ -625,8 +602,9 @@ mod tests {
         brighten.prepare(PLOT_SR, sheen_value(EDGE, 0.5), sheen_value(AMOUNT, 0.0));
         let mut buf = vec![0.0f32; 512];
         for (i, s) in buf.iter_mut().enumerate() {
-            let t = i as f32 / PLOT_SR;
-            *s = HITS.iter().map(|start| hit(t - start)).sum();
+            // Arbitrary finite programme, not the hero's old synthetic
+            // display signal. Exact bypass must hold for any input.
+            *s = (i % 31) as f32 / 15.0 - 1.0;
         }
         let before = buf.clone();
         brighten.process(&mut buf);
@@ -637,41 +615,72 @@ mod tests {
     /// do nothing at all.
     #[test]
     fn the_default_adds_something() {
-        let (_, ratio) = trace(&SheenUi::default());
-        assert!(ratio > 0.01, "a fresh sheen adds {ratio}, which is nothing");
+        let strength = response_strength(&SheenUi::default(), 8_000.0, 4.0);
+        assert!(
+            strength > 0.01,
+            "a fresh sheen maps to {strength}, which is nothing"
+        );
     }
 
-    /// The hero has to answer its own controls — the reason it plots the
-    /// difference rather than the kernel's `lift()`, which is a function
-    /// of the signal alone and would sit still while `amount` moved.
+    /// The hero answers the controls that shape colour. Output trim is
+    /// deliberately absent: it changes level after this relationship.
     #[test]
-    fn the_picture_answers_every_knob_that_shapes_it() {
+    fn the_response_field_answers_every_knob_that_shapes_it() {
         let base = SheenUi::default();
-        let (_, at_default) = trace(&base);
+        let at_default = response_strength(&base, 4_000.0, 2.0);
 
         let mut louder = base;
         louder.amount = sheen_norm(AMOUNT, sheen_value(AMOUNT, base.amount) * 2.0);
-        let (_, at_louder) = trace(&louder);
+        let at_louder = response_strength(&louder, 4_000.0, 2.0);
         assert!(
             at_louder > at_default,
-            "doubling amount left the picture at {at_louder} vs {at_default}"
+            "doubling amount left the field at {at_louder} vs {at_default}"
         );
 
         let mut quieter = base;
         quieter.mix = sheen_norm(MIX, 0.25);
-        let (_, at_quieter) = trace(&quieter);
+        let at_quieter = response_strength(&quieter, 4_000.0, 2.0);
         assert!(
             at_quieter < at_default,
-            "quartering mix left the picture at {at_quieter} vs {at_default}"
+            "quartering mix left the field at {at_quieter} vs {at_default}"
         );
 
         let mut higher = base;
         higher.edge = sheen_norm(EDGE, EDGE_MAX_HZ);
-        let (_, at_higher) = trace(&higher);
+        let at_higher = response_strength(&higher, 4_000.0, 2.0);
         assert!(
-            (at_higher - at_default).abs() > 1e-4,
-            "moving the corner left the picture unchanged at {at_higher}"
+            at_higher < at_default,
+            "raising the edge corner did not darken 4 kHz: {at_higher} vs {at_default}"
         );
+    }
+
+    /// The horizontal knee line is not an illustration convention. It is
+    /// the kernel's saturating ratio: equal envelope and knee means half
+    /// lift, slow is below it, and fast approaches but never reaches one.
+    #[test]
+    fn the_slew_axis_is_the_kernels_lift_curve() {
+        assert!((slew_lift(1.0) - 0.5).abs() < f32::EPSILON);
+        assert!(slew_lift(SLEW_RATIO_MIN) < 0.1);
+        assert!(slew_lift(SLEW_RATIO_MAX) > 0.9);
+        assert!(slew_lift(1_000_000.0) < 1.0);
+        assert_eq!(slew_lift(0.0), 0.0);
+    }
+
+    /// The frequency direction is the kernel's actual `x - lowpass(x)`:
+    /// DC disappears, the authored corner turns the response, and the far
+    /// top approaches unity rather than inventing a shelf gain.
+    #[test]
+    fn the_frequency_axis_is_the_kernels_edge_band() {
+        let corner = 1_500.0;
+        assert_eq!(edge_magnitude(0.0, corner), 0.0);
+        let below = edge_magnitude(100.0, corner);
+        let at = edge_magnitude(corner, corner);
+        let above = edge_magnitude(18_000.0, corner);
+        assert!(below < at && at < above, "{below} < {at} < {above}");
+        // The exponential smoother is not a bilinear -3 dB one-pole: its
+        // subtracted edge band is about 0.64 at the authored corner.
+        assert!((at - 0.64).abs() < 0.01, "corner magnitude was {at}");
+        assert!(above < 1.0, "the edge band invented gain: {above}");
     }
 
     /// Nothing here steps, and only the corner is logarithmic — the

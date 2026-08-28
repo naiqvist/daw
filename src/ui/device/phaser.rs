@@ -360,13 +360,39 @@ fn notches(ui: &mut egui::Ui, theme: &Theme, state: &PhaserUi) {
         );
     }
 
-    // Unity, so a notch has something to be a notch below.
-    painter.line_segment(
-        [
-            egui::pos2(field.left(), y_of(0.0)),
-            egui::pos2(field.right(), y_of(0.0)),
-        ],
-        egui::Stroke::new(stroke::HAIR, theme.text_muted),
+    // Calibrated depth rules. A phaser's important vertical information is
+    // cancellation, so the grid names attenuation rather than filling the
+    // field with arbitrary equal divisions.
+    for db in [0.0, -12.0, -24.0] {
+        let y = y_of(db);
+        painter.hline(
+            field.x_range(),
+            y,
+            egui::Stroke::new(
+                stroke::HAIR,
+                if db == 0.0 {
+                    theme.grid_beat
+                } else {
+                    theme.grid_sub
+                },
+            ),
+        );
+        painter.text(
+            egui::pos2(field.left(), y),
+            egui::Align2::LEFT_BOTTOM,
+            format!("{db:.0}"),
+            egui::FontId::monospace(font::MICRO_LABEL),
+            theme.text_muted,
+        );
+    }
+
+    // The centre-frequency registration line is the pivot the two ghost
+    // sweeps travel around. It is a parameter coordinate, not a live LFO.
+    let centre_hz = phaser_value(CENTRE, state.centre);
+    painter.vline(
+        x_of(centre_hz),
+        field.y_range(),
+        egui::Stroke::new(stroke::HAIR, theme.role_time_dim.gamma_multiply(0.8)),
     );
 
     let draw = |points: &[(f32, f32)], colour, width| {
@@ -382,12 +408,28 @@ fn notches(ui: &mut egui::Ui, theme: &Theme, state: &PhaserUi) {
         ));
     };
 
-    // The ends of the travel first, so the live shape draws over them.
-    for end in [-1.0f32, 1.0] {
-        draw(&comb(state, end), theme.role_mod_dim, stroke::HAIR);
-    }
+    // The ends of the travel first, so the live shape draws over them. Blue
+    // and dark red read as the two registrations of one moving comb rather
+    // than three competing response curves.
+    draw(&comb(state, -1.0), theme.role_time_dim, stroke::HAIR);
+    draw(&comb(state, 1.0), theme.role_mod_dim, stroke::HAIR);
     let centre = comb(state, 0.0);
     draw(&centre, theme.role_mod, stroke::BOLD);
+
+    // Square registrations pin the measured minima. Their count is exactly
+    // the count reported in the corner tag below.
+    for notch in centre
+        .windows(3)
+        .filter(|w| w[1].1 < w[0].1 && w[1].1 < w[2].1 && w[1].1 < NOTCH_FLOOR)
+    {
+        let point = egui::pos2(x_of(notch[1].0), y_of(notch[1].1));
+        let size = theme.sp(space::XXS);
+        painter.rect_filled(
+            egui::Rect::from_center_size(point, egui::vec2(size, size)),
+            0.0,
+            theme.role_mod,
+        );
+    }
 
     // The corner tag, counted off the curve above rather than derived
     // from the section count — see `count_notches` for the measurement
@@ -410,6 +452,17 @@ fn notches(ui: &mut egui::Ui, theme: &Theme, state: &PhaserUi) {
         tag,
         egui::FontId::proportional(font::MICRO_LABEL),
         theme.text_muted,
+    );
+    painter.text(
+        egui::pos2(field.left(), field.top()),
+        egui::Align2::LEFT_TOP,
+        format!(
+            "SWEEP ±{:.2} OCT // {:.2} HZ",
+            phaser_value(DEPTH, state.depth),
+            phaser_value(RATE, state.rate)
+        ),
+        egui::FontId::monospace(font::MICRO_LABEL),
+        theme.role_time_dim,
     );
 }
 

@@ -126,6 +126,44 @@ const WOW_MS: f32 = 8.0;
 const WOW_SWING_MS: f32 = 3.2;
 const WOW_HZ: f32 = 0.37;
 
+/// How the one GRAIN knob splits into a bit depth and a converter clock.
+///
+/// # Why the rate axis is cubed
+///
+/// The two halves of "lo-fi" do not sound alike. Bit reduction is GRIT:
+/// a quantisation floor that sits under the pad and stays where it is
+/// put. Sample-rate reduction is FUZZ: a zero-order hold at a
+/// non-integer ratio folds everything above its corner back down, and
+/// the tracking pre-filter in front of it is 12 dB/octave — enough to
+/// keep the programme, not enough to stop a bright detuned pad from
+/// hazing over. A pad is exactly the material that shows it, being
+/// three drifting oscillators of continuous high content.
+///
+/// The first mapping ran the rate down LINEARLY, so a quarter turn —
+/// the default — already dropped the clock to 38 kHz and the fuzz
+/// arrived before anything else did. Cubed, the bottom half of the knob
+/// is effectively transparent on rate and the character there is the
+/// bit depth alone, which is what a gentle lo-fi setting should mean.
+/// The fuzz is all still there at the top for anyone who wants it.
+fn grain_bits(grain: f32) -> f32 {
+    BITS_TOP - GRAIN_BITS_SPAN * grain
+}
+
+fn grain_rate(grain: f32, sample_rate: f32) -> f32 {
+    let drop = GRAIN_RATE_DROP * grain * grain * grain;
+    (sample_rate * (1.0 - drop)).max(crate::dsp::lofi::RATE_MIN)
+}
+
+/// Sixteen bits is where the quantiser switches itself off, so this is
+/// the transparent end of that axis.
+const BITS_TOP: f32 = 16.0;
+/// A full turn reaches six bits — audibly grainy, still musical.
+const GRAIN_BITS_SPAN: f32 = 10.0;
+/// And at most this much of the converter clock, at a full turn. Was
+/// 0.8, which put the top of the knob at a fifth of the sample rate;
+/// no setting of a pad synth wants that much aliasing.
+const GRAIN_RATE_DROP: f32 = 0.62;
+
 /// Everything a note needs after the tables are built.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -490,18 +528,16 @@ impl Haze {
         self.wow_lfo.set_rate(WOW_HZ);
 
         self.grain.prepare(rate);
-        // ONE knob over two axes. Bit depth falls from sixteen to six
-        // and the rate from full to a fifth, together, because "how
-        // lo-fi" is one question — and both reach their transparent end
-        // at exactly zero, which is what makes the bypass exact.
+        // ONE knob over two axes — see `grain_bits` and `grain_rate`.
+        // Both reach their transparent end at exactly zero, which is
+        // what makes the bypass exact.
         let grain = self.params.grain.clamp(0.0, 1.0);
         if grain <= 0.0 {
             self.grain.set_bits(0.0);
             self.grain.set_rate(rate.max(crate::dsp::lofi::RATE_MIN));
         } else {
-            self.grain.set_bits(16.0 - 10.0 * grain);
-            let floor = crate::dsp::lofi::RATE_MIN;
-            self.grain.set_rate((rate * (1.0 - 0.8 * grain)).max(floor));
+            self.grain.set_bits(grain_bits(grain));
+            self.grain.set_rate(grain_rate(grain, rate));
         }
         self.warmth.prepare(rate);
         self.warmth.set_amount(self.params.warmth);
@@ -564,9 +600,8 @@ impl Haze {
             self.grain.set_bits(0.0);
             self.grain.set_rate(rate.max(crate::dsp::lofi::RATE_MIN));
         } else {
-            self.grain.set_bits(16.0 - 10.0 * grain);
-            let floor = crate::dsp::lofi::RATE_MIN;
-            self.grain.set_rate((rate * (1.0 - 0.8 * grain)).max(floor));
+            self.grain.set_bits(grain_bits(grain));
+            self.grain.set_rate(grain_rate(grain, rate));
         }
         self.warmth.set_amount(self.params.warmth);
     }
@@ -1322,6 +1357,61 @@ mod tests {
 
     /// THE ENSEMBLE AND THE WOW ACTUALLY DO SOMETHING.
     ///
+    /// THE GRAIN KNOB'S BOTTOM HALF IS GRIT, NOT FUZZ.
+    ///
+    /// The two axes under this one knob do not sound alike: bit
+    /// reduction is a quantisation floor that stays where it is put,
+    /// and rate reduction folds everything above its corner back down
+    /// through a 12 dB/octave pre-filter. On a pad — three drifting
+    /// oscillators of continuous high content — the second one hazes
+    /// the whole instrument over.
+    ///
+    /// The first mapping ran the rate down linearly, so the DEFAULT
+    /// position had already dropped the converter to 38 kHz. This is
+    /// the shape that fixes it, held as a claim: at the default the
+    /// clock is within a few percent of transparent, at half turn it is
+    /// still most of the way there, and the top of the knob keeps its
+    /// character.
+    #[test]
+    fn the_grain_knobs_lower_half_barely_touches_the_clock() {
+        const FS: f32 = 48_000.0;
+        // At rest, exactly transparent on both axes.
+        assert_eq!(grain_rate(0.0, FS), FS);
+        assert_eq!(grain_bits(0.0), BITS_TOP);
+
+        // The default. A converter within a few percent of the real one
+        // images almost nothing back into the band.
+        let at_default = grain_rate(0.25, FS);
+        assert!(
+            at_default > FS * 0.97,
+            "a quarter turn drops the clock to {:.0} Hz",
+            at_default
+        );
+        // Half a turn is still mostly clean — this is where the knob
+        // should be adding GRIT, and at half turn there is a real
+        // amount of it.
+        assert!(grain_rate(0.5, FS) > FS * 0.88);
+        assert!(grain_bits(0.5) <= 11.5, "half a turn is barely quantised");
+
+        // And the top still means something, or the knob has no far end.
+        assert!(grain_rate(1.0, FS) < FS * 0.45);
+        assert!(grain_bits(1.0) <= 6.0);
+
+        // Monotonic in both, and never past the kernel's own floor.
+        let mut last_rate = f32::INFINITY;
+        let mut last_bits = f32::INFINITY;
+        for step in 0..=20 {
+            let grain = step as f32 / 20.0;
+            let rate = grain_rate(grain, FS);
+            let bits = grain_bits(grain);
+            assert!(rate <= last_rate + 1e-3, "the clock rose at {grain}");
+            assert!(bits <= last_bits + 1e-3, "the depth rose at {grain}");
+            assert!(rate >= crate::dsp::lofi::RATE_MIN);
+            last_rate = rate;
+            last_bits = bits;
+        }
+    }
+
     /// Both ride `DelayLine`, which does not own its memory and FAILS
     /// OPEN when handed a buffer of the wrong length — it passes the dry
     /// signal and says nothing. That is a silence which looks exactly

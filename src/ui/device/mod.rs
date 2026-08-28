@@ -76,6 +76,7 @@ pub mod acid;
 pub mod adjust;
 pub mod bezier;
 pub mod card;
+pub mod clamp;
 pub mod design;
 pub mod disperser;
 pub mod dynamics;
@@ -101,6 +102,7 @@ pub mod param;
 pub mod phaser;
 pub mod poly;
 pub mod poly_widgets;
+pub mod prism;
 /// NOT `#[cfg(test)]`, and deliberately.
 ///
 /// The device UI contract requires a pointer test for every draggable

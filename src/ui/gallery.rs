@@ -779,7 +779,7 @@ impl Gallery {
             kit::muted(
                 ui,
                 theme,
-                "sheen — what the brightener adds, on two synthetic hits",
+                "sheen — where slew and the edge band allow brightness through",
             );
             for edit in device::sheen_card(ui, theme, &mut self.dev_sheen) {
                 self.log.push(format!(

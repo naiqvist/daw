@@ -69,13 +69,16 @@ mod focus;
 use focus::Focus;
 mod device_state;
 use device_state::{
-    DeviceInstance, DeviceState, EchoParams, acid_knobs, device_edits, device_is_discrete,
-    device_is_log, device_value, disperser_knobs, echo_knobs, eq_knobs, gate_knobs, glue_knobs,
-    lofi_knobs, phaser_knobs, poly_knobs, resyn_knobs, reverb_knobs, sat_knobs, sheen_knobs,
-    strip_knobs, synth_knobs, tilt_knobs, unit_zoom, utility_knobs,
+    DeviceInstance, DeviceState, EchoParams, acid_knobs, card_pages, clamp_knobs, device_edits,
+    device_is_discrete, device_is_log, device_value, disperser_knobs, echo_knobs, eq_knobs,
+    gate_knobs, glue_knobs, lofi_knobs, phaser_knobs, poly_knobs, prism_knobs, resyn_knobs,
+    reverb_knobs, sat_knobs, sheen_knobs, strip_knobs, synth_knobs, tilt_knobs, unit_zoom,
+    utility_knobs,
 };
 mod devices;
+mod shell;
 use bar::{Bar, TRANSPORT_GAP, TRANSPORT_GROUP_GAP, bar_layout, buttons_width, fields_width};
+use daw::ui::glyph::Glyph;
 use devices::{DeviceKind, device_by_prefix};
 mod icon;
 mod piano_roll;
@@ -103,7 +106,7 @@ const ZOOM: f32 = 1.75;
 // --- the skeleton's geometry: starting guesses, all three live here ---
 
 /// Height of the top bar.
-const TOP_BAR_H: f32 = 36.0;
+const TOP_BAR_H: f32 = 40.0;
 /// Width of the left browser region — and, through the token, of every
 /// other side column, so the two never drift apart on screen.
 const BROWSER_W: f32 = control::SIDE_COLUMN_W;
@@ -235,7 +238,10 @@ const GRID_MIN_PX: f32 = 5.0;
 const MINIMAP_H: f32 = 40.0;
 /// The loop ruler: a strip above the lanes where the loop brace lives. The
 /// handles need somewhere to be grabbed that is not inside a track.
-const LOOP_RULER_H: f32 = 14.0;
+// Fourteen points technically held the ruler, but not a human click. This is
+// the Arrangement's permanent transport-seek surface, especially when a clip
+// covers beat zero, so give it the same comfortable target as other controls.
+const LOOP_RULER_H: f32 = 22.0;
 /// Width of a loop handle's hit area.
 const LOOP_HANDLE_W: f32 = 7.0;
 
@@ -331,17 +337,12 @@ const PAN_DETENT: f32 = 0.04;
 /// Drag limits for the two resizable regions, so proportions can be found by
 /// feel rather than by guessing numbers.
 const BROWSER_W_RANGE: std::ops::RangeInclusive<f32> = 180.0..=560.0;
-fn main() -> eframe::Result {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("daw")
-            .with_inner_size([1600.0, 900.0])
-            .with_min_inner_size([960.0, 600.0]),
-        renderer: eframe::Renderer::Wgpu,
-        ..Default::default()
-    };
-
-    eframe::run_native("daw", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Our own window and our own render loop — see `src/shell.rs`. The
+    // reason is one pass: eframe has nowhere to stand after egui has
+    // drawn, and the treatment in `shell::post` has to read the
+    // finished frame.
+    shell::run("daw", [1600.0, 900.0], [960.0, 600.0], App::new)
 }
 
 /// Split the browser's interior into the two bands, inset so the panel's own
@@ -393,10 +394,29 @@ fn arrangement_keys(ctx: &egui::Context, arr: &Arrangement, out: &mut Vec<UiActi
     if ctx.egui_wants_keyboard_input() {
         return;
     }
+    // Tab is global between Live's two main views. Once it has had first
+    // refusal, Session owns every other key while it is visible: timeline
+    // clipboard and time-edit commands must never consume a Session press.
+    if arr.main_view == MainView::Session {
+        ctx.input_mut(|i| {
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::Tab) {
+                out.push(UiAction::ToggleMainView);
+            }
+        });
+        return;
+    }
     // While the ring is on a cell, Left and Right walk the grid instead of
     // leaving the arrangement. At beat 0 Left is NOT claimed, so there is
     // always a way back out to the browser.
-    if arr.owns_arrows {
+    if !arr.selected_clip_refs().is_empty() {
+        ctx.input_mut(|i| {
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) {
+                out.push(UiAction::NudgeSelectedClips(-1));
+            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight) {
+                out.push(UiAction::NudgeSelectedClips(1));
+            }
+        });
+    } else if arr.owns_arrows {
         let at_start = arr.cursor.map(|c| c.1).unwrap_or(0.0) <= 0.0;
         ctx.input_mut(|i| {
             // SHIFT FIRST, and this order is not cosmetic. `consume_key`
@@ -446,27 +466,39 @@ fn arrangement_keys(ctx: &egui::Context, arr: &Arrangement, out: &mut Vec<UiActi
         // Alt is on this one because Ctrl+L was taken. It is also what
         // Ableton puts on the same panel.
         if i.consume_key(
+            egui::Modifiers::COMMAND | egui::Modifiers::ALT | egui::Modifiers::SHIFT,
+            egui::Key::F,
+        ) {
+            out.push(UiAction::ToggleChrome);
+        }
+        if i.consume_key(
+            egui::Modifiers::COMMAND | egui::Modifiers::ALT,
+            egui::Key::B,
+        ) {
+            out.push(UiAction::ToggleBrowser);
+        }
+        if i.consume_key(
             egui::Modifiers::COMMAND | egui::Modifiers::ALT,
             egui::Key::L,
         ) {
             out.push(UiAction::ToggleLower);
         }
-        if i.consume_key(egui::Modifiers::COMMAND, egui::Key::B) {
-            out.push(UiAction::ToggleBrowser);
-        }
-        if i.consume_key(
-            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
-            egui::Key::F,
-        ) {
-            out.push(UiAction::ToggleChrome);
-        }
         if i.consume_key(egui::Modifiers::COMMAND, egui::Key::L) {
             out.push(UiAction::LoopFromSelection);
         }
-        if i.consume_key(egui::Modifiers::COMMAND, egui::Key::M) {
+        if i.consume_key(
+            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+            egui::Key::M,
+        ) {
             out.push(UiAction::CreateClip);
         }
         // The clipboard verbs, everywhere a clip can be selected.
+        if i.consume_key(egui::Modifiers::COMMAND, egui::Key::A) {
+            out.push(UiAction::SelectAllClips);
+        }
+        if i.consume_key(egui::Modifiers::COMMAND, egui::Key::X) {
+            out.push(UiAction::CutClip);
+        }
         if i.consume_key(egui::Modifiers::COMMAND, egui::Key::C) {
             out.push(UiAction::CopyClip);
         }
@@ -545,6 +577,24 @@ fn arrangement_keys(ctx: &egui::Context, arr: &Arrangement, out: &mut Vec<UiActi
 
 /// One transport button: hover wash, icon, click. Returns true when pressed,
 /// by mouse or by keyboard.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TransportSignal {
+    /// A verb with no retained state: return, pause, stop.
+    Momentary,
+    /// A retained switch: play, loop, metronome, follow, engine.
+    Active,
+    /// Ready to record, but the transport is not rolling.
+    Armed,
+    /// Record is armed and the transport is rolling.
+    Recording,
+}
+
+impl TransportSignal {
+    fn retained(self) -> bool {
+        self != Self::Momentary
+    }
+}
+
 fn transport_button(
     ui: &mut egui::Ui,
     theme: &Theme,
@@ -553,17 +603,47 @@ fn transport_button(
     id: &'static str,
     icon: Icon,
     colour: egui::Color32,
+    signal: TransportSignal,
 ) -> bool {
     let wid = ui.id().with(id);
     focus.register(wid, rect);
     let response = ui
         .interact(rect, wid, egui::Sense::click())
         .affords(Affords::Press);
+    let painter = ui.painter();
+    if signal.retained() {
+        // State is additive: the icon keeps naming the action while a low
+        // edge and a square node say that state is retained. Colour supports
+        // the sentence, but a monochrome screenshot still reads it.
+        painter.rect_filled(rect.shrink(1.0), 0.0, colour.gamma_multiply(0.10));
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(rect.left(), rect.bottom() - stroke::BOLD),
+                rect.right_bottom(),
+            ),
+            0.0,
+            colour,
+        );
+        let node = egui::Rect::from_center_size(
+            egui::pos2(rect.right() - 3.0, rect.top() + 3.0),
+            egui::Vec2::splat(3.0),
+        );
+        painter.rect_filled(node, 0.0, colour);
+        if signal == TransportSignal::Recording {
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    rect.left_top(),
+                    egui::pos2(rect.right(), rect.top() + stroke::BOLD),
+                ),
+                0.0,
+                colour,
+            );
+        }
+    }
     if response.hovered() {
         ui.painter().rect_filled(rect, 0.0, theme.accent_muted);
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    let painter = ui.painter();
     match icon {
         Icon::Return => {
             let (bar, tri) = return_icon(rect);
@@ -591,7 +671,18 @@ fn transport_button(
         }
         Icon::Record => {
             let (centre, radius) = record_icon(rect);
-            painter.circle_filled(centre, radius, colour);
+            match signal {
+                TransportSignal::Recording => {
+                    painter.circle_filled(centre, radius, colour);
+                }
+                TransportSignal::Armed => {
+                    painter.circle_stroke(centre, radius, egui::Stroke::new(1.5, colour));
+                    painter.circle_filled(centre, radius * 0.24, colour);
+                }
+                _ => {
+                    painter.circle_stroke(centre, radius, egui::Stroke::new(1.5, colour));
+                }
+            }
         }
         Icon::Loop => {
             let (track, head) = loop_icon(rect);
@@ -632,7 +723,20 @@ fn transport_button(
         }
     }
     // Mouse and keyboard are the same press. The button does not care which.
-    response.clicked() || focus.activated(wid)
+    let clicked = response.clicked() || focus.activated(wid);
+    response.on_hover_text(match id {
+        "return" => "return to marker",
+        "play" => "play / pause transport",
+        "pause" => "pause and hold position",
+        "stop" => "stop and return",
+        "record" => "arm recording",
+        "power" => "audio engine power",
+        "loop" => "arrangement loop",
+        "metro" => "metronome",
+        "follow" => "follow playhead",
+        _ => id,
+    });
+    clicked
 }
 
 /// The ink a plain toggle takes: lit when on, resting when off.
@@ -680,6 +784,14 @@ fn field(
 
 /// A readout. Plain, never in a well: a well means editable, and these are
 /// not.
+///
+/// NO CAPTION. A bar-position readout, a timecode and an engine load
+/// are each recognisable from the shape of what they print — `2.1.480`,
+/// `00:00:03.2`, `dsp 4.1% xr 0` — and a micro-label naming them was a
+/// second copy of a fact the number already carried. What the caption
+/// cost was a line of type across the top of the transport that never
+/// changed, which is the kind of furniture that stops being read and
+/// carries on being seen.
 fn readout(ui: &mut egui::Ui, rect: egui::Rect, text: &str, colour: egui::Color32) {
     ui.painter().text(
         egui::pos2(rect.left(), rect.center().y),
@@ -688,6 +800,36 @@ fn readout(ui: &mut egui::Ui, rect: egui::Rect, text: &str, colour: egui::Color3
         egui::FontId::new(READOUT_TYPE, egui::FontFamily::Monospace),
         colour,
     );
+}
+
+/// Three positional rails make the bar's scopes visible: transport verbs,
+/// engine-authoritative indices, and system/sync settings. They are quiet
+/// enough to disappear with familiarity, but survive blur and monochrome.
+fn transport_scaffold(
+    ui: &egui::Ui,
+    theme: &Theme,
+    area: egui::Rect,
+    groups: [(f32, f32, &'static str); 3],
+) {
+    let y = area.bottom() - 2.0;
+    for (x, width, label) in groups {
+        ui.painter().line_segment(
+            [egui::pos2(x, y), egui::pos2(x + width, y)],
+            egui::Stroke::new(stroke::HAIR, theme.divider),
+        );
+        ui.painter().rect_filled(
+            egui::Rect::from_center_size(egui::pos2(x, y), egui::Vec2::splat(2.0)),
+            0.0,
+            theme.outline,
+        );
+        ui.painter().text(
+            egui::pos2(x + width, area.bottom()),
+            egui::Align2::RIGHT_BOTTOM,
+            label,
+            egui::FontId::monospace(6.0),
+            theme.text_muted,
+        );
+    }
 }
 
 /// Live engine numbers for the top bar's slot. Percent of the block budget
@@ -736,6 +878,16 @@ fn top_bar_body(
         + TRANSPORT_GROUP_GAP
         + fields_width(&[QUANT_W, TEMPO_W, TIMESIG_W, TIMESIG_W]);
     let (verbs_x, centre_x, right_x, _) = bar_layout(area, verbs_w, centre_w, right_w);
+    transport_scaffold(
+        ui,
+        theme,
+        area,
+        [
+            (verbs_x, verbs_w, "T01"),
+            (centre_x, centre_w, "C02"),
+            (right_x, right_w, "S03"),
+        ],
+    );
 
     // --- verbs, holding the left edge -------------------------------------
     let mut bar = Bar::at(area, verbs_x);
@@ -747,6 +899,7 @@ fn top_bar_body(
         "return",
         Icon::Return,
         theme.text_muted,
+        TransportSignal::Momentary,
     ) {
         out.push(UiAction::Return);
     }
@@ -759,7 +912,16 @@ fn top_bar_body(
         bar.button(),
         "play",
         Icon::Play,
-        toggle_ink(theme, t.playing),
+        if t.playing {
+            theme.ok
+        } else {
+            theme.text_muted
+        },
+        if t.playing {
+            TransportSignal::Active
+        } else {
+            TransportSignal::Momentary
+        },
     ) {
         out.push(UiAction::TogglePlay);
     }
@@ -771,6 +933,7 @@ fn top_bar_body(
         "pause",
         Icon::Pause,
         theme.text_muted,
+        TransportSignal::Momentary,
     ) {
         out.push(UiAction::Pause);
     }
@@ -782,6 +945,7 @@ fn top_bar_body(
         "stop",
         Icon::Stop,
         theme.text_muted,
+        TransportSignal::Momentary,
     ) {
         out.push(UiAction::Stop);
     }
@@ -800,6 +964,13 @@ fn top_bar_body(
         "record",
         Icon::Record,
         record_ink,
+        if t.recording() {
+            TransportSignal::Recording
+        } else if t.armed {
+            TransportSignal::Armed
+        } else {
+            TransportSignal::Momentary
+        },
     ) {
         out.push(UiAction::ToggleRecord);
     }
@@ -812,6 +983,8 @@ fn top_bar_body(
         &format_position(t.position, t.bpm, u64::from(t.beats_per_bar)),
         if t.recording() {
             theme.red_zone
+        } else if t.playing {
+            theme.ok
         } else {
             theme.text
         },
@@ -864,7 +1037,12 @@ fn top_bar_body(
         bar.button(),
         "power",
         Icon::Power,
-        toggle_ink(theme, ev.on),
+        if ev.on { theme.ok } else { theme.text_muted },
+        if ev.on {
+            TransportSignal::Active
+        } else {
+            TransportSignal::Momentary
+        },
     ) {
         out.push(if ev.on {
             UiAction::StopEngine
@@ -879,7 +1057,16 @@ fn top_bar_body(
         bar.button(),
         "loop",
         Icon::Loop,
-        toggle_ink(theme, t.loop_on),
+        if t.loop_on {
+            theme.loop_brace
+        } else {
+            theme.text_muted
+        },
+        if t.loop_on {
+            TransportSignal::Active
+        } else {
+            TransportSignal::Momentary
+        },
     ) {
         out.push(UiAction::ToggleLoop);
     }
@@ -891,6 +1078,11 @@ fn top_bar_body(
         "metro",
         Icon::Metronome,
         toggle_ink(theme, t.metronome),
+        if t.metronome {
+            TransportSignal::Active
+        } else {
+            TransportSignal::Momentary
+        },
     ) {
         out.push(UiAction::ToggleMetronome);
     }
@@ -901,28 +1093,39 @@ fn top_bar_body(
         bar.button(),
         "follow",
         Icon::Follow,
-        toggle_ink(theme, t.follow),
+        if t.follow {
+            theme.accent
+        } else {
+            theme.text_muted
+        },
+        if t.follow {
+            TransportSignal::Active
+        } else {
+            TransportSignal::Momentary
+        },
     ) {
         out.push(UiAction::ToggleFollow);
     }
 
     bar.group();
+    let quant_rect = bar.field(QUANT_W);
     let quant = field(
         ui,
         theme,
         focus,
-        bar.field(QUANT_W),
+        quant_rect,
         "launch_quantization",
         quantization.label(),
     );
     if quant.clicked() {
         *quantization = quantization.next();
     }
+    let tempo_rect = bar.field(TEMPO_W);
     let tempo = field(
         ui,
         theme,
         focus,
-        bar.field(TEMPO_W),
+        tempo_rect,
         "tempo",
         &format!("{:.2}", t.bpm),
     );
@@ -935,11 +1138,12 @@ fn top_bar_body(
 
     // The numerator drags, the denominator cycles. Dragging through powers of
     // two would be a lie about what values exist.
+    let num_rect = bar.field(TIMESIG_W);
     let num = field(
         ui,
         theme,
         focus,
-        bar.field(TIMESIG_W),
+        num_rect,
         "ts_num",
         &t.beats_per_bar.to_string(),
     );
@@ -973,11 +1177,12 @@ fn top_bar_body(
         egui::FontId::new(FIELD_TYPE, egui::FontFamily::Monospace),
         theme.text_muted,
     );
+    let den_rect = bar.field(TIMESIG_W);
     let den = field(
         ui,
         theme,
         focus,
-        bar.field(TIMESIG_W),
+        den_rect,
         "ts_den",
         &t.beat_unit.to_string(),
     );
@@ -1167,6 +1372,9 @@ fn perform(actions: &[UiAction], transport: &mut Transport, arrangement: &mut Ar
                 arrangement.select_track(track);
                 arrangement.selection = Some(extended(arrangement.anchor, beat, grid));
             }
+            UiAction::NudgeSelectedClips(delta) => {
+                arrangement.nudge_selected_clips(*delta as f32 * arrangement.grid_beats());
+            }
             UiAction::LoopFromSelection => {
                 if let Some(range) = arrangement.selection {
                     arrangement.loop_range = Some(range);
@@ -1183,9 +1391,10 @@ fn perform(actions: &[UiAction], transport: &mut Transport, arrangement: &mut Ar
                     } else if let Some(track) = arrangement.selected {
                         arrangement.remove_track(track);
                     }
-                } else if let Some((t, i)) = arrangement.selected_clip {
-                    arrangement.clips[t].remove(i);
-                    arrangement.selected_clip = None;
+                } else if arrangement.selected_clip.is_some()
+                    || !arrangement.selected_clip_ids.is_empty()
+                {
+                    arrangement.delete_selected_clips();
                 } else if let Some(track) = arrangement.selected {
                     arrangement.remove_track(track);
                 }
@@ -1206,6 +1415,10 @@ fn perform(actions: &[UiAction], transport: &mut Transport, arrangement: &mut Ar
                 }
             }
             UiAction::CopyClip => arrangement.copy_selected(),
+            UiAction::CutClip => {
+                arrangement.copy_selected();
+                arrangement.delete_selected_clips();
+            }
             UiAction::PasteClip => {
                 let track = arrangement.paste_track();
                 let playhead = (transport.position * transport.bpm / 60.0) as f32;
@@ -1213,6 +1426,11 @@ fn perform(actions: &[UiAction], transport: &mut Transport, arrangement: &mut Ar
             }
             UiAction::DuplicateClip => {
                 arrangement.duplicate_selected();
+            }
+            UiAction::SelectAllClips => {
+                if arrangement.main_view == MainView::Timeline {
+                    arrangement.select_all_clips();
+                }
             }
             UiAction::SplitAtCursor => {
                 if let Some((track, beat)) = arrangement.cursor {
@@ -1820,6 +2038,15 @@ struct Ghost {
     copy: bool,
 }
 
+/// One item in a multi-clip clipboard. Time and lane are relative to the
+/// upper-left clip in the copied set, so paste preserves the arrangement.
+#[derive(Clone)]
+struct ClipboardClip {
+    track_offset: usize,
+    beat_offset: f32,
+    clip: Clip,
+}
+
 /// An audio-file drag in flight over the window — an OS file hover or a
 /// browser sample row being pulled. The arrangement previews it as a ghost
 /// clip snapped to the grid and writes back where a release would land;
@@ -2232,9 +2459,15 @@ struct Arrangement {
     clips: Vec<Vec<Clip>>,
     /// The selected clip, as (track, index into that track's clips).
     selected_clip: Option<(usize, usize)>,
+    /// Additional selected clips, by stable id. `selected_clip` remains the
+    /// primary item for editors and old single-clip commands; this list is
+    /// what makes Ctrl+A / Ctrl-click and group clipboard edits honest.
+    selected_clip_ids: Vec<u64>,
     /// The clipboard: a whole clip, notes and all. `Ctrl+C` fills it,
     /// `Ctrl+V` reads it without emptying it.
     clipboard: Option<Clip>,
+    /// Structured clipboard used when more than one clip was copied.
+    clipboard_clips: Vec<ClipboardClip>,
     /// The Ctrl+drag ghost, while one is in flight.
     ghost: Option<Ghost>,
     /// The inline rename, while one is open.
@@ -2343,6 +2576,7 @@ struct Content {
 struct Marks {
     selected: Option<usize>,
     selected_clip: Option<(usize, usize)>,
+    selected_clip_ids: Vec<u64>,
     selection: Option<(f32, f32)>,
     cursor: Option<(usize, f32)>,
     anchor: f32,
@@ -2815,7 +3049,9 @@ impl Default for Arrangement {
             // clips on them are the user's.
             clips: (0..TRACK_COUNT).map(|_| Vec::new()).collect(),
             selected_clip: None,
+            selected_clip_ids: Vec::new(),
             clipboard: None,
+            clipboard_clips: Vec::new(),
             ghost: None,
             rename: None,
             key: Key::default(),
@@ -2929,6 +3165,7 @@ impl Arrangement {
             marks: Marks {
                 selected: self.selected,
                 selected_clip: self.selected_clip,
+                selected_clip_ids: self.selected_clip_ids.clone(),
                 selection: self.selection,
                 cursor: self.cursor,
                 anchor: self.anchor,
@@ -2955,6 +3192,7 @@ impl Arrangement {
         self.next_track_no = snapshot.content.next_track_no;
         self.selected = snapshot.marks.selected;
         self.selected_clip = snapshot.marks.selected_clip;
+        self.selected_clip_ids = snapshot.marks.selected_clip_ids.clone();
         self.selection = snapshot.marks.selection;
         self.cursor = snapshot.marks.cursor;
         self.anchor = snapshot.marks.anchor;
@@ -3002,6 +3240,11 @@ impl Arrangement {
         {
             self.selected_clip = None;
         }
+        self.selected_clip_ids.retain(|id| {
+            self.clips
+                .iter()
+                .any(|track| track.iter().any(|clip| clip.id == *id))
+        });
         if self.cursor.is_some_and(|(t, _)| t >= self.tracks.len()) {
             self.cursor = None;
         }
@@ -3459,6 +3702,7 @@ impl Arrangement {
         // The split lands selected on the left half, whose identity the
         // original kept.
         self.selected_clip = Some((track, index));
+        self.selected_clip_ids.clear();
         true
     }
 
@@ -3515,6 +3759,7 @@ impl Arrangement {
         let at = clips.partition_point(|clip| clip.start < start);
         clips.insert(at, merged);
         self.selected_clip = Some((track, at));
+        self.selected_clip_ids.clear();
         true
     }
 
@@ -3555,6 +3800,7 @@ impl Arrangement {
         });
         self.selection = None;
         self.selected_clip = None;
+        self.selected_clip_ids.clear();
         true
     }
 
@@ -3581,6 +3827,7 @@ impl Arrangement {
             (shift(a), shift(b))
         });
         self.selected_clip = None;
+        self.selected_clip_ids.clear();
         true
     }
 
@@ -3727,6 +3974,7 @@ impl Arrangement {
         // without a second click.
         self.select_track(i);
         self.selected_clip = None;
+        self.selected_clip_ids.clear();
         self.cursor = Some((i, self.cursor.map(|c| c.1).unwrap_or(0.0)));
         i
     }
@@ -3895,6 +4143,11 @@ impl Arrangement {
         };
         self.selected = self.selected.and_then(fix);
         self.selected_clip = self.selected_clip.and_then(|(t, c)| Some((fix(t)?, c)));
+        self.selected_clip_ids.retain(|id| {
+            self.clips
+                .iter()
+                .any(|clips| clips.iter().any(|clip| clip.id == *id))
+        });
         self.cursor = self.cursor.and_then(|(t, b)| Some((fix(t)?, b)));
         self.session.selected = self.session.selected.and_then(|(t, s)| Some((fix(t)?, s)));
         // A follower of the removed lane goes with it — and its wires go
@@ -3954,6 +4207,7 @@ impl Arrangement {
         clip.start = start;
         self.clips[track].insert(idx, clip);
         self.selected_clip = Some((track, idx));
+        self.selected_clip_ids.clear();
         Some(idx)
     }
 
@@ -4021,23 +4275,267 @@ impl Arrangement {
         )
     }
 
+    /// Every selected timeline clip, primary first and then the additive
+    /// selection, resolved from stable ids after any resorting.
+    fn selected_clip_refs(&self) -> Vec<(usize, usize)> {
+        let mut refs = Vec::new();
+        if let Some(primary) = self.selected_clip
+            && self
+                .clips
+                .get(primary.0)
+                .is_some_and(|track| primary.1 < track.len())
+        {
+            refs.push(primary);
+        }
+        for id in &self.selected_clip_ids {
+            if let Some(found) = self.clips.iter().enumerate().find_map(|(track, clips)| {
+                clips
+                    .iter()
+                    .position(|clip| clip.id == *id)
+                    .map(|clip| (track, clip))
+            }) && !refs.contains(&found)
+            {
+                refs.push(found);
+            }
+        }
+        refs
+    }
+
+    fn clip_is_selected(&self, track: usize, index: usize) -> bool {
+        self.selected_clip == Some((track, index))
+            || self
+                .clips
+                .get(track)
+                .and_then(|clips| clips.get(index))
+                .is_some_and(|clip| self.selected_clip_ids.contains(&clip.id))
+    }
+
+    fn select_only_clip(&mut self, track: usize, index: usize) {
+        self.selected_clip = Some((track, index));
+        self.selected_clip_ids.clear();
+        self.select_track(track);
+    }
+
+    fn toggle_clip_selection(&mut self, track: usize, index: usize) {
+        let Some(id) = self
+            .clips
+            .get(track)
+            .and_then(|clips| clips.get(index))
+            .map(|c| c.id)
+        else {
+            return;
+        };
+        if self.selected_clip == Some((track, index)) {
+            self.selected_clip = None;
+            self.selected_clip_ids.retain(|selected| *selected != id);
+        } else if let Some(at) = self
+            .selected_clip_ids
+            .iter()
+            .position(|selected| *selected == id)
+        {
+            self.selected_clip_ids.remove(at);
+        } else {
+            self.selected_clip_ids.push(id);
+            if self.selected_clip.is_none() {
+                self.selected_clip = Some((track, index));
+            }
+        }
+        self.select_track(track);
+    }
+
+    /// Shift-click: select the chronological range between the primary clip
+    /// and this clip. Across lanes there is no honest one-dimensional range,
+    /// so the clicked clip is added without inventing hidden selections.
+    fn extend_clip_selection(&mut self, track: usize, index: usize) {
+        let Some((anchor_track, anchor_index)) = self.selected_clip else {
+            self.select_only_clip(track, index);
+            return;
+        };
+        if anchor_track != track {
+            if !self.clip_is_selected(track, index) {
+                self.selected_clip_ids.push(self.clips[track][index].id);
+            }
+            self.select_track(track);
+            return;
+        }
+        let (from, to) = if anchor_index <= index {
+            (anchor_index, index)
+        } else {
+            (index, anchor_index)
+        };
+        self.selected_clip_ids = self.clips[track][from..=to]
+            .iter()
+            .map(|clip| clip.id)
+            .collect();
+        self.select_track(track);
+    }
+
+    /// Move the selected set as one rigid block. A move that would cross beat
+    /// zero or overlap an unselected clip is refused whole; partial movement
+    /// would destroy the grouping the selection expresses.
+    fn nudge_selected_clips(&mut self, delta: f32) -> bool {
+        let refs = self.selected_clip_refs();
+        if refs.is_empty() || delta == 0.0 {
+            return false;
+        }
+        if refs
+            .iter()
+            .any(|(track, index)| self.clips[*track][*index].start + delta < 0.0)
+        {
+            return false;
+        }
+        let selected_ids: std::collections::HashSet<u64> = refs
+            .iter()
+            .map(|(track, index)| self.clips[*track][*index].id)
+            .collect();
+        for (track, index) in &refs {
+            let moved = &self.clips[*track][*index];
+            let from = moved.start + delta;
+            let to = from + moved.len;
+            if self.clips[*track].iter().any(|other| {
+                !selected_ids.contains(&other.id)
+                    && from < other.start + other.len
+                    && other.start < to
+            }) {
+                return false;
+            }
+        }
+        let primary_id = self
+            .selected_clip
+            .and_then(|(track, index)| self.clips.get(track)?.get(index))
+            .map(|clip| clip.id);
+        for (track, index) in refs {
+            self.clips[track][index].start += delta;
+        }
+        for clips in &mut self.clips {
+            clips.sort_by(|a, b| a.start.total_cmp(&b.start));
+        }
+        self.selected_clip = primary_id.and_then(|id| {
+            self.clips.iter().enumerate().find_map(|(track, clips)| {
+                clips
+                    .iter()
+                    .position(|clip| clip.id == id)
+                    .map(|index| (track, index))
+            })
+        });
+        true
+    }
+
+    fn select_all_clips(&mut self) {
+        let Some((track, index, _)) = self
+            .clips
+            .iter()
+            .enumerate()
+            .find_map(|(track, clips)| clips.first().map(|clip| (track, 0, clip.id)))
+        else {
+            self.selected_clip = None;
+            self.selected_clip_ids.clear();
+            return;
+        };
+        self.selected_clip = Some((track, index));
+        self.selected_clip_ids = self
+            .clips
+            .iter()
+            .flat_map(|clips| clips.iter().map(|clip| clip.id))
+            .collect();
+        self.select_track(track);
+    }
+
+    fn delete_selected_clips(&mut self) -> bool {
+        let mut refs = self.selected_clip_refs();
+        if refs.is_empty() {
+            return false;
+        }
+        refs.sort_unstable();
+        for (track, index) in refs.into_iter().rev() {
+            self.clips[track].remove(index);
+        }
+        self.selected_clip = None;
+        self.selected_clip_ids.clear();
+        true
+    }
+
     /// Ctrl+C. A missing selection copies nothing — silence, not an error.
     fn copy_selected(&mut self) {
-        if let Some((t, i)) = self.selected_clip {
-            self.clipboard = self.clips[t].get(i).cloned();
-        }
+        let refs = self.selected_clip_refs();
+        let Some(base_track) = refs.iter().map(|(track, _)| *track).min() else {
+            return;
+        };
+        let base_beat = refs
+            .iter()
+            .map(|(track, clip)| self.clips[*track][*clip].start)
+            .fold(f32::INFINITY, f32::min);
+        self.clipboard = refs
+            .first()
+            .map(|(track, clip)| self.clips[*track][*clip].clone());
+        self.clipboard_clips = if refs.len() > 1 {
+            refs.into_iter()
+                .map(|(track, clip)| {
+                    let clip = self.clips[track][clip].clone();
+                    ClipboardClip {
+                        track_offset: track - base_track,
+                        beat_offset: clip.start - base_beat,
+                        clip,
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
     }
 
     /// Ctrl+V: the clipboard lands on `track` at `at`. The clipboard is not
     /// emptied — pasting twice makes two copies, like every other DAW.
     fn paste_clipboard(&mut self, track: usize, at: f32) -> Option<usize> {
+        if !self.clipboard_clips.is_empty() {
+            let copied = self.clipboard_clips.clone();
+            let mut pasted = Vec::new();
+            for item in copied {
+                let target = track + item.track_offset;
+                if target >= self.tracks.len() || !lane_accepts(&self.tracks[target], &item.clip) {
+                    continue;
+                }
+                let mut clip = item.clip;
+                clip.id = self.next_id();
+                let id = clip.id;
+                self.insert_clip(target, clip, at + item.beat_offset);
+                pasted.push(id);
+            }
+            let first = *pasted.first()?;
+            self.selected_clip_ids = pasted;
+            self.selected_clip = self.clips.iter().enumerate().find_map(|(track, clips)| {
+                clips
+                    .iter()
+                    .position(|clip| clip.id == first)
+                    .map(|clip| (track, clip))
+            });
+            return self.selected_clip.map(|(_, clip)| clip);
+        }
         let mut clip = self.clipboard.clone()?;
         clip.id = self.next_id();
+        self.selected_clip_ids.clear();
         self.insert_clip(track, clip, at)
     }
 
     /// Ctrl+D: a copy directly after the original, same name and notes.
     fn duplicate_selected(&mut self) -> Option<usize> {
+        let refs = self.selected_clip_refs();
+        if refs.len() > 1 {
+            let from = refs
+                .iter()
+                .map(|(track, clip)| self.clips[*track][*clip].start)
+                .fold(f32::INFINITY, f32::min);
+            let to = refs
+                .iter()
+                .map(|(track, clip)| {
+                    let clip = &self.clips[*track][*clip];
+                    clip.start + clip.len
+                })
+                .fold(0.0, f32::max);
+            let base_track = refs.iter().map(|(track, _)| *track).min()?;
+            self.copy_selected();
+            return self.paste_clipboard(base_track, from + (to - from));
+        }
         let (t, i) = self.selected_clip?;
         let mut copy = self.clips[t][i].clone();
         let at = copy.start + copy.len;
@@ -4056,6 +4554,7 @@ impl Arrangement {
         if self.selected_clip == Some((track, i)) {
             self.selected_clip = None;
         }
+        self.selected_clip_ids.retain(|selected| *selected != id);
         true
     }
 
@@ -6600,6 +7099,7 @@ fn track_headers(
     if let Some(i) = select {
         arr.select_track(i);
         arr.selected_clip = None;
+        arr.selected_clip_ids.clear();
     }
     // Folding is not muting: the lane goes away, the sound does not, so
     // this is the one header intent that never touches the schedule.
@@ -7117,6 +7617,7 @@ fn arrangement_body(
         // A drag on empty lane is a new intention; a clip left selected
         // from before is not part of it.
         arr.selected_clip = None;
+        arr.selected_clip_ids.clear();
     }
     // The press IS the insert marker: the transport moves to the snapped
     // beat, so Play starts where you pointed, and a click during playback
@@ -9341,7 +9842,9 @@ fn clips_pass(
     let mut rename = arr.rename.take();
     let mut ghost = arr.ghost.take();
 
-    let mut select: Option<(usize, u64)> = None;
+    // Command-click toggles membership; Shift-click extends from the primary;
+    // ordinary clicks establish one decisive primary selection.
+    let mut select: Option<(usize, u64, bool, bool)> = None;
     let mut left_to: Option<(usize, u64, f32)> = None;
     let mut right_to: Option<(usize, u64, f32)> = None;
     // The released ghost and the lane its ORIGINAL lives on — a move must
@@ -9374,7 +9877,7 @@ fn clips_pass(
             if rect.width() <= 0.0 {
                 continue;
             }
-            let selected = arr.selected_clip == Some((t, i));
+            let selected = arr.clip_is_selected(t, i);
             let body_id = ui.id().with(("clip", clip.id));
 
             // Interact BEFORE painting: the strips, created after the body,
@@ -9384,6 +9887,7 @@ fn clips_pass(
                 .interact(rect, body_id, egui::Sense::click_and_drag())
                 .affords(Affords::Carry);
             let command = ui.input(|i| i.modifiers.command);
+            let shift = ui.input(|i| i.modifiers.shift);
             if body.drag_started() {
                 // Every drag rides a ghost. Plain drag moves the original
                 // to wherever the ghost lands; Ctrl+drag leaves it and
@@ -9399,13 +9903,18 @@ fn clips_pass(
                     grab,
                     copy: command,
                 });
-                select = Some((t, clip.id));
+                if !selected {
+                    select = Some((t, clip.id, false, false));
+                }
             }
-            if body.clicked() || body.secondary_clicked() {
-                select = Some((t, clip.id));
+            if body.clicked() {
+                select = Some((t, clip.id, command, shift));
+            }
+            if body.secondary_clicked() && !selected {
+                select = Some((t, clip.id, false, false));
             }
             if body.double_clicked() {
-                select = Some((t, clip.id));
+                select = Some((t, clip.id, false, false));
                 open_editor = true;
             }
             if body.dragged()
@@ -9540,7 +10049,7 @@ fn clips_pass(
                                     waveform::ClipEdit::FadeOut(frames)
                                 },
                             ));
-                            select = Some((t, clip.id));
+                            select = Some((t, clip.id, false, false));
                         }
                     }
                 }
@@ -9916,19 +10425,23 @@ fn clips_pass(
         match act {
             ClipMenu::Copy => {
                 if let Some(i) = index_of(&arr.clips[t], id) {
-                    arr.clipboard = Some(arr.clips[t][i].clone());
-                    arr.selected_clip = Some((t, i));
+                    if !arr.clip_is_selected(t, i) {
+                        arr.select_only_clip(t, i);
+                    }
+                    arr.copy_selected();
                 }
             }
             ClipMenu::Duplicate => {
                 if let Some(i) = index_of(&arr.clips[t], id) {
-                    arr.selected_clip = Some((t, i));
+                    if !arr.clip_is_selected(t, i) {
+                        arr.select_only_clip(t, i);
+                    }
                     arr.duplicate_selected();
                 }
             }
             ClipMenu::Rename => {
                 if let Some(i) = index_of(&arr.clips[t], id) {
-                    arr.selected_clip = Some((t, i));
+                    arr.select_only_clip(t, i);
                     rename = Some(Rename {
                         track: t,
                         id,
@@ -9939,7 +10452,13 @@ fn clips_pass(
                 }
             }
             ClipMenu::Delete => {
-                arr.remove_clip(t, id);
+                if let Some(i) = index_of(&arr.clips[t], id) {
+                    if arr.clip_is_selected(t, i) {
+                        arr.delete_selected_clips();
+                    } else {
+                        arr.remove_clip(t, id);
+                    }
+                }
             }
         }
     }
@@ -9969,10 +10488,16 @@ fn clips_pass(
     }
     arr.rename = rename;
 
-    if let Some((t, id)) = select
+    if let Some((t, id, additive, extend)) = select
         && let Some(i) = index_of(&arr.clips[t], id)
     {
-        arr.selected_clip = Some((t, i));
+        if additive {
+            arr.toggle_clip_selection(t, i);
+        } else if extend {
+            arr.extend_clip_selection(t, i);
+        } else {
+            arr.select_only_clip(t, i);
+        }
     }
     if let Some((t, id, want)) = left_to
         && let Some(i) = index_of(&arr.clips[t], id)
@@ -10015,7 +10540,7 @@ fn clips_pass(
         let (start, idx) = place_clip(&arr.clips[g.track], placed.start, placed.len);
         placed.start = start;
         arr.clips[g.track].insert(idx, placed);
-        arr.selected_clip = Some((g.track, idx));
+        arr.select_only_clip(g.track, idx);
     }
 
     arr.ghost = ghost;
@@ -10299,10 +10824,33 @@ struct BrowserItem {
     load: DeviceKind,
 }
 
-struct Folder {
+/// A folder INSIDE a folder: one effect family, and the devices in it.
+///
+/// The device tree was two levels deep and the effects folder had grown
+/// to twenty rows — a flat list that long is a list you scan rather than
+/// one you read, and it filled the tree's whole share of the panel the
+/// moment it was opened. Grouping by family is what makes "where is the
+/// compressor" a question about one heading rather than about twenty
+/// names.
+struct Group {
     name: &'static str,
     items: &'static [BrowserItem],
     open: bool,
+    /// A miniature of what this family DOES — see `ui::glyph`. A name
+    /// is a word you read; in a list scanned a hundred times a day the
+    /// useful thing is a shape recognised before anything is read.
+    mark: Glyph,
+}
+
+struct Folder {
+    name: &'static str,
+    /// Devices sitting directly under the folder, above its groups.
+    items: &'static [BrowserItem],
+    /// Families under the folder. Empty for a folder that has no reason
+    /// to split — `Instruments` is one list and reads as one.
+    groups: Vec<Group>,
+    open: bool,
+    mark: Glyph,
 }
 
 /// Everything the browser owns that outlives a frame.
@@ -10357,6 +10905,11 @@ impl Default for Browser {
             folders: vec![
                 Folder {
                     name: "Instruments",
+                    mark: Glyph::Instrument,
+                    // ONE LIST, on purpose. Eleven instruments read as
+                    // eleven instruments; the effects folder was split
+                    // because twenty rows of unlike things do not.
+                    groups: Vec::new(),
                     items: &[
                         BrowserItem {
                             name: "Poly Synth",
@@ -10403,78 +10956,148 @@ impl Default for Browser {
                 },
                 Folder {
                     name: "Audio Effects",
-                    items: &[
-                        BrowserItem {
-                            name: "Reverb",
-                            load: DeviceKind::Reverb,
+                    // A container of families rather than a family: the
+                    // one mark with no signal in it, which is the point.
+                    mark: Glyph::Stack,
+                    // Nothing loose: every effect belongs to a family,
+                    // and one device sitting outside the headings would
+                    // read as the odd one out rather than as the
+                    // uncategorised one.
+                    items: &[],
+                    groups: vec![
+                        Group {
+                            // the level of a thing against itself.
+                            name: "Dynamics",
+                            mark: Glyph::Dynamics,
+                            items: &[
+                                BrowserItem {
+                                    name: "Clamp",
+                                    load: DeviceKind::Clamp,
+                                },
+                                BrowserItem {
+                                    name: "Glue",
+                                    load: DeviceKind::Glue,
+                                },
+                                BrowserItem {
+                                    name: "Gate",
+                                    load: DeviceKind::Gate,
+                                },
+                                BrowserItem {
+                                    name: "Limiter",
+                                    load: DeviceKind::Limiter,
+                                },
+                                BrowserItem {
+                                    name: "Prism",
+                                    load: DeviceKind::Prism,
+                                },
+                            ],
+                            open: false,
                         },
-                        BrowserItem {
-                            name: "Saturator",
-                            load: DeviceKind::Sat,
+                        Group {
+                            // which frequencies, and how much of each.
+                            name: "EQ & Filters",
+                            mark: Glyph::Filter,
+                            items: &[
+                                BrowserItem {
+                                    name: "EQ",
+                                    load: DeviceKind::Eq,
+                                },
+                                BrowserItem {
+                                    name: "Filter",
+                                    load: DeviceKind::Filter,
+                                },
+                                BrowserItem {
+                                    name: "Strip",
+                                    load: DeviceKind::Strip,
+                                },
+                                BrowserItem {
+                                    name: "Tilt",
+                                    load: DeviceKind::Tilt,
+                                },
+                            ],
+                            open: false,
                         },
-                        BrowserItem {
-                            name: "Lo-fi",
-                            load: DeviceKind::Lofi,
+                        Group {
+                            // the same sound again, later.
+                            name: "Delay & Reverb",
+                            mark: Glyph::Time,
+                            items: &[
+                                BrowserItem {
+                                    name: "Delay",
+                                    load: DeviceKind::Echo,
+                                },
+                                BrowserItem {
+                                    name: "Reverb",
+                                    load: DeviceKind::Reverb,
+                                },
+                            ],
+                            open: false,
                         },
-                        BrowserItem {
-                            name: "Sheen",
-                            load: DeviceKind::Sheen,
+                        Group {
+                            // harmonics that were not in the input.
+                            name: "Distortion",
+                            mark: Glyph::Drive,
+                            items: &[
+                                BrowserItem {
+                                    name: "Saturator",
+                                    load: DeviceKind::Sat,
+                                },
+                                BrowserItem {
+                                    name: "Lo-fi",
+                                    load: DeviceKind::Lofi,
+                                },
+                                BrowserItem {
+                                    name: "Sheen",
+                                    load: DeviceKind::Sheen,
+                                },
+                            ],
+                            open: false,
                         },
-                        BrowserItem {
-                            name: "Rack",
-                            load: DeviceKind::Rack,
+                        Group {
+                            // something moving on its own.
+                            name: "Modulation",
+                            mark: Glyph::Modulation,
+                            items: &[
+                                BrowserItem {
+                                    name: "Modulato",
+                                    load: DeviceKind::Modulato,
+                                },
+                                BrowserItem {
+                                    name: "Phaser",
+                                    load: DeviceKind::Phaser,
+                                },
+                                BrowserItem {
+                                    name: "Disperser",
+                                    load: DeviceKind::Disperser,
+                                },
+                            ],
+                            open: false,
                         },
-                        BrowserItem {
-                            name: "Disperser",
-                            load: DeviceKind::Disperser,
+                        Group {
+                            // the sound taken apart and put back together.
+                            name: "Spectral",
+                            mark: Glyph::Spectral,
+                            items: &[BrowserItem {
+                                name: "Resyn",
+                                load: DeviceKind::Resyn,
+                            }],
+                            open: false,
                         },
-                        BrowserItem {
-                            name: "Tilt",
-                            load: DeviceKind::Tilt,
-                        },
-                        BrowserItem {
-                            name: "Phaser",
-                            load: DeviceKind::Phaser,
-                        },
-                        BrowserItem {
-                            name: "Gate",
-                            load: DeviceKind::Gate,
-                        },
-                        BrowserItem {
-                            name: "Strip",
-                            load: DeviceKind::Strip,
-                        },
-                        BrowserItem {
-                            name: "Resyn",
-                            load: DeviceKind::Resyn,
-                        },
-                        BrowserItem {
-                            name: "Delay",
-                            load: DeviceKind::Echo,
-                        },
-                        BrowserItem {
-                            name: "EQ",
-                            load: DeviceKind::Eq,
-                        },
-                        BrowserItem {
-                            name: "Filter",
-                            load: DeviceKind::Filter,
-                        },
-                        BrowserItem {
-                            name: "Glue",
-                            load: DeviceKind::Glue,
-                        },
-                        BrowserItem {
-                            name: "Limiter",
-                            load: DeviceKind::Limiter,
-                        },
-                        BrowserItem {
-                            name: "Modulato",
-                            load: DeviceKind::Modulato,
-                        },
-                        BrowserItem {
-                            name: "Utility",
-                            load: DeviceKind::Utility,
+                        Group {
+                            // plumbing rather than sound.
+                            name: "Utilities",
+                            mark: Glyph::Utility,
+                            items: &[
+                                BrowserItem {
+                                    name: "Utility",
+                                    load: DeviceKind::Utility,
+                                },
+                                BrowserItem {
+                                    name: "Rack",
+                                    load: DeviceKind::Rack,
+                                },
+                            ],
+                            open: false,
                         },
                     ],
                     open: true,
@@ -10509,34 +11132,260 @@ enum BrowserEvent {
 /// Pure: the whole tree is derived from the folder list, so what is on
 /// screen and what the click handler thinks is on screen cannot drift apart.
 /// The last child of a folder gets the elbow, the rest get tees.
-fn tree_rows(folders: &[Folder]) -> Vec<(String, bool)> {
+/// One level of indent, in spaces. Two, matching what the flat tree
+/// already drew for a folder's children.
+const TREE_INDENT: &str = "  ";
+
+/// The two character cells a heading leaves empty for its family mark,
+/// plus the space after it. Spaces rather than a glyph: the mark is
+/// PAINTED there — see `ui::glyph` for why a vector and not a
+/// character.
+const MARK_PAD: &str = "   ";
+
+/// What a heading row toggles when it is pressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TreeToggle {
+    Folder(usize),
+    Group(usize, usize),
+}
+
+/// What pressing a row does. Every row does exactly one of these, which
+/// is the point of the type.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RowAct {
+    /// Open or close a container.
+    Toggle(TreeToggle),
+    /// Load a device.
+    Load(BrowserItem),
+    /// Nothing. The "no match" line, which is a message rather than a
+    /// control — and has to be a row, because an empty list reads as a
+    /// broken list rather than as an answer.
+    Inert,
+}
+
+/// One line of the tree: what it says, what it does, and which of its
+/// characters the query matched.
+///
+/// ONE WALKER, and that is a correctness property rather than tidiness.
+/// This was three parallel lists — the text, the load target, the
+/// toggle owner — each walking the same shape independently and each
+/// having to agree with the others by index. Three walks that must
+/// agree are a redundancy that can drift, and adding a filter would
+/// have meant teaching the filter to all three identically.
+#[derive(Debug, Clone, PartialEq)]
+struct Row {
+    text: String,
+    act: RowAct,
+    /// Where the query matched, in CHARACTERS from the start of `text`.
+    /// The font is monospace, so a character offset is a pixel offset
+    /// and the mark can be drawn without laying the string out twice.
+    hit: Option<(usize, usize)>,
+    /// The family mark and the character cell it sits in. Headings
+    /// only: a device belongs to whatever family it is filed under and
+    /// repeating that on every line would be forty copies of one fact.
+    mark: Option<(Glyph, usize)>,
+    /// How deep this row is, for the guides that connect a heading to
+    /// its children.
+    depth: usize,
+}
+
+impl Row {
+    /// Test-only: the drawing asks `act` directly, because it needs to
+    /// know WHICH of the three a row is rather than whether it is one.
+    #[cfg(test)]
+    fn is_heading(&self) -> bool {
+        matches!(self.act, RowAct::Toggle(_))
+    }
+}
+
+/// Does this device answer the query?
+///
+/// Name only. Matching the folder name as well sounds generous and is
+/// the opposite: type "dyn" and every compressor arrives with no
+/// indication of why, because the thing that matched is not on screen.
+fn item_matches(item: &BrowserItem, query: &str) -> bool {
+    item.name.to_lowercase().contains(query)
+}
+
+/// Where `query` sits inside `name`, in characters — offset by whatever
+/// glyphs the row puts in front of it.
+fn hit_at(name: &str, query: &str, lead: usize) -> Option<(usize, usize)> {
+    if query.is_empty() {
+        return None;
+    }
+    let lower = name.to_lowercase();
+    let byte = lower.find(query)?;
+    let start = lower[..byte].chars().count();
+    Some((lead + start, query.chars().count()))
+}
+
+/// The count a container carries: how many devices are under it, and
+/// how many of those the query left.
+///
+/// A closed container that says nothing about its contents costs a
+/// press to answer the most common question anyone has about it. Three
+/// characters answer it instead. Under a query it is `n/N`, which also
+/// says how much is being hidden — the one number a filter owes you.
+fn tally(shown: usize, total: usize, filtering: bool) -> String {
+    if filtering {
+        format!("  {shown}/{total}")
+    } else {
+        format!("  {total}")
+    }
+}
+
+/// The rows of `items`, indented `depth` levels and elbowed on the last.
+fn item_rows(items: &[BrowserItem], depth: usize, query: &str, rows: &mut Vec<Row>) {
+    let pad = TREE_INDENT.repeat(depth);
+    let keep: Vec<&BrowserItem> = items
+        .iter()
+        .filter(|item| query.is_empty() || item_matches(item, query))
+        .collect();
+    for (i, item) in keep.iter().enumerate() {
+        let last = i + 1 == keep.len();
+        let branch = if last { TREE_ELL } else { TREE_TEE };
+        // The glyphs in front of the name, in CHARACTERS: the indent,
+        // the two-character branch, and the space after it.
+        let lead = pad.chars().count() + branch.chars().count() + 1;
+        rows.push(Row {
+            text: format!("{pad}{branch} {}", item.name),
+            act: RowAct::Load(**item),
+            hit: hit_at(item.name, query, lead),
+            mark: None,
+            depth,
+        });
+    }
+}
+
+/// How many of `items` the query leaves.
+fn kept(items: &[BrowserItem], query: &str) -> usize {
+    if query.is_empty() {
+        return items.len();
+    }
+    items.iter().filter(|i| item_matches(i, query)).count()
+}
+
+/// Every visible line of the device tree, in order.
+///
+/// # What a query does
+///
+/// A container with no surviving device disappears; one with survivors
+/// is FORCED OPEN whatever its stored state says, because a filter that
+/// hid its own results behind a closed arrow would be answering a
+/// question nobody could see the answer to.
+///
+/// The stored state is not touched. Clearing the query puts the tree
+/// back exactly as it was — a filter that permanently reorganised your
+/// browser would cost you your place every time you used it.
+fn tree_rows(folders: &[Folder], query: &str) -> Vec<Row> {
+    let query = query.trim().to_lowercase();
+    let filtering = !query.is_empty();
     let mut rows = Vec::new();
-    for folder in folders {
-        let arrow = if folder.open { TREE_OPEN } else { TREE_SHUT };
-        rows.push((format!("{arrow} {}", folder.name), true));
-        if !folder.open {
+
+    for (f, folder) in folders.iter().enumerate() {
+        let under: usize =
+            folder.groups.iter().map(|g| g.items.len()).sum::<usize>() + folder.items.len();
+        let shown: usize = folder
+            .groups
+            .iter()
+            .map(|g| kept(g.items, &query))
+            .sum::<usize>()
+            + kept(folder.items, &query);
+        if filtering && shown == 0 {
             continue;
         }
-        for (i, item) in folder.items.iter().enumerate() {
-            let last = i + 1 == folder.items.len();
-            let branch = if last { TREE_ELL } else { TREE_TEE };
-            rows.push((format!("  {branch} {}", item.name), false));
+        let open = folder.open || filtering;
+        let arrow = if open { TREE_OPEN } else { TREE_SHUT };
+        rows.push(Row {
+            text: format!(
+                "{arrow} {MARK_PAD}{}{}",
+                folder.name,
+                tally(shown, under, filtering)
+            ),
+            act: RowAct::Toggle(TreeToggle::Folder(f)),
+            hit: None,
+            mark: Some((folder.mark, 2)),
+            depth: 0,
+        });
+        if !open {
+            continue;
         }
+        // Groups first, then whatever sits loose under the folder: a
+        // heading below the things it does not contain reads as if it
+        // did contain them.
+        for (g, group) in folder.groups.iter().enumerate() {
+            let shown = kept(group.items, &query);
+            if filtering && shown == 0 {
+                continue;
+            }
+            let open = group.open || filtering;
+            let arrow = if open { TREE_OPEN } else { TREE_SHUT };
+            rows.push(Row {
+                text: format!(
+                    "{TREE_INDENT}{arrow} {MARK_PAD}{}{}",
+                    group.name,
+                    tally(shown, group.items.len(), filtering)
+                ),
+                act: RowAct::Toggle(TreeToggle::Group(f, g)),
+                hit: None,
+                mark: Some((group.mark, TREE_INDENT.len() + 2)),
+                depth: 1,
+            });
+            if open {
+                item_rows(group.items, 2, &query, &mut rows);
+            }
+        }
+        item_rows(folder.items, 1, &query, &mut rows);
+    }
+
+    // AN ANSWER, not an absence. A list that simply goes blank reads as
+    // a browser that has broken rather than as a query that found
+    // nothing, and the two want very different next actions.
+    if filtering && rows.is_empty() {
+        rows.push(Row {
+            text: format!("{TREE_ELL} no device matches"),
+            act: RowAct::Inert,
+            hit: None,
+            mark: None,
+            depth: 0,
+        });
     }
     rows
 }
 
-/// What each visible row IS: a folder to toggle, or an item to load.
-/// Built alongside `tree_rows` so the two can never drift out of step.
-fn tree_targets(folders: &[Folder]) -> Vec<Option<BrowserItem>> {
-    let mut out = Vec::new();
-    for folder in folders {
-        out.push(None); // the folder's own row
-        if folder.open {
-            out.extend(folder.items.iter().map(|i| Some(*i)));
-        }
-    }
-    out
+/// Every device the tree offers, whatever depth it sits at.
+///
+/// One walker, so a test asking "is this kind reachable" cannot answer
+/// from a shape the tree no longer has — which is exactly what the flat
+/// version did the moment the effects folder grew subfolders.
+///
+/// Test-only: nothing in the running browser wants a flat list, because
+/// the tree draws the shape rather than a listing of it.
+#[cfg(test)]
+fn loadable(rows: &[Row]) -> Vec<BrowserItem> {
+    rows.iter()
+        .filter_map(|row| match row.act {
+            RowAct::Load(item) => Some(item),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The search field's tally counts against this, which is why it is not
+/// test-only: "of how many" has to mean every device there is, not
+/// every device currently unfolded.
+fn tree_items(folders: &[Folder]) -> Vec<BrowserItem> {
+    folders
+        .iter()
+        .flat_map(|folder| {
+            folder
+                .groups
+                .iter()
+                .flat_map(|group| group.items.iter())
+                .chain(folder.items.iter())
+                .copied()
+        })
+        .collect()
 }
 
 /// Draw the tree under the search well, and toggle a folder when its row is
@@ -10547,10 +11396,19 @@ fn tree(
     focus: &mut Focus,
     upper: egui::Rect,
     folders: &mut [Folder],
+    query: &str,
     scroll: &mut f32,
 ) -> Option<BrowserItem> {
     let font = egui::FontId::new(TREE_TYPE, egui::FontFamily::Monospace);
-    let rows = tree_rows(folders);
+    // Monospace, so one character is one width everywhere and the match
+    // mark can be placed by counting characters rather than by laying
+    // the string out a second time.
+    let char_w = ui
+        .painter()
+        .layout_no_wrap("M".to_owned(), font.clone(), theme.text)
+        .rect
+        .width();
+    let rows = tree_rows(folders, query);
     let viewport = tree_viewport(upper, rows.len());
     // The wheel belongs to whichever list it is OVER. Asking about the
     // whole band would mean a wheel anywhere in the browser moved both
@@ -10569,20 +11427,9 @@ fn tree(
     if rows.is_empty() {
         return None;
     }
-    let targets = tree_targets(folders);
     let mut load: Option<BrowserItem> = None;
-
-    // Which folder each row belongs to, so a click knows what to toggle.
-    let mut owner = Vec::new();
-    for (i, folder) in folders.iter().enumerate() {
-        owner.push(Some(i));
-        if folder.open {
-            owner.extend(std::iter::repeat_n(None, folder.items.len()));
-        }
-    }
-
     let mut toggle = None;
-    for (index, (text, is_folder)) in rows.iter().enumerate() {
+    for (index, row) in rows.iter().enumerate() {
         let y = top + index as f32 * TREE_ROW_H;
         // Scrolled past, above or below. `continue` and NOT `break`: the
         // list is offset now, so the rows still to come are the ones on
@@ -10591,7 +11438,7 @@ fn tree(
         if y + TREE_ROW_H <= viewport.top() || y >= viewport.bottom() {
             continue;
         }
-        let row = egui::Rect::from_min_size(
+        let line = egui::Rect::from_min_size(
             egui::pos2(upper.left(), y),
             egui::vec2(upper.width(), TREE_ROW_H),
         );
@@ -10599,50 +11446,112 @@ fn tree(
         // Every row is reachable by keyboard; only folders do anything when
         // pressed.
         let wid = ui.id().with(("tree_row", index));
-        focus.register(wid, row);
-        if *is_folder {
+        // The "no device matches" line is a MESSAGE. Registering it for
+        // the keyboard would put a stop on the ring that does nothing
+        // when pressed, which is worse than not being reachable at all.
+        if row.act != RowAct::Inert {
+            focus.register(wid, line);
             let response = ui
-                .interact(row, wid, egui::Sense::click())
+                .interact(line, wid, egui::Sense::click())
                 .affords(Affords::Press);
             if response.hovered() {
-                ui.painter().rect_filled(row, 0.0, theme.accent_muted);
+                ui.painter().rect_filled(line, 0.0, theme.accent_muted);
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
-            if response.clicked() || focus.activated(wid) {
-                toggle = owner.get(index).copied().flatten();
-            }
-        } else if let Some(item) = targets.get(index).copied().flatten() {
-            // An item loads: double-click with the mouse, Enter with the
-            // keyboard ring. Single click only points at it — loading a
-            // device is a commitment, and a stray click on a list should
-            // not rewire a track.
-            let response = ui
-                .interact(row, wid, egui::Sense::click())
-                .affords(Affords::Press);
-            if response.hovered() {
-                ui.painter().rect_filled(row, 0.0, theme.accent_muted);
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            }
-            if response.double_clicked() || focus.activated(wid) {
-                load = Some(item);
+            match row.act {
+                RowAct::Toggle(which) => {
+                    if response.clicked() || focus.activated(wid) {
+                        toggle = Some(which);
+                    }
+                }
+                // An item loads: double-click with the mouse, Enter with
+                // the keyboard ring. Single click only points at it —
+                // loading a device is a commitment, and a stray click on
+                // a list should not rewire a track.
+                RowAct::Load(item) => {
+                    if response.double_clicked() || focus.activated(wid) {
+                        load = Some(item);
+                    }
+                }
+                RowAct::Inert => {}
             }
         }
 
-        ui.painter().with_clip_rect(row).text(
-            egui::pos2(row.left() + TREE_PAD_X, row.center().y),
+        let painter = ui.painter().with_clip_rect(line);
+        let left = line.left() + TREE_PAD_X;
+
+        // GUIDES: the vertical that carries a heading down past its
+        // children. The branch glyphs say "this belongs to something";
+        // the guide says WHAT, which is the half you lose at depth two
+        // once the heading has scrolled off the top.
+        for level in 0..row.depth {
+            let x = left + (level as f32 * TREE_INDENT.len() as f32 + 0.5) * char_w;
+            painter.line_segment(
+                [egui::pos2(x, line.top()), egui::pos2(x, line.bottom())],
+                egui::Stroke::new(stroke::HAIR, theme.divider),
+            );
+        }
+
+        // The family's mark, in the two cells its text left empty.
+        if let Some((mark, at)) = row.mark {
+            let cell = egui::Rect::from_min_size(
+                egui::pos2(left + at as f32 * char_w, line.top()),
+                egui::vec2(char_w * 2.0, line.height()),
+            );
+            let open = row.text.trim_start().starts_with(TREE_OPEN);
+            daw::ui::glyph::paint(
+                &painter,
+                cell.shrink2(egui::vec2(0.0, TREE_ROW_H * 0.28)),
+                mark,
+                daw::ui::glyph::ink(theme, open),
+            );
+        }
+        painter.text(
+            egui::pos2(left, line.center().y),
             egui::Align2::LEFT_CENTER,
-            text,
+            &row.text,
             font.clone(),
-            if *is_folder {
-                theme.text
-            } else {
-                theme.text_muted
+            match row.act {
+                RowAct::Toggle(_) => theme.text,
+                RowAct::Load(_) => theme.text_muted,
+                RowAct::Inert => theme.divider,
             },
         );
+
+        // WHY THIS ROW IS HERE, under the characters that answered.
+        //
+        // A filtered list that does not say what it matched leaves you
+        // reading every result to work out which part of it you typed.
+        // The mark is a RULE rather than a colour on the glyphs
+        // themselves: recolouring text spends its legibility to say
+        // something about the text rather than in it.
+        if let Some((at, len)) = row.hit
+            && len > 0
+        {
+            let from = left + at as f32 * char_w;
+            let y = line.center().y + font.size * 0.5;
+            painter.line_segment(
+                [
+                    egui::pos2(from, y),
+                    egui::pos2(from + len as f32 * char_w, y),
+                ],
+                egui::Stroke::new(stroke::HAIR, theme.accent),
+            );
+        }
     }
 
-    if let Some(i) = toggle {
-        folders[i].open = !folders[i].open;
+    match toggle {
+        Some(TreeToggle::Folder(f)) => {
+            if let Some(folder) = folders.get_mut(f) {
+                folder.open = !folder.open;
+            }
+        }
+        Some(TreeToggle::Group(f, g)) => {
+            if let Some(group) = folders.get_mut(f).and_then(|f| f.groups.get_mut(g)) {
+                group.open = !group.open;
+            }
+        }
+        None => {}
     }
     load
 }
@@ -10686,6 +11595,36 @@ fn catalog_viewport(upper: egui::Rect, device_rows: usize) -> egui::Rect {
 
 /// Draw the configured catalog beneath the built-in device tree. The catalog
 /// is already an immutable snapshot: this function does no filesystem work.
+/// Has anyone asked to see samples?
+///
+/// A query, a location, or a folder. Whitespace is not a query — a
+/// stray space in the field would otherwise dump the whole library and
+/// look like a bug in the search rather than in the space.
+fn catalog_asked(query: &str, location: Option<&str>, folder: Option<&std::path::Path>) -> bool {
+    !query.trim().is_empty() || location.is_some() || folder.is_some()
+}
+
+/// The samples the catalog should list, which is NONE until asked.
+///
+/// `library::query_at` with no query and no location means "every asset
+/// in the library", and that is what the panel drew on launch: a list
+/// nobody requested, as long as the disk is deep, burying the locations
+/// that would have let anyone ask a real question.
+///
+/// The root row is a CONTAINER rather than a selection — opening it
+/// reveals the locations, and picking one of those is the ask.
+fn catalog_results<'a>(
+    snapshot: &'a LibrarySnapshot,
+    location: Option<&str>,
+    folder: Option<&std::path::Path>,
+    query: &str,
+) -> Vec<&'a library::AssetRecord> {
+    if !catalog_asked(query, location, folder) {
+        return Vec::new();
+    }
+    library::query_at(snapshot, location, folder, query)
+}
+
 fn catalog_tree(
     ui: &mut egui::Ui,
     theme: &Theme,
@@ -10695,11 +11634,28 @@ fn catalog_tree(
     snapshot: &LibrarySnapshot,
 ) -> Option<BrowserEvent> {
     let font = egui::FontId::new(TREE_TYPE, egui::FontFamily::Monospace);
-    let device_rows = tree_rows(&browser.folders).len();
+    let device_rows = tree_rows(&browser.folders, &browser.query).len();
     let viewport = catalog_viewport(upper, device_rows);
     let mut row_index = 0;
     let content_top = viewport.top();
-    let results = library::query_at(
+    // SAMPLES ARRIVE WHEN THEY ARE ASKED FOR.
+    //
+    // `query_at` with no query and no location is "every asset in the
+    // library", and that is what this drew on launch: a list nobody
+    // requested, as long as the disk is deep, under the two things
+    // anyone actually opens this panel for. A library of ten thousand
+    // files answered a question nobody had asked and buried the
+    // locations that would have let them ask one.
+    //
+    // Asking is a query, or a location, or a folder. The root row is a
+    // CONTAINER rather than a selection — opening it reveals the
+    // locations, and picking one of those is the ask.
+    let asked = catalog_asked(
+        &browser.query,
+        browser.location.as_deref(),
+        browser.folder.as_deref(),
+    );
+    let results = catalog_results(
         snapshot,
         browser.location.as_deref(),
         browser.folder.as_deref(),
@@ -10921,13 +11877,23 @@ fn catalog_tree(
                 egui::Align2::LEFT_CENTER,
                 if snapshot.locations.is_empty() {
                     "Set a library folder below to index samples"
+                } else if !asked {
+                    // NOT an empty result — an unasked question. The
+                    // two look identical as a blank line and want
+                    // completely different things from whoever is
+                    // reading them, so the row says which this is.
+                    "Pick a location above, or type to search"
                 } else if browser.query.is_empty() {
                     "No supported audio files in this location"
                 } else {
                     "No samples match this search"
                 },
                 font.clone(),
-                theme.text_muted,
+                if asked {
+                    theme.text_muted
+                } else {
+                    theme.divider
+                },
             );
         }
     }
@@ -11079,6 +12045,7 @@ fn search_bar(
     focus: &mut Focus,
     upper: egui::Rect,
     query: &mut String,
+    tally: Option<(usize, usize)>,
 ) {
     let well = egui::Rect::from_min_size(upper.min, egui::vec2(upper.width(), SEARCH_H));
     if well.width() <= SEARCH_PAD * 3.0 || upper.height() < SEARCH_H {
@@ -11111,7 +12078,34 @@ fn search_bar(
     // has nothing left to stretch.
     let text_font = egui::FontId::new(SEARCH_TYPE, egui::FontFamily::Proportional);
     let row = ui.ctx().fonts_mut(|f| f.row_height(&text_font));
-    let field = centred_band(well, icon_x + SEARCH_PAD, well.right() - SEARCH_PAD, row);
+
+    // WHAT THE QUERY LEFT, at the far end of the field it belongs to.
+    //
+    // The count is on the containers already, but scattered across
+    // however many of them survived — and the question "is this query
+    // too narrow" is about the whole tree, not about one family. One
+    // figure, beside the thing that caused it.
+    let mut tail = well.right() - SEARCH_PAD;
+    if let Some((shown, total)) = tally.filter(|_| !query.trim().is_empty()) {
+        let text = format!("{shown}/{total}");
+        let mono = egui::FontId::new(TREE_TYPE, egui::FontFamily::Monospace);
+        let mark = ui.painter().text(
+            egui::pos2(tail, well.center().y),
+            egui::Align2::RIGHT_CENTER,
+            &text,
+            mono,
+            // A query that found nothing is not a small number, it is a
+            // different answer — and the field is where you would look
+            // to fix it.
+            if shown == 0 {
+                theme.warn
+            } else {
+                theme.text_muted
+            },
+        );
+        tail = mark.left() - SEARCH_PAD;
+    }
+    let field = centred_band(well, icon_x + SEARCH_PAD, tail, row);
     ui.put(
         field,
         egui::TextEdit::singleline(query)
@@ -11182,13 +12176,28 @@ fn browser_body(
     painter.rect_filled(upper, 0.0, theme.surface);
     painter.rect_filled(lower, 0.0, theme.surface_raised);
 
-    search_bar(ui, theme, focus, upper, &mut browser.query);
+    // The tally the field prints: how many devices the query left, out
+    // of how many there are. Counted from the same rows the tree draws,
+    // so the number cannot disagree with the list under it.
+    let tally = {
+        let shown = tree_rows(&browser.folders, &browser.query)
+            .iter()
+            .filter(|row| matches!(row.act, RowAct::Load(_)))
+            .count();
+        // Every device there is — NOT every row currently on screen.
+        // Counting visible rows would make the total depend on which
+        // folders happened to be open, so a shut browser would report
+        // "3 of 0".
+        (shown, tree_items(&browser.folders).len())
+    };
+    search_bar(ui, theme, focus, upper, &mut browser.query, Some(tally));
     let load = tree(
         ui,
         theme,
         focus,
         upper,
         &mut browser.folders,
+        &browser.query,
         &mut browser.tree_scroll,
     );
     let catalog = catalog_tree(ui, theme, focus, upper, browser, snapshot);
@@ -12335,6 +13344,45 @@ fn draw_device_card(
             let history = histories.get(&instance.id).cloned().unwrap_or_default();
             device::glue_card(ui, theme, &mut knobs, &history)
         }
+        DeviceState::Clamp(params) => {
+            let mut knobs = clamp_knobs(params);
+            // The transfer curve is a static map with no time axis, and
+            // "is it fast" is the whole question this device answers —
+            // so the newest reading rides on top of it: what the engine
+            // is doing right now, against what it said it would do.
+            let said = histories
+                .get(&instance.id)
+                .map(|h| h.latest())
+                .unwrap_or_default();
+            device::clamp::clamp_card(
+                ui,
+                theme,
+                &mut knobs,
+                said.reduction_db,
+                Some(said.level_db),
+            )
+        }
+        DeviceState::Prism(params) => {
+            let mut knobs = prism_knobs(params, instance.page);
+            // The beams ARE the telemetry: a multiband's one useful
+            // picture is which of its three bands is working, and a
+            // card is rebuilt every frame, so the reading has to
+            // arrive from outside.
+            let said = histories
+                .get(&instance.id)
+                .map(|h| h.latest())
+                .unwrap_or_default();
+            let made = device::prism::prism_card(ui, theme, &mut knobs, said);
+            // Clicking a band picks the one the cell row edits, so the
+            // band it came back on is what the instance should
+            // remember — the same road the equaliser's tab takes, and
+            // for the same reason: the card is a temporary.
+            let band = knobs.selected.min(u8::MAX as usize) as u8;
+            if band != instance.page {
+                edits.pages.push((instance.id, band));
+            }
+            made
+        }
         DeviceState::Eq(params) => {
             let mut knobs = eq_knobs(params, instance.page);
             let made = device::eq_card(ui, theme, &mut knobs, sample_rate);
@@ -12370,6 +13418,12 @@ fn draw_device_card(
             index,
             name: instance.kind().spec().name,
             selected: selected.contains(&instance.id),
+            // Keep off the page dots. The grip is claimed after the
+            // card's face and egui gives a press to the last widget at
+            // a position, so without this the strip swallows every tab
+            // underneath it — which it did, and the sampler's pages
+            // could not be clicked at all.
+            keep_clear: device::card::tabs_width(ui, theme, card_pages(instance.kind())),
         },
     );
     if grip.clicked {
@@ -12656,9 +13710,44 @@ fn seam_active(ctx: &egui::Context, panel_id: &str) -> bool {
         .is_some_and(|r| r.hovered() || r.dragged())
 }
 
-fn seam(ui: &egui::Ui, panel_id: &str, rect: egui::Rect) {
-    if seam_active(ui.ctx(), panel_id) {
-        ui.painter().rect_filled(rect, 0.0, SEAM);
+/// Paint a region's draggable edge.
+///
+/// ALWAYS, now, rather than only while it is pointed at: this is the
+/// only line marking the boundary since the browser stopped drawing its
+/// own, and an edge you can only find by already being on it is an edge
+/// nobody finds. Quiet at rest, the accent under the pointer — the same
+/// "dim partner for inactive context" rule the role colours follow.
+///
+/// `rect` is the region's OWN rectangle, which is the whole point. egui
+/// draws its separator from the panel's OUTER rect on the parent's
+/// painter, and that line ran past the browser's bottom edge and down
+/// the side of the device editor.
+fn seam(ui: &egui::Ui, theme: &Theme, panel_id: &str, rect: egui::Rect) {
+    let active = seam_active(ui.ctx(), panel_id);
+    ui.painter().rect_filled(
+        if active { rect } else { hairline(rect) },
+        0.0,
+        if active { SEAM } else { theme.divider },
+    );
+}
+
+/// The resting mark: the last point of a seam's own rectangle, on the
+/// side the next region begins.
+///
+/// A three-point bar is the GRAB target and reads as a handle; at rest
+/// a boundary only has to be legible, and a hairline is what every
+/// other divider in this interface uses.
+fn hairline(rect: egui::Rect) -> egui::Rect {
+    if rect.width() <= rect.height() {
+        egui::Rect::from_min_max(
+            egui::pos2(rect.right() - stroke::HAIR, rect.top()),
+            rect.max,
+        )
+    } else {
+        egui::Rect::from_min_max(
+            rect.min,
+            egui::pos2(rect.right(), rect.top() + stroke::HAIR),
+        )
     }
 }
 
@@ -12794,6 +13883,8 @@ fn plockable_params(track: &Track) -> Vec<piano_roll::PlockParam> {
         | DeviceKind::Eq
         | DeviceKind::Filter
         | DeviceKind::Glue
+        | DeviceKind::Clamp
+        | DeviceKind::Prism
         | DeviceKind::Modulato
         | DeviceKind::Utility
         | DeviceKind::Limiter => u32::MAX,
@@ -13087,6 +14178,34 @@ fn compile_chain(
                 let node = spec.push(NodeSpec::Gate { params });
                 spec.connect(tail, node);
                 devices.insert(instance.id, node);
+                tail = node;
+            }
+            DeviceState::Prism(params) => {
+                let node = spec.push(NodeSpec::Prism { params });
+                spec.connect(tail, node);
+                devices.insert(instance.id, node);
+                // Three bands of gain movement ride the same readout
+                // the compressors use — see `Readout::bands`.
+                if readouts.len() < daw::audio::graph::MAX_METERS {
+                    let slot = readouts.len();
+                    spec.tap(slot, node);
+                    readouts.insert(instance.id, slot);
+                }
+                tail = node;
+            }
+            DeviceState::Clamp(params) => {
+                let node = spec.push(NodeSpec::Clamp { params });
+                spec.connect(tail, node);
+                devices.insert(instance.id, node);
+                // A compressor has something to SAY, and half this card
+                // is a display for it. The slot is handed out here, in
+                // device order, so a chain that gains a device does not
+                // shuffle everyone else's readings.
+                if readouts.len() < daw::audio::graph::MAX_METERS {
+                    let slot = readouts.len();
+                    spec.tap(slot, node);
+                    readouts.insert(instance.id, slot);
+                }
                 tail = node;
             }
             DeviceState::Glue(params) => {
@@ -13449,6 +14568,8 @@ fn build_graph_spec(
                     | DeviceState::Sat(_)
                     | DeviceState::Echo(_)
                     | DeviceState::Eq(_)
+                    | DeviceState::Clamp(_)
+                    | DeviceState::Prism(_)
                     | DeviceState::Glue(_) => {
                         continue;
                     }
@@ -14446,25 +15567,16 @@ struct ExportJob {
 const DEVICE_EMPTY: &str = "no device — load one from the browser";
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        install_fonts(&cc.egui_ctx);
-        cc.egui_ctx.set_zoom_factor(ZOOM);
+    fn new(storage: &shell::Storage) -> Self {
         // Machine-local preferences. A corrupt or missing blob falls back to
         // defaults — preferences are never worth failing a launch over.
-        let prefs: UiPrefs = cc
-            .storage
-            .and_then(|storage| eframe::get_value(storage, STORAGE_KEY))
-            .unwrap_or_default();
+        let prefs: UiPrefs = storage.get(STORAGE_KEY).unwrap_or_default();
         // Read before `prefs` is moved into the app.
         let show_splash = !prefs.skip_splash;
-        let library_config: LibraryConfig = cc
-            .storage
-            .and_then(|storage| eframe::get_value(storage, library::CONFIG_STORAGE_KEY))
-            .unwrap_or_default();
-        let library_snapshot: LibrarySnapshot = cc
-            .storage
-            .and_then(|storage| eframe::get_value(storage, library::CACHE_STORAGE_KEY))
-            .unwrap_or_default();
+        let library_config: LibraryConfig =
+            storage.get(library::CONFIG_STORAGE_KEY).unwrap_or_default();
+        let library_snapshot: LibrarySnapshot =
+            storage.get(library::CACHE_STORAGE_KEY).unwrap_or_default();
         let library_service = LibraryService::start(library_config.clone());
         let wav_import_service = WavImportService::start();
         let waveform_service = waveform::Service::start();
@@ -14480,7 +15592,6 @@ impl App {
         // Density arrives from prefs, not from a project — a scheme is
         // colours only, and a swap must not re-pack the interface.
         theme.set_density(prefs.density);
-        theme.apply(&cc.egui_ctx);
         Self {
             theme,
             prefs,
@@ -14636,7 +15747,7 @@ impl App {
             PaletteCommand::new("transport.follow", "transport", "toggle follow playhead"),
             // --- clip --------------------------------------------------
             PaletteCommand::new("clip.new", "clip", "new clip at cursor")
-                .hint("ctrl+M")
+                .hint("ctrl+shift+M")
                 .enabled(can_create_clip),
             PaletteCommand::new("clip.duplicate", "clip", "duplicate clip").enabled(has_clip),
             PaletteCommand::new("clip.rename", "clip", "rename clip").enabled(has_clip),
@@ -14953,9 +16064,9 @@ impl App {
             // --- view --------------------------------------------------
             PaletteCommand::new("view.roll", "view", "show clip editor").enabled(!editor),
             PaletteCommand::new("view.rack", "view", "show device rack").enabled(editor),
-            PaletteCommand::new("view.browser", "view", "show / hide browser").hint("ctrl+B"),
+            PaletteCommand::new("view.browser", "view", "show / hide browser").hint("ctrl+alt+B"),
             PaletteCommand::new("view.lower", "view", "show / hide lower panel").hint("ctrl+alt+L"),
-            PaletteCommand::new("view.chrome", "view", "hide everything").hint("ctrl+shift+F"),
+            PaletteCommand::new("view.chrome", "view", "hide everything").hint("ctrl+alt+shift+F"),
             PaletteCommand::new("view.compact", "view", "density: compact"),
             PaletteCommand::new("view.comfortable", "view", "density: comfortable"),
             PaletteCommand::new("view.theme", "view", "change theme"),
@@ -18648,6 +19759,7 @@ impl App {
                 .push(device::scope::Reading {
                     level_db: said.level_db,
                     reduction_db: said.reduction_db,
+                    bands: said.bands,
                 });
         }
         self.mod_telemetry = Some(ModTelemetry {
@@ -19780,8 +20892,18 @@ impl App {
     }
 }
 
-impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+impl shell::Host for App {
+    /// Fonts, zoom and the restored theme, once, before the first
+    /// frame. Under eframe this happened inside `App::new` because the
+    /// context arrived with the constructor; the shell builds the app
+    /// before the window exists, so it is its own call now.
+    fn startup(&mut self, ctx: &egui::Context) {
+        install_fonts(ctx);
+        ctx.set_zoom_factor(ZOOM);
+        self.theme.apply(ctx);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui) {
         // The engine first, before anything draws from its numbers.
         self.pump_engine(ui.ctx());
         if self.engine.is_none() {
@@ -19971,6 +21093,45 @@ impl eframe::App for App {
                 if i.consume_key(egui::Modifiers::NONE, egui::Key::Home) {
                     actions.push(UiAction::Return);
                 }
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::O) {
+                    actions.push(UiAction::ToggleMetronome);
+                }
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::F9) {
+                    actions.push(UiAction::ToggleRecord);
+                }
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::F10) {
+                    actions.push(UiAction::BackToArrangement);
+                }
+                if i.consume_key(
+                    egui::Modifiers::COMMAND | egui::Modifiers::ALT | egui::Modifiers::SHIFT,
+                    egui::Key::F,
+                ) {
+                    actions.push(UiAction::ToggleChrome);
+                }
+                if i.consume_key(
+                    egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                    egui::Key::F,
+                ) {
+                    actions.push(UiAction::ToggleFollow);
+                }
+                if i.consume_key(
+                    egui::Modifiers::COMMAND | egui::Modifiers::ALT,
+                    egui::Key::B,
+                ) {
+                    actions.push(UiAction::ToggleBrowser);
+                }
+                if i.consume_key(
+                    egui::Modifiers::COMMAND | egui::Modifiers::ALT,
+                    egui::Key::L,
+                ) {
+                    actions.push(UiAction::ToggleLower);
+                }
+                if i.consume_key(
+                    egui::Modifiers::COMMAND | egui::Modifiers::ALT,
+                    egui::Key::T,
+                ) {
+                    actions.push(UiAction::AddReturn);
+                }
                 // The project file. Shift-specific first, as everywhere.
                 if i.consume_key(
                     egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
@@ -19982,6 +21143,9 @@ impl eframe::App for App {
                 }
                 if i.consume_key(egui::Modifiers::COMMAND, egui::Key::O) {
                     actions.push(UiAction::OpenProjectWindow);
+                }
+                if i.consume_key(egui::Modifiers::COMMAND, egui::Key::N) {
+                    actions.push(UiAction::NewProject);
                 }
             });
         }
@@ -20444,7 +21608,17 @@ impl eframe::App for App {
         } else {
             let browser_panel = egui::Panel::left("browser")
                 .resizable(true)
-                .show_separator_line(true)
+                // OUR line, not egui's. Its separator is drawn by the
+                // PARENT ui's painter along the panel's OUTER rect —
+                // margins included — and on a layer that outlives the
+                // panel, so it ran on past the bottom of the browser and
+                // down the side of the device editor below it. The rect
+                // we paint instead is the panel's own, which cannot.
+                //
+                // It also removes a double line: `seam` was already
+                // marking this edge on hover, a few points inside where
+                // egui was drawing its own.
+                .show_separator_line(false)
                 .default_size(BROWSER_W)
                 .size_range(BROWSER_W_RANGE)
                 .frame(self.fill(t.surface_sunken))
@@ -20582,10 +21756,10 @@ impl eframe::App for App {
         // that is not there — and only while that seam is pointed at or
         // pulled, so an untouched window is fills and nothing else.
         if !self.prefs.browser_hidden {
-            seam(ui, "browser", vertical_seam(browser));
+            seam(ui, t, "browser", vertical_seam(browser));
         }
         if !self.prefs.lower_hidden {
-            seam(ui, bottom_panel_id, horizontal_seam(device));
+            seam(ui, t, bottom_panel_id, horizontal_seam(device));
         }
 
         self.focus.end(ui, t);
@@ -20941,10 +22115,10 @@ impl eframe::App for App {
 
     /// Machine-local preferences ride eframe's storage: saved at exit and on
     /// the 30s auto-save, so a density choice made mid-session survives it.
-    fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        eframe::set_value(storage, STORAGE_KEY, &self.prefs);
-        eframe::set_value(storage, library::CONFIG_STORAGE_KEY, &self.library_config);
-        eframe::set_value(storage, library::CACHE_STORAGE_KEY, &self.library_snapshot);
+    fn save(&mut self, storage: &mut shell::Storage) {
+        storage.set(STORAGE_KEY, &self.prefs);
+        storage.set(library::CONFIG_STORAGE_KEY, &self.library_config);
+        storage.set(library::CACHE_STORAGE_KEY, &self.library_snapshot);
     }
 }
 
@@ -21158,9 +22332,15 @@ mod tests {
         );
     }
 
-    /// An untouched window has no marks at all.
+    /// An untouched window shows no HANDLE.
+    ///
+    /// The boundary itself is drawn now — a hairline, always, since the
+    /// panels stopped drawing their own separators and an edge you can
+    /// only find by already being on it is an edge nobody finds. What
+    /// stays conditional is the three-point grab bar in the accent,
+    /// which is the affordance rather than the line.
     #[test]
-    fn seams_are_invisible_until_pointed_at() {
+    fn seam_handles_are_invisible_until_pointed_at() {
         let ctx = egui::Context::default();
         pass(&ctx, vec![]);
         pass(
@@ -21169,6 +22349,47 @@ mod tests {
         );
         assert!(!seam_active(&ctx, "browser"));
         assert!(!seam_active(&ctx, "device"));
+    }
+
+    /// A SEAM'S MARK STAYS INSIDE THE REGION IT BELONGS TO.
+    ///
+    /// This is the bug that put it here: egui draws a panel's separator
+    /// from the panel's OUTER rect, on the parent ui's painter, and the
+    /// browser's line therefore ran past its own bottom edge and down
+    /// the side of the device editor below it. Ours is built from the
+    /// region's own rectangle, and the resting hairline is built from
+    /// that in turn, so neither can leave it.
+    #[test]
+    fn a_seam_never_reaches_outside_its_own_region() {
+        let browser = Rect::from_min_max(pos2(0.0, 40.0), pos2(240.0, 552.0));
+        let device = Rect::from_min_max(pos2(0.0, 552.0), pos2(1200.0, 800.0));
+
+        for (region, mark) in [
+            (browser, vertical_seam(browser)),
+            (device, horizontal_seam(device)),
+        ] {
+            assert!(
+                region.contains_rect(mark),
+                "the grab bar {mark:?} leaves {region:?}"
+            );
+            assert!(
+                region.contains_rect(hairline(mark)),
+                "the resting hairline leaves {region:?}"
+            );
+        }
+
+        // And specifically: the browser's mark stops at the editor. The
+        // two regions touch, so "inside the browser" and "not in the
+        // device panel" are different claims and this is the one that
+        // was false.
+        let mark = vertical_seam(browser);
+        assert!(
+            mark.bottom() <= device.top(),
+            "the browser's seam reaches {} into an editor starting at {}",
+            mark.bottom(),
+            device.top()
+        );
+        assert!(hairline(mark).bottom() <= device.top());
     }
 
     /// The box travels: it must not arrive in one step, must not overshoot,
@@ -21466,18 +22687,22 @@ mod tests {
     #[test]
     fn the_browser_lists_only_devices_that_load() {
         let browser = Browser::default();
-        let items: Vec<BrowserItem> = browser
-            .folders
-            .iter()
-            .flat_map(|f| f.items.iter().copied())
-            .collect();
-        // Every item is reachable as a row, so it can be activated.
+        let items = tree_items(&browser.folders);
+        // Every item is reachable as a row, so it can be activated —
+        // with everything OPEN, since a closed group contributes no rows
+        // and the flat version of this test passed vacuously the day the
+        // groups arrived shut.
+        let mut open = Browser::default();
+        for folder in &mut open.folders {
+            folder.open = true;
+            for group in &mut folder.groups {
+                group.open = true;
+            }
+        }
         assert_eq!(
-            tree_targets(&browser.folders)
-                .iter()
-                .filter(|t| t.is_some())
-                .count(),
-            items.len()
+            loadable(&tree_rows(&open.folders, "")).len(),
+            items.len(),
+            "a device in the tree has no row of its own"
         );
     }
 
@@ -21488,6 +22713,8 @@ mod tests {
         let mut folders = vec![
             Folder {
                 name: "One",
+                mark: Glyph::Stack,
+                groups: Vec::new(),
                 items: &[
                     BrowserItem {
                         name: "a",
@@ -21506,6 +22733,8 @@ mod tests {
             },
             Folder {
                 name: "Two",
+                mark: Glyph::Stack,
+                groups: Vec::new(),
                 items: &[BrowserItem {
                     name: "d",
                     load: DeviceKind::SineSynth,
@@ -21514,34 +22743,407 @@ mod tests {
             },
         ];
 
-        let rows = tree_rows(&folders);
+        let rows = tree_rows(&folders, "");
         // Only One is open: 2 folder rows + its 3 children.
         assert_eq!(rows.len(), 5);
         assert!(
-            rows[0].0.starts_with(TREE_OPEN),
+            rows[0].text.starts_with(TREE_OPEN),
             "open folder wants {TREE_OPEN}"
         );
-        assert!(rows[0].1, "row 0 should be a folder");
-        assert!(rows[1].0.contains(TREE_TEE) && rows[1].0.contains("a"));
-        assert!(!rows[1].1, "row 1 should be a child");
+        assert!(rows[0].is_heading(), "row 0 should be a folder");
+        assert!(rows[1].text.contains(TREE_TEE) && rows[1].text.contains('a'));
+        assert!(!rows[1].is_heading(), "row 1 should be a child");
 
         // Last child gets the elbow, and only the last.
-        assert!(rows[3].0.contains(TREE_ELL), "last child wants {TREE_ELL}");
-        assert_eq!(rows.iter().filter(|(t, _)| t.contains(TREE_ELL)).count(), 1);
+        assert!(
+            rows[3].text.contains(TREE_ELL),
+            "last child wants {TREE_ELL}"
+        );
+        assert_eq!(rows.iter().filter(|r| r.text.contains(TREE_ELL)).count(), 1);
 
         // A closed folder shows the shut arrow and contributes one row.
-        assert!(rows[4].0.starts_with(TREE_SHUT));
+        assert!(rows[4].text.starts_with(TREE_SHUT));
 
         // Opening every folder shows every item; closing all shows the
         // folder rows alone.
         for folder in &mut folders {
             folder.open = true;
         }
-        assert_eq!(tree_rows(&folders).len(), 2 + 3 + 1);
+        assert_eq!(tree_rows(&folders, "").len(), 2 + 3 + 1);
         for folder in &mut folders {
             folder.open = false;
         }
-        assert_eq!(tree_rows(&folders).len(), 2);
+        assert_eq!(tree_rows(&folders, "").len(), 2);
+    }
+
+    /// EVERY ROW DOES EXACTLY ONE THING.
+    ///
+    /// This used to be three parallel lists — the text, the load
+    /// target, the toggle owner — each walking the tree independently
+    /// and agreeing by index, and this test existed to hold them
+    /// together. They are one walk now, so the redundancy is gone and
+    /// what is left worth asserting is the grammar: a heading toggles
+    /// and never loads, a device loads and never toggles, and the
+    /// glyph at the front says which it is.
+    ///
+    /// Checked across every open/closed combination of the real
+    /// browser's groups, not just the default one.
+    #[test]
+    fn a_row_is_a_heading_or_a_device_and_says_which() {
+        let mut browser = Browser::default();
+        let groups: usize = browser.folders.iter().map(|f| f.groups.len()).sum();
+        for mask in 0..(1u32 << groups.min(10)) {
+            let mut bit = 0;
+            for folder in &mut browser.folders {
+                folder.open = mask % 2 == 0;
+                for group in &mut folder.groups {
+                    group.open = mask & (1 << bit) != 0;
+                    bit += 1;
+                }
+            }
+            for row in tree_rows(&browser.folders, "") {
+                match row.act {
+                    RowAct::Toggle(_) => assert!(
+                        row.text.trim_start().starts_with(TREE_OPEN)
+                            || row.text.trim_start().starts_with(TREE_SHUT),
+                        "a heading without an arrow: {:?}",
+                        row.text
+                    ),
+                    RowAct::Load(_) => assert!(
+                        row.text.contains(TREE_TEE) || row.text.contains(TREE_ELL),
+                        "a device without a branch: {:?}",
+                        row.text
+                    ),
+                    RowAct::Inert => panic!("an unfiltered tree has no message rows"),
+                }
+            }
+        }
+    }
+
+    /// TYPING FILTERS THE TREE, which it did not do at all: the search
+    /// field reached the sample catalog and left forty-eight device rows
+    /// exactly where they were. A search box that searches half of what
+    /// it sits on top of is worse than none, because it answers
+    /// confidently about the half it forgot.
+    #[test]
+    fn a_query_collapses_the_tree_to_what_matches() {
+        let browser = Browser::default();
+        let all = tree_rows(&browser.folders, "");
+        let hits = tree_rows(&browser.folders, "reverb");
+
+        assert!(hits.len() < all.len(), "the query changed nothing");
+        // Every device left is one that matched.
+        let devices = loadable(&hits);
+        assert!(!devices.is_empty(), "the query hid its own answer");
+        for item in &devices {
+            assert!(
+                item.name.to_lowercase().contains("reverb"),
+                "{} does not match the query",
+                item.name
+            );
+        }
+        // And every device that matches is present — a filter that drops
+        // an answer is worse than one that shows too many.
+        let expected = tree_items(&browser.folders)
+            .into_iter()
+            .filter(|i| i.name.to_lowercase().contains("reverb"))
+            .count();
+        assert_eq!(devices.len(), expected);
+    }
+
+    /// A MATCH IS NOT HIDDEN BEHIND A CLOSED ARROW, and the tree is put
+    /// back exactly as it was when the query clears.
+    ///
+    /// Both halves matter. A filter whose results sit inside a shut
+    /// folder is answering a question you cannot see the answer to; one
+    /// that opens the folders permanently costs you your place every
+    /// time you use it.
+    #[test]
+    fn filtering_opens_what_it_has_to_and_puts_it_back() {
+        let mut browser = Browser::default();
+        for folder in &mut browser.folders {
+            folder.open = false;
+            for group in &mut folder.groups {
+                group.open = false;
+            }
+        }
+        let before = tree_rows(&browser.folders, "");
+        assert!(
+            loadable(&before).is_empty(),
+            "everything is shut, so nothing should be listed"
+        );
+
+        // Shut or not, the match is on screen.
+        let hits = tree_rows(&browser.folders, "prism");
+        assert_eq!(loadable(&hits).len(), 1, "the match stayed folded away");
+
+        // And nothing was written down: the same shut tree comes back.
+        assert_eq!(tree_rows(&browser.folders, ""), before);
+        assert!(browser.folders.iter().all(|f| !f.open));
+    }
+
+    /// A QUERY THAT FINDS NOTHING SAYS SO.
+    ///
+    /// An empty list reads as a browser that has broken rather than as
+    /// a question that has been answered, and those want very different
+    /// next actions from whoever is looking at it.
+    #[test]
+    fn a_query_with_no_answer_is_a_message_not_a_blank() {
+        let browser = Browser::default();
+        let rows = tree_rows(&browser.folders, "zzzznotathing");
+        assert_eq!(rows.len(), 1, "an empty answer drew {} rows", rows.len());
+        assert_eq!(rows[0].act, RowAct::Inert, "the message is pressable");
+        assert!(rows[0].text.contains("no device"));
+    }
+
+    /// THE MATCH MARK LANDS ON THE CHARACTERS THAT MATCHED.
+    ///
+    /// The mark is placed by counting characters, because the tree is
+    /// monospace and a character offset is therefore a pixel offset. If
+    /// the count includes the wrong number of leading glyphs the rule
+    /// sits under the wrong part of the word, which is worse than no
+    /// mark at all — it would be pointing at the wrong reason.
+    #[test]
+    fn the_match_mark_sits_under_the_characters_that_matched() {
+        let browser = Browser::default();
+        for query in ["rev", "amp", "eq", "limit"] {
+            for row in tree_rows(&browser.folders, query) {
+                let RowAct::Load(_) = row.act else { continue };
+                let (at, len) = row.hit.expect("a matched device marks its match");
+                let under: String = row.text.chars().skip(at).take(len).collect();
+                assert_eq!(
+                    under.to_lowercase(),
+                    query,
+                    "the mark on {:?} covers {under:?}",
+                    row.text
+                );
+            }
+        }
+    }
+
+    /// SAMPLES ARRIVE WHEN THEY ARE ASKED FOR, and not before.
+    ///
+    /// `library::query_at` with no query and no location means "every
+    /// asset in the library", and that is what this panel drew on
+    /// launch: a list nobody requested, as long as the disk is deep,
+    /// sitting under the two things anyone opens the browser for.
+    #[test]
+    fn the_catalog_lists_nothing_until_it_is_asked() {
+        let asset = |name: &str, location: &str, folder: &str| library::AssetRecord {
+            path: std::path::PathBuf::from(format!("/lib/{folder}/{name}")),
+            relative_path: std::path::PathBuf::from(folder).join(name),
+            location_id: location.to_owned(),
+            name: name.to_owned(),
+            extension: "wav".to_owned(),
+            bytes: 1,
+            modified_unix_secs: None,
+            tags: Vec::new(),
+        };
+        let snapshot = library::LibrarySnapshot {
+            generation: 1,
+            locations: Vec::new(),
+            folders: Vec::new(),
+            assets: vec![
+                asset("kick.wav", "drums", "hits"),
+                asset("snare.wav", "drums", "hits"),
+                asset("pad.wav", "keys", "beds"),
+            ],
+            warnings: Vec::new(),
+        };
+        let hits = std::path::Path::new("hits");
+
+        // Nothing asked: nothing listed, however many are indexed.
+        assert!(catalog_results(&snapshot, None, None, "").is_empty());
+        assert!(
+            catalog_results(&snapshot, None, None, "   ").is_empty(),
+            "a stray space dumped the library"
+        );
+
+        // Each of the three ways of asking works, and answers.
+        assert_eq!(catalog_results(&snapshot, None, None, "kick").len(), 1);
+        assert_eq!(catalog_results(&snapshot, Some("drums"), None, "").len(), 2);
+        assert_eq!(catalog_results(&snapshot, None, Some(hits), "").len(), 2);
+
+        // And the gate is the only thing held back — once asked, the
+        // answer is exactly what the library would have given.
+        assert_eq!(
+            catalog_results(&snapshot, Some("keys"), None, ""),
+            library::query_at(&snapshot, Some("keys"), None, "")
+        );
+    }
+
+    /// THE TALLY'S DENOMINATOR IS EVERY DEVICE, not every visible row.
+    ///
+    /// Counting rows would make "of how many" depend on which folders
+    /// happened to be open, so a shut browser with one match would
+    /// report "1 of 0" — a number that is not merely wrong but
+    /// impossible, which is the kind a reader stops trusting the whole
+    /// panel over.
+    #[test]
+    fn the_tally_counts_every_device_however_the_tree_is_folded() {
+        let mut browser = Browser::default();
+        let total = tree_items(&browser.folders).len();
+        assert!(total > 20, "the browser lists only {total} devices");
+
+        for shut in [true, false] {
+            for folder in &mut browser.folders {
+                folder.open = !shut;
+                for group in &mut folder.groups {
+                    group.open = !shut;
+                }
+            }
+            assert_eq!(
+                tree_items(&browser.folders).len(),
+                total,
+                "the total moved when the tree was folded"
+            );
+            // And the numerator still finds its match through a shut
+            // tree, so the pair stays coherent.
+            let shown = loadable(&tree_rows(&browser.folders, "reverb")).len();
+            assert_eq!(shown, 1, "shut: {shut}");
+            assert!(shown <= total);
+        }
+    }
+
+    /// A CONTAINER SAYS HOW MUCH IS IN IT.
+    ///
+    /// A shut folder that says nothing about its contents costs a press
+    /// to answer the most common question anyone has about it. Three
+    /// characters answer it instead — and under a query the count
+    /// becomes `n/N`, which is the one number a filter owes you: how
+    /// much it is hiding.
+    #[test]
+    fn a_container_carries_its_count() {
+        let browser = Browser::default();
+        let rows = tree_rows(&browser.folders, "");
+        let effects = rows
+            .iter()
+            .find(|r| r.text.contains("Audio Effects"))
+            .expect("the effects folder is listed");
+        let total = tree_items(&browser.folders)
+            .into_iter()
+            .filter(|i| {
+                browser.folders.iter().any(|f| {
+                    f.name == "Audio Effects" && f.groups.iter().any(|g| g.items.contains(i))
+                })
+            })
+            .count();
+        assert!(
+            effects.text.ends_with(&total.to_string()),
+            "{:?} does not carry its count of {total}",
+            effects.text
+        );
+
+        // Under a query it reads as "of".
+        let filtered = tree_rows(&browser.folders, "reverb");
+        let effects = filtered
+            .iter()
+            .find(|r| r.text.contains("Audio Effects"))
+            .expect("the effects folder survived the query");
+        assert!(
+            effects.text.contains(&format!("1/{total}")),
+            "{:?} does not say how much it is hiding",
+            effects.text
+        );
+    }
+
+    /// A group's devices appear only when BOTH its folder and the group
+    /// itself are open — the whole point of the second level, and the
+    /// thing a tree that ignored one of the two flags would get wrong
+    /// while still looking indented.
+    #[test]
+    fn a_group_opens_only_inside_an_open_folder() {
+        let mut browser = Browser::default();
+        let effects = browser
+            .folders
+            .iter()
+            .position(|f| !f.groups.is_empty())
+            .expect("some folder has groups");
+
+        let count = |b: &Browser| loadable(&tree_rows(&b.folders, "")).len();
+
+        // Folder open, every group shut: headings only.
+        for folder in &mut browser.folders {
+            folder.open = true;
+            for group in &mut folder.groups {
+                group.open = false;
+            }
+        }
+        let loose: usize = browser.folders.iter().map(|f| f.items.len()).sum();
+        assert_eq!(
+            count(&browser),
+            loose,
+            "a shut group still listed its devices"
+        );
+
+        // Open one group: exactly its devices appear.
+        let opened = {
+            let folder = &mut browser.folders[effects];
+            folder.groups[0].open = true;
+            folder.groups[0].items.len()
+        };
+        assert_eq!(count(&browser), loose + opened);
+
+        // Shut the FOLDER, leaving the group open: nothing from it shows.
+        browser.folders[effects].open = false;
+        let without: usize = browser
+            .folders
+            .iter()
+            .filter(|f| f.open)
+            .map(|f| f.items.len())
+            .sum();
+        assert_eq!(
+            count(&browser),
+            without,
+            "a group inside a shut folder still drew its devices"
+        );
+    }
+
+    /// The families are a real filing, not a pile with headings in it:
+    /// every group has devices, no device is filed twice, and the
+    /// effects folder keeps nothing loose.
+    #[test]
+    fn every_effect_is_filed_exactly_once() {
+        let browser = Browser::default();
+        for folder in &browser.folders {
+            for group in &folder.groups {
+                assert!(
+                    !group.items.is_empty(),
+                    "{}/{} is an empty heading",
+                    folder.name,
+                    group.name
+                );
+            }
+            if !folder.groups.is_empty() {
+                assert!(
+                    folder.items.is_empty(),
+                    "{} has both groups and loose devices",
+                    folder.name
+                );
+            }
+        }
+        let mut kinds: Vec<DeviceKind> = tree_items(&browser.folders)
+            .into_iter()
+            .map(|i| i.load)
+            .collect();
+        let before = kinds.len();
+        kinds.sort_by_key(|k| format!("{k:?}"));
+        kinds.dedup();
+        assert_eq!(before, kinds.len(), "a device is filed under two headings");
+    }
+
+    /// The split earns its keep: the effects folder used to open into
+    /// twenty rows and take the tree's whole share of the panel. Closed
+    /// groups mean opening it costs one row per family.
+    #[test]
+    fn opening_the_effects_folder_no_longer_floods_the_tree() {
+        let browser = Browser::default();
+        let rows = tree_rows(&browser.folders, "").len();
+        let devices = tree_items(&browser.folders).len();
+        assert!(
+            rows < devices,
+            "the default tree draws {rows} rows for {devices} devices — nothing is folded"
+        );
     }
 
     /// The bar lays controls out left to right, vertically centred, never
@@ -23305,21 +24907,21 @@ mod tests {
         assert_eq!(place_clip(&[], 3.0, 4.0), (3.0, 0));
     }
 
-    /// Ctrl+M creates one bar at the QWERTY cell when it exists; without
+    /// Ctrl+Shift+M creates one bar at the QWERTY cell when it exists; without
     /// one, it uses the active lane and snapped transport playhead.
     #[test]
-    fn ctrl_m_creates_a_clip_at_the_keyboard_cursor_or_playhead() {
+    fn ctrl_shift_m_creates_a_clip_at_the_keyboard_cursor_or_playhead() {
         let ctx = egui::Context::default();
         let mut actions = Vec::new();
         let mut out = ctx.run_ui(
             input(vec![
-                Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                Event::ModifiersChanged(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT),
                 Event::Key {
                     key: egui::Key::M,
                     physical_key: None,
                     pressed: true,
                     repeat: false,
-                    modifiers: egui::Modifiers::COMMAND,
+                    modifiers: egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
                 },
             ]),
             |_ui| {},
@@ -23411,6 +25013,150 @@ mod tests {
             !a.remove_clip(3, victim),
             "a second remove is a clean no-op"
         );
+    }
+
+    /// Ctrl+A is a real content selection: clipboard structure, deletion,
+    /// paste offsets and fresh identities all agree on the same set.
+    #[test]
+    fn select_all_copies_deletes_and_pastes_a_clip_arrangement() {
+        let mut arr = Arrangement::default();
+        arr.create_clip(0, 2.0, 2.0).unwrap();
+        arr.create_clip(1, 5.0, 1.0).unwrap();
+        let original_ids: Vec<u64> = arr
+            .clips
+            .iter()
+            .flat_map(|clips| clips.iter().map(|clip| clip.id))
+            .collect();
+
+        arr.select_all_clips();
+        assert_eq!(arr.selected_clip_refs().len(), 2);
+        assert!(arr.clip_is_selected(0, 0));
+        assert!(arr.clip_is_selected(1, 0));
+        arr.copy_selected();
+        assert_eq!(arr.clipboard_clips.len(), 2);
+
+        assert!(arr.delete_selected_clips());
+        assert!(arr.clips.iter().all(Vec::is_empty));
+        assert!(arr.selected_clip_refs().is_empty());
+
+        arr.paste_clipboard(0, 8.0).unwrap();
+        assert_eq!(arr.clips[0][0].start, 8.0);
+        assert_eq!(arr.clips[1][0].start, 11.0, "three-beat offset survives");
+        assert_eq!(
+            arr.selected_clip_refs().len(),
+            2,
+            "the pasted set stays selected"
+        );
+        for pasted in arr
+            .clips
+            .iter()
+            .flat_map(|clips| clips.iter().map(|clip| clip.id))
+        {
+            assert!(
+                !original_ids.contains(&pasted),
+                "paste mints fresh identity"
+            );
+        }
+    }
+
+    #[test]
+    fn command_click_toggles_clip_membership_without_losing_the_primary() {
+        let ctx = egui::Context::default();
+        let mut arr = Arrangement::default();
+        arr.create_clip(0, 0.0, 1.0).unwrap();
+        arr.create_clip(0, 2.0, 1.0).unwrap();
+        arr.select_only_clip(0, 0);
+        arrangement_pass(&ctx, &mut arr, vec![]);
+
+        let command = egui::Modifiers::COMMAND;
+        let second = pos2(TL + 2.5 * PX_PER_BEAT, LANES_TOP + TRACK_H * 0.5);
+        arrangement_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::PointerMoved(second),
+                Event::ModifiersChanged(command),
+                Event::PointerButton {
+                    pos: second,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: command,
+                },
+                Event::PointerButton {
+                    pos: second,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: command,
+                },
+            ],
+        );
+        assert_eq!(arr.selected_clip_refs().len(), 2);
+        assert_eq!(
+            arr.selected_clip,
+            Some((0, 0)),
+            "primary selection stays put"
+        );
+
+        // The model-side toggle is also what a later command-click uses.
+        arr.toggle_clip_selection(0, 1);
+        assert_eq!(arr.selected_clip_refs(), vec![(0, 0)]);
+        assert!(arr.clip_is_selected(0, 0));
+        assert!(!arr.clip_is_selected(0, 1));
+    }
+
+    #[test]
+    fn shift_click_selects_the_clip_range() {
+        let ctx = egui::Context::default();
+        let mut arr = Arrangement::default();
+        for beat in [0.0, 2.0, 4.0, 6.0] {
+            arr.create_clip(0, beat, 1.0).unwrap();
+        }
+        arr.select_only_clip(0, 0);
+        arrangement_pass(&ctx, &mut arr, vec![]);
+
+        let shift = egui::Modifiers::SHIFT;
+        let fourth = pos2(TL + 6.5 * PX_PER_BEAT, LANES_TOP + TRACK_H * 0.5);
+        arrangement_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::PointerMoved(fourth),
+                Event::ModifiersChanged(shift),
+                Event::PointerButton {
+                    pos: fourth,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: shift,
+                },
+                Event::PointerButton {
+                    pos: fourth,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: shift,
+                },
+            ],
+        );
+
+        assert_eq!(arr.selected_clip_refs().len(), 4);
+        assert_eq!(arr.selected_clip, Some((0, 0)), "the anchor stays primary");
+    }
+
+    #[test]
+    fn arrow_nudge_moves_the_selected_clip_set_as_one_block() {
+        let mut arr = Arrangement::default();
+        arr.create_clip(0, 2.0, 1.0).unwrap();
+        arr.create_clip(0, 4.0, 1.0).unwrap();
+        arr.select_only_clip(0, 0);
+        arr.toggle_clip_selection(0, 1);
+
+        assert!(arr.nudge_selected_clips(1.0));
+        assert_eq!(arr.clips[0][0].start, 3.0);
+        assert_eq!(arr.clips[0][1].start, 5.0);
+        assert_eq!(arr.selected_clip_refs().len(), 2);
+
+        assert!(arr.nudge_selected_clips(-1.0));
+        assert_eq!(arr.clips[0][0].start, 2.0);
+        assert_eq!(arr.clips[0][1].start, 4.0);
     }
 
     /// Double-clicking an empty lane creates a one-bar clip at the click.
@@ -23677,6 +25423,67 @@ mod tests {
             arrangement_keys(&ctx, &Arrangement::default(), &mut actions);
 
             assert_eq!(actions, vec![expected]);
+        }
+    }
+
+    #[test]
+    fn session_view_keeps_timeline_edit_keys_out() {
+        let key = |key, modifiers| {
+            input(vec![Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }])
+        };
+        let mut arr = Arrangement::default();
+        arr.main_view = MainView::Session;
+
+        for edit in [
+            egui::Key::X,
+            egui::Key::C,
+            egui::Key::V,
+            egui::Key::D,
+            egui::Key::I,
+        ] {
+            let ctx = egui::Context::default();
+            let mut actions = Vec::new();
+            let mut out = ctx.run_ui(key(edit, egui::Modifiers::COMMAND), |_ui| {});
+            out.textures_delta.clear();
+            arrangement_keys(&ctx, &arr, &mut actions);
+            assert!(actions.is_empty(), "Session lost {edit:?} to the timeline");
+        }
+
+        let ctx = egui::Context::default();
+        let mut actions = Vec::new();
+        let mut out = ctx.run_ui(key(egui::Key::Tab, egui::Modifiers::NONE), |_ui| {});
+        out.textures_delta.clear();
+        arrangement_keys(&ctx, &arr, &mut actions);
+        assert_eq!(actions, vec![UiAction::ToggleMainView]);
+    }
+
+    #[test]
+    fn midi_clip_creation_uses_abletons_shifted_binding() {
+        for (modifiers, expected) in [
+            (egui::Modifiers::COMMAND, false),
+            (egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, true),
+        ] {
+            let ctx = egui::Context::default();
+            let mut actions = Vec::new();
+            let mut out = ctx.run_ui(
+                input(vec![Event::Key {
+                    key: egui::Key::M,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }]),
+                |_ui| {},
+            );
+            out.textures_delta.clear();
+            arrangement_keys(&ctx, &Arrangement::default(), &mut actions);
+            assert_eq!(actions.contains(&UiAction::CreateClip), expected);
         }
     }
 
@@ -25410,10 +27217,9 @@ mod tests {
     #[test]
     fn every_device_kind_is_reachable_from_the_browser() {
         let browser = Browser::default();
-        let listed: Vec<DeviceKind> = browser
-            .folders
-            .iter()
-            .flat_map(|folder| folder.items.iter().map(|item| item.load))
+        let listed: Vec<DeviceKind> = tree_items(&browser.folders)
+            .into_iter()
+            .map(|item| item.load)
             .collect();
         let missing: Vec<&'static str> = DEVICES
             .iter()
@@ -27997,7 +29803,7 @@ mod tests {
     fn the_view_keys_come_out_of_the_live_handler() {
         for (modifiers, key, want) in [
             (
-                egui::Modifiers::COMMAND,
+                egui::Modifiers::COMMAND | egui::Modifiers::ALT,
                 egui::Key::B,
                 UiAction::ToggleBrowser,
             ),
@@ -28007,7 +29813,7 @@ mod tests {
                 UiAction::ToggleLower,
             ),
             (
-                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                egui::Modifiers::COMMAND | egui::Modifiers::ALT | egui::Modifiers::SHIFT,
                 egui::Key::F,
                 UiAction::ToggleChrome,
             ),

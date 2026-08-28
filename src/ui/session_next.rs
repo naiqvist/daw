@@ -3777,16 +3777,22 @@ fn paint_mixer(
                 colors.sunken
             },
         );
+        // PRESENT AND REFUSED, said once. Dimming was the old answer
+        // and it says the wrong thing twice over: a route faded to the
+        // divider colour reads as "far away" or as a rendering fault,
+        // which is exactly how an INACTIVE control looks, and it takes
+        // the route's own name down with it. The hatch reads as struck
+        // through — present, not in the path — so the name can stay
+        // legible and carry its own meaning. See `ui::hud`.
+        if !routable {
+            crate::ui::hud::hatch(ui.painter(), route, egui::Stroke::new(1.0, colors.divider));
+        }
         ui.painter().text(
             route.center(),
             egui::Align2::CENTER_CENTER,
             &track.input,
             egui::FontId::monospace(MICRO_FONT),
-            if routable {
-                colors.text
-            } else {
-                colors.divider
-            },
+            if routable { colors.text } else { colors.muted },
         );
         response.on_hover_text(if routable {
             format!(
@@ -4880,6 +4886,11 @@ fn keyboard_intents(
             }
         }
         if let Some(Subject::Track(track)) = subject {
+            // Modified C must be offered first: egui's logical matching lets
+            // the plain Ableton arm key match presses carrying extra mods.
+            if input.consume_key(Modifiers::ALT, Key::C) {
+                intents.push(SessionIntent::ClearClipHold(track));
+            }
             // Solo is exclusive bare and additive on Ctrl, which is the
             // pointer's rule said with a modifier instead of a click.
             if input.consume_key(Modifiers::NONE, Key::S) {
@@ -4888,10 +4899,10 @@ fn keyboard_intents(
             if input.consume_key(Modifiers::COMMAND, Key::S) {
                 intents.push(SessionIntent::ToggleTrackSolo(track));
             }
-            if input.consume_key(Modifiers::NONE, Key::R) {
+            if input.consume_key(Modifiers::NONE, Key::C) {
                 intents.push(SessionIntent::ToggleTrackArm(track));
             }
-            if input.consume_key(Modifiers::NONE, Key::O) {
+            if input.consume_key(Modifiers::ALT, Key::O) {
                 intents.push(SessionIntent::ToggleTrackMonitor(track));
             }
             if input.consume_key(Modifiers::NONE, Key::I)
@@ -4905,16 +4916,13 @@ fn keyboard_intents(
             if input.consume_key(Modifiers::NONE, Key::G) {
                 intents.push(SessionIntent::ToggleTrackFold(track));
             }
-            if input.consume_key(Modifiers::NONE, Key::C) {
-                intents.push(SessionIntent::ClearClipHold(track));
-            }
         }
         if let Some(GridSelection::Return(index)) = selection
             && input.consume_key(Modifiers::NONE, Key::Enter)
         {
             intents.push(SessionIntent::SelectReturn(index));
         }
-        if input.consume_key(Modifiers::NONE, Key::N)
+        if input.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::M)
             && let Some(GridSelection::Slot { track, scene }) = selection
         {
             intents.push(SessionIntent::CreateMidiClip { track, scene });
@@ -4923,9 +4931,9 @@ fn keyboard_intents(
         // ---- the scene verbs --------------------------------------------
         let (_, scene) = anchor(selection);
         // Specific before general, for the reason stop-all gives above.
-        if input.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::N) {
+        if input.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::I) {
             intents.push(SessionIntent::CaptureScene);
-        } else if input.consume_key(Modifiers::COMMAND, Key::N) {
+        } else if input.consume_key(Modifiers::COMMAND, Key::I) {
             intents.push(SessionIntent::InsertSceneBelow(scene));
         }
 

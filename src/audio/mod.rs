@@ -12,6 +12,7 @@
 
 pub mod acid;
 pub mod bounce;
+pub mod clamp;
 pub mod eq;
 pub mod filter;
 pub mod gate;
@@ -27,6 +28,7 @@ pub mod modulation;
 pub mod modulato;
 pub mod poly;
 pub mod preamp;
+pub mod prism;
 pub mod project;
 pub mod resyn;
 pub mod sampler;

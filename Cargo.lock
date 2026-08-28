@@ -872,11 +872,14 @@ dependencies = [
  "crossbeam-channel",
  "eframe",
  "egui",
+ "egui-wgpu",
+ "egui-winit",
  "fixed-resample",
  "glam",
  "hound",
  "lyon",
  "parking_lot",
+ "pollster",
  "ron",
  "rtaudio",
  "rtrb 0.4.0",
@@ -886,6 +889,7 @@ dependencies = [
  "thunderdome",
  "triple_buffer",
  "wgpu",
+ "winit",
 ]
 
 [[package]]

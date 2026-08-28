@@ -4,6 +4,10 @@
 //! exactly the set of things on screen this frame. `nearest` decides where
 //! an arrow lands and `spring_step` carries the ring there.
 //!
+//! The ring is drawn as CORNER BRACKETS (`ui::hud`), the same mark a
+//! widget's own focus ring uses. One thing on screen always means "the
+//! keyboard is here", so it has to mean it in one shape.
+//!
 //! The two pure halves — the navigation model and the spring — are the
 //! parts worth pinning by test, and neither needs a window.
 //!
@@ -11,13 +15,22 @@
 
 use daw::ui::theme::Theme;
 
-/// The cursor is a RING around the focused element, not a box floating in a
+/// The cursor SURROUNDS the focused element; it is not a box floating in a
 /// region. Once the keyboard can reach individual buttons, a marker sitting
 /// in the middle of a panel cannot say WHICH button it means.
+///
+/// It is drawn as four corner brackets rather than a closed rectangle —
+/// see `ui::hud` for why, and `RING_RADIUS` for the one case that still
+/// closes. The names here stay `RING_*`: what they describe is the mark
+/// that rings an element, and renaming a constant because its ink moved
+/// would rename the idea too.
 pub const RING_STROKE: f32 = 2.0;
 /// How far the ring stands off the element, so it surrounds rather than
 /// covers it.
 pub const RING_PAD: f32 = 3.0;
+/// The fallback's corner radius. Square, like everything else — and the
+/// fallback only happens under `hud::BRACKET_FLOOR`, where four corner
+/// arms would be four dots.
 pub const RING_RADIUS: f32 = 0.0;
 /// Stiffness of the ring's travel, radians per second. Critically damped, so
 /// it accelerates in and settles without overshoot.
@@ -192,12 +205,24 @@ impl Focus {
         };
         self.ring = Some(ring);
 
-        ui.painter().rect_stroke(
-            ring,
-            RING_RADIUS,
-            egui::Stroke::new(RING_STROKE, theme.focus),
-            egui::StrokeKind::Middle,
-        );
+        // CORNERS, the same mark the per-widget ring draws — see
+        // `ui::hud`. Before this the app had two focus marks that
+        // disagreed: the travelling cursor was a closed box and the
+        // widgets' own mark was brackets, so the one thing on screen
+        // that always means "the keyboard is here" meant it in two
+        // shapes depending on which surface you were on.
+        //
+        // The spring is unchanged and carries four corners instead of a
+        // rectangle, which is also the cheaper thing to watch move: a
+        // box sweeping across a dense grid drags four full edges over
+        // everything it passes, and corners drag eight short arms.
+        let ink = egui::Stroke::new(RING_STROKE, theme.focus);
+        if daw::ui::hud::is_bracketed(ring) {
+            daw::ui::hud::brackets(ui.painter(), ring, ink);
+        } else {
+            ui.painter()
+                .rect_stroke(ring, RING_RADIUS, ink, egui::StrokeKind::Middle);
+        }
     }
 
     pub fn rect_of(&self, id: Option<egui::Id>) -> Option<egui::Rect> {

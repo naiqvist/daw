@@ -43,6 +43,8 @@ pub enum DeviceKind {
     Eq,
     Filter,
     Glue,
+    Clamp,
+    Prism,
     Modulato,
     Utility,
     Limiter,
@@ -1280,6 +1282,154 @@ pub static DEVICES: &[DeviceSpec] = &[
                 name: "Send",
                 unit: "%",
                 group: "Delay",
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Clamp,
+        name: "clamp",
+        instrument: false,
+        prefix: "clamp",
+        params: daw::params::clamp::TABLE,
+        labels: &[
+            ParamLabel {
+                name: "Threshold",
+                unit: "dB",
+                group: "Clamp",
+            },
+            ParamLabel {
+                name: "Ratio",
+                unit: ":1",
+                group: "Clamp",
+            },
+            ParamLabel {
+                name: "Knee",
+                unit: "dB",
+                group: "Clamp",
+            },
+            ParamLabel {
+                name: "Attack",
+                unit: "ms",
+                group: "Clamp",
+            },
+            ParamLabel {
+                name: "Release",
+                unit: "ms",
+                group: "Clamp",
+            },
+            ParamLabel {
+                name: "Makeup",
+                unit: "dB",
+                group: "Clamp",
+            },
+            ParamLabel {
+                name: "Sidechain HP",
+                unit: "Hz",
+                group: "Clamp",
+            },
+            ParamLabel {
+                name: "Warmth",
+                unit: "%",
+                group: "Clamp",
+            },
+            ParamLabel {
+                name: "Mix",
+                unit: "%",
+                group: "Clamp",
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Prism,
+        name: "prism",
+        instrument: false,
+        prefix: "prism",
+        params: daw::params::prism::TABLE,
+        labels: &[
+            ParamLabel {
+                name: "Low crossover",
+                unit: "Hz",
+                group: "Prism",
+            },
+            ParamLabel {
+                name: "High crossover",
+                unit: "Hz",
+                group: "Prism",
+            },
+            ParamLabel {
+                name: "Grip",
+                unit: "%",
+                group: "Prism",
+            },
+            ParamLabel {
+                name: "Mix",
+                unit: "%",
+                group: "Prism",
+            },
+            ParamLabel {
+                name: "Output",
+                unit: "dB",
+                group: "Prism",
+            },
+            ParamLabel {
+                name: "Low threshold",
+                unit: "dB",
+                group: "Low",
+            },
+            ParamLabel {
+                name: "Low amount",
+                unit: "%",
+                group: "Low",
+            },
+            ParamLabel {
+                name: "Low heat",
+                unit: "%",
+                group: "Low",
+            },
+            ParamLabel {
+                name: "Low trim",
+                unit: "dB",
+                group: "Low",
+            },
+            ParamLabel {
+                name: "Mid threshold",
+                unit: "dB",
+                group: "Mid",
+            },
+            ParamLabel {
+                name: "Mid amount",
+                unit: "%",
+                group: "Mid",
+            },
+            ParamLabel {
+                name: "Mid heat",
+                unit: "%",
+                group: "Mid",
+            },
+            ParamLabel {
+                name: "Mid trim",
+                unit: "dB",
+                group: "Mid",
+            },
+            ParamLabel {
+                name: "High threshold",
+                unit: "dB",
+                group: "High",
+            },
+            ParamLabel {
+                name: "High amount",
+                unit: "%",
+                group: "High",
+            },
+            ParamLabel {
+                name: "High heat",
+                unit: "%",
+                group: "High",
+            },
+            ParamLabel {
+                name: "High trim",
+                unit: "dB",
+                group: "High",
             },
         ],
     },

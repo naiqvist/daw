@@ -4824,6 +4824,454 @@ pub mod sheen {
 /// and sample rate together because "how lo-fi" is one question, and
 /// splitting it in two would be the construction problem wearing a
 /// disguise.
+/// CLAMP — the surgical compressor's table.
+///
+/// The other compressor in the box is `glue`, and every difference here
+/// is a difference from that one rather than a preference. Glue is a bus
+/// compressor: three ratio detents, an auto release, a peak clipper at
+/// the rails, and a character you turn on. This one is the opposite
+/// device — continuous ratio, a knee you can set, an attack that reaches
+/// under a tenth of a millisecond, and a colour that is deliberately
+/// slight.
+///
+/// Two compressors is not duplication when they are these two: "hold a
+/// mix together" and "stop that one syllable" are different jobs, and a
+/// single device wide enough to do both is a device with a bad default
+/// for each.
+pub mod clamp {
+    use super::ParamDef;
+
+    pub const THRESHOLD: u32 = 0;
+    pub const RATIO: u32 = 1;
+    pub const KNEE: u32 = 2;
+    pub const ATTACK: u32 = 3;
+    pub const RELEASE: u32 = 4;
+    pub const MAKEUP: u32 = 5;
+    pub const SC_HP: u32 = 6;
+    pub const WARMTH: u32 = 7;
+    pub const MIX: u32 = 8;
+
+    pub const THRESHOLD_MIN_DB: f32 = -60.0;
+    pub const THRESHOLD_MAX_DB: f32 = 0.0;
+    /// Continuous, unlike glue's three detents.
+    ///
+    /// A bus compressor wants a small set of known ratios because the
+    /// job is repeated and the answer is usually one of three. Surgical
+    /// work is the opposite: the ratio IS the decision, it changes per
+    /// source, and 3.5:1 is a real answer that a detented knob cannot
+    /// give.
+    pub const RATIO_MIN: f32 = 1.0;
+    pub const RATIO_MAX: f32 = 20.0;
+    pub const KNEE_MAX_DB: f32 = 24.0;
+    /// Under a tenth of a millisecond at the fast end.
+    ///
+    /// This is the whole point of the device. Glue's fastest is 10 µs on
+    /// paper but its ballistics are program-dependent and its ratios
+    /// start at 2:1 — it is built to move slowly and be unnoticed. This
+    /// one is built to catch one transient and let go, so its attack has
+    /// to be able to be shorter than the transient.
+    pub const ATTACK_MIN_MS: f32 = 0.05;
+    pub const ATTACK_MAX_MS: f32 = 50.0;
+    pub const RELEASE_MIN_MS: f32 = 5.0;
+    pub const RELEASE_MAX_MS: f32 = 500.0;
+    pub const MAKEUP_MIN_DB: f32 = -12.0;
+    pub const MAKEUP_MAX_DB: f32 = 24.0;
+    pub const SC_HP_MIN_HZ: f32 = 20.0;
+    pub const SC_HP_MAX_HZ: f32 = 500.0;
+
+    /// How far the warmth knob drives the output stage.
+    ///
+    /// A THIRD of what the stage can do, and that ceiling is the device
+    /// saying what it is. `preamp` is the same colour the sampler and
+    /// the strip run, and at full amount it is a character — tilt, a
+    /// second harmonic, a hiss floor. A surgical compressor that
+    /// coloured that much would be a second glue with a different card,
+    /// and the reason to reach for this one is that it does not change
+    /// the sound it is controlling.
+    ///
+    /// So the knob spans this device's OWN range, top to bottom, and
+    /// that range stops early. A knob that reached the same place as
+    /// another device's would be the two devices being the same device.
+    pub const WARMTH_CEILING: f32 = 0.33;
+
+    pub const TABLE: &[ParamDef] = &[
+        ParamDef {
+            id: THRESHOLD,
+            name: "threshold",
+            min: THRESHOLD_MIN_DB,
+            max: THRESHOLD_MAX_DB,
+            // High enough to do nothing on arrival. A compressor that
+            // starts compressing is a compressor whose first act is to
+            // change a sound nobody asked it to.
+            default: -12.0,
+        },
+        ParamDef {
+            id: RATIO,
+            name: "ratio",
+            min: RATIO_MIN,
+            max: RATIO_MAX,
+            default: 4.0,
+        },
+        ParamDef {
+            id: KNEE,
+            name: "knee",
+            min: 0.0,
+            max: KNEE_MAX_DB,
+            // Soft, because a hard corner is audible as a click on
+            // material sitting exactly at the threshold — which is
+            // where surgical work puts it by definition.
+            default: 6.0,
+        },
+        ParamDef {
+            id: ATTACK,
+            name: "attack",
+            min: ATTACK_MIN_MS,
+            max: ATTACK_MAX_MS,
+            // Fast enough to catch a consonant, slow enough to leave a
+            // drum its stick.
+            default: 3.0,
+        },
+        ParamDef {
+            id: RELEASE,
+            name: "release",
+            min: RELEASE_MIN_MS,
+            max: RELEASE_MAX_MS,
+            default: 80.0,
+        },
+        ParamDef {
+            id: MAKEUP,
+            name: "makeup",
+            min: MAKEUP_MIN_DB,
+            max: MAKEUP_MAX_DB,
+            default: 0.0,
+        },
+        ParamDef {
+            id: SC_HP,
+            name: "sc hp",
+            min: SC_HP_MIN_HZ,
+            max: SC_HP_MAX_HZ,
+            // Off, at the bottom of its range. Glue defaults its
+            // detector deaf to bass because a mix bus always has some;
+            // one source might be a bass, and deafening the detector to
+            // the thing it was pointed at is the wrong default here.
+            default: SC_HP_MIN_HZ,
+        },
+        ParamDef {
+            id: WARMTH,
+            name: "warmth",
+            min: 0.0,
+            max: 1.0,
+            // A seasoning, and on by a little. Exact bypass at zero, the
+            // promise every colour stage here makes.
+            default: 0.25,
+        },
+        ParamDef {
+            id: MIX,
+            name: "mix",
+            min: 0.0,
+            max: 1.0,
+            // All wet. Parallel compression is a deliberate move and
+            // this device's job is the direct one; the knob is here
+            // because the move is worth having, not because it is the
+            // default way to use a compressor.
+            default: 1.0,
+        },
+    ];
+}
+
+/// PRISM — three-band dynamics, and where it disagrees with everyone
+/// else's.
+///
+/// Two disagreements, and they are the reason to build a fourth
+/// multiband rather than a third:
+///
+/// 1. **One knob per band, signed.** Every multiband gives a band a
+///    threshold, a ratio, an attack and a release, and then does it
+///    again for the upward direction — twenty-four decisions before a
+///    sound has moved. Here a band has a THRESHOLD and an AMOUNT, and
+///    the amount's SIGN chooses the direction: positive holds peaks
+///    down, negative lifts the quiet up. The ratio comes off the same
+///    knob, because "how much" and "how hard" are the same question
+///    asked twice.
+///
+/// 2. **The colour is earned, not dialled.** [`HEAT`](band::HEAT) is a
+///    saturation whose amount is the band's own gain reduction. A band
+///    doing nothing is bit-for-bit clean; a band working hard is warm.
+///    That is a claim about what compression should sound like, and it
+///    is the opposite of the neutral utility every other multiband
+///    aims to be.
+///
+/// And one thing that is physics rather than opinion: the per-band
+/// envelope times cannot go faster than the band itself. See
+/// [`GRIP`] and [`PERIODS_ATTACK`].
+pub mod prism {
+    use super::ParamDef;
+
+    pub const LOW_X: u32 = 0;
+    pub const HIGH_X: u32 = 1;
+    pub const GRIP: u32 = 2;
+    pub const MIX: u32 = 3;
+    pub const OUTPUT: u32 = 4;
+
+    /// How many bands, and it is three on purpose.
+    ///
+    /// Four is where a multiband stops being a tool you can hear and
+    /// starts being one you reason about — and the third and fourth
+    /// bands of a four-band are almost always doing one job between
+    /// them. Three is low, middle, top: the way anyone describes a
+    /// sound out loud.
+    pub const BANDS: usize = 3;
+
+    /// The first per-band id, and the stride between bands.
+    ///
+    /// Wire ids are flat because the engine's `set_param` is flat, and
+    /// the arithmetic lives here so that a card, a node and a p-lock
+    /// all derive the same id from the same two numbers.
+    pub const BAND_BASE: u32 = 5;
+    pub const BAND_STRIDE: u32 = 4;
+
+    /// Offsets within one band, for [`param`].
+    pub mod band {
+        pub const THRESHOLD: u32 = 0;
+        pub const AMOUNT: u32 = 1;
+        pub const HEAT: u32 = 2;
+        pub const TRIM: u32 = 3;
+        pub const COUNT: u32 = 4;
+    }
+
+    /// The wire id of one band's one control.
+    ///
+    /// Out-of-range asks fold back into band 0 rather than colliding
+    /// with a global — a bad index should be a wrong knob, never
+    /// someone else's knob.
+    pub const fn param(band: usize, which: u32) -> u32 {
+        let band = if band < BANDS { band } else { 0 };
+        let which = if which < band::COUNT { which } else { 0 };
+        BAND_BASE + band as u32 * BAND_STRIDE + which
+    }
+
+    /// Which band a wire id belongs to, and which control — `None` for
+    /// the globals.
+    pub const fn split(param: u32) -> Option<(usize, u32)> {
+        if param < BAND_BASE {
+            return None;
+        }
+        let offset = param - BAND_BASE;
+        let band = (offset / BAND_STRIDE) as usize;
+        if band >= BANDS {
+            return None;
+        }
+        Some((band, offset % BAND_STRIDE))
+    }
+
+    pub const LOW_X_MIN_HZ: f32 = 40.0;
+    pub const LOW_X_MAX_HZ: f32 = 800.0;
+    pub const HIGH_X_MIN_HZ: f32 = 800.0;
+    pub const HIGH_X_MAX_HZ: f32 = 12_000.0;
+
+    pub const THRESHOLD_MIN_DB: f32 = -60.0;
+    pub const THRESHOLD_MAX_DB: f32 = 0.0;
+    pub const TRIM_MIN_DB: f32 = -18.0;
+    pub const TRIM_MAX_DB: f32 = 18.0;
+    pub const OUTPUT_MIN_DB: f32 = -24.0;
+    pub const OUTPUT_MAX_DB: f32 = 24.0;
+
+    /// The steepest the AMOUNT knob gets, pushed all the way down.
+    ///
+    /// Ten to one and not twenty: a band of a mix is not a source, and
+    /// a limiter on one third of the spectrum is a sound nobody wants
+    /// by accident. The clamp is where twenty lives.
+    pub const RATIO_MAX: f32 = 10.0;
+
+    /// And pulled all the way up. Upward compression is far more
+    /// dangerous than downward — it lifts noise, room and bleed with
+    /// the signal — so the same knob travel buys much less of it.
+    pub const UPWARD_RATIO_MAX: f32 = 3.0;
+
+    /// However far the upward direction is pushed, it stops here.
+    ///
+    /// An upward compressor with no ceiling turns its own noise floor
+    /// into the loudest thing in the band, and does it slowly enough
+    /// that it sounds like the room rather than like a bug.
+    pub const LIFT_CEILING_DB: f32 = 18.0;
+
+    /// The knee, fixed and not on the face.
+    ///
+    /// Every band is crossing its threshold constantly — that is what a
+    /// band of music does — and a hard corner on that is audible as
+    /// grain. There is no setting of this worth the cell it would cost.
+    pub const KNEE_DB: f32 = 6.0;
+
+    /// The two ends of [`GRIP`], in milliseconds, before the band's own
+    /// floor is applied.
+    pub const ATTACK_SLOW_MS: f32 = 40.0;
+    pub const ATTACK_FAST_MS: f32 = 0.3;
+    pub const RELEASE_SLOW_MS: f32 = 500.0;
+    pub const RELEASE_FAST_MS: f32 = 25.0;
+
+    /// THE FLOOR UNDER GRIP, in cycles of the band's own lowest content.
+    ///
+    /// This is physics, not taste. A detector cannot measure the level
+    /// of a 60 Hz tone in less than a 60 Hz cycle — ask it to and it
+    /// tracks the waveform instead of the envelope, which is not fast
+    /// compression but distortion with a threshold on it. So each
+    /// band's attack floors at half a period of its lower corner and
+    /// its release at four, and the low band is SLOWER than the high
+    /// one at the same grip setting.
+    ///
+    /// Every multiband has this problem. Most hide it by letting you
+    /// set an attack the low band cannot honour.
+    pub const PERIODS_ATTACK: f32 = 0.5;
+    pub const PERIODS_RELEASE: f32 = 4.0;
+
+    /// How hard the heat curve is driven, and how much reduction counts
+    /// as "working hard".
+    ///
+    /// The drive is fixed because HEAT is an amount, not a flavour —
+    /// one curve, faded in. The dB figure is the scale of the claim: at
+    /// twelve decibels of reduction a band at full heat is fully
+    /// coloured, and at none it is untouched to the bit.
+    pub const HEAT_DRIVE: f32 = 2.5;
+    pub const HEAT_FULL_DB: f32 = 12.0;
+
+    /// The detector's window. Short — the ballistics are the part with
+    /// a knob on them.
+    pub const DETECT_MS: f32 = 2.0;
+
+    pub const TABLE: &[ParamDef] = &[
+        ParamDef {
+            id: LOW_X,
+            name: "low x",
+            min: LOW_X_MIN_HZ,
+            max: LOW_X_MAX_HZ,
+            // Under the voice, over the kick's body: the seam most
+            // mixes already have whether anyone drew it or not.
+            default: 180.0,
+        },
+        ParamDef {
+            id: HIGH_X,
+            name: "high x",
+            min: HIGH_X_MIN_HZ,
+            max: HIGH_X_MAX_HZ,
+            // Where presence stops and air starts.
+            default: 2_800.0,
+        },
+        ParamDef {
+            id: GRIP,
+            name: "grip",
+            min: 0.0,
+            max: 1.0,
+            // Middle: the times a multiband is usually set to anyway,
+            // and the one place the knob says nothing about itself.
+            default: 0.5,
+        },
+        ParamDef {
+            id: MIX,
+            name: "mix",
+            min: 0.0,
+            max: 1.0,
+            default: 1.0,
+        },
+        ParamDef {
+            id: OUTPUT,
+            name: "out",
+            min: OUTPUT_MIN_DB,
+            max: OUTPUT_MAX_DB,
+            default: 0.0,
+        },
+        // --- low ---------------------------------------------------
+        ParamDef {
+            id: param(0, band::THRESHOLD),
+            name: "low thresh",
+            min: THRESHOLD_MIN_DB,
+            max: THRESHOLD_MAX_DB,
+            default: -18.0,
+        },
+        ParamDef {
+            id: param(0, band::AMOUNT),
+            name: "low amount",
+            min: -1.0,
+            max: 1.0,
+            // ZERO. Every band opens doing nothing, which is what makes
+            // the signed knob safe to have: there is no direction to
+            // arrive in.
+            default: 0.0,
+        },
+        ParamDef {
+            id: param(0, band::HEAT),
+            name: "low heat",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: param(0, band::TRIM),
+            name: "low trim",
+            min: TRIM_MIN_DB,
+            max: TRIM_MAX_DB,
+            default: 0.0,
+        },
+        // --- mid ---------------------------------------------------
+        ParamDef {
+            id: param(1, band::THRESHOLD),
+            name: "mid thresh",
+            min: THRESHOLD_MIN_DB,
+            max: THRESHOLD_MAX_DB,
+            default: -18.0,
+        },
+        ParamDef {
+            id: param(1, band::AMOUNT),
+            name: "mid amount",
+            min: -1.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: param(1, band::HEAT),
+            name: "mid heat",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: param(1, band::TRIM),
+            name: "mid trim",
+            min: TRIM_MIN_DB,
+            max: TRIM_MAX_DB,
+            default: 0.0,
+        },
+        // --- high --------------------------------------------------
+        ParamDef {
+            id: param(2, band::THRESHOLD),
+            name: "high thresh",
+            min: THRESHOLD_MIN_DB,
+            max: THRESHOLD_MAX_DB,
+            default: -18.0,
+        },
+        ParamDef {
+            id: param(2, band::AMOUNT),
+            name: "high amount",
+            min: -1.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: param(2, band::HEAT),
+            name: "high heat",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: param(2, band::TRIM),
+            name: "high trim",
+            min: TRIM_MIN_DB,
+            max: TRIM_MAX_DB,
+            default: 0.0,
+        },
+    ];
+}
+
 pub mod haze {
     use super::ParamDef;
 
@@ -5158,6 +5606,8 @@ mod tests {
         ("echo", echo::TABLE),
         ("poly", poly::TABLE),
         ("haze", haze::TABLE),
+        ("clamp", clamp::TABLE),
+        ("prism", prism::TABLE),
         ("eq", eq::TABLE),
         ("glue", glue::TABLE),
         ("kick", kick::TABLE),

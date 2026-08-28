@@ -349,6 +349,73 @@ fn tail(ui: &mut egui::Ui, theme: &Theme, state: &ReverbUi) {
     let full = rect.height() * 0.9 * mix.max(0.05);
     let x_at = |seconds: f32| rect.left() + (seconds / PLOT_SECONDS).clamp(0.0, 1.0) * rect.width();
 
+    // The room lives in a fixed six-second observation window. One-second
+    // registrations make short rooms visibly short and long rooms visibly run
+    // off the instrument instead of auto-fitting every patch to the same tail.
+    for second in 0..=PLOT_SECONDS as usize {
+        let x = x_at(second as f32);
+        painter.vline(
+            x,
+            rect.y_range(),
+            egui::Stroke::new(
+                stroke::HAIR,
+                if second % 2 == 0 {
+                    theme.grid_beat
+                } else {
+                    theme.grid_sub
+                },
+            ),
+        );
+        painter.text(
+            egui::pos2(x, base - theme.sp(space::XXS)),
+            if second == 0 {
+                egui::Align2::LEFT_BOTTOM
+            } else if second as f32 == PLOT_SECONDS {
+                egui::Align2::RIGHT_BOTTOM
+            } else {
+                egui::Align2::CENTER_BOTTOM
+            },
+            format!("{second}"),
+            egui::FontId::monospace(font::MICRO_LABEL),
+            theme.text_muted,
+        );
+    }
+    painter.hline(
+        rect.x_range(),
+        base - stroke::HAIR,
+        egui::Stroke::new(stroke::BOLD, theme.grid_beat),
+    );
+
+    // PRE is where the room wakes; RT60 is where its envelope reaches
+    // −60 dB. Both are direct coordinates of the controls, exposed as terse
+    // hardware registrations rather than another envelope legend.
+    let pre_x = x_at(predelay_s);
+    painter.line_segment(
+        [
+            egui::pos2(pre_x, rect.top()),
+            egui::pos2(pre_x, rect.top() + theme.sp(space::SM)),
+        ],
+        egui::Stroke::new(stroke::BOLD, theme.role_mod),
+    );
+    let rt60_at = predelay_s + rt60;
+    let rt60_x = x_at(rt60_at);
+    painter.line_segment(
+        [
+            egui::pos2(rt60_x, base - theme.sp(space::SM)),
+            egui::pos2(rt60_x, base),
+        ],
+        egui::Stroke::new(stroke::BOLD, theme.role_time),
+    );
+    if rt60_at > PLOT_SECONDS {
+        painter.line_segment(
+            [
+                egui::pos2(rt60_x - theme.sp(space::XS), base - theme.sp(space::XS)),
+                egui::pos2(rt60_x, base - theme.sp(space::SM)),
+            ],
+            egui::Stroke::new(stroke::BOLD, theme.role_time),
+        );
+    }
+
     // The envelope, as a hairline: the −60 dB promise the decay control
     // makes, drawn dim because it is the ground everything else sits on.
     let mut guide = Vec::with_capacity(columns);
@@ -449,6 +516,23 @@ fn tail(ui: &mut egui::Ui, theme: &Theme, state: &ReverbUi) {
         ),
         egui::FontId::monospace(font::LABEL),
         theme.text_muted,
+    );
+    painter.text(
+        egui::pos2(rect.center().x, rect.top() + design::gap(theme)),
+        egui::Align2::CENTER_TOP,
+        "IMPULSE FIELD // 6.0 S",
+        egui::FontId::proportional(font::MICRO_LABEL),
+        theme.role_time_dim,
+    );
+    painter.text(
+        egui::pos2(
+            rect.right() - design::gap(theme),
+            rect.top() + design::gap(theme),
+        ),
+        egui::Align2::RIGHT_TOP,
+        format!("L/R {:.0}%", width * 100.0),
+        egui::FontId::monospace(font::MICRO_LABEL),
+        theme.role_time_dim,
     );
 }
 

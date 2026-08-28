@@ -67,7 +67,9 @@ pub mod action;
 pub mod affordance;
 pub mod device;
 pub mod gallery;
+pub mod glyph;
 pub mod host;
+pub mod hud;
 pub mod keymap;
 pub mod kit;
 pub mod legibility;
@@ -413,6 +415,8 @@ mod tests {
             "glue.rs",      // a card: its size is the sum of what it holds
             "kick.rs",      // ditto
             "haze.rs",      // a card: its size is the widest of its four pages
+            "clamp.rs",     // a card: its size is the sum of what it holds
+            "prism.rs",     // a card: its size is the sum of what it holds
             "limiter.rs",   // ditto
             "lofi.rs",      // ditto
             "sheen.rs",     // ditto

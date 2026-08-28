@@ -82,6 +82,7 @@ pub type LaneFrame = [f32; LANES];
 
 pub mod adsr;
 pub mod arith;
+pub mod crossover;
 pub mod delay;
 pub mod dynamics;
 pub mod fdn;

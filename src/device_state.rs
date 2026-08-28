@@ -261,6 +261,8 @@ pub enum DeviceState {
     Eq(daw::audio::eq::EqParams),
     Filter(daw::audio::filter::FilterParams),
     Glue(daw::audio::glue::GlueParams),
+    Clamp(daw::audio::clamp::ClampParams),
+    Prism(daw::audio::prism::PrismParams),
     Gate(daw::audio::gate::GateParams),
     Strip(daw::audio::strip::StripParams),
     Resyn(daw::audio::resyn::ResynParams),
@@ -306,6 +308,8 @@ impl DeviceState {
             DeviceKind::Eq => Self::Eq(daw::audio::eq::EqParams::default()),
             DeviceKind::Filter => Self::Filter(daw::audio::filter::FilterParams::default()),
             DeviceKind::Glue => Self::Glue(daw::audio::glue::GlueParams::default()),
+            DeviceKind::Clamp => Self::Clamp(daw::audio::clamp::ClampParams::default()),
+            DeviceKind::Prism => Self::Prism(daw::audio::prism::PrismParams::default()),
             DeviceKind::Gate => Self::Gate(daw::audio::gate::GateParams::default()),
             DeviceKind::Strip => Self::Strip(daw::audio::strip::StripParams::default()),
             DeviceKind::Resyn => Self::Resyn(daw::audio::resyn::ResynParams::default()),
@@ -339,6 +343,8 @@ impl DeviceState {
             Self::Eq(_) => DeviceKind::Eq,
             Self::Filter(_) => DeviceKind::Filter,
             Self::Glue(_) => DeviceKind::Glue,
+            Self::Clamp(_) => DeviceKind::Clamp,
+            Self::Prism(_) => DeviceKind::Prism,
             Self::Gate(_) => DeviceKind::Gate,
             Self::Strip(_) => DeviceKind::Strip,
             Self::Resyn(_) => DeviceKind::Resyn,
@@ -454,6 +460,8 @@ impl DeviceState {
             // in the struct that owns them.
             Self::Filter(p) => Some(p.get(param)),
             Self::Glue(p) => p.get(param),
+            Self::Clamp(p) => p.get(param),
+            Self::Prism(p) => p.get(param),
             Self::Gate(p) => p.get(param),
             Self::Strip(p) => p.get(param),
             Self::Resyn(p) => p.get(param),
@@ -558,6 +566,8 @@ impl DeviceState {
             Self::Eq(p) => p.set(param, value),
             Self::Filter(p) => p.set(param, value),
             Self::Glue(p) => p.set(param, value),
+            Self::Clamp(p) => p.set(param, value),
+            Self::Prism(p) => p.set(param, value),
             Self::Gate(p) => p.set(param, value),
             Self::Strip(p) => p.set(param, value),
             Self::Resyn(p) => p.set(param, value),
@@ -829,6 +839,40 @@ pub fn glue_knobs(params: daw::audio::glue::GlueParams) -> device::GlueUi {
     knobs
 }
 
+/// `page` is which band the card is showing — UI-only state that rides
+/// `DeviceInstance`, since a card is rebuilt from engine units every
+/// frame and would forget it otherwise.
+pub fn prism_knobs(params: daw::audio::prism::PrismParams, page: u8) -> device::prism::PrismUi {
+    device::prism::PrismUi::from_engine(usize::from(page), |id| {
+        params
+            .get(id)
+            .unwrap_or_else(|| daw::params::def(daw::params::prism::TABLE, id).default)
+    })
+}
+
+/// How many PAGE DOTS a kind's card draws in its title strip.
+///
+/// Only cards built on `card::tabbed_card*` have them; the equaliser and
+/// the prism page with a cell in their footer instead, and the poly
+/// synth has a named rail. Everything else is a single page.
+///
+/// This exists so the card's grip can keep clear of the dots — see
+/// `card::Handle::keep_clear`.
+pub fn card_pages(kind: DeviceKind) -> usize {
+    match kind {
+        DeviceKind::Sampler => device::sampler::pages(),
+        _ => 1,
+    }
+}
+
+pub fn clamp_knobs(params: daw::audio::clamp::ClampParams) -> device::clamp::ClampUi {
+    device::clamp::ClampUi::from_engine(|id| {
+        params
+            .get(id)
+            .unwrap_or_else(|| daw::params::def(daw::params::clamp::TABLE, id).default)
+    })
+}
+
 pub fn eq_knobs(params: daw::audio::eq::EqParams, page: u8) -> device::EqUi {
     let mut knobs = device::EqUi {
         selected: usize::from(page).min(daw::params::eq::BANDS - 1),
@@ -885,6 +929,8 @@ pub fn device_norm(kind: DeviceKind, param: u32, value: f32) -> f32 {
         DeviceKind::Eq => device::eq_norm(param, value),
         DeviceKind::Filter => device::filter_norm(param, value),
         DeviceKind::Glue => device::glue_norm(param, value),
+        DeviceKind::Clamp => device::clamp::clamp_norm(param, value),
+        DeviceKind::Prism => device::prism::prism_norm(param, value),
         DeviceKind::Gate => device::gate_norm(param, value),
         DeviceKind::Strip => device::strip_norm(param, value),
         DeviceKind::Resyn => device::resyn_norm(param, value),
@@ -929,6 +975,10 @@ pub fn device_is_discrete(kind: DeviceKind, param: u32) -> bool {
         DeviceKind::Eq => device::eq_is_discrete(param),
         DeviceKind::Filter => device::filter_is_discrete(param),
         DeviceKind::Glue => device::glue_is_discrete(param),
+        // Nothing on the surgical compressor snaps: the ratio is
+        // continuous, which is the point of it beside glue's detents.
+        DeviceKind::Clamp => false,
+        DeviceKind::Prism => false,
         DeviceKind::Gate => device::gate_is_discrete(param),
         DeviceKind::Strip => device::strip_is_discrete(param),
         DeviceKind::Resyn => device::resyn_is_discrete(param),
@@ -967,6 +1017,8 @@ pub fn device_is_log(kind: DeviceKind, param: u32) -> bool {
         DeviceKind::Eq => device::eq_is_log(param),
         DeviceKind::Filter => device::filter_is_log(param),
         DeviceKind::Glue => device::glue_is_log(param),
+        DeviceKind::Clamp => device::clamp::clamp_is_log(param),
+        DeviceKind::Prism => device::prism::prism_is_log(param),
         DeviceKind::Gate => device::gate_is_log(param),
         DeviceKind::Strip => device::strip_is_log(param),
         DeviceKind::Resyn => device::resyn_is_log(param),
@@ -1010,6 +1062,8 @@ pub fn device_value(kind: DeviceKind, param: u32, norm: f32) -> f32 {
         DeviceKind::Eq => device::eq_value(param, norm),
         DeviceKind::Filter => device::filter_value(param, norm),
         DeviceKind::Glue => device::glue_value(param, norm),
+        DeviceKind::Clamp => device::clamp::clamp_value(param, norm),
+        DeviceKind::Prism => device::prism::prism_value(param, norm),
         DeviceKind::Gate => device::gate_value(param, norm),
         DeviceKind::Strip => device::strip_value(param, norm),
         DeviceKind::Resyn => device::resyn_value(param, norm),
