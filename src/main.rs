@@ -12516,7 +12516,7 @@ fn device_body(
                             }
                             let before = racks.get(&instance.id).cloned().unwrap_or_default();
                             let mut rack = before.clone();
-                            let out = device::rack_card(ui, theme, &mut rack, |ui| {
+                            let out = device::rack_card(ui, theme, instance.id, &mut rack, |ui| {
                                 let mut touched = Vec::new();
                                 for child in chain.iter().filter(|d| d.parent == Some(instance.id))
                                 {

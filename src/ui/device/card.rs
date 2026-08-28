@@ -1063,8 +1063,88 @@ pub fn sections(
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
-mod grip_tests {
+pub(crate) mod grip_tests {
     use super::*;
+
+    /// Every error egui painted this frame.
+    ///
+    /// A widget id used twice is not returned, logged or raised — egui
+    /// PAINTS the words onto the offending widget and carries on. So the
+    /// only way to catch one in a test is to read what was drawn, which
+    /// is what this does: run a frame, walk its shapes, and collect any
+    /// text egui wrote about ids.
+    pub fn painted_errors(output: &egui::FullOutput, ctx: &egui::Context) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut walk = |shape: &egui::epaint::Shape| {
+            if let egui::epaint::Shape::Text(text) = shape {
+                let said = text.galley.text();
+                if said.contains("use of") && said.contains("ID") {
+                    found.push(said.to_owned());
+                }
+            }
+        };
+        for primitive in ctx.tessellate(output.shapes.clone(), output.pixels_per_point) {
+            let _ = &primitive;
+        }
+        for shape in &output.shapes {
+            visit(&shape.shape, &mut walk);
+        }
+        found.sort();
+        found.dedup();
+        found
+    }
+
+    fn visit(shape: &egui::epaint::Shape, at: &mut impl FnMut(&egui::epaint::Shape)) {
+        at(shape);
+        if let egui::epaint::Shape::Vec(shapes) = shape {
+            for shape in shapes {
+                visit(shape, at);
+            }
+        }
+    }
+
+    /// TWO OF THE SAME EFFECT ARE TWO WIDGETS, NOT ONE.
+    ///
+    /// A chain is allowed to hold duplicates — two filters in series is
+    /// an ordinary thing to want — and every id inside a card has to
+    /// carry something that tells them apart. When one does not, egui
+    /// does not raise or log: it PAINTS "Second use of widget ID" over
+    /// the card and carries on, so the only way to catch it is to read
+    /// what was drawn.
+    #[test]
+    fn two_of_the_same_card_do_not_share_an_id() {
+        let theme = Theme::dark();
+        let context = egui::Context::default();
+        // Two frames: egui compares this frame's ids against the same
+        // frame's, but hover and focus need a previous one to exist.
+        let mut errors = Vec::new();
+        for _ in 0..2 {
+            let mut run = context.run_ui(egui::RawInput::default(), |ui| {
+                ui.horizontal_top(|ui| {
+                    for _ in 0..2 {
+                        let mut page = 0;
+                        tabbed_card_gripped(
+                            ui,
+                            &theme,
+                            "filter",
+                            crate::ui::tokens::control::DEVICE_H,
+                            2,
+                            &mut page,
+                            |ui, _| {
+                                ui.label("body");
+                            },
+                        );
+                    }
+                });
+            });
+            errors = painted_errors(&run, &context);
+            run.textures_delta.clear();
+        }
+        assert!(
+            errors.is_empty(),
+            "two identical cards collided on a widget id: {errors:#?}"
+        );
+    }
 
     /// THE DERIVED BAND IS WHERE THE CARD ACTUALLY PUT ITS TITLE.
     ///

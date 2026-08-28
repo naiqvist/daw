@@ -311,6 +311,12 @@ fn macro_cell(
 pub fn rack_card(
     ui: &mut egui::Ui,
     theme: &Theme,
+    // The rack's own instance id. A chain may hold TWO racks — grouping
+    // twice is an ordinary thing to do — and the scroll area inside each
+    // needs a name that tells them apart. Without it both answer to one
+    // id, and egui paints "Second use of ScrollArea ID" across the
+    // second one and then scrolls them together.
+    instance: u64,
     state: &mut RackUi,
     chain: impl FnOnce(&mut egui::Ui) -> Vec<Touched>,
 ) -> RackOutcome {
@@ -358,7 +364,7 @@ pub fn rack_card(
             // than fits and the alternative is cards that shrink until
             // none of them can print their own numbers.
             let touched = egui::ScrollArea::horizontal()
-                .id_salt("rack.chain")
+                .id_salt(("rack.chain", instance))
                 .show(ui, |ui| ui.horizontal_top(|ui| chain(ui)).inner)
                 .inner;
 
@@ -382,6 +388,43 @@ pub fn rack_card(
         });
     });
     out
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod duplicate_ids {
+    use super::*;
+
+    /// TWO RACKS ON ONE CHAIN ARE TWO RACKS.
+    ///
+    /// Grouping twice is an ordinary thing to do, and every id inside a
+    /// rack has to carry something that tells the two apart. The chain's
+    /// scroll area carried a fixed name, so the second rack answered to
+    /// the first one's id — egui painted "Second use of ScrollArea ID"
+    /// across it and then scrolled both together.
+    ///
+    /// Caught by READING WHAT WAS PAINTED, because that is all egui does
+    /// about it: no error, no log, no panic. A test that only called the
+    /// function would have passed while the screen said otherwise.
+    #[test]
+    fn two_racks_do_not_share_a_scroll_area() {
+        let theme = Theme::dark();
+        let context = egui::Context::default();
+        let mut errors = Vec::new();
+        for _ in 0..2 {
+            let mut a = RackUi::default();
+            let mut b = RackUi::default();
+            let mut run = context.run_ui(egui::RawInput::default(), |ui| {
+                ui.horizontal_top(|ui| {
+                    rack_card(ui, &theme, 1, &mut a, |_ui| Vec::new());
+                    rack_card(ui, &theme, 2, &mut b, |_ui| Vec::new());
+                });
+            });
+            errors = crate::ui::device::card::grip_tests::painted_errors(&run, &context);
+            run.textures_delta.clear();
+        }
+        assert!(errors.is_empty(), "two racks collided: {errors:#?}");
+    }
 }
 
 #[cfg(test)]
@@ -479,7 +522,7 @@ mod tests {
         };
 
         let out = frame(&ctx, |ui| {
-            rack_card(ui, &theme, &mut rack, |_ui| {
+            rack_card(ui, &theme, 7, &mut rack, |_ui| {
                 vec![touched(11, 5), touched(22, 6)]
             })
         });
@@ -504,7 +547,7 @@ mod tests {
         let mut rack = RackUi::default();
 
         let out = frame(&ctx, |ui| {
-            rack_card(ui, &theme, &mut rack, |_ui| vec![touched(11, 5)])
+            rack_card(ui, &theme, 7, &mut rack, |_ui| vec![touched(11, 5)])
         });
 
         assert!(out.mapped.is_none());
@@ -528,7 +571,7 @@ mod tests {
             },
         );
         let out = frame(&ctx, |ui| {
-            rack_card(ui, &theme, &mut rack, |_ui| Vec::new())
+            rack_card(ui, &theme, 7, &mut rack, |_ui| Vec::new())
         });
         assert!(out.moves.is_empty());
         assert!(out.mapped.is_none());

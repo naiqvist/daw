@@ -877,7 +877,7 @@ impl Gallery {
             // rather than against a placeholder.
             let acid = &mut self.dev_acid;
             let lofi = &mut self.dev_lofi;
-            let out = device::rack_card(ui, theme, &mut self.dev_rack, |ui| {
+            let out = device::rack_card(ui, theme, 0, &mut self.dev_rack, |ui| {
                 let mut touched = Vec::new();
                 for edit in device::acid_card(ui, theme, acid) {
                     touched.push(device::Touched {
