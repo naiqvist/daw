@@ -70,6 +70,7 @@ pub mod gallery;
 pub mod host;
 pub mod keymap;
 pub mod kit;
+pub mod legibility;
 pub mod palette;
 pub mod panels;
 pub mod prefs;

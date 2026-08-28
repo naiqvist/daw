@@ -1591,7 +1591,11 @@ impl Default for SessionColors {
             muted: egui::Color32::from_rgb(0x9b, 0xa8, 0xb1),
             divider: egui::Color32::from_rgb(0x35, 0x30, 0x2a),
             outline: egui::Color32::from_rgb(0x4a, 0x43, 0x3a),
-            focus: egui::Color32::from_rgb(0x5a, 0xb5, 0xd2),
+            // The ring is BRIGHTER than what it surrounds — the accent's
+            // hue lifted, matching the app theme's rule, so the one mark
+            // that says where the keyboard is stops hiding among
+            // emphasis that is on screen everywhere.
+            focus: egui::Color32::from_rgb(0x8f, 0xdc, 0xf0),
             accent: egui::Color32::from_rgb(0x5a, 0xb5, 0xd2),
             accent_dim: egui::Color32::from_rgb(0x35, 0x62, 0x71),
             midi: egui::Color32::from_rgb(0x4b, 0x40, 0x34),
@@ -1636,6 +1640,16 @@ const FADER_WIDTH: f32 = 24.0;
 const STRIP_PAD_X: f32 = 6.0;
 const STRIP_PAD_Y: f32 = 6.0;
 const STRIP_GAP: f32 = 4.0;
+/// The gap BETWEEN groups of controls, as against within one.
+///
+/// A strip carries fourteen separate things and a glance holds three or
+/// four, so what decides whether it can be read is not how many controls
+/// there are but how many GROUPS. Four here — what the transport does
+/// with this lane, what comes in, where it also goes, and how loud —
+/// and the only thing that says so is that the space between them is
+/// bigger than the space inside them. Proximity is the cheapest grouping
+/// there is: it costs six pixels and no ink at all.
+const STRIP_CHUNK_GAP: f32 = 9.0;
 const PAN_HEIGHT: f32 = 13.0;
 const READOUT_HEIGHT: f32 = 13.0;
 const PEAK_HEIGHT: f32 = 11.0;
@@ -3124,7 +3138,7 @@ impl MixerStrip {
             }
         };
         let wants_pan = afford(PAN_HEIGHT + STRIP_GAP);
-        let wants_io = io && wants_pan && afford(IO_HEIGHT + STRIP_GAP);
+        let wants_io = io && wants_pan && afford(IO_HEIGHT + STRIP_CHUNK_GAP);
         let wants_readout = wants_pan && afford(READOUT_HEIGHT + 2.0);
         let wants_peak = wants_readout && afford(PEAK_HEIGHT + 1.0);
         // Only once everything fixed is in place, for the reason above.
@@ -3148,7 +3162,7 @@ impl MixerStrip {
             (None, first)
         };
         let solo = mute.translate(step);
-        top += TRACK_BUTTON_HEIGHT + STRIP_GAP;
+        top += TRACK_BUTTON_HEIGHT + STRIP_CHUNK_GAP;
         // The I/O row sits at the TOP, under the buttons, which is where
         // a console puts it and where a signal actually enters: read the
         // strip downwards and you read the path.
@@ -3157,7 +3171,7 @@ impl MixerStrip {
                 egui::pos2(content_left, top),
                 egui::pos2(content_right, top + IO_HEIGHT),
             );
-            top += IO_HEIGHT + STRIP_GAP;
+            top += IO_HEIGHT + STRIP_CHUNK_GAP;
             let split = (row.left() + MONITOR_WIDTH).min(row.right());
             (
                 Some(egui::Rect::from_min_max(
@@ -3172,14 +3186,9 @@ impl MixerStrip {
         } else {
             (None, None)
         };
-        let pan = wants_pan.then(|| {
-            let bar = egui::Rect::from_min_max(
-                egui::pos2(content_left, top),
-                egui::pos2(content_right, top + PAN_HEIGHT),
-            );
-            top += PAN_HEIGHT + STRIP_GAP;
-            bar
-        });
+        // Sends BEFORE pan, because pan belongs with the fader: how far
+        // left and how loud are one question asked twice, and the sends
+        // are a different question entirely.
         let send_rects: Vec<egui::Rect> = (0..send_rows)
             .map(|row| {
                 egui::Rect::from_min_max(
@@ -3189,8 +3198,16 @@ impl MixerStrip {
             })
             .collect();
         if send_rows > 0 {
-            top += send_rows as f32 * SEND_HEIGHT + STRIP_GAP;
+            top += send_rows as f32 * SEND_HEIGHT + STRIP_CHUNK_GAP;
         }
+        let pan = wants_pan.then(|| {
+            let bar = egui::Rect::from_min_max(
+                egui::pos2(content_left, top),
+                egui::pos2(content_right, top + PAN_HEIGHT),
+            );
+            top += PAN_HEIGHT + STRIP_GAP;
+            bar
+        });
 
         let mut bottom = rect.bottom() - STRIP_PAD_Y;
         let peak = wants_peak.then(|| {
@@ -6927,6 +6944,51 @@ mod tests {
                 .is_some_and(|hold| (*hold - 0.8).abs() < 1e-5),
             "the return's hold is not where the strip looks for it"
         );
+    }
+
+    /// FOURTEEN CONTROLS, FOUR GROUPS.
+    ///
+    /// A glance holds three or four things, so what decides whether a
+    /// strip can be read is not how many controls it has but how many
+    /// GROUPS — and the only thing that says where a group ends is that
+    /// the space between them is bigger than the space inside them.
+    /// Pinned because it is invisible: nothing looks broken when the two
+    /// gaps drift equal, the strip just quietly becomes a list.
+    #[test]
+    fn the_strip_reads_as_four_groups_and_not_fourteen_controls() {
+        let strip = MixerStrip::new(
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(112.0, 320.0)),
+            StripContent { sends: 2, io: true },
+        );
+        let io = strip.monitor.expect("an audio lane has an I/O row");
+        let pan = strip.pan.expect("a tall strip has a pan bar");
+        let first_send = *strip.sends.first().expect("two returns, two rows");
+        let last_send = *strip.sends.last().expect("two returns, two rows");
+
+        // Between groups.
+        let after_buttons = io.top() - strip.mute.bottom();
+        let after_io = first_send.top() - io.bottom();
+        let after_sends = pan.top() - last_send.bottom();
+        // Within one.
+        let between_sends = last_send.top() - first_send.bottom();
+        let pan_to_fader = strip.fader.top() - pan.bottom();
+
+        for (name, between) in [
+            ("buttons/io", after_buttons),
+            ("io/sends", after_io),
+            ("sends/level", after_sends),
+        ] {
+            assert!(
+                between > between_sends && between > pan_to_fader,
+                "{name} is {between}, no wider than the {between_sends} and \
+                 {pan_to_fader} inside a group — the strip reads as one list"
+            );
+        }
+        // And the order is the signal path: what comes in, what it is
+        // sent to, then how loud it leaves.
+        assert!(io.bottom() <= first_send.top());
+        assert!(last_send.bottom() <= pan.top());
+        assert!(pan.bottom() <= strip.fader.top());
     }
 
     // -------------------------------------------- keyboard parity ---

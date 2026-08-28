@@ -240,9 +240,17 @@ impl Monitor {
         }
     }
 
+    /// The two characters the button shows.
+    ///
+    /// THREE STATES, THREE SYMBOLS. `Off` and `In` used to share `IN`
+    /// and leave the button's fill to carry the difference — which made
+    /// the fill load-bearing for two states while `Auto` carried its own
+    /// glyph, so the alphabet said one thing and the paint said another.
+    /// A reader glancing at a dim strip could not tell a lane that was
+    /// off from one that was listening.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Off => "IN",
+            Self::Off => "--",
             Self::In => "IN",
             Self::Auto => "AU",
         }

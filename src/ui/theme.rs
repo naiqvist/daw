@@ -146,7 +146,10 @@ impl Theme {
             // separate adjacent cards and panel seams at a glance.
             outline: Color32::from_rgb(0x4a, 0x43, 0x3a),
             divider: Color32::from_rgb(0x35, 0x30, 0x2a),
-            focus: Color32::from_rgb(0x5a, 0xb5, 0xd2),
+            // A ring is BRIGHTER than what it surrounds: the accent's own hue,
+            // lifted, so the scheme keeps its character and the mark that
+            // says where the keyboard is stops hiding among emphasis.
+            focus: Color32::from_rgb(0x8f, 0xdc, 0xf0),
             accent: Color32::from_rgb(0x5a, 0xb5, 0xd2),
             accent_muted: Color32::from_rgb(0x35, 0x62, 0x71),
             // TE's on-screen hues, bright and dim. Note their "white" is
@@ -226,7 +229,9 @@ impl Theme {
             text_value: Color32::from_rgb(0x34, 0x4c, 0x5b),
             outline: Color32::from_rgb(0xc4, 0xbe, 0xb2),
             divider: Color32::from_rgb(0xd8, 0xd2, 0xc7),
-            focus: Color32::from_rgb(0x28, 0x7c, 0x9b),
+            // On a light ground the ring reads by going DARKER, which is the
+            // same move as dark's — more present than the accent, not less.
+            focus: Color32::from_rgb(0x0f, 0x5a, 0x78),
             accent: Color32::from_rgb(0x28, 0x7c, 0x9b),
             accent_muted: Color32::from_rgb(0xc6, 0xdd, 0xe5),
             role_time: Color32::from_rgb(0x37, 0x6f, 0x9d),
@@ -258,7 +263,10 @@ impl Theme {
             clip_audio: Color32::from_rgb(0xc9, 0xdb, 0xe1),
             clip_audio_header: Color32::from_rgb(0x8d, 0xb8, 0xc6),
             clip_hover: Color32::from_rgb(0x68, 0x74, 0x7d),
-            clip_selected: Color32::from_rgb(0x28, 0x7c, 0x9b),
+            // Warm against a cool accent, which is dark's rule said on a light
+            // ground — a selected clip and an emphasised control are
+            // different claims and cannot be the same mark.
+            clip_selected: Color32::from_rgb(0x8a, 0x6a, 0x3c),
             clip_note: Color32::from_rgb(0x59, 0x6d, 0x79),
             // The same hue on paper, and the step runs the other way:
             // on a light ground a selected note reads by going DARKER
@@ -291,12 +299,17 @@ impl Theme {
             text_value: Color32::from_rgb(0x58, 0xf7, 0xff),
             outline: Color32::from_rgb(0x63, 0x3d, 0x82),
             divider: Color32::from_rgb(0x2c, 0x1c, 0x43),
-            focus: Color32::from_rgb(0x00, 0xf5, 0xff),
+            // Neither the cyan a selected clip wears nor the magenta of the
+            // accent: the ring has to be findable when both are on screen.
+            focus: Color32::from_rgb(0xa8, 0xff, 0xe8),
             accent: Color32::from_rgb(0xff, 0x2b, 0xd6),
             accent_muted: Color32::from_rgb(0x55, 0x20, 0x4f),
             role_time: Color32::from_rgb(0x20, 0xe6, 0xff),
             role_time_dim: Color32::from_rgb(0x1d, 0x59, 0x70),
-            role_level: Color32::from_rgb(0xff, 0xe6, 0x3d),
+            // Amber, not the lemon a warning wears — a level's role colour
+            // marks knobs and lanes that are always present, so it cannot
+            // be the colour that means something is wrong.
+            role_level: Color32::from_rgb(0xff, 0xc2, 0x66),
             role_level_dim: Color32::from_rgb(0x65, 0x59, 0x24),
             role_shape: Color32::from_rgb(0xe8, 0xdc, 0xff),
             role_shape_dim: Color32::from_rgb(0x68, 0x5e, 0x7b),
@@ -307,7 +320,9 @@ impl Theme {
             danger: Color32::from_rgb(0xff, 0x42, 0x68),
             red_zone: Color32::from_rgb(0xff, 0x42, 0x68),
             green_zone: Color32::from_rgb(0x52, 0xff, 0x91),
-            playhead: Color32::from_rgb(0xff, 0xe6, 0x3d),
+            // The brightest thing that moves, and its own colour: a warning
+            // must be able to appear against it.
+            playhead: Color32::from_rgb(0xff, 0xf5, 0x9a),
             loop_region: Color32::from_rgba_unmultiplied(0xff, 0x2b, 0xd6, 0x28),
             loop_brace: Color32::from_rgb(0xff, 0x62, 0xe2),
             selection: Color32::from_rgba_unmultiplied(0x00, 0xf5, 0xff, 0x30),
