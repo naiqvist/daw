@@ -10,6 +10,7 @@
 //! audio is not warped or time-stretched here.
 
 use crate::{AudioSource, Clip, Focus, GRID_MIN_PX, claim};
+use daw::ui::affordance::{Afford, Affords};
 use daw::ui::device::{Mapping, Param, Unit, poly_widgets};
 use daw::ui::theme::Theme;
 use daw::ui::tokens::{control, font, stroke};
@@ -1327,7 +1328,9 @@ fn fade_handles(
             egui::vec2(grab * 2.0, grab * 2.0),
         );
         let id = ui.id().with(("fade", leading));
-        let response = ui.interact(hit, id, egui::Sense::click_and_drag());
+        let response = ui
+            .interact(hit, id, egui::Sense::click_and_drag())
+            .affords(Affords::SeamX);
         if response.dragged()
             && let Some(pos) = response.interact_pointer_pos()
         {
@@ -1396,7 +1399,9 @@ fn fade_handles(
                 egui::vec2(grab * 2.0, grab * 2.0),
             );
             let id = ui.id().with(("fade_curve", leading));
-            let response = ui.interact(hit, id, egui::Sense::click_and_drag());
+            let response = ui
+                .interact(hit, id, egui::Sense::click_and_drag())
+                .affords(Affords::SeamX);
             if response.hovered() || response.dragged() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
             }
@@ -1804,7 +1809,9 @@ pub fn body(
     editor.channels = channels;
 
     let id = ui.id().with("waveform_display");
-    let response = ui.interact(display, id, egui::Sense::click_and_drag());
+    let response = ui
+        .interact(display, id, egui::Sense::click_and_drag())
+        .affords(Affords::Sweep);
     editor.owns_keys = focus.register(id, display);
 
     editor.display_width = display.width();
@@ -2085,7 +2092,9 @@ fn gain_envelope(
 
     // The LINE first: a double-click anywhere on it adds a point there.
     let line_id = ui.id().with("envelope_line");
-    let response = ui.interact(display, line_id, egui::Sense::click());
+    let response = ui
+        .interact(display, line_id, egui::Sense::click())
+        .affords(Affords::Draw);
     if response.double_clicked()
         && let Some(at) = response.interact_pointer_pos()
     {
@@ -2106,7 +2115,9 @@ fn gain_envelope(
         }
         let hit = egui::Rect::from_center_size(*at, egui::vec2(grab * 2.0, grab * 2.0));
         let id = ui.id().with(("envelope_point", index));
-        let response = ui.interact(hit, id, egui::Sense::click_and_drag());
+        let response = ui
+            .interact(hit, id, egui::Sense::click_and_drag())
+            .affords(Affords::Steer);
         if response.hovered() || response.dragged() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
         }
@@ -3266,7 +3277,9 @@ fn selection_handles(
             egui::pos2(x + grab, display.bottom()),
         );
         let id = ui.id().with(("selection_edge", edge == Edge::From));
-        let response = ui.interact(hit, id, egui::Sense::click_and_drag());
+        let response = ui
+            .interact(hit, id, egui::Sense::click_and_drag())
+            .affords(Affords::SeamX);
         if response.hovered() || response.dragged() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
         }
@@ -3329,7 +3342,9 @@ fn channel_labels(
         );
         let hit = egui::Rect::from_min_size(at, size);
         let id = ui.id().with(("channel_label", channel));
-        let response = ui.interact(hit, id, egui::Sense::click());
+        let response = ui
+            .interact(hit, id, egui::Sense::click())
+            .affords(Affords::Press);
         if response.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             ui.painter()

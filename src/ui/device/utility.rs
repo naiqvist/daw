@@ -57,6 +57,7 @@
 
 use crate::params::utility as up;
 use crate::params::{self};
+use crate::ui::affordance::{Afford, Affords};
 use crate::ui::device::synth::ParamEdit;
 use crate::ui::device::{
     Footprint, Mapping, Param, Unit, Well, Wells, card, metrics, poly_widgets,
@@ -370,11 +371,13 @@ fn field(ui: &mut egui::Ui, theme: &Theme, state: &UtilityUi, tag: &str) -> Opti
         .max(metrics::interactive_min(ui).y * 0.5);
     let centre = egui::pos2(x_of(pan), y_of(width));
     let puck = egui::Rect::from_center_size(centre, egui::vec2(grab * 2.0, grab * 2.0));
-    let handle = ui.interact(
-        puck,
-        background.id.with("image"),
-        egui::Sense::click_and_drag(),
-    );
+    let handle = ui
+        .interact(
+            puck,
+            background.id.with("image"),
+            egui::Sense::click_and_drag(),
+        )
+        .affords(Affords::Steer);
 
     let mut moved = None;
     if handle.dragged() {

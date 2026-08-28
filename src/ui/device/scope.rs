@@ -54,6 +54,7 @@
 //! [`dynamics::transfer_curve`]: crate::ui::device::dynamics::transfer_curve
 //! [`dynamics::reduction_meter`]: crate::ui::device::dynamics::reduction_meter
 
+use crate::ui::affordance::{Afford, Affords};
 use crate::ui::device::{Footprint, metrics};
 use crate::ui::theme::Theme;
 use crate::ui::tokens::{control, font, space, stroke};
@@ -227,11 +228,13 @@ pub fn scope(
         egui::pos2(rect.left(), rule_y - grab),
         egui::pos2(rect.right(), rule_y + grab),
     );
-    let handle = ui.interact(
-        rule_rect,
-        background.id.with("threshold"),
-        egui::Sense::click_and_drag(),
-    );
+    let handle = ui
+        .interact(
+            rule_rect,
+            background.id.with("threshold"),
+            egui::Sense::click_and_drag(),
+        )
+        .affords(Affords::Sweep);
 
     let mut moved = None;
     if handle.dragged() {

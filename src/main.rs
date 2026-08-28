@@ -36,6 +36,7 @@ use daw::library::{
     self, ImportedWav, LibraryConfig, LibraryService, LibrarySnapshot, WavImportService,
 };
 use daw::ui::action::UiAction;
+use daw::ui::affordance::{Afford, Affords};
 use daw::ui::device;
 use daw::ui::kit;
 use daw::ui::palette::{Command as PaletteCommand, Palette};
@@ -550,7 +551,9 @@ fn transport_button(
 ) -> bool {
     let wid = ui.id().with(id);
     focus.register(wid, rect);
-    let response = ui.interact(rect, wid, egui::Sense::click());
+    let response = ui
+        .interact(rect, wid, egui::Sense::click())
+        .affords(Affords::Press);
     if response.hovered() {
         ui.painter().rect_filled(rect, 0.0, theme.accent_muted);
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -644,7 +647,9 @@ fn field(
 ) -> egui::Response {
     let wid = ui.id().with(id);
     focus.register(wid, rect);
-    let response = ui.interact(rect, wid, egui::Sense::click_and_drag());
+    let response = ui
+        .interact(rect, wid, egui::Sense::click_and_drag())
+        .affords(Affords::Slide);
     let live = response.hovered() || response.dragged();
     ui.painter().rect_filled(
         rect,
@@ -5007,7 +5012,9 @@ fn automation_lane(
             ));
         }
     }
-    let response = ui.interact(rect, id, egui::Sense::click_and_drag());
+    let response = ui
+        .interact(rect, id, egui::Sense::click_and_drag())
+        .affords(Affords::Draw);
     let mut hovered = response.hovered();
     if hovered {
         painter.rect_stroke(
@@ -5089,7 +5096,9 @@ fn automation_lane(
     for (index, point) in automation.points_mut(target).iter_mut().enumerate() {
         let pos = point_pos(point.beat, point.value);
         let hit = egui::Rect::from_center_size(pos, egui::Vec2::splat(8.0));
-        let response = ui.interact(hit, id.with(index), egui::Sense::click_and_drag());
+        let response = ui
+            .interact(hit, id.with(index), egui::Sense::click_and_drag())
+            .affords(Affords::Steer);
         hovered |= response.hovered();
         painter.circle_filled(
             pos,
@@ -5317,11 +5326,13 @@ fn automation_editor_body(
         egui::pos2(header.left() + 6.0, header.top() + 5.0),
         egui::vec2(88.0, header.height() - 10.0),
     );
-    let close_response = ui.interact(
-        close,
-        ui.id().with("close_automation_editor"),
-        egui::Sense::click(),
-    );
+    let close_response = ui
+        .interact(
+            close,
+            ui.id().with("close_automation_editor"),
+            egui::Sense::click(),
+        )
+        .affords(Affords::Press);
     ui.painter().rect_filled(
         close,
         0.0,
@@ -5552,7 +5563,9 @@ fn pan_knob(ui: &mut egui::Ui, theme: &Theme, rect: egui::Rect, pan: &mut f32) -
     let id = ui
         .id()
         .with(("pan", rect.left_top().x as i32, rect.top() as i32));
-    let response = ui.interact(rect, id, egui::Sense::click_and_drag());
+    let response = ui
+        .interact(rect, id, egui::Sense::click_and_drag())
+        .affords(Affords::Slide);
     let mut changed = false;
 
     if response.drag_started() {
@@ -5681,7 +5694,9 @@ fn gain_knob(ui: &mut egui::Ui, theme: &Theme, rect: egui::Rect, amp: &mut f32) 
     let id = ui
         .id()
         .with(("gain", rect.left_top().x as i32, rect.top() as i32));
-    let response = ui.interact(rect, id, egui::Sense::click_and_drag());
+    let response = ui
+        .interact(rect, id, egui::Sense::click_and_drag())
+        .affords(Affords::Slide);
     let mut changed = false;
 
     if response.drag_started() {
@@ -5819,7 +5834,9 @@ fn header_toggle(
     on: bool,
     on_fill: egui::Color32,
 ) -> egui::Response {
-    let response = ui.interact(rect, id, egui::Sense::click());
+    let response = ui
+        .interact(rect, id, egui::Sense::click())
+        .affords(Affords::Press);
     let painter = ui.painter();
     let fill = if response.is_pointer_button_down_on() {
         on_fill.gamma_multiply(0.72)
@@ -5865,7 +5882,9 @@ fn header_meter(
     if rect.width() <= 0.0 || rect.height() <= 0.0 {
         return;
     }
-    let response = ui.interact(rect, id, egui::Sense::click());
+    let response = ui
+        .interact(rect, id, egui::Sense::click())
+        .affords(Affords::Press);
     let meter = meter.map(|meter| {
         if response.clicked() {
             meter.clipped = false;
@@ -6059,7 +6078,9 @@ fn master_header(
     let rect = layout.head;
     let wid = ui.id().with("master_header");
     let selected = arr.master_selected;
-    let body = ui.interact(rect, wid.with("body"), egui::Sense::click());
+    let body = ui
+        .interact(rect, wid.with("body"), egui::Sense::click())
+        .affords(Affords::Press);
     if body.clicked() {
         arr.select_master();
     }
@@ -6212,7 +6233,9 @@ fn track_headers(
         // name, the two toggles and the pan knob — all made after this —
         // win the pointer where they overlap. Dragging it reorders the
         // stack; clicking anywhere on it selects the lane.
-        let body = ui.interact(head, wid.with("body"), egui::Sense::click_and_drag());
+        let body = ui
+            .interact(head, wid.with("body"), egui::Sense::click_and_drag())
+            .affords(Affords::Carry);
         if body.drag_started() {
             drag = Some(TrackDrag {
                 from: i,
@@ -6375,7 +6398,9 @@ fn track_headers(
                     }
                 }
             } else {
-                let response = ui.interact(layout.name, wid.with("name"), egui::Sense::click());
+                let response = ui
+                    .interact(layout.name, wid.with("name"), egui::Sense::click())
+                    .affords(Affords::Press);
                 if response.double_clicked() {
                     rename_open = Some(i);
                 } else if response.clicked() {
@@ -6819,7 +6844,9 @@ fn arrangement_body(
             egui::vec2(116.0, 14.0),
         );
         let wid = ui.id().with("timeline_back_to_arr");
-        let response = ui.interact(chip, wid, egui::Sense::click());
+        let response = ui
+            .interact(chip, wid, egui::Sense::click())
+            .affords(Affords::Press);
         if response.clicked() {
             arr.force_recompile |= arr.session.stop_all();
         }
@@ -6945,7 +6972,9 @@ fn arrangement_body(
             egui::pos2(visible.right(), (body_bottom - grab).max(visible.top())),
         );
         let anchor_id = wid.with("anchor");
-        let picked = ui.interact(body, wid.with("body"), egui::Sense::click_and_drag());
+        let picked = ui
+            .interact(body, wid.with("body"), egui::Sense::click_and_drag())
+            .affords(Affords::Carry);
         if let Some(pos) = picked.interact_pointer_pos() {
             let here = snap(beat_at(content, offset, arr.pixels_per_beat, pos.x), grid);
             if picked.drag_started() || picked.clicked() {
@@ -7027,7 +7056,9 @@ fn arrangement_body(
             egui::pos2(lane.left(), lane.bottom() - grab),
             egui::pos2(lane.right(), lane.bottom() + grab),
         );
-        let response = ui.interact(seam, wid.with("seam"), egui::Sense::drag());
+        let response = ui
+            .interact(seam, wid.with("seam"), egui::Sense::drag())
+            .affords(Affords::SeamY);
         if response.dragged() {
             resize = Some((i, arr.tracks[i].height + response.drag_delta().y));
         }
@@ -7099,7 +7130,9 @@ fn arrangement_body(
     // the snapped click. Created BEFORE the brace and the locators, so
     // both of those win the pointer where they overlap it — an empty
     // stretch is exactly the part neither of them claims.
-    let scrub = ui.interact(ruler, ui.id().with("scrub"), egui::Sense::click());
+    let scrub = ui
+        .interact(ruler, ui.id().with("scrub"), egui::Sense::click())
+        .affords(Affords::Press);
     if scrub.clicked()
         && let Some(pos) = scrub.interact_pointer_pos()
     {
@@ -7578,7 +7611,9 @@ fn channel_fader(
     let id = ui
         .id()
         .with(("channel", rect.left() as i32, rect.top() as i32));
-    let response = ui.interact(rect, id, egui::Sense::click_and_drag());
+    let response = ui
+        .interact(rect, id, egui::Sense::click_and_drag())
+        .affords(Affords::Slide);
     let handle_h = 9.0f32.min(rect.height());
     let top = rect.top() + handle_h * 0.5;
     let bottom = rect.bottom() - handle_h * 0.5;
@@ -7710,7 +7745,9 @@ fn channel_fader(
     // Latched: it stays lit after the overload has passed, because the
     // whole point is to report one you were not watching. Click to clear.
     let lamp_id = id.with("lamp");
-    let lamp_response = ui.interact(lamp, lamp_id, egui::Sense::click());
+    let lamp_response = ui
+        .interact(lamp, lamp_id, egui::Sense::click())
+        .affords(Affords::Press);
     painter.rect_filled(
         lamp,
         1.5,
@@ -7843,7 +7880,9 @@ fn session_body(
     // hand rather than accumulating deltas.
     let seam = layout.mixer_seam();
     let seam_id = ui.id().with("mixer_seam");
-    let seam_response = ui.interact(seam, seam_id, egui::Sense::drag());
+    let seam_response = ui
+        .interact(seam, seam_id, egui::Sense::drag())
+        .affords(Affords::SeamY);
     if seam_response.hovered() || seam_response.dragged() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
     }
@@ -7924,7 +7963,9 @@ fn session_body(
             );
         }
         let head_id = ui.id().with(("session_head", t));
-        let head_response = ui.interact(head, head_id, egui::Sense::click_and_drag());
+        let head_response = ui
+            .interact(head, head_id, egui::Sense::click_and_drag())
+            .affords(Affords::Carry);
         if head_response.double_clicked() {
             intent = Some(SessionIntent::RenameTrack(t));
         } else if head_response.clicked() {
@@ -8002,7 +8043,9 @@ fn session_body(
             let picked = arr.session.selected == Some((t, scene));
             let wid = ui.id().with(("slot", t, scene));
             focus.register(wid, rect);
-            let response = ui.interact(rect, wid, egui::Sense::click_and_drag());
+            let response = ui
+                .interact(rect, wid, egui::Sense::click_and_drag())
+                .affords(Affords::Carry);
             if response.drag_started() && clip.is_some() {
                 // A slot's clip can be pulled to another slot. Ctrl
                 // carries a copy, like the timeline's clip drag; nothing
@@ -8132,7 +8175,9 @@ fn session_body(
         if stop.height() > 1.0 {
             let wid = ui.id().with(("session_stop", t));
             focus.register(wid, stop);
-            let response = ui.interact(stop, wid, egui::Sense::click());
+            let response = ui
+                .interact(stop, wid, egui::Sense::click())
+                .affords(Affords::Press);
             if response.clicked() || focus.activated(wid) {
                 intent = Some(SessionIntent::StopTrack(t));
             }
@@ -8410,7 +8455,9 @@ fn session_body(
     if session_active {
         let wid = ui.id().with("back_to_arrangement");
         focus.register(wid, header);
-        let response = ui.interact(header, wid, egui::Sense::click());
+        let response = ui
+            .interact(header, wid, egui::Sense::click())
+            .affords(Affords::Press);
         if response.clicked() || focus.activated(wid) {
             intent = Some(SessionIntent::StopAll);
         }
@@ -8466,7 +8513,9 @@ fn session_body(
             rect.min,
             egui::pos2(rect.left() + SLOT_LAUNCH_W, rect.bottom()),
         );
-        let response = ui.interact(rect, wid, egui::Sense::click());
+        let response = ui
+            .interact(rect, wid, egui::Sense::click())
+            .affords(Affords::Press);
         if let Some(pos) = response.interact_pointer_pos() {
             if response.double_clicked() && !launch_rect.contains(pos) {
                 intent = Some(SessionIntent::RenameScene(s));
@@ -8573,7 +8622,9 @@ fn session_body(
     if stop_all.height() > 1.0 {
         let wid = ui.id().with("session_stop_all");
         focus.register(wid, stop_all);
-        let response = ui.interact(stop_all, wid, egui::Sense::click());
+        let response = ui
+            .interact(stop_all, wid, egui::Sense::click())
+            .affords(Affords::Press);
         if response.clicked() || focus.activated(wid) {
             intent = Some(SessionIntent::StopAll);
         }
@@ -8602,7 +8653,9 @@ fn session_body(
     if add.height() > 1.0 {
         let wid = ui.id().with("session_add_scene");
         focus.register(wid, add);
-        let response = ui.interact(add, wid, egui::Sense::click());
+        let response = ui
+            .interact(add, wid, egui::Sense::click())
+            .affords(Affords::Press);
         if response.clicked() || focus.activated(wid) {
             intent = Some(SessionIntent::AddScene);
         }
@@ -8622,7 +8675,9 @@ fn session_body(
     // --- the scrollbar ------------------------------------------------------
     if let (Some(bar), Some(thumb)) = (layout.scrollbar(), layout.thumb()) {
         let id = ui.id().with("session_scrollbar");
-        let response = ui.interact(bar, id, egui::Sense::click_and_drag());
+        let response = ui
+            .interact(bar, id, egui::Sense::click_and_drag())
+            .affords(Affords::Sweep);
         if response.is_pointer_button_down_on()
             && let Some(pos) = response.interact_pointer_pos()
         {
@@ -8895,7 +8950,9 @@ fn minimap_pass(
     // Interact before painting, so the drawn window is where this frame's
     // grab put it.
     let id = ui.id().with("minimap");
-    let resp = ui.interact(strip, id, egui::Sense::click_and_drag());
+    let resp = ui
+        .interact(strip, id, egui::Sense::click_and_drag())
+        .affords(Affords::Sweep);
     if resp.hovered() && !resp.is_pointer_button_down_on() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
     }
@@ -9274,7 +9331,9 @@ fn clips_pass(
             // Interact BEFORE painting: the strips, created after the body,
             // sit above it in hit-test order, and the paint lands on top of
             // both in the same order it is issued.
-            let body = ui.interact(rect, body_id, egui::Sense::click_and_drag());
+            let body = ui
+                .interact(rect, body_id, egui::Sense::click_and_drag())
+                .affords(Affords::Carry);
             let command = ui.input(|i| i.modifiers.command);
             if body.drag_started() {
                 // Every drag rides a ghost. Plain drag moves the original
@@ -9366,7 +9425,9 @@ fn clips_pass(
                 );
                 for (side, strip) in [(0usize, left), (1usize, right)] {
                     let wid = ui.id().with(("clip_edge", clip.id, side));
-                    let resp = ui.interact(strip, wid, egui::Sense::drag());
+                    let resp = ui
+                        .interact(strip, wid, egui::Sense::drag())
+                        .affords(Affords::SeamX);
                     if resp.hovered() || resp.dragged() {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                     }
@@ -9405,7 +9466,9 @@ fn clips_pass(
                             egui::vec2(CLIP_FADE_GRIP, visual.title.height()),
                         );
                         let wid = ui.id().with(("clip_fade", clip.id, leading));
-                        let resp = ui.interact(grip, wid, egui::Sense::drag());
+                        let resp = ui
+                            .interact(grip, wid, egui::Sense::drag())
+                            .affords(Affords::Carry);
                         if resp.hovered() || resp.dragged() {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                         }
@@ -9942,7 +10005,9 @@ fn locators_pass(
             egui::pos2(x + 5.0, ruler.bottom()),
         );
         let wid = ui.id().with(("locator", index));
-        let response = ui.interact(flag, wid, egui::Sense::click_and_drag());
+        let response = ui
+            .interact(flag, wid, egui::Sense::click_and_drag())
+            .affords(Affords::Carry);
         if response.double_clicked() {
             rename_open = Some(index);
         } else if response.clicked() {
@@ -10105,7 +10170,9 @@ fn loop_brace(
     // The brace body carries the WHOLE loop. Created before the handles, so
     // the handles win the pointer wherever they overlap the body.
     let body_id = ui.id().with("loop_body");
-    let body = ui.interact(brace, body_id, egui::Sense::drag());
+    let body = ui
+        .interact(brace, body_id, egui::Sense::drag())
+        .affords(Affords::Carry);
     if body.hovered() || body.dragged() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
     }
@@ -10136,7 +10203,9 @@ fn loop_brace(
         );
         let wid = ui.id().with(("loop_handle", which));
         focus.register(wid, handle);
-        let response = ui.interact(handle, wid, egui::Sense::drag());
+        let response = ui
+            .interact(handle, wid, egui::Sense::drag())
+            .affords(Affords::SeamX);
         if response.hovered() || response.dragged() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
         }
@@ -10457,7 +10526,9 @@ fn tree(
         let wid = ui.id().with(("tree_row", index));
         focus.register(wid, row);
         if *is_folder {
-            let response = ui.interact(row, wid, egui::Sense::click());
+            let response = ui
+                .interact(row, wid, egui::Sense::click())
+                .affords(Affords::Press);
             if response.hovered() {
                 ui.painter().rect_filled(row, 0.0, theme.accent_muted);
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -10470,7 +10541,9 @@ fn tree(
             // keyboard ring. Single click only points at it — loading a
             // device is a commitment, and a stray click on a list should
             // not rewire a track.
-            let response = ui.interact(row, wid, egui::Sense::click());
+            let response = ui
+                .interact(row, wid, egui::Sense::click())
+                .affords(Affords::Press);
             if response.hovered() {
                 ui.painter().rect_filled(row, 0.0, theme.accent_muted);
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -10614,7 +10687,9 @@ fn catalog_tree(
         let wid = ui.id().with(("catalog_location", id));
         focus.register(wid, visible);
         let active = browser.location.as_deref() == id;
-        let response = ui.interact(visible, wid, egui::Sense::click());
+        let response = ui
+            .interact(visible, wid, egui::Sense::click())
+            .affords(Affords::Press);
         if response.hovered() || active {
             ui.painter().rect_filled(
                 visible,
@@ -10684,7 +10759,9 @@ fn catalog_tree(
         focus.register(wid, visible);
         let active = browser.location.as_deref() == Some(&folder.location_id)
             && browser.folder.as_deref() == Some(folder.relative_path.as_path());
-        let response = ui.interact(visible, wid, egui::Sense::click());
+        let response = ui
+            .interact(visible, wid, egui::Sense::click())
+            .affords(Affords::Press);
         if response.hovered() || active {
             ui.painter().rect_filled(
                 visible,
@@ -10767,7 +10844,9 @@ fn catalog_tree(
         let visible = row.intersect(viewport);
         let wid = ui.id().with(("catalog_asset", &asset.path));
         focus.register(wid, visible);
-        let response = ui.interact(visible, wid, egui::Sense::click_and_drag());
+        let response = ui
+            .interact(visible, wid, egui::Sense::click_and_drag())
+            .affords(Affords::Carry);
         // A row can be pulled straight onto the timeline. The arrangement's
         // drop ghost is the drag visual, so the row itself stays put.
         response.dnd_set_drag_payload(SampleDrag(asset.path.clone()));
@@ -10981,7 +11060,9 @@ fn browser_body(
         egui::pos2(upper.left(), upper.bottom() - grab),
         egui::pos2(upper.right(), upper.bottom() + grab),
     );
-    let response = ui.interact(hit, ui.id().with("browser_split"), egui::Sense::drag());
+    let response = ui
+        .interact(hit, ui.id().with("browser_split"), egui::Sense::drag())
+        .affords(Affords::SeamX);
     if let Some(pointer) = response.interact_pointer_pos() {
         browser.split = split_from_pointer(area, pointer.y);
     }
@@ -11261,7 +11342,9 @@ fn mod_strip(ui: &mut egui::Ui, theme: &Theme, strip: ModStrip<'_>, collapsed: &
                                      id: egui::Id,
                                      text: String,
                                      on: bool| {
-                                        let response = ui.interact(rect, id, egui::Sense::click());
+                                        let response = ui
+                                            .interact(rect, id, egui::Sense::click())
+                                            .affords(Affords::Press);
                                         let painter = ui.painter();
                                         painter.rect_filled(
                                             rect,
@@ -11359,7 +11442,9 @@ fn mod_strip(ui: &mut egui::Ui, theme: &Theme, strip: ModStrip<'_>, collapsed: &
                             egui::vec2(13.0, 13.0),
                         );
                         let wire_id = ui.id().with(("mod_wire", modulator.id));
-                        let wire_response = ui.interact(wire_rect, wire_id, egui::Sense::click());
+                        let wire_response = ui
+                            .interact(wire_rect, wire_id, egui::Sense::click())
+                            .affords(Affords::Press);
                         painter.text(
                             wire_rect.center(),
                             egui::Align2::CENTER_CENTER,
@@ -11390,7 +11475,9 @@ fn mod_strip(ui: &mut egui::Ui, theme: &Theme, strip: ModStrip<'_>, collapsed: &
                             egui::vec2(13.0, 13.0),
                         );
                         let x_id = ui.id().with(("mod_x", modulator.id));
-                        let x_response = ui.interact(x_rect, x_id, egui::Sense::click());
+                        let x_response = ui
+                            .interact(x_rect, x_id, egui::Sense::click())
+                            .affords(Affords::Press);
                         if x_response.clicked() {
                             remove = Some(modulator.id);
                         }
@@ -11470,7 +11557,11 @@ fn mod_strip(ui: &mut egui::Ui, theme: &Theme, strip: ModStrip<'_>, collapsed: &
                         egui::vec2(9.0, 9.0),
                     );
                     let dot_id = ui.id().with(("wire_on", wire.id));
-                    if ui.interact(dot, dot_id, egui::Sense::click()).clicked() {
+                    if ui
+                        .interact(dot, dot_id, egui::Sense::click())
+                        .affords(Affords::Press)
+                        .clicked()
+                    {
                         wire.enabled = !wire.enabled;
                     }
                     if wire.enabled {
@@ -11487,7 +11578,11 @@ fn mod_strip(ui: &mut egui::Ui, theme: &Theme, strip: ModStrip<'_>, collapsed: &
                         egui::vec2(10.0, 11.0),
                     );
                     let solo_id = ui.id().with(("wire_solo", wire.id));
-                    if ui.interact(solo, solo_id, egui::Sense::click()).clicked() {
+                    if ui
+                        .interact(solo, solo_id, egui::Sense::click())
+                        .affords(Affords::Press)
+                        .clicked()
+                    {
                         wire.solo = !wire.solo;
                     }
                     painter.text(
@@ -11508,7 +11603,9 @@ fn mod_strip(ui: &mut egui::Ui, theme: &Theme, strip: ModStrip<'_>, collapsed: &
                         egui::pos2(row.left() + 150.0, row.bottom()),
                     );
                     let label_id = ui.id().with(("wire_label", wire.id));
-                    let label_response = ui.interact(label, label_id, egui::Sense::click());
+                    let label_response = ui
+                        .interact(label, label_id, egui::Sense::click())
+                        .affords(Affords::Press);
                     if label_response.clicked() {
                         *strip.expanded = if *strip.expanded == Some(wire.id) {
                             None
@@ -11536,7 +11633,9 @@ fn mod_strip(ui: &mut egui::Ui, theme: &Theme, strip: ModStrip<'_>, collapsed: &
                         egui::pos2(row.right() - 18.0, row.bottom() - 5.0),
                     );
                     let slider_id = ui.id().with(("mod_depth", wire.id));
-                    let response = ui.interact(slider, slider_id, egui::Sense::click_and_drag());
+                    let response = ui
+                        .interact(slider, slider_id, egui::Sense::click_and_drag())
+                        .affords(Affords::Sweep);
                     if response.double_clicked() {
                         wire.depth = 0.0;
                     } else if response.dragged()
@@ -11581,7 +11680,9 @@ fn mod_strip(ui: &mut egui::Ui, theme: &Theme, strip: ModStrip<'_>, collapsed: &
                         egui::vec2(12.0, 12.0),
                     );
                     let x_id = ui.id().with(("mod_wire_x", wire.id));
-                    let x_response = ui.interact(x_rect, x_id, egui::Sense::click());
+                    let x_response = ui
+                        .interact(x_rect, x_id, egui::Sense::click())
+                        .affords(Affords::Press);
                     if x_response.clicked() {
                         remove_wire = Some(index);
                     }
@@ -11652,7 +11753,9 @@ fn mod_strip(ui: &mut egui::Ui, theme: &Theme, strip: ModStrip<'_>, collapsed: &
                         };
                         let crv = micro(0);
                         let crv_id = ui.id().with(("wire_crv", wire.id));
-                        let crv_response = ui.interact(crv, crv_id, egui::Sense::click_and_drag());
+                        let crv_response = ui
+                            .interact(crv, crv_id, egui::Sense::click_and_drag())
+                            .affords(Affords::Sweep);
                         if crv_response.double_clicked() {
                             wire.curve = 0.0;
                         } else if crv_response.dragged() {
@@ -11673,7 +11776,11 @@ fn mod_strip(ui: &mut egui::Ui, theme: &Theme, strip: ModStrip<'_>, collapsed: &
                         );
                         let stp = micro(1);
                         let stp_id = ui.id().with(("wire_stp", wire.id));
-                        if ui.interact(stp, stp_id, egui::Sense::click()).clicked() {
+                        if ui
+                            .interact(stp, stp_id, egui::Sense::click())
+                            .affords(Affords::Press)
+                            .clicked()
+                        {
                             const LADDER: [u32; 6] = [0, 2, 3, 4, 8, 16];
                             let at = LADDER
                                 .iter()
@@ -11699,7 +11806,9 @@ fn mod_strip(ui: &mut egui::Ui, theme: &Theme, strip: ModStrip<'_>, collapsed: &
                         );
                         let lag = micro(2);
                         let lag_id = ui.id().with(("wire_lag", wire.id));
-                        let lag_response = ui.interact(lag, lag_id, egui::Sense::click_and_drag());
+                        let lag_response = ui
+                            .interact(lag, lag_id, egui::Sense::click_and_drag())
+                            .affords(Affords::Sweep);
                         if lag_response.double_clicked() {
                             wire.smooth_ms = 0.0;
                         } else if lag_response.dragged() {
@@ -12169,7 +12278,9 @@ fn device_body(
         // exists — collapsed must not mean forgotten — and one click to
         // reopen.
         let id = ui.id().with("mod_tab");
-        let response = ui.interact(strip_rect, id, egui::Sense::click());
+        let response = ui
+            .interact(strip_rect, id, egui::Sense::click())
+            .affords(Affords::Press);
         if response.clicked() {
             *mod_collapsed = false;
         }
@@ -15263,7 +15374,9 @@ impl App {
                     egui::vec2(CELL_W, CELL_H),
                 );
                 let id = ui.id().with(("matrix", modulator.id, at));
-                let response = ui.interact(cell, id, egui::Sense::click_and_drag());
+                let response = ui
+                    .interact(cell, id, egui::Sense::click_and_drag())
+                    .affords(Affords::Steer);
                 let wire = self.arrangement.mod_wires.iter().find(|wire| {
                     wire.source == modulator.id && wire.track == *track && wire.target == *target
                 });

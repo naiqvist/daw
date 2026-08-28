@@ -9,6 +9,7 @@
 //! - [`pitch_stack`] keeps octave, semitone and fine tuning in one hierarchy.
 //! - [`unison_field`] makes detune and stereo spread visible as voice dots.
 
+use crate::ui::affordance::{Afford, Affords};
 use crate::ui::device::adjust;
 use crate::ui::device::design;
 use crate::ui::device::metrics::Footprint;
@@ -239,11 +240,13 @@ pub fn wave_display(
     } else {
         rect
     };
-    let response = ui.interact(
-        plot_rect,
-        ui.id().with("poly-wave-display"),
-        egui::Sense::click(),
-    );
+    let response = ui
+        .interact(
+            plot_rect,
+            ui.id().with("poly-wave-display"),
+            egui::Sense::click(),
+        )
+        .affords(Affords::Press);
     let current = wave_index(*norm);
     let mut want = current as i32;
     let arrow_w = theme.sp(space::XL);
@@ -965,11 +968,13 @@ pub fn wave_hero(
                 },
             )
             .expand(theme.sp(space::XXS));
-        let response = ui.interact(
-            galley_rect,
-            ui.id().with(("hero-osc-tag", which)),
-            egui::Sense::click(),
-        );
+        let response = ui
+            .interact(
+                galley_rect,
+                ui.id().with(("hero-osc-tag", which)),
+                egui::Sense::click(),
+            )
+            .affords(Affords::Press);
         if response.clicked() && which != selected {
             clicked = Some(which);
         }
@@ -1395,11 +1400,13 @@ pub fn noise_glyph(
             },
         )
         .expand(theme.sp(space::XXS));
-    let db_resp = ui.interact(
-        db_rect,
-        ui.id().with("noise-level"),
-        egui::Sense::click_and_drag(),
-    );
+    let db_resp = ui
+        .interact(
+            db_rect,
+            ui.id().with("noise-level"),
+            egui::Sense::click_and_drag(),
+        )
+        .affords(Affords::Slide);
     if db_resp.double_clicked() {
         *level = level_param.default_norm;
     } else if db_resp.dragged() {
@@ -1443,11 +1450,13 @@ pub fn noise_glyph(
             },
         )
         .expand(theme.sp(space::XXS));
-    let color_resp = ui.interact(
-        color_rect,
-        ui.id().with("noise-color"),
-        egui::Sense::click(),
-    );
+    let color_resp = ui
+        .interact(
+            color_rect,
+            ui.id().with("noise-color"),
+            egui::Sense::click(),
+        )
+        .affords(Affords::Press);
     if color_resp.clicked() {
         let count = color_param.choices().unwrap_or(2) as usize;
         *color = color_param.at_index((color_param.index(*color) + 1) % count);
@@ -1577,7 +1586,9 @@ pub fn voice_glyph(
             theme.text_muted,
         )
         .expand(theme.sp(space::XXS));
-    let mode_resp = ui.interact(mode_rect, ui.id().with("voice-mode"), egui::Sense::click());
+    let mode_resp = ui
+        .interact(mode_rect, ui.id().with("voice-mode"), egui::Sense::click())
+        .affords(Affords::Press);
     if mode_resp.clicked() {
         let count = mode_param.choices().unwrap_or(3) as usize;
         *mode = mode_param.at_index((mode_param.index(*mode) + 1) % count);
@@ -1619,11 +1630,13 @@ pub fn voice_glyph(
                 step_rect.max,
             )
         };
-        let resp = ui.interact(
-            zone,
-            ui.id().with(("voice-count", half)),
-            egui::Sense::click(),
-        );
+        let resp = ui
+            .interact(
+                zone,
+                ui.id().with(("voice-count", half)),
+                egui::Sense::click(),
+            )
+            .affords(Affords::Press);
         if resp.clicked() && ok {
             *unison = unison_param.at_index((at + delta).max(0) as usize);
         }
@@ -1838,7 +1851,9 @@ pub fn corner_slide(
     let rect = align
         .anchor_size(anchor, probe.size())
         .expand(theme.sp(space::XXS));
-    let resp = ui.interact(rect, ui.id().with(id_salt), egui::Sense::click_and_drag());
+    let resp = ui
+        .interact(rect, ui.id().with(id_salt), egui::Sense::click_and_drag())
+        .affords(Affords::Steer);
     if resp.double_clicked() {
         *norm = default;
     } else if resp.dragged() {
@@ -1905,7 +1920,9 @@ pub fn dial_control(
     let before = *norm;
     let d = theme.sp(control::POLY_DIAL);
     let rect = egui::Rect::from_center_size(center, egui::vec2(d, d));
-    let resp = ui.interact(rect, ui.id().with(id_salt), egui::Sense::click_and_drag());
+    let resp = ui
+        .interact(rect, ui.id().with(id_salt), egui::Sense::click_and_drag())
+        .affords(Affords::Slide);
     if resp.double_clicked() {
         *norm = param.default_norm;
     } else if resp.dragged() {
@@ -1976,7 +1993,9 @@ pub fn corner_menu(
     let rect = align
         .anchor_size(anchor, probe.size())
         .expand(theme.sp(space::XXS));
-    let resp = ui.interact(rect, ui.id().with(id_salt), egui::Sense::click());
+    let resp = ui
+        .interact(rect, ui.id().with(id_salt), egui::Sense::click())
+        .affords(Affords::Press);
     let live = resp.hovered() || resp.has_focus();
     painter.text(
         anchor,
@@ -2278,11 +2297,13 @@ pub fn pitch_stack(
             egui::pos2(rect.left() + width * i as f32, rect.top()),
             egui::vec2(width, rect.height()),
         );
-        let response = ui.interact(
-            band,
-            ui.id().with(("pitch-stack", i)),
-            egui::Sense::click_and_drag(),
-        );
+        let response = ui
+            .interact(
+                band,
+                ui.id().with(("pitch-stack", i)),
+                egui::Sense::click_and_drag(),
+            )
+            .affords(Affords::Slide);
         let before = *norm;
         if response.double_clicked() {
             *norm = 0.5;

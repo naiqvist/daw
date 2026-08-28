@@ -9,6 +9,9 @@ mod ui {
     pub mod device {
         pub use daw::ui::device::probe;
     }
+    // The affordance rule is the app's, not this module's — the same
+    // shim the probe rides, for the same reason.
+    pub use daw::ui::affordance;
 }
 
 #[test]

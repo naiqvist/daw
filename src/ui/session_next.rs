@@ -13,6 +13,7 @@
 //! edited concurrently. `tests/session_next.rs` compiles and exercises it as a
 //! standalone module.
 
+use crate::ui::affordance::{Afford, Affords};
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -2103,11 +2104,13 @@ pub fn show_session(
     );
 
     let seam = layout.mixer_seam();
-    let seam_response = ui.interact(
-        seam,
-        ui.id().with("session_next_mixer_seam"),
-        egui::Sense::drag(),
-    );
+    let seam_response = ui
+        .interact(
+            seam,
+            ui.id().with("session_next_mixer_seam"),
+            egui::Sense::drag(),
+        )
+        .affords(Affords::SeamY);
     if seam_response.dragged()
         && let Some(position) = seam_response.interact_pointer_pos()
     {
@@ -2363,7 +2366,9 @@ fn paint_control_strip(
         egui::pos2(m1_rect.left() - gap, top + height),
     );
     let morph_id = ui.id().with("session_next_memory_morph");
-    let morph = ui.interact(morph_rect, morph_id, egui::Sense::click_and_drag());
+    let morph = ui
+        .interact(morph_rect, morph_id, egui::Sense::click_and_drag())
+        .affords(Affords::Sweep);
     ui.painter().line_segment(
         [morph_rect.left_center(), morph_rect.right_center()],
         egui::Stroke::new(1.0, colors.divider),
@@ -2398,7 +2403,9 @@ fn control_button(
     role: egui::Color32,
     colors: &SessionColors,
 ) -> egui::Response {
-    let response = ui.interact(rect, id, egui::Sense::click_and_drag());
+    let response = ui
+        .interact(rect, id, egui::Sense::click_and_drag())
+        .affords(Affords::Press);
     let fill = if active || response.is_pointer_button_down_on() {
         role.gamma_multiply(0.78)
     } else if response.hovered() {
@@ -2440,7 +2447,9 @@ fn paint_track_header(
     );
     let body_rect = egui::Rect::from_min_max(rect.min, egui::pos2(grip_rect.left(), rect.bottom()));
     let id = ui.id().with(("session_next_track", track.id.0));
-    let response = ui.interact(body_rect, id, egui::Sense::click());
+    let response = ui
+        .interact(body_rect, id, egui::Sense::click())
+        .affords(Affords::Press);
     if response.clicked() {
         state.selection = Some(GridSelection::Track(track_index));
         state.owns_keyboard = true;
@@ -2486,11 +2495,13 @@ fn paint_track_header(
             ),
             egui::vec2(FOLD_HANDLE, FOLD_HANDLE),
         );
-        let response = ui.interact(
-            handle,
-            ui.id().with(("session_next_fold", track_index)),
-            egui::Sense::click(),
-        );
+        let response = ui
+            .interact(
+                handle,
+                ui.id().with(("session_next_fold", track_index)),
+                egui::Sense::click(),
+            )
+            .affords(Affords::Press);
         if response.clicked() {
             intents.push(SessionIntent::ToggleTrackFold(track_index));
         }
@@ -2579,7 +2590,9 @@ fn paint_track_header(
         colors.muted,
     );
     let grip_id = ui.id().with(("session_next_track_grip", track.id.0));
-    let grip = ui.interact(grip_rect, grip_id, egui::Sense::drag());
+    let grip = ui
+        .interact(grip_rect, grip_id, egui::Sense::drag())
+        .affords(Affords::Carry);
     if grip.drag_started() {
         state.track_drag = Some(TrackDragState {
             from: track_index,
@@ -2693,7 +2706,9 @@ fn paint_slot(
     // Body first, launch rail second. Their rectangles do not overlap, but
     // the order makes foreground ownership explicit if geometry changes.
     let body_id = ui.id().with(("session_next_slot_body", track, scene));
-    let body = ui.interact(body_rect, body_id, egui::Sense::click_and_drag());
+    let body = ui
+        .interact(body_rect, body_id, egui::Sense::click_and_drag())
+        .affords(Affords::Carry);
     if body.clicked() {
         state.selection = Some(GridSelection::Slot { track, scene });
         state.owns_keyboard = true;
@@ -2711,7 +2726,9 @@ fn paint_slot(
     }
 
     let launch_id = ui.id().with(("session_next_slot_launch", track, scene));
-    let launch = ui.interact(launch_rect, launch_id, egui::Sense::click());
+    let launch = ui
+        .interact(launch_rect, launch_id, egui::Sense::click())
+        .affords(Affords::Press);
     if launch.clicked() {
         match slot {
             Slot::Clip(_) => intents.push(SessionIntent::LaunchSlot { track, scene }),
@@ -2956,7 +2973,9 @@ fn paint_stop_track(
     intents: &mut Vec<SessionIntent>,
 ) {
     let id = ui.id().with(("session_next_stop_track", track));
-    let response = ui.interact(rect, id, egui::Sense::click());
+    let response = ui
+        .interact(rect, id, egui::Sense::click())
+        .affords(Affords::Press);
     if response.clicked() {
         intents.push(SessionIntent::StopTrack {
             track,
@@ -3293,7 +3312,9 @@ fn pan_control(
     pan: f32,
     colors: &SessionColors,
 ) -> Option<f32> {
-    let response = ui.interact(rect, id, egui::Sense::click_and_drag());
+    let response = ui
+        .interact(rect, id, egui::Sense::click_and_drag())
+        .affords(Affords::Sweep);
     let moved = if response.double_clicked() {
         Some(0.0)
     } else if response.dragged() {
@@ -3438,7 +3459,9 @@ fn paint_level_column(
     }
 
     // The fader.
-    let response = ui.interact(strip.fader, id.with("fader"), egui::Sense::click_and_drag());
+    let response = ui
+        .interact(strip.fader, id.with("fader"), egui::Sense::click_and_drag())
+        .affords(Affords::Slide);
     if response.double_clicked() {
         edit.volume = Some(1.0);
     } else if response.dragged() {
@@ -3501,7 +3524,9 @@ fn paint_level_column(
         );
     }
     if let Some(row) = strip.peak {
-        let response = ui.interact(row, id.with("peak"), egui::Sense::click());
+        let response = ui
+            .interact(row, id.with("peak"), egui::Sense::click())
+            .affords(Affords::Press);
         edit.clear_peak = response.clicked();
         ui.painter().rect_filled(
             row,
@@ -3535,6 +3560,7 @@ fn paint_level_column(
         );
         if ui
             .interact(lamp.expand(3.0), id.with("lamp"), egui::Sense::click())
+            .affords(Affords::Press)
             .clicked()
         {
             edit.clear_peak = true;
@@ -3676,11 +3702,20 @@ fn paint_mixer(
             "monitor: off, in, auto · auto hears the input while the lane is armed · headphones first",
         );
 
-        let response = ui.interact(
-            route,
-            ui.id().with(("session_next_route", track_index)),
-            egui::Sense::click(),
-        );
+        // A route cell with no interface behind it is PRESENT and
+        // refused, which is a different thing from absent — so it says
+        // so under the pointer rather than looking broken.
+        let response = ui
+            .interact(
+                route,
+                ui.id().with(("session_next_route", track_index)),
+                egui::Sense::click(),
+            )
+            .affords(if routable {
+                Affords::Press
+            } else {
+                Affords::Refuse
+            });
         if response.clicked() {
             intents.push(SessionIntent::CycleTrackInput {
                 track: track_index,
@@ -3816,7 +3851,9 @@ fn send_row(
         ),
     );
     let bar = egui::Rect::from_min_max(egui::pos2(letter.right(), rect.top()), rect.max);
-    let response = ui.interact(bar, id, egui::Sense::click_and_drag());
+    let response = ui
+        .interact(bar, id, egui::Sense::click_and_drag())
+        .affords(Affords::Sweep);
     let moved = if response.double_clicked() {
         Some(0.0)
     } else if response.dragged() {
@@ -3912,11 +3949,13 @@ fn paint_return_strip(
     // solo — and the letter is the thing a send row is pointing at, so
     // it is the one label that must be visible from across the room.
     let head = egui::Rect::from_min_max(strip.mute.left_top(), strip.solo.right_bottom());
-    let response = ui.interact(
-        head,
-        ui.id().with(("session_next_return_head", index)),
-        egui::Sense::click(),
-    );
+    let response = ui
+        .interact(
+            head,
+            ui.id().with(("session_next_return_head", index)),
+            egui::Sense::click(),
+        )
+        .affords(Affords::Press);
     if response.clicked() {
         intents.push(SessionIntent::SelectReturn(index));
     }
@@ -4027,7 +4066,9 @@ fn paint_scene_column(
                 .is_some_and(|pending| !matches!(pending.action, PendingTrackAction::Arrangement))
     });
     let back_id = ui.id().with("session_next_back_to_arrangement");
-    let back = ui.interact(header.shrink(4.0), back_id, egui::Sense::click());
+    let back = ui
+        .interact(header.shrink(4.0), back_id, egui::Sense::click())
+        .affords(Affords::Press);
     if back.clicked() {
         intents.push(SessionIntent::BackToArrangement);
     }
@@ -4114,14 +4155,18 @@ fn paint_scene_column(
             );
         }
         let body_id = ui.id().with(("session_next_scene_body", scene.id.0));
-        let body = ui.interact(body_rect, body_id, egui::Sense::click());
+        let body = ui
+            .interact(body_rect, body_id, egui::Sense::click())
+            .affords(Affords::Press);
         if body.clicked() {
             state.selection = Some(GridSelection::Scene(scene_index));
             state.owns_keyboard = true;
             intents.push(SessionIntent::SelectScene(scene_index));
         }
         let launch_id = ui.id().with(("session_next_scene_launch", scene.id.0));
-        let launch = ui.interact(launch_rect, launch_id, egui::Sense::click());
+        let launch = ui
+            .interact(launch_rect, launch_id, egui::Sense::click())
+            .affords(Affords::Press);
         if launch.clicked() {
             intents.push(SessionIntent::LaunchScene(scene_index));
             state.owns_keyboard = true;
@@ -4129,7 +4174,9 @@ fn paint_scene_column(
         paint_scene_triangle(ui.painter(), launch_rect, active, launch.hovered(), colors);
         paint_scene_text(ui.painter(), body_rect, scene_index, scene, active, colors);
         let grip_id = ui.id().with(("session_next_scene_grip", scene.id.0));
-        let grip = ui.interact(grip_rect, grip_id, egui::Sense::drag());
+        let grip = ui
+            .interact(grip_rect, grip_id, egui::Sense::drag())
+            .affords(Affords::Carry);
         if grip.drag_started() {
             state.scene_drag = Some(SceneDragState {
                 from: scene_index,
@@ -4153,7 +4200,9 @@ fn paint_scene_column(
     let stop_all = layout.stop_all().intersect(rows_clip);
     if stop_all.height() > 1.0 {
         let id = ui.id().with("session_next_stop_all");
-        let response = ui.interact(stop_all, id, egui::Sense::click());
+        let response = ui
+            .interact(stop_all, id, egui::Sense::click())
+            .affords(Affords::Press);
         if response.clicked() {
             intents.push(SessionIntent::StopAll);
         }
@@ -4182,7 +4231,9 @@ fn paint_scene_column(
     let add = layout.add_scene().intersect(rows_clip);
     if add.height() > 1.0 {
         let id = ui.id().with("session_next_add_scene");
-        let response = ui.interact(add, id, egui::Sense::click());
+        let response = ui
+            .interact(add, id, egui::Sense::click())
+            .affords(Affords::Press);
         if response.clicked() {
             let below = match state.selection {
                 Some(GridSelection::Scene(scene)) => scene,
@@ -4312,7 +4363,9 @@ fn paint_scrollbar(
         egui::vec2(thumb_width, bar.height()),
     );
     let id = ui.id().with("session_next_scrollbar");
-    let response = ui.interact(bar, id, egui::Sense::click_and_drag());
+    let response = ui
+        .interact(bar, id, egui::Sense::click_and_drag())
+        .affords(Affords::Sweep);
     if (response.dragged() || response.clicked())
         && let Some(position) = response.interact_pointer_pos()
         && travel > 0.0

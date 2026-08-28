@@ -41,6 +41,7 @@
 //! breaks the symmetry, because a bias control that did not would be a
 //! knob that does nothing.
 
+use crate::ui::affordance::{Afford, Affords};
 use crate::ui::device::metrics::Footprint;
 use crate::ui::device::{Unit, adjust, design};
 use crate::ui::theme::Theme;
@@ -305,11 +306,13 @@ pub fn transfer_plot(ui: &mut egui::Ui, theme: &Theme, shaper: &mut Shaper) -> b
     let rect = egui::Rect::from_center_size(outer.center(), egui::vec2(side, side));
     // Interaction follows the SQUARE, not the well: the empty ground
     // beside it is not part of the control.
-    let response = ui.interact(
-        rect,
-        ui.id().with("transfer-curve"),
-        egui::Sense::click_and_drag(),
-    );
+    let response = ui
+        .interact(
+            rect,
+            ui.id().with("transfer-curve"),
+            egui::Sense::click_and_drag(),
+        )
+        .affords(Affords::Steer);
     draw_transfer(ui, theme, shaper, rect, &response, false)
 }
 

@@ -167,6 +167,7 @@
 //!   than one parked at the origin. [`PianoRoll::take_locate`] is the
 //!   other half of that handshake, waiting for a caller.
 
+use daw::ui::affordance::{Afford, Affords};
 use daw::ui::theme::Theme;
 use daw::ui::tokens::{font, radius, space, stroke};
 use eframe::egui;
@@ -3663,11 +3664,13 @@ fn plock_overlay(
             egui::pos2(inner.left(), inner.top() + vis as f32 * ROW_H_PX),
             egui::vec2(inner.width(), ROW_H_PX),
         );
-        let resp = ui.interact(
-            r,
-            ui.id().with(("plock-row", row)),
-            egui::Sense::click_and_drag(),
-        );
+        let resp = ui
+            .interact(
+                r,
+                ui.id().with(("plock-row", row)),
+                egui::Sense::click_and_drag(),
+            )
+            .affords(Affords::Steer);
         if resp.clicked() {
             pr.plock_view = Some((note_idx, row));
         }
@@ -3842,11 +3845,13 @@ fn trig_overlay(ui: &mut egui::Ui, theme: &Theme, pr: &mut PianoRoll, notes: &mu
             egui::pos2(inner.left(), inner.top() + row as f32 * ROW_H_PX),
             egui::vec2(inner.width(), ROW_H_PX),
         );
-        let resp = ui.interact(
-            r,
-            ui.id().with(("trig-row", row)),
-            egui::Sense::click_and_drag(),
-        );
+        let resp = ui
+            .interact(
+                r,
+                ui.id().with(("trig-row", row)),
+                egui::Sense::click_and_drag(),
+            )
+            .affords(Affords::Press);
         if resp.clicked() || resp.dragged() {
             pr.trig_view = Some((note_idx, row));
         }
@@ -4874,11 +4879,13 @@ pub fn body_at(
     // nothing is re-decided after the button goes down, so a drag that
     // crosses a neighbour, pins at a limit, or leaves the panel entirely
     // still belongs to whatever it began on. The pointer tests prove it.
-    let resp = ui.interact(
-        lay.grid,
-        ui.id().with("pr_grid"),
-        egui::Sense::click_and_drag(),
-    );
+    let resp = ui
+        .interact(
+            lay.grid,
+            ui.id().with("pr_grid"),
+            egui::Sense::click_and_drag(),
+        )
+        .affords(Affords::Draw);
     let mut band: Option<egui::Rect> = None;
 
     if let Some(ns) = notes.as_deref_mut() {
@@ -5626,7 +5633,9 @@ fn loop_bar(
 
     // --- the toggle -------------------------------------------------
     let toggle = egui::Rect::from_min_size(bar.min, egui::vec2(LOOP_TOGGLE_W, bar.height()));
-    let t = ui.interact(toggle, ui.id().with("pr_loop_toggle"), egui::Sense::click());
+    let t = ui
+        .interact(toggle, ui.id().with("pr_loop_toggle"), egui::Sense::click())
+        .affords(Affords::Press);
     if t.clicked() {
         *span.loop_on = !*span.loop_on;
         // Turning it on with no brace set adopts the whole clip, so the
@@ -5685,7 +5694,9 @@ fn loop_bar(
         // Body drag: move the whole brace, keeping its length.
         let inner = body.shrink2(egui::vec2(LOOP_GRIP_W, 0.0));
         if inner.width() > 1.0 {
-            let m = ui.interact(inner, ui.id().with("pr_brace_move"), egui::Sense::drag());
+            let m = ui
+                .interact(inner, ui.id().with("pr_brace_move"), egui::Sense::drag())
+                .affords(Affords::Carry);
             if m.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
             }
@@ -5720,7 +5731,9 @@ fn loop_bar(
                 egui::pos2(x - LOOP_GRIP_W * 0.5, bar.top()),
                 egui::vec2(LOOP_GRIP_W, bar.height()),
             );
-            let h = ui.interact(grip, ui.id().with(name), egui::Sense::drag());
+            let h = ui
+                .interact(grip, ui.id().with(name), egui::Sense::drag())
+                .affords(Affords::SeamX);
             if h.hovered() || h.dragged() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                 painter.rect_filled(grip, 0.0, theme.accent);
@@ -5750,7 +5763,9 @@ fn loop_bar(
         egui::pos2(end_x - LOOP_GRIP_W * 0.5, bar.top()),
         egui::vec2(LOOP_GRIP_W, bar.height()),
     );
-    let e = ui.interact(grip, ui.id().with("pr_clip_end"), egui::Sense::drag());
+    let e = ui
+        .interact(grip, ui.id().with("pr_clip_end"), egui::Sense::drag())
+        .affords(Affords::SeamX);
     if e.hovered() || e.dragged() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
     }
@@ -5799,11 +5814,13 @@ fn ruler(
     head: Option<f64>,
     grid_beats: f64,
 ) {
-    let resp = ui.interact(
-        rect,
-        ui.id().with("pr_ruler"),
-        egui::Sense::click_and_drag(),
-    );
+    let resp = ui
+        .interact(
+            rect,
+            ui.id().with("pr_ruler"),
+            egui::Sense::click_and_drag(),
+        )
+        .affords(Affords::Press);
     // Click or scrub: the cursor moves, and a locate request is left for
     // the app to pick up. The roll cannot move the transport itself — it
     // does not own one — so it asks, and clears the ask when it is taken.
@@ -5895,7 +5912,9 @@ fn gutter(
     g: Geom,
     notes: Option<&[Note]>,
 ) {
-    let resp = ui.interact(rect, ui.id().with("pr_keys"), egui::Sense::click_and_drag());
+    let resp = ui
+        .interact(rect, ui.id().with("pr_keys"), egui::Sense::click_and_drag())
+        .affords(Affords::Slide);
     if (resp.clicked() || resp.dragged())
         && let Some(at) = resp.interact_pointer_pos()
         && let Some(pitch) = g.over(rect).pitch_at(at.y)
@@ -5996,7 +6015,9 @@ fn tool_strip(
             egui::Rect::from_min_size(egui::pos2(rect.left(), top), egui::vec2(rect.width(), cell));
         // One target, one interaction, its own id — the device UI
         // contract's rule 1, in the place it is cheapest to obey.
-        let resp = ui.interact(button, ui.id().with(("pr_tool", n)), egui::Sense::click());
+        let resp = ui
+            .interact(button, ui.id().with(("pr_tool", n)), egui::Sense::click())
+            .affords(Affords::Press);
         if resp.clicked() {
             pr.tool = tool;
         }
@@ -6044,11 +6065,13 @@ fn expression_lane(
     let lg = g.over(body_rect);
 
     // --- the gutter: name, and a click that collapses ------------------
-    let head_resp = ui.interact(
-        gutter_rect,
-        ui.id().with(("pr_lane_head", idx)),
-        egui::Sense::click(),
-    );
+    let head_resp = ui
+        .interact(
+            gutter_rect,
+            ui.id().with(("pr_lane_head", idx)),
+            egui::Sense::click(),
+        )
+        .affords(Affords::Press);
     if head_resp.clicked() {
         // Plain click folds the lane to its header; Ctrl+click closes it
         // altogether. Same grammar as everywhere else: Ctrl removes.
@@ -6070,11 +6093,13 @@ fn expression_lane(
         egui::pos2(gutter_rect.left(), gutter_rect.top() - LANE_EDGE_W * 0.5),
         egui::pos2(body_rect.right(), gutter_rect.top() + LANE_EDGE_W * 0.5),
     );
-    let edge_resp = ui.interact(
-        edge,
-        ui.id().with(("pr_lane_edge", idx)),
-        egui::Sense::drag(),
-    );
+    let edge_resp = ui
+        .interact(
+            edge,
+            ui.id().with(("pr_lane_edge", idx)),
+            egui::Sense::drag(),
+        )
+        .affords(Affords::SeamY);
     if edge_resp.hovered() || matches!(pr.drag, Some(Drag::LaneResize { .. })) {
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
     }
@@ -6103,11 +6128,13 @@ fn expression_lane(
     // --- the bars ------------------------------------------------------
     let mods = Mods::read(ui);
     if !view.collapsed && body_rect.height() > 2.0 {
-        let resp = ui.interact(
-            body_rect,
-            ui.id().with(("pr_lane", idx)),
-            egui::Sense::click_and_drag(),
-        );
+        let resp = ui
+            .interact(
+                body_rect,
+                ui.id().with(("pr_lane", idx)),
+                egui::Sense::click_and_drag(),
+            )
+            .affords(Affords::Draw);
         if resp.drag_started()
             && let Some(press) = resp.interact_pointer_pos()
         {

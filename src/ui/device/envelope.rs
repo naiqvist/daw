@@ -2,6 +2,7 @@
 //! curve. Values are normalized 0..1 — the caller owns the mapping of
 //! attack/decay/release to real time (and can show it with `readout`).
 
+use crate::ui::affordance::{Afford, Affords};
 use crate::ui::device::bezier::{Cubic, Pt};
 use crate::ui::device::metrics::Footprint;
 use crate::ui::theme::Theme;
@@ -106,7 +107,9 @@ fn adsr_with_footprint(ui: &mut egui::Ui, theme: &Theme, env: &mut Adsr, min: Fo
     let grab = handle_r + stroke::FOCUS * 2.0;
     let handle = |ui: &mut egui::Ui, tag: &str, center: egui::Pos2| -> Option<egui::Pos2> {
         let hrect = egui::Rect::from_center_size(center, egui::vec2(grab, grab) * 2.0);
-        let response = ui.interact(hrect, base_id.with(tag), egui::Sense::drag());
+        let response = ui
+            .interact(hrect, base_id.with(tag), egui::Sense::drag())
+            .affords(Affords::Sweep);
         let pos = response
             .dragged()
             .then(|| response.interact_pointer_pos())??;

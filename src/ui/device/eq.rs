@@ -46,6 +46,7 @@
 
 use crate::params::eq as ep;
 use crate::params::{self};
+use crate::ui::affordance::{Afford, Affords};
 use crate::ui::device::synth::ParamEdit;
 use crate::ui::device::{
     Footprint, Mapping, Param, Unit, Well, Wells, adjust, card, design, filter, metrics,
@@ -558,11 +559,13 @@ fn curve(ui: &mut egui::Ui, theme: &Theme, state: &mut EqUi, sample_rate: f32) -
     for band in 0..ep::BANDS {
         let at = handle_pos(state, rect, band);
         let hit = egui::Rect::from_center_size(at, egui::Vec2::splat(reach * 2.0));
-        let handle = ui.interact(
-            hit,
-            response.id.with(("band", band)),
-            egui::Sense::click_and_drag(),
-        );
+        let handle = ui
+            .interact(
+                hit,
+                response.id.with(("band", band)),
+                egui::Sense::click_and_drag(),
+            )
+            .affords(Affords::Steer);
         if handle.drag_started() || handle.clicked() {
             state.selected = band;
         }

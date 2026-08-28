@@ -8,6 +8,7 @@
 //! the slice's length draw as permanently-off filler and cannot be
 //! toggled.
 
+use crate::ui::affordance::{Afford, Affords};
 use crate::ui::theme::Theme;
 use crate::ui::tokens::{control, radius, space, stroke};
 use eframe::egui;
@@ -52,11 +53,12 @@ pub fn squiggle_grid(
             let live = i < on.len();
             let mut enabled = live && on[i];
             if live {
-                let response = ui.interact(
+                let response = ui
+                    .interact(
                     cell_rect,
                     base_id.with(("squiggle", r, c)),
-                    egui::Sense::click(),
-                );
+                    egui::Sense::click(),)
+                    .affords(Affords::Press);
                 if response.clicked() {
                     enabled = !enabled;
                     on[i] = enabled;

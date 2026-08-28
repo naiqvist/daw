@@ -64,6 +64,7 @@
 //! Violations are TEST FAILURES, not review comments.
 
 pub mod action;
+pub mod affordance;
 pub mod device;
 pub mod gallery;
 pub mod host;

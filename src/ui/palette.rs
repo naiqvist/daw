@@ -17,6 +17,7 @@
 //! learning either vocabulary. That is the same rule panels follow: name
 //! the wish, let the app perform it.
 
+use crate::ui::affordance::{Afford, Affords};
 use crate::ui::theme::Theme;
 use crate::ui::tokens::{font, radius, space, stroke};
 use eframe::egui;
@@ -391,7 +392,9 @@ impl Palette {
             })
             .response;
 
-        resp.interact(egui::Sense::click()).clicked()
+        resp.interact(egui::Sense::click())
+            .affords(Affords::Press)
+            .clicked()
     }
 }
 

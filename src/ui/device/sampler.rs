@@ -27,6 +27,7 @@ use super::{
     Footprint, Mapping, Param, ParamEdit, Unit, Well, Wells, card, metrics, poly_widgets, switch,
 };
 use crate::params::{self, sampler as sp};
+use crate::ui::affordance::{Afford, Affords};
 use crate::ui::theme::Theme;
 use crate::ui::tokens::{control, font, space, stroke};
 use eframe::egui;
@@ -834,7 +835,9 @@ fn plot(
     // overlap (contract rule 1 — egui gives a press to the last widget
     // added at that position).
     let body_id = ui.id().with("body");
-    let body = ui.interact(rect, body_id, egui::Sense::click_and_drag());
+    let body = ui
+        .interact(rect, body_id, egui::Sense::click_and_drag())
+        .affords(Affords::Steer);
 
     // The window as it stands coming into the frame. The gestures below
     // move it; everything that DRAWS re-reads it afterwards.
@@ -1168,7 +1171,9 @@ fn plot(
         }
         let h_rect = h_rect(fraction);
         let id = body_id.with(("slice", idx));
-        let response = ui.interact(h_rect, id, egui::Sense::click_and_drag());
+        let response = ui
+            .interact(h_rect, id, egui::Sense::click_and_drag())
+            .affords(Affords::Sweep);
         if response.hovered() || response.is_pointer_button_down_on() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
             painter.line_segment(
@@ -1222,7 +1227,9 @@ fn corner_button(
     if rect.width() <= 0.0 || !within.contains(rect.min) {
         return false;
     }
-    let response = ui.interact(rect, ui.id().with(("corner", glyph)), egui::Sense::click());
+    let response = ui
+        .interact(rect, ui.id().with(("corner", glyph)), egui::Sense::click())
+        .affords(Affords::Press);
     let hot = response.hovered();
     ui.painter().rect_filled(
         rect,
@@ -1285,7 +1292,9 @@ fn handle_param(
     edits: &mut Vec<ParamEdit>,
     fraction_at: &dyn Fn(f32) -> f32,
 ) {
-    let response = ui.interact(handle.rect, handle.id, egui::Sense::click_and_drag());
+    let response = ui
+        .interact(handle.rect, handle.id, egui::Sense::click_and_drag())
+        .affords(Affords::Slide);
     let painter = ui.painter();
     let top = handle.rect.top() + HANDLE_PAD;
     let bottom = handle.rect.bottom() - HANDLE_PAD;
