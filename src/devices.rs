@@ -20,6 +20,7 @@
 pub enum DeviceKind {
     SineSynth,
     Poly,
+    Haze,
     Sampler,
     Kick,
     Snare,
@@ -386,6 +387,112 @@ pub static DEVICES: &[DeviceSpec] = &[
                 name: "Gain",
                 unit: "",
                 group: "Out",
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Haze,
+        name: "haze",
+        instrument: true,
+        prefix: "haze",
+        params: daw::params::haze::TABLE,
+        // Nineteen rows, grouped the way the card's pages are, so a
+        // modulation target reads "Filter / Cutoff" rather than an id.
+        labels: &[
+            ParamLabel {
+                name: "Spread",
+                unit: "ct",
+                group: "Tone",
+            },
+            ParamLabel {
+                name: "Shape",
+                unit: "%",
+                group: "Tone",
+            },
+            ParamLabel {
+                name: "Sub",
+                unit: "%",
+                group: "Tone",
+            },
+            ParamLabel {
+                name: "Drift",
+                unit: "%",
+                group: "Tone",
+            },
+            ParamLabel {
+                name: "Cutoff",
+                unit: "Hz",
+                group: "Filter",
+            },
+            ParamLabel {
+                name: "Resonance",
+                unit: "%",
+                group: "Filter",
+            },
+            ParamLabel {
+                name: "Keytrack",
+                unit: "%",
+                group: "Filter",
+            },
+            ParamLabel {
+                name: "Env amount",
+                unit: "",
+                group: "Filter",
+            },
+            ParamLabel {
+                name: "Attack",
+                unit: "s",
+                group: "Amp",
+            },
+            ParamLabel {
+                name: "Decay",
+                unit: "s",
+                group: "Amp",
+            },
+            ParamLabel {
+                name: "Sustain",
+                unit: "%",
+                group: "Amp",
+            },
+            ParamLabel {
+                name: "Release",
+                unit: "s",
+                group: "Amp",
+            },
+            ParamLabel {
+                name: "Filter attack",
+                unit: "s",
+                group: "Filter",
+            },
+            ParamLabel {
+                name: "Filter decay",
+                unit: "s",
+                group: "Filter",
+            },
+            ParamLabel {
+                name: "Ensemble",
+                unit: "%",
+                group: "Air",
+            },
+            ParamLabel {
+                name: "Wow",
+                unit: "%",
+                group: "Air",
+            },
+            ParamLabel {
+                name: "Grain",
+                unit: "%",
+                group: "Air",
+            },
+            ParamLabel {
+                name: "Warmth",
+                unit: "%",
+                group: "Air",
+            },
+            ParamLabel {
+                name: "Level",
+                unit: "%",
+                group: "Air",
             },
         ],
     },

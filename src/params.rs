@@ -4862,6 +4862,17 @@ pub mod haze {
     /// Eight seconds in and sixteen out is the range the string machines
     /// had, and the reason theirs went that far is that a chord change
     /// under a long release is the sound the whole instrument exists for.
+    /// The SHORTEST a stage can be, in seconds.
+    ///
+    /// A millisecond, and not zero. The knob is logarithmic — a linear
+    /// one would spend its first third between two and five seconds and
+    /// cross everything short in its last few degrees — and a log scale
+    /// has no zero to reach. Writing the floor into the TABLE rather
+    /// than clamping it in the widget is what keeps the two ends of the
+    /// range agreeing: a table saying zero and a knob unable to express
+    /// it is a round trip that does not close, which is what
+    /// `engine_values_survive_the_trip_through_the_knobs` found.
+    pub const TIME_MIN: f32 = 0.001;
     pub const ATTACK_MAX: f32 = 8.0;
     pub const RELEASE_MAX: f32 = 16.0;
 
@@ -4964,14 +4975,14 @@ pub mod haze {
         ParamDef {
             id: ATTACK,
             name: "attack",
-            min: 0.0,
+            min: TIME_MIN,
             max: ATTACK_MAX,
             default: 0.9,
         },
         ParamDef {
             id: DECAY,
             name: "decay",
-            min: 0.0,
+            min: TIME_MIN,
             max: ATTACK_MAX,
             default: 1.5,
         },
@@ -4987,7 +4998,7 @@ pub mod haze {
         ParamDef {
             id: RELEASE,
             name: "release",
-            min: 0.0,
+            min: TIME_MIN,
             max: RELEASE_MAX,
             // Long enough that a chord change overlaps itself, which is
             // the sound the instrument exists for.
@@ -4996,7 +5007,7 @@ pub mod haze {
         ParamDef {
             id: FILTER_ATTACK,
             name: "f.atk",
-            min: 0.0,
+            min: TIME_MIN,
             max: ATTACK_MAX,
             // SLOWER than the amp's, deliberately. The note arrives and
             // then opens: that lag is the whole gesture, and equal times
@@ -5006,7 +5017,7 @@ pub mod haze {
         ParamDef {
             id: FILTER_DECAY,
             name: "f.dec",
-            min: 0.0,
+            min: TIME_MIN,
             max: ATTACK_MAX,
             default: 2.5,
         },

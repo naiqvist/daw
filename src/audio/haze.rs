@@ -60,6 +60,7 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
+use crate::audio::graph::Ramp;
 use crate::dsp::adsr::LaneAdsr;
 use crate::dsp::delay::{DelayLine, buffer_len};
 use crate::dsp::filters::{LaneCascade, LaneOnePole};
@@ -126,7 +127,8 @@ const WOW_SWING_MS: f32 = 3.2;
 const WOW_HZ: f32 = 0.37;
 
 /// Everything a note needs after the tables are built.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct HazeParams {
     pub spread: f32,
     pub shape: f32,
@@ -208,6 +210,28 @@ impl HazeParams {
             p::WARMTH => self.warmth = value,
             p::LEVEL => self.level = value,
             _ => {}
+        }
+    }
+
+    /// Every row put back inside its own range, and anything that is
+    /// not a number replaced by its default.
+    ///
+    /// RON round-trips NaN and infinity literals, so a hand-edited or
+    /// corrupt project can carry one in — and a NaN cutoff does not
+    /// merely sound wrong, it poisons the filter state and then the
+    /// master bus for the rest of the session. Guarded HERE rather than
+    /// at the node, because the instrument is what knows the ranges.
+    pub fn sanitize(&mut self) {
+        for def in p::TABLE {
+            let value = self.get(def.id).unwrap_or(def.default);
+            self.set(
+                def.id,
+                if value.is_finite() {
+                    value.clamp(def.min, def.max)
+                } else {
+                    def.default
+                },
+            );
         }
     }
 
@@ -333,8 +357,16 @@ pub struct Haze {
     /// The stereo the ensemble makes, one chunk at a time.
     left: [f32; CHUNK],
     right: [f32; CHUNK],
-    /// Right channel of the last render, for the node to pick up.
+    /// Right channel of the whole BLOCK, for the node to pick up.
+    ///
+    /// Sized once at construction from the longest block the stream can
+    /// deliver, because the callback may not allocate.
     right_out: Vec<f32>,
+    /// The knobs as LETTERS have set them, under any note's parameter
+    /// locks. A lock restores to this and not to a compile-time
+    /// snapshot, so a knob turned mid-playback is heard on every
+    /// unlocked note after it.
+    base: HazeParams,
     /// Rising stamp for voice stealing.
     next_age: u64,
     /// Where we are inside the control chunk, in samples.
@@ -352,10 +384,13 @@ pub struct Haze {
 
 impl Haze {
     /// Green zone: builds the tables and every buffer, once.
-    pub fn new(sample_rate: f32, params: HazeParams) -> Self {
+    pub fn new(sample_rate: f32, block: usize, params: HazeParams) -> Self {
+        let mut params = params;
+        params.sanitize();
         let mut haze = Self {
             sample_rate: sample_rate.max(1.0),
             params,
+            base: params,
             groups: [(); GROUPS].map(|()| Group::new()),
             tables: vec![0.0; table_len(Waveform::Saw)],
             sub_tables: vec![0.0; table_len(Waveform::Saw)],
@@ -377,7 +412,7 @@ impl Haze {
             lfo_scratch: [0.0; CHUNK],
             left: [0.0; CHUNK],
             right: [0.0; CHUNK],
-            right_out: Vec::new(),
+            right_out: vec![0.0; block.max(1)],
             next_age: 1,
             phase: 0,
         };
@@ -479,6 +514,26 @@ impl Haze {
     /// Red zone: one knob, and the coefficients it decides.
     pub fn set_param(&mut self, param: u32, value: f32) {
         self.params.set(param, value);
+        self.base.set(param, value);
+        self.retune();
+    }
+
+    /// Red zone: a note's parameter lock, or its release.
+    ///
+    /// `Some` overrides one knob for this note; `None` puts the LIVE
+    /// base back — the knob as letters have most recently set it, so a
+    /// knob turned while the pattern runs is heard on every unlocked
+    /// note after it rather than snapping back to whatever the patch
+    /// held at compile.
+    pub fn plock(&mut self, param: u32, value: Option<f32>) {
+        match value {
+            Some(value) => self.params.set(param, value),
+            None => {
+                if let Some(base) = self.base.get(param) {
+                    self.params.set(param, base);
+                }
+            }
+        }
         self.retune();
     }
 
@@ -639,10 +694,13 @@ impl Haze {
         self.right_out.get(..len).unwrap_or(&[])
     }
 
-    /// Red zone: fill `out` (left) and the right channel, adding nothing
-    /// that was not asked for.
-    pub fn render(&mut self, out: &mut [f32]) {
-        self.right_out.resize(out.len(), 0.0);
+    /// Red zone: fill `out` (left) and the right channel, from `at`.
+    ///
+    /// `at` is where this run starts inside the BLOCK, not inside the
+    /// segment: the clock walks one block in as many pieces as it has
+    /// note events, and a right channel written from zero every time
+    /// would put every piece after the first on top of the first.
+    pub fn render(&mut self, out: &mut [f32], at: usize, gain: &mut Ramp) {
         let mut done = 0;
         while done < out.len() {
             // Up to the next chunk boundary, never past it.
@@ -651,14 +709,16 @@ impl Haze {
                 self.update_voices();
             }
             self.render_span(len);
-            for (index, sample) in self.left.iter().take(len).enumerate() {
+            for index in 0..len {
+                // The ramp is stepped ONCE per sample and spent on both
+                // channels: two calls would advance it twice as fast and
+                // the fade would end half way through the block.
+                let step = gain.next();
                 if let Some(slot) = out.get_mut(done + index) {
-                    *slot = *sample;
+                    *slot = self.left.get(index).copied().unwrap_or(0.0) * step;
                 }
-            }
-            for (index, sample) in self.right.iter().take(len).enumerate() {
-                if let Some(slot) = self.right_out.get_mut(done + index) {
-                    *slot = *sample;
+                if let Some(slot) = self.right_out.get_mut(at + done + index) {
+                    *slot = self.right.get(index).copied().unwrap_or(0.0) * step;
                 }
             }
             done += len;
@@ -959,13 +1019,20 @@ mod tests {
 
     const RATE: f32 = 48_000.0;
 
+    /// The longest block the tests ever ask for, which is what the
+    /// right channel has to be able to hold.
+    const BLOCK: usize = 480_000;
+
     fn synth() -> Haze {
-        Haze::new(RATE, HazeParams::default())
+        Haze::new(RATE, BLOCK, HazeParams::default())
     }
 
+    /// One whole block, as the node would ask for it: unity gain, from
+    /// the start of the block.
     fn render(haze: &mut Haze, frames: usize) -> (Vec<f32>, Vec<f32>) {
         let mut left = vec![0.0; frames];
-        haze.render(&mut left);
+        let mut gain = Ramp::across(1.0, 1.0, frames);
+        haze.render(&mut left, 0, &mut gain);
         let right = haze.right(frames).to_vec();
         (left, right)
     }
@@ -987,6 +1054,7 @@ mod tests {
                 for ensemble in [0.0, 1.0] {
                     let mut haze = Haze::new(
                         RATE,
+                        BLOCK,
                         HazeParams {
                             grain,
                             warmth,
@@ -1012,6 +1080,7 @@ mod tests {
     fn a_note_sounds_and_a_release_ends() {
         let mut haze = Haze::new(
             RATE,
+            BLOCK,
             HazeParams {
                 attack: 0.005,
                 release: 0.05,
@@ -1080,6 +1149,7 @@ mod tests {
         let bare = || {
             Haze::new(
                 RATE,
+                BLOCK,
                 HazeParams {
                     ensemble: 0.0,
                     wow: 0.0,
@@ -1095,9 +1165,12 @@ mod tests {
         let mut b = bare();
         b.note_on(62, 90, 1);
         let mut bare_split = Vec::new();
+        let mut at = 0;
         for len in [100, 1, 411, 512] {
             let mut block = vec![0.0; len];
-            b.render(&mut block);
+            let mut gain = Ramp::across(1.0, 1.0, len);
+            b.render(&mut block, at, &mut gain);
+            at += len;
             bare_split.extend(block);
         }
         for (index, (x, y)) in bare_whole.iter().zip(bare_split.iter()).enumerate() {
@@ -1111,13 +1184,18 @@ mod tests {
         let mut split = synth();
         split.note_on(62, 90, 1);
         let mut left_split = Vec::new();
-        let mut right_split = Vec::new();
+        let mut at = 0;
         for len in [100, 1, 411, 512] {
             let mut block = vec![0.0; len];
-            split.render(&mut block);
-            right_split.extend_from_slice(split.right(len));
+            let mut gain = Ramp::across(1.0, 1.0, len);
+            split.render(&mut block, at, &mut gain);
+            at += len;
             left_split.extend(block);
         }
+        // The right channel is written into the BLOCK at `at`, so it is
+        // read once at the end rather than gathered piece by piece —
+        // which is exactly the thing `at` exists to make possible.
+        let right_split = split.right(1024).to_vec();
         assert_eq!(left_split.len(), 1024);
         for (index, (a, b)) in left_whole.iter().zip(left_split.iter()).enumerate() {
             assert_eq!(a, b, "left diverged at {index}");
@@ -1134,7 +1212,8 @@ mod tests {
         haze.note_on(60, 100, 1);
         for len in [0, 1, 2, 7, 31, 33, 97, CHUNK, CHUNK + 1] {
             let mut block = vec![0.0; len];
-            haze.render(&mut block);
+            let mut gain = Ramp::across(1.0, 1.0, len.max(1));
+            haze.render(&mut block, 0, &mut gain);
             assert!(block.iter().all(|s| s.is_finite()), "len {len}");
             assert_eq!(haze.right(len).len(), len);
         }
@@ -1151,6 +1230,7 @@ mod tests {
         let steady = {
             let mut haze = Haze::new(
                 RATE,
+                BLOCK,
                 HazeParams {
                     drift: 0.0,
                     ensemble: 0.0,
@@ -1168,6 +1248,7 @@ mod tests {
         let wandering = {
             let mut haze = Haze::new(
                 RATE,
+                BLOCK,
                 HazeParams {
                     drift: 1.0,
                     ensemble: 0.0,
@@ -1200,6 +1281,7 @@ mod tests {
         let render_at = |spread: f32| {
             let mut haze = Haze::new(
                 RATE,
+                BLOCK,
                 HazeParams {
                     spread,
                     drift: 0.0,
@@ -1252,6 +1334,7 @@ mod tests {
         let dry = |ensemble: f32, wow: f32| {
             let mut haze = Haze::new(
                 RATE,
+                BLOCK,
                 HazeParams {
                     ensemble,
                     wow,
@@ -1294,6 +1377,44 @@ mod tests {
             differs(&wide_l, &wide_r) > 1e-3,
             "the ensemble did not spread the channels apart"
         );
+    }
+
+    /// A CORRUPT PATCH DOES NOT POISON THE BUS.
+    ///
+    /// RON round-trips NaN and infinity literals, so a hand-edited
+    /// project can carry one in — and a NaN cutoff does not merely sound
+    /// wrong, it poisons the filter state and then everything downstream
+    /// of it for the rest of the session.
+    #[test]
+    fn a_patch_full_of_nonsense_is_put_back_in_range() {
+        let mut params = HazeParams {
+            cutoff: f32::NAN,
+            resonance: f32::INFINITY,
+            attack: -5.0,
+            level: 1e9,
+            spread: f32::NEG_INFINITY,
+            ..HazeParams::default()
+        };
+        params.sanitize();
+        for def in p::TABLE {
+            let value = params.get(def.id).unwrap_or(f32::NAN);
+            assert!(
+                value.is_finite() && value >= def.min && value <= def.max,
+                "{} came back as {value}",
+                def.name
+            );
+        }
+        let mut haze = Haze::new(
+            RATE,
+            BLOCK,
+            HazeParams {
+                cutoff: f32::NAN,
+                ..HazeParams::default()
+            },
+        );
+        haze.note_on(60, 100, 1);
+        let (left, right) = render(&mut haze, 4096);
+        assert!(left.iter().chain(right.iter()).all(|s| s.is_finite()));
     }
 
     /// A pad is a HELD sound: the defaults have to survive being held.
@@ -1350,17 +1471,16 @@ mod tests {
         let mut haze = synth();
         haze.note_on(60, 100, 1);
         let mut block = vec![0.0; 512];
-        // The right-channel vec is sized on the first render, which is
-        // where the one allowed allocation happens; every render after
-        // it reuses the same buffer.
-        haze.render(&mut block);
         assert_no_alloc::assert_no_alloc(|| {
+            let mut gain = Ramp::across(1.0, 1.0, 512);
             haze.note_on(64, 100, 2);
-            haze.render(&mut block);
+            haze.render(&mut block, 0, &mut gain);
             haze.note_off(64);
-            haze.render(&mut block);
+            haze.render(&mut block, 0, &mut gain);
             haze.set_param(p::CUTOFF, 800.0);
-            haze.render(&mut block);
+            haze.plock(p::CUTOFF, Some(400.0));
+            haze.render(&mut block, 0, &mut gain);
+            haze.plock(p::CUTOFF, None);
             haze.all_sound_off();
         });
     }

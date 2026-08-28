@@ -589,6 +589,31 @@ impl Voices for VoiceBank {
     }
 }
 
+/// Haze as an instrument the pattern clock can play.
+///
+/// The same shape `PolyVoices` has, one instrument along — which is the
+/// point of having extracted the clock in the first place.
+impl Voices for crate::audio::haze::Haze {
+    fn all_sound_off(&mut self) {
+        crate::audio::haze::Haze::all_sound_off(self);
+    }
+    fn release_all(&mut self) {
+        crate::audio::haze::Haze::release_all(self);
+    }
+    fn note_off(&mut self, pitch: u8) {
+        crate::audio::haze::Haze::note_off(self, pitch);
+    }
+    fn note_on(&mut self, pitch: u8, vel: u8, age: u64) {
+        crate::audio::haze::Haze::note_on(self, pitch, vel, age);
+    }
+    fn plock(&mut self, param: u32, value: Option<f32>) {
+        crate::audio::haze::Haze::plock(self, param, value);
+    }
+    fn render(&mut self, out: &mut [f32], at: usize, gain: &mut Ramp) {
+        crate::audio::haze::Haze::render(self, out, at, gain);
+    }
+}
+
 /// The kick as an instrument the pattern clock can play.
 ///
 /// A ONE-SHOT drum, so half this trait is deliberately empty. A kick has
@@ -1511,6 +1536,15 @@ pub enum Node {
         gain: f32,
         target_gain: f32,
     },
+    /// The pad synth. Same clock as `Seq` and `Poly`, an instrument
+    /// built for one job instead of for all of them.
+    Haze {
+        events: Vec<SeqEvent>,
+        clock: PatternClock,
+        voices: Box<crate::audio::haze::Haze>,
+        gain: f32,
+        target_gain: f32,
+    },
     /// The kick drum synth. Same clock as `Seq` and `Poly`, a one-shot
     /// drum voice instead of a bank.
     Kick {
@@ -2111,7 +2145,8 @@ impl Node {
             // count is fixed by its kind.
             // Stereo for the same reason, one device downstream: a
             // saturator that summed to mono would undo the spread.
-            NodeSpec::Poly { .. }
+            NodeSpec::Haze { .. }
+            | NodeSpec::Poly { .. }
             | NodeSpec::Sampler { .. }
             | NodeSpec::Modulato { .. }
             | NodeSpec::Sat { .. }
@@ -2656,6 +2691,27 @@ impl Node {
                 let mut ramp = Ramp::across(*gain, *target_gain, out_len);
                 clock.run(voices.as_mut(), events, out.l, ctx, &mut ramp);
                 *gain = *target_gain;
+            }
+
+            Node::Haze {
+                events,
+                clock,
+                voices,
+                gain,
+                target_gain,
+            } => {
+                // `Poly`'s shape exactly: the clock is mono-shaped, so
+                // the bank stashes its right channel and the node reads
+                // it back once the segment is done.
+                let mut ramp = Ramp::across(*gain, *target_gain, out_len);
+                clock.run(voices.as_mut(), events, out.l, ctx, &mut ramp);
+                *gain = *target_gain;
+                if let Some(r) = out.r.as_deref_mut() {
+                    let right = voices.right(out_len);
+                    for (d, s) in r.iter_mut().zip(right.iter()) {
+                        *d = *s;
+                    }
+                }
             }
 
             Node::Poly {
@@ -4120,6 +4176,19 @@ impl Node {
             // arms above give: one door, so a letter cannot be routed by
             // two different opinions about what id 4 is.
             Node::Utility { core } => core.set_param(param, value),
+            // Every knob is a live letter. The LEVEL is not lifted out
+            // to the node's ramp the way the poly's gain is: this
+            // instrument applies its own, after a texture chain that is
+            // part of the sound rather than after it, and moving the
+            // fader outside that would change what the warmth stage is
+            // being driven with.
+            Node::Haze { voices, .. } => {
+                let Some(value) = crate::params::clamp(crate::params::haze::TABLE, param, value)
+                else {
+                    return;
+                };
+                voices.set_param(param, value);
+            }
             Node::Poly {
                 target_gain,
                 voices,
@@ -5071,6 +5140,22 @@ pub enum NodeSpec {
         #[serde(default)]
         params: crate::audio::poly::PolyParams,
     },
+    /// HAZE: an analog pad synth, one pattern, sixteen drifting voices.
+    ///
+    /// Stereo out, because the ensemble that gives it its width is part
+    /// of the instrument rather than an effect after it.
+    ///
+    /// TIMELINE-LOCKED, exactly as `Seq` and `Poly` are: its events are
+    /// stamped against the compiled tempo and it CUTS on discontinuity,
+    /// so an offline bounce reproduces a live take sample for sample.
+    Haze {
+        notes: Vec<Note>,
+        subloops: Vec<SubLoop>,
+        loop_len_beats: Option<f64>,
+        /// The nineteen-row `params::haze` patch, in engine units.
+        #[serde(default)]
+        params: crate::audio::haze::HazeParams,
+    },
     /// The kick drum synth: one pattern, one one-shot voice.
     ///
     /// The same pattern shape as [`NodeSpec::Seq`] and [`NodeSpec::Poly`],
@@ -5885,6 +5970,40 @@ impl GraphSpec {
                             voices: Box::new(voices),
                             gain: 0.0,
                             target_gain: gain,
+                        }
+                    }
+                    Some(NodeSpec::Haze {
+                        notes,
+                        subloops,
+                        loop_len_beats,
+                        params,
+                    }) => {
+                        let events =
+                            compile_events(notes, subloops, *loop_len_beats, samples_per_beat)?;
+                        // Green zone: this builds the tables, the delay
+                        // rings and every buffer the callback will ever
+                        // need. `block_frames` is the longest segment
+                        // there can be, which is what the right channel
+                        // has to be able to hold.
+                        let voices = crate::audio::haze::Haze::new(
+                            sample_rate as f32,
+                            block_frames,
+                            *params,
+                        );
+                        Node::Haze {
+                            events,
+                            clock: PatternClock::new(
+                                loop_len_beats
+                                    .map(|len| (len * samples_per_beat).round().max(0.0) as u64)
+                                    .unwrap_or(0),
+                                samples_per_beat,
+                            ),
+                            voices: Box::new(voices),
+                            // The instrument applies `level` itself, so
+                            // the node's ramp rides at unity: spending
+                            // it twice would square the fader.
+                            gain: 1.0,
+                            target_gain: 1.0,
                         }
                     }
                     Some(NodeSpec::Poly {

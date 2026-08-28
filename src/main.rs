@@ -10363,6 +10363,10 @@ impl Default for Browser {
                             load: DeviceKind::Poly,
                         },
                         BrowserItem {
+                            name: "Haze",
+                            load: DeviceKind::Haze,
+                        },
+                        BrowserItem {
                             name: "Sampler",
                             load: DeviceKind::Sampler,
                         },
@@ -12248,6 +12252,19 @@ fn draw_device_card(
             let mut knobs = device::HandclapUi::from_engine(|id| params.get(id));
             device::handclap_card(ui, theme, &mut knobs)
         }
+        DeviceState::Haze(params) => {
+            let mut knobs =
+                device::haze::HazeUi::from_engine(|id| params.get(id).unwrap_or_default());
+            let mut page = usize::from(instance.page);
+            let made = device::haze::haze_card(ui, theme, &mut knobs, &mut page);
+            // The page rail is part of the card, so the page it comes
+            // back on is what the instance should remember.
+            let page = page.min(u8::MAX as usize) as u8;
+            if page != instance.page {
+                edits.pages.push((instance.id, page));
+            }
+            made
+        }
         DeviceState::Poly(params) => {
             let mut knobs = poly_knobs(params, instance.page);
             let made = device::poly_card(ui, theme, &mut knobs);
@@ -12751,6 +12768,7 @@ fn plockable_params(track: &Track) -> Vec<piano_roll::PlockParam> {
     let spec = head.kind().spec();
     let excluded = match head.kind() {
         DeviceKind::Poly => daw::params::poly::GAIN,
+        DeviceKind::Haze => daw::params::haze::LEVEL,
         DeviceKind::Sampler => daw::params::sampler::GAIN,
         DeviceKind::SineSynth => daw::params::seq::GAIN,
         DeviceKind::Kick => daw::params::kick::GAIN,
@@ -12971,6 +12989,7 @@ fn compile_chain(
             // anywhere else in a chain shapes nothing.
             DeviceState::SineSynth(_)
             | DeviceState::Poly(_)
+            | DeviceState::Haze(_)
             | DeviceState::Sampler(_)
             | DeviceState::Kick(_)
             | DeviceState::Snare(_)
@@ -13361,6 +13380,12 @@ fn build_graph_spec(
                         params,
                     },
                     DeviceState::Poly(params) => NodeSpec::Poly {
+                        notes,
+                        subloops: Vec::new(),
+                        loop_len_beats,
+                        params,
+                    },
+                    DeviceState::Haze(params) => NodeSpec::Haze {
                         notes,
                         subloops: Vec::new(),
                         loop_len_beats,
@@ -28959,6 +28984,55 @@ mod tests {
                 .iter()
                 .all(|track| !track.is_group && track.depth == 0)
         );
+    }
+
+    /// HAZE REACHES THE SPEAKERS.
+    ///
+    /// Not that it renders — `audio::haze` proves that — but that the
+    /// whole path is joined: a browser row makes an instance, the
+    /// instance compiles into a node, the node lands on the lane's
+    /// output stage, and the schedule accepts it. Every one of those is
+    /// a separate registration, and a device is only loadable when all
+    /// of them are done.
+    #[test]
+    fn a_haze_track_compiles_and_sounds() {
+        let mut a = Arrangement::default();
+        load(&mut a, 0, DeviceKind::Haze);
+        assert_eq!(
+            a.tracks[0].instrument().map(|head| head.kind()),
+            Some(DeviceKind::Haze),
+            "it did not land at the head of the chain"
+        );
+        let (spec, nodes) =
+            build_graph_spec(&a.tracks, &a.master, &a.returns, &a.clips, None, false);
+        assert!(nodes.pans[0].is_some(), "the lane never reached the master");
+        let sched = spec.compile(48_000, 256);
+        assert!(sched.is_ok(), "the schedule refused a haze track");
+
+        // STEREO, because the ensemble that gives it its width is part
+        // of the instrument. A mono node here would mean the right
+        // channel of every pad was silently the left one.
+        let haze = spec
+            .iter_ordered()
+            .find(|(_, node)| matches!(node, NodeSpec::Haze { .. }))
+            .map(|(_, node)| node.clone());
+        assert!(haze.is_some(), "no haze node was compiled");
+
+        // And every knob is a live letter rather than a recompile: the
+        // whole patch rides `set_param`, which is what makes a slow
+        // instrument playable at all.
+        for def in daw::params::haze::TABLE {
+            let before = shape_hash(&a.tracks, &a.master, &a.returns);
+            if let Some(head) = a.tracks[0].chain.first_mut() {
+                head.state.set(def.id, def.default);
+            }
+            assert_eq!(
+                shape_hash(&a.tracks, &a.master, &a.returns),
+                before,
+                "{} asks for a recompile",
+                def.name
+            );
+        }
     }
 
     // -------------------------------------------------------- racks ---

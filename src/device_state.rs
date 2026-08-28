@@ -243,6 +243,7 @@ impl Default for PhaserParams {
 pub enum DeviceState {
     SineSynth(SynthParams),
     Poly(daw::audio::poly::PolyParams),
+    Haze(daw::audio::haze::HazeParams),
     Sampler(daw::audio::sampler::SamplerParams),
     Kick(daw::audio::kick::KickParams),
     Snare(daw::audio::snare::SnareParams),
@@ -287,6 +288,7 @@ impl DeviceState {
         match kind {
             DeviceKind::SineSynth => Self::SineSynth(SynthParams::default()),
             DeviceKind::Poly => Self::Poly(daw::audio::poly::PolyParams::default()),
+            DeviceKind::Haze => Self::Haze(daw::audio::haze::HazeParams::default()),
             DeviceKind::Sampler => Self::Sampler(daw::audio::sampler::SamplerParams::default()),
             DeviceKind::Kick => Self::Kick(daw::audio::kick::KickParams::default()),
             DeviceKind::Snare => Self::Snare(daw::audio::snare::SnareParams::default()),
@@ -319,6 +321,7 @@ impl DeviceState {
         match self {
             Self::SineSynth(_) => DeviceKind::SineSynth,
             Self::Poly(_) => DeviceKind::Poly,
+            Self::Haze(_) => DeviceKind::Haze,
             Self::Sampler(_) => DeviceKind::Sampler,
             Self::Kick(_) => DeviceKind::Kick,
             Self::Snare(_) => DeviceKind::Snare,
@@ -362,6 +365,7 @@ impl DeviceState {
             // beside its writer, in the engine struct that owns them —
             // spelling them out twice here is how the two halves drift.
             Self::Poly(p) => p.get(param),
+            Self::Haze(p) => p.get(param),
             // Thirty-six rows, with a reader beside their writer in the
             // struct that owns them — spelling them out again here is how
             // the two halves drift.
@@ -479,6 +483,7 @@ impl DeviceState {
                 _ => {}
             },
             Self::Poly(p) => p.set(param, value),
+            Self::Haze(p) => p.set(param, value),
             Self::Sampler(p) => p.set(param, value),
             Self::Kick(p) => p.set(param, value),
             Self::Snare(p) => p.set(param, value),
@@ -861,6 +866,7 @@ pub fn device_norm(kind: DeviceKind, param: u32, value: f32) -> f32 {
     match kind {
         DeviceKind::SineSynth => device::sine_synth_norm(param, value),
         DeviceKind::Poly => device::poly_norm(param, value),
+        DeviceKind::Haze => device::haze::haze_norm(param, value),
         DeviceKind::Sampler => device::sampler_norm(param, value),
         DeviceKind::Kick => device::kick::kick_norm(param, value),
         DeviceKind::Snare => device::snare_norm(param, value),
@@ -904,6 +910,8 @@ pub fn device_norm(kind: DeviceKind, param: u32, value: f32) -> f32 {
 pub fn device_is_discrete(kind: DeviceKind, param: u32) -> bool {
     match kind {
         DeviceKind::Poly => device::poly_is_discrete(param),
+        // Nothing on the pad synth snaps: every row is a sweep.
+        DeviceKind::Haze => false,
         DeviceKind::Sampler => device::sampler_is_discrete(param),
         DeviceKind::Kick => device::kick::kick_is_discrete(param),
         DeviceKind::Snare => device::snare_is_discrete(param),
@@ -940,6 +948,7 @@ pub fn device_is_discrete(kind: DeviceKind, param: u32) -> bool {
 pub fn device_is_log(kind: DeviceKind, param: u32) -> bool {
     match kind {
         DeviceKind::Poly => device::poly_is_log(param),
+        DeviceKind::Haze => device::haze::haze_is_log(param),
         DeviceKind::Sampler => device::sampler_is_log(param),
         DeviceKind::Kick => device::kick::kick_is_log(param),
         DeviceKind::Snare => device::snare_is_log(param),
@@ -982,6 +991,7 @@ pub fn device_value(kind: DeviceKind, param: u32, norm: f32) -> f32 {
     match kind {
         DeviceKind::SineSynth => device::sine_synth_value(param, norm),
         DeviceKind::Poly => device::poly_value(param, norm),
+        DeviceKind::Haze => device::haze::haze_value(param, norm),
         DeviceKind::Sampler => device::sampler_value(param, norm),
         DeviceKind::Kick => device::kick::kick_value(param, norm),
         DeviceKind::Snare => device::snare_value(param, norm),

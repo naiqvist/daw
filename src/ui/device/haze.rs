@@ -198,12 +198,12 @@ fn param_of(param: u32) -> Param {
         Param::new(
             name,
             Mapping::Log {
-                min: def.min.max(0.001),
+                min: def.min,
                 max: def.max,
             },
             unit,
         )
-        .with_default(def.default.max(0.001))
+        .with_default(def.default)
     };
     match param {
         hp::SPREAD => linear("spread", Unit::Plain),
@@ -243,11 +243,6 @@ fn shown(param: u32, value: f32) -> f32 {
         | hp::WARMTH => value * 100.0,
         // Level runs to 2.0, so full scale is 200 % and unity is 100.
         hp::LEVEL => value * 50.0,
-        // A zero time cannot ride a log mapping, and zero is a real
-        // setting: the floor stands in for it and reads as "1 ms".
-        hp::ATTACK | hp::DECAY | hp::RELEASE | hp::FILTER_ATTACK | hp::FILTER_DECAY => {
-            value.max(0.001)
-        }
         _ => value,
     }
 }
