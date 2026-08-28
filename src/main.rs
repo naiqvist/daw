@@ -12338,13 +12338,17 @@ fn draw_device_card(
     let grip = device::card::grip(
         ui,
         theme,
-        ui.id().with(("device_grip", instance.id)),
-        // The title band is the top of the card down to the rule the card
-        // paints under its name. Asked of the card rather than rebuilt
-        // from the font, so the two cannot drift.
-        device::card::title_band(theme, drawn.response.rect),
-        instance.id,
-        selected.contains(&instance.id),
+        device::card::Handle {
+            id: ui.id().with(("device_grip", instance.id)),
+            card: drawn.response.rect,
+            // The title band is the top of the card down to the rule the
+            // card paints under its name. Asked of the card rather than
+            // rebuilt from the font, so the two cannot drift.
+            title: device::card::title_band(theme, drawn.response.rect),
+            instance: instance.id,
+            name: instance.kind().spec().name,
+            selected: selected.contains(&instance.id),
+        },
     );
     if grip.clicked {
         edits.select = Some((instance.id, grip.additive));

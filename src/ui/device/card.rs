@@ -83,6 +83,19 @@ pub fn title_band(theme: &Theme, card: egui::Rect) -> egui::Rect {
     )
 }
 
+/// Everything a chain has to tell a card about being handled.
+pub struct Handle<'a> {
+    pub id: egui::Id,
+    /// The whole card, which is what the ghost is a copy of.
+    pub card: egui::Rect,
+    /// The strip at the top of it, which is what can be taken hold of.
+    pub title: egui::Rect,
+    pub instance: u64,
+    /// What the ghost says while it is in the air.
+    pub name: &'a str,
+    pub selected: bool,
+}
+
 /// Claim a card's title strip as its handle.
 ///
 /// The title strip and not the whole card, deliberately: a card's face is
@@ -94,33 +107,36 @@ pub fn title_band(theme: &Theme, card: egui::Rect) -> egui::Rect {
 /// landed on — because a device you have selected and a device you have
 /// not must not look the same, and a drop with no line drawn is a drop
 /// you find out about after it happens.
-pub fn grip(
-    ui: &mut egui::Ui,
-    theme: &Theme,
-    id: egui::Id,
-    title: egui::Rect,
-    instance: u64,
-    selected: bool,
-) -> Grip {
+pub fn grip(ui: &mut egui::Ui, theme: &Theme, handle: Handle<'_>) -> Grip {
     use crate::ui::affordance::{Afford, Affords};
 
     let response = ui
-        .interact(title, id, egui::Sense::click_and_drag())
+        .interact(handle.title, handle.id, egui::Sense::click_and_drag())
         .affords(Affords::Carry);
     let mut out = Grip {
         clicked: response.clicked(),
         additive: ui.input(|input| input.modifiers.command || input.modifiers.shift),
         ..Grip::default()
     };
-    if response.drag_started() {
-        egui::DragAndDrop::set_payload(ui.ctx(), Carried(instance));
-    }
-    let carried = egui::DragAndDrop::payload::<Carried>(ui.ctx()).map(|payload| payload.0);
-    out.carrying = carried == Some(instance);
+    response.dnd_set_drag_payload(Carried(handle.instance));
 
-    if selected || out.carrying {
+    // WHAT IS OVER THIS CARD, and what was let go over it. Both ask
+    // `contains_pointer` rather than `hovered`, and that is not a detail:
+    // egui reports every other widget as un-hovered while a drag is in
+    // flight, so a drop test written on `hovered` can never fire. The
+    // first version of this was, and did not.
+    let hovering = response.dnd_hover_payload::<Carried>().map(|held| held.0);
+    if let Some(from) = response.dnd_release_payload::<Carried>().map(|held| held.0)
+        && from != handle.instance
+    {
+        out.dropped_from = Some(from);
+    }
+    out.carrying = egui::DragAndDrop::payload::<Carried>(ui.ctx())
+        .is_some_and(|held| held.0 == handle.instance);
+
+    if handle.selected || out.carrying {
         ui.painter().rect_filled(
-            title,
+            handle.title,
             0.0,
             if out.carrying {
                 theme.accent_muted
@@ -129,31 +145,79 @@ pub fn grip(
             },
         );
         ui.painter().rect_stroke(
-            title,
+            handle.title,
             0.0,
             egui::Stroke::new(crate::ui::tokens::stroke::HAIR, theme.accent),
             egui::StrokeKind::Inside,
         );
     }
 
+    // The card being carried is dimmed WHERE IT STILL IS, because it has
+    // not moved yet — the ghost is the proposal and this is the thing the
+    // proposal is about. Fading it says "this one" without pretending the
+    // move has already happened.
+    if out.carrying {
+        ui.painter()
+            .rect_filled(handle.card, 0.0, theme.bg.gamma_multiply(0.55));
+        ghost(ui, theme, handle.card, handle.name);
+    }
+
     // A card in flight, hovering somewhere it could land: the line goes
     // on the LEADING edge, because that is where the carried device will
     // be — a drop that only highlighted the target would leave "before or
     // after" for the user to find out by doing it.
-    if let Some(from) = carried
-        && from != instance
-        && response.hovered()
-    {
+    if hovering.is_some_and(|from| from != handle.instance) {
         ui.painter().line_segment(
-            [title.left_top(), egui::pos2(title.left(), title.bottom())],
+            [
+                handle.card.left_top(),
+                egui::pos2(handle.card.left(), handle.card.bottom()),
+            ],
             egui::Stroke::new(crate::ui::tokens::stroke::BOLD * 1.5, theme.accent),
         );
-        if ui.input(|input| input.pointer.any_released()) {
-            out.dropped_from = Some(from);
-            egui::DragAndDrop::clear_payload(ui.ctx());
-        }
     }
     out
+}
+
+/// The card in the air: a translucent stand-in under the pointer.
+///
+/// A STAND-IN and not a copy. Redrawing the card's face would mean
+/// running every knob and display a second time, at a size and a place
+/// they were not laid out for — and the question a hand in mid-drag is
+/// asking is "what am I holding and where will it go", which a named
+/// plate answers exactly as well as a photograph would.
+///
+/// Drawn on the tooltip layer so it passes over the cards it is being
+/// carried across; anything less and the ghost would slide UNDER the
+/// chain it is moving through.
+fn ghost(ui: &egui::Ui, theme: &Theme, card: egui::Rect, name: &str) {
+    let Some(pointer) = ui.ctx().pointer_latest_pos() else {
+        return;
+    };
+    let painter = ui.ctx().layer_painter(egui::LayerId::new(
+        egui::Order::Tooltip,
+        egui::Id::new("device_ghost"),
+    ));
+    // Held near its top-left, the way a card is picked up by its title —
+    // centring it on the pointer would put the thing you are aiming with
+    // in the middle of the thing you are aiming.
+    let at = egui::Rect::from_min_size(
+        pointer + egui::vec2(-16.0, -10.0),
+        egui::vec2(card.width(), card.height()),
+    );
+    painter.rect_filled(at, 2.0, theme.surface_raised.gamma_multiply(0.82));
+    painter.rect_stroke(
+        at,
+        2.0,
+        egui::Stroke::new(crate::ui::tokens::stroke::HAIR, theme.accent),
+        egui::StrokeKind::Inside,
+    );
+    painter.text(
+        at.min + egui::vec2(theme.sp(space::SM), theme.sp(space::XS)),
+        egui::Align2::LEFT_TOP,
+        name,
+        egui::FontId::proportional(font::LABEL),
+        theme.text,
+    );
 }
 
 /// A card whose body has `pages` tabs, switched by the row of dots at the
@@ -1065,6 +1129,7 @@ pub fn sections(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 pub(crate) mod grip_tests {
     use super::*;
+    use crate::ui::device::probe;
 
     /// Every error egui painted this frame.
     ///
@@ -1143,6 +1208,94 @@ pub(crate) mod grip_tests {
         assert!(
             errors.is_empty(),
             "two identical cards collided on a widget id: {errors:#?}"
+        );
+    }
+
+    /// A CARD CARRIED ONTO ANOTHER REPORTS THE DROP.
+    ///
+    /// The first version of this gesture asked `hovered()` on the target
+    /// and could never fire: egui reports every other widget as
+    /// un-hovered while a drag is in flight, which its own source says in
+    /// as many words. Nothing failed, nothing warned — the cards simply
+    /// did not move, and only a pointer could tell.
+    #[test]
+    fn a_card_carried_onto_another_reports_the_drop() {
+        let theme = Theme::dark();
+        let context = egui::Context::default();
+        let view = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 240.0));
+        let first = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(120.0, 200.0));
+        let second = egui::Rect::from_min_size(egui::pos2(150.0, 10.0), egui::vec2(120.0, 200.0));
+        let from = title_band(&theme, first).center();
+        let to = title_band(&theme, second).center();
+
+        let frames = probe::run(&context, view, &probe::drag_path(from, to, 6), |ui| {
+            let mut out = Vec::new();
+            for (index, card) in [(1_u64, first), (2, second)] {
+                out.push(grip(
+                    ui,
+                    &theme,
+                    Handle {
+                        id: egui::Id::new(("grip_test", index)),
+                        card,
+                        title: title_band(&theme, card),
+                        instance: index,
+                        name: "filter",
+                        selected: false,
+                    },
+                ));
+            }
+            out
+        });
+
+        let carried = frames
+            .iter()
+            .any(|frame| frame.first().is_some_and(|grip| grip.carrying));
+        assert!(carried, "the card was never picked up");
+        let dropped = frames.iter().any(|frame| {
+            frame
+                .get(1)
+                .is_some_and(|grip| grip.dropped_from == Some(1))
+        });
+        assert!(dropped, "the carried card was never reported as landed");
+
+        // And a card is not dropped onto ITSELF, which would be a move
+        // with nowhere to go and a chain edit for nothing.
+        let onto_itself = frames.iter().any(|frame| {
+            frame
+                .first()
+                .is_some_and(|grip| grip.dropped_from == Some(1))
+        });
+        assert!(!onto_itself);
+    }
+
+    /// A press that does not travel is a SELECTION, not a carry. The two
+    /// share a target, so the one gesture has to be able to be both.
+    #[test]
+    fn a_press_without_a_drag_selects_instead_of_carrying() {
+        let theme = Theme::dark();
+        let context = egui::Context::default();
+        let view = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 240.0));
+        let card = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(120.0, 200.0));
+        let at = title_band(&theme, card).center();
+
+        let frames = probe::run(&context, view, &probe::click_path(at), |ui| {
+            grip(
+                ui,
+                &theme,
+                Handle {
+                    id: egui::Id::new("grip_click"),
+                    card,
+                    title: title_band(&theme, card),
+                    instance: 1,
+                    name: "filter",
+                    selected: false,
+                },
+            )
+        });
+        assert!(frames.iter().any(|grip| grip.clicked), "the press was lost");
+        assert!(
+            !frames.iter().any(|grip| grip.carrying),
+            "a click picked the card up"
         );
     }
 
