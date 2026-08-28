@@ -1143,13 +1143,15 @@ fn expand_idioms(source: &str, cursor_pitch: u8) -> Result<String, String> {
                 .ok_or_else(|| format!("`{modifier}` needs a value"))?;
             match modifier {
                 "--step" => {
-                    step = value
-                        .parse::<i16>()
-                        .ok()
-                        .filter(|step| (-12..=12).contains(step))
-                        .ok_or_else(|| {
-                            format!("`--step` is semitones between -12 and 12, not `{value}`")
-                        })?;
+                    // Named intervals and bare semitones both, because the
+                    // musician thinks `-m2` and the arithmetic wants -1.
+                    let interval = theory::parse_interval(value)?;
+                    if !(-12..=12).contains(&interval) {
+                        return Err(format!(
+                            "`--step` reaches at most an octave, not {interval} semitones"
+                        ));
+                    }
+                    step = interval;
                 }
                 "--n" => {
                     chords = value
@@ -2362,7 +2364,7 @@ fn script_help(ui: &mut egui::Ui, theme: &Theme, rect: egui::Rect) {
                 ui,
                 theme,
                 "IDIOM OPTIONS",
-                "--step -2   --n 4   --q m9no5,M9no5   --oct 3   --dur 1bar   --nocluster",
+                "--step -m2 -M2 m3 -P4 P5 -P8 · or semitones: -1 2 -7st\n--n 4   --q m9no5,M9no5   --oct 3   --dur 1bar   --nocluster",
             );
             help_group(
                 ui,
@@ -6564,6 +6566,32 @@ mod tests {
         // The help page's own example, kept honest: a page that teaches a
         // line this language cannot read is worse than no page.
         assert_eq!(idiom_pitches("@house f --dur 2beat --n 4").len(), 4);
+
+        // Every interval, named the way a musician says it rather than
+        // counted in semitones.
+        assert_eq!(
+            expand_idioms("@m9 c --step -m2", C4).unwrap(),
+            expand_idioms("@m9 c --step -1", C4).unwrap()
+        );
+        assert_eq!(
+            expand_idioms("@m9 c --step M2 --n 3", C4).unwrap(),
+            "4 !cm9no5:1bar 4 !dm9no5:1bar 4 !em9no5:1bar cluster"
+        );
+        assert_eq!(
+            expand_idioms("@m9 c --step -P4 --n 3", C4).unwrap(),
+            "4 !cm9no5:1bar 3 !gm9no5:1bar 3 !dm9no5:1bar cluster"
+        );
+        // A step wider than an octave, and a name that is not an interval.
+        assert!(
+            expand_idioms("@house f --step 14", C4)
+                .unwrap_err()
+                .contains("octave")
+        );
+        assert!(
+            expand_idioms("@house f --step M9", C4)
+                .unwrap_err()
+                .contains("not an interval")
+        );
 
         // Two idioms in one entry must agree about it, since the transform
         // is entry-wide.

@@ -546,6 +546,83 @@ impl ChordSymbol {
     }
 }
 
+// ------------------------------------------------------------- intervals ---
+
+/// Named intervals, ascending, in semitones. Every spelling this module
+/// accepts is a row here, because a vocabulary the parser knows and the
+/// help page does not is a vocabulary nobody finds.
+///
+/// Case is load-bearing: `m3` and `M3` are different intervals exactly as
+/// `!cm9` and `!cM9` are different chords, and this module already asks a
+/// reader to hold that distinction. The spellings where case cannot
+/// possibly mean two things — `P`, `TT`, `octave` — accept either.
+pub const INTERVALS: &[(&str, i16)] = &[
+    ("P1", 0),
+    ("p1", 0),
+    ("U", 0),
+    ("u", 0),
+    ("unison", 0),
+    ("m2", 1),
+    ("M2", 2),
+    ("m3", 3),
+    ("M3", 4),
+    ("P4", 5),
+    ("p4", 5),
+    ("A4", 6),
+    ("a4", 6),
+    ("d5", 6),
+    ("TT", 6),
+    ("tt", 6),
+    ("tritone", 6),
+    ("P5", 7),
+    ("p5", 7),
+    ("m6", 8),
+    ("A5", 8),
+    ("M6", 9),
+    ("d7", 9),
+    ("m7", 10),
+    ("M7", 11),
+    ("P8", 12),
+    ("p8", 12),
+    ("octave", 12),
+    ("8ve", 12),
+];
+
+/// Parse a signed interval: either semitones as a number, or a named
+/// interval. `-m2` is down a minor second, `M2` is up a major second, `-3`
+/// and `-m3` are the same thing, and `2st` says semitones out loud.
+///
+/// An unsigned name reads as ASCENDING, which is how a musician says an
+/// interval when they do not say a direction. Descending needs the `-`.
+///
+/// Degree numbers on their own are deliberately NOT accepted: `3` here is
+/// three semitones, but `3` in a chord symbol is a major third, which is
+/// four. One of those readings has to win and silence would pick the wrong
+/// one about half the time, so a bare number is always semitones and an
+/// interval always carries its quality.
+pub fn parse_interval(source: &str) -> Result<i16, String> {
+    let (sign, rest) = match source.strip_prefix('-') {
+        Some(rest) => (-1, rest),
+        None => (1, source.strip_prefix('+').unwrap_or(source)),
+    };
+    if rest.is_empty() {
+        return Err(format!("`{source}` is not an interval"));
+    }
+
+    let digits = rest.strip_suffix("st").unwrap_or(rest);
+    if let Ok(semitones) = digits.parse::<i16>() {
+        return Ok(sign * semitones);
+    }
+
+    INTERVALS
+        .iter()
+        .find(|(name, _)| *name == rest)
+        .map(|(_, semitones)| sign * semitones)
+        .ok_or_else(|| {
+            format!("`{source}` is not an interval; try -m2, M2, -m3, P5, 2st or a number")
+        })
+}
+
 // -------------------------------------------------------- voicing transforms ---
 
 /// Fold a chord into its tightest voicing: every pitch class stacked inside
@@ -871,6 +948,60 @@ pub fn motion(prev: (u8, u8), now: (u8, u8)) -> Motion {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------- intervals ---
+
+    #[test]
+    fn intervals_are_named_and_signed() {
+        assert_eq!(parse_interval("m2"), Ok(1));
+        assert_eq!(parse_interval("M2"), Ok(2));
+        assert_eq!(parse_interval("-m2"), Ok(-1));
+        assert_eq!(parse_interval("+M3"), Ok(4));
+        assert_eq!(parse_interval("-P5"), Ok(-7));
+        assert_eq!(parse_interval("octave"), Ok(12));
+        // Semitones, with or without saying so.
+        assert_eq!(parse_interval("-1"), Ok(-1));
+        assert_eq!(parse_interval("2st"), Ok(2));
+        assert_eq!(parse_interval("-7st"), Ok(-7));
+        // Unsigned reads as ascending, the way a musician says it.
+        assert_eq!(parse_interval("m3"), parse_interval("+m3"));
+    }
+
+    /// Case separates two different intervals, exactly as it separates two
+    /// different chords.
+    #[test]
+    fn interval_case_is_load_bearing() {
+        assert_ne!(parse_interval("m3"), parse_interval("M3"));
+        assert_eq!(parse_interval("m6"), Ok(8));
+        assert_eq!(parse_interval("M6"), Ok(9));
+    }
+
+    /// A bare number is semitones, never a scale degree — the two disagree
+    /// about every interval that has a quality, so only one reading is
+    /// allowed to exist.
+    #[test]
+    fn a_bare_number_is_semitones_and_a_degree_needs_its_quality() {
+        assert_eq!(parse_interval("3"), Ok(3));
+        assert_eq!(parse_interval("M3"), Ok(4));
+        assert!(parse_interval("b3").is_err());
+        assert!(parse_interval("#4").is_err());
+    }
+
+    #[test]
+    fn every_named_interval_parses_and_stays_inside_an_octave() {
+        for (name, semitones) in INTERVALS {
+            assert_eq!(parse_interval(name), Ok(*semitones), "{name}");
+            assert_eq!(
+                parse_interval(&format!("-{name}")),
+                Ok(-semitones),
+                "-{name}"
+            );
+            assert!((0..=12).contains(semitones), "{name} is not an interval");
+        }
+        for bad in ["", "-", "+", "x", "M9", "P3", "second", "m", "2nd"] {
+            assert!(parse_interval(bad).is_err(), "`{bad}` should not parse");
+        }
+    }
 
     // ------------------------------------------------------------ cluster ---
 
