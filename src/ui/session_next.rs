@@ -1356,8 +1356,15 @@ impl SessionDensity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GridSelection {
     Track(usize),
-    Slot { track: usize, scene: usize },
+    Slot {
+        track: usize,
+        scene: usize,
+    },
     Scene(usize),
+    /// A return bus. Reachable only from the keyboard's `Tab` walk and
+    /// by clicking a return's head — a return has no grid row, so the
+    /// arrows alone could never have arrived at one.
+    Return(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1392,6 +1399,14 @@ pub struct SessionViewState {
     /// Which return's devices the rack is showing, if a return's head
     /// was clicked. View state, like every other selection here.
     pub selected_return: Option<usize>,
+    /// Which send row the keyboard is on.
+    ///
+    /// A cursor and not a selection: the mouse aims at a row directly
+    /// and needs no memory of which one, but a keyboard has to hold the
+    /// question "which send" somewhere between choosing it and turning
+    /// it. Clamped against the return list wherever it is read, so
+    /// deleting a return cannot leave it pointing past the end.
+    pub send_cursor: usize,
     /// Peak hold per track, in linear amplitude.
     ///
     /// VIEW state, deliberately: a hold answers "how loud did that get
@@ -1435,6 +1450,7 @@ impl Default for SessionViewState {
             owns_keyboard: false,
             memory_morph: 0.5,
             selected_return: None,
+            send_cursor: 0,
             peak_hold: Vec::new(),
             slot_drag: None,
             track_drag: None,
@@ -3970,6 +3986,11 @@ fn paint_return_strip(
         )
         .affords(Affords::Press);
     if response.clicked() {
+        // The view's own selection moves too, or the keyboard's Tab walk
+        // and the pointer would disagree about what is selected — and
+        // the next `M` would mute a lane instead of this bus.
+        state.selection = Some(GridSelection::Return(index));
+        state.owns_keyboard = true;
         intents.push(SessionIntent::SelectReturn(index));
     }
     let mute = control_button(
@@ -4535,6 +4556,56 @@ fn settle_scene_drag(
     }
 }
 
+/// How far one press moves a level or a pan, as a fraction of its rail.
+///
+/// A twentieth: twenty presses cross the whole range, which is coarse
+/// enough to get somewhere and fine enough to arrive. `Shift` divides it
+/// by five, the same ratio the mouse's fine drag uses — one number for
+/// "finer", so the two inputs teach each other.
+const KEY_STEP: f32 = 0.05;
+
+/// What a verb is acting on: a lane, or a return.
+///
+/// The keyboard's subject is whatever the selection names, and a slot
+/// names its lane — pressing `M` with a clip selected mutes the track
+/// that clip is on, which is what a hand reaching for mute means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Subject {
+    Track(usize),
+    Return(usize),
+}
+
+impl GridSelection {
+    /// The lane or return this selection acts on, if any.
+    fn subject(self) -> Option<Subject> {
+        match self {
+            Self::Track(track) | Self::Slot { track, .. } => Some(Subject::Track(track)),
+            Self::Return(index) => Some(Subject::Return(index)),
+            Self::Scene(_) => None,
+        }
+    }
+}
+
+/// The keyboard's whole vocabulary for this view.
+///
+/// # The rule the grammar is built on
+///
+/// THE SELECTION IS THE SUBJECT AND THE KEY IS THE VERB. A pointer
+/// carries its subject with it — whatever is under it — so it needs no
+/// grammar at all; a keyboard has to name the thing first and act
+/// second, and every key here reads as a sentence about whatever is
+/// selected. `Tab` changes what kind of thing that is; the arrows move
+/// within the kind; a letter does something to it.
+///
+/// # Why the modifiers are laid out this way
+///
+/// - bare arrows MOVE the selection,
+/// - `Shift` arrows move the THING — reorder,
+/// - `Ctrl` arrows turn its level and pan,
+/// - `Alt` arrows choose a send and turn it.
+///
+/// One axis of meaning per modifier, so a hand that learns one row of
+/// the table has learned the others.
 fn keyboard_intents(
     ui: &mut egui::Ui,
     document: &SessionDocument,
@@ -4550,57 +4621,355 @@ fn keyboard_intents(
     {
         intents.push(SessionIntent::SetFill(FillState::Off));
     }
+    let tracks = document.tracks.len();
+    let scenes = document.scenes.len();
+    let returns = document.returns.len();
     let mut selection = state.selection;
+    let mut send_cursor = state.send_cursor;
+    let mut morph = state.memory_morph;
     ui.input_mut(|input| {
-        let step_track = if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) {
-            -1
-        } else if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight) {
-            1
-        } else {
-            0
-        };
-        let step_scene = if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
-            -1
-        } else if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
-            1
-        } else if input.consume_key(egui::Modifiers::NONE, egui::Key::PageUp) {
-            -8
-        } else if input.consume_key(egui::Modifiers::NONE, egui::Key::PageDown) {
-            8
-        } else {
-            0
-        };
-        if step_track != 0 || step_scene != 0 {
-            let (track, scene) = match selection {
-                Some(GridSelection::Slot { track, scene }) => (track, scene),
-                Some(GridSelection::Track(track)) => (track, 0),
-                Some(GridSelection::Scene(scene)) => (0, scene),
-                None => (0, 0),
+        use egui::{Key, Modifiers};
+        let fine = input.modifiers.shift;
+        let scale = |amount: f32| if fine { amount * FINE_DRAG } else { amount };
+
+        // ---- what kind of thing is selected -----------------------------
+        //
+        // Tab walks the kinds: a slot, its lane, the scene it is on, the
+        // returns, and back. Every subject the pointer can reach is on
+        // this walk, which is what makes the rest of the table enough.
+        if input.consume_key(Modifiers::NONE, Key::Tab)
+            || input.consume_key(Modifiers::SHIFT, Key::Tab)
+        {
+            let back = input.modifiers.shift;
+            let (track, scene) = anchor(selection);
+            let order: Vec<GridSelection> = std::iter::once(GridSelection::Slot {
+                track: track.min(tracks.saturating_sub(1)),
+                scene: scene.min(scenes.saturating_sub(1)),
+            })
+            .chain(std::iter::once(GridSelection::Track(
+                track.min(tracks.saturating_sub(1)),
+            )))
+            .chain(std::iter::once(GridSelection::Scene(
+                scene.min(scenes.saturating_sub(1)),
+            )))
+            .chain((returns > 0).then_some(GridSelection::Return(0)))
+            .collect();
+            let at = selection
+                .and_then(|current| {
+                    order.iter().position(|candidate| {
+                        std::mem::discriminant(candidate) == std::mem::discriminant(&current)
+                    })
+                })
+                .unwrap_or(0);
+            let next = if back {
+                (at + order.len() - 1) % order.len()
+            } else {
+                (at + 1) % order.len()
             };
-            let track = (track as i32 + step_track)
-                .clamp(0, document.tracks.len().saturating_sub(1) as i32)
-                as usize;
-            let scene = (scene as i32 + step_scene)
-                .clamp(0, document.scenes.len().saturating_sub(1) as i32)
-                as usize;
-            selection = Some(GridSelection::Slot { track, scene });
-            intents.push(SessionIntent::SelectSlot { track, scene });
+            selection = Some(order[next]);
+            push_select(order[next], intents);
         }
-        if input.consume_key(egui::Modifiers::NONE, egui::Key::Enter) {
+
+        // ---- moving, and moving things ----------------------------------
+        let horizontal = arrow_step(input, Key::ArrowLeft, Key::ArrowRight);
+        let vertical = arrow_step(input, Key::ArrowUp, Key::ArrowDown)
+            + 8 * arrow_step(input, Key::PageUp, Key::PageDown);
+        let held = input.modifiers;
+        // Taken off the queue once they have been read, so an arrow that
+        // moved this grid does not go on to move egui's own focus as
+        // well. Read by key and consumed by key, because the modifier is
+        // what decides which row of the table the press belongs to.
+        if horizontal != 0 || vertical != 0 {
+            for key in [
+                Key::ArrowLeft,
+                Key::ArrowRight,
+                Key::ArrowUp,
+                Key::ArrowDown,
+                Key::PageUp,
+                Key::PageDown,
+            ] {
+                input.consume_key(held, key);
+            }
+        }
+
+        if (horizontal != 0 || vertical != 0) && held.is_none() {
+            selection = Some(walk(
+                selection, horizontal, vertical, tracks, scenes, returns,
+            ));
+            if let Some(next) = selection {
+                push_select(next, intents);
+            }
+        }
+        // Home and End are the ends of the same walk.
+        if input.consume_key(Modifiers::NONE, Key::Home)
+            || input.consume_key(Modifiers::NONE, Key::End)
+        {
+            let last = input.key_pressed(Key::End) || input.modifiers.is_none();
+            let (track, _) = anchor(selection);
+            let scene = if last { scenes.saturating_sub(1) } else { 0 };
+            selection = Some(GridSelection::Slot { track, scene });
+            push_select(GridSelection::Slot { track, scene }, intents);
+        }
+
+        // SHIFT moves the THING rather than the selection.
+        if held.shift_only() {
+            match (selection, horizontal, vertical) {
+                (
+                    Some(GridSelection::Track(track) | GridSelection::Slot { track, .. }),
+                    step,
+                    0,
+                ) if step != 0 => {
+                    let to = (track as i32 + step).clamp(0, tracks.saturating_sub(1) as i32);
+                    if to as usize != track {
+                        intents.push(SessionIntent::ReorderTrack {
+                            from: track,
+                            to: to as usize,
+                        });
+                    }
+                }
+                (Some(GridSelection::Scene(scene)), 0, step) if step != 0 => {
+                    let to = (scene as i32 + step).clamp(0, scenes.saturating_sub(1) as i32);
+                    if to as usize != scene {
+                        intents.push(SessionIntent::ReorderScene {
+                            from: scene,
+                            to: to as usize,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // CTRL turns the level and the pan of whatever is selected.
+        if held.command {
+            let subject = selection.and_then(GridSelection::subject);
+            if vertical != 0
+                && let Some(subject) = subject
+            {
+                let step = scale(KEY_STEP) * -(vertical.signum() as f32);
+                match subject {
+                    Subject::Track(track) => {
+                        let now = document.tracks.get(track).map_or(1.0, |lane| lane.volume);
+                        intents.push(SessionIntent::SetTrackVolume {
+                            track,
+                            value: fader_volume(fader_normalized(now) + step),
+                        });
+                    }
+                    Subject::Return(index) => {
+                        let now = document.returns.get(index).map_or(1.0, |bus| bus.volume);
+                        intents.push(SessionIntent::SetReturnVolume {
+                            index,
+                            value: fader_volume(fader_normalized(now) + step),
+                        });
+                    }
+                }
+            }
+            if horizontal != 0
+                && let Some(subject) = subject
+            {
+                let step = scale(KEY_STEP * 2.0) * horizontal.signum() as f32;
+                match subject {
+                    Subject::Track(track) => {
+                        let now = document.tracks.get(track).map_or(0.0, |lane| lane.pan);
+                        intents.push(SessionIntent::SetTrackPan {
+                            track,
+                            value: (now + step).clamp(-1.0, 1.0),
+                        });
+                    }
+                    Subject::Return(index) => {
+                        let now = document.returns.get(index).map_or(0.0, |bus| bus.pan);
+                        intents.push(SessionIntent::SetReturnPan {
+                            index,
+                            value: (now + step).clamp(-1.0, 1.0),
+                        });
+                    }
+                }
+            }
+        }
+
+        // ALT chooses a send and turns it.
+        if held.alt && returns > 0 {
+            if vertical != 0 {
+                send_cursor =
+                    (send_cursor as i32 + vertical.signum()).rem_euclid(returns as i32) as usize;
+            }
+            if horizontal != 0
+                && let Some(GridSelection::Track(track) | GridSelection::Slot { track, .. }) =
+                    selection
+            {
+                let index = send_cursor.min(returns - 1);
+                let now = document
+                    .tracks
+                    .get(track)
+                    .and_then(|lane| lane.sends.get(index))
+                    .copied()
+                    .unwrap_or(0.0);
+                let step = scale(KEY_STEP) * horizontal.signum() as f32;
+                intents.push(SessionIntent::SetTrackSend {
+                    track,
+                    index,
+                    value: send_level(send_normalized(now) + step),
+                });
+            }
+            // The morph between the two performance memories, which is a
+            // continuous control the pointer sweeps and the keyboard has
+            // to be able to reach some other way.
+            if held.command && horizontal != 0 {
+                morph = (morph + scale(KEY_STEP) * horizontal.signum() as f32).clamp(0.0, 1.0);
+                intents.push(SessionIntent::MorphMemories(morph));
+            }
+        }
+
+        // ---- launching and stopping -------------------------------------
+        if input.consume_key(Modifiers::NONE, Key::Enter) {
             match selection {
                 Some(GridSelection::Slot { track, scene }) => {
                     intents.push(SessionIntent::LaunchSlot { track, scene });
                 }
                 Some(GridSelection::Scene(scene)) => {
-                    intents.push(SessionIntent::LaunchScene(scene))
+                    intents.push(SessionIntent::LaunchScene(scene));
                 }
-                Some(GridSelection::Track(_)) | None => {}
+                Some(GridSelection::Track(_) | GridSelection::Return(_)) | None => {}
             }
         }
-        if input.consume_key(egui::Modifiers::NONE, egui::Key::Delete) {
+        // The wider gesture is offered the key FIRST: `consume_key` takes
+        // it, so a general match that ran first would eat the specific
+        // one and stop-all would never arrive.
+        if input.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Enter) {
+            intents.push(SessionIntent::StopAll);
+        } else if input.consume_key(Modifiers::COMMAND, Key::Enter)
+            && let Some(Subject::Track(track)) = selection.and_then(GridSelection::subject)
+        {
+            intents.push(SessionIntent::StopTrack {
+                track,
+                immediate: false,
+            });
+        }
+        if input.consume_key(Modifiers::COMMAND, Key::Backspace) {
+            intents.push(SessionIntent::BackToArrangement);
+        }
+
+        // ---- the verbs, one letter each ---------------------------------
+        let subject = selection.and_then(GridSelection::subject);
+        if input.consume_key(Modifiers::NONE, Key::M) {
+            match subject {
+                Some(Subject::Track(track)) => {
+                    intents.push(SessionIntent::ToggleTrackMute(track));
+                }
+                Some(Subject::Return(index)) => {
+                    intents.push(SessionIntent::ToggleReturnMute(index));
+                }
+                None => {}
+            }
+        }
+        if let Some(Subject::Track(track)) = subject {
+            // Solo is exclusive bare and additive on Ctrl, which is the
+            // pointer's rule said with a modifier instead of a click.
+            if input.consume_key(Modifiers::NONE, Key::S) {
+                intents.push(SessionIntent::SoloTrackExclusive(track));
+            }
+            if input.consume_key(Modifiers::COMMAND, Key::S) {
+                intents.push(SessionIntent::ToggleTrackSolo(track));
+            }
+            if input.consume_key(Modifiers::NONE, Key::R) {
+                intents.push(SessionIntent::ToggleTrackArm(track));
+            }
+            if input.consume_key(Modifiers::NONE, Key::O) {
+                intents.push(SessionIntent::ToggleTrackMonitor(track));
+            }
+            if input.consume_key(Modifiers::NONE, Key::I)
+                || input.consume_key(Modifiers::SHIFT, Key::I)
+            {
+                intents.push(SessionIntent::CycleTrackInput {
+                    track,
+                    back: input.modifiers.shift,
+                });
+            }
+            if input.consume_key(Modifiers::NONE, Key::G) {
+                intents.push(SessionIntent::ToggleTrackFold(track));
+            }
+            if input.consume_key(Modifiers::NONE, Key::C) {
+                intents.push(SessionIntent::ClearClipHold(track));
+            }
+        }
+        if let Some(GridSelection::Return(index)) = selection
+            && input.consume_key(Modifiers::NONE, Key::Enter)
+        {
+            intents.push(SessionIntent::SelectReturn(index));
+        }
+        if input.consume_key(Modifiers::NONE, Key::N)
+            && let Some(GridSelection::Slot { track, scene }) = selection
+        {
+            intents.push(SessionIntent::CreateMidiClip { track, scene });
+        }
+
+        // ---- the scene verbs --------------------------------------------
+        let (_, scene) = anchor(selection);
+        // Specific before general, for the reason stop-all gives above.
+        if input.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::N) {
+            intents.push(SessionIntent::CaptureScene);
+        } else if input.consume_key(Modifiers::COMMAND, Key::N) {
+            intents.push(SessionIntent::InsertSceneBelow(scene));
+        }
+
+        // ---- the clipboard ----------------------------------------------
+        if input.consume_key(Modifiers::COMMAND, Key::X) {
+            intents.push(SessionIntent::Lift);
+        }
+        if input.consume_key(Modifiers::COMMAND, Key::V) {
+            intents.push(SessionIntent::Drop);
+        }
+        // Moving a clip WITHOUT the clipboard: the drag's own verb, one
+        // slot at a time. Lift and drop can do it in two gestures; a
+        // hand that wants a clip one row down should not have to.
+        if held.alt
+            && held.shift
+            && let Some(GridSelection::Slot { track, scene }) = selection
+        {
+            let to_track = (track as i32 + horizontal).clamp(0, tracks.saturating_sub(1) as i32);
+            let to_scene =
+                (scene as i32 + vertical.signum()).clamp(0, scenes.saturating_sub(1) as i32);
+            let to = (to_track as usize, to_scene as usize);
+            if to != (track, scene) {
+                intents.push(SessionIntent::MoveSlots {
+                    from: (track, scene),
+                    to,
+                    copy: held.command,
+                });
+                selection = Some(GridSelection::Slot {
+                    track: to.0,
+                    scene: to.1,
+                });
+            }
+        }
+
+        // ---- the global settings ----------------------------------------
+        //
+        // Bracket keys step the launch quantisation, which is what the
+        // control strip's chip cycles by click.
+        let quantization = arrow_step(input, Key::OpenBracket, Key::CloseBracket);
+        if quantization != 0 {
+            let all = Quantization::ALL;
+            let at = all
+                .iter()
+                .position(|value| *value == document.global_quantization)
+                .unwrap_or(0);
+            let next = (at as i32 + quantization).rem_euclid(all.len() as i32) as usize;
+            intents.push(SessionIntent::SetGlobalQuantization(all[next]));
+        }
+        for (key, index) in [(Key::Num1, 0), (Key::Num2, 1)] {
+            if input.consume_key(Modifiers::NONE, key) {
+                intents.push(SessionIntent::RecallMemory {
+                    index,
+                    pressed: true,
+                });
+            }
+        }
+
+        if input.consume_key(Modifiers::NONE, Key::Delete) {
             intents.push(SessionIntent::DeleteSelection);
         }
-        if input.consume_key(egui::Modifiers::NONE, egui::Key::F) {
+        if input.consume_key(Modifiers::NONE, Key::F) {
             intents.push(SessionIntent::SetFill(if input.modifiers.shift {
                 match runtime.fill {
                     FillState::Latched => FillState::Off,
@@ -4610,12 +4979,106 @@ fn keyboard_intents(
                 FillState::Momentary
             }));
         }
-        if input.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
+        if input.consume_key(Modifiers::NONE, Key::Escape) {
             selection = None;
             intents.push(SessionIntent::ClearSelection);
         }
     });
     state.selection = selection;
+    state.send_cursor = if returns == 0 {
+        0
+    } else {
+        send_cursor.min(returns - 1)
+    };
+    state.memory_morph = morph;
+}
+
+/// `-1`, `0` or `1` from a pair of opposed keys, whatever is held.
+///
+/// `consume_key` matches modifiers exactly, and this table's whole point
+/// is that the SAME arrow means different things under different ones —
+/// so the arrows are read by key alone and the modifier is asked
+/// separately.
+fn arrow_step(input: &mut egui::InputState, back: egui::Key, forward: egui::Key) -> i32 {
+    let mut step = 0;
+    if input.key_pressed(back) {
+        step -= 1;
+    }
+    if input.key_pressed(forward) {
+        step += 1;
+    }
+    step
+}
+
+/// The (track, scene) a selection sits at, for a verb that needs both.
+fn anchor(selection: Option<GridSelection>) -> (usize, usize) {
+    match selection {
+        Some(GridSelection::Slot { track, scene }) => (track, scene),
+        Some(GridSelection::Track(track)) => (track, 0),
+        Some(GridSelection::Scene(scene)) => (0, scene),
+        Some(GridSelection::Return(_)) | None => (0, 0),
+    }
+}
+
+fn push_select(selection: GridSelection, intents: &mut Vec<SessionIntent>) {
+    intents.push(match selection {
+        GridSelection::Slot { track, scene } => SessionIntent::SelectSlot { track, scene },
+        GridSelection::Track(track) => SessionIntent::SelectTrack(track),
+        GridSelection::Scene(scene) => SessionIntent::SelectScene(scene),
+        GridSelection::Return(index) => SessionIntent::SelectReturn(index),
+    });
+}
+
+/// One bare-arrow step, within whatever kind of thing is selected.
+fn walk(
+    selection: Option<GridSelection>,
+    horizontal: i32,
+    vertical: i32,
+    tracks: usize,
+    scenes: usize,
+    returns: usize,
+) -> GridSelection {
+    let clamp = |value: i32, len: usize| value.clamp(0, len.saturating_sub(1) as i32) as usize;
+    match selection {
+        Some(GridSelection::Track(track)) => {
+            // Down out of the header row and into the grid, which is the
+            // move a hand makes after choosing a lane.
+            if vertical > 0 {
+                GridSelection::Slot { track, scene: 0 }
+            } else {
+                GridSelection::Track(clamp(track as i32 + horizontal, tracks))
+            }
+        }
+        Some(GridSelection::Scene(scene)) => {
+            if horizontal > 0 {
+                GridSelection::Slot { track: 0, scene }
+            } else {
+                GridSelection::Scene(clamp(scene as i32 + vertical, scenes))
+            }
+        }
+        Some(GridSelection::Return(index)) => {
+            GridSelection::Return(clamp(index as i32 + horizontal, returns.max(1)))
+        }
+        Some(GridSelection::Slot { track, scene }) => {
+            // Up off the top row lands on the lane's own header, which is
+            // where the grid ends and the strip begins.
+            if vertical < 0 && scene == 0 {
+                GridSelection::Track(track)
+            } else {
+                GridSelection::Slot {
+                    track: clamp(track as i32 + horizontal, tracks),
+                    scene: clamp(scene as i32 + vertical, scenes),
+                }
+            }
+        }
+        // Nothing selected: the first arrow lands where that arrow
+        // points from the corner, rather than merely materialising a
+        // selection there and making the press count for nothing.
+        None => GridSelection::Slot {
+            track: clamp(horizontal.max(0), tracks),
+            scene: clamp(vertical.max(0), scenes),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -5492,6 +5955,14 @@ mod tests {
                         rect.max.to_vec2() + egui::vec2(64.0, 64.0),
                     )),
                     events: vec![
+                        // The modifiers are STATED before the key, not
+                        // only attached to it. Half the table reads
+                        // `input.modifiers` rather than matching on
+                        // `consume_key`, and without this every one of
+                        // those rows tested as unbound — the harness
+                        // said the keyboard could not do things it
+                        // could already do.
+                        egui::Event::ModifiersChanged(*modifiers),
                         egui::Event::Key {
                             key: *key,
                             physical_key: None,
@@ -6455,6 +6926,298 @@ mod tests {
                 .get(RETURN_HOLD_BASE)
                 .is_some_and(|hold| (*hold - 0.8).abs() < 1e-5),
             "the return's hold is not where the strip looks for it"
+        );
+    }
+
+    // -------------------------------------------- keyboard parity ---
+
+    /// The name of an intent's variant — `SetTrackVolume`, not the values
+    /// it carries.
+    ///
+    /// Parity is about CAPABILITIES, not about arriving at the same
+    /// number: a keyboard that can move a fader has parity with a mouse
+    /// that can move a fader, and insisting both reach 0.63 dB would be
+    /// insisting the keyboard is a mouse.
+    fn capability(intent: &SessionIntent) -> String {
+        let text = format!("{intent:?}");
+        text.split(['(', ' ', '{'])
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    fn names(intents: &[SessionIntent]) -> std::collections::BTreeSet<String> {
+        intents.iter().map(capability).collect()
+    }
+
+    /// A document with one of everything a control can be pointed at.
+    fn everything() -> SessionDocument {
+        let mut document = with_returns(2);
+        document.input_channels = 2;
+        document.tracks[0].sends = vec![0.3, 0.0];
+        document.tracks[1].sends = vec![0.0, 0.4];
+        document
+    }
+
+    /// Every rectangle the pointer can act on, pressed in turn.
+    ///
+    /// Built from the LAYOUT rather than from a list of coordinates, so a
+    /// control that moves stays covered and a control that is added
+    /// without a keyboard route makes this fail rather than quietly
+    /// widening the gap.
+    fn pointer_capabilities() -> std::collections::BTreeSet<String> {
+        let document = everything();
+        let mut runtime = SessionRuntime::new(document.tracks.len());
+        runtime.returns = vec![TrackRuntime::default(); document.returns.len()];
+        runtime.tracks[0].clipped = true;
+        let base = SessionViewState::default();
+        let layout = SessionLayout::new(view(), SessionShape::of(&document), &base);
+
+        let mut targets: Vec<(egui::Pos2, egui::Pos2)> = Vec::new();
+        for track in 0..document.tracks.len() {
+            let strip = MixerStrip::new(
+                layout.mixer(track),
+                StripContent {
+                    sends: document.returns.len(),
+                    io: matches!(document.tracks[track].kind, TrackKind::Audio),
+                },
+            );
+            targets.push((layout.header(track).center(), layout.header(track).center()));
+            targets.push((strip.mute.center(), strip.mute.center()));
+            targets.push((strip.solo.center(), strip.solo.center()));
+            for rect in [strip.arm, strip.monitor, strip.route, strip.pan, strip.peak]
+                .into_iter()
+                .flatten()
+            {
+                targets.push((rect.center(), rect.center()));
+            }
+            for row in &strip.sends {
+                targets.push((row.center(), row.center()));
+            }
+            targets.push((
+                layout.stop_track(track).center(),
+                layout.stop_track(track).center(),
+            ));
+            for scene in 0..document.scenes.len() {
+                targets.push((
+                    layout.slot_launch(track, scene).center(),
+                    layout.slot_launch(track, scene).center(),
+                ));
+                targets.push((
+                    layout.slot_body(track, scene).center(),
+                    layout.slot_body(track, scene).center(),
+                ));
+            }
+            // The gestures that are a MOVE rather than a press.
+            let fader = strip.fader;
+            targets.push((
+                fader.center(),
+                egui::pos2(fader.center().x, fader.top() + 2.0),
+            ));
+            if let Some(pan) = strip.pan {
+                targets.push((pan.center(), pan.right_center()));
+            }
+            if let Some(row) = strip.sends.first() {
+                targets.push((row.center(), row.right_center()));
+            }
+            targets.push((
+                layout.track_grip(track).center(),
+                layout
+                    .track_grip((track + 1).min(document.tracks.len() - 1))
+                    .center(),
+            ));
+            targets.push((
+                layout.slot_body(track, 0).center(),
+                layout.slot_body(track, 2).center(),
+            ));
+        }
+        for index in 0..document.returns.len() {
+            let strip = MixerStrip::new(layout.return_mixer(index), StripContent::default());
+            targets.push((strip.mute.center(), strip.mute.center()));
+            targets.push((strip.solo.center(), strip.solo.center()));
+            if let Some(pan) = strip.pan {
+                targets.push((pan.center(), pan.right_center()));
+            }
+            targets.push((
+                strip.fader.center(),
+                egui::pos2(strip.fader.center().x, strip.fader.top() + 2.0),
+            ));
+        }
+        for scene in 0..document.scenes.len() {
+            targets.push((
+                layout.scene_launch(scene).center(),
+                layout.scene_launch(scene).center(),
+            ));
+            targets.push((
+                layout.scene_body(scene).center(),
+                layout.scene_body(scene).center(),
+            ));
+            targets.push((
+                layout.scene_grip(scene).center(),
+                layout
+                    .scene_grip((scene + 1).min(document.scenes.len() - 1))
+                    .center(),
+            ));
+        }
+        targets.push((layout.stop_all().center(), layout.stop_all().center()));
+        targets.push((layout.add_scene().center(), layout.add_scene().center()));
+        // The control strip across the top, swept rather than aimed: its
+        // tiles are laid out inside the painter and have no accessor.
+        let strip = layout.control_strip();
+        let mut x = strip.left() + 4.0;
+        while x < strip.right() {
+            targets.push((
+                egui::pos2(x, strip.center().y),
+                egui::pos2(x, strip.center().y),
+            ));
+            targets.push((
+                egui::pos2(x, strip.center().y),
+                egui::pos2(x + 40.0, strip.center().y),
+            ));
+            x += 20.0;
+        }
+
+        let mut seen = std::collections::BTreeSet::new();
+        for (from, to) in targets {
+            for path in [
+                probe::click_path(from),
+                probe::double_click_path(from),
+                probe::click_path_holding(from, egui::Modifiers::COMMAND),
+                probe::drag_path(from, to, 4),
+            ] {
+                let mut state = SessionViewState::default();
+                seen.extend(names(&flattened(&render_path(
+                    &document, &runtime, &mut state, &path,
+                ))));
+            }
+        }
+        seen
+    }
+
+    /// Every key the view answers, pressed with every modifier that
+    /// could change what it means.
+    fn keyboard_capabilities() -> std::collections::BTreeSet<String> {
+        use egui::Key;
+        let document = everything();
+        let mut runtime = SessionRuntime::new(document.tracks.len());
+        runtime.returns = vec![TrackRuntime::default(); document.returns.len()];
+        let keys = [
+            Key::ArrowUp,
+            Key::ArrowDown,
+            Key::ArrowLeft,
+            Key::ArrowRight,
+            Key::PageUp,
+            Key::PageDown,
+            Key::Home,
+            Key::End,
+            Key::Enter,
+            Key::Space,
+            Key::Delete,
+            Key::Backspace,
+            Key::Escape,
+            Key::Tab,
+            Key::A,
+            Key::B,
+            Key::C,
+            Key::D,
+            Key::E,
+            Key::F,
+            Key::G,
+            Key::I,
+            Key::L,
+            Key::M,
+            Key::N,
+            Key::O,
+            Key::Q,
+            Key::R,
+            Key::S,
+            Key::V,
+            Key::X,
+            Key::Z,
+            Key::Num1,
+            Key::Num2,
+            Key::Minus,
+            Key::Equals,
+            Key::OpenBracket,
+            Key::CloseBracket,
+        ];
+        // Every combination the table gives a meaning to. A sweep that
+        // skipped one would report the binding as missing and send
+        // somebody off to write a key that is already there.
+        let mods = [
+            egui::Modifiers::NONE,
+            egui::Modifiers::SHIFT,
+            egui::Modifiers::COMMAND,
+            egui::Modifiers::ALT,
+            egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
+            egui::Modifiers::ALT.plus(egui::Modifiers::SHIFT),
+            egui::Modifiers::ALT.plus(egui::Modifiers::COMMAND),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for key in keys {
+            for modifiers in mods {
+                // A fresh state per press, then the same press twice —
+                // some verbs only make sense once something is selected,
+                // and the arrows are what select.
+                let mut state = SessionViewState {
+                    owns_keyboard: true,
+                    selection: Some(GridSelection::Slot { track: 0, scene: 0 }),
+                    ..SessionViewState::default()
+                };
+                seen.extend(names(&key_path(
+                    &document,
+                    &runtime,
+                    &mut state,
+                    &[(modifiers, key), (modifiers, key)],
+                )));
+                for anchor in [
+                    GridSelection::Track(0),
+                    GridSelection::Scene(0),
+                    GridSelection::Return(0),
+                ] {
+                    let mut state = SessionViewState {
+                        owns_keyboard: true,
+                        selection: Some(anchor),
+                        ..SessionViewState::default()
+                    };
+                    seen.extend(names(&key_path(
+                        &document,
+                        &runtime,
+                        &mut state,
+                        &[(modifiers, key)],
+                    )));
+                }
+            }
+        }
+        seen
+    }
+
+    /// WHAT THE POINTER CAN DO, THE KEYBOARD CAN DO.
+    ///
+    /// Not the same gesture and not the same value — a keyboard that
+    /// can move a fader has parity with a mouse that can move a fader,
+    /// and demanding both reach 0.63 dB would be demanding the keyboard
+    /// be a mouse. What is compared is the set of CAPABILITIES: which
+    /// intents each input can produce at all.
+    ///
+    /// The pointer half is built from the layout rather than from a list
+    /// of coordinates, so a control added tomorrow without a keyboard
+    /// route fails this rather than quietly widening the gap.
+    #[test]
+    fn the_keyboard_reaches_everything_the_pointer_does() {
+        let pointer = pointer_capabilities();
+        let keyboard = keyboard_capabilities();
+        assert!(
+            pointer.len() > 12,
+            "the pointer sweep found only {} capabilities — it has stopped \
+             finding the controls: {pointer:?}",
+            pointer.len()
+        );
+        let missing: Vec<&String> = pointer.difference(&keyboard).collect();
+        assert!(
+            missing.is_empty(),
+            "the pointer can do these and the keyboard cannot:\n{missing:#?}\n\
+             keyboard has: {keyboard:#?}"
         );
     }
 
