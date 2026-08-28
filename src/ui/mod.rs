@@ -412,6 +412,7 @@ mod tests {
             "probe.rs",     // the headless pointer harness: test-only, draws nothing
             "glue.rs",      // a card: its size is the sum of what it holds
             "kick.rs",      // ditto
+            "haze.rs",      // a card: its size is the widest of its four pages
             "limiter.rs",   // ditto
             "lofi.rs",      // ditto
             "sheen.rs",     // ditto

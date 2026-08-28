@@ -89,6 +89,7 @@ pub mod gate;
 pub mod glue;
 pub mod handclap;
 pub mod hat;
+pub mod haze;
 pub mod kick;
 pub mod knob;
 pub mod limiter;

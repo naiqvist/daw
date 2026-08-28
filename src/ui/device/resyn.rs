@@ -49,6 +49,7 @@ use crate::params::resyn::{
     TABLE, WARM, WARM_NAMES,
 };
 use crate::params::{self};
+use crate::ui::affordance::{Afford, Affords};
 use crate::ui::device::synth::ParamEdit;
 use crate::ui::device::{
     Footprint, Mapping, Param, Unit, Well, Wells, card, metrics, poly_widgets, switch,
@@ -276,31 +277,62 @@ pub fn resyn_edits(state: &ResynUi) -> Vec<ParamEdit> {
 const F_MIN: f32 = 20.0;
 const F_MAX: f32 = 20_000.0;
 
-/// The hero: eight bars, one per band, on the frequency axis they cover.
-fn bands(ui: &mut egui::Ui, theme: &Theme, state: &ResynUi) {
-    let (rect, _) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
+/// The part of the hero the eight band sliders occupy. The frequency labels
+/// sit below it and deliberately take no gesture.
+fn band_field(rect: egui::Rect, theme: &Theme) -> egui::Rect {
+    let plot = rect.shrink(theme.sp(space::XS));
+    let label_h = theme.sp(font::MICRO_LABEL) + theme.sp(space::XXS);
+    egui::Rect::from_min_max(plot.min, egui::pos2(plot.right(), plot.bottom() - label_h))
+}
+
+fn x_of(field: egui::Rect, hz: f32) -> f32 {
+    let t = (hz / F_MIN).max(1e-6).log10() / (F_MAX / F_MIN).log10();
+    field.left() + field.width() * t.clamp(0.0, 1.0)
+}
+
+/// One band owns one whole vertical lane. That makes a flat, one-pixel bar
+/// just as grabbable as a boosted one and leaves no nearest-handle search to
+/// change targets halfway through a drag.
+fn band_lane(field: egui::Rect, index: usize) -> Option<egui::Rect> {
+    let lo = *BAND_EDGES.get(index)?;
+    let hi = *BAND_EDGES.get(index + 1)?;
+    Some(egui::Rect::from_min_max(
+        egui::pos2(x_of(field, lo), field.top()),
+        egui::pos2(x_of(field, hi), field.bottom()),
+    ))
+}
+
+/// The dB value under a pointer. This is exactly the inverse of the bar's
+/// vertical mapping, including the asymmetric -24/+12 dB range.
+fn db_at_y(field: egui::Rect, y: f32) -> f32 {
+    if field.height() <= 0.0 {
+        return 0.0;
+    }
+    let span = BAND_MIN_DB.abs().max(BAND_MAX_DB);
+    let db = (field.center().y - y) / (field.height() * 0.5) * span;
+    db.clamp(BAND_MIN_DB, BAND_MAX_DB)
+}
+
+/// The hero: eight draggable bars, one per band, on the frequency axis they
+/// cover. Returns one edit for each band changed this frame.
+fn bands(ui: &mut egui::Ui, theme: &Theme, state: &mut ResynUi) -> Vec<ParamEdit> {
+    let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
     if !ui.is_rect_visible(rect) {
-        return;
+        return Vec::new();
     }
     let painter = ui.painter_at(rect);
     let pad = theme.sp(space::XS);
     let plot = rect.shrink(pad);
-    let label_h = theme.sp(font::MICRO_LABEL) + theme.sp(space::XXS);
-    let field =
-        egui::Rect::from_min_max(plot.min, egui::pos2(plot.right(), plot.bottom() - label_h));
+    let field = band_field(rect, theme);
     let mid = field.center().y;
     let half = field.height() * 0.5;
-    let x_of = |hz: f32| {
-        let t = (hz / F_MIN).max(1e-6).log10() / (F_MAX / F_MIN).log10();
-        field.left() + field.width() * t.clamp(0.0, 1.0)
-    };
     // The axis is the band range's own, so a bar at its stop touches the
     // edge of the lane and one at rest sits exactly on the centre line.
     let span = BAND_MIN_DB.abs().max(BAND_MAX_DB);
     let y_of = |db: f32| mid - (db / span).clamp(-1.0, 1.0) * half;
 
     for (hz, name) in [(100.0f32, "100"), (1_000.0, "1k"), (10_000.0, "10k")] {
-        let x = x_of(hz);
+        let x = x_of(field, hz);
         painter.line_segment(
             [egui::pos2(x, field.top()), egui::pos2(x, field.bottom())],
             egui::Stroke::new(stroke::HAIR, theme.grid_sub),
@@ -321,21 +353,45 @@ fn bands(ui: &mut egui::Ui, theme: &Theme, state: &ResynUi) {
         egui::Stroke::new(stroke::HAIR, theme.text_muted),
     );
 
+    let mut edits = Vec::new();
     for index in 0..BAND_COUNT {
-        let Some(lo) = BAND_EDGES.get(index) else {
+        let Some(lane) = band_lane(field, index) else {
             continue;
         };
-        let Some(hi) = BAND_EDGES.get(index + 1) else {
-            continue;
-        };
+        // ONE TARGET, ONE INTERACTION. The full lane is the target rather
+        // than the bar's current ink: at 0 dB that ink is one pixel high,
+        // and a one-pixel control is not a control. The lanes meet but do
+        // not overlap, so every press has exactly one owner.
+        let handle = ui
+            .interact(
+                lane,
+                response.id.with(("resyn-band", index)),
+                egui::Sense::click_and_drag(),
+            )
+            .affords(Affords::Slide);
+        if handle.drag_started() || handle.clicked() {
+            state.selected = index;
+        }
+        if (handle.dragged() || handle.clicked())
+            && let Some(at) = handle.interact_pointer_pos()
+        {
+            let id = BAND0 + index as u32;
+            let next = resyn_norm(id, db_at_y(field, at.y));
+            if state.bands[index] != next {
+                state.bands[index] = next;
+                edits.push(ParamEdit {
+                    param: id,
+                    value: resyn_value(id, next),
+                });
+            }
+        }
+
         let db = resyn_value(BAND0 + index as u32, state.bands[index]);
-        let x0 = x_of(*lo);
-        let x1 = x_of(*hi);
         // A hairline of inset, so eight bars read as eight rather than as
         // one striped block.
         let bar = egui::Rect::from_min_max(
-            egui::pos2(x0 + 1.0, y_of(db.max(0.0))),
-            egui::pos2(x1 - 1.0, y_of(db.min(0.0))),
+            egui::pos2(lane.left() + 1.0, y_of(db.max(0.0))),
+            egui::pos2(lane.right() - 1.0, y_of(db.min(0.0))),
         );
         // A band at rest still gets a mark, so flat reads as a row of
         // bars rather than as nothing drawn.
@@ -351,12 +407,17 @@ fn bands(ui: &mut egui::Ui, theme: &Theme, state: &ResynUi) {
         painter.rect_filled(
             bar,
             0.0,
-            if picked {
+            if picked || handle.hovered() || handle.dragged() {
                 theme.role_mod
             } else {
                 theme.role_mod_dim
             },
         );
+        handle.on_hover_text(format!(
+            "band {} — drag vertically · {}",
+            index + 1,
+            param_of(BAND0 + index as u32).format(state.bands[index])
+        ));
     }
 
     // The corner tag: which band the cell row is pointed at, since the
@@ -369,6 +430,7 @@ fn bands(ui: &mut egui::Ui, theme: &Theme, state: &ResynUi) {
         egui::FontId::proportional(font::MICRO_LABEL),
         theme.text_muted,
     );
+    edits
 }
 
 /// What ONE cell needs: room for the widest thing it will ever print.
@@ -433,11 +495,9 @@ pub fn resyn_card(ui: &mut egui::Ui, theme: &Theme, state: &mut ResynUi) -> Vec<
         card::wells(ui, theme, &layout, |ui, _| {
             poly_widgets::dark_curve_panel(ui, theme, None, 0.0, 0, FOOTER_ROWS, |ui, region| {
                 match region {
-                    // A READOUT. Eight bars could each be a handle, but
-                    // that is rule 1's territory — one interaction per
-                    // target, and the picker plus the gain cell already
-                    // reach every one of them.
-                    poly_widgets::CurveRegion::Plot => bands(ui, theme, state),
+                    poly_widgets::CurveRegion::Plot => {
+                        edits.extend(bands(ui, theme, state));
+                    }
                     poly_widgets::CurveRegion::Footer => {
                         // The row height comes off the footer with the
                         // GAPS TAKEN FIRST — rule 2. Dividing the height
@@ -507,6 +567,7 @@ pub fn resyn_card(ui: &mut egui::Ui, theme: &Theme, state: &mut ResynUi) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::device::probe;
 
     #[test]
     fn every_table_row_leaves_as_an_edit() {
@@ -665,5 +726,149 @@ mod tests {
             plot > theme.sp(control::POLY_CELL_H) * 3.0,
             "the footer left the plot only {plot} points"
         );
+    }
+
+    // ---------------------------------------------------- with a pointer ---
+
+    const PROBE: egui::Rect = egui::Rect {
+        min: egui::pos2(0.0, 0.0),
+        max: egui::pos2(420.0, 120.0),
+    };
+
+    fn gesture(state: &mut ResynUi, path: &[probe::Step]) -> Vec<ParamEdit> {
+        let ctx = egui::Context::default();
+        let theme = Theme::dark();
+        probe::run(&ctx, PROBE, path, |ui| bands(ui, &theme, state))
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    fn lane_at(index: usize) -> egui::Rect {
+        let theme = Theme::dark();
+        band_lane(band_field(PROBE, &theme), index).expect("a real band has a lane")
+    }
+
+    /// Every lane is its own target: pressing it selects and edits that
+    /// band, and no other parameter can leak out of the gesture.
+    #[test]
+    fn pressing_each_bar_edits_that_band() {
+        let theme = Theme::dark();
+        let field = band_field(PROBE, &theme);
+        for index in 0..BAND_COUNT {
+            let mut state = ResynUi {
+                selected: (index + 3) % BAND_COUNT,
+                ..ResynUi::default()
+            };
+            let before = state.bands;
+            let lane = lane_at(index);
+            let at = egui::pos2(lane.center().x, field.center().y - field.height() * 0.125);
+            let edits = gesture(&mut state, &probe::click_path(at));
+
+            assert_eq!(state.selected, index, "band {} was not selected", index + 1);
+            assert_ne!(
+                state.bands[index],
+                before[index],
+                "band {} did not move",
+                index + 1
+            );
+            assert!(
+                edits.iter().all(|edit| edit.param == BAND0 + index as u32),
+                "band {}'s press wrote another parameter: {edits:?}",
+                index + 1
+            );
+            for (other, was) in before.iter().enumerate() {
+                if other != index {
+                    assert_eq!(
+                        state.bands[other],
+                        *was,
+                        "band {} moved during band {}'s press",
+                        other + 1,
+                        index + 1
+                    );
+                }
+            }
+        }
+    }
+
+    /// A diagonal drag may cross several lanes, but egui keeps the
+    /// interaction that owned the press for the gesture's whole life.
+    #[test]
+    fn a_drag_keeps_its_bar_when_it_crosses_neighbours() {
+        let theme = Theme::dark();
+        let field = band_field(PROBE, &theme);
+        let mut state = ResynUi::default();
+        let from = egui::pos2(lane_at(1).center().x, field.center().y);
+        let to = egui::pos2(lane_at(6).center().x, field.top());
+        let before = state.bands;
+
+        let edits = gesture(&mut state, &probe::drag_path(from, to, 12));
+
+        assert_eq!(state.selected, 1);
+        assert_ne!(state.bands[1], before[1], "the grabbed bar did not move");
+        assert!(
+            edits.iter().all(|edit| edit.param == BAND0 + 1),
+            "the drag escaped into another bar: {edits:?}"
+        );
+        for (other, was) in before.iter().enumerate() {
+            if other != 1 {
+                assert_eq!(state.bands[other], *was, "band {} moved", other + 1);
+            }
+        }
+    }
+
+    /// Pinning a bar at its maximum does not lose ownership when the
+    /// pointer leaves the display; the same drag can bring it back down.
+    #[test]
+    fn a_bar_pinned_at_an_end_keeps_dragging() {
+        let theme = Theme::dark();
+        let field = band_field(PROBE, &theme);
+        let mut state = ResynUi::default();
+        let from = egui::pos2(lane_at(4).center().x, field.center().y);
+        let above = egui::pos2(from.x, field.top() - 100.0);
+        let below = egui::pos2(from.x, field.bottom() + 100.0);
+        let path = [
+            probe::Step::moved(from),
+            probe::Step::press(from),
+            probe::Step::moved(above),
+            probe::Step::moved(below),
+            probe::Step::release(below),
+        ];
+
+        let edits = gesture(&mut state, &path);
+        let id = BAND0 + 4;
+        assert!(
+            (resyn_value(id, state.bands[4]) - BAND_MIN_DB).abs() < 1e-3,
+            "the same drag did not return from the ceiling to the floor"
+        );
+        assert!(
+            edits.iter().all(|edit| edit.param == id),
+            "the pinned drag escaped into another bar: {edits:?}"
+        );
+    }
+
+    /// The labels and outer padding are explanation, not hidden controls.
+    #[test]
+    fn pressing_outside_the_bar_field_moves_nothing() {
+        let theme = Theme::dark();
+        let field = band_field(PROBE, &theme);
+        let mut state = ResynUi::default();
+        let before = state;
+        let label = egui::pos2(PROBE.center().x, (field.bottom() + PROBE.bottom()) * 0.5);
+
+        let edits = gesture(&mut state, &probe::click_path(label));
+
+        assert!(edits.is_empty(), "the label emitted {edits:?}");
+        assert_eq!(state, before, "the label changed the card");
+    }
+
+    #[test]
+    fn the_pointer_mapping_matches_the_drawn_range() {
+        let field = band_field(PROBE, &Theme::dark());
+        assert!((db_at_y(field, field.center().y) - 0.0).abs() < 1e-6);
+        assert!((db_at_y(field, field.top()) - BAND_MAX_DB).abs() < 1e-6);
+        assert!((db_at_y(field, field.bottom()) - BAND_MIN_DB).abs() < 1e-6);
+        assert_eq!(db_at_y(field, field.top() - 1_000.0), BAND_MAX_DB);
+        assert_eq!(db_at_y(field, field.bottom() + 1_000.0), BAND_MIN_DB);
     }
 }
