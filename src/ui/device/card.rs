@@ -39,7 +39,15 @@ const DOT_R: f32 = 0.3;
 /// or rebuilt in between and a remembered index would name the wrong
 /// device by then.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub struct Carried(pub u64);
+pub struct Carried {
+    pub instance: u64,
+    /// Where it started in the chain.
+    ///
+    /// Carried along because the DROP LINE has to know which way the
+    /// card is travelling — it lands after its target going right and
+    /// before it going left — and an id alone says nothing about order.
+    pub index: usize,
+}
 
 /// What the pointer did to one card's title strip.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -91,6 +99,9 @@ pub struct Handle<'a> {
     /// The strip at the top of it, which is what can be taken hold of.
     pub title: egui::Rect,
     pub instance: u64,
+    /// Where this card sits in the chain, so a drop can be drawn on the
+    /// side the card would actually land.
+    pub index: usize,
     /// What the ghost says while it is in the air.
     pub name: &'a str,
     pub selected: bool,
@@ -118,21 +129,24 @@ pub fn grip(ui: &mut egui::Ui, theme: &Theme, handle: Handle<'_>) -> Grip {
         additive: ui.input(|input| input.modifiers.command || input.modifiers.shift),
         ..Grip::default()
     };
-    response.dnd_set_drag_payload(Carried(handle.instance));
+    response.dnd_set_drag_payload(Carried {
+        instance: handle.instance,
+        index: handle.index,
+    });
 
     // WHAT IS OVER THIS CARD, and what was let go over it. Both ask
     // `contains_pointer` rather than `hovered`, and that is not a detail:
     // egui reports every other widget as un-hovered while a drag is in
     // flight, so a drop test written on `hovered` can never fire. The
     // first version of this was, and did not.
-    let hovering = response.dnd_hover_payload::<Carried>().map(|held| held.0);
-    if let Some(from) = response.dnd_release_payload::<Carried>().map(|held| held.0)
-        && from != handle.instance
+    let hovering = response.dnd_hover_payload::<Carried>().map(|held| *held);
+    if let Some(held) = response.dnd_release_payload::<Carried>()
+        && held.instance != handle.instance
     {
-        out.dropped_from = Some(from);
+        out.dropped_from = Some(held.instance);
     }
     out.carrying = egui::DragAndDrop::payload::<Carried>(ui.ctx())
-        .is_some_and(|held| held.0 == handle.instance);
+        .is_some_and(|held| held.instance == handle.instance);
 
     if handle.selected || out.carrying {
         ui.painter().rect_filled(
@@ -166,11 +180,20 @@ pub fn grip(ui: &mut egui::Ui, theme: &Theme, handle: Handle<'_>) -> Grip {
     // on the LEADING edge, because that is where the carried device will
     // be — a drop that only highlighted the target would leave "before or
     // after" for the user to find out by doing it.
-    if hovering.is_some_and(|from| from != handle.instance) {
+    if let Some(held) = hovering.filter(|held| held.instance != handle.instance) {
+        // The side the card will ACTUALLY land on. Drawn always-left, the
+        // line would promise "before this one" and then put the card
+        // after it half the time — a preview that lies is worse than no
+        // preview, because the hand trusts it.
+        let x = if held.index < handle.index {
+            handle.card.right()
+        } else {
+            handle.card.left()
+        };
         ui.painter().line_segment(
             [
-                handle.card.left_top(),
-                egui::pos2(handle.card.left(), handle.card.bottom()),
+                egui::pos2(x, handle.card.top()),
+                egui::pos2(x, handle.card.bottom()),
             ],
             egui::Stroke::new(crate::ui::tokens::stroke::BOLD * 1.5, theme.accent),
         );
@@ -1239,6 +1262,7 @@ pub(crate) mod grip_tests {
                         card,
                         title: title_band(&theme, card),
                         instance: index,
+                        index: index as usize - 1,
                         name: "filter",
                         selected: false,
                     },
@@ -1287,6 +1311,7 @@ pub(crate) mod grip_tests {
                     card,
                     title: title_band(&theme, card),
                     instance: 1,
+                    index: 0,
                     name: "filter",
                     selected: false,
                 },

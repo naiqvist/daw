@@ -12129,6 +12129,10 @@ fn draw_device_card(
     samplers: &HashMap<u64, SamplerFace>,
     slices: &HashMap<u64, Vec<u64>>,
     selected: &std::collections::BTreeSet<u64>,
+    // Where this card sits in the chain. The drop line needs it: a card
+    // lands after its target going right and before it going left, and
+    // an id alone says nothing about which way that is.
+    index: usize,
     edits: &mut DeviceEdits,
 ) -> Vec<device::ParamEdit> {
     // The card speaks normalized knob positions and
@@ -12346,6 +12350,7 @@ fn draw_device_card(
             // rebuilt from the font, so the two cannot drift.
             title: device::card::title_band(theme, drawn.response.rect),
             instance: instance.id,
+            index,
             name: instance.kind().spec().name,
             selected: selected.contains(&instance.id),
         },
@@ -12503,7 +12508,9 @@ fn device_body(
                         // drawn by its rack, not here. The chain stays
                         // flat and the nesting is read off `parent`,
                         // which is what made a rack affordable at all.
-                        for instance in chain.iter().filter(|d| d.parent.is_none()) {
+                        for (index, instance) in
+                            chain.iter().enumerate().filter(|(_, d)| d.parent.is_none())
+                        {
                             if !matches!(instance.state, DeviceState::Rack) {
                                 draw_device_card(
                                     ui,
@@ -12514,6 +12521,7 @@ fn device_body(
                                     samplers,
                                     slices,
                                     selected,
+                                    index,
                                     &mut edits,
                                 );
                                 continue;
@@ -12522,7 +12530,10 @@ fn device_body(
                             let mut rack = before.clone();
                             let out = device::rack_card(ui, theme, instance.id, &mut rack, |ui| {
                                 let mut touched = Vec::new();
-                                for child in chain.iter().filter(|d| d.parent == Some(instance.id))
+                                for (index, child) in chain
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, d)| d.parent == Some(instance.id))
                                 {
                                     let made = draw_device_card(
                                         ui,
@@ -12533,6 +12544,7 @@ fn device_body(
                                         samplers,
                                         slices,
                                         selected,
+                                        index,
                                         &mut edits,
                                     );
                                     // The same edits the engine is about
@@ -28965,16 +28977,43 @@ mod tests {
         let ids: Vec<u64> = a.tracks[0].chain.iter().map(|d| d.id).collect();
         let (synth, filter, reverb, glue) = (ids[0], ids[1], ids[2], ids[3]);
 
-        // Reverb before the filter.
-        assert!(track::move_device(&mut a.tracks[0].chain, reverb, filter));
-        let now: Vec<u64> = a.tracks[0].chain.iter().map(|d| d.id).collect();
-        assert_eq!(now, vec![synth, reverb, filter, glue]);
+        let order =
+            |a: &Arrangement| -> Vec<u64> { a.tracks[0].chain.iter().map(|d| d.id).collect() };
 
-        // And back the other way — a move that goes forwards has to
-        // account for the hole it leaves behind it.
+        // LEFTWARDS lands BEFORE the target.
+        assert!(track::move_device(&mut a.tracks[0].chain, reverb, filter));
+        assert_eq!(order(&a), vec![synth, reverb, filter, glue]);
+
+        // RIGHTWARDS lands AFTER it. The direction has to decide the
+        // side: with a fixed "before", dragging a card onto its
+        // right-hand neighbour asks for the place it is already in, so
+        // every rightward nudge between neighbours does nothing while
+        // every leftward one moves — which is how this read from the
+        // outside, working one way and not the other.
         assert!(track::move_device(&mut a.tracks[0].chain, reverb, glue));
-        let now: Vec<u64> = a.tracks[0].chain.iter().map(|d| d.id).collect();
-        assert_eq!(now, vec![synth, filter, reverb, glue]);
+        assert_eq!(order(&a), vec![synth, filter, glue, reverb]);
+
+        // THE NEIGHBOUR CASE, both ways, which is the one that was
+        // broken and the one a hand reaches for most.
+        assert!(track::move_device(&mut a.tracks[0].chain, glue, reverb));
+        assert_eq!(
+            order(&a),
+            vec![synth, filter, reverb, glue],
+            "rightward neighbour"
+        );
+        assert!(track::move_device(&mut a.tracks[0].chain, glue, reverb));
+        assert_eq!(
+            order(&a),
+            vec![synth, filter, glue, reverb],
+            "leftward neighbour"
+        );
+
+        // Every move is reversible by making it again the other way,
+        // which is what "it went where I dropped it" means.
+        assert!(track::move_device(&mut a.tracks[0].chain, glue, filter));
+        assert_eq!(order(&a), vec![synth, glue, filter, reverb]);
+        assert!(track::move_device(&mut a.tracks[0].chain, glue, reverb));
+        assert_eq!(order(&a), vec![synth, filter, reverb, glue]);
 
         // THE INSTRUMENT STAYS AT THE HEAD. It is what makes sound and
         // everything after it shapes that; dragged into the middle it

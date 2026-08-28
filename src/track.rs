@@ -742,7 +742,8 @@ impl ReturnTrack {
     }
 }
 
-/// Move `moved` so it sits immediately before `before` in the chain.
+/// Move `moved` so it sits immediately beside `target`, on the side it
+/// came from.
 ///
 /// Positional, because a chain IS its order — the signal runs left to
 /// right and there is nothing else to say about where a device is.
@@ -754,16 +755,26 @@ impl ReturnTrack {
 /// dragged out of a rack would be leaving the rack, which is a different
 /// gesture from reordering and is not this one.
 ///
+/// # Which side
+///
+/// The side is decided by the DIRECTION OF TRAVEL: carried rightwards a
+/// card lands after its target, carried leftwards it lands before. A
+/// fixed side cannot work — "always before" makes dragging a card onto
+/// its right-hand neighbour mean "put it where it already is", so every
+/// rightward nudge between adjacent cards does nothing while every
+/// leftward one moves. Which is exactly how it read: working one way and
+/// not the other.
+///
 /// Returns whether anything moved, so a caller can tell a no-op from a
 /// refusal without asking twice.
-pub fn move_device(chain: &mut Vec<DeviceInstance>, moved: u64, before: u64) -> bool {
-    if moved == before {
+pub fn move_device(chain: &mut Vec<DeviceInstance>, moved: u64, target: u64) -> bool {
+    if moved == target {
         return false;
     }
     let Some(from) = chain.iter().position(|device| device.id == moved) else {
         return false;
     };
-    let Some(to) = chain.iter().position(|device| device.id == before) else {
+    let Some(to) = chain.iter().position(|device| device.id == target) else {
         return false;
     };
     if chain[from].kind().is_instrument() || chain[to].kind().is_instrument() {
@@ -773,9 +784,18 @@ pub fn move_device(chain: &mut Vec<DeviceInstance>, moved: u64, before: u64) -> 
         return false;
     }
     let device = chain.remove(from);
-    // Removing shifted everything after the hole down by one, so a target
-    // that was past it is now one place earlier.
-    let to = if to > from { to - 1 } else { to };
+    // `to`, either way, and the two directions arrive there by different
+    // arithmetic that happens to agree:
+    //
+    // - LEFTWARDS the target has not moved (it was already before the
+    //   hole), and landing before it is index `to`.
+    // - RIGHTWARDS the target slid down one when the hole opened, so it
+    //   sits at `to - 1` — and landing AFTER it is one place later,
+    //   which is `to` again.
+    //
+    // The old version subtracted that one and then inserted BEFORE, so a
+    // rightward drag onto the next card asked for the position the card
+    // was already in.
     chain.insert(to, device);
     true
 }
