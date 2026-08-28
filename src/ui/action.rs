@@ -125,6 +125,14 @@ pub enum UiAction {
     /// Return the selected track's pan to center.
     CenterTrackPan,
 
+    // --- devices ---
+    /// Wrap the PICKED devices in a rack, or the whole loose chain when
+    /// nothing is picked. Ctrl+G.
+    GroupDevices,
+    /// Take the track's rack apart, leaving its devices in place and in
+    /// order. Ctrl+Shift+G.
+    UngroupDevices,
+
     // --- returns ---
     /// Add a return bus, named for where it lands. Refused past the
     /// eight letters a send row can label.
@@ -221,6 +229,8 @@ impl UiAction {
             Self::ToggleTrackSolo => "Solo track",
             Self::NudgeTrackPan(_) => "Pan track",
             Self::CenterTrackPan => "Center pan",
+            Self::GroupDevices => "Group devices into a rack",
+            Self::UngroupDevices => "Ungroup the rack",
             Self::AddReturn => "Add return",
             Self::RemoveReturn => "Delete return",
             Self::SaveProject => "Save project",
@@ -287,6 +297,8 @@ impl UiAction {
             | Self::ToggleTrackSolo
             | Self::NudgeTrackPan(_)
             | Self::CenterTrackPan
+            | Self::GroupDevices
+            | Self::UngroupDevices
             | Self::AddReturn
             | Self::RemoveReturn
             | Self::SaveProject

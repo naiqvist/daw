@@ -32,6 +32,130 @@ pub fn card<R>(
 /// Dot radius, as a fraction of the dot's hit box.
 const DOT_R: f32 = 0.3;
 
+/// A card in flight, as a drag-and-drop payload.
+///
+/// The instance id and nothing else: where it came from is read off the
+/// chain when it lands, because the chain may have been scrolled, folded
+/// or rebuilt in between and a remembered index would name the wrong
+/// device by then.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Carried(pub u64);
+
+/// What the pointer did to one card's title strip.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Grip {
+    /// Pressed: this card should become the selection.
+    pub clicked: bool,
+    /// Ctrl or Shift was held — add to the selection rather than replace
+    /// it, which is what makes grouping more than one device possible at
+    /// all.
+    pub additive: bool,
+    /// A carried card was released onto this one, and which one it was.
+    /// The carried device belongs immediately BEFORE this one in signal
+    /// order.
+    pub dropped_from: Option<u64>,
+    /// This card is the one being carried.
+    pub carrying: bool,
+}
+
+/// How tall a card's title strip is: its two margins and one line of
+/// text.
+///
+/// Derived rather than measured, because the strip has to be found from
+/// OUTSIDE the card — a chain holds the card's rect and nothing else.
+/// `the_title_band_is_where_the_card_actually_put_it` holds this to what
+/// [`tabbed_card_gripped`] measures, so the derivation cannot drift away
+/// from the thing it describes.
+pub fn title_height(theme: &Theme) -> f32 {
+    // Two margins, which scale with density, and one line of text, which
+    // does not — a font token is a size in points and stays one. The
+    // 1.75 is the row height egui gives a proportional face at this size,
+    // measured rather than assumed; the test below is what keeps it
+    // measured.
+    theme.sp(space::XS) * 2.0 + font::LABEL * 1.75
+}
+
+/// A card's title strip, given the card.
+pub fn title_band(theme: &Theme, card: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_max(
+        card.min,
+        egui::pos2(card.right(), card.top() + title_height(theme)),
+    )
+}
+
+/// Claim a card's title strip as its handle.
+///
+/// The title strip and not the whole card, deliberately: a card's face is
+/// covered in knobs, and a gesture that took the card would take every
+/// press meant for one of them. The strip is the only part of a card that
+/// belongs to the card.
+///
+/// The strip also PAINTS what it knows — selected, carried, about to be
+/// landed on — because a device you have selected and a device you have
+/// not must not look the same, and a drop with no line drawn is a drop
+/// you find out about after it happens.
+pub fn grip(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    id: egui::Id,
+    title: egui::Rect,
+    instance: u64,
+    selected: bool,
+) -> Grip {
+    use crate::ui::affordance::{Afford, Affords};
+
+    let response = ui
+        .interact(title, id, egui::Sense::click_and_drag())
+        .affords(Affords::Carry);
+    let mut out = Grip {
+        clicked: response.clicked(),
+        additive: ui.input(|input| input.modifiers.command || input.modifiers.shift),
+        ..Grip::default()
+    };
+    if response.drag_started() {
+        egui::DragAndDrop::set_payload(ui.ctx(), Carried(instance));
+    }
+    let carried = egui::DragAndDrop::payload::<Carried>(ui.ctx()).map(|payload| payload.0);
+    out.carrying = carried == Some(instance);
+
+    if selected || out.carrying {
+        ui.painter().rect_filled(
+            title,
+            0.0,
+            if out.carrying {
+                theme.accent_muted
+            } else {
+                theme.surface_raised
+            },
+        );
+        ui.painter().rect_stroke(
+            title,
+            0.0,
+            egui::Stroke::new(crate::ui::tokens::stroke::HAIR, theme.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
+
+    // A card in flight, hovering somewhere it could land: the line goes
+    // on the LEADING edge, because that is where the carried device will
+    // be — a drop that only highlighted the target would leave "before or
+    // after" for the user to find out by doing it.
+    if let Some(from) = carried
+        && from != instance
+        && response.hovered()
+    {
+        ui.painter().line_segment(
+            [title.left_top(), egui::pos2(title.left(), title.bottom())],
+            egui::Stroke::new(crate::ui::tokens::stroke::BOLD * 1.5, theme.accent),
+        );
+        if ui.input(|input| input.pointer.any_released()) {
+            out.dropped_from = Some(from);
+            egui::DragAndDrop::clear_payload(ui.ctx());
+        }
+    }
+    out
+}
+
 /// A card whose body has `pages` tabs, switched by the row of dots at the
 /// top-left of the title strip. The caller owns which page is open
 /// (`page`, clamped into range); `add` lays out the body for the page it
@@ -74,6 +198,30 @@ pub fn tabbed_card_sized<R>(
     page: &mut usize,
     add: impl FnOnce(&mut egui::Ui, usize) -> R,
 ) -> R {
+    tabbed_card_gripped(ui, theme, name, height, pages, page, add).0
+}
+
+/// [`tabbed_card_sized`], plus where the TITLE STRIP landed.
+///
+/// A chain that wants to pick a card up needs somewhere to take hold of
+/// it, and the title strip is the only part of a card that belongs to
+/// the card rather than to the controls on it. Handing the rect back is
+/// the card guarding its own geometry — the device UI contract's third
+/// rule — instead of a caller reconstructing the strip's height from the
+/// font and the margins and drifting the first time either changes.
+///
+/// The band is returned, not claimed: whether it is a handle at all is
+/// the chain's business, and a card drawn in the gallery has no chain.
+#[allow(clippy::too_many_arguments)]
+pub fn tabbed_card_gripped<R>(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    name: &str,
+    height: f32,
+    pages: usize,
+    page: &mut usize,
+    add: impl FnOnce(&mut egui::Ui, usize) -> R,
+) -> (R, egui::Rect) {
     let pages = pages.max(1);
     *page = (*page).min(pages - 1);
 
@@ -139,7 +287,10 @@ pub fn tabbed_card_sized<R>(
         rule_y,
         egui::Stroke::new(crate::ui::tokens::stroke::HAIR, theme.divider),
     );
-    out.inner
+    // The strip is everything above the rule the card just painted, so
+    // the band and the line that marks it are the same measurement.
+    let title = egui::Rect::from_min_max(rect.min, egui::pos2(rect.right(), rule_y));
+    (out.inner, title)
 }
 
 /// The clickable dots. Each dot is its own allocation, so ids stay unique
@@ -908,6 +1059,69 @@ pub fn sections(
     add: impl FnMut(&mut egui::Ui, usize),
 ) {
     wells(ui, theme, &Wells::uniform(cols, rows), add);
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod grip_tests {
+    use super::*;
+
+    /// THE DERIVED BAND IS WHERE THE CARD ACTUALLY PUT ITS TITLE.
+    ///
+    /// A chain holds a card's rect and nothing else, so the handle has to
+    /// be derived from outside — and a derivation that drifted from the
+    /// strip it describes would put the grab band over the top row of
+    /// knobs, which is the exact bug the device UI contract's second rule
+    /// is about. Measured against what the card reports so the two cannot
+    /// separate.
+    #[test]
+    fn the_title_band_is_where_the_card_actually_put_it() {
+        for density in [
+            crate::ui::tokens::Density::Comfortable,
+            crate::ui::tokens::Density::Compact,
+        ] {
+            check_band(density);
+        }
+    }
+
+    fn check_band(density: crate::ui::tokens::Density) {
+        let mut theme = Theme::dark();
+        theme.set_density(density);
+        let context = egui::Context::default();
+        let mut measured = egui::Rect::NOTHING;
+        let mut whole = egui::Rect::NOTHING;
+        let mut run = context.run_ui(egui::RawInput::default(), |ui| {
+            let mut page = 0;
+            let (_, title) = tabbed_card_gripped(
+                ui,
+                &theme,
+                "filter",
+                crate::ui::tokens::control::DEVICE_H,
+                1,
+                &mut page,
+                |ui, _| {
+                    ui.label("body");
+                },
+            );
+            measured = title;
+            whole = ui.min_rect();
+        });
+        // The font atlas the label built has to be collected, or egui
+        // panics on the way out of the test rather than in it.
+        run.textures_delta.clear();
+        assert!(measured.height() > 0.0, "the card reported no title strip");
+        let derived = title_band(
+            &theme,
+            egui::Rect::from_min_size(measured.min, whole.size()),
+        );
+        assert!(
+            (derived.height() - measured.height()).abs() <= 1.5,
+            "the derived band is {} and the card's strip is {} — the handle \
+             has drifted off the title and onto the controls",
+            derived.height(),
+            measured.height()
+        );
+    }
 }
 
 #[cfg(test)]

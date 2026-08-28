@@ -357,11 +357,48 @@ impl Track {
     /// Returns the new rack's id, or `None` when there was nothing to
     /// group. Racks do not nest yet, so a chain that is already one rack
     /// declines rather than wrapping itself again.
+    /// Wrap every LOOSE device in a new rack — the whole chain, less
+    /// anything already inside one.
+    ///
+    /// The convenience the chain-wide verb had before a selection
+    /// existed, and still the right answer for a chain of three: picking
+    /// all of them first would be ceremony.
     pub fn group_into_rack(&mut self, id: u64, name: &str) -> Option<u64> {
         let loose: Vec<u64> = self
             .chain
             .iter()
-            .filter(|d| d.parent.is_none() && !matches!(d.state, DeviceState::Rack))
+            .filter(|device| device.parent.is_none())
+            .map(|device| device.id)
+            .collect();
+        self.group_devices_into_rack(id, name, &loose)
+    }
+
+    /// Wrap the devices in `chosen` in a new rack.
+    ///
+    /// The CHOSEN ones, which is what makes a rack a decision rather than
+    /// a fact about the whole chain: two of five devices is the ordinary
+    /// case — a filter and a delay that belong together while the
+    /// compressor after them does not.
+    ///
+    /// Devices that are already inside a rack are refused rather than
+    /// stolen: a device has one parent, and pulling one out of its rack
+    /// by grouping it elsewhere would empty that rack from a gesture that
+    /// never mentioned it. A rack itself is refused for the same reason
+    /// nesting is not built yet.
+    ///
+    /// Order is the CHAIN's, never the order they were picked in — the
+    /// chain is signal order, and a rack whose contents were arranged by
+    /// the sequence of clicks would sound different depending on how it
+    /// was selected.
+    pub fn group_devices_into_rack(&mut self, id: u64, name: &str, chosen: &[u64]) -> Option<u64> {
+        let loose: Vec<u64> = self
+            .chain
+            .iter()
+            .filter(|d| {
+                chosen.contains(&d.id)
+                    && d.parent.is_none()
+                    && !matches!(d.state, DeviceState::Rack)
+            })
             .map(|d| d.id)
             .collect();
         if loose.is_empty() {
@@ -703,6 +740,44 @@ impl ReturnTrack {
         self.chain.push(instance);
         true
     }
+}
+
+/// Move `moved` so it sits immediately before `before` in the chain.
+///
+/// Positional, because a chain IS its order — the signal runs left to
+/// right and there is nothing else to say about where a device is.
+///
+/// Two things it refuses. An INSTRUMENT stays at the head: the head is
+/// what makes sound and everything after it shapes that, so a synth
+/// dragged into the middle would compile to a source the effects before
+/// it never see. And a device only moves among its OWN siblings — a card
+/// dragged out of a rack would be leaving the rack, which is a different
+/// gesture from reordering and is not this one.
+///
+/// Returns whether anything moved, so a caller can tell a no-op from a
+/// refusal without asking twice.
+pub fn move_device(chain: &mut Vec<DeviceInstance>, moved: u64, before: u64) -> bool {
+    if moved == before {
+        return false;
+    }
+    let Some(from) = chain.iter().position(|device| device.id == moved) else {
+        return false;
+    };
+    let Some(to) = chain.iter().position(|device| device.id == before) else {
+        return false;
+    };
+    if chain[from].kind().is_instrument() || chain[to].kind().is_instrument() {
+        return false;
+    }
+    if chain[from].parent != chain[to].parent {
+        return false;
+    }
+    let device = chain.remove(from);
+    // Removing shifted everything after the hole down by one, so a target
+    // that was past it is now one place earlier.
+    let to = if to > from { to - 1 } else { to };
+    chain.insert(to, device);
+    true
 }
 
 /// Force the ordering rule onto a chain that came from a FILE: keep the

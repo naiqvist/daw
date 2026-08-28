@@ -79,6 +79,17 @@ impl Default for Keymap {
             // when musical typing lands, and a view toggle that stopped
             // working the day the keyboard became an instrument would be
             // a binding chosen for today only.
+            // The rack's two verbs. The palette has advertised these as
+            // hints since they were written and nothing was listening —
+            // a shortcut printed beside a command that does not answer to
+            // it is worse than no shortcut, because it is tried once and
+            // then the whole sheet is distrusted.
+            Binding::new(
+                Modifiers::COMMAND.plus(Modifiers::SHIFT),
+                Key::G,
+                UiAction::UngroupDevices,
+            ),
+            Binding::new(Modifiers::COMMAND, Key::G, UiAction::GroupDevices),
             Binding::new(Modifiers::COMMAND, Key::B, UiAction::ToggleBrowser),
             Binding::new(
                 Modifiers::COMMAND.plus(Modifiers::ALT),

@@ -199,6 +199,11 @@ const TREE_TYPE: f32 = 12.0;
 const TREE_ROW_H: f32 = 20.0;
 /// Gap between the search well and the first row.
 const TREE_TOP_GAP: f32 = 6.0;
+/// The most of the browser's upper band the DEVICE tree may take.
+///
+/// Three fifths: enough that an open folder is worth opening, little
+/// enough that the sample catalog under it never disappears.
+const TREE_SHARE: f32 = 0.6;
 const TREE_PAD_X: f32 = 8.0;
 
 // --- the arrangement ---
@@ -10322,6 +10327,11 @@ struct Browser {
     expanded: std::collections::HashSet<String>,
     /// Pixel offset for the combined location, folder, and result list.
     catalog_scroll: f32,
+    /// How far the DEVICE tree is scrolled, in points.
+    ///
+    /// Its own, beside the catalog's: the two lists share a band but not
+    /// a position, and a wheel over one must not move the other.
+    tree_scroll: f32,
     user_library_path: String,
     sample_folder_path: String,
 }
@@ -10341,6 +10351,7 @@ impl Default for Browser {
             root_open: true,
             expanded: std::collections::HashSet::new(),
             catalog_scroll: 0.0,
+            tree_scroll: 0.0,
             user_library_path: String::new(),
             sample_folder_path: String::new(),
             folders: vec![
@@ -10532,10 +10543,22 @@ fn tree(
     focus: &mut Focus,
     upper: egui::Rect,
     folders: &mut [Folder],
+    scroll: &mut f32,
 ) -> Option<BrowserItem> {
     let font = egui::FontId::new(TREE_TYPE, egui::FontFamily::Monospace);
-    let top = upper.top() + SEARCH_H + TREE_TOP_GAP;
     let rows = tree_rows(folders);
+    let viewport = tree_viewport(upper, rows.len());
+    // The wheel belongs to whichever list it is OVER. Asking about the
+    // whole band would mean a wheel anywhere in the browser moved both
+    // lists, which is how a scroll ends up feeling like it is fighting.
+    let reach = rows.len() as f32 * TREE_ROW_H - viewport.height();
+    if ui.rect_contains_pointer(viewport) {
+        let wheel = ui.input(|input| input.smooth_scroll_delta.y);
+        *scroll = (*scroll - wheel).clamp(0.0, reach.max(0.0));
+    } else {
+        *scroll = scroll.min(reach.max(0.0)).max(0.0);
+    }
+    let top = viewport.top() - *scroll;
 
     // The catalog owns the empty state, because the device tree can be empty
     // while configured library folders are already present.
@@ -10557,8 +10580,12 @@ fn tree(
     let mut toggle = None;
     for (index, (text, is_folder)) in rows.iter().enumerate() {
         let y = top + index as f32 * TREE_ROW_H;
-        if y + TREE_ROW_H > upper.bottom() {
-            break;
+        // Scrolled past, above or below. `continue` and NOT `break`: the
+        // list is offset now, so the rows still to come are the ones on
+        // screen — breaking here is what made everything past the fold
+        // unreachable in the first place.
+        if y + TREE_ROW_H <= viewport.top() || y >= viewport.bottom() {
+            continue;
         }
         let row = egui::Rect::from_min_size(
             egui::pos2(upper.left(), y),
@@ -10619,8 +10646,36 @@ fn tree(
 /// The sample catalog scrolls in the space left below the fixed device tree.
 /// Keeping this boundary explicit prevents a scrolled sample row from being
 /// painted over Instruments or Audio Effects.
+/// The device tree's own viewport: where it draws, and no further.
+///
+/// BOUNDED, which is the whole fix. The tree used to take a row per
+/// device with no limit and no scroll — so a folder with more devices
+/// than the panel was tall simply stopped drawing partway down, and the
+/// ones past the fold could not be reached by any gesture. It also
+/// pushed the sample catalog below it, far enough that opening two
+/// folders left the catalog entirely off the bottom of the window.
+///
+/// Now it takes what it needs up to `TREE_SHARE` of the band, and
+/// scrolls inside that. Sharing beats winning: a browser where one list
+/// can starve the other is a browser with a list you cannot get to.
+fn tree_viewport(upper: egui::Rect, device_rows: usize) -> egui::Rect {
+    let top = upper.top() + SEARCH_H + TREE_TOP_GAP;
+    let room = (upper.bottom() - top).max(0.0);
+    let wanted = device_rows as f32 * TREE_ROW_H;
+    // At least a couple of rows even in a very short panel: a list
+    // cropped to nothing reads as a list that is not there.
+    let floor = (TREE_ROW_H * 2.0).min(room);
+    let height = wanted.min(room * TREE_SHARE).max(floor).min(room);
+    egui::Rect::from_min_max(
+        egui::pos2(upper.left(), top),
+        egui::pos2(upper.right(), top + height),
+    )
+}
+
+/// The catalog gets everything the device tree did not take.
 fn catalog_viewport(upper: egui::Rect, device_rows: usize) -> egui::Rect {
-    let top = (upper.top() + SEARCH_H + TREE_TOP_GAP + device_rows as f32 * TREE_ROW_H)
+    let top = tree_viewport(upper, device_rows)
+        .bottom()
         .min(upper.bottom());
     egui::Rect::from_min_max(egui::pos2(upper.left(), top), upper.right_bottom())
 }
@@ -10708,7 +10763,7 @@ fn catalog_tree(
     let total_rows = 1 + location_rows + visible_folders.len() + results.len().max(1);
     let viewport_height = viewport.height();
     let max_scroll = (total_rows as f32 * TREE_ROW_H - viewport_height).max(0.0);
-    if ui.rect_contains_pointer(upper) {
+    if ui.rect_contains_pointer(viewport) {
         let scroll = ui.input(|input| input.smooth_scroll_delta.y);
         browser.catalog_scroll = (browser.catalog_scroll - scroll).clamp(0.0, max_scroll);
     } else {
@@ -11124,7 +11179,14 @@ fn browser_body(
     painter.rect_filled(lower, 0.0, theme.surface_raised);
 
     search_bar(ui, theme, focus, upper, &mut browser.query);
-    let load = tree(ui, theme, focus, upper, &mut browser.folders);
+    let load = tree(
+        ui,
+        theme,
+        focus,
+        upper,
+        &mut browser.folders,
+        &mut browser.tree_scroll,
+    );
     let catalog = catalog_tree(ui, theme, focus, upper, browser, snapshot);
     let manager = library_manager(ui, theme, lower, browser, config, scanning);
 
@@ -11920,6 +11982,15 @@ struct DeviceEdits {
     /// which device the target is — it has the chain in front of it — and
     /// the value cannot be computed without knowing the device's kind.
     macro_moves: Vec<(u64, device::ParamEdit)>,
+    /// A card's title was pressed: `(instance, additive)`.
+    ///
+    /// Additive means Ctrl or Shift was held, which is what makes a
+    /// selection of more than one device possible — and a selection of
+    /// more than one is the whole point, because grouping two devices out
+    /// of five is the ordinary case.
+    select: Option<(u64, bool)>,
+    /// A card was carried onto another: `(moved, landed before)`.
+    reorder: Option<(u64, u64)>,
     /// Where a card's display is looking now: `(instance, zoom, scroll)`.
     views: Vec<(u64, f32, f32)>,
     /// A card asked for its display FULL SIZE.
@@ -12057,6 +12128,7 @@ fn draw_device_card(
     histories: &HashMap<u64, device::scope::History>,
     samplers: &HashMap<u64, SamplerFace>,
     slices: &HashMap<u64, Vec<u64>>,
+    selected: &std::collections::BTreeSet<u64>,
     edits: &mut DeviceEdits,
 ) -> Vec<device::ParamEdit> {
     // The card speaks normalized knob positions and
@@ -12260,6 +12332,26 @@ fn draw_device_card(
         }
     });
     let made = drawn.inner;
+    // The card's handle, claimed AFTER its face so every knob on it wins
+    // the pointer where the two overlap — the strip is what is left over,
+    // which is exactly what a handle should be.
+    let grip = device::card::grip(
+        ui,
+        theme,
+        ui.id().with(("device_grip", instance.id)),
+        // The title band is the top of the card down to the rule the card
+        // paints under its name. Asked of the card rather than rebuilt
+        // from the font, so the two cannot drift.
+        device::card::title_band(theme, drawn.response.rect),
+        instance.id,
+        selected.contains(&instance.id),
+    );
+    if grip.clicked {
+        edits.select = Some((instance.id, grip.additive));
+    }
+    if let Some(from) = grip.dropped_from {
+        edits.reorder = Some((from, instance.id));
+    }
     // Is a browser drag hovering THIS sampler? Only
     // NOTED, never taken — see `hover_sampler`.
     if instance.kind() == DeviceKind::Sampler
@@ -12286,6 +12378,7 @@ fn draw_device_card(
     made
 }
 
+#[allow(clippy::too_many_arguments)]
 fn device_body(
     ui: &mut egui::Ui,
     theme: &Theme,
@@ -12303,6 +12396,10 @@ fn device_body(
     // Each rack's name and macros, by instance id — the half of a rack
     // its empty parameter table cannot supply.
     racks: &std::collections::BTreeMap<u64, device::RackUi>,
+    // Which devices are picked, by instance id. View state the app owns:
+    // a chain is rebuilt from the track every frame and could not hold a
+    // selection between them.
+    selected: &std::collections::BTreeSet<u64>,
 ) -> DeviceEdits {
     let mut edits = DeviceEdits::default();
     // The MOD strip is PINNED at the panel's right edge, outside the
@@ -12412,6 +12509,7 @@ fn device_body(
                                     histories,
                                     samplers,
                                     slices,
+                                    selected,
                                     &mut edits,
                                 );
                                 continue;
@@ -12430,6 +12528,7 @@ fn device_body(
                                         histories,
                                         samplers,
                                         slices,
+                                        selected,
                                         &mut edits,
                                     );
                                     // The same edits the engine is about
@@ -14024,6 +14123,12 @@ struct App {
     /// the same only-on-change door the lanes use, and for the same
     /// reason: a fader that is not moving must not cost a letter a frame.
     master_out: Option<NodeId>,
+    /// Which devices are picked in the rack, by instance id.
+    ///
+    /// NOT saved and not undone: a selection is where your attention is,
+    /// and a project that opened with three devices picked would be
+    /// telling you about a session that ended days ago.
+    selected_devices: std::collections::BTreeSet<u64>,
     /// Drains the engine's capture ring to disk. `None` until the engine
     /// starts, because the ring belongs to a stream.
     recorder: Option<record::Recorder>,
@@ -14402,6 +14507,7 @@ impl App {
             pan_ids: Vec::new(),
             sent_pan: Vec::new(),
             master_out: None,
+            selected_devices: std::collections::BTreeSet::new(),
             recorder: None,
             recording_from: 0,
             recording_overruns: 0,
@@ -15660,9 +15766,21 @@ impl App {
             return;
         };
         let name = format!("{} rack", lane.name);
-        match lane.group_into_rack(id, &name) {
-            Some(_) => {
+        // The PICKED devices, or the whole loose chain when nothing is
+        // picked. The fallback is what the verb did before a selection
+        // existed and is still the right answer for a chain of three:
+        // picking all of them first would be ceremony.
+        let chosen: Vec<u64> = self.selected_devices.iter().copied().collect();
+        let made = if chosen.is_empty() {
+            lane.group_into_rack(id, &name)
+        } else {
+            lane.group_devices_into_rack(id, &name, &chosen)
+        };
+        match made {
+            Some(rack) => {
                 self.arrangement.force_recompile = true;
+                self.selected_devices.clear();
+                self.selected_devices.insert(rack);
                 self.notice = Some("grouped".to_owned());
             }
             None => self.notice = Some("nothing to group".to_owned()),
@@ -20122,6 +20240,7 @@ impl eframe::App for App {
                     let wire_scopes = &self.wire_scopes;
                     let expanded_wire = &mut self.expanded_wire;
                     let mod_collapsed = &mut self.prefs.mod_strip_collapsed;
+                    let selected_devices = &self.selected_devices;
                     let beat = (self.transport.position * self.transport.bpm / 60.0) as f32;
                     let out = egui::Panel::bottom("device")
                         .resizable(false)
@@ -20161,6 +20280,7 @@ impl eframe::App for App {
                                 sampler_faces,
                                 sampler_slices,
                                 &racks,
+                                selected_devices,
                             )
                         });
                     (out.response.rect, out.inner)
@@ -20539,6 +20659,47 @@ impl eframe::App for App {
                     }
                 }
             }
+            // A press on a card's title picks it. Bare replaces the
+            // selection, Ctrl or Shift adds — and pressing the only
+            // picked device again clears it, so a selection is always
+            // escapable without hunting for empty ground.
+            if let Some((instance, additive)) = edits.select {
+                if additive {
+                    if !self.selected_devices.remove(&instance) {
+                        self.selected_devices.insert(instance);
+                    }
+                } else if self.selected_devices.len() == 1
+                    && self.selected_devices.contains(&instance)
+                {
+                    self.selected_devices.clear();
+                } else {
+                    self.selected_devices.clear();
+                    self.selected_devices.insert(instance);
+                }
+            }
+            // A card carried onto another. The chain IS signal order, so
+            // this changes what the track sounds like and the schedule
+            // has to be rebuilt — no letter can move a node.
+            if let Some((moved, before)) = edits.reorder {
+                let chain = match owner {
+                    ChainOwner::Track(track) => self
+                        .arrangement
+                        .tracks
+                        .get_mut(track)
+                        .map(|lane| &mut lane.chain),
+                    ChainOwner::Return(index) => self
+                        .arrangement
+                        .returns
+                        .get_mut(index)
+                        .map(|bus| &mut bus.chain),
+                    ChainOwner::Master => Some(&mut self.arrangement.master.chain),
+                };
+                if let Some(chain) = chain
+                    && track::move_device(chain, moved, before)
+                {
+                    self.arrangement.force_recompile = true;
+                }
+            }
             for (instance, page) in &edits.pages {
                 if let Some(dev) = self.chain_device_mut(owner, *instance) {
                     dev.page = *page;
@@ -20625,6 +20786,12 @@ impl eframe::App for App {
                 // The frame regions are the app's own, for the same
                 // reason density is: they are a machine-local preference,
                 // and `perform` is pure over the arrangement.
+                // The rack's verbs live here rather than in `perform`
+                // for the reason the frame regions do: they read the
+                // device SELECTION, which is the app's own view state,
+                // and `perform` is pure over the arrangement.
+                UiAction::GroupDevices => self.group_devices(),
+                UiAction::UngroupDevices => self.ungroup_devices(),
                 UiAction::ToggleBrowser => {
                     self.prefs.browser_hidden = !self.prefs.browser_hidden;
                 }
@@ -21057,25 +21224,57 @@ mod tests {
         assert!(browser_bands(sliver, BROWSER_LOWER_FRAC).is_none());
     }
 
-    /// Built-in devices are a fixed header for the scrolling sample catalog.
-    /// Its viewport therefore starts after their final row, never at the
-    /// search bar where samples could paint over Instruments and FX.
+    /// NEITHER LIST MAY STARVE THE OTHER.
+    ///
+    /// The device tree used to take a row per device with no ceiling, so
+    /// opening two folders pushed the sample catalog entirely off the
+    /// bottom of the window — and the previous version of this test
+    /// asserted exactly that, which is how a defect gets written down as
+    /// a requirement and stops being reported.
+    ///
+    /// A short list still sits above the catalog with no gap, which is
+    /// what makes the two read as one column rather than two panes.
     #[test]
-    fn the_sample_catalog_begins_below_the_device_tree() {
+    fn the_two_browser_lists_share_the_band() {
         let upper = Rect::from_min_size(pos2(10.0, 20.0), vec2(240.0, 300.0));
         let rows = 5;
+        let tree = tree_viewport(upper, rows);
         let viewport = catalog_viewport(upper, rows);
         assert_eq!(viewport.left(), upper.left());
         assert_eq!(viewport.right(), upper.right());
         assert_eq!(
-            viewport.top(),
-            upper.top() + SEARCH_H + TREE_TOP_GAP + rows as f32 * TREE_ROW_H
+            tree.top(),
+            upper.top() + SEARCH_H + TREE_TOP_GAP,
+            "the tree starts under the search bar"
         );
+        assert_eq!(
+            tree.height(),
+            rows as f32 * TREE_ROW_H,
+            "a list that fits should take exactly what it needs"
+        );
+        assert_eq!(viewport.top(), tree.bottom(), "a gap opened between them");
         assert_eq!(viewport.bottom(), upper.bottom());
 
+        // A list longer than the panel is CAPPED, and what it does not
+        // take the catalog keeps.
         let crowded = catalog_viewport(upper, 10_000);
-        assert_eq!(crowded.top(), upper.bottom());
-        assert_eq!(crowded.height(), 0.0);
+        let crowded_tree = tree_viewport(upper, 10_000);
+        assert!(
+            crowded.height() > TREE_ROW_H * 3.0,
+            "a crowded device tree starved the catalog: {} left",
+            crowded.height()
+        );
+        assert!(crowded_tree.height() < upper.height() * 0.75);
+        assert_eq!(crowded_tree.bottom(), crowded.top());
+        assert_eq!(crowded.bottom(), upper.bottom());
+
+        // And in a panel too short for even the floor, nothing escapes
+        // the band it was given.
+        let cramped =
+            Rect::from_min_size(pos2(0.0, 0.0), vec2(240.0, SEARCH_H + TREE_TOP_GAP + 4.0));
+        assert!(upper.contains_rect(tree_viewport(upper, 0)));
+        assert!(cramped.contains_rect(tree_viewport(cramped, 40)));
+        assert!(cramped.contains_rect(catalog_viewport(cramped, 40)));
     }
 
     /// Dragging the inner divider maps pointer position to split, and cannot
@@ -28744,6 +28943,150 @@ mod tests {
                 .iter()
                 .all(|track| !track.is_group && track.depth == 0)
         );
+    }
+
+    // -------------------------------------------------------- racks ---
+
+    /// A chain is SIGNAL ORDER, so moving a card changes what the track
+    /// sounds like — and the two things that cannot move are the two
+    /// that would change what it sounds like into something the graph
+    /// cannot compile.
+    #[test]
+    fn a_device_moves_among_its_siblings_and_nowhere_else() {
+        let mut a = Arrangement::default();
+        load(&mut a, 0, DeviceKind::SineSynth);
+        load(&mut a, 0, DeviceKind::Filter);
+        load(&mut a, 0, DeviceKind::Reverb);
+        load(&mut a, 0, DeviceKind::Glue);
+        let ids: Vec<u64> = a.tracks[0].chain.iter().map(|d| d.id).collect();
+        let (synth, filter, reverb, glue) = (ids[0], ids[1], ids[2], ids[3]);
+
+        // Reverb before the filter.
+        assert!(track::move_device(&mut a.tracks[0].chain, reverb, filter));
+        let now: Vec<u64> = a.tracks[0].chain.iter().map(|d| d.id).collect();
+        assert_eq!(now, vec![synth, reverb, filter, glue]);
+
+        // And back the other way — a move that goes forwards has to
+        // account for the hole it leaves behind it.
+        assert!(track::move_device(&mut a.tracks[0].chain, reverb, glue));
+        let now: Vec<u64> = a.tracks[0].chain.iter().map(|d| d.id).collect();
+        assert_eq!(now, vec![synth, filter, reverb, glue]);
+
+        // THE INSTRUMENT STAYS AT THE HEAD. It is what makes sound and
+        // everything after it shapes that; dragged into the middle it
+        // would compile to a source the effects before it never see.
+        assert!(!track::move_device(&mut a.tracks[0].chain, synth, glue));
+        assert!(!track::move_device(&mut a.tracks[0].chain, glue, synth));
+        assert_eq!(a.tracks[0].chain[0].id, synth);
+
+        // Nothing, said clearly: onto itself, and onto a device that is
+        // not there.
+        assert!(!track::move_device(&mut a.tracks[0].chain, filter, filter));
+        assert!(!track::move_device(&mut a.tracks[0].chain, filter, 9_999));
+    }
+
+    /// A device inside a rack and one outside it are not siblings, so
+    /// dragging between them would be LEAVING the rack — a different
+    /// gesture, and not this one.
+    #[test]
+    fn a_card_cannot_be_dragged_out_of_its_rack() {
+        let mut a = Arrangement::default();
+        load(&mut a, 0, DeviceKind::Filter);
+        load(&mut a, 0, DeviceKind::Reverb);
+        load(&mut a, 0, DeviceKind::Glue);
+        let inside: Vec<u64> = a.tracks[0].chain[..2].iter().map(|d| d.id).collect();
+        let outside = a.tracks[0].chain[2].id;
+        let rack = a.mint_id();
+        assert!(
+            a.tracks[0]
+                .group_devices_into_rack(rack, "rack", &inside)
+                .is_some()
+        );
+        assert!(!track::move_device(
+            &mut a.tracks[0].chain,
+            inside[0],
+            outside
+        ));
+        // Inside the rack it moves freely.
+        assert!(track::move_device(
+            &mut a.tracks[0].chain,
+            inside[1],
+            inside[0]
+        ));
+    }
+
+    /// GROUPING TAKES WHAT IS PICKED, and takes it in CHAIN order.
+    ///
+    /// A rack whose contents were arranged by the sequence of clicks
+    /// would sound different depending on how it was selected, which is
+    /// the one thing a selection must never decide.
+    #[test]
+    fn a_rack_holds_what_was_picked_in_the_order_the_chain_had_it() {
+        let mut a = Arrangement::default();
+        load(&mut a, 0, DeviceKind::Filter);
+        load(&mut a, 0, DeviceKind::Reverb);
+        load(&mut a, 0, DeviceKind::Glue);
+        let ids: Vec<u64> = a.tracks[0].chain.iter().map(|d| d.id).collect();
+        let rack = a.mint_id();
+        // Picked back to front; the rack must not care.
+        let chosen = vec![ids[2], ids[0]];
+        assert_eq!(
+            a.tracks[0].group_devices_into_rack(rack, "rack", &chosen),
+            Some(rack)
+        );
+        let inside: Vec<u64> = a.tracks[0]
+            .chain
+            .iter()
+            .filter(|d| d.parent == Some(rack))
+            .map(|d| d.id)
+            .collect();
+        assert_eq!(
+            inside,
+            vec![ids[0], ids[2]],
+            "the rack took the click order"
+        );
+        assert_eq!(
+            a.tracks[0]
+                .chain
+                .iter()
+                .find(|d| d.id == ids[1])
+                .unwrap()
+                .parent,
+            None,
+            "a device nobody picked was swept in"
+        );
+
+        // A device already inside a rack is refused rather than stolen:
+        // it has one parent, and taking it would empty a rack from a
+        // gesture that never mentioned that rack.
+        let second = a.mint_id();
+        assert_eq!(
+            a.tracks[0].group_devices_into_rack(second, "again", &[ids[0]]),
+            None
+        );
+    }
+
+    /// The chords the palette has advertised since they were written
+    /// answer to something now. A shortcut printed beside a command that
+    /// ignores it is worse than none — it is tried once, and then the
+    /// whole sheet is distrusted.
+    #[test]
+    fn the_rack_chords_are_bound() {
+        let map = daw::ui::keymap::Keymap::default();
+        let group = map
+            .bindings()
+            .iter()
+            .find(|binding| binding.action == UiAction::GroupDevices)
+            .expect("ctrl+G is bound");
+        assert_eq!(group.shortcut.logical_key, egui::Key::G);
+        assert!(group.shortcut.modifiers.command);
+        assert!(!group.shortcut.modifiers.shift);
+        let ungroup = map
+            .bindings()
+            .iter()
+            .find(|binding| binding.action == UiAction::UngroupDevices)
+            .expect("ctrl+shift+G is bound");
+        assert!(ungroup.shortcut.modifiers.command && ungroup.shortcut.modifiers.shift);
     }
 
     // ---------------------------------------------------- recording ---
