@@ -57,6 +57,12 @@ pub struct SessionTrack {
     pub solo: bool,
     pub volume: f32,
     pub pan: f32,
+    /// How much of this track each return gets, in return order. Shorter
+    /// than the return list means zero, exactly as the project's own
+    /// send list does: adding a return must not have to write a silence
+    /// into every track.
+    #[serde(default)]
+    pub sends: Vec<f32>,
 }
 
 impl Default for SessionTrack {
@@ -67,6 +73,33 @@ impl Default for SessionTrack {
             kind: TrackKind::Midi,
             mute: false,
             solo: false,
+            volume: 1.0,
+            pan: 0.0,
+            sends: Vec::new(),
+        }
+    }
+}
+
+/// A return bus, as the mixer sees it.
+///
+/// The view's own shape rather than the project's `ReturnTrack`, for the
+/// reason `SessionTrack` is not `Track`: this module may not name the
+/// app. What it carries is what a strip draws — a chain is the rack's
+/// business, not the mixer's.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionReturn {
+    pub name: String,
+    pub mute: bool,
+    pub volume: f32,
+    pub pan: f32,
+}
+
+impl Default for SessionReturn {
+    fn default() -> Self {
+        Self {
+            name: "Return".to_owned(),
+            mute: false,
             volume: 1.0,
             pan: 0.0,
         }
@@ -362,6 +395,10 @@ pub struct PerformanceMemory {
 #[serde(default)]
 pub struct SessionDocument {
     pub tracks: Vec<SessionTrack>,
+    /// The return buses, in send order. Absent from a document written
+    /// before returns existed, which reads as a song with none.
+    #[serde(default)]
+    pub returns: Vec<SessionReturn>,
     pub scenes: Vec<Scene>,
     /// Track-major: `slots[track][scene]`.
     pub slots: Vec<Vec<Slot>>,
@@ -389,6 +426,7 @@ impl SessionDocument {
         let slots = vec![vec![Slot::default(); scenes.len()]; tracks.len()];
         Self {
             tracks,
+            returns: Vec::new(),
             scenes,
             slots,
             global_quantization: Quantization::Bar,
@@ -660,6 +698,10 @@ pub enum QueueRefusal {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct SessionRuntime {
     pub tracks: Vec<TrackRuntime>,
+    /// Return meters, in return order. `TrackRuntime` reused for its
+    /// level half — a return has no clip to be playing, so the rest of
+    /// the shape simply sits at rest.
+    pub returns: Vec<TrackRuntime>,
     pub pending: Vec<PendingLaunch>,
     pub active_scene: Option<SceneId>,
     pub fill: FillState,
@@ -672,6 +714,7 @@ impl SessionRuntime {
     pub fn new(track_count: usize) -> Self {
         Self {
             tracks: vec![TrackRuntime::default(); track_count],
+            returns: Vec::new(),
             next_transaction: 1,
             ..Self::default()
         }
@@ -1303,6 +1346,9 @@ pub struct SessionViewState {
     pub select_on_launch: bool,
     pub owns_keyboard: bool,
     pub memory_morph: f32,
+    /// Which return's devices the rack is showing, if a return's head
+    /// was clicked. View state, like every other selection here.
+    pub selected_return: Option<usize>,
     /// Peak hold per track, in linear amplitude.
     ///
     /// VIEW state, deliberately: a hold answers "how loud did that get
@@ -1345,6 +1391,7 @@ impl Default for SessionViewState {
             select_on_launch: true,
             owns_keyboard: false,
             memory_morph: 0.5,
+            selected_return: None,
             peak_hold: Vec::new(),
             slot_drag: None,
             track_drag: None,
@@ -1417,6 +1464,21 @@ pub enum SessionIntent {
         value: f32,
     },
     ClearClipHold(usize),
+    SetTrackSend {
+        track: usize,
+        index: usize,
+        value: f32,
+    },
+    SelectReturn(usize),
+    ToggleReturnMute(usize),
+    SetReturnVolume {
+        index: usize,
+        value: f32,
+    },
+    SetReturnPan {
+        index: usize,
+        value: f32,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1509,6 +1571,15 @@ const PEAK_HEIGHT: f32 = 11.0;
 const FADER_MIN_HEIGHT: f32 = 26.0;
 const METER_WIDTH: f32 = 9.0;
 const SCALE_MIN_WIDTH: f32 = 20.0;
+const SEND_HEIGHT: f32 = 11.0;
+const SEND_LETTER_WIDTH: f32 = 9.0;
+/// Where return peak holds live in the strip's hold table.
+///
+/// Far past any lane count, so a return's hold and a track's cannot
+/// collide however many tracks a project grows. The table is a `Vec`
+/// that grows on demand, so the gap costs a few zeroed floats and buys
+/// an index space that needs no bookkeeping.
+const RETURN_HOLD_BASE: usize = 4096;
 /// The fader's top. A console's fader runs a little past unity so a mix
 /// can be pushed as well as pulled; +6 dB is where this one stops.
 const MAX_FADER_GAIN: f32 = 2.0;
@@ -1532,16 +1603,32 @@ pub struct SessionLayout {
     pub scroll_y: f32,
     pub mixer_height: f32,
     tracks: usize,
+    /// Return columns, drawn after the tracks in the MIXER BAND only.
+    ///
+    /// A return has no clip slots, exactly as it has none in Live: the
+    /// grid above a return column is empty ground, and `slot_at` never
+    /// answers with one because it only ever walks the tracks.
+    returns: usize,
     scenes: usize,
 }
 
 impl SessionLayout {
-    pub fn new(area: egui::Rect, tracks: usize, scenes: usize, state: &SessionViewState) -> Self {
+    pub fn new(
+        area: egui::Rect,
+        tracks: usize,
+        returns: usize,
+        scenes: usize,
+        state: &SessionViewState,
+    ) -> Self {
         let lane_width = (area.width() - SCENE_WIDTH).max(0.0);
-        let track_width = if tracks == 0 {
+        // Columns, not tracks: a return takes a column's width in the
+        // mixer band, so it has to be one of the shares the width is cut
+        // into or the returns would sit off the right edge.
+        let columns = tracks + returns;
+        let track_width = if columns == 0 {
             TRACK_WIDTH_DEFAULT
         } else {
-            (lane_width / tracks as f32).clamp(TRACK_WIDTH_MIN, TRACK_WIDTH_MAX)
+            (lane_width / columns as f32).clamp(TRACK_WIDTH_MIN, TRACK_WIDTH_MAX)
         };
         let mixer_cap = (area.height() * 0.55).clamp(MIXER_HEIGHT_MIN, MIXER_HEIGHT_MAX);
         let mut layout = Self {
@@ -1552,6 +1639,7 @@ impl SessionLayout {
             scroll_y: 0.0,
             mixer_height: state.mixer_height.clamp(MIXER_HEIGHT_MIN, mixer_cap),
             tracks,
+            returns,
             scenes,
         };
         layout.scroll_x = state.scroll_x.clamp(0.0, layout.max_scroll_x());
@@ -1700,6 +1788,24 @@ impl SessionLayout {
         )
     }
 
+    /// One return's strip, in the mixer band after the last track.
+    pub fn return_mixer(self, index: usize) -> egui::Rect {
+        self.mixer(self.tracks + index)
+    }
+
+    /// The seam between the last track's strip and the first return's —
+    /// drawn, never interactive, so the eye knows where the mix ends and
+    /// what it is sent to begins.
+    pub fn return_divider(self) -> Option<egui::Rect> {
+        (self.returns > 0).then(|| {
+            let left = self.track_left(self.tracks);
+            egui::Rect::from_min_max(
+                egui::pos2(left - 1.0, self.mixer_top()),
+                egui::pos2(left + 1.0, self.area.bottom() - SCROLLBAR_HEIGHT),
+            )
+        })
+    }
+
     pub fn stop_track(self, track: usize) -> egui::Rect {
         let row = self.scenes;
         self.slot(track, row)
@@ -1714,7 +1820,10 @@ impl SessionLayout {
     }
 
     pub fn max_scroll_x(self) -> f32 {
-        (self.tracks as f32 * self.track_width - self.tracks_viewport().width()).max(0.0)
+        // The return columns count: a mixer you cannot scroll to is a
+        // mixer that does not have them.
+        ((self.tracks + self.returns) as f32 * self.track_width - self.tracks_viewport().width())
+            .max(0.0)
     }
 
     pub fn max_scroll_y(self) -> f32 {
@@ -1763,7 +1872,13 @@ pub fn show_session(
     colors: &SessionColors,
 ) -> SessionViewOutput {
     let area = ui.max_rect();
-    let mut layout = SessionLayout::new(area, document.tracks.len(), document.scenes.len(), state);
+    let mut layout = SessionLayout::new(
+        area,
+        document.tracks.len(),
+        document.returns.len(),
+        document.scenes.len(),
+        state,
+    );
     let mut intents = Vec::new();
 
     ui.painter().rect_filled(area, 0.0, colors.bg);
@@ -1778,7 +1893,13 @@ pub fn show_session(
             } else {
                 state.scroll_y = (state.scroll_y - scroll.y).clamp(0.0, layout.max_scroll_y());
             }
-            layout = SessionLayout::new(area, document.tracks.len(), document.scenes.len(), state);
+            layout = SessionLayout::new(
+                area,
+                document.tracks.len(),
+                document.returns.len(),
+                document.scenes.len(),
+                state,
+            );
         }
     }
 
@@ -1804,7 +1925,13 @@ pub fn show_session(
     {
         state.mixer_height = (area.bottom() - SCROLLBAR_HEIGHT - position.y)
             .clamp(MIXER_HEIGHT_MIN, MIXER_HEIGHT_MAX);
-        layout = SessionLayout::new(area, document.tracks.len(), document.scenes.len(), state);
+        layout = SessionLayout::new(
+            area,
+            document.tracks.len(),
+            document.returns.len(),
+            document.scenes.len(),
+            state,
+        );
     }
 
     let track_clip = layout.tracks_viewport();
@@ -1867,6 +1994,7 @@ pub fn show_session(
                 ui,
                 track,
                 track_index,
+                &document.returns,
                 runtime.tracks.get(track_index),
                 state,
                 mixer,
@@ -1874,6 +2002,35 @@ pub fn show_session(
                 &mut intents,
             );
         }
+    }
+
+    // --- the returns, in the mixer band after the last track.
+    //
+    // A return column has no clip slots — the grid above it is drawn
+    // ground and nothing else, which is exactly where Live puts one. The
+    // divider before them says where the mix stops and what it is sent
+    // to begins.
+    if let Some(divider) = layout.return_divider() {
+        ui.painter().rect_filled(divider, 0.0, colors.outline);
+    }
+    for (index, bus) in document.returns.iter().enumerate() {
+        let strip = layout
+            .return_mixer(index)
+            .intersect(layout.tracks_viewport());
+        if strip.width() <= 1.0 || strip.height() <= 1.0 {
+            continue;
+        }
+        paint_return_strip(
+            ui,
+            bus,
+            index,
+            runtime.returns.get(index),
+            state,
+            strip,
+            state.selected_return == Some(index),
+            colors,
+            &mut intents,
+        );
     }
 
     paint_scene_column(ui, document, runtime, state, colors, layout, &mut intents);
@@ -2585,12 +2742,22 @@ fn paint_stop_track(
 /// the pan bar it is ranked under finally affords itself — and a row
 /// that flickers off while a seam is dragged reads as a rendering fault,
 /// not as a budget. Predictable beats full.
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// The sends are the exception that proves it. They are a VARIABLE block,
+/// so they only begin once every fixed row is already there — from which
+/// point the block can only grow, because nothing above it can still
+/// arrive and take its space back.
+#[derive(Debug, Clone, PartialEq)]
 pub struct MixerStrip {
     pub rect: egui::Rect,
     pub mute: egui::Rect,
     pub solo: egui::Rect,
     pub pan: Option<egui::Rect>,
+    /// One row per send that fits, in send order.
+    pub sends: Vec<egui::Rect>,
+    /// How many sends did not fit. Drawn as a count, never silently
+    /// dropped: a send you cannot see is still sending.
+    pub sends_hidden: usize,
     pub fader: egui::Rect,
     /// The meter column, BESIDE the fader rather than behind it. A meter
     /// under a fader cap is a meter you cannot read at the one moment it
@@ -2603,7 +2770,7 @@ pub struct MixerStrip {
 }
 
 impl MixerStrip {
-    pub fn new(rect: egui::Rect) -> Self {
+    pub fn new(rect: egui::Rect, sends: usize) -> Self {
         let content_left = rect.left() + STRIP_PAD_X;
         let content_right = (rect.right() - STRIP_PAD_X).max(content_left + 8.0);
 
@@ -2624,6 +2791,12 @@ impl MixerStrip {
         let wants_pan = afford(PAN_HEIGHT + STRIP_GAP);
         let wants_readout = wants_pan && afford(READOUT_HEIGHT + 2.0);
         let wants_peak = wants_readout && afford(PEAK_HEIGHT + 1.0);
+        // Only once everything fixed is in place, for the reason above.
+        let send_rows = if wants_peak && sends > 0 {
+            (((spare - STRIP_GAP) / SEND_HEIGHT).floor().max(0.0) as usize).min(sends)
+        } else {
+            0
+        };
 
         let row_width = TRACK_BUTTON_WIDTH * 2.0 + 4.0;
         let mut top = rect.top() + STRIP_PAD_Y;
@@ -2641,6 +2814,17 @@ impl MixerStrip {
             top += PAN_HEIGHT + STRIP_GAP;
             bar
         });
+        let send_rects: Vec<egui::Rect> = (0..send_rows)
+            .map(|row| {
+                egui::Rect::from_min_max(
+                    egui::pos2(content_left, top + row as f32 * SEND_HEIGHT),
+                    egui::pos2(content_right, top + (row + 1) as f32 * SEND_HEIGHT - 1.0),
+                )
+            })
+            .collect();
+        if send_rows > 0 {
+            top += send_rows as f32 * SEND_HEIGHT + STRIP_GAP;
+        }
 
         let mut bottom = rect.bottom() - STRIP_PAD_Y;
         let peak = wants_peak.then(|| {
@@ -2688,6 +2872,8 @@ impl MixerStrip {
             mute,
             solo,
             pan,
+            sends: send_rects,
+            sends_hidden: sends - send_rows,
             fader,
             meter,
             scale,
@@ -2713,6 +2899,17 @@ fn fader_volume(normalized: f32) -> f32 {
 /// Where a decibel value sits on the fader, `0..=1`.
 fn fader_position(db: f32) -> f32 {
     fader_normalized(10.0_f32.powf(db / 20.0))
+}
+
+/// A send's taper. The same square law as the fader, over the send's own
+/// range — which stops at unity, because a send is how much of a track
+/// goes somewhere, and more than all of it is not a quantity.
+fn send_normalized(level: f32) -> f32 {
+    level.clamp(0.0, 1.0).sqrt()
+}
+
+fn send_level(normalized: f32) -> f32 {
+    normalized.clamp(0.0, 1.0).powi(2)
 }
 
 /// The ticks drawn beside the fader, loud first.
@@ -2763,18 +2960,283 @@ fn fine_drag(ui: &egui::Ui, amount: f32) -> f32 {
     }
 }
 
+/// The pan bar: a fill that GROWS FROM THE CENTRE, which is the shape
+/// that says at a glance both how far and which way. A dot on a line
+/// says only where, and a mix is read at a glance or not at all.
+///
+/// Returns the pan it was moved to, if it was moved.
+fn pan_control(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    id: egui::Id,
+    pan: f32,
+    colors: &SessionColors,
+) -> Option<f32> {
+    let response = ui.interact(rect, id, egui::Sense::click_and_drag());
+    let moved = if response.double_clicked() {
+        Some(0.0)
+    } else if response.dragged() {
+        let amount = fine_drag(ui, response.drag_delta().x);
+        (amount != 0.0).then(|| (pan + amount / rect.width().max(1.0)).clamp(-1.0, 1.0))
+    } else {
+        None
+    };
+    let live = response.hovered() || response.dragged();
+
+    ui.painter().rect_filled(rect, 0.0, colors.sunken);
+    let centre = rect.center().x;
+    let pan = pan.clamp(-1.0, 1.0);
+    if pan.abs() > 1e-4 {
+        let edge = centre + pan * rect.width() * 0.5;
+        ui.painter().rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(centre.min(edge), rect.top() + 2.0),
+                egui::pos2(centre.max(edge), rect.bottom() - 2.0),
+            ),
+            0.0,
+            if live {
+                colors.accent
+            } else {
+                colors.accent_dim
+            },
+        );
+    }
+    ui.painter().line_segment(
+        [
+            egui::pos2(centre, rect.top()),
+            egui::pos2(centre, rect.bottom()),
+        ],
+        egui::Stroke::new(1.0, colors.outline),
+    );
+    ui.painter().text(
+        egui::pos2(rect.right() - 2.0, rect.center().y),
+        egui::Align2::RIGHT_CENTER,
+        pan_text(pan),
+        egui::FontId::monospace(MICRO_FONT - 1.0),
+        if live { colors.text } else { colors.muted },
+    );
+    response.on_hover_text(format!(
+        "pan {} · drag to move · shift for fine · double-click centres",
+        pan_text(pan)
+    ));
+    moved
+}
+
+/// What a level column was asked to do this frame.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct LevelEdit {
+    /// The volume it was dragged to, as linear gain.
+    volume: Option<f32>,
+    /// The peak hold was clicked and should be forgotten.
+    clear_peak: bool,
+}
+
+/// The fader, its scale, its meter and its two numbers — the half of a
+/// strip a track and a return have IDENTICALLY.
+///
+/// Shared rather than copied, and the reason is the taper: a return whose
+/// fader read 0 dB two pixels from where a track's did would be a mixer
+/// nobody could balance by eye. One function, one rail.
+#[allow(clippy::too_many_arguments)]
+fn paint_level_column(
+    ui: &mut egui::Ui,
+    strip: &MixerStrip,
+    id: egui::Id,
+    volume: f32,
+    peak: f32,
+    hold: f32,
+    clipped: bool,
+    colors: &SessionColors,
+) -> LevelEdit {
+    let mut edit = LevelEdit::default();
+
+    // The dB ticks, drawn before the fader so the fader sits over its own
+    // scale rather than under it.
+    if let Some(scale) = strip.scale {
+        for (db, label) in FADER_TICKS {
+            let y = egui::lerp(scale.bottom()..=scale.top(), fader_position(*db));
+            if y < scale.top() - 0.5 || y > scale.bottom() + 0.5 {
+                continue;
+            }
+            let unity = *db == 0.0;
+            ui.painter().line_segment(
+                [
+                    egui::pos2(scale.left(), y),
+                    egui::pos2(scale.left() + if unity { 6.0 } else { 3.0 }, y),
+                ],
+                egui::Stroke::new(1.0, if unity { colors.muted } else { colors.divider }),
+            );
+            ui.painter().text(
+                egui::pos2(scale.right(), y),
+                egui::Align2::RIGHT_CENTER,
+                label,
+                egui::FontId::monospace(MICRO_FONT - 1.0),
+                if unity { colors.muted } else { colors.divider },
+            );
+        }
+    }
+
+    // The meter, on the fader's own taper so a level can be read against
+    // the ticks beside it instead of against nothing.
+    ui.painter().rect_filled(strip.meter, 0.0, colors.sunken);
+    let level = fader_normalized(peak).clamp(0.0, 1.0);
+    if level > 0.0 {
+        let top = egui::lerp(strip.meter.bottom()..=strip.meter.top(), level);
+        ui.painter().rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(strip.meter.left() + 1.0, top),
+                egui::pos2(strip.meter.right() - 1.0, strip.meter.bottom()),
+            ),
+            0.0,
+            if peak > 0.9 {
+                colors.meter_hot
+            } else {
+                colors.meter_low
+            },
+        );
+    }
+    if hold > 0.0 {
+        let y = egui::lerp(
+            strip.meter.bottom()..=strip.meter.top(),
+            fader_normalized(hold).clamp(0.0, 1.0),
+        );
+        ui.painter().line_segment(
+            [
+                egui::pos2(strip.meter.left(), y),
+                egui::pos2(strip.meter.right(), y),
+            ],
+            egui::Stroke::new(
+                1.0,
+                if clipped {
+                    colors.meter_clip
+                } else {
+                    colors.text
+                },
+            ),
+        );
+    }
+
+    // The fader.
+    let response = ui.interact(strip.fader, id.with("fader"), egui::Sense::click_and_drag());
+    if response.double_clicked() {
+        edit.volume = Some(1.0);
+    } else if response.dragged() {
+        let moved = fine_drag(ui, -response.drag_delta().y);
+        if moved != 0.0 {
+            edit.volume = Some(fader_volume(
+                fader_normalized(volume) + moved / strip.fader.height().max(1.0),
+            ));
+        }
+    }
+    ui.painter().rect_filled(strip.fader, 0.0, colors.sunken);
+    let unity_y = egui::lerp(
+        strip.fader.bottom()..=strip.fader.top(),
+        fader_position(0.0),
+    );
+    ui.painter().line_segment(
+        [
+            egui::pos2(strip.fader.left(), unity_y),
+            egui::pos2(strip.fader.right(), unity_y),
+        ],
+        egui::Stroke::new(1.0, colors.divider),
+    );
+    let handle_y = egui::lerp(
+        strip.fader.bottom()..=strip.fader.top(),
+        fader_normalized(volume),
+    );
+    ui.painter().rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(strip.fader.left() + 1.0, handle_y),
+            egui::pos2(strip.fader.right() - 1.0, strip.fader.bottom()),
+        ),
+        0.0,
+        colors.accent_dim.gamma_multiply(0.6),
+    );
+    ui.painter().rect_filled(
+        egui::Rect::from_center_size(
+            egui::pos2(strip.fader.center().x, handle_y),
+            egui::vec2(strip.fader.width() + 4.0, 5.0),
+        ),
+        1.0,
+        if response.hovered() || response.dragged() {
+            colors.text
+        } else {
+            colors.muted
+        },
+    );
+    response.on_hover_text(format!(
+        "{} dB · drag to move · shift for fine · double-click returns to unity",
+        db_text(volume)
+    ));
+
+    // The two numbers.
+    if let Some(readout) = strip.readout {
+        ui.painter().text(
+            readout.center(),
+            egui::Align2::CENTER_CENTER,
+            format!("{} dB", db_text(volume)),
+            egui::FontId::monospace(MICRO_FONT),
+            colors.text,
+        );
+    }
+    if let Some(row) = strip.peak {
+        let response = ui.interact(row, id.with("peak"), egui::Sense::click());
+        edit.clear_peak = response.clicked();
+        ui.painter().rect_filled(
+            row,
+            0.0,
+            if clipped {
+                colors.meter_clip.gamma_multiply(0.3)
+            } else if response.hovered() {
+                colors.raised
+            } else {
+                colors.bg
+            },
+        );
+        ui.painter().text(
+            row.center(),
+            egui::Align2::CENTER_CENTER,
+            format!("pk {}", db_text(hold)),
+            egui::FontId::monospace(MICRO_FONT - 1.0),
+            if clipped {
+                colors.meter_clip
+            } else {
+                colors.muted
+            },
+        );
+        response.on_hover_text("loudest peak since this was last cleared · click to clear");
+    } else if clipped {
+        // No room for the number, so the clip still has to be sayable: a
+        // lamp on the meter, clickable exactly as the number is.
+        let lamp = egui::Rect::from_min_max(
+            strip.meter.left_top(),
+            egui::pos2(strip.meter.right(), strip.meter.top() + 3.0),
+        );
+        if ui
+            .interact(lamp.expand(3.0), id.with("lamp"), egui::Sense::click())
+            .clicked()
+        {
+            edit.clear_peak = true;
+        }
+        ui.painter().rect_filled(lamp, 0.0, colors.meter_clip);
+    }
+
+    edit
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paint_mixer(
     ui: &mut egui::Ui,
     track: &SessionTrack,
     track_index: usize,
+    returns: &[SessionReturn],
     runtime: Option<&TrackRuntime>,
     state: &mut SessionViewState,
     rect: egui::Rect,
     colors: &SessionColors,
     intents: &mut Vec<SessionIntent>,
 ) {
-    let strip = MixerStrip::new(rect);
+    let strip = MixerStrip::new(rect, returns.len());
     ui.painter().rect_filled(rect, 0.0, colors.surface);
     ui.painter().line_segment(
         [rect.right_top(), rect.right_bottom()],
@@ -2819,254 +3281,287 @@ fn paint_mixer(
     solo.on_hover_text("solo · ctrl-click to add to the solo set");
 
     // ---- pan.
-    if let Some(pan_rect) = strip.pan {
-        let pan_id = ui.id().with(("session_next_pan", track_index));
-        let response = ui.interact(pan_rect, pan_id, egui::Sense::click_and_drag());
-        if response.double_clicked() {
-            intents.push(SessionIntent::SetTrackPan {
+    if let Some(pan_rect) = strip.pan
+        && let Some(value) = pan_control(
+            ui,
+            pan_rect,
+            ui.id().with(("session_next_pan", track_index)),
+            track.pan,
+            colors,
+        )
+    {
+        intents.push(SessionIntent::SetTrackPan {
+            track: track_index,
+            value,
+        });
+    }
+
+    // ---- the sends.
+    for (index, row) in strip.sends.iter().enumerate() {
+        let level = track.sends.get(index).copied().unwrap_or(0.0);
+        let name = returns.get(index).map_or("", |bus| bus.name.as_str());
+        if let Some(value) = send_row(
+            ui,
+            *row,
+            ui.id().with(("session_next_send", track_index, index)),
+            index,
+            level,
+            name,
+            colors,
+        ) {
+            intents.push(SessionIntent::SetTrackSend {
                 track: track_index,
-                value: 0.0,
+                index,
+                value,
             });
-        } else if response.dragged() {
-            let moved = fine_drag(ui, response.drag_delta().x);
-            if moved != 0.0 {
-                intents.push(SessionIntent::SetTrackPan {
-                    track: track_index,
-                    value: (track.pan + moved / pan_rect.width().max(1.0)).clamp(-1.0, 1.0),
-                });
-            }
-        }
-        let live = response.hovered() || response.dragged();
-        paint_pan(ui, pan_rect, track.pan, live, colors);
-        response.on_hover_text(format!(
-            "pan {} · drag to move · shift for fine · double-click centres",
-            pan_text(track.pan)
-        ));
-    }
-
-    // ---- the dB ticks, drawn before the fader so the fader sits over
-    // its own scale rather than under it.
-    if let Some(scale) = strip.scale {
-        for (db, label) in FADER_TICKS {
-            let y = egui::lerp(scale.bottom()..=scale.top(), fader_position(*db));
-            if y < scale.top() - 0.5 || y > scale.bottom() + 0.5 {
-                continue;
-            }
-            let unity = *db == 0.0;
-            ui.painter().line_segment(
-                [
-                    egui::pos2(scale.left(), y),
-                    egui::pos2(scale.left() + if unity { 6.0 } else { 3.0 }, y),
-                ],
-                egui::Stroke::new(1.0, if unity { colors.muted } else { colors.divider }),
-            );
-            ui.painter().text(
-                egui::pos2(scale.right(), y),
-                egui::Align2::RIGHT_CENTER,
-                label,
-                egui::FontId::monospace(MICRO_FONT - 1.0),
-                if unity { colors.muted } else { colors.divider },
-            );
         }
     }
+    if strip.sends_hidden > 0
+        && let Some(last) = strip.sends.last()
+    {
+        // A send you cannot see is still sending, so the count is drawn
+        // rather than the block quietly ending.
+        ui.painter().text(
+            egui::pos2(last.right(), last.bottom() + 1.0),
+            egui::Align2::RIGHT_TOP,
+            format!("+{}", strip.sends_hidden),
+            egui::FontId::monospace(MICRO_FONT - 2.0),
+            colors.muted,
+        );
+    }
 
-    // ---- the meter, on the fader's own taper so a level can be read
-    // against the ticks beside it instead of against nothing.
+    // ---- the level column.
     let peak = runtime.map_or(0.0, |runtime| runtime.peak.max(0.0));
     let hold = state.hold_peak(track_index, peak);
-    ui.painter().rect_filled(strip.meter, 0.0, colors.sunken);
-    let level = fader_normalized(peak).clamp(0.0, 1.0);
-    if level > 0.0 {
-        let top = egui::lerp(strip.meter.bottom()..=strip.meter.top(), level);
+    let clipped = runtime.is_some_and(|runtime| runtime.clipped);
+    let edit = paint_level_column(
+        ui,
+        &strip,
+        ui.id().with(("session_next_level", track_index)),
+        track.volume,
+        peak,
+        hold,
+        clipped,
+        colors,
+    );
+    if let Some(value) = edit.volume {
+        intents.push(SessionIntent::SetTrackVolume {
+            track: track_index,
+            value,
+        });
+    }
+    if edit.clear_peak {
+        state.clear_peak(track_index);
+        intents.push(SessionIntent::ClearClipHold(track_index));
+    }
+}
+
+/// One send row: its letter, and how much goes.
+///
+/// A bar rather than a knob, because a strip is a column and a column
+/// has width to spare and no height at all. Returns the level it was
+/// dragged to, if it moved.
+#[allow(clippy::too_many_arguments)]
+fn send_row(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    id: egui::Id,
+    index: usize,
+    level: f32,
+    name: &str,
+    colors: &SessionColors,
+) -> Option<f32> {
+    let letter = egui::Rect::from_min_max(
+        rect.min,
+        egui::pos2(
+            (rect.left() + SEND_LETTER_WIDTH).min(rect.right()),
+            rect.bottom(),
+        ),
+    );
+    let bar = egui::Rect::from_min_max(egui::pos2(letter.right(), rect.top()), rect.max);
+    let response = ui.interact(bar, id, egui::Sense::click_and_drag());
+    let moved = if response.double_clicked() {
+        Some(0.0)
+    } else if response.dragged() {
+        let amount = fine_drag(ui, response.drag_delta().x);
+        (amount != 0.0).then(|| send_level(send_normalized(level) + amount / bar.width().max(1.0)))
+    } else {
+        None
+    };
+    let live = response.hovered() || response.dragged();
+
+    ui.painter().text(
+        letter.center(),
+        egui::Align2::CENTER_CENTER,
+        daw_return_letter(index),
+        egui::FontId::monospace(MICRO_FONT - 1.0),
+        if live { colors.text } else { colors.divider },
+    );
+    ui.painter().rect_filled(bar, 0.0, colors.sunken);
+    let filled = send_normalized(level);
+    if filled > 0.0 {
         ui.painter().rect_filled(
             egui::Rect::from_min_max(
-                egui::pos2(strip.meter.left() + 1.0, top),
-                egui::pos2(strip.meter.right() - 1.0, strip.meter.bottom()),
+                egui::pos2(bar.left(), bar.top() + 1.0),
+                egui::pos2(
+                    egui::lerp(bar.left()..=bar.right(), filled),
+                    bar.bottom() - 1.0,
+                ),
             ),
             0.0,
-            if peak > 0.9 {
-                colors.meter_hot
+            if live {
+                colors.role_mod
             } else {
-                colors.meter_low
+                colors.role_mod.gamma_multiply(0.55)
             },
         );
     }
-    let clipped = runtime.is_some_and(|runtime| runtime.clipped);
-    if hold > 0.0 {
-        let y = egui::lerp(
-            strip.meter.bottom()..=strip.meter.top(),
-            fader_normalized(hold).clamp(0.0, 1.0),
-        );
-        ui.painter().line_segment(
-            [
-                egui::pos2(strip.meter.left(), y),
-                egui::pos2(strip.meter.right(), y),
-            ],
-            egui::Stroke::new(
-                1.0,
-                if clipped {
-                    colors.meter_clip
-                } else {
-                    colors.text
-                },
-            ),
+    response.on_hover_text(if name.is_empty() {
+        format!("send {} · {} dB", daw_return_letter(index), db_text(level))
+    } else {
+        format!(
+            "send {} to {name} · {} dB · drag to open · double-click shuts it",
+            daw_return_letter(index),
+            db_text(level)
+        )
+    });
+    moved
+}
+
+/// The letter a send row and a return column share: `A`, `B`, …
+///
+/// The view's own copy rather than the project's, because this module may
+/// not name the app — the same rule that keeps `SessionTrack` apart from
+/// `Track`. There is exactly one alphabet, so the two cannot drift.
+fn daw_return_letter(index: usize) -> String {
+    if index < 26 {
+        ((b'A' + index as u8) as char).to_string()
+    } else {
+        "?".to_owned()
+    }
+}
+
+/// A return's strip: the same level column a track has, a mute, a pan,
+/// and no sends of its own — a return that sent would be a feedback loop
+/// the graph cannot compile.
+#[allow(clippy::too_many_arguments)]
+fn paint_return_strip(
+    ui: &mut egui::Ui,
+    bus: &SessionReturn,
+    index: usize,
+    runtime: Option<&TrackRuntime>,
+    state: &mut SessionViewState,
+    rect: egui::Rect,
+    selected: bool,
+    colors: &SessionColors,
+    intents: &mut Vec<SessionIntent>,
+) {
+    let strip = MixerStrip::new(rect, 0);
+    ui.painter().rect_filled(rect, 0.0, colors.surface);
+    ui.painter().line_segment(
+        [rect.right_top(), rect.right_bottom()],
+        egui::Stroke::new(1.0, colors.divider),
+    );
+    if selected {
+        ui.painter().rect_stroke(
+            rect.shrink(1.0),
+            0.0,
+            egui::Stroke::new(1.0, colors.selected),
+            egui::StrokeKind::Inside,
         );
     }
 
-    // ---- the fader.
-    let fader_id = ui.id().with(("session_next_fader", track_index));
-    let fader_response = ui.interact(strip.fader, fader_id, egui::Sense::click_and_drag());
-    if fader_response.double_clicked() {
-        intents.push(SessionIntent::SetTrackVolume {
-            track: track_index,
-            value: 1.0,
-        });
-    } else if fader_response.dragged() {
-        let moved = fine_drag(ui, -fader_response.drag_delta().y);
-        if moved != 0.0 {
-            let normalized = fader_normalized(track.volume) + moved / strip.fader.height().max(1.0);
-            intents.push(SessionIntent::SetTrackVolume {
-                track: track_index,
-                value: fader_volume(normalized),
-            });
-        }
+    // The letter sits where a track's solo does, because a return has no
+    // solo — and the letter is the thing a send row is pointing at, so
+    // it is the one label that must be visible from across the room.
+    let head = egui::Rect::from_min_max(strip.mute.left_top(), strip.solo.right_bottom());
+    let response = ui.interact(
+        head,
+        ui.id().with(("session_next_return_head", index)),
+        egui::Sense::click(),
+    );
+    if response.clicked() {
+        intents.push(SessionIntent::SelectReturn(index));
     }
-    ui.painter().rect_filled(strip.fader, 0.0, colors.sunken);
-    let unity_y = egui::lerp(
-        strip.fader.bottom()..=strip.fader.top(),
-        fader_position(0.0),
+    let mute = control_button(
+        ui,
+        strip.mute,
+        ui.id().with(("session_next_return_mute", index)),
+        "M",
+        bus.mute,
+        colors.warn,
+        colors,
     );
-    ui.painter().line_segment(
-        [
-            egui::pos2(strip.fader.left(), unity_y),
-            egui::pos2(strip.fader.right(), unity_y),
-        ],
-        egui::Stroke::new(1.0, colors.divider),
-    );
-    let handle_y = egui::lerp(
-        strip.fader.bottom()..=strip.fader.top(),
-        fader_normalized(track.volume),
-    );
-    ui.painter().rect_filled(
-        egui::Rect::from_min_max(
-            egui::pos2(strip.fader.left() + 1.0, handle_y),
-            egui::pos2(strip.fader.right() - 1.0, strip.fader.bottom()),
-        ),
-        0.0,
-        colors.accent_dim.gamma_multiply(0.6),
-    );
-    ui.painter().rect_filled(
-        egui::Rect::from_center_size(
-            egui::pos2(strip.fader.center().x, handle_y),
-            egui::vec2(strip.fader.width() + 4.0, 5.0),
-        ),
-        1.0,
-        if fader_response.hovered() || fader_response.dragged() {
-            colors.text
+    if mute.clicked() {
+        intents.push(SessionIntent::ToggleReturnMute(index));
+    }
+    mute.on_hover_text(if bus.mute {
+        "switch this return back on"
+    } else {
+        "switch this return off — its sends go with it"
+    });
+    ui.painter().text(
+        strip.solo.center(),
+        egui::Align2::CENTER_CENTER,
+        daw_return_letter(index),
+        egui::FontId::monospace(LABEL_FONT + 1.0),
+        if selected {
+            colors.selected
         } else {
             colors.muted
         },
     );
-    fader_response.on_hover_text(format!(
-        "{} dB · drag to move · shift for fine · double-click returns to unity",
-        db_text(track.volume)
-    ));
+    response.on_hover_text(format!("{} · click to show its devices", bus.name));
 
-    // ---- the two numbers.
-    if let Some(readout) = strip.readout {
-        ui.painter().text(
-            readout.center(),
-            egui::Align2::CENTER_CENTER,
-            format!("{} dB", db_text(track.volume)),
-            egui::FontId::monospace(MICRO_FONT),
-            colors.text,
-        );
+    if let Some(pan_rect) = strip.pan
+        && let Some(value) = pan_control(
+            ui,
+            pan_rect,
+            ui.id().with(("session_next_return_pan", index)),
+            bus.pan,
+            colors,
+        )
+    {
+        intents.push(SessionIntent::SetReturnPan { index, value });
     }
-    if let Some(row) = strip.peak {
-        let id = ui.id().with(("session_next_peak_hold", track_index));
-        let response = ui.interact(row, id, egui::Sense::click());
-        if response.clicked() {
-            state.clear_peak(track_index);
-            intents.push(SessionIntent::ClearClipHold(track_index));
-        }
-        ui.painter().rect_filled(
-            row,
-            0.0,
-            if clipped {
-                colors.meter_clip.gamma_multiply(0.3)
-            } else if response.hovered() {
-                colors.raised
-            } else {
-                colors.bg
-            },
-        );
+
+    // The return's name, in the space its sends would have taken. A
+    // return is the one strip whose name is worth repeating down here:
+    // `A` says where it sits, and only the name says what it is.
+    let name_row = egui::Rect::from_min_max(
+        egui::pos2(strip.fader.left(), strip.fader.top() - SEND_HEIGHT),
+        egui::pos2(strip.meter.right(), strip.fader.top() - 1.0),
+    );
+    if name_row.height() > 6.0 && strip.pan.is_some() {
         ui.painter().text(
-            row.center(),
+            name_row.center(),
             egui::Align2::CENTER_CENTER,
-            format!("pk {}", db_text(hold)),
+            &bus.name,
             egui::FontId::monospace(MICRO_FONT - 1.0),
-            if clipped {
-                colors.meter_clip
-            } else {
-                colors.muted
-            },
+            colors.muted,
         );
-        response.on_hover_text("loudest peak since this was last cleared · click to clear");
-    } else if clipped {
-        // No room for the number, so the clip still has to be sayable:
-        // a lamp on the meter, clickable exactly as the number is.
-        let lamp = egui::Rect::from_min_max(
-            strip.meter.left_top(),
-            egui::pos2(strip.meter.right(), strip.meter.top() + 3.0),
-        );
-        let id = ui.id().with(("session_next_clip_lamp", track_index));
-        if ui
-            .interact(lamp.expand(3.0), id, egui::Sense::click())
-            .clicked()
-        {
-            state.clear_peak(track_index);
-            intents.push(SessionIntent::ClearClipHold(track_index));
-        }
-        ui.painter().rect_filled(lamp, 0.0, colors.meter_clip);
     }
-}
 
-/// The pan bar: a fill that GROWS FROM THE CENTRE, which is the shape
-/// that says at a glance both how far and which way. A dot on a line
-/// says only where, and a mix is read at a glance or not at all.
-fn paint_pan(ui: &egui::Ui, rect: egui::Rect, pan: f32, live: bool, colors: &SessionColors) {
-    ui.painter().rect_filled(rect, 0.0, colors.sunken);
-    let centre = rect.center().x;
-    let pan = pan.clamp(-1.0, 1.0);
-    if pan.abs() > 1e-4 {
-        let edge = centre + pan * rect.width() * 0.5;
-        ui.painter().rect_filled(
-            egui::Rect::from_min_max(
-                egui::pos2(centre.min(edge), rect.top() + 2.0),
-                egui::pos2(centre.max(edge), rect.bottom() - 2.0),
-            ),
-            0.0,
-            if live {
-                colors.accent
-            } else {
-                colors.accent_dim
-            },
-        );
+    let peak = runtime.map_or(0.0, |runtime| runtime.peak.max(0.0));
+    let slot = RETURN_HOLD_BASE + index;
+    let hold = state.hold_peak(slot, peak);
+    let clipped = runtime.is_some_and(|runtime| runtime.clipped);
+    let edit = paint_level_column(
+        ui,
+        &strip,
+        ui.id().with(("session_next_return_level", index)),
+        bus.volume,
+        peak,
+        hold,
+        clipped,
+        colors,
+    );
+    if let Some(value) = edit.volume {
+        intents.push(SessionIntent::SetReturnVolume { index, value });
     }
-    ui.painter().line_segment(
-        [
-            egui::pos2(centre, rect.top()),
-            egui::pos2(centre, rect.bottom()),
-        ],
-        egui::Stroke::new(1.0, colors.outline),
-    );
-    ui.painter().text(
-        egui::pos2(rect.right() - 2.0, rect.center().y),
-        egui::Align2::RIGHT_CENTER,
-        pan_text(pan),
-        egui::FontId::monospace(MICRO_FONT - 1.0),
-        if live { colors.text } else { colors.muted },
-    );
+    if edit.clear_peak {
+        state.clear_peak(slot);
+    }
 }
 
 fn paint_scene_column(
@@ -4196,8 +4691,13 @@ mod tests {
     fn layout_keeps_scene_and_slot_rows_aligned() {
         let document = document();
         let state = SessionViewState::default();
-        let layout =
-            SessionLayout::new(view(), document.tracks.len(), document.scenes.len(), &state);
+        let layout = SessionLayout::new(
+            view(),
+            document.tracks.len(),
+            document.returns.len(),
+            document.scenes.len(),
+            &state,
+        );
         for scene in 0..document.scenes.len() {
             assert_eq!(layout.slot(0, scene).top(), layout.scene(scene).top());
             assert_eq!(layout.slot(0, scene).bottom(), layout.scene(scene).bottom());
@@ -4208,8 +4708,13 @@ mod tests {
     fn launch_and_body_targets_are_disjoint() {
         let document = document();
         let state = SessionViewState::default();
-        let layout =
-            SessionLayout::new(view(), document.tracks.len(), document.scenes.len(), &state);
+        let layout = SessionLayout::new(
+            view(),
+            document.tracks.len(),
+            document.returns.len(),
+            document.scenes.len(),
+            &state,
+        );
         let launch = layout.slot_launch(0, 0);
         let body = layout.slot_body(0, 0);
         assert_eq!(launch.right(), body.left());
@@ -4226,12 +4731,14 @@ mod tests {
         let a = SessionLayout::new(
             view(),
             document.tracks.len(),
+            document.returns.len(),
             document.scenes.len(),
             &comfortable,
         );
         let b = SessionLayout::new(
             view(),
             document.tracks.len(),
+            document.returns.len(),
             document.scenes.len(),
             &compact,
         );
@@ -4246,8 +4753,13 @@ mod tests {
             mixer_height: 10_000.0,
             ..SessionViewState::default()
         };
-        let layout =
-            SessionLayout::new(view(), document.tracks.len(), document.scenes.len(), &state);
+        let layout = SessionLayout::new(
+            view(),
+            document.tracks.len(),
+            document.returns.len(),
+            document.scenes.len(),
+            &state,
+        );
         assert!(layout.mixer_height <= view().height() * 0.55 + f32::EPSILON);
         assert!(layout.rows_viewport().height() > 0.0);
     }
@@ -4256,8 +4768,13 @@ mod tests {
     fn slot_hit_testing_respects_the_rows_viewport() {
         let document = document();
         let state = SessionViewState::default();
-        let layout =
-            SessionLayout::new(view(), document.tracks.len(), document.scenes.len(), &state);
+        let layout = SessionLayout::new(
+            view(),
+            document.tracks.len(),
+            document.returns.len(),
+            document.scenes.len(),
+            &state,
+        );
         assert_eq!(
             layout.slot_at(layout.slot_body(1, 2).center()),
             Some((1, 2))
@@ -4636,7 +5153,7 @@ mod tests {
     fn launching_without_select_on_launch_leaves_the_selection_alone() {
         let document = document();
         let runtime = SessionRuntime::new(document.tracks.len());
-        let layout = SessionLayout::new(view(), 2, DEFAULT_SCENES, &SessionViewState::default());
+        let layout = SessionLayout::new(view(), 2, 0, DEFAULT_SCENES, &SessionViewState::default());
         // Track 0 scene 1 holds a real clip; the Continue slot beside it
         // would refuse the launch for an unrelated reason.
         let rail = layout.slot_launch(0, 1).center();
@@ -4681,7 +5198,7 @@ mod tests {
         let document = document();
         let runtime = SessionRuntime::new(document.tracks.len());
         let mut state = SessionViewState::default();
-        let at = SessionLayout::new(view(), 2, DEFAULT_SCENES, &state)
+        let at = SessionLayout::new(view(), 2, 0, DEFAULT_SCENES, &state)
             .slot_body(0, 0)
             .center();
         let frames = render_path(&document, &runtime, &mut state, &[probe::Step::moved(at)]);
@@ -4693,7 +5210,7 @@ mod tests {
         let document = document();
         let runtime = SessionRuntime::new(document.tracks.len());
         let mut state = SessionViewState::default();
-        let layout = SessionLayout::new(view(), 2, DEFAULT_SCENES, &state);
+        let layout = SessionLayout::new(view(), 2, 0, DEFAULT_SCENES, &state);
         let frames = render_path(
             &document,
             &runtime,
@@ -4710,7 +5227,7 @@ mod tests {
         let document = document();
         let runtime = SessionRuntime::new(document.tracks.len());
         let mut state = SessionViewState::default();
-        let layout = SessionLayout::new(view(), 2, DEFAULT_SCENES, &state);
+        let layout = SessionLayout::new(view(), 2, 0, DEFAULT_SCENES, &state);
         let frames = render_path(
             &document,
             &runtime,
@@ -4727,7 +5244,7 @@ mod tests {
         let document = document();
         let runtime = SessionRuntime::new(document.tracks.len());
         let mut state = SessionViewState::default();
-        let layout = SessionLayout::new(view(), 2, DEFAULT_SCENES, &state);
+        let layout = SessionLayout::new(view(), 2, 0, DEFAULT_SCENES, &state);
         let frames = render_path(
             &document,
             &runtime,
@@ -4742,7 +5259,7 @@ mod tests {
         let document = document();
         let runtime = SessionRuntime::new(document.tracks.len());
         let mut state = SessionViewState::default();
-        let layout = SessionLayout::new(view(), 2, DEFAULT_SCENES, &state);
+        let layout = SessionLayout::new(view(), 2, 0, DEFAULT_SCENES, &state);
         let frames = render_path(
             &document,
             &runtime,
@@ -4760,7 +5277,7 @@ mod tests {
         let document = document();
         let runtime = SessionRuntime::new(document.tracks.len());
         let mut state = SessionViewState::default();
-        let layout = SessionLayout::new(view(), 2, DEFAULT_SCENES, &state);
+        let layout = SessionLayout::new(view(), 2, 0, DEFAULT_SCENES, &state);
         let body = render_path(
             &document,
             &runtime,
@@ -4784,7 +5301,7 @@ mod tests {
         let document = document();
         let runtime = SessionRuntime::new(document.tracks.len());
         let mut state = SessionViewState::default();
-        let layout = SessionLayout::new(view(), 2, DEFAULT_SCENES, &state);
+        let layout = SessionLayout::new(view(), 2, 0, DEFAULT_SCENES, &state);
         let frames = render_path(
             &document,
             &runtime,
@@ -4805,7 +5322,7 @@ mod tests {
         let document = document();
         let runtime = SessionRuntime::new(document.tracks.len());
         let mut state = SessionViewState::default();
-        let layout = SessionLayout::new(view(), 2, DEFAULT_SCENES, &state);
+        let layout = SessionLayout::new(view(), 2, 0, DEFAULT_SCENES, &state);
         let frames = render_path(
             &document,
             &runtime,
@@ -4827,7 +5344,7 @@ mod tests {
         let document = document();
         let runtime = SessionRuntime::new(document.tracks.len());
         let mut state = SessionViewState::default();
-        let layout = SessionLayout::new(view(), 2, DEFAULT_SCENES, &state);
+        let layout = SessionLayout::new(view(), 2, 0, DEFAULT_SCENES, &state);
         let frames = render_path(
             &document,
             &runtime,
@@ -4856,8 +5373,8 @@ mod tests {
         let document = document();
         let runtime = SessionRuntime::new(document.tracks.len());
         let mut state = SessionViewState::default();
-        let layout = SessionLayout::new(view(), 2, DEFAULT_SCENES, &state);
-        let pan = MixerStrip::new(layout.mixer(0))
+        let layout = SessionLayout::new(view(), 2, 0, DEFAULT_SCENES, &state);
+        let pan = MixerStrip::new(layout.mixer(0), 0)
             .pan
             .expect("the default strip is tall enough for a pan bar");
         let frames = render_path(
@@ -4883,7 +5400,10 @@ mod tests {
 
     fn strip() -> MixerStrip {
         let state = SessionViewState::default();
-        MixerStrip::new(SessionLayout::new(view(), 2, DEFAULT_SCENES, &state).mixer(0))
+        MixerStrip::new(
+            SessionLayout::new(view(), 2, 0, DEFAULT_SCENES, &state).mixer(0),
+            0,
+        )
     }
 
     /// THE TAPER IS ONE FUNCTION, ASKED FOUR TIMES.
@@ -4972,7 +5492,7 @@ mod tests {
         let mut height = MIXER_HEIGHT_MIN;
         while height <= MIXER_HEIGHT_MAX {
             let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(112.0, height));
-            let strip = MixerStrip::new(rect);
+            let strip = MixerStrip::new(rect, 0);
             assert!(
                 strip.fader.height() >= FADER_MIN_HEIGHT - 0.01,
                 "at {height}"
@@ -5006,10 +5526,10 @@ mod tests {
             height += 1.0;
         }
         // And the floor really is lean: something had to go.
-        let floor = MixerStrip::new(egui::Rect::from_min_size(
-            egui::pos2(0.0, 0.0),
-            egui::vec2(112.0, MIXER_HEIGHT_MIN),
-        ));
+        let floor = MixerStrip::new(
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(112.0, MIXER_HEIGHT_MIN)),
+            0,
+        );
         assert!(floor.peak.is_none() && floor.pan.is_none());
     }
 
@@ -5177,6 +5697,276 @@ mod tests {
         assert_eq!(state.peak_hold[0], 0.0, "the hold survived being cleared");
     }
 
+    // ------------------------------------------------ sends and returns ---
+
+    /// The same document with `count` returns, and a track that already
+    /// sends to the first of them.
+    fn with_returns(count: usize) -> SessionDocument {
+        let mut document = document();
+        document.returns = (0..count)
+            .map(|index| SessionReturn {
+                name: format!("Return {}", daw_return_letter(index)),
+                ..SessionReturn::default()
+            })
+            .collect();
+        document.tracks[0].sends = vec![0.25];
+        document
+    }
+
+    fn layout_of(document: &SessionDocument, state: &SessionViewState) -> SessionLayout {
+        SessionLayout::new(
+            view(),
+            document.tracks.len(),
+            document.returns.len(),
+            DEFAULT_SCENES,
+            state,
+        )
+    }
+
+    /// A SEND ROW PER RETURN, AND A COUNT FOR THE ONES THAT DO NOT FIT.
+    ///
+    /// The block is the strip's variable row, so what matters is that it
+    /// never lies: every send is either drawn or counted, and the two
+    /// always add up to the number of returns there are.
+    #[test]
+    fn every_send_is_either_drawn_or_counted() {
+        for count in 0..=8 {
+            for height in [MIXER_HEIGHT_MIN, 120.0, 156.0, 240.0, MIXER_HEIGHT_MAX] {
+                let rect =
+                    egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(112.0, height));
+                let strip = MixerStrip::new(rect, count);
+                assert_eq!(
+                    strip.sends.len() + strip.sends_hidden,
+                    count,
+                    "{count} sends went missing at height {height}"
+                );
+                for row in &strip.sends {
+                    assert!(
+                        strip.rect.contains_rect(*row),
+                        "a send row escaped the strip at height {height}"
+                    );
+                    assert!(!row.intersects(strip.fader), "a send row sat on the fader");
+                }
+            }
+        }
+    }
+
+    /// THE SEND BLOCK ONLY GROWS.
+    ///
+    /// The fixed rows are strictly ranked so they cannot flicker; the
+    /// sends are variable, so they earn the same guarantee a different
+    /// way — they do not begin until every fixed row is already there,
+    /// from which point nothing above them can arrive and take their
+    /// space back.
+    #[test]
+    fn the_send_block_never_shrinks_as_the_strip_grows() {
+        let mut previous = 0;
+        let mut height = MIXER_HEIGHT_MIN;
+        while height <= MIXER_HEIGHT_MAX {
+            let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(112.0, height));
+            let rows = MixerStrip::new(rect, 8).sends.len();
+            assert!(
+                rows >= previous,
+                "the send block lost a row at height {height}: {previous} then {rows}"
+            );
+            previous = rows;
+            height += 1.0;
+        }
+        assert!(previous > 0, "the sends never appeared at all");
+    }
+
+    /// A SEND OPENS BY DRAG AND SHUTS BY DOUBLE CLICK.
+    #[test]
+    fn a_send_opens_by_drag_and_shuts_by_double_click() {
+        let document = with_returns(2);
+        let runtime = SessionRuntime::new(document.tracks.len());
+        let mut state = SessionViewState::default();
+        let layout = layout_of(&document, &state);
+        let strip = MixerStrip::new(layout.mixer(0), document.returns.len());
+        let row = *strip.sends.first().expect("two returns, so a send row");
+
+        let opened = flattened(&render_path(
+            &document,
+            &runtime,
+            &mut state,
+            &probe::drag_path(row.center(), row.right_center(), 6),
+        ));
+        let moved: Vec<f32> = opened
+            .iter()
+            .filter_map(|intent| match intent {
+                SessionIntent::SetTrackSend {
+                    track: 0,
+                    index: 0,
+                    value,
+                } => Some(*value),
+                _ => None,
+            })
+            .collect();
+        assert!(!moved.is_empty(), "the send did not move: {opened:?}");
+        assert!(
+            moved
+                .iter()
+                .all(|value| *value > document.tracks[0].sends[0]),
+            "dragging right must open a send: {moved:?}"
+        );
+        assert!(
+            moved.iter().all(|value| *value <= 1.0),
+            "a send stops at all of it: {moved:?}"
+        );
+        // And it moved the FIRST send, not the second one under it.
+        assert!(
+            !opened
+                .iter()
+                .any(|intent| matches!(intent, SessionIntent::SetTrackSend { index: 1, .. }))
+        );
+
+        let mut state = SessionViewState::default();
+        let shut = flattened(&render_path(
+            &document,
+            &runtime,
+            &mut state,
+            &probe::double_click_path(row.center()),
+        ));
+        assert!(shut.contains(&SessionIntent::SetTrackSend {
+            track: 0,
+            index: 0,
+            value: 0.0
+        }));
+    }
+
+    /// A RETURN COLUMN OWNS NO CLIP SLOT.
+    ///
+    /// It sits in the mixer band after the last track, and the grid above
+    /// it is drawn ground and nothing else — which is where Live puts
+    /// one, and what stops a launch gesture finding a bus.
+    #[test]
+    fn a_return_column_owns_no_clip_slot() {
+        let document = with_returns(2);
+        let state = SessionViewState::default();
+        let layout = layout_of(&document, &state);
+        let strip = layout.return_mixer(0);
+        assert!(
+            strip.left() >= layout.mixer(1).right() - 0.01,
+            "the returns sat on top of the tracks"
+        );
+        assert_eq!(
+            layout.slot_at(egui::pos2(strip.center().x, layout.slot(0, 0).center().y)),
+            None,
+            "a return column answered with a slot"
+        );
+        assert!(layout.return_divider().is_some());
+        // And they are reachable: a mixer you cannot scroll to is a
+        // mixer that does not have them.
+        let narrow = SessionLayout::new(
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 620.0)),
+            8,
+            4,
+            DEFAULT_SCENES,
+            &state,
+        );
+        assert!(narrow.max_scroll_x() > 0.0);
+    }
+
+    /// A RETURN'S STRIP IS A LEVEL COLUMN AND A MUTE, AND NO SENDS.
+    ///
+    /// A return that sent would be a feedback loop the graph cannot
+    /// compile, so the control simply is not there to reach for.
+    #[test]
+    fn a_return_strip_mutes_faders_and_selects_but_never_sends() {
+        let document = with_returns(1);
+        let mut runtime = SessionRuntime::new(document.tracks.len());
+        runtime.returns = vec![TrackRuntime::default()];
+        let mut state = SessionViewState::default();
+        let layout = layout_of(&document, &state);
+        let strip = MixerStrip::new(layout.return_mixer(0), 0);
+        assert!(strip.sends.is_empty() && strip.sends_hidden == 0);
+
+        let muted = flattened(&render_path(
+            &document,
+            &runtime,
+            &mut state,
+            &probe::click_path(strip.mute.center()),
+        ));
+        assert!(
+            muted.contains(&SessionIntent::ToggleReturnMute(0)),
+            "{muted:?}"
+        );
+        assert!(
+            !muted
+                .iter()
+                .any(|intent| matches!(intent, SessionIntent::ToggleTrackMute(_))),
+            "the return's mute reached a track"
+        );
+
+        let mut state = SessionViewState::default();
+        let faded = flattened(&render_path(
+            &document,
+            &runtime,
+            &mut state,
+            &probe::drag_path(
+                strip.fader.center(),
+                egui::pos2(strip.fader.center().x, strip.fader.top() + 4.0),
+                6,
+            ),
+        ));
+        assert!(
+            faded
+                .iter()
+                .any(|intent| matches!(intent, SessionIntent::SetReturnVolume { index: 0, .. })),
+            "the return's fader did nothing: {faded:?}"
+        );
+        assert!(
+            !faded
+                .iter()
+                .any(|intent| matches!(intent, SessionIntent::SetTrackVolume { .. })),
+            "the return's fader moved a track"
+        );
+
+        // Its head selects it, which is what points the rack at its chain.
+        let mut state = SessionViewState::default();
+        let head = flattened(&render_path(
+            &document,
+            &runtime,
+            &mut state,
+            &probe::click_path(egui::pos2(strip.solo.center().x, strip.solo.center().y)),
+        ));
+        assert!(head.contains(&SessionIntent::SelectReturn(0)), "{head:?}");
+    }
+
+    /// A return's peak hold is its OWN.
+    ///
+    /// Holds are kept in one table indexed by strip, and a return whose
+    /// hold shared an index with a track would show that track's loudest
+    /// moment as its own.
+    #[test]
+    fn a_returns_peak_hold_is_not_a_tracks() {
+        let document = with_returns(1);
+        let mut runtime = SessionRuntime::new(document.tracks.len());
+        runtime.returns = vec![TrackRuntime {
+            peak: 0.8,
+            ..TrackRuntime::default()
+        }];
+        let mut state = SessionViewState::default();
+        render_path(
+            &document,
+            &runtime,
+            &mut state,
+            &[probe::Step::moved(egui::pos2(-50.0, -50.0))],
+        );
+        assert_eq!(
+            state.peak_hold.first().copied(),
+            Some(0.0),
+            "a silent track held something"
+        );
+        assert!(
+            state
+                .peak_hold
+                .get(RETURN_HOLD_BASE)
+                .is_some_and(|hold| (*hold - 0.8).abs() < 1e-5),
+            "the return's hold is not where the strip looks for it"
+        );
+    }
+
     /// A SEAM IS NOT A BUTTON. Dragging the mixer's resize seam must
     /// resize it and touch nothing underneath — the mute of the first
     /// mixer strip sits a few pixels below, and a seam that leaked into
@@ -5188,7 +5978,7 @@ mod tests {
         let runtime = SessionRuntime::new(document.tracks.len());
         let mut state = SessionViewState::default();
         let before = state.mixer_height;
-        let layout = SessionLayout::new(view(), 2, DEFAULT_SCENES, &state);
+        let layout = SessionLayout::new(view(), 2, 0, DEFAULT_SCENES, &state);
         let seam = layout.mixer_seam().center();
         let intents = flattened(&render_path(
             &document,
@@ -5225,7 +6015,7 @@ mod tests {
             selection: Some(selected),
             ..SessionViewState::default()
         };
-        let layout = SessionLayout::new(view(), 2, DEFAULT_SCENES, &state);
+        let layout = SessionLayout::new(view(), 2, 0, DEFAULT_SCENES, &state);
         // The gutter to the right of the last track column and left of
         // the scene column: drawn ground, owned by nothing.
         let empty = egui::pos2(
@@ -5263,7 +6053,7 @@ mod tests {
         let document = document();
         let runtime = SessionRuntime::new(document.tracks.len());
         let mut state = SessionViewState::default();
-        let strip = SessionLayout::new(view(), 2, DEFAULT_SCENES, &state).control_strip();
+        let strip = SessionLayout::new(view(), 2, 0, DEFAULT_SCENES, &state).control_strip();
         let m1_left = strip.right() - 4.0 - 36.0 * 2.0 - 4.0;
         let morph = egui::Rect::from_min_max(
             egui::pos2(m1_left - 74.0, strip.top() + 4.0),

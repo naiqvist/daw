@@ -125,6 +125,15 @@ pub enum UiAction {
     /// Return the selected track's pan to center.
     CenterTrackPan,
 
+    // --- returns ---
+    /// Add a return bus, named for where it lands. Refused past the
+    /// eight letters a send row can label.
+    AddReturn,
+    /// Drop the return the rack is showing, and every send that pointed
+    /// at it. Does nothing when the rack is not showing one — a delete
+    /// that guessed which bus you meant would be the worst kind.
+    RemoveReturn,
+
     // --- the project file: owned by the app, never by `perform` ---
     /// Save to the current file, or open the project window if there is
     /// none yet. Ctrl+S.
@@ -212,6 +221,8 @@ impl UiAction {
             Self::ToggleTrackSolo => "Solo track",
             Self::NudgeTrackPan(_) => "Pan track",
             Self::CenterTrackPan => "Center pan",
+            Self::AddReturn => "Add return",
+            Self::RemoveReturn => "Delete return",
             Self::SaveProject => "Save project",
             Self::SaveProjectAs => "Save project as",
             Self::OpenProjectWindow => "Open project",
@@ -276,6 +287,8 @@ impl UiAction {
             | Self::ToggleTrackSolo
             | Self::NudgeTrackPan(_)
             | Self::CenterTrackPan
+            | Self::AddReturn
+            | Self::RemoveReturn
             | Self::SaveProject
             | Self::SaveProjectAs
             | Self::OpenProjectWindow

@@ -1260,6 +1260,28 @@ fn perform(actions: &[UiAction], transport: &mut Transport, arrangement: &mut Ar
             // --- tracks. Every one of these acts on the SELECTED track,
             // so the palette, the keyboard and the header buttons all
             // agree on which lane they mean.
+            UiAction::AddReturn => {
+                // Refused past the alphabet rather than reported: the
+                // palette row that offers this is disabled at the
+                // ceiling, so a command that gets here has room.
+                if arrangement.add_return() {
+                    // Selecting it is what makes the next device load
+                    // land on it — a new return with nowhere to put a
+                    // reverb would be a row of nothing.
+                    let index = arrangement.returns.len() - 1;
+                    arrangement.select_return(index);
+                    arrangement.force_recompile = true;
+                }
+            }
+            UiAction::RemoveReturn => {
+                // Only the return the rack is SHOWING. A delete that
+                // guessed which bus you meant would be the worst kind.
+                if let Some(index) = arrangement.return_selected
+                    && arrangement.remove_return(index)
+                {
+                    arrangement.force_recompile = true;
+                }
+            }
             UiAction::AddTrack(kind) => {
                 arrangement.add_track(*kind);
             }
@@ -2139,6 +2161,10 @@ struct Arrangement {
     /// it. `selected` keeps its lane underneath, so leaving the master
     /// puts you back where you were.
     master_selected: bool,
+    /// Which RETURN the rack is showing, if any. View state like
+    /// `master_selected`, and mutually exclusive with it — two strips
+    /// cannot both be the thing being edited.
+    return_selected: Option<usize>,
     /// Index into `GRID_BEATS`.
     grid: usize,
     /// The selected track. Time selection belongs to it and only it — one
@@ -2749,6 +2775,7 @@ impl Default for Arrangement {
             master: MasterTrack::default(),
             returns: Vec::new(),
             master_selected: false,
+            return_selected: None,
             grid: GRID_DEFAULT,
             selected: None,
             selection: None,
@@ -2804,6 +2831,7 @@ impl Arrangement {
     fn select_track(&mut self, track: usize) {
         self.selected = Some(track);
         self.master_selected = false;
+        self.return_selected = None;
     }
 
     /// Point them at the master instead. The lane stays selected
@@ -2811,6 +2839,50 @@ impl Arrangement {
     /// it, and only the rack and the strip highlight move.
     fn select_master(&mut self) {
         self.master_selected = true;
+        self.return_selected = None;
+    }
+
+    /// Point them at a return. Same rule as the master: the lane stays
+    /// selected underneath, and only the rack moves.
+    fn select_return(&mut self, index: usize) {
+        if index < self.returns.len() {
+            self.master_selected = false;
+            self.return_selected = Some(index);
+        }
+    }
+
+    /// Add a return, named for where it lands. Refused past the letters,
+    /// and the caller is told so it can say why.
+    fn add_return(&mut self) -> bool {
+        if self.returns.len() >= ReturnTrack::MAX {
+            return false;
+        }
+        self.returns.push(ReturnTrack::new(self.returns.len()));
+        true
+    }
+
+    /// Take a return away, and every send that pointed at it.
+    ///
+    /// The sends shift DOWN rather than being cleared, because the list
+    /// is positional: removing A must make what was B into A on every
+    /// track at once, or every send past the gap would silently start
+    /// feeding the wrong bus.
+    fn remove_return(&mut self, index: usize) -> bool {
+        if index >= self.returns.len() {
+            return false;
+        }
+        self.returns.remove(index);
+        for track in &mut self.tracks {
+            if index < track.sends.len() {
+                track.sends.remove(index);
+            }
+        }
+        self.return_selected = match self.return_selected {
+            Some(selected) if selected == index => None,
+            Some(selected) if selected > index => Some(selected - 1),
+            other => other,
+        };
+        true
     }
 
     fn grid_beats(&self) -> f32 {
@@ -13364,6 +13436,8 @@ struct App {
     /// the same only-on-change door the lanes use, and for the same
     /// reason: a fader that is not moving must not cost a letter a frame.
     master_out: Option<NodeId>,
+    /// One meter per return, in return order.
+    return_meters: Vec<device::meter::Ballistics>,
     /// Every send's gain node, `[track][return]`, as the last compile
     /// handed them over.
     send_ids: Vec<Vec<Option<NodeId>>>,
@@ -13732,6 +13806,7 @@ impl App {
             pan_ids: Vec::new(),
             sent_pan: Vec::new(),
             master_out: None,
+            return_meters: Vec::new(),
             send_ids: Vec::new(),
             return_ids: Vec::new(),
             sent_send: Vec::new(),
@@ -13885,6 +13960,11 @@ impl App {
             PaletteCommand::new("track.new.audio", "track", "new audio track").hint("ctrl+T"),
             PaletteCommand::new("track.new.midi", "track", "new MIDI track").hint("ctrl+shift+T"),
             PaletteCommand::new("track.rename", "track", "rename track").enabled(has_track),
+            // --- returns -----------------------------------------------
+            PaletteCommand::new("return.new", "return", "add return bus")
+                .enabled(self.arrangement.returns.len() < ReturnTrack::MAX),
+            PaletteCommand::new("return.remove", "return", "delete the shown return")
+                .enabled(self.arrangement.return_selected.is_some()),
             PaletteCommand::new("track.mute", "track", "mute / unmute track").enabled(has_track),
             PaletteCommand::new("track.solo", "track", "solo / unsolo track").enabled(has_track),
             // Pan has no gesture of its own: the header knob is the mouse
@@ -14201,6 +14281,8 @@ impl App {
 
             "track.new.audio" => actions.push(UiAction::AddTrack(TrackKind::Audio)),
             "track.new.midi" => actions.push(UiAction::AddTrack(TrackKind::Midi)),
+            "return.new" => actions.push(UiAction::AddReturn),
+            "return.remove" => actions.push(UiAction::RemoveReturn),
             "track.mute" => actions.push(UiAction::ToggleTrackMute),
             "track.solo" => actions.push(UiAction::ToggleTrackSolo),
             "track.pan.left" => actions.push(UiAction::NudgeTrackPan(-PAN_STEP)),
@@ -14438,6 +14520,34 @@ impl App {
     /// broken, and "it went to track 1, which is now selected" is both
     /// visible and undoable by loading it somewhere else.
     fn load_device(&mut self, item: BrowserItem) {
+        // A return, when the rack is showing one: same rule the master
+        // gets, and for the same reason — a bus has no notes to give an
+        // instrument, so dropping one in would look like a bug rather
+        // than like silence.
+        if let Some(index) = self.arrangement.return_selected {
+            if item.load.is_instrument() {
+                self.notice = Some(format!(
+                    "a return is a bus — no slot for a {}",
+                    item.load.spec().name
+                ));
+                return;
+            }
+            let instance = DeviceInstance {
+                id: self.arrangement.mint_id(),
+                parent: None,
+                state: DeviceState::new(item.load),
+                bypass: false,
+                page: 0,
+                view_zoom: unit_zoom(),
+                view_scroll: 0.0,
+            };
+            if let Some(bus) = self.arrangement.returns.get_mut(index) {
+                bus.insert_device(instance);
+                // A device is a node, and no letter can add one.
+                self.arrangement.force_recompile = true;
+            }
+            return;
+        }
         // The master, when it is the thing selected: an effect joins its
         // chain, an instrument is refused in words. A master has no notes
         // to give one, and dropping it into silence would look like a bug.
@@ -16019,6 +16129,50 @@ impl App {
                 sx::SessionIntent::ClearClipHold(track) => {
                     if let Some(meter) = self.meters.get_mut(track) {
                         meter.clipped = false;
+                    }
+                }
+                // A send level is a live gain on a node that already
+                // exists, so this is a letter and never a recompile —
+                // the same road pan and volume take.
+                sx::SessionIntent::SetTrackSend {
+                    track,
+                    index,
+                    value,
+                } => {
+                    let returns = self.arrangement.returns.len();
+                    if let Some(track) = self.arrangement.tracks.get_mut(track)
+                        && index < returns
+                    {
+                        // Grown on demand: a track carries only as many
+                        // sends as it has actually been given, so the
+                        // first move on send C is what makes A and B
+                        // explicit zeroes.
+                        if track.sends.len() <= index {
+                            track.sends.resize(index + 1, 0.0);
+                        }
+                        track.sends[index] = value.clamp(0.0, 1.0);
+                    }
+                }
+                sx::SessionIntent::SelectReturn(index) => {
+                    self.arrangement.select_return(index);
+                }
+                sx::SessionIntent::ToggleReturnMute(index) => {
+                    if let Some(bus) = self.arrangement.returns.get_mut(index) {
+                        bus.mute = !bus.mute;
+                        // Shape: a muted return leaves the schedule and
+                        // takes every send that fed it, which no letter
+                        // can express.
+                        self.arrangement.force_recompile = true;
+                    }
+                }
+                sx::SessionIntent::SetReturnVolume { index, value } => {
+                    if let Some(bus) = self.arrangement.returns.get_mut(index) {
+                        bus.volume = value.max(0.0);
+                    }
+                }
+                sx::SessionIntent::SetReturnPan { index, value } => {
+                    if let Some(bus) = self.arrangement.returns.get_mut(index) {
+                        bus.pan = value.clamp(-1.0, 1.0);
                     }
                 }
             }
@@ -17966,6 +18120,20 @@ impl App {
                 dt,
             );
         }
+        // The returns read the slots handed out downwards from just
+        // under the master's, which is where the graph put them.
+        self.return_meters
+            .resize_with(self.arrangement.returns.len(), Default::default);
+        for (index, meter) in self.return_meters.iter_mut().enumerate() {
+            let peak = peaks
+                .get(MASTER_METER.saturating_sub(1 + index))
+                .copied()
+                .unwrap_or(0.0);
+            meter.advance(
+                device::meter::amp_to_db(peak).max(device::meter::FLOOR_DB),
+                dt,
+            );
+        }
         // The master reads its reserved slot, not a lane's.
         let peak = peaks.get(MASTER_METER).copied().unwrap_or(0.0);
         self.master_meter.advance(
@@ -18934,7 +19102,9 @@ impl eframe::App for App {
         // Which chain the rack is showing. The master wins when it is the
         // thing selected — the lane stays selected underneath it, which is
         // what lets the clips and the roll carry on belonging to it.
-        let device_owner = if self.arrangement.master_selected {
+        let device_owner = if let Some(index) = self.arrangement.return_selected {
+            Some(ChainOwner::Return(index))
+        } else if self.arrangement.master_selected {
             Some(ChainOwner::Master)
         } else {
             device_track.map(ChainOwner::Track)
@@ -19365,6 +19535,7 @@ impl eframe::App for App {
                 session_clock,
                 self.transport.playing,
             );
+            session_bridge::sync_return_levels(&mut self.session_runtime, &self.return_meters);
             if session_bridge::mirror_playback(
                 &self.session_runtime,
                 &self.session_doc,
@@ -24028,7 +24199,7 @@ mod tests {
         use daw::ui::session_next as sx;
         let view = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 600.0));
         let state = sx::SessionViewState::default();
-        let layout = sx::SessionLayout::new(view, 2, 8, &state);
+        let layout = sx::SessionLayout::new(view, 2, 0, 8, &state);
 
         // Track 0 MIDI, track 1 audio.
         let midi = layout.slot(0, 0).center();
@@ -27348,6 +27519,66 @@ mod tests {
             "the return's reverb never reached the schedule"
         );
         assert!(spec.compile(48_000, 256).is_ok());
+    }
+
+    /// DELETING A RETURN SHIFTS EVERY SEND DOWN, IT DOES NOT CLEAR THEM.
+    ///
+    /// The list is positional: `sends[1]` means "return B" only because
+    /// B is second. Removing A has to make what was B into A on every
+    /// track at once, or every send past the gap silently starts feeding
+    /// the wrong bus — which is the kind of bug you hear a week later and
+    /// blame on the reverb.
+    #[test]
+    fn deleting_a_return_shifts_the_sends_that_pointed_past_it() {
+        let mut a = Arrangement::default();
+        assert!(a.add_return() && a.add_return() && a.add_return());
+        a.tracks[0].sends = vec![0.1, 0.2, 0.3];
+        // A track that has only ever been asked about the first return
+        // carries a short list, and that must survive the shift too.
+        a.tracks[1].sends = vec![0.9];
+        a.select_return(2);
+
+        assert!(a.remove_return(0));
+        assert_eq!(a.returns.len(), 2);
+        assert_eq!(a.tracks[0].sends, vec![0.2, 0.3], "the sends did not shift");
+        assert!(
+            a.tracks[1].sends.is_empty(),
+            "a short list lost its only send"
+        );
+        assert_eq!(
+            a.return_selected,
+            Some(1),
+            "the selection followed the bus it was on"
+        );
+
+        // Deleting the SELECTED one leaves nothing selected, rather than
+        // sliding onto whichever bus took its place.
+        a.select_return(1);
+        assert!(a.remove_return(1));
+        assert_eq!(a.return_selected, None);
+        assert!(!a.remove_return(9), "a return that is not there");
+    }
+
+    /// The alphabet is the ceiling, and selection is exclusive: the rack
+    /// shows a lane, the master or a return, never two at once.
+    #[test]
+    fn returns_stop_at_the_alphabet_and_selection_is_exclusive() {
+        let mut a = Arrangement::default();
+        for _ in 0..ReturnTrack::MAX {
+            assert!(a.add_return());
+        }
+        assert!(!a.add_return(), "a ninth return has no letter");
+        assert_eq!(ReturnTrack::letter(0), 'A');
+        assert_eq!(ReturnTrack::letter(ReturnTrack::MAX - 1), 'H');
+
+        a.select_master();
+        assert!(a.master_selected && a.return_selected.is_none());
+        a.select_return(3);
+        assert!(!a.master_selected && a.return_selected == Some(3));
+        a.select_track(1);
+        assert!(!a.master_selected && a.return_selected.is_none());
+        a.select_return(99);
+        assert_eq!(a.return_selected, None, "a return that is not there");
     }
 
     /// Mute, solo and kind are graph SHAPE — they add or drop nodes, so

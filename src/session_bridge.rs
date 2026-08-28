@@ -175,7 +175,25 @@ pub fn sync_document(document: &mut sx::SessionDocument, arrangement: &Arrangeme
         target.solo = track.solo;
         target.pan = track.pan;
         target.volume = track.volume;
+        target.sends.clone_from(&track.sends);
+        // A send list is allowed to be SHORT — that is how a track says
+        // it has never been asked about a return — but never long, or a
+        // strip would draw a row pointing at a bus that is not there.
+        target.sends.truncate(arrangement.returns.len());
     }
+
+    // Returns: the project owns all of it, so this is a straight copy
+    // rather than a reconcile. Nothing about a return is authored in the
+    // session view, which is what makes that safe.
+    document.returns.clear();
+    document
+        .returns
+        .extend(arrangement.returns.iter().map(|bus| sx::SessionReturn {
+            name: bus.name.clone(),
+            mute: bus.mute,
+            volume: bus.volume,
+            pan: bus.pan,
+        }));
 
     // Scenes: names come from the project, everything else is authored
     // here and survives.
@@ -260,6 +278,9 @@ pub fn sync_runtime(
     playing: bool,
 ) {
     runtime.sanitize(arrangement.tracks.len());
+    runtime
+        .returns
+        .resize(arrangement.returns.len(), sx::TrackRuntime::default());
     let beats_per_sample = clock.beats_per_sample();
     for (index, track) in runtime.tracks.iter_mut().enumerate() {
         if let Some(meter) = meters.get(index) {
@@ -289,6 +310,16 @@ pub fn sync_runtime(
         }
         let elapsed = clock.sample.saturating_sub(started_at_sample) as f64 * beats_per_sample;
         track.phase = ((elapsed / f64::from(length)).fract().max(0.0)) as f32;
+    }
+}
+
+/// The return meters, on their own list because they read their own
+/// slots — the graph hands returns meter slots downwards from under the
+/// master's, and a lane's list would have to be indexed backwards to
+/// find them.
+pub fn sync_return_levels(runtime: &mut sx::SessionRuntime, meters: &[Ballistics]) {
+    for (bus, meter) in runtime.returns.iter_mut().zip(meters) {
+        runtime_level(bus, meter);
     }
 }
 

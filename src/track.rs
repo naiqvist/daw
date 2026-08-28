@@ -346,10 +346,6 @@ impl ReturnTrack {
         }
     }
 
-    pub fn device(&self, id: u64) -> Option<&DeviceInstance> {
-        self.chain.iter().find(|instance| instance.id == id)
-    }
-
     pub fn device_mut(&mut self, id: u64) -> Option<&mut DeviceInstance> {
         self.chain.iter_mut().find(|instance| instance.id == id)
     }
