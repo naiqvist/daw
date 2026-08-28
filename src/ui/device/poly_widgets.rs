@@ -322,16 +322,22 @@ pub fn wave_display(
         egui::FontId::proportional(font::LABEL),
         theme.text,
     );
-    for (x, text) in [
-        (plot_rect.left() + arrow_w * 0.5, "‹"),
-        (plot_rect.right() - arrow_w * 0.5, "›"),
+    // The arrow the pointer is actually ON, not both of them. The two
+    // zones are invisible ground either side of the plot, so lighting
+    // the pair says "one of these does something" and lighting one says
+    // WHICH — and which way a click is about to step is the whole
+    // question a hand hovering here is asking.
+    let armed = response.hover_pos().map(|at| at.x >= plot_rect.center().x);
+    for (x, text, side) in [
+        (plot_rect.left() + arrow_w * 0.5, "‹", false),
+        (plot_rect.right() - arrow_w * 0.5, "›", true),
     ] {
         painter.text(
             egui::pos2(x, plot_rect.center().y),
             egui::Align2::CENTER_CENTER,
             text,
             egui::FontId::proportional(font::BODY),
-            if response.hovered() {
+            if armed == Some(side) {
                 theme.text
             } else {
                 theme.text_muted

@@ -5909,10 +5909,14 @@ fn header_meter(
     ui.painter().rect_filled(
         clip,
         0.0,
-        if clipped {
-            theme.meter_clip
-        } else {
-            theme.surface_sunken
+        // The lamp is the only part of a meter that can be PRESSED, and
+        // a clip hold nobody knows is clearable is a clip hold that
+        // stays lit all session. Hovered it lifts whether or not it is
+        // holding anything, which is what says it is a control.
+        match (clipped, response.hovered()) {
+            (true, _) => theme.meter_clip,
+            (false, true) => theme.surface_raised,
+            (false, false) => theme.surface_sunken,
         },
     );
     ui.painter().rect_filled(rail, 0.0, theme.surface_sunken);
@@ -6400,11 +6404,26 @@ fn track_headers(
             } else {
                 let response = ui
                     .interact(layout.name, wid.with("name"), egui::Sense::click())
-                    .affords(Affords::Press);
+                    .affords(Affords::Write)
+                    .on_hover_text("double-click to rename");
                 if response.double_clicked() {
                     rename_open = Some(i);
                 } else if response.clicked() {
                     select = Some(i);
+                }
+                // A RULE UNDER THE NAME WHILE THE POINTER IS ON IT.
+                // Renaming is a double-click, which is a gesture nobody
+                // discovers by looking — so the name has to say it is a
+                // field, and the cheapest way to say that is the one
+                // every text field already uses.
+                if response.hovered() {
+                    ui.painter().line_segment(
+                        [
+                            egui::pos2(layout.name.left(), layout.name.bottom() - 2.0),
+                            egui::pos2(layout.name.right(), layout.name.bottom() - 2.0),
+                        ],
+                        egui::Stroke::new(stroke::HAIR, theme.text_muted),
+                    );
                 }
                 // Nesting is drawn as INDENTATION here exactly as it is
                 // in the session's headers: one fact, said the same way
@@ -7133,6 +7152,23 @@ fn arrangement_body(
     let scrub = ui
         .interact(ruler, ui.id().with("scrub"), egui::Sense::click())
         .affords(Affords::Press);
+    // Where a click would LAND, drawn under the pointer before it is
+    // spent. The ruler SNAPS, so the honest preview is the snapped beat
+    // and not the pointer's own x — otherwise every seek arrives a
+    // little off where it was aimed and the grid takes the blame.
+    if let Some(pos) = scrub.hover_pos() {
+        let at = snap(beat_at(content, offset, arr.pixels_per_beat, pos.x), grid);
+        let x = x_at(content, offset, arr.pixels_per_beat, at);
+        if ruler.x_range().contains(x) {
+            ui.painter().line_segment(
+                [
+                    egui::pos2(x, ruler.top() + 2.0),
+                    egui::pos2(x, ruler.bottom()),
+                ],
+                egui::Stroke::new(stroke::HAIR, theme.text_muted),
+            );
+        }
+    }
     if scrub.clicked()
         && let Some(pos) = scrub.interact_pointer_pos()
     {
@@ -8106,6 +8142,12 @@ fn session_body(
                 });
             }
 
+            // A cell answers the pointer, filled or empty. Every slot in
+            // the grid looks alike, so "which one am I on" cannot be left
+            // to the hand's memory of where it moved — and an empty slot
+            // has to answer too, because creating a clip happens on
+            // ground that is otherwise blank.
+            let lit = response.hovered();
             let painter = ui.painter();
             match clip {
                 Some(clip) => {
@@ -8114,6 +8156,8 @@ fn session_body(
                         0.0,
                         if playing {
                             theme.clip_body
+                        } else if lit {
+                            theme.clip_body.gamma_multiply(0.9)
                         } else {
                             theme.clip_body.gamma_multiply(0.75)
                         },
@@ -11557,20 +11601,27 @@ fn mod_strip(ui: &mut egui::Ui, theme: &Theme, strip: ModStrip<'_>, collapsed: &
                         egui::vec2(9.0, 9.0),
                     );
                     let dot_id = ui.id().with(("wire_on", wire.id));
-                    if ui
+                    let dot_response = ui
                         .interact(dot, dot_id, egui::Sense::click())
-                        .affords(Affords::Press)
-                        .clicked()
-                    {
+                        .affords(Affords::Press);
+                    if dot_response.clicked() {
                         wire.enabled = !wire.enabled;
                     }
+                    // Nine pixels across, so the hover has to be the whole
+                    // difference: at this size a dot that does not answer
+                    // is a dot nobody finds twice.
+                    let lit = dot_response.hovered();
                     if wire.enabled {
-                        painter.circle_filled(dot.center(), 3.0, theme.accent);
+                        painter.circle_filled(
+                            dot.center(),
+                            if lit { 4.0 } else { 3.0 },
+                            theme.accent,
+                        );
                     } else {
                         painter.circle_stroke(
                             dot.center(),
                             3.0,
-                            egui::Stroke::new(1.0, theme.text_muted),
+                            egui::Stroke::new(1.0, if lit { theme.text } else { theme.text_muted }),
                         );
                     }
                     let solo = egui::Rect::from_center_size(

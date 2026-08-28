@@ -363,8 +363,12 @@ impl Palette {
             theme.text_muted
         };
 
+        // The row's ground is reserved NOW and painted once the row has
+        // been laid out and asked whether the pointer is on it. A frame
+        // cannot know its own size before its contents exist, and a
+        // hover fill drawn afterwards would sit on top of the text.
+        let ground = ui.painter().add(egui::Shape::Noop);
         let resp = egui::Frame::new()
-            .fill(fill)
             .corner_radius(radius::CTRL as u8)
             .inner_margin(egui::Margin::symmetric(
                 theme.sp(space::XS) as i8,
@@ -392,9 +396,24 @@ impl Palette {
             })
             .response;
 
-        resp.interact(egui::Sense::click())
-            .affords(Affords::Press)
-            .clicked()
+        let resp = resp.interact(egui::Sense::click()).affords(Affords::Press);
+        // The keyboard's row is the loud one — the palette is driven by
+        // typing — but a list that gave a mouse no answer at all would
+        // look like a picture of a list.
+        let fill = if active {
+            fill
+        } else if resp.hovered() {
+            theme.surface_raised
+        } else {
+            fill
+        };
+        if fill != egui::Color32::TRANSPARENT {
+            ui.painter().set(
+                ground,
+                egui::Shape::rect_filled(resp.rect, radius::CTRL as u8, fill),
+            );
+        }
+        resp.clicked()
     }
 }
 

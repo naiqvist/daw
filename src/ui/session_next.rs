@@ -2657,6 +2657,15 @@ fn paint_slot(
         _ => false,
     });
 
+    // Body first, launch rail second. Their rectangles do not overlap, but
+    // the order makes foreground ownership explicit if geometry changes —
+    // and both are claimed BEFORE anything is painted, so the cell can
+    // draw the answer to a pointer that is already on it.
+    let body_id = ui.id().with(("session_next_slot_body", track, scene));
+    let body = ui
+        .interact(body_rect, body_id, egui::Sense::click_and_drag())
+        .affords(Affords::Carry);
+
     let base = match slot {
         Slot::Clip(clip) if clip.media_offline => colors.sunken,
         Slot::Clip(clip) => match clip.kind {
@@ -2664,6 +2673,16 @@ fn paint_slot(
             TrackKind::Audio => colors.audio,
         },
         Slot::Empty(_) => colors.bg,
+    };
+    // A cell answers the pointer. The grid is the most-pressed surface
+    // in the app and every one of its cells looks alike, so "which one
+    // am I on" cannot be left to the hand's memory of where it moved —
+    // and an EMPTY cell has to answer too, because launching a stop or
+    // making a clip both happen on ground that is otherwise blank.
+    let base = if body.hovered() {
+        base.lerp_to_gamma(colors.raised, 0.45)
+    } else {
+        base
     };
     ui.painter()
         .rect_filled(full.intersect(clip_rect), 0.0, base);
@@ -2703,12 +2722,6 @@ fn paint_slot(
         );
     }
 
-    // Body first, launch rail second. Their rectangles do not overlap, but
-    // the order makes foreground ownership explicit if geometry changes.
-    let body_id = ui.id().with(("session_next_slot_body", track, scene));
-    let body = ui
-        .interact(body_rect, body_id, egui::Sense::click_and_drag())
-        .affords(Affords::Carry);
     if body.clicked() {
         state.selection = Some(GridSelection::Slot { track, scene });
         state.owns_keyboard = true;
