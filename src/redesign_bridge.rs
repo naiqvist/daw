@@ -1523,21 +1523,34 @@ impl App {
             let legacy = match self.song_track_map.get(&song_track.id) {
                 Some(&index) if index < self.arrangement.tracks.len() => index,
                 _ => {
-                    let index = self.arrangement.add_track(TrackKind::Midi);
-                    // A minted track is born able to speak: the workhorse
-                    // synth in its chain, so the first trig makes sound
-                    // instead of silence that reads as a bug.
-                    let instance = DeviceInstance {
-                        id: self.arrangement.mint_id(),
-                        parent: None,
-                        state: DeviceState::new(DeviceKind::Poly),
-                        bypass: false,
-                        page: 0,
-                        view_zoom: unit_zoom(),
-                        view_scroll: 0.0,
-                    };
-                    if let Some(track) = self.arrangement.tracks.get_mut(index) {
-                        track.chain.push(instance);
+                    // The twin carries the SONG track's kind. An audio
+                    // lane minted as MIDI would refuse every clip the
+                    // compiler needs to hear (`insert_audio` checks the
+                    // kind), so the sound would land and stay silent.
+                    let audio = song_track.kind == daw::sequencing::TrackKind::Audio;
+                    let index = self.arrangement.add_track(if audio {
+                        TrackKind::Audio
+                    } else {
+                        TrackKind::Midi
+                    });
+                    // An instrument track is born able to speak: the
+                    // workhorse synth in its chain, so the first trig
+                    // makes sound instead of silence that reads as a bug.
+                    // An audio track needs no instrument — it already IS
+                    // the sound.
+                    if !audio {
+                        let instance = DeviceInstance {
+                            id: self.arrangement.mint_id(),
+                            parent: None,
+                            state: DeviceState::new(DeviceKind::Poly),
+                            bypass: false,
+                            page: 0,
+                            view_zoom: unit_zoom(),
+                            view_scroll: 0.0,
+                        };
+                        if let Some(track) = self.arrangement.tracks.get_mut(index) {
+                            track.chain.push(instance);
+                        }
                     }
                     self.song_track_map.insert(song_track.id, index);
                     index
@@ -1571,6 +1584,24 @@ impl App {
                 self.arrangement.next_clip_id += 1;
                 clips.push(project_block(&song, block, id, &tempo, samples_per_beat));
             }
+            // Landed sound travels the same road. The legacy compiler
+            // already streams an audio clip (compile.rs's audio lane), so
+            // an AudioBlock reaches the speakers through C1 with no
+            // engine work — exactly as notes and curves do.
+            for block in &song_track.audio_blocks {
+                let id = self.arrangement.next_clip_id;
+                self.arrangement.next_clip_id += 1;
+                clips.push(project_audio_block(block, id, &tempo, samples_per_beat));
+            }
+            // One lane, one time order. The legacy side assumes a track's
+            // clips are sorted by start (arrangement.rs says so outright,
+            // and place_clip uses partition_point), so the two lists must
+            // be interleaved rather than concatenated.
+            clips.sort_by(|left, right| {
+                left.start
+                    .partial_cmp(&right.start)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             self.arrangement.clips[legacy] = clips;
         }
         self.arrangement.force_recompile = true;
@@ -1692,6 +1723,45 @@ fn project_block(
     }
 }
 
+/// One landed sound, copied out as one legacy audio clip.
+///
+/// The source crosses whole — it is the same `AudioSource` the legacy
+/// clip model already carries, because the lift in e33610d made it one
+/// type rather than two. Only the time units are converted, and through
+/// the tempo table, so a sound keeps its real duration across a tempo
+/// change.
+fn project_audio_block(
+    block: &daw::sequencing::AudioBlock,
+    id: u64,
+    tempo: &daw::tempo::TempoTable,
+    samples_per_beat: f64,
+) -> Clip {
+    let start = warped_beat(tempo, block.start_tick, samples_per_beat);
+    let end = warped_beat(tempo, block.end_tick(), samples_per_beat);
+    let name = block
+        .source
+        .path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("audio")
+        .to_owned();
+    Clip {
+        id,
+        name,
+        start: start as f32,
+        len: (end - start).max(0.0) as f32,
+        notes: Vec::new(),
+        audio: Some(block.source.clone()),
+        loop_on: block.loop_brace.is_some(),
+        loop_start: block.loop_brace.map_or(0.0, |brace| {
+            sequence_ticks_to_beats(brace.start_tick) as f32
+        }),
+        loop_len: block.loop_brace.map_or(0.0, |brace| {
+            sequence_ticks_to_beats(brace.length_ticks) as f32
+        }),
+    }
+}
+
 #[cfg(test)]
 mod projection_tests {
     use super::*;
@@ -1757,6 +1827,99 @@ mod projection_tests {
         );
         // The legacy lane was not also given the clip.
         assert!(app.arrangement.clips.iter().all(|lane| lane.is_empty()));
+    }
+
+    /// The whole road: a landed sound reaches the compiler as a legacy
+    /// AUDIO clip, on a legacy twin minted with the right kind. A twin
+    /// minted as MIDI would refuse the clip and the sound would land and
+    /// stay silent — which is the failure this test exists to catch.
+    #[test]
+    fn a_landed_sound_reaches_the_compiler_as_an_audio_clip() {
+        let storage = shell::Storage::default();
+        let mut app = App::new(&storage);
+        app.song = song_with_trig();
+        app.song.tracks.push(daw::sequencing::Track {
+            id: daw::sequencing::TrackId(99),
+            name: "AUDIO 01".to_owned(),
+            kind: daw::sequencing::TrackKind::Audio,
+            blocks: Vec::new(),
+            audio_blocks: Vec::new(),
+            muted: false,
+            solo: false,
+            pitch_authority: daw::sequencing::PitchAuthority::default(),
+            automation: Vec::new(),
+            volume: 1.0,
+            pan: 0.0,
+        });
+        let track = app.song.tracks.len() - 1;
+        let imported = daw::library::ImportedWav {
+            original_path: std::path::PathBuf::from("/samples/iron.wav"),
+            path: std::path::PathBuf::from("/cache/iron.wav"),
+            sample_rate: 48_000,
+            frames: 24_000,
+        };
+        app.finish_song_landing(&imported, track, daw::sequencing::TICKS_PER_BEAT * 2);
+
+        app.project_song();
+
+        let legacy = app.song_track_map[&app.song.tracks[track].id];
+        assert_eq!(
+            app.arrangement.tracks[legacy].kind,
+            TrackKind::Audio,
+            "the twin carries the song track's kind"
+        );
+        assert!(
+            app.arrangement.tracks[legacy].chain.is_empty(),
+            "an audio lane needs no instrument — it already is the sound"
+        );
+        let clips = &app.arrangement.clips[legacy];
+        assert_eq!(clips.len(), 1);
+        let clip = &clips[0];
+        let source = clip.audio.as_ref().expect("it is an AUDIO clip");
+        assert_eq!(source.source_frames, 24_000);
+        assert_eq!(clip.start, 2.0, "two beats in");
+        assert!((clip.len - 1.0).abs() < 1e-6, "half a second is one beat");
+        assert_eq!(clip.name, "iron");
+    }
+
+    /// A lane holding both kinds hands the legacy side ONE list in time
+    /// order. That side assumes clips are sorted by start (place_clip
+    /// uses partition_point), so concatenating the two lists would
+    /// silently corrupt it.
+    #[test]
+    fn a_mixed_lane_projects_in_time_order() {
+        let storage = shell::Storage::default();
+        let mut app = App::new(&storage);
+        app.song = song_with_trig();
+        // The default pattern block sits at tick 0; land sound before and
+        // after it in the audio list, on the same lane.
+        app.song.tracks[0].kind = daw::sequencing::TrackKind::Audio;
+        let imported = daw::library::ImportedWav {
+            original_path: std::path::PathBuf::from("/samples/late.wav"),
+            path: std::path::PathBuf::from("/cache/late.wav"),
+            sample_rate: 48_000,
+            frames: 24_000,
+        };
+        app.finish_song_landing(&imported, 0, daw::sequencing::DEFAULT_PATTERN_TICKS * 2);
+        let earlier = daw::library::ImportedWav {
+            original_path: std::path::PathBuf::from("/samples/mid.wav"),
+            path: std::path::PathBuf::from("/cache/mid.wav"),
+            sample_rate: 48_000,
+            frames: 24_000,
+        };
+        app.finish_song_landing(&earlier, 0, daw::sequencing::DEFAULT_PATTERN_TICKS);
+
+        app.project_song();
+
+        let legacy = app.song_track_map[&app.song.tracks[0].id];
+        let starts: Vec<f32> = app.arrangement.clips[legacy]
+            .iter()
+            .map(|clip| clip.start)
+            .collect();
+        let mut sorted = starts.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+        assert_eq!(starts, sorted, "the lane reaches legacy in time order");
+        assert_eq!(starts.len(), 3, "one pattern block and two sounds");
     }
 
     /// A landing that cannot happen says WHY, by name, rather than
