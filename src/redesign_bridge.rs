@@ -1496,6 +1496,13 @@ impl App {
             // drawn in the redesign is audible through C1 with no engine
             // work at all, exactly as p-locks ride the same bridge.
             self.arrangement.tracks[legacy].automation = project_automation(song_track);
+            // The mixer values travel as the BASE the envelopes bend. The
+            // legacy compiler reads the static fader and then applies
+            // `track.volume` / `track.pan` on top of it, which is exactly
+            // the offset model's shape — so the Song's knob and the Song's
+            // curve arrive as one already-agreeing pair.
+            self.arrangement.tracks[legacy].volume = song_track.volume;
+            self.arrangement.tracks[legacy].pan = song_track.pan;
             let mut clips = Vec::with_capacity(song_track.blocks.len());
             for block in &song_track.blocks {
                 let id = self.arrangement.next_clip_id;
@@ -1725,6 +1732,49 @@ mod projection_tests {
                 .value_at("track.volume", 2.0, 0.0);
         let song_mid = app.song.tracks[0].value_at("track.volume", 96, 0.0);
         assert!((legacy_mid - song_mid).abs() < 1e-6);
+    }
+
+    /// The mixer's target ids are FILE FORMAT, and they live in two
+    /// places: the Song model (library) and the legacy `targets` table
+    /// (binary). If they ever drift, every envelope already written to
+    /// disk is silently orphaned — so the two are pinned together here.
+    #[test]
+    fn the_mixer_target_ids_agree_across_the_bridge() {
+        assert_eq!(
+            daw::sequencing::TRACK_VOLUME,
+            crate::targets::TRACK_VOLUME_TARGET
+        );
+        assert_eq!(daw::sequencing::TRACK_PAN, crate::targets::TRACK_PAN_TARGET);
+    }
+
+    /// The fader and pan cross to the legacy twin the compiler reads,
+    /// and a curve on top of them composes rather than replaces.
+    #[test]
+    fn the_mixer_values_reach_the_legacy_twin() {
+        let storage = shell::Storage::default();
+        let mut app = App::new(&storage);
+        app.song = song_with_trig();
+        app.song.tracks[0].volume = 0.5;
+        app.song.tracks[0].pan = -0.25;
+
+        app.project_song();
+
+        let track_id = app.song.tracks[0].id;
+        let legacy = app.song_track_map[&track_id];
+        assert_eq!(app.arrangement.tracks[legacy].volume, 0.5);
+        assert_eq!(app.arrangement.tracks[legacy].pan, -0.25);
+
+        // With no curve, the Song read is the knob itself.
+        assert_eq!(app.song.tracks[0].volume_at(0), 0.5);
+        assert_eq!(app.song.tracks[0].pan_at(0), -0.25);
+
+        // The legacy reader, given the same base, agrees.
+        let legacy_volume = app.arrangement.tracks[legacy].automation.value_at(
+            crate::targets::TRACK_VOLUME_TARGET,
+            0.0,
+            app.arrangement.tracks[legacy].volume,
+        );
+        assert_eq!(legacy_volume, 0.5);
     }
 
     /// A target with an envelope but no points is the bare knob, so it

@@ -18,6 +18,21 @@ pub const PATTERN_STEPS: usize = GRID_COLUMNS * GRID_ROWS;
 pub const TICKS_PER_BEAT: usize = 48;
 pub const DEFAULT_PATTERN_TICKS: usize = PATTERN_STEPS * 12;
 
+/// The canonical automation target ids the mixer speaks.
+///
+/// These strings are FILE FORMAT. They are shared with the legacy
+/// `targets` table, and `redesign_bridge` asserts the two still agree —
+/// a silent divergence here orphans every envelope already on disk.
+pub const TRACK_VOLUME: &str = "track.volume";
+pub const TRACK_PAN: &str = "track.pan";
+
+/// Unity gain. A serde default, because a track absent from a pre-mixer
+/// document must come back at unity: defaulting a fader to zero would
+/// silently mute every project written before the mixer existed.
+fn unity() -> f32 {
+    1.0
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct PatternId(pub u64);
 
@@ -219,6 +234,18 @@ pub struct Track {
     /// curves", which reads exactly as it did before.
     #[serde(default)]
     pub automation: Vec<Envelope>,
+    /// Fader level as LINEAR amplitude, 1.0 = unity.
+    ///
+    /// Linear because that is what the engine multiplies by; the fader
+    /// widget owns the dB mapping, which is the only place that curve
+    /// belongs. Automatable through [`TRACK_VOLUME`].
+    #[serde(default = "unity")]
+    pub volume: f32,
+    /// Constant-power pan, `-1..=1`. Centre is 0.0 and it is EXACT, so
+    /// "back to the middle" stays reachable by hand rather than by luck.
+    /// Automatable through [`TRACK_PAN`].
+    #[serde(default)]
+    pub pan: f32,
 }
 
 impl Track {
@@ -330,6 +357,20 @@ impl Track {
         true
     }
 
+    /// The fader at `tick` — the knob, or the curve that overrides it.
+    ///
+    /// Never negative: an envelope drawn below the floor reads as silence
+    /// rather than as a phase inversion nobody asked for.
+    pub fn volume_at(&self, tick: usize) -> f32 {
+        self.value_at(TRACK_VOLUME, tick, self.volume).max(0.0)
+    }
+
+    /// The pan at `tick`, pinned to the legal span so a curve drawn past
+    /// an edge reads as hard left or hard right instead of nonsense.
+    pub fn pan_at(&self, tick: usize) -> f32 {
+        self.value_at(TRACK_PAN, tick, self.pan).clamp(-1.0, 1.0)
+    }
+
     /// THE THREE-LAYER READ, and the only sanctioned way to ask what a
     /// parameter is actually worth at a moment:
     ///
@@ -383,6 +424,8 @@ impl Default for Song {
                 solo: false,
                 pitch_authority: PitchAuthority::default(),
                 automation: Vec::new(),
+                volume: 1.0,
+                pan: 0.0,
             }],
             patterns: vec![pattern],
             key: default_key(),
@@ -860,6 +903,8 @@ mod automation_tests {
             solo: false,
             pitch_authority: PitchAuthority::default(),
             automation: Vec::new(),
+            volume: 1.0,
+            pan: 0.0,
         }
     }
 
@@ -1006,6 +1051,42 @@ mod automation_tests {
             composed.clamp_state(),
             crate::param_law::ClampState::Maximum
         );
+    }
+
+    /// The fader and pan are ordinary automation targets: the knob is
+    /// the base, the curve overrides it, and neither is allowed to leave
+    /// its legal span.
+    #[test]
+    fn the_mixer_reads_through_the_curve_and_stays_in_range() {
+        let mut track = track();
+        track.volume = 0.5;
+        track.pan = 0.0;
+        // No curve: the knob.
+        assert_eq!(track.volume_at(0), 0.5);
+        assert_eq!(track.pan_at(0), 0.0);
+
+        // A curve overrides the knob from its first point onward.
+        track.insert_point(TRACK_VOLUME, 48, 1.0);
+        assert_eq!(track.volume_at(0), 0.5, "held knob before the curve");
+        assert_eq!(track.volume_at(48), 1.0, "the curve took over");
+
+        // Neither read escapes its span, however the curve is drawn.
+        track.insert_point(TRACK_VOLUME, 96, -3.0);
+        assert_eq!(track.volume_at(96), 0.0, "a fader never inverts phase");
+        track.insert_point(TRACK_PAN, 0, -9.0);
+        assert_eq!(track.pan_at(0), -1.0, "pinned hard left, not nonsense");
+    }
+
+    /// A document written before the mixer existed comes back at UNITY.
+    /// Defaulting a fader to zero would mute every older project.
+    #[test]
+    fn a_pre_mixer_document_returns_at_unity_not_silence() {
+        let song = Song::default();
+        let text = ron::ser::to_string(&song).expect("serializes");
+        let older = text.replace("volume:1.0,", "").replace("pan:0.0,", "");
+        let back: Song = ron::from_str(&older).expect("older document loads");
+        assert_eq!(back.tracks[0].volume, 1.0, "unity, never silence");
+        assert_eq!(back.tracks[0].pan, 0.0, "centred, and exactly so");
     }
 
     /// A Song written before curves existed still loads, and reads as a
