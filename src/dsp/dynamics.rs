@@ -88,7 +88,7 @@ impl RmsDetector {
             30.0
         };
         let tau = win * 1e-3 * fs;
-        self.coeff = 1.0 - (-1.0 / tau).exp();
+        self.coeff = super::ramps::one_pole_coeff(1.0 / tau);
     }
 
     /// Green zone: forget everything heard.
@@ -241,9 +241,12 @@ impl GainComputer {
     /// here, once, so the caller never touches a logarithm.
     pub fn process(&self, env: &[f32], gain: &mut [f32]) {
         for (e, g) in env.iter().zip(gain.iter_mut()) {
-            let level_db = 20.0 * e.max(1e-6).log10();
+            // The dB round trip, once, through the shared base-two
+            // conversions — this runs per sample, which is why they are
+            // not spelled `powf`.
+            let level_db = super::arith::gain_to_db(e.max(1e-6));
             let gd = self.gain_db(level_db);
-            *g = 10.0f32.powf(gd * (1.0 / 20.0));
+            *g = super::arith::db_to_gain(gd);
         }
     }
 }
@@ -463,7 +466,7 @@ fn coeff(sample_rate: f32, time_ms: f32) -> f32 {
     if samples <= 1.0 {
         return 1.0;
     }
-    let c = 1.0 - (-1.0 / samples).exp();
+    let c = super::ramps::one_pole_coeff(1.0 / samples);
     if c.is_finite() {
         c.clamp(0.0, 1.0)
     } else {
@@ -476,6 +479,11 @@ fn coeff(sample_rate: f32, time_ms: f32) -> f32 {
 /// The longest lookahead accepted, in milliseconds. Past this the delay
 /// stops being "anticipation" and starts being latency nobody wanted.
 pub const LOOKAHEAD_MAX_MS: f32 = 20.0;
+
+/// Age stamps are kept to 24 bits, the widest integer an f32 holds
+/// exactly. Any window is a rounding error beside that, so subtracting
+/// modulo 2^24 recovers the true age however often the counter wraps.
+const STAMP_MASK: u32 = 0x00FF_FFFF;
 
 /// Brickwall lookahead limiter: the output NEVER exceeds the ceiling,
 /// and the family's first genuinely latency-reporting kernel.
@@ -492,19 +500,34 @@ pub const LOOKAHEAD_MAX_MS: f32 = 20.0;
 /// through, and the never-exceeds test drives hostile material at +12 dB
 /// to hold the kernel to that.
 ///
-/// The sliding max keeps a running (value, age) pair and rescans the
-/// window only when the reigning maximum expires: amortised O(1), worst
-/// case one bounded `L`-tap scan on decaying material — the documented
-/// cost ceiling, not an unbounded loop.
+/// The sliding max is a MONOTONIC WEDGE: a deque of candidates kept in
+/// non-increasing order, holding exactly those samples that could still
+/// become the window's maximum. A new sample evicts everything it beats
+/// from the back (they can never win again while it is in the window),
+/// and the front retires once it has aged past `L`. The front IS the
+/// maximum, read in one load. Every sample is pushed once and dropped
+/// once, so the total work is linear no matter what the signal does.
 ///
-/// State: ~50 bytes plus the caller-owned delay buffer
-/// ([`Self::scratch_len`]). Per-sample cost, MEASURED at a 5 ms
-/// lookahead: 17 ns steady; 570 ns on adversarial monotonically-
-/// decaying material that forces the rescan every sample — 2.7% of a
-/// core at 48 k, bounded, and acceptable for the bus roles a limiter
-/// plays. If a profile ever shows this mattering, the O(1)-worst-case
-/// monotonic-wedge algorithm is the known upgrade; per the contract,
-/// that optimisation follows profiling, not speculation.
+/// This replaced a running (value, age) pair that RESCANNED the window
+/// whenever the reigning peak expired. That was amortised O(1) too, but
+/// only on material that keeps producing new peaks: on anything
+/// monotonically decaying — a fade, a reverb tail, the decay of any
+/// struck note — the peak expired every single sample and the rescan
+/// ran every single sample. Measured at a 5 ms lookahead, release: 6 ns
+/// steady against 249 ns decaying, a 40x cliff that arrived with
+/// ordinary music. The wedge is 4.4 ns steady and 4.5 ns decaying — the
+/// cliff is not smaller, it is gone, which is the property that matters
+/// in a callback with a deadline.
+///
+/// The deque's STORAGE is the caller's, like every other buffer here:
+/// [`Self::scratch_len`] sizes the key buffer for the delay line and
+/// the wedge together, and the kernel splits it. Only the two ends and
+/// a stamp counter are state, which is what keeps this struct `Copy`.
+/// The two `while`-shaped loops are written as bounded `for`s so the
+/// no-unbounded-loops rule is satisfied syntactically and not by
+/// argument.
+///
+/// State: ~64 bytes plus the caller-owned buffers ([`Self::scratch_len`]).
 /// Denormal-safe: gain and envelope live near 1.0; the delayed audio
 /// relies on engine FTZ like any buffer.
 /// In-place safe: yes.
@@ -529,10 +552,17 @@ pub struct LookaheadLimiter {
     release_coeff: f32,
     /// Smoothed gain state.
     gain: f32,
-    /// Sliding-window maximum of |input| and how many samples ago it
-    /// entered the window.
+    /// The current sliding-window maximum of |key| — the front of the
+    /// wedge, cached so the gain maths reads a field and not a slice.
     win_max: f32,
-    win_age: usize,
+    /// The monotonic wedge's ends, indexing the caller's wedge storage.
+    /// The DEQUE lives in the scratch buffer; only these ends and the
+    /// stamp counter are state, which is what keeps this struct `Copy`.
+    wedge_head: usize,
+    wedge_tail: usize,
+    /// Samples pushed, for the age stamps. Wraps, and the comparison
+    /// wraps with it.
+    pushed: u32,
     /// Peak reduction this block, in dB — telemetry for a GR meter.
     reduction_db: f32,
 }
@@ -555,7 +585,9 @@ impl LookaheadLimiter {
             release_coeff: 0.0,
             gain: 1.0,
             win_max: 0.0,
-            win_age: 0,
+            wedge_head: 0,
+            wedge_tail: 0,
+            pushed: 0,
             reduction_db: 0.0,
         }
     }
@@ -566,10 +598,50 @@ impl LookaheadLimiter {
         Self::scratch_len_samples(Self::samples_for(sample_rate, lookahead_ms))
     }
 
-    /// Floats the caller-owned buffer needs for a lookahead stated in
+    /// Floats each caller-owned buffer needs for a lookahead stated in
     /// SAMPLES. Green zone, compile-time sizing.
+    ///
+    /// One figure for all three buffers, and it is the largest of them:
+    /// the KEY buffer carries the detector's wedge behind its delay
+    /// line, while the two audio lines use only the line part. Sizing
+    /// them all the same wastes a few hundred floats per limiter and
+    /// means no caller has to know which buffer is which.
     pub fn scratch_len_samples(lookahead: usize) -> usize {
+        Self::line_len_samples(lookahead) + Self::wedge_len_samples(lookahead)
+    }
+
+    /// The delay line's own length — the prefix of any of the buffers.
+    fn line_len_samples(lookahead: usize) -> usize {
         delay::buffer_len(lookahead.max(1) + 4)
+    }
+
+    /// Deque slots the wedge can ever need: one per sample of the
+    /// window, rounded up to a power of two so the ends mask instead of
+    /// dividing, plus one so `head == tail` can only mean EMPTY.
+    fn wedge_cap(lookahead: usize) -> usize {
+        (lookahead.max(1) + 2).next_power_of_two()
+    }
+
+    /// Floats the wedge needs: two per slot, a value and an age stamp.
+    pub fn wedge_len_samples(lookahead: usize) -> usize {
+        2 * Self::wedge_cap(lookahead)
+    }
+
+    /// Split a key buffer into its line prefix and its wedge tail.
+    /// `None` if the caller sized it for the line alone — fail open.
+    #[inline(always)]
+    fn split_key(lookahead: usize, buf: &mut [f32]) -> Option<(&mut [f32], &mut [f32])> {
+        if buf.len() < Self::scratch_len_samples(lookahead) {
+            return None;
+        }
+        Some(buf.split_at_mut(Self::line_len_samples(lookahead)))
+    }
+
+    /// An audio line's prefix inside a buffer sized by
+    /// [`scratch_len_samples`](Self::scratch_len_samples).
+    #[inline(always)]
+    fn line_of(lookahead: usize, buf: &mut [f32]) -> Option<&mut [f32]> {
+        buf.get_mut(..Self::line_len_samples(lookahead))
     }
 
     fn samples_for(sample_rate: f32, lookahead_ms: f32) -> usize {
@@ -618,13 +690,13 @@ impl LookaheadLimiter {
         // ~98% settled by the time the peak arrives, and the hard `min`
         // in the loop covers the rest.
         let attack_tau = (self.lookahead as f32 * 0.25).max(1.0);
-        self.attack_coeff = 1.0 - (-1.0 / attack_tau).exp();
+        self.attack_coeff = super::ramps::one_pole_coeff(1.0 / attack_tau);
         let rel = if release_ms.is_finite() {
             release_ms.clamp(1.0, 5_000.0)
         } else {
             100.0
         };
-        self.release_coeff = 1.0 - (-1.0 / (rel * 1e-3 * fs)).exp();
+        self.release_coeff = super::ramps::one_pole_coeff(1.0 / (rel * 1e-3 * fs));
         self.reset();
     }
 
@@ -650,7 +722,7 @@ impl LookaheadLimiter {
         } else {
             100.0
         };
-        self.release_coeff = 1.0 - (-1.0 / (rel * 1e-3 * fs)).exp();
+        self.release_coeff = super::ramps::one_pole_coeff(1.0 / (rel * 1e-3 * fs));
     }
 
     /// Green zone: the ceiling, in dBFS (≤ 0 in any sane session; junk
@@ -661,7 +733,7 @@ impl LookaheadLimiter {
         } else {
             0.0
         };
-        self.ceiling = 10.0f32.powf(db * (1.0 / 20.0));
+        self.ceiling = super::arith::db_to_gain(db);
     }
 
     /// Green zone: forget everything (caller clears the buffer slice).
@@ -669,7 +741,9 @@ impl LookaheadLimiter {
         self.line.reset();
         self.gain = 1.0;
         self.win_max = 0.0;
-        self.win_age = 0;
+        self.wedge_head = 0;
+        self.wedge_tail = 0;
+        self.pushed = 0;
         self.reduction_db = 0.0;
     }
 
@@ -694,32 +768,60 @@ impl LookaheadLimiter {
     /// SIGNED audio there (the line doubles as its delay) while linked
     /// stores an already-rectified key.
     #[inline(always)]
-    fn advance(&mut self, key_buf: &mut [f32], pushed: f32, ax: f32) -> f32 {
-        let window = self.lookahead + 1;
+    fn advance(&mut self, key_buf: &mut [f32], wedge: &mut [f32], pushed: f32, ax: f32) -> f32 {
+        let window = (self.lookahead + 1) as u32;
+        let cap = Self::wedge_cap(self.lookahead);
+        let mask = cap - 1;
         self.line.push(key_buf, pushed);
+        self.pushed = self.pushed.wrapping_add(1);
+        let now = self.pushed & STAMP_MASK;
 
-        // Sliding max of |key| over the window ending now.
-        self.win_age += 1;
-        if ax >= self.win_max {
-            self.win_max = ax;
-            self.win_age = 0;
-        } else if self.win_age >= window {
-            // The reigning peak fell out of the window: one bounded
-            // rescan. `behind` 1 is the newest pushed sample.
-            let mut m = 0.0f32;
-            let mut age = window - 1;
-            for behind in 1..=window {
-                let v = self.line.tap(key_buf, behind).abs();
-                // `>=` prefers the NEWEST equal value, which keeps the
-                // age low and rescans rare on flat material.
-                if v >= m {
-                    m = v;
-                    age = behind - 1;
-                }
+        // Anything the new sample matches or beats can never be the
+        // window maximum again while the new one is still in it, so it
+        // leaves now. Each sample is pushed once and dropped once, which
+        // is what makes the whole thing amortised O(1) — the loops are
+        // bounded by `cap` so the bound is syntactic, not an argument.
+        for _ in 0..cap {
+            if self.wedge_head == self.wedge_tail {
+                break;
             }
-            self.win_max = m;
-            self.win_age = age;
+            let back = (self.wedge_tail + mask) & mask;
+            let Some(v) = wedge.get(2 * back).copied() else {
+                break;
+            };
+            if v > ax {
+                break;
+            }
+            self.wedge_tail = back;
         }
+        if let Some(slot) = wedge.get_mut(2 * self.wedge_tail) {
+            *slot = ax;
+        }
+        if let Some(slot) = wedge.get_mut(2 * self.wedge_tail + 1) {
+            // Stamps are 24-bit, which an f32 holds exactly, and the age
+            // below subtracts modulo the same 24 bits — so the counter
+            // wrapping costs nothing.
+            *slot = now as f32;
+        }
+        self.wedge_tail = (self.wedge_tail + 1) & mask;
+
+        // Retire the front once it has aged out of the window.
+        for _ in 0..cap {
+            if self.wedge_head == self.wedge_tail {
+                break;
+            }
+            let Some(stamp) = wedge.get(2 * self.wedge_head + 1).copied() else {
+                break;
+            };
+            let age = now.wrapping_sub(stamp as u32) & STAMP_MASK;
+            if age < window {
+                break;
+            }
+            self.wedge_head = (self.wedge_head + 1) & mask;
+        }
+        // The front IS the maximum: the wedge is non-increasing, and the
+        // sample just pushed guarantees it is not empty.
+        self.win_max = wedge.get(2 * self.wedge_head).copied().unwrap_or(0.0);
 
         // The gain that GUARANTEES the delayed sample fits.
         let required = if self.win_max > self.ceiling {
@@ -744,21 +846,27 @@ impl LookaheadLimiter {
 
     /// Red zone: limit in place, any length.
     pub fn process(&mut self, io: &mut [f32], buf: &mut [f32]) {
-        if !self.line.matches(buf) {
+        let Some((buf, wedge)) = Self::split_key(self.lookahead, buf) else {
             return; // fail open, undelayed — loud enough to notice
+        };
+        if !self.line.matches(buf) {
+            return;
         }
-        let mut worst = 0.0f32; // block-local peak gain reduction
+        // The meter wants the block's WORST reduction, and reduction is
+        // a decreasing function of gain — so the deepest reduction is
+        // simply the smallest gain, and the logarithm belongs out here
+        // rather than on every sample. Same number, one call.
+        let mut lowest = 1.0f32;
         for s in io.iter_mut() {
             let x = *s;
             let ax = if x.is_finite() { x.abs() } else { 0.0 };
-            let gain = self.advance(buf, x, ax);
+            let gain = self.advance(buf, wedge, x, ax);
             *s = self.line.tap(buf, self.lookahead + 1) * gain;
-            let red = -20.0 * gain.max(1e-6).log10();
-            if red > worst {
-                worst = red;
+            if gain < lowest {
+                lowest = gain;
             }
         }
-        self.reduction_db = worst;
+        self.reduction_db = -super::arith::gain_to_db(lowest.max(1e-6));
     }
 
     /// Red zone: limit a stereo pair with ONE linked gain, in place.
@@ -786,14 +894,22 @@ impl LookaheadLimiter {
         buf_l: &mut [f32],
         buf_r: &mut [f32],
     ) {
+        let look = self.lookahead;
+        let (Some((key_buf, wedge)), Some(buf_l), Some(buf_r)) = (
+            Self::split_key(look, key_buf),
+            Self::line_of(look, buf_l),
+            Self::line_of(look, buf_r),
+        ) else {
+            return; // fail open, undelayed — loud enough to notice
+        };
         if l.len() != r.len()
             || !self.line.matches(key_buf)
             || !self.line_l.matches(buf_l)
             || !self.line_r.matches(buf_r)
         {
-            return; // fail open, undelayed — loud enough to notice
+            return;
         }
-        let mut worst = 0.0f32;
+        let mut lowest = 1.0f32;
         let behind = self.lookahead + 1;
         for (left, right) in l.iter_mut().zip(r.iter_mut()) {
             let (xl, xr) = (*left, *right);
@@ -804,15 +920,15 @@ impl LookaheadLimiter {
             // The KEY is the louder side, so the pair is held below the
             // ceiling by whichever channel is closest to it.
             let key = al.max(ar);
-            let gain = self.advance(key_buf, key, key);
+            let gain = self.advance(key_buf, wedge, key, key);
             *left = self.line_l.tap(buf_l, behind) * gain;
             *right = self.line_r.tap(buf_r, behind) * gain;
-            let red = -20.0 * gain.max(1e-6).log10();
-            if red > worst {
-                worst = red;
+            if gain < lowest {
+                lowest = gain;
             }
         }
-        self.reduction_db = worst;
+        // One logarithm per block; see the mono path.
+        self.reduction_db = -super::arith::gain_to_db(lowest.max(1e-6));
     }
 }
 
@@ -937,9 +1053,9 @@ impl SlewBrighten {
             1_500.0
         };
         // One-pole coefficient for the edge band's corner.
-        self.g = 1.0 - (-core::f32::consts::TAU * corner / fs).exp();
-        self.attack = 1.0 - (-1.0 / (Self::ATTACK_MS * 1e-3 * fs).max(1.0)).exp();
-        self.release = 1.0 - (-1.0 / (Self::RELEASE_MS * 1e-3 * fs).max(1.0)).exp();
+        self.g = super::ramps::one_pole_coeff(core::f32::consts::TAU * corner / fs);
+        self.attack = super::ramps::one_pole_coeff(1.0 / (Self::ATTACK_MS * 1e-3 * fs).max(1.0));
+        self.release = super::ramps::one_pole_coeff(1.0 / (Self::RELEASE_MS * 1e-3 * fs).max(1.0));
         // The per-sample slew of a full-scale sine at KNEE_HZ.
         self.knee = (core::f32::consts::TAU * Self::KNEE_HZ / fs).max(1e-6);
         self.amount = if amount.is_finite() {
@@ -997,6 +1113,144 @@ impl SlewBrighten {
             // Saturating, so nothing the input does can run away.
             let lift = self.env / (self.env + self.knee);
             *sample = x + self.amount * lift * edge;
+        }
+    }
+}
+
+// ------------------------------------------------------ transient split ---
+
+/// The fast envelope's ballistics. Short enough to be ON the attack
+/// rather than after it, and a release brisk enough that the gap has
+/// closed before the next sixteenth arrives.
+const SPLIT_FAST_ATTACK_MS: f32 = 0.05;
+const SPLIT_FAST_RELEASE_MS: f32 = 14.0;
+/// The slow envelope only ever RELEASES slowly; its attack is the knob.
+const SPLIT_SLOW_RELEASE_MS: f32 = 180.0;
+/// The window the caller may ask for, in milliseconds.
+pub const SPLIT_WINDOW_MIN_MS: f32 = 1.0;
+pub const SPLIT_WINDOW_MAX_MS: f32 = 60.0;
+/// Below this the fast envelope is silence and the ratio is meaningless.
+const SPLIT_FLOOR: f32 = 1e-6;
+
+/// How much of each sample belongs to the STRIKE rather than the BODY.
+///
+/// Two envelope followers watch one signal at different speeds. A hit
+/// moves the fast one at once and the slow one barely at all, so the GAP
+/// between them is the attack; once the hit settles the two agree and the
+/// gap closes. What this writes is that gap, divided by the fast envelope
+/// so it does not depend on how loud the hit was — a ghost note and a
+/// rimshot open it the same amount. That is the difference between a
+/// transient shaper and a compressor, and it is the property the tests
+/// hold this to.
+///
+/// The weight is a WEIGHT: this kernel applies no gain of its own, and
+/// the caller multiplies whatever shaping it wants by it. One job each,
+/// per the contract — which is also why the same kernel serves an attack
+/// boost, a sustain cut, and a colour that only tracks the strike.
+///
+/// State: 24 bytes. Per-sample cost: two compare-and-FMA pairs, one
+/// divide.
+/// Denormal-safe: relies on engine FTZ — both envelopes decay through the
+/// denormal range on silence, and the floor keeps the ratio finite.
+/// In-place safe: n/a — separate in/out slices by signature.
+/// Latency: 0 samples.
+#[derive(Debug, Clone, Copy)]
+pub struct TransientSplit {
+    fast: f32,
+    slow: f32,
+    fast_attack: f32,
+    fast_release: f32,
+    slow_attack: f32,
+    slow_release: f32,
+}
+
+impl Default for TransientSplit {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TransientSplit {
+    pub fn new() -> Self {
+        Self {
+            fast: 0.0,
+            slow: 0.0,
+            fast_attack: 1.0,
+            fast_release: 1.0,
+            slow_attack: 1.0,
+            slow_release: 1.0,
+        }
+    }
+
+    /// Green zone: `window_ms` is how long a strike is allowed to last —
+    /// the slow envelope's attack, and the only ballistic with a knob on
+    /// it. Everything else is fixed, because a transient shaper with four
+    /// time controls is a compressor with extra steps.
+    pub fn prepare(&mut self, sample_rate: f32, window_ms: f32) {
+        let fs = if sample_rate.is_finite() && sample_rate > 0.0 {
+            sample_rate
+        } else {
+            48_000.0
+        };
+        let window = if window_ms.is_finite() {
+            window_ms.clamp(SPLIT_WINDOW_MIN_MS, SPLIT_WINDOW_MAX_MS)
+        } else {
+            12.0
+        };
+        let coeff = |ms: f32| {
+            let samples = ms * 1e-3 * fs;
+            if samples >= 1.0 {
+                super::ramps::one_pole_coeff(1.0 / samples)
+            } else {
+                1.0
+            }
+        };
+        self.fast_attack = coeff(SPLIT_FAST_ATTACK_MS);
+        self.fast_release = coeff(SPLIT_FAST_RELEASE_MS);
+        self.slow_attack = coeff(window);
+        self.slow_release = coeff(SPLIT_SLOW_RELEASE_MS);
+    }
+
+    /// Green zone: forget the signal, keep the ballistics.
+    pub fn reset(&mut self) {
+        self.fast = 0.0;
+        self.slow = 0.0;
+    }
+
+    /// The weight the last processed sample produced — for a meter.
+    pub fn current(&self) -> f32 {
+        let denom = self.fast.max(SPLIT_FLOOR);
+        ((self.fast - self.slow) / denom).clamp(0.0, 1.0)
+    }
+
+    /// Red zone: write `key`'s strike weight into `weight`, in `0..=1`,
+    /// truncating to the shorter slice.
+    pub fn process(&mut self, key: &[f32], weight: &mut [f32]) {
+        for (w, x) in weight.iter_mut().zip(key.iter()) {
+            let level = if x.is_finite() { x.abs() } else { 0.0 };
+            let fc = if level > self.fast {
+                self.fast_attack
+            } else {
+                self.fast_release
+            };
+            self.fast = fc.mul_add(level - self.fast, self.fast);
+            // The slow envelope follows the FAST ONE, not the raw signal.
+            // Chasing the signal directly, it settles somewhere between
+            // the mean and the peak while the fast envelope sits on the
+            // peak — so a steady tone never closes the gap and reads as a
+            // permanent 11% strike. Following the fast envelope, the two
+            // agree exactly on anything steady, and open only when the
+            // envelope itself MOVES. Which is the definition.
+            let sc = if self.fast > self.slow {
+                self.slow_attack
+            } else {
+                self.slow_release
+            };
+            self.slow = sc.mul_add(self.fast - self.slow, self.slow);
+            // Normalising by the fast envelope is what makes this a
+            // TRANSIENT detector and not a level detector.
+            let denom = self.fast.max(SPLIT_FLOOR);
+            *w = ((self.fast - self.slow) / denom).clamp(0.0, 1.0);
         }
     }
 }
@@ -2176,5 +2430,266 @@ mod tests {
         let mut none = LookaheadLimiter::new();
         none.prepare_samples(48_000.0, 0, 50.0);
         assert!(none.latency() >= 1);
+    }
+
+    /// The wedge has to BE the sliding maximum — every sample, on the
+    /// shapes that break the naive versions.
+    ///
+    /// The limiter's guarantee rests entirely on `win_max` being the
+    /// true peak of the window that ends at the newest sample. The
+    /// never-exceeds test proves the ceiling holds, which a max that is
+    /// merely too BIG would also satisfy — over-limiting is silent. So
+    /// this compares against brute force directly, and the material is
+    /// chosen to hit the cases a monotonic deque gets wrong: a decay
+    /// (every sample evicts the front), a rise (every sample empties the
+    /// back), plateaus of equal values (the tie-break), and silence.
+    #[test]
+    fn the_sliding_maximum_is_the_real_one() {
+        const MS: f32 = 1.0;
+        let window = LookaheadLimiter::samples_for(FS, MS) + 1;
+        let shapes: [(&str, Box<dyn Fn(usize) -> f32>); 6] = [
+            ("decay", Box::new(|i: usize| 2.0 / (1.0 + i as f32 * 1e-3))),
+            ("rise", Box::new(|i: usize| i as f32 * 1e-3)),
+            (
+                "plateau",
+                Box::new(|i: usize| if i % 97 < 40 { 0.5 } else { 0.1 }),
+            ),
+            ("silence", Box::new(|_: usize| 0.0)),
+            (
+                "spikes",
+                Box::new(|i: usize| if i % 211 == 0 { 1.7 } else { 0.01 }),
+            ),
+            (
+                "wander",
+                Box::new(|i: usize| {
+                    let t = i as f32;
+                    (t * 0.017).sin() * (t * 0.0013).cos() * 1.3
+                }),
+            ),
+        ];
+        for (name, f) in shapes {
+            let mut lim = LookaheadLimiter::new();
+            lim.prepare(FS, MS, 100.0);
+            lim.set_ceiling_db(-1.0);
+            let mut buf = vec![0.0f32; LookaheadLimiter::scratch_len(FS, MS)];
+            let mut history: Vec<f32> = Vec::new();
+            for i in 0..4_000 {
+                let x = f(i);
+                history.push(if x.is_finite() { x.abs() } else { 0.0 });
+                let mut one = [x];
+                lim.process(&mut one, &mut buf);
+                let from = history.len().saturating_sub(window);
+                let want = history[from..].iter().fold(0.0f32, |m, v| m.max(*v));
+                assert_eq!(
+                    lim.win_max, want,
+                    "{name} at sample {i}: wedge says {}, window holds {want}",
+                    lim.win_max
+                );
+            }
+        }
+    }
+
+    /// The stamps are 24-bit, so the counter wraps; the age must not.
+    #[test]
+    fn the_wedge_survives_its_stamp_counter_wrapping() {
+        const MS: f32 = 0.5;
+        let window = LookaheadLimiter::samples_for(FS, MS) + 1;
+        let mut lim = LookaheadLimiter::new();
+        lim.prepare(FS, MS, 100.0);
+        lim.set_ceiling_db(-1.0);
+        let mut buf = vec![0.0f32; LookaheadLimiter::scratch_len(FS, MS)];
+        // Park the counter just below the 24-bit wrap, then walk across.
+        lim.pushed = STAMP_MASK - 32;
+        let mut history: Vec<f32> = Vec::new();
+        for i in 0..(window * 4 + 128) {
+            let x = ((i as f32) * 0.37).sin() * 1.4;
+            history.push(x.abs());
+            let mut one = [x];
+            lim.process(&mut one, &mut buf);
+            let from = history.len().saturating_sub(window);
+            let want = history[from..].iter().fold(0.0f32, |m, v| m.max(*v));
+            assert_eq!(lim.win_max, want, "across the wrap, at {i}");
+        }
+    }
+
+    // ---------------------------------------------- transient split ---
+
+    fn split_armed(window_ms: f32) -> TransientSplit {
+        let mut t = TransientSplit::new();
+        t.prepare(FS, window_ms);
+        t
+    }
+
+    /// A percussive hit: instant onset, exponential decay.
+    fn hit(amp: f32, decay_ms: f32, n: usize) -> Vec<f32> {
+        let tau = decay_ms * 1e-3 * FS;
+        (0..n)
+            .map(|i| {
+                let env = (-(i as f32) / tau).exp();
+                amp * env * ((i as f32) * 0.9).sin()
+            })
+            .collect()
+    }
+
+    /// REFERENCE: the gap opens on the attack and closes on the body.
+    #[test]
+    fn a_hit_opens_the_split_and_a_steady_tone_closes_it() {
+        let mut t = split_armed(12.0);
+        let signal = hit(0.8, 40.0, 4_800);
+        let mut w = vec![0.0f32; signal.len()];
+        t.process(&signal, &mut w);
+
+        let onset = w.get(..240).unwrap().iter().fold(0.0f32, |m, v| m.max(*v));
+        let body = w
+            .get(2_400..)
+            .unwrap()
+            .iter()
+            .fold(0.0f32, |m, v| m.max(*v));
+        assert!(onset > 0.5, "the attack must open the split: {onset}");
+        assert!(body < 0.1, "the decay must close it: {body}");
+
+        // A steady tone has no attack after its first moment.
+        let mut t = split_armed(12.0);
+        let tone: Vec<f32> = (0..9_600)
+            .map(|i| 0.5 * ((i as f32) * 0.31).sin())
+            .collect();
+        let mut w = vec![0.0f32; tone.len()];
+        t.process(&tone, &mut w);
+        let late = w
+            .get(4_800..)
+            .unwrap()
+            .iter()
+            .fold(0.0f32, |m, v| m.max(*v));
+        assert!(late < 0.1, "a sustained tone must read as body: {late}");
+    }
+
+    /// The property that makes this a transient detector rather than a
+    /// level detector: a quiet hit and a loud one open it the SAME.
+    ///
+    /// A compressor cares how loud you played; a transient shaper must
+    /// not, or a ghost note gets none of the treatment the accent gets
+    /// and the groove flattens out. Normalising by the fast envelope is
+    /// what buys this, and nothing else in the file checks it.
+    #[test]
+    fn the_split_does_not_care_how_loud_the_hit_was() {
+        let mut worst = 0.0f32;
+        let loud = {
+            let mut t = split_armed(12.0);
+            let mut w = vec![0.0f32; 2_400];
+            t.process(&hit(0.9, 40.0, 2_400), &mut w);
+            w
+        };
+        for amp in [0.03f32, 0.1, 0.3, 0.6] {
+            let mut t = split_armed(12.0);
+            let mut w = vec![0.0f32; 2_400];
+            t.process(&hit(amp, 40.0, 2_400), &mut w);
+            for (a, b) in w.iter().zip(loud.iter()) {
+                worst = worst.max((a - b).abs());
+            }
+        }
+        assert!(
+            worst < 1e-3,
+            "the split moved by {worst} when only the level changed"
+        );
+    }
+
+    /// A wider window keeps the strike open longer. That is the knob's
+    /// entire meaning, so it is worth one assertion.
+    #[test]
+    fn a_wider_window_holds_the_strike_open_longer() {
+        let signal = hit(0.8, 60.0, 4_800);
+        let open_for = |ms: f32| {
+            let mut t = split_armed(ms);
+            let mut w = vec![0.0f32; signal.len()];
+            t.process(&signal, &mut w);
+            w.iter().filter(|v| **v > 0.25).count()
+        };
+        let narrow = open_for(2.0);
+        let wide = open_for(40.0);
+        assert!(
+            wide > narrow,
+            "40 ms held the strike for {wide} samples, 2 ms for {narrow}"
+        );
+    }
+
+    #[test]
+    fn transient_split_is_bit_exact_when_the_block_is_split() {
+        let signal = hit(0.7, 30.0, 1_000);
+        let mut whole = vec![0.0f32; signal.len()];
+        split_armed(12.0).process(&signal, &mut whole);
+
+        let mut piecewise = vec![0.0f32; signal.len()];
+        let mut t = split_armed(12.0);
+        let mut at = 0;
+        for cut in [1usize, 7, 64, 128, 200, 600] {
+            let end = (at + cut).min(signal.len());
+            let (Some(src), Some(dst)) = (signal.get(at..end), piecewise.get_mut(at..end)) else {
+                break;
+            };
+            t.process(src, dst);
+            at = end;
+        }
+        if let (Some(src), Some(dst)) = (signal.get(at..), piecewise.get_mut(at..)) {
+            t.process(src, dst);
+        }
+        for (i, (a, b)) in whole.iter().zip(piecewise.iter()).enumerate() {
+            assert_eq!(bits(*a), bits(*b), "sample {i} differs across a split");
+        }
+    }
+
+    #[test]
+    fn transient_split_takes_any_block_length() {
+        let mut t = split_armed(12.0);
+        for len in [0usize, 1, 2, 3, 5, 17, 63, 255] {
+            let signal = hit(0.5, 20.0, len);
+            let mut w = vec![0.0f32; len];
+            t.process(&signal, &mut w);
+            assert!(w.iter().all(|v| (0.0..=1.0).contains(v)), "len {len}");
+        }
+        // Mismatched slices truncate rather than panic.
+        let mut w = vec![0.0f32; 4];
+        t.process(&[0.1; 32], &mut w);
+    }
+
+    #[test]
+    fn transient_split_does_not_allocate() {
+        let mut t = split_armed(12.0);
+        let signal = hit(0.6, 25.0, 256);
+        let mut w = vec![0.0f32; 256];
+        assert_no_alloc::assert_no_alloc(|| {
+            for _ in 0..50 {
+                t.process(&signal, &mut w);
+            }
+        });
+    }
+
+    #[test]
+    fn transient_split_stays_closed_and_finite_on_silence_and_nonsense() {
+        let mut t = split_armed(12.0);
+        let mut w = vec![9.0f32; 512];
+        t.process(&vec![0.0f32; 512], &mut w);
+        assert!(
+            w.iter().all(|v| *v == 0.0),
+            "silence must read as no strike"
+        );
+
+        // A decayed tail must not leave a stuck weight behind.
+        let mut t = split_armed(12.0);
+        let mut w = vec![0.0f32; 4_800];
+        t.process(&hit(0.8, 5.0, 4_800), &mut w);
+        assert!(
+            w.last().is_some_and(|v| *v < 1e-3),
+            "the tail left the split open"
+        );
+
+        // Nonsense in: bounded, finite, never NaN.
+        let mut t = split_armed(12.0);
+        let junk = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 1e30, -1e30, 0.0];
+        let mut w = vec![0.0f32; junk.len()];
+        t.process(&junk, &mut w);
+        assert!(
+            w.iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v)),
+            "nonsense produced {w:?}"
+        );
     }
 }

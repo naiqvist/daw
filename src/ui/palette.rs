@@ -61,6 +61,34 @@ impl Command {
     }
 }
 
+/// A long-form typed command: sentences too long for keys, spoken as
+/// `name arguments…` (`notes/20260826-note-command-language.md`). The
+/// palette recognizes the NAME as the query's first word and hands the
+/// whole line back — parsing stays with the app, like ids do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TypedCommand {
+    pub name: &'static str,
+    /// One usage line shown while the command is being typed.
+    pub usage: &'static str,
+}
+
+/// What the palette ran this frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Choice {
+    /// A listed command, by id.
+    Command(&'static str),
+    /// A typed long-form line, verbatim; its first word names the command.
+    Typed(String),
+}
+
+/// The typed command the query is speaking, if its first word names one.
+pub fn typed_match<'a>(query: &str, typed: &'a [TypedCommand]) -> Option<&'a TypedCommand> {
+    let first = query.split_whitespace().next()?;
+    typed
+        .iter()
+        .find(|command| command.name.eq_ignore_ascii_case(first))
+}
+
 // ------------------------------------------------------------- matching ---
 
 /// Score bonuses/penalties. Tuned so that, for a query, an exact prefix
@@ -214,7 +242,8 @@ impl Palette {
         ctx: &egui::Context,
         theme: &Theme,
         commands: &[Command],
-    ) -> Option<&'static str> {
+        typed: &[TypedCommand],
+    ) -> Option<Choice> {
         if !self.open {
             return None;
         }
@@ -225,9 +254,14 @@ impl Palette {
             return None;
         }
 
+        // A typed long form claims the top row while it is being spoken;
+        // the ranked list continues below it.
+        let speaking = typed_match(&self.query, typed).copied();
+        let typed_rows = usize::from(speaking.is_some());
         let ranked = rank(&self.query, commands);
-        if self.cursor >= ranked.len() {
-            self.cursor = ranked.len().saturating_sub(1);
+        let total = typed_rows + ranked.len();
+        if self.cursor >= total {
+            self.cursor = total.saturating_sub(1);
         }
 
         // Navigation. Ctrl+N/Ctrl+P mirror the arrows for the touch-typist.
@@ -244,8 +278,8 @@ impl Palette {
                 step -= 1;
             }
         });
-        if !ranked.is_empty() && step != 0 {
-            let n = ranked.len() as i32;
+        if total > 0 && step != 0 {
+            let n = total as i32;
             self.cursor = (((self.cursor as i32 + step) % n + n) % n) as usize;
         }
 
@@ -255,7 +289,7 @@ impl Palette {
         // the palette should never open under one.
         let screen = ctx.content_rect();
         let width = (screen.width() * WIDTH_FRAC).clamp(WIDTH_MIN, WIDTH_MAX);
-        let mut chosen: Option<&'static str> = None;
+        let mut chosen: Option<Choice> = None;
 
         egui::Area::new(egui::Id::new("command_palette"))
             .order(egui::Order::Foreground)
@@ -290,7 +324,7 @@ impl Palette {
 
                         ui.add_space(theme.sp(space::XS));
 
-                        if ranked.is_empty() {
+                        if total == 0 {
                             ui.label(
                                 egui::RichText::new("no matching command")
                                     .size(font::LABEL)
@@ -299,48 +333,56 @@ impl Palette {
                             return;
                         }
 
+                        // The typed long form, while spoken, is row zero.
+                        if let Some(speaking) = &speaking {
+                            let row = Command::new("", speaking.name, speaking.usage).hint("↵");
+                            if self.row(ui, theme, &row, self.cursor == 0) {
+                                chosen = Some(Choice::Typed(self.query.trim().to_owned()));
+                                self.cursor = 0;
+                            }
+                        }
+
                         // Scroll window: keep the cursor row on screen
                         // without moving the list more than it must.
-                        let first = self
-                            .cursor
-                            .saturating_sub(VISIBLE_ROWS.saturating_sub(1))
+                        let list_cursor = self.cursor.saturating_sub(typed_rows);
+                        let visible = VISIBLE_ROWS.saturating_sub(typed_rows).max(1);
+                        let first = list_cursor
+                            .saturating_sub(visible.saturating_sub(1))
                             .min(ranked.len().saturating_sub(1));
-                        let last = (first + VISIBLE_ROWS).min(ranked.len());
+                        let last = (first + visible).min(ranked.len());
 
                         for (row, &(ci, _)) in ranked[first..last].iter().enumerate() {
                             let idx = first + row;
                             let cmd = commands[ci];
-                            let active = idx == self.cursor;
+                            let active = idx + typed_rows == self.cursor;
                             let clicked = self.row(ui, theme, &cmd, active);
                             if clicked && cmd.enabled {
-                                chosen = Some(cmd.id);
+                                chosen = Some(Choice::Command(cmd.id));
                             }
                             if clicked {
-                                self.cursor = idx;
+                                self.cursor = idx + typed_rows;
                             }
                         }
 
-                        if ranked.len() > VISIBLE_ROWS {
+                        if ranked.len() > visible {
                             ui.add_space(theme.sp(space::XS));
                             ui.label(
-                                egui::RichText::new(format!(
-                                    "{} more",
-                                    ranked.len() - VISIBLE_ROWS
-                                ))
-                                .size(font::LABEL)
-                                .color(theme.text_muted),
+                                egui::RichText::new(format!("{} more", ranked.len() - visible))
+                                    .size(font::LABEL)
+                                    .color(theme.text_muted),
                             );
                         }
                     });
             });
 
-        if accept
-            && chosen.is_none()
-            && let Some(&(ci, _)) = ranked.get(self.cursor)
-        {
-            let cmd = commands[ci];
-            if cmd.enabled {
-                chosen = Some(cmd.id);
+        if accept && chosen.is_none() {
+            if self.cursor == 0 && speaking.is_some() {
+                chosen = Some(Choice::Typed(self.query.trim().to_owned()));
+            } else if let Some(&(ci, _)) = ranked.get(self.cursor.saturating_sub(typed_rows)) {
+                let cmd = commands[ci];
+                if cmd.enabled {
+                    chosen = Some(Choice::Command(cmd.id));
+                }
             }
         }
         if chosen.is_some() {
@@ -536,6 +578,35 @@ mod tests {
         // "n c" should find "new clip at cursor" — the space is not a
         // character to locate, it just separates fragments.
         assert!(s("n c", "new clip at cursor").is_some());
+    }
+
+    /// The typed long forms: the first WORD names the command — exactly,
+    /// not fuzzily — and only then does the palette hand back the line.
+    #[test]
+    fn typed_long_forms_match_on_their_first_word_only() {
+        let typed = [
+            TypedCommand {
+                name: "key",
+                usage: "key <tonic> <scale> [mode N]",
+            },
+            TypedCommand {
+                name: "quantize-key",
+                usage: "quantize-key",
+            },
+        ];
+        assert_eq!(
+            typed_match("key d dorian", &typed).map(|t| t.name),
+            Some("key")
+        );
+        assert_eq!(typed_match("KEY d", &typed).map(|t| t.name), Some("key"));
+        assert_eq!(
+            typed_match("quantize-key", &typed).map(|t| t.name),
+            Some("quantize-key")
+        );
+        // A prefix is not a name, and fuzzy matching never applies.
+        assert_eq!(typed_match("ke d dorian", &typed), None);
+        assert_eq!(typed_match("keys d", &typed), None);
+        assert_eq!(typed_match("", &typed), None);
     }
 
     #[test]

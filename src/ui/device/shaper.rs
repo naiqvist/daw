@@ -120,18 +120,23 @@ impl Default for Shaper {
 
 /// A triangle fold: identity inside the rails, reflected outside.
 ///
-/// `(2/π)·asin(sin(πx/2))` is the exact triangle wave of period 4 that
-/// passes through the origin with slope 1 — so it needs no branches and
-/// no floor, and it cannot disagree with itself at the seams the way a
-/// hand-rolled reflection does.
+/// The triangle wave of period 4 through the origin with slope 1, in
+/// closed form — no branches, no seams to disagree at, and no
+/// transcendentals. This used to be spelled `(2/π)·asin(sin(πx/2))`,
+/// which is the same curve on paper; in f32 it drifted 1.5e-4 near the
+/// peaks, because `asin` stands vertical at ±1. The kernel changed for
+/// that reason (a −76 dB floor on the fold peaks) and this followed it,
+/// which is what `the_kernel_agrees_with_what_the_ui_draws` is for —
+/// it caught this copy the moment the other one moved.
 ///
-/// The clamp is not decoration: `sin` can return 1.0000001, and `asin` of
-/// that is NaN. A NaN here becomes a NaN point, which egui draws as
-/// nothing at all — a curve that silently vanishes.
+/// The old spelling also needed a clamp to stay out of NaN, since `sin`
+/// can return 1.0000001 and `asin` of that is not a number — and a NaN
+/// point is drawn by egui as nothing at all, a curve that silently
+/// vanishes. This form has no such edge.
 fn triangle_fold(x: f32) -> f32 {
-    use std::f32::consts::PI;
-    let s = (x * PI * 0.5).sin().clamp(-1.0, 1.0);
-    (2.0 / PI) * s.asin()
+    let m = (x + 1.0) * 0.25;
+    let t = (m - m.floor()) * 4.0;
+    1.0 - (t - 2.0).abs()
 }
 
 impl Shaper {
@@ -730,8 +735,10 @@ mod tests {
             assert!(y.is_finite(), "{x} gave {y}");
             assert!((VIEW_MIN..=VIEW_MAX).contains(&y));
         }
-        // The fold's `asin(sin(x))` is the specific place a NaN could get
-        // in: `sin` can return a hair over 1.0.
+        // The fold is where a non-finite point could still get in: it
+        // takes a `floor` of a scaled input, so a wild x is the case to
+        // hold it to. (It used to be `asin(sin(x))`, where `sin`
+        // returning a hair over 1.0 made the asin NaN outright.)
         for x in [1.0f32, 2.0, 3.0, 1e7, -1e7] {
             assert!(triangle_fold(x).is_finite(), "fold at {x}");
         }

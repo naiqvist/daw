@@ -14,15 +14,20 @@ pub mod acid;
 pub mod bounce;
 pub mod clamp;
 pub mod eq;
+pub mod ferric;
 pub mod filter;
+pub mod flint;
 pub mod gate;
+pub mod gauge;
 pub mod glue;
 pub mod graph;
 pub mod handclap;
 pub mod hat;
 pub mod haze;
 pub mod kick;
+pub mod lens;
 pub mod limiter;
+pub mod loom;
 pub mod material;
 pub mod modulation;
 pub mod modulato;
@@ -32,17 +37,22 @@ pub mod prism;
 pub mod project;
 pub mod resyn;
 pub mod sampler;
+pub mod sibyl;
+pub mod sigil;
 pub mod snare;
 pub mod strip;
+pub mod tine;
 pub mod tom;
+pub mod tone;
 pub mod transport;
+pub mod umbra;
 pub mod utility;
 
 use assert_no_alloc::assert_no_alloc;
 use rtaudio::{
     Api, Buffers, DeviceParams, SampleFormat, StreamConfig, StreamFlags, StreamHandle, StreamStatus,
 };
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::audio::graph::{NodeId, ParamChange, ProcessCtx, Schedule};
@@ -267,6 +277,170 @@ pub enum EngineError {
     InterleavedNotSupported,
 }
 
+/// Green-built, sample-rate-matched audio for the callback's one-shot
+/// audition voice. Samples are planar, matching [`material::Material`];
+/// playback reads at most the first two channels, so work per output frame is
+/// constant even for unusual files.
+pub struct AuditionBuffer {
+    samples: Arc<Vec<f32>>,
+    channels: usize,
+    frames: usize,
+}
+
+impl AuditionBuffer {
+    pub fn from_material(material: material::Material) -> Self {
+        Self {
+            samples: material.samples,
+            channels: material.channels,
+            frames: usize::try_from(material.frames).unwrap_or(0),
+        }
+    }
+
+    fn frames(&self) -> usize {
+        self.frames
+    }
+}
+
+enum AuditionCommand {
+    Play(basedrop::Owned<AuditionBuffer>),
+    Stop,
+}
+
+struct AuditionVoice {
+    current: Option<basedrop::Owned<AuditionBuffer>>,
+    pending: Option<basedrop::Owned<AuditionBuffer>>,
+    position: usize,
+    fade_frames: usize,
+    stop_remaining: Option<usize>,
+}
+
+const AUDITION_GAIN: f32 = 0.25;
+const AUDITION_FADE_MS: usize = 5;
+
+impl AuditionVoice {
+    fn new(sample_rate: u32) -> Self {
+        Self {
+            current: None,
+            pending: None,
+            position: 0,
+            fade_frames: (sample_rate as usize * AUDITION_FADE_MS / 1_000).max(1),
+            stop_remaining: None,
+        }
+    }
+
+    fn apply(&mut self, command: AuditionCommand) {
+        match command {
+            AuditionCommand::Play(buffer) if self.current.is_none() => self.start(buffer),
+            AuditionCommand::Play(buffer) => {
+                self.pending = Some(buffer);
+                self.begin_stop();
+            }
+            AuditionCommand::Stop => {
+                self.pending = None;
+                self.begin_stop();
+            }
+        }
+    }
+
+    fn start(&mut self, buffer: basedrop::Owned<AuditionBuffer>) {
+        self.current = Some(buffer);
+        self.position = 0;
+        self.stop_remaining = None;
+    }
+
+    fn begin_stop(&mut self) {
+        if self.stop_remaining.is_some() {
+            return;
+        }
+        let Some(current) = self.current.as_ref() else {
+            return;
+        };
+        let left = current.frames().saturating_sub(self.position);
+        self.stop_remaining = Some(self.fade_frames.min(left).max(1));
+    }
+
+    fn finish_current(&mut self) {
+        // Dropping a basedrop::Owned only appends to its collector's lock-free
+        // queue. The allocation itself is reclaimed by Engine::collect_trash
+        // on the green thread.
+        self.current = None;
+        self.stop_remaining = None;
+        if let Some(next) = self.pending.take() {
+            self.start(next);
+        }
+    }
+
+    fn mix(&mut self, output: &mut [f32], out_channels: usize, frames: usize) {
+        if out_channels == 0 {
+            return;
+        }
+        for frame in 0..frames {
+            let Some(current) = self.current.as_ref() else {
+                break;
+            };
+            let total = current.frames();
+            if self.position >= total {
+                self.finish_current();
+                continue;
+            }
+            let (left, right) = audition_frame(current, self.position);
+            let gain = AUDITION_GAIN
+                * audition_envelope(self.position, total, self.fade_frames, self.stop_remaining);
+            if out_channels == 1 {
+                if let Some(sample) = output.get_mut(frame) {
+                    *sample += (left + right) * 0.5 * gain;
+                }
+            } else {
+                if let Some(sample) = output.get_mut(frame) {
+                    *sample += left * gain;
+                }
+                if let Some(sample) = output.get_mut(frames + frame) {
+                    *sample += right * gain;
+                }
+            }
+            self.position = self.position.saturating_add(1);
+            let stopping = self.stop_remaining.map(|left| left.saturating_sub(1));
+            self.stop_remaining = stopping;
+            if self.position >= total || stopping == Some(0) {
+                self.finish_current();
+            }
+        }
+    }
+}
+
+fn audition_frame(buffer: &AuditionBuffer, position: usize) -> (f32, f32) {
+    let left = buffer.samples.get(position).copied().unwrap_or(0.0);
+    let right = if buffer.channels > 1 {
+        buffer
+            .frames
+            .checked_add(position)
+            .and_then(|index| buffer.samples.get(index))
+            .copied()
+            .unwrap_or(left)
+    } else {
+        left
+    };
+    (left, right)
+}
+
+/// A click-free one-shot envelope. Both the first and final audible frames
+/// reach exact zero; an explicit stop uses the same exact-zero tail.
+fn audition_envelope(
+    position: usize,
+    total: usize,
+    fade_frames: usize,
+    stop_remaining: Option<usize>,
+) -> f32 {
+    let fade = fade_frames.max(1) as f32;
+    let fade_in = position.min(fade_frames) as f32 / fade;
+    let natural_left = total.saturating_sub(position.saturating_add(1));
+    let fade_out = natural_left.min(fade_frames) as f32 / fade;
+    let stop = stop_remaining.map_or(1.0, |left| {
+        left.saturating_sub(1).min(fade_frames) as f32 / fade
+    });
+    fade_in.min(fade_out).min(stop)
+}
+
 /// How many leading samples of channel 0 each block reports to the UI.
 pub const SNAPSHOT_SAMPLES: usize = 8;
 
@@ -396,7 +570,7 @@ pub struct StreamInfoSnapshot {
 
 /// Owns the running audio stream. Dropping this stops it.
 pub struct Engine {
-    _stream: StreamHandle,
+    _stream: Option<StreamHandle>,
     info: StreamInfoSnapshot,
     telemetry: triple_buffer::Output<BlockSnapshot>,
     /// Heartbeat state for health(): last block number seen, and when it
@@ -413,6 +587,11 @@ pub struct Engine {
     /// Transport commands: one ring, so a stop+seek+play gesture is atomic
     /// by ring order.
     transport_tx: rtrb::Producer<TransportCmd>,
+    /// Latest-wins audition commands. The optional producer is taken before
+    /// stream teardown so every queued basedrop allocation can be collected.
+    audition_tx: Option<rtrb::Producer<AuditionCommand>>,
+    audition_retry: Option<AuditionCommand>,
+    audition_collector: Option<basedrop::Collector>,
     /// Retired schedules come back here so they are dropped on THIS thread,
     /// never freed inside the callback.
     trash_rx: rtrb::Consumer<Box<Schedule>>,
@@ -524,6 +703,9 @@ impl Engine {
         // fewer wires than parameters, so 128 is generous.
         let (mod_tx, mut mod_rx) = rtrb::RingBuffer::<modulation::ModEdit>::new(128);
         let (transport_tx, mut transport_rx) = rtrb::RingBuffer::<TransportCmd>::new(64);
+        let (audition_tx, mut audition_rx) = rtrb::RingBuffer::<AuditionCommand>::new(8);
+        let audition_collector = basedrop::Collector::new();
+        let mut audition_voice = AuditionVoice::new(cfg.sample_rate);
         let mut transport = Transport::new(cfg.sample_rate as f64);
         let (mut trash_tx, trash_rx) = rtrb::RingBuffer::<Box<Schedule>>::new(4);
         let mut schedule: Option<Box<Schedule>> = None;
@@ -639,6 +821,15 @@ impl Engine {
                     while let Ok(cmd) = transport_rx.pop() {
                         transport.apply(cmd);
                     }
+                    // At most eight commands: the ring's fixed capacity is
+                    // the bound. Replaced buffers retire through basedrop;
+                    // no allocation is freed on this thread.
+                    for _ in 0..8 {
+                        let Ok(command) = audition_rx.pop() else {
+                            break;
+                        };
+                        audition_voice.apply(command);
+                    }
 
                     let frames = output.len() / out_channels;
                     let in_channels = input.len().checked_div(frames).unwrap_or(0);
@@ -709,6 +900,11 @@ impl Engine {
                                 output[start..start + (frames - done)].fill(0.0);
                             }
                         }
+                        // Outside the compiled schedule by design: an archive
+                        // audition never recompiles the song. One bounded pass
+                        // over this block, two source reads and at most two
+                        // output writes per frame.
+                        audition_voice.mix(output, out_channels, frames);
                     }
                     // The mic is deliberately NOT routed to the output — that
                     // would be a feedback loop. Input is only metered below,
@@ -822,13 +1018,16 @@ impl Engine {
             .map_err(|e| EngineError::StartStream(e.to_string()))?;
 
         Ok(Self {
-            _stream: stream,
+            _stream: Some(stream),
             info,
             telemetry,
             schedule_tx,
             param_tx,
             mod_tx,
             transport_tx,
+            audition_tx: Some(audition_tx),
+            audition_retry: None,
+            audition_collector: Some(audition_collector),
             trash_rx,
             capture_rx: Some(capture_rx),
             capturing,
@@ -919,7 +1118,43 @@ impl Engine {
 
     /// Drop any schedules the callback has retired. Cheap; call at UI rate.
     pub fn collect_trash(&mut self) {
+        self.flush_audition_command();
+        if let Some(collector) = &mut self.audition_collector {
+            collector.collect();
+        }
         while self.trash_rx.pop().is_ok() {}
+    }
+
+    /// Start a fixed-gain one-shot outside the compiled schedule. Allocation
+    /// happens here; dropping or replacing it in the callback only queues it
+    /// back to this thread through basedrop.
+    pub fn audition(&mut self, buffer: AuditionBuffer) {
+        let Some(collector) = self.audition_collector.as_ref() else {
+            return;
+        };
+        let owned = basedrop::Owned::new(&collector.handle(), buffer);
+        self.audition_retry = Some(AuditionCommand::Play(owned));
+        self.flush_audition_command();
+    }
+
+    /// Ask the callback for a declicked stop. Latest command wins while the
+    /// fixed ring is full, so a stop cannot disappear behind cursor traffic.
+    pub fn stop_audition(&mut self) {
+        self.audition_retry = Some(AuditionCommand::Stop);
+        self.flush_audition_command();
+    }
+
+    fn flush_audition_command(&mut self) {
+        let Some(command) = self.audition_retry.take() else {
+            return;
+        };
+        let Some(tx) = self.audition_tx.as_mut() else {
+            self.audition_retry = Some(command);
+            return;
+        };
+        if let Err(rtrb::PushError::Full(command)) = tx.push(command) {
+            self.audition_retry = Some(command);
+        }
     }
 
     /// Send one transport command. Ring order makes multi-command gestures
@@ -945,6 +1180,21 @@ impl Engine {
     /// these carry whole state, so the next one supersedes this one.
     pub fn set_modulation(&mut self, edit: modulation::ModEdit) {
         let _ = self.mod_tx.push(edit);
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        // Stop the callback first, then drop both ends of its audition ring;
+        // every Owned queued or held there can now reach the collector before
+        // the collector itself leaves this green thread.
+        drop(self._stream.take());
+        drop(self.audition_tx.take());
+        self.audition_retry = None;
+        if let Some(mut collector) = self.audition_collector.take() {
+            collector.collect();
+            let _ = collector.try_cleanup();
+        }
     }
 }
 
@@ -975,5 +1225,69 @@ mod device_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod audition_tests {
+    use super::*;
+
+    fn buffer(samples: &[f32], channels: usize, frames: usize) -> AuditionBuffer {
+        AuditionBuffer {
+            samples: Arc::new(samples.to_vec()),
+            channels,
+            frames,
+        }
+    }
+
+    #[test]
+    fn mono_and_stereo_frames_reach_the_expected_outputs() {
+        let mono = buffer(&[0.25, -0.5], 1, 2);
+        assert_eq!(audition_frame(&mono, 0), (0.25, 0.25));
+        assert_eq!(audition_frame(&mono, 1), (-0.5, -0.5));
+
+        let stereo = buffer(&[0.25, 0.5, -0.25, -0.5], 2, 2);
+        assert_eq!(audition_frame(&stereo, 0), (0.25, -0.25));
+        assert_eq!(audition_frame(&stereo, 1), (0.5, -0.5));
+    }
+
+    #[test]
+    fn every_declick_tail_reaches_exact_zero() {
+        assert_eq!(audition_envelope(0, 32, 4, None), 0.0);
+        assert_eq!(audition_envelope(31, 32, 4, None), 0.0);
+        assert_eq!(audition_envelope(12, 32, 4, Some(1)), 0.0);
+        assert_eq!(audition_envelope(4, 32, 4, None), 1.0);
+    }
+
+    #[test]
+    fn an_owned_buffer_crosses_the_command_ring_and_collects_green_side() {
+        let mut collector = basedrop::Collector::new();
+        let owned = basedrop::Owned::new(&collector.handle(), buffer(&[1.0], 1, 1));
+        let (mut tx, mut rx) = rtrb::RingBuffer::new(1);
+        assert!(tx.push(AuditionCommand::Play(owned)).is_ok());
+        let command = rx.pop().ok();
+        assert!(matches!(command, Some(AuditionCommand::Play(_))));
+        drop(command);
+        collector.collect();
+        assert_eq!(collector.alloc_count(), 0);
+        assert!(collector.try_cleanup().is_ok());
+    }
+
+    #[test]
+    fn callback_side_command_and_mix_work_do_not_allocate() {
+        let mut collector = basedrop::Collector::new();
+        let owned = basedrop::Owned::new(&collector.handle(), buffer(&[1.0; 64], 2, 32));
+        let mut voice = AuditionVoice::new(48_000);
+        let mut output = [0.0; 64];
+        assert_no_alloc::assert_no_alloc(|| {
+            voice.apply(AuditionCommand::Play(owned));
+            voice.mix(&mut output, 2, 16);
+            voice.apply(AuditionCommand::Stop);
+            voice.mix(&mut output, 2, 16);
+        });
+        drop(voice);
+        collector.collect();
+        assert_eq!(collector.alloc_count(), 0);
+        assert!(collector.try_cleanup().is_ok());
     }
 }

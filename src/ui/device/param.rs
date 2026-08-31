@@ -92,6 +92,8 @@ pub enum Unit {
     Ms,
     Seconds,
     Semitones,
+    /// Pitch in cents: ±50 on the clip's detune knob.
+    Cents,
     /// A multiplication factor: `x4.0`. The unit a drive control wants —
     /// a saturator's drive is input gain into a curve, and "four times
     /// in" is what the shape it draws actually shows. dB would be equally
@@ -124,6 +126,7 @@ impl Unit {
             Self::Ms => format!("{v:.1} ms"),
             Self::Seconds => format!("{v:.2} s"),
             Self::Semitones => format!("{v:+.0} st"),
+            Self::Cents => format!("{v:+.0} ct"),
             // TRAILING, like every other unit here — and not merely for
             // consistency: a field seeds its editor with this exact
             // string, and a leading "x" is not a number, so "x4.0" would

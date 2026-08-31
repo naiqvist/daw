@@ -145,6 +145,7 @@ fn scale_for(unit: Unit, suffix: &str) -> Option<f32> {
         Unit::Note => None,
         Unit::Percent => matches!(suffix, "%" | "pct").then_some(1.0),
         Unit::Semitones => matches!(suffix, "st" | "semi" | "semitones").then_some(1.0),
+        Unit::Cents => matches!(suffix, "ct" | "cents").then_some(1.0),
         // "4x" and a bare "4" mean the same factor.
         Unit::Ratio => matches!(suffix, "x").then_some(1.0),
         Unit::Plain | Unit::Choice(_) => None,

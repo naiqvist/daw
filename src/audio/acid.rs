@@ -349,9 +349,12 @@ impl AcidVoice {
         // per-CHUNK terms except the amp, which is per sample.
         let per_chunk = CHUNK as f32 / sr;
         let decay = (-per_chunk / (self.params.decay_ms * 1e-3).max(1e-6)).exp();
-        let glide = 1.0 - (-per_chunk / (self.params.glide_ms * 1e-3).max(1e-6)).exp();
-        let amp_up = 1.0 - (-1.0 / (p::AMP_ATTACK_MS * 1e-3 * sr).max(1.0)).exp();
-        let amp_down = 1.0 - (-1.0 / (p::AMP_RELEASE_MS * 1e-3 * sr).max(1.0)).exp();
+        let glide =
+            crate::dsp::ramps::one_pole_coeff(per_chunk / (self.params.glide_ms * 1e-3).max(1e-6));
+        let amp_up =
+            crate::dsp::ramps::one_pole_coeff(1.0 / (p::AMP_ATTACK_MS * 1e-3 * sr).max(1.0));
+        let amp_down =
+            crate::dsp::ramps::one_pole_coeff(1.0 / (p::AMP_RELEASE_MS * 1e-3 * sr).max(1.0));
 
         // The waveform, if a letter changed it. `prepare` on the osc is
         // green-zone work in the docs' sense — it sets a table pointer

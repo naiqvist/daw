@@ -171,6 +171,16 @@ impl History {
         self.ring.get(last).copied().unwrap_or_default()
     }
 
+    /// Every reading held, OLDEST FIRST — the order a trace is drawn in.
+    ///
+    /// The ring is private because pushing into it has an order that
+    /// matters; reading it does not, and a meter that wants to draw the
+    /// last few seconds should not have to keep a second copy of what
+    /// this already has.
+    pub fn oldest_first(&self) -> impl Iterator<Item = Reading> + '_ {
+        (0..HISTORY).filter_map(move |i| self.ring.get((self.head + i) % HISTORY).copied())
+    }
+
     /// The most reduction held since [`History::clear_peak`].
     pub fn peak_db(&self) -> f32 {
         self.peak_db

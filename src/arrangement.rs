@@ -1307,6 +1307,10 @@ pub(crate) struct ArrangementOutcome {
     pub(crate) open_clip_editor: bool,
     /// A fade handle on a timeline clip was dragged: (clip id, the edit).
     pub(crate) clip_fade: Option<(u64, waveform::ClipEdit)>,
+    pub(crate) bounce_in_place: bool,
+    /// The clip the ring is on: `(track, clip id)`. Fresh every frame the
+    /// timeline draws; the app stores it for the palette's focus commands.
+    pub(crate) focused_clip: Option<(usize, u64)>,
 }
 
 // The timeline composes independent UI services at the panel boundary.
@@ -1530,7 +1534,7 @@ pub(crate) fn arrangement_body(
     }
 
     let grab = ui.style().interaction.resize_grab_radius_side;
-    let mut resize: Option<(usize, f32)> = None;
+    let mut resize: Option<(usize, f32, bool)> = None;
     // The anchor lane, the lane the pointer is over now, and the span:
     // a band is a RECTANGLE of tracks and time, so the drag reports both
     // axes and the anchor is what the second one is measured from.
@@ -1685,7 +1689,10 @@ pub(crate) fn arrangement_body(
             .interact(seam, wid.with("seam"), egui::Sense::drag())
             .affords(Affords::SeamY);
         if response.dragged() {
-            resize = Some((i, arr.tracks[i].height + response.drag_delta().y));
+            // Alt: one seam resizes EVERY lane — Ableton's gesture for
+            // "make the whole arrangement this height".
+            let all = ui.input(|i| i.modifiers.alt);
+            resize = Some((i, arr.tracks[i].height + response.drag_delta().y, all));
         }
         if response.hovered() || response.dragged() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
@@ -1806,8 +1813,15 @@ pub(crate) fn arrangement_body(
         arr.select_track(i);
         arr.selection = Some(span(cursor_beat, cursor_beat, grid));
     }
-    if let Some((i, height)) = resize {
-        arr.tracks[i].height = height.clamp(*TRACK_H_RANGE.start(), *TRACK_H_RANGE.end());
+    if let Some((i, height, all)) = resize {
+        let height = height.clamp(*TRACK_H_RANGE.start(), *TRACK_H_RANGE.end());
+        if all {
+            for track in &mut arr.tracks {
+                track.height = height;
+            }
+        } else {
+            arr.tracks[i].height = height;
+        }
     }
 
     // Creation: double-click and the menu both land here, one bar long, at
@@ -1855,6 +1869,7 @@ pub(crate) fn arrangement_body(
     locators_pass(ui, theme, ruler, content, arr, grid);
     let clips = clips_pass(
         ui,
+        focus,
         theme,
         content,
         arr,
@@ -1921,6 +1936,8 @@ pub(crate) fn arrangement_body(
         automation_hovered,
         open_clip_editor: clips.open_editor,
         clip_fade: clips.fade,
+        bounce_in_place: clips.bounce_in_place,
+        focused_clip: clips.focused_clip,
     }
 }
 
@@ -2180,6 +2197,10 @@ pub(crate) fn drop_preview(
         len,
         notes: Vec::new(),
         audio: drag.header.map(|(sample_rate, source_frames)| AudioSource {
+            transpose: 0.0,
+            detune: 0.0,
+            transposed_from: None,
+            applied_ratio: 1.0,
             path: drag.path.clone(),
             sample_rate,
             source_offset: 0,
@@ -2302,6 +2323,12 @@ pub(crate) struct ClipsOutcome {
     /// because a fade rides a LETTER to the clip's node — and letters are
     /// the app's to send, the same as the editor's own fade drag.
     pub(crate) fade: Option<(u64, waveform::ClipEdit)>,
+    /// A context-menu request to print the clip's whole lane through its
+    /// devices. The app owns the worker, so the view only carries intent.
+    pub(crate) bounce_in_place: bool,
+    /// The clip the RING is on — `(track, clip id)`, not the selection.
+    /// The palette's focus commands target it.
+    pub(crate) focused_clip: Option<(usize, u64)>,
 }
 
 /// What the clip context menu asked for.
@@ -2310,6 +2337,7 @@ pub(crate) enum ClipMenu {
     Copy,
     Duplicate,
     Rename,
+    BounceInPlace,
     Delete,
 }
 
@@ -2325,6 +2353,7 @@ pub(crate) enum ClipMenu {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn clips_pass(
     ui: &mut egui::Ui,
+    focus: &mut Focus,
     theme: &Theme,
     content: egui::Rect,
     arr: &mut Arrangement,
@@ -2356,6 +2385,9 @@ pub(crate) fn clips_pass(
     let mut rename_cancel = false;
     let mut open_editor = false;
     let mut fade: Option<(u64, waveform::ClipEdit)> = None;
+    let mut bounce_in_place = false;
+    // The clip the ring is ON — focus commands' target.
+    let mut focused_clip: Option<(usize, u64)> = None;
     // WHERE THE INSERT MARKER GOES when a clip is clicked.
     //
     // Empty lane ground has always moved it — "the press IS the insert
@@ -2390,6 +2422,15 @@ pub(crate) fn clips_pass(
             }
             let selected = arr.clip_is_selected(t, i);
             let body_id = ui.id().with(("clip", clip.id));
+            // The ring can land on a clip. It does NOT select it — the
+            // ring says where the keyboard is, not what the mouse chose
+            // (see the session's slots, same rule). Enter is the click.
+            if focus.register(body_id, rect) {
+                focused_clip = Some((t, clip.id));
+            }
+            if focus.activated(body_id) {
+                select = Some((t, clip.id, false, false));
+            }
 
             // Interact BEFORE painting: the strips, created after the body,
             // sit above it in hit-test order, and the paint lands on top of
@@ -2397,6 +2438,12 @@ pub(crate) fn clips_pass(
             let body = ui
                 .interact(rect, body_id, egui::Sense::click_and_drag())
                 .affords(Affords::Carry);
+            if let Some(audio) = &clip.audio {
+                body.dnd_set_drag_payload(SampleDrag {
+                    path: audio.path.clone(),
+                    origin: SampleDragOrigin::Clip,
+                });
+            }
             let command = ui.input(|i| i.modifiers.command);
             let shift = ui.input(|i| i.modifiers.shift);
             if body.drag_started() {
@@ -2429,12 +2476,17 @@ pub(crate) fn clips_pass(
                     clip: clip.clone(),
                     grab,
                     copy: command,
+                    fine: ui.input(|i| i.modifiers.alt),
                     from_start: clip.start,
                     followers,
                 });
-                if !selected {
-                    select = Some((t, clip.id, false, false));
-                }
+                // Deliberately NOT selected here, although a click is:
+                // selection is what the rack follows, so selecting at drag
+                // start would switch the bottom region to this clip's track
+                // mid-drag — and a drag aimed at a device on ANOTHER track
+                // (a sampler waiting for a file drop, say) would lose its
+                // target before it got there. The landing re-selects; a
+                // cancelled drag changes nothing at all.
             }
             if body.clicked() {
                 select = Some((t, clip.id, command, shift));
@@ -2463,7 +2515,11 @@ pub(crate) fn clips_pass(
                 // grip point stays under the finger, and snapping cannot
                 // eat the motion a frame at a time.
                 let want = beat_at(content, offset, pixels_per_beat, pos.x) - g.grab;
-                g.clip.start = snap(want, grid);
+                g.clip.start = if g.fine {
+                    want.max(0.0)
+                } else {
+                    snap(want, grid)
+                };
                 // Cross-lane: the ghost follows the pointer onto any lane
                 // whose kind can hold the clip, and keeps its last lane
                 // while the pointer is over one that cannot.
@@ -2480,8 +2536,15 @@ pub(crate) fn clips_pass(
                 // is, like any other new clip. Deferred to the apply
                 // section — the draw loop still holds `arr.clips` borrowed.
                 let active = ghost.as_ref().is_some_and(|g| g.clip.id == clip.id);
-                if active {
+                let released_inside = body
+                    .interact_pointer_pos()
+                    .is_some_and(|position| content.contains(position));
+                if active && (clip.audio.is_none() || released_inside) {
                     ghost_finalize = ghost.take().map(|g| (g, t));
+                } else if active {
+                    // A release over the rack is a file drop, not a clip
+                    // move. Discarding the proposal leaves the source put.
+                    ghost = None;
                 }
             }
             if body.dragged() {
@@ -2501,6 +2564,10 @@ pub(crate) fn clips_pass(
                 }
                 if ui.button("Rename").clicked() {
                     menu.set(Some((t, clip.id, ClipMenu::Rename)));
+                    ui.close();
+                }
+                if ui.button("Bounce Track in Place").clicked() {
+                    menu.set(Some((t, clip.id, ClipMenu::BounceInPlace)));
                     ui.close();
                 }
                 if ui.button("Delete").clicked() {
@@ -3069,6 +3136,12 @@ pub(crate) fn clips_pass(
                     });
                 }
             }
+            ClipMenu::BounceInPlace => {
+                if let Some(i) = index_of(&arr.clips[t], id) {
+                    arr.select_only_clip(t, i);
+                    bounce_in_place = true;
+                }
+            }
             ClipMenu::Delete => {
                 if let Some(i) = index_of(&arr.clips[t], id) {
                     if arr.clip_is_selected(t, i) {
@@ -3126,7 +3199,14 @@ pub(crate) fn clips_pass(
         && let Some(i) = index_of(&arr.clips[t], id)
     {
         let old_start = arr.clips[t][i].start;
-        let mut want = snap(want, grid);
+        // Alt: the fine trim — the edge lands where the pointer is, not
+        // where the grid would have it. Ableton's fine drag.
+        let fine = ui.input(|i| i.modifiers.alt);
+        let mut want = if fine {
+            want.max(0.0)
+        } else {
+            snap(want, grid)
+        };
         if let Some(audio) = &arr.clips[t][i].audio {
             let available_beats =
                 audio.source_offset as f64 / f64::from(audio.sample_rate) * bpm.max(1.0) / 60.0;
@@ -3151,7 +3231,12 @@ pub(crate) fn clips_pass(
         // grid should still be draggable to a grid line, and snapping
         // its length instead would carry the offset into every edge it
         // ever has.
-        let mut len = drag_len(want, arr.clips[t][i].start, grid);
+        let fine = ui.input(|i| i.modifiers.alt);
+        let mut len = if fine {
+            (want - arr.clips[t][i].start).max(0.0)
+        } else {
+            drag_len(want, arr.clips[t][i].start, grid)
+        };
         if let Some(audio) = &arr.clips[t][i].audio
             && !audio.looped
         {
@@ -3170,7 +3255,12 @@ pub(crate) fn clips_pass(
         arr.land_ghost(g, src);
     }
     arr.ghost = ghost;
-    ClipsOutcome { open_editor, fade }
+    ClipsOutcome {
+        open_editor,
+        fade,
+        bounce_in_place,
+        focused_clip,
+    }
 }
 
 /// The locators: flags in the ruler. Click a flag to jump the playhead to

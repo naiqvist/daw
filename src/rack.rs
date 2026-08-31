@@ -1057,6 +1057,15 @@ pub(crate) fn draw_device_card(
             }
             made
         }
+        DeviceState::Loom(params) => {
+            let mut knobs = loom_knobs(params, instance.page);
+            let made = device::loom_card(ui, theme, &mut knobs);
+            let page = knobs.packed_view();
+            if page != instance.page {
+                edits.pages.push((instance.id, page));
+            }
+            made
+        }
         DeviceState::Sat(params) => {
             let mut knobs = sat_knobs(params);
             device::sat_card(ui, theme, &mut knobs)
@@ -1114,6 +1123,96 @@ pub(crate) fn draw_device_card(
             let mut knobs = glue_knobs(params);
             let history = histories.get(&instance.id).cloned().unwrap_or_default();
             device::glue_card(ui, theme, &mut knobs, &history)
+        }
+        DeviceState::Tine(params) => {
+            let mut knobs = tine_knobs(params);
+            let voices = histories
+                .get(&instance.id)
+                .map(|h| h.latest().bands[0])
+                .unwrap_or(0.0);
+            device::tine::tine_card(ui, theme, &mut knobs, voices)
+        }
+        DeviceState::Tone(params) => {
+            let mut knobs = tone_knobs(params);
+            device::tone::tone_card(ui, theme, &mut knobs)
+        }
+        DeviceState::Sigil(params) => {
+            let mut knobs = sigil_knobs(params);
+            device::sigil::sigil_card(ui, theme, &mut knobs)
+        }
+        DeviceState::Gauge(params) => {
+            let mut knobs = gauge_knobs(params);
+            // Peak and RMS ride the two fields the readout already has;
+            // the correlation rides the first band.
+            let said = histories
+                .get(&instance.id)
+                .map(|h| h.latest())
+                .unwrap_or_default();
+            let history = histories.get(&instance.id).cloned().unwrap_or_default();
+            device::gauge::gauge_card(
+                ui,
+                theme,
+                &mut knobs,
+                device::gauge::Reading {
+                    peak_db: said.level_db,
+                    rms_db: said.reduction_db,
+                    correlation: said.bands[0],
+                },
+                &history,
+            )
+        }
+        DeviceState::Umbra(params) => {
+            let mut knobs = umbra_knobs(params);
+            // The SMOOTHED depth, not the knob: the chain runs on it, and
+            // the figure should show what is sounding.
+            let depth = histories
+                .get(&instance.id)
+                .map(|h| h.latest().bands[0])
+                .unwrap_or(0.0);
+            device::umbra::umbra_card(ui, theme, &mut knobs, depth)
+        }
+        DeviceState::Ferric(params) => {
+            let mut knobs = ferric_knobs(params);
+            // Which grid step the head is on, and how far back it was
+            // placed — the two numbers the transport diagram draws.
+            let said = histories
+                .get(&instance.id)
+                .map(|h| h.latest())
+                .unwrap_or_default();
+            device::ferric::ferric_card(
+                ui,
+                theme,
+                &mut knobs,
+                device::ferric::Transport {
+                    step: said.bands[0],
+                    reach: said.bands[1],
+                    record_db: said.level_db,
+                    div_ms: said.bands[2],
+                },
+            )
+        }
+        DeviceState::Sibyl(params) => {
+            let mut knobs = sibyl_knobs(params);
+            // The note the engine is following. `bands[0]` is negative
+            // when it has lost the pitch, which the card must draw as a
+            // wheel with its spokes out rather than a stale answer.
+            let midi = histories
+                .get(&instance.id)
+                .map(|h| h.latest().bands[0])
+                .unwrap_or(-1.0);
+            let heard = (midi >= 0.0).then_some(midi);
+            device::sibyl::sibyl_card(ui, theme, &mut knobs, heard)
+        }
+        DeviceState::Flint(params) => {
+            let mut knobs = flint_knobs(params);
+            // The live strike weight rides on the plot: the picture is
+            // what the detector WOULD do to a reference hit, and this is
+            // what it is doing to the real one.
+            let weight = histories
+                .get(&instance.id)
+                .map(|h| h.latest().bands[0])
+                .unwrap_or(0.0);
+            device::flint::flint_card(ui, theme, &mut knobs, weight)
         }
         DeviceState::Clamp(params) => {
             let mut knobs = clamp_knobs(params);

@@ -66,6 +66,33 @@ fn prob_default() -> f32 {
     1.0
 }
 
+/// Swing one pattern: every ODD step of `grid` shifts toward the next
+/// even step by `swing * grid / 2`. Zero is straight; one parks the
+/// off-step three quarters of the way to the next step — the classic
+/// maximum. Beats and coarser do not swing: delaying whole beats is not
+/// a feel, it is a different song.
+///
+/// Only notes exactly ON the grid swing — a note placed between the
+/// lines was put there on purpose. Pure and deterministic, so a bounce
+/// reproduces the swung take bit for bit.
+pub fn swing_note_starts(notes: &mut [Note], grid: f64, swing: f32) {
+    if grid <= 0.0 || grid >= 1.0 || swing <= 0.0 || notes.is_empty() {
+        return;
+    }
+    let amount = f64::from(swing.clamp(0.0, 1.0)) * grid * 0.5;
+    let tolerance = grid * 1e-4;
+    for note in notes {
+        let step = (note.start_beats / grid).round();
+        if (note.start_beats - step * grid).abs() > tolerance {
+            continue;
+        }
+        let on = step as i64;
+        if on > 0 && on.rem_euclid(2) != 0 {
+            note.start_beats += amount;
+        }
+    }
+}
+
 /// A region of a pattern that plays several times before the rest continues.
 /// Musical time, like everything stored. Subloops are COMPILE-TIME: they
 /// unroll into a plain linear note list, so the red zone never knows they
@@ -773,6 +800,29 @@ impl Voices for crate::audio::poly::PolyVoices {
     }
 }
 
+/// The wavetable synth as an instrument the pattern clock can play.
+/// The same shape `PolyVoices` has, one instrument along.
+impl Voices for crate::audio::loom::LoomVoices {
+    fn all_sound_off(&mut self) {
+        crate::audio::loom::LoomVoices::all_sound_off(self);
+    }
+    fn release_all(&mut self) {
+        crate::audio::loom::LoomVoices::release_all(self);
+    }
+    fn note_off(&mut self, pitch: u8) {
+        crate::audio::loom::LoomVoices::note_off(self, pitch);
+    }
+    fn note_on(&mut self, pitch: u8, vel: u8, age: u64) {
+        crate::audio::loom::LoomVoices::note_on(self, pitch, vel, age);
+    }
+    fn plock(&mut self, param: u32, value: Option<f32>) {
+        crate::audio::loom::LoomVoices::plock(self, param, value);
+    }
+    fn render(&mut self, out: &mut [f32], at: usize, gain: &mut Ramp) {
+        crate::audio::loom::LoomVoices::render(self, out, at, gain);
+    }
+}
+
 /// The sampler as an instrument the pattern clock can play.
 ///
 /// Unlike the one-shot drums, half of this is NOT empty: a sampler in
@@ -780,6 +830,28 @@ impl Voices for crate::audio::poly::PolyVoices {
 /// slice modes ignore note-off, and they do it INSIDE the bank rather
 /// than here, because which of the three you are in is a parameter the
 /// bank owns.
+/// The struck-resonator synth as an instrument the clock can play.
+impl Voices for crate::audio::tine::TineVoices {
+    fn all_sound_off(&mut self) {
+        crate::audio::tine::TineVoices::all_sound_off(self);
+    }
+    fn release_all(&mut self) {
+        crate::audio::tine::TineVoices::release_all(self);
+    }
+    fn note_off(&mut self, pitch: u8) {
+        crate::audio::tine::TineVoices::note_off(self, pitch);
+    }
+    fn note_on(&mut self, pitch: u8, vel: u8, age: u64) {
+        crate::audio::tine::TineVoices::note_on(self, pitch, vel, age);
+    }
+    fn plock(&mut self, param: u32, value: Option<f32>) {
+        crate::audio::tine::TineVoices::plock(self, param, value);
+    }
+    fn render(&mut self, out: &mut [f32], at: usize, gain: &mut Ramp) {
+        crate::audio::tine::TineVoices::render(self, out, at, gain);
+    }
+}
+
 impl Voices for crate::audio::sampler::SamplerVoices {
     fn all_sound_off(&mut self) {
         crate::audio::sampler::SamplerVoices::all_sound_off(self);
@@ -1527,12 +1599,31 @@ pub enum Node {
         gain: f32,
         target_gain: f32,
     },
+    /// The struck-resonator synth. Same clock as every other instrument;
+    /// a different half of synthesis.
+    Tine {
+        events: Vec<SeqEvent>,
+        clock: PatternClock,
+        voices: Box<crate::audio::tine::TineVoices>,
+        gain: f32,
+        target_gain: f32,
+    },
     Poly {
         events: Vec<SeqEvent>,
         /// Where the pattern is — the SAME clock `Seq` uses.
         clock: PatternClock,
         /// The instrument the clock plays.
         voices: Box<crate::audio::poly::PolyVoices>,
+        gain: f32,
+        target_gain: f32,
+    },
+    /// The wavetable synth. Same clock, same shape — the instrument is
+    /// `crate::audio::loom`. Stereo out, because unison spread is a
+    /// stereo idea.
+    Loom {
+        events: Vec<SeqEvent>,
+        clock: PatternClock,
+        voices: Box<crate::audio::loom::LoomVoices>,
         gain: f32,
         target_gain: f32,
     },
@@ -2040,6 +2131,12 @@ pub enum Node {
     Clamp {
         core: Box<crate::audio::clamp::Clamp>,
     },
+    /// The transient shaper — see `crate::audio::flint`. Stereo in,
+    /// stereo out, and linked for the same reason the clamp is: one
+    /// detector across both sides, so a centred hit does not lean.
+    Flint {
+        core: Box<crate::audio::flint::Flint>,
+    },
     /// Three-band dynamics — see `crate::audio::prism`. A Linkwitz–Riley
     /// split, three of the same detector/computer/ballistics trio, and a
     /// saturation on each band whose amount is that band's own gain
@@ -2091,6 +2188,36 @@ pub enum Node {
     /// IT HAS REAL LATENCY, which is why `spec_latency` names it: PDC
     /// delays every sibling path to match, and the device's own test
     /// measures the figure rather than trusting it.
+    /// The test-signal generator — see `crate::audio::tone`.
+    Tone {
+        core: Box<crate::audio::tone::ToneCore>,
+    },
+    /// The ring modulator — see `crate::audio::sigil`. Reflects in
+    /// place, adds no latency, and at mix zero is the exact identity.
+    Sigil {
+        core: Box<crate::audio::sigil::SigilCore>,
+    },
+    /// The meter — see `crate::audio::gauge`. It measures and passes the
+    /// signal on untouched, which is why its arm does not write.
+    Gauge {
+        core: Box<crate::audio::gauge::GaugeCore>,
+    },
+    /// The shadow — see `crate::audio::umbra`. One knob, ten stages,
+    /// stereo in and out, and a window of latency it reports.
+    Umbra {
+        core: Box<crate::audio::umbra::UmbraCore>,
+    },
+    /// The tape looper — see `crate::audio::ferric`. Stereo in, stereo
+    /// out, and the only device here that needs the BEAT: its head is
+    /// placed on the musical grid rather than after a delay.
+    Ferric {
+        core: Box<crate::audio::ferric::FerricCore>,
+    },
+    /// The harmoniser — see `crate::audio::sibyl`. Stereo in, stereo
+    /// out, and a whole window of latency it reports.
+    Sibyl {
+        core: Box<crate::audio::sibyl::SibylCore>,
+    },
     Resyn {
         core: Box<crate::audio::resyn::ResynCore>,
     },
@@ -2167,7 +2294,9 @@ impl Node {
             // Stereo for the same reason, one device downstream: a
             // saturator that summed to mono would undo the spread.
             NodeSpec::Haze { .. }
+            | NodeSpec::Loom { .. }
             | NodeSpec::Poly { .. }
+            | NodeSpec::Tine { .. }
             | NodeSpec::Sampler { .. }
             | NodeSpec::Modulato { .. }
             | NodeSpec::Sat { .. }
@@ -2176,10 +2305,17 @@ impl Node {
             | NodeSpec::Filter { .. }
             | NodeSpec::Glue { .. }
             | NodeSpec::Clamp { .. }
+            | NodeSpec::Flint { .. }
             | NodeSpec::Prism { .. }
             | NodeSpec::Gate { .. }
             | NodeSpec::Strip { .. }
             | NodeSpec::Resyn { .. }
+            | NodeSpec::Sibyl { .. }
+            | NodeSpec::Ferric { .. }
+            | NodeSpec::Umbra { .. }
+            | NodeSpec::Tone { .. }
+            | NodeSpec::Sigil { .. }
+            | NodeSpec::Gauge { .. }
             | NodeSpec::Limiter { .. }
             | NodeSpec::Utility { .. }
             | NodeSpec::Lofi { .. }
@@ -2203,6 +2339,12 @@ impl Node {
         match self {
             Node::Glue { core } => Some(core.readout()),
             Node::Clamp { core } => Some(core.readout()),
+            Node::Flint { core } => Some(core.readout()),
+            Node::Sibyl { core } => Some(core.readout()),
+            Node::Ferric { core } => Some(core.readout()),
+            Node::Umbra { core } => Some(core.readout()),
+            Node::Gauge { core } => Some(core.readout()),
+            Node::Tine { voices, .. } => Some(voices.readout()),
             Node::Prism { core } => Some(core.readout()),
             Node::Gate { core } => Some(core.readout()),
             _ => None,
@@ -2313,25 +2455,19 @@ impl Node {
                     let left = src.get(i).copied().unwrap_or(0.0);
                     if let Some(source_r) = src_r {
                         let right = source_r.get(i).copied().unwrap_or(0.0);
-                        let left_gain = if p <= 0.0 {
-                            1.0
-                        } else {
-                            (p * std::f32::consts::FRAC_PI_2).cos()
-                        };
-                        let right_gain = if p >= 0.0 {
-                            1.0
-                        } else {
-                            (-p * std::f32::consts::FRAC_PI_2).cos()
-                        };
+                        let (left_gain, right_gain) = crate::dsp::pan::balance(p);
                         out.l[i] = left * left_gain * g;
                         if let Some(rs) = r.get_mut(i) {
                             *rs = right * right_gain * g;
                         }
                     } else {
-                        let angle = (p + 1.0) * std::f32::consts::FRAC_PI_4;
-                        out.l[i] = left * angle.cos() * g;
+                        // A mono source is PLACED, not balanced: the
+                        // constant-power law, so it holds its loudness
+                        // across the field.
+                        let (lg, rg) = crate::dsp::pan::spread(p);
+                        out.l[i] = left * lg * g;
                         if let Some(rs) = r.get_mut(i) {
-                            *rs = left * angle.sin() * g;
+                            *rs = left * rg * g;
                         }
                     }
                 }
@@ -2739,6 +2875,26 @@ impl Node {
                 }
             }
 
+            Node::Tine {
+                events,
+                clock,
+                voices,
+                gain,
+                target_gain,
+            } => {
+                // `Poly`'s shape exactly — which is the clock earning its
+                // keep for the fifth instrument running.
+                let mut ramp = Ramp::across(*gain, *target_gain, out_len);
+                clock.run(voices.as_mut(), events, out.l, ctx, &mut ramp);
+                *gain = *target_gain;
+                if let Some(r) = out.r.as_deref_mut() {
+                    let right = voices.right(out_len);
+                    for (d, s) in r.iter_mut().zip(right.iter()) {
+                        *d = *s;
+                    }
+                }
+            }
+
             Node::Poly {
                 events,
                 clock,
@@ -2751,6 +2907,26 @@ impl Node {
                 // extra step is stereo: the walk is mono-shaped, so the
                 // bank stashes its right channel and the node reads it back
                 // once the segment is done.
+                let mut ramp = Ramp::across(*gain, *target_gain, out_len);
+                clock.run(voices.as_mut(), events, out.l, ctx, &mut ramp);
+                *gain = *target_gain;
+                if let Some(r) = out.r.as_deref_mut() {
+                    let right = voices.right(out_len);
+                    for (d, s) in r.iter_mut().zip(right.iter()) {
+                        *d = *s;
+                    }
+                }
+            }
+
+            Node::Loom {
+                events,
+                clock,
+                voices,
+                gain,
+                target_gain,
+            } => {
+                // `Poly`'s exact shape, a different instrument — the
+                // clock is the same, the stereo readback is the same.
                 let mut ramp = Ramp::across(*gain, *target_gain, out_len);
                 clock.run(voices.as_mut(), events, out.l, ctx, &mut ramp);
                 *gain = *target_gain;
@@ -3617,6 +3793,58 @@ impl Node {
                 }
                 core.process(out.l, right);
             }
+            Node::Tone { core } => {
+                let right = out.r.as_deref_mut().unwrap_or(&mut []);
+                sum_inputs_stereo(inputs, out.l, right);
+                core.process(out.l, right);
+            }
+            Node::Sigil { core } => {
+                let right = out.r.as_deref_mut().unwrap_or(&mut []);
+                sum_inputs_stereo(inputs, out.l, right);
+                core.process(out.l, right);
+            }
+            Node::Gauge { core } => {
+                let right = out.r.as_deref_mut().unwrap_or(&mut []);
+                sum_inputs_stereo(inputs, out.l, right);
+                // MEASURES ONLY. The signal is already in place and this
+                // arm never writes to it — the contract is kept by the
+                // shape of the call, not by remembering not to.
+                core.measure(out.l, right);
+            }
+            Node::Umbra { core } => {
+                let right = out.r.as_deref_mut().unwrap_or(&mut []);
+                sum_inputs_stereo(inputs, out.l, right);
+                // A seek must not carry a reverb tail, a delay line and a
+                // frame of spectrum across the join.
+                if ctx.discontinuity {
+                    core.reset();
+                }
+                core.process(out.l, right);
+            }
+            Node::Ferric { core } => {
+                let right = out.r.as_deref_mut().unwrap_or(&mut []);
+                sum_inputs_stereo(inputs, out.l, right);
+                // A seek must not leave the head somewhere the new
+                // position knows nothing about, and the reel itself is
+                // now the wrong recording.
+                if ctx.discontinuity {
+                    core.reset();
+                }
+                // The BEAT, straight through: the head is placed on the
+                // grid, so the grid is what it needs.
+                core.process(out.l, right, ctx.beat, ctx.beats_per_sample, ctx.playing);
+            }
+            Node::Sibyl { core } => {
+                let right = out.r.as_deref_mut().unwrap_or(&mut []);
+                sum_inputs_stereo(inputs, out.l, right);
+                // Same reason as the resynthesiser's, plus one of its
+                // own: the phase accumulator is a running total, and
+                // carrying it across a splice would smear the seam.
+                if ctx.discontinuity {
+                    core.reset();
+                }
+                core.process(out.l, right);
+            }
             Node::Strip { core } => {
                 let right = out.r.as_deref_mut().unwrap_or(&mut []);
                 sum_inputs_stereo(inputs, out.l, right);
@@ -3669,6 +3897,17 @@ impl Node {
                 // Same reason as the glue's: arrive open, so the seek
                 // does not hand the new position a gain reduction that
                 // belonged to the old one.
+                if ctx.discontinuity {
+                    core.reset();
+                }
+                core.process(out.l, right);
+            }
+            Node::Flint { core } => {
+                let right = out.r.as_deref_mut().unwrap_or(&mut []);
+                sum_inputs_stereo(inputs, out.l, right);
+                // A seek must not hand the new position an envelope that
+                // belonged to the old one — the detector would read the
+                // splice itself as the biggest transient in the project.
                 if ctx.discontinuity {
                     core.reset();
                 }
@@ -4214,6 +4453,7 @@ impl Node {
             // different opinions about what id 4 is.
             Node::Glue { core } => core.set_param(param, value),
             Node::Clamp { core } => core.set_param(param, value),
+            Node::Flint { core } => core.set_param(param, value),
             Node::Prism { core } => core.set_param(param, value),
             // The whole table, straight through, for the reason the glue
             // does it: the core owns every range and every clamp, so a
@@ -4221,6 +4461,12 @@ impl Node {
             Node::Gate { core } => core.set_param(param, value),
             Node::Strip { core } => core.set_param(param, value),
             Node::Resyn { core } => core.set_param(param, value),
+            Node::Sibyl { core } => core.set_param(param, value),
+            Node::Ferric { core } => core.set_param(param, value),
+            Node::Umbra { core } => core.set_param(param, value),
+            Node::Tone { core } => core.set_param(param, value),
+            Node::Sigil { core } => core.set_param(param, value),
+            Node::Gauge { core } => core.set_param(param, value),
             // The whole table, straight through, for the reason the two
             // arms above give: one door, so a letter cannot be routed by
             // two different opinions about what id 4 is.
@@ -4238,6 +4484,22 @@ impl Node {
                 };
                 voices.set_param(param, value);
             }
+            Node::Tine {
+                target_gain,
+                voices,
+                ..
+            } => {
+                let Some(value) = crate::params::clamp(crate::params::tine::TABLE, param, value)
+                else {
+                    return;
+                };
+                // LEVEL is the node's, because the node owns the ramp;
+                // every other row is the instrument's.
+                if param == crate::params::tine::LEVEL {
+                    *target_gain = value;
+                }
+                voices.set_param(param, value);
+            }
             Node::Poly {
                 target_gain,
                 voices,
@@ -4252,6 +4514,20 @@ impl Node {
                 // there. One table, one clamp, no second opinion about
                 // ranges anywhere in this arm.
                 if param == crate::params::poly::GAIN {
+                    *target_gain = value;
+                }
+                voices.set_param(param, value);
+            }
+            Node::Loom {
+                target_gain,
+                voices,
+                ..
+            } => {
+                let Some(value) = crate::params::clamp(crate::params::loom::TABLE, param, value)
+                else {
+                    return;
+                };
+                if param == crate::params::loom::GAIN {
                     *target_gain = value;
                 }
                 voices.set_param(param, value);
@@ -5140,6 +5416,14 @@ pub enum NodeSpec {
         #[serde(default)]
         params: crate::audio::clamp::ClampParams,
     },
+    /// The transient shaper on whatever feeds it. Every range and every
+    /// `ParamChange` id is `crate::params::flint::TABLE`'s.
+    ///
+    /// Stereo in, stereo out.
+    Flint {
+        #[serde(default)]
+        params: crate::audio::flint::FlintParams,
+    },
     /// Three-band dynamics on whatever feeds it. Every range and every
     /// `ParamChange` id is `crate::params::prism::TABLE`'s.
     ///
@@ -5169,6 +5453,48 @@ pub enum NodeSpec {
     /// every `ParamChange` id is `crate::params::resyn::TABLE`'s.
     ///
     /// Stereo in, stereo out.
+    /// A test signal, in place of whatever feeds it. Every range and
+    /// every `ParamChange` id is `crate::params::tone::TABLE`'s.
+    Tone {
+        #[serde(default)]
+        params: crate::audio::tone::ToneParams,
+    },
+    /// A ring modulator on whatever feeds it. Every range and every
+    /// `ParamChange` id is `crate::params::sigil::TABLE`'s.
+    Sigil {
+        #[serde(default)]
+        params: crate::audio::sigil::SigilParams,
+    },
+    /// A meter on whatever feeds it, which it passes on untouched.
+    /// Every range and every id is `crate::params::gauge::TABLE`'s.
+    Gauge {
+        #[serde(default)]
+        params: crate::audio::gauge::GaugeParams,
+    },
+    /// The shadow on whatever feeds it. Every range and every
+    /// `ParamChange` id is `crate::params::umbra::TABLE`'s.
+    ///
+    /// Stereo in, stereo out.
+    Umbra {
+        #[serde(default)]
+        params: crate::audio::umbra::UmbraParams,
+    },
+    /// The tape looper on whatever feeds it. Every range and every
+    /// `ParamChange` id is `crate::params::ferric::TABLE`'s.
+    ///
+    /// Stereo in, stereo out.
+    Ferric {
+        #[serde(default)]
+        params: crate::audio::ferric::FerricParams,
+    },
+    /// The harmoniser on whatever feeds it. Every range and every
+    /// `ParamChange` id is `crate::params::sibyl::TABLE`'s.
+    ///
+    /// Stereo in, stereo out.
+    Sibyl {
+        #[serde(default)]
+        params: crate::audio::sibyl::SibylParams,
+    },
     Resyn {
         #[serde(default)]
         params: crate::audio::resyn::ResynParams,
@@ -5205,6 +5531,17 @@ pub enum NodeSpec {
     /// TIMELINE-LOCKED, exactly as `Seq` is: its events are stamped
     /// against the compiled tempo and it CUTS on discontinuity, so an
     /// offline bounce reproduces a live take sample for sample.
+    /// TINE: a struck-resonator synth, one pattern, sixteen voices.
+    ///
+    /// Stereo out, because the fan of voices across the field is part of
+    /// the instrument rather than an effect after it.
+    Tine {
+        notes: Vec<Note>,
+        subloops: Vec<SubLoop>,
+        loop_len_beats: Option<f64>,
+        #[serde(default)]
+        params: crate::audio::tine::TineParams,
+    },
     Poly {
         notes: Vec<Note>,
         subloops: Vec<SubLoop>,
@@ -5228,6 +5565,20 @@ pub enum NodeSpec {
         /// The nineteen-row `params::haze` patch, in engine units.
         #[serde(default)]
         params: crate::audio::haze::HazeParams,
+    },
+    /// The wavetable synth: two morphing oscillators, noise, a
+    /// multimode filter. Same pattern shape as its siblings.
+    ///
+    /// TIMELINE-LOCKED, exactly as `Seq` and `Poly` are: events are
+    /// stamped against the compiled tempo and it CUTS on discontinuity,
+    /// so an offline bounce reproduces a live take sample for sample.
+    Loom {
+        notes: Vec<Note>,
+        subloops: Vec<SubLoop>,
+        loop_len_beats: Option<f64>,
+        /// The 28-row `params::loom` patch, in engine units.
+        #[serde(default)]
+        params: crate::audio::loom::LoomParams,
     },
     /// The kick drum synth: one pattern, one one-shot voice.
     ///
@@ -5357,6 +5708,34 @@ pub enum NodeSpec {
 }
 
 impl GraphSpec {
+    /// Swing every pattern in the graph: each instrument's ODD grid steps
+    /// shift toward the next even step by `swing * grid / 2`. Called on
+    /// the WHOLE spec before compile, so live playback and every offline
+    /// render hear the same swing. The arithmetic lives in
+    /// [`swing_note_starts`], pure and pinned by test.
+    pub fn apply_swing(&mut self, grid: f32, swing: f32) {
+        let grid = f64::from(grid);
+        for id in self.order.clone() {
+            let Some(spec) = self.nodes.get_mut(id.0) else {
+                continue;
+            };
+            match spec {
+                NodeSpec::Seq { notes, .. }
+                | NodeSpec::Tine { notes, .. }
+                | NodeSpec::Poly { notes, .. }
+                | NodeSpec::Haze { notes, .. }
+                | NodeSpec::Kick { notes, .. }
+                | NodeSpec::Acid { notes, .. }
+                | NodeSpec::Sampler { notes, .. }
+                | NodeSpec::Snare { notes, .. }
+                | NodeSpec::Tom { notes, .. }
+                | NodeSpec::Hat { notes, .. }
+                | NodeSpec::Handclap { notes, .. } => swing_note_starts(notes, grid, swing),
+                _ => {}
+            }
+        }
+    }
+
     /// Add a node. The returned id is its permanent name tag.
     pub fn push(&mut self, node: NodeSpec) -> NodeId {
         let id = NodeId(self.nodes.insert(node));
@@ -5477,6 +5856,8 @@ impl GraphSpec {
             // drift apart — and `audio::resyn` MEASURES that figure
             // rather than asserting it.
             NodeSpec::Resyn { .. } => crate::audio::resyn::LATENCY,
+            NodeSpec::Sibyl { .. } => crate::audio::sibyl::LATENCY,
+            NodeSpec::Umbra { .. } => crate::audio::umbra::LATENCY,
             NodeSpec::Delay { samples, .. } => *samples,
             _ => 0,
         }
@@ -6079,6 +6460,39 @@ impl GraphSpec {
                             target_gain: 1.0,
                         }
                     }
+                    Some(NodeSpec::Tine {
+                        notes,
+                        subloops,
+                        loop_len_beats,
+                        params,
+                    }) => {
+                        let events =
+                            compile_events(notes, subloops, *loop_len_beats, samples_per_beat)?;
+                        // Green zone: every resonator, every scratch
+                        // buffer and the body's reel are born here.
+                        let voices = crate::audio::tine::TineVoices::new(
+                            sample_rate as f32,
+                            block_frames,
+                            *params,
+                        );
+                        let gain = if params.level.is_finite() {
+                            params.level.clamp(0.0, crate::params::tine::LEVEL_MAX)
+                        } else {
+                            crate::audio::tine::TineParams::default().level
+                        };
+                        Node::Tine {
+                            events,
+                            clock: PatternClock::new(
+                                loop_len_beats
+                                    .map(|len| (len * samples_per_beat).round().max(0.0) as u64)
+                                    .unwrap_or(0),
+                                samples_per_beat,
+                            ),
+                            voices: Box::new(voices),
+                            gain,
+                            target_gain: gain,
+                        }
+                    }
                     Some(NodeSpec::Poly {
                         notes,
                         subloops,
@@ -6103,6 +6517,39 @@ impl GraphSpec {
                             crate::audio::poly::PolyParams::default().gain
                         };
                         Node::Poly {
+                            events,
+                            clock: PatternClock::new(
+                                loop_len_beats
+                                    .map(|len| (len * samples_per_beat).round().max(0.0) as u64)
+                                    .unwrap_or(0),
+                                samples_per_beat,
+                            ),
+                            voices: Box::new(voices),
+                            gain,
+                            target_gain: gain,
+                        }
+                    }
+                    Some(NodeSpec::Loom {
+                        notes,
+                        subloops,
+                        loop_len_beats,
+                        params,
+                    }) => {
+                        let events =
+                            compile_events(notes, subloops, *loop_len_beats, samples_per_beat)?;
+                        // Green zone: every waveform table and every
+                        // scratch buffer the callback will ever need.
+                        let voices = crate::audio::loom::LoomVoices::new(
+                            sample_rate as f32,
+                            block_frames,
+                            *params,
+                        );
+                        let gain = if params.gain.is_finite() {
+                            params.gain.clamp(0.0, 2.0)
+                        } else {
+                            crate::audio::loom::LoomParams::default().gain
+                        };
+                        Node::Loom {
                             events,
                             clock: PatternClock::new(
                                 loop_len_beats
@@ -6672,6 +7119,50 @@ impl GraphSpec {
                             params,
                         )),
                     },
+                    Some(NodeSpec::Tone { params }) => Node::Tone {
+                        // Green zone: the wavetables are born here.
+                        core: Box::new(crate::audio::tone::ToneCore::new(
+                            sample_rate as f32,
+                            params,
+                        )),
+                    },
+                    Some(NodeSpec::Sigil { params }) => Node::Sigil {
+                        // Green zone: the carrier's tables are born here.
+                        core: Box::new(crate::audio::sigil::SigilCore::new(
+                            sample_rate as f32,
+                            params,
+                        )),
+                    },
+                    Some(NodeSpec::Gauge { params }) => Node::Gauge {
+                        core: Box::new(crate::audio::gauge::GaugeCore::new(
+                            sample_rate as f32,
+                            params,
+                        )),
+                    },
+                    Some(NodeSpec::Umbra { params }) => Node::Umbra {
+                        // Green zone: twenty buffers and a table of
+                        // wavetables, all born here.
+                        core: Box::new(crate::audio::umbra::UmbraCore::new(
+                            sample_rate as f32,
+                            params,
+                        )),
+                    },
+                    Some(NodeSpec::Ferric { params }) => Node::Ferric {
+                        // Green zone: the reel is allocated HERE. It is
+                        // the largest thing any device in this file owns
+                        // and the callback must never see it born.
+                        core: Box::new(crate::audio::ferric::FerricCore::new(
+                            sample_rate as f32,
+                            params,
+                        )),
+                    },
+                    Some(NodeSpec::Sibyl { params }) => Node::Sibyl {
+                        // Green zone: every kernel the callback will use.
+                        core: Box::new(crate::audio::sibyl::SibylCore::new(
+                            sample_rate as f32,
+                            params,
+                        )),
+                    },
                     Some(NodeSpec::Resyn { params }) => Node::Resyn {
                         // Green zone: every buffer the callback will use,
                         // and there are a lot of them.
@@ -6702,6 +7193,10 @@ impl GraphSpec {
                     Some(NodeSpec::Clamp { params }) => Node::Clamp {
                         // Green zone: every kernel the callback will use.
                         core: Box::new(crate::audio::clamp::Clamp::new(sample_rate as f32, params)),
+                    },
+                    Some(NodeSpec::Flint { params }) => Node::Flint {
+                        // Green zone: every kernel the callback will use.
+                        core: Box::new(crate::audio::flint::Flint::new(sample_rate as f32, params)),
                     },
                     Some(NodeSpec::Glue { params }) => Node::Glue {
                         // Green zone: every kernel the callback will use.
@@ -6911,6 +7406,99 @@ mod tests {
     use super::*;
 
     const NO_INPUT: &[f32] = &[0.0; 512];
+
+    fn test_note(start: f64) -> Note {
+        Note {
+            start_beats: start,
+            len_beats: 0.25,
+            pitch: 60,
+            vel: 100,
+            plocks: Vec::new(),
+            prob: 1.0,
+            cond: None,
+        }
+    }
+
+    /// Swing shifts ONLY the odd on-grid steps, and only when the grid is
+    /// a true subdivision: zero and whole beats leave the music alone.
+    #[test]
+    fn swing_shifts_only_odd_on_grid_steps() {
+        // 1/16 grid: 0.0625 beats per step.
+        let mut notes = vec![
+            test_note(0.0),    // step 0, downbeat — never swings
+            test_note(0.25),   // step 4, even — stays
+            test_note(0.3125), // step 5, odd — swings
+            test_note(0.35),   // between the lines — untouched, on purpose
+            test_note(-0.0),   // never negative — see the next assertion
+        ];
+        swing_note_starts(&mut notes, 0.0625, 0.5);
+        assert_eq!(notes[0].start_beats, 0.0, "the downbeat stays");
+        assert_eq!(notes[1].start_beats, 0.25, "even steps stay");
+        assert!(
+            (notes[2].start_beats - 0.328_125).abs() < 1e-9,
+            "an odd step moves half a grid toward the next even step: {}",
+            notes[2].start_beats
+        );
+        assert_eq!(notes[3].start_beats, 0.35, "off-grid notes stay");
+
+        // Full swing parks the off-step three quarters of the way to the
+        // next even step; zero swing is the exact identity.
+        let mut full = vec![test_note(0.0625)];
+        swing_note_starts(&mut full, 0.0625, 1.0);
+        assert!(
+            (full[0].start_beats - 0.093_75).abs() < 1e-9,
+            "maximum swing is the classic 75% point"
+        );
+        let mut straight = vec![test_note(0.0625)];
+        swing_note_starts(&mut straight, 0.0625, 0.0);
+        assert_eq!(straight[0].start_beats, 0.0625, "zero swing is identity");
+
+        // Whole beats and coarser do not swing — delaying a beat is a
+        // different song, not a feel.
+        let mut beats = vec![test_note(1.0), test_note(3.0)];
+        swing_note_starts(&mut beats, 1.0, 1.0);
+        assert_eq!(beats[0].start_beats, 1.0);
+        assert_eq!(beats[1].start_beats, 3.0);
+    }
+
+    /// The whole-graph pass reaches every pattern-carrying node — and
+    /// only those.
+    #[test]
+    fn apply_swing_walks_every_pattern_node() {
+        let mut spec = GraphSpec::default();
+        let seq = spec.push(NodeSpec::Seq {
+            notes: vec![test_note(0.0625)],
+            subloops: Vec::new(),
+            loop_len_beats: None,
+            params: SynthParams::default(),
+        });
+        let kick = spec.push(NodeSpec::Kick {
+            notes: vec![test_note(0.0625)],
+            subloops: Vec::new(),
+            loop_len_beats: None,
+            params: crate::audio::kick::KickParams::default(),
+        });
+        spec.push(NodeSpec::Mixer { gain: 1.0 });
+        spec.connect(seq, kick);
+        spec.apply_swing(0.0625, 1.0);
+        for id in [seq, kick] {
+            let notes: Vec<f64> = spec
+                .iter_ordered()
+                .filter(|(i, _)| *i == id)
+                .flat_map(|(_, n)| match n {
+                    NodeSpec::Seq { notes, .. } => notes.iter().map(|n| n.start_beats).collect(),
+                    NodeSpec::Kick { notes, .. } => notes.iter().map(|n| n.start_beats).collect(),
+                    _ => Vec::new(),
+                })
+                .collect();
+            assert_eq!(notes.len(), 1, "the pattern kept its one note");
+            assert!(
+                (notes[0] - 0.093_75).abs() < 1e-9,
+                "the pattern swung: {}",
+                notes[0]
+            );
+        }
+    }
 
     /// Whole-block segment with a rolling transport at 120bpm/48k.
     fn ctx(input: &'static [f32]) -> ProcessCtx<'static> {

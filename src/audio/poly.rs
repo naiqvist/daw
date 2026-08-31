@@ -1120,7 +1120,7 @@ impl PolyVoices {
         // Glide: one pole per control chunk toward the target. A zero or
         // one-sample time is instant, which is what "no glide" means.
         let glide_samples = (params.glide * 1e-3 * fs).max(1.0);
-        let glide = 1.0 - (-(CHUNK as f32) / glide_samples).exp();
+        let glide = crate::dsp::ramps::one_pole_coeff(CHUNK as f32 / glide_samples);
         let keytrack = params.keytrack / 100.0;
         let fenv_amount = params.filter_env / 100.0;
         let base_cutoff = params.cutoff;

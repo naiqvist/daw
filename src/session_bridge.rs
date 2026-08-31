@@ -709,6 +709,10 @@ mod tests {
         let mut clip = midi_clip(9, 2.0);
         clip.notes.clear();
         clip.audio = Some(crate::AudioSource {
+            transpose: 0.0,
+            detune: 0.0,
+            transposed_from: None,
+            applied_ratio: 1.0,
             path: std::path::PathBuf::from("/nowhere/gone.wav"),
             sample_rate: 48_000,
             source_offset: 0,

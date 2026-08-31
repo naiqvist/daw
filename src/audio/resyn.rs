@@ -408,7 +408,7 @@ impl ResynCore {
         // per hop, and a coefficient computed for samples would make both
         // knobs wrong by the overlap factor.
         let per_frame = HOP as f32 / self.sample_rate.max(1.0);
-        let coeff = |ms: f32| 1.0 - (-per_frame / (ms * 1e-3).max(1e-6)).exp();
+        let coeff = |ms: f32| crate::dsp::ramps::one_pole_coeff(per_frame / (ms * 1e-3).max(1e-6));
         let attack = coeff(self.params.attack_ms);
         let release = coeff(self.params.release_ms);
         for (state, target) in ch.smooth.iter_mut().zip(self.mag.iter()) {
@@ -450,7 +450,7 @@ impl ResynCore {
         let warm = self.params.warm_on();
         let mut band_gain = [1.0f32; p::BAND_COUNT];
         for (slot, db) in band_gain.iter_mut().zip(self.params.bands.iter()) {
-            *slot = 10.0f32.powf(*db / 20.0);
+            *slot = crate::dsp::arith::db_to_gain(*db);
         }
         let peak = ch.smooth.iter().fold(0.0f32, |a, m| a.max(*m)).max(1e-9);
 
@@ -480,8 +480,16 @@ impl ResynCore {
             // rather than another shelf.
             if warm {
                 let t = k as f32 / (BINS - 1).max(1) as f32;
-                m *= 10.0f32.powf(p::WARM_TILT_DB * t / 20.0);
-                m = peak * (m / peak).max(0.0).powf(p::WARM_EXPONENT);
+                // Both of these used `powf`, once per BIN per frame —
+                // a thousand calls to the generic power routine every
+                // hop. The tilt has a constant base, so it is a decibel
+                // conversion; the compression has a constant EXPONENT,
+                // so it is `exp2(k·log2 x)`, which is what `powf` does
+                // internally after deciding it has to. Zero still maps
+                // to zero: `log2(0)` is −inf and `exp2(−inf·0.85)` is 0.
+                m *= crate::dsp::arith::db_to_gain(p::WARM_TILT_DB * t);
+                let base = (m / peak).max(0.0);
+                m = peak * (p::WARM_EXPONENT * base.log2()).exp2();
             }
 
             if let Some(slot) = self.out_mag.get_mut(k) {

@@ -1,0 +1,12 @@
+! just-minor.scl
+! Five-limit just intonation natural minor.
+Just minor (5-limit)
+ 7
+!
+ 9/8
+ 6/5
+ 4/3
+ 3/2
+ 8/5
+ 9/5
+ 2/1

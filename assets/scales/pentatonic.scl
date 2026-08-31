@@ -1,0 +1,10 @@
+! pentatonic.scl
+! Major pentatonic in 12TET. The minor pentatonic is mode 4.
+Major pentatonic (12TET)
+ 5
+!
+ 200.0
+ 400.0
+ 700.0
+ 900.0
+ 2/1

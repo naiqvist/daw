@@ -677,13 +677,96 @@ pub struct Rendered {
 /// first, then the conventional path under `$HOME` — rather than by adding
 /// a dependency for two lines of string joining.
 pub fn cache_dir() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_DATA_HOME")
+    data_base().map(|base| base.join("daw").join("renders"))
+}
+
+/// Where a render or a bounce print actually LANDS: the data home when it
+/// can be written, the cache home when it cannot.
+///
+/// The data home is the first choice on purpose: a destructive edit
+/// cannot be rebuilt from anything, so its file must survive a reboot,
+/// and a bounce file is referenced by a project clip. But a machine whose
+/// root filesystem has gone read-only makes the data home unusable while
+/// `~/.cache` may still be writable — and an edit that cannot be written
+/// at all helps no one. The persistence guarantee degrades rather than
+/// failing outright: healthy machines never see the fallback, and a cache
+/// sweep is the price the broken machine pays for still being able to
+/// work. Old files are never moved: a project keeps pointing at whatever
+/// path its render actually landed on.
+///
+/// Candidates are PROBE-CHECKED rather than trusted: permission bits lie.
+/// A directory can report writable while its filesystem is read-only, and
+/// the other way around when the caller is root. The probe creates and
+/// removes a scratch file, so only a filesystem that will really accept
+/// the render is chosen — and when neither home is writable the caller
+/// gets `None` and can say so before a whole render is thrown away.
+pub fn renders_dir() -> Option<PathBuf> {
+    let homes: [Option<PathBuf>; 2] = [data_base(), cache_base()];
+    homes
+        .into_iter()
+        .flatten()
+        .map(|base| base.join("daw").join("renders"))
+        .find(|dir| writable_dir(dir))
+}
+
+/// The data home, found the way `ui::skin` finds its config directory:
+/// the XDG variable first, then the conventional path under `$HOME`.
+fn data_base() -> Option<PathBuf> {
+    std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .or_else(|| {
             std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("share"))
-        })?;
-    Some(base.join("daw").join("renders"))
+        })
+}
+
+/// The cache home, by the same convention: `XDG_CACHE_HOME`, else
+/// `~/.cache`.
+fn cache_base() -> Option<PathBuf> {
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+}
+
+/// Whether `dir` exists (creating it if needed) and really accepts new
+/// files. The create-and-remove probe is the only honest test: on a
+/// read-only filesystem `create_dir_all` of an existing directory
+/// succeeds and the permissions say writable, and only the write knows.
+fn writable_dir(dir: &Path) -> bool {
+    use std::io::ErrorKind;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    // Unique per call: tests run this in parallel, and two probes sharing
+    // one name would collide on `create_new` and report a writable
+    // directory as read-only.
+    static PROBE: AtomicU64 = AtomicU64::new(0);
+    let probe = dir.join(format!(
+        ".write-probe-{}-{}",
+        std::process::id(),
+        PROBE.fetch_add(1, Ordering::Relaxed)
+    ));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(file) => {
+            drop(file);
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        // A stale probe from a crashed earlier process: the name is ours
+        // alone, so finding it means the directory accepted the write.
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// Where this exact job's output belongs.
@@ -692,6 +775,12 @@ pub fn cache_dir() -> Option<PathBuf> {
 /// editing the file underneath produces a different name rather than a
 /// stale render — the same rule `library::reverse_cache_path` keeps, for
 /// the same reason.
+///
+/// The home is `renders_dir`: the persistent data directory when it can
+/// be written, the cache directory when it cannot. See that function's
+/// doc for the trade-off — the short form is that a read-only root
+/// filesystem degrades the persistence guarantee instead of making every
+/// destructive edit impossible.
 pub fn output_path(job: &Job) -> Result<PathBuf, WavImportError> {
     let metadata = job
         .source
@@ -708,9 +797,9 @@ pub fn output_path(job: &Job) -> Result<PathBuf, WavImportError> {
     for op in &job.ops {
         op.hash_into(&mut hasher);
     }
-    let directory = cache_dir().ok_or_else(|| WavImportError::Access {
+    let directory = renders_dir().ok_or_else(|| WavImportError::Access {
         path: job.source.clone(),
-        source: std::io::Error::other("no data directory"),
+        source: std::io::Error::other("no writable render directory"),
     })?;
     std::fs::create_dir_all(&directory).map_err(|source| WavImportError::Access {
         path: directory.clone(),
@@ -1190,6 +1279,43 @@ mod tests {
             !directory.starts_with(std::env::temp_dir()),
             "renders must not live in temp: {directory:?}"
         );
+    }
+
+    #[test]
+    fn the_renders_directory_is_a_writable_daw_renders_folder() {
+        // Machine-dependent by design — data home when writable, cache
+        // home when it is not — but it must always exist and be writable,
+        // because the probe has just verified it.
+        let directory = renders_dir().expect("at least one home is writable");
+        assert!(directory.ends_with("daw/renders"), "{directory:?}");
+        assert!(writable_dir(&directory), "{directory:?}");
+    }
+
+    #[test]
+    fn the_writability_probe_accepts_a_real_directory_and_cleans_up() {
+        let dir = std::env::temp_dir().join(format!("daw-probe-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(writable_dir(&dir));
+        assert!(
+            dir.is_dir(),
+            "the probe may create the folder, not remove it"
+        );
+        assert!(
+            std::fs::read_dir(&dir).unwrap().next().is_none(),
+            "the probe must remove its scratch file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_writability_probe_refuses_what_cannot_be_created() {
+        // A FILE where the directory would go: `create_dir_all` must fail
+        // even for a caller the permission bits would let through, so this
+        // holds in a root-run test too.
+        let file = std::env::temp_dir().join(format!("daw-probe-file-{}", std::process::id()));
+        std::fs::write(&file, b"x").unwrap();
+        assert!(!writable_dir(&file.join("renders")));
+        let _ = std::fs::remove_file(&file);
     }
 
     fn run(ops: Vec<Op>, samples: Vec<f32>, channels: usize) -> Vec<f32> {

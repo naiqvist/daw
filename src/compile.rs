@@ -131,6 +131,8 @@ pub(crate) fn compile_chain(
             // anywhere else in a chain shapes nothing.
             DeviceState::SineSynth(_)
             | DeviceState::Poly(_)
+            | DeviceState::Loom(_)
+            | DeviceState::Tine(_)
             | DeviceState::Haze(_)
             | DeviceState::Sampler(_)
             | DeviceState::Kick(_)
@@ -141,6 +143,48 @@ pub(crate) fn compile_chain(
             | DeviceState::Acid(_) => {}
             DeviceState::Utility(params) => {
                 let node = spec.push(NodeSpec::Utility { params });
+                spec.connect(tail, node);
+                devices.insert(instance.id, node);
+                tail = node;
+            }
+            DeviceState::Tone(params) => {
+                let node = spec.push(NodeSpec::Tone { params });
+                spec.connect(tail, node);
+                devices.insert(instance.id, node);
+                tail = node;
+            }
+            DeviceState::Sigil(params) => {
+                let node = spec.push(NodeSpec::Sigil { params });
+                spec.connect(tail, node);
+                devices.insert(instance.id, node);
+                tail = node;
+            }
+            DeviceState::Gauge(params) => {
+                let node = spec.push(NodeSpec::Gauge { params });
+                spec.connect(tail, node);
+                devices.insert(instance.id, node);
+                tail = node;
+            }
+            DeviceState::Umbra(params) => {
+                let node = spec.push(NodeSpec::Umbra { params });
+                spec.connect(tail, node);
+                devices.insert(instance.id, node);
+                tail = node;
+            }
+            DeviceState::Ferric(params) => {
+                let node = spec.push(NodeSpec::Ferric { params });
+                spec.connect(tail, node);
+                devices.insert(instance.id, node);
+                tail = node;
+            }
+            DeviceState::Sibyl(params) => {
+                let node = spec.push(NodeSpec::Sibyl { params });
+                spec.connect(tail, node);
+                devices.insert(instance.id, node);
+                tail = node;
+            }
+            DeviceState::Flint(params) => {
+                let node = spec.push(NodeSpec::Flint { params });
                 spec.connect(tail, node);
                 devices.insert(instance.id, node);
                 tail = node;
@@ -533,6 +577,13 @@ pub(crate) fn build_graph_spec(
                     // An effect at the head is not an instrument; the
                     // lane has nothing to make sound with.
                     DeviceState::Modulato(_)
+                    | DeviceState::Flint(_)
+                    | DeviceState::Sibyl(_)
+                    | DeviceState::Ferric(_)
+                    | DeviceState::Umbra(_)
+                    | DeviceState::Tone(_)
+                    | DeviceState::Sigil(_)
+                    | DeviceState::Gauge(_)
                     | DeviceState::Utility(_)
                     | DeviceState::Filter(_)
                     | DeviceState::Lofi(_)
@@ -553,7 +604,19 @@ pub(crate) fn build_graph_spec(
                         loop_len_beats,
                         params,
                     },
+                    DeviceState::Tine(params) => NodeSpec::Tine {
+                        notes,
+                        subloops: Vec::new(),
+                        loop_len_beats,
+                        params,
+                    },
                     DeviceState::Poly(params) => NodeSpec::Poly {
+                        notes,
+                        subloops: Vec::new(),
+                        loop_len_beats,
+                        params,
+                    },
+                    DeviceState::Loom(params) => NodeSpec::Loom {
                         notes,
                         subloops: Vec::new(),
                         loop_len_beats,

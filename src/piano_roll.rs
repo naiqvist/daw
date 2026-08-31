@@ -71,10 +71,11 @@
 //! The modifier grammar, once, for every drag:
 //!
 //! ```text
-//! Shift       extend the selection / constrain the drag to one axis
-//! Ctrl        toggle membership
-//! Alt         copy instead of move
-//! Ctrl+Alt    bypass snap (and scale lock) for this gesture
+//! Shift       extend/toggle selection; constrain a drag to one axis
+//! Ctrl-drag   copy instead of move (Windows/Linux)
+//! Option-drag copy instead of move (macOS)
+//! Alt-drag    bypass snap and scale lock (Windows/Linux)
+//! Cmd-drag    bypass snap and scale lock (macOS)
 //! ```
 //!
 //! # Tools
@@ -1828,10 +1829,17 @@ enum Drag {
     Move {
         anchor: usize,
         from: Vec<(usize, u8, f64)>,
+        /// Full source notes at the press. Live lets the copy modifier be
+        /// pressed after motion has begun, so an in-flight move must be
+        /// able to restore its sources and continue with fresh copies.
+        originals: Vec<(usize, Note)>,
         press: egui::Pos2,
         /// Which axis a Shift-constrained drag committed to, decided once
         /// at `AXIS_LOCK_PX` of travel and then held for the gesture.
         axis: Option<Axis>,
+        /// Once a move becomes a copy it stays a copy for the remainder of
+        /// the gesture, even if the modifier is released before the mouse.
+        copied: bool,
     },
     /// Pulling right edges. `from` is `(index, len)` per note.
     ResizeR {
@@ -4912,12 +4920,9 @@ impl PianoRoll {
 #[derive(Debug, Clone, Copy)]
 struct Mods {
     shift: bool,
-    command: bool,
-    /// Alt alone: copy instead of move.
+    /// Ableton: Ctrl on Windows/Linux, Option on macOS.
     copy: bool,
-    /// Ctrl+Alt: bypass snap for this gesture. Alt alone is copy — which
-    /// Live, Logic and Cubase all agree on — so the snap escape moves one
-    /// key over rather than fighting it.
+    /// Ableton: Alt on Windows/Linux, Command on macOS.
     free: bool,
 }
 
@@ -4926,9 +4931,16 @@ impl Mods {
         let m = ui.input(|i| i.modifiers);
         Self {
             shift: m.shift,
-            command: m.command,
-            copy: m.alt && !m.command,
-            free: m.alt && m.command,
+            copy: if cfg!(target_os = "macos") {
+                m.alt
+            } else {
+                m.ctrl
+            },
+            free: if cfg!(target_os = "macos") {
+                m.command
+            } else {
+                m.alt
+            },
         }
     }
 }
@@ -4962,9 +4974,39 @@ fn apply_drag(
         Drag::Move {
             anchor,
             from,
+            originals,
             press,
             axis,
+            copied,
         } => {
+            // Live permits the copy modifier to arrive AFTER the drag has
+            // started. Restore the notes that may already have moved,
+            // create one copy of every source, then retarget this same
+            // captured gesture to the copies. Target identity is still
+            // decided from the press; no note under the moving pointer is
+            // ever consulted.
+            if mods.copy && !*copied {
+                let mut fresh = HashSet::new();
+                let mut copied_from = Vec::with_capacity(originals.len());
+                let mut copied_anchor = *anchor;
+                for (source, original) in originals.iter() {
+                    if let Some(n) = notes.get_mut(*source) {
+                        *n = original.clone();
+                    }
+                    notes.push(original.clone());
+                    let new = notes.len() - 1;
+                    fresh.insert(new);
+                    copied_from.push((new, original.pitch, original.start));
+                    if *source == *anchor {
+                        copied_anchor = new;
+                    }
+                }
+                *anchor = copied_anchor;
+                *from = copied_from;
+                pr.selected = fresh;
+                *copied = true;
+            }
+
             // Shift constrains, and commits to one axis ONCE — at
             // AXIS_LOCK_PX of travel — then holds it for the gesture. A
             // constraint that re-decides every frame flips under the hand.
@@ -5438,14 +5480,13 @@ pub fn body_at(
                     }
                 }
                 (_, Some((i, _))) => {
-                    // Ctrl toggles membership; Shift adds; a plain click
-                    // replaces. The arrangement's grammar, unchanged.
-                    if mods.command {
+                    // Live uses Shift-click to add or remove a note from
+                    // the selection. A plain click replaces it. Ctrl is
+                    // reserved for copy-drag on Windows/Linux.
+                    if mods.shift {
                         if !pr.selected.remove(&i) {
                             pr.selected.insert(i);
                         }
-                    } else if mods.shift {
-                        pr.selected.insert(i);
                     } else {
                         pr.selected.clear();
                         pr.selected.insert(i);
@@ -5456,7 +5497,7 @@ pub fn body_at(
                     }
                 }
                 (_, None) => {
-                    if !mods.command && !mods.shift {
+                    if !mods.shift {
                         pr.selected.clear();
                     }
                     if let Some(pitch) = g.pitch_at(at.y) {
@@ -5527,40 +5568,26 @@ pub fn body_at(
                         // takes the selection over — otherwise dragging an
                         // unselected note would move eight other ones.
                         if !pr.selected.contains(&i) {
-                            if !mods.command && !mods.shift {
+                            if !mods.shift {
                                 pr.selected.clear();
                             }
                             pr.selected.insert(i);
                         }
-                        // Alt copies: the originals stay, the copies move,
-                        // and the copies are what ends up selected.
-                        let mut anchor = i;
-                        if mods.copy && zone == Zone::Body {
-                            let picked = pr.acting_on(ns);
-                            let mut fresh = HashSet::new();
-                            for &src in &picked {
-                                let Some(n) = ns.get(src).cloned() else {
-                                    continue;
-                                };
-                                ns.push(n);
-                                let new = ns.len() - 1;
-                                fresh.insert(new);
-                                if src == i {
-                                    anchor = new;
-                                }
-                            }
-                            pr.selected = fresh;
-                        }
                         let picked = pr.acting_on(ns);
                         match zone {
                             Zone::Body => Drag::Move {
-                                anchor,
+                                anchor: i,
                                 from: picked
                                     .iter()
                                     .filter_map(|&j| ns.get(j).map(|n| (j, n.pitch, n.start)))
                                     .collect(),
+                                originals: picked
+                                    .iter()
+                                    .filter_map(|&j| ns.get(j).cloned().map(|n| (j, n)))
+                                    .collect(),
                                 press,
                                 axis: None,
+                                copied: false,
                             },
                             Zone::Right => Drag::ResizeR {
                                 from: picked
@@ -8904,6 +8931,22 @@ mod pointer {
         pos2(r.left() + 2.0, r.center().y)
     }
 
+    fn ableton_copy_modifier() -> Modifiers {
+        if cfg!(target_os = "macos") {
+            Modifiers::ALT
+        } else {
+            Modifiers::CTRL
+        }
+    }
+
+    fn ableton_snap_bypass_modifier() -> Modifiers {
+        if cfg!(target_os = "macos") {
+            Modifiers::COMMAND
+        } else {
+            Modifiers::ALT
+        }
+    }
+
     /// The keyboard has to follow the hand. `keys` claims its input from
     /// the focus ring, so a roll being worked in with the mouse while the
     /// ring sat elsewhere answered no keystroke at all — press `i`, nothing
@@ -9085,24 +9128,63 @@ mod pointer {
 
     // --- the modifier grammar -------------------------------------------
 
-    /// ALT COPIES, and the COPIES are what ends up selected — so the next
-    /// gesture acts on what you just made, not on what you left behind.
+    /// Ableton's copy modifier copies, and the COPIES are what ends up
+    /// selected — so the next gesture acts on what you just made, not on
+    /// what you left behind.
     #[test]
-    fn alt_drag_copies_and_selects_the_copies() {
-        let (mut pr, mut clip) = scene(vec![note(60, 0.0, 1.0, 100)]);
+    fn ableton_copy_drag_selects_the_copies() {
+        let (mut pr, mut clip) = scene(vec![note(60, 0.0, 1.0, 100), note(64, 2.0, 1.0, 91)]);
+        pr.selected = HashSet::from([0, 1]);
         let g = geom(&pr);
         let from = body_of(g, &clip.notes[0]);
         let to = from + vec2(4.0 * g.px_per_beat(), 0.0);
         drive(
             &mut pr,
             &mut clip,
-            &probe::drag_path_holding(from, to, 6, Modifiers::ALT),
+            &probe::drag_path_holding(from, to, 6, ableton_copy_modifier()),
         );
 
-        assert_eq!(clip.notes.len(), 2, "the original stayed behind");
+        assert_eq!(clip.notes.len(), 4, "both originals stayed behind");
         assert_eq!(clip.notes[0].start, 0.0, "and it did not move");
-        assert!((clip.notes[1].start - 4.0).abs() < 1e-6, "the copy moved");
-        assert_eq!(pr.selected, HashSet::from([1]), "the COPY is selected");
+        assert_eq!(clip.notes[1].start, 2.0, "nor did its selected partner");
+        assert!(
+            (clip.notes[2].start - 4.0).abs() < 1e-6,
+            "the anchor copy moved"
+        );
+        assert!(
+            (clip.notes[3].start - 6.0).abs() < 1e-6,
+            "the group kept its spacing"
+        );
+        assert_eq!(
+            pr.selected,
+            HashSet::from([2, 3]),
+            "the COPIES are selected"
+        );
+    }
+
+    /// Live lets the user decide to copy after motion is already under
+    /// way. The source must return to its exact press state and the new
+    /// copy must continue under the same captured drag.
+    #[test]
+    fn copy_modifier_can_arrive_after_the_drag_starts() {
+        let (mut pr, mut clip) = scene(vec![note(60, 1.0, 1.0, 87)]);
+        let g = geom(&pr);
+        let from = body_of(g, &clip.notes[0]);
+        let to = from + vec2(4.0 * g.px_per_beat(), -2.0 * g.row_h());
+        let mut path = probe::drag_path(from, to, 8);
+        let copy = ableton_copy_modifier();
+        for step in path.iter_mut().skip(6) {
+            step.mods = copy;
+        }
+        drive(&mut pr, &mut clip, &path);
+
+        assert_eq!(clip.notes.len(), 2, "one source and one copy");
+        assert_eq!(clip.notes[0].pitch, 60, "the source pitch was restored");
+        assert_eq!(clip.notes[0].start, 1.0, "the source time was restored");
+        assert_eq!(clip.notes[0].vel, 87, "all source data survived");
+        assert_eq!(clip.notes[1].pitch, 62, "the copy kept following pitch");
+        assert!((clip.notes[1].start - 5.0).abs() < 1e-6);
+        assert_eq!(pr.selected, HashSet::from([1]), "the copy is selected");
     }
 
     /// SHIFT LOCKS THE AXIS, and locks it ONCE. A constraint that
@@ -9129,27 +9211,19 @@ mod pointer {
         assert!(clip.notes[0].start > 4.0, "and time still moved");
     }
 
-    /// CTRL+ALT BYPASSES SNAP. Alt alone is copy — Live, Logic and Cubase
-    /// all agree — so the snap escape moves one key over rather than
-    /// fighting it.
+    /// Ableton's snap-bypass modifier permits an off-grid landing.
     #[test]
-    fn ctrl_alt_bypasses_the_grid() {
+    fn ableton_modifier_bypasses_the_grid() {
         let (mut pr, mut clip) = scene(vec![note(60, 0.0, 1.0, 100)]);
         pr.grid = 2; // a coarse rung, so an unsnapped landing is obvious
         let g = geom(&pr);
         let from = body_of(g, &clip.notes[0]);
         // A deliberately awkward distance: a third of a beat.
         let to = from + vec2(g.px_per_beat() / 3.0, 0.0);
-        let free = Modifiers {
-            alt: true,
-            ctrl: true,
-            command: true,
-            ..Modifiers::NONE
-        };
         drive(
             &mut pr,
             &mut clip,
-            &probe::drag_path_holding(from, to, 4, free),
+            &probe::drag_path_holding(from, to, 4, ableton_snap_bypass_modifier()),
         );
 
         let landed = clip.notes[0].start;

@@ -1,7 +1,10 @@
 //! Family 2 of the kernel roadmap: vector × vector.
 //!
 //! `add`, `mul` (ring mod), `mac` (multiply-accumulate), `crossfade`,
-//! and `dot` — the elementwise binary primitives.
+//! and `dot` — the elementwise binary primitives — plus the decibel
+//! conversions ([`db_to_gain`], [`gain_to_db`]), which live here because
+//! six modules had privately spelled their own and three were calling
+//! one per sample.
 //!
 //! Stateless free functions, same conventions as family 1 ([`super::mem`]):
 //! zip truncation to the shortest slice (never a panic), no indexing that
@@ -106,6 +109,44 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
         acc = x.mul_add(*y, acc);
     }
     acc
+}
+
+// ------------------------------------------------------------ decibels ---
+
+/// Decibels per unit of base-two logarithm: `20·log10(2)`.
+const DB_PER_LOG2: f32 = 20.0 * core::f32::consts::LOG10_2;
+/// Its inverse, for the trip back to a linear gain.
+const LOG2_PER_DB: f32 = core::f32::consts::LOG2_10 / 20.0;
+
+/// Linear gain from decibels: `10^(db/20)`.
+///
+/// Written in base two on purpose. `10f32.powf(db / 20.0)` is the
+/// obvious spelling and computes the same number, but `powf` is the
+/// GENERIC power routine and pays for an arbitrary exponent this call
+/// never has — the base is always the constant 10. Folding it into
+/// `exp2` costs one multiply and a fraction of the work, which matters
+/// because the compressors call this once per SAMPLE.
+///
+/// State: none. Per-call cost: 1 mul + 1 exp2.
+/// Denormal-safe: n/a — no state. `-inf` dB gives 0, NaN gives NaN.
+/// In-place safe: n/a. Latency: 0 samples.
+pub fn db_to_gain(db: f32) -> f32 {
+    (db * LOG2_PER_DB).exp2()
+}
+
+/// Decibels from a linear gain: `20·log10(gain)`.
+///
+/// The inverse of [`db_to_gain`], in base two for the same reason. NO
+/// floor is applied: a caller that cannot accept `-inf` at silence
+/// clamps its own input, because the right floor is the caller's
+/// question (the limiter's meter wants 1e-6, a spectrum wants 1e-12)
+/// and a floor baked in here would be wrong somewhere.
+///
+/// State: none. Per-call cost: 1 log2 + 1 mul.
+/// Denormal-safe: n/a — no state. Zero gives `-inf`, negative NaN.
+/// In-place safe: n/a. Latency: 0 samples.
+pub fn gain_to_db(gain: f32) -> f32 {
+    DB_PER_LOG2 * gain.log2()
 }
 
 #[cfg(test)]
@@ -434,5 +475,57 @@ mod tests {
         let mut d = [1.0f32, -1.0];
         mac(&big, &big, &mut d);
         assert!(!d.iter().any(|s| s.is_nan()));
+    }
+
+    // ------------------------------------------------------ decibels ---
+
+    /// The base-two spelling has to be the base-ten one, or every
+    /// threshold in the app moves.
+    #[test]
+    fn the_decibel_pair_matches_the_base_ten_form() {
+        let mut worst_gain = 0.0f64;
+        let mut worst_db = 0.0f64;
+        let mut i = -120.0f32;
+        while i <= 24.0 {
+            let want = 10.0f32.powf(i / 20.0) as f64;
+            let got = db_to_gain(i) as f64;
+            worst_gain = worst_gain.max(((got - want) / want).abs());
+            i += 0.01;
+        }
+        // ~1.2e-6 relative in practice, about ten ulp of f32 and a
+        // hundred-thousandth of a decibel — the cost of routing the
+        // conversion through base two, and far under anything audible
+        // or anything a meter shows.
+        assert!(
+            worst_gain < 1e-5,
+            "db_to_gain drifts from 10^(db/20) by {worst_gain:e} relative"
+        );
+
+        for k in 0..2_000 {
+            let g = 10.0f32.powf((k as f32 * 0.06 - 120.0) / 20.0);
+            let want = (20.0 * g.log10()) as f64;
+            let got = gain_to_db(g) as f64;
+            worst_db = worst_db.max((got - want).abs());
+        }
+        assert!(
+            worst_db < 1e-4,
+            "gain_to_db drifts from 20*log10 by {worst_db:e} dB"
+        );
+    }
+
+    /// They invert each other, and the edges behave.
+    #[test]
+    fn the_decibel_pair_round_trips_and_survives_its_edges() {
+        for k in -240..=48 {
+            let db = k as f32 * 0.5;
+            let back = gain_to_db(db_to_gain(db));
+            assert!((back - db).abs() < 1e-3, "{db} dB came back as {back}");
+        }
+        assert_eq!(db_to_gain(0.0), 1.0, "unity dB must be unity gain");
+        assert_eq!(gain_to_db(1.0), 0.0, "unity gain must be zero dB");
+        assert_eq!(db_to_gain(f32::NEG_INFINITY), 0.0);
+        assert_eq!(gain_to_db(0.0), f32::NEG_INFINITY);
+        assert!(gain_to_db(-1.0).is_nan(), "a negative gain has no dB");
+        assert!(db_to_gain(f32::NAN).is_nan());
     }
 }

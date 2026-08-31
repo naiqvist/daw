@@ -1,0 +1,183 @@
+//! Selected-trig inspector for the sequence region.
+//!
+//! Values are placeholders sourced from the UI grid selection. The eventual
+//! sequence model can provide the same snapshot without changing this view.
+
+use crate::ui::redesign::OUTLINE;
+use crate::ui::redesign::grid_resolution::length_label;
+use crate::ui::redesign::layout_grid::{GridArea, LayoutGrid};
+use crate::ui::redesign::lens::degree_label;
+use crate::ui::redesign::sequence_grid::{TrigSelection, note_name};
+use crate::ui::tokens::{control, font, space};
+use eframe::egui;
+
+const PANEL_HEIGHT_MAX: f32 = 224.0;
+const HEADER_HEIGHT: f32 = 28.0;
+const SUM_HEIGHT: f32 = 22.0;
+const FIELD_COLUMNS: usize = 2;
+const FIELD_ROWS: usize = 4;
+const HEADER_FILL: egui::Color32 = egui::Color32::from_gray(20);
+const SECTION_FILLS: [egui::Color32; FIELD_ROWS] = [
+    egui::Color32::from_gray(12),
+    egui::Color32::from_gray(17),
+    egui::Color32::from_gray(22),
+    egui::Color32::from_gray(15),
+];
+const LABEL_COLOR: egui::Color32 = egui::Color32::from_gray(176);
+const PANEL_FILL: egui::Color32 = egui::Color32::from_gray(10);
+
+struct Field<'a> {
+    label: &'static str,
+    value: &'a str,
+    area: GridArea,
+}
+
+impl<'a> Field<'a> {
+    const fn new(label: &'static str, value: &'a str, area: GridArea) -> Self {
+        Self { label, value, area }
+    }
+}
+
+pub(crate) fn panel_rect(available: egui::Rect) -> egui::Rect {
+    let inset = space::MD;
+    let width = control::SIDE_COLUMN_W.min((available.width() - inset * 2.0).max(1.0));
+    let height = PANEL_HEIGHT_MAX.min((available.height() - inset * 2.0).max(1.0));
+    egui::Rect::from_center_size(
+        egui::pos2(available.left() + inset + width * 0.5, available.center().y),
+        egui::vec2(width, height),
+    )
+}
+
+pub(crate) fn show(ui: &mut egui::Ui, rect: egui::Rect, selection: TrigSelection) {
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 0.0, PANEL_FILL);
+
+    let header_rect = egui::Rect::from_min_max(
+        rect.min,
+        egui::pos2(rect.right(), rect.top() + HEADER_HEIGHT),
+    );
+    painter.rect_filled(header_rect, 0.0, HEADER_FILL);
+    painter.text(
+        header_rect.left_center() + egui::vec2(space::SM, 0.0),
+        egui::Align2::LEFT_CENTER,
+        "TRIG INFORMATION",
+        egui::FontId::new(font::BODY, egui::FontFamily::Monospace),
+        OUTLINE,
+    );
+
+    let step = format!("{:02}", selection.step + 1);
+    let bar = selection.tick / crate::ui::redesign::grid_resolution::TICKS_PER_BAR + 1;
+    let beat = selection.tick % crate::ui::redesign::grid_resolution::TICKS_PER_BAR
+        / (crate::ui::redesign::grid_resolution::TICKS_PER_BAR / 4)
+        + 1;
+    let position = format!("{bar}.{beat}");
+    let primary = selection.primary.as_ref();
+    let pitch = primary.map(anchor_label).unwrap_or_else(|| "--".to_owned());
+    let state = if primary.is_some_and(|note| note.enabled) {
+        "ON"
+    } else {
+        "OFF"
+    };
+    let length = primary
+        .map(|note| length_label(note.length_ticks))
+        .unwrap_or_else(|| "--".to_owned());
+    let velocity = primary
+        .map(|note| note.velocity.to_string())
+        .unwrap_or_else(|| "--".to_owned());
+    let chance = format!(
+        "{:.0}%",
+        primary.map_or(1.0, |note| note.probability) * 100.0
+    );
+    let notes = format!("{:02}", selection.tone_count);
+    let fields = [
+        Field::new("STEP", &step, GridArea::new(0, 0, 1, 1)),
+        Field::new("POSITION", &position, GridArea::new(1, 0, 1, 1)),
+        Field::new("PITCH", &pitch, GridArea::new(0, 1, 1, 1)),
+        Field::new("LENGTH", &length, GridArea::new(1, 1, 1, 1)),
+        Field::new("VELOCITY", &velocity, GridArea::new(0, 2, 1, 1)),
+        Field::new("CHANCE", &chance, GridArea::new(1, 2, 1, 1)),
+        Field::new("NOTES", &notes, GridArea::new(0, 3, 1, 1)),
+        Field::new("STATE", state, GridArea::new(1, 3, 1, 1)),
+    ];
+
+    let field_bounds = egui::Rect::from_min_max(
+        header_rect.left_bottom() + egui::vec2(space::SM, space::SM),
+        rect.right_bottom() - egui::vec2(space::SM, space::SM + SUM_HEIGHT),
+    );
+    let layout = LayoutGrid::new(
+        field_bounds,
+        FIELD_COLUMNS,
+        FIELD_ROWS,
+        egui::vec2(space::MD, space::XS),
+    );
+    for (row, fill) in SECTION_FILLS.into_iter().enumerate() {
+        painter.rect_filled(
+            layout.area(GridArea::new(0, row, FIELD_COLUMNS, 1)),
+            0.0,
+            fill,
+        );
+    }
+    for field in fields {
+        draw_field(&painter, layout.area(field.area), field.label, field.value);
+    }
+
+    // The display law: when two authorities compose a value, show the sum
+    // AS a sum — anchor, deviation, substrate, one line.
+    if let Some(note) = primary {
+        painter.text(
+            egui::pos2(rect.left() + space::SM, rect.bottom() - SUM_HEIGHT * 0.5),
+            egui::Align2::LEFT_CENTER,
+            sum_line(note),
+            egui::FontId::new(font::MINI_LABEL, egui::FontFamily::Monospace),
+            LABEL_COLOR,
+        );
+    }
+}
+
+/// The anchor's name alone: the address half of the sum.
+fn anchor_label(note: &crate::ui::redesign::sequence::NoteView) -> String {
+    match note.pitch.anchor {
+        crate::pitch::Anchor::Degree { degree, period } => degree_label(degree, period),
+        crate::pitch::Anchor::Absolute(_) => note_name(note.midi),
+    }
+}
+
+/// `^3 +14¢ = 331.1HZ` — the whole identity of the pitch, spelled as the
+/// sum it is. A zero deviation drops its term rather than printing +0.
+fn sum_line(note: &crate::ui::redesign::sequence::NoteView) -> String {
+    let anchor = anchor_label(note);
+    let cents = note.pitch.offset_cents;
+    let deviation = if cents != 0.0 {
+        format!(" {cents:+.0}¢")
+    } else {
+        String::new()
+    };
+    let push = if note.micro_ticks != 0 {
+        format!(" {:+}T", note.micro_ticks)
+    } else {
+        String::new()
+    };
+    let approx = if note.approx {
+        format!(" {}", crate::ui::redesign::signs::APPROX)
+    } else {
+        String::new()
+    };
+    format!("{anchor}{deviation}{push} = {:.1}HZ{approx}", note.hz)
+}
+
+fn draw_field(painter: &egui::Painter, rect: egui::Rect, label: &str, value: &str) {
+    painter.text(
+        rect.left_center() + egui::vec2(space::SM, 0.0),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::new(font::MINI_LABEL, egui::FontFamily::Monospace),
+        LABEL_COLOR,
+    );
+    painter.text(
+        rect.right_center() - egui::vec2(space::SM, 0.0),
+        egui::Align2::RIGHT_CENTER,
+        value,
+        egui::FontId::new(font::BODY, egui::FontFamily::Monospace),
+        OUTLINE,
+    );
+}

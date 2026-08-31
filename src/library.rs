@@ -117,6 +117,32 @@ pub struct LibraryFolder {
     pub name: String,
 }
 
+/// A Scala `.scl` file found in the library. Scale files join the catalog
+/// the way samples do (`notes/20260831-key-scale-brief.md`); the record
+/// carries the path, and parsing happens where the scale is asked for, so
+/// a garbage file refuses at `:key` time with words instead of poisoning
+/// the scan.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ScaleRecord {
+    pub path: PathBuf,
+    pub relative_path: PathBuf,
+    pub location_id: String,
+    /// The file stem: the name `:key` addresses it by.
+    pub name: String,
+}
+
+/// A `.lens` file (RON) found in the library: a user-minted sign system
+/// (`notes/20260831-pitch-lens-spec.md` §3). Same contract as scales —
+/// catalogued by path, parsed where `:lens` asks for it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LensRecord {
+    pub path: PathBuf,
+    pub relative_path: PathBuf,
+    pub location_id: String,
+    /// The file stem: the name `:lens` addresses it by.
+    pub name: String,
+}
+
 /// Immutable catalog view. A UI frame reads one snapshot and never touches
 /// the scanner or filesystem.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -126,6 +152,8 @@ pub struct LibrarySnapshot {
     pub locations: Vec<LibraryLocation>,
     pub folders: Vec<LibraryFolder>,
     pub assets: Vec<AssetRecord>,
+    pub scales: Vec<ScaleRecord>,
+    pub lenses: Vec<LensRecord>,
     pub warnings: Vec<String>,
 }
 
@@ -674,6 +702,18 @@ pub fn scan(config: &LibraryConfig, generation: u64) -> LibrarySnapshot {
             .cmp(&b.name.to_lowercase())
             .then_with(|| a.path.cmp(&b.path))
     });
+    snapshot.scales.sort_by(|a, b| {
+        a.name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    snapshot.lenses.sort_by(|a, b| {
+        a.name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
+            .then_with(|| a.path.cmp(&b.path))
+    });
     snapshot
 }
 
@@ -716,7 +756,44 @@ fn scan_root(
                 pending.push(path);
                 continue;
             }
-            if !file_type.is_file() || !is_audio_file(&path) {
+            if !file_type.is_file() {
+                continue;
+            }
+            if is_scale_file(&path) || is_lens_file(&path) {
+                let lens = is_lens_file(&path);
+                let Ok(path) = path.canonicalize() else {
+                    continue;
+                };
+                if !seen_assets.insert(path.clone()) {
+                    continue;
+                }
+                let relative_path = path
+                    .strip_prefix(root)
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|_| path.clone());
+                let name = path
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("unnamed")
+                    .to_owned();
+                if lens {
+                    snapshot.lenses.push(LensRecord {
+                        path,
+                        relative_path,
+                        location_id: location_id.to_owned(),
+                        name,
+                    });
+                } else {
+                    snapshot.scales.push(ScaleRecord {
+                        path,
+                        relative_path,
+                        location_id: location_id.to_owned(),
+                        name,
+                    });
+                }
+                continue;
+            }
+            if !is_audio_file(&path) {
                 continue;
             }
             let Ok(path) = path.canonicalize() else {
@@ -823,6 +900,21 @@ fn inferred_tags(relative_path: &Path, extension: &str) -> Vec<String> {
 
 fn location_id(root: &Path) -> String {
     root.to_string_lossy().to_string()
+}
+
+/// A Scala scale file, catalogued separately from audio: it names pitch
+/// addresses, not sound, so it must never look auditionable.
+fn is_scale_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("scl"))
+}
+
+/// A lens file: a sign system, catalogued beside the scales.
+fn is_lens_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("lens"))
 }
 
 fn is_audio_file(path: &Path) -> bool {
@@ -940,6 +1032,31 @@ mod tests {
         );
         let location = snapshot.locations[0].id.as_str();
         assert_eq!(query(&snapshot, Some(location), "kick").len(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Scale files join the catalog like samples, but in their own list:
+    /// an `.scl` is an address book, not audio, so it must never appear
+    /// among the auditionable assets.
+    #[test]
+    fn scale_files_are_catalogued_apart_from_audio() {
+        let root = temp_root("scales");
+        let nested = root.join("Tunings");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("meantone.scl"), "desc\n2\n9/8\n2\n").unwrap();
+        std::fs::write(nested.join("kick.wav"), []).unwrap();
+        let config = LibraryConfig {
+            user_library: Some(root.clone()),
+            ..Default::default()
+        };
+        let snapshot = scan(&config, 3);
+        assert_eq!(snapshot.assets.len(), 1, "the WAV is the only asset");
+        assert_eq!(snapshot.scales.len(), 1);
+        assert_eq!(snapshot.scales[0].name, "meantone");
+        assert_eq!(
+            snapshot.scales[0].relative_path,
+            PathBuf::from("Tunings/meantone.scl")
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

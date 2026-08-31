@@ -244,7 +244,7 @@ pub fn wire_chain(
         return target;
     }
     let previous = previous.unwrap_or(target);
-    let alpha = 1.0 - (-dt * 1000.0 / smooth_ms.max(1.0)).exp();
+    let alpha = crate::dsp::ramps::one_pole_coeff(dt * 1000.0 / smooth_ms.max(1.0));
     let out = previous + (target - previous) * alpha.clamp(0.0, 1.0);
     if out.is_finite() { out } else { target }
 }

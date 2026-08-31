@@ -1,0 +1,19 @@
+! bohlen-pierce.scl
+! Equal-tempered Bohlen-Pierce: 13 divisions of the tritave. The period
+! is 3/1 - the model never assumes an octave.
+Bohlen-Pierce (equal)
+ 13
+!
+ 146.304231
+ 292.608462
+ 438.912692
+ 585.216923
+ 731.521154
+ 877.825385
+ 1024.129615
+ 1170.433846
+ 1316.738077
+ 1463.042308
+ 1609.346539
+ 1755.650769
+ 3/1

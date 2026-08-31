@@ -1223,6 +1223,13 @@ pub enum ClipEdit {
     /// Where in the FILE the clip starts, in frames. Slides the window;
     /// see `paint_controls`.
     SourceOffset(u64),
+    /// Live's Transpose + Detune, as the knobs currently read. The pitch
+    /// is a varispeed RENDER (no live resampler exists), so the edit is
+    /// the ask; the app owns the worker and the refusal.
+    Transpose {
+        semitones: f32,
+        cents: f32,
+    },
     /// Never empty — a clip with no name is a clip you cannot find.
     Rename(String),
 }
@@ -1243,6 +1250,30 @@ fn loop_param() -> Param {
 
 fn reverse_param() -> Param {
     Param::choice("reverse", &["off", "on"])
+}
+
+fn transpose_param() -> Param {
+    Param::new(
+        "transpose",
+        Mapping::Linear {
+            min: -48.0,
+            max: 48.0,
+        },
+        Unit::Semitones,
+    )
+    .bipolar()
+}
+
+fn detune_param() -> Param {
+    Param::new(
+        "detune",
+        Mapping::Linear {
+            min: -50.0,
+            max: 50.0,
+        },
+        Unit::Cents,
+    )
+    .bipolar()
 }
 
 /// How many BEATS one frame of this clip is worth, or `None` when there
@@ -1639,6 +1670,42 @@ fn paint_controls(
             ui.set_height(cell_h);
             if poly_widgets::labeled_cell_steps(ui, theme, &reverse, &mut backwards, None) {
                 edit = Some(ClipEdit::Reversed(reverse.index(backwards) == 1));
+            }
+        },
+    );
+
+    // Live's Transpose + Detune: one varispeed render behind two knobs.
+    // The knobs say what was asked; the sound follows when the worker
+    // lands, and a busy worker snaps them back — see `set_clip_transpose`.
+    let transpose = transpose_param();
+    let mut st = source.transpose.clamp(-48.0, 48.0);
+    child.allocate_ui_with_layout(
+        egui::vec2(inner.width(), cell_h),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            ui.set_width(inner.width());
+            ui.set_height(cell_h);
+            if poly_widgets::labeled_cell_bar(ui, theme, &transpose, &mut st, None) {
+                edit = Some(ClipEdit::Transpose {
+                    semitones: st,
+                    cents: source.detune,
+                });
+            }
+        },
+    );
+    let detune = detune_param();
+    let mut cents = source.detune.clamp(-50.0, 50.0);
+    child.allocate_ui_with_layout(
+        egui::vec2(inner.width(), cell_h),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            ui.set_width(inner.width());
+            ui.set_height(cell_h);
+            if poly_widgets::labeled_cell_bar(ui, theme, &detune, &mut cents, None) {
+                edit = Some(ClipEdit::Transpose {
+                    semitones: source.transpose,
+                    cents,
+                });
             }
         },
     );
@@ -3512,6 +3579,10 @@ mod tests {
             build_from_samples(Path::new("test.wav"), 128, 1, samples.into_iter().map(Ok))
                 .expect("test samples are valid");
         let mut source = AudioSource {
+            transpose: 0.0,
+            detune: 0.0,
+            transposed_from: None,
+            applied_ratio: 1.0,
             path: PathBuf::from("test.wav"),
             sample_rate: 128,
             source_offset: 128,
@@ -3547,6 +3618,10 @@ mod tests {
     #[test]
     fn one_clip_frame_maps_to_one_source_frame() {
         let mut source = AudioSource {
+            transpose: 0.0,
+            detune: 0.0,
+            transposed_from: None,
+            applied_ratio: 1.0,
             path: PathBuf::from("s.wav"),
             sample_rate: 48_000,
             source_offset: 1_000,
@@ -3622,6 +3697,10 @@ mod tests {
     #[test]
     fn a_fade_is_measured_against_the_clip_not_the_sample() {
         let source = AudioSource {
+            transpose: 0.0,
+            detune: 0.0,
+            transposed_from: None,
+            applied_ratio: 1.0,
             path: PathBuf::from("loop.wav"),
             sample_rate: 48_000,
             source_offset: 0,
@@ -3675,6 +3754,10 @@ mod tests {
     #[test]
     fn a_reversed_clip_is_drawn_mirrored() {
         let source = AudioSource {
+            transpose: 0.0,
+            detune: 0.0,
+            transposed_from: None,
+            applied_ratio: 1.0,
             path: PathBuf::from("loop.wav"),
             sample_rate: 48_000,
             source_offset: 1_000,
@@ -3708,6 +3791,10 @@ mod tests {
 
         // Forwards is untouched.
         let forward = AudioSource {
+            transpose: 0.0,
+            detune: 0.0,
+            transposed_from: None,
+            applied_ratio: 1.0,
             reversed: false,
             ..source
         };
@@ -3721,6 +3808,10 @@ mod tests {
     #[test]
     fn the_mirror_stays_inside_the_region() {
         let source = AudioSource {
+            transpose: 0.0,
+            detune: 0.0,
+            transposed_from: None,
+            applied_ratio: 1.0,
             path: PathBuf::from("loop.wav"),
             sample_rate: 48_000,
             source_offset: 500,
@@ -3909,6 +4000,10 @@ mod tests {
             len: 2.0,
             notes: Vec::new(),
             audio: Some(AudioSource {
+                transpose: 0.0,
+                detune: 0.0,
+                transposed_from: None,
+                applied_ratio: 1.0,
                 path: PathBuf::from("voice.wav"),
                 sample_rate: 48_000,
                 source_offset: 0,
@@ -4035,6 +4130,10 @@ mod tests {
             len: 2.0,
             notes: Vec::new(),
             audio: Some(AudioSource {
+                transpose: 0.0,
+                detune: 0.0,
+                transposed_from: None,
+                applied_ratio: 1.0,
                 path: PathBuf::from("scene.wav"),
                 sample_rate: 48_000,
                 source_offset: 0,
@@ -4452,6 +4551,10 @@ mod tests {
         // with what one frame at a time says — the picture, the readout
         // and the edit must all be looking at the same audio.
         let reversed = AudioSource {
+            transpose: 0.0,
+            detune: 0.0,
+            transposed_from: None,
+            applied_ratio: 1.0,
             reversed: true,
             ..source.clone()
         };
@@ -4463,6 +4566,10 @@ mod tests {
         // LOOPED: inside one pass it maps; across the seam it does not,
         // because there is no one stretch of file for it to be.
         let looped = AudioSource {
+            transpose: 0.0,
+            detune: 0.0,
+            transposed_from: None,
+            applied_ratio: 1.0,
             looped: true,
             ..source
         };
@@ -4903,6 +5010,10 @@ mod tests {
 
     fn stub_source(rate: u32, offset: u64, frames: u64, file: u64) -> AudioSource {
         AudioSource {
+            transpose: 0.0,
+            detune: 0.0,
+            transposed_from: None,
+            applied_ratio: 1.0,
             path: PathBuf::from("stub.wav"),
             sample_rate: rate,
             source_offset: offset,

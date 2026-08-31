@@ -437,9 +437,6 @@ impl App {
         ops: Vec<daw::render::Op>,
         length_change: Option<(u64, i64)>,
     ) -> bool {
-        if ops.is_empty() || self.render_job.is_some() {
-            return false;
-        }
         let Some(clip) = self.arrangement.active_audio_clip() else {
             return false;
         };
@@ -450,21 +447,164 @@ impl App {
         // reversal, but the edit belongs to the material the project
         // actually owns — and `waveform::source_span` already hands back
         // forward-file frames for exactly this reason.
+        let source = audio.path.clone();
+        let id = clip.id;
+        self.request_render_from(verb, id, &source, ops, length_change)
+    }
+
+    /// The same, rendering FROM a named file — the original a clip pitch
+    /// change renders from, never the previous pitch render: rendering a
+    /// render would compound the resampling loss every time the knob
+    /// moved.
+    fn request_render_from(
+        &mut self,
+        verb: &'static str,
+        clip: u64,
+        source: &std::path::Path,
+        ops: Vec<daw::render::Op>,
+        length_change: Option<(u64, i64)>,
+    ) -> bool {
+        if ops.is_empty() || self.render_job.is_some() {
+            return false;
+        }
         let job = daw::render::Job {
-            source: audio.path.clone(),
+            source: source.to_path_buf(),
             ops,
         };
         self.render_job = Some(RenderRequest {
-            clip: clip.id,
+            clip,
             length_change,
             verb,
             flatten: false,
             rescale: None,
+            transpose_apply: None,
             as_new_clip: false,
             ripple: self.waveform.ripple(),
         });
         self.wav_import_service.render(job);
         true
+    }
+
+    /// Set the active clip's pitch — Live's Transpose + Detune, combined
+    /// into one varispeed ratio. The knobs update immediately; the SOUND
+    /// follows when the render lands, because no live resampler exists —
+    /// the same honesty the destructive transpose verb keeps. Returning
+    /// to zero is free and instant: the original file was never touched.
+    pub(crate) fn set_clip_transpose(&mut self, transpose: f32, detune: f32) {
+        let transpose = transpose.clamp(-48.0, 48.0);
+        let detune = detune.clamp(-50.0, 50.0);
+        let Some(clip) = self.arrangement.active_audio_clip() else {
+            return;
+        };
+        let Some(audio) = clip.audio.as_ref() else {
+            return;
+        };
+        let old_semitones = audio.transpose;
+        let old_cents = audio.detune;
+        let old_ratio = audio.applied_ratio.max(1e-4);
+        let total = (transpose + detune / 100.0).clamp(-48.0, 48.0);
+        let current = old_semitones + old_cents / 100.0;
+        if (total - current).abs() < 1e-4 {
+            return;
+        }
+
+        // Back to neutral: no render — hand the clip its original file
+        // and its original frames. The fades and envelope were scaled
+        // into render space, so they scale back by the old ratio.
+        if total.abs() < 1e-4 {
+            let Some(base) = audio.transposed_from.clone() else {
+                return;
+            };
+            let Some((track, index)) = self.arrangement.selected_clip else {
+                return;
+            };
+            let Some(clip) = self
+                .arrangement
+                .clips
+                .get_mut(track)
+                .and_then(|clips| clips.get_mut(index))
+            else {
+                return;
+            };
+            {
+                let Some(audio) = clip.audio.as_mut() else {
+                    return;
+                };
+                let frames = (audio.file_frames() as f32 * old_ratio).round().max(1.0) as u64;
+                audio.path = base.clone();
+                audio.source_offset = 0;
+                audio.source_frames = frames;
+                audio.file_frames = frames;
+                audio.transpose = 0.0;
+                audio.detune = 0.0;
+                audio.transposed_from = None;
+                audio.applied_ratio = 1.0;
+            }
+            rescale_after_transpose(clip, 1.0 / old_ratio);
+            self.arrangement.force_recompile = true;
+            let path = base;
+            if self.waveform_cache.contains_key(&path) || self.waveform_pending.contains(&path) {
+                return;
+            }
+            self.waveform_pending.insert(path.clone());
+            self.waveform_service.request(path);
+            return;
+        }
+
+        // A render, always from the ORIGINAL — the clip's own file while
+        // it is un-pitched, and `transposed_from` once it is not.
+        let base = audio
+            .transposed_from
+            .clone()
+            .unwrap_or_else(|| audio.path.clone());
+        let ratio = daw::render::Op::transpose_ratio(total);
+        let before = audio.file_frames();
+        let base_frames = (before as f32 * old_ratio).round().max(1.0) as u64;
+        let after = (base_frames as f32 / ratio).round().max(1.0) as u64;
+        let change = Some((0u64, after as i64 - before as i64));
+        let clip_id = clip.id;
+        if !self.request_render_from(
+            "transpose",
+            clip_id,
+            &base,
+            vec![daw::render::Op::Transpose { semitones: total }],
+            change,
+        ) {
+            // The worker is busy: the knobs snap back to what is actually
+            // sounding rather than promising a pitch that never arrives.
+            let Some((track, index)) = self.arrangement.selected_clip else {
+                return;
+            };
+            if let Some(audio) = self
+                .arrangement
+                .clips
+                .get_mut(track)
+                .and_then(|clips| clips.get_mut(index))
+                .and_then(|clip| clip.audio.as_mut())
+            {
+                audio.transpose = old_semitones;
+                audio.detune = old_cents;
+            }
+            self.notice = Some("transpose refused: a render is already running".into());
+            return;
+        }
+        if let Some(request) = self.render_job.as_mut() {
+            request.rescale = Some(ratio / old_ratio);
+            request.transpose_apply = Some((ratio, base));
+        }
+        // The knobs say what was asked while the render runs; the model
+        // fields follow so a second change reads the right old state.
+        if let Some((track, index)) = self.arrangement.selected_clip
+            && let Some(audio) = self
+                .arrangement
+                .clips
+                .get_mut(track)
+                .and_then(|clips| clips.get_mut(index))
+                .and_then(|clip| clip.audio.as_mut())
+        {
+            audio.transpose = transpose;
+            audio.detune = detune;
+        }
     }
 
     /// Take the worker's answers: a rendered file to repoint a clip at,
@@ -490,7 +630,7 @@ impl App {
                     continue;
                 }
             };
-            let Some(request) = self.render_job.take() else {
+            let Some(mut request) = self.render_job.take() else {
                 continue;
             };
             // On a LANE first, where a ripple has neighbours to move.
@@ -527,6 +667,15 @@ impl App {
                     repoint_clip(&mut clips[index], &rendered, request.length_change);
                     if let Some(ratio) = request.rescale {
                         rescale_after_transpose(&mut clips[index], ratio);
+                    }
+                    // A CLIP PITCH change landing: remember the original
+                    // file and the ratio now baked in, so the knobs can
+                    // come home to zero without another render.
+                    if let Some((ratio, base)) = request.transpose_apply.take()
+                        && let Some(audio) = clips[index].audio.as_mut()
+                    {
+                        audio.transposed_from = Some(base);
+                        audio.applied_ratio = ratio;
                     }
                     if request.flatten {
                         neutralise_after_flatten(&mut clips[index], &rendered);

@@ -119,6 +119,53 @@ impl Default for Keymap {
                 Key::F,
                 UiAction::ToggleChrome,
             ),
+            // Ableton's arrangement gestures. The live handler is
+            // `arrangement_keys`; the table keeps the shortcut sheet
+            // truthful alongside it.
+            Binding::new(
+                Modifiers::COMMAND.plus(Modifiers::SHIFT),
+                Key::L,
+                UiAction::SelectLoopContents,
+            ),
+            Binding::new(Modifiers::COMMAND, Key::L, UiAction::LoopFromSelection),
+            Binding::new(Modifiers::COMMAND, Key::ArrowLeft, UiAction::SnapMarker(-1)),
+            Binding::new(Modifiers::COMMAND, Key::ArrowRight, UiAction::SnapMarker(1)),
+            Binding::new(Modifiers::COMMAND, Key::ArrowUp, UiAction::ResizeLoop(2.0)),
+            Binding::new(
+                Modifiers::COMMAND,
+                Key::ArrowDown,
+                UiAction::ResizeLoop(0.5),
+            ),
+            Binding::new(Modifiers::ALT, Key::U, UiAction::UnfoldAll),
+            Binding::new(Modifiers::NONE, Key::U, UiAction::FoldTrack),
+            Binding::new(Modifiers::ALT, Key::Plus, UiAction::TrackHeight(20.0)),
+            Binding::new(Modifiers::ALT, Key::Minus, UiAction::TrackHeight(-20.0)),
+            Binding::new(Modifiers::NONE, Key::H, UiAction::FitTracks),
+            Binding::new(Modifiers::NONE, Key::W, UiAction::FitWidth),
+            Binding::new(Modifiers::NONE, Key::R, UiAction::ReverseAudio),
+            Binding::new(
+                Modifiers::COMMAND.plus(Modifiers::ALT),
+                Key::F,
+                UiAction::FadeSelected,
+            ),
+            Binding::new(
+                Modifiers::COMMAND.plus(Modifiers::ALT),
+                Key::Backspace,
+                UiAction::ClearFades,
+            ),
+            // Plain Plus is Shift+Equals on a US layout, so both forms
+            // carry the same verb.
+            Binding::new(Modifiers::NONE, Key::Plus, UiAction::ZoomTimeline(2.0)),
+            Binding::new(Modifiers::SHIFT, Key::Equals, UiAction::ZoomTimeline(2.0)),
+            Binding::new(Modifiers::NONE, Key::Minus, UiAction::ZoomTimeline(0.5)),
+            // Shift-specific first, so Ctrl+Shift+J crops before plain
+            // Ctrl+J could consolidate.
+            Binding::new(
+                Modifiers::COMMAND.plus(Modifiers::SHIFT),
+                Key::J,
+                UiAction::CropFocusedClip,
+            ),
+            Binding::new(Modifiers::COMMAND, Key::J, UiAction::Consolidate),
         ])
     }
 }

@@ -11,6 +11,31 @@
 //! changes arrive through setters between blocks; kernels do not smooth
 //! their own parameters (these ARE the smoothers).
 
+/// The one-pole coefficient that decays at `rate` per sample: `1 − e^−rate`.
+///
+/// Written with `exp_m1` because the obvious spelling cancels. For a slow
+/// envelope `rate` is tiny, so `e^−rate` sits just under 1.0 where f32
+/// steps by about 6e-8 — and `1.0 − 0.99999` throws away most of the
+/// digits that said what the time constant WAS. Measured against an f64
+/// reference: a one-second release at 48 kHz came out 0.14% fast (a
+/// coefficient meaning 47_934 samples, not 48_000), and a five-second one
+/// landed 7 ms short. `exp_m1` computes `e^x − 1` directly and holds all
+/// of it — the error drops from 1.4e-3 to about 3e-8, the float's own
+/// floor.
+///
+/// Inaudible either way, and free: `exp_m1` costs what `exp` costs. This
+/// is here so every ballistic in the tree gets the exact answer from one
+/// place instead of the lossy one from fifteen.
+///
+/// State: none. Green zone: coefficients are built at prepare, never in
+/// the loop. `rate <= 0` or non-finite gives 1.0, meaning "instant".
+pub fn one_pole_coeff(rate: f32) -> f32 {
+    if !rate.is_finite() || rate <= 0.0 {
+        return 1.0;
+    }
+    (-(-rate).exp_m1()).clamp(0.0, 1.0)
+}
+
 /// Linear glide from the current value to a target over a fixed number of
 /// samples, then hold. The parameter-ramp primitive: process() writes the
 /// control signal; endpoints are exact (the final sample IS the target
@@ -22,6 +47,7 @@
 /// In-place safe: n/a — output-only (fills the block).
 /// Latency: 0 samples.
 #[derive(Debug, Clone, Copy)]
+
 pub struct LinearRamp {
     value: f32,
     target: f32,
@@ -131,7 +157,7 @@ impl Smoother {
     pub fn prepare(&mut self, sample_rate: f32, time_ms: f32) {
         let samples = time_ms * 1e-3 * sample_rate;
         self.coeff = if samples.is_finite() && samples >= 1.0 {
-            1.0 - (-1.0 / samples).exp()
+            one_pole_coeff(1.0 / samples)
         } else {
             1.0
         };
@@ -295,7 +321,7 @@ impl Follower {
         let coeff = |ms: f32| {
             let samples = ms * 1e-3 * sample_rate;
             if samples.is_finite() && samples >= 1.0 {
-                1.0 - (-1.0 / samples).exp()
+                one_pole_coeff(1.0 / samples)
             } else {
                 1.0
             }
@@ -583,5 +609,30 @@ mod tests {
         let mut out = vec![9.0f32; 4_096];
         s.process(&mut out);
         assert!(out.iter().all(|x| x.is_finite() && *x >= 0.0));
+    }
+
+    /// The coefficient has to mean the time constant it was asked for.
+    #[test]
+    fn one_pole_coeff_keeps_its_time_constant() {
+        for &tau in &[10.0f64, 100.0, 1_000.0, 48_000.0, 240_000.0] {
+            let want = -((-1.0f64 / tau).exp_m1());
+            let got = one_pole_coeff(1.0 / tau as f32) as f64;
+            let rel = ((got - want) / want).abs();
+            assert!(
+                rel < 1e-6,
+                "tau {tau}: coefficient off by {rel:e} (naive `1 - exp` reaches 1.4e-3)"
+            );
+            // ...and read back as the same number of samples.
+            let read = -1.0 / (1.0 - got).ln();
+            assert!(
+                (read - tau).abs() / tau < 1e-5,
+                "tau {tau} reads back as {read:.1}"
+            );
+        }
+        assert_eq!(one_pole_coeff(0.0), 1.0, "no decay rate means instant");
+        assert_eq!(one_pole_coeff(-1.0), 1.0);
+        assert_eq!(one_pole_coeff(f32::NAN), 1.0);
+        assert_eq!(one_pole_coeff(f32::INFINITY), 1.0);
+        assert!((0.0..=1.0).contains(&one_pole_coeff(1e-30)));
     }
 }

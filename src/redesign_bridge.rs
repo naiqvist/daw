@@ -1,0 +1,1978 @@
+//! The redesign's bridge onto the application's established state.
+//!
+//! This layer survives the legacy UI because it projects canonical app data
+//! into read-only redesign views and returns typed intents through the old,
+//! authoritative mutation paths; it owns neither engine state nor a shadow UI.
+
+use super::*;
+
+/// The complete legacy arrangement vocabulary rendered in the redesign's
+/// grayscale material system. Every RGB role is neutral by construction;
+/// hierarchy comes from value, weight and geometry rather than hue.
+pub(super) fn redesign_arrangement_theme() -> Theme {
+    let mut theme = Theme::dark();
+    let gray = egui::Color32::from_gray;
+    theme.light = false;
+    theme.bg = egui::Color32::BLACK;
+    theme.surface = gray(10);
+    theme.surface_raised = gray(18);
+    theme.surface_sunken = egui::Color32::BLACK;
+    theme.text = egui::Color32::WHITE;
+    theme.text_muted = gray(112);
+    theme.text_value = egui::Color32::WHITE;
+    theme.outline = gray(42);
+    theme.divider = gray(24);
+    theme.focus = egui::Color32::WHITE;
+    theme.accent = gray(220);
+    theme.accent_muted = gray(72);
+    theme.role_time = gray(190);
+    theme.role_time_dim = gray(82);
+    theme.role_level = gray(205);
+    theme.role_level_dim = gray(76);
+    theme.role_shape = gray(225);
+    theme.role_shape_dim = gray(90);
+    theme.role_mod = gray(180);
+    theme.role_mod_dim = gray(68);
+    theme.ok = gray(188);
+    theme.warn = gray(214);
+    theme.danger = egui::Color32::WHITE;
+    theme.red_zone = gray(210);
+    theme.green_zone = gray(170);
+    theme.playhead = egui::Color32::WHITE;
+    theme.loop_region = egui::Color32::from_rgba_premultiplied(90, 90, 90, 30);
+    theme.loop_brace = gray(205);
+    theme.selection = egui::Color32::from_rgba_premultiplied(110, 110, 110, 44);
+    theme.grid_beat = gray(28);
+    theme.grid_bar = gray(54);
+    theme.grid_sub = gray(16);
+    theme.timeline_lane = egui::Color32::BLACK;
+    theme.timeline_lane_alt = gray(5);
+    theme.timeline_lane_selected = gray(12);
+    theme.clip_body = gray(24);
+    theme.clip_midi = gray(30);
+    theme.clip_midi_header = gray(58);
+    theme.clip_audio = gray(22);
+    theme.clip_audio_header = gray(48);
+    theme.clip_hover = gray(138);
+    theme.clip_selected = egui::Color32::WHITE;
+    theme.clip_note = gray(210);
+    theme.note_fill = gray(184);
+    theme.note_fill_selected = gray(220);
+    theme.note_edge = gray(20);
+    theme.note_hover = gray(204);
+    theme.note_ghost = gray(88);
+    theme.meter_low = gray(170);
+    theme.meter_hot = gray(220);
+    theme.meter_clip = egui::Color32::WHITE;
+    theme
+}
+
+fn beats_to_sequence_ticks(beats: f64) -> usize {
+    (beats.max(0.0) * daw::sequencing::TICKS_PER_BEAT as f64).round() as usize
+}
+
+fn sequence_ticks_to_beats(ticks: usize) -> f64 {
+    ticks as f64 / daw::sequencing::TICKS_PER_BEAT as f64
+}
+
+const SONG_PATTERN_STEP_TICKS: usize = daw::sequencing::TICKS_PER_BEAT / 4;
+
+fn song_pattern_length(song: &daw::sequencing::Song, id: daw::sequencing::PatternId) -> usize {
+    song.tracks
+        .iter()
+        .flat_map(|track| &track.blocks)
+        .find(|block| block.pattern_id == id)
+        .map_or(daw::sequencing::DEFAULT_PATTERN_TICKS, |block| {
+            block.length_ticks
+        })
+}
+
+fn song_pattern_note_views(
+    pattern: &daw::sequencing::Pattern,
+    key: &daw::pitch::Key,
+) -> Vec<redesign_sequence::NoteView> {
+    (0..daw::sequencing::PATTERN_STEPS)
+        .flat_map(|step| {
+            let trig = pattern.trig(step);
+            trig.enabled
+                .then_some(trig)
+                .into_iter()
+                .flat_map(move |trig| {
+                    trig.notes.iter().map(move |note| {
+                        song_note_view(
+                            note,
+                            step * SONG_PATTERN_STEP_TICKS,
+                            trig.probability,
+                            trig.enabled,
+                            key,
+                        )
+                    })
+                })
+        })
+        .collect()
+}
+
+/// Green-zone resolution, once per frame: the view carries the finished
+/// numbers, and the honest flag that the legacy path is approximating.
+fn song_note_view(
+    note: &daw::sequencing::Note,
+    start_ticks: usize,
+    probability: f32,
+    enabled: bool,
+    key: &daw::pitch::Key,
+) -> redesign_sequence::NoteView {
+    let hz = note.pitch.resolve(key);
+    redesign_sequence::NoteView {
+        pitch: note.pitch,
+        hz,
+        midi: daw::pitch::nearest_midi(hz),
+        approx: daw::pitch::cents_from_midi_table(hz).abs() > APPROX_CENTS,
+        start_ticks,
+        length_ticks: note.length_ticks,
+        micro_ticks: note.micro_ticks,
+        velocity: note.velocity,
+        probability,
+        enabled,
+    }
+}
+
+/// Below this remainder the legacy MIDI path reproduces a pitch exactly
+/// (float noise is orders of magnitude smaller); above it the trig wears
+/// the `≈` playback-approximation sign.
+const APPROX_CENTS: f64 = 0.05;
+
+/// A pending `:snap-key`: the notes the trig WOULD hold, previewed as
+/// ghosts until Enter commits or Escape cancels. Snap is the one LOSSY
+/// pitch transform, and the preview contract exists because loss must
+/// be seen before it is chosen.
+pub(super) struct SnapPreview {
+    pub(super) pattern: daw::sequencing::PatternId,
+    pub(super) step: usize,
+    pub(super) after: Vec<daw::sequencing::Note>,
+}
+
+/// A `.lens` file from the library, by stem, parsed on demand.
+fn lens_file_by_name(
+    snapshot: &daw::library::LibrarySnapshot,
+    stem: &str,
+) -> Option<Result<daw::ui::redesign::lens::Lens, String>> {
+    let record = snapshot
+        .lenses
+        .iter()
+        .find(|lens| lens.name.eq_ignore_ascii_case(stem))?;
+    Some(match std::fs::read_to_string(&record.path) {
+        Ok(source) => daw::ui::redesign::lens::parse_lens(&source),
+        Err(error) => Err(format!("cannot read {}: {error}", record.path.display())),
+    })
+}
+
+fn apply_song_pattern_intents(
+    pattern: &mut daw::sequencing::Pattern,
+    intents: &[redesign_sequence::Intent],
+) -> Option<&'static str> {
+    let mut notice = None;
+    for intent in intents {
+        use redesign_sequence::Intent;
+        let tick = match *intent {
+            Intent::Toggle { tick, .. }
+            | Intent::SetPrimary { tick, .. }
+            | Intent::Clear { tick }
+            | Intent::Nudge { tick, .. }
+            | Intent::Resize { tick, .. }
+            | Intent::AddNote { tick, .. }
+            | Intent::SetProbability { tick, .. }
+            | Intent::AdjustVelocity { tick, .. } => tick,
+        };
+        // Song patterns have one address per sixteenth. Finer sequence-grid
+        // ticks deliberately round down into the containing 12-tick step.
+        let step = tick / SONG_PATTERN_STEP_TICKS;
+        if step >= daw::sequencing::PATTERN_STEPS {
+            notice = Some("sequence step is outside the pattern");
+            continue;
+        }
+
+        match *intent {
+            Intent::Toggle {
+                default_pitch,
+                default_length_ticks,
+                default_velocity,
+                ..
+            } => pattern.toggle(
+                step,
+                daw::sequencing::Note::with_pitch(
+                    default_pitch,
+                    default_length_ticks,
+                    default_velocity,
+                ),
+            ),
+            Intent::SetPrimary {
+                pitch,
+                length_ticks,
+                velocity,
+                ..
+            } => pattern.set_primary(
+                step,
+                daw::sequencing::Note::with_pitch(pitch, length_ticks, velocity),
+            ),
+            Intent::Clear { .. } => pattern.clear(step),
+            Intent::AddNote {
+                pitch,
+                length_ticks,
+                velocity,
+                probability,
+                ..
+            } => {
+                pattern.add_tone(
+                    step,
+                    daw::sequencing::Note::with_pitch(pitch, length_ticks, velocity),
+                );
+                pattern.trig_mut(step).probability = probability.clamp(0.01, 1.0);
+            }
+            Intent::SetProbability { probability, .. } => {
+                pattern.trig_mut(step).probability = probability.clamp(0.01, 1.0);
+            }
+            Intent::AdjustVelocity { delta, .. } => {
+                let trig = pattern.trig_mut(step);
+                if trig.notes.is_empty() {
+                    notice = Some("velocity: no trig here");
+                    continue;
+                }
+                for note in &mut trig.notes {
+                    note.velocity =
+                        (isize::from(note.velocity).saturating_add(delta)).clamp(1, 127) as u8;
+                }
+            }
+            Intent::Resize { delta_ticks, .. } => {
+                let trig = pattern.trig_mut(step);
+                if trig.notes.is_empty() {
+                    notice = Some("resize: no trig here");
+                    continue;
+                }
+                for note in &mut trig.notes {
+                    note.length_ticks = note.length_ticks.saturating_add_signed(delta_ticks).max(1);
+                }
+            }
+            Intent::Nudge { delta_ticks, .. } => {
+                if pattern.trig(step).notes.is_empty() {
+                    notice = Some("nudge: no trig here");
+                    continue;
+                }
+                let Some(target_tick) = isize::try_from(tick)
+                    .ok()
+                    .and_then(|tick| tick.checked_add(delta_ticks))
+                    .filter(|target| *target >= 0)
+                    .map(|target| target as usize)
+                else {
+                    notice = Some("nudge blocked at the pattern edge");
+                    continue;
+                };
+                let target_step = target_tick / SONG_PATTERN_STEP_TICKS;
+                if target_step >= daw::sequencing::PATTERN_STEPS {
+                    notice = Some("nudge blocked at the pattern edge");
+                    continue;
+                }
+                if target_step == step {
+                    continue;
+                }
+                if !pattern.trig(target_step).notes.is_empty() {
+                    notice = Some("nudge blocked by an occupied step");
+                    continue;
+                }
+                let trig = std::mem::take(pattern.trig_mut(step));
+                *pattern.trig_mut(target_step) = trig;
+            }
+        }
+    }
+    notice
+}
+
+impl App {
+    pub(super) fn apply_redesign_sequence_intents(
+        &mut self,
+        intents: &[redesign_sequence::Intent],
+    ) {
+        let Some((track, index)) = self.arrangement.selected_clip else {
+            return;
+        };
+        if !self
+            .arrangement
+            .tracks
+            .get(track)
+            .is_some_and(|lane| lane.kind == TrackKind::Midi)
+        {
+            return;
+        }
+
+        for intent in intents {
+            use redesign_sequence::Intent;
+            let (tick, required_end) = match *intent {
+                Intent::Toggle {
+                    tick,
+                    default_length_ticks,
+                    ..
+                }
+                | Intent::SetPrimary {
+                    tick,
+                    length_ticks: default_length_ticks,
+                    ..
+                } => (tick, tick.saturating_add(default_length_ticks)),
+                Intent::AddNote {
+                    tick, length_ticks, ..
+                } => (tick, tick.saturating_add(length_ticks)),
+                Intent::Clear { tick }
+                | Intent::Nudge { tick, .. }
+                | Intent::Resize { tick, .. }
+                | Intent::SetProbability { tick, .. }
+                | Intent::AdjustVelocity { tick, .. } => (tick, tick),
+            };
+
+            // A fixed 64-address grid must never accept an inaudible note
+            // beyond the clip edge. Grow the clip as needed, respecting the
+            // next timeline clip; if that boundary blocks the address, leave
+            // the musical data untouched and tell the user why.
+            if required_end > 0 {
+                let want = sequence_ticks_to_beats(required_end) as f32;
+                if want > self.arrangement.clips[track][index].len {
+                    let length = clamp_clip_len(
+                        &self.arrangement.clips[track],
+                        index,
+                        want,
+                        self.arrangement.grid_beats(),
+                    );
+                    set_scripted_clip_len(&mut self.arrangement.clips[track][index], length);
+                }
+                if sequence_ticks_to_beats(tick) as f32 >= self.arrangement.clips[track][index].len
+                {
+                    self.notice = Some(
+                        "sequence step is beyond the clip boundary; move the next clip first"
+                            .to_owned(),
+                    );
+                    continue;
+                }
+            }
+
+            // Legacy clips store MIDI numbers: the bridge resolves the
+            // typed pitch against the project key, green-side, exactly
+            // like the song projection does.
+            let key = self.song.key.clone();
+            let as_midi = |pitch: daw::pitch::Pitch| daw::pitch::nearest_midi(pitch.resolve(&key));
+            let clip = &mut self.arrangement.clips[track][index];
+            let at_tick = |note: &Note| beats_to_sequence_ticks(note.start) == tick;
+            match *intent {
+                Intent::Toggle {
+                    default_pitch,
+                    default_length_ticks,
+                    default_velocity,
+                    ..
+                } => {
+                    let present = clip.notes.iter().any(at_tick);
+                    if present {
+                        let enabled = clip.notes.iter().any(|note| at_tick(note) && !note.muted);
+                        for note in clip.notes.iter_mut().filter(|note| at_tick(note)) {
+                            note.muted = enabled;
+                        }
+                    } else {
+                        clip.notes.push(Note {
+                            pitch: as_midi(default_pitch),
+                            start: sequence_ticks_to_beats(tick),
+                            len: sequence_ticks_to_beats(default_length_ticks),
+                            vel: default_velocity,
+                            muted: false,
+                            plocks: Vec::new(),
+                            prob: 1.0,
+                            cond: None,
+                        });
+                    }
+                }
+                Intent::SetPrimary {
+                    pitch,
+                    length_ticks,
+                    velocity,
+                    ..
+                } => {
+                    let primary = clip
+                        .notes
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, note)| at_tick(note))
+                        .min_by_key(|(_, note)| note.pitch)
+                        .map(|(index, _)| index);
+                    if let Some(primary) = primary {
+                        let note = &mut clip.notes[primary];
+                        note.pitch = as_midi(pitch);
+                        note.len = sequence_ticks_to_beats(length_ticks);
+                        note.vel = velocity;
+                        note.muted = false;
+                    } else {
+                        clip.notes.push(Note {
+                            pitch: as_midi(pitch),
+                            start: sequence_ticks_to_beats(tick),
+                            len: sequence_ticks_to_beats(length_ticks),
+                            vel: velocity,
+                            muted: false,
+                            plocks: Vec::new(),
+                            prob: 1.0,
+                            cond: None,
+                        });
+                    }
+                }
+                Intent::Clear { .. } => clip.notes.retain(|note| !at_tick(note)),
+                Intent::AddNote {
+                    pitch,
+                    length_ticks,
+                    velocity,
+                    probability,
+                    ..
+                } => {
+                    clip.notes.push(Note {
+                        pitch: as_midi(pitch),
+                        start: sequence_ticks_to_beats(tick),
+                        len: sequence_ticks_to_beats(length_ticks),
+                        vel: velocity,
+                        muted: false,
+                        plocks: Vec::new(),
+                        prob: probability,
+                        cond: None,
+                    });
+                }
+                Intent::AdjustVelocity { delta, .. } => {
+                    let mut touched = false;
+                    for note in clip.notes.iter_mut().filter(|note| at_tick(note)) {
+                        note.vel = (i16::from(note.vel) + delta as i16).clamp(1, 127) as u8;
+                        touched = true;
+                    }
+                    if !touched {
+                        self.notice = Some("velocity: no trig here".to_owned());
+                    }
+                }
+                Intent::SetProbability { probability, .. } => {
+                    let mut touched = false;
+                    for note in clip.notes.iter_mut().filter(|note| at_tick(note)) {
+                        note.prob = probability.clamp(0.01, 1.0);
+                        touched = true;
+                    }
+                    if !touched {
+                        self.notice = Some("condition: no trig here".to_owned());
+                    }
+                }
+                Intent::Nudge { delta_ticks, .. } => {
+                    // The whole trig moves or none of it does: a nudge that
+                    // would push any note past an edge is refused, so the
+                    // gesture never half-applies.
+                    if !clip.notes.iter().any(&at_tick) {
+                        self.notice = Some("nudge: no trig here".to_owned());
+                        continue;
+                    }
+                    let clip_end = beats_to_sequence_ticks(f64::from(clip.len));
+                    let target = tick as isize + delta_ticks;
+                    let blocked = target < 0
+                        || clip.notes.iter().filter(|note| at_tick(note)).any(|note| {
+                            target as usize + beats_to_sequence_ticks(note.len) > clip_end
+                        });
+                    if blocked {
+                        self.notice = Some("nudge blocked at the clip edge".to_owned());
+                        continue;
+                    }
+                    for note in clip.notes.iter_mut().filter(|note| at_tick(note)) {
+                        note.start = sequence_ticks_to_beats(target as usize);
+                    }
+                }
+                Intent::Resize { delta_ticks, .. } => {
+                    let clip_end = beats_to_sequence_ticks(f64::from(clip.len));
+                    let mut touched = false;
+                    for note in clip.notes.iter_mut().filter(|note| at_tick(note)) {
+                        let length = beats_to_sequence_ticks(note.len) as isize + delta_ticks;
+                        let length = (length.max(1) as usize).min(clip_end.saturating_sub(tick));
+                        note.len = sequence_ticks_to_beats(length.max(1));
+                        touched = true;
+                    }
+                    if !touched {
+                        self.notice = Some("resize: no trig here".to_owned());
+                    }
+                }
+            }
+            clip.notes.sort_by(|a, b| {
+                a.start
+                    .total_cmp(&b.start)
+                    .then_with(|| a.pitch.cmp(&b.pitch))
+            });
+        }
+    }
+
+    fn apply_redesign_chain_intents(&mut self, intents: &[daw::ui::redesign::chain::Intent]) {
+        let track = self.arrangement.active_track();
+        for intent in intents {
+            use daw::ui::redesign::chain::Intent;
+            match *intent {
+                Intent::SetParam {
+                    device,
+                    param,
+                    value,
+                } => {
+                    let Some(track) = track else { continue };
+                    self.apply_device_edits(
+                        ChainOwner::Track(track),
+                        device,
+                        &[device::ParamEdit { param, value }],
+                    );
+                }
+                Intent::ToggleBypass { device } => {
+                    let Some(track) = track else { continue };
+                    if let Some(instance) = self.chain_device_mut(ChainOwner::Track(track), device)
+                    {
+                        instance.bypass = !instance.bypass;
+                        self.arrangement.force_recompile = true;
+                    }
+                }
+                Intent::Reorder { device, target } => {
+                    let Some(track) = track else { continue };
+                    let moved =
+                        self.arrangement.tracks.get_mut(track).is_some_and(|lane| {
+                            track::move_device(&mut lane.chain, device, target)
+                        });
+                    if moved {
+                        self.arrangement.force_recompile = true;
+                    }
+                }
+                Intent::AddDevice { catalogue_index } => {
+                    if let Some(spec) = devices::DEVICES.get(catalogue_index) {
+                        self.add_redesign_device(spec.kind);
+                    }
+                }
+            }
+        }
+    }
+
+    fn add_redesign_device(&mut self, kind: DeviceKind) {
+        if let Some(index) = self.arrangement.return_selected {
+            if kind.is_instrument() {
+                self.notice = Some(format!(
+                    "a return is a bus — no slot for a {}",
+                    kind.spec().name
+                ));
+                return;
+            }
+            let instance = self.mint_device_instance(kind);
+            if let Some(bus) = self.arrangement.returns.get_mut(index)
+                && bus.insert_device(instance)
+            {
+                self.arrangement.force_recompile = true;
+            }
+            return;
+        }
+        if self.arrangement.master_selected {
+            if kind.is_instrument() {
+                self.notice = Some(format!(
+                    "the master is a bus — no slot for a {}",
+                    kind.spec().name
+                ));
+                return;
+            }
+            let instance = self.mint_device_instance(kind);
+            if self.arrangement.master.insert_device(instance) {
+                self.arrangement.force_recompile = true;
+            }
+            return;
+        }
+
+        let Some(track) = self.arrangement.active_track() else {
+            self.notice = Some("no track selected".to_owned());
+            return;
+        };
+        let Some(target) = self.arrangement.tracks.get(track) else {
+            self.notice = Some("no track selected".to_owned());
+            return;
+        };
+        if kind.is_instrument() && !target.kind.takes_instrument() {
+            let name = target.name.clone();
+            let what = if target.is_group {
+                "a group"
+            } else {
+                "an audio track"
+            };
+            self.notice = Some(format!(
+                "{name} is {what} — no slot for a {}",
+                kind.spec().name
+            ));
+            return;
+        }
+
+        let instance = self.mint_device_instance(kind);
+        let displaced = self.arrangement.tracks[track].insert_device(instance);
+        if let Some(displaced) = displaced {
+            self.arrangement.forget_device(track, displaced);
+        }
+        self.arrangement.select_track(track);
+        self.arrangement.force_recompile = true;
+    }
+
+    /// The new visual layer starts here. The render pass already clears the
+    /// client area to black, so drawing nothing is an intentional blank UI.
+    pub(super) fn draw_redesign_ui(&mut self, ui: &mut egui::Ui) {
+        // A pending snap owns Enter and Escape before anything else can
+        // hear them: commit the loss, or walk away whole. The ghosts in
+        // the grid say what is at stake; the palette, when open, still
+        // speaks first.
+        if self.snap_preview.is_some() && !self.palette.is_open() {
+            let commit = ui
+                .ctx()
+                .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+            let cancel = !commit
+                && ui
+                    .ctx()
+                    .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+            if commit {
+                self.commit_snap_preview();
+            } else if cancel {
+                self.snap_preview = None;
+                self.notice = Some("SNAP-KEY: CANCELLED — NOTHING CHANGED".to_owned());
+            }
+        }
+
+        let playhead_beats = self.transport.position * self.transport.bpm / 60.0;
+        // The device surface sees a green-zone projection of the selected
+        // track's canonical chain. Parameter words come from the same
+        // formatters as the legacy lock editor and device cards; edits return
+        // below through `apply_device_edits`, never through a second state.
+        let mut chain_view = self
+            .arrangement
+            .active_track()
+            .and_then(|track| self.arrangement.tracks.get(track))
+            .map(|track| daw::ui::redesign::chain::View {
+                track_name: Some(track.name.clone()),
+                devices: track
+                    .chain
+                    .iter()
+                    .map(|instance| {
+                        let kind = instance.kind();
+                        let spec = kind.spec();
+                        daw::ui::redesign::chain::DeviceView {
+                            id: instance.id,
+                            name: spec.name.to_owned(),
+                            bypassed: instance.bypass,
+                            instrument: kind.is_instrument(),
+                            parent: instance.parent,
+                            hero: match kind {
+                                devices::DeviceKind::Kick => {
+                                    daw::ui::redesign::chain::HeroKind::Kick
+                                }
+                                devices::DeviceKind::Filter => {
+                                    daw::ui::redesign::chain::HeroKind::Filter
+                                }
+                                devices::DeviceKind::Sat => {
+                                    daw::ui::redesign::chain::HeroKind::Saturator
+                                }
+                                _ => daw::ui::redesign::chain::HeroKind::None,
+                            },
+                            params: spec
+                                .params
+                                .iter()
+                                .zip(spec.labels)
+                                .map(|(def, label)| {
+                                    let base = instance.state.value(def.id).unwrap_or(def.default);
+                                    daw::ui::redesign::chain::ParamView {
+                                        id: def.id,
+                                        name: label.name.to_owned(),
+                                        min: def.min,
+                                        max: def.max,
+                                        base,
+                                        choices: device_choices(kind, def),
+                                        formatted: device_format(kind, def.id, base, label.unit),
+                                        // No trig noun is selected on this
+                                        // surface yet, so only BASE exists.
+                                        lock: None,
+                                    }
+                                })
+                                .collect(),
+                        }
+                    })
+                    .collect(),
+                catalogue: Vec::new(),
+            })
+            .unwrap_or_default();
+        chain_view.catalogue = devices::DEVICES
+            .iter()
+            .map(|spec| daw::ui::redesign::chain::CatalogueItem {
+                name: spec.name.to_owned(),
+                is_instrument: spec.instrument,
+            })
+            .collect();
+        // The lower grid projects whichever model owns the center. SONG mode
+        // reads its canonical pattern; legacy mode remains the piano-roll
+        // projection and sends its intents back to the selected legacy clip.
+        let song_pattern_id = if self.center_song {
+            self.redesign.selected_song_pattern(&self.song)
+        } else {
+            None
+        };
+        // The pitch language MIDI typing speaks: the focused song track's
+        // authority reads the ambient key; everything else (and the whole
+        // legacy world) stays chromatic. Local shadows global.
+        let entry_mode = if self.center_song {
+            let authority = self
+                .redesign
+                .selected_song_track(&self.song)
+                .and_then(|track| self.song.tracks.get(track))
+                .map(|track| track.pitch_authority);
+            match authority {
+                Some(daw::sequencing::PitchAuthority::Degree) => {
+                    daw::ui::redesign::midi_typing::EntryMode::Degree {
+                        degrees: self.song.key.degree_count(),
+                    }
+                }
+                _ => daw::ui::redesign::midi_typing::EntryMode::Chromatic,
+            }
+        } else {
+            daw::ui::redesign::midi_typing::EntryMode::Chromatic
+        };
+        let key_sign = daw::ui::redesign::lens::key_sign(&self.song.key);
+        // The active track's lens, resolved against the key each frame:
+        // a lens that cannot speak this key falls back to degrees, and
+        // the status line says so. Defaults follow the track's authority
+        // until `:lens` says otherwise.
+        let requested_lens = if self.center_song {
+            self.redesign
+                .selected_song_track(&self.song)
+                .and_then(|track| self.song.tracks.get(track))
+                .map(|track| {
+                    self.track_lenses
+                        .get(&track.id.0)
+                        .cloned()
+                        .unwrap_or_else(|| match track.pitch_authority {
+                            daw::sequencing::PitchAuthority::Degree => "degrees".to_owned(),
+                            daw::sequencing::PitchAuthority::Absolute => "notes".to_owned(),
+                        })
+                })
+                .unwrap_or_else(|| "notes".to_owned())
+        } else {
+            "notes".to_owned()
+        };
+        let lens_view = if daw::ui::redesign::lens::BUILTIN_LENSES
+            .contains(&requested_lens.as_str())
+        {
+            daw::ui::redesign::lens::LensView::resolve(&requested_lens, &self.song.key, &|_| None)
+        } else {
+            let file = self.cached_lens_file(&requested_lens);
+            daw::ui::redesign::lens::LensView::resolve(&requested_lens, &self.song.key, &|_| {
+                file.clone()
+            })
+        };
+        let (sequence_clip_id, sequence_clip_name, sequence_clip_len, sequence_notes) =
+            if self.center_song {
+                if let Some(pattern) = song_pattern_id.and_then(|id| self.song.pattern(id)) {
+                    (
+                        Some(pattern.id.0),
+                        Some(pattern.name.clone()),
+                        Some(song_pattern_length(&self.song, pattern.id)),
+                        song_pattern_note_views(pattern, &self.song.key),
+                    )
+                } else {
+                    (None, None, None, Vec::new())
+                }
+            } else {
+                let sequence_clip_id = self.arrangement.active_clip_id();
+                let sequence_clip_name = self
+                    .arrangement
+                    .active_clip_ref()
+                    .filter(|_| sequence_clip_id.is_some())
+                    .map(|clip| clip.name.clone());
+                let sequence_clip_len = self
+                    .arrangement
+                    .active_clip_ref()
+                    .filter(|_| sequence_clip_id.is_some())
+                    .map(|clip| beats_to_sequence_ticks(f64::from(clip.len)));
+                let sequence_notes = self
+                    .arrangement
+                    .active_clip_ref()
+                    .filter(|_| sequence_clip_id.is_some())
+                    .map(|clip| {
+                        clip.notes
+                            .iter()
+                            .map(|note| {
+                                redesign_sequence::NoteView::from_midi(
+                                    note.pitch,
+                                    beats_to_sequence_ticks(note.start),
+                                    beats_to_sequence_ticks(note.len).max(1),
+                                    note.vel,
+                                    note.prob,
+                                    !note.muted,
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                (
+                    sequence_clip_id,
+                    sequence_clip_name,
+                    sequence_clip_len,
+                    sequence_notes,
+                )
+            };
+        // The pending snap's would-be notes, as ghosts over the grid.
+        let sequence_ghosts: Vec<redesign_sequence::NoteView> = self
+            .snap_preview
+            .as_ref()
+            .filter(|preview| Some(preview.pattern) == song_pattern_id)
+            .map(|preview| {
+                preview
+                    .after
+                    .iter()
+                    .map(|note| {
+                        song_note_view(
+                            note,
+                            preview.step * SONG_PATTERN_STEP_TICKS,
+                            1.0,
+                            true,
+                            &self.song.key,
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let sequence_view = sequence_clip_id
+            .zip(sequence_clip_name.as_deref())
+            .zip(sequence_clip_len)
+            .map(|((id, name), length_ticks)| redesign_sequence::ClipView {
+                id,
+                name,
+                length_ticks,
+                notes: &sequence_notes,
+                ghosts: &sequence_ghosts,
+            });
+        let position = format_position(
+            self.transport.position,
+            self.transport.bpm,
+            u64::from(self.transport.beats_per_bar),
+        );
+        let outcome = self.redesign.show(
+            ui,
+            redesign_transport::View {
+                playing: self.transport.playing,
+                armed: self.transport.armed,
+                loop_on: self.transport.loop_on,
+                metronome: self.transport.metronome,
+                follow: self.transport.follow,
+                engine_on: self.engine.is_some(),
+                bpm: self.transport.bpm,
+                beats_per_bar: self.transport.beats_per_bar,
+                beat_unit: self.transport.beat_unit,
+                position: &position,
+                key_sign: &key_sign,
+            },
+            redesign_browser::View {
+                snapshot: &self.library_snapshot,
+                scanning: self.library_scanning,
+            },
+            &chain_view,
+            sequence_view,
+            entry_mode,
+            &lens_view,
+            playhead_beats,
+            !self.prefs.browser_hidden,
+            !self.prefs.lower_hidden,
+        );
+
+        if let Some(tick) = outcome.sequence.cursor_tick {
+            self.sequence_cursor_tick = tick;
+        }
+        if !outcome.sequence.intents.is_empty() {
+            if self.center_song {
+                if let Some(pattern_id) = song_pattern_id
+                    && let Some(pattern) = self.song.pattern_mut(pattern_id)
+                    && let Some(notice) =
+                        apply_song_pattern_intents(pattern, &outcome.sequence.intents)
+                {
+                    self.notice = Some(notice.to_owned());
+                }
+            } else {
+                self.apply_redesign_sequence_intents(&outcome.sequence.intents);
+            }
+        }
+        if !outcome.chain.intents.is_empty() {
+            self.apply_redesign_chain_intents(&outcome.chain.intents);
+        }
+
+        let mut actions = Vec::with_capacity(outcome.transport.intents.len());
+        for intent in outcome.transport.intents {
+            use redesign_transport::Intent;
+            match intent {
+                Intent::Return => actions.push(UiAction::Return),
+                Intent::TogglePlay => actions.push(UiAction::TogglePlay),
+                Intent::Pause => actions.push(UiAction::Pause),
+                Intent::Stop => actions.push(UiAction::Stop),
+                Intent::ToggleRecord => actions.push(UiAction::ToggleRecord),
+                Intent::ToggleLoop => actions.push(UiAction::ToggleLoop),
+                Intent::ToggleMetronome => actions.push(UiAction::ToggleMetronome),
+                Intent::ToggleFollow => actions.push(UiAction::ToggleFollow),
+                Intent::SetTempo(value) => actions.push(UiAction::SetTempo(value)),
+                Intent::CycleBeatUnit => actions.push(UiAction::SetTimeSignature(
+                    self.transport.beats_per_bar,
+                    match self.transport.beat_unit {
+                        1 => 2,
+                        2 => 4,
+                        4 => 8,
+                        8 => 16,
+                        _ => 1,
+                    },
+                )),
+                Intent::ToggleEngine => {
+                    if self.engine.is_some() {
+                        self.stop_engine();
+                    } else {
+                        self.start_engine();
+                    }
+                }
+            }
+        }
+        for intent in outcome.browser.intents {
+            match intent {
+                redesign_browser::Intent::SelectSample(path) => self.place_sample(path, None),
+                redesign_browser::Intent::AuditionSample(path) => {
+                    let Some(sample_rate) =
+                        self.engine.as_ref().map(|engine| engine.info().sample_rate)
+                    else {
+                        self.notice = Some("sample audition needs the audio engine".to_owned());
+                        continue;
+                    };
+                    self.audition_loader.request(path, sample_rate);
+                }
+                redesign_browser::Intent::StopAudition => {
+                    self.audition_loader.stop();
+                    if let Some(engine) = &mut self.engine {
+                        engine.stop_audition();
+                    }
+                }
+            }
+        }
+        // Consume focus/cursor stops before accepting a worker result from
+        // this frame. That ordering prevents a just-finished stale decode
+        // from sounding for one callback block on the way out of the panel.
+        if let Some(result) = self.audition_loader.try_result() {
+            match result {
+                Ok(buffer) => {
+                    if let Some(engine) = &mut self.engine {
+                        engine.audition(buffer);
+                    }
+                }
+                Err(error) => self.notice = Some(format!("sample audition refused: {error}")),
+            }
+        }
+
+        let arrangement_theme = redesign_arrangement_theme();
+        let commands = self.commands();
+        if let Some(choice) = self.palette.show(
+            ui.ctx(),
+            &arrangement_theme,
+            &commands,
+            App::typed_commands(),
+        ) {
+            match choice {
+                PaletteChoice::Command(id) => self.run_command(id, &mut actions),
+                PaletteChoice::Typed(line) => self.run_typed_command(&line),
+            }
+        } else if !self.palette.is_open()
+            && ui
+                .ctx()
+                .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Colon))
+        {
+            self.palette.open();
+        }
+        let palette_open = self.palette.is_open();
+
+        if outcome.arrangement_focused && !palette_open && !self.center_song {
+            arrangement_keys(ui.ctx(), &self.arrangement, &mut actions);
+        }
+        track_rename_keys(ui.ctx(), &mut self.arrangement);
+        self.focus.begin_enabled(
+            ui.ctx(),
+            outcome.arrangement_focused && !palette_open && !self.center_song,
+        );
+
+        let center = ui.available_rect_before_wrap();
+        if ui.ctx().input(|input| input.pointer.any_pressed())
+            && ui
+                .ctx()
+                .pointer_latest_pos()
+                .is_some_and(|pointer| center.contains(pointer))
+        {
+            self.redesign.focus_arrangement();
+        }
+
+        // Preferences (library roots live there) opens from the palette
+        // and must draw in this mode too, not only on the legacy path.
+        self.draw_preferences(ui.ctx());
+
+        // The center swap: F10 trades the legacy timeline for the SONG
+        // arrangement — the new world, made audible by the projection.
+        // Both occupy one address; the legacy occupant keeps all its
+        // duties (drag-import, automation) until they grow redesign
+        // equivalents.
+        if self.center_song {
+            let _song_outcome = ui
+                .scope_builder(egui::UiBuilder::new().max_rect(center), |ui| {
+                    self.redesign.show_arrangement(
+                        ui,
+                        daw::ui::redesign::arrangement::View {
+                            song: &mut self.song,
+                            playhead_beats,
+                            playing: self.transport.playing,
+                        },
+                    )
+                })
+                .inner;
+            self.focus.end(ui, &arrangement_theme);
+            self.project_song();
+            self.finish_redesign_actions(ui.ctx(), actions);
+            return;
+        }
+        let transport_view = ArrangementTransportView {
+            beats_per_bar: self.transport.beats_per_bar,
+            bpm: self.transport.bpm,
+            playhead: playhead_beats as f32,
+            follow: self.transport.follow,
+        };
+        let mut close_automation_editor = false;
+        let arrangement_outcome = ui
+            .scope_builder(egui::UiBuilder::new().max_rect(center), |ui| {
+                if self.automation_editor {
+                    close_automation_editor = automation_editor_body(
+                        ui,
+                        &arrangement_theme,
+                        &mut self.arrangement,
+                        self.transport.beats_per_bar,
+                        &self.parameter_registry,
+                        &mut self.automation_target,
+                    );
+                    ArrangementOutcome::default()
+                } else {
+                    arrangement_body(
+                        ui,
+                        &mut self.focus,
+                        &arrangement_theme,
+                        &mut self.arrangement,
+                        transport_view,
+                        &self.waveform_cache,
+                        self.drag_import.as_mut(),
+                        self.automation_mode,
+                        &self.parameter_registry,
+                        &mut self.automation_target,
+                        &mut self.meters,
+                        &mut self.master_meter,
+                    )
+                }
+            })
+            .inner;
+        if close_automation_editor {
+            self.automation_editor = false;
+        }
+        self.focus.end(ui, &arrangement_theme);
+
+        self.automation_hovered = arrangement_outcome.automation_hovered;
+        self.focused_clip = arrangement_outcome.focused_clip;
+        self.bounce_in_place_requested |= arrangement_outcome.bounce_in_place;
+        if arrangement_outcome.open_clip_editor {
+            self.bottom_view = BottomView::ClipEditor;
+        }
+        if arrangement_outcome.panned {
+            self.transport.follow = false;
+        }
+        if let Some((_, edit)) = arrangement_outcome.clip_fade {
+            self.apply_clip_edit(edit);
+        }
+        if std::mem::take(&mut self.bounce_in_place_requested) {
+            self.start_bounce_in_place(ui.ctx());
+        }
+
+        self.finish_redesign_actions(ui.ctx(), actions);
+    }
+
+    /// The action tail both center occupants share: transport wishes,
+    /// clipboard, pending seeks, recording and the engine sync.
+    fn finish_redesign_actions(&mut self, ctx: &egui::Context, actions: Vec<UiAction>) {
+        let mut wishes = Vec::with_capacity(actions.len());
+        for action in actions {
+            match action {
+                UiAction::StartEngine => self.start_engine(),
+                UiAction::StopEngine => self.stop_engine(),
+                UiAction::Undo | UiAction::Redo => {
+                    let stepped = if matches!(action, UiAction::Undo) {
+                        self.history.undo(&mut self.arrangement)
+                    } else {
+                        self.history.redo(&mut self.arrangement)
+                    };
+                    if stepped {
+                        self.push_graph();
+                    }
+                }
+                UiAction::ToggleBrowser => {
+                    self.prefs.browser_hidden = !self.prefs.browser_hidden;
+                }
+                UiAction::ToggleLower => {
+                    self.prefs.lower_hidden = !self.prefs.lower_hidden;
+                }
+                UiAction::ToggleChrome => {
+                    let clearing = !self.prefs.browser_hidden || !self.prefs.lower_hidden;
+                    self.prefs.browser_hidden = clearing;
+                    self.prefs.lower_hidden = clearing;
+                }
+                UiAction::ReverseAudio => {
+                    if let Some(clip) = self.arrangement.active_audio_clip()
+                        && let Some(audio) = clip.audio.as_ref()
+                    {
+                        let from = audio.source_offset;
+                        let to = audio.source_offset + audio.source_frames;
+                        if !self.request_render(
+                            "reverse",
+                            vec![daw::render::Op::Reverse {
+                                from,
+                                to,
+                                channels: daw::render::Channels::all(),
+                            }],
+                            None,
+                        ) {
+                            self.notice =
+                                Some("could not reverse — a render is already running".to_owned());
+                        }
+                    }
+                }
+                UiAction::CropFocusedClip => self.crop_focused_clip(),
+                other => wishes.push(other),
+            }
+        }
+        self.route_transport(&wishes);
+        let copied = wishes
+            .iter()
+            .any(|action| matches!(action, UiAction::CopyClip | UiAction::CutClip));
+        perform(&wishes, &mut self.transport, &mut self.arrangement);
+        if copied {
+            let summary = self.arrangement.clipboard_summary();
+            if !summary.is_empty() {
+                ctx.copy_text(summary);
+            }
+        }
+
+        let pointed = self.arrangement.pending_point.take();
+        if let Some(beat) = pointed {
+            self.transport.marker = beat;
+        }
+        let locate = self
+            .arrangement
+            .pending_seek
+            .take()
+            .or_else(|| pointed.filter(|_| !self.transport.playing));
+        if let Some(beat) = locate {
+            let seconds = f64::from(beat) * 60.0 / self.transport.bpm.max(1.0);
+            self.transport.position = seconds;
+            self.transport.marker = beat;
+            if let Some(engine) = &mut self.engine {
+                engine.transport(TransportCmd::Seek(
+                    (seconds * f64::from(engine.info().sample_rate)) as u64,
+                ));
+            }
+        }
+        self.drive_recording();
+        self.sync_engine();
+    }
+}
+
+// --- the typed palette long forms ---
+//
+// Sentences too long for keys (`notes/20260831-command-grammar.md` §7):
+// the palette recognizes the first word and hands the whole line here.
+// Everything acts on the ambient contexts — the project key, the
+// arrangement cursor's track, the sequence cursor's trig — with no
+// dialogs anywhere.
+
+impl App {
+    pub(super) fn typed_commands() -> &'static [PaletteTyped] {
+        &[
+            PaletteTyped {
+                name: "key",
+                usage: "key <tonic> <scale> [mode N] — set the harmonic context",
+            },
+            PaletteTyped {
+                name: "lens",
+                usage: "lens <name> — how this track spells pitch",
+            },
+            PaletteTyped {
+                name: "tune",
+                usage: "tune <±cents> — bend the selected trig (additive)",
+            },
+            PaletteTyped {
+                name: "push",
+                usage: "push <±ticks> — displace the selected trig in time",
+            },
+            PaletteTyped {
+                name: "quantize-key",
+                usage: "quantize-key — re-address the trig onto the key, sound-preserving",
+            },
+            PaletteTyped {
+                name: "free",
+                usage: "free — release the trig from the key, sound-preserving",
+            },
+            PaletteTyped {
+                name: "snap-key",
+                usage: "snap-key — snap the trig onto the key (LOSSY, previews first)",
+            },
+        ]
+    }
+
+    /// A scale by name: built-ins first, then the library's `.scl`
+    /// files. A garbage file refuses HERE, with words, at the moment it
+    /// is asked for — never during the scan.
+    fn scale_by_name(&self, stem: &str) -> Option<Result<daw::pitch::Scale, String>> {
+        if let Some(scale) = daw::pitch::builtin_scale(stem) {
+            return Some(Ok(scale));
+        }
+        let record = self
+            .library_snapshot
+            .scales
+            .iter()
+            .find(|scale| scale.name.eq_ignore_ascii_case(stem))?;
+        Some(match std::fs::read_to_string(&record.path) {
+            Ok(source) => {
+                daw::pitch::parse_scl(&record.name, &source).map_err(|error| format!("{error}"))
+            }
+            Err(error) => Err(format!("cannot read {}: {error}", record.path.display())),
+        })
+    }
+
+    /// A `.lens` file by name, through a per-generation cache so an
+    /// active user lens costs one read per rescan, not one per frame.
+    pub(super) fn cached_lens_file(
+        &mut self,
+        stem: &str,
+    ) -> Option<Result<daw::ui::redesign::lens::Lens, String>> {
+        if self.lens_cache_generation != self.library_snapshot.generation {
+            self.lens_cache.clear();
+            self.lens_cache_generation = self.library_snapshot.generation;
+        }
+        let key = stem.to_ascii_lowercase();
+        if !self.lens_cache.contains_key(&key) {
+            let loaded = lens_file_by_name(&self.library_snapshot, &key);
+            self.lens_cache.insert(key.clone(), loaded);
+        }
+        self.lens_cache.get(&key).cloned().flatten()
+    }
+
+    /// The universal selection the pitch long forms act on: the song
+    /// pattern under the arrangement cursor, at the sequence cursor's
+    /// step. Refusals are words, prefixed by the caller's verb.
+    fn selected_song_trig(&mut self) -> Result<(daw::sequencing::PatternId, usize), String> {
+        if !self.center_song {
+            return Err("SONG VIEW ONLY — F10".to_owned());
+        }
+        let pattern = self
+            .redesign
+            .selected_song_pattern(&self.song)
+            .ok_or_else(|| "NO PATTERN UNDER THE CURSOR".to_owned())?;
+        let step = self.sequence_cursor_tick / SONG_PATTERN_STEP_TICKS;
+        if step >= daw::sequencing::PATTERN_STEPS {
+            return Err("THE CURSOR IS OUTSIDE THE PATTERN".to_owned());
+        }
+        Ok((pattern, step))
+    }
+
+    /// Run one closure over every note of the selected trig; empty trigs
+    /// refuse. The selection stays where it is — the result remains the
+    /// working selection (composition contract, closure).
+    fn edit_selected_trig(
+        &mut self,
+        verb: &str,
+        edit: impl Fn(&mut daw::sequencing::Note, &daw::pitch::Key),
+    ) -> Result<usize, String> {
+        let (pattern_id, step) = self
+            .selected_song_trig()
+            .map_err(|error| format!("{verb}: {error}"))?;
+        let key = self.song.key.clone();
+        let Some(pattern) = self.song.pattern_mut(pattern_id) else {
+            return Err(format!("{verb}: THE PATTERN IS GONE"));
+        };
+        let trig = pattern.trig_mut(step);
+        if trig.notes.is_empty() {
+            return Err(format!("{verb}: NOTHING HERE"));
+        }
+        for note in &mut trig.notes {
+            edit(note, &key);
+        }
+        Ok(trig.notes.len())
+    }
+
+    pub(super) fn run_typed_command(&mut self, line: &str) {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let Some((&name, args)) = words.split_first() else {
+            return;
+        };
+        let outcome: Result<String, String> = match name.to_ascii_lowercase().as_str() {
+            "key" => {
+                let lookup = |stem: &str| self.scale_by_name(stem);
+                daw::pitch::parse_key_command(args, &self.song.key, &lookup).map(|key| {
+                    let sign = daw::ui::redesign::lens::key_sign(&key);
+                    self.song.key = key;
+                    format!("KEY: {sign}")
+                })
+            }
+            "lens" => self.typed_lens(args),
+            "tune" => match args.first().and_then(|cents| cents.parse::<f32>().ok()) {
+                Some(cents) if cents.is_finite() => self
+                    .edit_selected_trig("TUNE", |note, _| {
+                        note.pitch.offset_cents += cents;
+                    })
+                    .map(|notes| format!("TUNE: {cents:+.0}¢ ON {notes} NOTES")),
+                _ => Err("TUNE: SIGNED CENTS — :tune +14".to_owned()),
+            },
+            "push" => match args.first().and_then(|ticks| ticks.parse::<i16>().ok()) {
+                Some(ticks) => {
+                    // Sub-step displacement: a push past the step is a
+                    // nudge wearing the wrong verb.
+                    let limit = (SONG_PATTERN_STEP_TICKS - 1) as i16;
+                    self.edit_selected_trig("PUSH", |note, _| {
+                        note.micro_ticks =
+                            note.micro_ticks.saturating_add(ticks).clamp(-limit, limit);
+                    })
+                    .map(|notes| format!("PUSH: {ticks:+}T ON {notes} NOTES"))
+                }
+                None => Err("PUSH: SIGNED TICKS — :push -3".to_owned()),
+            },
+            "quantize-key" => self
+                .edit_selected_trig("QUANTIZE-KEY", |note, key| {
+                    note.pitch = note.pitch.quantize_to(key);
+                })
+                .map(|notes| format!("QUANTIZE-KEY: {notes} NOTES RE-ADDRESSED, SOUND HELD")),
+            "free" => self
+                .edit_selected_trig("FREE", |note, key| {
+                    note.pitch = note.pitch.free(key);
+                })
+                .map(|notes| format!("FREE: {notes} NOTES RELEASED, SOUND HELD")),
+            "snap-key" => self.typed_snap_key(),
+            other => Err(format!("{}: NOT YET SPOKEN", other.to_ascii_uppercase())),
+        };
+        self.notice = Some(match outcome {
+            Ok(answer) => answer,
+            Err(refusal) => refusal,
+        });
+    }
+
+    fn typed_lens(&mut self, args: &[&str]) -> Result<String, String> {
+        let Some(&name) = args.first() else {
+            return Err(format!(
+                "LENS: NAME ONE OF {} OR A .lens FILE",
+                daw::ui::redesign::lens::BUILTIN_LENSES.join("/")
+            ));
+        };
+        if !self.center_song {
+            return Err("LENS: SONG VIEW ONLY — F10".to_owned());
+        }
+        let name_lower = name.to_ascii_lowercase();
+        let known_builtin = daw::ui::redesign::lens::BUILTIN_LENSES.contains(&name_lower.as_str());
+        if !known_builtin {
+            match self.cached_lens_file(&name_lower) {
+                Some(Ok(_)) => {}
+                Some(Err(error)) => return Err(format!("LENS: {name} — {error}")),
+                None => return Err(format!("LENS: NO LENS NAMED {name}")),
+            }
+        }
+        let track = self
+            .redesign
+            .selected_song_track(&self.song)
+            .and_then(|track| self.song.tracks.get(track))
+            .ok_or_else(|| "LENS: NO TRACK UNDER THE CURSOR".to_owned())?;
+        let track_name = track.name.clone();
+        self.track_lenses.insert(track.id.0, name_lower.clone());
+        Ok(format!(
+            "LENS: {} READS {}",
+            track_name,
+            name_lower.to_ascii_uppercase()
+        ))
+    }
+
+    /// `:snap-key` — quantize, then zero the pitch offsets. LOSSY, so it
+    /// lands as ghosts first; Enter commits, Escape cancels.
+    fn typed_snap_key(&mut self) -> Result<String, String> {
+        let (pattern_id, step) = self
+            .selected_song_trig()
+            .map_err(|error| format!("SNAP-KEY: {error}"))?;
+        let key = self.song.key.clone();
+        let Some(pattern) = self.song.pattern(pattern_id) else {
+            return Err("SNAP-KEY: THE PATTERN IS GONE".to_owned());
+        };
+        let trig = pattern.trig(step);
+        if trig.notes.is_empty() {
+            return Err("SNAP-KEY: NOTHING HERE".to_owned());
+        }
+        let after: Vec<daw::sequencing::Note> = trig
+            .notes
+            .iter()
+            .map(|note| {
+                let mut snapped = note.clone();
+                snapped.pitch = note.pitch.quantize_to(&key);
+                snapped.pitch.offset_cents = 0.0;
+                snapped
+            })
+            .collect();
+        self.snap_preview = Some(SnapPreview {
+            pattern: pattern_id,
+            step,
+            after,
+        });
+        Ok("SNAP-KEY: GHOSTS SHOW THE LOSS — ENTER COMMITS · ESC CANCELS".to_owned())
+    }
+
+    /// Enter, while a snap preview stands: the one moment loss is chosen.
+    fn commit_snap_preview(&mut self) {
+        let Some(preview) = self.snap_preview.take() else {
+            return;
+        };
+        if let Some(pattern) = self.song.pattern_mut(preview.pattern) {
+            pattern.trig_mut(preview.step).notes = preview.after;
+            self.notice = Some("SNAP-KEY: SNAPPED ONTO THE KEY".to_owned());
+        } else {
+            self.notice = Some("SNAP-KEY: THE PATTERN IS GONE".to_owned());
+        }
+    }
+}
+
+// --- the C1 copyist: Song → legacy clips ---
+//
+// Phase C1 of the decided Song bridge (notes/20260831-song-bridge-brief.md,
+// notes/20260831-projection-c1-spec.md). The canonical tick-based `Song` is
+// made audible by copying it into legacy clips, which the existing compile
+// path already turns into sound — decide-new, play-old, exactly as
+// `session_bridge` did for the Session view. The projection is the ONLY
+// writer of the legacy tracks it creates; a stray legacy edit to an owned
+// clip is erased on the next pass rather than silently kept.
+
+impl App {
+    /// Copy the song into its owned legacy tracks when it has changed.
+    /// Runs green-zone, once per frame at most; the equality guard makes
+    /// the idle cost one comparison of a small struct.
+    pub(super) fn project_song(&mut self) {
+        if self.projected_song.as_ref() == Some(&self.song) {
+            return;
+        }
+        // Never touch the project before the song holds a first real
+        // edit: an untouched default song must not mint tracks.
+        if self.projected_song.is_none() && self.song == daw::sequencing::Song::default() {
+            return;
+        }
+        let song = self.song.clone();
+        let any_solo = song.tracks.iter().any(|track| track.solo);
+        for song_track in &song.tracks {
+            let legacy = match self.song_track_map.get(&song_track.id) {
+                Some(&index) if index < self.arrangement.tracks.len() => index,
+                _ => {
+                    let index = self.arrangement.add_track(TrackKind::Midi);
+                    // A minted track is born able to speak: the workhorse
+                    // synth in its chain, so the first trig makes sound
+                    // instead of silence that reads as a bug.
+                    let instance = DeviceInstance {
+                        id: self.arrangement.mint_id(),
+                        parent: None,
+                        state: DeviceState::new(DeviceKind::Poly),
+                        bypass: false,
+                        page: 0,
+                        view_zoom: unit_zoom(),
+                        view_scroll: 0.0,
+                    };
+                    if let Some(track) = self.arrangement.tracks.get_mut(index) {
+                        track.chain.push(instance);
+                    }
+                    self.song_track_map.insert(song_track.id, index);
+                    index
+                }
+            };
+            // The name follows the song track (the rename verb travels),
+            // carrying the ownership sign: legacy editors, look only.
+            self.arrangement.tracks[legacy].name = format!("{} §", song_track.name);
+            // The legacy compiler already removes muted tracks from the
+            // schedule. Project the Song's solo-precedence rule onto that
+            // real silence path; keep legacy solo off so Song solo cannot
+            // accidentally silence unrelated legacy tracks.
+            self.arrangement.tracks[legacy].mute = !song_track_audible(song_track, any_solo);
+            self.arrangement.tracks[legacy].solo = false;
+            let mut clips = Vec::with_capacity(song_track.blocks.len());
+            for block in &song_track.blocks {
+                let id = self.arrangement.next_clip_id;
+                self.arrangement.next_clip_id += 1;
+                clips.push(project_block(&song, block, id));
+            }
+            self.arrangement.clips[legacy] = clips;
+        }
+        self.arrangement.force_recompile = true;
+        self.projected_song = Some(song);
+    }
+}
+
+fn song_track_audible(track: &daw::sequencing::Track, any_solo: bool) -> bool {
+    if any_solo { track.solo } else { !track.muted }
+}
+
+/// One block, copied out as one legacy clip. A pattern shared by many
+/// blocks projects into many clips: the duplication is the copyist's job
+/// and invisible to the compile path.
+fn project_block(
+    song: &daw::sequencing::Song,
+    block: &daw::sequencing::PatternBlock,
+    id: u64,
+) -> Clip {
+    use daw::sequencing::{PATTERN_STEPS, TICKS_PER_BEAT};
+    let step_ticks = TICKS_PER_BEAT / 4;
+    let mut notes = Vec::new();
+    let mut name = String::new();
+    if let Some(pattern) = song.pattern(block.pattern_id) {
+        name = pattern.name.clone();
+        for step in 0..PATTERN_STEPS {
+            let start_tick = step * step_ticks;
+            if start_tick >= block.length_ticks {
+                break;
+            }
+            let trig = pattern.trig(step);
+            if !trig.enabled {
+                continue;
+            }
+            for note in &trig.notes {
+                // Phase-1 pitch resolution (pitch-lens spec §6): the
+                // stored address becomes Hz green-side, then the nearest
+                // legacy MIDI pitch — exact for 12TET-embeddable scales,
+                // approximate (and signed `≈` in the views) otherwise.
+                // The micro push projects exactly: legacy starts are
+                // fractional beats, so no time detail is lost.
+                let start_ticks = start_tick as f64 + f64::from(note.micro_ticks);
+                notes.push(Note {
+                    pitch: daw::pitch::nearest_midi(note.pitch.resolve(&song.key)),
+                    start: start_ticks.max(0.0) / TICKS_PER_BEAT as f64,
+                    len: (note.length_ticks.max(1)) as f64 / TICKS_PER_BEAT as f64,
+                    vel: note.velocity,
+                    muted: false,
+                    plocks: Vec::new(),
+                    prob: trig.probability,
+                    cond: None,
+                });
+            }
+        }
+    }
+    Clip {
+        id,
+        name,
+        start: (block.start_tick as f64 / TICKS_PER_BEAT as f64) as f32,
+        len: (block.length_ticks as f64 / TICKS_PER_BEAT as f64) as f32,
+        notes,
+        ..Clip::default()
+    }
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+    use daw::sequencing::{Note as SongNote, PatternBlock, Song};
+
+    fn song_with_trig() -> Song {
+        let mut song = Song::default();
+        let pattern_id = song.tracks[0].blocks[0].pattern_id;
+        let pattern = song.pattern_mut(pattern_id).expect("default pattern");
+        pattern.set_primary(4, SongNote::new(60, 12, 100));
+        pattern.trig_mut(4).probability = 0.75;
+        song
+    }
+
+    /// The copyist's timing: step 4 of a 16th grid lands one beat in, a
+    /// 12-tick note is a quarter beat long, and the trig's condition
+    /// carries onto the note the compile path will stamp.
+    #[test]
+    fn a_block_projects_notes_with_timing_and_probability() {
+        let song = song_with_trig();
+        let clip = project_block(&song, &song.tracks[0].blocks[0], 7);
+        assert_eq!(clip.id, 7);
+        assert_eq!(clip.notes.len(), 1);
+        let note = &clip.notes[0];
+        assert_eq!(note.pitch, 60);
+        assert!((note.start - 1.0).abs() < 1e-9, "step 4 = beat 1");
+        assert!((note.len - 0.25).abs() < 1e-9);
+        assert_eq!(note.vel, 100);
+        assert!((note.prob - 0.75).abs() < 1e-6, "the condition travels");
+        assert!((clip.len - 16.0).abs() < 1e-6, "default block = 16 beats");
+    }
+
+    /// One pattern, three blocks → three clips with identical notes:
+    /// sharing is the song's idea, duplication is the copyist's job.
+    #[test]
+    fn a_shared_pattern_projects_into_every_block() {
+        let mut song = song_with_trig();
+        let pattern_id = song.tracks[0].blocks[0].pattern_id;
+        for (block_id, start) in [(20u64, 16usize), (21, 32)] {
+            song.tracks[0].blocks.push(PatternBlock {
+                id: daw::sequencing::BlockId(block_id),
+                pattern_id,
+                start_tick: start * daw::sequencing::TICKS_PER_BEAT,
+                length_ticks: daw::sequencing::DEFAULT_PATTERN_TICKS,
+            });
+        }
+        let clips: Vec<Clip> = song.tracks[0]
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(index, block)| project_block(&song, block, index as u64))
+            .collect();
+        assert_eq!(clips.len(), 3);
+        assert!((clips[1].start - 16.0).abs() < 1e-6);
+        assert_eq!(clips[0].notes, clips[1].notes);
+        assert_eq!(clips[1].notes, clips[2].notes);
+    }
+
+    #[test]
+    fn song_solo_precedence_silences_every_other_track() {
+        let mut song = Song::default();
+        daw::ui::redesign::arrangement::ArrangementPanel::default().add_track(&mut song);
+        song.tracks[0].solo = true;
+        song.tracks[1].muted = false;
+
+        let any_solo = song.tracks.iter().any(|track| track.solo);
+        assert!(song_track_audible(&song.tracks[0], any_solo));
+        assert!(
+            !song_track_audible(&song.tracks[1], any_solo),
+            "an unmuted track is still silent beside a solo"
+        );
+    }
+
+    #[test]
+    fn a_muted_song_track_uses_the_legacy_twins_real_mute() {
+        let storage = shell::Storage::default();
+        let mut app = App::new(&storage);
+        app.song = song_with_trig();
+        app.song.tracks[0].muted = true;
+
+        app.project_song();
+
+        let track_id = app.song.tracks[0].id;
+        let legacy = app.song_track_map[&track_id];
+        assert!(app.arrangement.tracks[legacy].mute);
+        assert!(!app.arrangement.clips[legacy].is_empty());
+        assert!(app.arrangement.force_recompile);
+    }
+
+    /// A block shorter than the pattern truncates: no note starts past
+    /// the clip edge.
+    #[test]
+    fn a_short_block_truncates_the_pattern() {
+        let mut song = song_with_trig();
+        // One beat long: step 4 (beat 1) must not sound.
+        song.tracks[0].blocks[0].length_ticks = daw::sequencing::TICKS_PER_BEAT;
+        let clip = project_block(&song, &song.tracks[0].blocks[0], 1);
+        assert!(clip.notes.is_empty());
+    }
+
+    fn builtin_lookup(name: &str) -> Option<Result<daw::pitch::Scale, String>> {
+        daw::pitch::builtin_scale(name).map(Ok)
+    }
+
+    /// L3, heard through the projection: a Degree anchor reflows when
+    /// the key changes; the sound of an Absolute anchor never moves.
+    #[test]
+    fn a_degree_note_reflows_when_the_key_changes() {
+        let mut song = Song::default();
+        song.key = daw::pitch::parse_key_command(&["d", "dorian"], &song.key, &builtin_lookup)
+            .expect("d dorian");
+        let pattern_id = song.tracks[0].blocks[0].pattern_id;
+        let pattern = song.pattern_mut(pattern_id).expect("default pattern");
+        pattern.set_primary(
+            0,
+            daw::sequencing::Note::with_pitch(daw::pitch::Pitch::degree(2, 0), 12, 100),
+        );
+        pattern.add_tone(0, SongNote::new(69, 12, 100));
+
+        let clip = project_block(&song, &song.tracks[0].blocks[0], 1);
+        let pitches: Vec<u8> = clip.notes.iter().map(|note| note.pitch).collect();
+        assert!(
+            pitches.contains(&65),
+            "degree 2 of D dorian is F: {pitches:?}"
+        );
+        assert!(pitches.contains(&69), "the absolute A stays A");
+
+        song.key = daw::pitch::parse_key_command(&["d", "major"], &song.key, &builtin_lookup)
+            .expect("d major");
+        let clip = project_block(&song, &song.tracks[0].blocks[0], 1);
+        let pitches: Vec<u8> = clip.notes.iter().map(|note| note.pitch).collect();
+        assert!(
+            pitches.contains(&66),
+            "the same degree reads F# in D major: {pitches:?}"
+        );
+        assert!(pitches.contains(&69), "the absolute A still stays A");
+    }
+
+    /// The push survives projection exactly: legacy note starts are
+    /// fractional beats, so a 3-tick displacement is 3/48 of a beat.
+    #[test]
+    fn the_push_projects_exactly_into_fractional_beats() {
+        let mut song = song_with_trig();
+        let pattern_id = song.tracks[0].blocks[0].pattern_id;
+        song.pattern_mut(pattern_id)
+            .expect("default pattern")
+            .trig_mut(4)
+            .notes[0]
+            .micro_ticks = 3;
+        let clip = project_block(&song, &song.tracks[0].blocks[0], 1);
+        assert!((clip.notes[0].start - (1.0 + 3.0 / 48.0)).abs() < 1e-12);
+    }
+
+    /// The `:key` long form sets the ambient context, answers with its
+    /// sign, and refuses garbage without touching the key.
+    #[test]
+    fn the_key_long_form_sets_the_ambient_context_or_refuses() {
+        let storage = shell::Storage::default();
+        let mut app = App::new(&storage);
+
+        app.run_typed_command("key d dorian");
+        assert_eq!(daw::ui::redesign::lens::key_sign(&app.song.key), "D DORIAN");
+        assert_eq!(app.notice.as_deref(), Some("KEY: D DORIAN"));
+
+        app.run_typed_command("key d diatonic mode 9");
+        assert_eq!(app.notice.as_deref(), Some("MODE: SCALE HAS 7 DEGREES"));
+        assert_eq!(
+            daw::ui::redesign::lens::key_sign(&app.song.key),
+            "D DORIAN",
+            "a refused command leaves the context alone"
+        );
+
+        app.run_typed_command("key 264hz 22shruti mode 4");
+        assert_eq!(
+            daw::ui::redesign::lens::key_sign(&app.song.key),
+            "264HZ 22SHRUTI/4"
+        );
+    }
+
+    /// The bridge era never lies: a pitch the legacy 12TET path cannot
+    /// reproduce wears `approx` in its view; an exactly-reproducible one
+    /// does not — the machine's sign, not the musician's.
+    #[test]
+    fn xen_pitches_wear_the_approximation_flag() {
+        let mut song = Song::default();
+        let pattern_id = song.tracks[0].blocks[0].pattern_id;
+        song.pattern_mut(pattern_id)
+            .expect("default pattern")
+            .set_primary(
+                0,
+                daw::sequencing::Note::with_pitch(daw::pitch::Pitch::degree(1, 0), 12, 100),
+            );
+
+        // Chromatic 12TET: degree 1 is C#4, exactly on the table.
+        let views = song_pattern_note_views(song.pattern(pattern_id).expect("pattern"), &song.key);
+        assert_eq!(views.len(), 1);
+        assert!(!views[0].approx);
+
+        // 22 shruti: degree 1 (256/243) misses every 12TET slot.
+        song.key = daw::pitch::parse_key_command(&["264hz", "22shruti"], &song.key, &|name| {
+            daw::pitch::builtin_scale(name).map(Ok)
+        })
+        .expect("shruti key");
+        let views = song_pattern_note_views(song.pattern(pattern_id).expect("pattern"), &song.key);
+        assert!(views[0].approx, "the machine admits the approximation");
+    }
+
+    /// The deviation long forms: additive cents, sub-step ticks, and the
+    /// two sound-preserving striation transforms — all on the trig the
+    /// cursor names, all refusing where there is nothing to act on.
+    #[test]
+    fn the_pitch_long_forms_act_on_the_selected_trig() {
+        let storage = shell::Storage::default();
+        let mut app = App::new(&storage);
+
+        // Outside the song view the whole family refuses by name.
+        app.run_typed_command("tune +14");
+        assert_eq!(app.notice.as_deref(), Some("TUNE: SONG VIEW ONLY — F10"));
+
+        app.center_song = true;
+        let pattern_id = app.song.tracks[0].blocks[0].pattern_id;
+        app.song
+            .pattern_mut(pattern_id)
+            .expect("default pattern")
+            .set_primary(0, SongNote::new(69, 12, 100));
+
+        app.run_typed_command("tune +14");
+        assert_eq!(app.notice.as_deref(), Some("TUNE: +14¢ ON 1 NOTES"));
+        let note =
+            |app: &App| app.song.pattern(pattern_id).expect("pattern").trig(0).notes[0].clone();
+        assert_eq!(note(&app).pitch.offset_cents, 14.0);
+        let bent_hz = note(&app).pitch.resolve(&app.song.key);
+
+        app.run_typed_command("push -3");
+        assert_eq!(note(&app).micro_ticks, -3);
+
+        // Quantize: the anchor becomes a degree, the sound holds.
+        app.run_typed_command("quantize-key");
+        assert!(matches!(
+            note(&app).pitch.anchor,
+            daw::pitch::Anchor::Degree { .. }
+        ));
+        let after = note(&app).pitch.resolve(&app.song.key);
+        assert!(((after - bent_hz) / bent_hz).abs() < 1e-9, "sound held");
+
+        // Free: back to physics, still the same sound.
+        app.run_typed_command("free");
+        assert!(matches!(
+            note(&app).pitch.anchor,
+            daw::pitch::Anchor::Absolute(_)
+        ));
+        assert_eq!(note(&app).pitch.offset_cents, 0.0);
+        let freed = note(&app).pitch.resolve(&app.song.key);
+        assert!(((freed - bent_hz) / bent_hz).abs() < 1e-9, "sound held");
+
+        // An empty step refuses out loud.
+        app.sequence_cursor_tick = 20 * SONG_PATTERN_STEP_TICKS;
+        app.run_typed_command("tune +5");
+        assert_eq!(app.notice.as_deref(), Some("TUNE: NOTHING HERE"));
+    }
+
+    /// Snap is the one LOSSY transform: it lands as a preview, the model
+    /// holds still until Enter, and commit zeroes exactly the offsets.
+    #[test]
+    fn snap_key_previews_before_it_loses_anything() {
+        let storage = shell::Storage::default();
+        let mut app = App::new(&storage);
+        app.center_song = true;
+        let pattern_id = app.song.tracks[0].blocks[0].pattern_id;
+        app.song
+            .pattern_mut(pattern_id)
+            .expect("default pattern")
+            .set_primary(0, SongNote::new(69, 12, 100));
+        app.run_typed_command("tune +14");
+
+        app.run_typed_command("snap-key");
+        assert!(app.snap_preview.is_some(), "the loss is only previewed");
+        assert_eq!(
+            app.song.pattern(pattern_id).expect("pattern").trig(0).notes[0]
+                .pitch
+                .offset_cents,
+            14.0,
+            "nothing changed yet"
+        );
+
+        app.commit_snap_preview();
+        assert!(app.snap_preview.is_none());
+        let note = &app.song.pattern(pattern_id).expect("pattern").trig(0).notes[0];
+        assert_eq!(note.pitch.offset_cents, 0.0, "the offset is gone");
+        assert!(matches!(
+            note.pitch.anchor,
+            daw::pitch::Anchor::Degree { .. }
+        ));
+    }
+
+    /// `:lens` names how a track reads: built-ins always exist, unknown
+    /// names refuse, and the choice is per track.
+    #[test]
+    fn the_lens_long_form_sets_a_per_track_reading() {
+        let storage = shell::Storage::default();
+        let mut app = App::new(&storage);
+
+        app.run_typed_command("lens degrees");
+        assert_eq!(app.notice.as_deref(), Some("LENS: SONG VIEW ONLY — F10"));
+
+        app.center_song = true;
+        app.run_typed_command("lens degrees");
+        let track_id = app.song.tracks[0].id.0;
+        assert_eq!(
+            app.track_lenses.get(&track_id).map(String::as_str),
+            Some("degrees")
+        );
+
+        app.run_typed_command("lens sargam");
+        assert_eq!(app.notice.as_deref(), Some("LENS: NO LENS NAMED sargam"));
+        assert_eq!(
+            app.track_lenses.get(&track_id).map(String::as_str),
+            Some("degrees"),
+            "a refused lens leaves the standing choice alone"
+        );
+    }
+
+    #[test]
+    fn sequence_toggle_at_tick_twelve_lands_on_song_step_one() {
+        let mut pattern = daw::sequencing::Pattern::default();
+        let notice = apply_song_pattern_intents(
+            &mut pattern,
+            &[redesign_sequence::Intent::Toggle {
+                tick: 12,
+                default_pitch: daw::pitch::Pitch::from_midi(67),
+                default_length_ticks: 12,
+                default_velocity: 100,
+            }],
+        );
+
+        assert_eq!(notice, None);
+        assert!(pattern.trig(1).enabled);
+        assert_eq!(
+            pattern.trig(1).primary().map(|note| note.pitch),
+            Some(daw::pitch::Pitch::from_midi(67))
+        );
+        assert!(pattern.trig(0).notes.is_empty());
+    }
+
+    #[test]
+    fn sequence_probability_reaches_the_projected_note() {
+        let mut song = Song::default();
+        let pattern_id = song.tracks[0].blocks[0].pattern_id;
+        let pattern = song.pattern_mut(pattern_id).expect("default pattern");
+        pattern.set_primary(1, SongNote::new(60, 12, 100));
+        let notice = apply_song_pattern_intents(
+            pattern,
+            &[redesign_sequence::Intent::SetProbability {
+                tick: 12,
+                probability: 0.75,
+            }],
+        );
+        assert_eq!(notice, None);
+        assert!((pattern.trig(1).probability - 0.75).abs() < f32::EPSILON);
+
+        let clip = project_block(&song, &song.tracks[0].blocks[0], 9);
+        assert_eq!(clip.notes.len(), 1);
+        assert!((clip.notes[0].prob - 0.75).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn sequence_add_note_builds_a_song_chord() {
+        let mut pattern = daw::sequencing::Pattern::default();
+        let intents = [
+            redesign_sequence::Intent::SetPrimary {
+                tick: 24,
+                pitch: daw::pitch::Pitch::from_midi(60),
+                length_ticks: 12,
+                velocity: 100,
+            },
+            redesign_sequence::Intent::AddNote {
+                tick: 24,
+                pitch: daw::pitch::Pitch::from_midi(67),
+                length_ticks: 24,
+                velocity: 96,
+                probability: 1.0,
+            },
+        ];
+
+        assert_eq!(apply_song_pattern_intents(&mut pattern, &intents), None);
+        assert_eq!(pattern.trig(2).notes.len(), 2);
+        assert_eq!(
+            pattern.trig(2).notes[0].pitch,
+            daw::pitch::Pitch::from_midi(60)
+        );
+        assert_eq!(
+            pattern.trig(2).notes[1].pitch,
+            daw::pitch::Pitch::from_midi(67)
+        );
+    }
+
+    #[test]
+    fn sequence_nudge_refuses_an_occupied_song_step_atomically() {
+        let mut pattern = daw::sequencing::Pattern::default();
+        pattern.set_primary(1, SongNote::new(60, 12, 100));
+        pattern.set_primary(2, SongNote::new(67, 12, 100));
+        let before = pattern.clone();
+
+        let notice = apply_song_pattern_intents(
+            &mut pattern,
+            &[redesign_sequence::Intent::Nudge {
+                tick: 12,
+                delta_ticks: 12,
+            }],
+        );
+
+        assert_eq!(notice, Some("nudge blocked by an occupied step"));
+        assert_eq!(pattern, before);
+    }
+}

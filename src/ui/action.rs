@@ -105,6 +105,48 @@ pub enum UiAction {
     /// Restore the arrangement view saved by the last clip zoom. Ableton's X.
     ZoomBack,
 
+    // --- Ableton's arrangement gestures, the ones that were missing ---
+    /// Jump the keyboard cell cursor to the nearest timeline boundary in
+    /// this direction: a clip edge on the cursor's lane, a locator, or a
+    /// loop edge. Ableton's Ctrl+Left / Ctrl+Right.
+    SnapMarker(i8),
+    /// Multiply the loop region's length by this factor, anchored at its
+    /// start. 2.0 doubles, 0.5 halves. Ableton's Ctrl+Up / Ctrl+Down.
+    ResizeLoop(f32),
+    /// Select the time inside the loop region on every lane: the span
+    /// becomes the selection, and the clips it touches are selected.
+    /// Ableton's Ctrl+Shift+L.
+    SelectLoopContents,
+    /// Fold or unfold the selected group. Ableton's U.
+    FoldTrack,
+    /// Open every folded group. Ableton's Alt+U.
+    UnfoldAll,
+    /// Step the selected track's height by this many points, clamped to
+    /// the lane limits. Ableton's Alt+Plus / Alt+Minus.
+    TrackHeight(f32),
+    /// Divide the visible lane area evenly across the tracks. Ableton's H.
+    FitTracks,
+    /// Zoom the timeline so every clip is in view. Ableton's W.
+    FitWidth,
+    /// Reverse the selected audio clip — a destructive render, so this is
+    /// the app's own, never `perform`'s. Ableton's R.
+    ReverseAudio,
+    /// Give every selected audio clip default edge fades.
+    /// Ableton's Ctrl+Alt+F.
+    FadeSelected,
+    /// Remove every fade on the selected audio clips.
+    /// Ableton's Ctrl+Alt+Backspace.
+    ClearFades,
+    /// Zoom the timeline by this factor, anchored at the centre of the
+    /// view. 2.0 zooms in, 0.5 out. Ableton's plain Plus / Minus.
+    ZoomTimeline(f32),
+    /// Crop the focused clip's region: keep only the ring's span on the
+    /// clip's lane. Ableton 12's Ctrl+Shift+J.
+    CropFocusedClip,
+    /// Set the transport's global swing, `0..=1`. Baked into the
+    /// schedule, so a change recompiles.
+    SetSwing(f32),
+
     /// Flip the main area between the timeline and the clip launcher. Tab.
     ToggleMainView,
     /// Stop every session clip: playback returns to the timeline whole.
@@ -148,6 +190,10 @@ pub enum UiAction {
     /// Take the track's rack apart, leaving its devices in place and in
     /// order. Ctrl+Shift+G.
     UngroupDevices,
+    /// Remove the devices picked in the open rack editor. Delete / Backspace.
+    /// Kept separate from `DeleteSelected`: device selection is app-owned
+    /// view state, while clip and track selection lives in the arrangement.
+    DeleteDevices,
 
     // --- returns ---
     /// Add a return bus, named for where it lands. Refused past the
@@ -231,6 +277,20 @@ impl UiAction {
             Self::JumpLocator(_) => "Jump to locator",
             Self::ZoomSelectedAudioClip => "Zoom to selected audio clip",
             Self::ZoomBack => "Zoom back",
+            Self::SnapMarker(_) => "Jump cursor to boundary",
+            Self::ResizeLoop(_) => "Resize loop",
+            Self::SelectLoopContents => "Select loop contents",
+            Self::FoldTrack => "Fold group",
+            Self::UnfoldAll => "Unfold all groups",
+            Self::TrackHeight(_) => "Track height",
+            Self::FitTracks => "Fit tracks to height",
+            Self::FitWidth => "Fit width to content",
+            Self::ReverseAudio => "Reverse audio clip",
+            Self::FadeSelected => "Fade selected clips",
+            Self::ClearFades => "Clear fades",
+            Self::ZoomTimeline(_) => "Zoom timeline",
+            Self::CropFocusedClip => "Crop focused clip region",
+            Self::SetSwing(_) => "Swing",
             Self::ToggleBrowser => "Browser",
             Self::ToggleLower => "Lower panel",
             Self::ToggleChrome => "Hide everything",
@@ -252,6 +312,7 @@ impl UiAction {
             Self::CenterTrackPan => "Center pan",
             Self::GroupDevices => "Group devices into a rack",
             Self::UngroupDevices => "Ungroup the rack",
+            Self::DeleteDevices => "Delete selected devices",
             Self::AddReturn => "Add return",
             Self::RemoveReturn => "Delete return",
             Self::SaveProject => "Save project",
@@ -307,6 +368,20 @@ impl UiAction {
             | Self::JumpLocator(_)
             | Self::ZoomSelectedAudioClip
             | Self::ZoomBack
+            | Self::SnapMarker(_)
+            | Self::ResizeLoop(_)
+            | Self::SelectLoopContents
+            | Self::FoldTrack
+            | Self::UnfoldAll
+            | Self::TrackHeight(_)
+            | Self::FitTracks
+            | Self::FitWidth
+            | Self::ReverseAudio
+            | Self::FadeSelected
+            | Self::ClearFades
+            | Self::ZoomTimeline(_)
+            | Self::CropFocusedClip
+            | Self::SetSwing(_)
             | Self::ToggleMainView
             | Self::ToggleBrowser
             | Self::ToggleLower
@@ -325,6 +400,7 @@ impl UiAction {
             | Self::CenterTrackPan
             | Self::GroupDevices
             | Self::UngroupDevices
+            | Self::DeleteDevices
             | Self::AddReturn
             | Self::RemoveReturn
             | Self::SaveProject

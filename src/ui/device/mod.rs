@@ -84,9 +84,12 @@ pub mod echo;
 pub mod envelope;
 pub mod eq;
 pub mod fader;
+pub mod ferric;
 pub mod field;
 pub mod filter;
+pub mod flint;
 pub mod gate;
+pub mod gauge;
 pub mod glue;
 pub mod handclap;
 pub mod hat;
@@ -95,6 +98,7 @@ pub mod kick;
 pub mod knob;
 pub mod limiter;
 pub mod lofi;
+pub mod loom;
 pub mod meter;
 pub mod metrics;
 pub mod modulato;
@@ -123,13 +127,18 @@ pub mod sat;
 pub mod scope;
 pub mod shaper;
 pub mod sheen;
+pub mod sibyl;
+pub mod sigil;
 pub mod snare;
 pub mod spectrum;
 pub mod strip;
 pub mod switch;
 pub mod synth;
 pub mod tilt;
+pub mod tine;
 pub mod tom;
+pub mod tone;
+pub mod umbra;
 pub mod utility;
 pub mod xy;
 
@@ -168,6 +177,9 @@ pub use limiter::{
 };
 pub use lofi::{
     LofiUi, lofi_card, lofi_edits, lofi_is_discrete, lofi_is_log, lofi_norm, lofi_value,
+};
+pub use loom::{
+    LoomUi, loom_card, loom_edits, loom_is_discrete, loom_is_log, loom_norm, loom_value,
 };
 pub use metrics::Footprint;
 pub use param::{Mapping, Param, Unit};

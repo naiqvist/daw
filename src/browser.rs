@@ -1,7 +1,7 @@
 //! The browser: the device tree and the sample catalogue.
 //!
 //! Lifted out of `main.rs` whole. It was the most self-contained region
-//! in that file — a search field, two bands, and one walk over a folder
+//! in that file — a search field, two trees, and one walk over a folder
 //! tree — and the only thing tying it to its neighbours was a handful of
 //! layout constants, which stay where they are and reach it through
 //! `use super::*`.
@@ -54,8 +54,6 @@ pub(crate) struct Folder {
 
 /// Everything the browser owns that outlives a frame.
 pub(crate) struct Browser {
-    /// Where the two bands meet, as a fraction of panel height.
-    pub(crate) split: f32,
     pub(crate) query: String,
     pub(crate) folders: Vec<Folder>,
     /// None is the Ableton-style All view; otherwise this is a configured
@@ -79,8 +77,6 @@ pub(crate) struct Browser {
     /// Its own, beside the catalog's: the two lists share a band but not
     /// a position, and a wheel over one must not move the other.
     pub(crate) tree_scroll: f32,
-    pub(crate) user_library_path: String,
-    pub(crate) sample_folder_path: String,
 }
 
 impl Default for Browser {
@@ -88,10 +84,9 @@ impl Default for Browser {
         // The built-in devices, which are NOT mockups any more: every row
         // here is a real node with a real parameter table behind it, and
         // dragging one in is how a track gets an instrument. The sample
-        // library fills the lower band; this band is what the app itself
+        // library fills the catalog below; this tree is what the app itself
         // ships with, so it is built in rather than scanned.
         Self {
-            split: BROWSER_LOWER_FRAC,
             query: String::new(),
             location: None,
             folder: None,
@@ -99,8 +94,6 @@ impl Default for Browser {
             expanded: std::collections::HashSet::new(),
             catalog_scroll: 0.0,
             tree_scroll: 0.0,
-            user_library_path: String::new(),
-            sample_folder_path: String::new(),
             folders: vec![
                 Folder {
                     name: "Instruments",
@@ -125,8 +118,16 @@ impl Default for Browser {
                                     load: DeviceKind::Poly,
                                 },
                                 BrowserItem {
+                                    name: "Tine",
+                                    load: DeviceKind::Tine,
+                                },
+                                BrowserItem {
                                     name: "Haze",
                                     load: DeviceKind::Haze,
+                                },
+                                BrowserItem {
+                                    name: "Loom",
+                                    load: DeviceKind::Loom,
                                 },
                                 BrowserItem {
                                     name: "Acid",
@@ -201,6 +202,10 @@ impl Default for Browser {
                                     load: DeviceKind::Clamp,
                                 },
                                 BrowserItem {
+                                    name: "Flint",
+                                    load: DeviceKind::Flint,
+                                },
+                                BrowserItem {
                                     name: "Glue",
                                     load: DeviceKind::Glue,
                                 },
@@ -256,6 +261,14 @@ impl Default for Browser {
                                     name: "Reverb",
                                     load: DeviceKind::Reverb,
                                 },
+                                BrowserItem {
+                                    name: "Ferric",
+                                    load: DeviceKind::Ferric,
+                                },
+                                BrowserItem {
+                                    name: "Umbra",
+                                    load: DeviceKind::Umbra,
+                                },
                             ],
                             open: false,
                         },
@@ -296,6 +309,10 @@ impl Default for Browser {
                                     name: "Disperser",
                                     load: DeviceKind::Disperser,
                                 },
+                                BrowserItem {
+                                    name: "Sigil",
+                                    load: DeviceKind::Sigil,
+                                },
                             ],
                             open: false,
                         },
@@ -303,10 +320,16 @@ impl Default for Browser {
                             // the sound taken apart and put back together.
                             name: "Spectral",
                             mark: Glyph::Spectral,
-                            items: &[BrowserItem {
-                                name: "Resyn",
-                                load: DeviceKind::Resyn,
-                            }],
+                            items: &[
+                                BrowserItem {
+                                    name: "Resyn",
+                                    load: DeviceKind::Resyn,
+                                },
+                                BrowserItem {
+                                    name: "Sibyl",
+                                    load: DeviceKind::Sibyl,
+                                },
+                            ],
                             open: false,
                         },
                         Group {
@@ -317,6 +340,14 @@ impl Default for Browser {
                                 BrowserItem {
                                     name: "Utility",
                                     load: DeviceKind::Utility,
+                                },
+                                BrowserItem {
+                                    name: "Gauge",
+                                    load: DeviceKind::Gauge,
+                                },
+                                BrowserItem {
+                                    name: "Tone",
+                                    load: DeviceKind::Tone,
                                 },
                                 BrowserItem {
                                     name: "Rack",
@@ -347,10 +378,6 @@ pub(crate) fn folder_key(location_id: &str, relative: &std::path::Path) -> Strin
 pub(crate) enum BrowserEvent {
     LoadDevice(BrowserItem),
     SelectSample(std::path::PathBuf),
-    SetUserLibrary(std::path::PathBuf),
-    AddSampleFolder(std::path::PathBuf),
-    RemoveSampleFolder(std::path::PathBuf),
-    Rescan,
 }
 
 /// The rows the tree currently shows, as (indent depth, text, is_folder).
@@ -1106,7 +1133,7 @@ pub(crate) fn catalog_tree(
                 egui::pos2(upper.left() + TREE_PAD_X * 2.0, y + TREE_ROW_H * 0.5),
                 egui::Align2::LEFT_CENTER,
                 if snapshot.locations.is_empty() {
-                    "Set a library folder below to index samples"
+                    "Set a library folder in Preferences to index samples"
                 } else if !asked {
                     // NOT an empty result — an unasked question. The
                     // two look identical as a blank line and want
@@ -1148,7 +1175,10 @@ pub(crate) fn catalog_tree(
             .affords(Affords::Carry);
         // A row can be pulled straight onto the timeline. The arrangement's
         // drop ghost is the drag visual, so the row itself stays put.
-        response.dnd_set_drag_payload(SampleDrag(asset.path.clone()));
+        response.dnd_set_drag_payload(SampleDrag {
+            path: asset.path.clone(),
+            origin: SampleDragOrigin::Browser,
+        });
         if response.hovered() {
             ui.painter().rect_filled(visible, 0.0, theme.accent_muted);
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -1163,106 +1193,6 @@ pub(crate) fn catalog_tree(
             font.clone(),
             theme.text_muted,
         );
-    }
-    event
-}
-
-/// Folder management lives in the lower browser band. Paths are text fields
-/// rather than a native chooser, so adding folders needs no new dependency.
-pub(crate) fn library_manager(
-    ui: &mut egui::Ui,
-    theme: &Theme,
-    lower: egui::Rect,
-    browser: &mut Browser,
-    config: &LibraryConfig,
-    scanning: bool,
-) -> Option<BrowserEvent> {
-    let mut event = None;
-    let font = egui::FontId::new(SEARCH_TYPE, egui::FontFamily::Proportional);
-    let pad = SEARCH_PAD;
-    let row = SEARCH_H.min(TREE_ROW_H);
-    let width = lower.width() - pad * 2.0;
-    if width <= 0.0 || lower.height() < row {
-        return None;
-    }
-    let mut y = lower.top() + pad;
-    ui.painter().text(
-        egui::pos2(lower.left() + pad, y),
-        egui::Align2::LEFT_TOP,
-        if scanning {
-            "scanning library…"
-        } else {
-            "library folders"
-        },
-        font.clone(),
-        theme.text,
-    );
-    y += row * 0.75;
-
-    let button_w = 48.0;
-    let field = egui::Rect::from_min_size(
-        egui::pos2(lower.left() + pad, y),
-        egui::vec2((width - button_w).max(1.0), row),
-    );
-    let set = egui::Rect::from_min_size(egui::pos2(field.right(), y), egui::vec2(button_w, row));
-    ui.put(
-        field,
-        egui::TextEdit::singleline(&mut browser.user_library_path)
-            .hint_text("User Library path")
-            .font(font.clone()),
-    );
-    if ui.put(set, egui::Button::new("set")).clicked() && !browser.user_library_path.is_empty() {
-        event = Some(BrowserEvent::SetUserLibrary(std::path::PathBuf::from(
-            browser.user_library_path.clone(),
-        )));
-    }
-    y += row + 2.0;
-
-    let field = egui::Rect::from_min_size(
-        egui::pos2(lower.left() + pad, y),
-        egui::vec2((width - button_w).max(1.0), row),
-    );
-    let add = egui::Rect::from_min_size(egui::pos2(field.right(), y), egui::vec2(button_w, row));
-    ui.put(
-        field,
-        egui::TextEdit::singleline(&mut browser.sample_folder_path)
-            .hint_text("Sample folder path")
-            .font(font.clone()),
-    );
-    if ui.put(add, egui::Button::new("add")).clicked() && !browser.sample_folder_path.is_empty() {
-        event = Some(BrowserEvent::AddSampleFolder(std::path::PathBuf::from(
-            browser.sample_folder_path.clone(),
-        )));
-    }
-    y += row + 2.0;
-
-    let rescan =
-        egui::Rect::from_min_size(egui::pos2(lower.left() + pad, y), egui::vec2(70.0, row));
-    if ui.put(rescan, egui::Button::new("rescan")).clicked() {
-        event = Some(BrowserEvent::Rescan);
-    }
-    y += row + 2.0;
-    for root in &config.sample_folders {
-        if y + row > lower.bottom() {
-            break;
-        }
-        let remove =
-            egui::Rect::from_min_size(egui::pos2(lower.left() + pad, y), egui::vec2(48.0, row));
-        if ui.put(remove, egui::Button::new("remove")).clicked() {
-            event = Some(BrowserEvent::RemoveSampleFolder(root.clone()));
-        }
-        let text_clip = egui::Rect::from_min_max(
-            egui::pos2(remove.right() + pad, remove.top()),
-            egui::pos2(lower.right() - pad, remove.bottom()),
-        );
-        ui.painter().with_clip_rect(text_clip).text(
-            egui::pos2(remove.right() + pad, remove.center().y),
-            egui::Align2::LEFT_CENTER,
-            root.display().to_string(),
-            font.clone(),
-            theme.text_muted,
-        );
-        y += row;
     }
     event
 }
@@ -1363,7 +1293,7 @@ pub(crate) fn centred_band(outer: egui::Rect, left: f32, right: f32, height: f32
 }
 
 /// The browser's body: claim the space like every other region, then paint
-/// its content area and let the user drag the divider between the bands.
+/// the device tree and sample catalog through the full content height.
 ///
 /// The interaction happens BEFORE the paint so a drag lands on the same
 /// frame it was made — reading it back afterwards would put the bands one
@@ -1374,37 +1304,12 @@ pub(crate) fn browser_body(
     focus: &mut Focus,
     browser: &mut Browser,
     snapshot: &LibrarySnapshot,
-    config: &LibraryConfig,
-    scanning: bool,
 ) -> Option<BrowserEvent> {
     let area = ui.max_rect();
     claim(ui);
-
-    let (upper, _) = browser_bands(area, browser.split)?;
-
-    let grab = ui.style().interaction.resize_grab_radius_side;
-    let hit = egui::Rect::from_min_max(
-        egui::pos2(upper.left(), upper.bottom() - grab),
-        egui::pos2(upper.right(), upper.bottom() + grab),
-    );
-    let response = ui
-        .interact(hit, ui.id().with("browser_split"), egui::Sense::drag())
-        .affords(Affords::SeamX);
-    if let Some(pointer) = response.interact_pointer_pos() {
-        browser.split = split_from_pointer(area, pointer.y);
-    }
-    if response.hovered() || response.dragged() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
-    }
-
-    // Recomputed, because the drag above may have just moved the divider.
-    let (upper, lower) = browser_bands(area, browser.split)?;
-    // The two bands sit on the theme's own ramp: the upper one a step above
-    // the panel behind, the lower one a step above that — which keeps the
-    // original "felt, not read" split whatever the scheme's ground is.
+    let upper = browser_content(area)?;
     let painter = ui.painter();
     painter.rect_filled(upper, 0.0, theme.surface);
-    painter.rect_filled(lower, 0.0, theme.surface_raised);
 
     // The tally the field prints: how many devices the query left, out
     // of how many there are. Counted from the same rows the tree draws,
@@ -1431,20 +1336,5 @@ pub(crate) fn browser_body(
         &mut browser.tree_scroll,
     );
     let catalog = catalog_tree(ui, theme, focus, upper, browser, snapshot);
-    let manager = library_manager(ui, theme, lower, browser, config, scanning);
-
-    let painter = ui.painter();
-    // Same affordance as the panel edges: the divider is invisible until you
-    // reach for it, then it is unmistakable.
-    if response.hovered() || response.dragged() {
-        painter.rect_filled(
-            egui::Rect::from_min_max(
-                egui::pos2(upper.left(), upper.bottom() - SEAM_PX),
-                egui::pos2(upper.right(), upper.bottom()),
-            ),
-            0.0,
-            SEAM,
-        );
-    }
-    manager.or(catalog).or(load.map(BrowserEvent::LoadDevice))
+    catalog.or(load.map(BrowserEvent::LoadDevice))
 }

@@ -206,7 +206,7 @@ impl Resolved {
 }
 
 fn db_to_gain(db: f32) -> f32 {
-    10f32.powf(db / 20.0)
+    crate::dsp::arith::db_to_gain(db)
 }
 
 /// Geometric interpolation, for times where the ratio is what matters.
@@ -323,7 +323,7 @@ impl Band {
             // source toward whichever side happened to be louder, and
             // do it independently in three bands.
             let env = self.detector.tick(0.5 * (*left + *right));
-            let level_db = 20.0 * env.max(1e-7).log10();
+            let level_db = crate::dsp::arith::gain_to_db(env.max(1e-7));
             let raw = self.computer.gain_db(level_db);
             // The computer only ever gives back attenuation. Upward
             // compression is that same curve read the other way up,

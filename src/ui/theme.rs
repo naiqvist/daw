@@ -499,12 +499,32 @@ impl Theme {
         v.widgets.hovered.corner_radius = egui::CornerRadius::same(radius::CTRL as u8);
         v.widgets.active.corner_radius = egui::CornerRadius::same(radius::CTRL as u8);
         v.window_corner_radius = egui::CornerRadius::same(radius::PANEL as u8);
+        // `egui::Modal` uses `Frame::popup`, not `Frame::window`, so it
+        // reads this separate radius. Leaving egui's default here made the
+        // welcome, preferences, export and project windows round while the
+        // modulation-matrix window was square.
+        v.menu_corner_radius = egui::CornerRadius::same(radius::PANEL as u8);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_floating_surface_has_square_corners() {
+        for theme in [
+            Theme::dark(),
+            Theme::light(),
+            Theme::industrial(),
+            Theme::cyberpunk(),
+        ] {
+            let mut style = egui::Style::default();
+            theme.shape_style(&mut style);
+            assert_eq!(style.visuals.window_corner_radius, egui::CornerRadius::ZERO);
+            assert_eq!(style.visuals.menu_corner_radius, egui::CornerRadius::ZERO);
+        }
+    }
 
     /// Hue in degrees, chroma and value in `0..=1`. Hand-rolled because
     /// the doctrine is stated in these three channels and pulling a crate

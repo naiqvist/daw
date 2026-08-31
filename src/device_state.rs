@@ -243,6 +243,8 @@ impl Default for PhaserParams {
 pub enum DeviceState {
     SineSynth(SynthParams),
     Poly(daw::audio::poly::PolyParams),
+    Loom(daw::audio::loom::LoomParams),
+    Tine(daw::audio::tine::TineParams),
     Haze(daw::audio::haze::HazeParams),
     Sampler(daw::audio::sampler::SamplerParams),
     Kick(daw::audio::kick::KickParams),
@@ -281,6 +283,13 @@ pub enum DeviceState {
     Rack,
     Limiter(daw::audio::limiter::LimiterParams),
     Modulato(daw::audio::modulato::ModulatoParams),
+    Flint(daw::audio::flint::FlintParams),
+    Sibyl(daw::audio::sibyl::SibylParams),
+    Ferric(daw::audio::ferric::FerricParams),
+    Umbra(daw::audio::umbra::UmbraParams),
+    Tone(daw::audio::tone::ToneParams),
+    Sigil(daw::audio::sigil::SigilParams),
+    Gauge(daw::audio::gauge::GaugeParams),
     Utility(daw::audio::utility::UtilityParams),
 }
 
@@ -290,6 +299,8 @@ impl DeviceState {
         match kind {
             DeviceKind::SineSynth => Self::SineSynth(SynthParams::default()),
             DeviceKind::Poly => Self::Poly(daw::audio::poly::PolyParams::default()),
+            DeviceKind::Loom => Self::Loom(daw::audio::loom::LoomParams::default()),
+            DeviceKind::Tine => Self::Tine(daw::audio::tine::TineParams::default()),
             DeviceKind::Haze => Self::Haze(daw::audio::haze::HazeParams::default()),
             DeviceKind::Sampler => Self::Sampler(daw::audio::sampler::SamplerParams::default()),
             DeviceKind::Kick => Self::Kick(daw::audio::kick::KickParams::default()),
@@ -317,6 +328,13 @@ impl DeviceState {
             DeviceKind::Rack => Self::Rack,
             DeviceKind::Limiter => Self::Limiter(daw::audio::limiter::LimiterParams::default()),
             DeviceKind::Modulato => Self::Modulato(daw::audio::modulato::ModulatoParams::default()),
+            DeviceKind::Flint => Self::Flint(daw::audio::flint::FlintParams::default()),
+            DeviceKind::Sibyl => Self::Sibyl(daw::audio::sibyl::SibylParams::default()),
+            DeviceKind::Ferric => Self::Ferric(daw::audio::ferric::FerricParams::default()),
+            DeviceKind::Umbra => Self::Umbra(daw::audio::umbra::UmbraParams::default()),
+            DeviceKind::Tone => Self::Tone(daw::audio::tone::ToneParams::default()),
+            DeviceKind::Sigil => Self::Sigil(daw::audio::sigil::SigilParams::default()),
+            DeviceKind::Gauge => Self::Gauge(daw::audio::gauge::GaugeParams::default()),
             DeviceKind::Utility => Self::Utility(daw::audio::utility::UtilityParams::default()),
         }
     }
@@ -325,6 +343,8 @@ impl DeviceState {
         match self {
             Self::SineSynth(_) => DeviceKind::SineSynth,
             Self::Poly(_) => DeviceKind::Poly,
+            Self::Loom(_) => DeviceKind::Loom,
+            Self::Tine(_) => DeviceKind::Tine,
             Self::Haze(_) => DeviceKind::Haze,
             Self::Sampler(_) => DeviceKind::Sampler,
             Self::Kick(_) => DeviceKind::Kick,
@@ -352,6 +372,13 @@ impl DeviceState {
             Self::Rack => DeviceKind::Rack,
             Self::Limiter(_) => DeviceKind::Limiter,
             Self::Modulato(_) => DeviceKind::Modulato,
+            Self::Flint(_) => DeviceKind::Flint,
+            Self::Sibyl(_) => DeviceKind::Sibyl,
+            Self::Ferric(_) => DeviceKind::Ferric,
+            Self::Umbra(_) => DeviceKind::Umbra,
+            Self::Tone(_) => DeviceKind::Tone,
+            Self::Sigil(_) => DeviceKind::Sigil,
+            Self::Gauge(_) => DeviceKind::Gauge,
             Self::Utility(_) => DeviceKind::Utility,
         }
     }
@@ -371,7 +398,16 @@ impl DeviceState {
             // beside its writer, in the engine struct that owns them —
             // spelling them out twice here is how the two halves drift.
             Self::Poly(p) => p.get(param),
+            Self::Loom(p) => p.get(param),
+            Self::Tine(p) => p.get(param),
             Self::Haze(p) => p.get(param),
+            Self::Flint(p) => p.get(param),
+            Self::Sibyl(p) => p.get(param),
+            Self::Ferric(p) => p.get(param),
+            Self::Umbra(p) => p.get(param),
+            Self::Tone(p) => p.get(param),
+            Self::Sigil(p) => p.get(param),
+            Self::Gauge(p) => p.get(param),
             // Thirty-six rows, with a reader beside their writer in the
             // struct that owns them — spelling them out again here is how
             // the two halves drift.
@@ -491,7 +527,16 @@ impl DeviceState {
                 _ => {}
             },
             Self::Poly(p) => p.set(param, value),
+            Self::Loom(p) => p.set(param, value),
+            Self::Tine(p) => p.set(param, value),
             Self::Haze(p) => p.set(param, value),
+            Self::Flint(p) => p.set(param, value),
+            Self::Sibyl(p) => p.set(param, value),
+            Self::Ferric(p) => p.set(param, value),
+            Self::Umbra(p) => p.set(param, value),
+            Self::Tone(p) => p.set(param, value),
+            Self::Sigil(p) => p.set(param, value),
+            Self::Gauge(p) => p.set(param, value),
             Self::Sampler(p) => p.set(param, value),
             Self::Kick(p) => p.set(param, value),
             Self::Snare(p) => p.set(param, value),
@@ -668,6 +713,16 @@ pub fn synth_knobs(params: SynthParams) -> device::SineSynthUi {
 /// rather than by naming thirty-four fields: the card already knows which
 /// field each id belongs to, and a second copy of that map is a second
 /// thing to get wrong.
+pub fn loom_knobs(params: daw::audio::loom::LoomParams, page: u8) -> device::loom::LoomUi {
+    let mut ui = device::loom::LoomUi::from_engine(|id| {
+        params
+            .get(id)
+            .unwrap_or_else(|| daw::params::def(daw::params::loom::TABLE, id).default)
+    });
+    ui.restore_view(page);
+    ui
+}
+
 pub fn poly_knobs(params: daw::audio::poly::PolyParams, page: u8) -> device::PolyUi {
     let mut ui = device::PolyUi {
         page: usize::from(page),
@@ -865,6 +920,70 @@ pub fn card_pages(kind: DeviceKind) -> usize {
     }
 }
 
+pub fn tine_knobs(params: daw::audio::tine::TineParams) -> device::tine::TineUi {
+    device::tine::TineUi::from_engine(|id| {
+        params
+            .get(id)
+            .unwrap_or_else(|| daw::params::def(daw::params::tine::TABLE, id).default)
+    })
+}
+
+pub fn tone_knobs(params: daw::audio::tone::ToneParams) -> device::tone::ToneUi {
+    device::tone::ToneUi::from_engine(|id| {
+        params
+            .get(id)
+            .unwrap_or_else(|| daw::params::def(daw::params::tone::TABLE, id).default)
+    })
+}
+
+pub fn sigil_knobs(params: daw::audio::sigil::SigilParams) -> device::sigil::SigilUi {
+    device::sigil::SigilUi::from_engine(|id| {
+        params
+            .get(id)
+            .unwrap_or_else(|| daw::params::def(daw::params::sigil::TABLE, id).default)
+    })
+}
+
+pub fn gauge_knobs(params: daw::audio::gauge::GaugeParams) -> device::gauge::GaugeUi {
+    device::gauge::GaugeUi::from_engine(|id| {
+        params
+            .get(id)
+            .unwrap_or_else(|| daw::params::def(daw::params::gauge::TABLE, id).default)
+    })
+}
+
+pub fn umbra_knobs(params: daw::audio::umbra::UmbraParams) -> device::umbra::UmbraUi {
+    device::umbra::UmbraUi::from_engine(|id| {
+        params
+            .get(id)
+            .unwrap_or_else(|| daw::params::def(daw::params::umbra::TABLE, id).default)
+    })
+}
+
+pub fn ferric_knobs(params: daw::audio::ferric::FerricParams) -> device::ferric::FerricUi {
+    device::ferric::FerricUi::from_engine(|id| {
+        params
+            .get(id)
+            .unwrap_or_else(|| daw::params::def(daw::params::ferric::TABLE, id).default)
+    })
+}
+
+pub fn sibyl_knobs(params: daw::audio::sibyl::SibylParams) -> device::sibyl::SibylUi {
+    device::sibyl::SibylUi::from_engine(|id| {
+        params
+            .get(id)
+            .unwrap_or_else(|| daw::params::def(daw::params::sibyl::TABLE, id).default)
+    })
+}
+
+pub fn flint_knobs(params: daw::audio::flint::FlintParams) -> device::flint::FlintUi {
+    device::flint::FlintUi::from_engine(|id| {
+        params
+            .get(id)
+            .unwrap_or_else(|| daw::params::def(daw::params::flint::TABLE, id).default)
+    })
+}
+
 pub fn clamp_knobs(params: daw::audio::clamp::ClampParams) -> device::clamp::ClampUi {
     device::clamp::ClampUi::from_engine(|id| {
         params
@@ -908,8 +1027,17 @@ pub fn echo_knobs(params: EchoParams) -> device::EchoUi {
 /// The knob position of one engine value, by device kind.
 pub fn device_norm(kind: DeviceKind, param: u32, value: f32) -> f32 {
     match kind {
+        DeviceKind::Flint => device::flint::flint_norm(param, value),
+        DeviceKind::Sibyl => device::sibyl::sibyl_norm(param, value),
+        DeviceKind::Ferric => device::ferric::ferric_norm(param, value),
+        DeviceKind::Umbra => device::umbra::umbra_norm(param, value),
+        DeviceKind::Tone => device::tone::tone_norm(param, value),
+        DeviceKind::Sigil => device::sigil::sigil_norm(param, value),
+        DeviceKind::Gauge => device::gauge::gauge_norm(param, value),
         DeviceKind::SineSynth => device::sine_synth_norm(param, value),
         DeviceKind::Poly => device::poly_norm(param, value),
+        DeviceKind::Loom => device::loom::loom_norm(param, value),
+        DeviceKind::Tine => device::tine::tine_norm(param, value),
         DeviceKind::Haze => device::haze::haze_norm(param, value),
         DeviceKind::Sampler => device::sampler_norm(param, value),
         DeviceKind::Kick => device::kick::kick_norm(param, value),
@@ -955,7 +1083,18 @@ pub fn device_norm(kind: DeviceKind, param: u32, value: f32) -> f32 {
 /// has to know whether a row steps whole choices or sweeps.
 pub fn device_is_discrete(kind: DeviceKind, param: u32) -> bool {
     match kind {
+        // Nothing on the transient shaper snaps: every row is a sweep.
+        DeviceKind::Flint => false,
+        DeviceKind::Sibyl => device::sibyl::sibyl_is_discrete(param),
+        DeviceKind::Ferric => device::ferric::ferric_is_discrete(param),
+        DeviceKind::Umbra => false,
+        DeviceKind::Tone => device::tone::tone_is_discrete(param),
+        DeviceKind::Sigil => device::sigil::sigil_is_discrete(param),
+        DeviceKind::Gauge => device::gauge::gauge_is_discrete(param),
         DeviceKind::Poly => device::poly_is_discrete(param),
+        DeviceKind::Loom => device::loom::loom_is_discrete(param),
+        // Nothing on the resonator snaps: every row is a sweep.
+        DeviceKind::Tine => false,
         // Nothing on the pad synth snaps: every row is a sweep.
         DeviceKind::Haze => false,
         DeviceKind::Sampler => device::sampler_is_discrete(param),
@@ -997,7 +1136,21 @@ pub fn device_is_discrete(kind: DeviceKind, param: u32) -> bool {
 /// times in OCTAVES exactly where the knob does.
 pub fn device_is_log(kind: DeviceKind, param: u32) -> bool {
     match kind {
+        // Nothing on the transient shaper is a ratio: both amounts are
+        // already in dB and the split reads in milliseconds.
+        DeviceKind::Flint => false,
+        // Semitones and degrees are already logarithmic units.
+        DeviceKind::Sibyl => false,
+        DeviceKind::Ferric => false,
+        DeviceKind::Umbra => false,
+        // A test tone's frequency is heard in ratios, like every other.
+        DeviceKind::Tone => param == daw::params::tone::FREQ,
+        // The carrier is pitched: the seal is drawn in octaves.
+        DeviceKind::Sigil => param == daw::params::sigil::FREQ,
+        DeviceKind::Gauge => false,
         DeviceKind::Poly => device::poly_is_log(param),
+        DeviceKind::Loom => device::loom::loom_is_log(param),
+        DeviceKind::Tine => false,
         DeviceKind::Haze => device::haze::haze_is_log(param),
         DeviceKind::Sampler => device::sampler_is_log(param),
         DeviceKind::Kick => device::kick::kick_is_log(param),
@@ -1041,8 +1194,17 @@ pub fn device_is_log(kind: DeviceKind, param: u32) -> bool {
 /// turning it means asking that device what its own units call this much.
 pub fn device_value(kind: DeviceKind, param: u32, norm: f32) -> f32 {
     match kind {
+        DeviceKind::Flint => device::flint::flint_value(param, norm),
+        DeviceKind::Sibyl => device::sibyl::sibyl_value(param, norm),
+        DeviceKind::Ferric => device::ferric::ferric_value(param, norm),
+        DeviceKind::Umbra => device::umbra::umbra_value(param, norm),
+        DeviceKind::Tone => device::tone::tone_value(param, norm),
+        DeviceKind::Sigil => device::sigil::sigil_value(param, norm),
+        DeviceKind::Gauge => device::gauge::gauge_value(param, norm),
         DeviceKind::SineSynth => device::sine_synth_value(param, norm),
         DeviceKind::Poly => device::poly_value(param, norm),
+        DeviceKind::Loom => device::loom::loom_value(param, norm),
+        DeviceKind::Tine => device::tine::tine_value(param, norm),
         DeviceKind::Haze => device::haze::haze_value(param, norm),
         DeviceKind::Sampler => device::sampler_value(param, norm),
         DeviceKind::Kick => device::kick::kick_value(param, norm),

@@ -22,7 +22,7 @@
 //!   4. LFOs & mod       ← [`lfo`]
 //!   5. delay family    ← [`delay`] + [`reverb`] (the first effect built on it)
 //!   6. filters         ← [`filters`] (one-pole, SVF, DC blocker,
-//!      Butterworth cascade; tilt still pending)
+//!      Butterworth cascade, tilt)
 //!   7. oscillators     ← [`osc`] + [`noise`] (mip-mapped wavetables,
 //!      white/pink; polyBLEP deliberately skipped until a synth node
 //!      wants sync or PWM, wavetable playback pending)
@@ -30,6 +30,14 @@
 //!   9. dynamics        ← [`dynamics`]
 //!  10. FFT/spectral    ← [`fft`] (real FFT, windows, frame cutter,
 //!      overlap-add, magnitude/phase conversion)
+//!  11. stereo placement ← [`pan`] (balance and constant-power laws,
+//!      polynomial rather than transcendental)
+//!
+//! Built on the families above, and listed here so the file is a map of
+//! the directory rather than of the first ten changes: [`crossover`]
+//! (LR4 band split), [`fdn`] + [`reverb`] (family 5), [`interp`]
+//! (Hermite reads), [`lofi`] (decimation and quantisation), [`adsr`]
+//! (family 3).
 //!
 //! # The lane family
 //!
@@ -94,6 +102,7 @@ pub mod lofi;
 pub mod mem;
 pub mod noise;
 pub mod osc;
+pub mod pan;
 pub mod ramps;
 pub mod reverb;
 pub mod shaper;

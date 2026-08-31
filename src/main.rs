@@ -39,8 +39,14 @@ use daw::ui::action::UiAction;
 use daw::ui::affordance::{Afford, Affords};
 use daw::ui::device;
 use daw::ui::kit;
-use daw::ui::palette::{Command as PaletteCommand, Palette};
+use daw::ui::palette::{
+    Choice as PaletteChoice, Command as PaletteCommand, Palette, TypedCommand as PaletteTyped,
+};
 use daw::ui::prefs::{STORAGE_KEY, UiPrefs};
+use daw::ui::redesign::{
+    Redesign, browser as redesign_browser, sequence as redesign_sequence,
+    transport as redesign_transport,
+};
 use daw::ui::skin::Skin;
 use daw::ui::theme::Theme;
 use daw::ui::tokens::{Density, control, font, radius, space, stroke};
@@ -57,17 +63,19 @@ mod automation;
 mod bar;
 mod browser;
 mod compile;
+mod control_plane;
 mod engine;
 mod header;
 mod rack;
 mod recording;
+mod redesign_bridge;
 mod sampler_ui;
 mod session;
 use automation::TrackAutomation;
 mod track;
 use track::{
     MasterTrack, ReturnTrack, Track, TrackInput, delete_track_automation_time,
-    insert_track_automation_time, sanitize_chain, split_track_automation_at,
+    insert_track_automation_time, remove_devices, sanitize_chain, split_track_automation_at,
 };
 mod record;
 mod targets;
@@ -81,9 +89,10 @@ mod device_state;
 use device_state::{
     DeviceInstance, DeviceState, EchoParams, acid_knobs, card_pages, clamp_knobs, device_edits,
     device_is_discrete, device_is_log, device_value, disperser_knobs, echo_knobs, eq_knobs,
-    gate_knobs, glue_knobs, lofi_knobs, phaser_knobs, poly_knobs, prism_knobs, resyn_knobs,
-    reverb_knobs, sat_knobs, sheen_knobs, strip_knobs, synth_knobs, tilt_knobs, unit_zoom,
-    utility_knobs,
+    ferric_knobs, flint_knobs, gate_knobs, gauge_knobs, glue_knobs, lofi_knobs, loom_knobs,
+    phaser_knobs, poly_knobs, prism_knobs, resyn_knobs, reverb_knobs, sat_knobs, sheen_knobs,
+    sibyl_knobs, sigil_knobs, strip_knobs, synth_knobs, tilt_knobs, tine_knobs, tone_knobs,
+    umbra_knobs, unit_zoom, utility_knobs,
 };
 mod devices;
 mod shell;
@@ -94,6 +103,8 @@ use daw::ui::glyph::Glyph;
 use devices::{DeviceKind, device_by_prefix};
 use header::*;
 use rack::*;
+#[cfg(test)]
+use redesign_bridge::redesign_arrangement_theme;
 use session::*;
 // Re-exported so the file reads as it did before the split, and so
 // the test module below keeps resolving through `use super::*`.
@@ -154,13 +165,6 @@ const SEAM_PX: f32 = 3.0;
 /// gains a matching inset.
 const BROWSER_INSET_X: f32 = 16.0;
 const BROWSER_INSET_Y: f32 = 0.0;
-/// Starting height of the lower band, as a fraction of the browser's FULL
-/// height — the panel's, not the inset area's, so the split tracks the
-/// region rather than the margin. The user drags it from here.
-const BROWSER_LOWER_FRAC: f32 = 0.2;
-/// How far the divider can be pulled. Both ends leave a usable band; letting
-/// either collapse to nothing would hide a thing the user cannot then grab.
-const BROWSER_SPLIT_RANGE: std::ops::RangeInclusive<f32> = 0.08..=0.60;
 
 /// Height of the search bar.
 const SEARCH_H: f32 = 28.0;
@@ -180,6 +184,8 @@ const FIELD_RADIUS: f32 = 0.0;
 const TEMPO_W: f32 = 54.0;
 const TIMESIG_W: f32 = 22.0;
 const QUANT_W: f32 = 46.0;
+/// The global swing slider: rail plus a three-digit percent readout.
+const SWING_W: f32 = 84.0;
 /// BPM per pixel of horizontal drag.
 const TEMPO_PER_PX: f64 = 0.2;
 /// Pixels of vertical drag per step of the time-signature numerator.
@@ -232,8 +238,33 @@ const TREE_PAD_X: f32 = 8.0;
 
 /// The grid ladder, in beats. `Ctrl+1` walks down it (finer), `Ctrl+2` walks
 /// up (coarser) — Ableton's Narrow Grid / Widen Grid, same direction.
-const GRID_BEATS: [f32; 6] = [4.0, 2.0, 1.0, 0.5, 0.25, 0.125];
-const GRID_NAMES: [&str; 6] = ["1/1", "1/2", "1/4", "1/8", "1/16", "1/32"];
+/// The grid ladder, from a whole note down to Ableton's finest division.
+///
+/// Powers of two all the way: Live 12's narrow grid bottoms out at
+/// 1/16384 — sample-adjacent at ordinary tempos — and so does this one.
+/// Both views share the table, so the piano roll and the arrangement can
+/// never disagree about what "one division" means.
+const GRID_BEATS: [f32; 15] = [
+    4.0,
+    2.0,
+    1.0,
+    0.5,
+    0.25,
+    0.125,
+    0.0625,
+    0.03125,
+    0.015_625,
+    0.007_812_5,
+    0.003_906_25,
+    0.001_953_125,
+    0.000_976_562_5,
+    0.000_488_281_25,
+    0.000_244_140_625,
+];
+const GRID_NAMES: [&str; 15] = [
+    "1/1", "1/2", "1/4", "1/8", "1/16", "1/32", "1/64", "1/128", "1/256", "1/512", "1/1024",
+    "1/2048", "1/4096", "1/8192", "1/16384",
+];
 /// Start on quarter notes.
 const GRID_DEFAULT: usize = 2;
 /// The grid's name, shown in the arrangement's corner.
@@ -453,16 +484,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     shell::run("daw", [1600.0, 900.0], [960.0, 600.0], App::new)
 }
 
-/// Split the browser's interior into the two bands, inset so the panel's own
-/// dark brown shows around them.
+/// Inset the browser's content so the panel's own dark brown shows beside it.
 ///
-/// Returns `None` when the panel is too small to hold both bands — dragged to
-/// its minimum with a short window, the inset alone can exceed the height,
-/// and half-drawn bands are worse than none.
-///
-/// Pure, so `the_browser_bands_split_and_degrade_cleanly` can check the
-/// arithmetic without a window.
-fn browser_bands(area: egui::Rect, split: f32) -> Option<(egui::Rect, egui::Rect)> {
+/// Pure, so `the_browser_content_insets_and_degrades_cleanly` can check the
+/// arithmetic without a window. Folder configuration no longer claims a
+/// second band here; it belongs to Preferences.
+fn browser_content(area: egui::Rect) -> Option<egui::Rect> {
     let inner = egui::Rect::from_min_max(
         egui::pos2(area.left() + BROWSER_INSET_X, area.top() + BROWSER_INSET_Y),
         egui::pos2(
@@ -470,25 +497,10 @@ fn browser_bands(area: egui::Rect, split: f32) -> Option<(egui::Rect, egui::Rect
             area.bottom() - BROWSER_INSET_Y,
         ),
     );
-    let lower_h = area.height() * split;
-    if inner.width() <= 0.0 || inner.height() <= lower_h {
+    if inner.width() <= 0.0 || inner.height() <= 0.0 {
         return None;
     }
-    let seam_y = inner.bottom() - lower_h;
-    Some((
-        egui::Rect::from_min_max(inner.min, egui::pos2(inner.right(), seam_y)),
-        egui::Rect::from_min_max(egui::pos2(inner.left(), seam_y), inner.max),
-    ))
-}
-
-/// The split a pointer at `y` is asking for, given the panel's `area`.
-///
-/// Inverse of the `seam_y` arithmetic in `browser_bands`, clamped. Pure, so
-/// the drag maths is checkable without dragging anything.
-fn split_from_pointer(area: egui::Rect, y: f32) -> f32 {
-    let seam_top = area.bottom() - BROWSER_INSET_Y;
-    let frac = (seam_top - y) / area.height().max(1.0);
-    frac.clamp(*BROWSER_SPLIT_RANGE.start(), *BROWSER_SPLIT_RANGE.end())
+    Some(inner)
 }
 
 /// The arrangement's shortcuts. Ctrl+1 narrows the grid, Ctrl+2 widens it,
@@ -562,6 +574,83 @@ fn arrangement_keys(ctx: &egui::Context, arr: &Arrangement, out: &mut Vec<UiActi
         if i.consume_key(egui::Modifiers::COMMAND, egui::Key::Num2) {
             out.push(UiAction::WidenGrid);
         }
+        // Ableton's marker jumps: Ctrl+Left/Right to the nearest clip
+        // edge, locator or loop edge; Ctrl+Up/Down doubles or halves the
+        // loop. SHIFT FIRST is not needed here — the plain arrows are
+        // handled above with their own modifiers.
+        if i.consume_key(egui::Modifiers::COMMAND, egui::Key::ArrowLeft) {
+            out.push(UiAction::SnapMarker(-1));
+        }
+        if i.consume_key(egui::Modifiers::COMMAND, egui::Key::ArrowRight) {
+            out.push(UiAction::SnapMarker(1));
+        }
+        if i.consume_key(egui::Modifiers::COMMAND, egui::Key::ArrowUp) {
+            out.push(UiAction::ResizeLoop(2.0));
+        }
+        if i.consume_key(egui::Modifiers::COMMAND, egui::Key::ArrowDown) {
+            out.push(UiAction::ResizeLoop(0.5));
+        }
+        // SHIFT FIRST for the loop pair: `consume_key` ignores an extra
+        // Shift, so a plain Ctrl+L checked first would swallow
+        // Ctrl+Shift+L and loop the selection when asked to select the
+        // loop's contents. The pair itself lives with the frame regions
+        // below, AFTER Ctrl+Alt+L — an extra Alt is ignored the same
+        // way, and Ctrl+L must not swallow the panel toggle.
+        // Ableton's folds: U folds the selected group, Alt+U opens every
+        // group. ALT FIRST — a plain-U check has different modifiers and
+        // cannot swallow Alt+U, but the order keeps the specific one
+        // readable next to the others.
+        if i.consume_key(egui::Modifiers::ALT, egui::Key::U) {
+            out.push(UiAction::UnfoldAll);
+        }
+        if i.consume_key(egui::Modifiers::NONE, egui::Key::U) {
+            out.push(UiAction::FoldTrack);
+        }
+        // Ableton's lane height keys: Alt+Plus/Minus steps the selected
+        // track. `Key::Plus` is the numpad's too.
+        if i.consume_key(egui::Modifiers::ALT, egui::Key::Plus) {
+            out.push(UiAction::TrackHeight(20.0));
+        }
+        if i.consume_key(egui::Modifiers::ALT, egui::Key::Minus) {
+            out.push(UiAction::TrackHeight(-20.0));
+        }
+        // H fits the lanes to the screen; W fits the timeline to the
+        // song. Bare letters, like Z, X and A before them — the
+        // arrangement owns these while the ring is on it.
+        if i.consume_key(egui::Modifiers::NONE, egui::Key::H) {
+            out.push(UiAction::FitTracks);
+        }
+        if i.consume_key(egui::Modifiers::NONE, egui::Key::W) {
+            out.push(UiAction::FitWidth);
+        }
+        // Ableton's R: reverse the selected audio clip. A destructive
+        // render — the app owns the worker, `perform` never sees it.
+        if i.consume_key(egui::Modifiers::NONE, egui::Key::R) {
+            out.push(UiAction::ReverseAudio);
+        }
+        // Ableton's zoom keys: plain Plus zooms in, Minus out. On a US
+        // layout Plus is typed as Shift+Equals, which egui reports as
+        // Equals with Shift held — so both forms are the same verb.
+        if i.consume_key(egui::Modifiers::NONE, egui::Key::Plus)
+            || i.consume_key(egui::Modifiers::SHIFT, egui::Key::Equals)
+        {
+            out.push(UiAction::ZoomTimeline(2.0));
+        }
+        if i.consume_key(egui::Modifiers::NONE, egui::Key::Minus) {
+            out.push(UiAction::ZoomTimeline(0.5));
+        }
+        // Ableton 12's crop: Ctrl+Shift+J, and SHIFT FIRST — a plain
+        // Ctrl+J checked first would swallow the shifted gesture and
+        // consolidate when asked to crop.
+        if i.consume_key(
+            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+            egui::Key::J,
+        ) {
+            out.push(UiAction::CropFocusedClip);
+        }
+        if i.consume_key(egui::Modifiers::COMMAND, egui::Key::J) {
+            out.push(UiAction::Consolidate);
+        }
         // THE FRAME REGIONS, and they go BEFORE the loop's Ctrl+L.
         //
         // `consume_key` ignores an EXTRA modifier, so the loop check
@@ -579,6 +668,26 @@ fn arrangement_keys(ctx: &egui::Context, arr: &Arrangement, out: &mut Vec<UiActi
         ) {
             out.push(UiAction::ToggleChrome);
         }
+        // Ableton's fade verbs come AFTER the chrome toggle for the same
+        // reason the loop pair comes after the lower panel: an extra
+        // Shift is ignored, so Ctrl+Alt+F must not swallow
+        // Ctrl+Alt+Shift+F. Ctrl+Alt+F puts default fades on every
+        // selected audio clip; Ctrl+Alt+Backspace takes them off.
+        if i.consume_key(
+            egui::Modifiers::COMMAND | egui::Modifiers::ALT,
+            egui::Key::F,
+        ) {
+            out.push(UiAction::FadeSelected);
+        }
+        if i.consume_key(
+            egui::Modifiers::COMMAND | egui::Modifiers::ALT,
+            egui::Key::Backspace,
+        ) || i.consume_key(
+            egui::Modifiers::COMMAND | egui::Modifiers::ALT,
+            egui::Key::Delete,
+        ) {
+            out.push(UiAction::ClearFades);
+        }
         if i.consume_key(
             egui::Modifiers::COMMAND | egui::Modifiers::ALT,
             egui::Key::B,
@@ -590,6 +699,15 @@ fn arrangement_keys(ctx: &egui::Context, arr: &Arrangement, out: &mut Vec<UiActi
             egui::Key::L,
         ) {
             out.push(UiAction::ToggleLower);
+        }
+        // SHIFT FIRST: `consume_key` ignores an extra Shift, so the
+        // plain Ctrl+L checked first would swallow Ctrl+Shift+L and loop
+        // the selection when asked to select the loop's contents.
+        if i.consume_key(
+            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+            egui::Key::L,
+        ) {
+            out.push(UiAction::SelectLoopContents);
         }
         if i.consume_key(egui::Modifiers::COMMAND, egui::Key::L) {
             out.push(UiAction::LoopFromSelection);
@@ -655,9 +773,9 @@ fn arrangement_keys(ctx: &egui::Context, arr: &Arrangement, out: &mut Vec<UiActi
         if i.consume_key(egui::Modifiers::COMMAND, egui::Key::E) {
             out.push(UiAction::SplitAtCursor);
         }
-        if i.consume_key(egui::Modifiers::COMMAND, egui::Key::J) {
-            out.push(UiAction::Consolidate);
-        }
+        // Ctrl+J and Ctrl+Shift+J both live ABOVE with the other
+        // Ableton gestures — the pair needs the shift-specific check
+        // first, and a second copy here would be dead code.
         if i.consume_key(egui::Modifiers::COMMAND, egui::Key::I) {
             out.push(UiAction::InsertSilence);
         }
@@ -722,6 +840,15 @@ impl TransportSignal {
     }
 }
 
+/// What a transport button's press came out as. `clicked` folds mouse and
+/// keyboard together — Enter on a focused button is the same press — while
+/// `response` carries the raw pointer state for gestures the keyboard
+/// cannot make (a double-click on stop).
+struct TransportPress {
+    response: egui::Response,
+    clicked: bool,
+}
+
 fn transport_button(
     ui: &mut egui::Ui,
     theme: &Theme,
@@ -731,7 +858,7 @@ fn transport_button(
     icon: Icon,
     colour: egui::Color32,
     signal: TransportSignal,
-) -> bool {
+) -> TransportPress {
     let wid = ui.id().with(id);
     focus.register(wid, rect);
     let response = ui
@@ -851,7 +978,7 @@ fn transport_button(
     }
     // Mouse and keyboard are the same press. The button does not care which.
     let clicked = response.clicked() || focus.activated(wid);
-    response.on_hover_text(match id {
+    let response = response.on_hover_text(match id {
         "return" => "return to marker",
         "play" => "play / pause transport",
         "pause" => "pause and hold position",
@@ -863,7 +990,7 @@ fn transport_button(
         "follow" => "follow playhead",
         _ => id,
     });
-    clicked
+    TransportPress { response, clicked }
 }
 
 /// The ink a plain toggle takes: lit when on, resting when off.
@@ -1003,7 +1130,7 @@ fn top_bar_body(
     let centre_w = fields_width(&[READOUT_W, TIMECODE_W, ENGINE_W]);
     let right_w = buttons_width(4)
         + TRANSPORT_GROUP_GAP
-        + fields_width(&[QUANT_W, TEMPO_W, TIMESIG_W, TIMESIG_W]);
+        + fields_width(&[QUANT_W, SWING_W, TEMPO_W, TIMESIG_W, TIMESIG_W]);
     let (verbs_x, centre_x, right_x, _) = bar_layout(area, verbs_w, centre_w, right_w);
     transport_scaffold(
         ui,
@@ -1018,7 +1145,7 @@ fn top_bar_body(
 
     // --- verbs, holding the left edge -------------------------------------
     let mut bar = Bar::at(area, verbs_x);
-    if transport_button(
+    let returned = transport_button(
         ui,
         theme,
         focus,
@@ -1027,12 +1154,13 @@ fn top_bar_body(
         Icon::Return,
         theme.text_muted,
         TransportSignal::Momentary,
-    ) {
+    );
+    if returned.clicked {
         out.push(UiAction::Return);
     }
     // Play is the only one of these that is a state rather than a verb, so it
     // is the only one that lights.
-    if transport_button(
+    let play_response = transport_button(
         ui,
         theme,
         focus,
@@ -1049,10 +1177,11 @@ fn top_bar_body(
         } else {
             TransportSignal::Momentary
         },
-    ) {
+    );
+    if play_response.clicked {
         out.push(UiAction::TogglePlay);
     }
-    if transport_button(
+    let paused = transport_button(
         ui,
         theme,
         focus,
@@ -1061,10 +1190,11 @@ fn top_bar_body(
         Icon::Pause,
         theme.text_muted,
         TransportSignal::Momentary,
-    ) {
+    );
+    if paused.clicked {
         out.push(UiAction::Pause);
     }
-    if transport_button(
+    let stopped = transport_button(
         ui,
         theme,
         focus,
@@ -1073,8 +1203,14 @@ fn top_bar_body(
         Icon::Stop,
         theme.text_muted,
         TransportSignal::Momentary,
-    ) {
+    );
+    if stopped.clicked {
         out.push(UiAction::Stop);
+    }
+    // Ableton's stop twice: a double-click on stop returns to 1.1.1,
+    // which is the same verb Home already owns.
+    if stopped.response.double_clicked() {
+        out.push(UiAction::Return);
     }
     // Record is the exception to "ink brightens when on": armed is a warning,
     // not an emphasis, so it takes the red outright.
@@ -1083,7 +1219,7 @@ fn top_bar_body(
         (true, _) => theme.danger,
         _ => theme.text_muted,
     };
-    if transport_button(
+    let recorded = transport_button(
         ui,
         theme,
         focus,
@@ -1098,7 +1234,8 @@ fn top_bar_body(
         } else {
             TransportSignal::Momentary
         },
-    ) {
+    );
+    if recorded.clicked {
         out.push(UiAction::ToggleRecord);
     }
 
@@ -1157,7 +1294,7 @@ fn top_bar_body(
     let mut bar = Bar::at(area, right_x);
     // The power switch, apart from the transport verbs: this opens and
     // closes the audio device, it does not move the playhead.
-    if transport_button(
+    let powered = transport_button(
         ui,
         theme,
         focus,
@@ -1170,14 +1307,15 @@ fn top_bar_body(
         } else {
             TransportSignal::Momentary
         },
-    ) {
+    );
+    if powered.clicked {
         out.push(if ev.on {
             UiAction::StopEngine
         } else {
             UiAction::StartEngine
         });
     }
-    if transport_button(
+    let looped = transport_button(
         ui,
         theme,
         focus,
@@ -1194,10 +1332,11 @@ fn top_bar_body(
         } else {
             TransportSignal::Momentary
         },
-    ) {
+    );
+    if looped.clicked {
         out.push(UiAction::ToggleLoop);
     }
-    if transport_button(
+    let metronomed = transport_button(
         ui,
         theme,
         focus,
@@ -1210,10 +1349,11 @@ fn top_bar_body(
         } else {
             TransportSignal::Momentary
         },
-    ) {
+    );
+    if metronomed.clicked {
         out.push(UiAction::ToggleMetronome);
     }
-    if transport_button(
+    let follow_response = transport_button(
         ui,
         theme,
         focus,
@@ -1230,7 +1370,8 @@ fn top_bar_body(
         } else {
             TransportSignal::Momentary
         },
-    ) {
+    );
+    if follow_response.clicked {
         out.push(UiAction::ToggleFollow);
     }
 
@@ -1246,6 +1387,39 @@ fn top_bar_body(
     );
     if quant.clicked() {
         *quantization = quantization.next();
+    }
+    // Global swing: one slider, and the readout says it in percent — the
+    // way a swing knob always has. Every other step of the arrangement's
+    // grid leans by this much, baked into the schedule so bounces and
+    // exports hear it too.
+    let swing_rect = bar.field(SWING_W);
+    // The same sunken well every field sits in — the swing slider is one
+    // more field, not a stranger.
+    ui.painter()
+        .rect_filled(swing_rect, FIELD_RADIUS, theme.surface_sunken);
+    let mut swing_pct = t.swing.clamp(0.0, 1.0) * 100.0;
+    let mut swing_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(swing_rect.shrink(4.0))
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    swing_ui.spacing_mut().slider_width = (swing_rect.width() - 36.0).max(20.0);
+    let slider = swing_ui.add(
+        egui::Slider::new(&mut swing_pct, 0.0..=100.0)
+            .show_value(false)
+            .integer(),
+    );
+    swing_ui.label(
+        egui::RichText::new(format!("{swing_pct:>3.0}%"))
+            .monospace()
+            .size(FIELD_TYPE)
+            .color(theme.text_muted),
+    );
+    if slider.changed() {
+        out.push(UiAction::SetSwing(swing_pct / 100.0));
+    }
+    if slider.hovered() {
+        slider.on_hover_text("swing — leans every other grid step");
     }
     let tempo_rect = bar.field(TEMPO_W);
     let tempo = field(
@@ -1356,6 +1530,11 @@ struct Transport {
     /// other transport verb clears it — an old fence must not ambush a new
     /// playback.
     play_until: Option<f32>,
+    /// Global swing, `0..=1`: every ODD step of the arrangement's grid
+    /// shifts toward the next even step. Zero is straight; one is the
+    /// classic maximum. It is baked into the compiled schedule, so a
+    /// change recompiles — and every offline render hears it too.
+    swing: f32,
 }
 
 impl Default for Transport {
@@ -1372,6 +1551,7 @@ impl Default for Transport {
             follow: true,
             marker: 0.0,
             play_until: None,
+            swing: 0.0,
         }
     }
 }
@@ -1711,6 +1891,197 @@ fn perform(actions: &[UiAction], transport: &mut Transport, arrangement: &mut Ar
                     track.pan = 0.0;
                 }
             }
+            UiAction::SnapMarker(dir) => {
+                // The nearest boundary that way: a clip edge on the
+                // cursor's own lane, a locator, or a loop edge. The cell
+                // the cursor lands on IS the selection, like every move.
+                let (track, beat) = arrangement.cursor.unwrap_or((0, 0.0));
+                let mut candidates: Vec<f32> = Vec::new();
+                if let Some(lane) = arrangement.clips.get(track) {
+                    for clip in lane {
+                        candidates.push(clip.start);
+                        candidates.push(clip.start + clip.len);
+                    }
+                }
+                candidates.extend(arrangement.locators.iter().map(|locator| locator.beat));
+                if let Some((from, to)) = arrangement.loop_range {
+                    candidates.push(from);
+                    candidates.push(to);
+                }
+                let next = if *dir < 0 {
+                    candidates
+                        .iter()
+                        .copied()
+                        .filter(|at| *at < beat - 1e-4)
+                        .fold(None, |best: Option<f32>, at| {
+                            best.map_or(Some(at), |b| Some(if at > b { at } else { b }))
+                        })
+                } else {
+                    candidates
+                        .iter()
+                        .copied()
+                        .filter(|at| *at > beat + 1e-4)
+                        .fold(None, |best: Option<f32>, at| {
+                            best.map_or(Some(at), |b| Some(if at < b { at } else { b }))
+                        })
+                };
+                if let Some(next) = next {
+                    arrangement.cursor = Some((track, next));
+                    arrangement.anchor = next;
+                    arrangement.select_track(track);
+                    arrangement.selection = Some(span(next, next, arrangement.grid_beats()));
+                }
+            }
+            UiAction::ResizeLoop(factor) => {
+                // Anchored at the loop's start, so doubling reads as
+                // "twice as long from where it begins", never as a brace
+                // that walks off to the right.
+                if let Some((from, to)) = arrangement.loop_range
+                    && to > from
+                {
+                    let len = ((to - from) * factor).max(arrangement.grid_beats());
+                    arrangement.loop_range = Some((from, from + len));
+                }
+            }
+            UiAction::SelectLoopContents => {
+                if let Some((from, to)) = arrangement.loop_range
+                    && to > from
+                {
+                    arrangement.selection = Some((from, to));
+                    let mut ids: Vec<u64> = Vec::new();
+                    for lane in &arrangement.clips {
+                        for clip in lane {
+                            if clip.start < to && clip.start + clip.len > from {
+                                ids.push(clip.id);
+                            }
+                        }
+                    }
+                    if let Some(primary) = ids.first().copied() {
+                        let at = arrangement.clips.iter().enumerate().find_map(|(t, lane)| {
+                            lane.iter()
+                                .position(|clip| clip.id == primary)
+                                .map(|i| (t, i))
+                        });
+                        if let Some((t, i)) = at {
+                            arrangement.select_only_clip(t, i);
+                        }
+                        arrangement.selected_clip_ids = ids.into_iter().skip(1).collect();
+                    } else {
+                        arrangement.selected_clip = None;
+                        arrangement.selected_clip_ids.clear();
+                    }
+                }
+            }
+            UiAction::FoldTrack => {
+                if let Some(t) = arrangement.active_track()
+                    && let Some(track) = arrangement.tracks.get_mut(t)
+                    && track.is_group
+                {
+                    track.folded = !track.folded;
+                }
+            }
+            UiAction::UnfoldAll => {
+                for track in &mut arrangement.tracks {
+                    track.folded = false;
+                }
+            }
+            UiAction::TrackHeight(delta) => {
+                if let Some(t) = arrangement.active_track()
+                    && let Some(track) = arrangement.tracks.get_mut(t)
+                {
+                    track.height =
+                        (track.height + delta).clamp(*TRACK_H_RANGE.start(), *TRACK_H_RANGE.end());
+                }
+            }
+            UiAction::FitTracks => {
+                // The visible lane area, divided evenly — Ableton's H.
+                // `viewport_height` is stashed by the arrangement pass.
+                let tracks = arrangement.tracks.len();
+                if tracks > 0 && arrangement.viewport_height > 0.0 {
+                    let h = (arrangement.viewport_height / tracks as f32)
+                        .clamp(*TRACK_H_RANGE.start(), *TRACK_H_RANGE.end());
+                    for track in &mut arrangement.tracks {
+                        track.height = h;
+                    }
+                }
+            }
+            UiAction::FitWidth => {
+                // Every clip in view: Ableton's W. The span is the last
+                // clip's end, floored at a bar so an empty song still
+                // zooms somewhere sensible.
+                let end = arrangement
+                    .clips
+                    .iter()
+                    .flatten()
+                    .map(|clip| clip.start + clip.len)
+                    .fold(4.0f32, f32::max);
+                if arrangement.viewport_width > 0.0 && end > 0.0 {
+                    arrangement.view_beats = 0.0;
+                    arrangement.pixels_per_beat = (arrangement.viewport_width / end)
+                        .clamp(ARRANGEMENT_ZOOM_MIN, ARRANGEMENT_ZOOM_MAX);
+                }
+            }
+            UiAction::FadeSelected => {
+                let mut touched = false;
+                for (t, i) in arrangement.selected_clip_refs() {
+                    if let Some(clip) = arrangement
+                        .clips
+                        .get_mut(t)
+                        .and_then(|lane| lane.get_mut(i))
+                        && let Some(audio) = clip.audio.as_mut()
+                    {
+                        // Ten milliseconds, Ableton's default fade — a
+                        // click-stopper, not an effect.
+                        let frames = ((0.010 * audio.sample_rate as f32) as u64)
+                            .min(audio.source_frames / 2);
+                        audio.fade_in = frames;
+                        audio.fade_out = frames;
+                        touched = true;
+                    }
+                }
+                if touched {
+                    arrangement.force_recompile = true;
+                }
+            }
+            UiAction::ClearFades => {
+                let mut touched = false;
+                for (t, i) in arrangement.selected_clip_refs() {
+                    if let Some(clip) = arrangement
+                        .clips
+                        .get_mut(t)
+                        .and_then(|lane| lane.get_mut(i))
+                        && let Some(audio) = clip.audio.as_mut()
+                    {
+                        audio.fade_in = 0;
+                        audio.fade_out = 0;
+                        audio.fade_in_curve = 0.0;
+                        audio.fade_out_curve = 0.0;
+                        touched = true;
+                    }
+                }
+                if touched {
+                    arrangement.force_recompile = true;
+                }
+            }
+            UiAction::SetSwing(swing) => {
+                transport.swing = swing.clamp(0.0, 1.0);
+            }
+            UiAction::ZoomTimeline(factor) => {
+                // Anchored at the centre of the view: the beat under the
+                // middle of the screen stays there, like every zoom the
+                // wheel already does.
+                if arrangement.viewport_width > 0.0 && *factor > 0.0 {
+                    let old = arrangement.pixels_per_beat;
+                    let new = (old * factor).clamp(ARRANGEMENT_ZOOM_MIN, ARRANGEMENT_ZOOM_MAX);
+                    if (new - old).abs() > 1e-4 {
+                        let centre =
+                            arrangement.view_beats + arrangement.viewport_width / (2.0 * old);
+                        arrangement.pixels_per_beat = new;
+                        arrangement.view_beats =
+                            (centre - arrangement.viewport_width / (2.0 * new)).max(0.0);
+                    }
+                }
+            }
             // The rest of the vocabulary exists but nothing emits it yet.
             other => debug_assert!(false, "unhandled action: {other:?}"),
         }
@@ -1887,6 +2258,27 @@ struct AudioSource {
     source_frames: u64,
     gain: f32,
     looped: bool,
+    /// Live's Transpose, in semitones. VARISPEED: no live resampler
+    /// exists, so a non-zero pitch plays a cached render of the ORIGINAL
+    /// file at the ratio — `transposed_from` — and the clip's duration
+    /// follows the rate. Zero is the file as it is, bit for bit.
+    #[serde(default)]
+    transpose: f32,
+    /// Live's Detune, in cents, added to `transpose` before the ratio.
+    #[serde(default)]
+    detune: f32,
+    /// The file the pitch render was made FROM — the original. `None`
+    /// while the clip plays its own file (transpose and detune zero).
+    /// Returning the knobs to zero hands the clip back this file, so
+    /// the pitch change is reversible where a destructive verb is not.
+    #[serde(default)]
+    transposed_from: Option<std::path::PathBuf>,
+    /// The pitch ratio currently baked into `path`: 1.0 = the original,
+    /// 2.0 = one octave up. The clip's frame-space numbers (fades,
+    /// envelope) live in the CURRENT file's space, so every change
+    /// scales them by new/old.
+    #[serde(default)]
+    applied_ratio: f32,
     /// Frames in the WHOLE FILE, which `source_offset`/`source_frames`
     /// name a region of.
     ///
@@ -2200,6 +2592,9 @@ struct Ghost {
     /// Ctrl held at press: the original stays and the landing is a copy
     /// with an id of its own.
     copy: bool,
+    /// Alt held at press: the drag bypasses the grid and lands exactly
+    /// where the pointer says. Ableton's fine drag.
+    fine: bool,
     /// Where the dragged clip started, so the distance it actually
     /// travelled can be measured at the landing and applied to everyone
     /// it brought with it.
@@ -2276,8 +2671,20 @@ enum DropSpot {
     Slot { track: usize, scene: usize },
 }
 
-/// The egui drag-and-drop payload of a browser sample row.
-struct SampleDrag(std::path::PathBuf);
+/// An audio file carried inside the app: either out of the browser or from
+/// an audio clip on the timeline. The origin matters on release — a browser
+/// file dropped on the arrangement creates a clip, while an existing clip
+/// already has its own move ghost and must not create a duplicate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SampleDragOrigin {
+    Browser,
+    Clip,
+}
+
+struct SampleDrag {
+    path: std::path::PathBuf,
+    origin: SampleDragOrigin,
+}
 
 /// An inline rename in flight: which clip, and the text being edited.
 /// `original` is what Escape restores.
@@ -2823,10 +3230,10 @@ struct Snapshot {
     marks: Marks,
 }
 
-/// A project on disk: the content, the transport's musical settings, and
-/// nothing else. View state — scrolls, zooms, which face is showing — is
-/// how you were LOOKING at the song when you saved, and deliberately does
-/// not travel with it.
+/// A project on disk: both musical models, the bridge between them, the
+/// transport's musical settings, and nothing else. View state — scrolls,
+/// zooms, which face is showing — is how you were LOOKING at the song when
+/// you saved, and deliberately does not travel with it.
 ///
 /// Every field is `serde(default)`-tolerant, so a file written by an older
 /// build (or trimmed by hand) loads with the missing parts at their
@@ -2842,6 +3249,8 @@ struct ProjectDoc {
     metronome: bool,
     loop_on: bool,
     loop_range: Option<(f32, f32)>,
+    /// Global swing, `0..=1`. Absent in older files: straight.
+    swing: f32,
     grid: usize,
     tracks: Vec<Track>,
     /// Absent in a file written before the master existed; a default
@@ -2863,6 +3272,14 @@ struct ProjectDoc {
     next_modulator_id: u64,
     next_clip_id: u64,
     next_track_no: [u32; TrackKind::ALL.len()],
+    /// The canonical SONG-world document. Older projects predate it and
+    /// open onto its one-track default rather than losing compatibility.
+    #[serde(default)]
+    song: daw::sequencing::Song,
+    /// SONG track ids own legacy projection twins by index. Invalid indices
+    /// are discarded on load and reminted by the projection.
+    #[serde(default)]
+    song_track_map: std::collections::HashMap<daw::sequencing::TrackId, usize>,
 }
 
 /// 2: a track's devices became a chain of identified instances, and targets
@@ -2888,6 +3305,7 @@ fn project_doc(arr: &Arrangement, transport: &Transport) -> ProjectDoc {
         metronome: transport.metronome,
         loop_on: transport.loop_on,
         loop_range: arr.loop_range,
+        swing: transport.swing,
         grid: arr.grid,
         tracks: arr.tracks.clone(),
         master: arr.master.clone(),
@@ -2901,6 +3319,8 @@ fn project_doc(arr: &Arrangement, transport: &Transport) -> ProjectDoc {
         next_modulator_id: arr.next_modulator_id,
         next_clip_id: arr.next_clip_id,
         next_track_no: arr.next_track_no,
+        song: daw::sequencing::Song::default(),
+        song_track_map: std::collections::HashMap::new(),
     }
 }
 
@@ -3152,6 +3572,7 @@ fn apply_project_doc(doc: ProjectDoc, arr: &mut Arrangement, transport: &mut Tra
     transport.beat_unit = doc.beat_unit.clamp(1, 16);
     transport.metronome = doc.metronome;
     transport.loop_on = doc.loop_on;
+    transport.swing = doc.swing.clamp(0.0, 1.0);
     transport.playing = false;
     transport.position = 0.0;
     transport.marker = 0.0;
@@ -3790,6 +4211,30 @@ impl Arrangement {
         }
     }
 
+    /// Remove picked devices from one track and retire everything keyed by
+    /// their stable ids. Returns the ids actually removed.
+    fn remove_track_devices(
+        &mut self,
+        track: usize,
+        picked: &std::collections::BTreeSet<u64>,
+    ) -> Vec<u64> {
+        let removed = {
+            let Some(lane) = self.tracks.get_mut(track) else {
+                return Vec::new();
+            };
+            let removed = remove_devices(&mut lane.chain, &mut lane.racks, picked);
+            for id in &removed {
+                lane.sampler_sources.remove(id);
+            }
+            removed
+        };
+        for id in &removed {
+            self.forget_device(track, *id);
+        }
+        self.force_recompile |= !removed.is_empty();
+        removed
+    }
+
     /// Whether another modulator would fit. The ENGINE carries a fixed
     /// number of sources (its telemetry is a `Copy` array), and a source
     /// past that cap would be silently dead — drawn in the strip, wired in
@@ -4024,6 +4469,73 @@ impl Arrangement {
         clips.insert(at, merged);
         self.selected_clip = Some((track, at));
         self.selected_clip_ids.clear();
+        true
+    }
+
+    /// Crop: keep ONLY the ring span on this lane — the focused clip's
+    /// own span, edges and all. Clips fully outside it are removed; clips
+    /// straddling its edges are trimmed to them, and their NOTES are
+    /// cropped along: a crop is a decision about what KEEPS, where a
+    /// length change merely hides. The clip that now carries the span is
+    /// selected.
+    fn crop_lane_to(&mut self, track: usize, from: f32, to: f32, bpm: f64) -> bool {
+        if !from.is_finite() || !to.is_finite() || to <= from {
+            return false;
+        }
+        let Some(lane) = self.clips.get(track) else {
+            return false;
+        };
+        let keep: Vec<u64> = lane
+            .iter()
+            .filter(|clip| clip.start + clip.len > from && clip.start < to)
+            .map(|clip| clip.id)
+            .collect();
+        let doomed: Vec<u64> = self.clips[track]
+            .iter()
+            .map(|clip| clip.id)
+            .filter(|id| !keep.contains(id))
+            .collect();
+        for id in doomed {
+            if let Some(i) = self.clips[track].iter().position(|clip| clip.id == id) {
+                self.clips[track].remove(i);
+            }
+        }
+        for id in &keep {
+            let Some(i) = self.clips[track].iter().position(|clip| clip.id == *id) else {
+                continue;
+            };
+            let clip = &mut self.clips[track][i];
+            if clip.start < from {
+                // Notes are clip-relative: the ones before the new edge
+                // are gone, the rest shift back so the music stays where
+                // it SOUNDS. Audio's source window moves with the edge,
+                // exactly as the left-edge drag does.
+                let delta = f64::from(from - clip.start);
+                clip.notes.retain(|note| note.start >= delta);
+                for note in &mut clip.notes {
+                    note.start -= delta;
+                }
+                trim_clip_left(clip, from, bpm);
+            }
+            let end = clip.start + clip.len;
+            if end > to {
+                // A note starting at or past the end does not sound (see
+                // `seq_notes`); a crop drops it rather than hiding it.
+                let len = f64::from(to - clip.start);
+                clip.notes.retain(|note| note.start < len);
+                clip.len = to - clip.start;
+            }
+        }
+        if self.clips[track].is_empty() {
+            self.selected_clip = None;
+            self.selected_clip_ids.clear();
+        } else if let Some(i) = self.clips[track]
+            .iter()
+            .position(|clip| clip.start <= from && from < clip.start + clip.len)
+        {
+            self.select_only_clip(track, i);
+        }
+        self.force_recompile = true;
         true
     }
 
@@ -4678,6 +5190,84 @@ impl Arrangement {
             },
             at,
         )
+    }
+
+    /// Replace one lane with the stereo file produced by an offline track
+    /// print. This is the single model mutation behind bounce in place, so
+    /// snapshot history records the conversion as one undo step.
+    fn replace_track_with_bounce(
+        &mut self,
+        track_index: usize,
+        path: PathBuf,
+        sample_rate: u32,
+        frames: u64,
+        start: f32,
+        end: f32,
+    ) -> Option<Vec<u64>> {
+        if sample_rate == 0 || frames == 0 || !start.is_finite() || !end.is_finite() || end <= start
+        {
+            return None;
+        }
+        let name = self.tracks.get(track_index)?.name.clone();
+        let removed_devices: Vec<u64> = self.tracks[track_index]
+            .chain
+            .iter()
+            .map(|device| device.id)
+            .collect();
+        let id = self.next_id();
+        let lane = &mut self.tracks[track_index];
+        lane.kind = TrackKind::Audio;
+        lane.input = TrackInput::None;
+        lane.monitor = track::Monitor::Off;
+        lane.armed = false;
+        lane.pan = 0.0;
+        lane.volume = 1.0;
+        lane.automation = TrackAutomation::default();
+        lane.chain.clear();
+        lane.sampler_sources.clear();
+        lane.racks.clear();
+        self.clips[track_index] = vec![Clip {
+            id,
+            name: format!("{name} (bounce)"),
+            start,
+            len: end - start,
+            notes: Vec::new(),
+            audio: Some(AudioSource {
+                transpose: 0.0,
+                detune: 0.0,
+                transposed_from: None,
+                applied_ratio: 1.0,
+                path,
+                sample_rate,
+                source_offset: 0,
+                source_frames: frames,
+                gain: 1.0,
+                looped: false,
+                file_frames: frames,
+                reversed: false,
+                fade_in: 0,
+                fade_out: 0,
+                fade_in_curve: 0.0,
+                fade_out_curve: 0.0,
+                envelope: Vec::new(),
+            }),
+            loop_on: false,
+            loop_start: 0.0,
+            loop_len: 0.0,
+        }];
+        self.mod_wires.retain(|wire| wire.track != track_index);
+        if let Some(slots) = self.session.slots.get_mut(track_index) {
+            slots.fill(None);
+        }
+        if let Some(playing) = self.session.playing.get_mut(track_index) {
+            *playing = None;
+        }
+        self.select_track(track_index);
+        self.selected_clip = Some((track_index, 0));
+        self.selected_clip_ids.clear();
+        self.cursor = Some((track_index, start));
+        self.force_recompile = true;
+        Some(removed_devices)
     }
 
     /// Every selected timeline clip, primary first and then the additive
@@ -5498,6 +6088,8 @@ fn plockable_params(track: &Track) -> Vec<piano_roll::PlockParam> {
     let spec = head.kind().spec();
     let excluded = match head.kind() {
         DeviceKind::Poly => daw::params::poly::GAIN,
+        DeviceKind::Loom => daw::params::loom::GAIN,
+        DeviceKind::Tine => daw::params::tine::LEVEL,
         DeviceKind::Haze => daw::params::haze::LEVEL,
         DeviceKind::Sampler => daw::params::sampler::GAIN,
         DeviceKind::SineSynth => daw::params::seq::GAIN,
@@ -5510,6 +6102,13 @@ fn plockable_params(track: &Track) -> Vec<piano_roll::PlockParam> {
         // No id: an effect never heads a chain, so nothing here is
         // p-lockable and there is nothing to exclude.
         DeviceKind::Reverb
+        | DeviceKind::Flint
+        | DeviceKind::Sibyl
+        | DeviceKind::Ferric
+        | DeviceKind::Umbra
+        | DeviceKind::Tone
+        | DeviceKind::Sigil
+        | DeviceKind::Gauge
         | DeviceKind::Sat
         | DeviceKind::Lofi
         | DeviceKind::Sheen
@@ -5637,6 +6236,44 @@ impl LaunchQuantization {
 
 struct App {
     theme: Theme,
+    /// The replacement frame's persistent view state. It is deliberately
+    /// isolated from the project and engine state below.
+    redesign: Redesign,
+    /// The canonical tick-based song the redesign edits (the NEW model,
+    /// `notes/20260831-song-bridge-brief.md`). Made audible by the C1
+    /// projection in `redesign_bridge`, which copies it into legacy clips
+    /// for the existing compile path.
+    song: daw::sequencing::Song,
+    /// What the projection last copied, so a pass runs only on change.
+    projected_song: Option<daw::sequencing::Song>,
+    /// Song track → the legacy track the projection owns for it. Ownership
+    /// only flows through creation by the projection; user tracks are
+    /// never claimed.
+    song_track_map: std::collections::HashMap<daw::sequencing::TrackId, usize>,
+    /// What the frame's center shows: the legacy timeline (false) or the
+    /// SONG arrangement (true). F10 flips it, the way Ctrl+Down flips the
+    /// detail strip — two worlds, one address.
+    center_song: bool,
+    /// Undo/redo for the canonical song (the legacy history covers only
+    /// the legacy arrangement). Restoring a snapshot is audible for
+    /// free: the projection notices and reprojects.
+    song_history: control_plane::SongHistory,
+    /// Per-song-track lens choice (`:lens`): how each track SPELLS pitch.
+    /// View state, not music — it never enters the song model.
+    track_lenses: std::collections::HashMap<u64, String>,
+    /// The sequence grid cursor's tick, mirrored each frame so palette
+    /// long forms can act on the trig the cursor names.
+    sequence_cursor_tick: usize,
+    /// A pending `:snap-key` — the one lossy pitch transform, held as
+    /// ghosts until Enter commits or Escape cancels.
+    snap_preview: Option<redesign_bridge::SnapPreview>,
+    /// Parsed `.lens` files by name, so an active user lens costs one
+    /// read per library generation instead of one per frame.
+    lens_cache:
+        std::collections::HashMap<String, Option<Result<daw::ui::redesign::lens::Lens, String>>>,
+    lens_cache_generation: u64,
+    /// Recent Ctrl+B presses, for tap tempo. Session-local, never saved.
+    tap_times: Vec<std::time::Instant>,
     /// Machine-local preferences, loaded at startup and handed back to
     /// eframe on `save` — density lives here, so a packing choice survives
     /// the session.
@@ -5650,6 +6287,8 @@ struct App {
     library_scanning: bool,
     wav_import_service: WavImportService,
     wav_import_pending: usize,
+    /// Browser previews decode off the UI thread and never enter the graph.
+    audition_loader: engine::AuditionLoader,
     /// The audio-file drag in flight over the window, if any. Rebuilt from
     /// the hover each frame; carries the header probe and the ghost's spot.
     drag_import: Option<DragImport>,
@@ -5731,6 +6370,14 @@ struct App {
     /// fight over nothing except the user's attention, and the second
     /// would finish looking like the first.
     export_job: Option<ExportJob>,
+    /// A selected-track print running on its own offline schedule. The live
+    /// engine is untouched until the completed WAV is committed as one
+    /// arrangement edit.
+    bounce_in_place_job: Option<BounceInPlaceJob>,
+    bounce_in_place_requested: bool,
+    /// The clip the ring is on, refreshed by the arrangement pass —
+    /// `(track, clip id)`. The palette's focus commands target it.
+    focused_clip: Option<(usize, u64)>,
     /// The file the song lives in, once it has one. Save goes here without
     /// asking; Save As and Load change it.
     project_path: Option<std::path::PathBuf>,
@@ -5892,7 +6539,7 @@ struct App {
     /// or lost a node, which no param letter can express. The transport
     /// loop is deliberately NOT part of the shape: patterns compile
     /// one-shot, so moving the brace changes nothing a recompile would.
-    graph_key: (bool, usize, u64, u64, u64),
+    graph_key: (bool, usize, u64, u64, u64, u64),
     /// The transport loop last sent, in samples — resent only on change, so
     /// brace drags, Ctrl+L and tempo changes all reconcile through one door.
     sent_loop: Option<(u64, u64)>,
@@ -5926,8 +6573,25 @@ struct Preferences {
     device: Option<String>,
     rate_hz: Option<u32>,
     buffer_frames: Option<u32>,
+    /// Paths being typed in the Library section. Staged as text until the
+    /// adjacent button validates and commits them to `LibraryConfig`.
+    user_library_path: String,
+    sample_folder_path: String,
     /// What went wrong the last time Apply was pressed, if anything.
     status: Option<String>,
+    /// Library validation and scan feedback belongs beside the paths that
+    /// caused it, independently of audio-stream status.
+    library_status: Option<String>,
+}
+
+/// A Preferences-window request that mutates the machine-local library.
+/// Kept separate from `BrowserEvent`: the browser now consumes the catalog
+/// but no longer owns its configuration.
+enum LibraryAction {
+    SetUserLibrary(PathBuf),
+    AddSampleFolder(PathBuf),
+    RemoveSampleFolder(PathBuf),
+    Rescan,
 }
 
 /// The welcome screen's state.
@@ -6086,6 +6750,96 @@ struct ExportJob {
     range: String,
 }
 
+struct BounceInPlaceJob {
+    done: crossbeam_channel::Receiver<Result<PathBuf, String>>,
+    source_track: usize,
+    track_snapshot: Track,
+    clips_snapshot: Vec<Clip>,
+    start: f32,
+    end: f32,
+    bpm: f64,
+    sample_rate: u32,
+}
+
+/// A persistent, content-addressed home for one exact track print. Source
+/// file metadata joins the document state in the key, so replacing a sample
+/// on disk cannot silently reuse a render of its old contents.
+///
+/// The home itself is `render::renders_dir`: the data directory when it is
+/// writable, the cache directory when it is not — so a bounce survives a
+/// root filesystem that has gone read-only instead of failing at the end
+/// of a whole render with nothing to show for it.
+fn bounce_in_place_output_path(
+    track: &Track,
+    clips: &[Clip],
+    modulators: &[Modulator],
+    wires: &[ModWire],
+    bpm: f64,
+    sample_rate: u32,
+) -> Result<(PathBuf, bool), String> {
+    use std::hash::{Hash, Hasher};
+
+    let encoded = ron::ser::to_string(&(
+        "bounce-in-place-v1",
+        track,
+        clips,
+        modulators,
+        wires,
+        bpm,
+        sample_rate,
+    ))
+    .map_err(|error| format!("could not describe bounce: {error}"))?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    encoded.hash(&mut hasher);
+    let mut source_paths: Vec<&std::path::Path> = clips
+        .iter()
+        .filter_map(|clip| clip.audio.as_ref().map(|audio| audio.path.as_path()))
+        .chain(
+            track
+                .sampler_sources
+                .values()
+                .map(|source| source.path.as_path()),
+        )
+        .collect();
+    source_paths.sort_unstable();
+    source_paths.dedup();
+    for path in source_paths {
+        path.hash(&mut hasher);
+        if let Ok(metadata) = path.metadata() {
+            metadata.len().hash(&mut hasher);
+            metadata.modified().ok().hash(&mut hasher);
+        }
+    }
+
+    let directory = daw::render::renders_dir().ok_or_else(|| {
+        "no writable folder is available for bounced audio — the data and \
+         cache folders are both unavailable or on a read-only filesystem"
+            .to_owned()
+    })?;
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| format!("could not create {}: {error}", directory.display()))?;
+    let stem = format!("bip-{:016x}", hasher.finish());
+    let path = directory.join(format!("{stem}.wav"));
+    if let Ok(reader) = hound::WavReader::open(&path) {
+        let spec = reader.spec();
+        if spec.channels == 2 && spec.sample_rate == sample_rate && reader.duration() > 0 {
+            return Ok((path, true));
+        }
+    }
+    if !path.exists() {
+        return Ok((path, false));
+    }
+    // Never overwrite even a corrupt cache entry: undo and older projects
+    // may still name it. A suffixed sibling is the recoverable answer.
+    for suffix in 1_u32.. {
+        let candidate = directory.join(format!("{stem}-{suffix}.wav"));
+        if !candidate.exists() {
+            return Ok((candidate, false));
+        }
+    }
+    unreachable!()
+}
+
 /// What the device region shows when there is no device to show: no track
 /// selected, or a selected track with nothing loaded on it. One line for
 /// both, because the fix is the same — pick a track, load an instrument.
@@ -6104,11 +6858,9 @@ impl App {
             storage.get(library::CACHE_STORAGE_KEY).unwrap_or_default();
         let library_service = LibraryService::start(library_config.clone());
         let wav_import_service = WavImportService::start();
+        let audition_loader = engine::AuditionLoader::start();
         let waveform_service = waveform::Service::start();
-        let mut browser = Browser::default();
-        if let Some(root) = &library_config.user_library {
-            browser.user_library_path = root.display().to_string();
-        }
+        let browser = Browser::default();
         let mut theme = Theme::dark();
         let mut skin = Skin::default();
         // The kept theme, if any, is restored before anything draws:
@@ -6119,6 +6871,18 @@ impl App {
         theme.set_density(prefs.density);
         Self {
             theme,
+            redesign: Redesign::default(),
+            song: daw::sequencing::Song::default(),
+            projected_song: None,
+            song_track_map: std::collections::HashMap::new(),
+            center_song: false,
+            song_history: control_plane::SongHistory::new(daw::sequencing::Song::default()),
+            track_lenses: std::collections::HashMap::new(),
+            sequence_cursor_tick: 0,
+            snap_preview: None,
+            lens_cache: std::collections::HashMap::new(),
+            lens_cache_generation: 0,
+            tap_times: Vec::new(),
             prefs,
             transport: Transport::default(),
             launch_quantization: LaunchQuantization::default(),
@@ -6138,6 +6902,7 @@ impl App {
             library_scanning: true,
             wav_import_service,
             wav_import_pending: 0,
+            audition_loader,
             drag_import: None,
             pending_drop_spots: Vec::new(),
             waveform_service,
@@ -6167,6 +6932,9 @@ impl App {
             preferences: Preferences::default(),
             export: ExportWindow::default(),
             export_job: None,
+            bounce_in_place_job: None,
+            bounce_in_place_requested: false,
+            focused_clip: None,
             project_path: None,
             skin,
             engine: None,
@@ -6210,7 +6978,7 @@ impl App {
             master_meter: device::meter::Ballistics::default(),
             compiled_clips: Vec::new(),
             last_compile: None,
-            graph_key: (false, 0, 0, 0, 0),
+            graph_key: (false, 0, 0, 0, 0, 0),
             sent_loop: None,
         }
     }
@@ -6246,6 +7014,37 @@ impl App {
             .get(create_track)
             .is_some_and(|track| track.kind.takes_instrument());
         let has_clip = self.arrangement.selected_clip.is_some();
+        // The ring's clip, for the focus commands: `(track, index)` on the
+        // lane where it lives, and the span those commands treat as "the
+        // region" — the focused clip's own bounds.
+        let focused = self.focused_clip_index();
+        let focused_span = focused.map(|(track, index)| {
+            let clip = &self.arrangement.clips[track][index];
+            (clip.start, clip.start + clip.len)
+        });
+        let consolidate_ready = match (focused, focused_span) {
+            (Some((track, _)), Some((from, to))) => {
+                let overlapping: Vec<_> = self.arrangement.clips[track]
+                    .iter()
+                    .filter(|clip| clip.start < to && clip.start + clip.len > from)
+                    .collect();
+                overlapping.len() >= 2 && overlapping.iter().all(|clip| clip.audio.is_none())
+            }
+            _ => false,
+        };
+        let can_bounce_in_place = self.arrangement.active_track().is_some_and(|track| {
+            self.arrangement
+                .tracks
+                .get(track)
+                .is_some_and(|lane| !lane.is_group)
+                && self
+                    .arrangement
+                    .clips
+                    .get(track)
+                    .is_some_and(|clips| !clips.is_empty())
+        }) && self.bounce_in_place_job.is_none()
+            && self.export_job.is_none()
+            && self.render_job.is_none();
         let editor = self.bottom_view == BottomView::ClipEditor;
         let kind = clip_editor_kind(&self.arrangement);
         let roll = editor && kind == ClipEditorKind::Midi;
@@ -6280,6 +7079,18 @@ impl App {
             PaletteCommand::new("clip.loop", "clip", "loop the selection"),
             PaletteCommand::new("clip.split", "clip", "split clip at cursor").hint("ctrl+E"),
             PaletteCommand::new("clip.consolidate", "clip", "consolidate selection").hint("ctrl+J"),
+            // --- clip focus: the ring's clip --------------------------
+            PaletteCommand::new("clip.focus.crop", "clip", "crop focused clip region")
+                .hint("ctrl+shift+J")
+                .enabled(focused.is_some()),
+            PaletteCommand::new("clip.focus.consolidate", "clip", "consolidate region")
+                .enabled(consolidate_ready),
+            PaletteCommand::new("clip.focus.duplicate", "clip", "duplicate focused clip")
+                .enabled(focused.is_some()),
+            PaletteCommand::new("clip.focus.delete", "clip", "delete focused clip")
+                .enabled(focused.is_some()),
+            PaletteCommand::new("track.bounce_in_place", "track", "bounce track in place")
+                .enabled(can_bounce_in_place),
             // --- time: the all-track commands --------------------------
             PaletteCommand::new("time.duplicate", "time", "duplicate time")
                 .hint("ctrl+shift+D")
@@ -6301,7 +7112,7 @@ impl App {
             PaletteCommand::new("project.new", "project", "new project"),
             PaletteCommand::new("project.export", "project", "export audio…"),
             PaletteCommand::new("project.splash", "project", "welcome screen"),
-            PaletteCommand::new("app.preferences", "app", "audio preferences…"),
+            PaletteCommand::new("app.preferences", "app", "preferences…"),
             PaletteCommand::new("device.group", "device", "group devices into a rack")
                 .hint("ctrl+G"),
             PaletteCommand::new("device.ungroup", "device", "ungroup the rack")
@@ -6608,6 +7419,37 @@ impl App {
     /// they travel the same path a button press does — the palette is
     /// another way to SAY things, not a second way to do them. Only
     /// app-local verbs with no action are handled inline.
+    /// The clip the RING is on, as a lane position: `(track, index)`.
+    /// `None` when the ring is elsewhere, or the clip went away since the
+    /// arrangement pass last reported it.
+    fn focused_clip_index(&self) -> Option<(usize, usize)> {
+        let (track, id) = self.focused_clip?;
+        self.arrangement
+            .clips
+            .get(track)
+            .and_then(|clips| clips.iter().position(|clip| clip.id == id))
+            .map(|index| (track, index))
+    }
+
+    /// Crop the focused clip's region: keep only the ring's span on its
+    /// lane. Ableton 12's Ctrl+Shift+J. The ring's clip is app-owned view
+    /// state, so this lives here rather than in `perform`.
+    fn crop_focused_clip(&mut self) {
+        if let Some((track, index)) = self.focused_clip_index()
+            && let Some(clip) = self
+                .arrangement
+                .clips
+                .get(track)
+                .and_then(|clips| clips.get(index))
+        {
+            let (from, to) = (clip.start, clip.start + clip.len);
+            self.arrangement
+                .crop_lane_to(track, from, to, self.transport.bpm);
+        } else {
+            self.notice = Some("nothing to crop — put the ring on a clip".to_owned());
+        }
+    }
+
     fn run_command(&mut self, id: &'static str, actions: &mut Vec<UiAction>) {
         match id {
             "transport.play" => actions.push(UiAction::TogglePlay),
@@ -6672,6 +7514,47 @@ impl App {
             "session.scene.capture" => actions.push(UiAction::CaptureScene),
             "clip.split" => actions.push(UiAction::SplitAtCursor),
             "clip.consolidate" => actions.push(UiAction::Consolidate),
+            "clip.focus.crop" => {
+                if let Some((track, index)) = self.focused_clip_index()
+                    && let Some(clip) = self
+                        .arrangement
+                        .clips
+                        .get(track)
+                        .and_then(|clips| clips.get(index))
+                {
+                    let (from, to) = (clip.start, clip.start + clip.len);
+                    self.arrangement
+                        .crop_lane_to(track, from, to, self.transport.bpm);
+                }
+            }
+            "clip.focus.consolidate" => {
+                if let Some((track, index)) = self.focused_clip_index()
+                    && let Some(clip) = self
+                        .arrangement
+                        .clips
+                        .get(track)
+                        .and_then(|clips| clips.get(index))
+                {
+                    let (from, to) = (clip.start, clip.start + clip.len);
+                    self.arrangement.consolidate(track, from, to);
+                }
+            }
+            "clip.focus.duplicate" => {
+                // The focus verbs name the target by focus, then hand off
+                // to the same verbs the selection uses — one definition
+                // of what "duplicate" and "delete" do.
+                if let Some((track, index)) = self.focused_clip_index() {
+                    self.arrangement.select_only_clip(track, index);
+                    actions.push(UiAction::DuplicateClip);
+                }
+            }
+            "clip.focus.delete" => {
+                if let Some((track, index)) = self.focused_clip_index() {
+                    self.arrangement.select_only_clip(track, index);
+                    actions.push(UiAction::DeleteSelected);
+                }
+            }
+            "track.bounce_in_place" => self.bounce_in_place_requested = true,
             "time.duplicate" => actions.push(UiAction::DuplicateTime),
             "time.delete" => actions.push(UiAction::DeleteTime),
             "time.silence" => actions.push(UiAction::InsertSilence),
@@ -6944,6 +7827,19 @@ impl App {
         }
     }
 
+    /// One construction path for every UI that can add a device.
+    fn mint_device_instance(&mut self, kind: DeviceKind) -> DeviceInstance {
+        DeviceInstance {
+            id: self.arrangement.mint_id(),
+            parent: None,
+            state: DeviceState::new(kind),
+            bypass: false,
+            page: 0,
+            view_zoom: unit_zoom(),
+            view_scroll: 0.0,
+        }
+    }
+
     /// Put a browser item's device on a track, and select that track so the
     /// device region immediately shows what just landed.
     ///
@@ -6964,15 +7860,7 @@ impl App {
                 ));
                 return;
             }
-            let instance = DeviceInstance {
-                id: self.arrangement.mint_id(),
-                parent: None,
-                state: DeviceState::new(item.load),
-                bypass: false,
-                page: 0,
-                view_zoom: unit_zoom(),
-                view_scroll: 0.0,
-            };
+            let instance = self.mint_device_instance(item.load);
             if let Some(bus) = self.arrangement.returns.get_mut(index) {
                 bus.insert_device(instance);
                 // A device is a node, and no letter can add one.
@@ -6991,15 +7879,7 @@ impl App {
                 ));
                 return;
             }
-            let instance = DeviceInstance {
-                id: self.arrangement.mint_id(),
-                parent: None,
-                state: DeviceState::new(item.load),
-                bypass: false,
-                page: 0,
-                view_zoom: unit_zoom(),
-                view_scroll: 0.0,
-            };
+            let instance = self.mint_device_instance(item.load);
             self.arrangement.master.insert_device(instance);
             return;
         }
@@ -7026,15 +7906,7 @@ impl App {
         }
         // Fresh knobs for a fresh device, and the engine hears them on the
         // next swap — which the shape change forces immediately.
-        let instance = DeviceInstance {
-            id: self.arrangement.mint_id(),
-            parent: None,
-            state: DeviceState::new(item.load),
-            bypass: false,
-            page: 0,
-            view_zoom: unit_zoom(),
-            view_scroll: 0.0,
-        };
+        let instance = self.mint_device_instance(item.load);
         let Some(t) = self.arrangement.tracks.get_mut(track) else {
             return;
         };
@@ -7053,29 +7925,48 @@ impl App {
         match event {
             BrowserEvent::LoadDevice(item) => self.load_device(item),
             BrowserEvent::SelectSample(path) => self.place_sample(path, None),
-            BrowserEvent::SetUserLibrary(path) => match self.library_config.set_user_library(&path)
-            {
-                Ok(()) => {
-                    self.browser.user_library_path = path.display().to_string();
-                    self.request_library_scan();
-                }
-                Err(error) => self.notice = Some(error.to_string()),
-            },
-            BrowserEvent::AddSampleFolder(path) => {
-                match self.library_config.add_sample_folder(&path) {
+        }
+    }
+
+    /// Apply one Library-section action. Directory validation and scanning
+    /// stay green-side; the audio engine never sees a path or filesystem IO.
+    fn handle_library_action(&mut self, action: LibraryAction) {
+        match action {
+            LibraryAction::SetUserLibrary(path) => {
+                match self.library_config.set_user_library(&path) {
                     Ok(()) => {
-                        self.browser.sample_folder_path.clear();
+                        self.preferences.user_library_path = self
+                            .library_config
+                            .user_library
+                            .as_ref()
+                            .map(|root| root.display().to_string())
+                            .unwrap_or_default();
+                        self.preferences.library_status = None;
                         self.request_library_scan();
                     }
-                    Err(error) => self.notice = Some(error.to_string()),
+                    Err(error) => self.preferences.library_status = Some(error.to_string()),
                 }
             }
-            BrowserEvent::RemoveSampleFolder(path) => {
+            LibraryAction::AddSampleFolder(path) => {
+                match self.library_config.add_sample_folder(&path) {
+                    Ok(()) => {
+                        self.preferences.sample_folder_path.clear();
+                        self.preferences.library_status = None;
+                        self.request_library_scan();
+                    }
+                    Err(error) => self.preferences.library_status = Some(error.to_string()),
+                }
+            }
+            LibraryAction::RemoveSampleFolder(path) => {
                 if self.library_config.remove_sample_folder(&path) {
+                    self.preferences.library_status = None;
                     self.request_library_scan();
                 }
             }
-            BrowserEvent::Rescan => self.request_library_scan(),
+            LibraryAction::Rescan => {
+                self.preferences.library_status = None;
+                self.request_library_scan();
+            }
         }
     }
 
@@ -7488,6 +8379,75 @@ impl App {
         }
     }
 
+    /// Whether the open rack contains at least one picked device.
+    ///
+    /// Selection survives switching tracks as view state, so checking the
+    /// chain is essential: an invisible pick from another lane must not eat
+    /// Delete and protect the clip or track the user can actually see.
+    fn has_visible_device_selection(&self) -> bool {
+        if self.prefs.lower_hidden
+            || self.bottom_view != BottomView::Rack
+            || self.arrangement.master_selected
+            || self.arrangement.return_selected.is_some()
+        {
+            return false;
+        }
+        let chain = self
+            .arrangement
+            .active_track()
+            .and_then(|index| self.arrangement.tracks.get(index))
+            .map(|track| &track.chain);
+        chain.is_some_and(|chain| {
+            chain
+                .iter()
+                .any(|device| self.selected_devices.contains(&device.id))
+        })
+    }
+
+    /// Delete the devices picked in the chain the rack currently shows.
+    ///
+    /// This is app-owned rather than part of `perform`: the selection is
+    /// app view state, while this verb is specifically about a track's
+    /// instrument/effect chain.
+    /// The arrangement mutation is still caught by the normal history sync,
+    /// so one press remains one undo step.
+    fn delete_selected_devices(&mut self) {
+        let picked = self.selected_devices.clone();
+        if self.arrangement.master_selected || self.arrangement.return_selected.is_some() {
+            return;
+        }
+        let Some(index) = self.arrangement.active_track() else {
+            return;
+        };
+        let removed = self.arrangement.remove_track_devices(index, &picked);
+        if removed.is_empty() {
+            return;
+        }
+        for id in &removed {
+            self.selected_devices.remove(id);
+            self.device_histories.remove(id);
+            self.sampler_faces.remove(id);
+            self.sampler_slices.remove(id);
+        }
+        if self
+            .expanded_sampler
+            .is_some_and(|(_, instance)| removed.contains(&instance))
+        {
+            self.expanded_sampler = None;
+        }
+        if self
+            .sampler_drop_target
+            .is_some_and(|(_, instance)| removed.contains(&instance))
+        {
+            self.sampler_drop_target = None;
+        }
+        self.notice = Some(if removed.len() == 1 {
+            "device deleted".to_owned()
+        } else {
+            format!("{} devices deleted", removed.len())
+        });
+    }
+
     /// Open the audio preferences, staged from what is in force now.
     fn open_preferences(&mut self) {
         self.preferences = Preferences {
@@ -7496,12 +8456,21 @@ impl App {
             device: self.prefs.audio_device.clone(),
             rate_hz: self.prefs.audio_rate_hz,
             buffer_frames: self.prefs.audio_buffer_frames,
+            user_library_path: self
+                .library_config
+                .user_library
+                .as_ref()
+                .map(|root| root.display().to_string())
+                .unwrap_or_default(),
+            sample_folder_path: String::new(),
             status: None,
+            library_status: None,
         };
     }
 
-    /// The audio preferences: which backend, which device, how fast, and
-    /// how big a block.
+    /// Machine preferences: audio stream configuration and sample-library
+    /// roots. Audio choices are staged; library actions validate and rescan
+    /// immediately because they do not restart or touch the engine.
     ///
     /// The window this app most needed. Until it existed the engine
     /// opened `EngineConfig::default()` — JACK, 48 kHz, 256 frames — with
@@ -7533,11 +8502,14 @@ impl App {
         // being plugged in while the user is looking at it.
         let devices = daw::audio::output_devices(api);
         let mut apply = false;
+        let mut library_action = None;
 
         let modal = egui::Modal::new(egui::Id::new("preferences")).show(ctx, |ui| {
-            ui.set_width(420.0);
-            ui.heading("audio");
+            ui.set_width(520.0);
+            ui.heading("preferences");
             ui.add_space(8.0);
+            ui.label(egui::RichText::new("audio").strong());
+            ui.add_space(4.0);
 
             egui::Grid::new("prefs.audio")
                 .num_columns(2)
@@ -7691,6 +8663,101 @@ impl App {
             }
 
             ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("library").strong());
+                ui.add_space(8.0);
+                let summary = if self.library_scanning {
+                    "scanning…".to_owned()
+                } else {
+                    format!("{} samples indexed", self.library_snapshot.assets.len())
+                };
+                ui.label(egui::RichText::new(summary).weak());
+            });
+            ui.add_space(4.0);
+
+            // Paths remain plain text fields, as they were in the browser:
+            // no file-dialog dependency, and invalid directories can be
+            // explained right beside the field that supplied them.
+            egui::Grid::new("prefs.library")
+                .num_columns(3)
+                .spacing([10.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label("user library");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.preferences.user_library_path)
+                            .desired_width(320.0)
+                            .hint_text("/path/to/User Library"),
+                    );
+                    if ui
+                        .add_enabled(
+                            !self.preferences.user_library_path.trim().is_empty(),
+                            egui::Button::new("set"),
+                        )
+                        .clicked()
+                    {
+                        library_action = Some(LibraryAction::SetUserLibrary(PathBuf::from(
+                            self.preferences.user_library_path.trim(),
+                        )));
+                    }
+                    ui.end_row();
+
+                    ui.label("sample folder");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.preferences.sample_folder_path)
+                            .desired_width(320.0)
+                            .hint_text("/path/to/samples"),
+                    );
+                    if ui
+                        .add_enabled(
+                            !self.preferences.sample_folder_path.trim().is_empty(),
+                            egui::Button::new("add"),
+                        )
+                        .clicked()
+                    {
+                        library_action = Some(LibraryAction::AddSampleFolder(PathBuf::from(
+                            self.preferences.sample_folder_path.trim(),
+                        )));
+                    }
+                    ui.end_row();
+                });
+
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui.button("rescan").clicked() {
+                    library_action = Some(LibraryAction::Rescan);
+                }
+                if self.library_config.sample_folders.is_empty() {
+                    ui.label(egui::RichText::new("no additional sample folders").weak());
+                }
+            });
+            egui::ScrollArea::vertical()
+                .id_salt("prefs.library.roots")
+                .max_height(100.0)
+                .show(ui, |ui| {
+                    for root in &self.library_config.sample_folders {
+                        ui.horizontal(|ui| {
+                            if ui.small_button("remove").clicked() {
+                                library_action =
+                                    Some(LibraryAction::RemoveSampleFolder(root.clone()));
+                            }
+                            ui.add_sized(
+                                [440.0, 18.0],
+                                egui::Label::new(
+                                    egui::RichText::new(root.display().to_string()).weak(),
+                                )
+                                .truncate(),
+                            );
+                        });
+                    }
+                });
+            if let Some(status) = &self.preferences.library_status {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(status).weak());
+            }
+
+            ui.add_space(10.0);
             ui.horizontal(|ui| {
                 if ui.button("apply and restart").clicked() {
                     apply = true;
@@ -7703,6 +8770,9 @@ impl App {
 
         if modal.should_close() {
             self.preferences.open = false;
+        }
+        if let Some(action) = library_action {
+            self.handle_library_action(action);
         }
         if apply {
             self.prefs.audio_backend = self.preferences.backend;
@@ -7785,6 +8855,8 @@ impl App {
             None,
             false,
         );
+        // An export is of the SONG, swung like it plays.
+        spec.apply_swing(self.arrangement.grid_beats(), self.transport.swing);
         spec.set_modulation(build_mod_spec(
             &self.arrangement.tracks,
             &self.arrangement.modulators,
@@ -7886,6 +8958,273 @@ impl App {
                 self.export.open = true;
             }
         }
+    }
+
+    /// Print the selected lane through its instrument, insert effects,
+    /// automation, modulation, pan and fader. Returns and the master are not
+    /// part of the print: they remain shared mix structure, not devices owned
+    /// by this track.
+    fn start_bounce_in_place(&mut self, ctx: &egui::Context) {
+        if self.bounce_in_place_job.is_some()
+            || self.export_job.is_some()
+            || self.render_job.is_some()
+        {
+            self.notice = Some("another audio render is already running".to_owned());
+            return;
+        }
+        let Some(source_track) = self.arrangement.active_track() else {
+            self.notice = Some("select a track to bounce".to_owned());
+            return;
+        };
+        let Some(track_snapshot) = self.arrangement.tracks.get(source_track).cloned() else {
+            return;
+        };
+        if track_snapshot.is_group {
+            self.notice = Some("group bounce is not available yet".to_owned());
+            return;
+        }
+        let clips_snapshot = self
+            .arrangement
+            .clips
+            .get(source_track)
+            .cloned()
+            .unwrap_or_default();
+        let Some(start) = clips_snapshot
+            .iter()
+            .map(|clip| clip.start)
+            .reduce(f32::min)
+        else {
+            self.notice = Some("the selected track has no clips to bounce".to_owned());
+            return;
+        };
+        let end = clips_snapshot
+            .iter()
+            .map(|clip| clip.start + clip.len)
+            .fold(start, f32::max);
+        if !start.is_finite() || !end.is_finite() || end <= start {
+            self.notice = Some("the selected track has no audible time range".to_owned());
+            return;
+        }
+
+        let mut render_track = track_snapshot.clone();
+        render_track.mute = false;
+        render_track.solo = false;
+        render_track.depth = 0;
+        render_track.folded = false;
+        render_track.input = TrackInput::None;
+        render_track.monitor = track::Monitor::Off;
+        render_track.armed = false;
+        render_track.sends.clear();
+        let render_tracks = vec![render_track];
+        let render_clips = vec![clips_snapshot.clone()];
+
+        // Lane-local modulation comes along. A follower of another lane is
+        // deliberately omitted: including that lane would also mix it into
+        // the print, while pretending it were silence would be less honest.
+        let allowed_sources: HashSet<u64> = self
+            .arrangement
+            .modulators
+            .iter()
+            .filter(|modulator| {
+                !matches!(modulator.kind, ModKind::Follower { track } if track != source_track)
+            })
+            .map(|modulator| modulator.id)
+            .collect();
+        let mut render_modulators: Vec<Modulator> = self
+            .arrangement
+            .modulators
+            .iter()
+            .filter(|modulator| allowed_sources.contains(&modulator.id))
+            .copied()
+            .collect();
+        for modulator in &mut render_modulators {
+            if let ModKind::Follower { track } = &mut modulator.kind {
+                *track = 0;
+            }
+        }
+        let mut render_wires: Vec<ModWire> = self
+            .arrangement
+            .mod_wires
+            .iter()
+            .filter(|wire| wire.track == source_track && allowed_sources.contains(&wire.source))
+            .cloned()
+            .collect();
+        for wire in &mut render_wires {
+            wire.track = 0;
+        }
+
+        let sample_rate = self.engine_sample_rate();
+        let bpm = self.transport.bpm;
+        let (path, cached) = match bounce_in_place_output_path(
+            &track_snapshot,
+            &clips_snapshot,
+            &render_modulators,
+            &render_wires,
+            bpm,
+            sample_rate,
+        ) {
+            Ok(path) => path,
+            Err(error) => {
+                self.notice = Some(error);
+                return;
+            }
+        };
+        let (mut spec, nodes) = build_graph_spec(
+            &render_tracks,
+            &MasterTrack::default(),
+            &[],
+            &render_clips,
+            None,
+            false,
+        );
+        // A bounce prints the lane as the song SWUNG it.
+        spec.apply_swing(self.arrangement.grid_beats(), self.transport.swing);
+        spec.set_modulation(build_mod_spec(
+            &render_tracks,
+            &render_modulators,
+            &render_wires,
+            &self.parameter_registry,
+            &nodes,
+        ));
+        let opts = daw::audio::bounce::BounceOptions {
+            sample_rate,
+            block_frames: 256,
+            bpm,
+            length_beats: f64::from(end),
+            start_beats: f64::from(start),
+            format: daw::audio::bounce::BounceFormat::Float32,
+        };
+        let registry = self.parameter_registry.clone();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let repaint = ctx.clone();
+        let job_path = path.clone();
+        std::thread::spawn(move || {
+            let outcome = if cached {
+                Ok(())
+            } else {
+                daw::audio::bounce::bounce_automated(
+                    &spec,
+                    &opts,
+                    &job_path,
+                    |beat, out| automation_letters(&render_tracks, &nodes, &registry, beat, out),
+                    |_: f32| {
+                        repaint.request_repaint();
+                        true
+                    },
+                )
+            };
+            let _ = tx.send(
+                outcome
+                    .map(|()| job_path)
+                    .map_err(|error| error.to_string()),
+            );
+        });
+        self.bounce_in_place_job = Some(BounceInPlaceJob {
+            done: rx,
+            source_track,
+            track_snapshot,
+            clips_snapshot,
+            start,
+            end,
+            bpm,
+            sample_rate,
+        });
+        self.notice = Some(format!("bouncing {} in place…", path.display()));
+        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+    }
+
+    /// Commit a finished track print as one model mutation. If the lane was
+    /// edited while the worker ran, the WAV is kept but the stale result is
+    /// not allowed to erase newer work.
+    fn poll_bounce_in_place(&mut self) {
+        let Some(job) = &self.bounce_in_place_job else {
+            return;
+        };
+        let Ok(outcome) = job.done.try_recv() else {
+            return;
+        };
+        let Some(job) = self.bounce_in_place_job.take() else {
+            return;
+        };
+        let path = match outcome {
+            Ok(path) => path,
+            Err(error) => {
+                self.notice = Some(format!("bounce in place failed: {error}"));
+                return;
+            }
+        };
+        let target = (self
+            .arrangement
+            .tracks
+            .get(job.source_track)
+            .zip(self.arrangement.clips.get(job.source_track))
+            .is_some_and(|(track, clips)| {
+                *track == job.track_snapshot && *clips == job.clips_snapshot
+            }))
+        .then_some(job.source_track)
+        .or_else(|| {
+            self.arrangement
+                .tracks
+                .iter()
+                .zip(&self.arrangement.clips)
+                .position(|(track, clips)| {
+                    *track == job.track_snapshot && *clips == job.clips_snapshot
+                })
+        });
+        let Some(track_index) = target else {
+            self.notice = Some(format!(
+                "bounce finished at {}, but the source track changed; no clips were replaced",
+                path.display()
+            ));
+            return;
+        };
+        if (self.transport.bpm - job.bpm).abs() > f64::EPSILON {
+            self.notice = Some(format!(
+                "bounce finished at {}, but the tempo changed; no clips were replaced",
+                path.display()
+            ));
+            return;
+        }
+        let (file_rate, frames) = match hound::WavReader::open(&path) {
+            Ok(reader) if reader.spec().channels == 2 && reader.duration() > 0 => {
+                (reader.spec().sample_rate, u64::from(reader.duration()))
+            }
+            Ok(_) => {
+                self.notice = Some("bounce produced an empty or non-stereo WAV".to_owned());
+                return;
+            }
+            Err(error) => {
+                self.notice = Some(format!("could not open bounced WAV: {error}"));
+                return;
+            }
+        };
+        if file_rate != job.sample_rate {
+            self.notice = Some("bounce returned at the wrong sample rate".to_owned());
+            return;
+        }
+
+        let Some(removed_devices) = self.arrangement.replace_track_with_bounce(
+            track_index,
+            path.clone(),
+            file_rate,
+            frames,
+            job.start,
+            job.end,
+        ) else {
+            self.notice = Some("could not place the bounced audio".to_owned());
+            return;
+        };
+        self.bottom_view = BottomView::ClipEditor;
+        for id in removed_devices {
+            self.selected_devices.remove(&id);
+            self.device_histories.remove(&id);
+            self.sampler_faces.remove(&id);
+            self.sampler_slices.remove(&id);
+        }
+        if !self.waveform_cache.contains_key(&path) && self.waveform_pending.insert(path.clone()) {
+            self.waveform_service.request(path.clone());
+        }
+        self.notice = Some(format!("bounced track in place to {}", path.display()));
     }
 
     /// The export modal: where the file goes, how much of the song, and in
@@ -8043,7 +9382,9 @@ impl App {
             self.project.status = Some("choose a file to save to".to_owned());
             return;
         };
-        let doc = project_doc(&self.arrangement, &self.transport);
+        let mut doc = project_doc(&self.arrangement, &self.transport);
+        doc.song = self.song.clone();
+        doc.song_track_map = self.song_track_map.clone();
         let written = ron::ser::to_string_pretty(&doc, ron::ser::PrettyConfig::default())
             .map_err(|error| error.to_string())
             .and_then(|text| std::fs::write(&path, text).map_err(|error| error.to_string()));
@@ -8079,7 +9420,19 @@ impl App {
             Ok(doc) => doc,
             Err(error) => return Err(format!("could not load: {error}")),
         };
+        let loaded_song = doc.song.clone();
+        let mut loaded_song_track_map = doc.song_track_map.clone();
         apply_project_doc(doc, &mut self.arrangement, &mut self.transport);
+        loaded_song_track_map.retain(|track_id, legacy_index| {
+            *legacy_index < self.arrangement.tracks.len()
+                && loaded_song.tracks.iter().any(|track| track.id == *track_id)
+        });
+        self.song = loaded_song;
+        self.song_track_map = loaded_song_track_map;
+        // A load has no trusted projection cache: rebuild the legacy twins
+        // from the document so the canonical song becomes audible.
+        self.projected_song = None;
+        self.song_history = control_plane::SongHistory::new(self.song.clone());
         if let Some(engine) = &mut self.engine {
             engine.transport(TransportCmd::Stop);
             engine.transport(TransportCmd::Seek(0));
@@ -8102,6 +9455,10 @@ impl App {
         self.arrangement = Arrangement::default();
         self.arrangement.force_recompile = true;
         self.transport = Transport::default();
+        self.song = daw::sequencing::Song::default();
+        self.song_track_map.clear();
+        self.projected_song = None;
+        self.song_history = control_plane::SongHistory::new(self.song.clone());
         if let Some(engine) = &mut self.engine {
             engine.transport(TransportCmd::Stop);
             engine.transport(TransportCmd::Seek(0));
@@ -8255,8 +9612,11 @@ impl App {
                 .first()
                 .and_then(|file| file.path.clone())
         });
-        let dragged = hovered
-            .or_else(|| egui::DragAndDrop::payload::<SampleDrag>(ctx).map(|drag| drag.0.clone()));
+        let dragged = hovered.or_else(|| {
+            egui::DragAndDrop::payload::<SampleDrag>(ctx)
+                .filter(|drag| drag.origin == SampleDragOrigin::Browser)
+                .map(|drag| drag.path.clone())
+        });
         let Some(path) = dragged else {
             // On the drop frame the hover is already gone; the drag state
             // survives it so the release lands where the ghost stood, and
@@ -8904,6 +10264,10 @@ impl App {
             .unwrap_or("audio")
             .to_owned();
         let source = AudioSource {
+            transpose: 0.0,
+            detune: 0.0,
+            transposed_from: None,
+            applied_ratio: 1.0,
             path: imported.path.clone(),
             sample_rate: imported.sample_rate,
             source_offset: 0,
@@ -8974,6 +10338,10 @@ impl App {
             len,
             notes: Vec::new(),
             audio: Some(AudioSource {
+                transpose: 0.0,
+                detune: 0.0,
+                transposed_from: None,
+                applied_ratio: 1.0,
                 path: imported.path.clone(),
                 sample_rate: imported.sample_rate,
                 source_offset: 0,
@@ -9056,6 +10424,10 @@ struct RenderRequest {
     /// envelope are in FRAMES, so they have to be scaled by the same
     /// amount or they would land somewhere else in the shorter file.
     rescale: Option<f32>,
+    /// A CLIP PITCH change (transpose/detune knobs) landing: the ratio
+    /// baked into the rendered file and the ORIGINAL file it was made
+    /// from, so the clip can remember where to come back to at zero.
+    transpose_apply: Option<(f32, std::path::PathBuf)>,
     /// The render's output becomes a NEW clip beside the original rather
     /// than replacing it. Extract-channel is the only verb that does
     /// this, and it is why the request carries it rather than the op.
@@ -9229,6 +10601,14 @@ fn repoint_clip(clip: &mut Clip, rendered: &daw::render::Rendered, change: Optio
         .min(rendered.frames - audio.source_offset);
 }
 
+impl App {
+    /// A runtime seam keeps the signed-off legacy UI compiling while the new
+    /// design replaces it incrementally.
+    fn redesign_active(&self) -> bool {
+        true
+    }
+}
+
 impl shell::Host for App {
     /// Fonts, zoom and the restored theme, once, before the first
     /// frame. Under eframe this happened inside `App::new` because the
@@ -9241,6 +10621,12 @@ impl shell::Host for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui) {
+        if self.redesign_active() {
+            self.update_control_plane(ui.ctx());
+            self.draw_redesign_ui(ui);
+            return;
+        }
+
         // The engine first, before anything draws from its numbers.
         self.pump_engine(ui.ctx());
         if self.engine.is_none() {
@@ -9318,13 +10704,14 @@ impl shell::Host for App {
             let spot = self.drag_import.take().and_then(|drag| drag.spot);
             match (payload, onto_device) {
                 (Some(payload), Some((track, instance))) => {
-                    self.load_sample_into(track, instance, payload.0.clone());
+                    self.load_sample_into(track, instance, payload.path.clone());
                 }
-                (Some(payload), None) => {
+                (Some(payload), None) if payload.origin == SampleDragOrigin::Browser => {
                     if let Some(spot) = spot {
-                        self.place_sample(payload.0.clone(), Some(spot));
+                        self.place_sample(payload.path.clone(), Some(spot));
                     }
                 }
+                (Some(_), None) => {}
                 (None, _) => {}
             }
         }
@@ -9377,8 +10764,14 @@ impl shell::Host for App {
         self.expanded_sampler_overlay(ui.ctx());
 
         let cmds = self.commands();
-        if let Some(id) = self.palette.show(ui.ctx(), &self.theme, &cmds) {
-            self.run_command(id, &mut actions);
+        if let Some(choice) = self
+            .palette
+            .show(ui.ctx(), &self.theme, &cmds, App::typed_commands())
+        {
+            match choice {
+                PaletteChoice::Command(id) => self.run_command(id, &mut actions),
+                PaletteChoice::Typed(line) => self.run_typed_command(&line),
+            }
         } else if !piano_roll_modal
             && !self.palette.is_open()
             && !self.skin.is_open()
@@ -9536,6 +10929,7 @@ impl shell::Host for App {
         self.draw_project_window(ui.ctx());
         // A finished render before its window draws, so the modal that
         // shows the progress bar is the one that shows the result.
+        self.poll_bounce_in_place();
         self.poll_export();
         self.draw_export_window(ui.ctx());
         self.draw_matrix_window(ui.ctx());
@@ -9638,6 +11032,25 @@ impl shell::Host for App {
                     self.waveform.owns_keys = false;
                 }
             }
+        }
+        // A picked card is more specific than the clip or track behind the
+        // rack. Give the device editor first refusal on both delete keys;
+        // `arrangement_keys` runs next and therefore cannot dispose two
+        // different things with the same press.
+        if !piano_roll_modal
+            && !palette_open
+            && !skin_open
+            && !self.project.open
+            && !self.export.open
+            && !self.splash.open
+            && !ui.ctx().egui_wants_keyboard_input()
+            && self.has_visible_device_selection()
+            && ui.ctx().input_mut(|i| {
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Delete)
+                    || i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)
+            })
+        {
+            actions.push(UiAction::DeleteDevices);
         }
         if !palette_open && !skin_open && !self.project.open && !self.automation_editor {
             arrangement_keys(ui.ctx(), &self.arrangement, &mut actions);
@@ -9966,8 +11379,6 @@ impl shell::Host for App {
                         &mut self.focus,
                         &mut self.browser,
                         &self.library_snapshot,
-                        &self.library_config,
-                        self.library_scanning,
                     )
                 });
             // Applied at the end of the frame with `edits`, for the same
@@ -10080,6 +11491,8 @@ impl shell::Host for App {
         if arrangement_outcome.open_clip_editor {
             self.bottom_view = BottomView::ClipEditor;
         }
+        self.bounce_in_place_requested |= arrangement_outcome.bounce_in_place;
+        self.focused_clip = arrangement_outcome.focused_clip;
 
         // Panning by hand is the user taking the wheel: follow stays off
         // until they ask for it again.
@@ -10161,6 +11574,9 @@ impl shell::Host for App {
         // AFTER the panels, where the theme is no longer borrowed: the
         // editor has drawn and settled on a selection by now, which is
         // the only moment there is one worth projecting.
+        if std::mem::take(&mut self.bounce_in_place_requested) {
+            self.start_bounce_in_place(ui.ctx());
+        }
         self.mirror_audio_selection();
         // A verb chosen from the display's context menu. It goes through
         // the same dispatch the palette uses, so there is one definition
@@ -10344,6 +11760,7 @@ impl shell::Host for App {
                 // and `perform` is pure over the arrangement.
                 UiAction::GroupDevices => self.group_devices(),
                 UiAction::UngroupDevices => self.ungroup_devices(),
+                UiAction::DeleteDevices => self.delete_selected_devices(),
                 UiAction::ToggleBrowser => {
                     self.prefs.browser_hidden = !self.prefs.browser_hidden;
                 }
@@ -10361,6 +11778,34 @@ impl shell::Host for App {
                     self.prefs.browser_hidden = clearing;
                     self.prefs.lower_hidden = clearing;
                 }
+                // Reverse is a DESTRUCTIVE RENDER — the app's own, like
+                // every verb that touches the wav worker. Ableton's R.
+                UiAction::ReverseAudio => {
+                    if let Some(clip) = self.arrangement.active_audio_clip()
+                        && let Some(audio) = clip.audio.as_ref()
+                    {
+                        let from = audio.source_offset;
+                        let to = audio.source_offset + audio.source_frames;
+                        let taken = self.request_render(
+                            "reverse",
+                            vec![daw::render::Op::Reverse {
+                                from,
+                                to,
+                                channels: daw::render::Channels::all(),
+                            }],
+                            None,
+                        );
+                        if !taken {
+                            self.notice =
+                                Some("could not reverse — a render is already running".to_owned());
+                        }
+                    } else {
+                        self.notice = Some("nothing to reverse — select an audio clip".to_owned());
+                    }
+                }
+                // Crop rides the ring's clip, which is app-owned view state
+                // — `perform` never sees it. Ableton 12's Ctrl+Shift+J.
+                UiAction::CropFocusedClip => self.crop_focused_clip(),
                 other => wishes.push(other),
             }
         }
@@ -10509,6 +11954,85 @@ mod tests {
     use super::timecode::bars_beats;
     use super::track::SamplerSource;
     use super::*;
+
+    /// The redesign's arrangement vocabulary is monochrome by construction:
+    /// every role speaks through value alone, and pure white is reserved
+    /// for the signals that must always win — focus, the playhead, danger.
+    #[test]
+    fn redesign_theme_is_monochrome_and_white_is_reserved() {
+        let theme = redesign_arrangement_theme();
+        let colors = [
+            ("bg", theme.bg),
+            ("surface", theme.surface),
+            ("surface_raised", theme.surface_raised),
+            ("surface_sunken", theme.surface_sunken),
+            ("text", theme.text),
+            ("text_muted", theme.text_muted),
+            ("text_value", theme.text_value),
+            ("outline", theme.outline),
+            ("divider", theme.divider),
+            ("focus", theme.focus),
+            ("accent", theme.accent),
+            ("accent_muted", theme.accent_muted),
+            ("role_time", theme.role_time),
+            ("role_time_dim", theme.role_time_dim),
+            ("role_level", theme.role_level),
+            ("role_level_dim", theme.role_level_dim),
+            ("role_shape", theme.role_shape),
+            ("role_shape_dim", theme.role_shape_dim),
+            ("role_mod", theme.role_mod),
+            ("role_mod_dim", theme.role_mod_dim),
+            ("ok", theme.ok),
+            ("warn", theme.warn),
+            ("danger", theme.danger),
+            ("red_zone", theme.red_zone),
+            ("green_zone", theme.green_zone),
+            ("playhead", theme.playhead),
+            ("loop_region", theme.loop_region),
+            ("loop_brace", theme.loop_brace),
+            ("selection", theme.selection),
+            ("grid_beat", theme.grid_beat),
+            ("grid_bar", theme.grid_bar),
+            ("grid_sub", theme.grid_sub),
+            ("timeline_lane", theme.timeline_lane),
+            ("timeline_lane_alt", theme.timeline_lane_alt),
+            ("timeline_lane_selected", theme.timeline_lane_selected),
+            ("clip_body", theme.clip_body),
+            ("clip_midi", theme.clip_midi),
+            ("clip_midi_header", theme.clip_midi_header),
+            ("clip_audio", theme.clip_audio),
+            ("clip_audio_header", theme.clip_audio_header),
+            ("clip_hover", theme.clip_hover),
+            ("clip_selected", theme.clip_selected),
+            ("clip_note", theme.clip_note),
+            ("note_fill", theme.note_fill),
+            ("note_fill_selected", theme.note_fill_selected),
+            ("note_edge", theme.note_edge),
+            ("note_hover", theme.note_hover),
+            ("note_ghost", theme.note_ghost),
+            ("meter_low", theme.meter_low),
+            ("meter_hot", theme.meter_hot),
+            ("meter_clip", theme.meter_clip),
+        ];
+        for (name, color) in colors {
+            assert!(
+                color.r() == color.g() && color.g() == color.b(),
+                "theme role {name} carries hue"
+            );
+        }
+        for (name, color) in [
+            ("focus", theme.focus),
+            ("playhead", theme.playhead),
+            ("danger", theme.danger),
+            ("meter_clip", theme.meter_clip),
+        ] {
+            assert_eq!(
+                color,
+                egui::Color32::WHITE,
+                "the {name} signal must be the loudest value in the system"
+            );
+        }
+    }
     use daw::audio::graph::SynthParams;
     use egui::{Event, PointerButton, RawInput, Rect, Vec2, pos2, vec2};
 
@@ -10613,8 +12137,6 @@ mod tests {
                         &mut Focus::default(),
                         &mut Browser::default(),
                         &LibrarySnapshot::default(),
-                        &LibraryConfig::default(),
-                        false,
                     )
                 })
                 .response
@@ -10817,47 +12339,31 @@ mod tests {
         }
     }
 
-    /// The bands are inset on every side, meet exactly, and give up rather
-    /// than draw a sliver when the panel gets small.
+    /// The browser content is inset horizontally, spans the panel vertically,
+    /// and gives up rather than drawing a sliver when the panel gets small.
     #[test]
-    fn the_browser_bands_split_and_degrade_cleanly() {
+    fn the_browser_content_insets_and_degrades_cleanly() {
         let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(240.0, 500.0));
-        let (upper, lower) = browser_bands(area, BROWSER_LOWER_FRAC).unwrap();
+        let content = browser_content(area).unwrap();
 
         // Dark brown shows down both sides...
-        assert_eq!(upper.left(), area.left() + BROWSER_INSET_X);
-        assert_eq!(lower.right(), area.right() - BROWSER_INSET_X);
+        assert_eq!(content.left(), area.left() + BROWSER_INSET_X);
+        assert_eq!(content.right(), area.right() - BROWSER_INSET_X);
         // ...and the content spans the panel's full height, so it lines up
         // with the arrangement beside it.
-        assert_eq!(upper.top(), area.top() + BROWSER_INSET_Y);
-        assert_eq!(lower.bottom(), area.bottom() - BROWSER_INSET_Y);
+        assert_eq!(content.top(), area.top() + BROWSER_INSET_Y);
+        assert_eq!(content.bottom(), area.bottom() - BROWSER_INSET_Y);
 
-        // No gap and no overlap between them.
-        assert_eq!(upper.bottom(), lower.top());
-        assert_eq!(
-            lower.height(),
-            area.height() * BROWSER_LOWER_FRAC,
-            "the lower band is a fifth of the PANEL height, not of the inset area"
-        );
-        assert!(upper.height() > lower.height());
-
-        // The split tracks the region: a taller panel gets a taller band.
-        let tall = Rect::from_min_size(pos2(0.0, 0.0), vec2(240.0, 1000.0));
-        let (_, tall_lower) = browser_bands(tall, BROWSER_LOWER_FRAC).unwrap();
-        assert_eq!(tall_lower.height(), 200.0);
-
-        // A squat panel no longer degenerates: with no vertical inset the
-        // bands simply scale down, both keeping positive height.
+        // A squat panel still has a positive content rectangle.
         let squat = Rect::from_min_size(pos2(0.0, 0.0), vec2(240.0, 20.0));
-        let (u, l) = browser_bands(squat, BROWSER_LOWER_FRAC).unwrap();
-        assert!(u.height() > 0.0 && l.height() > 0.0);
+        assert!(browser_content(squat).unwrap().height() > 0.0);
 
         // What does still degenerate: no height at all, and a panel narrower
         // than its own side margins.
         let flat = Rect::from_min_size(pos2(0.0, 0.0), vec2(240.0, 0.0));
-        assert!(browser_bands(flat, BROWSER_LOWER_FRAC).is_none());
+        assert!(browser_content(flat).is_none());
         let sliver = Rect::from_min_size(pos2(0.0, 0.0), vec2(BROWSER_INSET_X * 2.0, 500.0));
-        assert!(browser_bands(sliver, BROWSER_LOWER_FRAC).is_none());
+        assert!(browser_content(sliver).is_none());
     }
 
     /// NEITHER LIST MAY STARVE THE OTHER.
@@ -10913,35 +12419,6 @@ mod tests {
         assert!(cramped.contains_rect(catalog_viewport(cramped, 40)));
     }
 
-    /// Dragging the inner divider maps pointer position to split, and cannot
-    /// be pulled far enough to erase either band.
-    #[test]
-    fn the_inner_divider_drags_within_bounds() {
-        let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(240.0, 500.0));
-        let lo = *BROWSER_SPLIT_RANGE.start();
-        let hi = *BROWSER_SPLIT_RANGE.end();
-
-        // Pointer at the divider's resting place reproduces the resting split.
-        let (upper, _) = browser_bands(area, BROWSER_LOWER_FRAC).unwrap();
-        let round_trip = split_from_pointer(area, upper.bottom());
-        assert!(
-            (round_trip - BROWSER_LOWER_FRAC).abs() < 1e-4,
-            "pointer on the divider asked for {round_trip}, not {BROWSER_LOWER_FRAC}"
-        );
-
-        // Dragging up grows the lower band, down shrinks it.
-        assert!(split_from_pointer(area, upper.bottom() - 50.0) > BROWSER_LOWER_FRAC);
-        assert!(split_from_pointer(area, upper.bottom() + 50.0) < BROWSER_LOWER_FRAC);
-
-        // Yanked off either end, both bands survive.
-        for y in [-10_000.0, -1.0, 0.0, 250.0, 499.0, 10_000.0] {
-            let split = split_from_pointer(area, y);
-            assert!((lo..=hi).contains(&split), "y={y} gave split {split}");
-            let (u, l) = browser_bands(area, split).unwrap();
-            assert!(u.height() > 0.0 && l.height() > 0.0, "y={y} erased a band");
-        }
-    }
-
     /// The browser must be exactly as tall as the arrangement. It hung 180px
     /// below it — the device panel's height — because `left` was claimed
     /// before `bottom`, so the browser took the full column and the device
@@ -10980,8 +12457,6 @@ mod tests {
                             &mut Focus::default(),
                             &mut Browser::default(),
                             &LibrarySnapshot::default(),
-                            &LibraryConfig::default(),
-                            false,
                         )
                     })
                     .response
@@ -11005,18 +12480,18 @@ mod tests {
         // The visible content, not just the panel: a vertical inset would
         // make the browser's box shorter than the arrangement and push it
         // down, which is what a uniform inset did.
-        let (upper, lower) = browser_bands(browser, BROWSER_LOWER_FRAC).unwrap();
+        let content = browser_content(browser).unwrap();
         assert_eq!(
-            upper.top(),
+            content.top(),
             center.top(),
             "the browser's content sits {}px below the arrangement",
-            upper.top() - center.top()
+            content.top() - center.top()
         );
         assert_eq!(
-            lower.bottom(),
+            content.bottom(),
             center.bottom(),
             "the browser's content stops {}px short of the arrangement",
-            center.bottom() - lower.bottom()
+            center.bottom() - content.bottom()
         );
         assert_eq!(
             browser.bottom(),
@@ -11322,6 +12797,8 @@ mod tests {
                 asset("snare.wav", "drums", "hits"),
                 asset("pad.wav", "keys", "beds"),
             ],
+            scales: Vec::new(),
+            lenses: Vec::new(),
             warnings: Vec::new(),
         };
         let hits = std::path::Path::new("hits");
@@ -12145,27 +13622,34 @@ mod tests {
     }
 
     /// Ctrl+1 walks the grid finer, Ctrl+2 coarser, and both stop at the
-    /// ends. Wrapping from 1/32 back to 1/1 mid-edit would be a nasty
+    /// ends. Wrapping from 1/16384 back to 1/1 mid-edit would be a nasty
     /// surprise, so it clamps.
     #[test]
     fn the_grid_ladder_steps_and_clamps() {
-        // Narrow: 1/4 -> 1/8 -> 1/16 -> 1/32, then hold.
+        // Narrow: 1/4 down through Ableton's whole ladder to 1/16384,
+        // then hold.
         assert_eq!(GRID_NAMES[GRID_DEFAULT], "1/4");
         let mut g = GRID_DEFAULT;
-        for expected in ["1/8", "1/16", "1/32"] {
+        for expected in [
+            "1/8", "1/16", "1/32", "1/64", "1/128", "1/256", "1/512", "1/1024", "1/2048", "1/4096",
+            "1/8192", "1/16384",
+        ] {
             g = step_grid(g, true);
             assert_eq!(GRID_NAMES[g], expected);
         }
-        assert_eq!(step_grid(g, true), g, "narrowing past 1/32 should hold");
+        assert_eq!(step_grid(g, true), g, "narrowing past 1/16384 should hold");
 
         // Widen back down, then hold at 1/1.
-        for expected in ["1/16", "1/8", "1/4", "1/2", "1/1"] {
+        for expected in [
+            "1/8192", "1/4096", "1/2048", "1/1024", "1/512", "1/256", "1/128", "1/64", "1/32",
+            "1/16", "1/8", "1/4", "1/2", "1/1",
+        ] {
             g = step_grid(g, false);
             assert_eq!(GRID_NAMES[g], expected);
         }
         assert_eq!(step_grid(g, false), g, "widening past 1/1 should hold");
 
-        // Every rung is half the one above it.
+        // Every rung is half the one above it, all the way down.
         for pair in GRID_BEATS.windows(2) {
             assert!(
                 (pair[1] * 2.0 - pair[0]).abs() < 1e-6,
@@ -12409,6 +13893,10 @@ mod tests {
         let mut arrangement = Arrangement::default();
         let track = arrangement.add_track(TrackKind::Audio);
         let source = AudioSource {
+            transpose: 0.0,
+            detune: 0.0,
+            transposed_from: None,
+            applied_ratio: 1.0,
             path: std::path::PathBuf::from("kick.wav"),
             sample_rate: 48_000,
             source_offset: 0,
@@ -12588,6 +14076,10 @@ mod tests {
             len: 8.0,
             notes: Vec::new(),
             audio: Some(AudioSource {
+                transpose: 0.0,
+                detune: 0.0,
+                transposed_from: None,
+                applied_ratio: 1.0,
                 path: PathBuf::from("take.wav"),
                 sample_rate: 48_000,
                 source_offset: 0,
@@ -12809,6 +14301,398 @@ mod tests {
             "one grid step of drag moves the clip one beat"
         );
         assert_eq!(arr.selected_clip, Some((0, 0)), "the drag also selects");
+    }
+
+    /// Selection is what the rack follows, so a drag must not grab it at
+    /// START — that would switch the bottom region to the source track
+    /// mid-drag and hide the device the drag was aimed at. The landing
+    /// selects; the take-off leaves focus alone.
+    #[test]
+    fn starting_a_clip_drag_leaves_the_focus_where_it_is() {
+        let ctx = egui::Context::default();
+        let mut arr = Arrangement::default();
+        arr.create_clip(0, 0.0, 4.0).unwrap();
+        // Creating a clip selects it; the user's situation is the opposite
+        // — focus elsewhere (the sampler's track), clip unselected.
+        arr.selected_clip = None;
+        arr.selected_clip_ids.clear();
+        arr.selected = None;
+        arrangement_pass(&ctx, &mut arr, vec![]);
+        assert_eq!(arr.selected_clip, None, "nothing is selected to begin with");
+
+        // Press on the unselected clip, then move past the drag threshold.
+        let press = pos2(TL + 48.0, LANES_TOP + TRACK_H * 0.5);
+        let moved = pos2(TL + 48.0 + PX_PER_BEAT, LANES_TOP + TRACK_H * 0.5);
+        arrangement_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::PointerMoved(press),
+                Event::PointerButton {
+                    pos: press,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        arrangement_pass(&ctx, &mut arr, vec![Event::PointerMoved(moved)]);
+        assert!(
+            arr.ghost.is_some(),
+            "the pointer has moved: the ghost is in flight"
+        );
+        assert_eq!(
+            arr.selected_clip, None,
+            "mid-drag the clip is NOT selected — selecting here would flip the rack to this track and hide the drop target"
+        );
+        assert_eq!(
+            arr.selected, None,
+            "nor does the drag steal the track focus"
+        );
+        assert_eq!(arr.clips[0][0].start, 0.0, "and the clip has not moved yet");
+
+        // The release lands the clip, and only THEN does it select.
+        arrangement_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::PointerMoved(moved),
+                Event::PointerButton {
+                    pos: moved,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        assert_eq!(
+            arr.clips[0][0].start, 1.0,
+            "the landing still moves the clip"
+        );
+        assert_eq!(
+            arr.selected_clip,
+            Some((0, 0)),
+            "and the landing still selects it"
+        );
+    }
+
+    /// Alt held while dragging a clip bypasses the grid: the clip lands
+    /// where the pointer says, off the grid lines. Ableton's fine drag.
+    #[test]
+    fn an_alt_clip_drag_bypasses_the_grid() {
+        let ctx = egui::Context::default();
+        let mut arr = Arrangement::default();
+        arr.create_clip(0, 0.0, 4.0).unwrap();
+        arr.selected_clip = None;
+        arr.selected_clip_ids.clear();
+        arrangement_pass(&ctx, &mut arr, vec![]);
+
+        // 1.2 beats of travel — deliberately off any grid line.
+        let press = pos2(TL + 48.0, LANES_TOP + TRACK_H * 0.5);
+        let release = pos2(TL + 48.0 + PX_PER_BEAT * 1.2, LANES_TOP + TRACK_H * 0.5);
+        arrangement_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::ModifiersChanged(egui::Modifiers::ALT),
+                Event::PointerMoved(press),
+                Event::PointerButton {
+                    pos: press,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::ALT,
+                },
+            ],
+        );
+        arrangement_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::ModifiersChanged(egui::Modifiers::ALT),
+                Event::PointerMoved(release),
+            ],
+        );
+        arrangement_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::PointerMoved(release),
+                Event::PointerButton {
+                    pos: release,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::ALT,
+                },
+            ],
+        );
+        assert!(
+            (arr.clips[0][0].start - 1.2).abs() < 0.05,
+            "the alt drag lands off the grid: {}",
+            arr.clips[0][0].start
+        );
+    }
+
+    /// Alt held on a lane seam resizes EVERY track, not just the one the
+    /// seam belongs to. Ableton's gesture for one height for all lanes.
+    #[test]
+    fn an_alt_seam_drag_resizes_every_lane() {
+        let ctx = egui::Context::default();
+        let mut arr = Arrangement::default();
+        arrangement_pass(&ctx, &mut arr, vec![]);
+        let before: Vec<f32> = arr.tracks.iter().map(|track| track.height).collect();
+
+        // The seam under lane 0 lives just above the lane's bottom edge —
+        // exactly on the boundary belongs to lane 1's body, so the grab
+        // aims where a pointer would: at the seam line itself.
+        let at = pos2(TL + 100.0, LANES_TOP + TRACK_H - 2.0);
+        let to = pos2(TL + 100.0, LANES_TOP + TRACK_H + 10.0);
+        arrangement_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::ModifiersChanged(egui::Modifiers::ALT),
+                Event::PointerMoved(at),
+                Event::PointerButton {
+                    pos: at,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::ALT,
+                },
+            ],
+        );
+        arrangement_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::ModifiersChanged(egui::Modifiers::ALT),
+                Event::PointerMoved(to),
+            ],
+        );
+        arrangement_pass(
+            &ctx,
+            &mut arr,
+            vec![
+                Event::PointerMoved(to),
+                Event::PointerButton {
+                    pos: to,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::ALT,
+                },
+            ],
+        );
+        for (i, track) in arr.tracks.iter().enumerate() {
+            assert!(
+                (track.height - (before[i] + 12.0)).abs() < 2.0,
+                "lane {i} did not follow the alt seam"
+            );
+        }
+    }
+
+    /// The ring can arrow onto a clip, and the pass reports WHICH clip —
+    /// the focus commands' target. Enter is the click: it selects.
+    #[test]
+    fn the_ring_can_land_on_a_clip_and_name_it() {
+        let ctx = egui::Context::default();
+        let mut arr = Arrangement::default();
+        arr.create_clip(0, 0.0, 4.0).unwrap();
+        let id = arr.clips[0][0].id;
+        arr.selected_clip = None;
+        arr.selected_clip_ids.clear();
+        arr.selected = None;
+
+        let theme = Theme::dark();
+        let mut focus = Focus::default();
+        let mut pass = |focus: &mut Focus, arr: &mut Arrangement, events: Vec<Event>| {
+            let mut outcome = ArrangementOutcome::default();
+            let mut out = ctx.run_ui(input(events), |ui| {
+                focus.begin(ui.ctx());
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::new().fill(theme.bg))
+                    .show(ui, |ui| {
+                        outcome = arrangement_body(
+                            ui,
+                            focus,
+                            &theme,
+                            arr,
+                            ArrangementTransportView {
+                                beats_per_bar: 4,
+                                bpm: 120.0,
+                                playhead: 0.0,
+                                follow: false,
+                            },
+                            &HashMap::new(),
+                            None,
+                            false,
+                            &ParameterRegistry::default(),
+                            &mut TRACK_VOLUME_TARGET.to_owned(),
+                            &mut Vec::new(),
+                            &mut device::meter::Ballistics::default(),
+                        );
+                    });
+                focus.end(ui, &theme);
+            });
+            out.textures_delta.clear();
+            outcome
+        };
+        // First frame: the ring lands on the lane's cell, not the clip.
+        let outcome = pass(&mut focus, &mut arr, vec![]);
+        assert_eq!(
+            outcome.focused_clip, None,
+            "the ring starts on the lane, not the clip"
+        );
+        // One arrow right: the clip is the nearest thing that way. The
+        // move resolves in `Focus::end`, AFTER the pass registered, so the
+        // outcome reports it one frame later — the ring's own spring is
+        // the same one-frame story, and the app reads this every frame.
+        pass(
+            &mut focus,
+            &mut arr,
+            vec![Event::Key {
+                key: egui::Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        let outcome = pass(&mut focus, &mut arr, vec![]);
+        assert_eq!(
+            outcome.focused_clip,
+            Some((0, id)),
+            "the ring lands on the clip and names it"
+        );
+        assert_eq!(
+            arr.selected_clip, None,
+            "the ring is not the selection — see the slot rule"
+        );
+        // Enter on the focused clip is the click.
+        pass(
+            &mut focus,
+            &mut arr,
+            vec![Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(
+            arr.selected_clip,
+            Some((0, 0)),
+            "Enter on a focused clip selects it"
+        );
+    }
+
+    /// Crop keeps ONLY the focused clip's span on the lane: outsiders go,
+    /// straddlers are trimmed, and their notes crop along so the music
+    /// stays where it sounds.
+    #[test]
+    fn crop_keeps_only_the_focused_span() {
+        let mut arr = Arrangement::default();
+        arr.create_clip(0, 0.0, 1.0).unwrap();
+        arr.create_clip(0, 2.0, 3.0).unwrap();
+        arr.clips[0][1].notes.push(note(62, 0.0, 1.0, 100));
+        arr.clips[0][1].notes.push(note(60, 0.5, 1.0, 100));
+        arr.create_clip(0, 6.0, 1.0).unwrap();
+        assert!(arr.crop_lane_to(0, 2.0, 5.0, 120.0));
+        assert_eq!(arr.clips[0].len(), 1, "outsiders are removed");
+        let clip = &arr.clips[0][0];
+        assert_eq!(
+            (clip.start, clip.len),
+            (2.0, 3.0),
+            "the carrier stays whole"
+        );
+        assert_eq!(clip.notes.len(), 2, "its notes are untouched");
+        assert_eq!(arr.selected_clip, Some((0, 0)), "the survivor is selected");
+
+        // A straddler: both edges trim, and notes crop WITH the clip.
+        let mut b = Arrangement::default();
+        b.create_clip(0, 1.0, 6.0).unwrap();
+        b.clips[0][0].notes.push(note(60, 0.5, 1.0, 100)); // absolute 1.5 — drops
+        b.clips[0][0].notes.push(note(62, 2.5, 1.0, 100)); // absolute 3.5 — keeps, shifts
+        b.clips[0][0].notes.push(note(64, 6.5, 1.0, 100)); // absolute 7.5 — past the new end
+        assert!(b.crop_lane_to(0, 3.0, 6.0, 120.0));
+        let clip = &b.clips[0][0];
+        assert_eq!((clip.start, clip.len), (3.0, 3.0));
+        let starts: Vec<f64> = clip.notes.iter().map(|note| note.start).collect();
+        assert_eq!(starts, vec![0.5], "a note that kept its sound shifts to it");
+    }
+
+    /// Audio straddlers crop by moving the source window, exactly as the
+    /// left-edge drag does — the crop never touches the file.
+    #[test]
+    fn crop_moves_an_audio_clips_source_window() {
+        let mut arr = Arrangement::default();
+        arr.tracks[0].kind = TrackKind::Audio;
+        arr.insert_audio(
+            0,
+            0.0,
+            "take".into(),
+            AudioSource {
+                transpose: 0.0,
+                detune: 0.0,
+                transposed_from: None,
+                applied_ratio: 1.0,
+                path: PathBuf::from("take.wav"),
+                sample_rate: 48_000,
+                source_offset: 0,
+                source_frames: 8 * 48_000,
+                gain: 1.0,
+                looped: false,
+                file_frames: 8 * 48_000,
+                reversed: false,
+                fade_in: 0,
+                fade_out: 0,
+                fade_in_curve: 0.0,
+                fade_out_curve: 0.0,
+                envelope: Vec::new(),
+            },
+            120.0,
+        )
+        .unwrap();
+        assert!(arr.crop_lane_to(0, 2.0, 6.0, 120.0));
+        let clip = &arr.clips[0][0];
+        assert_eq!((clip.start, clip.len), (2.0, 4.0));
+        let audio = clip.audio.as_ref().expect("audio source");
+        assert_eq!(
+            audio.source_offset, 48_000,
+            "two beats at 120 bpm is one second of source"
+        );
+    }
+
+    /// The palette's focus verbs enable on the ring's clip and dispatch to
+    /// the operations the tests above pin down.
+    #[test]
+    fn the_palette_focus_verbs_target_the_ringed_clip() {
+        let storage = shell::Storage::default();
+        let mut app = App::new(&storage);
+        app.arrangement.create_clip(0, 0.0, 4.0).unwrap();
+        let id = app.arrangement.clips[0][0].id;
+        app.focused_clip = Some((0, id));
+        let commands = app.commands();
+        let crop = commands
+            .iter()
+            .find(|command| command.id == "clip.focus.crop")
+            .expect("the crop verb is listed");
+        assert!(crop.enabled, "a focused clip enables the crop verb");
+        let consolidate = commands
+            .iter()
+            .find(|command| command.id == "clip.focus.consolidate")
+            .expect("the consolidate verb is listed");
+        assert!(!consolidate.enabled, "one clip is nothing to consolidate");
+
+        // Crop runs against the FOCUSED span, selection or no selection.
+        app.arrangement.create_clip(0, 6.0, 1.0).unwrap();
+        let mut actions = Vec::new();
+        app.run_command("clip.focus.crop", &mut actions);
+        assert_eq!(
+            app.arrangement.clips[0].len(),
+            1,
+            "the outsider is cropped away"
+        );
+        assert_eq!(app.arrangement.clips[0][0].start, 0.0);
     }
 
     /// Dragging the loop brace's body moves both ends, snapped to the grid.
@@ -14261,6 +16145,7 @@ mod tests {
             },
             grab: 0.0,
             copy: false,
+            fine: false,
             from_start: dragged.start,
             followers: vec![(id_b, 0), (id_c, 1)],
         };
@@ -14302,6 +16187,7 @@ mod tests {
                 },
                 grab: 0.0,
                 copy: true,
+                fine: false,
                 from_start: dragged.start,
                 followers: vec![(id_b, 0)],
             },
@@ -14343,6 +16229,7 @@ mod tests {
                 clip: dragged.clone(),
                 grab: 0.0,
                 copy: false,
+                fine: false,
                 from_start: dragged.start,
                 followers: vec![(id_b, -1)],
             },
@@ -15617,6 +17504,10 @@ mod tests {
             len: 4.0,
             notes: Vec::new(),
             audio: Some(AudioSource {
+                transpose: 0.0,
+                detune: 0.0,
+                transposed_from: None,
+                applied_ratio: 1.0,
                 path: "/tmp/loop.wav".into(),
                 sample_rate: 48_000,
                 source_offset: 100,
@@ -15898,6 +17789,10 @@ mod tests {
             len: 8.0,
             notes: Vec::new(),
             audio: Some(AudioSource {
+                transpose: 0.0,
+                detune: 0.0,
+                transposed_from: None,
+                applied_ratio: 1.0,
                 path: "/tmp/x.wav".into(),
                 sample_rate: 48_000,
                 source_offset: 0,
@@ -15938,6 +17833,10 @@ mod tests {
     #[test]
     fn an_audio_selection_maps_onto_absolute_beats() {
         let audio = AudioSource {
+            transpose: 0.0,
+            detune: 0.0,
+            transposed_from: None,
+            applied_ratio: 1.0,
             path: std::path::PathBuf::from("s.wav"),
             sample_rate: 48_000,
             source_offset: 0,
@@ -15991,6 +17890,10 @@ mod tests {
 
         // A clip at another rate measures in ITS frames, not the device's.
         let slow = AudioSource {
+            transpose: 0.0,
+            detune: 0.0,
+            transposed_from: None,
+            applied_ratio: 1.0,
             sample_rate: 24_000,
             ..audio.clone()
         };
@@ -16004,6 +17907,10 @@ mod tests {
     #[test]
     fn repointing_a_clip_keeps_its_region_inside_the_new_file() {
         let audio = AudioSource {
+            transpose: 0.0,
+            detune: 0.0,
+            transposed_from: None,
+            applied_ratio: 1.0,
             path: std::path::PathBuf::from("old.wav"),
             sample_rate: 48_000,
             source_offset: 1_000,
@@ -16237,6 +18144,10 @@ mod tests {
             len: 2.0,
             notes: Vec::new(),
             audio: Some(AudioSource {
+                transpose: 0.0,
+                detune: 0.0,
+                transposed_from: None,
+                applied_ratio: 1.0,
                 path: "/tmp/x.wav".into(),
                 sample_rate: 48_000,
                 source_offset: 0,
@@ -17278,6 +19189,10 @@ mod tests {
             len: 4.0,
             notes: Vec::new(),
             audio: Some(AudioSource {
+                transpose: 0.0,
+                detune: 0.0,
+                transposed_from: None,
+                applied_ratio: 1.0,
                 path: "/tmp/loop.wav".into(),
                 sample_rate: 48_000,
                 source_offset: 0,
@@ -18025,6 +19940,7 @@ mod tests {
             clip: clip.clone(),
             grab: 0.0,
             copy: false,
+            fine: false,
             from_start: clip.start,
             followers: Vec::new(),
         });
@@ -18285,10 +20201,10 @@ mod tests {
         }
     }
 
-    /// Painting inside the browser must not change the size it reports, or
-    /// the seam mark and the drag would drift apart.
+    /// Painting the browser content must not change the width its panel
+    /// reports, or the outer resize seam would drift away from the edge.
     #[test]
-    fn painting_the_bands_does_not_resize_the_browser() {
+    fn painting_the_browser_content_does_not_resize_it() {
         let ctx = egui::Context::default();
         for _ in 0..3 {
             assert_eq!(pass(&ctx, vec![]), BROWSER_W);
@@ -18592,6 +20508,10 @@ mod tests {
     #[test]
     fn a_fade_lands_at_the_same_beat_in_both_editors() {
         let audio = AudioSource {
+            transpose: 0.0,
+            detune: 0.0,
+            transposed_from: None,
+            applied_ratio: 1.0,
             path: std::path::PathBuf::from("stab.wav"),
             sample_rate: 48_000,
             source_offset: 0,
@@ -18646,6 +20566,10 @@ mod tests {
     fn a_reversed_clip_reads_the_mirrored_region() {
         // A ten-second file at 48k; the clip plays seconds 2..3.
         let mut source = AudioSource {
+            transpose: 0.0,
+            detune: 0.0,
+            transposed_from: None,
+            applied_ratio: 1.0,
             path: std::path::PathBuf::from("loop.wav"),
             sample_rate: 48_000,
             source_offset: 96_000,
@@ -18674,6 +20598,10 @@ mod tests {
 
         // A clip that plays the WHOLE file starts at zero either way.
         let whole = AudioSource {
+            transpose: 0.0,
+            detune: 0.0,
+            transposed_from: None,
+            applied_ratio: 1.0,
             source_offset: 0,
             source_frames: 480_000,
             reversed: true,
@@ -18688,6 +20616,10 @@ mod tests {
     #[test]
     fn an_old_project_without_a_file_length_still_reverses() {
         let untrimmed = AudioSource {
+            transpose: 0.0,
+            detune: 0.0,
+            transposed_from: None,
+            applied_ratio: 1.0,
             path: std::path::PathBuf::from("loop.wav"),
             sample_rate: 48_000,
             source_offset: 0,
@@ -18713,6 +20645,10 @@ mod tests {
     #[test]
     fn a_clip_waiting_for_its_reversal_has_no_file_to_play() {
         let source = AudioSource {
+            transpose: 0.0,
+            detune: 0.0,
+            transposed_from: None,
+            applied_ratio: 1.0,
             path: std::path::PathBuf::from("/nowhere/loop.wav"),
             sample_rate: 48_000,
             source_offset: 0,
@@ -18730,6 +20666,10 @@ mod tests {
         assert_eq!(source.playing_path(), None);
 
         let forward = AudioSource {
+            transpose: 0.0,
+            detune: 0.0,
+            transposed_from: None,
+            applied_ratio: 1.0,
             reversed: false,
             ..source
         };
@@ -18784,6 +20724,505 @@ mod tests {
             arrangement_keys(&ctx, &Arrangement::default(), &mut actions);
             assert_eq!(actions, vec![want], "{key:?} did not reach the app");
         }
+    }
+
+    /// Ableton's arrangement gestures, the ones this app was missing,
+    /// all answer to their keys in the LIVE handler — not merely in the
+    /// keymap table. Pressing each gesture must emit exactly its action.
+    #[test]
+    fn the_ableton_arrangement_gestures_reach_the_live_handler() {
+        use egui::Modifiers as M;
+        let ctrl = M::COMMAND;
+        let alt = M::ALT;
+        for (modifiers, key, want) in [
+            (ctrl, egui::Key::ArrowLeft, UiAction::SnapMarker(-1)),
+            (ctrl, egui::Key::ArrowRight, UiAction::SnapMarker(1)),
+            (ctrl, egui::Key::ArrowUp, UiAction::ResizeLoop(2.0)),
+            (ctrl, egui::Key::ArrowDown, UiAction::ResizeLoop(0.5)),
+            (ctrl | M::SHIFT, egui::Key::L, UiAction::SelectLoopContents),
+            (M::NONE, egui::Key::U, UiAction::FoldTrack),
+            (alt, egui::Key::U, UiAction::UnfoldAll),
+            (alt, egui::Key::Plus, UiAction::TrackHeight(20.0)),
+            (alt, egui::Key::Minus, UiAction::TrackHeight(-20.0)),
+            (M::NONE, egui::Key::H, UiAction::FitTracks),
+            (M::NONE, egui::Key::W, UiAction::FitWidth),
+            (M::NONE, egui::Key::R, UiAction::ReverseAudio),
+            (ctrl | alt, egui::Key::F, UiAction::FadeSelected),
+            (ctrl | alt, egui::Key::Backspace, UiAction::ClearFades),
+            // Plain Plus zooms in; a US layout types it as Shift+Equals,
+            // which must reach the same verb. Minus zooms out.
+            (M::NONE, egui::Key::Plus, UiAction::ZoomTimeline(2.0)),
+            (M::SHIFT, egui::Key::Equals, UiAction::ZoomTimeline(2.0)),
+            (M::NONE, egui::Key::Minus, UiAction::ZoomTimeline(0.5)),
+            // Ableton 12's crop pair: Ctrl+Shift+J crops before Ctrl+J
+            // could consolidate.
+            (ctrl | M::SHIFT, egui::Key::J, UiAction::CropFocusedClip),
+            (ctrl, egui::Key::J, UiAction::Consolidate),
+        ] {
+            let ctx = egui::Context::default();
+            let mut actions = Vec::new();
+            let mut out = ctx.run_ui(
+                input(vec![
+                    Event::ModifiersChanged(modifiers),
+                    Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                    },
+                ]),
+                |_ui| {},
+            );
+            out.textures_delta.clear();
+            arrangement_keys(&ctx, &Arrangement::default(), &mut actions);
+            assert_eq!(actions, vec![want], "{key:?} did not reach the app");
+        }
+        // And the loop pair keeps its load-bearing order: Ctrl+L loops,
+        // Ctrl+Shift+L selects, and the live handler still answers both.
+        for (modifiers, key, want) in [
+            (ctrl, egui::Key::L, UiAction::LoopFromSelection),
+            (ctrl | M::SHIFT, egui::Key::L, UiAction::SelectLoopContents),
+        ] {
+            let ctx = egui::Context::default();
+            let mut actions = Vec::new();
+            let mut out = ctx.run_ui(
+                input(vec![
+                    Event::ModifiersChanged(modifiers),
+                    Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                    },
+                ]),
+                |_ui| {},
+            );
+            out.textures_delta.clear();
+            arrangement_keys(&ctx, &Arrangement::default(), &mut actions);
+            assert_eq!(actions, vec![want], "{key:?} did not reach the app");
+        }
+    }
+
+    /// Ctrl+arrows jump the cursor to the nearest boundary that way —
+    /// a clip edge on the cursor's lane, a locator, or a loop edge — and
+    /// the cell it lands on IS the selection, like every cursor move.
+    #[test]
+    fn the_marker_snaps_to_edges_locators_and_the_loop() {
+        let mut t = Transport::default();
+        let mut a = Arrangement::default();
+        a.create_clip(0, 2.0, 2.0).unwrap();
+        a.create_clip(0, 8.0, 2.0).unwrap();
+        a.locators.push(Locator {
+            beat: 5.0,
+            name: "verse".into(),
+        });
+        a.loop_range = Some((6.0, 10.0));
+        a.cursor = Some((0, 3.0));
+
+        perform(&[UiAction::SnapMarker(-1)], &mut t, &mut a);
+        assert_eq!(a.cursor, Some((0, 2.0)), "left finds the clip's start");
+        perform(&[UiAction::SnapMarker(1)], &mut t, &mut a);
+        assert_eq!(a.cursor, Some((0, 4.0)), "right finds the clip's end");
+        perform(&[UiAction::SnapMarker(1)], &mut t, &mut a);
+        assert_eq!(a.cursor, Some((0, 5.0)), "then the locator");
+        perform(&[UiAction::SnapMarker(1)], &mut t, &mut a);
+        assert_eq!(a.cursor, Some((0, 6.0)), "then the loop's start");
+        perform(&[UiAction::SnapMarker(-1)], &mut t, &mut a);
+        assert_eq!(a.cursor, Some((0, 5.0)), "and back the way it came");
+        assert_eq!(a.selection, Some((5.0, 6.0)), "the cell IS the selection");
+    }
+
+    /// Ctrl+Up doubles the loop, Ctrl+Down halves it — anchored at the
+    /// start, never shorter than one grid division.
+    #[test]
+    fn the_loop_doubles_and_halves_about_its_start() {
+        let mut t = Transport::default();
+        let mut a = Arrangement {
+            loop_range: Some((4.0, 8.0)),
+            ..Default::default()
+        };
+        perform(&[UiAction::ResizeLoop(2.0)], &mut t, &mut a);
+        assert_eq!(a.loop_range, Some((4.0, 12.0)), "doubled, start kept");
+        perform(&[UiAction::ResizeLoop(0.5)], &mut t, &mut a);
+        assert_eq!(a.loop_range, Some((4.0, 8.0)), "halved back");
+        perform(
+            &[UiAction::ResizeLoop(0.25), UiAction::ResizeLoop(0.25)],
+            &mut t,
+            &mut a,
+        );
+        assert_eq!(
+            a.loop_range,
+            Some((4.0, 4.0 + a.grid_beats())),
+            "never shorter than one division"
+        );
+    }
+
+    /// Ctrl+Shift+L makes the loop's span the selection and selects the
+    /// clips it touches on every lane.
+    #[test]
+    fn selecting_the_loop_contents_selects_the_span_and_its_clips() {
+        let mut t = Transport::default();
+        let mut a = Arrangement::default();
+        a.create_clip(0, 1.0, 2.0).unwrap(); // outside — lane 0 index 0
+        a.create_clip(0, 5.0, 1.0).unwrap(); // inside — lane 0 index 1
+        a.create_clip(1, 7.0, 2.0).unwrap(); // straddles the end — lane 1
+        a.loop_range = Some((4.0, 8.0));
+        perform(&[UiAction::SelectLoopContents], &mut t, &mut a);
+        assert_eq!(a.selection, Some((4.0, 8.0)), "the span is the selection");
+        assert!(a.clip_is_selected(0, 1), "the inside clip is selected");
+        assert!(a.clip_is_selected(1, 0), "the straddler is selected");
+        assert!(!a.clip_is_selected(0, 0), "the outsider stays unselected");
+    }
+
+    /// U folds the selected group; Alt+U opens everything.
+    #[test]
+    fn the_folds_fold_and_unfold() {
+        let mut t = Transport::default();
+        let mut a = Arrangement::default();
+        a.tracks[0].is_group = true;
+        a.tracks[1].folded = true;
+        a.tracks[2].folded = true;
+        a.selected = Some(0);
+        perform(&[UiAction::FoldTrack], &mut t, &mut a);
+        assert!(a.tracks[0].folded, "U folds the selected group");
+        perform(&[UiAction::UnfoldAll], &mut t, &mut a);
+        assert!(
+            a.tracks.iter().all(|track| !track.folded),
+            "Alt+U opens every group"
+        );
+        // A lane that is not a group has nothing to fold.
+        a.selected = Some(1);
+        perform(&[UiAction::FoldTrack], &mut t, &mut a);
+        assert!(!a.tracks[1].folded);
+    }
+
+    /// Alt+Plus/Minus steps the selected track's height, clamped at the
+    /// lane limits; H divides the visible area evenly; W frames the song.
+    #[test]
+    fn the_height_and_fit_gestures_move_geometry() {
+        let mut t = Transport::default();
+        let mut a = Arrangement::default();
+        a.selected = Some(0);
+        let before = a.tracks[0].height;
+        perform(&[UiAction::TrackHeight(20.0)], &mut t, &mut a);
+        assert!(
+            (a.tracks[0].height - (before + 20.0)).abs() < 1e-3,
+            "a step up"
+        );
+        perform(&[UiAction::TrackHeight(-400.0)], &mut t, &mut a);
+        assert_eq!(
+            a.tracks[0].height,
+            *TRACK_H_RANGE.start(),
+            "clamped at the floor"
+        );
+
+        a.viewport_height = 300.0;
+        perform(&[UiAction::FitTracks], &mut t, &mut a);
+        let share = 300.0 / a.tracks.len() as f32;
+        for track in &a.tracks {
+            assert!(
+                (track.height - share).abs() < 1e-3,
+                "every lane gets the share"
+            );
+        }
+
+        a.create_clip(0, 2.0, 8.0).unwrap();
+        a.viewport_width = 240.0;
+        perform(&[UiAction::FitWidth], &mut t, &mut a);
+        assert_eq!(a.view_beats, 0.0, "the view starts at zero");
+        assert!(
+            (a.pixels_per_beat - 240.0 / 10.0).abs() < 1e-3,
+            "the span 0..10 frames in the viewport"
+        );
+    }
+
+    /// The swing knob rides the project file like every other transport
+    /// state: a song saved swung reopens swung.
+    #[test]
+    fn the_swing_survives_the_project_round_trip() {
+        let mut t = Transport::default();
+        let mut a = Arrangement::default();
+        perform(&[UiAction::SetSwing(0.62)], &mut t, &mut a);
+        assert!((t.swing - 0.62).abs() < 1e-6, "the knob moved");
+
+        let doc = project_doc(&a, &t);
+        assert!((doc.swing - 0.62).abs() < 1e-6, "the doc carries it");
+        // Older files carry no swing: the default is straight, and a
+        // value out of range clamps instead of refusing the song.
+        let mut older = project_doc(&a, &Transport::default());
+        older.swing = 3.0;
+        let mut t2 = Transport::default();
+        let mut a2 = Arrangement::default();
+        apply_project_doc(older, &mut a2, &mut t2);
+        assert_eq!(t2.swing, 1.0, "loaded swing clamps to the range");
+    }
+
+    /// The swing action clamps at both ends — a knob can only mean
+    /// straight-to-maximum, never a negative delay.
+    #[test]
+    fn the_swing_action_clamps() {
+        let mut t = Transport::default();
+        let mut a = Arrangement::default();
+        perform(&[UiAction::SetSwing(1.7)], &mut t, &mut a);
+        assert_eq!(t.swing, 1.0, "above the range clamps to maximum");
+        perform(&[UiAction::SetSwing(-0.4)], &mut t, &mut a);
+        assert_eq!(t.swing, 0.0, "below the range clamps to straight");
+        perform(&[UiAction::SetSwing(0.5)], &mut t, &mut a);
+        assert_eq!(t.swing, 0.5, "inside the range it sticks");
+    }
+
+    /// The clip's pitch knobs: a non-zero setting asks for a render and
+    /// remembers the original; coming home to zero hands the clip back
+    /// its untouched file, frames and fades — instantly, no worker.
+    #[test]
+    fn the_pitch_knobs_come_home_to_the_original_file() {
+        let storage = shell::Storage::default();
+        let mut app = App::new(&storage);
+        app.arrangement.tracks[0].kind = TrackKind::Audio;
+        let original = std::path::PathBuf::from("/persistent/take.wav");
+        app.arrangement
+            .insert_audio(
+                0,
+                0.0,
+                "take".into(),
+                AudioSource {
+                    path: original.clone(),
+                    sample_rate: 48_000,
+                    source_offset: 0,
+                    source_frames: 96_000,
+                    gain: 1.0,
+                    looped: false,
+                    transpose: 0.0,
+                    detune: 0.0,
+                    transposed_from: None,
+                    applied_ratio: 1.0,
+                    file_frames: 96_000,
+                    reversed: false,
+                    fade_in: 960,
+                    fade_out: 960,
+                    fade_in_curve: 0.0,
+                    fade_out_curve: 0.0,
+                    envelope: Vec::new(),
+                },
+                120.0,
+            )
+            .unwrap();
+        app.arrangement.select_only_clip(0, 0);
+
+        // Asking for pitch while no worker is busy enqueues the render
+        // and writes the knobs.
+        app.set_clip_transpose(12.0, 0.0);
+        let audio = app.arrangement.clips[0][0].audio.as_ref().unwrap();
+        assert_eq!(audio.transpose, 12.0, "the knob says what was asked");
+        let request = app.render_job.as_ref().expect("a render was asked");
+        assert_eq!(request.rescale, Some(2.0), "an octave is a ratio of two");
+        assert_eq!(
+            request.transpose_apply.as_ref().map(|(r, _)| *r),
+            Some(2.0),
+            "the landing remembers the ratio"
+        );
+        // Pretend the render landed: repoint the clip the way the worker
+        // answer does, then the knobs can come home.
+        app.render_job = None;
+        let clip = &mut app.arrangement.clips[0][0];
+        let audio = clip.audio.as_mut().unwrap();
+        audio.path = std::path::PathBuf::from("/persistent/renders/take-up.wav");
+        audio.file_frames = 48_000;
+        audio.source_frames = 48_000;
+        audio.fade_in = 480;
+        audio.fade_out = 480;
+        audio.transposed_from = Some(original.clone());
+        audio.applied_ratio = 2.0;
+        app.arrangement.force_recompile = false;
+
+        // Home again: the original file, frames and fades all return.
+        app.set_clip_transpose(0.0, 0.0);
+        let audio = app.arrangement.clips[0][0].audio.as_ref().unwrap();
+        assert_eq!(audio.path, original, "the original file is handed back");
+        assert_eq!(audio.file_frames, 96_000, "the original length returns");
+        assert_eq!(audio.source_frames, 96_000);
+        assert_eq!(audio.fade_in, 960, "fades scale back with the frames");
+        assert_eq!(audio.fade_out, 960);
+        assert!(
+            audio.transposed_from.is_none(),
+            "the round trip is complete"
+        );
+        assert_eq!(audio.applied_ratio, 1.0);
+        assert!(app.arrangement.force_recompile, "the swap recompiles");
+    }
+
+    /// A busy worker refuses, and the knobs snap back to what is actually
+    /// sounding rather than promising a pitch that never arrives.
+    #[test]
+    fn a_busy_worker_snaps_the_pitch_knobs_back() {
+        let storage = shell::Storage::default();
+        let mut app = App::new(&storage);
+        app.arrangement.tracks[0].kind = TrackKind::Audio;
+        app.arrangement
+            .insert_audio(
+                0,
+                0.0,
+                "take".into(),
+                AudioSource {
+                    path: std::path::PathBuf::from("/persistent/take.wav"),
+                    sample_rate: 48_000,
+                    source_offset: 0,
+                    source_frames: 96_000,
+                    gain: 1.0,
+                    looped: false,
+                    transpose: 0.0,
+                    detune: 0.0,
+                    transposed_from: None,
+                    applied_ratio: 1.0,
+                    file_frames: 96_000,
+                    reversed: false,
+                    fade_in: 0,
+                    fade_out: 0,
+                    fade_in_curve: 0.0,
+                    fade_out_curve: 0.0,
+                    envelope: Vec::new(),
+                },
+                120.0,
+            )
+            .unwrap();
+        app.arrangement.select_only_clip(0, 0);
+        app.render_job = Some(RenderRequest {
+            clip: app.arrangement.clips[0][0].id,
+            length_change: None,
+            verb: "busy",
+            flatten: false,
+            rescale: None,
+            transpose_apply: None,
+            as_new_clip: false,
+            ripple: false,
+        });
+        app.set_clip_transpose(7.0, 0.0);
+        let audio = app.arrangement.clips[0][0].audio.as_ref().unwrap();
+        assert_eq!(audio.transpose, 0.0, "the knob snaps back, not the render");
+        assert_eq!(audio.detune, 0.0);
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|n| n.contains("already running")),
+            "the refusal says why"
+        );
+    }
+
+    /// Ctrl+Alt+F gives every selected audio clip Ableton's ten-millisecond
+    /// default fades; Ctrl+Alt+Backspace takes them off.
+    #[test]
+    fn the_fade_verbs_set_and_clear_default_fades() {
+        let mut t = Transport::default();
+        let mut a = Arrangement::default();
+        a.tracks[0].kind = TrackKind::Audio;
+        a.insert_audio(
+            0,
+            0.0,
+            "take".into(),
+            AudioSource {
+                transpose: 0.0,
+                detune: 0.0,
+                transposed_from: None,
+                applied_ratio: 1.0,
+                path: PathBuf::from("take.wav"),
+                sample_rate: 48_000,
+                source_offset: 0,
+                source_frames: 2 * 48_000,
+                gain: 1.0,
+                looped: false,
+                file_frames: 2 * 48_000,
+                reversed: false,
+                fade_in: 0,
+                fade_out: 0,
+                fade_in_curve: 0.0,
+                fade_out_curve: 0.0,
+                envelope: Vec::new(),
+            },
+            120.0,
+        )
+        .unwrap();
+        a.select_only_clip(0, 0);
+        perform(&[UiAction::FadeSelected], &mut t, &mut a);
+        let audio = a.clips[0][0].audio.as_ref().unwrap();
+        assert_eq!(audio.fade_in, 480, "ten milliseconds at 48 kHz");
+        assert_eq!(audio.fade_out, 480);
+        perform(&[UiAction::ClearFades], &mut t, &mut a);
+        let audio = a.clips[0][0].audio.as_ref().unwrap();
+        assert_eq!(
+            (audio.fade_in, audio.fade_out),
+            (0, 0),
+            "the fades are gone"
+        );
+    }
+
+    /// Plus and Minus zoom the timeline about the centre of the view —
+    /// the beat under the middle of the screen stays there, clamped to
+    /// the zoom range Ableton's grid keys share.
+    #[test]
+    fn the_zoom_keys_frame_the_centre_of_the_view() {
+        let mut t = Transport::default();
+        let mut a = Arrangement {
+            view_beats: 8.0,
+            pixels_per_beat: 24.0,
+            viewport_width: 480.0,
+            ..Default::default()
+        };
+        // Centre of the view: 480 px at 24 px/beat = 20 beats wide,
+        // centre beat 8 + 10 = 18.
+        perform(&[UiAction::ZoomTimeline(2.0)], &mut t, &mut a);
+        assert_eq!(a.pixels_per_beat, 48.0, "in is twice the scale");
+        // 480 px at 48 px/beat = 10 beats wide; centre stays 18:
+        // view_beats = 18 - 5 = 13.
+        assert!((a.view_beats - 13.0).abs() < 1e-3, "the centre beat holds");
+        perform(&[UiAction::ZoomTimeline(0.5)], &mut t, &mut a);
+        assert_eq!(a.pixels_per_beat, 24.0, "out is half the scale");
+        assert!((a.view_beats - 8.0).abs() < 1e-3, "and the view comes back");
+        // Zooming past the range clamps; the view never goes negative.
+        a.view_beats = 0.0;
+        perform(
+            &[
+                UiAction::ZoomTimeline(1_000.0),
+                UiAction::ZoomTimeline(0.001),
+            ],
+            &mut t,
+            &mut a,
+        );
+        assert_eq!(
+            a.pixels_per_beat, ARRANGEMENT_ZOOM_MIN,
+            "clamped at the floor"
+        );
+        assert!(a.view_beats >= 0.0);
+    }
+
+    /// Ctrl+Shift+J crops the ring's clip through the APP's handler — the
+    /// ring is app-owned view state, so the verb never rides `perform`.
+    #[test]
+    fn the_crop_gesture_rides_the_apps_focused_clip() {
+        let storage = shell::Storage::default();
+        let mut app = App::new(&storage);
+        app.arrangement.create_clip(0, 0.0, 4.0).unwrap();
+        let id = app.arrangement.clips[0][0].id;
+        app.arrangement.create_clip(0, 6.0, 1.0).unwrap();
+        app.focused_clip = Some((0, id));
+        app.crop_focused_clip();
+        assert_eq!(
+            app.arrangement.clips[0].len(),
+            1,
+            "the outsider is cropped away"
+        );
+        assert_eq!(app.arrangement.clips[0][0].start, 0.0);
+        // No ring on a clip: the verb refuses honestly instead of
+        // guessing.
+        let mut app = App::new(&storage);
+        app.crop_focused_clip();
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|n| n.contains("nothing to crop")),
+            "the refusal names the missing target"
+        );
     }
 
     /// Ctrl+Alt+L must not be swallowed by the LOOP on Ctrl+L, which is
@@ -19016,6 +21455,10 @@ mod tests {
         assert_eq!(clip_editor_kind(&arrangement), ClipEditorKind::Audio);
 
         let source = AudioSource {
+            transpose: 0.0,
+            detune: 0.0,
+            transposed_from: None,
+            applied_ratio: 1.0,
             path: PathBuf::from("voice.wav"),
             sample_rate: 48_000,
             source_offset: 0,
@@ -19197,6 +21640,10 @@ mod tests {
         assert!(nodes.pans[i].is_none(), "an empty audio lane is absent");
 
         let source = AudioSource {
+            transpose: 0.0,
+            detune: 0.0,
+            transposed_from: None,
+            applied_ratio: 1.0,
             path: std::path::PathBuf::from("/missing/but-structurally-valid.wav"),
             sample_rate: 48_000,
             source_offset: 0,
@@ -20038,6 +22485,30 @@ mod tests {
         // is set up, not what it is doing.
         assert_eq!(back.tracks[0].input, TrackInput::Mono(0));
         assert_eq!(back.tracks[0].monitor, crate::track::Monitor::Auto);
+    }
+
+    #[test]
+    fn project_document_round_trips_song_and_projection_ownership() {
+        let mut doc = project_doc(&Arrangement::default(), &Transport::default());
+        let track_id = doc.song.tracks[0].id;
+        doc.song.patterns[0].set_primary(
+            1,
+            daw::sequencing::Note::with_pitch(daw::pitch::Pitch::degree(4, 1), 12, 100),
+        );
+        doc.song_track_map.insert(track_id, 0);
+
+        let text = ron::ser::to_string(&doc).expect("project document serializes");
+        let read: ProjectDoc = ron::from_str(&text).expect("project document deserializes");
+        assert_eq!(read.song, doc.song);
+        assert_eq!(read.song_track_map, doc.song_track_map);
+    }
+
+    #[test]
+    fn project_document_without_song_fields_loads_the_default_song() {
+        let read: ProjectDoc = ron::from_str("(version: 2, bpm: 93.0)")
+            .expect("an old-format project remains readable");
+        assert_eq!(read.song, daw::sequencing::Song::default());
+        assert!(read.song_track_map.is_empty());
     }
 
     /// AUTO IS WHAT MAKES ARMING ONE GESTURE.
@@ -21633,6 +24104,36 @@ mod tests {
         assert!(bound(&a).0);
     }
 
+    #[test]
+    fn deleting_a_device_retires_its_stable_id_everywhere() {
+        let mut a = Arrangement::default();
+        let synth = load(&mut a, 0, DeviceKind::SineSynth);
+        let gone = load(&mut a, 0, DeviceKind::Reverb);
+        let stays = load(&mut a, 0, DeviceKind::Lofi);
+        let target = aimed(gone, DeviceKind::Reverb, "mix");
+        let lfo = a.add_lfo().unwrap();
+        a.add_wire(lfo, 0, &target).unwrap();
+        a.tracks[0].automation.insert(&target, 0.0, 0.5);
+
+        let picked = [gone].into_iter().collect();
+        assert_eq!(a.remove_track_devices(0, &picked), vec![gone]);
+        assert_eq!(
+            a.tracks[0]
+                .chain
+                .iter()
+                .map(|device| device.id)
+                .collect::<Vec<_>>(),
+            vec![synth, stays],
+            "deletion disturbed another device"
+        );
+        assert!(a.mod_wires.is_empty(), "a modulation wire dangled");
+        assert!(
+            a.tracks[0].automation.points(&target).is_empty(),
+            "an automation envelope dangled"
+        );
+        assert!(a.force_recompile, "the audio graph kept the deleted node");
+    }
+
     /// The ordering rule: AT MOST ONE instrument, and it heads the chain.
     /// An effect never displaces the instrument that feeds it, a second
     /// instrument replaces the first rather than joining it, and the graph
@@ -22335,6 +24836,107 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn bounce_replaces_a_midi_lane_with_one_sampler_ready_audio_clip() {
+        let mut arrangement = Arrangement::default();
+        let device = load(&mut arrangement, 0, DeviceKind::SineSynth);
+        arrangement.create_clip(0, 2.0, 4.0).unwrap();
+        arrangement.tracks[0].pan = -0.4;
+        arrangement.tracks[0].volume = 0.6;
+        arrangement.tracks[0].sends = vec![0.25];
+        arrangement.mod_wires.push(ModWire {
+            track: 0,
+            ..ModWire::default()
+        });
+        arrangement.session.slots[0][0] = Some(arrangement.clips[0][0].clone());
+        arrangement.session.playing[0] = Some(0);
+
+        let path = PathBuf::from("/persistent/renders/track.wav");
+        let removed = arrangement
+            .replace_track_with_bounce(0, path.clone(), 48_000, 192_000, 2.0, 6.0)
+            .unwrap();
+
+        assert_eq!(removed, vec![device]);
+        assert_eq!(arrangement.tracks[0].kind, TrackKind::Audio);
+        assert!(arrangement.tracks[0].chain.is_empty());
+        assert_eq!(arrangement.tracks[0].pan, 0.0);
+        assert_eq!(arrangement.tracks[0].volume, 1.0);
+        assert_eq!(arrangement.tracks[0].sends, vec![0.25]);
+        assert!(arrangement.mod_wires.is_empty());
+        assert!(arrangement.session.slots[0][0].is_none());
+        assert_eq!(arrangement.session.playing[0], None);
+        assert_eq!(arrangement.clips[0].len(), 1);
+        let clip = &arrangement.clips[0][0];
+        assert_eq!((clip.start, clip.len), (2.0, 4.0));
+        let audio = clip.audio.as_ref().unwrap();
+        assert_eq!(audio.path, path);
+        assert_eq!(audio.source_frames, 192_000);
+        assert_eq!(audio.file_frames, 192_000);
+        assert_eq!(arrangement.selected_clip, Some((0, 0)));
+        assert!(arrangement.force_recompile);
+    }
+
+    #[test]
+    fn bounce_rejects_an_empty_or_backwards_render_without_mutating_the_lane() {
+        let mut arrangement = Arrangement::default();
+        let before = arrangement.tracks[0].clone();
+        assert!(
+            arrangement
+                .replace_track_with_bounce(0, PathBuf::from("bad.wav"), 48_000, 0, 4.0, 2.0)
+                .is_none()
+        );
+        assert_eq!(arrangement.tracks[0], before);
+        assert!(arrangement.clips[0].is_empty());
+    }
+
+    #[test]
+    fn redesigned_grid_edits_the_clip_that_the_audio_compiler_reads() {
+        let storage = shell::Storage::default();
+        let mut app = App::new(&storage);
+        app.arrangement.create_clip(0, 0.0, 4.0).unwrap();
+
+        app.apply_redesign_sequence_intents(&[redesign_sequence::Intent::SetPrimary {
+            tick: 12,
+            pitch: daw::pitch::Pitch::from_midi(64),
+            length_ticks: 12,
+            velocity: 101,
+        }]);
+        let clip = &app.arrangement.clips[0][0];
+        assert_eq!(clip.notes.len(), 1);
+        assert_eq!((clip.notes[0].start, clip.notes[0].len), (0.25, 0.25));
+        let compiled = seq_notes(std::slice::from_ref(clip));
+        assert_eq!(compiled.len(), 1, "the grid note never reached playback");
+        assert_eq!((compiled[0].pitch, compiled[0].vel), (64, 101));
+
+        app.apply_redesign_sequence_intents(&[redesign_sequence::Intent::Toggle {
+            tick: 12,
+            default_pitch: daw::pitch::Pitch::from_midi(60),
+            default_length_ticks: 12,
+            default_velocity: 100,
+        }]);
+        assert!(app.arrangement.clips[0][0].notes[0].muted);
+        assert!(seq_notes(&app.arrangement.clips[0]).is_empty());
+
+        app.apply_redesign_sequence_intents(&[redesign_sequence::Intent::Clear { tick: 12 }]);
+        assert!(app.arrangement.clips[0][0].notes.is_empty());
+    }
+
+    #[test]
+    fn redesigned_grid_extends_a_short_clip_so_every_entered_step_can_sound() {
+        let storage = shell::Storage::default();
+        let mut app = App::new(&storage);
+        app.arrangement.create_clip(0, 0.0, 1.0).unwrap();
+        app.apply_redesign_sequence_intents(&[redesign_sequence::Intent::SetPrimary {
+            tick: 63 * 12,
+            pitch: daw::pitch::Pitch::from_midi(60),
+            length_ticks: 12,
+            velocity: 100,
+        }]);
+        let clip = &app.arrangement.clips[0][0];
+        assert_eq!(clip.len, 16.0);
+        assert_eq!(seq_notes(std::slice::from_ref(clip)).len(), 1);
     }
 
     /// A whole-block context with the transport rolling, for the graph

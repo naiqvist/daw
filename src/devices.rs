@@ -20,7 +20,9 @@
 pub enum DeviceKind {
     SineSynth,
     Poly,
+    Tine,
     Haze,
+    Loom,
     Sampler,
     Kick,
     Snare,
@@ -44,6 +46,13 @@ pub enum DeviceKind {
     Filter,
     Glue,
     Clamp,
+    Flint,
+    Sibyl,
+    Ferric,
+    Umbra,
+    Tone,
+    Sigil,
+    Gauge,
     Prism,
     Modulato,
     Utility,
@@ -495,6 +504,175 @@ pub static DEVICES: &[DeviceSpec] = &[
                 name: "Level",
                 unit: "%",
                 group: "Air",
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Loom,
+        name: "loom",
+        instrument: true,
+        prefix: "loom",
+        params: daw::params::loom::TABLE,
+        labels: &[
+            ParamLabel {
+                name: "Morph",
+                unit: "",
+                group: "Loom",
+            },
+            ParamLabel {
+                name: "Octave",
+                unit: "",
+                group: "Loom",
+            },
+            ParamLabel {
+                name: "Semi",
+                unit: "",
+                group: "Loom",
+            },
+            ParamLabel {
+                name: "Level",
+                unit: "",
+                group: "Loom",
+            },
+            ParamLabel {
+                name: "Morph",
+                unit: "",
+                group: "Loom",
+            },
+            ParamLabel {
+                name: "Octave",
+                unit: "",
+                group: "Loom",
+            },
+            ParamLabel {
+                name: "Semi",
+                unit: "",
+                group: "Loom",
+            },
+            ParamLabel {
+                name: "Level",
+                unit: "",
+                group: "Loom",
+            },
+            ParamLabel {
+                name: "Noise",
+                unit: "",
+                group: "Loom",
+            },
+            ParamLabel {
+                name: "N Decay",
+                unit: "",
+                group: "Loom",
+            },
+            ParamLabel {
+                name: "Mode",
+                unit: "",
+                group: "Loom",
+            },
+            ParamLabel {
+                name: "Cutoff",
+                unit: "",
+                group: "Loom",
+            },
+            ParamLabel {
+                name: "Res",
+                unit: "",
+                group: "Loom",
+            },
+            ParamLabel {
+                name: "F Env",
+                unit: "",
+                group: "Loom",
+            },
+            ParamLabel {
+                name: "Attack",
+                unit: "",
+                group: "Loom",
+            },
+            ParamLabel {
+                name: "Decay",
+                unit: "",
+                group: "Loom",
+            },
+            ParamLabel {
+                name: "Sustain",
+                unit: "",
+                group: "Loom",
+            },
+            ParamLabel {
+                name: "Release",
+                unit: "",
+                group: "Loom",
+            },
+            ParamLabel {
+                name: "Gain",
+                unit: "",
+                group: "Loom",
+            },
+            ParamLabel {
+                name: "Velocity",
+                unit: "",
+                group: "Loom",
+            },
+            ParamLabel {
+                name: "F Attack",
+                unit: "",
+                group: "Loom",
+            },
+            ParamLabel {
+                name: "F Decay",
+                unit: "",
+                group: "Loom",
+            },
+            ParamLabel {
+                name: "F Sustain",
+                unit: "",
+                group: "Loom",
+            },
+            ParamLabel {
+                name: "F Release",
+                unit: "",
+                group: "Loom",
+            },
+            ParamLabel {
+                name: "Unison",
+                unit: "",
+                group: "Loom",
+            },
+            ParamLabel {
+                name: "Detune",
+                unit: "",
+                group: "Loom",
+            },
+            ParamLabel {
+                name: "Spread",
+                unit: "",
+                group: "Loom",
+            },
+            ParamLabel {
+                name: "Glide",
+                unit: "",
+                group: "Loom",
+            },
+            ParamLabel {
+                name: "P Decay",
+                unit: "",
+                group: "Loom",
+            },
+            ParamLabel {
+                name: "P Env",
+                unit: "",
+                group: "Loom",
+            },
+            ParamLabel {
+                name: "LFO Rate",
+                unit: "",
+                group: "Loom",
+            },
+            ParamLabel {
+                name: "LFO Pitch",
+                unit: "",
+                group: "Loom",
             },
         ],
     },
@@ -1772,6 +1950,329 @@ pub static DEVICES: &[DeviceSpec] = &[
                 name: "Out",
                 unit: "",
                 group: "Lo-fi",
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Flint,
+        name: "flint",
+        instrument: false,
+        prefix: "flint",
+        params: daw::params::flint::TABLE,
+        // Units blank for the reason the lo-fi's are: the card prints
+        // "+4.5 dB", "12 ms" and "65 %" through its own `Unit`, and a
+        // second opinion here would be a second answer to one question.
+        labels: &[
+            ParamLabel {
+                name: "Strike",
+                unit: "",
+                group: "Flint",
+            },
+            ParamLabel {
+                name: "Body",
+                unit: "",
+                group: "Flint",
+            },
+            ParamLabel {
+                name: "Split",
+                unit: "",
+                group: "Flint",
+            },
+            ParamLabel {
+                name: "Colour",
+                unit: "",
+                group: "Flint",
+            },
+            ParamLabel {
+                name: "Mix",
+                unit: "",
+                group: "Flint",
+            },
+            ParamLabel {
+                name: "Out",
+                unit: "",
+                group: "Flint",
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Sibyl,
+        name: "sibyl",
+        instrument: false,
+        prefix: "sibyl",
+        params: daw::params::sibyl::TABLE,
+        // Units blank for the reason the lo-fi's are: the card prints
+        // "+7 st", "C", "minor" and "55 %" through its own `Unit`, and a
+        // second opinion here would be a second answer to one question.
+        labels: &[
+            ParamLabel {
+                name: "Shift",
+                unit: "",
+                group: "Sibyl",
+            },
+            ParamLabel {
+                name: "Formant",
+                unit: "",
+                group: "Sibyl",
+            },
+            ParamLabel {
+                name: "Voice A",
+                unit: "",
+                group: "Sibyl",
+            },
+            ParamLabel {
+                name: "Voice B",
+                unit: "",
+                group: "Sibyl",
+            },
+            ParamLabel {
+                name: "Key",
+                unit: "",
+                group: "Sibyl",
+            },
+            ParamLabel {
+                name: "Scale",
+                unit: "",
+                group: "Sibyl",
+            },
+            ParamLabel {
+                name: "Blend",
+                unit: "",
+                group: "Sibyl",
+            },
+            ParamLabel {
+                name: "Mix",
+                unit: "",
+                group: "Sibyl",
+            },
+            ParamLabel {
+                name: "Out",
+                unit: "",
+                group: "Sibyl",
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Ferric,
+        name: "ferric",
+        instrument: false,
+        prefix: "ferric",
+        params: daw::params::ferric::TABLE,
+        labels: &[
+            ParamLabel {
+                name: "Speed",
+                unit: "",
+                group: "Ferric",
+            },
+            ParamLabel {
+                name: "Division",
+                unit: "",
+                group: "Ferric",
+            },
+            ParamLabel {
+                name: "Pattern",
+                unit: "",
+                group: "Ferric",
+            },
+            ParamLabel {
+                name: "Groove",
+                unit: "",
+                group: "Ferric",
+            },
+            ParamLabel {
+                name: "Drive",
+                unit: "",
+                group: "Ferric",
+            },
+            ParamLabel {
+                name: "Wow",
+                unit: "",
+                group: "Ferric",
+            },
+            ParamLabel {
+                name: "Age",
+                unit: "",
+                group: "Ferric",
+            },
+            ParamLabel {
+                name: "Mix",
+                unit: "",
+                group: "Ferric",
+            },
+            ParamLabel {
+                name: "Out",
+                unit: "",
+                group: "Ferric",
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Umbra,
+        name: "umbra",
+        instrument: false,
+        prefix: "umbra",
+        params: daw::params::umbra::TABLE,
+        labels: &[
+            ParamLabel {
+                name: "Depth",
+                unit: "",
+                group: "Umbra",
+            },
+            ParamLabel {
+                name: "Time",
+                unit: "",
+                group: "Umbra",
+            },
+            ParamLabel {
+                name: "Tone",
+                unit: "",
+                group: "Umbra",
+            },
+            ParamLabel {
+                name: "Duck",
+                unit: "",
+                group: "Umbra",
+            },
+            ParamLabel {
+                name: "Mix",
+                unit: "",
+                group: "Umbra",
+            },
+            ParamLabel {
+                name: "Out",
+                unit: "",
+                group: "Umbra",
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Tone,
+        name: "tone",
+        instrument: false,
+        prefix: "tone",
+        params: daw::params::tone::TABLE,
+        labels: &[
+            ParamLabel {
+                name: "Shape",
+                unit: "",
+                group: "Tone",
+            },
+            ParamLabel {
+                name: "Freq",
+                unit: "",
+                group: "Tone",
+            },
+            ParamLabel {
+                name: "Level",
+                unit: "",
+                group: "Tone",
+            },
+            ParamLabel {
+                name: "Mix",
+                unit: "",
+                group: "Tone",
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Sigil,
+        name: "sigil",
+        instrument: false,
+        prefix: "sigil",
+        params: daw::params::sigil::TABLE,
+        labels: &[
+            ParamLabel {
+                name: "Shape",
+                unit: "",
+                group: "Sigil",
+            },
+            ParamLabel {
+                name: "Freq",
+                unit: "",
+                group: "Sigil",
+            },
+            ParamLabel {
+                name: "Mix",
+                unit: "",
+                group: "Sigil",
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Gauge,
+        name: "gauge",
+        instrument: false,
+        prefix: "gauge",
+        params: daw::params::gauge::TABLE,
+        labels: &[
+            ParamLabel {
+                name: "Window",
+                unit: "",
+                group: "Gauge",
+            },
+            ParamLabel {
+                name: "Hold",
+                unit: "",
+                group: "Gauge",
+            },
+            ParamLabel {
+                name: "Range",
+                unit: "",
+                group: "Gauge",
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Tine,
+        name: "tine",
+        instrument: true,
+        prefix: "tine",
+        params: daw::params::tine::TABLE,
+        labels: &[
+            ParamLabel {
+                name: "Material",
+                unit: "",
+                group: "Tine",
+            },
+            ParamLabel {
+                name: "Strike",
+                unit: "",
+                group: "Tine",
+            },
+            ParamLabel {
+                name: "Place",
+                unit: "",
+                group: "Tine",
+            },
+            ParamLabel {
+                name: "Decay",
+                unit: "",
+                group: "Tine",
+            },
+            ParamLabel {
+                name: "Body",
+                unit: "",
+                group: "Tine",
+            },
+            ParamLabel {
+                name: "Tone",
+                unit: "",
+                group: "Tine",
+            },
+            ParamLabel {
+                name: "Spread",
+                unit: "",
+                group: "Tine",
+            },
+            ParamLabel {
+                name: "Tune",
+                unit: "",
+                group: "Tine",
+            },
+            ParamLabel {
+                name: "Level",
+                unit: "",
+                group: "Tine",
             },
         ],
     },

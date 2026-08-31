@@ -201,7 +201,7 @@ fn clamp_or_default(id: u32, value: f32) -> f32 {
 }
 
 fn db_to_gain(db: f32) -> f32 {
-    10f32.powf(db / 20.0)
+    crate::dsp::arith::db_to_gain(db)
 }
 
 /// The device's state, boxed by the node so `Node` stays lean.
@@ -410,17 +410,9 @@ impl UtilityCore {
             // extreme attenuates only the side it is moving away from.
             // The same law in both places, because a pan knob on a track
             // header and a pan cell on this card have to mean the same
-            // thing.
-            let left_gain = if pan <= 0.0 {
-                1.0
-            } else {
-                (pan * std::f32::consts::FRAC_PI_2).cos()
-            };
-            let right_gain = if pan >= 0.0 {
-                1.0
-            } else {
-                (-pan * std::f32::consts::FRAC_PI_2).cos()
-            };
+            // thing — which is now a shared kernel rather than two
+            // copies and a comment asking them to agree.
+            let (left_gain, right_gain) = crate::dsp::pan::balance(pan);
 
             if let Some(slot) = l.get_mut(i) {
                 *slot = a * left_gain * gain;

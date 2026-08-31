@@ -35,8 +35,6 @@ use crate::dsp::{LANES, LaneFrame};
 /// Kaiser transition (≈ 8 kHz at 96 k) puts the stopband where content
 /// would fold below ~20 kHz.
 const HB_LEN: usize = 71;
-/// The FIR history rings: next power of two above HB_LEN.
-const RING: usize = 128;
 /// Kaiser beta: ~90 dB stopband.
 const KAISER_BETA: f64 = 9.0;
 
@@ -63,9 +61,16 @@ pub enum Mode {
 /// `sin` can return 1.0000001 and `asin` of that is NaN.
 #[inline(always)]
 fn triangle_fold(x: f32) -> f32 {
-    use core::f32::consts::PI;
-    let s = (x * PI * 0.5).sin().clamp(-1.0, 1.0);
-    (2.0 / PI) * s.asin()
+    // `(2/π)·asin(sin(πx/2))` is the textbook way to write this, and it
+    // is the same curve — but `asin` has an infinite derivative at ±1,
+    // which is EXACTLY where a folder spends its time. Measured against
+    // an f64 reference, that form carried 1.5e-4 of error through the
+    // unit range: a −76 dB noise floor on the one shape whose whole
+    // point is the fold peaks. This is the same triangle in closed
+    // form, exact to 9e-8, and it drops a sin and an asin per sample.
+    let m = (x + 1.0) * 0.25;
+    let t = (m - m.floor()) * 4.0;
+    1.0 - (t - 2.0).abs()
 }
 
 /// The waveshaper: five nonlinearities behind one face.
@@ -134,6 +139,18 @@ impl Waveshaper {
         if !x.is_finite() {
             return 0.0;
         }
+        // Exact bypasses return the input before doing ANY arithmetic.
+        // In particular, the closed-form triangle is mathematically x
+        // inside the rails at drive one, but its rearranged operations can
+        // still move x by an ulp.
+        if self.mix == 0.0
+            || (self.mode == Mode::Fold
+                && self.drive == DRIVE_MIN
+                && self.bias == 0.0
+                && (-1.0..=1.0).contains(&x))
+        {
+            return x;
+        }
         let wet = match self.mode {
             Mode::Crush => {
                 let steps = (CRUSH_STEPS / self.drive).round().max(2.0);
@@ -188,25 +205,104 @@ fn bessel_i0(x: f64) -> f64 {
     sum
 }
 
+/// Non-zero taps in the halfband: the centre plus every even index.
+/// A halfband's odd-offset taps are EXACTLY zero — `sin(πn/2)` vanishes
+/// at every even `n` — which is what makes the polyphase form free.
+const HALF_LEN: usize = HB_LEN.div_ceil(2);
+/// History ring for an arm that runs the 36-tap sum. Power of two ≥
+/// HALF_LEN; stored doubled so any window is a flat ascending slice.
+const PHASE_RING: usize = 64;
+/// History ring for the arm that is a pure delay — it only ever reads
+/// `CENTRE_BACK + 1` back, so it does not need the big ring.
+const DELAY_RING: usize = 32;
+/// The centre tap sits at an odd offset from itself-as-origin, so its
+/// arm reads the input this many samples back at the ORIGINAL rate:
+/// (C − 1) / 2, where C = (HB_LEN − 1) / 2 is the centre index.
+const CENTRE_BACK: usize = ((HB_LEN - 1) / 2 - 1) / 2;
+
+/// Green zone: build the Kaiser-windowed halfband (sinc at a quarter of
+/// the doubled rate) and split it into the two arms the polyphase form
+/// runs. Computed in f64 and normalised so DC through the whole round
+/// trip is exactly unity. One window in this file, shared by the scalar
+/// and lane kernels — there is no second Kaiser anywhere.
+fn halfband_arms() -> ([f32; HALF_LEN], f32) {
+    let h = halfband_taps();
+    let mut even = [0.0f32; HALF_LEN];
+    for (j, dst) in even.iter_mut().enumerate() {
+        // Reversed, so tap j pairs with the j-th OLDEST sample of the
+        // window and both walk upward together.
+        if let Some(src) = h.get(2 * (HALF_LEN - 1 - j)) {
+            *dst = *src as f32;
+        }
+    }
+    let centre = h.get((HB_LEN - 1) / 2).map(|t| *t as f32).unwrap_or(0.0);
+    (even, centre)
+}
+
+/// The full 71-tap halfband, normalised to unit DC gain. The polyphase
+/// arms are a VIEW of this, and `the_halfband_odd_taps_are_zero` is what
+/// entitles them to be: change the window, the length, or the sinc and
+/// that test is the thing that notices the split has stopped being
+/// lossless.
+fn halfband_taps() -> [f64; HB_LEN] {
+    let c = (HB_LEN - 1) as f64 / 2.0;
+    let denom = bessel_i0(KAISER_BETA);
+    let mut sum = 0.0f64;
+    let mut h = [0.0f64; HB_LEN];
+    for (i, tap) in h.iter_mut().enumerate() {
+        let n = i as f64 - c;
+        let sinc = if n == 0.0 {
+            0.5
+        } else {
+            (core::f64::consts::PI * n * 0.5).sin() / (core::f64::consts::PI * n)
+        };
+        let r = 2.0 * (i as f64) / (HB_LEN - 1) as f64 - 1.0;
+        let win = bessel_i0(KAISER_BETA * (1.0 - r * r).max(0.0).sqrt()) / denom;
+        *tap = sinc * win;
+        sum += *tap;
+    }
+    for tap in h.iter_mut() {
+        *tap /= sum;
+    }
+    h
+}
+
 /// 2× oversampler: linear-phase halfband up/down, caller scratch for the
 /// doubled-rate signal, honest latency.
 ///
-/// State: two 128-float history rings plus 71 coefficients (~1.3 KB).
-/// Per-sample cost, MEASURED: the full wrap around a hard clip is
-/// 152 ns/sample (~0.7% of a core at 48 k) — three 71-tap convolutions
-/// with the halfband zeros convolved for simplicity. The polyphase
-/// halving is the named, profiling-triggered upgrade, per the
-/// contract's optimise-after-measuring rule. Alias improvement at full
-/// drive, measured: worst image -27.2 dB naive, -43.6 dB wrapped.
+/// # Why this costs a third of what it looks like
+///
+/// Of the 71 taps only 37 do anything: the centre, and every even index.
+/// Convolving the zeros anyway was this kernel's documented shortcut,
+/// and this is it paid off. Each arm keeps its own history at the
+/// ORIGINAL rate, so `up` writes one filtered slot (36 taps) and one
+/// DELAYED slot (the lone odd tap — a single multiply) instead of two
+/// 71-tap sweeps, and `down` computes only the phase it keeps. 213
+/// multiply-adds per input sample became 74, and each history is read as
+/// a flat ascending slice instead of through a masked ring, so what
+/// remains vectorises.
+///
+/// It is the same sum with its zero terms dropped: the alias figures
+/// below are the ones the tests still pin.
+///
+/// State: two 64-slot histories, one 32-slot delay, 36 coefficients
+/// (~1.4 KB). Per-sample cost, MEASURED in RELEASE (the profile the
+/// engine ships; `report_cost_per_sample` under `cargo test` alone runs
+/// at `opt-level = 1` and reads about three times slower) on the full
+/// wrap around a hard clip: 151 ns/sample convolving the zeros, 36 now.
+/// Alias improvement at full drive, measured: worst image −27.2 dB
+/// naive, −43.6 dB wrapped.
 /// Denormal-safe: FIR state decays through FTZ on silence.
 /// In-place safe: n/a — up and down have distinct in/out slices.
 /// Latency: [`Self::latency`] samples at the ORIGINAL rate (linear
 /// phase: the two filter group delays sum to exactly the centre tap).
 #[derive(Debug, Clone, Copy)]
 pub struct Oversampler2x {
-    coeffs: [f32; HB_LEN],
-    up_hist: [f32; RING],
-    down_hist: [f32; RING],
+    even: [f32; HALF_LEN],
+    centre: f32,
+    up_hist: [f32; PHASE_RING * 2],
+    down_a: [f32; PHASE_RING * 2],
+    down_b: [f32; DELAY_RING * 2],
     up_pos: usize,
     down_pos: usize,
 }
@@ -220,9 +316,11 @@ impl Default for Oversampler2x {
 impl Oversampler2x {
     pub fn new() -> Self {
         let mut o = Self {
-            coeffs: [0.0; HB_LEN],
-            up_hist: [0.0; RING],
-            down_hist: [0.0; RING],
+            even: [0.0; HALF_LEN],
+            centre: 0.0,
+            up_hist: [0.0; PHASE_RING * 2],
+            down_a: [0.0; PHASE_RING * 2],
+            down_b: [0.0; DELAY_RING * 2],
             up_pos: 0,
             down_pos: 0,
         };
@@ -235,36 +333,19 @@ impl Oversampler2x {
         block * 2
     }
 
-    /// Green zone: build the halfband (Kaiser-windowed sinc at a quarter
-    /// of the doubled rate), normalised in f64 so DC through the whole
-    /// round trip is exactly unity.
+    /// Green zone: build the halfband arms.
     pub fn prepare(&mut self) {
-        let c = (HB_LEN - 1) as f64 / 2.0;
-        let denom = bessel_i0(KAISER_BETA);
-        let mut sum = 0.0f64;
-        let mut h = [0.0f64; HB_LEN];
-        for (i, tap) in h.iter_mut().enumerate() {
-            let n = i as f64 - c;
-            let sinc = if n == 0.0 {
-                0.5
-            } else {
-                (core::f64::consts::PI * n * 0.5).sin() / (core::f64::consts::PI * n)
-            };
-            let r = 2.0 * (i as f64) / (HB_LEN - 1) as f64 - 1.0;
-            let win = bessel_i0(KAISER_BETA * (1.0 - r * r).max(0.0).sqrt()) / denom;
-            *tap = sinc * win;
-            sum += *tap;
-        }
-        for (dst, src) in self.coeffs.iter_mut().zip(h.iter()) {
-            *dst = (*src / sum) as f32;
-        }
+        let (even, centre) = halfband_arms();
+        self.even = even;
+        self.centre = centre;
         self.reset();
     }
 
     /// Green zone: forget the signal history.
     pub fn reset(&mut self) {
-        self.up_hist = [0.0; RING];
-        self.down_hist = [0.0; RING];
+        self.up_hist = [0.0; PHASE_RING * 2];
+        self.down_a = [0.0; PHASE_RING * 2];
+        self.down_b = [0.0; DELAY_RING * 2];
         self.up_pos = 0;
         self.down_pos = 0;
     }
@@ -274,13 +355,36 @@ impl Oversampler2x {
         (HB_LEN - 1) / 2
     }
 
+    /// Write one sample into a doubled ring, so both copies stay valid.
     #[inline(always)]
-    fn fir(hist: &[f32; RING], pos: usize, coeffs: &[f32; HB_LEN]) -> f32 {
+    fn push(hist: &mut [f32], pos: usize, ring: usize, v: f32) {
+        if let Some(s) = hist.get_mut(pos) {
+            *s = v;
+        }
+        if let Some(s) = hist.get_mut(pos + ring) {
+            *s = v;
+        }
+    }
+
+    /// The 36-tap arm over a flat, ascending window. `pos` is the slot
+    /// the newest sample went to; the doubling makes `base..base+36`
+    /// contiguous for every `pos`, so this is a plain zipped MAC.
+    #[inline(always)]
+    fn arm(hist: &[f32], pos: usize, even: &[f32; HALF_LEN]) -> f32 {
+        let base = pos + PHASE_RING + 1 - HALF_LEN;
         let mut acc = 0.0f32;
-        for (k, c) in coeffs.iter().enumerate() {
-            acc += c * hist[pos.wrapping_sub(k) & (RING - 1)];
+        if let Some(win) = hist.get(base..base + HALF_LEN) {
+            for (c, h) in even.iter().zip(win.iter()) {
+                acc += c * h;
+            }
         }
         acc
+    }
+
+    /// The delay arm: one sample, `back` behind the newest.
+    #[inline(always)]
+    fn tapped(hist: &[f32], pos: usize, ring: usize, back: usize) -> f32 {
+        hist.get(pos + ring - back).copied().unwrap_or(0.0)
     }
 
     /// Red zone: upsample `input` into `out2x`, which must be exactly
@@ -291,12 +395,14 @@ impl Oversampler2x {
             return;
         }
         for (x, pair) in input.iter().zip(out2x.as_chunks_mut::<2>().0) {
-            // Zero-stuff, filter, ×2 to preserve amplitude.
-            for (slot, sample) in pair.iter_mut().zip([*x, 0.0]) {
-                self.up_pos = self.up_pos.wrapping_add(1);
-                self.up_hist[self.up_pos & (RING - 1)] = sample;
-                *slot = 2.0 * Self::fir(&self.up_hist, self.up_pos, &self.coeffs);
-            }
+            self.up_pos = (self.up_pos + 1) & (PHASE_RING - 1);
+            Self::push(&mut self.up_hist, self.up_pos, PHASE_RING, *x);
+            // ×2 to preserve amplitude across the zero-stuff, exactly as
+            // the naive form did.
+            pair[0] = 2.0 * Self::arm(&self.up_hist, self.up_pos, &self.even);
+            pair[1] = 2.0
+                * self.centre
+                * Self::tapped(&self.up_hist, self.up_pos, PHASE_RING, CENTRE_BACK);
         }
     }
 
@@ -308,17 +414,21 @@ impl Oversampler2x {
     /// is an even number of 2× slots, so the kept phase must be the even
     /// one: sampling the odd phase reads every peak half a sample off
     /// (an impulse came back at 0.63 instead of ~0.95, which is how the
-    /// impulse test caught it).
+    /// impulse test caught it). In this form that shows up as the two
+    /// arms taking the two slots: the even arm gets slot 0, and slot 1
+    /// reaches the output only through the centre tap.
     pub fn down(&mut self, in2x: &[f32], out: &mut [f32]) {
         if in2x.len() != out.len() * 2 {
             return;
         }
         for (pair, y) in in2x.as_chunks::<2>().0.iter().zip(out.iter_mut()) {
             self.down_pos = self.down_pos.wrapping_add(1);
-            self.down_hist[self.down_pos & (RING - 1)] = pair[0];
-            *y = Self::fir(&self.down_hist, self.down_pos, &self.coeffs);
-            self.down_pos = self.down_pos.wrapping_add(1);
-            self.down_hist[self.down_pos & (RING - 1)] = pair[1];
+            let a = self.down_pos & (PHASE_RING - 1);
+            let b = self.down_pos & (DELAY_RING - 1);
+            Self::push(&mut self.down_a, a, PHASE_RING, pair[0]);
+            Self::push(&mut self.down_b, b, DELAY_RING, pair[1]);
+            *y = Self::arm(&self.down_a, a, &self.even)
+                + self.centre * Self::tapped(&self.down_b, b, DELAY_RING, CENTRE_BACK + 1);
         }
     }
 }
@@ -344,26 +454,34 @@ impl Waveshaper {
 
 /// [`Oversampler2x`] for a whole voice group.
 ///
-/// The halfband taps are shared — one patch, one filter — and the two
-/// delay rings are per lane, stored RING-SLOT MAJOR (`[[f32; LANES];
-/// RING]`) so one tap of the FIR reads every lane's history from one
-/// contiguous, register-shaped slot. Stored the other way round, each of
-/// the 71 taps would stride across [`LANES`] separate histories.
+/// Same polyphase split as the scalar kernel, and the same reason: the
+/// halfband's odd taps are zero, so one arm is a 36-tap sum and the
+/// other is a single multiply on a delayed sample.
 ///
-/// State: 2 × RING × [`LANES`] floats + the taps.
-/// Per-sample-per-lane cost: the scalar's — HB_LEN multiply-adds per 2x
-/// slot, twice up and once down.
+/// The taps are shared — one patch, one filter — and each history is
+/// stored SLOT-MAJOR (`[[f32; LANES]; _]`) so one tap reads every lane's
+/// history from one contiguous, register-shaped slot. Stored the other
+/// way round, each tap would stride across [`LANES`] separate histories.
+/// The doubled ring keeps the window flat here too, so the inner loop is
+/// a straight walk over slots with no masking in it.
+///
+/// State: (2 × PHASE_RING + DELAY_RING) × 2 × [`LANES`] floats plus the
+/// arms.
+/// Per-sample-per-lane cost: the scalar's — 36 multiply-adds plus one
+/// multiply per arm, rather than HB_LEN per 2× slot.
 /// Denormal-safe: an FIR cannot recirculate, so a decayed tail leaves the
-/// ring after RING samples rather than lingering.
+/// ring after PHASE_RING samples rather than lingering.
 /// In-place safe: no — `up` and `down` read one buffer and write another.
 /// Latency: [`Self::latency`] samples, the same as the scalar kernel's,
 /// and the constant-latency rule applies — a node reporting this feeds
 /// plugin delay compensation.
 #[derive(Debug, Clone, Copy)]
 pub struct LaneOversampler2x {
-    coeffs: [f32; HB_LEN],
-    up_hist: [[f32; LANES]; RING],
-    down_hist: [[f32; LANES]; RING],
+    even: [f32; HALF_LEN],
+    centre: f32,
+    up_hist: [[f32; LANES]; PHASE_RING * 2],
+    down_a: [[f32; LANES]; PHASE_RING * 2],
+    down_b: [[f32; LANES]; DELAY_RING * 2],
     up_pos: usize,
     down_pos: usize,
 }
@@ -377,9 +495,11 @@ impl Default for LaneOversampler2x {
 impl LaneOversampler2x {
     pub fn new() -> Self {
         let mut o = Self {
-            coeffs: [0.0; HB_LEN],
-            up_hist: [[0.0; LANES]; RING],
-            down_hist: [[0.0; LANES]; RING],
+            even: [0.0; HALF_LEN],
+            centre: 0.0,
+            up_hist: [[0.0; LANES]; PHASE_RING * 2],
+            down_a: [[0.0; LANES]; PHASE_RING * 2],
+            down_b: [[0.0; LANES]; DELAY_RING * 2],
             up_pos: 0,
             down_pos: 0,
         };
@@ -392,23 +512,31 @@ impl LaneOversampler2x {
         block * 2
     }
 
-    /// Green zone: take the halfband from a prepared SCALAR oversampler,
-    /// so there is one Kaiser window in this file and not two.
+    /// Green zone: take the halfband from the one builder in this file,
+    /// so there is one Kaiser window here and not two.
     pub fn prepare(&mut self) {
-        let o = Oversampler2x::new();
-        self.coeffs = o.coeffs;
+        let (even, centre) = halfband_arms();
+        self.even = even;
+        self.centre = centre;
+        self.reset();
     }
 
     pub fn reset(&mut self) {
-        self.up_hist = [[0.0; LANES]; RING];
-        self.down_hist = [[0.0; LANES]; RING];
+        self.up_hist = [[0.0; LANES]; PHASE_RING * 2];
+        self.down_a = [[0.0; LANES]; PHASE_RING * 2];
+        self.down_b = [[0.0; LANES]; DELAY_RING * 2];
         self.up_pos = 0;
         self.down_pos = 0;
     }
 
-    /// Green zone: clear ONE lane's history through both rings.
+    /// Green zone: clear ONE lane's history through every ring.
     pub fn reset_lane(&mut self, lane: usize) {
-        for slot in self.up_hist.iter_mut().chain(self.down_hist.iter_mut()) {
+        for slot in self
+            .up_hist
+            .iter_mut()
+            .chain(self.down_a.iter_mut())
+            .chain(self.down_b.iter_mut())
+        {
             if let Some(v) = slot.get_mut(lane) {
                 *v = 0.0;
             }
@@ -418,20 +546,38 @@ impl LaneOversampler2x {
     /// The round trip's group delay, in input samples. Identical to the
     /// scalar kernel's, because the taps are identical.
     pub fn latency(&self) -> usize {
-        Oversampler2x::new().latency()
+        (HB_LEN - 1) / 2
     }
 
-    /// One FIR tap sweep across every lane.
     #[inline(always)]
-    fn fir(hist: &[[f32; LANES]; RING], pos: usize, coeffs: &[f32; HB_LEN]) -> [f32; LANES] {
+    fn push(hist: &mut [[f32; LANES]], pos: usize, ring: usize, v: &[f32; LANES]) {
+        if let Some(s) = hist.get_mut(pos) {
+            *s = *v;
+        }
+        if let Some(s) = hist.get_mut(pos + ring) {
+            *s = *v;
+        }
+    }
+
+    /// The 36-tap arm, swept across every lane at once.
+    #[inline(always)]
+    fn arm(hist: &[[f32; LANES]], pos: usize, even: &[f32; HALF_LEN]) -> [f32; LANES] {
+        let base = pos + PHASE_RING + 1 - HALF_LEN;
         let mut acc = [0.0f32; LANES];
-        for (k, c) in coeffs.iter().enumerate() {
-            let slot = &hist[pos.wrapping_sub(k) & (RING - 1)];
-            for (a, h) in acc.iter_mut().zip(slot.iter()) {
-                *a += c * *h;
+        if let Some(win) = hist.get(base..base + HALF_LEN) {
+            for (c, slot) in even.iter().zip(win.iter()) {
+                for (a, h) in acc.iter_mut().zip(slot.iter()) {
+                    *a += c * *h;
+                }
             }
         }
         acc
+    }
+
+    /// The delay arm: one slot, `back` behind the newest.
+    #[inline(always)]
+    fn tapped(hist: &[[f32; LANES]], pos: usize, ring: usize, back: usize) -> [f32; LANES] {
+        hist.get(pos + ring - back).copied().unwrap_or([0.0; LANES])
     }
 
     /// Red zone: upsample `input` into `out2x`, which must be exactly
@@ -441,16 +587,16 @@ impl LaneOversampler2x {
             return;
         }
         for (x, pair) in input.iter().zip(out2x.as_chunks_mut::<2>().0) {
-            // Zero-stuff, filter, x2 to preserve amplitude — the scalar
-            // kernel's sequence, one frame at a time.
-            let zero = [0.0f32; LANES];
-            for (slot, sample) in pair.iter_mut().zip([*x, zero]) {
-                self.up_pos = self.up_pos.wrapping_add(1);
-                self.up_hist[self.up_pos & (RING - 1)] = sample;
-                let filtered = Self::fir(&self.up_hist, self.up_pos, &self.coeffs);
-                for (o, f) in slot.iter_mut().zip(filtered.iter()) {
-                    *o = 2.0 * *f;
-                }
+            self.up_pos = (self.up_pos + 1) & (PHASE_RING - 1);
+            Self::push(&mut self.up_hist, self.up_pos, PHASE_RING, x);
+            // ×2 to preserve amplitude across the zero-stuff.
+            let filtered = Self::arm(&self.up_hist, self.up_pos, &self.even);
+            let delayed = Self::tapped(&self.up_hist, self.up_pos, PHASE_RING, CENTRE_BACK);
+            for (o, f) in pair[0].iter_mut().zip(filtered.iter()) {
+                *o = 2.0 * *f;
+            }
+            for (o, d) in pair[1].iter_mut().zip(delayed.iter()) {
+                *o = 2.0 * self.centre * *d;
             }
         }
     }
@@ -468,10 +614,15 @@ impl LaneOversampler2x {
         }
         for (pair, y) in in2x.as_chunks::<2>().0.iter().zip(out.iter_mut()) {
             self.down_pos = self.down_pos.wrapping_add(1);
-            self.down_hist[self.down_pos & (RING - 1)] = pair[0];
-            *y = Self::fir(&self.down_hist, self.down_pos, &self.coeffs);
-            self.down_pos = self.down_pos.wrapping_add(1);
-            self.down_hist[self.down_pos & (RING - 1)] = pair[1];
+            let a = self.down_pos & (PHASE_RING - 1);
+            let b = self.down_pos & (DELAY_RING - 1);
+            Self::push(&mut self.down_a, a, PHASE_RING, &pair[0]);
+            Self::push(&mut self.down_b, b, DELAY_RING, &pair[1]);
+            let filtered = Self::arm(&self.down_a, a, &self.even);
+            let delayed = Self::tapped(&self.down_b, b, DELAY_RING, CENTRE_BACK + 1);
+            for ((o, f), d) in y.iter_mut().zip(filtered.iter()).zip(delayed.iter()) {
+                *o = *f + self.centre * *d;
+            }
         }
     }
 }
@@ -773,9 +924,134 @@ mod tests {
         );
     }
 
+    /// The polyphase split is lossless ONLY because a halfband's
+    /// odd-offset taps vanish — `sin(πn/2)` is zero at every even `n`.
+    /// `up` and `down` now read 37 numbers and assume the other 34 are
+    /// nothing. Nothing else in this file checks that assumption, so a
+    /// change to `HB_LEN`, `KAISER_BETA`, or the sinc could quietly turn
+    /// the arms into a different filter than the one they document,
+    /// while every transparency test still passed on the arms' own terms.
+    #[test]
+    fn the_halfband_odd_taps_are_zero_and_the_arms_are_the_rest() {
+        let h = halfband_taps();
+        let centre = (HB_LEN - 1) / 2;
+        assert_eq!(centre % 2, 1, "centre index parity is what splits the arms");
+
+        // Every odd index except the centre must be exactly negligible.
+        let worst = h
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != centre && i % 2 == 1)
+            .map(|(_, t)| t.abs())
+            .fold(0.0f64, f64::max);
+        assert!(
+            worst < 1e-12,
+            "an odd tap is carrying signal ({worst:e}); the polyphase arms drop it on the floor"
+        );
+
+        // Unit DC through the whole filter, and the two arms split it.
+        let total: f64 = h.iter().sum();
+        assert!((total - 1.0).abs() < 1e-12, "halfband DC gain is {total}");
+
+        let (even, ct) = halfband_arms();
+        let arm_dc: f64 = even.iter().map(|c| *c as f64).sum();
+        assert!(
+            (arm_dc + ct as f64 - 1.0).abs() < 1e-6,
+            "the arms must add back up to the filter: {arm_dc} + {ct}"
+        );
+
+        // The arms really are the even taps (reversed) and the centre.
+        for (j, c) in even.iter().enumerate() {
+            let want = h[2 * (HALF_LEN - 1 - j)] as f32;
+            assert_eq!(
+                *c,
+                want,
+                "even arm tap {j} is not halfband tap {}",
+                2 * (HALF_LEN - 1 - j)
+            );
+        }
+        assert_eq!(ct, h[centre] as f32, "delay arm is not the centre tap");
+    }
+
+    /// The fold is a triangle wave, and it has to BE one to the float.
+    ///
+    /// This is the reference-correctness test the contract asks for, and
+    /// it exists because the obvious spelling of this curve —
+    /// `(2/π)·asin(sin(πx/2))` — passes every other test in this file
+    /// while carrying 1.5e-4 of error, a −76 dB floor parked on the fold
+    /// peaks where `asin` goes vertical. Nothing else here looks at the
+    /// curve closely enough to notice, so this does.
+    #[test]
+    fn the_fold_is_a_triangle_to_within_a_float() {
+        fn reference(x: f64) -> f64 {
+            let m = (x + 1.0) * 0.25;
+            let t = (m - m.floor()) * 4.0;
+            1.0 - (t - 2.0).abs()
+        }
+        for &(lo, hi, tol, name) in &[
+            (-1.0f64, 1.0f64, 1e-6f64, "unit range"),
+            (0.98, 1.02, 1e-6, "across a peak"),
+            (-DRIVE_MAX as f64, DRIVE_MAX as f64, 1e-5, "full drive"),
+        ] {
+            let n = 100_000;
+            let worst = (0..=n)
+                .map(|i| {
+                    let x = lo + (hi - lo) * i as f64 / n as f64;
+                    (triangle_fold(x as f32) as f64 - reference(x)).abs()
+                })
+                .fold(0.0f64, f64::max);
+            assert!(
+                worst < tol,
+                "fold drifts from a triangle by {worst:e} over the {name}"
+            );
+        }
+
+        // The peaks are the point: they must be reached exactly.
+        for k in [-3.0f32, 1.0, 5.0] {
+            assert_eq!(triangle_fold(k), 1.0, "fold must reach +1 at x={k}");
+        }
+        for k in [-1.0f32, 3.0, 7.0] {
+            assert_eq!(triangle_fold(k), -1.0, "fold must reach -1 at x={k}");
+        }
+        // ...and it stays a bounded, odd, period-4 triangle.
+        for i in -400..=400 {
+            let x = i as f32 * 0.037;
+            let y = triangle_fold(x);
+            assert!((-1.0..=1.0).contains(&y), "fold left the rails at {x}");
+            assert!(
+                (triangle_fold(-x) + y).abs() < 1e-6,
+                "fold must stay odd at {x}"
+            );
+            assert!(
+                (triangle_fold(x + 4.0) - y).abs() < 1e-5,
+                "fold must stay period-4 at {x}"
+            );
+        }
+    }
+
+    /// The bottom of a colour control is an exact bypass, not a curve
+    /// that happens to land very close to the input.
+    #[test]
+    fn fold_drive_one_is_bit_exact_inside_the_rails() {
+        let mut shaper = Waveshaper::new();
+        shaper.configure(Mode::Fold, 1.0, 0.0, 1.0);
+        for i in 0..=2_000 {
+            let x = i as f32 / 1_000.0 - 1.0;
+            assert_eq!(shaper.shape(x).to_bits(), x.to_bits(), "x = {x}");
+        }
+    }
+
     // ---------------------------------------------------------------- cost ---
 
     /// What a sample costs. Printed, not asserted.
+    ///
+    /// Run it in RELEASE to get the numbers the docs quote — the engine
+    /// ships at `opt-level = 3` with fat LTO, while plain `cargo test`
+    /// builds this crate at `opt-level = 1` and reads roughly three
+    /// times slower. Comparing a change across two runs also needs a
+    /// CONTROL row that the change does not touch: a build leaves the
+    /// machine hot enough to move every figure here by 2x, which is
+    /// exactly how a pessimisation can read as a win.
     #[test]
     fn report_cost_per_sample() {
         use std::time::Instant;

@@ -76,6 +76,8 @@ pub mod legibility;
 pub mod palette;
 pub mod panels;
 pub mod prefs;
+/// The new application frame, built independently from the legacy panels.
+pub mod redesign;
 /// The replacement Session surface. Registered now that `session_bridge`
 /// exists to adapt it — before the adapters, this would have been a
 /// second authority for what plays.
@@ -408,6 +410,7 @@ mod tests {
             "synth.rs",   // a card: its size is the sum of what it holds
             "reverb.rs",
             "poly.rs",
+            "loom.rs", // a card: its size is the sum of what it holds
             "sat.rs",
             "echo.rs",
             "eq.rs",
@@ -416,6 +419,14 @@ mod tests {
             "kick.rs",      // ditto
             "haze.rs",      // a card: its size is the widest of its four pages
             "clamp.rs",     // a card: its size is the sum of what it holds
+            "flint.rs",     // ditto
+            "sibyl.rs",     // ditto
+            "ferric.rs",    // ditto
+            "umbra.rs",     // ditto
+            "tone.rs",      // ditto
+            "sigil.rs",     // ditto
+            "tine.rs",      // ditto
+            "gauge.rs",     // ditto
             "prism.rs",     // a card: its size is the sum of what it holds
             "limiter.rs",   // ditto
             "lofi.rs",      // ditto
@@ -454,6 +465,52 @@ mod tests {
             missing.is_empty(),
             "size contract violations:\n{}",
             missing.join("\n")
+        );
+    }
+
+    /// EVERY DEVICE CARD IS THE SAME HEIGHT.
+    ///
+    /// A rack is a column of cards, and one that is shorter than its
+    /// neighbours reads as broken rather than as compact. The rule is
+    /// easy to keep and easy to lose: `card::card` defaults to the SHORT
+    /// body, so a card written the obvious way comes out a third short —
+    /// which is exactly how `synth.rs` ended up that way and stayed
+    /// there.
+    ///
+    /// So the height is not a matter of taste per card: every module
+    /// that draws one passes `DEVICE_TALL_H`, and this counts them.
+    #[test]
+    fn every_device_card_is_the_same_height() {
+        // Containers and the card kit itself size themselves to what
+        // they hold, and are the only modules allowed a say.
+        const NOT_A_CARD: &[&str] = &["card.rs", "rack.rs", "probe.rs"];
+        let mut wrong: Vec<String> = Vec::new();
+        for path in module_files("device") {
+            let file = path.file_name().unwrap().to_string_lossy().to_string();
+            if NOT_A_CARD.contains(&file.as_str()) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            // The short helper, which defaults to `DEVICE_H`.
+            for call in ["card::card(", "card::tabbed_card("] {
+                if text.contains(call) {
+                    wrong.push(format!(
+                        "device/{file}: uses `{call}`, which defaults to the SHORT body — \
+                         pass DEVICE_TALL_H through `card_sized` instead"
+                    ));
+                }
+            }
+            // And any sized call must ask for the tall one.
+            for (i, line) in text.lines().enumerate() {
+                if line.contains("card_sized(") && line.contains("control::DEVICE_H") {
+                    wrong.push(format!("device/{file}:{}: draws a card at DEVICE_H", i + 1));
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "cards at more than one height:\n{}",
+            wrong.join("\n")
         );
     }
 

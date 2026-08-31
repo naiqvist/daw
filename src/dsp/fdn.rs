@@ -843,4 +843,48 @@ mod tests {
         assert!(difference > 1.0, "modulation did nothing: {difference}");
         assert!(moving.iter().all(|s| s.is_finite()));
     }
+
+    /// What a sample costs, in nanoseconds. Printed, not asserted: a
+    /// timing threshold fails on a loaded box and tells you nothing.
+    ///
+    /// Run in RELEASE for the figures the header quotes — plain `cargo
+    /// test` builds this crate at `opt-level = 1` and reads several
+    /// times slower — and when comparing a change across two runs, keep
+    /// a CONTROL row the change cannot touch: a preceding build leaves
+    /// the machine hot enough to move every number here by 2x.
+    #[test]
+    fn report_cost_per_sample() {
+        use std::time::Instant;
+        const BLOCK: usize = 256;
+        const REPS: usize = 8_000;
+        let row = |name: &str, run: &mut dyn FnMut()| {
+            for _ in 0..500 {
+                run();
+            }
+            let t = Instant::now();
+            for _ in 0..REPS {
+                run();
+            }
+            let ns = t.elapsed().as_nanos() as f64 / (REPS * BLOCK) as f64;
+            println!(
+                "{name:<26} {ns:7.2} ns/sample   {:5.3}% of a core at 48k",
+                ns * 48_000.0 * 1e-9 * 100.0
+            );
+        };
+        let sig: Vec<f32> = (0..BLOCK).map(|i| (i as f32 * 0.07).sin() * 0.4).collect();
+
+        let mut bufs = vec![0.0f32; Fdn::buffer_len(FS)];
+        let mut f = Fdn::new();
+        f.prepare(FS, &mut bufs);
+        f.set_size(1.0);
+        f.set_decay(3.0);
+        f.set_damping(6_000.0);
+        f.set_diffusion(0.7);
+        f.set_modulation(2.0);
+        let (mut l, mut r) = (vec![0.0f32; BLOCK], vec![0.0f32; BLOCK]);
+        row("fdn 8 lines, stereo", &mut || {
+            f.process(&sig, &mut l, &mut r, &mut bufs);
+            std::hint::black_box((&mut l, &mut r));
+        });
+    }
 }

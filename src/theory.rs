@@ -196,6 +196,57 @@ impl Scale {
 
 /// Note name of a pitch class, sharps only. Enough for a key readout;
 /// proper spelling (F# vs Gb) needs a key signature, which is a bigger
+/// The interval, in semitones, from a sounding pitch to the note `steps`
+/// SCALE DEGREES away from it in the given key.
+///
+/// This is the device's whole musical claim, and it is a pure function so
+/// it can be tested without an FFT in the room. `source_midi` may be
+/// fractional — a singer is not on the grid — and is snapped to the
+/// nearest degree before counting, because "a third above" is counted
+/// from the note the scale has, not from wherever the voice happened to
+/// land.
+pub fn scale_interval(source_midi: f32, key: i16, scale: Scale, steps: i32) -> f32 {
+    if steps == 0 || !source_midi.is_finite() {
+        return 0.0;
+    }
+    let degrees = scale.degrees();
+    let n = degrees.len() as i32;
+    if n == 0 {
+        return 0.0;
+    }
+    let rounded = source_midi.round() as i16;
+    let pc = (rounded - key).rem_euclid(12);
+    // The degree the source is nearest to, by pitch-class distance.
+    let mut nearest = 0i32;
+    let mut best = i16::MAX;
+    for (i, d) in degrees.iter().enumerate() {
+        let raw = (pc - *d).rem_euclid(12);
+        let distance = raw.min(12 - raw);
+        if distance < best {
+            best = distance;
+            nearest = i as i32;
+        }
+    }
+    let target = nearest + steps;
+    let octave = target.div_euclid(n);
+    let index = target.rem_euclid(n) as usize;
+    let from = degrees.get(nearest as usize).copied().unwrap_or(0);
+    let to = degrees.get(index).copied().unwrap_or(0) + 12 * octave as i16;
+    // The snap has to be part of the answer. Counting degrees from the
+    // note the source is NEAREST gives the interval between two scale
+    // tones — but the source may not be one, and applying that interval
+    // to where the voice actually is lands the harmony off the scale by
+    // however far off it was. An A over C minor snapped to A-flat and
+    // then rose four semitones to C-sharp, which is in no key involved.
+    // Adding the snap back makes the harmony land ON the scale tone,
+    // which is the only thing "harmony in key" can mean.
+    let snap = {
+        let raw = (from - pc).rem_euclid(12);
+        if raw > 6 { raw - 12 } else { raw }
+    };
+    f32::from(snap + to - from)
+}
+
 /// idea than this app has yet.
 pub fn pitch_class_name(pitch: u8) -> &'static str {
     const NAMES: [&str; 12] = [
@@ -1303,5 +1354,112 @@ mod tests {
         assert_eq!(motion((60, 67), (62, 65)), Motion::Contrary);
         assert_eq!(motion((60, 67), (62, 69)), Motion::Similar);
         assert_eq!(motion((60, 67), (60, 69)), Motion::Oblique);
+    }
+
+    // ------------------------------------------------ the musical claim ---
+
+    /// THE CLAIM: a harmony measured in scale steps is a DIFFERENT
+    /// number of semitones depending on where in the key it starts.
+    ///
+    /// This is the whole reason the device counts degrees instead of
+    /// semitones, and it is a pure function, so it is tested exactly
+    /// rather than by ear. In C major a third above C is four semitones
+    /// and a third above D is three — a harmoniser that shifts by a
+    /// fixed +4 is wrong on the second note, which is the failure people
+    /// mean when they say harmonisers sound cheap.
+    #[test]
+    fn a_third_is_not_always_the_same_number_of_semitones() {
+        let major = Scale::Major;
+        // C major, thirds up: C-E is 4, D-F is 3, E-G is 3, F-A is 4.
+        for (note, want) in [(60.0f32, 4.0f32), (62.0, 3.0), (64.0, 3.0), (65.0, 4.0)] {
+            let got = scale_interval(note, 0, major, 2);
+            assert_eq!(got, want, "a third above MIDI {note} in C major");
+        }
+        // ...and it wraps the octave correctly: B up a third is D.
+        assert_eq!(scale_interval(71.0, 0, major, 2), 3.0, "B to D");
+        // Fifths.
+        assert_eq!(scale_interval(60.0, 0, major, 4), 7.0, "C to G");
+        assert_eq!(scale_interval(62.0, 0, major, 4), 7.0, "D to A");
+        // Downward, through the octave below.
+        assert_eq!(scale_interval(60.0, 0, major, -2), -3.0, "C down to A");
+        // A minor key gives a MINOR third off the tonic.
+        assert_eq!(
+            scale_interval(60.0, 0, Scale::NaturalMinor, 2),
+            3.0,
+            "C to Eb in C minor"
+        );
+        // Zero steps is unison, and never anything else.
+        for note in [60.0f32, 61.5, 70.0] {
+            assert_eq!(scale_interval(note, 0, major, 0), 0.0);
+        }
+    }
+
+    /// A singer is not on the grid: a note a third of a semitone sharp
+    /// still counts its degrees from the note it is nearest.
+    #[test]
+    fn an_out_of_tune_source_still_counts_from_the_right_degree() {
+        for offset in [-0.4f32, -0.2, 0.0, 0.2, 0.4] {
+            let got = scale_interval(62.0 + offset, 0, Scale::Major, 2);
+            assert_eq!(got, 3.0, "D{offset:+} up a third should be F");
+        }
+    }
+
+    /// Nonsense in, unison out — never a NaN ratio, which would silence
+    /// the device for the rest of the session.
+    #[test]
+    fn scale_interval_survives_nonsense() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(scale_interval(bad, 0, Scale::Major, 2), 0.0);
+        }
+        for steps in [-99i32, 99] {
+            let got = scale_interval(60.0, 0, Scale::Major, steps);
+            assert!(got.is_finite(), "{steps} steps gave {got}");
+        }
+        for key in [-5i16, 0, 11, 40] {
+            assert!(scale_interval(60.0, key, Scale::PentatonicMinor, 3).is_finite());
+        }
+    }
+
+    /// THE PROPERTY: whatever came in, the harmony lands IN THE SCALE.
+    ///
+    /// Counting degrees is only half of it. The source may be a note the
+    /// scale does not contain — a passing tone, a bend, a singer between
+    /// two pitches — and an interval measured between two scale tones,
+    /// applied to a source that is not one, lands off the scale by
+    /// exactly how far off the source was. This walks every semitone
+    /// through every scale and every step and insists the destination is
+    /// a note the key actually has.
+    #[test]
+    fn a_harmony_always_lands_in_the_scale() {
+        for scale in Scale::ALL {
+            for key in 0..12i16 {
+                for source in 48..84i16 {
+                    for steps in [-7i32, -4, -3, -2, -1, 1, 2, 3, 4, 7] {
+                        let interval = scale_interval(f32::from(source), key, scale, steps);
+                        let landed = source + interval as i16;
+                        assert!(
+                            scale.contains(key as u8, landed as u8),
+                            "{scale:?} in key {key}: {source} + {steps} steps \
+                             landed on {landed}, which is not in the scale"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// ...and it goes the way it was asked to go.
+    #[test]
+    fn a_harmony_moves_in_the_direction_it_was_asked_for() {
+        for scale in Scale::ALL {
+            for source in [60.0f32, 61.0, 62.0, 63.5] {
+                for steps in 1..=5i32 {
+                    let up = scale_interval(source, 0, scale, steps);
+                    let down = scale_interval(source, 0, scale, -steps);
+                    assert!(up > 0.0, "{scale:?}: +{steps} gave {up}");
+                    assert!(down < 0.0, "{scale:?}: -{steps} gave {down}");
+                }
+            }
+        }
     }
 }

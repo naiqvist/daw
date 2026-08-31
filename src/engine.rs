@@ -12,6 +12,96 @@
 
 use super::*;
 
+struct AuditionLoadCommand {
+    serial: u64,
+    path: PathBuf,
+    sample_rate: u32,
+}
+
+struct AuditionLoadResult {
+    serial: u64,
+    buffer: Result<daw::audio::AuditionBuffer, String>,
+}
+
+/// Green-zone owner for browser audition decoding. The resident-material
+/// loader is the application's existing decode/resample path; this worker
+/// only gives it a request identity so a superseded cursor can never sound.
+pub(crate) struct AuditionLoader {
+    commands: crossbeam_channel::Sender<AuditionLoadCommand>,
+    results: crossbeam_channel::Receiver<AuditionLoadResult>,
+    next_serial: u64,
+    wanted: Option<u64>,
+}
+
+impl AuditionLoader {
+    pub(crate) fn start() -> Self {
+        let (commands, command_rx) = crossbeam_channel::unbounded::<AuditionLoadCommand>();
+        let (result_tx, results) = crossbeam_channel::unbounded::<AuditionLoadResult>();
+        std::thread::Builder::new()
+            .name("sample-audition".to_owned())
+            .spawn(move || {
+                while let Ok(mut command) = command_rx.recv() {
+                    // A stable cursor is the only request worth decoding.
+                    // Collapse anything that queued while the previous file
+                    // was being read; all of this remains green-zone work.
+                    while let Ok(newer) = command_rx.try_recv() {
+                        command = newer;
+                    }
+                    let buffer = daw::audio::material::load(&command.path, command.sample_rate)
+                        .map(daw::audio::AuditionBuffer::from_material)
+                        .map_err(|error| error.to_string());
+                    if result_tx
+                        .send(AuditionLoadResult {
+                            serial: command.serial,
+                            buffer,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            })
+            .expect("sample audition thread must start");
+        Self {
+            commands,
+            results,
+            next_serial: 0,
+            wanted: None,
+        }
+    }
+
+    pub(crate) fn request(&mut self, path: PathBuf, sample_rate: u32) {
+        self.next_serial = self.next_serial.wrapping_add(1);
+        let serial = self.next_serial;
+        self.wanted = Some(serial);
+        if self
+            .commands
+            .send(AuditionLoadCommand {
+                serial,
+                path,
+                sample_rate,
+            })
+            .is_err()
+        {
+            self.wanted = None;
+        }
+    }
+
+    pub(crate) fn stop(&mut self) {
+        self.wanted = None;
+    }
+
+    pub(crate) fn try_result(&mut self) -> Option<Result<daw::audio::AuditionBuffer, String>> {
+        while let Ok(result) = self.results.try_recv() {
+            if self.wanted == Some(result.serial) {
+                self.wanted = None;
+                return Some(result.buffer);
+            }
+        }
+        None
+    }
+}
+
 impl App {
     pub(crate) fn shape_hash(&self) -> u64 {
         shape_hash(
@@ -103,6 +193,7 @@ impl App {
         // dropped along with everything still in it.
         self.finish_recording();
         self.recorder = None;
+        self.audition_loader.stop();
         self.engine = None;
         self.hud = None;
         self.device_nodes.clear();
@@ -146,6 +237,10 @@ impl App {
             None,
             self.transport.metronome,
         );
+        // Swing is baked into the note starts, at the arrangement's grid —
+        // the knob in the transport says how far every other grid step
+        // leans. Live playback and offline renders share this one call.
+        spec.apply_swing(self.arrangement.grid_beats(), self.transport.swing);
         // Modulation rides INSIDE the schedule, so it reaches the callback
         // and the offline renderer by the same road the audio does.
         spec.set_modulation(build_mod_spec(
@@ -188,6 +283,7 @@ impl App {
                             self.arrangement.tracks.len(),
                             self.shape_hash(),
                             self.transport.bpm.to_bits(),
+                            u64::from(self.transport.swing.to_bits()),
                             self.mod_shape_hash(),
                         );
                         self.last_compile = Some(Instant::now());
@@ -536,6 +632,7 @@ impl App {
             self.arrangement.tracks.len(),
             self.shape_hash(),
             self.transport.bpm.to_bits(),
+            u64::from(self.transport.swing.to_bits()),
             self.mod_shape_hash(),
         );
         if shape != self.graph_key {
@@ -798,6 +895,10 @@ impl App {
         let Some(audio) = clip.audio.as_mut() else {
             return;
         };
+        // The pitch knobs need the WHOLE app (the render worker), so the
+        // ask rides out of the borrow and lands after the match — the
+        // same pattern the ghost and the menu keep.
+        let mut transpose_req: Option<(f32, f32)> = None;
         match edit {
             waveform::ClipEdit::Gain(gain) => {
                 let gain =
@@ -920,6 +1021,12 @@ impl App {
                     clip.name = name;
                 }
             }
+            waveform::ClipEdit::Transpose { semitones, cents } => {
+                transpose_req = Some((semitones, cents));
+            }
+        }
+        if let Some((semitones, cents)) = transpose_req {
+            self.set_clip_transpose(semitones, cents);
         }
     }
 

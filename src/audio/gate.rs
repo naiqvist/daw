@@ -257,13 +257,13 @@ impl GateCore {
             // wide source fail to open the gate at all.
             let side = dry_l.abs().max(dry_r.abs());
             let level = self.detector.tick(side);
-            let level_db = 20.0 * level.max(1e-6).log10();
+            let level_db = crate::dsp::arith::gain_to_db(level.max(1e-6));
             let target = self.computer.gain_db(level_db).max(floor_db);
             self.reduction_db = self.ballistics.tick(target);
             self.said.level_db = self.said.level_db.max(level_db);
             self.said.reduction_db = self.said.reduction_db.min(self.reduction_db);
 
-            let gain = 10.0f32.powf(self.reduction_db / 20.0);
+            let gain = crate::dsp::arith::db_to_gain(self.reduction_db);
             *left = dry_l * gain;
             if stereo && let Some(right) = r.get_mut(i) {
                 *right = dry_r * gain;
@@ -286,7 +286,7 @@ mod tests {
     /// A tone at `db`, `ms` long.
     fn tone(db: f32, ms: f32) -> Vec<f32> {
         let n = (FS * ms / 1000.0) as usize;
-        let amp = 10.0f32.powf(db / 20.0);
+        let amp = crate::dsp::arith::db_to_gain(db);
         (0..n)
             .map(|i| (i as f32 / FS * 440.0 * std::f32::consts::TAU).sin() * amp)
             .collect()

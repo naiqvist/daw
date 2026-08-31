@@ -424,7 +424,7 @@ impl GlueCore {
             let side = wet_l.abs().max(wet_r.abs());
             let side = self.sc_hp.tick_highpass(side);
             let level = self.detector.tick(side);
-            let level_db = 20.0 * level.max(1e-6).log10();
+            let level_db = crate::dsp::arith::gain_to_db(level.max(1e-6));
             let target = self.computer.gain_db(level_db).max(floor_db);
             self.reduction_db = self.ballistics.tick(target);
             self.said.level_db = self.said.level_db.max(level_db);

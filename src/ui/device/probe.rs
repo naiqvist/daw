@@ -36,8 +36,8 @@ pub struct Step {
     pub button: Option<bool>,
     /// What is held while this step happens.
     ///
-    /// Modifiers change what a gesture MEANS — Alt copies instead of
-    /// moving, Shift constrains, Ctrl+Alt bypasses snap — so a harness
+    /// Modifiers change what a gesture MEANS — Ctrl copies instead of
+    /// moving on Windows/Linux, Shift constrains, Alt bypasses snap — so a harness
     /// that can only send bare drags cannot test the half of the grammar
     /// that matters most. Defaults to nothing held, so every existing
     /// call site is unchanged.

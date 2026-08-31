@@ -7,8 +7,11 @@
 pub mod audio;
 pub mod dsp;
 pub mod library;
+pub mod param_law;
 pub mod params;
+pub mod pitch;
 pub mod render;
+pub mod sequencing;
 pub mod slice;
 pub mod theory;
 pub mod ui;
@@ -23,45 +26,35 @@ use std::sync::Arc;
 #[global_allocator]
 static ALLOC: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
 
-/// Where Iosevka might live. First hit wins.
+/// The redesign's project-local typeface.
 ///
-/// The Mono variant is used for both text families: Iosevka is monospace for
-/// latin either way, and the two files are ~14MB each, so loading one instead
-/// of two halves the startup parse.
-const IOSEVKA_CANDIDATES: &[&str] = &[
-    "/usr/share/fonts/TTF/IosevkaNerdFontMono-Regular.ttf",
-    "/usr/share/fonts/TTF/IosevkaNerdFont-Regular.ttf",
-    "/usr/share/fonts/truetype/iosevka/Iosevka-Regular.ttf",
-    "/usr/local/share/fonts/IosevkaNerdFontMono-Regular.ttf",
-];
+/// Keeping the font in the repository makes the app's typography independent
+/// of the fonts installed on the machine that launches it.
+const TERMINUS_REGULAR: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/fonts/Terminus-Regular.ttf"
+));
 
-/// Make Iosevka the default for both proportional and monospace text.
-///
-/// Returns the path loaded, or `None` if no candidate was readable — in which
-/// case egui keeps its built-in fonts and the app still runs.
+/// Make the bundled Terminus the default for both text families.
 pub fn install_fonts(ctx: &egui::Context) -> Option<&'static str> {
-    let (path, bytes) = IOSEVKA_CANDIDATES
-        .iter()
-        .find_map(|p| std::fs::read(p).ok().map(|b| (*p, b)))?;
-
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
-        "iosevka".to_owned(),
-        Arc::new(egui::FontData::from_owned(bytes)),
+        "terminus".to_owned(),
+        Arc::new(egui::FontData::from_static(TERMINUS_REGULAR)),
     );
 
-    // Insert at the front of both families so Iosevka wins, while egui's
-    // built-ins stay behind it as fallback for glyphs Iosevka lacks.
+    // Insert at the front so Terminus wins, while egui's built-ins remain
+    // available as fallback for glyphs it does not contain.
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
         fonts
             .families
             .entry(family)
             .or_default()
-            .insert(0, "iosevka".to_owned());
+            .insert(0, "terminus".to_owned());
     }
 
     ctx.set_fonts(fonts);
-    Some(path)
+    Some("Terminus TTF 4.49.3 (bundled)")
 }
 
 /// Describe the adapter wgpu actually selected. Reported at runtime, not build

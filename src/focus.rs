@@ -111,9 +111,18 @@ pub struct Focus {
 impl Focus {
     /// Take this frame's keyboard input and start collecting elements.
     pub fn begin(&mut self, ctx: &egui::Context) {
+        self.begin_enabled(ctx, true);
+    }
+
+    /// Start a collection pass without stealing arrows from another panel.
+    pub fn begin_enabled(&mut self, ctx: &egui::Context, keyboard_enabled: bool) {
         self.items.clear();
         self.pending = None;
         self.activate = false;
+
+        if !keyboard_enabled {
+            return;
+        }
 
         // A focused text field owns the keyboard outright. Escape hands it
         // back — without that you would be stuck inside the search box.

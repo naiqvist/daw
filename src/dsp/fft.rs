@@ -581,6 +581,127 @@ fn complex_fft(work: &mut [f32], size: usize, inverse: bool) {
     }
 }
 
+// ------------------------------------------------------ phase vocoder ---
+
+/// The half of a pitch shifter that is not a transform.
+///
+/// An FFT frame's phase is not a frequency; it is where a partial happened
+/// to be when the window opened. What a shifter needs is the partial's
+/// TRUE frequency, and that is hiding in how far the phase moved between
+/// one frame and the next: the part of the movement that a bin-centred
+/// partial would have made anyway is expected, and everything left over
+/// says how far off centre the partial really sits.
+///
+/// [`analyse`](Self::analyse) does that reading and
+/// [`synthesise`](Self::synthesise) does the inverse — turning frequencies
+/// back into a phase that advances coherently frame after frame, which is
+/// what stops a shifted signal from arriving as a smear.
+///
+/// It is handed PHASES and never sees a magnitude, so it cannot tell a
+/// silent bin from a steady one — and does not try. Silence is settled by
+/// the caller, which has the magnitudes and multiplies by them.
+///
+/// Both halves keep one float per bin between frames, and it is the
+/// CALLER's, per the contract: an FFT size is a runtime decision and a
+/// kernel does not own a heap. Frequencies are in BINS, not hertz — the
+/// caller knows the sample rate and this does not need to.
+///
+/// State: 16 bytes here, plus [`Self::state_len`] floats per direction in
+/// the caller's buffer.
+/// Per-bin cost: analysis is a subtract, a round and two multiplies;
+/// synthesis is one multiply-add and a wrap.
+/// Denormal-safe: phases live near unity magnitude; the accumulator is
+/// wrapped to ±π every frame so it cannot drift into a range where an f32
+/// stops resolving radians.
+/// In-place safe: no — `phase` and `freq` are distinct slices.
+/// Latency: 0 frames of its own; the caller's window is the latency.
+#[derive(Debug, Clone, Copy)]
+pub struct PhaseVocoder {
+    size: usize,
+    hop: usize,
+}
+
+impl Default for PhaseVocoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PhaseVocoder {
+    pub fn new() -> Self {
+        Self { size: 1, hop: 1 }
+    }
+
+    /// Green zone: the transform size and the hop between frames.
+    pub fn prepare(&mut self, size: usize, hop: usize) {
+        self.size = size.max(1);
+        self.hop = hop.max(1);
+    }
+
+    /// Floats of caller state one direction needs: one per bin.
+    pub fn state_len(bins: usize) -> usize {
+        bins
+    }
+
+    /// Green zone: forget the previous frame.
+    pub fn reset(state: &mut [f32]) {
+        for slot in state.iter_mut() {
+            *slot = 0.0;
+        }
+    }
+
+    /// Radians a bin-centred partial advances across one hop.
+    #[inline(always)]
+    fn expected(&self, k: usize) -> f32 {
+        core::f32::consts::TAU * self.hop as f32 * k as f32 / self.size as f32
+    }
+
+    /// Wrap to `-pi..=pi`, which is the only range the deviation can
+    /// honestly be read in — a partial that moved a full turn between
+    /// frames is indistinguishable from one that did not move at all,
+    /// and pretending otherwise is where a vocoder's warble comes from.
+    #[inline(always)]
+    fn wrap(x: f32) -> f32 {
+        x - core::f32::consts::TAU * (x / core::f32::consts::TAU).round()
+    }
+
+    /// Red zone: phases into TRUE FREQUENCIES, in bins.
+    ///
+    /// `prev` holds the last frame's phases and is updated. Truncates to
+    /// the shortest slice.
+    pub fn analyse(&self, phase: &[f32], freq: &mut [f32], prev: &mut [f32]) {
+        let scale = self.size as f32 / (core::f32::consts::TAU * self.hop as f32);
+        for (k, ((f, p), last)) in freq
+            .iter_mut()
+            .zip(phase.iter())
+            .zip(prev.iter_mut())
+            .enumerate()
+        {
+            let p = if p.is_finite() { *p } else { 0.0 };
+            let moved = p - *last;
+            *last = p;
+            let deviation = Self::wrap(moved - self.expected(k));
+            *f = k as f32 + deviation * scale;
+        }
+    }
+
+    /// Red zone: TRUE FREQUENCIES back into a coherently advancing phase.
+    ///
+    /// `acc` carries the running phase between frames and is updated.
+    /// Truncates to the shortest slice.
+    pub fn synthesise(&self, freq: &[f32], phase: &mut [f32], acc: &mut [f32]) {
+        let step = core::f32::consts::TAU * self.hop as f32 / self.size as f32;
+        for ((p, f), running) in phase.iter_mut().zip(freq.iter()).zip(acc.iter_mut()) {
+            let f = if f.is_finite() { *f } else { 0.0 };
+            // Wrapped every frame rather than left to grow: an f32 holding
+            // a phase in the thousands of radians has already lost the
+            // fraction of a radian this is trying to track.
+            *running = Self::wrap(*running + f * step);
+            *p = *running;
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -1047,5 +1168,188 @@ mod tests {
         input.fill(9.0);
         fft.forward(&[0.0; N], &mut real, &mut imag, &mut scratch);
         assert!(real.iter().chain(&imag).all(|value| *value == 0.0));
+    }
+
+    // ------------------------------------------------ phase vocoder ---
+
+    const PV_SIZE: usize = 1024;
+    const PV_HOP: usize = 256;
+    const PV_BINS: usize = PV_SIZE / 2 + 1;
+
+    fn vocoder() -> PhaseVocoder {
+        let mut pv = PhaseVocoder::new();
+        pv.prepare(PV_SIZE, PV_HOP);
+        pv
+    }
+
+    /// The phases a steady partial at `bin` would present, frame by
+    /// frame. `bin` may be fractional — that is the whole point.
+    fn phases_of(bin: f32, frames: usize) -> Vec<Vec<f32>> {
+        let step = core::f32::consts::TAU * PV_HOP as f32 * bin / PV_SIZE as f32;
+        (0..frames)
+            .map(|f| {
+                let here = step * f as f32;
+                (0..PV_BINS)
+                    .map(|k| {
+                        // The partial's NEAREST bin carries its phase.
+                        // A `< 0.5` window matched no bin at all for a
+                        // half-integer `bin`, so the fixture handed the
+                        // kernel silence and then blamed it for the
+                        // answer.
+                        if k == bin.round() as usize { here } else { 0.0 }
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// REFERENCE: a steady partial reads back as its own frequency,
+    /// on a bin centre and — the part that matters — between two.
+    #[test]
+    fn analysis_recovers_the_frequency_a_partial_actually_has() {
+        let pv = vocoder();
+        for bin in [8.0f32, 20.0, 20.25, 33.5, 60.75, 100.0] {
+            let mut prev = vec![0.0f32; PV_BINS];
+            let mut freq = vec![0.0f32; PV_BINS];
+            let frames = phases_of(bin, 6);
+            for frame in &frames {
+                pv.analyse(frame, &mut freq, &mut prev);
+            }
+            let k = bin.round() as usize;
+            let got = freq[k];
+            assert!(
+                (got - bin).abs() < 0.02,
+                "a partial at bin {bin} read back as {got}"
+            );
+        }
+    }
+
+    /// Analysis and synthesis are inverses: put the frequencies back and
+    /// the phase advances exactly as the source's did.
+    #[test]
+    fn synthesis_undoes_analysis() {
+        let pv = vocoder();
+        let bin = 30.4f32;
+        let (mut prev, mut acc) = (vec![0.0f32; PV_BINS], vec![0.0f32; PV_BINS]);
+        let (mut freq, mut out) = (vec![0.0f32; PV_BINS], vec![0.0f32; PV_BINS]);
+        let frames = phases_of(bin, 8);
+        let mut last = 0.0f32;
+        for (i, frame) in frames.iter().enumerate() {
+            pv.analyse(frame, &mut freq, &mut prev);
+            pv.synthesise(&freq, &mut out, &mut acc);
+            let k = bin.round() as usize;
+            if i >= 2 {
+                // The advance per frame must match the source's.
+                let want = core::f32::consts::TAU * PV_HOP as f32 * bin / PV_SIZE as f32;
+                let moved = PhaseVocoder::wrap(out[k] - last);
+                assert!(
+                    (PhaseVocoder::wrap(moved - want)).abs() < 0.02,
+                    "frame {i}: phase advanced {moved}, source advanced {want}"
+                );
+            }
+            last = out[bin.round() as usize];
+        }
+    }
+
+    /// Shifting the frequencies shifts the phase advance by the same
+    /// ratio — the property a pitch shifter is built on.
+    #[test]
+    fn scaling_the_frequencies_scales_the_advance() {
+        let pv = vocoder();
+        let bin = 40.0f32;
+        let ratio = 1.5f32;
+        let (mut prev, mut acc) = (vec![0.0f32; PV_BINS], vec![0.0f32; PV_BINS]);
+        let (mut freq, mut out) = (vec![0.0f32; PV_BINS], vec![0.0f32; PV_BINS]);
+        let mut last = 0.0f32;
+        for (i, frame) in phases_of(bin, 6).iter().enumerate() {
+            pv.analyse(frame, &mut freq, &mut prev);
+            for f in freq.iter_mut() {
+                *f *= ratio;
+            }
+            pv.synthesise(&freq, &mut out, &mut acc);
+            if i >= 2 {
+                let k = bin.round() as usize;
+                let want = core::f32::consts::TAU * PV_HOP as f32 * (bin * ratio) / PV_SIZE as f32;
+                let moved = PhaseVocoder::wrap(out[k] - last);
+                assert!(
+                    (PhaseVocoder::wrap(moved - want)).abs() < 0.02,
+                    "frame {i}: advanced {moved}, wanted {want}"
+                );
+            }
+            last = out[bin.round() as usize];
+        }
+    }
+
+    #[test]
+    fn the_vocoder_takes_any_slice_length() {
+        let pv = vocoder();
+        for len in [0usize, 1, 2, 7, 63, PV_BINS] {
+            let (mut prev, mut acc) = (vec![0.0f32; len], vec![0.0f32; len]);
+            let (mut freq, mut out) = (vec![0.0f32; len], vec![0.0f32; len]);
+            pv.analyse(&vec![0.3f32; len], &mut freq, &mut prev);
+            pv.synthesise(&freq, &mut out, &mut acc);
+            assert!(out.iter().all(|v| v.is_finite()), "len {len}");
+        }
+        // Mismatched slices truncate rather than panic.
+        let (mut prev, mut acc) = (vec![0.0f32; 4], vec![0.0f32; 4]);
+        let (mut freq, mut out) = (vec![0.0f32; 4], vec![0.0f32; 4]);
+        pv.analyse(&[0.1; 64], &mut freq, &mut prev);
+        pv.synthesise(&[1.0; 64], &mut out, &mut acc);
+    }
+
+    #[test]
+    fn the_vocoder_does_not_allocate() {
+        let pv = vocoder();
+        let (mut prev, mut acc) = (vec![0.0f32; PV_BINS], vec![0.0f32; PV_BINS]);
+        let (mut freq, mut out) = (vec![0.0f32; PV_BINS], vec![0.0f32; PV_BINS]);
+        let phase = vec![0.7f32; PV_BINS];
+        assert_no_alloc::assert_no_alloc(|| {
+            for _ in 0..50 {
+                pv.analyse(&phase, &mut freq, &mut prev);
+                pv.synthesise(&freq, &mut out, &mut acc);
+            }
+        });
+    }
+
+    /// Silence, nonsense, and a long run all stay finite — and the
+    /// accumulator stays inside a range an f32 can still resolve.
+    #[test]
+    fn the_vocoder_stays_finite_and_bounded() {
+        let pv = vocoder();
+        let (mut prev, mut acc) = (vec![0.0f32; PV_BINS], vec![0.0f32; PV_BINS]);
+        let (mut freq, mut out) = (vec![0.0f32; PV_BINS], vec![0.0f32; PV_BINS]);
+
+        // NOT "silence leaves the phase alone" — this kernel is handed
+        // phases and never sees a magnitude, so it cannot tell a silent
+        // bin from a steady one and must not pretend to. Silence is the
+        // caller's business, and it settles it with the magnitude.
+        pv.analyse(&vec![0.0f32; PV_BINS], &mut freq, &mut prev);
+        pv.synthesise(&freq, &mut out, &mut acc);
+        assert!(
+            freq.iter().chain(out.iter()).all(|v| v.is_finite()),
+            "a zero phase produced a non-finite reading"
+        );
+
+        let junk = vec![f32::NAN; PV_BINS];
+        pv.analyse(&junk, &mut freq, &mut prev);
+        pv.synthesise(&freq, &mut out, &mut acc);
+        assert!(
+            freq.iter().chain(out.iter()).all(|v| v.is_finite()),
+            "nonsense escaped"
+        );
+
+        // Ten thousand frames of a real partial: the accumulator must
+        // not have drifted out of the range radians survive in.
+        PhaseVocoder::reset(&mut prev);
+        PhaseVocoder::reset(&mut acc);
+        let phase = vec![1.1f32; PV_BINS];
+        for _ in 0..10_000 {
+            pv.analyse(&phase, &mut freq, &mut prev);
+            pv.synthesise(&freq, &mut out, &mut acc);
+        }
+        assert!(
+            acc.iter().all(|v| v.abs() <= core::f32::consts::PI + 1e-3),
+            "the accumulator left the wrapped range"
+        );
     }
 }

@@ -176,7 +176,7 @@ impl Resolved {
 }
 
 fn db_to_gain(db: f32) -> f32 {
-    10f32.powf(db / 20.0)
+    crate::dsp::arith::db_to_gain(db)
 }
 
 pub struct Clamp {
@@ -337,7 +337,7 @@ impl Clamp {
             // would be an equaliser nobody asked for.
             let detect = self.sc_hp.tick_highpass(sum);
             let env = self.detector.tick(detect);
-            let level_db = 20.0 * env.max(1e-7).log10();
+            let level_db = crate::dsp::arith::gain_to_db(env.max(1e-7));
             peak_db = peak_db.max(level_db);
 
             let target_db = self.computer.gain_db(level_db);

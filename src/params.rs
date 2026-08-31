@@ -5520,6 +5520,1593 @@ pub mod haze {
     ];
 }
 
+/// Flint: the transient shaper.
+///
+/// Two knobs that mean what they say — how hard the STRIKE hits and how
+/// much BODY follows it — over a detector that does not care how loud you
+/// played. See `audio::flint` for why the gain is not neutral.
+pub mod flint {
+    use super::ParamDef;
+
+    pub const STRIKE: u32 = 0;
+    pub const BODY: u32 = 1;
+    pub const SPLIT: u32 = 2;
+    pub const COLOUR: u32 = 3;
+    pub const MIX: u32 = 4;
+    pub const OUT: u32 = 5;
+
+    /// How far either half can be pushed, in dB. Eighteen is enough to
+    /// rebuild a hit that was recorded badly and far enough past "tasteful"
+    /// to be an effect rather than a correction.
+    pub const SHAPE_MAX_DB: f32 = 18.0;
+
+    /// The output trim, both ways round, for the reason `lofi::OUT_MIN_DB`
+    /// gives: the TABLE is linear gain and the KNOB is dB, and deriving one
+    /// from the other by hand is how the two ends drift apart.
+    pub const OUT_MIN_DB: f32 = -24.0;
+    pub const OUT_MAX_DB: f32 = 12.0;
+    pub const OUT_MIN: f32 = 0.063_095_73;
+    pub const OUT_MAX: f32 = 3.981_072;
+
+    pub const TABLE: &[ParamDef] = &[
+        ParamDef {
+            id: STRIKE,
+            name: "strike",
+            min: -SHAPE_MAX_DB,
+            max: SHAPE_MAX_DB,
+            // Up, and audibly. A transient shaper that arrives neutral is
+            // asking the user to guess what it does; this one arrives
+            // having already done it, which is the argument `lofi::TABLE`
+            // makes about defaults and it applies double here.
+            default: 4.5,
+        },
+        ParamDef {
+            id: BODY,
+            name: "body",
+            min: -SHAPE_MAX_DB,
+            max: SHAPE_MAX_DB,
+            // Down a little. Up on the strike and down on the body is the
+            // move people actually reach for — it tightens a loop without
+            // touching its level — so it is the position the device opens
+            // in rather than one the manual mentions.
+            default: -1.5,
+        },
+        ParamDef {
+            id: SPLIT,
+            name: "split",
+            min: crate::dsp::dynamics::SPLIT_WINDOW_MIN_MS,
+            max: crate::dsp::dynamics::SPLIT_WINDOW_MAX_MS,
+            // Twelve milliseconds: long enough to hold a kick's whole
+            // click, short enough that a snare's body is still body.
+            default: 12.0,
+        },
+        ParamDef {
+            id: COLOUR,
+            name: "colour",
+            min: 0.0,
+            max: 1.0,
+            // On, and most of the way. The colour IS the device's opinion
+            // — at zero this is a competent neutral transient shaper and
+            // there are several of those. Turning it down is the choice;
+            // leaving it up is the default.
+            default: 0.65,
+        },
+        ParamDef {
+            id: MIX,
+            name: "mix",
+            min: 0.0,
+            max: 1.0,
+            // Fully wet. Parallel transient shaping is a real technique
+            // and a rare one; the common case is in the path.
+            default: 1.0,
+        },
+        ParamDef {
+            id: OUT,
+            name: "out",
+            min: OUT_MIN,
+            max: OUT_MAX,
+            default: 1.0,
+        },
+    ];
+}
+
+/// Sibyl: the pitch shifter that arrives as a harmoniser.
+///
+/// A transpose, a formant control that is independent of it, and two
+/// harmony voices measured in SCALE STEPS rather than semitones — so a
+/// third stays a third whether the passage is major or minor. See
+/// `audio::sibyl`.
+pub mod sibyl {
+    use super::ParamDef;
+
+    pub const SHIFT: u32 = 0;
+    pub const FORMANT: u32 = 1;
+    pub const VOICE_A: u32 = 2;
+    pub const VOICE_B: u32 = 3;
+    pub const KEY: u32 = 4;
+    pub const SCALE: u32 = 5;
+    pub const BLEND: u32 = 6;
+    pub const MIX: u32 = 7;
+    pub const OUT: u32 = 8;
+
+    /// Two octaves either way. Past that a phase vocoder is a texture
+    /// rather than a transposition, and the device says so by stopping.
+    pub const SHIFT_MAX_ST: f32 = 24.0;
+    /// One octave of formant either way — the whole usable range of a
+    /// vocal tract, and well past the whole tasteful one.
+    pub const FORMANT_MAX_ST: f32 = 12.0;
+    /// Scale steps a harmony voice may sit at. Seven is an octave in a
+    /// seven-note scale and more than an octave in a pentatonic, which
+    /// is the right kind of wrong: the step is the SCALE's, not the
+    /// chromatic ladder's.
+    pub const VOICE_MAX_STEPS: f32 = 7.0;
+
+    pub const KEY_NAMES: &[&str] = &[
+        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+    ];
+    pub const SCALE_NAMES: &[&str] = &["major", "minor", "dorian", "mixo", "pent"];
+
+    pub const OUT_MIN_DB: f32 = -24.0;
+    pub const OUT_MAX_DB: f32 = 12.0;
+    pub const OUT_MIN: f32 = 0.063_095_73;
+    pub const OUT_MAX: f32 = 3.981_072;
+
+    pub const TABLE: &[ParamDef] = &[
+        ParamDef {
+            id: SHIFT,
+            name: "shift",
+            min: -SHIFT_MAX_ST,
+            max: SHIFT_MAX_ST,
+            // ZERO, and that is the opinion rather than the absence of
+            // one. Sibyl arrives as a HARMONISER — the voice you already
+            // have, joined by one you did not — and a device that opened
+            // a fifth up would be a transposer that happens to harmonise.
+            default: 0.0,
+        },
+        ParamDef {
+            id: FORMANT,
+            name: "formant",
+            min: -FORMANT_MAX_ST,
+            max: FORMANT_MAX_ST,
+            // Zero means HELD, not "moves with the pitch". The envelope
+            // is put back where the source had it, which is what stops
+            // an octave down sounding like a monster — and it is the
+            // reason this control exists as its own knob rather than as
+            // a switch nobody finds.
+            default: 0.0,
+        },
+        ParamDef {
+            id: VOICE_A,
+            name: "voice a",
+            min: -VOICE_MAX_STEPS,
+            max: VOICE_MAX_STEPS,
+            // A third above, in whatever key is set. The device makes a
+            // sound the moment it is added, and the sound it makes is
+            // the one it is for.
+            default: 2.0,
+        },
+        ParamDef {
+            id: VOICE_B,
+            name: "voice b",
+            min: -VOICE_MAX_STEPS,
+            max: VOICE_MAX_STEPS,
+            // OFF. Two harmonies at once is a choice; one is a default.
+            default: 0.0,
+        },
+        ParamDef {
+            id: KEY,
+            name: "key",
+            min: 0.0,
+            max: 11.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: SCALE,
+            name: "scale",
+            min: 0.0,
+            max: 4.0,
+            // MINOR. A harmoniser has to pick one, and the third that
+            // surprises people in a good way is the flat one.
+            default: 1.0,
+        },
+        ParamDef {
+            id: BLEND,
+            name: "blend",
+            min: 0.0,
+            max: 1.0,
+            // The harmony stands behind the voice it is answering, not
+            // beside it.
+            default: 0.55,
+        },
+        ParamDef {
+            id: MIX,
+            name: "mix",
+            min: 0.0,
+            max: 1.0,
+            // Fully wet: the dry is already in the harmony, because the
+            // main voice at SHIFT 0 IS the dry.
+            default: 1.0,
+        },
+        ParamDef {
+            id: OUT,
+            name: "out",
+            min: OUT_MIN,
+            max: OUT_MAX,
+            default: 1.0,
+        },
+    ];
+}
+
+/// Ferric: the tape looper.
+///
+/// A loop of tape that is ALWAYS recording, a read head the grid moves
+/// around on it, and the wear that a real one would have. The groove
+/// patterns live here rather than in the node so the card draws the same
+/// table the engine plays — see `audio::ferric`.
+pub mod ferric {
+    use super::ParamDef;
+
+    pub const SPEED: u32 = 0;
+    pub const DIVISION: u32 = 1;
+    pub const PATTERN: u32 = 2;
+    pub const GROOVE: u32 = 3;
+    pub const DRIVE: u32 = 4;
+    pub const WOW: u32 = 5;
+    pub const AGE: u32 = 6;
+    pub const MIX: u32 = 7;
+    pub const OUT: u32 = 8;
+
+    /// An octave either way of varispeed. A tape machine's pitch control
+    /// is a SPEED control, so this moves time with it — which is the
+    /// whole difference between this and a pitch shifter.
+    pub const SPEED_MAX_ST: f32 = 12.0;
+
+    /// The grid the head is moved on, in beats.
+    pub const DIVISION_BEATS: [f32; 6] = [
+        1.0,       // 1/4
+        0.5,       // 1/8
+        1.0 / 3.0, // 1/8T
+        0.25,      // 1/16
+        1.0 / 6.0, // 1/16T
+        0.125,     // 1/32
+    ];
+    pub const DIVISION_NAMES: &[&str] = &["1/4", "1/8", "1/8T", "1/16", "1/16T", "1/32"];
+
+    /// How many steps a groove pattern cycles over.
+    pub const PATTERN_STEPS: usize = 8;
+
+    /// What each pattern does, as how many DIVISIONS back the read head
+    /// is placed at the start of each step.
+    ///
+    /// Displacement, not a note list: the head is put somewhere and the
+    /// tape does the rest. Zero is "wherever the write head is", which is
+    /// the tape passing through — so `run` is the identity and every
+    /// other pattern is a departure from it that can be measured against
+    /// it.
+    pub const PATTERNS: [[u8; PATTERN_STEPS]; 6] = [
+        // RUN — straight through. The timbre and the speed, nothing else.
+        [0, 0, 0, 0, 0, 0, 0, 0],
+        // STUTTER — four steps all playing the first one's tape.
+        [0, 1, 2, 3, 0, 1, 2, 3],
+        // HALFTIME — every step played twice, so the bar drags at half
+        // pace without the tempo moving.
+        [0, 0, 1, 1, 2, 2, 3, 3],
+        // SKIP — a bounce: every other step reaches two back.
+        [0, 2, 0, 2, 0, 2, 0, 2],
+        // REVERSE — one division back, played backwards. The pattern is
+        // flat because the DIRECTION is the figure here.
+        [1, 1, 1, 1, 1, 1, 1, 1],
+        // DRAG — a pull-back on the last step of each half. The subtle
+        // one, and the reason the device opens on it.
+        [0, 0, 0, 1, 0, 0, 0, 1],
+    ];
+    pub const PATTERN_NAMES: &[&str] = &["run", "stutter", "half", "skip", "rev", "drag"];
+    /// Which pattern plays its division backwards.
+    pub const REVERSE_PATTERN: usize = 4;
+
+    /// Where the top of the band ends up as the tape wears: fresh, then
+    /// worn. Here rather than in the node because the CARD prints the
+    /// figure the AGE knob is actually buying, and a second copy of these
+    /// two numbers is a second answer to that question.
+    pub const LOSS_FRESH_HZ: f32 = 19_000.0;
+    pub const LOSS_WORN_HZ: f32 = 4_200.0;
+
+    /// The band edge at a given age.
+    pub fn top_hz(age: f32) -> f32 {
+        let age = age.clamp(0.0, 1.0);
+        LOSS_FRESH_HZ + (LOSS_WORN_HZ - LOSS_FRESH_HZ) * age
+    }
+
+    pub const OUT_MIN_DB: f32 = -24.0;
+    pub const OUT_MAX_DB: f32 = 12.0;
+    pub const OUT_MIN: f32 = 0.063_095_73;
+    pub const OUT_MAX: f32 = 3.981_072;
+
+    pub const TABLE: &[ParamDef] = &[
+        ParamDef {
+            id: SPEED,
+            name: "speed",
+            min: -SPEED_MAX_ST,
+            max: SPEED_MAX_ST,
+            // Nominal. The varispeed is a thing you reach for, and a
+            // looper that arrived detuned would be a looper nobody
+            // trusted with a whole mix.
+            default: 0.0,
+        },
+        ParamDef {
+            id: DIVISION,
+            name: "div",
+            min: 0.0,
+            max: (DIVISION_BEATS.len() - 1) as f32,
+            // A sixteenth: small enough to be a groove, large enough to
+            // still be a piece of the performance rather than a grain.
+            default: 3.0,
+        },
+        ParamDef {
+            id: PATTERN,
+            name: "pattern",
+            min: 0.0,
+            max: (PATTERNS.len() - 1) as f32,
+            // DRAG. The device has to do something when it is added, and
+            // of the six this is the one that can sit under a whole take
+            // without announcing itself.
+            default: 5.0,
+        },
+        ParamDef {
+            id: GROOVE,
+            name: "groove",
+            min: 0.0,
+            max: 1.0,
+            // Half. At zero the head never leaves the write position and
+            // this is a tape saturator; the groove is the device.
+            default: 0.5,
+        },
+        ParamDef {
+            id: DRIVE,
+            name: "drive",
+            min: 0.0,
+            max: 1.0,
+            default: 0.35,
+        },
+        ParamDef {
+            id: WOW,
+            name: "wow",
+            min: 0.0,
+            max: 1.0,
+            // Present but not seasick. Enough that two passes of the same
+            // bar are not identical, which is the whole reason tape
+            // sounds like tape.
+            default: 0.25,
+        },
+        ParamDef {
+            id: AGE,
+            name: "age",
+            min: 0.0,
+            max: 1.0,
+            // One knob for the whole decay: the top comes off, the head
+            // bump comes up, and the hiss arrives. They happen together
+            // on a real reel and there is no musical reason to take them
+            // apart.
+            default: 0.3,
+        },
+        ParamDef {
+            id: MIX,
+            name: "mix",
+            min: 0.0,
+            max: 1.0,
+            default: 1.0,
+        },
+        ParamDef {
+            id: OUT,
+            name: "out",
+            min: OUT_MIN,
+            max: OUT_MAX,
+            default: 1.0,
+        },
+    ];
+}
+
+/// Umbra: the signal's shadow.
+///
+/// Four MACROS over a ten-link chain. No link has a control of its own —
+/// each knob reaches across several at once, and the REACH matrix says
+/// which. It lives here so the card draws the same wiring the engine
+/// plays. See `audio::umbra`.
+pub mod umbra {
+    use super::ParamDef;
+
+    pub const DEPTH: u32 = 0;
+    pub const MOTION: u32 = 1;
+    pub const DECAY: u32 = 2;
+    pub const COLOUR: u32 = 3;
+    pub const MIX: u32 = 4;
+    pub const OUT: u32 = 5;
+
+    /// One link in the chain: what it is called, and the DEPTH at which
+    /// it begins to arrive.
+    pub struct Stage {
+        pub name: &'static str,
+        pub at: f32,
+    }
+
+    /// The chain, in the order the signal meets it.
+    ///
+    /// Ordered by how far each one takes the sound from what came in, so
+    /// DEPTH is a journey rather than a switchboard: tone, then dirt,
+    /// then time, then space, then things that were never in the
+    /// recording at all.
+    pub const STAGES: &[Stage] = &[
+        Stage {
+            name: "tilt",
+            at: 0.00,
+        },
+        Stage {
+            name: "drive",
+            at: 0.08,
+        },
+        Stage {
+            name: "grain",
+            at: 0.20,
+        },
+        Stage {
+            name: "smear",
+            at: 0.32,
+        },
+        Stage {
+            name: "sweep",
+            at: 0.42,
+        },
+        Stage {
+            name: "echo",
+            at: 0.52,
+        },
+        Stage {
+            name: "room",
+            at: 0.62,
+        },
+        Stage {
+            name: "bloom",
+            at: 0.72,
+        },
+        Stage {
+            name: "shimmer",
+            at: 0.82,
+        },
+        Stage {
+            name: "haze",
+            at: 0.90,
+        },
+    ];
+
+    /// The delay the chain imposes, in samples: the shimmer's frame.
+    /// Constant whatever DEPTH is doing, and here rather than in the node
+    /// because the CARD prints it — a device that quietly costs a
+    /// twenty-first of a second should say so on its face.
+    pub const LATENCY_SAMPLES: usize = 1024;
+
+    /// How many links there are. A compile-time figure so the engine can
+    /// hold the stage amounts in an ARRAY rather than a `Vec` — a
+    /// `collect()` once a chunk is an allocation in the audio callback,
+    /// which is the one thing the red zone will not have.
+    pub const STAGE_COUNT: usize = 10;
+
+    /// The four macros, in the order they sit on the face.
+    pub const MACRO_NAMES: [&str; 4] = ["depth", "motion", "decay", "colour"];
+    pub const MACRO_COUNT: usize = 4;
+    /// Which knob each macro is.
+    pub const MACRO_PARAMS: [u32; MACRO_COUNT] = [DEPTH, MOTION, DECAY, COLOUR];
+
+    /// How strongly each macro reaches each link, `0..=1`.
+    ///
+    /// This is the device. No stage has a knob; every knob has stages,
+    /// and a control that moved exactly one thing would just be that
+    /// thing's parameter wearing a costume. Reading a column tells you
+    /// what shapes a link; reading a row tells you what a knob will do.
+    ///
+    /// DEPTH reaches everything because it is the gate — it decides
+    /// whether a link is in the signal at all. The other three decide
+    /// what it is like once it is.
+    pub const REACH: [[f32; STAGE_COUNT]; MACRO_COUNT] = [
+        //     tilt drive grain smear sweep echo  room bloom shim  haze
+        /* depth  */
+        [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        /* motion */ [0.0, 0.0, 0.3, 0.8, 1.0, 0.4, 0.0, 0.6, 0.2, 0.9],
+        /* decay  */ [0.0, 0.0, 0.0, 0.2, 0.0, 1.0, 0.9, 1.0, 0.7, 0.3],
+        /* colour */ [1.0, 0.9, 0.8, 0.0, 0.6, 0.3, 0.5, 0.5, 0.4, 0.6],
+    ];
+
+    /// How much DEPTH a stage takes to arrive fully. The LAST stage's
+    /// threshold plus this must not exceed 1.0, or the end of the chain
+    /// can never fully engage — haze sat at 0.92 and topped out at four
+    /// fifths of itself with the knob against the stop.
+    ///
+    /// Stages overlap, and that is the point: the chain crossfades
+    /// rather than switching, so there is no position of the knob where
+    /// something clicks on.
+    pub const STAGE_FADE: f32 = 0.10;
+
+    /// How far into a stage the depth has travelled, `0..=1`.
+    pub fn stage_amount(depth: f32, index: usize) -> f32 {
+        let Some(stage) = STAGES.get(index) else {
+            return 0.0;
+        };
+        ((depth - stage.at) / STAGE_FADE).clamp(0.0, 1.0)
+    }
+
+    /// How hard macro `m` is currently pulling on link `s`.
+    ///
+    /// The macro's own position times its reach, and then GATED by
+    /// whether the link is in the signal at all — a decay setting on a
+    /// reverb that is not running is not doing anything, and a matrix
+    /// that showed it lit would be describing the wiring rather than the
+    /// sound.
+    pub fn pull(values: [f32; MACRO_COUNT], depth: f32, m: usize, s: usize) -> f32 {
+        let Some(reach) = REACH.get(m).and_then(|row| row.get(s)).copied() else {
+            return 0.0;
+        };
+        let value = values.get(m).copied().unwrap_or(0.0).abs().clamp(0.0, 1.0);
+        let engaged = stage_amount(depth, s);
+        if m == 0 {
+            engaged * reach
+        } else {
+            value * reach * engaged
+        }
+    }
+
+    pub const OUT_MIN_DB: f32 = -24.0;
+    pub const OUT_MAX_DB: f32 = 12.0;
+    pub const OUT_MIN: f32 = 0.063_095_73;
+    pub const OUT_MAX: f32 = 3.981_072;
+
+    pub const TABLE: &[ParamDef] = &[
+        ParamDef {
+            id: DEPTH,
+            name: "depth",
+            min: 0.0,
+            max: 1.0,
+            // Far enough in to be past the dirt and into the time, so the
+            // device arrives sounding like what it is rather than like a
+            // tone control somebody forgot to turn up.
+            default: 0.58,
+        },
+        ParamDef {
+            id: MOTION,
+            name: "motion",
+            min: 0.0,
+            max: 1.0,
+            // Everything that WANDERS: the filter sweep, the smear, the
+            // reel's wobble, the ring under the haze. Present, because a
+            // shadow that stood perfectly still would read as a copy.
+            default: 0.45,
+        },
+        ParamDef {
+            id: DECAY,
+            name: "decay",
+            min: 0.0,
+            max: 1.0,
+            // Everything that LASTS: the echo's time and feedback, the
+            // room, the bloom's tail, how long the shimmer holds.
+            default: 0.5,
+        },
+        ParamDef {
+            id: COLOUR,
+            name: "colour",
+            min: -1.0,
+            max: 1.0,
+            // Everything that SHAPES: the tilt, the drive, the grain, the
+            // damping of both reverbs. Bipolar, and slightly dark — a
+            // shadow is darker than the thing casting it.
+            default: -0.15,
+        },
+        ParamDef {
+            id: MIX,
+            name: "mix",
+            min: 0.0,
+            max: 1.0,
+            // A shadow stands BEHIND what casts it. This is the one knob
+            // on the card that is deliberately not at its top.
+            default: 0.4,
+        },
+        ParamDef {
+            id: OUT,
+            name: "out",
+            min: OUT_MIN,
+            max: OUT_MAX,
+            default: 1.0,
+        },
+    ];
+}
+
+/// Tone: the test-signal generator.
+///
+/// A utility, and the one every studio has on the wall: a known signal to
+/// push through a chain when you want to know what the chain is doing
+/// rather than what the music is doing.
+pub mod tone {
+    use super::ParamDef;
+
+    pub const SHAPE: u32 = 0;
+    pub const FREQ: u32 = 1;
+    pub const LEVEL: u32 = 2;
+    pub const MIX: u32 = 3;
+
+    /// The six signals worth having on tap. The four waveforms are the
+    /// oscillator's own; the two noises are the noise kernel's.
+    pub const SHAPE_NAMES: &[&str] = &["sine", "tri", "saw", "square", "white", "pink"];
+    /// Which shapes are NOISE, and therefore have no frequency.
+    pub const FIRST_NOISE: usize = 4;
+
+    pub const FREQ_MIN: f32 = 20.0;
+    pub const FREQ_MAX: f32 = 20_000.0;
+    pub const LEVEL_MIN_DB: f32 = -60.0;
+    pub const LEVEL_MAX_DB: f32 = 0.0;
+    /// `10^(-60/20)` and `10^(0/20)`, to f32 precision.
+    pub const LEVEL_MIN: f32 = 0.001;
+    pub const LEVEL_MAX: f32 = 1.0;
+
+    pub const TABLE: &[ParamDef] = &[
+        ParamDef {
+            id: SHAPE,
+            name: "shape",
+            min: 0.0,
+            max: (SHAPE_NAMES.len() - 1) as f32,
+            default: 0.0,
+        },
+        ParamDef {
+            id: FREQ,
+            name: "freq",
+            min: FREQ_MIN,
+            max: FREQ_MAX,
+            // A440. The number every musician can hear the rightness of,
+            // and the one a tuner is checked against.
+            default: 440.0,
+        },
+        ParamDef {
+            id: LEVEL,
+            name: "level",
+            min: LEVEL_MIN,
+            max: LEVEL_MAX,
+            // −18 dBFS: the level a calibrated chain is set up around,
+            // and quiet enough that plugging this into a monitor chain
+            // by accident is a surprise rather than an injury.
+            default: 0.125_892_54,
+        },
+        ParamDef {
+            id: MIX,
+            name: "mix",
+            min: 0.0,
+            max: 1.0,
+            // FULLY WET, and that is the point of the device: you insert
+            // a tone generator to hear the tone. Turning it down blends
+            // the tone under what is already there, which is the rarer
+            // case and so the one you have to ask for.
+            default: 1.0,
+        },
+    ];
+}
+
+/// LOOM: the wavetable synth.
+///
+/// Two morphing wavetable oscillators — the position knob walks the
+/// whole table set, sine to metal, crossfading equal-power between
+/// neighbours so a scan is one continuous timbre — plus noise, a
+/// multimode filter and two ADSRs. The table rows are ordinary rows:
+/// automation, projects and letters address them like any knob.
+pub mod loom {
+    use super::ParamDef;
+
+    // wavetable osc A
+    pub const A_MORPH: u32 = 0;
+    pub const A_OCT: u32 = 1;
+    pub const A_SEMI: u32 = 2;
+    pub const A_LEVEL: u32 = 3;
+    // wavetable osc B
+    pub const B_MORPH: u32 = 4;
+    pub const B_OCT: u32 = 5;
+    pub const B_SEMI: u32 = 6;
+    pub const B_LEVEL: u32 = 7;
+    // noise
+    pub const N_LEVEL: u32 = 8;
+    pub const N_DECAY: u32 = 9;
+    // filter
+    pub const F_MODE: u32 = 10;
+    pub const F_CUTOFF: u32 = 11;
+    pub const F_RES: u32 = 12;
+    pub const F_ENV: u32 = 13;
+    // amp
+    pub const AMP_A: u32 = 14;
+    pub const AMP_D: u32 = 15;
+    pub const AMP_S: u32 = 16;
+    pub const AMP_R: u32 = 17;
+    pub const GAIN: u32 = 18;
+    pub const VEL: u32 = 19;
+    // filter envelope — its OWN times, not the amp's
+    pub const FENV_A: u32 = 20;
+    pub const FENV_D: u32 = 21;
+    pub const FENV_S: u32 = 22;
+    pub const FENV_R: u32 = 23;
+    // voices
+    pub const V_UNISON: u32 = 24;
+    pub const V_DETUNE: u32 = 25;
+    pub const V_SPREAD: u32 = 26;
+    pub const V_GLIDE: u32 = 27;
+    // the workhorse extras: the pitch envelope (kick drop, snare crack)
+    // and the internal LFO (dub sirens, vibrato)
+    pub const PENV_D: u32 = 28;
+    pub const PENV: u32 = 29;
+    pub const LFO_RATE: u32 = 30;
+    pub const LFO_PITCH: u32 = 31;
+
+    /// Voices the synth owns, before unison multiplies what one note
+    /// costs. Sixteen = two groups of eight lanes.
+    pub const VOICES: usize = 16;
+
+    pub const FILTER_MODES: &[&str] = &["lp", "hp", "bp", "notch"];
+    /// Octave transpose choices, index minus `OCT_CENTER` is the octave.
+    pub const OCTAVES: &[&str] = &["-4", "-3", "-2", "-1", "0", "+1", "+2", "+3", "+4"];
+    pub const OCT_CENTER: u32 = 4;
+    /// Unison voices per note: `voices = index + 1`.
+    pub const UNISON: &[&str] = &["1", "2", "3", "4", "5", "6", "7", "8"];
+
+    pub const TABLE: &[ParamDef] = &[
+        ParamDef {
+            id: A_MORPH,
+            name: "a morph",
+            min: 0.0,
+            max: 1.0,
+            default: 0.35,
+        },
+        ParamDef {
+            id: A_OCT,
+            name: "a octave",
+            min: 0.0,
+            max: (OCTAVES.len() - 1) as f32,
+            default: OCT_CENTER as f32,
+        },
+        ParamDef {
+            id: A_SEMI,
+            name: "a semi",
+            min: -12.0,
+            max: 12.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: A_LEVEL,
+            name: "a level",
+            min: 0.0,
+            max: 100.0,
+            default: 100.0,
+        },
+        ParamDef {
+            id: B_MORPH,
+            name: "b morph",
+            min: 0.0,
+            max: 1.0,
+            default: 0.35,
+        },
+        ParamDef {
+            id: B_OCT,
+            name: "b octave",
+            min: 0.0,
+            max: (OCTAVES.len() - 1) as f32,
+            default: OCT_CENTER as f32,
+        },
+        ParamDef {
+            id: B_SEMI,
+            name: "b semi",
+            min: -12.0,
+            max: 12.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: B_LEVEL,
+            name: "b level",
+            min: 0.0,
+            max: 100.0,
+            default: 50.0,
+        },
+        ParamDef {
+            id: N_LEVEL,
+            name: "noise",
+            min: 0.0,
+            max: 100.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: N_DECAY,
+            name: "n decay",
+            min: 1.0,
+            max: 2_000.0,
+            default: 40.0,
+        },
+        ParamDef {
+            id: F_MODE,
+            name: "mode",
+            min: 0.0,
+            max: (FILTER_MODES.len() - 1) as f32,
+            default: 0.0,
+        },
+        ParamDef {
+            id: F_CUTOFF,
+            name: "cutoff",
+            min: 20.0,
+            max: 20_000.0,
+            default: 12_000.0,
+        },
+        ParamDef {
+            id: F_RES,
+            name: "res",
+            min: 0.0,
+            max: 100.0,
+            default: 30.0,
+        },
+        ParamDef {
+            id: F_ENV,
+            name: "f env",
+            min: -1.0,
+            max: 1.0,
+            default: 0.5,
+        },
+        ParamDef {
+            id: AMP_A,
+            name: "attack",
+            min: 0.1,
+            max: 5_000.0,
+            default: 2.0,
+        },
+        ParamDef {
+            id: AMP_D,
+            name: "decay",
+            min: 1.0,
+            max: 30_000.0,
+            default: 300.0,
+        },
+        ParamDef {
+            id: AMP_S,
+            name: "sustain",
+            min: 0.0,
+            max: 1.0,
+            default: 0.7,
+        },
+        ParamDef {
+            id: AMP_R,
+            name: "release",
+            min: 1.0,
+            max: 30_000.0,
+            default: 300.0,
+        },
+        ParamDef {
+            id: GAIN,
+            name: "gain",
+            min: 0.0,
+            max: 2.0,
+            default: 0.5,
+        },
+        ParamDef {
+            id: VEL,
+            name: "velocity",
+            min: 0.0,
+            max: 100.0,
+            default: 100.0,
+        },
+        ParamDef {
+            id: FENV_A,
+            name: "f attack",
+            min: 0.1,
+            max: 5_000.0,
+            default: 2.0,
+        },
+        ParamDef {
+            id: FENV_D,
+            name: "f decay",
+            min: 1.0,
+            max: 30_000.0,
+            default: 400.0,
+        },
+        ParamDef {
+            id: FENV_S,
+            name: "f sustain",
+            min: 0.0,
+            max: 1.0,
+            default: 0.4,
+        },
+        ParamDef {
+            id: FENV_R,
+            name: "f release",
+            min: 1.0,
+            max: 30_000.0,
+            default: 200.0,
+        },
+        ParamDef {
+            id: V_UNISON,
+            name: "unison",
+            min: 0.0,
+            max: (UNISON.len() - 1) as f32,
+            default: 0.0,
+        },
+        ParamDef {
+            id: V_DETUNE,
+            name: "detune",
+            min: 0.0,
+            max: 100.0,
+            default: 6.0,
+        },
+        ParamDef {
+            id: V_SPREAD,
+            name: "spread",
+            min: 0.0,
+            max: 100.0,
+            default: 50.0,
+        },
+        ParamDef {
+            id: V_GLIDE,
+            name: "glide",
+            // One millisecond is the floor: a glide shorter than a
+            // sample is no glide, and a LOG mapping needs a positive
+            // floor — log(0) is not a number a knob can show.
+            min: 1.0,
+            max: 2_000.0,
+            default: 1.0,
+        },
+        ParamDef {
+            id: PENV_D,
+            name: "p decay",
+            min: 1.0,
+            max: 500.0,
+            default: 1.0,
+        },
+        ParamDef {
+            id: PENV,
+            name: "p env",
+            min: -48.0,
+            max: 48.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: LFO_RATE,
+            name: "lfo rate",
+            min: 0.05,
+            max: 30.0,
+            default: 3.0,
+        },
+        ParamDef {
+            id: LFO_PITCH,
+            name: "lfo pitch",
+            min: 0.0,
+            max: 2.0,
+            default: 0.0,
+        },
+    ];
+}
+
+/// SIGIL: the ring modulator.
+///
+/// The carrier frequency is chosen in octaves like any other pitched
+/// thing, and the mix reaches an EXACT bypass at zero — the one promise
+/// every colour stage keeps, so a sigil can sit in a chain and be
+/// measured rather than merely asserted.
+pub mod sigil {
+    use super::ParamDef;
+
+    pub const SHAPE: u32 = 0;
+    pub const FREQ: u32 = 1;
+    pub const MIX: u32 = 2;
+
+    /// The three forms the seal can be cast in. Sine is the classic
+    /// spectral mirror; triangle is the gentler one; square is the
+    /// metallic one that turns every input into an anvil.
+    pub const SHAPE_NAMES: &[&str] = &["sine", "tri", "square"];
+
+    /// Below a hertz is where the seal stops being a tone and starts
+    /// being a slow throb — tremolo territory, and it belongs here
+    /// because a ring modulator that cannot be parked there is missing
+    /// half its range.
+    pub const FREQ_MIN: f32 = 0.25;
+    pub const FREQ_MAX: f32 = 8_000.0;
+
+    pub const TABLE: &[ParamDef] = &[
+        ParamDef {
+            id: SHAPE,
+            name: "shape",
+            min: 0.0,
+            max: (SHAPE_NAMES.len() - 1) as f32,
+            default: 0.0,
+        },
+        ParamDef {
+            id: FREQ,
+            name: "freq",
+            min: FREQ_MIN,
+            max: FREQ_MAX,
+            // A440, the same A the tone generator defaults to — a sigil
+            // dropped on a track in A meets the music it finds there.
+            default: 440.0,
+        },
+        ParamDef {
+            id: MIX,
+            name: "mix",
+            min: 0.0,
+            max: 1.0,
+            // Half cast: the ring is clearly there, and clearly
+            // bypassable both ways from where you start.
+            default: 0.5,
+        },
+    ];
+}
+
+/// Gauge: the measurement utility.
+///
+/// It changes nothing. That is its whole contract, and the reason it can
+/// be left in a chain: what it reports is what was there, and what comes
+/// out is what went in, bit for bit.
+pub mod gauge {
+    use super::ParamDef;
+
+    pub const WINDOW: u32 = 0;
+    pub const HOLD: u32 = 1;
+    pub const RANGE: u32 = 2;
+
+    /// The meter's floor options, in dB. A meter with the wrong range
+    /// shows either a solid bar or nothing at all.
+    pub const RANGE_NAMES: &[&str] = &["-24", "-48", "-72"];
+    pub const RANGE_FLOORS: [f32; 3] = [-24.0, -48.0, -72.0];
+
+    pub const TABLE: &[ParamDef] = &[
+        ParamDef {
+            id: WINDOW,
+            name: "window",
+            min: 1.0,
+            max: 1_000.0,
+            // 300 ms: the standard integration for a programme meter, and
+            // long enough that the number stops dancing.
+            default: 300.0,
+        },
+        ParamDef {
+            id: HOLD,
+            name: "hold",
+            min: 0.0,
+            max: 10.0,
+            // Two seconds. Long enough to read a peak that went by while
+            // you were looking at something else.
+            default: 2.0,
+        },
+        ParamDef {
+            id: RANGE,
+            name: "range",
+            min: 0.0,
+            max: (RANGE_FLOORS.len() - 1) as f32,
+            default: 1.0,
+        },
+    ];
+}
+
+/// Tine: the struck-resonator synth.
+///
+/// Excite a structure and let it ring. The MODE TABLES are the structure
+/// — the ratios a material's partials fall on — and they live here so the
+/// card can draw the same spectrum the voices sound. See `audio::tine`.
+pub mod tine {
+    use super::ParamDef;
+
+    pub const MATERIAL: u32 = 0;
+    pub const STRIKE: u32 = 1;
+    pub const PLACE: u32 = 2;
+    pub const DECAY: u32 = 3;
+    pub const BODY: u32 = 4;
+    pub const TONE: u32 = 5;
+    pub const SPREAD: u32 = 6;
+    pub const TUNE: u32 = 7;
+    pub const LEVEL: u32 = 8;
+
+    /// How many partials a voice rings on.
+    pub const MODES: usize = 8;
+
+    /// A STRING's partials: whole multiples of the fundamental. What a
+    /// plucked or struck string does, and what the ear hears as "a note".
+    pub const HARMONIC: [f32; MODES] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+
+    /// A BAR's partials, free at both ends. Not multiples of anything —
+    /// which is why a marimba or a glockenspiel has a pitch you can name
+    /// and a sound you would never call a note.
+    ///
+    /// These are the real ratios, from the bar's own equation. They are
+    /// the reason MATERIAL is one knob and not a menu: everything between
+    /// a string and a bar is a position on this morph.
+    pub const INHARMONIC: [f32; MODES] = [1.0, 2.756, 5.404, 8.933, 13.34, 18.64, 24.82, 31.87];
+
+    /// Where a partial's ratio sits at a given MATERIAL, `0` string to
+    /// `1` bar.
+    pub fn ratio(material: f32, mode: usize) -> f32 {
+        let t = material.clamp(0.0, 1.0);
+        let a = HARMONIC.get(mode).copied().unwrap_or(1.0);
+        let b = INHARMONIC.get(mode).copied().unwrap_or(1.0);
+        a + (b - a) * t
+    }
+
+    /// How loud a partial is excited when the structure is struck at
+    /// `place`, `0`..`1` along it.
+    ///
+    /// `|sin(pi * n * place)|` — not a curve chosen to sound nice, but
+    /// what actually happens: a partial with a node where you hit it
+    /// cannot be excited at all. Striking at a half kills the even
+    /// partials, at a third kills every third, and at the very end
+    /// excites everything, which is why picking near the bridge is
+    /// bright and thin.
+    pub fn strike_gain(place: f32, mode: usize) -> f32 {
+        let p = place.clamp(0.0, 1.0);
+        (core::f32::consts::PI * (mode + 1) as f32 * p).sin().abs()
+    }
+
+    /// Ring time at the bottom and top of DECAY, in seconds, for the
+    /// first partial at the reference pitch.
+    pub const RING_SHORT_S: f32 = 0.18;
+    pub const RING_LONG_S: f32 = 9.0;
+    /// The pitch the ring times are quoted at. A shared resonator Q makes
+    /// higher notes decay faster, which is what a real bar does.
+    pub const RING_REF_HZ: f32 = 220.0;
+
+    /// How long partial `mode` rings, in seconds.
+    ///
+    /// Higher partials always die first, and they die FASTER on a string
+    /// than on a bar — which is most of what tells wood from metal. Here
+    /// rather than in the node because the card draws these lengths, and
+    /// a second copy of the falloff would be a second opinion about what
+    /// the instrument is made of.
+    pub fn ring_seconds(material: f32, decay: f32, mode: usize) -> f32 {
+        let decay = decay.clamp(0.0, 1.0);
+        let base = RING_SHORT_S + (RING_LONG_S - RING_SHORT_S) * decay * decay;
+        let falloff = 0.62 + 0.33 * material.clamp(0.0, 1.0);
+        base * falloff.powi(mode as i32)
+    }
+
+    /// Past this, STRIKE stops being a mallet and becomes a BOW: the
+    /// excitation sustains for as long as the note is held instead of
+    /// being a burst.
+    pub const BOW_AT: f32 = 0.78;
+
+    pub const TUNE_MAX_ST: f32 = 24.0;
+    pub const LEVEL_MIN: f32 = 0.0;
+    pub const LEVEL_MAX: f32 = 2.0;
+
+    pub const TABLE: &[ParamDef] = &[
+        ParamDef {
+            id: MATERIAL,
+            name: "material",
+            min: 0.0,
+            max: 1.0,
+            // A third of the way to the bar: enough inharmonicity to
+            // sound struck rather than plucked, and not so much that it
+            // stops having a pitch. This is the knob the instrument is
+            // for, and it opens where the instrument is most itself.
+            default: 0.34,
+        },
+        ParamDef {
+            id: STRIKE,
+            name: "strike",
+            min: 0.0,
+            max: 1.0,
+            // A firm mallet. Soft enough to have a body, hard enough to
+            // have an attack.
+            default: 0.45,
+        },
+        ParamDef {
+            id: PLACE,
+            name: "place",
+            min: 0.02,
+            max: 0.5,
+            // A fifth of the way along — where a piano's hammers hit,
+            // and for the reason they do: it suppresses the seventh
+            // partial, which is the one that sounds sour.
+            default: 0.2,
+        },
+        ParamDef {
+            id: DECAY,
+            name: "decay",
+            min: 0.0,
+            max: 1.0,
+            default: 0.5,
+        },
+        ParamDef {
+            id: BODY,
+            name: "body",
+            min: 0.0,
+            max: 1.0,
+            // The cabinet the thing is mounted in. Present, because an
+            // unmounted resonator sounds like a test tone.
+            default: 0.35,
+        },
+        ParamDef {
+            id: TONE,
+            name: "tone",
+            min: -1.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: SPREAD,
+            name: "spread",
+            min: 0.0,
+            max: 1.0,
+            // Voices fanned across the field by their own index, so a
+            // chord arrives as a chord rather than as a stack.
+            default: 0.45,
+        },
+        ParamDef {
+            id: TUNE,
+            name: "tune",
+            min: -TUNE_MAX_ST,
+            max: TUNE_MAX_ST,
+            default: 0.0,
+        },
+        ParamDef {
+            id: LEVEL,
+            name: "level",
+            min: LEVEL_MIN,
+            max: LEVEL_MAX,
+            default: 0.8,
+        },
+    ];
+}
+
+/// LENS — the analog poly, bent.
+///
+/// Two oscillators, a sub and noise into a 24 dB ladder, which is the
+/// classic machine exactly. What makes it this one is the LENS between
+/// them: a single warp axis the whole oscillator section passes through.
+///
+/// # The lens
+///
+/// [`WARP`] is how much, [`BEND`] is which — and BEND is a morph, not a
+/// menu, because the three regimes it crosses are the same operation
+/// aimed at different places in the signal:
+///
+/// | bend | regime | what bends |
+/// |---|---|---|
+/// | 0.0 | phase | the phase, before the table read — self-PM |
+/// | 0.5 | fold  | the amplitude, after it — a triangle folder |
+/// | 1.0 | ring  | the envelope, by a sine at a ratio of the note |
+///
+/// All three run at every setting; the weights are a triangle over BEND,
+/// so the middle of the knob is genuinely half of two regimes rather
+/// than a crossfade between two rendered voices. At `WARP = 0` all three
+/// depths are zero and the path is EXACTLY the unwarped one — the same
+/// promise the sampler's colour stages make, and for the same reason:
+/// the bend has to be measurable, not merely asserted.
+///
+/// [`WARP`]: WARP
+/// [`BEND`]: BEND
+pub mod lens {
+    use super::ParamDef;
+
+    // The tone row.
+    pub const MIX: u32 = 0;
+    pub const DETUNE: u32 = 1;
+    pub const WIDTH: u32 = 2;
+    pub const SUB: u32 = 3;
+    pub const NOISE: u32 = 4;
+    pub const WARP: u32 = 5;
+    pub const BEND: u32 = 6;
+    pub const DRIFT: u32 = 7;
+
+    // The shape row.
+    pub const CUTOFF: u32 = 8;
+    pub const RESO: u32 = 9;
+    pub const ENV: u32 = 10;
+    pub const ATTACK: u32 = 11;
+    pub const DECAY: u32 = 12;
+    pub const SUSTAIN: u32 = 13;
+    pub const RELEASE: u32 = 14;
+    pub const ENSEMBLE: u32 = 15;
+    pub const LEVEL: u32 = 16;
+
+    /// The three things BEND crosses, in the order it crosses them.
+    pub const REGIMES: [&str; 3] = ["phase", "fold", "ring"];
+
+    /// How much of each regime is in the signal at a given BEND.
+    ///
+    /// A triangle per regime, centred on its own position and one full
+    /// span wide, so the weights sum to one everywhere and each regime
+    /// reaches its own peak alone. Shared because the card prints the
+    /// mix and the voice multiplies by it: two triangles would be two
+    /// opinions about what the knob is pointing at.
+    pub fn regime_mix(bend: f32) -> [f32; REGIMES.len()] {
+        let b = bend.clamp(0.0, 1.0) * (REGIMES.len() - 1) as f32;
+        let mut out = [0.0; REGIMES.len()];
+        for (i, w) in out.iter_mut().enumerate() {
+            *w = (1.0 - (b - i as f32).abs()).max(0.0);
+        }
+        out
+    }
+
+    /// What to call where BEND is pointing.
+    pub fn regime_name(bend: f32) -> &'static str {
+        let mix = regime_mix(bend);
+        let mut best = 0;
+        for (i, w) in mix.iter().enumerate() {
+            if *w > mix[best] {
+                best = i;
+            }
+        }
+        REGIMES[best]
+    }
+
+    /// How deep the self-phase-modulation goes, in turns of phase.
+    ///
+    /// Fed as a PM input from a sine locked to the oscillator's own
+    /// pitch and phase — which is self-PM written feed-forward, so the
+    /// no-feedback rule in the synth brief holds without costing the
+    /// sound anything. A third of a turn is where a saw stops being a
+    /// saw and starts being the hollow, formant-ish thing a phase
+    /// distortion synth is known for.
+    pub const PM_MAX_TURNS: f32 = 0.34;
+
+    pub fn pm_depth(warp: f32, bend: f32) -> f32 {
+        warp.clamp(0.0, 1.0) * regime_mix(bend)[0] * PM_MAX_TURNS
+    }
+
+    /// Input gain into the triangle folder. ONE at the bottom, which is
+    /// the folder's exact identity — a fold that cannot be switched off
+    /// is a colour you can never measure.
+    pub const FOLD_MAX_DRIVE: f32 = 7.0;
+
+    pub fn fold_drive(warp: f32, bend: f32) -> f32 {
+        1.0 + (FOLD_MAX_DRIVE - 1.0) * warp.clamp(0.0, 1.0) * regime_mix(bend)[1]
+    }
+
+    /// How much of the ring modulator replaces the dry signal, `0..=1`.
+    pub fn ring_depth(warp: f32, bend: f32) -> f32 {
+        warp.clamp(0.0, 1.0) * regime_mix(bend)[2]
+    }
+
+    /// The ring modulator's pitch, as a ratio of the note.
+    ///
+    /// Not a whole number, and that is the point: a whole ratio ring-mods
+    /// back onto the harmonic series and just sounds like a filter. This
+    /// one lands between partials and makes the metallic, bell-adjacent
+    /// clang the regime is there for.
+    pub const RING_RATIO: f32 = 2.717;
+
+    /// The duty cycle WIDTH asks for, `0.5` (square) down to a sliver.
+    ///
+    /// The pulse is built as the difference of two saws a fraction of a
+    /// cycle apart, which is the analog trick and needs no new kernel —
+    /// the phase offset IS the duty cycle.
+    pub const WIDTH_MIN_DUTY: f32 = 0.06;
+
+    pub fn duty(width: f32) -> f32 {
+        0.5 - (0.5 - WIDTH_MIN_DUTY) * width.clamp(0.0, 1.0)
+    }
+
+    /// How far DRIFT pulls one voice off the others.
+    ///
+    /// Three destinations from one per-voice random walk, because that is
+    /// what the analog fault actually was: one drifting reference per
+    /// card moved everything on it together. Independent noise on three
+    /// destinations sounds like three effects; this sounds like a voice.
+    pub const DRIFT_CENTS: f32 = 11.0;
+    pub const DRIFT_CUTOFF: f32 = 0.22;
+    pub const DRIFT_WARP: f32 = 0.18;
+
+    /// Below this, ENSEMBLE leaves the signal alone.
+    ///
+    /// The classic string chorus smears the bass into porridge because
+    /// it choruses everything. An LR4 split at the bottom of the cello's
+    /// range keeps the low end mono and solid and lets the top swim,
+    /// which is what the effect was always for.
+    pub const ENSEMBLE_SPLIT_HZ: f32 = 180.0;
+    pub const ENSEMBLE_BASE_MS: f32 = 9.0;
+    pub const ENSEMBLE_SWING_MS: f32 = 5.2;
+    pub const ENSEMBLE_HZ: f32 = 0.62;
+
+    pub const CUTOFF_MIN_HZ: f32 = 20.0;
+    pub const CUTOFF_MAX_HZ: f32 = 18_000.0;
+    pub const TIME_MIN_MS: f32 = 1.0;
+    pub const TIME_MAX_MS: f32 = 8_000.0;
+    pub const ATTACK_MIN_MS: f32 = 0.5;
+    pub const ATTACK_MAX_MS: f32 = 4_000.0;
+    pub const DETUNE_MAX_CENTS: f32 = 50.0;
+    pub const LEVEL_MAX: f32 = 2.0;
+
+    /// The knob positions the card draws a cycle from — natural units,
+    /// exactly as the engine holds them.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct Shape {
+        pub mix: f32,
+        pub width: f32,
+        pub sub: f32,
+        pub noise: f32,
+        pub warp: f32,
+        pub bend: f32,
+    }
+
+    /// One cycle of the voice as it leaves the lens, into `out`.
+    ///
+    /// THE SAME ARITHMETIC THE VOICE RUNS, in the same order: mix, then
+    /// phase warp, then fold, then ring. What differs is that the engine
+    /// reads band-limited tables and oversamples the folder, so this is
+    /// the IDEAL shape rather than the rendered one — which is what a
+    /// display should show, since the anti-aliasing is a thing the
+    /// instrument does to avoid an artefact, not a thing it sounds like.
+    ///
+    /// Noise is deliberately absent: it has no cycle, and drawing one
+    /// frozen instance of it as though it repeated would be a lie about
+    /// the shape. The card states the noise level in text instead.
+    pub fn cycle(shape: &Shape, out: &mut [f32]) {
+        let n = out.len();
+        if n == 0 {
+            return;
+        }
+        let pm = pm_depth(shape.warp, shape.bend);
+        let drive = fold_drive(shape.warp, shape.bend);
+        let ring = ring_depth(shape.warp, shape.bend);
+        let duty = duty(shape.width);
+        let mix = shape.mix.clamp(0.0, 1.0);
+        let sub = shape.sub.clamp(0.0, 1.0);
+        let tau = core::f32::consts::TAU;
+
+        for (i, s) in out.iter_mut().enumerate() {
+            let t = i as f32 / n as f32;
+            // The warp is on the PHASE, which is why it survives the
+            // filter: it changes which harmonics exist, not how loud the
+            // ones already there are.
+            let p = t + pm * (tau * t).sin();
+            let saw = |x: f32| {
+                let f = x - x.floor();
+                f * 2.0 - 1.0
+            };
+            // Two saws a duty cycle apart IS a pulse — the analog trick,
+            // and the reason WIDTH needs no waveform of its own.
+            // The difference of two saws a duty apart is ALREADY dc-free
+            // and already peak-to-peak two — the offset a naive pulse
+            // needs is the wrap itself. Nothing to correct.
+            let pulse = saw(p) - saw(p + duty);
+            let osc = saw(p) * (1.0 - mix) + pulse * mix;
+            let square = if (p - p.floor()) < 0.5 { 1.0 } else { -1.0 };
+            let mut v = osc + square * sub * 0.7;
+            v = fold(v * drive) / drive.max(1.0).sqrt();
+            let modulator = (tau * t * RING_RATIO).sin();
+            *s = v * (1.0 - ring) + v * modulator * ring;
+        }
+    }
+
+    /// The folder's transfer curve, stated once. The kernel's closed-form
+    /// triangle, repeated here because the card cannot reach into
+    /// `dsp::shaper` without crossing the layer the UI is not allowed to
+    /// cross — and asserted equal to it by a test in `audio::lens`.
+    pub fn fold(x: f32) -> f32 {
+        let m = (x + 1.0) * 0.25;
+        let t = (m - m.floor()) * 4.0;
+        1.0 - (t - 2.0).abs()
+    }
+
+    pub const TABLE: &[ParamDef] = &[
+        ParamDef {
+            id: MIX,
+            name: "mix",
+            min: 0.0,
+            max: 1.0,
+            // Mostly saw with the pulse under it: the sound every classic
+            // poly preset starts from.
+            default: 0.35,
+        },
+        ParamDef {
+            id: DETUNE,
+            name: "detune",
+            min: 0.0,
+            max: DETUNE_MAX_CENTS,
+            // Nine cents. Enough beating to be two oscillators, little
+            // enough to still be one note.
+            default: 9.0,
+        },
+        ParamDef {
+            id: WIDTH,
+            name: "width",
+            min: 0.0,
+            max: 1.0,
+            default: 0.34,
+        },
+        ParamDef {
+            id: SUB,
+            name: "sub",
+            min: 0.0,
+            max: 1.0,
+            default: 0.22,
+        },
+        ParamDef {
+            id: NOISE,
+            name: "noise",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: WARP,
+            name: "warp",
+            min: 0.0,
+            max: 1.0,
+            // Open with the lens actually in the path. A synth whose one
+            // idea is off by default teaches nobody what it is.
+            default: 0.26,
+        },
+        ParamDef {
+            id: BEND,
+            name: "bend",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: DRIFT,
+            name: "drift",
+            min: 0.0,
+            max: 1.0,
+            default: 0.24,
+        },
+        ParamDef {
+            id: CUTOFF,
+            name: "cutoff",
+            min: CUTOFF_MIN_HZ,
+            max: CUTOFF_MAX_HZ,
+            default: 2_400.0,
+        },
+        ParamDef {
+            id: RESO,
+            name: "reso",
+            min: 0.0,
+            max: 1.0,
+            default: 0.26,
+        },
+        ParamDef {
+            id: ENV,
+            name: "env",
+            min: -1.0,
+            max: 1.0,
+            default: 0.45,
+        },
+        ParamDef {
+            id: ATTACK,
+            name: "attack",
+            min: ATTACK_MIN_MS,
+            max: ATTACK_MAX_MS,
+            default: 4.0,
+        },
+        ParamDef {
+            id: DECAY,
+            name: "decay",
+            min: TIME_MIN_MS,
+            max: TIME_MAX_MS,
+            default: 900.0,
+        },
+        ParamDef {
+            id: SUSTAIN,
+            name: "sustain",
+            min: 0.0,
+            max: 1.0,
+            default: 0.55,
+        },
+        ParamDef {
+            id: RELEASE,
+            name: "release",
+            min: TIME_MIN_MS,
+            max: TIME_MAX_MS,
+            default: 320.0,
+        },
+        ParamDef {
+            id: ENSEMBLE,
+            name: "ensemble",
+            min: 0.0,
+            max: 1.0,
+            default: 0.3,
+        },
+        ParamDef {
+            id: LEVEL,
+            name: "level",
+            min: 0.0,
+            max: LEVEL_MAX,
+            default: 0.4,
+        },
+    ];
+}
+
 pub mod lofi {
     use super::ParamDef;
 

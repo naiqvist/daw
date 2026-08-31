@@ -181,6 +181,10 @@ impl App {
                 .unwrap_or("take")
                 .to_owned();
             let source = AudioSource {
+                transpose: 0.0,
+                detune: 0.0,
+                transposed_from: None,
+                applied_ratio: 1.0,
                 path: take.path.clone(),
                 sample_rate: take.sample_rate,
                 source_offset: 0,

@@ -1162,7 +1162,8 @@ pub fn role_color(theme: &Theme, param: &Param) -> egui::Color32 {
         | crate::ui::device::param::Unit::Ms
         | crate::ui::device::param::Unit::Seconds
         | crate::ui::device::param::Unit::Note
-        | crate::ui::device::param::Unit::Semitones => theme.role_time,
+        | crate::ui::device::param::Unit::Semitones
+        | crate::ui::device::param::Unit::Cents => theme.role_time,
         // Percent and dB are AMOUNTS — ochre — except a bipolar one,
         // which is a modulation depth by construction.
         crate::ui::device::param::Unit::Percent | crate::ui::device::param::Unit::Db => {

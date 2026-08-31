@@ -813,6 +813,63 @@ pub fn sanitize_chain(chain: &mut Vec<DeviceInstance>) {
     chain.insert(0, instrument);
 }
 
+/// Remove picked devices from one chain and return every id that went.
+///
+/// A picked rack takes its children with it: leaving them behind with a
+/// parent id that no longer exists would make them invisible in the editor
+/// while they continued to sound. Removing a child alone leaves its rack in
+/// place, and any macro that named the child is cleared rather than left as
+/// a dangling remote control.
+pub fn remove_devices(
+    chain: &mut Vec<DeviceInstance>,
+    racks: &mut std::collections::BTreeMap<u64, device::RackUi>,
+    picked: &std::collections::BTreeSet<u64>,
+) -> Vec<u64> {
+    let mut removed: std::collections::BTreeSet<u64> = chain
+        .iter()
+        .filter(|instance| picked.contains(&instance.id))
+        .map(|instance| instance.id)
+        .collect();
+
+    // Racks do not nest today, but closing over parents makes the rule
+    // correct if they ever do, and the chain is bounded by the document.
+    loop {
+        let before = removed.len();
+        for instance in chain.iter() {
+            if instance
+                .parent
+                .is_some_and(|parent| removed.contains(&parent))
+            {
+                removed.insert(instance.id);
+            }
+        }
+        if removed.len() == before {
+            break;
+        }
+    }
+    if removed.is_empty() {
+        return Vec::new();
+    }
+
+    chain.retain(|instance| !removed.contains(&instance.id));
+    racks.retain(|id, rack| {
+        if removed.contains(id) {
+            return false;
+        }
+        for knob in &mut rack.macros {
+            if knob
+                .target
+                .as_ref()
+                .is_some_and(|target| removed.contains(&target.device))
+            {
+                knob.target = None;
+            }
+        }
+        true
+    });
+    removed.into_iter().collect()
+}
+
 impl Default for Track {
     fn default() -> Self {
         Self {
@@ -1104,6 +1161,52 @@ mod rack_tests {
     fn an_empty_chain_declines_to_group() {
         let mut track = Track::default();
         assert!(track.group_into_rack(99, "r").is_none());
+        assert!(track.chain.is_empty());
+        assert!(track.racks.is_empty());
+    }
+
+    #[test]
+    fn deleting_picked_devices_keeps_the_rest_in_signal_order() {
+        let mut track = track_with(&[DeviceKind::SineSynth, DeviceKind::Lofi, DeviceKind::Sheen]);
+        let picked = [track.chain[0].id, track.chain[2].id].into_iter().collect();
+        let removed = remove_devices(&mut track.chain, &mut track.racks, &picked);
+
+        assert_eq!(removed, vec![1, 3]);
+        assert_eq!(
+            track
+                .chain
+                .iter()
+                .map(|device| device.id)
+                .collect::<Vec<_>>(),
+            vec![2],
+            "the unpicked effect moved or disappeared"
+        );
+    }
+
+    #[test]
+    fn deleting_a_rack_takes_its_children_and_child_deletion_clears_macros() {
+        let mut track = track_with(&[DeviceKind::Lofi, DeviceKind::Sheen]);
+        let child = track.chain[0].id;
+        let rack = track.group_into_rack(99, "r").unwrap();
+        track.racks.get_mut(&rack).unwrap().macros[0].target = Some(device::MacroTarget {
+            device: child,
+            param: 0,
+            label: "mix".to_owned(),
+        });
+
+        let picked = [child].into_iter().collect();
+        assert_eq!(
+            remove_devices(&mut track.chain, &mut track.racks, &picked),
+            vec![child]
+        );
+        assert!(
+            track.racks[&rack].macros[0].target.is_none(),
+            "a macro kept a dangling device target"
+        );
+
+        let picked = [rack].into_iter().collect();
+        let removed = remove_devices(&mut track.chain, &mut track.racks, &picked);
+        assert_eq!(removed, vec![2, rack], "the rack did not take its child");
         assert!(track.chain.is_empty());
         assert!(track.racks.is_empty());
     }
