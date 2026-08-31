@@ -13,6 +13,7 @@ pub mod pitch;
 pub mod render;
 pub mod sequencing;
 pub mod slice;
+pub mod tempo;
 pub mod theory;
 pub mod ui;
 

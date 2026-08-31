@@ -396,10 +396,55 @@ impl Track {
 }
 
 /// Application-owned song context shared by the arrangement and note views.
+/// A tempo change in song time. The tempo holds CONSTANT until the next
+/// mark — see `notes/20260831-midi-and-tempo-decisions.md` for why a ramp
+/// is deliberately not the first shape: a prefix sum over constant
+/// segments is exact where an integrated ramp drifts along a long
+/// timeline, and ramps stay strictly additive later.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct TempoMark {
+    pub tick: usize,
+    pub bpm: f64,
+}
+
+/// A meter change in song time. Bars are counted from the mark onward.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct MeterMark {
+    pub tick: usize,
+    pub numerator: u32,
+    pub denominator: u32,
+}
+
+/// A tempo a musician could actually mean. Marks outside this are dropped
+/// rather than trusted: a zero or NaN bpm would make a tick worth
+/// infinity samples and hang the compile that tried to stamp it.
+const MIN_BPM: f64 = 1.0;
+const MAX_BPM: f64 = 1000.0;
+
+fn usable_bpm(bpm: f64) -> bool {
+    bpm.is_finite() && (MIN_BPM..=MAX_BPM).contains(&bpm)
+}
+
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Song {
     pub tracks: Vec<Track>,
     pub patterns: Vec<Pattern>,
+    /// Tempo changes in song time, sorted by tick.
+    ///
+    /// EMPTY MEANS the single global tempo the transport has always
+    /// carried, so every project written before the map keeps its
+    /// meaning and `SetTempo` remains the no-marks case.
+    ///
+    /// Tempo is its OWN authority, never an automation target: an
+    /// envelope is read *at* a tick, and tempo is what decides what a
+    /// tick is worth. It is not a value in a unit — it is the unit's
+    /// exchange rate.
+    #[serde(default)]
+    pub tempo: Vec<TempoMark>,
+    /// Meter changes in song time, sorted by tick. Empty means the
+    /// transport's single global signature.
+    #[serde(default)]
+    pub meter: Vec<MeterMark>,
     /// The project-level harmonic context. Degree anchors resolve against
     /// it; absolute anchors never read it.
     pub key: Key,
@@ -428,12 +473,79 @@ impl Default for Song {
                 pan: 0.0,
             }],
             patterns: vec![pattern],
+            tempo: Vec::new(),
+            meter: Vec::new(),
             key: default_key(),
         }
     }
 }
 
 impl Song {
+    /// The tempo in force at `tick`, or `fallback` before the first mark
+    /// (and everywhere, when the map is empty).
+    pub fn bpm_at(&self, tick: usize, fallback: f64) -> f64 {
+        self.tempo
+            .iter()
+            .filter(|mark| mark.tick <= tick && usable_bpm(mark.bpm))
+            .next_back()
+            .map_or(fallback, |mark| mark.bpm)
+    }
+
+    /// The meter in force at `tick`, or `fallback` before the first mark.
+    pub fn meter_at(&self, tick: usize, fallback: (u32, u32)) -> (u32, u32) {
+        self.meter
+            .iter()
+            .filter(|mark| mark.tick <= tick && mark.numerator > 0 && mark.denominator > 0)
+            .next_back()
+            .map_or(fallback, |mark| (mark.numerator, mark.denominator))
+    }
+
+    /// Place or move a tempo mark. A mark already at `tick` takes the new
+    /// tempo; an unusable tempo is refused rather than stored.
+    pub fn set_tempo_mark(&mut self, tick: usize, bpm: f64) -> bool {
+        if !usable_bpm(bpm) {
+            return false;
+        }
+        let at = self.tempo.partition_point(|mark| mark.tick < tick);
+        if self.tempo.get(at).is_some_and(|mark| mark.tick == tick) {
+            self.tempo[at].bpm = bpm;
+        } else {
+            self.tempo.insert(at, TempoMark { tick, bpm });
+        }
+        true
+    }
+
+    pub fn remove_tempo_mark(&mut self, tick: usize) -> bool {
+        let Some(at) = self.tempo.iter().position(|mark| mark.tick == tick) else {
+            return false;
+        };
+        self.tempo.remove(at);
+        true
+    }
+
+    /// Place or move a meter mark. A degenerate signature is refused.
+    pub fn set_meter_mark(&mut self, tick: usize, numerator: u32, denominator: u32) -> bool {
+        if numerator == 0 || denominator == 0 {
+            return false;
+        }
+        let at = self.meter.partition_point(|mark| mark.tick < tick);
+        let mark = MeterMark {
+            tick,
+            numerator,
+            denominator,
+        };
+        if self
+            .meter
+            .get(at)
+            .is_some_and(|existing| existing.tick == tick)
+        {
+            self.meter[at] = mark;
+        } else {
+            self.meter.insert(at, mark);
+        }
+        true
+    }
+
     pub fn pattern(&self, id: PatternId) -> Option<&Pattern> {
         self.patterns.iter().find(|pattern| pattern.id == id)
     }
