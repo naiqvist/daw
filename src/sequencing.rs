@@ -165,6 +165,28 @@ pub struct LoopBrace {
     pub length_ticks: usize,
 }
 
+/// Why a sound could not be landed. Each is said OUT LOUD at the
+/// surface; none of them is a silent no-op.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LandRefusal {
+    NoTrack,
+    NotAnAudioTrack,
+    Occupied,
+    Unreadable,
+}
+
+impl LandRefusal {
+    /// The sign the performer actually reads.
+    pub const fn sign(self) -> &'static str {
+        match self {
+            Self::NoTrack => "LAND: NO TRACK",
+            Self::NotAnAudioTrack => "LAND: NOT AN AUDIO TRACK",
+            Self::Occupied => "LAND: BLOCK IN THE WAY",
+            Self::Unreadable => "LAND: CANNOT READ",
+        }
+    }
+}
+
 /// One placement of recorded sound in song time.
 ///
 /// The `AudioSource` carries everything about the SOUND — path, trim,
@@ -901,6 +923,68 @@ impl Song {
         true
     }
 
+    /// Land recorded sound on a track.
+    ///
+    /// The one place an audio block comes into existence. Refuses through
+    /// the `Result` rather than doing nothing: a silent no-op is
+    /// indistinguishable from a broken key.
+    ///
+    /// LENGTH IS NOT GUESSED. It comes from the file's real duration
+    /// converted through the TEMPO TABLE — not a bar count, not a
+    /// default. A sound landed at the wrong length sounds wrong the
+    /// moment the tempo changes, and the bug then looks like a tempo bug
+    /// rather than an import bug.
+    pub fn place_audio(
+        &mut self,
+        track_index: usize,
+        start_tick: usize,
+        source: crate::audio_source::AudioSource,
+        tempo: &crate::tempo::TempoTable,
+    ) -> Result<BlockId, LandRefusal> {
+        let Some(track) = self.tracks.get(track_index) else {
+            return Err(LandRefusal::NoTrack);
+        };
+        if track.kind != TrackKind::Audio {
+            return Err(LandRefusal::NotAnAudioTrack);
+        }
+        if source.sample_rate == 0 || source.source_frames == 0 {
+            return Err(LandRefusal::Unreadable);
+        }
+        let seconds = source.source_frames as f64 / f64::from(source.sample_rate);
+        let length_ticks = tempo.ticks_for_seconds(start_tick, seconds);
+        let Some(end_tick) = start_tick.checked_add(length_ticks) else {
+            return Err(LandRefusal::Unreadable);
+        };
+        // Both lists: a lane occupied by a pattern is occupied.
+        if track.occupied(start_tick, end_tick) {
+            return Err(LandRefusal::Occupied);
+        }
+        let id = BlockId(
+            self.tracks
+                .iter()
+                .flat_map(|track| {
+                    track
+                        .blocks
+                        .iter()
+                        .map(|block| block.id.0)
+                        .chain(track.audio_blocks.iter().map(|block| block.id.0))
+                })
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1),
+        );
+        let track = &mut self.tracks[track_index];
+        track.audio_blocks.push(AudioBlock {
+            id,
+            start_tick,
+            length_ticks,
+            source,
+            loop_brace: None,
+        });
+        track.audio_blocks.sort_by_key(|block| block.start_tick);
+        Ok(id)
+    }
+
     pub fn pattern_block(&self, id: BlockId) -> Option<(usize, &PatternBlock)> {
         let (track, index) = self.block_location(id)?;
         Some((track, &self.tracks[track].blocks[index]))
@@ -1439,6 +1523,154 @@ mod audio_block_tests {
         track.audio_blocks.push(audio(9, 1_000, 100));
         assert!(track.occupied(1_050, 1_100), "and now the audio is seen");
         assert!(!track.occupied(1_100, 1_200), "but only where it sits");
+    }
+
+    fn audio_track(song: &mut Song) -> usize {
+        song.tracks.push(Track {
+            id: TrackId(99),
+            name: "AUDIO 01".to_owned(),
+            kind: TrackKind::Audio,
+            blocks: Vec::new(),
+            audio_blocks: Vec::new(),
+            muted: false,
+            solo: false,
+            pitch_authority: PitchAuthority::default(),
+            automation: Vec::new(),
+            volume: 1.0,
+            pan: 0.0,
+        });
+        song.tracks.len() - 1
+    }
+
+    /// One second of audio at 120bpm is two beats — 96 ticks.
+    #[test]
+    fn landing_takes_its_length_from_the_files_real_duration() {
+        let mut song = Song::default();
+        let track = audio_track(&mut song);
+        let tempo = crate::tempo::TempoTable::build(&song, 48_000.0, 120.0);
+
+        let id = song
+            .place_audio(track, 0, source(), &tempo)
+            .expect("lands on an audio track");
+        let block = &song.tracks[track].audio_blocks[0];
+        assert_eq!(block.id, id);
+        // 24000 frames at 48kHz is half a second; at 120bpm that is one
+        // beat, which is TICKS_PER_BEAT.
+        assert_eq!(block.length_ticks, TICKS_PER_BEAT);
+    }
+
+    /// THE test the landing brief insists on.
+    ///
+    /// The length must come through the TEMPO MAP. A uniform map would
+    /// pass even if the map were ignored entirely, so this one changes
+    /// tempo underneath the sound: at half speed the same half-second of
+    /// audio spans half as many ticks, because a tick lasts twice as
+    /// long.
+    #[test]
+    fn a_landed_length_follows_a_non_uniform_tempo_map() {
+        let mut song = Song::default();
+        let track = audio_track(&mut song);
+
+        let fast = crate::tempo::TempoTable::build(&song, 48_000.0, 120.0);
+        song.place_audio(track, 0, source(), &fast).expect("lands");
+        let at_120 = song.tracks[track].audio_blocks[0].length_ticks;
+
+        // Now the same sound on a song that runs at half the tempo.
+        let mut slow_song = Song::default();
+        let slow_track = audio_track(&mut slow_song);
+        assert!(slow_song.set_tempo_mark(0, 60.0));
+        let slow = crate::tempo::TempoTable::build(&slow_song, 48_000.0, 120.0);
+        slow_song
+            .place_audio(slow_track, 0, source(), &slow)
+            .expect("lands");
+        let at_60 = slow_song.tracks[slow_track].audio_blocks[0].length_ticks;
+
+        assert_eq!(at_120, TICKS_PER_BEAT);
+        assert_eq!(
+            at_60,
+            TICKS_PER_BEAT / 2,
+            "half the tempo, half the ticks for the same half-second"
+        );
+    }
+
+    /// Every refusal fires, by name, and none of them is silent.
+    #[test]
+    fn landing_refuses_out_loud_for_every_reason() {
+        let mut song = Song::default();
+        let tempo = crate::tempo::TempoTable::build(&song, 48_000.0, 120.0);
+
+        assert_eq!(
+            song.place_audio(99, 0, source(), &tempo),
+            Err(LandRefusal::NoTrack)
+        );
+        // Track 0 of a default song is an INSTRUMENT track.
+        assert_eq!(
+            song.place_audio(0, 0, source(), &tempo),
+            Err(LandRefusal::NotAnAudioTrack)
+        );
+
+        let track = audio_track(&mut song);
+        let mut broken = source();
+        broken.source_frames = 0;
+        assert_eq!(
+            song.place_audio(track, 0, broken, &tempo),
+            Err(LandRefusal::Unreadable)
+        );
+
+        song.place_audio(track, 0, source(), &tempo).expect("lands");
+        assert_eq!(
+            song.place_audio(track, 0, source(), &tempo),
+            Err(LandRefusal::Occupied),
+            "a second sound cannot sit on the first"
+        );
+
+        // And every sign is distinct, so a refusal names its own reason.
+        let signs = [
+            LandRefusal::NoTrack.sign(),
+            LandRefusal::NotAnAudioTrack.sign(),
+            LandRefusal::Occupied.sign(),
+            LandRefusal::Unreadable.sign(),
+        ];
+        for (index, sign) in signs.iter().enumerate() {
+            assert!(sign.starts_with("LAND: "));
+            assert!(!signs[..index].contains(sign), "signs are distinct");
+        }
+    }
+
+    /// A pattern block occupies the lane too. An overlap test that read
+    /// only `audio_blocks` would drop a recording on top of a pattern.
+    #[test]
+    fn landing_refuses_where_a_pattern_block_already_sits() {
+        let mut song = Song::default();
+        // Make track 0 an audio track while keeping its pattern block.
+        song.tracks[0].kind = TrackKind::Audio;
+        let tempo = crate::tempo::TempoTable::build(&song, 48_000.0, 120.0);
+        assert_eq!(
+            song.place_audio(0, 0, source(), &tempo),
+            Err(LandRefusal::Occupied)
+        );
+        // Past the pattern block there is room.
+        assert!(
+            song.place_audio(0, DEFAULT_PATTERN_TICKS, source(), &tempo)
+                .is_ok()
+        );
+    }
+
+    /// Block ids are unique across BOTH lists, or a lookup by id becomes
+    /// ambiguous the moment a track holds one of each.
+    #[test]
+    fn ids_are_unique_across_both_lists() {
+        let mut song = Song::default();
+        let track = audio_track(&mut song);
+        let tempo = crate::tempo::TempoTable::build(&song, 48_000.0, 120.0);
+        let first = song.place_audio(track, 0, source(), &tempo).expect("lands");
+        let second = song
+            .place_audio(track, 480, source(), &tempo)
+            .expect("lands");
+        let pattern_id = song.tracks[0].blocks[0].id;
+        assert_ne!(first, second);
+        assert_ne!(first, pattern_id);
+        assert_ne!(second, pattern_id);
     }
 
     /// The merged view is what the time verbs will walk, so it must be in

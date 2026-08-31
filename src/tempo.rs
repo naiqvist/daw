@@ -35,6 +35,10 @@ pub struct TempoTable {
     /// Always non-empty: there is always a segment starting at tick 0, so
     /// every lookup lands somewhere and none can fail.
     segments: Vec<Segment>,
+    /// The rate the table was resolved at. Kept because converting a
+    /// real-time duration into ticks needs it, and a caller guessing it
+    /// would be guessing the one number that must agree.
+    sample_rate: f64,
 }
 
 impl TempoTable {
@@ -93,7 +97,35 @@ impl TempoTable {
             });
         }
 
-        Self { segments }
+        Self {
+            segments,
+            sample_rate,
+        }
+    }
+
+    /// The rate this table was resolved at.
+    pub fn sample_rate(&self) -> f64 {
+        self.sample_rate
+    }
+
+    /// How many ticks a real-time duration occupies, starting at
+    /// `start_tick`.
+    ///
+    /// Consults the map rather than dividing by one tempo, so a sound
+    /// laid across a tempo change gets the length it will actually
+    /// occupy. Always at least one tick: a placement with no extent is
+    /// not a placement.
+    pub fn ticks_for_seconds(&self, start_tick: usize, seconds: f64) -> usize {
+        if !seconds.is_finite() || seconds <= 0.0 {
+            return 1;
+        }
+        let start_sample = self.sample_at(start_tick);
+        let span = (seconds * self.sample_rate).round();
+        if !span.is_finite() || span <= 0.0 {
+            return 1;
+        }
+        let end_sample = start_sample.saturating_add(span as u64);
+        self.tick_at(end_sample).saturating_sub(start_tick).max(1)
     }
 
     fn segment_for_tick(&self, tick: usize) -> Segment {
