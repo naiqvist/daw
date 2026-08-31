@@ -108,6 +108,36 @@ mod tests {
         );
     }
 
+    /// PUT lands the sound under the cursor. It needed no new verb and
+    /// no new key — it was a refusal until the app had somewhere to put
+    /// a sample in the new world.
+    #[test]
+    fn put_lands_the_sound_under_the_cursor() {
+        let rows = rows();
+        let mut state = BrowserState::default();
+        state.cursor = 1;
+        let (outcome, _) = utter(&mut state, &rows, Some(Verb::Put), None, 1);
+        assert_eq!(
+            outcome.intents,
+            vec![Intent::LandSample(std::path::PathBuf::from(
+                "/samples/iron.wav"
+            ))]
+        );
+        assert!(state.refusal.is_none());
+    }
+
+    /// PUT on a folder is not a sound, and says so rather than doing
+    /// nothing. A silent no-op reads exactly like a broken key.
+    #[test]
+    fn put_on_a_container_refuses_out_loud() {
+        let rows = rows();
+        let mut state = BrowserState::default();
+        state.cursor = 0;
+        let (outcome, _) = utter(&mut state, &rows, Some(Verb::Put), None, 1);
+        assert!(outcome.intents.is_empty());
+        assert_eq!(state.refusal.as_deref(), Some("PUT: NOT A SOUND"));
+    }
+
     #[test]
     fn search_enters_the_existing_field_and_other_verbs_refuse() {
         let rows = rows();
@@ -400,6 +430,20 @@ fn speak(
         (Some(Verb::Search), _) => {
             state.searching = true;
             return SpeakEffect::FocusSearch;
+        }
+        // PUT is the grammar's verb for placing something carried in
+        // from elsewhere, which is exactly what landing a sample is — so
+        // the gesture needs no new verb and no new key. It was a refusal
+        // ("PUT: NOT HERE") until now.
+        (Some(Verb::Put), _) => {
+            let path = rows.get(state.cursor).and_then(|row| match &row.kind {
+                RowKind::Asset(path) => Some(path.clone()),
+                _ => None,
+            });
+            match path {
+                Some(path) => outcome.intents.push(Intent::LandSample(path)),
+                None => state.refusal = Some("PUT: NOT A SOUND".to_owned()),
+            }
         }
         (Some(Verb::Mute), _) => state.audition_enabled = !state.audition_enabled,
         (Some(verb), _) => state.refusal = Some(format!("{}: NOT HERE", verb.name())),

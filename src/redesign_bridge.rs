@@ -958,6 +958,27 @@ impl App {
         for intent in outcome.browser.intents {
             match intent {
                 redesign_browser::Intent::SelectSample(path) => self.place_sample(path, None),
+                redesign_browser::Intent::LandSample(path) => {
+                    // The browser said WHICH sound; the target comes from
+                    // where attention already is, so the cursor never
+                    // travels to place something. When held track keys
+                    // arrive (roadmap item 1) they replace this line and
+                    // nothing else.
+                    let track = self.redesign.selected_song_track(&self.song);
+                    match track {
+                        Some(track) => {
+                            let (start_beats, _) = self.redesign.song_selection_beats(&self.song);
+                            let start_tick = beats_to_sequence_ticks(f64::from(start_beats));
+                            self.pending_song_landings
+                                .push((path.clone(), track, start_tick));
+                            self.place_sample(path, None);
+                        }
+                        None => {
+                            self.notice =
+                                Some(daw::sequencing::LandRefusal::NoTrack.sign().to_owned());
+                        }
+                    }
+                }
                 redesign_browser::Intent::AuditionSample(path) => {
                     let Some(sample_rate) =
                         self.engine.as_ref().map(|engine| engine.info().sample_rate)
@@ -1691,6 +1712,74 @@ mod projection_tests {
         pattern.set_primary(4, SongNote::new(60, 12, 100));
         pattern.trig_mut(4).probability = 0.75;
         song
+    }
+
+    /// A finished import aimed at the Song lands there — and NEVER also
+    /// falls through to the legacy arrangement. Two worlds must not both
+    /// claim one import.
+    #[test]
+    fn a_finished_import_lands_on_the_song_track() {
+        let storage = shell::Storage::default();
+        let mut app = App::new(&storage);
+        app.song = song_with_trig();
+        // An audio track to land on.
+        app.song.tracks.push(daw::sequencing::Track {
+            id: daw::sequencing::TrackId(99),
+            name: "AUDIO 01".to_owned(),
+            kind: daw::sequencing::TrackKind::Audio,
+            blocks: Vec::new(),
+            audio_blocks: Vec::new(),
+            muted: false,
+            solo: false,
+            pitch_authority: daw::sequencing::PitchAuthority::default(),
+            automation: Vec::new(),
+            volume: 1.0,
+            pan: 0.0,
+        });
+        let track = app.song.tracks.len() - 1;
+
+        let imported = daw::library::ImportedWav {
+            original_path: std::path::PathBuf::from("/samples/iron.wav"),
+            path: std::path::PathBuf::from("/cache/iron.wav"),
+            sample_rate: 48_000,
+            frames: 24_000,
+        };
+        app.finish_song_landing(&imported, track, 0);
+
+        let landed = &app.song.tracks[track].audio_blocks;
+        assert_eq!(landed.len(), 1, "the sound landed on the song track");
+        assert_eq!(landed[0].source.source_frames, 24_000);
+        // Half a second at 120bpm is one beat.
+        assert_eq!(landed[0].length_ticks, daw::sequencing::TICKS_PER_BEAT);
+        assert!(
+            app.notice.as_deref().is_some_and(|n| n.contains("iron")),
+            "and it said so by name"
+        );
+        // The legacy lane was not also given the clip.
+        assert!(app.arrangement.clips.iter().all(|lane| lane.is_empty()));
+    }
+
+    /// A landing that cannot happen says WHY, by name, rather than
+    /// leaving the performer wondering whether the key works.
+    #[test]
+    fn a_refused_landing_names_its_reason() {
+        let storage = shell::Storage::default();
+        let mut app = App::new(&storage);
+        app.song = song_with_trig();
+
+        let imported = daw::library::ImportedWav {
+            original_path: std::path::PathBuf::from("/samples/iron.wav"),
+            path: std::path::PathBuf::from("/cache/iron.wav"),
+            sample_rate: 48_000,
+            frames: 24_000,
+        };
+        // Track 0 is an INSTRUMENT track.
+        app.finish_song_landing(&imported, 0, 0);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some(daw::sequencing::LandRefusal::NotAnAudioTrack.sign())
+        );
+        assert!(app.song.tracks[0].audio_blocks.is_empty());
     }
 
     /// The tempo map is AUDIBLE, not decorative.

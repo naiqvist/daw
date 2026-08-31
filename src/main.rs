@@ -6168,6 +6168,13 @@ struct App {
     /// canonicalized path handed to the importer. Cleared whenever nothing
     /// is pending, so a stale aim can never steer a later import.
     pending_drop_spots: Vec<(PathBuf, DropSpot)>,
+    /// Imports aimed at the SONG rather than the legacy arrangement:
+    /// (file, song track index, start tick).
+    ///
+    /// The same shape as `pending_drop_spots` and for the same reason —
+    /// a wav import is asynchronous, so the aim has to outlive the
+    /// request that started it.
+    pending_song_landings: Vec<(PathBuf, usize, usize)>,
     /// Green-zone waveform analysis and immutable views keyed by the exact
     /// playback path. Duplicated clips share one analysis.
     waveform_service: waveform::Service,
@@ -6777,6 +6784,7 @@ impl App {
             audition_loader,
             drag_import: None,
             pending_drop_spots: Vec::new(),
+            pending_song_landings: Vec::new(),
             waveform_service,
             waveform_cache: HashMap::new(),
             waveform_pending: HashSet::new(),
@@ -10075,6 +10083,18 @@ impl App {
     }
 
     fn finish_sample_placement(&mut self, imported: ImportedWav) {
+        // A landing aimed at the Song is answered whole, here, and never
+        // falls through to the legacy arrangement: the two worlds must
+        // not both claim one import.
+        if let Some(index) = self
+            .pending_song_landings
+            .iter()
+            .position(|(path, _, _)| *path == imported.original_path)
+        {
+            let (_, track, start_tick) = self.pending_song_landings.remove(index);
+            self.finish_song_landing(&imported, track, start_tick);
+            return;
+        }
         // A drop remembered where it was aimed; consume the aim so a later
         // import of the same file is its own decision.
         let spot = self
@@ -10179,6 +10199,51 @@ impl App {
     /// duration in musical time at the current tempo, exactly like a
     /// timeline placement — a slot's clip is an ordinary clip that happens
     /// to have no position.
+    /// Land a finished import on a Song track, saying out loud what
+    /// happened either way.
+    fn finish_song_landing(&mut self, imported: &ImportedWav, track: usize, start_tick: usize) {
+        let name = imported
+            .original_path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("audio")
+            .to_owned();
+        let source = AudioSource {
+            path: imported.path.clone(),
+            sample_rate: imported.sample_rate,
+            source_offset: 0,
+            source_frames: imported.frames,
+            gain: 1.0,
+            looped: false,
+            transpose: 0.0,
+            detune: 0.0,
+            transposed_from: None,
+            applied_ratio: 1.0,
+            file_frames: imported.frames,
+            reversed: false,
+            fade_in: 0,
+            fade_out: 0,
+            fade_in_curve: 0.0,
+            fade_out_curve: 0.0,
+            envelope: Vec::new(),
+        };
+        // The length is the tempo map's business, so the table is built
+        // from the same reference the projection warps against.
+        let reference_bpm = if self.transport.bpm.is_finite() && self.transport.bpm > 0.0 {
+            self.transport.bpm
+        } else {
+            120.0
+        };
+        let tempo = daw::tempo::TempoTable::build(&self.song, 48_000.0, reference_bpm);
+        match self.song.place_audio(track, start_tick, source, &tempo) {
+            Ok(_) => {
+                self.notice = Some(format!("LANDED {name}"));
+                self.projected_song = None;
+            }
+            Err(refusal) => self.notice = Some(refusal.sign().to_owned()),
+        }
+    }
+
     fn place_sample_in_slot(&mut self, track: usize, scene: usize, imported: &ImportedWav) -> bool {
         if imported.sample_rate == 0 || imported.frames == 0 {
             return false;
