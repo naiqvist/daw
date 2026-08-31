@@ -83,6 +83,7 @@ pub(crate) fn add_track(song: &mut Song) -> &'static str {
         muted: false,
         solo: false,
         pitch_authority: crate::sequencing::PitchAuthority::default(),
+        audio_blocks: Vec::new(),
         automation: Vec::new(),
         volume: 1.0,
         pan: 0.0,

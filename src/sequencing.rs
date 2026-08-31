@@ -156,6 +156,42 @@ pub struct PatternBlock {
     pub length_ticks: usize,
 }
 
+/// A clip-relative loop: a region of an audio block's own content that
+/// repeats to fill it. Placement, not source — which is why it lives on
+/// the block and not on the `AudioSource` inside it.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct LoopBrace {
+    pub start_tick: usize,
+    pub length_ticks: usize,
+}
+
+/// One placement of recorded sound in song time.
+///
+/// The `AudioSource` carries everything about the SOUND — path, trim,
+/// gain, varispeed, reversal, and the fades. None of it is duplicated
+/// here: a second home for a fade is a second authority for one fact.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct AudioBlock {
+    pub id: BlockId,
+    pub start_tick: usize,
+    pub length_ticks: usize,
+    pub source: crate::audio_source::AudioSource,
+    #[serde(default)]
+    pub loop_brace: Option<LoopBrace>,
+}
+
+impl AudioBlock {
+    /// One past the last tick this block occupies. Saturating, because an
+    /// overlap test must never be the thing that panics.
+    pub fn end_tick(&self) -> usize {
+        self.start_tick.saturating_add(self.length_ticks)
+    }
+
+    pub fn intersects(&self, start: usize, end: usize) -> bool {
+        self.start_tick < end && start < self.end_tick()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum TrackKind {
     Instrument,
@@ -232,6 +268,25 @@ pub struct Track {
     /// at each. Locks travel with the content; curves belong to the
     /// timeline. Absent from pre-automation Song documents means "no
     /// curves", which reads exactly as it did before.
+    /// Recorded sound placed on this track, in song time.
+    ///
+    /// A SEPARATE list rather than `blocks` becoming an enum, and the
+    /// reason is the file format. RON is not self-describing enough for
+    /// `#[serde(untagged)]` (it fails with "data did not match any
+    /// variant"), and without the `implicit_some` extension an
+    /// `Option`-based wire struct cannot read the old bare values either.
+    /// An externally-tagged enum would rewrite every `blocks` entry from
+    /// `(id:(1),…)` to `Pattern((id:(1),…))`, and since `blocks` is a
+    /// required field, a present-but-wrong value is not rescued by any
+    /// default: the Track fails, the Song fails, and the WHOLE PROJECT
+    /// refuses to open rather than merely losing its song.
+    ///
+    /// Two typed lists cost a merge when time order across both is
+    /// needed (see `blocks_in_time_order`). That is a small price for
+    /// every project on disk continuing to load untouched — and
+    /// `TrackKind` already says which list a track actually uses.
+    #[serde(default)]
+    pub audio_blocks: Vec<AudioBlock>,
     #[serde(default)]
     pub automation: Vec<Envelope>,
     /// Fader level as LINEAR amplitude, 1.0 = unity.
@@ -248,7 +303,73 @@ pub struct Track {
     pub pan: f32,
 }
 
+/// A placement on a track's timeline, whichever list it came from.
+/// The borrow is what lets time-ordered work treat both kinds alike
+/// without either list having to become the other.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BlockRef<'a> {
+    Pattern(&'a PatternBlock),
+    Audio(&'a AudioBlock),
+}
+
+impl BlockRef<'_> {
+    pub fn id(&self) -> BlockId {
+        match self {
+            Self::Pattern(block) => block.id,
+            Self::Audio(block) => block.id,
+        }
+    }
+
+    pub fn start_tick(&self) -> usize {
+        match self {
+            Self::Pattern(block) => block.start_tick,
+            Self::Audio(block) => block.start_tick,
+        }
+    }
+
+    pub fn length_ticks(&self) -> usize {
+        match self {
+            Self::Pattern(block) => block.length_ticks,
+            Self::Audio(block) => block.length_ticks,
+        }
+    }
+
+    pub fn end_tick(&self) -> usize {
+        self.start_tick().saturating_add(self.length_ticks())
+    }
+
+    pub fn intersects(&self, start: usize, end: usize) -> bool {
+        self.start_tick() < end && start < self.end_tick()
+    }
+}
+
 impl Track {
+    /// Every placement on this track, pattern and audio alike, in time
+    /// order. The one iterator that sees a whole lane — what the time
+    /// verbs need, and what an overlap test across both kinds needs.
+    pub fn blocks_in_time_order(&self) -> Vec<BlockRef<'_>> {
+        let mut all: Vec<BlockRef<'_>> = self
+            .blocks
+            .iter()
+            .map(BlockRef::Pattern)
+            .chain(self.audio_blocks.iter().map(BlockRef::Audio))
+            .collect();
+        all.sort_by_key(BlockRef::start_tick);
+        all
+    }
+
+    /// Whether anything at all on this lane occupies `[start, end)` —
+    /// pattern or audio. An overlap test that only consulted `blocks`
+    /// would happily drop a pattern on top of a recording.
+    pub fn occupied(&self, start: usize, end: usize) -> bool {
+        self.blocks.iter().any(|block| {
+            block.start_tick < end && start < block.start_tick.saturating_add(block.length_ticks)
+        }) || self
+            .audio_blocks
+            .iter()
+            .any(|block| block.intersects(start, end))
+    }
+
     /// This track's breakpoints against `target`, or an empty slice.
     pub fn points(&self, target: &str) -> &[Point] {
         self.automation
@@ -468,6 +589,7 @@ impl Default for Song {
                 muted: false,
                 solo: false,
                 pitch_authority: PitchAuthority::default(),
+                audio_blocks: Vec::new(),
                 automation: Vec::new(),
                 volume: 1.0,
                 pan: 0.0,
@@ -1014,6 +1136,7 @@ mod automation_tests {
             muted: false,
             solo: false,
             pitch_authority: PitchAuthority::default(),
+            audio_blocks: Vec::new(),
             automation: Vec::new(),
             volume: 1.0,
             pan: 0.0,
@@ -1214,5 +1337,131 @@ mod automation_tests {
             .replace("automation:[]", "");
         let back: Song = ron::from_str(&older).expect("older document still loads");
         assert!(back.tracks.iter().all(|track| track.automation.is_empty()));
+    }
+}
+
+/// Audio blocks are the new half of a track's timeline. The tests that
+/// matter most here are not the round trips — they are the ones proving
+/// a project written before audio blocks existed still opens.
+#[cfg(test)]
+mod audio_block_tests {
+    use super::*;
+
+    fn source() -> crate::audio_source::AudioSource {
+        ron::from_str(
+            r#"(path:"/tmp/kick.wav",sample_rate:48000,source_offset:0,source_frames:24000,gain:1.0,looped:false)"#,
+        )
+        .expect("a minimal source deserializes from its required fields")
+    }
+
+    fn audio(id: u64, start_tick: usize, length_ticks: usize) -> AudioBlock {
+        AudioBlock {
+            id: BlockId(id),
+            start_tick,
+            length_ticks,
+            source: source(),
+            loop_brace: None,
+        }
+    }
+
+    /// THE test this design exists for.
+    ///
+    /// A document that predates audio blocks — built by serializing a
+    /// real Song and stripping every field added since, which is exactly
+    /// the shape sitting in users' .daw.ron files today. Not a round
+    /// trip: a round trip only proves the new code agrees with itself.
+    /// This proves it agrees with what is already on disk.
+    ///
+    /// Getting this wrong means every project a user ever saved stops
+    /// opening, and they find out by losing their work.
+    #[test]
+    fn a_pre_audio_project_still_loads_untouched() {
+        let song = Song::default();
+        let text = ron::ser::to_string(&song).expect("serializes");
+        assert!(
+            text.contains("audio_blocks:[]"),
+            "the new field is written today"
+        );
+
+        // Strip every field added after the original on-disk shape.
+        let older = text
+            .replace("audio_blocks:[],", "")
+            .replace("automation:[],", "")
+            .replace("volume:1.0,", "")
+            .replace("pan:0.0,", "")
+            .replace("tempo:[],", "")
+            .replace("meter:[],", "");
+        assert!(
+            !older.contains("audio_blocks"),
+            "the stripped document really lacks the field"
+        );
+
+        let back: Song = match ron::from_str(&older) {
+            Ok(back) => back,
+            Err(error) => panic!("a pre-audio document must still load: {error}"),
+        };
+        let track = &back.tracks[0];
+        assert_eq!(track.blocks.len(), 1, "its pattern block survived");
+        assert_eq!(track.blocks[0].length_ticks, DEFAULT_PATTERN_TICKS);
+        assert!(track.audio_blocks.is_empty(), "and it simply has no audio");
+        // Everything added since defaults rather than failing the load.
+        assert_eq!(track.volume, 1.0, "unity, never silence");
+        assert!(track.automation.is_empty());
+        assert!(back.tempo.is_empty());
+    }
+
+    /// A song carrying audio survives a round trip whole, source and all.
+    #[test]
+    fn an_audio_block_round_trips() {
+        let mut song = Song::default();
+        song.tracks[0].audio_blocks.push(audio(7, 96, 480));
+        song.tracks[0].audio_blocks[0].loop_brace = Some(LoopBrace {
+            start_tick: 0,
+            length_ticks: 240,
+        });
+
+        let text = ron::ser::to_string(&song).expect("serializes");
+        let back: Song = ron::from_str(&text).expect("deserializes");
+        assert_eq!(back, song, "every field of the source came back");
+        assert_eq!(back.tracks[0].audio_blocks[0].source.source_frames, 24_000);
+    }
+
+    /// An overlap test that only consulted `blocks` would happily drop a
+    /// pattern on top of a recording. `occupied` sees both lists.
+    #[test]
+    fn occupancy_sees_audio_as_well_as_patterns() {
+        let mut song = Song::default();
+        let track = &mut song.tracks[0];
+        // The default song already holds one pattern block at 0..768.
+        assert!(track.occupied(0, 10), "the pattern block is seen");
+        assert!(!track.occupied(1_000, 1_100), "empty space is empty");
+
+        track.audio_blocks.push(audio(9, 1_000, 100));
+        assert!(track.occupied(1_050, 1_100), "and now the audio is seen");
+        assert!(!track.occupied(1_100, 1_200), "but only where it sits");
+    }
+
+    /// The merged view is what the time verbs will walk, so it must be in
+    /// time order regardless of which list a block came from.
+    #[test]
+    fn the_merged_view_is_in_time_order_across_both_lists() {
+        let mut song = Song::default();
+        let track = &mut song.tracks[0];
+        track.audio_blocks.push(audio(9, 2_000, 100));
+        track.audio_blocks.push(audio(8, 100, 100));
+
+        let order: Vec<usize> = track
+            .blocks_in_time_order()
+            .iter()
+            .map(BlockRef::start_tick)
+            .collect();
+        assert_eq!(order, vec![0, 100, 2_000], "interleaved, not concatenated");
+
+        let ids: Vec<u64> = track
+            .blocks_in_time_order()
+            .iter()
+            .map(|block| block.id().0)
+            .collect();
+        assert_eq!(ids, vec![1, 8, 9]);
     }
 }
