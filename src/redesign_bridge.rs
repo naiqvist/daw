@@ -67,6 +67,37 @@ pub(super) fn redesign_arrangement_theme() -> Theme {
     theme
 }
 
+/// The sample rate the tempo warp is computed at.
+///
+/// Any rate gives the same answer: the warp is a RATIO of two quantities
+/// both proportional to it, so the rate cancels. A concrete one is named
+/// only because the table needs one.
+const WARP_SAMPLE_RATE: f64 = 48_000.0;
+
+/// A tick's position, expressed as the beat the UNIFORM legacy compiler
+/// must be told in order to stamp the sample the tempo map really means.
+///
+/// The legacy path multiplies one beat by one samples-per-beat (graph.rs
+/// computes `samples_per_beat = sr*60/bpm` once), so a varying tempo
+/// cannot be handed to it directly. It can be BAKED: a tick's true sample
+/// is `table.sample_at(tick)`, and dividing by the reference
+/// samples-per-beat gives the beat that lands on exactly that sample.
+///
+/// With an EMPTY tempo map this is the exact identity — `sample_at` is
+/// uniform at the reference tempo, so the division returns
+/// `tick / TICKS_PER_BEAT`, which is precisely what the projection
+/// computed before. That is what makes it safe to apply unconditionally:
+/// a project with no tempo marks projects bit for bit as it always did.
+///
+/// A bridge-era measure, exactly as p-locks ride the same road. At C2 the
+/// Song-direct compiler consults the table itself and this disappears.
+fn warped_beat(table: &daw::tempo::TempoTable, tick: usize, samples_per_beat: f64) -> f64 {
+    if samples_per_beat <= 0.0 {
+        return 0.0;
+    }
+    table.sample_at(tick) as f64 / samples_per_beat
+}
+
 fn beats_to_sequence_ticks(beats: f64) -> usize {
     (beats.max(0.0) * daw::sequencing::TICKS_PER_BEAT as f64).round() as usize
 }
@@ -1457,6 +1488,16 @@ impl App {
         }
         let song = self.song.clone();
         let any_solo = song.tracks.iter().any(|track| track.solo);
+        // The tempo map, resolved once for the whole projection. The
+        // reference is the transport's own tempo, so an empty map warps
+        // nothing at all.
+        let reference_bpm = if self.transport.bpm.is_finite() && self.transport.bpm > 0.0 {
+            self.transport.bpm
+        } else {
+            120.0
+        };
+        let tempo = daw::tempo::TempoTable::build(&song, WARP_SAMPLE_RATE, reference_bpm);
+        let samples_per_beat = WARP_SAMPLE_RATE * 60.0 / reference_bpm;
         for song_track in &song.tracks {
             let legacy = match self.song_track_map.get(&song_track.id) {
                 Some(&index) if index < self.arrangement.tracks.len() => index,
@@ -1507,7 +1548,7 @@ impl App {
             for block in &song_track.blocks {
                 let id = self.arrangement.next_clip_id;
                 self.arrangement.next_clip_id += 1;
-                clips.push(project_block(&song, block, id));
+                clips.push(project_block(&song, block, id, &tempo, samples_per_beat));
             }
             self.arrangement.clips[legacy] = clips;
         }
@@ -1562,9 +1603,19 @@ fn project_block(
     song: &daw::sequencing::Song,
     block: &daw::sequencing::PatternBlock,
     id: u64,
+    tempo: &daw::tempo::TempoTable,
+    samples_per_beat: f64,
 ) -> Clip {
     use daw::sequencing::{PATTERN_STEPS, TICKS_PER_BEAT};
     let step_ticks = TICKS_PER_BEAT / 4;
+    // The clip's own origin, warped once — every note is expressed
+    // relative to it.
+    let clip_beat = warped_beat(tempo, block.start_tick, samples_per_beat);
+    let clip_end_beat = warped_beat(
+        tempo,
+        block.start_tick.saturating_add(block.length_ticks),
+        samples_per_beat,
+    );
     let mut notes = Vec::new();
     let mut name = String::new();
     if let Some(pattern) = song.pattern(block.pattern_id) {
@@ -1585,11 +1636,22 @@ fn project_block(
                 // approximate (and signed `≈` in the views) otherwise.
                 // The micro push projects exactly: legacy starts are
                 // fractional beats, so no time detail is lost.
-                let start_ticks = start_tick as f64 + f64::from(note.micro_ticks);
+                // Everything is warped through the tempo table, so a
+                // tempo change mid-song lands the note on the sample the
+                // map means. Clip-relative, because the clip's own start
+                // is warped the same way just below.
+                let pushed = start_tick as f64 + f64::from(note.micro_ticks);
+                let absolute = block.start_tick as f64 + pushed.max(0.0);
+                let note_beat = warped_beat(tempo, absolute.round() as usize, samples_per_beat);
+                let note_end = warped_beat(
+                    tempo,
+                    (absolute + note.length_ticks.max(1) as f64).round() as usize,
+                    samples_per_beat,
+                );
                 notes.push(Note {
                     pitch: daw::pitch::nearest_midi(note.pitch.resolve(&song.key)),
-                    start: start_ticks.max(0.0) / TICKS_PER_BEAT as f64,
-                    len: (note.length_ticks.max(1)) as f64 / TICKS_PER_BEAT as f64,
+                    start: (note_beat - clip_beat).max(0.0),
+                    len: (note_end - note_beat).max(1.0 / TICKS_PER_BEAT as f64),
                     vel: note.velocity,
                     muted: false,
                     plocks: Vec::new(),
@@ -1602,8 +1664,8 @@ fn project_block(
     Clip {
         id,
         name,
-        start: (block.start_tick as f64 / TICKS_PER_BEAT as f64) as f32,
-        len: (block.length_ticks as f64 / TICKS_PER_BEAT as f64) as f32,
+        start: clip_beat as f32,
+        len: (clip_end_beat - clip_beat).max(0.0) as f32,
         notes,
         ..Clip::default()
     }
@@ -1614,6 +1676,14 @@ mod projection_tests {
     use super::*;
     use daw::sequencing::{Note as SongNote, PatternBlock, Song};
 
+    /// Project at ONE steady tempo — what every test that is not about
+    /// the tempo map wants, and the case in which the warp is the exact
+    /// identity.
+    fn project_block_steady(song: &Song, block: &PatternBlock, id: u64) -> Clip {
+        let tempo = daw::tempo::TempoTable::build(song, WARP_SAMPLE_RATE, 120.0);
+        project_block(song, block, id, &tempo, WARP_SAMPLE_RATE * 60.0 / 120.0)
+    }
+
     fn song_with_trig() -> Song {
         let mut song = Song::default();
         let pattern_id = song.tracks[0].blocks[0].pattern_id;
@@ -1623,13 +1693,65 @@ mod projection_tests {
         song
     }
 
+    /// The tempo map is AUDIBLE, not decorative.
+    ///
+    /// The legacy compiler stamps `beat * samples_per_beat` at one fixed
+    /// tempo, so a map is expressed by moving the beat. At half the
+    /// reference tempo every position doubles — which lands the note on
+    /// the sample the map actually means, through a compiler that knows
+    /// nothing about tempo maps.
+    #[test]
+    fn a_tempo_mark_moves_where_the_compiler_stamps_the_note() {
+        let mut song = song_with_trig();
+        let steady = project_block_steady(&song, &song.tracks[0].blocks[0], 1);
+        let steady_start = steady.notes[0].start;
+        assert!((steady_start - 1.0).abs() < 1e-6, "step 4 is one beat in");
+
+        // Half the reference tempo, from the very start.
+        assert!(song.set_tempo_mark(0, 60.0));
+        let tempo = daw::tempo::TempoTable::build(&song, WARP_SAMPLE_RATE, 120.0);
+        let halved = project_block(
+            &song,
+            &song.tracks[0].blocks[0],
+            1,
+            &tempo,
+            WARP_SAMPLE_RATE * 60.0 / 120.0,
+        );
+        assert!(
+            (halved.notes[0].start - 2.0).abs() < 1e-3,
+            "at half tempo the note sits twice as far out, so it sounds at \
+             the same wall-clock moment a 60bpm beat 1 would: got {}",
+            halved.notes[0].start
+        );
+        assert!(
+            halved.len > steady.len * 1.9,
+            "and the clip stretches with it"
+        );
+    }
+
+    /// A song with no tempo marks must project EXACTLY as it did before
+    /// the warp existed. This is what makes the warp safe to apply to
+    /// every project unconditionally.
+    #[test]
+    fn an_empty_tempo_map_warps_nothing_at_all() {
+        let song = song_with_trig();
+        let clip = project_block_steady(&song, &song.tracks[0].blocks[0], 1);
+        let block = &song.tracks[0].blocks[0];
+        let ticks = daw::sequencing::TICKS_PER_BEAT as f64;
+        assert_eq!(clip.start, (block.start_tick as f64 / ticks) as f32);
+        assert_eq!(clip.len, (block.length_ticks as f64 / ticks) as f32);
+        // Step 4 with no push is exactly one beat, to the bit.
+        assert!((clip.notes[0].start - 1.0).abs() < 1e-9);
+        assert!((clip.notes[0].len - 0.25).abs() < 1e-9);
+    }
+
     /// The copyist's timing: step 4 of a 16th grid lands one beat in, a
     /// 12-tick note is a quarter beat long, and the trig's condition
     /// carries onto the note the compile path will stamp.
     #[test]
     fn a_block_projects_notes_with_timing_and_probability() {
         let song = song_with_trig();
-        let clip = project_block(&song, &song.tracks[0].blocks[0], 7);
+        let clip = project_block_steady(&song, &song.tracks[0].blocks[0], 7);
         assert_eq!(clip.id, 7);
         assert_eq!(clip.notes.len(), 1);
         let note = &clip.notes[0];
@@ -1659,7 +1781,7 @@ mod projection_tests {
             .blocks
             .iter()
             .enumerate()
-            .map(|(index, block)| project_block(&song, block, index as u64))
+            .map(|(index, block)| project_block_steady(&song, block, index as u64))
             .collect();
         assert_eq!(clips.len(), 3);
         assert!((clips[1].start - 16.0).abs() < 1e-6);
@@ -1808,7 +1930,7 @@ mod projection_tests {
         let mut song = song_with_trig();
         // One beat long: step 4 (beat 1) must not sound.
         song.tracks[0].blocks[0].length_ticks = daw::sequencing::TICKS_PER_BEAT;
-        let clip = project_block(&song, &song.tracks[0].blocks[0], 1);
+        let clip = project_block_steady(&song, &song.tracks[0].blocks[0], 1);
         assert!(clip.notes.is_empty());
     }
 
@@ -1831,7 +1953,7 @@ mod projection_tests {
         );
         pattern.add_tone(0, SongNote::new(69, 12, 100));
 
-        let clip = project_block(&song, &song.tracks[0].blocks[0], 1);
+        let clip = project_block_steady(&song, &song.tracks[0].blocks[0], 1);
         let pitches: Vec<u8> = clip.notes.iter().map(|note| note.pitch).collect();
         assert!(
             pitches.contains(&65),
@@ -1841,7 +1963,7 @@ mod projection_tests {
 
         song.key = daw::pitch::parse_key_command(&["d", "major"], &song.key, &builtin_lookup)
             .expect("d major");
-        let clip = project_block(&song, &song.tracks[0].blocks[0], 1);
+        let clip = project_block_steady(&song, &song.tracks[0].blocks[0], 1);
         let pitches: Vec<u8> = clip.notes.iter().map(|note| note.pitch).collect();
         assert!(
             pitches.contains(&66),
@@ -1861,7 +1983,7 @@ mod projection_tests {
             .trig_mut(4)
             .notes[0]
             .micro_ticks = 3;
-        let clip = project_block(&song, &song.tracks[0].blocks[0], 1);
+        let clip = project_block_steady(&song, &song.tracks[0].blocks[0], 1);
         assert!((clip.notes[0].start - (1.0 + 3.0 / 48.0)).abs() < 1e-12);
     }
 
@@ -2072,7 +2194,7 @@ mod projection_tests {
         assert_eq!(notice, None);
         assert!((pattern.trig(1).probability - 0.75).abs() < f32::EPSILON);
 
-        let clip = project_block(&song, &song.tracks[0].blocks[0], 9);
+        let clip = project_block_steady(&song, &song.tracks[0].blocks[0], 9);
         assert_eq!(clip.notes.len(), 1);
         assert!((clip.notes[0].prob - 0.75).abs() < f32::EPSILON);
     }
