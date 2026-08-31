@@ -5,6 +5,7 @@
 //! duplicating it.
 
 pub mod audio;
+pub mod devices;
 pub mod dsp;
 pub mod library;
 pub mod param_law;
@@ -13,6 +14,7 @@ pub mod pitch;
 pub mod render;
 pub mod sequencing;
 pub mod slice;
+pub mod targets;
 pub mod theory;
 pub mod ui;
 
