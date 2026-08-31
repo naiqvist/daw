@@ -3,6 +3,7 @@
 //! This view owns only navigation state. Tracks, blocks and patterns stay in
 //! the application-owned [`Song`], shared with the wrapped sequence editor.
 
+pub(super) mod automation;
 mod edit;
 mod palette;
 mod state;
