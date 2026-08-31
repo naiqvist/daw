@@ -89,6 +89,10 @@ pub(super) struct ArrangementState {
     /// The view window's first beat — always a whole bar, so the lane
     /// grid keeps its phase as the window travels the world.
     pub(super) view_start: usize,
+    /// The arrangement's second occupant: the automation sublane. The
+    /// same shape as the sequence strip's grid/roll pair — one address,
+    /// two occupants, and whichever is open owns the keys.
+    pub(super) automation: super::automation::AutomationLane,
 }
 
 impl Default for ArrangementState {
@@ -104,6 +108,7 @@ impl Default for ArrangementState {
             block_drag: None,
             rename: None,
             view_start: 0,
+            automation: super::automation::AutomationLane::default(),
         }
     }
 }

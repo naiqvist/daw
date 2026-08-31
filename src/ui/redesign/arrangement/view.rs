@@ -88,15 +88,37 @@ pub(super) fn show(
         }
     }
 
+    // The automation strip is carved off the bottom BEFORE the timeline
+    // is measured, so opening it shortens the tracks rather than drawing
+    // over them.
+    let automation_open = state.automation.open;
+    let canvas_bottom = if automation_open {
+        area.bottom() - AUTOMATION_H
+    } else {
+        area.bottom()
+    };
     let ruler = egui::Rect::from_min_max(area.min, egui::pos2(area.right(), area.top() + RULER_H));
     let timeline = egui::Rect::from_min_max(
         egui::pos2(area.left() + TRACK_HEADER_W, ruler.bottom()),
-        area.right_bottom(),
+        egui::pos2(area.right(), canvas_bottom),
     );
     draw_ruler(ui, ruler, timeline, state.view_start);
     let mut pointer_edit = None;
     let mut rename_outcome = RenameOutcome::Editing;
 
+    if automation_open {
+        let strip =
+            egui::Rect::from_min_max(egui::pos2(area.left(), canvas_bottom), area.right_bottom());
+        draw_automation(
+            ui,
+            strip,
+            TRACK_HEADER_W,
+            &state.automation,
+            input.song.tracks.get(state.cursor.track),
+            state.view_start,
+            focused,
+        );
+    }
     let any_solo = input.song.tracks.iter().any(|track| track.solo);
     for (track_index, track) in input.song.tracks.iter().enumerate() {
         let top = timeline.top() + track_index as f32 * TRACK_H;
@@ -410,10 +432,31 @@ fn keyboard(
     song: &mut Song,
     outcome: &mut Outcome,
 ) {
+    // Ctrl+5 joins the Ctrl+1/2/3 grid family and Ctrl+4's grid/roll
+    // switch: same hand, same neighbourhood, no new verb. The
+    // arrangement has two occupants and whichever is open owns the keys.
+    if ui
+        .ctx()
+        .input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Num5))
+    {
+        state.automation.toggle();
+    }
     let Some(utterance) = voice.sentence.consume(ui.ctx()) else {
         return;
     };
     state.refusal = None;
+    if state.automation.open {
+        // The lane is the occupant, so the sentence is spoken to it.
+        let track = state.cursor.track;
+        state.automation.speak(
+            song,
+            track,
+            utterance.verb,
+            utterance.motion,
+            utterance.count,
+        );
+        return;
+    }
     speak(state, song, voice.registers, utterance, outcome);
 }
 
@@ -927,6 +970,167 @@ fn draw_playhead(
     ));
 }
 
+// --- the automation sublane -------------------------------------------
+//
+// A FIXED strip at the bottom of the arrangement, never a row inserted
+// between tracks: one layout, learned once, never rearranged. It shows
+// the SELECTED track's selected target, because a lane not under the
+// hands is steady state and steady state earns no pixels.
+
+/// Fixed height of the automation strip, in points. A constant, never a
+/// window fraction.
+const AUTOMATION_H: f32 = 104.0;
+const AUTOMATION_HEADER_H: f32 = 18.0;
+
+/// Draw the lane, and say what it occupied.
+fn draw_automation(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    header_w: f32,
+    lane: &super::automation::AutomationLane,
+    track: Option<&crate::sequencing::Track>,
+    view_start: usize,
+    focused: bool,
+) {
+    let painter = ui.painter();
+    painter.rect_filled(rect, 0.0, TRACK_LANE);
+
+    let head = egui::Rect::from_min_max(
+        rect.min,
+        egui::pos2(rect.right(), rect.top() + AUTOMATION_HEADER_H),
+    );
+    // Inset, so the floor and ceiling read as RULES rather than as the
+    // strip's own edges — a line flush with a boundary says nothing.
+    let plot = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + header_w, head.bottom() + space::XS),
+        egui::pos2(rect.right(), rect.bottom() - space::SM),
+    );
+
+    // The header carries the one thing the shape cannot: what parameter
+    // this is, and — when two authorities compose — the sum AS a sum.
+    let (min, max) = super::automation::span(&lane.target);
+    let cursor_value = super::automation::denormalize(&lane.target, lane.cursor_value);
+    let at_cursor = track.map(|track| track.value_at(&lane.target, lane.cursor_tick, min));
+    let title = match at_cursor {
+        Some(base) if track.is_some_and(|t| t.automated(&lane.target)) => {
+            format!(
+                "AUTO  {}   {base:.3}  /  CURSOR {cursor_value:.3}",
+                lane.target
+            )
+        }
+        _ => format!(
+            "AUTO  {}   (no curve)   CURSOR {cursor_value:.3}",
+            lane.target
+        ),
+    };
+    painter.text(
+        egui::pos2(rect.left() + space::SM, head.center().y),
+        egui::Align2::LEFT_CENTER,
+        title,
+        egui::FontId::new(font::MINI_LABEL, egui::FontFamily::Monospace),
+        if focused { ACTIVE } else { MUTED },
+    );
+
+    // Three rules only: floor, ceiling, and the parameter's DEFAULT —
+    // the one line carrying information, because it is where "no change"
+    // lives. A full grid would fail the subtraction test.
+    let y_of = |value: f32| {
+        let t = ((value - min) / (max - min).max(f32::EPSILON)).clamp(0.0, 1.0);
+        plot.bottom() - t * plot.height()
+    };
+    for (value, ink) in [(min, QUIET), (max, QUIET)] {
+        let y = y_of(value);
+        painter.line_segment(
+            [egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)],
+            egui::Stroke::new(stroke::HAIR, ink),
+        );
+    }
+    // The DEFAULT rule is the one gridline carrying information: it is
+    // where "no change" lives, so a curve reads at a glance as boost or
+    // cut. It is drawn only when it lands somewhere the floor and ceiling
+    // do not already mark — a duplicate line carries nothing, and the
+    // subtraction test cuts it. A fader's unity IS its ceiling, so on
+    // track.volume there is correctly no third line.
+    let default_value = if lane.target == crate::sequencing::TRACK_PAN {
+        0.0
+    } else {
+        max
+    };
+    let y = y_of(default_value);
+    if (y - y_of(min)).abs() > 1.0 && (y - y_of(max)).abs() > 1.0 {
+        painter.line_segment(
+            [egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)],
+            egui::Stroke::new(stroke::HAIR, SILENT),
+        );
+    }
+
+    // The curve. Segments are inference, so they are quieter than the
+    // breakpoints, which are the editable truth.
+    if let Some(track) = track {
+        let points = track.points(&lane.target);
+        let x_of = |tick: usize| beat_x(plot, tick as f64 / TICKS_PER_BEAT as f64, view_start);
+        if !points.is_empty() {
+            // Sample the curve so a bend draws as the shape it is.
+            let steps = 96;
+            let first = points[0].tick;
+            let last = points[points.len() - 1].tick;
+            let span = last.saturating_sub(first).max(1);
+            let mut path = Vec::with_capacity(steps + 1);
+            for step in 0..=steps {
+                let tick = first + span * step / steps;
+                let value = track.value_at(&lane.target, tick, default_value);
+                path.push(egui::pos2(x_of(tick), y_of(value)));
+            }
+            painter.add(egui::Shape::line(
+                path,
+                egui::Stroke::new(stroke::HAIR, MUTED),
+            ));
+            for point in points {
+                let at = egui::pos2(x_of(point.tick), y_of(point.value));
+                painter.rect_filled(
+                    egui::Rect::from_center_size(at, egui::vec2(5.0, 5.0)),
+                    0.0,
+                    ACTIVE,
+                );
+            }
+        }
+    }
+
+    // The cursor is the loudest thing here, because it is focus.
+    let cursor = egui::pos2(
+        beat_x(
+            plot,
+            lane.cursor_tick as f64 / TICKS_PER_BEAT as f64,
+            view_start,
+        ),
+        y_of(cursor_value),
+    );
+    let ink = if focused { OUTLINE } else { MUTED };
+    painter.line_segment(
+        [
+            egui::pos2(cursor.x, plot.top()),
+            egui::pos2(cursor.x, plot.bottom()),
+        ],
+        egui::Stroke::new(stroke::HAIR, ink),
+    );
+    painter.rect_stroke(
+        egui::Rect::from_center_size(cursor, egui::vec2(9.0, 9.0)),
+        0.0,
+        egui::Stroke::new(stroke::BOLD, ink),
+        egui::StrokeKind::Middle,
+    );
+
+    if let Some(refusal) = &lane.refusal {
+        painter.text(
+            egui::pos2(rect.right() - space::SM, head.center().y),
+            egui::Align2::RIGHT_CENTER,
+            refusal,
+            egui::FontId::new(font::MINI_LABEL, egui::FontFamily::Monospace),
+            OUTLINE,
+        );
+    }
+}
+
 fn beat_x(rect: egui::Rect, beat: f64, view_start: usize) -> f32 {
     let relative = beat - view_start as f64;
     rect.left() + rect.width() * (relative / SONG_BEATS as f64).clamp(0.0, 1.0) as f32
@@ -951,6 +1155,50 @@ fn y_track(timeline: egui::Rect, y: f32, track_count: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    /// The automation lane's ink ladder, as the charter demands:
+    /// hierarchy from value alone, and the CURSOR loudest because it is
+    /// focus. A curve that outshone the cursor would be a semiotic lie —
+    /// it would claim an importance it does not have.
+    #[test]
+    fn the_automation_lane_ranks_the_cursor_above_its_data() {
+        use super::{ACTIVE, MUTED, OUTLINE, QUIET, SILENT, TRACK_LANE};
+        // ground < rules < default rule < curve < breakpoints < cursor
+        let ladder = [TRACK_LANE, QUIET, SILENT, MUTED, ACTIVE, OUTLINE];
+        for pair in ladder.windows(2) {
+            assert!(
+                pair[0].r() < pair[1].r(),
+                "the lane's ladder must ascend: {:?} then {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        assert_eq!(
+            OUTLINE,
+            eframe::egui::Color32::WHITE,
+            "the cursor is the loudest thing on the lane"
+        );
+        // And every rung spends value, never hue.
+        for ink in ladder {
+            assert!(
+                ink.r() == ink.g() && ink.g() == ink.b(),
+                "an automation ink reached for hue"
+            );
+        }
+    }
+
+    /// The lane is CLOSED by default: a surface not under the hands is
+    /// steady state, and steady state earns no pixels.
+    #[test]
+    fn the_lane_is_closed_until_asked_for() {
+        let lane = crate::ui::redesign::arrangement::automation::AutomationLane::default();
+        assert!(!lane.open);
+        let mut lane = lane;
+        lane.toggle();
+        assert!(lane.open, "and one gesture opens it");
+        lane.toggle();
+        assert!(!lane.open, "and the same gesture closes it");
+    }
+
     use super::*;
 
     fn utter(
