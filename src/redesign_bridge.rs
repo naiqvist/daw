@@ -1490,6 +1490,12 @@ impl App {
             // accidentally silence unrelated legacy tracks.
             self.arrangement.tracks[legacy].mute = !song_track_audible(song_track, any_solo);
             self.arrangement.tracks[legacy].solo = false;
+            // The curves travel with the track. Song automation is the
+            // offset model's BASE, and the legacy compiler already bakes
+            // envelopes into ramps (`automation_letters`) — so a curve
+            // drawn in the redesign is audible through C1 with no engine
+            // work at all, exactly as p-locks ride the same bridge.
+            self.arrangement.tracks[legacy].automation = project_automation(song_track);
             let mut clips = Vec::with_capacity(song_track.blocks.len());
             for block in &song_track.blocks {
                 let id = self.arrangement.next_clip_id;
@@ -1505,6 +1511,41 @@ impl App {
 
 fn song_track_audible(track: &daw::sequencing::Track, any_solo: bool) -> bool {
     if any_solo { track.solo } else { !track.muted }
+}
+
+/// Song automation, copied onto the legacy track the compiler reads.
+///
+/// The ONLY conversion is the time unit — song time is ticks, the legacy
+/// envelope is beats — and it happens here and nowhere else, the same
+/// one-way trip the blocks make. Values, bends and target ids cross
+/// untouched: a curve has to sound like the one the redesign drew, and a
+/// target id is file format on both sides of the bridge.
+///
+/// An envelope with no points is dropped rather than projected empty: an
+/// automated-but-pointless target reads as the bare knob, which is what
+/// `Track::value_at` already promises.
+fn project_automation(track: &daw::sequencing::Track) -> TrackAutomation {
+    use crate::automation::{AutomationEnvelope, AutomationPoint};
+    const TICKS_PER_BEAT: f32 = daw::sequencing::TICKS_PER_BEAT as f32;
+    TrackAutomation {
+        envelopes: track
+            .automation
+            .iter()
+            .filter(|envelope| !envelope.points.is_empty())
+            .map(|envelope| AutomationEnvelope {
+                target: envelope.target.clone(),
+                points: envelope
+                    .points
+                    .iter()
+                    .map(|point| AutomationPoint {
+                        beat: point.tick as f32 / TICKS_PER_BEAT,
+                        value: point.value,
+                        bend: point.bend,
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
 }
 
 /// One block, copied out as one legacy clip. A pattern shared by many
@@ -1648,6 +1689,66 @@ mod projection_tests {
         assert!(app.arrangement.tracks[legacy].mute);
         assert!(!app.arrangement.clips[legacy].is_empty());
         assert!(app.arrangement.force_recompile);
+    }
+
+    /// The offset model's base crosses the bridge: a curve drawn on a
+    /// Song track lands on the legacy track the compiler already bakes
+    /// into ramps, converted from ticks to beats and otherwise untouched.
+    #[test]
+    fn a_song_curve_reaches_the_legacy_compiler_in_beats() {
+        let storage = shell::Storage::default();
+        let mut app = App::new(&storage);
+        app.song = song_with_trig();
+        // Two beats apart, at 48 ticks to the beat.
+        app.song.tracks[0].insert_point("track.volume", 0, 0.25);
+        app.song.tracks[0].insert_point("track.volume", 96, 0.75);
+        assert!(app.song.tracks[0].bend_point("track.volume", 0, 0.5));
+
+        app.project_song();
+
+        let track_id = app.song.tracks[0].id;
+        let legacy = app.song_track_map[&track_id];
+        let points = app.arrangement.tracks[legacy]
+            .automation
+            .points("track.volume");
+        assert_eq!(points.len(), 2, "both breakpoints crossed");
+        assert_eq!(points[0].beat, 0.0);
+        assert_eq!(points[1].beat, 2.0, "96 ticks is beat 2");
+        assert_eq!(points[0].value, 0.25);
+        assert_eq!(points[1].value, 0.75);
+        assert_eq!(points[0].bend, 0.5, "the bend crosses untouched");
+
+        // And the legacy reader agrees with the Song reader at the ends.
+        let legacy_mid =
+            app.arrangement.tracks[legacy]
+                .automation
+                .value_at("track.volume", 2.0, 0.0);
+        let song_mid = app.song.tracks[0].value_at("track.volume", 96, 0.0);
+        assert!((legacy_mid - song_mid).abs() < 1e-6);
+    }
+
+    /// A target with an envelope but no points is the bare knob, so it
+    /// must not project an empty envelope that reads as "automated".
+    #[test]
+    fn an_envelope_with_no_points_never_projects() {
+        let storage = shell::Storage::default();
+        let mut app = App::new(&storage);
+        app.song = song_with_trig();
+        // Mint the envelope, then leave it empty.
+        let _ = app.song.tracks[0].points_mut("track.pan");
+        assert_eq!(app.song.tracks[0].automation.len(), 1);
+
+        app.project_song();
+
+        let track_id = app.song.tracks[0].id;
+        let legacy = app.song_track_map[&track_id];
+        assert!(
+            app.arrangement.tracks[legacy]
+                .automation
+                .envelopes
+                .is_empty(),
+            "an empty envelope is not automation"
+        );
     }
 
     /// A block shorter than the pattern truncates: no note starts past
