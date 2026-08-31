@@ -31,6 +31,7 @@ use daw::audio::modulation::{
 };
 use daw::audio::transport::TransportCmd;
 use daw::audio::{Engine, EngineConfig, StreamHealth};
+use daw::audio_source::AudioSource;
 use daw::install_fonts;
 use daw::library::{
     self, ImportedWav, LibraryConfig, LibraryService, LibrarySnapshot, WavImportService,
@@ -2245,135 +2246,6 @@ struct Note {
 
 fn prob_default() -> f32 {
     1.0
-}
-
-/// Green-zone metadata for an audio clip's source region. The path and
-/// musical placement persist; disk streams are created only while compiling
-/// a schedule and never enter the arrangement model.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-struct AudioSource {
-    path: std::path::PathBuf,
-    sample_rate: u32,
-    source_offset: u64,
-    source_frames: u64,
-    gain: f32,
-    looped: bool,
-    /// Live's Transpose, in semitones. VARISPEED: no live resampler
-    /// exists, so a non-zero pitch plays a cached render of the ORIGINAL
-    /// file at the ratio — `transposed_from` — and the clip's duration
-    /// follows the rate. Zero is the file as it is, bit for bit.
-    #[serde(default)]
-    transpose: f32,
-    /// Live's Detune, in cents, added to `transpose` before the ratio.
-    #[serde(default)]
-    detune: f32,
-    /// The file the pitch render was made FROM — the original. `None`
-    /// while the clip plays its own file (transpose and detune zero).
-    /// Returning the knobs to zero hands the clip back this file, so
-    /// the pitch change is reversible where a destructive verb is not.
-    #[serde(default)]
-    transposed_from: Option<std::path::PathBuf>,
-    /// The pitch ratio currently baked into `path`: 1.0 = the original,
-    /// 2.0 = one octave up. The clip's frame-space numbers (fades,
-    /// envelope) live in the CURRENT file's space, so every change
-    /// scales them by new/old.
-    #[serde(default)]
-    applied_ratio: f32,
-    /// Frames in the WHOLE FILE, which `source_offset`/`source_frames`
-    /// name a region of.
-    ///
-    /// Needed to play backwards: the region `[o, o + n)` of a file is
-    /// `[F - o - n, F - o)` of its reversal, and there is no way to work
-    /// that out without `F`. Zero means "not recorded" — a project
-    /// written before this existed — and is read as the region's own end,
-    /// which is exact for the untrimmed clip that most of them are.
-    #[serde(default)]
-    file_frames: u64,
-    /// Plays backwards. The FILE is reversed into a cache and the clip
-    /// points at it; nothing in the audio callback knows, which is why
-    /// this costs the red zone nothing at all.
-    #[serde(default)]
-    reversed: bool,
-    /// A gain ramp at each end of the clip, in FRAMES of its timeline
-    /// span — the same units the node applies them in, so the handle you
-    /// drag and the envelope you hear are the same number.
-    #[serde(default)]
-    fade_in: u64,
-    #[serde(default)]
-    fade_out: u64,
-    /// Each fade's SHAPE, in `-1..=1`; zero is linear.
-    ///
-    /// Defaulted, so a project written before shapes existed loads with
-    /// the straight ramps it was made with and sounds identical.
-    #[serde(default)]
-    fade_in_curve: f32,
-    #[serde(default)]
-    fade_out_curve: f32,
-    /// A gain ride over the clip's timeline span: `(frame, dB)`, sorted.
-    ///
-    /// dB in the MODEL and linear in the node, because dB is what a
-    /// fader is marked in and what a breakpoint should be read as, while
-    /// the callback wants a number it can multiply by. The conversion is
-    /// one place: the graph builder.
-    ///
-    /// Empty is no envelope, which is what every clip written before this
-    /// carries — so a project from before it loads sounding identical.
-    #[serde(default)]
-    envelope: Vec<(u64, f32)>,
-}
-
-impl AudioSource {
-    /// The file's length, falling back to this region's end for a
-    /// project written before the field existed.
-    fn file_frames(&self) -> u64 {
-        if self.file_frames > 0 {
-            self.file_frames
-        } else {
-            self.source_offset.saturating_add(self.source_frames)
-        }
-    }
-
-    /// Is there more of the file BEFORE this clip's left edge, and after
-    /// its right?
-    ///
-    /// Invisible until now, and it is the one thing about an audio clip
-    /// you cannot work out by looking: a clip trimmed to a quarter of
-    /// its file and one that IS its file are drawn identically, so
-    /// "can I pull this edge out further" was a question you answered by
-    /// trying.
-    ///
-    /// A looped clip is never trimmed in this sense — it repeats its
-    /// region rather than running out of one.
-    fn spare(&self) -> (bool, bool) {
-        if self.looped {
-            return (false, false);
-        }
-        let end = self.source_offset.saturating_add(self.source_frames);
-        (self.source_offset > 0, end < self.file_frames())
-    }
-
-    /// Where this clip's region starts in whichever file will actually be
-    /// streamed — the original, or its reversal.
-    fn playing_offset(&self) -> u64 {
-        if self.reversed {
-            self.file_frames()
-                .saturating_sub(self.source_offset.saturating_add(self.source_frames))
-        } else {
-            self.source_offset
-        }
-    }
-
-    /// The file the node should open. `None` while a reversal has been
-    /// asked for and not yet built — the caller decides what silence
-    /// means, rather than this quietly handing back the forward file and
-    /// playing the clip the wrong way round.
-    fn playing_path(&self) -> Option<std::path::PathBuf> {
-        if !self.reversed {
-            return Some(self.path.clone());
-        }
-        let cache = daw::library::reverse_cache_path(&self.path)?;
-        cache.exists().then_some(cache)
-    }
 }
 
 /// One clip on a lane. Positions are absolute beats.

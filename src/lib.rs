@@ -5,6 +5,7 @@
 //! duplicating it.
 
 pub mod audio;
+pub mod audio_source;
 pub mod dsp;
 pub mod library;
 pub mod param_law;
