@@ -551,10 +551,16 @@ impl App {
                         {
                             match param {
                                 daw::ui::redesign::chain::TRACK_LEVEL_PARAM => {
-                                    song_track.volume = value.clamp(0.0, 1.0);
+                                    let (min, max) =
+                                        daw::targets::span_of(daw::sequencing::TRACK_VOLUME)
+                                            .unwrap_or((0.0, 1.0));
+                                    song_track.volume = value.clamp(min, max);
                                 }
                                 daw::ui::redesign::chain::TRACK_PAN_PARAM => {
-                                    song_track.pan = value.clamp(-1.0, 1.0);
+                                    let (min, max) =
+                                        daw::targets::span_of(daw::sequencing::TRACK_PAN)
+                                            .unwrap_or((-1.0, 1.0));
+                                    song_track.pan = value.clamp(min, max);
                                 }
                                 _ => {}
                             }
@@ -765,6 +771,9 @@ impl App {
         // legacy twin, so reading the twin would read a shadow.
         if let Some(song_index) = self.song_track_for_active_chain() {
             let track = &self.song.tracks[song_index];
+            let level_span =
+                daw::targets::span_of(daw::sequencing::TRACK_VOLUME).unwrap_or((0.0, 1.0));
+            let pan_span = daw::targets::span_of(daw::sequencing::TRACK_PAN).unwrap_or((-1.0, 1.0));
             chain_view.devices.insert(
                 0,
                 daw::ui::redesign::chain::DeviceView {
@@ -778,8 +787,11 @@ impl App {
                         daw::ui::redesign::chain::ParamView {
                             id: daw::ui::redesign::chain::TRACK_LEVEL_PARAM,
                             name: "LEVEL".to_owned(),
-                            min: 0.0,
-                            max: 1.0,
+                            // The registry's span, not an assumed unit
+                            // interval: a fader reaches 1.5, so it can
+                            // boost above unity like every other one.
+                            min: level_span.0,
+                            max: level_span.1,
                             base: track.volume,
                             choices: 0,
                             // DECIBELS, not a unit fraction: real data over
@@ -793,8 +805,8 @@ impl App {
                         daw::ui::redesign::chain::ParamView {
                             id: daw::ui::redesign::chain::TRACK_PAN_PARAM,
                             name: "PAN".to_owned(),
-                            min: -1.0,
-                            max: 1.0,
+                            min: pan_span.0,
+                            max: pan_span.1,
                             base: track.pan,
                             choices: 0,
                             formatted: format_pan(track.pan),

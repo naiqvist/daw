@@ -34,9 +34,15 @@ const TIME_STEP: usize = TICKS_PER_BEAT;
 /// target is drawn against the unit span rather than refused, so the lane
 /// is never a dead end.
 pub(super) fn span(target: &str) -> (f32, f32) {
+    // The real range, from the parameter registry — the same table the
+    // legacy lock editor and the device cards read, so a lane draws a
+    // device parameter against the span the device actually has rather
+    // than against a guessed unit interval.
+    if let Some(span) = crate::targets::span_of(target) {
+        return span;
+    }
     match target {
         TRACK_PAN => (-1.0, 1.0),
-        TRACK_VOLUME => (0.0, 1.0),
         _ => (0.0, 1.0),
     }
 }
@@ -304,10 +310,16 @@ mod tests {
             "half height on a -1..1 span is centre, not 0.5"
         );
 
-        // The same height on the volume lane means something different.
+        // The same height on the volume lane means something different,
+        // and the difference comes from the REGISTRY: track.volume is
+        // 0..1.5, so half height is 0.75 rather than 0.5. That is the
+        // whole point of addressing a normalized height.
         lane.aim(TRACK_VOLUME);
         lane.speak(&mut song, 0, Some(Verb::Act), None, 1);
-        assert!((song.tracks[0].points(TRACK_VOLUME)[0].value - 0.5).abs() < 1e-6);
+        let (min, max) = span(TRACK_VOLUME);
+        let half = min + (max - min) * 0.5;
+        assert!((song.tracks[0].points(TRACK_VOLUME)[0].value - half).abs() < 1e-6);
+        assert!(max > 1.0, "a fader can boost above unity");
     }
 
     /// Placing twice at one tick is an edit, never a stack.
@@ -320,7 +332,8 @@ mod tests {
         lane.cursor_value = 0.25;
         lane.speak(&mut song, 0, Some(Verb::Act), None, 1);
         assert_eq!(song.tracks[0].points(TRACK_VOLUME).len(), 1);
-        assert!((song.tracks[0].points(TRACK_VOLUME)[0].value - 0.25).abs() < 1e-6);
+        let quarter = denormalize(TRACK_VOLUME, 0.25);
+        assert!((song.tracks[0].points(TRACK_VOLUME)[0].value - quarter).abs() < 1e-6);
     }
 
     /// DELETE on silence refuses OUT LOUD. A silent no-op reads exactly
@@ -369,7 +382,10 @@ mod tests {
         let points = song.tracks[0].points(TRACK_VOLUME);
         assert_eq!(points.len(), 1);
         assert_eq!(points[0].bend, 0.5, "the bend survived the move");
-        assert!((points[0].value - 0.75).abs() < 1e-6, "four steps down");
+        // Four steps of a sixteenth is a quarter of the span, whatever
+        // the span happens to be.
+        let expected = denormalize(TRACK_VOLUME, 0.75);
+        assert!((points[0].value - expected).abs() < 1e-6, "four steps down");
     }
 
     /// RESIZE bows the segment, and both directions are reachable.

@@ -128,6 +128,17 @@ impl ParameterRegistry {
 /// Device targets resolve through the same [`ParameterRegistry`] rows that
 /// are built from each device's [`crate::params::ParamDef`] table. Unknown
 /// or stale ids are refused rather than assigned a plausible but wrong span.
+/// The value a parameter rests at — where "no change" lives, which is
+/// what an automation lane draws its one informative gridline against.
+/// Not always the middle and not always the ceiling: a fader's unity sits
+/// two thirds up a 0..1.5 span, because a fader can boost.
+pub fn default_of(target: &str) -> Option<f32> {
+    static REGISTRY: std::sync::LazyLock<ParameterRegistry> =
+        std::sync::LazyLock::new(ParameterRegistry::default);
+
+    REGISTRY.spec(target).map(|spec| spec.default)
+}
+
 pub fn span_of(target: &str) -> Option<(f32, f32)> {
     static REGISTRY: std::sync::LazyLock<ParameterRegistry> =
         std::sync::LazyLock::new(ParameterRegistry::default);

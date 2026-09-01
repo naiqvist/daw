@@ -1141,11 +1141,11 @@ fn draw_automation(
     // do not already mark — a duplicate line carries nothing, and the
     // subtraction test cuts it. A fader's unity IS its ceiling, so on
     // track.volume there is correctly no third line.
-    let default_value = if lane.target == crate::sequencing::TRACK_PAN {
-        0.0
-    } else {
-        max
-    };
+    // Where "no change" lives, from the registry rather than assumed. A
+    // fader's unity is 1.0 on a 0..1.5 span — two thirds up, not the
+    // ceiling — so on track.volume this line is genuinely informative and
+    // is drawn, where a ceiling-assumed one would have been a duplicate.
+    let default_value = crate::targets::default_of(&lane.target).unwrap_or(max);
     let y = y_of(default_value);
     if (y - y_of(min)).abs() > 1.0 && (y - y_of(max)).abs() > 1.0 {
         painter.line_segment(
