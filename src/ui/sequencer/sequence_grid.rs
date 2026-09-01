@@ -9,6 +9,14 @@
 //! width: a 1/32 grid is thirty-two narrower cells in the bar's row, not
 //! a longer row. So the bar stays where the eye learned it.
 //!
+//! The window onto the bar is a CAMERA, not a count of cells: a stretch
+//! of ticks and a magnification, and every mark lands where its tick
+//! falls under it. Zoom scales ticks to pixels; resolution only decides
+//! where the cells are cut. So a sixteenth is twice a thirty-second at
+//! every zoom, a triplet is two thirds of a sixteenth, a resolution
+//! change moves nothing, and a cell the window catches only part of is
+//! drawn cut at the edge, not dropped or stretched.
+//!
 //! What is drawn is a channel, not a table. An empty step is a point;
 //! the start of a beat is a plane one rung up; a trig is a mark with its
 //! onset, its address through the lens, and — value being the axis — a
@@ -65,7 +73,7 @@ const PANEL_FILL: egui::Color32 = egui::Color32::from_gray(10);
 const HEADER_FILL: egui::Color32 = egui::Color32::from_gray(18);
 /// Magnification of the bar: how many times its row is enlarged, with
 /// the window sliding to keep the cursor in view. Powers of two, so the
-/// automatic zoom that follows a resolution change is exact.
+/// bar's tick count divides exactly at every level.
 const MAX_ZOOM: usize = 16;
 /// Wider than this, a cell has room for a second line of detail.
 const DETAIL_MIN_W: f32 = 64.0;
@@ -89,10 +97,10 @@ pub(crate) struct SequenceGrid {
     /// How many times the bar is magnified. One shows the whole bar in
     /// its row; two shows half of it, at twice the width; and so on.
     zoom: usize,
-    /// The first column each row shows, in steps of the current grid.
-    /// Every row shows the same window, so the bars stay aligned and a
-    /// beat reads straight down through them.
-    view_start: usize,
+    /// The first tick of the bar each row shows: where the camera
+    /// stands. Every row shows the same window, so the bars stay
+    /// aligned and a beat reads straight down through them.
+    view_tick: usize,
     last_pitch: Pitch,
     /// The last refusal, shown in the status line until the next sentence.
     /// Silence is forbidden: an unsupported verb answers out loud.
@@ -105,7 +113,7 @@ impl Default for SequenceGrid {
             cursor_step: 0,
             resolution: GridResolution::default(),
             zoom: 1,
-            view_start: 0,
+            view_tick: 0,
             last_pitch: Pitch::from_midi(DEFAULT_PITCH),
             refusal: None,
         }
@@ -115,21 +123,16 @@ impl Default for SequenceGrid {
 impl SequenceGrid {
     /// Read this frame's view chords: resolution (`^1` finer, `^2`
     /// coarser, `^3` triplets) and zoom (`^+` in, `^-` out, `^0` the whole
-    /// bar). Then keep the cursor where it was and the window around it.
+    /// bar). Then keep the cursor on its tick and the camera around it.
     ///
-    /// Resolution and zoom are yoked: narrowing the grid zooms in by the
-    /// same factor, so the cells under the hand keep their width and the
-    /// window simply shows less of the bar. Widening zooms back out. A
-    /// zoom chord on its own is the way to look at more or less of the
-    /// bar without changing what a step is.
+    /// A resolution change does not move the camera: the same stretch of
+    /// the bar stays on screen, cut into more or fewer cells. Zoom is the
+    /// one way to look at more or less of the bar, and it magnifies about
+    /// the cursor, so the cell under the hand holds its place.
     pub(crate) fn update_view(&mut self, ctx: &egui::Context) {
         let tick = self.cursor_tick();
-        let columns_before = self.columns();
         self.resolution.update(ctx);
-        let columns_after = self.columns();
-        if columns_after != columns_before {
-            self.zoom = (self.zoom * columns_after / columns_before.max(1)).clamp(1, MAX_ZOOM);
-        }
+        self.cursor_step = (tick / self.resolution.step_ticks()).min(self.steps() - 1);
         let zoom_in = ctx.input_mut(|input| {
             input.consume_key(egui::Modifiers::COMMAND, egui::Key::Plus)
                 || input.consume_key(egui::Modifiers::COMMAND, egui::Key::Equals)
@@ -140,12 +143,12 @@ impl SequenceGrid {
             ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Num0));
         if zoom_fit {
             self.zoom = 1;
+            self.view_tick = 0;
         } else if zoom_in {
-            self.zoom = (self.zoom * 2).min(MAX_ZOOM);
+            self.rezoom((self.zoom * 2).min(MAX_ZOOM));
         } else if zoom_out {
-            self.zoom = (self.zoom / 2).max(1);
+            self.rezoom((self.zoom / 2).max(1));
         }
-        self.cursor_step = (tick / self.resolution.step_ticks()).min(self.steps() - 1);
         self.follow_cursor();
     }
 
@@ -159,24 +162,57 @@ impl SequenceGrid {
         self.columns() * BARS
     }
 
-    /// How many of a row's steps the window shows.
-    fn visible(&self) -> usize {
-        (self.columns() / self.zoom).max(1)
+    /// How many ticks of the bar the window holds.
+    fn visible_ticks(&self) -> usize {
+        TICKS_PER_BAR / self.zoom
     }
 
-    /// Slide the window the least it must to contain the cursor's
-    /// column, and never past the end of the bar. Minimal by rule: a
-    /// window that recentred would move the ground under a hand that
-    /// only stepped one cell sideways.
-    fn follow_cursor(&mut self) {
-        let visible = self.visible();
-        let column = self.cursor_step % self.columns();
-        if column < self.view_start {
-            self.view_start = column;
-        } else if column >= self.view_start + visible {
-            self.view_start = column + 1 - visible;
+    /// The camera for a row `row_width` wide. At ×1 the bar fills the
+    /// row exactly as the sixteenth grid lays it — sixteen strides of a
+    /// cell and a gap — and each doubling doubles the scale. Resolution
+    /// has no say here: the scale is ticks to pixels, and a cell of any
+    /// grid is as wide as the time it spans.
+    fn camera(&self, row_width: f32) -> Camera {
+        Camera {
+            view_tick: self.view_tick,
+            visible_ticks: self.visible_ticks(),
+            px_per_tick: self.zoom as f32 * (row_width + CELL_GAP) / TICKS_PER_BAR as f32,
         }
-        self.view_start = self.view_start.min(self.columns() - visible);
+    }
+
+    /// Magnify about the cursor: the cursor's tick keeps its fraction of
+    /// the window, so the cell under the hand stays put and the bar grows
+    /// or shrinks around it. Then the window is kept inside the bar.
+    fn rezoom(&mut self, zoom: usize) {
+        let anchor = self.cursor_tick() % TICKS_PER_BAR;
+        let before = self.visible_ticks();
+        let offset = anchor.saturating_sub(self.view_tick).min(before);
+        self.zoom = zoom;
+        let after = self.visible_ticks();
+        self.view_tick = anchor.saturating_sub(offset * after / before);
+        self.clamp_view();
+    }
+
+    /// The window never runs past the end of the bar.
+    fn clamp_view(&mut self) {
+        self.view_tick = self.view_tick.min(TICKS_PER_BAR - self.visible_ticks());
+    }
+
+    /// Slide the camera the least it must to show the cursor's cell, and
+    /// never past the bar's ends. Minimal by rule: a window that
+    /// recentred would move the ground under a hand that only stepped
+    /// one cell sideways. A cell wider than the window shows from its
+    /// start.
+    fn follow_cursor(&mut self) {
+        let visible = self.visible_ticks();
+        let start = self.cursor_tick() % TICKS_PER_BAR;
+        let end = start + self.resolution.step_ticks();
+        if start < self.view_tick {
+            self.view_tick = start;
+        } else if end > self.view_tick + visible {
+            self.view_tick = (end - visible).min(start);
+        }
+        self.clamp_view();
     }
 
     #[allow(clippy::too_many_arguments)] // One read-only context per concern.
@@ -239,24 +275,29 @@ impl SequenceGrid {
         painter.rect_filled(header, 0.0, HEADER_FILL);
         self.draw_status(&painter, origin, full_width, clip, lens, overlay.as_deref());
 
-        // The window: which steps of each bar the rows show, and how wide
-        // a cell is once the row is cut into them.
+        // The camera: which stretch of each bar the rows show, and where
+        // every tick of it falls. The grid says where the cells are cut;
+        // the camera says where they land; the window's edges cut them.
         let columns = self.columns();
-        let visible = self.visible();
-        let first = self.view_start;
-        let cell_w = ((row_width - CELL_GAP * (visible - 1) as f32) / visible as f32).max(1.0);
         let step_ticks = self.resolution.step_ticks();
+        let camera = self.camera(row_width);
+        let shown = camera.columns(step_ticks);
         let grid_origin = origin + egui::vec2(ROW_ADDRESS_WIDTH, STATUS_HEIGHT + RULER_HEIGHT);
-        let column_x =
-            |column: usize| grid_origin.x + (column - first) as f32 * (cell_w + CELL_GAP);
+        let tick_x = |tick_in_bar: usize| grid_origin.x + camera.x(tick_in_bar);
+        let window = egui::Rect::from_min_max(
+            egui::pos2(grid_origin.x, origin.y + STATUS_HEIGHT),
+            egui::pos2(grid_origin.x + row_width, origin.y + full_height),
+        )
+        .expand2(egui::vec2(CURSOR_GAP, 0.0));
+        let cells = painter.with_clip_rect(window.intersect(painter.clip_rect()));
 
         self.draw_ruler(
-            &painter,
+            &cells,
             egui::Rect::from_min_size(
                 egui::pos2(grid_origin.x, origin.y + STATUS_HEIGHT),
                 egui::vec2(row_width, RULER_HEIGHT),
             ),
-            cell_w,
+            &camera,
         );
 
         for row in 0..BARS {
@@ -264,19 +305,28 @@ impl SequenceGrid {
             draw_row_address(
                 &painter,
                 egui::pos2(origin.x + ROW_ADDRESS_WIDTH - space::SM, row_top),
-                row * columns + first + 1,
-                row * TICKS_PER_BAR + first * step_ticks,
+                row * columns + shown.start() + 1,
+                row * TICKS_PER_BAR + shown.start() * step_ticks,
                 cell_side,
             );
-            for column in first..first + visible {
+            for column in shown.clone() {
                 let step = row * columns + column;
-                let rect = egui::Rect::from_min_size(
-                    egui::pos2(column_x(column), row_top),
-                    egui::vec2(cell_w, cell_side),
+                let rect = egui::Rect::from_min_max(
+                    egui::pos2(tick_x(column * step_ticks), row_top),
+                    egui::pos2(
+                        tick_x((column + 1) * step_ticks) - CELL_GAP,
+                        row_top + cell_side,
+                    ),
                 );
+                // A cell cut by the window's edge answers the pointer on
+                // the part that shows, and nowhere else.
+                let hit = rect.intersect(window);
+                if !hit.is_positive() {
+                    continue;
+                }
                 let response = ui
                     .interact(
-                        rect,
+                        hit,
                         ui.id().with(("sequence-step", step)),
                         egui::Sense::click(),
                     )
@@ -287,15 +337,15 @@ impl SequenceGrid {
                 }
 
                 let tick = step * step_ticks;
-                draw_ground(&painter, rect, tick);
+                draw_ground(&cells, rect, tick);
                 if response.hovered() && self.cursor_step != step {
                     // The pointer's presence is a tint, not an outline: a
                     // rule would say something, and hovering says nothing.
-                    painter.rect_filled(rect, 0.0, egui::Color32::from_white_alpha(8));
+                    cells.rect_filled(rect, 0.0, egui::Color32::from_white_alpha(8));
                 }
-                self.draw_cell_events(&painter, rect, clip, lens, step);
+                self.draw_cell_events(&cells, rect, clip, lens, step);
                 if self.cursor_step == step {
-                    draw_cursor(&painter, rect);
+                    draw_cursor(&cells, rect);
                 }
             }
         }
@@ -306,14 +356,14 @@ impl SequenceGrid {
     /// wherever the next one has room — beats first, then sixteenths,
     /// then finer, as the zoom makes room for them. Every bar's row is
     /// the same window, so one ruler serves all four.
-    fn draw_ruler(&self, painter: &egui::Painter, band: egui::Rect, cell_w: f32) {
+    fn draw_ruler(&self, painter: &egui::Painter, band: egui::Rect, camera: &Camera) {
         let step_ticks = self.resolution.step_ticks();
-        let stride = cell_w + CELL_GAP;
+        let stride = step_ticks as f32 * camera.px_per_tick;
         let unit = ruler_unit(step_ticks, stride);
         let font = egui::FontId::new(font::MICRO_LABEL, egui::FontFamily::Monospace);
-        for (index, column) in (self.view_start..self.view_start + self.visible()).enumerate() {
+        for column in camera.columns(step_ticks) {
             let tick = column * step_ticks;
-            let x = band.min.x + index as f32 * stride;
+            let x = band.min.x + camera.x(tick);
             let beat = tick.is_multiple_of(TICKS_PER_BAR / 4);
             if beat {
                 painter.rect_filled(
@@ -777,6 +827,33 @@ impl SequenceGrid {
     }
 }
 
+/// The camera over the bar: the first tick each row shows, how many
+/// ticks the window holds, and the scale that puts a tick on screen.
+/// One camera serves every row, so a beat reads straight down.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Camera {
+    view_tick: usize,
+    visible_ticks: usize,
+    px_per_tick: f32,
+}
+
+impl Camera {
+    /// Where a tick of the bar falls, from the window's left edge. Ticks
+    /// before the window are negative and land under the row address;
+    /// the caller's clip decides what shows.
+    fn x(&self, tick_in_bar: usize) -> f32 {
+        (tick_in_bar as f32 - self.view_tick as f32) * self.px_per_tick
+    }
+
+    /// The cells of a `step_ticks` grid the window catches any part of,
+    /// the cut ones at either edge included.
+    fn columns(&self, step_ticks: usize) -> std::ops::RangeInclusive<usize> {
+        let step = step_ticks.max(1);
+        let last = (self.view_tick + self.visible_ticks).saturating_sub(1);
+        self.view_tick / step..=last / step
+    }
+}
+
 /// The trig cell's pitch text: the address through the lens, the
 /// musician's bend as a raised tick, the machine's approximation as a
 /// leading `≈` — two deviation sign classes, because they mean different
@@ -1160,43 +1237,112 @@ mod tests {
         assert_eq!(grid.cursor_step, 0);
     }
 
-    /// Narrowing the grid zooms in by the same factor, so the cells under
-    /// the hand keep their width and the window shows less of the bar;
-    /// widening zooms back out. The window always contains the cursor.
+    /// The window is a camera over ticks, not a count of cells: the
+    /// scale depends on the zoom alone, so a sixteenth is twice a
+    /// thirty-second and a triplet two thirds of a sixteenth at every
+    /// magnification; a resolution change leaves the camera exactly
+    /// where it stood; and a cell the window half-catches is drawn cut,
+    /// not dropped or stretched to fill the row.
     #[test]
-    fn resolution_and_zoom_are_yoked_and_the_window_follows_the_cursor() {
+    fn the_camera_scales_ticks_not_cells() {
         let mut grid = SequenceGrid::default();
-        grid.cursor_step = 20; // bar 2, column 4
-        grid.follow_cursor();
-        assert_eq!((grid.zoom, grid.visible(), grid.view_start), (1, 16, 0));
+        let row_width = 16.0 * 44.0 + 15.0 * CELL_GAP;
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-3;
 
-        // The same change `update_view` makes on ^1, without the context.
-        let tick = grid.cursor_tick();
-        let before = grid.columns();
-        grid.resolution = GridResolution::at(32, false);
-        grid.zoom = (grid.zoom * grid.columns() / before).clamp(1, MAX_ZOOM);
-        grid.cursor_step = tick / grid.resolution.step_ticks();
-        grid.follow_cursor();
-        assert_eq!(grid.zoom, 2, "narrowing did not zoom in");
-        assert_eq!(grid.visible(), 16, "the cells changed width");
-        assert_eq!(grid.cursor_step % grid.columns(), 8);
+        // ×1: sixteen sixteenths fill the row, each a cell and a gap.
+        let at_one = grid.camera(row_width);
+        assert!(close(at_one.x(12) - at_one.x(0), 44.0 + CELL_GAP));
+        assert!(close(at_one.x(TICKS_PER_BAR), row_width + CELL_GAP));
+        assert_eq!(at_one.columns(12), 0..=15);
+
+        // ×8 is exactly eight times the scale, whatever the grid.
+        grid.zoom = 8;
+        let at_eight = grid.camera(row_width);
+        assert!(close(at_eight.px_per_tick, at_one.px_per_tick * 8.0));
+        grid.resolution = GridResolution::at(16, true);
         assert_eq!(
-            grid.view_start, 0,
-            "the window moved with the cursor still in view"
+            grid.camera(row_width),
+            at_eight,
+            "the resolution moved the camera"
+        );
+        // Three 1/16T cells of 8 ticks fill the 24-tick window: each is
+        // two thirds of a sixteenth's width, never a third of the row.
+        assert_eq!(at_eight.columns(8), 0..=2);
+        let sixteenth = 12.0 * at_eight.px_per_tick;
+        assert!(close(at_eight.x(8) - at_eight.x(0), sixteenth * 2.0 / 3.0));
+
+        // ×16 shows twelve ticks: a triplet cell and half of the next,
+        // the cut one kept and the whole one two thirds of the row.
+        grid.zoom = 16;
+        let at_sixteen = grid.camera(row_width);
+        assert_eq!(at_sixteen.visible_ticks, 12);
+        assert_eq!(
+            at_sixteen.columns(8),
+            0..=1,
+            "the cell the window half-catches was dropped"
+        );
+        assert!(close(
+            at_sixteen.x(8) - at_sixteen.x(0),
+            (row_width + CELL_GAP) * 2.0 / 3.0
+        ));
+        // A window standing mid-cell starts on that cell, cut.
+        grid.view_tick = 4;
+        assert_eq!(grid.camera(row_width).columns(8), 0..=1);
+        assert!(grid.camera(row_width).x(0) < 0.0);
+    }
+
+    /// The camera slides the least it must to keep the cursor's cell in
+    /// view, magnifies about the cursor, never leaves the bar, and does
+    /// not move for a resolution change.
+    #[test]
+    fn the_camera_follows_the_cursor_and_zooms_about_it() {
+        let mut grid = SequenceGrid::default();
+        grid.cursor_step = 20; // bar 2, column 4: tick 48 of the bar
+        grid.follow_cursor();
+        assert_eq!(
+            (grid.zoom, grid.visible_ticks(), grid.view_tick),
+            (1, 192, 0)
         );
 
-        // Walking past the window's right edge slides it by exactly one.
-        grid.cursor_step += 8; // column 16, just outside 0..16
+        // Zooming in keeps the cursor's quarter of the window: 48 of 192
+        // becomes 24 of 96, so the cell under the hand does not move.
+        grid.rezoom(2);
+        assert_eq!((grid.zoom, grid.view_tick), (2, 24));
+
+        // Walking to the last cell in view slides nothing.
+        grid.cursor_step = 16 + 9; // cell 108..120 in a 24..120 window
         grid.follow_cursor();
-        assert_eq!(grid.view_start, 1);
-        // And the window never runs past the bar.
-        grid.cursor_step = grid.columns() - 1;
+        assert_eq!(grid.view_tick, 24);
+        // One cell further slides by exactly one cell.
+        grid.cursor_step = 16 + 10;
         grid.follow_cursor();
-        assert_eq!(grid.view_start, grid.columns() - grid.visible());
-        // Zooming out to one shows the whole bar again from its start.
-        grid.zoom = 1;
+        assert_eq!(grid.view_tick, 36);
+        // Walking back left of the window slides to the cell's start.
+        grid.cursor_step = 16 + 2; // cell 24..36
         grid.follow_cursor();
-        assert_eq!((grid.visible(), grid.view_start), (32, 0));
+        assert_eq!(grid.view_tick, 24);
+
+        // A finer grid leaves the camera where it stood.
+        grid.resolution = GridResolution::at(32, false);
+        grid.cursor_step = 32 + 4; // still tick 24 of bar 2
+        grid.follow_cursor();
+        assert_eq!((grid.zoom, grid.view_tick), (2, 24));
+
+        // Never past the bar: the last cell pins the window to the end.
+        grid.cursor_step = 32 + 31;
+        grid.follow_cursor();
+        assert_eq!(grid.view_tick, 96);
+
+        // Zooming out to one shows the whole bar from its start.
+        grid.rezoom(1);
+        assert_eq!((grid.visible_ticks(), grid.view_tick), (192, 0));
+
+        // A cell wider than the window shows from its start.
+        grid.resolution = GridResolution::at(4, false); // 48-tick cells
+        grid.cursor_step = 4 + 1; // tick 48
+        grid.zoom = 16; // a 12-tick window
+        grid.follow_cursor();
+        assert_eq!(grid.view_tick, 48);
     }
 
     #[test]
