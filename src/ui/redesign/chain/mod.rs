@@ -95,6 +95,21 @@ pub struct CatalogueItem {
     pub is_instrument: bool,
 }
 
+/// The reserved device id of the TRACK HEAD.
+///
+/// The head is drawn as a device because, to the hand, it IS one: fixed
+/// slots, the same cursor, the same travel. The vision promises muscle
+/// memory transfers across every device forever, and the fader is the
+/// control a musician touches most — a bespoke widget there would break
+/// that promise at the worst possible place. Making it a DeviceView also
+/// means the whole chain surface renders and edits it with no new code.
+pub const TRACK_HEAD_ID: u64 = u64::MAX;
+
+/// Slot ids on the track head. They never collide with device parameter
+/// ids because the head is not backed by a `ParamDef` table at all.
+pub const TRACK_LEVEL_PARAM: u32 = 0;
+pub const TRACK_PAN_PARAM: u32 = 1;
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct View {
     pub track_name: Option<String>,

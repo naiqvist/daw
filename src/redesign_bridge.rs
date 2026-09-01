@@ -540,6 +540,28 @@ impl App {
                     param,
                     value,
                 } => {
+                    // The TRACK HEAD is not in any chain: its slots are the
+                    // Song track's own mixer values, and they must be
+                    // written there. Writing the legacy twin would be
+                    // erased on the next projection pass, which copies the
+                    // Song onto it.
+                    if device == daw::ui::redesign::chain::TRACK_HEAD_ID {
+                        if let Some(index) = self.song_track_for_active_chain()
+                            && let Some(song_track) = self.song.tracks.get_mut(index)
+                        {
+                            match param {
+                                daw::ui::redesign::chain::TRACK_LEVEL_PARAM => {
+                                    song_track.volume = value.clamp(0.0, 1.0);
+                                }
+                                daw::ui::redesign::chain::TRACK_PAN_PARAM => {
+                                    song_track.pan = value.clamp(-1.0, 1.0);
+                                }
+                                _ => {}
+                            }
+                            self.projected_song = None;
+                        }
+                        continue;
+                    }
                     let Some(track) = track else { continue };
                     self.apply_device_edits(
                         ChainOwner::Track(track),
@@ -721,6 +743,52 @@ impl App {
                 catalogue: Vec::new(),
             })
             .unwrap_or_default();
+        // The TRACK HEAD, at the head of the chain — the fader and pan as
+        // one more 8-slot page, so the hand travels to them exactly as it
+        // travels to any device. Values come from the SONG track, because
+        // that is where they persist; the projection copies them onto the
+        // legacy twin, so reading the twin would read a shadow.
+        if let Some(song_index) = self.song_track_for_active_chain() {
+            let track = &self.song.tracks[song_index];
+            chain_view.devices.insert(
+                0,
+                daw::ui::redesign::chain::DeviceView {
+                    id: daw::ui::redesign::chain::TRACK_HEAD_ID,
+                    name: "TRACK".to_owned(),
+                    bypassed: false,
+                    instrument: false,
+                    parent: None,
+                    hero: daw::ui::redesign::chain::HeroKind::None,
+                    params: vec![
+                        daw::ui::redesign::chain::ParamView {
+                            id: daw::ui::redesign::chain::TRACK_LEVEL_PARAM,
+                            name: "LEVEL".to_owned(),
+                            min: 0.0,
+                            max: 1.0,
+                            base: track.volume,
+                            choices: 0,
+                            // DECIBELS, not a unit fraction: real data over
+                            // euphemism. The model stores linear because
+                            // that is what the engine multiplies by; the
+                            // widget owns the dB mapping, which is the only
+                            // place that curve belongs.
+                            formatted: format_gain_db(track.volume),
+                            lock: None,
+                        },
+                        daw::ui::redesign::chain::ParamView {
+                            id: daw::ui::redesign::chain::TRACK_PAN_PARAM,
+                            name: "PAN".to_owned(),
+                            min: -1.0,
+                            max: 1.0,
+                            base: track.pan,
+                            choices: 0,
+                            formatted: format_pan(track.pan),
+                            lock: None,
+                        },
+                    ],
+                },
+            );
+        }
         chain_view.catalogue = devices::DEVICES
             .iter()
             .map(|spec| daw::ui::redesign::chain::CatalogueItem {
@@ -1609,6 +1677,47 @@ impl App {
     }
 }
 
+/// A fader level as DECIBELS, because that is what a musician reads.
+/// Unity is exactly 0.0 dB and silence says so in words rather than as a
+/// number nobody can act on.
+fn format_gain_db(linear: f32) -> String {
+    if linear <= 0.0 {
+        return "-INF".to_owned();
+    }
+    let db = 20.0 * linear.max(1e-6).log10();
+    if db.abs() < 0.05 {
+        "0.0dB".to_owned()
+    } else {
+        format!("{db:+.1}dB")
+    }
+}
+
+/// Pan as its position, with an exact CENTRE that reads as one character.
+/// A centred pan is a fact worth seeing at a glance, and "0.00" makes the
+/// reader do arithmetic to learn it.
+fn format_pan(pan: f32) -> String {
+    if pan.abs() < 0.005 {
+        return "C".to_owned();
+    }
+    let side = if pan < 0.0 { 'L' } else { 'R' };
+    format!("{side}{:.0}", pan.abs() * 100.0)
+}
+
+/// The Song track whose legacy twin is the chain's active track.
+///
+/// The chain is addressed through the legacy arrangement, but a track's
+/// mixer values live on the Song. This is the one place the two are
+/// reconciled, by walking the map the projection already maintains.
+impl App {
+    fn song_track_for_active_chain(&self) -> Option<usize> {
+        let legacy = self.arrangement.active_track()?;
+        self.song
+            .tracks
+            .iter()
+            .position(|track| self.song_track_map.get(&track.id) == Some(&legacy))
+    }
+}
+
 fn song_track_audible(track: &daw::sequencing::Track, any_solo: bool) -> bool {
     if any_solo { track.solo } else { !track.muted }
 }
@@ -1943,6 +2052,54 @@ mod projection_tests {
             Some(daw::sequencing::LandRefusal::NotAnAudioTrack.sign())
         );
         assert!(app.song.tracks[0].audio_blocks.is_empty());
+    }
+
+    /// The fader reads in DECIBELS and pan reads its side — real data
+    /// over euphemism, and an exact centre that says so in one character
+    /// rather than making the reader do arithmetic.
+    #[test]
+    fn the_track_head_speaks_decibels_and_sides() {
+        assert_eq!(format_gain_db(1.0), "0.0dB", "unity is exactly zero");
+        assert_eq!(
+            format_gain_db(0.0),
+            "-INF",
+            "silence is a word, not a number"
+        );
+        assert_eq!(format_gain_db(0.5), "-6.0dB");
+        assert!(
+            format_gain_db(2.0).starts_with('+'),
+            "boost carries its sign"
+        );
+
+        assert_eq!(format_pan(0.0), "C", "centre is one character");
+        assert_eq!(format_pan(-1.0), "L100");
+        assert_eq!(format_pan(1.0), "R100");
+        assert_eq!(format_pan(0.5), "R50");
+    }
+
+    /// A slot edit on the track head writes the SONG, not the legacy
+    /// twin. Writing the twin would be erased by the next projection
+    /// pass, which copies the Song onto it — the edit would appear to
+    /// work and then silently revert.
+    #[test]
+    fn a_track_head_edit_lands_on_the_song_not_the_twin() {
+        let storage = shell::Storage::default();
+        let mut app = App::new(&storage);
+        app.song = song_with_trig();
+        app.project_song();
+
+        app.apply_redesign_chain_intents(&[daw::ui::redesign::chain::Intent::SetParam {
+            device: daw::ui::redesign::chain::TRACK_HEAD_ID,
+            param: daw::ui::redesign::chain::TRACK_LEVEL_PARAM,
+            value: 0.25,
+        }]);
+
+        assert_eq!(app.song.tracks[0].volume, 0.25, "the song took the edit");
+        // And it survives the next projection rather than being erased.
+        app.project_song();
+        let legacy = app.song_track_map[&app.song.tracks[0].id];
+        assert_eq!(app.arrangement.tracks[legacy].volume, 0.25);
+        assert_eq!(app.song.tracks[0].volume, 0.25);
     }
 
     /// The tempo map is AUDIBLE, not decorative.
