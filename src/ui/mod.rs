@@ -83,6 +83,7 @@ pub mod redesign;
 /// second authority for what plays.
 pub mod session_next;
 pub mod skin;
+pub mod stage;
 pub mod theme;
 pub mod tokens;
 pub mod vm;
