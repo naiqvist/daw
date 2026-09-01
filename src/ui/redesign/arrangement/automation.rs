@@ -15,8 +15,11 @@
 //! locks travel with content, curves belong to the timeline.
 
 use crate::sequencing::{Song, TICKS_PER_BEAT, TRACK_PAN, TRACK_VOLUME};
+use crate::ui::redesign::OUTLINE;
 use crate::ui::redesign::grammar::Motion;
 use crate::ui::redesign::verbs::Verb;
+use crate::ui::tokens::{font, space, stroke};
+use eframe::egui;
 
 /// One motion of value: a sixteenth of the span, so four presses is a
 /// quarter and sixteen crosses the lane exactly.
@@ -75,6 +78,9 @@ pub(super) struct AutomationLane {
     /// Said out loud when a gesture cannot mean anything here. A silent
     /// no-op is indistinguishable from a broken key.
     pub(super) refusal: Option<String>,
+    /// The target chooser. Reuses the palette's own state type, because
+    /// it is the same gesture with a different list.
+    pub(super) picker: super::state::PaletteState,
 }
 
 impl Default for AutomationLane {
@@ -85,6 +91,7 @@ impl Default for AutomationLane {
             cursor_tick: 0,
             cursor_value: 1.0,
             refusal: None,
+            picker: super::state::PaletteState::default(),
         }
     }
 }
@@ -151,6 +158,12 @@ impl AutomationLane {
 
             // Bow the segment leaving the point under the cursor.
             (Some(Verb::Resize), Some(motion)) => self.bend(song, track, motion, count),
+
+            // SEARCH aims the lane. The charter's answer for a long tail
+            // is fuzzy name-search, and a chain can carry a great many
+            // parameters — so this reuses the browser's and the palette's
+            // gesture rather than inventing a picker.
+            (Some(Verb::Search), _) => self.picker.open(),
 
             (Some(other), _) => {
                 self.refusal = Some(format!("{}: NOT HERE", verb_name(other)));
@@ -437,5 +450,212 @@ mod tests {
                 assert!((normalize(target, real) - normalized).abs() < 1e-6);
             }
         }
+    }
+}
+
+/// One parameter the lane can be aimed at.
+///
+/// `id` is the target string and is FILE FORMAT; `label` and `group` are
+/// only for reading. The list is built by the app, because which
+/// parameters exist depends on the track's chain — the lane does not
+/// reach into the song to find out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TargetOption {
+    pub id: String,
+    pub label: String,
+    pub group: String,
+}
+
+const PICKER_WIDTH: f32 = 460.0;
+const PICKER_ROW_H: f32 = 28.0;
+const PICKER_SURFACE: egui::Color32 = egui::Color32::from_gray(10);
+const PICKER_ROW: egui::Color32 = egui::Color32::from_gray(18);
+const PICKER_MUTED: egui::Color32 = egui::Color32::from_gray(110);
+
+/// Aim the lane at another parameter.
+///
+/// The same shape as the arrangement's command palette — fuzzy search,
+/// arrows, Enter, Escape — because reusing a gesture beats inventing a
+/// picker. The device-page strategy already names fuzzy name-search as
+/// the answer for the long tail, and a chain can carry a great many
+/// parameters.
+pub(super) fn show_picker(
+    ctx: &egui::Context,
+    state: &mut super::state::PaletteState,
+    targets: &[TargetOption],
+) -> Option<String> {
+    if !state.open {
+        return None;
+    }
+    if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+        state.close();
+        return None;
+    }
+    let matches: Vec<&TargetOption> = targets
+        .iter()
+        .filter(|option| fuzzy(&state.query, &option.label) || fuzzy(&state.query, &option.group))
+        .collect();
+    state.cursor = state.cursor.min(matches.len().saturating_sub(1));
+    ctx.input_mut(|input| {
+        if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) && !matches.is_empty() {
+            state.cursor = (state.cursor + 1) % matches.len();
+        }
+        if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) && !matches.is_empty() {
+            state.cursor = state.cursor.checked_sub(1).unwrap_or(matches.len() - 1);
+        }
+    });
+    let accept = ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+    let mut chosen = None;
+    let screen = ctx.content_rect();
+    egui::Area::new(egui::Id::new("redesign_automation_targets"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(egui::pos2(
+            screen.center().x - PICKER_WIDTH * 0.5,
+            screen.top() + 72.0,
+        ))
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(egui::Color32::BLACK)
+                .stroke(egui::Stroke::new(stroke::FOCUS, OUTLINE))
+                .inner_margin(egui::Margin::same(space::SM as i8))
+                .show(ui, |ui| {
+                    ui.set_width(PICKER_WIDTH);
+                    ui.painter()
+                        .rect_filled(ui.available_rect_before_wrap(), 0.0, PICKER_SURFACE);
+                    let field = ui.add(
+                        egui::TextEdit::singleline(&mut state.query)
+                            .hint_text("AUTOMATE WHAT")
+                            .desired_width(f32::INFINITY)
+                            .font(egui::TextStyle::Monospace)
+                            .frame(egui::Frame::NONE.fill(PICKER_SURFACE)),
+                    );
+                    if state.just_opened {
+                        field.request_focus();
+                        state.just_opened = false;
+                    }
+                    ui.add_space(space::XS);
+                    if matches.is_empty() {
+                        // Absence is a sign too: an empty result says so
+                        // rather than leaving a blank panel to be read as
+                        // a broken search.
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), PICKER_ROW_H),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().text(
+                            rect.left_center() + egui::vec2(space::SM, 0.0),
+                            egui::Align2::LEFT_CENTER,
+                            "NOTHING BY THAT NAME",
+                            egui::FontId::new(font::MICRO_LABEL, egui::FontFamily::Monospace),
+                            PICKER_MUTED,
+                        );
+                    }
+                    for (index, option) in matches.iter().enumerate() {
+                        let (rect, response) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), PICKER_ROW_H),
+                            egui::Sense::click(),
+                        );
+                        if index == state.cursor {
+                            ui.painter().rect_filled(rect, 0.0, PICKER_ROW);
+                            ui.painter().text(
+                                rect.left_center(),
+                                egui::Align2::LEFT_CENTER,
+                                ">",
+                                egui::FontId::new(font::LABEL, egui::FontFamily::Monospace),
+                                OUTLINE,
+                            );
+                        }
+                        ui.painter().text(
+                            rect.left_center() + egui::vec2(space::SM, 0.0),
+                            egui::Align2::LEFT_CENTER,
+                            &option.label,
+                            egui::FontId::new(font::LABEL, egui::FontFamily::Monospace),
+                            OUTLINE,
+                        );
+                        // The GROUP is what makes two parameters called
+                        // MIX tellable apart, so it is never dropped.
+                        ui.painter().text(
+                            rect.right_center() - egui::vec2(space::SM, 0.0),
+                            egui::Align2::RIGHT_CENTER,
+                            &option.group,
+                            egui::FontId::new(font::MICRO_LABEL, egui::FontFamily::Monospace),
+                            PICKER_MUTED,
+                        );
+                        if response.clicked() {
+                            chosen = Some(option.id.clone());
+                        }
+                    }
+                });
+        });
+    if chosen.is_none() && accept {
+        chosen = matches.get(state.cursor).map(|option| option.id.clone());
+    }
+    if chosen.is_some() {
+        state.close();
+    }
+    chosen
+}
+
+fn fuzzy(query: &str, text: &str) -> bool {
+    let mut text = text.chars().map(|character| character.to_ascii_lowercase());
+    query
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .map(|character| character.to_ascii_lowercase())
+        .all(|needle| text.by_ref().any(|candidate| candidate == needle))
+}
+
+#[cfg(test)]
+mod picker_tests {
+    use super::*;
+
+    /// The search matches a subsequence, so LVL finds LEVEL — the same
+    /// forgiving rule the command palette and the browser already use.
+    #[test]
+    fn the_search_matches_a_subsequence_case_blind() {
+        assert!(fuzzy("lvl", "LEVEL"));
+        assert!(fuzzy("CUT", "cutoff"));
+        assert!(fuzzy("", "ANYTHING"), "an empty query matches everything");
+        assert!(!fuzzy("xyz", "LEVEL"));
+        assert!(!fuzzy("levell", "LEVEL"), "it is a subsequence, not a soup");
+    }
+
+    /// Two parameters can share a name, so the GROUP is what tells them
+    /// apart — and searching the group has to find them.
+    #[test]
+    fn the_group_is_searchable_because_names_collide() {
+        let targets = [
+            TargetOption {
+                id: "track.volume".to_owned(),
+                label: "LEVEL".to_owned(),
+                group: "TRACK".to_owned(),
+            },
+            TargetOption {
+                id: "dev.1.poly.level".to_owned(),
+                label: "LEVEL".to_owned(),
+                group: "POLY SYNTH".to_owned(),
+            },
+        ];
+        let by_group: Vec<&str> = targets
+            .iter()
+            .filter(|option| fuzzy("poly", &option.label) || fuzzy("poly", &option.group))
+            .map(|option| option.id.as_str())
+            .collect();
+        assert_eq!(
+            by_group,
+            vec!["dev.1.poly.level"],
+            "the group narrows two identically named parameters to one"
+        );
+    }
+
+    /// Aiming the lane changes the target and leaves the time cursor
+    /// alone: the performer is travelling targets, not time.
+    #[test]
+    fn aiming_keeps_the_time_cursor() {
+        let mut lane = AutomationLane::default();
+        lane.cursor_tick = 480;
+        lane.aim("dev.1.poly.Wave");
+        assert_eq!(lane.target, "dev.1.poly.Wave");
+        assert_eq!(lane.cursor_tick, 480, "time did not move");
     }
 }

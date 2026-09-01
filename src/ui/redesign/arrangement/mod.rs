@@ -3,7 +3,7 @@
 //! This view owns only navigation state. Tracks, blocks and patterns stay in
 //! the application-owned [`Song`], shared with the wrapped sequence editor.
 
-pub(super) mod automation;
+pub mod automation;
 mod edit;
 mod palette;
 mod state;
@@ -18,6 +18,11 @@ pub struct View<'a> {
     pub song: &'a mut Song,
     pub playhead_beats: f64,
     pub playing: bool,
+    /// Every parameter the automation lane may be aimed at on the
+    /// selected track. Built by the app, because which parameters exist
+    /// depends on the track's device chain — the lane never reaches into
+    /// the song to find out.
+    pub automation_targets: &'a [automation::TargetOption],
 }
 
 #[derive(Default)]

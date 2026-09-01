@@ -1155,12 +1155,18 @@ impl App {
         // Both occupy one address; the legacy occupant keeps all its
         // duties (drag-import, automation) until they grow redesign
         // equivalents.
+        // Every parameter this track's automation lane may aim at: the
+        // two mixer targets, then each device in its chain. Built here
+        // because only the app knows the chain; the lane is handed a list
+        // and never goes looking.
+        let automation_targets = self.automation_targets();
         if self.center_song {
             let _song_outcome = ui
                 .scope_builder(egui::UiBuilder::new().max_rect(center), |ui| {
                     self.redesign.show_arrangement(
                         ui,
                         daw::ui::redesign::arrangement::View {
+                            automation_targets: &automation_targets,
                             song: &mut self.song,
                             playhead_beats,
                             playing: self.transport.playing,
@@ -1737,6 +1743,47 @@ fn format_pan(pan: f32) -> String {
 /// mixer values live on the Song. This is the one place the two are
 /// reconciled, by walking the map the projection already maintains.
 impl App {
+    /// Everything the automation lane may be aimed at on the active
+    /// track: the mixer's two targets, then every parameter of every
+    /// device in its chain.
+    ///
+    /// Device targets name an INSTANCE — `dev.7.reverb.mix` — so a chain
+    /// can be reordered without a curve following the wrong device.
+    fn automation_targets(&self) -> Vec<daw::ui::redesign::arrangement::automation::TargetOption> {
+        use daw::ui::redesign::arrangement::automation::TargetOption;
+        let mut targets = vec![
+            TargetOption {
+                id: daw::sequencing::TRACK_VOLUME.to_owned(),
+                label: "LEVEL".to_owned(),
+                group: "TRACK".to_owned(),
+            },
+            TargetOption {
+                id: daw::sequencing::TRACK_PAN.to_owned(),
+                label: "PAN".to_owned(),
+                group: "TRACK".to_owned(),
+            },
+        ];
+        let Some(track) = self
+            .arrangement
+            .active_track()
+            .and_then(|index| self.arrangement.tracks.get(index))
+        else {
+            return targets;
+        };
+        for instance in &track.chain {
+            let kind = instance.kind();
+            let spec = kind.spec();
+            for label in spec.labels {
+                targets.push(TargetOption {
+                    id: daw::targets::device_target(instance.id, spec, label.name),
+                    label: label.name.to_ascii_uppercase(),
+                    group: spec.name.to_ascii_uppercase(),
+                });
+            }
+        }
+        targets
+    }
+
     fn song_track_for_active_chain(&self) -> Option<usize> {
         let legacy = self.arrangement.active_track()?;
         self.song

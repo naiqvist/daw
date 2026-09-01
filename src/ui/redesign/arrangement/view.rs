@@ -59,7 +59,11 @@ pub(super) fn show(
     let mut command = None;
     // A rename in progress is TYPING mode: the text field owns the
     // keyboard, so the grammar stays silent until it closes.
-    if focused && !state.palette.open && state.rename.is_none() {
+    // A palette OWNS the keyboard while it is open — the command palette
+    // already claimed that, and the target chooser is the same gesture
+    // with a different list. Without this the grammar sees Enter first
+    // and ACTS with it: choosing a target would place a breakpoint.
+    if focused && !state.palette.open && !state.automation.picker.open && state.rename.is_none() {
         keyboard(ui, voice, state, input.song, &mut outcome);
     }
     if focused && state.palette.open {
@@ -106,6 +110,17 @@ pub(super) fn show(
     let mut pointer_edit = None;
     let mut rename_outcome = RenameOutcome::Editing;
 
+    // The target chooser floats above everything, like the palette, and
+    // owns the keyboard while it is open.
+    if automation_open
+        && let Some(target) = super::automation::show_picker(
+            ui.ctx(),
+            &mut state.automation.picker,
+            input.automation_targets,
+        )
+    {
+        state.automation.aim(&target);
+    }
     if automation_open {
         let strip =
             egui::Rect::from_min_max(egui::pos2(area.left(), canvas_bottom), area.right_bottom());
