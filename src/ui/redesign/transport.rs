@@ -58,20 +58,7 @@ pub struct View<'a> {
     pub notice: Option<&'a str>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Intent {
-    Return,
-    TogglePlay,
-    Pause,
-    Stop,
-    ToggleRecord,
-    ToggleEngine,
-    ToggleLoop,
-    ToggleMetronome,
-    ToggleFollow,
-    SetTempo(f64),
-    CycleBeatUnit,
-}
+pub use crate::intent::transport::Intent;
 
 #[derive(Default)]
 pub struct Outcome {

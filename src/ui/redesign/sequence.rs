@@ -86,54 +86,7 @@ pub struct ClipView<'a> {
     pub ghosts: &'a [NoteView],
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Intent {
-    Toggle {
-        tick: usize,
-        default_pitch: crate::pitch::Pitch,
-        default_length_ticks: usize,
-        default_velocity: u8,
-    },
-    SetPrimary {
-        tick: usize,
-        pitch: crate::pitch::Pitch,
-        length_ticks: usize,
-        velocity: u8,
-    },
-    Clear {
-        tick: usize,
-    },
-    /// Move every note at `tick` by a signed tick delta (grammar: nudge).
-    Nudge {
-        tick: usize,
-        delta_ticks: isize,
-    },
-    /// Lengthen or shorten every note at `tick` (grammar: resize).
-    Resize {
-        tick: usize,
-        delta_ticks: isize,
-    },
-    /// Add one note at `tick` without touching its neighbours
-    /// (grammar: put and duplicate land whole trigs one note at a time).
-    AddNote {
-        tick: usize,
-        pitch: crate::pitch::Pitch,
-        length_ticks: usize,
-        velocity: u8,
-        probability: f32,
-    },
-    /// Set the condition sign on every note at `tick` (grammar: condition).
-    SetProbability {
-        tick: usize,
-        probability: f32,
-    },
-    /// Adjust the velocity of every note at `tick` by a signed amount
-    /// (grammar: hold-the-trig + up/down).
-    AdjustVelocity {
-        tick: usize,
-        delta: isize,
-    },
-}
+pub use crate::intent::sequence::Intent;
 
 #[derive(Default)]
 pub struct Outcome {

@@ -8,6 +8,7 @@ pub mod audio;
 pub mod audio_source;
 pub mod devices;
 pub mod dsp;
+pub mod intent;
 pub mod library;
 pub mod midi_input;
 pub mod param_law;

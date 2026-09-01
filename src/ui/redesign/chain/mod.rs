@@ -143,28 +143,7 @@ pub struct View {
     pub catalogue: Vec<CatalogueItem>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Intent {
-    SetParam {
-        device: u64,
-        param: u32,
-        value: f32,
-    },
-    ToggleBypass {
-        device: u64,
-    },
-    ToggleTrackArm,
-    CycleTrackMonitor,
-    /// Move `device` onto `target`; the shared rack helper decides which
-    /// side from their direction in the canonical chain.
-    Reorder {
-        device: u64,
-        target: u64,
-    },
-    AddDevice {
-        catalogue_index: usize,
-    },
-}
+pub use crate::intent::chain::Intent;
 
 #[derive(Default)]
 pub struct Outcome {

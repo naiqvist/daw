@@ -22,20 +22,7 @@ pub struct View<'a> {
     pub scanning: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Intent {
-    SelectSample(PathBuf),
-    AuditionSample(PathBuf),
-    StopAudition,
-    /// Put this sound onto the arrangement.
-    ///
-    /// The browser says WHICH sound and nothing else. It does not decide
-    /// what landing means, does not know the track, and never reaches
-    /// into the Song — it reads an immutable snapshot and emits semantic
-    /// intents, which is why this layer has stayed clean. The app
-    /// resolves the target and the meaning from the track's kind.
-    LandSample(PathBuf),
-}
+pub use crate::intent::browser::Intent;
 
 #[derive(Default)]
 pub struct Outcome {
