@@ -39,7 +39,7 @@ use daw::library::{
 };
 use daw::targets::{
     self, DEVICE_TARGET_PREFIX, ParameterRegistry, ParameterSpec, TRACK_PAN_TARGET,
-    TRACK_VOLUME_TARGET, device_target,
+    TRACK_VOLUME_TARGET, device_target, track_send_index,
 };
 use daw::ui::action::UiAction;
 use daw::ui::affordance::{Afford, Affords};
@@ -9404,7 +9404,12 @@ impl App {
             Ok(doc) => doc,
             Err(error) => return Err(format!("could not load: {error}")),
         };
-        let loaded_song = doc.song.clone();
+        let mut loaded_song = doc.song.clone();
+        // Repair the canonical model at the ownership boundary, never in
+        // `project_song`: undo must begin from the same legal stack and
+        // mixer data the projection will hear.
+        loaded_song.normalize_group_depths();
+        loaded_song.normalize_mixer();
         let mut loaded_song_track_map = doc.song_track_map.clone();
         apply_project_doc(doc, &mut self.arrangement, &mut self.transport);
         loaded_song_track_map.retain(|track_id, legacy_index| {

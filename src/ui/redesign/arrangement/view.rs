@@ -71,6 +71,18 @@ pub(super) fn show(
         command = palette::show(ui.ctx(), &mut state.palette, input.song, selection);
     }
     if let Some(command) = command {
+        let moved_track = matches!(
+            command,
+            edit::Command::MoveTrackUp | edit::Command::MoveTrackDown
+        )
+        .then(|| {
+            input
+                .song
+                .tracks
+                .get(state.cursor.track)
+                .map(|track| track.id)
+        })
+        .flatten();
         state.notice = Some(edit::apply(command, input.song, state.selection()));
         if command == edit::Command::DeleteClips {
             state.selected_block = None;
@@ -81,12 +93,12 @@ pub(super) fn show(
             edit::Command::AddTrack | edit::Command::AddAudioTrack => {
                 state.cursor.track = input.song.tracks.len().saturating_sub(1);
             }
-            edit::Command::MoveTrackUp => {
-                state.cursor.track = state.cursor.track.saturating_sub(1);
-            }
-            edit::Command::MoveTrackDown => {
-                state.cursor.track =
-                    (state.cursor.track + 1).min(input.song.tracks.len().saturating_sub(1));
+            edit::Command::MoveTrackUp | edit::Command::MoveTrackDown => {
+                if let Some(id) = moved_track
+                    && let Some(index) = input.song.tracks.iter().position(|track| track.id == id)
+                {
+                    state.cursor.track = index;
+                }
             }
             _ => {}
         }

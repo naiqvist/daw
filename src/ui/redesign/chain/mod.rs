@@ -109,6 +109,16 @@ pub const TRACK_HEAD_ID: u64 = u64::MAX;
 /// ids because the head is not backed by a `ParamDef` table at all.
 pub const TRACK_LEVEL_PARAM: u32 = 0;
 pub const TRACK_PAN_PARAM: u32 = 1;
+pub const TRACK_SEND_PARAM_START: u32 = 2;
+
+pub fn track_send_param(index: usize) -> Option<u32> {
+    (index < crate::sequencing::ReturnTrack::MAX).then(|| TRACK_SEND_PARAM_START + index as u32)
+}
+
+pub fn track_send_index(param: u32) -> Option<usize> {
+    let index = param.checked_sub(TRACK_SEND_PARAM_START)? as usize;
+    (index < crate::sequencing::ReturnTrack::MAX).then_some(index)
+}
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct View {

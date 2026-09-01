@@ -26,6 +26,12 @@ pub const DEFAULT_PATTERN_TICKS: usize = PATTERN_STEPS * 12;
 pub const TRACK_VOLUME: &str = "track.volume";
 pub const TRACK_PAN: &str = "track.pan";
 
+/// How deeply the Song's positional group stack may nest.
+///
+/// This deliberately matches the legacy stack the C1 copyist writes. The
+/// bound makes every group walk finite even for a hand-edited document.
+pub const MAX_GROUP_DEPTH: u8 = 8;
+
 /// Unity gain. A serde default, because a track absent from a pre-mixer
 /// document must come back at unity: defaulting a fader to zero would
 /// silently mute every project written before the mixer existed.
@@ -331,6 +337,24 @@ pub struct Track {
     /// Automatable through [`TRACK_PAN`].
     #[serde(default)]
     pub pan: f32,
+    /// How much of this track each return receives, as LINEAR gain.
+    ///
+    /// Positional and deliberately short: `sends[0]` feeds return A, and a
+    /// missing entry is exact zero. The graph owns the post-fader tap; this
+    /// green-zone model owns only the amount.
+    #[serde(default)]
+    pub sends: Vec<f32>,
+    /// A group is a summing lane whose members are the contiguous run below
+    /// it at greater depth. Membership is position, never a pointer.
+    #[serde(default)]
+    pub is_group: bool,
+    /// Closed in the arrangement while still sounding.
+    #[serde(default)]
+    pub folded: bool,
+    /// Zero is top level. A lane at depth `d` belongs to the nearest group
+    /// above it at depth `d - 1`.
+    #[serde(default)]
+    pub depth: u8,
 }
 
 /// A placement on a track's timeline, whichever list it came from.
@@ -522,6 +546,21 @@ impl Track {
         self.value_at(TRACK_PAN, tick, self.pan).clamp(-1.0, 1.0)
     }
 
+    /// One send's knob, with a short vector reading as exact silence.
+    pub fn send(&self, index: usize) -> f32 {
+        self.sends.get(index).copied().unwrap_or(0.0)
+    }
+
+    /// One send at `tick`: its static knob or the curve addressed by the
+    /// return's stable letter target (`track.send.a` … `track.send.h`).
+    pub fn send_at(&self, index: usize, tick: usize) -> f32 {
+        let Some(target) = crate::targets::track_send_target(index) else {
+            return 0.0;
+        };
+        self.value_at(target, tick, self.send(index))
+            .clamp(0.0, 1.0)
+    }
+
     /// THE THREE-LAYER READ, and the only sanctioned way to ask what a
     /// parameter is actually worth at a moment:
     ///
@@ -566,6 +605,54 @@ pub struct MeterMark {
     pub denominator: u32,
 }
 
+/// A return bus in the canonical Song.
+///
+/// Its effects chain remains projection-only for v1: the Song owns these
+/// four mixer facts, and `project_song` writes them onto the legacy bus while
+/// leaving that bus's effects intact.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct ReturnTrack {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub mute: bool,
+    #[serde(default = "unity")]
+    pub volume: f32,
+    #[serde(default)]
+    pub pan: f32,
+}
+
+impl Default for ReturnTrack {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            mute: false,
+            volume: 1.0,
+            pan: 0.0,
+        }
+    }
+}
+
+impl ReturnTrack {
+    pub const MAX: usize = 8;
+
+    pub fn letter(index: usize) -> char {
+        if index < Self::MAX {
+            (b'A' + index as u8) as char
+        } else {
+            '?'
+        }
+    }
+
+    pub fn new(index: usize) -> Self {
+        Self {
+            name: format!("Return {}", Self::letter(index)),
+            ..Self::default()
+        }
+    }
+}
+
 /// A tempo a musician could actually mean. Marks outside this are dropped
 /// rather than trusted: a zero or NaN bpm would make a tick worth
 /// infinity samples and hang the compile that tried to stamp it.
@@ -580,6 +667,10 @@ fn usable_bpm(bpm: f64) -> bool {
 pub struct Song {
     pub tracks: Vec<Track>,
     pub patterns: Vec<Pattern>,
+    /// Return buses in letter order. Their effects live on the legacy
+    /// projection for v1; these mixer facts are canonical here.
+    #[serde(default)]
+    pub returns: Vec<ReturnTrack>,
     /// Tempo changes in song time, sorted by tick.
     ///
     /// EMPTY MEANS the single global tempo the transport has always
@@ -623,8 +714,13 @@ impl Default for Song {
                 automation: Vec::new(),
                 volume: 1.0,
                 pan: 0.0,
+                sends: Vec::new(),
+                is_group: false,
+                folded: false,
+                depth: 0,
             }],
             patterns: vec![pattern],
+            returns: Vec::new(),
             tempo: Vec::new(),
             meter: Vec::new(),
             key: default_key(),
@@ -633,6 +729,88 @@ impl Default for Song {
 }
 
 impl Song {
+    /// Normalize the positional group stack at a green-zone ownership
+    /// boundary (load or edit), never in the C1 projection. Repairing only
+    /// the twin would leave the Song and undo history holding illegal data.
+    pub fn normalize_group_depths(&mut self) {
+        let mut allowed = 0;
+        for track in &mut self.tracks {
+            track.depth = track.depth.min(allowed).min(MAX_GROUP_DEPTH);
+            track.folded &= track.is_group;
+            allowed = if track.is_group {
+                track.depth.saturating_add(1)
+            } else {
+                track.depth
+            };
+        }
+    }
+
+    /// Sanitize mixer data arriving from a file. Edits already enforce the
+    /// same bounds; doing it once on load keeps the projection a pure copy.
+    pub fn normalize_mixer(&mut self) {
+        self.returns.truncate(ReturnTrack::MAX);
+        for track in &mut self.tracks {
+            track.sends.truncate(self.returns.len());
+            for send in &mut track.sends {
+                *send = if send.is_finite() {
+                    send.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+            }
+        }
+    }
+
+    /// Add the next lettered return. The caller turns `None` into a visible
+    /// refusal; this model never silently exceeds A through H.
+    pub fn add_return(&mut self) -> Option<usize> {
+        if self.returns.len() >= ReturnTrack::MAX {
+            return None;
+        }
+        let index = self.returns.len();
+        self.returns.push(ReturnTrack::new(index));
+        Some(index)
+    }
+
+    /// Take a return away, and every send that pointed at it.
+    ///
+    /// The sends shift DOWN rather than being cleared, because the list is
+    /// positional: removing A must make what was B into A on every track at
+    /// once, or every send past the gap would silently start feeding the
+    /// wrong bus. Lettered envelopes are shifted with the same physical bus;
+    /// the deleted bus's own envelope is the only one discarded.
+    pub fn remove_return(&mut self, index: usize) -> bool {
+        if index >= self.returns.len() {
+            return false;
+        }
+        self.returns.remove(index);
+        for track in &mut self.tracks {
+            if index < track.sends.len() {
+                track.sends.remove(index);
+            }
+
+            if let Some(deleted) = crate::targets::track_send_target(index) {
+                track
+                    .automation
+                    .retain(|envelope| envelope.target != deleted);
+            }
+            for shifted in index + 1..=self.returns.len() {
+                let Some(from) = crate::targets::track_send_target(shifted) else {
+                    continue;
+                };
+                let Some(to) = crate::targets::track_send_target(shifted - 1) else {
+                    continue;
+                };
+                for envelope in &mut track.automation {
+                    if envelope.target == from {
+                        envelope.target = to.to_owned();
+                    }
+                }
+            }
+        }
+        true
+    }
+
     /// The tempo in force at `tick`, or `fallback` before the first mark
     /// (and everywhere, when the map is empty).
     pub fn bpm_at(&self, tick: usize, fallback: f64) -> f64 {
@@ -1234,6 +1412,10 @@ mod automation_tests {
             automation: Vec::new(),
             volume: 1.0,
             pan: 0.0,
+            sends: Vec::new(),
+            is_group: false,
+            folded: false,
+            depth: 0,
         }
     }
 
@@ -1434,6 +1616,112 @@ mod automation_tests {
     }
 }
 
+/// Mixer data is project file format first: every absent field defaults to
+/// the sound an older project already made, and positional edits keep sends,
+/// returns and their lettered curves in one meaning.
+#[cfg(test)]
+mod mixer_tests {
+    use super::*;
+
+    #[test]
+    fn a_pre_mixer_song_still_loads_untouched() {
+        let text = ron::ser::to_string(&Song::default()).expect("serializes");
+        let older = text
+            .replace("sends:[],", "")
+            .replace("is_group:false,", "")
+            .replace("folded:false,", "")
+            .replace("depth:0,", "")
+            .replace("returns:[],", "");
+        assert!(!older.contains("sends"));
+        assert!(!older.contains("is_group"));
+        assert!(!older.contains("returns"));
+
+        let loaded: Song = ron::from_str(&older).expect("the whole older Song still opens");
+        assert_eq!(loaded.tracks.len(), 1);
+        assert_eq!(loaded.tracks[0].volume, 1.0);
+        assert_eq!(loaded.tracks[0].pan, 0.0);
+        assert!(loaded.tracks[0].sends.is_empty());
+        assert!(!loaded.tracks[0].is_group);
+        assert!(!loaded.tracks[0].folded);
+        assert_eq!(loaded.tracks[0].depth, 0);
+        assert!(loaded.returns.is_empty());
+    }
+
+    #[test]
+    fn returns_and_group_fields_round_trip() {
+        let mut song = Song::default();
+        song.returns.push(ReturnTrack {
+            name: "Plate".to_owned(),
+            mute: true,
+            volume: 0.7,
+            pan: -0.25,
+        });
+        let track = &mut song.tracks[0];
+        track.sends = vec![0.375];
+        track.is_group = true;
+        track.folded = true;
+        track.depth = 3;
+
+        let text = ron::ser::to_string(&song).expect("serializes");
+        let loaded: Song = ron::from_str(&text).expect("deserializes");
+        assert_eq!(loaded, song);
+    }
+
+    #[test]
+    fn deleting_a_return_shifts_static_sends_and_lettered_curves_together() {
+        let mut song = Song::default();
+        for _ in 0..3 {
+            song.add_return().expect("A through C fit");
+        }
+        let track = &mut song.tracks[0];
+        track.sends = vec![0.1, 0.2, 0.3];
+        track.automation = vec![
+            Envelope {
+                target: "track.send.b".to_owned(),
+                points: vec![Point {
+                    tick: 0,
+                    value: 0.8,
+                    bend: 0.0,
+                }],
+            },
+            Envelope {
+                target: "track.send.c".to_owned(),
+                points: vec![Point {
+                    tick: 0,
+                    value: 0.6,
+                    bend: 0.0,
+                }],
+            },
+        ];
+
+        assert!(song.remove_return(1));
+        assert_eq!(song.tracks[0].sends, vec![0.1, 0.3]);
+        assert_eq!(song.tracks[0].automation.len(), 1);
+        assert_eq!(song.tracks[0].automation[0].target, "track.send.b");
+        assert_eq!(song.tracks[0].automation[0].points[0].value, 0.6);
+    }
+
+    #[test]
+    fn group_depth_is_normalized_on_the_song() {
+        let mut song = Song::default();
+        song.tracks[0].depth = u8::MAX;
+        song.tracks[0].folded = true;
+        let mut child = song.tracks[0].clone();
+        child.id = TrackId(2);
+        child.is_group = true;
+        child.folded = true;
+        child.depth = u8::MAX;
+        song.tracks.push(child);
+
+        song.normalize_group_depths();
+
+        assert_eq!(song.tracks[0].depth, 0);
+        assert!(!song.tracks[0].folded, "plain lanes cannot fold");
+        assert_eq!(song.tracks[1].depth, 0, "no group above permits depth one");
+        assert!(song.tracks[1].folded, "a real group keeps its fold");
+    }
+}
+
 /// Audio blocks are the new half of a track's timeline. The tests that
 /// matter most here are not the round trips — they are the ones proving
 /// a project written before audio blocks existed still opens.
@@ -1484,6 +1772,11 @@ mod audio_block_tests {
             .replace("automation:[],", "")
             .replace("volume:1.0,", "")
             .replace("pan:0.0,", "")
+            .replace("sends:[],", "")
+            .replace("is_group:false,", "")
+            .replace("folded:false,", "")
+            .replace("depth:0,", "")
+            .replace("returns:[],", "")
             .replace("tempo:[],", "")
             .replace("meter:[],", "");
         assert!(
@@ -1503,6 +1796,11 @@ mod audio_block_tests {
         assert_eq!(track.volume, 1.0, "unity, never silence");
         assert!(track.automation.is_empty());
         assert!(back.tempo.is_empty());
+        assert!(back.returns.is_empty());
+        assert!(track.sends.is_empty());
+        assert!(!track.is_group);
+        assert!(!track.folded);
+        assert_eq!(track.depth, 0);
     }
 
     /// A song carrying audio survives a round trip whole, source and all.
@@ -1549,6 +1847,10 @@ mod audio_block_tests {
             automation: Vec::new(),
             volume: 1.0,
             pan: 0.0,
+            sends: Vec::new(),
+            is_group: false,
+            folded: false,
+            depth: 0,
         });
         song.tracks.len() - 1
     }

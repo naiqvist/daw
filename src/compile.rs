@@ -1052,8 +1052,9 @@ pub(crate) fn automation_letters(
             if envelope.points.is_empty() || !target_applies(track, target) {
                 continue;
             }
-            // Volume and pan live on the track's output stage; everything
-            // else resolves through the registry to a device node.
+            // Volume and pan live on the track's output stage; sends live
+            // on their per-return gain nodes; everything else resolves
+            // through the registry to a device node.
             let (node, param, value) = match target {
                 TRACK_VOLUME_TARGET | TRACK_PAN_TARGET => {
                     let Some(Some(node)) = nodes.pans.get(i).copied() else {
@@ -1069,23 +1070,36 @@ pub(crate) fn automation_letters(
                     };
                     (node, param, value)
                 }
-                _ => {
-                    let Some(TargetRef::Device { id, param }) = target_ref(target) else {
-                        continue;
-                    };
-                    let Some(spec) = registry.spec(target) else {
-                        continue;
-                    };
-                    let Some(node) = nodes.devices.get(&id).copied() else {
-                        continue;
-                    };
-                    let base = parameter_base(track, target, spec);
-                    let value = track
-                        .automation
-                        .value_at(target, beat, base)
-                        .clamp(spec.min, spec.max);
-                    (node, param, value)
-                }
+                _ => match target_ref(target) {
+                    Some(TargetRef::TrackSend(index)) => {
+                        let Some(Some(node)) =
+                            nodes.sends.get(i).and_then(|row| row.get(index)).copied()
+                        else {
+                            continue;
+                        };
+                        let base = track.sends.get(index).copied().unwrap_or(0.0);
+                        let value = track
+                            .automation
+                            .value_at(target, beat, base)
+                            .clamp(0.0, 1.0);
+                        (node, daw::params::mixer::GAIN, value)
+                    }
+                    Some(TargetRef::Device { id, param }) => {
+                        let Some(spec) = registry.spec(target) else {
+                            continue;
+                        };
+                        let Some(node) = nodes.devices.get(&id).copied() else {
+                            continue;
+                        };
+                        let base = parameter_base(track, target, spec);
+                        let value = track
+                            .automation
+                            .value_at(target, beat, base)
+                            .clamp(spec.min, spec.max);
+                        (node, param, value)
+                    }
+                    Some(TargetRef::TrackOutput(_)) | None => continue,
+                },
             };
             out.push(daw::audio::graph::ParamChange {
                 node: node.to_bits(),
@@ -1140,6 +1154,17 @@ pub(crate) fn build_mod_spec(
                 };
                 (node, param)
             }
+            TargetRef::TrackSend(index) => {
+                let Some(Some(node)) = nodes
+                    .sends
+                    .get(wire.track)
+                    .and_then(|row| row.get(index))
+                    .copied()
+                else {
+                    continue;
+                };
+                (node, daw::params::mixer::GAIN)
+            }
             TargetRef::Device { id, param } => {
                 let Some(node) = nodes.devices.get(&id).copied() else {
                     continue;
@@ -1156,7 +1181,7 @@ pub(crate) fn build_mod_spec(
                 .iter()
                 .find(|d| d.id == id)
                 .is_some_and(|d| device_is_log(d.kind(), param)),
-            TargetRef::TrackOutput(_) => false,
+            TargetRef::TrackOutput(_) | TargetRef::TrackSend(_) => false,
         };
         out.push(WireSpec {
             id: wire.id,

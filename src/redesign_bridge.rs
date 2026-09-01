@@ -546,26 +546,51 @@ impl App {
                     // erased on the next projection pass, which copies the
                     // Song onto it.
                     if device == daw::ui::redesign::chain::TRACK_HEAD_ID {
-                        if let Some(index) = self.song_track_for_active_chain()
-                            && let Some(song_track) = self.song.tracks.get_mut(index)
-                        {
-                            match param {
-                                daw::ui::redesign::chain::TRACK_LEVEL_PARAM => {
-                                    let (min, max) =
-                                        daw::targets::span_of(daw::sequencing::TRACK_VOLUME)
-                                            .unwrap_or((0.0, 1.0));
-                                    song_track.volume = value.clamp(min, max);
-                                }
-                                daw::ui::redesign::chain::TRACK_PAN_PARAM => {
-                                    let (min, max) =
-                                        daw::targets::span_of(daw::sequencing::TRACK_PAN)
-                                            .unwrap_or((-1.0, 1.0));
-                                    song_track.pan = value.clamp(min, max);
-                                }
-                                _ => {}
+                        let Some(index) = self.song_track_for_active_chain() else {
+                            self.notice = Some("TRACK: NO SONG TRACK".to_owned());
+                            continue;
+                        };
+                        let returns = self.song.returns.len();
+                        let Some(song_track) = self.song.tracks.get_mut(index) else {
+                            self.notice = Some("TRACK: NO SONG TRACK".to_owned());
+                            continue;
+                        };
+                        match param {
+                            daw::ui::redesign::chain::TRACK_LEVEL_PARAM => {
+                                let (min, max) =
+                                    daw::targets::span_of(daw::sequencing::TRACK_VOLUME)
+                                        .unwrap_or((0.0, 1.0));
+                                song_track.volume = value.clamp(min, max);
                             }
-                            self.projected_song = None;
+                            daw::ui::redesign::chain::TRACK_PAN_PARAM => {
+                                let (min, max) = daw::targets::span_of(daw::sequencing::TRACK_PAN)
+                                    .unwrap_or((-1.0, 1.0));
+                                song_track.pan = value.clamp(min, max);
+                            }
+                            other => {
+                                let Some(send) = daw::ui::redesign::chain::track_send_index(other)
+                                else {
+                                    self.notice = Some("TRACK: NO SUCH SLOT".to_owned());
+                                    continue;
+                                };
+                                if send >= returns {
+                                    let letter = daw::sequencing::ReturnTrack::letter(send);
+                                    self.notice = Some(format!("SEND {letter}: NO RETURN"));
+                                    continue;
+                                }
+                                let Some(target) = daw::targets::track_send_target(send) else {
+                                    self.notice = Some("SEND: NO SUCH SLOT".to_owned());
+                                    continue;
+                                };
+                                let (min, max) =
+                                    daw::targets::span_of(target).unwrap_or((0.0, 1.0));
+                                if song_track.sends.len() <= send {
+                                    song_track.sends.resize(send + 1, 0.0);
+                                }
+                                song_track.sends[send] = value.clamp(min, max);
+                            }
                         }
+                        self.projected_song = None;
                         continue;
                     }
                     let Some(track) = track else { continue };
@@ -774,6 +799,59 @@ impl App {
             let level_span =
                 daw::targets::span_of(daw::sequencing::TRACK_VOLUME).unwrap_or((0.0, 1.0));
             let pan_span = daw::targets::span_of(daw::sequencing::TRACK_PAN).unwrap_or((-1.0, 1.0));
+            let mut params = vec![
+                daw::ui::redesign::chain::ParamView {
+                    id: daw::ui::redesign::chain::TRACK_LEVEL_PARAM,
+                    name: "LEVEL".to_owned(),
+                    // The registry's span, not an assumed unit
+                    // interval: a fader reaches 1.5, so it can
+                    // boost above unity like every other one.
+                    min: level_span.0,
+                    max: level_span.1,
+                    base: track.volume,
+                    choices: 0,
+                    // DECIBELS, not a unit fraction: real data over
+                    // euphemism. The model stores linear because
+                    // that is what the engine multiplies by; the
+                    // widget owns the dB mapping, which is the only
+                    // place that curve belongs.
+                    formatted: format_gain_db(track.volume),
+                    lock: None,
+                },
+                daw::ui::redesign::chain::ParamView {
+                    id: daw::ui::redesign::chain::TRACK_PAN_PARAM,
+                    name: "PAN".to_owned(),
+                    min: pan_span.0,
+                    max: pan_span.1,
+                    base: track.pan,
+                    choices: 0,
+                    formatted: format_pan(track.pan),
+                    lock: None,
+                },
+            ];
+            for return_index in 0..self.song.returns.len() {
+                let Some(id) = daw::ui::redesign::chain::track_send_param(return_index) else {
+                    continue;
+                };
+                let Some(target) = daw::targets::track_send_target(return_index) else {
+                    continue;
+                };
+                let (min, max) = daw::targets::span_of(target).unwrap_or((0.0, 1.0));
+                let base = track.send(return_index);
+                params.push(daw::ui::redesign::chain::ParamView {
+                    id,
+                    name: format!(
+                        "SEND {}",
+                        daw::sequencing::ReturnTrack::letter(return_index)
+                    ),
+                    min,
+                    max,
+                    base,
+                    choices: 0,
+                    formatted: format_gain_db(base),
+                    lock: None,
+                });
+            }
             chain_view.devices.insert(
                 0,
                 daw::ui::redesign::chain::DeviceView {
@@ -783,36 +861,7 @@ impl App {
                     instrument: false,
                     parent: None,
                     hero: daw::ui::redesign::chain::HeroKind::None,
-                    params: vec![
-                        daw::ui::redesign::chain::ParamView {
-                            id: daw::ui::redesign::chain::TRACK_LEVEL_PARAM,
-                            name: "LEVEL".to_owned(),
-                            // The registry's span, not an assumed unit
-                            // interval: a fader reaches 1.5, so it can
-                            // boost above unity like every other one.
-                            min: level_span.0,
-                            max: level_span.1,
-                            base: track.volume,
-                            choices: 0,
-                            // DECIBELS, not a unit fraction: real data over
-                            // euphemism. The model stores linear because
-                            // that is what the engine multiplies by; the
-                            // widget owns the dB mapping, which is the only
-                            // place that curve belongs.
-                            formatted: format_gain_db(track.volume),
-                            lock: None,
-                        },
-                        daw::ui::redesign::chain::ParamView {
-                            id: daw::ui::redesign::chain::TRACK_PAN_PARAM,
-                            name: "PAN".to_owned(),
-                            min: pan_span.0,
-                            max: pan_span.1,
-                            base: track.pan,
-                            choices: 0,
-                            formatted: format_pan(track.pan),
-                            lock: None,
-                        },
-                    ],
+                    params,
                 },
             );
         }
@@ -1253,6 +1302,46 @@ impl App {
             match action {
                 UiAction::StartEngine => self.start_engine(),
                 UiAction::StopEngine => self.stop_engine(),
+                UiAction::AddReturn if self.center_song => {
+                    if let Some(index) = self.song.add_return() {
+                        // The chain is projection-only, so mint its legacy
+                        // owner in the same edit. The next projection writes
+                        // Song's four facts over it unconditionally.
+                        if self.arrangement.returns.len() == index {
+                            self.arrangement.add_return();
+                        }
+                        self.arrangement.select_return(index);
+                        self.arrangement.force_recompile = true;
+                        self.projected_song = None;
+                        self.notice = Some(format!(
+                            "RETURN {}: ADDED",
+                            daw::sequencing::ReturnTrack::letter(index)
+                        ));
+                    } else {
+                        self.notice = Some("RETURN: A THROUGH H ALREADY EXIST".to_owned());
+                    }
+                }
+                UiAction::RemoveReturn if self.center_song => {
+                    let Some(index) = self.arrangement.return_selected else {
+                        self.notice = Some("DELETE RETURN: NOTHING SHOWN".to_owned());
+                        continue;
+                    };
+                    if self.song.remove_return(index) {
+                        // Remove this SAME positional bus now, while the edit
+                        // still names it. A later length-only projection
+                        // could only truncate the tail and would discard the
+                        // wrong effects chain when B is deleted before C.
+                        self.arrangement.remove_return(index);
+                        self.arrangement.force_recompile = true;
+                        self.projected_song = None;
+                        self.notice = Some(format!(
+                            "RETURN {}: DELETED",
+                            daw::sequencing::ReturnTrack::letter(index)
+                        ));
+                    } else {
+                        self.notice = Some("DELETE RETURN: NO RETURN THERE".to_owned());
+                    }
+                }
                 UiAction::Undo | UiAction::Redo => {
                     let stepped = if matches!(action, UiAction::Undo) {
                         self.history.undo(&mut self.arrangement)
@@ -1697,6 +1786,100 @@ impl App {
 // clip is erased on the next pass rather than silently kept.
 
 impl App {
+    /// Ensure every Song lane has a projection twin. Creation is separate
+    /// from copying so all twins can be put into Song order before positional
+    /// group depths are written onto them.
+    fn ensure_song_twins(&mut self, song: &daw::sequencing::Song) {
+        for song_track in &song.tracks {
+            if self
+                .song_track_map
+                .get(&song_track.id)
+                .is_some_and(|index| *index < self.arrangement.tracks.len())
+            {
+                continue;
+            }
+
+            // A group is audio-kinded on the legacy side because it has no
+            // notes and takes no instrument. Otherwise the twin carries the
+            // Song track's kind so audio clips cannot land on a MIDI lane.
+            let audio = song_track.is_group || song_track.kind == daw::sequencing::TrackKind::Audio;
+            let index = self.arrangement.add_track(if audio {
+                TrackKind::Audio
+            } else {
+                TrackKind::Midi
+            });
+            // An instrument track is born able to speak. A group starts at
+            // its sum, and an audio track already IS the sound.
+            if !audio {
+                let instance = DeviceInstance {
+                    id: self.arrangement.mint_id(),
+                    parent: None,
+                    state: DeviceState::new(DeviceKind::Poly),
+                    bypass: false,
+                    page: 0,
+                    view_zoom: unit_zoom(),
+                    view_scroll: 0.0,
+                };
+                if let Some(track) = self.arrangement.tracks.get_mut(index) {
+                    track.chain.push(instance);
+                }
+            }
+            self.song_track_map.insert(song_track.id, index);
+        }
+    }
+
+    /// Move a projection twin through the legacy arrangement and keep every
+    /// Song id's index map on the same move. `Arrangement::move_track` carries
+    /// all of its parallel data and index-addressed state in one operation.
+    fn move_song_twin(&mut self, from: usize, to: usize) -> bool {
+        if !self.arrangement.move_track(from, to) {
+            return false;
+        }
+        let shifted = |index: usize| {
+            if index == from {
+                to
+            } else if from < to && index > from && index <= to {
+                index - 1
+            } else if to < from && index >= to && index < from {
+                index + 1
+            } else {
+                index
+            }
+        };
+        for index in self.song_track_map.values_mut() {
+            *index = shifted(*index);
+        }
+        true
+    }
+
+    /// Positional group membership requires the twins to follow Song order.
+    /// Projection-created lanes live as one owned run at the tail; unrelated
+    /// legacy tracks keep their relative order and are never claimed.
+    fn order_song_twins(&mut self, song: &daw::sequencing::Song) {
+        if song.tracks.is_empty() || song.tracks.len() > self.arrangement.tracks.len() {
+            return;
+        }
+        let tail = self.arrangement.tracks.len() - song.tracks.len();
+        let already_ordered =
+            song.tracks.iter().enumerate().all(|(offset, track)| {
+                self.song_track_map.get(&track.id) == Some(&(tail + offset))
+            });
+        if already_ordered {
+            return;
+        }
+
+        let ids: Vec<daw::sequencing::TrackId> = song.tracks.iter().map(|track| track.id).collect();
+        let last = self.arrangement.tracks.len() - 1;
+        for id in ids {
+            let Some(&from) = self.song_track_map.get(&id) else {
+                continue;
+            };
+            if from != last {
+                self.move_song_twin(from, last);
+            }
+        }
+    }
+
     /// Copy the song into its owned legacy tracks when it has changed.
     /// Runs green-zone, once per frame at most; the equality guard makes
     /// the idle cost one comparison of a small struct.
@@ -1710,6 +1893,29 @@ impl App {
             return;
         }
         let song = self.song.clone();
+        // Song is the authority for the return list once it has a real edit.
+        // Grow and shrink only the legacy buses; their effects chains stay
+        // where they are, while these four duplicated mixer facts are always
+        // overwritten from Song so load order cannot choose the winner.
+        self.arrangement
+            .returns
+            .resize_with(song.returns.len(), ReturnTrack::default);
+        for (source, projected) in song.returns.iter().zip(&mut self.arrangement.returns) {
+            projected.name = source.name.clone();
+            projected.mute = source.mute;
+            projected.volume = source.volume;
+            projected.pan = source.pan;
+        }
+        if self
+            .arrangement
+            .return_selected
+            .is_some_and(|index| index >= song.returns.len())
+        {
+            self.arrangement.return_selected = None;
+        }
+
+        self.ensure_song_twins(&song);
+        self.order_song_twins(&song);
         let any_solo = song.tracks.iter().any(|track| track.solo);
         // The tempo map, resolved once for the whole projection. The
         // reference is the transport's own tempo, so an empty map warps
@@ -1721,65 +1927,65 @@ impl App {
         };
         let tempo = daw::tempo::TempoTable::build(&song, WARP_SAMPLE_RATE, reference_bpm);
         let samples_per_beat = WARP_SAMPLE_RATE * 60.0 / reference_bpm;
-        for song_track in &song.tracks {
-            let legacy = match self.song_track_map.get(&song_track.id) {
-                Some(&index) if index < self.arrangement.tracks.len() => index,
-                _ => {
-                    // The twin carries the SONG track's kind. An audio
-                    // lane minted as MIDI would refuse every clip the
-                    // compiler needs to hear (`insert_audio` checks the
-                    // kind), so the sound would land and stay silent.
-                    let audio = song_track.kind == daw::sequencing::TrackKind::Audio;
-                    let index = self.arrangement.add_track(if audio {
-                        TrackKind::Audio
-                    } else {
-                        TrackKind::Midi
-                    });
-                    // An instrument track is born able to speak: the
-                    // workhorse synth in its chain, so the first trig
-                    // makes sound instead of silence that reads as a bug.
-                    // An audio track needs no instrument — it already IS
-                    // the sound.
-                    if !audio {
-                        let instance = DeviceInstance {
-                            id: self.arrangement.mint_id(),
-                            parent: None,
-                            state: DeviceState::new(DeviceKind::Poly),
-                            bypass: false,
-                            page: 0,
-                            view_zoom: unit_zoom(),
-                            view_scroll: 0.0,
-                        };
-                        if let Some(track) = self.arrangement.tracks.get_mut(index) {
-                            track.chain.push(instance);
-                        }
-                    }
-                    self.song_track_map.insert(song_track.id, index);
-                    index
-                }
+        for (song_index, song_track) in song.tracks.iter().enumerate() {
+            let Some(&legacy) = self.song_track_map.get(&song_track.id) else {
+                continue;
             };
+            let legacy_kind =
+                if song_track.is_group || song_track.kind == daw::sequencing::TrackKind::Audio {
+                    TrackKind::Audio
+                } else {
+                    TrackKind::Midi
+                };
+            let needs_instrument = legacy_kind == TrackKind::Midi
+                && !self.arrangement.tracks[legacy]
+                    .chain
+                    .iter()
+                    .any(|device| device.kind().is_instrument());
+            let instrument = needs_instrument.then(|| DeviceInstance {
+                id: self.arrangement.mint_id(),
+                parent: None,
+                state: DeviceState::new(DeviceKind::Poly),
+                bypass: false,
+                page: 0,
+                view_zoom: unit_zoom(),
+                view_scroll: 0.0,
+            });
+            let projected = &mut self.arrangement.tracks[legacy];
+            projected.kind = legacy_kind;
+            if legacy_kind == TrackKind::Audio {
+                projected
+                    .chain
+                    .retain(|device| !device.kind().is_instrument());
+            } else if let Some(instrument) = instrument {
+                projected.chain.insert(0, instrument);
+            }
             // The name follows the song track (the rename verb travels),
             // carrying the ownership sign: legacy editors, look only.
-            self.arrangement.tracks[legacy].name = format!("{} §", song_track.name);
+            projected.name = format!("{} §", song_track.name);
             // The legacy compiler already removes muted tracks from the
             // schedule. Project the Song's solo-precedence rule onto that
             // real silence path; keep legacy solo off so Song solo cannot
             // accidentally silence unrelated legacy tracks.
-            self.arrangement.tracks[legacy].mute = !song_track_audible(song_track, any_solo);
-            self.arrangement.tracks[legacy].solo = false;
+            projected.mute = !song_track_audible(&song.tracks, song_index, any_solo);
+            projected.solo = false;
             // The curves travel with the track. Song automation is the
             // offset model's BASE, and the legacy compiler already bakes
             // envelopes into ramps (`automation_letters`) — so a curve
             // drawn in the redesign is audible through C1 with no engine
             // work at all, exactly as p-locks ride the same bridge.
-            self.arrangement.tracks[legacy].automation = project_automation(song_track);
+            projected.automation = project_automation(song_track);
             // The mixer values travel as the BASE the envelopes bend. The
             // legacy compiler reads the static fader and then applies
             // `track.volume` / `track.pan` on top of it, which is exactly
             // the offset model's shape — so the Song's knob and the Song's
             // curve arrive as one already-agreeing pair.
-            self.arrangement.tracks[legacy].volume = song_track.volume;
-            self.arrangement.tracks[legacy].pan = song_track.pan;
+            projected.volume = song_track.volume;
+            projected.pan = song_track.pan;
+            projected.sends = song_track.sends.clone();
+            projected.is_group = song_track.is_group;
+            projected.folded = song_track.folded;
+            projected.depth = song_track.depth;
             let mut clips = Vec::with_capacity(song_track.blocks.len());
             for block in &song_track.blocks {
                 let id = self.arrangement.next_clip_id;
@@ -1863,6 +2069,16 @@ impl App {
                 group: "TRACK".to_owned(),
             },
         ];
+        for index in 0..self.song.returns.len() {
+            let Some(id) = daw::targets::track_send_target(index) else {
+                continue;
+            };
+            targets.push(TargetOption {
+                id: id.to_owned(),
+                label: format!("SEND {}", daw::sequencing::ReturnTrack::letter(index)),
+                group: "TRACK".to_owned(),
+            });
+        }
         let Some(track) = self
             .arrangement
             .active_track()
@@ -1893,8 +2109,62 @@ impl App {
     }
 }
 
-fn song_track_audible(track: &daw::sequencing::Track, any_solo: bool) -> bool {
-    if any_solo { track.solo } else { !track.muted }
+fn song_parent_group(tracks: &[daw::sequencing::Track], index: usize) -> Option<usize> {
+    let depth = tracks.get(index)?.depth;
+    if depth == 0 {
+        return None;
+    }
+    tracks[..index]
+        .iter()
+        .rposition(|track| track.is_group && track.depth + 1 == depth)
+}
+
+fn song_group_members(tracks: &[daw::sequencing::Track], index: usize) -> std::ops::Range<usize> {
+    let Some(group) = tracks.get(index).filter(|track| track.is_group) else {
+        return index..index;
+    };
+    let mut end = index + 1;
+    while tracks
+        .get(end)
+        .is_some_and(|track| track.depth > group.depth)
+    {
+        end += 1;
+    }
+    index + 1..end
+}
+
+fn song_muted_in_place(tracks: &[daw::sequencing::Track], index: usize) -> bool {
+    let mut at = index;
+    loop {
+        if tracks.get(at).is_some_and(|track| track.muted) {
+            return true;
+        }
+        match song_parent_group(tracks, at) {
+            Some(parent) => at = parent,
+            None => return false,
+        }
+    }
+}
+
+fn song_solo_in_scope(tracks: &[daw::sequencing::Track], index: usize) -> bool {
+    let Some(track) = tracks.get(index) else {
+        return false;
+    };
+    if track.solo {
+        return true;
+    }
+    let mut at = index;
+    while let Some(parent) = song_parent_group(tracks, at) {
+        if tracks[parent].solo {
+            return true;
+        }
+        at = parent;
+    }
+    song_group_members(tracks, index).any(|member| song_solo_in_scope(tracks, member))
+}
+
+fn song_track_audible(tracks: &[daw::sequencing::Track], index: usize, any_solo: bool) -> bool {
+    !song_muted_in_place(tracks, index) && (!any_solo || song_solo_in_scope(tracks, index))
 }
 
 /// Song automation, copied onto the legacy track the compiler reads.
@@ -2089,6 +2359,10 @@ mod projection_tests {
             automation: Vec::new(),
             volume: 1.0,
             pan: 0.0,
+            sends: Vec::new(),
+            is_group: false,
+            folded: false,
+            depth: 0,
         });
         let track = app.song.tracks.len() - 1;
 
@@ -2134,6 +2408,10 @@ mod projection_tests {
             automation: Vec::new(),
             volume: 1.0,
             pan: 0.0,
+            sends: Vec::new(),
+            is_group: false,
+            folded: false,
+            depth: 0,
         });
         let track = app.song.tracks.len() - 1;
         let imported = daw::library::ImportedWav {
@@ -2307,6 +2585,247 @@ mod projection_tests {
             peak(tail)
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn song_returns_overwrite_all_four_legacy_facts_but_keep_the_effect_chain() {
+        let storage = shell::Storage::default();
+        let mut app = App::new(&storage);
+        app.song = song_with_trig();
+        app.song.returns.push(daw::sequencing::ReturnTrack {
+            name: "Plate".to_owned(),
+            mute: true,
+            volume: 0.625,
+            pan: -0.4,
+        });
+
+        let mut legacy = ReturnTrack::new(0);
+        legacy.name = "STALE".to_owned();
+        legacy.mute = false;
+        legacy.volume = 0.1;
+        legacy.pan = 0.9;
+        legacy.chain.push(DeviceInstance {
+            id: 777,
+            parent: None,
+            state: DeviceState::new(DeviceKind::Reverb),
+            bypass: false,
+            page: 0,
+            view_zoom: unit_zoom(),
+            view_scroll: 0.0,
+        });
+        app.arrangement.returns = vec![legacy];
+
+        app.project_song();
+
+        let projected = &app.arrangement.returns[0];
+        assert_eq!(projected.name, "Plate");
+        assert!(projected.mute);
+        assert_eq!(projected.volume, 0.625);
+        assert_eq!(projected.pan, -0.4);
+        assert_eq!(projected.chain.len(), 1, "the projection-only chain stays");
+        assert_eq!(projected.chain[0].id, 777);
+    }
+
+    #[test]
+    fn a_default_song_leaves_a_legacy_only_projects_returns_untouched() {
+        let storage = shell::Storage::default();
+        let mut app = App::new(&storage);
+        let mut legacy = ReturnTrack::new(0);
+        legacy.name = "Old Plate".to_owned();
+        legacy.mute = true;
+        legacy.volume = 0.42;
+        legacy.pan = 0.3;
+        app.arrangement.returns = vec![legacy.clone()];
+        app.song = daw::sequencing::Song::default();
+        app.projected_song = None;
+
+        app.project_song();
+
+        assert_eq!(app.arrangement.returns, vec![legacy]);
+        assert!(
+            app.projected_song.is_none(),
+            "the compatibility early-return held"
+        );
+    }
+
+    #[test]
+    fn groups_project_as_one_contiguous_legacy_run_in_song_order() {
+        let storage = shell::Storage::default();
+        let mut app = App::new(&storage);
+        let mut song = song_with_trig();
+        song.tracks[0].name = "DRUMS".to_owned();
+        song.tracks[0].blocks.clear();
+        song.tracks[0].is_group = true;
+        song.tracks[0].folded = true;
+        let mut kick = song.tracks[0].clone();
+        kick.id = daw::sequencing::TrackId(2);
+        kick.name = "KICK".to_owned();
+        kick.is_group = false;
+        kick.folded = false;
+        kick.depth = 1;
+        let mut bass = kick.clone();
+        bass.id = daw::sequencing::TrackId(3);
+        bass.name = "BASS".to_owned();
+        bass.depth = 0;
+        song.tracks.extend([kick, bass]);
+        app.song = song;
+
+        app.project_song();
+
+        let indices: Vec<usize> = app
+            .song
+            .tracks
+            .iter()
+            .map(|track| app.song_track_map[&track.id])
+            .collect();
+        assert_eq!(indices[1], indices[0] + 1);
+        assert_eq!(indices[2], indices[1] + 1);
+        let projected = &app.arrangement.tracks[indices[0]..=indices[2]];
+        assert_eq!(
+            projected
+                .iter()
+                .map(|track| track.name.as_str())
+                .collect::<Vec<_>>(),
+            ["DRUMS §", "KICK §", "BASS §"]
+        );
+        assert!(projected[0].is_group);
+        assert!(projected[0].folded);
+        assert_eq!(projected[0].depth, 0);
+        assert_eq!(projected[1].depth, 1);
+        assert_eq!(projected[2].depth, 0);
+        assert!(
+            projected[0]
+                .chain
+                .iter()
+                .all(|device| !device.kind().is_instrument()),
+            "a group starts at its sum, never at a synth"
+        );
+
+        // Reordering the canonical list reorders the physical twins, not
+        // merely their copied labels: positional membership reads Song order.
+        app.song.tracks.rotate_left(2);
+        app.project_song();
+        let reordered: Vec<usize> = app
+            .song
+            .tracks
+            .iter()
+            .map(|track| app.song_track_map[&track.id])
+            .collect();
+        assert!(reordered.windows(2).all(|pair| pair[1] == pair[0] + 1));
+    }
+
+    #[test]
+    fn group_solo_keeps_its_members_and_a_soloed_member_keeps_its_bus() {
+        let mut song = daw::sequencing::Song::default();
+        let mut child = song.tracks[0].clone();
+        child.id = daw::sequencing::TrackId(2);
+        child.depth = 1;
+        child.solo = false;
+        song.tracks[0].is_group = true;
+        song.tracks[0].solo = true;
+        song.tracks.push(child);
+        assert!(song_track_audible(&song.tracks, 0, true));
+        assert!(song_track_audible(&song.tracks, 1, true));
+
+        song.tracks[0].solo = false;
+        song.tracks[1].solo = true;
+        assert!(song_track_audible(&song.tracks, 0, true));
+        assert!(song_track_audible(&song.tracks, 1, true));
+    }
+
+    #[test]
+    fn a_send_slot_writes_song_and_refuses_a_missing_return_out_loud() {
+        let storage = shell::Storage::default();
+        let mut app = App::new(&storage);
+        app.song = song_with_trig();
+        app.song.add_return().expect("return A");
+        app.project_song();
+
+        app.apply_redesign_chain_intents(&[daw::ui::redesign::chain::Intent::SetParam {
+            device: daw::ui::redesign::chain::TRACK_HEAD_ID,
+            param: daw::ui::redesign::chain::track_send_param(0).expect("slot A"),
+            value: 0.375,
+        }]);
+        assert_eq!(app.song.tracks[0].sends, vec![0.375]);
+        app.project_song();
+        let legacy = app.song_track_map[&app.song.tracks[0].id];
+        assert_eq!(app.arrangement.tracks[legacy].sends, vec![0.375]);
+
+        app.apply_redesign_chain_intents(&[daw::ui::redesign::chain::Intent::SetParam {
+            device: daw::ui::redesign::chain::TRACK_HEAD_ID,
+            param: daw::ui::redesign::chain::track_send_param(1).expect("slot B"),
+            value: 0.9,
+        }]);
+        assert_eq!(app.notice.as_deref(), Some("SEND B: NO RETURN"));
+        assert_eq!(app.song.tracks[0].sends, vec![0.375]);
+    }
+
+    #[test]
+    fn return_verbs_edit_song_and_every_inapplicable_noun_refuses() {
+        let storage = shell::Storage::default();
+        let mut app = App::new(&storage);
+        app.center_song = true;
+        let ctx = egui::Context::default();
+
+        for _ in 0..daw::sequencing::ReturnTrack::MAX {
+            app.finish_redesign_actions(&ctx, vec![UiAction::AddReturn]);
+        }
+        assert_eq!(app.song.returns.len(), 8);
+        assert_eq!(app.arrangement.returns.len(), 8);
+        app.finish_redesign_actions(&ctx, vec![UiAction::AddReturn]);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("RETURN: A THROUGH H ALREADY EXIST")
+        );
+
+        app.song.tracks[0].sends = (0..8).map(|index| index as f32 / 10.0).collect();
+        app.arrangement.return_selected = Some(3);
+        app.finish_redesign_actions(&ctx, vec![UiAction::RemoveReturn]);
+        assert_eq!(app.song.returns.len(), 7);
+        assert_eq!(app.arrangement.returns.len(), 7);
+        assert_eq!(
+            app.song.tracks[0].sends,
+            vec![0.0, 0.1, 0.2, 0.4, 0.5, 0.6, 0.7]
+        );
+
+        app.finish_redesign_actions(&ctx, vec![UiAction::RemoveReturn]);
+        assert_eq!(app.notice.as_deref(), Some("DELETE RETURN: NOTHING SHOWN"));
+    }
+
+    #[test]
+    fn a_song_send_curve_reaches_the_existing_send_gain_node() {
+        let storage = shell::Storage::default();
+        let mut app = App::new(&storage);
+        app.song = song_with_trig();
+        app.song.add_return().expect("return A");
+        app.song.tracks[0].sends = vec![0.2];
+        app.song.tracks[0].insert_point("track.send.a", 0, 0.75);
+        app.project_song();
+
+        let arrangement = &app.arrangement;
+        let (_, nodes) = build_graph_spec(
+            &arrangement.tracks,
+            &arrangement.master,
+            &arrangement.returns,
+            &arrangement.clips,
+            None,
+            false,
+        );
+        let track = app.song_track_map[&app.song.tracks[0].id];
+        let send = nodes.sends[track][0].expect("return A has a send node");
+        let mut letters = Vec::new();
+        automation_letters(
+            &arrangement.tracks,
+            &nodes,
+            &ParameterRegistry::default(),
+            0.0,
+            &mut letters,
+        );
+        assert!(letters.iter().any(|letter| {
+            letter.node == send.to_bits()
+                && letter.param == daw::params::mixer::GAIN
+                && (letter.value - 0.75).abs() < 1e-6
+        }));
     }
 
     /// The fader reads in DECIBELS and pan reads its side — real data
@@ -2544,9 +3063,9 @@ mod projection_tests {
         song.tracks[1].muted = false;
 
         let any_solo = song.tracks.iter().any(|track| track.solo);
-        assert!(song_track_audible(&song.tracks[0], any_solo));
+        assert!(song_track_audible(&song.tracks, 0, any_solo));
         assert!(
-            !song_track_audible(&song.tracks[1], any_solo),
+            !song_track_audible(&song.tracks, 1, any_solo),
             "an unmuted track is still silent beside a solo"
         );
     }

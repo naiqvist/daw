@@ -980,6 +980,7 @@ pub(crate) fn parameter_base(track: &Track, target: &str, spec: &ParameterSpec) 
     match target_ref(target) {
         Some(TargetRef::TrackOutput(pan::GAIN)) => track.volume,
         Some(TargetRef::TrackOutput(_)) => track.pan,
+        Some(TargetRef::TrackSend(index)) => track.sends.get(index).copied().unwrap_or(0.0),
         Some(TargetRef::Device { id, param }) => track
             .device(id)
             .and_then(|instance| instance.state.value(param))
@@ -993,7 +994,7 @@ pub(crate) fn parameter_base(track: &Track, target: &str, spec: &ParameterSpec) 
 /// not offer it. Track-group targets apply everywhere.
 pub(crate) fn target_applies(track: &Track, target: &str) -> bool {
     match target_ref(target) {
-        Some(TargetRef::TrackOutput(_)) => true,
+        Some(TargetRef::TrackOutput(_) | TargetRef::TrackSend(_)) => true,
         Some(TargetRef::Device { id, param }) => track
             .device(id)
             .is_some_and(|instance| instance.state.value(param).is_some()),
@@ -1009,6 +1010,8 @@ pub(crate) fn target_applies(track: &Track, target: &str) -> bool {
 pub(crate) enum TargetRef {
     /// The track's output stage (`pans`), which every audible track has.
     TrackOutput(u32),
+    /// One lettered post-fader send gain (`sends[index]`).
+    TrackSend(usize),
     /// A device INSTANCE, by the id its target names.
     Device { id: u64, param: u32 },
 }
@@ -1019,6 +1022,9 @@ pub(crate) fn target_ref(target: &str) -> Option<TargetRef> {
         TRACK_VOLUME_TARGET => return Some(TargetRef::TrackOutput(pan::GAIN)),
         TRACK_PAN_TARGET => return Some(TargetRef::TrackOutput(pan::PAN)),
         _ => {}
+    }
+    if let Some(index) = track_send_index(target) {
+        return Some(TargetRef::TrackSend(index));
     }
     // `dev.<id>.<prefix>.<param>`. A target the tables do not recognize is
     // no target at all — a renamed prefix orphans its wires rather than

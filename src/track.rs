@@ -12,7 +12,7 @@ use crate::TRACK_H;
 use crate::automation::TrackAutomation;
 use crate::device_state::{DeviceInstance, DeviceState, ReverbParams, unit_zoom};
 use crate::devices::DeviceKind;
-use crate::targets::{TRACK_PAN_TARGET, TRACK_VOLUME_TARGET};
+use crate::targets::{TRACK_PAN_TARGET, TRACK_VOLUME_TARGET, track_send_index};
 use daw::audio::graph::SynthParams;
 use daw::ui::device;
 use daw::ui::vm::TrackKind;
@@ -1062,7 +1062,9 @@ pub fn split_track_automation_at(track: &mut Track, beat: f32) {
         let base = match target.as_str() {
             TRACK_VOLUME_TARGET => track.volume,
             TRACK_PAN_TARGET => track.pan,
-            _ => 0.0,
+            other => track_send_index(other)
+                .and_then(|index| track.sends.get(index).copied())
+                .unwrap_or(0.0),
         };
         track.automation.split_at(&target, beat, base);
     }
@@ -1073,7 +1075,9 @@ pub fn insert_track_automation_time(track: &mut Track, at: f32, amount: f32) {
         let base = match target.as_str() {
             TRACK_VOLUME_TARGET => track.volume,
             TRACK_PAN_TARGET => track.pan,
-            _ => 0.0,
+            other => track_send_index(other)
+                .and_then(|index| track.sends.get(index).copied())
+                .unwrap_or(0.0),
         };
         track.automation.insert_time(&target, at, amount, base);
     }
@@ -1084,7 +1088,9 @@ pub fn delete_track_automation_time(track: &mut Track, from: f32, to: f32) {
         let base = match target.as_str() {
             TRACK_VOLUME_TARGET => track.volume,
             TRACK_PAN_TARGET => track.pan,
-            _ => 0.0,
+            other => track_send_index(other)
+                .and_then(|index| track.sends.get(index).copied())
+                .unwrap_or(0.0),
         };
         track.automation.delete_time(&target, from, to, base);
     }

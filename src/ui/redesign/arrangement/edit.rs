@@ -62,8 +62,8 @@ impl Command {
             Self::CreateClip => can_create(song, selection),
             Self::DeleteClips => intersects_block(song, selection),
             Self::AddTrack | Self::AddAudioTrack => true,
-            Self::MoveTrackUp => selection.first_track > 0,
-            Self::MoveTrackDown => selection.first_track + 1 < song.tracks.len(),
+            Self::MoveTrackUp => previous_sibling(&song.tracks, selection.first_track).is_some(),
+            Self::MoveTrackDown => next_sibling(&song.tracks, selection.first_track).is_some(),
         }
     }
 }
@@ -109,6 +109,10 @@ fn add_track_of(song: &mut Song, kind: TrackKind) -> &'static str {
         automation: Vec::new(),
         volume: 1.0,
         pan: 0.0,
+        sends: Vec::new(),
+        is_group: false,
+        folded: false,
+        depth: 0,
     });
     notice
 }
@@ -143,18 +147,20 @@ pub(super) fn apply(command: Command, song: &mut Song, selection: Selection) -> 
         Command::AddAudioTrack => add_audio_track(song),
         Command::MoveTrackUp => {
             let track = selection.first_track;
-            if track == 0 || track >= song.tracks.len() {
-                return "TOP OF THE FRAME";
+            // Normalize HERE, on the canonical model, before either the
+            // history or the projection can observe an illegal stack.
+            song.normalize_group_depths();
+            if !move_track_up(&mut song.tracks, track) {
+                return "TRACK: NO SIBLING ABOVE";
             }
-            song.tracks.swap(track, track - 1);
             "TRACK MOVED UP"
         }
         Command::MoveTrackDown => {
             let track = selection.first_track;
-            if track + 1 >= song.tracks.len() {
-                return "BOTTOM OF THE FRAME";
+            song.normalize_group_depths();
+            if !move_track_down(&mut song.tracks, track) {
+                return "TRACK: NO SIBLING BELOW";
             }
-            song.tracks.swap(track, track + 1);
             "TRACK MOVED DOWN"
         }
         Command::DeleteClips => {
@@ -173,6 +179,65 @@ pub(super) fn apply(command: Command, song: &mut Song, selection: Selection) -> 
             }
         }
     }
+}
+
+/// The selected lane and every descendant it owns. On a plain lane this is
+/// exactly one element; a normalized stack never puts a deeper lane below a
+/// non-group.
+fn track_run(tracks: &[Track], start: usize) -> Option<std::ops::Range<usize>> {
+    let depth = tracks.get(start)?.depth;
+    let mut end = start + 1;
+    while tracks.get(end).is_some_and(|track| track.depth > depth) {
+        end += 1;
+    }
+    Some(start..end)
+}
+
+/// The adjacent sibling above `start`, skipping that sibling's whole run.
+fn previous_sibling(tracks: &[Track], start: usize) -> Option<usize> {
+    let depth = tracks.get(start)?.depth;
+    for index in (0..start).rev() {
+        match tracks[index].depth.cmp(&depth) {
+            std::cmp::Ordering::Equal => return Some(index),
+            std::cmp::Ordering::Less => return None,
+            std::cmp::Ordering::Greater => {}
+        }
+    }
+    None
+}
+
+/// The adjacent sibling below `start`, after the selected lane's whole run.
+fn next_sibling(tracks: &[Track], start: usize) -> Option<usize> {
+    let run = track_run(tracks, start)?;
+    tracks
+        .get(run.end)
+        .filter(|next| next.depth == tracks[start].depth)
+        .map(|_| run.end)
+}
+
+fn move_track_up(tracks: &mut [Track], start: usize) -> bool {
+    let Some(run) = track_run(tracks, start) else {
+        return false;
+    };
+    let Some(previous) = previous_sibling(tracks, start) else {
+        return false;
+    };
+    tracks[previous..run.end].rotate_left(start - previous);
+    true
+}
+
+fn move_track_down(tracks: &mut [Track], start: usize) -> bool {
+    let Some(run) = track_run(tracks, start) else {
+        return false;
+    };
+    let Some(next) = next_sibling(tracks, start) else {
+        return false;
+    };
+    let Some(next_run) = track_run(tracks, next) else {
+        return false;
+    };
+    tracks[start..next_run.end].rotate_left(run.end - start);
+    true
 }
 
 pub(super) fn place_block(
@@ -269,6 +334,25 @@ mod tests {
         }
     }
 
+    fn track_selection(track: usize) -> Selection {
+        Selection {
+            first_track: track,
+            last_track: track,
+            first_beat: 0,
+            end_beat: 1,
+        }
+    }
+
+    fn lane(id: u64, name: &str, depth: u8, is_group: bool) -> Track {
+        let mut track = Song::default().tracks.remove(0);
+        track.id = TrackId(id);
+        track.name = name.to_owned();
+        track.blocks.clear();
+        track.depth = depth;
+        track.is_group = is_group;
+        track
+    }
+
     #[test]
     fn palette_and_sentence_command_create_the_selected_duration() {
         let mut song = Song::default();
@@ -291,5 +375,97 @@ mod tests {
             "CLIP DELETED"
         );
         assert!(song.tracks[0].blocks.is_empty());
+    }
+
+    #[test]
+    fn moving_a_group_down_carries_its_whole_run() {
+        let mut song = Song::default();
+        song.tracks = vec![
+            lane(1, "GROUP", 0, true),
+            lane(2, "KICK", 1, false),
+            lane(3, "HATS", 1, false),
+            lane(4, "BASS", 0, false),
+        ];
+
+        assert_eq!(
+            apply(Command::MoveTrackDown, &mut song, track_selection(0)),
+            "TRACK MOVED DOWN"
+        );
+        let names: Vec<&str> = song
+            .tracks
+            .iter()
+            .map(|track| track.name.as_str())
+            .collect();
+        assert_eq!(names, ["BASS", "GROUP", "KICK", "HATS"]);
+        assert_eq!(
+            song.tracks
+                .iter()
+                .map(|track| track.depth)
+                .collect::<Vec<_>>(),
+            [0, 0, 1, 1]
+        );
+    }
+
+    #[test]
+    fn moving_a_plain_lane_up_skips_the_whole_group_above() {
+        let mut song = Song::default();
+        song.tracks = vec![
+            lane(1, "GROUP", 0, true),
+            lane(2, "KICK", 1, false),
+            lane(3, "HATS", 1, false),
+            lane(4, "BASS", 0, false),
+        ];
+
+        assert_eq!(
+            apply(Command::MoveTrackUp, &mut song, track_selection(3)),
+            "TRACK MOVED UP"
+        );
+        let names: Vec<&str> = song
+            .tracks
+            .iter()
+            .map(|track| track.name.as_str())
+            .collect();
+        assert_eq!(names, ["BASS", "GROUP", "KICK", "HATS"]);
+        assert_eq!(song.tracks[2].depth, 1, "KICK remains a group member");
+    }
+
+    #[test]
+    fn movement_stays_among_siblings_and_refuses_at_a_group_edge() {
+        let mut song = Song::default();
+        song.tracks = vec![
+            lane(1, "GROUP", 0, true),
+            lane(2, "A", 1, false),
+            lane(3, "B", 1, true),
+            lane(4, "B CHILD", 2, false),
+            lane(5, "C", 1, false),
+        ];
+
+        assert_eq!(
+            apply(Command::MoveTrackUp, &mut song, track_selection(4)),
+            "TRACK MOVED UP"
+        );
+        let names: Vec<&str> = song
+            .tracks
+            .iter()
+            .map(|track| track.name.as_str())
+            .collect();
+        assert_eq!(names, ["GROUP", "A", "C", "B", "B CHILD"]);
+        assert_eq!(
+            apply(Command::MoveTrackUp, &mut song, track_selection(1)),
+            "TRACK: NO SIBLING ABOVE"
+        );
+    }
+
+    #[test]
+    fn reorder_repairs_depth_on_the_song_before_it_moves() {
+        let mut song = Song::default();
+        song.tracks = vec![lane(1, "A", 7, false), lane(2, "B", 7, false)];
+
+        assert_eq!(
+            apply(Command::MoveTrackUp, &mut song, track_selection(1)),
+            "TRACK MOVED UP"
+        );
+        assert!(song.tracks.iter().all(|track| track.depth == 0));
+        assert_eq!(song.tracks[0].name, "B");
     }
 }

@@ -716,7 +716,7 @@ impl App {
                 self.sent_volume[i] = volume;
             }
         }
-        self.sync_sends();
+        self.sync_sends(beat);
         self.sync_returns();
         self.sync_master(beat);
         self.sync_device_automation(beat);
@@ -730,7 +730,7 @@ impl App {
     /// schedule never moves. A send with no compiled node — a muted
     /// return, a silent lane — is skipped rather than queued, because a
     /// letter to a node that does not exist has nowhere to arrive.
-    pub(crate) fn sync_sends(&mut self) {
+    pub(crate) fn sync_sends(&mut self, beat: f32) {
         let tracks = self.arrangement.tracks.len();
         let returns = self.arrangement.returns.len();
         self.sent_send.resize(tracks, Vec::new());
@@ -739,12 +739,17 @@ impl App {
         }
         for track in 0..tracks {
             for index in 0..returns {
-                let level = self.arrangement.tracks[track]
+                let base = self.arrangement.tracks[track]
                     .sends
                     .get(index)
                     .copied()
-                    .unwrap_or(0.0)
-                    .clamp(0.0, 1.0);
+                    .unwrap_or(0.0);
+                let level = daw::targets::track_send_target(index).map_or(0.0, |target| {
+                    self.arrangement.tracks[track]
+                        .automation
+                        .value_at(target, beat, base)
+                        .clamp(0.0, 1.0)
+                });
                 if level == self.sent_send[track][index] {
                     continue;
                 }

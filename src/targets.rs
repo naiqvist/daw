@@ -14,6 +14,28 @@ use crate::devices::{DEVICES, DeviceSpec};
 
 pub const TRACK_VOLUME_TARGET: &str = "track.volume";
 pub const TRACK_PAN_TARGET: &str = "track.pan";
+/// Lettered rather than numeric because these strings are file format. The
+/// letters are the return addresses a musician sees: A through H.
+pub const TRACK_SEND_TARGETS: [&str; 8] = [
+    "track.send.a",
+    "track.send.b",
+    "track.send.c",
+    "track.send.d",
+    "track.send.e",
+    "track.send.f",
+    "track.send.g",
+    "track.send.h",
+];
+
+pub fn track_send_target(index: usize) -> Option<&'static str> {
+    TRACK_SEND_TARGETS.get(index).copied()
+}
+
+pub fn track_send_index(target: &str) -> Option<usize> {
+    TRACK_SEND_TARGETS
+        .iter()
+        .position(|candidate| *candidate == target)
+}
 
 /// Stable, content-independent metadata for an automatable parameter.
 /// Devices will register more specs; the timeline only speaks these ids.
@@ -79,6 +101,18 @@ impl Default for ParameterRegistry {
             default: 0.0,
             stepped: false,
         });
+        for (index, id) in TRACK_SEND_TARGETS.iter().enumerate() {
+            registry.register(ParameterSpec {
+                id: (*id).to_owned(),
+                group: "Track".to_owned(),
+                name: format!("Send {}", (b'A' + index as u8) as char),
+                unit: "dB".to_owned(),
+                min: 0.0,
+                max: 1.0,
+                default: 0.0,
+                stepped: false,
+            });
+        }
         // The device rows are walked out of DEVICES: range and default come
         // from `daw::params`, words from the device's labels. Adding a
         // device adds its rows here without an edit.
@@ -149,7 +183,8 @@ pub fn span_of(target: &str) -> Option<(f32, f32)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEVICE_TARGET_PREFIX, TRACK_PAN_TARGET, TRACK_VOLUME_TARGET, device_target, span_of,
+        DEVICE_TARGET_PREFIX, TRACK_PAN_TARGET, TRACK_SEND_TARGETS, TRACK_VOLUME_TARGET,
+        device_target, span_of, track_send_index, track_send_target,
     };
     use crate::devices::DeviceKind;
 
@@ -157,6 +192,20 @@ mod tests {
     fn target_ids_remain_the_exact_file_format_strings() {
         assert_eq!(TRACK_VOLUME_TARGET, "track.volume");
         assert_eq!(TRACK_PAN_TARGET, "track.pan");
+        assert_eq!(
+            TRACK_SEND_TARGETS,
+            [
+                "track.send.a",
+                "track.send.b",
+                "track.send.c",
+                "track.send.d",
+                "track.send.e",
+                "track.send.f",
+                "track.send.g",
+                "track.send.h",
+            ],
+            "renaming one send target must fail loudly: these ids are project file format"
+        );
         assert_eq!(DEVICE_TARGET_PREFIX, "dev.");
         assert_eq!(
             device_target(7, DeviceKind::Reverb.spec(), "mix"),
@@ -168,6 +217,19 @@ mod tests {
     fn track_targets_resolve_to_the_registry_spans() {
         assert_eq!(span_of(TRACK_VOLUME_TARGET), Some((0.0, 1.5)));
         assert_eq!(span_of(TRACK_PAN_TARGET), Some((-1.0, 1.0)));
+        for target in TRACK_SEND_TARGETS {
+            assert_eq!(span_of(target), Some((0.0, 1.0)));
+        }
+    }
+
+    #[test]
+    fn send_targets_are_letter_addressed_both_ways() {
+        for (index, expected) in TRACK_SEND_TARGETS.iter().enumerate() {
+            assert_eq!(track_send_target(index), Some(*expected));
+            assert_eq!(track_send_index(expected), Some(index));
+        }
+        assert_eq!(track_send_target(TRACK_SEND_TARGETS.len()), None);
+        assert_eq!(track_send_index("track.send.0"), None);
     }
 
     #[test]
