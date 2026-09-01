@@ -154,7 +154,7 @@ impl App {
         &mut self,
         takes: Vec<record::Take>,
         started_at: u64,
-        latency: u64,
+        stream_latency: u64,
         overruns: u64,
         frames: u64,
     ) {
@@ -166,14 +166,29 @@ impl App {
             .as_ref()
             .map_or(48_000, |engine| engine.info().sample_rate);
         // A take arrives LATE by the round trip the player was hearing
-        // through, so it is pulled back by what the backend reports.
+        // through, so pull back both parts of that path. The schedule's
+        // PDC is computed from device declarations whose impulse tests
+        // MEASURE the delay; the stream figure is only what the backend
+        // REPORTS. Neither is a physical loopback measurement of this
+        // machine and room — that calibration is separate work.
         //
-        // The backend's figure, not a measured one — a loopback
-        // measurement is the honest way to get this and is its own piece
-        // of work. Stated here so the next person knows the number is a
-        // claim rather than an observation.
+        // rtaudio exposes one duplex stream-latency number, not separate
+        // input and output figures, so there is no divergence to choose
+        // between here.
+        let latency = stream_latency.saturating_add(self.schedule_latency_frames);
         let at_sample = started_at.saturating_sub(latency);
-        let beat = at_sample as f64 / f64::from(rate.max(1)) * self.transport.bpm / 60.0;
+        let beat = if self.song.tempo.is_empty() {
+            // Preserve the legacy answer bit for bit when there is no map,
+            // including its sub-tick precision.
+            at_sample as f64 / f64::from(rate.max(1)) * self.transport.bpm / 60.0
+        } else {
+            let tempo = daw::tempo::TempoTable::build(
+                &self.song,
+                f64::from(rate.max(1)),
+                self.transport.bpm,
+            );
+            tempo.tick_at(at_sample) as f64 / daw::sequencing::TICKS_PER_BEAT as f64
+        };
         let at = beat as f32;
         let mut placed = 0;
         for take in takes {
@@ -235,5 +250,97 @@ impl App {
         self.engine
             .as_ref()
             .map_or(0, |engine| engine.info().in_channels as u32)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RATE: u32 = 48_000;
+
+    fn app_with_audio_lane() -> App {
+        let storage = shell::Storage::default();
+        let mut app = App::new(&storage);
+        app.arrangement.tracks[0].kind = TrackKind::Audio;
+        app
+    }
+
+    fn take() -> record::Take {
+        record::Take {
+            track: 0,
+            path: std::path::PathBuf::from("known-take.wav"),
+            frames: RATE as u64,
+            channels: 1,
+            sample_rate: RATE,
+        }
+    }
+
+    /// A tempo change in front of the take changes samples-per-beat. The
+    /// capture stamp therefore has to come back through the song's table,
+    /// not through the transport's one fallback tempo.
+    #[test]
+    fn a_take_after_a_tempo_change_lands_on_the_tick_it_was_played_at() {
+        use daw::sequencing::TICKS_PER_BEAT;
+
+        let mut app = app_with_audio_lane();
+        app.transport.bpm = 120.0;
+        app.song.set_tempo_mark(0, 120.0);
+        app.song.set_tempo_mark(4 * TICKS_PER_BEAT, 60.0);
+        let played_tick = 5 * TICKS_PER_BEAT;
+        let table = daw::tempo::TempoTable::build(&app.song, RATE as f64, app.transport.bpm);
+        let captured_at = table.sample_at(played_tick);
+
+        app.place_takes(vec![take()], captured_at, 0, 0, RATE as u64);
+
+        assert_eq!(
+            app.arrangement.clips[0][0].start,
+            played_tick as f32 / TICKS_PER_BEAT as f32,
+            "the flat transport tempo ignored the slower span before the take"
+        );
+
+        // With no marks, keep the legacy continuous beat exactly. Routing
+        // every capture through ticks would quantize an old project to 1/48
+        // beat merely because tempo maps were added to the model.
+        let mut legacy = app_with_audio_lane();
+        legacy.transport.bpm = 120.0;
+        let captured_at = 12_345;
+        let legacy_beat = captured_at as f64 / RATE as f64 * legacy.transport.bpm / 60.0;
+        legacy.place_takes(vec![take()], captured_at, 0, 0, RATE as u64);
+        assert_eq!(legacy.arrangement.clips[0][0].start, legacy_beat as f32);
+    }
+
+    /// Monitoring through a latent schedule makes the performance reach the
+    /// input after both the stream and graph delays. Both must be removed or
+    /// the recorded clip lands late by exactly the graph's PDC.
+    #[test]
+    fn a_take_monitored_through_pdc_lands_on_the_beat_it_was_played_at() {
+        let mut spec = GraphSpec::default();
+        let input = spec.push(NodeSpec::Input { channel: 0 });
+        let filter = spec.push(NodeSpec::Filter {
+            params: daw::audio::filter::FilterParams::default(),
+        });
+        spec.connect(input, filter);
+        spec.set_output(filter);
+        let pdc = spec
+            .compile(RATE, 256)
+            .expect("the monitoring graph compiles")
+            .latency() as u64;
+        assert!(pdc > 0, "the test needs a latency-bearing chain");
+
+        let mut app = app_with_audio_lane();
+        app.transport.bpm = 120.0;
+        app.schedule_latency_frames = pdc;
+        let played_beat = 4.0;
+        let played_at = (played_beat * RATE as f64 * 60.0 / app.transport.bpm) as u64;
+        let stream_latency = 256;
+        let captured_at = played_at + stream_latency + pdc;
+
+        app.place_takes(vec![take()], captured_at, stream_latency, 0, RATE as u64);
+
+        assert_eq!(
+            app.arrangement.clips[0][0].start, played_beat as f32,
+            "the take stayed late by the schedule's {pdc}-frame PDC"
+        );
     }
 }

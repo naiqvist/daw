@@ -6448,6 +6448,10 @@ struct App {
     /// Capture overruns as of the moment the take began, so the count a
     /// finished take reports is ITS holes and not the session's.
     recording_overruns: u64,
+    /// PDC of the schedule most recently accepted by the engine. Read from
+    /// the compiled schedule green-side before its box crosses to the audio
+    /// thread, because the recorder cannot recover that ownership later.
+    schedule_latency_frames: u64,
     /// One meter per return, in return order.
     return_meters: Vec<device::meter::Ballistics>,
     /// Every send's gain node, `[track][return]`, as the last compile
@@ -6935,6 +6939,7 @@ impl App {
             recorder: None,
             recording_from: 0,
             recording_overruns: 0,
+            schedule_latency_frames: 0,
             return_meters: Vec::new(),
             send_ids: Vec::new(),
             return_ids: Vec::new(),

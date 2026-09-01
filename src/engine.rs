@@ -201,6 +201,7 @@ impl App {
         self.clip_nodes.clear();
         self.sent_loop = None;
         self.last_compile = None;
+        self.schedule_latency_frames = 0;
         self.transport.playing = false;
     }
 
@@ -252,11 +253,16 @@ impl App {
         ));
         match spec.compile_at_tempo(info.sample_rate, info.max_frames, self.transport.bpm) {
             Ok(sched) => {
+                // GREEN ZONE: once the box crosses `set_schedule`, the
+                // callback owns it and the recorder has no lawful way to
+                // ask it how late the monitored signal is.
+                let schedule_latency_frames = sched.latency() as u64;
                 let Some(engine) = &mut self.engine else {
                     return;
                 };
                 match engine.set_schedule(Box::new(sched)) {
                     Ok(()) => {
+                        self.schedule_latency_frames = schedule_latency_frames;
                         self.device_nodes = nodes.devices;
                         self.readout_slots = nodes.readouts;
                         self.clip_nodes = nodes.audio_clips;

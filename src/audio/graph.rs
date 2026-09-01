@@ -4956,7 +4956,13 @@ impl Schedule {
         self.readouts = [Readout::default(); MAX_METERS];
     }
 
-    /// Total latency from input to output, in samples. See the field.
+    /// Total latency from input to output, in samples.
+    ///
+    /// Computed green-side from the compiled path and each device's declared
+    /// latency; the latency-bearing kernels pin those declarations with
+    /// impulse measurements. This is distinct from a backend's stream
+    /// latency, which is merely reported by the audio API. A recorder that
+    /// needs both must read this before handing the schedule to the callback.
     pub fn latency(&self) -> usize {
         self.latency
     }
