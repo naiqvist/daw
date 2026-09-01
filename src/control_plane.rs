@@ -94,6 +94,7 @@ impl App {
             self.arrangement.pending_seek = Some(from);
             self.transport.play_until = Some(to);
             self.transport.playing = true;
+            self.transport.begin_pass();
         }
         // Ctrl+T adds an instrument track, the cursor landing on it.
         if song_world

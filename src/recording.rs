@@ -7,13 +7,16 @@
 use super::*;
 
 impl App {
-    /// Whether a take should be running right now.
+    /// Whether a take should be WRITING right now.
     ///
     /// Rolling is `armed && playing`, exactly as the action vocabulary
     /// says — one derived answer rather than a third piece of state that
-    /// could disagree with the two it is made of.
+    /// could disagree with the two it is made of. The count-in and the
+    /// punch range narrow that intention to the moment, and neither
+    /// un-arms the transport: the performer stays armed across a punch
+    /// window rather than having to re-arm inside it.
     pub(crate) fn should_record(&self) -> bool {
-        self.transport.armed && self.transport.playing
+        self.transport.capturing()
     }
 
     /// Start, feed and stop the take, once per frame.

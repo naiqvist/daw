@@ -1536,6 +1536,21 @@ struct Transport {
     /// classic maximum. It is baked into the compiled schedule, so a
     /// change recompiles — and every offline render hears it too.
     swing: f32,
+    /// Bars of count-in before a take starts CAPTURING. Zero is off.
+    ///
+    /// This pre-rolls the capture, not the transport: the playhead starts
+    /// where it was asked to and the metronome runs, but nothing is
+    /// written until the count-in has passed. That keeps the count-in
+    /// honest at beat zero, where a transport pre-roll would have to run
+    /// the playhead into negative time it does not have.
+    count_in_bars: u32,
+    /// Capture only inside this beat range — punch in and punch out.
+    /// `None` is the whole pass.
+    punch: Option<(f32, f32)>,
+    /// The beat the count-in ends on, set when a pass begins. Derived
+    /// state, never persisted: a count-in belongs to a take, not to a
+    /// song.
+    count_in_until: f32,
 }
 
 impl Default for Transport {
@@ -1553,6 +1568,9 @@ impl Default for Transport {
             marker: 0.0,
             play_until: None,
             swing: 0.0,
+            count_in_bars: 0,
+            punch: None,
+            count_in_until: 0.0,
         }
     }
 }
@@ -1561,6 +1579,62 @@ impl Transport {
     /// Recording happens only while armed AND rolling.
     fn recording(&self) -> bool {
         self.armed && self.playing
+    }
+
+    /// The playhead in beats. `position` is seconds, which is the clock
+    /// the app has; everything a musician says is in beats.
+    fn beats(&self) -> f32 {
+        if self.bpm <= 0.0 {
+            return 0.0;
+        }
+        (self.position * self.bpm / 60.0) as f32
+    }
+
+    /// A pass begins: fix where its count-in ends.
+    ///
+    /// Called when playback starts, so a count-in is measured from where
+    /// the take actually began rather than from beat zero. With no
+    /// count-in this is the current beat and the window is empty.
+    fn begin_pass(&mut self) {
+        let bars = self.count_in_bars as f32;
+        self.count_in_until = self.beats() + bars * self.beats_per_bar.max(1) as f32;
+    }
+
+    /// Whether a take should be WRITING right now.
+    ///
+    /// Armed and rolling is the intention; the count-in and the punch
+    /// range are what narrow it to the moment. Each is a separate reason
+    /// to be silent, and none of them un-arms the transport — the
+    /// performer stays armed across a punch window.
+    fn capturing(&self) -> bool {
+        if !self.recording() {
+            return false;
+        }
+        let beat = self.beats();
+        if beat < self.count_in_until {
+            return false;
+        }
+        match self.punch {
+            Some((start, end)) => beat >= start && beat < end,
+            None => true,
+        }
+    }
+
+    /// Set the punch range, refusing one that could never capture. A
+    /// zero-width or inverted window is not a punch, and silently
+    /// accepting it would arm a recording that never writes.
+    fn set_punch(&mut self, range: Option<(f32, f32)>) -> bool {
+        match range {
+            None => {
+                self.punch = None;
+                true
+            }
+            Some((start, end)) if end > start && start.is_finite() && end.is_finite() => {
+                self.punch = Some((start, end));
+                true
+            }
+            Some(_) => false,
+        }
     }
 }
 
@@ -1608,6 +1682,9 @@ fn perform(actions: &[UiAction], transport: &mut Transport, arrangement: &mut Ar
                 } else {
                     arrangement.pending_seek = Some(transport.marker);
                     transport.playing = true;
+                    // A pass begins here, so the count-in is measured from where
+                    // the take actually started.
+                    transport.begin_pass();
                 }
             }
             UiAction::ContinuePlay => {
@@ -1622,11 +1699,17 @@ fn perform(actions: &[UiAction], transport: &mut Transport, arrangement: &mut Ar
                     arrangement.pending_seek = Some(from);
                     transport.play_until = Some(to);
                     transport.playing = true;
+                    // A pass begins here, so the count-in is measured from where
+                    // the take actually started.
+                    transport.begin_pass();
                 } else {
                     // No selection: the fence has nothing to stand on, so
                     // this is Space.
                     arrangement.pending_seek = Some(transport.marker);
                     transport.playing = true;
+                    // A pass begins here, so the count-in is measured from where
+                    // the take actually started.
+                    transport.begin_pass();
                 }
             }
             UiAction::SetTempo(bpm) => {
@@ -3146,6 +3229,13 @@ struct ProjectDoc {
     next_track_no: [u32; TrackKind::ALL.len()],
     /// The canonical SONG-world document. Older projects predate it and
     /// open onto its one-track default rather than losing compatibility.
+    /// Bars of count-in. Absent means none, which is what every project
+    /// written before count-in existed meant.
+    #[serde(default)]
+    count_in_bars: u32,
+    /// The punch range in beats, if one is set.
+    #[serde(default)]
+    punch: Option<(f32, f32)>,
     #[serde(default)]
     song: daw::sequencing::Song,
     /// SONG track ids own legacy projection twins by index. Invalid indices
@@ -3178,6 +3268,8 @@ fn project_doc(arr: &Arrangement, transport: &Transport) -> ProjectDoc {
         loop_on: transport.loop_on,
         loop_range: arr.loop_range,
         swing: transport.swing,
+        count_in_bars: transport.count_in_bars,
+        punch: transport.punch,
         grid: arr.grid,
         tracks: arr.tracks.clone(),
         master: arr.master.clone(),
@@ -3445,6 +3537,10 @@ fn apply_project_doc(doc: ProjectDoc, arr: &mut Arrangement, transport: &mut Tra
     transport.metronome = doc.metronome;
     transport.loop_on = doc.loop_on;
     transport.swing = doc.swing.clamp(0.0, 1.0);
+    transport.count_in_bars = doc.count_in_bars.min(8);
+    // A punch loaded from disk goes through the same guard a live edit
+    // does, so a hand-edited file cannot arm a window that never writes.
+    transport.set_punch(doc.punch);
     transport.playing = false;
     transport.position = 0.0;
     transport.marker = 0.0;
@@ -17470,6 +17566,9 @@ mod tests {
         assert!(arr.session.launch(0, 2));
         arr.selected_clip = Some((0, 0));
         transport.playing = true;
+        // A pass begins here, so the count-in is measured from where
+        // the take actually started.
+        transport.begin_pass();
         transport.position = 9.0;
 
         let text = ron::ser::to_string_pretty(
@@ -22425,6 +22524,120 @@ mod tests {
     }
 
     #[test]
+    /// A count-in suppresses CAPTURE, not the transport: armed and
+    /// rolling stay true throughout, so nothing has to be re-armed when
+    /// the bars run out.
+    #[test]
+    fn a_count_in_delays_capture_without_disarming() {
+        let mut transport = Transport::default();
+        transport.bpm = 120.0;
+        transport.beats_per_bar = 4;
+        transport.count_in_bars = 2;
+        transport.armed = true;
+        transport.playing = true;
+        transport.position = 0.0;
+        transport.begin_pass();
+
+        assert!(
+            transport.recording(),
+            "armed and rolling from the first beat"
+        );
+        assert!(!transport.capturing(), "but nothing is written yet");
+
+        // Seven beats in — still inside two bars of four.
+        transport.position = 7.0 * 60.0 / 120.0;
+        assert!(!transport.capturing());
+        // Eight beats: the count-in is spent.
+        transport.position = 8.0 * 60.0 / 120.0;
+        assert!(transport.capturing(), "the take starts writing on the bar");
+        assert!(transport.armed, "and it never disarmed");
+    }
+
+    /// The count-in is measured from where the take BEGAN, not from beat
+    /// zero — otherwise starting mid-song would skip it entirely.
+    #[test]
+    fn a_count_in_is_measured_from_where_the_pass_started() {
+        let mut transport = Transport::default();
+        transport.bpm = 120.0;
+        transport.count_in_bars = 1;
+        transport.armed = true;
+        transport.playing = true;
+        transport.position = 16.0 * 60.0 / 120.0; // beat 16
+        transport.begin_pass();
+
+        assert!(!transport.capturing(), "the count-in runs here too");
+        transport.position = 19.0 * 60.0 / 120.0;
+        assert!(!transport.capturing());
+        transport.position = 20.0 * 60.0 / 120.0;
+        assert!(
+            transport.capturing(),
+            "one bar after the start, not after zero"
+        );
+    }
+
+    /// Punch writes only inside its window, and the edges are half-open
+    /// so a punch-out lands exactly on its beat rather than one sample
+    /// late.
+    #[test]
+    fn punch_captures_only_inside_its_window() {
+        let mut transport = Transport::default();
+        transport.bpm = 120.0;
+        transport.armed = true;
+        transport.playing = true;
+        assert!(transport.set_punch(Some((4.0, 8.0))));
+
+        for (beat, want) in [
+            (0.0, false),
+            (3.9, false),
+            (4.0, true),
+            (7.9, true),
+            (8.0, false),
+            (12.0, false),
+        ] {
+            transport.position = f64::from(beat) * 60.0 / 120.0;
+            assert_eq!(transport.capturing(), want, "at beat {beat}");
+        }
+    }
+
+    /// A window that could never capture is REFUSED rather than stored:
+    /// silently accepting it would arm a recording that never writes,
+    /// which looks exactly like broken hardware.
+    #[test]
+    fn an_impossible_punch_is_refused() {
+        let mut transport = Transport::default();
+        assert!(!transport.set_punch(Some((8.0, 8.0))), "zero width");
+        assert!(!transport.set_punch(Some((8.0, 4.0))), "inverted");
+        assert!(!transport.set_punch(Some((0.0, f32::NAN))), "not a number");
+        assert!(transport.punch.is_none(), "and none of them was stored");
+        assert!(transport.set_punch(Some((0.0, 1.0))));
+        assert!(transport.set_punch(None), "and it can always be cleared");
+    }
+
+    /// Count-in and punch survive a save, and a project written before
+    /// they existed loads with neither.
+    #[test]
+    fn count_in_and_punch_round_trip_and_default_off() {
+        let mut transport = Transport::default();
+        transport.count_in_bars = 2;
+        transport.set_punch(Some((4.0, 8.0)));
+        let doc = project_doc(&Arrangement::default(), &transport);
+        assert_eq!(doc.count_in_bars, 2);
+        assert_eq!(doc.punch, Some((4.0, 8.0)));
+
+        let text = ron::ser::to_string(&doc).expect("serializes");
+        let back: ProjectDoc = ron::from_str(&text).expect("round trips");
+        assert_eq!(back.count_in_bars, 2);
+        assert_eq!(back.punch, Some((4.0, 8.0)));
+
+        // An older document lacks both fields entirely.
+        let older = text
+            .replace("count_in_bars:2,", "")
+            .replace("punch:Some((4.0,8.0)),", "");
+        let older: ProjectDoc = ron::from_str(&older).expect("an older document still loads");
+        assert_eq!(older.count_in_bars, 0, "no count-in is the old meaning");
+        assert_eq!(older.punch, None);
+    }
+
     fn project_document_round_trips_song_and_projection_ownership() {
         let mut doc = project_doc(&Arrangement::default(), &Transport::default());
         let track_id = doc.song.tracks[0].id;
