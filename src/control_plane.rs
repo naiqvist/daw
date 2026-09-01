@@ -187,63 +187,13 @@ impl App {
 // the Song is a small pure value, and the projection already compares
 // whole Songs every frame — and restoring one is AUDIBLE for free: the
 // copyist sees the change, reprojects, and the compiler follows.
+//
+// The mechanism now lives in `daw::history` (lifted so the stage can
+// share it); this is the same observe/undo/redo it always was, one step
+// per frame that changed the Song — sentence-granular in practice, since
+// sentences are how frames change it.
 
-/// Snapshot history for the canonical song. One step per frame that
-/// changed it: sentence-granular in practice, since sentences are how
-/// frames change it.
-pub(super) struct SongHistory {
-    undo: Vec<daw::sequencing::Song>,
-    redo: Vec<daw::sequencing::Song>,
-    present: daw::sequencing::Song,
-}
-
-/// Enough for a long session; the Song is small, but unbounded memory
-/// is not a feature.
-const SONG_HISTORY_CAP: usize = 512;
-
-impl SongHistory {
-    pub(super) fn new(initial: daw::sequencing::Song) -> Self {
-        Self {
-            undo: Vec::new(),
-            redo: Vec::new(),
-            present: initial,
-        }
-    }
-
-    /// Notice a change since last frame: the departed state becomes an
-    /// undo step and the redo branch dies (a new edit is a new future).
-    fn observe(&mut self, song: &daw::sequencing::Song) {
-        if *song == self.present {
-            return;
-        }
-        self.undo
-            .push(std::mem::replace(&mut self.present, song.clone()));
-        self.redo.clear();
-        if self.undo.len() > SONG_HISTORY_CAP {
-            self.undo.remove(0);
-        }
-    }
-
-    fn undo(&mut self, song: &mut daw::sequencing::Song) -> bool {
-        let Some(previous) = self.undo.pop() else {
-            return false;
-        };
-        self.redo
-            .push(std::mem::replace(&mut self.present, previous.clone()));
-        *song = previous;
-        true
-    }
-
-    fn redo(&mut self, song: &mut daw::sequencing::Song) -> bool {
-        let Some(next) = self.redo.pop() else {
-            return false;
-        };
-        self.undo
-            .push(std::mem::replace(&mut self.present, next.clone()));
-        *song = next;
-        true
-    }
-}
+pub(super) type SongHistory = daw::history::History<daw::sequencing::Song>;
 
 impl App {
     /// Song undo, run every frame from the control plane: observe first
@@ -273,87 +223,5 @@ impl App {
         }
         // No projection call here: project_song runs later in the frame
         // and notices the restored Song the same way it notices an edit.
-    }
-}
-
-#[cfg(test)]
-mod song_history_tests {
-    use super::SongHistory;
-    use daw::sequencing::{Note, Song};
-
-    fn edited(song: &Song, step: usize) -> Song {
-        let mut next = song.clone();
-        let pattern_id = next.tracks[0].blocks[0].pattern_id;
-        next.pattern_mut(pattern_id)
-            .expect("default pattern")
-            .set_primary(step, Note::new(60, 12, 100));
-        next
-    }
-
-    /// Each observed change is one step; undo walks back through them
-    /// and redo walks forward, restoring bit-identical Songs.
-    #[test]
-    fn undo_and_redo_walk_the_observed_states() {
-        let base = Song::default();
-        let mut history = SongHistory::new(base.clone());
-        let first = edited(&base, 0);
-        let second = edited(&first, 4);
-
-        let mut song = first.clone();
-        history.observe(&song);
-        song = second.clone();
-        history.observe(&song);
-
-        assert!(history.undo(&mut song));
-        assert_eq!(song, first);
-        assert!(history.undo(&mut song));
-        assert_eq!(song, base);
-        assert!(!history.undo(&mut song), "the floor refuses quietly");
-
-        assert!(history.redo(&mut song));
-        assert_eq!(song, first);
-        assert!(history.redo(&mut song));
-        assert_eq!(song, second);
-        assert!(!history.redo(&mut song));
-    }
-
-    /// A new edit after an undo abandons the redo branch: one timeline,
-    /// no forks pretending otherwise.
-    #[test]
-    fn a_new_edit_kills_the_redo_branch() {
-        let base = Song::default();
-        let mut history = SongHistory::new(base.clone());
-        let mut song = edited(&base, 0);
-        history.observe(&song);
-        history.undo(&mut song);
-
-        song = edited(&base, 8);
-        history.observe(&song);
-        assert!(!history.redo(&mut song), "the old future is gone");
-        assert!(history.undo(&mut song));
-        assert_eq!(song, base);
-    }
-
-    /// Observing an unchanged song records nothing.
-    #[test]
-    fn no_change_is_no_step() {
-        let base = Song::default();
-        let mut history = SongHistory::new(base.clone());
-        let mut song = base.clone();
-        history.observe(&song);
-        assert!(!history.undo(&mut song));
-    }
-
-    #[test]
-    fn a_track_mute_is_one_undoable_song_edit() {
-        let base = Song::default();
-        let mut history = SongHistory::new(base.clone());
-        let mut song = base.clone();
-        song.tracks[0].muted = true;
-        history.observe(&song);
-
-        assert!(history.undo(&mut song));
-        assert_eq!(song, base);
-        assert!(!song.tracks[0].muted);
     }
 }

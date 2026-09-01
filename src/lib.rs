@@ -6,8 +6,10 @@
 
 pub mod audio;
 pub mod audio_source;
+pub mod design;
 pub mod devices;
 pub mod dsp;
+pub mod history;
 pub mod intent;
 pub mod library;
 pub mod midi_input;
