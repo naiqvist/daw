@@ -568,6 +568,45 @@ pub struct StreamInfoSnapshot {
     pub latency_frames: Option<usize>,
 }
 
+/// How many letters each green-to-audio ring holds — and, because they are
+/// the SAME constants, how many the callback will take from one in a single
+/// block. That identity is the point: see [`drain_bounded`].
+const SCHEDULE_RING: usize = 4;
+const PARAM_RING: usize = 256;
+const MOD_RING: usize = 128;
+const TRANSPORT_RING: usize = 64;
+const AUDITION_RING: usize = 8;
+
+/// Take at most `max` letters from `rx`, handing each to `apply`. Returns
+/// how many were taken.
+///
+/// **Red zone, and the bound is the whole reason this exists.**
+/// `while let Ok(x) = rx.pop() {}` reads as "drain the ring, so at most
+/// capacity iterations" and that is FALSE: `rtrb` reloads the producer's
+/// tail when its cached range is exhausted, so a green-side thread writing
+/// while the callback drains can keep the loop fed indefinitely. Capacity
+/// bounds how many letters may WAIT at once; it never bounded how many can
+/// pass through in one block.
+///
+/// The callback is not allowed an unbounded-time path (`AGENTS.md`), and
+/// four of these loops were one. Nothing had been heard yet only because
+/// every producer runs at UI speed — which is a fact about today's callers,
+/// not a property of the code.
+///
+/// Anything past `max` stays in the ring and is taken next block: one block
+/// of extra latency for a backlog that in practice never forms.
+fn drain_bounded<T>(rx: &mut rtrb::Consumer<T>, max: usize, mut apply: impl FnMut(T)) -> usize {
+    let mut taken = 0;
+    while taken < max {
+        let Ok(item) = rx.pop() else {
+            break;
+        };
+        apply(item);
+        taken += 1;
+    }
+    taken
+}
+
 /// Owns the running audio stream. Dropping this stops it.
 pub struct Engine {
     _stream: Option<StreamHandle>,
@@ -695,15 +734,17 @@ impl Engine {
 
         // Schedule handoff. Capacity 4 is plenty: swaps happen at UI speed.
         // Pushing a Box moves a pointer — the callback never allocates or frees.
-        let (schedule_tx, mut schedule_rx) = rtrb::RingBuffer::<Box<Schedule>>::new(4);
+        let (schedule_tx, mut schedule_rx) = rtrb::RingBuffer::<Box<Schedule>>::new(SCHEDULE_RING);
         // 256 letters is ~1.4 blocks of continuous 60Hz knob-drag backlog —
         // far more than the callback can fall behind by.
-        let (param_tx, mut param_rx) = rtrb::RingBuffer::<ParamChange>::new(256);
+        let (param_tx, mut param_rx) = rtrb::RingBuffer::<ParamChange>::new(PARAM_RING);
         // Modulation edits are sent only on CHANGE, and there are far
         // fewer wires than parameters, so 128 is generous.
-        let (mod_tx, mut mod_rx) = rtrb::RingBuffer::<modulation::ModEdit>::new(128);
-        let (transport_tx, mut transport_rx) = rtrb::RingBuffer::<TransportCmd>::new(64);
-        let (audition_tx, mut audition_rx) = rtrb::RingBuffer::<AuditionCommand>::new(8);
+        let (mod_tx, mut mod_rx) = rtrb::RingBuffer::<modulation::ModEdit>::new(MOD_RING);
+        let (transport_tx, mut transport_rx) =
+            rtrb::RingBuffer::<TransportCmd>::new(TRANSPORT_RING);
+        let (audition_tx, mut audition_rx) =
+            rtrb::RingBuffer::<AuditionCommand>::new(AUDITION_RING);
         let audition_collector = basedrop::Collector::new();
         let mut audition_voice = AuditionVoice::new(cfg.sample_rate);
         let mut transport = Transport::new(cfg.sample_rate as f64);
@@ -784,7 +825,7 @@ impl Engine {
                     // Swap in a newer schedule if one arrived. Pop and push are
                     // lock-free and constant-time; the old Box goes back to the
                     // UI thread to be dropped there.
-                    while let Ok(mut new_schedule) = schedule_rx.pop() {
+                    drain_bounded(&mut schedule_rx, SCHEDULE_RING, |mut new_schedule| {
                         // Modulation memory rides across the seam: a
                         // recompile happens for a clip drag or a tempo
                         // nudge, once a second, while audio plays — and a
@@ -797,39 +838,41 @@ impl Engine {
                             // until stream teardown — still never freed here.
                             let _ = trash_tx.push(old);
                         }
-                    }
+                    });
 
-                    // Drain parameter letters in arrival order. Bounded by ring
-                    // capacity; each apply is two indexes and a store.
-                    while let Ok(change) = param_rx.pop() {
+                    // Parameter letters in arrival order; each apply is two
+                    // indexes and a store. The count is the bound — the ring's
+                    // capacity never was one.
+                    drain_bounded(&mut param_rx, PARAM_RING, |change| {
                         if let Some(s) = schedule.as_mut() {
                             s.apply(change);
                         }
-                    }
+                    });
                     // Modulation letters, after the parameter letters: both
                     // can arrive in one frame, and a wire's new depth
                     // should be applied against this block's base rather
                     // than the last one's.
-                    while let Ok(edit) = mod_rx.pop() {
+                    drain_bounded(&mut mod_rx, MOD_RING, |edit| {
                         if let Some(s) = schedule.as_mut() {
                             s.apply_mod_edit(edit);
                         }
-                    }
-                    // Drain transport commands, in order — the whole gesture
-                    // lands before any audio is produced, so N seeks in one
-                    // block collapse to the last.
-                    while let Ok(cmd) = transport_rx.pop() {
+                    });
+                    // Transport commands, in order — the whole gesture lands
+                    // before any audio is produced, so N seeks in one block
+                    // collapse to the last. A gesture longer than the ring
+                    // would now split across two blocks; at 64 commands that
+                    // is a backlog nothing generates, and splitting is still
+                    // better than an unbounded callback.
+                    drain_bounded(&mut transport_rx, TRANSPORT_RING, |cmd| {
                         transport.apply(cmd);
-                    }
-                    // At most eight commands: the ring's fixed capacity is
-                    // the bound. Replaced buffers retire through basedrop;
-                    // no allocation is freed on this thread.
-                    for _ in 0..8 {
-                        let Ok(command) = audition_rx.pop() else {
-                            break;
-                        };
+                    });
+                    // This one was already bounded, by a hand-written counter;
+                    // it now says so through the same helper as the rest.
+                    // Replaced buffers retire through basedrop; no allocation
+                    // is freed on this thread.
+                    drain_bounded(&mut audition_rx, AUDITION_RING, |command| {
                         audition_voice.apply(command);
-                    }
+                    });
 
                     let frames = output.len() / out_channels;
                     let in_channels = input.len().checked_div(frames).unwrap_or(0);
@@ -1289,5 +1332,84 @@ mod audition_tests {
         collector.collect();
         assert_eq!(collector.alloc_count(), 0);
         assert!(collector.try_cleanup().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+
+    /// THE test. A producer that writes while the callback drains is what
+    /// makes `while let Ok(..) = pop()` unbounded, and it is made
+    /// deterministic here by refilling from inside `apply` itself: under
+    /// the old loop this never terminates, because every take frees a slot
+    /// the producer immediately reuses.
+    #[test]
+    fn a_producer_refilling_during_the_drain_cannot_extend_it() {
+        let (mut tx, mut rx) = rtrb::RingBuffer::<u32>::new(4);
+        for i in 0..4 {
+            let _ = tx.push(i);
+        }
+        let mut seen = 0usize;
+        let taken = drain_bounded(&mut rx, 4, |_| {
+            seen += 1;
+            // The concurrent producer, standing over the bucket.
+            let _ = tx.push(99);
+        });
+        assert_eq!(taken, 4, "the bound must hold even as the ring refills");
+        assert_eq!(seen, 4, "and apply runs exactly that many times");
+        // Proof the refills really happened and are simply left for the
+        // next block, which is the intended behaviour rather than a loss.
+        assert!(rx.pop().is_ok(), "what arrived mid-drain waits its turn");
+    }
+
+    #[test]
+    fn it_takes_at_most_max_and_leaves_the_rest() {
+        let (mut tx, mut rx) = rtrb::RingBuffer::<u32>::new(8);
+        for i in 0..8 {
+            let _ = tx.push(i);
+        }
+        let taken = drain_bounded(&mut rx, 3, |_| {});
+        assert_eq!(taken, 3);
+        let rest = drain_bounded(&mut rx, 8, |_| {});
+        assert_eq!(rest, 5, "the remainder is still there next block");
+    }
+
+    #[test]
+    fn an_empty_ring_stops_immediately() {
+        let (_tx, mut rx) = rtrb::RingBuffer::<u32>::new(4);
+        assert_eq!(drain_bounded(&mut rx, 256, |_| {}), 0);
+    }
+
+    #[test]
+    fn a_zero_bound_takes_nothing_and_does_not_spin() {
+        let (mut tx, mut rx) = rtrb::RingBuffer::<u32>::new(4);
+        let _ = tx.push(1);
+        assert_eq!(drain_bounded(&mut rx, 0, |_| {}), 0);
+        assert!(rx.pop().is_ok(), "and the letter is untouched");
+    }
+
+    /// Order is preserved: these are letters, and a stop+seek+play gesture
+    /// is only atomic if it arrives in the order it was written.
+    #[test]
+    fn letters_arrive_in_the_order_they_were_written() {
+        let (mut tx, mut rx) = rtrb::RingBuffer::<u32>::new(8);
+        for i in 0..5 {
+            let _ = tx.push(i);
+        }
+        let mut got = Vec::new();
+        drain_bounded(&mut rx, 8, |v| got.push(v));
+        assert_eq!(got, vec![0, 1, 2, 3, 4]);
+    }
+
+    /// The drain bound and the ring capacity are the same constant, so they
+    /// cannot drift into disagreeing about what "one block's worth" means.
+    #[test]
+    fn every_ring_is_drained_to_exactly_its_own_capacity() {
+        assert_eq!(SCHEDULE_RING, 4);
+        assert_eq!(PARAM_RING, 256);
+        assert_eq!(MOD_RING, 128);
+        assert_eq!(TRANSPORT_RING, 64);
+        assert_eq!(AUDITION_RING, 8);
     }
 }
