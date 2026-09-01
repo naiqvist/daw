@@ -4592,6 +4592,14 @@ impl Node {
         }
     }
 }
+/// Mint the next schedule epoch. Green zone only — compile is never called
+/// from the callback. Wrapping is unreachable in any real process life, and
+/// a wrap would only ever cause a stale letter to be binned one swap late.
+fn next_schedule_epoch() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
 
 /// A parameter change: "worker `node`, knob `param`, new value". 16 bytes,
 /// Copy. `node` is a NodeId in packed form — letters carry the permanent name
@@ -4773,6 +4781,20 @@ struct Step {
 /// green zone, executed in the red zone, never mutated structurally after
 /// compile. Swapped whole via ring buffer.
 pub struct Schedule {
+    /// Which COMPILE this schedule came from. Unique for the process.
+    ///
+    /// Node name tags are only unique within one `thunderdome` arena, and
+    /// every compile starts a fresh one — so slot 0 / generation 1 in this
+    /// schedule and slot 0 / generation 1 in the next are unrelated nodes
+    /// wearing the same tag. The generation compare in [`Self::apply`]
+    /// cannot see that, because it is the same number. A letter still in
+    /// flight across a schedule swap would be delivered to whatever now
+    /// occupies its slot.
+    ///
+    /// The epoch is what makes the tag unambiguous ACROSS compiles. Letters
+    /// carry the epoch they were addressed under and the callback bins the
+    /// ones that no longer match.
+    epoch: u64,
     nodes: Vec<Node>,
     steps: Vec<Step>,
     arena: Arena,
@@ -4929,6 +4951,13 @@ impl Schedule {
                 node.apply(change.param, change.value);
             }
         }
+    }
+
+    /// Which compile this schedule came from. A letter addressed under a
+    /// different epoch names a node that no longer exists, whatever its
+    /// slot and generation say.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// Red zone: the peaks accumulated since the last [`Self::clear_peaks`],
@@ -7361,6 +7390,7 @@ impl GraphSpec {
         }
 
         Ok(Schedule {
+            epoch: next_schedule_epoch(),
             nodes,
             steps,
             arena: Arena::new(num_slots.max(1), block_frames),
@@ -8761,6 +8791,61 @@ mod tests {
             }
         }
         assert!(clicked, "metronome stayed mute after tempo drop");
+    }
+
+    /// The hazard, DEMONSTRATED rather than asserted. Two schedules built
+    /// from independent specs mint the SAME packed node tag for unrelated
+    /// nodes, because every compile starts a fresh `thunderdome` arena and
+    /// generations restart with it. Slot and generation cannot tell those
+    /// two nodes apart — which is why a letter surviving a schedule swap
+    /// used to be delivered to whatever now sat in its slot.
+    #[test]
+    fn two_compiles_mint_the_same_node_tag_and_only_the_epoch_separates_them() {
+        let mut a = GraphSpec::default();
+        let first = a.push(NodeSpec::Sine {
+            freq: 440.0,
+            amp: 0.5,
+        });
+        a.set_output(first);
+        let sched_a = a.compile(48_000, 256).unwrap();
+
+        let mut b = GraphSpec::default();
+        let second = b.push(NodeSpec::Sine {
+            freq: 880.0,
+            amp: 0.5,
+        });
+        b.set_output(second);
+        let sched_b = b.compile(48_000, 256).unwrap();
+
+        assert_eq!(
+            first.to_bits(),
+            second.to_bits(),
+            "unrelated nodes in two compiles wear the SAME tag — the hazard"
+        );
+        assert_ne!(
+            sched_a.epoch(),
+            sched_b.epoch(),
+            "and the epoch is the only thing that can distinguish them"
+        );
+    }
+
+    /// Epochs never repeat, so a letter can never be mistaken for one
+    /// belonging to a later compile that happens to reuse a number.
+    #[test]
+    fn every_compile_gets_a_fresh_epoch() {
+        let build = || {
+            let mut spec = GraphSpec::default();
+            let n = spec.push(NodeSpec::Sine {
+                freq: 440.0,
+                amp: 0.0,
+            });
+            spec.set_output(n);
+            spec.compile(48_000, 256).unwrap().epoch()
+        };
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..8 {
+            assert!(seen.insert(build()), "an epoch was reused");
+        }
     }
 
     fn seq_sched(notes: Vec<Note>) -> Schedule {

@@ -568,6 +568,23 @@ pub struct StreamInfoSnapshot {
     pub latency_frames: Option<usize>,
 }
 
+/// A letter, plus the compile it was addressed under.
+///
+/// Node name tags are unique only within one `thunderdome` arena and every
+/// compile starts a fresh one, so the same slot and generation name
+/// different nodes in successive schedules. A letter that misses its
+/// schedule swap by a block would otherwise be delivered to whatever now
+/// occupies its slot — silently, and to a node the sender never meant.
+///
+/// The epoch travels WITH the letter rather than being inferred at the far
+/// end, because by the time the callback reads it the sender's idea of
+/// "current" is exactly the thing in question.
+#[derive(Debug, Clone, Copy)]
+struct Stamped<T> {
+    epoch: u64,
+    item: T,
+}
+
 /// How many letters each green-to-audio ring holds — and, because they are
 /// the SAME constants, how many the callback will take from one in a single
 /// block. That identity is the point: see [`drain_bounded`].
@@ -618,11 +635,16 @@ pub struct Engine {
     last_advance: Instant,
     /// New schedules go in here; the callback swaps them in between blocks.
     schedule_tx: rtrb::Producer<Box<Schedule>>,
+    /// The epoch of the schedule most recently handed to the callback, and
+    /// therefore the one every outgoing letter is addressed under. Zero
+    /// until the first schedule: epochs start at 1, so letters sent before
+    /// there is anything to address are binned rather than guessed at.
+    epoch: u64,
     /// Parameter letters: 16-byte Copy structs, drained at each block start.
-    param_tx: rtrb::Producer<ParamChange>,
+    param_tx: rtrb::Producer<Stamped<ParamChange>>,
     /// Modulation letters: wire chains and source definitions, so a knob
     /// drag is heard now instead of at the next debounced schedule swap.
-    mod_tx: rtrb::Producer<modulation::ModEdit>,
+    mod_tx: rtrb::Producer<Stamped<modulation::ModEdit>>,
     /// Transport commands: one ring, so a stop+seek+play gesture is atomic
     /// by ring order.
     transport_tx: rtrb::Producer<TransportCmd>,
@@ -737,10 +759,10 @@ impl Engine {
         let (schedule_tx, mut schedule_rx) = rtrb::RingBuffer::<Box<Schedule>>::new(SCHEDULE_RING);
         // 256 letters is ~1.4 blocks of continuous 60Hz knob-drag backlog —
         // far more than the callback can fall behind by.
-        let (param_tx, mut param_rx) = rtrb::RingBuffer::<ParamChange>::new(PARAM_RING);
+        let (param_tx, mut param_rx) = rtrb::RingBuffer::<Stamped<ParamChange>>::new(PARAM_RING);
         // Modulation edits are sent only on CHANGE, and there are far
         // fewer wires than parameters, so 128 is generous.
-        let (mod_tx, mut mod_rx) = rtrb::RingBuffer::<modulation::ModEdit>::new(MOD_RING);
+        let (mod_tx, mut mod_rx) = rtrb::RingBuffer::<Stamped<modulation::ModEdit>>::new(MOD_RING);
         let (transport_tx, mut transport_rx) =
             rtrb::RingBuffer::<TransportCmd>::new(TRANSPORT_RING);
         let (audition_tx, mut audition_rx) =
@@ -844,8 +866,10 @@ impl Engine {
                     // indexes and a store. The count is the bound — the ring's
                     // capacity never was one.
                     drain_bounded(&mut param_rx, PARAM_RING, |change| {
-                        if let Some(s) = schedule.as_mut() {
-                            s.apply(change);
+                        if let Some(s) = schedule.as_mut()
+                            && change.epoch == s.epoch()
+                        {
+                            s.apply(change.item);
                         }
                     });
                     // Modulation letters, after the parameter letters: both
@@ -853,8 +877,10 @@ impl Engine {
                     // should be applied against this block's base rather
                     // than the last one's.
                     drain_bounded(&mut mod_rx, MOD_RING, |edit| {
-                        if let Some(s) = schedule.as_mut() {
-                            s.apply_mod_edit(edit);
+                        if let Some(s) = schedule.as_mut()
+                            && edit.epoch == s.epoch()
+                        {
+                            s.apply_mod_edit(edit.item);
                         }
                     });
                     // Transport commands, in order — the whole gesture lands
@@ -1065,6 +1091,7 @@ impl Engine {
             info,
             telemetry,
             schedule_tx,
+            epoch: 0,
             param_tx,
             mod_tx,
             transport_tx,
@@ -1154,9 +1181,15 @@ impl Engine {
     /// too if schedules are swapped often.
     pub fn set_schedule(&mut self, schedule: Box<Schedule>) -> Result<(), EngineError> {
         self.collect_trash();
+        // Read the epoch BEFORE the box crosses: after the push it belongs
+        // to the callback. On a failed push the epoch is left alone, so
+        // letters keep addressing the schedule that is actually installed.
+        let epoch = schedule.epoch();
         self.schedule_tx
             .push(schedule)
-            .map_err(|_| EngineError::ScheduleQueueFull)
+            .map_err(|_| EngineError::ScheduleQueueFull)?;
+        self.epoch = epoch;
+        Ok(())
     }
 
     /// Drop any schedules the callback has retired. Cheap; call at UI rate.
@@ -1211,10 +1244,13 @@ impl Engine {
     /// callback drains), the newest value is the one that matters — dropping
     /// this letter is fine, the next one supersedes it.
     pub fn set_param(&mut self, node: NodeId, param: u32, value: f32) {
-        let _ = self.param_tx.push(ParamChange {
-            node: node.to_bits(),
-            param,
-            value,
+        let _ = self.param_tx.push(Stamped {
+            epoch: self.epoch,
+            item: ParamChange {
+                node: node.to_bits(),
+                param,
+                value,
+            },
         });
     }
 
@@ -1222,7 +1258,10 @@ impl Engine {
     /// Dropped on a full ring for the same reason a parameter letter is:
     /// these carry whole state, so the next one supersedes this one.
     pub fn set_modulation(&mut self, edit: modulation::ModEdit) {
-        let _ = self.mod_tx.push(edit);
+        let _ = self.mod_tx.push(Stamped {
+            epoch: self.epoch,
+            item: edit,
+        });
     }
 }
 
