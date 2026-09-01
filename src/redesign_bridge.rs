@@ -109,42 +109,16 @@ fn sequence_ticks_to_beats(ticks: usize) -> f64 {
 const SONG_PATTERN_STEP_TICKS: usize = daw::sequencing::PATTERN_STEP_TICKS;
 
 fn song_pattern_length(song: &daw::sequencing::Song, id: daw::sequencing::PatternId) -> usize {
-    song.tracks
-        .iter()
-        .flat_map(|track| &track.blocks)
-        .find(|block| block.pattern_id == id)
-        .map_or(daw::sequencing::DEFAULT_PATTERN_TICKS, |block| {
-            block.length_ticks
-        })
+    daw::ui::sequencer::pattern_length(song, id)
 }
 
 fn song_pattern_note_views(
     pattern: &daw::sequencing::Pattern,
     key: &daw::pitch::Key,
 ) -> Vec<redesign_sequence::NoteView> {
-    (0..daw::sequencing::PATTERN_STEPS)
-        .flat_map(|step| {
-            let trig = pattern.trig(step);
-            trig.enabled
-                .then_some(trig)
-                .into_iter()
-                .flat_map(move |trig| {
-                    trig.notes.iter().map(move |note| {
-                        song_note_view(
-                            note,
-                            step * SONG_PATTERN_STEP_TICKS,
-                            trig.probability,
-                            trig.enabled,
-                            key,
-                        )
-                    })
-                })
-        })
-        .collect()
+    daw::ui::sequencer::note_views(pattern, key)
 }
 
-/// Green-zone resolution, once per frame: the view carries the finished
-/// numbers, and the honest flag that the legacy path is approximating.
 fn song_note_view(
     note: &daw::sequencing::Note,
     start_ticks: usize,
@@ -152,25 +126,12 @@ fn song_note_view(
     enabled: bool,
     key: &daw::pitch::Key,
 ) -> redesign_sequence::NoteView {
-    let hz = note.pitch.resolve(key);
-    redesign_sequence::NoteView {
-        pitch: note.pitch,
-        hz,
-        midi: daw::pitch::nearest_midi(hz),
-        approx: daw::pitch::cents_from_midi_table(hz).abs() > APPROX_CENTS,
-        start_ticks,
-        length_ticks: note.length_ticks,
-        micro_ticks: note.micro_ticks,
-        velocity: note.velocity,
-        probability,
-        enabled,
-    }
+    daw::ui::sequencer::note_view(note, start_ticks, probability, enabled, key)
 }
 
 /// Below this remainder the legacy MIDI path reproduces a pitch exactly
 /// (float noise is orders of magnitude smaller); above it the trig wears
 /// the `≈` playback-approximation sign.
-const APPROX_CENTS: f64 = 0.05;
 
 /// One whole trig a recorded MIDI take WOULD write. The complete `after`
 /// value matters: the approved collision rule replaces the addressed trig,
@@ -266,120 +227,7 @@ fn apply_song_pattern_intents(
     pattern: &mut daw::sequencing::Pattern,
     intents: &[redesign_sequence::Intent],
 ) -> Option<&'static str> {
-    let mut notice = None;
-    for intent in intents {
-        use redesign_sequence::Intent;
-        let tick = match *intent {
-            Intent::Toggle { tick, .. }
-            | Intent::SetPrimary { tick, .. }
-            | Intent::Clear { tick }
-            | Intent::Nudge { tick, .. }
-            | Intent::Resize { tick, .. }
-            | Intent::AddNote { tick, .. }
-            | Intent::SetProbability { tick, .. }
-            | Intent::AdjustVelocity { tick, .. } => tick,
-        };
-        // Song patterns have one address per sixteenth. Finer sequence-grid
-        // ticks deliberately round down into the containing 12-tick step.
-        let step = tick / SONG_PATTERN_STEP_TICKS;
-        if step >= daw::sequencing::PATTERN_STEPS {
-            notice = Some("sequence step is outside the pattern");
-            continue;
-        }
-
-        match *intent {
-            Intent::Toggle {
-                default_pitch,
-                default_length_ticks,
-                default_velocity,
-                ..
-            } => pattern.toggle(
-                step,
-                daw::sequencing::Note::with_pitch(
-                    default_pitch,
-                    default_length_ticks,
-                    default_velocity,
-                ),
-            ),
-            Intent::SetPrimary {
-                pitch,
-                length_ticks,
-                velocity,
-                ..
-            } => pattern.set_primary(
-                step,
-                daw::sequencing::Note::with_pitch(pitch, length_ticks, velocity),
-            ),
-            Intent::Clear { .. } => pattern.clear(step),
-            Intent::AddNote {
-                pitch,
-                length_ticks,
-                velocity,
-                probability,
-                ..
-            } => {
-                pattern.add_tone(
-                    step,
-                    daw::sequencing::Note::with_pitch(pitch, length_ticks, velocity),
-                );
-                pattern.trig_mut(step).probability = probability.clamp(0.01, 1.0);
-            }
-            Intent::SetProbability { probability, .. } => {
-                pattern.trig_mut(step).probability = probability.clamp(0.01, 1.0);
-            }
-            Intent::AdjustVelocity { delta, .. } => {
-                let trig = pattern.trig_mut(step);
-                if trig.notes.is_empty() {
-                    notice = Some("velocity: no trig here");
-                    continue;
-                }
-                for note in &mut trig.notes {
-                    note.velocity =
-                        (isize::from(note.velocity).saturating_add(delta)).clamp(1, 127) as u8;
-                }
-            }
-            Intent::Resize { delta_ticks, .. } => {
-                let trig = pattern.trig_mut(step);
-                if trig.notes.is_empty() {
-                    notice = Some("resize: no trig here");
-                    continue;
-                }
-                for note in &mut trig.notes {
-                    note.length_ticks = note.length_ticks.saturating_add_signed(delta_ticks).max(1);
-                }
-            }
-            Intent::Nudge { delta_ticks, .. } => {
-                if pattern.trig(step).notes.is_empty() {
-                    notice = Some("nudge: no trig here");
-                    continue;
-                }
-                let Some(target_tick) = isize::try_from(tick)
-                    .ok()
-                    .and_then(|tick| tick.checked_add(delta_ticks))
-                    .filter(|target| *target >= 0)
-                    .map(|target| target as usize)
-                else {
-                    notice = Some("nudge blocked at the pattern edge");
-                    continue;
-                };
-                let target_step = target_tick / SONG_PATTERN_STEP_TICKS;
-                if target_step >= daw::sequencing::PATTERN_STEPS {
-                    notice = Some("nudge blocked at the pattern edge");
-                    continue;
-                }
-                if target_step == step {
-                    continue;
-                }
-                if !pattern.trig(target_step).notes.is_empty() {
-                    notice = Some("nudge blocked by an occupied step");
-                    continue;
-                }
-                let trig = std::mem::take(pattern.trig_mut(step));
-                *pattern.trig_mut(target_step) = trig;
-            }
-        }
-    }
-    notice
+    pattern.apply_all(intents)
 }
 
 impl App {

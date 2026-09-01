@@ -11,8 +11,8 @@
 //! `display` exists so a status line can hold it on screen instead
 //! (contract: sentence visibility, `notes/20260831-command-grammar.md`).
 
-use crate::ui::redesign::registers::Registers;
-use crate::ui::redesign::verbs::{TABLE, Verb};
+use crate::ui::sequencer::registers::Registers;
+use crate::ui::sequencer::verbs::{TABLE, Verb};
 use eframe::egui;
 
 /// Everything a panel needs to speak: the frame's one sentence and its

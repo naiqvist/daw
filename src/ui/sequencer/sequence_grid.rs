@@ -1,0 +1,1608 @@
+//! The pattern as bars of steps: one row per bar, one cell per step of
+//! the current grid.
+//!
+//! Time reads left-to-right, then continues on the next row. Vertical
+//! position has no pitch meaning: `row * columns + column` is the one
+//! address. The FOOTPRINT is the sixteenth grid's — four bars of sixteen
+//! — and a finer or coarser resolution subdivides or merges the cells of
+//! that same footprint rather than redrawing the pattern at another
+//! width: a 1/32 grid is thirty-two narrower cells in the bar's row, not
+//! a longer row. So the bar stays where the eye learned it.
+//!
+//! What is drawn is a channel, not a table. An empty step is a point;
+//! the start of a beat is a plane one rung up; a trig is a mark with its
+//! onset, its address through the lens, and — value being the axis — a
+//! rail whose lightness is its velocity. A rule is drawn only where a
+//! rule is the sign (the cursor's corners); nothing is furniture.
+
+use crate::pitch::Pitch;
+use crate::sequencing::{GRID_COLUMNS, GRID_ROWS};
+use crate::ui::affordance::{Afford, Affords};
+use crate::ui::sequencer::INK;
+use crate::ui::sequencer::grammar::{Motion, Utterance, Voice};
+use crate::ui::sequencer::grid_resolution::{GridResolution, TICKS_PER_BAR};
+use crate::ui::sequencer::lens::LensView;
+use crate::ui::sequencer::registers::{Payload, Registers, TrigNote};
+use crate::ui::sequencer::sequence::{ClipView, Intent, NoteView};
+use crate::ui::sequencer::verbs::Verb;
+use crate::ui::tokens::{font, space, stroke};
+use eframe::egui;
+
+const MAX_CELL_SIDE: f32 = 44.0;
+const CELL_GAP: f32 = space::XXS;
+const ROW_GAP: f32 = space::MD;
+const STATUS_HEIGHT: f32 = 24.0;
+const ROW_ADDRESS_WIDTH: f32 = 48.0;
+/// The bar count the footprint holds: the pattern's own.
+const BARS: usize = GRID_ROWS;
+/// The empty-step ladder. The ground is black; a beat's first step is a
+/// plane one rung up, a bar's first step a rung above that. Every other
+/// step is a point on the ground, not a plane — the lattice shows as
+/// rank and file, and a trig is figure against it.
+const GROUND: egui::Color32 = egui::Color32::from_gray(0);
+const BEAT_FILL: u8 = 16;
+const BAR_FILL: u8 = 24;
+/// The point: the smallest mark, for a place with nothing in it.
+const POINT: f32 = 2.0;
+const ACTIVE_BAR_HEIGHT: f32 = space::XS;
+const ACTIVE_BAR_INSET: f32 = space::XS;
+const ONSET_WIDTH: f32 = 3.0;
+const CURSOR_GAP: f32 = 2.0;
+const CURSOR_CAP: f32 = 8.0;
+/// Narrower than this, a cell has room for its onset and rail only.
+const LABEL_MIN_W: f32 = 22.0;
+/// Narrower than this, a cell keeps its label but drops the corner signs.
+const SIGNS_MIN_W: f32 = 34.0;
+const EDGE: egui::Color32 = egui::Color32::from_gray(48);
+const LABEL_INK: egui::Color32 = egui::Color32::from_gray(145);
+const GHOST_INK: egui::Color32 = egui::Color32::from_gray(112);
+/// The ruler's band, between the header and the first bar.
+const RULER_HEIGHT: f32 = 18.0;
+/// The container: a recess the grid sits in, with its header one rung
+/// up — the same two planes the inspector is made of, and no rules.
+const PANEL_PAD: f32 = space::SM;
+const PANEL_FILL: egui::Color32 = egui::Color32::from_gray(10);
+const HEADER_FILL: egui::Color32 = egui::Color32::from_gray(18);
+/// Magnification of the bar: how many times its row is enlarged, with
+/// the window sliding to keep the cursor in view. Powers of two, so the
+/// automatic zoom that follows a resolution change is exact.
+const MAX_ZOOM: usize = 16;
+/// Wider than this, a cell has room for a second line of detail.
+const DETAIL_MIN_W: f32 = 64.0;
+/// A ruler label needs this much room before the next one may appear.
+const RULER_LABEL_MIN_W: f32 = 28.0;
+const DEFAULT_PITCH: u8 = 60;
+const DEFAULT_VELOCITY: u8 = 100;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct TrigSelection {
+    pub(crate) step: usize,
+    pub(crate) tick: usize,
+    /// The trig's primary note, whole: address, deviation, substrate.
+    pub(crate) primary: Option<NoteView>,
+    pub(crate) tone_count: usize,
+}
+
+pub(crate) struct SequenceGrid {
+    cursor_step: usize,
+    resolution: GridResolution,
+    /// How many times the bar is magnified. One shows the whole bar in
+    /// its row; two shows half of it, at twice the width; and so on.
+    zoom: usize,
+    /// The first column each row shows, in steps of the current grid.
+    /// Every row shows the same window, so the bars stay aligned and a
+    /// beat reads straight down through them.
+    view_start: usize,
+    last_pitch: Pitch,
+    /// The last refusal, shown in the status line until the next sentence.
+    /// Silence is forbidden: an unsupported verb answers out loud.
+    refusal: Option<String>,
+}
+
+impl Default for SequenceGrid {
+    fn default() -> Self {
+        Self {
+            cursor_step: 0,
+            resolution: GridResolution::default(),
+            zoom: 1,
+            view_start: 0,
+            last_pitch: Pitch::from_midi(DEFAULT_PITCH),
+            refusal: None,
+        }
+    }
+}
+
+impl SequenceGrid {
+    /// Read this frame's view chords: resolution (`^1` finer, `^2`
+    /// coarser, `^3` triplets) and zoom (`^+` in, `^-` out, `^0` the whole
+    /// bar). Then keep the cursor where it was and the window around it.
+    ///
+    /// Resolution and zoom are yoked: narrowing the grid zooms in by the
+    /// same factor, so the cells under the hand keep their width and the
+    /// window simply shows less of the bar. Widening zooms back out. A
+    /// zoom chord on its own is the way to look at more or less of the
+    /// bar without changing what a step is.
+    pub(crate) fn update_view(&mut self, ctx: &egui::Context) {
+        let tick = self.cursor_tick();
+        let columns_before = self.columns();
+        self.resolution.update(ctx);
+        let columns_after = self.columns();
+        if columns_after != columns_before {
+            self.zoom = (self.zoom * columns_after / columns_before.max(1)).clamp(1, MAX_ZOOM);
+        }
+        let zoom_in = ctx.input_mut(|input| {
+            input.consume_key(egui::Modifiers::COMMAND, egui::Key::Plus)
+                || input.consume_key(egui::Modifiers::COMMAND, egui::Key::Equals)
+        });
+        let zoom_out =
+            ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Minus));
+        let zoom_fit =
+            ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Num0));
+        if zoom_fit {
+            self.zoom = 1;
+        } else if zoom_in {
+            self.zoom = (self.zoom * 2).min(MAX_ZOOM);
+        } else if zoom_out {
+            self.zoom = (self.zoom / 2).max(1);
+        }
+        self.cursor_step = (tick / self.resolution.step_ticks()).min(self.steps() - 1);
+        self.follow_cursor();
+    }
+
+    /// Steps across one row: one bar at the current resolution.
+    fn columns(&self) -> usize {
+        self.resolution.steps_per_bar()
+    }
+
+    /// Every step the grid addresses at the current resolution.
+    fn steps(&self) -> usize {
+        self.columns() * BARS
+    }
+
+    /// How many of a row's steps the window shows.
+    fn visible(&self) -> usize {
+        (self.columns() / self.zoom).max(1)
+    }
+
+    /// Slide the window the least it must to contain the cursor's
+    /// column, and never past the end of the bar. Minimal by rule: a
+    /// window that recentred would move the ground under a hand that
+    /// only stepped one cell sideways.
+    fn follow_cursor(&mut self) {
+        let visible = self.visible();
+        let column = self.cursor_step % self.columns();
+        if column < self.view_start {
+            self.view_start = column;
+        } else if column >= self.view_start + visible {
+            self.view_start = column + 1 - visible;
+        }
+        self.view_start = self.view_start.min(self.columns() - visible);
+    }
+
+    #[allow(clippy::too_many_arguments)] // One read-only context per concern.
+    pub(crate) fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        available: egui::Rect,
+        focused: bool,
+        voice: &mut Voice<'_>,
+        clip: Option<ClipView<'_>>,
+        lens: &LensView,
+        intents: &mut Vec<Intent>,
+    ) {
+        if focused {
+            self.keyboard(ui.ctx(), voice, clip, intents);
+        }
+        self.follow_cursor();
+        // Sentence-in-progress outranks a stale refusal on the status line.
+        let overlay = if voice.sentence.is_empty() {
+            self.refusal.clone()
+        } else {
+            Some(voice.sentence.display())
+        };
+
+        // The footprint is the sixteenth grid's, whatever the resolution
+        // or zoom: a square cell per sixteenth, sixteen to a bar, four
+        // bars down. Resolution and zoom decide how that width is cut.
+        let sixteenth_gaps = CELL_GAP * (GRID_COLUMNS - 1) as f32;
+        let width_limited =
+            (available.width() - PANEL_PAD * 2.0 - ROW_ADDRESS_WIDTH - sixteenth_gaps)
+                / GRID_COLUMNS as f32;
+        let height_limited = (available.height()
+            - PANEL_PAD * 2.0
+            - STATUS_HEIGHT
+            - RULER_HEIGHT
+            - ROW_GAP * (BARS - 1) as f32)
+            / BARS as f32;
+        let cell_side = width_limited
+            .min(height_limited)
+            .clamp(1.0, MAX_CELL_SIDE)
+            .floor();
+        let row_width = cell_side * GRID_COLUMNS as f32 + sixteenth_gaps;
+        let grid_height = cell_side * BARS as f32 + ROW_GAP * (BARS - 1) as f32;
+        let full_width = ROW_ADDRESS_WIDTH + row_width;
+        let full_height = STATUS_HEIGHT + RULER_HEIGHT + grid_height;
+        let origin = egui::pos2(
+            (available.center().x - full_width * 0.5).floor(),
+            (available.center().y - full_height * 0.5).floor(),
+        );
+        let painter = ui.painter_at(available);
+
+        // The container: one recess, its header a rung up, nothing ruled.
+        let container = egui::Rect::from_min_size(origin, egui::vec2(full_width, full_height))
+            .expand(PANEL_PAD);
+        painter.rect_filled(container, 0.0, PANEL_FILL);
+        let header = egui::Rect::from_min_max(
+            container.min,
+            egui::pos2(container.max.x, origin.y + STATUS_HEIGHT),
+        );
+        painter.rect_filled(header, 0.0, HEADER_FILL);
+        self.draw_status(&painter, origin, full_width, clip, lens, overlay.as_deref());
+
+        // The window: which steps of each bar the rows show, and how wide
+        // a cell is once the row is cut into them.
+        let columns = self.columns();
+        let visible = self.visible();
+        let first = self.view_start;
+        let cell_w = ((row_width - CELL_GAP * (visible - 1) as f32) / visible as f32).max(1.0);
+        let step_ticks = self.resolution.step_ticks();
+        let grid_origin = origin + egui::vec2(ROW_ADDRESS_WIDTH, STATUS_HEIGHT + RULER_HEIGHT);
+        let column_x =
+            |column: usize| grid_origin.x + (column - first) as f32 * (cell_w + CELL_GAP);
+
+        self.draw_ruler(
+            &painter,
+            egui::Rect::from_min_size(
+                egui::pos2(grid_origin.x, origin.y + STATUS_HEIGHT),
+                egui::vec2(row_width, RULER_HEIGHT),
+            ),
+            cell_w,
+        );
+
+        for row in 0..BARS {
+            let row_top = row_y(grid_origin.y, cell_side, row);
+            draw_row_address(
+                &painter,
+                egui::pos2(origin.x + ROW_ADDRESS_WIDTH - space::SM, row_top),
+                row * columns + first + 1,
+                row * TICKS_PER_BAR + first * step_ticks,
+                cell_side,
+            );
+            for column in first..first + visible {
+                let step = row * columns + column;
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2(column_x(column), row_top),
+                    egui::vec2(cell_w, cell_side),
+                );
+                let response = ui
+                    .interact(
+                        rect,
+                        ui.id().with(("sequence-step", step)),
+                        egui::Sense::click(),
+                    )
+                    .affords(Affords::Press);
+                if response.clicked() {
+                    self.cursor_step = step;
+                    self.toggle(clip, intents);
+                }
+
+                let tick = step * step_ticks;
+                draw_ground(&painter, rect, tick);
+                if response.hovered() && self.cursor_step != step {
+                    // The pointer's presence is a tint, not an outline: a
+                    // rule would say something, and hovering says nothing.
+                    painter.rect_filled(rect, 0.0, egui::Color32::from_white_alpha(8));
+                }
+                self.draw_cell_events(&painter, rect, clip, lens, step);
+                if self.cursor_step == step {
+                    draw_cursor(&painter, rect);
+                }
+            }
+        }
+    }
+
+    /// The ruler: time across the window, in the bar's own units. A
+    /// point at every step, a short bar at every beat, and a label
+    /// wherever the next one has room — beats first, then sixteenths,
+    /// then finer, as the zoom makes room for them. Every bar's row is
+    /// the same window, so one ruler serves all four.
+    fn draw_ruler(&self, painter: &egui::Painter, band: egui::Rect, cell_w: f32) {
+        let step_ticks = self.resolution.step_ticks();
+        let stride = cell_w + CELL_GAP;
+        let unit = ruler_unit(step_ticks, stride);
+        let font = egui::FontId::new(font::MICRO_LABEL, egui::FontFamily::Monospace);
+        for (index, column) in (self.view_start..self.view_start + self.visible()).enumerate() {
+            let tick = column * step_ticks;
+            let x = band.min.x + index as f32 * stride;
+            let beat = tick.is_multiple_of(TICKS_PER_BAR / 4);
+            if beat {
+                painter.rect_filled(
+                    egui::Rect::from_min_size(
+                        egui::pos2(x, band.max.y - RULER_HEIGHT * 0.5),
+                        egui::vec2(1.0, RULER_HEIGHT * 0.5),
+                    ),
+                    0.0,
+                    LABEL_INK,
+                );
+            } else {
+                painter.rect_filled(
+                    egui::Rect::from_center_size(
+                        egui::pos2(x + 0.5, band.max.y - POINT),
+                        egui::Vec2::splat(POINT),
+                    ),
+                    0.0,
+                    EDGE,
+                );
+            }
+            if let Some(label) = ruler_label(tick, unit) {
+                painter.text(
+                    egui::pos2(x + space::XS, band.min.y),
+                    egui::Align2::LEFT_TOP,
+                    label,
+                    font.clone(),
+                    if beat { INK } else { LABEL_INK },
+                );
+            }
+        }
+    }
+
+    fn draw_status(
+        &self,
+        painter: &egui::Painter,
+        origin: egui::Pos2,
+        width: f32,
+        clip: Option<ClipView<'_>>,
+        lens: &LensView,
+        overlay: Option<&str>,
+    ) {
+        let rect = egui::Rect::from_min_size(origin, egui::vec2(width, STATUS_HEIGHT));
+        // Words set apart by space, the one delimiter that costs no ink.
+        // The harmonic context reads here: key sign and active lens,
+        // beside the clip — a context with no sign is a trap.
+        let words = match clip {
+            Some(clip) if width >= 560.0 => format!(
+                "{}   {:02}B   {}{}   {}",
+                clip.name,
+                clip.length_ticks.div_ceil(TICKS_PER_BAR),
+                self.resolution.label(),
+                zoom_sign(self.zoom),
+                lens.status
+            ),
+            Some(clip) => format!(
+                "{}   {}{}",
+                clip.name,
+                self.resolution.label(),
+                zoom_sign(self.zoom)
+            ),
+            None if width >= 560.0 => {
+                format!("NO CLIP   {}   {}", self.resolution.label(), lens.status)
+            }
+            None => "NO CLIP".to_owned(),
+        };
+        painter.text(
+            rect.left_center() + egui::vec2(space::XS, 0.0),
+            egui::Align2::LEFT_CENTER,
+            words,
+            egui::FontId::new(font::MINI_LABEL, egui::FontFamily::Monospace),
+            LABEL_INK,
+        );
+        // The right side is the grammar's mouth: the sentence-in-progress
+        // or a refusal takes the spot, and the quiet is left quiet.
+        if let Some(overlay) = overlay {
+            painter.text(
+                rect.right_center(),
+                egui::Align2::RIGHT_CENTER,
+                overlay,
+                egui::FontId::new(font::BODY, egui::FontFamily::Monospace),
+                INK,
+            );
+        }
+    }
+
+    fn draw_cell_events(
+        &self,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        clip: Option<ClipView<'_>>,
+        lens: &LensView,
+        step: usize,
+    ) {
+        let span = self.resolution.step_ticks();
+        let tick = step * span;
+        let primary = clip.and_then(|clip| primary_at(clip, tick, span));
+        let tone_count = clip.map_or(0, |clip| tone_count_at(clip, tick, span));
+        let continuation = clip
+            .map(|clip| continuation_fraction(clip, tick, span))
+            .unwrap_or(0.0);
+        if let Some(note) = primary.filter(|note| note.enabled) {
+            draw_active_rail(painter, rect, note.velocity);
+        } else if continuation > 0.0 {
+            draw_continuation(painter, rect, continuation);
+        }
+
+        let Some(note) = primary else {
+            return;
+        };
+        let ink = trig_ink(note.enabled, note.probability);
+        // A note that starts after the cell does shows it as geometry:
+        // the onset bar sits displaced within the cell by exactly that
+        // much — an index, not a symbol. A pushed note and a note placed
+        // on a finer grid look the same here, because they are.
+        let push =
+            ((note.start_ticks - tick) as f32 / span.max(1) as f32).clamp(0.0, 0.9) * rect.width();
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(rect.left() + push, rect.top()),
+                egui::pos2(rect.left() + push + ONSET_WIDTH, rect.bottom()),
+            ),
+            0.0,
+            ink,
+        );
+        // A narrow cell keeps its onset and rail and says nothing else:
+        // marks degrade by dropping, never by overlapping.
+        if rect.width() < LABEL_MIN_W {
+            return;
+        }
+        // With room, the label rises to make a line for the detail
+        // beneath it: velocity, length, and the push if there is one.
+        // The facts the inspector states, brought onto the trig once the
+        // trig is wide enough to carry them without crowding.
+        let detailed = rect.width() >= DETAIL_MIN_W && rect.height() >= 36.0;
+        let label_y = if detailed {
+            rect.center().y - space::SM
+        } else {
+            rect.center().y - space::XXS
+        };
+        painter.text(
+            egui::pos2(rect.center().x + ONSET_WIDTH * 0.5, label_y),
+            egui::Align2::CENTER_CENTER,
+            cell_label(note, lens),
+            egui::FontId::new(font::BODY, egui::FontFamily::Monospace),
+            ink,
+        );
+        if detailed {
+            let push = if note.micro_ticks != 0 {
+                format!("  {:+}T", note.micro_ticks)
+            } else {
+                String::new()
+            };
+            painter.text(
+                egui::pos2(
+                    rect.center().x + ONSET_WIDTH * 0.5,
+                    rect.center().y + space::SM,
+                ),
+                egui::Align2::CENTER_CENTER,
+                format!(
+                    "{}  {}{push}",
+                    note.velocity,
+                    crate::ui::sequencer::grid_resolution::length_label(note.length_ticks)
+                ),
+                egui::FontId::new(font::MICRO_LABEL, egui::FontFamily::Monospace),
+                LABEL_INK,
+            );
+        }
+        if rect.width() < SIGNS_MIN_W {
+            return;
+        }
+        if tone_count > 1 {
+            painter.text(
+                rect.right_top() + egui::vec2(-space::XS, space::XS),
+                egui::Align2::RIGHT_TOP,
+                format!("+{}", tone_count - 1),
+                egui::FontId::new(font::MICRO_LABEL, egui::FontFamily::Monospace),
+                ink,
+            );
+        }
+        // A conditional trig is a rule, not an event: the document says so
+        // by marking the condition on the trig (settled ruling: signed
+        // conditions, `notes/20260831-command-grammar.md`). The mark is a
+        // SHADE — the trig's density of occurrence as the density of a
+        // sign — and the exact figure is the inspector's to state.
+        if note.enabled && note.probability < 1.0 {
+            painter.text(
+                rect.right_bottom() + egui::vec2(-space::XS, -space::XXS),
+                egui::Align2::RIGHT_BOTTOM,
+                condition_sign(note.probability).to_string(),
+                egui::FontId::new(font::MINI_LABEL, egui::FontFamily::Monospace),
+                ink,
+            );
+        }
+        // A pending transform previews as a ghost: the would-be spelling
+        // in ghost ink under the standing one. Nothing has changed yet.
+        if let Some(clip) = clip
+            && let Some(ghost) = clip
+                .ghosts
+                .iter()
+                .filter(|ghost| ghost.start_ticks == tick)
+                .min_by(|a, b| a.pitch.stack_order(&b.pitch))
+        {
+            painter.text(
+                rect.left_bottom() + egui::vec2(ONSET_WIDTH + space::XS, -space::XXS),
+                egui::Align2::LEFT_BOTTOM,
+                cell_label(ghost, lens),
+                egui::FontId::new(font::MICRO_LABEL, egui::FontFamily::Monospace),
+                GHOST_INK,
+            );
+        }
+    }
+
+    /// Interpret this frame's utterance against the grid's noun: the trig
+    /// under the cursor. Verbs the trig does not support are refused out
+    /// loud, never silently dropped (`notes/20260831-command-grammar.md`).
+    fn keyboard(
+        &mut self,
+        ctx: &egui::Context,
+        voice: &mut Voice<'_>,
+        clip: Option<ClipView<'_>>,
+        intents: &mut Vec<Intent>,
+    ) {
+        let Some(utterance) = voice.sentence.consume(ctx) else {
+            return;
+        };
+        self.refusal = None;
+        self.speak(utterance, voice.registers, clip, intents);
+    }
+
+    fn speak(
+        &mut self,
+        utterance: Utterance,
+        registers: &mut Registers,
+        clip: Option<ClipView<'_>>,
+        intents: &mut Vec<Intent>,
+    ) {
+        let count = utterance.count as isize;
+        let span = self.resolution.step_ticks();
+        let tick = self.cursor_step * span;
+        // What is here: every tick a note starts on within the cell. A
+        // verb on the cell is spoken once per such tick, so a coarse
+        // cell edits everything it holds and a fine one exactly one.
+        let here = starts_in(clip, tick, span);
+        match (utterance.verb, utterance.motion) {
+            // Hold-as-preposition: the same arrows, spoken while holding
+            // the trig qualifier, edit the trig instead of travelling.
+            (None, Some(motion @ (Motion::Up | Motion::Down))) if utterance.held => {
+                if here.is_empty() {
+                    self.refusal = Some("HOLD: NOTHING HERE".to_owned());
+                } else {
+                    for start in &here {
+                        intents.push(Intent::AdjustVelocity {
+                            tick: *start,
+                            delta: count * if motion == Motion::Up { 1 } else { -1 },
+                        });
+                    }
+                }
+            }
+            (None, Some(_)) if utterance.held => {
+                self.refusal = Some("HOLD: UP OR DOWN".to_owned());
+            }
+            (None, Some(motion)) => self.move_by(count * self.motion_steps(motion)),
+            (Some(Verb::Act), _) => self.toggle(clip, intents),
+            (Some(Verb::Delete), _) => {
+                for start in here
+                    .iter()
+                    .copied()
+                    .chain((here.is_empty()).then_some(tick))
+                {
+                    intents.push(Intent::Clear { tick: start });
+                }
+            }
+            (Some(Verb::Nudge), Some(motion)) => {
+                let steps = count * self.motion_steps(motion);
+                let delta_ticks = steps * span as isize;
+                // Moving right, the last note moves first so none lands on
+                // a neighbour that has not moved yet; moving left, the
+                // first. An empty cell still speaks once, to be refused.
+                let mut order = here.clone();
+                if delta_ticks > 0 {
+                    order.reverse();
+                }
+                for start in order.into_iter().chain((here.is_empty()).then_some(tick)) {
+                    intents.push(Intent::Nudge {
+                        tick: start,
+                        delta_ticks,
+                    });
+                }
+                self.move_by(steps);
+            }
+            (Some(Verb::Resize), Some(motion @ (Motion::Left | Motion::Right))) => {
+                let delta_ticks = count * self.motion_steps(motion) * span as isize;
+                for start in here
+                    .iter()
+                    .copied()
+                    .chain((here.is_empty()).then_some(tick))
+                {
+                    intents.push(Intent::Resize {
+                        tick: start,
+                        delta_ticks,
+                    });
+                }
+            }
+            (Some(Verb::Resize), Some(_)) => {
+                self.refusal = Some("RESIZE: LEFT OR RIGHT".to_owned());
+            }
+            (Some(Verb::Yank), _) => match trig_at(clip, tick, span) {
+                Some(notes) => {
+                    registers.yank(Payload::Trig(notes));
+                    self.refusal = Some("YANKED A TRIG".to_owned());
+                }
+                None => self.refusal = Some("YANK: NOTHING HERE".to_owned()),
+            },
+            (Some(Verb::Put), _) => match registers.trig() {
+                Ok(notes) => {
+                    for start in here
+                        .iter()
+                        .copied()
+                        .chain((here.is_empty()).then_some(tick))
+                    {
+                        intents.push(Intent::Clear { tick: start });
+                    }
+                    for note in notes {
+                        intents.push(Intent::AddNote {
+                            tick,
+                            pitch: note.pitch,
+                            length_ticks: note.length_ticks,
+                            velocity: note.velocity,
+                            probability: note.probability,
+                        });
+                    }
+                }
+                Err(refusal) => self.refusal = Some(refusal),
+            },
+            (Some(Verb::Duplicate), _) => match trig_at(clip, tick, span) {
+                Some(notes) => {
+                    // Yank-and-put-adjacent in one keystroke: the copy
+                    // lands `count` steps ahead and the cursor rides
+                    // along, Elektron style. The register is untouched —
+                    // duplicate is a shorthand, not a yank.
+                    let steps = count.max(1);
+                    let target = (self.cursor_step as isize + steps)
+                        .rem_euclid(self.steps() as isize)
+                        as usize
+                        * span;
+                    let there = starts_in(clip, target, span);
+                    for start in there
+                        .iter()
+                        .copied()
+                        .chain((there.is_empty()).then_some(target))
+                    {
+                        intents.push(Intent::Clear { tick: start });
+                    }
+                    for note in notes {
+                        intents.push(Intent::AddNote {
+                            tick: target,
+                            pitch: note.pitch,
+                            length_ticks: note.length_ticks,
+                            velocity: note.velocity,
+                            probability: note.probability,
+                        });
+                    }
+                    self.move_by(steps);
+                }
+                None => self.refusal = Some("DUPLICATE: NOTHING HERE".to_owned()),
+            },
+            (Some(Verb::Condition), _) => {
+                match clip.and_then(|clip| primary_at(clip, tick, span)) {
+                    Some(note) => {
+                        // `50 C` says fifty percent; bare C cycles the
+                        // canonical ladder. A count of 1 is read as bare —
+                        // a one-percent trig is a typo, not an intent.
+                        let probability = if utterance.count > 1 {
+                            (utterance.count.min(100)) as f32 / 100.0
+                        } else {
+                            next_probability(note.probability)
+                        };
+                        intents.push(Intent::SetProbability {
+                            tick: note.start_ticks,
+                            probability,
+                        });
+                    }
+                    None => self.refusal = Some("CONDITION: NOTHING HERE".to_owned()),
+                }
+            }
+            (Some(verb), _) => {
+                self.refusal = Some(format!("{}: NOT HERE", verb.name()));
+            }
+            (None, None) => {}
+        }
+    }
+
+    fn move_by(&mut self, amount: isize) {
+        self.cursor_step =
+            (self.cursor_step as isize + amount).rem_euclid(self.steps() as isize) as usize;
+    }
+
+    /// A horizontal step is one cell; a vertical step is one row — one
+    /// bar, however many steps the current grid cuts it into.
+    fn motion_steps(&self, motion: Motion) -> isize {
+        match motion {
+            Motion::Left => -1,
+            Motion::Right => 1,
+            Motion::Up => -(self.columns() as isize),
+            Motion::Down => self.columns() as isize,
+        }
+    }
+
+    /// ACT on the cell: gate the note that is here, or put one here. A
+    /// cell holding a note placed on a finer grid gates THAT note's
+    /// tick, so the toggle never adds a second note beside it.
+    fn toggle(&mut self, clip: Option<ClipView<'_>>, intents: &mut Vec<Intent>) {
+        let span = self.resolution.step_ticks();
+        let tick = self.cursor_step * span;
+        intents.push(Intent::Toggle {
+            tick: clip
+                .and_then(|clip| primary_at(clip, tick, span))
+                .map_or(tick, |note| note.start_ticks),
+            default_pitch: self.last_pitch,
+            default_length_ticks: span,
+            default_velocity: DEFAULT_VELOCITY,
+        });
+    }
+
+    /// The cursor's address in ticks — the universal selection the
+    /// palette long forms act on.
+    pub(crate) fn cursor_tick(&self) -> usize {
+        self.cursor_step * self.resolution.step_ticks()
+    }
+
+    pub(crate) fn selection(&self, clip: Option<ClipView<'_>>) -> TrigSelection {
+        let span = self.resolution.step_ticks();
+        let tick = self.cursor_step * span;
+        TrigSelection {
+            step: self.cursor_step,
+            tick,
+            primary: clip.and_then(|clip| primary_at(clip, tick, span)).copied(),
+            tone_count: clip.map_or(0, |clip| tone_count_at(clip, tick, span)),
+        }
+    }
+
+    /// A typed or played pitch replaces the cell's first note, or puts
+    /// one on the cursor's tick when the cell is empty.
+    pub(crate) fn enter_pitch(
+        &mut self,
+        pitch: Pitch,
+        clip: Option<ClipView<'_>>,
+        intents: &mut Vec<Intent>,
+    ) {
+        self.last_pitch = pitch;
+        let span = self.resolution.step_ticks();
+        let tick = self.cursor_step * span;
+        intents.push(Intent::SetPrimary {
+            tick: clip
+                .and_then(|clip| primary_at(clip, tick, span))
+                .map_or(tick, |note| note.start_ticks),
+            pitch: self.last_pitch,
+            length_ticks: span,
+            velocity: DEFAULT_VELOCITY,
+        });
+    }
+}
+
+/// The trig cell's pitch text: the address through the lens, the
+/// musician's bend as a raised tick, the machine's approximation as a
+/// leading `≈` — two deviation sign classes, because they mean different
+/// things (`notes/20260831-pitch-lens-spec.md` §4).
+fn cell_label(note: &NoteView, lens: &LensView) -> String {
+    use crate::design::signs;
+    let name = crate::ui::sequencer::lens::address_label(&lens.active, note, &lens.key);
+    let bend = if note.pitch.offset_cents > 0.0 {
+        signs::BEND_UP
+    } else if note.pitch.offset_cents < 0.0 {
+        signs::BEND_DOWN
+    } else if note.micro_ticks > 0 {
+        signs::BEND_UP
+    } else if note.micro_ticks < 0 {
+        signs::BEND_DOWN
+    } else {
+        ""
+    };
+    format!(
+        "{}{name}{bend}",
+        if note.approx { signs::APPROX } else { "" }
+    )
+}
+
+/// The trig's three voices, ordered by value: a certain trig speaks at
+/// full white, a conditional one steps down (it is a rule, not an event),
+/// and a muted one recedes to furniture. Hierarchy by value alone.
+pub(crate) fn trig_ink(enabled: bool, probability: f32) -> egui::Color32 {
+    if !enabled {
+        egui::Color32::from_gray(104)
+    } else if probability < 1.0 {
+        egui::Color32::from_gray(176)
+    } else {
+        INK
+    }
+}
+
+/// The condition as a sign: the trig's density of occurrence drawn as
+/// the density of a shade. Three rungs, because that is what the eye can
+/// tell apart at a glance in a cell corner; the exact figure is read in
+/// the inspector, never off the trig.
+pub(crate) fn condition_sign(probability: f32) -> char {
+    if probability >= 0.7 {
+        '▓'
+    } else if probability >= 0.4 {
+        '▒'
+    } else {
+        '░'
+    }
+}
+
+/// The condition ladder bare C walks: certain, then thinner and thinner,
+/// then certain again. A closed set of signs, not a continuous dial —
+/// the exact percentages come from `count C`.
+pub(crate) fn next_probability(current: f32) -> f32 {
+    const LADDER: [f32; 5] = [1.0, 0.75, 0.5, 0.25, 0.1];
+    let position = LADDER
+        .iter()
+        .position(|p| (p - current).abs() < 0.05)
+        .unwrap_or(LADDER.len() - 1);
+    LADDER[(position + 1) % LADDER.len()]
+}
+
+/// The notes that START within a cell: at `tick` or later, before
+/// `tick + span`. A cell is a span of time, and at a coarse grid it may
+/// hold notes placed on a finer one; they are the cell's, drawn with
+/// their offset, and every verb spoken on the cell finds them.
+fn notes_in<'a>(
+    clip: ClipView<'a>,
+    tick: usize,
+    span: usize,
+) -> impl Iterator<Item = &'a NoteView> + 'a {
+    clip.notes
+        .iter()
+        .filter(move |note| note.start_ticks >= tick && note.start_ticks < tick + span)
+}
+
+/// Every distinct tick a note starts on within the cell, in time order.
+/// Verbs that act on "what is here" act on each of these exactly.
+fn starts_in(clip: Option<ClipView<'_>>, tick: usize, span: usize) -> Vec<usize> {
+    let Some(clip) = clip else {
+        return Vec::new();
+    };
+    let mut starts: Vec<usize> = notes_in(clip, tick, span)
+        .map(|note| note.start_ticks)
+        .collect();
+    starts.sort_unstable();
+    starts.dedup();
+    starts
+}
+
+/// Every note in the cell, as register payload — or `None` when the cell
+/// is empty, so yank and duplicate can refuse honestly. Offsets within
+/// the cell do not travel: a put lands the trig on the cursor's tick.
+pub(crate) fn trig_at(
+    clip: Option<ClipView<'_>>,
+    tick: usize,
+    span: usize,
+) -> Option<Vec<TrigNote>> {
+    let notes: Vec<TrigNote> = notes_in(clip?, tick, span)
+        .map(|note| TrigNote {
+            pitch: note.pitch,
+            length_ticks: note.length_ticks,
+            velocity: note.velocity,
+            probability: note.probability,
+            enabled: note.enabled,
+        })
+        .collect();
+    (!notes.is_empty()).then_some(notes)
+}
+
+/// The cell's first note: earliest, then lowest.
+fn primary_at(clip: ClipView<'_>, tick: usize, span: usize) -> Option<&NoteView> {
+    notes_in(clip, tick, span).min_by(|a, b| {
+        a.start_ticks
+            .cmp(&b.start_ticks)
+            .then_with(|| a.pitch.stack_order(&b.pitch))
+    })
+}
+
+fn tone_count_at(clip: ClipView<'_>, tick: usize, span: usize) -> usize {
+    notes_in(clip, tick, span).count()
+}
+
+fn row_y(grid_top: f32, cell_side: f32, row: usize) -> f32 {
+    grid_top + row as f32 * (cell_side + ROW_GAP)
+}
+
+/// The row's address: the number of its first step in the current
+/// grid, and beneath it the bar it is. Two lines on the cell's top and
+/// bottom edges, so they align with the cells they name.
+fn draw_row_address(
+    painter: &egui::Painter,
+    right_top: egui::Pos2,
+    first_step: usize,
+    tick: usize,
+    cell_side: f32,
+) {
+    painter.text(
+        right_top,
+        egui::Align2::RIGHT_TOP,
+        format!("{first_step:02}"),
+        egui::FontId::new(font::MINI_LABEL, egui::FontFamily::Monospace),
+        INK,
+    );
+    if cell_side >= 32.0 {
+        painter.text(
+            egui::pos2(right_top.x, right_top.y + cell_side),
+            egui::Align2::RIGHT_BOTTOM,
+            musical_position(tick),
+            egui::FontId::new(font::MICRO_LABEL, egui::FontFamily::Monospace),
+            LABEL_INK,
+        );
+    }
+}
+
+/// The ground under a step: a plane where a beat or a bar begins, a
+/// point everywhere else.
+fn draw_ground(painter: &egui::Painter, rect: egui::Rect, tick: usize) {
+    let fill = beat_fill(tick);
+    if fill == GROUND {
+        painter.rect_filled(
+            egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(POINT)),
+            0.0,
+            EDGE,
+        );
+    } else {
+        painter.rect_filled(rect, 0.0, fill);
+    }
+}
+
+/// The zoom as a sign on the status line: silent at one, `×2` and up
+/// beyond it. A magnification the eye cannot see stated is a trap.
+fn zoom_sign(zoom: usize) -> String {
+    if zoom > 1 {
+        format!(" ×{zoom}")
+    } else {
+        String::new()
+    }
+}
+
+/// The finest time unit the ruler may label at this cell stride: the
+/// coarsest of beat, sixteenth, thirty-second and sixty-fourth whose
+/// span on screen leaves room for a label. `None` when not even a beat
+/// has room.
+fn ruler_unit(step_ticks: usize, stride: f32) -> Option<usize> {
+    [TICKS_PER_BAR / 4, 12, 6, 3]
+        .into_iter()
+        // Only units the grid actually has steps at: a label on a tick no
+        // cell begins at would name a place the cursor cannot stand.
+        .filter(|unit| unit.is_multiple_of(step_ticks.max(1)))
+        .take_while(|unit| (*unit as f32 / step_ticks.max(1) as f32) * stride >= RULER_LABEL_MIN_W)
+        .last()
+}
+
+/// The ruler's word for a tick in the bar, at the labelled unit: the
+/// beat alone (`2`), the beat and sixteenth (`2.3`), or those and the
+/// sub-sixteenth (`2.3.2`). Ticks off the unit say nothing.
+fn ruler_label(tick_in_bar: usize, unit: Option<usize>) -> Option<String> {
+    let unit = unit?;
+    let tick = tick_in_bar % TICKS_PER_BAR;
+    if !tick.is_multiple_of(unit) {
+        return None;
+    }
+    let beat_ticks = TICKS_PER_BAR / 4;
+    let beat = tick / beat_ticks + 1;
+    let within_beat = tick % beat_ticks;
+    let sixteenth = within_beat / 12 + 1;
+    let within_sixteenth = within_beat % 12;
+    Some(if within_beat == 0 {
+        format!("{beat}")
+    } else if within_sixteenth == 0 {
+        format!("{beat}.{sixteenth}")
+    } else {
+        format!("{beat}.{sixteenth}.{}", within_sixteenth / unit + 1)
+    })
+}
+
+fn musical_position(tick: usize) -> String {
+    let bar = tick / TICKS_PER_BAR + 1;
+    let beat = tick % TICKS_PER_BAR / (TICKS_PER_BAR / 4) + 1;
+    format!("{bar}.{beat}")
+}
+
+fn continuation_fraction(clip: ClipView<'_>, cell_start: usize, step_ticks: usize) -> f32 {
+    let cell_end = cell_start + step_ticks;
+    let mut fraction = 0.0_f32;
+    for note in clip.notes {
+        if !note.enabled || note.start_ticks >= cell_start {
+            continue;
+        }
+        let note_end = note.start_ticks.saturating_add(note.length_ticks);
+        if note_end > cell_start {
+            fraction = fraction
+                .max((note_end.min(cell_end) - cell_start) as f32 / step_ticks.max(1) as f32);
+        }
+    }
+    fraction
+}
+
+/// The empty-step ladder by position in the bar. Ground for an ordinary
+/// step: the grid draws a point there rather than a plane.
+pub(crate) fn beat_fill(tick: usize) -> egui::Color32 {
+    let beat_ticks = TICKS_PER_BAR / 4;
+    if tick.is_multiple_of(TICKS_PER_BAR) {
+        egui::Color32::from_gray(BAR_FILL)
+    } else if tick.is_multiple_of(beat_ticks) {
+        egui::Color32::from_gray(BEAT_FILL)
+    } else {
+        GROUND
+    }
+}
+
+/// The rail's ink carries the VELOCITY: a whisper of a trig draws a
+/// quiet rail, an accent a white one. Value is the axis (charter), and
+/// the whole kit's dynamics read at a glance without opening a trig.
+pub(crate) fn velocity_ink(velocity: u8) -> egui::Color32 {
+    // 1..=127 maps into gray(112..=255): the floor keeps even the softest
+    // trig clearly present, while a full accent earns the loudest value.
+    let level = 112.0 + (f32::from(velocity.clamp(1, 127)) / 127.0) * 143.0;
+    egui::Color32::from_gray(level as u8)
+}
+
+fn draw_active_rail(painter: &egui::Painter, rect: egui::Rect, velocity: u8) {
+    let rail = egui::Rect::from_min_max(
+        egui::pos2(
+            rect.left() + ACTIVE_BAR_INSET,
+            rect.bottom() - ACTIVE_BAR_INSET - ACTIVE_BAR_HEIGHT,
+        ),
+        egui::pos2(
+            rect.right() - ACTIVE_BAR_INSET,
+            rect.bottom() - ACTIVE_BAR_INSET,
+        ),
+    );
+    painter.rect_filled(rail, 0.0, velocity_ink(velocity));
+}
+
+fn draw_continuation(painter: &egui::Painter, rect: egui::Rect, fraction: f32) {
+    let left = rect.left() + ACTIVE_BAR_INSET;
+    let right = rect.right() - ACTIVE_BAR_INSET;
+    // The held note's tail: the rail continues, at the edge's value
+    // rather than the onset's, exactly as far as the note lasts.
+    let bottom = rect.bottom() - ACTIVE_BAR_INSET;
+    painter.rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(left, bottom - ACTIVE_BAR_HEIGHT),
+            egui::pos2(left + (right - left) * fraction.clamp(0.0, 1.0), bottom),
+        ),
+        0.0,
+        EDGE,
+    );
+}
+
+pub(crate) fn note_name(pitch: u8) -> String {
+    let octave = i16::from(pitch / 12) - 1;
+    format!("{}{octave}", crate::theory::pitch_class_name(pitch))
+}
+
+pub(crate) fn draw_cursor(painter: &egui::Painter, cell: egui::Rect) {
+    let rect = cell.expand(CURSOR_GAP);
+    let cap = CURSOR_CAP.min(rect.width() * 0.4);
+    // The one place a rule is the sign: four corners, and nothing joins
+    // them, so the cursor brackets a cell without boxing it.
+    painter.rect_filled(cell, 0.0, egui::Color32::from_white_alpha(14));
+    let cursor_stroke = egui::Stroke::new(stroke::FOCUS, INK);
+    for (from, to) in [
+        (rect.left_top(), rect.left_top() + egui::vec2(cap, 0.0)),
+        (rect.left_top(), rect.left_top() + egui::vec2(0.0, cap)),
+        (rect.right_top() - egui::vec2(cap, 0.0), rect.right_top()),
+        (rect.right_top(), rect.right_top() + egui::vec2(0.0, cap)),
+        (
+            rect.left_bottom(),
+            rect.left_bottom() + egui::vec2(cap, 0.0),
+        ),
+        (
+            rect.left_bottom() - egui::vec2(0.0, cap),
+            rect.left_bottom(),
+        ),
+        (
+            rect.right_bottom() - egui::vec2(cap, 0.0),
+            rect.right_bottom(),
+        ),
+        (
+            rect.right_bottom() - egui::vec2(0.0, cap),
+            rect.right_bottom(),
+        ),
+    ] {
+        painter.line_segment([from, to], cursor_stroke);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sequencing::PATTERN_STEPS;
+
+    #[test]
+    fn horizontal_cursor_wraps_through_rows_and_pattern_end() {
+        let mut grid = SequenceGrid::default();
+        grid.cursor_step = 15;
+        grid.move_by(1);
+        assert_eq!(grid.cursor_step, 16);
+        grid.cursor_step = 63;
+        grid.move_by(1);
+        assert_eq!(grid.cursor_step, 0);
+        grid.move_by(-1);
+        assert_eq!(grid.cursor_step, 63);
+    }
+
+    #[test]
+    fn vertical_cursor_moves_sixteen_chronological_steps() {
+        let mut grid = SequenceGrid::default();
+        grid.cursor_step = 5;
+        grid.move_by(GRID_COLUMNS as isize);
+        assert_eq!(grid.cursor_step, 21);
+        grid.move_by(-(GRID_COLUMNS as isize));
+        assert_eq!(grid.cursor_step, 5);
+    }
+
+    /// A finer grid cuts the same bars into more steps: the row grows
+    /// in steps, not the pattern in rows, and the cursor stays on its tick.
+    #[test]
+    fn a_finer_grid_subdivides_the_bar_and_keeps_the_cursor_on_its_tick() {
+        let mut grid = SequenceGrid::default();
+        assert_eq!(grid.columns(), 16);
+        assert_eq!(grid.steps(), 64);
+        grid.cursor_step = 5;
+        let tick = grid.cursor_tick();
+        grid.resolution = GridResolution::at(32, false);
+        grid.cursor_step = tick / grid.resolution.step_ticks();
+        assert_eq!(grid.columns(), 32);
+        assert_eq!(grid.steps(), 128, "the pattern gained or lost bars");
+        assert_eq!(grid.cursor_tick(), tick, "the cursor left its moment");
+        assert_eq!(grid.cursor_step, 10);
+        // Down is still one bar.
+        grid.move_by(grid.motion_steps(Motion::Down));
+        assert_eq!(grid.cursor_tick(), tick + TICKS_PER_BAR);
+        // And the end still wraps to the start.
+        grid.cursor_step = 127;
+        grid.move_by(1);
+        assert_eq!(grid.cursor_step, 0);
+    }
+
+    /// Narrowing the grid zooms in by the same factor, so the cells under
+    /// the hand keep their width and the window shows less of the bar;
+    /// widening zooms back out. The window always contains the cursor.
+    #[test]
+    fn resolution_and_zoom_are_yoked_and_the_window_follows_the_cursor() {
+        let mut grid = SequenceGrid::default();
+        grid.cursor_step = 20; // bar 2, column 4
+        grid.follow_cursor();
+        assert_eq!((grid.zoom, grid.visible(), grid.view_start), (1, 16, 0));
+
+        // The same change `update_view` makes on ^1, without the context.
+        let tick = grid.cursor_tick();
+        let before = grid.columns();
+        grid.resolution = GridResolution::at(32, false);
+        grid.zoom = (grid.zoom * grid.columns() / before).clamp(1, MAX_ZOOM);
+        grid.cursor_step = tick / grid.resolution.step_ticks();
+        grid.follow_cursor();
+        assert_eq!(grid.zoom, 2, "narrowing did not zoom in");
+        assert_eq!(grid.visible(), 16, "the cells changed width");
+        assert_eq!(grid.cursor_step % grid.columns(), 8);
+        assert_eq!(
+            grid.view_start, 0,
+            "the window moved with the cursor still in view"
+        );
+
+        // Walking past the window's right edge slides it by exactly one.
+        grid.cursor_step += 8; // column 16, just outside 0..16
+        grid.follow_cursor();
+        assert_eq!(grid.view_start, 1);
+        // And the window never runs past the bar.
+        grid.cursor_step = grid.columns() - 1;
+        grid.follow_cursor();
+        assert_eq!(grid.view_start, grid.columns() - grid.visible());
+        // Zooming out to one shows the whole bar again from its start.
+        grid.zoom = 1;
+        grid.follow_cursor();
+        assert_eq!((grid.visible(), grid.view_start), (32, 0));
+    }
+
+    #[test]
+    fn the_ruler_labels_the_finest_unit_that_has_room() {
+        // Sixteenth cells at 46px: beats and sixteenths have room, finer
+        // units do not exist in the grid.
+        assert_eq!(ruler_unit(12, 46.0), Some(12));
+        assert_eq!(ruler_label(0, Some(12)).as_deref(), Some("1"));
+        assert_eq!(ruler_label(12, Some(12)).as_deref(), Some("1.2"));
+        assert_eq!(ruler_label(48, Some(12)).as_deref(), Some("2"));
+        assert_eq!(ruler_label(6, Some(12)), None, "an off-unit tick spoke");
+        // Thirty-second cells at 92px (zoomed): the sub-sixteenth speaks.
+        assert_eq!(ruler_unit(6, 92.0), Some(6));
+        assert_eq!(ruler_label(6, Some(6)).as_deref(), Some("1.1.2"));
+        // Thirty-second cells at 12px: only every beat has room.
+        assert_eq!(ruler_unit(6, 12.0), Some(48));
+        assert_eq!(ruler_label(12, Some(48)), None);
+        // Nothing has room: the ruler keeps its marks and says nothing.
+        assert_eq!(ruler_unit(12, 4.0), None);
+        assert_eq!(ruler_label(0, None), None);
+        assert_eq!(zoom_sign(1), "");
+        assert_eq!(zoom_sign(4), " ×4");
+    }
+
+    /// A note placed on a finer grid belongs to the coarse cell that
+    /// spans it: the cell shows it, and ACT gates it instead of adding a
+    /// second note beside it.
+    #[test]
+    fn a_coarse_cell_owns_the_finer_notes_within_it() {
+        let notes = [NoteView::from_midi(60, 6, 6, 100, 1.0, true)];
+        let clip = one_note_clip(&notes);
+        assert_eq!(primary_at(clip, 0, 12).map(|n| n.start_ticks), Some(6));
+        assert_eq!(
+            primary_at(clip, 0, 6),
+            None,
+            "a fine cell claimed a later note"
+        );
+        assert_eq!(starts_in(Some(clip), 0, 12), vec![6]);
+        let mut grid = SequenceGrid::default();
+        let mut intents = Vec::new();
+        grid.toggle(Some(clip), &mut intents);
+        assert!(
+            matches!(intents.as_slice(), [Intent::Toggle { tick: 6, .. }]),
+            "ACT on the cell did not address the note's own tick: {intents:?}"
+        );
+        // Delete on the coarse cell clears exactly what is there.
+        let intents = utter_on(
+            &mut grid,
+            &mut Registers::default(),
+            Some(clip),
+            Some(Verb::Delete),
+            None,
+            1,
+        );
+        assert_eq!(intents, vec![Intent::Clear { tick: 6 }]);
+    }
+
+    #[test]
+    fn the_condition_sign_thins_with_the_chance() {
+        assert_eq!(condition_sign(0.75), '▓');
+        assert_eq!(condition_sign(0.5), '▒');
+        assert_eq!(condition_sign(0.25), '░');
+        assert_eq!(condition_sign(0.1), '░');
+    }
+
+    #[test]
+    fn duration_continues_across_the_visual_row_wrap() {
+        let notes = [NoteView::from_midi(60, 15 * 12, 24, 100, 1.0, true)];
+        let clip = ClipView {
+            id: 1,
+            name: "test",
+            length_ticks: 64 * 12,
+            notes: &notes,
+            ghosts: &[],
+        };
+        assert_eq!(continuation_fraction(clip, 16 * 12, 12), 1.0);
+    }
+
+    fn utter(
+        grid: &mut SequenceGrid,
+        verb: Option<Verb>,
+        motion: Option<Motion>,
+        count: usize,
+    ) -> Vec<Intent> {
+        let mut registers = Registers::default();
+        utter_on(grid, &mut registers, None, verb, motion, count)
+    }
+
+    fn utter_on(
+        grid: &mut SequenceGrid,
+        registers: &mut Registers,
+        clip: Option<ClipView<'_>>,
+        verb: Option<Verb>,
+        motion: Option<Motion>,
+        count: usize,
+    ) -> Vec<Intent> {
+        let mut intents = Vec::new();
+        grid.refusal = None;
+        grid.speak(
+            Utterance {
+                count,
+                verb,
+                motion,
+                held: false,
+            },
+            registers,
+            clip,
+            &mut intents,
+        );
+        intents
+    }
+
+    fn one_note_clip(notes: &[NoteView]) -> ClipView<'_> {
+        ClipView {
+            id: 1,
+            name: "test",
+            length_ticks: 64 * 12,
+            notes,
+            ghosts: &[],
+        }
+    }
+
+    fn utter_held(
+        grid: &mut SequenceGrid,
+        clip: Option<ClipView<'_>>,
+        motion: Motion,
+        count: usize,
+    ) -> Vec<Intent> {
+        let mut registers = Registers::default();
+        let mut intents = Vec::new();
+        grid.refusal = None;
+        grid.speak(
+            Utterance {
+                count,
+                verb: None,
+                motion: Some(motion),
+                held: true,
+            },
+            &mut registers,
+            clip,
+            &mut intents,
+        );
+        intents
+    }
+
+    /// Hold-as-preposition: held arrows edit the trig and never travel;
+    /// a hold over nothing, or in a direction the trig cannot answer,
+    /// refuses out loud.
+    #[test]
+    fn held_arrows_edit_velocity_and_never_travel() {
+        let mut grid = SequenceGrid::default();
+        let step = grid.resolution.step_ticks();
+        let notes = [NoteView::from_midi(60, 0, step, 100, 1.0, true)];
+        let clip = one_note_clip(&notes);
+
+        let intents = utter_held(&mut grid, Some(clip), Motion::Up, 8);
+        assert_eq!(intents, vec![Intent::AdjustVelocity { tick: 0, delta: 8 }]);
+        assert_eq!(grid.cursor_step, 0, "a held motion never travels");
+
+        let intents = utter_held(&mut grid, Some(clip), Motion::Down, 1);
+        assert_eq!(intents, vec![Intent::AdjustVelocity { tick: 0, delta: -1 }]);
+
+        let intents = utter_held(&mut grid, Some(clip), Motion::Left, 1);
+        assert!(intents.is_empty());
+        assert_eq!(grid.refusal.as_deref(), Some("HOLD: UP OR DOWN"));
+
+        let intents = utter_held(&mut grid, None, Motion::Up, 1);
+        assert!(intents.is_empty());
+        assert_eq!(grid.refusal.as_deref(), Some("HOLD: NOTHING HERE"));
+    }
+
+    #[test]
+    fn yank_then_put_lands_the_whole_trig_elsewhere() {
+        let mut grid = SequenceGrid::default();
+        let mut registers = Registers::default();
+        let step = grid.resolution.step_ticks();
+        let notes = [NoteView::from_midi(60, 0, step, 100, 0.75, true)];
+        let clip = one_note_clip(&notes);
+
+        let intents = utter_on(
+            &mut grid,
+            &mut registers,
+            Some(clip),
+            Some(Verb::Yank),
+            None,
+            1,
+        );
+        assert!(intents.is_empty());
+        assert_eq!(grid.refusal.as_deref(), Some("YANKED A TRIG"));
+
+        grid.cursor_step = 4;
+        let intents = utter_on(
+            &mut grid,
+            &mut registers,
+            Some(clip),
+            Some(Verb::Put),
+            None,
+            1,
+        );
+        assert_eq!(
+            intents,
+            vec![
+                Intent::Clear { tick: 4 * step },
+                Intent::AddNote {
+                    tick: 4 * step,
+                    pitch: Pitch::from_midi(60),
+                    length_ticks: step,
+                    velocity: 100,
+                    probability: 0.75,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn yanking_an_empty_step_is_refused_and_put_says_so() {
+        let mut grid = SequenceGrid::default();
+        let mut registers = Registers::default();
+        let intents = utter_on(&mut grid, &mut registers, None, Some(Verb::Yank), None, 1);
+        assert!(intents.is_empty());
+        assert_eq!(grid.refusal.as_deref(), Some("YANK: NOTHING HERE"));
+
+        let intents = utter_on(&mut grid, &mut registers, None, Some(Verb::Put), None, 1);
+        assert!(intents.is_empty());
+        assert_eq!(grid.refusal.as_deref(), Some("PUT: NOTHING YANKED"));
+    }
+
+    #[test]
+    fn bare_condition_walks_the_ladder_and_counted_condition_names_a_percentage() {
+        let mut grid = SequenceGrid::default();
+        let mut registers = Registers::default();
+        let step = grid.resolution.step_ticks();
+        let notes = [NoteView::from_midi(60, 0, step, 100, 1.0, true)];
+        let clip = one_note_clip(&notes);
+
+        let intents = utter_on(
+            &mut grid,
+            &mut registers,
+            Some(clip),
+            Some(Verb::Condition),
+            None,
+            1,
+        );
+        assert_eq!(
+            intents,
+            vec![Intent::SetProbability {
+                tick: 0,
+                probability: 0.75,
+            }]
+        );
+
+        let intents = utter_on(
+            &mut grid,
+            &mut registers,
+            Some(clip),
+            Some(Verb::Condition),
+            None,
+            50,
+        );
+        assert_eq!(
+            intents,
+            vec![Intent::SetProbability {
+                tick: 0,
+                probability: 0.5,
+            }]
+        );
+
+        let intents = utter_on(
+            &mut grid,
+            &mut registers,
+            None,
+            Some(Verb::Condition),
+            None,
+            1,
+        );
+        assert!(intents.is_empty());
+        assert_eq!(grid.refusal.as_deref(), Some("CONDITION: NOTHING HERE"));
+    }
+
+    #[test]
+    fn the_condition_ladder_is_closed_and_returns_home() {
+        let mut probability = 1.0;
+        for _ in 0..5 {
+            probability = next_probability(probability);
+        }
+        assert_eq!(probability, 1.0, "five steps walk the whole ladder home");
+        assert_eq!(next_probability(0.62), 1.0, "off-ladder values re-enter");
+    }
+
+    #[test]
+    fn duplicate_copies_ahead_and_carries_the_cursor() {
+        let mut grid = SequenceGrid::default();
+        let mut registers = Registers::default();
+        let step = grid.resolution.step_ticks();
+        let notes = [NoteView::from_midi(60, 0, step, 100, 1.0, true)];
+        let clip = one_note_clip(&notes);
+        let intents = utter_on(
+            &mut grid,
+            &mut registers,
+            Some(clip),
+            Some(Verb::Duplicate),
+            None,
+            2,
+        );
+        assert_eq!(
+            intents,
+            vec![
+                Intent::Clear { tick: 2 * step },
+                Intent::AddNote {
+                    tick: 2 * step,
+                    pitch: Pitch::from_midi(60),
+                    length_ticks: step,
+                    velocity: 100,
+                    probability: 1.0,
+                },
+            ]
+        );
+        assert_eq!(grid.cursor_step, 2);
+        assert!(registers.is_empty(), "duplicate is a shorthand, not a yank");
+    }
+
+    /// Velocity reads as value on the rail: neutral throughout, floored
+    /// so the softest trig stays a visible fact, accents reaching white.
+    #[test]
+    fn the_rail_carries_velocity_as_value() {
+        let soft = velocity_ink(1);
+        let mid = velocity_ink(100);
+        let hard = velocity_ink(127);
+        for ink in [soft, mid, hard] {
+            assert!(ink.r() == ink.g() && ink.g() == ink.b());
+        }
+        assert!(soft.r() >= 96, "a rail is a fact before it is a level");
+        assert!(soft.r() < mid.r());
+        assert!(mid.r() < hard.r());
+        assert_eq!(hard.r(), 255, "the accent reaches white");
+    }
+
+    /// The sign class ordering from the settled conditions ruling: certain
+    /// outshines conditional outshines muted, and every voice is neutral.
+    #[test]
+    fn conditional_trigs_are_a_distinct_sign_class() {
+        let certain = trig_ink(true, 1.0);
+        let conditional = trig_ink(true, 0.75);
+        let muted = trig_ink(false, 1.0);
+        for ink in [certain, conditional, muted] {
+            assert!(ink.r() == ink.g() && ink.g() == ink.b());
+        }
+        assert!(conditional.r() < certain.r());
+        assert!(muted.r() < conditional.r());
+    }
+
+    #[test]
+    fn a_counted_motion_travels_that_far() {
+        let mut grid = SequenceGrid::default();
+        utter(&mut grid, None, Some(Motion::Right), 4);
+        assert_eq!(grid.cursor_step, 4);
+    }
+
+    #[test]
+    fn act_speaks_the_trig_toggle() {
+        let mut grid = SequenceGrid::default();
+        let intents = utter(&mut grid, Some(Verb::Act), None, 1);
+        assert!(matches!(
+            intents.as_slice(),
+            [Intent::Toggle { tick: 0, .. }]
+        ));
+    }
+
+    #[test]
+    fn nudge_carries_the_cursor_with_the_trig() {
+        let mut grid = SequenceGrid::default();
+        grid.cursor_step = 8;
+        let step = grid.resolution.step_ticks();
+        let intents = utter(&mut grid, Some(Verb::Nudge), Some(Motion::Right), 2);
+        assert_eq!(
+            intents,
+            vec![Intent::Nudge {
+                tick: 8 * step,
+                delta_ticks: 2 * step as isize,
+            }]
+        );
+        assert_eq!(grid.cursor_step, 10);
+    }
+
+    #[test]
+    fn an_unsupported_verb_is_refused_out_loud() {
+        let mut grid = SequenceGrid::default();
+        let intents = utter(&mut grid, Some(Verb::Rename), None, 1);
+        assert!(intents.is_empty());
+        assert_eq!(grid.refusal.as_deref(), Some("RENAME: NOT HERE"));
+    }
+
+    #[test]
+    fn resize_refuses_a_vertical_motion() {
+        let mut grid = SequenceGrid::default();
+        let intents = utter(&mut grid, Some(Verb::Resize), Some(Motion::Up), 1);
+        assert!(intents.is_empty());
+        assert_eq!(grid.refusal.as_deref(), Some("RESIZE: LEFT OR RIGHT"));
+    }
+
+    #[test]
+    fn sixty_four_sixteenths_are_four_bars() {
+        let grid = SequenceGrid::default();
+        assert_eq!(
+            PATTERN_STEPS * grid.resolution.step_ticks(),
+            TICKS_PER_BAR * 4
+        );
+    }
+}

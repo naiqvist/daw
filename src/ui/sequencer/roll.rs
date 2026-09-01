@@ -13,15 +13,15 @@
 
 use crate::pitch::Pitch;
 use crate::sequencing::PATTERN_STEPS;
-use crate::ui::redesign::OUTLINE;
-use crate::ui::redesign::grammar::{Motion, Utterance, Voice};
-use crate::ui::redesign::registers::Payload;
-use crate::ui::redesign::sequence::{ClipView, Intent, NoteView};
-use crate::ui::redesign::sequence_grid::{
+use crate::ui::sequencer::INK;
+use crate::ui::sequencer::grammar::{Motion, Utterance, Voice};
+use crate::ui::sequencer::registers::Payload;
+use crate::ui::sequencer::sequence::{ClipView, Intent, NoteView};
+use crate::ui::sequencer::sequence_grid::{
     TrigSelection, beat_fill, draw_cursor, next_probability, note_name, trig_at, velocity_ink,
 };
-use crate::ui::redesign::verbs::Verb;
-use crate::ui::tokens::{font, space};
+use crate::ui::sequencer::verbs::Verb;
+use crate::ui::tokens::{font, space, stroke};
 use eframe::egui;
 
 /// The pattern's canonical step: a sixteenth.
@@ -32,9 +32,12 @@ const ROW_H: f32 = 13.0;
 const DEFAULT_MIDI: u8 = 60;
 const DEFAULT_VELOCITY: u8 = 100;
 
-const LANE_DARK: egui::Color32 = egui::Color32::from_gray(4);
+const LANE_LIGHT: egui::Color32 = egui::Color32::from_gray(10);
+const LANE_DARK: egui::Color32 = egui::Color32::from_gray(5);
+const EDGE: egui::Color32 = egui::Color32::from_gray(48);
+const LABEL_INK: egui::Color32 = egui::Color32::from_gray(145);
 const GHOST: egui::Color32 = egui::Color32::from_gray(88);
-const MUTED: egui::Color32 = egui::Color32::from_gray(112);
+const MUTED: egui::Color32 = egui::Color32::from_gray(104);
 
 pub(crate) struct RollPanel {
     cursor_step: usize,
@@ -85,6 +88,15 @@ impl RollPanel {
             available.right_bottom(),
         );
         let step_w = lanes.width() / PATTERN_STEPS as f32;
+        painter.rect_filled(lanes, 0.0, LANE_LIGHT);
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(available.left(), lanes.top()),
+                egui::pos2(lanes.left(), lanes.bottom()),
+            ),
+            0.0,
+            LANE_DARK,
+        );
 
         for row in 0..rows {
             let Some(midi) = self.top_midi.checked_sub(row as u8) else {
@@ -99,22 +111,35 @@ impl RollPanel {
             if is_black_key(midi) {
                 painter.rect_filled(lane, 0.0, LANE_DARK);
             }
-            for beat in 0..(PATTERN_STEPS / 4) {
-                let x = lanes.left() + (beat * 4) as f32 * step_w;
-                painter.line_segment(
-                    [egui::pos2(x, lane.top()), egui::pos2(x, lane.bottom())],
-                    egui::Stroke::new(1.0, beat_fill((beat * 4) * STEP_TICKS)),
-                );
-            }
+            painter.line_segment(
+                [lane.left_bottom(), lane.right_bottom()],
+                egui::Stroke::new(stroke::HAIR, egui::Color32::from_gray(18)),
+            );
             if midi.is_multiple_of(12) {
                 painter.text(
                     egui::pos2(available.left() + LABEL_W - space::SM, lane.center().y),
                     egui::Align2::RIGHT_CENTER,
                     note_name(midi),
                     egui::FontId::new(font::MICRO_LABEL, egui::FontFamily::Monospace),
-                    MUTED,
+                    LABEL_INK,
                 );
             }
+        }
+
+        // The time lattice sits over both white- and black-key lanes so
+        // rhythm stays continuous across the keyboard geography.
+        for step in 0..=PATTERN_STEPS {
+            let tick = step * STEP_TICKS;
+            let x = lanes.left() + step as f32 * step_w;
+            let width = if step.is_multiple_of(16) {
+                stroke::BOLD
+            } else {
+                stroke::HAIR
+            };
+            painter.line_segment(
+                [egui::pos2(x, lanes.top()), egui::pos2(x, lanes.bottom())],
+                egui::Stroke::new(width, beat_fill(tick)),
+            );
         }
 
         if let Some(clip) = clip {
@@ -177,7 +202,12 @@ impl RollPanel {
         } else {
             velocity_ink(note.velocity)
         };
+        painter.rect_filled(rect.expand(1.0), 0.0, egui::Color32::from_gray(18));
         painter.rect_filled(rect, 0.0, ink);
+        painter.line_segment(
+            [rect.left_top(), rect.left_bottom()],
+            egui::Stroke::new(stroke::BOLD, INK),
+        );
         if note.approx {
             painter.text(
                 rect.left_center() - egui::vec2(space::XS, 0.0),
@@ -197,15 +227,28 @@ impl RollPanel {
         overlay: Option<&str>,
     ) {
         let line = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), STATUS_HEIGHT));
+        painter.rect_filled(line, 0.0, egui::Color32::from_gray(10));
+        painter.line_segment(
+            [line.left_bottom(), line.right_bottom()],
+            egui::Stroke::new(stroke::HAIR, EDGE),
+        );
+        painter.rect_filled(
+            egui::Rect::from_min_size(
+                line.left_top() + egui::vec2(space::SM, space::XS),
+                egui::vec2(stroke::MARK, STATUS_HEIGHT - space::SM),
+            ),
+            0.0,
+            INK,
+        );
         painter.text(
-            line.left_center() + egui::vec2(space::SM, 0.0),
+            line.left_center() + egui::vec2(space::LG, 0.0),
             egui::Align2::LEFT_CENTER,
             match clip {
                 Some(clip) => format!("ROLL  /  {}  /  CTRL+4 GRID", clip.name),
                 None => "ROLL  /  SELECT MIDI CLIP".to_owned(),
             },
             egui::FontId::new(font::BODY, egui::FontFamily::Monospace),
-            OUTLINE,
+            LABEL_INK,
         );
         if let Some(overlay) = overlay {
             painter.text(
@@ -213,7 +256,7 @@ impl RollPanel {
                 egui::Align2::RIGHT_CENTER,
                 overlay,
                 egui::FontId::new(font::BODY, egui::FontFamily::Monospace),
-                OUTLINE,
+                INK,
             );
         }
     }
@@ -292,7 +335,7 @@ impl RollPanel {
         });
         match (utterance.verb, utterance.motion) {
             (None, Some(motion @ (Motion::Up | Motion::Down))) if utterance.held => {
-                if trig_at(clip, tick).is_some() {
+                if trig_at(clip, tick, STEP_TICKS).is_some() {
                     intents.push(Intent::AdjustVelocity {
                         tick,
                         delta: count * if motion == Motion::Up { 1 } else { -1 },
@@ -358,7 +401,7 @@ impl RollPanel {
             (Some(Verb::Resize), Some(_)) => {
                 self.refusal = Some("RESIZE: LEFT OR RIGHT".to_owned());
             }
-            (Some(Verb::Yank), _) => match trig_at(clip, tick) {
+            (Some(Verb::Yank), _) => match trig_at(clip, tick, STEP_TICKS) {
                 Some(notes) => {
                     voice.registers.yank(Payload::Trig(notes));
                     self.refusal = Some("YANKED A TRIG".to_owned());
@@ -380,7 +423,7 @@ impl RollPanel {
                 }
                 Err(refusal) => self.refusal = Some(refusal),
             },
-            (Some(Verb::Condition), _) => match trig_at(clip, tick) {
+            (Some(Verb::Condition), _) => match trig_at(clip, tick, STEP_TICKS) {
                 Some(_) => {
                     let current = clip
                         .and_then(|clip| {
@@ -441,7 +484,7 @@ fn is_black_key(midi: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::redesign::registers::Registers;
+    use crate::ui::sequencer::registers::Registers;
 
     fn utter(
         roll: &mut RollPanel,
@@ -451,7 +494,7 @@ mod tests {
         count: usize,
     ) -> Vec<Intent> {
         let mut registers = Registers::default();
-        let mut sentence = crate::ui::redesign::grammar::Sentence::default();
+        let mut sentence = crate::ui::sequencer::grammar::Sentence::default();
         let mut voice = Voice {
             sentence: &mut sentence,
             registers: &mut registers,

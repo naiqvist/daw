@@ -1,10 +1,18 @@
-//! The redesign's closed sign vocabulary.
+//! The closed sign vocabulary.
 //!
 //! One sign, one meaning, everywhere — a glyph used for PLAY in the
 //! transport may never mean something else in another panel, and no second
-//! glyph may also mean play. Panels take their glyphs from these constants
-//! instead of writing string literals, so a new sign has to enter through
-//! this file and face the uniqueness tests below.
+//! glyph may also mean play. Surfaces take their glyphs from these
+//! constants instead of writing string literals, so a new sign has to
+//! enter through this file and face the uniqueness tests below.
+//!
+//! It sits beside the colour alphabet rather than inside the frame that
+//! first needed it. A vocabulary owned by one frame is one a second frame
+//! must either borrow from the surface it is replacing, or mint again and
+//! let drift; two glyphs meaning "play" is the same defect as two answers
+//! to "what does Delete do here", and `crate::intent` is the worked
+//! example of the move. The bijection tests below are the enforcement, and
+//! they now cover every frame at once.
 
 /// Return the playhead to the start.
 pub(crate) const RETURN: &str = "|<";

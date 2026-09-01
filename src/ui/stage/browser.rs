@@ -12,9 +12,10 @@
 //! for the audition loop — hear one, no, hear the next — which is the one
 //! browsing job that typing cannot do.
 
-use super::grid::{FocusColumn, Step};
-use crate::devices::{DEVICES, DeviceKind};
+use super::grid::Step;
+use crate::devices::{DEVICES, DeviceKind, Family, Section};
 use crate::library::AssetRecord;
+use crate::ui::glyph::Glyph;
 use std::path::PathBuf;
 
 /// The glyph vocabulary, all of it VERIFIED present in bundled Terminus.
@@ -33,6 +34,19 @@ use std::path::PathBuf;
 /// terminal interface is drawn from, settled and checked once, so the
 /// drawing code chooses from a verified set instead of reaching for
 /// whatever character looks right and discovering the gap on screen.
+///
+/// # Rules are no longer typed
+///
+/// The ruling and corner characters below are kept and checked, but the
+/// browser pane's frame is DRAWN — see `Stage::draw_browser`. A border
+/// made of characters is one glyph per cell: it seams at every cell
+/// boundary and rides a baseline that is not the cell's centre, and at
+/// this size the result reads as hatching rather than as a line. A
+/// segment is one stroke, pixel-aligned, and identical on every machine.
+/// `ui::glyph` reached the same conclusion for the family marks.
+///
+/// What is still typed is what a character is genuinely better at: marks
+/// that occupy a cell in a run of text, like the caret and the shading.
 #[allow(dead_code, reason = "the vocabulary is settled before its renderer")]
 pub mod glyph {
     /// Rules. Light for structure inside a pane, double for its border —
@@ -56,11 +70,14 @@ pub mod glyph {
     pub const SHADE_MID: char = '▒';
     pub const SHADE_HEAVY: char = '▓';
 
-    /// Blocks. `CARET` is the typing cursor and `MARK` the row cursor —
-    /// both filled, because the triangles are not in the font.
+    /// Blocks. `MARK` is the row cursor — filled, because the triangles
+    /// are not in the font.
     pub const BLOCK: char = '█';
-    pub const CARET: char = '▌';
     pub const MARK: char = '▮';
+    /// The typing prompt: a shell's `>`, leading whatever has been typed.
+    /// A prompt rather than a caret, because the field is append-only —
+    /// there is no insertion point to mark, only a place to type.
+    pub const PROMPT: char = '>';
     pub const DOT: char = '■';
 
     /// Present, and the honest way to point.
@@ -82,9 +99,9 @@ impl Shelf {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Devices => "DEVICES",
-            Self::Samples => "SAMPLES",
-            Self::Projects => "PROJECTS",
+            Self::Devices => "Devices",
+            Self::Samples => "Samples",
+            Self::Projects => "Projects",
         }
     }
 }
@@ -92,8 +109,12 @@ impl Shelf {
 /// What a row actually is, once you press Enter on it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EntryKind {
-    /// Descend into a shelf.
+    /// A top-level shelf. A branch whose children may arrive later.
     Shelf(Shelf),
+    /// A heading — a section or a family. It holds rows and does nothing
+    /// else, so opening it is the only thing pressing it could honestly
+    /// mean.
+    Group,
     /// An instrument or effect, ready to head or join a chain.
     Device(DeviceKind),
     /// A file on disk that can be auditioned.
@@ -102,15 +123,86 @@ pub enum EntryKind {
     Project(PathBuf),
 }
 
-/// One row of the library.
+/// One row of the library, and whatever hangs beneath it.
+///
+/// A tree rather than a stack of lists. The library's SHAPE is
+/// information — that a reverb is filed under DELAY & REVERB is worth
+/// knowing while looking at it — and a drill-down hides every heading
+/// except the one being stood in, so the reader has to remember the
+/// structure instead of reading it.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Entry {
-    /// What it is called, and what typing is matched against.
+pub struct Node {
     pub label: String,
     pub kind: EntryKind,
+    pub children: Vec<Node>,
+    /// Whether the children are drawn. Everything starts closed: the top
+    /// of the library has to fit in a glance, or the tree has bought
+    /// structure at the cost of the thing structure is for.
+    pub expanded: bool,
+    /// A heading's own mark: a miniature of what the family DOES.
+    ///
+    /// An icon, in the semiotic sense — a sign that resembles its
+    /// subject — where every other row here is a symbol, a word you have
+    /// to have learned. In a list scanned a hundred times a day, a shape
+    /// is recognised before a word is read, and the word underneath
+    /// becomes confirmation rather than information.
+    ///
+    /// Leaves carry none: the heading above already said it, and a mark
+    /// repeated on every row beneath it would be ornament by the
+    /// subtraction test.
+    pub mark: Option<Glyph>,
 }
 
-/// Whether the rows under the current shelf are complete.
+impl Node {
+    pub fn leaf(label: impl Into<String>, kind: EntryKind) -> Self {
+        Self {
+            label: label.into(),
+            kind,
+            children: Vec::new(),
+            expanded: false,
+            mark: None,
+        }
+    }
+
+    pub fn branch(label: impl Into<String>, kind: EntryKind, children: Vec<Node>) -> Self {
+        Self {
+            label: label.into(),
+            kind,
+            children,
+            expanded: false,
+            mark: None,
+        }
+    }
+
+    /// Give a heading the mark of what it holds.
+    pub fn marked(mut self, mark: Glyph) -> Self {
+        self.mark = Some(mark);
+        self
+    }
+
+    /// How many LEAVES hang beneath this row, at any depth.
+    ///
+    /// Leaves rather than immediate children because the reader's
+    /// question is how much is in there, not how many doors are between
+    /// them and it — and a heading holding three headings holding one
+    /// device each is a small place wearing a large number.
+    pub fn leaves(&self) -> usize {
+        if self.children.is_empty() {
+            return usize::from(!self.is_branch());
+        }
+        self.children.iter().map(Node::leaves).sum()
+    }
+
+    /// Whether this row opens. A shelf opens even while empty: its
+    /// children are scanned rather than known, and a shelf that looked
+    /// like a leaf until the scan landed would change shape under the
+    /// cursor.
+    pub fn is_branch(&self) -> bool {
+        !self.children.is_empty() || matches!(self.kind, EntryKind::Shelf(_))
+    }
+}
+
+/// Whether the rows under a shelf are complete.
 ///
 /// This is display truth, not progress theatre: the scanner either still
 /// owns the answer, has delivered it, or no neutral source exists yet.
@@ -121,32 +213,80 @@ pub(super) enum BrowserStatus {
     Unavailable,
 }
 
-/// Every registered device, with instruments first and effects second.
-/// The registry is the source of truth, so adding a device there makes it
-/// browsable here without growing a second catalog.
-pub(super) fn device_entries() -> Vec<Entry> {
-    [true, false]
+/// The mark a family draws: the picture its own cards already draw,
+/// shrunk to a cell.
+///
+/// Lives here rather than on `Family` so the registry stays a model: what
+/// a device IS belongs in `devices`, what it LOOKS like belongs in a
+/// frame's design system.
+fn family_mark(family: Family) -> Glyph {
+    match family {
+        Family::Synths => Glyph::Saw,
+        Family::Drums => Glyph::Transient,
+        Family::Sampling => Glyph::Sample,
+        Family::Dynamics => Glyph::Dynamics,
+        Family::EqAndFilters => Glyph::Filter,
+        Family::DelayAndReverb => Glyph::Time,
+        Family::Distortion => Glyph::Drive,
+        Family::Modulation => Glyph::Modulation,
+        Family::Spectral => Glyph::Spectral,
+        Family::Utilities => Glyph::Utility,
+    }
+}
+
+/// A section holds families rather than being one, so its mark is the one
+/// with no signal in it.
+fn section_mark(section: Section) -> Glyph {
+    match section {
+        Section::Instruments => Glyph::Instrument,
+        Section::AudioEffects => Glyph::Stack,
+    }
+}
+
+/// The device shelf, as the registry files it.
+///
+/// Built by walking `Section` and `Family` rather than from a list kept
+/// here: the registry is the only catalog, so adding a device there makes
+/// it browsable — and filed correctly — without touching this.
+pub(super) fn device_nodes() -> Vec<Node> {
+    Section::ALL
         .into_iter()
-        .flat_map(|instrument| {
-            DEVICES
-                .iter()
-                .filter(move |spec| spec.instrument == instrument)
-                .map(|spec| Entry {
-                    label: spec.name.to_uppercase(),
-                    kind: EntryKind::Device(spec.kind),
+        .map(|section| {
+            let families = Family::ALL
+                .into_iter()
+                .filter(|family| family.section() == section)
+                .map(|family| {
+                    let devices = DEVICES
+                        .iter()
+                        .filter(|spec| spec.family == family)
+                        .map(|spec| {
+                            // The registry already writes these as names
+                            // a reader would say out loud — "808 hat",
+                            // "poly synth" — so they are shown as written.
+                            // Shouting them was the browser's own
+                            // decoration, not the catalog's.
+                            Node::leaf(spec.name, EntryKind::Device(spec.kind))
+                        })
+                        .collect();
+                    Node::branch(family.label(), EntryKind::Group, devices)
+                        .marked(family_mark(family))
                 })
+                .collect();
+            Node::branch(section.label(), EntryKind::Group, families).marked(section_mark(section))
         })
         .collect()
 }
 
-/// One immutable scanner record becomes one browser row. No filesystem work
+/// One immutable scanner record becomes one row. No filesystem work
 /// happens here; the path was already resolved by the green-zone service.
-pub(super) fn sample_entries(assets: &[AssetRecord]) -> Vec<Entry> {
+pub(super) fn sample_nodes(assets: &[AssetRecord]) -> Vec<Node> {
     assets
         .iter()
-        .map(|asset| Entry {
-            label: asset.relative_path.to_string_lossy().into_owned(),
-            kind: EntryKind::Sample(asset.path.clone()),
+        .map(|asset| {
+            Node::leaf(
+                asset.relative_path.to_string_lossy().into_owned(),
+                EntryKind::Sample(asset.path.clone()),
+            )
         })
         .collect()
 }
@@ -156,91 +296,261 @@ pub(super) fn sample_entries(assets: &[AssetRecord]) -> Vec<Entry> {
 /// There is no frame-independent project catalog today. Keep this empty
 /// until one exists; guessing a directory here would turn a machine-local
 /// convention into an accidental data model.
-pub(super) fn project_entries() -> Vec<Entry> {
+pub(super) fn project_nodes() -> Vec<Node> {
     Vec::new()
 }
 
-impl Entry {
-    pub fn shelf(shelf: Shelf) -> Self {
-        Self {
-            label: shelf.label().to_owned(),
-            kind: EntryKind::Shelf(shelf),
-        }
-    }
+/// Where one visible row sits in the tree.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Row {
+    /// Child indices from the root down. The address the cursor holds,
+    /// so opening or closing a branch above cannot silently re-point it.
+    pub path: Vec<usize>,
+    pub depth: usize,
 }
 
 /// The library, what has been typed, and where the cursor is standing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Browser {
-    entries: Vec<Entry>,
+    roots: Vec<Node>,
     /// What has been typed. Never shown as state text — it is shown
     /// because it is being written, which is a different thing.
     query: String,
-    /// Indices into `entries` that survive the query, in library order.
-    matches: Vec<usize>,
-    cursor: FocusColumn,
-    shelf: Option<Shelf>,
-    status: BrowserStatus,
+    /// Index into the currently visible rows.
+    cursor: usize,
+    /// Per shelf, because they complete independently: a finished device
+    /// list says nothing about whether the sample scan has landed.
+    status: [BrowserStatus; 3],
 }
 
 impl Browser {
-    /// The top of the library: the shelves, and nothing scanned yet.
+    /// The top of the library: three closed shelves, nothing scanned yet.
     pub fn shelves() -> Self {
-        Self::new(Shelf::ALL.into_iter().map(Entry::shelf).collect())
-    }
-
-    pub fn new(entries: Vec<Entry>) -> Self {
-        let mut browser = Self {
-            entries,
+        let roots = Shelf::ALL
+            .into_iter()
+            .map(|shelf| {
+                let children = match shelf {
+                    Shelf::Devices => device_nodes(),
+                    // Filled by the scanner when it lands.
+                    Shelf::Samples => Vec::new(),
+                    // Empty by construction, and the seam says so here
+                    // rather than being an anonymous empty vector.
+                    Shelf::Projects => project_nodes(),
+                };
+                Node::branch(shelf.label(), EntryKind::Shelf(shelf), children)
+            })
+            .collect();
+        Self {
+            roots,
             query: String::new(),
-            matches: Vec::new(),
-            cursor: FocusColumn::new(0),
-            shelf: None,
-            status: BrowserStatus::Ready,
-        };
-        browser.refilter();
-        browser
+            cursor: 0,
+            status: [
+                BrowserStatus::Ready,
+                BrowserStatus::Scanning,
+                BrowserStatus::Unavailable,
+            ],
+        }
     }
 
     pub fn query(&self) -> &str {
         &self.query
     }
 
-    pub(super) fn shelf(&self) -> Option<Shelf> {
-        self.shelf
+    pub(super) fn status_of(&self, shelf: Shelf) -> BrowserStatus {
+        self.status[shelf as usize]
     }
 
-    pub(super) fn status(&self) -> BrowserStatus {
-        self.status
+    /// Replace one shelf's children when a scan lands. What was typed
+    /// stays the filter on the new truth, and the shelf keeps whether it
+    /// was open — a scan is not a navigation event.
+    pub(super) fn set_children(
+        &mut self,
+        shelf: Shelf,
+        children: Vec<Node>,
+        status: BrowserStatus,
+    ) {
+        self.status[shelf as usize] = status;
+        if let Some(node) = self
+            .roots
+            .iter_mut()
+            .find(|node| node.kind == EntryKind::Shelf(shelf))
+        {
+            node.children = children;
+        }
+        self.clamp_cursor();
     }
 
-    /// Rows that survive the query, in library order.
-    pub fn matches(&self) -> impl Iterator<Item = &Entry> {
-        self.matches.iter().map(|index| &self.entries[*index])
+    /// Every row the tree currently shows, in reading order.
+    ///
+    /// While a query is live the tree opens itself along every path that
+    /// leads to a match: a filter that left its results hidden inside
+    /// closed branches would be reporting a count the reader cannot
+    /// reach.
+    pub fn rows(&self) -> Vec<Row> {
+        let mut rows = Vec::new();
+        for (index, node) in self.roots.iter().enumerate() {
+            self.collect(node, vec![index], 0, &mut rows);
+        }
+        rows
+    }
+
+    fn collect(&self, node: &Node, path: Vec<usize>, depth: usize, rows: &mut Vec<Row>) {
+        if !self.kept(node) {
+            return;
+        }
+        rows.push(Row {
+            path: path.clone(),
+            depth,
+        });
+        let open = node.expanded || !self.query.is_empty();
+        if !open {
+            return;
+        }
+        for (index, child) in node.children.iter().enumerate() {
+            let mut child_path = path.clone();
+            child_path.push(index);
+            self.collect(child, child_path, depth + 1, rows);
+        }
+    }
+
+    /// A row survives if it matches, or if anything beneath it does — so
+    /// the headings that lead to a match come with it.
+    fn kept(&self, node: &Node) -> bool {
+        matches_query(&node.label, &self.query)
+            || node.children.iter().any(|child| self.kept(child))
+    }
+
+    pub fn node_at(&self, path: &[usize]) -> Option<&Node> {
+        let mut nodes = &self.roots;
+        let mut found = None;
+        for index in path {
+            let node = nodes.get(*index)?;
+            nodes = &node.children;
+            found = Some(node);
+        }
+        found
+    }
+
+    fn node_at_mut(&mut self, path: &[usize]) -> Option<&mut Node> {
+        let (first, rest) = path.split_first()?;
+        let mut node = self.roots.get_mut(*first)?;
+        for index in rest {
+            node = node.children.get_mut(*index)?;
+        }
+        Some(node)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.matches.is_empty()
+        self.rows().is_empty()
     }
 
     pub fn cursor(&self) -> Option<usize> {
-        self.cursor.cursor()
+        (!self.is_empty()).then_some(self.cursor)
     }
 
-    /// The row the cursor is on, if the query left it anything to stand on.
-    pub fn selected(&self) -> Option<&Entry> {
-        let index = self.cursor.cursor()?;
-        self.matches.get(index).map(|entry| &self.entries[*entry])
+    /// The row the cursor is on, if the query left it anything to stand
+    /// on.
+    pub fn selected(&self) -> Option<&Node> {
+        let rows = self.rows();
+        let row = rows.get(self.cursor)?;
+        self.node_at(&row.path)
     }
 
+    fn selected_path(&self) -> Option<Vec<usize>> {
+        self.rows().get(self.cursor).map(|row| row.path.clone())
+    }
+
+    /// Move, open, or climb. `false` means the tree had nowhere to go and
+    /// the caller should SHOW that refusal rather than swallow it.
     pub fn step(&mut self, step: Step) -> bool {
-        self.cursor.step(step)
+        let rows = self.rows();
+        if rows.is_empty() {
+            return false;
+        }
+        match step {
+            Step::Up => {
+                if self.cursor == 0 {
+                    return false;
+                }
+                self.cursor -= 1;
+                true
+            }
+            Step::Down => {
+                if self.cursor + 1 >= rows.len() {
+                    return false;
+                }
+                self.cursor += 1;
+                true
+            }
+            // Right OPENS, then walks in. Two presses to reach a child
+            // rather than one, because opening and moving are different
+            // events and a reader who only wanted to see inside should
+            // not have lost their place doing it.
+            Step::Right => {
+                let Some(path) = self.selected_path() else {
+                    return false;
+                };
+                let Some(node) = self.node_at_mut(&path) else {
+                    return false;
+                };
+                if !node.is_branch() {
+                    return false;
+                }
+                if !node.expanded {
+                    node.expanded = true;
+                    return true;
+                }
+                if node.children.is_empty() {
+                    return false;
+                }
+                self.cursor += 1;
+                true
+            }
+            // Left CLOSES, then climbs — the mirror of Right.
+            Step::Left => {
+                let Some(path) = self.selected_path() else {
+                    return false;
+                };
+                let Some(node) = self.node_at_mut(&path) else {
+                    return false;
+                };
+                if node.expanded && node.is_branch() {
+                    node.expanded = false;
+                    return true;
+                }
+                if path.len() < 2 {
+                    return false;
+                }
+                let parent = &path[..path.len() - 1];
+                let Some(index) = rows.iter().position(|row| row.path == parent) else {
+                    return false;
+                };
+                self.cursor = index;
+                true
+            }
+        }
+    }
+
+    /// Open or close the row the cursor is on. `false` means it is a leaf
+    /// and there is nothing to open.
+    pub fn toggle(&mut self) -> bool {
+        let Some(path) = self.selected_path() else {
+            return false;
+        };
+        let Some(node) = self.node_at_mut(&path) else {
+            return false;
+        };
+        if !node.is_branch() {
+            return false;
+        }
+        node.expanded = !node.expanded;
+        true
     }
 
     /// Extend the query by one character.
     pub fn type_char(&mut self, ch: char) {
         self.query.push(ch);
-        self.refilter();
+        self.cursor = 0;
     }
 
     /// Retract the last character. `false` means there was nothing to
@@ -248,59 +558,27 @@ impl Browser {
     pub fn backspace(&mut self) -> bool {
         let popped = self.query.pop().is_some();
         if popped {
-            self.refilter();
+            self.cursor = 0;
         }
         popped
     }
 
-    /// Replace the library, keeping what has been typed. This is how a
-    /// scan lands, and how descending into a shelf works.
-    pub fn load(&mut self, entries: Vec<Entry>) {
-        self.entries = entries;
-        self.refilter();
-    }
-
-    /// Descend one layer. A shelf is a new list, so its query begins empty.
-    pub(super) fn enter_shelf(&mut self, shelf: Shelf, entries: Vec<Entry>, status: BrowserStatus) {
-        self.shelf = Some(shelf);
-        self.status = status;
-        self.query.clear();
-        self.load(entries);
-    }
-
-    /// Replace a shelf after an asynchronous scan lands without inventing a
-    /// navigation event. What was typed remains the filter on the new truth.
-    pub(super) fn refresh_shelf(&mut self, entries: Vec<Entry>, status: BrowserStatus) {
-        self.status = status;
-        self.load(entries);
-    }
-
-    /// Climb from a shelf to the fixed top level. `false` means the browser
-    /// is already at its root and Escape should dismiss it instead.
-    pub(super) fn ascend(&mut self) -> bool {
-        if self.shelf.is_none() {
-            return false;
-        }
-        *self = Self::shelves();
-        true
-    }
-
-    /// Recompute the surviving rows and put the cursor back on the first
-    /// of them.
+    /// How many leaves the query has left standing.
     ///
-    /// The cursor RESETS rather than trying to follow its old row: the
-    /// list it was standing in no longer exists, so there is nothing
-    /// honest to follow. Typing narrows toward the top, which is where
-    /// the eye already is.
-    fn refilter(&mut self) {
-        self.matches = self
-            .entries
+    /// The yield of what has been typed. A keystroke is worth spending
+    /// only if it removes uncertainty, and this is the only place the
+    /// reader can see whether the last one did.
+    pub fn surviving_leaves(&self) -> usize {
+        self.rows()
             .iter()
-            .enumerate()
-            .filter(|(_, entry)| matches_query(&entry.label, &self.query))
-            .map(|(index, _)| index)
-            .collect();
-        self.cursor = FocusColumn::new(self.matches.len());
+            .filter_map(|row| self.node_at(&row.path))
+            .filter(|node| !node.is_branch())
+            .count()
+    }
+
+    fn clamp_cursor(&mut self) {
+        let rows = self.rows().len();
+        self.cursor = self.cursor.min(rows.saturating_sub(1));
     }
 }
 
@@ -323,38 +601,345 @@ pub fn matches_query(label: &str, query: &str) -> bool {
     wanted.peek().is_none()
 }
 
+/// Which characters of `label` the query actually consumed.
+///
+/// The filter is a SUBSEQUENCE, so why a row survived is not obvious from
+/// looking at it — `hcl` keeping `HANDCLAP` is a claim the reader has to
+/// take on trust unless the match is shown. Returned parallel to the
+/// label's characters.
+///
+/// Matched greedily and leftmost, exactly as [`matches_query`] consumes
+/// them, so the marks can never disagree with the filter that produced
+/// them.
+pub fn match_positions(label: &str, query: &str) -> Vec<bool> {
+    let mut wanted = query.chars().flat_map(char::to_lowercase).peekable();
+    label
+        .chars()
+        .map(|have| {
+            let hit = have
+                .to_lowercase()
+                .next()
+                .is_some_and(|lowered| wanted.peek().is_some_and(|want| *want == lowered));
+            if hit {
+                wanted.next();
+            }
+            hit
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn an_empty_query_keeps_the_whole_library() {
+    fn every_heading_in_the_device_tree_carries_a_mark() {
+        for section in device_nodes() {
+            assert!(
+                section.mark.is_some(),
+                "the section {} has no mark",
+                section.label
+            );
+            for family in &section.children {
+                assert!(
+                    family.mark.is_some(),
+                    "the family {} has no mark",
+                    family.label
+                );
+                for device in &family.children {
+                    assert!(
+                        device.mark.is_none(),
+                        "the leaf {} repeats its family's mark",
+                        device.label
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_two_families_are_given_the_same_mark() {
+        let marks: Vec<_> = Family::ALL.into_iter().map(family_mark).collect();
+        for (index, mark) in marks.iter().enumerate() {
+            for other in &marks[index + 1..] {
+                assert_ne!(
+                    mark, other,
+                    "two families draw the same mark, so one sign means two things"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_section_never_wears_a_familys_mark() {
+        let families: Vec<_> = Family::ALL.into_iter().map(family_mark).collect();
+        for section in Section::ALL {
+            assert!(
+                !families.contains(&section_mark(section)),
+                "the section {} borrowed a family's mark",
+                section.label()
+            );
+        }
+    }
+
+    #[test]
+    fn a_branch_counts_the_leaves_beneath_it_not_the_doors() {
         let browser = Browser::shelves();
-        assert_eq!(browser.matches().count(), Shelf::ALL.len());
-        assert_eq!(browser.cursor(), Some(0));
+        let devices = browser.node_at(&[0]).expect("the devices shelf");
+        assert_eq!(
+            devices.leaves(),
+            DEVICES.len(),
+            "the shelf miscounted what it holds"
+        );
+
+        let instruments = browser.node_at(&[0, 0]).expect("the instruments section");
+        assert_eq!(
+            instruments.leaves(),
+            DEVICES.iter().filter(|spec| spec.instrument).count()
+        );
+    }
+
+    #[test]
+    fn an_empty_shelf_counts_nothing() {
+        let browser = Browser::shelves();
+        let projects = browser.node_at(&[2]).expect("the projects shelf");
+        assert_eq!(projects.leaves(), 0);
+    }
+
+    #[test]
+    fn the_yield_counts_what_the_query_left_standing() {
+        let mut browser = Browser::shelves();
+        assert_eq!(
+            browser.surviving_leaves(),
+            0,
+            "a closed library reported leaves nobody can see"
+        );
+
+        for ch in "reverb".chars() {
+            browser.type_char(ch);
+        }
+        assert!(
+            browser.surviving_leaves() > 0,
+            "the filter kept rows but reported no yield"
+        );
+        assert!(
+            browser.surviving_leaves() < DEVICES.len(),
+            "the filter reported the whole library as surviving"
+        );
+    }
+
+    #[test]
+    fn the_marked_characters_are_the_ones_the_filter_consumed() {
+        let marks = match_positions("handclap", "hcl");
+        assert_eq!(marks.iter().filter(|hit| **hit).count(), 3);
+        // h-a-n-d-c-l-a-p: the h, then the first c, then the l.
+        assert_eq!(marks, [true, false, false, false, true, true, false, false]);
+    }
+
+    #[test]
+    fn nothing_is_marked_when_nothing_was_typed() {
+        assert!(match_positions("reverb", "").iter().all(|hit| !hit));
+    }
+
+    #[test]
+    fn a_row_that_survives_on_its_children_marks_none_of_itself() {
+        // DELAY & REVERB survives the query `reverb` because a child does,
+        // not because it matches — and the marks must not imply otherwise.
+        let marks = match_positions("Delay & Reverb", "zzz");
+        assert!(marks.iter().all(|hit| !hit));
+    }
+
+    /// Walk to a row by label, so a test says what it is standing on
+    /// rather than counting rows that a taxonomy change would renumber.
+    fn walk_to(browser: &mut Browser, labels: &[&str]) {
+        for label in labels {
+            let target = browser
+                .rows()
+                .iter()
+                .position(|row| {
+                    browser
+                        .node_at(&row.path)
+                        .is_some_and(|node| node.label == *label)
+                })
+                .unwrap_or_else(|| panic!("no row labelled {label:?}"));
+            let here = browser.cursor().expect("the tree had nothing to stand on");
+            let step = if target > here { Step::Down } else { Step::Up };
+            for _ in 0..here.abs_diff(target) {
+                assert!(browser.step(step), "ran out of rows reaching {label:?}");
+            }
+            if browser
+                .selected()
+                .is_some_and(|node| node.is_branch() && !node.expanded)
+            {
+                assert!(browser.step(Step::Right), "{label:?} would not open");
+            }
+        }
+    }
+
+    #[test]
+    fn the_library_opens_closed_on_its_three_shelves() {
+        let browser = Browser::shelves();
+        let labels: Vec<_> = browser
+            .rows()
+            .iter()
+            .map(|row| browser.node_at(&row.path).expect("row").label.clone())
+            .collect();
+        assert_eq!(labels, ["Devices", "Samples", "Projects"]);
+    }
+
+    #[test]
+    fn right_opens_a_branch_before_it_walks_into_one() {
+        let mut browser = Browser::shelves();
+        assert!(browser.step(Step::Right), "DEVICES would not open");
+        assert_eq!(
+            browser.cursor(),
+            Some(0),
+            "opening a branch also moved the cursor"
+        );
+        assert_eq!(
+            browser.selected().map(|node| node.label.as_str()),
+            Some("Devices")
+        );
+
+        assert!(
+            browser.step(Step::Right),
+            "the open branch would not be entered"
+        );
+        assert_eq!(
+            browser.selected().map(|node| node.label.as_str()),
+            Some("Instruments")
+        );
+    }
+
+    #[test]
+    fn left_closes_a_branch_before_it_climbs_out_of_one() {
+        let mut browser = Browser::shelves();
+        walk_to(&mut browser, &["Devices", "Instruments", "Synths"]);
+        assert!(browser.step(Step::Left), "SYNTHS would not close");
+        assert_eq!(
+            browser.selected().map(|node| node.label.as_str()),
+            Some("Synths"),
+            "closing a branch also moved the cursor"
+        );
+
+        assert!(browser.step(Step::Left), "the cursor would not climb");
+        assert_eq!(
+            browser.selected().map(|node| node.label.as_str()),
+            Some("Instruments")
+        );
+    }
+
+    #[test]
+    fn the_root_refuses_to_climb_any_further() {
+        let mut browser = Browser::shelves();
+        assert!(
+            !browser.step(Step::Left),
+            "a closed root pretended there was somewhere above it"
+        );
+        assert!(!browser.step(Step::Up), "the first row stepped up");
+    }
+
+    #[test]
+    fn a_leaf_refuses_to_open() {
+        let mut browser = Browser::shelves();
+        walk_to(
+            &mut browser,
+            &["Devices", "Instruments", "Synths", "poly synth"],
+        );
+        assert_eq!(
+            browser.selected().map(|node| node.label.as_str()),
+            Some("poly synth")
+        );
+        assert!(!browser.step(Step::Right), "a device opened like a folder");
+        assert!(!browser.toggle(), "a device toggled like a folder");
+    }
+
+    #[test]
+    fn the_device_tree_is_the_registry_filed_by_its_own_headings() {
+        let mut browser = Browser::shelves();
+        walk_to(&mut browser, &["Devices"]);
+        let sections: Vec<_> = browser
+            .rows()
+            .iter()
+            .filter(|row| row.depth == 1)
+            .map(|row| browser.node_at(&row.path).expect("row").label.clone())
+            .collect();
+        assert_eq!(sections, ["Instruments", "Audio Effects"]);
+
+        walk_to(&mut browser, &["Audio Effects"]);
+        let families: Vec<_> = browser
+            .rows()
+            .iter()
+            .filter(|row| row.depth == 2 && row.path[1] == 1)
+            .map(|row| browser.node_at(&row.path).expect("row").label.clone())
+            .collect();
+        assert_eq!(
+            families,
+            [
+                "Dynamics",
+                "EQ & Filters",
+                "Delay & Reverb",
+                "Distortion",
+                "Modulation",
+                "Spectral",
+                "Utilities"
+            ]
+        );
+    }
+
+    #[test]
+    fn every_registered_device_is_reachable_in_the_tree() {
+        let nodes = device_nodes();
+        let mut found = 0;
+        for section in &nodes {
+            for family in &section.children {
+                found += family.children.len();
+                assert!(
+                    !family.children.is_empty(),
+                    "the family {} is a heading over nothing",
+                    family.label
+                );
+            }
+        }
+        assert_eq!(found, DEVICES.len(), "a device is missing from the tree");
+    }
+
+    #[test]
+    fn an_empty_query_shows_only_what_is_open() {
+        let browser = Browser::shelves();
+        assert_eq!(browser.rows().len(), Shelf::ALL.len());
+    }
+
+    #[test]
+    fn typing_opens_the_tree_along_every_path_to_a_match() {
+        let mut browser = Browser::shelves();
+        for ch in "reverb".chars() {
+            browser.type_char(ch);
+        }
+        let labels: Vec<_> = browser
+            .rows()
+            .iter()
+            .map(|row| browser.node_at(&row.path).expect("row").label.clone())
+            .collect();
+        assert!(
+            labels.iter().any(|label| label == "reverb"),
+            "a match stayed hidden inside a closed branch: {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|label| label == "Delay & Reverb"),
+            "the heading leading to the match was dropped: {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|label| label == "poly synth"),
+            "the filter kept a row that does not match: {labels:?}"
+        );
     }
 
     #[test]
     fn typing_narrows_by_subsequence_not_by_prefix() {
         assert!(matches_query("HANDCLAP", "hcl"));
-        assert!(matches_query("HANDCLAP", "HANDCLAP"));
-        assert!(!matches_query("HANDCLAP", "hcx"));
-        assert!(
-            !matches_query("HANDCLAP", "pl"),
-            "order is part of the match"
-        );
-    }
-
-    #[test]
-    fn the_cursor_lands_on_the_first_survivor_as_the_query_narrows() {
-        let mut browser = Browser::shelves();
-        browser.type_char('s');
-        assert_eq!(browser.cursor(), Some(0));
-        assert!(
-            browser
-                .matches()
-                .all(|entry| matches_query(&entry.label, "s"))
-        );
+        assert!(matches_query("HANDCLAP", "clap"));
+        assert!(!matches_query("HANDCLAP", "xyz"));
     }
 
     #[test]
@@ -365,119 +950,79 @@ mod tests {
         }
         assert!(browser.is_empty());
         assert_eq!(browser.cursor(), None);
-        assert_eq!(browser.selected(), None);
-        assert!(!browser.step(Step::Down), "an empty list refuses to move");
+        assert!(browser.selected().is_none());
+        assert!(!browser.step(Step::Down), "an empty tree stepped");
     }
 
     #[test]
     fn backspace_widens_again_and_reports_when_there_is_nothing_left() {
         let mut browser = Browser::shelves();
+        // `z` alone survives — HAZE carries one — so the query has to be
+        // two characters to actually empty the tree.
         browser.type_char('z');
-        assert!(browser.is_empty());
+        browser.type_char('q');
+        assert!(browser.is_empty(), "zq matched something");
 
         assert!(browser.backspace());
-        assert_eq!(browser.matches().count(), Shelf::ALL.len());
-        assert!(!browser.backspace(), "an empty query says so");
-    }
+        assert!(!browser.is_empty(), "the tree did not come back");
 
-    #[test]
-    fn selection_follows_the_cursor_through_the_surviving_rows() {
-        let mut browser = Browser::shelves();
-        assert_eq!(
-            browser.selected().map(|e| e.label.as_str()),
-            Some("DEVICES")
-        );
-        assert!(browser.step(Step::Down));
-        assert_eq!(
-            browser.selected().map(|e| e.label.as_str()),
-            Some("SAMPLES")
-        );
-    }
-
-    #[test]
-    fn the_device_shelf_is_the_registry_split_instruments_then_effects() {
-        let entries = device_entries();
-        assert_eq!(entries.len(), DEVICES.len());
-
-        let kinds: Vec<_> = entries
-            .iter()
-            .map(|entry| match entry.kind {
-                EntryKind::Device(kind) => kind,
-                _ => panic!("the device shelf contained a non-device"),
-            })
-            .collect();
+        assert!(browser.backspace());
         assert!(
-            kinds
-                .windows(2)
-                .all(|pair| pair[0].is_instrument() || !pair[1].is_instrument()),
-            "an instrument appeared after the effects began"
+            !browser.backspace(),
+            "backspace claimed to erase an empty query"
         );
-        for spec in DEVICES {
-            assert_eq!(
-                kinds.iter().filter(|kind| **kind == spec.kind).count(),
-                1,
-                "{:?} is missing or duplicated",
-                spec.kind
-            );
-        }
+    }
+
+    #[test]
+    fn a_scan_lands_on_a_closed_shelf_without_disturbing_the_cursor() {
+        let mut browser = Browser::shelves();
+        walk_to(&mut browser, &["Devices"]);
+        let standing_on = browser.selected().map(|node| node.label.clone());
+
+        browser.set_children(
+            Shelf::Samples,
+            vec![Node::leaf(
+                "kick.wav",
+                EntryKind::Sample(PathBuf::from("/k.wav")),
+            )],
+            BrowserStatus::Ready,
+        );
+
+        assert_eq!(
+            browser.selected().map(|node| node.label.clone()),
+            standing_on,
+            "a scan moved the cursor"
+        );
+        assert_eq!(browser.status_of(Shelf::Samples), BrowserStatus::Ready);
     }
 
     #[test]
     fn samples_are_built_from_snapshot_records_without_touching_disk() {
-        let record = AssetRecord {
-            path: PathBuf::from("/library/drums/kick.wav"),
-            relative_path: PathBuf::from("drums/kick.wav"),
+        let assets = [AssetRecord {
+            path: PathBuf::from("/library/kick.wav"),
+            relative_path: PathBuf::from("kick.wav"),
             location_id: "library".to_owned(),
-            name: "kick".to_owned(),
+            name: "kick.wav".to_owned(),
             extension: "wav".to_owned(),
-            bytes: 42,
+            bytes: 0,
             modified_unix_secs: None,
-            tags: vec!["drum".to_owned()],
-        };
-        let entries = sample_entries(std::slice::from_ref(&record));
-        assert_eq!(entries[0].label, "drums/kick.wav");
-        assert_eq!(entries[0].kind, EntryKind::Sample(record.path));
-    }
-
-    #[test]
-    fn escape_climbs_from_a_shelf_to_the_fixed_top_level() {
-        let mut browser = Browser::shelves();
-        browser.enter_shelf(Shelf::Devices, device_entries(), BrowserStatus::Ready);
-        browser.type_char('s');
-
-        assert!(browser.ascend());
-        assert_eq!(browser.shelf(), None);
-        assert_eq!(browser.query(), "");
-        assert_eq!(browser.matches().count(), Shelf::ALL.len());
-        assert!(!browser.ascend(), "the browser root has no parent");
-    }
-
-    #[test]
-    fn a_scan_can_land_without_erasing_the_filter() {
-        let mut browser = Browser::shelves();
-        browser.enter_shelf(Shelf::Samples, Vec::new(), BrowserStatus::Scanning);
-        browser.type_char('k');
-        assert_eq!(browser.status(), BrowserStatus::Scanning);
-
-        browser.refresh_shelf(
-            vec![Entry {
-                label: "kick.wav".to_owned(),
-                kind: EntryKind::Sample(PathBuf::from("/library/kick.wav")),
-            }],
-            BrowserStatus::Ready,
-        );
-
-        assert_eq!(browser.status(), BrowserStatus::Ready);
-        assert_eq!(browser.query(), "k");
-        assert_eq!(
-            browser.selected().map(|entry| entry.label.as_str()),
-            Some("kick.wav")
-        );
+            tags: Vec::new(),
+        }];
+        let nodes = sample_nodes(&assets);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].label, "kick.wav");
+        assert!(!nodes[0].is_branch(), "a sample opened like a folder");
     }
 
     #[test]
     fn projects_stay_an_explicit_empty_seam_until_a_neutral_catalog_exists() {
-        assert!(project_entries().is_empty());
+        assert!(project_nodes().is_empty());
+        let browser = Browser::shelves();
+        assert_eq!(
+            browser.status_of(Shelf::Projects),
+            BrowserStatus::Unavailable,
+            "the empty seam stopped saying why it is empty"
+        );
     }
 
     /// Every glyph the interface is built from is in the bundled font.
@@ -500,14 +1045,15 @@ mod tests {
             glyph::SHADE_MID,
             glyph::SHADE_HEAVY,
             glyph::BLOCK,
-            glyph::CARET,
+            glyph::PROMPT,
             glyph::MARK,
             glyph::DOT,
             glyph::ARROW_R,
             glyph::ARROW_D,
         ] {
             let code = ch as u32;
-            let covered = (0x2500..=0x2503).contains(&code)
+            let covered = (0x20..=0x7e).contains(&code)
+                || (0x2500..=0x2503).contains(&code)
                 || (0x2508..=0x254b).contains(&code)
                 || (0x2550..=0x2593).contains(&code)
                 || (0x2596..=0x25a0).contains(&code)

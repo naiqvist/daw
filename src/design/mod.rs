@@ -44,6 +44,8 @@
 //! judgements, made by the person whose app this is, and they are recorded
 //! here as decisions rather than derived as results.
 
+pub mod signs;
+
 use eframe::egui::Color32;
 
 // ---------------------------------------------------------------- tiers
@@ -95,10 +97,16 @@ pub struct Signal {
 pub mod lstar {
     /// The ground. Black is not a colour choice here, it is the floor.
     pub const GROUND: f32 = 0.0;
-    /// A resting object's fill. Low, because rest is the common case.
-    pub const SURFACE: f32 = 12.0;
+    /// A recess below the surfaces: what a summoned window (the browser)
+    /// is drawn on, so it reads as cut into the ground rather than laid
+    /// on top of the work. Told apart from the ground by its edge — a
+    /// window has one — rather than at a glance.
+    pub const WELL: f32 = 2.7;
+    /// A resting object's fill. Near the floor, because rest is the
+    /// common case and the ground should read as black, not as grey.
+    pub const SURFACE: f32 = 5.5;
     /// The boundary of a resting object.
-    pub const EDGE: f32 = 28.0;
+    pub const EDGE: f32 = 20.0;
     /// Readable marks on a surface.
     pub const INK: f32 = 60.0;
     /// The addressed thing. Thrown clear of the whole resting world: the
@@ -106,12 +114,16 @@ pub mod lstar {
     pub const FOCUS: f32 = 95.0;
 
     /// Every rung, dimmest first.
-    pub const LADDER: [f32; 5] = [GROUND, SURFACE, EDGE, INK, FOCUS];
+    pub const LADDER: [f32; 6] = [GROUND, WELL, SURFACE, EDGE, INK, FOCUS];
 
     /// The smallest perceptual gap the alphabet tolerates between two
     /// rungs meant to be told apart, under glance conditions rather than
-    /// under study.
-    pub const MIN_SEPARATION: f32 = 10.0;
+    /// under study. The bottom of the ladder was pushed toward black on
+    /// purpose, and now packs three rungs under L* 6: a resting fill is
+    /// meant to be barely there, and a well barely below that. Those two
+    /// pairs are the only ones that sit near the floor; everything meant
+    /// to be read at a glance is separated by ten or more.
+    pub const MIN_SEPARATION: f32 = 2.5;
 }
 
 /// The ground: what the screen is when nothing has been said.
@@ -121,16 +133,23 @@ pub const GROUND: Signal = Signal {
     channels: &[Channel::Luminance],
 };
 
+/// A recess below the surfaces. See [`lstar::WELL`].
+pub const WELL: Signal = Signal {
+    color: Color32::from_gray(10),
+    tier: Tier::Structure,
+    channels: &[Channel::Luminance, Channel::Position],
+};
+
 /// A resting object's fill.
 pub const SURFACE: Signal = Signal {
-    color: Color32::from_gray(32),
+    color: Color32::from_gray(18),
     tier: Tier::Structure,
     channels: &[Channel::Luminance],
 };
 
 /// A resting object's boundary; also the periphery's hairlines.
 pub const EDGE: Signal = Signal {
-    color: Color32::from_gray(66),
+    color: Color32::from_gray(48),
     tier: Tier::Structure,
     channels: &[Channel::Luminance],
 };
@@ -212,8 +231,9 @@ pub const LIVE_DIM: Signal = Signal {
 };
 
 /// Every symbol in the alphabet. The cap is enforced against this list.
-pub const ALPHABET: [Signal; 9] = [
+pub const ALPHABET: [Signal; 10] = [
     GROUND,
+    WELL,
     SURFACE,
     EDGE,
     INK,
@@ -353,6 +373,7 @@ mod tests {
     fn every_rung_sits_where_its_lightness_says_it_does() {
         for (signal, declared) in [
             (GROUND, lstar::GROUND),
+            (WELL, lstar::WELL),
             (SURFACE, lstar::SURFACE),
             (EDGE, lstar::EDGE),
             (INK, lstar::INK),
@@ -400,14 +421,14 @@ mod tests {
     }
 
     /// The cap, held as code. Absolute judgment on one dimension runs out
-    /// around seven levels; we spend five and keep the margin.
+    /// around seven levels; we spend six and keep the margin.
     #[test]
     fn the_alphabet_stays_inside_the_receivers_capacity() {
         assert!(
             lstar::LADDER.len() <= 7,
             "more luminance rungs than absolute judgment can carry"
         );
-        assert_eq!(lstar::LADDER.len(), 5);
+        assert_eq!(lstar::LADDER.len(), 6);
 
         let hues: Vec<f32> = ALPHABET
             .iter()

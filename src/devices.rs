@@ -93,6 +93,99 @@ pub struct ParamLabel {
 /// Adding a device is a row here, a [`DeviceState`] variant and a node —
 /// not an edit in nine hardcoded matches.
 ///
+/// The two headings a device can be filed under.
+///
+/// Instruments MAKE sound and head a chain; effects SHAPE what reaches
+/// them. It is the same split `DeviceSpec::instrument` records, named
+/// here so a browser can print it — and a test holds the two to each
+/// other so they can never disagree.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Section {
+    Instruments,
+    AudioEffects,
+}
+
+impl Section {
+    pub const ALL: [Self; 2] = [Self::Instruments, Self::AudioEffects];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Instruments => "Instruments",
+            Self::AudioEffects => "Audio Effects",
+        }
+    }
+}
+
+/// Which family a device belongs to.
+///
+/// The registry already says what exists, so it says where each device is
+/// FILED too. A catalog kept anywhere else drifts the first time someone
+/// adds a device to one and not the other — and a device missing from a
+/// browser is invisible rather than obviously broken.
+///
+/// Every family belongs to exactly one section, and nothing is loose: a
+/// device sitting outside the headings would read as the odd one out
+/// rather than as the uncategorised one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Family {
+    Synths,
+    Drums,
+    Sampling,
+    Dynamics,
+    EqAndFilters,
+    DelayAndReverb,
+    Distortion,
+    Modulation,
+    Spectral,
+    Utilities,
+}
+
+impl Family {
+    pub const ALL: [Self; 10] = [
+        Self::Synths,
+        Self::Drums,
+        Self::Sampling,
+        Self::Dynamics,
+        Self::EqAndFilters,
+        Self::DelayAndReverb,
+        Self::Distortion,
+        Self::Modulation,
+        Self::Spectral,
+        Self::Utilities,
+    ];
+
+    /// The heading this family sits under.
+    pub fn section(self) -> Section {
+        match self {
+            Self::Synths => Section::Instruments,
+            Self::Drums => Section::Instruments,
+            Self::Sampling => Section::Instruments,
+            Self::Dynamics => Section::AudioEffects,
+            Self::EqAndFilters => Section::AudioEffects,
+            Self::DelayAndReverb => Section::AudioEffects,
+            Self::Distortion => Section::AudioEffects,
+            Self::Modulation => Section::AudioEffects,
+            Self::Spectral => Section::AudioEffects,
+            Self::Utilities => Section::AudioEffects,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Synths => "Synths",
+            Self::Drums => "Drums",
+            Self::Sampling => "Sampling",
+            Self::Dynamics => "Dynamics",
+            Self::EqAndFilters => "EQ & Filters",
+            Self::DelayAndReverb => "Delay & Reverb",
+            Self::Distortion => "Distortion",
+            Self::Modulation => "Modulation",
+            Self::Spectral => "Spectral",
+            Self::Utilities => "Utilities",
+        }
+    }
+}
+
 /// `params` is `&'static` and stays that way: `daw::params::clamp` scans
 /// exactly this slice inside the audio callback, so anything heap-backed
 /// reaching it would be a red-zone allocation. Descriptive on this side,
@@ -102,6 +195,8 @@ pub struct DeviceSpec {
     pub name: &'static str,
     /// Instruments MAKE sound and head the chain; effects SHAPE it.
     pub instrument: bool,
+    /// Where this device is filed. See [`Family`].
+    pub family: Family,
     /// Stable target-id prefix: "synth", "reverb". Part of the file
     /// format — renaming one orphans every wire that names it.
     pub prefix: &'static str,
@@ -116,6 +211,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::SineSynth,
         name: "sine synth",
         instrument: true,
+        family: Family::Synths,
         prefix: "synth",
         params: daw::params::seq::TABLE,
         labels: &[
@@ -140,6 +236,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::Sampler,
         name: "sampler",
         instrument: true,
+        family: Family::Sampling,
         prefix: "sampler",
         params: daw::params::sampler::TABLE,
         // Grouped the way the card's five pages are, so a modulation
@@ -333,6 +430,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::Kick,
         name: "kick",
         instrument: true,
+        family: Family::Drums,
         prefix: "kick",
         params: daw::params::kick::TABLE,
         // Grouped the way the card's sections are, so a modulation
@@ -409,6 +507,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::Haze,
         name: "haze",
         instrument: true,
+        family: Family::Synths,
         prefix: "haze",
         params: daw::params::haze::TABLE,
         // Nineteen rows, grouped the way the card's pages are, so a
@@ -515,6 +614,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::Loom,
         name: "loom",
         instrument: true,
+        family: Family::Synths,
         prefix: "loom",
         params: daw::params::loom::TABLE,
         labels: &[
@@ -684,6 +784,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::Poly,
         name: "poly synth",
         instrument: true,
+        family: Family::Synths,
         prefix: "poly",
         params: daw::params::poly::TABLE,
         // Thirty-four rows, grouped the way the card's sections are, so a
@@ -935,6 +1036,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::Snare,
         name: "snare",
         instrument: true,
+        family: Family::Drums,
         prefix: "snare",
         params: daw::params::snare::TABLE,
         // Grouped as the card's two halves are: the SHELL and the WIRES, so a
@@ -1001,6 +1103,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::Tom,
         name: "tom",
         instrument: true,
+        family: Family::Drums,
         prefix: "tom",
         params: daw::params::tom::TABLE,
         // Grouped as the card's rows are.
@@ -1056,6 +1159,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::Hat,
         name: "808 hat",
         instrument: true,
+        family: Family::Drums,
         prefix: "hat",
         params: daw::params::hat::TABLE,
         // Grouped as the card's plot is: the BANK, and the WINDOW it is
@@ -1107,6 +1211,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::Handclap,
         name: "clap",
         instrument: true,
+        family: Family::Drums,
         prefix: "clap",
         params: daw::params::handclap::TABLE,
         // Grouped as the card's two rows are: the HANDS, then the ROOM and
@@ -1168,6 +1273,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::Utility,
         name: "utility",
         instrument: false,
+        family: Family::Utilities,
         prefix: "util",
         params: daw::params::utility::TABLE,
         // Seven rows, in the table's order. Two groups, because the card
@@ -1221,6 +1327,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::Modulato,
         name: "modulato",
         instrument: false,
+        family: Family::Modulation,
         prefix: "modulato",
         params: daw::params::modulato::TABLE,
         // Seven rows, in the table's order. Grouped as the card reads:
@@ -1267,6 +1374,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::Filter,
         name: "filter",
         instrument: false,
+        family: Family::EqAndFilters,
         prefix: "filter",
         params: daw::params::filter::TABLE,
         // Grouped as the card's two rows are: what SHAPE the filter is,
@@ -1314,6 +1422,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::Limiter,
         name: "limiter",
         instrument: false,
+        family: Family::Dynamics,
         prefix: "limiter",
         params: daw::params::limiter::TABLE,
         // Grouped as the card's two rows are: what it does to the LEVEL,
@@ -1361,6 +1470,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::Reverb,
         name: "reverb",
         instrument: false,
+        family: Family::DelayAndReverb,
         prefix: "reverb",
         params: daw::params::reverb::TABLE,
         // Nine rows, in the table's order, grouped the way the card's
@@ -1417,6 +1527,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::Echo,
         name: "delay",
         instrument: false,
+        family: Family::DelayAndReverb,
         prefix: "echo",
         params: daw::params::echo::TABLE,
         labels: &[
@@ -1471,6 +1582,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::Clamp,
         name: "clamp",
         instrument: false,
+        family: Family::Dynamics,
         prefix: "clamp",
         params: daw::params::clamp::TABLE,
         labels: &[
@@ -1525,6 +1637,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::Prism,
         name: "prism",
         instrument: false,
+        family: Family::Dynamics,
         prefix: "prism",
         params: daw::params::prism::TABLE,
         labels: &[
@@ -1619,6 +1732,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::Glue,
         name: "glue",
         instrument: false,
+        family: Family::Dynamics,
         prefix: "glue",
         params: daw::params::glue::TABLE,
         labels: &[
@@ -1673,6 +1787,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::Eq,
         name: "eq",
         instrument: false,
+        family: Family::EqAndFilters,
         prefix: "eq",
         params: daw::params::eq::TABLE,
         // One group per BAND, so a modulation picker offering forty-one
@@ -1891,6 +2006,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::Sat,
         name: "saturator",
         instrument: false,
+        family: Family::Distortion,
         prefix: "sat",
         params: daw::params::sat::TABLE,
         // The units a MODULATION READOUT appends, which is why drive and
@@ -1929,6 +2045,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::Lofi,
         name: "lo-fi",
         instrument: false,
+        family: Family::Distortion,
         prefix: "lofi",
         params: daw::params::lofi::TABLE,
         // Units blank for the reason the saturator's are: the card prints
@@ -1961,6 +2078,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::Flint,
         name: "flint",
         instrument: false,
+        family: Family::Dynamics,
         prefix: "flint",
         params: daw::params::flint::TABLE,
         // Units blank for the reason the lo-fi's are: the card prints
@@ -2003,6 +2121,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::Sibyl,
         name: "sibyl",
         instrument: false,
+        family: Family::Spectral,
         prefix: "sibyl",
         params: daw::params::sibyl::TABLE,
         // Units blank for the reason the lo-fi's are: the card prints
@@ -2060,6 +2179,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::Ferric,
         name: "ferric",
         instrument: false,
+        family: Family::DelayAndReverb,
         prefix: "ferric",
         params: daw::params::ferric::TABLE,
         labels: &[
@@ -2114,6 +2234,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::Umbra,
         name: "umbra",
         instrument: false,
+        family: Family::DelayAndReverb,
         prefix: "umbra",
         params: daw::params::umbra::TABLE,
         labels: &[
@@ -2153,6 +2274,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::Tone,
         name: "tone",
         instrument: false,
+        family: Family::Utilities,
         prefix: "tone",
         params: daw::params::tone::TABLE,
         labels: &[
@@ -2182,6 +2304,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::Sigil,
         name: "sigil",
         instrument: false,
+        family: Family::Modulation,
         prefix: "sigil",
         params: daw::params::sigil::TABLE,
         labels: &[
@@ -2206,6 +2329,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::Gauge,
         name: "gauge",
         instrument: false,
+        family: Family::Utilities,
         prefix: "gauge",
         params: daw::params::gauge::TABLE,
         labels: &[
@@ -2230,6 +2354,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::Tine,
         name: "tine",
         instrument: true,
+        family: Family::Synths,
         prefix: "tine",
         params: daw::params::tine::TABLE,
         labels: &[
@@ -2284,6 +2409,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::Sheen,
         name: "sheen",
         instrument: false,
+        family: Family::Distortion,
         prefix: "sheen",
         params: daw::params::sheen::TABLE,
         // Units blank for the reason the saturator's and the lo-fi's are:
@@ -2316,6 +2442,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::Disperser,
         name: "disperser",
         instrument: false,
+        family: Family::Modulation,
         prefix: "disp",
         params: daw::params::disperser::TABLE,
         // Units blank for the reason the others' are: the card prints
@@ -2342,6 +2469,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::Tilt,
         name: "tilt",
         instrument: false,
+        family: Family::EqAndFilters,
         prefix: "tilt",
         params: daw::params::tilt::TABLE,
         // Units blank for the reason the others' are: the card prints
@@ -2363,6 +2491,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::Phaser,
         name: "phaser",
         instrument: false,
+        family: Family::Modulation,
         prefix: "phaser",
         params: daw::params::phaser::TABLE,
         // Units blank for the reason the others' are: the card prints
@@ -2400,6 +2529,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::Gate,
         name: "gate",
         instrument: false,
+        family: Family::Dynamics,
         prefix: "gate",
         params: daw::params::gate::TABLE,
         // Units blank for the reason the others' are: the card prints
@@ -2437,6 +2567,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::Strip,
         name: "strip",
         instrument: false,
+        family: Family::EqAndFilters,
         prefix: "strip",
         params: daw::params::strip::TABLE,
         // Units blank for the reason the others' are: the card prints
@@ -2473,6 +2604,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::Resyn,
         name: "resyn",
         instrument: false,
+        family: Family::Spectral,
         prefix: "resyn",
         params: daw::params::resyn::TABLE,
         // Units blank for the reason the others' are: the card prints
@@ -2554,6 +2686,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::Acid,
         name: "acid",
         instrument: true,
+        family: Family::Synths,
         prefix: "acid",
         params: daw::params::acid::TABLE,
         // Units blank for the reason the others' are: the card prints
@@ -2615,6 +2748,7 @@ pub static DEVICES: &[DeviceSpec] = &[
         kind: DeviceKind::Rack,
         name: "rack",
         instrument: false,
+        family: Family::Utilities,
         prefix: "rack",
         // EMPTY, and that is the device: a rack is a container with no
         // sound and no settings of its own. Its macros are not parameters
@@ -2629,4 +2763,65 @@ pub static DEVICES: &[DeviceSpec] = &[
 /// [`DeviceSpec::prefix`].
 pub fn device_by_prefix(prefix: &str) -> Option<&'static DeviceSpec> {
     DEVICES.iter().find(|spec| spec.prefix == prefix)
+}
+
+/// Where devices are filed. The registry is the only catalog, so these
+/// hold it to the two promises a browser built from it depends on:
+/// nothing is loose, and the section a device is filed under is the same
+/// fact as whether it is an instrument.
+#[cfg(test)]
+mod family_tests {
+    use super::*;
+
+    #[test]
+    fn a_devices_section_and_its_instrument_flag_are_the_same_fact() {
+        for spec in DEVICES {
+            let filed_as_instrument = spec.family.section() == Section::Instruments;
+            assert_eq!(
+                spec.instrument,
+                filed_as_instrument,
+                "{} is filed under {} but its instrument flag says otherwise",
+                spec.name,
+                spec.family.section().label()
+            );
+        }
+    }
+
+    #[test]
+    fn every_family_holds_something() {
+        for family in Family::ALL {
+            assert!(
+                DEVICES.iter().any(|spec| spec.family == family),
+                "the family {} has no devices, so it is a heading over nothing",
+                family.label()
+            );
+        }
+    }
+
+    #[test]
+    fn every_device_is_reachable_by_walking_the_headings() {
+        let walked: usize = Section::ALL
+            .into_iter()
+            .flat_map(|section| {
+                Family::ALL
+                    .into_iter()
+                    .filter(move |family| family.section() == section)
+            })
+            .map(|family| DEVICES.iter().filter(|spec| spec.family == family).count())
+            .sum();
+        assert_eq!(
+            walked,
+            DEVICES.len(),
+            "a device is in the registry but not under any heading"
+        );
+    }
+
+    #[test]
+    fn no_two_families_share_a_name() {
+        for (index, family) in Family::ALL.iter().enumerate() {
+            for other in &Family::ALL[index + 1..] {
+                assert_ne!(family.label(), other.label());
+            }
+        }
+    }
 }

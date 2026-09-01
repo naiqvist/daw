@@ -108,6 +108,12 @@ impl Default for MidiTyping {
 }
 
 impl MidiTyping {
+    /// Whether the letters are pitches right now. A frame that also binds
+    /// Escape needs to know, because while this is on Escape is ours.
+    pub(crate) fn enabled(&self) -> bool {
+        self.enabled
+    }
+
     pub(crate) fn update(&mut self, ctx: &egui::Context, mode: EntryMode) -> Update {
         // A focused text field owns the keyboard OUTRIGHT — the same rule
         // the grammar already keeps in `Keyboard::update`. Without it,

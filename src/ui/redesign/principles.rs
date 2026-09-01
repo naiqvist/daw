@@ -38,7 +38,12 @@ fn hierarchy_comes_from_value_alone() {
 /// the day one signal earns color deliberately — grant it here, by name.
 #[test]
 fn the_layer_is_monochrome_by_construction() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/redesign");
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    // The sequencer was lifted out of this layer and keeps its charter.
+    let roots = [
+        manifest.join("src/ui/redesign"),
+        manifest.join("src/ui/sequencer"),
+    ];
     let banned = [
         "from_rgb",
         "from_rgba",
@@ -54,7 +59,7 @@ fn the_layer_is_monochrome_by_construction() {
         "Color32::LIGHT_",
         "Color32::DARK_",
     ];
-    let mut stack = vec![root];
+    let mut stack = roots.to_vec();
     let mut seen = 0;
     while let Some(dir) = stack.pop() {
         for entry in std::fs::read_dir(&dir).expect("redesign source dir") {

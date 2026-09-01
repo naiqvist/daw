@@ -1,10 +1,9 @@
 //! The lower sequence region and its persistent UI-local state.
 
-use crate::ui::redesign::focus;
-use crate::ui::redesign::grammar::Voice;
-use crate::ui::redesign::roll::RollPanel;
-use crate::ui::redesign::sequence_grid::SequenceGrid;
-use crate::ui::redesign::trig_info;
+use crate::ui::sequencer::grammar::Voice;
+use crate::ui::sequencer::roll::RollPanel;
+use crate::ui::sequencer::sequence_grid::SequenceGrid;
+use crate::ui::sequencer::trig_info;
 use crate::ui::tokens::space;
 use eframe::egui;
 
@@ -88,14 +87,27 @@ pub struct ClipView<'a> {
 
 pub use crate::intent::sequence::Intent;
 
-#[derive(Default)]
 pub struct Outcome {
     pub intents: Vec<Intent>,
     pub claim_focus: bool,
+    /// Where the panel drew, so the frame that owns focus can mark it
+    /// (a focus bar, a scrim, an inversion — the frame's sign, not ours).
+    pub content_rect: egui::Rect,
     /// The grid cursor's tick: the universal selection's address, read
     /// by the palette's long forms (`:tune`, `:quantize-key`, …).
     /// `None` when the sequence panel did not draw this frame.
     pub cursor_tick: Option<usize>,
+}
+
+impl Default for Outcome {
+    fn default() -> Self {
+        Self {
+            intents: Vec::new(),
+            claim_focus: false,
+            content_rect: egui::Rect::NOTHING,
+            cursor_tick: None,
+        }
+    }
 }
 
 impl SequencePanel {
@@ -110,10 +122,10 @@ impl SequencePanel {
         mut voice: Voice<'_>,
         entered_pitch: Option<crate::pitch::Pitch>,
         clip: Option<ClipView<'_>>,
-        lens: &crate::ui::redesign::lens::LensView,
+        lens: &crate::ui::sequencer::lens::LensView,
     ) -> Outcome {
         let mut outcome = Outcome::default();
-        self.grid.update_resolution(ui.ctx());
+        self.grid.update_view(ui.ctx());
         // Ctrl+4 joins the grid-resolution family (Ctrl+1/2/3) as the
         // editor switch: same hand, same neighbourhood, no new verb.
         if focused
@@ -134,7 +146,7 @@ impl SequencePanel {
         };
         if let Some(pitch) = entered_pitch {
             match editor {
-                Editor::Grid => self.grid.enter_pitch(pitch, &mut outcome.intents),
+                Editor::Grid => self.grid.enter_pitch(pitch, clip, &mut outcome.intents),
                 Editor::Roll => {
                     self.roll
                         .enter_pitch(pitch, &crate::pitch::default_key(), &mut outcome.intents)
@@ -142,6 +154,7 @@ impl SequencePanel {
             }
         }
         let content_rect = ui.available_rect_before_wrap();
+        outcome.content_rect = content_rect;
         ui.allocate_rect(content_rect, egui::Sense::hover());
         outcome.claim_focus = ui.ctx().input(|input| input.pointer.any_pressed())
             && ui
@@ -180,7 +193,6 @@ impl SequencePanel {
                 outcome.cursor_tick = Some(self.roll.cursor_tick());
             }
         }
-        focus::show(ui.painter(), content_rect, focused);
         outcome
     }
 }

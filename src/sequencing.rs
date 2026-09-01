@@ -282,6 +282,34 @@ impl Trig {
         self.notes.clear();
         self.enabled = false;
     }
+
+    /// Add a note at its own sub-step offset. Same pitch at the same
+    /// offset replaces; anything else joins. Notes are kept in time order
+    /// then stack order, so [`Trig::primary`] is the earliest and lowest.
+    pub fn add_tone_at(&mut self, note: Note) {
+        if let Some(existing) = self
+            .notes
+            .iter_mut()
+            .find(|tone| tone.pitch == note.pitch && tone.micro_ticks == note.micro_ticks)
+        {
+            *existing = note;
+        } else {
+            self.notes.push(note);
+            self.notes.sort_by(|a, b| {
+                a.micro_ticks
+                    .cmp(&b.micro_ticks)
+                    .then_with(|| a.pitch.stack_order(&b.pitch))
+            });
+        }
+        self.enabled = true;
+    }
+
+    /// The notes at exactly `micro` ticks into the step.
+    pub fn notes_at(&self, micro: i16) -> impl Iterator<Item = &Note> {
+        self.notes
+            .iter()
+            .filter(move |note| note.micro_ticks == micro)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -825,6 +853,62 @@ fn usable_bpm(bpm: f64) -> bool {
     bpm.is_finite() && (MIN_BPM..=MAX_BPM).contains(&bpm)
 }
 
+/// How many scenes a new session offers: enough rows that a sketch has
+/// room, few enough that they fit one screen.
+pub const SESSION_SCENES: usize = 8;
+
+/// What a session slot holds. One variant today; an audio clip joins it
+/// when a slot can be given a sample, and the enum is what keeps that
+/// from being a second slot type.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub enum Clip {
+    Pattern(PatternId),
+}
+
+/// One clip in one scene, on one track. Keyed by [`TrackId`] rather than
+/// track position so a reordered strip does not move clips between
+/// tracks, and stored as a list rather than a map so the document stays
+/// plain RON.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct Slot {
+    pub track: TrackId,
+    pub clip: Clip,
+}
+
+/// One row of the session: a clip per track, at most, launched as a unit.
+/// Launching is not modelled yet — a scene is a place to keep clips
+/// before it is a thing to fire.
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct Scene {
+    #[serde(default)]
+    pub slots: Vec<Slot>,
+}
+
+impl Scene {
+    pub fn clip(&self, track: TrackId) -> Option<Clip> {
+        self.slots
+            .iter()
+            .find(|slot| slot.track == track)
+            .map(|slot| slot.clip)
+    }
+}
+
+/// The session: scenes down, tracks across, a clip where they meet.
+/// Document data beside the arrangement, not a view of it — a clip in a
+/// slot is not on the timeline until something places it there.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct Session {
+    pub scenes: Vec<Scene>,
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self {
+            scenes: vec![Scene::default(); SESSION_SCENES],
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Song {
     pub tracks: Vec<Track>,
@@ -849,6 +933,11 @@ pub struct Song {
     /// transport's single global signature.
     #[serde(default)]
     pub meter: Vec<MeterMark>,
+    /// The session's scenes and their clips. Absent from documents
+    /// written before the session existed means an empty default
+    /// session, which reads exactly as it did before.
+    #[serde(default)]
+    pub session: Session,
     /// The project-level harmonic context. Degree anchors resolve against
     /// it; absolute anchors never read it.
     pub key: Key,
@@ -861,7 +950,7 @@ impl Default for Song {
         Self {
             tracks: vec![Track {
                 id: TrackId(1),
-                name: "INSTRUMENT 01".to_owned(),
+                name: "Instrument 01".to_owned(),
                 kind: TrackKind::Instrument,
                 blocks: vec![PatternBlock {
                     id: BlockId(1),
@@ -888,12 +977,72 @@ impl Default for Song {
             returns: Vec::new(),
             tempo: Vec::new(),
             meter: Vec::new(),
+            session: Session::default(),
             key: default_key(),
         }
     }
 }
 
 impl Song {
+    /// Append a new, empty track of `kind` and return its id.
+    ///
+    /// Document editing, not scheduling: an empty track carries no events,
+    /// no compiled chunks and no nodes, so none of the five rules in
+    /// `notes/20260823-sequencing-contract.md` are in play. It becomes
+    /// audible only once something is placed on it.
+    ///
+    /// The id is one past the highest currently in use, which makes it
+    /// unique among the tracks the song HOLDS. It is deliberately NOT a
+    /// permanent serial: remove the highest track and the next one made
+    /// takes that id back. Nothing can observe this yet — no verb removes
+    /// a track — but a delete verb has to bring a monotonic counter on the
+    /// document with it before anything may hold a `TrackId` across a
+    /// removal. `an_id_is_reused_once_the_track_holding_it_is_gone` pins
+    /// the current behaviour so that day is not a surprise.
+    pub fn add_track(&mut self, kind: TrackKind) -> TrackId {
+        let id = TrackId(
+            self.tracks
+                .iter()
+                .map(|track| track.id.0)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1),
+        );
+        // Numbered within its own kind, so adding an audio track does not
+        // depend on how many instrument tracks happen to exist.
+        let ordinal = self
+            .tracks
+            .iter()
+            .filter(|track| track.kind == kind)
+            .count()
+            .saturating_add(1);
+        let name = match kind {
+            TrackKind::Instrument => format!("Instrument {ordinal:02}"),
+            TrackKind::Audio => format!("Audio {ordinal:02}"),
+        };
+        self.tracks.push(Track {
+            id,
+            name,
+            kind,
+            blocks: Vec::new(),
+            muted: false,
+            solo: false,
+            pitch_authority: PitchAuthority::default(),
+            audio_blocks: Vec::new(),
+            automation: Vec::new(),
+            volume: 1.0,
+            pan: 0.0,
+            sends: Vec::new(),
+            is_group: false,
+            folded: false,
+            depth: 0,
+            input: TrackInput::default(),
+            monitor: Monitor::default(),
+            armed: false,
+        });
+        id
+    }
+
     /// Normalize the positional group stack at a green-zone ownership
     /// boundary (load or edit), never in the C1 projection. Repairing only
     /// the twin would leave the Song and undo history holding illegal data.
@@ -1052,6 +1201,67 @@ impl Song {
     /// Insert an empty pattern block when the requested region is free.
     /// Arrangement editing is green-zone work; the audio side will later
     /// receive a newly compiled immutable sequence rather than these vectors.
+    /// A new, empty pattern with the next free id and the next serial
+    /// name. The one place a pattern is minted, whether for the timeline
+    /// or for a session slot.
+    fn allocate_pattern(&mut self) -> Option<PatternId> {
+        let pattern_number = self.patterns.len().checked_add(1)?;
+        let pattern_id = PatternId(
+            self.patterns
+                .iter()
+                .map(|pattern| pattern.id.0)
+                .max()
+                .unwrap_or(0)
+                .checked_add(1)?,
+        );
+        self.patterns
+            .push(Pattern::empty(pattern_id, format!("P{pattern_number:02}")));
+        Some(pattern_id)
+    }
+
+    /// The clip at `scene` on the track at `track_index`, if either exists
+    /// and the slot holds one.
+    pub fn slot_clip(&self, track_index: usize, scene: usize) -> Option<Clip> {
+        let track = self.tracks.get(track_index)?;
+        self.session.scenes.get(scene)?.clip(track.id)
+    }
+
+    /// Fill an empty session slot with a new, empty pattern and return
+    /// its id. Refused — `None`, nothing changed — when there is no such
+    /// track or scene, when the track is not an instrument (an audio slot
+    /// needs a sample, which is the browser's verb), or when the slot is
+    /// already taken: a clip is never silently replaced.
+    ///
+    /// Document editing, not scheduling: the new pattern has no trigs and
+    /// no placement, so nothing in the sequencing contract is in play.
+    pub fn fill_slot(&mut self, track_index: usize, scene: usize) -> Option<PatternId> {
+        let track = self.tracks.get(track_index)?;
+        if track.kind != TrackKind::Instrument {
+            return None;
+        }
+        let track_id = track.id;
+        if self.session.scenes.get(scene)?.clip(track_id).is_some() {
+            return None;
+        }
+        let pattern_id = self.allocate_pattern()?;
+        self.session.scenes.get_mut(scene)?.slots.push(Slot {
+            track: track_id,
+            clip: Clip::Pattern(pattern_id),
+        });
+        Some(pattern_id)
+    }
+
+    /// Empty a session slot and return what it held. The pattern itself
+    /// stays in the song: a clip may be the only thing referring to it,
+    /// but reclaiming patterns is a policy for the document as a whole,
+    /// not a side effect of clearing one place they were kept.
+    pub fn clear_slot(&mut self, track_index: usize, scene: usize) -> Option<Clip> {
+        let track_id = self.tracks.get(track_index)?.id;
+        let scene = self.session.scenes.get_mut(scene)?;
+        let index = scene.slots.iter().position(|slot| slot.track == track_id)?;
+        Some(scene.slots.remove(index).clip)
+    }
+
     pub fn create_pattern_block(
         &mut self,
         track_index: usize,
@@ -1070,15 +1280,6 @@ impl Song {
             return None;
         }
 
-        let pattern_number = self.patterns.len().checked_add(1)?;
-        let pattern_id = PatternId(
-            self.patterns
-                .iter()
-                .map(|pattern| pattern.id.0)
-                .max()
-                .unwrap_or(0)
-                .checked_add(1)?,
-        );
         let block_id = BlockId(
             self.tracks
                 .iter()
@@ -1088,8 +1289,7 @@ impl Song {
                 .unwrap_or(0)
                 .checked_add(1)?,
         );
-        self.patterns
-            .push(Pattern::empty(pattern_id, format!("P{pattern_number:02}")));
+        let pattern_id = self.allocate_pattern()?;
         let track = self.tracks.get_mut(track_index)?;
         track.blocks.push(PatternBlock {
             id: block_id,
@@ -1389,6 +1589,196 @@ impl Pattern {
 
     pub fn clear(&mut self, step: usize) {
         self.trig_mut(step).clear();
+    }
+
+    /// Apply one sequence intent, tick-accurately. A tick addresses a
+    /// step and an offset into it: `tick / 12` is the step, `tick % 12`
+    /// the note's `micro_ticks`. So a 1/32 grid, a triplet grid, or a
+    /// sixty-fourth all land where they were spoken, and the projection
+    /// plays them there — it already adds the micro offset to the step.
+    /// What stays per STEP is the trig's own state, `enabled` and
+    /// `probability`: notes finer than a sixteenth share the sixteenth's
+    /// gate and condition.
+    ///
+    /// Returns a notice when the intent could not be honoured — the
+    /// caller shows it, never swallows it.
+    ///
+    /// Document editing, not scheduling: what changes here is compiled
+    /// into immutable chunks by the green-zone compiler afterwards, so
+    /// none of the five contract rules are in play at this layer.
+    pub fn apply(&mut self, intent: &crate::intent::sequence::Intent) -> Option<&'static str> {
+        use crate::intent::sequence::Intent;
+        let tick = match *intent {
+            Intent::Toggle { tick, .. }
+            | Intent::SetPrimary { tick, .. }
+            | Intent::Clear { tick }
+            | Intent::Nudge { tick, .. }
+            | Intent::Resize { tick, .. }
+            | Intent::AddNote { tick, .. }
+            | Intent::SetProbability { tick, .. }
+            | Intent::AdjustVelocity { tick, .. } => tick,
+        };
+        let (step, micro) = Self::address(tick);
+        if step >= PATTERN_STEPS {
+            return Some("sequence step is outside the pattern");
+        }
+        let at = |note: &Note| note.micro_ticks == micro;
+        match *intent {
+            // A note exactly here gates the step; nothing here means a
+            // new note here, joining whatever else the step holds.
+            Intent::Toggle {
+                default_pitch,
+                default_length_ticks,
+                default_velocity,
+                ..
+            } => {
+                let trig = self.trig_mut(step);
+                if trig.notes.iter().any(at) {
+                    trig.enabled = !trig.enabled;
+                } else {
+                    let mut note =
+                        Note::with_pitch(default_pitch, default_length_ticks, default_velocity);
+                    note.micro_ticks = micro;
+                    trig.add_tone_at(note);
+                }
+            }
+            // Entry replaces the note exactly here, or puts one here.
+            Intent::SetPrimary {
+                pitch,
+                length_ticks,
+                velocity,
+                ..
+            } => {
+                let mut note = Note::with_pitch(pitch, length_ticks, velocity);
+                note.micro_ticks = micro;
+                let trig = self.trig_mut(step);
+                if let Some(existing) = trig.notes.iter_mut().find(|note| at(note)) {
+                    *existing = note;
+                    trig.enabled = true;
+                } else {
+                    trig.add_tone_at(note);
+                }
+            }
+            Intent::Clear { .. } => {
+                let trig = self.trig_mut(step);
+                trig.notes.retain(|note| !at(note));
+                if trig.notes.is_empty() {
+                    trig.clear();
+                }
+            }
+            Intent::AddNote {
+                pitch,
+                length_ticks,
+                velocity,
+                probability,
+                ..
+            } => {
+                let mut note = Note::with_pitch(pitch, length_ticks, velocity);
+                note.micro_ticks = micro;
+                let trig = self.trig_mut(step);
+                trig.add_tone_at(note);
+                trig.probability = probability.clamp(0.01, 1.0);
+            }
+            Intent::SetProbability { probability, .. } => {
+                self.trig_mut(step).probability = probability.clamp(0.01, 1.0);
+            }
+            Intent::AdjustVelocity { delta, .. } => {
+                let trig = self.trig_mut(step);
+                if !trig.notes.iter().any(at) {
+                    return Some("velocity: no trig here");
+                }
+                for note in trig.notes.iter_mut().filter(|note| at(note)) {
+                    note.velocity =
+                        (isize::from(note.velocity).saturating_add(delta)).clamp(1, 127) as u8;
+                }
+            }
+            Intent::Resize { delta_ticks, .. } => {
+                let trig = self.trig_mut(step);
+                if !trig.notes.iter().any(at) {
+                    return Some("resize: no trig here");
+                }
+                for note in trig.notes.iter_mut().filter(|note| at(note)) {
+                    note.length_ticks = note.length_ticks.saturating_add_signed(delta_ticks).max(1);
+                }
+            }
+            // The notes exactly here move to exactly there, whatever grid
+            // "there" is on. Refused, unchanged, past either end of the
+            // pattern or onto a tick that already holds a note.
+            Intent::Nudge { delta_ticks, .. } => {
+                if !self.trig(step).notes.iter().any(at) {
+                    return Some("nudge: no trig here");
+                }
+                let Some(target_tick) = isize::try_from(tick)
+                    .ok()
+                    .and_then(|tick| tick.checked_add(delta_ticks))
+                    .filter(|target| *target >= 0)
+                    .map(|target| target as usize)
+                else {
+                    return Some("nudge blocked at the pattern edge");
+                };
+                let (target_step, target_micro) = Self::address(target_tick);
+                if target_step >= PATTERN_STEPS {
+                    return Some("nudge blocked at the pattern edge");
+                }
+                if (target_step, target_micro) == (step, micro) {
+                    return None;
+                }
+                if self
+                    .trig(target_step)
+                    .notes_at(target_micro)
+                    .next()
+                    .is_some()
+                {
+                    return Some("nudge blocked by an occupied step");
+                }
+                let source = self.trig_mut(step);
+                let (moving, staying): (Vec<Note>, Vec<Note>) =
+                    source.notes.drain(..).partition(at);
+                let (was_enabled, probability) = (source.enabled, source.probability);
+                source.notes = staying;
+                if source.notes.is_empty() {
+                    source.clear();
+                }
+                let target = self.trig_mut(target_step);
+                let target_was_empty = target.notes.is_empty();
+                for mut note in moving {
+                    note.micro_ticks = target_micro;
+                    target.add_tone_at(note);
+                }
+                // A moved trig keeps its own gate and condition when it
+                // lands somewhere empty; joining an occupied step, it
+                // takes that step's.
+                if target_was_empty {
+                    target.enabled = was_enabled;
+                    target.probability = probability;
+                }
+            }
+        }
+        None
+    }
+
+    /// A tick as the step it falls in and the offset into that step.
+    pub fn address(tick: usize) -> (usize, i16) {
+        (
+            tick / PATTERN_STEP_TICKS,
+            (tick % PATTERN_STEP_TICKS) as i16,
+        )
+    }
+
+    /// Apply a frame's intents in order. The LAST notice wins, as the
+    /// frame that first wrote this loop decided: one line of status per
+    /// frame, and the most recent refusal is the one still true.
+    pub fn apply_all(
+        &mut self,
+        intents: &[crate::intent::sequence::Intent],
+    ) -> Option<&'static str> {
+        let mut notice = None;
+        for intent in intents {
+            if let Some(refusal) = self.apply(intent) {
+                notice = Some(refusal);
+            }
+        }
+        notice
     }
 }
 
@@ -1787,6 +2177,72 @@ mod automation_tests {
 /// Mixer data is project file format first: every absent field defaults to
 /// the sound an older project already made, and positional edits keep sends,
 /// returns and their lettered curves in one meaning.
+/// Making a track. Document editing rather than scheduling, so what is
+/// on trial is identity — that a new track is empty, silent, uniquely
+/// addressed, and named in a way that does not depend on tracks of some
+/// other kind.
+#[cfg(test)]
+mod track_tests {
+    use super::*;
+
+    #[test]
+    fn a_new_track_is_numbered_within_its_own_kind() {
+        let mut song = Song::default();
+        assert_eq!(song.tracks.len(), 1, "the default song changed shape");
+
+        song.add_track(TrackKind::Audio);
+        song.add_track(TrackKind::Audio);
+        song.add_track(TrackKind::Instrument);
+
+        let names: Vec<_> = song.tracks.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["Instrument 01", "Audio 01", "Audio 02", "Instrument 02"]
+        );
+    }
+
+    #[test]
+    fn ids_are_unique_among_the_tracks_the_song_holds() {
+        let mut song = Song::default();
+        song.add_track(TrackKind::Audio);
+        song.add_track(TrackKind::Instrument);
+        song.add_track(TrackKind::Audio);
+
+        let mut ids: Vec<_> = song.tracks.iter().map(|track| track.id.0).collect();
+        let count = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), count, "two tracks share an id");
+    }
+
+    #[test]
+    fn an_id_is_reused_once_the_track_holding_it_is_gone() {
+        // Pinned on purpose. This is what "one past the highest in use"
+        // costs, and no verb can remove a track today, so nothing can
+        // observe it. When a delete verb arrives, this test is the
+        // reminder that it owes the document a monotonic counter.
+        let mut song = Song::default();
+        let first = song.add_track(TrackKind::Audio);
+        song.tracks.retain(|track| track.id != first);
+        let second = song.add_track(TrackKind::Audio);
+
+        assert_eq!(second, first, "the reuse this test exists to pin is gone");
+    }
+
+    #[test]
+    fn a_new_track_starts_empty_and_silent() {
+        let mut song = Song::default();
+        song.add_track(TrackKind::Instrument);
+        let made = song.tracks.last().expect("the track was not added");
+
+        assert!(made.blocks.is_empty());
+        assert!(made.audio_blocks.is_empty());
+        assert!(made.automation.is_empty());
+        assert!(!made.muted && !made.solo && !made.armed);
+        assert!(!made.is_group);
+    }
+}
+
 #[cfg(test)]
 mod mixer_tests {
     use super::*;
@@ -2210,5 +2666,268 @@ mod audio_block_tests {
             .map(|block| block.id().0)
             .collect();
         assert_eq!(ids, vec![1, 8, 9]);
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+
+    #[test]
+    fn a_new_song_has_an_empty_session_of_the_default_size() {
+        let song = Song::default();
+        assert_eq!(song.session.scenes.len(), SESSION_SCENES);
+        assert!(
+            song.session
+                .scenes
+                .iter()
+                .all(|scene| scene.slots.is_empty())
+        );
+        assert_eq!(song.slot_clip(0, 0), None);
+    }
+
+    #[test]
+    fn filling_a_slot_mints_a_pattern_and_keeps_it_there() {
+        let mut song = Song::default();
+        let before = song.patterns.len();
+        let id = song
+            .fill_slot(0, 2)
+            .expect("an instrument slot refused a clip");
+        assert_eq!(song.patterns.len(), before + 1, "no pattern was minted");
+        assert!(song.patterns.iter().any(|pattern| pattern.id == id));
+        assert_eq!(song.slot_clip(0, 2), Some(Clip::Pattern(id)));
+        assert_eq!(
+            song.slot_clip(0, 1),
+            None,
+            "the clip leaked into another scene"
+        );
+        assert!(
+            song.tracks[0]
+                .blocks
+                .iter()
+                .all(|block| block.pattern_id != id),
+            "a session clip landed on the timeline"
+        );
+    }
+
+    #[test]
+    fn a_filled_slot_is_never_silently_replaced() {
+        let mut song = Song::default();
+        let first = song.fill_slot(0, 0).expect("first fill");
+        let patterns = song.patterns.len();
+        assert_eq!(song.fill_slot(0, 0), None, "a clip was overwritten");
+        assert_eq!(
+            song.patterns.len(),
+            patterns,
+            "a refused fill still minted a pattern"
+        );
+        assert_eq!(song.slot_clip(0, 0), Some(Clip::Pattern(first)));
+    }
+
+    #[test]
+    fn an_audio_track_and_a_missing_place_refuse_a_pattern() {
+        let mut song = Song::default();
+        song.add_track(TrackKind::Audio);
+        assert_eq!(song.fill_slot(1, 0), None, "an audio slot took a pattern");
+        assert_eq!(
+            song.fill_slot(0, SESSION_SCENES),
+            None,
+            "a scene past the end took a clip"
+        );
+        assert_eq!(
+            song.fill_slot(9, 0),
+            None,
+            "a track that does not exist took a clip"
+        );
+        assert_eq!(song.patterns.len(), 1, "a refused fill minted a pattern");
+    }
+
+    #[test]
+    fn clearing_returns_the_clip_and_leaves_the_pattern_in_the_song() {
+        let mut song = Song::default();
+        let id = song.fill_slot(0, 3).expect("fill");
+        assert_eq!(song.clear_slot(0, 3), Some(Clip::Pattern(id)));
+        assert_eq!(song.slot_clip(0, 3), None);
+        assert!(
+            song.patterns.iter().any(|pattern| pattern.id == id),
+            "clearing a slot deleted its pattern"
+        );
+        assert_eq!(
+            song.clear_slot(0, 3),
+            None,
+            "an empty slot claimed to hold something"
+        );
+        assert!(
+            song.fill_slot(0, 3).is_some(),
+            "a cleared slot could not be refilled"
+        );
+    }
+
+    #[test]
+    fn clips_follow_their_track_by_id_not_by_position() {
+        let mut song = Song::default();
+        song.add_track(TrackKind::Instrument);
+        let id = song.fill_slot(1, 0).expect("fill on the second track");
+        song.tracks.swap(0, 1);
+        assert_eq!(
+            song.slot_clip(0, 0),
+            Some(Clip::Pattern(id)),
+            "the clip stayed at the old position"
+        );
+        assert_eq!(song.slot_clip(1, 0), None);
+    }
+
+    #[test]
+    fn the_session_survives_the_document_and_is_defaulted_when_absent() {
+        let mut song = Song::default();
+        song.fill_slot(0, 5).expect("fill");
+        let text = ron::to_string(&song).expect("serialise");
+        let back: Song = ron::from_str(&text).expect("deserialise");
+        assert_eq!(back.session, song.session);
+
+        // A document from before the session existed names no `session`
+        // field at all, and must open with the empty default rather than
+        // refuse.
+        let without: String = text
+            .split_once("session:")
+            .map(|(head, tail)| {
+                let rest = tail
+                    .split_once("key:")
+                    .map(|(_, rest)| rest)
+                    .expect("key field");
+                format!("{head}key:{rest}")
+            })
+            .expect("the session was not written");
+        let old: Song = ron::from_str(&without).expect("an old document refused to open");
+        assert_eq!(old.session, Session::default());
+    }
+}
+
+#[cfg(test)]
+mod tick_tests {
+    use super::*;
+    use crate::intent::sequence::Intent;
+    use crate::pitch::Pitch;
+
+    fn toggle(tick: usize) -> Intent {
+        Intent::Toggle {
+            tick,
+            default_pitch: Pitch::from_midi(60),
+            default_length_ticks: 6,
+            default_velocity: 100,
+        }
+    }
+
+    #[test]
+    fn a_thirty_second_lands_in_its_step_at_its_offset() {
+        let mut pattern = Pattern::default();
+        assert_eq!(pattern.apply(&toggle(6)), None);
+        let trig = pattern.trig(0);
+        assert!(trig.enabled);
+        assert_eq!(trig.notes.len(), 1);
+        assert_eq!(trig.notes[0].micro_ticks, 6, "the offset was rounded away");
+        // A sixty-fourth and a triplet land exactly too.
+        assert_eq!(pattern.apply(&toggle(3)), None);
+        assert_eq!(pattern.apply(&toggle(8)), None);
+        let micros: Vec<i16> = pattern
+            .trig(0)
+            .notes
+            .iter()
+            .map(|n| n.micro_ticks)
+            .collect();
+        assert_eq!(micros, vec![3, 6, 8], "notes are not kept in time order");
+        assert_eq!(Pattern::address(6), (0, 6));
+        assert_eq!(Pattern::address(20), (1, 8));
+    }
+
+    #[test]
+    fn toggling_exactly_a_note_gates_the_step_and_elsewhere_adds_a_note() {
+        let mut pattern = Pattern::default();
+        pattern.apply(&toggle(0));
+        pattern.apply(&toggle(0));
+        assert!(
+            !pattern.trig(0).enabled,
+            "a second toggle on the note did not gate it"
+        );
+        assert_eq!(pattern.trig(0).notes.len(), 1);
+        pattern.apply(&toggle(6));
+        assert!(
+            pattern.trig(0).enabled,
+            "adding a note did not reopen the gate"
+        );
+        assert_eq!(pattern.trig(0).notes.len(), 2);
+    }
+
+    #[test]
+    fn clearing_a_tick_leaves_the_steps_other_notes_alone() {
+        let mut pattern = Pattern::default();
+        pattern.apply(&toggle(0));
+        pattern.apply(&toggle(6));
+        pattern.apply(&Intent::Clear { tick: 6 });
+        assert_eq!(pattern.trig(0).notes.len(), 1);
+        assert_eq!(pattern.trig(0).notes[0].micro_ticks, 0);
+        assert!(pattern.trig(0).enabled);
+        pattern.apply(&Intent::Clear { tick: 0 });
+        assert!(pattern.trig(0).notes.is_empty());
+        assert!(
+            !pattern.trig(0).enabled,
+            "an emptied step stayed gated open"
+        );
+    }
+
+    #[test]
+    fn a_nudge_moves_by_ticks_across_steps_and_refuses_an_occupied_tick() {
+        let mut pattern = Pattern::default();
+        pattern.apply(&toggle(6));
+        assert_eq!(
+            pattern.apply(&Intent::Nudge {
+                tick: 6,
+                delta_ticks: 9,
+            }),
+            None
+        );
+        assert!(pattern.trig(0).notes.is_empty());
+        assert_eq!(
+            pattern.trig(1).notes[0].micro_ticks,
+            3,
+            "6 + 9 is step 1, offset 3"
+        );
+        pattern.apply(&toggle(12));
+        assert_eq!(
+            pattern.apply(&Intent::Nudge {
+                tick: 15,
+                delta_ticks: -3,
+            }),
+            Some("nudge blocked by an occupied step")
+        );
+        assert_eq!(
+            pattern.apply(&Intent::Nudge {
+                tick: 12,
+                delta_ticks: -13,
+            }),
+            Some("nudge blocked at the pattern edge")
+        );
+    }
+
+    #[test]
+    fn velocity_and_length_address_only_the_note_at_the_tick() {
+        let mut pattern = Pattern::default();
+        pattern.apply(&toggle(0));
+        pattern.apply(&toggle(6));
+        pattern.apply(&Intent::AdjustVelocity {
+            tick: 6,
+            delta: -50,
+        });
+        pattern.apply(&Intent::Resize {
+            tick: 6,
+            delta_ticks: 6,
+        });
+        let notes = &pattern.trig(0).notes;
+        assert_eq!((notes[0].velocity, notes[0].length_ticks), (100, 6));
+        assert_eq!((notes[1].velocity, notes[1].length_ticks), (50, 12));
+        assert_eq!(
+            pattern.apply(&Intent::AdjustVelocity { tick: 3, delta: 1 }),
+            Some("velocity: no trig here")
+        );
     }
 }
