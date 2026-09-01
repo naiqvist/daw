@@ -661,7 +661,22 @@ impl App {
 
     /// The new visual layer starts here. The render pass already clears the
     /// client area to black, so drawing nothing is an intentional blank UI.
+    /// Drain the controller and enter what it played.
+    ///
+    /// Note-ONS only: a release ends nothing here, because entering a
+    /// note into a step sequencer is an instant act rather than a held
+    /// one. When live monitoring exists, note-offs become its business.
+    fn pump_midi_input(&mut self) {
+        for (_stamp, event) in self.midi_input.drain() {
+            if let daw::midi_input::MidiEvent::NoteOn { note, .. } = event {
+                self.redesign
+                    .enter_pitch(daw::pitch::Pitch::from_midi(note));
+            }
+        }
+    }
+
     pub(super) fn draw_redesign_ui(&mut self, ui: &mut egui::Ui) {
+        self.pump_midi_input();
         // A pending snap owns Enter and Escape before anything else can
         // hear them: commit the loss, or walk away whole. The ghosts in
         // the grid say what is at stake; the palette, when open, still

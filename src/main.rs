@@ -6271,6 +6271,10 @@ struct App {
     /// a wav import is asynchronous, so the aim has to outlive the
     /// request that started it.
     pending_song_landings: Vec<(PathBuf, usize, usize)>,
+    /// Hardware MIDI in. Green zone throughout: midir runs its own thread
+    /// and the app drains it here, exactly as it drains every other
+    /// worker. Nothing from it reaches the audio callback.
+    midi_input: daw::midi_input::MidiInput,
     /// Green-zone waveform analysis and immutable views keyed by the exact
     /// playback path. Duplicated clips share one analysis.
     waveform_service: waveform::Service,
@@ -6881,6 +6885,7 @@ impl App {
             drag_import: None,
             pending_drop_spots: Vec::new(),
             pending_song_landings: Vec::new(),
+            midi_input: daw::midi_input::MidiInput::default(),
             waveform_service,
             waveform_cache: HashMap::new(),
             waveform_pending: HashSet::new(),

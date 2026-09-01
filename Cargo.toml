@@ -9,6 +9,15 @@ edition = "2024"
 # --- audio i/o — RED ZONE ---
 rtaudio           = { version = "0.8.0", features = ["jack_linux"] }
 
+# --- MIDI input — GREEN ZONE ---
+# ALSA seq on Linux, CoreMIDI on macOS, WinMM on Windows. NOT the `jack`
+# feature, and not the jack crate: the backend note already traded JACK
+# integration for cross-platform reach, and THE GOTCHA makes JACK
+# presence unreliable by construction here — rtaudio silently builds
+# without it. Binding MIDI to JACK would stack a second invisible failure
+# behind the first. See notes/20260831-midi-and-tempo-decisions.md.
+midir             = "0.10"
+
 # --- rt-safe plumbing — RED ZONE ---
 rtrb              = "0.4.0"
 triple_buffer     = "9.0.0"

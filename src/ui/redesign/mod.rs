@@ -67,6 +67,13 @@ pub struct Redesign {
     midi_typing: midi_typing::MidiTyping,
     sequence: sequence::SequencePanel,
     transport: transport::TransportBar,
+    /// A pitch played on HARDWARE, waiting for the next frame to enter it.
+    ///
+    /// Hardware notes join the same road the typed piano already uses, so
+    /// entry has one meaning wherever the note came from. Held here rather
+    /// than threaded through `show`'s argument list, which is already at
+    /// its limit.
+    queued_pitch: Option<crate::pitch::Pitch>,
 }
 
 pub struct Outcome {
@@ -80,6 +87,13 @@ pub struct Outcome {
 impl Redesign {
     pub fn focus_arrangement(&mut self) {
         self.keyboard.focus(keyboard::FocusTarget::Arrangement);
+    }
+
+    /// Enter a pitch played on hardware. The newest wins: a frame can
+    /// only enter one note, and the most recent key is the one the hand
+    /// meant.
+    pub fn enter_pitch(&mut self, pitch: crate::pitch::Pitch) {
+        self.queued_pitch = Some(pitch);
     }
 
     pub fn focus_sequence(&mut self) {
@@ -174,6 +188,7 @@ impl Redesign {
             }
         }
 
+        let queued_pitch = self.queued_pitch.take();
         let detail_target = match self.detail {
             Detail::Sequence => keyboard::FocusTarget::Sequence,
             Detail::Chain => keyboard::FocusTarget::Chain,
@@ -233,14 +248,19 @@ impl Redesign {
                             sentence: &mut self.keyboard.sentence,
                             registers: &mut self.keyboard.registers,
                         },
-                        midi.entered.map(|entered| match entered {
-                            midi_typing::Entered::Midi(midi) => {
-                                crate::pitch::Pitch::from_midi(midi)
-                            }
-                            midi_typing::Entered::Degree { degree, period } => {
-                                crate::pitch::Pitch::degree(degree, period)
-                            }
-                        }),
+                        // A typed note wins over a hardware one only
+                        // because it is the more deliberate of the two;
+                        // either way exactly one note enters per frame.
+                        midi.entered
+                            .map(|entered| match entered {
+                                midi_typing::Entered::Midi(midi) => {
+                                    crate::pitch::Pitch::from_midi(midi)
+                                }
+                                midi_typing::Entered::Degree { degree, period } => {
+                                    crate::pitch::Pitch::degree(degree, period)
+                                }
+                            })
+                            .or(queued_pitch),
                         sequence_view,
                         lens_view,
                     );
