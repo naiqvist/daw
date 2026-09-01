@@ -22,6 +22,10 @@ pub(crate) enum Verb {
     Resize,
     Mute,
     Solo,
+    /// Arm the addressed track for recording.
+    Arm,
+    /// Cycle the addressed track's input monitor through off/in/auto.
+    Monitor,
     Rename,
     /// Edit a trig's condition sign.
     Condition,
@@ -45,6 +49,10 @@ pub(crate) const TABLE: &[(Verb, egui::Key, &str)] = &[
     (Verb::Resize, egui::Key::R, "RESIZE"),
     (Verb::Mute, egui::Key::M, "MUTE"),
     (Verb::Solo, egui::Key::S, "SOLO"),
+    (Verb::Arm, egui::Key::A, "ARM"),
+    // M already means mute and I enters MIDI typing. V keeps monitoring on
+    // the left hand without stealing either established word.
+    (Verb::Monitor, egui::Key::V, "MONITOR"),
     (Verb::Rename, egui::Key::F2, "RENAME"),
     (Verb::Condition, egui::Key::C, "CONDITION"),
     (Verb::Search, egui::Key::Slash, "SEARCH"),

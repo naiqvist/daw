@@ -63,6 +63,24 @@ impl App {
 
     pub(crate) fn begin_recording(&mut self) {
         let routes = self.record_routes();
+        if routes.iter().any(|route| {
+            self.song_track_map
+                .values()
+                .any(|legacy| *legacy == route.track)
+        }) {
+            // P5 will give takes a canonical Song landing place. Until then,
+            // beginning on an owned twin would create a legacy clip that the
+            // next Song projection erases. Refuse BEFORE the recorder opens
+            // files: a take not started is safer than a take shown and lost.
+            // The lane's own arm remains live for monitoring; only the global
+            // recording request drops so this refusal is spoken once.
+            self.transport.armed = false;
+            self.notice = Some(
+                "recording refused — this Song lane's takes have nowhere to land yet; no take was started"
+                    .to_owned(),
+            );
+            return;
+        }
         if routes.is_empty() {
             // Said once, and it stops the transport asking again every
             // frame: nothing is armed, or what is armed has no input.
@@ -264,6 +282,33 @@ mod tests {
         let mut app = App::new(&storage);
         app.arrangement.tracks[0].kind = TrackKind::Audio;
         app
+    }
+
+    #[test]
+    fn a_song_owned_armed_lane_refuses_before_a_take_can_start() {
+        let mut app = app_with_audio_lane();
+        app.arrangement.tracks[0].armed = true;
+        app.arrangement.tracks[0].input = TrackInput::Mono(0);
+        app.transport.armed = true;
+        app.song_track_map.insert(app.song.tracks[0].id, 0);
+
+        app.begin_recording();
+
+        assert!(!app.transport.armed, "the request would repeat every frame");
+        assert!(
+            app.arrangement.tracks[0].armed,
+            "the lane arm is for monitoring too"
+        );
+        assert!(
+            app.arrangement.clips[0].is_empty(),
+            "a take reached the lossy twin"
+        );
+        assert_eq!(
+            app.notice.as_deref(),
+            Some(
+                "recording refused — this Song lane's takes have nowhere to land yet; no take was started"
+            )
+        );
     }
 
     fn take() -> record::Take {

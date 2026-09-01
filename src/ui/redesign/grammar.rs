@@ -203,6 +203,19 @@ mod tests {
     }
 
     #[test]
+    fn arm_and_monitor_are_immediate_global_verbs() {
+        let mut sentence = Sentence::default();
+        let arm = sentence.feed_verb(Verb::Arm).expect("arm acts on the spot");
+        let monitor = sentence
+            .feed_verb(Verb::Monitor)
+            .expect("monitor acts on the spot");
+        assert_eq!(arm.verb, Some(Verb::Arm));
+        assert_eq!(monitor.verb, Some(Verb::Monitor));
+        assert_eq!(arm.motion, None);
+        assert_eq!(monitor.motion, None);
+    }
+
+    #[test]
     fn a_new_verb_replaces_a_pending_one() {
         let mut sentence = Sentence::default();
         assert_eq!(sentence.feed_verb(Verb::Nudge), None);

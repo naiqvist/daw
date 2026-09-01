@@ -260,6 +260,8 @@ const fn verb_name(verb: Verb) -> &'static str {
         Verb::Resize => "RESIZE",
         Verb::Mute => "MUTE",
         Verb::Solo => "SOLO",
+        Verb::Arm => "ARM",
+        Verb::Monitor => "MONITOR",
         Verb::Rename => "RENAME",
         Verb::Condition => "CONDITION",
         Verb::Search => "SEARCH",

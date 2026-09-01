@@ -30,6 +30,8 @@ const CHOOSER_W: f32 = 420.0;
 const CHOOSER_FIELD_H: f32 = 32.0;
 const CHOOSER_ROW_H: f32 = 26.0;
 const CHOOSER_ROWS: usize = 7;
+const TRACK_HEAD_MIN_W: f32 = 218.0;
+const TRACK_STATE_W: f32 = 116.0;
 
 const VOID: egui::Color32 = egui::Color32::BLACK;
 const BAND: egui::Color32 = egui::Color32::from_gray(12);
@@ -89,6 +91,19 @@ pub struct DeviceView {
     pub params: Vec<ParamView>,
 }
 
+/// Live recording state shown only on an audio track's reserved head.
+/// Strings arrive already formatted; this surface owns signs, not routing.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrackStateView {
+    pub input: String,
+    pub monitor: String,
+    pub monitoring: bool,
+    pub armed: bool,
+    /// Armed while the transport is recording. Waiting is standing state;
+    /// this is change, and earns the second rail.
+    pub recording: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct CatalogueItem {
     pub name: String,
@@ -123,6 +138,7 @@ pub fn track_send_index(param: u32) -> Option<usize> {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct View {
     pub track_name: Option<String>,
+    pub track_state: Option<TrackStateView>,
     pub devices: Vec<DeviceView>,
     pub catalogue: Vec<CatalogueItem>,
 }
@@ -137,6 +153,8 @@ pub enum Intent {
     ToggleBypass {
         device: u64,
     },
+    ToggleTrackArm,
+    CycleTrackMonitor,
     /// Move `device` onto `target`; the shared rack helper decides which
     /// side from their direction in the canonical chain.
     Reorder {
@@ -303,6 +321,24 @@ impl ChainPanel {
             (None, Some(Motion::Right)) => self.move_address(view, count as isize),
             (None, Some(motion @ (Motion::Up | Motion::Down))) => {
                 self.adjust(view, motion, count, outcome)
+            }
+            (Some(Verb::Arm), _) => {
+                if self.selected_device != Some(TRACK_HEAD_ID) {
+                    self.refusal = Some("ARM: TRACK HEAD ONLY".to_owned());
+                } else if view.track_state.is_none() {
+                    self.refusal = Some("ARM: AUDIO TRACKS ONLY".to_owned());
+                } else {
+                    outcome.intents.push(Intent::ToggleTrackArm);
+                }
+            }
+            (Some(Verb::Monitor), _) => {
+                if self.selected_device != Some(TRACK_HEAD_ID) {
+                    self.refusal = Some("MONITOR: TRACK HEAD ONLY".to_owned());
+                } else if view.track_state.is_none() {
+                    self.refusal = Some("MONITOR: AUDIO TRACKS ONLY".to_owned());
+                } else {
+                    outcome.intents.push(Intent::CycleTrackMonitor);
+                }
             }
             (Some(Verb::Act), _) => {
                 if let Some(device) = self.selected(view) {
@@ -637,9 +673,21 @@ impl ChainPanel {
             let ink = card_ink(device.bypassed);
             painter.rect_filled(card, 0.0, ink.surface);
             let header = egui::Rect::from_min_size(card.min, egui::vec2(card.width(), HEADER_H));
+            let track_state = (device.id == TRACK_HEAD_ID)
+                .then_some(view.track_state.as_ref())
+                .flatten();
+            let title_header = track_state.map_or(header, |_| {
+                egui::Rect::from_min_max(
+                    header.min,
+                    egui::pos2(
+                        (header.right() - TRACK_STATE_W - GAP).max(header.left()),
+                        header.bottom(),
+                    ),
+                )
+            });
             let header_response = ui
                 .interact(
-                    header,
+                    title_header,
                     ui.id().with(("chain-device", device.id)),
                     egui::Sense::click(),
                 )
@@ -664,16 +712,33 @@ impl ChainPanel {
             let inner = header.shrink2(egui::vec2(space::XS, 0.0));
             let name_rect = egui::Rect::from_min_max(
                 inner.min,
-                egui::pos2((inner.right() - 30.0).max(inner.left()), inner.bottom()),
+                egui::pos2(
+                    track_state.map_or_else(
+                        || (inner.right() - 30.0).max(inner.left()),
+                        |_| title_header.right(),
+                    ),
+                    inner.bottom(),
+                ),
             );
             draw_text(&painter, name_rect, &device.name, ink.text);
-            painter.text(
-                inner.right_center(),
-                egui::Align2::RIGHT_CENTER,
-                if device.bypassed { "OFF" } else { "ON" },
-                egui::FontId::new(font::MICRO_LABEL, egui::FontFamily::Monospace),
-                ink.muted,
-            );
+            if let Some(state) = track_state {
+                let controls = egui::Rect::from_min_max(
+                    egui::pos2(header.right() - TRACK_STATE_W, header.top()),
+                    header.right_bottom(),
+                );
+                if draw_track_state(ui, &painter, controls, state, ink, outcome) {
+                    self.selected_device = Some(device.id);
+                    self.selected_param = 0;
+                }
+            } else {
+                painter.text(
+                    inner.right_center(),
+                    egui::Align2::RIGHT_CENTER,
+                    if device.bypassed { "OFF" } else { "ON" },
+                    egui::FontId::new(font::MICRO_LABEL, egui::FontFamily::Monospace),
+                    ink.muted,
+                );
+            }
 
             let mut top = header.bottom() + CARD_PAD;
             if layout.geometry.hero_h > 0.0 {
@@ -822,6 +887,129 @@ fn draw_text(painter: &egui::Painter, rect: egui::Rect, text: &str, color: egui:
     );
 }
 
+/// Three facts, one plate: route is read-only here (`:input` names it
+/// exactly), while monitor and arm are direct presses. Armed-and-waiting gets
+/// one muted rail; recording adds a second bright rail because change, not
+/// standing state, earns contrast.
+fn draw_track_state(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    state: &TrackStateView,
+    ink: CardInk,
+    outcome: &mut Outcome,
+) -> bool {
+    let arm = egui::Rect::from_min_max(egui::pos2(rect.right() - 36.0, rect.top()), rect.max);
+    let monitor = egui::Rect::from_min_max(
+        egui::pos2(arm.left() - GAP - 32.0, rect.top()),
+        egui::pos2(arm.left() - GAP, rect.bottom()),
+    );
+    let input = egui::Rect::from_min_max(rect.min, egui::pos2(monitor.left() - GAP, rect.bottom()));
+
+    let input_response = ui
+        .interact(input, ui.id().with("track-input"), egui::Sense::hover())
+        .on_hover_text(format!(
+            "INPUT {} · TYPE :input <channel|L/R|none>",
+            state.input
+        ));
+    painter.rect_filled(
+        input,
+        0.0,
+        if input_response.hovered() {
+            ink.hover
+        } else {
+            ink.cell
+        },
+    );
+    painter.with_clip_rect(input).text(
+        input.center(),
+        egui::Align2::CENTER_CENTER,
+        format!("I {}", state.input),
+        egui::FontId::new(font::MICRO_LABEL, egui::FontFamily::Monospace),
+        ink.muted,
+    );
+
+    let monitor_response = ui
+        .interact(monitor, ui.id().with("track-monitor"), egui::Sense::click())
+        .affords(Affords::Press)
+        .on_hover_text("MONITOR OFF / IN / AUTO · V");
+    painter.rect_filled(
+        monitor,
+        0.0,
+        if monitor_response.hovered() {
+            ink.hover
+        } else {
+            ink.cell
+        },
+    );
+    painter.text(
+        monitor.center(),
+        egui::Align2::CENTER_CENTER,
+        &state.monitor,
+        egui::FontId::new(font::MICRO_LABEL, egui::FontFamily::Monospace),
+        ink.text,
+    );
+    if state.monitoring {
+        painter.rect_filled(
+            egui::Rect::from_min_size(
+                egui::pos2(monitor.left(), monitor.bottom() - 2.0),
+                egui::vec2(monitor.width(), 2.0),
+            ),
+            0.0,
+            ink.muted,
+        );
+    }
+    let monitor_clicked = monitor_response.clicked();
+    if monitor_clicked {
+        outcome.intents.push(Intent::CycleTrackMonitor);
+        outcome.claim_focus = true;
+    }
+
+    let arm_response = ui
+        .interact(arm, ui.id().with("track-arm"), egui::Sense::click())
+        .affords(Affords::Press)
+        .on_hover_text("TRACK RECORD ARM · A");
+    painter.rect_filled(
+        arm,
+        0.0,
+        if arm_response.hovered() {
+            ink.hover
+        } else {
+            ink.cell
+        },
+    );
+    painter.text(
+        arm.center(),
+        egui::Align2::CENTER_CENTER,
+        "ARM",
+        egui::FontId::new(font::MICRO_LABEL, egui::FontFamily::Monospace),
+        ink.text,
+    );
+    if state.armed {
+        painter.rect_filled(
+            egui::Rect::from_min_size(
+                egui::pos2(arm.left(), arm.bottom() - 2.0),
+                egui::vec2(arm.width(), 2.0),
+            ),
+            0.0,
+            if state.recording { ink.rail } else { ink.muted },
+        );
+    }
+    if state.recording {
+        painter.rect_filled(
+            egui::Rect::from_min_size(arm.min, egui::vec2(arm.width(), 2.0)),
+            0.0,
+            ink.rail,
+        );
+    }
+    let arm_clicked = arm_response.clicked();
+    if arm_clicked {
+        outcome.intents.push(Intent::ToggleTrackArm);
+        outcome.claim_focus = true;
+    }
+    monitor_clicked || arm_clicked
+}
+
 fn display_value(param: &ParamView) -> String {
     param.lock.as_ref().map_or_else(
         || param.formatted.clone(),
@@ -926,7 +1114,7 @@ fn card_layouts(
     view.devices
         .iter()
         .map(|device| {
-            let geometry = card_geometry(
+            let mut geometry = card_geometry(
                 device.params.len(),
                 device.hero,
                 available_height - CARD_PAD * 2.0,
@@ -936,6 +1124,9 @@ fn card_layouts(
                     0
                 },
             );
+            if device.id == TRACK_HEAD_ID && view.track_state.is_some() {
+                geometry.width = geometry.width.max(TRACK_HEAD_MIN_W);
+            }
             let layout = CardLayout {
                 device: device.id,
                 x,
@@ -1154,6 +1345,7 @@ mod tests {
     fn view() -> View {
         View {
             track_name: Some("ONE".to_owned()),
+            track_state: None,
             devices: vec![device(10, 17), device(20, 2)],
             catalogue: vec![
                 CatalogueItem {
@@ -1169,6 +1361,29 @@ mod tests {
                     is_instrument: false,
                 },
             ],
+        }
+    }
+
+    fn track_head_view() -> View {
+        View {
+            track_name: Some("AUDIO 01".to_owned()),
+            track_state: Some(TrackStateView {
+                input: "1/2".to_owned(),
+                monitor: "AU".to_owned(),
+                monitoring: true,
+                armed: true,
+                recording: false,
+            }),
+            devices: vec![DeviceView {
+                id: TRACK_HEAD_ID,
+                name: "TRACK".to_owned(),
+                bypassed: false,
+                instrument: false,
+                parent: None,
+                hero: HeroKind::None,
+                params: vec![param(TRACK_LEVEL_PARAM, 1.0, 0, "0.0dB")],
+            }],
+            catalogue: Vec::new(),
         }
     }
 
@@ -1266,6 +1481,38 @@ mod tests {
         let mut panel = ChainPanel::default();
         let outcome = utter(&mut panel, &view, Some(Verb::Act), None, 1, false);
         assert_eq!(outcome.intents, vec![Intent::ToggleBypass { device: 10 }]);
+    }
+
+    #[test]
+    fn arm_and_monitor_land_only_on_the_track_head() {
+        let head = track_head_view();
+        let mut panel = ChainPanel::default();
+        assert_eq!(
+            utter(&mut panel, &head, Some(Verb::Arm), None, 1, false).intents,
+            vec![Intent::ToggleTrackArm]
+        );
+        assert_eq!(
+            utter(&mut panel, &head, Some(Verb::Monitor), None, 1, false).intents,
+            vec![Intent::CycleTrackMonitor]
+        );
+
+        let devices = view();
+        utter(&mut panel, &devices, Some(Verb::Arm), None, 1, false);
+        assert_eq!(panel.refusal.as_deref(), Some("ARM: TRACK HEAD ONLY"));
+        utter(&mut panel, &devices, Some(Verb::Monitor), None, 1, false);
+        assert_eq!(panel.refusal.as_deref(), Some("MONITOR: TRACK HEAD ONLY"));
+    }
+
+    #[test]
+    fn arm_and_monitor_refuse_on_an_instrument_head() {
+        let mut view = track_head_view();
+        view.track_state = None;
+        let mut panel = ChainPanel::default();
+
+        utter(&mut panel, &view, Some(Verb::Arm), None, 1, false);
+        assert_eq!(panel.refusal.as_deref(), Some("ARM: AUDIO TRACKS ONLY"));
+        utter(&mut panel, &view, Some(Verb::Monitor), None, 1, false);
+        assert_eq!(panel.refusal.as_deref(), Some("MONITOR: AUDIO TRACKS ONLY"));
     }
 
     #[test]
@@ -1462,5 +1709,28 @@ mod tests {
             },
         );
         assert!(offsets.into_iter().any(|offset| offset > 0.0));
+    }
+
+    #[test]
+    fn track_head_arm_and_monitor_each_own_their_pointer() {
+        use crate::ui::device::probe;
+
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 220.0));
+        let click = |at: egui::Pos2| {
+            let context = egui::Context::default();
+            let view = track_head_view();
+            let mut panel = ChainPanel::default();
+            probe::run(&context, rect, &probe::click_path(at), |ui| {
+                let mut outcome = Outcome::default();
+                panel.draw_cards(ui, rect, &view, &mut outcome);
+                outcome.intents
+            })
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+        };
+
+        assert!(click(egui::pos2(168.0, 18.0)).contains(&Intent::CycleTrackMonitor));
+        assert!(click(egui::pos2(204.0, 18.0)).contains(&Intent::ToggleTrackArm));
     }
 }

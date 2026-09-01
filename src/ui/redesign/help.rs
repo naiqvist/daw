@@ -31,6 +31,8 @@ fn key_label(key: egui::Key) -> &'static str {
         egui::Key::R => "R",
         egui::Key::M => "M",
         egui::Key::S => "S",
+        egui::Key::A => "A",
+        egui::Key::V => "V",
         egui::Key::C => "C",
         _ => "?",
     }
@@ -48,6 +50,8 @@ fn verb_hint(verb: Verb) -> &'static str {
         Verb::Resize => "then ◄ ►: grow or shrink",
         Verb::Mute => "the noun falls silent but remains",
         Verb::Solo => "the noun alone speaks",
+        Verb::Arm => "arm the track head for recording",
+        Verb::Monitor => "cycle the track head through off / in / auto",
         Verb::Rename => "type a new name, ENTER commits",
         Verb::Condition => "cycle chance; 50 C names a percent",
         Verb::Search => "find by name in this panel's world",

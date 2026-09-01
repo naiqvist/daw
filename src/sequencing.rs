@@ -39,6 +39,153 @@ fn unity() -> f32 {
     1.0
 }
 
+/// Where a lane's LIVE signal comes from, beside its clips.
+///
+/// AUDIO ONLY, deliberately. The engine's input node reads device audio
+/// channels and there is no MIDI input path at all, so a note lane must not
+/// be offered a route whose every entry is silence.
+///
+/// Channels are stored as INDICES and not clamped on load, because the
+/// number of them belongs to whatever interface is plugged in today. A
+/// channel that is not there reads as silence at the node, so a project
+/// written on an eight-in desk opens on a laptop quiet rather than wrong.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TrackInput {
+    /// Nothing. The lane is its clips and only its clips.
+    #[default]
+    None,
+    /// One channel, centred.
+    Mono(u32),
+    /// A pair, hard left and hard right.
+    Stereo(u32, u32),
+}
+
+impl TrackInput {
+    /// The label a strip shows: `—`, `1`, `1/2`.
+    ///
+    /// One-based, because a musician counts inputs from one and the engine
+    /// counts them from zero, and exactly one place should do the arithmetic.
+    pub fn label(self) -> String {
+        match self {
+            Self::None => "—".to_owned(),
+            Self::Mono(channel) => format!("{}", channel + 1),
+            Self::Stereo(left, right) => format!("{}/{}", left + 1, right + 1),
+        }
+    }
+
+    /// Every route an interface with `channels` inputs can offer, in the
+    /// order a click cycles through them: nothing, each channel alone, then
+    /// each adjacent pair.
+    pub fn routes(channels: u32) -> Vec<Self> {
+        let mut out = vec![Self::None];
+        out.extend((0..channels).map(Self::Mono));
+        out.extend(
+            (0..channels.saturating_sub(1))
+                .step_by(2)
+                .map(|left| Self::Stereo(left, left + 1)),
+        );
+        out
+    }
+
+    /// The next route after this one, wrapping. `back` walks the other way.
+    pub fn cycled(self, channels: u32, back: bool) -> Self {
+        let routes = Self::routes(channels);
+        let at = routes.iter().position(|route| *route == self).unwrap_or(0);
+        let step = if back { routes.len() - 1 } else { 1 };
+        routes[(at + step) % routes.len()]
+    }
+}
+
+/// Whether a routed input is HEARD.
+///
+/// `Off` is the safety default: an input wired to the speakers may be a
+/// feedback loop, so choosing a source must not itself make noise. `Auto`
+/// makes arming one gesture — armed lanes are heard, disarmed lanes are not.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub enum Monitor {
+    #[default]
+    Off,
+    /// Heard whenever there is a route, armed or not.
+    In,
+    /// Heard while the lane is armed.
+    Auto,
+}
+
+impl Monitor {
+    pub fn hears(self, armed: bool) -> bool {
+        match self {
+            Self::Off => false,
+            Self::In => true,
+            Self::Auto => armed,
+        }
+    }
+
+    /// Off, in, auto — quietest first.
+    pub fn cycled(self) -> Self {
+        match self {
+            Self::Off => Self::In,
+            Self::In => Self::Auto,
+            Self::Auto => Self::Off,
+        }
+    }
+
+    /// THREE STATES, THREE SYMBOLS: paint never has to carry meaning that
+    /// the text withholds.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "--",
+            Self::In => "IN",
+            Self::Auto => "AU",
+        }
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+
+    #[test]
+    fn monitoring_truth_table_and_cycle_are_exact() {
+        assert!(!Monitor::Off.hears(false));
+        assert!(!Monitor::Off.hears(true), "off means off, armed or not");
+        assert!(Monitor::In.hears(false), "in means in, armed or not");
+        assert!(Monitor::In.hears(true));
+        assert!(!Monitor::Auto.hears(false));
+        assert!(Monitor::Auto.hears(true));
+
+        let mut state = Monitor::default();
+        let seen = (0..3)
+            .map(|_| {
+                state = state.cycled();
+                state
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(seen, vec![Monitor::In, Monitor::Auto, Monitor::Off]);
+        assert_eq!(Monitor::Off.label(), "--");
+        assert_eq!(Monitor::In.label(), "IN");
+        assert_eq!(Monitor::Auto.label(), "AU");
+    }
+
+    #[test]
+    fn route_labels_are_one_based_and_cycles_are_bounded() {
+        assert_eq!(TrackInput::None.label(), "—");
+        assert_eq!(TrackInput::Mono(0).label(), "1");
+        assert_eq!(TrackInput::Stereo(0, 1).label(), "1/2");
+        assert_eq!(
+            TrackInput::routes(2),
+            vec![
+                TrackInput::None,
+                TrackInput::Mono(0),
+                TrackInput::Mono(1),
+                TrackInput::Stereo(0, 1),
+            ]
+        );
+        assert_eq!(TrackInput::None.cycled(2, true), TrackInput::Stereo(0, 1));
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct PatternId(pub u64);
 
@@ -355,6 +502,19 @@ pub struct Track {
     /// above it at depth `d - 1`.
     #[serde(default)]
     pub depth: u8,
+    /// Where this audio lane's live signal comes from, beside its clips.
+    #[serde(default)]
+    pub input: TrackInput,
+    /// Whether that live signal is heard.
+    #[serde(default)]
+    pub monitor: Monitor,
+    /// Armed to RECORD and, under [`Monitor::Auto`], to hear the input.
+    ///
+    /// An arm is a thing the performer is doing RIGHT NOW, not project
+    /// state. Opening a song with live lanes armed could begin recording
+    /// over them before anybody had looked at the screen.
+    #[serde(skip)]
+    pub armed: bool,
 }
 
 /// A placement on a track's timeline, whichever list it came from.
@@ -718,6 +878,9 @@ impl Default for Song {
                 is_group: false,
                 folded: false,
                 depth: 0,
+                input: TrackInput::default(),
+                monitor: Monitor::default(),
+                armed: false,
             }],
             patterns: vec![pattern],
             returns: Vec::new(),
@@ -1416,6 +1579,9 @@ mod automation_tests {
             is_group: false,
             folded: false,
             depth: 0,
+            input: TrackInput::default(),
+            monitor: Monitor::default(),
+            armed: false,
         }
     }
 
@@ -1631,6 +1797,8 @@ mod mixer_tests {
             .replace("is_group:false,", "")
             .replace("folded:false,", "")
             .replace("depth:0,", "")
+            .replace("input:None,", "")
+            .replace("monitor:Off,", "")
             .replace("returns:[],", "");
         assert!(!older.contains("sends"));
         assert!(!older.contains("is_group"));
@@ -1644,6 +1812,9 @@ mod mixer_tests {
         assert!(!loaded.tracks[0].is_group);
         assert!(!loaded.tracks[0].folded);
         assert_eq!(loaded.tracks[0].depth, 0);
+        assert_eq!(loaded.tracks[0].input, TrackInput::None);
+        assert_eq!(loaded.tracks[0].monitor, Monitor::Off);
+        assert!(!loaded.tracks[0].armed);
         assert!(loaded.returns.is_empty());
     }
 
@@ -1661,10 +1832,26 @@ mod mixer_tests {
         track.is_group = true;
         track.folded = true;
         track.depth = 3;
+        track.input = TrackInput::Stereo(2, 3);
+        track.monitor = Monitor::Auto;
 
         let text = ron::ser::to_string(&song).expect("serializes");
         let loaded: Song = ron::from_str(&text).expect("deserializes");
         assert_eq!(loaded, song);
+    }
+
+    #[test]
+    fn arm_is_live_state_and_never_opens_from_disk() {
+        let mut song = Song::default();
+        song.tracks[0].armed = true;
+        let text = ron::ser::to_string(&song).expect("serializes");
+        assert!(
+            !text.contains("armed"),
+            "an arm must never become project state"
+        );
+
+        let loaded: Song = ron::from_str(&text).expect("deserializes");
+        assert!(!loaded.tracks[0].armed, "the song opened armed");
     }
 
     #[test]
@@ -1851,6 +2038,9 @@ mod audio_block_tests {
             is_group: false,
             folded: false,
             depth: 0,
+            input: TrackInput::default(),
+            monitor: Monitor::default(),
+            armed: false,
         });
         song.tracks.len() - 1
     }

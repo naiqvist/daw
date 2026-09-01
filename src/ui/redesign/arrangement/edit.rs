@@ -113,6 +113,9 @@ fn add_track_of(song: &mut Song, kind: TrackKind) -> &'static str {
         is_group: false,
         folded: false,
         depth: 0,
+        input: crate::sequencing::TrackInput::default(),
+        monitor: crate::sequencing::Monitor::default(),
+        armed: false,
     });
     notice
 }

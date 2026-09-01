@@ -600,6 +600,43 @@ impl App {
                         &[device::ParamEdit { param, value }],
                     );
                 }
+                Intent::ToggleTrackArm => {
+                    let Some(index) = self.song_track_for_active_chain() else {
+                        self.notice = Some("ARM: NO SONG TRACK".to_owned());
+                        continue;
+                    };
+                    let Some(song_track) = self.song.tracks.get_mut(index) else {
+                        self.notice = Some("ARM: NO SONG TRACK".to_owned());
+                        continue;
+                    };
+                    if song_track.kind != daw::sequencing::TrackKind::Audio || song_track.is_group {
+                        self.notice = Some("ARM: AUDIO TRACKS ONLY".to_owned());
+                        continue;
+                    }
+                    song_track.armed = !song_track.armed;
+                    self.notice = Some(format!(
+                        "ARM: {}",
+                        if song_track.armed { "ON" } else { "OFF" }
+                    ));
+                    self.projected_song = None;
+                }
+                Intent::CycleTrackMonitor => {
+                    let Some(index) = self.song_track_for_active_chain() else {
+                        self.notice = Some("MONITOR: NO SONG TRACK".to_owned());
+                        continue;
+                    };
+                    let Some(song_track) = self.song.tracks.get_mut(index) else {
+                        self.notice = Some("MONITOR: NO SONG TRACK".to_owned());
+                        continue;
+                    };
+                    if song_track.kind != daw::sequencing::TrackKind::Audio || song_track.is_group {
+                        self.notice = Some("MONITOR: AUDIO TRACKS ONLY".to_owned());
+                        continue;
+                    }
+                    song_track.monitor = song_track.monitor.cycled();
+                    self.notice = Some(format!("MONITOR: {}", song_track.monitor.label()));
+                    self.projected_song = None;
+                }
                 Intent::ToggleBypass { device } => {
                     let Some(track) = track else { continue };
                     if let Some(instance) = self.chain_device_mut(ChainOwner::Track(track), device)
@@ -739,6 +776,7 @@ impl App {
             .and_then(|track| self.arrangement.tracks.get(track))
             .map(|track| daw::ui::redesign::chain::View {
                 track_name: Some(track.name.clone()),
+                track_state: None,
                 devices: track
                     .chain
                     .iter()
@@ -796,6 +834,15 @@ impl App {
         // legacy twin, so reading the twin would read a shadow.
         if let Some(song_index) = self.song_track_for_active_chain() {
             let track = &self.song.tracks[song_index];
+            if track.kind == daw::sequencing::TrackKind::Audio && !track.is_group {
+                chain_view.track_state = Some(daw::ui::redesign::chain::TrackStateView {
+                    input: track.input.label(),
+                    monitor: track.monitor.label().to_owned(),
+                    monitoring: track.monitor.hears(track.armed),
+                    armed: track.armed,
+                    recording: track.armed && self.transport.recording(),
+                });
+            }
             let level_span =
                 daw::targets::span_of(daw::sequencing::TRACK_VOLUME).unwrap_or((0.0, 1.0));
             let pan_span = daw::targets::span_of(daw::sequencing::TRACK_PAN).unwrap_or((-1.0, 1.0));
@@ -1228,6 +1275,20 @@ impl App {
                     )
                 })
                 .inner;
+            // The lower track head follows the Song cursor. Its legacy twin
+            // remains the chain owner, but the address is chosen in the new
+            // world; otherwise ARM on lane two would still arm lane one.
+            if let Some(song_index) = self.redesign.selected_song_track(&self.song)
+                && let Some(legacy) = self
+                    .song
+                    .tracks
+                    .get(song_index)
+                    .and_then(|track| self.song_track_map.get(&track.id))
+                    .copied()
+            {
+                self.arrangement.selected_clip = None;
+                self.arrangement.selected = Some(legacy);
+            }
             self.focus.end(ui, &arrangement_theme);
             self.project_song();
             self.finish_redesign_actions(ui.ctx(), actions);
@@ -1431,6 +1492,44 @@ impl App {
 // arrangement cursor's track, the sequence cursor's trig — with no
 // dialogs anywhere.
 
+fn parse_track_input(args: &[&str], channels: u32) -> Result<daw::sequencing::TrackInput, String> {
+    let [route] = args else {
+        return Err("INPUT: SAY NONE, A CHANNEL, OR L/R — :input 1/2".to_owned());
+    };
+    if route.eq_ignore_ascii_case("none") {
+        return Ok(daw::sequencing::TrackInput::None);
+    }
+
+    let parse_channel = |word: &str| -> Result<u32, String> {
+        let Ok(one_based) = word.parse::<u32>() else {
+            return Err(format!("INPUT: {word} IS NOT A CHANNEL"));
+        };
+        if channels == 0 {
+            return Err("INPUT: ENGINE OFF — NO CHANNELS TO CHOOSE".to_owned());
+        }
+        if !(1..=channels).contains(&one_based) {
+            return Err(format!(
+                "INPUT: CHANNEL {one_based} IS NOT AVAILABLE (1..{channels})"
+            ));
+        }
+        Ok(one_based - 1)
+    };
+
+    if let Some((left, right)) = route.split_once('/') {
+        if right.contains('/') || left.is_empty() || right.is_empty() {
+            return Err("INPUT: STEREO IS L/R — :input 1/2".to_owned());
+        }
+        let left = parse_channel(left)?;
+        let right = parse_channel(right)?;
+        if left == right {
+            return Err("INPUT: LEFT AND RIGHT MUST DIFFER".to_owned());
+        }
+        return Ok(daw::sequencing::TrackInput::Stereo(left, right));
+    }
+
+    parse_channel(route).map(daw::sequencing::TrackInput::Mono)
+}
+
 impl App {
     pub(super) fn typed_commands() -> &'static [PaletteTyped] {
         &[
@@ -1453,6 +1552,10 @@ impl App {
             PaletteTyped {
                 name: "punch",
                 usage: "punch <in> <out> | punch clear — capture only inside these beats",
+            },
+            PaletteTyped {
+                name: "input",
+                usage: "input <channel|L/R|none> — route the selected audio track",
             },
             PaletteTyped {
                 name: "tune",
@@ -1638,6 +1741,30 @@ impl App {
         }
     }
 
+    /// Route the selected Song audio track from the currently open
+    /// interface. The project may remember unavailable channels, but an EDIT
+    /// may not invent one: a command must land in hardware that exists now.
+    fn typed_input(&mut self, args: &[&str]) -> Result<String, String> {
+        if !self.center_song {
+            return Err("INPUT: SONG VIEW ONLY — F10".to_owned());
+        }
+        let Some(index) = self.song_track_for_active_chain() else {
+            return Err("INPUT: NO SONG TRACK".to_owned());
+        };
+        let Some(track) = self.song.tracks.get(index) else {
+            return Err("INPUT: NO SONG TRACK".to_owned());
+        };
+        if track.kind != daw::sequencing::TrackKind::Audio || track.is_group {
+            return Err("INPUT: AUDIO TRACKS ONLY".to_owned());
+        }
+
+        let route = parse_track_input(args, self.input_channels())?;
+        let track = &mut self.song.tracks[index];
+        track.input = route;
+        self.projected_song = None;
+        Ok(format!("INPUT: {}", route.label()))
+    }
+
     pub(super) fn run_typed_command(&mut self, line: &str) {
         let words: Vec<&str> = line.split_whitespace().collect();
         let Some((&name, args)) = words.split_first() else {
@@ -1656,6 +1783,7 @@ impl App {
             "tempo" => self.typed_tempo(args),
             "countin" => self.typed_count_in(args),
             "punch" => self.typed_punch(args),
+            "input" => self.typed_input(args),
             "tune" => match args.first().and_then(|cents| cents.parse::<f32>().ok()) {
                 Some(cents) if cents.is_finite() => self
                     .edit_selected_trig("TUNE", |note, _| {
@@ -1986,6 +2114,9 @@ impl App {
             projected.is_group = song_track.is_group;
             projected.folded = song_track.folded;
             projected.depth = song_track.depth;
+            projected.input = song_track.input;
+            projected.monitor = song_track.monitor;
+            projected.armed = song_track.armed;
             let mut clips = Vec::with_capacity(song_track.blocks.len());
             for block in &song_track.blocks {
                 let id = self.arrangement.next_clip_id;
@@ -2363,6 +2494,9 @@ mod projection_tests {
             is_group: false,
             folded: false,
             depth: 0,
+            input: daw::sequencing::TrackInput::None,
+            monitor: daw::sequencing::Monitor::Off,
+            armed: false,
         });
         let track = app.song.tracks.len() - 1;
 
@@ -2412,6 +2546,9 @@ mod projection_tests {
             is_group: false,
             folded: false,
             depth: 0,
+            input: daw::sequencing::TrackInput::None,
+            monitor: daw::sequencing::Monitor::Off,
+            armed: false,
         });
         let track = app.song.tracks.len() - 1;
         let imported = daw::library::ImportedWav {
@@ -2649,6 +2786,51 @@ mod projection_tests {
     }
 
     #[test]
+    fn song_input_monitor_and_arm_project_onto_the_recording_twin() {
+        let storage = shell::Storage::default();
+        let mut app = App::new(&storage);
+        app.song = song_with_trig();
+        let source = &mut app.song.tracks[0];
+        source.kind = daw::sequencing::TrackKind::Audio;
+        source.blocks.clear();
+        source.input = daw::sequencing::TrackInput::Stereo(2, 3);
+        source.monitor = daw::sequencing::Monitor::Auto;
+        source.armed = true;
+
+        app.project_song();
+
+        let legacy = app.song_track_map[&app.song.tracks[0].id];
+        let twin = &app.arrangement.tracks[legacy];
+        assert_eq!(twin.input, daw::sequencing::TrackInput::Stereo(2, 3));
+        assert_eq!(twin.monitor, daw::sequencing::Monitor::Auto);
+        assert!(twin.armed);
+    }
+
+    #[test]
+    fn a_default_song_leaves_legacy_only_routing_untouched() {
+        let storage = shell::Storage::default();
+        let mut app = App::new(&storage);
+        app.arrangement.tracks[0].input = daw::sequencing::TrackInput::Mono(4);
+        app.arrangement.tracks[0].monitor = daw::sequencing::Monitor::In;
+        app.arrangement.tracks[0].armed = true;
+        app.song = daw::sequencing::Song::default();
+        app.projected_song = None;
+
+        app.project_song();
+
+        assert_eq!(
+            app.arrangement.tracks[0].input,
+            daw::sequencing::TrackInput::Mono(4)
+        );
+        assert_eq!(
+            app.arrangement.tracks[0].monitor,
+            daw::sequencing::Monitor::In
+        );
+        assert!(app.arrangement.tracks[0].armed);
+        assert!(app.projected_song.is_none());
+    }
+
+    #[test]
     fn groups_project_as_one_contiguous_legacy_run_in_song_order() {
         let storage = shell::Storage::default();
         let mut app = App::new(&storage);
@@ -2758,6 +2940,44 @@ mod projection_tests {
         }]);
         assert_eq!(app.notice.as_deref(), Some("SEND B: NO RETURN"));
         assert_eq!(app.song.tracks[0].sends, vec![0.375]);
+    }
+
+    #[test]
+    fn track_head_arm_and_monitor_edit_song_then_reach_the_twin() {
+        let storage = shell::Storage::default();
+        let mut app = App::new(&storage);
+        app.song = song_with_trig();
+        app.song.tracks[0].kind = daw::sequencing::TrackKind::Audio;
+        app.song.tracks[0].blocks.clear();
+        app.project_song();
+
+        app.apply_redesign_chain_intents(&[
+            daw::ui::redesign::chain::Intent::ToggleTrackArm,
+            daw::ui::redesign::chain::Intent::CycleTrackMonitor,
+        ]);
+        assert!(app.song.tracks[0].armed, "arm landed on the Song");
+        assert_eq!(app.song.tracks[0].monitor, daw::sequencing::Monitor::In);
+
+        app.project_song();
+        let legacy = app.song_track_map[&app.song.tracks[0].id];
+        assert!(app.arrangement.tracks[legacy].armed);
+        assert_eq!(
+            app.arrangement.tracks[legacy].monitor,
+            daw::sequencing::Monitor::In
+        );
+    }
+
+    #[test]
+    fn arm_and_monitor_refuse_an_instrument_out_loud() {
+        let storage = shell::Storage::default();
+        let mut app = App::new(&storage);
+        app.song = song_with_trig();
+        app.project_song();
+
+        app.apply_redesign_chain_intents(&[daw::ui::redesign::chain::Intent::ToggleTrackArm]);
+        assert_eq!(app.notice.as_deref(), Some("ARM: AUDIO TRACKS ONLY"));
+        app.apply_redesign_chain_intents(&[daw::ui::redesign::chain::Intent::CycleTrackMonitor]);
+        assert_eq!(app.notice.as_deref(), Some("MONITOR: AUDIO TRACKS ONLY"));
     }
 
     #[test]
@@ -2874,6 +3094,56 @@ mod projection_tests {
         let legacy = app.song_track_map[&app.song.tracks[0].id];
         assert_eq!(app.arrangement.tracks[legacy].volume, 0.25);
         assert_eq!(app.song.tracks[0].volume, 0.25);
+    }
+
+    #[test]
+    fn typed_input_speaks_mono_stereo_none_and_every_refusal() {
+        use daw::sequencing::TrackInput;
+
+        assert_eq!(parse_track_input(&["1"], 4), Ok(TrackInput::Mono(0)));
+        assert_eq!(parse_track_input(&["4/2"], 4), Ok(TrackInput::Stereo(3, 1)));
+        assert_eq!(parse_track_input(&["none"], 0), Ok(TrackInput::None));
+        assert_eq!(
+            parse_track_input(&["1"], 0).unwrap_err(),
+            "INPUT: ENGINE OFF — NO CHANNELS TO CHOOSE"
+        );
+        assert_eq!(
+            parse_track_input(&["5"], 4).unwrap_err(),
+            "INPUT: CHANNEL 5 IS NOT AVAILABLE (1..4)"
+        );
+        assert_eq!(
+            parse_track_input(&["2/2"], 4).unwrap_err(),
+            "INPUT: LEFT AND RIGHT MUST DIFFER"
+        );
+        assert!(
+            parse_track_input(&[], 4).is_err(),
+            "missing route was silent"
+        );
+        assert!(
+            parse_track_input(&["1", "2"], 4).is_err(),
+            "extra words were silently ignored"
+        );
+    }
+
+    #[test]
+    fn typed_input_none_lands_on_the_selected_song_audio_track() {
+        let storage = shell::Storage::default();
+        let mut app = App::new(&storage);
+        app.center_song = true;
+        app.song = song_with_trig();
+        app.song.tracks[0].kind = daw::sequencing::TrackKind::Audio;
+        app.song.tracks[0].blocks.clear();
+        app.song.tracks[0].input = daw::sequencing::TrackInput::Mono(7);
+        app.project_song();
+
+        assert_eq!(app.typed_input(&["none"]), Ok("INPUT: —".to_owned()));
+        assert_eq!(app.song.tracks[0].input, daw::sequencing::TrackInput::None);
+
+        app.song.tracks[0].kind = daw::sequencing::TrackKind::Instrument;
+        assert_eq!(
+            app.typed_input(&["none"]).unwrap_err(),
+            "INPUT: AUDIO TRACKS ONLY"
+        );
     }
 
     /// A tempo change is placed by the typed palette, because a tempo is
