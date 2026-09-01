@@ -34,6 +34,19 @@ pub struct View<'a> {
     /// never inverted — key is state, not a mode, and loudness is
     /// rationed (`notes/20260831-pitch-lens-spec.md` §4).
     pub key_sign: &'a str,
+    /// What just happened, if anything did.
+    ///
+    /// The app sets notices — landings, refusals, import failures — and
+    /// until now the redesign drew NONE of them, so every one was
+    /// invisible. That breaks the rule the semiotics brief states
+    /// outright: an unavailable action must refuse visibly rather than
+    /// masquerade as inert decoration. Silence and refusal are different
+    /// states and must not look the same.
+    ///
+    /// It lives on the transport because that bar is the frame's
+    /// glanceable state line, and a notice is change rather than steady
+    /// state — which is exactly what earns contrast.
+    pub notice: Option<&'a str>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -184,6 +197,21 @@ fn draw(
             midi.octave
         )
     };
+    // What just happened, when something did. Change earns contrast, so
+    // a notice is drawn at full ink where the steady furniture is quiet
+    // — and it takes its room from the same right-hand rail rather than
+    // overlapping anything, so it can never hide the transport's state.
+    if let Some(notice) = view.notice.filter(|notice| !notice.is_empty()) {
+        let notice_w = (notice.len() as f32 * 7.0 + 16.0).min(rect.width() * 0.34);
+        let notice_rect = take_right(&mut right, rect, notice_w, GAP);
+        ui.painter().text(
+            notice_rect.right_center(),
+            egui::Align2::RIGHT_CENTER,
+            notice,
+            egui::FontId::new(font::MINI_LABEL, egui::FontFamily::Monospace),
+            OUTLINE,
+        );
+    }
     // The key sign sits beside the plate: quiet ink, always present.
     if !view.key_sign.is_empty() {
         let key_w = if compact { 92.0 } else { 128.0 };

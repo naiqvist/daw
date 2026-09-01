@@ -74,7 +74,7 @@ pub(super) fn show(
         // Closure: the result stays addressed. A new lane takes the
         // cursor; a moved lane carries it along.
         match command {
-            edit::Command::AddTrack => {
+            edit::Command::AddTrack | edit::Command::AddAudioTrack => {
                 state.cursor.track = input.song.tracks.len().saturating_sub(1);
             }
             edit::Command::MoveTrackUp => {
@@ -317,6 +317,42 @@ pub(super) fn show(
                     }
                 }
             }
+        }
+
+        // Landed sound on the same lane. A second list, drawn in the same
+        // pass, so a lane reads as one timeline rather than two.
+        for audio in &track.audio_blocks {
+            let left = beat_x(
+                timeline,
+                audio.start_tick as f64 / TICKS_PER_BEAT as f64,
+                state.view_start,
+            );
+            let right = beat_x(
+                timeline,
+                audio.end_tick() as f64 / TICKS_PER_BEAT as f64,
+                state.view_start,
+            );
+            if right - left < 1.0 {
+                continue;
+            }
+            let rect = egui::Rect::from_min_max(
+                egui::pos2(left + space::XXS, top + space::XS),
+                egui::pos2(right - space::XXS, bottom - space::XS),
+            );
+            // The carried name, never the path: an imported wav lives
+            // under a content hash, so the path reads as a checksum
+            // rather than as a sound. A hash is not a name.
+            let name = if audio.name.is_empty() {
+                "AUDIO"
+            } else {
+                audio.name.as_str()
+            };
+            let seconds = if audio.source.sample_rate == 0 {
+                0.0
+            } else {
+                audio.source.source_frames as f64 / f64::from(audio.source.sample_rate)
+            };
+            draw_audio_block(ui, rect, name, seconds);
         }
     }
 
@@ -823,6 +859,60 @@ fn draw_block(ui: &egui::Ui, rect: egui::Rect, name: &str, length_ticks: usize) 
         rect.left_center() + egui::vec2(space::SM, space::MD),
         egui::Align2::LEFT_CENTER,
         format!("64 STEP  /  {} BEAT", length_ticks / TICKS_PER_BEAT),
+        egui::FontId::new(font::MICRO_LABEL, egui::FontFamily::Monospace),
+        MUTED,
+    );
+}
+
+/// A landed sound on the timeline.
+///
+/// It shares a pattern block's material — both are content, and identity
+/// should survive a change of state rather than be repainted — but it
+/// differs in FORM, because shape is the channel that carries object
+/// type.
+///
+/// A pattern block is DIVIDED: sixty-four counted trigs, a grid, and it
+/// wears a bar along its top edge, which reads as a divider. Recorded
+/// sound has no intrinsic divisions at all; it is continuous material.
+/// So it wears a SPINE through its middle instead — where signal lives,
+/// and honest about being one thing rather than many.
+///
+/// The difference is positional, so it survives the monochrome test (both
+/// are grey) and the blur test (a top edge and a centre line stay apart
+/// when the labels go).
+///
+/// The second line is the sound's real DURATION, in seconds. That is
+/// information a pattern block cannot carry — a pattern is measured in
+/// steps, a recording in time — so the mark earns its pixels by saying
+/// something its neighbour cannot.
+///
+/// It does NOT draw a waveform. There are no peaks here to draw, and a
+/// drawn shape that did not come from the audio would be decoration
+/// impersonating an index: the brief forbids representing a capability
+/// that does not exist. When peaks are available the spine is exactly
+/// where they belong.
+fn draw_audio_block(ui: &egui::Ui, rect: egui::Rect, name: &str, seconds: f64) {
+    let painter = ui.painter();
+    painter.rect_filled(rect, 0.0, BLOCK);
+    // The spine: continuous material, drawn as one unbroken line.
+    painter.line_segment(
+        [
+            egui::pos2(rect.left(), rect.center().y),
+            egui::pos2(rect.right(), rect.center().y),
+        ],
+        egui::Stroke::new(stroke::HAIR, MUTED),
+    );
+    painter.text(
+        rect.left_center() + egui::vec2(space::SM, -space::MD),
+        egui::Align2::LEFT_CENTER,
+        name,
+        egui::FontId::new(font::BODY, egui::FontFamily::Monospace),
+        OUTLINE,
+    );
+    painter.text(
+        rect.left_center() + egui::vec2(space::SM, space::MD),
+        egui::Align2::LEFT_CENTER,
+        format!("{seconds:.2}s"),
         egui::FontId::new(font::MICRO_LABEL, egui::FontFamily::Monospace),
         MUTED,
     );

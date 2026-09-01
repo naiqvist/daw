@@ -109,6 +109,24 @@ impl Default for MidiTyping {
 
 impl MidiTyping {
     pub(crate) fn update(&mut self, ctx: &egui::Context, mode: EntryMode) -> Update {
+        // A focused text field owns the keyboard OUTRIGHT — the same rule
+        // the grammar already keeps in `Keyboard::update`. Without it,
+        // typing a name into the palette or a rename field is read as
+        // pitch: the letter I silently toggles MIDI entry on and the rest
+        // of the word is played into the pattern. Found by typing the
+        // word "AUDIO" into the command palette and watching a note
+        // appear.
+        if ctx.egui_wants_keyboard_input() {
+            return Update {
+                entered: None,
+                status: Status {
+                    enabled: self.enabled,
+                    octave: self.octave,
+                    period_shift: self.period_shift,
+                    degree_mode: matches!(mode, EntryMode::Degree { .. }),
+                },
+            };
+        }
         let toggle = ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::I));
         if toggle {
             self.enabled = !self.enabled;

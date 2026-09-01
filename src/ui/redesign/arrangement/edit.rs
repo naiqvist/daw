@@ -20,15 +20,17 @@ pub(super) enum Command {
     CreateClip,
     DeleteClips,
     AddTrack,
+    AddAudioTrack,
     MoveTrackUp,
     MoveTrackDown,
 }
 
 impl Command {
-    pub(super) const ALL: [Self; 5] = [
+    pub(super) const ALL: [Self; 6] = [
         Self::CreateClip,
         Self::DeleteClips,
         Self::AddTrack,
+        Self::AddAudioTrack,
         Self::MoveTrackUp,
         Self::MoveTrackDown,
     ];
@@ -38,6 +40,7 @@ impl Command {
             Self::CreateClip => "CREATE EMPTY MIDI CLIP",
             Self::DeleteClips => "DELETE CLIPS IN SELECTION",
             Self::AddTrack => "ADD INSTRUMENT TRACK",
+            Self::AddAudioTrack => "ADD AUDIO TRACK",
             Self::MoveTrackUp => "MOVE TRACK UP",
             Self::MoveTrackDown => "MOVE TRACK DOWN",
         }
@@ -48,6 +51,7 @@ impl Command {
             Self::CreateClip => "SEARCH / ACT",
             Self::DeleteClips => "DELETE",
             Self::AddTrack => "A NEW LANE BELOW",
+            Self::AddAudioTrack => "A LANE FOR RECORDED SOUND",
             Self::MoveTrackUp => "THIS LANE, ONE UP",
             Self::MoveTrackDown => "THIS LANE, ONE DOWN",
         }
@@ -57,7 +61,7 @@ impl Command {
         match self {
             Self::CreateClip => can_create(song, selection),
             Self::DeleteClips => intersects_block(song, selection),
-            Self::AddTrack => true,
+            Self::AddTrack | Self::AddAudioTrack => true,
             Self::MoveTrackUp => selection.first_track > 0,
             Self::MoveTrackDown => selection.first_track + 1 < song.tracks.len(),
         }
@@ -67,6 +71,19 @@ impl Command {
 /// Append a fresh instrument track. Shared by the palette command and
 /// the frame-level Ctrl+T, so the id mint lives once.
 pub(crate) fn add_track(song: &mut Song) -> &'static str {
+    add_track_of(song, TrackKind::Instrument)
+}
+
+/// Append a lane for recorded sound.
+///
+/// Without this there is no way to make an audio track at all, so
+/// landing a sample could only ever refuse — the feature existed and was
+/// unreachable.
+pub(crate) fn add_audio_track(song: &mut Song) -> &'static str {
+    add_track_of(song, TrackKind::Audio)
+}
+
+fn add_track_of(song: &mut Song, kind: TrackKind) -> &'static str {
     let id = TrackId(
         song.tracks
             .iter()
@@ -75,10 +92,15 @@ pub(crate) fn add_track(song: &mut Song) -> &'static str {
             .unwrap_or(0)
             .saturating_add(1),
     );
+    let number = song.tracks.len() + 1;
+    let (name, notice) = match kind {
+        TrackKind::Instrument => (format!("INSTRUMENT {number:02}"), "TRACK ADDED"),
+        TrackKind::Audio => (format!("AUDIO {number:02}"), "AUDIO TRACK ADDED"),
+    };
     song.tracks.push(Track {
         id,
-        name: format!("INSTRUMENT {:02}", song.tracks.len() + 1),
-        kind: TrackKind::Instrument,
+        name,
+        kind,
         blocks: Vec::new(),
         muted: false,
         solo: false,
@@ -88,7 +110,7 @@ pub(crate) fn add_track(song: &mut Song) -> &'static str {
         volume: 1.0,
         pan: 0.0,
     });
-    "TRACK ADDED"
+    notice
 }
 
 pub(super) fn apply(command: Command, song: &mut Song, selection: Selection) -> &'static str {
@@ -118,6 +140,7 @@ pub(super) fn apply(command: Command, song: &mut Song, selection: Selection) -> 
             }
         }
         Command::AddTrack => add_track(song),
+        Command::AddAudioTrack => add_audio_track(song),
         Command::MoveTrackUp => {
             let track = selection.first_track;
             if track == 0 || track >= song.tracks.len() {

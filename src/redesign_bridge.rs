@@ -972,6 +972,7 @@ impl App {
                 beat_unit: self.transport.beat_unit,
                 position: &position,
                 key_sign: &key_sign,
+                notice: self.notice.as_deref(),
             },
             redesign_browser::View {
                 snapshot: &self.library_snapshot,
@@ -1862,13 +1863,13 @@ fn project_audio_block(
 ) -> Clip {
     let start = warped_beat(tempo, block.start_tick, samples_per_beat);
     let end = warped_beat(tempo, block.end_tick(), samples_per_beat);
-    let name = block
-        .source
-        .path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("audio")
-        .to_owned();
+    // The carried name, not the path — an imported wav lives under a
+    // content hash, so the path reads as a checksum rather than a sound.
+    let name = if block.name.is_empty() {
+        "audio".to_owned()
+    } else {
+        block.name.clone()
+    };
     Clip {
         id,
         name,

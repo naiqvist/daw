@@ -10336,7 +10336,10 @@ impl App {
             120.0
         };
         let tempo = daw::tempo::TempoTable::build(&self.song, 48_000.0, reference_bpm);
-        match self.song.place_audio(track, start_tick, source, &tempo) {
+        match self
+            .song
+            .place_audio(track, start_tick, name.clone(), source, &tempo)
+        {
             Ok(_) => {
                 self.notice = Some(format!("LANDED {name}"));
                 self.projected_song = None;

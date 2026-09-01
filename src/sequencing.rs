@@ -195,6 +195,14 @@ impl LandRefusal {
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct AudioBlock {
     pub id: BlockId,
+    /// What to CALL this sound.
+    ///
+    /// Carried rather than derived from the path, because the path is a
+    /// cache artefact: an imported wav lives under a content hash, so a
+    /// name taken from it reads `ed3ac3c1f22032ac-48000` instead of
+    /// `cw_amen01_175`. A hash is not a name.
+    #[serde(default)]
+    pub name: String,
     pub start_tick: usize,
     pub length_ticks: usize,
     pub source: crate::audio_source::AudioSource,
@@ -938,6 +946,7 @@ impl Song {
         &mut self,
         track_index: usize,
         start_tick: usize,
+        name: String,
         source: crate::audio_source::AudioSource,
         tempo: &crate::tempo::TempoTable,
     ) -> Result<BlockId, LandRefusal> {
@@ -976,6 +985,7 @@ impl Song {
         let track = &mut self.tracks[track_index];
         track.audio_blocks.push(AudioBlock {
             id,
+            name,
             start_tick,
             length_ticks,
             source,
@@ -1441,6 +1451,7 @@ mod audio_block_tests {
     fn audio(id: u64, start_tick: usize, length_ticks: usize) -> AudioBlock {
         AudioBlock {
             id: BlockId(id),
+            name: "kick".to_owned(),
             start_tick,
             length_ticks,
             source: source(),
@@ -1550,7 +1561,7 @@ mod audio_block_tests {
         let tempo = crate::tempo::TempoTable::build(&song, 48_000.0, 120.0);
 
         let id = song
-            .place_audio(track, 0, source(), &tempo)
+            .place_audio(track, 0, "kick".to_owned(), source(), &tempo)
             .expect("lands on an audio track");
         let block = &song.tracks[track].audio_blocks[0];
         assert_eq!(block.id, id);
@@ -1572,7 +1583,8 @@ mod audio_block_tests {
         let track = audio_track(&mut song);
 
         let fast = crate::tempo::TempoTable::build(&song, 48_000.0, 120.0);
-        song.place_audio(track, 0, source(), &fast).expect("lands");
+        song.place_audio(track, 0, "kick".to_owned(), source(), &fast)
+            .expect("lands");
         let at_120 = song.tracks[track].audio_blocks[0].length_ticks;
 
         // Now the same sound on a song that runs at half the tempo.
@@ -1581,7 +1593,7 @@ mod audio_block_tests {
         assert!(slow_song.set_tempo_mark(0, 60.0));
         let slow = crate::tempo::TempoTable::build(&slow_song, 48_000.0, 120.0);
         slow_song
-            .place_audio(slow_track, 0, source(), &slow)
+            .place_audio(slow_track, 0, "kick".to_owned(), source(), &slow)
             .expect("lands");
         let at_60 = slow_song.tracks[slow_track].audio_blocks[0].length_ticks;
 
@@ -1600,12 +1612,12 @@ mod audio_block_tests {
         let tempo = crate::tempo::TempoTable::build(&song, 48_000.0, 120.0);
 
         assert_eq!(
-            song.place_audio(99, 0, source(), &tempo),
+            song.place_audio(99, 0, "kick".to_owned(), source(), &tempo),
             Err(LandRefusal::NoTrack)
         );
         // Track 0 of a default song is an INSTRUMENT track.
         assert_eq!(
-            song.place_audio(0, 0, source(), &tempo),
+            song.place_audio(0, 0, "kick".to_owned(), source(), &tempo),
             Err(LandRefusal::NotAnAudioTrack)
         );
 
@@ -1613,13 +1625,14 @@ mod audio_block_tests {
         let mut broken = source();
         broken.source_frames = 0;
         assert_eq!(
-            song.place_audio(track, 0, broken, &tempo),
+            song.place_audio(track, 0, "kick".to_owned(), broken, &tempo),
             Err(LandRefusal::Unreadable)
         );
 
-        song.place_audio(track, 0, source(), &tempo).expect("lands");
+        song.place_audio(track, 0, "kick".to_owned(), source(), &tempo)
+            .expect("lands");
         assert_eq!(
-            song.place_audio(track, 0, source(), &tempo),
+            song.place_audio(track, 0, "kick".to_owned(), source(), &tempo),
             Err(LandRefusal::Occupied),
             "a second sound cannot sit on the first"
         );
@@ -1646,13 +1659,19 @@ mod audio_block_tests {
         song.tracks[0].kind = TrackKind::Audio;
         let tempo = crate::tempo::TempoTable::build(&song, 48_000.0, 120.0);
         assert_eq!(
-            song.place_audio(0, 0, source(), &tempo),
+            song.place_audio(0, 0, "kick".to_owned(), source(), &tempo),
             Err(LandRefusal::Occupied)
         );
         // Past the pattern block there is room.
         assert!(
-            song.place_audio(0, DEFAULT_PATTERN_TICKS, source(), &tempo)
-                .is_ok()
+            song.place_audio(
+                0,
+                DEFAULT_PATTERN_TICKS,
+                "kick".to_owned(),
+                source(),
+                &tempo
+            )
+            .is_ok()
         );
     }
 
@@ -1663,9 +1682,11 @@ mod audio_block_tests {
         let mut song = Song::default();
         let track = audio_track(&mut song);
         let tempo = crate::tempo::TempoTable::build(&song, 48_000.0, 120.0);
-        let first = song.place_audio(track, 0, source(), &tempo).expect("lands");
+        let first = song
+            .place_audio(track, 0, "kick".to_owned(), source(), &tempo)
+            .expect("lands");
         let second = song
-            .place_audio(track, 480, source(), &tempo)
+            .place_audio(track, 480, "kick".to_owned(), source(), &tempo)
             .expect("lands");
         let pattern_id = song.tracks[0].blocks[0].id;
         assert_ne!(first, second);
