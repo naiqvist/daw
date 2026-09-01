@@ -2054,6 +2054,86 @@ mod projection_tests {
         assert!(app.song.tracks[0].audio_blocks.is_empty());
     }
 
+    /// STEP 8 of the MVP acceptance list: an export matches what the
+    /// speakers said.
+    ///
+    /// It needs no Song-direct render path during the bridge era, and
+    /// that is worth proving rather than assuming. What the speakers say
+    /// IS the projection — the compile path reads arrangement.clips, and
+    /// the projection is the only writer of the lanes it owns. So a Song
+    /// exports because it is already the thing being played.
+    ///
+    /// The test renders a Song-sourced project through the SAME
+    /// bounce_automated the export window uses, and listens.
+    #[test]
+    fn a_song_exports_through_the_projection_it_already_plays() {
+        use daw::audio::bounce::{BounceFormat, BounceOptions, bounce_automated};
+
+        let storage = shell::Storage::default();
+        let mut app = App::new(&storage);
+        app.song = song_with_trig();
+        // A curve on the Song, so the export must carry automation too.
+        app.song.tracks[0].insert_point(daw::sequencing::TRACK_VOLUME, 0, 1.0);
+        app.song.tracks[0].insert_point(
+            daw::sequencing::TRACK_VOLUME,
+            daw::sequencing::TICKS_PER_BEAT * 2,
+            0.0,
+        );
+        app.project_song();
+
+        let arrangement = &app.arrangement;
+        let (mut spec, nodes) = build_graph_spec(
+            &arrangement.tracks,
+            &arrangement.master,
+            &arrangement.returns,
+            &arrangement.clips,
+            None,
+            false,
+        );
+        spec.set_modulation(build_mod_spec(
+            &arrangement.tracks,
+            &arrangement.modulators,
+            &arrangement.mod_wires,
+            &ParameterRegistry::default(),
+            &nodes,
+        ));
+        let registry = ParameterRegistry::default();
+        let tracks = arrangement.tracks.clone();
+        let path = std::env::temp_dir().join("daw-test-song-export.wav");
+        let opts = BounceOptions {
+            length_beats: 4.0,
+            format: BounceFormat::Int24,
+            ..Default::default()
+        };
+        bounce_automated(
+            &spec,
+            &opts,
+            &path,
+            |beat, out| automation_letters(&tracks, &nodes, &registry, beat, out),
+            |_| true,
+        )
+        .expect("the song renders");
+
+        let all: Vec<i32> = hound::WavReader::open(&path)
+            .expect("the export exists")
+            .samples::<i32>()
+            .map(Result::unwrap)
+            .collect();
+        let peak = |half: &[i32]| half.iter().fold(0, |peak: i32, s| peak.max(s.abs()));
+        let (head, tail) = all.split_at(all.len() / 2);
+        assert!(
+            peak(head) > 0,
+            "a trig written in the SONG must be audible in the export"
+        );
+        assert!(
+            peak(tail) < peak(head),
+            "and the Song's own curve must be heard closing the fader: {} then {}",
+            peak(head),
+            peak(tail)
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// The fader reads in DECIBELS and pan reads its side — real data
     /// over euphemism, and an exact centre that says so in one character
     /// rather than making the reader do arithmetic.
