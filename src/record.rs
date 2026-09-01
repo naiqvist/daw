@@ -44,6 +44,29 @@ pub struct Take {
     pub sample_rate: u32,
 }
 
+/// One performed MIDI note, stamped on the transport sample timeline.
+///
+/// Pairing note-on with note-off belongs to the input side; landing owns
+/// the later sample→tick conversion and the explicit quantisation preview.
+/// Keeping samples here satisfies the sequencing contract without making a
+/// transient take into project data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MidiTakeNote {
+    pub start_sample: u64,
+    pub end_sample: u64,
+    pub pitch: u8,
+    pub velocity: u8,
+}
+
+/// A closed controller performance ready to be previewed into one Song
+/// pattern. `track` is the same projection-twin address an audio [`Take`]
+/// carries; the landing resolves it back to canonical Song ownership.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MidiTake {
+    pub track: usize,
+    pub notes: Vec<MidiTakeNote>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RecordError {
     #[error("could not make room for the recording: {0}")]

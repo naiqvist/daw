@@ -6,6 +6,19 @@
 
 use super::*;
 
+fn quantize_tick(tick: usize, grid_ticks: usize) -> Option<usize> {
+    if grid_ticks == 0 {
+        return None;
+    }
+    let below = tick / grid_ticks * grid_ticks;
+    let remainder = tick % grid_ticks;
+    Some(if remainder >= grid_ticks.div_ceil(2) {
+        below.saturating_add(grid_ticks)
+    } else {
+        below
+    })
+}
+
 impl App {
     /// Whether a take should be WRITING right now.
     ///
@@ -63,24 +76,6 @@ impl App {
 
     pub(crate) fn begin_recording(&mut self) {
         let routes = self.record_routes();
-        if routes.iter().any(|route| {
-            self.song_track_map
-                .values()
-                .any(|legacy| *legacy == route.track)
-        }) {
-            // P5 will give takes a canonical Song landing place. Until then,
-            // beginning on an owned twin would create a legacy clip that the
-            // next Song projection erases. Refuse BEFORE the recorder opens
-            // files: a take not started is safer than a take shown and lost.
-            // The lane's own arm remains live for monitoring; only the global
-            // recording request drops so this refusal is spoken once.
-            self.transport.armed = false;
-            self.notice = Some(
-                "recording refused — this Song lane's takes have nowhere to land yet; no take was started"
-                    .to_owned(),
-            );
-            return;
-        }
         if routes.is_empty() {
             // Said once, and it stops the transport asking again every
             // frame: nothing is armed, or what is armed has no input.
@@ -195,20 +190,18 @@ impl App {
         // between here.
         let latency = stream_latency.saturating_add(self.schedule_latency_frames);
         let at_sample = started_at.saturating_sub(latency);
+        let tempo =
+            daw::tempo::TempoTable::build(&self.song, f64::from(rate.max(1)), self.transport.bpm);
         let beat = if self.song.tempo.is_empty() {
             // Preserve the legacy answer bit for bit when there is no map,
             // including its sub-tick precision.
             at_sample as f64 / f64::from(rate.max(1)) * self.transport.bpm / 60.0
         } else {
-            let tempo = daw::tempo::TempoTable::build(
-                &self.song,
-                f64::from(rate.max(1)),
-                self.transport.bpm,
-            );
             tempo.tick_at(at_sample) as f64 / daw::sequencing::TICKS_PER_BEAT as f64
         };
         let at = beat as f32;
         let mut placed = 0;
+        let mut refused = Vec::new();
         for take in takes {
             let name = take
                 .path
@@ -235,27 +228,190 @@ impl App {
                 fade_out_curve: 0.0,
                 envelope: Vec::new(),
             };
-            if self
+            if let Some(song_track) = self.song_track_for_legacy_twin(take.track) {
+                // The compensation above produces the same absolute sample
+                // the legacy placement used. Song time is integral ticks, so
+                // the already-built table performs the one necessary unit
+                // conversion before the existing AudioBlock landing takes
+                // over length, overlap and id minting.
+                let start_tick = tempo.tick_at(at_sample);
+                match self
+                    .song
+                    .place_audio(song_track, start_tick, name.clone(), source, &tempo)
+                {
+                    Ok(_) => {
+                        placed += 1;
+                        self.projected_song = None;
+                    }
+                    Err(why) => refused.push(format!(
+                        "{} — {}; FILE KEPT AT {}",
+                        name,
+                        why.sign(),
+                        take.path.display()
+                    )),
+                }
+            } else if self
                 .arrangement
                 .insert_audio(take.track, at.max(0.0), name, source, self.transport.bpm)
                 .is_some()
             {
                 placed += 1;
+                self.arrangement.force_recompile = true;
+            } else {
+                refused.push(format!(
+                    "TAKE: NO TRACK — FILE KEPT AT {}",
+                    take.path.display()
+                ));
             }
         }
         if placed > 0 {
-            self.arrangement.force_recompile = true;
             // A hole is not a dropout to shrug off: the file is missing
             // samples and the take after the hole is early. Say so.
             let seconds = frames as f64 / f64::from(rate.max(1));
-            self.notice = Some(if overruns > 0 {
+            let recorded = if overruns > 0 {
                 format!(
                     "recorded {placed} take(s), {seconds:.1}s at beat {at:.2} — {overruns} block(s) were LOST, the audio has holes"
                 )
             } else {
                 format!("recorded {placed} take(s), {seconds:.1}s at beat {at:.2}")
+            };
+            self.notice = Some(if refused.is_empty() {
+                recorded
+            } else {
+                format!("{recorded}; {}", refused.join("; "))
             });
+        } else if !refused.is_empty() {
+            self.notice = Some(refused.join("; "));
         }
+    }
+
+    /// Turn a closed controller performance into one visible, pending Song
+    /// write. Nothing in the Song changes here: quantisation and collision
+    /// replacement are lossy, so the lower strip shows the COMPLETE result
+    /// as ghosts until Enter commits or Escape cancels.
+    ///
+    /// `grid_ticks` and `grid` are the visible rhythmic context's value and
+    /// sign from the frame that closes the take. Passing both keeps this
+    /// landing pure: it does not mint a second grid authority beside the UI.
+    pub(crate) fn preview_midi_take(
+        &mut self,
+        take: record::MidiTake,
+        sample_rate: u32,
+        grid_ticks: usize,
+        grid: impl Into<String>,
+    ) {
+        let Some(song_track) = self.song_track_for_legacy_twin(take.track) else {
+            self.notice = Some("MIDI TAKE: NO SONG TRACK — NOTHING CHANGED".to_owned());
+            return;
+        };
+        let Some(track) = self.song.tracks.get(song_track) else {
+            self.notice = Some("MIDI TAKE: NO SONG TRACK — NOTHING CHANGED".to_owned());
+            return;
+        };
+        if track.kind != daw::sequencing::TrackKind::Instrument || track.is_group {
+            self.notice = Some("MIDI TAKE: INSTRUMENT TRACKS ONLY — NOTHING CHANGED".to_owned());
+            return;
+        }
+        if take.notes.is_empty() {
+            self.notice = Some("MIDI TAKE: NO NOTES — NOTHING CHANGED".to_owned());
+            return;
+        }
+        if grid_ticks == 0 {
+            self.notice = Some("MIDI TAKE: GRID HAS NO DURATION — NOTHING CHANGED".to_owned());
+            return;
+        }
+
+        let tempo = daw::tempo::TempoTable::build(
+            &self.song,
+            f64::from(sample_rate.max(1)),
+            self.transport.bpm,
+        );
+        let mut destination = None;
+        let mut writes = std::collections::BTreeMap::<usize, daw::sequencing::Trig>::new();
+        for performed in take.notes {
+            let raw_start = tempo.tick_at(performed.start_sample);
+            let start_tick = quantize_tick(raw_start, grid_ticks).unwrap_or(raw_start);
+            let Some(block) = track.blocks.iter().find(|block| {
+                block.start_tick <= start_tick
+                    && start_tick < block.start_tick.saturating_add(block.length_ticks)
+            }) else {
+                self.notice = Some(format!(
+                    "MIDI TAKE: NO PATTERN UNDER TICK {start_tick} — NOTHING CHANGED"
+                ));
+                return;
+            };
+            if destination.is_some_and(|id| id != block.id) {
+                self.notice =
+                    Some("MIDI TAKE: CROSSES PATTERN BLOCKS — NOTHING CHANGED".to_owned());
+                return;
+            }
+            destination = Some(block.id);
+
+            let local_tick = start_tick.saturating_sub(block.start_tick);
+            let step = local_tick / daw::sequencing::PATTERN_STEP_TICKS;
+            if step >= daw::sequencing::PATTERN_STEPS {
+                self.notice = Some(
+                    "MIDI TAKE: NOTE FALLS PAST THE PATTERN'S LAST TRIG — NOTHING CHANGED"
+                        .to_owned(),
+                );
+                return;
+            }
+            let raw_end = tempo.tick_at(performed.end_sample.max(performed.start_sample));
+            let mut note = daw::sequencing::Note::new(
+                performed.pitch.min(127),
+                raw_end.saturating_sub(raw_start).max(1),
+                performed.velocity,
+            );
+            note.micro_ticks = (local_tick % daw::sequencing::PATTERN_STEP_TICKS) as i16;
+            writes.entry(step).or_default().add_tone(note);
+        }
+
+        let Some(block_id) = destination else {
+            self.notice = Some("MIDI TAKE: NO NOTES — NOTHING CHANGED".to_owned());
+            return;
+        };
+        let Some((_, block)) = self.song.pattern_block(block_id) else {
+            self.notice = Some("MIDI TAKE: THE PATTERN BLOCK IS GONE — NOTHING CHANGED".to_owned());
+            return;
+        };
+        let pattern_id = block.pattern_id;
+        let Some(pattern) = self.song.pattern(pattern_id) else {
+            self.notice = Some("MIDI TAKE: THE PATTERN IS GONE — NOTHING CHANGED".to_owned());
+            return;
+        };
+        let collisions = writes
+            .keys()
+            .filter(|step| {
+                let trig = pattern.trig(**step);
+                trig.enabled || !trig.notes.is_empty()
+            })
+            .count();
+        let writes = writes
+            .into_iter()
+            .map(|(step, after)| redesign_bridge::MidiTrigWrite { step, after })
+            .collect::<Vec<_>>();
+        let count = writes.len();
+        let grid = grid.into();
+        self.snap_preview = Some(redesign_bridge::SnapPreview::Midi {
+            pattern: pattern_id,
+            writes,
+            grid: grid.clone(),
+        });
+        self.redesign.focus_sequence();
+        self.notice = Some(format!(
+            "MIDI TAKE: {count} TRIG(S) ON {grid} PREVIEWED — ENTER REPLACES {collisions} COLLISION(S) · ESC CANCELS"
+        ));
+    }
+
+    /// Resolve a projection-owned legacy lane back to its canonical Song
+    /// track. A lane absent from this map is genuinely legacy-owned and must
+    /// keep using the old placement path.
+    pub(crate) fn song_track_for_legacy_twin(&self, legacy: usize) -> Option<usize> {
+        self.song.tracks.iter().position(|track| {
+            self.song_track_map
+                .get(&track.id)
+                .is_some_and(|twin| *twin == legacy)
+        })
     }
 
     /// How many hardware inputs there are to route from.
@@ -285,30 +441,34 @@ mod tests {
     }
 
     #[test]
-    fn a_song_owned_armed_lane_refuses_before_a_take_can_start() {
+    fn a_song_owned_armed_lane_can_begin_now_that_its_take_has_a_home() {
         let mut app = app_with_audio_lane();
-        app.arrangement.tracks[0].armed = true;
-        app.arrangement.tracks[0].input = TrackInput::Mono(0);
+        app.song.tracks[0].kind = daw::sequencing::TrackKind::Audio;
+        app.song.tracks[0].blocks.clear();
+        app.song.tracks[0].armed = true;
+        app.song.tracks[0].input = TrackInput::Mono(0);
+        app.project_song();
         app.transport.armed = true;
-        app.song_track_map.insert(app.song.tracks[0].id, 0);
+        let (tx, rx) = rtrb::RingBuffer::new(16);
+        drop(tx);
+        app.recorder = Some(record::Recorder::new(rx, 1, RATE));
+        let root = std::env::temp_dir().join(format!("daw-p5-begin-{}", std::process::id()));
+        app.project_path = Some(root.join("project.daw"));
 
         app.begin_recording();
 
-        assert!(!app.transport.armed, "the request would repeat every frame");
         assert!(
-            app.arrangement.tracks[0].armed,
-            "the lane arm is for monitoring too"
+            app.transport.armed,
+            "the removed guard still dropped record"
         );
         assert!(
-            app.arrangement.clips[0].is_empty(),
-            "a take reached the lossy twin"
+            app.recorder
+                .as_ref()
+                .is_some_and(record::Recorder::recording),
+            "the Song route did not open a take"
         );
-        assert_eq!(
-            app.notice.as_deref(),
-            Some(
-                "recording refused — this Song lane's takes have nowhere to land yet; no take was started"
-            )
-        );
+        let _ = app.recorder.as_mut().map(record::Recorder::finish);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn take() -> record::Take {
@@ -319,6 +479,167 @@ mod tests {
             channels: 1,
             sample_rate: RATE,
         }
+    }
+
+    #[test]
+    fn a_song_owned_audio_take_lands_as_an_audio_block_and_survives_projection() {
+        use daw::sequencing::TICKS_PER_BEAT;
+
+        let mut app = app_with_audio_lane();
+        app.transport.bpm = 120.0;
+        app.song.tracks[0].kind = daw::sequencing::TrackKind::Audio;
+        app.song.tracks[0].blocks.clear();
+        app.song.tracks[0].name = "RECORDED AUDIO".to_owned();
+        app.project_song();
+        let legacy = app.song_track_map[&app.song.tracks[0].id];
+        let table = daw::tempo::TempoTable::build(&app.song, RATE as f64, app.transport.bpm);
+        let mut recorded = take();
+        recorded.track = legacy;
+
+        app.place_takes(
+            vec![recorded],
+            table.sample_at(4 * TICKS_PER_BEAT),
+            0,
+            0,
+            RATE as u64,
+        );
+
+        assert_eq!(app.song.tracks[0].audio_blocks.len(), 1);
+        let block = app.song.tracks[0].audio_blocks[0].clone();
+        assert_eq!(block.start_tick, 4 * TICKS_PER_BEAT);
+        assert_eq!(block.source.path, std::path::Path::new("known-take.wav"));
+        assert!(
+            app.arrangement.clips[legacy].is_empty(),
+            "landed on the twin"
+        );
+
+        app.project_song();
+        assert_eq!(app.arrangement.clips[legacy].len(), 1);
+        app.song.tracks[0].volume = 0.5;
+        app.project_song();
+        assert_eq!(
+            app.song.tracks[0].audio_blocks[0], block,
+            "a later Song edit erased or rewrote the canonical take"
+        );
+        assert_eq!(app.arrangement.clips[legacy].len(), 1);
+    }
+
+    #[test]
+    fn a_refused_song_landing_keeps_the_new_take_file() {
+        let mut app = app_with_audio_lane();
+        app.song.tracks[0].kind = daw::sequencing::TrackKind::Audio;
+        app.song.tracks[0].name = "OCCUPIED AUDIO".to_owned();
+        // Deliberately keep the default pattern block: both typed block
+        // lists count as occupancy on an audio lane.
+        app.project_song();
+        let legacy = app.song_track_map[&app.song.tracks[0].id];
+        let root = std::env::temp_dir().join(format!("daw-p5-kept-{}", std::process::id()));
+        let path = root.join("new-take.wav");
+        std::fs::create_dir_all(&root).expect("test directory");
+        std::fs::write(&path, b"new take").expect("test take");
+        let mut recorded = take();
+        recorded.track = legacy;
+        recorded.path = path.clone();
+
+        app.place_takes(vec![recorded], 0, 0, 0, RATE as u64);
+
+        assert!(app.song.tracks[0].audio_blocks.is_empty());
+        assert!(path.exists(), "a refused landing deleted the new take");
+        assert!(app.notice.as_deref().is_some_and(|notice| {
+            notice.contains("LAND: BLOCK IN THE WAY") && notice.contains("FILE KEPT AT")
+        }));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_midi_take_quantises_to_the_visible_grid_then_replaces_only_on_commit() {
+        use daw::sequencing::{Note as SongNote, TICKS_PER_BEAT};
+
+        let storage = shell::Storage::default();
+        let mut app = App::new(&storage);
+        app.transport.bpm = 120.0;
+        app.song.tracks[0].name = "RECORDED MIDI".to_owned();
+        let pattern_id = app.song.tracks[0].blocks[0].pattern_id;
+        app.song
+            .pattern_mut(pattern_id)
+            .expect("default pattern")
+            .set_primary(2, SongNote::new(48, 12, 90));
+        app.project_song();
+        let legacy = app.song_track_map[&app.song.tracks[0].id];
+        let table = daw::tempo::TempoTable::build(&app.song, RATE as f64, app.transport.bpm);
+        let before = app.song.clone();
+        app.song_history = control_plane::SongHistory::new(before.clone());
+        let take = record::MidiTake {
+            track: legacy,
+            notes: vec![record::MidiTakeNote {
+                // Tick 13 rounds UP to tick 24 on the visible 1/8 grid.
+                start_sample: table.sample_at(13),
+                end_sample: table.sample_at(13 + TICKS_PER_BEAT),
+                pitch: 67,
+                velocity: 111,
+            }],
+        };
+
+        app.preview_midi_take(take, RATE, 24, "1/8");
+
+        assert_eq!(app.song, before, "the ghost preview changed the Song");
+        let Some(redesign_bridge::SnapPreview::Midi { writes, .. }) = &app.snap_preview else {
+            panic!("the take must stand as a MIDI preview");
+        };
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].step, 2);
+        assert_eq!(writes[0].after.notes.len(), 1);
+        assert_eq!(
+            writes[0].after.notes[0].pitch,
+            daw::pitch::Pitch::from_midi(67)
+        );
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|notice| { notice.contains("ENTER REPLACES 1 COLLISION(S)") })
+        );
+
+        app.commit_snap_preview();
+
+        let trig = app.song.pattern(pattern_id).expect("pattern").trig(2);
+        assert_eq!(trig.notes.len(), 1, "the old trig was merged, not replaced");
+        assert_eq!(trig.notes[0].pitch, daw::pitch::Pitch::from_midi(67));
+        assert_eq!(trig.notes[0].length_ticks, TICKS_PER_BEAT);
+        assert_eq!(
+            app.sequence_cursor_tick,
+            2 * daw::sequencing::PATTERN_STEP_TICKS
+        );
+        assert!(matches!(
+            app.snap_preview,
+            Some(redesign_bridge::SnapPreview::MidiResult { pattern }) if pattern == pattern_id
+        ));
+
+        // Song history observes the committed take as ONE edit, and undo
+        // restores the collision whole rather than merely deleting the new
+        // note and leaving an empty trig behind.
+        app.center_song = true;
+        let context = egui::Context::default();
+        let mut frame = context.run_ui(egui::RawInput::default(), |_ui| {
+            app.drive_song_history(&context);
+        });
+        frame.textures_delta.clear();
+        let modifiers = egui::Modifiers::COMMAND;
+        let undo = egui::RawInput {
+            events: vec![
+                egui::Event::ModifiersChanged(modifiers),
+                egui::Event::Key {
+                    key: egui::Key::Z,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut frame = context.run_ui(undo, |_ui| app.drive_song_history(&context));
+        frame.textures_delta.clear();
+        assert_eq!(app.song, before, "undo did not restore the replaced trig");
     }
 
     /// A tempo change in front of the take changes samples-per-beat. The

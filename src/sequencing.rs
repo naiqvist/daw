@@ -16,7 +16,9 @@ pub const GRID_COLUMNS: usize = 16;
 pub const GRID_ROWS: usize = 4;
 pub const PATTERN_STEPS: usize = GRID_COLUMNS * GRID_ROWS;
 pub const TICKS_PER_BEAT: usize = 48;
-pub const DEFAULT_PATTERN_TICKS: usize = PATTERN_STEPS * 12;
+/// The canonical Song pattern's one-sixteenth trig stride.
+pub const PATTERN_STEP_TICKS: usize = TICKS_PER_BEAT / 4;
+pub const DEFAULT_PATTERN_TICKS: usize = PATTERN_STEPS * PATTERN_STEP_TICKS;
 
 /// The canonical automation target ids the mixer speaks.
 ///

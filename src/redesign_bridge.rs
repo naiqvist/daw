@@ -106,7 +106,7 @@ fn sequence_ticks_to_beats(ticks: usize) -> f64 {
     ticks as f64 / daw::sequencing::TICKS_PER_BEAT as f64
 }
 
-const SONG_PATTERN_STEP_TICKS: usize = daw::sequencing::TICKS_PER_BEAT / 4;
+const SONG_PATTERN_STEP_TICKS: usize = daw::sequencing::PATTERN_STEP_TICKS;
 
 fn song_pattern_length(song: &daw::sequencing::Song, id: daw::sequencing::PatternId) -> usize {
     song.tracks
@@ -172,14 +172,79 @@ fn song_note_view(
 /// the `≈` playback-approximation sign.
 const APPROX_CENTS: f64 = 0.05;
 
-/// A pending `:snap-key`: the notes the trig WOULD hold, previewed as
-/// ghosts until Enter commits or Escape cancels. Snap is the one LOSSY
-/// pitch transform, and the preview contract exists because loss must
-/// be seen before it is chosen.
-pub(super) struct SnapPreview {
-    pub(super) pattern: daw::sequencing::PatternId,
+/// One whole trig a recorded MIDI take WOULD write. The complete `after`
+/// value matters: the approved collision rule replaces the addressed trig,
+/// so a preview that carried only the incoming notes would conceal what
+/// Enter actually commits.
+pub(super) struct MidiTrigWrite {
     pub(super) step: usize,
-    pub(super) after: Vec<daw::sequencing::Note>,
+    pub(super) after: daw::sequencing::Trig,
+}
+
+/// Pending lossy note material, held outside the Song until Enter commits
+/// or Escape cancels. `:snap-key` and recorded MIDI share the same preview
+/// contract and therefore the same single pending address.
+pub(super) enum SnapPreview {
+    Key {
+        pattern: daw::sequencing::PatternId,
+        step: usize,
+        after: Vec<daw::sequencing::Note>,
+    },
+    Midi {
+        pattern: daw::sequencing::PatternId,
+        writes: Vec<MidiTrigWrite>,
+        grid: String,
+    },
+    /// Closure after commit: the new material remains the lower strip's
+    /// active noun until the performer returns to the arrangement. It owns
+    /// no music, only the same transient attention a cursor owns.
+    MidiResult { pattern: daw::sequencing::PatternId },
+}
+
+impl SnapPreview {
+    fn pattern(&self) -> daw::sequencing::PatternId {
+        match self {
+            Self::Key { pattern, .. }
+            | Self::Midi { pattern, .. }
+            | Self::MidiResult { pattern } => *pattern,
+        }
+    }
+
+    fn is_pending(&self) -> bool {
+        !matches!(self, Self::MidiResult { .. })
+    }
+
+    fn ghosts(&self, key: &daw::pitch::Key) -> Vec<redesign_sequence::NoteView> {
+        match self {
+            Self::Key { step, after, .. } => after
+                .iter()
+                .map(|note| song_note_view(note, step * SONG_PATTERN_STEP_TICKS, 1.0, true, key))
+                .collect(),
+            Self::Midi { writes, .. } => writes
+                .iter()
+                .flat_map(|write| {
+                    write.after.notes.iter().map(move |note| {
+                        song_note_view(
+                            note,
+                            write.step * SONG_PATTERN_STEP_TICKS,
+                            write.after.probability,
+                            write.after.enabled,
+                            key,
+                        )
+                    })
+                })
+                .collect(),
+            Self::MidiResult { .. } => Vec::new(),
+        }
+    }
+
+    fn cancelled_notice(&self) -> &'static str {
+        match self {
+            Self::Key { .. } => "SNAP-KEY: CANCELLED — NOTHING CHANGED",
+            Self::Midi { .. } => "MIDI TAKE: CANCELLED — NOTHING CHANGED",
+            Self::MidiResult { .. } => "MIDI TAKE: RESULT STILL SELECTED",
+        }
+    }
 }
 
 /// A `.lens` file from the library, by stem, parsed on demand.
@@ -745,11 +810,16 @@ impl App {
 
     pub(super) fn draw_redesign_ui(&mut self, ui: &mut egui::Ui) {
         self.pump_midi_input();
-        // A pending snap owns Enter and Escape before anything else can
-        // hear them: commit the loss, or walk away whole. The ghosts in
+        // A pending lossy write owns Enter and Escape before anything else
+        // can hear them: commit the loss, or walk away whole. The ghosts in
         // the grid say what is at stake; the palette, when open, still
         // speaks first.
-        if self.snap_preview.is_some() && !self.palette.is_open() {
+        if self
+            .snap_preview
+            .as_ref()
+            .is_some_and(SnapPreview::is_pending)
+            && !self.palette.is_open()
+        {
             let commit = ui
                 .ctx()
                 .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
@@ -760,8 +830,14 @@ impl App {
             if commit {
                 self.commit_snap_preview();
             } else if cancel {
+                let notice = self
+                    .snap_preview
+                    .as_ref()
+                    .map_or("PREVIEW: CANCELLED — NOTHING CHANGED", |preview| {
+                        preview.cancelled_notice()
+                    });
                 self.snap_preview = None;
-                self.notice = Some("SNAP-KEY: CANCELLED — NOTHING CHANGED".to_owned());
+                self.notice = Some(notice.to_owned());
             }
         }
 
@@ -923,7 +999,10 @@ impl App {
         // reads its canonical pattern; legacy mode remains the piano-roll
         // projection and sends its intents back to the selected legacy clip.
         let song_pattern_id = if self.center_song {
-            self.redesign.selected_song_pattern(&self.song)
+            self.snap_preview
+                .as_ref()
+                .map(SnapPreview::pattern)
+                .or_else(|| self.redesign.selected_song_pattern(&self.song))
         } else {
             None
         };
@@ -1030,26 +1109,12 @@ impl App {
                     sequence_notes,
                 )
             };
-        // The pending snap's would-be notes, as ghosts over the grid.
+        // The pending lossy write's would-be notes, as ghosts over the grid.
         let sequence_ghosts: Vec<redesign_sequence::NoteView> = self
             .snap_preview
             .as_ref()
-            .filter(|preview| Some(preview.pattern) == song_pattern_id)
-            .map(|preview| {
-                preview
-                    .after
-                    .iter()
-                    .map(|note| {
-                        song_note_view(
-                            note,
-                            preview.step * SONG_PATTERN_STEP_TICKS,
-                            1.0,
-                            true,
-                            &self.song.key,
-                        )
-                    })
-                    .collect()
-            })
+            .filter(|preview| Some(preview.pattern()) == song_pattern_id)
+            .map(|preview| preview.ghosts(&self.song.key))
             .unwrap_or_default();
         let sequence_view = sequence_clip_id
             .zip(sequence_clip_name.as_deref())
@@ -1243,6 +1308,9 @@ impl App {
                 .pointer_latest_pos()
                 .is_some_and(|pointer| center.contains(pointer))
         {
+            if matches!(self.snap_preview, Some(SnapPreview::MidiResult { .. })) {
+                self.snap_preview = None;
+            }
             self.redesign.focus_arrangement();
         }
 
@@ -1625,10 +1693,13 @@ impl App {
         if !self.center_song {
             return Err("SONG VIEW ONLY — F10".to_owned());
         }
-        let pattern = self
-            .redesign
-            .selected_song_pattern(&self.song)
-            .ok_or_else(|| "NO PATTERN UNDER THE CURSOR".to_owned())?;
+        let pattern = match self.snap_preview.as_ref() {
+            Some(SnapPreview::MidiResult { pattern }) => *pattern,
+            _ => self
+                .redesign
+                .selected_song_pattern(&self.song)
+                .ok_or_else(|| "NO PATTERN UNDER THE CURSOR".to_owned())?,
+        };
         let step = self.sequence_cursor_tick / SONG_PATTERN_STEP_TICKS;
         if step >= daw::sequencing::PATTERN_STEPS {
             return Err("THE CURSOR IS OUTSIDE THE PATTERN".to_owned());
@@ -1881,7 +1952,7 @@ impl App {
                 snapped
             })
             .collect();
-        self.snap_preview = Some(SnapPreview {
+        self.snap_preview = Some(SnapPreview::Key {
             pattern: pattern_id,
             step,
             after,
@@ -1890,15 +1961,52 @@ impl App {
     }
 
     /// Enter, while a snap preview stands: the one moment loss is chosen.
-    fn commit_snap_preview(&mut self) {
+    pub(crate) fn commit_snap_preview(&mut self) {
         let Some(preview) = self.snap_preview.take() else {
             return;
         };
-        if let Some(pattern) = self.song.pattern_mut(preview.pattern) {
-            pattern.trig_mut(preview.step).notes = preview.after;
-            self.notice = Some("SNAP-KEY: SNAPPED ONTO THE KEY".to_owned());
-        } else {
-            self.notice = Some("SNAP-KEY: THE PATTERN IS GONE".to_owned());
+        match preview {
+            SnapPreview::Key {
+                pattern,
+                step,
+                after,
+            } => {
+                if let Some(pattern) = self.song.pattern_mut(pattern) {
+                    pattern.trig_mut(step).notes = after;
+                    self.notice = Some("SNAP-KEY: SNAPPED ONTO THE KEY".to_owned());
+                } else {
+                    self.notice = Some("SNAP-KEY: THE PATTERN IS GONE".to_owned());
+                }
+            }
+            SnapPreview::Midi {
+                pattern: pattern_id,
+                writes,
+                grid,
+            } => {
+                let first = writes.first().map(|write| write.step);
+                let count = writes.len();
+                if let Some(pattern) = self.song.pattern_mut(pattern_id) {
+                    for write in writes {
+                        *pattern.trig_mut(write.step) = write.after;
+                    }
+                    if let Some(step) = first {
+                        self.sequence_cursor_tick = step * SONG_PATTERN_STEP_TICKS;
+                    }
+                    self.projected_song = None;
+                    self.notice = Some(format!(
+                        "MIDI TAKE: WROTE {count} TRIG(S) ON {grid} — RESULT SELECTED"
+                    ));
+                    self.snap_preview = Some(SnapPreview::MidiResult {
+                        pattern: pattern_id,
+                    });
+                } else {
+                    self.notice =
+                        Some("MIDI TAKE: THE PATTERN IS GONE — NOTHING CHANGED".to_owned());
+                }
+            }
+            result @ SnapPreview::MidiResult { .. } => {
+                self.snap_preview = Some(result);
+            }
         }
     }
 }
