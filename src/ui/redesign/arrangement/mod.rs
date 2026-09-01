@@ -23,6 +23,9 @@ pub struct View<'a> {
     /// depends on the track's device chain — the lane never reaches into
     /// the song to find out.
     pub automation_targets: &'a [automation::TargetOption],
+    /// The punch window in beats, if one is set. On the ruler rather than
+    /// on a lane, because it is a span of TIME and belongs to no track.
+    pub punch: Option<(f32, f32)>,
 }
 
 #[derive(Default)]

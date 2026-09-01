@@ -106,7 +106,14 @@ pub(super) fn show(
         egui::pos2(area.left() + TRACK_HEADER_W, ruler.bottom()),
         egui::pos2(area.right(), canvas_bottom),
     );
-    draw_ruler(ui, ruler, timeline, state.view_start, &input.song.tempo);
+    draw_ruler(
+        ui,
+        ruler,
+        timeline,
+        state.view_start,
+        &input.song.tempo,
+        input.punch,
+    );
     let mut pointer_edit = None;
     let mut rename_outcome = RenameOutcome::Editing;
 
@@ -741,6 +748,7 @@ fn draw_ruler(
     timeline: egui::Rect,
     view_start: usize,
     tempo: &[crate::sequencing::TempoMark],
+    punch: Option<(f32, f32)>,
 ) {
     ui.painter().rect_filled(rect, 0.0, RULER);
     ui.painter().rect_filled(
@@ -794,6 +802,27 @@ fn draw_ruler(
                 egui::FontId::new(font::MINI_LABEL, egui::FontFamily::Monospace),
                 MUTED,
             );
+        }
+    }
+
+    // The punch window: where a take is allowed to write. A BRACKET
+    // rather than a fill, because a fill would compete with the bars for
+    // the ruler's ground, and because the two ends are the information —
+    // the middle can be inferred from them.
+    if let Some((start, end)) = punch.filter(|(start, end)| end > start) {
+        let left = beat_x(timeline, f64::from(start), view_start);
+        let right = beat_x(timeline, f64::from(end), view_start);
+        if right > timeline.left() && left < timeline.right() {
+            let y = rect.top() + 3.0;
+            let ink = egui::Stroke::new(stroke::HAIR, ACTIVE);
+            ui.painter()
+                .line_segment([egui::pos2(left, y), egui::pos2(right, y)], ink);
+            for x in [left, right] {
+                ui.painter().line_segment(
+                    [egui::pos2(x, y), egui::pos2(x, y + 6.0)],
+                    egui::Stroke::new(stroke::BOLD, ACTIVE),
+                );
+            }
         }
     }
 

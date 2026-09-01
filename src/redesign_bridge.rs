@@ -985,6 +985,10 @@ impl App {
                 position: &position,
                 key_sign: &key_sign,
                 notice: self.notice.as_deref(),
+                count_in_bars: self.transport.count_in_bars,
+                // Armed and rolling but not yet writing: the one state a
+                // performer must not confuse with recording.
+                counting_in: self.transport.recording() && !self.transport.capturing(),
             },
             redesign_browser::View {
                 snapshot: &self.library_snapshot,
@@ -1167,6 +1171,7 @@ impl App {
                         ui,
                         daw::ui::redesign::arrangement::View {
                             automation_targets: &automation_targets,
+                            punch: self.transport.punch,
                             song: &mut self.song,
                             playhead_beats,
                             playing: self.transport.playing,
@@ -1353,6 +1358,14 @@ impl App {
                 usage: "tempo <bpm> | tempo clear — a tempo change at the cursor",
             },
             PaletteTyped {
+                name: "countin",
+                usage: "countin <bars> | countin off — bars before a take writes",
+            },
+            PaletteTyped {
+                name: "punch",
+                usage: "punch <in> <out> | punch clear — capture only inside these beats",
+            },
+            PaletteTyped {
                 name: "tune",
                 usage: "tune <±cents> — bend the selected trig (additive)",
             },
@@ -1491,6 +1504,51 @@ impl App {
         }
     }
 
+    /// Bars of count-in before a take starts writing.
+    fn typed_count_in(&mut self, args: &[&str]) -> Result<String, String> {
+        match args.first().copied() {
+            None => Err("COUNTIN: SAY A NUMBER OF BARS, OR OFF".to_owned()),
+            Some("off") | Some("0") => {
+                self.transport.count_in_bars = 0;
+                Ok("COUNTIN: OFF".to_owned())
+            }
+            Some(word) => match word.parse::<u32>() {
+                // A ceiling, because a count-in nobody would wait through
+                // is a typo rather than an intention.
+                Ok(bars) if (1..=8).contains(&bars) => {
+                    self.transport.count_in_bars = bars;
+                    Ok(format!("COUNTIN: {bars} BAR"))
+                }
+                _ => Err(format!("COUNTIN: {word} IS NOT 1 TO 8 BARS")),
+            },
+        }
+    }
+
+    /// The beats a take is allowed to write inside.
+    fn typed_punch(&mut self, args: &[&str]) -> Result<String, String> {
+        match args {
+            [] => Err("PUNCH: SAY IN AND OUT, OR CLEAR".to_owned()),
+            ["clear"] => {
+                self.transport.set_punch(None);
+                Ok("PUNCH: CLEARED".to_owned())
+            }
+            [start, end] => {
+                let (Ok(start), Ok(end)) = (start.parse::<f32>(), end.parse::<f32>()) else {
+                    return Err("PUNCH: IN AND OUT ARE BEATS".to_owned());
+                };
+                if self.transport.set_punch(Some((start, end))) {
+                    Ok(format!("PUNCH: {start} TO {end}"))
+                } else {
+                    // Refused rather than stored: a window that can never
+                    // capture arms a recording that never writes, which
+                    // on stage looks exactly like broken hardware.
+                    Err("PUNCH: THAT WINDOW CANNOT CAPTURE".to_owned())
+                }
+            }
+            _ => Err("PUNCH: SAY IN AND OUT, OR CLEAR".to_owned()),
+        }
+    }
+
     pub(super) fn run_typed_command(&mut self, line: &str) {
         let words: Vec<&str> = line.split_whitespace().collect();
         let Some((&name, args)) = words.split_first() else {
@@ -1507,6 +1565,8 @@ impl App {
             }
             "lens" => self.typed_lens(args),
             "tempo" => self.typed_tempo(args),
+            "countin" => self.typed_count_in(args),
+            "punch" => self.typed_punch(args),
             "tune" => match args.first().and_then(|cents| cents.parse::<f32>().ok()) {
                 Some(cents) if cents.is_finite() => self
                     .edit_selected_trig("TUNE", |note, _| {
@@ -2332,6 +2392,52 @@ mod projection_tests {
         assert!(app.typed_tempo(&["-120"]).is_err(), "not a tempo");
         assert!(app.typed_tempo(&["clear"]).is_err(), "nothing to clear");
         assert!(app.song.tempo.is_empty(), "and nothing was stored");
+    }
+
+    /// Count-in and punch are placed by the typed palette, and every
+    /// refusal names its reason rather than doing nothing.
+    #[test]
+    fn count_in_and_punch_are_reachable_and_refuse_out_loud() {
+        let storage = shell::Storage::default();
+        let mut app = App::new(&storage);
+
+        assert!(app.typed_count_in(&["2"]).is_ok());
+        assert_eq!(app.transport.count_in_bars, 2);
+        assert!(app.typed_count_in(&["off"]).is_ok());
+        assert_eq!(app.transport.count_in_bars, 0);
+        assert!(app.typed_count_in(&[]).is_err(), "no argument");
+        assert!(app.typed_count_in(&["nine"]).is_err(), "not a number");
+        assert!(app.typed_count_in(&["99"]).is_err(), "past the ceiling");
+
+        assert!(app.typed_punch(&["4", "8"]).is_ok());
+        assert_eq!(app.transport.punch, Some((4.0, 8.0)));
+        assert!(app.typed_punch(&["clear"]).is_ok());
+        assert_eq!(app.transport.punch, None);
+        assert!(app.typed_punch(&[]).is_err());
+        assert!(app.typed_punch(&["8", "4"]).is_err(), "inverted");
+        assert!(app.typed_punch(&["a", "b"]).is_err(), "not beats");
+        assert_eq!(app.transport.punch, None, "and none of them was stored");
+    }
+
+    /// Armed-and-waiting is NOT recording, and the transport must be able
+    /// to say which it is. A performer who cannot tell them apart starts
+    /// playing into nothing.
+    #[test]
+    fn counting_in_is_a_different_state_from_recording() {
+        let storage = shell::Storage::default();
+        let mut app = App::new(&storage);
+        app.transport.bpm = 120.0;
+        app.transport.count_in_bars = 1;
+        app.transport.armed = true;
+        app.transport.playing = true;
+        app.transport.position = 0.0;
+        app.transport.begin_pass();
+
+        assert!(app.transport.recording(), "armed and rolling");
+        assert!(!app.transport.capturing(), "but not writing yet");
+
+        app.transport.position = 4.0 * 60.0 / 120.0;
+        assert!(app.transport.capturing(), "and now it writes");
     }
 
     /// The tempo map is AUDIBLE, not decorative.

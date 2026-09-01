@@ -34,6 +34,15 @@ pub struct View<'a> {
     /// never inverted — key is state, not a mode, and loudness is
     /// rationed (`notes/20260831-pitch-lens-spec.md` §4).
     pub key_sign: &'a str,
+    /// Bars of count-in, zero when off. Standing state: drawn quiet.
+    pub count_in_bars: u32,
+    /// True while a take is armed and rolling but NOT yet writing.
+    ///
+    /// A separate sign from armed, because they are different states and
+    /// the brief is explicit that queued and playing must not look the
+    /// same. Armed-and-waiting is not recording, and a performer who
+    /// cannot tell them apart will start playing into nothing.
+    pub counting_in: bool,
     /// What just happened, if anything did.
     ///
     /// The app sets notices — landings, refusals, import failures — and
@@ -197,6 +206,29 @@ fn draw(
             midi.octave
         )
     };
+    // The count-in. Set-but-idle is standing state and stays quiet; a
+    // count-in actually RUNNING is change, and change earns contrast —
+    // it is also the moment a performer most needs to know they are not
+    // being recorded yet.
+    if view.counting_in || view.count_in_bars > 0 {
+        let label = if view.counting_in {
+            "CNT".to_owned()
+        } else {
+            format!("CI{}", view.count_in_bars)
+        };
+        let count_rect = take_right(&mut right, rect, 44.0, GAP);
+        ui.painter().text(
+            count_rect.right_center(),
+            egui::Align2::RIGHT_CENTER,
+            label,
+            egui::FontId::new(font::MINI_LABEL, egui::FontFamily::Monospace),
+            if view.counting_in {
+                OUTLINE
+            } else {
+                egui::Color32::from_gray(128)
+            },
+        );
+    }
     // What just happened, when something did. Change earns contrast, so
     // a notice is drawn at full ink where the steady furniture is quiet
     // — and it takes its room from the same right-hand rail rather than
