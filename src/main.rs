@@ -32,9 +32,14 @@ use daw::audio::modulation::{
 use daw::audio::transport::TransportCmd;
 use daw::audio::{Engine, EngineConfig, StreamHealth};
 use daw::audio_source::AudioSource;
+use daw::devices::{self, DeviceKind, device_by_prefix};
 use daw::install_fonts;
 use daw::library::{
     self, ImportedWav, LibraryConfig, LibraryService, LibrarySnapshot, WavImportService,
+};
+use daw::targets::{
+    self, DEVICE_TARGET_PREFIX, ParameterRegistry, ParameterSpec, TRACK_PAN_TARGET,
+    TRACK_VOLUME_TARGET, device_target,
 };
 use daw::ui::action::UiAction;
 use daw::ui::affordance::{Afford, Affords};
@@ -78,13 +83,8 @@ use track::{
     MasterTrack, ReturnTrack, Track, TrackInput, delete_track_automation_time,
     insert_track_automation_time, remove_devices, sanitize_chain, split_track_automation_at,
 };
-mod record;
-mod targets;
-use targets::{
-    DEVICE_TARGET_PREFIX, ParameterRegistry, ParameterSpec, TRACK_PAN_TARGET, TRACK_VOLUME_TARGET,
-    device_target,
-};
 mod focus;
+mod record;
 use focus::Focus;
 mod device_state;
 use device_state::{
@@ -95,13 +95,11 @@ use device_state::{
     sibyl_knobs, sigil_knobs, strip_knobs, synth_knobs, tilt_knobs, tine_knobs, tone_knobs,
     umbra_knobs, unit_zoom, utility_knobs,
 };
-mod devices;
 mod shell;
 use arrangement::*;
 use bar::{Bar, TRANSPORT_GAP, TRANSPORT_GROUP_GAP, bar_layout, buttons_width, fields_width};
 use compile::*;
 use daw::ui::glyph::Glyph;
-use devices::{DeviceKind, device_by_prefix};
 use header::*;
 use rack::*;
 #[cfg(test)]

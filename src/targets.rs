@@ -122,3 +122,50 @@ impl ParameterRegistry {
         }
     }
 }
+
+/// The legal engine-unit span of an automation or modulation target.
+///
+/// Device targets resolve through the same [`ParameterRegistry`] rows that
+/// are built from each device's [`crate::params::ParamDef`] table. Unknown
+/// or stale ids are refused rather than assigned a plausible but wrong span.
+pub fn span_of(target: &str) -> Option<(f32, f32)> {
+    static REGISTRY: std::sync::LazyLock<ParameterRegistry> =
+        std::sync::LazyLock::new(ParameterRegistry::default);
+
+    REGISTRY.spec(target).map(|spec| (spec.min, spec.max))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DEVICE_TARGET_PREFIX, TRACK_PAN_TARGET, TRACK_VOLUME_TARGET, device_target, span_of,
+    };
+    use crate::devices::DeviceKind;
+
+    #[test]
+    fn target_ids_remain_the_exact_file_format_strings() {
+        assert_eq!(TRACK_VOLUME_TARGET, "track.volume");
+        assert_eq!(TRACK_PAN_TARGET, "track.pan");
+        assert_eq!(DEVICE_TARGET_PREFIX, "dev.");
+        assert_eq!(
+            device_target(7, DeviceKind::Reverb.spec(), "mix"),
+            "dev.7.reverb.mix"
+        );
+    }
+
+    #[test]
+    fn track_targets_resolve_to_the_registry_spans() {
+        assert_eq!(span_of(TRACK_VOLUME_TARGET), Some((0.0, 1.5)));
+        assert_eq!(span_of(TRACK_PAN_TARGET), Some((-1.0, 1.0)));
+    }
+
+    #[test]
+    fn device_targets_resolve_to_their_param_def_spans() {
+        assert_eq!(span_of("dev.7.reverb.predelay"), Some((0.0, 200.0)));
+    }
+
+    #[test]
+    fn unknown_target_has_no_guessed_span() {
+        assert_eq!(span_of("dev.7.reverb.not-a-parameter"), None);
+    }
+}

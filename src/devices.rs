@@ -11,6 +11,10 @@
 //!
 //! Lifted out of `main.rs` unchanged.
 
+// This data now compiles in the library; retain the public `daw::params`
+// spelling used throughout the catalogue while resolving it to this crate.
+use crate as daw;
+
 /// A device a track can hold: `SineSynth` makes sound, `Reverb` shapes it.
 ///
 /// What a device IS. Every variant is a real node with a real parameter

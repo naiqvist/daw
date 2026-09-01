@@ -6,6 +6,7 @@
 
 pub mod audio;
 pub mod audio_source;
+pub mod devices;
 pub mod dsp;
 pub mod library;
 pub mod midi_input;
@@ -15,6 +16,7 @@ pub mod pitch;
 pub mod render;
 pub mod sequencing;
 pub mod slice;
+pub mod targets;
 pub mod tempo;
 pub mod theory;
 pub mod ui;
