@@ -331,6 +331,426 @@ impl AudioProbe {
 /// How many blocks the scrolling readout keeps on screen.
 const BELT_ROWS: usize = 24;
 
+/// The loopback click sits this far into its precomputed file. The silence
+/// gives creek time to fill its cache and lets the capture stamp settle before
+/// the one sample that matters reaches the output.
+const LOOPBACK_LEAD_MS: u64 = 250;
+/// Search this far after the known output sample. A real interface round trip
+/// is normally tens of milliseconds; 750 ms leaves room for a badly buffered
+/// compatibility path while keeping correlation strictly bounded.
+const LOOPBACK_SEARCH_MS: u64 = 750;
+const LOOPBACK_IMPULSE_LEVEL: f32 = 0.8;
+const LOOPBACK_MIN_PEAK: f32 = 0.01;
+const LOOPBACK_MIN_SNR: f32 = 8.0;
+
+struct LoopbackProbe {
+    /// The engine's one capture-ring consumer. Green-side only: the callback
+    /// merely fills the other end with its existing bounded write.
+    capture: Option<rtrb::Consumer<f32>>,
+    /// Input channel zero, deinterleaved while the UI drains the ring.
+    captured: Vec<f32>,
+    phase: LoopbackPhase,
+    /// A measurement temporarily owns the schedule. On the following frame,
+    /// put the bench's authored graph back after the result is safely stored.
+    restore_graph: bool,
+}
+
+enum LoopbackPhase {
+    Idle,
+    Capturing {
+        sample_rate: u32,
+        in_channels: usize,
+        impulse_at: u64,
+        reported_latency: Option<usize>,
+        overruns_before: u64,
+    },
+    Measured(LoopbackReading),
+    NoCable(LoopbackReading),
+    Failed(String),
+}
+
+#[derive(Clone, Copy)]
+struct LoopbackReading {
+    measured_frames: Option<usize>,
+    sample_rate: u32,
+    reported_latency: Option<usize>,
+    peak: f32,
+    noise_rms: f32,
+    snr: f32,
+    clipped: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ImpulseCorrelation {
+    delay_frames: Option<usize>,
+    peak: f32,
+    noise_rms: f32,
+    snr: f32,
+    clipped: bool,
+}
+
+impl Default for LoopbackProbe {
+    fn default() -> Self {
+        Self {
+            capture: None,
+            captured: Vec::new(),
+            phase: LoopbackPhase::Idle,
+            restore_graph: false,
+        }
+    }
+}
+
+impl LoopbackProbe {
+    fn attach(&mut self, capture: Option<rtrb::Consumer<f32>>) {
+        *self = Self {
+            capture,
+            ..Self::default()
+        };
+    }
+
+    fn detach(&mut self) {
+        *self = Self::default();
+    }
+
+    fn running(&self) -> bool {
+        matches!(self.phase, LoopbackPhase::Capturing { .. })
+    }
+
+    fn discard_capture(&mut self) {
+        let Some(capture) = self.capture.as_mut() else {
+            return;
+        };
+        let waiting = capture.slots();
+        if waiting > 0
+            && let Ok(chunk) = capture.read_chunk(waiting)
+        {
+            chunk.commit_all();
+        }
+    }
+
+    fn drain_capture(&mut self, channels: usize) {
+        let channels = channels.max(1);
+        let (capture, captured) = (&mut self.capture, &mut self.captured);
+        let Some(capture) = capture.as_mut() else {
+            return;
+        };
+        let ready = capture.slots() / channels * channels;
+        if ready == 0 {
+            return;
+        }
+        if let Ok(chunk) = capture.read_chunk(ready) {
+            let (first, second) = chunk.as_slices();
+            let mut channel = 0usize;
+            for sample in first.iter().chain(second.iter()) {
+                if channel == 0 {
+                    captured.push(*sample);
+                }
+                channel += 1;
+                if channel == channels {
+                    channel = 0;
+                }
+            }
+            chunk.commit_all();
+        }
+    }
+
+    fn start(&mut self, engine: &mut Engine) -> Result<(), String> {
+        if self.capture.is_none() {
+            return Err("capture ring is unavailable — stop and restart the stream".to_owned());
+        }
+        let info = engine.info();
+        if info.in_channels == 0 || info.out_channels == 0 {
+            return Err("the stream needs at least one input and one output".to_owned());
+        }
+
+        self.discard_capture();
+        self.captured.clear();
+
+        let impulse_path = std::env::temp_dir().join(format!(
+            "daw-lab-loopback-{}-impulse.wav",
+            std::process::id()
+        ));
+        let impulse_at = write_loopback_impulse(&impulse_path, info.sample_rate)?;
+        let mut spec = GraphSpec::default();
+        let impulse = spec.push(NodeSpec::AudioClip {
+            path: impulse_path,
+            start_beats: 0.0,
+            length_beats: None,
+            source_offset_frames: 0,
+            source_frames: None,
+            loop_clip: false,
+            loop_start_frames: 0,
+            gain: 1.0,
+            fade_in_frames: 0,
+            fade_out_frames: 0,
+            fade_in_shape: 0.0,
+            fade_out_shape: 0.0,
+            envelope: Vec::new(),
+        });
+        spec.set_output(impulse);
+        let schedule = spec
+            .compile(info.sample_rate, info.max_frames)
+            .map_err(|error| format!("impulse graph refused: {error}"))?;
+        engine
+            .set_schedule(Box::new(schedule))
+            .map_err(|error| error.to_string())?;
+
+        let search_frames = frames_for_ms(info.sample_rate, LOOPBACK_SEARCH_MS);
+        self.captured
+            .reserve((impulse_at as usize).saturating_add(search_frames));
+        self.phase = LoopbackPhase::Capturing {
+            sample_rate: info.sample_rate,
+            in_channels: info.in_channels,
+            impulse_at,
+            reported_latency: info.latency_frames,
+            overruns_before: engine.capture_overruns(),
+        };
+
+        // Commands enter their ring before capture is armed. If the callback
+        // runs between these stores, `capture_start` simply stamps the later
+        // transport position; subtracting that stamp below keeps the output
+        // sample known without asking the red zone for a new timestamp.
+        engine.transport(TransportCmd::Stop);
+        engine.transport(TransportCmd::Seek(0));
+        engine.transport(TransportCmd::Play);
+        engine.set_capturing(true);
+        Ok(())
+    }
+
+    /// Drain and correlate on the UI thread. Returns after a fixed search
+    /// window, so a missing cable is a result rather than an endless wait.
+    fn poll(&mut self, engine: &Engine) {
+        let (sample_rate, in_channels, impulse_at, reported_latency, overruns_before) =
+            match self.phase {
+                LoopbackPhase::Capturing {
+                    sample_rate,
+                    in_channels,
+                    impulse_at,
+                    reported_latency,
+                    overruns_before,
+                } => (
+                    sample_rate,
+                    in_channels,
+                    impulse_at,
+                    reported_latency,
+                    overruns_before,
+                ),
+                _ => return,
+            };
+
+        self.drain_capture(in_channels);
+        if self.captured.is_empty() {
+            return;
+        }
+        let capture_start = engine.capture_start();
+        let Some(expected_impulse) = impulse_at.checked_sub(capture_start) else {
+            engine.set_capturing(false);
+            self.phase = LoopbackPhase::Failed(
+                "capture began after the impulse — run the measurement again".to_owned(),
+            );
+            self.restore_graph = true;
+            return;
+        };
+        let search_frames = frames_for_ms(sample_rate, LOOPBACK_SEARCH_MS);
+        let needed = (expected_impulse as usize)
+            .saturating_add(search_frames)
+            .saturating_add(1);
+        if self.captured.len() < needed {
+            return;
+        }
+
+        engine.set_capturing(false);
+        if engine.capture_overruns().saturating_sub(overruns_before) > 0 {
+            self.phase = LoopbackPhase::Failed(
+                "capture ring overran — the measurement has a hole; run it again".to_owned(),
+            );
+            self.restore_graph = true;
+            return;
+        }
+
+        let correlation =
+            correlate_impulse(&self.captured, expected_impulse as usize, search_frames);
+        let reading = LoopbackReading {
+            measured_frames: correlation.delay_frames,
+            sample_rate,
+            reported_latency,
+            peak: correlation.peak,
+            noise_rms: correlation.noise_rms,
+            snr: correlation.snr,
+            clipped: correlation.clipped,
+        };
+        self.phase = if correlation.delay_frames.is_some() {
+            LoopbackPhase::Measured(reading)
+        } else {
+            LoopbackPhase::NoCable(reading)
+        };
+        self.restore_graph = true;
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, engine: &mut Engine) {
+        let info = engine.info();
+        ui.add_space(10.0);
+        ui.separator();
+        ui.strong("physical loopback latency");
+        ui.label("Patch interface output 1 to interface input 1 with a physical line cable.");
+        ui.weak(
+            "Confirm daw:outport 0 feeds hardware playback 1 and hardware capture 1 feeds daw:inport 0. Turn speakers/headphones down: the test emits one click.",
+        );
+        ui.weak(
+            "Use line output → line input. Start with interface gains low, then aim for a captured peak between 0.05 and 0.8 full scale; never patch a speaker/power output into a mic input.",
+        );
+
+        let can_start = !self.running()
+            && self.capture.is_some()
+            && info.in_channels > 0
+            && info.out_channels > 0;
+        if ui
+            .add_enabled(can_start, egui::Button::new("measure round trip"))
+            .clicked()
+            && let Err(error) = self.start(engine)
+        {
+            self.phase = LoopbackPhase::Failed(error);
+        }
+
+        match &self.phase {
+            LoopbackPhase::Idle => {
+                ui.monospace("measured : not run");
+                backend_latency_ui(ui, info.latency_frames, info.sample_rate);
+            }
+            LoopbackPhase::Capturing { sample_rate, .. } => {
+                let ms = self.captured.len() as f64 * 1_000.0 / f64::from((*sample_rate).max(1));
+                ui.monospace(format!(
+                    "capturing: {ms:.0} ms — waiting through the search window"
+                ));
+                backend_latency_ui(ui, info.latency_frames, *sample_rate);
+                ui.ctx().request_repaint();
+            }
+            LoopbackPhase::Measured(reading) => reading.ui(ui, false),
+            LoopbackPhase::NoCable(reading) => reading.ui(ui, true),
+            LoopbackPhase::Failed(error) => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(0xd0, 0x5f, 0x5f),
+                    format!("measurement refused — {error}"),
+                );
+                backend_latency_ui(ui, info.latency_frames, info.sample_rate);
+            }
+        }
+    }
+}
+
+impl LoopbackReading {
+    fn ui(self, ui: &mut egui::Ui, no_cable: bool) {
+        if no_cable {
+            ui.colored_label(
+                egui::Color32::from_rgb(0xd0, 0x5f, 0x5f),
+                "NO CABLE / NO CREDIBLE IMPULSE — check the physical patch and interface gains",
+            );
+            ui.monospace("measured : refused");
+        } else if let Some(frames) = self.measured_frames {
+            let ms = frames as f64 * 1_000.0 / f64::from(self.sample_rate.max(1));
+            ui.monospace(format!("measured : {frames} frames · {ms:.3} ms"));
+        }
+        backend_latency_ui(ui, self.reported_latency, self.sample_rate);
+        if let (Some(measured), Some(reported)) = (self.measured_frames, self.reported_latency) {
+            let delta = measured as i128 - reported as i128;
+            let delta_ms = delta as f64 * 1_000.0 / f64::from(self.sample_rate.max(1));
+            ui.monospace(format!("delta    : {delta:+} frames · {delta_ms:+.3} ms"));
+        }
+        ui.monospace(format!(
+            "signal   : peak {:.4} · floor {:.6} · {:.1}× floor",
+            self.peak, self.noise_rms, self.snr
+        ));
+        if self.clipped {
+            ui.colored_label(
+                egui::Color32::from_rgb(0xd0, 0xa0, 0x5f),
+                "input clipped — timing is shown, but lower the interface gain and repeat",
+            );
+        }
+    }
+}
+
+fn backend_latency_ui(ui: &mut egui::Ui, latency: Option<usize>, sample_rate: u32) {
+    match latency {
+        Some(frames) => {
+            let ms = frames as f64 * 1_000.0 / f64::from(sample_rate.max(1));
+            ui.monospace(format!("reported : {frames} frames · {ms:.3} ms"));
+        }
+        None => {
+            ui.monospace("reported : backend supplied no figure");
+        }
+    }
+}
+
+fn frames_for_ms(sample_rate: u32, milliseconds: u64) -> usize {
+    (u64::from(sample_rate).saturating_mul(milliseconds) / 1_000) as usize
+}
+
+fn correlate_impulse(
+    captured: &[f32],
+    expected_impulse: usize,
+    search_frames: usize,
+) -> ImpulseCorrelation {
+    // The signal is a unit impulse scaled by `LOOPBACK_IMPULSE_LEVEL`, so
+    // cross-correlation is the captured sample at each candidate lag. Remove
+    // the pre-impulse DC mean first, then pick the largest absolute score so
+    // a polarity-inverting input remains measurable.
+    let baseline_end = expected_impulse.min(captured.len());
+    let baseline = &captured[..baseline_end];
+    let mean = if baseline.is_empty() {
+        0.0
+    } else {
+        baseline
+            .iter()
+            .map(|sample| f64::from(*sample))
+            .sum::<f64>()
+            / baseline.len() as f64
+    };
+    let noise_rms = if baseline.is_empty() {
+        0.0
+    } else {
+        (baseline
+            .iter()
+            .map(|sample| {
+                let centered = f64::from(*sample) - mean;
+                centered * centered
+            })
+            .sum::<f64>()
+            / baseline.len() as f64)
+            .sqrt() as f32
+    };
+    let end = expected_impulse
+        .saturating_add(search_frames)
+        .saturating_add(1)
+        .min(captured.len());
+    let mut best_score = 0.0f32;
+    let mut peak = 0.0f32;
+    let mut peak_at = expected_impulse;
+    for (index, sample) in captured
+        .get(expected_impulse..end)
+        .unwrap_or(&[])
+        .iter()
+        .enumerate()
+    {
+        let centered = (*sample - mean as f32).abs();
+        let score = centered * LOOPBACK_IMPULSE_LEVEL;
+        if score > best_score {
+            best_score = score;
+            peak = centered;
+            peak_at = expected_impulse + index;
+        }
+    }
+    let floor = noise_rms.max(1e-6);
+    let snr = peak / floor;
+    let credible = peak >= LOOPBACK_MIN_PEAK && snr >= LOOPBACK_MIN_SNR;
+    ImpulseCorrelation {
+        delay_frames: credible.then_some(peak_at.saturating_sub(expected_impulse)),
+        peak,
+        noise_rms,
+        snr,
+        clipped: peak >= 0.99,
+    }
+}
+
 struct EngineBench {
     engine: Option<Engine>,
     error: Option<String>,
@@ -365,6 +785,7 @@ struct EngineBench {
     /// Newest block first. Sampled at UI rate, so this is a thinned view of the
     /// belt, not every block — blocks arrive ~187x/sec, frames redraw ~60x/sec.
     belt: VecDeque<BlockSnapshot>,
+    loopback: LoopbackProbe,
 }
 
 impl Default for EngineBench {
@@ -398,6 +819,7 @@ impl Default for EngineBench {
             id_b: None,
             id_mixer: None,
             belt: VecDeque::new(),
+            loopback: LoopbackProbe::default(),
         }
     }
 }
@@ -581,6 +1003,9 @@ impl EngineBench {
 
 impl EngineBench {
     fn ui(&mut self, ui: &mut egui::Ui) {
+        if std::mem::take(&mut self.loopback.restore_graph) {
+            self.push_graph();
+        }
         ui.heading("Engine");
         ui.add_space(8.0);
 
@@ -588,7 +1013,8 @@ impl EngineBench {
             if self.engine.is_none() {
                 if ui.button("Start duplex stream").clicked() {
                     match Engine::start(EngineConfig::default()) {
-                        Ok(e) => {
+                        Ok(mut e) => {
+                            self.loopback.attach(e.take_capture());
                             self.engine = Some(e);
                             self.error = None;
                         }
@@ -600,7 +1026,11 @@ impl EngineBench {
                 }
             } else if ui.button("Stop").clicked() {
                 // Dropping the Engine stops and closes the stream.
+                if let Some(engine) = &self.engine {
+                    engine.set_capturing(false);
+                }
                 self.engine = None;
+                self.loopback.detach();
                 self.belt.clear();
                 self.tone_a = false;
                 self.tone_b = false;
@@ -828,6 +1258,7 @@ impl EngineBench {
             return;
         };
         let info = engine.info();
+        self.loopback.poll(engine);
 
         // Death notice before anything else: a dead stream makes every other
         // number on this screen stale.
@@ -911,6 +1342,8 @@ impl EngineBench {
             Some(l) => ui.monospace(format!("latency     : {l} frames")),
             None => ui.monospace("latency     : not reported"),
         };
+
+        self.loopback.ui(ui, engine);
 
         // Planar layout is assumed by the DSP. If NONINTERLEAVED was not
         // honoured, every buffer index in the engine is wrong.
@@ -1352,6 +1785,37 @@ fn sequencer_ui(ui: &mut egui::Ui, eng: &mut EngineBench) {
 
 /// A 2-second 48k drum-ish loop: four kick thumps and offbeat noise hats.
 /// Exists so the audio-clip path is testable without hunting for files.
+fn write_loopback_impulse(path: &std::path::Path, sample_rate: u32) -> Result<u64, String> {
+    let sample_rate = sample_rate.max(1);
+    let impulse_at = frames_for_ms(sample_rate, LOOPBACK_LEAD_MS) as u64;
+    let total_frames = impulse_at
+        .saturating_add(u64::from(sample_rate) / 10)
+        .max(impulse_at.saturating_add(1));
+
+    // GREEN ZONE: the whole waveform exists before its schedule crosses to
+    // the callback. The red zone only performs the AudioClip node's existing
+    // bounded reads; no sample generation, allocation or filesystem work was
+    // added there.
+    let mut impulse = vec![0.0f32; total_frames as usize];
+    if let Some(sample) = impulse.get_mut(impulse_at as usize) {
+        *sample = LOOPBACK_IMPULSE_LEVEL;
+    }
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    let mut writer = hound::WavWriter::create(path, spec).map_err(|error| error.to_string())?;
+    for sample in impulse {
+        writer
+            .write_sample(sample)
+            .map_err(|error| error.to_string())?;
+    }
+    writer.finalize().map_err(|error| error.to_string())?;
+    Ok(impulse_at)
+}
+
 fn write_test_loop(path: &std::path::Path) -> Result<(), hound::Error> {
     let spec = hound::WavSpec {
         channels: 1,
@@ -1377,4 +1841,41 @@ fn write_test_loop(path: &std::path::Path) -> Result<(), hound::Error> {
         w.write_sample((v * i16::MAX as f32 * 0.8) as i16)?;
     }
     w.finalize()
+}
+
+#[cfg(test)]
+mod loopback_tests {
+    use super::*;
+
+    #[test]
+    fn correlation_finds_the_known_round_trip() {
+        let expected = 128;
+        let delay = 73;
+        let mut captured = vec![0.0; expected + 512];
+        captured[expected + delay] = 0.5;
+
+        let result = correlate_impulse(&captured, expected, 511);
+
+        assert_eq!(result.delay_frames, Some(delay));
+        assert!(result.peak >= LOOPBACK_MIN_PEAK);
+    }
+
+    #[test]
+    fn silence_is_no_cable_not_zero_latency() {
+        let captured = vec![0.0; 1_024];
+
+        let result = correlate_impulse(&captured, 256, 512);
+
+        assert_eq!(result.delay_frames, None);
+        assert_eq!(result.peak, 0.0);
+    }
+
+    #[test]
+    fn a_steady_background_is_not_credible_as_the_impulse() {
+        let captured = vec![0.2; 1_024];
+
+        let result = correlate_impulse(&captured, 256, 512);
+
+        assert_eq!(result.delay_frames, None);
+    }
 }
