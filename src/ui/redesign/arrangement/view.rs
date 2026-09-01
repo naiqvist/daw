@@ -106,7 +106,7 @@ pub(super) fn show(
         egui::pos2(area.left() + TRACK_HEADER_W, ruler.bottom()),
         egui::pos2(area.right(), canvas_bottom),
     );
-    draw_ruler(ui, ruler, timeline, state.view_start);
+    draw_ruler(ui, ruler, timeline, state.view_start, &input.song.tempo);
     let mut pointer_edit = None;
     let mut rename_outcome = RenameOutcome::Editing;
 
@@ -735,7 +735,13 @@ fn select_placement(state: &mut ArrangementState, placement: edit::Placement) {
     );
 }
 
-fn draw_ruler(ui: &egui::Ui, rect: egui::Rect, timeline: egui::Rect, view_start: usize) {
+fn draw_ruler(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    timeline: egui::Rect,
+    view_start: usize,
+    tempo: &[crate::sequencing::TempoMark],
+) {
     ui.painter().rect_filled(rect, 0.0, RULER);
     ui.painter().rect_filled(
         egui::Rect::from_min_max(rect.min, egui::pos2(timeline.left(), rect.bottom())),
@@ -789,6 +795,35 @@ fn draw_ruler(ui: &egui::Ui, rect: egui::Rect, timeline: egui::Rect, view_start:
                 MUTED,
             );
         }
+    }
+
+    // Tempo marks. A tempo change belongs on the RULER because it is a
+    // property of time itself, not of any track — putting it on a lane
+    // would say it belonged to that lane.
+    //
+    // The mark is a full-height rule plus the bpm: the rule says WHERE,
+    // the number says WHAT, and neither can be inferred from the other.
+    // It is drawn at ACTIVE rather than at full white, because the
+    // loudest thing on this bar must remain the playhead — a tempo mark
+    // is standing state, and loudness is rationed to what must always
+    // win.
+    for mark in tempo {
+        let beat = mark.tick as f64 / crate::sequencing::TICKS_PER_BEAT as f64;
+        let x = beat_x(timeline, beat, view_start);
+        if x < timeline.left() - 1.0 || x > timeline.right() + 1.0 {
+            continue;
+        }
+        ui.painter().line_segment(
+            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+            egui::Stroke::new(stroke::HAIR, ACTIVE),
+        );
+        ui.painter().text(
+            egui::pos2(x + space::XXS, rect.top() + space::XXS),
+            egui::Align2::LEFT_TOP,
+            format!("{:.0}", mark.bpm),
+            egui::FontId::new(font::MICRO_LABEL, egui::FontFamily::Monospace),
+            ACTIVE,
+        );
     }
 }
 

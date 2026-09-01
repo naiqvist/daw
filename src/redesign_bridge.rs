@@ -1349,6 +1349,10 @@ impl App {
                 usage: "lens <name> — how this track spells pitch",
             },
             PaletteTyped {
+                name: "tempo",
+                usage: "tempo <bpm> | tempo clear — a tempo change at the cursor",
+            },
+            PaletteTyped {
                 name: "tune",
                 usage: "tune <±cents> — bend the selected trig (additive)",
             },
@@ -1452,6 +1456,41 @@ impl App {
         Ok(trig.notes.len())
     }
 
+    /// A tempo change at the arrangement cursor.
+    ///
+    /// Tempo is its own authority rather than an automation target — an
+    /// envelope is read AT a tick, and tempo decides what a tick is worth
+    /// — so it gets its own verb rather than riding the lane. A number is
+    /// an argument, which is what the typed palette is for.
+    fn typed_tempo(&mut self, args: &[&str]) -> Result<String, String> {
+        let (start_beats, _) = self.redesign.song_selection_beats(&self.song);
+        let tick = beats_to_sequence_ticks(f64::from(start_beats));
+        match args.first().copied() {
+            None => Err("TEMPO: SAY A BPM, OR CLEAR".to_owned()),
+            Some("clear") => {
+                if self.song.remove_tempo_mark(tick) {
+                    self.projected_song = None;
+                    Ok("TEMPO: MARK CLEARED".to_owned())
+                } else {
+                    Err("TEMPO: NO MARK HERE".to_owned())
+                }
+            }
+            Some(word) => {
+                let Ok(bpm) = word.parse::<f64>() else {
+                    return Err(format!("TEMPO: {word} IS NOT A BPM"));
+                };
+                if self.song.set_tempo_mark(tick, bpm) {
+                    // The projection warps against the map, so a new mark
+                    // has to reach the compiler.
+                    self.projected_song = None;
+                    Ok(format!("TEMPO: {bpm:.2} FROM HERE"))
+                } else {
+                    Err(format!("TEMPO: {bpm} IS NOT A TEMPO"))
+                }
+            }
+        }
+    }
+
     pub(super) fn run_typed_command(&mut self, line: &str) {
         let words: Vec<&str> = line.split_whitespace().collect();
         let Some((&name, args)) = words.split_first() else {
@@ -1467,6 +1506,7 @@ impl App {
                 })
             }
             "lens" => self.typed_lens(args),
+            "tempo" => self.typed_tempo(args),
             "tune" => match args.first().and_then(|cents| cents.parse::<f32>().ok()) {
                 Some(cents) if cents.is_finite() => self
                     .edit_selected_trig("TUNE", |note, _| {
@@ -2255,6 +2295,43 @@ mod projection_tests {
         let legacy = app.song_track_map[&app.song.tracks[0].id];
         assert_eq!(app.arrangement.tracks[legacy].volume, 0.25);
         assert_eq!(app.song.tracks[0].volume, 0.25);
+    }
+
+    /// A tempo change is placed by the typed palette, because a tempo is
+    /// an argument and the palette is the grammar's long-sentence mouth.
+    #[test]
+    fn the_typed_tempo_command_places_and_clears_a_mark() {
+        let storage = shell::Storage::default();
+        let mut app = App::new(&storage);
+        app.song = song_with_trig();
+
+        assert!(app.typed_tempo(&["140"]).is_ok());
+        assert_eq!(app.song.tempo.len(), 1);
+        assert_eq!(app.song.bpm_at(0, 120.0), 140.0);
+
+        // Placing again at the same tick edits rather than stacks.
+        assert!(app.typed_tempo(&["90"]).is_ok());
+        assert_eq!(app.song.tempo.len(), 1);
+        assert_eq!(app.song.bpm_at(0, 120.0), 90.0);
+
+        assert!(app.typed_tempo(&["clear"]).is_ok());
+        assert!(app.song.tempo.is_empty());
+    }
+
+    /// Every refusal names its reason rather than doing nothing, and a
+    /// tempo nobody could mean is never stored.
+    #[test]
+    fn the_typed_tempo_command_refuses_out_loud() {
+        let storage = shell::Storage::default();
+        let mut app = App::new(&storage);
+        app.song = song_with_trig();
+
+        assert!(app.typed_tempo(&[]).is_err(), "no argument");
+        assert!(app.typed_tempo(&["fast"]).is_err(), "not a number");
+        assert!(app.typed_tempo(&["0"]).is_err(), "not a tempo");
+        assert!(app.typed_tempo(&["-120"]).is_err(), "not a tempo");
+        assert!(app.typed_tempo(&["clear"]).is_err(), "nothing to clear");
+        assert!(app.song.tempo.is_empty(), "and nothing was stored");
     }
 
     /// The tempo map is AUDIBLE, not decorative.
