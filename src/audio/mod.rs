@@ -55,7 +55,7 @@ use rtaudio::{
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::audio::graph::{LiveKind, LiveNote, NodeId, ParamChange, ProcessCtx, Schedule};
+use crate::audio::graph::{NodeId, ParamChange, ProcessCtx, Schedule};
 use crate::audio::transport::{Transport, TransportCmd};
 
 /// Errors reported by the backend's global error callback. Green zone: the
@@ -581,10 +581,6 @@ pub struct Engine {
     schedule_tx: rtrb::Producer<Box<Schedule>>,
     /// Parameter letters: 16-byte Copy structs, drained at each block start.
     param_tx: rtrb::Producer<ParamChange>,
-    /// Live notes from a controller or the typing keyboard, drained at each
-    /// block start beside the parameter letters. NOT sequence data — see
-    /// `notes/20260901-live-monitoring-decision.md`.
-    live_tx: rtrb::Producer<LiveNote>,
     /// Modulation letters: wire chains and source definitions, so a knob
     /// drag is heard now instead of at the next debounced schedule swap.
     mod_tx: rtrb::Producer<modulation::ModEdit>,
@@ -703,13 +699,6 @@ impl Engine {
         // 256 letters is ~1.4 blocks of continuous 60Hz knob-drag backlog —
         // far more than the callback can fall behind by.
         let (param_tx, mut param_rx) = rtrb::RingBuffer::<ParamChange>::new(256);
-        // Notes arrive at human speed — ten a second from a fast player,
-        // against a callback draining hundreds of times a second. 256 is
-        // not a backlog budget, it is headroom so wide that a dropped
-        // note-off (a note that hangs FOREVER, unlike a superseded knob)
-        // cannot happen in practice. `live_note` still reports a failed
-        // push rather than swallowing it.
-        let (live_tx, mut live_rx) = rtrb::RingBuffer::<LiveNote>::new(256);
         // Modulation edits are sent only on CHANGE, and there are far
         // fewer wires than parameters, so 128 is generous.
         let (mod_tx, mut mod_rx) = rtrb::RingBuffer::<modulation::ModEdit>::new(128);
@@ -824,15 +813,6 @@ impl Engine {
                     while let Ok(edit) = mod_rx.pop() {
                         if let Some(s) = schedule.as_mut() {
                             s.apply_mod_edit(edit);
-                        }
-                    }
-                    // Live notes AFTER the parameter and modulation letters,
-                    // so a monitored note is voiced with this block's knob
-                    // values rather than the previous block's. Bounded by
-                    // ring capacity; each apply is one index and a compare.
-                    while let Ok(note) = live_rx.pop() {
-                        if let Some(s) = schedule.as_mut() {
-                            s.apply_live_note(note);
                         }
                     }
                     // Drain transport commands, in order — the whole gesture
@@ -1043,7 +1023,6 @@ impl Engine {
             telemetry,
             schedule_tx,
             param_tx,
-            live_tx,
             mod_tx,
             transport_tx,
             audition_tx: Some(audition_tx),
@@ -1194,37 +1173,6 @@ impl Engine {
             param,
             value,
         });
-    }
-
-    /// Send one LIVE note to an instrument node — a performer's gesture,
-    /// not a sequenced event.
-    ///
-    /// **Returns whether it was delivered, and the caller must care.** A
-    /// parameter letter may be dropped on a full ring because the next one
-    /// supersedes it; a note-OFF has no successor, and dropping one leaves
-    /// a note sounding forever. On `false` the caller's recovery is
-    /// [`Self::live_all_off`], which is why that exists as its own verb.
-    #[must_use]
-    pub fn live_note(&mut self, node: NodeId, kind: LiveKind, pitch: u8, vel: u8) -> bool {
-        self.live_tx
-            .push(LiveNote {
-                node: node.to_bits(),
-                kind,
-                pitch,
-                vel,
-            })
-            .is_ok()
-    }
-
-    /// Cut every live voice on one instrument node.
-    ///
-    /// The recovery path for a dropped note-off, and the right answer
-    /// whenever a held note can no longer be released by the gesture that
-    /// started it: the monitored track changed, the controller vanished,
-    /// the transport jumped. A discontinuity already cuts the voice bank
-    /// inside the graph, so this is for the cases the graph cannot see.
-    pub fn live_all_off(&mut self, node: NodeId) -> bool {
-        self.live_note(node, LiveKind::AllOff, 0, 0)
     }
 
     /// Send one modulation edit — a wire's chain, or a source's definition.

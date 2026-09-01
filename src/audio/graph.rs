@@ -917,17 +917,6 @@ pub struct PatternClock {
 }
 
 impl PatternClock {
-    /// The next voice-stealing stamp, consumed.
-    ///
-    /// Live notes and sequenced notes share ONE age space on purpose:
-    /// stealing compares `(gate, age)`, and two independent counters
-    /// would make that comparison meaningless and steal the wrong voice.
-    fn take_age(&mut self) -> u64 {
-        let age = self.next_age;
-        self.next_age = self.next_age.wrapping_add(1);
-        age
-    }
-
     fn new(loop_samples: u64, samples_per_beat: f64) -> Self {
         Self {
             cursor: 0,
@@ -1120,7 +1109,8 @@ impl PatternClock {
                         0 => voices.note_off(ev.pitch),
                         1 => voices.plock(ev.param, if ev.restore { None } else { Some(ev.value) }),
                         _ => {
-                            let age = self.take_age();
+                            let age = self.next_age;
+                            self.next_age = self.next_age.wrapping_add(1);
                             voices.note_on(ev.pitch, ev.vel, age);
                         }
                     }
@@ -4613,32 +4603,6 @@ pub struct ParamChange {
     pub value: f32,
 }
 
-/// What a LIVE note says. The performer's gesture, not the timeline's.
-///
-/// Deliberately the same shape as [`ParamChange`]: a `Copy` letter
-/// addressed to a node by name tag, carried on its own `rtrb` ring and
-/// delivered by [`Schedule::apply_live_note`]. Nothing here is sequence
-/// data and nothing here touches a compiled event list — the reasoning,
-/// including why contract rule 4 does not forbid this, is
-/// `notes/20260901-live-monitoring-decision.md`.
-#[derive(Debug, Clone, Copy)]
-pub struct LiveNote {
-    pub node: u64,
-    pub kind: LiveKind,
-    pub pitch: u8,
-    pub vel: u8,
-}
-
-/// The three things a live gesture can say. `AllOff` exists because a
-/// discontinuity, a stop, or a change of monitored track must be able to
-/// cut a held note that no key-up will ever arrive for.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum LiveKind {
-    On,
-    Off,
-    AllOff,
-}
-
 /// One wired input as the callback sees it: left channel, and a right channel
 /// when the producer is stereo. Mono sources into stereo consumers are
 /// centered by the consumer reading `l` for both sides.
@@ -4964,43 +4928,6 @@ impl Schedule {
             } else if let Some(node) = self.nodes.get_mut(dense as usize) {
                 node.apply(change.param, change.value);
             }
-        }
-    }
-
-    /// Red zone. Deliver one LIVE note, by the same name tag and the same
-    /// generation compare a parameter letter travels under: one bounded
-    /// index, one compare, and a letter for a departed node is binned —
-    /// misdelivery is structurally impossible here too.
-    ///
-    /// This is NOT sequence data. It never reads or writes `events`; it
-    /// speaks straight to the voice bank. Contract rule 4 forbids
-    /// streaming the SEQUENCE from the UI, because a laggy thread must not
-    /// delay a note that was owed a specific sample. A monitored note is
-    /// owed no sample but "now", so that harm cannot occur, and rule 5
-    /// classifies monitoring as free-running. See
-    /// `notes/20260901-live-monitoring-decision.md`.
-    ///
-    /// A letter for a node that is not an instrument is binned rather than
-    /// guessed at: only `Node::Seq` owns a voice bank.
-    pub fn apply_live_note(&mut self, note: LiveNote) {
-        let slot = note.node as u32 as usize;
-        let generation = (note.node >> 32) as u32;
-        let Some(&(g, dense)) = self.slot_table.get(slot) else {
-            return;
-        };
-        if g != generation {
-            return;
-        }
-        let Some(Node::Seq { clock, voices, .. }) = self.nodes.get_mut(dense as usize) else {
-            return;
-        };
-        match note.kind {
-            LiveKind::On => {
-                let age = clock.take_age();
-                voices.note_on(note.pitch, note.vel, age);
-            }
-            LiveKind::Off => voices.note_off(note.pitch),
-            LiveKind::AllOff => voices.all_sound_off(),
         }
     }
 
@@ -8858,198 +8785,6 @@ mod tests {
 
     fn rms(buf: &[f32]) -> f32 {
         (buf.iter().map(|s| s * s).sum::<f32>() / buf.len() as f32).sqrt()
-    }
-
-    /// A Seq node with NO compiled notes, plus its name tag — the shape
-    /// live monitoring actually runs in: an instrument with an empty
-    /// pattern that must still be playable by hand.
-    fn live_sched() -> (Schedule, NodeId) {
-        let mut spec = GraphSpec::default();
-        let q = spec.push(NodeSpec::Seq {
-            notes: Vec::new(),
-            subloops: Vec::new(),
-            loop_len_beats: None,
-            params: Default::default(),
-        });
-        spec.set_output(q);
-        (spec.compile(48_000, 256).unwrap(), q)
-    }
-
-    fn live(node: NodeId, kind: LiveKind, pitch: u8, vel: u8) -> LiveNote {
-        LiveNote {
-            node: node.to_bits(),
-            kind,
-            pitch,
-            vel,
-        }
-    }
-
-    /// The whole claim of the feature: a note nobody compiled is audible,
-    /// and the compiled event list is untouched by it. The second half is
-    /// the contract compliance — live gestures must never become sequence
-    /// data (notes/20260901-live-monitoring-decision.md).
-    #[test]
-    fn a_live_note_sounds_and_never_enters_the_event_list() {
-        let (mut sched, id) = live_sched();
-        sched.apply_live_note(live(id, LiveKind::On, 69, 100));
-
-        // NOT run_rolling: its first block flags the first-play
-        // discontinuity, which correctly cuts every voice — including this
-        // one. A monitored note belongs to a transport already rolling.
-        let mut out = vec![0.0f32; 512];
-        run(&mut sched, &mut out);
-        assert!(
-            rms(&out) > 0.0,
-            "a live note must be audible with no compiled pattern at all"
-        );
-
-        let Some(Node::Seq { events, voices, .. }) = sched.nodes.first() else {
-            panic!("the graph should hold one Seq");
-        };
-        assert!(
-            events.is_empty(),
-            "a live note must NOT be written into the compiled event list"
-        );
-        assert!(
-            voices.held().any(|p| p == 69),
-            "the voice bank should be holding the live note"
-        );
-    }
-
-    /// A letter for a node that has departed finds a generation mismatch
-    /// and is binned, exactly as a parameter letter is. Misdelivery must be
-    /// structurally impossible for notes too — a note delivered to whatever
-    /// reused the slot would sound at random.
-    #[test]
-    fn a_live_note_for_a_departed_node_is_binned() {
-        let (mut sched, id) = live_sched();
-        // Flip a generation bit: a tag thunderdome once minted, for an
-        // occupant that is gone.
-        let stale = id.to_bits() ^ (1u64 << 32);
-        sched.apply_live_note(LiveNote {
-            node: stale,
-            kind: LiveKind::On,
-            pitch: 69,
-            vel: 100,
-        });
-
-        let mut out = vec![0.0f32; 512];
-        run(&mut sched, &mut out);
-        assert_eq!(
-            rms(&out),
-            0.0,
-            "a letter for a departed node must be binned, not delivered"
-        );
-    }
-
-    /// Only `Node::Seq` owns a voice bank. A live note addressed to
-    /// anything else is binned rather than guessed at.
-    #[test]
-    fn a_live_note_to_a_node_that_is_not_an_instrument_is_binned() {
-        let mut spec = GraphSpec::default();
-        let sine = spec.push(NodeSpec::Sine {
-            freq: 440.0,
-            amp: 0.0,
-        });
-        spec.set_output(sine);
-        let mut sched = spec.compile(48_000, 256).unwrap();
-        // Must not panic, and must not somehow make sound.
-        sched.apply_live_note(live(sine, LiveKind::On, 69, 127));
-        let mut out = vec![0.0f32; 512];
-        run(&mut sched, &mut out);
-        assert_eq!(rms(&out), 0.0, "a sine at amp 0 has nothing to say");
-    }
-
-    /// `AllOff` is the recovery path for a note whose release can never
-    /// arrive — a dropped note-off, a changed monitor target, a vanished
-    /// controller. Without it those notes sound forever.
-    #[test]
-    fn all_off_cuts_a_held_live_note() {
-        let (mut sched, id) = live_sched();
-        sched.apply_live_note(live(id, LiveKind::On, 69, 100));
-        let mut out = vec![0.0f32; 512];
-        run(&mut sched, &mut out);
-        assert!(rms(&out) > 0.0, "the note should be sounding first");
-
-        sched.apply_live_note(live(id, LiveKind::AllOff, 0, 0));
-        let Some(Node::Seq { voices, .. }) = sched.nodes.first() else {
-            panic!("the graph should hold one Seq");
-        };
-        assert_eq!(
-            voices.held().count(),
-            0,
-            "all-sound-off must leave nothing held"
-        );
-    }
-
-    /// A note-off for a pitch that is not sounding is a no-op, not a
-    /// panic and not a stolen release of some other voice.
-    #[test]
-    fn a_live_note_off_for_an_unheld_pitch_is_harmless() {
-        let (mut sched, id) = live_sched();
-        sched.apply_live_note(live(id, LiveKind::On, 69, 100));
-        sched.apply_live_note(live(id, LiveKind::Off, 60, 0));
-        let Some(Node::Seq { voices, .. }) = sched.nodes.first() else {
-            panic!("the graph should hold one Seq");
-        };
-        assert!(
-            voices.held().any(|p| p == 69),
-            "releasing an unheld pitch must not release a different note"
-        );
-    }
-
-    /// A discontinuity cuts a held LIVE note along with the sequenced
-    /// ones. They share one voice bank, which is exactly why no separate
-    /// all-sound-off machinery was added for monitoring: contract rule 2
-    /// already reaches these voices.
-    #[test]
-    fn a_discontinuity_cuts_a_held_live_note() {
-        let (mut sched, id) = live_sched();
-        sched.apply_live_note(live(id, LiveKind::On, 69, 100));
-        let mut out = vec![0.0f32; 512];
-        sched.run(&mut out, &play_ctx(0.0, true));
-        let Some(Node::Seq { voices, .. }) = sched.nodes.first() else {
-            panic!("the graph should hold one Seq");
-        };
-        assert_eq!(
-            voices.held().count(),
-            0,
-            "a discontinuity must cut a live note as it cuts a sequenced one"
-        );
-    }
-
-    /// Live and sequenced notes draw voice-stealing stamps from ONE
-    /// counter. Two independent age spaces would make `(gate, age)`
-    /// comparisons meaningless and steal the wrong voice.
-    #[test]
-    fn live_notes_advance_the_same_age_space_as_sequenced_ones() {
-        let (mut sched, id) = live_sched();
-        let age_before = match sched.nodes.first() {
-            Some(Node::Seq { clock, .. }) => clock.next_age,
-            _ => panic!("the graph should hold one Seq"),
-        };
-        sched.apply_live_note(live(id, LiveKind::On, 69, 100));
-        let age_after = match sched.nodes.first() {
-            Some(Node::Seq { clock, .. }) => clock.next_age,
-            _ => panic!("the graph should hold one Seq"),
-        };
-        assert_eq!(
-            age_after,
-            age_before + 1,
-            "a live note must consume a stamp from the clock's own counter"
-        );
-    }
-
-    /// `apply_live_note` runs in the red zone. `assert_no_alloc` ABORTS the
-    /// process on any allocation, so this passing is the claim.
-    #[test]
-    fn applying_a_live_note_allocates_nothing() {
-        let (mut sched, id) = live_sched();
-        assert_no_alloc::assert_no_alloc(|| {
-            sched.apply_live_note(live(id, LiveKind::On, 69, 100));
-            sched.apply_live_note(live(id, LiveKind::Off, 69, 0));
-            sched.apply_live_note(live(id, LiveKind::AllOff, 0, 0));
-        });
     }
 
     #[test]
