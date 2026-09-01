@@ -6,12 +6,19 @@
 //! reasoning for that choice over the `jack` crate — and the cost it
 //! accepts — is `notes/20260831-midi-and-tempo-decisions.md`.
 //!
-//! **Nothing here reaches the audio callback.** `midir` runs its own
-//! thread and hands bytes to a channel; the app drains that channel from
-//! the green zone, exactly as it drains every other worker. Streaming
-//! live events from here INTO the callback would violate the sequencing
-//! contract's rule 4 — sequences ride compiled immutable chunks, and a
-//! laggy thread must never be able to delay a note.
+//! **Nothing here reaches the audio callback directly.** `midir` runs its
+//! own thread and hands bytes to a channel; the app drains that channel
+//! from the green zone, exactly as it drains every other worker.
+//!
+//! What that channel may then do is worth stating precisely, because the
+//! earlier wording here read as a blanket prohibition and stopped the
+//! work once. Writing these events into a compiled SEQUENCE would violate
+//! contract rule 4 — sequences ride immutable chunks, and a laggy thread
+//! must never delay a note that was owed a specific sample. Playing them
+//! LIVE does not: a monitored note is owed no sample but "now", and rule 5
+//! classifies monitoring as free-running. It travels as a `LiveNote`
+//! letter on its own ring, never touching an event list. The full
+//! reasoning is `notes/20260901-live-monitoring-decision.md`.
 
 use std::sync::mpsc::{Receiver, Sender, channel};
 
