@@ -336,7 +336,42 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
             if which.contains("open") {
                 let _ = stage.apply(StageIntent::Enter);
             }
-            if which.contains("rolling") {
+            if which.contains("brace") {
+                // The loop from bar two to bar six, a marker at bar three.
+                let _ = stage.apply(StageIntent::Song(SongIntent::JumpPrev));
+                let _ = stage.apply(StageIntent::Song(SongIntent::JumpPrev));
+                let _ = stage.apply(StageIntent::Step(Step::Right));
+                let _ = stage.apply(StageIntent::Song(SongIntent::BraceStart));
+                let _ = stage.apply(StageIntent::Step(Step::Right));
+                let _ = stage.apply(StageIntent::Song(SongIntent::Marker));
+                for _ in 0..3 {
+                    let _ = stage.apply(StageIntent::Step(Step::Right));
+                }
+                let _ = stage.apply(StageIntent::Song(SongIntent::BraceEnd));
+                let _ = stage.apply(StageIntent::Step(Step::Left));
+            }
+            if which.contains("take") {
+                // Armed, the session fires two clips, and the song view
+                // watches the takes arrive.
+                let _ = stage.apply(StageIntent::SongView);
+                let _ = stage.apply(StageIntent::RecordSong);
+                // The strip's cursor is on the last track made; down to
+                // its slot row and back along it to the first fresh track.
+                let _ = stage.apply(StageIntent::Step(Step::Down));
+                let last = stage.song().tracks.len() - 1;
+                for _ in first..last {
+                    let _ = stage.apply(StageIntent::Step(Step::Left));
+                }
+                let _ = stage.apply(StageIntent::ToggleTransport);
+                // The slots were filled when their blocks were laid;
+                // the launches fire them.
+                let _ = stage.apply(StageIntent::Launch);
+                stage.transport_seek(daw::sequencing::TICKS_PER_BEAT * 4);
+                let _ = stage.apply(StageIntent::Step(Step::Right));
+                let _ = stage.apply(StageIntent::Launch);
+                stage.transport_seek(daw::sequencing::TICKS_PER_BEAT * 11);
+                let _ = stage.apply(StageIntent::SongView);
+            } else if which.contains("rolling") {
                 let _ = stage.apply(StageIntent::ToggleTransport);
                 stage.set_position(6.5);
             }

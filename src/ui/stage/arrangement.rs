@@ -184,10 +184,15 @@ impl Arrangement {
         true
     }
 
-    /// The edges on the cursor's track: the song's start and every
-    /// block's two ends.
+    /// The edges on the cursor's track: the song's start, every block's
+    /// two ends, the locators, and the brace's ends.
     fn edges(&self, song: &Song) -> Vec<usize> {
         let mut edges = vec![0];
+        edges.extend(song.locators.iter().map(|locator| locator.tick));
+        if let Some((start, end)) = song.loop_brace {
+            edges.push(start);
+            edges.push(end);
+        }
         if let Some(track) = song.tracks.get(self.track) {
             for block in track.blocks_in_time_order() {
                 edges.push(block.start_tick());
@@ -423,6 +428,11 @@ impl Stage {
                         Step::Left
                     }))
             }
+            SongIntent::BraceStart => self.brace_start(),
+            SongIntent::BraceEnd => self.brace_end(),
+            SongIntent::ToggleLoop => self.toggle_loop(),
+            SongIntent::Marker => self.toggle_marker(),
+            SongIntent::Export => self.request_export(),
             SongIntent::Resize => {
                 let (_, block) = self.song_block().ok_or(RefusalReason::Empty)?;
                 self.arrangement.hold = Some(Hold::Resize);
@@ -611,6 +621,16 @@ impl Stage {
 
     /// Delete in the song view: the block under the cursor goes.
     pub(super) fn song_clear(&mut self) -> Result<(), RefusalReason> {
+        if self.song_block().is_none()
+            && let Some((track, block)) = self.song_audio_block()
+        {
+            self.song.tracks[track]
+                .audio_blocks
+                .retain(|candidate| candidate.id != block.id);
+            self.notice = Some(format!("- {}", block.name));
+            self.touched();
+            return Ok(());
+        }
         let (track, block) = self.song_block().ok_or(RefusalReason::Empty)?;
         let taken = self
             .song
@@ -1105,6 +1125,8 @@ impl Stage {
             }
         }
 
+        self.draw_song_marks(painter, &frame, phase);
+
         // The playhead: a heavy rule in the live ink from the ruler to
         // the foot of the lanes, breathing with the beat, with its
         // marker on the ruler. Only while the SONG sounds — in scene
@@ -1147,6 +1169,14 @@ impl Stage {
                     block.start_tick,
                     block.start_tick.saturating_add(block.length_ticks),
                 ),
+                None if self.song_audio_block().is_some() => {
+                    let (_, block) = self.song_audio_block().expect("just found");
+                    frame.span(
+                        lane.shrink2(egui::vec2(0.0, 3.0)),
+                        block.start_tick,
+                        block.end_tick(),
+                    )
+                }
                 None => {
                     let grid = self.arrangement.grid_ticks(&self.song);
                     frame.span(
@@ -1159,7 +1189,7 @@ impl Stage {
             if target.is_positive() {
                 let bracket_ink = if holds_the_keys { ink } else { edge };
                 let mut shapes = Vec::new();
-                if self.song_block().is_none() {
+                if self.song_block().is_none() && self.song_audio_block().is_none() {
                     shapes.push(egui::Shape::rect_filled(
                         target,
                         0.0,
@@ -1337,5 +1367,572 @@ mod tests {
         assert!((frame.x(frame.view_len) - frame.ruler.max.x).abs() < 0.01);
         assert_eq!(frame.head(1).min.y, frame.lane(1).min.y);
         assert!(frame.rows >= 3);
+    }
+}
+
+// ------------------------------------------------------------------ the
+// brace, the locators, the takes, and the way out
+
+/// A block being written while the session is recorded into the song:
+/// the pattern that fired on a track, from when it fired until the
+/// moment something else fires there or the transport stops.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Take {
+    pub track: usize,
+    pub pattern: PatternId,
+    pub start: usize,
+    pub end: Option<usize>,
+}
+
+/// What the stage asks the host to render: a range of the song, to a
+/// file. The host builds the arrangement's graph and bounces it on a
+/// thread, reporting back through [`Stage::set_export_progress`] and
+/// [`Stage::export_finished`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExportRequest {
+    pub start_tick: usize,
+    pub end_tick: usize,
+    pub path: std::path::PathBuf,
+}
+
+/// An export under way, as the strip shows it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExportState {
+    pub path: std::path::PathBuf,
+    pub progress: f32,
+}
+
+/// `YYYYMMDD-HHMMSS`, now, in UTC: a render's name should say when it
+/// was made, and should sort by it.
+pub fn stamp() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let days = secs / 86_400;
+    let rest = secs % 86_400;
+    // Civil date from days since the epoch (Howard Hinnant's algorithm).
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{y:04}{m:02}{d:02}-{:02}{:02}{:02}",
+        rest / 3600,
+        rest % 3600 / 60,
+        rest % 60
+    )
+}
+
+impl Stage {
+    /// The loop the transport should run while the SONG plays: the
+    /// brace, when it is on and has a length.
+    pub fn loop_region(&self) -> Option<(usize, usize)> {
+        if !self.song_mode() || !self.song.loop_on {
+            return None;
+        }
+        self.song.loop_brace.filter(|(start, end)| end > start)
+    }
+
+    /// Whether the arrangement is armed to record the session.
+    pub fn arming(&self) -> bool {
+        self.arming
+    }
+
+    /// Whether takes are being written right now.
+    pub fn recording_song(&self) -> bool {
+        self.arming && self.rolling() && !self.song_mode()
+    }
+
+    /// The export the stage wants rendered, once.
+    pub fn take_export(&self) -> Option<ExportRequest> {
+        self.export_request.clone()
+    }
+
+    /// The host took the request.
+    pub fn export_taken(&mut self) {
+        self.export_request = None;
+    }
+
+    /// Whether the performer abandoned the export in progress, once.
+    pub fn export_abandoned(&mut self) -> bool {
+        std::mem::take(&mut self.export_abandon)
+    }
+
+    pub fn set_export_progress(&mut self, progress: f32) {
+        if let Some(export) = &mut self.export {
+            export.progress = progress.clamp(0.0, 1.0);
+        }
+    }
+
+    /// The render ended, one way or the other.
+    pub fn export_finished(&mut self, result: Result<(), String>) {
+        let Some(export) = self.export.take() else {
+            return;
+        };
+        self.export_request = None;
+        self.notice = Some(match result {
+            Ok(()) => format!("exported → {}", export.path.display()),
+            Err(error) => format!("export failed: {error}"),
+        });
+    }
+
+    pub(super) fn export_state(&self) -> Option<&ExportState> {
+        self.export.as_ref()
+    }
+
+    /// ^X: render the brace when it is on, else the whole song, to a
+    /// wav under the song folder's renders. The host does the work.
+    pub(super) fn request_export(&mut self) -> Result<(), RefusalReason> {
+        if self.export.is_some() {
+            self.notice = Some("EXPORT · already rendering".to_owned());
+            return Err(RefusalReason::Unavailable);
+        }
+        let (start, end) = match (self.song.loop_on, self.song.loop_brace) {
+            (true, Some((start, end))) if end > start => (start, end),
+            _ => (0, self.song.end_tick()),
+        };
+        if end <= start {
+            self.notice = Some("EXPORT · nothing to render".to_owned());
+            return Err(RefusalReason::Empty);
+        }
+        let home = self.home.clone().unwrap_or_else(std::env::temp_dir);
+        let name = self
+            .path
+            .as_ref()
+            .and_then(|path| path.file_stem())
+            .map_or_else(
+                || "untitled".to_owned(),
+                |stem| stem.to_string_lossy().into_owned(),
+            );
+        let path = home.join("renders").join(format!("{name}-{}.wav", stamp()));
+        self.export_request = Some(ExportRequest {
+            start_tick: start,
+            end_tick: end,
+            path: path.clone(),
+        });
+        self.export = Some(ExportState {
+            path,
+            progress: 0.0,
+        });
+        self.notice = Some(format!(
+            "EXPORT · {}",
+            crate::ui::sequencer::grid_resolution::bars_label(end - start)
+        ));
+        Ok(())
+    }
+
+    /// Escape while a render runs: abandon it. The host removes the
+    /// part-written file.
+    pub(super) fn abandon_export(&mut self) -> Result<(), RefusalReason> {
+        if self.export.is_none() {
+            return Err(RefusalReason::Unavailable);
+        }
+        self.export_abandon = true;
+        self.notice = Some("EXPORT · abandoned".to_owned());
+        Ok(())
+    }
+
+    /// The brace's start at the cursor. A brace that would be
+    /// inside-out keeps a bar past the cursor as its end.
+    pub(super) fn brace_start(&mut self) -> Result<(), RefusalReason> {
+        let at = self.arrangement.tick;
+        let bar = bar_ticks(&self.song, at);
+        let end = match self.song.loop_brace {
+            Some((_, end)) if end > at => end,
+            _ => at + bar,
+        };
+        self.song.loop_brace = Some((at, end));
+        self.song.loop_on = true;
+        self.say_brace();
+        self.touched();
+        Ok(())
+    }
+
+    /// The brace's end at the cursor: the cursor's cell is the last one
+    /// inside it. A brace with no start yet begins at the song's start.
+    pub(super) fn brace_end(&mut self) -> Result<(), RefusalReason> {
+        let grid = self.arrangement.grid_ticks(&self.song);
+        let at = self.arrangement.tick + grid;
+        let start = match self.song.loop_brace {
+            Some((start, _)) if start < at => start,
+            _ => 0,
+        };
+        self.song.loop_brace = Some((start, at));
+        self.song.loop_on = true;
+        self.say_brace();
+        self.touched();
+        Ok(())
+    }
+
+    /// L: the brace on or off, without losing where it is.
+    pub(super) fn toggle_loop(&mut self) -> Result<(), RefusalReason> {
+        if self.song.loop_brace.is_none() {
+            self.notice = Some("LOOP · no brace yet · [ and ]".to_owned());
+            return Err(RefusalReason::Empty);
+        }
+        self.song.loop_on = !self.song.loop_on;
+        self.say_brace();
+        self.touched();
+        Ok(())
+    }
+
+    fn say_brace(&mut self) {
+        let Some((start, end)) = self.song.loop_brace else {
+            return;
+        };
+        let bar = bar_ticks(&self.song, start).max(1);
+        self.notice = Some(format!(
+            "LOOP {} · {} → {}",
+            if self.song.loop_on { "ON" } else { "OFF" },
+            start / bar + 1,
+            end.div_ceil(bar) + 1
+        ));
+    }
+
+    /// M: a locator at the cursor, or the one there taken away.
+    pub(super) fn toggle_marker(&mut self) -> Result<(), RefusalReason> {
+        let at = self.arrangement.tick;
+        if let Some(index) = self
+            .song
+            .locators
+            .iter()
+            .position(|locator| locator.tick == at)
+        {
+            let gone = self.song.locators.remove(index);
+            self.notice = Some(format!("- {}", gone.name));
+        } else {
+            let name = format!("M{}", self.song.locators.len() + 1);
+            self.song.locators.push(crate::sequencing::Locator {
+                tick: at,
+                name: name.clone(),
+            });
+            self.song.locators.sort_by_key(|locator| locator.tick);
+            self.notice = Some(format!("+ {name}"));
+        }
+        self.touched();
+        Ok(())
+    }
+
+    /// ^Space: arm the arrangement to take down what the session plays.
+    pub(super) fn toggle_arming(&mut self) -> Result<(), RefusalReason> {
+        self.arming = !self.arming;
+        if self.arming {
+            self.notice = Some("SONG REC · armed · launches write blocks".to_owned());
+            // Already rolling: what plays now begins its take now.
+            if self.recording_song() {
+                let tick = self.transport.tick();
+                for track in 0..self.playing.len() {
+                    if let Some(scene) = self.playing[track] {
+                        self.open_take(track, scene, tick);
+                    }
+                }
+            }
+        } else {
+            let tick = self.transport.tick();
+            self.commit_takes(tick);
+            if self.notice.is_none() {
+                self.notice = Some("SONG REC · off".to_owned());
+            }
+        }
+        Ok(())
+    }
+
+    fn open_take(&mut self, track: usize, scene: usize, tick: usize) {
+        if let Some(Clip::Pattern(pattern)) = self.song.slot_clip(track, scene) {
+            self.takes.push(Take {
+                track,
+                pattern,
+                start: tick,
+                end: None,
+            });
+        }
+    }
+
+    fn close_take(&mut self, track: usize, tick: usize) {
+        for take in &mut self.takes {
+            if take.track == track && take.end.is_none() {
+                take.end = Some(tick);
+            }
+        }
+    }
+
+    /// Every take lands as a block, in one edit. A take is the
+    /// performer's latest word on its span: the pattern blocks it lands
+    /// on go, as they would under an arrangement recording. Recorded
+    /// sound is not overwritten; a take over an audio block is counted
+    /// and left out.
+    fn commit_takes(&mut self, tick: usize) {
+        let takes = std::mem::take(&mut self.takes);
+        if takes.is_empty() {
+            return;
+        }
+        let (mut laid, mut refused) = (0, 0);
+        for take in takes {
+            let end = take.end.unwrap_or(tick);
+            if end <= take.start {
+                continue;
+            }
+            if let Some(lane) = self.song.tracks.get_mut(take.track) {
+                lane.blocks.retain(|block| {
+                    !(block.start_tick < end
+                        && take.start < block.start_tick.saturating_add(block.length_ticks))
+                });
+            }
+            match self
+                .song
+                .place_block(take.track, take.pattern, take.start, end - take.start)
+            {
+                Ok(_) => laid += 1,
+                Err(_) => refused += 1,
+            }
+        }
+        if laid > 0 {
+            self.touched();
+        }
+        self.notice = Some(match refused {
+            0 => format!("recorded {laid} blocks"),
+            _ => format!("recorded {laid} blocks · {refused} in the way"),
+        });
+    }
+
+    /// After every intent: what the session started or stopped playing
+    /// becomes takes while the arrangement is armed. Called with what
+    /// was playing, and whether takes were being written, before.
+    pub(super) fn record_takes(&mut self, before: &[Option<usize>], was_recording: bool) {
+        if !self.arming {
+            return;
+        }
+        let recording = self.recording_song();
+        let tick = self.transport.tick();
+        match (was_recording, recording) {
+            (false, true) => {
+                for track in 0..self.playing.len() {
+                    if let Some(scene) = self.playing[track] {
+                        self.open_take(track, scene, tick);
+                    }
+                }
+            }
+            (true, false) => {
+                let tracks: Vec<usize> = self.takes.iter().map(|take| take.track).collect();
+                for track in tracks {
+                    self.close_take(track, tick);
+                }
+                self.commit_takes(tick);
+            }
+            (true, true) => {
+                let count = before.len().max(self.playing.len());
+                for track in 0..count {
+                    let then = before.get(track).copied().flatten();
+                    let now = self.playing.get(track).copied().flatten();
+                    if then == now {
+                        continue;
+                    }
+                    self.close_take(track, tick);
+                    if let Some(scene) = now {
+                        self.open_take(track, scene, tick);
+                    }
+                }
+            }
+            (false, false) => {}
+        }
+    }
+
+    /// A sound from the browser onto an audio track in the song view:
+    /// an audio block at the cursor, as long as the file is at the
+    /// tempo there.
+    pub(super) fn land_audio(
+        &mut self,
+        track: usize,
+        path: std::path::PathBuf,
+    ) -> Result<(), RefusalReason> {
+        let unreadable = crate::sequencing::LandRefusal::Unreadable.sign().to_owned();
+        let Ok(reader) = hound::WavReader::open(&path) else {
+            self.notice = Some(unreadable);
+            return Err(RefusalReason::Unavailable);
+        };
+        let frames = u64::from(reader.duration());
+        let sample_rate = reader.spec().sample_rate;
+        let source = crate::audio_source::AudioSource {
+            path: path.clone(),
+            sample_rate,
+            source_offset: 0,
+            source_frames: frames,
+            gain: 1.0,
+            looped: false,
+            transpose: 0.0,
+            detune: 0.0,
+            transposed_from: None,
+            applied_ratio: 1.0,
+            file_frames: frames,
+            reversed: false,
+            fade_in: 0,
+            fade_out: 0,
+            fade_in_curve: 0.0,
+            fade_out_curve: 0.0,
+            envelope: Vec::new(),
+        };
+        let name = path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let tempo = crate::tempo::TempoTable::build(&self.song, 48_000.0, self.bpm());
+        let start = self.arrangement.tick;
+        match self
+            .song
+            .place_audio(track, start, name.clone(), source, &tempo)
+        {
+            Ok(_) => {
+                self.notice = Some(format!("+ {name}"));
+                self.touched();
+                Ok(())
+            }
+            Err(refusal) => {
+                self.notice = Some(refusal.sign().to_owned());
+                Err(RefusalReason::Unavailable)
+            }
+        }
+    }
+
+    /// The audio block under the song cursor, when no pattern block is.
+    pub(super) fn song_audio_block(&self) -> Option<(usize, crate::sequencing::AudioBlock)> {
+        let track = self.song_track()?;
+        let tick = self.arrangement.tick;
+        self.song.tracks[track]
+            .audio_blocks
+            .iter()
+            .find(|block| block.start_tick <= tick && tick < block.end_tick())
+            .map(|block| (track, block.clone()))
+    }
+
+    /// The brace, the locators, and the takes being written, over the
+    /// lanes: drawn after the blocks and before the playhead.
+    pub(super) fn draw_song_marks(&self, painter: &egui::Painter, frame: &Frame, phase: Phase) {
+        let alpha = self.alphabet();
+        let edge = alpha.edge.color;
+        let ink = alpha.ink.color;
+        let mut shapes = Vec::new();
+
+        // The brace: brackets on the ruler between its ends, and a wash
+        // over the lanes inside it while it is on.
+        if let Some((start, end)) = self.song.loop_brace
+            && end > start
+            && end > frame.view_start
+            && start < frame.view_end()
+        {
+            let x0 = frame.x(start).max(frame.ruler.min.x);
+            let x1 = frame.x(end).min(frame.ruler.max.x);
+            let brace_ink = if self.song.loop_on {
+                alpha.live.color
+            } else {
+                edge
+            };
+            let band = egui::Rect::from_min_max(
+                egui::pos2(x0, frame.ruler.min.y),
+                egui::pos2(x1, frame.ruler.min.y + 9.0),
+            );
+            if band.is_positive() {
+                circuit::brackets(&mut shapes, band, 6.0, Weight::Bold, brace_ink);
+                circuit::trace(
+                    &mut shapes,
+                    &[
+                        egui::pos2(x0, frame.ruler.min.y + 1.0),
+                        egui::pos2(x1, frame.ruler.min.y + 1.0),
+                    ],
+                    Weight::Hair,
+                    brace_ink,
+                );
+            }
+            if self.song.loop_on {
+                shapes.push(egui::Shape::rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(x0, frame.lanes.min.y),
+                        egui::pos2(x1, frame.lanes.max.y),
+                    ),
+                    0.0,
+                    alpha.live_dim.color.gamma_multiply(0.12),
+                ));
+            }
+        }
+
+        // Locators: a plaque on the ruler and a hairline down the lanes.
+        for locator in &self.song.locators {
+            if locator.tick < frame.view_start || locator.tick >= frame.view_end() {
+                continue;
+            }
+            let x = frame.x(locator.tick);
+            circuit::trace(
+                &mut shapes,
+                &[
+                    egui::pos2(x, frame.lanes.min.y),
+                    egui::pos2(x, frame.lanes.max.y),
+                ],
+                Weight::Hair,
+                edge.gamma_multiply(0.9),
+            );
+            shapes.push(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(x, frame.ruler.max.y - 1.0),
+                    egui::pos2(x - 4.0, frame.ruler.max.y - 7.0),
+                    egui::pos2(x + 4.0, frame.ruler.max.y - 7.0),
+                ],
+                ink,
+                egui::Stroke::NONE,
+            ));
+            block::paint(
+                painter,
+                egui::Id::new(("stage-song-locator", locator.tick)),
+                egui::pos2(x + 6.0, frame.ruler.max.y - 2.0),
+                egui::Align2::LEFT_BOTTOM,
+                block::unit::MICRO,
+                &locator.name,
+                ink,
+            );
+        }
+
+        // Takes: the blocks arriving, dashed in the live ink, the open
+        // ones growing to the playhead.
+        if !self.takes.is_empty() {
+            let now = self.transport.tick();
+            let live = motion::pulse_ink(alpha.live.color, alpha.live_dim.color, phase);
+            for take in &self.takes {
+                if take.track < frame.row_offset || take.track >= frame.row_offset + frame.rows {
+                    continue;
+                }
+                let end = take.end.unwrap_or(now).max(take.start + 1);
+                if end <= frame.view_start || take.start >= frame.view_end() {
+                    continue;
+                }
+                let lane = frame.lane(take.track - frame.row_offset);
+                let rect = frame.span(lane.shrink2(egui::vec2(0.0, 3.0)), take.start, end);
+                if !rect.is_positive() {
+                    continue;
+                }
+                shapes.push(egui::Shape::rect_filled(
+                    rect,
+                    0.0,
+                    alpha.live_dim.color.gamma_multiply(0.35),
+                ));
+                circuit::dashes(
+                    &mut shapes,
+                    &[
+                        rect.left_top(),
+                        rect.right_top(),
+                        rect.right_bottom(),
+                        rect.left_bottom(),
+                        rect.left_top(),
+                    ],
+                    phase.dash(),
+                    Weight::Hair,
+                    live,
+                );
+            }
+        }
+        painter.extend(shapes);
     }
 }

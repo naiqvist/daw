@@ -161,6 +161,9 @@ pub enum StageIntent {
     SongView,
     /// The song view's own verbs, over the block or cell under the cursor.
     Song(SongIntent),
+    /// Arm the arrangement: while the session plays, every launch
+    /// writes a block into the song.
+    RecordSong,
 }
 
 /// What the song view does beyond the cursor's walk and the verbs it
@@ -186,6 +189,16 @@ pub enum SongIntent {
     JumpPrev,
     /// The next.
     JumpNext,
+    /// The loop brace's start at the cursor.
+    BraceStart,
+    /// The loop brace's end at the cursor's cell.
+    BraceEnd,
+    /// The brace on or off.
+    ToggleLoop,
+    /// A locator at the cursor, or the one there taken away.
+    Marker,
+    /// Render the brace, or the whole song, to a wav.
+    Export,
 }
 
 impl SongIntent {
@@ -201,6 +214,11 @@ impl SongIntent {
             Self::PickBack => "previous pattern",
             Self::JumpPrev => "previous edge",
             Self::JumpNext => "next edge",
+            Self::BraceStart => "loop start here",
+            Self::BraceEnd => "loop end here",
+            Self::ToggleLoop => "loop on / off",
+            Self::Marker => "marker",
+            Self::Export => "export wav",
         }
     }
 }
@@ -371,6 +389,7 @@ impl StageIntent {
             Self::Rescan => "rescan library",
             Self::SongView => "session / song",
             Self::Song(intent) => intent.label(),
+            Self::RecordSong => "record session into song",
         }
     }
 }
@@ -1204,6 +1223,38 @@ const BINDINGS: &[Binding] = &[
     Binding::command_shift(ScopeContext::Song, Key::Z, StageIntent::Redo),
     Binding::command(ScopeContext::Song, Key::S, StageIntent::Save),
     Binding::new(ScopeContext::Song, Key::Questionmark, StageIntent::Help),
+    Binding::new(
+        ScopeContext::Song,
+        Key::OpenBracket,
+        StageIntent::Song(SongIntent::BraceStart),
+    ),
+    Binding::new(
+        ScopeContext::Song,
+        Key::CloseBracket,
+        StageIntent::Song(SongIntent::BraceEnd),
+    ),
+    Binding::new(
+        ScopeContext::Song,
+        Key::L,
+        StageIntent::Song(SongIntent::ToggleLoop),
+    ),
+    Binding::new(
+        ScopeContext::Song,
+        Key::M,
+        StageIntent::Song(SongIntent::Marker),
+    ),
+    Binding::command(
+        ScopeContext::Song,
+        Key::X,
+        StageIntent::Song(SongIntent::Export),
+    ),
+    // Arming the arrangement is asked from wherever the session is
+    // being played: the session's levels, the mixer, and the song view
+    // itself.
+    Binding::command(ScopeContext::Root, Key::Space, StageIntent::RecordSong),
+    Binding::command(ScopeContext::Nested, Key::Space, StageIntent::RecordSong),
+    Binding::command(ScopeContext::Mixer, Key::Space, StageIntent::RecordSong),
+    Binding::command(ScopeContext::Song, Key::Space, StageIntent::RecordSong),
 ];
 
 /// Every binding in one scope, in table order. The help surface reads
@@ -1248,7 +1299,7 @@ fn family(intent: StageIntent) -> &'static str {
         | StageIntent::TrigMenu
         | StageIntent::ClearLock => "edit",
         StageIntent::Sample(_) => "sample",
-        StageIntent::Song(_) => "song",
+        StageIntent::Song(_) | StageIntent::RecordSong => "song",
     }
 }
 

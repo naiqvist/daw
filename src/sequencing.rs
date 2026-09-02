@@ -1005,6 +1005,13 @@ pub struct TempoMark {
     pub bpm: f64,
 }
 
+/// A named place on the timeline: a marker the song view jumps to.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct Locator {
+    pub tick: usize,
+    pub name: String,
+}
+
 /// A meter change in song time. Bars are counted from the mark onward.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct MeterMark {
@@ -1159,6 +1166,16 @@ pub struct Song {
     /// transport's single global signature.
     #[serde(default)]
     pub meter: Vec<MeterMark>,
+    /// The song view's loop brace, in song ticks, and whether the
+    /// transport runs it while the song plays. Kept apart so the brace
+    /// can be switched off without being lost.
+    #[serde(default)]
+    pub loop_brace: Option<(usize, usize)>,
+    #[serde(default)]
+    pub loop_on: bool,
+    /// Named places on the timeline, sorted by tick.
+    #[serde(default)]
+    pub locators: Vec<Locator>,
     /// The session's scenes and their clips. Absent from documents
     /// written before the session existed means an empty default
     /// session, which reads exactly as it did before.
@@ -1213,6 +1230,9 @@ impl Default for Song {
             returns: Vec::new(),
             tempo: Vec::new(),
             meter: Vec::new(),
+            loop_brace: None,
+            loop_on: false,
+            locators: Vec::new(),
             session: Session::default(),
             key: default_key(),
             next_track_id: 2,

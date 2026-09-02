@@ -27,7 +27,11 @@
 //! recompiles the graph and hands it to the engine, and the engine's
 //! meters come back the other way. Nothing else crosses.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
 use daw::audio::AuditionBuffer;
+use daw::audio::bounce::{BounceFormat, BounceOptions, bounce_automated};
 use daw::audio::material;
 use daw::audio::transport::TransportCmd;
 use daw::audio::{Engine, EngineConfig, StreamHealth};
@@ -75,6 +79,14 @@ struct App {
     ground: Option<Polarity>,
 }
 
+/// A render in flight: the fraction done, the flag that stops it, and
+/// where its result lands.
+struct ExportJob {
+    progress: Arc<Mutex<f32>>,
+    cancel: Arc<AtomicBool>,
+    done: Arc<Mutex<Option<Result<(), String>>>>,
+}
+
 /// The engine, and everything needed to keep it agreeing with the stage.
 ///
 /// Every field here is a MEMORY of what the engine was last told. That is
@@ -110,6 +122,10 @@ struct Audio {
     bpm: f64,
     /// The stage's seek count the engine was last made to agree with.
     seeks: u64,
+    /// The loop the engine was last given, in samples.
+    looped: Option<(u64, u64)>,
+    /// A render on its own thread, and the way to watch and stop it.
+    export: Option<ExportJob>,
     /// The block the engine had published when it was last told to
     /// seek. Its position is not read back until a LATER block has
     /// arrived: the snapshot in hand was written before the seek, and
@@ -139,6 +155,78 @@ impl Audio {
             seeks: 0,
             seek_block: None,
             levels: Vec::new(),
+            looped: None,
+            export: None,
+        }
+    }
+
+    /// The stage asked for a render: build the arrangement's graph and
+    /// bounce it on a thread; report progress back every frame until it
+    /// ends. Runs with or without an engine — a render is offline.
+    fn serve_export(&mut self, stage: &mut Stage) {
+        if let Some(request) = stage.take_export() {
+            stage.export_taken();
+            let (spec, _) = song_graph::build_song(stage.song());
+            let sample_rate = self
+                .engine
+                .as_ref()
+                .map_or(48_000, |engine| engine.info().sample_rate);
+            let bpm = stage.song().bpm_at(request.start_tick, stage.bpm());
+            let ticks = f64::from(daw::sequencing::TICKS_PER_BEAT as u32);
+            let opts = BounceOptions {
+                sample_rate,
+                block_frames: 256,
+                bpm,
+                length_beats: (request.end_tick - request.start_tick) as f64 / ticks,
+                start_beats: request.start_tick as f64 / ticks,
+                format: BounceFormat::Int24,
+            };
+            if let Some(dir) = request.path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let job = ExportJob {
+                progress: Arc::new(Mutex::new(0.0)),
+                cancel: Arc::new(AtomicBool::new(false)),
+                done: Arc::new(Mutex::new(None)),
+            };
+            let (progress, cancel, done) =
+                (job.progress.clone(), job.cancel.clone(), job.done.clone());
+            let path = request.path.clone();
+            std::thread::spawn(move || {
+                let result = bounce_automated(
+                    &spec,
+                    &opts,
+                    &path,
+                    |_, _| {},
+                    |fraction| {
+                        if let Ok(mut slot) = progress.lock() {
+                            *slot = fraction;
+                        }
+                        !cancel.load(Ordering::Relaxed)
+                    },
+                )
+                .map_err(|error| error.to_string());
+                if let Ok(mut slot) = done.lock() {
+                    *slot = Some(result);
+                }
+            });
+            self.export = Some(job);
+        }
+        if let Some(job) = &self.export {
+            if stage.export_abandoned() {
+                job.cancel.store(true, Ordering::Relaxed);
+            }
+            let finished = job.done.lock().ok().and_then(|mut slot| slot.take());
+            match finished {
+                Some(result) => {
+                    stage.export_finished(result);
+                    self.export = None;
+                }
+                None => {
+                    let fraction = job.progress.lock().map_or(0.0, |slot| *slot);
+                    stage.set_export_progress(fraction);
+                }
+            }
         }
     }
 
@@ -255,6 +343,7 @@ impl Audio {
 
     /// Make the engine agree with the stage, then hand back what it heard.
     fn follow(&mut self, stage: &mut Stage) {
+        self.serve_export(stage);
         // Told every frame rather than once: a stage that opened without
         // an engine and one whose engine went away are the same state,
         // and the surface should say so either way — and a block dropped
@@ -330,6 +419,19 @@ impl Audio {
             engine.transport(TransportCmd::Seek(samples));
             self.seeks = stage.seeks();
             self.seek_block = Some(snapshot.block);
+        }
+
+        // The brace: the engine loops the song's timeline while the
+        // song plays with the brace on, and runs free otherwise.
+        let looped = stage
+            .loop_region()
+            .map(|(start, end)| (samples_at(engine, start, bpm), samples_at(engine, end, bpm)));
+        if looped != self.looped {
+            engine.transport(match looped {
+                Some((start, end)) => TransportCmd::SetLoop { start, end },
+                None => TransportCmd::ClearLoop,
+            });
+            self.looped = looped;
         }
 
         let rolling = stage.rolling();

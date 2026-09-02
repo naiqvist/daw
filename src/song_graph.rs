@@ -701,6 +701,33 @@ mod tests {
         );
     }
 
+    /// The arrangement's graph renders offline, which is what the song
+    /// view's export runs: a song with a note in its first block, two
+    /// bars of it, to a wav with sound in it.
+    #[test]
+    fn the_arrangement_renders_offline() {
+        let song = song_with_a_clip();
+        let (spec, _) = build_song(&song);
+        let path = std::env::temp_dir().join("daw-song-graph-export.wav");
+        let opts = crate::audio::bounce::BounceOptions {
+            sample_rate: 48_000,
+            block_frames: 256,
+            bpm: 120.0,
+            length_beats: 8.0,
+            start_beats: 0.0,
+            format: crate::audio::bounce::BounceFormat::Int24,
+        };
+        crate::audio::bounce::bounce_automated(&spec, &opts, &path, |_, _| {}, |_| true)
+            .expect("the arrangement renders");
+        let peak = hound::WavReader::open(&path)
+            .expect("the export exists")
+            .samples::<i32>()
+            .map(Result::unwrap)
+            .fold(0, |peak: i32, s| peak.max(s.abs()));
+        let _ = std::fs::remove_file(&path);
+        assert!(peak > 0, "the block's note sounds in the export");
+    }
+
     /// A sampler's authored slices ride into its node spec as the
     /// fractions the device holds.
     #[test]

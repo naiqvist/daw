@@ -162,3 +162,49 @@ Later, each its own note: automation lanes on the timeline, tempo map
 editing on the ruler, time-stretch of audio blocks, a song ROW list
 (Elektron's song mode as a table) as a third projection of the same
 arrangement.
+
+## As built, 2026-09-02
+
+Heads on the LEFT as the rows' labels (the user's call): tracks are
+rows, time runs across, the view pages horizontally after the cursor
+and the heads column scrolls with the cursor's row when tracks
+overflow. Modules: `src/ui/stage/arrangement.rs` (state, geometry,
+verbs, drawing), `song_graph::build_song` (the compiler),
+`transport::Mode` (SCENE / SONG), host seam for export in
+`src/bin/stage.rs` (`serve_export`).
+
+Keys, as bound (the table above was the plan; these are the facts):
+
+| Key | Act |
+|---|---|
+| Tab | Session ↔ song |
+| ← → ↑ ↓ | Cell / track; the grid is a bar, or a beat at ≤ 4 bars across |
+| Shift ↑ / ↓ | Zoom in / out (2 … 64 bars across) |
+| ^← / ^→ | Jump to the previous / next edge: block ends, locators, the brace |
+| Enter | Place the track's last pattern on an empty cell (cut to the gap); open a block in the tray |
+| Delete | Remove the block (pattern or audio) |
+| D | Duplicate after itself |
+| W then ← → | Nudge by a cell (holds until Escape) |
+| ^R then ← → | Resize by a cell (holds until Escape) |
+| Shift ← / → | A bar shorter / longer |
+| Q / E | Yank / put |
+| P / Shift+P | Next / previous pattern the track holds in the session |
+| [ / ] | Brace start / end at the cursor (end includes the cursor's cell) |
+| L | Brace on / off, kept |
+| M | Locator at the cursor, or lift the one there |
+| Space | Roll the SONG from the playhead (mode SONG until Space in the session) |
+| ^Space | Arm: launches in the session write takes; stop lands them, one undo |
+| ^X | Export the brace when on, else the whole song, to `Music/daw/renders/<song>-<stamp>.wav`; Escape abandons |
+| Browser Enter on a sample, audio track | An audio block at the cursor, as long as the file at the tempo there |
+
+Export moved from ^B to ^X: ^B is the browser everywhere, and a
+render is a verb that should not shadow a window.
+
+Takes OVERWRITE the pattern blocks they land on (an arrangement
+recording is the later word); they never overwrite audio blocks —
+those are counted and reported in the strip.
+
+Not yet: locator names (M1, M2 … are minted), plaques for tempo and
+meter marks on the ruler, peaks inside audio blocks, a take-over of a
+track by a session launch while the song plays, the tempo map's ramp
+in an export.

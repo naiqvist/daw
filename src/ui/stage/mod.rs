@@ -41,7 +41,8 @@ use crate::design::kit::{self, Weight};
 use crate::design::motion::{self, Phase};
 use crate::design::{block, circuit};
 use crate::sequencing::PatternBlock;
-use arrangement::{Arrangement, Hold};
+use arrangement::{Arrangement, Hold, Take};
+pub use arrangement::{ExportRequest, ExportState};
 
 use crate::design;
 use crate::devices::{DeviceKind, Family};
@@ -643,6 +644,16 @@ pub struct Stage {
     arrangement: Arrangement,
     /// A block lifted off a lane with Q, waiting for E.
     block_clipboard: Option<PatternBlock>,
+    /// Whether the arrangement takes down what the session plays.
+    arming: bool,
+    /// The blocks being written while it does; landed as one edit when
+    /// the transport stops or the arm comes off.
+    takes: Vec<Take>,
+    /// A render the host has been asked for, until it takes it.
+    export_request: Option<ExportRequest>,
+    /// The render under way, for the strip.
+    export: Option<ExportState>,
+    export_abandon: bool,
     /// The trig menu, while it is up: which row the cursor is on. The
     /// trig it is about is whatever is under the sequencer's cursor —
     /// read afresh each time, never copied, so the menu can never speak
@@ -805,6 +816,11 @@ impl Stage {
             song_view: false,
             arrangement: Arrangement::default(),
             block_clipboard: None,
+            arming: false,
+            takes: Vec::new(),
+            export_request: None,
+            export: None,
+            export_abandon: false,
             trig_menu: None,
             trig_menu_kept: None,
             sample: None,
@@ -931,6 +947,12 @@ impl Stage {
     /// The song cursor's track, for posing.
     pub fn arrangement_track(&self) -> usize {
         self.arrangement.track
+    }
+
+    /// Move the stage's own clock, for posing: where the engine would
+    /// have reported the transport to be.
+    pub fn transport_seek(&mut self, tick: usize) {
+        self.transport.seek(tick);
     }
 
     pub fn playing(&self) -> &[Option<usize>] {
@@ -1472,7 +1494,19 @@ impl Stage {
             Some(beat) if self.transport.motion().is_rolling() => {
                 self.transport.follow(beat);
             }
-            _ => self.transport.advance(&self.song, f64::from(dt)),
+            _ => {
+                self.transport.advance(&self.song, f64::from(dt));
+                // The brace, on the stage's own clock: the engine loops
+                // for itself and reports back, but a deck with no engine
+                // still shows the loop looping.
+                if let Some((start, end)) = self.loop_region()
+                    && self.transport.motion().is_rolling()
+                    && self.transport.tick() >= end
+                {
+                    let over = (self.transport.tick() - end) % (end - start).max(1);
+                    self.transport.seek(start + over);
+                }
+            }
         }
         self.vitals.tick(dt);
     }
@@ -2449,7 +2483,12 @@ impl Stage {
         // comes next ends the wait: a Left or a Right is the motion, and
         // anything else is a sentence abandoned.
         let nudging = std::mem::take(&mut self.nudging);
+        // What the session was playing, for the arrangement's record.
+        let playing_before = self.playing.clone();
+        let was_recording = self.recording_song();
         let result = match intent {
+            StageIntent::RecordSong => self.toggle_arming(),
+            StageIntent::Escape if self.export.is_some() => self.abandon_export(),
             // The song view's keys, while it holds them. Its own verbs
             // first; then the shared words, which mean the same act on
             // a block that they mean on a slot or a device.
@@ -2692,6 +2731,12 @@ impl Stage {
                         }
                         // A sound goes into a sampler: the one already at
                         // the head of the track, or a new one made for it.
+                        (Some(EntryKind::Sample(path)), Some(track))
+                            if self.song_view
+                                && self.song.tracks[track].kind == TrackKind::Audio =>
+                        {
+                            self.land_audio(track, path)
+                        }
                         (Some(EntryKind::Sample(path)), Some(track)) => {
                             self.place_sample(track, path)
                         }
@@ -3209,6 +3254,7 @@ impl Stage {
             StageIntent::Yank => self.yank(),
             StageIntent::Put => self.put(),
         };
+        self.record_takes(&playing_before, was_recording);
         // Every intent ends at a settled song, which is what undo steps
         // back through. Undo and redo settle where they land, so the
         // observation is a no-op for them.
@@ -6042,6 +6088,20 @@ impl Stage {
             );
             left = word.min.x - gap;
         }
+        // The arrangement armed: ARM while it waits, REC while the
+        // session plays into it.
+        if self.arming {
+            let word = block::paint(
+                painter,
+                egui::Id::new("stage-arming"),
+                egui::pos2(left, center_y),
+                egui::Align2::RIGHT_CENTER,
+                block::unit::MICRO,
+                if self.recording_song() { "REC" } else { "ARM" },
+                self.alphabet().jeopardy_active.color,
+            );
+            left = word.min.x - gap;
+        }
         if self.transport.motion() == Motion::Recording {
             block::paint(
                 painter,
@@ -7282,6 +7342,32 @@ impl Stage {
             } else if let Some(notice) = &self.notice {
                 words.push(notice.as_str());
             }
+            // A render under way: a gauge at the strip's right shoulder,
+            // filling as it goes.
+            if let Some(export) = self.export_state() {
+                let gauge = egui::Rect::from_min_max(
+                    egui::pos2(zone.max.x - 260.0, zone.center().y - 5.0),
+                    egui::pos2(zone.max.x - 120.0, zone.center().y + 5.0),
+                );
+                let mut marks = Vec::new();
+                circuit::tick_bar(
+                    &mut marks,
+                    gauge,
+                    20,
+                    export.progress,
+                    self.alphabet().live.color,
+                    self.alphabet().edge.color,
+                    true,
+                );
+                painter.extend(marks);
+                painter.text(
+                    egui::pos2(gauge.min.x - 8.0, zone.center().y),
+                    egui::Align2::RIGHT_CENTER,
+                    format!("{:>3}%", (export.progress * 100.0).round() as u32),
+                    egui::FontId::monospace(design::px(design::type_scale::MICRO)),
+                    self.alphabet().ink.color,
+                );
+            }
             if !words.is_empty() {
                 let mut marks = Vec::new();
                 let pad = egui::pos2(zone.min.x + MARGIN - 13.0, zone.center().y);
@@ -8092,6 +8178,201 @@ mod tests {
             Some(ApplyOutcome::Changed)
         );
         assert_eq!(stage.arrangement.bars_across(), far);
+    }
+
+    /// The brace and the locators: [ and ] set the loop's ends at the
+    /// cursor, L switches it without losing it, M drops and lifts a
+    /// marker, and the jumps land on all of them. The transport runs
+    /// the loop only while the SONG plays.
+    #[test]
+    fn the_brace_and_the_markers_are_set_from_the_cursor() {
+        let mut stage = Stage::new();
+        assert_eq!(drive(&mut stage, &[Key::Tab]), vec![ApplyOutcome::Changed]);
+        let bar = arrangement::bar_ticks(stage.song(), 0);
+        assert_eq!(
+            drive(&mut stage, &[Key::ArrowRight, Key::OpenBracket]),
+            vec![ApplyOutcome::Changed; 2]
+        );
+        assert_eq!(stage.song().loop_brace, Some((bar, 2 * bar)));
+        assert!(stage.song().loop_on);
+        assert_eq!(
+            drive(
+                &mut stage,
+                &[Key::ArrowRight, Key::ArrowRight, Key::CloseBracket]
+            ),
+            vec![ApplyOutcome::Changed; 3]
+        );
+        assert_eq!(stage.song().loop_brace, Some((bar, 4 * bar)));
+        assert_eq!(stage.loop_region(), None, "the scene plays, not the song");
+        assert_eq!(
+            drive(&mut stage, &[Key::Space]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(stage.loop_region(), Some((bar, 4 * bar)));
+        assert_eq!(drive(&mut stage, &[Key::L]), vec![ApplyOutcome::Changed]);
+        assert!(!stage.song().loop_on);
+        assert_eq!(stage.loop_region(), None);
+        assert_eq!(
+            stage.song().loop_brace,
+            Some((bar, 4 * bar)),
+            "off is not gone"
+        );
+
+        // A marker at bar four, and the jumps find it from either side.
+        assert_eq!(drive(&mut stage, &[Key::M]), vec![ApplyOutcome::Changed]);
+        assert_eq!(stage.song().locators.len(), 1);
+        assert_eq!(stage.song().locators[0].tick, 3 * bar);
+        while stage.arrangement.tick > 0 {
+            assert_eq!(
+                stage.handle_key(Modifiers::COMMAND, Key::ArrowLeft),
+                Some(ApplyOutcome::Changed)
+            );
+        }
+        assert_eq!(
+            stage.handle_key(Modifiers::COMMAND, Key::ArrowRight),
+            Some(ApplyOutcome::Changed)
+        );
+        assert_eq!(stage.arrangement.tick, bar, "the brace's start is an edge");
+        assert_eq!(
+            stage.handle_key(Modifiers::COMMAND, Key::ArrowRight),
+            Some(ApplyOutcome::Changed)
+        );
+        assert_eq!(stage.arrangement.tick, 3 * bar, "then the marker");
+        assert_eq!(drive(&mut stage, &[Key::M]), vec![ApplyOutcome::Changed]);
+        assert!(stage.song().locators.is_empty(), "M on a marker lifts it");
+    }
+
+    /// ^Space arms the arrangement; while the session plays, a launch
+    /// opens a take and the stop lands every take as a block, in one
+    /// edit that one undo takes away.
+    #[test]
+    fn an_armed_arrangement_records_the_sessions_launches() {
+        let mut stage = Stage::new();
+        assert_eq!(
+            stage.apply(StageIntent::NewInstrumentTrack),
+            ApplyOutcome::Changed
+        );
+        let track = stage.song().tracks.len() - 1;
+        let before = stage.song().tracks[track].blocks.len();
+        // A filled slot on the new track: Enter on the empty slot fills it.
+        assert_eq!(
+            drive(&mut stage, &[Key::ArrowDown]),
+            vec![ApplyOutcome::Changed]
+        );
+        while stage.session_address() != Some(Address::Slot { track, scene: 0 }) {
+            assert_eq!(
+                drive(&mut stage, &[Key::ArrowRight]),
+                vec![ApplyOutcome::Changed]
+            );
+        }
+        assert_eq!(
+            drive(&mut stage, &[Key::Enter]),
+            vec![ApplyOutcome::Changed]
+        );
+        let pattern = match stage.song().slot_clip(track, 0) {
+            Some(Clip::Pattern(pattern)) => pattern,
+            other => panic!("the slot holds {other:?}"),
+        };
+
+        // A block already on the lane where the take will land: the
+        // take is the later word, and it goes.
+        let bar = arrangement::bar_ticks(stage.song(), 0);
+        stage
+            .song_mut()
+            .place_block(track, pattern, bar, bar)
+            .expect("the lane is clear");
+        let before = before + 1;
+
+        assert_eq!(command(&mut stage, Key::Space), ApplyOutcome::Changed);
+        assert!(stage.arming());
+        assert_eq!(
+            drive(&mut stage, &[Key::Space]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert!(stage.recording_song());
+        assert!(stage.takes.is_empty(), "nothing has fired yet");
+        stage.transport.seek(bar);
+        assert_eq!(
+            stage.handle_key(Modifiers::SHIFT, Key::Enter),
+            Some(ApplyOutcome::Changed)
+        );
+        assert_eq!(stage.takes.len(), 1);
+        assert_eq!((stage.takes[0].track, stage.takes[0].start), (track, bar));
+        stage.transport.seek(3 * bar);
+        assert_eq!(
+            drive(&mut stage, &[Key::Space]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert!(stage.takes.is_empty(), "the stop landed the takes");
+        let blocks = &stage.song().tracks[track].blocks;
+        assert_eq!(blocks.len(), before, "the take replaced the block under it");
+        let landed = blocks.last().expect("a block");
+        assert_eq!(
+            (landed.pattern_id, landed.start_tick, landed.length_ticks),
+            (pattern, bar, 2 * bar)
+        );
+        assert_eq!(command(&mut stage, Key::Z), ApplyOutcome::Changed);
+        let restored = &stage.song().tracks[track].blocks;
+        assert_eq!(
+            restored.len(),
+            before,
+            "one undo, and the old block is back"
+        );
+        assert_eq!(restored.last().map(|block| block.length_ticks), Some(bar));
+    }
+
+    /// ^X asks the host for a render of the brace or the whole song, to
+    /// a wav under the song folder's renders; the strip shows it, and
+    /// Escape abandons it.
+    #[test]
+    fn export_asks_the_host_for_a_render_and_escape_abandons_it() {
+        let mut stage = Stage::new();
+        stage.set_home("/tmp/daw-test-home");
+        assert_eq!(drive(&mut stage, &[Key::Tab]), vec![ApplyOutcome::Changed]);
+        let end = stage.song().end_tick();
+        assert!(end > 0, "the furnished song has blocks");
+        assert_eq!(command(&mut stage, Key::X), ApplyOutcome::Changed);
+        let request = stage.take_export().expect("a request");
+        assert_eq!((request.start_tick, request.end_tick), (0, end));
+        assert!(request.path.starts_with("/tmp/daw-test-home/renders"));
+        assert_eq!(
+            request.path.extension().and_then(|e| e.to_str()),
+            Some("wav")
+        );
+        stage.export_taken();
+        assert_eq!(stage.take_export(), None);
+        assert!(
+            matches!(command(&mut stage, Key::X), ApplyOutcome::Refused(_)),
+            "one at a time"
+        );
+        stage.set_export_progress(0.5);
+        assert_eq!(stage.export_state().map(|e| e.progress), Some(0.5));
+        assert_eq!(
+            drive(&mut stage, &[Key::Escape]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert!(stage.export_abandoned());
+        assert!(!stage.export_abandoned(), "taken once");
+        stage.export_finished(Err("cancelled".to_owned()));
+        assert_eq!(stage.export_state(), None);
+        assert_eq!(stage.notice.as_deref(), Some("export failed: cancelled"));
+        // With the brace on, the brace is what renders.
+        let bar = arrangement::bar_ticks(stage.song(), 0);
+        assert_eq!(
+            drive(
+                &mut stage,
+                &[
+                    Key::ArrowRight,
+                    Key::OpenBracket,
+                    Key::ArrowRight,
+                    Key::CloseBracket
+                ]
+            ),
+            vec![ApplyOutcome::Changed; 4]
+        );
+        assert_eq!(command(&mut stage, Key::X), ApplyOutcome::Changed);
+        let request = stage.take_export().expect("a request");
+        assert_eq!((request.start_tick, request.end_tick), (bar, 3 * bar));
     }
 
     /// A sampler with a file on track one, and the editor up over it.
@@ -9399,6 +9680,9 @@ mod tests {
                         stage.library_generation,
                         stage.song_view,
                         stage.arrangement.clone(),
+                        stage.arming,
+                        stage.takes.clone(),
+                        stage.export.clone(),
                     ),
                 );
 
@@ -9425,6 +9709,9 @@ mod tests {
                                     stage.library_generation,
                                     stage.song_view,
                                     stage.arrangement.clone(),
+                                    stage.arming,
+                                    stage.takes.clone(),
+                                    stage.export.clone(),
                                 ),
                             ),
                             before,
@@ -9454,6 +9741,9 @@ mod tests {
                                     stage.library_generation,
                                     stage.song_view,
                                     stage.arrangement.clone(),
+                                    stage.arming,
+                                    stage.takes.clone(),
+                                    stage.export.clone(),
                                 ),
                             ),
                             before,
