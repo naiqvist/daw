@@ -1324,6 +1324,26 @@ mod device_tests {
     /// not something a test suite should have an opinion about. Run it
     /// with `cargo test -- --ignored --nocapture list_the_output_devices`.
     #[test]
+    /// Does a backend deliver blocks at all on this machine? `#[ignore]`
+    /// because it opens real hardware. `DAW_TEST_API=pulse` or `alsa`
+    /// tries another backend — which is how the JACK shim's silence was
+    /// told apart from the engine's.
+    #[test]
+    #[ignore]
+    fn the_engine_delivers_blocks() {
+        let mut config = EngineConfig::default();
+        if std::env::var("DAW_TEST_API").as_deref() == Ok("pulse") {
+            config.api = AudioApi::Pulse;
+        } else if std::env::var("DAW_TEST_API").as_deref() == Ok("alsa") {
+            config.api = AudioApi::Alsa;
+        }
+        let mut engine = Engine::start(config).expect("an engine");
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let block = engine.latest_block().block;
+        eprintln!("blocks after 1.5 s: {block}, info {:?}", engine.info());
+        assert!(block > 0, "no callback ran");
+    }
+
     #[ignore]
     fn list_the_output_devices() {
         for api in AudioApi::ALL {

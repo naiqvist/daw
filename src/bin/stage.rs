@@ -163,7 +163,15 @@ struct Audio {
     levels: Vec<Level>,
     /// The same for the console's telemetry.
     telemetry: Vec<(daw::sequencing::DeviceId, daw::console::Telemetry)>,
+    /// When the engine was started, and whether it has already been
+    /// started again on the fallback backend.
+    started: std::time::Instant,
+    fell_back: bool,
 }
+
+/// How long a freshly started backend gets to deliver its first block
+/// before it is given up on.
+const FIRST_BLOCK_GRACE: std::time::Duration = std::time::Duration::from_millis(1500);
 
 impl Audio {
     fn start() -> Self {
@@ -172,6 +180,8 @@ impl Audio {
             Err(error) => (None, Some(error.to_string())),
         };
         Self {
+            started: std::time::Instant::now(),
+            fell_back: false,
             engine,
             trouble,
             built: None,
@@ -371,8 +381,64 @@ impl Audio {
     }
 
     /// Make the engine agree with the stage, then hand back what it heard.
+    /// A backend that opened but never delivers is not an engine. JACK
+    /// through PipeWire's shim has been seen to do exactly that — the
+    /// node scheduled, the callback never called — while ALSA through
+    /// the same server delivers at once. So the first backend gets a
+    /// grace period for its first block, and then the engine is started
+    /// again on ALSA, once. Everything the host remembered about the
+    /// old engine is forgotten with it, so the schedule is sent afresh.
+    fn fall_back_if_dead(&mut self) {
+        if self.fell_back {
+            return;
+        }
+        let Some(engine) = &mut self.engine else {
+            return;
+        };
+        if engine.latest_block().block > 0 || self.started.elapsed() < FIRST_BLOCK_GRACE {
+            return;
+        }
+        self.fell_back = true;
+        eprintln!(
+            "stage: the audio backend delivered no blocks in {:.1} s — starting again on ALSA",
+            FIRST_BLOCK_GRACE.as_secs_f32()
+        );
+        // The dead backend is LEAKED rather than closed: closing a JACK
+        // client the shim never ran has been seen to block forever, and
+        // a hang there would take the whole surface with it. One dead
+        // client's memory, once per run, is the price of a surface that
+        // keeps answering.
+        if let Some(dead) = self.engine.take() {
+            std::mem::forget(dead);
+        }
+        let config = EngineConfig {
+            api: daw::audio::AudioApi::Alsa,
+            ..EngineConfig::default()
+        };
+        match Engine::start(config) {
+            Ok(engine) => {
+                eprintln!("stage: the ALSA engine is up: {:?}", engine.info());
+                self.engine = Some(engine);
+                self.trouble = None;
+            }
+            Err(error) => {
+                eprintln!("stage: ALSA engine refused: {error}");
+                self.trouble = Some(error.to_string());
+            }
+        }
+        self.started = std::time::Instant::now();
+        self.built = None;
+        self.mixed = None;
+        self.nodes = None;
+        self.rolling = false;
+        self.seeks = 0;
+        self.seek_block = None;
+        self.looped = None;
+    }
+
     fn follow(&mut self, stage: &mut Stage) {
         self.serve_export(stage);
+        self.fall_back_if_dead();
         // Told every frame rather than once: a stage that opened without
         // an engine and one whose engine went away are the same state,
         // and the surface should say so either way — and a block dropped
