@@ -132,18 +132,22 @@ fn row_gap() -> f32 {
     design::px(design::space::HAIR)
 }
 
-/// Between the identity band and the content under it.
+/// Between the head and the first cell under it: NOTHING.
 ///
-/// A SECTION break, and the widest gap on the surface — wider than the
-/// one between columns, which is in turn wider than the one between the
-/// slots of a column. Three distances, three degrees of belonging, and
-/// the eye sorts them without being told.
+/// They touch, because they are one thing. A head and the cells beneath
+/// it are a column — the head names it and the cells are what is in it —
+/// and a break between them made the strip read as two stacked bands
+/// that happened to line up rather than as a row of columns.
 ///
-/// A rule was tried here first and taken out again: it drew a boundary
-/// that the space already draws, which is the same reason the columns
-/// have no outline.
+/// So the surface has two distances, not three: none inside a column,
+/// and a gap between columns. The only boundary left is the one that
+/// separates things which really are separate.
+///
+/// A rule was tried here first and taken out again — it drew a boundary
+/// the space already drew — and then the space itself turned out to be
+/// drawing a boundary that was not there.
 fn section_gap() -> f32 {
-    design::px(design::space::ROOM)
+    0.0
 }
 
 /// The sign for a place with nothing in it: a point, the smallest mark
@@ -3237,6 +3241,28 @@ impl Stage {
                 let here = focused == Some(Address::Slot { track, scene });
                 let mark = scenes::mark(&self.song, track, scene);
 
+                // Every cell is bounded, faintly, whether or not anything
+                // is in it.
+                //
+                // The rank and file used to be carried by the points
+                // alone, which asks the eye to infer a grid from a
+                // scattering of marks — and on a paper ground, where the
+                // resting rungs sit inside a narrow band, that inference
+                // is work. A hairline at low opacity states the lattice
+                // instead of implying it, and stays quiet enough that the
+                // clips remain the figure and this remains the ground.
+                //
+                // Opacity rather than a rung: the alphabet's ladder is a
+                // set of VALUES for things that speak, and this does not
+                // speak. It is the same edge every region is bounded with,
+                // held back to a third of itself.
+                painter.rect_stroke(
+                    rect,
+                    0.0,
+                    egui::Stroke::new(1.0, self.alphabet().edge.color.gamma_multiply(0.35)),
+                    egui::StrokeKind::Inside,
+                );
+
                 // Three states, three values. The cursor is a plane in the
                 // focus shade. A clip is a plane one rung up from the
                 // ground. An empty place is a point — the lattice shows
@@ -6001,15 +6027,15 @@ mod tests {
         }
     }
 
-    /// Three distances, three degrees of belonging. The eye groups by
-    /// proximity before it groups by anything else, so this ordering is
-    /// what makes a column read as a column and the heads read as a band
-    /// — and it is an ordering, not three numbers that happen to differ.
+    /// The eye groups by proximity before it groups by anything else, so
+    /// these distances are what make a column read as a column. It is an
+    /// ORDERING, not a set of numbers that happen to differ.
     #[test]
     fn the_session_spaces_its_parts_by_how_much_they_belong_together() {
-        assert!(
-            section_gap() > column_gap(),
-            "the break between identity and content is no wider than the one between columns"
+        assert_eq!(
+            section_gap(),
+            0.0,
+            "a head and its own cells are one column and must touch"
         );
         assert!(
             column_gap() > row_gap(),

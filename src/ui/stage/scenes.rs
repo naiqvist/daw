@@ -118,9 +118,9 @@ pub fn rows_that_fit(room: f32, gap: f32) -> usize {
 }
 
 /// The slot `row` rows beneath `head`, sharing its left edge and width
-/// exactly. The first row sits one `section` under the head — a wider
-/// break, because that is where identity stops and content starts — and
-/// every row after sits one `gap` under the one before.
+/// exactly. The first row sits one `section` under the head — which the
+/// stage sets to nothing, because a head and its cells are one column —
+/// and every row after sits one `gap` under the one before.
 pub fn slot_beneath(head: egui::Rect, row: usize, gap: f32, section: f32) -> egui::Rect {
     let top = head.max.y + section + row as f32 * (SLOT_H + gap);
     egui::Rect::from_min_size(
@@ -136,7 +136,7 @@ mod tests {
 
     const GAP: f32 = 8.0;
     /// The section break under the heads, in these tests' own terms.
-    const SECTION: f32 = 18.0;
+    const SECTION: f32 = 0.0;
 
     fn head() -> egui::Rect {
         egui::Rect::from_min_size(egui::pos2(50.0, 20.0), egui::vec2(132.0, 64.0))
