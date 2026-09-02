@@ -1777,7 +1777,7 @@ mod tests {
         assert!(registers.is_empty(), "duplicate is a shorthand, not a yank");
     }
 
-    /// Velocity reads as value on the face: neutral throughout, floored
+    /// Velocity reads as value on the face: bone-tinted throughout, floored
     /// so the softest trig stays a visible fact, accents reaching white.
     #[test]
     fn the_note_face_carries_velocity_as_value() {
@@ -1785,7 +1785,7 @@ mod tests {
         let mid = velocity_ink(100, Polarity::Dark);
         let hard = velocity_ink(127, Polarity::Dark);
         for ink in [soft, mid, hard] {
-            assert!(ink.r() == ink.g() && ink.g() == ink.b());
+            assert!(crate::design::is_tint(ink));
         }
         assert!(soft.r() >= 96, "a face is a fact before it is a level");
         assert!(soft.r() < mid.r());

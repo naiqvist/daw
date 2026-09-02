@@ -43,7 +43,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ---- egui: the context, the fonts and the theme the app uses ----
     let ctx = egui::Context::default();
     ctx.set_pixels_per_point(scale);
-    daw::install_fonts(&ctx);
+    if which.starts_with("stage") {
+        daw::install_stage_fonts(&ctx);
+    } else {
+        daw::install_fonts(&ctx);
+    }
     // A light shot needs the light runtime theme too, or the stock
     // widgets in it would be a dark window over a paper page.
     let theme = if which.ends_with("-light") {

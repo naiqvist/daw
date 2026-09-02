@@ -44,9 +44,42 @@
 //! judgements, made by the person whose app this is, and they are recorded
 //! here as decisions rather than derived as results.
 
+pub mod block;
+pub mod circuit;
+pub mod codex;
+pub mod glyph;
+pub mod grain;
+pub mod kit;
+pub mod motion;
 pub mod signs;
 
 use eframe::egui::Color32;
+
+// ------------------------------------------------------------------ tint
+
+/// The bone tint: the ladder is warm, the way traces on a black board are
+/// bone rather than white. Red is the channel the ladder is measured on,
+/// so it keeps the grey's byte and the others sit a little under it.
+/// Chroma stays far below the point where the eye would call it a hue.
+pub const fn bone(level: u8) -> Color32 {
+    let r = level as u32;
+    let g = (r * 965 + 500) / 1000;
+    let b = (r * 900 + 500) / 1000;
+    Color32::from_rgb(level, g as u8, b as u8)
+}
+
+/// The most chroma a resting rung may carry, as a share of its brightest
+/// channel. A tint, not a hue: the colourless test allows this much and
+/// no more.
+pub const TINT_CHROMA_MAX: f32 = 0.11;
+
+/// Whether a colour is neutral or merely tinted — carries no hue the eye
+/// would name.
+pub fn is_tint(color: Color32) -> bool {
+    let max = color.r().max(color.g()).max(color.b());
+    let min = color.r().min(color.g()).min(color.b());
+    (max - min) as f32 <= TINT_CHROMA_MAX * max as f32 + 2.0
+}
 
 // ---------------------------------------------------------------- tiers
 
@@ -221,28 +254,28 @@ pub const GROUND: Signal = Signal {
 
 /// A recess below the surfaces. See [`lstar::WELL`].
 pub const WELL: Signal = Signal {
-    color: Color32::from_gray(10),
+    color: bone(10),
     tier: Tier::Structure,
     channels: &[Channel::Luminance, Channel::Position],
 };
 
 /// A resting object's fill.
 pub const SURFACE: Signal = Signal {
-    color: Color32::from_gray(18),
+    color: bone(18),
     tier: Tier::Structure,
     channels: &[Channel::Luminance],
 };
 
 /// A resting object's boundary; also the periphery's hairlines.
 pub const EDGE: Signal = Signal {
-    color: Color32::from_gray(48),
+    color: bone(48),
     tier: Tier::Structure,
     channels: &[Channel::Luminance],
 };
 
 /// Readable marks on a surface: names, values, refusal words.
 pub const INK: Signal = Signal {
-    color: Color32::from_gray(145),
+    color: bone(145),
     tier: Tier::Content,
     channels: &[Channel::Luminance],
 };
@@ -254,7 +287,7 @@ pub const INK: Signal = Signal {
 /// must survive a bad glance. Inversion (this as fill, [`GROUND`] as ink)
 /// is its validated form.
 pub const FOCUS: Signal = Signal {
-    color: Color32::from_gray(241),
+    color: bone(241),
     tier: Tier::Exception,
     channels: &[Channel::Luminance, Channel::Position],
 };
@@ -263,37 +296,37 @@ pub const FOCUS: Signal = Signal {
 // comes from value and the display around it, while hue remains reserved for
 // jeopardy and the sounding present.
 const LIGHT_GROUND: Signal = Signal {
-    color: Color32::from_gray(243),
+    color: bone(243),
     tier: Tier::Ground,
     channels: &[Channel::Luminance],
 };
 
 const LIGHT_WELL: Signal = Signal {
-    color: Color32::from_gray(236),
+    color: bone(236),
     tier: Tier::Structure,
     channels: &[Channel::Luminance, Channel::Position],
 };
 
 const LIGHT_SURFACE: Signal = Signal {
-    color: Color32::from_gray(228),
+    color: bone(228),
     tier: Tier::Structure,
     channels: &[Channel::Luminance],
 };
 
 const LIGHT_EDGE: Signal = Signal {
-    color: Color32::from_gray(187),
+    color: bone(187),
     tier: Tier::Structure,
     channels: &[Channel::Luminance],
 };
 
 const LIGHT_INK: Signal = Signal {
-    color: Color32::from_gray(85),
+    color: bone(85),
     tier: Tier::Content,
     channels: &[Channel::Luminance],
 };
 
 const LIGHT_FOCUS: Signal = Signal {
-    color: Color32::from_gray(4),
+    color: bone(4),
     tier: Tier::Exception,
     channels: &[Channel::Luminance, Channel::Position],
 };
@@ -343,14 +376,16 @@ pub const JEOPARDY_ACTIVE: Signal = Signal {
 /// The sounding present: the playhead, what is making sound right now,
 /// meters in motion. Not an alarm — this is where the music is.
 pub const LIVE: Signal = Signal {
-    color: Color32::from_rgb(72, 198, 224),
+    // Pale, nearly white: the glow of a rune that has woken, not a
+    // coloured light. Still the same hue, still its own meaning.
+    color: Color32::from_rgb(186, 232, 240),
     tier: Tier::Exception,
     channels: &[Channel::Hue, Channel::Position],
 };
 
 /// The same meaning, quieter: present but not the subject.
 pub const LIVE_DIM: Signal = Signal {
-    color: Color32::from_rgb(44, 122, 138),
+    color: Color32::from_rgb(96, 140, 148),
     tier: Tier::Exception,
     channels: &[Channel::Hue, Channel::Position],
 };
@@ -663,6 +698,7 @@ mod tests {
             let hues: Vec<f32> = alphabet
                 .signals()
                 .iter()
+                .filter(|signal| !is_tint(signal.color))
                 .map(|signal| hue_degrees(signal.color))
                 .filter(|degrees| *degrees > 0.0)
                 .collect();
@@ -761,9 +797,12 @@ mod tests {
     }
 
     /// Colour is an exception by construction: most of the alphabet is
-    /// grey, and everything a calm screen draws is.
+    /// grey, and everything a calm screen draws is. The grey is BONE — a
+    /// warm tint, the same on every rung — but a tint is not a hue: its
+    /// chroma stays under the floor at which the eye would name a colour,
+    /// and the hue it does carry is one warm hue for the whole ladder.
     #[test]
-    fn the_resting_alphabet_is_colourless() {
+    fn the_resting_alphabet_is_only_tinted() {
         for alphabet in BOTH {
             for signal in alphabet
                 .signals()
@@ -771,11 +810,30 @@ mod tests {
                 .filter(|signal| signal.tier <= Tier::Content)
             {
                 let color = signal.color;
-                assert!(
-                    color.r() == color.g() && color.g() == color.b(),
-                    "a resting symbol spent hue: {color:?}"
-                );
+                assert!(is_tint(color), "a resting symbol spent hue: {color:?}");
+                if color.r() > 8 {
+                    let h = hue_degrees(color);
+                    assert!(
+                        (20.0..=60.0).contains(&h),
+                        "the bone tint drifted off warm: {color:?} at {h}°"
+                    );
+                }
             }
+        }
+        // the tint really is one tint: a hue, when there is one, is the same
+        // for every rung of the dark ladder
+        // (measured above the rungs where byte rounding makes hue noise)
+        let hues: Vec<f32> = DARK
+            .signals()
+            .iter()
+            .filter(|s| s.tier <= Tier::Content && s.color.r() > 40)
+            .map(|s| hue_degrees(s.color))
+            .collect();
+        for pair in hues.windows(2) {
+            assert!(
+                (pair[0] - pair[1]).abs() < 12.0,
+                "the ladder's warmth is uneven: {hues:?}"
+            );
         }
     }
 

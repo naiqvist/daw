@@ -33,6 +33,10 @@ mod tracks;
 mod transport;
 mod vitals;
 
+use crate::design::codex::Sign;
+use crate::design::kit::{self, Weight};
+use crate::design::{circuit, grain};
+
 use crate::design;
 use crate::devices::DeviceKind;
 use crate::history::History;
@@ -597,7 +601,7 @@ impl Stage {
             // dark — this is the frame choosing which of the two grounds
             // it opens on while the light one is being lived with, not a
             // change to which one the code considers its house default.
-            polarity: design::Polarity::Light,
+            polarity: design::Polarity::Dark,
             palette: {
                 let mut palette = crate::ui::palette::Palette::default();
                 palette.open();
@@ -2322,6 +2326,9 @@ impl Stage {
         // colour when somebody else guessed correctly is not a surface
         // that owns its own appearance.
         painter.rect_filled(whole, 0.0, self.alphabet().ground.color);
+        // Paper grain: the one texture, so black is a material and not an
+        // absence. It says nothing and never moves.
+        grain::overlay(&painter, whole, self.polarity);
         // The ground's own material. Quietest thing on the surface, says
         // nothing, and therefore may cover everything — and what it does
         // say without saying it is that this app is a lattice.
@@ -2352,12 +2359,93 @@ impl Stage {
         // arriving, an edge drawn at the destination is a line the
         // panel has not reached yet. Its edge travels with it, in the
         // slide below.
-        for region in [vitals, message, session, clip] {
-            painter.rect_stroke(
+        // Brushed rather than ruled. The line still does the value's work
+        // on paper; what changes is the hand that drew it. A frame with
+        // pressure in it says the deck was MADE, and the same seed every
+        // frame says it was made once.
+        for (n, region) in [vitals, message, session, clip].into_iter().enumerate() {
+            let edge = self.alphabet().edge.color;
+            kit::cached(
+                &painter,
+                egui::Id::new(("stage-frame", n)),
                 region,
-                0.0,
-                egui::Stroke::new(1.0, self.alphabet().edge.color),
-                egui::StrokeKind::Inside,
+                edge,
+                |out| {
+                    circuit::frame(out, region, Weight::Hair, edge);
+                },
+            );
+        }
+        // The register: a rail with pads just before the seam, where the
+        // breadcrumb never reaches. Structure rung.
+        {
+            let edge = self.alphabet().edge.color;
+            let room = design::px(design::space::ROOM);
+            let strip = egui::Rect::from_min_max(
+                egui::pos2(transport.min.x - room * 12.0, vitals.min.y + room * 0.6),
+                egui::pos2(transport.min.x - room, vitals.max.y - room * 0.6),
+            );
+            if strip.min.x > breadcrumb.min.x + room * 10.0 {
+                kit::cached(
+                    &painter,
+                    egui::Id::new("stage-register"),
+                    strip,
+                    edge,
+                    |out| {
+                        let y = strip.center().y;
+                        circuit::rail(
+                            out,
+                            egui::pos2(strip.min.x + strip.height(), y),
+                            egui::pos2(strip.max.x, y),
+                            &[0.0, 0.2, 0.45, 0.7, 1.0],
+                            edge,
+                        );
+                        Sign::Dipper.paint(
+                            out,
+                            egui::Rect::from_center_size(
+                                egui::pos2(strip.min.x + strip.height() * 0.5, y),
+                                egui::Vec2::splat(strip.height()),
+                            ),
+                            Weight::Hair,
+                            edge,
+                        );
+                        let mut rng = kit::Rng::seeded("register");
+                        circuit::barcode(
+                            out,
+                            egui::Rect::from_min_max(
+                                egui::pos2(strip.max.x - 70.0, y + 4.0),
+                                egui::pos2(strip.max.x, strip.max.y),
+                            ),
+                            &mut rng,
+                            edge,
+                        );
+                    },
+                );
+            }
+        }
+        // The seam between the breadcrumb and the clock: one stroke.
+        {
+            let edge = self.alphabet().edge.color;
+            let x = transport.min.x;
+            let seam = egui::Rect::from_min_max(
+                egui::pos2(x - 4.0, vitals.min.y),
+                egui::pos2(x + 4.0, vitals.max.y),
+            );
+            kit::cached(
+                &painter,
+                egui::Id::new("stage-vitals-seam"),
+                seam,
+                edge,
+                |out| {
+                    circuit::trace(
+                        out,
+                        &[
+                            egui::pos2(x, vitals.min.y + 6.0),
+                            egui::pos2(x, vitals.max.y - 6.0),
+                        ],
+                        Weight::Hair,
+                        edge,
+                    );
+                },
             );
         }
 
@@ -2366,15 +2454,66 @@ impl Stage {
         self.draw_transport(&painter, transport);
         // The badge. Instruments have them, and this is the one piece of
         // ornament here that carries nothing at all.
-        ornament::sigil(
-            &painter,
-            egui::pos2(
-                message.min.x + design::px(design::space::ROOM),
+        // It is a SEAL now — a brush ring with a register glyph inside —
+        // and after it the colophon: two glyphs and a barcode, the
+        // maker's mark of a deck that was handed down rather than
+        // bought. None of it varies with anything.
+        {
+            let ink_col = self.alphabet().ink.color;
+            let edge = self.alphabet().edge.color;
+            let r = design::px(design::space::STEP) * 0.8;
+            let c = egui::pos2(
+                message.min.x + design::px(design::space::ROOM) + r * 0.5,
                 message.center().y,
-            ),
-            design::px(design::space::STEP) / 2.0,
-            self.alphabet().edge.color,
-        );
+            );
+            let zone = egui::Rect::from_center_size(c, egui::Vec2::splat(r * 2.8));
+            kit::cached(
+                &painter,
+                egui::Id::new("stage-badge"),
+                zone,
+                ink_col,
+                |out| {
+                    Sign::Engine.paint(
+                        out,
+                        egui::Rect::from_center_size(c, egui::Vec2::splat(r * 2.2)),
+                        Weight::Hair,
+                        ink_col,
+                    );
+                },
+            );
+            let gx = c.x + r + design::px(design::space::ROOM);
+            let gs = design::px(design::space::ROOM) * 1.2;
+            let colophon = egui::Rect::from_min_max(
+                egui::pos2(gx, message.min.y),
+                egui::pos2(gx + gs * 2.5 + 80.0, message.max.y),
+            );
+            kit::cached(
+                &painter,
+                egui::Id::new("stage-colophon"),
+                colophon,
+                edge,
+                |out| {
+                    for (i, sign) in [Sign::Codex, Sign::Archive].into_iter().enumerate() {
+                        let cell = egui::Rect::from_center_size(
+                            egui::pos2(gx + gs * (0.5 + 1.15 * i as f32), c.y),
+                            egui::Vec2::splat(gs * 0.8),
+                        );
+                        sign.paint(out, cell, Weight::Hair, edge);
+                    }
+                    let bx = gx + gs * 2.5;
+                    let mut rng = kit::Rng::seeded("colophon");
+                    circuit::barcode(
+                        out,
+                        egui::Rect::from_center_size(
+                            egui::pos2(bx + 36.0, c.y),
+                            egui::vec2(72.0, gs * 0.7),
+                        ),
+                        &mut rng,
+                        edge,
+                    );
+                },
+            );
+        }
         self.draw_message(&painter, message);
         // The codebook takes the whole field while it is up. It is a
         // DISPLAY mode, not a scope: focus never enters it, and the
@@ -2426,6 +2565,58 @@ impl Stage {
                 egui::StrokeKind::Inside,
             );
         }
+    }
+
+    /// The tray with nothing in it: the deck's dormant face. A sigil
+    /// wheel, two register columns, a spiral and the cosmological dial,
+    /// all at the structure rung — present, and saying nothing, the way
+    /// a shrine is carved before it lights.
+    fn draw_quiet_tray(&self, painter: &egui::Painter, tray: egui::Rect) {
+        let edge = self.alphabet().edge.color;
+        let ground = self.alphabet().ground.color;
+        kit::cached(
+            painter,
+            egui::Id::new("stage-quiet-tray"),
+            tray,
+            (edge, ground),
+            |out| {
+                let m = design::px(design::space::ROOM);
+                let plaque = tray.shrink(m);
+                if plaque.height() < 40.0 {
+                    return;
+                }
+                circuit::frame(out, plaque, Weight::Hair, edge);
+                circuit::corner_pads(out, plaque, edge);
+                let c = plaque.center();
+                let side = plaque.height() * 0.7;
+                Sign::Dipper.paint(
+                    out,
+                    egui::Rect::from_center_size(c, egui::Vec2::splat(side)),
+                    Weight::Heavy,
+                    edge,
+                );
+                let mut rng = kit::Rng::seeded("quiet-tray");
+                let unit = 8.0;
+                for row in 0..3 {
+                    let y = plaque.min.y + m + row as f32 * (unit + 2.0);
+                    circuit::binary(
+                        out,
+                        egui::pos2(plaque.min.x + m, y),
+                        unit,
+                        rng.next_u64() as u32,
+                        16,
+                        edge,
+                    );
+                }
+                circuit::rail(
+                    out,
+                    egui::pos2(plaque.max.x - m - 140.0, plaque.max.y - m),
+                    egui::pos2(plaque.max.x - m, plaque.max.y - m),
+                    &[0.0, 0.5, 1.0],
+                    edge,
+                );
+            },
+        );
     }
 
     /// The clip tray. The sequencer draws the clip in view — the stage
@@ -2613,6 +2804,7 @@ impl Stage {
 
     fn draw_clip(&mut self, ui: &mut egui::Ui, tray: egui::Rect) {
         let Some(shown) = self.clip_in_view() else {
+            self.draw_quiet_tray(ui.painter(), tray);
             return;
         };
         let Some(pattern) = self.song.pattern(shown.pattern) else {
@@ -2726,6 +2918,35 @@ impl Stage {
         } else {
             self.focused()
         };
+
+        // The dormant deck: the grid sits in an octagonal shield with a pad
+        // on each shoulder, at the structure rung so the squares stay the
+        // subject. Carved before it lights, the way a shrine is.
+        {
+            let edge = self.alphabet().edge.color;
+            let span = egui::vec2(span_x, span_y);
+            kit::cached(
+                painter,
+                egui::Id::new("stage-field-sheet"),
+                avail,
+                (edge, span.x as i32, span.y as i32),
+                |out| {
+                    let shield = egui::Rect::from_center_size(
+                        avail.center(),
+                        span + egui::Vec2::splat(design::px(design::space::VAST) * 2.0),
+                    );
+                    let shield = shield.intersect(avail.shrink(design::px(design::space::SNUG)));
+                    circuit::octagon(
+                        out,
+                        shield,
+                        design::px(design::space::ROOM),
+                        None,
+                        Some((Weight::Heavy, edge)),
+                    );
+                    circuit::corner_pads(out, shield, edge);
+                },
+            );
+        }
 
         let (focus_col, focus_row) = active.cursor();
         for row in 0..active.rows() {
@@ -2872,13 +3093,18 @@ impl Stage {
             );
             if focused {
                 // The bracket is this app's cursor form — it was already
-                // the step grid's, and it is the house's now.
-                ornament::brackets(
+                // the step grid's, and it is the house's now. Brushed:
+                // the cursor is the one mark a hand is always on.
+                let ink_col = self.alphabet().ink.color;
+                let zone = rect.expand(6.0);
+                kit::cached(
                     painter,
-                    rect.expand(3.0),
-                    self.alphabet().ink.color,
-                    1.0,
-                    8.0,
+                    egui::Id::new("stage-head-cursor"),
+                    zone,
+                    ink_col,
+                    |out| {
+                        circuit::brackets(out, rect.expand(3.0), 8.0, Weight::Bold, ink_col);
+                    },
                 );
             }
 
@@ -2893,21 +3119,27 @@ impl Stage {
             let sigil_side = design::px(design::space::STEP);
             let sigil_room = sigil_side + pad;
             if let Some(mark) = self.track_sigil(index) {
-                glyph::paint(
-                    painter,
-                    egui::Rect::from_center_size(
-                        egui::pos2(
-                            rect.max.x - pad - sigil_side / 2.0,
-                            rect.min.y + pad * 0.9 + sigil_side / 2.0,
-                        ),
-                        egui::Vec2::splat(sigil_side),
+                // The same strokes the browser files the family under,
+                // drawn with the brush: the meaning is the shape's, the
+                // hand is the house's.
+                let cell = egui::Rect::from_center_size(
+                    egui::pos2(
+                        rect.max.x - pad - sigil_side / 2.0,
+                        rect.min.y + pad * 0.9 + sigil_side / 2.0,
                     ),
-                    mark,
-                    if focused {
-                        self.alphabet().well.color
-                    } else {
-                        self.alphabet().edge.color
-                    },
+                    egui::Vec2::splat(sigil_side),
+                );
+                let colour = if focused {
+                    self.alphabet().well.color
+                } else {
+                    self.alphabet().ink.color
+                };
+                Sign::Seal(mark).painted(
+                    painter,
+                    egui::Id::new(("stage-head-mark", index)),
+                    cell,
+                    Weight::Hair,
+                    colour,
                 );
             }
 
@@ -3547,11 +3779,50 @@ impl Stage {
         );
 
         let body = egui::FontId::monospace(design::px(design::type_scale::BODY));
-        let quiet = egui::FontId::monospace(design::px(design::type_scale::MICRO));
+        // The numbers are CARVED: the readout and the tempo wear the
+        // inscription face, the beat cells stay typewritten so they keep
+        // their one-cell-per-beat geometry.
+        let carved = egui::FontId::new(
+            design::px(design::type_scale::BODY),
+            egui::FontFamily::Name(crate::INSCRIPTION.into()),
+        );
+        let quiet = egui::FontId::new(
+            design::px(design::type_scale::MICRO),
+            egui::FontFamily::Name(crate::INSCRIPTION.into()),
+        );
         let margin = design::px(design::space::ROOM);
         let gap = design::px(design::space::ROOM);
         let center_y = zone.center().y;
         let mut right = zone.max.x - margin;
+
+        // The clock's face: a sigil wheel at the strip's shoulder. The
+        // one instrument on the periphery, and it does not turn.
+        {
+            let r = (zone.height() * 0.36).min(22.0);
+            let c = egui::pos2(zone.min.x + margin + r, center_y);
+            let ink_col = self.alphabet().ink.color;
+            let ground = self.alphabet().ground.color;
+            let face = egui::Rect::from_center_size(c, egui::Vec2::splat(r * 2.4));
+            kit::cached(
+                painter,
+                egui::Id::new("stage-clock"),
+                face,
+                (ink_col, ground),
+                |out| {
+                    out.push(egui::Shape::circle_stroke(
+                        c,
+                        r,
+                        egui::Stroke::new(Weight::Heavy.px(), ink_col),
+                    ));
+                    Sign::Dipper.paint(
+                        out,
+                        egui::Rect::from_center_size(c, egui::Vec2::splat(r * 1.3)),
+                        Weight::Hair,
+                        ink_col,
+                    );
+                },
+            );
+        }
 
         let tempo_rect = painter.text(
             egui::pos2(right, center_y),
@@ -3560,6 +3831,7 @@ impl Stage {
             quiet,
             self.alphabet().ink.color,
         );
+        let _ = &body;
         right = tempo_rect.min.x - gap;
 
         let beat_color = if self.transport.motion().is_rolling() {
@@ -3580,7 +3852,7 @@ impl Stage {
             egui::pos2(right, center_y),
             egui::Align2::RIGHT_CENTER,
             readout,
-            body.clone(),
+            carved.clone(),
             self.alphabet().ink.color,
         );
 
@@ -3589,7 +3861,7 @@ impl Stage {
                 egui::pos2(readout_rect.min.x - gap, center_y),
                 egui::Align2::RIGHT_CENTER,
                 "REC",
-                body,
+                carved,
                 self.alphabet().jeopardy_active.color,
             );
         }
@@ -3988,9 +4260,9 @@ impl Stage {
     }
 
     fn draw_message(&self, painter: &egui::Painter, zone: egui::Rect) {
-        // The badge takes the strip's left shoulder, so everything the
-        // strip has to SAY begins after it.
-        const MARGIN: f32 = 44.0;
+        // The badge and the colophon take the strip's left shoulder, so
+        // everything the strip has to SAY begins after them.
+        const MARGIN: f32 = 190.0;
 
         let Some(refusal) = self.refusal else {
             // With no refusal this frame, the strip carries the

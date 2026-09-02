@@ -201,6 +201,7 @@ pub fn leaders(
 /// the same parts everything else here is: a circle, a line, a cut. The
 /// one piece of pure ornament in the app, and it earns its place the way
 /// a badge on an instrument does.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn sigil(painter: &egui::Painter, centre: egui::Pos2, radius: f32, ink: egui::Color32) {
     if radius <= 1.0 {
         return;

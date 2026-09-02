@@ -13,6 +13,7 @@
 //! why this surface can exist for all of them at once instead of being
 //! hand-laid-out thirty-nine times.
 
+use crate::design::codex::ParamFamily;
 use crate::devices::ParamLabel;
 use crate::params::ParamDef;
 use crate::sequencing::{Device, Song};
@@ -29,6 +30,14 @@ pub struct Row {
     /// list of forty numbers cannot otherwise give you at a glance: which
     /// of them somebody actually moved.
     pub edited: bool,
+    /// What kind of control this is, before its name.
+    pub family: ParamFamily,
+    /// Where the value sits in its range, 0..1. A gauge's fill.
+    pub place: f32,
+    /// How many positions a LIST has; zero for a range.
+    pub choices: usize,
+    /// Which position the value stands on, when it is a list.
+    pub choice: usize,
 }
 
 /// One device, as a column of the band.
@@ -79,6 +88,10 @@ pub fn column(device: &Device) -> Column {
                         name: qualified(label, spec.labels),
                         value: format_param(def, label, value),
                         edited: value != def.default,
+                        family: family_of(def, label),
+                        place: place_of(def, value),
+                        choices: label.choices.len(),
+                        choice: choice_index(def, label, value).unwrap_or(0),
                     }
                 })
                 .collect(),
@@ -188,11 +201,59 @@ pub fn format_param(def: &ParamDef, label: &ParamLabel, value: f32) -> String {
 /// same single arithmetic step the compiler takes to turn an index back
 /// into a choice.
 fn choice_of(def: &ParamDef, label: &ParamLabel, value: f32) -> Option<&'static str> {
+    choice_index(def, label, value).map(|at| label.choices[at])
+}
+
+fn choice_index(def: &ParamDef, label: &ParamLabel, value: f32) -> Option<usize> {
     if label.choices.is_empty() {
         return None;
     }
     let at = (value - def.min).round().max(0.0) as usize;
-    Some(label.choices[at.min(label.choices.len() - 1)])
+    Some(at.min(label.choices.len() - 1))
+}
+
+/// Where `value` sits in the parameter's range, 0..1.
+pub fn place_of(def: &ParamDef, value: f32) -> f32 {
+    let span = def.max - def.min;
+    if span <= 0.0 || !value.is_finite() {
+        return 0.0;
+    }
+    ((value - def.min) / span).clamp(0.0, 1.0)
+}
+
+/// What kind of control a parameter is, read from the catalog's words:
+/// a list is a SHAPE; a rate, delay or tuning is TIME; a gain or amount is
+/// LEVEL, unless it swings both ways, which makes it MODULATION; a ratio
+/// is MODULATION too. The unit is the tell, and the catalog already
+/// carries it.
+pub fn family_of(def: &ParamDef, label: &ParamLabel) -> ParamFamily {
+    if !label.choices.is_empty() {
+        return ParamFamily::Shape;
+    }
+    let bipolar = def.min < 0.0 && def.max > 0.0;
+    match label.unit.trim() {
+        "Hz" | "ms" | "s" | "st" | "ct" => ParamFamily::Time,
+        "dB/oct" => ParamFamily::Shape,
+        ":1" => ParamFamily::Modulation,
+        _ if bipolar => ParamFamily::Modulation,
+        _ => ParamFamily::Level,
+    }
+}
+
+/// Maximal runs of consecutive rows in one family, in row order. A card
+/// draws one rail segment per run, with the family's sign once at its
+/// top — catalog order is kept, because the cursor addresses rows by
+/// position.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn family_runs(rows: &[Row]) -> Vec<(ParamFamily, std::ops::Range<usize>)> {
+    let mut runs: Vec<(ParamFamily, std::ops::Range<usize>)> = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        match runs.last_mut() {
+            Some((family, range)) if *family == row.family => range.end = i + 1,
+            _ => runs.push((row.family, i..i + 1)),
+        }
+    }
+    runs
 }
 
 /// One press of a parameter.
@@ -480,6 +541,95 @@ mod tests {
         song.device_mut(id).expect("there").sample = Some("/kits/909/kick 01.wav".into());
         let loaded = columns(&song, track).pop().expect("one device");
         assert_eq!(loaded.sample.as_deref(), Some("kick 01.wav"));
+    }
+
+    #[test]
+    fn a_family_is_read_off_the_catalogs_words() {
+        let def = |min: f32, max: f32| ParamDef {
+            id: 0,
+            name: "x",
+            min,
+            max,
+            default: min,
+        };
+        let label = |unit: &'static str, choices: &'static [&'static str]| ParamLabel {
+            name: "x",
+            unit,
+            group: "",
+            choices,
+        };
+        assert_eq!(
+            family_of(&def(0.0, 1.0), &label("", &["a", "b"])),
+            ParamFamily::Shape
+        );
+        assert_eq!(
+            family_of(&def(20.0, 20000.0), &label("Hz", &[])),
+            ParamFamily::Time
+        );
+        assert_eq!(
+            family_of(&def(0.0, 1.0), &label(" ms", &[])),
+            ParamFamily::Time
+        );
+        assert_eq!(
+            family_of(&def(0.0, 100.0), &label("%", &[])),
+            ParamFamily::Level
+        );
+        assert_eq!(
+            family_of(&def(-1.0, 1.0), &label("", &[])),
+            ParamFamily::Modulation
+        );
+        assert_eq!(
+            family_of(&def(1.0, 20.0), &label(":1", &[])),
+            ParamFamily::Modulation
+        );
+        assert_eq!(
+            family_of(&def(6.0, 48.0), &label("dB/oct", &[])),
+            ParamFamily::Shape
+        );
+        assert_eq!(place_of(&def(0.0, 10.0), 2.5), 0.25);
+        assert_eq!(place_of(&def(0.0, 10.0), 99.0), 1.0);
+        assert_eq!(place_of(&def(5.0, 5.0), 5.0), 0.0);
+    }
+
+    #[test]
+    fn family_runs_keep_catalog_order_and_join_neighbours() {
+        let row = |family: ParamFamily| Row {
+            name: String::new(),
+            value: String::new(),
+            edited: false,
+            family,
+            place: 0.0,
+            choices: 0,
+            choice: 0,
+        };
+        let rows = [
+            row(ParamFamily::Time),
+            row(ParamFamily::Time),
+            row(ParamFamily::Level),
+            row(ParamFamily::Time),
+        ];
+        let runs = family_runs(&rows);
+        assert_eq!(
+            runs,
+            vec![
+                (ParamFamily::Time, 0..2),
+                (ParamFamily::Level, 2..3),
+                (ParamFamily::Time, 3..4)
+            ]
+        );
+        assert!(family_runs(&[]).is_empty());
+    }
+
+    #[test]
+    fn every_parameter_in_the_app_has_a_family() {
+        // Every unit the catalog uses is one the rule knows, so no device
+        // ends up with a card whose rows are unclassified by accident.
+        for spec in crate::devices::DEVICES {
+            for (def, label) in spec.params.iter().zip(spec.labels) {
+                let _ = family_of(def, label);
+                assert!((0.0..=1.0).contains(&place_of(def, def.default)));
+            }
+        }
     }
 
     #[test]

@@ -45,6 +45,91 @@ const TERMINUS_REGULAR: &[u8] = include_bytes!(concat!(
 ));
 
 /// Make the bundled Terminus the default for both text families.
+/// The stage's own type: a typewriter for everything read, and an
+/// inscription face for the few words that are carved rather than typed.
+///
+/// iA Writer Mono S is the typewriter — the Rosicrucian diagram's
+/// annotations, the register's colophon — and it leads both families so
+/// every `FontId::monospace` the stage builds lands on it. The
+/// inscription face is a geometric grotesque with wide-set capitals, the
+/// letterform of a plaque on a machine nobody alive built. It is loaded
+/// from the machine's own fonts when present, and falls back to the
+/// bundled iA Writer Quattro so a stage without it still has a face for
+/// its inscriptions.
+pub const INSCRIPTION: &str = "inscription";
+pub const TYPEWRITER_BOLD: &str = "typewriter-bold";
+
+static IA_MONO_REGULAR: &[u8] = include_bytes!("../assets/fonts/iAWriterMonoS-Regular.ttf");
+static IA_MONO_BOLD: &[u8] = include_bytes!("../assets/fonts/iAWriterMonoS-Bold.ttf");
+static IA_QUATTRO_BOLD: &[u8] = include_bytes!("../assets/fonts/iAWriterQuattroS-Bold.ttf");
+
+/// The inscription face, wherever this machine keeps it.
+const INSCRIPTION_CANDIDATES: &[&str] = &[
+    "/usr/share/fonts/gsfonts/URWGothic-Demi.otf",
+    "/usr/share/fonts/urw-base35/URWGothic-Demi.otf",
+    "/usr/share/fonts/gsfonts/URWGothic-Book.otf",
+];
+
+pub fn install_stage_fonts(ctx: &egui::Context) -> &'static str {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "terminus".to_owned(),
+        Arc::new(egui::FontData::from_static(TERMINUS_REGULAR)),
+    );
+    fonts.font_data.insert(
+        "typewriter".to_owned(),
+        Arc::new(egui::FontData::from_static(IA_MONO_REGULAR)),
+    );
+    fonts.font_data.insert(
+        TYPEWRITER_BOLD.to_owned(),
+        Arc::new(egui::FontData::from_static(IA_MONO_BOLD)),
+    );
+    let inscription = INSCRIPTION_CANDIDATES
+        .iter()
+        .find_map(|path| std::fs::read(path).ok().map(|bytes| (*path, bytes)));
+    let label = match inscription {
+        Some((path, bytes)) => {
+            fonts.font_data.insert(
+                INSCRIPTION.to_owned(),
+                Arc::new(egui::FontData::from_owned(bytes)),
+            );
+            path
+        }
+        None => {
+            fonts.font_data.insert(
+                INSCRIPTION.to_owned(),
+                Arc::new(egui::FontData::from_static(IA_QUATTRO_BOLD)),
+            );
+            "iA Writer Quattro S Bold (bundled)"
+        }
+    };
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        let list = fonts.families.entry(family).or_default();
+        list.insert(0, "typewriter".to_owned());
+        // Terminus stays behind it for the box-drawing and symbol glyphs
+        // the typewriter lacks; egui's own fonts remain behind both.
+        list.insert(1, "terminus".to_owned());
+    }
+    fonts.families.insert(
+        egui::FontFamily::Name(INSCRIPTION.into()),
+        vec![
+            INSCRIPTION.to_owned(),
+            "typewriter".to_owned(),
+            "terminus".to_owned(),
+        ],
+    );
+    fonts.families.insert(
+        egui::FontFamily::Name(TYPEWRITER_BOLD.into()),
+        vec![
+            TYPEWRITER_BOLD.to_owned(),
+            "typewriter".to_owned(),
+            "terminus".to_owned(),
+        ],
+    );
+    ctx.set_fonts(fonts);
+    label
+}
+
 pub fn install_fonts(ctx: &egui::Context) -> Option<&'static str> {
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(

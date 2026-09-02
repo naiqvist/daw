@@ -52,9 +52,11 @@ use sequence::NoteView;
 /// bytes are not a perceptual space — which is the same argument the
 /// design alphabet's ladder is built on.
 pub fn shade(level: u8, ground: design::Polarity) -> egui::Color32 {
+    // Bone, not grey: the same warm tint the alphabet's ladder wears, so
+    // the sequencer's levels and the frame's rungs are one material.
     match ground {
-        design::Polarity::Dark => egui::Color32::from_gray(level),
-        design::Polarity::Light => egui::Color32::from_gray(MIRROR[level as usize]),
+        design::Polarity::Dark => design::bone(level),
+        design::Polarity::Light => design::bone(MIRROR[level as usize]),
     }
 }
 
@@ -215,11 +217,9 @@ mod tests {
         // chosen against, or the second frame would have been redesigned
         // by a refactor that promised not to touch it.
         for level in [0u8, 5, 10, 18, 48, 112, 145, 255] {
-            assert_eq!(
-                shade(level, design::Polarity::Dark),
-                egui::Color32::from_gray(level),
-                "the dark projection moved level {level}"
-            );
+            let shade = shade(level, design::Polarity::Dark);
+            assert_eq!(shade.r(), level, "the dark projection moved level {level}");
+            assert!(design::is_tint(shade), "a level spent hue: {shade:?}");
         }
     }
 
@@ -249,10 +249,7 @@ mod tests {
     fn the_certain_thing_is_farthest_from_whichever_ground_it_is_on() {
         // White on black and near-black on paper: the same MEANING, which
         // is what the projection is for.
-        assert_eq!(
-            shade(INK_LEVEL, design::Polarity::Dark),
-            egui::Color32::WHITE
-        );
+        assert_eq!(shade(INK_LEVEL, design::Polarity::Dark).r(), 255);
         let paper_ink = shade(INK_LEVEL, design::Polarity::Light);
         assert!(
             design::lightness(paper_ink.r()) < 5.0,

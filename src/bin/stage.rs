@@ -30,7 +30,7 @@
 use daw::audio::transport::TransportCmd;
 use daw::audio::{Engine, EngineConfig, StreamHealth};
 use daw::design::Polarity;
-use daw::install_fonts;
+use daw::install_stage_fonts;
 use daw::params;
 use daw::song_graph::{self, MASTER_METER, SongNodes};
 use daw::ui::stage::{EngineState, Health, Level, Stage};
@@ -289,7 +289,7 @@ impl App {
         // The fonts and the theme are the design system, and they are the
         // one part of the old surfaces that carries over unchanged — they
         // encode the aesthetic charter rather than any layout.
-        install_fonts(&cc.egui_ctx);
+        install_stage_fonts(&cc.egui_ctx);
         Theme::dark().apply(&cc.egui_ctx);
         let audio = Audio::start();
         if let Some(trouble) = &audio.trouble {
