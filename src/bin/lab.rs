@@ -941,6 +941,7 @@ impl EngineBench {
                             pitch,
                             vel: 100,
                             plocks: Vec::new(),
+                            fx_locks: Vec::new(),
                             prob: 1.0,
                             cond: None,
                         });

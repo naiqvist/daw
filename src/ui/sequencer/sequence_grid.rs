@@ -118,6 +118,10 @@ pub(crate) struct SequenceGrid {
     /// The last refusal, shown in the status line until the next sentence.
     /// Silence is forbidden: an unsupported verb answers out loud.
     refusal: Option<String>,
+    /// Where the cursor's cell was drawn this frame, so a surface over
+    /// the grid can point at the thing under the cursor. A fact about
+    /// the last draw, never about the model: `None` until drawn.
+    cursor_rect: Option<egui::Rect>,
 }
 
 impl Default for SequenceGrid {
@@ -130,6 +134,7 @@ impl Default for SequenceGrid {
             clip_ticks: DEFAULT_PATTERN_TICKS,
             last_pitch: Pitch::from_midi(DEFAULT_PITCH),
             refusal: None,
+            cursor_rect: None,
         }
     }
 }
@@ -248,6 +253,7 @@ impl SequenceGrid {
             .map_or(DEFAULT_PATTERN_TICKS, |clip| clip.length_ticks)
             .clamp(PATTERN_STEP_TICKS, DEFAULT_PATTERN_TICKS);
         self.cursor_step = self.cursor_step.min(self.steps() - 1);
+        self.cursor_rect = None;
         if focused {
             self.keyboard(ui.ctx(), voice, clip, intents);
         }
@@ -373,9 +379,6 @@ impl SequenceGrid {
             );
             for column in shown.clone() {
                 let step = row * columns + column;
-                if step >= self.steps() {
-                    continue;
-                }
                 let rect = egui::Rect::from_min_max(
                     egui::pos2(tick_x(column * step_ticks), row_top),
                     egui::pos2(
@@ -383,6 +386,33 @@ impl SequenceGrid {
                         row_top + cell_side,
                     ),
                 );
+                if step >= self.steps() {
+                    // Past the clip's end the lattice is a ghost: a
+                    // hairline outline says a cell could stand here, and
+                    // the END mark on the first of them says why none does.
+                    // Nothing here answers the pointer or the keys.
+                    if rect.intersect(window).is_positive() {
+                        let mut shapes = Vec::new();
+                        circuit::octagon(
+                            &mut shapes,
+                            rect,
+                            circuit::CHAMFER,
+                            None,
+                            Some((Weight::Hair, shade(EDGE, ground).gamma_multiply(0.45))),
+                        );
+                        cells.extend(shapes);
+                        if step == self.steps() {
+                            draw_clip_end(
+                                &cells,
+                                rect.left() - CELL_GAP * 0.5,
+                                rect.top(),
+                                rect.bottom(),
+                                ground,
+                            );
+                        }
+                    }
+                    continue;
+                }
                 // A cell cut by the window's edge answers the pointer on
                 // the part that shows, and nowhere else.
                 let hit = rect.intersect(window);
@@ -411,6 +441,25 @@ impl SequenceGrid {
                 self.draw_cell_events(&cells, rect, clip, lens, step, ground);
                 if self.cursor_step == step {
                     draw_cursor(&cells, rect, ground);
+                    self.cursor_rect = Some(rect);
+                }
+            }
+            // Past the end the light goes down: everything beyond the
+            // clip is veiled toward the ground, so the clip's extent is
+            // read as brightness before it is read as a line.
+            let before_end = self.steps().saturating_sub(row * columns).min(columns);
+            if before_end < columns {
+                let x = if before_end == 0 {
+                    window.left()
+                } else {
+                    tick_x(before_end * step_ticks) - CELL_GAP * 0.5
+                };
+                let veil = egui::Rect::from_min_max(
+                    egui::pos2(x.max(window.left()), row_top - CELL_GAP),
+                    egui::pos2(window.right(), row_top + cell_side + CELL_GAP),
+                );
+                if veil.is_positive() {
+                    cells.rect_filled(veil, 0.0, clip_veil(ground));
                 }
             }
         }
@@ -503,9 +552,12 @@ impl SequenceGrid {
                 painter.add(shape);
             }
             if let Some(label) = ruler_label(tick, unit) {
+                // Centred over the column, where the cell beneath keeps
+                // its own content, so the word and the cell it names line
+                // up. The pad at the column's edge stays the tick.
                 painter.text(
-                    egui::pos2(x + space::XS, band.center().y - 1.0),
-                    egui::Align2::LEFT_TOP,
+                    egui::pos2(x + stride * 0.5, band.center().y - 1.0),
+                    egui::Align2::CENTER_TOP,
                     label,
                     ruler_font.clone(),
                     if beat {
@@ -536,9 +588,9 @@ impl SequenceGrid {
         // beside the clip — a context with no sign is a trap.
         let words = match clip {
             Some(clip) if width >= 560.0 => format!(
-                "{}   {:02}B   {}{}   {}",
+                "{}   {}   {}{}   {}",
                 clip.name,
-                clip.length_ticks.div_ceil(TICKS_PER_BAR),
+                crate::ui::sequencer::grid_resolution::bars_label(clip.length_ticks),
                 self.resolution.label(),
                 zoom_sign(self.zoom),
                 lens.status
@@ -664,6 +716,12 @@ impl SequenceGrid {
             shade(FACE_INK, ground),
             true,
         );
+        // The lock mark: a trig that holds parameter locks wears a short
+        // row of pads along its foot in the live ink, one per lock up to
+        // four — the deck bends its sound here, and the row says how
+        // much without the figure. Drawn before the width gate below,
+        // because a lock is worth a mark at any size the face still is.
+        draw_lock_marks(&mut shapes, face, note.locks, ground);
         for shape in shapes {
             painter.add(shape);
         }
@@ -725,6 +783,19 @@ impl SequenceGrid {
         }
         if face.width() < SIGNS_MIN_W {
             return;
+        }
+        // On a slicing track the trig's locked slice is a tag at the
+        // crown: the note below it is a pitch, the tag is which cut.
+        if let (true, Some(slice)) = (clip.is_some_and(|clip| clip.slicing), note.slice) {
+            draw_edge_tag(
+                painter,
+                egui::Rect::from_center_size(
+                    egui::pos2(face.center().x, face.top() + 5.0),
+                    egui::vec2(24.0, 10.0),
+                ),
+                &slice_label(slice),
+                ground,
+            );
         }
         if tone_count > 1 {
             painter.text(
@@ -877,10 +948,12 @@ impl SequenceGrid {
                 self.refusal = Some("RESIZE: LEFT OR RIGHT".to_owned());
             }
             (Some(Verb::ClipResize), Some(motion @ (Motion::Left | Motion::Right))) => {
+                // A step of the grid, or a whole bar with Shift held.
+                let unit = if utterance.held { TICKS_PER_BAR } else { span };
                 intents.push(Intent::ResizeClip {
                     delta_ticks: count
                         * if motion == Motion::Right { 1 } else { -1 }
-                        * span as isize,
+                        * unit as isize,
                 });
             }
             (Some(Verb::ClipResize), Some(_)) => {
@@ -1042,6 +1115,11 @@ impl SequenceGrid {
         self.cursor_step * self.resolution.step_ticks()
     }
 
+    /// The cursor cell as last drawn, if it was on screen.
+    pub(crate) fn cursor_rect(&self) -> Option<egui::Rect> {
+        self.cursor_rect
+    }
+
     pub(crate) fn selection(&self, clip: Option<ClipView<'_>>) -> TrigSelection {
         let span = self.resolution.step_ticks();
         let tick = self.cursor_step * span;
@@ -1110,6 +1188,13 @@ fn cell_label(note: &NoteView, lens: &LensView) -> String {
     crate::ui::sequencer::lens::address_label(&lens.active, note, &lens.key)
 }
 
+/// The word for a slice: its number from one, as the editor and the
+/// SLICE row count them, so every surface agrees about which cut is
+/// which.
+pub(crate) fn slice_label(slice: u8) -> String {
+    format!("S{slice:02}")
+}
+
 /// Deviation is an edge tag, separate from the pitch address it modifies.
 /// Approximation belongs to the machine and bend to the musician, so when
 /// both apply the tag carries both signs rather than collapsing them.
@@ -1150,6 +1235,69 @@ fn draw_edge_tag(painter: &egui::Painter, rect: egui::Rect, words: &str, ground:
 /// the density of a shade. Three rungs, because that is what the eye can
 /// tell apart at a glance in a cell corner; the exact figure is read in
 /// the inspector, never off the trig.
+/// The lock mark's pads, along a face's foot: one per lock, at most
+/// four, in the live ink. Shared by the grid and the roll so a locked
+/// trig wears the same mark in both projections.
+pub(crate) fn draw_lock_marks(
+    out: &mut Vec<egui::Shape>,
+    face: egui::Rect,
+    locks: u8,
+    ground: Polarity,
+) {
+    if locks == 0 || face.width() < 14.0 || face.height() < 10.0 {
+        return;
+    }
+    let live = crate::design::Alphabet::for_polarity(ground).live.color;
+    let y = face.bottom() - 4.0;
+    let mut x = face.left() + 7.0;
+    for _ in 0..locks.min(4) {
+        if x + 2.0 > face.right() - 4.0 {
+            break;
+        }
+        circuit::pad(out, egui::pos2(x, y), 3.0, live, true);
+        x += 5.0;
+    }
+}
+
+/// The veil laid over everything past a clip's end: the ground, mostly
+/// opaque, so what is beyond is seen but not read.
+pub(crate) fn clip_veil(ground: Polarity) -> egui::Color32 {
+    crate::design::Alphabet::for_polarity(ground)
+        .ground
+        .color
+        .gamma_multiply(0.62)
+}
+
+/// The clip's end: a heavy rule from `top` to `bottom` at `x`, capped
+/// with pads and the word END at its head. The same mark in the grid
+/// and the roll, so a clip resized in one is seen to end in the other.
+pub(crate) fn draw_clip_end(
+    painter: &egui::Painter,
+    x: f32,
+    top: f32,
+    bottom: f32,
+    ground: Polarity,
+) {
+    let ink = shade(INK_LEVEL, ground);
+    let mut shapes = Vec::new();
+    circuit::trace(
+        &mut shapes,
+        &[egui::pos2(x, top), egui::pos2(x, bottom)],
+        Weight::Heavy,
+        ink,
+    );
+    circuit::pad(&mut shapes, egui::pos2(x, top), circuit::PAD, ink, true);
+    circuit::pad(&mut shapes, egui::pos2(x, bottom), circuit::PAD, ink, true);
+    painter.extend(shapes);
+    painter.text(
+        egui::pos2(x + 4.0, top + 2.0),
+        egui::Align2::LEFT_TOP,
+        "END",
+        egui::FontId::new(font::MICRO_LABEL, egui::FontFamily::Monospace),
+        ink,
+    );
+}
+
 pub(crate) fn condition_sign(probability: f32) -> char {
     if probability >= 0.7 {
         '▓'
@@ -1730,6 +1878,7 @@ mod tests {
             length_ticks: 64 * 12,
             notes,
             ghosts: &[],
+            slicing: false,
         }
     }
 

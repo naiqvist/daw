@@ -125,6 +125,9 @@ pub struct SamplerParams {
     pub preamp: f32,
     pub gain_db: f32,
     pub pan: f32,
+    /// The slice a note plays in slice mode, from one. Locked per trig
+    /// like any other row; the note itself is a pitch against the root.
+    pub slice: f32,
 }
 
 impl Default for SamplerParams {
@@ -170,6 +173,7 @@ impl Default for SamplerParams {
             preamp: at(sp::PREAMP),
             gain_db: at(sp::GAIN),
             pan: at(sp::PAN),
+            slice: at(sp::SLICE),
         }
     }
 }
@@ -218,6 +222,7 @@ impl SamplerParams {
             sp::PREAMP => self.preamp = value,
             sp::GAIN => self.gain_db = value,
             sp::PAN => self.pan = value,
+            sp::SLICE => self.slice = value,
             _ => {}
         }
     }
@@ -261,6 +266,7 @@ impl SamplerParams {
             sp::PREAMP => self.preamp,
             sp::GAIN => self.gain_db,
             sp::PAN => self.pan,
+            sp::SLICE => self.slice,
             _ => return None,
         })
     }
@@ -777,7 +783,10 @@ impl SamplerVoices {
         let detune = p.tune + p.fine / 100.0;
 
         if p.slicing() {
-            let index = usize::from(pitch.checked_sub(sp::SLICE_BASE_NOTE)?);
+            // The SLICE row says which cut; the note says how fast. A
+            // slice past the table is silence, not the last slice: a
+            // lock that points at nothing should be heard as nothing.
+            let index = (p.slice.round().max(1.0) as usize) - 1;
             let count = self.slice_count;
             if count == 0 || index >= count {
                 return None;
@@ -797,8 +806,9 @@ impl SamplerVoices {
             if hi - lo < 2.0 {
                 return None;
             }
-            // Slice mode: the note SELECTS, it does not transpose.
-            return Some((lo, hi, detune));
+            // Slice mode: the row selects, and the note transposes,
+            // as it does in classic mode.
+            return Some((lo, hi, f32::from(pitch) - p.root + detune));
         }
 
         let a = frames * f64::from(p.start.clamp(0.0, 1.0));
@@ -1594,7 +1604,8 @@ mod tests {
                 fresh.set_slices(&grid(1_600, 4));
                 fresh
             };
-            v.note_on(sp::SLICE_BASE_NOTE + slice, 127, 0);
+            v.plock(sp::SLICE, Some(f32::from(slice) + 1.0));
+            v.note_on(p.root.round() as u8, 127, 0);
             let (l, _) = run(&mut v, 64, BLOCK);
             let want = f32::from(slice) * 0.25;
             assert!(
@@ -1614,9 +1625,10 @@ mod tests {
         p.mode = sp::MODE_SLICE;
         let mut v = bank(p, tone(1_600));
         v.set_slices(&grid(1_600, 4));
-        v.note_on(sp::SLICE_BASE_NOTE + 9, 127, 0);
+        v.plock(sp::SLICE, Some(10.0));
+        v.note_on(p.root.round() as u8, 127, 0);
         let (l, _) = run(&mut v, 256, BLOCK);
-        assert!(l.iter().all(|s| *s == 0.0), "a note off the end sounded");
+        assert!(l.iter().all(|s| *s == 0.0), "a slice off the end sounded");
         assert!(!v.any_active());
     }
 
@@ -1630,9 +1642,11 @@ mod tests {
         p.fade_out_ms = 1.0;
         let mut v = bank(p, tone(1_600));
         v.set_slices(&grid(1_600, 4));
-        v.note_on(sp::SLICE_BASE_NOTE, 127, 0);
+        v.plock(sp::SLICE, Some(1.0));
+        v.note_on(p.root.round() as u8, 127, 0);
         let _ = run(&mut v, 64, BLOCK);
-        v.note_on(sp::SLICE_BASE_NOTE + 1, 127, 1);
+        v.plock(sp::SLICE, Some(2.0));
+        v.note_on(p.root.round() as u8, 127, 1);
         let _ = run(&mut v, 256, BLOCK);
         let sounding = (0..VOICES).filter(|i| v.voices[*i].active).count();
         assert_eq!(sounding, 1, "choke left {sounding} voices sounding");
@@ -1647,8 +1661,10 @@ mod tests {
         p.choke = 0.0;
         let mut v = bank(p, tone(1_600));
         v.set_slices(&grid(1_600, 4));
-        v.note_on(sp::SLICE_BASE_NOTE, 127, 0);
-        v.note_on(sp::SLICE_BASE_NOTE + 1, 127, 1);
+        v.plock(sp::SLICE, Some(1.0));
+        v.note_on(p.root.round() as u8, 127, 0);
+        v.plock(sp::SLICE, Some(2.0));
+        v.note_on(p.root.round() as u8, 127, 1);
         let _ = run(&mut v, 64, BLOCK);
         let sounding = (0..VOICES).filter(|i| v.voices[*i].active).count();
         assert_eq!(sounding, 2);
@@ -1866,7 +1882,11 @@ mod tests {
                 def.name
             );
         }
-        assert_eq!(sp::TABLE.len(), 36, "the brief says thirty-six rows");
+        assert_eq!(
+            sp::TABLE.len(),
+            37,
+            "the brief says thirty-six rows, and the slice row makes thirty-seven"
+        );
     }
 
     /// Defaults come from the table and from nowhere else.

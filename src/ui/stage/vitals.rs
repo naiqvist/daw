@@ -65,6 +65,29 @@ pub enum Tone {
     Alarm,
 }
 
+/// The stream's standing facts: what the engine opened, as opposed to
+/// how it is doing. These change only when the device does, so they
+/// are handed in separately from `Health` and kept until replaced.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Stream {
+    pub sample_rate: u32,
+    pub buffer_frames: u32,
+    /// The device's reported round trip, when it reports one.
+    pub latency_frames: Option<u32>,
+    pub inputs: u8,
+    pub outputs: u8,
+    /// The backend's name, for its seal.
+    pub backend: &'static str,
+}
+
+impl Stream {
+    /// The stream's latency in milliseconds, when known.
+    pub fn latency_ms(&self) -> Option<f32> {
+        let frames = self.latency_frames?;
+        (self.sample_rate > 0).then(|| frames as f32 * 1000.0 / self.sample_rate as f32)
+    }
+}
+
 /// The engine's health, with the memory that makes an xrun visible.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Vitals {
@@ -72,6 +95,8 @@ pub struct Vitals {
     /// difference is drawn: no report is a stage nobody has wired, and
     /// `Absent` is a host that tried and could not.
     health: Option<Health>,
+    /// The stream's facts, while there is a stream.
+    stream: Option<Stream>,
     /// The count the last report carried, so a rise can be noticed.
     seen_xruns: u64,
     /// Seconds of flash left.
@@ -90,6 +115,15 @@ impl Vitals {
         self.health = Some(health);
     }
 
+    /// Take the stream's facts, or their absence.
+    pub fn set_stream(&mut self, stream: Option<Stream>) {
+        self.stream = stream;
+    }
+
+    pub fn stream(&self) -> Option<&Stream> {
+        self.stream.as_ref()
+    }
+
     /// Let `dt` seconds of flash burn down.
     pub fn tick(&mut self, dt: f32) {
         self.flash = (self.flash - dt.max(0.0)).max(0.0);
@@ -100,7 +134,6 @@ impl Vitals {
     }
 
     /// Whether the report says an engine is running.
-    #[cfg(test)]
     pub fn running(&self) -> bool {
         matches!(
             self.health,

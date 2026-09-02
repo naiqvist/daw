@@ -23,14 +23,11 @@
 //! that changing the shell does not silently discard a machine's
 //! preferences.
 //!
-//! # The post pass makes an exact-bypass promise
+//! # The post pass is blank
 //!
-//! At zero amount the shader returns the sampled texel unchanged, and
-//! `post::Amounts::NONE` is a supported setting rather than a
-//! degenerate one. Every colour stage in this codebase makes that
-//! promise — see `notes/20260827-sampler-brief.md` — and a full-screen
-//! filter is the one where it matters most: it is the only stage that
-//! cannot be removed from the chain to check what it was doing.
+//! It copies the finished frame to the swapchain unchanged. The stage keeps
+//! the offscreen seam so a treatment can be explored later without touching
+//! windowing or input code.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -251,8 +248,6 @@ impl<A: Host> winit::application::ApplicationHandler for Shell<A> {
                 // The one place preferences MUST be written: an exit
                 // that dropped them would lose thirty seconds of
                 // settings and look like a bug in the settings.
-                let amounts = live.post.amounts();
-                self.storage.set(post::STORAGE_KEY, &amounts);
                 self.app.save(&mut self.storage);
                 self.storage.flush();
                 event_loop.exit();
@@ -313,7 +308,19 @@ impl<A: Host> Shell<A> {
         }
 
         // --- the egui pass, exactly as eframe ran it -------------------
-        let raw_input = live.egui.take_egui_input(&live.window);
+        let mut raw_input = live.egui.take_egui_input(&live.window);
+        // What eframe does and `take_egui_input` does not: tell egui about
+        // the window itself — fullscreen, focus, its rect on the screen.
+        // The surface reads `fullscreen` from here; it never sees the window.
+        egui_winit::update_viewport_info(
+            raw_input
+                .viewports
+                .entry(egui::ViewportId::ROOT)
+                .or_default(),
+            live.egui.egui_ctx(),
+            &live.window,
+            false,
+        );
         let app = &mut self.app;
         let mut output = live
             .egui
@@ -400,12 +407,10 @@ impl<A: Host> Shell<A> {
         // --- and then, after everything -------------------------------
         live.post.draw(
             &live.device,
-            &live.queue,
             &mut encoder,
             &live.offscreen.view,
             live.offscreen.generation,
             &target,
-            size,
         );
 
         live.queue
@@ -513,26 +518,12 @@ impl<A: Host> Shell<A> {
             Some(device.limits().max_texture_dimension_2d as usize),
         );
         let renderer = egui_wgpu::Renderer::new(&device, format, Default::default());
-        // The treatment's settings, and a way to turn them off from
-        // outside. `DAW_POST=off` is the A/B the exact bypass exists
-        // for: a filter you cannot compare against nothing is a filter
-        // nobody can judge, and this one is meant to be too subtle to
-        // judge any other way.
-        let amounts = if std::env::var("DAW_POST").is_ok_and(|v| v.eq_ignore_ascii_case("off")) {
-            post::Amounts::NONE
-        } else {
-            self.storage
-                .get::<post::Amounts>(post::STORAGE_KEY)
-                .unwrap_or_default()
-        };
-        let mut post = post::Post::new(&device, format, amounts);
-        // `DAW_POST=test` — the diagnostic. See `post::Post::set_test`.
-        post.set_test(std::env::var("DAW_POST").is_ok_and(|v| v.eq_ignore_ascii_case("test")));
+        let post = post::Post::new(&device, format);
         let offscreen = Offscreen::new(&device, format, size, 0);
 
         if std::env::var("DAW_SHELL_DEBUG").is_ok() {
             eprintln!(
-                "shell: format={format:?} size={size:?} scale={} zoom={} amounts={amounts:?}",
+                "shell: format={format:?} size={size:?} scale={} zoom={}",
                 window.scale_factor(),
                 egui_ctx.zoom_factor(),
             );

@@ -108,12 +108,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut subject = Subject::default();
     let mut jobs = Vec::new();
     for _ in 0..2 {
+        // A pose named `-full` is shot as the app would look fullscreen:
+        // the stage reads that from the viewport, exactly as it does in
+        // the real shell, so the cut corners show.
+        let mut viewports = egui::ViewportIdMap::default();
+        viewports.insert(
+            egui::ViewportId::ROOT,
+            egui::ViewportInfo {
+                fullscreen: Some(which.contains("-full")),
+                ..Default::default()
+            },
+        );
         let mut out = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
                     egui::vec2(logical_w, logical_h),
                 )),
+                viewports,
                 ..Default::default()
             },
             |ui| {
@@ -319,6 +331,24 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
         let _ = stage.apply(StageIntent::Step(Step::Down));
         let _ = stage.apply(StageIntent::Launch);
         let _ = stage.apply(StageIntent::ToggleTransport);
+        // `-sounding`: an engine is behind the roll, as the host would
+        // report it, so the marks that need both can be shot.
+        if which.contains("-sounding") {
+            use daw::ui::stage::{EngineState, Health, Stream};
+            stage.set_health(Health {
+                state: EngineState::Running,
+                xruns: 0,
+                load: 0.2,
+            });
+            stage.set_stream(Some(Stream {
+                sample_rate: 48_000,
+                buffer_frames: 256,
+                latency_frames: Some(512),
+                inputs: 2,
+                outputs: 2,
+                backend: "JACK",
+            }));
+        }
     } else if which.contains("chain") {
         // A voice and two effects, with a few values moved off their
         // defaults so the band has something to distinguish.
@@ -342,7 +372,102 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
         // nothing about that.
         let _ = stage.apply(StageIntent::NewInstrumentTrack);
         let _ = stage.apply(StageIntent::NewAudioTrack);
+        // Two returns, and a spread of sends, so the strips carry rails
+        // and the returns stand beside the tracks in their own casing.
+        {
+            let song = stage.song_mut();
+            let _ = song.add_return();
+            let _ = song.add_return();
+            song.returns[0].name = "hall".to_owned();
+            song.returns[1].name = "tape".to_owned();
+            song.tracks[0].sends = vec![0.35, 0.0];
+            song.tracks[1].sends = vec![0.0, 0.6];
+            song.tracks[2].sends = vec![0.8, 0.2];
+        }
         let _ = stage.apply(StageIntent::Mix);
+    } else if which.contains("sample") {
+        // A sampler on the first track with a synthesized file — a
+        // decaying tone struck four times, so onsets exist to find —
+        // and the cutting room open over it, on the page asked for.
+        use daw::ui::stage::{SampleData, SampleIntent};
+        let id = stage
+            .song_mut()
+            .add_device(0, daw::devices::DeviceKind::Sampler)
+            .expect("a sampler");
+        let path = std::path::PathBuf::from("/shot/amen-cut.wav");
+        if let Some(device) = stage.song_mut().device_mut(id) {
+            device.sample = Some(path.clone());
+        }
+        let rate = 48_000u32;
+        let frames = rate as usize * 2;
+        let samples: Vec<f32> = (0..frames)
+            .map(|i| {
+                let t = i as f32 / rate as f32;
+                let hit = (t * 2.0).fract() / 2.0;
+                let env = (-hit * 9.0).exp();
+                let tone = (t * 110.0 * std::f32::consts::TAU).sin() * 0.55
+                    + (t * 3_300.0 * std::f32::consts::TAU).sin() * 0.25 * (-hit * 40.0).exp();
+                let noise = ((i as u32).wrapping_mul(2_654_435_761) >> 8) as f32
+                    / (1u32 << 24) as f32
+                    - 0.5;
+                (tone * env + noise * 0.12 * (-hit * 25.0).exp()).clamp(-1.0, 1.0)
+            })
+            .collect();
+        stage.set_sample(SampleData::from_planar(
+            path,
+            std::sync::Arc::new(samples),
+            1,
+            frames as u64,
+            rate,
+        ));
+        // `SHOT_SAMPLE=/path/to/file.wav` puts a real file in the room
+        // instead, through the same material path the host uses — the
+        // way to see the editor over something that was actually played.
+        if let Some(real) = std::env::var_os("SHOT_SAMPLE").map(std::path::PathBuf::from) {
+            match daw::audio::material::load_cached(&real, rate) {
+                Ok(loaded) => {
+                    if let Some(device) = stage.song_mut().device_mut(id) {
+                        device.sample = Some(real.clone());
+                    }
+                    stage.set_sample(SampleData::from_planar(
+                        real,
+                        loaded.samples.clone(),
+                        loaded.channels,
+                        loaded.frames,
+                        loaded.sample_rate,
+                    ));
+                }
+                Err(error) => eprintln!("shot: could not read {}: {error}", real.display()),
+            }
+        }
+        let _ = stage.apply(StageIntent::Sample(SampleIntent::Open));
+        let _ = stage.apply(StageIntent::Sample(SampleIntent::Transients));
+        // A coarse step is an eighth of the view: two in, the start;
+        // five more, the end; then back a little, so the cursor stands
+        // inside the trim with markers either side of it.
+        for _ in 0..2 {
+            let _ = stage.apply(StageIntent::Sample(SampleIntent::Right { coarse: true }));
+        }
+        let _ = stage.apply(StageIntent::Sample(SampleIntent::SetStart));
+        for _ in 0..5 {
+            let _ = stage.apply(StageIntent::Sample(SampleIntent::Right { coarse: true }));
+        }
+        let _ = stage.apply(StageIntent::Sample(SampleIntent::SetEnd));
+        for _ in 0..2 {
+            let _ = stage.apply(StageIntent::Sample(SampleIntent::Left { coarse: true }));
+        }
+        let _ = stage.apply(StageIntent::Sample(SampleIntent::Audition));
+        if which.contains("-slice") {
+            let _ = stage.apply(StageIntent::Sample(SampleIntent::Page));
+        } else if which.contains("-attr") {
+            let _ = stage.apply(StageIntent::Sample(SampleIntent::Page));
+            let _ = stage.apply(StageIntent::Sample(SampleIntent::Page));
+        }
+        if which.contains("-zoom") {
+            for _ in 0..3 {
+                let _ = stage.apply(StageIntent::Sample(SampleIntent::ZoomIn));
+            }
+        }
     } else if which.contains("clip") {
         // Down onto a slot, fill it, and go in: the sequencer and the
         // trig inspector are what this shot is for. Give the new pattern
@@ -364,8 +489,97 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
             pattern.add_tone(7, Note::with_pitch(Pitch::degree(6, 0), 24, 92));
             pattern.set_primary(12, Note::with_pitch(Pitch::degree(1, 1), 48, 126));
             pattern.set_primary(20, Note::new(54, 18, 66));
+            // `-short`: the clip cut to a bar and a half, so the views
+            // can be seen to say where it ends.
+            if which.contains("-short") {
+                let _ = pattern.apply(&daw::intent::sequence::Intent::ResizeClip {
+                    delta_ticks: -(40 * daw::sequencing::PATTERN_STEP_TICKS as isize),
+                });
+            }
         }
         let _ = stage.apply(StageIntent::Enter);
+        // `-menu`: the trig menu up over the trig under the cursor, a
+        // few rows down so the cursor row is seen among its neighbours.
+        if which.contains("-menu") && which.contains("-slicer") {
+            // The same menu over a slicing sampler: the strip shows the
+            // file and the cut, and the cursor rests on the slice row
+            // with a lock two cuts along.
+            use daw::params::sampler as sp;
+            use daw::ui::stage::SampleData;
+            let sampler = stage
+                .song_mut()
+                .add_device(0, daw::devices::DeviceKind::Sampler)
+                .expect("a sampler");
+            let path = std::path::PathBuf::from("/shot/break.wav");
+            let rate = 48_000u32;
+            let frames = rate as usize;
+            let samples: Vec<f32> = (0..frames)
+                .map(|i| {
+                    let t = i as f32 / rate as f32;
+                    let hit = (t * 8.0).fract() / 8.0;
+                    ((t * 180.0 * std::f32::consts::TAU).sin() * (-hit * 30.0).exp())
+                        .clamp(-1.0, 1.0)
+                })
+                .collect();
+            if let Some(device) = stage.song_mut().device_mut(sampler) {
+                device.sample = Some(path.clone());
+                device.set_slices((0..8).map(|i| f64::from(i) / 8.0));
+                device.set(sp::MODE, sp::MODE_SLICE);
+            }
+            stage.set_sample(SampleData::from_planar(
+                path,
+                std::sync::Arc::new(samples),
+                1,
+                frames as u64,
+                rate,
+            ));
+            let _ = stage.apply(StageIntent::TrigMenu);
+            for _ in 0..2 {
+                let _ = stage.apply(StageIntent::Param {
+                    up: true,
+                    coarse: false,
+                });
+            }
+        } else if which.contains("-menu") && which.contains("-fx") {
+            // An effect on the chain, and the menu walked down to its
+            // rows with one of them locked: the lock page reaches the
+            // whole chain, not only the voice.
+            let voice_rows = daw::devices::DeviceKind::Poly.spec().params.len();
+            let _ = stage
+                .song_mut()
+                .add_device(0, daw::devices::DeviceKind::Sat);
+            let _ = stage.apply(StageIntent::TrigMenu);
+            for _ in 0..voice_rows + 1 {
+                let _ = stage.apply(StageIntent::Step(Step::Down));
+            }
+            for _ in 0..3 {
+                let _ = stage.apply(StageIntent::Param {
+                    up: true,
+                    coarse: true,
+                });
+            }
+            let _ = stage.apply(StageIntent::Step(Step::Down));
+        } else if which.contains("-menu") {
+            let _ = stage.apply(StageIntent::TrigMenu);
+            // Two sliders held — one above its knob, one below — and
+            // the cursor resting on a third, so the page shows a lock
+            // in each direction beside an unheld row.
+            let _ = stage.apply(StageIntent::Step(Step::Down));
+            for _ in 0..3 {
+                let _ = stage.apply(StageIntent::Param {
+                    up: true,
+                    coarse: true,
+                });
+            }
+            let _ = stage.apply(StageIntent::Step(Step::Down));
+            for _ in 0..2 {
+                let _ = stage.apply(StageIntent::Param {
+                    up: false,
+                    coarse: true,
+                });
+            }
+            let _ = stage.apply(StageIntent::Step(Step::Down));
+        }
     }
     stage
 }

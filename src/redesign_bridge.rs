@@ -272,6 +272,8 @@ impl App {
                 | Intent::TransposeNote { tick, .. }
                 | Intent::Resize { tick, .. }
                 | Intent::ResizeNote { tick, .. }
+                | Intent::SetLock { tick, .. }
+                | Intent::ClearLock { tick, .. }
                 | Intent::SetProbability { tick, .. }
                 | Intent::AdjustVelocity { tick, .. }
                 | Intent::AdjustNoteVelocity { tick, .. }
@@ -322,6 +324,11 @@ impl App {
                     } else {
                         clip.len = sequence_ticks_to_beats(next) as f32;
                     }
+                }
+                // Parameter locks belong to the Song's trigs; the second
+                // frame's clips have no place for them, and say so.
+                Intent::SetLock { .. } | Intent::ClearLock { .. } => {
+                    self.notice = Some("locks: not in this frame".to_owned());
                 }
                 Intent::Toggle {
                     default_pitch,
@@ -1127,6 +1134,7 @@ impl App {
                 length_ticks,
                 notes: &sequence_notes,
                 ghosts: &sequence_ghosts,
+                slicing: false,
             });
         let position = format_position(
             self.transport.position,

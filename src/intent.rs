@@ -116,6 +116,21 @@ pub mod sequence {
             pitch: crate::pitch::Pitch,
             muted: bool,
         },
+        /// Hold one of the voice's parameters at `value` for the trig
+        /// at `tick`. The value is the parameter's engine value, whole.
+        SetLock {
+            tick: usize,
+            /// The device the lock is on, by id; `None` is the voice.
+            device: Option<u64>,
+            param: u32,
+            value: f32,
+        },
+        /// Release the trig's lock on `param`.
+        ClearLock {
+            tick: usize,
+            device: Option<u64>,
+            param: u32,
+        },
     }
 }
 

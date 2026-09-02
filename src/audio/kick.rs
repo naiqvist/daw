@@ -168,6 +168,10 @@ fn pitch_scale(pitch: u8) -> f32 {
 pub struct KickVoice {
     sample_rate: f32,
     params: KickParams,
+    /// The knobs as letters last set them: what a lock's restore
+    /// returns to. `params` is the LIVE patch, which a lock may hold
+    /// elsewhere for one hit.
+    base: KickParams,
 
     osc: MipOsc,
     /// The sine's band-limited tables. Built once at prepare — green
@@ -220,6 +224,7 @@ impl KickVoice {
         Self {
             sample_rate: 48_000.0,
             params: KickParams::default(),
+            base: KickParams::default(),
             osc: MipOsc::new(),
             tables: Vec::new(),
             noise: WhiteNoise::new(),
@@ -313,7 +318,21 @@ impl KickVoice {
         self.disperser.reset();
     }
 
+    /// A letter: the knob moves, and the live patch with it.
     pub fn set_param(&mut self, param: u32, value: f32) {
+        self.base.set(param, value);
+        self.apply_param(param, value);
+    }
+
+    /// A parameter LOCK at a note boundary: `Some` holds the live patch
+    /// at the note's own value, `None` returns it to the knob. The knob
+    /// itself never moves, so a lock is heard on its hit and no other.
+    pub fn plock(&mut self, param: u32, value: Option<f32>) {
+        let value = value.unwrap_or_else(|| self.base.get(param));
+        self.apply_param(param, value);
+    }
+
+    fn apply_param(&mut self, param: u32, value: f32) {
         self.params.set(param, value);
         match param {
             kp::AMP_DECAY | kp::PITCH_A_DECAY | kp::PITCH_B_DECAY | kp::CLICK_DECAY => {
@@ -804,5 +823,29 @@ mod tests {
         assert!((pitch_scale(36) - 1.0).abs() < 1e-6);
         assert!((pitch_scale(48) - 2.0).abs() < 1e-5);
         assert!((pitch_scale(24) - 0.5).abs() < 1e-5);
+    }
+
+    /// A lock holds for its hit and no other: the knob is what the
+    /// restore returns to, and the lock never moved it.
+    #[test]
+    fn a_lock_is_heard_on_its_hit_and_the_knob_comes_back() {
+        let mut v = KickVoice::new();
+        v.prepare(48_000.0, KickParams::default());
+        v.set_param(kp::AMP_DECAY, 200.0);
+        v.plock(kp::AMP_DECAY, Some(50.0));
+        assert_eq!(v.params().get(kp::AMP_DECAY), 50.0);
+        v.plock(kp::AMP_DECAY, None);
+        assert_eq!(
+            v.params().get(kp::AMP_DECAY),
+            200.0,
+            "the lock became the knob"
+        );
+        v.set_param(kp::AMP_DECAY, 300.0);
+        v.plock(kp::AMP_DECAY, None);
+        assert_eq!(
+            v.params().get(kp::AMP_DECAY),
+            300.0,
+            "a turned knob was not what came back"
+        );
     }
 }

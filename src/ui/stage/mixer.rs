@@ -36,6 +36,7 @@
 
 use super::Level;
 use crate::design::{self, block, circuit, kit::Weight};
+use crate::sequencing::ReturnTrack;
 use crate::sequencing::Song;
 use crate::ui::device::meter;
 use eframe::egui;
@@ -83,6 +84,24 @@ pub struct Channel {
     pub level: Level,
     /// The loudest recent moment, held: the mark above the bar.
     pub peak: Level,
+    /// The sends, one per return the song has, in return order: the
+    /// share of this channel that goes to each. `None` past the song's
+    /// returns, so a strip draws exactly as many rails as there are
+    /// places to send to.
+    pub sends: [Option<f32>; ReturnTrack::MAX],
+    /// Whether this channel IS a return — a place sends arrive rather
+    /// than a track that plays. Drawn in its own casing so the two are
+    /// never mistaken, and with no solo, because a return has none.
+    pub is_return: bool,
+}
+
+/// A return, as the mixer draws it beside the tracks: its letter, its
+/// name, and its channel.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Return {
+    pub letter: char,
+    pub name: String,
+    pub channel: Channel,
 }
 
 /// One meter as it is drawn: the bar, and the mark above it.
@@ -105,6 +124,10 @@ pub fn channels(song: &Song, readings: &[Reading]) -> Vec<Channel> {
         .enumerate()
         .map(|(index, track)| {
             let reading = readings.get(index).copied().unwrap_or_default();
+            let mut sends = [None; ReturnTrack::MAX];
+            for (slot, send) in sends.iter_mut().enumerate().take(song.returns.len()) {
+                *send = Some(track.send(slot));
+            }
             Channel {
                 gain: track.volume,
                 pan: track.pan,
@@ -114,10 +137,41 @@ pub fn channels(song: &Song, readings: &[Reading]) -> Vec<Channel> {
                 switches: true,
                 level: reading.level,
                 peak: reading.peak,
+                sends,
+                is_return: false,
             }
         })
         .collect()
 }
+
+/// Every return as a channel, lettered in the song's own order. A
+/// return has no meter of its own yet — the engine reports tracks and
+/// the master — so its bar reads silence, honestly.
+pub fn returns(song: &Song) -> Vec<Return> {
+    song.returns
+        .iter()
+        .enumerate()
+        .map(|(index, ret)| Return {
+            letter: ReturnTrack::letter(index),
+            name: ret.name.clone(),
+            channel: Channel {
+                gain: ret.volume,
+                pan: ret.pan,
+                muted: ret.mute,
+                soloed: false,
+                audible: !ret.mute,
+                switches: true,
+                level: Level::default(),
+                peak: Level::default(),
+                sends: [None; ReturnTrack::MAX],
+                is_return: true,
+            },
+        })
+        .collect()
+}
+
+/// One send's rail: the letter, the rail, and the mark on it.
+pub const SEND_H: f32 = 15.0;
 
 /// Where a decibel sits in a strip, as `0..=1` from the bottom.
 ///
@@ -285,18 +339,7 @@ pub fn draw(
     if strip.height() <= 0.0 || strip.width() <= 0.0 {
         return;
     }
-    let mut casing = Vec::new();
-    circuit::panel_variant(
-        &mut casing,
-        strip,
-        Some(alpha.surface.color),
-        alpha.ground.color,
-        Some((Weight::Hair, alpha.edge.color)),
-        variant,
-    );
-    for shape in casing {
-        painter.add(shape);
-    }
+    draw_casing(painter, strip, channel.is_return, alpha, variant);
 
     let inner = strip.shrink(gap.max(3.0));
     let pan_top = inner.max.y - PAN_H;
@@ -306,9 +349,29 @@ pub fn draw(
         0.0
     };
     let switch_top = pan_top - switch_h;
-    let meters = egui::Rect::from_min_max(inner.min, egui::pos2(inner.max.x, switch_top - gap));
+    // The sends sit between the meters and the switches: a rail per
+    // return, and none at all when the song has nowhere to send to.
+    let send_count = channel.sends.iter().flatten().count();
+    let sends_h = if send_count > 0 {
+        send_count as f32 * SEND_H + gap
+    } else {
+        0.0
+    };
+    let sends_top = switch_top - sends_h;
+    let meters = egui::Rect::from_min_max(inner.min, egui::pos2(inner.max.x, sends_top - gap));
     if meters.height() > 0.0 {
         draw_meters(painter, meters, channel, gap, alpha);
+    }
+    if send_count > 0 {
+        draw_sends(
+            painter,
+            egui::Rect::from_min_max(
+                egui::pos2(inner.min.x, sends_top),
+                egui::pos2(inner.max.x, sends_top + send_count as f32 * SEND_H),
+            ),
+            channel,
+            alpha,
+        );
     }
     if channel.switches {
         draw_switches(
@@ -328,6 +391,134 @@ pub fn draw(
         channel,
         alpha,
     );
+}
+
+/// A channel's casing. A track's is the deck's surface with the house
+/// edge; a return's is a WELL — a step down in value — with a dotted
+/// frame inset from its edge, so a return reads as a place things are
+/// sent into rather than a track that plays, from across the room.
+fn draw_casing(
+    painter: &egui::Painter,
+    strip: egui::Rect,
+    is_return: bool,
+    alpha: &design::Alphabet,
+    variant: u8,
+) {
+    let mut casing = Vec::new();
+    circuit::panel_variant(
+        &mut casing,
+        strip,
+        Some(if is_return {
+            alpha.well.color
+        } else {
+            alpha.surface.color
+        }),
+        alpha.ground.color,
+        Some((Weight::Hair, alpha.edge.color)),
+        variant,
+    );
+    if is_return {
+        let frame = strip.shrink(5.0);
+        let corners = [
+            frame.left_top(),
+            frame.right_top(),
+            frame.right_bottom(),
+            frame.left_bottom(),
+            frame.left_top(),
+        ];
+        circuit::dashes(&mut casing, &corners, 0.0, Weight::Hair, alpha.edge.color);
+    }
+    for shape in casing {
+        painter.add(shape);
+    }
+}
+
+/// The return's head, above its strip: the same well casing, its letter
+/// carved large, and its name beneath.
+pub fn draw_return_head(
+    painter: &egui::Painter,
+    head: egui::Rect,
+    ret: &Return,
+    alpha: &design::Alphabet,
+    variant: u8,
+) {
+    draw_casing(painter, head, true, alpha, variant);
+    let inner = head.shrink(10.0);
+    block::paint(
+        painter,
+        egui::Id::new(("mixer-return-letter", head.min.x.round() as i32)),
+        inner.left_top(),
+        egui::Align2::LEFT_TOP,
+        block::unit::TITLE,
+        &ret.letter.to_string(),
+        alpha.ink.color,
+    );
+    block::paint(
+        painter,
+        egui::Id::new(("mixer-return-word", head.min.x.round() as i32)),
+        egui::pos2(inner.left() + 22.0, inner.top() + 2.0),
+        egui::Align2::LEFT_TOP,
+        block::unit::MICRO,
+        "RETURN",
+        alpha.edge.color,
+    );
+    painter.text(
+        inner.left_bottom(),
+        egui::Align2::LEFT_BOTTOM,
+        if ret.name.is_empty() {
+            "unnamed".to_owned()
+        } else {
+            ret.name.clone()
+        },
+        egui::FontId::monospace(design::px(design::type_scale::MICRO)),
+        alpha.ink.color,
+    );
+}
+
+/// The sends: one rail per return, lettered, with the mark at the share
+/// sent. A send at nothing keeps its rail and a hollow mark, so a
+/// channel sending nowhere still shows where it could.
+fn draw_sends(
+    painter: &egui::Painter,
+    zone: egui::Rect,
+    channel: &Channel,
+    alpha: &design::Alphabet,
+) {
+    let mut shapes = Vec::new();
+    for (slot, send) in channel.sends.iter().enumerate() {
+        let Some(send) = send else {
+            break;
+        };
+        let y = zone.min.y + slot as f32 * SEND_H + SEND_H * 0.5;
+        block::paint(
+            painter,
+            egui::Id::new(("mixer-send-letter", zone.min.x.round() as i32, slot)),
+            egui::pos2(zone.min.x + 2.0, y),
+            egui::Align2::LEFT_CENTER,
+            block::unit::MICRO,
+            &ReturnTrack::letter(slot).to_string(),
+            alpha.edge.color,
+        );
+        let left = egui::pos2(zone.min.x + 16.0, y);
+        let right = egui::pos2(zone.max.x - 4.0, y);
+        circuit::rail(&mut shapes, left, right, &[0.0, 1.0], alpha.edge.color);
+        let x = left.x + send.clamp(0.0, 1.0) * (right.x - left.x);
+        let sending = *send > 0.0;
+        circuit::pad(
+            &mut shapes,
+            egui::pos2(x, y),
+            circuit::PAD,
+            if sending {
+                alpha.ink.color
+            } else {
+                alpha.edge.color
+            },
+            sending,
+        );
+    }
+    for shape in shapes {
+        painter.add(shape);
+    }
 }
 
 /// Two meter ladders in one well, their ruler, and a separate fader rail.
@@ -352,7 +543,7 @@ fn draw_meters(
     if !chart.is_positive() {
         return;
     }
-    let scale_w = block::width("-48", block::unit::MICRO) + gap;
+    let scale_w = block::measure(painter, "-48", block::unit::MICRO) + gap;
     let fader_w = 20.0;
     let well = egui::Rect::from_min_max(
         egui::pos2(chart.min.x + scale_w, chart.min.y),
@@ -526,10 +717,16 @@ fn draw_switches(
 ) {
     let size = SWITCH_H.min(zone.height()).min(zone.width());
     let centre = zone.center().x;
-    let switches = [
-        (centre - gap * 0.5 - size, channel.muted, "M"),
-        (centre + gap * 0.5, channel.soloed, "S"),
-    ];
+    // A return has no solo: one switch, centred, rather than a pair
+    // with one that cannot be pressed.
+    let switches: Vec<(f32, bool, &str)> = if channel.is_return {
+        vec![(centre - size * 0.5, channel.muted, "M")]
+    } else {
+        vec![
+            (centre - gap * 0.5 - size, channel.muted, "M"),
+            (centre + gap * 0.5, channel.soloed, "S"),
+        ]
+    };
     for (x, on, label) in switches {
         let rect = egui::Rect::from_min_size(egui::pos2(x, zone.min.y), egui::vec2(size, size));
         if on {
@@ -688,6 +885,42 @@ mod tests {
         assert_eq!(pan_label(0.0), "centre");
         assert_eq!(pan_label(-0.5), "L50");
         assert_eq!(pan_label(1.0), "R100");
+    }
+
+    /// A channel carries one send per return the song has and none past
+    /// them; a return is a channel of its own, marked as one, with no
+    /// sends and no solo, lettered in order.
+    #[test]
+    fn sends_follow_the_returns_and_a_return_is_marked_as_one() {
+        let mut song = Song::default();
+        assert!(channels(&song, &[])[0].sends.iter().all(Option::is_none));
+        assert!(returns(&song).is_empty());
+
+        song.add_return();
+        song.add_return();
+        song.returns[1].name = "tape".to_owned();
+        song.returns[1].mute = true;
+        song.tracks[0].sends = vec![0.35];
+        let channel = channels(&song, &[])[0];
+        assert_eq!(channel.sends[0], Some(0.35));
+        assert_eq!(
+            channel.sends[1],
+            Some(0.0),
+            "a send unset is not a send absent"
+        );
+        assert_eq!(channel.sends[2], None, "a send past the returns");
+        assert!(!channel.is_return);
+
+        let returns = returns(&song);
+        assert_eq!(returns.len(), 2);
+        assert_eq!(returns[0].letter, 'A');
+        assert_eq!(returns[1].letter, 'B');
+        assert_eq!(returns[1].name, "tape");
+        assert!(returns[1].channel.is_return);
+        assert!(returns[1].channel.muted);
+        assert!(!returns[1].channel.audible);
+        assert!(!returns[1].channel.soloed);
+        assert!(returns[1].channel.sends.iter().all(Option::is_none));
     }
 
     #[test]

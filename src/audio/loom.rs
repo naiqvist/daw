@@ -387,6 +387,9 @@ struct Scratch {
 /// The voice bank.
 pub struct LoomVoices {
     params: LoomParams,
+    /// The knobs as letters last set them: what a lock's restore
+    /// returns to. `params` is the LIVE patch.
+    base: LoomParams,
     sample_rate: f32,
     tables: WaveTables,
     groups: [Group; GROUPS],
@@ -406,8 +409,10 @@ pub struct LoomVoices {
 
 impl LoomVoices {
     pub fn new(sample_rate: f32, block: usize, params: LoomParams) -> Self {
+        let base = params;
         let mut voices = Self {
             params,
+            base,
             sample_rate: if sample_rate.is_finite() && sample_rate > 0.0 {
                 sample_rate
             } else {
@@ -475,7 +480,13 @@ impl LoomVoices {
         }
     }
 
+    /// A letter: the knob moves, and the live patch with it.
     pub fn set_param(&mut self, param: u32, value: f32) {
+        self.base.set(param, value);
+        self.apply_param(param, value);
+    }
+
+    fn apply_param(&mut self, param: u32, value: f32) {
         self.params.set(param, value);
         // Coefficients that letters can move: rebuild what they feed.
         match param {
@@ -509,12 +520,12 @@ impl LoomVoices {
     pub fn plock(&mut self, param: u32, value: Option<f32>) {
         let value = match value {
             Some(v) => v,
-            None => match self.params.get(param) {
+            None => match self.base.get(param) {
                 Some(v) => v,
                 None => return,
             },
         };
-        self.set_param(param, value);
+        self.apply_param(param, value);
     }
 
     /// The right channel the last render wrote, for the stereo node arm.

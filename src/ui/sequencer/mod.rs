@@ -157,7 +157,12 @@ fn note_views_unsorted(pattern: &Pattern, key: &Key) -> Vec<NoteView> {
                         // own offset into it, the way the projection plays it.
                         let start = (step * PATTERN_STEP_TICKS)
                             .saturating_add_signed(isize::from(note.micro_ticks));
-                        note_view(note, start, trig.probability, trig.enabled, key)
+                        let mut view = note_view(note, start, trig.probability, trig.enabled, key);
+                        view.locks = trig.locks.len().min(u8::MAX as usize) as u8;
+                        view.slice = trig
+                            .lock(crate::params::sampler::SLICE)
+                            .map(|slice| slice.round().clamp(1.0, 64.0) as u8);
+                        view
                     })
                 })
         })
@@ -185,6 +190,8 @@ pub fn note_view(
         probability,
         enabled,
         muted: note.muted,
+        locks: 0,
+        slice: None,
     }
 }
 
@@ -193,6 +200,27 @@ mod tests {
     use super::{INK_LEVEL, shade, wash};
     use crate::design;
     use eframe::egui;
+
+    /// A trig's lock count rides every note of that trig into the view,
+    /// and a trig without locks reads zero.
+    #[test]
+    fn a_trigs_locks_ride_its_notes_into_the_views() {
+        use crate::sequencing::{Note, PATTERN_STEP_TICKS, Pattern};
+        let mut pattern = Pattern::default();
+        pattern.toggle(0, Note::new(60, PATTERN_STEP_TICKS, 100));
+        pattern.add_tone(0, Note::new(64, PATTERN_STEP_TICKS, 90));
+        pattern.toggle(4, Note::new(62, PATTERN_STEP_TICKS, 100));
+        pattern.trig_mut(0).set_lock(3, 0.5);
+        pattern.trig_mut(0).set_lock(5, 0.1);
+        let views = super::note_views(&pattern, &crate::pitch::default_key());
+        let at = |tick: usize| views.iter().filter(move |v| v.start_ticks == tick);
+        assert_eq!(at(0).count(), 2);
+        assert!(
+            at(0).all(|view| view.locks == 2),
+            "a lock left one note behind"
+        );
+        assert!(at(4 * PATTERN_STEP_TICKS).all(|view| view.locks == 0));
+    }
 
     /// The sequencer is frame-independent, which is the entire reason it
     /// was lifted. A frame name here would rebuild the coupling quietly.

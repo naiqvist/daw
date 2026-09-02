@@ -27,16 +27,39 @@
 //! recompiles the graph and hands it to the engine, and the engine's
 //! meters come back the other way. Nothing else crosses.
 
+use daw::audio::AuditionBuffer;
+use daw::audio::material;
 use daw::audio::transport::TransportCmd;
 use daw::audio::{Engine, EngineConfig, StreamHealth};
 use daw::design::Polarity;
 use daw::install_stage_fonts;
+use daw::library::{LibraryConfig, LibrarySnapshot};
 use daw::params;
 use daw::shell;
 use daw::song_graph::{self, MASTER_METER, SongNodes};
-use daw::ui::stage::{EngineState, Health, Level, Stage};
+use daw::ui::stage::{EngineState, Health, Level, SampleData, Stage, Stream};
 use daw::ui::theme::Theme;
 use eframe::egui;
+
+/// The library the stage browses: the folders a musician keeps sounds
+/// in, when they exist. Said here rather than guessed by the stage, so
+/// a headless stage scans nothing and a real one scans what is there.
+fn library_config() -> LibraryConfig {
+    let mut config = LibraryConfig::default();
+    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+        return config;
+    };
+    for folder in [
+        home.join("Samples"),
+        home.join("Music").join("samples"),
+        home.join("Music").join("Samples"),
+    ] {
+        if folder.is_dir() {
+            let _ = config.add_sample_folder(&folder);
+        }
+    }
+    config
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     shell::run("daw — stage", [1280.0, 800.0], [720.0, 480.0], App::new)
@@ -143,6 +166,89 @@ impl Audio {
         }
     }
 
+    /// What the sample editor asks of the host: the file it is looking
+    /// at, as the stage may hold it, and the ranges it wants to hear.
+    ///
+    /// The file comes through the material cache at the device's rate —
+    /// the same bytes the sampler node will play — and the stage gets
+    /// the material's own `Arc`, so nothing is copied. An audition is a
+    /// cut of those samples through the engine's audition voice. Loading
+    /// happens on this thread, once per file: a first look at a long
+    /// file is a pause, and a second look is free.
+    fn serve_cutting_room(&mut self, stage: &mut Stage) {
+        let rate = self
+            .engine
+            .as_ref()
+            .map_or(48_000, |engine| engine.info().sample_rate);
+        if let Some(path) = stage.wanted_sample().map(std::path::Path::to_path_buf) {
+            match material::load_cached(&path, rate) {
+                Ok(loaded) => stage.set_sample(SampleData::from_planar(
+                    path,
+                    loaded.samples.clone(),
+                    loaded.channels,
+                    loaded.frames,
+                    loaded.sample_rate,
+                )),
+                Err(error) => {
+                    eprintln!("stage: could not read {}: {error}", path.display());
+                    // An empty file, so the editor stops asking and says
+                    // what it has: nothing.
+                    stage.set_sample(SampleData::from_planar(
+                        path,
+                        std::sync::Arc::new(Vec::new()),
+                        1,
+                        0,
+                        rate,
+                    ));
+                }
+            }
+        }
+        if stage.take_audition_stop()
+            && let Some(engine) = &mut self.engine
+        {
+            engine.stop_audition();
+        }
+        if let Some(asked) = stage.take_audition()
+            && let Some(engine) = &mut self.engine
+            && let Ok(whole) = material::load_cached(&asked.path, rate)
+        {
+            let frames = whole.frames as usize;
+            let from = ((asked.from * frames as f64).round() as usize).min(frames);
+            let to = ((asked.to * frames as f64).round() as usize).clamp(from, frames);
+            if to > from {
+                let mut cut = Vec::with_capacity((to - from) * whole.channels);
+                for channel in 0..whole.channels {
+                    let base = channel * frames;
+                    cut.extend_from_slice(&whole.samples[base + from..base + to]);
+                }
+                let piece = material::Material {
+                    samples: std::sync::Arc::new(cut),
+                    channels: whole.channels,
+                    frames: (to - from) as u64,
+                    source: whole.source.clone(),
+                    sample_rate: whole.sample_rate,
+                    original_rate: whole.original_rate,
+                    truncated: whole.truncated,
+                };
+                engine.audition(AuditionBuffer::from_material(piece));
+            }
+        }
+    }
+
+    /// The stream's standing facts, for the strip's screen.
+    fn stream(&self) -> Option<Stream> {
+        let engine = self.engine.as_ref()?;
+        let info = engine.info();
+        Some(Stream {
+            sample_rate: info.sample_rate,
+            buffer_frames: info.max_frames as u32,
+            latency_frames: info.latency_frames.map(|frames| frames as u32),
+            inputs: info.in_channels.min(255) as u8,
+            outputs: info.out_channels.min(255) as u8,
+            backend: EngineConfig::default().api.label(),
+        })
+    }
+
     /// Make the engine agree with the stage, then hand back what it heard.
     fn follow(&mut self, stage: &mut Stage) {
         // Told every frame rather than once: a stage that opened without
@@ -151,6 +257,8 @@ impl Audio {
         // this frame is only news this frame.
         let health = self.health();
         stage.set_health(health);
+        stage.set_stream(self.stream());
+        self.serve_cutting_room(stage);
         let Some(engine) = &mut self.engine else {
             return;
         };
@@ -280,7 +388,7 @@ impl App {
             // strip and it belongs to the musician, not to the console.
             eprintln!("stage: no audio engine — {trouble}");
         }
-        let mut stage = Stage::new();
+        let mut stage = Stage::with_library(library_config(), LibrarySnapshot::default());
         // Songs live under the music folder unless one is opened from
         // somewhere else. Said here rather than guessed by the stage, so
         // a headless stage never writes to disk by accident.

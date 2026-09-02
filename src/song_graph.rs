@@ -30,7 +30,7 @@ use crate::audio::graph::{GraphSpec, MAX_METERS, NodeId, NodeSpec, Note as Graph
 use crate::devices::DeviceKind;
 use crate::pitch::nearest_midi;
 use crate::sequencing::{
-    Clip, Device, PATTERN_STEP_TICKS, PATTERN_STEPS, Pattern, Song, TICKS_PER_BEAT,
+    Clip, Device, DeviceId, PATTERN_STEP_TICKS, PATTERN_STEPS, Pattern, Song, TICKS_PER_BEAT,
 };
 
 /// The master's meter slot: the LAST one, so the tracks can take theirs in
@@ -97,7 +97,7 @@ pub fn build(song: &Song, playing: &[Option<usize>]) -> (GraphSpec, SongNodes) {
             continue;
         };
 
-        let notes = notes_of(song, pattern);
+        let notes = notes_of(song, pattern, &[]);
         if notes.is_empty() {
             // A voice with nothing to play is not silence worth paying a
             // node for — and a meter that never moves says the same thing
@@ -112,6 +112,7 @@ pub fn build(song: &Song, playing: &[Option<usize>]) -> (GraphSpec, SongNodes) {
         // The effects, in signal order, each fed by the one before it. A
         // BYPASSED effect is simply not built: the signal passes it by,
         // which is what bypass means, and costs nothing to run.
+        let mut effects: Vec<(DeviceId, NodeId)> = Vec::new();
         let mut tail = voice;
         for device in &track.chain {
             if device.is_instrument() || device.bypassed {
@@ -122,7 +123,28 @@ pub fn build(song: &Song, playing: &[Option<usize>]) -> (GraphSpec, SongNodes) {
             };
             let node = spec.push(node);
             spec.connect(tail, node);
+            effects.push((device.id, node));
             tail = node;
+        }
+        // Now the effects have ids, the notes can name them: the voice's
+        // notes are cut again with every effect lock addressed, and every
+        // locked effect parameter registers the knob it returns to.
+        if !effects.is_empty() {
+            if let Some(notes) = spec.node_mut(voice).and_then(NodeSpec::notes_mut) {
+                *notes = notes_of(song, pattern, &effects);
+            }
+            for step in 0..PATTERN_STEPS {
+                for lock in &pattern.trig(step).locks {
+                    let Some(id) = lock.device else {
+                        continue;
+                    };
+                    if let Some((_, node)) = effects.iter().find(|(device, _)| *device == id)
+                        && let Some(device) = track.chain.iter().find(|device| device.id == id)
+                    {
+                        spec.lock_base(*node, lock.param, device.value(lock.param));
+                    }
+                }
+            }
         }
         // The fader and the pan are ONE node, which is why the meter tapped
         // from it reads post-fader and post-pan — what a mixer meter is
@@ -222,9 +244,10 @@ fn voice_of(
                 loop_len_beats,
                 path: head.sample.clone().unwrap_or_default(),
                 params,
-                // Nothing authors slices from the Song yet; the compiler
-                // falls back to the grid the device's own knob asks for.
-                slices: Vec::new(),
+                // The device's authored slices, as fractions; an empty
+                // table leaves the compiler to lay the grid the SLICES
+                // knob asks for.
+                slices: head.slices.clone(),
             }
         }
         _ => return None,
@@ -353,7 +376,7 @@ fn beats(ticks: usize) -> f64 {
 /// absolute frequency — so resolving it needs the key and cannot be done
 /// by the caller. The engine speaks MIDI numbers, so the resolution ends
 /// at the nearest one.
-fn notes_of(song: &Song, pattern: &Pattern) -> Vec<GraphNote> {
+fn notes_of(song: &Song, pattern: &Pattern, effects: &[(DeviceId, NodeId)]) -> Vec<GraphNote> {
     let mut notes = Vec::new();
     for step in 0..PATTERN_STEPS {
         let trig = pattern.trig(step);
@@ -374,7 +397,28 @@ fn notes_of(song: &Song, pattern: &Pattern) -> Vec<GraphNote> {
                 len_beats: beats(note.length_ticks),
                 pitch: nearest_midi(note.pitch.resolve(&song.key)),
                 vel: note.velocity,
-                plocks: Vec::new(),
+                // The trig's locks ride every note of the chord: the
+                // graph locks per note, the trig locks per firing, and a
+                // chord is one firing.
+                // The voice's locks, and the effects' locks each addressed to
+                // the node its device became. A lock on a device that is not
+                // on the chain now — bypassed, or gone — is left out, not
+                // misdelivered.
+                plocks: trig
+                    .locks
+                    .iter()
+                    .filter(|lock| lock.device.is_none())
+                    .map(|lock| (lock.param, lock.value))
+                    .collect(),
+                fx_locks: trig
+                    .locks
+                    .iter()
+                    .filter_map(|lock| {
+                        let device = lock.device?;
+                        let (_, node) = effects.iter().find(|(id, _)| *id == device)?;
+                        Some((node.to_bits(), lock.param, lock.value))
+                    })
+                    .collect(),
                 prob: trig.probability,
                 cond: None,
             });
@@ -411,6 +455,87 @@ mod tests {
             }],
         };
         song
+    }
+
+    /// A sampler's authored slices ride into its node spec as the
+    /// fractions the device holds.
+    #[test]
+    fn a_samplers_slices_ride_into_its_spec() {
+        let mut song = song_with_a_clip();
+        let id = song
+            .add_device(0, DeviceKind::Sampler)
+            .expect("a sampler on the track");
+        song.device_mut(id)
+            .expect("the device")
+            .set_slices([0.5, 0.25, 0.0]);
+        let (spec, _) = build(&song, &playing(&song));
+        let slices = spec
+            .iter_ordered()
+            .find_map(|(_, node)| match node {
+                NodeSpec::Sampler { slices, .. } => Some(slices.clone()),
+                _ => None,
+            })
+            .expect("a sampler node");
+        assert_eq!(slices, vec![0.0, 0.25, 0.5]);
+    }
+
+    /// A lock on an effect rides into the voice's notes addressed to the
+    /// effect's node, and the effect's knob is registered so the lock
+    /// can be restored.
+    #[test]
+    fn an_effect_lock_names_its_node_and_registers_its_knob() {
+        use crate::params::sat;
+        let mut song = song_with_a_clip();
+        let sat_id = song
+            .add_device(0, DeviceKind::Sat)
+            .expect("an effect on the track");
+        song.device_mut(sat_id)
+            .expect("device")
+            .set(sat::DRIVE, 0.3);
+        let knob = song.device(sat_id).expect("device").value(sat::DRIVE);
+        song.patterns[0]
+            .trig_mut(0)
+            .set_lock_on(Some(sat_id), sat::DRIVE, 0.9);
+        let (spec, _) = build(&song, &playing(&song));
+        let sat_node = spec
+            .iter_ordered()
+            .find_map(|(id, node)| matches!(node, NodeSpec::Sat { .. }).then_some(id))
+            .expect("the effect is in the graph");
+        let notes = spec
+            .iter_ordered()
+            .find_map(|(_, node)| match node {
+                NodeSpec::Poly { notes, .. } => Some(notes.clone()),
+                _ => None,
+            })
+            .expect("the voice is in the graph");
+        assert_eq!(
+            notes[0].fx_locks,
+            vec![(sat_node.to_bits(), sat::DRIVE, 0.9)]
+        );
+        assert!(
+            notes[0].plocks.is_empty(),
+            "an effect lock leaked onto the voice"
+        );
+        let bases = spec.lock_bases();
+        assert!(
+            bases.iter().any(|(node, param, base)| *node == sat_node
+                && *param == sat::DRIVE
+                && (*base - knob).abs() < 1e-6),
+            "the knob was not registered: {bases:?}"
+        );
+    }
+
+    /// A trig's locks ride into the graph verbatim, on every note of
+    /// the chord, as the (param, value) pairs the engine applies.
+    #[test]
+    fn a_trigs_locks_ride_its_notes_into_the_graph() {
+        let mut song = song_with_a_clip();
+        song.patterns[0].trig_mut(0).set_lock(3, 0.25);
+        song.patterns[0].trig_mut(0).set_lock(7, 0.9);
+        let pattern = song.patterns[0].clone();
+        let notes = notes_of(&song, &pattern, &[]);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].plocks, vec![(3, 0.25), (7, 0.9)]);
     }
 
     /// Put `track`'s clip for scene zero into the session.

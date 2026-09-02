@@ -351,6 +351,8 @@ mod tests {
             probability: 1.0,
             enabled: true,
             muted: false,
+            locks: 0,
+            slice: None,
         }
     }
 

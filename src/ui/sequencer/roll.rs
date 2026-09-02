@@ -20,7 +20,8 @@ use crate::ui::sequencer::sequence::{
     ClipView, EDITOR_SWITCH_WIDTH, Editor, Intent, NoteView, editor_switch,
 };
 use crate::ui::sequencer::sequence_grid::{
-    TrigSelection, beat_fill, draw_cursor, next_probability, note_name, trig_at, velocity_ink,
+    TrigSelection, beat_fill, clip_veil, draw_clip_end, draw_cursor, draw_lock_marks,
+    next_probability, note_name, trig_at, velocity_ink,
 };
 use crate::ui::sequencer::verbs::Verb;
 use crate::ui::sequencer::{INK_LEVEL, phase_of, shade};
@@ -75,6 +76,8 @@ pub(crate) struct RollPanel {
     selected_notes: Vec<SelectedNote>,
     selection_anchor: Option<(usize, u8)>,
     refusal: Option<String>,
+    /// Where the cursor's cell was drawn this frame; see the grid's.
+    cursor_rect: Option<egui::Rect>,
 }
 
 impl Default for RollPanel {
@@ -90,6 +93,7 @@ impl Default for RollPanel {
             selected_notes: Vec::new(),
             selection_anchor: None,
             refusal: None,
+            cursor_rect: None,
         }
     }
 }
@@ -117,8 +121,15 @@ impl RollPanel {
         self.follow_time();
     }
 
+    /// The steps the roll lays out: the clip, and a bar past its end so
+    /// the end is seen as an edge inside the picture rather than as the
+    /// picture's own edge — up to the pattern's four bars.
+    fn span_steps(&self) -> usize {
+        (self.clip_steps + 16).min(PATTERN_STEPS).max(1)
+    }
+
     fn visible_steps(&self) -> usize {
-        self.clip_steps.div_ceil(self.zoom).max(1)
+        self.span_steps().div_ceil(self.zoom).max(1)
     }
 
     fn step_width(&self, width: f32) -> f32 {
@@ -137,7 +148,9 @@ impl RollPanel {
     }
 
     fn clamp_time_view(&mut self) {
-        self.view_step = self.view_step.min(self.clip_steps - self.visible_steps());
+        self.view_step = self
+            .view_step
+            .min(self.span_steps().saturating_sub(self.visible_steps()));
     }
 
     fn follow_time(&mut self) {
@@ -166,6 +179,7 @@ impl RollPanel {
             .map_or(PATTERN_STEPS, |clip| clip.length_ticks.div_ceil(STEP_TICKS))
             .clamp(1, PATTERN_STEPS);
         self.cursor_step = self.cursor_step.min(self.clip_steps - 1);
+        self.cursor_rect = None;
         if focused && let Some(utterance) = voice.sentence.consume(ui.ctx()) {
             self.refusal = None;
             self.speak(utterance, voice, clip, intents);
@@ -280,6 +294,21 @@ impl RollPanel {
             }
         }
 
+        // Past the end the light goes down, as it does in the grid.
+        {
+            let end_x = lanes.left() + (self.clip_steps as f32 - self.view_step as f32) * step_w;
+            if end_x < lanes.right() {
+                roll_painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(end_x.max(lanes.left()), lanes.top()),
+                        lanes.right_bottom(),
+                    ),
+                    0.0,
+                    clip_veil(ground),
+                );
+            }
+        }
+
         if let Some(clip) = clip {
             for note in clip
                 .notes
@@ -316,6 +345,21 @@ impl RollPanel {
         // one line — drawn OVER the notes rather than under them, because
         // a playhead hidden behind a long note disappears exactly when
         // the music is densest.
+        // The clip's end, when the view reaches it: the same END rule the
+        // grid draws, so a clip resized here is seen to end here.
+        {
+            let x = lanes.left() + (self.clip_steps as f32 - self.view_step as f32) * step_w;
+            if x >= lanes.left() && x <= lanes.right() + 1.0 {
+                draw_clip_end(
+                    &roll_painter,
+                    x.min(lanes.right()),
+                    lanes.top(),
+                    lanes.bottom(),
+                    ground,
+                );
+            }
+        }
+
         if let Some(tick) = playhead {
             let steps = tick as f32 / STEP_TICKS as f32;
             let x = lanes.left() + (steps - self.view_step as f32) * step_w;
@@ -351,6 +395,7 @@ impl RollPanel {
                 egui::vec2(step_w, ROW_H),
             );
             draw_cursor(&roll_painter, cell, ground);
+            self.cursor_rect = Some(cell);
         }
         requested_editor
     }
@@ -423,6 +468,7 @@ impl RollPanel {
             shade(INK_LEVEL, ground),
             true,
         );
+        draw_lock_marks(&mut shapes, rect, note.locks, ground);
         if selected {
             circuit::octagon(
                 &mut shapes,
@@ -465,10 +511,9 @@ impl RollPanel {
             egui::Align2::LEFT_CENTER,
             match clip {
                 Some(clip) => format!(
-                    "{}   {:02}B{}",
+                    "{}   {}{}",
                     clip.name,
-                    clip.length_ticks
-                        .div_ceil(crate::ui::sequencer::grid_resolution::TICKS_PER_BAR),
+                    crate::ui::sequencer::grid_resolution::bars_label(clip.length_ticks),
                     zoom_sign(self.zoom)
                 ),
                 None => "SELECT MIDI CLIP".to_owned(),
@@ -500,6 +545,11 @@ impl RollPanel {
         if self.cursor_midi < bottom {
             self.top_midi = (self.cursor_midi + rows.saturating_sub(1) as u8).min(127);
         }
+    }
+
+    /// The cursor cell as last drawn, if it was on screen.
+    pub(crate) fn cursor_rect(&self) -> Option<egui::Rect> {
+        self.cursor_rect
     }
 
     pub(crate) fn cursor_tick(&self) -> usize {
@@ -733,10 +783,16 @@ impl RollPanel {
                 self.refusal = Some("STACK RESIZE: LEFT OR RIGHT".to_owned());
             }
             (Some(Verb::ClipResize), Some(motion @ (Motion::Left | Motion::Right))) => {
+                // A step, or a whole bar with Shift held.
+                let unit = if utterance.held {
+                    crate::ui::sequencer::grid_resolution::TICKS_PER_BAR
+                } else {
+                    STEP_TICKS
+                };
                 intents.push(Intent::ResizeClip {
                     delta_ticks: count
                         * if motion == Motion::Right { 1 } else { -1 }
-                        * STEP_TICKS as isize,
+                        * unit as isize,
                 });
             }
             (Some(Verb::ClipResize), Some(_)) => {
@@ -1154,6 +1210,7 @@ mod tests {
             length_ticks: 64 * 12,
             notes,
             ghosts: &[],
+            slicing: false,
         }
     }
 

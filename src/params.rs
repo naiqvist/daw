@@ -3371,6 +3371,11 @@ pub mod sampler {
     pub const PREAMP: u32 = 33;
     pub const GAIN: u32 = 34;
     pub const PAN: u32 = 35;
+    /// Which slice a note plays, in slice mode, counted from one. A
+    /// parameter rather than an address in the keyboard, so a trig locks
+    /// it the way it locks anything else and the note is free to be a
+    /// pitch — the Octatrack's SLIC, exactly.
+    pub const SLICE: u32 = 36;
 
     // ------------------------------------------------------- discretes ---
 
@@ -3453,7 +3458,7 @@ pub mod sampler {
 
     pub fn page_of(id: u32) -> usize {
         match id {
-            MODE..=FINE => 0,
+            MODE..=FINE | SLICE => 0,
             LOOP_MODE..=CHOKE => 1,
             AMP_A..=KEYTRACK => 2,
             MOD_A..=VELOCITY => 3,
@@ -3731,6 +3736,13 @@ pub mod sampler {
             min: -1.0,
             max: 1.0,
             default: 0.0,
+        },
+        ParamDef {
+            id: SLICE,
+            name: "slice",
+            min: 1.0,
+            max: SLICES_MAX,
+            default: 1.0,
         },
     ];
 }

@@ -161,9 +161,22 @@ impl Sentence {
     }
 
     fn feed_motion(&mut self, motion: Motion, held: bool) -> Utterance {
+        let mut verb = self.pending.take();
+        // CLIP RESIZE stays spoken. A clip is sized by ear, a step at a
+        // time, and asking for the chord again on every step would be the
+        // sentence's failure rather than the hand's: Left and Right keep
+        // resizing until Escape lets the verb go or another verb is
+        // spoken. Up and Down are not a size, so they end it and walk.
+        if verb == Some(Verb::ClipResize) {
+            if matches!(motion, Motion::Left | Motion::Right) {
+                self.pending = verb;
+            } else {
+                verb = None;
+            }
+        }
         Utterance {
             count: self.take_count(),
-            verb: self.pending.take(),
+            verb,
             motion: Some(motion),
             held,
         }
@@ -342,5 +355,28 @@ mod tests {
             sentence.feed_digit(9);
         }
         assert_eq!(sentence.feed_motion(Motion::Right, false).count, MAX_COUNT);
+    }
+
+    /// CLIP RESIZE holds: Left and Right keep resizing, Escape lets go,
+    /// and a vertical arrow ends it and walks instead.
+    #[test]
+    fn clip_resize_holds_until_let_go() {
+        let mut sentence = Sentence::default();
+        assert_eq!(sentence.feed_verb(Verb::ClipResize), None);
+        let first = sentence.feed_motion(Motion::Right, false);
+        assert_eq!(first.verb, Some(Verb::ClipResize));
+        assert!(!sentence.is_empty(), "the verb was let go after one step");
+        let second = sentence.feed_motion(Motion::Left, false);
+        assert_eq!(second.verb, Some(Verb::ClipResize));
+        let walk = sentence.feed_motion(Motion::Down, false);
+        assert_eq!(walk.verb, None, "a vertical arrow was read as a size");
+        assert!(sentence.is_empty(), "the verb outlived the walk");
+        assert_eq!(sentence.feed_verb(Verb::ClipResize), None);
+        sentence.abandon();
+        assert!(sentence.is_empty());
+        // Other verbs are still one motion long.
+        assert_eq!(sentence.feed_verb(Verb::Nudge), None);
+        let _ = sentence.feed_motion(Motion::Right, false);
+        assert!(sentence.is_empty(), "nudge held like a resize");
     }
 }

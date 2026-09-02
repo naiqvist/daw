@@ -1,0 +1,523 @@
+//! The trig menu: a callout over the sequencer, pointing at the trig
+//! under the cursor and listing what that trig can do.
+//!
+//! A speech bubble in shape and in purpose — the trig is the one
+//! speaking, and the list is what it can say — but drawn the way this
+//! deck draws everything: a chamfered casing with a wedge for a tail,
+//! not a lozenge with a curl. The tail is a leader, and it lands ON the
+//! trig, so the eye never has to guess which cell the list belongs to.
+//!
+//! This file holds the two things a menu is made of that have nothing to
+//! do with a painter: the rows, with the sequencer intents each one
+//! speaks; and the geometry, which decides where the casing stands and
+//! where the tail reaches, from the trig's cell and the window alone.
+//! `mod.rs` owns the state (open, which row) and the ink.
+
+use eframe::egui::{Pos2, Rect, pos2, vec2};
+
+use crate::devices::{DeviceKind, DeviceSpec, ParamLabel};
+use crate::intent::sequence::Intent;
+use crate::params::ParamDef;
+use crate::sequencing::{DeviceId, PATTERN_STEP_TICKS, Track, Trig};
+use crate::ui::sequencer::sequence::NoteView;
+use crate::ui::sequencer::sequence_grid::next_probability;
+
+// ------------------------------------------------------------------ state
+
+/// Which page of the menu is showing. The locks are the menu's purpose
+/// and its first page; the trig's own verbs sit one level in, under the
+/// TRIG row, so they are there without crowding the sliders.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Page {
+    Locks,
+    Trig,
+}
+
+/// The menu's own state: the page, the row the cursor rests on, and
+/// where the list's window starts when there are more rows than fit.
+/// Everything else — the trig, its cell, the voice, the rows — is read
+/// from the stage and the sequencer when needed, never copied here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct TrigMenu {
+    pub(super) page: Page,
+    pub(super) row: usize,
+    pub(super) offset: usize,
+}
+
+impl TrigMenu {
+    /// Fresh, on the lock page, resting on the TRIG row.
+    pub(super) fn open() -> Self {
+        Self {
+            page: Page::Locks,
+            row: 0,
+            offset: 0,
+        }
+    }
+}
+
+/// The most rows the casing shows at once. A voice may have more
+/// parameters than that, and the list then scrolls under a fixed
+/// casing rather than the casing growing past the window.
+pub(super) const MAX_ROWS: usize = 12;
+
+// ------------------------------------------------------------------ locks
+
+/// One slider on the lock page: a voice parameter, what its knob says,
+/// and what this trig holds it at, if anything.
+#[derive(Clone, Copy)]
+pub(super) struct LockRow {
+    pub(super) def: &'static ParamDef,
+    pub(super) label: &'static ParamLabel,
+    /// The device the row locks: `None` for the voice, an effect's id
+    /// for its rows.
+    pub(super) device: Option<DeviceId>,
+    /// The effect's short name, before the parameter's, on an effect's
+    /// row; empty on the voice's.
+    pub(super) prefix: &'static str,
+    /// The knob's value: the voice's setting, which every unlocked trig
+    /// sounds.
+    pub(super) knob: f32,
+    /// The lock, if this trig holds one.
+    pub(super) lock: Option<f32>,
+}
+
+impl LockRow {
+    /// Where the row stands: the lock if there is one, else the knob.
+    /// This is what a step moves from.
+    pub(super) fn standing(&self) -> f32 {
+        self.lock.unwrap_or(self.knob)
+    }
+
+    /// `value` as a share of the parameter's range, 0..1.
+    pub(super) fn fraction(&self, value: f32) -> f32 {
+        let span = self.def.max - self.def.min;
+        if span <= 0.0 {
+            0.0
+        } else {
+            ((value - self.def.min) / span).clamp(0.0, 1.0)
+        }
+    }
+}
+
+/// The voice a track's trigs lock: the head of its chain when that is
+/// an instrument, and the default voice otherwise — the same rule the
+/// compiler applies, so the sliders name the parameters that will
+/// actually be locked.
+pub(super) fn voice_of(track: &Track) -> (&'static DeviceSpec, Option<&crate::sequencing::Device>) {
+    match track.chain.first().filter(|device| device.is_instrument()) {
+        Some(device) => (device.kind.spec(), Some(device)),
+        None => (DeviceKind::Poly.spec(), None),
+    }
+}
+
+/// The slice row: on a sampler in slice mode, which cut this trig
+/// plays. The SLICE parameter with the file's cuts beside it, so the
+/// row can say "3 of 12" and the strip above can show the third.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct SliceRow {
+    /// How many cuts there are to choose from: the authored table, or
+    /// the grid the SLICES knob will lay when nothing is authored.
+    pub(super) count: usize,
+    /// The device's own SLICE knob, from one.
+    pub(super) knob: u8,
+    /// The trig's lock, from one, if it holds one.
+    pub(super) lock: Option<u8>,
+}
+
+impl SliceRow {
+    pub(super) fn standing(&self) -> u8 {
+        self.lock.unwrap_or(self.knob)
+    }
+}
+
+/// One row of the lock page.
+#[derive(Clone, Copy)]
+pub(super) enum MenuRow {
+    /// Leads to the trig's verbs.
+    Trig,
+    /// The slice selector, on a slicing sampler.
+    Slice(SliceRow),
+    /// A voice parameter's slider.
+    Param(LockRow),
+}
+
+/// Whether `track`'s voice is a sampler in slice mode: the tracks whose
+/// trigs choose a cut.
+pub(super) fn slicing(track: &Track) -> bool {
+    use crate::params::sampler as sp;
+    match voice_of(track) {
+        (spec, Some(device)) => {
+            spec.kind == DeviceKind::Sampler && device.value(sp::MODE).round() == sp::MODE_SLICE
+        }
+        _ => false,
+    }
+}
+
+/// The lock page's rows for `trig` on `track`: the slice row first
+/// where the voice slices — the menu opens with the cut under the
+/// hand, because on a slicing track that is the thing a trig is most
+/// often told — then the TRIG row, then the voice's parameters in its
+/// own order, all but SLICE, which the slice row already is.
+pub(super) fn menu_rows(track: &Track, trig: &Trig) -> Vec<MenuRow> {
+    use crate::params::sampler as sp;
+    let (spec, device) = voice_of(track);
+    let mut rows = Vec::new();
+    let slices = slicing(track);
+    if slices && let Some(device) = device {
+        let count = if device.slices.is_empty() {
+            device.value(sp::SLICES).round().max(1.0) as usize
+        } else {
+            device.slices.len()
+        };
+        rows.push(MenuRow::Slice(SliceRow {
+            count,
+            knob: device.value(sp::SLICE).round().clamp(1.0, 64.0) as u8,
+            lock: trig
+                .lock(sp::SLICE)
+                .map(|slice| slice.round().clamp(1.0, 64.0) as u8),
+        }));
+    }
+    rows.push(MenuRow::Trig);
+    rows.extend(
+        spec.params
+            .iter()
+            .zip(spec.labels)
+            .filter(|(def, _)| !(slices && def.id == sp::SLICE))
+            .map(|(def, label)| {
+                MenuRow::Param(LockRow {
+                    def,
+                    label,
+                    device: None,
+                    prefix: "",
+                    knob: device.map_or(def.default, |device| device.value(def.id)),
+                    lock: trig.lock(def.id),
+                })
+            }),
+    );
+    // Then the effects, in chain order, each parameter under the
+    // effect's short name: a trig can bend the whole chain, not only
+    // the voice.
+    for effect in track.chain.iter().filter(|device| !device.is_instrument()) {
+        let spec = effect.kind.spec();
+        rows.extend(spec.params.iter().zip(spec.labels).map(|(def, label)| {
+            MenuRow::Param(LockRow {
+                def,
+                label,
+                device: Some(effect.id),
+                prefix: spec.prefix,
+                knob: effect.value(def.id),
+                lock: trig.lock_on(Some(effect.id), def.id),
+            })
+        }));
+    }
+    rows
+}
+
+// ------------------------------------------------------------------ verbs
+
+/// Everything a trig can be told from the menu, in the order the rows
+/// are read. Pairs sit together (a nudge and its opposite, and so on)
+/// and the one destructive verb is last, furthest from the resting row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum TrigAction {
+    NudgeLeft,
+    NudgeRight,
+    Longer,
+    Shorter,
+    Louder,
+    Softer,
+    Higher,
+    Lower,
+    Condition,
+    Mute,
+    Delete,
+}
+
+/// How far one LOUDER or SOFTER moves the velocity. The grammar's held
+/// arrows move it by one per press, which is for fine work with a key
+/// held down; a row picked from a list is one deliberate step and
+/// should be heard.
+const VELOCITY_STEP: isize = 8;
+
+impl TrigAction {
+    pub(super) const ALL: [TrigAction; 11] = [
+        TrigAction::NudgeLeft,
+        TrigAction::NudgeRight,
+        TrigAction::Longer,
+        TrigAction::Shorter,
+        TrigAction::Louder,
+        TrigAction::Softer,
+        TrigAction::Higher,
+        TrigAction::Lower,
+        TrigAction::Condition,
+        TrigAction::Mute,
+        TrigAction::Delete,
+    ];
+
+    /// The row's words, given the trig they would act on — MUTE reads
+    /// UNMUTE over a muted trig, because a row that says what it will
+    /// do is worth more than one that says what it is.
+    pub(super) fn label(self, trig: &NoteView) -> &'static str {
+        match self {
+            TrigAction::NudgeLeft => "NUDGE EARLIER",
+            TrigAction::NudgeRight => "NUDGE LATER",
+            TrigAction::Longer => "LONGER",
+            TrigAction::Shorter => "SHORTER",
+            TrigAction::Louder => "LOUDER",
+            TrigAction::Softer => "SOFTER",
+            TrigAction::Higher => "UP A SEMITONE",
+            TrigAction::Lower => "DOWN A SEMITONE",
+            TrigAction::Condition => "NEXT CONDITION",
+            TrigAction::Mute if trig.muted => "UNMUTE",
+            TrigAction::Mute => "MUTE",
+            TrigAction::Delete => "DELETE",
+        }
+    }
+
+    /// What the row says to the pattern, addressed to `trig`. One step
+    /// of the pattern's own grid for time, one semitone for pitch, one
+    /// audible step for velocity — the same units the grammar uses for
+    /// a bare verb, so a row here and a key there land the same edit.
+    pub(super) fn intents(self, trig: &NoteView) -> Vec<Intent> {
+        let tick = trig.start_ticks;
+        let step = PATTERN_STEP_TICKS as isize;
+        match self {
+            TrigAction::NudgeLeft => vec![Intent::Nudge {
+                tick,
+                delta_ticks: -step,
+            }],
+            TrigAction::NudgeRight => vec![Intent::Nudge {
+                tick,
+                delta_ticks: step,
+            }],
+            TrigAction::Longer => vec![Intent::Resize {
+                tick,
+                delta_ticks: step,
+            }],
+            TrigAction::Shorter => vec![Intent::Resize {
+                tick,
+                delta_ticks: -step,
+            }],
+            TrigAction::Louder => vec![Intent::AdjustVelocity {
+                tick,
+                delta: VELOCITY_STEP,
+            }],
+            TrigAction::Softer => vec![Intent::AdjustVelocity {
+                tick,
+                delta: -VELOCITY_STEP,
+            }],
+            TrigAction::Higher => vec![Intent::Transpose {
+                tick,
+                delta_semitones: 1,
+            }],
+            TrigAction::Lower => vec![Intent::Transpose {
+                tick,
+                delta_semitones: -1,
+            }],
+            TrigAction::Condition => vec![Intent::SetProbability {
+                tick,
+                probability: next_probability(trig.probability),
+            }],
+            TrigAction::Mute => vec![Intent::SetNoteMuted {
+                tick,
+                pitch: trig.pitch,
+                muted: !trig.muted,
+            }],
+            TrigAction::Delete => vec![Intent::Clear { tick }],
+        }
+    }
+}
+
+// --------------------------------------------------------------- geometry
+
+/// The casing's width. Fixed: a menu that sized itself to its longest
+/// row would be a different shape over every trig.
+pub(super) const WIDTH: f32 = 352.0;
+/// The head: a title row and a line of the trig's facts beneath it.
+pub(super) const HEAD_H: f32 = 54.0;
+/// One row of the list.
+pub(super) const ROW_H: f32 = 19.0;
+/// The casing's inner margin, top and bottom.
+pub(super) const MARGIN: f32 = 12.0;
+/// How far the tail reaches from the casing to the trig.
+pub(super) const TAIL_H: f32 = 18.0;
+/// The tail's width where it leaves the casing.
+pub(super) const TAIL_W: f32 = 24.0;
+/// The least the casing stands off the window's edge.
+const KEEP_OFF: f32 = 16.0;
+
+/// Where a menu stands: its casing, and the tail from casing to trig.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Bubble {
+    pub(super) panel: Rect,
+    /// Base left, base right, apex — the apex is the point on the trig.
+    pub(super) tail: [Pos2; 3],
+    /// Whether the casing stands above the trig (the usual case) or had
+    /// to drop below it for want of room.
+    pub(super) above: bool,
+}
+
+/// The slice strip's height: the file's picture above the list, on a
+/// slicing track.
+pub(super) const STRIP_H: f32 = 52.0;
+
+/// The casing's height for `rows` rows, with `extra` above the list.
+pub(super) fn height(rows: usize, extra: f32) -> f32 {
+    MARGIN + HEAD_H + extra + rows as f32 * ROW_H + MARGIN
+}
+
+/// Place the menu for a trig drawn at `anchor`, inside `whole`.
+///
+/// The casing stands above the trig, centred on it, and the tail drops
+/// from the casing's foot to the trig's top edge. It is pushed sideways
+/// to stay inside the window — the tail's base slides with the trig
+/// rather than with the casing, so it still points home — and only
+/// when there is no room above at all does the casing go beneath the
+/// trig instead, the tail then rising to the trig's foot.
+pub(super) fn place(anchor: Rect, whole: Rect, rows: usize, extra: f32) -> Bubble {
+    let h = height(rows, extra);
+    let above = anchor.top() - TAIL_H - h >= whole.top() + KEEP_OFF;
+    let x = (anchor.center().x - WIDTH * 0.5).clamp(
+        whole.left() + KEEP_OFF,
+        (whole.right() - KEEP_OFF - WIDTH).max(whole.left()),
+    );
+    let panel = if above {
+        Rect::from_min_size(pos2(x, anchor.top() - TAIL_H - h), vec2(WIDTH, h))
+    } else {
+        Rect::from_min_size(pos2(x, anchor.bottom() + TAIL_H), vec2(WIDTH, h))
+    };
+    let apex_x = anchor.center().x;
+    // The base sits under the apex, but never past the casing's own
+    // chamfers, so the wedge always leaves a flat edge.
+    let base_x = apex_x.clamp(panel.left() + TAIL_W, panel.right() - TAIL_W);
+    let (base_y, apex) = if above {
+        (panel.bottom(), pos2(apex_x, anchor.top()))
+    } else {
+        (panel.top(), pos2(apex_x, anchor.bottom()))
+    };
+    Bubble {
+        panel,
+        tail: [
+            pos2(base_x - TAIL_W * 0.5, base_y),
+            pos2(base_x + TAIL_W * 0.5, base_y),
+            apex,
+        ],
+        above,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pitch::Pitch;
+
+    fn trig(muted: bool) -> NoteView {
+        NoteView {
+            pitch: Pitch::from_midi(60),
+            hz: 261.6,
+            midi: 60,
+            approx: false,
+            start_ticks: 4 * PATTERN_STEP_TICKS,
+            length_ticks: PATTERN_STEP_TICKS,
+            micro_ticks: 0,
+            velocity: 100,
+            probability: 1.0,
+            enabled: true,
+            muted,
+            locks: 0,
+            slice: None,
+        }
+    }
+
+    /// Every row speaks, addresses the trig it was given, and no two
+    /// rows say the same thing.
+    #[test]
+    fn every_row_addresses_the_trig_and_says_something_distinct() {
+        let note = trig(false);
+        let mut seen = Vec::new();
+        for action in TrigAction::ALL {
+            let intents = action.intents(&note);
+            assert!(!intents.is_empty(), "{action:?} says nothing");
+            for intent in &intents {
+                let tick = match intent {
+                    Intent::Nudge { tick, .. }
+                    | Intent::Resize { tick, .. }
+                    | Intent::AdjustVelocity { tick, .. }
+                    | Intent::Transpose { tick, .. }
+                    | Intent::SetProbability { tick, .. }
+                    | Intent::SetNoteMuted { tick, .. }
+                    | Intent::Clear { tick } => *tick,
+                    other => panic!("{action:?} spoke an intent it should not: {other:?}"),
+                };
+                assert_eq!(tick, note.start_ticks, "{action:?} addressed another trig");
+            }
+            let words = format!("{intents:?}");
+            assert!(!seen.contains(&words), "{action:?} repeats another row");
+            seen.push(words);
+        }
+    }
+
+    #[test]
+    fn mute_reads_as_what_it_will_do() {
+        assert_eq!(TrigAction::Mute.label(&trig(false)), "MUTE");
+        assert_eq!(TrigAction::Mute.label(&trig(true)), "UNMUTE");
+        assert!(matches!(
+            TrigAction::Mute.intents(&trig(true)).as_slice(),
+            [Intent::SetNoteMuted { muted: false, .. }]
+        ));
+    }
+
+    #[test]
+    fn delete_is_the_last_row() {
+        assert_eq!(TrigAction::ALL.last(), Some(&TrigAction::Delete));
+    }
+
+    /// The casing stands above the trig, centred, and the tail's apex
+    /// is on the trig's top edge at its centre: the bubble points at
+    /// the thing it is about.
+    #[test]
+    fn the_bubble_stands_above_the_trig_and_points_at_it() {
+        let whole = Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0));
+        let anchor = Rect::from_min_size(pos2(400.0, 600.0), vec2(40.0, 30.0));
+        let bubble = place(anchor, whole, TrigAction::ALL.len(), 0.0);
+        assert!(bubble.above);
+        assert_eq!(bubble.panel.bottom(), anchor.top() - TAIL_H);
+        assert_eq!(bubble.panel.center().x, anchor.center().x);
+        assert_eq!(bubble.panel.width(), WIDTH);
+        let [l, r, apex] = bubble.tail;
+        assert_eq!(apex, pos2(anchor.center().x, anchor.top()));
+        assert_eq!(l.y, bubble.panel.bottom());
+        assert_eq!(r.y, bubble.panel.bottom());
+        assert!(
+            l.x < apex.x && apex.x < r.x,
+            "the tail does not straddle its apex"
+        );
+    }
+
+    /// Pushed against the window's side the casing stays inside, and
+    /// the tail keeps pointing at the trig rather than at the casing's
+    /// middle.
+    #[test]
+    fn the_bubble_stays_in_the_window_and_the_tail_still_points_home() {
+        let whole = Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0));
+        let anchor = Rect::from_min_size(pos2(4.0, 600.0), vec2(40.0, 30.0));
+        let bubble = place(anchor, whole, 5, 0.0);
+        assert!(whole.contains_rect(bubble.panel));
+        assert!(bubble.panel.left() >= KEEP_OFF);
+        let [l, r, apex] = bubble.tail;
+        assert_eq!(apex.x, anchor.center().x);
+        assert!(l.x >= bubble.panel.left(), "the tail left the casing");
+        assert!(r.x <= bubble.panel.right(), "the tail left the casing");
+    }
+
+    /// With no room above, the casing drops below and the tail rises.
+    #[test]
+    fn with_no_room_above_the_bubble_hangs_below() {
+        let whole = Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0));
+        let anchor = Rect::from_min_size(pos2(400.0, 30.0), vec2(40.0, 30.0));
+        let bubble = place(anchor, whole, 5, 0.0);
+        assert!(!bubble.above);
+        assert_eq!(bubble.panel.top(), anchor.bottom() + TAIL_H);
+        assert_eq!(bubble.tail[2], pos2(anchor.center().x, anchor.bottom()));
+    }
+}

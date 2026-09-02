@@ -493,6 +493,12 @@ pub static DEVICES: &[DeviceSpec] = &[
                 group: "Out",
                 choices: &[],
             },
+            ParamLabel {
+                name: "Slice",
+                unit: "",
+                group: "Sample",
+                choices: &[],
+            },
         ],
     },
     DeviceSpec {

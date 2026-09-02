@@ -28,15 +28,17 @@ mod grid;
 mod keymap;
 mod mixer;
 mod ornament;
+mod sample;
 mod scenes;
 mod tracks;
 mod transport;
+mod trig_menu;
 mod vitals;
 
 use crate::design::codex::Sign;
 use crate::design::kit::{self, Weight};
 use crate::design::motion::{self, Phase};
-use crate::design::{block, circuit, grain};
+use crate::design::{block, circuit};
 
 use crate::design;
 use crate::devices::{DeviceKind, Family};
@@ -53,16 +55,19 @@ use eframe::egui;
 use std::path::{Path, PathBuf};
 
 use browser::{BrowserStatus, sample_nodes};
+use sample::{Page as SamplePage, SampleEditor};
+use trig_menu::{LockRow, MenuRow, Page, SliceRow, TrigAction, TrigMenu};
 
 pub use browser::{Browser, EntryKind, Node, Row, Shelf};
 pub use grid::{
     FocusColumn, FocusGrid, FocusLattice, FocusRow, FocusScope, FocusStack, Miniature, Step,
 };
-pub use keymap::StageIntent;
+pub use keymap::{SampleIntent, StageIntent};
 pub use mixer::Reading;
+pub use sample::{Audition, SampleData};
 pub use scenes::Address;
 pub use transport::{Motion, Place, Transport};
-pub use vitals::{EngineState, Health};
+pub use vitals::{EngineState, Health, Stream};
 
 /// The calibration field. Big enough that a weak focus signal would let
 /// the eye lose the cursor — which is the point of the test.
@@ -108,12 +113,147 @@ const CLIP_HELP_EXAMPLES: [(&str, &str); 16] = [
 /// is for the distances between things, not for how big a zone is.
 const PERIPHERY_H: f32 = 64.0;
 
+/// The frame's side rails: how much of the surface material shows to the
+/// left and right of the field. With the vitals and message strips this
+/// closes the periphery into one continuous casing, so the field is a
+/// window CUT INTO the deck rather than a band laid between two bars.
+/// Kept small on purpose — it is a frame, not a margin — and, like
+/// `PERIPHERY_H`, a layout dimension settled by eye rather than a rung.
+const FRAME_W: f32 = 12.0;
+
+/// The corner the deck gives up when it IS the screen. Windowed, the
+/// compositor owns the corners and the frame keeps its bevels at the
+/// house chamfer; fullscreen, the top left is cut at this size, so the
+/// casing reads as one made object rather than a picture that happens
+/// to fill the display. One corner, not four: a bevel repeated is a
+/// border, a bevel once is a mark. Larger than the periphery is tall, so
+/// the cut is seen to pass through the vitals strip.
+const SCREEN_CHAMFER: f32 = 40.0;
+
+/// The foot's chamfers, one each side, at a fraction of the crown's.
+/// Much smaller on purpose: the top left is the mark, and the two below
+/// are the casing agreeing with it — the same hand, not the same word.
+/// The top right stays square so the three cuts read as a deliberate
+/// asymmetry rather than as a template stamped on every corner.
+const SCREEN_CHAMFER_FOOT: f32 = 14.0;
+
+/// Which corner of the screen a cut is on. The top right is not here:
+/// see `SCREEN_CHAMFER_FOOT`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScreenCorner {
+    TopLeft,
+    BottomLeft,
+    BottomRight,
+}
+
+impl ScreenCorner {
+    const ALL: [ScreenCorner; 3] = [
+        ScreenCorner::TopLeft,
+        ScreenCorner::BottomLeft,
+        ScreenCorner::BottomRight,
+    ];
+
+    fn size(self) -> f32 {
+        match self {
+            ScreenCorner::TopLeft => SCREEN_CHAMFER,
+            ScreenCorner::BottomLeft | ScreenCorner::BottomRight => SCREEN_CHAMFER_FOOT,
+        }
+    }
+}
+
+/// A cut: a right triangle on one corner of `whole`. The first point is
+/// the corner itself; the other two lie along the window's edges, the
+/// face between them. Never larger than the window can hold.
+fn screen_cut(whole: egui::Rect, corner: ScreenCorner) -> [egui::Pos2; 3] {
+    let c = corner.size().min(whole.width()).min(whole.height());
+    let (l, t, r, b) = (whole.min.x, whole.min.y, whole.max.x, whole.max.y);
+    match corner {
+        ScreenCorner::TopLeft => [egui::pos2(l, t), egui::pos2(l + c, t), egui::pos2(l, t + c)],
+        ScreenCorner::BottomLeft => [egui::pos2(l, b), egui::pos2(l + c, b), egui::pos2(l, b - c)],
+        ScreenCorner::BottomRight => [egui::pos2(r, b), egui::pos2(r - c, b), egui::pos2(r, b - c)],
+    }
+}
+
+/// The crown's cut: the top-left corner, which the rings live in.
+fn screen_chamfer_cut(whole: egui::Rect) -> [egui::Pos2; 3] {
+    screen_cut(whole, ScreenCorner::TopLeft)
+}
+
+/// The stream screen's height: most of the strip, with a margin that
+/// leaves the strip's own edge showing above and below. The figures
+/// inside were drawn for thirty points and scale with this.
+const STREAM_SCREEN_H: f32 = 46.0;
+/// The stream screen's width: what its figures need at that height.
+const STREAM_SCREEN_W: f32 = 284.0 * (STREAM_SCREEN_H / 30.0);
+
+/// Where the stream screen sits: in the vitals strip, just before the
+/// register rail that precedes the transport, and centred on the
+/// strip's height. Anchored to the transport rather than to the window's
+/// centre so it keeps its place on the strip at every width.
+fn stream_screen(vitals: egui::Rect, transport: egui::Rect) -> egui::Rect {
+    let room = design::px(design::space::ROOM);
+    let right = transport.min.x - room * 12.0 - room;
+    let left = (right - STREAM_SCREEN_W).max(vitals.min.x + room);
+    egui::Rect::from_min_max(
+        egui::pos2(left, (vitals.center().y - STREAM_SCREEN_H * 0.5).floor()),
+        egui::pos2(right, (vitals.center().y + STREAM_SCREEN_H * 0.5).floor()),
+    )
+}
+
+/// The gap between the chamfer's nested triangles, and from the cut face
+/// to the first. A spacing rung would be too coarse for a mark this
+/// small: three rings have to fit inside forty points with room to read.
+const CHAMFER_RING_GAP: f32 = 3.0;
+/// How many rings the corner carries while the deck sounds.
+const CHAMFER_RINGS: usize = 3;
+
+/// The corner's sign of life: triangles nested inside the cut, each set
+/// in from the last by one gap, all sharing the cut's own shape. Sound
+/// happening is shown at the deck's edge, where nothing else is, so the
+/// eye can confirm it without leaving what it was reading.
+///
+/// A right isosceles triangle inset by `d` keeps its right angle at
+/// `(d, d)`. The face moves in by `d` along its normal, to the line
+/// `x + y = c − d·√2`; meeting that line at `y = d` puts the far vertex
+/// at `x = c − d·√2 − d`, so each leg is `c − d·(2 + √2)`. Rings that
+/// would collapse are simply not drawn, so a small window shows fewer
+/// rings rather than a scribble.
+fn screen_chamfer_rings(whole: egui::Rect) -> Vec<[egui::Pos2; 3]> {
+    let [corner, along, _] = screen_chamfer_cut(whole);
+    let c = along.x - corner.x;
+    (1..=CHAMFER_RINGS)
+        .filter_map(|ring| {
+            let d = CHAMFER_RING_GAP * ring as f32;
+            let leg = c - d * (2.0 + std::f32::consts::SQRT_2);
+            (leg > 2.0).then(|| {
+                let apex = egui::pos2(corner.x + d, corner.y + d);
+                [
+                    apex,
+                    egui::pos2(apex.x + leg, apex.y),
+                    egui::pos2(apex.x, apex.y + leg),
+                ]
+            })
+        })
+        .collect()
+}
+
 /// A track column. A layout dimension like [`BROWSER_W`], and fixed for
 /// the same reason: geometry that resized itself with the track count
 /// would move the ground under a cursor that had already learned where
 /// each track lives.
 const TRACK_W: f32 = 132.0;
 const TRACK_H: f32 = 64.0;
+
+/// A device card in the chain band. Wider than a track's column on
+/// purpose: a column is an address and holds a name and a number, while
+/// a card is a table of parameters — a name, a gauge and a value on
+/// every row — and a table crammed to a column's width cut every name
+/// to three letters. Layout dimensions, settled by eye like the rest.
+const CHAIN_W: f32 = 272.0;
+/// One parameter row's height in a card.
+const CHAIN_PITCH: f32 = 24.0;
+/// A card's head: the family seal, the terse title, and a sample's name.
+const CHAIN_HEAD_H: f32 = 40.0;
 
 /// The gutter left of the session where each scene's address is written.
 /// A layout dimension: two digits of the smallest type and a breath, and
@@ -261,9 +401,13 @@ impl Layout {
         // The browser holds the left of the middle band, INSIDE the strips
         // rather than beside them: vitals and messages speak for the whole
         // app, while the browser is content and sits with the content.
+        //
+        // The band stands off the window's sides by the frame rail, so
+        // the surface material runs unbroken from the vitals, down both
+        // sides, into the message strip.
         let band = egui::Rect::from_min_max(
-            egui::pos2(whole.min.x, vitals.max.y),
-            egui::pos2(whole.max.x, message.min.y),
+            egui::pos2(whole.min.x + FRAME_W, vitals.max.y),
+            egui::pos2(whole.max.x - FRAME_W, message.min.y),
         );
         let browser =
             egui::Rect::from_min_max(band.min, egui::pos2(band.min.x + BROWSER_W, band.max.y));
@@ -406,6 +550,12 @@ pub struct Stage {
     library_service: LibraryService,
     library_snapshot: LibrarySnapshot,
     library_scanning: bool,
+    /// The folders the library reads, kept so a rescan reads the same
+    /// ones the stage opened with.
+    library_config: LibraryConfig,
+    /// How many scans this stage has asked for since it opened. A fact
+    /// a key can change, so a rescan is a change and not a lie.
+    library_generation: u64,
     /// The scene that is playing, if one has been fired.
     ///
     /// NOT document data, and the model says why: a scene is "a place to
@@ -482,6 +632,31 @@ pub struct Stage {
     /// A rename in flight. `Some` means the letters are the keyboard's
     /// meaning — see `keymap::ScopeContext::Rename`.
     renaming: Option<Rename>,
+    /// The trig menu, while it is up: which row the cursor is on. The
+    /// trig it is about is whatever is under the sequencer's cursor —
+    /// read afresh each time, never copied, so the menu can never speak
+    /// to a trig that has since moved or gone.
+    trig_menu: Option<TrigMenu>,
+    /// The trig's locks as they stood when the menu opened, so Escape
+    /// can put them back: the menu edits live, and leaving it without
+    /// keeping means undoing what it did.
+    trig_menu_kept: Option<(PatternId, usize, Vec<crate::sequencing::ParamLock>)>,
+    /// The sample editor, while it is up. A place of its own that takes
+    /// the whole field, like the codebook, and the keys with it.
+    sample: Option<SampleEditor>,
+    /// The file the editor shows, once the host has handed it in. Kept
+    /// across the editor closing and opening again on the same file, so
+    /// the second look is instant; replaced when the file differs.
+    sample_data: Option<SampleData>,
+    /// A range the host is asked to play, until it takes it.
+    audition: Option<Audition>,
+    /// Whether the host is asked to stop what it is auditioning.
+    audition_stop: bool,
+    /// Where the sequencer drew the cursor's cell this frame, so the
+    /// menu's tail can land on it. A fact about the last draw: cleared
+    /// every frame before the tray is drawn, and `None` while it is
+    /// covered or off screen.
+    trig_anchor: Option<egui::Rect>,
     /// A nudge has been spoken and is waiting for its direction. The
     /// grammar's own shape — verb, then motion — and it lasts exactly
     /// one intent: anything but a Left or a Right lets it go.
@@ -531,6 +706,7 @@ pub struct Stage {
 /// first letter REPLACES that name rather than appending to it. That is
 /// the shape a selected field has in every editor: the old name is
 /// there to read and to keep, and gone the moment a new one starts.
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Rename {
     track: usize,
@@ -600,9 +776,11 @@ impl Stage {
             midi_typing: midi_typing::MidiTyping::default(),
             entered_pitch: None,
             notice: None,
-            library_service: LibraryService::start(config),
+            library_service: LibraryService::start(config.clone()),
             library_snapshot: cached,
             library_scanning: true,
+            library_config: config,
+            library_generation: 0,
             playing: Vec::new(),
             vitals: vitals::Vitals::default(),
             engine_beat: None,
@@ -613,6 +791,13 @@ impl Stage {
             home: None,
             dirty: false,
             renaming: None,
+            trig_menu: None,
+            trig_menu_kept: None,
+            sample: None,
+            sample_data: None,
+            audition: None,
+            audition_stop: false,
+            trig_anchor: None,
             nudging: false,
             clipboard: None,
             mixing: false,
@@ -766,6 +951,12 @@ impl Stage {
     /// Tell the stage how the engine behind it is doing.
     pub fn set_health(&mut self, health: Health) {
         self.vitals.report(health);
+    }
+
+    /// Tell the stage what stream the engine opened, or that there is
+    /// none. Standing facts, kept until the host says otherwise.
+    pub fn set_stream(&mut self, stream: Option<Stream>) {
+        self.vitals.set_stream(stream);
     }
 
     /// Hand the stage what the engine measured this frame. The meters
@@ -938,9 +1129,7 @@ impl Stage {
     /// ones. A pure function of the tray, like every other capacity here.
     fn chain_capacity(tray: egui::Rect) -> usize {
         let margin = design::px(design::space::ROOM);
-        let head_h = design::px(design::space::OPEN);
-        let pitch = design::px(design::space::ROOM);
-        chain::rows_that_fit(tray.height() - margin - head_h, pitch)
+        chain::rows_that_fit(tray.height() - margin - CHAIN_HEAD_H, CHAIN_PITCH)
     }
 
     /// Where the transport is inside the OPEN clip, in ticks — but only
@@ -965,6 +1154,26 @@ impl Stage {
         // pattern's own length rather than a position that runs off it.
         let length = sequencer::pattern_length(&self.song, opened.pattern).max(1);
         Some(self.transport.tick() % length)
+    }
+
+    /// Bring the band's row back inside the device under its cursor.
+    fn clamp_chain_row(&mut self) {
+        let Some(track) = self.addressed_track() else {
+            return;
+        };
+        let Some(lattice) = &mut self.chain else {
+            return;
+        };
+        let Some((col, mut row)) = lattice.cursor() else {
+            return;
+        };
+        let len = self.song.tracks[track]
+            .chain
+            .get(col)
+            .map_or(0, |device| device.kind.spec().params.len());
+        while row >= len && row > 0 && lattice.step(Step::Up) {
+            row -= 1;
+        }
     }
 
     /// The device the chain band's cursor is on, as an index into the
@@ -1083,8 +1292,9 @@ impl Stage {
         // While a sentence is being spoken, or the letters are pitches,
         // Escape is the grammar's: it abandons the sentence or leaves
         // pitch entry, and only a bare Escape leaves the clip.
-        let grammar_owns_escape =
-            self.inside.is_some() && (!self.sentence.is_empty() || self.midi_typing.enabled());
+        let grammar_owns_escape = self.inside.is_some()
+            && self.trig_menu.is_none()
+            && (!self.sentence.is_empty() || self.midi_typing.enabled());
         let scope = self.scope_context();
         let inputs = if palette_open {
             Vec::new()
@@ -1264,7 +1474,11 @@ impl Stage {
     }
 
     fn scope_context(&self) -> keymap::ScopeContext {
-        if self.renaming.is_some() {
+        if self.sample.is_some() {
+            keymap::ScopeContext::Sample
+        } else if self.trig_menu.is_some() {
+            keymap::ScopeContext::TrigMenu
+        } else if self.renaming.is_some() {
             keymap::ScopeContext::Rename
         } else if self.browser.is_some() {
             keymap::ScopeContext::Browser
@@ -1370,8 +1584,14 @@ impl Stage {
         let FocusScope::Lattice(lattice) = self.focus.levels().first()? else {
             return None;
         };
+        // Exactly one thing on the screen is focus-bright. While the
+        // band or the browser holds the keys, the session's cursor rests
+        // — it says where focus will land when it comes back, not where
+        // it is.
+        let holds_the_keys = self.chain.is_none() && self.browser.is_none();
         match (self.focus.depth(), self.inside) {
-            (1, _) => Some((lattice, self.focused())),
+            (1, _) if holds_the_keys => Some((lattice, self.focused())),
+            (1, _) => Some((lattice, self.resting())),
             (_, Some(_)) => Some((lattice, self.resting())),
             _ => None,
         }
@@ -1417,6 +1637,667 @@ impl Stage {
             // the master is not a place clips live at all.
             Address::Head { .. } | Address::Master => None,
         })
+    }
+
+    // ------------------------------------------------------- the cutting room
+
+    /// The file the editor needs and does not have. The host loads it
+    /// and answers with `set_sample`.
+    pub fn wanted_sample(&self) -> Option<&Path> {
+        let path = if let Some(editor) = &self.sample {
+            self.song.device(editor.device)?.sample.as_deref()?
+        } else if self.trig_menu.is_some() {
+            // The menu's slice strip shows the track's file.
+            let shown = self.clip_in_view()?;
+            let track = self.song.tracks.get(shown.track)?;
+            if !trig_menu::slicing(track) {
+                return None;
+            }
+            track.chain.first()?.sample.as_deref()?
+        } else {
+            return None;
+        };
+        match &self.sample_data {
+            Some(data) if data.path == path => None,
+            _ => Some(path),
+        }
+    }
+
+    /// The host's answer: the file, as the stage may hold it.
+    pub fn set_sample(&mut self, data: SampleData) {
+        self.sample_data = Some(data);
+    }
+
+    /// A range to play, if the editor asked for one since the last take.
+    pub fn take_audition(&mut self) -> Option<Audition> {
+        self.audition.take()
+    }
+
+    /// Whether the editor asked for the audition to stop since the last take.
+    pub fn take_audition_stop(&mut self) -> bool {
+        std::mem::take(&mut self.audition_stop)
+    }
+
+    /// The sampler an editor would open on: the device under the band's
+    /// cursor if the band is up, else the head of the addressed track.
+    /// A device that is not a sampler refuses as unavailable; no track,
+    /// or a track with nothing on it, refuses as empty.
+    fn sampler_target(&self) -> Result<(usize, crate::sequencing::DeviceId), RefusalReason> {
+        if let Some((track, device)) = self.chained_device() {
+            let device = &self.song.tracks[track].chain[device];
+            return if device.kind == DeviceKind::Sampler {
+                Ok((track, device.id))
+            } else {
+                Err(RefusalReason::Unavailable)
+            };
+        }
+        let track = self.addressed_track().ok_or(RefusalReason::Empty)?;
+        let head = self.song.tracks[track]
+            .chain
+            .first()
+            .ok_or(RefusalReason::Empty)?;
+        if head.kind == DeviceKind::Sampler {
+            Ok((track, head.id))
+        } else {
+            Err(RefusalReason::Unavailable)
+        }
+    }
+
+    /// The editor's device, while the editor is up and the device stands.
+    fn edited_sampler(&self) -> Option<(&SampleEditor, &crate::sequencing::Device)> {
+        let editor = self.sample.as_ref()?;
+        let device = self.song.device(editor.device)?;
+        Some((editor, device))
+    }
+
+    /// Where a placed marker lands: the cursor, walked back to a zero
+    /// crossing when snap is on and the file is here to walk.
+    fn placed(&self) -> f64 {
+        let Some(editor) = &self.sample else {
+            return 0.0;
+        };
+        match (&self.sample_data, editor.snap) {
+            (Some(data), true) => data.snapped(editor.cursor),
+            _ => editor.cursor,
+        }
+    }
+
+    /// Set one of the editor's sampler parameters, as a letter to the
+    /// running node — the same road a knob in the band takes.
+    fn set_sampler_param(&mut self, param: u32, value: f32) -> Result<f32, RefusalReason> {
+        let id = self.sample.as_ref().map(|editor| editor.device);
+        let device = id
+            .and_then(|id| self.song.device_mut(id))
+            .ok_or(RefusalReason::Unavailable)?;
+        if !device.set(param, value) {
+            return Err(RefusalReason::Unavailable);
+        }
+        let after = device.value(param);
+        self.remixed();
+        Ok(after)
+    }
+
+    /// Replace the editor's sampler's slices, and rebuild: a slice table
+    /// is baked at compile, not sent as a letter.
+    fn set_sampler_slices(&mut self, slices: Vec<f64>) -> Result<usize, RefusalReason> {
+        use crate::params::sampler as sp;
+        let id = self.sample.as_ref().map(|editor| editor.device);
+        let device = id
+            .and_then(|id| self.song.device_mut(id))
+            .ok_or(RefusalReason::Unavailable)?;
+        device.set_slices(slices);
+        let count = device.slices.len();
+        // Slices are played in slice mode, and a table that was just
+        // laid is a table meant to be played: the mode follows, so the
+        // next trig sounds a slice rather than the whole file.
+        if count > 0 {
+            device.set(sp::MODE, sp::MODE_SLICE);
+        }
+        self.touched();
+        self.remixed();
+        Ok(count)
+    }
+
+    /// Everything the cutting room can be told.
+    fn apply_sample(&mut self, intent: SampleIntent) -> Result<(), RefusalReason> {
+        use crate::params::sampler as sp;
+        if intent == SampleIntent::Open {
+            let (track, id) = self.sampler_target()?;
+            let device = self.song.device(id).ok_or(RefusalReason::Unavailable)?;
+            if device.sample.is_none() {
+                return Err(RefusalReason::Empty);
+            }
+            let cursor = f64::from(device.value(sp::START));
+            self.sample = Some(SampleEditor::open(track, id, cursor));
+            self.trig_menu = None;
+            return Ok(());
+        }
+        let Some((editor, device)) = self.edited_sampler() else {
+            return Err(RefusalReason::Unavailable);
+        };
+        let editor = editor.clone();
+        let device = device.clone();
+        let frames = self
+            .sample_data
+            .as_ref()
+            .map_or(1 << 40, |data| data.frames);
+        let seconds = self.sample_data.as_ref().map_or(0.0, SampleData::seconds);
+        let word = |at: f64| sample::time_word(at, seconds);
+        match intent {
+            SampleIntent::Open => unreachable!("handled above"),
+            SampleIntent::Left { coarse } | SampleIntent::Right { coarse } => {
+                let right = matches!(intent, SampleIntent::Right { .. });
+                let mut next = editor;
+                if !next.step(right, coarse) {
+                    return Err(RefusalReason::Edge(if right {
+                        Step::Right
+                    } else {
+                        Step::Left
+                    }));
+                }
+                self.sample = Some(next);
+                Ok(())
+            }
+            SampleIntent::JumpPrev | SampleIntent::JumpNext => {
+                let forward = intent == SampleIntent::JumpNext;
+                let markers = sample::markers(&device);
+                let Some(to) = sample::jump(&markers, editor.cursor, forward) else {
+                    return Err(RefusalReason::Edge(if forward {
+                        Step::Right
+                    } else {
+                        Step::Left
+                    }));
+                };
+                let mut next = editor;
+                next.seek(to);
+                self.sample = Some(next);
+                Ok(())
+            }
+            SampleIntent::ZoomIn | SampleIntent::ZoomOut => {
+                let closer = intent == SampleIntent::ZoomIn;
+                let mut next = editor;
+                if !next.zoom(closer, frames) {
+                    return Err(RefusalReason::Edge(if closer {
+                        Step::Up
+                    } else {
+                        Step::Down
+                    }));
+                }
+                self.sample = Some(next);
+                Ok(())
+            }
+            SampleIntent::ScrollLeft | SampleIntent::ScrollRight => {
+                let right = intent == SampleIntent::ScrollRight;
+                let mut next = editor;
+                if !next.scroll(right) {
+                    return Err(RefusalReason::Edge(if right {
+                        Step::Right
+                    } else {
+                        Step::Left
+                    }));
+                }
+                self.sample = Some(next);
+                Ok(())
+            }
+            SampleIntent::Page => {
+                let mut next = editor;
+                next.page = next.page.next();
+                self.sample = Some(next);
+                Ok(())
+            }
+            SampleIntent::SetStart | SampleIntent::SetEnd | SampleIntent::SetLoop => {
+                let at = self.placed();
+                let (param, name) = match intent {
+                    SampleIntent::SetStart => (sp::START, "start"),
+                    SampleIntent::SetEnd => (sp::END, "end"),
+                    _ => (sp::LOOP_START, "loop"),
+                };
+                let after = self.set_sampler_param(param, at as f32)?;
+                self.notice = Some(format!("{name} {}", word(f64::from(after))));
+                Ok(())
+            }
+            SampleIntent::AddSlice => {
+                let at = self.placed();
+                if device.slices.iter().any(|s| (*s - at).abs() < 1e-9) {
+                    return Err(RefusalReason::Unavailable);
+                }
+                let mut slices = device.slices.clone();
+                slices.push(at);
+                let count = self.set_sampler_slices(slices)?;
+                self.notice = Some(format!("slice at {} · {count} slices", word(at)));
+                Ok(())
+            }
+            SampleIntent::RemoveSlice => {
+                let Some(index) = editor.nearest_slice(&device) else {
+                    return Err(RefusalReason::Empty);
+                };
+                let mut slices = device.slices.clone();
+                slices.remove(index);
+                // The head of the file is not a cut, so removing the last
+                // real slice leaves no table at all rather than a table
+                // of one.
+                if slices.len() == 1 && slices[0] == 0.0 {
+                    slices.clear();
+                }
+                let count = self.set_sampler_slices(slices)?;
+                self.notice = Some(format!("slice removed · {count} slices"));
+                Ok(())
+            }
+            SampleIntent::Grid => {
+                let count = editor.count.max(1);
+                let slices: Vec<f64> = (0..count).map(|i| i as f64 / count as f64).collect();
+                let laid = self.set_sampler_slices(slices)?;
+                self.notice = Some(format!("{laid} slices on the grid"));
+                Ok(())
+            }
+            SampleIntent::Transients => {
+                let Some(data) = &self.sample_data else {
+                    return Err(RefusalReason::Unavailable);
+                };
+                let onsets = crate::slice::transients_of(&data.planar(), editor.sensitivity);
+                if onsets.len() <= 1 {
+                    self.notice = Some("no onsets found".to_owned());
+                    return Err(RefusalReason::Empty);
+                }
+                let frames = data.frames.max(1) as f64;
+                let slices: Vec<f64> = onsets.iter().map(|at| *at as f64 / frames).collect();
+                let laid = self.set_sampler_slices(slices)?;
+                self.notice = Some(format!("{laid} slices on onsets"));
+                Ok(())
+            }
+            SampleIntent::ClearSlices => {
+                if device.slices.is_empty() {
+                    return Err(RefusalReason::Empty);
+                }
+                self.set_sampler_slices(Vec::new())?;
+                let _ = self.set_sampler_param(sp::MODE, sp::MODE_CLASSIC);
+                self.notice = Some("slices cleared".to_owned());
+                Ok(())
+            }
+            SampleIntent::More | SampleIntent::Less => {
+                let more = intent == SampleIntent::More;
+                match editor.page {
+                    SamplePage::Slice => {
+                        let next = if more {
+                            (editor.count + 1).min(crate::audio::sampler::MAX_SLICES)
+                        } else {
+                            editor.count.saturating_sub(1).max(1)
+                        };
+                        if next == editor.count {
+                            return Err(RefusalReason::Edge(if more {
+                                Step::Up
+                            } else {
+                                Step::Down
+                            }));
+                        }
+                        let mut e = editor;
+                        e.count = next;
+                        self.sample = Some(e);
+                        self.notice = Some(format!("grid of {next}"));
+                        Ok(())
+                    }
+                    SamplePage::Attr => {
+                        let before = device.value(sp::GAIN);
+                        let after = self
+                            .set_sampler_param(sp::GAIN, before + if more { 1.0 } else { -1.0 })?;
+                        if after == before {
+                            return Err(RefusalReason::Edge(if more {
+                                Step::Up
+                            } else {
+                                Step::Down
+                            }));
+                        }
+                        self.notice = Some(format!("gain {after:+.1} dB"));
+                        Ok(())
+                    }
+                    SamplePage::Trim => Err(RefusalReason::Unavailable),
+                }
+            }
+            SampleIntent::Eager | SampleIntent::Shyer => {
+                let eager = intent == SampleIntent::Eager;
+                let next = (editor.sensitivity + if eager { 0.1 } else { -0.1 }).clamp(0.0, 1.0);
+                if (next - editor.sensitivity).abs() < 1e-6 {
+                    return Err(RefusalReason::Edge(if eager {
+                        Step::Up
+                    } else {
+                        Step::Down
+                    }));
+                }
+                let mut e = editor;
+                e.sensitivity = next;
+                self.sample = Some(e);
+                self.notice = Some(format!("onsets at {:.0}%", next * 100.0));
+                Ok(())
+            }
+            SampleIntent::Normalize => {
+                let Some(data) = &self.sample_data else {
+                    return Err(RefusalReason::Unavailable);
+                };
+                let db = data.normalizing_db();
+                let after = self.set_sampler_param(sp::GAIN, db)?;
+                self.notice = Some(format!("normalized · gain {after:+.1} dB"));
+                Ok(())
+            }
+            SampleIntent::Reverse => {
+                let on = device.value(sp::REVERSE).round() < 1.0;
+                self.set_sampler_param(sp::REVERSE, if on { 1.0 } else { 0.0 })?;
+                self.notice = Some(if on { "reversed" } else { "forward" }.to_owned());
+                Ok(())
+            }
+            SampleIntent::Mode => {
+                let next = (device.value(sp::MODE).round() + 1.0) % (sp::MODE_MAX + 1.0);
+                self.set_sampler_param(sp::MODE, next)?;
+                let name = sp::MODE_NAMES.get(next as usize).copied().unwrap_or("?");
+                self.notice = Some(format!("mode {name}"));
+                Ok(())
+            }
+            SampleIntent::LoopMode => {
+                let next = (device.value(sp::LOOP_MODE).round() + 1.0) % (sp::LOOP_MODE_MAX + 1.0);
+                self.set_sampler_param(sp::LOOP_MODE, next)?;
+                let name = sp::LOOP_NAMES.get(next as usize).copied().unwrap_or("?");
+                self.notice = Some(format!("loop {name}"));
+                Ok(())
+            }
+            SampleIntent::Snap => {
+                let mut e = editor;
+                e.snap = !e.snap;
+                self.notice = Some(
+                    if e.snap {
+                        "snap to zero"
+                    } else {
+                        "free placement"
+                    }
+                    .to_owned(),
+                );
+                self.sample = Some(e);
+                Ok(())
+            }
+            SampleIntent::Audition | SampleIntent::AuditionAll => {
+                let Some(path) = device.sample.as_deref() else {
+                    return Err(RefusalReason::Empty);
+                };
+                let (from, to) = if intent == SampleIntent::AuditionAll {
+                    (0.0, 1.0)
+                } else if let Some(index) = editor.slice_at(&device) {
+                    let from = device.slices[index];
+                    let to = device.slices.get(index + 1).copied().unwrap_or(1.0);
+                    (from, to)
+                } else {
+                    let start = f64::from(device.value(sp::START));
+                    let end = f64::from(device.value(sp::END));
+                    if end > start {
+                        (start, end)
+                    } else {
+                        (start, 1.0)
+                    }
+                };
+                self.audition = Some(Audition::of(path, from, to));
+                let mut e = editor;
+                e.playing = Some((from, to));
+                self.sample = Some(e);
+                Ok(())
+            }
+        }
+    }
+
+    /// Whether `track`'s voice is a sampler in slice mode; the grid then
+    /// tags cells with their locked slice. The same rule the compiler
+    /// applies to pick the voice: the head of the chain.
+    fn slicing_track(&self, track: usize) -> bool {
+        self.song.tracks.get(track).is_some_and(trig_menu::slicing)
+    }
+
+    /// The trig under the sequencer's cursor in the clip on view, and
+    /// the pattern it lives in. Built the way the tray builds its view,
+    /// so the menu and the inspector always agree about what is there.
+    fn trig_under_cursor(&self) -> Option<(PatternId, sequence::NoteView)> {
+        let shown = self.clip_in_view()?;
+        let pattern = self.song.pattern(shown.pattern)?;
+        let notes = sequencer::note_views(pattern, &self.song.key);
+        let clip = sequence::ClipView {
+            id: shown.pattern.0,
+            name: &pattern.name,
+            length_ticks: sequencer::pattern_length(&self.song, shown.pattern),
+            notes: &notes,
+            ghosts: &[],
+            slicing: self.slicing_track(shown.track),
+        };
+        let trig = self.sequencer.selection(Some(clip)).primary?;
+        Some((shown.pattern, trig))
+    }
+
+    /// The lock page's rows for the trig under the cursor, with the
+    /// pattern and step they belong to.
+    fn menu_rows_under_cursor(&self) -> Option<(PatternId, usize, Vec<MenuRow>)> {
+        let shown = self.clip_in_view()?;
+        let (id, trig) = self.trig_under_cursor()?;
+        let step = trig.start_ticks / PATTERN_STEP_TICKS;
+        let track = self.song.tracks.get(shown.track)?;
+        let pattern = self.song.pattern(id)?;
+        Some((id, step, trig_menu::menu_rows(track, pattern.trig(step))))
+    }
+
+    /// How many rows the menu's current page holds.
+    fn trig_menu_rows(&self, menu: TrigMenu) -> usize {
+        match menu.page {
+            Page::Trig => TrigAction::ALL.len(),
+            Page::Locks => self
+                .menu_rows_under_cursor()
+                .map_or(1, |(_, _, rows)| rows.len()),
+        }
+    }
+
+    /// The row under the menu's cursor on the lock page.
+    fn menu_row_under_cursor(&self) -> Option<(PatternId, usize, MenuRow)> {
+        let menu = self.trig_menu?;
+        if menu.page != Page::Locks {
+            return None;
+        }
+        let (id, step, rows) = self.menu_rows_under_cursor()?;
+        let row = *rows.get(menu.row)?;
+        Some((id, step, row))
+    }
+
+    /// Walk the trig menu. A list has two directions and two ends, and
+    /// an end is refused rather than wrapped: a cursor that comes round
+    /// the bottom to the top has moved somewhere the hand did not ask.
+    /// The window follows the cursor by the strip's own minimal rule.
+    fn step_trig_menu(&mut self, step: Step) -> Result<(), RefusalReason> {
+        let Some(menu) = self.trig_menu else {
+            return Err(RefusalReason::Unavailable);
+        };
+        let rows = self.trig_menu_rows(menu);
+        let row = match step {
+            Step::Up if menu.row > 0 => menu.row - 1,
+            Step::Down if menu.row + 1 < rows => menu.row + 1,
+            other => return Err(RefusalReason::Edge(other)),
+        };
+        self.trig_menu = Some(TrigMenu {
+            row,
+            offset: tracks::offset_following(menu.offset, Some(row), rows, trig_menu::MAX_ROWS),
+            ..menu
+        });
+        Ok(())
+    }
+
+    /// Lay a lock for the trig under the menu's cursor.
+    fn lay_lock(
+        &mut self,
+        id: PatternId,
+        step: usize,
+        device: Option<crate::sequencing::DeviceId>,
+        param: u32,
+        value: f32,
+    ) {
+        self.apply_sequence(
+            id,
+            &[sequence::Intent::SetLock {
+                tick: step * PATTERN_STEP_TICKS,
+                device: device.map(|device| device.0),
+                param,
+                value,
+            }],
+        );
+    }
+
+    /// Release a lock for the trig under the menu's cursor.
+    fn lift_lock(
+        &mut self,
+        id: PatternId,
+        step: usize,
+        device: Option<crate::sequencing::DeviceId>,
+        param: u32,
+    ) {
+        self.apply_sequence(
+            id,
+            &[sequence::Intent::ClearLock {
+                tick: step * PATTERN_STEP_TICKS,
+                device: device.map(|device| device.0),
+                param,
+            }],
+        );
+    }
+
+    /// Move the value under the cursor: a slider by the parameter's own
+    /// step, the slice row by one cut. A row with no lock yet gets one,
+    /// one step from the knob: the first press both lays the lock and
+    /// moves it, so the row answers on the first key rather than the
+    /// second. The menu stays up — this is an editor.
+    fn slide_lock(&mut self, up: bool, coarse: bool) -> Result<(), RefusalReason> {
+        use crate::params::sampler as sp;
+        let Some((id, step, row)) = self.menu_row_under_cursor() else {
+            return Err(RefusalReason::Unavailable);
+        };
+        match row {
+            // The TRIG row leads somewhere, and Right is the way in.
+            MenuRow::Trig if up => {
+                self.trig_menu = Some(TrigMenu {
+                    page: Page::Trig,
+                    row: 0,
+                    offset: 0,
+                });
+                Ok(())
+            }
+            MenuRow::Trig => Err(RefusalReason::Unavailable),
+            MenuRow::Slice(slice) => {
+                let standing = i32::from(slice.standing());
+                let next =
+                    (standing + if up { 1 } else { -1 }).clamp(1, slice.count.max(1) as i32) as u8;
+                if next == standing as u8 && slice.lock.is_some() {
+                    return Err(RefusalReason::Edge(if up {
+                        Step::Right
+                    } else {
+                        Step::Left
+                    }));
+                }
+                self.lay_lock(id, step, None, sp::SLICE, f32::from(next));
+                self.notice = Some(format!("slice {next} of {}", slice.count));
+                Ok(())
+            }
+            MenuRow::Param(row) => {
+                let delta =
+                    chain::step_of(row.def, row.label, coarse) * if up { 1.0 } else { -1.0 };
+                let next = row.def.clamp(row.standing() + delta);
+                if row.lock == Some(next) {
+                    return Err(RefusalReason::Edge(if up {
+                        Step::Right
+                    } else {
+                        Step::Left
+                    }));
+                }
+                self.lay_lock(id, step, row.device, row.def.id, next);
+                self.notice = Some(format!(
+                    "{} lock {}",
+                    row.label.name,
+                    chain::format_param(row.def, row.label, next)
+                ));
+                Ok(())
+            }
+        }
+    }
+
+    /// Let the lock under the cursor go.
+    fn clear_lock(&mut self) -> Result<(), RefusalReason> {
+        use crate::params::sampler as sp;
+        let Some((id, step, row)) = self.menu_row_under_cursor() else {
+            return Err(RefusalReason::Unavailable);
+        };
+        let (device, param, name) = match row {
+            MenuRow::Trig => return Err(RefusalReason::Unavailable),
+            MenuRow::Slice(slice) => {
+                if slice.lock.is_none() {
+                    return Err(RefusalReason::Empty);
+                }
+                (None, sp::SLICE, "slice")
+            }
+            MenuRow::Param(row) => {
+                if row.lock.is_none() {
+                    return Err(RefusalReason::Empty);
+                }
+                (row.device, row.def.id, row.label.name)
+            }
+        };
+        self.lift_lock(id, step, device, param);
+        self.notice = Some(format!("{name} unlocked"));
+        Ok(())
+    }
+
+    /// Enter on the menu: on the lock page it KEEPS what the rows did
+    /// and puts the menu away — the edits landed as they were made, so
+    /// keeping is only closing; on the verbs page it speaks the row.
+    fn enter_trig_menu(&mut self) -> Result<(), RefusalReason> {
+        let Some(menu) = self.trig_menu else {
+            return Err(RefusalReason::Unavailable);
+        };
+        if menu.page == Page::Trig {
+            return self.speak_trig_menu();
+        }
+        self.trig_menu = None;
+        self.trig_menu_kept = None;
+        Ok(())
+    }
+
+    /// Escape climbs out one level: from the verbs back to the sliders,
+    /// and from the sliders AWAY WITHOUT KEEPING — the trig's locks go
+    /// back to what they were when the menu opened, so a menu left by
+    /// Escape leaves no mark.
+    fn escape_trig_menu(&mut self) -> Result<(), RefusalReason> {
+        let Some(menu) = self.trig_menu else {
+            return Err(RefusalReason::Unavailable);
+        };
+        match menu.page {
+            Page::Trig => {
+                self.trig_menu = Some(TrigMenu::open());
+            }
+            Page::Locks => {
+                if let Some((id, step, kept)) = self.trig_menu_kept.take()
+                    && let Some(pattern) = self.song.pattern_mut(id)
+                    && pattern.trig(step).locks != kept
+                {
+                    pattern.trig_mut(step).locks = kept;
+                    self.touched();
+                    self.notice = Some("locks put back".to_owned());
+                }
+                self.trig_menu = None;
+            }
+        }
+        Ok(())
+    }
+
+    /// Speak the verbs page's row to the trig, and put the menu away.
+    /// One row, one edit, one gesture: a menu that stayed open after
+    /// speaking would be pointing at a cell whose trig it just moved.
+    fn speak_trig_menu(&mut self) -> Result<(), RefusalReason> {
+        let Some(menu) = self.trig_menu.take() else {
+            return Err(RefusalReason::Unavailable);
+        };
+        self.trig_menu_kept = None;
+        let Some((id, trig)) = self.trig_under_cursor() else {
+            return Err(RefusalReason::Empty);
+        };
+        let action = TrigAction::ALL[menu.row.min(TrigAction::ALL.len() - 1)];
+        self.apply_sequence(id, &action.intents(&trig));
+        Ok(())
     }
 
     /// The sequencer's edits land on the open pattern through the model's
@@ -1515,6 +2396,53 @@ impl Stage {
         let nudging = std::mem::take(&mut self.nudging);
         let result = match intent {
             StageIntent::Step(step @ (Step::Left | Step::Right)) if nudging => self.nudge(step),
+            // The trig menu. Summoned over the trig under the cursor —
+            // and only over a trig: an empty cell has nothing to say.
+            // Up it is a list of sliders with the trig's verbs one row
+            // in: the arrows walk and slide, Enter latches or speaks,
+            // Escape climbs out. The sequencer beneath hears none of it.
+            // The library, read again: the same folders, a fresh look.
+            // The shelf keeps what it has and says it is scanning, and
+            // the poll swaps in the new catalogue when it lands.
+            StageIntent::Rescan => {
+                self.library_service.rescan(self.library_config.clone());
+                self.library_scanning = true;
+                self.library_generation = self.library_generation.wrapping_add(1);
+                if let Some(browser) = &mut self.browser {
+                    let nodes = sample_nodes(&self.library_snapshot.assets);
+                    browser.set_children(Shelf::Samples, nodes, BrowserStatus::Scanning);
+                }
+                self.notice = Some("scanning the library".to_owned());
+                Ok(())
+            }
+            // The cutting room. Its own vocabulary, over one file.
+            StageIntent::Sample(intent) => self.apply_sample(intent),
+            StageIntent::Escape if self.sample.is_some() => {
+                self.sample = None;
+                self.audition_stop = true;
+                Ok(())
+            }
+            StageIntent::TrigMenu => match self.trig_under_cursor() {
+                Some((id, trig)) => {
+                    let step = trig.start_ticks / PATTERN_STEP_TICKS;
+                    let kept = self
+                        .song
+                        .pattern(id)
+                        .map(|pattern| pattern.trig(step).locks.clone())
+                        .unwrap_or_default();
+                    self.trig_menu_kept = Some((id, step, kept));
+                    self.trig_menu = Some(TrigMenu::open());
+                    Ok(())
+                }
+                None => Err(RefusalReason::Empty),
+            },
+            StageIntent::Step(step) if self.trig_menu.is_some() => self.step_trig_menu(step),
+            StageIntent::Param { up, coarse } if self.trig_menu.is_some() => {
+                self.slide_lock(up, coarse)
+            }
+            StageIntent::ClearLock => self.clear_lock(),
+            StageIntent::Enter if self.trig_menu.is_some() => self.enter_trig_menu(),
+            StageIntent::Escape if self.trig_menu.is_some() => self.escape_trig_menu(),
             // While a name is being typed the keys are letters, and the
             // three that are not — keep, let go, erase — act on the name
             // and nothing else.
@@ -1560,13 +2488,27 @@ impl Stage {
             }
             // Movement goes wherever focus is standing. There is exactly
             // one cursor in the app, and this is the only place it moves.
-            StageIntent::Step(step) if self.chain.is_some() => self
-                .chain
-                .as_mut()
-                .expect("the band is showing")
-                .step(step)
-                .then_some(())
-                .ok_or(RefusalReason::Edge(step)),
+            // W then an arrow still reorders the band: the arrows turn
+            // values there now, so the waiting nudge takes its direction
+            // from the value key instead.
+            StageIntent::Param { up, .. } if nudging && self.chain.is_some() => {
+                self.nudge(if up { Step::Right } else { Step::Left })
+            }
+            StageIntent::Step(step) if self.chain.is_some() => {
+                let moved = self.chain.as_mut().expect("the band is showing").step(step);
+                if moved {
+                    // A row is a parameter of THIS device. Arriving on a
+                    // device with fewer of them, the cursor climbs to its
+                    // last row rather than pointing past the list at
+                    // nothing.
+                    if matches!(step, Step::Left | Step::Right) {
+                        self.clamp_chain_row();
+                    }
+                    Ok(())
+                } else {
+                    Err(RefusalReason::Edge(step))
+                }
+            }
             StageIntent::Step(step) => match &mut self.browser {
                 Some(browser) => browser
                     .step(step)
@@ -2353,10 +3295,14 @@ impl Stage {
         // wrong rather than a constant. A surface that is only the right
         // colour when somebody else guessed correctly is not a surface
         // that owns its own appearance.
-        painter.rect_filled(whole, 0.0, self.alphabet().ground.color);
-        // Paper grain: the one texture, so black is a material and not an
-        // absence. It says nothing and never moves.
-        grain::overlay(&painter, whole, self.polarity);
+        //
+        // The casing is painted first and the field is cut out of it: the
+        // whole window is surface material, and the field is the one
+        // place the ground shows through. Vitals, message strip and the
+        // two side rails are therefore one continuous frame, not four
+        // pieces that happen to touch.
+        painter.rect_filled(whole, 0.0, self.alphabet().surface.color);
+        painter.rect_filled(field, 0.0, self.alphabet().ground.color);
         // The ground's own material. Quietest thing on the surface, says
         // nothing, and therefore may cover everything — and what it does
         // say without saying it is that this app is a lattice.
@@ -2366,8 +3312,6 @@ impl Stage {
             self.alphabet().surface.color,
             design::px(design::space::VAST),
         );
-        painter.rect_filled(vitals, 0.0, self.alphabet().surface.color);
-        painter.rect_filled(message, 0.0, self.alphabet().surface.color);
         // The regions get an edge each.
         //
         // This is a DEPARTURE from the rule above, and worth saying so
@@ -2391,17 +3335,76 @@ impl Stage {
         // on paper; what changes is the hand that drew it. A frame with
         // pressure in it says the deck was MADE, and the same seed every
         // frame says it was made once.
-        for (n, region) in [vitals, message, session, clip].into_iter().enumerate() {
+        //
+        // Two weights, by rank. The strips are periphery and keep the
+        // hairline; the session and the tray are the primary casings —
+        // the two windows cut into the deck — and take the heavy line,
+        // which is what `Weight::Heavy` is for. Same rung, same ink: the
+        // weight says what kind of edge this is, not how loud.
+        for (n, (region, weight)) in [
+            (vitals, Weight::Hair),
+            (message, Weight::Hair),
+            (session, Weight::Heavy),
+            (clip, Weight::Heavy),
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let edge = self.alphabet().edge.color;
             kit::cached(
                 &painter,
                 egui::Id::new(("stage-frame", n)),
                 region,
-                edge,
+                (edge, weight),
                 |out| {
-                    circuit::panel_frame_variant(out, region, Weight::Hair, edge, n as u8);
+                    circuit::panel_frame_variant(out, region, weight, edge, n as u8);
                 },
             );
+        }
+        // The screen's own chamfer, fullscreen only. Painted AFTER the
+        // strip's frame so the cut goes through the line as well as the
+        // material, the way a corner cut off a casing takes its edge with
+        // it; then the cut gets the edge back along its new face.
+        if ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false)) {
+            let ground = self.alphabet().ground.color;
+            let edge = self.alphabet().edge.color;
+            kit::cached(
+                &painter,
+                egui::Id::new("stage-screen-chamfer"),
+                whole,
+                (ground, edge),
+                |out| {
+                    for corner in ScreenCorner::ALL {
+                        let [apex, along, down] = screen_cut(whole, corner);
+                        out.push(egui::Shape::convex_polygon(
+                            vec![apex, along, down],
+                            ground,
+                            egui::Stroke::NONE,
+                        ));
+                        circuit::trace(out, &[along, down], Weight::Hair, edge);
+                    }
+                },
+            );
+            // While the deck SOUNDS — transport rolling, and an engine
+            // behind it to roll — the cut fills with rings. Both are
+            // required: a rolling transport with no engine is a clock
+            // with nothing to drive, and the corner should not claim
+            // sound that is not being made. Uncached, because it
+            // breathes with the beat like every other live mark.
+            if phase.rolling && self.vitals.running() {
+                let alpha = self.alphabet();
+                let live = motion::pulse_ink(alpha.live.color, alpha.live_dim.color, phase);
+                let mut rings = Vec::new();
+                for tri in screen_chamfer_rings(whole) {
+                    circuit::trace(
+                        &mut rings,
+                        &[tri[0], tri[1], tri[2], tri[0]],
+                        Weight::Hair,
+                        live,
+                    );
+                }
+                painter.extend(rings);
+            }
         }
         // The register: a rail with pads just before the seam, where the
         // breadcrumb never reaches. Structure rung.
@@ -2478,6 +3481,7 @@ impl Stage {
         }
 
         self.draw_breadcrumb(&painter, breadcrumb);
+        self.draw_stream(&painter, stream_screen(vitals, transport), phase);
         self.draw_engine(&painter, message);
         self.draw_transport(&painter, transport);
         // The badge. Instruments have them, and this is the one piece of
@@ -2546,7 +3550,12 @@ impl Stage {
         // The codebook takes the whole field while it is up. It is a
         // DISPLAY mode, not a scope: focus never enters it, and the
         // cursor underneath is exactly where it was left.
-        if self.help {
+        // The tray sets this while it draws; a covered tray leaves it
+        // unset, and a menu with nowhere to point is not drawn.
+        self.trig_anchor = None;
+        if self.sample.is_some() {
+            self.draw_sample_editor(&painter, field, phase);
+        } else if self.help {
             self.draw_help(&painter, field);
         } else {
             // Stacked: the session above, the clip tray below. The tray
@@ -2593,6 +3602,444 @@ impl Stage {
                 egui::StrokeKind::Inside,
             );
         }
+        // Over everything, because it is about one thing: the trig menu
+        // is a callout, and a callout drawn under anything is a callout
+        // pointing through it.
+        self.draw_trig_menu(&painter, whole);
+    }
+
+    /// The trig menu: a chamfered casing over the sequencer with a wedge
+    /// of a tail landing on the trig under the cursor. The casing is the
+    /// deck's material with the deck's heavy edge; the tail is cut from
+    /// the same piece, so casing and tail read as one shape and not as a
+    /// box with an arrow beside it. The head names the trig; on a
+    /// slicing track a strip shows the file with its cuts and the one
+    /// this trig plays; the list is the voice's parameters as sliders,
+    /// each showing the knob and, when the trig holds one, the lock; the
+    /// TRIG row leads to the trig's own verbs. The cursor row wears the
+    /// cursor's brackets.
+    fn draw_trig_menu(&self, painter: &egui::Painter, whole: egui::Rect) {
+        let Some(menu) = self.trig_menu else {
+            return;
+        };
+        let Some(anchor) = self.trig_anchor else {
+            return;
+        };
+        let Some((_, trig)) = self.trig_under_cursor() else {
+            return;
+        };
+        let alpha = self.alphabet();
+        let rows = self
+            .menu_rows_under_cursor()
+            .map(|(_, _, rows)| rows)
+            .unwrap_or_else(|| vec![MenuRow::Trig]);
+        let shown_track = self
+            .clip_in_view()
+            .and_then(|shown| self.song.tracks.get(shown.track));
+        let voice = shown_track.map_or("VOICE", |track| trig_menu::voice_of(track).0.name);
+        let slice_row = rows.iter().find_map(|row| match row {
+            MenuRow::Slice(slice) => Some(*slice),
+            _ => None,
+        });
+        let strip_h = if menu.page == Page::Locks && slice_row.is_some() {
+            trig_menu::STRIP_H
+        } else {
+            0.0
+        };
+        let total = self.trig_menu_rows(menu);
+        let visible = total.min(trig_menu::MAX_ROWS);
+        let bubble = trig_menu::place(anchor, whole, visible, strip_h);
+        let panel = bubble.panel;
+        let inner = panel.shrink2(egui::vec2(16.0, trig_menu::MARGIN));
+        let [tail_l, tail_r, apex] = bubble.tail;
+        let reach = panel.union(egui::Rect::from_points(&bubble.tail));
+        kit::cached(
+            painter,
+            egui::Id::new("stage-trig-menu-shell"),
+            reach,
+            (
+                alpha.surface.color,
+                alpha.ground.color,
+                alpha.ink.color,
+                (apex.x * 2.0) as i32,
+                (apex.y * 2.0) as i32,
+                bubble.above,
+            ),
+            |out| {
+                circuit::panel_variant(
+                    out,
+                    panel,
+                    Some(alpha.surface.color),
+                    alpha.ground.color,
+                    Some((Weight::Heavy, alpha.ink.color)),
+                    1,
+                );
+                let into = if bubble.above { -3.0 } else { 3.0 };
+                out.push(egui::Shape::convex_polygon(
+                    vec![
+                        egui::pos2(tail_l.x, tail_l.y + into),
+                        egui::pos2(tail_r.x, tail_r.y + into),
+                        apex,
+                    ],
+                    alpha.surface.color,
+                    egui::Stroke::NONE,
+                ));
+                circuit::trace(out, &[tail_l, apex], Weight::Heavy, alpha.ink.color);
+                circuit::trace(out, &[tail_r, apex], Weight::Heavy, alpha.ink.color);
+                circuit::pad(out, apex, circuit::PAD, alpha.ink.color, true);
+                circuit::panel_frame_variant(
+                    out,
+                    panel.shrink(5.0),
+                    Weight::Hair,
+                    alpha.edge.color,
+                    3,
+                );
+                let sign = egui::Rect::from_center_size(
+                    egui::pos2(inner.left() + 9.0, inner.top() + 9.0),
+                    egui::Vec2::splat(16.0),
+                );
+                Sign::General((trig.start_ticks / PATTERN_STEP_TICKS % 32) as u8).paint(
+                    out,
+                    sign,
+                    Weight::Hair,
+                    alpha.edge.color,
+                );
+                let rail_y = inner.top() + trig_menu::HEAD_H - 8.0;
+                circuit::rail(
+                    out,
+                    egui::pos2(inner.left(), rail_y),
+                    egui::pos2(inner.right(), rail_y),
+                    &[0.0, 0.8, 1.0],
+                    alpha.edge.color,
+                );
+            },
+        );
+        let step = trig.start_ticks / PATTERN_STEP_TICKS;
+        block::paint(
+            painter,
+            egui::Id::new("stage-trig-menu-title"),
+            egui::pos2(inner.left() + 24.0, inner.top()),
+            egui::Align2::LEFT_TOP,
+            block::unit::TITLE,
+            &format!("TRIG {:02}", step + 1),
+            alpha.ink.color,
+        );
+        let held = rows
+            .iter()
+            .filter(|row| match row {
+                MenuRow::Trig => false,
+                MenuRow::Slice(slice) => slice.lock.is_some(),
+                MenuRow::Param(row) => row.lock.is_some(),
+            })
+            .count();
+        let facts = match menu.page {
+            Page::Locks => format!("{}  ·  {held} LOCKED", voice.to_uppercase()),
+            Page::Trig => format!(
+                "{}  VEL {:>3}  LEN {}  {}%",
+                sequencer::sequence_grid::note_name(trig.midi),
+                trig.velocity,
+                sequencer::grid_resolution::length_label(trig.length_ticks),
+                (trig.probability * 100.0).round() as u32,
+            ),
+        };
+        painter.text(
+            egui::pos2(inner.left(), inner.top() + 27.0),
+            egui::Align2::LEFT_TOP,
+            facts,
+            egui::FontId::monospace(11.0),
+            alpha.ink.color,
+        );
+
+        // The slice strip: the file, its cuts, and the cut this trig
+        // plays washed in the focus ink. The lock's cut when there is a
+        // lock, the knob's when not, so the strip always shows what
+        // will sound.
+        if let Some(slice) = slice_row
+            && strip_h > 0.0
+        {
+            let strip = egui::Rect::from_min_size(
+                egui::pos2(inner.left(), inner.top() + trig_menu::HEAD_H),
+                egui::vec2(inner.width(), strip_h - 6.0),
+            );
+            let device = shown_track.and_then(|track| track.chain.first());
+            self.draw_slice_strip(painter, strip, slice, device);
+        }
+
+        let list_top = inner.top() + trig_menu::HEAD_H + strip_h;
+        for shown in 0..visible {
+            let index = menu.offset + shown;
+            let y = list_top + shown as f32 * trig_menu::ROW_H;
+            let row = egui::Rect::from_min_max(
+                egui::pos2(inner.left(), y + 1.0),
+                egui::pos2(inner.right(), y + trig_menu::ROW_H - 1.0),
+            );
+            let on = index == menu.row;
+            if on {
+                let mut marks = Vec::new();
+                circuit::brackets(&mut marks, row, 5.0, Weight::Bold, alpha.focus.color);
+                painter.extend(marks);
+            }
+            let ink = if on {
+                alpha.focus.color
+            } else {
+                alpha.ink.color
+            };
+            match menu.page {
+                Page::Trig => {
+                    painter.text(
+                        egui::pos2(row.left() + 14.0, row.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        TrigAction::ALL[index].label(&trig),
+                        egui::FontId::monospace(13.0),
+                        ink,
+                    );
+                }
+                Page::Locks => match rows.get(index) {
+                    Some(MenuRow::Trig) | None => {
+                        painter.text(
+                            egui::pos2(row.left() + 14.0, row.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            "TRIG",
+                            egui::FontId::monospace(13.0),
+                            ink,
+                        );
+                        painter.text(
+                            egui::pos2(row.right() - 6.0, row.center().y),
+                            egui::Align2::RIGHT_CENTER,
+                            ">",
+                            egui::FontId::monospace(13.0),
+                            alpha.edge.color,
+                        );
+                    }
+                    Some(MenuRow::Slice(slice)) => {
+                        painter.text(
+                            egui::pos2(row.left() + 14.0, row.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            "SLICE",
+                            egui::FontId::monospace(12.0),
+                            ink,
+                        );
+                        let (word, word_ink) = match slice.lock {
+                            Some(lock) => {
+                                (format!("{lock:02} / {:02}", slice.count), alpha.live.color)
+                            }
+                            None => (
+                                format!("{:02} / {:02}", slice.knob, slice.count),
+                                alpha.edge.color,
+                            ),
+                        };
+                        painter.text(
+                            egui::pos2(row.right() - 4.0, row.center().y),
+                            egui::Align2::RIGHT_CENTER,
+                            word,
+                            egui::FontId::monospace(12.0),
+                            word_ink,
+                        );
+                        painter.text(
+                            egui::pos2(row.left() + 128.0, row.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            "<  LEFT / RIGHT  >",
+                            egui::FontId::monospace(10.0),
+                            alpha.edge.color,
+                        );
+                    }
+                    Some(MenuRow::Param(lock_row)) => {
+                        self.draw_lock_row(painter, row, lock_row, on);
+                    }
+                },
+            }
+        }
+        if total > visible {
+            let hint = |y: f32, glyph: &str| {
+                painter.text(
+                    egui::pos2(inner.right() - 6.0, y),
+                    egui::Align2::RIGHT_CENTER,
+                    glyph,
+                    egui::FontId::monospace(11.0),
+                    alpha.edge.color,
+                );
+            };
+            if menu.offset > 0 {
+                hint(list_top - 4.0, "^");
+            }
+            if menu.offset + visible < total {
+                hint(list_top + visible as f32 * trig_menu::ROW_H + 2.0, "v");
+            }
+        }
+    }
+
+    /// The slice strip: a dark screen with the file's envelope, a
+    /// hairline at every cut, and the chosen cut washed and numbered.
+    /// Without the file yet, the cuts alone on an empty screen.
+    fn draw_slice_strip(
+        &self,
+        painter: &egui::Painter,
+        strip: egui::Rect,
+        slice: SliceRow,
+        device: Option<&crate::sequencing::Device>,
+    ) {
+        let alpha = self.alphabet();
+        let mut marks = Vec::new();
+        circuit::panel_variant(
+            &mut marks,
+            strip,
+            Some(alpha.ground.color),
+            alpha.surface.color,
+            Some((Weight::Hair, alpha.edge.color)),
+            2,
+        );
+        painter.extend(marks);
+        let wave = strip.shrink2(egui::vec2(4.0, 4.0));
+        let count = slice.count.max(1);
+        // The cuts as fractions: the authored table, or the grid the
+        // knob will lay.
+        let cuts: Vec<f64> = match device {
+            Some(device) if !device.slices.is_empty() => device.slices.clone(),
+            _ => (0..count).map(|i| i as f64 / count as f64).collect(),
+        };
+        let x_of = |at: f64| wave.left() + at as f32 * wave.width();
+        let chosen = usize::from(slice.standing()).saturating_sub(1);
+        if let Some(from) = cuts.get(chosen) {
+            let to = cuts.get(chosen + 1).copied().unwrap_or(1.0);
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(x_of(*from), strip.top() + 1.0),
+                    egui::pos2(x_of(to), strip.bottom() - 1.0),
+                ),
+                0.0,
+                alpha.focus.color.gamma_multiply(0.12),
+            );
+        }
+        let file = self.sample_data.as_ref().filter(|data| {
+            device.and_then(|device| device.sample.as_deref()) == Some(data.path.as_path())
+        });
+        let mid = wave.center().y;
+        let half = wave.height() * 0.5;
+        match file {
+            Some(data) => {
+                let columns = wave.width().max(1.0) as usize;
+                let bins = data.peaks.columns(None, 0.0, 1.0, columns);
+                let per = wave.width() / columns as f32;
+                for (i, bin) in bins.iter().enumerate() {
+                    let x = wave.left() + (i as f32 + 0.5) * per;
+                    let reach = bin.max.abs().max(bin.min.abs()).clamp(0.0, 1.0) * half;
+                    let rms = bin.rms.clamp(0.0, 1.0) * half;
+                    painter.line_segment(
+                        [egui::pos2(x, mid - reach), egui::pos2(x, mid + reach)],
+                        egui::Stroke::new(1.0, alpha.edge.color),
+                    );
+                    if rms >= 0.5 {
+                        painter.line_segment(
+                            [egui::pos2(x, mid - rms), egui::pos2(x, mid + rms)],
+                            egui::Stroke::new(per.max(1.0), alpha.ink.color),
+                        );
+                    }
+                }
+            }
+            None => {
+                painter.line_segment(
+                    [egui::pos2(wave.left(), mid), egui::pos2(wave.right(), mid)],
+                    egui::Stroke::new(1.0, alpha.edge.color),
+                );
+            }
+        }
+        for (index, at) in cuts.iter().enumerate() {
+            let x = x_of(*at);
+            let on = index == chosen;
+            painter.line_segment(
+                [
+                    egui::pos2(x, strip.top() + 1.0),
+                    egui::pos2(x, strip.bottom() - 1.0),
+                ],
+                egui::Stroke::new(
+                    1.0,
+                    if on {
+                        alpha.focus.color
+                    } else {
+                        alpha.ink.color
+                    },
+                ),
+            );
+        }
+        painter.text(
+            egui::pos2(wave.left() + 3.0, wave.top()),
+            egui::Align2::LEFT_TOP,
+            format!("S{:02}", chosen + 1),
+            egui::FontId::monospace(10.0),
+            alpha.focus.color,
+        );
+    }
+
+    /// One slider: the parameter's name, its range as a rail with the
+    /// knob's position marked hollow, and — when the trig holds a lock
+    /// — the lock marked solid in the live ink with the span from knob
+    /// to lock drawn heavy, so the override reads as a DISTANCE from
+    /// the setting and not merely as a second dot. The value at the
+    /// right is the lock's when there is one, the knob's when not.
+    fn draw_lock_row(&self, painter: &egui::Painter, row: egui::Rect, lock: &LockRow, on: bool) {
+        let alpha = self.alphabet();
+        let ink = if on {
+            alpha.focus.color
+        } else {
+            alpha.ink.color
+        };
+        painter.text(
+            egui::pos2(row.left() + 14.0, row.center().y),
+            egui::Align2::LEFT_CENTER,
+            if lock.prefix.is_empty() {
+                lock.label.name.to_uppercase()
+            } else {
+                format!("{} {}", lock.prefix, lock.label.name)
+                    .to_uppercase()
+                    .chars()
+                    .take(15)
+                    .collect()
+            },
+            egui::FontId::monospace(12.0),
+            ink,
+        );
+        let y = row.center().y;
+        let rail_l = row.left() + 128.0;
+        let rail_r = row.right() - 92.0;
+        if rail_r - rail_l < 20.0 {
+            return;
+        }
+        let at = |value: f32| egui::pos2(rail_l + (rail_r - rail_l) * lock.fraction(value), y);
+        let mut marks = Vec::new();
+        circuit::trace(
+            &mut marks,
+            &[egui::pos2(rail_l, y), egui::pos2(rail_r, y)],
+            Weight::Hair,
+            alpha.edge.color,
+        );
+        circuit::pad(
+            &mut marks,
+            at(lock.knob),
+            circuit::PAD - 1.0,
+            alpha.edge.color,
+            false,
+        );
+        if let Some(held) = lock.lock {
+            circuit::trace(
+                &mut marks,
+                &[at(lock.knob), at(held)],
+                Weight::Heavy,
+                alpha.live.color,
+            );
+            circuit::pad(&mut marks, at(held), circuit::PAD, alpha.live.color, true);
+        }
+        painter.extend(marks);
+        let (value, value_ink) = match lock.lock {
+            Some(held) => (held, alpha.live.color),
+            None => (lock.knob, alpha.edge.color),
+        };
+        painter.text(
+            egui::pos2(row.right() - 4.0, y),
+            egui::Align2::RIGHT_CENTER,
+            chain::format_param(lock.def, lock.label, value),
+            egui::FontId::monospace(11.0),
+            value_ink,
+        );
     }
 
     /// The tray with nothing in it: the deck's dormant face. A sigil
@@ -2613,7 +4060,9 @@ impl Stage {
                 if plaque.height() < 40.0 {
                     return;
                 }
-                circuit::panel_frame_variant(out, plaque, Weight::Hair, edge, 2);
+                // The plaque is the tray's own casing while nothing is in
+                // it, so it carries the frame weight rather than a rule's.
+                circuit::panel_frame_variant(out, plaque, Weight::Heavy, edge, 2);
                 let c = plaque.center();
                 let side = plaque.height() * 0.7;
                 Sign::Dipper.paint(
@@ -2667,8 +4116,8 @@ impl Stage {
         }
         let margin = design::px(design::space::ROOM);
         let gap = column_gap();
-        let head_h = design::px(design::space::OPEN);
-        let pitch = design::px(design::space::ROOM);
+        let head_h = CHAIN_HEAD_H;
+        let pitch = CHAIN_PITCH;
         let body_top = tray.min.y + head_h;
         let rows_shown = chain::rows_that_fit(tray.max.y - margin - body_top, pitch);
         let cursor = lattice.cursor();
@@ -2676,7 +4125,7 @@ impl Stage {
             .iter()
             .enumerate()
             .take_while(|(index, _)| {
-                tray.min.x + margin + (*index + 1) as f32 * TRACK_W + *index as f32 * gap
+                tray.min.x + margin + (*index + 1) as f32 * CHAIN_W + *index as f32 * gap
                     <= tray.max.x
             })
             .collect();
@@ -2693,9 +4142,9 @@ impl Stage {
         for pair in visible.windows(2) {
             let (left_index, _) = pair[0];
             let (right_index, right) = pair[1];
-            let left_x = tray.min.x + margin + left_index as f32 * (TRACK_W + gap);
-            let right_x = tray.min.x + margin + right_index as f32 * (TRACK_W + gap);
-            let from = egui::pos2(left_x + TRACK_W, signal_y);
+            let left_x = tray.min.x + margin + left_index as f32 * (CHAIN_W + gap);
+            let right_x = tray.min.x + margin + right_index as f32 * (CHAIN_W + gap);
+            let from = egui::pos2(left_x + CHAIN_W, signal_y);
             let to = egui::pos2(right_x, signal_y);
             let path = if right.bypassed {
                 let lift = gap.min(8.0);
@@ -2725,10 +4174,10 @@ impl Stage {
         }
 
         for (index, column) in visible {
-            let x = tray.min.x + margin + index as f32 * (TRACK_W + gap);
+            let x = tray.min.x + margin + index as f32 * (CHAIN_W + gap);
             let card = egui::Rect::from_min_max(
                 egui::pos2(x, tray.top()),
-                egui::pos2(x + TRACK_W, tray.bottom() - margin),
+                egui::pos2(x + CHAIN_W, tray.bottom() - margin),
             );
             self.draw_chain_card(
                 painter,
@@ -2840,7 +4289,7 @@ impl Stage {
             painter.text(
                 egui::pos2(head.left() + 30.0, head.bottom() - 5.0),
                 egui::Align2::LEFT_BOTTOM,
-                fit_cells(sample, 12),
+                fit_cells(sample, 24),
                 row_font.clone(),
                 family_ink,
             );
@@ -2900,13 +4349,19 @@ impl Stage {
             let Some(row) = column.rows.get(row_offset + line) else {
                 break;
             };
+            // The row: in from the family rail, and short of the right
+            // edge by a real margin, so the value never touches the
+            // casing and the cursor's brackets have room to sit.
             let rect = egui::Rect::from_min_size(
-                egui::pos2(card.left() + 31.0, body_top + line as f32 * pitch),
-                egui::vec2(card.width() - 37.0, pitch),
+                egui::pos2(card.left() + 36.0, body_top + line as f32 * pitch),
+                egui::vec2(card.width() - 48.0, pitch),
             );
             let on_row = cursor == Some((index, row_offset + line));
             if on_row {
-                painter.rect_filled(rect, 0.0, alpha.edge.color);
+                // The cursor row is the brightest thing on the card:
+                // ground-coloured words on the focus ink, so the row
+                // under the hand is never the hardest one to read.
+                painter.rect_filled(rect, 0.0, alpha.focus.color);
                 let mut shapes = Vec::new();
                 circuit::brackets(
                     &mut shapes,
@@ -2919,29 +4374,37 @@ impl Stage {
                     painter.add(shape);
                 }
             }
+            // Read at the ink, not the edge: a card is a table to be
+            // read, and a table in the structure rung is a table you
+            // lean into. A value moved off its default steps up once
+            // more, to the focus ink, so the edits are found at a glance.
             let value_ink = if on_row {
                 alpha.ground.color
             } else if row.edited {
-                alpha.ink.color
+                alpha.focus.color
             } else {
-                alpha.edge.color
+                alpha.ink.color
             };
             let name_ink = if on_row {
                 alpha.ground.color
             } else {
-                alpha.edge.color
+                alpha.ink.color
             };
             let value_w = painter
                 .layout_no_wrap(row.value.clone(), row_font.clone(), value_ink)
                 .rect
                 .width();
-            let gauge_w = 25.0;
+            // A value column wide enough for the longest word a row can
+            // say, so the gauges line up down the card instead of
+            // wandering with each value's length.
+            let value_col = (cell_w * 8.0).max(value_w);
+            let gauge_w = 44.0;
             let value_x = rect.right();
             let gauge = egui::Rect::from_center_size(
-                egui::pos2(value_x - value_w - gauge_w * 0.5 - 5.0, rect.center().y),
-                egui::vec2(gauge_w, 6.0),
+                egui::pos2(value_x - value_col - gauge_w * 0.5 - 10.0, rect.center().y),
+                egui::vec2(gauge_w, 7.0),
             );
-            let name_room = (gauge.left() - rect.left() - 4.0).max(cell_w);
+            let name_room = (gauge.left() - rect.left() - 8.0).max(cell_w);
             let name_cells = (name_room / cell_w).floor().max(1.0) as usize;
             painter.text(
                 egui::pos2(rect.left(), rect.center().y),
@@ -3006,6 +4469,7 @@ impl Stage {
     }
 
     fn draw_clip(&mut self, ui: &mut egui::Ui, tray: egui::Rect) {
+        self.trig_anchor = None;
         let Some(shown) = self.clip_in_view() else {
             self.draw_quiet_tray(ui.painter(), tray);
             return;
@@ -3026,8 +4490,13 @@ impl Stage {
             length_ticks: sequencer::pattern_length(&self.song, shown.pattern),
             notes: &notes,
             ghosts: &[],
+            slicing: self.slicing_track(shown.track),
         };
         let focused = self.inside.is_some() && self.browser.is_none();
+        // While the trig menu is up the sequencer is seen and not heard
+        // from: it keeps its cursor and its view, but the keys are the
+        // menu's, so its grammar must not consume them underneath.
+        let keys = focused && self.trig_menu.is_none();
 
         // The sequencer sits at the tray's left, inside the field's own
         // margin, and no wider than its natural width: a grid that
@@ -3046,7 +4515,7 @@ impl Stage {
         let playhead = self.playhead(shown);
         let outcome = self.sequencer.show(
             &mut child,
-            focused,
+            keys,
             grammar::Voice {
                 sentence: &mut self.sentence,
                 registers: &mut self.registers,
@@ -3057,6 +4526,7 @@ impl Stage {
             self.polarity,
             playhead,
         );
+        self.trig_anchor = outcome.cursor_rect;
         if focused {
             self.apply_sequence(shown.pattern, &outcome.intents);
             // The level under the cursor mirrors the sequencer's step, so
@@ -3516,7 +4986,10 @@ impl Stage {
                 egui::Id::new(("stage-head-codex-number", index)),
                 egui::Rect::from_center_size(
                     egui::pos2(
-                        rect.right() - pad - block::width(&number, block::unit::MICRO) - 8.0,
+                        rect.right()
+                            - pad
+                            - block::measure(painter, &number, block::unit::MICRO)
+                            - 8.0,
                         rect.bottom() - 9.0,
                     ),
                     egui::Vec2::splat(9.0),
@@ -3717,11 +5190,15 @@ impl Stage {
         let rail_bottom = field.bottom() - margin;
         let tracks = self.strip_window(field);
         let mut rail_shapes = Vec::new();
-        circuit::rail(
+        // The spine: the one rail every track hangs off, so it is the
+        // one rail on the board drawn heavy. The elbows that reach it
+        // stay hairlines — they connect, the spine carries.
+        circuit::rail_weighted(
             &mut rail_shapes,
             egui::pos2(seam, rail_top),
             egui::pos2(seam, rail_bottom),
             &[0.0, 1.0],
+            Weight::Heavy,
             alpha.edge.color,
         );
         for (slot, _) in tracks.clone().enumerate() {
@@ -3763,6 +5240,8 @@ impl Stage {
                 switches: false,
                 level: self.meters.master().level,
                 peak: self.meters.master().peak,
+                sends: [None; crate::sequencing::ReturnTrack::MAX],
+                is_return: false,
             },
             design::px(design::space::SNUG),
             alpha,
@@ -3799,6 +5278,7 @@ impl Stage {
         }
         let bottom = field.max.y - margin;
         let channels = mixer::channels(&self.song, &self.meters.readings());
+        let shown = tracks.len();
         for (slot, track) in tracks.enumerate() {
             let Some(channel) = channels.get(track) else {
                 continue;
@@ -3806,6 +5286,27 @@ impl Stage {
             let head = Self::head_rect(field, slot);
             let strip = mixer::strip_beneath(head, bottom, gap);
             mixer::draw(painter, strip, channel, inner, self.alphabet(), track as u8);
+        }
+        // The returns, after the last shown track and before the master,
+        // as far as they fit: a return the strip has no column for is
+        // simply not drawn this frame rather than drawn over something.
+        let master = Self::master_rect(field);
+        for (index, ret) in mixer::returns(&self.song).iter().enumerate() {
+            let head = Self::head_rect(field, shown + index);
+            if head.right() > master.left() - gap {
+                break;
+            }
+            let variant = (8 + index) as u8;
+            mixer::draw_return_head(painter, head, ret, self.alphabet(), variant);
+            let strip = mixer::strip_beneath(head, bottom, gap);
+            mixer::draw(
+                painter,
+                strip,
+                &ret.channel,
+                inner,
+                self.alphabet(),
+                variant,
+            );
         }
     }
 
@@ -4039,6 +5540,172 @@ impl Stage {
     /// left end of the vitals strip — a constant home the eye learns once;
     /// at the root the strip is simply empty, which itself reads as "top
     /// level, all quiet".
+    /// The stream screen: a dark pane set into the vitals strip that
+    /// states the stream's facts in figures rather than words — the
+    /// codex's numerals for the rate, a row of bits for the buffer, a
+    /// gauge for the latency, pads for the channels, and the backend's
+    /// seal. Read once it is learned, and legible at a glance as "the
+    /// deck's own instruments" before then. It is a SCREEN, so it is the
+    /// one recess on a strip that is otherwise all surface, and it
+    /// carries the strip's chamfer so it reads as fitted. Everything in
+    /// it is drawn at a scale taken from the pane's height, so the pane
+    /// can be made larger or smaller and its figures keep their places.
+    fn draw_stream(&self, painter: &egui::Painter, screen: egui::Rect, phase: Phase) {
+        if screen.width() < 80.0 || screen.height() < 16.0 {
+            return;
+        }
+        // One unit of the pane: its height over the height the figures
+        // were drawn for.
+        let k = screen.height() / 30.0;
+        let alpha = self.alphabet();
+        let stream = self.vitals.stream().copied();
+        let running = self.vitals.running();
+        let facts = stream.map(|s| {
+            (
+                s.sample_rate,
+                s.buffer_frames,
+                s.latency_frames,
+                s.inputs,
+                s.outputs,
+                s.backend,
+            )
+        });
+        kit::cached(
+            painter,
+            egui::Id::new("stage-stream-screen"),
+            screen,
+            (alpha.ground.color, alpha.edge.color, alpha.ink.color, facts),
+            |out| {
+                circuit::panel_variant(
+                    out,
+                    screen,
+                    Some(alpha.ground.color),
+                    alpha.surface.color,
+                    Some((Weight::Hair, alpha.edge.color)),
+                    2,
+                );
+                let inner = screen.shrink2(egui::vec2(10.0 * k, 5.0 * k));
+                let y = inner.center().y;
+                let mut x = inner.left();
+                // The engine's own sign opens the line.
+                Sign::Engine.paint(
+                    out,
+                    egui::Rect::from_center_size(
+                        egui::pos2(x + 7.0 * k, y),
+                        egui::Vec2::splat(14.0 * k),
+                    ),
+                    Weight::Hair,
+                    alpha.ink.color,
+                );
+                x += 22.0 * k;
+                let Some(stream) = stream else {
+                    // No stream: the screen is lit and empty, one hollow
+                    // pad where the facts would begin.
+                    circuit::pad(
+                        out,
+                        egui::pos2(x + 4.0 * k, y),
+                        circuit::PAD * k,
+                        alpha.edge.color,
+                        false,
+                    );
+                    return;
+                };
+                // The rate, in the codex's numerals, as kilohertz: two or
+                // three figures, no unit — the unit is the position.
+                let khz = (stream.sample_rate / 1000).min(999);
+                let digits: Vec<u8> = khz.to_string().bytes().map(|b| b - b'0').collect();
+                for digit in digits {
+                    Sign::Numeral(digit).paint(
+                        out,
+                        egui::Rect::from_center_size(
+                            egui::pos2(x + 5.0 * k, y),
+                            egui::Vec2::splat(11.0 * k),
+                        ),
+                        Weight::Hair,
+                        alpha.ink.color,
+                    );
+                    x += 12.0 * k;
+                }
+                x += 6.0 * k;
+                circuit::via(out, egui::pos2(x, y), alpha.edge.color, alpha.ground.color);
+                x += 8.0 * k;
+                // The buffer, in binary: twelve bits, which reach 4096
+                // frames, every value the device could plausibly open.
+                let unit = 3.0 * k;
+                circuit::binary(
+                    out,
+                    egui::pos2(x, y - unit * 0.5),
+                    unit,
+                    stream.buffer_frames.min(4095),
+                    12,
+                    alpha.ink.color,
+                );
+                x += 12.0 * (unit + 1.0) + 6.0 * k;
+                circuit::via(out, egui::pos2(x, y), alpha.edge.color, alpha.ground.color);
+                x += 8.0 * k;
+                // The latency, as a gauge over forty milliseconds: unlit
+                // when the device will not say.
+                let gauge = egui::Rect::from_min_size(
+                    egui::pos2(x, y - 3.0 * k),
+                    egui::vec2(40.0 * k, 6.0 * k),
+                );
+                let lit = stream
+                    .latency_ms()
+                    .map_or(0.0, |ms| (ms / 40.0).clamp(0.0, 1.0));
+                circuit::tick_bar(out, gauge, 8, lit, alpha.ink.color, alpha.edge.color, true);
+                x += 46.0 * k;
+                circuit::via(out, egui::pos2(x, y), alpha.edge.color, alpha.ground.color);
+                x += 8.0 * k;
+                // The channels: a row of hollow pads for what comes in
+                // above a row of filled pads for what goes out.
+                for (row, (count, filled)) in [(stream.inputs, false), (stream.outputs, true)]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let py = y - 3.0 * k + row as f32 * 6.0 * k;
+                    for n in 0..count.min(8) {
+                        circuit::pad(
+                            out,
+                            egui::pos2(x + 2.0 * k + n as f32 * 5.0 * k, py),
+                            3.0 * k,
+                            alpha.ink.color,
+                            filled,
+                        );
+                    }
+                }
+                x += 8.0 * 5.0 * k + 4.0 * k;
+                // The backend's seal: a barcode cut from its name, so one
+                // backend always wears one mark.
+                let seal = egui::Rect::from_min_max(
+                    egui::pos2(x, y - 6.0 * k),
+                    egui::pos2(inner.right().max(x + 24.0 * k), y + 6.0 * k),
+                );
+                let mut rng = kit::Rng::seeded(("stream-seal", stream.backend));
+                circuit::barcode(out, seal, &mut rng, alpha.edge.color);
+            },
+        );
+        // The trace along the screen's foot: current, while the engine
+        // runs and the song rolls; a still hairline otherwise. The one
+        // moving thing on the strip, and it moves because the deck is.
+        let foot = [
+            egui::pos2(screen.left() + 8.0 * k, screen.bottom() - 3.0 * k),
+            egui::pos2(screen.right() - 8.0 * k, screen.bottom() - 3.0 * k),
+        ];
+        let mut marks = Vec::new();
+        if running && phase.rolling {
+            circuit::dashes(
+                &mut marks,
+                &foot,
+                phase.dash(),
+                Weight::Hair,
+                alpha.live_dim.color,
+            );
+        } else {
+            circuit::trace(&mut marks, &foot, Weight::Hair, alpha.edge.color);
+        }
+        painter.extend(marks);
+    }
+
     fn draw_breadcrumb(&self, painter: &egui::Painter, zone: egui::Rect) {
         const MINI_CELL: f32 = 5.0;
         const MINI_GAP: f32 = 1.0;
@@ -4382,20 +6049,14 @@ impl Stage {
             egui::pos2(frame.right() - 13.0, frame.bottom() - 78.0),
             egui::pos2(frame.right() - 3.0, frame.bottom() - 4.0),
         );
-        kit::cached(
+        // Drawn straight rather than through the mesh cache: a word on
+        // the atlas must not be frozen into a mesh the atlas can outgrow.
+        block::paint_vertical(
             painter,
-            egui::Id::new("stage-browser-archive-rail"),
-            rail_rect,
+            egui::pos2(rail_rect.left(), rail_rect.bottom()),
+            1.0,
+            "ARCHIVE",
             alpha.edge.color,
-            |out| {
-                block::text_vertical(
-                    out,
-                    egui::pos2(rail_rect.left(), rail_rect.bottom()),
-                    1.0,
-                    "ARCHIVE",
-                    alpha.edge.color,
-                );
-            },
         );
 
         // The surface's ONE mute flourish, and the only mark in this pane
@@ -4695,6 +6356,659 @@ impl Stage {
     /// actionable half, meanings at [`design::INK`]. Monospace does the
     /// alignment for free, which is most of why the whole stage is
     /// monospace.
+    // SAMPLE-EDITOR-DRAW-BEGIN
+    /// The cutting room. The field, whole, like the codebook: a casing
+    /// with the file's name and facts and the three page tabs across
+    /// the head; the waveform in a dark screen with the house chamfer,
+    /// three tones deep; the markers, the slices, the cursor; a minimap
+    /// of the whole file under it with the view's window drawn on;
+    /// the page's readouts along the foot; and the keys that page
+    /// answers to, in one line, last.
+    fn draw_sample_editor(&self, painter: &egui::Painter, field: egui::Rect, phase: Phase) {
+        use crate::params::sampler as sp;
+        let Some((editor, device)) = self.edited_sampler() else {
+            return;
+        };
+        let alpha = self.alphabet();
+        let data = self.sample_data.as_ref();
+        // The block face carries letters, digits and a few marks; a
+        // file name's underscores and dots read as spaces on it.
+        let name = device
+            .sample
+            .as_deref()
+            .and_then(|path| path.file_stem())
+            .map(|stem| {
+                stem.to_string_lossy()
+                    .to_uppercase()
+                    .replace(['_', '.'], " ")
+            })
+            .unwrap_or_else(|| "NO FILE".to_owned());
+        let seconds = data.map_or(0.0, SampleData::seconds);
+        let word = |at: f64| sample::time_word(at, seconds);
+
+        // ---- the casing
+        let panel = field.shrink2(egui::vec2(28.0, 22.0));
+        let inner = panel.shrink2(egui::vec2(24.0, 16.0));
+        kit::cached(
+            painter,
+            egui::Id::new("stage-sample-shell"),
+            panel,
+            (alpha.surface.color, alpha.ground.color, alpha.ink.color),
+            |out| {
+                circuit::panel_variant(
+                    out,
+                    panel,
+                    Some(alpha.surface.color),
+                    alpha.ground.color,
+                    Some((Weight::Heavy, alpha.ink.color)),
+                    2,
+                );
+                circuit::panel_frame_variant(
+                    out,
+                    panel.shrink(5.0),
+                    Weight::Hair,
+                    alpha.edge.color,
+                    1,
+                );
+            },
+        );
+
+        // ---- the head: sign, name, facts; the pages at the right
+        const HEAD_H: f32 = 48.0;
+        let head = egui::Rect::from_min_size(inner.min, egui::vec2(inner.width(), HEAD_H));
+        let mut marks = Vec::new();
+        Sign::Archive.paint(
+            &mut marks,
+            egui::Rect::from_center_size(
+                egui::pos2(head.left() + 10.0, head.top() + 11.0),
+                egui::Vec2::splat(20.0),
+            ),
+            Weight::Hair,
+            alpha.edge.color,
+        );
+        painter.extend(marks);
+        let shown_name: String = name.chars().take(28).collect();
+        block::paint(
+            painter,
+            egui::Id::new("stage-sample-title"),
+            egui::pos2(head.left() + 28.0, head.top()),
+            egui::Align2::LEFT_TOP,
+            block::unit::TITLE,
+            &shown_name,
+            alpha.ink.color,
+        );
+        let mode = sp::MODE_NAMES
+            .get(device.value(sp::MODE).round() as usize)
+            .copied()
+            .unwrap_or("?");
+        let facts = match data {
+            Some(data) => format!(
+                "{}  ·  {:.1}K  ·  {}CH  ·  {} SLICES  ·  {}",
+                word(1.0),
+                data.sample_rate as f32 / 1000.0,
+                data.channels,
+                device.slices.len(),
+                mode.to_uppercase()
+            ),
+            None => format!(
+                "LOADING  ·  {} SLICES  ·  {}",
+                device.slices.len(),
+                mode.to_uppercase()
+            ),
+        };
+        painter.text(
+            egui::pos2(head.left() + 28.0, head.top() + 28.0),
+            egui::Align2::LEFT_TOP,
+            facts,
+            egui::FontId::monospace(11.0),
+            alpha.edge.color,
+        );
+        // The pages: three words, the open one bracketed in the focus ink.
+        let mut x = head.right();
+        for page in SamplePage::ALL.iter().rev() {
+            let on = *page == editor.page;
+            let w = 62.0;
+            x -= w;
+            let tab = egui::Rect::from_min_size(
+                egui::pos2(x, head.top() + 2.0),
+                egui::vec2(w - 8.0, 20.0),
+            );
+            if on {
+                let mut marks = Vec::new();
+                circuit::brackets(&mut marks, tab, 5.0, Weight::Bold, alpha.focus.color);
+                painter.extend(marks);
+            }
+            painter.text(
+                tab.center(),
+                egui::Align2::CENTER_CENTER,
+                page.word(),
+                egui::FontId::monospace(12.0),
+                if on {
+                    alpha.focus.color
+                } else {
+                    alpha.edge.color
+                },
+            );
+        }
+
+        // ---- the foot: readouts and the keys
+        const FOOT_H: f32 = 56.0;
+        const KEYS_H: f32 = 16.0;
+        const MAP_H: f32 = 22.0;
+        let keys_line = egui::Rect::from_min_max(
+            egui::pos2(inner.left(), inner.bottom() - KEYS_H),
+            inner.right_bottom(),
+        );
+        let foot = egui::Rect::from_min_max(
+            egui::pos2(inner.left(), keys_line.top() - FOOT_H),
+            egui::pos2(inner.right(), keys_line.top() - 4.0),
+        );
+        let map = egui::Rect::from_min_max(
+            egui::pos2(inner.left(), foot.top() - MAP_H - 6.0),
+            egui::pos2(inner.right(), foot.top() - 6.0),
+        );
+        // The slice list takes a column on the right on the SLICE page.
+        let list_w = if editor.page == SamplePage::Slice {
+            118.0
+        } else {
+            0.0
+        };
+        let screen = egui::Rect::from_min_max(
+            egui::pos2(inner.left(), head.bottom() + 6.0),
+            egui::pos2(inner.right() - list_w, map.top() - 8.0),
+        );
+        if screen.height() < 40.0 || screen.width() < 80.0 {
+            return;
+        }
+
+        // ---- the screen
+        let mut marks = Vec::new();
+        circuit::panel_variant(
+            &mut marks,
+            screen,
+            Some(alpha.ground.color),
+            alpha.surface.color,
+            Some((Weight::Hair, alpha.edge.color)),
+            3,
+        );
+        painter.extend(marks);
+        let wave = screen.shrink2(egui::vec2(6.0, 14.0));
+        let x_of = |at: f64| -> f32 {
+            let t = if editor.view_span > 0.0 {
+                (at - editor.view_from) / editor.view_span
+            } else {
+                0.0
+            };
+            wave.left() + (t as f32) * wave.width()
+        };
+        let mid = wave.center().y;
+        let half = wave.height() * 0.5 * 0.94;
+        let start = f64::from(device.value(sp::START));
+        let end = f64::from(device.value(sp::END));
+        let (trim_a, trim_b) = if end > start {
+            (start, end)
+        } else {
+            (start, 1.0)
+        };
+        let loop_at = f64::from(device.value(sp::LOOP_START));
+        let visible = |at: f64| at >= editor.view_from - 1e-9 && at <= editor.view_to() + 1e-9;
+
+        // The centre line, first and faintest.
+        painter.line_segment(
+            [egui::pos2(wave.left(), mid), egui::pos2(wave.right(), mid)],
+            egui::Stroke::new(1.0, alpha.edge.color.gamma_multiply(0.6)),
+        );
+
+        match data {
+            Some(data) => {
+                // Outside the trim, the picture is a step dimmer: what
+                // the sampler will not play is still there to see, but
+                // it is not the subject.
+                let columns = wave.width().max(1.0) as usize;
+                let bins = data.peaks.columns(
+                    Some(&data.samples),
+                    editor.view_from,
+                    editor.view_to(),
+                    columns,
+                );
+                let per = wave.width() / columns as f32;
+                for (i, bin) in bins.iter().enumerate() {
+                    let x = wave.left() + (i as f32 + 0.5) * per;
+                    let at =
+                        editor.view_from + (i as f64 + 0.5) / columns as f64 * editor.view_span;
+                    let inside = at >= trim_a && at <= trim_b;
+                    let (outer, core) = if inside {
+                        (alpha.edge.color, alpha.ink.color)
+                    } else {
+                        (alpha.edge.color.gamma_multiply(0.55), alpha.edge.color)
+                    };
+                    // Tone one: the extremes, a hairline the full reach.
+                    let top = mid - bin.max.clamp(-1.0, 1.0) * half;
+                    let bottom = mid - bin.min.clamp(-1.0, 1.0) * half;
+                    painter.line_segment(
+                        [egui::pos2(x, top.min(mid)), egui::pos2(x, bottom.max(mid))],
+                        egui::Stroke::new(1.0, outer),
+                    );
+                    // Tone two: the density, a heavier bar over the RMS.
+                    let rms = bin.rms.clamp(0.0, 1.0) * half;
+                    if rms >= 0.5 {
+                        painter.line_segment(
+                            [egui::pos2(x, mid - rms), egui::pos2(x, mid + rms)],
+                            egui::Stroke::new(per.max(1.0), core),
+                        );
+                    }
+                    // Tone three: the crest, one bright point where the
+                    // extreme stands well past the density.
+                    if inside && bin.max - bin.rms > 0.35 {
+                        painter.rect_filled(
+                            egui::Rect::from_center_size(
+                                egui::pos2(x, top),
+                                egui::Vec2::splat(2.0),
+                            ),
+                            0.0,
+                            alpha.focus.color,
+                        );
+                    }
+                }
+            }
+            None => {
+                painter.text(
+                    wave.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "· · ·   READING THE FILE   · · ·",
+                    egui::FontId::monospace(12.0),
+                    alpha.edge.color,
+                );
+            }
+        }
+
+        // The audition: the range that is sounding, washed in the live ink.
+        if let Some((from, to)) = editor.playing {
+            let a = x_of(from.max(editor.view_from));
+            let b = x_of(to.min(editor.view_to()));
+            if b > a {
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(a, wave.top()),
+                        egui::pos2(b, wave.bottom()),
+                    ),
+                    0.0,
+                    alpha.live_dim.color.gamma_multiply(0.18),
+                );
+            }
+        }
+
+        // The slices: hairlines with their numbers, and the one under
+        // the cursor washed and numbered in the focus ink.
+        let under = editor.slice_at(device);
+        // Numbers are dropped, never overlapped: a slice whose number
+        // would land on the last one's keeps its line and loses its
+        // word, and the list on the SLICE page still names it.
+        let mut last_number_x = f32::NEG_INFINITY;
+        for (index, at) in device.slices.iter().enumerate() {
+            let next = device.slices.get(index + 1).copied().unwrap_or(1.0);
+            let on = under == Some(index);
+            if on {
+                let a = x_of(at.max(editor.view_from));
+                let b = x_of(next.min(editor.view_to()));
+                if b > a {
+                    painter.rect_filled(
+                        egui::Rect::from_min_max(
+                            egui::pos2(a, screen.top() + 2.0),
+                            egui::pos2(b, screen.bottom() - 2.0),
+                        ),
+                        0.0,
+                        alpha.focus.color.gamma_multiply(0.07),
+                    );
+                }
+            }
+            if !visible(*at) {
+                continue;
+            }
+            let x = x_of(*at);
+            let mut marks = Vec::new();
+            circuit::trace(
+                &mut marks,
+                &[
+                    egui::pos2(x, screen.top() + 2.0),
+                    egui::pos2(x, screen.bottom() - 2.0),
+                ],
+                Weight::Hair,
+                if on {
+                    alpha.focus.color
+                } else {
+                    alpha.ink.color
+                },
+            );
+            painter.extend(marks);
+            if on || x - last_number_x >= 18.0 {
+                painter.text(
+                    egui::pos2(x + 3.0, screen.top() + 3.0),
+                    egui::Align2::LEFT_TOP,
+                    format!("{:02}", index + 1),
+                    egui::FontId::monospace(10.0),
+                    if on {
+                        alpha.focus.color
+                    } else {
+                        alpha.edge.color
+                    },
+                );
+                last_number_x = x;
+            }
+        }
+
+        // The trim: brackets at the start and the end, heavy; the loop
+        // start dashed. Outside the trim, a wash so the excluded part
+        // reads as behind glass.
+        for (at, inward, label) in [(trim_a, 1.0f32, "S"), (trim_b, -1.0f32, "E")] {
+            if !visible(at) {
+                continue;
+            }
+            let x = x_of(at);
+            let mut marks = Vec::new();
+            circuit::trace(
+                &mut marks,
+                &[
+                    egui::pos2(x, screen.top() + 1.0),
+                    egui::pos2(x, screen.bottom() - 1.0),
+                ],
+                Weight::Heavy,
+                alpha.ink.color,
+            );
+            for y in [screen.top() + 1.0, screen.bottom() - 1.0] {
+                circuit::trace(
+                    &mut marks,
+                    &[egui::pos2(x, y), egui::pos2(x + inward * 9.0, y)],
+                    Weight::Heavy,
+                    alpha.ink.color,
+                );
+            }
+            painter.extend(marks);
+            painter.text(
+                egui::pos2(x + inward * 6.0, screen.bottom() - 4.0),
+                if inward > 0.0 {
+                    egui::Align2::LEFT_BOTTOM
+                } else {
+                    egui::Align2::RIGHT_BOTTOM
+                },
+                label,
+                egui::FontId::monospace(10.0),
+                alpha.ink.color,
+            );
+        }
+        if device.value(sp::LOOP_MODE).round() >= 1.0 && visible(loop_at) {
+            let x = x_of(loop_at);
+            let mut marks = Vec::new();
+            circuit::dashes(
+                &mut marks,
+                &[
+                    egui::pos2(x, screen.top() + 1.0),
+                    egui::pos2(x, screen.bottom() - 1.0),
+                ],
+                0.0,
+                Weight::Hair,
+                alpha.ink.color,
+            );
+            painter.extend(marks);
+            painter.text(
+                egui::pos2(x + 4.0, screen.bottom() - 4.0),
+                egui::Align2::LEFT_BOTTOM,
+                "L",
+                egui::FontId::monospace(10.0),
+                alpha.edge.color,
+            );
+        }
+
+        // The cursor: bold, in the focus ink, with its time at the head.
+        if visible(editor.cursor) {
+            let x = x_of(editor.cursor);
+            let mut marks = Vec::new();
+            circuit::trace(
+                &mut marks,
+                &[egui::pos2(x, screen.top()), egui::pos2(x, screen.bottom())],
+                Weight::Bold,
+                alpha.focus.color,
+            );
+            circuit::pad(
+                &mut marks,
+                egui::pos2(x, screen.top() + 4.0),
+                circuit::PAD,
+                alpha.focus.color,
+                true,
+            );
+            circuit::pad(
+                &mut marks,
+                egui::pos2(x, screen.bottom() - 4.0),
+                circuit::PAD,
+                alpha.focus.color,
+                true,
+            );
+            painter.extend(marks);
+            let text = if data.is_some() {
+                word(editor.cursor)
+            } else {
+                format!("{:.1}%", editor.cursor * 100.0)
+            };
+            let align = if x > screen.center().x {
+                egui::Align2::RIGHT_TOP
+            } else {
+                egui::Align2::LEFT_TOP
+            };
+            painter.text(
+                egui::pos2(
+                    x + if x > screen.center().x { -8.0 } else { 8.0 },
+                    screen.top() + 14.0,
+                ),
+                align,
+                text,
+                egui::FontId::monospace(11.0),
+                alpha.focus.color,
+            );
+        }
+
+        // ---- the slice list, on the SLICE page
+        if editor.page == SamplePage::Slice {
+            let list = egui::Rect::from_min_max(
+                egui::pos2(screen.right() + 8.0, screen.top()),
+                egui::pos2(inner.right(), screen.bottom()),
+            );
+            let mut marks = Vec::new();
+            circuit::panel_frame_variant(&mut marks, list, Weight::Hair, alpha.edge.color, 0);
+            painter.extend(marks);
+            block::paint(
+                painter,
+                egui::Id::new("stage-sample-list-title"),
+                egui::pos2(list.left() + 8.0, list.top() + 6.0),
+                egui::Align2::LEFT_TOP,
+                block::unit::MICRO,
+                "SLICES",
+                alpha.edge.color,
+            );
+            let row_h = 15.0;
+            let rows = ((list.height() - 26.0) / row_h).floor().max(0.0) as usize;
+            let total = device.slices.len();
+            let first = under
+                .map(|u| u.saturating_sub(rows / 2))
+                .unwrap_or(0)
+                .min(total.saturating_sub(rows));
+            for (shown, index) in (first..total.min(first + rows)).enumerate() {
+                let y = list.top() + 26.0 + shown as f32 * row_h;
+                let on = under == Some(index);
+                painter.text(
+                    egui::pos2(list.left() + 8.0, y),
+                    egui::Align2::LEFT_TOP,
+                    format!("{:02}  {}", index + 1, word(device.slices[index])),
+                    egui::FontId::monospace(11.0),
+                    if on {
+                        alpha.focus.color
+                    } else {
+                        alpha.ink.color
+                    },
+                );
+            }
+            if total == 0 {
+                painter.text(
+                    egui::pos2(list.left() + 8.0, list.top() + 26.0),
+                    egui::Align2::LEFT_TOP,
+                    "none yet",
+                    egui::FontId::monospace(11.0),
+                    alpha.edge.color,
+                );
+            }
+        }
+
+        // ---- the minimap: the whole file, and the window on it
+        let mut marks = Vec::new();
+        circuit::panel_frame_variant(&mut marks, map, Weight::Hair, alpha.edge.color, 2);
+        painter.extend(marks);
+        let map_wave = map.shrink2(egui::vec2(4.0, 3.0));
+        if let Some(data) = data {
+            let columns = map_wave.width().max(1.0) as usize;
+            let bins = data.peaks.columns(None, 0.0, 1.0, columns);
+            let per = map_wave.width() / columns as f32;
+            let mid = map_wave.center().y;
+            let half = map_wave.height() * 0.5;
+            for (i, bin) in bins.iter().enumerate() {
+                let x = map_wave.left() + (i as f32 + 0.5) * per;
+                let reach = bin.max.abs().max(bin.min.abs()).clamp(0.0, 1.0) * half;
+                painter.line_segment(
+                    [egui::pos2(x, mid - reach), egui::pos2(x, mid + reach)],
+                    egui::Stroke::new(1.0, alpha.edge.color),
+                );
+            }
+        }
+        for at in &device.slices {
+            let x = map_wave.left() + (*at as f32) * map_wave.width();
+            painter.line_segment(
+                [
+                    egui::pos2(x, map.top() + 1.0),
+                    egui::pos2(x, map.top() + 5.0),
+                ],
+                egui::Stroke::new(1.0, alpha.ink.color),
+            );
+        }
+        let window = egui::Rect::from_min_max(
+            egui::pos2(
+                map_wave.left() + editor.view_from as f32 * map_wave.width(),
+                map.top() + 1.0,
+            ),
+            egui::pos2(
+                map_wave.left() + editor.view_to() as f32 * map_wave.width(),
+                map.bottom() - 1.0,
+            ),
+        );
+        let mut marks = Vec::new();
+        circuit::brackets(&mut marks, window, 4.0, Weight::Heavy, alpha.focus.color);
+        painter.extend(marks);
+        let cursor_x = map_wave.left() + editor.cursor as f32 * map_wave.width();
+        painter.line_segment(
+            [
+                egui::pos2(cursor_x, map.top() + 2.0),
+                egui::pos2(cursor_x, map.bottom() - 2.0),
+            ],
+            egui::Stroke::new(1.0, alpha.focus.color),
+        );
+
+        // ---- the readouts, per page
+        let value_of = |param: u32| -> String {
+            let spec = device.kind.spec();
+            spec.params
+                .iter()
+                .zip(spec.labels)
+                .find(|(def, _)| def.id == param)
+                .map(|(def, label)| chain::format_param(def, label, device.value(param)))
+                .unwrap_or_default()
+        };
+        let readouts: Vec<(&str, String)> = match editor.page {
+            SamplePage::Trim => vec![
+                ("START", word(start)),
+                ("END", word(if end > start { end } else { 1.0 })),
+                ("LOOP", word(loop_at)),
+                ("LOOP MODE", value_of(sp::LOOP_MODE).to_uppercase()),
+                ("FADE IN", value_of(sp::FADE_IN)),
+                ("FADE OUT", value_of(sp::FADE_OUT)),
+            ],
+            SamplePage::Slice => vec![
+                ("SLICES", device.slices.len().to_string()),
+                ("GRID", editor.count.to_string()),
+                ("ONSETS", format!("{:.0}%", editor.sensitivity * 100.0)),
+                ("SNAP", if editor.snap { "ZERO" } else { "FREE" }.to_owned()),
+                ("MODE", mode.to_uppercase()),
+                ("CHOKE", value_of(sp::CHOKE).to_uppercase()),
+            ],
+            SamplePage::Attr => vec![
+                ("GAIN", value_of(sp::GAIN)),
+                ("TUNE", value_of(sp::TUNE)),
+                ("ROOT", value_of(sp::ROOT)),
+                (
+                    "REVERSE",
+                    if device.value(sp::REVERSE).round() >= 1.0 {
+                        "ON"
+                    } else {
+                        "OFF"
+                    }
+                    .to_owned(),
+                ),
+                ("MODE", mode.to_uppercase()),
+                ("LOOP MODE", value_of(sp::LOOP_MODE).to_uppercase()),
+            ],
+        };
+        let cell_w = foot.width() / readouts.len().max(1) as f32;
+        for (index, (label, value)) in readouts.iter().enumerate() {
+            let cell = egui::Rect::from_min_size(
+                egui::pos2(foot.left() + index as f32 * cell_w, foot.top()),
+                egui::vec2(cell_w - 6.0, foot.height()),
+            );
+            let mut marks = Vec::new();
+            circuit::panel_frame_variant(
+                &mut marks,
+                cell,
+                Weight::Hair,
+                alpha.edge.color,
+                (index % 4) as u8,
+            );
+            painter.extend(marks);
+            block::paint(
+                painter,
+                egui::Id::new(("stage-sample-readout", index, *label)),
+                egui::pos2(cell.left() + 8.0, cell.top() + 7.0),
+                egui::Align2::LEFT_TOP,
+                block::unit::MICRO,
+                label,
+                alpha.edge.color,
+            );
+            painter.text(
+                egui::pos2(cell.left() + 8.0, cell.bottom() - 7.0),
+                egui::Align2::LEFT_BOTTOM,
+                value,
+                egui::FontId::monospace(13.0),
+                alpha.ink.color,
+            );
+        }
+
+        // ---- the keys this page answers to
+        let keys = match editor.page {
+            SamplePage::Trim => {
+                "S START  E END  L LOOP  Z SNAP  P PLAY  +P ALL  UP/DOWN ZOOM  PGUP/PGDN SCROLL  ^ARROWS MARKERS  TAB PAGE  ESC OUT"
+            }
+            SamplePage::Slice => {
+                "ENTER CUT  DEL REMOVE  G GRID  +/- GRID SIZE  T ONSETS  [ ] SENSITIVITY  C CLEAR  P PLAY SLICE  TAB PAGE"
+            }
+            SamplePage::Attr => {
+                "N NORMALIZE  +/- GAIN  R REVERSE  M MODE  Q LOOP MODE  P PLAY  ^Z UNDO  TAB PAGE  ESC OUT"
+            }
+        };
+        painter.text(
+            keys_line.left_center(),
+            egui::Align2::LEFT_CENTER,
+            keys,
+            egui::FontId::monospace(10.0),
+            alpha.edge.color,
+        );
+        let _ = phase;
+    }
+    // SAMPLE-EDITOR-DRAW-END
+
     fn draw_help(&self, painter: &egui::Painter, field: egui::Rect) {
         let scope = self.scope_context();
         let mut rows: Vec<(String, &'static str)> = keymap::bindings_for(scope)
@@ -5290,6 +7604,857 @@ mod tests {
         id
     }
 
+    /// ^R asks the library for a fresh scan: the shelf says so while it
+    /// waits, and the ask is counted so it reads as a change.
+    #[test]
+    fn a_rescan_is_asked_for_and_the_shelf_says_so() {
+        let mut stage = Stage::new();
+        stage.library_scanning = false;
+        assert_eq!(command(&mut stage, Key::R), ApplyOutcome::Changed);
+        assert!(stage.library_scanning);
+        assert_eq!(stage.library_generation, 1);
+        let _ = command(&mut stage, Key::F);
+        assert_eq!(command(&mut stage, Key::R), ApplyOutcome::Changed);
+        assert_eq!(stage.library_generation, 2);
+        assert_eq!(
+            stage
+                .browser
+                .as_ref()
+                .expect("browser")
+                .status_of(Shelf::Samples),
+            BrowserStatus::Scanning
+        );
+    }
+
+    /// Only one cursor is focus-bright: while the band holds the keys
+    /// the session's cursor rests, and it comes back bright when the
+    /// band closes.
+    #[test]
+    fn the_session_cursor_rests_while_the_band_holds_the_keys() {
+        let mut stage = Stage::new();
+        stage
+            .song
+            .add_device(0, crate::devices::DeviceKind::Sat)
+            .expect("effect");
+        let bright = stage.session_lattice().map(|(_, shade)| shade);
+        assert_eq!(bright, Some(stage.focused()));
+        assert_eq!(command(&mut stage, Key::D), ApplyOutcome::Changed);
+        let resting = stage.session_lattice().map(|(_, shade)| shade);
+        assert_eq!(
+            resting,
+            Some(stage.resting()),
+            "two cursors were bright at once"
+        );
+        assert_eq!(
+            drive(&mut stage, &[Key::Escape]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(stage.session_lattice().map(|(_, shade)| shade), bright);
+    }
+
+    /// Walking from a long device onto a short one brings the row back
+    /// inside the short one's list, and the arrows then turn a real
+    /// parameter rather than refusing at nothing.
+    #[test]
+    fn the_band_row_stays_inside_the_device_under_the_cursor() {
+        let mut stage = Stage::new();
+        stage
+            .song
+            .add_device(0, crate::devices::DeviceKind::Poly)
+            .expect("instrument");
+        let sat = stage
+            .song
+            .add_device(0, crate::devices::DeviceKind::Sat)
+            .expect("effect");
+        let sat_rows = crate::devices::DeviceKind::Sat.spec().params.len();
+        assert_eq!(command(&mut stage, Key::D), ApplyOutcome::Changed);
+        for _ in 0..sat_rows + 4 {
+            let _ = drive(&mut stage, &[Key::ArrowDown]);
+        }
+        assert_eq!(drive(&mut stage, &[Key::Tab]), vec![ApplyOutcome::Changed]);
+        assert_eq!(
+            stage.chain.as_ref().and_then(FocusLattice::cursor),
+            Some((1, sat_rows - 1)),
+            "the row pointed past the device's list"
+        );
+        let before = stage.song.device(sat).expect("sat").clone();
+        assert_eq!(
+            drive(&mut stage, &[Key::ArrowRight]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_ne!(
+            stage.song.device(sat).expect("sat"),
+            &before,
+            "the arrow turned nothing"
+        );
+    }
+
+    /// A sampler with a file on track one, and the editor up over it.
+    fn into_sample_editor(stage: &mut Stage) -> crate::sequencing::DeviceId {
+        let id = stage
+            .song
+            .add_device(0, crate::devices::DeviceKind::Sampler)
+            .expect("a sampler on the track");
+        stage.song.device_mut(id).expect("the device").sample =
+            Some(PathBuf::from("/tmp/nowhere/break.wav"));
+        assert_eq!(command(stage, Key::E), ApplyOutcome::Changed);
+        assert_eq!(stage.scope_context(), keymap::ScopeContext::Sample);
+        id
+    }
+
+    /// A synthesized file handed to the stage, the way the host would:
+    /// a tenth of a second of a decaying tone with a hard onset, at
+    /// forty-eight kilohertz.
+    fn synthetic_sample(path: &str) -> SampleData {
+        // Struck twice: at the head, and again halfway, so there is an
+        // onset for the detector to find beyond the file's own start.
+        let frames = 4_800usize;
+        let samples: Vec<f32> = (0..frames)
+            .map(|i| {
+                let k = (i % 2_400) as f32;
+                let t = k / 48_000.0;
+                let env = (-t * 30.0).exp();
+                0.5 * env * (t * 220.0 * std::f32::consts::TAU).sin()
+            })
+            .collect();
+        SampleData::from_planar(
+            PathBuf::from(path),
+            std::sync::Arc::new(samples),
+            1,
+            frames as u64,
+            48_000,
+        )
+    }
+
+    /// The editor opens only over a sampler that has a file: a bare
+    /// track refuses as empty, a sampler with nothing loaded as empty,
+    /// and once open the scope is the editor's until Escape.
+    #[test]
+    fn the_cutting_room_opens_over_a_loaded_sampler_and_nowhere_else() {
+        let mut stage = Stage::new();
+        assert!(matches!(
+            command(&mut stage, Key::E),
+            ApplyOutcome::Refused(Refusal {
+                reason: RefusalReason::Empty,
+                ..
+            })
+        ));
+        let id = stage
+            .song
+            .add_device(0, crate::devices::DeviceKind::Sampler)
+            .expect("a sampler");
+        assert!(matches!(
+            command(&mut stage, Key::E),
+            ApplyOutcome::Refused(Refusal {
+                reason: RefusalReason::Empty,
+                ..
+            })
+        ));
+        stage.song.device_mut(id).expect("device").sample = Some(PathBuf::from("/x/break.wav"));
+        assert_eq!(command(&mut stage, Key::E), ApplyOutcome::Changed);
+        assert_eq!(stage.scope_context(), keymap::ScopeContext::Sample);
+        assert_eq!(
+            stage.wanted_sample(),
+            Some(Path::new("/x/break.wav")),
+            "the editor did not ask for its file"
+        );
+        assert_eq!(
+            drive(&mut stage, &[Key::Escape]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(stage.sample, None);
+        assert!(
+            stage.take_audition_stop(),
+            "leaving did not stop the audition"
+        );
+    }
+
+    /// The cursor and the view answer the keys: Right steps, Up zooms
+    /// about the cursor, Tab turns the page, and an end is refused.
+    #[test]
+    fn the_cutting_rooms_cursor_and_view_answer_the_keys() {
+        let mut stage = Stage::new();
+        into_sample_editor(&mut stage);
+        let at = |stage: &Stage| stage.sample.as_ref().expect("editor").clone();
+        assert_eq!(at(&stage).cursor, 0.0);
+        assert_eq!(
+            drive(&mut stage, &[Key::ArrowRight]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert!(at(&stage).cursor > 0.0);
+        assert!(matches!(
+            drive(&mut stage, &[Key::ArrowLeft, Key::ArrowLeft]).as_slice(),
+            [ApplyOutcome::Changed, ApplyOutcome::Refused(_)]
+        ));
+        assert_eq!(
+            drive(&mut stage, &[Key::ArrowUp]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert!(at(&stage).view_span < 1.0, "up did not zoom");
+        assert_eq!(
+            drive(&mut stage, &[Key::ArrowDown]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(at(&stage).view_span, 1.0);
+        assert_eq!(drive(&mut stage, &[Key::Tab]), vec![ApplyOutcome::Changed]);
+        assert_eq!(at(&stage).page, SamplePage::Slice);
+        assert_eq!(
+            drive(&mut stage, &[Key::Tab, Key::Tab]),
+            vec![ApplyOutcome::Changed, ApplyOutcome::Changed]
+        );
+        assert_eq!(at(&stage).page, SamplePage::Trim);
+    }
+
+    /// Markers land on the device as its own parameters, in fractions:
+    /// S sets the start where the cursor stands, E the end, L the loop.
+    #[test]
+    fn trim_markers_land_on_the_samplers_parameters() {
+        use crate::params::sampler as sp;
+        let mut stage = Stage::new();
+        let id = into_sample_editor(&mut stage);
+        // Free placement: with no file to walk, snap has nothing to do.
+        for _ in 0..8 {
+            let _ = drive(&mut stage, &[Key::ArrowRight]);
+        }
+        let cursor = stage.sample.as_ref().expect("editor").cursor;
+        assert_eq!(drive(&mut stage, &[Key::S]), vec![ApplyOutcome::Changed]);
+        let device = stage.song.device(id).expect("device");
+        assert!((f64::from(device.value(sp::START)) - cursor).abs() < 1e-6);
+        for _ in 0..8 {
+            let _ = drive(&mut stage, &[Key::ArrowRight]);
+        }
+        assert_eq!(
+            drive(&mut stage, &[Key::E, Key::L]),
+            vec![ApplyOutcome::Changed; 2]
+        );
+        let device = stage.song.device(id).expect("device");
+        assert!(device.value(sp::END) > device.value(sp::START));
+        assert_eq!(device.value(sp::LOOP_START), device.value(sp::END));
+    }
+
+    /// Slices: Enter cuts at the cursor and puts the sampler in slice
+    /// mode; G lays a grid of the count, +/- change the count on the
+    /// SLICE page; Delete removes the nearest; C clears and the mode
+    /// returns to classic. Every table starts at the head of the file.
+    #[test]
+    fn slices_are_cut_gridded_removed_and_cleared() {
+        use crate::params::sampler as sp;
+        let mut stage = Stage::new();
+        let id = into_sample_editor(&mut stage);
+        let slices = |stage: &Stage| stage.song.device(id).expect("device").slices.clone();
+        for _ in 0..16 {
+            let _ = drive(&mut stage, &[Key::ArrowRight]);
+        }
+        assert_eq!(
+            drive(&mut stage, &[Key::Enter]),
+            vec![ApplyOutcome::Changed]
+        );
+        let cut = slices(&stage);
+        assert_eq!(
+            cut.len(),
+            2,
+            "a first cut did not also mark the head: {cut:?}"
+        );
+        assert_eq!(cut[0], 0.0);
+        assert!(cut[1] > 0.0);
+        assert_eq!(
+            stage.song.device(id).expect("device").value(sp::MODE),
+            sp::MODE_SLICE,
+            "cutting did not put the sampler in slice mode"
+        );
+        assert!(matches!(
+            drive(&mut stage, &[Key::Enter]).as_slice(),
+            [ApplyOutcome::Refused(_)]
+        ));
+
+        assert_eq!(drive(&mut stage, &[Key::Tab]), vec![ApplyOutcome::Changed]);
+        assert_eq!(
+            drive(
+                &mut stage,
+                &[Key::Minus, Key::Minus, Key::Minus, Key::Minus]
+            ),
+            vec![ApplyOutcome::Changed; 4]
+        );
+        assert_eq!(stage.sample.as_ref().expect("editor").count, 12);
+        assert_eq!(drive(&mut stage, &[Key::G]), vec![ApplyOutcome::Changed]);
+        let grid = slices(&stage);
+        assert_eq!(grid.len(), 12);
+        assert!((grid[6] - 0.5).abs() < 1e-9);
+
+        assert_eq!(
+            drive(&mut stage, &[Key::Delete]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(slices(&stage).len(), 11);
+        assert_eq!(drive(&mut stage, &[Key::C]), vec![ApplyOutcome::Changed]);
+        assert!(slices(&stage).is_empty());
+        assert_eq!(
+            stage.song.device(id).expect("device").value(sp::MODE),
+            sp::MODE_CLASSIC
+        );
+        assert!(matches!(
+            drive(&mut stage, &[Key::C]).as_slice(),
+            [ApplyOutcome::Refused(_)]
+        ));
+    }
+
+    /// With the file in hand: T slices on its onsets, N normalizes its
+    /// gain to full scale, and a placed marker snaps to a zero
+    /// crossing. Without the file, T and N refuse.
+    #[test]
+    fn the_file_enables_onsets_normalizing_and_snap() {
+        use crate::params::sampler as sp;
+        let mut stage = Stage::new();
+        let id = into_sample_editor(&mut stage);
+        assert!(matches!(
+            drive(&mut stage, &[Key::T]).as_slice(),
+            [ApplyOutcome::Refused(_)]
+        ));
+        assert!(matches!(
+            drive(&mut stage, &[Key::N]).as_slice(),
+            [ApplyOutcome::Refused(_)]
+        ));
+        stage.set_sample(synthetic_sample("/tmp/nowhere/break.wav"));
+        assert_eq!(
+            stage.wanted_sample(),
+            None,
+            "the file was handed in and still wanted"
+        );
+
+        assert_eq!(drive(&mut stage, &[Key::N]), vec![ApplyOutcome::Changed]);
+        let gain = stage.song.device(id).expect("device").value(sp::GAIN);
+        // The tone peaks a hair under half scale — the first sample is
+        // zero and the envelope has begun to fall by the first crest —
+        // so the gain lands a little over six decibels.
+        assert!((5.5..7.0).contains(&gain), "normalized gain {gain}");
+
+        assert_eq!(drive(&mut stage, &[Key::T]), vec![ApplyOutcome::Changed]);
+        let slices = stage.song.device(id).expect("device").slices.clone();
+        assert!(
+            slices.len() >= 2,
+            "the hard onset was not found: {slices:?}"
+        );
+        assert_eq!(slices[0], 0.0);
+
+        // A marker placed a little past a crossing walks back onto it.
+        stage.sample.as_mut().expect("editor").cursor = 2_405.0 / 4_800.0;
+        assert_eq!(drive(&mut stage, &[Key::S]), vec![ApplyOutcome::Changed]);
+        let start = f64::from(stage.song.device(id).expect("device").value(sp::START));
+        let frame = (start * 4_800.0).round() as usize;
+        assert!(frame <= 2_405 && frame > 2_300, "snapped to {frame}");
+    }
+
+    /// P asks the host to play the slice under the cursor; with no
+    /// slices, the trim; Shift+P the whole file. Each is one request,
+    /// taken once.
+    #[test]
+    fn audition_asks_the_host_for_the_right_range() {
+        use crate::params::sampler as sp;
+        let mut stage = Stage::new();
+        let id = into_sample_editor(&mut stage);
+        assert_eq!(drive(&mut stage, &[Key::P]), vec![ApplyOutcome::Changed]);
+        let asked = stage.take_audition().expect("an audition");
+        assert_eq!(asked.path, PathBuf::from("/tmp/nowhere/break.wav"));
+        assert_eq!(
+            (asked.from, asked.to),
+            (0.0, 1.0),
+            "no trim yet plays the whole file"
+        );
+        assert_eq!(stage.take_audition(), None, "taken twice");
+
+        stage
+            .song
+            .device_mut(id)
+            .expect("device")
+            .set(sp::START, 0.25);
+        stage.song.device_mut(id).expect("device").set(sp::END, 0.5);
+        assert_eq!(drive(&mut stage, &[Key::P]), vec![ApplyOutcome::Changed]);
+        let asked = stage.take_audition().expect("an audition");
+        assert!((asked.from - 0.25).abs() < 1e-6 && (asked.to - 0.5).abs() < 1e-6);
+
+        stage
+            .song
+            .device_mut(id)
+            .expect("device")
+            .set_slices([0.0, 0.5]);
+        stage.sample.as_mut().expect("editor").cursor = 0.75;
+        assert_eq!(drive(&mut stage, &[Key::P]), vec![ApplyOutcome::Changed]);
+        let asked = stage.take_audition().expect("an audition");
+        assert_eq!((asked.from, asked.to), (0.5, 1.0));
+        assert_eq!(
+            stage.handle_key(Modifiers::SHIFT, Key::P),
+            Some(ApplyOutcome::Changed)
+        );
+        let asked = stage.take_audition().expect("an audition");
+        assert_eq!((asked.from, asked.to), (0.0, 1.0));
+    }
+
+    /// An effect on the chain puts its parameters in the menu after the
+    /// voice's, under its own name, and a lock laid there lands on the
+    /// effect rather than on the voice.
+    #[test]
+    fn effect_parameters_lock_per_trig_from_the_menu() {
+        use crate::params::sat;
+        let mut stage = Stage::new();
+        let sat_id = stage
+            .song
+            .add_device(0, crate::devices::DeviceKind::Sat)
+            .expect("an effect");
+        let id = into_trig_menu(&mut stage);
+        let (_, _, rows) = stage.menu_rows_under_cursor().expect("rows");
+        let (index, row) = rows
+            .iter()
+            .enumerate()
+            .find_map(|(index, row)| match row {
+                MenuRow::Param(lock)
+                    if lock.device == Some(sat_id) && lock.def.id == sat::DRIVE =>
+                {
+                    Some((index, *lock))
+                }
+                _ => None,
+            })
+            .expect("the effect's drive is a row");
+        assert_eq!(row.prefix, "sat");
+        assert!(index > 1, "the effect's rows came before the voice's");
+        for _ in 0..index {
+            assert_eq!(
+                drive(&mut stage, &[Key::ArrowDown]),
+                vec![ApplyOutcome::Changed]
+            );
+        }
+        assert_eq!(
+            drive(&mut stage, &[Key::ArrowRight]),
+            vec![ApplyOutcome::Changed]
+        );
+        let trig = stage.song.pattern(id).expect("pattern").trig(0).clone();
+        assert_eq!(trig.lock(sat::DRIVE), None, "the lock landed on the voice");
+        let fine = chain::step_of(row.def, row.label, false);
+        assert_eq!(
+            trig.lock_on(Some(sat_id), sat::DRIVE),
+            Some(row.def.clamp(row.knob + fine))
+        );
+        assert_eq!(
+            drive(&mut stage, &[Key::Delete]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(
+            stage
+                .song
+                .pattern(id)
+                .expect("pattern")
+                .trig(0)
+                .lock_on(Some(sat_id), sat::DRIVE),
+            None
+        );
+    }
+
+    /// Only a sampler in slice mode makes a slicing track; its cells
+    /// then wear the locked cut as a tag, named from one.
+    #[test]
+    fn a_slicing_track_is_a_sampler_in_slice_mode() {
+        use crate::params::sampler as sp;
+        let mut stage = Stage::new();
+        assert!(!stage.slicing_track(0));
+        let id = stage
+            .song
+            .add_device(0, crate::devices::DeviceKind::Sampler)
+            .expect("a sampler");
+        assert!(!stage.slicing_track(0), "classic mode is pitches");
+        stage
+            .song
+            .device_mut(id)
+            .expect("device")
+            .set(sp::MODE, sp::MODE_SLICE);
+        assert!(stage.slicing_track(0));
+        assert_eq!(sequencer::sequence_grid::slice_label(1), "S01");
+        assert_eq!(sequencer::sequence_grid::slice_label(16), "S16");
+    }
+
+    /// Into a clip, a trig under the cursor, and the menu up over it.
+    fn into_trig_menu(stage: &mut Stage) -> PatternId {
+        let id = into_clip(stage);
+        stage.apply_sequence(
+            id,
+            &[sequence::Intent::Toggle {
+                tick: 0,
+                default_pitch: Pitch::from_midi(60),
+                default_length_ticks: PATTERN_STEP_TICKS,
+                default_velocity: 100,
+            }],
+        );
+        assert_eq!(command_shift(stage, Key::Enter), ApplyOutcome::Changed);
+        assert_eq!(stage.scope_context(), keymap::ScopeContext::TrigMenu);
+        assert_eq!(stage.trig_menu, Some(TrigMenu::open()));
+        id
+    }
+
+    /// Onto the verbs page: Right on the TRIG row, which is first on the
+    /// lock page of an ordinary voice.
+    fn into_trig_verbs(stage: &mut Stage) -> PatternId {
+        let id = into_trig_menu(stage);
+        assert_eq!(
+            drive(stage, &[Key::ArrowRight]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(
+            stage.trig_menu.map(|menu| menu.page),
+            Some(Page::Trig),
+            "the TRIG row did not open the verbs"
+        );
+        id
+    }
+
+    /// The menu is about a trig, so an empty cell refuses it; over a
+    /// trig it opens on the lock page's first row, and the keys are then
+    /// its own.
+    #[test]
+    fn the_trig_menu_needs_a_trig_under_the_cursor() {
+        let mut stage = Stage::new();
+        let id = into_clip(&mut stage);
+        assert_eq!(
+            command_shift(&mut stage, Key::Enter),
+            ApplyOutcome::Refused(Refusal {
+                intent: StageIntent::TrigMenu,
+                reason: RefusalReason::Empty,
+            })
+        );
+        assert_eq!(stage.trig_menu, None);
+        assert_eq!(stage.scope_context(), keymap::ScopeContext::Clip);
+
+        stage.apply_sequence(
+            id,
+            &[sequence::Intent::Toggle {
+                tick: 0,
+                default_pitch: Pitch::from_midi(60),
+                default_length_ticks: PATTERN_STEP_TICKS,
+                default_velocity: 100,
+            }],
+        );
+        assert_eq!(command_shift(&mut stage, Key::Enter), ApplyOutcome::Changed);
+        assert_eq!(stage.trig_menu, Some(TrigMenu::open()));
+        assert_eq!(stage.scope_context(), keymap::ScopeContext::TrigMenu);
+    }
+
+    /// The lock page lists the voice's parameters under the TRIG row,
+    /// and the cursor walks exactly that far and no further.
+    #[test]
+    fn the_lock_page_holds_one_row_per_voice_parameter() {
+        let mut stage = Stage::new();
+        into_trig_menu(&mut stage);
+        let (_, _, rows) = stage.menu_rows_under_cursor().expect("rows");
+        let voice = trig_menu::voice_of(&stage.song.tracks[0]).0;
+        assert_eq!(
+            rows.len(),
+            1 + voice.params.len(),
+            "a row per parameter, under TRIG"
+        );
+        assert!(matches!(rows[0], MenuRow::Trig));
+        assert!(
+            rows[1..]
+                .iter()
+                .all(|row| matches!(row, MenuRow::Param(lock) if lock.lock.is_none())),
+            "a lock was born held"
+        );
+        for _ in 1..rows.len() {
+            assert_eq!(
+                drive(&mut stage, &[Key::ArrowDown]),
+                vec![ApplyOutcome::Changed]
+            );
+        }
+        assert!(matches!(
+            drive(&mut stage, &[Key::ArrowDown]).as_slice(),
+            [ApplyOutcome::Refused(_)]
+        ));
+        assert_eq!(stage.trig_menu.map(|menu| menu.row), Some(rows.len() - 1));
+    }
+
+    /// On a slicing sampler the second row is the slice: Right lays a
+    /// slice lock one past the knob, Left walks it back and refuses at
+    /// the first cut, Delete lets it go, and Enter latches the knob's
+    /// cut. The grid tags the trig with the locked cut.
+    #[test]
+    fn the_slice_row_locks_which_cut_a_trig_plays() {
+        use crate::params::sampler as sp;
+        let mut stage = Stage::new();
+        let sampler = stage
+            .song
+            .add_device(0, crate::devices::DeviceKind::Sampler)
+            .expect("a sampler");
+        {
+            let device = stage.song.device_mut(sampler).expect("device");
+            device.sample = Some(PathBuf::from("/tmp/nowhere/break.wav"));
+            device.set_slices((0..8).map(|i| f64::from(i) / 8.0));
+            device.set(sp::MODE, sp::MODE_SLICE);
+        }
+        assert!(stage.slicing_track(0));
+        let id = into_trig_menu(&mut stage);
+        let (_, _, rows) = stage.menu_rows_under_cursor().expect("rows");
+        let MenuRow::Slice(slice) = rows[0] else {
+            panic!("the first row is not the slice")
+        };
+        assert!(
+            matches!(rows[1], MenuRow::Trig),
+            "TRIG did not follow the slice"
+        );
+        assert_eq!((slice.count, slice.knob, slice.lock), (8, 1, None));
+        assert!(
+            !rows[2..]
+                .iter()
+                .any(|row| matches!(row, MenuRow::Param(lock) if lock.def.id == sp::SLICE)),
+            "the slice is a slider as well as a row"
+        );
+        assert_eq!(
+            stage.wanted_sample(),
+            Some(Path::new("/tmp/nowhere/break.wav")),
+            "the menu did not ask for the file"
+        );
+        let lock_of = |stage: &Stage| {
+            stage
+                .song
+                .pattern(id)
+                .expect("pattern")
+                .trig(0)
+                .lock(sp::SLICE)
+        };
+        assert_eq!(
+            drive(&mut stage, &[Key::ArrowRight]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(lock_of(&stage), Some(2.0));
+        assert_eq!(
+            drive(&mut stage, &[Key::ArrowRight]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(lock_of(&stage), Some(3.0));
+        let views =
+            sequencer::note_views(stage.song.pattern(id).expect("pattern"), &stage.song.key);
+        assert_eq!(views[0].slice, Some(3), "the grid was not told the cut");
+        assert_eq!(sequencer::sequence_grid::slice_label(3), "S03");
+        assert_eq!(
+            drive(&mut stage, &[Key::ArrowLeft, Key::ArrowLeft]),
+            vec![ApplyOutcome::Changed; 2]
+        );
+        assert_eq!(lock_of(&stage), Some(1.0));
+        assert!(matches!(
+            drive(&mut stage, &[Key::ArrowLeft]).as_slice(),
+            [ApplyOutcome::Refused(_)]
+        ));
+        assert_eq!(
+            drive(&mut stage, &[Key::Delete]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(lock_of(&stage), None);
+        assert_eq!(
+            drive(&mut stage, &[Key::ArrowRight]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(
+            drive(&mut stage, &[Key::Enter]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(stage.trig_menu, None, "enter did not close the menu");
+        assert_eq!(lock_of(&stage), Some(2.0), "enter did not keep the cut");
+    }
+
+    /// Right on a slider lays a lock one step above the knob and keeps
+    /// the menu up; Left walks it back below; Delete lets it go and a
+    /// second Delete has nothing to let go of. Enter keeps what was done
+    /// and closes; Escape puts the trig's locks back as they were and
+    /// closes. Each kept edit lands on the trig in the song.
+    #[test]
+    fn a_lock_is_laid_slid_and_let_go_from_its_slider() {
+        let mut stage = Stage::new();
+        let id = into_trig_menu(&mut stage);
+        let (_, _, rows) = stage.menu_rows_under_cursor().expect("rows");
+        let (index, first) = rows
+            .iter()
+            .enumerate()
+            .find_map(|(index, row)| match row {
+                MenuRow::Param(lock) => {
+                    let fine = chain::step_of(lock.def, lock.label, false);
+                    (lock.knob - fine >= lock.def.min && lock.knob + fine <= lock.def.max)
+                        .then_some((index, *lock))
+                }
+                _ => None,
+            })
+            .expect("a parameter with room both ways");
+        for _ in 0..index {
+            assert_eq!(
+                drive(&mut stage, &[Key::ArrowDown]),
+                vec![ApplyOutcome::Changed]
+            );
+        }
+        let fine = chain::step_of(first.def, first.label, false);
+        let lock_of = |stage: &Stage| {
+            stage
+                .song
+                .pattern(id)
+                .expect("pattern")
+                .trig(0)
+                .lock(first.def.id)
+        };
+
+        assert_eq!(
+            drive(&mut stage, &[Key::ArrowRight]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(lock_of(&stage), Some(first.def.clamp(first.knob + fine)));
+        assert_eq!(
+            stage.trig_menu.map(|menu| menu.page),
+            Some(Page::Locks),
+            "sliding closed the menu"
+        );
+        assert_eq!(
+            drive(&mut stage, &[Key::ArrowLeft, Key::ArrowLeft]),
+            vec![ApplyOutcome::Changed, ApplyOutcome::Changed]
+        );
+        assert_eq!(lock_of(&stage), Some(first.def.clamp(first.knob - fine)));
+        assert_eq!(
+            drive(&mut stage, &[Key::Delete]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(lock_of(&stage), None);
+        assert_eq!(
+            drive(&mut stage, &[Key::Delete]),
+            vec![ApplyOutcome::Refused(Refusal {
+                intent: StageIntent::ClearLock,
+                reason: RefusalReason::Empty,
+            })]
+        );
+
+        // Escape puts things back: a lock laid, then abandoned.
+        assert_eq!(
+            drive(&mut stage, &[Key::ArrowRight]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert!(lock_of(&stage).is_some());
+        assert_eq!(
+            drive(&mut stage, &[Key::Escape]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(stage.trig_menu, None);
+        assert_eq!(lock_of(&stage), None, "escape kept an edit");
+
+        // Enter keeps: a lock laid, then kept.
+        assert_eq!(command_shift(&mut stage, Key::Enter), ApplyOutcome::Changed);
+        for _ in 0..index {
+            let _ = drive(&mut stage, &[Key::ArrowDown]);
+        }
+        assert_eq!(
+            drive(&mut stage, &[Key::ArrowRight]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(
+            drive(&mut stage, &[Key::Enter]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(stage.trig_menu, None);
+        assert_eq!(
+            lock_of(&stage),
+            Some(first.def.clamp(first.knob + fine)),
+            "enter lost the edit"
+        );
+    }
+
+    /// The TRIG row leads in on Right and has nothing to slide on Left.
+    #[test]
+    fn the_trig_row_leads_in_on_right_and_refuses_left() {
+        let mut stage = Stage::new();
+        into_trig_menu(&mut stage);
+        assert!(matches!(
+            drive(&mut stage, &[Key::ArrowLeft]).as_slice(),
+            [ApplyOutcome::Refused(Refusal {
+                reason: RefusalReason::Unavailable,
+                ..
+            })]
+        ));
+        assert_eq!(
+            drive(&mut stage, &[Key::ArrowRight]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(stage.trig_menu.map(|menu| menu.page), Some(Page::Trig));
+    }
+
+    /// The verbs page: Up at the top is refused, Down walks, Escape
+    /// climbs back to the lock page, and Escape again puts the menu away.
+    #[test]
+    fn the_trig_row_opens_the_verbs_and_escape_climbs_out() {
+        let mut stage = Stage::new();
+        into_trig_verbs(&mut stage);
+        assert_eq!(
+            drive(&mut stage, &[Key::ArrowUp]),
+            vec![ApplyOutcome::Refused(Refusal {
+                intent: StageIntent::Step(Step::Up),
+                reason: RefusalReason::Edge(Step::Up),
+            })]
+        );
+        assert_eq!(
+            drive(&mut stage, &[Key::ArrowDown]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(stage.trig_menu.map(|menu| menu.row), Some(1));
+        assert_eq!(
+            drive(&mut stage, &[Key::Escape]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(stage.trig_menu, Some(TrigMenu::open()));
+        assert_eq!(
+            drive(&mut stage, &[Key::Escape]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(stage.trig_menu, None);
+        assert_eq!(stage.scope_context(), keymap::ScopeContext::Clip);
+    }
+
+    /// Enter on a verb speaks it to the trig and puts the whole menu
+    /// away. The second verb nudges the trig one step later, so that is
+    /// where it is afterwards.
+    #[test]
+    fn a_verb_speaks_to_the_trig_and_closes_the_menu() {
+        let mut stage = Stage::new();
+        let id = into_trig_verbs(&mut stage);
+        assert_eq!(
+            drive(&mut stage, &[Key::ArrowDown]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(TrigAction::ALL[1], TrigAction::NudgeRight);
+        assert_eq!(
+            drive(&mut stage, &[Key::Enter]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(stage.trig_menu, None, "the menu outlived its word");
+        assert_eq!(stage.scope_context(), keymap::ScopeContext::Clip);
+        let pattern = stage.song.pattern(id).expect("pattern");
+        assert!(!pattern.trig(0).enabled, "the trig did not leave step one");
+        assert!(pattern.trig(1).enabled, "the trig did not land on step two");
+    }
+
+    /// The verbs cannot walk past their last row, and the last row is
+    /// the one destructive verb — so the far end of the list deletes
+    /// the trig, and nothing is left under the cursor afterwards.
+    #[test]
+    fn the_last_verb_deletes_the_trig() {
+        let mut stage = Stage::new();
+        let id = into_trig_verbs(&mut stage);
+        let rows = TrigAction::ALL.len();
+        for _ in 1..rows {
+            assert_eq!(
+                drive(&mut stage, &[Key::ArrowDown]),
+                vec![ApplyOutcome::Changed]
+            );
+        }
+        assert!(matches!(
+            drive(&mut stage, &[Key::ArrowDown]).as_slice(),
+            [ApplyOutcome::Refused(_)]
+        ));
+        assert_eq!(
+            drive(&mut stage, &[Key::Enter]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert!(!stage.song.pattern(id).expect("pattern").trig(0).enabled);
+        assert_eq!(stage.trig_under_cursor(), None);
+    }
+
     #[test]
     fn enter_on_a_filled_slot_opens_its_pattern_as_a_sixteen_by_four_grid() {
         let mut stage = Stage::new();
@@ -5792,6 +8957,12 @@ mod tests {
                     keymap::ScopeContext::Clip => {
                         into_clip(&mut stage);
                     }
+                    keymap::ScopeContext::TrigMenu => {
+                        into_trig_menu(&mut stage);
+                    }
+                    keymap::ScopeContext::Sample => {
+                        into_sample_editor(&mut stage);
+                    }
                     keymap::ScopeContext::Root => {}
                 }
                 // Everything a key is allowed to change. A new piece of
@@ -5815,6 +8986,9 @@ mod tests {
                         stage.nudging,
                         stage.clipboard.clone(),
                         stage.path.clone(),
+                        stage.trig_menu,
+                        stage.sample.clone(),
+                        stage.library_generation,
                     ),
                 );
 
@@ -5836,6 +9010,9 @@ mod tests {
                                     stage.nudging,
                                     stage.clipboard.clone(),
                                     stage.path.clone(),
+                                    stage.trig_menu,
+                                    stage.sample.clone(),
+                                    stage.library_generation,
                                 ),
                             ),
                             before,
@@ -5860,6 +9037,9 @@ mod tests {
                                     stage.nudging,
                                     stage.clipboard.clone(),
                                     stage.path.clone(),
+                                    stage.trig_menu,
+                                    stage.sample.clone(),
+                                    stage.library_generation,
                                 ),
                             ),
                             before,
@@ -5908,6 +9088,12 @@ mod tests {
                 keymap::ScopeContext::Chain => into_chain(&mut stage),
                 keymap::ScopeContext::Clip => {
                     into_clip(&mut stage);
+                }
+                keymap::ScopeContext::TrigMenu => {
+                    into_trig_menu(&mut stage);
+                }
+                keymap::ScopeContext::Sample => {
+                    into_sample_editor(&mut stage);
                 }
             }
             let focus = stage.focus.clone();
@@ -6108,8 +9294,152 @@ mod tests {
             layout.field.min.x, layout.browser.min.x,
             "the field yielded ground to the browser"
         );
-        assert_eq!(layout.field.width(), window.width());
+        assert_eq!(layout.field.width(), window.width() - 2.0 * FRAME_W);
         assert!(layout.field.contains_rect(layout.browser));
+    }
+
+    /// The periphery is one casing: the strips span the window, and the
+    /// field stands off both sides by the same rail, so surface material
+    /// runs unbroken from the vitals down either side into the message.
+    #[test]
+    /// The screen chamfer sits on the window's own corner, at its size,
+    /// and never grows past a window too small to hold it.
+    #[test]
+    fn the_screen_chamfer_cuts_the_top_left_corner_at_its_size() {
+        let window = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1280.0, 800.0));
+        let [corner, along, down] = screen_chamfer_cut(window);
+        assert_eq!(corner, window.min);
+        assert_eq!(along, egui::pos2(SCREEN_CHAMFER, 0.0));
+        assert_eq!(down, egui::pos2(0.0, SCREEN_CHAMFER));
+        assert!(
+            SCREEN_CHAMFER < PERIPHERY_H,
+            "the cut would leave the vitals strip"
+        );
+        let tiny = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(10.0, 30.0));
+        let [_, along, down] = screen_chamfer_cut(tiny);
+        assert_eq!(along.x, 10.0);
+        assert_eq!(down.y, 10.0);
+    }
+
+    /// The foot's cuts sit on their own corners, much smaller than the
+    /// crown's, and every cut's apex is a corner of the window with its
+    /// face's ends on the window's edges.
+    #[test]
+    fn the_foot_is_chamfered_small_on_both_sides() {
+        let window = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1280.0, 800.0));
+        assert!(
+            SCREEN_CHAMFER_FOOT * 2.0 < SCREEN_CHAMFER,
+            "the foot's cuts are not much smaller"
+        );
+        let f = SCREEN_CHAMFER_FOOT;
+        assert_eq!(
+            screen_cut(window, ScreenCorner::BottomLeft),
+            [
+                egui::pos2(0.0, 800.0),
+                egui::pos2(f, 800.0),
+                egui::pos2(0.0, 800.0 - f)
+            ]
+        );
+        assert_eq!(
+            screen_cut(window, ScreenCorner::BottomRight),
+            [
+                egui::pos2(1280.0, 800.0),
+                egui::pos2(1280.0 - f, 800.0),
+                egui::pos2(1280.0, 800.0 - f)
+            ]
+        );
+        for corner in ScreenCorner::ALL {
+            let [apex, along, down] = screen_cut(window, corner);
+            let on_corner =
+                (apex.x == 0.0 || apex.x == 1280.0) && (apex.y == 0.0 || apex.y == 800.0);
+            assert!(on_corner, "{corner:?} apex {apex:?} is not a window corner");
+            assert_eq!(
+                along.y, apex.y,
+                "{corner:?} face does not start on the edge"
+            );
+            assert_eq!(down.x, apex.x, "{corner:?} face does not end on the edge");
+        }
+    }
+
+    /// The rings nest inside the cut, each strictly inside the last and
+    /// all inside the cut face, and a window too small for them shows
+    /// fewer rather than a tangle.
+    #[test]
+    fn the_chamfer_rings_nest_inside_the_cut() {
+        let window = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1280.0, 800.0));
+        let rings = screen_chamfer_rings(window);
+        assert_eq!(
+            rings.len(),
+            CHAMFER_RINGS,
+            "a ring did not fit at full size"
+        );
+        let mut last_leg = SCREEN_CHAMFER;
+        for (n, tri) in rings.iter().enumerate() {
+            let d = CHAMFER_RING_GAP * (n + 1) as f32;
+            assert_eq!(tri[0], egui::pos2(d, d), "ring {n} lost its right angle");
+            let leg = tri[1].x - tri[0].x;
+            assert!(leg < last_leg, "ring {n} is not inside the last");
+            // On the cut face x + y = C, so every vertex sits at or
+            // under it by at least the gap along the normal.
+            for p in tri {
+                assert!(
+                    p.x + p.y <= SCREEN_CHAMFER - CHAMFER_RING_GAP,
+                    "ring {n} crossed the cut"
+                );
+            }
+            last_leg = leg;
+        }
+        let tiny = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(14.0, 14.0));
+        assert!(screen_chamfer_rings(tiny).len() < CHAMFER_RINGS);
+    }
+
+    /// The stream screen sits inside the vitals strip, clear of the
+    /// register rail that precedes the transport, at its own size.
+    #[test]
+    fn the_stream_screen_sits_in_the_strip_before_the_register() {
+        let window = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1280.0, 800.0));
+        let layout = Layout::of(window);
+        let screen = stream_screen(layout.vitals, layout.transport);
+        assert!(
+            layout.vitals.contains_rect(screen),
+            "the screen left the strip"
+        );
+        let room = design::px(design::space::ROOM);
+        assert!(
+            screen.right() <= layout.transport.min.x - room * 12.0,
+            "the screen overlaps the register"
+        );
+        assert_eq!(screen.width(), STREAM_SCREEN_W);
+        assert_eq!(screen.height(), STREAM_SCREEN_H);
+    }
+
+    #[test]
+    fn the_field_is_framed_on_all_four_sides() {
+        let window = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1280.0, 800.0));
+        let layout = Layout::of(window);
+
+        assert_eq!(
+            layout.vitals.width(),
+            window.width(),
+            "the vitals strip stopped short"
+        );
+        assert_eq!(
+            layout.message.width(),
+            window.width(),
+            "the message strip stopped short"
+        );
+        assert_eq!(
+            layout.field.min.x - window.min.x,
+            FRAME_W,
+            "the left rail is not the frame"
+        );
+        assert_eq!(
+            window.max.x - layout.field.max.x,
+            FRAME_W,
+            "the right rail is not the frame"
+        );
+        assert_eq!(layout.field.min.y, layout.vitals.max.y);
+        assert_eq!(layout.field.max.y, layout.message.min.y);
     }
 
     #[test]
@@ -6835,6 +10165,12 @@ mod tests {
                 keymap::ScopeContext::Clip => {
                     into_clip(&mut stage);
                 }
+                keymap::ScopeContext::TrigMenu => {
+                    into_trig_menu(&mut stage);
+                }
+                keymap::ScopeContext::Sample => {
+                    into_sample_editor(&mut stage);
+                }
                 keymap::ScopeContext::Rename => {
                     let _ = stage.handle_key(Modifiers::NONE, Key::F2);
                 }
@@ -7066,13 +10402,13 @@ mod tests {
         assert_eq!(command(&mut stage, Key::D), ApplyOutcome::Changed);
 
         assert_eq!(
-            stage.handle_key(Modifiers::NONE, Key::ArrowRight),
+            stage.handle_key(Modifiers::NONE, Key::Tab),
             Some(ApplyOutcome::Changed)
         );
         assert_eq!(
             stage.chain.as_ref().and_then(FocusLattice::cursor),
             Some((1, 0)),
-            "right did not walk to the next device"
+            "tab did not walk to the next device"
         );
         assert_eq!(
             stage.handle_key(Modifiers::NONE, Key::ArrowDown),
@@ -7559,7 +10895,7 @@ mod tests {
     fn w_then_an_arrow_reorders_the_chain_and_the_cursor_follows_the_device() {
         let mut stage = Stage::new();
         let [poly, sat, reverb] = into_chain_of_three(&mut stage);
-        let _ = drive(&mut stage, &[Key::ArrowRight]);
+        let _ = drive(&mut stage, &[Key::Tab]);
         assert_eq!(
             stage.chain.as_ref().and_then(FocusLattice::cursor),
             Some((1, 0))
@@ -7621,7 +10957,7 @@ mod tests {
             .device_mut(sat)
             .expect("there")
             .set(drive_param, quarter);
-        let _ = drive(&mut stage, &[Key::ArrowRight]);
+        let _ = drive(&mut stage, &[Key::Tab]);
 
         assert_eq!(drive(&mut stage, &[Key::Q]), vec![ApplyOutcome::Changed]);
         assert_eq!(chain_ids(&stage), [poly, reverb]);
@@ -7644,7 +10980,7 @@ mod tests {
         );
 
         // Put lands after the cursor's device, and the cursor goes to it.
-        let _ = drive(&mut stage, &[Key::ArrowLeft]);
+        let _ = stage.handle_key(Modifiers::SHIFT, Key::Tab);
         assert_eq!(drive(&mut stage, &[Key::E]), vec![ApplyOutcome::Changed]);
         let ids = chain_ids(&stage);
         assert_eq!(ids.len(), 3);
@@ -7670,7 +11006,7 @@ mod tests {
     fn a_yanked_device_can_be_put_on_another_track_from_the_session() {
         let mut stage = Stage::new();
         let [_, sat, _] = into_chain_of_three(&mut stage);
-        let _ = drive(&mut stage, &[Key::ArrowRight, Key::Q]);
+        let _ = drive(&mut stage, &[Key::Tab, Key::Q]);
         assert_eq!(
             stage.clipboard.as_ref().map(|d| d.kind),
             Some(crate::devices::DeviceKind::Sat)
@@ -7735,7 +11071,7 @@ mod tests {
         // Row zero of the poly is osc A's wave: a list of eight.
         let wave = crate::params::poly::A_WAVE;
         assert_eq!(
-            stage.handle_key(Modifiers::SHIFT, Key::ArrowRight),
+            stage.handle_key(Modifiers::NONE, Key::ArrowRight),
             Some(ApplyOutcome::Changed)
         );
         assert_eq!(stage.song.device(id).expect("there").value(wave), 1.0);
@@ -7760,7 +11096,7 @@ mod tests {
             .device(id)
             .expect("there")
             .value(crate::params::poly::GAIN);
-        let _ = stage.handle_key(Modifiers::SHIFT, Key::ArrowRight);
+        let _ = stage.handle_key(Modifiers::NONE, Key::ArrowRight);
         let after = stage
             .song
             .device(id)

@@ -48,7 +48,6 @@ pub mod block;
 pub mod circuit;
 pub mod codex;
 pub mod glyph;
-pub mod grain;
 pub mod kit;
 pub mod motion;
 pub mod signs;

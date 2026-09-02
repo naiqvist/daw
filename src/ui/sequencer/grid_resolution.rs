@@ -83,6 +83,20 @@ impl GridResolution {
     }
 }
 
+/// A clip's length as bars: `02B` when whole, and `1B+8` — bars, then
+/// the steps past the last whole bar — when it is not, so a clip cut
+/// mid-bar says exactly where it ends rather than rounding up.
+pub(crate) fn bars_label(ticks: usize) -> String {
+    let bars = ticks / TICKS_PER_BAR;
+    let rest = ticks % TICKS_PER_BAR;
+    if rest == 0 {
+        format!("{bars:02}B")
+    } else {
+        let steps = rest.div_ceil(crate::sequencing::PATTERN_STEP_TICKS);
+        format!("{bars}B+{steps}")
+    }
+}
+
 pub(crate) fn length_label(ticks: usize) -> String {
     for denominator in [4_u8, 8, 16, 32, 64] {
         let straight = TICKS_PER_BAR / usize::from(denominator);
@@ -132,5 +146,13 @@ mod tests {
             grid.widen();
         }
         assert_eq!(grid.label(), "1/4");
+    }
+
+    #[test]
+    fn a_clips_length_says_bars_and_the_steps_past_them() {
+        use crate::sequencing::PATTERN_STEP_TICKS;
+        assert_eq!(bars_label(TICKS_PER_BAR * 2), "02B");
+        assert_eq!(bars_label(TICKS_PER_BAR + 8 * PATTERN_STEP_TICKS), "1B+8");
+        assert_eq!(bars_label(4 * PATTERN_STEP_TICKS), "0B+4");
     }
 }

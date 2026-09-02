@@ -28,6 +28,42 @@
 
 use crate::audio::material::Material;
 
+/// A file as the detector reads it: planar samples, channel `c` at
+/// `samples[c * frames .. (c + 1) * frames]`. A view rather than the
+/// material itself, so a surface that holds the same samples through
+/// an `Arc` — and may not name the audio module — can run the detector
+/// on them too.
+#[derive(Clone, Copy, Debug)]
+pub struct Planar<'a> {
+    pub samples: &'a [f32],
+    pub channels: usize,
+    pub frames: u64,
+    pub sample_rate: u32,
+}
+
+impl<'a> Planar<'a> {
+    pub fn channel(&self, channel: usize) -> &'a [f32] {
+        let frames = self.frames as usize;
+        let from = channel * frames;
+        self.samples.get(from..from + frames).unwrap_or(&[])
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.frames == 0 || self.channels == 0 || self.samples.is_empty()
+    }
+}
+
+impl<'a> From<&'a Material> for Planar<'a> {
+    fn from(material: &'a Material) -> Self {
+        Self {
+            samples: &material.samples,
+            channels: material.channels,
+            frames: material.frames,
+            sample_rate: material.sample_rate,
+        }
+    }
+}
+
 /// Analysis window, in milliseconds. Five is short enough to place a
 /// drum hit inside a sixteenth at any sane tempo and long enough that one
 /// cycle of a bass note does not read as a transient.
@@ -68,6 +104,11 @@ pub fn grid(frames: u64, count: usize) -> Vec<u64> {
 /// `sensitivity` is `0..=1`: at zero only an obvious hit counts, at one
 /// almost any rise does.
 pub fn transients(material: &Material, sensitivity: f32) -> Vec<u64> {
+    transients_of(&Planar::from(material), sensitivity)
+}
+
+/// `transients`, over a planar view of any samples.
+pub fn transients_of(material: &Planar<'_>, sensitivity: f32) -> Vec<u64> {
     let mut out = vec![0u64];
     if material.is_empty() || material.sample_rate == 0 {
         return out;
@@ -122,7 +163,7 @@ pub fn transients(material: &Material, sensitivity: f32) -> Vec<u64> {
 }
 
 /// RMS of one window across every channel, in dB.
-fn window_db(material: &Material, from: usize, to: usize) -> f32 {
+fn window_db(material: &Planar<'_>, from: usize, to: usize) -> f32 {
     let mut energy = 0.0f64;
     let mut counted = 0usize;
     for c in 0..material.channels {
@@ -150,7 +191,7 @@ fn window_db(material: &Material, from: usize, to: usize) -> f32 {
 ///
 /// Backwards rather than forwards: a marker that moves EARLIER keeps the
 /// attack it was pointing at, and one that moves later eats it.
-fn walk_back_to_zero(material: &Material, at: u64, sample_rate: f32) -> u64 {
+pub fn walk_back_to_zero(material: &Planar<'_>, at: u64, sample_rate: f32) -> u64 {
     let channel = material.channel(0);
     if channel.is_empty() {
         return at;

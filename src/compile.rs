@@ -641,7 +641,13 @@ pub(crate) fn build_graph_spec(
                             loop_len_beats,
                             path: source.map(|s| s.path.clone()).unwrap_or_default(),
                             params,
-                            slices: source.map(|s| s.slices.clone()).unwrap_or_default(),
+                            // The node spec takes slices as FRACTIONS of
+                            // the file; this frame's source table is in
+                            // frames, and nothing in this frame authors
+                            // it, so the compiler leaves the sampler to
+                            // the grid its SLICES knob asks for. The
+                            // authored table lives on the Song's device.
+                            slices: Vec::new(),
                         }
                     }
                     DeviceState::Acid(params) => NodeSpec::Acid {

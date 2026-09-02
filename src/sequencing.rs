@@ -239,6 +239,14 @@ pub struct Device {
     /// the red zone reads and must never find a string in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sample: Option<std::path::PathBuf>,
+    /// A sampler's slice starts, as FRACTIONS of the file in `0..1`,
+    /// sorted and distinct. Fractions rather than frames, like the
+    /// sampler's own START and END, so the document does not depend on
+    /// the rate the device happened to open at. Empty means "no slices
+    /// authored", and the compiler then lays the grid the SLICES knob
+    /// asks for. Meaningless on any other kind, and kept empty there.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slices: Vec<f64>,
 }
 
 impl Device {
@@ -249,7 +257,26 @@ impl Device {
             bypassed: false,
             overrides: Vec::new(),
             sample: None,
+            slices: Vec::new(),
         }
+    }
+
+    /// Replace the slice table: sorted, distinct, inside the file, and no
+    /// more than the sampler can hold. The first slice is always the
+    /// file's start when any slice exists, so slice one is the head of
+    /// the file and not the first cut into it.
+    pub fn set_slices(&mut self, fractions: impl IntoIterator<Item = f64>) {
+        let mut table: Vec<f64> = fractions
+            .into_iter()
+            .filter(|f| f.is_finite() && (0.0..1.0).contains(f))
+            .collect();
+        if !table.is_empty() && table.iter().all(|f| *f > 0.0) {
+            table.push(0.0);
+        }
+        table.sort_by(f64::total_cmp);
+        table.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+        table.truncate(crate::audio::sampler::MAX_SLICES);
+        self.slices = table;
     }
 
     /// The device's table, from the catalog.
@@ -334,12 +361,37 @@ pub enum PitchAuthority {
     Degree,
 }
 
+/// A parameter lock: one of the track's voice parameters, held at a
+/// value for the moment this trig fires and released when the next
+/// unlocked trig on that parameter plays. The value is the parameter's
+/// own engine value, whole, exactly as the graph carries it in
+/// `GraphNote::plocks` — a lock OVERWRITES the knob for its trig rather
+/// than moving it, so what the trig sounds is what the lock says,
+/// whatever the knob is doing that day.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct ParamLock {
+    pub param: u32,
+    pub value: f32,
+    /// The device the lock is on. `None` is the track's voice — the
+    /// head of the chain, whatever it is — and a document written
+    /// before effects could be locked reads as all-voice. `Some` names
+    /// an effect on the chain by its id, so a reordered chain keeps
+    /// every lock on the device it was laid on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<DeviceId>,
+}
+
 /// One chronological step. Multiple notes are one chord, not parallel lanes.
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Trig {
     pub enabled: bool,
     pub notes: Vec<Note>,
     pub probability: f32,
+    /// The trig's parameter locks, one per parameter at most. Absent
+    /// from documents written before locks means "none", which reads
+    /// exactly as it did before.
+    #[serde(default)]
+    pub locks: Vec<ParamLock>,
 }
 
 impl Default for Trig {
@@ -348,11 +400,58 @@ impl Default for Trig {
             enabled: false,
             notes: Vec::new(),
             probability: 1.0,
+            locks: Vec::new(),
         }
     }
 }
 
 impl Trig {
+    /// The voice's lock on `param`, if this trig holds one.
+    pub fn lock(&self, param: u32) -> Option<f32> {
+        self.lock_on(None, param)
+    }
+
+    pub fn set_lock(&mut self, param: u32, value: f32) {
+        self.set_lock_on(None, param, value);
+    }
+
+    pub fn clear_lock(&mut self, param: u32) -> bool {
+        self.clear_lock_on(None, param)
+    }
+
+    /// The lock on `param` of `device` — `None` for the voice — if held.
+    pub fn lock_on(&self, device: Option<DeviceId>, param: u32) -> Option<f32> {
+        self.locks
+            .iter()
+            .find(|lock| lock.device == device && lock.param == param)
+            .map(|lock| lock.value)
+    }
+
+    /// Hold `param` of `device` at `value`. One lock per parameter per
+    /// device: a second lock on the same one replaces the first.
+    pub fn set_lock_on(&mut self, device: Option<DeviceId>, param: u32, value: f32) {
+        match self
+            .locks
+            .iter_mut()
+            .find(|lock| lock.device == device && lock.param == param)
+        {
+            Some(lock) => lock.value = value,
+            None => self.locks.push(ParamLock {
+                param,
+                value,
+                device,
+            }),
+        }
+    }
+
+    /// Release `param` of `device`. Whether there was anything to release.
+    pub fn clear_lock_on(&mut self, device: Option<DeviceId>, param: u32) -> bool {
+        let before = self.locks.len();
+        self.locks
+            .retain(|lock| !(lock.device == device && lock.param == param));
+        self.locks.len() != before
+    }
+
     pub fn primary(&self) -> Option<&Note> {
         self.notes.first()
     }
@@ -2072,7 +2171,9 @@ impl Pattern {
             | Intent::SetProbability { tick, .. }
             | Intent::AdjustVelocity { tick, .. }
             | Intent::AdjustNoteVelocity { tick, .. }
-            | Intent::SetNoteMuted { tick, .. } => tick,
+            | Intent::SetNoteMuted { tick, .. }
+            | Intent::SetLock { tick, .. }
+            | Intent::ClearLock { tick, .. } => tick,
         };
         let (step, micro) = Self::address(tick);
         if step >= PATTERN_STEPS {
@@ -2182,6 +2283,30 @@ impl Pattern {
                     return Some("mute: no note here");
                 };
                 note.muted = muted;
+            }
+            // Locks belong to the STEP, not to a note: they say what the
+            // voice does when the trig fires, and a trig fires once
+            // however many notes it holds. A step with nothing on it has
+            // no firing to lock.
+            Intent::SetLock {
+                device,
+                param,
+                value,
+                ..
+            } => {
+                let trig = self.trig_mut(step);
+                if trig.notes.is_empty() {
+                    return Some("lock: no trig here");
+                }
+                trig.set_lock_on(device.map(DeviceId), param, value);
+            }
+            Intent::ClearLock { device, param, .. } => {
+                if !self
+                    .trig_mut(step)
+                    .clear_lock_on(device.map(DeviceId), param)
+                {
+                    return Some("lock: nothing locked here");
+                }
             }
             Intent::Resize { delta_ticks, .. } => {
                 let trig = self.trig_mut(step);
@@ -4124,6 +4249,78 @@ mod tick_tests {
         assert_eq!(
             pattern.apply(&Intent::ResizeClip { delta_ticks: 1 }),
             Some("clip resize blocked at the pattern edge")
+        );
+    }
+
+    /// A lock is one per parameter, replaced rather than doubled, and
+    /// released by name. Locking an empty step is refused: there is no
+    /// firing to lock.
+    #[test]
+    fn locks_are_one_per_parameter_and_need_a_trig() {
+        use crate::intent::sequence::Intent;
+        let mut pattern = Pattern::default();
+        assert_eq!(
+            pattern.apply(&Intent::SetLock {
+                tick: 0,
+                device: None,
+                param: 3,
+                value: 0.5
+            }),
+            Some("lock: no trig here")
+        );
+        pattern.toggle(0, Note::new(60, PATTERN_STEP_TICKS, 100));
+        assert_eq!(
+            pattern.apply(&Intent::SetLock {
+                tick: 0,
+                device: None,
+                param: 3,
+                value: 0.5
+            }),
+            None
+        );
+        assert_eq!(
+            pattern.apply(&Intent::SetLock {
+                tick: 0,
+                device: None,
+                param: 3,
+                value: 0.75
+            }),
+            None
+        );
+        assert_eq!(
+            pattern.trig(0).locks.len(),
+            1,
+            "a second lock doubled the first"
+        );
+        assert_eq!(pattern.trig(0).lock(3), Some(0.75));
+        assert_eq!(
+            pattern.apply(&Intent::ClearLock {
+                tick: 0,
+                device: None,
+                param: 3
+            }),
+            None
+        );
+        assert_eq!(pattern.trig(0).lock(3), None);
+        assert_eq!(
+            pattern.apply(&Intent::ClearLock {
+                tick: 0,
+                device: None,
+                param: 3
+            }),
+            Some("lock: nothing locked here")
+        );
+        // The same parameter id on an effect is a different lock.
+        pattern.trig_mut(0).set_lock_on(Some(DeviceId(9)), 3, 0.25);
+        pattern.trig_mut(0).set_lock_on(None, 3, 0.5);
+        assert_eq!(pattern.trig(0).locks.len(), 2);
+        assert_eq!(pattern.trig(0).lock_on(Some(DeviceId(9)), 3), Some(0.25));
+        assert_eq!(pattern.trig(0).lock(3), Some(0.5));
+        assert!(pattern.trig_mut(0).clear_lock_on(Some(DeviceId(9)), 3));
+        assert_eq!(
+            pattern.trig(0).lock(3),
+            Some(0.5),
+            "clearing the effect's took the voice's"
         );
     }
 }

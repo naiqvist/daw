@@ -35,11 +35,21 @@ pub(super) enum ScopeContext {
     /// name is being typed every other key IS a letter, and a chord that
     /// fired mid-word would be a trap.
     Rename,
+    /// The trig menu is up: a callout over the sequencer, pointing at
+    /// the trig under the cursor, holding the verbs that trig answers
+    /// to. A list, so Up and Down walk it, Enter speaks the row and
+    /// Escape puts it away; the sequencer's own grammar waits underneath
+    /// until it is gone. Time and the ground stay global, as everywhere.
+    TrigMenu,
+    /// The sample editor is up: one file, full screen, and the keys are
+    /// the editor's — cursor, zoom, markers, slices, audition. A place
+    /// of its own, like the browser, that Escape leaves.
+    Sample,
 }
 
 impl ScopeContext {
     #[cfg(test)]
-    pub(super) const ALL: [Self; 7] = [
+    pub(super) const ALL: [Self; 9] = [
         Self::Root,
         Self::Nested,
         Self::Browser,
@@ -47,6 +57,8 @@ impl ScopeContext {
         Self::Chain,
         Self::Clip,
         Self::Rename,
+        Self::TrigMenu,
+        Self::Sample,
     ];
 }
 
@@ -131,6 +143,103 @@ pub enum StageIntent {
     /// Put the kept device down: after the cursor's device in the band,
     /// or at the end of the cursor's track from the session.
     Put,
+    /// Summon the trig menu over the trig under the cursor.
+    TrigMenu,
+    /// Release the parameter lock under the trig menu's cursor.
+    ClearLock,
+    /// An act in the sample editor, or the act of opening it.
+    Sample(SampleIntent),
+    /// Scan the library's folders again, so a pack dropped in while the
+    /// stage runs turns up without a restart.
+    Rescan,
+}
+
+/// What the sample editor can be told. Its own enum, so the editor's
+/// vocabulary is one thing to read and one thing to bind, and so the
+/// stage's own verbs are not diluted by two dozen that only mean
+/// anything over a waveform.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SampleIntent {
+    /// Open the editor on the sampler under the cursor.
+    Open,
+    Left {
+        coarse: bool,
+    },
+    Right {
+        coarse: bool,
+    },
+    /// Jump to the previous or next marker: trim, loop, slice.
+    JumpPrev,
+    JumpNext,
+    ZoomIn,
+    ZoomOut,
+    ScrollLeft,
+    ScrollRight,
+    /// The next page: TRIM, SLICE, ATTR, round.
+    Page,
+    SetStart,
+    SetEnd,
+    SetLoop,
+    AddSlice,
+    RemoveSlice,
+    /// Lay a grid of `count` equal slices.
+    Grid,
+    /// Detect onsets at the sensitivity and slice on them.
+    Transients,
+    ClearSlices,
+    /// More slices for the grid, or more gain on the ATTR page.
+    More,
+    Less,
+    /// A more eager, or a shyer, onset detector.
+    Eager,
+    Shyer,
+    Normalize,
+    Reverse,
+    Mode,
+    LoopMode,
+    /// Toggle zero-crossing snap for placed markers.
+    Snap,
+    /// Play the slice or the trim under the cursor.
+    Audition,
+    AuditionAll,
+}
+
+impl SampleIntent {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Open => "sample editor",
+            Self::Left { coarse: false } => "cursor left",
+            Self::Left { coarse: true } => "cursor left, coarsely",
+            Self::Right { coarse: false } => "cursor right",
+            Self::Right { coarse: true } => "cursor right, coarsely",
+            Self::JumpPrev => "previous marker",
+            Self::JumpNext => "next marker",
+            Self::ZoomIn => "zoom in",
+            Self::ZoomOut => "zoom out",
+            Self::ScrollLeft => "scroll left",
+            Self::ScrollRight => "scroll right",
+            Self::Page => "next page",
+            Self::SetStart => "start here",
+            Self::SetEnd => "end here",
+            Self::SetLoop => "loop from here",
+            Self::AddSlice => "slice here",
+            Self::RemoveSlice => "remove slice",
+            Self::Grid => "grid slices",
+            Self::Transients => "slice on onsets",
+            Self::ClearSlices => "clear slices",
+            Self::More => "more",
+            Self::Less => "less",
+            Self::Eager => "eager onsets",
+            Self::Shyer => "shy onsets",
+            Self::Normalize => "normalize",
+            Self::Reverse => "reverse",
+            Self::Mode => "play mode",
+            Self::LoopMode => "loop mode",
+            Self::Snap => "zero snap",
+            Self::Audition => "audition",
+            Self::AuditionAll => "audition all",
+        }
+    }
 }
 
 impl StageIntent {
@@ -205,6 +314,10 @@ impl StageIntent {
             Self::Nudge => "nudge, then a direction",
             Self::Yank => "yank device",
             Self::Put => "put device",
+            Self::TrigMenu => "trig menu",
+            Self::ClearLock => "clear lock",
+            Self::Sample(intent) => intent.label(),
+            Self::Rescan => "rescan library",
         }
     }
 }
@@ -443,12 +556,18 @@ const BINDINGS: &[Binding] = &[
     Binding::new(
         ScopeContext::Chain,
         Key::ArrowLeft,
-        StageIntent::Step(Step::Left),
+        StageIntent::Param {
+            up: false,
+            coarse: false,
+        },
     ),
     Binding::new(
         ScopeContext::Chain,
         Key::ArrowRight,
-        StageIntent::Step(Step::Right),
+        StageIntent::Param {
+            up: true,
+            coarse: false,
+        },
     ),
     Binding::new(
         ScopeContext::Chain,
@@ -465,7 +584,7 @@ const BINDINGS: &[Binding] = &[
         Key::ArrowRight,
         StageIntent::Param {
             up: true,
-            coarse: false,
+            coarse: true,
         },
     ),
     Binding::shift(
@@ -473,7 +592,7 @@ const BINDINGS: &[Binding] = &[
         Key::ArrowLeft,
         StageIntent::Param {
             up: false,
-            coarse: false,
+            coarse: true,
         },
     ),
     Binding::shift(
@@ -645,6 +764,294 @@ const BINDINGS: &[Binding] = &[
     Binding::new(ScopeContext::Rename, Key::Escape, StageIntent::Escape),
     Binding::new(ScopeContext::Rename, Key::Backspace, StageIntent::Backspace),
     Binding::command(ScopeContext::Rename, Key::L, StageIntent::Ground),
+    // The trig menu. Summoned from inside a clip on the heaviest form of
+    // the key that already means "act on this": Enter toggles the trig,
+    // and Enter with both hands down asks what ELSE the trig can do.
+    // Once up, it is a list and takes the list's keys, nothing more.
+    Binding::command_shift(ScopeContext::Clip, Key::Enter, StageIntent::TrigMenu),
+    Binding::new(
+        ScopeContext::TrigMenu,
+        Key::ArrowUp,
+        StageIntent::Step(Step::Up),
+    ),
+    Binding::new(
+        ScopeContext::TrigMenu,
+        Key::ArrowDown,
+        StageIntent::Step(Step::Down),
+    ),
+    Binding::new(ScopeContext::TrigMenu, Key::Enter, StageIntent::Enter),
+    Binding::new(ScopeContext::TrigMenu, Key::Escape, StageIntent::Escape),
+    // The sliders: Left and Right move the lock under the cursor by the
+    // parameter's own step, shifted for the coarse one — the same
+    // words the band uses for a knob, because a lock IS that knob for
+    // one trig. Delete lets the lock go.
+    Binding::new(
+        ScopeContext::TrigMenu,
+        Key::ArrowLeft,
+        StageIntent::Param {
+            up: false,
+            coarse: false,
+        },
+    ),
+    Binding::new(
+        ScopeContext::TrigMenu,
+        Key::ArrowRight,
+        StageIntent::Param {
+            up: true,
+            coarse: false,
+        },
+    ),
+    Binding::shift(
+        ScopeContext::TrigMenu,
+        Key::ArrowLeft,
+        StageIntent::Param {
+            up: false,
+            coarse: true,
+        },
+    ),
+    Binding::shift(
+        ScopeContext::TrigMenu,
+        Key::ArrowRight,
+        StageIntent::Param {
+            up: true,
+            coarse: true,
+        },
+    ),
+    Binding::new(ScopeContext::TrigMenu, Key::Delete, StageIntent::ClearLock),
+    Binding::new(
+        ScopeContext::TrigMenu,
+        Key::Backspace,
+        StageIntent::ClearLock,
+    ),
+    Binding::new(
+        ScopeContext::TrigMenu,
+        Key::Space,
+        StageIntent::ToggleTransport,
+    ),
+    Binding::new(ScopeContext::TrigMenu, Key::Home, StageIntent::Rewind),
+    Binding::new(ScopeContext::TrigMenu, Key::Questionmark, StageIntent::Help),
+    Binding::command(ScopeContext::TrigMenu, Key::L, StageIntent::Ground),
+    // The cutting room. Opened with ^E wherever the cursor addresses a
+    // track, and with Enter on a sampler in the band. Once up, its keys
+    // are its own; the globals stay.
+    Binding::command(
+        ScopeContext::Root,
+        Key::E,
+        StageIntent::Sample(SampleIntent::Open),
+    ),
+    Binding::command(
+        ScopeContext::Nested,
+        Key::E,
+        StageIntent::Sample(SampleIntent::Open),
+    ),
+    Binding::command(
+        ScopeContext::Mixer,
+        Key::E,
+        StageIntent::Sample(SampleIntent::Open),
+    ),
+    Binding::command(
+        ScopeContext::Clip,
+        Key::E,
+        StageIntent::Sample(SampleIntent::Open),
+    ),
+    Binding::command(
+        ScopeContext::Chain,
+        Key::E,
+        StageIntent::Sample(SampleIntent::Open),
+    ),
+    Binding::new(
+        ScopeContext::Chain,
+        Key::Enter,
+        StageIntent::Sample(SampleIntent::Open),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::ArrowLeft,
+        StageIntent::Sample(SampleIntent::Left { coarse: false }),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::ArrowRight,
+        StageIntent::Sample(SampleIntent::Right { coarse: false }),
+    ),
+    Binding::shift(
+        ScopeContext::Sample,
+        Key::ArrowLeft,
+        StageIntent::Sample(SampleIntent::Left { coarse: true }),
+    ),
+    Binding::shift(
+        ScopeContext::Sample,
+        Key::ArrowRight,
+        StageIntent::Sample(SampleIntent::Right { coarse: true }),
+    ),
+    Binding::command(
+        ScopeContext::Sample,
+        Key::ArrowLeft,
+        StageIntent::Sample(SampleIntent::JumpPrev),
+    ),
+    Binding::command(
+        ScopeContext::Sample,
+        Key::ArrowRight,
+        StageIntent::Sample(SampleIntent::JumpNext),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::ArrowUp,
+        StageIntent::Sample(SampleIntent::ZoomIn),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::ArrowDown,
+        StageIntent::Sample(SampleIntent::ZoomOut),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::PageUp,
+        StageIntent::Sample(SampleIntent::ScrollLeft),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::PageDown,
+        StageIntent::Sample(SampleIntent::ScrollRight),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::Tab,
+        StageIntent::Sample(SampleIntent::Page),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::S,
+        StageIntent::Sample(SampleIntent::SetStart),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::E,
+        StageIntent::Sample(SampleIntent::SetEnd),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::L,
+        StageIntent::Sample(SampleIntent::SetLoop),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::Enter,
+        StageIntent::Sample(SampleIntent::AddSlice),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::Delete,
+        StageIntent::Sample(SampleIntent::RemoveSlice),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::Backspace,
+        StageIntent::Sample(SampleIntent::RemoveSlice),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::G,
+        StageIntent::Sample(SampleIntent::Grid),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::T,
+        StageIntent::Sample(SampleIntent::Transients),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::C,
+        StageIntent::Sample(SampleIntent::ClearSlices),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::Plus,
+        StageIntent::Sample(SampleIntent::More),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::Equals,
+        StageIntent::Sample(SampleIntent::More),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::Minus,
+        StageIntent::Sample(SampleIntent::Less),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::CloseBracket,
+        StageIntent::Sample(SampleIntent::Eager),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::OpenBracket,
+        StageIntent::Sample(SampleIntent::Shyer),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::N,
+        StageIntent::Sample(SampleIntent::Normalize),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::R,
+        StageIntent::Sample(SampleIntent::Reverse),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::M,
+        StageIntent::Sample(SampleIntent::Mode),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::Q,
+        StageIntent::Sample(SampleIntent::LoopMode),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::Z,
+        StageIntent::Sample(SampleIntent::Snap),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::P,
+        StageIntent::Sample(SampleIntent::Audition),
+    ),
+    Binding::shift(
+        ScopeContext::Sample,
+        Key::P,
+        StageIntent::Sample(SampleIntent::AuditionAll),
+    ),
+    Binding::new(ScopeContext::Sample, Key::Escape, StageIntent::Escape),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::Space,
+        StageIntent::ToggleTransport,
+    ),
+    Binding::new(ScopeContext::Sample, Key::Home, StageIntent::Rewind),
+    Binding::new(ScopeContext::Sample, Key::Questionmark, StageIntent::Help),
+    Binding::command(ScopeContext::Sample, Key::L, StageIntent::Ground),
+    Binding::command(ScopeContext::Sample, Key::Z, StageIntent::Undo),
+    Binding::command_shift(ScopeContext::Sample, Key::Z, StageIntent::Redo),
+    Binding::command(ScopeContext::Sample, Key::S, StageIntent::Save),
+    // The library, read again. From the browser, where the result is
+    // seen, and from every place the browser can be summoned from.
+    Binding::command(ScopeContext::Browser, Key::R, StageIntent::Rescan),
+    Binding::command(ScopeContext::Root, Key::R, StageIntent::Rescan),
+    Binding::command(ScopeContext::Nested, Key::R, StageIntent::Rescan),
+    Binding::command(ScopeContext::Mixer, Key::R, StageIntent::Rescan),
+    Binding::command(ScopeContext::Chain, Key::R, StageIntent::Rescan),
+    // The band walks its devices on Tab, because the arrows are spent on
+    // the row and its value: Up and Down choose the parameter, Left and
+    // Right turn it, and Shift makes the turn coarse.
+    Binding::new(
+        ScopeContext::Chain,
+        Key::Tab,
+        StageIntent::Step(Step::Right),
+    ),
+    Binding::shift(ScopeContext::Chain, Key::Tab, StageIntent::Step(Step::Left)),
 ];
 
 /// Every binding in one scope, in table order. The help surface reads
@@ -669,7 +1076,7 @@ fn family(intent: StageIntent) -> &'static str {
         StageIntent::Step(_) | StageIntent::Enter | StageIntent::Escape => "move",
         StageIntent::ToggleTransport | StageIntent::Rewind => "time",
         StageIntent::Help | StageIntent::Browse | StageIntent::Mix | StageIntent::Ground => "view",
-        StageIntent::TypeChar(_) | StageIntent::Backspace => "browse",
+        StageIntent::TypeChar(_) | StageIntent::Backspace | StageIntent::Rescan => "browse",
         StageIntent::NewAudioTrack | StageIntent::NewInstrumentTrack => "track",
         StageIntent::Clear | StageIntent::Launch | StageIntent::LaunchScene => "session",
         StageIntent::Gain { .. }
@@ -679,7 +1086,12 @@ fn family(intent: StageIntent) -> &'static str {
         StageIntent::Devices | StageIntent::Param { .. } => "devices",
         StageIntent::Undo | StageIntent::Redo | StageIntent::Save => "document",
         StageIntent::Rename | StageIntent::DeleteTrack => "track",
-        StageIntent::Nudge | StageIntent::Yank | StageIntent::Put => "edit",
+        StageIntent::Nudge
+        | StageIntent::Yank
+        | StageIntent::Put
+        | StageIntent::TrigMenu
+        | StageIntent::ClearLock => "edit",
+        StageIntent::Sample(_) => "sample",
     }
 }
 
@@ -866,6 +1278,24 @@ mod tests {
             ),
             Some(StageIntent::Escape)
         );
+    }
+
+    /// Inside a clip the sequencer's own command chords are its own:
+    /// ^R resizes the clip and ^A selects all, and the stage must not
+    /// take either before the grammar sees it. This is the binding that
+    /// once shadowed clip resize with the library rescan.
+    #[test]
+    fn the_clip_scope_leaves_the_grammars_command_chords_alone() {
+        for (verb, key, name) in crate::ui::sequencer::verbs::COMMAND_TABLE {
+            assert_eq!(
+                dispatch(
+                    ScopeContext::Clip,
+                    StageInput::Chord(Modifiers::COMMAND, *key)
+                ),
+                None,
+                "the stage took ^{key:?} from the grammar's {name} ({verb:?})"
+            );
+        }
     }
 
     #[test]

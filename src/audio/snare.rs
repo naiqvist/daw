@@ -160,6 +160,10 @@ fn pitch_scale(pitch: u8) -> f32 {
 pub struct SnareVoice {
     sample_rate: f32,
     params: SnareParams,
+    /// The knobs as letters last set them: what a lock's restore
+    /// returns to. `params` is the LIVE patch, which a lock may hold
+    /// elsewhere for one hit.
+    base: SnareParams,
 
     /// The two shell modes. One table set between them — the tables are
     /// read-only once built, so sharing costs nothing and allocates once.
@@ -210,6 +214,7 @@ impl SnareVoice {
         Self {
             sample_rate: 48_000.0,
             params: SnareParams::default(),
+            base: SnareParams::default(),
             shell_a: MipOsc::new(),
             shell_b: MipOsc::new(),
             tables: Vec::new(),
@@ -295,7 +300,21 @@ impl SnareVoice {
         self.snap_env.reset();
     }
 
+    /// A letter: the knob moves, and the live patch with it.
     pub fn set_param(&mut self, param: u32, value: f32) {
+        self.base.set(param, value);
+        self.apply_param(param, value);
+    }
+
+    /// A parameter LOCK at a note boundary: `Some` holds the live patch
+    /// at the note's own value, `None` returns it to the knob. The knob
+    /// itself never moves, so a lock is heard on its hit and no other.
+    pub fn plock(&mut self, param: u32, value: Option<f32>) {
+        let value = value.unwrap_or_else(|| self.base.get(param));
+        self.apply_param(param, value);
+    }
+
+    fn apply_param(&mut self, param: u32, value: f32) {
         self.params.set(param, value);
         match param {
             sp::TONE_DECAY | sp::BEND_TIME | sp::SNAP_DECAY => self.apply_envelopes(),

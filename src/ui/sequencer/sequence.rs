@@ -124,6 +124,13 @@ pub struct NoteView {
     pub probability: f32,
     pub enabled: bool,
     pub muted: bool,
+    /// How many parameters the trig this note belongs to holds locked.
+    /// A trig's fact carried on each of its notes, because the views are
+    /// per note and a lock mark belongs on the cell either way.
+    pub locks: u8,
+    /// The slice the trig holds locked, from one, if it holds one — the
+    /// sampler's SLICE row. A cell on a slicing track wears it as a tag.
+    pub slice: Option<u8>,
 }
 
 impl NoteView {
@@ -148,6 +155,8 @@ impl NoteView {
             probability,
             enabled,
             muted: !enabled,
+            locks: 0,
+            slice: None,
         }
     }
 }
@@ -162,6 +171,11 @@ pub struct ClipView<'a> {
     /// drawn as ghosts before commit (the note-command preview
     /// contract). Empty when nothing is pending.
     pub ghosts: &'a [NoteView],
+    /// Whether the track's voice is a sampler in slice mode. A cell on
+    /// such a track wears the trig's locked slice as a tag; the note
+    /// stays a pitch, because on this deck a note IS a pitch and the
+    /// slice is a row.
+    pub slicing: bool,
 }
 
 pub use crate::intent::sequence::Intent;
@@ -176,6 +190,10 @@ pub struct Outcome {
     /// by the palette's long forms (`:tune`, `:quantize-key`, …).
     /// `None` when the sequence panel did not draw this frame.
     pub cursor_tick: Option<usize>,
+    /// Where the cursor's cell was drawn, so a frame can put a mark ON
+    /// the thing under the cursor — a callout, a bubble — rather than
+    /// somewhere near the editor. `None` when the cell was off screen.
+    pub cursor_rect: Option<egui::Rect>,
 }
 
 impl Default for Outcome {
@@ -185,11 +203,25 @@ impl Default for Outcome {
             claim_focus: false,
             content_rect: egui::Rect::NOTHING,
             cursor_tick: None,
+            cursor_rect: None,
         }
     }
 }
 
 impl SequencePanel {
+    /// What is under the cursor in whichever editor this clip is shown
+    /// in: the same snapshot the inspector states, for a frame that
+    /// wants to act on it.
+    pub(crate) fn selection(
+        &self,
+        clip: Option<ClipView<'_>>,
+    ) -> crate::ui::sequencer::sequence_grid::TrigSelection {
+        match clip.map_or(Editor::Grid, |clip| self.editor_for(clip.id)) {
+            Editor::Grid => self.grid.selection(clip),
+            Editor::Roll => self.roll.selection(clip),
+        }
+    }
+
     fn editor_for(&self, pattern: u64) -> Editor {
         if self.roll_patterns.contains(&pattern) {
             Editor::Roll
@@ -292,6 +324,7 @@ impl SequencePanel {
                 );
                 trig_info::show(ui, trig_rect, self.grid.selection(clip), ground);
                 outcome.cursor_tick = Some(self.grid.cursor_tick());
+                outcome.cursor_rect = self.grid.cursor_rect();
                 requested
             }
             Editor::Roll => {
@@ -307,6 +340,7 @@ impl SequencePanel {
                 );
                 trig_info::show(ui, trig_rect, self.roll.selection(clip), ground);
                 outcome.cursor_tick = Some(self.roll.cursor_tick());
+                outcome.cursor_rect = self.roll.cursor_rect();
                 requested
             }
         };

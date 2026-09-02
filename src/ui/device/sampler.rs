@@ -54,7 +54,7 @@ pub struct SamplerUi {
 /// How many rows the table has. Checked against `sp::TABLE` by a test —
 /// a constant here and a table there is precisely the drift this layout
 /// is trying to avoid, so it is asserted rather than trusted.
-pub const ROWS_TOTAL: usize = 36;
+pub const ROWS_TOTAL: usize = 37;
 
 impl Default for SamplerUi {
     /// Every knob at the TABLE's default, so a fresh card and a fresh
@@ -266,6 +266,13 @@ fn param_of(param: u32) -> Param {
             },
             Unit::Plain,
         )),
+        sp::SLICE => with(Param::new(
+            "slice",
+            Mapping::Steps {
+                count: def.max as u32,
+            },
+            Unit::Plain,
+        )),
         // A MIDI note prints as a name. Sixty is C4, which is what the
         // piano roll already draws.
         sp::ROOT => with(Param::new(
@@ -356,7 +363,7 @@ fn shown(param: u32, value: f32) -> f32 {
         | sp::PREAMP
         | sp::PAN => value * 100.0,
         // One slice is step zero.
-        sp::SLICES => value - 1.0,
+        sp::SLICES | sp::SLICE => value - 1.0,
         _ => value,
     }
 }
@@ -386,7 +393,7 @@ fn natural(param: u32, value: f32) -> f32 {
         | sp::DRIVE
         | sp::PREAMP
         | sp::PAN => value / 100.0,
-        sp::SLICES => value.round() + 1.0,
+        sp::SLICES | sp::SLICE => value.round() + 1.0,
         sp::ROOT
         | sp::MODE
         | sp::REVERSE
@@ -476,6 +483,7 @@ const PAGES: [&[&[u32]]; 5] = [
         sp::FADE_OUT,
         sp::TUNE,
         sp::FINE,
+        sp::SLICE,
     ]],
     // loop: how it repeats, and how it is cut up.
     &[&[

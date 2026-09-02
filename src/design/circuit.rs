@@ -35,7 +35,114 @@ pub fn trace(out: &mut Vec<Shape>, path: &[Pos2], weight: Weight, ink: Color32) 
         return;
     }
     let pts: Vec<Pos2> = path.iter().map(|p| snap_pos(*p)).collect();
-    out.push(Shape::line(pts, Stroke::new(weight.px(), ink)));
+    inked(out, &pts, false, weight, ink);
+}
+
+// -------------------------------------------------------------------- ink
+
+/// How far the ink may thin along a line, as a share of full strength.
+/// Well under a fifth: the texture has to stay below the point where a
+/// line reads as worn, broken or dashed. It is a line that was LAID, and
+/// the eye should only know that on a second look.
+const INK_WAVER: f32 = 0.0;
+/// One run of the pen, in pixels, before the pressure changes.
+const INK_RUN: f32 = 5.0;
+/// How often a run of the pen throws a speck: one run in this many.
+/// Sparse enough that a speck is found, never seen.
+const SPRAY_CHANCE: f32 = 0.0;
+/// How far a speck's centre lands from the line's centre, in pixels,
+/// either side. With the pixel snap and the speck's own half-pixel this
+/// bounds all dust to three pixels of the line, which is the slop
+/// `every_figure_stays_inside_its_rect` grants a figure.
+const SPRAY_REACH: f32 = 2.0;
+/// The strongest a speck may be, as a share of the ink. Under half: a
+/// speck is dust beside the line, never a second line.
+const SPRAY_STRENGTH: f32 = 0.12;
+
+/// A stroke laid rather than ruled.
+///
+/// The line is drawn once, whole, at a little under full ink; then short
+/// runs of extra ink are laid over it, each at its own strength, so the
+/// density wavers along the line the way a pen's does. The texture is
+/// only ever ink ADDED to a continuous stroke, so nothing here can open
+/// a gap or move an edge — geometry is untouched, only the ink varies.
+///
+/// Seeded from where the path lies, so the same line is inked the same
+/// way on every frame and every machine: a seed, not a clock, per the
+/// kit's first rule. A moving grain would be a channel nobody budgeted.
+pub fn inked(out: &mut Vec<Shape>, pts: &[Pos2], closed: bool, weight: Weight, ink: Color32) {
+    if pts.len() < 2 {
+        return;
+    }
+    // Ruled, not laid: with no waver and no spray there is nothing to
+    // add to a whole line, so the whole line is all that is drawn.
+    if INK_WAVER <= 0.0 && SPRAY_CHANCE <= 0.0 {
+        let stroke = Stroke::new(weight.px(), ink);
+        if closed {
+            out.push(Shape::closed_line(pts.to_vec(), stroke));
+        } else {
+            out.push(Shape::line(pts.to_vec(), stroke));
+        }
+        return;
+    }
+    let base = Stroke::new(weight.px(), ink.gamma_multiply(1.0 - INK_WAVER));
+    if closed {
+        out.push(Shape::closed_line(pts.to_vec(), base));
+    } else {
+        out.push(Shape::line(pts.to_vec(), base));
+    }
+    let key: Vec<(i32, i32)> = pts
+        .iter()
+        .map(|p| ((p.x * 2.0).round() as i32, (p.y * 2.0).round() as i32))
+        .collect();
+    let mut rng = Rng::seeded(("ink", key));
+    let n = pts.len();
+    let segments = if closed { n } else { n - 1 };
+    for i in 0..segments {
+        let a = pts[i];
+        let b = pts[(i + 1) % n];
+        let seg = b - a;
+        let len = seg.length();
+        if len < 1e-3 {
+            continue;
+        }
+        let dir = seg / len;
+        let mut t = 0.0;
+        while t < len {
+            let run = rng.range(INK_RUN * 0.6, INK_RUN * 1.6).min(len - t);
+            // Strength is the share of the missing ink this run puts
+            // back: 1 brings the run to full, 0 leaves it at the base.
+            // The faintest quarter is dropped, so some of the line is
+            // simply the base and the pen visibly lifted there.
+            let strength = rng.f32();
+            if strength > 0.25 {
+                out.push(Shape::line_segment(
+                    [a + dir * t, a + dir * (t + run)],
+                    Stroke::new(weight.px(), ink.gamma_multiply(strength)),
+                ));
+            }
+            // The spray: now and then a run throws one speck of dust a
+            // pixel or two off the line, faint, on either side. Single
+            // pixels, pixel-aligned, so a speck is a speck and not a
+            // smear. The same seed as the pressure, so it too holds still.
+            if rng.chance(SPRAY_CHANCE) {
+                let along = a + dir * rng.range(t, t + run);
+                let side = rng.range(0.75, SPRAY_REACH) * if rng.chance(0.5) { 1.0 } else { -1.0 };
+                let normal = vec2(-dir.y, dir.x);
+                let at = along + normal * side;
+                let speck = Rect::from_center_size(
+                    pos2(at.x.round() + 0.5, at.y.round() + 0.5),
+                    vec2(1.0, 1.0),
+                );
+                out.push(Shape::rect_filled(
+                    speck,
+                    0.0,
+                    ink.gamma_multiply(rng.range(SPRAY_STRENGTH * 0.5, SPRAY_STRENGTH)),
+                ));
+            }
+            t += run;
+        }
+    }
 }
 
 /// A path from `a` to `b`: straight along the longer axis, then a
@@ -193,7 +300,7 @@ pub fn octagon(
                 }
             })
             .collect();
-        out.push(Shape::closed_line(pts, Stroke::new(weight.px(), ink)));
+        inked(out, &pts, true, weight, ink);
     }
 }
 
@@ -507,7 +614,20 @@ pub fn brackets(out: &mut Vec<Shape>, rect: Rect, cap: f32, weight: Weight, ink:
 
 /// A hairline with filled pads at `pads`, each a position in 0..1 along it.
 pub fn rail(out: &mut Vec<Shape>, from: Pos2, to: Pos2, pads: &[f32], ink: Color32) {
-    trace(out, &[from, to], Weight::Hair, ink);
+    rail_weighted(out, from, to, pads, Weight::Hair, ink);
+}
+
+/// A rail at a chosen weight. `Heavy` is for the one rail a board hangs
+/// off; every rail that merely connects stays a hairline.
+pub fn rail_weighted(
+    out: &mut Vec<Shape>,
+    from: Pos2,
+    to: Pos2,
+    pads: &[f32],
+    weight: Weight,
+    ink: Color32,
+) {
+    trace(out, &[from, to], weight, ink);
     for t in pads {
         let t = t.clamp(0.0, 1.0);
         pad(out, from + (to - from) * t, PAD - 1.0, ink, true);
@@ -742,6 +862,105 @@ mod tests {
     const INK: Color32 = Color32::WHITE;
     const GROUND: Color32 = Color32::BLACK;
 
+    /// The texture is ink added to a whole line. The first shape is the
+    /// full path at nearly full strength, so no run can ever open a gap;
+    /// every run lies on that path and none is stronger than the ink.
+    #[test]
+    fn inked_lines_stay_whole_and_never_exceed_the_ink() {
+        if INK_WAVER <= 0.0 && SPRAY_CHANCE <= 0.0 {
+            // Ruled: one whole line and nothing laid over it.
+            let mut out = Vec::new();
+            inked(
+                &mut out,
+                &[pos2(1.5, 2.5), pos2(50.5, 2.5)],
+                false,
+                Weight::Hair,
+                INK,
+            );
+            assert_eq!(out.len(), 1, "a ruled line laid extra ink");
+            return;
+        }
+        let path = [pos2(10.5, 20.5), pos2(200.5, 20.5), pos2(200.5, 90.5)];
+        let mut out = Vec::new();
+        inked(&mut out, &path, false, Weight::Hair, INK);
+        let Some(Shape::Path(base)) = out.first() else {
+            panic!("the first shape is not the whole line")
+        };
+        assert_eq!(base.points, path.to_vec(), "the base line moved");
+        let eframe::epaint::ColorMode::Solid(base_ink) = base.stroke.color else {
+            panic!("the base line is not one colour")
+        };
+        assert!(base_ink.a() >= 200, "the base line is not nearly full");
+        assert!(out.len() > 3, "no runs were laid");
+        let mut specks = 0;
+        for shape in &out[1..] {
+            match shape {
+                Shape::LineSegment { points, stroke } => {
+                    assert!(stroke.color.a() <= INK.a(), "a run outweighed the ink");
+                    for p in points {
+                        let on_first = (p.y - 20.5).abs() < 1e-3 && (10.5..=200.5).contains(&p.x);
+                        let on_second = (p.x - 200.5).abs() < 1e-3 && (20.5..=90.5).contains(&p.y);
+                        assert!(on_first || on_second, "a run left the line at {p:?}");
+                    }
+                }
+                Shape::Rect(speck) => {
+                    specks += 1;
+                    assert_eq!(
+                        speck.rect.size(),
+                        vec2(1.0, 1.0),
+                        "a speck is not one pixel"
+                    );
+                    assert!(
+                        speck.fill.a() as f32 <= INK.a() as f32 * SPRAY_STRENGTH + 1.0,
+                        "a speck outweighed the dust"
+                    );
+                    let c = speck.rect.center();
+                    let near_first =
+                        (c.y - 20.5).abs() <= SPRAY_REACH + 1.0 && (9.0..=202.0).contains(&c.x);
+                    let near_second =
+                        (c.x - 200.5).abs() <= SPRAY_REACH + 1.0 && (19.0..=92.0).contains(&c.y);
+                    assert!(near_first || near_second, "a speck flew off at {c:?}");
+                }
+                other => panic!("an unexpected shape in the ink: {other:?}"),
+            }
+        }
+        assert!(specks > 0, "no dust at all");
+        assert!(specks < out.len() / 2, "more dust than line");
+    }
+
+    /// A seed, not a clock: the same line is inked the same way twice,
+    /// and a different line differently.
+    #[test]
+    fn the_ink_is_the_same_every_time_and_different_per_line() {
+        if INK_WAVER <= 0.0 && SPRAY_CHANCE <= 0.0 {
+            // Ruled lines have no hand to differ by.
+            return;
+        }
+        let path = [pos2(10.5, 20.5), pos2(300.5, 20.5)];
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        inked(&mut a, &path, false, Weight::Hair, INK);
+        inked(&mut b, &path, false, Weight::Hair, INK);
+        assert_eq!(
+            format!("{a:?}"),
+            format!("{b:?}"),
+            "the ink moved between frames"
+        );
+        let mut c = Vec::new();
+        inked(
+            &mut c,
+            &[pos2(10.5, 40.5), pos2(300.5, 40.5)],
+            false,
+            Weight::Hair,
+            INK,
+        );
+        assert_ne!(
+            format!("{a:?}").replace("20.5", "40.5"),
+            format!("{c:?}"),
+            "two lines were inked with one hand"
+        );
+    }
+
     #[test]
     fn an_elbow_bends_once_at_forty_five_degrees() {
         let path = elbow(pos2(0.0, 0.0), pos2(100.0, 30.0));
@@ -792,7 +1011,9 @@ mod tests {
     fn every_figure_stays_inside_its_rect() {
         for side in [4.0f32, 8.0, 14.0, 22.0, 60.0, 120.0] {
             let rect = r(side, side * 0.7 + 3.0);
-            let within = rect.expand(2.0);
+            // Three: two for the stroke's own width and snap, and one
+            // more for the dust the ink throws (see `SPRAY_REACH`).
+            let within = rect.expand(3.0);
             let mut cases: Vec<(&str, Vec<Shape>)> = Vec::new();
             let mut out = Vec::new();
             octagon(

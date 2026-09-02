@@ -49,6 +49,15 @@ pub struct Note {
     /// never sees the notes.
     #[serde(default)]
     pub plocks: Vec<(u32, f32)>,
+    /// Locks on OTHER nodes — the track's effects — as `(node bits,
+    /// param id, engine value)`. The voice's clock fires them at the
+    /// note's own sample into a bounded bus, and the walk hands each to
+    /// its node before that node renders the same block: as tight as a
+    /// block, which is what a letter gets too. An unlocked note on a
+    /// parameter locked anywhere restores the node's knob, the way a
+    /// voice lock restores the voice's.
+    #[serde(default)]
+    pub fx_locks: Vec<(u64, u32, f32)>,
     /// TRIG probability, `0..=1`. Deterministic by DESIGN: the decision
     /// is a hash of the note's identity and the pattern cycle, so it
     /// feels random across cycles while a bounce reproduces the take
@@ -209,6 +218,9 @@ pub struct SeqEvent {
     param: u32,
     value: f32,
     restore: bool,
+    /// The node a lock is for, as `NodeId::to_bits`; zero is the voice
+    /// itself, and anything else goes out on the clock's lock bus.
+    node: u64,
     /// Trig condition, carried by the note's ON and OFF alike: both make
     /// the SAME deterministic decision, so a skipped note's off cannot
     /// release some other voice of the same pitch.
@@ -664,11 +676,7 @@ impl Voices for crate::audio::kick::KickVoice {
         crate::audio::kick::KickVoice::trigger(self, pitch, vel);
     }
     fn plock(&mut self, param: u32, value: Option<f32>) {
-        // `None` restores the instrument's live base, which for a kick is
-        // simply the knob — there is no per-voice state to unwind.
-        if let Some(value) = value {
-            crate::audio::kick::KickVoice::set_param(self, param, value);
-        }
+        crate::audio::kick::KickVoice::plock(self, param, value);
     }
     fn render(&mut self, out: &mut [f32], _at: usize, gain: &mut Ramp) {
         // The trait's contract is WRITE, not add: clear, fill, then ride
@@ -714,12 +722,7 @@ macro_rules! one_shot_drum_voices {
                 <$voice>::trigger(self, pitch, vel);
             }
             fn plock(&mut self, param: u32, value: Option<f32>) {
-                // `None` restores the instrument's live base, which for a
-                // one-shot drum is simply the knob — there is no
-                // per-voice state to unwind.
-                if let Some(value) = value {
-                    <$voice>::set_param(self, param, value);
-                }
+                <$voice>::plock(self, param, value);
             }
             fn render(&mut self, out: &mut [f32], _at: usize, gain: &mut Ramp) {
                 // The trait's contract is WRITE, not add: clear, fill,
@@ -885,6 +888,30 @@ impl Voices for crate::audio::sampler::SamplerVoices {
 /// strictly-greater wrap reconciliation, the monotonic phase guard — is
 /// the most expensively-earned code in this file, and two copies of it
 /// would drift the first time one was fixed.
+/// One lock bound for another node, waiting on the clock's bus.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FxLock {
+    pub node: u64,
+    pub param: u32,
+    pub value: f32,
+    pub restore: bool,
+}
+
+/// One effect parameter's knob, remembered by the schedule so a lock
+/// can be restored from it.
+#[derive(Debug, Clone, Copy)]
+struct FxBase {
+    node: u64,
+    param: u32,
+    base: f32,
+}
+
+/// The most effect locks one clock can post in one block. A fixed
+/// array, because the callback allocates nothing; a note with more
+/// locks than this on more effects than this loses the surplus for the
+/// block, which is a bound and not a crash.
+pub const FX_BUS: usize = 32;
+
 #[derive(Debug, Clone, Copy)]
 pub struct PatternClock {
     /// Index into the compiled event list.
@@ -914,6 +941,9 @@ pub struct PatternClock {
     /// accumulating, so this exists to keep that derivation MONOTONIC:
     /// a float rounding that stepped backward would fire an event twice.
     prev_phase: u64,
+    /// Effect locks fired this block, for the walk to deliver.
+    fx_out: [FxLock; FX_BUS],
+    fx_len: usize,
 }
 
 impl PatternClock {
@@ -925,6 +955,8 @@ impl PatternClock {
             samples_per_beat,
             last_cycle: 0,
             prev_phase: 0,
+            fx_out: [FxLock::default(); FX_BUS],
+            fx_len: 0,
         }
     }
 
@@ -934,6 +966,13 @@ impl PatternClock {
     /// `gain` is the caller's ramp, already spanning the segment; it must
     /// advance once per sample on EVERY path, silence included, which the
     /// instrument's `render` is responsible for.
+    /// Take this block's effect locks off the bus, in the order fired.
+    fn take_fx(&mut self) -> ([FxLock; FX_BUS], usize) {
+        let out = (self.fx_out, self.fx_len);
+        self.fx_len = 0;
+        out
+    }
+
     fn run<V: Voices>(
         &mut self,
         voices: &mut V,
@@ -1107,7 +1146,20 @@ impl PatternClock {
                     }
                     match ev.rank {
                         0 => voices.note_off(ev.pitch),
-                        1 => voices.plock(ev.param, if ev.restore { None } else { Some(ev.value) }),
+                        1 if ev.node == 0 => {
+                            voices.plock(ev.param, if ev.restore { None } else { Some(ev.value) })
+                        }
+                        1 => {
+                            if self.fx_len < FX_BUS {
+                                self.fx_out[self.fx_len] = FxLock {
+                                    node: ev.node,
+                                    param: ev.param,
+                                    value: ev.value,
+                                    restore: ev.restore,
+                                };
+                                self.fx_len += 1;
+                            }
+                        }
                         _ => {
                             let age = self.next_age;
                             self.next_age = self.next_age.wrapping_add(1);
@@ -1133,6 +1185,21 @@ impl PatternClock {
         self.last_cycle = cycle;
         self.prev_phase = phase;
     }
+}
+
+/// A slice table in frames, from fractions of a file `frames` long:
+/// sorted, distinct, inside the file, and no more than the sampler holds.
+pub(crate) fn slice_frames(fractions: &[f64], frames: u64) -> Vec<u64> {
+    let mut table: Vec<u64> = fractions
+        .iter()
+        .filter(|f| f.is_finite() && (0.0..1.0).contains(*f))
+        .map(|f| (f * frames as f64).round() as u64)
+        .filter(|at| *at < frames)
+        .collect();
+    table.sort_unstable();
+    table.dedup();
+    table.truncate(crate::audio::sampler::MAX_SLICES);
+    table
 }
 
 /// Bake a pattern's notes into one sorted, sample-stamped event list.
@@ -1165,6 +1232,14 @@ fn compile_events(
         .collect();
     locked_anywhere.sort_unstable();
     locked_anywhere.dedup();
+    // The same story for the effects: every (node, param) locked by any
+    // note gets an event on every note — a value, or a restore.
+    let mut fx_locked_anywhere: Vec<(u64, u32)> = notes
+        .iter()
+        .flat_map(|n| n.fx_locks.iter().map(|(node, id, _)| (*node, *id)))
+        .collect();
+    fx_locked_anywhere.sort_unstable();
+    fx_locked_anywhere.dedup();
     // Bake note starts/ends into one sorted event list.
     // Sort by (beat, rank): offs before ons on exact ties.
     let mut events = Vec::with_capacity(notes.len() * 2);
@@ -1233,6 +1308,26 @@ fn compile_events(
                 param,
                 value: lock.map(|(_, v)| *v).unwrap_or(0.0),
                 restore: lock.is_none(),
+                node: 0,
+                prob,
+                cond,
+                trig_key,
+            });
+        }
+        for &(node, param) in &fx_locked_anywhere {
+            let lock = n
+                .fx_locks
+                .iter()
+                .find(|(target, id, _)| *target == node && *id == param);
+            events.push(SeqEvent {
+                sample: on,
+                rank: 1,
+                pitch: n.pitch,
+                vel: 0,
+                param,
+                value: lock.map(|(_, _, v)| *v).unwrap_or(0.0),
+                restore: lock.is_none(),
+                node,
                 prob,
                 cond,
                 trig_key,
@@ -1246,6 +1341,7 @@ fn compile_events(
             param: 0,
             value: 0.0,
             restore: false,
+            node: 0,
             prob,
             cond,
             trig_key,
@@ -1258,6 +1354,7 @@ fn compile_events(
             param: 0,
             value: 0.0,
             restore: false,
+            node: 0,
             prob,
             cond,
             trig_key,
@@ -3967,6 +4064,26 @@ impl Node {
         }
     }
 
+    /// The pattern clock a timeline-locked instrument walks, for the
+    /// schedule to take its effect locks from after it renders.
+    fn clock_mut(&mut self) -> Option<&mut PatternClock> {
+        match self {
+            Node::Seq { clock, .. }
+            | Node::Tine { clock, .. }
+            | Node::Poly { clock, .. }
+            | Node::Loom { clock, .. }
+            | Node::Haze { clock, .. }
+            | Node::Kick { clock, .. }
+            | Node::Acid { clock, .. }
+            | Node::Sampler { clock, .. }
+            | Node::Snare { clock, .. }
+            | Node::Tom { clock, .. }
+            | Node::Hat { clock, .. }
+            | Node::Handclap { clock, .. } => Some(clock),
+            _ => None,
+        }
+    }
+
     /// Apply one parameter letter. Unknown param ids are ignored — a stale
     /// letter after a graph edit must be harmless, not a panic.
     fn apply(&mut self, param: u32, value: f32) {
@@ -4830,6 +4947,10 @@ pub struct Schedule {
     /// the walk, so the values a node reads this segment are this
     /// segment's.
     modulation: ModPlan,
+    /// The knob behind every effect parameter some note locks: what a
+    /// restore returns to. Letters move it, so a knob turned mid-playback
+    /// is heard on every unlocked note, as with the voice's own locks.
+    fx_bases: Vec<FxBase>,
     /// Samples of latency between this schedule's inputs and its output —
     /// the deepest path, after compensation has made every path agree.
     ///
@@ -4946,15 +5067,49 @@ impl Schedule {
         if !change.value.is_finite() {
             return;
         }
-        let slot = change.node as u32 as usize;
-        let generation = (change.node >> 32) as u32;
-        if let Some(&(g, dense)) = self.slot_table.get(slot)
+        if let Some(base) = self
+            .fx_bases
+            .iter_mut()
+            .find(|b| b.node == change.node && b.param == change.param)
+        {
+            base.base = change.value;
+        }
+        self.apply_to(change.node, change.param, change.value);
+    }
+
+    /// Land a value on a node's parameter, or on its modulation base
+    /// when the parameter is modulated. The letter path and the effect
+    /// lock path both end here.
+    fn apply_to(&mut self, node: u64, param: u32, value: f32) {
+        Self::land(
+            &mut self.nodes,
+            &mut self.modulation,
+            &self.slot_table,
+            node,
+            param,
+            value,
+        );
+    }
+
+    /// `apply_to` over the schedule's parts, so the walk can deliver a
+    /// lock while it holds its steps.
+    fn land(
+        nodes: &mut [Node],
+        modulation: &mut ModPlan,
+        slot_table: &[(u32, u32)],
+        node: u64,
+        param: u32,
+        value: f32,
+    ) {
+        let slot = node as u32 as usize;
+        let generation = (node >> 32) as u32;
+        if let Some(&(g, dense)) = slot_table.get(slot)
             && g == generation
         {
-            if let Some(base) = self.modulation.base_slot(dense as usize, change.param) {
-                *base = change.value;
-            } else if let Some(node) = self.nodes.get_mut(dense as usize) {
-                node.apply(change.param, change.value);
+            if let Some(base) = modulation.base_slot(dense as usize, param) {
+                *base = value;
+            } else if let Some(node) = nodes.get_mut(dense as usize) {
+                node.apply(param, value);
             }
         }
     }
@@ -5105,6 +5260,38 @@ impl Schedule {
             let mut out = OutRef { l, r };
             self.nodes[step.node].process(&gathered[..n_inputs], &mut out, ctx);
 
+            // The effect locks this node's clock fired: delivered now,
+            // before the nodes downstream render this block. A restore
+            // returns the knob; a lock on a knob nobody registered is
+            // binned, like a letter for a departed node.
+            if let Some((bus, fired)) = self.nodes[step.node].clock_mut().map(PatternClock::take_fx)
+            {
+                for lock in &bus[..fired.min(FX_BUS)] {
+                    let value = if lock.restore {
+                        match self
+                            .fx_bases
+                            .iter()
+                            .find(|b| b.node == lock.node && b.param == lock.param)
+                        {
+                            Some(base) => base.base,
+                            None => continue,
+                        }
+                    } else {
+                        lock.value
+                    };
+                    if value.is_finite() {
+                        Self::land(
+                            &mut self.nodes,
+                            &mut self.modulation,
+                            &self.slot_table,
+                            lock.node,
+                            lock.param,
+                            value,
+                        );
+                    }
+                }
+            }
+
             // Metering happens HERE, not after the walk: the allocator
             // recycles a node's slots as soon as its last consumer has run,
             // so this is the only moment this step's output exists. Bounded
@@ -5205,6 +5392,28 @@ pub enum CompileError {
     BadClipLen,
 }
 
+impl NodeSpec {
+    /// The notes a timeline-locked instrument plays, for a compiler that
+    /// finishes them after the rest of the chain is placed.
+    pub fn notes_mut(&mut self) -> Option<&mut Vec<Note>> {
+        match self {
+            NodeSpec::Seq { notes, .. }
+            | NodeSpec::Tine { notes, .. }
+            | NodeSpec::Poly { notes, .. }
+            | NodeSpec::Loom { notes, .. }
+            | NodeSpec::Haze { notes, .. }
+            | NodeSpec::Kick { notes, .. }
+            | NodeSpec::Acid { notes, .. }
+            | NodeSpec::Sampler { notes, .. }
+            | NodeSpec::Snare { notes, .. }
+            | NodeSpec::Tom { notes, .. }
+            | NodeSpec::Hat { notes, .. }
+            | NodeSpec::Handclap { notes, .. } => Some(notes),
+            _ => None,
+        }
+    }
+}
+
 /// Green zone: the editable graph description — nodes plus wires. Compile
 /// turns it into a runnable plan or refuses with a reason.
 ///
@@ -5233,6 +5442,11 @@ pub struct GraphSpec {
     /// resolved to a node and param id by whoever built the graph — the
     /// only place that knows both halves.
     modulation: ModSpec,
+    /// The knob behind every effect parameter a note locks, so the
+    /// schedule can restore it. Registered by the compiler that knows
+    /// the device's value; a lock on a parameter nobody registered is
+    /// applied but never restored.
+    fx_bases: Vec<(NodeId, u32, f32)>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -5702,12 +5916,14 @@ pub enum NodeSpec {
         /// The 36-row `params::sampler` patch, in engine units.
         #[serde(default)]
         params: crate::audio::sampler::SamplerParams,
-        /// Slice boundaries in SOURCE frames. Authored green-side (a
-        /// grid, detected onsets, or dragged markers) and baked here, for
-        /// the reason a clip's envelope is sorted at compile: the
-        /// callback walks it assuming it rises.
+        /// Slice starts as FRACTIONS of the file, `0..1`. Authored green
+        /// side (a grid, detected onsets, placed markers) and turned into
+        /// frames at compile against the material actually loaded, so
+        /// the table is right at whatever rate the device opened. Sorted
+        /// and deduplicated at compile, for the reason a clip's envelope
+        /// is: the callback walks it assuming it rises.
         #[serde(default)]
-        slices: Vec<u64>,
+        slices: Vec<f64>,
     },
     /// The snare drum synth: one pattern, one one-shot voice.
     ///
@@ -5812,6 +6028,30 @@ impl GraphSpec {
     }
 
     /// Add a node. The returned id is its permanent name tag.
+    /// A pushed node, to finish after its neighbours exist — a voice's
+    /// notes name the effects they lock, and the effects are pushed
+    /// after the voice so the chain reads in signal order.
+    pub fn node_mut(&mut self, id: NodeId) -> Option<&mut NodeSpec> {
+        self.nodes.get_mut(id.0)
+    }
+
+    /// The knobs registered behind locked effect parameters.
+    pub fn lock_bases(&self) -> &[(NodeId, u32, f32)] {
+        &self.fx_bases
+    }
+
+    /// Register the knob behind an effect parameter that trigs lock.
+    pub fn lock_base(&mut self, node: NodeId, param: u32, base: f32) {
+        match self
+            .fx_bases
+            .iter_mut()
+            .find(|(n, p, _)| *n == node && *p == param)
+        {
+            Some(entry) => entry.2 = base,
+            None => self.fx_bases.push((node, param, base)),
+        }
+    }
+
     pub fn push(&mut self, node: NodeSpec) -> NodeId {
         let id = NodeId(self.nodes.insert(node));
         self.order.push(id);
@@ -6324,14 +6564,7 @@ impl GraphSpec {
                         // walk: sorted, deduplicated, inside the file, and
                         // capped. Exactly what `sorted_envelope` does for a
                         // clip, and for the same reason.
-                        let mut table: Vec<u64> = slices
-                            .iter()
-                            .copied()
-                            .filter(|at| *at < material.frames)
-                            .collect();
-                        table.sort_unstable();
-                        table.dedup();
-                        table.truncate(crate::audio::sampler::MAX_SLICES);
+                        let mut table = slice_frames(slices, material.frames);
                         // Nothing authored yet: fall back to the grid the
                         // knob asks for, so dropping a break on the device
                         // and switching to slice mode plays slices instead
@@ -7450,6 +7683,15 @@ impl GraphSpec {
             // The deepest path to the output. Compensation has already made
             // every path agree, so summing along any one of them gives the
             // same answer; the walk below takes the max regardless.
+            fx_bases: self
+                .fx_bases
+                .iter()
+                .map(|(node, param, base)| FxBase {
+                    node: node.to_bits(),
+                    param: *param,
+                    base: *base,
+                })
+                .collect(),
             latency: output_dense.map_or(0, |out| {
                 let mut arrival = vec![0usize; n];
                 for &i in &topo {
@@ -7491,6 +7733,7 @@ mod tests {
             pitch: 60,
             vel: 100,
             plocks: Vec::new(),
+            fx_locks: Vec::new(),
             prob: 1.0,
             cond: None,
         }
@@ -7854,6 +8097,7 @@ mod tests {
                 pitch: 69,
                 vel: 127,
                 plocks: Vec::new(),
+                fx_locks: Vec::new(),
                 prob: 1.0,
                 cond: None,
             }],
@@ -7882,6 +8126,7 @@ mod tests {
                         pitch: *p,
                         vel: 127,
                         plocks: Vec::new(),
+                        fx_locks: Vec::new(),
                         prob: 1.0,
                         cond: None,
                     })
@@ -7942,6 +8187,7 @@ mod tests {
                 pitch: 60 + i as u8,
                 vel: 127,
                 plocks: Vec::new(),
+                fx_locks: Vec::new(),
                 prob: 1.0,
                 cond: None,
             })
@@ -8413,6 +8659,7 @@ mod tests {
                 pitch: 69,
                 vel: 127,
                 plocks: Vec::new(),
+                fx_locks: Vec::new(),
                 prob: 1.0,
                 cond: None,
             }],
@@ -8924,6 +9171,7 @@ mod tests {
                 pitch: 60 + i,
                 vel: 100,
                 plocks: Vec::new(),
+                fx_locks: Vec::new(),
                 prob: 1.0,
                 cond: None,
             })
@@ -8959,6 +9207,7 @@ mod tests {
             pitch: 60,
             vel: 100,
             plocks: Vec::new(),
+            fx_locks: Vec::new(),
             prob: 1.0,
             cond: None,
         }];
@@ -8980,6 +9229,7 @@ mod tests {
             pitch: 60,
             vel: 100,
             plocks: Vec::new(),
+            fx_locks: Vec::new(),
             prob: 1.0,
             cond: None,
         }];
@@ -9030,6 +9280,7 @@ mod tests {
                 pitch: 60 + i,
                 vel: 100,
                 plocks: Vec::new(),
+                fx_locks: Vec::new(),
                 prob: 1.0,
                 cond: None,
             })
@@ -10552,6 +10803,7 @@ mod tests {
                     pitch: 60 + (i % 12) as u8,
                     vel: 100,
                     plocks: Vec::new(),
+                    fx_locks: Vec::new(),
                     prob: 1.0,
                     cond: None,
                 })
@@ -10567,6 +10819,7 @@ mod tests {
                     pitch: 48 + (i % 24) as u8,
                     vel: 100,
                     plocks: Vec::new(),
+                    fx_locks: Vec::new(),
                     prob: 1.0,
                     cond: None,
                 })
@@ -10582,6 +10835,7 @@ mod tests {
                     pitch: 60,
                     vel: 100,
                     plocks: Vec::new(),
+                    fx_locks: Vec::new(),
                     prob: 1.0,
                     cond: None,
                 })
@@ -10612,6 +10866,7 @@ mod tests {
                 pitch: 60,
                 vel: 110,
                 plocks: Vec::new(),
+                fx_locks: Vec::new(),
                 prob: 1.0,
                 cond: None,
             })
@@ -10678,6 +10933,7 @@ mod tests {
                 pitch: 69,
                 vel: 127,
                 plocks: Vec::new(),
+                fx_locks: Vec::new(),
                 prob: 1.0,
                 cond: None,
             }]);
@@ -10712,6 +10968,7 @@ mod tests {
             pitch: 69,
             vel: 127,
             plocks: Vec::new(),
+            fx_locks: Vec::new(),
             prob: 1.0,
             cond: None,
         }]);
@@ -10738,6 +10995,7 @@ mod tests {
                 pitch,
                 vel: 100,
                 plocks: Vec::new(),
+                fx_locks: Vec::new(),
                 prob: 1.0,
                 cond: None,
             })
@@ -10767,6 +11025,7 @@ mod tests {
             pitch: 69,
             vel: 100,
             plocks: Vec::new(),
+            fx_locks: Vec::new(),
             prob: 1.0,
             cond: None,
         }]);
@@ -10809,6 +11068,7 @@ mod tests {
                 pitch: 60,
                 vel: 100,
                 plocks: Vec::new(),
+                fx_locks: Vec::new(),
                 prob: 1.0,
                 cond: None,
             },
@@ -10818,6 +11078,7 @@ mod tests {
                 pitch: 60,
                 vel: 100,
                 plocks: Vec::new(),
+                fx_locks: Vec::new(),
                 prob: 1.0,
                 cond: None,
             },
@@ -10852,6 +11113,7 @@ mod tests {
             pitch: 57,
             vel: 127,
             plocks: Vec::new(),
+            fx_locks: Vec::new(),
             prob: 1.0,
             cond: None,
         }]);
@@ -10892,6 +11154,7 @@ mod tests {
                 pitch: 69,
                 vel: 100,
                 plocks: Vec::new(),
+                fx_locks: Vec::new(),
                 prob: 1.0,
                 cond: None,
             }],
@@ -10931,6 +11194,7 @@ mod tests {
                 pitch: 45,
                 vel: 127,
                 plocks: Vec::new(),
+                fx_locks: Vec::new(),
                 prob: 1.0,
                 cond: None,
             }],
@@ -10970,6 +11234,7 @@ mod tests {
                 pitch: 60,
                 vel: 100,
                 plocks: Vec::new(),
+                fx_locks: Vec::new(),
                 prob: 1.0,
                 cond: None,
             }],
@@ -11005,6 +11270,7 @@ mod tests {
                 pitch: 60 + i as u8,
                 vel: 100,
                 plocks: Vec::new(),
+                fx_locks: Vec::new(),
                 prob: 1.0,
                 cond: None,
             })
@@ -11032,6 +11298,7 @@ mod tests {
                 pitch: 36,
                 vel: 110,
                 plocks: Vec::new(),
+                fx_locks: Vec::new(),
                 prob: 1.0,
                 cond: None,
             })
@@ -11081,6 +11348,7 @@ mod tests {
                 pitch: 36,
                 vel: 110,
                 plocks: Vec::new(),
+                fx_locks: Vec::new(),
                 prob: 1.0,
                 cond: None,
             }],
@@ -11149,6 +11417,7 @@ mod tests {
                 pitch: 60 + (i % 12) as u8,
                 vel: 100,
                 plocks: Vec::new(),
+                fx_locks: Vec::new(),
                 prob: 1.0,
                 cond: None,
             })
@@ -12163,6 +12432,7 @@ mod tests {
                 param: 0,
                 value: 0.0,
                 restore: false,
+                node: 0,
                 prob: 1.0,
                 cond: (0, 0),
                 trig_key: 0,
@@ -12175,6 +12445,7 @@ mod tests {
                 param: 0,
                 value: 0.0,
                 restore: false,
+                node: 0,
                 prob: 1.0,
                 cond: (0, 0),
                 trig_key: 0,
@@ -12187,6 +12458,7 @@ mod tests {
                 param: 0,
                 value: 0.0,
                 restore: false,
+                node: 0,
                 prob: 1.0,
                 cond: (0, 0),
                 trig_key: 0,
@@ -12218,6 +12490,7 @@ mod tests {
             param: 0,
             value: 0.0,
             restore: false,
+            node: 0,
             prob: 1.0,
             cond: (0, 0),
             trig_key: 0,
@@ -12246,6 +12519,7 @@ mod tests {
             param: 0,
             value: 0.0,
             restore: false,
+            node: 0,
             prob: 1.0,
             cond: (0, 0),
             trig_key: 0,
@@ -12277,6 +12551,7 @@ mod tests {
                 param: 0,
                 value: 0.0,
                 restore: false,
+                node: 0,
                 prob: 1.0,
                 cond: (0, 0),
                 trig_key: 0,
@@ -12289,6 +12564,7 @@ mod tests {
                 param: 0,
                 value: 0.0,
                 restore: false,
+                node: 0,
                 prob: 1.0,
                 cond: (0, 0),
                 trig_key: 0,
@@ -12324,6 +12600,7 @@ mod tests {
                     pitch: *p,
                     vel: 127,
                     plocks: Vec::new(),
+                    fx_locks: Vec::new(),
                     prob: 1.0,
                     cond: None,
                 })
@@ -12824,6 +13101,7 @@ mod tests {
                     pitch: 48,
                     vel: 110,
                     plocks: Vec::new(),
+                    fx_locks: Vec::new(),
                     prob: 1.0,
                     cond: None,
                 },
@@ -12833,6 +13111,7 @@ mod tests {
                     pitch: 48,
                     vel: 110,
                     plocks: dark.clone(),
+                    fx_locks: Vec::new(),
                     prob: 1.0,
                     cond: None,
                 },
@@ -12842,6 +13121,7 @@ mod tests {
                     pitch: 48,
                     vel: 110,
                     plocks: Vec::new(),
+                    fx_locks: Vec::new(),
                     prob: 1.0,
                     cond: None,
                 },
@@ -12914,6 +13194,7 @@ mod tests {
                 pitch: 60,
                 vel: 100,
                 plocks: Vec::new(),
+                fx_locks: Vec::new(),
                 prob,
                 cond,
             }];

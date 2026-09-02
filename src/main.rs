@@ -6034,6 +6034,7 @@ fn seq_notes(clips: &[Clip]) -> Vec<SeqNote> {
                     pitch: n.pitch,
                     vel: n.vel,
                     plocks: n.plocks.clone(),
+                    fx_locks: Vec::new(),
                     prob: n.prob,
                     cond: n.cond,
                 }),
