@@ -3420,6 +3420,24 @@ pub static CONSOLE: &[DeviceSpec] = &[
                 group: "Tone",
                 choices: &[],
             },
+            ParamLabel {
+                name: "Kill Lo",
+                unit: "",
+                group: "Tone",
+                choices: &["off", "on"],
+            },
+            ParamLabel {
+                name: "Kill Mid",
+                unit: "",
+                group: "Tone",
+                choices: &["off", "on"],
+            },
+            ParamLabel {
+                name: "Kill Hi",
+                unit: "",
+                group: "Tone",
+                choices: &["off", "on"],
+            },
         ],
     },
     DeviceSpec {

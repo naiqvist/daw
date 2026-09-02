@@ -7664,6 +7664,21 @@ pub mod console {
         pub const MID: u32 = 1;
         pub const HI: u32 = 2;
         pub const MID_HZ: u32 = 3;
+        pub const KILL_LO: u32 = 4;
+        pub const KILL_MID: u32 = 5;
+        pub const KILL_HI: u32 = 6;
+
+        /// The desk chose the corners once: the shelves' corners and the
+        /// mid's Q, and the kills' slope and depth.
+        pub const LO_HZ: f32 = 100.0;
+        pub const HI_HZ: f32 = 8_000.0;
+        pub const SHELF_Q: f32 = 0.7;
+        pub const MID_Q: f32 = 0.7;
+        /// A killed shelf is a 24 dB/octave cut at its corner.
+        pub const KILL_ORDER: u32 = 4;
+        /// A killed mid is a wide bell this deep.
+        pub const KILL_MID_DB: f32 = -36.0;
+        pub const KILL_MID_Q: f32 = 0.4;
 
         pub const TABLE: &[ParamDef] = &[
             ParamDef {
@@ -7693,6 +7708,27 @@ pub mod console {
                 min: 200.0,
                 max: 6000.0,
                 default: 1000.0,
+            },
+            ParamDef {
+                id: 4,
+                name: "Kill Lo",
+                min: 0.0,
+                max: 1.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 5,
+                name: "Kill Mid",
+                min: 0.0,
+                max: 1.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 6,
+                name: "Kill Hi",
+                min: 0.0,
+                max: 1.0,
+                default: 0.0,
             },
         ];
     }

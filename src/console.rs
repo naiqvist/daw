@@ -350,6 +350,135 @@ pub mod preamp_curve {
     }
 }
 
+/// TONE's shape, here on the green side so the card draws the response
+/// the core runs: the same bands, prepared the same way, read at a
+/// frequency. A killed band is the cut filter the core runs in its
+/// place.
+pub mod tone_curve {
+    use crate::dsp::filters::{BandShape, EqBand};
+    use crate::params::console::tone as p;
+
+    /// TONE's settings, as both the core and the card resolve them.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct Shape {
+        pub lo_db: f32,
+        pub mid_db: f32,
+        pub hi_db: f32,
+        pub mid_hz: f32,
+        pub kill_lo: bool,
+        pub kill_mid: bool,
+        pub kill_hi: bool,
+    }
+
+    impl Shape {
+        pub fn of(params: &super::SectionParams) -> Self {
+            let table = super::SectionKind::Tone.table();
+            let clamp = |id: u32, value: f32| {
+                table
+                    .iter()
+                    .find(|def| def.id == id)
+                    .map_or(value, |def| def.clamp(value))
+            };
+            Self {
+                lo_db: clamp(p::LO, params.value(p::LO)),
+                mid_db: clamp(p::MID, params.value(p::MID)),
+                hi_db: clamp(p::HI, params.value(p::HI)),
+                mid_hz: clamp(p::MID_HZ, params.value(p::MID_HZ)),
+                kill_lo: params.value(p::KILL_LO) >= 0.5,
+                kill_mid: params.value(p::KILL_MID) >= 0.5,
+                kill_hi: params.value(p::KILL_HI) >= 0.5,
+            }
+        }
+
+        /// Whether the section is a wire.
+        pub fn is_flat(&self) -> bool {
+            self.lo_db == 0.0
+                && self.mid_db == 0.0
+                && self.hi_db == 0.0
+                && !self.kill_lo
+                && !self.kill_mid
+                && !self.kill_hi
+        }
+    }
+
+    /// A biquad's magnitude at `hz`, from its coefficients
+    /// `[b0, b1, b2, a1, a2]`.
+    fn biquad_db(coeffs: [f32; 5], hz: f32, sample_rate: f32) -> f32 {
+        let w = 2.0 * core::f32::consts::PI * hz / sample_rate;
+        let (c1, s1) = (w.cos(), w.sin());
+        let (c2, s2) = ((2.0 * w).cos(), (2.0 * w).sin());
+        let [b0, b1, b2, a1, a2] = coeffs;
+        let num = (b0 + b1 * c1 + b2 * c2, -(b1 * s1 + b2 * s2));
+        let den = (1.0 + a1 * c1 + a2 * c2, -(a1 * s1 + a2 * s2));
+        let mag = (num.0 * num.0 + num.1 * num.1).sqrt()
+            / (den.0 * den.0 + den.1 * den.1).sqrt().max(1e-9);
+        20.0 * mag.max(1e-9).log10()
+    }
+
+    /// A Butterworth cut's magnitude at `hz`: the analytic curve of the
+    /// cascade the core runs.
+    fn butterworth_db(hz: f32, corner: f32, order: u32, highpass: bool) -> f32 {
+        let ratio = (hz / corner).max(1e-6);
+        let r2n = ratio.powi(2 * order as i32);
+        let mag2 = if highpass {
+            r2n / (1.0 + r2n)
+        } else {
+            1.0 / (1.0 + r2n)
+        };
+        10.0 * mag2.max(1e-12).log10()
+    }
+
+    /// The whole section's response at `hz`, in dB.
+    pub fn response_db(shape: &Shape, sample_rate: f32, hz: f32) -> f32 {
+        let mut db = 0.0;
+        let mut band = EqBand::new();
+        if shape.kill_lo {
+            db += butterworth_db(hz, p::LO_HZ, p::KILL_ORDER, true);
+        } else if shape.lo_db != 0.0 {
+            band.prepare(
+                sample_rate,
+                p::LO_HZ,
+                p::SHELF_Q,
+                shape.lo_db,
+                BandShape::LowShelf,
+            );
+            db += biquad_db(band.coeffs(), hz, sample_rate);
+        }
+        if shape.kill_mid {
+            band.prepare(
+                sample_rate,
+                shape.mid_hz,
+                p::KILL_MID_Q,
+                p::KILL_MID_DB,
+                BandShape::Bell,
+            );
+            db += biquad_db(band.coeffs(), hz, sample_rate);
+        } else if shape.mid_db != 0.0 {
+            band.prepare(
+                sample_rate,
+                shape.mid_hz,
+                p::MID_Q,
+                shape.mid_db,
+                BandShape::Bell,
+            );
+            db += biquad_db(band.coeffs(), hz, sample_rate);
+        }
+        if shape.kill_hi {
+            db += butterworth_db(hz, p::HI_HZ, p::KILL_ORDER, false);
+        } else if shape.hi_db != 0.0 {
+            band.prepare(
+                sample_rate,
+                p::HI_HZ,
+                p::SHELF_Q,
+                shape.hi_db,
+                BandShape::HighShelf,
+            );
+            db += biquad_db(band.coeffs(), hz, sample_rate);
+        }
+        db
+    }
+}
+
 /// What a section measured this frame, as the surface reads it: the
 /// green twin of the engine's readout, so a card can carry live figures
 /// without the surface importing the audio side. Level in dBFS,
