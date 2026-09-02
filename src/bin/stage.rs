@@ -66,7 +66,28 @@ fn library_config() -> LibraryConfig {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    keep_the_stream_driven();
     shell::run("daw — stage", [1280.0, 800.0], [720.0, 480.0], App::new)
+}
+
+/// Ask PipeWire to keep the stage's stream processing and to give it a
+/// driver of its own.
+///
+/// Without this a JACK client on PipeWire is scheduled only while the
+/// graph around it is awake: with the sink muted or idle the server picks
+/// whatever node is running — the microphone, as often as not — as the
+/// client's driver, and when THAT suspends the callback stops and the
+/// stage reports a stalled engine for no reason of its own. The two
+/// properties are what `pw-jack` sets for a client that must never
+/// sleep; pipewire-jack reads them from this variable. A user who set the
+/// variable themselves is left alone.
+fn keep_the_stream_driven() {
+    const PROPS: &str = "{ node.always-process = true node.want-driver = true }";
+    if std::env::var_os("PIPEWIRE_PROPS").is_none() {
+        // Set before any thread exists — the engine's are made in
+        // `App::new` — which is what makes this sound.
+        unsafe { std::env::set_var("PIPEWIRE_PROPS", PROPS) };
+    }
 }
 
 struct App {
