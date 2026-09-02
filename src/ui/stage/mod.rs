@@ -1196,7 +1196,11 @@ impl Stage {
         let margin = design::px(design::space::ROOM);
         let cards = chain::rows_that_fit(tray.height() - margin - CHAIN_HEAD_H, CHAIN_PITCH);
         let pieces = chain::rows_that_fit(
-            tray.height() - margin - (strip::HEAD_H + 4.0 + strip::FIGURE_H + 6.0) - 6.0,
+            tray.height()
+                - margin
+                - (strip::HEAD_H + 4.0 + 3.0 + strip::FIGURE_MAX_H + 4.0)
+                - strip::FOOT_H
+                - 6.0,
             strip::ROW_H,
         );
         cards.min(pieces)

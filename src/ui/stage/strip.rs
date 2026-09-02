@@ -28,8 +28,11 @@ pub const TONGUE: f32 = 12.0;
 pub const JOINT_H: f32 = 26.0;
 /// The head band, where the name and the IN pad live and the joint sits.
 pub const HEAD_H: f32 = 30.0;
-/// The figure's recess under the head.
-pub const FIGURE_H: f32 = 58.0;
+/// The tallest figure any section draws at the top of its glass; the
+/// rows begin under it. The band's row capacity is set by this.
+pub const FIGURE_MAX_H: f32 = 64.0;
+/// The foot under the glass, where an OUT piece's bypass rail runs.
+pub const FOOT_H: f32 = 16.0;
 /// A parameter row.
 pub const ROW_H: f32 = 19.0;
 /// The two traces' spacing about the joint's centre.
@@ -212,17 +215,36 @@ pub fn tongue_fill(out: &mut Vec<egui::Shape>, rect: egui::Rect, fill: egui::Col
     ));
 }
 
-/// The figure's recess: under the head, inset from the walls.
+/// The glass: under the head, inset from the walls, down to the foot.
+/// The screen is most of the piece — the figure at its top, every
+/// parameter beneath it.
 pub fn recess(rect: egui::Rect) -> egui::Rect {
     egui::Rect::from_min_max(
-        egui::pos2(rect.left() + 14.0, rect.top() + HEAD_H + 4.0),
-        egui::pos2(rect.right() - 14.0, rect.top() + HEAD_H + 4.0 + FIGURE_H),
+        egui::pos2(rect.left() + 10.0, rect.top() + HEAD_H + 4.0),
+        egui::pos2(rect.right() - 10.0, rect.bottom() - FOOT_H),
     )
 }
 
-/// Where the rows begin.
-pub fn rows_top(rect: egui::Rect) -> f32 {
-    recess(rect).bottom() + 6.0
+/// How tall a section's figure is at the top of its glass.
+pub fn figure_h(kind: SectionKind) -> f32 {
+    match kind {
+        SectionKind::Preamp => FIGURE_MAX_H,
+        _ => 30.0,
+    }
+}
+
+/// The figure's part of the glass.
+pub fn figure_rect(rect: egui::Rect, kind: SectionKind) -> egui::Rect {
+    let glass = recess(rect).shrink(3.0);
+    egui::Rect::from_min_max(
+        glass.min,
+        egui::pos2(glass.max.x, (glass.min.y + figure_h(kind)).min(glass.max.y)),
+    )
+}
+
+/// Where the rows begin, inside the glass.
+pub fn rows_top(rect: egui::Rect, kind: SectionKind) -> f32 {
+    figure_rect(rect, kind).bottom() + 4.0
 }
 
 /// The pair's two routes through a piece, from the notch's inner wall
@@ -246,7 +268,7 @@ pub fn route(
     } else {
         rect.right()
     };
-    let hole = recess(rect);
+    let hole = figure_rect(rect, kind);
     let a = egui::pos2(x0, jy - PAIR);
     let b = egui::pos2(x0, jy + PAIR);
     let a_end = egui::pos2(x1, jy - PAIR);
@@ -477,10 +499,20 @@ impl Stage {
 
         // The screen: the piece's casing is the shell, and this is the
         // glass set into it — the ground showing through a double
-        // frame with a rune tick at each corner.
+        // frame with a rune tick at each corner. An OUT piece's glass
+        // is dark: the frame dim, no figure, its rows in the edge ink.
         let hole = recess(rect);
-        if is_in && hole.is_positive() {
-            screen_frame(&mut shapes, hole, edge, alpha.ground.color);
+        if hole.is_positive() {
+            screen_frame(
+                &mut shapes,
+                hole,
+                if is_in {
+                    edge
+                } else {
+                    edge.gamma_multiply(0.55)
+                },
+                alpha.ground.color,
+            );
         }
         // The IN pad on the head's right: lit while IN, fixed for a
         // section the desk never lets out.
@@ -514,55 +546,36 @@ impl Stage {
             piece.kind.name(),
             ink,
         );
-        if is_in {
-            // The reveal: a screen that comes under the hand redraws
-            // itself top to bottom with a scan line at the edge, the
-            // way a terminal painted a page. Once painted it stays.
-            let reveal = if focused {
-                painter.ctx().animate_bool_with_time(
-                    egui::Id::new(("stage-piece-reveal", piece.index)),
-                    true,
-                    REVEAL_S,
-                )
-            } else {
-                painter.ctx().animate_bool_with_time(
-                    egui::Id::new(("stage-piece-reveal", piece.index)),
-                    false,
-                    0.0,
-                );
-                1.0
-            };
-            let glass = hole.shrink(3.0);
-            let shown = egui::Rect::from_min_max(
-                glass.min,
-                egui::pos2(glass.max.x, glass.min.y + glass.height() * reveal),
-            );
-            let screen = painter.with_clip_rect(shown);
-            self.draw_figure(&screen, piece, column, glass, level, phase);
-            if reveal < 1.0 {
-                let y = shown.max.y;
-                let mut scan = Vec::new();
-                circuit::trace(
-                    &mut scan,
-                    &[egui::pos2(glass.left(), y), egui::pos2(glass.right(), y)],
-                    Weight::Heavy,
-                    alpha.live.color,
-                );
-                painter.extend(scan);
-                painter.ctx().request_repaint();
-            }
-            if piece.kind.full_screen() {
-                painter.text(
-                    egui::pos2(hole.right() - 6.0, hole.bottom() - 4.0),
-                    egui::Align2::RIGHT_BOTTOM,
-                    "⏎ FULL",
-                    row_font.clone(),
-                    edge,
-                );
-            }
+
+        // The reveal: a screen that comes under the hand redraws itself
+        // top to bottom with a scan line at the edge, the way a terminal
+        // painted a page. Once painted it stays.
+        let glass = hole.shrink(3.0);
+        let reveal = if focused {
+            painter.ctx().animate_bool_with_time(
+                egui::Id::new(("stage-piece-reveal", piece.index)),
+                true,
+                REVEAL_S,
+            )
         } else {
-            painter.text(
-                egui::pos2(rect.center().x, rect.top() + HEAD_H + 14.0),
+            painter.ctx().animate_bool_with_time(
+                egui::Id::new(("stage-piece-reveal", piece.index)),
+                false,
+                0.0,
+            );
+            1.0
+        };
+        let shown = egui::Rect::from_min_max(
+            glass.min,
+            egui::pos2(glass.max.x, glass.min.y + glass.height() * reveal),
+        );
+        let screen = painter.with_clip_rect(shown);
+        let figure = figure_rect(rect, piece.kind);
+        if is_in {
+            self.draw_figure(&screen, piece, column, figure, level, phase);
+        } else {
+            screen.text(
+                figure.center(),
                 egui::Align2::CENTER_CENTER,
                 "OUT",
                 row_font.clone(),
@@ -570,9 +583,12 @@ impl Stage {
             );
         }
 
-        // The rows, narrow or wide.
+        // The rows, on the glass under the figure: a terminal's table —
+        // the name, a leader of dots, the value; the cursor's row an
+        // inverse block; a wide piece's gauges as runs of cells.
         let wide = piece.kind.width() == Width::Wide;
-        let top = rows_top(rect);
+        let top = rows_top(rect, piece.kind);
+        let text_ink = if is_in { ink } else { edge };
         let cell_w = painter
             .layout_no_wrap("M".to_owned(), row_font.clone(), ink)
             .rect
@@ -583,34 +599,25 @@ impl Stage {
                 break;
             };
             let y = top + line as f32 * ROW_H;
-            if y + ROW_H > rect.bottom() - 4.0 {
+            if y + ROW_H > glass.bottom() - 2.0 {
                 break;
             }
             let row_rect = egui::Rect::from_min_size(
-                egui::pos2(rect.left() + 12.0, y),
-                egui::vec2(rect.width() - 24.0, ROW_H),
+                egui::pos2(glass.left() + 4.0, y),
+                egui::vec2(glass.width() - 8.0, ROW_H),
             );
             let on_row = focused && cursor == Some((piece.index, row_offset + line));
             if on_row {
-                painter.rect_filled(row_rect, 0.0, alpha.focus.color);
-                let mut marks = Vec::new();
-                circuit::brackets(
-                    &mut marks,
-                    row_rect.expand(2.0),
-                    5.0,
-                    Weight::Bold,
-                    alpha.ink.color,
-                );
-                painter.extend(marks);
+                screen.rect_filled(row_rect, 0.0, alpha.focus.color);
             }
             let value_ink = if on_row {
                 alpha.ground.color
             } else if row.edited {
                 alpha.focus.color
             } else {
-                ink
+                text_ink
             };
-            let name_ink = if on_row { alpha.ground.color } else { ink };
+            let name_ink = if on_row { alpha.ground.color } else { text_ink };
             let value_w = painter
                 .layout_no_wrap(row.value.clone(), row_font.clone(), value_ink)
                 .rect
@@ -634,13 +641,39 @@ impl Stage {
                 row_rect.width() - value_col - 10.0
             };
             let cells = (name_room / cell_w).floor().max(1.0) as usize;
-            painter.text(
-                egui::pos2(row_rect.left(), row_rect.center().y),
+            let name = fit_cells(&row.name, cells);
+            let name_w = painter
+                .layout_no_wrap(
+                    row.name.chars().take(cells).collect(),
+                    row_font.clone(),
+                    name_ink,
+                )
+                .rect
+                .width();
+            screen.text(
+                egui::pos2(row_rect.left() + 2.0, row_rect.center().y),
                 egui::Align2::LEFT_CENTER,
-                fit_cells(&row.name, cells),
+                name,
                 row_font.clone(),
                 name_ink,
             );
+            // The leader: dots from the name to the value or the gauge.
+            let leader_end = if wide {
+                gauge.left() - 6.0
+            } else {
+                row_rect.right() - value_col - 6.0
+            };
+            let mut x = row_rect.left() + 2.0 + name_w + cell_w;
+            let mut dots = Vec::new();
+            while x < leader_end {
+                circuit::dot(
+                    &mut dots,
+                    egui::pos2(x, row_rect.center().y + 3.0),
+                    if on_row { alpha.ground.color } else { edge },
+                );
+                x += cell_w;
+            }
+            screen.extend(dots);
             if wide {
                 let mut marks = Vec::new();
                 let rest = if on_row { alpha.surface.color } else { edge };
@@ -656,10 +689,10 @@ impl Stage {
                 } else {
                     circuit::tick_bar(&mut marks, gauge, 12, row.place, value_ink, rest, true);
                 }
-                painter.extend(marks);
+                screen.extend(marks);
             }
-            painter.text(
-                egui::pos2(row_rect.right(), row_rect.center().y),
+            screen.text(
+                egui::pos2(row_rect.right() - 2.0, row_rect.center().y),
                 egui::Align2::RIGHT_CENTER,
                 &row.value,
                 row_font.clone(),
@@ -670,11 +703,32 @@ impl Stage {
             let mut marks = Vec::new();
             circuit::annotation_arrow(
                 &mut marks,
-                egui::pos2(rect.center().x, rect.bottom() - 2.0),
-                egui::pos2(rect.center().x, rect.bottom() + 8.0),
-                ink,
+                egui::pos2(glass.center().x, glass.bottom() - 10.0),
+                egui::pos2(glass.center().x, glass.bottom() - 1.0),
+                text_ink,
             );
-            painter.extend(marks);
+            screen.extend(marks);
+        }
+        if reveal < 1.0 {
+            let y = shown.max.y;
+            let mut scan = Vec::new();
+            circuit::trace(
+                &mut scan,
+                &[egui::pos2(glass.left(), y), egui::pos2(glass.right(), y)],
+                Weight::Heavy,
+                alpha.live.color,
+            );
+            painter.extend(scan);
+            painter.ctx().request_repaint();
+        }
+        if is_in && piece.kind.full_screen() {
+            painter.text(
+                egui::pos2(hole.right() - 6.0, hole.top() + 4.0),
+                egui::Align2::RIGHT_TOP,
+                "⏎ FULL",
+                row_font.clone(),
+                edge,
+            );
         }
     }
 }
@@ -729,9 +783,8 @@ pub fn screen_frame(
 
 /// Where the preamp's needle turns: low on the glass, right of centre,
 /// leaving the trim ring its third on the left.
-fn preamp_pivot(hole: egui::Rect) -> egui::Pos2 {
-    let glass = hole.shrink(3.0);
-    egui::pos2(glass.left() + glass.width() * 0.62, glass.bottom() - 7.0)
+fn preamp_pivot(figure: egui::Rect) -> egui::Pos2 {
+    egui::pos2(figure.left() + figure.width() * 0.62, figure.bottom() - 7.0)
 }
 
 /// A point on an arc about `c`, at `deg` (0 is right, counter-clockwise
@@ -833,7 +886,7 @@ impl Stage {
 
         // The VU: an arc from −20 to +3, the top three dB in the live
         // ink, the needle from the pivot at the channel's level.
-        let pivot = preamp_pivot(glass.expand(3.0));
+        let pivot = preamp_pivot(glass);
         let radius = (glass.height() - 12.0).min(glass.width() * 0.3);
         let (start, end) = (150.0, 30.0);
         let arc: Vec<egui::Pos2> = (0..=24)
