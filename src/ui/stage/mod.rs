@@ -2365,7 +2365,7 @@ impl Stage {
         ornament::sigil(
             &painter,
             egui::pos2(
-                message.max.x - design::px(design::space::VAST),
+                message.min.x + design::px(design::space::ROOM),
                 message.center().y,
             ),
             design::px(design::space::STEP) / 2.0,
@@ -3962,7 +3962,9 @@ impl Stage {
     }
 
     fn draw_message(&self, painter: &egui::Painter, zone: egui::Rect) {
-        const MARGIN: f32 = 16.0;
+        // The badge takes the strip's left shoulder, so everything the
+        // strip has to SAY begins after it.
+        const MARGIN: f32 = 44.0;
 
         let Some(refusal) = self.refusal else {
             // With no refusal this frame, the strip carries the
