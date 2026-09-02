@@ -30,7 +30,7 @@ use crate::audio::graph::{GraphSpec, MAX_METERS, NodeId, NodeSpec, Note as Graph
 use crate::devices::DeviceKind;
 use crate::pitch::nearest_midi;
 use crate::sequencing::{
-    Clip, Device, DeviceId, PATTERN_STEP_TICKS, PATTERN_STEPS, Pattern, Song, TICKS_PER_BEAT,
+    Clip, Device, DeviceId, PATTERN_STEP_TICKS, PATTERN_STEPS, Pattern, Song, TICKS_PER_BEAT, Track,
 };
 
 /// The master's meter slot: the LAST one, so the tracks can take theirs in
@@ -370,6 +370,173 @@ fn beats(ticks: usize) -> f64 {
     ticks as f64 / TICKS_PER_BEAT as f64
 }
 
+/// The SONG: every track's blocks laid on the timeline, as the graph
+/// plays them. The session's `build` plays one scene and loops it; this
+/// plays the arrangement once from the top, so no node loops and every
+/// note is stamped in song time.
+///
+/// A pattern block plays its pattern from the block's start, repeated
+/// to fill the block and cut at its end. An audio block streams its
+/// file from the block's start. Effects, pan, and the master are the
+/// track's as in the session; a track with nothing placed on it is
+/// not built at all.
+pub fn build_song(song: &Song) -> (GraphSpec, SongNodes) {
+    let mut spec = GraphSpec::default();
+    let master = spec.push(NodeSpec::Mixer { gain: song.master });
+    let mut nodes = SongNodes {
+        outputs: vec![None; song.tracks.len()],
+        meters: vec![None; song.tracks.len()],
+        master,
+    };
+
+    for (index, track) in song.tracks.iter().enumerate() {
+        if !song.audible(index) {
+            continue;
+        }
+        let notes = notes_of_blocks(song, track, &[]);
+        let audio = audio_blocks_of(song, track);
+        if notes.is_empty() && audio.is_empty() {
+            continue;
+        }
+
+        let out = spec.push(NodeSpec::Pan {
+            pan: track.pan,
+            gain: track.volume,
+        });
+        // The voice and its chain, as the session builds them, when
+        // there are notes to play.
+        if !notes.is_empty()
+            && let Some(instrument) = voice_of(track, notes, None)
+        {
+            let voice = spec.push(instrument);
+            let mut effects: Vec<(DeviceId, NodeId)> = Vec::new();
+            let mut tail = voice;
+            for device in &track.chain {
+                if device.is_instrument() || device.bypassed {
+                    continue;
+                }
+                let Some(node) = effect_of(device) else {
+                    continue;
+                };
+                let node = spec.push(node);
+                spec.connect(tail, node);
+                effects.push((device.id, node));
+                tail = node;
+            }
+            if !effects.is_empty() {
+                if let Some(notes) = spec.node_mut(voice).and_then(NodeSpec::notes_mut) {
+                    *notes = notes_of_blocks(song, track, &effects);
+                }
+                for block in &track.blocks {
+                    let Some(pattern) = song.pattern(block.pattern_id) else {
+                        continue;
+                    };
+                    for step in 0..PATTERN_STEPS {
+                        for lock in &pattern.trig(step).locks {
+                            let Some(id) = lock.device else {
+                                continue;
+                            };
+                            if let Some((_, node)) =
+                                effects.iter().find(|(device, _)| *device == id)
+                                && let Some(device) =
+                                    track.chain.iter().find(|device| device.id == id)
+                            {
+                                spec.lock_base(*node, lock.param, device.value(lock.param));
+                            }
+                        }
+                    }
+                }
+            }
+            spec.connect(tail, out);
+        }
+        // Audio blocks feed the output beside the chain: a clip is
+        // recorded sound, and the chain is the voice's.
+        for clip in audio {
+            let node = spec.push(clip);
+            spec.connect(node, out);
+        }
+        spec.connect(out, master);
+        nodes.outputs[index] = Some(out);
+        if index < MASTER_METER {
+            spec.meter(index, out);
+            nodes.meters[index] = Some(index);
+        }
+    }
+
+    spec.meter(MASTER_METER, master);
+    spec.set_output(master);
+    (spec, nodes)
+}
+
+/// A track's pattern blocks as notes in song time: each block plays its
+/// pattern from the block's start, repeated to fill the block, and any
+/// note that would outrun the block is cut at the block's end.
+fn notes_of_blocks(song: &Song, track: &Track, effects: &[(DeviceId, NodeId)]) -> Vec<GraphNote> {
+    let mut out = Vec::new();
+    for block in &track.blocks {
+        let Some(pattern) = song.pattern(block.pattern_id) else {
+            continue;
+        };
+        let pattern_len = beats(pattern.length_ticks.max(1));
+        let block_len = beats(block.length_ticks);
+        if block_len <= 0.0 {
+            continue;
+        }
+        let base = notes_of(song, pattern, effects);
+        let start = beats(block.start_tick);
+        let mut offset = 0.0;
+        while offset < block_len {
+            for note in &base {
+                let at = offset + note.start_beats;
+                if at >= block_len {
+                    continue;
+                }
+                let mut placed = note.clone();
+                placed.start_beats = start + at;
+                placed.len_beats = note.len_beats.min(block_len - at);
+                out.push(placed);
+            }
+            offset += pattern_len;
+        }
+    }
+    out.sort_by(|a, b| a.start_beats.total_cmp(&b.start_beats));
+    out
+}
+
+/// A track's audio blocks as clip nodes in song time.
+fn audio_blocks_of(song: &Song, track: &Track) -> Vec<NodeSpec> {
+    track
+        .audio_blocks
+        .iter()
+        .map(|block| {
+            let source = &block.source;
+            // A clip-relative loop brace is in ticks; the node wants the
+            // loop's start in the file's own frames, at the tempo the
+            // block starts under.
+            let bpm = song.bpm_at(block.start_tick, 120.0).max(1.0);
+            let frames_per_beat = 60.0 / bpm * f64::from(source.sample_rate.max(1));
+            let loop_start_frames = block.loop_brace.as_ref().map_or(0, |brace| {
+                (beats(brace.start_tick) * frames_per_beat).round() as u64
+            });
+            NodeSpec::AudioClip {
+                path: source.path.clone(),
+                start_beats: beats(block.start_tick),
+                length_beats: Some(beats(block.length_ticks)),
+                source_offset_frames: source.source_offset,
+                source_frames: Some(source.source_frames),
+                loop_clip: source.looped || block.loop_brace.is_some(),
+                loop_start_frames,
+                gain: source.gain,
+                fade_in_frames: 0,
+                fade_out_frames: 0,
+                fade_in_shape: 0.0,
+                fade_out_shape: 0.0,
+                envelope: Vec::new(),
+            }
+        })
+        .collect()
+}
+
 /// One pattern's trigs as graph notes, in the key the song is in.
 ///
 /// A pitch in this model is an ANCHOR — a degree of the song's key, or an
@@ -455,6 +622,83 @@ mod tests {
             }],
         };
         song
+    }
+
+    /// The song compiler lays a block's pattern at the block's start,
+    /// repeats it to fill the block, and cuts the last repeat at the
+    /// block's end; the voice's node does not loop.
+    #[test]
+    fn a_block_plays_its_pattern_from_its_start_repeated_to_its_end() {
+        let mut song = song_with_a_clip();
+        // A second note halfway through the bar, so repeats are visible.
+        song.patterns[0].toggle(8, Note::new(62, PATTERN_STEP_TICKS, 90));
+        let pattern = song.patterns[0].id;
+        let bar = crate::sequencing::TICKS_PER_BEAT * 4;
+        // The pattern is four bars; place it at bar two, six bars long,
+        // so the second repeat is cut after two bars.
+        song.tracks[0].blocks.clear();
+        song.tracks[0].blocks.push(crate::sequencing::PatternBlock {
+            id: crate::sequencing::BlockId(1),
+            pattern_id: pattern,
+            start_tick: 2 * bar,
+            length_ticks: 6 * bar,
+        });
+        let (spec, _) = build_song(&song);
+        let (notes, loops) = spec
+            .iter_ordered()
+            .find_map(|(_, node)| match node {
+                NodeSpec::Poly {
+                    notes,
+                    loop_len_beats,
+                    ..
+                } => Some((notes.clone(), *loop_len_beats)),
+                _ => None,
+            })
+            .expect("the voice is in the graph");
+        assert_eq!(loops, None, "the song's voice loops");
+        let starts: Vec<f64> = notes.iter().map(|n| n.start_beats).collect();
+        // Beats: bar two starts at 8; the pattern's notes at 0 and 2
+        // beats in; the repeat starts four bars (16 beats) later.
+        assert_eq!(starts, vec![8.0, 10.0, 24.0, 26.0]);
+    }
+
+    /// An audio block becomes a clip node at its start, and a track with
+    /// nothing placed on it is not in the graph.
+    #[test]
+    fn audio_blocks_stream_from_their_start_and_empty_tracks_are_absent() {
+        let mut song = song_with_a_clip();
+        song.tracks[0].blocks.clear();
+        song.tracks[0].audio_blocks.push(crate::sequencing::AudioBlock {
+            id: crate::sequencing::BlockId(7),
+            name: "take".to_owned(),
+            start_tick: crate::sequencing::TICKS_PER_BEAT * 4,
+            length_ticks: crate::sequencing::TICKS_PER_BEAT * 8,
+            source: ron::from_str(
+                r#"(path:"/x/take.wav",sample_rate:48000,source_offset:0,source_frames:96000,gain:1.0,looped:false)"#,
+            )
+            .expect("a minimal source deserializes from its required fields"),
+            loop_brace: None,
+        });
+        let (spec, nodes) = build_song(&song);
+        let clip = spec
+            .iter_ordered()
+            .find_map(|(_, node)| match node {
+                NodeSpec::AudioClip {
+                    start_beats,
+                    length_beats,
+                    ..
+                } => Some((*start_beats, *length_beats)),
+                _ => None,
+            })
+            .expect("the clip is in the graph");
+        assert_eq!(clip, (4.0, Some(8.0)));
+        assert!(nodes.outputs[0].is_some());
+        assert!(
+            !spec
+                .iter_ordered()
+                .any(|(_, node)| matches!(node, NodeSpec::Poly { .. })),
+            "a voice was built for a track with no notes"
+        );
     }
 
     /// A sampler's authored slices ride into its node spec as the

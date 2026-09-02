@@ -93,6 +93,9 @@ struct Audio {
     trouble: Option<String>,
     /// The stage revision the live schedule was built from.
     built: Option<u64>,
+    /// Whether the graph built was the arrangement's. A mode change is
+    /// a rebuild even when the song has not changed.
+    built_song: bool,
     /// The mix revision whose values the live schedule is carrying.
     ///
     /// Separate from `built` because these two changes are answered in
@@ -128,6 +131,7 @@ impl Audio {
             engine,
             trouble,
             built: None,
+            built_song: false,
             mixed: None,
             nodes: None,
             rolling: false,
@@ -267,9 +271,14 @@ impl Audio {
         // What sounds, when it changed. A rebuild mints fresh node ids,
         // so the mapping is captured with the schedule rather than
         // derived from the song afterwards.
-        if self.built != Some(stage.revision()) {
+        if self.built != Some(stage.revision()) || self.built_song != stage.song_mode() {
             let info = engine.info();
-            let (spec, nodes) = song_graph::build(stage.song(), stage.playing());
+            let (spec, nodes) = if stage.song_mode() {
+                song_graph::build_song(stage.song())
+            } else {
+                song_graph::build(stage.song(), stage.playing())
+            };
+            self.built_song = stage.song_mode();
             match spec.compile(info.sample_rate, info.max_frames) {
                 Ok(schedule) => match engine.set_schedule(Box::new(schedule)) {
                     Ok(()) => {

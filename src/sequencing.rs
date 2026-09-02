@@ -1778,6 +1778,115 @@ impl Song {
     ///
     /// Document editing, not scheduling: the new pattern has no trigs and
     /// no placement, so nothing in the sequencing contract is in play.
+    /// A block id no block in the song holds.
+    pub fn mint_block_id(&self) -> BlockId {
+        let top = self
+            .tracks
+            .iter()
+            .flat_map(|track| {
+                track
+                    .blocks
+                    .iter()
+                    .map(|block| block.id.0)
+                    .chain(track.audio_blocks.iter().map(|block| block.id.0))
+            })
+            .max()
+            .unwrap_or(0);
+        BlockId(top + 1)
+    }
+
+    /// One past the last tick anything in the song occupies.
+    pub fn end_tick(&self) -> usize {
+        self.tracks
+            .iter()
+            .flat_map(|track| {
+                track
+                    .blocks_in_time_order()
+                    .into_iter()
+                    .map(|block| block.end_tick())
+                    .collect::<Vec<_>>()
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Lay `pattern` on `track` from `start`, `length` ticks long.
+    /// Refused when anything already stands in the way.
+    pub fn place_block(
+        &mut self,
+        track: usize,
+        pattern: PatternId,
+        start: usize,
+        length: usize,
+    ) -> Result<BlockId, LandRefusal> {
+        let id = self.mint_block_id();
+        let lane = self.tracks.get_mut(track).ok_or(LandRefusal::NoTrack)?;
+        if length == 0 || lane.occupied(start, start.saturating_add(length)) {
+            return Err(LandRefusal::Occupied);
+        }
+        lane.blocks.push(PatternBlock {
+            id,
+            pattern_id: pattern,
+            start_tick: start,
+            length_ticks: length,
+        });
+        lane.blocks.sort_by_key(|block| block.start_tick);
+        Ok(id)
+    }
+
+    /// Take a pattern block off its track and hand it back.
+    pub fn remove_block(&mut self, track: usize, id: BlockId) -> Option<PatternBlock> {
+        let lane = self.tracks.get_mut(track)?;
+        let at = lane.blocks.iter().position(|block| block.id == id)?;
+        Some(lane.blocks.remove(at))
+    }
+
+    /// Whether `[start, end)` on `lane` is clear of everything but `id`.
+    fn lane_clear_but(lane: &Track, id: BlockId, start: usize, end: usize) -> bool {
+        !lane.blocks.iter().any(|block| {
+            block.id != id
+                && block.start_tick < end
+                && start < block.start_tick.saturating_add(block.length_ticks)
+        }) && !lane
+            .audio_blocks
+            .iter()
+            .any(|block| block.intersects(start, end))
+    }
+
+    /// Move a pattern block to `start`. False when the way is blocked.
+    pub fn move_block(&mut self, track: usize, id: BlockId, start: usize) -> bool {
+        let Some(lane) = self.tracks.get_mut(track) else {
+            return false;
+        };
+        let Some(at) = lane.blocks.iter().position(|block| block.id == id) else {
+            return false;
+        };
+        let length = lane.blocks[at].length_ticks;
+        if !Self::lane_clear_but(lane, id, start, start.saturating_add(length)) {
+            return false;
+        }
+        lane.blocks[at].start_tick = start;
+        lane.blocks.sort_by_key(|block| block.start_tick);
+        true
+    }
+
+    /// Give a pattern block a new length from its start. False when it
+    /// would run into something, or would be nothing.
+    pub fn resize_block(&mut self, track: usize, id: BlockId, length: usize) -> bool {
+        let Some(lane) = self.tracks.get_mut(track) else {
+            return false;
+        };
+        let Some(at) = lane.blocks.iter().position(|block| block.id == id) else {
+            return false;
+        };
+        let start = lane.blocks[at].start_tick;
+        if length == 0 || !Self::lane_clear_but(lane, id, start, start.saturating_add(length)) {
+            return false;
+        }
+        lane.blocks[at].length_ticks = length;
+        true
+    }
+
     pub fn fill_slot(&mut self, track_index: usize, scene: usize) -> Option<PatternId> {
         let track = self.tracks.get(track_index)?;
         if track.kind != TrackKind::Instrument {

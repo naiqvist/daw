@@ -21,6 +21,7 @@
 //! channel, and no channel is spent before the sync marker has proven
 //! itself in luminance alone.
 
+mod arrangement;
 mod browser;
 mod chain;
 mod document;
@@ -39,6 +40,8 @@ use crate::design::codex::Sign;
 use crate::design::kit::{self, Weight};
 use crate::design::motion::{self, Phase};
 use crate::design::{block, circuit};
+use crate::sequencing::PatternBlock;
+use arrangement::{Arrangement, Hold};
 
 use crate::design;
 use crate::devices::{DeviceKind, Family};
@@ -62,7 +65,7 @@ pub use browser::{Browser, EntryKind, Node, Row, Shelf};
 pub use grid::{
     FocusColumn, FocusGrid, FocusLattice, FocusRow, FocusScope, FocusStack, Miniature, Step,
 };
-pub use keymap::{SampleIntent, StageIntent};
+pub use keymap::{SampleIntent, SongIntent, StageIntent};
 pub use mixer::Reading;
 pub use sample::{Audition, SampleData};
 pub use scenes::Address;
@@ -632,6 +635,14 @@ pub struct Stage {
     /// A rename in flight. `Some` means the letters are the keyboard's
     /// meaning — see `keymap::ScopeContext::Rename`.
     renaming: Option<Rename>,
+    /// Whether the field shows the song's arrangement rather than the
+    /// session. Tab turns it over. The transport's MODE is separate: it
+    /// is where Space was last pressed, and the two can differ.
+    song_view: bool,
+    /// The song view's cursor, window, and memory.
+    arrangement: Arrangement,
+    /// A block lifted off a lane with Q, waiting for E.
+    block_clipboard: Option<PatternBlock>,
     /// The trig menu, while it is up: which row the cursor is on. The
     /// trig it is about is whatever is under the sequencer's cursor —
     /// read afresh each time, never copied, so the menu can never speak
@@ -791,6 +802,9 @@ impl Stage {
             home: None,
             dirty: false,
             renaming: None,
+            song_view: false,
+            arrangement: Arrangement::default(),
+            block_clipboard: None,
             trig_menu: None,
             trig_menu_kept: None,
             sample: None,
@@ -903,6 +917,22 @@ impl Stage {
 
     /// What each track is playing, for a host that has to turn it into
     /// sound. Index-aligned to the song's tracks.
+    /// Whether the transport plays the song's arrangement rather than a
+    /// scene: the host builds the arrangement's graph while it does.
+    pub fn song_mode(&self) -> bool {
+        self.transport.mode() == transport::Mode::Song
+    }
+
+    /// Whether the field shows the song rather than the session.
+    pub fn song_view(&self) -> bool {
+        self.song_view
+    }
+
+    /// The song cursor's track, for posing.
+    pub fn arrangement_track(&self) -> usize {
+        self.arrangement.track
+    }
+
     pub fn playing(&self) -> &[Option<usize>] {
         &self.playing
     }
@@ -1144,6 +1174,9 @@ impl Stage {
         if !self.transport.motion().is_rolling() {
             return None;
         }
+        if self.song_mode() {
+            return self.song_playhead(opened);
+        }
         let scene = self.playing_on(opened.track)?;
         let track = self.song.tracks.get(opened.track)?;
         let Clip::Pattern(sounding) = self.song.session.scenes.get(scene)?.clip(track.id)?;
@@ -1226,6 +1259,10 @@ impl Stage {
     /// there still has a track to land on, and it is the one the strip is
     /// pointing at.
     fn addressed_track(&self) -> Option<usize> {
+        if self.song_view {
+            return (self.arrangement.track < self.song.tracks.len())
+                .then_some(self.arrangement.track);
+        }
         let track = self.session_address().and_then(Address::track)?;
         (track < self.song.tracks.len()).then_some(track)
     }
@@ -1235,6 +1272,11 @@ impl Stage {
     /// cursor, and a verb that acted on anything but where it stands
     /// would be acting somewhere the performer is not looking.
     fn focused_track(&self) -> Option<usize> {
+        if self.song_view {
+            return (self.browser.is_none() && self.focus.depth() == 1)
+                .then_some(self.arrangement.track)
+                .filter(|&track| track < self.song.tracks.len());
+        }
         let track = self.standing_on().and_then(Address::track)?;
         (track < self.song.tracks.len()).then_some(track)
     }
@@ -1488,6 +1530,8 @@ impl Stage {
             keymap::ScopeContext::Clip
         } else if self.mixing && self.focus.depth() == 1 {
             keymap::ScopeContext::Mixer
+        } else if self.song_view && self.focus.depth() == 1 {
+            keymap::ScopeContext::Song
         } else if self.focus.depth() == 1 {
             keymap::ScopeContext::Root
         } else {
@@ -1636,6 +1680,9 @@ impl Stage {
     /// shows nothing, and the tray goes quiet rather than showing a clip
     /// the cursor is not on.
     fn clip_in_view(&self) -> Option<Opened> {
+        if self.inside.is_none() && self.song_view {
+            return self.song_clip();
+        }
         self.inside.or_else(|| match self.session_address()? {
             Address::Slot { track, scene } => {
                 let Clip::Pattern(pattern) = self.song.slot_clip(track, scene)?;
@@ -2403,6 +2450,24 @@ impl Stage {
         // anything else is a sentence abandoned.
         let nudging = std::mem::take(&mut self.nudging);
         let result = match intent {
+            // The song view's keys, while it holds them. Its own verbs
+            // first; then the shared words, which mean the same act on
+            // a block that they mean on a slot or a device.
+            StageIntent::Song(intent) => self.apply_song(intent),
+            StageIntent::Step(step) if self.in_song() => self.song_step(step),
+            StageIntent::Enter if self.in_song() => self.song_enter(),
+            StageIntent::Clear if self.in_song() => self.song_clear(),
+            StageIntent::Nudge if self.in_song() => match self.song_block() {
+                Some(_) => {
+                    self.arrangement.hold = Some(Hold::Nudge);
+                    self.notice = Some(Hold::Nudge.word().to_owned());
+                    Ok(())
+                }
+                None => Err(RefusalReason::Empty),
+            },
+            StageIntent::Yank if self.in_song() => self.song_yank(),
+            StageIntent::Put if self.in_song() => self.song_put(),
+            StageIntent::Escape if self.in_song() => self.song_escape(),
             StageIntent::Step(step @ (Step::Left | Step::Right)) if nudging => self.nudge(step),
             // The trig menu. Summoned over the trig under the cursor —
             // and only over a trig: an empty cell has nothing to say.
@@ -2760,9 +2825,23 @@ impl Stage {
                     left.then_some(()).ok_or(RefusalReason::Shallower)
                 }
             }
+            StageIntent::SongView => {
+                self.song_view = !self.song_view;
+                self.notice = Some(if self.song_view { "song" } else { "session" }.to_owned());
+                Ok(())
+            }
             StageIntent::ToggleTransport => {
                 match self.transport.motion() {
-                    Motion::Stopped => self.transport.set_motion(Motion::Rolling),
+                    Motion::Stopped => {
+                        // Space plays what is in front of it: the song
+                        // from the song view, the scene from the session.
+                        self.transport.set_mode(if self.song_view {
+                            transport::Mode::Song
+                        } else {
+                            transport::Mode::Scene
+                        });
+                        self.transport.set_motion(Motion::Rolling)
+                    }
                     // Space is the shortest emergency path out of a write;
                     // it never silently demotes recording into ordinary roll.
                     Motion::Rolling | Motion::Recording => self.transport.stop(),
@@ -4585,6 +4664,12 @@ impl Stage {
     }
 
     fn draw_field(&self, painter: &egui::Painter, avail: egui::Rect, phase: Phase) {
+        // The field turned over: the song's arrangement in the session's
+        // place. The mixer keeps its own picture over either.
+        if self.song_view && !self.mixing {
+            self.draw_song(painter, avail, phase);
+            return;
+        }
         if let Some((lattice, cursor_shade)) = self.session_lattice() {
             if !self.mixing {
                 self.draw_board(painter, avail, phase);
@@ -5938,11 +6023,30 @@ impl Stage {
             self.alphabet().ink.color,
         );
 
+        let mut left = readout_rect.min.x - gap;
+        // What the clock runs: the session's scene, or the song. Said
+        // only for the song, which is the departure from the norm.
+        if self.transport.mode() == transport::Mode::Song {
+            let word = block::paint(
+                painter,
+                egui::Id::new("stage-transport-mode"),
+                egui::pos2(left, center_y),
+                egui::Align2::RIGHT_CENTER,
+                block::unit::MICRO,
+                transport::Mode::Song.word(),
+                if self.transport.motion().is_rolling() {
+                    self.alphabet().live.color
+                } else {
+                    self.alphabet().ink.color
+                },
+            );
+            left = word.min.x - gap;
+        }
         if self.transport.motion() == Motion::Recording {
             block::paint(
                 painter,
                 egui::Id::new("stage-recording"),
-                egui::pos2(readout_rect.min.x - gap, center_y),
+                egui::pos2(left, center_y),
                 egui::Align2::RIGHT_CENTER,
                 block::unit::MICRO,
                 "REC",
@@ -7771,6 +7875,225 @@ mod tests {
         );
     }
 
+    /// Tab turns the field over, and Space plays what is in front of it:
+    /// the song from the song view, the scene from the session. The mode
+    /// holds until Space is pressed on the other side.
+    #[test]
+    fn tab_turns_the_field_and_space_plays_what_is_in_front_of_it() {
+        let mut stage = Stage::new();
+        assert!(!stage.song_view());
+        assert_eq!(drive(&mut stage, &[Key::Tab]), vec![ApplyOutcome::Changed]);
+        assert!(stage.song_view());
+        assert_eq!(
+            drive(&mut stage, &[Key::Space]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert!(stage.song_mode(), "space in the song view played the scene");
+        assert_eq!(
+            drive(&mut stage, &[Key::Space, Key::Tab]),
+            vec![ApplyOutcome::Changed; 2]
+        );
+        assert!(stage.song_mode(), "turning the field changed what plays");
+        assert_eq!(
+            drive(&mut stage, &[Key::Space]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert!(!stage.song_mode(), "space in the session played the song");
+    }
+
+    /// The song view's verbs, through the keys: Enter lays a block one
+    /// pattern long and opens one that is there; D doubles it; W and ^R
+    /// hold a nudge and a resize that refuse to run into a neighbour;
+    /// Delete, Q and E take a block away, keep it, and put it back.
+    #[test]
+    fn the_song_view_lays_moves_sizes_and_lifts_blocks() {
+        let mut stage = Stage::new();
+        assert_eq!(
+            stage.apply(StageIntent::NewInstrumentTrack),
+            ApplyOutcome::Changed
+        );
+        let track = stage.song().tracks.len() - 1;
+        assert_eq!(drive(&mut stage, &[Key::Tab]), vec![ApplyOutcome::Changed]);
+        while stage.arrangement.track < track {
+            assert_eq!(
+                drive(&mut stage, &[Key::ArrowDown]),
+                vec![ApplyOutcome::Changed]
+            );
+        }
+        assert_eq!(
+            drive(&mut stage, &[Key::ArrowDown]),
+            vec![ApplyOutcome::Refused(Refusal {
+                intent: StageIntent::Step(Step::Down),
+                reason: RefusalReason::Edge(Step::Down),
+            })]
+        );
+
+        // Enter on the empty first cell lays a block, one pattern long.
+        assert_eq!(
+            drive(&mut stage, &[Key::Enter]),
+            vec![ApplyOutcome::Changed]
+        );
+        let blocks = |stage: &Stage| stage.song().tracks[track].blocks.clone();
+        assert_eq!(blocks(&stage).len(), 1);
+        let first = blocks(&stage)[0].clone();
+        let len = sequencer::pattern_length(stage.song(), first.pattern_id);
+        assert_eq!((first.start_tick, first.length_ticks), (0, len));
+        let bar = arrangement::bar_ticks(stage.song(), 0);
+
+        // Enter on the block opens its pattern in the tray; Escape climbs out.
+        assert_eq!(
+            drive(&mut stage, &[Key::Enter]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(
+            stage.inside,
+            Some(Opened {
+                pattern: first.pattern_id,
+                track
+            })
+        );
+        assert_eq!(stage.scope_context(), keymap::ScopeContext::Clip);
+        assert_eq!(
+            drive(&mut stage, &[Key::Escape]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(stage.inside, None);
+        assert_eq!(stage.scope_context(), keymap::ScopeContext::Song);
+
+        // Past the block, another; D doubles it right after itself.
+        for _ in 0..len.div_ceil(bar) {
+            assert_eq!(
+                drive(&mut stage, &[Key::ArrowRight]),
+                vec![ApplyOutcome::Changed]
+            );
+        }
+        assert_eq!(stage.arrangement.tick, len);
+        assert_eq!(
+            drive(&mut stage, &[Key::Enter, Key::D]),
+            vec![ApplyOutcome::Changed; 2]
+        );
+        let laid = blocks(&stage);
+        assert_eq!(laid.len(), 3);
+        assert_eq!(laid[1].start_tick, len);
+        assert_eq!(laid[2].start_tick, 2 * len);
+        assert_eq!(
+            stage.arrangement.tick,
+            2 * len,
+            "the cursor follows the double"
+        );
+
+        // Back on the middle block: a nudge either way runs into a
+        // neighbour and is refused, said out loud; Escape lets go.
+        assert_eq!(
+            drive(&mut stage, &[Key::ArrowLeft]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(
+            stage.song_block().map(|(_, block)| block.id),
+            Some(laid[1].id)
+        );
+        assert_eq!(drive(&mut stage, &[Key::W]), vec![ApplyOutcome::Changed]);
+        assert_eq!(stage.arrangement.hold, Some(Hold::Nudge));
+        assert!(matches!(
+            drive(&mut stage, &[Key::ArrowRight])[0],
+            ApplyOutcome::Refused(_)
+        ));
+        assert_eq!(stage.notice.as_deref(), Some("LAND: BLOCK IN THE WAY"));
+        assert_eq!(
+            drive(&mut stage, &[Key::Escape]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(stage.arrangement.hold, None);
+        assert!(stage.song_view(), "escape from a hold left the view");
+
+        // The last block goes; then the middle one can grow by a cell.
+        assert_eq!(
+            drive(&mut stage, &[Key::ArrowRight]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(
+            drive(&mut stage, &[Key::Delete]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(blocks(&stage).len(), 2);
+        assert_eq!(
+            drive(&mut stage, &[Key::ArrowLeft]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(command(&mut stage, Key::R), ApplyOutcome::Changed);
+        assert_eq!(stage.arrangement.hold, Some(Hold::Resize));
+        assert_eq!(
+            drive(&mut stage, &[Key::ArrowRight]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(blocks(&stage)[1].length_ticks, len + bar);
+        assert_eq!(
+            drive(&mut stage, &[Key::Escape]),
+            vec![ApplyOutcome::Changed]
+        );
+
+        // Yank lifts it; put lays it down again at the cursor.
+        assert_eq!(drive(&mut stage, &[Key::Q]), vec![ApplyOutcome::Changed]);
+        assert_eq!(blocks(&stage).len(), 1);
+        for _ in 0..3 {
+            assert_eq!(
+                drive(&mut stage, &[Key::ArrowRight]),
+                vec![ApplyOutcome::Changed]
+            );
+        }
+        assert_eq!(drive(&mut stage, &[Key::E]), vec![ApplyOutcome::Changed]);
+        let put = blocks(&stage);
+        assert_eq!(put.len(), 2);
+        assert_eq!(put[1].start_tick, stage.arrangement.tick);
+        assert_eq!(put[1].length_ticks, len + bar);
+
+        // One pattern in the track's column: nothing to pick.
+        assert!(matches!(
+            drive(&mut stage, &[Key::P])[0],
+            ApplyOutcome::Refused(_)
+        ));
+        // Undo covers the edits.
+        assert_eq!(command(&mut stage, Key::Z), ApplyOutcome::Changed);
+        assert_eq!(blocks(&stage).len(), 1);
+    }
+
+    /// The tray shows the block under the song cursor, and shifted
+    /// arrows zoom the view.
+    #[test]
+    fn the_tray_follows_the_song_cursor_and_the_view_zooms() {
+        let mut stage = Stage::new();
+        assert_eq!(
+            stage.apply(StageIntent::NewInstrumentTrack),
+            ApplyOutcome::Changed
+        );
+        let track = stage.song().tracks.len() - 1;
+        assert_eq!(drive(&mut stage, &[Key::Tab]), vec![ApplyOutcome::Changed]);
+        while stage.arrangement.track < track {
+            assert_eq!(
+                drive(&mut stage, &[Key::ArrowDown]),
+                vec![ApplyOutcome::Changed]
+            );
+        }
+        assert_eq!(stage.clip_in_view(), None);
+        assert_eq!(
+            drive(&mut stage, &[Key::Enter]),
+            vec![ApplyOutcome::Changed]
+        );
+        let pattern = stage.song().tracks[track].blocks[0].pattern_id;
+        assert_eq!(stage.clip_in_view(), Some(Opened { pattern, track }));
+        let far = stage.arrangement.bars_across();
+        assert_eq!(
+            stage.handle_key(Modifiers::SHIFT, Key::ArrowUp),
+            Some(ApplyOutcome::Changed)
+        );
+        assert!(stage.arrangement.bars_across() < far);
+        assert_eq!(
+            stage.handle_key(Modifiers::SHIFT, Key::ArrowDown),
+            Some(ApplyOutcome::Changed)
+        );
+        assert_eq!(stage.arrangement.bars_across(), far);
+    }
+
     /// A sampler with a file on track one, and the editor up over it.
     fn into_sample_editor(stage: &mut Stage) -> crate::sequencing::DeviceId {
         let id = stage
@@ -9045,6 +9368,9 @@ mod tests {
                     keymap::ScopeContext::Sample => {
                         into_sample_editor(&mut stage);
                     }
+                    keymap::ScopeContext::Song => {
+                        let _ = stage.handle_key(Modifiers::NONE, Key::Tab);
+                    }
                     keymap::ScopeContext::Root => {}
                 }
                 // Everything a key is allowed to change. A new piece of
@@ -9071,6 +9397,8 @@ mod tests {
                         stage.trig_menu,
                         stage.sample.clone(),
                         stage.library_generation,
+                        stage.song_view,
+                        stage.arrangement.clone(),
                     ),
                 );
 
@@ -9095,6 +9423,8 @@ mod tests {
                                     stage.trig_menu,
                                     stage.sample.clone(),
                                     stage.library_generation,
+                                    stage.song_view,
+                                    stage.arrangement.clone(),
                                 ),
                             ),
                             before,
@@ -9122,6 +9452,8 @@ mod tests {
                                     stage.trig_menu,
                                     stage.sample.clone(),
                                     stage.library_generation,
+                                    stage.song_view,
+                                    stage.arrangement.clone(),
                                 ),
                             ),
                             before,
@@ -9176,6 +9508,9 @@ mod tests {
                 }
                 keymap::ScopeContext::Sample => {
                     into_sample_editor(&mut stage);
+                }
+                keymap::ScopeContext::Song => {
+                    let _ = stage.handle_key(Modifiers::NONE, Key::Tab);
                 }
             }
             let focus = stage.focus.clone();
@@ -10252,6 +10587,9 @@ mod tests {
                 }
                 keymap::ScopeContext::Sample => {
                     into_sample_editor(&mut stage);
+                }
+                keymap::ScopeContext::Song => {
+                    let _ = stage.handle_key(Modifiers::NONE, Key::Tab);
                 }
                 keymap::ScopeContext::Rename => {
                     let _ = stage.handle_key(Modifiers::NONE, Key::F2);

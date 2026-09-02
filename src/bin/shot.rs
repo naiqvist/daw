@@ -266,7 +266,7 @@ fn posed_history(hot: f32) -> daw::ui::device::scope::History {
 /// intent vocabulary is the same thing a key would have produced — so a
 /// shot is of the surface the keys reach, not of a back door into it.
 fn build_stage(which: &str) -> daw::ui::stage::Stage {
-    use daw::ui::stage::{Stage, StageIntent, Step};
+    use daw::ui::stage::{SongIntent, Stage, StageIntent, Step};
 
     let mut stage = Stage::new();
     // The palette opens with the app and would cover the very thing most
@@ -282,7 +282,70 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
     if stage.polarity() != want {
         let _ = stage.apply(StageIntent::Ground);
     }
-    if which.contains("browser") {
+    if which.contains("song") {
+        // The song view: three instrument tracks and an audio track,
+        // blocks laid along the first two, the cursor on one, the song
+        // rolling through the second bar.
+        for _ in 0..3 {
+            let _ = stage.apply(StageIntent::NewInstrumentTrack);
+        }
+        let _ = stage.apply(StageIntent::NewAudioTrack);
+        let _ = stage.apply(StageIntent::SongView);
+        if !which.contains("empty") {
+            let first = stage.song().tracks.len() - 4;
+            while stage.arrangement_track() < first {
+                let _ = stage.apply(StageIntent::Step(Step::Down));
+            }
+            // Track one: a block, then two more back to back, the last
+            // cut to a bar.
+            let _ = stage.apply(StageIntent::Enter);
+            let _ = stage.apply(StageIntent::Song(SongIntent::JumpNext));
+            let _ = stage.apply(StageIntent::Enter);
+            let _ = stage.apply(StageIntent::Song(SongIntent::Duplicate));
+            for _ in 0..3 {
+                let _ = stage.apply(StageIntent::Song(SongIntent::Stretch(Step::Left)));
+            }
+            // Track two: one block two bars in, stretched a bar.
+            let _ = stage.apply(StageIntent::Step(Step::Down));
+            let _ = stage.apply(StageIntent::Song(SongIntent::JumpPrev));
+            let _ = stage.apply(StageIntent::Step(Step::Right));
+            let _ = stage.apply(StageIntent::Step(Step::Right));
+            let _ = stage.apply(StageIntent::Enter);
+            let _ = stage.apply(StageIntent::Song(SongIntent::Stretch(Step::Right)));
+            // Track three: a block at the seventh bar, a bar long.
+            let _ = stage.apply(StageIntent::Step(Step::Down));
+            for _ in 0..4 {
+                let _ = stage.apply(StageIntent::Step(Step::Right));
+            }
+            let _ = stage.apply(StageIntent::Enter);
+            for _ in 0..3 {
+                let _ = stage.apply(StageIntent::Song(SongIntent::Stretch(Step::Left)));
+            }
+            // Notes in the patterns, so the strips show rhythm.
+            let patterns = stage.song().patterns.len();
+            for (index, pattern) in stage.song_mut().patterns.iter_mut().enumerate() {
+                for step in (index % 3..16).step_by(if index % 2 == 0 { 4 } else { 3 }) {
+                    pattern.toggle(step, daw::sequencing::Note::new(60, 24, 100));
+                }
+            }
+            let _ = patterns;
+            // Back to the block on track two.
+            let _ = stage.apply(StageIntent::Step(Step::Up));
+            let _ = stage.apply(StageIntent::Song(SongIntent::JumpPrev));
+            let _ = stage.apply(StageIntent::Song(SongIntent::JumpPrev));
+            if which.contains("open") {
+                let _ = stage.apply(StageIntent::Enter);
+            }
+            if which.contains("rolling") {
+                let _ = stage.apply(StageIntent::ToggleTransport);
+                stage.set_position(6.5);
+            }
+        }
+        if which.contains("zoom") {
+            let _ = stage.apply(StageIntent::Song(SongIntent::ZoomIn));
+            let _ = stage.apply(StageIntent::Song(SongIntent::ZoomIn));
+        }
+    } else if which.contains("browser") {
         let _ = stage.apply(StageIntent::Browse);
     } else if which.contains("help") {
         let _ = stage.apply(StageIntent::Help);

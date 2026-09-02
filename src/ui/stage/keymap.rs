@@ -45,11 +45,15 @@ pub(super) enum ScopeContext {
     /// the editor's — cursor, zoom, markers, slices, audition. A place
     /// of its own, like the browser, that Escape leaves.
     Sample,
+    /// The song view: the arrangement's lanes, the cursor on a cell or
+    /// a block. The tray beneath shows the block's pattern; the verbs
+    /// here move, size, and lay blocks.
+    Song,
 }
 
 impl ScopeContext {
     #[cfg(test)]
-    pub(super) const ALL: [Self; 9] = [
+    pub(super) const ALL: [Self; 10] = [
         Self::Root,
         Self::Nested,
         Self::Browser,
@@ -59,6 +63,7 @@ impl ScopeContext {
         Self::Rename,
         Self::TrigMenu,
         Self::Sample,
+        Self::Song,
     ];
 }
 
@@ -152,6 +157,52 @@ pub enum StageIntent {
     /// Scan the library's folders again, so a pack dropped in while the
     /// stage runs turns up without a restart.
     Rescan,
+    /// Turn the field over: the session, or the song's arrangement.
+    SongView,
+    /// The song view's own verbs, over the block or cell under the cursor.
+    Song(SongIntent),
+}
+
+/// What the song view does beyond the cursor's walk and the verbs it
+/// shares with the session (Enter, Delete, W, Q, E).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SongIntent {
+    /// Fewer bars across: a closer look.
+    ZoomIn,
+    /// More bars across.
+    ZoomOut,
+    /// Hold: Left and Right resize the block under the cursor by a
+    /// cell until Escape.
+    Resize,
+    /// The block under the cursor a whole bar longer or shorter.
+    Stretch(Step),
+    /// The block under the cursor again, right after itself.
+    Duplicate,
+    /// The block's pattern: the next one its track holds in the session.
+    Pick,
+    /// The previous one.
+    PickBack,
+    /// The cursor to the previous block edge on its track.
+    JumpPrev,
+    /// The next.
+    JumpNext,
+}
+
+impl SongIntent {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ZoomIn => "zoom in",
+            Self::ZoomOut => "zoom out",
+            Self::Resize => "resize block",
+            Self::Stretch(Step::Left) => "a bar shorter",
+            Self::Stretch(_) => "a bar longer",
+            Self::Duplicate => "duplicate block",
+            Self::Pick => "next pattern",
+            Self::PickBack => "previous pattern",
+            Self::JumpPrev => "previous edge",
+            Self::JumpNext => "next edge",
+        }
+    }
 }
 
 /// What the sample editor can be told. Its own enum, so the editor's
@@ -318,6 +369,8 @@ impl StageIntent {
             Self::ClearLock => "clear lock",
             Self::Sample(intent) => intent.label(),
             Self::Rescan => "rescan library",
+            Self::SongView => "session / song",
+            Self::Song(intent) => intent.label(),
         }
     }
 }
@@ -1052,6 +1105,105 @@ const BINDINGS: &[Binding] = &[
         StageIntent::Step(Step::Right),
     ),
     Binding::shift(ScopeContext::Chain, Key::Tab, StageIntent::Step(Step::Left)),
+    // The field turned over: Tab, from the session and its levels and
+    // from the mixer. Inside a clip Tab is the grammar's; in the band it
+    // walks devices; in the room it turns pages.
+    Binding::new(ScopeContext::Root, Key::Tab, StageIntent::SongView),
+    Binding::new(ScopeContext::Nested, Key::Tab, StageIntent::SongView),
+    Binding::new(ScopeContext::Mixer, Key::Tab, StageIntent::SongView),
+    // The song view. Time and the field's turn as everywhere; the
+    // cursor's walk and the shared verbs by the same keys the session
+    // uses for the same acts; and its own: zoom on the shifted vertical
+    // arrows, a bar at a time on the shifted horizontal ones, ^R to
+    // hold a resize (rescan is the session's), D to double, P to pick.
+    Binding::new(ScopeContext::Song, Key::Space, StageIntent::ToggleTransport),
+    Binding::new(ScopeContext::Song, Key::Home, StageIntent::Rewind),
+    Binding::new(ScopeContext::Song, Key::Tab, StageIntent::SongView),
+    Binding::new(ScopeContext::Song, Key::Escape, StageIntent::Escape),
+    Binding::new(
+        ScopeContext::Song,
+        Key::ArrowUp,
+        StageIntent::Step(Step::Up),
+    ),
+    Binding::new(
+        ScopeContext::Song,
+        Key::ArrowDown,
+        StageIntent::Step(Step::Down),
+    ),
+    Binding::new(
+        ScopeContext::Song,
+        Key::ArrowLeft,
+        StageIntent::Step(Step::Left),
+    ),
+    Binding::new(
+        ScopeContext::Song,
+        Key::ArrowRight,
+        StageIntent::Step(Step::Right),
+    ),
+    Binding::new(ScopeContext::Song, Key::Enter, StageIntent::Enter),
+    Binding::new(ScopeContext::Song, Key::Delete, StageIntent::Clear),
+    Binding::new(ScopeContext::Song, Key::Backspace, StageIntent::Clear),
+    Binding::new(ScopeContext::Song, Key::W, StageIntent::Nudge),
+    Binding::new(ScopeContext::Song, Key::Q, StageIntent::Yank),
+    Binding::new(ScopeContext::Song, Key::E, StageIntent::Put),
+    Binding::new(
+        ScopeContext::Song,
+        Key::D,
+        StageIntent::Song(SongIntent::Duplicate),
+    ),
+    Binding::new(
+        ScopeContext::Song,
+        Key::P,
+        StageIntent::Song(SongIntent::Pick),
+    ),
+    Binding::shift(
+        ScopeContext::Song,
+        Key::P,
+        StageIntent::Song(SongIntent::PickBack),
+    ),
+    Binding::shift(
+        ScopeContext::Song,
+        Key::ArrowUp,
+        StageIntent::Song(SongIntent::ZoomIn),
+    ),
+    Binding::shift(
+        ScopeContext::Song,
+        Key::ArrowDown,
+        StageIntent::Song(SongIntent::ZoomOut),
+    ),
+    Binding::shift(
+        ScopeContext::Song,
+        Key::ArrowLeft,
+        StageIntent::Song(SongIntent::Stretch(Step::Left)),
+    ),
+    Binding::shift(
+        ScopeContext::Song,
+        Key::ArrowRight,
+        StageIntent::Song(SongIntent::Stretch(Step::Right)),
+    ),
+    Binding::command(
+        ScopeContext::Song,
+        Key::ArrowLeft,
+        StageIntent::Song(SongIntent::JumpPrev),
+    ),
+    Binding::command(
+        ScopeContext::Song,
+        Key::ArrowRight,
+        StageIntent::Song(SongIntent::JumpNext),
+    ),
+    Binding::command(
+        ScopeContext::Song,
+        Key::R,
+        StageIntent::Song(SongIntent::Resize),
+    ),
+    Binding::command(ScopeContext::Song, Key::M, StageIntent::Mix),
+    Binding::command(ScopeContext::Song, Key::D, StageIntent::Devices),
+    Binding::command(ScopeContext::Song, Key::B, StageIntent::Browse),
+    Binding::command(ScopeContext::Song, Key::L, StageIntent::Ground),
+    Binding::command(ScopeContext::Song, Key::Z, StageIntent::Undo),
+    Binding::command_shift(ScopeContext::Song, Key::Z, StageIntent::Redo),
+    Binding::command(ScopeContext::Song, Key::S, StageIntent::Save),
+    Binding::new(ScopeContext::Song, Key::Questionmark, StageIntent::Help),
 ];
 
 /// Every binding in one scope, in table order. The help surface reads
@@ -1075,7 +1227,11 @@ fn family(intent: StageIntent) -> &'static str {
     match intent {
         StageIntent::Step(_) | StageIntent::Enter | StageIntent::Escape => "move",
         StageIntent::ToggleTransport | StageIntent::Rewind => "time",
-        StageIntent::Help | StageIntent::Browse | StageIntent::Mix | StageIntent::Ground => "view",
+        StageIntent::Help
+        | StageIntent::Browse
+        | StageIntent::Mix
+        | StageIntent::Ground
+        | StageIntent::SongView => "view",
         StageIntent::TypeChar(_) | StageIntent::Backspace | StageIntent::Rescan => "browse",
         StageIntent::NewAudioTrack | StageIntent::NewInstrumentTrack => "track",
         StageIntent::Clear | StageIntent::Launch | StageIntent::LaunchScene => "session",
@@ -1092,6 +1248,7 @@ fn family(intent: StageIntent) -> &'static str {
         | StageIntent::TrigMenu
         | StageIntent::ClearLock => "edit",
         StageIntent::Sample(_) => "sample",
+        StageIntent::Song(_) => "song",
     }
 }
 

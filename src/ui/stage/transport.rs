@@ -45,6 +45,25 @@ impl Motion {
     }
 }
 
+/// What the transport plays: the session's scene, looping, or the
+/// song's arrangement, once from the playhead. Set by where Space was
+/// pressed, kept until Space is pressed somewhere else.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Mode {
+    #[default]
+    Scene,
+    Song,
+}
+
+impl Mode {
+    pub fn word(self) -> &'static str {
+        match self {
+            Mode::Scene => "SCENE",
+            Mode::Song => "SONG",
+        }
+    }
+}
+
 /// The transport: a position in song ticks and what it is doing.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Transport {
@@ -52,11 +71,20 @@ pub struct Transport {
     /// lost between frames and the drift does not accumulate.
     tick: f64,
     motion: Motion,
+    mode: Mode,
 }
 
 impl Transport {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.mode = mode;
     }
 
     pub fn motion(&self) -> Motion {
