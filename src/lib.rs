@@ -18,6 +18,7 @@ pub mod params;
 pub mod pitch;
 pub mod render;
 pub mod sequencing;
+pub mod shell;
 pub mod slice;
 pub mod song_graph;
 pub mod targets;

@@ -260,6 +260,19 @@ pub fn lens_name(lens: &ActiveLens) -> String {
     }
 }
 
+/// A note's continuous degree address, where one period advances by the
+/// active key's degree count. Absolute pitches have no degree sign: the
+/// substrate is not quietly reinterpreted as a scale address merely
+/// because the display lens changed.
+pub fn degree_of(note: &NoteView, key: &Key) -> Option<i32> {
+    match note.pitch.anchor {
+        Anchor::Degree { degree, period } => {
+            Some(degree.saturating_add(period.saturating_mul(key.degree_count() as i32)))
+        }
+        Anchor::Absolute(_) => None,
+    }
+}
+
 /// A degree address in the universal `degrees` lens: `^3`, one period
 /// up `^3'`, one down `^3,`. Degrees print one-based — musicians count
 /// from one; storage counts from zero.
@@ -444,6 +457,8 @@ mod tests {
         let high = degree_view(2, 1, &key);
         assert_eq!(address_label(&sargam, &high, &key), "Ga'");
         assert_eq!(address_label(&ActiveLens::Degrees, &high, &key), "^3'");
+        assert_eq!(degree_of(&note, &key), Some(2));
+        assert_eq!(degree_of(&high, &key), Some(9));
     }
 
     /// The ratio lens speaks the scale's own spellings where the `.scl`
@@ -468,5 +483,6 @@ mod tests {
         assert_eq!(address_label(&ActiveLens::Degrees, &note, &key), "A4");
         assert_eq!(address_label(&ActiveLens::Notes, &note, &key), "A4");
         assert_eq!(address_label(&ActiveLens::Cents, &note, &key), "440");
+        assert_eq!(degree_of(&note, &key), None);
     }
 }

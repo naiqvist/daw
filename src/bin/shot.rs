@@ -338,9 +338,26 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
         let _ = stage.apply(StageIntent::Mix);
     } else if which.contains("clip") {
         // Down onto a slot, fill it, and go in: the sequencer and the
-        // trig inspector are what this shot is for.
+        // trig inspector are what this shot is for. Give the new pattern
+        // a small phrase before opening it, so the pose exercises seals,
+        // held traces, velocity, condition and degree signs rather than
+        // proving only that empty vias draw.
         let _ = stage.apply(StageIntent::Step(Step::Down));
         let _ = stage.apply(StageIntent::Enter);
+        if let Some(pattern) = stage.song_mut().patterns.last_mut() {
+            use daw::pitch::Pitch;
+            use daw::sequencing::Note;
+
+            pattern.set_primary(0, Note::with_pitch(Pitch::degree(0, 0), 36, 118));
+            pattern.trig_mut(0).probability = 0.75;
+            pattern.set_primary(4, Note::with_pitch(Pitch::degree(2, 0), 12, 82));
+            let mut pushed = Note::with_pitch(Pitch::degree(4, 0), 24, 104);
+            pushed.micro_ticks = 2;
+            pattern.set_primary(7, pushed);
+            pattern.add_tone(7, Note::with_pitch(Pitch::degree(6, 0), 24, 92));
+            pattern.set_primary(12, Note::with_pitch(Pitch::degree(1, 1), 48, 126));
+            pattern.set_primary(20, Note::new(54, 18, 66));
+        }
         let _ = stage.apply(StageIntent::Enter);
     }
     stage

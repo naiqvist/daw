@@ -32,26 +32,14 @@ use daw::audio::{Engine, EngineConfig, StreamHealth};
 use daw::design::Polarity;
 use daw::install_stage_fonts;
 use daw::params;
+use daw::shell;
 use daw::song_graph::{self, MASTER_METER, SongNodes};
 use daw::ui::stage::{EngineState, Health, Level, Stage};
 use daw::ui::theme::Theme;
 use eframe::egui;
 
-fn main() -> eframe::Result {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("daw — stage")
-            .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([720.0, 480.0]),
-        renderer: eframe::Renderer::Wgpu,
-        ..Default::default()
-    };
-
-    eframe::run_native(
-        "daw-stage",
-        options,
-        Box::new(|cc| Ok(Box::new(App::new(cc)))),
-    )
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    shell::run("daw — stage", [1280.0, 800.0], [720.0, 480.0], App::new)
 }
 
 struct App {
@@ -285,12 +273,7 @@ fn samples_at(engine: &Engine, tick: usize, bpm: f64) -> u64 {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        // The fonts and the theme are the design system, and they are the
-        // one part of the old surfaces that carries over unchanged — they
-        // encode the aesthetic charter rather than any layout.
-        install_stage_fonts(&cc.egui_ctx);
-        Theme::dark().apply(&cc.egui_ctx);
+    fn new(_storage: &shell::Storage) -> Self {
         let audio = Audio::start();
         if let Some(trouble) = &audio.trouble {
             // stderr rather than the surface: the stage has one message
@@ -320,28 +303,19 @@ impl App {
     }
 }
 
-impl eframe::App for App {
-    /// The ground, and meant. Whichever way the polarity is turned, this
-    /// is the alphabet's own GROUND rung rather than a colour picked to
-    /// look like it — so the window behind the stage and the stage's own
-    /// ground can never be two different blacks, or two different papers.
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        let ground = daw::design::Alphabet::for_polarity(self.stage.polarity())
-            .ground
-            .color;
-        let channel = |v: u8| (v as f32 / 255.0).powf(2.2);
-        [
-            channel(ground.r()),
-            channel(ground.g()),
-            channel(ground.b()),
-            1.0,
-        ]
+impl shell::Host for App {
+    /// Fonts and the initial stock-widget theme, once the shell has made
+    /// the egui context. The custom shell exists so the completed frame
+    /// can pass through `shell::post` before presentation.
+    fn startup(&mut self, ctx: &egui::Context) {
+        install_stage_fonts(ctx);
+        Theme::dark().apply(ctx);
     }
 
     /// eframe 0.36 hands the app a `Ui` rather than a `Context` and a
     /// panel to build, so there is nothing between the window and the
     /// stage. That is the whole surface.
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui) {
         // The window's title carries the song's name and whether it is
         // safe, so a glance at the taskbar answers both.
         let title = match self.stage.path() {
@@ -374,4 +348,6 @@ impl eframe::App for App {
         // A meter that only moves when the mouse does is not a meter.
         ui.ctx().request_repaint();
     }
+
+    fn save(&mut self, _storage: &mut shell::Storage) {}
 }

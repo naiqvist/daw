@@ -3,7 +3,7 @@
 //! Values are placeholders sourced from the UI grid selection. The eventual
 //! sequence model can provide the same snapshot without changing this view.
 
-use crate::design::Polarity;
+use crate::design::{Polarity, circuit, kit::Weight};
 use crate::ui::sequencer::grid_resolution::length_label;
 use crate::ui::sequencer::layout_grid::{GridArea, LayoutGrid};
 use crate::ui::sequencer::lens::degree_label;
@@ -54,13 +54,35 @@ pub(crate) fn show(
     ground: Polarity,
 ) {
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 0.0, shade(PANEL_FILL, ground));
+    let mut panel = Vec::new();
+    circuit::panel_variant(
+        &mut panel,
+        rect,
+        Some(shade(PANEL_FILL, ground)),
+        shade(0, ground),
+        Some((Weight::Hair, shade(LABEL_COLOR, ground))),
+        1,
+    );
+    for shape in panel {
+        painter.add(shape);
+    }
 
     let header_rect = egui::Rect::from_min_max(
         rect.min,
         egui::pos2(rect.right(), rect.top() + HEADER_HEIGHT),
     );
-    painter.rect_filled(header_rect, 0.0, shade(HEADER_FILL, ground));
+    let mut header = Vec::new();
+    circuit::panel_variant(
+        &mut header,
+        header_rect,
+        Some(shade(HEADER_FILL, ground)),
+        shade(PANEL_FILL, ground),
+        Some((Weight::Hair, shade(LABEL_COLOR, ground))),
+        3,
+    );
+    for shape in header {
+        painter.add(shape);
+    }
     // The header names the noun and, at its right, the noun's address —
     // the same address the grid's cursor brackets.
     painter.text(
@@ -71,7 +93,7 @@ pub(crate) fn show(
         shade(INK_LEVEL, ground),
     );
     painter.text(
-        header_rect.right_center() - egui::vec2(space::SM, 0.0),
+        header_rect.right_center() - egui::vec2(space::LG, 0.0),
         egui::Align2::RIGHT_CENTER,
         format!("{:02}", selection.step + 1),
         egui::FontId::new(font::LABEL, egui::FontFamily::Monospace),

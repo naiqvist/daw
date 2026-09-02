@@ -11,7 +11,7 @@
 //! Per-pitch removal needs no private intent: it speaks `Clear` then
 //! re-adds the survivors, exactly the way put replaces a trig.
 
-use crate::design::Polarity;
+use crate::design::{Polarity, circuit, kit::Weight, motion::pulse_ink};
 use crate::pitch::Pitch;
 use crate::sequencing::PATTERN_STEPS;
 use crate::ui::sequencer::grammar::{Motion, Utterance, Voice};
@@ -23,7 +23,7 @@ use crate::ui::sequencer::sequence_grid::{
     TrigSelection, beat_fill, draw_cursor, next_probability, note_name, trig_at, velocity_ink,
 };
 use crate::ui::sequencer::verbs::Verb;
-use crate::ui::sequencer::{INK_LEVEL, shade};
+use crate::ui::sequencer::{INK_LEVEL, phase_of, shade};
 use crate::ui::tokens::{font, space, stroke};
 use eframe::egui;
 
@@ -46,8 +46,6 @@ const EDGE: u8 = 48;
 const LABEL_INK: u8 = 145;
 const GHOST: u8 = 88;
 const MUTED: u8 = 104;
-/// The present moment's own width, as the step grid draws it too.
-const PLAYHEAD_W: f32 = 2.0;
 /// The hairline between lanes, and the face a note is drawn on.
 const LANE_RULE: u8 = 18;
 /// A selected note's outline, one step above the ghost it replaces.
@@ -178,6 +176,7 @@ impl RollPanel {
         } else {
             Some(voice.sentence.display())
         };
+        let phase = phase_of(playhead);
 
         let rows = (((available.height() - STATUS_HEIGHT) / ROW_H).floor() as usize).max(1);
         self.follow(rows);
@@ -220,10 +219,31 @@ impl RollPanel {
             if is_black_key(midi) {
                 painter.rect_filled(lane, 0.0, shade(LANE_DARK, ground));
             }
-            painter.line_segment(
-                [lane.left_bottom(), lane.right_bottom()],
-                egui::Stroke::new(stroke::HAIR, shade(LANE_RULE, ground)),
+            let mut lane_shapes = Vec::new();
+            circuit::trace(
+                &mut lane_shapes,
+                &[lane.left_bottom(), lane.right_bottom()],
+                Weight::Hair,
+                shade(LANE_RULE, ground),
             );
+            for step in self.view_step..=self.view_step + self.visible_steps() {
+                if step.is_multiple_of(16) {
+                    let x = lanes.left() + (step - self.view_step) as f32 * step_w;
+                    circuit::via(
+                        &mut lane_shapes,
+                        egui::pos2(x, lane.center().y),
+                        shade(EDGE, ground),
+                        if is_black_key(midi) {
+                            shade(LANE_DARK, ground)
+                        } else {
+                            shade(LANE_LIGHT, ground)
+                        },
+                    );
+                }
+            }
+            for shape in lane_shapes {
+                painter.add(shape);
+            }
             if midi.is_multiple_of(12) {
                 painter.text(
                     egui::pos2(available.left() + LABEL_W - space::SM, lane.center().y),
@@ -243,15 +263,21 @@ impl RollPanel {
         for step in self.view_step..=visible_end {
             let tick = step * STEP_TICKS;
             let x = lanes.left() + (step - self.view_step) as f32 * step_w;
-            let width = if step.is_multiple_of(16) {
-                stroke::BOLD
+            let weight = if step.is_multiple_of(16) {
+                Weight::Heavy
             } else {
-                stroke::HAIR
+                Weight::Hair
             };
-            roll_painter.line_segment(
-                [egui::pos2(x, lanes.top()), egui::pos2(x, lanes.bottom())],
-                egui::Stroke::new(width, beat_fill(tick, ground)),
+            let mut shapes = Vec::new();
+            circuit::trace(
+                &mut shapes,
+                &[egui::pos2(x, lanes.top()), egui::pos2(x, lanes.bottom())],
+                weight,
+                beat_fill(tick, ground),
             );
+            for shape in shapes {
+                roll_painter.add(shape);
+            }
         }
 
         if let Some(clip) = clip {
@@ -294,14 +320,25 @@ impl RollPanel {
             let steps = tick as f32 / STEP_TICKS as f32;
             let x = lanes.left() + (steps - self.view_step as f32) * step_w;
             if x >= lanes.left() && x <= lanes.right() {
-                roll_painter.rect_filled(
-                    egui::Rect::from_min_max(
-                        egui::pos2(x, lanes.top()),
-                        egui::pos2(x + PLAYHEAD_W, lanes.bottom()),
-                    ),
-                    0.0,
-                    crate::design::LIVE.color,
+                let alpha = crate::design::Alphabet::for_polarity(ground);
+                let ink = pulse_ink(alpha.live.color, alpha.live_dim.color, phase);
+                let mut shapes = Vec::new();
+                circuit::trace(
+                    &mut shapes,
+                    &[egui::pos2(x, lanes.top()), egui::pos2(x, lanes.bottom())],
+                    Weight::Heavy,
+                    ink,
                 );
+                circuit::pad(
+                    &mut shapes,
+                    egui::pos2(x, lanes.top()),
+                    circuit::PAD + 1.0,
+                    ink,
+                    true,
+                );
+                for shape in shapes {
+                    roll_painter.add(shape);
+                }
             }
         }
 
@@ -349,12 +386,17 @@ impl RollPanel {
             egui::vec2(width, (ROW_H - 2.0).max(1.0)),
         );
         if ghost {
-            painter.rect_stroke(
+            let mut shapes = Vec::new();
+            circuit::octagon(
+                &mut shapes,
                 rect,
-                0.0,
-                egui::Stroke::new(1.0, shade(GHOST, ground)),
-                egui::StrokeKind::Inside,
+                3.0,
+                None,
+                Some((Weight::Hair, shade(GHOST, ground))),
             );
+            for shape in shapes {
+                painter.add(shape);
+            }
             return;
         }
         let ink = if note.muted || !note.enabled {
@@ -366,20 +408,33 @@ impl RollPanel {
         } else {
             velocity_ink(note.velocity, ground)
         };
-        painter.rect_filled(rect.expand(1.0), 0.0, shade(LANE_RULE, ground));
-        painter.rect_filled(rect, 0.0, ink);
+        let mut shapes = Vec::new();
+        circuit::octagon(
+            &mut shapes,
+            rect,
+            3.0,
+            Some(ink),
+            Some((Weight::Hair, shade(LANE_RULE, ground))),
+        );
+        circuit::pad(
+            &mut shapes,
+            rect.left_center(),
+            circuit::PAD - 1.0,
+            shade(INK_LEVEL, ground),
+            true,
+        );
         if selected {
-            painter.rect_stroke(
+            circuit::octagon(
+                &mut shapes,
                 rect,
-                0.0,
-                egui::Stroke::new(stroke::BOLD, crate::design::FOCUS.color),
-                egui::StrokeKind::Inside,
+                3.0,
+                None,
+                Some((Weight::Bold, shade(INK_LEVEL, ground))),
             );
         }
-        painter.line_segment(
-            [rect.left_top(), rect.left_bottom()],
-            egui::Stroke::new(stroke::BOLD, shade(INK_LEVEL, ground)),
-        );
+        for shape in shapes {
+            painter.add(shape);
+        }
         if note.approx {
             painter.text(
                 rect.left_center() - egui::vec2(space::XS, 0.0),

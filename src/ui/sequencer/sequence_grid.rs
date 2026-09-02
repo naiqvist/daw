@@ -24,7 +24,7 @@
 //! the cells they cross. A rule is drawn only where a rule is the sign
 //! (the cursor's corners); nothing is furniture.
 
-use crate::design::Polarity;
+use crate::design::{Polarity, block, circuit, codex::Sign, kit::Weight, motion::pulse_ink};
 use crate::pitch::Pitch;
 use crate::sequencing::{DEFAULT_PATTERN_TICKS, GRID_COLUMNS, GRID_ROWS, PATTERN_STEP_TICKS};
 use crate::ui::affordance::{Afford, Affords};
@@ -36,8 +36,8 @@ use crate::ui::sequencer::sequence::{
     ClipView, EDITOR_SWITCH_WIDTH, Editor, Intent, NoteView, editor_switch,
 };
 use crate::ui::sequencer::verbs::Verb;
-use crate::ui::sequencer::{INK_LEVEL, shade, wash};
-use crate::ui::tokens::{font, space, stroke};
+use crate::ui::sequencer::{INK_LEVEL, phase_of, shade, wash};
+use crate::ui::tokens::{font, space};
 use eframe::egui;
 
 const MAX_CELL_SIDE: f32 = 44.0;
@@ -55,8 +55,6 @@ const BARS: usize = GRID_ROWS;
 const GROUND: u8 = 0;
 const BEAT_FILL: u8 = 16;
 const BAR_FILL: u8 = 24;
-/// The point: the smallest mark, for a place with nothing in it.
-const POINT: f32 = 2.0;
 /// Notes leave a hair of ground above and below, but their horizontal
 /// edges remain exact time positions.
 const NOTE_Y_INSET: f32 = space::XXS;
@@ -92,8 +90,6 @@ const HEADER_FILL: u8 = 18;
 const MAX_ZOOM: usize = 16;
 /// Wider than this, a cell has room for a second line of detail.
 const DETAIL_MIN_W: f32 = 64.0;
-/// A ruler label needs this much room before the next one may appear.
-const RULER_LABEL_MIN_W: f32 = 28.0;
 const DEFAULT_PITCH: u8 = 60;
 const DEFAULT_VELOCITY: u8 = 100;
 
@@ -262,6 +258,7 @@ impl SequenceGrid {
         } else {
             Some(voice.sentence.display())
         };
+        let phase = phase_of(playhead);
 
         // The footprint is the sixteenth grid's, whatever the resolution
         // or zoom: a square cell per sixteenth, sixteen to a bar, four
@@ -290,15 +287,38 @@ impl SequenceGrid {
         );
         let painter = ui.painter_at(available);
 
-        // The container: one recess, its header a rung up, nothing ruled.
+        // Two related but non-identical terminal casings. Their fills and
+        // outlines give up the same pieces of the layout rectangle.
         let container = egui::Rect::from_min_size(origin, egui::vec2(full_width, full_height))
             .expand(PANEL_PAD);
-        painter.rect_filled(container, 0.0, shade(PANEL_FILL, ground));
+        let mut casing = Vec::new();
+        circuit::panel_variant(
+            &mut casing,
+            container,
+            Some(shade(PANEL_FILL, ground)),
+            shade(GROUND, ground),
+            Some((Weight::Hair, shade(EDGE, ground))),
+            2,
+        );
+        for shape in casing {
+            painter.add(shape);
+        }
         let header = egui::Rect::from_min_max(
             container.min,
             egui::pos2(container.max.x, origin.y + STATUS_HEIGHT),
         );
-        painter.rect_filled(header, 0.0, shade(HEADER_FILL, ground));
+        let mut header_shapes = Vec::new();
+        circuit::panel_variant(
+            &mut header_shapes,
+            header,
+            Some(shade(HEADER_FILL, ground)),
+            shade(PANEL_FILL, ground),
+            Some((Weight::Hair, shade(EDGE, ground))),
+            0,
+        );
+        for shape in header_shapes {
+            painter.add(shape);
+        }
         self.draw_status(
             &painter,
             origin,
@@ -410,7 +430,25 @@ impl SequenceGrid {
                 )
                 .intersect(window);
                 if head.is_positive() {
-                    cells.rect_filled(head, 0.0, crate::design::LIVE.color);
+                    let alpha = crate::design::Alphabet::for_polarity(ground);
+                    let ink = pulse_ink(alpha.live.color, alpha.live_dim.color, phase);
+                    let mut shapes = Vec::new();
+                    circuit::trace(
+                        &mut shapes,
+                        &[head.center_top(), head.center_bottom()],
+                        Weight::Heavy,
+                        ink,
+                    );
+                    circuit::pad(
+                        &mut shapes,
+                        head.center_top(),
+                        circuit::PAD + 1.0,
+                        ink,
+                        true,
+                    );
+                    for shape in shapes {
+                        cells.add(shape);
+                    }
                 }
             }
         }
@@ -432,37 +470,44 @@ impl SequenceGrid {
     ) {
         let step_ticks = self.resolution.step_ticks();
         let stride = step_ticks as f32 * camera.px_per_tick;
-        let unit = ruler_unit(step_ticks, stride);
-        let font = egui::FontId::new(font::MICRO_LABEL, egui::FontFamily::Monospace);
+        let ruler_font = egui::FontId::new(font::MICRO_LABEL, egui::FontFamily::Monospace);
+        // Derive cadence from the actual face rather than a guessed cell
+        // count. `4.4.2` is the widest word this ruler can say.
+        let widest = painter.layout_no_wrap(
+            "4.4.2".to_owned(),
+            ruler_font.clone(),
+            shade(LABEL_INK, ground),
+        );
+        let unit = ruler_unit(step_ticks, stride, widest.size().x + space::MD);
         for column in camera.columns(step_ticks) {
             let tick = column * step_ticks;
             let x = band.min.x + camera.x(tick);
             let beat = tick.is_multiple_of(TICKS_PER_BAR / 4);
-            if beat {
-                painter.rect_filled(
-                    egui::Rect::from_min_size(
-                        egui::pos2(x, band.max.y - RULER_HEIGHT * 0.5),
-                        egui::vec2(1.0, RULER_HEIGHT * 0.5),
-                    ),
-                    0.0,
-                    shade(LABEL_INK, ground),
-                );
-            } else {
-                painter.rect_filled(
-                    egui::Rect::from_center_size(
-                        egui::pos2(x + 0.5, band.max.y - POINT),
-                        egui::Vec2::splat(POINT),
-                    ),
-                    0.0,
-                    shade(EDGE, ground),
-                );
+            let mut shapes = Vec::new();
+            circuit::pad(
+                &mut shapes,
+                egui::pos2(x, band.bottom() - 3.0),
+                if beat {
+                    circuit::PAD
+                } else {
+                    circuit::PAD - 2.0
+                },
+                if beat {
+                    shade(LABEL_INK, ground)
+                } else {
+                    shade(EDGE, ground)
+                },
+                beat,
+            );
+            for shape in shapes {
+                painter.add(shape);
             }
             if let Some(label) = ruler_label(tick, unit) {
                 painter.text(
-                    egui::pos2(x + space::XS, band.min.y),
+                    egui::pos2(x + space::XS, band.center().y - 1.0),
                     egui::Align2::LEFT_TOP,
                     label,
-                    font.clone(),
+                    ruler_font.clone(),
                     if beat {
                         shade(INK_LEVEL, ground)
                     } else {
@@ -509,8 +554,20 @@ impl SequenceGrid {
             }
             None => "NO CLIP".to_owned(),
         };
+        let note_at = rect.left_center() + egui::vec2(EDITOR_SWITCH_WIDTH + space::SM, 0.0);
+        let words_at = note_at + egui::vec2(16.0, 0.0);
+        let mut shapes = Vec::new();
+        circuit::annotation_arrow(
+            &mut shapes,
+            note_at,
+            words_at - egui::vec2(3.0, 0.0),
+            shade(EDGE, ground),
+        );
+        for shape in shapes {
+            painter.add(shape);
+        }
         painter.text(
-            rect.left_center() + egui::vec2(EDITOR_SWITCH_WIDTH + space::SM, 0.0),
+            words_at,
             egui::Align2::LEFT_CENTER,
             words,
             egui::FontId::new(font::MINI_LABEL, egui::FontFamily::Monospace),
@@ -559,7 +616,24 @@ impl SequenceGrid {
                 .filter(|note| note.enabled && note.start_ticks < tick)
             {
                 if let Some(tail) = note_span_rect(rect, tick, span, held) {
-                    painter.rect_filled(tail, 0.0, tail_ink(held.velocity, ground));
+                    let ink = tail_ink(held.velocity, ground);
+                    let mut shapes = Vec::new();
+                    circuit::trace(
+                        &mut shapes,
+                        &[tail.left_center(), tail.right_center()],
+                        Weight::Hair,
+                        ink,
+                    );
+                    circuit::pad(
+                        &mut shapes,
+                        tail.right_center(),
+                        circuit::PAD - 1.0,
+                        ink,
+                        true,
+                    );
+                    for shape in shapes {
+                        painter.add(shape);
+                    }
                 }
             }
         }
@@ -570,10 +644,29 @@ impl SequenceGrid {
         let Some(face) = note_span_rect(rect, tick, span, note) else {
             return;
         };
-        // The note is one box. Its left edge is onset, its right edge is
-        // end (or the cell boundary when it is held), and the face itself
-        // carries velocity. Micro-timing therefore needs no separate bar.
-        painter.rect_filled(face, 0.0, velocity_ink(note.velocity, ground));
+        // The note is one sealed component. Its left edge is onset, its
+        // right edge is end, and its face carries velocity. The onset pad
+        // makes a pushed attack legible even when the face begins inside
+        // a coarse cell.
+        let face_fill = velocity_ink(note.velocity, ground);
+        let mut shapes = Vec::new();
+        circuit::octagon(
+            &mut shapes,
+            face,
+            circuit::CHAMFER,
+            Some(face_fill),
+            Some((Weight::Hair, shade(FACE_DETAIL_INK, ground))),
+        );
+        circuit::pad(
+            &mut shapes,
+            face.left_center(),
+            circuit::PAD,
+            shade(FACE_INK, ground),
+            true,
+        );
+        for shape in shapes {
+            painter.add(shape);
+        }
 
         // Marks degrade by dropping, never by overlapping.
         if face.width() < LABEL_MIN_W {
@@ -596,6 +689,22 @@ impl SequenceGrid {
             egui::FontId::new(font::BODY, egui::FontFamily::Monospace),
             shade(FACE_INK, ground),
         );
+
+        if matches!(lens.active, crate::ui::sequencer::lens::ActiveLens::Degrees)
+            && let Some(degree) = crate::ui::sequencer::lens::degree_of(note, &lens.key)
+            && let Ok(degree) = u8::try_from(degree.rem_euclid(7))
+        {
+            Sign::Degree(degree).painted(
+                painter,
+                egui::Id::new(("sequencer-degree", step, degree)),
+                egui::Rect::from_center_size(
+                    face.left_center() + egui::vec2(10.0, 0.0),
+                    egui::Vec2::splat(11.0),
+                ),
+                Weight::Hair,
+                shade(FACE_INK, ground),
+            );
+        }
         if detailed {
             let push = if note.micro_ticks != 0 {
                 format!("  {:+}T", note.micro_ticks)
@@ -632,12 +741,23 @@ impl SequenceGrid {
         // SHADE — the trig's density of occurrence as the density of a
         // sign — and the exact figure is the inspector's to state.
         if note.enabled && note.probability < 1.0 {
-            painter.text(
-                face.right_bottom() + egui::vec2(-space::XS, -space::XXS),
-                egui::Align2::RIGHT_BOTTOM,
-                condition_sign(note.probability).to_string(),
-                egui::FontId::new(font::MINI_LABEL, egui::FontFamily::Monospace),
-                shade(FACE_INK, ground),
+            draw_edge_tag(
+                painter,
+                egui::Rect::from_min_size(
+                    face.right_bottom() - egui::vec2(13.0, 10.0),
+                    egui::vec2(13.0, 10.0),
+                ),
+                &condition_sign(note.probability).to_string(),
+                ground,
+            );
+        }
+        let deviation = deviation_sign(note);
+        if !deviation.is_empty() {
+            draw_edge_tag(
+                painter,
+                egui::Rect::from_min_size(face.left_top(), egui::vec2(15.0, 10.0)),
+                &deviation,
+                ground,
             );
         }
         // A pending transform previews as a ghost: the would-be spelling
@@ -987,23 +1107,43 @@ impl Camera {
 /// leading `≈` — two deviation sign classes, because they mean different
 /// things (`notes/20260831-pitch-lens-spec.md` §4).
 fn cell_label(note: &NoteView, lens: &LensView) -> String {
+    crate::ui::sequencer::lens::address_label(&lens.active, note, &lens.key)
+}
+
+/// Deviation is an edge tag, separate from the pitch address it modifies.
+/// Approximation belongs to the machine and bend to the musician, so when
+/// both apply the tag carries both signs rather than collapsing them.
+fn deviation_sign(note: &NoteView) -> String {
     use crate::design::signs;
-    let name = crate::ui::sequencer::lens::address_label(&lens.active, note, &lens.key);
-    let bend = if note.pitch.offset_cents > 0.0 {
+    let bend = if note.pitch.offset_cents > 0.0 || note.micro_ticks > 0 {
         signs::BEND_UP
-    } else if note.pitch.offset_cents < 0.0 {
-        signs::BEND_DOWN
-    } else if note.micro_ticks > 0 {
-        signs::BEND_UP
-    } else if note.micro_ticks < 0 {
+    } else if note.pitch.offset_cents < 0.0 || note.micro_ticks < 0 {
         signs::BEND_DOWN
     } else {
         ""
     };
-    format!(
-        "{}{name}{bend}",
-        if note.approx { signs::APPROX } else { "" }
-    )
+    format!("{}{bend}", if note.approx { signs::APPROX } else { "" })
+}
+
+fn draw_edge_tag(painter: &egui::Painter, rect: egui::Rect, words: &str, ground: Polarity) {
+    let mut shapes = Vec::new();
+    circuit::octagon(
+        &mut shapes,
+        rect,
+        2.0,
+        Some(shade(FACE_DETAIL_INK, ground)),
+        Some((Weight::Hair, shade(FACE_INK, ground))),
+    );
+    for shape in shapes {
+        painter.add(shape);
+    }
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        words,
+        egui::FontId::new(font::MICRO_LABEL, egui::FontFamily::Monospace),
+        shade(INK_LEVEL, ground),
+    );
 }
 
 /// The condition as a sign: the trig's density of occurrence drawn as
@@ -1109,11 +1249,24 @@ fn draw_row_address(
     cell_side: f32,
     ground: Polarity,
 ) {
-    painter.text(
+    let row = (tick / TICKS_PER_BAR) % 16;
+    Sign::Register(row as u8).painted(
+        painter,
+        egui::Id::new(("sequencer-row-register", row)),
+        egui::Rect::from_center_size(
+            right_top + egui::vec2(-31.0, cell_side.min(28.0) * 0.5),
+            egui::Vec2::splat(cell_side.min(22.0)),
+        ),
+        Weight::Hair,
+        shade(LABEL_INK, ground),
+    );
+    block::paint(
+        painter,
+        egui::Id::new(("sequencer-row-address", row, first_step)),
         right_top,
         egui::Align2::RIGHT_TOP,
-        format!("{first_step:02}"),
-        egui::FontId::new(font::MINI_LABEL, egui::FontFamily::Monospace),
+        block::unit::MICRO,
+        &format!("{first_step:02}"),
         shade(INK_LEVEL, ground),
     );
     if cell_side >= 32.0 {
@@ -1127,18 +1280,35 @@ fn draw_row_address(
     }
 }
 
-/// The ground under a step: a plane where a beat or a bar begins, a
-/// point everywhere else.
+/// The ground under a step: a via at an ordinary address, a larger pad
+/// at a beat, and a junction where a bar's bus begins.
 fn draw_ground(painter: &egui::Painter, rect: egui::Rect, tick: usize, ground: Polarity) {
-    let fill = beat_fill(tick, ground);
-    if fill == shade(GROUND, ground) {
-        painter.rect_filled(
-            egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(POINT)),
-            0.0,
-            shade(EDGE, ground),
+    let mut shapes = Vec::new();
+    if tick.is_multiple_of(TICKS_PER_BAR) {
+        circuit::junction(
+            &mut shapes,
+            rect.center(),
+            shade(BAR_FILL, ground),
+            shade(GROUND, ground),
+        );
+    } else if tick.is_multiple_of(TICKS_PER_BAR / 4) {
+        circuit::pad(
+            &mut shapes,
+            rect.center(),
+            circuit::PAD + 2.0,
+            shade(BEAT_FILL, ground),
+            true,
         );
     } else {
-        painter.rect_filled(rect, 0.0, fill);
+        circuit::via(
+            &mut shapes,
+            rect.center(),
+            shade(EDGE, ground),
+            shade(GROUND, ground),
+        );
+    }
+    for shape in shapes {
+        painter.add(shape);
     }
 }
 
@@ -1156,13 +1326,13 @@ fn zoom_sign(zoom: usize) -> String {
 /// coarsest of beat, sixteenth, thirty-second and sixty-fourth whose
 /// span on screen leaves room for a label. `None` when not even a beat
 /// has room.
-fn ruler_unit(step_ticks: usize, stride: f32) -> Option<usize> {
+fn ruler_unit(step_ticks: usize, stride: f32, label_width: f32) -> Option<usize> {
     [TICKS_PER_BAR / 4, 12, 6, 3]
         .into_iter()
         // Only units the grid actually has steps at: a label on a tick no
         // cell begins at would name a place the cursor cannot stand.
         .filter(|unit| unit.is_multiple_of(step_ticks.max(1)))
-        .take_while(|unit| (*unit as f32 / step_ticks.max(1) as f32) * stride >= RULER_LABEL_MIN_W)
+        .take_while(|unit| (*unit as f32 / step_ticks.max(1) as f32) * stride >= label_width)
         .last()
 }
 
@@ -1262,34 +1432,19 @@ pub(crate) fn note_name(pitch: u8) -> String {
 
 pub(crate) fn draw_cursor(painter: &egui::Painter, cell: egui::Rect, ground: Polarity) {
     let rect = cell.expand(CURSOR_GAP);
-    let cap = CURSOR_CAP.min(rect.width() * 0.4);
     // The one place a rule is the sign: four corners, and nothing joins
     // them, so the cursor brackets a cell without boxing it.
     painter.rect_filled(cell, 0.0, wash(CURSOR_WASH, ground));
-    let cursor_stroke = egui::Stroke::new(stroke::FOCUS, shade(INK_LEVEL, ground));
-    for (from, to) in [
-        (rect.left_top(), rect.left_top() + egui::vec2(cap, 0.0)),
-        (rect.left_top(), rect.left_top() + egui::vec2(0.0, cap)),
-        (rect.right_top() - egui::vec2(cap, 0.0), rect.right_top()),
-        (rect.right_top(), rect.right_top() + egui::vec2(0.0, cap)),
-        (
-            rect.left_bottom(),
-            rect.left_bottom() + egui::vec2(cap, 0.0),
-        ),
-        (
-            rect.left_bottom() - egui::vec2(0.0, cap),
-            rect.left_bottom(),
-        ),
-        (
-            rect.right_bottom() - egui::vec2(cap, 0.0),
-            rect.right_bottom(),
-        ),
-        (
-            rect.right_bottom() - egui::vec2(0.0, cap),
-            rect.right_bottom(),
-        ),
-    ] {
-        painter.line_segment([from, to], cursor_stroke);
+    let mut shapes = Vec::new();
+    circuit::brackets(
+        &mut shapes,
+        rect,
+        CURSOR_CAP,
+        Weight::Bold,
+        shade(INK_LEVEL, ground),
+    );
+    for shape in shapes {
+        painter.add(shape);
     }
 }
 
@@ -1457,19 +1612,19 @@ mod tests {
     fn the_ruler_labels_the_finest_unit_that_has_room() {
         // Sixteenth cells at 46px: beats and sixteenths have room, finer
         // units do not exist in the grid.
-        assert_eq!(ruler_unit(12, 46.0), Some(12));
+        assert_eq!(ruler_unit(12, 46.0, 28.0), Some(12));
         assert_eq!(ruler_label(0, Some(12)).as_deref(), Some("1"));
         assert_eq!(ruler_label(12, Some(12)).as_deref(), Some("1.2"));
         assert_eq!(ruler_label(48, Some(12)).as_deref(), Some("2"));
         assert_eq!(ruler_label(6, Some(12)), None, "an off-unit tick spoke");
         // Thirty-second cells at 92px (zoomed): the sub-sixteenth speaks.
-        assert_eq!(ruler_unit(6, 92.0), Some(6));
+        assert_eq!(ruler_unit(6, 92.0, 28.0), Some(6));
         assert_eq!(ruler_label(6, Some(6)).as_deref(), Some("1.1.2"));
         // Thirty-second cells at 12px: only every beat has room.
-        assert_eq!(ruler_unit(6, 12.0), Some(48));
+        assert_eq!(ruler_unit(6, 12.0, 28.0), Some(48));
         assert_eq!(ruler_label(12, Some(48)), None);
         // Nothing has room: the ruler keeps its marks and says nothing.
-        assert_eq!(ruler_unit(12, 4.0), None);
+        assert_eq!(ruler_unit(12, 4.0, 28.0), None);
         assert_eq!(ruler_label(0, None), None);
         assert_eq!(zoom_sign(1), "");
         assert_eq!(zoom_sign(4), " ×4");

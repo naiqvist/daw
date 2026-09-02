@@ -2399,7 +2399,7 @@ impl Stage {
                 region,
                 edge,
                 |out| {
-                    circuit::frame(out, region, Weight::Hair, edge);
+                    circuit::panel_frame_variant(out, region, Weight::Hair, edge, n as u8);
                 },
             );
         }
@@ -2613,8 +2613,7 @@ impl Stage {
                 if plaque.height() < 40.0 {
                     return;
                 }
-                circuit::frame(out, plaque, Weight::Hair, edge);
-                circuit::corner_pads(out, plaque, edge);
+                circuit::panel_frame_variant(out, plaque, Weight::Hair, edge, 2);
                 let c = plaque.center();
                 let side = plaque.height() * 0.7;
                 Sign::Dipper.paint(
@@ -2771,14 +2770,20 @@ impl Stage {
             painter,
             egui::Id::new(("stage-chain-card", index)),
             card,
-            (alpha.surface.color, alpha.edge.color, family_ink),
+            (
+                alpha.surface.color,
+                alpha.ground.color,
+                alpha.edge.color,
+                family_ink,
+            ),
             |out| {
-                circuit::octagon(
+                circuit::panel_variant(
                     out,
                     card,
-                    circuit::CHAMFER,
                     Some(alpha.surface.color),
+                    alpha.ground.color,
                     Some((Weight::Hair, alpha.edge.color)),
+                    index as u8,
                 );
                 circuit::trace(
                     out,
@@ -3137,14 +3142,7 @@ impl Stage {
                         span + egui::Vec2::splat(design::px(design::space::VAST) * 2.0),
                     );
                     let shield = shield.intersect(avail.shrink(design::px(design::space::SNUG)));
-                    circuit::octagon(
-                        out,
-                        shield,
-                        design::px(design::space::ROOM),
-                        None,
-                        Some((Weight::Heavy, edge)),
-                    );
-                    circuit::corner_pads(out, shield, edge);
+                    circuit::panel_frame_variant(out, shield, Weight::Heavy, edge, 1);
                 },
             );
         }
@@ -3358,14 +3356,15 @@ impl Stage {
                 painter,
                 egui::Id::new(("stage-track-head", index)),
                 rect,
-                (fill, figure_ink),
+                (fill, self.alphabet().ground.color, figure_ink),
                 |out| {
-                    circuit::octagon(
+                    circuit::panel_variant(
                         out,
                         rect,
-                        circuit::CHAMFER,
                         Some(fill),
+                        self.alphabet().ground.color,
                         Some((Weight::Hair, self.alphabet().edge.color)),
+                        index as u8,
                     );
                     circuit::rail(
                         out,
@@ -3659,10 +3658,16 @@ impl Stage {
             painter,
             egui::Id::new("stage-master-head"),
             head,
-            (fill, title_ink),
+            (fill, alpha.ground.color, title_ink),
             |out| {
-                circuit::octagon(out, head, circuit::CHAMFER, Some(fill), None);
-                circuit::double_frame(out, head, 4.0, title_ink);
+                circuit::panel_variant(
+                    out,
+                    head,
+                    Some(fill),
+                    alpha.ground.color,
+                    Some((Weight::Heavy, title_ink)),
+                    3,
+                );
                 Sign::Master.paint(
                     out,
                     egui::Rect::from_center_size(

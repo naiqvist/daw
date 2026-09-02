@@ -197,6 +197,254 @@ pub fn octagon(
     }
 }
 
+/// A large panel in the archive's later hand. The variants are a small
+/// construction family, not one branded silhouette stamped everywhere:
+/// long straight runs, at most one side notch, and selected diagonal cuts.
+///
+/// `ground` is the plane behind the panel. Every cut in the outline is
+/// repeated as a mask over the fill, so the panel's colour follows its
+/// silhouette rather than leaking into a rectangular backing box.
+pub fn panel(
+    out: &mut Vec<Shape>,
+    rect: Rect,
+    fill: Option<Color32>,
+    ground: Color32,
+    stroke: Option<(Weight, Color32)>,
+) {
+    panel_variant(out, rect, fill, ground, stroke, 0);
+}
+
+/// One of four related, deliberately non-uniform panel constructions.
+pub fn panel_variant(
+    out: &mut Vec<Shape>,
+    rect: Rect,
+    fill: Option<Color32>,
+    ground: Color32,
+    stroke: Option<(Weight, Color32)>,
+    variant: u8,
+) {
+    if !rect.is_positive() {
+        return;
+    }
+    let c = 6.0_f32
+        .min(rect.width() / 10.0)
+        .min(rect.height() / 5.0)
+        .max(1.0);
+    let s = (c * 1.8).min(rect.width() / 7.0);
+    let (l, t, r, b) = (rect.left(), rect.top(), rect.right(), rect.bottom());
+    let variant = variant % 4;
+    let side_a = t + rect.height() * 0.27;
+    let side_b = (side_a + c * 1.35).min(b - c);
+    let lower_a = t + rect.height() * 0.62;
+    let lower_b = (lower_a + c * 1.35).min(b - c);
+
+    let points = match variant {
+        // Two remote diagonal cuts; otherwise almost a rectangle.
+        0 => vec![
+            pos2(l + c, t),
+            pos2(r, t),
+            pos2(r, b - c),
+            pos2(r - c, b),
+            pos2(l, b),
+            pos2(l, t + c),
+        ],
+        // A single cable bay in the right wall, between two cut corners.
+        1 => vec![
+            pos2(l, t),
+            pos2(r - c, t),
+            pos2(r, t + c),
+            pos2(r, side_a),
+            pos2(r - s, side_a),
+            pos2(r - s, side_b),
+            pos2(r, side_b),
+            pos2(r, b),
+            pos2(l + c, b),
+            pos2(l, b - c),
+        ],
+        // One stepped foot and one cut shoulder. The bottom run breaks.
+        2 => vec![
+            pos2(l, t),
+            pos2(r - c, t),
+            pos2(r, t + c),
+            pos2(r, b),
+            pos2(l + s, b),
+            pos2(l + s, b - c),
+            pos2(l, b - c),
+        ],
+        // A left-wall service recess and one cut at the opposite foot.
+        _ => vec![
+            pos2(l, t),
+            pos2(r, t),
+            pos2(r, b - c),
+            pos2(r - c, b),
+            pos2(l, b),
+            pos2(l, lower_b),
+            pos2(l + s, lower_b),
+            pos2(l + s, lower_a),
+            pos2(l, lower_a),
+        ],
+    };
+
+    if let Some(fill) = fill {
+        out.push(Shape::rect_filled(rect, 0.0, fill));
+        let triangle = |out: &mut Vec<Shape>, points| {
+            out.push(Shape::convex_polygon(points, ground, Stroke::NONE));
+        };
+        match variant {
+            0 => {
+                triangle(out, vec![pos2(l, t), pos2(l + c, t), pos2(l, t + c)]);
+                triangle(out, vec![pos2(r, b), pos2(r - c, b), pos2(r, b - c)]);
+            }
+            1 => {
+                triangle(out, vec![pos2(r, t), pos2(r - c, t), pos2(r, t + c)]);
+                triangle(out, vec![pos2(l, b), pos2(l + c, b), pos2(l, b - c)]);
+                out.push(Shape::rect_filled(
+                    Rect::from_min_max(pos2(r - s, side_a), pos2(r, side_b)),
+                    0.0,
+                    ground,
+                ));
+            }
+            2 => {
+                triangle(out, vec![pos2(r, t), pos2(r - c, t), pos2(r, t + c)]);
+                out.push(Shape::rect_filled(
+                    Rect::from_min_max(pos2(l, b - c), pos2(l + s, b)),
+                    0.0,
+                    ground,
+                ));
+            }
+            _ => {
+                triangle(out, vec![pos2(r, b), pos2(r - c, b), pos2(r, b - c)]);
+                out.push(Shape::rect_filled(
+                    Rect::from_min_max(pos2(l, lower_a), pos2(l + s, lower_b)),
+                    0.0,
+                    ground,
+                ));
+            }
+        }
+    }
+
+    if let Some((weight, ink)) = stroke {
+        match variant {
+            0 => {
+                let gap_a = l + rect.width() * 0.58;
+                let gap_b = l + rect.width() * 0.67;
+                trace(out, &[points[0], pos2(gap_a, t)], weight, ink);
+                let mut rest = vec![pos2(gap_b, t)];
+                rest.extend_from_slice(&points[1..]);
+                rest.push(points[0]);
+                trace(out, &rest, weight, ink);
+            }
+            1 => {
+                let mut closed = points.clone();
+                closed.push(points[0]);
+                trace(out, &closed, weight, ink);
+                pad(
+                    out,
+                    pos2(r - s, (side_a + side_b) * 0.5),
+                    PAD - 2.0,
+                    ink,
+                    true,
+                );
+            }
+            2 => {
+                let gap_a = l + rect.width() * 0.34;
+                let gap_b = l + rect.width() * 0.43;
+                trace(
+                    out,
+                    &[points[0], points[1], points[2], points[3], pos2(gap_b, b)],
+                    weight,
+                    ink,
+                );
+                let mut rest = vec![pos2(gap_a, b)];
+                rest.extend_from_slice(&points[4..]);
+                rest.push(points[0]);
+                trace(out, &rest, weight, ink);
+                trace(
+                    out,
+                    &[pos2(r - c * 0.8, t + c * 2.0), pos2(r - c * 0.8, b - c)],
+                    Weight::Hair,
+                    ink,
+                );
+            }
+            _ => {
+                let gap_a = l + rect.width() * 0.18;
+                let gap_b = l + rect.width() * 0.29;
+                trace(out, &[points[0], pos2(gap_a, t)], weight, ink);
+                let mut rest = vec![pos2(gap_b, t)];
+                rest.extend_from_slice(&points[1..]);
+                rest.push(points[0]);
+                trace(out, &rest, weight, ink);
+                let tab_y = t + c * 0.75;
+                trace(
+                    out,
+                    &[pos2(gap_a + 2.0, tab_y), pos2(gap_b - 2.0, tab_y)],
+                    Weight::Hair,
+                    ink,
+                );
+                let hatch_end = (gap_a + 14.0).min(gap_b - 3.0);
+                let mut x = gap_a + 5.0;
+                while x <= hatch_end {
+                    trace(
+                        out,
+                        &[pos2(x, tab_y - 2.0), pos2(x + 3.0, tab_y + 2.0)],
+                        Weight::Hair,
+                        ink,
+                    );
+                    x += 5.0;
+                }
+            }
+        }
+    }
+}
+
+/// The same asymmetric casing, outline only.
+pub fn panel_frame(out: &mut Vec<Shape>, rect: Rect, weight: Weight, ink: Color32) {
+    panel(out, rect, None, Color32::TRANSPARENT, Some((weight, ink)));
+}
+
+/// A selected asymmetric casing, outline only.
+pub fn panel_frame_variant(
+    out: &mut Vec<Shape>,
+    rect: Rect,
+    weight: Weight,
+    ink: Color32,
+    variant: u8,
+) {
+    panel_variant(
+        out,
+        rect,
+        None,
+        Color32::TRANSPARENT,
+        Some((weight, ink)),
+        variant,
+    );
+}
+
+/// Two nested asymmetric casings: the master/archive hierarchy.
+pub fn double_panel(out: &mut Vec<Shape>, rect: Rect, gap: f32, ground: Color32, ink: Color32) {
+    double_panel_variant(out, rect, gap, ground, ink, 0);
+}
+
+/// Two nested but non-identical casings: the master/archive hierarchy.
+pub fn double_panel_variant(
+    out: &mut Vec<Shape>,
+    rect: Rect,
+    gap: f32,
+    ground: Color32,
+    ink: Color32,
+    variant: u8,
+) {
+    panel_frame_variant(out, rect, Weight::Heavy, ink, variant);
+    panel_variant(
+        out,
+        rect.shrink(gap),
+        None,
+        ground,
+        Some((Weight::Hair, ink)),
+        variant.wrapping_add(2),
+    );
+}
+
 /// An octagonal outline at the house chamfer.
 pub fn frame(out: &mut Vec<Shape>, rect: Rect, weight: Weight, ink: Color32) {
     octagon(out, rect, CHAMFER, None, Some((weight, ink)));
@@ -558,6 +806,18 @@ mod tests {
             let mut out = Vec::new();
             double_frame(&mut out, rect, 3.0, INK);
             cases.push(("double_frame", out));
+            for variant in 0..4 {
+                let mut out = Vec::new();
+                panel_variant(
+                    &mut out,
+                    rect,
+                    Some(INK),
+                    GROUND,
+                    Some((Weight::Hair, INK)),
+                    variant,
+                );
+                cases.push(("panel_variant", out));
+            }
             let mut out = Vec::new();
             corner_pads(&mut out, rect, INK);
             cases.push(("corner_pads", out));
@@ -633,5 +893,27 @@ mod tests {
             format!("{out:?}")
         };
         assert_eq!(draw(), draw());
+    }
+
+    #[test]
+    fn panels_are_a_family_not_one_repeated_stamp() {
+        let draw = |variant| {
+            let mut out = Vec::new();
+            panel_variant(
+                &mut out,
+                r(180.0, 90.0),
+                Some(INK),
+                GROUND,
+                Some((Weight::Hair, INK)),
+                variant,
+            );
+            format!("{out:?}")
+        };
+        let variants: Vec<String> = (0..4).map(draw).collect();
+        for a in 0..variants.len() {
+            for b in (a + 1)..variants.len() {
+                assert_ne!(variants[a], variants[b], "variants {a} and {b} repeated");
+            }
+        }
     }
 }

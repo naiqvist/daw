@@ -33,6 +33,7 @@ use crate::design;
 use crate::pitch::Key;
 use crate::sequencing::{
     DEFAULT_PATTERN_TICKS, Note, PATTERN_STEP_TICKS, PATTERN_STEPS, Pattern, PatternId, Song,
+    TICKS_PER_BEAT,
 };
 use eframe::egui;
 use sequence::NoteView;
@@ -103,6 +104,18 @@ pub const INK: egui::Color32 = egui::Color32::WHITE;
 /// The same value as a LEVEL, for surfaces that project it onto the
 /// ground they are drawn on rather than assuming black.
 pub const INK_LEVEL: u8 = 255;
+
+/// The sequencer receives the playhead as a tick, not a frame clock. Its
+/// motion therefore comes from the same musical time it draws: parked
+/// without a playhead, and one beat of phase while the pattern rolls.
+pub(crate) fn phase_of(playhead: Option<usize>) -> design::motion::Phase {
+    design::motion::Phase::of(
+        playhead.is_some(),
+        playhead.map_or(0.0, |tick| {
+            (tick % TICKS_PER_BEAT) as f32 / TICKS_PER_BEAT as f32
+        }),
+    )
+}
 
 /// Above this many cents from the nearest twelve-tone pitch, the bridge-
 /// era playback path is approximating, and the view says so.
