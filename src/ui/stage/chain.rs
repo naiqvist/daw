@@ -14,7 +14,7 @@
 //! hand-laid-out thirty-nine times.
 
 use crate::design::codex::ParamFamily;
-use crate::devices::ParamLabel;
+use crate::devices::{Family, ParamLabel};
 use crate::params::ParamDef;
 use crate::sequencing::{Device, Song};
 
@@ -44,6 +44,11 @@ pub struct Row {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Column {
     pub title: &'static str,
+    /// The catalog's compact machine address. It is stable enough for
+    /// automation targets and short enough to cut into a card header.
+    pub code: &'static str,
+    /// The browser family whose seal heads the card.
+    pub family: Family,
     /// Whether it heads the chain rather than shaping what comes in.
     pub instrument: bool,
     pub bypassed: bool,
@@ -68,6 +73,8 @@ pub fn column(device: &Device) -> Column {
     let spec = device.kind.spec();
     Column {
         title: spec.name,
+        code: spec.prefix,
+        family: spec.family,
         instrument: spec.instrument,
         bypassed: device.bypassed,
         sample: device
@@ -244,7 +251,6 @@ pub fn family_of(def: &ParamDef, label: &ParamLabel) -> ParamFamily {
 /// draws one rail segment per run, with the family's sign once at its
 /// top — catalog order is kept, because the cursor addresses rows by
 /// position.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn family_runs(rows: &[Row]) -> Vec<(ParamFamily, std::ops::Range<usize>)> {
     let mut runs: Vec<(ParamFamily, std::ops::Range<usize>)> = Vec::new();
     for (i, row) in rows.iter().enumerate() {
@@ -402,6 +408,7 @@ mod tests {
         let (song, track) = song_with(DeviceKind::Poly);
         let column = columns(&song, track).pop().expect("one device");
         assert_eq!(column.title, DeviceKind::Poly.spec().name);
+        assert_eq!(column.code, DeviceKind::Poly.spec().prefix);
         assert!(column.instrument, "an instrument did not say so");
         assert!(!column.bypassed);
     }

@@ -39,7 +39,7 @@ use crate::design::motion::{self, Phase};
 use crate::design::{block, circuit, grain};
 
 use crate::design;
-use crate::devices::DeviceKind;
+use crate::devices::{DeviceKind, Family};
 use crate::history::History;
 use crate::library::{LibraryConfig, LibraryService, LibrarySnapshot};
 use crate::pitch::Pitch;
@@ -127,6 +127,21 @@ const ADDRESS_W: f32 = 44.0;
 /// independently approximating where a column carries current.
 fn bus_x(field: egui::Rect, slot: usize) -> f32 {
     Stage::head_rect(field, slot).center().x
+}
+
+fn device_family_word(family: Family) -> &'static str {
+    match family {
+        Family::Synths => "SYNTHS",
+        Family::Drums => "DRUMS",
+        Family::Sampling => "SAMPLING",
+        Family::Dynamics => "DYNAMICS",
+        Family::EqAndFilters => "FILTERS",
+        Family::DelayAndReverb => "TIME",
+        Family::Distortion => "DRIVE",
+        Family::Modulation => "MODULATION",
+        Family::Spectral => "SPECTRAL",
+        Family::Utilities => "UTILITY",
+    }
 }
 
 /// Between one track column and the next.
@@ -2544,7 +2559,7 @@ impl Stage {
             // sound design and sequencing are separate spaces, and the
             // one you are in is the one you asked for.
             if self.chain.is_some() {
-                self.draw_chain(ui.painter(), clip);
+                self.draw_chain(ui.painter(), clip, phase);
             } else {
                 self.draw_clip(ui, clip);
             }
@@ -2640,7 +2655,7 @@ impl Stage {
     /// the screen, and lands whatever it asked for on the pattern.
     /// The chain band: the addressed track's devices, in signal order,
     /// each carrying its whole parameter table as a scrolling list.
-    fn draw_chain(&self, painter: &egui::Painter, tray: egui::Rect) {
+    fn draw_chain(&self, painter: &egui::Painter, tray: egui::Rect, phase: Phase) {
         let Some(lattice) = self.chain.as_ref() else {
             return;
         };
@@ -2651,166 +2666,336 @@ impl Stage {
         if columns.is_empty() {
             return;
         }
-        let alpha = self.alphabet();
         let margin = design::px(design::space::ROOM);
-        let pad = design::px(design::space::SNUG);
         let gap = column_gap();
-        let title_font = egui::FontId::monospace(design::px(design::type_scale::MICRO));
-        let row_font = egui::FontId::monospace(design::px(design::type_scale::MICRO));
-
         let head_h = design::px(design::space::OPEN);
         let pitch = design::px(design::space::ROOM);
         let body_top = tray.min.y + head_h;
         let rows_shown = chain::rows_that_fit(tray.max.y - margin - body_top, pitch);
         let cursor = lattice.cursor();
-        // The column is monospace, so its width is a COUNT of cells — and
-        // a name laid out without knowing that count runs straight into
-        // the value at its right. One measurement, once.
+        let visible: Vec<_> = columns
+            .iter()
+            .enumerate()
+            .take_while(|(index, _)| {
+                tray.min.x + margin + (*index + 1) as f32 * TRACK_W + *index as f32 * gap
+                    <= tray.max.x
+            })
+            .collect();
+        if visible.is_empty() {
+            return;
+        }
+
+        // The signal trace is behind the cards and emerges only in the
+        // gaps between their side pads. A bypassed destination bends the
+        // trace upward before it arrives: the card stays present while the
+        // current visibly routes around its processing path.
+        let signal_y = tray.top() + head_h - 5.0;
+        let sounding = self.playing_on(track).is_some();
+        for pair in visible.windows(2) {
+            let (left_index, _) = pair[0];
+            let (right_index, right) = pair[1];
+            let left_x = tray.min.x + margin + left_index as f32 * (TRACK_W + gap);
+            let right_x = tray.min.x + margin + right_index as f32 * (TRACK_W + gap);
+            let from = egui::pos2(left_x + TRACK_W, signal_y);
+            let to = egui::pos2(right_x, signal_y);
+            let path = if right.bypassed {
+                let lift = gap.min(8.0);
+                vec![
+                    from,
+                    egui::pos2(from.x + lift, signal_y - lift),
+                    egui::pos2(to.x - lift, signal_y - lift),
+                    to,
+                ]
+            } else {
+                vec![from, to]
+            };
+            let mut shapes = Vec::new();
+            circuit::trace(&mut shapes, &path, Weight::Hair, self.alphabet().edge.color);
+            if sounding && phase.rolling {
+                circuit::dashes(
+                    &mut shapes,
+                    &path,
+                    phase.dash(),
+                    Weight::Heavy,
+                    self.alphabet().live_dim.color,
+                );
+            }
+            for shape in shapes {
+                painter.add(shape);
+            }
+        }
+
+        for (index, column) in visible {
+            let x = tray.min.x + margin + index as f32 * (TRACK_W + gap);
+            let card = egui::Rect::from_min_max(
+                egui::pos2(x, tray.top()),
+                egui::pos2(x + TRACK_W, tray.bottom() - margin),
+            );
+            self.draw_chain_card(
+                painter,
+                card,
+                column,
+                index,
+                cursor,
+                self.chain_offset,
+                rows_shown,
+                head_h,
+                pitch,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_chain_card(
+        &self,
+        painter: &egui::Painter,
+        card: egui::Rect,
+        column: &chain::Column,
+        index: usize,
+        cursor: Option<(usize, usize)>,
+        row_offset: usize,
+        rows_shown: usize,
+        head_h: f32,
+        pitch: f32,
+    ) {
+        let alpha = self.alphabet();
+        let head = egui::Rect::from_min_size(card.min, egui::vec2(card.width(), head_h));
+        let body_top = head.bottom();
+        let row_font = egui::FontId::monospace(design::px(design::type_scale::MICRO));
+        let family_ink = if column.bypassed {
+            alpha.edge.color
+        } else {
+            alpha.ink.color
+        };
+        kit::cached(
+            painter,
+            egui::Id::new(("stage-chain-card", index)),
+            card,
+            (alpha.surface.color, alpha.edge.color, family_ink),
+            |out| {
+                circuit::octagon(
+                    out,
+                    card,
+                    circuit::CHAMFER,
+                    Some(alpha.surface.color),
+                    Some((Weight::Hair, alpha.edge.color)),
+                );
+                circuit::trace(
+                    out,
+                    &[
+                        egui::pos2(card.left() + circuit::CHAMFER, head.bottom()),
+                        egui::pos2(card.right() - circuit::CHAMFER, head.bottom()),
+                    ],
+                    Weight::Hair,
+                    alpha.edge.color,
+                );
+                for point in [
+                    egui::pos2(card.center().x, card.top()),
+                    egui::pos2(card.center().x, card.bottom()),
+                    egui::pos2(card.left(), head.bottom() - 5.0),
+                    egui::pos2(card.right(), head.bottom() - 5.0),
+                ] {
+                    circuit::pad(out, point, circuit::PAD, family_ink, true);
+                }
+                Sign::Seal(browser::family_mark(column.family)).paint(
+                    out,
+                    egui::Rect::from_center_size(
+                        egui::pos2(head.left() + 16.0, head.center().y),
+                        egui::Vec2::splat(19.0),
+                    ),
+                    Weight::Hair,
+                    family_ink,
+                );
+                circuit::pad(
+                    out,
+                    egui::pos2(head.right() - 11.0, head.center().y),
+                    circuit::PAD + 1.0,
+                    family_ink,
+                    !column.bypassed,
+                );
+            },
+        );
+
+        // The full catalog name remains the column's semantic title; the
+        // header cuts its stable target prefix. That address is the terse
+        // machine name the narrow card can carry at the real block-face
+        // size (POLY, SAT, REVERB), rather than shrinking prose into an
+        // unreadable seven-pixel imitation of the face.
+        let title = column.code.to_ascii_uppercase();
+        block::paint(
+            painter,
+            egui::Id::new(("stage-chain-title", index)),
+            egui::pos2(head.left() + 30.0, head.top() + 5.0),
+            egui::Align2::LEFT_TOP,
+            block::unit::MICRO,
+            &title,
+            family_ink,
+        );
+        if let Some(sample) = &column.sample {
+            painter.text(
+                egui::pos2(head.left() + 30.0, head.bottom() - 5.0),
+                egui::Align2::LEFT_BOTTOM,
+                fit_cells(sample, 12),
+                row_font.clone(),
+                family_ink,
+            );
+        }
+
+        // The card's family word climbs its outer rail in the typewriter
+        // hand, separate from the parameter-family signs on the next rail.
+        let family_word = device_family_word(column.family);
+        let galley =
+            painter.layout_no_wrap(family_word.to_owned(), row_font.clone(), alpha.edge.color);
+        painter.add(egui::Shape::Text(
+            egui::epaint::TextShape::new(
+                egui::pos2(card.left() + 5.0, card.bottom() - 8.0),
+                galley,
+                alpha.edge.color,
+            )
+            .with_angle(-core::f32::consts::FRAC_PI_2),
+        ));
+
+        let visible = row_offset..(row_offset + rows_shown).min(column.rows.len());
+        for (family, run) in chain::family_runs(&column.rows) {
+            let start = run.start.max(visible.start);
+            let end = run.end.min(visible.end);
+            if start >= end {
+                continue;
+            }
+            let first_line = start - row_offset;
+            let last_line = end - 1 - row_offset;
+            let x = card.left() + 23.0;
+            let y0 = body_top + first_line as f32 * pitch + pitch * 0.5;
+            let y1 = body_top + last_line as f32 * pitch + pitch * 0.5;
+            let mut shapes = Vec::new();
+            circuit::rail(
+                &mut shapes,
+                egui::pos2(x, y0),
+                egui::pos2(x, y1.max(y0 + 1.0)),
+                &[0.0, 1.0],
+                alpha.edge.color,
+            );
+            Sign::Family(family).paint(
+                &mut shapes,
+                egui::Rect::from_center_size(egui::pos2(x, y0), egui::Vec2::splat(11.0)),
+                Weight::Hair,
+                alpha.edge.color,
+            );
+            for shape in shapes {
+                painter.add(shape);
+            }
+        }
+
         let cell_w = painter
             .layout_no_wrap("M".to_owned(), row_font.clone(), alpha.ink.color)
             .rect
             .width()
             .max(1.0);
-        let cells = ((TRACK_W - pad * 2.0) / cell_w).floor().max(1.0) as usize;
-
-        for (index, column) in columns.iter().enumerate() {
-            let x = tray.min.x + margin + index as f32 * (TRACK_W + gap);
-            if x + TRACK_W > tray.max.x {
+        for line in 0..rows_shown {
+            let Some(row) = column.rows.get(row_offset + line) else {
                 break;
-            }
-            let head =
-                egui::Rect::from_min_size(egui::pos2(x, tray.min.y), egui::vec2(TRACK_W, head_h));
-            let here = cursor.map(|(col, _)| col) == Some(index);
-
-            // The device's own head: its name, and whether it is passing
-            // sound through. A bypassed device keeps its place and its
-            // list — it is drawn at the structure rung instead of the
-            // content one, which is the same step down the ladder a
-            // silenced thing takes everywhere on this surface.
-            ornament::plane(
-                painter,
-                head,
-                if here {
-                    alpha.edge.color
-                } else {
-                    alpha.surface.color
-                },
-                Some(ornament::Cut::TopLeft),
-            );
-            if here {
-                ornament::brackets(painter, head.expand(2.0), alpha.ink.color, 1.0, 6.0);
-            }
-            let ink = if column.bypassed {
-                alpha.edge.color
-            } else {
-                alpha.ink.color
             };
-            painter.text(
-                egui::pos2(head.min.x + pad, head.center().y),
-                egui::Align2::LEFT_CENTER,
-                column.title,
-                title_font.clone(),
-                if here { alpha.ground.color } else { ink },
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(card.left() + 31.0, body_top + line as f32 * pitch),
+                egui::vec2(card.width() - 37.0, pitch),
             );
-            // The right of the head: the bypass mark, or — on a sampler
-            // that is not bypassed — the name of the file it plays, cut
-            // to the cells the title leaves free.
-            let aside = if column.bypassed {
-                Some("—".to_owned())
-            } else {
-                column.sample.as_ref().map(|name| {
-                    let room = cells.saturating_sub(column.title.chars().count() + 1);
-                    name.chars().take(room).collect()
-                })
-            };
-            if let Some(aside) = aside {
-                painter.text(
-                    egui::pos2(head.max.x - pad, head.center().y),
-                    egui::Align2::RIGHT_CENTER,
-                    aside,
-                    title_font.clone(),
-                    if here {
-                        alpha.ground.color
-                    } else {
-                        alpha.ink.color
-                    },
-                );
-            }
-
-            // Its parameters, from the scroll offset down. A name at the
-            // left and a value at the right, both monospace, so the
-            // values form a column the eye reads without tracking.
-            for line in 0..rows_shown {
-                let Some(row) = column.rows.get(self.chain_offset + line) else {
-                    break;
-                };
-                let top = body_top + line as f32 * pitch;
-                let rect =
-                    egui::Rect::from_min_size(egui::pos2(x, top), egui::vec2(TRACK_W, pitch));
-                let on_row = cursor == Some((index, self.chain_offset + line));
-                if on_row {
-                    painter.rect_filled(rect, 0.0, alpha.edge.color);
-                }
-                // An edited value carries the content rung; one still at
-                // its default is structure. That is the one distinction a
-                // list of forty numbers cannot otherwise make.
-                let (name_ink, value_ink) = if on_row {
-                    (alpha.ground.color, alpha.ground.color)
-                } else if row.edited {
-                    (alpha.edge.color, alpha.ink.color)
-                } else {
-                    (alpha.edge.color, alpha.edge.color)
-                };
-                // The value keeps its cells and the name takes what is
-                // left, with one cell of air between. A name too long for
-                // its column is cut rather than allowed to run under the
-                // number — a truncated word is still readable, and two
-                // overlapping ones are not.
-                let room = cells.saturating_sub(row.value.chars().count() + 1);
-                painter.text(
-                    egui::pos2(rect.min.x + pad, rect.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    fit_cells(&row.name, room),
-                    row_font.clone(),
-                    name_ink,
-                );
-                // The oldest fix for the oldest problem in a list: a
-                // name at one edge, its value at the other, and a run of
-                // points so the eye crosses without losing the row.
-                if !on_row {
-                    let name_end =
-                        rect.min.x + pad + row.name.chars().count().min(room) as f32 * cell_w;
-                    let value_start = rect.max.x - pad - row.value.chars().count() as f32 * cell_w;
-                    ornament::leaders(
-                        painter,
-                        name_end + cell_w,
-                        value_start - cell_w,
-                        rect.center().y,
-                        alpha.edge.color,
-                        cell_w,
-                    );
-                }
-                painter.text(
-                    egui::pos2(rect.max.x - pad, rect.center().y),
-                    egui::Align2::RIGHT_CENTER,
-                    &row.value,
-                    row_font.clone(),
-                    value_ink,
-                );
-            }
-
-            // More parameters below than the band is showing: a point at
-            // the foot, the same mark an empty session slot uses, because
-            // it means the same thing — there is something here.
-            if column.rows.len() > self.chain_offset + rows_shown {
-                painter.rect_filled(
-                    egui::Rect::from_center_size(
-                        egui::pos2(head.center().x, tray.max.y - margin / 2.0),
-                        egui::Vec2::splat(POINT),
-                    ),
-                    0.0,
+            let on_row = cursor == Some((index, row_offset + line));
+            if on_row {
+                painter.rect_filled(rect, 0.0, alpha.edge.color);
+                let mut shapes = Vec::new();
+                circuit::brackets(
+                    &mut shapes,
+                    rect.expand(2.0),
+                    5.0,
+                    Weight::Bold,
                     alpha.ink.color,
                 );
+                for shape in shapes {
+                    painter.add(shape);
+                }
+            }
+            let value_ink = if on_row {
+                alpha.ground.color
+            } else if row.edited {
+                alpha.ink.color
+            } else {
+                alpha.edge.color
+            };
+            let name_ink = if on_row {
+                alpha.ground.color
+            } else {
+                alpha.edge.color
+            };
+            let value_w = painter
+                .layout_no_wrap(row.value.clone(), row_font.clone(), value_ink)
+                .rect
+                .width();
+            let gauge_w = 25.0;
+            let value_x = rect.right();
+            let gauge = egui::Rect::from_center_size(
+                egui::pos2(value_x - value_w - gauge_w * 0.5 - 5.0, rect.center().y),
+                egui::vec2(gauge_w, 6.0),
+            );
+            let name_room = (gauge.left() - rect.left() - 4.0).max(cell_w);
+            let name_cells = (name_room / cell_w).floor().max(1.0) as usize;
+            painter.text(
+                egui::pos2(rect.left(), rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                fit_cells(&row.name, name_cells),
+                row_font.clone(),
+                name_ink,
+            );
+            let mut shapes = Vec::new();
+            if row.choices > 0 {
+                circuit::choice_bar(
+                    &mut shapes,
+                    gauge,
+                    row.choices,
+                    row.choice,
+                    value_ink,
+                    if on_row {
+                        alpha.surface.color
+                    } else {
+                        alpha.edge.color
+                    },
+                );
+            } else {
+                circuit::tick_bar(
+                    &mut shapes,
+                    gauge,
+                    12,
+                    row.place,
+                    value_ink,
+                    if on_row {
+                        alpha.surface.color
+                    } else {
+                        alpha.edge.color
+                    },
+                    true,
+                );
+            }
+            for shape in shapes {
+                painter.add(shape);
+            }
+            painter.text(
+                egui::pos2(value_x, rect.center().y),
+                egui::Align2::RIGHT_CENTER,
+                &row.value,
+                row_font.clone(),
+                value_ink,
+            );
+        }
+
+        if column.rows.len() > row_offset + rows_shown {
+            let mut shapes = Vec::new();
+            circuit::annotation_arrow(
+                &mut shapes,
+                egui::pos2(card.center().x, card.bottom() - 2.0),
+                egui::pos2(card.center().x, card.bottom() + 8.0),
+                alpha.ink.color,
+            );
+            for shape in shapes {
+                painter.add(shape);
             }
         }
     }
