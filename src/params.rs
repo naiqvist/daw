@@ -7673,7 +7673,20 @@ pub mod console {
         pub const LO_HZ: f32 = 100.0;
         pub const HI_HZ: f32 = 8_000.0;
         pub const SHELF_Q: f32 = 0.7;
-        pub const MID_Q: f32 = 0.7;
+        /// The mid's Q is proportional: broad below the knee, rising to
+        /// focused at full boost, and narrower again on a cut.
+        pub const Q_KNEE_DB: f32 = 3.0;
+        pub const Q_BROAD: f32 = 0.5;
+        pub const Q_FOCUSED: f32 = 1.2;
+        pub const CUT_NARROWER: f32 = 1.5;
+        /// A kill crosses over in this long, so a kill locked on a trig
+        /// stutters clean and an un-kill is a small swell.
+        pub const KILL_FADE_MS: f32 = 20.0;
+        /// Past this much boost the boosted band is driven through the
+        /// iron, harder with every dB — a big low boost on a transformer
+        /// desk is thick, not clean.
+        pub const IRON_FROM_DB: f32 = 6.0;
+        pub const IRON_DRIVE: f32 = 2.5;
         /// A killed shelf is a 24 dB/octave cut at its corner.
         pub const KILL_ORDER: u32 = 4;
         /// A killed mid is a wide bell this deep.

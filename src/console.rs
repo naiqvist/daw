@@ -401,6 +401,20 @@ pub mod tone_curve {
         }
     }
 
+    /// The mid's Q at a gain: proportional, and narrower on a cut.
+    /// Broad at a nudge, focused at a push — a +3 dB bell is wide and
+    /// musical, a +15 dB one is aimed — and a cut of the same amount is
+    /// half again as narrow, the way passive desks cut.
+    pub fn mid_q(gain_db: f32) -> f32 {
+        let amount = ((gain_db.abs() - p::Q_KNEE_DB) / (15.0 - p::Q_KNEE_DB)).clamp(0.0, 1.0);
+        let q = p::Q_BROAD + (p::Q_FOCUSED - p::Q_BROAD) * amount;
+        if gain_db < 0.0 {
+            q * p::CUT_NARROWER
+        } else {
+            q
+        }
+    }
+
     /// A biquad's magnitude at `hz`, from its coefficients
     /// `[b0, b1, b2, a1, a2]`.
     fn biquad_db(coeffs: [f32; 5], hz: f32, sample_rate: f32) -> f32 {
@@ -457,7 +471,7 @@ pub mod tone_curve {
             band.prepare(
                 sample_rate,
                 shape.mid_hz,
-                p::MID_Q,
+                mid_q(shape.mid_db),
                 shape.mid_db,
                 BandShape::Bell,
             );
