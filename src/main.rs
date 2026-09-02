@@ -6094,7 +6094,8 @@ fn plockable_params(track: &Track) -> Vec<piano_roll::PlockParam> {
         | DeviceKind::Prism
         | DeviceKind::Modulato
         | DeviceKind::Utility
-        | DeviceKind::Limiter => u32::MAX,
+        | DeviceKind::Limiter
+        | DeviceKind::Console(_) => u32::MAX,
     };
     let kind = head.kind();
     spec.params

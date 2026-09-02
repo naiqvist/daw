@@ -282,7 +282,33 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
     if stage.polarity() != want {
         let _ = stage.apply(StageIntent::Ground);
     }
-    if which.contains("song") {
+    if which.contains("strip") {
+        // The strip band: an instrument track, its console strip laid
+        // out as pieces; a few sections switched IN, the cursor on one.
+        let _ = stage.apply(StageIntent::NewInstrumentTrack);
+        let _ = stage.apply(StageIntent::Devices);
+        if which.contains("-in") {
+            // TONE, VCA and ECHO in; the cursor on VCA's second row.
+            for (col, rows) in [(1usize, 0usize), (6, 2), (17, 0)] {
+                while stage.band_column() < col {
+                    let _ = stage.apply(StageIntent::Step(Step::Right));
+                }
+                let _ = stage.apply(StageIntent::Mute);
+                for _ in 0..rows {
+                    let _ = stage.apply(StageIntent::Step(Step::Down));
+                }
+            }
+            while stage.band_column() > 6 {
+                let _ = stage.apply(StageIntent::Step(Step::Left));
+            }
+            for _ in 0..3 {
+                let _ = stage.apply(StageIntent::Param {
+                    up: true,
+                    coarse: true,
+                });
+            }
+        }
+    } else if which.contains("song") {
         // The song view: three instrument tracks and an audio track,
         // blocks laid along the first two, the cursor on one, the song
         // rolling through the second bar.

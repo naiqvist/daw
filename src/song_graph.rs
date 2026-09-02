@@ -55,6 +55,91 @@ pub struct SongNodes {
     /// The master's output stage, always present — a song with nothing in
     /// it still has somewhere for the meter and the master gain to live.
     pub master: NodeId,
+    /// Every device that reached the graph, by id: chain effects, strip
+    /// sections, and the desk's own. A knob turn rides a letter to its
+    /// node through this table rather than rebuilding the schedule.
+    pub devices: Vec<(DeviceId, NodeId)>,
+}
+
+/// The meter slots the desk takes: tracks below, then the four buses,
+/// the two returns, the mix, and the master last.
+pub const TRACK_METERS: usize = 24;
+pub const BUS_METER_BASE: usize = 24;
+pub const RETURN_METER_BASE: usize = 28;
+pub const MIX_METER: usize = 30;
+
+/// The desk as nodes: where a channel's output goes, by bus.
+struct Desk {
+    /// The first node of each group bus's rail.
+    buses: Vec<NodeId>,
+}
+
+/// One rail — a bus, the mix, a return — as nodes: its sections in
+/// order (all of them, a rail's sections are never OUT), then its own
+/// pan and level. Returns the rail's first node and its output.
+fn rail(
+    spec: &mut GraphSpec,
+    rail: &crate::sequencing::Rail,
+    nodes: &mut SongNodes,
+) -> (NodeId, NodeId) {
+    let out = spec.push(NodeSpec::Pan {
+        pan: rail.pan,
+        gain: rail.volume,
+    });
+    let mut first = None;
+    let mut tail = None;
+    for device in &rail.sections {
+        let Some(node) = effect_of(device) else {
+            continue;
+        };
+        let node = spec.push(node);
+        nodes.devices.push((device.id, node));
+        if let Some(previous) = tail {
+            spec.connect(previous, node);
+        }
+        first.get_or_insert(node);
+        tail = Some(node);
+    }
+    if let Some(tail) = tail {
+        spec.connect(tail, out);
+    }
+    (first.unwrap_or(out), out)
+}
+
+/// The desk: the mix rail into the master, the buses and the returns
+/// into the mix, every rail metered. Built before any track, so the
+/// tracks have somewhere to go.
+fn desk(spec: &mut GraphSpec, song: &Song, nodes: &mut SongNodes, master: NodeId) -> Desk {
+    let (mix_in, mix_out) = rail(spec, &song.console.mix, nodes);
+    spec.connect(mix_out, master);
+    spec.meter(MIX_METER, mix_out);
+    let mut buses = Vec::with_capacity(song.console.buses.len());
+    for (index, bus) in song.console.buses.iter().enumerate() {
+        let (bus_in, bus_out) = rail(spec, bus, nodes);
+        spec.connect(bus_out, mix_in);
+        if BUS_METER_BASE + index < RETURN_METER_BASE {
+            spec.meter(BUS_METER_BASE + index, bus_out);
+        }
+        buses.push(bus_in);
+    }
+    for (index, aux) in song.console.aux.iter().enumerate() {
+        let (_, aux_out) = rail(spec, aux, nodes);
+        spec.connect(aux_out, mix_in);
+        if RETURN_METER_BASE + index < MIX_METER {
+            spec.meter(RETURN_METER_BASE + index, aux_out);
+        }
+    }
+    Desk { buses }
+}
+
+/// The bus a track's output lands on: its own, or the last one when
+/// the desk has fewer than it names.
+fn bus_of(desk: &Desk, track: &crate::sequencing::Track, master: NodeId) -> NodeId {
+    desk.buses
+        .get(usize::from(track.bus))
+        .or(desk.buses.last())
+        .copied()
+        .unwrap_or(master)
 }
 
 /// Compile `song` into a graph, playing whatever `playing` says.
@@ -78,7 +163,9 @@ pub fn build(song: &Song, playing: &[Option<usize>]) -> (GraphSpec, SongNodes) {
         outputs: vec![None; song.tracks.len()],
         meters: vec![None; song.tracks.len()],
         master,
+        devices: Vec::new(),
     };
+    let desk = desk(&mut spec, song, &mut nodes, master);
 
     for (index, track) in song.tracks.iter().enumerate() {
         if !song.audible(index) {
@@ -114,7 +201,9 @@ pub fn build(song: &Song, playing: &[Option<usize>]) -> (GraphSpec, SongNodes) {
         // which is what bypass means, and costs nothing to run.
         let mut effects: Vec<(DeviceId, NodeId)> = Vec::new();
         let mut tail = voice;
-        for device in &track.chain {
+        // The chain's effects, then the strip's sections that are IN, in
+        // the desk's order: one run of nodes, each fed by the one before.
+        for device in track.chain.iter().chain(track.strip.iter()) {
             if device.is_instrument() || device.bypassed {
                 continue;
             }
@@ -124,6 +213,7 @@ pub fn build(song: &Song, playing: &[Option<usize>]) -> (GraphSpec, SongNodes) {
             let node = spec.push(node);
             spec.connect(tail, node);
             effects.push((device.id, node));
+            nodes.devices.push((device.id, node));
             tail = node;
         }
         // Now the effects have ids, the notes can name them: the voice's
@@ -139,7 +229,11 @@ pub fn build(song: &Song, playing: &[Option<usize>]) -> (GraphSpec, SongNodes) {
                         continue;
                     };
                     if let Some((_, node)) = effects.iter().find(|(device, _)| *device == id)
-                        && let Some(device) = track.chain.iter().find(|device| device.id == id)
+                        && let Some(device) = track
+                            .chain
+                            .iter()
+                            .chain(track.strip.iter())
+                            .find(|device| device.id == id)
                     {
                         spec.lock_base(*node, lock.param, device.value(lock.param));
                     }
@@ -154,10 +248,11 @@ pub fn build(song: &Song, playing: &[Option<usize>]) -> (GraphSpec, SongNodes) {
             gain: track.volume,
         });
         spec.connect(tail, out);
-        spec.connect(out, master);
+        // Into the desk: the channel's bus, never the master directly.
+        spec.connect(out, bus_of(&desk, track, master));
         nodes.outputs[index] = Some(out);
 
-        if index < MASTER_METER {
+        if index < TRACK_METERS {
             spec.meter(index, out);
             nodes.meters[index] = Some(index);
         }
@@ -285,6 +380,14 @@ fn effect_of(device: &Device) -> Option<NodeSpec> {
     let choice = |id: u32| device.value(id).round().max(0.0) as u32;
 
     Some(match device.kind {
+        // A section of the console: the kind and the device's edits, as
+        // they are — the core clamps them again on the way in.
+        DeviceKind::Console(kind) => NodeSpec::Section {
+            params: crate::console::SectionParams {
+                kind,
+                values: device.overrides.clone(),
+            },
+        },
         DeviceKind::Utility => patch!(Utility, crate::audio::utility::UtilityParams),
         DeviceKind::Modulato => patch!(Modulato, crate::audio::modulato::ModulatoParams),
         DeviceKind::Filter => patch!(Filter, crate::audio::filter::FilterParams),
@@ -387,7 +490,9 @@ pub fn build_song(song: &Song) -> (GraphSpec, SongNodes) {
         outputs: vec![None; song.tracks.len()],
         meters: vec![None; song.tracks.len()],
         master,
+        devices: Vec::new(),
     };
+    let desk = desk(&mut spec, song, &mut nodes, master);
 
     for (index, track) in song.tracks.iter().enumerate() {
         if !song.audible(index) {
@@ -411,7 +516,9 @@ pub fn build_song(song: &Song) -> (GraphSpec, SongNodes) {
             let voice = spec.push(instrument);
             let mut effects: Vec<(DeviceId, NodeId)> = Vec::new();
             let mut tail = voice;
-            for device in &track.chain {
+            // The chain's effects, then the strip's sections that are IN, in
+            // the desk's order: one run of nodes, each fed by the one before.
+            for device in track.chain.iter().chain(track.strip.iter()) {
                 if device.is_instrument() || device.bypassed {
                     continue;
                 }
@@ -421,6 +528,7 @@ pub fn build_song(song: &Song) -> (GraphSpec, SongNodes) {
                 let node = spec.push(node);
                 spec.connect(tail, node);
                 effects.push((device.id, node));
+                nodes.devices.push((device.id, node));
                 tail = node;
             }
             if !effects.is_empty() {
@@ -438,8 +546,11 @@ pub fn build_song(song: &Song) -> (GraphSpec, SongNodes) {
                             };
                             if let Some((_, node)) =
                                 effects.iter().find(|(device, _)| *device == id)
-                                && let Some(device) =
-                                    track.chain.iter().find(|device| device.id == id)
+                                && let Some(device) = track
+                                    .chain
+                                    .iter()
+                                    .chain(track.strip.iter())
+                                    .find(|device| device.id == id)
                             {
                                 spec.lock_base(*node, lock.param, device.value(lock.param));
                             }
@@ -455,9 +566,9 @@ pub fn build_song(song: &Song) -> (GraphSpec, SongNodes) {
             let node = spec.push(clip);
             spec.connect(node, out);
         }
-        spec.connect(out, master);
+        spec.connect(out, bus_of(&desk, track, master));
         nodes.outputs[index] = Some(out);
-        if index < MASTER_METER {
+        if index < TRACK_METERS {
             spec.meter(index, out);
             nodes.meters[index] = Some(index);
         }

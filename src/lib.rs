@@ -6,6 +6,7 @@
 
 pub mod audio;
 pub mod audio_source;
+pub mod console;
 pub mod design;
 pub mod devices;
 pub mod dsp;

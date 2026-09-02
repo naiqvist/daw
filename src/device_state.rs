@@ -326,6 +326,8 @@ impl DeviceState {
             DeviceKind::Resyn => Self::Resyn(daw::audio::resyn::ResynParams::default()),
             DeviceKind::Acid => Self::Acid(daw::audio::acid::AcidParams::default()),
             DeviceKind::Rack => Self::Rack,
+            // A console section never reaches this binary; it is the stage's.
+            DeviceKind::Console(_) => Self::Rack,
             DeviceKind::Limiter => Self::Limiter(daw::audio::limiter::LimiterParams::default()),
             DeviceKind::Modulato => Self::Modulato(daw::audio::modulato::ModulatoParams::default()),
             DeviceKind::Flint => Self::Flint(daw::audio::flint::FlintParams::default()),
@@ -1066,6 +1068,8 @@ pub fn device_norm(kind: DeviceKind, param: u32, value: f32) -> f32 {
         // A rack has no parameters; nothing ever asks, and this is what
         // it would be told if it did.
         DeviceKind::Rack => 0.0,
+        // A console section never reaches this binary; it is the stage's.
+        DeviceKind::Console(_) => 0.0,
         DeviceKind::Modulato => device::modulato::modulato_norm(param, value),
         DeviceKind::Utility => device::utility_norm(param, value),
     }
@@ -1125,6 +1129,8 @@ pub fn device_is_discrete(kind: DeviceKind, param: u32) -> bool {
         // A rack has no parameters; nothing ever asks, and this is what
         // it would be told if it did.
         DeviceKind::Rack => false,
+        // A console section never reaches this binary; it is the stage's.
+        DeviceKind::Console(_) => false,
         DeviceKind::Modulato => device::modulato::modulato_is_discrete(param),
         DeviceKind::Utility => device::utility_is_discrete(param),
         DeviceKind::SineSynth | DeviceKind::Reverb => false,
@@ -1179,6 +1185,8 @@ pub fn device_is_log(kind: DeviceKind, param: u32) -> bool {
         // A rack has no parameters; nothing ever asks, and this is what
         // it would be told if it did.
         DeviceKind::Rack => false,
+        // A console section never reaches this binary; it is the stage's.
+        DeviceKind::Console(_) => false,
         DeviceKind::Modulato => device::modulato::modulato_is_log(param),
         DeviceKind::Utility => device::utility_is_log(param),
         DeviceKind::Reverb => false,
@@ -1233,6 +1241,8 @@ pub fn device_value(kind: DeviceKind, param: u32, norm: f32) -> f32 {
         // A rack has no parameters; nothing ever asks, and this is what
         // it would be told if it did.
         DeviceKind::Rack => 0.0,
+        // A console section never reaches this binary; it is the stage's.
+        DeviceKind::Console(_) => 0.0,
         DeviceKind::Modulato => device::modulato::modulato_value(param, norm),
         DeviceKind::Utility => device::utility_value(param, norm),
     }

@@ -398,6 +398,17 @@ impl Audio {
                     engine.set_param(*node, params::pan::GAIN, track.volume);
                     engine.set_param(*node, params::pan::PAN, track.pan);
                 }
+                // Every knob on every device that reached the graph: a
+                // turn is a letter, not a rebuild. Sent whole rather than
+                // as a diff, because a diff needs a memory of what the
+                // engine was last told and the song itself is that.
+                for (id, node) in &nodes.devices {
+                    if let Some(device) = stage.song().device(*id) {
+                        for (param, value) in &device.overrides {
+                            engine.set_param(*node, *param, *value);
+                        }
+                    }
+                }
             }
             self.mixed = Some(stage.mix_revision());
         }

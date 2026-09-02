@@ -7599,3 +7599,1159 @@ mod tests {
         }
     }
 }
+
+/// The console's sections, one module each, in `crate::console::SectionKind`'s
+/// order. Every id is its row's position in its table.
+pub mod console {
+    pub mod preamp {
+        use super::super::ParamDef;
+
+        pub const TRIM: u32 = 0;
+        pub const PHASE: u32 = 1;
+        pub const IRON: u32 = 2;
+        pub const COLOUR: u32 = 3;
+
+        pub const TABLE: &[ParamDef] = &[
+            ParamDef {
+                id: 0,
+                name: "Trim",
+                min: -24.0,
+                max: 24.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 1,
+                name: "Phase",
+                min: 0.0,
+                max: 1.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 2,
+                name: "Iron",
+                min: 0.0,
+                max: 100.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 3,
+                name: "Colour",
+                min: 0.0,
+                max: 1.0,
+                default: 0.0,
+            },
+        ];
+    }
+
+    pub mod tone {
+        use super::super::ParamDef;
+
+        pub const LO: u32 = 0;
+        pub const MID: u32 = 1;
+        pub const HI: u32 = 2;
+        pub const MID_HZ: u32 = 3;
+
+        pub const TABLE: &[ParamDef] = &[
+            ParamDef {
+                id: 0,
+                name: "Lo",
+                min: -15.0,
+                max: 15.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 1,
+                name: "Mid",
+                min: -15.0,
+                max: 15.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 2,
+                name: "Hi",
+                min: -15.0,
+                max: 15.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 3,
+                name: "Mid Hz",
+                min: 200.0,
+                max: 6000.0,
+                default: 1000.0,
+            },
+        ];
+    }
+
+    pub mod door {
+        use super::super::ParamDef;
+
+        pub const THRESHOLD: u32 = 0;
+        pub const RANGE: u32 = 1;
+        pub const ATTACK: u32 = 2;
+        pub const HOLD: u32 = 3;
+        pub const RELEASE: u32 = 4;
+        pub const KEY_HZ: u32 = 5;
+
+        pub const TABLE: &[ParamDef] = &[
+            ParamDef {
+                id: 0,
+                name: "Threshold",
+                min: -60.0,
+                max: 0.0,
+                default: -40.0,
+            },
+            ParamDef {
+                id: 1,
+                name: "Range",
+                min: 0.0,
+                max: 80.0,
+                default: 24.0,
+            },
+            ParamDef {
+                id: 2,
+                name: "Attack",
+                min: 0.05,
+                max: 100.0,
+                default: 1.0,
+            },
+            ParamDef {
+                id: 3,
+                name: "Hold",
+                min: 0.0,
+                max: 500.0,
+                default: 20.0,
+            },
+            ParamDef {
+                id: 4,
+                name: "Release",
+                min: 5.0,
+                max: 2000.0,
+                default: 120.0,
+            },
+            ParamDef {
+                id: 5,
+                name: "Key",
+                min: 20.0,
+                max: 2000.0,
+                default: 20.0,
+            },
+        ];
+    }
+
+    pub mod cut {
+        use super::super::ParamDef;
+
+        pub const HP_HZ: u32 = 0;
+        pub const HP_SLOPE: u32 = 1;
+        pub const LP_HZ: u32 = 2;
+        pub const LP_SLOPE: u32 = 3;
+        pub const RESONANCE: u32 = 4;
+
+        pub const TABLE: &[ParamDef] = &[
+            ParamDef {
+                id: 0,
+                name: "HP",
+                min: 20.0,
+                max: 2000.0,
+                default: 20.0,
+            },
+            ParamDef {
+                id: 1,
+                name: "HP Slope",
+                min: 0.0,
+                max: 5.0,
+                default: 1.0,
+            },
+            ParamDef {
+                id: 2,
+                name: "LP",
+                min: 200.0,
+                max: 20000.0,
+                default: 20000.0,
+            },
+            ParamDef {
+                id: 3,
+                name: "LP Slope",
+                min: 0.0,
+                max: 5.0,
+                default: 1.0,
+            },
+            ParamDef {
+                id: 4,
+                name: "Resonance",
+                min: 0.0,
+                max: 100.0,
+                default: 0.0,
+            },
+        ];
+    }
+
+    pub mod hit {
+        use super::super::ParamDef;
+
+        pub const ATTACK: u32 = 0;
+        pub const SUSTAIN: u32 = 1;
+        pub const BRIGHT: u32 = 2;
+
+        pub const TABLE: &[ParamDef] = &[
+            ParamDef {
+                id: 0,
+                name: "Attack",
+                min: -100.0,
+                max: 100.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 1,
+                name: "Sustain",
+                min: -100.0,
+                max: 100.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 2,
+                name: "Bright",
+                min: 0.0,
+                max: 100.0,
+                default: 0.0,
+            },
+        ];
+    }
+
+    pub mod four {
+        use super::super::ParamDef;
+
+        pub const LOW_HZ: u32 = 0;
+        pub const LOW_DB: u32 = 1;
+        pub const LOW_SHAPE: u32 = 2;
+        pub const LMF_HZ: u32 = 3;
+        pub const LMF_DB: u32 = 4;
+        pub const LMF_Q: u32 = 5;
+        pub const HMF_HZ: u32 = 6;
+        pub const HMF_DB: u32 = 7;
+        pub const HMF_Q: u32 = 8;
+        pub const HIGH_HZ: u32 = 9;
+        pub const HIGH_DB: u32 = 10;
+        pub const HIGH_SHAPE: u32 = 11;
+
+        pub const TABLE: &[ParamDef] = &[
+            ParamDef {
+                id: 0,
+                name: "Low Hz",
+                min: 30.0,
+                max: 500.0,
+                default: 100.0,
+            },
+            ParamDef {
+                id: 1,
+                name: "Low",
+                min: -15.0,
+                max: 15.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 2,
+                name: "Low Shape",
+                min: 0.0,
+                max: 1.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 3,
+                name: "LMF Hz",
+                min: 80.0,
+                max: 2000.0,
+                default: 400.0,
+            },
+            ParamDef {
+                id: 4,
+                name: "LMF",
+                min: -15.0,
+                max: 15.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 5,
+                name: "LMF Q",
+                min: 0.3,
+                max: 4.0,
+                default: 0.8,
+            },
+            ParamDef {
+                id: 6,
+                name: "HMF Hz",
+                min: 600.0,
+                max: 8000.0,
+                default: 2500.0,
+            },
+            ParamDef {
+                id: 7,
+                name: "HMF",
+                min: -15.0,
+                max: 15.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 8,
+                name: "HMF Q",
+                min: 0.3,
+                max: 4.0,
+                default: 0.8,
+            },
+            ParamDef {
+                id: 9,
+                name: "High Hz",
+                min: 2000.0,
+                max: 16000.0,
+                default: 8000.0,
+            },
+            ParamDef {
+                id: 10,
+                name: "High",
+                min: -15.0,
+                max: 15.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 11,
+                name: "High Shape",
+                min: 0.0,
+                max: 1.0,
+                default: 0.0,
+            },
+        ];
+    }
+
+    pub mod vca {
+        use super::super::ParamDef;
+
+        pub const THRESHOLD: u32 = 0;
+        pub const RATIO: u32 = 1;
+        pub const ATTACK: u32 = 2;
+        pub const RELEASE: u32 = 3;
+        pub const KNEE: u32 = 4;
+        pub const SC_HP: u32 = 5;
+        pub const TOPOLOGY: u32 = 6;
+        pub const MIX: u32 = 7;
+        pub const MAKEUP: u32 = 8;
+
+        pub const TABLE: &[ParamDef] = &[
+            ParamDef {
+                id: 0,
+                name: "Threshold",
+                min: -60.0,
+                max: 0.0,
+                default: -18.0,
+            },
+            ParamDef {
+                id: 1,
+                name: "Ratio",
+                min: 1.0,
+                max: 20.0,
+                default: 4.0,
+            },
+            ParamDef {
+                id: 2,
+                name: "Attack",
+                min: 0.1,
+                max: 100.0,
+                default: 10.0,
+            },
+            ParamDef {
+                id: 3,
+                name: "Release",
+                min: 10.0,
+                max: 2000.0,
+                default: 100.0,
+            },
+            ParamDef {
+                id: 4,
+                name: "Knee",
+                min: 0.0,
+                max: 24.0,
+                default: 6.0,
+            },
+            ParamDef {
+                id: 5,
+                name: "SC HP",
+                min: 20.0,
+                max: 500.0,
+                default: 20.0,
+            },
+            ParamDef {
+                id: 6,
+                name: "Topology",
+                min: 0.0,
+                max: 1.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 7,
+                name: "Mix",
+                min: 0.0,
+                max: 100.0,
+                default: 100.0,
+            },
+            ParamDef {
+                id: 8,
+                name: "Makeup",
+                min: 0.0,
+                max: 24.0,
+                default: 0.0,
+            },
+        ];
+    }
+
+    pub mod split {
+        use super::super::ParamDef;
+
+        pub const LOW_HZ: u32 = 0;
+        pub const HIGH_HZ: u32 = 1;
+        pub const LOW: u32 = 2;
+        pub const MID: u32 = 3;
+        pub const HIGH: u32 = 4;
+        pub const LOW_DB: u32 = 5;
+        pub const MID_DB: u32 = 6;
+        pub const HIGH_DB: u32 = 7;
+
+        pub const TABLE: &[ParamDef] = &[
+            ParamDef {
+                id: 0,
+                name: "Low Hz",
+                min: 60.0,
+                max: 500.0,
+                default: 150.0,
+            },
+            ParamDef {
+                id: 1,
+                name: "High Hz",
+                min: 1000.0,
+                max: 8000.0,
+                default: 2500.0,
+            },
+            ParamDef {
+                id: 2,
+                name: "Low",
+                min: -100.0,
+                max: 100.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 3,
+                name: "Mid",
+                min: -100.0,
+                max: 100.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 4,
+                name: "High",
+                min: -100.0,
+                max: 100.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 5,
+                name: "Low Gain",
+                min: -12.0,
+                max: 12.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 6,
+                name: "Mid Gain",
+                min: -12.0,
+                max: 12.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 7,
+                name: "High Gain",
+                min: -12.0,
+                max: 12.0,
+                default: 0.0,
+            },
+        ];
+    }
+
+    pub mod pump {
+        use super::super::ParamDef;
+
+        pub const DIVISION: u32 = 0;
+        pub const DEPTH: u32 = 1;
+        pub const SHAPE: u32 = 2;
+        pub const HOLD: u32 = 3;
+
+        pub const TABLE: &[ParamDef] = &[
+            ParamDef {
+                id: 0,
+                name: "Division",
+                min: 0.0,
+                max: 4.0,
+                default: 2.0,
+            },
+            ParamDef {
+                id: 1,
+                name: "Depth",
+                min: 0.0,
+                max: 100.0,
+                default: 50.0,
+            },
+            ParamDef {
+                id: 2,
+                name: "Shape",
+                min: 0.0,
+                max: 100.0,
+                default: 50.0,
+            },
+            ParamDef {
+                id: 3,
+                name: "Hold",
+                min: 0.0,
+                max: 100.0,
+                default: 10.0,
+            },
+        ];
+    }
+
+    pub mod drive {
+        use super::super::ParamDef;
+
+        pub const CHARACTER: u32 = 0;
+        pub const DRIVE: u32 = 1;
+        pub const TILT_PRE: u32 = 2;
+        pub const TILT_POST: u32 = 3;
+        pub const MIX: u32 = 4;
+        pub const OUT: u32 = 5;
+
+        pub const TABLE: &[ParamDef] = &[
+            ParamDef {
+                id: 0,
+                name: "Character",
+                min: 0.0,
+                max: 4.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 1,
+                name: "Drive",
+                min: 0.0,
+                max: 100.0,
+                default: 20.0,
+            },
+            ParamDef {
+                id: 2,
+                name: "Tilt Pre",
+                min: -6.0,
+                max: 6.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 3,
+                name: "Tilt Post",
+                min: -6.0,
+                max: 6.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 4,
+                name: "Mix",
+                min: 0.0,
+                max: 100.0,
+                default: 100.0,
+            },
+            ParamDef {
+                id: 5,
+                name: "Out",
+                min: -24.0,
+                max: 12.0,
+                default: 0.0,
+            },
+        ];
+    }
+
+    pub mod grit {
+        use super::super::ParamDef;
+
+        pub const RATE: u32 = 0;
+        pub const BITS: u32 = 1;
+        pub const JITTER: u32 = 2;
+        pub const HISS: u32 = 3;
+
+        pub const TABLE: &[ParamDef] = &[
+            ParamDef {
+                id: 0,
+                name: "Rate",
+                min: 1000.0,
+                max: 48000.0,
+                default: 48000.0,
+            },
+            ParamDef {
+                id: 1,
+                name: "Bits",
+                min: 2.0,
+                max: 16.0,
+                default: 16.0,
+            },
+            ParamDef {
+                id: 2,
+                name: "Jitter",
+                min: 0.0,
+                max: 100.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 3,
+                name: "Hiss",
+                min: 0.0,
+                max: 100.0,
+                default: 0.0,
+            },
+        ];
+    }
+
+    pub mod shine {
+        use super::super::ParamDef;
+
+        pub const AMOUNT: u32 = 0;
+        pub const TUNE: u32 = 1;
+        pub const MIX: u32 = 2;
+
+        pub const TABLE: &[ParamDef] = &[
+            ParamDef {
+                id: 0,
+                name: "Amount",
+                min: 0.0,
+                max: 100.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 1,
+                name: "Tune",
+                min: 1000.0,
+                max: 12000.0,
+                default: 4000.0,
+            },
+            ParamDef {
+                id: 2,
+                name: "Mix",
+                min: 0.0,
+                max: 100.0,
+                default: 50.0,
+            },
+        ];
+    }
+
+    pub mod drift {
+        use super::super::ParamDef;
+
+        pub const MODE: u32 = 0;
+        pub const RATE: u32 = 1;
+        pub const DEPTH: u32 = 2;
+        pub const FEEDBACK: u32 = 3;
+        pub const WIDTH: u32 = 4;
+        pub const MIX: u32 = 5;
+
+        pub const TABLE: &[ParamDef] = &[
+            ParamDef {
+                id: 0,
+                name: "Mode",
+                min: 0.0,
+                max: 3.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 1,
+                name: "Rate",
+                min: 0.05,
+                max: 10.0,
+                default: 0.5,
+            },
+            ParamDef {
+                id: 2,
+                name: "Depth",
+                min: 0.0,
+                max: 100.0,
+                default: 40.0,
+            },
+            ParamDef {
+                id: 3,
+                name: "Feedback",
+                min: -90.0,
+                max: 90.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 4,
+                name: "Width",
+                min: 0.0,
+                max: 100.0,
+                default: 100.0,
+            },
+            ParamDef {
+                id: 5,
+                name: "Mix",
+                min: 0.0,
+                max: 100.0,
+                default: 50.0,
+            },
+        ];
+    }
+
+    pub mod phase {
+        use super::super::ParamDef;
+
+        pub const STAGES: u32 = 0;
+        pub const RATE: u32 = 1;
+        pub const DEPTH: u32 = 2;
+        pub const FEEDBACK: u32 = 3;
+        pub const OFFSET: u32 = 4;
+
+        pub const TABLE: &[ParamDef] = &[
+            ParamDef {
+                id: 0,
+                name: "Stages",
+                min: 0.0,
+                max: 5.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 1,
+                name: "Rate",
+                min: 0.05,
+                max: 10.0,
+                default: 0.3,
+            },
+            ParamDef {
+                id: 2,
+                name: "Depth",
+                min: 0.0,
+                max: 100.0,
+                default: 60.0,
+            },
+            ParamDef {
+                id: 3,
+                name: "Feedback",
+                min: -90.0,
+                max: 90.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 4,
+                name: "Offset",
+                min: 0.0,
+                max: 180.0,
+                default: 90.0,
+            },
+        ];
+    }
+
+    pub mod smear {
+        use super::super::ParamDef;
+
+        pub const AMOUNT: u32 = 0;
+        pub const CENTRE: u32 = 1;
+
+        pub const TABLE: &[ParamDef] = &[
+            ParamDef {
+                id: 0,
+                name: "Amount",
+                min: 0.0,
+                max: 32.0,
+                default: 8.0,
+            },
+            ParamDef {
+                id: 1,
+                name: "Centre",
+                min: 100.0,
+                max: 8000.0,
+                default: 1000.0,
+            },
+        ];
+    }
+
+    pub mod ring {
+        use super::super::ParamDef;
+
+        pub const CARRIER: u32 = 0;
+        pub const HZ: u32 = 1;
+        pub const HOLD_RATE: u32 = 2;
+        pub const MIX: u32 = 3;
+
+        pub const TABLE: &[ParamDef] = &[
+            ParamDef {
+                id: 0,
+                name: "Carrier",
+                min: 0.0,
+                max: 3.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 1,
+                name: "Hz",
+                min: 20.0,
+                max: 5000.0,
+                default: 440.0,
+            },
+            ParamDef {
+                id: 2,
+                name: "Hold",
+                min: 0.0,
+                max: 50.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 3,
+                name: "Mix",
+                min: 0.0,
+                max: 100.0,
+                default: 50.0,
+            },
+        ];
+    }
+
+    pub mod spectra {
+        use super::super::ParamDef;
+
+        pub const MODE: u32 = 0;
+        pub const FREEZE: u32 = 1;
+        pub const BLUR: u32 = 2;
+        pub const PITCH: u32 = 3;
+        pub const VOICE_A: u32 = 4;
+        pub const VOICE_B: u32 = 5;
+        pub const MIX: u32 = 6;
+
+        pub const TABLE: &[ParamDef] = &[
+            ParamDef {
+                id: 0,
+                name: "Mode",
+                min: 0.0,
+                max: 4.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 1,
+                name: "Freeze",
+                min: 0.0,
+                max: 1.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 2,
+                name: "Blur",
+                min: 0.0,
+                max: 100.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 3,
+                name: "Pitch",
+                min: -24.0,
+                max: 24.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 4,
+                name: "Voice A",
+                min: -12.0,
+                max: 12.0,
+                default: 4.0,
+            },
+            ParamDef {
+                id: 5,
+                name: "Voice B",
+                min: -12.0,
+                max: 12.0,
+                default: 7.0,
+            },
+            ParamDef {
+                id: 6,
+                name: "Mix",
+                min: 0.0,
+                max: 100.0,
+                default: 50.0,
+            },
+        ];
+    }
+
+    pub mod echo {
+        use super::super::ParamDef;
+
+        pub const SYNC: u32 = 0;
+        pub const TIME: u32 = 1;
+        pub const FEEDBACK: u32 = 2;
+        pub const TONE: u32 = 3;
+        pub const WOW: u32 = 4;
+        pub const PINGPONG: u32 = 5;
+        pub const MIX: u32 = 6;
+
+        pub const TABLE: &[ParamDef] = &[
+            ParamDef {
+                id: 0,
+                name: "Sync",
+                min: 0.0,
+                max: 5.0,
+                default: 4.0,
+            },
+            ParamDef {
+                id: 1,
+                name: "Time",
+                min: 1.0,
+                max: 2000.0,
+                default: 375.0,
+            },
+            ParamDef {
+                id: 2,
+                name: "Feedback",
+                min: 0.0,
+                max: 100.0,
+                default: 35.0,
+            },
+            ParamDef {
+                id: 3,
+                name: "Tone",
+                min: 200.0,
+                max: 12000.0,
+                default: 3000.0,
+            },
+            ParamDef {
+                id: 4,
+                name: "Wow",
+                min: 0.0,
+                max: 100.0,
+                default: 10.0,
+            },
+            ParamDef {
+                id: 5,
+                name: "Ping-pong",
+                min: 0.0,
+                max: 1.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 6,
+                name: "Mix",
+                min: 0.0,
+                max: 100.0,
+                default: 30.0,
+            },
+        ];
+    }
+
+    pub mod room {
+        use super::super::ParamDef;
+
+        pub const ALGO: u32 = 0;
+        pub const PREDELAY: u32 = 1;
+        pub const SIZE: u32 = 2;
+        pub const DAMP: u32 = 3;
+        pub const MIX: u32 = 4;
+
+        pub const TABLE: &[ParamDef] = &[
+            ParamDef {
+                id: 0,
+                name: "Algo",
+                min: 0.0,
+                max: 1.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 1,
+                name: "Predelay",
+                min: 0.0,
+                max: 200.0,
+                default: 10.0,
+            },
+            ParamDef {
+                id: 2,
+                name: "Size",
+                min: 0.0,
+                max: 100.0,
+                default: 50.0,
+            },
+            ParamDef {
+                id: 3,
+                name: "Damp",
+                min: 0.0,
+                max: 100.0,
+                default: 40.0,
+            },
+            ParamDef {
+                id: 4,
+                name: "Mix",
+                min: 0.0,
+                max: 100.0,
+                default: 25.0,
+            },
+        ];
+    }
+
+    pub mod out {
+        use super::super::ParamDef;
+
+        pub const WIDTH: u32 = 0;
+        pub const BASS_MONO: u32 = 1;
+        pub const SEND_TAPE: u32 = 2;
+        pub const SEND_SHADOW: u32 = 3;
+
+        pub const TABLE: &[ParamDef] = &[
+            ParamDef {
+                id: 0,
+                name: "Width",
+                min: 0.0,
+                max: 200.0,
+                default: 100.0,
+            },
+            ParamDef {
+                id: 1,
+                name: "Bass Mono",
+                min: 0.0,
+                max: 300.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 2,
+                name: "Send Tape",
+                min: 0.0,
+                max: 100.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 3,
+                name: "Send Shadow",
+                min: 0.0,
+                max: 100.0,
+                default: 0.0,
+            },
+        ];
+    }
+
+    pub mod glue {
+        use super::super::ParamDef;
+
+        pub const LEAN: u32 = 0;
+
+        pub const TABLE: &[ParamDef] = &[ParamDef {
+            id: 0,
+            name: "Lean",
+            min: 0.0,
+            max: 100.0,
+            default: 30.0,
+        }];
+    }
+
+    pub mod iron {
+        use super::super::ParamDef;
+
+        pub const DRIVE: u32 = 0;
+
+        pub const TABLE: &[ParamDef] = &[ParamDef {
+            id: 0,
+            name: "Drive",
+            min: 5.0,
+            max: 100.0,
+            default: 20.0,
+        }];
+    }
+
+    pub mod ceiling {
+        use super::super::ParamDef;
+
+        pub const TABLE: &[ParamDef] = &[];
+    }
+
+    pub mod scope {
+        use super::super::ParamDef;
+
+        pub const TABLE: &[ParamDef] = &[];
+    }
+
+    pub mod tape {
+        use super::super::ParamDef;
+
+        pub const TIME: u32 = 0;
+        pub const FEEDBACK: u32 = 1;
+        pub const WOW: u32 = 2;
+        pub const FLUTTER: u32 = 3;
+        pub const HISS: u32 = 4;
+        pub const TONE: u32 = 5;
+
+        pub const TABLE: &[ParamDef] = &[
+            ParamDef {
+                id: 0,
+                name: "Time",
+                min: 50.0,
+                max: 1500.0,
+                default: 375.0,
+            },
+            ParamDef {
+                id: 1,
+                name: "Feedback",
+                min: 0.0,
+                max: 100.0,
+                default: 45.0,
+            },
+            ParamDef {
+                id: 2,
+                name: "Wow",
+                min: 0.0,
+                max: 100.0,
+                default: 20.0,
+            },
+            ParamDef {
+                id: 3,
+                name: "Flutter",
+                min: 0.0,
+                max: 100.0,
+                default: 10.0,
+            },
+            ParamDef {
+                id: 4,
+                name: "Hiss",
+                min: 0.0,
+                max: 100.0,
+                default: 15.0,
+            },
+            ParamDef {
+                id: 5,
+                name: "Tone",
+                min: 500.0,
+                max: 10000.0,
+                default: 3500.0,
+            },
+        ];
+    }
+
+    pub mod shadow {
+        use super::super::ParamDef;
+
+        pub const PREDELAY: u32 = 0;
+        pub const SIZE: u32 = 1;
+        pub const DAMP: u32 = 2;
+
+        pub const TABLE: &[ParamDef] = &[
+            ParamDef {
+                id: 0,
+                name: "Predelay",
+                min: 0.0,
+                max: 200.0,
+                default: 20.0,
+            },
+            ParamDef {
+                id: 1,
+                name: "Size",
+                min: 0.0,
+                max: 100.0,
+                default: 70.0,
+            },
+            ParamDef {
+                id: 2,
+                name: "Damp",
+                min: 0.0,
+                max: 100.0,
+                default: 50.0,
+            },
+        ];
+    }
+}

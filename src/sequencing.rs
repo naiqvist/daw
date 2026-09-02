@@ -10,6 +10,7 @@
 //! projection, never here and never in the callback
 //! (`notes/20260831-pitch-lens-spec.md`).
 
+use crate::console::SectionKind;
 use crate::devices::DeviceKind;
 use crate::pitch::{Key, Pitch, default_key};
 
@@ -654,6 +655,142 @@ pub struct Envelope {
     pub points: Vec<Point>,
 }
 
+/// The group buses, by index.
+pub const BUS_DRUM: u8 = 0;
+pub const BUS_BASS: u8 = 1;
+pub const BUS_MUSIC: u8 = 2;
+pub const BUS_TAPE: u8 = 3;
+pub const BUS_COUNT: usize = 4;
+pub const BUS_NAMES: [&str; BUS_COUNT] = ["DRUM", "BASS", "MUSIC", "TAPE"];
+pub const RETURN_NAMES: [&str; 2] = ["TAPE", "SHADOW"];
+
+/// A bus, the mix, or a return: a run of sections that are never taken
+/// out, a level and a pan.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct Rail {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub sections: Vec<Device>,
+    #[serde(default = "unity")]
+    pub volume: f32,
+    #[serde(default)]
+    pub pan: f32,
+}
+
+impl Rail {
+    fn named(name: &str) -> Self {
+        Self {
+            name: name.to_owned(),
+            sections: Vec::new(),
+            volume: 1.0,
+            pan: 0.0,
+        }
+    }
+
+    /// The section of `kind` on this rail.
+    pub fn section(&self, kind: SectionKind) -> Option<&Device> {
+        self.sections
+            .iter()
+            .find(|device| device.kind == DeviceKind::Console(kind))
+    }
+}
+
+/// The desk: four group buses into the mix, and two returns into it.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct Console {
+    #[serde(default)]
+    pub buses: Vec<Rail>,
+    #[serde(default = "mix_rail")]
+    pub mix: Rail,
+    /// The two returns, TAPE and SHADOW. Named `aux` in the document
+    /// because `returns` is the legacy mixer's word.
+    #[serde(default)]
+    pub aux: Vec<Rail>,
+}
+
+fn mix_rail() -> Rail {
+    Rail::named("MIX")
+}
+
+impl Default for Console {
+    fn default() -> Self {
+        let mut console = Self {
+            buses: Vec::new(),
+            mix: mix_rail(),
+            aux: Vec::new(),
+        };
+        console.furnish();
+        console
+    }
+}
+
+impl Console {
+    /// Four buses, the mix, two returns, each with its sections in
+    /// order; whatever is already there is kept.
+    fn furnish(&mut self) {
+        for (index, name) in BUS_NAMES.iter().enumerate() {
+            if self.buses.len() <= index {
+                self.buses.push(Rail::named(name));
+            }
+            furnish_run(&mut self.buses[index].sections, &SectionKind::BUS);
+        }
+        self.buses.truncate(BUS_COUNT);
+        furnish_run(&mut self.mix.sections, &SectionKind::MIX);
+        for (index, name) in RETURN_NAMES.iter().enumerate() {
+            if self.aux.len() <= index {
+                self.aux.push(Rail::named(name));
+            }
+            furnish_run(
+                &mut self.aux[index].sections,
+                &SectionKind::RETURNS[index..=index],
+            );
+        }
+        self.aux.truncate(RETURN_NAMES.len());
+    }
+
+    pub fn all_devices(&self) -> impl Iterator<Item = &Device> {
+        self.buses
+            .iter()
+            .chain(std::iter::once(&self.mix))
+            .chain(self.aux.iter())
+            .flat_map(|rail| rail.sections.iter())
+    }
+
+    fn all_devices_mut(&mut self) -> impl Iterator<Item = &mut Device> {
+        self.buses
+            .iter_mut()
+            .chain(std::iter::once(&mut self.mix))
+            .chain(self.aux.iter_mut())
+            .flat_map(|rail| rail.sections.iter_mut())
+    }
+}
+
+/// Make `run` exactly `kinds`, in order: a device already there of the
+/// right kind is kept with its settings and id; a missing one is made
+/// with id zero for `furnish` to mint; anything else is dropped. The
+/// desk's always-in sections are switched in whatever a file said.
+fn furnish_run(run: &mut Vec<Device>, kinds: &[SectionKind]) {
+    let mut fresh = Vec::with_capacity(kinds.len());
+    for kind in kinds {
+        let wanted = DeviceKind::Console(*kind);
+        let mut device = run
+            .iter()
+            .find(|device| device.kind == wanted)
+            .cloned()
+            .unwrap_or_else(|| {
+                let mut device = Device::new(DeviceId(0), wanted);
+                device.bypassed = !kind.always_in();
+                device
+            });
+        if kind.always_in() {
+            device.bypassed = false;
+        }
+        fresh.push(device);
+    }
+    *run = fresh;
+}
+
 // NOTE: `Eq` is gone from `Track` deliberately. An envelope carries f32
 // values, so total equality is not available; `PartialEq` is what the
 // history and the tests actually use.
@@ -746,6 +883,18 @@ pub struct Track {
     /// every project written before devices reached the Song does.
     #[serde(default)]
     pub chain: Vec<Device>,
+    /// The console's channel strip: one device per section of
+    /// `SectionKind::STRIP`, in that order, always. `bypassed` means
+    /// OUT. A document without one is furnished on load.
+    #[serde(default)]
+    pub strip: Vec<Device>,
+    /// Which group bus this channel feeds, 0–3.
+    #[serde(default)]
+    pub bus: u8,
+    /// Whether the performer chose the bus, so a change of instrument
+    /// does not route the track again.
+    #[serde(default)]
+    pub bus_by_hand: bool,
     /// Zero is top level. A lane at depth `d` belongs to the nearest group
     /// above it at depth `d - 1`.
     #[serde(default)]
@@ -1166,6 +1315,10 @@ pub struct Song {
     /// transport's single global signature.
     #[serde(default)]
     pub meter: Vec<MeterMark>,
+    /// The desk: four group buses, the mix, two returns, each wearing
+    /// the sections that are never taken out. Furnished on load.
+    #[serde(default)]
+    pub console: Console,
     /// The song view's loop brace, in song ticks, and whether the
     /// transport runs it while the song plays. Kept apart so the brace
     /// can be switched off without being lost.
@@ -1198,7 +1351,7 @@ impl Default for Song {
     fn default() -> Self {
         let pattern = Pattern::default();
         let pattern_id = pattern.id;
-        Self {
+        let mut song = Self {
             master: 1.0,
             tracks: vec![Track {
                 id: TrackId(1),
@@ -1221,6 +1374,9 @@ impl Default for Song {
                 is_group: false,
                 folded: false,
                 chain: Vec::new(),
+                strip: Vec::new(),
+                bus: 0,
+                bus_by_hand: false,
                 depth: 0,
                 input: TrackInput::default(),
                 monitor: Monitor::default(),
@@ -1230,13 +1386,16 @@ impl Default for Song {
             returns: Vec::new(),
             tempo: Vec::new(),
             meter: Vec::new(),
+            console: Console::default(),
             loop_brace: None,
             loop_on: false,
             locators: Vec::new(),
             session: Session::default(),
             key: default_key(),
             next_track_id: 2,
-        }
+        };
+        song.furnish();
+        song
     }
 }
 
@@ -1283,11 +1442,15 @@ impl Song {
             is_group: false,
             folded: false,
             chain: Vec::new(),
+            strip: Vec::new(),
+            bus: 0,
+            bus_by_hand: false,
             depth: 0,
             input: TrackInput::default(),
             monitor: Monitor::default(),
             armed: false,
         });
+        self.furnish();
         id
     }
 
@@ -1542,15 +1705,30 @@ impl Song {
         self.place_device(track, at, device)
     }
 
-    /// One past the highest device id anywhere in the song.
+    /// One past the highest device id anywhere in the song: chains,
+    /// strips, buses, mix and returns alike, so one id means one device.
     fn mint_device_id(&self) -> u64 {
-        self.tracks
-            .iter()
-            .flat_map(|track| track.chain.iter())
+        self.all_devices()
             .map(|device| device.id.0)
             .max()
             .unwrap_or(0)
             .saturating_add(1)
+    }
+
+    /// Every device in the song, chains first, then the strips, then
+    /// the desk's own.
+    pub fn all_devices(&self) -> impl Iterator<Item = &Device> {
+        self.tracks
+            .iter()
+            .flat_map(|track| track.chain.iter().chain(track.strip.iter()))
+            .chain(self.console.all_devices())
+    }
+
+    fn all_devices_mut(&mut self) -> impl Iterator<Item = &mut Device> {
+        self.tracks
+            .iter_mut()
+            .flat_map(|track| track.chain.iter_mut().chain(track.strip.iter_mut()))
+            .chain(self.console.all_devices_mut())
     }
 
     /// The one place a device joins a chain, so the head rule has one
@@ -1602,17 +1780,89 @@ impl Song {
 
     /// The device with this id, wherever it is.
     pub fn device(&self, id: DeviceId) -> Option<&Device> {
-        self.tracks
-            .iter()
-            .flat_map(|track| track.chain.iter())
-            .find(|device| device.id == id)
+        self.all_devices().find(|device| device.id == id)
     }
 
     pub fn device_mut(&mut self, id: DeviceId) -> Option<&mut Device> {
+        self.all_devices_mut().find(|device| device.id == id)
+    }
+
+    // ------------------------------------------------------------ the desk
+
+    /// Give every track its strip, the desk its buses, the mix and the
+    /// returns, and every new device an id of its own. Idempotent: a
+    /// furnished song is left exactly as it is. Called on every load and
+    /// every new track, so no code path ever sees a channel without its
+    /// strip.
+    pub fn furnish(&mut self) {
+        for track in &mut self.tracks {
+            furnish_run(&mut track.strip, &SectionKind::STRIP);
+        }
+        self.console.furnish();
+        // Ids for whatever was just made. Minted in one pass from the
+        // highest id in the song, so nothing collides with a chain's.
+        let mut next = self.mint_device_id();
+        for device in self.all_devices_mut() {
+            if device.id.0 == 0 {
+                device.id = DeviceId(next);
+                next += 1;
+            }
+        }
+        for index in 0..self.tracks.len() {
+            if !self.tracks[index].bus_by_hand {
+                self.tracks[index].bus = self.bus_for(index);
+            }
+        }
+    }
+
+    /// The bus a track belongs on by what it is: drums to A, bass to B,
+    /// audio to D, everything else to C.
+    pub fn bus_for(&self, track: usize) -> u8 {
+        let Some(track) = self.tracks.get(track) else {
+            return BUS_MUSIC;
+        };
+        if track.kind == TrackKind::Audio {
+            return BUS_TAPE;
+        }
+        let head = track
+            .chain
+            .first()
+            .filter(|device| device.is_instrument())
+            .map(|device| device.kind);
+        match head {
+            Some(DeviceKind::Acid) => BUS_BASS,
+            Some(kind) if kind.spec().family == crate::devices::Family::Drums => BUS_DRUM,
+            _ => BUS_MUSIC,
+        }
+    }
+
+    /// Route `track` again by what it is, unless the performer chose.
+    pub fn reroute(&mut self, track: usize) {
+        if let Some(head) = self.tracks.get(track)
+            && !head.bus_by_hand
+        {
+            let bus = self.bus_for(track);
+            self.tracks[track].bus = bus;
+        }
+    }
+
+    /// The performer's choice of bus for `track`, kept.
+    pub fn set_bus(&mut self, track: usize, bus: u8) -> bool {
+        let Some(head) = self.tracks.get_mut(track) else {
+            return false;
+        };
+        head.bus = bus % BUS_COUNT as u8;
+        head.bus_by_hand = true;
+        true
+    }
+
+    /// The section of `kind` on `track`'s strip.
+    pub fn section(&self, track: usize, kind: SectionKind) -> Option<&Device> {
         self.tracks
-            .iter_mut()
-            .flat_map(|track| track.chain.iter_mut())
-            .find(|device| device.id == id)
+            .get(track)?
+            .strip
+            .iter()
+            .find(|device| device.kind == DeviceKind::Console(kind))
     }
 
     /// Sanitize mixer data arriving from a file. Edits already enforce the
@@ -2839,6 +3089,9 @@ mod automation_tests {
             is_group: false,
             folded: false,
             chain: Vec::new(),
+            strip: Vec::new(),
+            bus: 0,
+            bus_by_hand: false,
             depth: 0,
             input: TrackInput::default(),
             monitor: Monitor::default(),
@@ -3802,6 +4055,9 @@ mod audio_block_tests {
             is_group: false,
             folded: false,
             chain: Vec::new(),
+            strip: Vec::new(),
+            bus: 0,
+            bus_by_hand: false,
             depth: 0,
             input: TrackInput::default(),
             monitor: Monitor::default(),

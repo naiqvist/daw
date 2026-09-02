@@ -159,6 +159,8 @@ pub enum StageIntent {
     Rescan,
     /// Turn the field over: the session, or the song's arrangement.
     SongView,
+    /// The cursor's track to the next group bus.
+    Bus,
     /// The song view's own verbs, over the block or cell under the cursor.
     Song(SongIntent),
     /// Arm the arrangement: while the session plays, every launch
@@ -388,6 +390,7 @@ impl StageIntent {
             Self::Sample(intent) => intent.label(),
             Self::Rescan => "rescan library",
             Self::SongView => "session / song",
+            Self::Bus => "next bus",
             Self::Song(intent) => intent.label(),
             Self::RecordSong => "record session into song",
         }
@@ -599,6 +602,7 @@ const BINDINGS: &[Binding] = &[
     // pressed often and they undo themselves, so they get the short code.
     Binding::new(ScopeContext::Mixer, Key::M, StageIntent::Mute),
     Binding::new(ScopeContext::Mixer, Key::S, StageIntent::Solo),
+    Binding::new(ScopeContext::Mixer, Key::B, StageIntent::Bus),
     // Time and the codebook are global, and repeated here as table data
     // for the reason the top of this list gives: there is no hidden
     // universal-key path, so a scope's vocabulary is exactly its rows.
@@ -1255,6 +1259,17 @@ const BINDINGS: &[Binding] = &[
     Binding::command(ScopeContext::Nested, Key::Space, StageIntent::RecordSong),
     Binding::command(ScopeContext::Mixer, Key::Space, StageIntent::RecordSong),
     Binding::command(ScopeContext::Song, Key::Space, StageIntent::RecordSong),
+    // The device view on one key: V opens the strip band on the
+    // cursor's track from wherever a track is addressed, and closes it
+    // from inside. ^D stays as the old hand.
+    Binding::new(ScopeContext::Root, Key::V, StageIntent::Devices),
+    Binding::new(ScopeContext::Nested, Key::V, StageIntent::Devices),
+    Binding::new(ScopeContext::Mixer, Key::V, StageIntent::Devices),
+    Binding::new(ScopeContext::Song, Key::V, StageIntent::Devices),
+    Binding::new(ScopeContext::Chain, Key::V, StageIntent::Devices),
+    // A section IN or OUT: the desk's button, on the band's Shift+Enter
+    // as well as the M the effects already answer to.
+    Binding::shift(ScopeContext::Chain, Key::Enter, StageIntent::Mute),
 ];
 
 /// Every binding in one scope, in table order. The help surface reads
@@ -1300,6 +1315,7 @@ fn family(intent: StageIntent) -> &'static str {
         | StageIntent::ClearLock => "edit",
         StageIntent::Sample(_) => "sample",
         StageIntent::Song(_) | StageIntent::RecordSong => "song",
+        StageIntent::Bus => "mix",
     }
 }
 

@@ -13,6 +13,7 @@
 pub mod acid;
 pub mod bounce;
 pub mod clamp;
+pub mod console;
 pub mod eq;
 pub mod ferric;
 pub mod filter;

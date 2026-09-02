@@ -2272,6 +2272,12 @@ pub enum Node {
     Strip {
         core: Box<crate::audio::strip::StripCore>,
     },
+    /// A section of the console — see `crate::audio::console`. One node
+    /// kind for every section; the core behind the trait is the kind's.
+    /// Free-running, and it cuts on discontinuity.
+    Section {
+        core: Box<dyn crate::audio::console::SectionCore>,
+    },
     /// The spectral resynthesiser — see `crate::audio::resyn`. The first
     /// node in the tree to run an FFT in the callback.
     ///
@@ -2406,6 +2412,7 @@ impl Node {
             | NodeSpec::Prism { .. }
             | NodeSpec::Gate { .. }
             | NodeSpec::Strip { .. }
+            | NodeSpec::Section { .. }
             | NodeSpec::Resyn { .. }
             | NodeSpec::Sibyl { .. }
             | NodeSpec::Ferric { .. }
@@ -2444,6 +2451,7 @@ impl Node {
             Node::Tine { voices, .. } => Some(voices.readout()),
             Node::Prism { core } => Some(core.readout()),
             Node::Gate { core } => Some(core.readout()),
+            Node::Section { core } => Some(core.readout()),
             _ => None,
         }
     }
@@ -3952,6 +3960,19 @@ impl Node {
                 }
                 core.process(out.l, right);
             }
+            Node::Section { core } => {
+                let right = out.r.as_deref_mut().unwrap_or(&mut []);
+                sum_inputs_stereo(inputs, out.l, right);
+                if ctx.discontinuity {
+                    core.reset();
+                }
+                let clock = crate::audio::console::Clock {
+                    playing: ctx.playing,
+                    beat: ctx.beat,
+                    beats_per_sample: ctx.beats_per_sample,
+                };
+                core.process(out.l, right, &clock);
+            }
             Node::Gate { core } => {
                 let right = out.r.as_deref_mut().unwrap_or(&mut []);
                 sum_inputs_stereo(inputs, out.l, right);
@@ -4577,6 +4598,7 @@ impl Node {
             // letter cannot be routed by two opinions about what id 3 is.
             Node::Gate { core } => core.set_param(param, value),
             Node::Strip { core } => core.set_param(param, value),
+            Node::Section { core } => core.set_param(param, value),
             Node::Resyn { core } => core.set_param(param, value),
             Node::Sibyl { core } => core.set_param(param, value),
             Node::Ferric { core } => core.set_param(param, value),
@@ -5737,6 +5759,11 @@ pub enum NodeSpec {
     Strip {
         #[serde(default)]
         params: crate::audio::strip::StripParams,
+    },
+    /// A section of the console on whatever feeds it. The kind and the
+    /// settings are `crate::console`'s; every id is the kind's table's.
+    Section {
+        params: crate::console::SectionParams,
     },
     /// A spectral resynthesiser on whatever feeds it. Every range and
     /// every `ParamChange` id is `crate::params::resyn::TABLE`'s.
@@ -7485,6 +7512,14 @@ impl GraphSpec {
                             sample_rate as f32,
                             params,
                         )),
+                    },
+                    Some(NodeSpec::Section { params }) => Node::Section {
+                        // Green zone: the kind's core, buffers and all.
+                        core: crate::audio::console::core_of(
+                            params,
+                            sample_rate as f32,
+                            block_frames,
+                        ),
                     },
                     Some(NodeSpec::Gate { params }) => Node::Gate {
                         // Green zone: every kernel the callback will use.

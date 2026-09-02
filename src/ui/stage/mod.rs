@@ -31,6 +31,7 @@ mod mixer;
 mod ornament;
 mod sample;
 mod scenes;
+mod strip;
 mod tracks;
 mod transport;
 mod trig_menu;
@@ -40,7 +41,7 @@ use crate::design::codex::Sign;
 use crate::design::kit::{self, Weight};
 use crate::design::motion::{self, Phase};
 use crate::design::{block, circuit};
-use crate::sequencing::PatternBlock;
+use crate::sequencing::{DeviceId, PatternBlock};
 use arrangement::{Arrangement, Hold, Take};
 pub use arrangement::{ExportRequest, ExportState};
 
@@ -285,6 +286,7 @@ fn device_family_word(family: Family) -> &'static str {
         Family::Modulation => "MODULATION",
         Family::Spectral => "SPECTRAL",
         Family::Utilities => "UTILITY",
+        Family::Console => "CONSOLE",
     }
 }
 
@@ -949,6 +951,14 @@ impl Stage {
         self.arrangement.track
     }
 
+    /// The band's cursor column, for posing.
+    pub fn band_column(&self) -> usize {
+        self.chain
+            .as_ref()
+            .and_then(|lattice| lattice.cursor())
+            .map_or(0, |(col, _)| col)
+    }
+
     /// Move the stage's own clock, for posing: where the engine would
     /// have reported the transport to be.
     pub fn transport_seek(&mut self, tick: usize) {
@@ -1117,6 +1127,9 @@ impl Stage {
     /// else is clamped rather than reset.
     fn adopt_song(&mut self, song: Song) {
         self.song = song;
+        // Every channel gets its strip and the desk its rails, whatever
+        // the file held; a furnished song is left as it is.
+        self.song.furnish();
         self.renaming = None;
         self.nudging = false;
         if let Some(opened) = self.inside
@@ -1181,7 +1194,12 @@ impl Stage {
     /// ones. A pure function of the tray, like every other capacity here.
     fn chain_capacity(tray: egui::Rect) -> usize {
         let margin = design::px(design::space::ROOM);
-        chain::rows_that_fit(tray.height() - margin - CHAIN_HEAD_H, CHAIN_PITCH)
+        let cards = chain::rows_that_fit(tray.height() - margin - CHAIN_HEAD_H, CHAIN_PITCH);
+        let pieces = chain::rows_that_fit(
+            tray.height() - margin - (strip::HEAD_H + 4.0 + strip::FIGURE_H + 6.0) - 6.0,
+            strip::ROW_H,
+        );
+        cards.min(pieces)
     }
 
     /// Where the transport is inside the OPEN clip, in ticks — but only
@@ -1222,10 +1240,14 @@ impl Stage {
         let Some((col, mut row)) = lattice.cursor() else {
             return;
         };
-        let len = self.song.tracks[track]
-            .chain
-            .get(col)
+        let _ = track;
+        let len = self
+            .band_device(col)
+            .and_then(|(_, id)| self.song.device(id))
             .map_or(0, |device| device.kind.spec().params.len());
+        let Some(lattice) = &mut self.chain else {
+            return;
+        };
         while row >= len && row > 0 && lattice.step(Step::Up) {
             row -= 1;
         }
@@ -1239,16 +1261,32 @@ impl Stage {
         (device < self.song.tracks[track].chain.len()).then_some((track, device))
     }
 
-    /// The parameter the band's cursor is on: its device, and its id.
-    fn chained_param(&self) -> Option<(usize, usize, u32)> {
-        let (track, device) = self.chained_device()?;
+    /// The device the band's column `col` shows: the chain's, then the
+    /// strip's sections, in the band's order.
+    fn band_device(&self, col: usize) -> Option<(usize, DeviceId)> {
+        let track = self.addressed_track()?;
+        let lane = &self.song.tracks[track];
+        let device = if col < lane.chain.len() {
+            &lane.chain[col]
+        } else {
+            lane.strip.get(col - lane.chain.len())?
+        };
+        Some((track, device.id))
+    }
+
+    /// The device under the band's cursor, chain or strip.
+    fn band_cursor_device(&self) -> Option<(usize, DeviceId)> {
+        let (col, _) = self.chain.as_ref()?.cursor()?;
+        self.band_device(col)
+    }
+
+    /// The parameter the band's cursor is on: its track, its device's
+    /// id, and the parameter's id.
+    fn chained_param(&self) -> Option<(usize, DeviceId, u32)> {
+        let (track, id) = self.band_cursor_device()?;
         let (_, row) = self.chain.as_ref()?.cursor()?;
-        let def = self.song.tracks[track].chain[device]
-            .kind
-            .spec()
-            .params
-            .get(row)?;
-        Some((track, device, def.id))
+        let def = self.song.device(id)?.kind.spec().params.get(row)?;
+        Some((track, id, def.id))
     }
 
     /// The lattice the band needs for the chain it is showing: one column
@@ -1262,13 +1300,15 @@ impl Stage {
         let Some(track) = self.addressed_track() else {
             return (0, 0);
         };
-        let chain = &self.song.tracks[track].chain;
-        let rows = chain
+        let lane = &self.song.tracks[track];
+        let rows = lane
+            .chain
             .iter()
+            .chain(lane.strip.iter())
             .map(|device| device.kind.spec().params.len())
             .max()
             .unwrap_or(0);
-        (chain.len(), rows)
+        (lane.chain.len() + lane.strip.len(), rows)
     }
 
     /// The track the session's cursor ADDRESSES, whether or not focus is
@@ -2870,6 +2910,20 @@ impl Stage {
                     left.then_some(()).ok_or(RefusalReason::Shallower)
                 }
             }
+            StageIntent::Bus => match self.focused_track() {
+                Some(track) => {
+                    let next =
+                        (self.song.tracks[track].bus + 1) % crate::sequencing::BUS_COUNT as u8;
+                    self.song.set_bus(track, next);
+                    self.notice = Some(format!(
+                        "→ {}",
+                        crate::sequencing::BUS_NAMES[usize::from(next)]
+                    ));
+                    self.touched();
+                    Ok(())
+                }
+                None => Err(RefusalReason::Unavailable),
+            },
             StageIntent::SongView => {
                 self.song_view = !self.song_view;
                 self.notice = Some(if self.song_view { "song" } else { "session" }.to_owned());
@@ -3021,12 +3075,34 @@ impl Stage {
             // The switches change AUDIBILITY, which is what decides who
             // reaches the graph at all — so unlike a fader these are a
             // rebuild rather than a letter.
-            StageIntent::Mute if self.chain.is_some() => match self.chained_device() {
-                Some((track, device)) => {
-                    let lane = &mut self.song.tracks[track].chain[device];
+            StageIntent::Mute if self.chain.is_some() => match self.band_cursor_device() {
+                Some((_, id)) => {
+                    let Some(lane) = self.song.device_mut(id) else {
+                        return ApplyOutcome::Refused(Refusal {
+                            intent,
+                            reason: RefusalReason::Empty,
+                        });
+                    };
+                    let section = match lane.kind {
+                        DeviceKind::Console(kind) => Some(kind),
+                        _ => None,
+                    };
+                    if section.is_some_and(crate::console::SectionKind::always_in) {
+                        // The desk's own: never out. Said, not ignored.
+                        self.notice = Some("always in".to_owned());
+                        return ApplyOutcome::Refused(Refusal {
+                            intent,
+                            reason: RefusalReason::Unavailable,
+                        });
+                    }
                     lane.bypassed = !lane.bypassed;
                     let bypassed = lane.bypassed;
-                    self.notice = Some(if bypassed { "bypassed" } else { "in" }.to_owned());
+                    self.notice = Some(match (section, bypassed) {
+                        (Some(kind), true) => format!("{} OUT", kind.name()),
+                        (Some(kind), false) => format!("{} IN", kind.name()),
+                        (None, true) => "bypassed".to_owned(),
+                        (None, false) => "in".to_owned(),
+                    });
                     // Bypass changes who is in the graph at all, so the
                     // graph is rebuilt — the same division a track's mute
                     // makes against a fader.
@@ -3089,8 +3165,13 @@ impl Stage {
                 }
             }
             StageIntent::Param { up, coarse } => match self.chained_param() {
-                Some((track, device, param)) => {
-                    let spec = self.song.tracks[track].chain[device].kind.spec();
+                Some((_, id, param)) => {
+                    let Some(spec) = self.song.device(id).map(|device| device.kind.spec()) else {
+                        return ApplyOutcome::Refused(Refusal {
+                            intent,
+                            reason: RefusalReason::Empty,
+                        });
+                    };
                     match spec
                         .params
                         .iter()
@@ -3102,7 +3183,12 @@ impl Stage {
                             let step =
                                 chain::step_of(def, label, coarse) * if up { 1.0 } else { -1.0 };
                             let name = label.name;
-                            let lane = &mut self.song.tracks[track].chain[device];
+                            let Some(lane) = self.song.device_mut(id) else {
+                                return ApplyOutcome::Refused(Refusal {
+                                    intent,
+                                    reason: RefusalReason::Empty,
+                                });
+                            };
                             let before = lane.value(param);
                             lane.set(param, before + step);
                             let after = lane.value(param);
@@ -4268,7 +4354,7 @@ impl Stage {
         let Some(track) = self.addressed_track() else {
             return;
         };
-        let columns = chain::columns(&self.song, track);
+        let columns = chain::band(&self.song, track);
         if columns.is_empty() {
             return;
         }
@@ -4277,34 +4363,90 @@ impl Stage {
         let head_h = CHAIN_HEAD_H;
         let pitch = CHAIN_PITCH;
         let body_top = tray.min.y + head_h;
-        let rows_shown = chain::rows_that_fit(tray.max.y - margin - body_top, pitch);
+        let rows_shown = Self::chain_capacity(tray);
+        let _ = chain::rows_that_fit(tray.max.y - margin - body_top, pitch);
         let cursor = lattice.cursor();
-        let visible: Vec<_> = columns
+
+        // The band is a rail of pieces of two kinds: cards, which stand
+        // apart by the column gap, and the strip's sections, which mate
+        // — a section's tongue lies in the next section's notch, so two
+        // sections take no gap between them.
+        let widths: Vec<f32> = columns
             .iter()
-            .enumerate()
-            .take_while(|(index, _)| {
-                tray.min.x + margin + (*index + 1) as f32 * CHAIN_W + *index as f32 * gap
-                    <= tray.max.x
-            })
+            .map(|column| column.section.map_or(CHAIN_W, strip::width_of))
             .collect();
-        if visible.is_empty() {
+        let mates = |i: usize| -> bool {
+            i + 1 < columns.len()
+                && columns[i].section.is_some()
+                && columns[i + 1].section.is_some()
+        };
+        let step = |i: usize| -> f32 { widths[i] + if mates(i) { 0.0 } else { gap } };
+        let avail = tray.width() - margin * 2.0;
+
+        // The rail scrolls so the cursor's piece is on screen: the first
+        // piece shown is the earliest from which the cursor's still fits.
+        let cursor_col = cursor.map_or(0, |(col, _)| col).min(columns.len() - 1);
+        let mut first = 0;
+        loop {
+            let mut x = 0.0;
+            let mut fits = false;
+            for i in first..=cursor_col {
+                if x + widths[i] <= avail {
+                    if i == cursor_col {
+                        fits = true;
+                    }
+                    x += step(i);
+                } else {
+                    break;
+                }
+            }
+            if fits || first >= cursor_col {
+                break;
+            }
+            first += 1;
+        }
+        let mut layout: Vec<(usize, egui::Rect)> = Vec::new();
+        let mut x = tray.min.x + margin;
+        for i in first..columns.len() {
+            if x + widths[i] > tray.max.x - margin + 0.5 {
+                break;
+            }
+            layout.push((
+                i,
+                egui::Rect::from_min_max(
+                    egui::pos2(x, tray.top()),
+                    egui::pos2(x + widths[i], tray.bottom() - margin),
+                ),
+            ));
+            x += step(i);
+        }
+        if layout.is_empty() {
             return;
         }
 
-        // The signal trace is behind the cards and emerges only in the
-        // gaps between their side pads. A bypassed destination bends the
-        // trace upward before it arrives: the card stays present while the
-        // current visibly routes around its processing path.
+        // The signal between cards, and from the last card into the
+        // first piece's notch. Between two pieces there is no trace to
+        // draw: they are joined. A bypassed card bends the trace upward
+        // before it arrives, as it always did.
         let signal_y = tray.top() + head_h - 5.0;
         let sounding = self.playing_on(track).is_some();
-        for pair in visible.windows(2) {
-            let (left_index, _) = pair[0];
-            let (right_index, right) = pair[1];
-            let left_x = tray.min.x + margin + left_index as f32 * (CHAIN_W + gap);
-            let right_x = tray.min.x + margin + right_index as f32 * (CHAIN_W + gap);
-            let from = egui::pos2(left_x + CHAIN_W, signal_y);
-            let to = egui::pos2(right_x, signal_y);
-            let path = if right.bypassed {
+        for pair in layout.windows(2) {
+            let (left_index, left_rect) = pair[0];
+            let (right_index, right_rect) = pair[1];
+            if columns[left_index].section.is_some() && columns[right_index].section.is_some() {
+                continue;
+            }
+            let from = egui::pos2(left_rect.right(), signal_y);
+            let right_is_piece = columns[right_index].section.is_some();
+            let to = if right_is_piece {
+                egui::pos2(
+                    right_rect.left() + strip::TONGUE,
+                    strip::joint_y(right_rect),
+                )
+            } else {
+                egui::pos2(right_rect.left(), signal_y)
+            };
+            let path = if columns[right_index].bypassed && !right_is_piece {
                 let lift = gap.min(8.0);
                 vec![
                     from,
@@ -4313,7 +4455,7 @@ impl Stage {
                     to,
                 ]
             } else {
-                vec![from, to]
+                circuit::elbow(from, to)
             };
             let mut shapes = Vec::new();
             circuit::trace(&mut shapes, &path, Weight::Hair, self.alphabet().edge.color);
@@ -4326,22 +4468,52 @@ impl Stage {
                     self.alphabet().live_dim.color,
                 );
             }
-            for shape in shapes {
-                painter.add(shape);
-            }
+            painter.extend(shapes);
         }
 
-        for (index, column) in visible {
-            let x = tray.min.x + margin + index as f32 * (CHAIN_W + gap);
-            let card = egui::Rect::from_min_max(
-                egui::pos2(x, tray.top()),
-                egui::pos2(x + CHAIN_W, tray.bottom() - margin),
+        // The pieces: every body first, so a tongue laid afterwards lies
+        // in its neighbour's notch rather than under it.
+        let pieces: Vec<(strip::Piece, &chain::Column)> = layout
+            .iter()
+            .filter_map(|(i, rect)| {
+                columns[*i].section.map(|kind| {
+                    (
+                        strip::Piece {
+                            index: *i,
+                            rect: *rect,
+                            kind,
+                            notch: *i > 0 && columns[*i - 1].section.is_some(),
+                            tongue: mates(*i),
+                        },
+                        &columns[*i],
+                    )
+                })
+            })
+            .collect();
+        for (piece, column) in &pieces {
+            self.draw_piece_body(painter, *piece, column);
+        }
+        for (piece, column) in &pieces {
+            self.draw_piece_face(
+                painter,
+                *piece,
+                column,
+                cursor,
+                self.chain_offset,
+                rows_shown,
+                sounding,
+                phase,
             );
+        }
+        for (index, rect) in &layout {
+            if columns[*index].section.is_some() {
+                continue;
+            }
             self.draw_chain_card(
                 painter,
-                card,
-                column,
-                index,
+                *rect,
+                &columns[*index],
+                *index,
                 cursor,
                 self.chain_offset,
                 rows_shown,
@@ -11068,17 +11240,69 @@ mod tests {
         );
     }
 
+    /// A track with no chain still has its strip: the band opens on the
+    /// console's twenty sections, PREAMP first, and V is the one key.
     #[test]
-    fn a_track_with_no_devices_has_no_band_to_show() {
+    fn a_track_with_no_devices_still_has_its_strip_to_show() {
         let mut stage = Stage::new();
+        assert_eq!(drive(&mut stage, &[Key::V]), vec![ApplyOutcome::Changed]);
+        let (cols, _) = stage.chain_shape();
+        assert_eq!(cols, crate::console::SectionKind::STRIP.len());
+        let (_, id) = stage
+            .band_cursor_device()
+            .expect("a device under the cursor");
         assert_eq!(
-            command(&mut stage, Key::D),
-            ApplyOutcome::Refused(Refusal {
-                intent: StageIntent::Devices,
-                reason: RefusalReason::Empty,
-            })
+            stage.song.device(id).map(|device| device.kind),
+            Some(DeviceKind::Console(crate::console::SectionKind::Preamp))
         );
-        assert!(stage.chain.is_none());
+        assert_eq!(drive(&mut stage, &[Key::V]), vec![ApplyOutcome::Changed]);
+        assert!(stage.chain.is_none(), "V again closes the band");
+    }
+
+    /// A section is switched IN and OUT from the band; the desk's own
+    /// sections refuse, out loud; switching is a rebuild.
+    #[test]
+    fn a_section_switches_in_and_out_and_the_preamp_never_does() {
+        let mut stage = Stage::new();
+        assert_eq!(drive(&mut stage, &[Key::V]), vec![ApplyOutcome::Changed]);
+        assert!(matches!(
+            stage.handle_key(Modifiers::SHIFT, Key::Enter),
+            Some(ApplyOutcome::Refused(_))
+        ));
+        assert_eq!(stage.notice.as_deref(), Some("always in"));
+        assert_eq!(drive(&mut stage, &[Key::Tab]), vec![ApplyOutcome::Changed]);
+        let before = stage.revision();
+        assert_eq!(
+            stage.handle_key(Modifiers::SHIFT, Key::Enter),
+            Some(ApplyOutcome::Changed)
+        );
+        assert_eq!(stage.notice.as_deref(), Some("TONE IN"));
+        assert!(
+            !stage
+                .song
+                .section(0, crate::console::SectionKind::Tone)
+                .expect("tone")
+                .bypassed
+        );
+        assert_ne!(
+            stage.revision(),
+            before,
+            "switching a section in is a rebuild"
+        );
+        assert_eq!(drive(&mut stage, &[Key::M]), vec![ApplyOutcome::Changed]);
+        assert_eq!(stage.notice.as_deref(), Some("TONE OUT"));
+        // A knob on a section rides a letter, as any device's does.
+        let mixed = stage.mix_revision();
+        assert_eq!(
+            stage.handle_key(Modifiers::NONE, Key::ArrowRight),
+            Some(ApplyOutcome::Changed)
+        );
+        assert_ne!(stage.mix_revision(), mixed);
+        let tone = stage
+            .song
+            .section(0, crate::console::SectionKind::Tone)
+            .expect("tone");
+        assert!(tone.value(crate::params::console::tone::LO) > 0.0);
     }
 
     #[test]
@@ -11225,10 +11449,13 @@ mod tests {
             Some(ApplyOutcome::Changed)
         );
         assert!(stage.song.tracks[0].chain.is_empty());
+        // The strip is still there, so the band stays up over it.
         assert!(
-            stage.chain.is_none(),
-            "the band stayed open over a chain that no longer exists"
+            stage.chain.is_some(),
+            "the band closed over a strip that is always there"
         );
+        let (cols, _) = stage.chain_shape();
+        assert_eq!(cols, crate::console::SectionKind::STRIP.len());
     }
 
     #[test]
@@ -11238,7 +11465,7 @@ mod tests {
         let mut stage = Stage::new();
         into_chain(&mut stage);
         let (_, rows) = stage.chain_shape();
-        assert_eq!(rows, crate::devices::DeviceKind::Sat.spec().params.len());
+        assert!(rows >= crate::devices::DeviceKind::Sat.spec().params.len());
     }
 
     /// Get a clip open, playing, and the transport rolling.
@@ -11683,7 +11910,11 @@ mod tests {
             Some(format!("yanked {}", crate::devices::DeviceKind::Sat.spec().name).as_str())
         );
         // The band is one narrower and the cursor is still inside it.
-        assert_eq!(stage.chain.as_ref().map(FocusLattice::cols), Some(2));
+        // (Two chain cards, and the strip's twenty pieces after them.)
+        assert_eq!(
+            stage.chain.as_ref().map(FocusLattice::cols),
+            Some(2 + crate::console::SectionKind::STRIP.len())
+        );
         assert_eq!(
             stage.chain.as_ref().and_then(FocusLattice::cursor),
             Some((1, 0))

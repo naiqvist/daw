@@ -57,14 +57,34 @@ pub struct Column {
     /// fact about a sampler its parameter table cannot show.
     pub sample: Option<String>,
     pub rows: Vec<Row>,
+    /// Which section of the console this column is, when it is one:
+    /// drawn as a piece of the strip rather than as a card.
+    pub section: Option<crate::console::SectionKind>,
 }
 
-/// The devices on `track`, in signal order. An empty vector is a track
-/// with no chain, which sounds the default voice and has nothing to show.
+/// The devices on `track`'s chain, in signal order. An empty vector is a
+/// track with no chain, which sounds the default voice.
 pub fn columns(song: &Song, track: usize) -> Vec<Column> {
     song.tracks
         .get(track)
         .map(|track| track.chain.iter().map(column).collect())
+        .unwrap_or_default()
+}
+
+/// The whole band: the chain, then the strip's sections in the desk's
+/// order. Never empty for a track that exists — the strip is always
+/// there — and empty for one that does not.
+pub fn band(song: &Song, track: usize) -> Vec<Column> {
+    song.tracks
+        .get(track)
+        .map(|track| {
+            track
+                .chain
+                .iter()
+                .chain(track.strip.iter())
+                .map(column)
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -82,6 +102,10 @@ pub fn column(device: &Device) -> Column {
             .as_deref()
             .and_then(|path| path.file_name())
             .map(|name| name.to_string_lossy().into_owned()),
+        section: match device.kind {
+            crate::devices::DeviceKind::Console(kind) => Some(kind),
+            _ => None,
+        },
         // The two tables are parallel by construction — the automation
         // target picker already walks them zipped — so a row is one
         // parameter's numbers beside its words.

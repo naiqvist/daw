@@ -231,6 +231,7 @@ pub(super) fn family_mark(family: Family) -> Glyph {
         Family::Modulation => Glyph::Modulation,
         Family::Spectral => Glyph::Spectral,
         Family::Utilities => Glyph::Utility,
+        Family::Console => Glyph::Utility,
     }
 }
 

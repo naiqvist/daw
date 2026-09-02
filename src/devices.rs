@@ -22,6 +22,9 @@ use crate as daw;
 /// reaches a track.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum DeviceKind {
+    /// A section of the console: never offered by the browser, on every
+    /// track by construction. See `crate::console`.
+    Console(daw::console::SectionKind),
     SineSynth,
     Poly,
     Tine,
@@ -75,6 +78,7 @@ impl DeviceKind {
     pub fn spec(self) -> &'static DeviceSpec {
         DEVICES
             .iter()
+            .chain(CONSOLE)
             .find(|spec| spec.kind == self)
             .unwrap_or(&DEVICES[0])
     }
@@ -137,6 +141,9 @@ impl Section {
 /// rather than as the uncategorised one.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Family {
+    /// The console's own sections. Not a browser heading: nothing here
+    /// is fetched, it is already on every track.
+    Console,
     Synths,
     Drums,
     Sampling,
@@ -166,6 +173,9 @@ impl Family {
     /// The heading this family sits under.
     pub fn section(self) -> Section {
         match self {
+            // Filed under the effects for the codebook's sake; the
+            // browser never lists it because it is not in `ALL`.
+            Self::Console => Section::AudioEffects,
             Self::Synths => Section::Instruments,
             Self::Drums => Section::Instruments,
             Self::Sampling => Section::Instruments,
@@ -181,6 +191,7 @@ impl Family {
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::Console => "Console",
             Self::Synths => "Synths",
             Self::Drums => "Drums",
             Self::Sampling => "Sampling",
@@ -3333,3 +3344,976 @@ mod family_tests {
         }
     }
 }
+
+/// The console's sections as device specs: never offered by the browser,
+/// always on every track. One entry per `SectionKind`, in its order.
+pub static CONSOLE: &[DeviceSpec] = &[
+    DeviceSpec {
+        kind: DeviceKind::Console(daw::console::SectionKind::Preamp),
+        name: "preamp",
+        instrument: false,
+        family: Family::Console,
+        prefix: "preamp",
+        params: daw::params::console::preamp::TABLE,
+        labels: &[
+            ParamLabel {
+                name: "Trim",
+                unit: "dB",
+                group: "Preamp",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Phase",
+                unit: "",
+                group: "Preamp",
+                choices: &["+", "-"],
+            },
+            ParamLabel {
+                name: "Iron",
+                unit: "%",
+                group: "Preamp",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Colour",
+                unit: "",
+                group: "Preamp",
+                choices: &["off", "on"],
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Console(daw::console::SectionKind::Tone),
+        name: "tone",
+        instrument: false,
+        family: Family::Console,
+        prefix: "tone",
+        params: daw::params::console::tone::TABLE,
+        labels: &[
+            ParamLabel {
+                name: "Lo",
+                unit: "dB",
+                group: "Tone",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Mid",
+                unit: "dB",
+                group: "Tone",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Hi",
+                unit: "dB",
+                group: "Tone",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Mid Hz",
+                unit: "Hz",
+                group: "Tone",
+                choices: &[],
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Console(daw::console::SectionKind::Door),
+        name: "door",
+        instrument: false,
+        family: Family::Console,
+        prefix: "door",
+        params: daw::params::console::door::TABLE,
+        labels: &[
+            ParamLabel {
+                name: "Threshold",
+                unit: "dB",
+                group: "Door",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Range",
+                unit: "dB",
+                group: "Door",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Attack",
+                unit: "ms",
+                group: "Door",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Hold",
+                unit: "ms",
+                group: "Door",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Release",
+                unit: "ms",
+                group: "Door",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Key",
+                unit: "Hz",
+                group: "Door",
+                choices: &[],
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Console(daw::console::SectionKind::Cut),
+        name: "cut",
+        instrument: false,
+        family: Family::Console,
+        prefix: "cut",
+        params: daw::params::console::cut::TABLE,
+        labels: &[
+            ParamLabel {
+                name: "HP",
+                unit: "Hz",
+                group: "Cut",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "HP Slope",
+                unit: "",
+                group: "Cut",
+                choices: &["6", "12", "18", "24", "36", "48"],
+            },
+            ParamLabel {
+                name: "LP",
+                unit: "Hz",
+                group: "Cut",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "LP Slope",
+                unit: "",
+                group: "Cut",
+                choices: &["6", "12", "18", "24", "36", "48"],
+            },
+            ParamLabel {
+                name: "Resonance",
+                unit: "%",
+                group: "Cut",
+                choices: &[],
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Console(daw::console::SectionKind::Hit),
+        name: "hit",
+        instrument: false,
+        family: Family::Console,
+        prefix: "hit",
+        params: daw::params::console::hit::TABLE,
+        labels: &[
+            ParamLabel {
+                name: "Attack",
+                unit: "%",
+                group: "Hit",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Sustain",
+                unit: "%",
+                group: "Hit",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Bright",
+                unit: "%",
+                group: "Hit",
+                choices: &[],
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Console(daw::console::SectionKind::Four),
+        name: "four",
+        instrument: false,
+        family: Family::Console,
+        prefix: "four",
+        params: daw::params::console::four::TABLE,
+        labels: &[
+            ParamLabel {
+                name: "Low Hz",
+                unit: "Hz",
+                group: "Four",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Low",
+                unit: "dB",
+                group: "Four",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Low Shape",
+                unit: "",
+                group: "Four",
+                choices: &["shelf", "bell"],
+            },
+            ParamLabel {
+                name: "LMF Hz",
+                unit: "Hz",
+                group: "Four",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "LMF",
+                unit: "dB",
+                group: "Four",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "LMF Q",
+                unit: "",
+                group: "Four",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "HMF Hz",
+                unit: "Hz",
+                group: "Four",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "HMF",
+                unit: "dB",
+                group: "Four",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "HMF Q",
+                unit: "",
+                group: "Four",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "High Hz",
+                unit: "Hz",
+                group: "Four",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "High",
+                unit: "dB",
+                group: "Four",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "High Shape",
+                unit: "",
+                group: "Four",
+                choices: &["shelf", "bell"],
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Console(daw::console::SectionKind::Vca),
+        name: "vca",
+        instrument: false,
+        family: Family::Console,
+        prefix: "vca",
+        params: daw::params::console::vca::TABLE,
+        labels: &[
+            ParamLabel {
+                name: "Threshold",
+                unit: "dB",
+                group: "Vca",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Ratio",
+                unit: ":1",
+                group: "Vca",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Attack",
+                unit: "ms",
+                group: "Vca",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Release",
+                unit: "ms",
+                group: "Vca",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Knee",
+                unit: "dB",
+                group: "Vca",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "SC HP",
+                unit: "Hz",
+                group: "Vca",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Topology",
+                unit: "",
+                group: "Vca",
+                choices: &["forward", "feedback"],
+            },
+            ParamLabel {
+                name: "Mix",
+                unit: "%",
+                group: "Vca",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Makeup",
+                unit: "dB",
+                group: "Vca",
+                choices: &[],
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Console(daw::console::SectionKind::Split),
+        name: "split",
+        instrument: false,
+        family: Family::Console,
+        prefix: "split",
+        params: daw::params::console::split::TABLE,
+        labels: &[
+            ParamLabel {
+                name: "Low Hz",
+                unit: "Hz",
+                group: "Split",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "High Hz",
+                unit: "Hz",
+                group: "Split",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Low",
+                unit: "%",
+                group: "Split",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Mid",
+                unit: "%",
+                group: "Split",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "High",
+                unit: "%",
+                group: "Split",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Low Gain",
+                unit: "dB",
+                group: "Split",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Mid Gain",
+                unit: "dB",
+                group: "Split",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "High Gain",
+                unit: "dB",
+                group: "Split",
+                choices: &[],
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Console(daw::console::SectionKind::Pump),
+        name: "pump",
+        instrument: false,
+        family: Family::Console,
+        prefix: "pump",
+        params: daw::params::console::pump::TABLE,
+        labels: &[
+            ParamLabel {
+                name: "Division",
+                unit: "",
+                group: "Pump",
+                choices: &["1/1", "1/2", "1/4", "1/8", "1/16"],
+            },
+            ParamLabel {
+                name: "Depth",
+                unit: "%",
+                group: "Pump",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Shape",
+                unit: "%",
+                group: "Pump",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Hold",
+                unit: "%",
+                group: "Pump",
+                choices: &[],
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Console(daw::console::SectionKind::Drive),
+        name: "drive",
+        instrument: false,
+        family: Family::Console,
+        prefix: "drive",
+        params: daw::params::console::drive::TABLE,
+        labels: &[
+            ParamLabel {
+                name: "Character",
+                unit: "",
+                group: "Drive",
+                choices: &["tube", "tape", "transistor", "fuzz", "fold"],
+            },
+            ParamLabel {
+                name: "Drive",
+                unit: "%",
+                group: "Drive",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Tilt Pre",
+                unit: "dB",
+                group: "Drive",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Tilt Post",
+                unit: "dB",
+                group: "Drive",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Mix",
+                unit: "%",
+                group: "Drive",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Out",
+                unit: "dB",
+                group: "Drive",
+                choices: &[],
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Console(daw::console::SectionKind::Grit),
+        name: "grit",
+        instrument: false,
+        family: Family::Console,
+        prefix: "grit",
+        params: daw::params::console::grit::TABLE,
+        labels: &[
+            ParamLabel {
+                name: "Rate",
+                unit: "Hz",
+                group: "Grit",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Bits",
+                unit: "",
+                group: "Grit",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Jitter",
+                unit: "%",
+                group: "Grit",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Hiss",
+                unit: "%",
+                group: "Grit",
+                choices: &[],
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Console(daw::console::SectionKind::Shine),
+        name: "shine",
+        instrument: false,
+        family: Family::Console,
+        prefix: "shine",
+        params: daw::params::console::shine::TABLE,
+        labels: &[
+            ParamLabel {
+                name: "Amount",
+                unit: "%",
+                group: "Shine",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Tune",
+                unit: "Hz",
+                group: "Shine",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Mix",
+                unit: "%",
+                group: "Shine",
+                choices: &[],
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Console(daw::console::SectionKind::Drift),
+        name: "drift",
+        instrument: false,
+        family: Family::Console,
+        prefix: "drift",
+        params: daw::params::console::drift::TABLE,
+        labels: &[
+            ParamLabel {
+                name: "Mode",
+                unit: "",
+                group: "Drift",
+                choices: &["chorus", "flanger", "vibrato", "ensemble"],
+            },
+            ParamLabel {
+                name: "Rate",
+                unit: "Hz",
+                group: "Drift",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Depth",
+                unit: "%",
+                group: "Drift",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Feedback",
+                unit: "%",
+                group: "Drift",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Width",
+                unit: "%",
+                group: "Drift",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Mix",
+                unit: "%",
+                group: "Drift",
+                choices: &[],
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Console(daw::console::SectionKind::Phase),
+        name: "phase",
+        instrument: false,
+        family: Family::Console,
+        prefix: "phase",
+        params: daw::params::console::phase::TABLE,
+        labels: &[
+            ParamLabel {
+                name: "Stages",
+                unit: "",
+                group: "Phase",
+                choices: &["2", "4", "6", "8", "12", "16"],
+            },
+            ParamLabel {
+                name: "Rate",
+                unit: "Hz",
+                group: "Phase",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Depth",
+                unit: "%",
+                group: "Phase",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Feedback",
+                unit: "%",
+                group: "Phase",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Offset",
+                unit: "°",
+                group: "Phase",
+                choices: &[],
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Console(daw::console::SectionKind::Smear),
+        name: "smear",
+        instrument: false,
+        family: Family::Console,
+        prefix: "smear",
+        params: daw::params::console::smear::TABLE,
+        labels: &[
+            ParamLabel {
+                name: "Amount",
+                unit: "",
+                group: "Smear",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Centre",
+                unit: "Hz",
+                group: "Smear",
+                choices: &[],
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Console(daw::console::SectionKind::Ring),
+        name: "ring",
+        instrument: false,
+        family: Family::Console,
+        prefix: "ring",
+        params: daw::params::console::ring::TABLE,
+        labels: &[
+            ParamLabel {
+                name: "Carrier",
+                unit: "",
+                group: "Ring",
+                choices: &["sine", "tri", "square", "noise"],
+            },
+            ParamLabel {
+                name: "Hz",
+                unit: "Hz",
+                group: "Ring",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Hold",
+                unit: "Hz",
+                group: "Ring",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Mix",
+                unit: "%",
+                group: "Ring",
+                choices: &[],
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Console(daw::console::SectionKind::Spectra),
+        name: "spectra",
+        instrument: false,
+        family: Family::Console,
+        prefix: "spectra",
+        params: daw::params::console::spectra::TABLE,
+        labels: &[
+            ParamLabel {
+                name: "Mode",
+                unit: "",
+                group: "Spectra",
+                choices: &["freeze", "blur", "pitch", "choir", "robot"],
+            },
+            ParamLabel {
+                name: "Freeze",
+                unit: "",
+                group: "Spectra",
+                choices: &["off", "on"],
+            },
+            ParamLabel {
+                name: "Blur",
+                unit: "%",
+                group: "Spectra",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Pitch",
+                unit: "st",
+                group: "Spectra",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Voice A",
+                unit: "st",
+                group: "Spectra",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Voice B",
+                unit: "st",
+                group: "Spectra",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Mix",
+                unit: "%",
+                group: "Spectra",
+                choices: &[],
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Console(daw::console::SectionKind::Echo),
+        name: "echo",
+        instrument: false,
+        family: Family::Console,
+        prefix: "echo",
+        params: daw::params::console::echo::TABLE,
+        labels: &[
+            ParamLabel {
+                name: "Sync",
+                unit: "",
+                group: "Echo",
+                choices: &["free", "1/16", "1/8", "1/8d", "1/4", "1/2"],
+            },
+            ParamLabel {
+                name: "Time",
+                unit: "ms",
+                group: "Echo",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Feedback",
+                unit: "%",
+                group: "Echo",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Tone",
+                unit: "Hz",
+                group: "Echo",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Wow",
+                unit: "%",
+                group: "Echo",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Ping-pong",
+                unit: "",
+                group: "Echo",
+                choices: &["off", "on"],
+            },
+            ParamLabel {
+                name: "Mix",
+                unit: "%",
+                group: "Echo",
+                choices: &[],
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Console(daw::console::SectionKind::Room),
+        name: "room",
+        instrument: false,
+        family: Family::Console,
+        prefix: "room",
+        params: daw::params::console::room::TABLE,
+        labels: &[
+            ParamLabel {
+                name: "Algo",
+                unit: "",
+                group: "Room",
+                choices: &["room", "hall"],
+            },
+            ParamLabel {
+                name: "Predelay",
+                unit: "ms",
+                group: "Room",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Size",
+                unit: "%",
+                group: "Room",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Damp",
+                unit: "%",
+                group: "Room",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Mix",
+                unit: "%",
+                group: "Room",
+                choices: &[],
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Console(daw::console::SectionKind::Out),
+        name: "out",
+        instrument: false,
+        family: Family::Console,
+        prefix: "out",
+        params: daw::params::console::out::TABLE,
+        labels: &[
+            ParamLabel {
+                name: "Width",
+                unit: "%",
+                group: "Out",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Bass Mono",
+                unit: "Hz",
+                group: "Out",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Send Tape",
+                unit: "%",
+                group: "Out",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Send Shadow",
+                unit: "%",
+                group: "Out",
+                choices: &[],
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Console(daw::console::SectionKind::Glue),
+        name: "glue",
+        instrument: false,
+        family: Family::Console,
+        prefix: "glue",
+        params: daw::params::console::glue::TABLE,
+        labels: &[ParamLabel {
+            name: "Lean",
+            unit: "%",
+            group: "Glue",
+            choices: &[],
+        }],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Console(daw::console::SectionKind::Iron),
+        name: "iron",
+        instrument: false,
+        family: Family::Console,
+        prefix: "iron",
+        params: daw::params::console::iron::TABLE,
+        labels: &[ParamLabel {
+            name: "Drive",
+            unit: "%",
+            group: "Iron",
+            choices: &[],
+        }],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Console(daw::console::SectionKind::Ceiling),
+        name: "ceiling",
+        instrument: false,
+        family: Family::Console,
+        prefix: "ceiling",
+        params: daw::params::console::ceiling::TABLE,
+        labels: &[],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Console(daw::console::SectionKind::Scope),
+        name: "scope",
+        instrument: false,
+        family: Family::Console,
+        prefix: "scope",
+        params: daw::params::console::scope::TABLE,
+        labels: &[],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Console(daw::console::SectionKind::Tape),
+        name: "tape",
+        instrument: false,
+        family: Family::Console,
+        prefix: "tape",
+        params: daw::params::console::tape::TABLE,
+        labels: &[
+            ParamLabel {
+                name: "Time",
+                unit: "ms",
+                group: "Tape",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Feedback",
+                unit: "%",
+                group: "Tape",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Wow",
+                unit: "%",
+                group: "Tape",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Flutter",
+                unit: "%",
+                group: "Tape",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Hiss",
+                unit: "%",
+                group: "Tape",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Tone",
+                unit: "Hz",
+                group: "Tape",
+                choices: &[],
+            },
+        ],
+    },
+    DeviceSpec {
+        kind: DeviceKind::Console(daw::console::SectionKind::Shadow),
+        name: "shadow",
+        instrument: false,
+        family: Family::Console,
+        prefix: "shadow",
+        params: daw::params::console::shadow::TABLE,
+        labels: &[
+            ParamLabel {
+                name: "Predelay",
+                unit: "ms",
+                group: "Shadow",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Size",
+                unit: "%",
+                group: "Shadow",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Damp",
+                unit: "%",
+                group: "Shadow",
+                choices: &[],
+            },
+        ],
+    },
+];
