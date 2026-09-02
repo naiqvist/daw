@@ -493,6 +493,105 @@ pub mod tone_curve {
     }
 }
 
+/// CUT's shape on the green side: the two filters' linear response,
+/// which is what the card draws. The crunch is the one thing the curve
+/// cannot show, and the card shows it as heat.
+pub mod cut_curve {
+    use crate::params::console::cut as p;
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct Shape {
+        pub hp_hz: f32,
+        pub hp_res: f32,
+        pub lp_hz: f32,
+        pub lp_res: f32,
+        pub crunch: f32,
+    }
+
+    impl Shape {
+        pub fn of(params: &super::SectionParams) -> Self {
+            let table = super::SectionKind::Cut.table();
+            let clamp = |id: u32| {
+                let value = params.value(id);
+                table
+                    .iter()
+                    .find(|def| def.id == id)
+                    .map_or(value, |def| def.clamp(value))
+            };
+            Self {
+                hp_hz: clamp(p::HP_HZ),
+                hp_res: clamp(p::HP_RES) / 100.0,
+                lp_hz: clamp(p::LP_HZ),
+                lp_res: clamp(p::LP_RES) / 100.0,
+                crunch: clamp(p::CRUNCH) / 100.0,
+            }
+        }
+
+        pub fn hp_off(&self) -> bool {
+            self.hp_hz <= p::HP_OFF_HZ
+        }
+
+        pub fn lp_off(&self) -> bool {
+            self.lp_hz >= p::LP_OFF_HZ
+        }
+
+        /// Whether both are parked: a wire.
+        pub fn is_off(&self) -> bool {
+            self.hp_off() && self.lp_off()
+        }
+    }
+
+    /// The resonance knob's Q: exponential from flat to just past
+    /// self-oscillation, so the last inch is where it sings.
+    pub fn q_of(res: f32) -> f32 {
+        p::Q_MIN * (p::Q_MAX / p::Q_MIN).powf(res.clamp(0.0, 1.0))
+    }
+
+    /// The loop's damping for a resonance: `1/Q` down to the last inch,
+    /// then through zero to slightly negative, which is where a real
+    /// loop starts to sing on its own — the tanh in the loop is what
+    /// holds it there.
+    pub fn damping_of(res: f32) -> f32 {
+        let res = res.clamp(0.0, 1.0);
+        if res < p::SING_FROM {
+            1.0 / q_of(res)
+        } else {
+            let along = (res - p::SING_FROM) / (1.0 - p::SING_FROM);
+            (1.0 / p::Q_MAX) * (1.0 - along) + p::SING_DAMPING * along
+        }
+    }
+
+    /// The passband gain at a resonance, in dB: pulled down as the
+    /// resonance rises, so a sweep gets a peak and not a level jump.
+    pub fn compensation_db(res: f32) -> f32 {
+        -p::RES_COMPENSATION_DB * res.clamp(0.0, 1.0)
+    }
+
+    /// A 2-pole filter's magnitude at `hz`, in dB: the analogue
+    /// prototype's, which the digital loop matches at its corner.
+    fn two_pole_db(hz: f32, corner: f32, q: f32, highpass: bool) -> f32 {
+        let w = hz / corner.max(1.0);
+        let w2 = w * w;
+        let den = ((1.0 - w2).powi(2) + (w / q).powi(2)).max(1e-12);
+        let num = if highpass { w2 * w2 } else { 1.0 };
+        10.0 * (num / den).log10()
+    }
+
+    /// The whole section's response at `hz`, in dB.
+    pub fn response_db(shape: &Shape, hz: f32) -> f32 {
+        let mut db = 0.0;
+        if !shape.hp_off() {
+            db += two_pole_db(hz, shape.hp_hz, q_of(shape.hp_res), true)
+                + compensation_db(shape.hp_res);
+        }
+        if !shape.lp_off() {
+            db += two_pole_db(hz, shape.lp_hz, q_of(shape.lp_res), false)
+                + compensation_db(shape.lp_res);
+        }
+        db
+    }
+}
+
 /// What a section measured this frame, as the surface reads it: the
 /// green twin of the engine's readout, so a card can carry live figures
 /// without the surface importing the audio side. Level in dBFS,

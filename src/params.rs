@@ -7871,46 +7871,65 @@ pub mod console {
         use super::super::ParamDef;
 
         pub const HP_HZ: u32 = 0;
-        pub const HP_SLOPE: u32 = 1;
+        pub const HP_RES: u32 = 1;
         pub const LP_HZ: u32 = 2;
-        pub const LP_SLOPE: u32 = 3;
-        pub const RESONANCE: u32 = 4;
+        pub const LP_RES: u32 = 3;
+        pub const CRUNCH: u32 = 4;
+
+        /// The two knobs' resting ends: parked here a filter is off.
+        pub const HP_OFF_HZ: f32 = 20.0;
+        pub const LP_OFF_HZ: f32 = 20_000.0;
+        /// The resonance's reach: from a flat 1/√2 to just past
+        /// self-oscillation.
+        pub const Q_MIN: f32 = 0.707;
+        pub const Q_MAX: f32 = 40.0;
+        /// How much the passband is pulled down at full resonance, in
+        /// dB, so a resonant sweep gets a peak and not a level jump.
+        pub const RES_COMPENSATION_DB: f32 = 6.0;
+        /// The loop's saturation: a floor that always holds a singing
+        /// loop, and the OTA's knee at full crunch.
+        pub const CRUNCH_FLOOR: f32 = 0.25;
+        pub const CRUNCH_DRIVE: f32 = 6.0;
+        /// Past this much resonance the damping goes through zero to
+        /// this, and the loop sings on its own.
+        pub const SING_FROM: f32 = 0.97;
+        pub const SING_DAMPING: f32 = -0.03;
 
         pub const TABLE: &[ParamDef] = &[
             ParamDef {
                 id: 0,
                 name: "HP",
                 min: 20.0,
-                max: 2000.0,
+                max: 4000.0,
                 default: 20.0,
             },
             ParamDef {
                 id: 1,
-                name: "HP Slope",
+                name: "HP Res",
                 min: 0.0,
-                max: 5.0,
-                default: 1.0,
+                max: 100.0,
+                default: 20.0,
             },
             ParamDef {
                 id: 2,
                 name: "LP",
-                min: 200.0,
+                min: 100.0,
                 max: 20000.0,
                 default: 20000.0,
             },
             ParamDef {
                 id: 3,
-                name: "LP Slope",
+                name: "LP Res",
                 min: 0.0,
-                max: 5.0,
-                default: 1.0,
+                max: 100.0,
+                default: 20.0,
             },
             ParamDef {
                 id: 4,
-                name: "Resonance",
+                name: "Crunch",
                 min: 0.0,
                 max: 100.0,
-                default: 0.0,
+                default: 35.0,
             },
         ];
     }

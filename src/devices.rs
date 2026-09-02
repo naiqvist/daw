@@ -3537,10 +3537,10 @@ pub static CONSOLE: &[DeviceSpec] = &[
                 choices: &[],
             },
             ParamLabel {
-                name: "HP Slope",
-                unit: "",
+                name: "HP Res",
+                unit: "%",
                 group: "Cut",
-                choices: &["6", "12", "18", "24", "36", "48"],
+                choices: &[],
             },
             ParamLabel {
                 name: "LP",
@@ -3549,13 +3549,13 @@ pub static CONSOLE: &[DeviceSpec] = &[
                 choices: &[],
             },
             ParamLabel {
-                name: "LP Slope",
-                unit: "",
+                name: "LP Res",
+                unit: "%",
                 group: "Cut",
-                choices: &["6", "12", "18", "24", "36", "48"],
+                choices: &[],
             },
             ParamLabel {
-                name: "Resonance",
+                name: "Crunch",
                 unit: "%",
                 group: "Cut",
                 choices: &[],
