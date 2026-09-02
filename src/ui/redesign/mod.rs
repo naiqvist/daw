@@ -8,26 +8,27 @@ pub mod arrangement;
 pub mod browser;
 pub mod chain;
 mod focus;
-mod grammar;
-mod grid_resolution;
 mod help;
 pub mod keyboard;
-mod layout_grid;
-pub mod lens;
-pub mod midi_typing;
 #[cfg(test)]
 mod principles;
-mod registers;
-mod roll;
-pub mod sequence;
-mod sequence_grid;
-mod signs;
 pub mod tools;
 pub mod transport;
-mod trig_info;
-mod verbs;
+
+// The sequencer and its grammar were born here and now live in a
+// neutral home; the frame keeps its old names for them so nothing inside
+// it had to move.
+pub use crate::ui::sequencer::{
+    grammar, grid_resolution, layout_grid, lens, midi_typing, registers, roll, sequence,
+    sequence_grid, trig_info, verbs,
+};
 
 use eframe::egui;
+
+/// The sign vocabulary moved to `crate::design`, beside the colour
+/// alphabet. Re-exported so this frame's panels keep naming it exactly
+/// where they always did — what changed is where it is DEFINED.
+pub(crate) use crate::design::signs;
 
 pub(crate) const OUTLINE: egui::Color32 = egui::Color32::WHITE;
 /// The transport and browser read as one continuous L-shaped surface.
@@ -263,6 +264,19 @@ impl Redesign {
                             .or(queued_pitch),
                         sequence_view,
                         lens_view,
+                        // This frame is dark, and stays dark: the ground
+                        // turns over on the stage, which is where it is
+                        // chosen.
+                        crate::design::Polarity::Dark,
+                        // The second frame has no session to launch from,
+                        // so nothing here is ever the sounding clip.
+                        None,
+                    );
+                    // The focus bar is the frame's sign, drawn by the frame.
+                    focus::show(
+                        ui.painter(),
+                        sequence.content_rect,
+                        focus == keyboard::FocusTarget::Sequence,
                     );
                 }
                 Detail::Chain => {

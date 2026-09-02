@@ -210,53 +210,55 @@ impl Theme {
         }
     }
 
-    /// The house light scheme: warm paper rather than bare white, with
-    /// slate ink and the same restrained cyan identity as the dark side.
+    /// The house light scheme: warm e-paper rather than bare white, with
+    /// graphite ink and desaturated pigments.
     ///
     /// This is authored role by role instead of mechanically inverting the
     /// dark theme. Wells remain recessed, raised surfaces catch light,
     /// timeline divisions recede in three distinct steps, and parameter
-    /// families use darker pigments that remain readable on paper.
+    /// families use darker pigments that remain readable on paper. Neither
+    /// the page nor its strongest neutral mark reaches the display's end
+    /// stops: this is a reflected-light surface, not dark mode inverted.
     pub fn light() -> Self {
         Self {
             light: true,
-            bg: Color32::from_rgb(0xf3, 0xf0, 0xe9),
-            surface: Color32::from_rgb(0xeb, 0xe7, 0xde),
-            surface_raised: Color32::from_rgb(0xfc, 0xfa, 0xf5),
-            surface_sunken: Color32::from_rgb(0xdd, 0xd8, 0xce),
-            text: Color32::from_rgb(0x24, 0x28, 0x2d),
-            text_muted: Color32::from_rgb(0x68, 0x74, 0x7d),
-            text_value: Color32::from_rgb(0x34, 0x4c, 0x5b),
-            outline: Color32::from_rgb(0xc4, 0xbe, 0xb2),
-            divider: Color32::from_rgb(0xd8, 0xd2, 0xc7),
+            bg: Color32::from_rgb(0xe8, 0xe4, 0xda),
+            surface: Color32::from_rgb(0xe0, 0xdc, 0xd2),
+            surface_raised: Color32::from_rgb(0xef, 0xec, 0xe4),
+            surface_sunken: Color32::from_rgb(0xd5, 0xd1, 0xc7),
+            text: Color32::from_rgb(0x53, 0x51, 0x4b),
+            text_muted: Color32::from_rgb(0x78, 0x76, 0x6f),
+            text_value: Color32::from_rgb(0x5f, 0x66, 0x63),
+            outline: Color32::from_rgb(0xb8, 0xb3, 0xa8),
+            divider: Color32::from_rgb(0xcc, 0xc7, 0xbc),
             // On a light ground the ring reads by going DARKER, which is the
             // same move as dark's — more present than the accent, not less.
-            focus: Color32::from_rgb(0x0f, 0x5a, 0x78),
-            accent: Color32::from_rgb(0x28, 0x7c, 0x9b),
-            accent_muted: Color32::from_rgb(0xc6, 0xdd, 0xe5),
-            role_time: Color32::from_rgb(0x37, 0x6f, 0x9d),
-            role_time_dim: Color32::from_rgb(0xaa, 0xb9, 0xc3),
-            role_level: Color32::from_rgb(0x9a, 0x6b, 0x2f),
-            role_level_dim: Color32::from_rgb(0xcf, 0xc1, 0xae),
-            role_shape: Color32::from_rgb(0x56, 0x5b, 0x52),
-            role_shape_dim: Color32::from_rgb(0xba, 0xbd, 0xb5),
-            role_mod: Color32::from_rgb(0xc5, 0x3f, 0x2f),
-            role_mod_dim: Color32::from_rgb(0xd8, 0xb4, 0xae),
-            ok: Color32::from_rgb(0x27, 0x7a, 0x50),
-            warn: Color32::from_rgb(0xa5, 0x6c, 0x1b),
-            danger: Color32::from_rgb(0xb5, 0x3d, 0x3d),
-            red_zone: Color32::from_rgb(0xca, 0x44, 0x36),
-            green_zone: Color32::from_rgb(0x26, 0x82, 0x5b),
-            playhead: Color32::from_rgb(0xb3, 0x6c, 0x00),
-            loop_region: Color32::from_rgba_unmultiplied(0x28, 0x7c, 0x9b, 0x22),
-            loop_brace: Color32::from_rgb(0x5f, 0x78, 0x86),
-            selection: Color32::from_rgba_unmultiplied(0x28, 0x7c, 0x9b, 0x30),
+            focus: Color32::from_rgb(0x48, 0x52, 0x50),
+            accent: Color32::from_rgb(0x68, 0x7b, 0x7b),
+            accent_muted: Color32::from_rgb(0xc5, 0xd0, 0xcb),
+            role_time: Color32::from_rgb(0x63, 0x77, 0x89),
+            role_time_dim: Color32::from_rgb(0xaa, 0xb3, 0xb6),
+            role_level: Color32::from_rgb(0x8a, 0x75, 0x57),
+            role_level_dim: Color32::from_rgb(0xc2, 0xb9, 0xaa),
+            role_shape: Color32::from_rgb(0x62, 0x63, 0x5c),
+            role_shape_dim: Color32::from_rgb(0xb3, 0xb3, 0xaa),
+            role_mod: Color32::from_rgb(0xa4, 0x66, 0x5d),
+            role_mod_dim: Color32::from_rgb(0xcb, 0xb4, 0xae),
+            ok: Color32::from_rgb(0x5f, 0x78, 0x66),
+            warn: Color32::from_rgb(0x8d, 0x76, 0x50),
+            danger: Color32::from_rgb(0x96, 0x5f, 0x5b),
+            red_zone: Color32::from_rgb(0xa4, 0x63, 0x59),
+            green_zone: Color32::from_rgb(0x61, 0x7d, 0x6b),
+            playhead: Color32::from_rgb(0x7c, 0x6f, 0x4c),
+            loop_region: Color32::from_rgba_unmultiplied(0x68, 0x7b, 0x7b, 0x20),
+            loop_brace: Color32::from_rgb(0x71, 0x79, 0x78),
+            selection: Color32::from_rgba_unmultiplied(0x68, 0x7b, 0x7b, 0x28),
             grid_beat: Color32::from_rgb(0xdf, 0xd9, 0xce),
             grid_bar: Color32::from_rgb(0xc8, 0xc0, 0xb4),
             grid_sub: Color32::from_rgb(0xeb, 0xe6, 0xdd),
-            timeline_lane: Color32::from_rgb(0xf3, 0xf0, 0xe9),
-            timeline_lane_alt: Color32::from_rgb(0xee, 0xea, 0xe2),
-            timeline_lane_selected: Color32::from_rgb(0xe4, 0xeb, 0xeb),
+            timeline_lane: Color32::from_rgb(0xe8, 0xe4, 0xda),
+            timeline_lane_alt: Color32::from_rgb(0xe4, 0xdf, 0xd5),
+            timeline_lane_selected: Color32::from_rgb(0xda, 0xe0, 0xdc),
             clip_body: Color32::from_rgb(0xdd, 0xd4, 0xc5),
             clip_midi: Color32::from_rgb(0xdd, 0xd1, 0xbd),
             clip_midi_header: Color32::from_rgb(0xc7, 0xae, 0x89),
@@ -510,6 +512,21 @@ impl Theme {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_light_scheme_is_warm_epaper_not_an_inverted_display() {
+        let theme = Theme::light();
+        let ground = crate::design::lightness_of(theme.bg);
+        let ink = crate::design::lightness_of(theme.text);
+        let dark_span = (crate::design::lightness_of(Theme::dark().bg)
+            - crate::design::lightness_of(Theme::dark().text))
+        .abs();
+
+        assert!((85.0..95.0).contains(&ground));
+        assert!((25.0..45.0).contains(&ink));
+        assert!((ground - ink).abs() < dark_span);
+        assert!(theme.bg.r() >= theme.bg.b(), "the page lost its warm cast");
+    }
 
     #[test]
     fn every_floating_surface_has_square_corners() {

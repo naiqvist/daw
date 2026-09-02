@@ -9,7 +9,7 @@
 //! Contract: `notes/20260831-pitch-lens-spec.md` §3.
 
 use crate::pitch::{Anchor, Key, cents_from_midi_table, nearest_midi};
-use crate::ui::redesign::sequence::NoteView;
+use crate::ui::sequencer::sequence::NoteView;
 
 /// The ambient key's sign for the transport bar: `D DORIAN`,
 /// `264HZ 22SHRUTI/4`. Key is state, not a mode — the sign never
@@ -337,6 +337,7 @@ mod tests {
             velocity: 100,
             probability: 1.0,
             enabled: true,
+            muted: false,
         }
     }
 

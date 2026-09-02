@@ -27,6 +27,16 @@ impl Default for GridResolution {
 }
 
 impl GridResolution {
+    /// A resolution by name, for callers that already know it (tests,
+    /// and a frame that restores one). Clamped to the supported range.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn at(denominator: u8, triplet: bool) -> Self {
+        Self {
+            denominator: denominator.clamp(MIN_DENOMINATOR, MAX_DENOMINATOR),
+            triplet,
+        }
+    }
+
     pub(crate) fn update(&mut self, ctx: &egui::Context) {
         let narrow =
             ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Num1));

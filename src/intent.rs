@@ -25,6 +25,10 @@ use std::path::PathBuf;
 pub mod sequence {
     #[derive(Clone, Copy, Debug, PartialEq)]
     pub enum Intent {
+        /// Grow or shrink the containing clip by a signed tick delta.
+        ResizeClip {
+            delta_ticks: isize,
+        },
         Toggle {
             tick: usize,
             default_pitch: crate::pitch::Pitch,
@@ -40,14 +44,44 @@ pub mod sequence {
         Clear {
             tick: usize,
         },
+        /// Remove one pitch-addressed note at `tick`.
+        RemoveNote {
+            tick: usize,
+            pitch: crate::pitch::Pitch,
+        },
         /// Move every note at `tick` by a signed tick delta (grammar: nudge).
         Nudge {
             tick: usize,
             delta_ticks: isize,
         },
+        /// Move one pitch-addressed note at `tick`, leaving its stack
+        /// siblings in place (grammar: nudge in a single-note view).
+        NudgeNote {
+            tick: usize,
+            pitch: crate::pitch::Pitch,
+            delta_ticks: isize,
+        },
+        /// Transpose every note at `tick` by a signed chromatic interval.
+        Transpose {
+            tick: usize,
+            delta_semitones: isize,
+        },
+        /// Transpose one pitch-addressed note at `tick`, leaving its stack
+        /// siblings in place.
+        TransposeNote {
+            tick: usize,
+            pitch: crate::pitch::Pitch,
+            delta_semitones: isize,
+        },
         /// Lengthen or shorten every note at `tick` (grammar: resize).
         Resize {
             tick: usize,
+            delta_ticks: isize,
+        },
+        /// Lengthen or shorten one pitch-addressed note at `tick`.
+        ResizeNote {
+            tick: usize,
+            pitch: crate::pitch::Pitch,
             delta_ticks: isize,
         },
         /// Add one note at `tick` without touching its neighbours
@@ -69,6 +103,18 @@ pub mod sequence {
         AdjustVelocity {
             tick: usize,
             delta: isize,
+        },
+        /// Adjust one pitch-addressed note's velocity.
+        AdjustNoteVelocity {
+            tick: usize,
+            pitch: crate::pitch::Pitch,
+            delta: isize,
+        },
+        /// Set one pitch-addressed note's mute state.
+        SetNoteMuted {
+            tick: usize,
+            pitch: crate::pitch::Pitch,
+            muted: bool,
         },
     }
 }

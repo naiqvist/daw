@@ -77,6 +77,19 @@ pub fn amp_to_db(amp: f32) -> f32 {
     }
 }
 
+/// dBFS back to linear amplitude — the inverse of [`amp_to_db`], and
+/// kept beside it so the pair cannot drift apart.
+///
+/// A fader is edited in decibels because that is the unit the ear works
+/// in, and stored as amplitude because that is what the engine
+/// multiplies by; this is the whole of that conversion, in one place.
+pub fn db_to_amp(db: f32) -> f32 {
+    if db.is_nan() {
+        return 0.0;
+    }
+    10.0f32.powf(db / 20.0)
+}
+
 /// dBFS to a `0..=1` position on the scale. Anything at or below the floor
 /// is 0, anything at or above the ceiling is 1, and −infinity and NaN both
 /// answer 0 rather than poisoning the geometry.
@@ -494,5 +507,17 @@ mod tests {
         );
         // Zero channels is still a meter, not a zero-width sliver.
         assert_eq!(footprint(&theme, 0).width(), mono.width());
+    }
+
+    #[test]
+    fn decibels_and_amplitude_are_each_other_s_inverse() {
+        for db in [-60.0f32, -18.0, -6.0, 0.0, 3.5] {
+            let round_trip = amp_to_db(db_to_amp(db));
+            assert!(
+                (round_trip - db).abs() < 1e-3,
+                "{db} dB became {round_trip} dB"
+            );
+        }
+        assert_eq!(db_to_amp(0.0), 1.0, "unity is not unity");
     }
 }

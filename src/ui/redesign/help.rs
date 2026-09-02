@@ -1,7 +1,7 @@
 //! The grammar's reference card, summoned with `?`.
 //!
 //! One overlay listing every sentence the keyboard speaks. The verb rows
-//! are GENERATED from `verbs::TABLE` — the same table the bijection tests
+//! are GENERATED from the verb tables — the same tables the bijection tests
 //! guard — so the help can never drift from the truth. Everything else on
 //! the card names a binding that lives in exactly one other place
 //! (keyboard.rs travel, midi_typing, the control plane's transport keys);
@@ -42,12 +42,20 @@ fn key_label(key: egui::Key) -> &'static str {
 fn verb_hint(verb: Verb) -> &'static str {
     match verb {
         Verb::Act => "the noun's primary act: trig toggles, clip opens, device bypasses",
+        Verb::Select => "toggle the noun under the cursor in the selection",
+        Verb::SelectAll => "select every peer noun on this surface",
         Verb::Delete => "remove the noun under the cursor",
         Verb::Yank => "copy into the register",
         Verb::Put => "place the register's content here",
         Verb::Duplicate => "copy N steps ahead, cursor rides along",
-        Verb::Nudge => "then an arrow: move by grid unit",
+        Verb::StackDuplicate => "copy the whole time-aligned stack N steps ahead",
+        Verb::Nudge => "then ◄ ► move in time; ▲ ▼ transpose in the roll",
+        Verb::StackNudge => "then an arrow: move every note in the stack",
         Verb::Resize => "then ◄ ►: grow or shrink",
+        Verb::StackResize => "then ◄ ►: resize every note in the stack",
+        Verb::ClipResize => "then ◄ ►: grow or shrink the containing clip",
+        Verb::Velocity => "then ▲ ▼: change one note or the selection",
+        Verb::StackVelocity => "then ▲ ▼: change every note in the stack",
         Verb::Mute => "the noun falls silent but remains",
         Verb::Solo => "the noun alone speaks",
         Verb::Arm => "arm the track head for recording",
@@ -55,6 +63,8 @@ fn verb_hint(verb: Verb) -> &'static str {
         Verb::Rename => "type a new name, ENTER commits",
         Verb::Condition => "cycle chance; 50 C names a percent",
         Verb::Search => "find by name in this panel's world",
+        Verb::StackYank => "copy the whole note stack into the register",
+        Verb::StackPut => "replace this step with the yanked stack",
     }
 }
 
@@ -71,7 +81,7 @@ pub(crate) fn show(ctx: &egui::Context, open: &mut bool) {
             let card_width = 640.0_f32.min(screen.width() - 2.0 * space::LG);
             let card = egui::Rect::from_center_size(
                 screen.center(),
-                egui::vec2(card_width, (screen.height() - 2.0 * space::LG).min(660.0)),
+                egui::vec2(card_width, (screen.height() - 2.0 * space::LG).min(900.0)),
             );
             ui.painter().rect_filled(card, 0.0, SURFACE_FRAME);
             ui.painter()
@@ -111,16 +121,56 @@ pub(crate) fn show(ctx: &egui::Context, open: &mut bool) {
 
             heading(ui, &mut y, "THE SENTENCE   [count] [hold] VERB [motion]");
             row(ui, &mut y, "4 W \u{2192}", "nudge four grid units right");
+            row(
+                ui,
+                &mut y,
+                "12 W \u{2191}",
+                "piano roll: note up one octave",
+            );
+            row(
+                ui,
+                &mut y,
+                "12 W \u{2193}",
+                "piano roll: note down one octave",
+            );
+            row(
+                ui,
+                &mut y,
+                "12 +W \u{2191}",
+                "piano roll: stack up one octave",
+            );
+            row(
+                ui,
+                &mut y,
+                "12 +W \u{2193}",
+                "piano roll: stack down one octave",
+            );
             row(ui, &mut y, "50 C", "this trig fires half the time");
             row(ui, &mut y, "ESC", "abandon the sentence in progress");
             y += space::SM;
 
-            heading(ui, &mut y, "VERBS   one key, one meaning, everywhere");
+            heading(ui, &mut y, "VERBS   one chord, one meaning, everywhere");
             for (verb, key, name) in verbs::TABLE {
                 row(
                     ui,
                     &mut y,
                     &format!("{} {}", key_label(*key), name),
+                    verb_hint(*verb),
+                );
+            }
+            for (verb, key, name) in verbs::SHIFT_TABLE {
+                row(
+                    ui,
+                    &mut y,
+                    &format!("+{} {}", key_label(*key), name),
+                    verb_hint(*verb),
+                );
+            }
+            for (verb, key, name) in verbs::COMMAND_TABLE {
+                row(
+                    ui,
+                    &mut y,
+                    &format!("CTRL {} {}", key_label(*key), name),
                     verb_hint(*verb),
                 );
             }
@@ -131,7 +181,7 @@ pub(crate) fn show(ctx: &egui::Context, open: &mut bool) {
                 ui,
                 &mut y,
                 "\u{21e7} \u{2191}\u{2193}",
-                "sequencer: edit the trig under the cursor (velocity)",
+                "piano roll: extend selection; grid: edit trig velocity",
             );
             row(
                 ui,

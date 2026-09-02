@@ -16,26 +16,41 @@
 use daw::ui::theme::Theme;
 use eframe::egui;
 
-/// The card is drawn at this logical size and this scale, so the PNG is
-/// legible rather than a postage stamp.
-const SCALE: f32 = 3.0;
+/// A card is drawn at this scale, so the PNG is legible rather than a
+/// postage stamp. A whole frame is drawn at 1:1 — it is already window
+/// sized, and three times a window is a picture nothing can open.
+const CARD_SCALE: f32 = 3.0;
+const FRAME_SCALE: f32 = 1.0;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let which = args.next().unwrap_or_else(|| "flint".into());
     let out = args.next().unwrap_or_else(|| "card.png".into());
 
-    // Snug around the card: it declares its own width, and its height
-    // is the tall-card budget plus the frame that sits outside it.
-    // Wide enough for the widest card: sibyl's nine cells.
-    let (logical_w, logical_h) = (540.0f32, 248.0f32);
-    let size = [(logical_w * SCALE) as u32, (logical_h * SCALE) as u32];
+    // A whole frame asks for a window; a card asks for a card. Snug
+    // around the card: it declares its own width, and its height is the
+    // tall-card budget plus the frame that sits outside it. Wide enough
+    // for the widest card: sibyl's nine cells.
+    let frame = which.starts_with("stage");
+    let (logical_w, logical_h) = if frame {
+        (1280.0f32, 800.0f32)
+    } else {
+        (540.0f32, 248.0f32)
+    };
+    let scale = if frame { FRAME_SCALE } else { CARD_SCALE };
+    let size = [(logical_w * scale) as u32, (logical_h * scale) as u32];
 
     // ---- egui: the context, the fonts and the theme the app uses ----
     let ctx = egui::Context::default();
-    ctx.set_pixels_per_point(SCALE);
+    ctx.set_pixels_per_point(scale);
     daw::install_fonts(&ctx);
-    let theme = Theme::dark();
+    // A light shot needs the light runtime theme too, or the stock
+    // widgets in it would be a dark window over a paper page.
+    let theme = if which.ends_with("-light") {
+        Theme::light()
+    } else {
+        Theme::dark()
+    };
 
     // ---- wgpu: a device with no window ------------------------------
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
@@ -76,7 +91,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut renderer = egui_wgpu::Renderer::new(&device, format, Default::default());
     let screen = egui_wgpu::ScreenDescriptor {
         size_in_pixels: size,
-        pixels_per_point: SCALE,
+        pixels_per_point: scale,
     };
     // ---- egui: run the card and tessellate what it drew -------------
     //
@@ -86,6 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // takes its colour from the atlas's white pixel. Drop it and the
     // renderer silently skips every mesh, which is a blank card that
     // reports 3000 vertices tessellated.
+    let mut subject = Subject::default();
     let mut jobs = Vec::new();
     for _ in 0..2 {
         let mut out = ctx.run_ui(
@@ -97,11 +113,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ..Default::default()
             },
             |ui| {
-                let bg = theme.bg;
+                let bg = if frame {
+                    daw::design::Alphabet::for_polarity(if which.ends_with("-light") {
+                        daw::design::Polarity::Light
+                    } else {
+                        daw::design::Polarity::Dark
+                    })
+                    .ground
+                    .color
+                } else {
+                    theme.bg
+                };
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(bg))
                     .show(ui, |ui| {
-                        draw(&which, ui, &theme);
+                        draw(&which, ui, &theme, &mut subject);
                     });
             },
         );
@@ -117,7 +143,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             renderer.free_texture(&id);
         }
         textures.clear();
-        jobs = ctx.tessellate(std::mem::take(&mut out.shapes), SCALE);
+        jobs = ctx.tessellate(std::mem::take(&mut out.shapes), scale);
     }
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -218,8 +244,122 @@ fn posed_history(hot: f32) -> daw::ui::device::scope::History {
 }
 
 /// Which card to draw. One arm per card that has been taught to pose.
-fn draw(which: &str, ui: &mut egui::Ui, theme: &Theme) {
+/// The stage, driven to whatever the shot is meant to show.
+///
+/// Intents rather than keystrokes: the harness has no keyboard, and the
+/// intent vocabulary is the same thing a key would have produced — so a
+/// shot is of the surface the keys reach, not of a back door into it.
+fn build_stage(which: &str) -> daw::ui::stage::Stage {
+    use daw::ui::stage::{Stage, StageIntent, Step};
+
+    let mut stage = Stage::new();
+    // The palette opens with the app and would cover the very thing most
+    // of these shots are of.
+    stage.set_palette_open(false);
+    // Set the ground the subject asks for, rather than assuming which
+    // one the frame opens on — that is a frame's choice and it moves.
+    let want = if which.ends_with("-light") {
+        daw::design::Polarity::Light
+    } else {
+        daw::design::Polarity::Dark
+    };
+    if stage.polarity() != want {
+        let _ = stage.apply(StageIntent::Ground);
+    }
+    if which.contains("full") {
+        // A session with something in it. An empty one is easy to make
+        // look tidy and tells you nothing about how the surface reads
+        // when it is carrying a piece of music.
+        for _ in 0..3 {
+            let _ = stage.apply(StageIntent::NewInstrumentTrack);
+        }
+        let _ = stage.apply(StageIntent::NewAudioTrack);
+        // Fill a scattering of slots: down a column, across a row, and a
+        // few singles, so both axes have something to line up.
+        let fills = [
+            (0usize, 0usize),
+            (0, 1),
+            (0, 2),
+            (1, 0),
+            (2, 0),
+            (1, 3),
+            (3, 2),
+            (4, 1),
+            (2, 4),
+        ];
+        for (col, row) in fills {
+            let _ = stage.apply(StageIntent::Step(Step::Up));
+            for _ in 0..8 {
+                let _ = stage.apply(StageIntent::Step(Step::Left));
+            }
+            for _ in 0..col {
+                let _ = stage.apply(StageIntent::Step(Step::Right));
+            }
+            for _ in 0..=row {
+                let _ = stage.apply(StageIntent::Step(Step::Down));
+            }
+            let _ = stage.apply(StageIntent::Enter);
+        }
+        // Rest the cursor somewhere ordinary, fire that clip, and roll:
+        // the session should say what is sounding.
+        for _ in 0..8 {
+            let _ = stage.apply(StageIntent::Step(Step::Up));
+        }
+        let _ = stage.apply(StageIntent::Step(Step::Down));
+        let _ = stage.apply(StageIntent::Launch);
+        let _ = stage.apply(StageIntent::ToggleTransport);
+    } else if which.contains("chain") {
+        // A voice and two effects, with a few values moved off their
+        // defaults so the band has something to distinguish.
+        use daw::devices::DeviceKind;
+        for kind in [DeviceKind::Poly, DeviceKind::Sat, DeviceKind::Reverb] {
+            let _ = stage.song_mut().add_device(0, kind);
+        }
+        let _ = stage.apply(StageIntent::Devices);
+        for _ in 0..3 {
+            let _ = stage.apply(StageIntent::Step(Step::Down));
+        }
+        for _ in 0..6 {
+            let _ = stage.apply(StageIntent::Param {
+                up: true,
+                coarse: false,
+            });
+        }
+    } else if which.contains("mixer") {
+        // Two more tracks, so the strip is a row of channels rather than
+        // one column — a mixer is read across, and a mixer of one says
+        // nothing about that.
+        let _ = stage.apply(StageIntent::NewInstrumentTrack);
+        let _ = stage.apply(StageIntent::NewAudioTrack);
+        let _ = stage.apply(StageIntent::Mix);
+    } else if which.contains("clip") {
+        // Down onto a slot, fill it, and go in: the sequencer and the
+        // trig inspector are what this shot is for.
+        let _ = stage.apply(StageIntent::Step(Step::Down));
+        let _ = stage.apply(StageIntent::Enter);
+        let _ = stage.apply(StageIntent::Enter);
+    }
+    stage
+}
+
+/// State a subject keeps BETWEEN the two passes.
+///
+/// The stage is a running frame rather than a pure drawing: it settles
+/// layout on the second pass like everything else here, and it must be
+/// the same stage both times or the shot would be of a surface in two
+/// different states.
+#[derive(Default)]
+struct Subject {
+    stage: Option<daw::ui::stage::Stage>,
+}
+
+fn draw(which: &str, ui: &mut egui::Ui, theme: &Theme, subject: &mut Subject) {
     use daw::ui::device;
+    if which.starts_with("stage") {
+        let stage = subject.stage.get_or_insert_with(|| build_stage(which));
+        stage.show(ui);
+        return;
+    }
     match which {
         "flint" => {
             let mut state = device::flint::FlintUi::default();

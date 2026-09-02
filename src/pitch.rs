@@ -393,6 +393,17 @@ impl Pitch {
         anchor_hz * (f64::from(self.offset_cents) / OCTAVE_CENTS).exp2()
     }
 
+    /// Move by chromatic semitones without changing the kind of address.
+    /// Twelve semitones is exactly one octave; a scale-degree pitch remains
+    /// degree-addressed and therefore still follows later key changes.
+    pub fn shifted_semitones(self, delta: isize) -> Self {
+        let cents = f64::from(self.offset_cents) + delta as f64 * 100.0;
+        Self {
+            anchor: self.anchor,
+            offset_cents: cents.clamp(f64::from(f32::MIN), f64::from(f32::MAX)) as f32,
+        }
+    }
+
     /// Territorialize: re-address onto the key, SOUND-PRESERVING. The
     /// nearest degree becomes the anchor; the exact remainder lands in
     /// `offset_cents`. `resolve()` before equals `resolve()` after (L1).
@@ -819,6 +830,19 @@ mod tests {
 
     fn close(a: f64, b: f64, relative: f64) -> bool {
         (a - b).abs() <= relative * b.abs().max(1e-12)
+    }
+
+    #[test]
+    fn chromatic_shift_preserves_the_anchor_and_twelve_semitones_is_an_octave() {
+        let key = twelve_tet(midi_to_hz(60));
+        for pitch in [Pitch::absolute(327.03), Pitch::degree(4, 1)] {
+            let up = pitch.shifted_semitones(12);
+            let down = pitch.shifted_semitones(-12);
+            assert_eq!(up.anchor, pitch.anchor);
+            assert_eq!(down.anchor, pitch.anchor);
+            assert!(close(up.resolve(&key), pitch.resolve(&key) * 2.0, 1e-6));
+            assert!(close(down.resolve(&key), pitch.resolve(&key) / 2.0, 1e-6));
+        }
     }
 
     /// L1 — round trip: striation is removable. Quantize-then-free and

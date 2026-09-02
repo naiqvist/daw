@@ -87,9 +87,21 @@ pub struct Skin {
     /// The kept choice. `None` has never chosen, and wears the app's own
     /// theme.
     chosen: Option<Pick>,
+    /// Restrict this picker to the house dark/light polarity. Stage uses
+    /// this form so its design alphabet and runtime theme cannot disagree;
+    /// the legacy frame retains the wider authored-scheme list.
+    house_only: bool,
 }
 
 impl Skin {
+    /// A picker containing only the two house-ground polarities.
+    pub fn house() -> Self {
+        Self {
+            house_only: true,
+            ..Self::default()
+        }
+    }
+
     pub fn is_open(&self) -> bool {
         self.open
     }
@@ -112,13 +124,25 @@ impl Skin {
     /// Apply whatever was kept last time, at startup. Nothing kept wears
     /// the house theme, which is what a fresh install sees.
     pub fn restore(&mut self, theme: &mut Theme) {
-        self.chosen = load_choice();
+        self.chosen = load_choice().filter(|pick| self.allows(*pick));
         self.apply(self.chosen.unwrap_or(Pick::Dark), theme);
+    }
+
+    fn choices(&self) -> Vec<Pick> {
+        if self.house_only {
+            vec![Pick::Dark, Pick::Light]
+        } else {
+            every()
+        }
+    }
+
+    fn allows(&self, pick: Pick) -> bool {
+        !self.house_only || matches!(pick, Pick::Dark | Pick::Light)
     }
 
     fn matches(&self) -> Vec<Pick> {
         let query = self.query.trim().to_lowercase();
-        every()
+        self.choices()
             .into_iter()
             .filter(|p| query.is_empty() || p.name().to_lowercase().contains(&query))
             .collect()
@@ -482,6 +506,14 @@ mod tests {
             all,
             vec![Pick::Dark, Pick::Light, Pick::Industrial, Pick::Cyberpunk]
         );
+    }
+
+    #[test]
+    fn the_house_picker_offers_only_the_two_ground_polarities() {
+        let skin = Skin::house();
+        assert_eq!(skin.matches(), vec![Pick::Dark, Pick::Light]);
+        assert!(!skin.allows(Pick::Industrial));
+        assert!(!skin.allows(Pick::Cyberpunk));
     }
 
     #[test]

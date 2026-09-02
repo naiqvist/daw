@@ -467,7 +467,10 @@ pub struct BlockSnapshot {
     /// `triple_buffer`, and a Vec cannot ride in one. A slot with no tap
     /// behind it reads 0.0, which is also what a silent track reads — the
     /// meter cannot tell the difference and does not need to.
-    pub track_peaks: [f32; graph::MAX_METERS],
+    pub track_peaks_l: [f32; graph::MAX_METERS],
+    /// The right side of the same reading. A mono node reports the same
+    /// figure on both sides.
+    pub track_peaks_r: [f32; graph::MAX_METERS],
 
     /// What each TAPPED DEVICE said about itself this block — how loud
     /// its detector heard, and how hard it worked.
@@ -525,7 +528,8 @@ impl Default for BlockSnapshot {
             frames: 0,
             peak: 0.0,
             head: [0.0; SNAPSHOT_SAMPLES],
-            track_peaks: [0.0; graph::MAX_METERS],
+            track_peaks_l: [0.0; graph::MAX_METERS],
+            track_peaks_r: [0.0; graph::MAX_METERS],
             device_readouts: [graph::Readout::default(); graph::MAX_METERS],
             mod_sources: [0.0; modulation::MAX_MOD_SOURCES],
             mod_wire_ids: [0; modulation::MAX_MOD_WIRES],
@@ -544,6 +548,19 @@ impl Default for BlockSnapshot {
 }
 
 impl BlockSnapshot {
+    /// Every track's level as a single number: the louder side, per slot.
+    ///
+    /// What a caller with room for one mark reads, and what metering a
+    /// track meant before the sides were reported separately — so a
+    /// reading taken this way cannot disagree with the one taken then.
+    pub fn track_peaks(&self) -> [f32; graph::MAX_METERS] {
+        let mut peaks = [0.0f32; graph::MAX_METERS];
+        for (slot, out) in peaks.iter_mut().enumerate() {
+            *out = self.track_peaks_l[slot].max(self.track_peaks_r[slot]);
+        }
+        peaks
+    }
+
     /// Fraction of the deadline the callback used, at the given stream config.
     /// 1.0 means the whole budget was spent; past 1.0 the deadline was missed.
     pub fn load(&self, sample_rate: u32, buffer_frames: u32) -> f64 {
@@ -1041,9 +1058,12 @@ impl Engine {
                         .map_or([graph::Readout::default(); graph::MAX_METERS], |s| {
                             *s.readouts()
                         });
-                    let track_peaks = schedule
+                    let track_peaks_l = schedule
                         .as_ref()
-                        .map_or([0.0; graph::MAX_METERS], |s| *s.peaks());
+                        .map_or([0.0; graph::MAX_METERS], |s| *s.peaks_l());
+                    let track_peaks_r = schedule
+                        .as_ref()
+                        .map_or([0.0; graph::MAX_METERS], |s| *s.peaks_r());
 
                     // Modulation, as the engine just ran it. Three fixed
                     // fills; no schedule reports zeros, which is the honest
@@ -1067,7 +1087,8 @@ impl Engine {
                         frames: output.len() / out_channels,
                         peak,
                         head,
-                        track_peaks,
+                        track_peaks_l,
+                        track_peaks_r,
                         device_readouts,
                         mod_sources,
                         mod_wire_ids,

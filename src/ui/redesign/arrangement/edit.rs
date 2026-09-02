@@ -112,6 +112,7 @@ fn add_track_of(song: &mut Song, kind: TrackKind) -> &'static str {
         sends: Vec::new(),
         is_group: false,
         folded: false,
+        chain: Vec::new(),
         depth: 0,
         input: crate::sequencing::TrackInput::default(),
         monitor: crate::sequencing::Monitor::default(),

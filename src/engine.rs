@@ -311,7 +311,7 @@ impl App {
         engine.collect_trash();
         let info = engine.info();
         let snap = engine.latest_block();
-        let peaks = snap.track_peaks;
+        let peaks = snap.track_peaks();
         // One reading per device per FRAME, from the block the engine
         // just finished. The engine reports the block's extremes rather
         // than its newest sample, so a transient between two repaints is

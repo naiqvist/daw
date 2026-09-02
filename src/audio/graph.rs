@@ -4813,7 +4813,13 @@ pub struct Schedule {
     /// Peak per meter slot since the last reset, accumulated across the
     /// segments of a block: `run` is called once per SEGMENT, so a block's
     /// peak is the max over its segments.
-    peaks: [f32; MAX_METERS],
+    ///
+    /// TWO SIDES, because a stereo track that is not centred is two
+    /// different levels and a single number cannot say which. A mono node
+    /// reports the same figure on both — that is the truth about a mono
+    /// source rather than a second meter invented to fill a space.
+    peaks_l: [f32; MAX_METERS],
+    peaks_r: [f32; MAX_METERS],
     /// Tap slot per step, or [`NO_METER`]. The readout twin of
     /// `step_meter`, and read the same way: one bounded load per step,
     /// no search.
@@ -4960,10 +4966,25 @@ impl Schedule {
         self.epoch
     }
 
-    /// Red zone: the peaks accumulated since the last [`Self::clear_peaks`],
-    /// one per meter slot. Linear amplitude, where 1.0 is full scale.
-    pub fn peaks(&self) -> &[f32; MAX_METERS] {
-        &self.peaks
+    /// Red zone: the LEFT peaks accumulated since the last
+    /// [`Self::clear_peaks`], one per meter slot. Linear amplitude, where
+    /// 1.0 is full scale.
+    pub fn peaks_l(&self) -> &[f32; MAX_METERS] {
+        &self.peaks_l
+    }
+
+    /// The right side of the same reading.
+    pub fn peaks_r(&self) -> &[f32; MAX_METERS] {
+        &self.peaks_r
+    }
+
+    /// One slot's level as a single number: the louder side. What a
+    /// caller with room for one mark asks for, and what everything that
+    /// metered a track before it had sides still means.
+    pub fn peak(&self, slot: usize) -> f32 {
+        let left = self.peaks_l.get(slot).copied().unwrap_or(0.0);
+        let right = self.peaks_r.get(slot).copied().unwrap_or(0.0);
+        left.max(right)
     }
 
     /// What every tapped device said this block.
@@ -4980,8 +5001,16 @@ impl Schedule {
     /// walk. That is one block (~5ms at 256 frames) of detector latency,
     /// which is what every sidechain has.
     pub fn clear_peaks(&mut self) {
-        self.modulation.note_peaks(&self.peaks);
-        self.peaks = [0.0; MAX_METERS];
+        // A follower detects a LEVEL, not a side, so modulation is handed
+        // the louder of the two. A fixed thirty-two-step fill on the
+        // stack: no allocation, and bounded like everything else here.
+        let mut combined = [0.0f32; MAX_METERS];
+        for (slot, out) in combined.iter_mut().enumerate() {
+            *out = self.peaks_l[slot].max(self.peaks_r[slot]);
+        }
+        self.modulation.note_peaks(&combined);
+        self.peaks_l = [0.0; MAX_METERS];
+        self.peaks_r = [0.0; MAX_METERS];
         self.readouts = [Readout::default(); MAX_METERS];
     }
 
@@ -5091,18 +5120,29 @@ impl Schedule {
             // instead, which is where a non-finite level can come from.
             if let Some(&slot) = self.step_meter.get(step_index)
                 && slot != NO_METER
-                && let Some(peak) = self.peaks.get_mut(slot as usize)
             {
-                let mut hot = *peak;
+                let slot = slot as usize;
+                let mut hot_l = self.peaks_l.get(slot).copied().unwrap_or(0.0);
                 for sample in out.l.iter() {
-                    hot = hot.max(sample.abs());
+                    hot_l = hot_l.max(sample.abs());
                 }
-                if let Some(right) = out.r.as_deref() {
-                    for sample in right.iter() {
-                        hot = hot.max(sample.abs());
+                let mut hot_r = self.peaks_r.get(slot).copied().unwrap_or(0.0);
+                match out.r.as_deref() {
+                    Some(right) => {
+                        for sample in right.iter() {
+                            hot_r = hot_r.max(sample.abs());
+                        }
                     }
+                    // Mono: both sides carry the same signal by the time
+                    // it reaches a speaker, so both sides report it.
+                    None => hot_r = hot_l,
                 }
-                *peak = hot;
+                if let Some(peak) = self.peaks_l.get_mut(slot) {
+                    *peak = hot_l;
+                }
+                if let Some(peak) = self.peaks_r.get_mut(slot) {
+                    *peak = hot_r;
+                }
             }
 
             // And what the device itself has to say, if it is tapped and
@@ -7399,7 +7439,8 @@ impl GraphSpec {
             step_meter,
             step_tap,
             readouts: [Readout::default(); MAX_METERS],
-            peaks: [0.0; MAX_METERS],
+            peaks_l: [0.0; MAX_METERS],
+            peaks_r: [0.0; MAX_METERS],
             // Wires resolve against the SAME dense correspondence the
             // name-tag directory uses, so a wire and a letter can never
             // disagree about which node a parameter lives on.
@@ -11789,6 +11830,49 @@ mod tests {
         assert!(rms(&out[..256]) < 1e-4, "a closed fader is silent");
     }
 
+    /// A meter has TWO SIDES, and a hard-panned source proves they are
+    /// measured separately rather than one figure copied twice.
+    ///
+    /// This is the test that makes an L/R pair on a mixer honest: without
+    /// it, two meters drawn from one number would be a mark claiming a
+    /// distinction the engine never made.
+    #[test]
+    fn a_panned_source_meters_on_the_side_it_was_sent_to() {
+        let mut spec = GraphSpec::default();
+        let s0 = spec.push(NodeSpec::Sine {
+            freq: 1_000.0,
+            amp: 0.5,
+        });
+        // Hard right: constant-power pan puts nothing on the left.
+        let p0 = spec.push(NodeSpec::Pan {
+            pan: 1.0,
+            gain: 1.0,
+        });
+        spec.connect(s0, p0);
+        spec.set_output(p0);
+        spec.meter(3, p0);
+        let mut sched = spec.compile(48_000, 256).unwrap();
+        let mut out = vec![0.0f32; 512];
+
+        run(&mut sched, &mut out); // the sine and the pan both ramp in
+        run(&mut sched, &mut out);
+        sched.clear_peaks();
+        run(&mut sched, &mut out);
+
+        let left = sched.peaks_l()[3];
+        let right = sched.peaks_r()[3];
+        assert!(right > 0.2, "nothing arrived on the side it was sent to");
+        assert!(
+            left < right * 0.1,
+            "the left side heard a hard-right source ({left} against {right})"
+        );
+        assert_eq!(
+            sched.peak(3),
+            right,
+            "the single-number reading is the louder side"
+        );
+    }
+
     /// Meter taps report the level at the node they are attached to, per
     /// block, and reset between blocks rather than latching.
     #[test]
@@ -11811,11 +11895,11 @@ mod tests {
         sched.clear_peaks();
         run(&mut sched, &mut out); // sine ramps in
         run(&mut sched, &mut out);
-        let peak = sched.peaks()[3];
+        let peak = sched.peak(3);
         assert!(peak > 0.2, "the tapped node's level is reported ({peak})");
         assert!(peak <= 1.0, "and it is an amplitude, not a sum");
         assert_eq!(
-            sched.peaks()[0],
+            sched.peak(0),
             0.0,
             "an untapped slot stays silent — slots are the CALLER's index"
         );
@@ -11831,7 +11915,7 @@ mod tests {
         sched.clear_peaks();
         run(&mut sched, &mut out);
         assert!(
-            sched.peaks()[3] < 1e-4,
+            sched.peak(3) < 1e-4,
             "peaks reset per window rather than latching"
         );
     }
@@ -11925,10 +12009,7 @@ mod tests {
                 sched.run(&mut out, &c);
             }
         });
-        assert!(
-            sched.peaks()[0] > 0.0,
-            "the tap did its work under the guard"
-        );
+        assert!(sched.peak(0) > 0.0, "the tap did its work under the guard");
     }
 
     /// A fader jump spreads over the whole BLOCK even when the transport

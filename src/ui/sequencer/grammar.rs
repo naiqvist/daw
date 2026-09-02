@@ -11,8 +11,8 @@
 //! `display` exists so a status line can hold it on screen instead
 //! (contract: sentence visibility, `notes/20260831-command-grammar.md`).
 
-use crate::ui::redesign::registers::Registers;
-use crate::ui::redesign::verbs::{TABLE, Verb};
+use crate::ui::sequencer::registers::Registers;
+use crate::ui::sequencer::verbs::{COMMAND_TABLE, SHIFT_TABLE, TABLE, Verb};
 use eframe::egui;
 
 /// Everything a panel needs to speak: the frame's one sentence and its
@@ -57,11 +57,10 @@ const DIGITS: [egui::Key; 10] = [
 /// One finished sentence. `verb` is `None` for a bare motion (cursor
 /// travel); `motion` is `None` for an on-the-spot verb. Never both.
 ///
-/// `held` is the hold-as-preposition qualifier: the same gesture spoken
-/// while holding the trig qualifier addresses the trig's own values (the
-/// lock side of the offset model) instead of travelling. Shift stands in
-/// for the qualifier until dedicated track/step keys exist; a hold NEVER
-/// acts on its own — it only recolours the sentence it accompanies.
+/// `held` is the hold-as-preposition qualifier on a MOTION: the same arrow
+/// spoken while holding the trig qualifier addresses the trig's own values
+/// instead of travelling. Shift on Q/W/E is different: it names the
+/// explicit stack yank/nudge/put verbs before the motion arrives.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Utterance {
     pub(crate) count: usize,
@@ -92,6 +91,22 @@ impl Sentence {
         {
             self.abandon();
             return None;
+        }
+        for (verb, key, _) in COMMAND_TABLE {
+            if ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, *key))
+                && let Some(utterance) = self.feed_verb(*verb)
+            {
+                return Some(utterance);
+            }
+        }
+        // Most-specific first. egui matches a no-modifier chord under
+        // Shift, so the shifted stack words must get the first chance.
+        for (verb, key, _) in SHIFT_TABLE {
+            if ctx.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, *key))
+                && let Some(utterance) = self.feed_verb(*verb)
+            {
+                return Some(utterance);
+            }
         }
         for (verb, key, _) in TABLE {
             if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, *key))
@@ -193,6 +208,57 @@ mod tests {
     }
 
     #[test]
+    fn stack_nudge_is_its_own_motion_verb() {
+        let mut sentence = Sentence::default();
+        assert_eq!(sentence.feed_verb(Verb::StackNudge), None);
+        let utterance = sentence.feed_motion(Motion::Right, false);
+        assert_eq!(utterance.verb, Some(Verb::StackNudge));
+        assert_eq!(utterance.motion, Some(Motion::Right));
+    }
+
+    #[test]
+    fn clip_resize_is_a_motion_verb() {
+        let mut sentence = Sentence::default();
+        assert_eq!(sentence.feed_verb(Verb::ClipResize), None);
+        let utterance = sentence.feed_motion(Motion::Left, false);
+        assert_eq!(utterance.verb, Some(Verb::ClipResize));
+        assert_eq!(utterance.motion, Some(Motion::Left));
+    }
+
+    #[test]
+    fn shift_w_is_consumed_as_stack_nudge_not_plain_nudge() {
+        let ctx = egui::Context::default();
+        let mut sentence = Sentence::default();
+        let key = |key, modifiers| egui::RawInput {
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+            ..Default::default()
+        };
+        let mut first = None;
+        let mut run = ctx.run_ui(key(egui::Key::W, egui::Modifiers::SHIFT), |ui| {
+            first = sentence.consume(ui.ctx());
+        });
+        run.textures_delta.clear();
+        assert_eq!(first, None, "a motion verb acted before its arrow");
+        assert_eq!(sentence.display(), "STACK NUDGE …");
+
+        let mut second = None;
+        let mut run = ctx.run_ui(key(egui::Key::ArrowRight, egui::Modifiers::NONE), |ui| {
+            second = sentence.consume(ui.ctx());
+        });
+        run.textures_delta.clear();
+        assert_eq!(
+            second.map(|utterance| utterance.verb),
+            Some(Some(Verb::StackNudge))
+        );
+    }
+
+    #[test]
     fn an_immediate_verb_takes_the_count_with_it() {
         let mut sentence = Sentence::default();
         sentence.feed_digit(3);
@@ -213,6 +279,31 @@ mod tests {
         assert_eq!(monitor.verb, Some(Verb::Monitor));
         assert_eq!(arm.motion, None);
         assert_eq!(monitor.motion, None);
+    }
+
+    #[test]
+    fn command_a_speaks_the_reusable_select_all_verb() {
+        let ctx = egui::Context::default();
+        let mut sentence = Sentence::default();
+        let mut utterance = None;
+        let mut run = ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::A,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::COMMAND,
+                }],
+                ..Default::default()
+            },
+            |ui| utterance = sentence.consume(ui.ctx()),
+        );
+        run.textures_delta.clear();
+        assert_eq!(
+            utterance.and_then(|words| words.verb),
+            Some(Verb::SelectAll)
+        );
     }
 
     #[test]

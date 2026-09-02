@@ -19,6 +19,7 @@ pub mod pitch;
 pub mod render;
 pub mod sequencing;
 pub mod slice;
+pub mod song_graph;
 pub mod targets;
 pub mod tempo;
 pub mod theory;

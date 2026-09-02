@@ -109,42 +109,16 @@ fn sequence_ticks_to_beats(ticks: usize) -> f64 {
 const SONG_PATTERN_STEP_TICKS: usize = daw::sequencing::PATTERN_STEP_TICKS;
 
 fn song_pattern_length(song: &daw::sequencing::Song, id: daw::sequencing::PatternId) -> usize {
-    song.tracks
-        .iter()
-        .flat_map(|track| &track.blocks)
-        .find(|block| block.pattern_id == id)
-        .map_or(daw::sequencing::DEFAULT_PATTERN_TICKS, |block| {
-            block.length_ticks
-        })
+    daw::ui::sequencer::pattern_length(song, id)
 }
 
 fn song_pattern_note_views(
     pattern: &daw::sequencing::Pattern,
     key: &daw::pitch::Key,
 ) -> Vec<redesign_sequence::NoteView> {
-    (0..daw::sequencing::PATTERN_STEPS)
-        .flat_map(|step| {
-            let trig = pattern.trig(step);
-            trig.enabled
-                .then_some(trig)
-                .into_iter()
-                .flat_map(move |trig| {
-                    trig.notes.iter().map(move |note| {
-                        song_note_view(
-                            note,
-                            step * SONG_PATTERN_STEP_TICKS,
-                            trig.probability,
-                            trig.enabled,
-                            key,
-                        )
-                    })
-                })
-        })
-        .collect()
+    daw::ui::sequencer::note_views(pattern, key)
 }
 
-/// Green-zone resolution, once per frame: the view carries the finished
-/// numbers, and the honest flag that the legacy path is approximating.
 fn song_note_view(
     note: &daw::sequencing::Note,
     start_ticks: usize,
@@ -152,25 +126,12 @@ fn song_note_view(
     enabled: bool,
     key: &daw::pitch::Key,
 ) -> redesign_sequence::NoteView {
-    let hz = note.pitch.resolve(key);
-    redesign_sequence::NoteView {
-        pitch: note.pitch,
-        hz,
-        midi: daw::pitch::nearest_midi(hz),
-        approx: daw::pitch::cents_from_midi_table(hz).abs() > APPROX_CENTS,
-        start_ticks,
-        length_ticks: note.length_ticks,
-        micro_ticks: note.micro_ticks,
-        velocity: note.velocity,
-        probability,
-        enabled,
-    }
+    daw::ui::sequencer::note_view(note, start_ticks, probability, enabled, key)
 }
 
 /// Below this remainder the legacy MIDI path reproduces a pitch exactly
 /// (float noise is orders of magnitude smaller); above it the trig wears
 /// the `≈` playback-approximation sign.
-const APPROX_CENTS: f64 = 0.05;
 
 /// One whole trig a recorded MIDI take WOULD write. The complete `after`
 /// value matters: the approved collision rule replaces the addressed trig,
@@ -266,120 +227,7 @@ fn apply_song_pattern_intents(
     pattern: &mut daw::sequencing::Pattern,
     intents: &[redesign_sequence::Intent],
 ) -> Option<&'static str> {
-    let mut notice = None;
-    for intent in intents {
-        use redesign_sequence::Intent;
-        let tick = match *intent {
-            Intent::Toggle { tick, .. }
-            | Intent::SetPrimary { tick, .. }
-            | Intent::Clear { tick }
-            | Intent::Nudge { tick, .. }
-            | Intent::Resize { tick, .. }
-            | Intent::AddNote { tick, .. }
-            | Intent::SetProbability { tick, .. }
-            | Intent::AdjustVelocity { tick, .. } => tick,
-        };
-        // Song patterns have one address per sixteenth. Finer sequence-grid
-        // ticks deliberately round down into the containing 12-tick step.
-        let step = tick / SONG_PATTERN_STEP_TICKS;
-        if step >= daw::sequencing::PATTERN_STEPS {
-            notice = Some("sequence step is outside the pattern");
-            continue;
-        }
-
-        match *intent {
-            Intent::Toggle {
-                default_pitch,
-                default_length_ticks,
-                default_velocity,
-                ..
-            } => pattern.toggle(
-                step,
-                daw::sequencing::Note::with_pitch(
-                    default_pitch,
-                    default_length_ticks,
-                    default_velocity,
-                ),
-            ),
-            Intent::SetPrimary {
-                pitch,
-                length_ticks,
-                velocity,
-                ..
-            } => pattern.set_primary(
-                step,
-                daw::sequencing::Note::with_pitch(pitch, length_ticks, velocity),
-            ),
-            Intent::Clear { .. } => pattern.clear(step),
-            Intent::AddNote {
-                pitch,
-                length_ticks,
-                velocity,
-                probability,
-                ..
-            } => {
-                pattern.add_tone(
-                    step,
-                    daw::sequencing::Note::with_pitch(pitch, length_ticks, velocity),
-                );
-                pattern.trig_mut(step).probability = probability.clamp(0.01, 1.0);
-            }
-            Intent::SetProbability { probability, .. } => {
-                pattern.trig_mut(step).probability = probability.clamp(0.01, 1.0);
-            }
-            Intent::AdjustVelocity { delta, .. } => {
-                let trig = pattern.trig_mut(step);
-                if trig.notes.is_empty() {
-                    notice = Some("velocity: no trig here");
-                    continue;
-                }
-                for note in &mut trig.notes {
-                    note.velocity =
-                        (isize::from(note.velocity).saturating_add(delta)).clamp(1, 127) as u8;
-                }
-            }
-            Intent::Resize { delta_ticks, .. } => {
-                let trig = pattern.trig_mut(step);
-                if trig.notes.is_empty() {
-                    notice = Some("resize: no trig here");
-                    continue;
-                }
-                for note in &mut trig.notes {
-                    note.length_ticks = note.length_ticks.saturating_add_signed(delta_ticks).max(1);
-                }
-            }
-            Intent::Nudge { delta_ticks, .. } => {
-                if pattern.trig(step).notes.is_empty() {
-                    notice = Some("nudge: no trig here");
-                    continue;
-                }
-                let Some(target_tick) = isize::try_from(tick)
-                    .ok()
-                    .and_then(|tick| tick.checked_add(delta_ticks))
-                    .filter(|target| *target >= 0)
-                    .map(|target| target as usize)
-                else {
-                    notice = Some("nudge blocked at the pattern edge");
-                    continue;
-                };
-                let target_step = target_tick / SONG_PATTERN_STEP_TICKS;
-                if target_step >= daw::sequencing::PATTERN_STEPS {
-                    notice = Some("nudge blocked at the pattern edge");
-                    continue;
-                }
-                if target_step == step {
-                    continue;
-                }
-                if !pattern.trig(target_step).notes.is_empty() {
-                    notice = Some("nudge blocked by an occupied step");
-                    continue;
-                }
-                let trig = std::mem::take(pattern.trig_mut(step));
-                *pattern.trig_mut(target_step) = trig;
-            }
-        }
-    }
-    notice
+    pattern.apply_all(intents)
 }
 
 impl App {
@@ -402,6 +250,7 @@ impl App {
         for intent in intents {
             use redesign_sequence::Intent;
             let (tick, required_end) = match *intent {
+                Intent::ResizeClip { .. } => (0, 0),
                 Intent::Toggle {
                     tick,
                     default_length_ticks,
@@ -416,10 +265,17 @@ impl App {
                     tick, length_ticks, ..
                 } => (tick, tick.saturating_add(length_ticks)),
                 Intent::Clear { tick }
+                | Intent::RemoveNote { tick, .. }
                 | Intent::Nudge { tick, .. }
+                | Intent::NudgeNote { tick, .. }
+                | Intent::Transpose { tick, .. }
+                | Intent::TransposeNote { tick, .. }
                 | Intent::Resize { tick, .. }
+                | Intent::ResizeNote { tick, .. }
                 | Intent::SetProbability { tick, .. }
-                | Intent::AdjustVelocity { tick, .. } => (tick, tick),
+                | Intent::AdjustVelocity { tick, .. }
+                | Intent::AdjustNoteVelocity { tick, .. }
+                | Intent::SetNoteMuted { tick, .. } => (tick, tick),
             };
 
             // A fixed 64-address grid must never accept an inaudible note
@@ -455,6 +311,18 @@ impl App {
             let clip = &mut self.arrangement.clips[track][index];
             let at_tick = |note: &Note| beats_to_sequence_ticks(note.start) == tick;
             match *intent {
+                Intent::ResizeClip { delta_ticks } => {
+                    let ticks = beats_to_sequence_ticks(f64::from(clip.len));
+                    let next = ticks.saturating_add_signed(delta_ticks).clamp(
+                        SONG_PATTERN_STEP_TICKS,
+                        daw::sequencing::DEFAULT_PATTERN_TICKS,
+                    );
+                    if next == ticks {
+                        self.notice = Some("clip resize blocked at the pattern edge".to_owned());
+                    } else {
+                        clip.len = sequence_ticks_to_beats(next) as f32;
+                    }
+                }
                 Intent::Toggle {
                     default_pitch,
                     default_length_ticks,
@@ -513,6 +381,18 @@ impl App {
                     }
                 }
                 Intent::Clear { .. } => clip.notes.retain(|note| !at_tick(note)),
+                Intent::RemoveNote { pitch, .. } => {
+                    let midi = as_midi(pitch);
+                    let Some(index) = clip
+                        .notes
+                        .iter()
+                        .position(|note| at_tick(note) && note.pitch == midi)
+                    else {
+                        self.notice = Some("delete: no note here".to_owned());
+                        continue;
+                    };
+                    clip.notes.remove(index);
+                }
                 Intent::AddNote {
                     pitch,
                     length_ticks,
@@ -540,6 +420,30 @@ impl App {
                     if !touched {
                         self.notice = Some("velocity: no trig here".to_owned());
                     }
+                }
+                Intent::AdjustNoteVelocity { pitch, delta, .. } => {
+                    let midi = as_midi(pitch);
+                    let Some(note) = clip
+                        .notes
+                        .iter_mut()
+                        .find(|note| at_tick(note) && note.pitch == midi)
+                    else {
+                        self.notice = Some("velocity: no note here".to_owned());
+                        continue;
+                    };
+                    note.vel = (i16::from(note.vel) + delta as i16).clamp(1, 127) as u8;
+                }
+                Intent::SetNoteMuted { pitch, muted, .. } => {
+                    let midi = as_midi(pitch);
+                    let Some(note) = clip
+                        .notes
+                        .iter_mut()
+                        .find(|note| at_tick(note) && note.pitch == midi)
+                    else {
+                        self.notice = Some("mute: no note here".to_owned());
+                        continue;
+                    };
+                    note.muted = muted;
                 }
                 Intent::SetProbability { probability, .. } => {
                     let mut touched = false;
@@ -573,6 +477,87 @@ impl App {
                         note.start = sequence_ticks_to_beats(target as usize);
                     }
                 }
+                Intent::NudgeNote {
+                    pitch, delta_ticks, ..
+                } => {
+                    let midi = as_midi(pitch);
+                    let Some(source) = clip
+                        .notes
+                        .iter()
+                        .position(|note| at_tick(note) && note.pitch == midi)
+                    else {
+                        self.notice = Some("nudge: no note here".to_owned());
+                        continue;
+                    };
+                    let clip_end = beats_to_sequence_ticks(f64::from(clip.len));
+                    let target = tick as isize + delta_ticks;
+                    let blocked = target < 0
+                        || target as usize + beats_to_sequence_ticks(clip.notes[source].len)
+                            > clip_end;
+                    if blocked {
+                        self.notice = Some("nudge blocked at the clip edge".to_owned());
+                        continue;
+                    }
+                    let target = target as usize;
+                    if clip.notes.iter().enumerate().any(|(index, note)| {
+                        index != source
+                            && beats_to_sequence_ticks(note.start) == target
+                            && note.pitch == midi
+                    }) {
+                        self.notice = Some("nudge blocked by an occupied note".to_owned());
+                        continue;
+                    }
+                    clip.notes[source].start = sequence_ticks_to_beats(target);
+                }
+                Intent::Transpose {
+                    delta_semitones, ..
+                } => {
+                    let delta = delta_semitones;
+                    let mut touched = false;
+                    let blocked = clip.notes.iter().filter(|note| at_tick(note)).any(|note| {
+                        touched = true;
+                        !(0..=127).contains(&(isize::from(note.pitch) + delta))
+                    });
+                    if !touched {
+                        self.notice = Some("transpose: no trig here".to_owned());
+                        continue;
+                    }
+                    if blocked {
+                        self.notice = Some("transpose blocked at the pitch edge".to_owned());
+                        continue;
+                    }
+                    for note in clip.notes.iter_mut().filter(|note| at_tick(note)) {
+                        note.pitch = (isize::from(note.pitch) + delta) as u8;
+                    }
+                }
+                Intent::TransposeNote {
+                    pitch,
+                    delta_semitones,
+                    ..
+                } => {
+                    let midi = as_midi(pitch);
+                    let Some(source) = clip
+                        .notes
+                        .iter()
+                        .position(|note| at_tick(note) && note.pitch == midi)
+                    else {
+                        self.notice = Some("transpose: no note here".to_owned());
+                        continue;
+                    };
+                    let target = isize::from(midi) + delta_semitones;
+                    if !(0..=127).contains(&target) {
+                        self.notice = Some("transpose blocked at the pitch edge".to_owned());
+                        continue;
+                    }
+                    let target = target as u8;
+                    if clip.notes.iter().enumerate().any(|(index, note)| {
+                        index != source && at_tick(note) && note.pitch == target
+                    }) {
+                        self.notice = Some("transpose blocked by an occupied note".to_owned());
+                        continue;
+                    }
+                    clip.notes[source].pitch = target;
+                }
                 Intent::Resize { delta_ticks, .. } => {
                     let clip_end = beats_to_sequence_ticks(f64::from(clip.len));
                     let mut touched = false;
@@ -585,6 +570,23 @@ impl App {
                     if !touched {
                         self.notice = Some("resize: no trig here".to_owned());
                     }
+                }
+                Intent::ResizeNote {
+                    pitch, delta_ticks, ..
+                } => {
+                    let midi = as_midi(pitch);
+                    let clip_end = beats_to_sequence_ticks(f64::from(clip.len));
+                    let Some(note) = clip
+                        .notes
+                        .iter_mut()
+                        .find(|note| at_tick(note) && note.pitch == midi)
+                    else {
+                        self.notice = Some("resize: no note here".to_owned());
+                        continue;
+                    };
+                    let length = beats_to_sequence_ticks(note.len) as isize + delta_ticks;
+                    let length = (length.max(1) as usize).min(clip_end.saturating_sub(tick));
+                    note.len = sequence_ticks_to_beats(length.max(1));
                 }
             }
             clip.notes.sort_by(|a, b| {
@@ -2152,7 +2154,6 @@ impl App {
 
         self.ensure_song_twins(&song);
         self.order_song_twins(&song);
-        let any_solo = song.tracks.iter().any(|track| track.solo);
         // The tempo map, resolved once for the whole projection. The
         // reference is the transport's own tempo, so an empty map warps
         // nothing at all.
@@ -2203,7 +2204,7 @@ impl App {
             // schedule. Project the Song's solo-precedence rule onto that
             // real silence path; keep legacy solo off so Song solo cannot
             // accidentally silence unrelated legacy tracks.
-            projected.mute = !song_track_audible(&song.tracks, song_index, any_solo);
+            projected.mute = !song.audible(song_index);
             projected.solo = false;
             // The curves travel with the track. Song automation is the
             // offset model's BASE, and the legacy compiler already bakes
@@ -2348,64 +2349,6 @@ impl App {
     }
 }
 
-fn song_parent_group(tracks: &[daw::sequencing::Track], index: usize) -> Option<usize> {
-    let depth = tracks.get(index)?.depth;
-    if depth == 0 {
-        return None;
-    }
-    tracks[..index]
-        .iter()
-        .rposition(|track| track.is_group && track.depth + 1 == depth)
-}
-
-fn song_group_members(tracks: &[daw::sequencing::Track], index: usize) -> std::ops::Range<usize> {
-    let Some(group) = tracks.get(index).filter(|track| track.is_group) else {
-        return index..index;
-    };
-    let mut end = index + 1;
-    while tracks
-        .get(end)
-        .is_some_and(|track| track.depth > group.depth)
-    {
-        end += 1;
-    }
-    index + 1..end
-}
-
-fn song_muted_in_place(tracks: &[daw::sequencing::Track], index: usize) -> bool {
-    let mut at = index;
-    loop {
-        if tracks.get(at).is_some_and(|track| track.muted) {
-            return true;
-        }
-        match song_parent_group(tracks, at) {
-            Some(parent) => at = parent,
-            None => return false,
-        }
-    }
-}
-
-fn song_solo_in_scope(tracks: &[daw::sequencing::Track], index: usize) -> bool {
-    let Some(track) = tracks.get(index) else {
-        return false;
-    };
-    if track.solo {
-        return true;
-    }
-    let mut at = index;
-    while let Some(parent) = song_parent_group(tracks, at) {
-        if tracks[parent].solo {
-            return true;
-        }
-        at = parent;
-    }
-    song_group_members(tracks, index).any(|member| song_solo_in_scope(tracks, member))
-}
-
-fn song_track_audible(tracks: &[daw::sequencing::Track], index: usize, any_solo: bool) -> bool {
-    !song_muted_in_place(tracks, index) && (!any_solo || song_solo_in_scope(tracks, index))
-}
-
 /// Song automation, copied onto the legacy track the compiler reads.
 ///
 /// The ONLY conversion is the time unit — song time is ticks, the legacy
@@ -2498,7 +2441,7 @@ fn project_block(
                     start: (note_beat - clip_beat).max(0.0),
                     len: (note_end - note_beat).max(1.0 / TICKS_PER_BEAT as f64),
                     vel: note.velocity,
-                    muted: false,
+                    muted: note.muted,
                     plocks: Vec::new(),
                     prob: trig.probability,
                     cond: None,
@@ -2601,6 +2544,7 @@ mod projection_tests {
             sends: Vec::new(),
             is_group: false,
             folded: false,
+            chain: Vec::new(),
             depth: 0,
             input: daw::sequencing::TrackInput::None,
             monitor: daw::sequencing::Monitor::Off,
@@ -2653,6 +2597,7 @@ mod projection_tests {
             sends: Vec::new(),
             is_group: false,
             folded: false,
+            chain: Vec::new(),
             depth: 0,
             input: daw::sequencing::TrackInput::None,
             monitor: daw::sequencing::Monitor::Off,
@@ -3014,13 +2959,13 @@ mod projection_tests {
         song.tracks[0].is_group = true;
         song.tracks[0].solo = true;
         song.tracks.push(child);
-        assert!(song_track_audible(&song.tracks, 0, true));
-        assert!(song_track_audible(&song.tracks, 1, true));
+        assert!(song.audible(0));
+        assert!(song.audible(1));
 
         song.tracks[0].solo = false;
         song.tracks[1].solo = true;
-        assert!(song_track_audible(&song.tracks, 0, true));
-        assert!(song_track_audible(&song.tracks, 1, true));
+        assert!(song.audible(0));
+        assert!(song.audible(1));
     }
 
     #[test]
@@ -3440,10 +3385,9 @@ mod projection_tests {
         song.tracks[0].solo = true;
         song.tracks[1].muted = false;
 
-        let any_solo = song.tracks.iter().any(|track| track.solo);
-        assert!(song_track_audible(&song.tracks, 0, any_solo));
+        assert!(song.audible(0));
         assert!(
-            !song_track_audible(&song.tracks, 1, any_solo),
+            !song.audible(1),
             "an unmuted track is still silent beside a solo"
         );
     }
@@ -3841,6 +3785,29 @@ mod projection_tests {
         let clip = project_block_steady(&song, &song.tracks[0].blocks[0], 9);
         assert_eq!(clip.notes.len(), 1);
         assert!((clip.notes[0].prob - 0.75).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn per_note_mute_reaches_the_projected_note() {
+        let mut song = Song::default();
+        let pattern_id = song.tracks[0].blocks[0].pattern_id;
+        let pattern = song.pattern_mut(pattern_id).expect("default pattern");
+        pattern.set_primary(0, SongNote::new(60, 12, 100));
+        assert_eq!(
+            apply_song_pattern_intents(
+                pattern,
+                &[redesign_sequence::Intent::SetNoteMuted {
+                    tick: 0,
+                    pitch: daw::pitch::Pitch::from_midi(60),
+                    muted: true,
+                }],
+            ),
+            None
+        );
+
+        let clip = project_block_steady(&song, &song.tracks[0].blocks[0], 9);
+        assert_eq!(clip.notes.len(), 1);
+        assert!(clip.notes[0].muted);
     }
 
     #[test]

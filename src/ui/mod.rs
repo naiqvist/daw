@@ -78,6 +78,7 @@ pub mod panels;
 pub mod prefs;
 /// The new application frame, built independently from the legacy panels.
 pub mod redesign;
+pub mod sequencer;
 /// The replacement Session surface. Registered now that `session_bridge`
 /// exists to adapt it — before the adapters, this would have been a
 /// second authority for what plays.

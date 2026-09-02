@@ -566,6 +566,7 @@ fn speak(
                 ));
             }
         }
+        (Some(Verb::SelectAll), _) => state.select_all(song),
         (Some(Verb::Delete), _) => {
             state.notice = Some(edit::apply(
                 edit::Command::DeleteClips,
@@ -1577,6 +1578,23 @@ mod tests {
 
         assert!(song.tracks[0].blocks.is_empty());
         assert_eq!(state.notice, Some("CLIP DELETED"));
+    }
+
+    #[test]
+    fn select_all_reuses_delete_across_the_arrangement() {
+        let mut song = Song::default();
+        song.add_track(crate::sequencing::TrackKind::Instrument);
+        let mut state = ArrangementState::default();
+
+        utter(&mut state, &mut song, Some(Verb::SelectAll), None, 1);
+        let selection = state.selection();
+        assert_eq!(selection.first_track, 0);
+        assert_eq!(selection.last_track, song.tracks.len() - 1);
+        assert_eq!(selection.first_beat, 0);
+        assert_eq!(selection.end_beat, super::super::state::WORLD_BEATS);
+
+        utter(&mut state, &mut song, Some(Verb::Delete), None, 1);
+        assert!(song.tracks.iter().all(|track| track.blocks.is_empty()));
     }
 
     #[test]

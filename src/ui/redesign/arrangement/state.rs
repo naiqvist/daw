@@ -219,6 +219,20 @@ impl ArrangementState {
         self.refusal = None;
     }
 
+    /// The arrangement's interpretation of the shared SELECT ALL verb:
+    /// every track across the whole editable song world.
+    pub(super) fn select_all(&mut self, song: &Song) {
+        self.anchor = Some(Locus { track: 0, beat: 0 });
+        self.cursor = Locus {
+            track: song.tracks.len().saturating_sub(1),
+            beat: WORLD_BEATS.saturating_sub(1),
+        };
+        self.selected_block = None;
+        self.notice = None;
+        self.refusal = None;
+        self.follow_cursor();
+    }
+
     pub(super) fn select_block(
         &mut self,
         id: BlockId,

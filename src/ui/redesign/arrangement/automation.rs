@@ -252,12 +252,20 @@ impl AutomationLane {
 const fn verb_name(verb: Verb) -> &'static str {
     match verb {
         Verb::Act => "ACT",
+        Verb::Select => "SELECT",
+        Verb::SelectAll => "SELECT ALL",
         Verb::Delete => "DELETE",
         Verb::Yank => "YANK",
         Verb::Put => "PUT",
         Verb::Duplicate => "DUPLICATE",
+        Verb::StackDuplicate => "STACK DUPLICATE",
         Verb::Nudge => "NUDGE",
+        Verb::StackNudge => "STACK NUDGE",
         Verb::Resize => "RESIZE",
+        Verb::StackResize => "STACK RESIZE",
+        Verb::ClipResize => "CLIP RESIZE",
+        Verb::Velocity => "VELOCITY",
+        Verb::StackVelocity => "STACK VELOCITY",
         Verb::Mute => "MUTE",
         Verb::Solo => "SOLO",
         Verb::Arm => "ARM",
@@ -265,6 +273,8 @@ const fn verb_name(verb: Verb) -> &'static str {
         Verb::Rename => "RENAME",
         Verb::Condition => "CONDITION",
         Verb::Search => "SEARCH",
+        Verb::StackYank => "STACK YANK",
+        Verb::StackPut => "STACK PUT",
     }
 }
 
