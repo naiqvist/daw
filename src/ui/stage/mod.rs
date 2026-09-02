@@ -35,7 +35,8 @@ mod vitals;
 
 use crate::design::codex::Sign;
 use crate::design::kit::{self, Weight};
-use crate::design::{circuit, grain};
+use crate::design::motion::{self, Phase};
+use crate::design::{block, circuit, grain};
 
 use crate::design;
 use crate::devices::DeviceKind;
@@ -118,7 +119,15 @@ const TRACK_H: f32 = 64.0;
 /// A layout dimension: two digits of the smallest type and a breath, and
 /// it is reserved whether or not there are scenes to number, so the
 /// columns never shift when the first scene arrives.
-const ADDRESS_W: f32 = 28.0;
+const ADDRESS_W: f32 = 44.0;
+
+/// The centre of one shown track's board bus.
+///
+/// Kept pure so every session layer asks the same geometry rather than
+/// independently approximating where a column carries current.
+fn bus_x(field: egui::Rect, slot: usize) -> f32 {
+    Stage::head_rect(field, slot).center().x
+}
 
 /// Between one track column and the next.
 ///
@@ -2293,6 +2302,10 @@ impl Stage {
     fn draw(&mut self, ui: &mut egui::Ui) {
         let whole = ui.available_rect_before_wrap();
         let painter = ui.painter().clone();
+        let phase = Phase::of(
+            self.transport.motion().is_rolling(),
+            self.transport.beat_phase(),
+        );
 
         // The constitution: a thin fixed periphery around one sovereign
         // field. The strips hold display only; nothing in them is ever
@@ -2525,7 +2538,7 @@ impl Stage {
             // shows whatever clip the session cursor is on, and is only
             // FOCUSED once entered — Ableton's session over its clip
             // detail, an Elektron's track keys over its trig keys.
-            self.draw_field(&painter, session);
+            self.draw_field(&painter, session, phase);
             // One detail region, and the band and the sequencer are two
             // things to put in it. The band wins while it is showing:
             // sound design and sequencing are separate spaces, and the
@@ -2878,16 +2891,19 @@ impl Stage {
         }
     }
 
-    fn draw_field(&self, painter: &egui::Painter, avail: egui::Rect) {
+    fn draw_field(&self, painter: &egui::Painter, avail: egui::Rect, phase: Phase) {
         if let Some((lattice, cursor_shade)) = self.session_lattice() {
+            if !self.mixing {
+                self.draw_board(painter, avail, phase);
+            }
             self.draw_tracks(painter, avail, lattice, cursor_shade);
-            self.draw_master(painter, avail, cursor_shade);
+            self.draw_master(painter, avail, cursor_shade, phase);
             // One lattice, two contents. The heads above are the same
             // heads either way — only what hangs beneath them changes.
             if self.mixing {
                 self.draw_mixer(painter, avail, lattice, cursor_shade);
             } else {
-                self.draw_scenes(painter, avail, lattice, cursor_shade);
+                self.draw_scenes(painter, avail, lattice, cursor_shade, phase);
             }
             return;
         }
@@ -3035,6 +3051,84 @@ impl Stage {
         }
     }
 
+    /// The session's circuit board: one bus per shown track, one rail per
+    /// shown scene, and a junction wherever they meet.  It is painted
+    /// before heads and cells so those objects read as components soldered
+    /// over a continuous board rather than as a grid laid on top of them.
+    fn draw_board(&self, painter: &egui::Painter, field: egui::Rect, phase: Phase) {
+        let tracks = self.strip_window(field);
+        if tracks.is_empty() {
+            return;
+        }
+        let rows = self.scene_window(field);
+        let margin = design::px(design::space::ROOM);
+        let head = Self::head_rect(field, 0);
+        let seam = Self::master_rect(field).left() - column_gap() * 0.5;
+        let area = egui::Rect::from_min_max(
+            egui::pos2(head.left(), head.bottom()),
+            egui::pos2(seam, field.bottom() - margin),
+        );
+        if !area.is_positive() {
+            return;
+        }
+
+        let cols: Vec<f32> = tracks
+            .clone()
+            .enumerate()
+            .map(|(slot, _)| bus_x(field, slot))
+            .collect();
+        let row_y: Vec<f32> = rows
+            .clone()
+            .enumerate()
+            .map(|(line, _)| {
+                scenes::slot_beneath(head, line, row_gap(), section_gap())
+                    .center()
+                    .y
+            })
+            .collect();
+        let edge = self.alphabet().edge.color;
+        let ground = self.alphabet().ground.color;
+        let board_ink = edge.gamma_multiply(0.72);
+        let dots = edge.gamma_multiply(0.38);
+        kit::cached(
+            painter,
+            egui::Id::new("stage-session-board"),
+            area,
+            (
+                board_ink,
+                ground,
+                tracks.len(),
+                rows.len(),
+                tracks.start,
+                rows.start,
+            ),
+            |out| {
+                circuit::lattice(out, area, design::px(design::space::VAST), dots);
+                circuit::board(out, area, &cols, &row_y, board_ink, ground);
+            },
+        );
+
+        if phase.rolling {
+            for (slot, track) in tracks.enumerate() {
+                if self.playing_on(track).is_none() {
+                    continue;
+                }
+                let x = bus_x(field, slot);
+                let mut shapes = Vec::new();
+                circuit::dashes(
+                    &mut shapes,
+                    &[egui::pos2(x, area.top()), egui::pos2(x, area.bottom())],
+                    phase.dash(),
+                    Weight::Heavy,
+                    self.alphabet().live_dim.color,
+                );
+                for shape in shapes {
+                    painter.add(shape);
+                }
+            }
+        }
+    }
+
     /// The track strip: every track in the song, across the top of the
     /// field, one column each. Identity only — name and kind — because a
     /// surface has to say what its objects ARE before it can say what they
@@ -3067,28 +3161,57 @@ impl Stage {
             let index = first + slot;
             let rect = Self::head_rect(field, slot);
             let focused = lattice.cursor() == Some((index, 0));
-            // No outline: the column is a lighter plane than the field
-            // it sits on, and the gap between columns is the field showing
-            // through. The edge was drawing a boundary the value already
-            // drew.
-            ornament::plane(
+            let fill = if focused { cursor_shade } else { self.square() };
+            let figure_ink = if focused {
+                self.alphabet().ground.color
+            } else {
+                self.alphabet().ink.color
+            };
+            let rail_x = rect.left() + 18.0;
+            let content_x = rect.left() + 36.0;
+            kit::cached(
                 painter,
+                egui::Id::new(("stage-track-head", index)),
                 rect,
-                if focused { cursor_shade } else { self.square() },
-                // The strip is ONE band with two shoulders, not a row of
-                // separately bevelled tiles: the first track gives up its
-                // left corner, the last its right, and everything between
-                // them is square. A cut in the middle of a run would be a
-                // shoulder where the band does not end.
-                //
-                // The ends are the SONG's, not the window's, so scrolling
-                // never moves a shoulder onto a track that is not one —
-                // ornament that shifted as the view moved would be
-                // varying with something it does not mean.
-                match (index == 0, index + 1 == heads.len()) {
-                    (true, _) => Some(ornament::Cut::TopLeft),
-                    (_, true) => Some(ornament::Cut::TopRight),
-                    _ => None,
+                (fill, figure_ink),
+                |out| {
+                    circuit::octagon(
+                        out,
+                        rect,
+                        circuit::CHAMFER,
+                        Some(fill),
+                        Some((Weight::Hair, self.alphabet().edge.color)),
+                    );
+                    circuit::rail(
+                        out,
+                        egui::pos2(rail_x, rect.top() + 7.0),
+                        egui::pos2(rail_x, rect.bottom() - 7.0),
+                        &[0.0, 1.0],
+                        figure_ink,
+                    );
+                    Sign::General((index % 32) as u8).paint(
+                        out,
+                        egui::Rect::from_center_size(
+                            egui::pos2(rail_x, rect.center().y - 2.0),
+                            egui::Vec2::splat(16.0),
+                        ),
+                        Weight::Hair,
+                        figure_ink,
+                    );
+                    circuit::pad(
+                        out,
+                        egui::pos2(rail_x, rect.bottom() - 1.0),
+                        circuit::PAD,
+                        figure_ink,
+                        true,
+                    );
+                    circuit::pad(
+                        out,
+                        egui::pos2(rect.right() - 18.0, rect.bottom() - 1.0),
+                        circuit::PAD,
+                        figure_ink,
+                        true,
+                    );
                 },
             );
             if focused {
@@ -3171,19 +3294,19 @@ impl Stage {
                     .rect
                     .width()
                     .max(1.0);
-                let cells =
-                    (((rect.width() - pad * 2.0 - sigil_room) / cell).floor()).max(1.0) as usize;
+                let cells = (((rect.right() - pad - sigil_room - content_x) / cell).floor())
+                    .max(1.0) as usize;
                 name.chars().take(cells).collect::<String>()
             };
             painter.text(
-                egui::pos2(rect.min.x + pad, rect.min.y + pad),
+                egui::pos2(content_x, rect.min.y + pad),
                 egui::Align2::LEFT_TOP,
                 name,
                 name_font.clone(),
                 name_ink,
             );
             painter.text(
-                egui::pos2(rect.min.x + pad, rect.max.y - pad),
+                egui::pos2(content_x, rect.max.y - pad),
                 egui::Align2::LEFT_BOTTOM,
                 head.kind,
                 kind_font.clone(),
@@ -3194,11 +3317,27 @@ impl Stage {
             // name, and the number is what a held key will one day say.
             // On the kind's line, not the name's: a name may run the
             // whole width, and the number must never be under it.
-            painter.text(
+            let number = format!("{:02}", index + 1);
+            block::paint(
+                painter,
+                egui::Id::new(("stage-head-number", index)),
                 egui::pos2(rect.max.x - pad, rect.max.y - pad),
                 egui::Align2::RIGHT_BOTTOM,
-                format!("{:02}", index + 1),
-                kind_font.clone(),
+                block::unit::MICRO,
+                &number,
+                kind_ink,
+            );
+            Sign::Numeral(((index + 1) % 10) as u8).painted(
+                painter,
+                egui::Id::new(("stage-head-codex-number", index)),
+                egui::Rect::from_center_size(
+                    egui::pos2(
+                        rect.right() - pad - block::width(&number, block::unit::MICRO) - 8.0,
+                        rect.bottom() - 9.0,
+                    ),
+                    egui::Vec2::splat(9.0),
+                ),
+                Weight::Hair,
                 kind_ink,
             );
         }
@@ -3247,22 +3386,28 @@ impl Stage {
         let elsewhere = TRACK_H / 3.0;
         let middle = top + TRACK_H / 2.0;
         if first > 0 {
-            painter.line_segment(
-                [
-                    egui::pos2(span.left() - inset, middle - elsewhere / 2.0),
-                    egui::pos2(span.left() - inset, middle + elsewhere / 2.0),
-                ],
-                egui::Stroke::new(2.0, self.alphabet().ink.color),
+            let mut shapes = Vec::new();
+            circuit::annotation_arrow(
+                &mut shapes,
+                egui::pos2(span.left(), middle),
+                egui::pos2(span.left() - inset - elsewhere * 0.5, middle),
+                self.alphabet().ink.color,
             );
+            for shape in shapes {
+                painter.add(shape);
+            }
         }
         if last < heads.len() {
-            painter.line_segment(
-                [
-                    egui::pos2(span.right() + inset, middle - elsewhere / 2.0),
-                    egui::pos2(span.right() + inset, middle + elsewhere / 2.0),
-                ],
-                egui::Stroke::new(2.0, self.alphabet().ink.color),
+            let mut shapes = Vec::new();
+            circuit::annotation_arrow(
+                &mut shapes,
+                egui::pos2(span.right(), middle),
+                egui::pos2(span.right() + inset + elsewhere * 0.5, middle),
+                self.alphabet().ink.color,
             );
+            for shape in shapes {
+                painter.add(shape);
+            }
         }
         match self.refusal.map(|refusal| refusal.reason) {
             Some(RefusalReason::Edge(step)) => {
@@ -3305,51 +3450,109 @@ impl Stage {
     /// its own channel strip in the mixer, and in the session nothing,
     /// because the master holds no clips and a column of empty slots
     /// would invite firing one.
-    fn draw_master(&self, painter: &egui::Painter, field: egui::Rect, cursor_shade: egui::Color32) {
+    fn draw_master(
+        &self,
+        painter: &egui::Painter,
+        field: egui::Rect,
+        cursor_shade: egui::Color32,
+        phase: Phase,
+    ) {
         let alpha = self.alphabet();
         let pad = design::px(design::space::STEP);
         let margin = design::px(design::space::ROOM);
         let gap = row_gap();
-        let name_font = egui::FontId::monospace(design::px(design::type_scale::BODY));
         let kind_font = egui::FontId::monospace(design::px(design::type_scale::MICRO));
         let head = Self::master_rect(field);
         let focused = self.session_address() == Some(Address::Master);
-
-        painter.rect_filled(
-            head,
-            0.0,
-            if focused { cursor_shade } else { self.square() },
-        );
-        let (name_ink, kind_ink) = if focused {
+        let fill = if focused { cursor_shade } else { self.square() };
+        let (title_ink, kind_ink) = if focused {
             (alpha.ground.color, alpha.well.color)
         } else {
             (alpha.ink.color, alpha.ink.color)
         };
-        painter.text(
-            egui::pos2(head.min.x + pad, head.min.y + pad),
+        kit::cached(
+            painter,
+            egui::Id::new("stage-master-head"),
+            head,
+            (fill, title_ink),
+            |out| {
+                circuit::octagon(out, head, circuit::CHAMFER, Some(fill), None);
+                circuit::double_frame(out, head, 4.0, title_ink);
+                Sign::Master.paint(
+                    out,
+                    egui::Rect::from_center_size(
+                        egui::pos2(head.left() + 19.0, head.center().y),
+                        egui::Vec2::splat(25.0),
+                    ),
+                    Weight::Heavy,
+                    title_ink,
+                );
+            },
+        );
+        block::paint(
+            painter,
+            egui::Id::new("stage-master-title"),
+            egui::pos2(head.left() + 39.0, head.top() + pad),
             egui::Align2::LEFT_TOP,
-            "Master",
-            name_font,
-            name_ink,
+            block::unit::MICRO,
+            "MASTER",
+            title_ink,
         );
         painter.text(
-            egui::pos2(head.min.x + pad, head.max.y - pad),
+            egui::pos2(head.left() + 39.0, head.bottom() - pad),
             egui::Align2::LEFT_BOTTOM,
-            "Out",
+            "OUT",
             kind_font,
             kind_ink,
         );
+        if focused {
+            let mut shapes = Vec::new();
+            circuit::brackets(
+                &mut shapes,
+                head.expand(3.0),
+                8.0,
+                Weight::Bold,
+                alpha.ink.color,
+            );
+            for shape in shapes {
+                painter.add(shape);
+            }
+        }
 
-        // A line down its left side, the same one the tracks have between
-        // them — it is a column beside the others, not a thing apart.
+        // The seam is the master rail. Every shown track elbows into its
+        // top shoulder; the scene rails already terminate against its
+        // vertical run in `draw_board`.
         let seam = (head.min.x - column_gap() / 2.0).floor() + 0.5;
-        painter.line_segment(
-            [
-                egui::pos2(seam, head.min.y),
-                egui::pos2(seam, field.max.y - margin),
-            ],
-            egui::Stroke::new(1.0, alpha.edge.color),
+        let rail_top = head.top() - 7.0;
+        let rail_bottom = field.bottom() - margin;
+        let tracks = self.strip_window(field);
+        let mut rail_shapes = Vec::new();
+        circuit::rail(
+            &mut rail_shapes,
+            egui::pos2(seam, rail_top),
+            egui::pos2(seam, rail_bottom),
+            &[0.0, 1.0],
+            alpha.edge.color,
         );
+        for (slot, _) in tracks.clone().enumerate() {
+            let from = egui::pos2(bus_x(field, slot), head.top() - 1.0);
+            let to = egui::pos2(seam, rail_top - slot as f32 * 1.5);
+            let path = circuit::elbow(from, to);
+            circuit::trace(&mut rail_shapes, &path, Weight::Hair, alpha.edge.color);
+            circuit::pad(&mut rail_shapes, from, circuit::PAD, alpha.edge.color, true);
+        }
+        if phase.rolling && self.playing.iter().any(Option::is_some) {
+            circuit::dashes(
+                &mut rail_shapes,
+                &[egui::pos2(seam, rail_top), egui::pos2(seam, rail_bottom)],
+                phase.dash(),
+                Weight::Heavy,
+                alpha.live_dim.color,
+            );
+        }
+        for shape in rail_shapes {
+            painter.add(shape);
+        }
 
         if !self.mixing {
             return;
@@ -3426,10 +3629,10 @@ impl Stage {
         field: egui::Rect,
         lattice: &FocusLattice,
         cursor_shade: egui::Color32,
+        phase: Phase,
     ) {
         let gap = row_gap();
         let pad = design::px(design::space::STEP);
-        let font = egui::FontId::monospace(design::px(design::type_scale::MICRO));
         let tracks = self.strip_window(field);
         let rows = self.scene_window(field);
         if tracks.is_empty() || rows.is_empty() {
@@ -3449,19 +3652,32 @@ impl Stage {
         // The scene addresses, in the gutter: the row's number, lit when
         // the cursor is on that row and quiet otherwise. The heads get no
         // number here because their number is on them.
-        let gutter_x = Self::head_rect(field, 0).min.x - column_gap();
+        let head = Self::head_rect(field, 0);
         for (line, scene) in rows.clone().enumerate() {
-            let rect = scenes::slot_beneath(Self::head_rect(field, 0), line, gap, section_gap());
+            let rect = scenes::slot_beneath(head, line, gap, section_gap());
             let ink = if focused_scene == Some(scene) {
                 self.alphabet().ink.color
             } else {
                 self.alphabet().edge.color
             };
-            painter.text(
-                egui::pos2(gutter_x, rect.center().y),
-                egui::Align2::RIGHT_CENTER,
-                format!("{:02}", scene + 1),
-                font.clone(),
+            let number = format!("{:02}", scene + 1);
+            block::paint(
+                painter,
+                egui::Id::new(("stage-scene-address", scene)),
+                egui::pos2(head.left() - ADDRESS_W + 1.0, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                block::unit::MICRO,
+                &number,
+                ink,
+            );
+            Sign::Register((scene % 16) as u8).painted(
+                painter,
+                egui::Id::new(("stage-scene-register", scene)),
+                egui::Rect::from_center_size(
+                    egui::pos2(head.left() - 9.0, rect.center().y),
+                    egui::Vec2::splat(13.0),
+                ),
+                Weight::Hair,
                 ink,
             );
         }
@@ -3472,142 +3688,119 @@ impl Stage {
                 let rect = scenes::slot_beneath(head, line, gap, section_gap());
                 let here = focused == Some(Address::Slot { track, scene });
                 let mark = scenes::mark(&self.song, track, scene);
-
-                // Every cell is bounded, faintly, whether or not anything
-                // is in it.
-                //
-                // The rank and file used to be carried by the points
-                // alone, which asks the eye to infer a grid from a
-                // scattering of marks — and on a paper ground, where the
-                // resting rungs sit inside a narrow band, that inference
-                // is work. A hairline at low opacity states the lattice
-                // instead of implying it, and stays quiet enough that the
-                // clips remain the figure and this remains the ground.
-                //
-                // Opacity rather than a rung: the alphabet's ladder is a
-                // set of VALUES for things that speak, and this does not
-                // speak. It is the same edge every region is bounded with,
-                // held back to a third of itself.
-                painter.rect_stroke(
+                let alpha = self.alphabet();
+                let fill = if here {
+                    Some(cursor_shade)
+                } else if mark.is_some() {
+                    Some(alpha.edge.color)
+                } else {
+                    None
+                };
+                let figure_ink = if here {
+                    alpha.ground.color
+                } else {
+                    alpha.ink.color
+                };
+                let outline = if mark.is_some() || here {
+                    alpha.edge.color
+                } else {
+                    alpha.edge.color.gamma_multiply(0.62)
+                };
+                kit::cached(
+                    painter,
+                    egui::Id::new(("stage-scene-cell", track, scene)),
                     rect,
-                    0.0,
-                    egui::Stroke::new(1.0, self.alphabet().edge.color.gamma_multiply(0.35)),
-                    egui::StrokeKind::Inside,
+                    (fill, figure_ink, outline, mark.is_some()),
+                    |out| {
+                        circuit::octagon(
+                            out,
+                            rect,
+                            circuit::CHAMFER,
+                            fill,
+                            Some((Weight::Hair, outline)),
+                        );
+                        if mark.is_none() {
+                            circuit::via(
+                                out,
+                                rect.center(),
+                                figure_ink,
+                                fill.unwrap_or(alpha.ground.color),
+                            );
+                        }
+                    },
                 );
 
-                // Three states, three values. The cursor is a plane in the
-                // focus shade. A clip is a plane one rung up from the
-                // ground. An empty place is a point — the lattice shows
-                // through as rank and file, and nothing else.
                 if here {
-                    ornament::plane(
-                        painter,
-                        rect,
-                        cursor_shade,
-                        Some(ornament::Cut::BottomRight),
-                    );
-                    ornament::brackets(
-                        painter,
+                    let mut shapes = Vec::new();
+                    circuit::brackets(
+                        &mut shapes,
                         rect.expand(3.0),
-                        self.alphabet().ink.color,
-                        1.0,
-                        6.0,
+                        7.0,
+                        Weight::Bold,
+                        alpha.ink.color,
                     );
-                } else if mark.is_some() {
-                    // A clip is the FIGURE of this surface, and it was
-                    // drawn on the same rung as the head above it — two
-                    // different kinds of thing sharing one value, which is
-                    // the one thing the code may not do. It goes up to the
-                    // structure rung: clear of the ground, clear of the
-                    // heads, and the brightest resting plane in the
-                    // lattice, which is what a clip is.
-                    ornament::plane(
-                        painter,
-                        rect,
-                        self.alphabet().edge.color,
-                        Some(ornament::Cut::BottomRight),
-                    );
-                } else {
-                    // The empty place is still a point and not a plane —
-                    // but at the structure rung it was a mark the eye had
-                    // to hunt for, and rank and file cannot be read from
-                    // marks that are not seen. It carries the content rung
-                    // now: the lattice is quiet, not invisible.
-                    painter.rect_filled(
-                        egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(POINT)),
-                        0.0,
-                        self.alphabet().ink.color,
-                    );
+                    for shape in shapes {
+                        painter.add(shape);
+                    }
                 }
 
-                // What is SOUNDING, in the alphabet's word for it. LIVE is
-                // documented as "the playhead, what is making sound right
-                // now" — and its dim partner as the same meaning present
-                // but not the subject, which is exactly a clip that is
-                // launched while the transport is parked.
-                //
-                // A bar at the slot's leading edge rather than a tint of
-                // the whole plane: the plane is already carrying focus and
-                // occupancy, and a third meaning laid over both would make
-                // all three harder to read.
                 if self.playing_on(track) == Some(scene) {
-                    // The bar BREATHES on the beat while it rolls: bright
-                    // on the downbeat, decaying across it, back at the
-                    // next. Motion that is state rather than decoration —
-                    // it is the tempo, made visible on the thing the
-                    // tempo is moving, and it means a glance at the
-                    // session tells you the song is running without
-                    // reading a number.
-                    let ink = if self.transport.motion().is_rolling() {
-                        let phase = (self.transport.tick() % crate::sequencing::TICKS_PER_BEAT)
-                            as f32
-                            / crate::sequencing::TICKS_PER_BEAT as f32;
-                        let (hot, cool) =
-                            (self.alphabet().live.color, self.alphabet().live_dim.color);
-                        // Eased so the decay reads as a falling thing
-                        // rather than a linear ramp.
-                        cool.lerp_to_gamma(hot, (1.0 - phase) * (1.0 - phase))
-                    } else {
-                        self.alphabet().live_dim.color
-                    };
-                    painter.rect_filled(
-                        egui::Rect::from_min_size(rect.min, egui::vec2(POINT, rect.height())),
-                        0.0,
-                        ink,
+                    let mut shapes = Vec::new();
+                    circuit::octagon(
+                        &mut shapes,
+                        rect,
+                        circuit::CHAMFER,
+                        None,
+                        Some((Weight::Heavy, alpha.live_dim.color)),
                     );
+                    if phase.rolling {
+                        let mut path = circuit::octagon_points(rect.shrink(1.5), circuit::CHAMFER);
+                        if let Some(first) = path.first().copied() {
+                            path.push(first);
+                        }
+                        circuit::dashes(
+                            &mut shapes,
+                            &path,
+                            phase.dash(),
+                            Weight::Heavy,
+                            alpha.live.color,
+                        );
+                    }
+                    let live = motion::pulse_ink(alpha.live.color, alpha.live_dim.color, phase);
+                    shapes.push(egui::Shape::rect_filled(
+                        egui::Rect::from_min_size(
+                            egui::pos2(rect.left(), rect.top() + circuit::CHAMFER),
+                            egui::vec2(POINT, rect.height() - circuit::CHAMFER * 2.0),
+                        ),
+                        0.0,
+                        live,
+                    ));
+                    for shape in shapes {
+                        painter.add(shape);
+                    }
                 }
 
-                // A filled slot: its kind at the left, its number at the
-                // right, one quiet line between them. The sign is a rung
-                // below the number — the number is the address, the sign
-                // only says what kind of thing lives there. Both invert
-                // with the fill so the mark survives being focused.
                 let Some(mark) = mark else {
                     continue;
                 };
-                // The sign stays a rung below the number on both sides of
-                // the inversion. On a lit clip that rung is the GROUND
-                // showing through its own plane — engraved rather than
-                // printed — because above the structure rung there is
-                // nothing quieter left to say it with.
-                let (sign_ink, number_ink) = if here {
-                    (self.alphabet().surface.color, self.alphabet().ground.color)
-                } else {
-                    (self.alphabet().ground.color, self.alphabet().ink.color)
-                };
-                painter.text(
-                    egui::pos2(rect.min.x + pad, rect.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    mark.glyph.to_string(),
-                    font.clone(),
-                    sign_ink,
+                Sign::Register((scene % 16) as u8).painted(
+                    painter,
+                    egui::Id::new(("stage-cell-register", track, scene)),
+                    egui::Rect::from_center_size(
+                        egui::pos2(rect.left() + pad + 3.0, rect.center().y),
+                        egui::Vec2::splat(14.0),
+                    ),
+                    Weight::Hair,
+                    figure_ink,
                 );
-                painter.text(
-                    egui::pos2(rect.max.x - pad, rect.center().y),
+                block::paint(
+                    painter,
+                    egui::Id::new(("stage-cell-number", track, scene)),
+                    egui::pos2(rect.right() - pad, rect.center().y),
                     egui::Align2::RIGHT_CENTER,
+                    block::unit::MICRO,
                     &mark.number,
-                    font.clone(),
-                    number_ink,
+                    figure_ink,
                 );
             }
         }
@@ -3625,22 +3818,28 @@ impl Stage {
         let middle = first_slot.center().x;
         let inset = gap.max(4.0);
         if rows.start > 0 {
-            painter.line_segment(
-                [
-                    egui::pos2(middle - elsewhere / 2.0, first_slot.top() - inset),
-                    egui::pos2(middle + elsewhere / 2.0, first_slot.top() - inset),
-                ],
-                egui::Stroke::new(2.0, self.alphabet().ink.color),
+            let mut shapes = Vec::new();
+            circuit::annotation_arrow(
+                &mut shapes,
+                egui::pos2(middle, first_slot.top()),
+                egui::pos2(middle, first_slot.top() - inset - elsewhere * 0.35),
+                self.alphabet().ink.color,
             );
+            for shape in shapes {
+                painter.add(shape);
+            }
         }
         if rows.end < self.song.session.scenes.len() {
-            painter.line_segment(
-                [
-                    egui::pos2(middle - elsewhere / 2.0, last_slot.bottom() + inset),
-                    egui::pos2(middle + elsewhere / 2.0, last_slot.bottom() + inset),
-                ],
-                egui::Stroke::new(2.0, self.alphabet().ink.color),
+            let mut shapes = Vec::new();
+            circuit::annotation_arrow(
+                &mut shapes,
+                egui::pos2(middle, last_slot.bottom()),
+                egui::pos2(middle, last_slot.bottom() + inset + elsewhere * 0.35),
+                self.alphabet().ink.color,
             );
+            for shape in shapes {
+                painter.add(shape);
+            }
         }
     }
 
@@ -7590,6 +7789,21 @@ mod tests {
             Stage::head_rect(field, last).max.x <= master.min.x,
             "a track was drawn under the master"
         );
+    }
+
+    #[test]
+    fn the_board_has_one_bus_per_shown_column() {
+        let field = egui::Rect::from_min_size(egui::pos2(12.0, 24.0), egui::vec2(1280.0, 400.0));
+        for slot in 0..Stage::strip_capacity(field) {
+            assert_eq!(bus_x(field, slot), Stage::head_rect(field, slot).center().x);
+            if slot > 0 {
+                assert_eq!(
+                    bus_x(field, slot) - bus_x(field, slot - 1),
+                    TRACK_W + column_gap(),
+                    "adjacent buses lost the column pitch"
+                );
+            }
+        }
     }
 
     #[test]
