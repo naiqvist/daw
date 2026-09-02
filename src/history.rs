@@ -85,6 +85,12 @@ impl<T: Clone + PartialEq> History<T> {
         true
     }
 
+    /// The settled state: what the last `observe` saw, and what `undo`
+    /// would step back FROM.
+    pub fn present(&self) -> &T {
+        &self.present
+    }
+
     pub fn can_undo(&self) -> bool {
         !self.undo.is_empty()
     }

@@ -83,24 +83,44 @@ pub struct Channel {
     /// solo against. Two squares that cannot be pressed would be two
     /// controls promising something the surface will not do.
     pub switches: bool,
-    /// The last level the engine reported. Silence where there is no
-    /// engine, which is the truth about a stage with nothing behind it.
+    /// The level as the meter shows it — the engine's report, through
+    /// the meter's ballistics. Silence where there is no engine, which
+    /// is the truth about a stage with nothing behind it.
     pub level: Level,
+    /// The loudest recent moment, held: the mark above the bar.
+    pub peak: Level,
+}
+
+/// One meter as it is drawn: the bar, and the mark above it.
+///
+/// Both come out of the ballistics rather than straight from the engine.
+/// A block's peak is a few milliseconds of truth, and a bar that showed
+/// each one raw would flicker between the loudest and quietest block of
+/// every frame; the bar rises at once and falls slowly, and the mark
+/// stays at the loudest thing it saw for long enough to be read.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Reading {
+    pub level: Level,
+    pub peak: Level,
 }
 
 /// Every track as a channel, in the song's own order.
-pub fn channels(song: &Song, levels: &[Level]) -> Vec<Channel> {
+pub fn channels(song: &Song, readings: &[Reading]) -> Vec<Channel> {
     song.tracks
         .iter()
         .enumerate()
-        .map(|(index, track)| Channel {
-            gain: track.volume,
-            pan: track.pan,
-            muted: track.muted,
-            soloed: track.solo,
-            audible: song.audible(index),
-            switches: true,
-            level: levels.get(index).copied().unwrap_or_default(),
+        .map(|(index, track)| {
+            let reading = readings.get(index).copied().unwrap_or_default();
+            Channel {
+                gain: track.volume,
+                pan: track.pan,
+                muted: track.muted,
+                soloed: track.solo,
+                audible: song.audible(index),
+                switches: true,
+                level: reading.level,
+                peak: reading.peak,
+            }
         })
         .collect()
 }
@@ -379,10 +399,14 @@ fn draw_meters(
     let gutter = gap * 0.5;
     let meter_w = ((zone.width() - gutter) / 2.0).max(1.0);
     let sides = [
-        (zone.min.x, channel.level.left),
-        (zone.max.x - meter_w, channel.level.right),
+        (zone.min.x, channel.level.left, channel.peak.left),
+        (
+            zone.max.x - meter_w,
+            channel.level.right,
+            channel.peak.right,
+        ),
     ];
-    for (x, amp) in sides {
+    for (x, amp, peak) in sides {
         let place = place_of_amp(amp);
         // Over full scale there is nothing taller to draw, so the top
         // cell changes its VALUE instead of its height — the one place
@@ -408,6 +432,23 @@ fn draw_meters(
                 ink
             };
             block(painter, rect, lit, coverage);
+        }
+        // The peak mark: a rule at the loudest recent moment, above the
+        // bar while the bar is falling and on it while it is not. Content
+        // ink, because it is the one reading a glance at a moving bar
+        // cannot take; alarm ink past full scale, for the same reason the
+        // top cell turns.
+        if peak > 0.0 {
+            let y = ladder.max.y - ladder.height() * place_of_amp(peak).min(1.0);
+            let rule = if peak >= 1.0 {
+                alpha.jeopardy_active.color
+            } else {
+                alpha.ink.color
+            };
+            painter.line_segment(
+                [egui::pos2(x, y), egui::pos2(x + meter_w, y)],
+                egui::Stroke::new(1.0, rule),
+            );
         }
     }
 
@@ -608,6 +649,26 @@ mod tests {
             Level::default(),
             "a meter with no engine behind it invented a reading"
         );
+        assert_eq!(channels[0].peak, Level::default());
+
+        let heard = super::channels(
+            &song,
+            &[Reading {
+                level: Level {
+                    left: 0.5,
+                    right: 0.25,
+                },
+                peak: Level {
+                    left: 0.8,
+                    right: 0.4,
+                },
+            }],
+        );
+        assert_eq!(
+            heard[0].level.right, 0.25,
+            "the sides were flattened into one"
+        );
+        assert_eq!(heard[0].peak.left, 0.8, "the peak mark was lost");
     }
 
     #[test]

@@ -13,6 +13,8 @@
 //! why this surface can exist for all of them at once instead of being
 //! hand-laid-out thirty-nine times.
 
+use crate::devices::ParamLabel;
+use crate::params::ParamDef;
 use crate::sequencing::{Device, Song};
 
 /// One parameter, as the band draws it.
@@ -36,6 +38,10 @@ pub struct Column {
     /// Whether it heads the chain rather than shaping what comes in.
     pub instrument: bool,
     pub bypassed: bool,
+    /// The file a sampler is playing, by name. `None` on every other
+    /// kind, and on a sampler with nothing loaded yet — which is the one
+    /// fact about a sampler its parameter table cannot show.
+    pub sample: Option<String>,
     pub rows: Vec<Row>,
 }
 
@@ -55,6 +61,11 @@ pub fn column(device: &Device) -> Column {
         title: spec.name,
         instrument: spec.instrument,
         bypassed: device.bypassed,
+        sample: device
+            .sample
+            .as_deref()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned()),
         // The two tables are parallel by construction — the automation
         // target picker already walks them zipped — so a row is one
         // parameter's numbers beside its words.
@@ -66,7 +77,7 @@ pub fn column(device: &Device) -> Column {
                     let value = device.value(def.id);
                     Row {
                         name: qualified(label, spec.labels),
-                        value: format_value(value, label.unit),
+                        value: format_param(def, label, value),
                         edited: value != def.default,
                     }
                 })
@@ -161,23 +172,40 @@ pub fn format_value(value: f32, unit: &str) -> String {
     }
 }
 
-/// One press of a parameter: a hundredth of its range, or a tenth when
-/// the press is coarse.
+/// A parameter's value as the band writes it: the NAME of its position
+/// when the catalog says it is a list, and the number with its unit when
+/// it is a range. "saw" is what an oscillator is doing; "2.00" is the
+/// wire it rides on.
+pub fn format_param(def: &ParamDef, label: &ParamLabel, value: f32) -> String {
+    match choice_of(def, label, value) {
+        Some(name) => name.to_owned(),
+        None => format_value(value, label.unit),
+    }
+}
+
+/// The name of the position `value` stands on, when the parameter is a
+/// list. Positions are `min + n`, rounded, and clamped to the list — the
+/// same single arithmetic step the compiler takes to turn an index back
+/// into a choice.
+fn choice_of(def: &ParamDef, label: &ParamLabel, value: f32) -> Option<&'static str> {
+    if label.choices.is_empty() {
+        return None;
+    }
+    let at = (value - def.min).round().max(0.0) as usize;
+    Some(label.choices[at.min(label.choices.len() - 1)])
+}
+
+/// One press of a parameter.
 ///
-/// Uniform, deliberately, and this is the honest limit rather than the
-/// clever answer. A filter mode or a waveform is a LIST to walk, not a
-/// slider, and a hundredth of a four-wide range is twenty-five presses to
-/// the next entry — but nothing in the catalog records which parameters
-/// are choices, and the shape of a range cannot be read to find out. The
-/// measurement: a span of one is mostly continuous (`mix`, `drive`,
-/// `start`), while a span of two to sixteen with whole bounds mixes real
-/// lists (`filter mode`, `a wave`) with values that are plainly not
-/// (`pan`, `gain`). Any rule drawn through that gets one group wrong.
-///
-/// The fix is for the catalog to say so itself — a flag beside the name,
-/// unit and group each parameter already carries — and until it does,
-/// stepping every parameter the same way is at least never surprising.
-pub fn step_of(def: &crate::params::ParamDef, coarse: bool) -> f32 {
+/// For a RANGE: a hundredth of it, or a tenth when the press is coarse.
+/// For a LIST: one position, whichever press — a list has no "coarse"
+/// walk, and a press that skipped entries would be a press whose landing
+/// could not be predicted. The catalog says which is which; the shape of
+/// a range cannot be read to find out, and this surface no longer tries.
+pub fn step_of(def: &ParamDef, label: &ParamLabel, coarse: bool) -> f32 {
+    if !label.choices.is_empty() {
+        return 1.0;
+    }
     let span = def.max - def.min;
     if span <= 0.0 {
         return 0.0;
@@ -373,16 +401,24 @@ mod tests {
         // A step of zero is a parameter nobody can move, and a step
         // bigger than the range is one with two positions.
         for spec in crate::devices::DEVICES {
-            for def in spec.params {
+            for (def, label) in spec.params.iter().zip(spec.labels) {
                 let span = def.max - def.min;
-                let fine = step_of(def, false);
-                let coarse = step_of(def, true);
+                let fine = step_of(def, label, false);
+                let coarse = step_of(def, label, true);
                 assert!(
                     fine > 0.0 && coarse > 0.0,
                     "{} / {} cannot be moved at all",
                     spec.name,
                     def.name
                 );
+                if !label.choices.is_empty() {
+                    // A list is walked one position at a time, whichever
+                    // press: there is nothing between two entries to land
+                    // on, and nothing past the next one to skip to.
+                    assert_eq!(fine, 1.0, "{} / {}", spec.name, def.name);
+                    assert_eq!(coarse, 1.0, "{} / {}", spec.name, def.name);
+                    continue;
+                }
                 assert!(
                     coarse > fine,
                     "{} / {} has no coarse press",
@@ -394,6 +430,56 @@ mod tests {
                 assert!((span / coarse - 10.0).abs() < 0.01);
             }
         }
+    }
+
+    #[test]
+    fn a_choice_is_shown_by_name_and_a_range_by_number() {
+        let (mut song, track) = song_with(DeviceKind::Poly);
+        let id = song.tracks[0].chain[0].id;
+        let wave = crate::params::poly::A_WAVE;
+        song.device_mut(id).expect("there").set(wave, 2.0);
+        let column = columns(&song, track).pop().expect("one device");
+        let row = column
+            .rows
+            .iter()
+            .find(|row| row.name == "A Wave")
+            .expect("the wave row");
+        assert_eq!(row.value, "saw", "a list showed its wire value");
+        assert!(row.edited);
+
+        let gain = column
+            .rows
+            .iter()
+            .find(|row| row.name == "Gain")
+            .expect("the gain row");
+        assert!(
+            gain.value
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit()),
+            "a range was not shown as a number: {}",
+            gain.value
+        );
+
+        // A value between two positions reads as the nearer one, and one
+        // past the end reads as the last: the band never shows a name
+        // the engine will not play.
+        let def = crate::params::def(crate::params::poly::TABLE, wave);
+        let label = &DeviceKind::Poly.spec().labels[0];
+        assert_eq!(format_param(def, label, 2.4), "saw");
+        assert_eq!(format_param(def, label, 99.0), "air");
+        assert_eq!(format_param(def, label, -3.0), "sine");
+    }
+
+    #[test]
+    fn a_sampler_column_names_its_file() {
+        let (mut song, track) = song_with(DeviceKind::Sampler);
+        let bare = columns(&song, track).pop().expect("one device");
+        assert_eq!(bare.sample, None);
+        let id = song.tracks[0].chain[0].id;
+        song.device_mut(id).expect("there").sample = Some("/kits/909/kick 01.wav".into());
+        let loaded = columns(&song, track).pop().expect("one device");
+        assert_eq!(loaded.sample.as_deref(), Some("kick 01.wav"));
     }
 
     #[test]

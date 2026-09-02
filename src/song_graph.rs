@@ -157,8 +157,13 @@ pub fn build(song: &Song, playing: &[Option<usize>]) -> (GraphSpec, SongNodes) {
 /// answer to both. Quietly substituting a different instrument would be a
 /// track sounding something nobody chose.
 ///
-/// **Not built yet:** `Sampler`, which needs a sample path the Song's
-/// `Device` does not carry, and `SineSynth`. Both are additions here.
+/// The sampler is the one instrument whose patch is not only numbers: it
+/// plays the file the device carries in `Device::sample`, and a sampler
+/// with no file yet compiles to a SILENT sampler rather than a refused
+/// graph — the engine's own rule, because a missing sample must not mute
+/// a project.
+///
+/// **Not built yet:** `SineSynth`. An addition here.
 fn voice_of(
     track: &crate::sequencing::Track,
     notes: Vec<GraphNote>,
@@ -206,6 +211,22 @@ fn voice_of(
         DeviceKind::Hat => voice!(Hat, crate::audio::hat::HatParams, head),
         DeviceKind::Tom => voice!(Tom, crate::audio::tom::TomParams, head),
         DeviceKind::Handclap => voice!(Handclap, crate::audio::handclap::HandclapParams, head),
+        DeviceKind::Sampler => {
+            let mut params = crate::audio::sampler::SamplerParams::default();
+            for (id, value) in &head.overrides {
+                params.set(*id, *value);
+            }
+            NodeSpec::Sampler {
+                notes,
+                subloops: Vec::new(),
+                loop_len_beats,
+                path: head.sample.clone().unwrap_or_default(),
+                params,
+                // Nothing authors slices from the Song yet; the compiler
+                // falls back to the grid the device's own knob asks for.
+                slices: Vec::new(),
+            }
+        }
         _ => return None,
     })
 }
@@ -623,6 +644,47 @@ mod tests {
         assert_eq!(
             params.gain, quiet,
             "an edited parameter did not reach the engine's patch"
+        );
+    }
+
+    #[test]
+    fn a_sampler_plays_the_file_its_device_carries() {
+        let mut song = song_with_a_clip();
+        let id = song
+            .add_device(0, DeviceKind::Sampler)
+            .expect("an instrument");
+
+        // No file yet: a silent sampler, not a refused graph and not the
+        // default voice standing in.
+        let (spec, nodes) = build(&song, &playing(&song));
+        let path = spec
+            .iter_ordered()
+            .find_map(|(_, node)| match node {
+                NodeSpec::Sampler { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .expect("the sampler is in the graph");
+        assert!(path.as_os_str().is_empty());
+        assert!(
+            nodes.outputs[0].is_some(),
+            "a sampler with no file lost its output"
+        );
+
+        let device = song.device_mut(id).expect("there");
+        device.sample = Some("/kits/break.wav".into());
+        assert!(device.set(crate::params::sampler::START, 0.25));
+        let (spec, _) = build(&song, &playing(&song));
+        let (path, params) = spec
+            .iter_ordered()
+            .find_map(|(_, node)| match node {
+                NodeSpec::Sampler { path, params, .. } => Some((path.clone(), *params)),
+                _ => None,
+            })
+            .expect("the sampler is in the graph");
+        assert_eq!(path, std::path::PathBuf::from("/kits/break.wav"));
+        assert_eq!(
+            params.start, 0.25,
+            "an edit did not reach the sampler's patch"
         );
     }
 

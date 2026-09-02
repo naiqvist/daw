@@ -30,17 +30,23 @@ pub(super) enum ScopeContext {
     /// time, the codebook, the browser, making tracks — and the one way
     /// out. Arrows, Enter and the verbs are the sequencer's to consume.
     Clip,
+    /// A track is being renamed: the letters are its name. The smallest
+    /// vocabulary on the stage — commit, abandon, erase — because while a
+    /// name is being typed every other key IS a letter, and a chord that
+    /// fired mid-word would be a trap.
+    Rename,
 }
 
 impl ScopeContext {
     #[cfg(test)]
-    pub(super) const ALL: [Self; 6] = [
+    pub(super) const ALL: [Self; 7] = [
         Self::Root,
         Self::Nested,
         Self::Browser,
         Self::Mixer,
         Self::Chain,
         Self::Clip,
+        Self::Rename,
     ];
 }
 
@@ -106,6 +112,25 @@ pub enum StageIntent {
     /// — daylight, a bright room, an unfamiliar display — rather than a
     /// preference about how the app should look.
     Ground,
+    /// Step the document back one edit, or forward again.
+    Undo,
+    Redo,
+    /// Write the song to its file.
+    Save,
+    /// Begin renaming the track the cursor is in. The letters are the
+    /// name until Enter keeps it or Escape lets it go.
+    Rename,
+    /// Take the track the cursor is in out of the song, with its slots.
+    DeleteTrack,
+    /// Arm a move: the next Left or Right shifts the thing under the
+    /// cursor — a device along its chain, a track along the strip — one
+    /// place that way. The grammar's NUDGE, spoken the same way here.
+    Nudge,
+    /// Lift the device under the cursor off its chain and keep it.
+    Yank,
+    /// Put the kept device down: after the cursor's device in the band,
+    /// or at the end of the cursor's track from the session.
+    Put,
 }
 
 impl StageIntent {
@@ -172,6 +197,14 @@ impl StageIntent {
                 coarse: true,
             } => "less, coarsely",
             Self::Ground => "dark / light",
+            Self::Undo => "undo",
+            Self::Redo => "redo",
+            Self::Save => "save",
+            Self::Rename => "rename track",
+            Self::DeleteTrack => "delete track",
+            Self::Nudge => "nudge, then a direction",
+            Self::Yank => "yank device",
+            Self::Put => "put device",
         }
     }
 }
@@ -548,6 +581,70 @@ const BINDINGS: &[Binding] = &[
     Binding::command(ScopeContext::Clip, Key::F, StageIntent::Browse),
     Binding::command(ScopeContext::Clip, Key::T, StageIntent::NewAudioTrack),
     Binding::command_shift(ScopeContext::Clip, Key::T, StageIntent::NewInstrumentTrack),
+    // The document's own verbs, reachable from wherever the cursor is:
+    // an edit made from the band or the browser is undone from there
+    // too, and a song is saved from wherever the performer happens to be
+    // standing when they think of it.
+    Binding::command(ScopeContext::Root, Key::Z, StageIntent::Undo),
+    Binding::command(ScopeContext::Nested, Key::Z, StageIntent::Undo),
+    Binding::command(ScopeContext::Mixer, Key::Z, StageIntent::Undo),
+    Binding::command(ScopeContext::Chain, Key::Z, StageIntent::Undo),
+    Binding::command(ScopeContext::Browser, Key::Z, StageIntent::Undo),
+    Binding::command(ScopeContext::Clip, Key::Z, StageIntent::Undo),
+    Binding::command_shift(ScopeContext::Root, Key::Z, StageIntent::Redo),
+    Binding::command_shift(ScopeContext::Nested, Key::Z, StageIntent::Redo),
+    Binding::command_shift(ScopeContext::Mixer, Key::Z, StageIntent::Redo),
+    Binding::command_shift(ScopeContext::Chain, Key::Z, StageIntent::Redo),
+    Binding::command_shift(ScopeContext::Browser, Key::Z, StageIntent::Redo),
+    Binding::command_shift(ScopeContext::Clip, Key::Z, StageIntent::Redo),
+    Binding::command(ScopeContext::Root, Key::S, StageIntent::Save),
+    Binding::command(ScopeContext::Nested, Key::S, StageIntent::Save),
+    Binding::command(ScopeContext::Mixer, Key::S, StageIntent::Save),
+    Binding::command(ScopeContext::Chain, Key::S, StageIntent::Save),
+    Binding::command(ScopeContext::Browser, Key::S, StageIntent::Save),
+    Binding::command(ScopeContext::Clip, Key::S, StageIntent::Save),
+    // The track under the cursor: its name, its place, its existence.
+    // Rename is on the key the grammar already spends on it; deleting a
+    // track is the one verb here that destroys content, so it takes the
+    // modifier — the same key that clears a slot, told to mean more.
+    Binding::new(ScopeContext::Root, Key::F2, StageIntent::Rename),
+    Binding::new(ScopeContext::Nested, Key::F2, StageIntent::Rename),
+    Binding::new(ScopeContext::Mixer, Key::F2, StageIntent::Rename),
+    Binding::command(ScopeContext::Root, Key::Delete, StageIntent::DeleteTrack),
+    Binding::command(ScopeContext::Nested, Key::Delete, StageIntent::DeleteTrack),
+    Binding::command(ScopeContext::Mixer, Key::Delete, StageIntent::DeleteTrack),
+    Binding::command(ScopeContext::Root, Key::Backspace, StageIntent::DeleteTrack),
+    Binding::command(
+        ScopeContext::Nested,
+        Key::Backspace,
+        StageIntent::DeleteTrack,
+    ),
+    Binding::command(
+        ScopeContext::Mixer,
+        Key::Backspace,
+        StageIntent::DeleteTrack,
+    ),
+    // The grammar's move-and-copy cluster, Q/W/E under the left hand, on
+    // the things this surface holds: a device in the band, a track on
+    // the strip. Nudge takes a direction, as it does in the sequencer.
+    // Put is reachable from the session as well as the band, because a
+    // track with no devices has no band to open — and putting a device
+    // on it is how it gets one.
+    Binding::new(ScopeContext::Root, Key::W, StageIntent::Nudge),
+    Binding::new(ScopeContext::Nested, Key::W, StageIntent::Nudge),
+    Binding::new(ScopeContext::Mixer, Key::W, StageIntent::Nudge),
+    Binding::new(ScopeContext::Chain, Key::W, StageIntent::Nudge),
+    Binding::new(ScopeContext::Chain, Key::Q, StageIntent::Yank),
+    Binding::new(ScopeContext::Chain, Key::E, StageIntent::Put),
+    Binding::new(ScopeContext::Root, Key::E, StageIntent::Put),
+    Binding::new(ScopeContext::Nested, Key::E, StageIntent::Put),
+    Binding::new(ScopeContext::Mixer, Key::E, StageIntent::Put),
+    // Renaming: keep, let go, erase. Everything else is a letter, and
+    // reaches the name as text rather than as a chord.
+    Binding::new(ScopeContext::Rename, Key::Enter, StageIntent::Enter),
+    Binding::new(ScopeContext::Rename, Key::Escape, StageIntent::Escape),
+    Binding::new(ScopeContext::Rename, Key::Backspace, StageIntent::Backspace),
+    Binding::command(ScopeContext::Rename, Key::L, StageIntent::Ground),
 ];
 
 /// Every binding in one scope, in table order. The help surface reads
@@ -580,6 +677,9 @@ fn family(intent: StageIntent) -> &'static str {
         | StageIntent::Mute
         | StageIntent::Solo => "mixer",
         StageIntent::Devices | StageIntent::Param { .. } => "devices",
+        StageIntent::Undo | StageIntent::Redo | StageIntent::Save => "document",
+        StageIntent::Rename | StageIntent::DeleteTrack => "track",
+        StageIntent::Nudge | StageIntent::Yank | StageIntent::Put => "edit",
     }
 }
 
@@ -650,7 +750,10 @@ pub(super) fn dispatch(scope: ScopeContext, input: StageInput) -> Option<StageIn
                 binding.scope == scope && binding.modifiers == modifiers && binding.key == key
             })
             .map(|binding| binding.intent),
-        StageInput::Text(ch) if scope == ScopeContext::Browser && !ch.is_control() => {
+        StageInput::Text(ch)
+            if matches!(scope, ScopeContext::Browser | ScopeContext::Rename)
+                && !ch.is_control() =>
+        {
             Some(StageIntent::TypeChar(ch))
         }
         StageInput::Text(_) => None,
@@ -768,6 +871,10 @@ mod tests {
     #[test]
     fn transport_keys_are_global_table_bindings() {
         for scope in ScopeContext::ALL {
+            // While a name is being typed, a space is a space.
+            if scope == ScopeContext::Rename {
+                continue;
+            }
             assert_eq!(
                 dispatch(scope, StageInput::Chord(Modifiers::NONE, Key::Space)),
                 Some(StageIntent::ToggleTransport),

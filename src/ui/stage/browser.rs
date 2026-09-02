@@ -291,13 +291,38 @@ pub(super) fn sample_nodes(assets: &[AssetRecord]) -> Vec<Node> {
         .collect()
 }
 
-/// PROJECT SOURCE SEAM.
+/// The songs in the stage's own folder, by name. `None` — a stage with
+/// no songs folder — is an empty shelf, and the seam says so here rather
+/// than being an anonymous empty vector: guessing a directory would turn
+/// a machine-local convention into an accidental data model.
 ///
-/// There is no frame-independent project catalog today. Keep this empty
-/// until one exists; guessing a directory here would turn a machine-local
-/// convention into an accidental data model.
-pub(super) fn project_nodes() -> Vec<Node> {
-    Vec::new()
+/// One directory, read when the browser is summoned. Green zone, and a
+/// folder of songs is a few dozen names; a library of them is the
+/// scanner's job, the day there is one.
+pub(super) fn project_nodes(home: Option<&std::path::Path>) -> Vec<Node> {
+    let Some(home) = home else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(home) else {
+        return Vec::new();
+    };
+    let mut songs: Vec<(String, PathBuf)> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            name.ends_with(".stage.ron") || name.ends_with(".daw.ron")
+        })
+        .map(|path| (super::document::title(&path), path))
+        .collect();
+    songs.sort();
+    songs
+        .into_iter()
+        .map(|(title, path)| Node::leaf(title, EntryKind::Project(path)))
+        .collect()
 }
 
 /// Where one visible row sits in the tree.
@@ -333,9 +358,9 @@ impl Browser {
                     Shelf::Devices => device_nodes(),
                     // Filled by the scanner when it lands.
                     Shelf::Samples => Vec::new(),
-                    // Empty by construction, and the seam says so here
-                    // rather than being an anonymous empty vector.
-                    Shelf::Projects => project_nodes(),
+                    // Filled by the stage when it summons the browser,
+                    // from the songs folder it was given.
+                    Shelf::Projects => Vec::new(),
                 };
                 Node::branch(shelf.label(), EntryKind::Shelf(shelf), children)
             })
@@ -1015,8 +1040,32 @@ mod tests {
     }
 
     #[test]
+    fn the_songs_folder_lists_its_songs_by_name_and_nothing_else() {
+        let dir = std::env::temp_dir().join(format!("daw-stage-shelf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a folder");
+        for name in ["zed.stage.ron", "alpha.daw.ron", "notes.txt", "loose.ron"] {
+            std::fs::write(dir.join(name), "").expect("writes");
+        }
+        let nodes = project_nodes(Some(&dir));
+        let labels: Vec<&str> = nodes.iter().map(|node| node.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["alpha", "zed"],
+            "the shelf is not the songs, sorted"
+        );
+        assert!(
+            matches!(nodes[0].kind, EntryKind::Project(ref path) if path.ends_with("alpha.daw.ron"))
+        );
+        assert!(project_nodes(Some(&dir.join("missing"))).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn projects_stay_an_explicit_empty_seam_until_a_neutral_catalog_exists() {
-        assert!(project_nodes().is_empty());
+        // With no songs folder there is nothing to list — and no
+        // guessing at one.
+        assert!(project_nodes(None).is_empty());
         let browser = Browser::shelves();
         assert_eq!(
             browser.status_of(Shelf::Projects),

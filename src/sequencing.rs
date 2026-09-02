@@ -229,6 +229,16 @@ pub struct Device {
     /// the red zone already applies to a stale letter.
     #[serde(default)]
     pub overrides: Vec<(u32, f32)>,
+    /// The file a sampler plays. `None` on every other kind, and on a
+    /// sampler nobody has given a sound yet — which compiles to a silent
+    /// sampler rather than a refused graph, because a missing sample must
+    /// not mute the project.
+    ///
+    /// On the DEVICE rather than in a parameter: a path is not a number
+    /// in a range, and the parameter table is the engine's table, which
+    /// the red zone reads and must never find a string in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample: Option<std::path::PathBuf>,
 }
 
 impl Device {
@@ -238,6 +248,7 @@ impl Device {
             kind,
             bypassed: false,
             overrides: Vec::new(),
+            sample: None,
         }
     }
 
@@ -1057,6 +1068,14 @@ pub struct Song {
     /// The project-level harmonic context. Degree anchors resolve against
     /// it; absolute anchors never read it.
     pub key: Key,
+    /// The next [`TrackId`] to mint. MONOTONIC: a removed track's id is
+    /// never handed out again, so anything that held it — a scene slot,
+    /// an undo step, a frame's memory — can only ever point at the track
+    /// it meant or at nothing. Zero, which is what every document written
+    /// before removal existed carries, means "one past the highest in
+    /// use", exactly as it always did.
+    #[serde(default)]
+    pub next_track_id: u64,
 }
 
 impl Default for Song {
@@ -1097,6 +1116,7 @@ impl Default for Song {
             meter: Vec::new(),
             session: Session::default(),
             key: default_key(),
+            next_track_id: 2,
         }
     }
 }
@@ -1109,23 +1129,13 @@ impl Song {
     /// `notes/20260823-sequencing-contract.md` are in play. It becomes
     /// audible only once something is placed on it.
     ///
-    /// The id is one past the highest currently in use, which makes it
-    /// unique among the tracks the song HOLDS. It is deliberately NOT a
-    /// permanent serial: remove the highest track and the next one made
-    /// takes that id back. Nothing can observe this yet — no verb removes
-    /// a track — but a delete verb has to bring a monotonic counter on the
-    /// document with it before anything may hold a `TrackId` across a
-    /// removal. `an_id_is_reused_once_the_track_holding_it_is_gone` pins
-    /// the current behaviour so that day is not a surprise.
+    /// The id comes off [`Self::next_track_id`], which only ever goes up:
+    /// a removed track's id is never reused, so a scene slot or an undo
+    /// step that still names it names nothing rather than a stranger. A
+    /// document from before the counter existed carries zero, and reads
+    /// as "one past the highest in use" — the same id it always minted.
     pub fn add_track(&mut self, kind: TrackKind) -> TrackId {
-        let id = TrackId(
-            self.tracks
-                .iter()
-                .map(|track| track.id.0)
-                .max()
-                .unwrap_or(0)
-                .saturating_add(1),
-        );
+        let id = TrackId(self.mint_track_id());
         // Numbered within its own kind, so adding an audio track does not
         // depend on how many instrument tracks happen to exist.
         let ordinal = self
@@ -1160,6 +1170,76 @@ impl Song {
             armed: false,
         });
         id
+    }
+
+    /// The next unused track id, and the counter moved past it.
+    fn mint_track_id(&mut self) -> u64 {
+        let past_highest = self
+            .tracks
+            .iter()
+            .map(|track| track.id.0)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let id = self.next_track_id.max(past_highest);
+        self.next_track_id = id.saturating_add(1);
+        id
+    }
+
+    /// Take the track at `index` out of the song, and every scene slot
+    /// that pointed at it with it. `None` means there is no such track.
+    ///
+    /// The slots go too because a slot is keyed by id and the id is never
+    /// minted again: a slot left behind would be a clip filed under a
+    /// track that no longer exists, invisible to every surface and still
+    /// in the file. The patterns stay — a pattern is content, and content
+    /// is not destroyed by removing a place it was kept.
+    pub fn remove_track(&mut self, index: usize) -> Option<Track> {
+        if index >= self.tracks.len() {
+            return None;
+        }
+        let track = self.tracks.remove(index);
+        for scene in &mut self.session.scenes {
+            scene.slots.retain(|slot| slot.track != track.id);
+        }
+        self.normalize_group_depths();
+        Some(track)
+    }
+
+    /// Swap the track at `index` with its neighbour. `false` means it was
+    /// already at that end of the strip, or there is no such track.
+    ///
+    /// Its clips travel with it for free: a slot names a track by id, so
+    /// nothing in the session has to be told the strip was reordered.
+    pub fn move_track(&mut self, index: usize, later: bool) -> bool {
+        let to = if later {
+            index + 1
+        } else {
+            index.wrapping_sub(1)
+        };
+        if index >= self.tracks.len() || to >= self.tracks.len() {
+            return false;
+        }
+        self.tracks.swap(index, to);
+        self.normalize_group_depths();
+        true
+    }
+
+    /// Give the track at `index` a new name. `false` means there is no
+    /// such track, or the name was blank — a track has to be called
+    /// SOMETHING, or the strip has a column nobody can refer to.
+    pub fn rename_track(&mut self, index: usize, name: &str) -> bool {
+        let name = name.trim();
+        if name.is_empty() {
+            return false;
+        }
+        match self.tracks.get_mut(index) {
+            Some(track) => {
+                track.name = name.to_owned();
+                true
+            }
+            None => false,
+        }
     }
 
     /// Normalize the positional group stack at a green-zone ownership
@@ -1311,24 +1391,64 @@ impl Song {
         if audio && instrument {
             return None;
         }
-        let id = DeviceId(
-            self.tracks
-                .iter()
-                .flat_map(|track| track.chain.iter())
-                .map(|device| device.id.0)
-                .max()
-                .unwrap_or(0)
-                .saturating_add(1),
-        );
-        let device = Device::new(id, kind);
+        let device = Device::new(DeviceId(self.mint_device_id()), kind);
+        let at = self.tracks.get(track)?.chain.len();
+        self.place_device(track, at, device)
+    }
+
+    /// Put a device that already has settings — one taken off another
+    /// chain, or the same one — onto `track` at position `at`, and give
+    /// it a fresh id. `None` means the track does not exist, or the
+    /// device is an instrument offered to an audio track.
+    ///
+    /// A FRESH id, always: the device may be a copy of one still in the
+    /// song, and two devices with one id would be one device to every
+    /// letter addressed to it. What carries over is what the performer
+    /// set — the kind, the bypass, the edits, the sample.
+    ///
+    /// `at` is clamped: an instrument goes to the head whatever was asked,
+    /// replacing the one there, and an effect never lands in front of the
+    /// head. Past the tail means the tail.
+    pub fn insert_device(
+        &mut self,
+        track: usize,
+        at: usize,
+        mut device: Device,
+    ) -> Option<DeviceId> {
+        let audio = self.tracks.get(track)?.kind == TrackKind::Audio;
+        if audio && device.is_instrument() {
+            return None;
+        }
+        device.id = DeviceId(self.mint_device_id());
+        self.place_device(track, at, device)
+    }
+
+    /// One past the highest device id anywhere in the song.
+    fn mint_device_id(&self) -> u64 {
+        self.tracks
+            .iter()
+            .flat_map(|track| track.chain.iter())
+            .map(|device| device.id.0)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+    }
+
+    /// The one place a device joins a chain, so the head rule has one
+    /// home: an instrument REPLACES the head, and an effect lands at `at`
+    /// clamped behind the head and inside the chain.
+    fn place_device(&mut self, track: usize, at: usize, device: Device) -> Option<DeviceId> {
+        let id = device.id;
         let chain = &mut self.tracks.get_mut(track)?.chain;
-        if instrument {
+        if device.is_instrument() {
             // A second instrument REPLACES the first rather than joining
             // it: a track sounds one voice, and the head is that voice.
             chain.retain(|existing| !existing.is_instrument());
             chain.insert(0, device);
         } else {
-            chain.push(device);
+            let first = usize::from(chain.first().is_some_and(Device::is_instrument));
+            let at = at.clamp(first, chain.len());
+            chain.insert(at, device);
         }
         Some(id)
     }
@@ -2698,17 +2818,94 @@ mod track_tests {
     }
 
     #[test]
-    fn an_id_is_reused_once_the_track_holding_it_is_gone() {
-        // Pinned on purpose. This is what "one past the highest in use"
-        // costs, and no verb can remove a track today, so nothing can
-        // observe it. When a delete verb arrives, this test is the
-        // reminder that it owes the document a monotonic counter.
+    fn an_id_is_never_minted_twice_even_after_its_track_is_gone() {
+        // The counter the delete verb owed the document. Without it a
+        // scene slot, an undo step or a frame's memory that held the
+        // removed id would silently attach to the next track made.
         let mut song = Song::default();
         let first = song.add_track(TrackKind::Audio);
-        song.tracks.retain(|track| track.id != first);
+        assert_eq!(song.remove_track(1).map(|track| track.id), Some(first));
         let second = song.add_track(TrackKind::Audio);
 
-        assert_eq!(second, first, "the reuse this test exists to pin is gone");
+        assert_ne!(second, first, "a removed track's id was handed out again");
+        assert!(second.0 > first.0, "ids do not go up");
+    }
+
+    #[test]
+    fn a_document_without_the_counter_mints_one_past_the_highest() {
+        // Every file written before the counter existed reads as zero,
+        // and must mint what it always minted.
+        let mut song = Song {
+            next_track_id: 0,
+            ..Song::default()
+        };
+        song.tracks[0].id = TrackId(7);
+        assert_eq!(song.add_track(TrackKind::Audio), TrackId(8));
+        assert_eq!(song.next_track_id, 9);
+    }
+
+    #[test]
+    fn removing_a_track_takes_its_slots_and_leaves_its_patterns() {
+        let mut song = Song::default();
+        let gone = song.add_track(TrackKind::Instrument);
+        let kept = song.add_track(TrackKind::Instrument);
+        let pattern = song.fill_slot(1, 2).expect("a slot on the doomed track");
+        song.fill_slot(2, 2).expect("a slot on the survivor");
+        let patterns = song.patterns.len();
+
+        let removed = song.remove_track(1).expect("there");
+        assert_eq!(removed.id, gone);
+        assert_eq!(song.tracks.len(), 2);
+        assert!(
+            song.session
+                .scenes
+                .iter()
+                .all(|scene| scene.clip(gone).is_none()),
+            "a slot still named the removed track"
+        );
+        assert!(
+            song.session.scenes[2].clip(kept).is_some(),
+            "the survivor lost its clip"
+        );
+        assert_eq!(
+            song.patterns.len(),
+            patterns,
+            "content was destroyed with a place"
+        );
+        assert!(song.pattern(pattern).is_some());
+        assert!(
+            song.remove_track(9).is_none(),
+            "a track that is not there was removed"
+        );
+    }
+
+    #[test]
+    fn a_moved_track_keeps_its_clips_and_refuses_at_the_ends() {
+        let mut song = Song::default();
+        let first = song.tracks[0].id;
+        let second = song.add_track(TrackKind::Audio);
+        song.fill_slot(0, 0).expect("a pattern on the first track");
+
+        assert!(song.move_track(0, true));
+        let order: Vec<TrackId> = song.tracks.iter().map(|track| track.id).collect();
+        assert_eq!(order, [second, first]);
+        // The clip is on the track, wherever the track is.
+        assert!(song.slot_clip(1, 0).is_some(), "the clip did not travel");
+        assert!(song.slot_clip(0, 0).is_none());
+
+        assert!(!song.move_track(1, true), "moved past the end");
+        assert!(!song.move_track(0, false), "moved before the start");
+        assert!(!song.move_track(5, true), "a track that is not there moved");
+    }
+
+    #[test]
+    fn a_rename_is_trimmed_and_a_blank_one_is_refused() {
+        let mut song = Song::default();
+        assert!(song.rename_track(0, "  Bass  "));
+        assert_eq!(song.tracks[0].name, "Bass");
+        assert!(!song.rename_track(0, "   "), "a track was given no name");
+        assert_eq!(song.tracks[0].name, "Bass");
+        assert!(!song.rename_track(4, "Ghost"));
     }
 
     #[test]
@@ -3045,6 +3242,76 @@ mod chain_tests {
         assert!(
             !song.move_device(0, a, true),
             "an effect moved past the tail"
+        );
+    }
+
+    #[test]
+    fn a_put_device_keeps_its_settings_and_gets_a_fresh_id() {
+        let mut song = song();
+        let poly = song.add_device(0, DeviceKind::Poly).expect("instrument");
+        let a = song.add_device(0, DeviceKind::Reverb).expect("effect");
+        let b = song.add_device(0, DeviceKind::Echo).expect("effect");
+        // A COPY of a device still on the chain: the case where keeping
+        // the id would make two devices one.
+        let mut taken = song.device(b).expect("there").clone();
+        taken.bypassed = true;
+        taken.set(crate::params::echo::MIX, 0.9);
+
+        // Asked for the head, an effect lands right behind it.
+        let put = song.insert_device(0, 0, taken.clone()).expect("put");
+        let order: Vec<DeviceId> = song.tracks[0].chain.iter().map(|d| d.id).collect();
+        assert_eq!(order, [poly, put, a, b]);
+        assert_ne!(put, b, "the put device kept an id that is in use");
+        let device = song.device(put).expect("there");
+        assert!(device.bypassed, "the bypass did not travel");
+        assert_eq!(
+            device.value(crate::params::echo::MIX),
+            0.9,
+            "the edit did not travel"
+        );
+        assert!(
+            !song.device(b).expect("there").bypassed,
+            "the original was edited"
+        );
+
+        // Putting the same thing again is another copy, not a move.
+        let again = song
+            .insert_device(0, 99, taken.clone())
+            .expect("put past the tail");
+        assert_ne!(again, put);
+        assert_eq!(song.tracks[0].chain.len(), 5);
+        assert_eq!(song.tracks[0].chain.last().map(|d| d.id), Some(again));
+
+        // An instrument put anywhere replaces the head.
+        let head = song.remove_device(0, poly).expect("there");
+        let replaced = song.insert_device(0, 3, head).expect("put");
+        assert_eq!(song.tracks[0].chain[0].id, replaced);
+        assert_eq!(song.tracks[0].chain.len(), 5);
+
+        // And an audio track refuses it, as it refuses every instrument.
+        let head = song.remove_device(0, replaced).expect("there");
+        assert!(song.insert_device(1, 0, head).is_none());
+    }
+
+    #[test]
+    fn a_sampler_carries_its_sample_through_the_file() {
+        let mut song = song();
+        let id = song.add_device(0, DeviceKind::Sampler).expect("instrument");
+        song.device_mut(id).expect("there").sample = Some("/kits/kick.wav".into());
+        let text = ron::ser::to_string(&song).expect("encodes");
+        let back: Song = ron::from_str(&text).expect("decodes");
+        assert_eq!(
+            back.device(id).and_then(|device| device.sample.clone()),
+            Some(std::path::PathBuf::from("/kits/kick.wav"))
+        );
+        // A device with no sample writes no field, so every file written
+        // before the field existed reads the same as one written after.
+        let reverb = song.add_device(0, DeviceKind::Reverb).expect("effect");
+        assert!(song.device(reverb).expect("there").sample.is_none());
+        let text = ron::ser::to_string(song.device(reverb).expect("there")).expect("encodes");
+        assert!(
+            !text.contains("sample"),
+            "an absent sample was written: {text}"
         );
     }
 

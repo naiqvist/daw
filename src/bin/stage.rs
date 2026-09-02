@@ -28,12 +28,12 @@
 //! meters come back the other way. Nothing else crosses.
 
 use daw::audio::transport::TransportCmd;
-use daw::audio::{Engine, EngineConfig};
+use daw::audio::{Engine, EngineConfig, StreamHealth};
 use daw::design::Polarity;
 use daw::install_fonts;
 use daw::params;
 use daw::song_graph::{self, MASTER_METER, SongNodes};
-use daw::ui::stage::{Level, Stage};
+use daw::ui::stage::{EngineState, Health, Level, Stage};
 use daw::ui::theme::Theme;
 use eframe::egui;
 
@@ -94,6 +94,14 @@ struct Audio {
     /// What the engine was last told about time.
     rolling: bool,
     bpm: f64,
+    /// The stage's seek count the engine was last made to agree with.
+    seeks: u64,
+    /// The block the engine had published when it was last told to
+    /// seek. Its position is not read back until a LATER block has
+    /// arrived: the snapshot in hand was written before the seek, and
+    /// handing the stage that position would throw its clock back to
+    /// where it just left, for one visible frame.
+    seek_block: Option<u64>,
     /// Scratch for the levels handed back to the stage, kept between
     /// frames so a meter costs no allocation per frame.
     levels: Vec<Level>,
@@ -113,7 +121,37 @@ impl Audio {
             nodes: None,
             rolling: false,
             bpm: 0.0,
+            seeks: 0,
+            seek_block: None,
             levels: Vec::new(),
+        }
+    }
+
+    /// What the stage should say about the engine: whether there is one,
+    /// whether it is alive, and what it has dropped. A machine with no
+    /// audio reports itself rather than staying silent about it, and so
+    /// does an engine that was there and went away.
+    fn health(&mut self) -> Health {
+        let Some(engine) = &mut self.engine else {
+            return Health {
+                state: EngineState::Absent,
+                xruns: 0,
+                load: 0.0,
+            };
+        };
+        let state = match engine.health() {
+            StreamHealth::Running => EngineState::Running,
+            StreamHealth::Stalled { seconds } => EngineState::Stalled { seconds },
+            StreamHealth::Errored(error) => EngineState::Errored(error),
+        };
+        let snapshot = engine.latest_block();
+        let info = engine.info();
+        Health {
+            state,
+            // Under- and over-runs together, and the blocks refused for
+            // being oversized: each was probably heard.
+            xruns: snapshot.underflows + snapshot.overflows + snapshot.oversized_blocks,
+            load: snapshot.load(info.sample_rate, info.max_frames as u32) as f32,
         }
     }
 
@@ -121,8 +159,10 @@ impl Audio {
     fn follow(&mut self, stage: &mut Stage) {
         // Told every frame rather than once: a stage that opened without
         // an engine and one whose engine went away are the same state,
-        // and the surface should say so either way.
-        stage.set_engine(self.engine.is_some());
+        // and the surface should say so either way — and a block dropped
+        // this frame is only news this frame.
+        let health = self.health();
+        stage.set_health(health);
         let Some(engine) = &mut self.engine else {
             return;
         };
@@ -176,14 +216,19 @@ impl Audio {
             self.bpm = bpm;
         }
 
+        // Where the stage moved its own clock — a return to the top —
+        // the engine is sent there too, and its position is not read
+        // back until a block written after the seek has arrived.
+        let snapshot = engine.latest_block();
+        if stage.seeks() != self.seeks {
+            let samples = samples_at(engine, stage.tick(), bpm);
+            engine.transport(TransportCmd::Seek(samples));
+            self.seeks = stage.seeks();
+            self.seek_block = Some(snapshot.block);
+        }
+
         let rolling = stage.rolling();
         if rolling != self.rolling {
-            // The stage's clock is still the one on screen; this only
-            // makes the engine's agree about STOPPED or ROLLING. Reading
-            // the engine's position back — so the playhead is what
-            // sounded rather than what was counted — is the next step,
-            // and until it is taken the two clocks share a tempo and a
-            // start rather than a source.
             engine.transport(if rolling {
                 TransportCmd::Play
             } else {
@@ -192,9 +237,22 @@ impl Audio {
             self.rolling = rolling;
         }
 
+        // The playhead is what SOUNDED rather than what was counted: the
+        // engine's own position goes back to the stage every frame it is
+        // rolling, and the stage's frame clock stands in only while a
+        // seek is still in flight.
+        let settled = self
+            .seek_block
+            .is_none_or(|seek_block| snapshot.block > seek_block.saturating_add(1));
+        if settled {
+            self.seek_block = None;
+            if snapshot.playing {
+                stage.set_position(snapshot.beat);
+            }
+        }
+
         // And what came back. A track with no voice in the graph has no
         // meter slot, and reads as silence — which is what it is.
-        let snapshot = engine.latest_block();
         let tracks = stage.song().tracks.len();
         self.levels.clear();
         self.levels.resize(tracks, Level::default());
@@ -217,6 +275,15 @@ impl Audio {
     }
 }
 
+/// A song tick as a sample position, at the tempo the engine is running.
+/// The same arithmetic the engine's own time map does, done here once so
+/// a seek lands where the stage's readout says it is.
+fn samples_at(engine: &Engine, tick: usize, bpm: f64) -> u64 {
+    let beats = tick as f64 / daw::sequencing::TICKS_PER_BEAT as f64;
+    let sample_rate = f64::from(engine.info().sample_rate);
+    (beats * 60.0 / bpm.max(1.0) * sample_rate).round() as u64
+}
+
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         // The fonts and the theme are the design system, and they are the
@@ -230,8 +297,23 @@ impl App {
             // strip and it belongs to the musician, not to the console.
             eprintln!("stage: no audio engine — {trouble}");
         }
+        let mut stage = Stage::new();
+        // Songs live under the music folder unless one is opened from
+        // somewhere else. Said here rather than guessed by the stage, so
+        // a headless stage never writes to disk by accident.
+        if let Some(home) = std::env::var_os("HOME") {
+            stage.set_home(std::path::PathBuf::from(home).join("Music").join("daw"));
+        }
+        // `cargo run --bin stage -- song.stage.ron` opens that song. A
+        // file that will not open is said on stderr and the stage opens
+        // empty, rather than refusing to start over a path.
+        if let Some(path) = std::env::args_os().nth(1)
+            && let Err(error) = stage.open(std::path::PathBuf::from(path))
+        {
+            eprintln!("stage: could not open the song — {error}");
+        }
         Self {
-            stage: Stage::new(),
+            stage,
             audio,
             ground: None,
         }
@@ -260,6 +342,20 @@ impl eframe::App for App {
     /// panel to build, so there is nothing between the window and the
     /// stage. That is the whole surface.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // The window's title carries the song's name and whether it is
+        // safe, so a glance at the taskbar answers both.
+        let title = match self.stage.path() {
+            Some(path) => format!(
+                "daw — stage — {}{}",
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                if self.stage.is_dirty() { " *" } else { "" }
+            ),
+            None => "daw — stage".to_owned(),
+        };
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::Title(title));
         // Follow the stage's ground. Applied only when it CHANGES: the
         // theme rebuilds egui's whole style, which is not a thing to do
         // sixty times a second for an answer that is usually the same.

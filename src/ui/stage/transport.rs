@@ -98,6 +98,16 @@ impl Transport {
         self.tick = tick as f64;
     }
 
+    /// Take the position from outside — an engine reporting where it
+    /// actually is, in beats. The fraction is kept, as it is everywhere
+    /// here, so the subdivision row moves smoothly between the beats the
+    /// engine reports.
+    pub fn follow(&mut self, beats: f64) {
+        if beats.is_finite() {
+            self.tick = (beats * TICKS_PER_BEAT as f64).max(0.0);
+        }
+    }
+
     /// Let `seconds` of time pass at the song's tempo where the playhead
     /// currently stands. Does nothing while stopped.
     ///
@@ -299,6 +309,25 @@ mod tests {
 
         transport.advance(&song, 0.25);
         assert!(transport.beat_phase() < 1e-5, "a whole beat resets it");
+    }
+
+    #[test]
+    fn a_followed_position_replaces_the_counted_one() {
+        let song = Song::default();
+        let mut transport = Transport::new();
+        transport.set_motion(Motion::Rolling);
+        transport.advance(&song, 10.0);
+        transport.follow(2.5);
+        assert_eq!(transport.tick(), TICKS_PER_BEAT * 5 / 2);
+        assert!(
+            (transport.beat_phase() - 0.5).abs() < 1e-5,
+            "the fraction was lost"
+        );
+        // Nonsense from outside is ignored rather than becoming the clock.
+        transport.follow(f64::NAN);
+        assert_eq!(transport.tick(), TICKS_PER_BEAT * 5 / 2);
+        transport.follow(-4.0);
+        assert_eq!(transport.tick(), 0);
     }
 
     #[test]

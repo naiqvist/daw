@@ -23,6 +23,7 @@
 
 mod browser;
 mod chain;
+mod document;
 mod grid;
 mod keymap;
 mod mixer;
@@ -30,18 +31,21 @@ mod ornament;
 mod scenes;
 mod tracks;
 mod transport;
+mod vitals;
 
 use crate::design;
+use crate::devices::DeviceKind;
+use crate::history::History;
 use crate::library::{LibraryConfig, LibraryService, LibrarySnapshot};
 use crate::pitch::Pitch;
 use crate::sequencing::{
-    Clip, GRID_COLUMNS as PATTERN_COLS, GRID_ROWS as PATTERN_ROWS, PATTERN_STEP_TICKS,
+    Clip, Device, GRID_COLUMNS as PATTERN_COLS, GRID_ROWS as PATTERN_ROWS, PATTERN_STEP_TICKS,
     PATTERN_STEPS, PatternId, PitchAuthority, Song, TrackKind,
 };
-use crate::ui::device::meter;
 use crate::ui::glyph;
 use crate::ui::sequencer::{self, grammar, lens, midi_typing, registers, sequence};
 use eframe::egui;
+use std::path::{Path, PathBuf};
 
 use browser::{BrowserStatus, sample_nodes};
 
@@ -50,8 +54,10 @@ pub use grid::{
     FocusColumn, FocusGrid, FocusLattice, FocusRow, FocusScope, FocusStack, Miniature, Step,
 };
 pub use keymap::StageIntent;
+pub use mixer::Reading;
 pub use scenes::Address;
 pub use transport::{Motion, Place, Transport};
+pub use vitals::{EngineState, Health};
 
 /// The calibration field. Big enough that a weak focus signal would let
 /// the eye lose the cursor — which is the point of the test.
@@ -389,39 +395,69 @@ pub struct Stage {
     /// lattice, two contents. The columns never move across the change,
     /// which is what lets the eye keep its place.
     mixing: bool,
-    /// Latest peak per track, index-aligned to the song's tracks, as the
-    /// engine last reported it. Empty while nothing is behind the stage —
-    /// a meter with no engine draws NOTHING rather than a guess.
-    levels: Vec<Level>,
-    /// The master's peak, in the same terms.
-    master_level: Level,
-    /// The BALLISTICS behind those numbers: one pair per track, and the
-    /// master's.
-    ///
-    /// A meter fed raw block peaks is not a meter — the engine finishes a
-    /// block every few milliseconds and the frame sees one of them, so
-    /// the bar flickers on whichever block the repaint happened to catch.
-    /// Attack is instant, because a transient the meter missed is a
-    /// transient the meter lied about; release is slow, because the eye
-    /// reads a falling bar as loudness and a jumping one as noise.
-    meters: Vec<[meter::Ballistics; 2]>,
-    master_meter: [meter::Ballistics; 2],
+    /// The meters: what the engine last reported, through the ballistics
+    /// that make a per-block peak readable. Empty while nothing is
+    /// behind the stage — a meter with no engine draws NOTHING rather
+    /// than a guess.
+    meters: vitals::Meters,
     /// Bumped by every edit that changes WHAT SOUNDS.
     ///
     /// The host watches this to know when the graph it handed the engine
     /// has gone stale. A cursor move must never bump it: recompiling the
     /// graph under a moving cursor would break the sound for nothing.
     revision: u64,
-    /// What the host says about the engine behind this frame: `None`
-    /// while nothing has reported, `Some(false)` when there is no engine
-    /// and `Some(true)` when one is running.
+    /// What the host says about the engine behind this frame: whether
+    /// there is one, whether it is alive, and what it has dropped.
     ///
     /// The stage cannot ask — it holds no engine and never will — so this
-    /// is pushed in beside the levels. Worth one mark on the periphery:
-    /// silence with a running engine is a musical problem, and silence
-    /// with no engine at all is a different one, and a surface that draws
-    /// them the same way makes the reader guess which they have.
-    engine: Option<bool>,
+    /// is pushed in beside the levels. Worth ink on the periphery:
+    /// silence with a running engine is a musical problem, silence with
+    /// no engine at all is a different one, and a glitch that went by
+    /// unannounced is a third — and a surface that draws them the same
+    /// way makes the reader guess which they have.
+    vitals: vitals::Vitals,
+    /// The engine's own position, in beats, as the host last read it
+    /// back — taken once per frame by `show` and then gone. While it
+    /// arrives, the playhead is what SOUNDED; while it does not, the
+    /// frame clock stands in, exactly as it did before there was an
+    /// engine to read.
+    engine_beat: Option<f64>,
+    /// Bumped whenever the stage moves its own clock somewhere the engine
+    /// did not: a return to the top. The host watches it, as it watches
+    /// the revision, and tells the engine to agree.
+    seeks: u64,
+    /// The last frame's length, for the things that move on their own
+    /// between one `show` and the next: meters falling, a flash burning
+    /// down.
+    frame_dt: f32,
+    /// Every settled state of the song, for stepping back through.
+    ///
+    /// Observed after every intent rather than at the end of the frame:
+    /// an intent is the unit a performer thinks in, and the unit they
+    /// expect to take back.
+    history: History<Song>,
+    /// The file the song came from, or was last saved to. `None` is a
+    /// song that has never touched disk, and the first save says where
+    /// it went.
+    path: Option<PathBuf>,
+    /// Where a song with no file of its own is saved, if the host gave
+    /// the stage a folder for songs. Without one a first save is
+    /// refused rather than landing somewhere nobody chose — and a
+    /// headless stage never writes to disk by accident.
+    home: Option<PathBuf>,
+    /// Whether the song differs from what is on disk.
+    dirty: bool,
+    /// A rename in flight. `Some` means the letters are the keyboard's
+    /// meaning — see `keymap::ScopeContext::Rename`.
+    renaming: Option<Rename>,
+    /// A nudge has been spoken and is waiting for its direction. The
+    /// grammar's own shape — verb, then motion — and it lasts exactly
+    /// one intent: anything but a Left or a Right lets it go.
+    nudging: bool,
+    /// The device most recently yanked, with its settings, waiting to be
+    /// put down. Kept rather than consumed by a put, so one device can
+    /// be put on several tracks.
+    clipboard: Option<Device>,
     /// Bumped by every edit a running graph can absorb as a letter — a
     /// fader, a pan. See [`Self::mix_revision`].
     mix_revision: u64,
@@ -454,6 +490,20 @@ pub struct Stage {
     /// daylight answer, so this is a viewing condition rather than a
     /// preference about how the app should look.
     polarity: design::Polarity,
+}
+
+/// A track's name being typed.
+///
+/// It opens holding the name the track already has, so Enter straight
+/// away keeps it — and `fresh` says nothing has been typed yet, so the
+/// first letter REPLACES that name rather than appending to it. That is
+/// the shape a selected field has in every editor: the old name is
+/// there to read and to keep, and gone the moment a new one starts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Rename {
+    track: usize,
+    text: String,
+    fresh: bool,
 }
 
 /// One meter reading: the two sides, as linear amplitude where 1.0 is
@@ -522,12 +572,19 @@ impl Stage {
             library_snapshot: cached,
             library_scanning: true,
             playing: Vec::new(),
-            engine: None,
+            vitals: vitals::Vitals::default(),
+            engine_beat: None,
+            seeks: 0,
+            frame_dt: 0.0,
+            history: History::new(Song::default()),
+            path: None,
+            home: None,
+            dirty: false,
+            renaming: None,
+            nudging: false,
+            clipboard: None,
             mixing: false,
-            levels: Vec::new(),
-            master_level: Level::default(),
-            meters: Vec::new(),
-            master_meter: [meter::Ballistics::default(); 2],
+            meters: vitals::Meters::default(),
             revision: 0,
             mix_revision: 0,
             chain: None,
@@ -611,18 +668,6 @@ impl Stage {
         }
     }
 
-    /// What the meters SHOW, which is not what the engine last said: the
-    /// ballistic reading, which is the one a musician can read.
-    fn shown_levels(&self) -> Vec<Level> {
-        self.meters
-            .iter()
-            .map(|pair| Level {
-                left: meter::db_to_amp(pair[0].shown_db),
-                right: meter::db_to_amp(pair[1].shown_db),
-            })
-            .collect()
-    }
-
     /// The document, for a host that has to turn it into sound.
     ///
     /// Read-only on purpose: the stage owns every edit to the song, so a
@@ -686,15 +731,175 @@ impl Stage {
     /// The stage never asks the engine for anything — telemetry is
     /// pushed in, exactly as edits are pushed out. That is what keeps
     /// this frame free of the audio layer entirely.
-    /// Tell the stage whether there is an engine behind it.
-    pub fn set_engine(&mut self, running: bool) {
-        self.engine = Some(running);
+    /// Tell the stage how the engine behind it is doing.
+    pub fn set_health(&mut self, health: Health) {
+        self.vitals.report(health);
     }
 
+    /// Hand the stage what the engine measured this frame. The meters
+    /// move toward it at the rate the last frame took, which is what
+    /// keeps a per-block peak from flickering.
     pub fn set_levels(&mut self, tracks: &[Level], master: Level) {
-        self.levels.clear();
-        self.levels.extend_from_slice(tracks);
-        self.master_level = master;
+        self.meters.follow(tracks, master, self.frame_dt);
+    }
+
+    /// Tell the stage where the engine's transport is, in beats. Read
+    /// once by the next `show` and then forgotten: a position is a fact
+    /// about NOW, and one kept past its frame would be a clock running
+    /// backwards.
+    pub fn set_position(&mut self, beat: f64) {
+        self.engine_beat = Some(beat);
+    }
+
+    /// How many times the stage has moved its own clock somewhere the
+    /// engine did not. A host that remembers the last value it saw knows
+    /// exactly when to seek the engine.
+    pub fn seeks(&self) -> u64 {
+        self.seeks
+    }
+
+    /// The song's own tick, for a host that has to turn a seek into a
+    /// sample position.
+    pub fn tick(&self) -> usize {
+        self.transport.tick()
+    }
+
+    /// The file the song lives in, if it has one yet.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// Whether the song differs from what is on disk.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Give the stage a folder for songs: where a song that has never
+    /// been saved goes on its first save.
+    pub fn set_home(&mut self, home: impl Into<PathBuf>) {
+        self.home = Some(home.into());
+    }
+
+    /// Replace the song with the one in `path`. The performance stops —
+    /// nothing plays, focus returns to the top — and history restarts:
+    /// undo does not cross a load. A file that will not open changes
+    /// nothing and says why.
+    pub fn open(&mut self, path: impl Into<PathBuf>) -> Result<(), String> {
+        let path = path.into();
+        let song = document::load(&path)?;
+        self.notice = Some(format!("opened {}", document::title(&path)));
+        self.path = Some(path);
+        self.replace_song(song);
+        self.history = History::new(self.song.clone());
+        self.dirty = false;
+        Ok(())
+    }
+
+    /// Write the song to its file, or into the songs folder if it has no
+    /// file yet. Either way the strip says where it went.
+    pub fn save(&mut self) -> Result<(), String> {
+        let path = match (&self.path, &self.home) {
+            (Some(path), _) => path.clone(),
+            (None, Some(home)) => document::untitled_in(home),
+            (None, None) => return Err("nowhere to save: no songs folder".to_owned()),
+        };
+        document::save(&path, &self.song)?;
+        self.notice = Some(format!("saved {}", path.display()));
+        self.path = Some(path);
+        self.dirty = false;
+        Ok(())
+    }
+
+    /// Put a whole new song under the stage — a load, an undo — and
+    /// bring every piece of frame state that stands for the song back
+    /// into agreement with it.
+    ///
+    /// Focus comes back to the top and the performance stops. Both are
+    /// deliberate: the cursor may have been inside a clip the new song
+    /// does not have, and a scene that was playing may not exist. A frame
+    /// that guessed at either would be pointing at something the
+    /// performer cannot see.
+    fn replace_song(&mut self, song: Song) {
+        while self.focus.depth() > 1 {
+            self.focus.escape();
+        }
+        self.inside = None;
+        self.chain = None;
+        self.playing.clear();
+        // A song opens parked at its top, and the engine is told so.
+        self.transport.stop();
+        if self.transport.tick() != 0 {
+            self.transport.rewind();
+            self.seeks = self.seeks.wrapping_add(1);
+        }
+        self.adopt_song(song);
+    }
+
+    /// Take a song that differs from the one under the stage — an undo,
+    /// a redo — keeping focus and the performance wherever the new song
+    /// can still honour them. A clip the cursor is inside that the new
+    /// song does not have sends focus back to the session; everything
+    /// else is clamped rather than reset.
+    fn adopt_song(&mut self, song: Song) {
+        self.song = song;
+        self.renaming = None;
+        self.nudging = false;
+        if let Some(opened) = self.inside
+            && (self.song.pattern(opened.pattern).is_none()
+                || opened.track >= self.song.tracks.len())
+        {
+            while self.focus.depth() > 1 {
+                self.focus.escape();
+            }
+            self.inside = None;
+        }
+        self.fit_playing();
+        self.fit_session();
+        self.touched();
+    }
+
+    /// Bring the frame's scopes back to the song's shape after an edit
+    /// that changed how many tracks or scenes there are, or which devices
+    /// are on the addressed chain. The cursor stays where it can, and
+    /// comes inside the edge where it cannot.
+    fn fit_session(&mut self) {
+        let cols = self.song.tracks.len();
+        let rows = if self.mixing {
+            1
+        } else {
+            scenes::lattice_rows(&self.song)
+        };
+        if let FocusScope::Lattice(lattice) = self.focus.root_mut() {
+            lattice.resize_cols(cols);
+            lattice.resize_rows(rows);
+        }
+        let scenes = self.song.session.scenes.len();
+        for slot in &mut self.playing {
+            if slot.is_some_and(|scene| scene >= scenes) {
+                *slot = None;
+            }
+        }
+        // The band is one device narrower or wider; the cursor comes
+        // back inside it rather than pointing past the end, and a band
+        // with nothing left in it closes.
+        let (cols, rows) = self.chain_shape();
+        match (cols, self.chain.as_mut()) {
+            (0, Some(_)) => self.chain = None,
+            (_, Some(lattice)) => {
+                lattice.resize_cols(cols);
+                lattice.resize_rows(rows);
+            }
+            _ => {}
+        }
+    }
+
+    /// Note the song as it stands, for undo. Every intent ends here
+    /// except the two that walk history themselves.
+    fn settle(&mut self) {
+        if self.song != *self.history.present() {
+            self.history.observe(&self.song);
+            self.dirty = true;
+        }
     }
 
     /// How many parameter rows the band shows at once, and only whole
@@ -842,7 +1047,7 @@ impl Stage {
             self.browser_leaving = self.browser.clone();
         }
 
-        let collect_text = self.browser.is_some();
+        let collect_text = self.browser.is_some() || self.renaming.is_some();
         // While a sentence is being spoken, or the letters are pitches,
         // Escape is the grammar's: it abandons the sentence or leaves
         // pitch entry, and only a bare Escape leaves the clip.
@@ -960,45 +1165,32 @@ impl Stage {
             );
         }
 
-        // The meters move. Every frame, from the last thing the engine
-        // said — including the frames where it said nothing new, which is
-        // exactly when a bar should be falling rather than holding.
+        // The clock. The engine's own position when the host read one
+        // back this frame — so the playhead is what SOUNDED — and the
+        // same fallback the legacy control plane uses when it did not:
+        // the UI's stable frame delta, with continuous frames only while
+        // time is actually passing.
         let dt = ui.ctx().input(|input| input.stable_dt);
-        self.meters
-            .resize(self.song.tracks.len(), Default::default());
-        for (track, pair) in self.meters.iter_mut().enumerate() {
-            let level = self.levels.get(track).copied().unwrap_or_default();
-            for (side, amp) in [level.left, level.right].into_iter().enumerate() {
-                pair[side].advance(meter::amp_to_db(amp).max(meter::FLOOR_DB), dt);
-            }
-        }
-        for (side, amp) in [self.master_level.left, self.master_level.right]
-            .into_iter()
-            .enumerate()
-        {
-            self.master_meter[side].advance(meter::amp_to_db(amp).max(meter::FLOOR_DB), dt);
-        }
-        // A meter still settling is a reason to draw again, even with
-        // nothing else moving.
-        if self
-            .meters
-            .iter()
-            .chain(std::iter::once(&self.master_meter))
-            .any(|pair| pair.iter().any(meter::Ballistics::moving))
-        {
-            ui.ctx().request_repaint();
-        }
-
-        // Same fallback clock as the legacy control plane: the UI's stable
-        // frame delta while there is no engine, with continuous frames only
-        // while time is actually passing.
-        let seconds = f64::from(ui.ctx().input(|input| input.stable_dt));
-        self.transport.advance(&self.song, seconds);
-        if self.transport.motion().is_rolling() {
+        self.tick_clock(dt);
+        if self.transport.motion().is_rolling() || self.meters.moving() || self.vitals.flashing() {
             ui.ctx().request_repaint();
         }
 
         self.draw(ui);
+    }
+
+    /// One frame of time. The engine's position, if the host read one
+    /// back, or `dt` on the frame clock; and `dt` for everything that
+    /// moves on its own between frames.
+    fn tick_clock(&mut self, dt: f32) {
+        self.frame_dt = dt;
+        match self.engine_beat.take() {
+            Some(beat) if self.transport.motion().is_rolling() => {
+                self.transport.follow(beat);
+            }
+            _ => self.transport.advance(&self.song, f64::from(dt)),
+        }
+        self.vitals.tick(dt);
     }
 
     /// Where focus is standing, which is what every key is conditioned on.
@@ -1040,7 +1232,9 @@ impl Stage {
     }
 
     fn scope_context(&self) -> keymap::ScopeContext {
-        if self.browser.is_some() {
+        if self.renaming.is_some() {
+            keymap::ScopeContext::Rename
+        } else if self.browser.is_some() {
             keymap::ScopeContext::Browser
         } else if self.chain.is_some() {
             keymap::ScopeContext::Chain
@@ -1283,7 +1477,55 @@ impl Stage {
     /// and retained in the frame channel; successful later intents do not
     /// erase it, so the slot always holds the latest refusal this frame.
     pub fn apply(&mut self, intent: StageIntent) -> ApplyOutcome {
+        // A nudge waits exactly one intent for its direction. Whatever
+        // comes next ends the wait: a Left or a Right is the motion, and
+        // anything else is a sentence abandoned.
+        let nudging = std::mem::take(&mut self.nudging);
         let result = match intent {
+            StageIntent::Step(step @ (Step::Left | Step::Right)) if nudging => self.nudge(step),
+            // While a name is being typed the keys are letters, and the
+            // three that are not — keep, let go, erase — act on the name
+            // and nothing else.
+            StageIntent::Enter if self.renaming.is_some() => {
+                let rename = self.renaming.take().expect("a rename is in flight");
+                if self.song.rename_track(rename.track, &rename.text) {
+                    self.notice = Some(format!("renamed to {}", rename.text.trim()));
+                    Ok(())
+                } else {
+                    // A blank is refused and the rename stays open: the
+                    // way to keep the old name is Escape, and the way to
+                    // give a new one is to type it.
+                    self.notice = Some("a track needs a name".to_owned());
+                    self.renaming = Some(rename);
+                    Err(RefusalReason::Empty)
+                }
+            }
+            StageIntent::Escape if self.renaming.is_some() => {
+                self.renaming = None;
+                Ok(())
+            }
+            StageIntent::Backspace if self.renaming.is_some() => {
+                let rename = self.renaming.as_mut().expect("a rename is in flight");
+                if rename.fresh {
+                    // The old name is the whole selection: one erase
+                    // takes all of it.
+                    rename.fresh = false;
+                    let had = !rename.text.is_empty();
+                    rename.text.clear();
+                    had.then_some(()).ok_or(RefusalReason::Empty)
+                } else {
+                    rename.text.pop().map(|_| ()).ok_or(RefusalReason::Empty)
+                }
+            }
+            StageIntent::TypeChar(ch) if self.renaming.is_some() => {
+                let rename = self.renaming.as_mut().expect("a rename is in flight");
+                if rename.fresh {
+                    rename.text.clear();
+                    rename.fresh = false;
+                }
+                rename.text.push(ch);
+                Ok(())
+            }
             // Movement goes wherever focus is standing. There is exactly
             // one cursor in the app, and this is the only place it moves.
             StageIntent::Step(step) if self.chain.is_some() => self
@@ -1376,6 +1618,23 @@ impl Stage {
                                 None => Err(RefusalReason::Unavailable),
                             }
                         }
+                        // A sound goes into a sampler: the one already at
+                        // the head of the track, or a new one made for it.
+                        (Some(EntryKind::Sample(path)), Some(track)) => {
+                            self.place_sample(track, path)
+                        }
+                        // A song replaces this one. The browser closes
+                        // with it — it was a window over the old song.
+                        (Some(EntryKind::Project(path)), _) => match self.open(path) {
+                            Ok(()) => {
+                                self.browser = None;
+                                Ok(())
+                            }
+                            Err(error) => {
+                                self.notice = Some(format!("could not open: {error}"));
+                                Err(RefusalReason::Unavailable)
+                            }
+                        },
                         _ => Err(RefusalReason::Unavailable),
                     }
                 }
@@ -1506,9 +1765,14 @@ impl Stage {
             StageIntent::Rewind => {
                 let before = self.transport;
                 self.transport.rewind();
-                (self.transport != before)
-                    .then_some(())
-                    .ok_or(RefusalReason::AtTop)
+                if self.transport == before {
+                    Err(RefusalReason::AtTop)
+                } else {
+                    // The stage moved its own clock; the host has to move
+                    // the engine's to match, and this is how it knows.
+                    self.seeks = self.seeks.wrapping_add(1);
+                    Ok(())
+                }
             }
             StageIntent::Help => {
                 self.help = !self.help;
@@ -1695,18 +1959,24 @@ impl Stage {
             }
             StageIntent::Param { up, coarse } => match self.chained_param() {
                 Some((track, device, param)) => {
-                    let table = self.song.tracks[track].chain[device].kind.spec().params;
-                    match table.iter().find(|def| def.id == param) {
+                    let spec = self.song.tracks[track].chain[device].kind.spec();
+                    match spec
+                        .params
+                        .iter()
+                        .zip(spec.labels)
+                        .find(|(def, _)| def.id == param)
+                    {
                         None => Err(RefusalReason::Unavailable),
-                        Some(def) => {
-                            let step = chain::step_of(def, coarse) * if up { 1.0 } else { -1.0 };
-                            let name = def.name;
+                        Some((def, label)) => {
+                            let step =
+                                chain::step_of(def, label, coarse) * if up { 1.0 } else { -1.0 };
+                            let name = label.name;
                             let lane = &mut self.song.tracks[track].chain[device];
                             let before = lane.value(param);
                             lane.set(param, before + step);
                             let after = lane.value(param);
                             self.notice =
-                                Some(format!("{name} {}", chain::format_value(after, "")));
+                                Some(format!("{name} {}", chain::format_param(def, label, after)));
                             if after == before {
                                 // The end of the range, said the way the
                                 // edge of a grid is said.
@@ -1753,9 +2023,22 @@ impl Stage {
             StageIntent::Browse => {
                 self.browser = match self.browser {
                     Some(_) => None,
-                    // The library opens at its shelves. What is on them
-                    // is not scanned yet.
-                    None => Some(Browser::shelves()),
+                    // The library opens at its shelves. The samples are
+                    // not scanned yet; the songs are read from the songs
+                    // folder now, because a folder is not a scan.
+                    None => {
+                        let mut browser = Browser::shelves();
+                        browser.set_children(
+                            Shelf::Projects,
+                            browser::project_nodes(self.home.as_deref()),
+                            if self.home.is_some() {
+                                BrowserStatus::Ready
+                            } else {
+                                BrowserStatus::Unavailable
+                            },
+                        );
+                        Some(browser)
+                    }
                 };
                 Ok(())
             }
@@ -1774,7 +2057,76 @@ impl Stage {
                         .then_some(())
                         .ok_or(RefusalReason::Empty)
                 }),
+            // History. The floor refuses quietly and says so; a step
+            // that lands leaves focus where it is and the performance
+            // running, because undoing a fader move is not a reason to
+            // stop the song or lose one's place.
+            StageIntent::Undo => {
+                let mut song = self.song.clone();
+                if self.history.undo(&mut song) {
+                    self.adopt_song(song);
+                    self.dirty = true;
+                    self.notice = Some("undo".to_owned());
+                    Ok(())
+                } else {
+                    self.notice = Some("nothing to undo".to_owned());
+                    Err(RefusalReason::Empty)
+                }
+            }
+            StageIntent::Redo => {
+                let mut song = self.song.clone();
+                if self.history.redo(&mut song) {
+                    self.adopt_song(song);
+                    self.dirty = true;
+                    self.notice = Some("redo".to_owned());
+                    Ok(())
+                } else {
+                    self.notice = Some("nothing to redo".to_owned());
+                    Err(RefusalReason::Empty)
+                }
+            }
+            StageIntent::Save => match self.save() {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    self.notice = Some(format!("could not save: {error}"));
+                    Err(RefusalReason::Unavailable)
+                }
+            },
+            // The track under the cursor. Its name is typed over the head
+            // it belongs to; taking it out of the song takes its slots
+            // with it, and the last track stays — a session with no
+            // columns has nowhere for the cursor to be.
+            StageIntent::Rename => match self.focused_track() {
+                Some(index) => {
+                    self.renaming = Some(Rename {
+                        track: index,
+                        text: self.song.tracks[index].name.clone(),
+                        fresh: true,
+                    });
+                    Ok(())
+                }
+                None => Err(RefusalReason::Unavailable),
+            },
+            StageIntent::DeleteTrack => self.delete_track(),
+            StageIntent::Nudge => {
+                // Only where there is something to move. Spoken from the
+                // browser or inside a clip it would wait for a motion
+                // that could not mean anything.
+                if self.chained_device().is_some() || self.focused_track().is_some() {
+                    self.nudging = true;
+                    self.notice = Some("NUDGE · ← →".to_owned());
+                    Ok(())
+                } else {
+                    Err(RefusalReason::Unavailable)
+                }
+            }
+            StageIntent::Yank => self.yank(),
+            StageIntent::Put => self.put(),
         };
+        // Every intent ends at a settled song, which is what undo steps
+        // back through. Undo and redo settle where they land, so the
+        // observation is a no-op for them.
+        self.settle();
         match result {
             Ok(()) => ApplyOutcome::Changed,
             Err(reason) => {
@@ -1783,6 +2135,151 @@ impl Stage {
                 ApplyOutcome::Refused(refusal)
             }
         }
+    }
+
+    /// A nudge's motion: the device under the band's cursor one place
+    /// along its chain, or the track under the session's cursor one
+    /// place along the strip. The cursor goes with the thing it moved,
+    /// so a second press moves it again.
+    fn nudge(&mut self, step: Step) -> Result<(), RefusalReason> {
+        let later = step == Step::Right;
+        if self.chain.is_some() {
+            let (track, device) = self.chained_device().ok_or(RefusalReason::Empty)?;
+            let id = self.song.tracks[track].chain[device].id;
+            if !self.song.move_device(track, id, later) {
+                return Err(RefusalReason::Edge(step));
+            }
+            let to = self.song.tracks[track]
+                .chain
+                .iter()
+                .position(|candidate| candidate.id == id)
+                .unwrap_or(device);
+            if let Some(lattice) = self.chain.as_mut() {
+                lattice.focus_col(to);
+            }
+            self.notice = Some(format!(
+                "{} → {}",
+                self.song.tracks[track].chain[to].kind.spec().name,
+                to + 1
+            ));
+            self.touched();
+            return Ok(());
+        }
+        let index = self.focused_track().ok_or(RefusalReason::Unavailable)?;
+        if !self.song.move_track(index, later) {
+            return Err(RefusalReason::Edge(step));
+        }
+        let to = if later { index + 1 } else { index - 1 };
+        // What each track is playing is indexed by position, and the
+        // positions just swapped.
+        self.fit_playing();
+        self.playing.swap(index, to);
+        if let FocusScope::Lattice(lattice) = self.focus.root_mut() {
+            lattice.focus_col(to);
+        }
+        self.notice = Some(format!("{} → {:02}", self.song.tracks[to].name, to + 1));
+        self.touched();
+        Ok(())
+    }
+
+    /// Lift the device under the band's cursor off its chain and keep it,
+    /// settings and all.
+    fn yank(&mut self) -> Result<(), RefusalReason> {
+        let (track, device) = self.chained_device().ok_or(RefusalReason::Empty)?;
+        let id = self.song.tracks[track].chain[device].id;
+        let taken = self
+            .song
+            .remove_device(track, id)
+            .ok_or(RefusalReason::Empty)?;
+        self.notice = Some(format!("yanked {}", taken.kind.spec().name));
+        self.clipboard = Some(taken);
+        self.fit_session();
+        self.touched();
+        Ok(())
+    }
+
+    /// Put the kept device down: after the device under the band's
+    /// cursor, or at the end of the addressed track's chain when the band
+    /// is not up. The clipboard keeps it, so one device can go on several
+    /// tracks — each copy with an id of its own.
+    fn put(&mut self) -> Result<(), RefusalReason> {
+        let device = self.clipboard.clone().ok_or(RefusalReason::Empty)?;
+        let track = self.addressed_track().ok_or(RefusalReason::Unavailable)?;
+        let at = match self.chained_device() {
+            Some((_, index)) => index + 1,
+            None => self.song.tracks[track].chain.len(),
+        };
+        let name = device.kind.spec().name;
+        let id = self
+            .song
+            .insert_device(track, at, device)
+            .ok_or(RefusalReason::Unavailable)?;
+        self.notice = Some(format!("+ {name}"));
+        self.fit_session();
+        if let Some(lattice) = self.chain.as_mut() {
+            let to = self.song.tracks[track]
+                .chain
+                .iter()
+                .position(|candidate| candidate.id == id)
+                .unwrap_or(0);
+            lattice.focus_col(to);
+        }
+        self.touched();
+        Ok(())
+    }
+
+    /// Take the track under the cursor out of the song. The cursor stays
+    /// at the same place on the strip, which is now the next track along
+    /// — or the last one, if it was the last that went.
+    fn delete_track(&mut self) -> Result<(), RefusalReason> {
+        let index = self.focused_track().ok_or(RefusalReason::Unavailable)?;
+        if self.song.tracks.len() <= 1 {
+            self.notice = Some("the last track stays".to_owned());
+            return Err(RefusalReason::Unavailable);
+        }
+        let removed = self
+            .song
+            .remove_track(index)
+            .ok_or(RefusalReason::Unavailable)?;
+        if index < self.playing.len() {
+            self.playing.remove(index);
+        }
+        self.notice = Some(format!("- {}", removed.name));
+        self.fit_session();
+        let last = self.song.tracks.len() - 1;
+        if let FocusScope::Lattice(lattice) = self.focus.root_mut() {
+            lattice.focus_col(index.min(last));
+        }
+        self.touched();
+        Ok(())
+    }
+
+    /// A sound for the addressed track: into the sampler at its head, or
+    /// into a new sampler that takes the head. An audio track has no
+    /// instrument to give a sound to, and says so.
+    fn place_sample(&mut self, track: usize, path: PathBuf) -> Result<(), RefusalReason> {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let head_is_sampler = self.song.tracks[track]
+            .chain
+            .first()
+            .is_some_and(|device| device.kind == DeviceKind::Sampler);
+        let id = if head_is_sampler {
+            self.song.tracks[track].chain[0].id
+        } else {
+            self.song
+                .add_device(track, DeviceKind::Sampler)
+                .ok_or(RefusalReason::Unavailable)?
+        };
+        if let Some(device) = self.song.device_mut(id) {
+            device.sample = Some(path);
+        }
+        self.notice = Some(format!("+ sampler · {name}"));
+        self.fit_session();
+        self.touched();
+        Ok(())
     }
 
     fn draw(&mut self, ui: &mut egui::Ui) {
@@ -2007,11 +2504,22 @@ impl Stage {
                 title_font.clone(),
                 if here { alpha.ground.color } else { ink },
             );
-            if column.bypassed {
+            // The right of the head: the bypass mark, or — on a sampler
+            // that is not bypassed — the name of the file it plays, cut
+            // to the cells the title leaves free.
+            let aside = if column.bypassed {
+                Some("—".to_owned())
+            } else {
+                column.sample.as_ref().map(|name| {
+                    let room = cells.saturating_sub(column.title.chars().count() + 1);
+                    name.chars().take(room).collect()
+                })
+            };
+            if let Some(aside) = aside {
                 painter.text(
                     egui::pos2(head.max.x - pad, head.center().y),
                     egui::Align2::RIGHT_CENTER,
-                    "—",
+                    aside,
                     title_font.clone(),
                     if here {
                         alpha.ground.color
@@ -2413,18 +2921,28 @@ impl Stage {
             } else {
                 (self.alphabet().ink.color, self.alphabet().ink.color)
             };
-            let name_cells = {
+            // While this head is being renamed the letters typed so far
+            // ARE its name, with a caret to say the word is not finished.
+            let name = match &self.renaming {
+                Some(rename) if rename.track == index => format!("{}_", rename.text),
+                _ => head.name.clone(),
+            };
+            // Cut to leave the sigil its corner: a name that ran under
+            // the mark would be two things in one place.
+            let name = {
                 let cell = painter
                     .layout_no_wrap("M".to_owned(), name_font.clone(), name_ink)
                     .rect
                     .width()
                     .max(1.0);
-                (((rect.width() - pad * 2.0 - sigil_room) / cell).floor()).max(1.0) as usize
+                let cells =
+                    (((rect.width() - pad * 2.0 - sigil_room) / cell).floor()).max(1.0) as usize;
+                name.chars().take(cells).collect::<String>()
             };
             painter.text(
                 egui::pos2(rect.min.x + pad, rect.min.y + pad),
                 egui::Align2::LEFT_TOP,
-                head.name.chars().take(name_cells).collect::<String>(),
+                name,
                 name_font.clone(),
                 name_ink,
             );
@@ -2614,10 +3132,8 @@ impl Stage {
                 // could silence it.
                 audible: true,
                 switches: false,
-                level: Level {
-                    left: meter::db_to_amp(self.master_meter[0].shown_db),
-                    right: meter::db_to_amp(self.master_meter[1].shown_db),
-                },
+                level: self.meters.master().level,
+                peak: self.meters.master().peak,
             },
             design::px(design::space::SNUG),
             alpha,
@@ -2652,7 +3168,7 @@ impl Stage {
             return;
         }
         let bottom = field.max.y - margin;
-        let channels = mixer::channels(&self.song, &self.shown_levels());
+        let channels = mixer::channels(&self.song, &self.meters.readings());
         for (slot, track) in tracks.enumerate() {
             let Some(channel) = channels.get(track) else {
                 continue;
@@ -2946,16 +3462,51 @@ impl Stage {
     /// It is JEOPARDY rather than ink: nothing this frame does will make
     /// a sound, and that is a thing at stake rather than a fact to read.
     fn draw_engine(&self, painter: &egui::Painter, zone: egui::Rect) {
-        if self.engine != Some(false) {
-            return;
-        }
         let margin = design::px(design::space::ROOM);
+        let gap = design::px(design::space::ROOM);
+        let font = egui::FontId::monospace(design::px(design::type_scale::MICRO));
+        let alpha = self.alphabet();
+        let mut right = zone.max.x - margin;
+
+        // The song's name, and whether it is safe. Structure ink: a fact
+        // to read when looked for, never a thing that competes with the
+        // message beside it.
+        let title = self
+            .path
+            .as_deref()
+            .map(document::title)
+            .unwrap_or_else(|| "untitled".to_owned());
+        let title = if self.dirty {
+            format!("{title} *")
+        } else {
+            title
+        };
+        let title_rect = painter.text(
+            egui::pos2(right, zone.center().y),
+            egui::Align2::RIGHT_CENTER,
+            title,
+            font.clone(),
+            alpha.edge.color,
+        );
+        right = title_rect.min.x - gap;
+
+        // The engine, in as many words as it needs and no more: a
+        // running engine says nothing, a dropped block says so loudly
+        // for as long as it takes to be seen, and the count stays behind
+        // quietly for whoever looks later.
+        let Some((words, tone)) = self.vitals.words() else {
+            return;
+        };
+        let ink = match tone {
+            vitals::Tone::Alarm => alpha.jeopardy_active.color,
+            vitals::Tone::Quiet => alpha.edge.color,
+        };
         painter.text(
-            egui::pos2(zone.min.x + margin, zone.center().y),
-            egui::Align2::LEFT_CENTER,
-            "NO ENGINE",
-            egui::FontId::monospace(design::px(design::type_scale::MICRO)),
-            self.alphabet().jeopardy_active.color,
+            egui::pos2(right, zone.center().y),
+            egui::Align2::RIGHT_CENTER,
+            words,
+            font,
+            ink,
         );
     }
 
@@ -3421,7 +3972,15 @@ impl Stage {
             if self.midi_typing.enabled() {
                 words.push("MIDI · letters are pitches");
             }
-            if let Some(notice) = &self.notice {
+            // A mode that does not announce itself is a trap, and a
+            // rename is a mode: every letter is the name until Enter.
+            let renaming = self
+                .renaming
+                .as_ref()
+                .map(|rename| format!("RENAME · {}_", rename.text));
+            if let Some(renaming) = &renaming {
+                words.push(renaming.as_str());
+            } else if let Some(notice) = &self.notice {
                 words.push(notice.as_str());
             }
             if !words.is_empty() {
@@ -4317,6 +4876,12 @@ mod tests {
                     keymap::ScopeContext::Mixer => {
                         assert_eq!(command(&mut stage, Key::M), ApplyOutcome::Changed);
                     }
+                    keymap::ScopeContext::Rename => {
+                        assert_eq!(
+                            stage.handle_key(Modifiers::NONE, Key::F2),
+                            Some(ApplyOutcome::Changed)
+                        );
+                    }
                     keymap::ScopeContext::Chain => {
                         into_chain(&mut stage);
                     }
@@ -4339,6 +4904,14 @@ mod tests {
                     stage.song.clone(),
                     stage.polarity,
                     stage.chain.clone(),
+                    // Tuples stop at twelve; the document's own state
+                    // rides as one.
+                    (
+                        stage.renaming.clone(),
+                        stage.nudging,
+                        stage.clipboard.clone(),
+                        stage.path.clone(),
+                    ),
                 );
 
                 match stage.handle_key(modifiers, key) {
@@ -4354,6 +4927,12 @@ mod tests {
                                 stage.song.clone(),
                                 stage.polarity,
                                 stage.chain.clone(),
+                                (
+                                    stage.renaming.clone(),
+                                    stage.nudging,
+                                    stage.clipboard.clone(),
+                                    stage.path.clone(),
+                                ),
                             ),
                             before,
                             "{scope:?} + {key:?} lied about changing"
@@ -4372,6 +4951,12 @@ mod tests {
                                 stage.song.clone(),
                                 stage.polarity,
                                 stage.chain.clone(),
+                                (
+                                    stage.renaming.clone(),
+                                    stage.nudging,
+                                    stage.clipboard.clone(),
+                                    stage.path.clone(),
+                                ),
                             ),
                             before,
                             "{scope:?} + {key:?} changed and refused"
@@ -4393,9 +4978,14 @@ mod tests {
     #[test]
     fn transport_keys_apply_from_every_scope_without_moving_focus() {
         for scope in keymap::ScopeContext::ALL {
+            // While a name is being typed, a space is a space.
+            if scope == keymap::ScopeContext::Rename {
+                continue;
+            }
             let mut stage = Stage::new();
             match scope {
                 keymap::ScopeContext::Root => {}
+                keymap::ScopeContext::Rename => unreachable!(),
                 keymap::ScopeContext::Nested => {
                     assert_eq!(
                         stage.handle_key(Modifiers::NONE, Key::Enter),
@@ -4981,7 +5571,7 @@ mod tests {
     #[test]
     fn a_meter_reads_nothing_until_something_measures_it() {
         let mut stage = Stage::new();
-        let quiet = mixer::channels(stage.song(), &stage.levels);
+        let quiet = mixer::channels(stage.song(), &stage.meters.readings());
         assert_eq!(quiet[0].level, Level::default());
 
         stage.set_levels(
@@ -4994,12 +5584,42 @@ mod tests {
                 right: 0.5,
             },
         );
-        let heard = mixer::channels(stage.song(), &stage.levels);
-        assert_eq!(heard[0].level.left, 0.5);
-        assert_eq!(
-            heard[0].level.right, 0.25,
+        let heard = mixer::channels(stage.song(), &stage.meters.readings());
+        // Through decibels and back, so to within a rounding.
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-5;
+        assert!(near(heard[0].level.left, 0.5));
+        assert!(
+            near(heard[0].level.right, 0.25),
             "the sides were flattened into one"
         );
+        assert!(
+            near(heard[0].peak.left, 0.5),
+            "the peak mark did not rise with the bar"
+        );
+    }
+
+    #[test]
+    fn a_meter_falls_at_the_frames_own_rate_rather_than_at_once() {
+        // The flicker: a per-block peak drawn raw. The frame's length is
+        // what the ballistics run on, and the host hands the stage a
+        // level every frame — so a loud block followed by a quiet one is
+        // a bar coming down, not a bar that vanished.
+        let mut stage = Stage::new();
+        stage.frame_dt = 1.0 / 60.0;
+        let loud = Level {
+            left: 1.0,
+            right: 1.0,
+        };
+        stage.set_levels(&[loud], loud);
+        stage.set_levels(&[Level::default()], Level::default());
+        let shown = stage.meters.readings()[0];
+        assert!(shown.level.left < 1.0, "the bar did not fall");
+        assert!(
+            shown.level.left > 0.5,
+            "the bar fell to nothing in one frame"
+        );
+        assert_eq!(shown.peak, loud, "the peak mark let go at once");
+        assert!(stage.meters.moving(), "a falling meter said it was at rest");
     }
 
     /// Put a device on the addressed track and open the band on it.
@@ -5311,6 +5931,9 @@ mod tests {
                 keymap::ScopeContext::Clip => {
                     into_clip(&mut stage);
                 }
+                keymap::ScopeContext::Rename => {
+                    let _ = stage.handle_key(Modifiers::NONE, Key::F2);
+                }
             }
             assert_eq!(stage.scope_context(), scope);
             let opened = stage.polarity();
@@ -5395,6 +6018,11 @@ mod tests {
     /// Walk the browser to a device leaf and press it.
     fn place_device(stage: &mut Stage, name: &str) -> ApplyOutcome {
         let _ = command(stage, Key::F);
+        enter_leaf(stage, name)
+    }
+
+    /// With the browser already up: find the named leaf and press it.
+    fn enter_leaf(stage: &mut Stage, name: &str) -> ApplyOutcome {
         // Open shelves and headings until the named leaf is under the
         // cursor. The browser is a tree; this is a search, not a route.
         for _ in 0..400 {
@@ -5737,11 +6365,887 @@ mod tests {
     #[test]
     fn the_stage_says_when_there_is_no_engine_behind_it() {
         let mut stage = Stage::new();
-        assert_eq!(stage.engine, None, "the stage assumed an engine");
-        stage.set_engine(true);
-        assert_eq!(stage.engine, Some(true));
-        stage.set_engine(false);
-        assert_eq!(stage.engine, Some(false));
+        assert_eq!(stage.vitals.words(), None, "the stage assumed an engine");
+        assert!(!stage.vitals.running());
+        stage.set_health(Health {
+            state: EngineState::Running,
+            xruns: 0,
+            load: 0.1,
+        });
+        assert!(stage.vitals.running());
+        assert_eq!(stage.vitals.words(), None, "a running engine spent ink");
+        stage.set_health(Health {
+            state: EngineState::Absent,
+            xruns: 0,
+            load: 0.0,
+        });
+        assert!(!stage.vitals.running());
+        assert_eq!(
+            stage.vitals.words().map(|(words, _)| words).as_deref(),
+            Some("NO ENGINE")
+        );
+    }
+
+    #[test]
+    fn an_xrun_is_said_out_loud_and_then_kept_as_a_count() {
+        let mut stage = Stage::new();
+        let report = |xruns| Health {
+            state: EngineState::Running,
+            xruns,
+            load: 0.3,
+        };
+        stage.set_health(report(0));
+        stage.set_health(report(1));
+        assert!(stage.vitals.flashing(), "an xrun happened silently");
+        let (words, tone) = stage.vitals.words().expect("something to say");
+        assert!(words.starts_with("XRUN"), "{words}");
+        assert_eq!(tone, vitals::Tone::Alarm);
+        // The flash burns down on the frame clock, and the count stays.
+        stage.frame_dt = 1.0;
+        stage.vitals.tick(vitals::XRUN_FLASH_S + 0.1);
+        assert!(!stage.vitals.flashing());
+        assert_eq!(
+            stage.vitals.words(),
+            Some(("1 dropped".to_owned(), vitals::Tone::Quiet))
+        );
+    }
+
+    // ------------------------------------------------------- tracks ---
+
+    #[test]
+    fn f2_renames_the_track_under_the_cursor_and_the_first_letter_replaces_the_old_name() {
+        let mut stage = Stage::new();
+        assert_eq!(
+            stage.handle_key(Modifiers::NONE, Key::F2),
+            Some(ApplyOutcome::Changed)
+        );
+        assert_eq!(stage.scope_context(), keymap::ScopeContext::Rename);
+        // The old name is there to keep...
+        assert_eq!(
+            stage.renaming.as_ref().map(|r| r.text.as_str()),
+            Some("Instrument 01")
+        );
+        // ...and gone the moment a new one starts.
+        type_text(&mut stage, "Bass");
+        assert_eq!(
+            stage.renaming.as_ref().map(|r| r.text.as_str()),
+            Some("Bass")
+        );
+        assert_eq!(
+            stage.song.tracks[0].name, "Instrument 01",
+            "the name changed before Enter"
+        );
+        assert_eq!(
+            drive(&mut stage, &[Key::Enter]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(stage.song.tracks[0].name, "Bass");
+        assert_eq!(stage.scope_context(), keymap::ScopeContext::Root);
+        assert!(stage.renaming.is_none());
+    }
+
+    #[test]
+    fn enter_at_once_keeps_the_name_and_escape_lets_the_typing_go() {
+        let mut stage = Stage::new();
+        let _ = stage.handle_key(Modifiers::NONE, Key::F2);
+        assert_eq!(
+            drive(&mut stage, &[Key::Enter]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(stage.song.tracks[0].name, "Instrument 01");
+
+        let _ = stage.handle_key(Modifiers::NONE, Key::F2);
+        type_text(&mut stage, "Nope");
+        assert_eq!(
+            drive(&mut stage, &[Key::Escape]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(
+            stage.song.tracks[0].name, "Instrument 01",
+            "escape kept the typing"
+        );
+        assert!(stage.renaming.is_none());
+    }
+
+    #[test]
+    fn a_blank_name_is_refused_and_the_rename_stays_open() {
+        let mut stage = Stage::new();
+        let _ = stage.handle_key(Modifiers::NONE, Key::F2);
+        // One erase on the fresh name takes the whole selection.
+        assert_eq!(
+            drive(&mut stage, &[Key::Backspace]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(stage.renaming.as_ref().map(|r| r.text.as_str()), Some(""));
+        assert!(matches!(
+            drive(&mut stage, &[Key::Enter])[0],
+            ApplyOutcome::Refused(Refusal {
+                reason: RefusalReason::Empty,
+                ..
+            })
+        ));
+        assert!(stage.renaming.is_some(), "a refused rename closed");
+        assert_eq!(stage.song.tracks[0].name, "Instrument 01");
+        // Letters after the erase append, one at a time, and erase again
+        // takes one at a time.
+        type_text(&mut stage, "Kick");
+        let _ = drive(&mut stage, &[Key::Backspace]);
+        assert_eq!(
+            stage.renaming.as_ref().map(|r| r.text.as_str()),
+            Some("Kic")
+        );
+        // While typing, a chord that would mean something elsewhere is a
+        // letter here: nothing but the name changes.
+        let before = stage.song.clone();
+        type_text(&mut stage, " ?");
+        assert_eq!(stage.song, before);
+        assert_eq!(
+            stage.renaming.as_ref().map(|r| r.text.as_str()),
+            Some("Kic ?")
+        );
+    }
+
+    #[test]
+    fn deleting_a_track_takes_its_slots_and_the_cursor_stays_on_the_strip() {
+        let mut stage = Stage::new();
+        assert_eq!(command(&mut stage, Key::T), ApplyOutcome::Changed);
+        assert_eq!(command_shift(&mut stage, Key::T), ApplyOutcome::Changed);
+        // A clip on the middle track, and that track playing it.
+        let _ = drive(&mut stage, &[Key::ArrowLeft, Key::ArrowDown, Key::Enter]);
+        let _ = stage.handle_key(Modifiers::SHIFT, Key::Enter);
+        let gone = stage.song.tracks[1].id;
+        assert_eq!(stage.playing, vec![None, Some(0), None]);
+        let _ = drive(&mut stage, &[Key::ArrowUp]);
+
+        assert_eq!(command(&mut stage, Key::Delete), ApplyOutcome::Changed);
+        assert_eq!(stage.song.tracks.len(), 2);
+        assert!(stage.song.tracks.iter().all(|track| track.id != gone));
+        assert!(
+            stage
+                .song
+                .session
+                .scenes
+                .iter()
+                .all(|scene| scene.clip(gone).is_none()),
+            "a slot still named the removed track"
+        );
+        assert_eq!(
+            stage.playing,
+            vec![None, None],
+            "the playing table fell out of step"
+        );
+        // The cursor stays at the same place on the strip: the track
+        // that was to the right is now under it.
+        assert_eq!(session(&stage).cursor(), Some((1, 0)));
+        assert_eq!(stage.song.tracks[1].kind, TrackKind::Instrument);
+        assert_eq!(stage.notice.as_deref(), Some("- Audio 01"));
+
+        // Deleting the last on the strip lands the cursor on the new last.
+        assert_eq!(command(&mut stage, Key::Backspace), ApplyOutcome::Changed);
+        assert_eq!(session(&stage).cursor(), Some((0, 0)));
+    }
+
+    #[test]
+    fn the_last_track_stays() {
+        let mut stage = Stage::new();
+        assert!(matches!(
+            command(&mut stage, Key::Delete),
+            ApplyOutcome::Refused(Refusal {
+                reason: RefusalReason::Unavailable,
+                ..
+            })
+        ));
+        assert_eq!(stage.song.tracks.len(), 1);
+        assert_eq!(stage.notice.as_deref(), Some("the last track stays"));
+    }
+
+    #[test]
+    fn w_then_an_arrow_moves_the_track_and_the_cursor_goes_with_it() {
+        let mut stage = Stage::new();
+        let _ = command(&mut stage, Key::T);
+        let first = stage.song.tracks[0].id;
+        let _ = drive(&mut stage, &[Key::ArrowLeft]);
+        // The first track is playing scene two; the fact must travel.
+        let _ = drive(&mut stage, &[Key::ArrowDown, Key::ArrowDown, Key::Enter]);
+        let _ = stage.handle_key(Modifiers::SHIFT, Key::Enter);
+        let _ = drive(&mut stage, &[Key::ArrowUp, Key::ArrowUp]);
+        assert_eq!(stage.playing, vec![Some(1), None]);
+
+        assert_eq!(drive(&mut stage, &[Key::W]), vec![ApplyOutcome::Changed]);
+        assert!(stage.nudging);
+        assert_eq!(
+            drive(&mut stage, &[Key::ArrowRight]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert!(!stage.nudging, "the nudge outlived its motion");
+        assert_eq!(stage.song.tracks[1].id, first);
+        assert_eq!(
+            session(&stage).cursor(),
+            Some((1, 0)),
+            "the cursor lost its track"
+        );
+        assert_eq!(
+            stage.playing,
+            vec![None, Some(1)],
+            "what was playing stayed behind"
+        );
+
+        // At the end of the strip the motion is refused as an edge.
+        let _ = drive(&mut stage, &[Key::W]);
+        assert!(matches!(
+            drive(&mut stage, &[Key::ArrowRight])[0],
+            ApplyOutcome::Refused(Refusal {
+                reason: RefusalReason::Edge(Step::Right),
+                ..
+            })
+        ));
+        assert_eq!(stage.song.tracks[1].id, first);
+    }
+
+    #[test]
+    fn a_nudge_followed_by_anything_else_is_let_go() {
+        let mut stage = Stage::new();
+        let _ = command(&mut stage, Key::T);
+        let _ = drive(&mut stage, &[Key::ArrowLeft, Key::W]);
+        let order: Vec<_> = stage.song.tracks.iter().map(|t| t.id).collect();
+        // Down is a step, not a motion for the nudge.
+        assert_eq!(
+            drive(&mut stage, &[Key::ArrowDown]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(
+            session(&stage).cursor(),
+            Some((0, 1)),
+            "the step did not step"
+        );
+        assert!(!stage.nudging);
+        // And now Right is a step too.
+        let _ = drive(&mut stage, &[Key::ArrowRight]);
+        assert_eq!(session(&stage).cursor(), Some((1, 1)));
+        assert_eq!(
+            stage.song.tracks.iter().map(|t| t.id).collect::<Vec<_>>(),
+            order,
+            "a let-go nudge still moved something"
+        );
+    }
+
+    // -------------------------------------------------------- chain ---
+
+    /// A chain of three on the first track, and the band open on it.
+    fn into_chain_of_three(stage: &mut Stage) -> [crate::sequencing::DeviceId; 3] {
+        use crate::devices::DeviceKind;
+        let poly = stage
+            .song
+            .add_device(0, DeviceKind::Poly)
+            .expect("instrument");
+        let sat = stage.song.add_device(0, DeviceKind::Sat).expect("effect");
+        let reverb = stage
+            .song
+            .add_device(0, DeviceKind::Reverb)
+            .expect("effect");
+        assert_eq!(command(stage, Key::D), ApplyOutcome::Changed);
+        [poly, sat, reverb]
+    }
+
+    fn chain_ids(stage: &Stage) -> Vec<crate::sequencing::DeviceId> {
+        stage.song.tracks[0].chain.iter().map(|d| d.id).collect()
+    }
+
+    #[test]
+    fn w_then_an_arrow_reorders_the_chain_and_the_cursor_follows_the_device() {
+        let mut stage = Stage::new();
+        let [poly, sat, reverb] = into_chain_of_three(&mut stage);
+        let _ = drive(&mut stage, &[Key::ArrowRight]);
+        assert_eq!(
+            stage.chain.as_ref().and_then(FocusLattice::cursor),
+            Some((1, 0))
+        );
+        let before = stage.revision();
+
+        assert_eq!(drive(&mut stage, &[Key::W]), vec![ApplyOutcome::Changed]);
+        assert_eq!(
+            drive(&mut stage, &[Key::ArrowRight]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(chain_ids(&stage), [poly, reverb, sat]);
+        assert_eq!(
+            stage.chain.as_ref().and_then(FocusLattice::cursor),
+            Some((2, 0)),
+            "the cursor did not go with the device"
+        );
+        assert_ne!(
+            stage.revision(),
+            before,
+            "a reordered chain did not change what sounds"
+        );
+
+        // Back the other way, and then into the head: refused, and the
+        // head keeps its place.
+        let _ = drive(&mut stage, &[Key::W, Key::ArrowLeft]);
+        assert_eq!(chain_ids(&stage), [poly, sat, reverb]);
+        assert_eq!(
+            stage.chain.as_ref().and_then(FocusLattice::cursor),
+            Some((1, 0))
+        );
+        let _ = drive(&mut stage, &[Key::W]);
+        assert!(matches!(
+            drive(&mut stage, &[Key::ArrowLeft])[0],
+            ApplyOutcome::Refused(Refusal {
+                reason: RefusalReason::Edge(Step::Left),
+                ..
+            })
+        ));
+        assert_eq!(chain_ids(&stage), [poly, sat, reverb]);
+        // The codebook names the verb, so it can be found.
+        assert!(
+            keymap::bindings_for(keymap::ScopeContext::Chain)
+                .any(|(_, key, intent)| key == Key::W && intent == StageIntent::Nudge)
+        );
+    }
+
+    #[test]
+    fn q_yanks_a_device_with_its_settings_and_e_puts_a_copy_after_the_cursor() {
+        let mut stage = Stage::new();
+        let [poly, sat, reverb] = into_chain_of_three(&mut stage);
+        // A setting a quarter of the way up its range: not the default,
+        // whatever the range is.
+        let drive_param = crate::params::sat::DRIVE;
+        let def = crate::params::def(crate::params::sat::TABLE, drive_param);
+        let quarter = def.min + (def.max - def.min) / 4.0;
+        stage
+            .song
+            .device_mut(sat)
+            .expect("there")
+            .set(drive_param, quarter);
+        let _ = drive(&mut stage, &[Key::ArrowRight]);
+
+        assert_eq!(drive(&mut stage, &[Key::Q]), vec![ApplyOutcome::Changed]);
+        assert_eq!(chain_ids(&stage), [poly, reverb]);
+        let kept = stage.clipboard.as_ref().expect("the device was kept");
+        assert_eq!(kept.kind, crate::devices::DeviceKind::Sat);
+        assert_eq!(
+            kept.value(drive_param),
+            quarter,
+            "the settings did not travel"
+        );
+        assert_eq!(
+            stage.notice.as_deref(),
+            Some(format!("yanked {}", crate::devices::DeviceKind::Sat.spec().name).as_str())
+        );
+        // The band is one narrower and the cursor is still inside it.
+        assert_eq!(stage.chain.as_ref().map(FocusLattice::cols), Some(2));
+        assert_eq!(
+            stage.chain.as_ref().and_then(FocusLattice::cursor),
+            Some((1, 0))
+        );
+
+        // Put lands after the cursor's device, and the cursor goes to it.
+        let _ = drive(&mut stage, &[Key::ArrowLeft]);
+        assert_eq!(drive(&mut stage, &[Key::E]), vec![ApplyOutcome::Changed]);
+        let ids = chain_ids(&stage);
+        assert_eq!(ids.len(), 3);
+        assert_eq!(ids[0], poly);
+        assert_eq!(ids[2], reverb);
+        let put = stage.song.tracks[0].chain[1].clone();
+        assert_eq!(put.kind, crate::devices::DeviceKind::Sat);
+        assert_eq!(put.value(drive_param), quarter);
+        assert_eq!(
+            stage.chain.as_ref().and_then(FocusLattice::cursor),
+            Some((1, 0))
+        );
+
+        // The clipboard keeps it: a second put is a second copy, with an
+        // id of its own.
+        assert_eq!(drive(&mut stage, &[Key::E]), vec![ApplyOutcome::Changed]);
+        assert_eq!(chain_ids(&stage).len(), 4);
+        let mut seen = std::collections::HashSet::new();
+        assert!(chain_ids(&stage).into_iter().all(|id| seen.insert(id)));
+    }
+
+    #[test]
+    fn a_yanked_device_can_be_put_on_another_track_from_the_session() {
+        let mut stage = Stage::new();
+        let [_, sat, _] = into_chain_of_three(&mut stage);
+        let _ = drive(&mut stage, &[Key::ArrowRight, Key::Q]);
+        assert_eq!(
+            stage.clipboard.as_ref().map(|d| d.kind),
+            Some(crate::devices::DeviceKind::Sat)
+        );
+        let _ = drive(&mut stage, &[Key::Escape]);
+        assert!(stage.chain.is_none());
+
+        // A new audio track has no band to open — and E is how it gets
+        // its first device.
+        let _ = command(&mut stage, Key::T);
+        assert_eq!(drive(&mut stage, &[Key::E]), vec![ApplyOutcome::Changed]);
+        assert_eq!(stage.song.tracks[1].chain.len(), 1);
+        assert_eq!(
+            stage.song.tracks[1].chain[0].kind,
+            crate::devices::DeviceKind::Sat
+        );
+        assert_ne!(stage.song.tracks[1].chain[0].id, sat);
+        assert_eq!(
+            stage.notice.as_deref(),
+            Some(format!("+ {}", crate::devices::DeviceKind::Sat.spec().name).as_str())
+        );
+
+        // An instrument does not go on an audio track, by any door.
+        let _ = drive(&mut stage, &[Key::ArrowLeft]);
+        let _ = command(&mut stage, Key::D);
+        let _ = drive(&mut stage, &[Key::Q]);
+        assert_eq!(
+            stage.clipboard.as_ref().map(|d| d.kind),
+            Some(crate::devices::DeviceKind::Poly)
+        );
+        let _ = drive(&mut stage, &[Key::Escape, Key::ArrowRight]);
+        assert!(matches!(
+            drive(&mut stage, &[Key::E])[0],
+            ApplyOutcome::Refused(Refusal {
+                reason: RefusalReason::Unavailable,
+                ..
+            })
+        ));
+        assert_eq!(stage.song.tracks[1].chain.len(), 1);
+    }
+
+    #[test]
+    fn e_with_nothing_kept_is_refused_as_empty() {
+        let mut stage = Stage::new();
+        assert!(matches!(
+            drive(&mut stage, &[Key::E])[0],
+            ApplyOutcome::Refused(Refusal {
+                reason: RefusalReason::Empty,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_choice_steps_one_position_and_is_said_by_name() {
+        let mut stage = Stage::new();
+        let id = stage
+            .song
+            .add_device(0, crate::devices::DeviceKind::Poly)
+            .expect("instrument");
+        let _ = command(&mut stage, Key::D);
+        // Row zero of the poly is osc A's wave: a list of eight.
+        let wave = crate::params::poly::A_WAVE;
+        assert_eq!(
+            stage.handle_key(Modifiers::SHIFT, Key::ArrowRight),
+            Some(ApplyOutcome::Changed)
+        );
+        assert_eq!(stage.song.device(id).expect("there").value(wave), 1.0);
+        assert_eq!(stage.notice.as_deref(), Some("Wave tri"));
+        // Coarse is the same one position: a list has no tenth to skip.
+        assert_eq!(
+            stage.handle_key(Modifiers::SHIFT, Key::ArrowUp),
+            Some(ApplyOutcome::Changed)
+        );
+        assert_eq!(stage.song.device(id).expect("there").value(wave), 2.0);
+        assert_eq!(stage.notice.as_deref(), Some("Wave saw"));
+        // And a range still steps by its hundredth: the gain row.
+        let gain_row = crate::params::poly::TABLE
+            .iter()
+            .position(|def| def.id == crate::params::poly::GAIN)
+            .expect("gain is in the table");
+        for _ in 0..gain_row {
+            let _ = drive(&mut stage, &[Key::ArrowDown]);
+        }
+        let before = stage
+            .song
+            .device(id)
+            .expect("there")
+            .value(crate::params::poly::GAIN);
+        let _ = stage.handle_key(Modifiers::SHIFT, Key::ArrowRight);
+        let after = stage
+            .song
+            .device(id)
+            .expect("there")
+            .value(crate::params::poly::GAIN);
+        assert!(
+            (after - before - 0.02).abs() < 1e-5,
+            "a range stepped like a list"
+        );
+    }
+
+    // ------------------------------------------------------ samples ---
+
+    fn browser_with_a_sample(stage: &mut Stage, path: &str) {
+        let _ = command(stage, Key::F);
+        let browser = stage.browser.as_mut().expect("the browser is up");
+        browser.set_children(
+            Shelf::Samples,
+            vec![Node::leaf(
+                std::path::Path::new(path)
+                    .file_name()
+                    .expect("a file")
+                    .to_string_lossy()
+                    .into_owned(),
+                EntryKind::Sample(PathBuf::from(path)),
+            )],
+            BrowserStatus::Ready,
+        );
+    }
+
+    #[test]
+    fn a_sample_from_the_browser_goes_into_a_sampler_on_the_track() {
+        let mut stage = Stage::new();
+        browser_with_a_sample(&mut stage, "/kits/909/kick.wav");
+        let placed = enter_leaf(&mut stage, "kick.wav");
+        assert_eq!(placed, ApplyOutcome::Changed);
+        let chain = &stage.song.tracks[0].chain;
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].kind, crate::devices::DeviceKind::Sampler);
+        assert_eq!(
+            chain[0].sample.as_deref(),
+            Some(std::path::Path::new("/kits/909/kick.wav"))
+        );
+        assert_eq!(stage.notice.as_deref(), Some("+ sampler · kick.wav"));
+        let sampler = chain[0].id;
+
+        // A second sample goes into the SAME sampler: its file changes,
+        // its settings and its id do not.
+        let _ = drive(&mut stage, &[Key::Escape]);
+        stage
+            .song
+            .device_mut(sampler)
+            .expect("there")
+            .set(crate::params::sampler::START, 0.3);
+        browser_with_a_sample(&mut stage, "/kits/909/snare.wav");
+        assert_eq!(enter_leaf(&mut stage, "snare.wav"), ApplyOutcome::Changed);
+        let chain = &stage.song.tracks[0].chain;
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].id, sampler);
+        assert_eq!(
+            chain[0].sample.as_deref(),
+            Some(std::path::Path::new("/kits/909/snare.wav"))
+        );
+        assert_eq!(chain[0].value(crate::params::sampler::START), 0.3);
+    }
+
+    #[test]
+    fn a_sample_replaces_another_instrument_and_an_audio_track_refuses_it() {
+        let mut stage = Stage::new();
+        stage
+            .song
+            .add_device(0, crate::devices::DeviceKind::Haze)
+            .expect("instrument");
+        browser_with_a_sample(&mut stage, "/kits/hat.wav");
+        assert_eq!(enter_leaf(&mut stage, "hat.wav"), ApplyOutcome::Changed);
+        let kinds: Vec<_> = stage.song.tracks[0].chain.iter().map(|d| d.kind).collect();
+        assert_eq!(
+            kinds,
+            [crate::devices::DeviceKind::Sampler],
+            "two instruments on one track"
+        );
+
+        let _ = drive(&mut stage, &[Key::Escape]);
+        let _ = command(&mut stage, Key::T);
+        browser_with_a_sample(&mut stage, "/kits/hat.wav");
+        assert!(matches!(
+            enter_leaf(&mut stage, "hat.wav"),
+            ApplyOutcome::Refused(Refusal {
+                reason: RefusalReason::Unavailable,
+                ..
+            })
+        ));
+        assert!(stage.song.tracks[1].chain.is_empty());
+    }
+
+    // ------------------------------------------------------ history ---
+
+    #[test]
+    fn every_edit_is_one_step_back_and_the_floor_says_so() {
+        let mut stage = Stage::new();
+        assert!(matches!(
+            command(&mut stage, Key::Z),
+            ApplyOutcome::Refused(Refusal {
+                reason: RefusalReason::Empty,
+                ..
+            })
+        ));
+        assert_eq!(stage.notice.as_deref(), Some("nothing to undo"));
+
+        let _ = command(&mut stage, Key::T);
+        let _ = command_shift(&mut stage, Key::T);
+        assert_eq!(stage.song.tracks.len(), 3);
+        assert_eq!(command(&mut stage, Key::Z), ApplyOutcome::Changed);
+        assert_eq!(stage.song.tracks.len(), 2, "undo took more than one step");
+        assert_eq!(
+            session(&stage).cols(),
+            2,
+            "the strip did not follow the song back"
+        );
+        assert_eq!(command(&mut stage, Key::Z), ApplyOutcome::Changed);
+        assert_eq!(stage.song.tracks.len(), 1);
+        assert_eq!(command_shift(&mut stage, Key::Z), ApplyOutcome::Changed);
+        assert_eq!(stage.song.tracks.len(), 2);
+        assert_eq!(session(&stage).cols(), 2);
+        // A new edit is a new future.
+        let _ = command(&mut stage, Key::T);
+        assert!(matches!(
+            command_shift(&mut stage, Key::Z),
+            ApplyOutcome::Refused(Refusal {
+                reason: RefusalReason::Empty,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_fader_press_is_a_step_and_undoing_it_keeps_the_song_playing_and_the_cursor_put() {
+        let mut stage = Stage::new();
+        let _ = drive(&mut stage, &[Key::ArrowDown, Key::Enter]);
+        let _ = stage.handle_key(Modifiers::SHIFT, Key::Enter);
+        assert_eq!(stage.playing, vec![Some(0)]);
+        let _ = drive(&mut stage, &[Key::ArrowUp]);
+        into_mixer(&mut stage);
+        let rest = stage.song.tracks[0].volume;
+        let _ = drive(&mut stage, &[Key::ArrowUp, Key::ArrowUp]);
+        let two = stage.song.tracks[0].volume;
+        assert_ne!(two, rest);
+        let before = stage.revision();
+
+        assert_eq!(command(&mut stage, Key::Z), ApplyOutcome::Changed);
+        let one = stage.song.tracks[0].volume;
+        assert!(one < two && one > rest, "undo took the wrong size of step");
+        assert!(stage.mixing, "undo closed the mixer");
+        assert_eq!(stage.playing, vec![Some(0)], "undo stopped the performance");
+        assert_ne!(
+            stage.revision(),
+            before,
+            "the host was not told the song changed"
+        );
+        assert_eq!(stage.notice.as_deref(), Some("undo"));
+    }
+
+    #[test]
+    fn undoing_the_clip_the_cursor_is_inside_sends_focus_back_to_the_session() {
+        let mut stage = Stage::new();
+        let pattern = into_clip(&mut stage);
+        assert!(stage.inside.is_some());
+        // Two steps back: opening is not an edit, filling the slot was.
+        assert_eq!(command(&mut stage, Key::Z), ApplyOutcome::Changed);
+        assert!(
+            stage.song.slot_clip(0, 0).is_none(),
+            "the fill was not undone"
+        );
+        assert!(
+            stage.inside.is_none(),
+            "the cursor stayed inside a clip that is gone"
+        );
+        assert_eq!(stage.focus.depth(), 1);
+        let _ = pattern;
+    }
+
+    #[test]
+    fn a_rename_and_a_reorder_are_undone_like_any_edit() {
+        let mut stage = Stage::new();
+        let _ = command(&mut stage, Key::T);
+        let _ = stage.handle_key(Modifiers::NONE, Key::F2);
+        type_text(&mut stage, "Drums");
+        let _ = drive(&mut stage, &[Key::Enter]);
+        assert_eq!(stage.song.tracks[1].name, "Drums");
+        let _ = drive(&mut stage, &[Key::W, Key::ArrowLeft]);
+        assert_eq!(stage.song.tracks[0].name, "Drums");
+        let _ = command(&mut stage, Key::Z);
+        assert_eq!(
+            stage.song.tracks[1].name, "Drums",
+            "the reorder was not undone"
+        );
+        let _ = command(&mut stage, Key::Z);
+        assert_eq!(
+            stage.song.tracks[1].name, "Audio 01",
+            "the rename was not undone"
+        );
+    }
+
+    // ---------------------------------------------------------- file ---
+
+    fn songs_folder(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("daw-stage-songs-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn a_song_with_no_folder_is_not_saved_anywhere() {
+        let mut stage = Stage::new();
+        let _ = command(&mut stage, Key::T);
+        assert!(stage.is_dirty());
+        assert!(matches!(
+            command(&mut stage, Key::S),
+            ApplyOutcome::Refused(Refusal {
+                reason: RefusalReason::Unavailable,
+                ..
+            })
+        ));
+        assert!(stage.path().is_none());
+        assert!(stage.is_dirty());
+        assert!(
+            stage
+                .notice
+                .as_deref()
+                .is_some_and(|n| n.starts_with("could not save")),
+            "{:?}",
+            stage.notice
+        );
+    }
+
+    #[test]
+    fn save_writes_the_song_and_open_brings_it_back() {
+        let dir = songs_folder("save");
+        let mut stage = Stage::new();
+        stage.set_home(&dir);
+        assert!(!stage.is_dirty(), "a new song claimed edits");
+        let _ = command(&mut stage, Key::T);
+        let _ = stage.handle_key(Modifiers::NONE, Key::F2);
+        type_text(&mut stage, "Keys");
+        let _ = drive(&mut stage, &[Key::Enter]);
+        assert!(stage.is_dirty());
+
+        assert_eq!(command(&mut stage, Key::S), ApplyOutcome::Changed);
+        let path = stage
+            .path()
+            .expect("the first save named a file")
+            .to_path_buf();
+        assert_eq!(path, dir.join("untitled.stage.ron"));
+        assert!(path.exists());
+        assert!(!stage.is_dirty());
+        assert!(
+            stage
+                .notice
+                .as_deref()
+                .is_some_and(|n| n.starts_with("saved ")),
+            "{:?}",
+            stage.notice
+        );
+        // The next save goes to the same file, dirty or not.
+        let _ = command(&mut stage, Key::T);
+        assert!(stage.is_dirty());
+        assert_eq!(command(&mut stage, Key::S), ApplyOutcome::Changed);
+        assert_eq!(stage.path(), Some(path.as_path()));
+        assert!(!stage.is_dirty());
+
+        // Opened into a fresh stage: the same song, no history, focus at
+        // the top, nothing playing.
+        let mut fresh = Stage::new();
+        fresh.open(&path).expect("opens");
+        assert_eq!(fresh.song, stage.song);
+        assert_eq!(fresh.song.tracks[1].name, "Keys");
+        // And parked at the top, whatever it was doing.
+        stage.transport.set_motion(Motion::Rolling);
+        stage.transport.seek(500);
+        let seeks = stage.seeks();
+        stage.open(&path).expect("opens again");
+        assert_eq!(stage.transport.motion(), Motion::Stopped);
+        assert_eq!(stage.tick(), 0);
+        assert_eq!(
+            stage.seeks(),
+            seeks + 1,
+            "the engine was not told to return"
+        );
+        assert_eq!(
+            session(&fresh).cols(),
+            3,
+            "the strip did not follow the opened song"
+        );
+        assert!(!fresh.is_dirty());
+        assert!(matches!(
+            command(&mut fresh, Key::Z),
+            ApplyOutcome::Refused(Refusal {
+                reason: RefusalReason::Empty,
+                ..
+            })
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_songs_folder_is_the_projects_shelf() {
+        let dir = songs_folder("shelf");
+        std::fs::create_dir_all(&dir).expect("a folder");
+        let mut song = Song::default();
+        song.rename_track(0, "Shelved");
+        document::save(&dir.join("night.stage.ron"), &song).expect("saves");
+        std::fs::write(dir.join("notes.txt"), "not a song").expect("writes");
+
+        let mut stage = Stage::new();
+        stage.set_home(&dir);
+        assert_eq!(place_device(&mut stage, "night"), ApplyOutcome::Changed);
+        assert_eq!(stage.song.tracks[0].name, "Shelved");
+        assert!(
+            stage.browser.is_none(),
+            "the browser stayed over a song it was not for"
+        );
+        assert_eq!(stage.path(), Some(dir.join("night.stage.ron").as_path()));
+
+        // With no folder the shelf is empty and says it is unavailable.
+        let mut bare = Stage::new();
+        let _ = command(&mut bare, Key::F);
+        assert_eq!(
+            bare.browser.as_ref().map(|b| b.status_of(Shelf::Projects)),
+            Some(BrowserStatus::Unavailable)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --------------------------------------------------------- clock ---
+
+    #[test]
+    fn the_engines_position_is_the_playhead_while_it_arrives_and_the_frame_clock_when_it_does_not()
+    {
+        let mut stage = Stage::new();
+        stage.transport.set_motion(Motion::Rolling);
+        stage.set_position(3.0);
+        stage.tick_clock(1.0);
+        assert_eq!(
+            stage.transport.tick(),
+            crate::sequencing::TICKS_PER_BEAT * 3,
+            "the engine's position was not the playhead"
+        );
+        // Nothing read back this frame: the frame clock stands in, from
+        // where the engine left it. Half a second at 120 is one beat.
+        stage.tick_clock(0.5);
+        assert_eq!(
+            stage.transport.tick(),
+            crate::sequencing::TICKS_PER_BEAT * 4
+        );
+        // A position that arrives while stopped is not applied — a
+        // stopped stage does not move — and does not linger.
+        stage.transport.stop();
+        stage.set_position(9.0);
+        stage.tick_clock(0.5);
+        assert_eq!(
+            stage.transport.tick(),
+            crate::sequencing::TICKS_PER_BEAT * 4
+        );
+        assert!(stage.engine_beat.is_none(), "a stale position lingered");
+        stage.transport.set_motion(Motion::Rolling);
+        stage.tick_clock(0.0);
+        assert_eq!(
+            stage.transport.tick(),
+            crate::sequencing::TICKS_PER_BEAT * 4
+        );
+    }
+
+    #[test]
+    fn returning_to_the_top_tells_the_host_to_seek() {
+        let mut stage = Stage::new();
+        assert_eq!(stage.seeks(), 0);
+        assert!(matches!(
+            drive(&mut stage, &[Key::Home])[0],
+            ApplyOutcome::Refused(Refusal {
+                reason: RefusalReason::AtTop,
+                ..
+            })
+        ));
+        assert_eq!(stage.seeks(), 0, "a refused return asked for a seek");
+        stage.transport.seek(100);
+        assert_eq!(drive(&mut stage, &[Key::Home]), vec![ApplyOutcome::Changed]);
+        assert_eq!(stage.seeks(), 1);
+        assert_eq!(stage.tick(), 0);
     }
 
     /// Walk the cursor onto the master's column, whatever the song holds.
@@ -5860,47 +7364,51 @@ mod tests {
 
     #[test]
     fn a_meter_attacks_instantly_and_falls_slowly() {
-        // The whole reason ballistics exist: a bar that tracked raw block
-        // peaks would flicker on whichever block the repaint caught.
-        let mut stage = Stage::new();
-        stage.meters.resize(1, Default::default());
-        let loud = crate::ui::device::meter::amp_to_db(0.9);
-
-        stage.meters[0][0].advance(loud, 1.0 / 60.0);
+        // The whole reason ballistics exist: a bar tracking raw block
+        // peaks flickers on whichever block the repaint happened to catch.
+        let mut meters = vitals::Meters::default();
+        let hit = [Level {
+            left: 0.9,
+            right: 0.9,
+        }];
+        meters.follow(&hit, Level::default(), 1.0 / 60.0);
+        let struck = meters.readings()[0].level.left;
         assert!(
-            (stage.meters[0][0].shown_db - loud).abs() < 0.01,
-            "the meter did not take a transient on the frame it arrived"
+            struck > 0.8,
+            "the meter did not take a transient on the frame it arrived ({struck})"
         );
 
         // Silence next frame: it falls, but nowhere near all the way.
-        let floor = crate::ui::device::meter::FLOOR_DB;
-        stage.meters[0][0].advance(floor, 1.0 / 60.0);
+        meters.follow(&[Level::default()], Level::default(), 1.0 / 60.0);
+        let after = meters.readings()[0].level.left;
+        assert!(after < struck, "the meter did not fall at all");
         assert!(
-            stage.meters[0][0].shown_db > loud - 5.0,
-            "the meter fell off a cliff instead of releasing"
+            after > struck * 0.5,
+            "the meter fell off a cliff instead of releasing ({after})"
         );
-        assert!(
-            stage.meters[0][0].shown_db < loud,
-            "the meter did not fall at all"
-        );
+        assert!(meters.moving(), "a falling meter did not ask to be redrawn");
     }
 
     #[test]
     fn what_the_meters_show_is_the_ballistic_reading_not_the_raw_peak() {
         let mut stage = Stage::new();
-        stage.meters.resize(1, Default::default());
-        // Nothing has moved yet, so the bar sits at the floor even though
-        // the engine just reported a hit.
-        stage.set_levels(
-            &[Level {
-                left: 1.0,
-                right: 1.0,
-            }],
-            Level::default(),
-        );
-        let shown = stage.shown_levels();
+        let hit = [Level {
+            left: 1.0,
+            right: 1.0,
+        }];
+        // Attack IS instant — a transient the meter missed is a transient
+        // the meter lied about — so the hit arrives whole.
+        stage.set_levels(&hit, Level::default());
+        assert!(stage.meters.readings()[0].level.left > 0.9);
+
+        // The frame after, the engine reports silence. A strip reading
+        // the raw number would go black; the meter holds what it had and
+        // releases from there. How FAST it releases is a function of the
+        // frame's own dt, which a stage that has never drawn does not
+        // have — that half is measured directly on the meters above.
+        stage.set_levels(&[Level::default()], Level::default());
         assert!(
-            shown[0].left < 0.01,
+            stage.meters.readings()[0].level.left > 0.0,
             "the raw peak reached the strip without passing through the meter"
         );
     }
