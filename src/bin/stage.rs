@@ -82,7 +82,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// sleep; pipewire-jack reads them from this variable. A user who set the
 /// variable themselves is left alone.
 fn keep_the_stream_driven() {
-    const PROPS: &str = "{ node.always-process = true node.want-driver = true }";
+    // The quantum is forced to the engine's own block: PipeWire hands a
+    // JACK client the graph's quantum whatever the client asked for, and
+    // a block larger than the arena is refused as silence — which reads
+    // as a stalled engine.
+    const PROPS: &str =
+        "{ node.always-process = true node.want-driver = true node.force-quantum = 256 }";
     if std::env::var_os("PIPEWIRE_PROPS").is_none() {
         // Set before any thread exists — the engine's are made in
         // `App::new` — which is what makes this sound.
