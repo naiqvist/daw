@@ -7941,6 +7941,18 @@ pub mod console {
         pub const SUSTAIN: u32 = 1;
         pub const BRIGHT: u32 = 2;
 
+        /// The most a lever moves its part of the sound, in dB, at full.
+        pub const RANGE_DB: f32 = 12.0;
+        /// How long a strike is allowed to last.
+        pub const WINDOW_MS: f32 = 20.0;
+        /// The tail is what has decayed from the recent peak: the quick
+        /// follower against the long one.
+        pub const TAIL_QUICK_MS: f32 = 60.0;
+        pub const TAIL_LONG_MS: f32 = 800.0;
+        /// Where the brightness starts, and how much at full.
+        pub const BRIGHT_HZ: f32 = 3_000.0;
+        pub const BRIGHT_AMOUNT: f32 = 0.8;
+
         pub const TABLE: &[ParamDef] = &[
             ParamDef {
                 id: 0,
