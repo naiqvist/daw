@@ -84,12 +84,27 @@ pub fn lattice_rows(song: &Song) -> usize {
     1 + song.session.scenes.len()
 }
 
+/// The most scenes a session holds: twenty-six banks of sixteen, which
+/// is where the bank letters run out. The session has no bottom before
+/// that — Down on the last scene makes the next one.
+pub const MAX_SCENES: usize = 26 * 16;
+
 /// What a filled slot draws: one glyph for the kind of clip, one number
 /// for which one. Reduced from the model every frame, never stored.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Mark {
     pub glyph: char,
-    pub number: String,
+    /// The pattern's address on the cell: its bank and slot, `A1`, with
+    /// the track left off because the column already is the track. A
+    /// pattern named some other way shows its name whole.
+    pub label: String,
+}
+
+/// A pattern's name as a cell on `track_index` shows it: the address
+/// with this track's own prefix dropped.
+pub fn slot_label(name: &str, track_index: usize) -> String {
+    let prefix = format!("T{} ", track_index + 1);
+    name.strip_prefix(&prefix).unwrap_or(name).to_owned()
 }
 
 /// The mark for the slot at `scene` on the track at `track_index`, or
@@ -102,7 +117,10 @@ pub fn mark(song: &Song, track_index: usize, scene: usize) -> Option<Mark> {
         // cell, the way a trig is a solid thing in a step.
         Clip::Pattern(id) => Mark {
             glyph: glyph::DOT,
-            number: format!("{:02}", id.0),
+            label: song
+                .pattern(id)
+                .map(|pattern| slot_label(&pattern.name, track_index))
+                .unwrap_or_else(|| format!("{:02}", id.0)),
         },
     })
 }
@@ -157,15 +175,15 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_slot_draws_nothing_and_a_filled_one_draws_its_number() {
+    fn an_empty_slot_draws_nothing_and_a_filled_one_draws_its_address() {
         let mut song = Song::default();
         assert_eq!(mark(&song, 0, 0), None);
-        let id = song.fill_slot(0, 0).expect("fill");
+        song.fill_slot(0, 0).expect("fill");
         assert_eq!(
             mark(&song, 0, 0),
             Some(Mark {
                 glyph: glyph::DOT,
-                number: format!("{:02}", id.0),
+                label: "A1".to_owned(),
             })
         );
         assert_eq!(
@@ -180,22 +198,26 @@ mod tests {
         );
     }
 
+    /// The cell drops its own track from the address and keeps the
+    /// rest; a name that is not an address shows whole.
     #[test]
-    fn a_mark_never_carries_a_name() {
-        let mut song = Song::default();
-        song.fill_slot(0, 0).expect("fill");
-        let mark = mark(&song, 0, 0).expect("mark");
-        assert!(
-            mark.number.chars().all(|ch| ch.is_ascii_digit()),
-            "the number was not a number: {:?}",
-            mark.number
+    fn a_cell_shows_the_address_without_its_own_track() {
+        assert_eq!(slot_label("T1 A1", 0), "A1");
+        assert_eq!(slot_label("T3 B12", 2), "B12");
+        assert_eq!(
+            slot_label("T3 B12", 0),
+            "T3 B12",
+            "another track's prefix was dropped"
         );
-        for pattern in &song.patterns {
-            assert!(
-                !mark.number.contains(&pattern.name),
-                "the pattern's name reached the lattice"
-            );
+        assert_eq!(slot_label("P02", 0), "P02");
+        let mut song = Song::default();
+        while song.session.scenes.len() < 18 {
+            song.session
+                .scenes
+                .push(crate::sequencing::Scene::default());
         }
+        song.fill_slot(0, 17).expect("fill");
+        assert_eq!(mark(&song, 0, 17).map(|m| m.label), Some("B2".to_owned()));
     }
 
     #[test]

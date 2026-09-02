@@ -1565,6 +1565,14 @@ impl Stage {
     /// `None` while focus is inside a track, in the browser, or the song
     /// has no tracks. Every question about "which track" or "which scene"
     /// the root cursor means is answered here and nowhere else.
+    /// Whether the session cursor stands on the last scene there is.
+    fn on_last_scene(&self) -> bool {
+        matches!(
+            self.session_address(),
+            Some(Address::Slot { scene, .. }) if scene + 1 == self.song.session.scenes.len()
+        )
+    }
+
     fn session_address(&self) -> Option<Address> {
         match self.focus.levels().first() {
             Some(FocusScope::Lattice(lattice)) => lattice
@@ -2507,6 +2515,31 @@ impl Stage {
                     Ok(())
                 } else {
                     Err(RefusalReason::Edge(step))
+                }
+            }
+            // The session has no bottom: Down on the last scene makes the
+            // next one, so a song grows as far as the hand walks. A new
+            // scene is a document edit, and the lattice follows the song.
+            StageIntent::Step(Step::Down)
+                if self.browser.is_none()
+                    && self.chain.is_none()
+                    && !self.mixing
+                    && self.focus.depth() == 1
+                    && self.on_last_scene() =>
+            {
+                if self.song.session.scenes.len() >= scenes::MAX_SCENES {
+                    Err(RefusalReason::Edge(Step::Down))
+                } else {
+                    self.song
+                        .session
+                        .scenes
+                        .push(crate::sequencing::Scene::default());
+                    self.fit_session();
+                    self.touched();
+                    self.focus
+                        .step(Step::Down)
+                        .then_some(())
+                        .ok_or(RefusalReason::Edge(Step::Down))
                 }
             }
             StageIntent::Step(step) => match &mut self.browser {
@@ -5491,7 +5524,7 @@ impl Stage {
                     egui::pos2(rect.right() - pad, rect.center().y),
                     egui::Align2::RIGHT_CENTER,
                     block::unit::MICRO,
-                    &mark.number,
+                    &mark.label,
                     figure_ink,
                 );
             }
@@ -7527,7 +7560,7 @@ mod tests {
     }
 
     #[test]
-    fn down_walks_the_scenes_and_stops_at_the_last() {
+    fn down_walks_the_scenes_and_grows_the_session_at_the_last() {
         let mut stage = Stage::new();
         let count = stage.song.session.scenes.len();
         for scene in 0..count {
@@ -7541,13 +7574,15 @@ mod tests {
                 "down did not land on scene {scene}"
             );
         }
+        // The session has no bottom: one more Down is one more scene.
         assert_eq!(
             drive(&mut stage, &[Key::ArrowDown]),
-            vec![ApplyOutcome::Refused(Refusal {
-                intent: StageIntent::Step(Step::Down),
-                reason: RefusalReason::Edge(Step::Down),
-            })],
-            "the lattice went past its last scene"
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(stage.song.session.scenes.len(), count + 1);
+        assert_eq!(
+            drive(&mut stage, &[Key::ArrowUp]),
+            vec![ApplyOutcome::Changed]
         );
         for _ in 0..count {
             assert_eq!(
@@ -7588,10 +7623,7 @@ mod tests {
         );
         let mark = scenes::mark(&stage.song, 0, 0).expect("the slot drew nothing");
         assert_eq!(mark.glyph, browser::glyph::DOT);
-        assert_eq!(
-            mark.number, "02",
-            "the pattern after the default one is the second"
-        );
+        assert_eq!(mark.label, "A1", "the slot is not named by its address");
     }
 
     /// Fill the first slot of the first track and open it.
@@ -7686,6 +7718,56 @@ mod tests {
             stage.song.device(sat).expect("sat"),
             &before,
             "the arrow turned nothing"
+        );
+    }
+
+    /// The session has no bottom: Down on the last scene makes another,
+    /// and the cursor lands on it. Up walks back through what was made.
+    #[test]
+    fn down_on_the_last_scene_makes_the_next_one() {
+        let mut stage = Stage::new();
+        let scenes = stage.song.session.scenes.len();
+        for _ in 0..scenes {
+            assert_eq!(
+                drive(&mut stage, &[Key::ArrowDown]),
+                vec![ApplyOutcome::Changed]
+            );
+        }
+        assert_eq!(
+            stage.session_address(),
+            Some(Address::Slot {
+                track: 0,
+                scene: scenes - 1
+            })
+        );
+        assert_eq!(
+            drive(&mut stage, &[Key::ArrowDown]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(
+            stage.song.session.scenes.len(),
+            scenes + 1,
+            "no scene was made"
+        );
+        assert_eq!(
+            stage.session_address(),
+            Some(Address::Slot {
+                track: 0,
+                scene: scenes
+            }),
+            "the cursor did not land on the new scene"
+        );
+        assert_eq!(
+            drive(&mut stage, &[Key::Enter]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(
+            scenes::mark(&stage.song, 0, scenes).map(|m| m.label),
+            Some("A9".to_owned())
+        );
+        assert_eq!(
+            drive(&mut stage, &[Key::ArrowUp]),
+            vec![ApplyOutcome::Changed]
         );
     }
 

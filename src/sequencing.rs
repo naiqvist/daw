@@ -527,7 +527,7 @@ impl Default for Pattern {
     fn default() -> Self {
         Self {
             id: PatternId(1),
-            name: "P01".to_owned(),
+            name: Song::pattern_address(0, 0),
             length_ticks: DEFAULT_PATTERN_TICKS,
             trigs: vec![Trig::default(); PATTERN_STEPS],
         }
@@ -1740,8 +1740,17 @@ impl Song {
     /// A new, empty pattern with the next free id and the next serial
     /// name. The one place a pattern is minted, whether for the timeline
     /// or for a session slot.
-    fn allocate_pattern(&mut self) -> Option<PatternId> {
-        let pattern_number = self.patterns.len().checked_add(1)?;
+    /// A pattern's name, the Elektron way: the track it lives on, then
+    /// its bank and slot — scenes in banks of sixteen, A upward — so
+    /// `T2 B3` is track two, the third slot of the second bank. The name
+    /// says where the pattern is found, which is what a name on a
+    /// machine with no screen room is for.
+    pub fn pattern_address(track_index: usize, scene: usize) -> String {
+        let bank = (b'A' + (scene / 16).min(25) as u8) as char;
+        format!("T{} {bank}{}", track_index + 1, scene % 16 + 1)
+    }
+
+    fn allocate_pattern(&mut self, name: String) -> Option<PatternId> {
         let pattern_id = PatternId(
             self.patterns
                 .iter()
@@ -1750,8 +1759,7 @@ impl Song {
                 .unwrap_or(0)
                 .checked_add(1)?,
         );
-        self.patterns
-            .push(Pattern::empty(pattern_id, format!("P{pattern_number:02}")));
+        self.patterns.push(Pattern::empty(pattern_id, name));
         Some(pattern_id)
     }
 
@@ -1779,7 +1787,7 @@ impl Song {
         if self.session.scenes.get(scene)?.clip(track_id).is_some() {
             return None;
         }
-        let pattern_id = self.allocate_pattern()?;
+        let pattern_id = self.allocate_pattern(Self::pattern_address(track_index, scene))?;
         self.session.scenes.get_mut(scene)?.slots.push(Slot {
             track: track_id,
             clip: Clip::Pattern(pattern_id),
@@ -1825,7 +1833,10 @@ impl Song {
                 .unwrap_or(0)
                 .checked_add(1)?,
         );
-        let pattern_id = self.allocate_pattern()?;
+        // Born in the arrangement, with no slot to be named by: the
+        // track and a number.
+        let name = format!("T{} P{:02}", track_index + 1, self.patterns.len() + 1);
+        let pattern_id = self.allocate_pattern(name)?;
         let track = self.tracks.get_mut(track_index)?;
         track.blocks.push(PatternBlock {
             id: block_id,
@@ -1965,7 +1976,9 @@ impl Song {
                 .checked_add(1)?,
         );
         pattern.id = pattern_id;
-        pattern.name = format!("P{:02}", self.patterns.len() + 1);
+        // A pattern born in the arrangement has no slot to be named by,
+        // so it carries its track and a number.
+        pattern.name = format!("T{} P{:02}", target_track + 1, self.patterns.len() + 1);
         self.patterns.push(pattern);
         self.tracks[target_track].blocks.push(PatternBlock {
             id: block_id,
@@ -2637,7 +2650,7 @@ mod tests {
         assert_eq!(song.tracks[0].blocks[1].pattern_id, id);
         assert_eq!(
             song.pattern(id).map(|pattern| pattern.name.as_str()),
-            Some("P02")
+            Some("T1 P02")
         );
     }
 
@@ -4322,5 +4335,22 @@ mod tick_tests {
             Some(0.5),
             "clearing the effect's took the voice's"
         );
+    }
+
+    /// A pattern is named by where it lives: track, bank, slot.
+    #[test]
+    fn a_pattern_is_named_by_its_track_bank_and_slot() {
+        assert_eq!(Song::pattern_address(0, 0), "T1 A1");
+        assert_eq!(Song::pattern_address(1, 2), "T2 A3");
+        assert_eq!(Song::pattern_address(0, 15), "T1 A16");
+        assert_eq!(Song::pattern_address(2, 16), "T3 B1");
+        assert_eq!(Song::pattern_address(0, 33), "T1 C2");
+        let mut song = Song::default();
+        assert_eq!(song.patterns[0].name, "T1 A1");
+        while song.session.scenes.len() < 18 {
+            song.session.scenes.push(Scene::default());
+        }
+        let id = song.fill_slot(0, 17).expect("a slot filled");
+        assert_eq!(song.pattern(id).map(|p| p.name.as_str()), Some("T1 B2"));
     }
 }
