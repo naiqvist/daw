@@ -144,6 +144,47 @@ mod tests {
         }
     }
 
+    /// A section tapped for telemetry reports through the schedule: a
+    /// sine through a leaned-on preamp lands a level in its slot, and an
+    /// untapped slot reads silence.
+    #[test]
+    fn a_tapped_section_reports_its_level_in_its_slot() {
+        use crate::audio::graph::{GraphSpec, NodeSpec, ProcessCtx};
+        let mut spec = GraphSpec::default();
+        let sine = spec.push(NodeSpec::Sine {
+            freq: 220.0,
+            amp: 0.5,
+        });
+        let mut params = SectionParams::of(SectionKind::Preamp);
+        params.set(crate::params::console::preamp::IRON, 40.0);
+        let stage = spec.push(NodeSpec::Section { params });
+        spec.connect(sine, stage);
+        spec.set_output(stage);
+        spec.telemetry(5, stage);
+        let mut schedule = spec.compile(48_000, 256).expect("the graph runs");
+        let silence = [0.0f32; 512];
+        let beats_per_sample = 120.0 / 60.0 / 48_000.0;
+        let mut out = vec![0.0f32; 512];
+        for block in 0..4u64 {
+            let ctx = ProcessCtx {
+                device_input: &silence,
+                in_channels: 2,
+                block_frames: 256,
+                offset: 0,
+                len: 256,
+                playing: true,
+                position: block * 256,
+                beat: block as f64 * 256.0 * beats_per_sample,
+                beats_per_sample,
+                discontinuity: block == 0,
+            };
+            schedule.run(&mut out, &ctx);
+        }
+        let said = schedule.telemetry();
+        assert!(said[5].level_db > -20.0, "slot 5 read {}", said[5].level_db);
+        assert_eq!(said[4].level_db, Readout::default().level_db);
+    }
+
     /// A letter lands clamped, and an id the table lacks is dropped.
     #[test]
     fn a_wire_keeps_its_settings_within_the_table() {

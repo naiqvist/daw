@@ -350,6 +350,28 @@ pub mod preamp_curve {
     }
 }
 
+/// What a section measured this frame, as the surface reads it: the
+/// green twin of the engine's readout, so a card can carry live figures
+/// without the surface importing the audio side. Level in dBFS,
+/// reduction in dB (zero is none, negative is reduction), and up to
+/// three bands of the same figure for a section that has bands.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Telemetry {
+    pub level_db: f32,
+    pub reduction_db: f32,
+    pub bands: [f32; 3],
+}
+
+impl Default for Telemetry {
+    fn default() -> Self {
+        Self {
+            level_db: -120.0,
+            reduction_db: 0.0,
+            bands: [0.0; 3],
+        }
+    }
+}
+
 /// A section's settings as the graph's spec carries them: the kind, and
 /// the edits by id — exactly a device's overrides. A missing id reads
 /// as the table's default.

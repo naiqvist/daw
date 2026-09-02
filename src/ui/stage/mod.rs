@@ -651,6 +651,8 @@ pub struct Stage {
     /// The blocks being written while it does; landed as one edit when
     /// the transport stops or the arm comes off.
     takes: Vec<Take>,
+    /// What every section measured this frame, by device.
+    telemetry: std::collections::HashMap<DeviceId, crate::console::Telemetry>,
     /// A render the host has been asked for, until it takes it.
     export_request: Option<ExportRequest>,
     /// The render under way, for the strip.
@@ -820,6 +822,7 @@ impl Stage {
             block_clipboard: None,
             arming: false,
             takes: Vec::new(),
+            telemetry: std::collections::HashMap::new(),
             export_request: None,
             export: None,
             export_abandon: false,
@@ -1026,6 +1029,22 @@ impl Stage {
     /// keeps a per-block peak from flickering.
     pub fn set_levels(&mut self, tracks: &[Level], master: Level) {
         self.meters.follow(tracks, master, self.frame_dt);
+    }
+
+    /// Hand the stage what every section measured this frame, by the
+    /// device it belongs to. Kept raw; a card reads it through
+    /// [`Self::telemetry`], which is where a needle's ballistics belong.
+    pub fn set_telemetry(&mut self, said: &[(DeviceId, crate::console::Telemetry)]) {
+        self.telemetry.clear();
+        for (id, figures) in said {
+            self.telemetry.insert(*id, *figures);
+        }
+    }
+
+    /// What `device` measured this frame: silence and no reduction for a
+    /// device that is not in the graph, which is the truth about it.
+    pub fn telemetry(&self, device: DeviceId) -> crate::console::Telemetry {
+        self.telemetry.get(&device).copied().unwrap_or_default()
     }
 
     /// Tell the stage where the engine's transport is, in beats. Read

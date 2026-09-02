@@ -1396,6 +1396,10 @@ pub const MAX_NODE_INPUTS: usize = 8;
 /// `triple_buffer` and a Vec cannot travel in one. Tracks past this many
 /// have no meter — they still sound.
 pub const MAX_METERS: usize = 32;
+/// The console's telemetry slots: enough for every IN section of a
+/// handful of strips and the desk's own. Past this, a section is
+/// simply not reported, and its card reads silence.
+pub const MAX_TELEMETRY: usize = 128;
 
 /// One cache-line-sized, 64-byte-aligned chunk. The arena is a `Vec` of these
 /// so every slot starts on a cache-line (and AVX-512 register) boundary.
@@ -4965,6 +4969,12 @@ pub struct Schedule {
     step_tap: Vec<u8>,
     /// What each tapped device said this block.
     readouts: [Readout; MAX_METERS],
+    /// Telemetry slot per step, or [`NO_METER`]: the console's channel,
+    /// wider than the meters' so every section on every strip can
+    /// report, in its own slot space.
+    step_telemetry: Vec<u8>,
+    /// What each telemetered section said this block.
+    telemetry: [Readout; MAX_TELEMETRY],
     /// Modulation, compiled. Evaluated at the top of every segment, before
     /// the walk, so the values a node reads this segment are this
     /// segment's.
@@ -5189,6 +5199,12 @@ impl Schedule {
         self.peaks_l = [0.0; MAX_METERS];
         self.peaks_r = [0.0; MAX_METERS];
         self.readouts = [Readout::default(); MAX_METERS];
+        self.telemetry = [Readout::default(); MAX_TELEMETRY];
+    }
+
+    /// What every telemetered section said this block, by slot.
+    pub fn telemetry(&self) -> &[Readout; MAX_TELEMETRY] {
+        &self.telemetry
     }
 
     /// Total latency from input to output, in samples.
@@ -5369,6 +5385,24 @@ impl Schedule {
                 // Reduction is negative, so "most" is the minimum.
                 readout.reduction_db = readout.reduction_db.min(said.reduction_db);
             }
+            // The console's telemetry, accumulated the same way: the
+            // loudest and the most reduced across the block's segments.
+            if let Some(&slot) = self.step_telemetry.get(step_index)
+                && slot != NO_METER
+                && let Some(readout) = self.telemetry.get_mut(slot as usize)
+                && let Some(node) = self.nodes.get(step.node)
+                && let Some(said) = node.readout()
+            {
+                readout.level_db = readout.level_db.max(said.level_db);
+                readout.reduction_db = readout.reduction_db.min(said.reduction_db);
+                for (mine, theirs) in readout.bands.iter_mut().zip(said.bands) {
+                    *mine = if theirs < 0.0 {
+                        mine.min(theirs)
+                    } else {
+                        mine.max(theirs)
+                    };
+                }
+            }
         }
 
         let device_ch = output.len() / ctx.block_frames.max(1);
@@ -5460,6 +5494,10 @@ pub struct GraphSpec {
     /// a dynamics processor reports about ITSELF rather than about its
     /// output — see [`Readout`].
     taps: Vec<(usize, NodeId)>,
+    /// The console's telemetry taps: (slot, node), in their own slot
+    /// space of [`MAX_TELEMETRY`], so every section of every strip can
+    /// report without taking a meter from a track.
+    telemetry: Vec<(usize, NodeId)>,
     /// Modulation, with each wire's `(track, parameter)` target already
     /// resolved to a node and param id by whoever built the graph — the
     /// only place that knows both halves.
@@ -6117,6 +6155,13 @@ impl GraphSpec {
     pub fn tap(&mut self, slot: usize, node: NodeId) {
         if slot < MAX_METERS {
             self.taps.push((slot, node));
+        }
+    }
+
+    /// Report what `node` says about itself under telemetry `slot`.
+    pub fn telemetry(&mut self, slot: usize, node: NodeId) {
+        if slot < MAX_TELEMETRY {
+            self.telemetry.push((slot, node));
         }
     }
 
@@ -7681,6 +7726,19 @@ impl GraphSpec {
             }
         }
 
+        let mut step_telemetry = vec![NO_METER; steps.len()];
+        for (slot, node) in &self.telemetry {
+            if *slot >= MAX_TELEMETRY {
+                continue;
+            }
+            let Some(dense) = self.order.iter().position(|id| id == node) else {
+                continue;
+            };
+            if let Some(step) = steps.iter().position(|step| step.node == dense) {
+                step_telemetry[step] = *slot as u8;
+            }
+        }
+
         let mut step_meter = vec![NO_METER; steps.len()];
         for (slot, node) in &self.meters {
             if *slot >= MAX_METERS {
@@ -7707,6 +7765,8 @@ impl GraphSpec {
             step_meter,
             step_tap,
             readouts: [Readout::default(); MAX_METERS],
+            step_telemetry,
+            telemetry: [Readout::default(); MAX_TELEMETRY],
             peaks_l: [0.0; MAX_METERS],
             peaks_r: [0.0; MAX_METERS],
             // Wires resolve against the SAME dense correspondence the

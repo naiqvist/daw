@@ -483,6 +483,9 @@ pub struct BlockSnapshot {
     /// exactly what a device that is not working reads, and the display
     /// cannot tell the difference and does not need to.
     pub device_readouts: [graph::Readout; graph::MAX_METERS],
+    /// The console's telemetry: what every tapped section said this
+    /// block, in its own slot space. Same rules as the readouts.
+    pub telemetry: [graph::Readout; graph::MAX_TELEMETRY],
 
     /// Each modulation source's value as of this block's last segment, in
     /// the arrangement's modulator order.
@@ -532,6 +535,7 @@ impl Default for BlockSnapshot {
             track_peaks_l: [0.0; graph::MAX_METERS],
             track_peaks_r: [0.0; graph::MAX_METERS],
             device_readouts: [graph::Readout::default(); graph::MAX_METERS],
+            telemetry: [graph::Readout::default(); graph::MAX_TELEMETRY],
             mod_sources: [0.0; modulation::MAX_MOD_SOURCES],
             mod_wire_ids: [0; modulation::MAX_MOD_WIRES],
             mod_wires: [0.0; modulation::MAX_MOD_WIRES],
@@ -1059,6 +1063,11 @@ impl Engine {
                         .map_or([graph::Readout::default(); graph::MAX_METERS], |s| {
                             *s.readouts()
                         });
+                    let telemetry = schedule
+                        .as_ref()
+                        .map_or([graph::Readout::default(); graph::MAX_TELEMETRY], |s| {
+                            *s.telemetry()
+                        });
                     let track_peaks_l = schedule
                         .as_ref()
                         .map_or([0.0; graph::MAX_METERS], |s| *s.peaks_l());
@@ -1091,6 +1100,7 @@ impl Engine {
                         track_peaks_l,
                         track_peaks_r,
                         device_readouts,
+                        telemetry,
                         mod_sources,
                         mod_wire_ids,
                         mod_wires,

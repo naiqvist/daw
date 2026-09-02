@@ -59,6 +59,22 @@ pub struct SongNodes {
     /// sections, and the desk's own. A knob turn rides a letter to its
     /// node through this table rather than rebuilding the schedule.
     pub devices: Vec<(DeviceId, NodeId)>,
+    /// Which telemetry slot each of those reports under, in the order
+    /// they were built. The host reads the slot and hands the stage the
+    /// device's id, so a card finds its own figures by the device it
+    /// draws.
+    pub telemetry: Vec<(DeviceId, usize)>,
+}
+
+/// Put `node` in the tables: its letters, and its telemetry slot while
+/// there is one to give.
+fn register(spec: &mut GraphSpec, nodes: &mut SongNodes, id: DeviceId, node: NodeId) {
+    nodes.devices.push((id, node));
+    let slot = nodes.telemetry.len();
+    if slot < crate::audio::graph::MAX_TELEMETRY {
+        spec.telemetry(slot, node);
+        nodes.telemetry.push((id, slot));
+    }
 }
 
 /// The meter slots the desk takes: tracks below, then the four buses,
@@ -93,7 +109,7 @@ fn rail(
             continue;
         };
         let node = spec.push(node);
-        nodes.devices.push((device.id, node));
+        register(spec, nodes, device.id, node);
         if let Some(previous) = tail {
             spec.connect(previous, node);
         }
@@ -164,6 +180,7 @@ pub fn build(song: &Song, playing: &[Option<usize>]) -> (GraphSpec, SongNodes) {
         meters: vec![None; song.tracks.len()],
         master,
         devices: Vec::new(),
+        telemetry: Vec::new(),
     };
     let desk = desk(&mut spec, song, &mut nodes, master);
 
@@ -213,7 +230,7 @@ pub fn build(song: &Song, playing: &[Option<usize>]) -> (GraphSpec, SongNodes) {
             let node = spec.push(node);
             spec.connect(tail, node);
             effects.push((device.id, node));
-            nodes.devices.push((device.id, node));
+            register(&mut spec, &mut nodes, device.id, node);
             tail = node;
         }
         // Now the effects have ids, the notes can name them: the voice's
@@ -491,6 +508,7 @@ pub fn build_song(song: &Song) -> (GraphSpec, SongNodes) {
         meters: vec![None; song.tracks.len()],
         master,
         devices: Vec::new(),
+        telemetry: Vec::new(),
     };
     let desk = desk(&mut spec, song, &mut nodes, master);
 
@@ -528,7 +546,7 @@ pub fn build_song(song: &Song) -> (GraphSpec, SongNodes) {
                 let node = spec.push(node);
                 spec.connect(tail, node);
                 effects.push((device.id, node));
-                nodes.devices.push((device.id, node));
+                register(&mut spec, &mut nodes, device.id, node);
                 tail = node;
             }
             if !effects.is_empty() {
@@ -810,6 +828,42 @@ mod tests {
                 .any(|(_, node)| matches!(node, NodeSpec::Poly { .. })),
             "a voice was built for a track with no notes"
         );
+    }
+
+    /// Every device that reaches the graph gets a telemetry slot of its
+    /// own, in both builders: the strip's IN sections and the desk's
+    /// rails alike, no two on one slot.
+    #[test]
+    fn every_built_device_reports_under_its_own_slot() {
+        let song = song_with_a_clip();
+        for (spec, nodes) in [build(&song, &playing(&song)), build_song(&song)] {
+            let _ = spec;
+            assert_eq!(nodes.telemetry.len(), nodes.devices.len());
+            let mut slots: Vec<usize> = nodes.telemetry.iter().map(|(_, slot)| *slot).collect();
+            slots.sort_unstable();
+            slots.dedup();
+            assert_eq!(
+                slots.len(),
+                nodes.telemetry.len(),
+                "two devices share a slot"
+            );
+            let preamp = song
+                .section(0, crate::console::SectionKind::Preamp)
+                .expect("preamp")
+                .id;
+            assert!(
+                nodes.telemetry.iter().any(|(id, _)| *id == preamp),
+                "the preamp is not telemetered"
+            );
+            let glue = song.console.buses[0]
+                .section(crate::console::SectionKind::Glue)
+                .expect("glue")
+                .id;
+            assert!(
+                nodes.telemetry.iter().any(|(id, _)| *id == glue),
+                "the bus's glue is not telemetered"
+            );
+        }
     }
 
     /// The arrangement's graph renders offline, which is what the song

@@ -135,6 +135,8 @@ struct Audio {
     /// Scratch for the levels handed back to the stage, kept between
     /// frames so a meter costs no allocation per frame.
     levels: Vec<Level>,
+    /// The same for the console's telemetry.
+    telemetry: Vec<(daw::sequencing::DeviceId, daw::console::Telemetry)>,
 }
 
 impl Audio {
@@ -155,6 +157,7 @@ impl Audio {
             seeks: 0,
             seek_block: None,
             levels: Vec::new(),
+            telemetry: Vec::new(),
             looped: None,
             export: None,
         }
@@ -490,6 +493,25 @@ impl Audio {
             right: snapshot.track_peaks_r[MASTER_METER],
         };
         stage.set_levels(&self.levels, master);
+        // The console's telemetry: every section's own figures, by the
+        // device the card draws.
+        self.telemetry.clear();
+        if let Some(nodes) = &self.nodes {
+            for (id, slot) in &nodes.telemetry {
+                let Some(said) = snapshot.telemetry.get(*slot) else {
+                    continue;
+                };
+                self.telemetry.push((
+                    *id,
+                    daw::console::Telemetry {
+                        level_db: said.level_db,
+                        reduction_db: said.reduction_db,
+                        bands: said.bands,
+                    },
+                ));
+            }
+        }
+        stage.set_telemetry(&self.telemetry);
     }
 }
 
