@@ -3449,14 +3449,20 @@ pub static CONSOLE: &[DeviceSpec] = &[
         params: daw::params::console::door::TABLE,
         labels: &[
             ParamLabel {
+                name: "Mode",
+                unit: "",
+                group: "Door",
+                choices: &["key", "rhythm"],
+            },
+            ParamLabel {
                 name: "Threshold",
                 unit: "dB",
                 group: "Door",
                 choices: &[],
             },
             ParamLabel {
-                name: "Range",
-                unit: "dB",
+                name: "Ratio",
+                unit: ":1",
                 group: "Door",
                 choices: &[],
             },
@@ -3479,8 +3485,38 @@ pub static CONSOLE: &[DeviceSpec] = &[
                 choices: &[],
             },
             ParamLabel {
-                name: "Key",
+                name: "Range",
+                unit: "dB",
+                group: "Door",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Key HP",
                 unit: "Hz",
+                group: "Door",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Key LP",
+                unit: "Hz",
+                group: "Door",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Hysteresis",
+                unit: "dB",
+                group: "Door",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Division",
+                unit: "",
+                group: "Door",
+                choices: &["1/4", "1/8", "1/16", "1/32", "1/8T", "1/16T"],
+            },
+            ParamLabel {
+                name: "Duty",
+                unit: "%",
                 group: "Door",
                 choices: &[],
             },

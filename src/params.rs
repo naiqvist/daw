@@ -7749,55 +7749,120 @@ pub mod console {
     pub mod door {
         use super::super::ParamDef;
 
-        pub const THRESHOLD: u32 = 0;
-        pub const RANGE: u32 = 1;
-        pub const ATTACK: u32 = 2;
-        pub const HOLD: u32 = 3;
-        pub const RELEASE: u32 = 4;
-        pub const KEY_HZ: u32 = 5;
+        pub const MODE: u32 = 0;
+        pub const THRESHOLD: u32 = 1;
+        pub const RATIO: u32 = 2;
+        pub const ATTACK: u32 = 3;
+        pub const HOLD: u32 = 4;
+        pub const RELEASE: u32 = 5;
+        pub const RANGE: u32 = 6;
+        pub const KEY_HP: u32 = 7;
+        pub const KEY_LP: u32 = 8;
+        pub const HYSTERESIS: u32 = 9;
+        pub const DIVISION: u32 = 10;
+        pub const DUTY: u32 = 11;
+
+        pub const MODE_KEY: u32 = 0;
+        pub const MODE_RHYTHM: u32 = 1;
+        /// The door looks ahead by this much, so a transient is never
+        /// clipped by its own opening. Fixed, so the latency is fixed.
+        pub const LOOKAHEAD_MS: f32 = 2.0;
+        /// The detector's own ballistics: as fast as a VCA's.
+        pub const DETECT_ATTACK_MS: f32 = 0.1;
+        pub const DETECT_RELEASE_MS: f32 = 3.0;
+        /// The key filters' slope.
+        pub const KEY_ORDER: u32 = 2;
+        /// A short burst releases faster than a sustained note: the
+        /// release scales from this share up to one over this long open.
+        pub const RELEASE_QUICK: f32 = 0.35;
+        pub const RELEASE_SETTLE_MS: f32 = 200.0;
+        /// The rhythm's divisions, in beats, in `DIVISION`'s order.
+        pub const DIVISION_BEATS: [f32; 6] = [1.0, 0.5, 0.25, 0.125, 1.0 / 3.0, 1.0 / 6.0];
 
         pub const TABLE: &[ParamDef] = &[
             ParamDef {
                 id: 0,
+                name: "Mode",
+                min: 0.0,
+                max: 1.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 1,
                 name: "Threshold",
                 min: -60.0,
                 max: 0.0,
                 default: -40.0,
             },
             ParamDef {
-                id: 1,
-                name: "Range",
-                min: 0.0,
-                max: 80.0,
-                default: 24.0,
-            },
-            ParamDef {
                 id: 2,
-                name: "Attack",
-                min: 0.05,
-                max: 100.0,
-                default: 1.0,
+                name: "Ratio",
+                min: 1.5,
+                max: 20.0,
+                default: 10.0,
             },
             ParamDef {
                 id: 3,
+                name: "Attack",
+                min: 0.05,
+                max: 100.0,
+                default: 0.5,
+            },
+            ParamDef {
+                id: 4,
                 name: "Hold",
                 min: 0.0,
                 max: 500.0,
                 default: 20.0,
             },
             ParamDef {
-                id: 4,
+                id: 5,
                 name: "Release",
                 min: 5.0,
                 max: 2000.0,
-                default: 120.0,
+                default: 100.0,
             },
             ParamDef {
-                id: 5,
-                name: "Key",
+                id: 6,
+                name: "Range",
+                min: 0.0,
+                max: 80.0,
+                default: 40.0,
+            },
+            ParamDef {
+                id: 7,
+                name: "Key HP",
                 min: 20.0,
                 max: 2000.0,
                 default: 20.0,
+            },
+            ParamDef {
+                id: 8,
+                name: "Key LP",
+                min: 200.0,
+                max: 20000.0,
+                default: 20000.0,
+            },
+            ParamDef {
+                id: 9,
+                name: "Hysteresis",
+                min: 0.0,
+                max: 12.0,
+                default: 3.0,
+            },
+            ParamDef {
+                id: 10,
+                name: "Division",
+                min: 0.0,
+                max: 5.0,
+                default: 2.0,
+            },
+            ParamDef {
+                id: 11,
+                name: "Duty",
+                min: 5.0,
+                max: 95.0,
+                default: 50.0,
             },
         ];
     }

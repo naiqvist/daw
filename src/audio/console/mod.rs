@@ -19,6 +19,7 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
+pub mod door;
 pub mod preamp;
 pub mod tone;
 
@@ -109,6 +110,7 @@ pub fn core_of(params: &SectionParams, sample_rate: f32, block: usize) -> Box<dy
     match params.kind {
         SectionKind::Preamp => Box::new(preamp::PreampCore::new(params, sample_rate, block)),
         SectionKind::Tone => Box::new(tone::ToneCore::new(params, sample_rate, block)),
+        SectionKind::Door => Box::new(door::DoorCore::new(params, sample_rate, block)),
         _ => Box::new(Wire::new(params)),
     }
 }
@@ -133,6 +135,11 @@ mod tests {
         for kind in SectionKind::ALL {
             let params = SectionParams::of(kind);
             let mut core = core_of(&params, 48_000.0, 256);
+            if core.latency() > 0 {
+                // A section that looks ahead is a wire BEHIND its
+                // lookahead, which its own tests hold it to.
+                continue;
+            }
             for len in [0usize, 1, 7, 256] {
                 let mut l: Vec<f32> = (0..len).map(|i| (i as f32 * 0.1).sin()).collect();
                 let mut r: Vec<f32> = l.iter().map(|s| -s).collect();
