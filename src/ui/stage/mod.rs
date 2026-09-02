@@ -3766,6 +3766,7 @@ impl Stage {
             },
             design::px(design::space::SNUG),
             alpha,
+            0,
         );
     }
 
@@ -3804,7 +3805,7 @@ impl Stage {
             };
             let head = Self::head_rect(field, slot);
             let strip = mixer::strip_beneath(head, bottom, gap);
-            mixer::draw(painter, strip, channel, inner, self.alphabet());
+            mixer::draw(painter, strip, channel, inner, self.alphabet(), track as u8);
         }
     }
 

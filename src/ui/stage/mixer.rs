@@ -30,18 +30,12 @@
 //! mark of its own, in the value focus always uses, spent on the one
 //! thing that is focus rather than on the biggest thing on screen.
 //!
-//! # What the blocks are
-//!
-//! The meter is a stack of cells lit from the bottom, and the topmost lit
-//! cell is a DITHER — a hard-coded pattern of sub-squares at ordered
-//! coverage, which is what buys intermediate steps without spending new
-//! symbols from the alphabet: one ink, more or less of it. Vectors and
-//! not characters, for the reason `ui::glyph` gives: a character carries
-//! a typeface's opinion, sits on a baseline that is not the cell's
-//! centre, and becomes a box on a machine without the font.
+//! The meter is a run of circuit ticks in a recessed well. A separate
+//! rail carries the fader, so a moving level cannot hide the value the
+//! hand set.
 
 use super::Level;
-use crate::design;
+use crate::design::{self, block, circuit, kit::Weight};
 use crate::sequencing::Song;
 use crate::ui::device::meter;
 use eframe::egui;
@@ -170,60 +164,6 @@ pub fn cell_coverage(index: usize, place: f32) -> f32 {
     ((place - floor) / per_cell).clamp(0.0, 1.0)
 }
 
-/// The ordered-dither matrix the pseudo-blocks are built from.
-///
-/// A 4×4 Bayer threshold map: sixteen coverage steps from one ink, which
-/// is the whole trick — an intermediate value is AREA, not a new colour,
-/// so the alphabet's cap is untouched by however many steps are drawn.
-const BAYER: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
-
-/// Paint one pseudo-block: `rect` filled to `coverage` in `ink`.
-///
-/// Full coverage is one rectangle rather than sixteen, which is both
-/// faster and sharper; anything between is the dither. Sub-squares are
-/// snapped to whole pixels, or the pattern moirés at fractional scaling
-/// and the meter shimmers while standing still.
-pub fn block(painter: &egui::Painter, rect: egui::Rect, ink: egui::Color32, coverage: f32) {
-    let coverage = coverage.clamp(0.0, 1.0);
-    if coverage <= 0.0 {
-        return;
-    }
-    if coverage >= 1.0 {
-        painter.rect_filled(snap(painter, rect), 0.0, ink);
-        return;
-    }
-    let steps = (coverage * 16.0).round() as u8;
-    let cell = egui::vec2(rect.width() / 4.0, rect.height() / 4.0);
-    for (row, thresholds) in BAYER.iter().enumerate() {
-        for (col, threshold) in thresholds.iter().enumerate() {
-            if *threshold >= steps {
-                continue;
-            }
-            let min = rect.min + egui::vec2(col as f32 * cell.x, row as f32 * cell.y);
-            painter.rect_filled(
-                snap(painter, egui::Rect::from_min_size(min, cell)),
-                0.0,
-                ink,
-            );
-        }
-    }
-}
-
-/// Pull a rectangle onto the pixel grid. A dither is a pattern of
-/// hairlines; half a pixel of drift is the difference between a texture
-/// and a shimmer.
-fn snap(painter: &egui::Painter, rect: egui::Rect) -> egui::Rect {
-    let ppp = painter.ctx().pixels_per_point();
-    if ppp <= 0.0 {
-        return rect;
-    }
-    let to = |v: f32| (v * ppp).round() / ppp;
-    egui::Rect::from_min_max(
-        egui::pos2(to(rect.min.x), to(rect.min.y)),
-        egui::pos2(to(rect.max.x), to(rect.max.y)),
-    )
-}
-
 /// The most the model lets a fader hold, as linear amplitude: the top of
 /// `track.volume`'s registered span. Named here so the verb and the drawn
 /// overtravel cannot come to disagree about the same number.
@@ -310,9 +250,8 @@ pub fn pan_label(pan: f32) -> String {
     format!("{side}{amount}")
 }
 
-/// The pan rail's height at the foot of a strip. A layout dimension,
-/// settled by eye: one rail and its mark, and no more.
-pub const PAN_H: f32 = 12.0;
+/// The pan rail and its always-visible value at the foot of a strip.
+pub const PAN_H: f32 = 26.0;
 
 /// The two switches' row. Square by construction — a switch is a square
 /// because a square at this size is a shape rather than a glyph, and it
@@ -341,13 +280,33 @@ pub fn draw(
     channel: &Channel,
     gap: f32,
     alpha: &design::Alphabet,
+    variant: u8,
 ) {
     if strip.height() <= 0.0 || strip.width() <= 0.0 {
         return;
     }
-    let pan_top = strip.max.y - PAN_H;
-    let switch_top = pan_top - gap - SWITCH_H;
-    let meters = egui::Rect::from_min_max(strip.min, egui::pos2(strip.max.x, switch_top - gap));
+    let mut casing = Vec::new();
+    circuit::panel_variant(
+        &mut casing,
+        strip,
+        Some(alpha.surface.color),
+        alpha.ground.color,
+        Some((Weight::Hair, alpha.edge.color)),
+        variant,
+    );
+    for shape in casing {
+        painter.add(shape);
+    }
+
+    let inner = strip.shrink(gap.max(3.0));
+    let pan_top = inner.max.y - PAN_H;
+    let switch_h = if channel.switches {
+        SWITCH_H + gap
+    } else {
+        0.0
+    };
+    let switch_top = pan_top - switch_h;
+    let meters = egui::Rect::from_min_max(inner.min, egui::pos2(inner.max.x, switch_top - gap));
     if meters.height() > 0.0 {
         draw_meters(painter, meters, channel, gap, alpha);
     }
@@ -355,8 +314,8 @@ pub fn draw(
         draw_switches(
             painter,
             egui::Rect::from_min_max(
-                egui::pos2(strip.min.x, switch_top),
-                egui::pos2(strip.max.x, switch_top + SWITCH_H),
+                egui::pos2(inner.min.x, switch_top),
+                egui::pos2(inner.max.x, switch_top + SWITCH_H),
             ),
             channel,
             gap,
@@ -365,13 +324,13 @@ pub fn draw(
     }
     draw_pan(
         painter,
-        egui::Rect::from_min_max(egui::pos2(strip.min.x, pan_top), strip.max),
+        egui::Rect::from_min_max(egui::pos2(inner.min.x, pan_top), inner.max),
         channel,
         alpha,
     );
 }
 
-/// The two meters and the fader that crosses them.
+/// Two meter ladders in one well, their ruler, and a separate fader rail.
 fn draw_meters(
     painter: &egui::Painter,
     zone: egui::Rect,
@@ -388,106 +347,176 @@ fn draw_meters(
     } else {
         alpha.edge.color
     };
-    let rest = alpha.well.color;
+    let readout_h = block::height(block::unit::MICRO) + gap;
+    let chart = egui::Rect::from_min_max(zone.min, egui::pos2(zone.max.x, zone.max.y - readout_h));
+    if !chart.is_positive() {
+        return;
+    }
+    let scale_w = block::width("-48", block::unit::MICRO) + gap;
+    let fader_w = 20.0;
+    let well = egui::Rect::from_min_max(
+        egui::pos2(chart.min.x + scale_w, chart.min.y),
+        egui::pos2(chart.max.x - fader_w - gap, chart.max.y),
+    );
+    let mut shapes = Vec::new();
+    circuit::octagon(
+        &mut shapes,
+        well,
+        4.0,
+        Some(alpha.well.color),
+        Some((Weight::Hair, alpha.edge.color)),
+    );
 
-    // Cells fill the ladder from the floor to unity; the band above it is
-    // the fader's overtravel, which has no meter behind it.
-    let unity_y = zone.max.y - zone.height() * unity_place();
-    let ladder = egui::Rect::from_min_max(egui::pos2(zone.min.x, unity_y), zone.max);
-    let cell_h = ladder.height() / CELLS as f32;
-
-    let gutter = gap * 0.5;
-    let meter_w = ((zone.width() - gutter) / 2.0).max(1.0);
+    // The meter cells occupy floor-to-unity. The well itself continues
+    // into the fader's boost band so the shared ruler stays honest.
+    let unity_y = chart.max.y - chart.height() * unity_place();
+    let ladder = egui::Rect::from_min_max(
+        egui::pos2(well.min.x + gap * 0.5, unity_y),
+        egui::pos2(well.max.x - gap * 0.5, well.max.y - 2.0),
+    );
+    let lane_gap = 3.0;
+    let lane_w = ((ladder.width() - lane_gap) * 0.5).max(1.0);
     let sides = [
-        (zone.min.x, channel.level.left, channel.peak.left),
         (
-            zone.max.x - meter_w,
+            egui::Rect::from_min_size(ladder.min, egui::vec2(lane_w, ladder.height())),
+            channel.level.left,
+            channel.peak.left,
+        ),
+        (
+            egui::Rect::from_min_size(
+                egui::pos2(ladder.max.x - lane_w, ladder.min.y),
+                egui::vec2(lane_w, ladder.height()),
+            ),
             channel.level.right,
             channel.peak.right,
         ),
     ];
-    for (x, amp, peak) in sides {
+    for (lane, amp, peak) in sides {
         let place = place_of_amp(amp);
-        // Over full scale there is nothing taller to draw, so the top
-        // cell changes its VALUE instead of its height — the one place
-        // this surface spends alarm ink, and it spends it on the only
-        // thing here that is actually at stake.
-        let clipping = amp >= 1.0;
-        for cell in 0..CELLS {
-            let top = ladder.max.y - (cell + 1) as f32 * cell_h;
-            let rect = egui::Rect::from_min_size(
-                egui::pos2(x, top + cell_h * 0.15),
-                egui::vec2(meter_w, cell_h * 0.7),
-            );
-            let coverage = cell_coverage(cell, place);
-            if coverage <= 0.0 {
-                // The unlit ladder stays visible: a meter reading nothing
-                // and a meter that is not there must not look alike.
-                block(painter, rect, rest, 1.0);
-                continue;
-            }
-            let lit = if clipping && cell + 1 == CELLS {
-                alpha.jeopardy_active.color
-            } else {
-                ink
-            };
-            block(painter, rect, lit, coverage);
+        let lit = (0..CELLS)
+            .map(|cell| cell_coverage(cell, place))
+            .sum::<f32>()
+            / CELLS as f32;
+        circuit::tick_bar(
+            &mut shapes,
+            lane,
+            CELLS,
+            lit,
+            ink,
+            alpha.surface.color,
+            false,
+        );
+        if amp >= 1.0 {
+            let cell_h = lane.height() / CELLS as f32;
+            shapes.push(egui::Shape::rect_filled(
+                egui::Rect::from_min_max(
+                    lane.min,
+                    egui::pos2(lane.max.x, lane.min.y + cell_h - 1.0),
+                ),
+                0.0,
+                alpha.jeopardy_active.color,
+            ));
         }
-        // The peak mark: a rule at the loudest recent moment, above the
-        // bar while the bar is falling and on it while it is not. Content
-        // ink, because it is the one reading a glance at a moving bar
-        // cannot take; alarm ink past full scale, for the same reason the
-        // top cell turns.
         if peak > 0.0 {
-            let y = ladder.max.y - ladder.height() * place_of_amp(peak).min(1.0);
-            let rule = if peak >= 1.0 {
+            let y = chart.max.y - chart.height() * place_of_amp(peak);
+            let peak_ink = if peak >= 1.0 {
                 alpha.jeopardy_active.color
             } else {
                 alpha.ink.color
             };
-            painter.line_segment(
-                [egui::pos2(x, y), egui::pos2(x + meter_w, y)],
-                egui::Stroke::new(1.0, rule),
+            circuit::trace(
+                &mut shapes,
+                &[egui::pos2(lane.min.x, y), egui::pos2(lane.max.x, y)],
+                Weight::Heavy,
+                peak_ink,
+            );
+            circuit::pad(
+                &mut shapes,
+                egui::pos2(lane.max.x, y),
+                circuit::PAD - 2.0,
+                peak_ink,
+                true,
             );
         }
     }
 
-    // The scale. Graduations at the decibels a mixer is actually read
-    // against, drawn up the strip's leading edge. This is most of what
-    // separates an instrument from a drawing of one: a value you can
-    // read off a rail without a number beside it.
-    let marks: Vec<f32> = [0.0f32, -6.0, -12.0, -24.0, -48.0]
-        .into_iter()
-        .map(place_of_db)
-        .collect();
-    super::ornament::graduations(painter, zone, &marks, alpha.edge.color, gap * 0.6);
-
-    // Unity, as a rule across the whole strip: the line the meters top
-    // out at and the fader's own zero — one line, because it is one number.
-    painter.line_segment(
-        [
-            egui::pos2(zone.min.x, unity_y),
-            egui::pos2(zone.max.x, unity_y),
-        ],
-        egui::Stroke::new(1.0, alpha.edge.color),
+    // The fader has its own rail beside the moving meters.
+    let fader_x = chart.max.x - fader_w * 0.5;
+    circuit::rail(
+        &mut shapes,
+        egui::pos2(fader_x, chart.min.y + 2.0),
+        egui::pos2(fader_x, chart.max.y - 2.0),
+        &[0.0, 1.0 - unity_place(), 1.0],
+        alpha.edge.color,
     );
-
-    // The handle: the gain, on the same ruler, across both meters. Drawn
-    // last so it is never hidden by a loud meter — the fader is a thing
-    // the hand set and must stay findable while the music moves.
-    let handle_y = zone.max.y - zone.height() * place_of_amp(channel.gain);
-    painter.line_segment(
-        [
-            egui::pos2(zone.min.x, handle_y),
-            egui::pos2(zone.max.x, handle_y),
+    let handle_y = chart.max.y - chart.height() * place_of_amp(channel.gain);
+    circuit::trace(
+        &mut shapes,
+        &[
+            egui::pos2(fader_x - 7.0, handle_y),
+            egui::pos2(fader_x + 7.0, handle_y),
         ],
-        egui::Stroke::new(3.0, alpha.ink.color),
+        Weight::Bold,
+        alpha.ink.color,
+    );
+    circuit::pad(
+        &mut shapes,
+        egui::pos2(fader_x, handle_y),
+        circuit::PAD,
+        alpha.ink.color,
+        true,
+    );
+    for shape in shapes {
+        painter.add(shape);
+    }
+
+    // Graduations are pads on one rail; their numbers are cut beside it.
+    let rail_x = chart.min.x + scale_w - gap * 0.5;
+    let mut scale = Vec::new();
+    circuit::trace(
+        &mut scale,
+        &[
+            egui::pos2(rail_x, chart.min.y),
+            egui::pos2(rail_x, chart.max.y),
+        ],
+        Weight::Hair,
+        alpha.edge.color,
+    );
+    for db in [0_i32, -6, -12, -24, -48] {
+        let y = chart.max.y - chart.height() * place_of_db(db as f32);
+        circuit::pad(
+            &mut scale,
+            egui::pos2(rail_x, y),
+            circuit::PAD - 2.0,
+            alpha.edge.color,
+            true,
+        );
+        block::paint(
+            painter,
+            egui::Id::new(("mixer-db", chart.min.x.round() as i32, db)),
+            egui::pos2(rail_x - gap, y),
+            egui::Align2::RIGHT_CENTER,
+            block::unit::MICRO,
+            &db.to_string(),
+            alpha.edge.color,
+        );
+    }
+    for shape in scale {
+        painter.add(shape);
+    }
+
+    block::paint(
+        painter,
+        egui::Id::new(("mixer-gain", zone.min.x.round() as i32)),
+        egui::pos2(zone.center().x, zone.max.y),
+        egui::Align2::CENTER_BOTTOM,
+        block::unit::MICRO,
+        &gain_label(channel.gain),
+        alpha.ink.color,
     );
 }
 
-/// Mute and solo, as two squares. POSITION is the code — left is mute,
-/// right is solo — because a letter is unreadable at the distance this
-/// surface is meant to be read from, and a square is not.
+/// Mute and solo, as two labelled squares.
 fn draw_switches(
     painter: &egui::Painter,
     zone: egui::Rect,
@@ -498,13 +527,13 @@ fn draw_switches(
     let size = SWITCH_H.min(zone.height()).min(zone.width());
     let centre = zone.center().x;
     let switches = [
-        (centre - gap * 0.5 - size, channel.muted),
-        (centre + gap * 0.5, channel.soloed),
+        (centre - gap * 0.5 - size, channel.muted, "M"),
+        (centre + gap * 0.5, channel.soloed, "S"),
     ];
-    for (x, on) in switches {
+    for (x, on, label) in switches {
         let rect = egui::Rect::from_min_size(egui::pos2(x, zone.min.y), egui::vec2(size, size));
         if on {
-            block(painter, rect, alpha.ink.color, 1.0);
+            painter.rect_filled(rect, 0.0, alpha.ink.color);
         } else {
             painter.rect_stroke(
                 rect,
@@ -513,6 +542,19 @@ fn draw_switches(
                 egui::StrokeKind::Inside,
             );
         }
+        block::paint(
+            painter,
+            egui::Id::new(("mixer-switch", zone.min.x.round() as i32, label)),
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            block::unit::MICRO,
+            label,
+            if on {
+                alpha.ground.color
+            } else {
+                alpha.edge.color
+            },
+        );
     }
 }
 
@@ -524,16 +566,29 @@ fn draw_pan(
     channel: &Channel,
     alpha: &design::Alphabet,
 ) {
-    let mid = zone.center();
-    painter.line_segment(
-        [egui::pos2(zone.min.x, mid.y), egui::pos2(zone.max.x, mid.y)],
-        egui::Stroke::new(1.0, alpha.edge.color),
+    let rail_y = zone.min.y + 6.0;
+    let left = egui::pos2(zone.min.x + 4.0, rail_y);
+    let right = egui::pos2(zone.max.x - 4.0, rail_y);
+    let mut shapes = Vec::new();
+    circuit::rail(&mut shapes, left, right, &[0.0, 0.5, 1.0], alpha.edge.color);
+    let x = left.x + channel.pan.clamp(-1.0, 1.0).mul_add(0.5, 0.5) * (right.x - left.x);
+    circuit::pad(
+        &mut shapes,
+        egui::pos2(x, rail_y),
+        circuit::PAD + 1.0,
+        alpha.ink.color,
+        true,
     );
-    let half = zone.width() / 2.0;
-    let x = mid.x + channel.pan.clamp(-1.0, 1.0) * half;
-    let mark =
-        egui::Rect::from_center_size(egui::pos2(x, mid.y), egui::vec2(3.0, zone.height() * 0.6));
-    block(painter, mark, alpha.ink.color, 1.0);
+    for shape in shapes {
+        painter.add(shape);
+    }
+    painter.text(
+        egui::pos2(zone.center().x, zone.max.y),
+        egui::Align2::CENTER_BOTTOM,
+        pan_label(channel.pan),
+        egui::FontId::monospace(design::px(design::type_scale::MICRO)),
+        alpha.ink.color,
+    );
 }
 
 #[cfg(test)]
