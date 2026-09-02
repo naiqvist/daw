@@ -19,7 +19,11 @@
 
 use crate::ui::affordance::{Afford, Affords};
 use crate::ui::theme::Theme;
-use crate::ui::tokens::{font, radius, space, stroke};
+use crate::ui::tokens::{font, space};
+use crate::{
+    design::kit::Weight,
+    design::{block, circuit},
+};
 use eframe::egui;
 
 /// One thing the palette can run. `id` is what comes back when it is
@@ -293,24 +297,71 @@ impl Palette {
 
         egui::Area::new(egui::Id::new("command_palette"))
             .order(egui::Order::Foreground)
+            // This is a summoned machine surface, not a tooltip. It must
+            // arrive at full contrast on the invocation frame so the
+            // keyboard cursor is readable immediately.
+            .fade_in(false)
             .fixed_pos(egui::pos2(
                 screen.center().x - width * 0.5,
                 screen.top() + theme.sp(space::XXL),
             ))
             .show(ctx, |ui| {
                 ui.set_width(width);
-                egui::Frame::new()
+                let contents = egui::Frame::new()
                     .fill(theme.surface_raised)
-                    .stroke(egui::Stroke::new(stroke::HAIR, theme.outline))
-                    .corner_radius(radius::PANEL as u8)
                     .inner_margin(egui::Margin::same(theme.sp(space::SM) as i8))
                     .show(ui, |ui| {
-                        let field = ui.add(
-                            egui::TextEdit::singleline(&mut self.query)
-                                .hint_text("run a command")
-                                .desired_width(f32::INFINITY)
-                                .font(egui::TextStyle::Body),
+                        let title_h = block::height(block::unit::MICRO) + theme.sp(space::XS);
+                        let (title_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), title_h),
+                            egui::Sense::hover(),
                         );
+                        block::paint(
+                            ui.painter(),
+                            egui::Id::new("command-palette-title"),
+                            title_rect.left_top(),
+                            egui::Align2::LEFT_TOP,
+                            block::unit::MICRO,
+                            "COMMAND",
+                            theme.text,
+                        );
+
+                        let (search_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), 27.0),
+                            egui::Sense::hover(),
+                        );
+                        let mut search_shapes = Vec::new();
+                        circuit::panel_variant(
+                            &mut search_shapes,
+                            search_rect,
+                            Some(theme.bg),
+                            theme.surface_raised,
+                            Some((Weight::Hair, theme.outline)),
+                            2,
+                        );
+                        circuit::pad(
+                            &mut search_shapes,
+                            egui::pos2(search_rect.right() - 9.0, search_rect.center().y),
+                            circuit::PAD - 1.0,
+                            theme.outline,
+                            true,
+                        );
+                        ui.painter().extend(search_shapes);
+                        let field = ui
+                            .scope_builder(
+                                egui::UiBuilder::new()
+                                    .max_rect(search_rect.shrink2(egui::vec2(7.0, 2.0))),
+                                |ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.query)
+                                            .hint_text("run a command")
+                                            .desired_width(f32::INFINITY)
+                                            .font(egui::TextStyle::Body)
+                                            .frame(egui::Frame::NONE),
+                                    )
+                                },
+                            )
+                            .inner;
                         if self.just_opened {
                             field.request_focus();
                             self.just_opened = false;
@@ -373,6 +424,28 @@ impl Palette {
                             );
                         }
                     });
+
+                let mut shell_shapes = Vec::new();
+                // The frame lays down the opaque plane before its text.
+                // Cut the service recesses back out afterwards; they live
+                // wholly in the margin, so the fill follows the casing
+                // without a late background shape washing over content.
+                mask_palette_shell(&mut shell_shapes, contents.response.rect, theme.bg);
+                circuit::panel_frame_variant(
+                    &mut shell_shapes,
+                    contents.response.rect,
+                    Weight::Heavy,
+                    theme.text,
+                    3,
+                );
+                circuit::panel_frame_variant(
+                    &mut shell_shapes,
+                    contents.response.rect.shrink(5.0),
+                    Weight::Hair,
+                    theme.outline,
+                    0,
+                );
+                ui.painter().extend(shell_shapes);
             });
 
         if accept && chosen.is_none() {
@@ -405,18 +478,42 @@ impl Palette {
             theme.text_muted
         };
 
-        // The row's ground is reserved NOW and painted once the row has
-        // been laid out and asked whether the pointer is on it. A frame
-        // cannot know its own size before its contents exist, and a
-        // hover fill drawn afterwards would sit on top of the text.
-        let ground = ui.painter().add(egui::Shape::Noop);
-        let resp = egui::Frame::new()
-            .corner_radius(radius::CTRL as u8)
-            .inner_margin(egui::Margin::symmetric(
-                theme.sp(space::XS) as i8,
-                theme.sp(space::XS) as i8,
-            ))
-            .show(ui, |ui| {
+        let row_h = font::BODY + theme.sp(space::XS) * 2.0 + 4.0;
+        let (rect, resp) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), row_h),
+            egui::Sense::click(),
+        );
+        let resp = resp.affords(Affords::Press);
+        // Allocate first so hover is known, paint the shaped fill second,
+        // and lay the text down last. That ordering keeps the selection
+        // opaque without turning the command itself into a ghost.
+        let fill = if active {
+            fill
+        } else if resp.hovered() {
+            theme.surface
+        } else {
+            fill
+        };
+        if fill != egui::Color32::TRANSPARENT {
+            let mut shapes = Vec::new();
+            circuit::panel_variant(
+                &mut shapes,
+                rect,
+                Some(fill),
+                theme.surface_raised,
+                None,
+                (self.cursor % 4) as u8,
+            );
+            if active {
+                circuit::brackets(&mut shapes, rect.expand(2.0), 7.0, Weight::Bold, theme.text);
+            }
+            ui.painter().extend(shapes);
+        }
+
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(rect.shrink2(egui::vec2(theme.sp(space::XS), theme.sp(space::XS)))),
+            |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new(cmd.group)
@@ -435,28 +532,40 @@ impl Palette {
                         });
                     }
                 });
-            })
-            .response;
-
-        let resp = resp.interact(egui::Sense::click()).affords(Affords::Press);
-        // The keyboard's row is the loud one — the palette is driven by
-        // typing — but a list that gave a mouse no answer at all would
-        // look like a picture of a list.
-        let fill = if active {
-            fill
-        } else if resp.hovered() {
-            theme.surface_raised
-        } else {
-            fill
-        };
-        if fill != egui::Color32::TRANSPARENT {
-            ui.painter().set(
-                ground,
-                egui::Shape::rect_filled(resp.rect, radius::CTRL as u8, fill),
-            );
-        }
+            },
+        );
         resp.clicked()
     }
+}
+
+/// Mask the two cuts used by palette shell variant three. The opaque egui
+/// frame is painted before its children; these small pieces restore the
+/// ground only in the casing's discarded corners after layout is known.
+fn mask_palette_shell(out: &mut Vec<egui::Shape>, rect: egui::Rect, ground: egui::Color32) {
+    let c = 6.0_f32
+        .min(rect.width() / 10.0)
+        .min(rect.height() / 5.0)
+        .max(1.0);
+    let s = (c * 1.8).min(rect.width() / 7.0);
+    let lower_a = rect.top() + rect.height() * 0.62;
+    let lower_b = (lower_a + c * 1.35).min(rect.bottom() - c);
+    out.push(egui::Shape::convex_polygon(
+        vec![
+            rect.right_bottom(),
+            egui::pos2(rect.right() - c, rect.bottom()),
+            egui::pos2(rect.right(), rect.bottom() - c),
+        ],
+        ground,
+        egui::Stroke::NONE,
+    ));
+    out.push(egui::Shape::rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(rect.left(), lower_a),
+            egui::pos2(rect.left() + s, lower_b),
+        ),
+        0.0,
+        ground,
+    ));
 }
 
 #[cfg(test)]

@@ -4169,17 +4169,6 @@ impl Stage {
         );
 
         let body = egui::FontId::monospace(design::px(design::type_scale::BODY));
-        // The numbers are CARVED: the readout and the tempo wear the
-        // inscription face, the beat cells stay typewritten so they keep
-        // their one-cell-per-beat geometry.
-        let carved = egui::FontId::new(
-            design::px(design::type_scale::BODY),
-            egui::FontFamily::Name(crate::INSCRIPTION.into()),
-        );
-        let quiet = egui::FontId::new(
-            design::px(design::type_scale::MICRO),
-            egui::FontFamily::Name(crate::INSCRIPTION.into()),
-        );
         let margin = design::px(design::space::ROOM);
         let gap = design::px(design::space::ROOM);
         let center_y = zone.center().y;
@@ -4214,14 +4203,15 @@ impl Stage {
             );
         }
 
-        let tempo_rect = painter.text(
+        let tempo_rect = block::paint(
+            painter,
+            egui::Id::new("stage-tempo"),
             egui::pos2(right, center_y),
             egui::Align2::RIGHT_CENTER,
-            tempo,
-            quiet,
+            block::unit::MICRO,
+            &tempo,
             self.alphabet().ink.color,
         );
-        let _ = &body;
         right = tempo_rect.min.x - gap;
 
         let beat_color = if self.transport.motion().is_rolling() {
@@ -4238,20 +4228,24 @@ impl Stage {
         );
         right = beat_rect.min.x - gap;
 
-        let readout_rect = painter.text(
+        let readout_rect = block::paint(
+            painter,
+            egui::Id::new("stage-readout"),
             egui::pos2(right, center_y),
             egui::Align2::RIGHT_CENTER,
-            readout,
-            carved.clone(),
+            block::unit::TITLE,
+            &readout,
             self.alphabet().ink.color,
         );
 
         if self.transport.motion() == Motion::Recording {
-            painter.text(
+            block::paint(
+                painter,
+                egui::Id::new("stage-recording"),
                 egui::pos2(readout_rect.min.x - gap, center_y),
                 egui::Align2::RIGHT_CENTER,
+                block::unit::MICRO,
                 "REC",
-                carved,
                 self.alphabet().jeopardy_active.color,
             );
         }
@@ -4272,13 +4266,36 @@ impl Stage {
         let Some(browser) = &self.browser else {
             return;
         };
-        // The browser is a PLANE above the work, and its lightness is what
-        // says so. It needs no edge drawn along it: a raised surface is
-        // already legible as one, and an outline would be the drawing
-        // apologising for the value not being trusted.
-        // A well, not a surface: the browser is a window cut into the
-        // ground, and sits below the planes it covers rather than among them.
-        painter.rect_filled(zone, 0.0, self.alphabet().well.color);
+        // The archive is one made object rather than a rectangular veil.
+        // Its fill and its outline are cut from the same path, so every
+        // recess exposes the field beneath instead of leaving a square
+        // patch behind the decorative border.
+        let alpha = self.alphabet();
+        let shell = zone.shrink(2.0);
+        kit::cached(
+            painter,
+            egui::Id::new("stage-browser-shell"),
+            shell,
+            (alpha.well.color, alpha.ground.color, alpha.ink.color),
+            |out| {
+                circuit::panel_variant(
+                    out,
+                    shell,
+                    Some(alpha.well.color),
+                    alpha.ground.color,
+                    Some((Weight::Heavy, alpha.ink.color)),
+                    1,
+                );
+                circuit::panel_frame_variant(
+                    out,
+                    shell.shrink(5.0),
+                    Weight::Hair,
+                    alpha.edge.color,
+                    3,
+                );
+                circuit::corner_pads(out, shell.shrink(2.0), alpha.edge.color);
+            },
+        );
 
         let line = design::px(design::type_scale::BODY);
         let font = egui::FontId::monospace(line);
@@ -4320,13 +4337,65 @@ impl Stage {
         // between them. A recess also says what the band is for — you
         // write into a surface, not onto one.
         let divider = snap(at(0, 2) + half).y;
-        painter.rect_filled(
-            egui::Rect::from_min_max(
-                egui::pos2(frame.left(), frame.top()),
-                egui::pos2(frame.right(), divider),
-            ),
-            0.0,
-            self.alphabet().ground.color,
+        let search = egui::Rect::from_min_max(
+            egui::pos2(frame.left(), frame.top()),
+            egui::pos2(frame.right(), divider),
+        );
+        kit::cached(
+            painter,
+            egui::Id::new("stage-browser-search"),
+            search,
+            (alpha.ground.color, alpha.well.color, alpha.edge.color),
+            |out| {
+                circuit::panel_variant(
+                    out,
+                    search,
+                    Some(alpha.ground.color),
+                    alpha.well.color,
+                    Some((Weight::Hair, alpha.edge.color)),
+                    2,
+                );
+                circuit::pad(
+                    out,
+                    egui::pos2(search.right() - 10.0, search.center().y),
+                    circuit::PAD,
+                    alpha.edge.color,
+                    true,
+                );
+            },
+        );
+
+        // Archive seal and the vertical rail-name make this overlay read
+        // as a place, not merely as a list that happened to cover a pane.
+        let archive_mark = egui::Rect::from_center_size(
+            egui::pos2(frame.left() + 12.0, frame.top() + 9.0),
+            egui::Vec2::splat(14.0),
+        );
+        kit::cached(
+            painter,
+            egui::Id::new("stage-browser-archive-mark"),
+            archive_mark,
+            alpha.edge.color,
+            |out| Sign::Archive.paint(out, archive_mark, Weight::Hair, alpha.edge.color),
+        );
+        let rail_rect = egui::Rect::from_min_max(
+            egui::pos2(frame.right() - 13.0, frame.bottom() - 78.0),
+            egui::pos2(frame.right() - 3.0, frame.bottom() - 4.0),
+        );
+        kit::cached(
+            painter,
+            egui::Id::new("stage-browser-archive-rail"),
+            rail_rect,
+            alpha.edge.color,
+            |out| {
+                block::text_vertical(
+                    out,
+                    egui::pos2(rail_rect.left(), rail_rect.bottom()),
+                    1.0,
+                    "ARCHIVE",
+                    alpha.edge.color,
+                );
+            },
         );
 
         // The surface's ONE mute flourish, and the only mark in this pane
@@ -4439,14 +4508,27 @@ impl Stage {
                 Line::Row(index, row, node) => {
                     let addressed = Some(*index) == browser.cursor();
                     if addressed {
-                        painter.rect_filled(
-                            egui::Rect::from_min_size(
-                                at(1, screen_row),
-                                egui::vec2(inner as f32 * cell.x, cell.y),
-                            ),
-                            0.0,
-                            self.focused(),
+                        let cursor = egui::Rect::from_min_size(
+                            at(1, screen_row),
+                            egui::vec2(inner as f32 * cell.x, cell.y),
                         );
+                        let mut shapes = Vec::new();
+                        circuit::panel_variant(
+                            &mut shapes,
+                            cursor,
+                            Some(self.focused()),
+                            alpha.well.color,
+                            None,
+                            (*index % 4) as u8,
+                        );
+                        circuit::brackets(
+                            &mut shapes,
+                            cursor.expand(2.0),
+                            7.0,
+                            Weight::Bold,
+                            alpha.focus.color,
+                        );
+                        painter.extend(shapes);
                     }
 
                     // Depth is drawn, not implied: two cells per level, so
@@ -4544,14 +4626,14 @@ impl Stage {
                     // character is unmatched and the row is drawn flat, so
                     // this costs nothing until it says something.
                     let start = 1 + indent + 3;
-                    let room =
-                        (columns - 1)
-                            .saturating_sub(start)
-                            .saturating_sub(if count.is_empty() {
-                                0
-                            } else {
-                                count.chars().count() + 1
-                            });
+                    let leaf_tail = usize::from(!node.is_branch()) * 3;
+                    let room = (columns - 1 - leaf_tail)
+                        .saturating_sub(start)
+                        .saturating_sub(if count.is_empty() {
+                            0
+                        } else {
+                            count.chars().count() + 1
+                        });
                     let marks = browser::match_positions(&node.label, browser.query());
                     for (offset, letter) in node.label.chars().take(room).enumerate() {
                         let lit = marks.get(offset).copied().unwrap_or(false);
@@ -4565,6 +4647,15 @@ impl Stage {
                             content
                         };
                         text(at(start + offset, screen_row), letter.to_string(), ink);
+                    }
+                    if !node.is_branch() {
+                        let y = at(columns - 3, screen_row).y + cell.y * 0.5;
+                        let a = egui::pos2(at(columns - 3, screen_row).x, y);
+                        let b = egui::pos2(at(columns - 1, screen_row).x, y);
+                        let mut shapes = Vec::new();
+                        circuit::trace(&mut shapes, &[a, b], Weight::Hair, structure);
+                        circuit::pad(&mut shapes, b, circuit::PAD - 1.0, structure, addressed);
+                        painter.extend(shapes);
                     }
                 }
                 // A note is never addressable, so it never inverts, and it
@@ -4620,33 +4711,100 @@ impl Stage {
             return;
         }
 
-        let line = design::px(design::type_scale::BODY);
-        let pitch = line + design::px(design::space::STEP);
-        let key_w = design::px(design::space::VAST) * 2.0;
-        let block_h = pitch * rows.len() as f32;
+        let alpha = self.alphabet();
+        let panel = field.shrink2(egui::vec2(28.0, 22.0));
+        let header_h = 42.0;
+        let footer_h = 22.0;
+        let pitch = 21.0;
+        let inner = panel.shrink2(egui::vec2(26.0, 18.0));
+        let available_h = (inner.height() - header_h - footer_h).max(pitch);
+        let max_rows = (available_h / pitch).floor().max(1.0) as usize;
+        let columns = rows.len().div_ceil(max_rows).clamp(1, 3);
+        let per_column = rows.len().div_ceil(columns);
+        let column_w = inner.width() / columns as f32;
 
-        let origin = egui::pos2(
-            (field.center().x - key_w).floor(),
-            (field.center().y - block_h / 2.0).floor(),
+        kit::cached(
+            painter,
+            egui::Id::new(("stage-help-shell", scope as u8)),
+            panel,
+            (alpha.surface.color, alpha.ground.color, alpha.ink.color),
+            |out| {
+                circuit::panel_variant(
+                    out,
+                    panel,
+                    Some(alpha.surface.color),
+                    alpha.ground.color,
+                    Some((Weight::Heavy, alpha.ink.color)),
+                    3,
+                );
+                circuit::panel_frame_variant(
+                    out,
+                    panel.shrink(5.0),
+                    Weight::Hair,
+                    alpha.edge.color,
+                    0,
+                );
+                let sign = egui::Rect::from_center_size(
+                    egui::pos2(inner.left() + 12.0, inner.top() + 10.0),
+                    egui::Vec2::splat(18.0),
+                );
+                Sign::Codex.paint(out, sign, Weight::Hair, alpha.edge.color);
+                circuit::rail(
+                    out,
+                    egui::pos2(inner.left() + 30.0, inner.top() + 10.0),
+                    egui::pos2(inner.right(), inner.top() + 10.0),
+                    &[0.0, 0.72, 1.0],
+                    alpha.edge.color,
+                );
+            },
+        );
+        block::paint(
+            painter,
+            egui::Id::new(("stage-help-title", scope as u8)),
+            egui::pos2(inner.left() + 34.0, inner.top()),
+            egui::Align2::LEFT_TOP,
+            block::unit::TITLE,
+            "CODEX",
+            alpha.ink.color,
         );
 
         for (index, (chord, label)) in rows.iter().enumerate() {
-            let y = origin.y + index as f32 * pitch + pitch / 2.0;
-            painter.text(
-                egui::pos2(origin.x + key_w, y),
-                egui::Align2::RIGHT_CENTER,
-                chord,
-                egui::FontId::monospace(line),
-                self.alphabet().focus.color,
+            let column = index / per_column;
+            if column >= columns {
+                break;
+            }
+            let row = index % per_column;
+            let left = inner.left() + column as f32 * column_w;
+            let y = inner.top() + header_h + row as f32 * pitch;
+            let chord = carved_chord(chord);
+            block::paint(
+                painter,
+                egui::Id::new(("stage-help-chord", scope as u8, index)),
+                egui::pos2(left, y),
+                egui::Align2::LEFT_TOP,
+                block::unit::MICRO,
+                &chord,
+                alpha.focus.color,
             );
             painter.text(
-                egui::pos2(origin.x + key_w + design::px(design::space::OPEN), y),
+                egui::pos2(
+                    left + column_w * 0.36,
+                    y + block::height(block::unit::MICRO) * 0.5,
+                ),
                 egui::Align2::LEFT_CENTER,
                 label,
-                egui::FontId::monospace(line),
-                self.alphabet().ink.color,
+                egui::FontId::monospace(13.0),
+                alpha.ink.color,
             );
         }
+
+        painter.text(
+            egui::pos2(inner.left(), inner.bottom()),
+            egui::Align2::LEFT_BOTTOM,
+            "CHORD / MEANING   ·   ? CLOSES THE CODEX",
+            egui::FontId::monospace(11.0),
+            alpha.edge.color,
+        );
     }
 
     fn draw_message(&self, painter: &egui::Painter, zone: egui::Rect) {
@@ -4674,6 +4832,22 @@ impl Stage {
                 words.push(notice.as_str());
             }
             if !words.is_empty() {
+                let mut marks = Vec::new();
+                let pad = egui::pos2(zone.min.x + MARGIN - 13.0, zone.center().y);
+                circuit::pad(
+                    &mut marks,
+                    pad,
+                    circuit::PAD,
+                    self.alphabet().edge.color,
+                    true,
+                );
+                circuit::trace(
+                    &mut marks,
+                    &[pad, pad + egui::vec2(8.0, 0.0)],
+                    Weight::Hair,
+                    self.alphabet().edge.color,
+                );
+                painter.extend(marks);
                 painter.text(
                     egui::pos2(zone.min.x + MARGIN, zone.center().y),
                     egui::Align2::LEFT_CENTER,
@@ -4695,6 +4869,22 @@ impl Stage {
             RefusalReason::AtTop => "Refused · already at top",
             RefusalReason::Unavailable => "Refused · no action yet",
         };
+        let mut marks = Vec::new();
+        let pad = egui::pos2(zone.min.x + MARGIN - 13.0, zone.center().y);
+        circuit::pad(
+            &mut marks,
+            pad,
+            circuit::PAD + 2.0,
+            self.refusal_ink(),
+            true,
+        );
+        circuit::trace(
+            &mut marks,
+            &[pad, pad + egui::vec2(8.0, 0.0)],
+            Weight::Bold,
+            self.refusal_ink(),
+        );
+        painter.extend(marks);
         painter.text(
             egui::pos2(zone.min.x + MARGIN, zone.center().y),
             egui::Align2::LEFT_CENTER,
@@ -4703,6 +4893,30 @@ impl Stage {
             self.refusal_ink(),
         );
     }
+}
+
+/// The block face is deliberately a small alphabet. Translate the few
+/// symbolic names produced by egui into terse machine words before they
+/// are cut into the codebook plaques.
+fn carved_chord(chord: &str) -> String {
+    let mut chord = chord;
+    let mut words = Vec::new();
+    if let Some(rest) = chord.strip_prefix('^') {
+        words.push("CTRL");
+        chord = rest;
+    }
+    if let Some(rest) = chord.strip_prefix('+') {
+        words.push("SHIFT");
+        chord = rest;
+    }
+    words.push(match chord {
+        "←" => "LEFT",
+        "→" => "RIGHT",
+        "↑" => "UP",
+        "↓" => "DOWN",
+        other => other,
+    });
+    words.join(" ").to_ascii_uppercase()
 }
 
 /// Fit one terminal row by CHARACTER count, never byte count. The stage's

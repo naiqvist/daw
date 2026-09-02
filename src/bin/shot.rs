@@ -258,8 +258,8 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
 
     let mut stage = Stage::new();
     // The palette opens with the app and would cover the very thing most
-    // of these shots are of.
-    stage.set_palette_open(false);
+    // of these shots are of. Its own pose is the deliberate exception.
+    stage.set_palette_open(which.contains("palette"));
     // Set the ground the subject asks for, rather than assuming which
     // one the frame opens on — that is a frame's choice and it moves.
     let want = if which.ends_with("-light") {
@@ -270,7 +270,14 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
     if stage.polarity() != want {
         let _ = stage.apply(StageIntent::Ground);
     }
-    if which.contains("full") {
+    if which.contains("browser") {
+        let _ = stage.apply(StageIntent::Browse);
+    } else if which.contains("help") {
+        let _ = stage.apply(StageIntent::Help);
+    } else if which.contains("palette") {
+        // Opening state is the pose: it shows the full current vocabulary
+        // and leaves the first command bracketed.
+    } else if which.contains("full") {
         // A session with something in it. An empty one is easy to make
         // look tidy and tells you nothing about how the surface reads
         // when it is carrying a piece of music.
