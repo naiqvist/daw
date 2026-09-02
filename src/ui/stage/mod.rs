@@ -4493,6 +4493,11 @@ impl Stage {
         for (piece, column) in &pieces {
             self.draw_piece_body(painter, *piece, column);
         }
+        let level = self
+            .meters
+            .readings()
+            .get(track)
+            .map(|reading| reading.level.peak());
         for (piece, column) in &pieces {
             self.draw_piece_face(
                 painter,
@@ -4503,6 +4508,7 @@ impl Stage {
                 rows_shown,
                 sounding,
                 phase,
+                level,
             );
         }
         for (index, rect) in &layout {

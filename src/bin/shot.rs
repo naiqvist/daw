@@ -287,6 +287,24 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
         // out as pieces; a few sections switched IN, the cursor on one.
         let _ = stage.apply(StageIntent::NewInstrumentTrack);
         let _ = stage.apply(StageIntent::Devices);
+        // The preamp leaned on: iron up, colour in, back to the trim row.
+        let _ = stage.apply(StageIntent::Step(Step::Down));
+        for _ in 0..6 {
+            let _ = stage.apply(StageIntent::Param {
+                up: true,
+                coarse: true,
+            });
+        }
+        for _ in 0..3 {
+            let _ = stage.apply(StageIntent::Step(Step::Down));
+        }
+        let _ = stage.apply(StageIntent::Param {
+            up: true,
+            coarse: false,
+        });
+        for _ in 0..4 {
+            let _ = stage.apply(StageIntent::Step(Step::Up));
+        }
         if which.contains("-in") {
             // TONE, VCA and ECHO in; the cursor on VCA's second row.
             for (col, rows) in [(1usize, 0usize), (6, 2), (17, 0)] {

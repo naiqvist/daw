@@ -3363,16 +3363,22 @@ pub static CONSOLE: &[DeviceSpec] = &[
                 choices: &[],
             },
             ParamLabel {
-                name: "Phase",
-                unit: "",
-                group: "Preamp",
-                choices: &["+", "-"],
-            },
-            ParamLabel {
                 name: "Iron",
                 unit: "%",
                 group: "Preamp",
                 choices: &[],
+            },
+            ParamLabel {
+                name: "Character",
+                unit: "",
+                group: "Preamp",
+                choices: &["iron", "steel"],
+            },
+            ParamLabel {
+                name: "Phase",
+                unit: "",
+                group: "Preamp",
+                choices: &["+", "-"],
             },
             ParamLabel {
                 name: "Colour",

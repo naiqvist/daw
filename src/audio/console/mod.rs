@@ -19,6 +19,8 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
+pub mod preamp;
+
 use crate::audio::graph::Readout;
 use crate::console::{SectionKind, SectionParams};
 
@@ -102,8 +104,9 @@ impl SectionCore for Wire {
 /// Green zone: the core for a section, at a sample rate and block size.
 /// Every kind is a [`Wire`] until its section is written; the match is
 /// where each one will take its place.
-pub fn core_of(params: &SectionParams, _sample_rate: f32, _block: usize) -> Box<dyn SectionCore> {
+pub fn core_of(params: &SectionParams, sample_rate: f32, block: usize) -> Box<dyn SectionCore> {
     match params.kind {
+        SectionKind::Preamp => Box::new(preamp::PreampCore::new(params, sample_rate, block)),
         _ => Box::new(Wire::new(params)),
     }
 }

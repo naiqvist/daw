@@ -309,6 +309,47 @@ impl SectionKind {
     }
 }
 
+/// PREAMP's two curves, here on the green side so the card can draw
+/// the transfer the core runs. `iron` is the drive, 0..1; `x` in −1..1.
+/// Unit slope at zero — the drive changes colour before level.
+pub mod preamp_curve {
+    /// The bias that makes the iron's even harmonics.
+    pub const IRON_BIAS: f32 = 0.22;
+    /// How hard each stage drives its curve at full.
+    pub const IRON_DRIVE: f32 = 2.5;
+    pub const STEEL_DRIVE: f32 = 4.0;
+    /// The steel's knee: higher is harder.
+    pub const STEEL_KNEE: f32 = 2.5;
+
+    /// The transformer stage: asymmetric soft saturation.
+    #[inline(always)]
+    pub fn iron(x: f32, k: f32) -> f32 {
+        let b = IRON_BIAS;
+        let tb = b.tanh();
+        let slope = k * (1.0 - tb * tb);
+        ((k * x + b).tanh() - tb) / slope
+    }
+
+    /// The push-pull stage: symmetric, a harder knee.
+    #[inline(always)]
+    pub fn steel(x: f32, k: f32) -> f32 {
+        let y = k * x;
+        y / (1.0 + y.abs().powf(STEEL_KNEE)).powf(1.0 / STEEL_KNEE) / k
+    }
+
+    /// The stage's transfer at `iron` and character.
+    pub fn transfer(iron: f32, steel: bool, x: f32) -> f32 {
+        if iron <= 0.0 {
+            return x;
+        }
+        if steel {
+            self::steel(x, 1.0 + STEEL_DRIVE * iron)
+        } else {
+            self::iron(x, 1.0 + IRON_DRIVE * iron)
+        }
+    }
+}
+
 /// A section's settings as the graph's spec carries them: the kind, and
 /// the edits by id — exactly a device's overrides. A missing id reads
 /// as the table's default.

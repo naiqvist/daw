@@ -7607,9 +7607,16 @@ pub mod console {
         use super::super::ParamDef;
 
         pub const TRIM: u32 = 0;
-        pub const PHASE: u32 = 1;
-        pub const IRON: u32 = 2;
-        pub const COLOUR: u32 = 3;
+        pub const IRON: u32 = 1;
+        pub const CHARACTER: u32 = 2;
+        pub const PHASE: u32 = 3;
+        pub const COLOUR: u32 = 4;
+
+        /// The two stages: a transformer-coupled class-A stage, even
+        /// harmonics and a low emphasis; a push-pull op-amp stage, odd
+        /// harmonics and a harder knee.
+        pub const CHARACTER_IRON: u32 = 0;
+        pub const CHARACTER_STEEL: u32 = 1;
 
         pub const TABLE: &[ParamDef] = &[
             ParamDef {
@@ -7621,20 +7628,27 @@ pub mod console {
             },
             ParamDef {
                 id: 1,
-                name: "Phase",
-                min: 0.0,
-                max: 1.0,
-                default: 0.0,
-            },
-            ParamDef {
-                id: 2,
                 name: "Iron",
                 min: 0.0,
                 max: 100.0,
                 default: 0.0,
             },
             ParamDef {
+                id: 2,
+                name: "Character",
+                min: 0.0,
+                max: 1.0,
+                default: 0.0,
+            },
+            ParamDef {
                 id: 3,
+                name: "Phase",
+                min: 0.0,
+                max: 1.0,
+                default: 0.0,
+            },
+            ParamDef {
+                id: 4,
                 name: "Colour",
                 min: 0.0,
                 max: 1.0,
