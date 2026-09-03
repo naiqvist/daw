@@ -5608,7 +5608,9 @@ impl Stage {
         let ground = alpha.ground.color;
         let glass = alpha.well.color;
         let structure = alpha.edge.color.gamma_multiply(0.56);
-        let powered = alpha.live_dim.color.gamma_multiply(0.52);
+        // The board's rails are the instrument's own frame. A frame is
+        // not a signal, so it does not wear the sounding hue.
+        let powered = alpha.edge.color.gamma_multiply(1.05);
         let spine_x = head.left() - 10.0;
         kit::cached(
             painter,
@@ -5782,7 +5784,7 @@ impl Stage {
             let powered = if focused {
                 alpha.ground.color
             } else {
-                alpha.live_dim.color.gamma_multiply(0.78)
+                alpha.edge.color.gamma_multiply(1.25)
             };
             let rail_x = rect.left() + 18.0;
             let content_x = rect.left() + 36.0;
@@ -6133,7 +6135,7 @@ impl Stage {
         let powered = if focused {
             alpha.ground.color
         } else {
-            alpha.live_dim.color.gamma_multiply(0.78)
+            alpha.edge.color.gamma_multiply(1.25)
         };
         kit::cached(
             painter,
@@ -6527,11 +6529,23 @@ impl Stage {
             let powered = if focused_scene == Some(scene) {
                 alpha.ink.color
             } else {
-                alpha.live_dim.color.gamma_multiply(0.72)
+                alpha.edge.color.gamma_multiply(1.1)
             };
             let node = egui::pos2(head.left() - 9.0, rect.center().y);
+            // The gutter's mark is a graduation on the sheet's edge,
+            // long for the row and short beside it, rather than a node.
             let mut shapes = Vec::new();
-            circuit::relic_node(&mut shapes, node, 6.0, powered, alpha.ground.color);
+            for (reach, weight) in [(7.0f32, Weight::Heavy), (3.0, Weight::Hair)] {
+                circuit::trace(
+                    &mut shapes,
+                    &[
+                        egui::pos2(node.x - reach, node.y + if reach > 5.0 { 0.0 } else { 4.0 }),
+                        egui::pos2(node.x + reach, node.y + if reach > 5.0 { 0.0 } else { 4.0 }),
+                    ],
+                    weight,
+                    powered,
+                );
+            }
             circuit::trace(
                 &mut shapes,
                 &[
@@ -6583,12 +6597,16 @@ impl Stage {
                 } else {
                     alpha.ink.color
                 };
+                // Structure ink, not live ink. An empty address on the
+                // session is an empty place on a ruled sheet; spending
+                // the sounding hue on every one of them left nothing
+                // for the clips that are actually playing.
                 let cell_power = if here {
                     alpha.ground.color
                 } else if mark.is_some() {
-                    alpha.live_dim.color.gamma_multiply(0.82)
+                    alpha.edge.color.gamma_multiply(1.25)
                 } else {
-                    alpha.live_dim.color.gamma_multiply(0.48)
+                    alpha.edge.color.gamma_multiply(0.8)
                 };
                 kit::cached(
                     painter,
@@ -6596,16 +6614,48 @@ impl Stage {
                     rect,
                     (fill, figure_ink, cell_power, mark.is_some()),
                     |out| {
-                        circuit::relic_frame(out, rect, fill, Weight::Hair, cell_power);
-                        if mark.is_none() {
-                            circuit::relic_node(
+                        // AN EMPTY ADDRESS IS EMPTY. It gets the row's
+                        // ruling and a registration tick at its left
+                        // edge, and nothing else — no casing, no node.
+                        // The sheet is ruled; the clips are what is
+                        // written on it.
+                        if mark.is_none() && !here {
+                            circuit::trace(
                                 out,
-                                rect.center(),
-                                6.0,
-                                cell_power,
-                                if here { alpha.ground.color } else { cell_power },
+                                &[
+                                    egui::pos2(rect.left(), rect.bottom() + 0.5),
+                                    egui::pos2(rect.right(), rect.bottom() + 0.5),
+                                ],
+                                Weight::Hair,
+                                cell_power.gamma_multiply(0.55),
                             );
-                        } else {
+                            circuit::trace(
+                                out,
+                                &[
+                                    egui::pos2(rect.left() + 0.5, rect.bottom() + 0.5),
+                                    egui::pos2(rect.left() + 0.5, rect.bottom() - 4.5),
+                                ],
+                                Weight::Hair,
+                                cell_power,
+                            );
+                            return;
+                        }
+                        // A filled address is a square component on the
+                        // sheet, the way a written entry is.
+                        out.push(egui::Shape::rect_filled(rect, 0.0, fill));
+                        circuit::trace(
+                            out,
+                            &[
+                                rect.left_top(),
+                                rect.right_top(),
+                                rect.right_bottom(),
+                                rect.left_bottom(),
+                                rect.left_top(),
+                            ],
+                            Weight::Hair,
+                            cell_power,
+                        );
+                        if mark.is_some() {
                             circuit::trace(
                                 out,
                                 &[
@@ -6642,10 +6692,18 @@ impl Stage {
 
                 if self.playing_on(track) == Some(scene) {
                     let mut shapes = Vec::new();
-                    shapes.push(egui::Shape::closed_line(
-                        circuit::relic_points(rect),
-                        egui::Stroke::new(Weight::Heavy.px(), alpha.live_dim.color),
-                    ));
+                    circuit::trace(
+                        &mut shapes,
+                        &[
+                            rect.left_top(),
+                            rect.right_top(),
+                            rect.right_bottom(),
+                            rect.left_bottom(),
+                            rect.left_top(),
+                        ],
+                        Weight::Heavy,
+                        alpha.live_dim.color,
+                    );
                     if phase.rolling {
                         let mut path = circuit::relic_points(rect.shrink(1.5));
                         if let Some(first) = path.first().copied() {

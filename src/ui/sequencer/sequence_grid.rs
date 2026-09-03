@@ -42,6 +42,15 @@ use eframe::egui;
 
 const MAX_CELL_SIDE: f32 = 44.0;
 const CELL_GAP: f32 = space::XXS;
+/// How far a plain step's tick stands off the baseline. Minor
+/// graduations are SHORT: the hierarchy of tick lengths is what lets a
+/// ruled field be counted without every mark being labelled.
+const GRAT_TICK: f32 = 4.0;
+/// The ruler's three graduation lengths. A scale with one tick length
+/// is a scale nobody can count on.
+const RULER_MAJOR: f32 = 9.0;
+const RULER_MEDIUM: f32 = 6.0;
+const RULER_MINOR: f32 = 3.0;
 const ROW_GAP: f32 = space::MD;
 const STATUS_HEIGHT: f32 = 24.0;
 const ROW_ADDRESS_WIDTH: f32 = 48.0;
@@ -92,12 +101,16 @@ const DETAIL_MIN_W: f32 = 64.0;
 const DEFAULT_PITCH: u8 = 60;
 const DEFAULT_VELOCITY: u8 = 100;
 
-/// The quiet powered trace shared by the sequencer's display modules.
-/// Active time still earns the full LIVE signal; this is the circuitry that
-/// says an idle address is awake and ready.
-fn relic_ink(ground: Polarity, strength: f32) -> egui::Color32 {
+/// The RULING the grid is drawn with.
+///
+/// Structure ink, not live ink. An idle address is not "awake and ready":
+/// it is an empty place on a ruled field, and drawing every one of them
+/// in the sounding hue spends the loudest signal the alphabet has on the
+/// quietest thing on the screen. LIVE is reserved here for what is
+/// actually sounding, which is what makes a sounding thing visible.
+fn rule_ink(ground: Polarity, strength: f32) -> egui::Color32 {
     crate::design::Alphabet::for_polarity(ground)
-        .live_dim
+        .edge
         .color
         .gamma_multiply(strength)
 }
@@ -306,18 +319,16 @@ impl SequenceGrid {
         // outlines give up the same pieces of the layout rectangle.
         let container = egui::Rect::from_min_size(origin, egui::vec2(full_width, full_height))
             .expand(PANEL_PAD);
+        // A panel, squarely cut. The instrument's case is a case; the
+        // interest belongs to what is being read inside it.
         let mut casing = Vec::new();
-        circuit::relic_frame(
-            &mut casing,
+        casing.push(egui::Shape::rect_filled(
             container,
+            0.0,
             shade(PANEL_FILL, ground),
-            Weight::Heavy,
-            relic_ink(ground, 0.62),
-        );
-        casing.push(egui::Shape::closed_line(
-            circuit::relic_points(container.shrink(4.0)),
-            egui::Stroke::new(Weight::Hair.px(), shade(EDGE, ground)),
         ));
+        circuit::panel_frame(&mut casing, container, Weight::Heavy, rule_ink(ground, 0.8));
+        circuit::corner_pads(&mut casing, container.shrink(4.0), shade(EDGE, ground));
         for shape in casing {
             painter.add(shape);
         }
@@ -326,12 +337,19 @@ impl SequenceGrid {
             egui::pos2(container.max.x, origin.y + STATUS_HEIGHT),
         );
         let mut header_shapes = Vec::new();
-        circuit::relic_frame(
-            &mut header_shapes,
+        header_shapes.push(egui::Shape::rect_filled(
             header,
+            0.0,
             shade(HEADER_FILL, ground),
+        ));
+        circuit::trace(
+            &mut header_shapes,
+            &[
+                egui::pos2(header.left(), header.bottom() + 0.5),
+                egui::pos2(header.right(), header.bottom() + 0.5),
+            ],
             Weight::Hair,
-            relic_ink(ground, 0.82),
+            rule_ink(ground, 0.9),
         );
         for shape in header_shapes {
             painter.add(shape);
@@ -403,11 +421,19 @@ impl SequenceGrid {
                     // the END mark on the first of them says why none does.
                     // Nothing here answers the pointer or the keys.
                     if rect.intersect(window).is_positive() {
+                        // Past the end the field is blank paper: the
+                        // baseline runs on so the row still reads as a
+                        // row, and nothing else is drawn.
                         let mut shapes = Vec::new();
-                        shapes.push(egui::Shape::closed_line(
-                            circuit::relic_points(rect),
-                            egui::Stroke::new(Weight::Hair.px(), relic_ink(ground, 0.34)),
-                        ));
+                        circuit::trace(
+                            &mut shapes,
+                            &[
+                                egui::pos2(rect.left() - CELL_GAP * 0.5, rect.bottom() + 0.5),
+                                egui::pos2(rect.right() + CELL_GAP * 0.5, rect.bottom() + 0.5),
+                            ],
+                            Weight::Hair,
+                            rule_ink(ground, 0.18),
+                        );
                         cells.extend(shapes);
                         if step == self.steps() {
                             draw_clip_end(
@@ -444,15 +470,11 @@ impl SequenceGrid {
                 if response.hovered() && self.cursor_step != step {
                     // The pointer's presence is a tint, not an outline: a
                     // rule would say something, and hovering says nothing.
-                    let mut shapes = Vec::new();
-                    circuit::relic_frame(
-                        &mut shapes,
+                    cells.add(egui::Shape::rect_filled(
                         rect,
+                        0.0,
                         wash(SELECTION_WASH, ground),
-                        Weight::Hair,
-                        relic_ink(ground, 0.72),
-                    );
-                    cells.extend(shapes);
+                    ));
                 }
                 self.draw_cell_events(&cells, rect, clip, lens, step, ground);
                 if self.cursor_step == step {
@@ -548,21 +570,30 @@ impl SequenceGrid {
             let tick = column * step_ticks;
             let x = band.min.x + camera.x(tick);
             let beat = tick.is_multiple_of(TICKS_PER_BAR / 4);
+            let bar = tick.is_multiple_of(TICKS_PER_BAR);
+            // A graduated scale: the bar's mark is long and heavy, the
+            // beat's is long and fine, a plain step's is short. Three
+            // lengths, so the scale is counted rather than read.
             let mut shapes = Vec::new();
-            circuit::pad(
+            let foot = band.bottom();
+            let reach = if bar {
+                RULER_MAJOR
+            } else if beat {
+                RULER_MEDIUM
+            } else {
+                RULER_MINOR
+            };
+            circuit::trace(
                 &mut shapes,
-                egui::pos2(x, band.bottom() - 3.0),
-                if beat {
-                    circuit::PAD
-                } else {
-                    circuit::PAD - 2.0
-                },
-                if beat {
+                &[egui::pos2(x, foot), egui::pos2(x, foot - reach)],
+                if bar { Weight::Heavy } else { Weight::Hair },
+                if bar {
                     shade(LABEL_INK, ground)
+                } else if beat {
+                    rule_ink(ground, 1.1)
                 } else {
-                    shade(EDGE, ground)
+                    rule_ink(ground, 0.6)
                 },
-                beat,
             );
             for shape in shapes {
                 painter.add(shape);
@@ -718,10 +749,16 @@ impl SequenceGrid {
         // a coarse cell.
         let face_fill = velocity_ink(note.velocity, ground);
         let mut shapes = Vec::new();
-        circuit::relic_frame(
+        shapes.push(egui::Shape::rect_filled(face, 0.0, face_fill));
+        circuit::trace(
             &mut shapes,
-            face,
-            face_fill,
+            &[
+                face.left_top(),
+                face.right_top(),
+                face.right_bottom(),
+                face.left_bottom(),
+                face.left_top(),
+            ],
             Weight::Hair,
             shade(FACE_DETAIL_INK, ground),
         );
@@ -1415,14 +1452,23 @@ fn draw_row_address(
 ) {
     let row = (tick / TICKS_PER_BAR) % 16;
     let node = right_top + egui::vec2(-31.0, cell_side.min(28.0) * 0.5);
+    // The row's mark is a graduation on the left margin: one long rule
+    // and as many short ones as the row's ordinal, so the margin is read
+    // the way a ruler's edge is read rather than decorated.
     let mut shapes = Vec::new();
-    circuit::relic_node(
-        &mut shapes,
-        node,
-        cell_side.min(22.0) * 0.42,
-        relic_ink(ground, 0.72),
-        shade(GROUND, ground),
-    );
+    let arm = cell_side.min(22.0) * 0.42;
+    for i in 0..=(row % 4) {
+        let y = node.y - arm + i as f32 * 3.0;
+        circuit::trace(
+            &mut shapes,
+            &[
+                egui::pos2(node.x - arm, y),
+                egui::pos2(node.x + if i == 0 { arm } else { arm * 0.45 }, y),
+            ],
+            if i == 0 { Weight::Heavy } else { Weight::Hair },
+            rule_ink(ground, if i == 0 { 1.0 } else { 0.7 }),
+        );
+    }
     for shape in shapes {
         painter.add(shape);
     }
@@ -1460,34 +1506,73 @@ fn draw_ground(painter: &egui::Painter, rect: egui::Rect, tick: usize, ground: P
     let mut shapes = Vec::new();
     let bar = tick.is_multiple_of(TICKS_PER_BAR);
     let beat = tick.is_multiple_of(TICKS_PER_BAR / 4);
-    let power = relic_ink(
-        ground,
-        if bar {
-            0.88
-        } else if beat {
-            0.70
-        } else {
-            0.52
-        },
+
+    // The beat's band: a wash every four steps, so the eye counts in
+    // fours without a checkerboard under it. It runs the cell's whole
+    // width including the gap, so the field reads as continuous paper
+    // rather than as a tray of tiles.
+    let band = egui::Rect::from_min_max(
+        egui::pos2(rect.left() - CELL_GAP * 0.5, rect.top()),
+        egui::pos2(rect.right() + CELL_GAP * 0.5, rect.bottom()),
     );
-    circuit::relic_frame(
-        &mut shapes,
-        rect,
-        beat_fill(tick, ground),
-        if bar { Weight::Bold } else { Weight::Hair },
-        power,
-    );
-    if bar || beat {
-        circuit::relic_node(
+    // Ledger banding: every OTHER beat's four steps are washed, so the
+    // eye counts in fours the way it counts rows on ruled paper. A wash
+    // on the single cell that lands on the beat read as a row of
+    // isolated blocks, which is not a band and not a count.
+    let beat_index = tick / (TICKS_PER_BAR / 4);
+    if beat_index % 2 == 0 {
+        shapes.push(egui::Shape::rect_filled(
+            band,
+            0.0,
+            shade(BEAT_FILL, ground),
+        ));
+    }
+
+    // THE RULING. A bar's line runs the full height and carries weight;
+    // a beat's is the same length as a hairline; a plain step gets a
+    // short tick off the baseline and nothing else. Nothing is
+    // outlined, and no empty address carries a mark of its own — an
+    // empty address on a graticule is empty.
+    let x = (band.left()).floor() + 0.5;
+    if bar {
+        circuit::trace(
             &mut shapes,
-            rect.center(),
-            if bar { 6.0 } else { 4.5 },
-            power,
-            if bar { power } else { shade(BEAT_FILL, ground) },
+            &[
+                egui::pos2(x, rect.top() - 2.0),
+                egui::pos2(x, rect.bottom() + 2.0),
+            ],
+            Weight::Heavy,
+            rule_ink(ground, 1.15),
+        );
+    } else if beat {
+        circuit::trace(
+            &mut shapes,
+            &[egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+            Weight::Hair,
+            rule_ink(ground, 0.85),
         );
     } else {
-        circuit::via(&mut shapes, rect.center(), power, shade(GROUND, ground));
+        circuit::trace(
+            &mut shapes,
+            &[
+                egui::pos2(x, rect.bottom() + 0.5),
+                egui::pos2(x, rect.bottom() + 0.5 - GRAT_TICK),
+            ],
+            Weight::Hair,
+            rule_ink(ground, 1.0),
+        );
     }
+    // The baseline the ticks stand on, drawn cell by cell so it is one
+    // unbroken rule across the row.
+    circuit::trace(
+        &mut shapes,
+        &[
+            egui::pos2(band.left(), rect.bottom() + 0.5),
+            egui::pos2(band.right(), rect.bottom() + 0.5),
+        ],
+        Weight::Hair,
+        rule_ink(ground, if bar || beat { 0.75 } else { 0.5 }),
+    );
     for shape in shapes {
         painter.add(shape);
     }
@@ -1618,12 +1703,24 @@ pub(crate) fn draw_cursor(
     focused: bool,
 ) {
     let mut shapes = Vec::new();
-    circuit::relic_frame(
-        &mut shapes,
+    // Square, because a step is a step. The cut corners said nothing
+    // about the address and made every one of them look decorative.
+    shapes.push(egui::Shape::rect_filled(
         cell,
+        0.0,
         wash(CURSOR_WASH, ground),
-        Weight::Bold,
-        relic_ink(ground, 0.92),
+    ));
+    circuit::trace(
+        &mut shapes,
+        &[
+            cell.left_top(),
+            cell.right_top(),
+            cell.right_bottom(),
+            cell.left_bottom(),
+            cell.left_top(),
+        ],
+        Weight::Heavy,
+        shade(INK_LEVEL, ground),
     );
     for shape in shapes {
         painter.add(shape);

@@ -61,10 +61,15 @@ pub(crate) fn editor_switch(
         let alpha = crate::design::Alphabet::for_polarity(ground);
         let active = editor == current;
         let hovered = response.hovered() && !active;
+        // A selector on the case: square, and marked by an UNDERSCORE
+        // rather than by a lit outline. The chosen position is the one
+        // with a rule under it, the way a laboratory switch's chosen
+        // detent is the one with the mark beside it.
+        let plate = tab.shrink2(egui::vec2(1.0, 2.0));
         let mut shell = Vec::new();
-        circuit::relic_frame(
-            &mut shell,
-            tab.shrink2(egui::vec2(1.0, 2.0)),
+        shell.push(egui::Shape::rect_filled(
+            plate,
+            0.0,
             if active {
                 crate::ui::sequencer::shade(EDITOR_ACTIVE_FILL, ground)
             } else if hovered {
@@ -72,11 +77,19 @@ pub(crate) fn editor_switch(
             } else {
                 crate::ui::sequencer::shade(0, ground)
             },
-            if active { Weight::Bold } else { Weight::Hair },
-            alpha
-                .live_dim
-                .color
-                .gamma_multiply(if active { 0.90 } else { 0.55 }),
+        ));
+        circuit::trace(
+            &mut shell,
+            &[
+                egui::pos2(plate.left(), plate.bottom()),
+                egui::pos2(plate.right(), plate.bottom()),
+            ],
+            if active { Weight::Heavy } else { Weight::Hair },
+            if active {
+                alpha.ink.color
+            } else {
+                alpha.edge.color
+            },
         );
         for shape in shell {
             painter.add(shape);
