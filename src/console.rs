@@ -306,7 +306,10 @@ impl SectionKind {
     /// instrument on its own glass, and so needs no table of names and
     /// numbers under them.
     pub fn owns_its_glass(self) -> bool {
-        matches!(self, SectionKind::Preamp | SectionKind::Tone)
+        matches!(
+            self,
+            SectionKind::Preamp | SectionKind::Tone | SectionKind::Door
+        )
     }
 
     /// Where on the strip this section stands, or `None` for a bus,

@@ -57,8 +57,8 @@ pub fn width_of(kind: SectionKind) -> f32 {
     match kind {
         // The channel's own stages.
         SectionKind::Preamp => PREAMP_W,
-        SectionKind::Tone => 212.0,
-        SectionKind::Door => 176.0,
+        SectionKind::Tone => 248.0,
+        SectionKind::Door => 236.0,
         SectionKind::Cut => 188.0,
         SectionKind::Hit => 152.0,
         SectionKind::Pump => 160.0,
@@ -120,6 +120,37 @@ fn cuts(kind: SectionKind) -> (f32, f32, f32, f32) {
     }
 }
 
+/// A step cut into a piece's TOP edge: where along the width it falls
+/// and how far it drops. A piece with one is taller on the left than
+/// on the right, which is what stops a run of them reading as a row of
+/// boxes.
+fn shoulder(kind: SectionKind) -> Option<(f32, f32)> {
+    match kind {
+        SectionKind::Door => Some((0.46, 15.0)),
+        _ => None,
+    }
+}
+
+/// A bay cut into a piece's RIGHT wall, under the joint: where it
+/// starts as a share of the height, how tall it is, and how deep. What
+/// a bay is FOR is the face beside it — a control that sits in the
+/// crevice rather than in the middle of the glass.
+fn bay(kind: SectionKind) -> Option<(f32, f32, f32)> {
+    match kind {
+        SectionKind::Door => Some((0.63, 34.0, 16.0)),
+        _ => None,
+    }
+}
+
+/// A step cut into a piece's BOTTOM edge, on the right: how far along
+/// it starts and how far it lifts.
+fn plinth(kind: SectionKind) -> Option<(f32, f32)> {
+    match kind {
+        SectionKind::Door => Some((0.58, 13.0)),
+        _ => None,
+    }
+}
+
 /// The piece's outline, clockwise from the top-left, with the tongue
 /// and the notch where the piece has them. `(tl, tr, br, bl)` are the
 /// corner cuts.
@@ -129,11 +160,20 @@ pub fn outline(rect: egui::Rect, kind: SectionKind, notch: bool, tongue: bool) -
     let jy = joint_y(rect);
     let (jt, jb) = (jy - JOINT_H * 0.5, jy + JOINT_H * 0.5);
     let c = circuit::CHAMFER * 0.6;
-    let mut points = vec![
-        egui::pos2(l + tl, t),
-        egui::pos2(r - tr, t),
-        egui::pos2(r, t + tr),
-    ];
+    let mut points = vec![egui::pos2(l + tl, t)];
+    // The top edge, with its step where the piece has one: along, down
+    // the riser at the chamfer's angle, and on at the lower level.
+    let top_right = match shoulder(kind) {
+        Some((at, drop)) => {
+            let x = l + rect.width() * at;
+            points.push(egui::pos2(x - c, t));
+            points.push(egui::pos2(x + c, t + drop));
+            t + drop
+        }
+        None => t,
+    };
+    points.push(egui::pos2(r - tr, top_right));
+    points.push(egui::pos2(r, top_right + tr));
     if tongue {
         points.extend([
             egui::pos2(r, jt),
@@ -144,12 +184,34 @@ pub fn outline(rect: egui::Rect, kind: SectionKind, notch: bool, tongue: bool) -
             egui::pos2(r, jb),
         ]);
     }
-    points.extend([
-        egui::pos2(r, b - br),
-        egui::pos2(r - br, b),
-        egui::pos2(l + bl, b),
-        egui::pos2(l, b - bl),
-    ]);
+    // The right wall's bay, under the joint.
+    if let Some((at, tall, deep)) = bay(kind) {
+        let y0 = t + rect.height() * at;
+        let y1 = y0 + tall;
+        points.extend([
+            egui::pos2(r, y0),
+            egui::pos2(r - deep, y0 + c),
+            egui::pos2(r - deep, y1 - c),
+            egui::pos2(r, y1),
+        ]);
+    }
+    points.push(egui::pos2(r, b - br));
+    // The bottom edge, with its plinth where the piece has one.
+    match plinth(kind) {
+        Some((at, lift)) => {
+            let x = l + rect.width() * at;
+            points.push(egui::pos2(r - br, b));
+            points.push(egui::pos2(x + c, b));
+            points.push(egui::pos2(x - c, b - lift));
+            points.push(egui::pos2(l + bl, b - lift));
+            points.push(egui::pos2(l, b - lift - bl));
+        }
+        None => {
+            points.push(egui::pos2(r - br, b));
+            points.push(egui::pos2(l + bl, b));
+            points.push(egui::pos2(l, b - bl));
+        }
+    }
     if notch {
         points.extend([
             egui::pos2(l, jb),
@@ -174,12 +236,85 @@ pub fn body_fill(
     fill: egui::Color32,
     ground: egui::Color32,
 ) {
+    // The casing is the rectangle, and every cut in the silhouette is
+    // the ground painted back over it. Filling the outline instead
+    // would ask the tessellator to fill a concave path, which it will
+    // not do honestly — and a step, a bay and a notch are all concave.
     let (tl, tr, br, bl) = cuts(kind);
     let (l, t, r, b) = (rect.left(), rect.top(), rect.right(), rect.bottom());
+    let c = circuit::CHAMFER * 0.6;
     out.push(egui::Shape::rect_filled(rect, 0.0, fill));
     let tri = |out: &mut Vec<egui::Shape>, pts: Vec<egui::Pos2>| {
         out.push(egui::Shape::convex_polygon(pts, ground, egui::Stroke::NONE));
     };
+    let block = |out: &mut Vec<egui::Shape>, a: egui::Pos2, z: egui::Pos2| {
+        out.push(egui::Shape::rect_filled(
+            egui::Rect::from_min_max(a, z),
+            0.0,
+            ground,
+        ));
+    };
+    // The step in the top edge: the shoulder is gone on the right of
+    // it, and the riser between is a chamfer.
+    let top_right = match shoulder(kind) {
+        Some((at, drop)) => {
+            let x = l + rect.width() * at;
+            block(out, egui::pos2(x + c, t), egui::pos2(r, t + drop));
+            tri(
+                out,
+                vec![
+                    egui::pos2(x - c, t),
+                    egui::pos2(x + c, t),
+                    egui::pos2(x + c, t + drop),
+                ],
+            );
+            t + drop
+        }
+        None => t,
+    };
+    // The step in the bottom edge, on the left of it.
+    let bottom_left = match plinth(kind) {
+        Some((at, lift)) => {
+            let x = l + rect.width() * at;
+            block(out, egui::pos2(l, b - lift), egui::pos2(x - c, b));
+            tri(
+                out,
+                vec![
+                    egui::pos2(x - c, b - lift),
+                    egui::pos2(x + c, b),
+                    egui::pos2(x - c, b),
+                ],
+            );
+            b - lift
+        }
+        None => b,
+    };
+    // The bay in the right wall.
+    if let Some((at, tall, deep)) = bay(kind) {
+        let y0 = t + rect.height() * at;
+        block(
+            out,
+            egui::pos2(r - deep, y0 + c),
+            egui::pos2(r, y0 + tall - c),
+        );
+        tri(
+            out,
+            vec![
+                egui::pos2(r, y0),
+                egui::pos2(r - deep, y0 + c),
+                egui::pos2(r, y0 + c),
+            ],
+        );
+        tri(
+            out,
+            vec![
+                egui::pos2(r, y0 + tall),
+                egui::pos2(r - deep, y0 + tall - c),
+                egui::pos2(r, y0 + tall - c),
+            ],
+        );
+    }
+    // The corners, each against the edge it actually sits on.
     tri(
         out,
         vec![
@@ -191,9 +326,9 @@ pub fn body_fill(
     tri(
         out,
         vec![
-            egui::pos2(r, t),
-            egui::pos2(r - tr, t),
-            egui::pos2(r, t + tr),
+            egui::pos2(r, top_right),
+            egui::pos2(r - tr, top_right),
+            egui::pos2(r, top_right + tr),
         ],
     );
     tri(
@@ -207,15 +342,14 @@ pub fn body_fill(
     tri(
         out,
         vec![
-            egui::pos2(l, b),
-            egui::pos2(l + bl, b),
-            egui::pos2(l, b - bl),
+            egui::pos2(l, bottom_left),
+            egui::pos2(l + bl, bottom_left),
+            egui::pos2(l, bottom_left - bl),
         ],
     );
     if notch {
         let jy = joint_y(rect);
         let (jt, jb) = (jy - JOINT_H * 0.5, jy + JOINT_H * 0.5);
-        let c = circuit::CHAMFER * 0.6;
         out.push(egui::Shape::convex_polygon(
             vec![
                 egui::pos2(l, jt),
@@ -256,23 +390,57 @@ pub fn tongue_fill(out: &mut Vec<egui::Shape>, rect: egui::Rect, fill: egui::Col
 /// The screen is most of the piece — the figure at its top, every
 /// parameter beneath it.
 pub fn recess(rect: egui::Rect) -> egui::Rect {
+    recess_of(rect, SectionKind::Out)
+}
+
+/// The glass, keeping out of whatever the piece's silhouette has cut
+/// away: a step in the top edge takes the head down with it, a plinth
+/// takes the foot up, and the bay in the right wall is not the glass's
+/// at all — it belongs to whatever sits in it.
+pub fn recess_of(rect: egui::Rect, kind: SectionKind) -> egui::Rect {
+    let drop = shoulder(kind).map_or(0.0, |(_, drop)| drop);
+    let lift = plinth(kind).map_or(0.0, |(_, lift)| lift);
+    let deep = bay(kind).map_or(0.0, |(_, _, deep)| deep);
     egui::Rect::from_min_max(
-        egui::pos2(rect.left() + 10.0, rect.top() + HEAD_H + 4.0),
-        egui::pos2(rect.right() - 10.0, rect.bottom() - FOOT_H),
+        egui::pos2(rect.left() + 10.0, rect.top() + drop + HEAD_H + 4.0),
+        egui::pos2(rect.right() - 10.0 - deep, rect.bottom() - FOOT_H - lift),
     )
+}
+
+/// The bay's own rectangle, for the instrument that lives in it.
+pub fn bay_rect(rect: egui::Rect, kind: SectionKind) -> Option<egui::Rect> {
+    let (at, tall, deep) = bay(kind)?;
+    let y0 = rect.top() + rect.height() * at;
+    Some(egui::Rect::from_min_max(
+        egui::pos2(rect.right() - deep - 2.0, y0 + 2.0),
+        egui::pos2(rect.right() - 3.0, y0 + tall - 2.0),
+    ))
+}
+
+/// The plinth's own rectangle: the low shelf along the piece's foot,
+/// left of the step.
+pub fn plinth_rect(rect: egui::Rect, kind: SectionKind) -> Option<egui::Rect> {
+    let (at, lift) = plinth(kind)?;
+    Some(egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 10.0, rect.bottom() - lift - FOOT_H + 2.0),
+        egui::pos2(
+            rect.left() + rect.width() * at - 6.0,
+            rect.bottom() - lift + 2.0,
+        ),
+    ))
 }
 
 /// How tall a section's figure is at the top of its glass.
 pub fn figure_h(kind: SectionKind) -> f32 {
     match kind {
-        SectionKind::Preamp | SectionKind::Tone => FIGURE_MAX_H,
+        SectionKind::Preamp | SectionKind::Tone | SectionKind::Door => FIGURE_MAX_H,
         _ => 30.0,
     }
 }
 
 /// The figure's part of the glass.
 pub fn figure_rect(rect: egui::Rect, kind: SectionKind) -> egui::Rect {
-    let glass = recess(rect).shrink(3.0);
+    let glass = recess_of(rect, kind).shrink(3.0);
     egui::Rect::from_min_max(
         glass.min,
         egui::pos2(glass.max.x, (glass.min.y + figure_h(kind)).min(glass.max.y)),
@@ -563,7 +731,7 @@ impl Stage {
         // glass set into it — the ground showing through a double
         // frame with a rune tick at each corner. An OUT piece's glass
         // is dark: the frame dim, no figure, its rows in the edge ink.
-        let hole = recess(rect);
+        let hole = recess_of(rect, piece.kind);
         if hole.is_positive() {
             let screen_edge = if is_in {
                 edge
@@ -631,7 +799,18 @@ impl Stage {
             glass.min,
             egui::pos2(glass.max.x, glass.min.y + glass.height() * reveal),
         );
-        let screen = painter.with_clip_rect(shown);
+        // The reveal's clip takes in the piece's crevices as well as
+        // its glass: a control that lives in a bay is still the
+        // section's face, and would otherwise be wiped away with the
+        // wall it sits in.
+        let mut clip = shown;
+        for crevice in [bay_rect(rect, piece.kind), plinth_rect(rect, piece.kind)]
+            .into_iter()
+            .flatten()
+        {
+            clip = clip.union(crevice);
+        }
+        let screen = painter.with_clip_rect(clip);
         let figure = figure_rect(rect, piece.kind);
         let face = if piece.kind.owns_its_glass() {
             glass
@@ -700,6 +879,14 @@ impl Stage {
             let on_row = focused && cursor == Some((piece.index, row_offset + line));
             if on_row {
                 screen.rect_filled(row_rect, 0.0, alpha.focus.color);
+                crate::ui::nav_cursor::claim(
+                    &screen,
+                    ("stage-strip-row-cursor", piece.index, row_offset + line),
+                    row_rect,
+                    crate::ui::nav_cursor::Kind::Row,
+                    crate::ui::nav_cursor::Layer::Surface,
+                    alpha.ground.color,
+                );
             }
             let value_ink = if on_row {
                 alpha.ground.color
@@ -1070,9 +1257,13 @@ const TONE_LO_INK: egui::Color32 = egui::Color32::from_rgb(255, 138, 62);
 const TONE_MID_INK: egui::Color32 = egui::Color32::from_rgb(186, 122, 255);
 const TONE_HI_INK: egui::Color32 = egui::Color32::from_rgb(139, 245, 255);
 
-/// How many squares a band lights at full boost or full cut, and so
+/// How many squares a band hangs at full boost or full cut, and so
 /// how much each one is worth.
-const TONE_CELLS: usize = 6;
+const TONE_CELLS: usize = 8;
+/// The squares are SMALL. The curve is the picture; the stack under it
+/// says how much of the lever that took, and should not shout it.
+const TONE_CELL: f32 = 4.0;
+const TONE_CELL_PITCH: f32 = 6.0;
 /// The face's frequency span, in Hz: what the horizontal axis means.
 const TONE_LOW_HZ: f32 = 30.0;
 const TONE_HIGH_HZ: f32 = 18_000.0;
@@ -1166,6 +1357,171 @@ fn tone_face(glass: egui::Rect, mid_hz: f32) -> ToneFace {
     }
 }
 
+/// DOOR's face, laid out once so the key that addresses an instrument
+/// and the art that answers cannot drift apart.
+///
+/// The LADDER carries four of them at once, because they are four
+/// facts about one line: where the door decides (the threshold notch),
+/// how far under that it will not change its mind (the hysteresis
+/// notch), how steeply it lets go below (the slope), and how far down
+/// that fall is allowed to go (the floor). The DOORWAY beside it is
+/// not a control at all — it is the door, open as far as the sound has
+/// opened it.
+#[derive(Clone, Copy, Debug)]
+struct DoorFace {
+    ladder: egui::Rect,
+    doorway: egui::Rect,
+    /// The three parts of one envelope: the rise, the plateau, the fall.
+    attack: egui::Rect,
+    hold: egui::Rect,
+    release: egui::Rect,
+    /// The threshold notch, the hysteresis notch under it, the slope
+    /// below that, and the floor it flattens onto.
+    threshold: egui::Rect,
+    hysteresis: egui::Rect,
+    ratio: egui::Rect,
+    range: egui::Rect,
+    /// The key's window: two posts on a spectrum.
+    key_hp: egui::Rect,
+    key_lp: egui::Rect,
+    /// The mode, and the beat grid the chopper runs on.
+    mode: egui::Rect,
+    division: egui::Rect,
+    duty: egui::Rect,
+}
+
+impl DoorFace {
+    fn controls(self) -> [(u32, egui::Rect); 12] {
+        use crate::params::console::door as p;
+        [
+            (p::MODE, self.mode),
+            (p::THRESHOLD, self.threshold),
+            (p::RATIO, self.ratio),
+            (p::ATTACK, self.attack),
+            (p::HOLD, self.hold),
+            (p::RELEASE, self.release),
+            (p::RANGE, self.range),
+            (p::KEY_HP, self.key_hp),
+            (p::KEY_LP, self.key_lp),
+            (p::HYSTERESIS, self.hysteresis),
+            (p::DIVISION, self.division),
+            (p::DUTY, self.duty),
+        ]
+    }
+
+    fn control(self, param: usize) -> Option<egui::Rect> {
+        self.controls()
+            .into_iter()
+            .find_map(|(id, rect)| (id as usize == param).then_some(rect))
+    }
+}
+
+/// Where a level stands on the ladder, top being silence and bottom
+/// being the quietest the face draws.
+fn door_ladder_y(ladder: egui::Rect, db: f32) -> f32 {
+    let at = ((db + 72.0) / 72.0).clamp(0.0, 1.0);
+    egui::lerp(ladder.bottom()..=ladder.top(), at)
+}
+
+fn door_face(
+    glass: egui::Rect,
+    piece: egui::Rect,
+    threshold_db: f32,
+    hysteresis_db: f32,
+    range_db: f32,
+) -> DoorFace {
+    let inner = glass.shrink2(egui::vec2(6.0, 4.0));
+    let top_h = (inner.height() * 0.44).clamp(56.0, 104.0);
+    let top = egui::Rect::from_min_max(inner.min, egui::pos2(inner.right(), inner.top() + top_h));
+    let ladder_w = (top.width() * 0.34).clamp(40.0, 86.0);
+    let ladder = egui::Rect::from_min_max(top.min, egui::pos2(top.left() + ladder_w, top.bottom()));
+    let doorway = egui::Rect::from_min_max(
+        egui::pos2(ladder.right() + 8.0, top.top()),
+        egui::pos2(top.right(), top.bottom()),
+    );
+    // The ladder's four regions, each a band of it wide enough to take
+    // the cursor's brackets.
+    let notch = |db: f32| {
+        let y = door_ladder_y(ladder, db);
+        egui::Rect::from_min_max(
+            egui::pos2(ladder.left(), y - 5.0),
+            egui::pos2(ladder.right(), y + 5.0),
+        )
+    };
+    let threshold = notch(threshold_db);
+    let hysteresis = notch(threshold_db - hysteresis_db);
+    let floor_db = (threshold_db - range_db).max(-72.0);
+    let range = notch(floor_db);
+    let ratio = egui::Rect::from_min_max(
+        egui::pos2(ladder.left(), hysteresis.bottom()),
+        egui::pos2(ladder.right(), range.top().max(hysteresis.bottom() + 4.0)),
+    );
+
+    let rest = egui::Rect::from_min_max(egui::pos2(inner.left(), top.bottom() + 5.0), inner.max);
+    let gap = 4.0;
+    let env_h = (rest.height() * 0.44).max(22.0);
+    let envelope = egui::Rect::from_min_max(rest.min, egui::pos2(rest.right(), rest.top() + env_h));
+    // The rise, the plateau and the fall each take a third of the
+    // drawing, which is where they are grabbed.
+    let third = envelope.width() / 3.0;
+    let attack = egui::Rect::from_min_max(
+        envelope.min,
+        egui::pos2(envelope.left() + third, envelope.bottom()),
+    );
+    let hold = egui::Rect::from_min_max(
+        egui::pos2(attack.right(), envelope.top()),
+        egui::pos2(attack.right() + third, envelope.bottom()),
+    );
+    let release = egui::Rect::from_min_max(
+        egui::pos2(hold.right(), envelope.top()),
+        egui::pos2(envelope.right(), envelope.bottom()),
+    );
+
+    let key_h = ((rest.height() - env_h - gap * 2.0) * 0.42).max(12.0);
+    let key = egui::Rect::from_min_max(
+        egui::pos2(rest.left(), envelope.bottom() + gap),
+        egui::pos2(rest.right(), envelope.bottom() + gap + key_h),
+    );
+    let key_hp = egui::Rect::from_min_max(key.min, egui::pos2(key.center().x, key.bottom()));
+    let key_lp = egui::Rect::from_min_max(egui::pos2(key.center().x, key.top()), key.max);
+
+    // The MODE sits in the bay cut into the right wall, and the beat
+    // GRID lies along the plinth at the foot — the two crevices the
+    // silhouette leaves, each holding the control that suits its shape:
+    // a tall narrow slot for a switch, a long low shelf for a row of
+    // cells. What is left of the glass is the foot strip between them.
+    let foot = egui::Rect::from_min_max(egui::pos2(rest.left(), key.bottom() + gap), rest.max);
+    let mode = bay_rect(piece, SectionKind::Door).unwrap_or_else(|| {
+        egui::Rect::from_min_max(
+            foot.min,
+            egui::pos2(foot.left() + foot.width() * 0.2, foot.bottom()),
+        )
+    });
+    let grid = plinth_rect(piece, SectionKind::Door).unwrap_or(foot);
+    // The grid says two things: how many cells (the division) and how
+    // much of each is open (the duty). The top half is grabbed for one
+    // and the bottom half for the other.
+    let division = egui::Rect::from_min_max(grid.min, egui::pos2(grid.right(), grid.center().y));
+    let duty = egui::Rect::from_min_max(egui::pos2(grid.left(), grid.center().y), grid.max);
+
+    DoorFace {
+        ladder,
+        doorway,
+        attack,
+        hold,
+        release,
+        threshold,
+        hysteresis,
+        ratio,
+        range,
+        key_hp,
+        key_lp,
+        mode,
+        division,
+        duty,
+    }
+}
+
 fn mix_ink(a: egui::Color32, b: egui::Color32, amount: f32) -> egui::Color32 {
     let amount = amount.clamp(0.0, 1.0);
     let channel =
@@ -1198,6 +1554,7 @@ impl Stage {
                 self.draw_preamp_figure(painter, piece, column, glass, selected, level, phase)
             }
             SectionKind::Tone => self.draw_tone_figure(painter, piece, glass, selected, phase),
+            SectionKind::Door => self.draw_door_figure(painter, piece, glass, selected, phase),
             _ => {
                 painter.text(
                     glass.center(),
@@ -1314,86 +1671,99 @@ impl Stage {
             circuit::trace(&mut shapes, &curve, Weight::Hair, alpha.ink.color);
         }
 
-        // The three stacks.
-        let cell_pitch = (face.field.height() * 0.46 / TONE_CELLS as f32).min(17.0);
-        let cell = (cell_pitch - 3.0)
-            .max(5.0)
-            .min(face.columns[0].width() - 2.0);
+        // The three stacks, each HANGING FROM THE CURVE at its own
+        // frequency rather than standing on the zero line. Where the
+        // curve is is what the band did; the squares under it are how
+        // much of the lever that took. They are small and quiet until
+        // the keyboard is holding one, which is when they light.
+        let db_at = |hz: f32| {
+            shape.map_or(0.0, |shape| {
+                crate::console::tone_curve::response_db(&shape, 48_000.0, hz)
+            })
+        };
+        let curve_y = |db: f32| zero_y - (db / 18.0).clamp(-1.0, 1.0) * face.field.height() * 0.46;
+        let held = |band: usize| {
+            selected.is_some_and(|param| {
+                param == [p::LO, p::MID, p::HI][band] as usize
+                    || param == [p::KILL_LO, p::KILL_MID, p::KILL_HI][band] as usize
+            })
+        };
         for band in 0..3 {
             let column = face.columns[band];
             let ink = inks[band];
             let x = column.center().x;
+            let hz = [p::LO_HZ, mid_hz.max(1.0), p::HI_HZ][band];
             let lit = painter.ctx().animate_value_with_time(
                 egui::Id::new(("stage-tone-band", piece.index, band)),
                 (gains[band] / 15.0).clamp(-1.0, 1.0),
                 0.14,
             );
             let killed = kills[band];
-            // The post the squares stand on.
+            let awake = held(band);
+            // Where the curve stands over this band is where the stack
+            // hangs from.
+            let top = curve_y(db_at(hz)).clamp(
+                face.field.top() + 2.0,
+                face.field.bottom() - TONE_CELL_PITCH * 2.0,
+            );
+            let steps = if killed {
+                TONE_CELLS
+            } else {
+                (lit.abs() * TONE_CELLS as f32).round() as usize
+            };
+            let reach = TONE_CELL_PITCH * (steps.max(1) as f32) + 3.0;
             circuit::trace(
                 &mut shapes,
                 &[
-                    egui::pos2(x, zero_y - cell_pitch * TONE_CELLS as f32),
-                    egui::pos2(x, zero_y + cell_pitch * TONE_CELLS as f32),
+                    egui::pos2(x, top),
+                    egui::pos2(x, (top + reach).min(face.field.bottom())),
                 ],
                 Weight::Hair,
-                edge.gamma_multiply(if killed { 0.4 } else { 0.7 }),
+                if awake {
+                    ink.gamma_multiply(0.8)
+                } else {
+                    edge.gamma_multiply(0.7)
+                },
             );
-            for step in 1..=TONE_CELLS {
-                let reach = step as f32 / TONE_CELLS as f32;
-                for up in [true, false] {
-                    let awake = !killed
-                        && if up {
-                            lit > 0.0 && reach <= lit + 0.001
-                        } else {
-                            lit < 0.0 && reach <= -lit + 0.001
-                        };
-                    let y = if up {
-                        zero_y - cell_pitch * step as f32
-                    } else {
-                        zero_y + cell_pitch * step as f32
-                    };
-                    let square =
-                        egui::Rect::from_center_size(egui::pos2(x, y), egui::Vec2::splat(cell));
-                    if awake {
-                        // A lit square is solid in the band's hue and
-                        // brighter the further out it stands, with a
-                        // wash of the same hue around it — the light a
-                        // lit thing throws on the glass beside it.
-                        shapes.push(egui::Shape::rect_filled(
-                            square.expand(2.0),
-                            0.0,
-                            ink.gamma_multiply(0.22),
-                        ));
-                        shapes.push(egui::Shape::rect_filled(
-                            square,
-                            0.0,
-                            mix_ink(ink.gamma_multiply(0.7), ink, reach),
-                        ));
-                    } else {
-                        shapes.push(egui::Shape::rect_stroke(
-                            square,
-                            0.0,
-                            egui::Stroke::new(
-                                Weight::Hair.px(),
-                                edge.gamma_multiply(if killed { 0.35 } else { 0.6 }),
-                            ),
-                            egui::StrokeKind::Inside,
-                        ));
-                    }
+            for step in 0..steps {
+                let y = top + 4.0 + TONE_CELL_PITCH * step as f32;
+                if y > face.field.bottom() - 2.0 {
+                    break;
                 }
+                let square =
+                    egui::Rect::from_center_size(egui::pos2(x, y), egui::Vec2::splat(TONE_CELL));
+                if awake {
+                    shapes.push(egui::Shape::rect_filled(
+                        square.expand(1.5),
+                        0.0,
+                        ink.gamma_multiply(0.3),
+                    ));
+                }
+                shapes.push(egui::Shape::rect_filled(
+                    square,
+                    0.0,
+                    if killed {
+                        ink.gamma_multiply(if awake { 0.5 } else { 0.28 })
+                    } else if awake {
+                        ink
+                    } else {
+                        ink.gamma_multiply(0.62)
+                    },
+                ));
             }
-            // A killed band: the stack is struck through in its own
-            // hue, which is the one mark on this face that means STOP.
             if killed {
-                let top = zero_y - cell_pitch * TONE_CELLS as f32;
-                let bottom = zero_y + cell_pitch * TONE_CELLS as f32;
-                let arm = column.width() * 0.36;
+                let bottom = (top + reach).min(face.field.bottom());
+                let arm = 5.0;
                 for (a, b) in [
-                    (egui::pos2(x - arm, top), egui::pos2(x + arm, bottom)),
-                    (egui::pos2(x + arm, top), egui::pos2(x - arm, bottom)),
+                    (egui::pos2(x - arm, top + 3.0), egui::pos2(x + arm, bottom)),
+                    (egui::pos2(x + arm, top + 3.0), egui::pos2(x - arm, bottom)),
                 ] {
-                    circuit::trace(&mut shapes, &[a, b], Weight::Heavy, ink);
+                    circuit::trace(
+                        &mut shapes,
+                        &[a, b],
+                        Weight::Heavy,
+                        if awake { ink } else { ink.gamma_multiply(0.7) },
+                    );
                 }
             }
         }
@@ -1442,15 +1812,358 @@ impl Stage {
         // The cursor: the house brackets around whichever instrument
         // the keyboard is holding, and nothing else on the face bright.
         if let Some(rect) = selected.and_then(|param| face.control(param)) {
-            let mut cursor = Vec::new();
-            circuit::brackets(
-                &mut cursor,
-                rect.expand(2.0),
-                6.0,
-                Weight::Bold,
+            crate::ui::nav_cursor::claim(
+                painter,
+                ("stage-tone-cursor", piece.index),
+                rect,
+                crate::ui::nav_cursor::Kind::Instrument,
+                crate::ui::nav_cursor::Layer::Surface,
                 motion::pulse_ink(alpha.live.color, alpha.ink.color, phase),
             );
-            painter.extend(cursor);
+        }
+    }
+
+    /// DOOR: a doorway, a ladder, an envelope and a window.
+    ///
+    /// The LADDER on the left is the decision, drawn as one line: a
+    /// bright notch where the door opens, a dimmer one under it where
+    /// it will not change its mind again, a slope below that whose
+    /// steepness is the ratio, and a floor where the fall stops. The
+    /// key's own level rides the ladder as a column, so what the door
+    /// is listening to and what it decided are the same picture.
+    ///
+    /// The DOORWAY beside it is not a control: it is the door, its leaf
+    /// standing as far open as the sound has opened it.
+    ///
+    /// Under them, one ENVELOPE drawn as it is heard — a rise, a
+    /// plateau and a fall, each the width of its own time — and one
+    /// WINDOW showing the band the key listens through. At the foot,
+    /// the mode: an ear, or a beat grid whose cells are the division
+    /// and whose lit share is the duty.
+    fn draw_door_figure(
+        &self,
+        painter: &egui::Painter,
+        piece: Piece,
+        glass: egui::Rect,
+        selected: Option<usize>,
+        phase: Phase,
+    ) {
+        use crate::params::console::door as p;
+        let alpha = self.alphabet();
+        let edge = alpha.edge.color;
+        let ink = alpha.ink.color;
+        let live = motion::pulse_ink(alpha.live.color, alpha.live_dim.color, phase);
+        let (_, id) = self.band_device(piece.index).unzip();
+        let device = id.and_then(|id| self.song.device(id));
+        let value = |param: u32| device.map_or(0.0, |device| device.value(param));
+        let said = id.map(|id| self.telemetry(id)).unwrap_or_default();
+        let rhythm = value(p::MODE).round() as u32 == p::MODE_RHYTHM;
+        let threshold_db = value(p::THRESHOLD);
+        let hysteresis_db = value(p::HYSTERESIS);
+        let range_db = value(p::RANGE);
+        let face = door_face(glass, piece.rect, threshold_db, hysteresis_db, range_db);
+        // How far the door stands open, smoothed so the leaf swings
+        // rather than snaps between frames.
+        let open = painter.ctx().animate_value_with_time(
+            egui::Id::new(("stage-door-open", piece.index)),
+            if said.bands[1] > 0.0 {
+                said.bands[1].clamp(0.0, 1.0)
+            } else {
+                1.0
+            },
+            0.09,
+        );
+        let mut shapes = Vec::new();
+
+        // ---- the ladder: threshold, hysteresis, ratio, range -------
+        circuit::panel_frame_variant(&mut shapes, face.ladder, Weight::Hair, edge, 1);
+        let ladder = face.ladder.shrink2(egui::vec2(4.0, 3.0));
+        let rail_x = ladder.left() + 9.0;
+        circuit::trace(
+            &mut shapes,
+            &[
+                egui::pos2(rail_x, ladder.top()),
+                egui::pos2(rail_x, ladder.bottom()),
+            ],
+            Weight::Hair,
+            edge.gamma_multiply(0.8),
+        );
+        // The key's level, as a column climbing the rail.
+        let key_y = door_ladder_y(face.ladder, said.bands[2]);
+        if said.bands[2] > -71.0 {
+            shapes.push(egui::Shape::rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(rail_x - 3.0, key_y),
+                    egui::pos2(rail_x + 3.0, ladder.bottom()),
+                ),
+                0.0,
+                live.gamma_multiply(0.85),
+            ));
+        }
+        // The decision: the threshold's notch bright, the hysteresis
+        // notch under it dim, the slope between the two floors.
+        let threshold_y = door_ladder_y(face.ladder, threshold_db);
+        let hyst_y = door_ladder_y(face.ladder, threshold_db - hysteresis_db);
+        let floor_y = door_ladder_y(face.ladder, (threshold_db - range_db).max(-72.0));
+        circuit::trace(
+            &mut shapes,
+            &[
+                egui::pos2(rail_x - 6.0, threshold_y),
+                egui::pos2(ladder.right(), threshold_y),
+            ],
+            Weight::Heavy,
+            ink,
+        );
+        circuit::trace(
+            &mut shapes,
+            &[
+                egui::pos2(rail_x - 4.0, hyst_y),
+                egui::pos2(ladder.right() - 6.0, hyst_y),
+            ],
+            Weight::Hair,
+            alpha.jeopardy_latent.color,
+        );
+        // The slope: how fast the gain falls under the threshold. Its
+        // angle IS the ratio, and it flattens where the range stops it.
+        let slope_left = ladder.right() - 4.0;
+        let ratio = value(p::RATIO).max(1.0);
+        let reach = ((floor_y - hyst_y) / (ratio * 3.0)).clamp(4.0, ladder.width() - 14.0);
+        let corner = egui::pos2(slope_left - reach, floor_y);
+        circuit::trace(
+            &mut shapes,
+            &[egui::pos2(slope_left, hyst_y), corner],
+            Weight::Heavy,
+            mix_ink(ink, alpha.jeopardy_active.color, 0.4),
+        );
+        circuit::trace(
+            &mut shapes,
+            &[corner, egui::pos2(ladder.left() + 2.0, floor_y)],
+            Weight::Hair,
+            edge.gamma_multiply(1.2),
+        );
+
+        // ---- the doorway: the leaf, as far open as the sound has it
+        circuit::panel_variant(
+            &mut shapes,
+            face.doorway,
+            Some(alpha.well.color),
+            alpha.ground.color,
+            Some((Weight::Hair, edge)),
+            2,
+        );
+        let jamb = face.doorway.shrink(5.0);
+        shapes.push(egui::Shape::rect_filled(jamb, 0.0, alpha.ground.color));
+        // The frame it swings in, and the plate it closes onto.
+        circuit::trace(
+            &mut shapes,
+            &[
+                jamb.left_bottom(),
+                jamb.left_top(),
+                jamb.right_top(),
+                jamb.right_bottom(),
+            ],
+            Weight::Hair,
+            edge.gamma_multiply(1.1),
+        );
+        shapes.push(egui::Shape::rect_filled(
+            egui::Rect::from_min_max(egui::pos2(jamb.left(), jamb.bottom() - 2.0), jamb.max),
+            0.0,
+            edge,
+        ));
+        // The opening the leaf swings into, and the leaf itself: shut,
+        // it covers the whole jamb; open, it has swung to the side.
+        // The leaf never vanishes: thrown wide it stands against the
+        // wall, shut it covers the opening. A door with no leaf in it
+        // is a hole.
+        let leaf_w = jamb.width() * (0.22 + 0.78 * (1.0 - open).clamp(0.0, 1.0));
+        if leaf_w > 0.5 {
+            let leaf =
+                egui::Rect::from_min_max(egui::pos2(jamb.right() - leaf_w, jamb.top()), jamb.max);
+            shapes.push(egui::Shape::rect_filled(
+                leaf,
+                0.0,
+                mix_ink(alpha.surface.color, alpha.jeopardy_latent.color, 0.35),
+            ));
+            circuit::trace(
+                &mut shapes,
+                &[leaf.left_top(), leaf.left_bottom()],
+                Weight::Heavy,
+                ink,
+            );
+        }
+        // The light through the opening, and the hinges it swings on.
+        let gap =
+            egui::Rect::from_min_max(jamb.min, egui::pos2(jamb.right() - leaf_w, jamb.bottom()));
+        if gap.width() > 1.0 {
+            // What comes through: brighter the wider it stands, and a
+            // sill of light along the floor of the opening.
+            shapes.push(egui::Shape::rect_filled(
+                gap,
+                0.0,
+                live.gamma_multiply(0.05 + 0.13 * open),
+            ));
+            shapes.push(egui::Shape::rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(gap.left(), gap.bottom() - 3.0),
+                    egui::pos2(gap.right(), gap.bottom()),
+                ),
+                0.0,
+                live.gamma_multiply(0.35 + 0.5 * open),
+            ));
+        }
+        for at in [0.25, 0.5, 0.75] {
+            circuit::pad(
+                &mut shapes,
+                egui::pos2(jamb.right() + 1.0, egui::lerp(jamb.y_range(), at)),
+                circuit::PAD - 2.0,
+                edge,
+                false,
+            );
+        }
+
+        // ---- the envelope: rise, plateau, fall ---------------------
+        let env = egui::Rect::from_min_max(face.attack.min, face.release.max);
+        circuit::panel_frame_variant(&mut shapes, env, Weight::Hair, edge, 3);
+        let shape_of = |ms: f32, most: f32| (ms / most).clamp(0.02, 1.0).sqrt();
+        let rise = shape_of(value(p::ATTACK), 100.0);
+        let plateau = shape_of(value(p::HOLD), 500.0);
+        let fall = shape_of(value(p::RELEASE), 2_000.0);
+        let inner = env.shrink2(egui::vec2(5.0, 4.0));
+        let base = inner.bottom();
+        let peak = inner.top();
+        // Each time takes its own third of the drawing, and within that
+        // third the corner slides: a long attack leans, a short one
+        // stands up.
+        let a_end = egui::lerp(face.attack.x_range(), rise.clamp(0.1, 0.95));
+        let h_end = egui::lerp(face.hold.x_range(), plateau.clamp(0.05, 0.95));
+        let r_end = egui::lerp(face.release.x_range(), fall.clamp(0.1, 0.95));
+        let envelope = vec![
+            egui::pos2(inner.left(), base),
+            egui::pos2(a_end, peak),
+            egui::pos2(h_end.max(a_end), peak),
+            egui::pos2(r_end.max(h_end), base),
+            egui::pos2(inner.right(), base),
+        ];
+        circuit::trace(&mut shapes, &envelope, Weight::Heavy, ink);
+        for x in [a_end, h_end] {
+            circuit::trace(
+                &mut shapes,
+                &[egui::pos2(x, peak), egui::pos2(x, base)],
+                Weight::Hair,
+                edge.gamma_multiply(0.7),
+            );
+        }
+        // The door's own gain rides the envelope's height, so the
+        // drawing moves with the sound it is describing.
+        shapes.push(egui::Shape::rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(inner.left(), egui::lerp(base..=peak, open)),
+                egui::pos2(inner.right(), base),
+            ),
+            0.0,
+            live.gamma_multiply(0.12),
+        ));
+
+        // ---- the key's window -------------------------------------
+        let key = egui::Rect::from_min_max(face.key_hp.min, face.key_lp.max);
+        circuit::trace(
+            &mut shapes,
+            &[
+                egui::pos2(key.left(), key.center().y),
+                egui::pos2(key.right(), key.center().y),
+            ],
+            Weight::Hair,
+            edge.gamma_multiply(0.8),
+        );
+        let hp_x = tone_x(key, value(p::KEY_HP));
+        let lp_x = tone_x(key, value(p::KEY_LP));
+        shapes.push(egui::Shape::rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(hp_x, key.top() + 2.0),
+                egui::pos2(lp_x.max(hp_x + 1.0), key.bottom() - 2.0),
+            ),
+            0.0,
+            live.gamma_multiply(0.3),
+        ));
+        for (x, out) in [(hp_x, true), (lp_x, false)] {
+            let post = egui::Rect::from_min_max(
+                egui::pos2(x - 2.0, key.top()),
+                egui::pos2(x + 2.0, key.bottom()),
+            );
+            shapes.push(egui::Shape::rect_filled(post, 0.0, ink));
+            let _ = out;
+        }
+
+        // ---- the mode, and the grid the chopper runs on ------------
+        let mode = face.mode;
+        if rhythm {
+            // A beat: a filled square with its own pulse.
+            shapes.push(egui::Shape::rect_filled(
+                mode.shrink(3.0),
+                0.0,
+                mix_ink(alpha.live_dim.color, alpha.live.color, phase.dash()),
+            ));
+        } else {
+            // An ear: two arcs listening.
+            for r in [3.0f32, 6.0] {
+                let arc: Vec<egui::Pos2> = (0..=12)
+                    .map(|i| on_arc(mode.center(), r, -60.0 + 120.0 * i as f32 / 12.0))
+                    .collect();
+                circuit::trace(&mut shapes, &arc, Weight::Hair, ink);
+            }
+        }
+        let grid = egui::Rect::from_min_max(face.division.min, face.duty.max);
+        let cells = match value(p::DIVISION).round().max(0.0) as usize {
+            0 => 2usize,
+            1 => 4,
+            2 => 8,
+            3 => 16,
+            4 => 3,
+            _ => 6,
+        };
+        let duty = (value(p::DUTY) / 100.0).clamp(0.0, 1.0);
+        let step = grid.width() / cells as f32;
+        for cell in 0..cells {
+            let x0 = grid.left() + step * cell as f32;
+            let lit = egui::Rect::from_min_max(
+                egui::pos2(x0, grid.top() + 1.0),
+                egui::pos2(x0 + (step - 1.0) * duty, grid.bottom() - 1.0),
+            );
+            let whole = egui::Rect::from_min_max(
+                egui::pos2(x0, grid.top() + 1.0),
+                egui::pos2(x0 + step - 1.0, grid.bottom() - 1.0),
+            );
+            shapes.push(egui::Shape::rect_stroke(
+                whole,
+                0.0,
+                egui::Stroke::new(Weight::Hair.px(), edge.gamma_multiply(0.8)),
+                egui::StrokeKind::Inside,
+            ));
+            if lit.width() > 0.5 {
+                shapes.push(egui::Shape::rect_filled(
+                    lit,
+                    0.0,
+                    if rhythm {
+                        live.gamma_multiply(0.85)
+                    } else {
+                        edge.gamma_multiply(1.1)
+                    },
+                ));
+            }
+        }
+        painter.extend(shapes);
+
+        // The cursor: the house brackets around whichever instrument
+        // the keyboard is holding.
+        if let Some(rect) = selected.and_then(|param| face.control(param)) {
+            crate::ui::nav_cursor::claim(
+                painter,
+                ("stage-door-cursor", piece.index),
+                rect,
+                crate::ui::nav_cursor::Kind::Instrument,
+                crate::ui::nav_cursor::Layer::Surface,
+                motion::pulse_ink(alpha.live.color, alpha.ink.color, phase),
+            );
         }
     }
 
@@ -1888,15 +2601,14 @@ impl Stage {
         // The cursor is not a sixth row below the drawing. Four bright
         // corners sit just inside the addressed instrument itself.
         if let Some(rect) = selected.and_then(|param| face.control(param)) {
-            let mut cursor = Vec::new();
-            circuit::brackets(
-                &mut cursor,
-                rect.shrink(2.0),
-                5.0,
-                Weight::Bold,
+            crate::ui::nav_cursor::claim(
+                painter,
+                ("stage-preamp-cursor", piece.index),
+                rect,
+                crate::ui::nav_cursor::Kind::Instrument,
+                crate::ui::nav_cursor::Layer::Surface,
                 alpha.focus.color,
             );
-            painter.extend(cursor);
         }
     }
 }
@@ -1976,6 +2688,88 @@ mod tests {
             );
         }
         let _ = p::MID_HZ;
+    }
+
+    /// Every DOOR parameter has one instrument; the four that are
+    /// facts about one line share the ladder without overlapping; and
+    /// the two that live in the silhouette's crevices are outside the
+    /// glass, which is the point of cutting the crevices.
+    #[test]
+    fn every_door_parameter_has_one_instrument() {
+        let piece = egui::Rect::from_min_size(
+            egui::pos2(30.0, 40.0),
+            egui::vec2(width_of(SectionKind::Door), 240.0),
+        );
+        let glass = recess_of(piece, SectionKind::Door).shrink(3.0);
+        let face = door_face(glass, piece, -30.0, 6.0, 40.0);
+        for table in SectionKind::Door.table() {
+            let rect = face
+                .control(table.id as usize)
+                .unwrap_or_else(|| panic!("{} has no instrument", table.name));
+            assert!(rect.is_positive(), "{} has no room", table.name);
+            assert!(piece.contains_rect(rect), "{} left the piece", table.name);
+        }
+        // The ladder reads top to bottom: the threshold, the give under
+        // it, the slope, then the floor.
+        assert!(face.threshold.center().y < face.hysteresis.center().y);
+        assert!(face.hysteresis.center().y <= face.ratio.center().y);
+        assert!(face.ratio.center().y <= face.range.center().y);
+        // The envelope is three parts of one drawing, in order.
+        assert!(face.attack.right() <= face.hold.left() + 0.01);
+        assert!(face.hold.right() <= face.release.left() + 0.01);
+        // And the crevices hold what the glass has no room for.
+        assert!(
+            !glass.contains_rect(face.mode),
+            "the mode is not in its bay"
+        );
+        assert!(
+            !glass.contains_rect(face.division),
+            "the grid is not on its plinth"
+        );
+    }
+
+    /// DOOR's silhouette is not a box: a step in the top edge, a bay in
+    /// the right wall and a plinth at the foot. The joint is untouched
+    /// by all of it, which is what lets it still plug into TONE.
+    #[test]
+    fn the_door_is_an_irregular_shape_that_still_mates() {
+        let piece = egui::Rect::from_min_size(
+            egui::pos2(0.0, 40.0),
+            egui::vec2(width_of(SectionKind::Door), 240.0),
+        );
+        assert!(shoulder(SectionKind::Door).is_some());
+        assert!(bay(SectionKind::Door).is_some());
+        assert!(plinth(SectionKind::Door).is_some());
+        assert!(shoulder(SectionKind::Tone).is_none(), "TONE is a plain box");
+
+        let door = outline(piece, SectionKind::Door, true, true);
+        // The top edge is at two heights, and the right wall comes in.
+        let top = piece.top();
+        let highest = door.iter().map(|p| p.y).fold(f32::MAX, f32::min);
+        assert!((highest - top).abs() < 0.01);
+        assert!(
+            door.iter().any(|p| p.y > top + 10.0 && p.y < top + 20.0),
+            "no step in the top edge"
+        );
+        assert!(
+            door.iter()
+                .any(|p| p.x < piece.right() - 10.0 && p.x > piece.right() - 20.0),
+            "no bay in the right wall"
+        );
+        // The notch and the tongue are where every other piece's are.
+        let jy = joint_y(piece);
+        assert!(door.iter().any(
+            |p| (p.x - piece.left()).abs() < 0.01 && (p.y - (jy - JOINT_H * 0.5)).abs() < 0.01
+        ));
+        assert!(
+            door.iter()
+                .any(|p| (p.x - (piece.right() + TONGUE)).abs() < 0.01)
+        );
+        // And the glass keeps out of every crevice.
+        let glass = recess_of(piece, SectionKind::Door);
+        assert!(glass.top() > recess_of(piece, SectionKind::Tone).top());
+        assert!(glass.right() < recess_of(piece, SectionKind::Tone).right());
+        assert!(glass.bottom() < recess_of(piece, SectionKind::Tone).bottom());
     }
 
     /// The face's axis is read in octaves, so a decade takes the same
