@@ -73,6 +73,7 @@ pub mod hud;
 pub mod keymap;
 pub mod kit;
 pub mod legibility;
+pub mod nav_cursor;
 pub mod palette;
 pub mod panels;
 pub mod prefs;

@@ -504,10 +504,17 @@ impl Palette {
                 None,
                 (self.cursor % 4) as u8,
             );
-            if active {
-                circuit::brackets(&mut shapes, rect.expand(2.0), 7.0, Weight::Bold, theme.text);
-            }
             ui.painter().extend(shapes);
+        }
+        if active {
+            crate::ui::nav_cursor::claim(
+                ui.painter(),
+                ("palette-cursor", cmd.id),
+                rect,
+                crate::ui::nav_cursor::Kind::Row,
+                crate::ui::nav_cursor::Layer::Palette,
+                theme.text,
+            );
         }
 
         ui.scope_builder(

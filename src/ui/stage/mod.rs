@@ -1408,6 +1408,7 @@ impl Stage {
 
     /// Draw one frame: read the keyboard, advance time, paint the stage.
     pub fn show(&mut self, ui: &mut egui::Ui) {
+        crate::ui::nav_cursor::begin_frame(ui.ctx());
         self.refusal = None;
         self.poll_library(ui.ctx());
 
@@ -3877,6 +3878,7 @@ impl Stage {
         // is a callout, and a callout drawn under anything is a callout
         // pointing through it.
         self.draw_trig_menu(&painter, whole);
+        crate::ui::nav_cursor::paint(ui.ctx());
     }
 
     /// The fixed shell: two raised faceplates, a recessed transport glass,
@@ -4242,9 +4244,14 @@ impl Stage {
             );
             let on = index == menu.row;
             if on {
-                let mut marks = Vec::new();
-                circuit::brackets(&mut marks, row, 5.0, Weight::Bold, alpha.focus.color);
-                painter.extend(marks);
+                crate::ui::nav_cursor::claim(
+                    painter,
+                    ("stage-trig-menu-cursor", index),
+                    row,
+                    crate::ui::nav_cursor::Kind::Row,
+                    crate::ui::nav_cursor::Layer::Overlay,
+                    alpha.focus.color,
+                );
             }
             let ink = if on {
                 alpha.focus.color
@@ -4921,17 +4928,14 @@ impl Stage {
                 // ground-coloured words on the focus ink, so the row
                 // under the hand is never the hardest one to read.
                 painter.rect_filled(rect, 0.0, alpha.focus.color);
-                let mut shapes = Vec::new();
-                circuit::brackets(
-                    &mut shapes,
-                    rect.expand(2.0),
-                    5.0,
-                    Weight::Bold,
+                crate::ui::nav_cursor::claim(
+                    painter,
+                    ("stage-chain-row-cursor", index, row_offset + line),
+                    rect,
+                    crate::ui::nav_cursor::Kind::Row,
+                    crate::ui::nav_cursor::Layer::Surface,
                     alpha.ink.color,
                 );
-                for shape in shapes {
-                    painter.add(shape);
-                }
             }
             // Read at the ink, not the edge: a card is a table to be
             // read, and a table in the structure rung is a table you
@@ -5208,6 +5212,14 @@ impl Stage {
                     focus_row as f32 * (cell + gap),
                 ),
             egui::vec2(cell, cell),
+        );
+        crate::ui::nav_cursor::claim(
+            painter,
+            "stage-nested-grid-cursor",
+            focused,
+            crate::ui::nav_cursor::Kind::Cell,
+            crate::ui::nav_cursor::Layer::Surface,
+            self.alphabet().ink.color,
         );
         self.draw_grid_refusal(painter, field, focused, gap.max(4.0));
     }
@@ -5565,19 +5577,28 @@ impl Stage {
                 },
             );
             if focused {
-                // The bracket is this app's cursor form — it was already
-                // the step grid's, and it is the house's now. Brushed:
-                // the cursor is the one mark a hand is always on.
-                let ink_col = self.alphabet().ink.color;
-                let zone = rect.expand(6.0);
-                kit::cached(
+                let target = if self.mixing {
+                    egui::Rect::from_min_max(
+                        rect.min,
+                        egui::pos2(
+                            rect.right(),
+                            field.bottom() - design::px(design::space::ROOM),
+                        ),
+                    )
+                } else {
+                    rect
+                };
+                crate::ui::nav_cursor::claim(
                     painter,
-                    egui::Id::new("stage-head-cursor"),
-                    zone,
-                    ink_col,
-                    |out| {
-                        circuit::brackets(out, rect.expand(3.0), 8.0, Weight::Bold, ink_col);
+                    ("stage-track-cursor", index),
+                    target,
+                    if self.mixing {
+                        crate::ui::nav_cursor::Kind::Column
+                    } else {
+                        crate::ui::nav_cursor::Kind::Cell
                     },
+                    crate::ui::nav_cursor::Layer::Surface,
+                    self.alphabet().ink.color,
                 );
             }
 
@@ -5880,17 +5901,29 @@ impl Stage {
             kind_ink,
         );
         if focused {
-            let mut shapes = Vec::new();
-            circuit::brackets(
-                &mut shapes,
-                head.expand(3.0),
-                8.0,
-                Weight::Bold,
+            let target = if self.mixing {
+                egui::Rect::from_min_max(
+                    head.min,
+                    egui::pos2(
+                        head.right(),
+                        field.bottom() - design::px(design::space::ROOM),
+                    ),
+                )
+            } else {
+                head
+            };
+            crate::ui::nav_cursor::claim(
+                painter,
+                "stage-master-cursor",
+                target,
+                if self.mixing {
+                    crate::ui::nav_cursor::Kind::Column
+                } else {
+                    crate::ui::nav_cursor::Kind::Cell
+                },
+                crate::ui::nav_cursor::Layer::Surface,
                 alpha.ink.color,
             );
-            for shape in shapes {
-                painter.add(shape);
-            }
         }
 
         // The seam is the master rail. Every shown track elbows into its
@@ -6175,17 +6208,14 @@ impl Stage {
                 );
 
                 if here {
-                    let mut shapes = Vec::new();
-                    circuit::brackets(
-                        &mut shapes,
-                        rect.expand(3.0),
-                        7.0,
-                        Weight::Bold,
+                    crate::ui::nav_cursor::claim(
+                        painter,
+                        ("stage-session-cell-cursor", track, scene),
+                        rect,
+                        crate::ui::nav_cursor::Kind::Cell,
+                        crate::ui::nav_cursor::Layer::Surface,
                         alpha.ink.color,
                     );
-                    for shape in shapes {
-                        painter.add(shape);
-                    }
                 }
 
                 if self.playing_on(track) == Some(scene) {
@@ -7066,14 +7096,17 @@ impl Stage {
                             None,
                             (*index % 4) as u8,
                         );
-                        circuit::brackets(
-                            &mut shapes,
-                            cursor.expand(2.0),
-                            7.0,
-                            Weight::Bold,
-                            alpha.focus.color,
-                        );
                         painter.extend(shapes);
+                        if self.browser.is_some() {
+                            crate::ui::nav_cursor::claim(
+                                painter,
+                                ("stage-browser-cursor", *index),
+                                cursor,
+                                crate::ui::nav_cursor::Kind::Row,
+                                crate::ui::nav_cursor::Layer::Overlay,
+                                alpha.focus.color,
+                            );
+                        }
                     }
 
                     // Depth is drawn, not implied: two cells per level, so
@@ -7219,16 +7252,23 @@ impl Stage {
         // With no addressable row, the typing prompt becomes the one focus
         // signal. When a row exists its inversion is the signal instead.
         if browser.cursor().is_none() {
-            painter.rect_filled(
-                egui::Rect::from_min_size(at(1, 1), egui::vec2(cell.x, cell.y)),
-                0.0,
-                self.focused(),
-            );
+            let prompt = egui::Rect::from_min_size(at(1, 1), egui::vec2(cell.x, cell.y));
+            painter.rect_filled(prompt, 0.0, self.focused());
             text(
                 at(1, 1),
                 browser::glyph::PROMPT.to_string(),
                 self.alphabet().ground.color,
             );
+            if self.browser.is_some() {
+                crate::ui::nav_cursor::claim(
+                    painter,
+                    "stage-browser-prompt",
+                    prompt,
+                    crate::ui::nav_cursor::Kind::Prompt,
+                    crate::ui::nav_cursor::Layer::Overlay,
+                    alpha.focus.color,
+                );
+            }
         }
     }
 
@@ -7646,28 +7686,17 @@ impl Stage {
         // The cursor: bold, in the focus ink, with its time at the head.
         if visible(editor.cursor) {
             let x = x_of(editor.cursor);
-            let mut marks = Vec::new();
-            circuit::trace(
-                &mut marks,
-                &[egui::pos2(x, screen.top()), egui::pos2(x, screen.bottom())],
-                Weight::Bold,
+            crate::ui::nav_cursor::claim(
+                painter,
+                "stage-sample-playhead-cursor",
+                egui::Rect::from_min_max(
+                    egui::pos2(x - 1.5, screen.top()),
+                    egui::pos2(x + 1.5, screen.bottom()),
+                ),
+                crate::ui::nav_cursor::Kind::Playhead,
+                crate::ui::nav_cursor::Layer::Overlay,
                 alpha.focus.color,
             );
-            circuit::pad(
-                &mut marks,
-                egui::pos2(x, screen.top() + 4.0),
-                circuit::PAD,
-                alpha.focus.color,
-                true,
-            );
-            circuit::pad(
-                &mut marks,
-                egui::pos2(x, screen.bottom() - 4.0),
-                circuit::PAD,
-                alpha.focus.color,
-                true,
-            );
-            painter.extend(marks);
             let text = if data.is_some() {
                 word(editor.cursor)
             } else {
@@ -7964,6 +7993,14 @@ impl Stage {
             block::unit::TITLE,
             "CODEX",
             alpha.ink.color,
+        );
+        crate::ui::nav_cursor::claim(
+            painter,
+            "stage-help-cursor",
+            egui::Rect::from_min_size(inner.min, egui::vec2(inner.width(), header_h)),
+            crate::ui::nav_cursor::Kind::Prompt,
+            crate::ui::nav_cursor::Layer::Overlay,
+            alpha.focus.color,
         );
 
         for (index, (chord, label)) in rows.iter().enumerate() {

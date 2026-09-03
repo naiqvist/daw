@@ -65,7 +65,6 @@ const SELECTION_WASH: u8 = 8;
 /// lit cell; wider than this and it stops being a moment.
 const PLAYHEAD_W: f32 = 2.0;
 const CURSOR_GAP: f32 = 2.0;
-const CURSOR_CAP: f32 = 8.0;
 /// Narrower than this, a note face has no room for a label.
 const LABEL_MIN_W: f32 = 22.0;
 /// Narrower than this, a note face keeps its label but drops the corner signs.
@@ -457,7 +456,7 @@ impl SequenceGrid {
                 }
                 self.draw_cell_events(&cells, rect, clip, lens, step, ground);
                 if self.cursor_step == step {
-                    draw_cursor(&cells, rect, ground);
+                    draw_cursor(&cells, rect, ground, focused);
                     self.cursor_rect = Some(rect);
                 }
             }
@@ -1612,10 +1611,12 @@ pub(crate) fn note_name(pitch: u8) -> String {
     format!("{}{octave}", crate::theory::pitch_class_name(pitch))
 }
 
-pub(crate) fn draw_cursor(painter: &egui::Painter, cell: egui::Rect, ground: Polarity) {
-    let rect = cell.expand(CURSOR_GAP);
-    // The one place a rule is the sign: four corners, and nothing joins
-    // them, so the cursor brackets a cell without boxing it.
+pub(crate) fn draw_cursor(
+    painter: &egui::Painter,
+    cell: egui::Rect,
+    ground: Polarity,
+    focused: bool,
+) {
     let mut shapes = Vec::new();
     circuit::relic_frame(
         &mut shapes,
@@ -1624,15 +1625,18 @@ pub(crate) fn draw_cursor(painter: &egui::Painter, cell: egui::Rect, ground: Pol
         Weight::Bold,
         relic_ink(ground, 0.92),
     );
-    circuit::brackets(
-        &mut shapes,
-        rect,
-        CURSOR_CAP,
-        Weight::Bold,
-        shade(INK_LEVEL, ground),
-    );
     for shape in shapes {
         painter.add(shape);
+    }
+    if focused {
+        crate::ui::nav_cursor::claim(
+            painter,
+            "sequence-cell-cursor",
+            cell.expand(CURSOR_GAP),
+            crate::ui::nav_cursor::Kind::Cell,
+            crate::ui::nav_cursor::Layer::Surface,
+            shade(INK_LEVEL, ground),
+        );
     }
 }
 

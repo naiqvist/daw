@@ -1187,7 +1187,6 @@ impl Stage {
                 }
             };
             if target.is_positive() {
-                let bracket_ink = if holds_the_keys { ink } else { edge };
                 let mut shapes = Vec::new();
                 if self.song_block().is_none() && self.song_audio_block().is_none() {
                     shapes.push(egui::Shape::rect_filled(
@@ -1196,14 +1195,17 @@ impl Stage {
                         cursor_shade.gamma_multiply(0.35),
                     ));
                 }
-                circuit::brackets(
-                    &mut shapes,
-                    target.expand(2.0),
-                    8.0,
-                    Weight::Bold,
-                    bracket_ink,
-                );
                 painter.extend(shapes);
+                if holds_the_keys {
+                    crate::ui::nav_cursor::claim(
+                        painter,
+                        "stage-song-cursor",
+                        target,
+                        crate::ui::nav_cursor::Kind::Block,
+                        crate::ui::nav_cursor::Layer::Surface,
+                        ink,
+                    );
+                }
             }
         }
 

@@ -394,7 +394,7 @@ impl RollPanel {
                 ),
                 egui::vec2(step_w, ROW_H),
             );
-            draw_cursor(&roll_painter, cell, ground);
+            draw_cursor(&roll_painter, cell, ground, focused);
             self.cursor_rect = Some(cell);
         }
         requested_editor
