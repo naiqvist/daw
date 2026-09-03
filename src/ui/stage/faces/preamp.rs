@@ -97,7 +97,8 @@ pub(super) fn draw(face: &Face<'_>) {
     let painter = face.painter;
     let piece = face.piece;
     let glass = face.glass;
-    let selected = face.selected;
+    // The mark is claimed through the layout, so the parameter index
+    // itself is never needed here.
     let phase = face.phase;
     let alpha = face.alpha;
     let level = face.level;

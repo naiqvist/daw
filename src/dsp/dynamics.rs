@@ -592,6 +592,26 @@ impl LookaheadLimiter {
         }
     }
 
+    /// Where the smoothed gain stands right now, in dB, at or below
+    /// zero. Telemetry: the block's WORST reduction and where the gain
+    /// stands at the block's end are different questions, and a meter
+    /// that shows recovery needs the second one.
+    pub fn gain_db(&self) -> f32 {
+        20.0 * self.gain.max(1e-6).log10()
+    }
+
+    /// The loudest sample anywhere inside the lookahead window, in
+    /// dBFS, floored. Telemetry: the one figure on the desk that comes
+    /// from AHEAD of the playhead, which is what lets a surface draw
+    /// lookahead rather than only its aftermath.
+    pub fn window_peak_db(&self) -> f32 {
+        if self.win_max > 1e-6 {
+            20.0 * self.win_max.log10()
+        } else {
+            -120.0
+        }
+    }
+
     /// Floats the caller-owned buffer needs for a lookahead at a rate.
     /// Green zone, compile-time sizing.
     pub fn scratch_len(sample_rate: f32, lookahead_ms: f32) -> usize {

@@ -1602,6 +1602,17 @@ pub enum Node {
     /// Sums its wired inputs, then applies a ramped master gain
     /// (ParamChange 0 = gain). Stereo out; mono inputs are centered.
     Mixer { gain: f32, target_gain: f32 },
+    /// A SEND: the same sum and ramped gain as a mixer, but it listens
+    /// for ONE named parameter of the device that owns it, as a
+    /// percentage. It exists so a channel can be tapped into a return
+    /// without the tap being a device of its own — the amount lives on
+    /// the channel's OUT section, where the hand set it, and the letter
+    /// that carries a turn reaches this node as well as that section's.
+    Send {
+        gain: f32,
+        target_gain: f32,
+        param: u32,
+    },
     /// The per-track output stage: constant-power pan (first input's mono
     /// signal -> stereo) and the track's fader level. Both ramped.
     /// ParamChange 0 = pan, 1 = gain.
@@ -2432,7 +2443,10 @@ impl Node {
             | NodeSpec::Tilt { .. }
             | NodeSpec::Phaser { .. } => 2,
             NodeSpec::Delay { channels, .. } => (*channels).clamp(1, 2),
-            NodeSpec::Mixer { .. } | NodeSpec::AudioClip { .. } | NodeSpec::Pan { .. } => 2,
+            NodeSpec::Mixer { .. }
+            | NodeSpec::Send { .. }
+            | NodeSpec::AudioClip { .. }
+            | NodeSpec::Pan { .. } => 2,
         }
     }
 
@@ -2507,7 +2521,10 @@ impl Node {
                 }
             }
 
-            Node::Mixer { gain, target_gain } => {
+            Node::Send {
+                gain, target_gain, ..
+            }
+            | Node::Mixer { gain, target_gain } => {
                 // Stereo sum: stereo inputs go L->L R->R; mono inputs are
                 // centered (same signal to both sides).
                 let r = out.r.as_deref_mut().unwrap_or(&mut []);
@@ -4281,6 +4298,19 @@ impl Node {
                     *target_gain = value;
                 }
             }
+            Node::Send {
+                target_gain,
+                param: wanted,
+                ..
+            } => {
+                // A send listens for ONE parameter of the section that
+                // owns it, and ignores the rest of that section's
+                // letters — which is what lets the tap live on the
+                // channel's OUT without being a device of its own.
+                if param == *wanted {
+                    *target_gain = (value * 0.01).clamp(0.0, 1.0);
+                }
+            }
             Node::Click { .. } => {}
             Node::Reverb {
                 core,
@@ -5524,6 +5554,12 @@ pub enum NodeSpec {
     Mixer {
         gain: f32,
     },
+    /// A tap into a return: a gain node that takes its amount from
+    /// `param` of the device it is registered under, as a percentage.
+    Send {
+        gain: f32,
+        param: u32,
+    },
     /// Metronome blip on every beat while the transport rolls.
     Click,
     /// An audio file streamed from disk and placed in musical time. Compile
@@ -6096,6 +6132,12 @@ impl GraphSpec {
     /// A pushed node, to finish after its neighbours exist — a voice's
     /// notes name the effects they lock, and the effects are pushed
     /// after the voice so the chain reads in signal order.
+    /// One node's spec, for a caller that built the graph and wants to
+    /// read back what it made.
+    pub fn node(&self, id: NodeId) -> Option<&NodeSpec> {
+        self.nodes.get(id.0)
+    }
+
     pub fn node_mut(&mut self, id: NodeId) -> Option<&mut NodeSpec> {
         self.nodes.get_mut(id.0)
     }
@@ -6511,6 +6553,11 @@ impl GraphSpec {
                     Some(NodeSpec::Mixer { gain }) => Node::Mixer {
                         gain: 0.0, // ramp in, same reasoning as sine amp
                         target_gain: *gain,
+                    },
+                    Some(NodeSpec::Send { gain, param }) => Node::Send {
+                        gain: 0.0, // ramp in, so a send never arrives as a click
+                        target_gain: *gain,
+                        param: *param,
                     },
                     Some(NodeSpec::Seq {
                         notes,

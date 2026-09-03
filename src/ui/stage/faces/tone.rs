@@ -136,7 +136,8 @@ pub(super) fn draw(face: &Face<'_>) {
     let piece = face.piece;
     let glass = face.glass;
     let selected = face.selected;
-    let phase = face.phase;
+    // Nothing on TONE runs on the beat: every figure on it is either a
+    // coefficient or a hand.
     let alpha = face.alpha;
     let edge = alpha.edge.color;
     let value = |param: u32| face.value(param);

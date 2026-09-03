@@ -73,7 +73,9 @@ pub use mixer::Reading;
 pub use sample::{Audition, SampleData};
 pub use scenes::Address;
 pub use transport::{Motion, Place, Transport};
-pub use vitals::{EngineState, Health, Stream};
+pub use vitals::{
+    BUS_METER, DESK_METERS, EngineState, Health, MIX_METER as MIX_RAIL_METER, RETURN_METER, Stream,
+};
 
 /// The calibration field. Big enough that a weak focus signal would let
 /// the eye lose the cursor — which is the point of the test.
@@ -1070,6 +1072,12 @@ impl Stage {
     /// keeps a per-block peak from flickering.
     pub fn set_levels(&mut self, tracks: &[Level], master: Level) {
         self.meters.follow(tracks, master, self.frame_dt);
+    }
+
+    /// The same, with what the desk's own rails measured: the four group
+    /// buses, the two returns and the mix, in the graph's slot order.
+    pub fn set_desk_levels(&mut self, tracks: &[Level], master: Level, desk: &[Level]) {
+        self.meters.follow_desk(tracks, master, desk, self.frame_dt);
     }
 
     /// Hand the stage what every section measured this frame, by the
@@ -6264,6 +6272,7 @@ impl Stage {
                 level: self.meters.master().level,
                 peak: self.meters.master().peak,
                 sends: [None; crate::sequencing::ReturnTrack::MAX],
+                send_letters: ['?'; crate::sequencing::ReturnTrack::MAX],
                 is_return: false,
             },
             design::px(design::space::SNUG),
@@ -6310,14 +6319,31 @@ impl Stage {
             let strip = mixer::strip_beneath(head, bottom, gap);
             mixer::draw(painter, strip, channel, inner, self.alphabet(), track as u8);
         }
-        // The returns, after the last shown track and before the master,
-        // as far as they fit: a return the strip has no column for is
-        // simply not drawn this frame rather than drawn over something.
+        // The returns stand NEXT TO THE MASTER, at the right-hand end of
+        // the desk where the sends are going, rather than after the last
+        // track where they would move every time a track is added. Laid
+        // right to left from the master so the order reads TAPE, SHADOW,
+        // MASTER however many tracks are shown.
         let master = Self::master_rect(field);
-        for (index, ret) in mixer::returns(&self.song).iter().enumerate() {
-            let head = Self::head_rect(field, shown + index);
-            if head.right() > master.left() - gap {
-                break;
+        let rails: Vec<mixer::Reading> = (0..self.song.console.aux.len())
+            .map(|index| self.meters.rail(vitals::RETURN_METER + index))
+            .collect();
+        let returns = mixer::returns(&self.song, &rails);
+        let column = TRACK_W + column_gap();
+        let last_track = Self::head_rect(field, shown.saturating_sub(1));
+        let mut placed: Vec<(usize, egui::Rect)> = Vec::new();
+        for (index, ret) in returns.iter().enumerate() {
+            let head = egui::Rect::from_min_size(
+                egui::pos2(
+                    master.left() - (returns.len() - index) as f32 * column,
+                    master.top(),
+                ),
+                master.size(),
+            );
+            // A return with no column left is not drawn this frame,
+            // rather than drawn over the tracks it would collide with.
+            if head.left() < last_track.right() + gap {
+                continue;
             }
             let variant = (8 + index) as u8;
             mixer::draw_return_head(painter, head, ret, self.alphabet(), variant);
@@ -6330,7 +6356,129 @@ impl Stage {
                 self.alphabet(),
                 variant,
             );
+            placed.push((index, strip));
         }
+        self.draw_send_loom(painter, field, bottom, gap, inner, &channels, &placed);
+    }
+
+    /// The send loom: the cable that makes a send a PATH rather than a
+    /// number on a strip.
+    ///
+    /// Every channel's send rail is the same rail — the one that runs to
+    /// that return — so the mixer stitches them together across the gaps
+    /// between the strips and carries the line on to the return's own
+    /// column. Each return keeps its colour, the same one the band's
+    /// loom uses, so a send followed by eye in one view is the same
+    /// send in the other. A segment leaving an open send is bright; one
+    /// leaving a closed send is the ghost of where it could go.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_send_loom(
+        &self,
+        painter: &egui::Painter,
+        field: egui::Rect,
+        bottom: f32,
+        gap: f32,
+        inner: f32,
+        channels: &[mixer::Channel],
+        returns: &[(usize, egui::Rect)],
+    ) {
+        let tracks = self.strip_window(field);
+        if tracks.is_empty() || returns.is_empty() {
+            return;
+        }
+        let alpha = self.alphabet();
+        let count = self
+            .song
+            .console
+            .aux
+            .len()
+            .min(crate::sequencing::ReturnTrack::MAX);
+        let strips: Vec<(usize, egui::Rect)> = tracks
+            .clone()
+            .enumerate()
+            .map(|(slot, track)| {
+                (
+                    track,
+                    mixer::strip_beneath(Self::head_rect(field, slot), bottom, gap),
+                )
+            })
+            .collect();
+        let mut shapes = Vec::new();
+        for (slot, ret_strip) in returns {
+            let Some(&ink) = RETURN_INK.get(*slot) else {
+                continue;
+            };
+            let y = strips
+                .first()
+                .map(|(_, strip)| mixer::send_y(*strip, inner, count, true, *slot));
+            let Some(y) = y else { continue };
+            // Across every gap between the strips, and on to the
+            // return's own column.
+            let mut runs: Vec<(f32, f32, f32)> = Vec::new();
+            for pair in strips.windows(2) {
+                let ((left_track, left), (_, right)) = (pair[0], pair[1]);
+                let open = channels
+                    .get(left_track)
+                    .and_then(|channel| channel.sends[*slot])
+                    .unwrap_or(0.0);
+                runs.push((left.right(), right.left(), open));
+            }
+            if let Some((last_track, last)) = strips.last() {
+                let open = channels
+                    .get(*last_track)
+                    .and_then(|channel| channel.sends[*slot])
+                    .unwrap_or(0.0);
+                runs.push((last.right(), ret_strip.left(), open));
+            }
+            for (from, to, open) in runs {
+                if to <= from {
+                    continue;
+                }
+                circuit::trace(
+                    &mut shapes,
+                    &[egui::pos2(from, y), egui::pos2(to, y)],
+                    Weight::Hair,
+                    tint(ink, 0.22 + 0.78 * open.clamp(0.0, 1.0)),
+                );
+            }
+            // Where each channel taps the line: a pad on its own mark,
+            // filled when it is sending.
+            for (track, strip) in &strips {
+                let Some(open) = channels
+                    .get(*track)
+                    .and_then(|channel| channel.sends[*slot])
+                else {
+                    continue;
+                };
+                circuit::pad(
+                    &mut shapes,
+                    egui::pos2(mixer::send_x(*strip, inner, open), y),
+                    circuit::PAD - 1.0,
+                    tint(ink, 0.3 + 0.7 * open),
+                    open > 0.005,
+                );
+            }
+            // And where it lands: the return's own column, tapped on its
+            // wall so the cable plainly arrives somewhere.
+            circuit::pad(
+                &mut shapes,
+                egui::pos2(ret_strip.left(), y),
+                circuit::PAD,
+                ink,
+                true,
+            );
+            circuit::trace(
+                &mut shapes,
+                &[
+                    egui::pos2(ret_strip.left(), y),
+                    egui::pos2(ret_strip.left() + 8.0, y),
+                ],
+                Weight::Heavy,
+                ink,
+            );
+        }
+        let _ = alpha;
+        painter.extend(shapes);
     }
 
     /// The scene lattice: one slot per (shown track, scene), stacked under

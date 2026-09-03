@@ -641,17 +641,28 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
         // nothing about that.
         let _ = stage.apply(StageIntent::NewInstrumentTrack);
         let _ = stage.apply(StageIntent::NewAudioTrack);
-        // Two returns, and a spread of sends, so the strips carry rails
-        // and the returns stand beside the tracks in their own casing.
+        // A spread of sends on the desk's own two returns, so the send
+        // loom is carrying something on every channel and the cable can
+        // be followed from a strip's rail across to TAPE and SHADOW.
         {
+            use daw::params::console::out as p;
+            let spread = [[35.0, 0.0], [0.0, 60.0], [80.0, 20.0]];
             let song = stage.song_mut();
-            let _ = song.add_return();
-            let _ = song.add_return();
-            song.returns[0].name = "hall".to_owned();
-            song.returns[1].name = "tape".to_owned();
-            song.tracks[0].sends = vec![0.35, 0.0];
-            song.tracks[1].sends = vec![0.0, 0.6];
-            song.tracks[2].sends = vec![0.8, 0.2];
+            let outs: Vec<_> = (0..song.tracks.len())
+                .filter_map(|track| {
+                    song.section(track, daw::console::SectionKind::Out)
+                        .map(|device| device.id)
+                })
+                .collect();
+            for (index, id) in outs.into_iter().enumerate() {
+                let Some(amounts) = spread.get(index) else {
+                    break;
+                };
+                if let Some(device) = song.device_mut(id) {
+                    device.set(p::SEND_TAPE, amounts[0]);
+                    device.set(p::SEND_SHADOW, amounts[1]);
+                }
+            }
         }
         let _ = stage.apply(StageIntent::Mix);
     } else if which.contains("sample") {

@@ -84,10 +84,14 @@ pub const BUS_METER_BASE: usize = 24;
 pub const RETURN_METER_BASE: usize = 28;
 pub const MIX_METER: usize = 30;
 
-/// The desk as nodes: where a channel's output goes, by bus.
+/// The desk as nodes: where a channel's output goes, by bus, and where
+/// its sends go.
 struct Desk {
     /// The first node of each group bus's rail.
     buses: Vec<NodeId>,
+    /// The first node of each return's rail, in the console's order:
+    /// TAPE, then SHADOW. A channel taps itself into these.
+    aux: Vec<NodeId>,
 }
 
 /// One rail — a bus, the mix, a return — as nodes: its sections in
@@ -138,14 +142,58 @@ fn desk(spec: &mut GraphSpec, song: &Song, nodes: &mut SongNodes, master: NodeId
         }
         buses.push(bus_in);
     }
-    for (index, aux) in song.console.aux.iter().enumerate() {
-        let (_, aux_out) = rail(spec, aux, nodes);
+    let mut aux = Vec::with_capacity(song.console.aux.len());
+    for (index, rail_of) in song.console.aux.iter().enumerate() {
+        let (aux_in, aux_out) = rail(spec, rail_of, nodes);
         spec.connect(aux_out, mix_in);
         if RETURN_METER_BASE + index < MIX_METER {
             spec.meter(RETURN_METER_BASE + index, aux_out);
         }
+        aux.push(aux_in);
     }
-    Desk { buses }
+    Desk { buses, aux }
+}
+
+/// The two parameters of OUT that are the sends, in the console's return
+/// order. A return past these has no send to it, which is the honest
+/// answer for a desk that has exactly two.
+const SEND_PARAMS: [u32; 2] = [
+    crate::params::console::out::SEND_TAPE,
+    crate::params::console::out::SEND_SHADOW,
+];
+
+/// Tap a channel into the returns.
+///
+/// A send is POST-FADER: `out` is the channel's pan-and-fader stage, so
+/// pulling a channel down pulls what it is sending with it, which is
+/// what a send on a desk does. The amount lives on the channel's own OUT
+/// section, where the hand set it, and the tap node is registered under
+/// that section's id — so the letter that carries a turn reaches the tap
+/// as well as the section, and moving a send is a letter rather than a
+/// recompile. A send at zero still builds its node: it ramps, so opening
+/// one is a fade rather than a click.
+fn sends(spec: &mut GraphSpec, track: &Track, out: NodeId, desk: &Desk, nodes: &mut SongNodes) {
+    let Some(section) = track
+        .strip
+        .iter()
+        .find(|device| device.kind == DeviceKind::Console(crate::console::SectionKind::Out))
+    else {
+        return;
+    };
+    for (index, aux_in) in desk.aux.iter().enumerate() {
+        let Some(param) = SEND_PARAMS.get(index).copied() else {
+            break;
+        };
+        let node = spec.push(NodeSpec::Send {
+            gain: (section.value(param) * 0.01).clamp(0.0, 1.0),
+            param,
+        });
+        spec.connect(out, node);
+        spec.connect(node, *aux_in);
+        // The tap answers to the section's letters, and takes no
+        // telemetry slot: it has nothing of its own to report.
+        nodes.devices.push((section.id, node));
+    }
 }
 
 /// The bus a track's output lands on: its own, or the last one when
@@ -267,6 +315,7 @@ pub fn build(song: &Song, playing: &[Option<usize>]) -> (GraphSpec, SongNodes) {
         spec.connect(tail, out);
         // Into the desk: the channel's bus, never the master directly.
         spec.connect(out, bus_of(&desk, track, master));
+        sends(&mut spec, track, out, &desk, &mut nodes);
         nodes.outputs[index] = Some(out);
 
         if index < TRACK_METERS {
@@ -585,6 +634,7 @@ pub fn build_song(song: &Song) -> (GraphSpec, SongNodes) {
             spec.connect(node, out);
         }
         spec.connect(out, bus_of(&desk, track, master));
+        sends(&mut spec, track, out, &desk, &mut nodes);
         nodes.outputs[index] = Some(out);
         if index < TRACK_METERS {
             spec.meter(index, out);
@@ -726,6 +776,55 @@ fn notes_of(song: &Song, pattern: &Pattern, effects: &[(DeviceId, NodeId)]) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A send is a real path, not a number on a card: opening one on a
+    /// channel's OUT puts that channel into the return's rail, and the
+    /// return lands in the mix. Closed, the tap is still built — it
+    /// ramps, so opening one is a fade rather than a click.
+    #[test]
+    fn a_send_taps_the_channel_into_its_return() {
+        use crate::console::SectionKind;
+        use crate::params::console::out as p;
+        let mut song = song_with_a_clip();
+        let track = 0;
+        let out = song
+            .section(track, SectionKind::Out)
+            .expect("every channel has an out")
+            .id;
+        // Closed: the taps exist, and they are the OUT section's.
+        let (_, nodes) = build(&song, &playing(&song));
+        let taps = nodes.devices.iter().filter(|(id, _)| *id == out).count();
+        assert_eq!(
+            taps,
+            1 + song.console.aux.len(),
+            "the OUT section and one tap per return"
+        );
+        // Every tap has exactly one telemetry slot between them all:
+        // the section reports, the taps have nothing of their own.
+        assert_eq!(
+            nodes.telemetry.iter().filter(|(id, _)| *id == out).count(),
+            1
+        );
+        // Opened: the tap's gain is the amount the hand set.
+        if let Some(device) = song.device_mut(out) {
+            device.set(p::SEND_TAPE, 50.0);
+        }
+        let (spec, nodes) = build(&song, &playing(&song));
+        let opened: Vec<f32> = nodes
+            .devices
+            .iter()
+            .filter(|(id, _)| *id == out)
+            .filter_map(|(_, node)| match spec.node(*node) {
+                Some(NodeSpec::Send { gain, param }) if *param == p::SEND_TAPE => Some(*gain),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(opened.len(), 1, "one tape tap on this channel");
+        assert!(
+            (opened[0] - 0.5).abs() < 0.001,
+            "the send did not reach its tap: {opened:?}"
+        );
+    }
     use crate::sequencing::{Note, Scene, Slot, TrackKind};
 
     /// A song with one instrument track holding one pattern, and a scene
@@ -838,7 +937,14 @@ mod tests {
         let song = song_with_a_clip();
         for (spec, nodes) in [build(&song, &playing(&song)), build_song(&song)] {
             let _ = spec;
-            assert_eq!(nodes.telemetry.len(), nodes.devices.len());
+            // A device reports once. `devices` may hold a device more
+            // than once — a channel's OUT owns its send taps as well as
+            // its own node, so a letter reaches all of them — so the
+            // count to match is DISTINCT devices, not table entries.
+            let mut addressed: Vec<u64> = nodes.devices.iter().map(|(id, _)| id.0).collect();
+            addressed.sort_unstable();
+            addressed.dedup();
+            assert_eq!(nodes.telemetry.len(), addressed.len());
             let mut slots: Vec<usize> = nodes.telemetry.iter().map(|(_, slot)| *slot).collect();
             slots.sort_unstable();
             slots.dedup();

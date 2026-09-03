@@ -89,6 +89,11 @@ pub struct Channel {
     /// returns, so a strip draws exactly as many rails as there are
     /// places to send to.
     pub sends: [Option<f32>; ReturnTrack::MAX],
+    /// What each of those returns is called, by its first letter. The
+    /// desk's returns are named, not lettered, so a rail says T and S
+    /// rather than A and B — the letter on the rail and the letter on
+    /// the return's head are the same letter.
+    pub send_letters: [char; ReturnTrack::MAX],
     /// Whether this channel IS a return — a place sends arrive rather
     /// than a track that plays. Drawn in its own casing so the two are
     /// never mistaken, and with no solo, because a return has none.
@@ -117,6 +122,32 @@ pub struct Reading {
     pub peak: Level,
 }
 
+/// The console's two sends, as OUT carries them, 0..1. A track whose
+/// OUT is missing sends nothing, which cannot happen to a furnished song
+/// and is the honest answer if it ever did.
+fn console_sends(
+    song: &Song,
+    track: usize,
+) -> ([Option<f32>; ReturnTrack::MAX], [char; ReturnTrack::MAX]) {
+    use crate::params::console::out as p;
+    let mut sends = [None; ReturnTrack::MAX];
+    let mut letters = ['?'; ReturnTrack::MAX];
+    let Some(out) = song.section(track, crate::console::SectionKind::Out) else {
+        return (sends, letters);
+    };
+    for (slot, param) in [p::SEND_TAPE, p::SEND_SHADOW].into_iter().enumerate() {
+        let Some(rail) = song.console.aux.get(slot) else {
+            break;
+        };
+        if slot >= ReturnTrack::MAX {
+            break;
+        }
+        sends[slot] = Some((out.value(param) * 0.01).clamp(0.0, 1.0));
+        letters[slot] = rail.name.chars().next().unwrap_or('R');
+    }
+    (sends, letters)
+}
+
 /// Every track as a channel, in the song's own order.
 pub fn channels(song: &Song, readings: &[Reading]) -> Vec<Channel> {
     song.tracks
@@ -124,10 +155,7 @@ pub fn channels(song: &Song, readings: &[Reading]) -> Vec<Channel> {
         .enumerate()
         .map(|(index, track)| {
             let reading = readings.get(index).copied().unwrap_or_default();
-            let mut sends = [None; ReturnTrack::MAX];
-            for (slot, send) in sends.iter_mut().enumerate().take(song.returns.len()) {
-                *send = Some(track.send(slot));
-            }
+            let (sends, send_letters) = console_sends(song, index);
             Channel {
                 gain: track.volume,
                 pan: track.pan,
@@ -138,36 +166,68 @@ pub fn channels(song: &Song, readings: &[Reading]) -> Vec<Channel> {
                 level: reading.level,
                 peak: reading.peak,
                 sends,
+                send_letters,
                 is_return: false,
             }
         })
         .collect()
 }
 
-/// Every return as a channel, lettered in the song's own order. A
-/// return has no meter of its own yet — the engine reports tracks and
-/// the master — so its bar reads silence, honestly.
-pub fn returns(song: &Song) -> Vec<Return> {
-    song.returns
+/// The console's returns as channels: TAPE and SHADOW, in the desk's
+/// own order, each with what its rail measured.
+///
+/// These are the desk's returns rather than the legacy send tracks: the
+/// place the two sends actually land, with a whole section on each and
+/// a meter of its own. A return has no solo — there is nothing to solo
+/// it against — and it is drawn in its own casing so a destination is
+/// never mistaken for a source.
+pub fn returns(song: &Song, rails: &[Reading]) -> Vec<Return> {
+    song.console
+        .aux
         .iter()
         .enumerate()
-        .map(|(index, ret)| Return {
-            letter: ReturnTrack::letter(index),
-            name: ret.name.clone(),
-            channel: Channel {
-                gain: ret.volume,
-                pan: ret.pan,
-                muted: ret.mute,
-                soloed: false,
-                audible: !ret.mute,
-                switches: true,
-                level: Level::default(),
-                peak: Level::default(),
-                sends: [None; ReturnTrack::MAX],
-                is_return: true,
-            },
+        .map(|(index, rail)| {
+            let reading = rails.get(index).copied().unwrap_or_default();
+            Return {
+                letter: rail.name.chars().next().unwrap_or('R'),
+                name: rail.name.clone(),
+                channel: Channel {
+                    gain: rail.volume,
+                    pan: rail.pan,
+                    muted: false,
+                    soloed: false,
+                    audible: true,
+                    switches: false,
+                    level: reading.level,
+                    peak: reading.peak,
+                    sends: [None; ReturnTrack::MAX],
+                    send_letters: ['?'; ReturnTrack::MAX],
+                    is_return: true,
+                },
+            }
         })
         .collect()
+}
+
+/// Where a send's rail runs inside a strip.
+///
+/// The mixer draws the cable that leaves it, and the cable must land on
+/// the rail rather than near it — so the one piece of arithmetic that
+/// places the rail is shared rather than repeated.
+pub fn send_y(strip: egui::Rect, gap: f32, sends: usize, switches: bool, slot: usize) -> f32 {
+    let inner = strip.shrink(gap.max(3.0));
+    let pan_top = inner.max.y - PAN_H;
+    let switch_h = if switches { SWITCH_H + gap } else { 0.0 };
+    let sends_top = pan_top - switch_h - (sends as f32 * SEND_H + gap);
+    sends_top + slot as f32 * SEND_H + SEND_H * 0.5
+}
+
+/// Where the send's mark stands on that rail, across the strip.
+pub fn send_x(strip: egui::Rect, gap: f32, send: f32) -> f32 {
+    let inner = strip.shrink(gap.max(3.0));
+    let left = inner.min.x + 16.0;
+    let right = inner.max.x - 4.0;
+    left + send.clamp(0.0, 1.0) * (right - left)
 }
 
 /// One send's rail: the letter, the rail, and the mark on it.
@@ -520,7 +580,7 @@ fn draw_sends(
             egui::pos2(zone.min.x + 2.0, y),
             egui::Align2::LEFT_CENTER,
             block::unit::MICRO,
-            &ReturnTrack::letter(slot).to_string(),
+            &channel.send_letters[slot].to_string(),
             alpha.edge.color,
         );
         let left = egui::pos2(zone.min.x + 16.0, y);
@@ -896,40 +956,93 @@ mod tests {
         assert_eq!(pan_label(1.0), "R100");
     }
 
-    /// A channel carries one send per return the song has and none past
-    /// them; a return is a channel of its own, marked as one, with no
-    /// sends and no solo, lettered in order.
+    /// A channel's sends are the ones the DESK has: the two the
+    /// console's OUT section carries, to TAPE and to SHADOW. A return is
+    /// a channel of its own, marked as one, with no sends of its own and
+    /// no solo — there is nothing to solo a destination against.
     #[test]
-    fn sends_follow_the_returns_and_a_return_is_marked_as_one() {
+    fn the_sends_are_the_desks_own_and_a_return_is_marked_as_one() {
+        use crate::params::console::out as p;
         let mut song = Song::default();
-        assert!(channels(&song, &[])[0].sends.iter().all(Option::is_none));
-        assert!(returns(&song).is_empty());
-
-        song.add_return();
-        song.add_return();
-        song.returns[1].name = "tape".to_owned();
-        song.returns[1].mute = true;
-        song.tracks[0].sends = vec![0.35];
+        song.furnish();
         let channel = channels(&song, &[])[0];
-        assert_eq!(channel.sends[0], Some(0.35));
         assert_eq!(
-            channel.sends[1],
+            channel.sends[0],
             Some(0.0),
-            "a send unset is not a send absent"
+            "a send at rest is a send present"
         );
-        assert_eq!(channel.sends[2], None, "a send past the returns");
+        assert_eq!(channel.sends[1], Some(0.0));
+        assert_eq!(channel.sends[2], None, "a send past the desk's returns");
         assert!(!channel.is_return);
 
-        let returns = returns(&song);
-        assert_eq!(returns.len(), 2);
-        assert_eq!(returns[0].letter, 'A');
-        assert_eq!(returns[1].letter, 'B');
-        assert_eq!(returns[1].name, "tape");
-        assert!(returns[1].channel.is_return);
-        assert!(returns[1].channel.muted);
-        assert!(!returns[1].channel.audible);
-        assert!(!returns[1].channel.soloed);
-        assert!(returns[1].channel.sends.iter().all(Option::is_none));
+        // Opening a send on the channel's OUT is what the strip shows.
+        let out = song
+            .section(0, crate::console::SectionKind::Out)
+            .expect("every channel has an out")
+            .id;
+        if let Some(device) = song.device_mut(out) {
+            device.set(p::SEND_TAPE, 35.0);
+        }
+        assert_eq!(channels(&song, &[])[0].sends[0], Some(0.35));
+
+        let rails = [Reading::default(); 2];
+        let aux = returns(&song, &rails);
+        assert_eq!(aux.len(), 2);
+        assert_eq!(aux[0].name, "TAPE");
+        assert_eq!(aux[1].name, "SHADOW");
+        assert_eq!(aux[0].letter, 'T');
+        assert_eq!(aux[1].letter, 'S');
+        for ret in &aux {
+            assert!(ret.channel.is_return);
+            assert!(!ret.channel.soloed);
+            assert!(!ret.channel.switches, "a return has nothing to mute it");
+            assert!(ret.channel.sends.iter().all(Option::is_none));
+        }
+
+        // A return's meter is its rail's, not a guess.
+        let heard = returns(
+            &song,
+            &[
+                Reading {
+                    level: Level {
+                        left: 0.5,
+                        right: 0.25,
+                    },
+                    peak: Level {
+                        left: 0.6,
+                        right: 0.3,
+                    },
+                },
+                Reading::default(),
+            ],
+        );
+        assert_eq!(heard[0].channel.level.left, 0.5);
+        assert_eq!(heard[0].channel.peak.right, 0.3);
+        assert_eq!(heard[1].channel.level, Level::default());
+    }
+
+    /// The cable that leaves a send lands ON its rail, and the mark it
+    /// carries stands where the amount says — which is the whole reason
+    /// the arithmetic is shared rather than repeated.
+    #[test]
+    fn the_send_cable_lands_on_the_rail_it_leaves() {
+        let strip = egui::Rect::from_min_size(egui::pos2(40.0, 80.0), egui::vec2(96.0, 300.0));
+        let gap = 8.0;
+        let first = send_y(strip, gap, 2, true, 0);
+        let second = send_y(strip, gap, 2, true, 1);
+        assert!(second > first, "the second rail is under the first");
+        assert!((second - first - SEND_H).abs() < 0.01);
+        assert!(first > strip.top() && first < strip.bottom());
+        assert!(second > strip.top() && second < strip.bottom());
+        // A switchless strip — a return — puts its rails lower, because
+        // it has no switch row above the pan to make room for.
+        assert!(send_y(strip, gap, 2, false, 0) > first);
+        // The mark travels the whole rail and never leaves the strip.
+        let shut = send_x(strip, gap, 0.0);
+        let open = send_x(strip, gap, 1.0);
+        assert!(open > shut + 40.0, "the mark barely moved");
+        assert!(shut > strip.left() && open < strip.right());
+        assert_eq!(send_x(strip, gap, 2.0), open, "an amount past full clamps");
     }
 
     #[test]

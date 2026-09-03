@@ -168,11 +168,22 @@ impl Vitals {
     }
 }
 
-/// The meters: one pair of ballistics per track, and one for the master.
+/// How many of the desk's own rails carry a meter: the four group
+/// buses, the two returns, and the mix. In the graph's own slot order,
+/// so the host hands them over as one run.
+pub const DESK_METERS: usize = 7;
+/// Where each rail stands in that run.
+pub const BUS_METER: usize = 0;
+pub const RETURN_METER: usize = 4;
+pub const MIX_METER: usize = 6;
+
+/// The meters: one pair of ballistics per track, one for the master,
+/// and one for each of the desk's own rails.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Meters {
     tracks: Vec<[Ballistics; 2]>,
     master: [Ballistics; 2],
+    desk: [[Ballistics; 2]; DESK_METERS],
 }
 
 impl Meters {
@@ -181,11 +192,22 @@ impl Meters {
     /// `raw` reads silence, and a track that has gone takes its meter
     /// with it.
     pub fn follow(&mut self, raw: &[Level], master: Level, dt: f32) {
+        self.follow_desk(raw, master, &[], dt);
+    }
+
+    /// The same, with what the desk's own rails measured: the four group
+    /// buses, the two returns and the mix, in the graph's slot order. A
+    /// rail the caller has nothing for reads silence, which is the truth
+    /// about a desk with no engine behind it.
+    pub fn follow_desk(&mut self, raw: &[Level], master: Level, desk: &[Level], dt: f32) {
         self.tracks.resize(raw.len(), [Ballistics::default(); 2]);
         for (pair, level) in self.tracks.iter_mut().zip(raw) {
             advance(pair, *level, dt);
         }
         advance(&mut self.master, master, dt);
+        for (index, pair) in self.desk.iter_mut().enumerate() {
+            advance(pair, desk.get(index).copied().unwrap_or_default(), dt);
+        }
     }
 
     /// Every track's meter as the strip draws it.
@@ -201,12 +223,19 @@ impl Meters {
         reading(&self.master)
     }
 
+    /// One of the desk's own rails, by its place in the run. Silence for
+    /// a rail past the end, so a caller cannot index out of the desk.
+    pub fn rail(&self, index: usize) -> Reading {
+        self.desk.get(index).map(reading).unwrap_or_default()
+    }
+
     /// Whether any meter is still falling. A stage at rest need not
     /// repaint for its meters.
     pub fn moving(&self) -> bool {
         self.tracks
             .iter()
             .chain(std::iter::once(&self.master))
+            .chain(self.desk.iter())
             .flatten()
             .any(Ballistics::moving)
     }

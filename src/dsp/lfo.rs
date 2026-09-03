@@ -94,6 +94,16 @@ impl Lfo {
         self.phase = 0;
     }
 
+    /// Where the cycle stands, in turns, 0..1.
+    ///
+    /// The inverse of [`set_phase`](Self::set_phase), for telemetry: a
+    /// surface that wants to draw the modulator's own wheel needs the
+    /// ANGLE, which the bipolar output cannot give it — a sine reads the
+    /// same value twice a cycle. Pure arithmetic on state already held.
+    pub fn phase_turns(&self) -> f32 {
+        self.phase as f32 / (u32::MAX as f32 + 1.0)
+    }
+
     /// Red zone: write one bipolar modulation value for each output sample.
     pub fn process(&mut self, out: &mut [f32]) {
         for sample in out.iter_mut() {

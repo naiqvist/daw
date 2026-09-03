@@ -584,7 +584,19 @@ impl Audio {
             left: snapshot.track_peaks_l[MASTER_METER],
             right: snapshot.track_peaks_r[MASTER_METER],
         };
-        stage.set_levels(&self.levels, master);
+        // The desk's own rails, in the graph's slot order: the four
+        // group buses, the two returns, then the mix.
+        let mut desk = [Level::default(); daw::ui::stage::DESK_METERS];
+        for (index, level) in desk.iter_mut().enumerate() {
+            let slot = daw::song_graph::BUS_METER_BASE + index;
+            if slot < snapshot.track_peaks_l.len() {
+                *level = Level {
+                    left: snapshot.track_peaks_l[slot],
+                    right: snapshot.track_peaks_r[slot],
+                };
+            }
+        }
+        stage.set_desk_levels(&self.levels, master, &desk);
         // The console's telemetry: every section's own figures, by the
         // device the card draws.
         self.telemetry.clear();
