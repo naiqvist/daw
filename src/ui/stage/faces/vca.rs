@@ -151,7 +151,12 @@ pub(super) fn draw(face: &Face<'_>) {
         Weight::Heavy,
         tool::mix_ink(ink, face.focus(), face.lit(p::THRESHOLD)),
     );
-    tool::halo(&mut shapes, lay.threshold, face.lit(p::THRESHOLD), face.focus());
+    tool::halo(
+        &mut shapes,
+        lay.threshold,
+        face.lit(p::THRESHOLD),
+        face.focus(),
+    );
 
     // SC HP: a wedge under the columns that closes as the filter climbs,
     // drawn where the signal it removes would have been.
@@ -181,7 +186,13 @@ pub(super) fn draw(face: &Face<'_>) {
         (said.reduction_db.abs() / VICE_FULL_DB).clamp(0.0, 1.0),
         0.5,
     );
-    tool::iris(&mut shapes, lay.vice, 1.0 - gain, tool::fade(ink, 0.75), edge);
+    tool::iris(
+        &mut shapes,
+        lay.vice,
+        1.0 - gain,
+        tool::fade(ink, 0.75),
+        edge,
+    );
     // The peak hold: a hairline where the jaws got to at their closest.
     let mark = egui::lerp(
         lay.vice.center().y..=lay.vice.top() + 1.0,

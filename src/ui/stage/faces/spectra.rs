@@ -50,10 +50,8 @@ impl Layout for Lay {
 fn lay(glass: egui::Rect, bay: Option<egui::Rect>, plinth: Option<egui::Rect>) -> Lay {
     let inner = glass.shrink2(egui::vec2(5.0, 4.0));
     let (w, h) = (inner.width(), inner.height());
-    let field = egui::Rect::from_min_max(
-        inner.min,
-        egui::pos2(inner.right(), inner.top() + 0.46 * h),
-    );
+    let field =
+        egui::Rect::from_min_max(inner.min, egui::pos2(inner.right(), inner.top() + 0.46 * h));
     let row = |top: f32, from: f32, to: f32| {
         egui::Rect::from_min_max(
             egui::pos2(inner.left() + w * from, top),
@@ -86,10 +84,7 @@ fn rake(field: egui::Rect, centre: f32, spread: f32, semitones: f32) -> (f32, f3
     // out as it climbs, exactly as the vocoder's own bins do.
     let shifted = (centre * 2f32.powf(semitones / 12.0)).clamp(0.0, 1.0);
     let width = (spread * 2f32.powf(semitones / 12.0)).clamp(0.01, 1.0);
-    (
-        egui::lerp(field.x_range(), shifted),
-        field.width() * width,
-    )
+    (egui::lerp(field.x_range(), shifted), field.width() * width)
 }
 
 pub(super) fn draw(face: &Face<'_>) {
@@ -168,7 +163,11 @@ pub(super) fn draw(face: &Face<'_>) {
                 egui::pos2(x, field.bottom()),
                 egui::pos2(x, field.bottom() - tooth),
             ],
-            if flux > 0.25 { Weight::Heavy } else { Weight::Hair },
+            if flux > 0.25 {
+                Weight::Heavy
+            } else {
+                Weight::Hair
+            },
             tool::mix_ink(tool::fade(ink, 0.55), face.live(), flux),
         );
     }
@@ -176,10 +175,7 @@ pub(super) fn draw(face: &Face<'_>) {
     // either side of it.
     circuit::trace(
         &mut shapes,
-        &[
-            egui::pos2(at, field.top()),
-            egui::pos2(at, field.bottom()),
-        ],
+        &[egui::pos2(at, field.top()), egui::pos2(at, field.bottom())],
         Weight::Heavy,
         tool::mix_ink(face.live(), face.focus(), face.lit(p::PITCH)),
     );

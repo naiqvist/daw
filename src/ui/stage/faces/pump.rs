@@ -76,7 +76,11 @@ fn lobe(t: f32, lobes: usize, depth: f32, shape: f32, hold: f32) -> f32 {
     // The dwell: the lobe sits at its peak for this share of a turn.
     let dwell = hold.clamp(0.0, 0.9);
     let run = (1.0 - dwell).max(1e-3);
-    let x = if phase < dwell { 0.0 } else { (phase - dwell) / run };
+    let x = if phase < dwell {
+        0.0
+    } else {
+        (phase - dwell) / run
+    };
     // Square at one end of SHAPE, a raised cosine at the other.
     let soft = 0.5 - 0.5 * (x * core::f32::consts::TAU).cos();
     let hard = if x < 0.5 { 0.0 } else { 1.0 };
@@ -119,7 +123,10 @@ pub(super) fn draw(face: &Face<'_>) {
     // The keyway: one mark on the disc, so the turning is visible.
     circuit::trace(
         &mut shapes,
-        &[centre, tool::on_arc(centre, radius * 0.5, 90.0 - turn * 360.0)],
+        &[
+            centre,
+            tool::on_arc(centre, radius * 0.5, 90.0 - turn * 360.0),
+        ],
         Weight::Hair,
         tool::fade(edge, 1.1),
     );
@@ -174,10 +181,7 @@ pub(super) fn draw(face: &Face<'_>) {
 
     // DEPTH, SHAPE and HOLD, each drawn as what it does to the lobe:
     // how deep it cuts, how square it is, how long it dwells.
-    for (rect, param, value) in [
-        (lay.depth, p::DEPTH, depth),
-        (lay.shape, p::SHAPE, shape),
-    ] {
+    for (rect, param, value) in [(lay.depth, p::DEPTH, depth), (lay.shape, p::SHAPE, shape)] {
         tool::slider(
             &mut shapes,
             rect.shrink2(egui::vec2(4.0, 4.0)),

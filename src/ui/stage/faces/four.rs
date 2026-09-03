@@ -314,11 +314,17 @@ mod tests {
         let mut boosted = SectionParams::of(SectionKind::Four);
         boosted.set(p::LMF_DB, 12.0);
         let (_, up) = laid(&boosted);
-        assert!(up.gain[1].center().y < flat.gain[1].center().y, "a boost sank");
+        assert!(
+            up.gain[1].center().y < flat.gain[1].center().y,
+            "a boost sank"
+        );
         let mut cut = SectionParams::of(SectionKind::Four);
         cut.set(p::LMF_DB, -12.0);
         let (_, down) = laid(&cut);
-        assert!(down.gain[1].center().y > flat.gain[1].center().y, "a cut rose");
+        assert!(
+            down.gain[1].center().y > flat.gain[1].center().y,
+            "a cut rose"
+        );
         // And sweeping an arm walks it along the spectrum.
         let mut swept = SectionParams::of(SectionKind::Four);
         swept.set(p::LMF_HZ, 1_800.0);

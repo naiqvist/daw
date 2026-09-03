@@ -117,10 +117,7 @@ pub(super) fn draw(face: &Face<'_>) {
     ));
     circuit::trace(
         &mut shapes,
-        &[
-            egui::pos2(lay.plate.left(), lay.prism.y - 12.0),
-            lay.prism,
-        ],
+        &[egui::pos2(lay.plate.left(), lay.prism.y - 12.0), lay.prism],
         Weight::Hair,
         face.live(),
     );

@@ -92,7 +92,10 @@ pub(super) fn draw(face: &Face<'_>) {
         let t = (i as f32 + 0.5) / BUCKETS as f32;
         let cell = egui::Rect::from_min_max(
             egui::pos2(line.left() + pitch * i as f32 + 1.0, line.center().y - 5.0),
-            egui::pos2(line.left() + pitch * (i as f32 + 1.0) - 1.0, line.center().y + 5.0),
+            egui::pos2(
+                line.left() + pitch * (i as f32 + 1.0) - 1.0,
+                line.center().y + 5.0,
+            ),
         );
         if cell.is_positive() {
             circuit::trace(

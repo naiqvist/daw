@@ -137,10 +137,7 @@ pub(super) fn draw(face: &Face<'_>) {
         }
         circuit::trace(
             &mut shapes,
-            &[
-                egui::pos2(x, field.top()),
-                egui::pos2(x, field.bottom()),
-            ],
+            &[egui::pos2(x, field.top()), egui::pos2(x, field.bottom())],
             Weight::Heavy,
             ink,
         );
@@ -180,7 +177,12 @@ pub(super) fn draw(face: &Face<'_>) {
             tool::mix_ink(ink, face.hot(), ring),
             ring > 0.02,
         );
-        tool::halo(&mut shapes, lay.controls()[index * 2 + 1].1, face.lit(param), face.focus());
+        tool::halo(
+            &mut shapes,
+            lay.controls()[index * 2 + 1].1,
+            face.lit(param),
+            face.focus(),
+        );
     }
 
     // CRUNCH: the heat in the slit, drawn as a bar that fills with what
@@ -225,7 +227,6 @@ pub(super) fn draw(face: &Face<'_>) {
     );
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,7 +265,10 @@ mod tests {
         let (_, narrow) = laid(900.0, 1_100.0);
         let open = (wide.lp.center().x - wide.hp.center().x).abs();
         let shut = (narrow.lp.center().x - narrow.hp.center().x).abs();
-        assert!(open > shut + 60.0, "the slit did not close: {open} to {shut}");
+        assert!(
+            open > shut + 60.0,
+            "the slit did not close: {open} to {shut}"
+        );
         let (_, raised) = laid(2_000.0, 20_000.0);
         assert!(raised.hp.center().x > wide.hp.center().x);
         assert!((narrow.hp_res.center().x - narrow.hp.center().x).abs() < 0.01);

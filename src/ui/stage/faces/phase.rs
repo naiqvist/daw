@@ -44,10 +44,8 @@ impl Layout for Lay {
 fn lay(glass: egui::Rect, bay: Option<egui::Rect>, plinth: Option<egui::Rect>) -> Lay {
     let inner = glass.shrink2(egui::vec2(5.0, 4.0));
     let (w, h) = (inner.width(), inner.height());
-    let field = egui::Rect::from_min_max(
-        inner.min,
-        egui::pos2(inner.right(), inner.top() + 0.58 * h),
-    );
+    let field =
+        egui::Rect::from_min_max(inner.min, egui::pos2(inner.right(), inner.top() + 0.58 * h));
     let row = |top: f32, from: f32, to: f32| {
         egui::Rect::from_min_max(
             egui::pos2(inner.left() + w * from, top),
@@ -140,15 +138,18 @@ pub(super) fn draw(face: &Face<'_>) {
             let reach = bite * (0.35 + 0.65 * (t * core::f32::consts::PI).sin());
             circuit::trace(
                 &mut shapes,
-                &[
-                    egui::pos2(x, spine),
-                    egui::pos2(x, spine + dir * reach),
-                ],
+                &[egui::pos2(x, spine), egui::pos2(x, spine + dir * reach)],
                 Weight::Hair,
                 tool::fade(hue, 0.55 + 0.45 * fb.abs()),
             );
         }
-        circuit::pad(&mut shapes, egui::pos2(left, spine), circuit::PAD - 2.0, hue, true);
+        circuit::pad(
+            &mut shapes,
+            egui::pos2(left, spine),
+            circuit::PAD - 2.0,
+            hue,
+            true,
+        );
     }
     tool::halo(&mut shapes, lay.depth, face.lit(p::DEPTH), face.focus());
 
@@ -196,7 +197,12 @@ pub(super) fn draw(face: &Face<'_>) {
         tool::mix_ink(ink, face.focus(), face.lit(p::FEEDBACK)),
         tool::fade(edge, 0.6),
     );
-    tool::halo(&mut shapes, lay.feedback, face.lit(p::FEEDBACK), face.focus());
+    tool::halo(
+        &mut shapes,
+        lay.feedback,
+        face.lit(p::FEEDBACK),
+        face.focus(),
+    );
 
     // OFFSET: the two sides' cycles, drawn as two hands on one dial.
     // Nothing else on the desk says what a degree of stereo offset is
@@ -281,7 +287,10 @@ mod tests {
         let low = crate::params::console::phase::LOW_HZ;
         let high = crate::params::console::phase::HIGH_HZ;
         let at = |sweep: f32, depth: f32| {
-            tool::octave_x(lay.field, low * (high / low).powf((sweep * 0.5 + 0.5) * depth))
+            tool::octave_x(
+                lay.field,
+                low * (high / low).powf((sweep * 0.5 + 0.5) * depth),
+            )
         };
         // Flat: the comb stands still at the bottom corner.
         assert!((at(-1.0, 0.0) - at(1.0, 0.0)).abs() < 0.01);

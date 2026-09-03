@@ -153,10 +153,7 @@ pub(super) fn draw(face: &Face<'_>) {
         let x = time_x(field, age.min(SPAN_MS));
         circuit::trace(
             &mut shapes,
-            &[
-                egui::pos2(x, field.top()),
-                egui::pos2(x, field.bottom()),
-            ],
+            &[egui::pos2(x, field.top()), egui::pos2(x, field.bottom())],
             Weight::Hair,
             tool::fade(
                 face.live(),
@@ -221,7 +218,10 @@ mod tests {
             egui::vec2(strip::width_of(SectionKind::Smear), 250.0),
         );
         let glass = strip::recess_of(piece, SectionKind::Smear).shrink(3.0);
-        (piece, lay(glass, strip::bay_rect(piece, SectionKind::Smear)))
+        (
+            piece,
+            lay(glass, strip::bay_rect(piece, SectionKind::Smear)),
+        )
     }
 
     #[test]

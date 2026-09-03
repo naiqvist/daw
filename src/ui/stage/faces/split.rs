@@ -52,14 +52,8 @@ impl Layout for Lay {
 fn lay(glass: egui::Rect, params: &SectionParams) -> Lay {
     let inner = glass.shrink2(egui::vec2(5.0, 4.0));
     let rail_h = 13.0;
-    let rail = egui::Rect::from_min_max(
-        inner.min,
-        egui::pos2(inner.right(), inner.top() + rail_h),
-    );
-    let field = egui::Rect::from_min_max(
-        egui::pos2(inner.left(), rail.bottom() + 4.0),
-        inner.max,
-    );
+    let rail = egui::Rect::from_min_max(inner.min, egui::pos2(inner.right(), inner.top() + rail_h));
+    let field = egui::Rect::from_min_max(egui::pos2(inner.left(), rail.bottom() + 4.0), inner.max);
     let seam = |hz: f32| {
         let x = tool::octave_x(rail, hz).clamp(rail.left() + 7.0, rail.right() - 7.0);
         egui::Rect::from_min_max(
@@ -110,7 +104,12 @@ pub(super) fn draw(face: &Face<'_>) {
         egui::pos2(lay.field.left(), lay.field.top() - 17.0),
         egui::pos2(lay.field.right(), lay.field.top() - 4.0),
     );
-    let cuts = [rail.left(), lay.low_hz.center().x, lay.high_hz.center().x, rail.right()];
+    let cuts = [
+        rail.left(),
+        lay.low_hz.center().x,
+        lay.high_hz.center().x,
+        rail.right(),
+    ];
     for band in 0..3 {
         let zone = egui::Rect::from_min_max(
             egui::pos2(cuts[band], rail.top()),
@@ -135,7 +134,13 @@ pub(super) fn draw(face: &Face<'_>) {
             Weight::Hair,
             tool::mix_ink(tool::fade(edge, 0.7), face.focus(), face.lit(param)),
         );
-        circuit::pad(&mut shapes, egui::pos2(x, rail.center().y), circuit::PAD, ink, true);
+        circuit::pad(
+            &mut shapes,
+            egui::pos2(x, rail.center().y),
+            circuit::PAD,
+            ink,
+            true,
+        );
         tool::halo(&mut shapes, rect, face.lit(param), face.focus());
     }
 
@@ -157,10 +162,7 @@ pub(super) fn draw(face: &Face<'_>) {
         let exit = y - applied * BEND;
         circuit::trace(
             &mut shapes,
-            &[
-                egui::pos2(lay.field.left(), y),
-                egui::pos2(lens.left(), y),
-            ],
+            &[egui::pos2(lay.field.left(), y), egui::pos2(lens.left(), y)],
             Weight::Hair,
             tool::fade(hue, 0.55),
         );

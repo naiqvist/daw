@@ -92,10 +92,15 @@ pub(super) fn draw(face: &Face<'_>) {
 
     // THE LATTICE: one rung per bit. Rungs vanish as the word shortens,
     // so the quantiser's floor rises where it can be seen.
-    let bits = face.anim("bits", face.value(p::BITS), 0.12).clamp(2.0, 16.0);
+    let bits = face
+        .anim("bits", face.value(p::BITS), 0.12)
+        .clamp(2.0, 16.0);
     let kept = bits.round() as usize;
     for i in 0..RUNGS_MAX {
-        let y = egui::lerp(field.bottom()..=field.top(), i as f32 / (RUNGS_MAX - 1) as f32);
+        let y = egui::lerp(
+            field.bottom()..=field.top(),
+            i as f32 / (RUNGS_MAX - 1) as f32,
+        );
         let on = i < kept;
         circuit::trace(
             &mut shapes,
@@ -261,7 +266,10 @@ mod tests {
     fn the_grain_is_deterministic_and_spread() {
         for i in 0..40 {
             assert_eq!(wobble(i), wobble(i), "the grain moved on its own");
-            assert!((-1.0..=1.0).contains(&wobble(i)), "the grain left its range");
+            assert!(
+                (-1.0..=1.0).contains(&wobble(i)),
+                "the grain left its range"
+            );
         }
         // It is a spread, not a constant: the values differ and both
         // signs occur.

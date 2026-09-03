@@ -306,15 +306,11 @@ impl SectionKind {
     /// instrument on its own glass, and so needs no table of names and
     /// numbers under them.
     pub fn owns_its_glass(self) -> bool {
-        matches!(
-            self,
-            SectionKind::Preamp
-                | SectionKind::Tone
-                | SectionKind::Door
-                | SectionKind::Glue
-                | SectionKind::Ceiling
-                | SectionKind::Scope
-        )
+        // Every section on the desk is drawn. Not one of them answers a
+        // question with a number, so not one of them keeps the generic
+        // table under its figure — the face IS the parameters, and it
+        // is handed the whole glass to be them on.
+        true
     }
 
     /// Where on the strip this section stands, or `None` for a bus,

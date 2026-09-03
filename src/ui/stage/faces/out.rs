@@ -45,10 +45,8 @@ impl Layout for Lay {
 fn lay(glass: egui::Rect, bay: Option<egui::Rect>, plinth: Option<egui::Rect>) -> Lay {
     let inner = glass.shrink2(egui::vec2(5.0, 4.0));
     let (w, h) = (inner.width(), inner.height());
-    let scope = egui::Rect::from_min_max(
-        inner.min,
-        egui::pos2(inner.right(), inner.top() + 0.52 * h),
-    );
+    let scope =
+        egui::Rect::from_min_max(inner.min, egui::pos2(inner.right(), inner.top() + 0.52 * h));
     let row = |top: f32, from: f32, to: f32| {
         egui::Rect::from_min_max(
             egui::pos2(inner.left() + w * from, top),

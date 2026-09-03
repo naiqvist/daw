@@ -229,7 +229,12 @@ pub(super) fn draw(face: &Face<'_>) {
         tool::fade(edge, 0.6),
         6.0,
     );
-    tool::halo(&mut shapes, lay.feedback, face.lit(p::FEEDBACK), face.focus());
+    tool::halo(
+        &mut shapes,
+        lay.feedback,
+        face.lit(p::FEEDBACK),
+        face.focus(),
+    );
     let tone = lay.tone;
     let open = tool::norm(face.value(p::TONE), 200.0, 12_000.0);
     circuit::trace(

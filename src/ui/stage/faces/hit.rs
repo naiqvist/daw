@@ -84,7 +84,11 @@ pub(super) fn draw(face: &Face<'_>) {
     let edge_share = face.anim("edge", said.bands[2].clamp(0.0, 1.0), 0.07);
 
     // THE ANVIL and the specimen bar across it.
-    shapes.push(egui::Shape::rect_filled(lay.anvil, 0.0, tool::fade(edge, 0.9)));
+    shapes.push(egui::Shape::rect_filled(
+        lay.anvil,
+        0.0,
+        tool::fade(edge, 0.9),
+    ));
     circuit::trace(
         &mut shapes,
         &[
@@ -164,7 +168,10 @@ pub(super) fn draw(face: &Face<'_>) {
             &mut shapes,
             &[
                 egui::pos2(x, rasp.bottom()),
-                egui::pos2(x + lean, rasp.bottom() - rasp.height() * (0.35 + 0.65 * edge_share)),
+                egui::pos2(
+                    x + lean,
+                    rasp.bottom() - rasp.height() * (0.35 + 0.65 * edge_share),
+                ),
             ],
             Weight::Hair,
             tool::mix_ink(tool::fade(edge, 0.5), face.hot(), edge_share),
@@ -220,7 +227,10 @@ mod tests {
     #[test]
     fn the_hammer_stands_over_the_anvil_and_the_wedge_under_it() {
         let (_, lay) = laid();
-        assert!(lay.pivot.y < lay.anvil.top(), "the hammer hangs below the bar");
+        assert!(
+            lay.pivot.y < lay.anvil.top(),
+            "the hammer hangs below the bar"
+        );
         assert!(lay.bright.bottom() <= lay.anvil.top() + 0.01);
         assert!(lay.sustain.top() >= lay.anvil.bottom() - 0.01);
         assert!(lay.reach > 20.0, "the arm has no swing");

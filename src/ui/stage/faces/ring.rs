@@ -105,13 +105,13 @@ pub(super) fn draw(face: &Face<'_>) {
         egui::pos2(b.left(), b.center().y),
         egui::pos2(b.right(), b.center().y),
     );
-    for (from, to) in [
-        (top, right),
-        (right, bottom),
-        (bottom, left),
-        (left, top),
-    ] {
-        circuit::trace(&mut shapes, &[from, to], Weight::Hair, tool::fade(edge, 0.9));
+    for (from, to) in [(top, right), (right, bottom), (bottom, left), (left, top)] {
+        circuit::trace(
+            &mut shapes,
+            &[from, to],
+            Weight::Hair,
+            tool::fade(edge, 0.9),
+        );
         // The diode itself: a triangle into a bar, halfway along.
         let mid = egui::pos2((from.x + to.x) * 0.5, (from.y + to.y) * 0.5);
         let along = (to - from).normalized();
@@ -128,13 +128,21 @@ pub(super) fn draw(face: &Face<'_>) {
         ));
         circuit::trace(
             &mut shapes,
-            &[mid + along * 4.5 + across * 4.0, mid + along * 4.5 - across * 4.0],
+            &[
+                mid + along * 4.5 + across * 4.0,
+                mid + along * 4.5 - across * 4.0,
+            ],
             Weight::Hair,
             hue,
         );
     }
     // The carrier transformer across the middle, and the signal down it.
-    circuit::trace(&mut shapes, &[left, right], Weight::Hair, tool::fade(edge, 0.6));
+    circuit::trace(
+        &mut shapes,
+        &[left, right],
+        Weight::Hair,
+        tool::fade(edge, 0.6),
+    );
     circuit::pad(&mut shapes, top, circuit::PAD - 1.0, ink, true);
     circuit::pad(&mut shapes, bottom, circuit::PAD - 1.0, ink, true);
     // AT MIX ZERO the bridge is shorted out by a jumper, which is what
@@ -217,8 +225,14 @@ pub(super) fn draw(face: &Face<'_>) {
         circuit::trace(
             &mut shapes,
             &[
-                egui::pos2(mid.x + side * fence.width() * 0.5 * (0.06 + 0.44 * reach), fence.top() + 2.0),
-                egui::pos2(mid.x + side * fence.width() * 0.5 * (0.06 + 0.44 * reach), fence.bottom() - 2.0),
+                egui::pos2(
+                    mid.x + side * fence.width() * 0.5 * (0.06 + 0.44 * reach),
+                    fence.top() + 2.0,
+                ),
+                egui::pos2(
+                    mid.x + side * fence.width() * 0.5 * (0.06 + 0.44 * reach),
+                    fence.bottom() - 2.0,
+                ),
             ],
             Weight::Hair,
             tool::mix_ink(tool::fade(edge, 0.9), face.focus(), face.lit(p::HOLD_RATE)),
