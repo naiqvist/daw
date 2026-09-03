@@ -85,6 +85,9 @@ pub struct DriveCore {
     pre: [Tilt; 2],
     post: [Tilt; 2],
     top: [OnePole; 2],
+    /// The pivot's own one-pole, per channel, run over the OUTPUT: what
+    /// it passes is the bottom, so what it does not is the top share.
+    share: [OnePole; 2],
     over: [Oversampler2x; 2],
     dc: [DcBlocker; 2],
     lane: Vec<f32>,
@@ -93,6 +96,11 @@ pub struct DriveCore {
     out: f32,
     level_db: f32,
     heat: f32,
+    /// The held INPUT peak, linear, decayed a block at a time.
+    input_peak: f32,
+    input_db: f32,
+    dirt: f32,
+    top_share: f32,
 }
 
 impl DriveCore {
@@ -104,18 +112,24 @@ impl DriveCore {
             pre: [Tilt::new(), Tilt::new()],
             post: [Tilt::new(), Tilt::new()],
             top: [OnePole::new(), OnePole::new()],
+            share: [OnePole::new(), OnePole::new()],
             over: [Oversampler2x::new(), Oversampler2x::new()],
             dc: [DcBlocker::new(), DcBlocker::new()],
             lane: vec![0.0; Oversampler2x::scratch_len(block.max(1))],
             dry: vec![0.0; block.max(1)],
             k: 1.0,
             out: 1.0,
-            level_db: -120.0,
+            level_db: p::SILENT_DB,
             heat: 0.0,
+            input_peak: 0.0,
+            input_db: p::INPUT_FLOOR_DB,
+            dirt: 0.0,
+            top_share: 0.0,
         };
         for ch in 0..2 {
             core.over[ch].prepare();
             core.dc[ch].prepare(sample_rate);
+            core.share[ch].prepare(sample_rate, p::TILT_HZ);
         }
         core.tune();
         core
@@ -157,7 +171,7 @@ impl DriveCore {
                 *x = curve(character, k, *x);
             }
             self.over[ch].down(lane, io);
-            self.heat = self.heat.max((hottest / 3.0).min(1.0));
+            self.heat = self.heat.max((hottest / p::HEAT_FULL).min(1.0));
             if s.character == p::TAPE {
                 self.top[ch].process_lowpass(io);
             }
@@ -167,6 +181,18 @@ impl DriveCore {
                     *y = *x + (*y - *x) * s.mix;
                 }
             }
+            // The dirt, measured here and nowhere later: what the
+            // shaper and the mix added, against the dry they were
+            // handed, with neither the post-tilt nor OUT in the way.
+            let (mut added, mut clean) = (0.0f32, 0.0f32);
+            for (y, x) in io.iter().zip(dry.iter()) {
+                let d = *y - *x;
+                added += d * d;
+                clean += *x * *x;
+            }
+            let scale = 1.0 / n as f32;
+            let ratio = (added * scale).sqrt() / (clean * scale).sqrt().max(p::DIRT_FLOOR);
+            self.dirt = self.dirt.max(ratio.min(1.0));
         }
         if s.tilt_post_db != 0.0 {
             self.post[ch].process(io);
@@ -176,6 +202,20 @@ impl DriveCore {
                 *y *= self.out;
             }
         }
+    }
+
+    /// One channel of OUTPUT, folded into the three figures the meters
+    /// want: the peak, the block's energy, and the energy the pivot's
+    /// one-pole passed — the bottom. Whatever it did not pass is top.
+    fn scan(&mut self, ch: usize, io: &[f32]) -> (f32, f32, f32) {
+        let (mut peak, mut all, mut low) = (0.0f32, 0.0f32, 0.0f32);
+        for y in io {
+            peak = peak.max(y.abs());
+            all += *y * *y;
+            let under = self.share[ch].tick_lowpass(*y);
+            low += under * under;
+        }
+        (peak, all, low)
     }
 }
 
@@ -194,11 +234,16 @@ impl SectionCore for DriveCore {
             self.pre[ch].reset();
             self.post[ch].reset();
             self.top[ch].reset();
+            self.share[ch].reset();
             self.over[ch].reset();
             self.dc[ch].reset();
         }
-        self.level_db = -120.0;
+        self.level_db = p::SILENT_DB;
         self.heat = 0.0;
+        self.input_peak = 0.0;
+        self.input_db = p::INPUT_FLOOR_DB;
+        self.dirt = 0.0;
+        self.top_share = 0.0;
     }
 
     fn process(&mut self, l: &mut [f32], r: &mut [f32], _clock: &Clock) {
@@ -207,29 +252,83 @@ impl SectionCore for DriveCore {
             return;
         }
         let stereo = r.len() >= n;
-        self.heat *= 0.8;
+        self.heat *= p::READOUT_DECAY;
+        self.dirt *= p::READOUT_DECAY;
+        self.top_share *= p::READOUT_DECAY;
+        self.input_peak *= p::READOUT_DECAY;
+        // The input, taken before the pre-tilt: this is what arrived.
+        let heard = l
+            .iter()
+            .chain(if stereo { r[..n].iter() } else { [].iter() })
+            .fold(0.0f32, |peak, s| peak.max(s.abs()));
+        self.input_peak = self.input_peak.max(heard);
+        let held = self.input_peak.max(p::ENERGY_FLOOR);
+        self.input_db = (20.0 * held.log10()).max(p::INPUT_FLOOR_DB);
         if !self.settings.is_wire() {
             self.run(0, l);
             if stereo {
                 self.run(1, &mut r[..n]);
             }
         }
-        let peak = l
-            .iter()
-            .chain(if stereo { r[..n].iter() } else { [].iter() })
-            .fold(0.0f32, |peak, s| peak.max(s.abs()));
-        self.level_db = if peak <= 1e-6 {
-            -120.0
+        let (mut peak, mut all, mut low) = self.scan(0, l);
+        if stereo {
+            let (other, energy, under) = self.scan(1, &r[..n]);
+            peak = peak.max(other);
+            all += energy;
+            low += under;
+        }
+        self.level_db = if peak <= p::SILENT_PEAK {
+            p::SILENT_DB
         } else {
             20.0 * peak.log10()
         };
+        let top = ((all - low) / all.max(p::ENERGY_FLOOR)).clamp(0.0, 1.0);
+        self.top_share = self.top_share.max(top);
     }
 
+    /// What the press shows. Every figure here is MEASURED from the
+    /// block just processed — none of it is a setting, because the card
+    /// already has every setting from the parameter table.
+    ///
+    /// - `level_db`: the OUTPUT peak of the block over both channels, in
+    ///   dBFS, after mix, post-tilt and OUT. `SILENT_DB` (-120) for a
+    ///   silent block. No hold: it is that block's own peak.
+    /// - `reduction_db`: minus the HEAT, so 0.0 at rest down to -1.0 flat
+    ///   out. Heat is dimensionless, not dB: how far up its curve the
+    ///   hottest sample of the block went, `max|x*k| / HEAT_FULL`
+    ///   clamped to 1, so it is the press working and not a gain
+    ///   reduction. Held (see below). Exactly 0 while the section is a
+    ///   wire.
+    /// - `bands[0]`: the INPUT peak over both channels, in dBFS, taken
+    ///   at the section's input BEFORE the pre-tilt and the curve — so
+    ///   neither DRIVE nor OUT moves it. Floored at `INPUT_FLOOR_DB`
+    ///   (-72) and free to run above 0 for an input over full scale.
+    ///   Held on the LINEAR peak, so the reading falls about 1.9 dB a
+    ///   block once the sound stops.
+    /// - `bands[1]`: DIRT, 0.0..1.0 — `rms(mixed - dry) / rms(dry)`
+    ///   taken inside the shaper's own stage, after the mix and before
+    ///   the post-tilt and OUT, so it is the distortion the section is
+    ///   really adding and no part of it is the trim. Exactly 0.0 while
+    ///   the section is a wire, and proportional to MIX otherwise.
+    ///   Clamped to 1.0. Held.
+    /// - `bands[2]`: TOP SHARE, 0.0..1.0 — the share of the OUTPUT
+    ///   block's energy above `TILT_HZ`, as `1 - low/all` through one
+    ///   pole at the pivot. A 250 Hz note reads near 0.06, a 6 kHz one
+    ///   near 0.97, and driving a low note upward moves it because the
+    ///   harmonics are real. 0.0 on silence. Held.
+    ///
+    /// The hold on the four held figures is a peak-hold multiplied by
+    /// `READOUT_DECAY` (0.8) per block and then re-maxed against the new
+    /// block: a tenth survives ten blocks (about 53 ms at 48 kHz and a
+    /// block of 256), so each reads as a meter and never as a spike.
+    /// There is no wall clock and nothing here smooths over time in
+    /// seconds — the decay is per block by design, as everywhere on the
+    /// desk.
     fn readout(&self) -> Readout {
         Readout {
             level_db: self.level_db,
             reduction_db: -self.heat,
-            bands: [self.settings.character as f32, self.settings.drive, 0.0],
+            bands: [self.input_db, self.dirt, self.top_share],
         }
     }
 }

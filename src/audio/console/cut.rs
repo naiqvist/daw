@@ -102,6 +102,30 @@ pub struct CutCore {
     lp_gain: f32,
     level_db: f32,
     heat: f32,
+    /// Each loop's own ring: the block peak of its band-pass state,
+    /// scaled and held, so the card can light the filter that is
+    /// actually resonating rather than the one that is merely set to.
+    hp_ring: f32,
+    lp_ring: f32,
+    /// The input peak, in dBFS, measured before the filters run.
+    in_db: f32,
+}
+
+/// The loudest sample in a block, over one channel or two.
+fn peak_of(l: &[f32], r: &[f32], n: usize, stereo: bool) -> f32 {
+    l.iter()
+        .chain(if stereo { r[..n].iter() } else { [].iter() })
+        .fold(0.0f32, |peak, s| peak.max(s.abs()))
+}
+
+/// A block peak as dBFS, floored so silence is a number and not a log
+/// of zero.
+fn peak_db(peak: f32) -> f32 {
+    if peak <= p::SILENCE_PEAK {
+        p::SILENT_DB
+    } else {
+        20.0 * peak.log10()
+    }
 }
 
 impl CutCore {
@@ -116,8 +140,11 @@ impl CutCore {
             lane: vec![0.0; Oversampler2x::scratch_len(block.max(1))],
             hp_gain: 1.0,
             lp_gain: 1.0,
-            level_db: -120.0,
+            level_db: p::SILENT_DB,
             heat: 0.0,
+            hp_ring: 0.0,
+            lp_ring: 0.0,
+            in_db: p::SILENT_DB,
         };
         for over in &mut core.over {
             over.prepare();
@@ -148,22 +175,35 @@ impl CutCore {
         self.over[ch].up(io, lane);
         let (hp_on, lp_on) = (!s.hp_off(), !s.lp_off());
         let mut hottest = 0.0f32;
+        // The two loops' resonance currents, kept APART: heat is how
+        // hard either one is leaning on its tanh, but a ring belongs to
+        // one filter and says which of the two is singing.
+        let mut hp_ring = 0.0f32;
+        let mut lp_ring = 0.0f32;
         for x in lane.iter_mut() {
             let mut y = *x;
             if hp_on {
                 let (_, high) = self.hp[ch].tick(y);
                 y = high * self.hp_gain;
-                hottest = hottest.max((self.hp[ch].ic1 * self.hp[ch].knee).abs());
+                let ic1 = self.hp[ch].ic1.abs();
+                hp_ring = hp_ring.max(ic1);
+                hottest = hottest.max(ic1 * self.hp[ch].knee);
             }
             if lp_on {
                 let (low, _) = self.lp[ch].tick(y);
                 y = low * self.lp_gain;
-                hottest = hottest.max((self.lp[ch].ic1 * self.lp[ch].knee).abs());
+                let ic1 = self.lp[ch].ic1.abs();
+                lp_ring = lp_ring.max(ic1);
+                hottest = hottest.max(ic1 * self.lp[ch].knee);
             }
             *x = y;
         }
         self.over[ch].down(lane, io);
-        self.heat = self.heat.max((hottest / 3.0).min(1.0));
+        self.heat = self.heat.max((hottest / p::HEAT_FULL).min(1.0));
+        // `max` across the call, so the pair's two channels fold into
+        // one figure per filter.
+        self.hp_ring = self.hp_ring.max((hp_ring / p::RING_FULL).min(1.0));
+        self.lp_ring = self.lp_ring.max((lp_ring / p::RING_FULL).min(1.0));
     }
 }
 
@@ -183,8 +223,12 @@ impl SectionCore for CutCore {
             self.lp[ch].reset();
             self.over[ch].reset();
         }
-        self.level_db = -120.0;
+        self.level_db = p::SILENT_DB;
         self.heat = 0.0;
+        self.hp_ring = 0.0;
+        self.lp_ring = 0.0;
+        // A dB field's zero is silence, not full scale.
+        self.in_db = p::SILENT_DB;
     }
 
     fn process(&mut self, l: &mut [f32], r: &mut [f32], _clock: &Clock) {
@@ -193,29 +237,51 @@ impl SectionCore for CutCore {
             return;
         }
         let stereo = r.len() >= n;
-        self.heat *= 0.8;
+        self.heat *= p::READOUT_DECAY;
+        self.hp_ring *= p::READOUT_DECAY;
+        self.lp_ring *= p::READOUT_DECAY;
+        // The input peak is taken BEFORE the filters run over the same
+        // buffers, so `in_db - level_db` is this section's own loss and
+        // nothing else's.
+        self.in_db = peak_db(peak_of(l, r, n, stereo));
         if !self.shape.is_off() {
             self.run(0, l);
             if stereo {
                 self.run(1, &mut r[..n]);
             }
         }
-        let peak = l
-            .iter()
-            .chain(if stereo { r[..n].iter() } else { [].iter() })
-            .fold(0.0f32, |peak, s| peak.max(s.abs()));
-        self.level_db = if peak <= 1e-6 {
-            -120.0
-        } else {
-            20.0 * peak.log10()
-        };
+        self.level_db = peak_db(peak_of(l, r, n, stereo));
     }
 
+    /// What the CUT card is drawn from. Every figure is measured in
+    /// `process`; this is a copy of five floats and no work.
+    ///
+    /// - `level_db`: the loudest OUTPUT sample of the block, in dBFS,
+    ///   from 0 down to a floor of −120 for silence. One block's peak,
+    ///   no smoothing and no hold — it follows the material exactly.
+    /// - `reduction_db`: not a gain reduction but the LOOP HEAT,
+    ///   negated: 0 at rest, −1 when a resonance loop is as deep into
+    ///   its tanh as the crunch knee allows. A block peak, held and
+    ///   multiplied by 0.8 each block (≈10 blocks to a tenth).
+    /// - `bands[0]`: the HP loop's RING, 0..1 and unitless — the block
+    ///   peak of |ic1|, the band-pass state that IS the resonance
+    ///   current in the loop, taken over both channels, divided by 1.5
+    ///   and clamped, then held and decayed 0.8 per block like the
+    ///   heat. 0 while the filter is parked, while the section is off,
+    ///   or while the signal sits away from that corner; 1 when the
+    ///   loop is fully ringing or singing.
+    /// - `bands[1]`: the same figure for the LP loop, on the same scale
+    ///   and the same time constant, so the two are comparable.
+    /// - `bands[2]`: the loudest INPUT sample of the block in dBFS, 0
+    ///   down to the same −120 floor, taken before either filter runs;
+    ///   one block's peak, no smoothing, no hold. `bands[2] −
+    ///   level_db` is therefore the section's true loss in dB, 0 when
+    ///   both blades are parked.
     fn readout(&self) -> Readout {
         Readout {
             level_db: self.level_db,
             reduction_db: -self.heat,
-            bands: [self.shape.hp_hz, self.shape.lp_hz, 0.0],
+            bands: [self.hp_ring, self.lp_ring, self.in_db],
         }
     }
 }
@@ -421,6 +487,132 @@ mod tests {
         for (x, y) in a.iter().zip(&b) {
             assert!((x - y).abs() < 1e-4);
         }
+    }
+
+    /// At its defaults the section is a wire, and a wire says so: both
+    /// rings dark, and the input peak equal to the output level, which
+    /// is a loss of nothing. On silence the whole readout is at rest.
+    #[test]
+    fn at_its_defaults_the_bands_report_rest() {
+        let mut core = core_with(&[]);
+        let mut quiet = vec![0.0f32; BLOCK];
+        core.process(&mut quiet, &mut [], &clock());
+        let said = core.readout();
+        assert_eq!(said.bands, [0.0, 0.0, p::SILENT_DB]);
+        assert_eq!(said.reduction_db, 0.0);
+
+        let l = sine(440.0, 0.5, BLOCK * 4);
+        let out = run(&mut core, &l);
+        assert_eq!(out, l, "the defaults are not a wire");
+        let said = core.readout();
+        assert_eq!(said.bands[0], 0.0, "a parked HP rang");
+        assert_eq!(said.bands[1], 0.0, "a parked LP rang");
+        assert!(
+            (said.bands[2] - said.level_db).abs() < 1e-3,
+            "a wire lost {} dB",
+            said.bands[2] - said.level_db
+        );
+    }
+
+    /// The rings are the loops RINGING, not the loops' settings: with
+    /// both filters set to the same resonance, only the one the note
+    /// sits on lights up.
+    #[test]
+    fn each_ring_lights_only_for_the_loop_that_is_ringing() {
+        let edits = [
+            (p::HP_HZ, 300.0),
+            (p::HP_RES, 85.0),
+            (p::LP_HZ, 6_000.0),
+            (p::LP_RES, 85.0),
+            (p::CRUNCH, 0.0),
+        ];
+        let n = FS as usize / 4;
+        let mut low = core_with(&edits);
+        run(&mut low, &sine(300.0, 0.3, n));
+        let at_hp = low.readout();
+        let mut high = core_with(&edits);
+        run(&mut high, &sine(6_000.0, 0.3, n));
+        let at_lp = high.readout();
+        assert!(
+            at_hp.bands[0] > at_hp.bands[1] + 0.3,
+            "a note on the HP corner lit {} / {}",
+            at_hp.bands[0],
+            at_hp.bands[1]
+        );
+        assert!(
+            at_lp.bands[1] > at_lp.bands[0] + 0.3,
+            "a note on the LP corner lit {} / {}",
+            at_lp.bands[0],
+            at_lp.bands[1]
+        );
+        for said in [at_hp, at_lp] {
+            assert!(said.bands[0] >= 0.0 && said.bands[0] <= 1.0);
+            assert!(said.bands[1] >= 0.0 && said.bands[1] <= 1.0);
+        }
+    }
+
+    /// A ring is live in both directions: it grows with the resonance
+    /// that made it, and it falls away, block by block, when the note
+    /// stops — no wall clock, just the hold's 0.8.
+    #[test]
+    fn the_ring_grows_with_resonance_and_dies_into_silence() {
+        let note = sine(800.0, 0.2, FS as usize / 8);
+        let mut flat = core_with(&[(p::LP_HZ, 800.0), (p::LP_RES, 0.0), (p::CRUNCH, 0.0)]);
+        run(&mut flat, &note);
+        let dull = flat.readout().bands[1];
+        let mut peaked = core_with(&[(p::LP_HZ, 800.0), (p::LP_RES, 75.0), (p::CRUNCH, 0.0)]);
+        run(&mut peaked, &note);
+        let ringing = peaked.readout().bands[1];
+        assert!(
+            ringing > dull + 0.3,
+            "res 0 rang {dull}, res 75 rang {ringing}"
+        );
+
+        let mut before = ringing;
+        for block in 0..24 {
+            let mut quiet = vec![0.0f32; BLOCK];
+            peaked.process(&mut quiet, &mut [], &clock());
+            let now = peaked.readout().bands[1];
+            assert!(now <= before + 1e-6, "block {block}: {before} then {now}");
+            before = now;
+        }
+        assert!(before < 0.05, "the ring never went dark: {before}");
+    }
+
+    /// `bands[2]` is the INPUT peak: it holds still while the blades
+    /// close on the signal, so the card's `bands[2] - level_db` is this
+    /// section's own loss.
+    #[test]
+    fn the_third_band_is_the_input_peak_so_the_loss_is_readable() {
+        let l = sine(100.0, 0.5, FS as usize / 8);
+        let mut wire = core_with(&[]);
+        run(&mut wire, &l);
+        let open = wire.readout();
+        let half_db = 20.0 * 0.5f32.log10();
+        assert!(
+            (open.bands[2] - half_db).abs() < 0.5,
+            "a half-scale sine read {} dBFS",
+            open.bands[2]
+        );
+        assert!(
+            (open.bands[2] - open.level_db).abs() < 0.2,
+            "a wire lost level"
+        );
+
+        let mut shut = core_with(&[(p::HP_HZ, 4_000.0), (p::HP_RES, 0.0)]);
+        run(&mut shut, &l);
+        let closed = shut.readout();
+        assert!(
+            (closed.bands[2] - open.bands[2]).abs() < 0.5,
+            "the input peak moved with the setting: {} vs {}",
+            closed.bands[2],
+            open.bands[2]
+        );
+        assert!(
+            closed.bands[2] - closed.level_db > 24.0,
+            "a shut blade lost only {} dB",
+            closed.bands[2] - closed.level_db
+        );
     }
 
     #[test]

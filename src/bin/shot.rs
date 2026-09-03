@@ -318,6 +318,56 @@ fn posed_history(hot: f32) -> daw::ui::device::scope::History {
 /// Intents rather than keystrokes: the harness has no keyboard, and the
 /// intent vocabulary is the same thing a key would have produced — so a
 /// shot is of the surface the keys reach, not of a back door into it.
+/// A block of telemetry a section might plausibly have measured, so a
+/// headless shot can show a card WORKING rather than parked.
+///
+/// Only for the harness: in the app every one of these numbers comes
+/// out of the audio callback.
+fn posed_telemetry(kind: daw::console::SectionKind) -> daw::console::Telemetry {
+    use daw::console::{SectionKind, Telemetry};
+    let base = Telemetry {
+        level_db: -9.0,
+        reduction_db: 0.0,
+        bands: [0.0; 3],
+    };
+    match kind {
+        SectionKind::Glue => Telemetry {
+            level_db: -11.0,
+            reduction_db: -5.2,
+            bands: [-3.6, 30.0, -14.4],
+            ..base
+        },
+        SectionKind::Iron => Telemetry {
+            reduction_db: -0.42,
+            bands: [20.0, 0.55, 0.31],
+            ..base
+        },
+        SectionKind::Ceiling => Telemetry {
+            level_db: -0.4,
+            reduction_db: -2.1,
+            bands: [-0.3, -1.4, -0.1],
+            ..base
+        },
+        SectionKind::Scope => Telemetry {
+            level_db: -6.5,
+            reduction_db: -14.0,
+            bands: [-8.0, -12.5, -19.0],
+            ..base
+        },
+        SectionKind::Tape => Telemetry {
+            level_db: -17.0,
+            bands: [0.62, 0.48, 0.30],
+            ..base
+        },
+        SectionKind::Shadow => Telemetry {
+            level_db: -21.0,
+            bands: [0.55, 0.34, 0.20],
+            ..base
+        },
+        _ => base,
+    }
+}
+
 fn build_stage(which: &str) -> daw::ui::stage::Stage {
     use daw::ui::stage::{SongIntent, Stage, StageIntent, Step};
 
@@ -363,6 +413,23 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
                 let _ = stage.apply(StageIntent::Step(Step::Down));
             }
             return stage;
+        }
+        if which.contains("-live") || which.contains("-desk") || which.contains("-cross") {
+            // The shot has no engine behind it, so every section would
+            // report rest and every card would draw a machine standing
+            // still. Hand the stage a plausible block of telemetry, the
+            // same shape the host hands it, so the faces can be LOOKED
+            // at doing what they do.
+            let said: Vec<(daw::sequencing::DeviceId, daw::console::Telemetry)> = stage
+                .song()
+                .all_devices()
+                .filter_map(|device| match device.kind {
+                    daw::devices::DeviceKind::Console(kind) => Some((device.id, kind)),
+                    _ => None,
+                })
+                .map(|(id, kind)| (id, posed_telemetry(kind)))
+                .collect();
+            stage.set_telemetry(&said);
         }
         if which.contains("-cross") {
             // Where the band crosses off the channel and onto the desk:

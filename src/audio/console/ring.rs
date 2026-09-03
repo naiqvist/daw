@@ -76,6 +76,13 @@ pub struct RingCore {
     carrier: Vec<f32>,
     walk: Vec<f32>,
     level_db: f32,
+    /// The carrier's frequency at the last block's final sample, in Hz;
+    /// zero when there is no carrier tone to name.
+    carrier_hz: f32,
+    /// The last block's mean |carrier|, linear 0..1.
+    carrier_mean: f32,
+    /// The last block's peak |dry|, linear, taken before the crossfade.
+    dry_peak: f32,
 }
 
 impl RingCore {
@@ -105,7 +112,10 @@ impl RingCore {
             hold,
             carrier: vec![0.0; block.max(1)],
             walk: vec![0.0; block.max(1)],
-            level_db: -120.0,
+            level_db: p::LEVEL_FLOOR_DB,
+            carrier_hz: 0.0,
+            carrier_mean: 0.0,
+            dry_peak: 0.0,
         };
         core.tune();
         core
@@ -144,7 +154,10 @@ impl SectionCore for RingCore {
         self.noise.reset();
         self.band.reset();
         self.hold.reset();
-        self.level_db = -120.0;
+        self.level_db = p::LEVEL_FLOOR_DB;
+        self.carrier_hz = 0.0;
+        self.carrier_mean = 0.0;
+        self.dry_peak = 0.0;
     }
 
     fn process(&mut self, l: &mut [f32], r: &mut [f32], _clock: &Clock) {
@@ -154,6 +167,16 @@ impl SectionCore for RingCore {
         }
         let stereo = r.len() >= n;
         let s = self.settings;
+        // The DRY peak, taken before the crossfade. With `level_db`,
+        // which is taken after it, the pair is the section's true gain
+        // — and the proof that MIX at zero is a wire.
+        self.dry_peak = l
+            .iter()
+            .chain(if stereo { r[..n].iter() } else { [].iter() })
+            .fold(0.0f32, |peak, s| peak.max(s.abs()));
+        // A shorted bridge has no carrier: no frequency, no burn.
+        self.carrier_hz = 0.0;
+        self.carrier_mean = 0.0;
         if !s.is_wire() {
             let carrier = &mut self.carrier[..n];
             if s.carrier == p::NOISE {
@@ -164,23 +187,35 @@ impl SectionCore for RingCore {
                 for c in carrier.iter_mut() {
                     *c = (*c * 4.0).clamp(-1.0, 1.0);
                 }
+                // Noise has no frequency; `carrier_hz` stays zero so
+                // the face does not draw a post that means nothing.
             } else if s.hold_rate > 0.0 {
                 // The walk steps the pitch; the oscillator is retuned
                 // per sample, which is what it is built for.
                 self.hold.process(&mut self.walk[..n]);
+                let mut hz = s.hz;
                 for (c, step) in carrier.iter_mut().zip(&self.walk[..n]) {
-                    self.osc.set_freq(s.hz * 2f32.powf(p::HOLD_OCTAVES * *step));
+                    hz = s.hz * 2f32.powf(p::HOLD_OCTAVES * *step);
+                    self.osc.set_freq(hz);
                     let mut one = [0.0f32; 1];
                     self.osc.process(&mut one, &self.tables);
                     *c = one[0];
                 }
+                // Where the walk left the carrier at the block's end.
+                self.carrier_hz = hz;
             } else {
                 self.osc.set_freq(s.hz);
                 self.osc.process(carrier, &self.tables);
+                self.carrier_hz = s.hz;
             }
+            let mut sum = 0.0f32;
             for (y, c) in l.iter_mut().zip(carrier.iter()) {
+                sum += c.abs();
                 *y += (*y * *c - *y) * s.mix;
             }
+            // The loop above ran exactly `n` times, and `n` is not
+            // zero: a divide, not a branch.
+            self.carrier_mean = sum / n as f32;
             if stereo {
                 for (y, c) in r[..n].iter_mut().zip(carrier.iter()) {
                     *y += (*y * *c - *y) * s.mix;
@@ -191,22 +226,48 @@ impl SectionCore for RingCore {
             .iter()
             .chain(if stereo { r[..n].iter() } else { [].iter() })
             .fold(0.0f32, |peak, s| peak.max(s.abs()));
-        self.level_db = if peak <= 1e-6 {
-            -120.0
+        self.level_db = if peak <= p::LEVEL_SILENCE {
+            p::LEVEL_FLOOR_DB
         } else {
             20.0 * peak.log10()
         };
     }
 
+    /// What RING tells its card. Every figure is measured in
+    /// [`RingCore::process`] over the block that just ran and copied
+    /// here untouched: nothing is smoothed and nothing is peak-held, so
+    /// each field's time constant is one block and the JUMP is the
+    /// instrument. A block the core skipped (empty, or longer than the
+    /// scratch) leaves the last report standing.
+    ///
+    /// - `level_db`: the loudest sample the section PUT OUT, post
+    ///   crossfade, in dBFS over [`p::LEVEL_FLOOR_DB`]..0. The floor is
+    ///   silence, not a number to draw.
+    /// - `reduction_db`: always `0.0`. RING reduces nothing.
+    /// - `bands[0]`: the carrier's LIVE frequency at the block's final
+    ///   sample, in Hz. It is exactly HZ (20..5000) while HOLD is zero,
+    ///   and while HOLD runs it steps inside
+    ///   `hz / 2^HOLD_OCTAVES ..= hz * 2^HOLD_OCTAVES` — a fence three
+    ///   octaves wide — moving only when the hold's own clock ticks.
+    ///   `0.0` means there is no post to draw: the carrier is NOISE, or
+    ///   MIX is zero and the bridge is shorted.
+    /// - `bands[1]`: the block's MEAN |carrier|, linear 0..1, averaged
+    ///   over that block alone. Each carrier has its own steady value,
+    ///   measured: SQUARE ~0.98, SINE ~0.64 (2/pi), TRIANGLE ~0.50 —
+    ///   dead still block to block — while band-limited NOISE sits
+    ///   around ~0.67 and WANDERS over roughly 0.58..0.73, which is the
+    ///   one carrier the face can see is unsteady. `0.0` when MIX is
+    ///   zero.
+    /// - `bands[2]`: the block's PEAK |dry|, LINEAR, taken BEFORE the
+    ///   crossfade — 0..1 for a signal at or under full scale, and not
+    ///   clamped, so a hot input reads above 1. It does not move with
+    ///   MIX. `10^(level_db / 20) / bands[2]` is therefore the
+    ///   section's true gain, and is exactly 1 while MIX is zero.
     fn readout(&self) -> Readout {
         Readout {
             level_db: self.level_db,
             reduction_db: 0.0,
-            bands: [
-                self.settings.carrier as f32,
-                self.settings.hz,
-                self.settings.mix,
-            ],
+            bands: [self.carrier_hz, self.carrier_mean, self.dry_peak],
         }
     }
 }
@@ -384,5 +445,179 @@ mod tests {
         core.set_param(99, 1.0);
         core.set_param(p::MIX, 0.0);
         assert!(core.settings().is_wire());
+    }
+
+    /// bands[0] is the carrier's LIVE frequency, not the HZ letter: it
+    /// sits exactly on the set value while HOLD is zero, steps about
+    /// inside the walk's three-octave fence while HOLD runs, and is
+    /// zero for the noise carrier, which has no frequency to name.
+    #[test]
+    fn band_zero_is_the_carriers_live_frequency() {
+        let mut still = core_with(&[(p::HZ, 300.0), (p::MIX, 100.0)]);
+        let mut block = sine(1_000.0, 0.5, BLOCK);
+        still.process(&mut block, &mut [], &clock());
+        assert_eq!(still.readout().bands[0], 300.0, "the still post moved");
+
+        let mut walking = core_with(&[(p::HZ, 300.0), (p::MIX, 100.0), (p::HOLD_RATE, 50.0)]);
+        let mut seen = Vec::new();
+        for _ in 0..24 {
+            let mut block = sine(1_000.0, 0.5, BLOCK);
+            walking.process(&mut block, &mut [], &clock());
+            seen.push(walking.readout().bands[0]);
+        }
+        let low = 300.0 / 2f32.powf(p::HOLD_OCTAVES);
+        let high = 300.0 * 2f32.powf(p::HOLD_OCTAVES);
+        assert!(
+            seen.iter().all(|hz| (low..=high).contains(hz)),
+            "the walk left its fence {low}..{high}: {seen:?}"
+        );
+        let moves = seen.windows(2).filter(|w| w[0] != w[1]).count();
+        assert!(moves >= 4, "the walk did not step: {seen:?}");
+        assert!(
+            seen.iter().any(|hz| *hz < 300.0) && seen.iter().any(|hz| *hz > 300.0),
+            "the walk stayed on one side of the post: {seen:?}"
+        );
+
+        let mut noisy = core_with(&[(p::CARRIER, p::NOISE as f32), (p::MIX, 100.0)]);
+        let mut block = sine(1_000.0, 0.5, BLOCK);
+        noisy.process(&mut block, &mut [], &clock());
+        assert_eq!(
+            noisy.readout().bands[0],
+            0.0,
+            "the noise carrier named a frequency"
+        );
+    }
+
+    /// bands[1] is the block's mean |carrier|, and each shape has its
+    /// own steady value: measured at a carrier that fits the block
+    /// whole, SINE lands on 2/pi, TRIANGLE on 1/2 and SQUARE just under
+    /// 1, each dead still block to block — while the noise carrier
+    /// wanders, because a block of noise is a different block of noise
+    /// every time.
+    #[test]
+    fn band_one_is_the_carriers_mean_and_each_shape_has_its_own() {
+        // 375 Hz is exactly two cycles in a 256-sample block at 48 kHz,
+        // so a tone carrier's block mean has nothing to wobble on.
+        let burn = |carrier: u32| {
+            let mut core = core_with(&[
+                (p::CARRIER, carrier as f32),
+                (p::HZ, 375.0),
+                (p::MIX, 100.0),
+            ]);
+            let mut seen = Vec::new();
+            for _ in 0..16 {
+                let mut block = sine(1_000.0, 0.5, BLOCK);
+                core.process(&mut block, &mut [], &clock());
+                seen.push(core.readout().bands[1]);
+            }
+            let high = seen.iter().fold(f32::MIN, |a, b| a.max(*b));
+            let low = seen.iter().fold(f32::MAX, |a, b| a.min(*b));
+            (seen[15], high - low)
+        };
+        let (sine_burn, sine_spread) = burn(p::SINE);
+        let (tri_burn, tri_spread) = burn(p::TRIANGLE);
+        let (square_burn, square_spread) = burn(p::SQUARE);
+        let (noise_burn, noise_spread) = burn(p::NOISE);
+        assert!(
+            (sine_burn - 0.637).abs() < 0.02,
+            "the sine carrier burned at {sine_burn}, not 2/pi"
+        );
+        assert!(
+            (tri_burn - 0.500).abs() < 0.02,
+            "the triangle carrier burned at {tri_burn}, not 1/2"
+        );
+        assert!(
+            (square_burn - 0.985).abs() < 0.03,
+            "the square carrier burned at {square_burn}, not ~1"
+        );
+        assert!(
+            (0.5..0.85).contains(&noise_burn),
+            "the noise carrier burned at {noise_burn}"
+        );
+        assert!(
+            square_burn > sine_burn && sine_burn > tri_burn,
+            "the shapes lost their order: {square_burn} {sine_burn} {tri_burn}"
+        );
+        // Only the noise carrier's burn is unsteady, and that is the
+        // face's tell that it is the noise one.
+        assert!(
+            noise_spread > 0.05,
+            "the noise carrier's burn sat still: spread {noise_spread}"
+        );
+        for (name, spread) in [
+            ("sine", sine_spread),
+            ("triangle", tri_spread),
+            ("square", square_spread),
+        ] {
+            assert!(
+                spread < noise_spread / 10.0,
+                "the {name} carrier's burn wandered: spread {spread}"
+            );
+        }
+    }
+
+    /// bands[2] is the DRY peak, taken before the crossfade: it reads
+    /// the same at every MIX while what leaves does not, and paired
+    /// with level_db it is the section's true gain.
+    #[test]
+    fn band_two_is_the_dry_peak_taken_before_the_crossfade() {
+        for mix in [0.0f32, 40.0, 100.0] {
+            let mut core = core_with(&[(p::HZ, 375.0), (p::MIX, mix)]);
+            let mut block = sine(1_000.0, 0.5, BLOCK);
+            core.process(&mut block, &mut [], &clock());
+            let said = core.readout();
+            assert!(
+                (said.bands[2] - 0.5).abs() < 1e-3,
+                "the dry moved with MIX {mix}: {}",
+                said.bands[2]
+            );
+            assert_eq!(said.reduction_db, 0.0, "RING reduced something");
+        }
+        // A carrier slow enough to stay near zero across the block
+        // takes the output well down while the dry stands where it was:
+        // the two cannot be the same measurement.
+        let mut slow = core_with(&[(p::HZ, 20.0), (p::MIX, 100.0)]);
+        let mut block = sine(1_000.0, 0.5, BLOCK);
+        slow.process(&mut block, &mut [], &clock());
+        let said = slow.readout();
+        let gain = 10f32.powf(said.level_db / 20.0) / said.bands[2];
+        assert!(
+            gain < 0.8,
+            "the dry peak followed the crossfade: gain {gain}"
+        );
+    }
+
+    /// At its defaults the section is a wire, and the readout says so
+    /// rather than repeating the letters: no carrier frequency, no
+    /// burn, and a true gain of exactly 1 — which is the balance dot's
+    /// resting size and the visual proof of the wire.
+    #[test]
+    fn at_its_defaults_the_section_reports_rest() {
+        let mut core = core_with(&[]);
+        assert!(core.settings().is_wire());
+        let fresh = core.readout();
+        assert_eq!(
+            fresh.bands,
+            [0.0, 0.0, 0.0],
+            "a core at rest said something"
+        );
+        assert_eq!(fresh.level_db, p::LEVEL_FLOOR_DB);
+
+        let mut block = sine(440.0, 0.5, BLOCK);
+        core.process(&mut block, &mut [], &clock());
+        let said = core.readout();
+        assert_eq!(said.bands[0], 0.0, "a shorted bridge named a frequency");
+        assert_eq!(said.bands[1], 0.0, "a shorted bridge burned");
+        let gain = 10f32.powf(said.level_db / 20.0) / said.bands[2];
+        assert!(
+            (gain - 1.0).abs() < 1e-3,
+            "the wire's gain was not 1: {gain}"
+        );
+
+        // A discontinuity puts every measured field back to rest.
+        core.reset();
+        let after = core.readout();
+        assert_eq!(after.bands, [0.0, 0.0, 0.0]);
+        assert_eq!(after.level_db, p::LEVEL_FLOOR_DB);
     }
 }

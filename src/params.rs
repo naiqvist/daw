@@ -7894,6 +7894,23 @@ pub mod console {
         /// this, and the loop sings on its own.
         pub const SING_FROM: f32 = 0.97;
         pub const SING_DAMPING: f32 = -0.03;
+        /// How much of a block's peak-hold survives into the next one,
+        /// for every held figure the readout carries — the loop heat and
+        /// the two resonance rings. A ring that has stopped is dark
+        /// within a dozen blocks, with no wall clock anywhere.
+        pub const READOUT_DECAY: f32 = 0.8;
+        /// The driven band-pass state that reads as full heat: how hard
+        /// the loop is into its own tanh.
+        pub const HEAT_FULL: f32 = 3.0;
+        /// The band-pass state magnitude — the resonance current in the
+        /// loop — that reads as a fully lit ring.
+        pub const RING_FULL: f32 = 1.5;
+        /// What a silent block reports for a level, in dBFS: the floor
+        /// for both the output level and the input peak.
+        pub const SILENT_DB: f32 = -120.0;
+        /// Below this peak a block is silence rather than a very quiet
+        /// level, so the log is never taken of nothing.
+        pub const SILENCE_PEAK: f32 = 1e-6;
 
         pub const TABLE: &[ParamDef] = &[
             ParamDef {
@@ -7952,6 +7969,11 @@ pub mod console {
         /// Where the brightness starts, and how much at full.
         pub const BRIGHT_HZ: f32 = 3_000.0;
         pub const BRIGHT_AMOUNT: f32 = 0.8;
+        /// The quietest linear amplitude the section will divide by: the
+        /// floor under the tail's follower ratio, under the readout's
+        /// edge share, and under the peak that reads as silence. Below
+        /// it a ratio is noise over noise, so it reads as nothing at all.
+        pub const LEVEL_FLOOR: f32 = 1e-6;
 
         pub const TABLE: &[ParamDef] = &[
             ParamDef {
@@ -8005,6 +8027,22 @@ pub mod console {
         pub const INDUCTOR_AT: f32 = 1.6;
         pub const INDUCTOR_SHARE: f32 = 0.28;
         pub const INDUCTOR_Q: f32 = 1.1;
+
+        /// The readout's three zones, cut on exactly the two frequencies
+        /// the card's spine is cut on: below LOW is the bottom zone,
+        /// LOW to HIGH the middle, above HIGH the top.
+        pub const ZONE_LOW_HZ: f32 = 200.0;
+        pub const ZONE_HIGH_HZ: f32 = 2000.0;
+        /// The quietest a zone reports while a block is not silent. The
+        /// card's glow is already at its floor well above this, so there
+        /// is nothing to be had from reporting further down.
+        pub const ZONE_FLOOR_DB: f32 = -72.0;
+        /// Silence: what every level in the readout rests at, and the
+        /// sentinel a block with nothing in it reports.
+        pub const SILENCE_DB: f32 = -120.0;
+        /// A peak at or under this is silence rather than a number —
+        /// it is the sentinel's own amplitude, -120 dBFS.
+        pub const SILENCE_PEAK: f32 = 1e-6;
 
         pub const TABLE: &[ParamDef] = &[
             ParamDef {
@@ -8114,7 +8152,18 @@ pub mod console {
         /// The knee the detector and the feedback give it, fixed.
         pub const KNEE_DB: f32 = 3.0;
         /// The detector's window: fast, a peak more than an average.
+        /// The pre-high-pass key detector runs at the same window, so
+        /// the two key bands differ only by the filter.
         pub const DETECT_MS: f32 = 5.0;
+        /// Silence, in dBFS: where every level the readout carries
+        /// rests when the section has heard nothing. The same figure
+        /// `Readout::default()` uses, so a section at rest and a
+        /// section that is not there read alike.
+        pub const FLOOR_DB: f32 = -120.0;
+        /// `FLOOR_DB` as a linear gain: the smallest reading trusted
+        /// before a level is called silence, and the guard that keeps
+        /// `log10` off zero in the red zone.
+        pub const FLOOR_GAIN: f32 = 1e-6;
 
         pub const TABLE: &[ParamDef] = &[
             ParamDef {
@@ -8323,6 +8372,31 @@ pub mod console {
         pub const TAPE_TOP_DRIVEN_HZ: f32 = 5_000.0;
         /// The fuzz's bias: the gate-like asymmetry of a starved fuzz.
         pub const FUZZ_BIAS: f32 = 0.3;
+
+        /// How far up its curve the hottest sample of a block has to go
+        /// to read as full heat: `|x*k|` measured against this.
+        pub const HEAT_FULL: f32 = 3.0;
+        /// How much of a block's held figure survives into the next one,
+        /// for every live figure the readout carries — the heat, the
+        /// input peak, the dirt and the top share. A tenth of a figure
+        /// survives ten blocks, so a section that has gone quiet is at
+        /// rest within a few dozen, with no wall clock anywhere.
+        pub const READOUT_DECAY: f32 = 0.8;
+        /// The quietest input the meter draws, in dBFS: below this the
+        /// press is at rest and the specimen wave is at its floor.
+        pub const INPUT_FLOOR_DB: f32 = -72.0;
+        /// What a silent block reports for the OUTPUT level, in dBFS,
+        /// and the output peak at or under which a block counts as
+        /// silent.
+        pub const SILENT_DB: f32 = -120.0;
+        pub const SILENT_PEAK: f32 = 1e-6;
+        /// The smallest RMS the dirt ratio will divide by: a dry block
+        /// quieter than this is silence, not a denominator.
+        pub const DIRT_FLOOR: f32 = 1e-6;
+        /// The smallest block energy the meters will divide by or take a
+        /// logarithm of, so silence reads as rest instead of as a ratio
+        /// of two nothings.
+        pub const ENERGY_FLOOR: f32 = 1e-12;
 
         pub const TABLE: &[ParamDef] = &[
             ParamDef {
@@ -8632,6 +8706,40 @@ pub mod console {
         /// sharply and the smear is a chirp rather than a wash.
         pub const STAGE_Q: f32 = 1.2;
 
+        /// The onset clock's FAST envelope, in ms: a one-pole on the
+        /// input peak, quick enough to ride a transient's leading edge.
+        pub const ONSET_FAST_MS: f32 = 1.0;
+
+        /// The onset clock's SLOW envelope, in ms: the running bed the
+        /// fast one is measured against.
+        pub const ONSET_SLOW_MS: f32 = 120.0;
+
+        /// How far the fast envelope must stand over the slow one, as a
+        /// ratio, for the sample to count as an onset.
+        pub const ONSET_RATIO: f32 = 1.6;
+
+        /// The quietest peak that may start an onset, linear: below it
+        /// the ratio is only noise arguing with noise.
+        pub const ONSET_FLOOR: f32 = 1e-3;
+
+        /// A floor on the slow envelope where it is used as a DIVISOR,
+        /// linear, so the strength figure stays finite out of silence.
+        pub const ONSET_BED_FLOOR: f32 = 1e-9;
+
+        /// The retrigger lockout in ms: no second onset inside it, so
+        /// one hit sends one wavefront rather than a burst of them.
+        pub const ONSET_LOCKOUT_MS: f32 = 30.0;
+
+        /// How many dB of fast-over-slow reads as a full-strength hit,
+        /// for the 0..1 onset strength the card lights bars with.
+        pub const ONSET_FULL_DB: f32 = 12.0;
+
+        /// How long an onset stays IN FLIGHT, in ms. Past it the clock
+        /// reads exactly 0.0 again, which is the card's "nothing
+        /// crawling across the field" — longer than the longest smear
+        /// the section can make (244 ms at 32 stages, 100 Hz).
+        pub const ONSET_EXPIRE_MS: f32 = 1000.0;
+
         pub const TABLE: &[ParamDef] = &[
             ParamDef {
                 id: 0,
@@ -8667,6 +8775,11 @@ pub mod console {
         /// The noise carrier's band: a low-pass, so it is a hiss
         /// modulator and not a bit crusher.
         pub const NOISE_HZ: f32 = 3_000.0;
+        /// The level meter's floor, in dBFS: what a block quieter than
+        /// [`LEVEL_SILENCE`] reads as, instead of minus infinity.
+        pub const LEVEL_FLOOR_DB: f32 = -120.0;
+        /// The peak below which a block is silence rather than a level.
+        pub const LEVEL_SILENCE: f32 = 1e-6;
 
         pub const TABLE: &[ParamDef] = &[
             ParamDef {
@@ -8724,6 +8837,21 @@ pub mod console {
         /// Blur at full holds this share of the last frame's shape,
         /// per frame — so a blurred sound arrives late and leaves late.
         pub const BLUR_HOLD: f32 = 0.94;
+        /// The readout's one-pole, in seconds: how long the card's
+        /// centroid, spread and flux take to arrive at a new value.
+        /// Short enough to follow a phrase, long enough not to strobe
+        /// at the frame rate, which is one hop.
+        pub const READOUT_TAU_S: f32 = 0.060;
+        /// The floor under the readout's dB figures, in dBFS: what the
+        /// analysed frame's peak reads when nothing arrived.
+        pub const READOUT_FLOOR_DB: f32 = -120.0;
+        /// How much magnitude a frame must carry before its centroid
+        /// and spread mean anything. Under it the card is told 0
+        /// rather than the ratio of two roundings.
+        pub const MOMENT_FLOOR: f32 = 1e-6;
+        /// The guard under the flux's denominator, so a silent frame
+        /// divides by something.
+        pub const FLUX_EPS: f32 = 1e-9;
 
         pub const TABLE: &[ParamDef] = &[
             ParamDef {
@@ -8804,6 +8932,12 @@ pub mod console {
         /// How long the time takes to reach a new setting: an analogue
         /// delay glides rather than jumping, so a turn is a swoop.
         pub const GLIDE_MS: f32 = 120.0;
+        /// The linear peak inside the loop under which the soft top's
+        /// compression is not reported. Below it `soft(x)/x` is 1.0 to
+        /// the last bit and the logarithm is dividing noise by noise,
+        /// so the readout says "none" rather than a number made of
+        /// rounding.
+        pub const READOUT_QUIET: f32 = 1e-6;
 
         pub const TABLE: &[ParamDef] = &[
             ParamDef {
@@ -8883,6 +9017,20 @@ pub mod console {
         /// The room's decay across its size.
         pub const ROOM_DECAY_LOW: f32 = 0.3;
         pub const ROOM_DECAY_HIGH: f32 = 0.92;
+        /// How fast the readout's three bands fall, in ms. A tail is
+        /// read at frame rate, so the bands hold their peak and fall
+        /// this slowly: a ring reads as a smooth ramp, not a flicker.
+        pub const READOUT_FALL_MS: f32 = 300.0;
+        /// The bottom of the two level bands' range, in dBFS: a peak at
+        /// or under this reads 0.0 and a peak at full scale reads 1.0,
+        /// so the bands are a 60 dB window on the send and the return.
+        pub const READOUT_FLOOR_DB: f32 = -60.0;
+        /// The linear amplitude at which the wet return counts as
+        /// silence. Below it the brightness ratio is dividing noise by
+        /// noise, so that band falls instead of reading it; it is also
+        /// where a falling band is snapped to zero, so the meter never
+        /// trails off into denormals.
+        pub const READOUT_QUIET: f32 = 1e-7;
 
         pub const TABLE: &[ParamDef] = &[
             ParamDef {
@@ -8937,6 +9085,22 @@ pub mod console {
         pub const BASS_MONO_OFF_HZ: f32 = 0.0;
         /// The crossover that takes the bottom to mono.
         pub const BASS_ORDER: u32 = 2;
+
+        /// The readout's three followers, in milliseconds: how long a
+        /// measured figure takes to cover ~63% of a step toward what the
+        /// block just said. Correlation is the figure a reader stares
+        /// at, so it is steadied hardest; the spread has to open as fast
+        /// as a hand can pan; the bass share only moves when the corner
+        /// does, and a slow one keeps it from flickering on transients.
+        pub const CORRELATION_MS: f32 = 150.0;
+        pub const SPREAD_MS: f32 = 120.0;
+        pub const BASS_SHARE_MS: f32 = 200.0;
+
+        /// A block whose summed squares fall under this is silence, and
+        /// a ratio taken from it would be the quotient of two roundings.
+        /// The measured bands rest at zero instead of inventing a
+        /// direction for noise.
+        pub const QUIET_SUM: f32 = 1e-9;
 
         pub const TABLE: &[ParamDef] = &[
             ParamDef {
@@ -9019,6 +9183,20 @@ pub mod console {
         /// it arrived, whatever the drive.
         pub const UNITY_AT: f32 = 0.316;
 
+        /// One ballistics law for every figure the section reports:
+        /// peak-hold within a block, then this much of it survives into
+        /// the next. At a 256-sample block that is a ~5 ms half-life,
+        /// fast enough to follow a bus and slow enough to read.
+        pub const TELEMETRY_DECAY: f32 = 0.8;
+        /// The asymmetry reading's full-scale: the shaped signal's mean
+        /// as a fraction of its peak, times this, is 1.0. A quarter of
+        /// the peak is as lopsided as this curve ever gets, so a quarter
+        /// is the top of the scale.
+        pub const ASYM_SCALE: f32 = 4.0;
+        /// The guard on every telemetry divisor, so a silent block
+        /// reports zero rather than a NaN.
+        pub const TELEMETRY_EPS: f32 = 1e-6;
+
         pub const TABLE: &[ParamDef] = &[ParamDef {
             id: 0,
             name: "Drive",
@@ -9036,6 +9214,16 @@ pub mod console {
         pub const CEILING_DB: f32 = -0.3;
         pub const LOOKAHEAD_MS: f32 = 1.5;
         pub const RELEASE_MS: f32 = 120.0;
+
+        /// Where the HELD GAIN reads at rest, in dB. An open limiter is
+        /// spending nothing, and a surface draws that as a press closed
+        /// flush against the beam rather than as a zeroed meter.
+        pub const REST_GAIN_DB: f32 = 0.0;
+        /// Where the WINDOW PEAK reads on silence, in dBFS. Borrowed
+        /// from the kernel's own floor rather than restated, so the band
+        /// and `LookaheadLimiter::window_peak_db` can never disagree
+        /// about what an empty lookahead window reads.
+        pub const SILENCE_DB: f32 = crate::dsp::dynamics::FLOOR_DB;
 
         pub const TABLE: &[ParamDef] = &[];
     }

@@ -125,6 +125,9 @@ struct Side {
     dry_at: usize,
     /// This block's wet, taken out before this block's input goes in.
     wet: Vec<f32>,
+    /// The last frame's POST-mode magnitudes, which is what the card's
+    /// flux is measured against.
+    prev_mag: Vec<f32>,
 }
 
 /// How many frames are cut at a time.
@@ -172,6 +175,7 @@ impl Side {
             dry: vec![0.0; delay.max(1)],
             dry_at: 0,
             wet: vec![0.0; p::HOP],
+            prev_mag: vec![0.0; bins],
         };
         // A HEAD START of silence, so the queue between the machine's
         // two halves never runs dry. A queue that runs dry does not
@@ -200,6 +204,7 @@ impl Side {
         self.fifo_write = prime % self.fifo.len();
         self.dry.fill(0.0);
         self.dry_at = 0;
+        self.prev_mag.fill(0.0);
     }
 
     fn push(&mut self, samples: &[f32]) {
@@ -287,6 +292,58 @@ fn lock_to_peaks(magnitude: &[f32], analysed: &[f32], phase: &mut [f32], peak_of
     }
 }
 
+/// The frame's first two moments and its loudest bin: where the mass
+/// of the spectrum sits, how far it is spread either side of that, and
+/// how tall the tallest partial stands. Both moments come back in BINS
+/// — the caller divides by the last bin to put them on 0..1 — and the
+/// peak comes back as a raw magnitude.
+///
+/// A frame carrying almost nothing has no centre and no width, only the
+/// ratio of two roundings, so under [`p::MOMENT_FLOOR`] both are 0.
+fn moments(magnitude: &[f32]) -> (f32, f32, f32) {
+    let mut sum = 0.0f32;
+    let mut weighted = 0.0f32;
+    let mut peak = 0.0f32;
+    for (k, m) in magnitude.iter().enumerate() {
+        sum += *m;
+        weighted += k as f32 * *m;
+        peak = peak.max(*m);
+    }
+    if sum < p::MOMENT_FLOOR {
+        return (0.0, 0.0, peak);
+    }
+    let centroid = weighted / sum;
+    let mut variance = 0.0f32;
+    for (k, m) in magnitude.iter().enumerate() {
+        let away = k as f32 - centroid;
+        variance += *m * away * away;
+    }
+    (centroid, (variance / sum).max(0.0).sqrt(), peak)
+}
+
+/// How much the frame MOVED since the last one, as a share of its own
+/// size — and the last one replaced by this one on the way through.
+///
+/// Nothing moving reads exactly 0, which is what a held freeze is; a
+/// frame that arrived out of silence reads 1.
+fn flux(magnitude: &[f32], prev: &mut [f32]) -> f32 {
+    let mut change = 0.0f32;
+    let mut sum = 0.0f32;
+    for (m, was) in magnitude.iter().zip(prev.iter_mut()) {
+        change += (*m - *was).abs();
+        sum += *m;
+        *was = *m;
+    }
+    (change / (sum + p::FLUX_EPS)).clamp(0.0, 1.0)
+}
+
+/// One step of the readout's one-pole, taken once per analysed frame.
+/// `keep` is the coefficient: 1 would never move, 0 would not smooth.
+#[inline(always)]
+fn glide(state: &mut f32, target: f32, keep: f32) {
+    *state += (target - *state) * (1.0 - keep);
+}
+
 pub struct SpectraCore {
     params: SectionParams,
     settings: Settings,
@@ -300,10 +357,20 @@ pub struct SpectraCore {
     bins: usize,
     latency: usize,
     level_db: f32,
+    /// What the card is told about the sound, all of it measured in
+    /// `process` on side 0 and only copied out in `readout`.
+    centroid: f32,
+    spread: f32,
+    flux: f32,
+    peak_db: f32,
+    /// The readout one-pole's per-frame coefficient, and what turns a
+    /// raw bin magnitude into a dBFS figure.
+    smooth: f32,
+    mag_scale: f32,
 }
 
 impl SpectraCore {
-    pub fn new(params: &SectionParams, _sample_rate: f32, _block: usize) -> Self {
+    pub fn new(params: &SectionParams, sample_rate: f32, _block: usize) -> Self {
         let bins = RealFft::bins(p::SIZE);
         let mut fft = RealFft::new();
         fft.prepare(p::SIZE);
@@ -318,6 +385,19 @@ impl SpectraCore {
         // finds an impulse and what the graph pays back.
         let prime = p::SIZE + p::HOP;
         let latency = p::SIZE * 2;
+        // A bin's magnitude out of an unnormalised transform is the
+        // ANALYSIS WINDOW'S coherent gain times the partial's own
+        // amplitude. Dividing that out is what makes the frame's peak
+        // a dBFS figure rather than a number about the window: a
+        // full-scale sine then reads 0 dB, whatever SIZE is.
+        let coherent = window.iter().sum::<f32>() * 0.5;
+        let mag_scale = if coherent > 0.0 { 1.0 / coherent } else { 1.0 };
+        // The readout's one-pole steps once per analysed FRAME, not
+        // per sample and not per block, so its coefficient is one
+        // hop's worth of the time constant — which keeps how the card
+        // moves independent of how the sound was cut into blocks.
+        let frame_dt = p::HOP as f32 / sample_rate.max(1.0);
+        let smooth = (-frame_dt / p::READOUT_TAU_S).exp();
         let mut core = Self {
             params: params.clone(),
             settings: Settings::of(params),
@@ -332,6 +412,12 @@ impl SpectraCore {
             bins,
             latency,
             level_db: -120.0,
+            centroid: 0.0,
+            spread: 0.0,
+            flux: 0.0,
+            peak_db: p::READOUT_FLOOR_DB,
+            smooth,
+            mag_scale,
         };
         for side in &mut core.sides {
             side.cutter.prepare(p::SIZE, p::HOP);
@@ -388,6 +474,32 @@ impl SpectraCore {
             &mut it.scratch,
         );
         magnitude_phase(&it.real, &it.imag, &mut it.magnitude, &mut it.phase);
+        // The card's two moments are taken PRE-mode, on side 0 only:
+        // the face draws the mode's own law bending this spectrum, so
+        // measuring the shifted frame here would draw the shift twice.
+        // The two sides carry the same music; one pass is enough.
+        if side == 0 {
+            let (centroid, spread, peak) = moments(&it.magnitude[..bins]);
+            let last = (bins.max(2) - 1) as f32;
+            glide(
+                &mut self.centroid,
+                (centroid / last).clamp(0.0, 1.0),
+                self.smooth,
+            );
+            glide(
+                &mut self.spread,
+                (spread / last).clamp(0.0, 1.0),
+                self.smooth,
+            );
+            // The rake's height, so it stands even at MIX 0 where
+            // level_db is reporting the dry going past.
+            let scaled = peak * self.mag_scale;
+            self.peak_db = if scaled <= 0.0 {
+                p::READOUT_FLOOR_DB
+            } else {
+                (20.0 * scaled.log10()).max(p::READOUT_FLOOR_DB)
+            };
+        }
         it.analysed[..bins].copy_from_slice(&it.phase[..bins]);
         self.vocoder
             .analyse(&it.phase, &mut it.freq, &mut it.prev_phase);
@@ -472,6 +584,14 @@ impl SpectraCore {
             }
         }
 
+        // Flux is taken POST-mode, so it reports what the machine
+        // actually did rather than what arrived: exactly nothing moving
+        // under a held freeze, a little under a blur, everything moving
+        // on a transient. It is the number that proves the mode took.
+        if side == 0 {
+            let moved = flux(&it.magnitude[..bins], &mut it.prev_mag[..bins]);
+            glide(&mut self.flux, moved, self.smooth);
+        }
         self.vocoder
             .synthesise(&it.freq, &mut it.phase, &mut it.out_phase);
         // Locking is for the modes that leave the partials where they
@@ -585,6 +705,10 @@ impl SectionCore for SpectraCore {
             side.reset(prime);
         }
         self.level_db = -120.0;
+        self.centroid = 0.0;
+        self.spread = 0.0;
+        self.flux = 0.0;
+        self.peak_db = p::READOUT_FLOOR_DB;
     }
 
     fn latency(&self) -> usize {
@@ -615,15 +739,40 @@ impl SectionCore for SpectraCore {
         };
     }
 
+    /// What the card is drawn from. A plain copy of fields measured in
+    /// `process`; nothing is computed here. Everything but `level_db`
+    /// is refreshed once per ANALYSED FRAME — one hop, 256 samples,
+    /// about 5.3 ms at 48 kHz — and held between frames.
+    ///
+    /// - `level_db`: the section's OUTPUT peak over the last block, in
+    ///   dBFS, floored at -120. At MIX 0 that is the dry going past
+    ///   untouched, which is why it can be full while the spectrum
+    ///   above it is doing something else entirely. Per block, no
+    ///   smoothing.
+    /// - `reduction_db`: repurposed — this section reduces no gain.
+    ///   The PRE-mode analysed frame's LOUDEST BIN in dBFS, the
+    ///   analysis window's coherent gain divided out so a full-scale
+    ///   sine reads 0. Range -120..0-ish, floored hard at -120. Per
+    ///   frame, no smoothing: it is that frame's own peak.
+    /// - `bands[0]`: SPECTRAL CENTROID of the PRE-mode frame — where
+    ///   the spectrum's mass sits — as a share of the LINEAR bin axis:
+    ///   0.0 is DC, 1.0 is Nyquist. Exactly 0.0 on a frame whose
+    ///   magnitudes sum under 1e-6. One-pole, 60 ms.
+    /// - `bands[1]`: SPECTRAL SPREAD of the same PRE-mode frame — the
+    ///   magnitude-weighted standard deviation about that centroid —
+    ///   on the same 0..1 bin axis. A lone partial sits near 0, a
+    ///   broadband noise near 0.3, silence at exactly 0.0. One-pole,
+    ///   60 ms.
+    /// - `bands[2]`: SPECTRAL FLUX of the POST-mode frame — how much
+    ///   the frame moved since the last one, sum|m - m_prev| over
+    ///   sum m — clamped to 0..1. 0.0 while a freeze holds, small
+    ///   under a blur, near 1.0 on a transient out of silence.
+    ///   One-pole, 60 ms.
     fn readout(&self) -> Readout {
         Readout {
             level_db: self.level_db,
-            reduction_db: 0.0,
-            bands: [
-                self.settings.mode as f32,
-                self.settings.mix,
-                if self.settings.holding() { 1.0 } else { 0.0 },
-            ],
+            reduction_db: self.peak_db,
+            bands: [self.centroid, self.spread, self.flux],
         }
     }
 }
@@ -666,6 +815,24 @@ mod tests {
             core.process(&mut out[start..end], &mut [], &clock());
         }
         out
+    }
+
+    /// A deterministic hiss: broadband, the same sound every run, and
+    /// no dependency on anything the red zone cannot have.
+    fn noise(amp: f32, n: usize) -> Vec<f32> {
+        let mut state = 0x1234_5678u32;
+        (0..n)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                amp * ((state >> 8) as f32 / 8_388_608.0 - 1.0)
+            })
+            .collect()
+    }
+
+    /// Run a sound through and ask the section what it saw.
+    fn readout_after(core: &mut SpectraCore, l: &[f32]) -> Readout {
+        let _ = run(core, l);
+        core.readout()
     }
 
     fn rms(s: &[f32]) -> f32 {
@@ -783,10 +950,14 @@ mod tests {
             note > octave + 6.0,
             "the held sound is a smear: {note} against {octave}"
         );
-        assert!(
-            core.readout().bands[2] == 1.0,
-            "the card is not told it is holding"
-        );
+        // CHANGED with the readout: bands[2] used to be a copy of
+        // holding(), which the face already has from its own value —
+        // a band spent on a setting. It is now the POST-mode spectral
+        // flux, so the same fact arrives MEASURED instead: a held
+        // freeze puts the identical frame out every hop, and nothing
+        // moving is what the band reads.
+        let churn = core.readout().bands[2];
+        assert!(churn < 0.01, "the held spectrum is still moving: {churn}");
 
         let mut thawed = core_with(&[(p::MODE, 0.0), (p::FREEZE, 0.0), (p::MIX, 100.0)]);
         let out = run(&mut thawed, &l);
@@ -881,6 +1052,154 @@ mod tests {
         let sound = rms(&a);
         let under = 20.0 * (apart / sound.max(1e-9)).log10();
         assert!(under < -40.0, "the two runs differ by {under} dB");
+    }
+
+    /// At its defaults, on silence, the section reports rest: no
+    /// centre, no width, nothing moving, and both dB figures on the
+    /// floor. A card drawn from this is a card at rest.
+    #[test]
+    fn the_defaults_report_rest() {
+        let mut core = core_with(&[]);
+        let quiet = vec![0.0f32; FS as usize / 4];
+        let said = readout_after(&mut core, &quiet);
+        assert_eq!(said.bands, [0.0, 0.0, 0.0], "silence is not rest: {said:?}");
+        assert_eq!(said.reduction_db, -120.0, "the rake stands on silence");
+        assert_eq!(said.level_db, -120.0, "the floor bar stands on silence");
+    }
+
+    /// bands[0] IS the sound's centre of mass on the linear bin axis:
+    /// a low tone puts it near DC, a high one carries it up, and each
+    /// lands on the bin the tone is actually in — which is where the
+    /// card draws the envelope's centre.
+    #[test]
+    fn the_centroid_band_follows_the_sound_up_the_bin_axis() {
+        let n = FS as usize / 2;
+        let last = (RealFft::bins(p::SIZE) - 1) as f32;
+        let want = |hz: f32| hz * p::SIZE as f32 / FS / last;
+        let mut low = core_with(&[]);
+        let low_c = readout_after(&mut low, &sine(220.0, 0.5, n)).bands[0];
+        let mut high = core_with(&[]);
+        let high_c = readout_after(&mut high, &sine(5_000.0, 0.5, n)).bands[0];
+        assert!(
+            (low_c - want(220.0)).abs() < 0.02,
+            "220 Hz landed at {low_c}, not {}",
+            want(220.0)
+        );
+        assert!(
+            (high_c - want(5_000.0)).abs() < 0.02,
+            "5 kHz landed at {high_c}, not {}",
+            want(5_000.0)
+        );
+        assert!(
+            high_c > low_c + 0.1,
+            "the band did not move: {high_c} against {low_c}"
+        );
+    }
+
+    /// bands[1] is the WIDTH of that mass: one partial is narrow, hiss
+    /// across the whole band is wide, and the number sits where a
+    /// uniform spectrum's standard deviation should — 1/sqrt(12) of
+    /// the axis.
+    #[test]
+    fn the_spread_band_tells_a_tone_from_a_hiss() {
+        let n = FS as usize / 2;
+        let mut tone = core_with(&[]);
+        let narrow = readout_after(&mut tone, &sine(1_000.0, 0.5, n)).bands[1];
+        let mut hiss = core_with(&[]);
+        let wide = readout_after(&mut hiss, &noise(0.5, n)).bands[1];
+        assert!(narrow < 0.05, "a lone partial reads {narrow} wide");
+        assert!(
+            (wide - 1.0 / 12f32.sqrt()).abs() < 0.08,
+            "flat hiss reads {wide}, not about 0.29"
+        );
+        assert!(wide <= 1.0, "the spread ran off the axis: {wide}");
+    }
+
+    /// bands[2] is measured POST-mode, which is what makes it the
+    /// number that proves the mode took: a held freeze puts the same
+    /// frame out over and over and the band falls to nothing, while
+    /// the same hiss running free keeps it up.
+    #[test]
+    fn the_flux_band_falls_to_nothing_under_a_held_freeze() {
+        let n = FS as usize / 2;
+        let hiss = noise(0.5, n);
+        let mut running = core_with(&[(p::MODE, 0.0), (p::FREEZE, 0.0), (p::MIX, 100.0)]);
+        let moving = readout_after(&mut running, &hiss).bands[2];
+        let mut held = core_with(&[(p::MODE, 0.0), (p::FREEZE, 1.0), (p::MIX, 100.0)]);
+        let still = readout_after(&mut held, &hiss).bands[2];
+        assert!(moving > 0.1, "churning hiss reads only {moving}");
+        assert!(still < 0.01, "the held spectrum still moves: {still}");
+    }
+
+    /// And a blur smears one frame into the next, so the band DROPS
+    /// without reaching nothing — which is what the stair's lit share
+    /// on the card is drawn from.
+    #[test]
+    fn the_flux_band_drops_under_a_blur() {
+        let n = FS as usize / 2;
+        let hiss = noise(0.5, n);
+        let mut open = core_with(&[(p::MODE, 1.0), (p::BLUR, 0.0), (p::MIX, 100.0)]);
+        let raw = readout_after(&mut open, &hiss).bands[2];
+        let mut smeared = core_with(&[(p::MODE, 1.0), (p::BLUR, 100.0), (p::MIX, 100.0)]);
+        let smooth = readout_after(&mut smeared, &hiss).bands[2];
+        assert!(raw > 0.1, "the hiss did not churn: {raw}");
+        assert!(
+            smooth < raw * 0.5,
+            "the blur left the flux at {smooth} of {raw}"
+        );
+        assert!(smooth > 0.0, "the blur stopped the spectrum dead");
+    }
+
+    /// The two moments are taken BEFORE the mode: an octave shift
+    /// moves the sound and not the numbers, because the face draws the
+    /// mode's own law over the incoming spectrum and must not be
+    /// handed the shift a second time.
+    #[test]
+    fn the_moments_are_measured_before_the_mode() {
+        let n = FS as usize / 2;
+        let l = sine(1_000.0, 0.5, n);
+        let mut flat = core_with(&[(p::MODE, 2.0), (p::PITCH, 0.0), (p::MIX, 100.0)]);
+        let a = readout_after(&mut flat, &l);
+        let mut up = core_with(&[(p::MODE, 2.0), (p::PITCH, 12.0), (p::MIX, 100.0)]);
+        let b = readout_after(&mut up, &l);
+        assert!(
+            (a.bands[0] - b.bands[0]).abs() < 0.005,
+            "the shift reached the centroid: {} against {}",
+            a.bands[0],
+            b.bands[0]
+        );
+        assert!(
+            (a.reduction_db - b.reduction_db).abs() < 0.5,
+            "the shift reached the height: {} against {}",
+            a.reduction_db,
+            b.reduction_db
+        );
+    }
+
+    /// reduction_db is the analysed INPUT frame's tallest bin, so the
+    /// rake has a height at MIX 0 — where level_db is busy reporting
+    /// the dry going past — and a half-scale tone reads about -6 dBFS,
+    /// which is the window's gain divided back out.
+    #[test]
+    fn the_rake_has_a_height_at_no_mix() {
+        let n = FS as usize / 2;
+        let mut loud = core_with(&[]);
+        let a = readout_after(&mut loud, &sine(1_000.0, 0.5, n));
+        assert!(loud.settings().is_wire(), "the test is not at MIX 0");
+        let mut quiet = core_with(&[]);
+        let b = readout_after(&mut quiet, &sine(1_000.0, 0.005, n));
+        assert!(
+            (a.reduction_db + 6.0).abs() < 3.0,
+            "half scale read {} dBFS",
+            a.reduction_db
+        );
+        assert!(
+            a.reduction_db > b.reduction_db + 30.0,
+            "the height did not follow the level: {} against {}",
+            a.reduction_db,
+            b.reduction_db
+        );
+        assert!(a.reduction_db >= -120.0 && b.reduction_db >= -120.0);
     }
 
     #[test]

@@ -45,12 +45,120 @@ impl Settings {
     }
 }
 
+/// THE ONSET CLOCK: the one thing about this section only the
+/// callback can know.
+///
+/// Two one-pole envelopes of the input peak — a fast one that rides a
+/// transient's edge and a slow one that holds the bed under it — and
+/// the ages of the two most recent times the fast one stood clear of
+/// the slow one. Ages are kept in SAMPLES, and `0.0` means "no onset
+/// in flight" rather than "an onset this instant": a live onset is
+/// always at least one sample old, so the flag costs nothing.
+///
+/// Two multiply-adds and a compare per sample, plus one `log10` at
+/// most once per lockout. No allocation, no lock, no unbounded loop.
+struct Onset {
+    /// One-pole coefficients for the two envelopes, from the ms time
+    /// constants in `params::console::smear`.
+    fast_coeff: f32,
+    slow_coeff: f32,
+    fast: f32,
+    slow: f32,
+    /// Samples since the newest onset; 0.0 when none is in flight.
+    age0: f32,
+    /// Samples since the one before it, same convention.
+    age1: f32,
+    /// The newest onset's strength, 0..1.
+    hit0: f32,
+    /// The retrigger lockout, in samples.
+    lockout: f32,
+    /// The age at which an onset stops being in flight, in samples.
+    expire: f32,
+    /// Sample to millisecond, so `process` can hand `readout` a figure
+    /// in the card's units without dividing there.
+    ms_per_sample: f32,
+}
+
+impl Onset {
+    fn new(sample_rate: f32) -> Self {
+        let fs = if sample_rate.is_finite() {
+            sample_rate.max(1.0)
+        } else {
+            48_000.0
+        };
+        let coeff = |ms: f32| 1.0 - (-1000.0 / (ms.max(0.01) * fs)).exp();
+        Self {
+            fast_coeff: coeff(p::ONSET_FAST_MS),
+            slow_coeff: coeff(p::ONSET_SLOW_MS),
+            fast: 0.0,
+            slow: 0.0,
+            age0: 0.0,
+            age1: 0.0,
+            hit0: 0.0,
+            lockout: fs * p::ONSET_LOCKOUT_MS / 1000.0,
+            expire: fs * p::ONSET_EXPIRE_MS / 1000.0,
+            ms_per_sample: 1000.0 / fs,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.fast = 0.0;
+        self.slow = 0.0;
+        self.age0 = 0.0;
+        self.age1 = 0.0;
+        self.hit0 = 0.0;
+    }
+
+    /// One sample of the input peak: age the clocks, then decide
+    /// whether this sample is an arrival.
+    fn feed(&mut self, peak: f32) {
+        self.fast += (peak - self.fast) * self.fast_coeff;
+        self.slow += (peak - self.slow) * self.slow_coeff;
+        if self.age0 > 0.0 {
+            self.age0 += 1.0;
+            if self.age0 > self.expire {
+                // Out of flight: the wavefront has crossed the field
+                // and the counter is parked rather than left to grow.
+                self.age0 = 0.0;
+                self.hit0 = 0.0;
+            }
+        }
+        if self.age1 > 0.0 {
+            self.age1 += 1.0;
+            if self.age1 > self.expire {
+                self.age1 = 0.0;
+            }
+        }
+        let armed = self.age0 == 0.0 || self.age0 > self.lockout;
+        if armed && self.fast > p::ONSET_RATIO * self.slow && self.fast > p::ONSET_FLOOR {
+            self.age1 = self.age0;
+            // One sample of age, not none: 0.0 is the "nothing in
+            // flight" flag and an arrival is a something.
+            self.age0 = 1.0;
+            let over = self.fast / self.slow.max(p::ONSET_BED_FLOOR);
+            self.hit0 = (20.0 * over.log10() / p::ONSET_FULL_DB).clamp(0.0, 1.0);
+        }
+    }
+
+    /// The three bands, in the card's units: ms, 0..1, ms.
+    fn bands(&self) -> [f32; 3] {
+        [
+            self.age0 * self.ms_per_sample,
+            self.hit0,
+            self.age1 * self.ms_per_sample,
+        ]
+    }
+}
+
 pub struct SmearCore {
     params: SectionParams,
     settings: Settings,
     sample_rate: f32,
     dispersers: [Disperser; 2],
     level_db: f32,
+    onset: Onset,
+    /// What `readout` hands over, computed at the end of `process`.
+    bands: [f32; 3],
 }
 
 impl SmearCore {
@@ -61,6 +169,8 @@ impl SmearCore {
             sample_rate,
             dispersers: [Disperser::new(), Disperser::new()],
             level_db: -120.0,
+            onset: Onset::new(sample_rate),
+            bands: [0.0; 3],
         };
         core.tune();
         core
@@ -93,6 +203,8 @@ impl SectionCore for SmearCore {
             disperser.reset();
         }
         self.level_db = -120.0;
+        self.onset.reset();
+        self.bands = [0.0; 3];
     }
 
     fn process(&mut self, l: &mut [f32], r: &mut [f32], _clock: &Clock) {
@@ -101,6 +213,19 @@ impl SectionCore for SmearCore {
             return;
         }
         let stereo = r.len() >= n;
+        // The onset clock runs on the INPUT, before the dispersers and
+        // whether or not any are running: what the card watches crawl
+        // across its time axis is when the transient ARRIVED, and a
+        // wire has arrivals too.
+        if stereo {
+            for (a, b) in l.iter().zip(r[..n].iter()) {
+                self.onset.feed(a.abs().max(b.abs()));
+            }
+        } else {
+            for a in l.iter() {
+                self.onset.feed(a.abs());
+            }
+        }
         if !self.settings.is_wire() {
             self.dispersers[0].process(l);
             if stereo {
@@ -116,13 +241,41 @@ impl SectionCore for SmearCore {
         } else {
             20.0 * peak.log10()
         };
+        self.bands = self.onset.bands();
     }
 
+    /// What the card is told, per field:
+    ///
+    /// - `level_db`: the loudest sample of the block's OUTPUT, dBFS,
+    ///   −120.0 at silence, no smoothing — it is the block's extreme,
+    ///   not its last sample. The section is flat to 0.3 dB at every
+    ///   setting, so this is the input level too, which is what lets
+    ///   the two level columns be drawn from the one figure.
+    /// - `reduction_db`: always exactly 0.0. This section takes
+    ///   nothing away.
+    /// - `bands[0]`: MILLISECONDS SINCE THE NEWEST ONSET, 0..1000 ms,
+    ///   and EXACTLY 0.0 when no onset is in flight — a live onset is
+    ///   always at least one sample old, so 0.0 is a safe "none". The
+    ///   clock is started by a peak envelope of 1 ms time constant
+    ///   standing 1.6x clear of one of 120 ms, no faster than once
+    ///   every 30 ms, and it is dropped back to 0.0 once it passes
+    ///   1000 ms.
+    /// - `bands[1]`: THAT ONSET'S STRENGTH, 0..1: how far the fast
+    ///   envelope stood over the slow bed at the instant it arrived,
+    ///   in dB over 12 dB, clamped. It is latched at the onset and
+    ///   held for as long as `bands[0]` runs, and falls to 0.0 with
+    ///   it.
+    /// - `bands[2]`: MILLISECONDS SINCE THE PREVIOUS ONSET, same
+    ///   0..1000 ms range and same exact-0.0 convention, so two
+    ///   wavefronts can be in flight at once. It is always the larger
+    ///   of the two ages while both are live.
+    ///
+    /// All of it is measured in `process`; this is a copy.
     fn readout(&self) -> Readout {
         Readout {
             level_db: self.level_db,
             reduction_db: 0.0,
-            bands: [self.settings.stages as f32, self.settings.centre, 0.0],
+            bands: self.bands,
         }
     }
 }
@@ -166,6 +319,23 @@ mod tests {
         }
         out
     }
+
+    /// Run a signal through in blocks and keep the readout after each
+    /// one: the card's view, sampled where the graph samples it.
+    fn readouts(core: &mut SmearCore, l: &[f32]) -> Vec<Readout> {
+        let mut out = l.to_vec();
+        let mut said = Vec::new();
+        for start in (0..out.len()).step_by(BLOCK) {
+            let end = (start + BLOCK).min(out.len());
+            core.process(&mut out[start..end], &mut [], &clock());
+            said.push(core.readout());
+        }
+        said
+    }
+
+    /// One block of 256 at 48 kHz, in ms — the step the clock takes
+    /// between two readouts.
+    const BLOCK_MS: f32 = 1000.0 * BLOCK as f32 / FS;
 
     fn rms(s: &[f32]) -> f32 {
         (s.iter().map(|x| x * x).sum::<f32>() / s.len() as f32).sqrt()
@@ -259,5 +429,201 @@ mod tests {
         core.set_param(99, 1.0);
         core.set_param(p::AMOUNT, 0.0);
         assert!(core.settings().is_wire());
+    }
+
+    /// At its defaults, on silence, the section reports rest: nothing
+    /// in flight, no strength, no reduction, the level floor. And the
+    /// bands carry no SETTING any more — a section wound all the way
+    /// up but hearing nothing still reads three zeroes, which is what
+    /// makes a moving band mean something.
+    #[test]
+    fn at_rest_the_section_reports_rest() {
+        let mut core = core_with(&[]);
+        assert!(core.settings().is_wire());
+        assert_eq!(core.readout().bands, [0.0, 0.0, 0.0]);
+        assert_eq!(core.readout().reduction_db, 0.0);
+        for said in readouts(&mut core, &vec![0.0f32; BLOCK * 8]) {
+            assert_eq!(said.bands, [0.0, 0.0, 0.0], "silence started a clock");
+            assert_eq!(said.reduction_db, 0.0);
+            assert_eq!(said.level_db, -120.0);
+        }
+        let mut wound_up = core_with(&[(p::AMOUNT, 32.0), (p::CENTRE, 8_000.0)]);
+        let said = readouts(&mut wound_up, &vec![0.0f32; BLOCK * 4]);
+        assert_eq!(
+            said[3].bands,
+            [0.0, 0.0, 0.0],
+            "a setting leaked into a band"
+        );
+    }
+
+    /// bands[0] is a CLOCK: a click starts it and it counts real
+    /// milliseconds, one block's worth per block, until it lets go.
+    #[test]
+    fn a_click_starts_a_clock_that_counts_milliseconds() {
+        let mut core = core_with(&[(p::AMOUNT, 16.0), (p::CENTRE, 1_000.0)]);
+        let mut l = vec![0.0f32; BLOCK * 12];
+        l[BLOCK + 8] = 1.0;
+        let said = readouts(&mut core, &l);
+        assert_eq!(said[0].bands[0], 0.0, "the clock ran before the click");
+        let first = said[1].bands[0];
+        let expected = 1000.0 * (BLOCK - 8) as f32 / FS;
+        assert!(
+            (first - expected).abs() < 0.05,
+            "the click's own block read {first} ms, not {expected}"
+        );
+        for k in 2..said.len() {
+            let step = said[k].bands[0] - said[k - 1].bands[0];
+            assert!(
+                (step - BLOCK_MS).abs() < 0.01,
+                "block {k} advanced {step} ms, not {BLOCK_MS}"
+            );
+        }
+    }
+
+    /// The clock is not a stopwatch: an onset stays in flight for a
+    /// second and then every band drops back to exactly 0.0, which is
+    /// the "nothing crawling" the card draws as an empty field.
+    #[test]
+    fn the_clock_lets_go_after_a_second() {
+        let mut core = core_with(&[]);
+        let mut l = vec![0.0f32; FS as usize * 2];
+        l[BLOCK] = 1.0;
+        let said = readouts(&mut core, &l);
+        let held = said.iter().fold(0.0f32, |peak, r| peak.max(r.bands[0]));
+        assert!(
+            (held - p::ONSET_EXPIRE_MS).abs() < BLOCK_MS + 0.1,
+            "the clock held {held} ms"
+        );
+        assert_eq!(said[said.len() - 1].bands, [0.0, 0.0, 0.0]);
+    }
+
+    /// bands[1] measures the arrival against the bed it landed on: a
+    /// click out of silence is a full-strength hit, a swell of the
+    /// same music is not.
+    #[test]
+    fn the_hit_measures_the_onset_against_its_bed() {
+        let bare = {
+            let mut core = core_with(&[]);
+            let mut l = vec![0.0f32; BLOCK * 4];
+            l[BLOCK] = 1.0;
+            readouts(&mut core, &l)[1].bands[1]
+        };
+        let over_a_bed = {
+            let mut core = core_with(&[]);
+            let mut l = sine(1_000.0, 0.2, BLOCK * 48);
+            // Four times as loud from block 40, once the slow envelope
+            // has had three time constants to learn the quiet bed.
+            for s in l[BLOCK * 40..].iter_mut() {
+                *s *= 4.0;
+            }
+            readouts(&mut core, &l)[40].bands[1]
+        };
+        assert!(bare > 0.9, "a click out of silence read {bare}");
+        assert!(
+            over_a_bed > 0.1,
+            "a swell over a bed read nothing: {over_a_bed}"
+        );
+        assert!(
+            over_a_bed < bare,
+            "a swell ({over_a_bed}) read as hard as a click ({bare})"
+        );
+    }
+
+    /// bands[2] is the onset BEFORE the newest one, on its own clock,
+    /// so two wavefronts can be crawling across the field at once.
+    #[test]
+    fn the_older_onset_keeps_its_own_clock() {
+        let mut core = core_with(&[(p::AMOUNT, 32.0), (p::CENTRE, 1_000.0)]);
+        let gap = (FS * 0.2) as usize;
+        let mut l = vec![0.0f32; BLOCK * 60];
+        l[BLOCK] = 1.0;
+        l[BLOCK + gap] = 1.0;
+        let said = readouts(&mut core, &l);
+        let last = said[said.len() - 1];
+        assert!(last.bands[0] > 0.0, "the newest onset is not in flight");
+        let apart = last.bands[2] - last.bands[0];
+        assert!(
+            (apart - 200.0).abs() < 0.1,
+            "the two clocks are {apart} ms apart, not 200"
+        );
+    }
+
+    /// One hit is one wavefront: a second click inside the 30 ms
+    /// lockout does not start a clock of its own, so the older band
+    /// stays at rest.
+    #[test]
+    fn a_retrigger_inside_the_lockout_is_ignored() {
+        let mut core = core_with(&[]);
+        let mut l = vec![0.0f32; BLOCK * 20];
+        l[BLOCK] = 1.0;
+        l[BLOCK + (FS * 0.010) as usize] = 1.0;
+        let said = readouts(&mut core, &l);
+        let last = said[said.len() - 1];
+        assert_eq!(last.bands[2], 0.0, "the lockout let a second onset through");
+        let since_first = 1000.0 * (l.len() - BLOCK) as f32 / FS;
+        assert!(
+            (last.bands[0] - since_first).abs() < 0.05,
+            "the clock reads {} ms, not the first click's {since_first}",
+            last.bands[0]
+        );
+    }
+
+    /// A tone that has arrived stops arriving. While the slow envelope
+    /// is still learning a signal that began in digital silence the
+    /// clock restarts a few times — that is a real onset each time —
+    /// but once the bed has caught up the clock only counts on.
+    #[test]
+    fn a_settled_tone_stops_onsetting() {
+        let mut core = core_with(&[]);
+        let said = readouts(&mut core, &sine(1_000.0, 0.4, BLOCK * 100));
+        let settled = (2.0 * p::ONSET_SLOW_MS / BLOCK_MS) as usize;
+        for k in settled..said.len() {
+            let step = said[k].bands[0] - said[k - 1].bands[0];
+            assert!(
+                (step - BLOCK_MS).abs() < 0.01,
+                "block {k} of a held tone re-onset: {step} ms"
+            );
+        }
+        assert!(said[said.len() - 1].bands[0] > 2.0 * p::ONSET_SLOW_MS);
+    }
+
+    /// The clock runs when the section is a WIRE, and running it costs
+    /// the audio nothing: a wire still has arrivals, and the card's
+    /// wavefront must sweep an empty rack too.
+    #[test]
+    fn a_wire_still_reports_the_onset() {
+        let mut core = core_with(&[]);
+        assert!(core.settings().is_wire());
+        let mut l = vec![0.0f32; BLOCK * 4];
+        l[BLOCK] = 1.0;
+        let before = l.clone();
+        let mut out = l.clone();
+        let mut said = Vec::new();
+        for start in (0..out.len()).step_by(BLOCK) {
+            let end = start + BLOCK;
+            core.process(&mut out[start..end], &mut [], &clock());
+            said.push(core.readout());
+        }
+        assert_eq!(out, before, "the wire changed the sound");
+        assert!(said[1].bands[0] > 0.0, "a wire reported no arrival");
+        assert!(said[1].bands[1] > 0.9, "a wire reported no strength");
+    }
+
+    /// The level is the block's peak in dBFS and the reduction stays
+    /// zero at every setting: this section takes nothing away, which
+    /// is the promise the card's twin columns are drawn from.
+    #[test]
+    fn the_level_is_the_block_peak_and_nothing_is_taken_away() {
+        let mut core = core_with(&[(p::AMOUNT, 32.0), (p::CENTRE, 1_000.0)]);
+        let said = readouts(&mut core, &sine(1_000.0, 0.5, BLOCK * 8));
+        let last = said[said.len() - 1];
+        assert!(
+            (last.level_db - 20.0 * 0.5f32.log10()).abs() < 0.3,
+            "a half-scale tone read {} dB",
+            last.level_db
+        );
+        for r in &said {
+            assert_eq!(r.reduction_db, 0.0);
+        }
     }
 }

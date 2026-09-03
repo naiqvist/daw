@@ -41,8 +41,14 @@ pub struct IronCore {
     k: f32,
     bias: f32,
     makeup: f32,
+    /// One pole at the lift's own corner, per channel: the running
+    /// bass content of the signal the core is actually fed.
+    lp: [f32; 2],
+    lp_a: f32,
     level_db: f32,
     heat: f32,
+    asym: f32,
+    bottom: f32,
 }
 
 impl IronCore {
@@ -59,8 +65,12 @@ impl IronCore {
             k: 1.0,
             bias: p::BIAS_FLOOR,
             makeup: 1.0,
+            lp: [0.0; 2],
+            lp_a: 0.0,
             level_db: -120.0,
             heat: 0.0,
+            asym: 0.0,
+            bottom: 0.0,
         };
         for ch in 0..2 {
             core.lift[ch].prepare(
@@ -97,6 +107,14 @@ impl IronCore {
             .find(|def| def.id == p::DRIVE)
             .map_or(raw, |def| def.clamp(raw))
             / 100.0;
+        // The bass reader's pole, at the same corner the lift turns on,
+        // so "the bottom" means exactly the band the lift hands the iron.
+        let fs = if self.sample_rate.is_finite() && self.sample_rate > 0.0 {
+            self.sample_rate
+        } else {
+            48_000.0
+        };
+        self.lp_a = (1.0 - (-core::f32::consts::TAU * p::LIFT_HZ / fs).exp()).clamp(0.0, 1.0);
         self.k = 1.0 + p::CURVE_DRIVE * self.drive;
         self.bias = p::BIAS_FLOOR + (p::BIAS_FULL - p::BIAS_FLOOR) * self.drive;
         // Unity for a −10 dBFS sine, whatever the drive: the iron is
@@ -119,14 +137,38 @@ impl IronCore {
     fn run(&mut self, ch: usize, io: &mut [f32]) {
         let n = io.len();
         self.lift[ch].process(io);
+        // How much of the flux driving the core is bottom. Read HERE —
+        // after the lift, before the curve — because this is the signal
+        // the iron sees, and the lift is the reason it is worth seeing.
+        let a = self.lp_a;
+        let (mut lo_peak, mut hi_peak) = (0.0f32, 0.0f32);
+        for x in io.iter() {
+            self.lp[ch] += a * (*x - self.lp[ch]);
+            lo_peak = lo_peak.max(self.lp[ch].abs());
+            hi_peak = hi_peak.max(x.abs());
+        }
+        self.bottom = self
+            .bottom
+            .max((lo_peak / hi_peak.max(p::TELEMETRY_EPS)).min(1.0));
         let lane = &mut self.lane[..n * 2];
         self.over[ch].up(io, lane);
         let (k, bias) = (self.k, self.bias);
         let mut hottest = 0.0f32;
+        // The even-order term, measured where it is made: a curve with a
+        // bias pushes the shaped signal off centre, and that offset IS
+        // the second harmonic's home. The DC blocker below strips it out
+        // of the sound; we read it on the way past.
+        let (mut sum, mut shaped_peak) = (0.0f32, 0.0f32);
         for x in lane.iter_mut() {
             hottest = hottest.max((*x * k).abs());
             *x = curve(*x, k, bias);
+            sum += *x;
+            shaped_peak = shaped_peak.max(x.abs());
         }
+        let mean = sum / lane.len() as f32;
+        self.asym = self
+            .asym
+            .max((mean.abs() / shaped_peak.max(p::TELEMETRY_EPS) * p::ASYM_SCALE).min(1.0));
         self.over[ch].down(lane, io);
         let makeup = self.makeup;
         if makeup != 1.0 {
@@ -153,8 +195,11 @@ impl SectionCore for IronCore {
             self.over[ch].reset();
             self.dc[ch].reset();
         }
+        self.lp = [0.0; 2];
         self.level_db = -120.0;
         self.heat = 0.0;
+        self.asym = 0.0;
+        self.bottom = 0.0;
     }
 
     fn process(&mut self, l: &mut [f32], r: &mut [f32], _clock: &Clock) {
@@ -163,7 +208,9 @@ impl SectionCore for IronCore {
             return;
         }
         let stereo = r.len() >= n;
-        self.heat *= 0.8;
+        self.heat *= p::TELEMETRY_DECAY;
+        self.asym *= p::TELEMETRY_DECAY;
+        self.bottom *= p::TELEMETRY_DECAY;
         self.run(0, l);
         if stereo {
             self.run(1, &mut r[..n]);
@@ -179,11 +226,38 @@ impl SectionCore for IronCore {
         };
     }
 
+    /// A pure copy of fields measured in `process` — the graph calls
+    /// this from its telemetry step, so it does no work.
+    ///
+    /// - `level_db`: the loudest sample leaving the stage this block, in
+    ///   dBFS, over −120..0-and-a-bit. Per block, no smoothing: it is a
+    ///   peak, not a meter.
+    /// - `reduction_db`: **flux**, negated so the sign matches every
+    ///   other section's reduction. `-heat`, where heat is 0..1 — the
+    ///   hottest the curve's input got this block against a full-scale
+    ///   of 3.0 — so the figure runs 0 (rest) down to −1 (the iron is
+    ///   being pushed as hard as the reading goes).
+    /// - `bands[0]`: **drive**, 0..1, the DRIVE setting normalised. A
+    ///   setting, not a measurement, and it moves only when the hand
+    ///   does — there is no time constant on it.
+    /// - `bands[1]`: **asym**, 0..1, the even-harmonic content the curve
+    ///   is making right now: the mean of the shaped, oversampled signal
+    ///   as a fraction of its peak, times `ASYM_SCALE` (so a quarter of
+    ///   the peak reads full), clamped. Zero for a symmetric or silent
+    ///   block; grows with drive because the curve's bias walks with it.
+    /// - `bands[2]`: **bottom**, 0..1, how much of what drives the core
+    ///   is bass: the peak of a one-pole at `LIFT_HZ` over the peak of
+    ///   the full band, both taken after the lift shelf and before the
+    ///   curve. 1.0 is all bottom, 0.0 is nothing under the corner.
+    ///
+    /// All three of flux, asym and bottom share one ballistic: peak-hold
+    /// within a block, then `TELEMETRY_DECAY` (0.8) of it carried into
+    /// the next — a ~5 ms half-life at a 256-sample block, 48 kHz.
     fn readout(&self) -> Readout {
         Readout {
             level_db: self.level_db,
             reduction_db: -self.heat,
-            bands: [self.drive, 0.0, 0.0],
+            bands: [self.drive, self.asym, self.bottom],
         }
     }
 }
@@ -288,6 +362,40 @@ mod tests {
         let l = sine(100.0, 0.4, BLOCK);
         let out = run(&mut core, &l);
         assert!(out != l, "the floor was a wire");
+    }
+
+    #[test]
+    fn probe_bands() {
+        let n = FS as usize / 4;
+        for hz in [60.0f32, 100.0, 1000.0] {
+            for drive in [5.0f32, 20.0, 50.0, 100.0] {
+                for amp in [0.05f32, 0.2, 0.5] {
+                    let l = sine(hz, amp, n);
+                    let mut core = core_with(drive);
+                    let _ = run(&mut core, &l);
+                    let rd = core.readout();
+                    println!(
+                        "hz {hz} drive {drive} amp {amp} -> asym {:.4} bottom {:.4} heat {:.4}",
+                        rd.bands[1], rd.bands[2], -rd.reduction_db
+                    );
+                }
+            }
+        }
+        let white: Vec<f32> = (0..n)
+            .map(|i| {
+                let x = (i as f32 * 12.9898).sin() * 43758.547;
+                (x - x.floor()) * 0.6 - 0.3
+            })
+            .collect();
+        for drive in [5.0f32, 100.0] {
+            let mut core = core_with(drive);
+            let _ = run(&mut core, &white);
+            let rd = core.readout();
+            println!(
+                "noise drive {drive} -> asym {:.4} bottom {:.4}",
+                rd.bands[1], rd.bands[2]
+            );
+        }
     }
 
     #[test]

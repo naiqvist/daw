@@ -169,6 +169,7 @@ impl SectionCore for PhaseCore {
         self.since = 0;
         self.tune();
         self.level_db = -120.0;
+        self.sweep_now = [0.0; 2];
     }
 
     fn process(&mut self, l: &mut [f32], r: &mut [f32], _clock: &Clock) {
@@ -177,7 +178,14 @@ impl SectionCore for PhaseCore {
             return;
         }
         let stereo = r.len() >= n;
-        if !self.settings.is_wire() {
+        if self.settings.is_wire() {
+            // A wire has no sweep at all: neither side ran, so the last
+            // angle the LFOs stopped at is stale the moment the section
+            // goes flat. Park the sweep so the readout comes to REST
+            // rather than jamming mid-swing at a number that is no
+            // longer being computed.
+            self.sweep_now = [0.0; 2];
+        } else {
             // Where the control clock falls in this block, decided once
             // so both sides tune at the same samples.
             let mut tune_at = [false; MAX_BLOCK];
@@ -192,6 +200,12 @@ impl SectionCore for PhaseCore {
             self.run(0, l, &tune_at[..n]);
             if stereo {
                 self.run(1, &mut r[..n], &tune_at[..n]);
+            } else {
+                // Mono: side 1's run never happened, so its LFO did not
+                // advance and its sweep would go stale and freeze half
+                // the readout. On a mono block there is one sweep, and
+                // both sides report it.
+                self.sweep_now[1] = self.sweep_now[0];
             }
         }
         let peak = l
@@ -205,15 +219,41 @@ impl SectionCore for PhaseCore {
         };
     }
 
+    /// What the section tells the surface. A pure copy of fields the
+    /// block already measured — no arithmetic, because the graph calls
+    /// this on its telemetry step.
+    ///
+    /// - `level_db`: the loudest OUTPUT sample of the block, both sides
+    ///   together, in dBFS. Range −120..≈0 (a resonant feedback peak can
+    ///   nudge just above 0). Unsmoothed and unheld, so its time
+    ///   constant is the block itself — about 5 ms at 256 samples — and
+    ///   it drops to −120 on the first silent block.
+    /// - `reduction_db`: always exactly 0. A phaser is a phase network
+    ///   mixed half-and-half with the dry; it has no gain computer and
+    ///   reduces nothing, ever.
+    /// - `bands[0]`: the LEFT SWEEP. The left LFO's own bipolar output
+    ///   at the block's last sample — dimensionless, −1..=1, a sine.
+    ///   Its only time constant is the sweep's own period, one cycle per
+    ///   `Rate`, so 0.1 s at 10 Hz to 20 s at 0.05 Hz; nothing else
+    ///   filters or smooths it, and it steps once per block. It is the
+    ///   angle the left comb stands at: the corner in Hz is
+    ///   `LOW_HZ * 2^(log2(HIGH_HZ / LOW_HZ) * (bands[0] * 0.5 + 0.5) *
+    ///   depth)`, which is [`PhaseCore::corner`] verbatim. Exactly 0 and
+    ///   dead still whenever the section is a wire, because then the
+    ///   LFOs do not run.
+    /// - `bands[1]`: the RIGHT SWEEP — the same quantity, same units,
+    ///   same −1..=1 range and same time constant, for side 1, whose
+    ///   cycle stands `Offset / 360` of a turn ahead of side 0. On a MONO
+    ///   block side 1 never runs and this reads exactly `bands[0]`.
+    ///   Exactly 0 when the section is a wire.
+    /// - `bands[2]`: unused, always exactly 0. The section has two
+    ///   sweeps and nothing else that moves; it carries no third figure
+    ///   rather than repeating a setting the surface already holds.
     fn readout(&self) -> Readout {
         Readout {
             level_db: self.level_db,
             reduction_db: 0.0,
-            bands: [
-                self.settings.stages as f32,
-                self.sweep_now[0],
-                self.sweep_now[1],
-            ],
+            bands: [self.sweep_now[0], self.sweep_now[1], 0.0],
         }
     }
 }
@@ -274,6 +314,29 @@ mod tests {
 
     fn rms(s: &[f32]) -> f32 {
         (s.iter().map(|x| x * x).sum::<f32>() / s.len() as f32).sqrt()
+    }
+
+    /// One `bands` reading per block, so a test can WATCH the sweep move
+    /// on the section's own clock instead of asking it what it holds.
+    fn bands_over(core: &mut PhaseCore, l: &[f32], stereo: bool) -> Vec<[f32; 3]> {
+        let (mut ol, mut or) = (l.to_vec(), l.to_vec());
+        let mut said = Vec::new();
+        for start in (0..l.len()).step_by(BLOCK) {
+            let end = (start + BLOCK).min(l.len());
+            if stereo {
+                core.process(&mut ol[start..end], &mut or[start..end], &clock());
+            } else {
+                core.process(&mut ol[start..end], &mut [], &clock());
+            }
+            said.push(core.readout().bands);
+        }
+        said
+    }
+
+    fn span(said: &[[f32; 3]], k: usize) -> (f32, f32) {
+        said.iter().fold((f32::MAX, f32::MIN), |(lo, hi), b| {
+            (lo.min(b[k]), hi.max(b[k]))
+        })
     }
 
     #[test]
@@ -387,6 +450,164 @@ mod tests {
         for (x, y) in a.iter().zip(&b) {
             assert!((x - y).abs() < 1e-4);
         }
+    }
+
+    /// `bands[0]` is the LEFT sweep itself, running on the phaser's own
+    /// clock: it completes one cycle per RATE hertz. Counted rather than
+    /// asserted — the band is sampled once a block and its sign changes
+    /// are counted against the seconds that actually passed.
+    #[test]
+    fn the_sweep_band_runs_at_the_rate() {
+        let seconds = 2.0f32;
+        let n = (FS * seconds) as usize;
+        let l = sine(440.0, 0.3, n);
+        for rate in [1.0f32, 3.0] {
+            let mut core = core_with(&[(p::DEPTH, 70.0), (p::RATE, rate)]);
+            let said = bands_over(&mut core, &l, true);
+            let crossings = said
+                .windows(2)
+                .filter(|w| (w[0][0] < 0.0) != (w[1][0] < 0.0))
+                .count();
+            // A sine crosses zero twice a cycle.
+            let want = (2.0 * rate * seconds) as usize;
+            assert!(
+                crossings.abs_diff(want) <= 1,
+                "{rate} Hz swept {crossings} crossings, wanted about {want}"
+            );
+            let (lo, hi) = span(&said, 0);
+            assert!(lo < -0.98 && hi > 0.98, "the sweep only reached {lo}..{hi}");
+        }
+    }
+
+    /// `bands[1]` is the RIGHT sweep, standing OFFSET of a turn from the
+    /// left one. Half a turn is exact antiphase and a quarter turn exact
+    /// quadrature; both are measured off the readout, and the gap
+    /// between the two bands is what draws the two carriages apart.
+    #[test]
+    fn the_two_bands_stand_the_offset_apart() {
+        let n = FS as usize;
+        let l = sine(440.0, 0.3, n);
+
+        let mut core = core_with(&[(p::DEPTH, 70.0), (p::RATE, 2.0), (p::OFFSET, 180.0)]);
+        let said = bands_over(&mut core, &l, true);
+        let worst = said.iter().fold(0.0f32, |w, b| w.max((b[0] + b[1]).abs()));
+        assert!(
+            worst < 3e-3,
+            "half a turn was not antiphase: off by {worst}"
+        );
+
+        let mut core = core_with(&[(p::DEPTH, 70.0), (p::RATE, 2.0), (p::OFFSET, 90.0)]);
+        let said = bands_over(&mut core, &l, true);
+        // sin(t)^2 + sin(t + quarter turn)^2 == 1, and only at quadrature.
+        let worst = said.iter().fold(0.0f32, |w, b| {
+            w.max((b[0] * b[0] + b[1] * b[1] - 1.0).abs())
+        });
+        assert!(
+            worst < 3e-3,
+            "a quarter turn was not square: off by {worst}"
+        );
+        for k in [0usize, 1] {
+            let (lo, hi) = span(&said, k);
+            assert!(lo < -0.98 && hi > 0.98, "band {k} only swung {lo}..{hi}");
+        }
+    }
+
+    /// A mono block runs side 0 only, so side 1's LFO never advances.
+    /// The right band must still carry a live sweep rather than the
+    /// angle it happened to stop at when the block last went stereo.
+    #[test]
+    fn a_mono_block_still_moves_the_right_band() {
+        let n = FS as usize;
+        let l = sine(440.0, 0.3, n);
+        let mut core = core_with(&[(p::DEPTH, 70.0), (p::RATE, 2.0)]);
+        let said = bands_over(&mut core, &l, false);
+        for b in &said {
+            assert_eq!(b[0], b[1], "the mono block let the right band drift");
+        }
+        let (lo, hi) = span(&said, 1);
+        assert!(lo < -0.98 && hi > 0.98, "the right band sat at {lo}..{hi}");
+    }
+
+    /// At its defaults the section is a wire, and the readout must say
+    /// so: no sweep at all, and no level once the sound stops. The
+    /// second half pins the other end of it — a section that swept and
+    /// was then flattened parks its bands instead of freezing at the
+    /// angle it stopped on.
+    #[test]
+    fn the_defaults_report_rest() {
+        let n = FS as usize / 4;
+        let l = sine(440.0, 0.3, n);
+
+        let mut core = core_with(&[]);
+        assert!(core.settings().is_wire());
+        for b in &bands_over(&mut core, &l, true) {
+            assert_eq!(*b, [0.0, 0.0, 0.0], "a wire reported a sweep");
+        }
+        let (mut quiet_l, mut quiet_r) = (vec![0.0f32; BLOCK], vec![0.0f32; BLOCK]);
+        core.process(&mut quiet_l, &mut quiet_r, &clock());
+        let said = core.readout();
+        assert_eq!(said.bands, [0.0, 0.0, 0.0]);
+        assert_eq!(said.level_db, -120.0);
+        assert_eq!(said.reduction_db, 0.0);
+
+        let mut core = core_with(&[(p::DEPTH, 70.0), (p::RATE, 2.0)]);
+        let moving = bands_over(&mut core, &l, true);
+        assert!(
+            moving.iter().any(|b| b[0].abs() > 0.5),
+            "the sweep never ran to begin with"
+        );
+        core.set_param(p::DEPTH, 0.0);
+        assert!(core.settings().is_wire());
+        for b in &bands_over(&mut core, &l, true) {
+            assert_eq!(*b, [0.0, 0.0, 0.0], "a flattened section jammed mid-swing");
+        }
+    }
+
+    /// `bands[0]` used to carry `stages as f32`, a number the surface
+    /// already holds as its own parameter and which reads 2..16. It now
+    /// carries the left sweep, so it stays inside −1..=1 at EVERY stage
+    /// position, and `bands[2]` says nothing at all.
+    #[test]
+    fn the_bands_carry_no_setting() {
+        let n = FS as usize / 8;
+        let l = sine(440.0, 0.3, n);
+        for step in 0..p::STAGE_COUNTS.len() {
+            let mut core = core_with(&[(p::STAGES, step as f32), (p::DEPTH, 70.0), (p::RATE, 2.0)]);
+            let said = bands_over(&mut core, &l, true);
+            for b in &said {
+                assert!(
+                    b[0].abs() <= 1.0 && b[1].abs() <= 1.0,
+                    "step {step} put a setting in the sweep's slot: {b:?}"
+                );
+                assert_eq!(b[2], 0.0, "step {step} spoke on the silent band");
+            }
+            assert!(
+                said.iter().any(|b| b[0].abs() > 0.5),
+                "step {step}: the sweep never ran"
+            );
+        }
+    }
+
+    /// The level band lights the comb, so it has to follow the sound
+    /// and not the settings: a loud block reads far above a quiet one,
+    /// and silence reads the floor.
+    #[test]
+    fn the_level_band_follows_the_sound() {
+        let n = BLOCK * 8;
+        let level_of = |amp: f32| -> f32 {
+            let mut core = core_with(&[(p::DEPTH, 70.0), (p::RATE, 2.0)]);
+            let l = sine(440.0, amp, n);
+            let _ = bands_over(&mut core, &l, true);
+            core.readout().level_db
+        };
+        let loud = level_of(0.5);
+        let quiet = level_of(0.05);
+        assert!(
+            loud - quiet > 15.0,
+            "a tenth of the amplitude only moved the level {loud} to {quiet}"
+        );
+        assert!(loud < 0.5, "the section handed back more than it was given");
+        assert_eq!(level_of(0.0), -120.0, "silence did not read the floor");
     }
 
     #[test]

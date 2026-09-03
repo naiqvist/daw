@@ -308,7 +308,12 @@ impl SectionKind {
     pub fn owns_its_glass(self) -> bool {
         matches!(
             self,
-            SectionKind::Preamp | SectionKind::Tone | SectionKind::Door
+            SectionKind::Preamp
+                | SectionKind::Tone
+                | SectionKind::Door
+                | SectionKind::Glue
+                | SectionKind::Ceiling
+                | SectionKind::Scope
         )
     }
 
@@ -799,6 +804,119 @@ impl Default for Telemetry {
     }
 }
 
+/// SMEAR's law, green side.
+///
+/// The card's whole middle is a bar chart of WHEN each octave will
+/// arrive, and a card that guessed at that would be drawing a disperser
+/// that does not exist. So the group delay is computed from the very
+/// coefficients the kernel is tuned with — a topology-preserving SVF
+/// allpass at a prewarped corner — and the answer is in milliseconds,
+/// which is what the eye is being asked to read.
+pub mod smear_curve {
+    use super::SectionParams;
+    use crate::params::console::smear as p;
+
+    /// What the section is set to. The same two numbers the core reads.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct Shape {
+        pub stages: u32,
+        pub centre: f32,
+    }
+
+    impl Shape {
+        pub fn of(params: &SectionParams) -> Self {
+            let table = super::SectionKind::Smear.table();
+            let clamp = |id: u32| {
+                let value = params.value(id);
+                table
+                    .iter()
+                    .find(|def| def.id == id)
+                    .map_or(value, |def| def.clamp(value))
+            };
+            Self {
+                stages: clamp(p::AMOUNT).round().max(0.0) as u32,
+                centre: clamp(p::CENTRE),
+            }
+        }
+    }
+
+    /// The allpass's denominator, at the same prewarped corner the SVF
+    /// takes: `H(z) = (a2 + a1 z⁻¹ + z⁻²) / (1 + a1 z⁻¹ + a2 z⁻²)`.
+    fn coefficients(sample_rate: f64, hz: f64) -> (f64, f64) {
+        let nyquist = sample_rate * 0.5;
+        let hz = hz.clamp(1.0, nyquist * 0.98);
+        let g = (core::f64::consts::PI * hz / sample_rate).tan();
+        let k = 1.0 / f64::from(p::STAGE_Q).max(1e-3);
+        let denom = 1.0 + g * k + g * g;
+        if denom.abs() < 1e-12 {
+            return (0.0, 0.0);
+        }
+        ((2.0 * g * g - 2.0) / denom, (1.0 - g * k + g * g) / denom)
+    }
+
+    /// The phase one section turns at `omega`, in radians.
+    fn phase_at(a1: f64, a2: f64, omega: f64) -> f64 {
+        let (s1, c1) = omega.sin_cos();
+        let (s2, c2) = (2.0 * omega).sin_cos();
+        // Numerator a2 + a1 z⁻¹ + z⁻², denominator 1 + a1 z⁻¹ + a2 z⁻².
+        let nre = a2 + a1 * c1 + c2;
+        let nim = -(a1 * s1 + s2);
+        let dre = 1.0 + a1 * c1 + a2 * c2;
+        let dim = -(a1 * s1 + a2 * s2);
+        nim.atan2(nre) - dim.atan2(dre)
+    }
+
+    /// How long the chain holds `hz` back, in milliseconds.
+    ///
+    /// The group delay is the slope of the phase, so it is measured the
+    /// way a slope is measured: two phases a hair apart. The step is
+    /// small enough that no wrap can fall between them at any delay this
+    /// section can produce, and the arithmetic is in double so a
+    /// difference of two nearly equal angles keeps its digits.
+    pub fn group_delay_ms(shape: &Shape, sample_rate: f32, hz: f32) -> f32 {
+        if shape.stages == 0 {
+            return 0.0;
+        }
+        let fs = f64::from(sample_rate).max(1.0);
+        let (a1, a2) = coefficients(fs, f64::from(shape.centre));
+        let nyquist = fs * 0.5;
+        let omega = core::f64::consts::TAU * f64::from(hz).clamp(1.0, nyquist * 0.98) / fs;
+        let step = 1e-3;
+        let lo = (omega - step).max(1e-6);
+        let hi = (omega + step).min(core::f64::consts::PI - 1e-6);
+        let slope = (phase_at(a1, a2, hi) - phase_at(a1, a2, lo)) / (hi - lo);
+        let samples = (-slope).max(0.0) * f64::from(shape.stages);
+        (samples * 1000.0 / fs) as f32
+    }
+}
+
+/// GLUE's law, green side.
+///
+/// The bus compressor's card draws the settle line the fill walks to,
+/// and a card that sketched that line would be drawing a compressor
+/// that does not exist. So the card asks the SAME kernel the core
+/// configures, with the same numbers, and the two cannot drift.
+pub mod glue_curve {
+    use crate::dsp::dynamics::{GainComputer, Mode};
+    use crate::params::console::glue as p;
+
+    /// Where the threshold stands for a lean of 0..100: at the top of
+    /// the scale when nothing is leaning, down in the mix at full.
+    pub fn threshold_db(lean: f32) -> f32 {
+        let lean = (lean / 100.0).clamp(0.0, 1.0);
+        p::THRESHOLD_HIGH_DB + (p::THRESHOLD_LOW_DB - p::THRESHOLD_HIGH_DB) * lean
+    }
+
+    /// How much gain the computer asks for at `level_db`, in dB at or
+    /// below zero — the kernel's own soft knee, configured exactly as
+    /// the core configures it.
+    pub fn gain_db(level_db: f32, threshold_db: f32) -> f32 {
+        let mut computer = GainComputer::new();
+        computer.configure(Mode::Compress, threshold_db, p::RATIO, p::KNEE_DB);
+        computer.gain_db(level_db)
+    }
+}
+
 /// A section's settings as the graph's spec carries them: the kind, and
 /// the edits by id — exactly a device's overrides. A missing id reads
 /// as the table's default.
@@ -844,6 +962,67 @@ impl SectionParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SMEAR's card draws WHEN each octave arrives, so the figure it
+    /// draws is checked against the identity a second-order allpass is
+    /// known by: at its own corner one section holds the signal back by
+    /// four Q over omega-nought, and far below the corner by two over Q
+    /// omega-nought. If this ever stops agreeing, the card has started
+    /// drawing a disperser that is not the one running.
+    #[test]
+    fn the_smear_curve_is_the_allpass_the_kernel_runs() {
+        use crate::params::console::smear as p;
+        let fs = 48_000.0;
+        let centre = 1_000.0;
+        let q = p::STAGE_Q;
+        let one = smear_curve::Shape { stages: 1, centre };
+        let at_corner = smear_curve::group_delay_ms(&one, fs, centre);
+        let analogue = 4.0 * q / (core::f32::consts::TAU * centre) * 1000.0;
+        assert!(
+            (at_corner - analogue).abs() < analogue * 0.05,
+            "at the corner: {at_corner} ms against {analogue} ms"
+        );
+        let low = smear_curve::group_delay_ms(&one, fs, 30.0);
+        let far = 2.0 / (q * core::f32::consts::TAU * centre) * 1000.0;
+        assert!(
+            (low - far).abs() < far * 0.15,
+            "well below the corner: {low} ms against {far} ms"
+        );
+        // The corner is where the holding is deepest, and stacking
+        // sections multiplies it exactly.
+        assert!(at_corner > low * 2.0);
+        assert!(at_corner > smear_curve::group_delay_ms(&one, fs, 12_000.0));
+        let many = smear_curve::Shape { stages: 16, centre };
+        assert!(
+            (smear_curve::group_delay_ms(&many, fs, centre) - at_corner * 16.0).abs() < 1e-3,
+            "sixteen sections are not sixteen times one"
+        );
+        // No sections is a wire, at every frequency.
+        let none = smear_curve::Shape { stages: 0, centre };
+        for hz in [30.0, 1_000.0, 16_000.0] {
+            assert_eq!(smear_curve::group_delay_ms(&none, fs, hz), 0.0);
+        }
+    }
+
+    /// GLUE's settle line is the kernel's own knee, so leaning walks the
+    /// threshold down the vessel and a quiet mix is never touched.
+    #[test]
+    fn the_glue_curve_is_the_computer_the_core_configures() {
+        let open = glue_curve::threshold_db(0.0);
+        let deep = glue_curve::threshold_db(100.0);
+        assert_eq!(open, crate::params::console::glue::THRESHOLD_HIGH_DB);
+        assert_eq!(deep, crate::params::console::glue::THRESHOLD_LOW_DB);
+        assert_eq!(glue_curve::gain_db(-90.0, open), 0.0);
+        assert!(glue_curve::gain_db(0.0, deep) < 0.0);
+        // Past the knee the law is the ratio: one dB in, 1/2.5 dB out.
+        let a = glue_curve::gain_db(-6.0, deep);
+        let b = glue_curve::gain_db(-5.0, deep);
+        let slope = 1.0 + (b - a);
+        assert!(
+            (slope - 1.0 / crate::params::console::glue::RATIO).abs() < 0.02,
+            "the slope past the knee is {slope}"
+        );
+    }
 
     #[test]
     fn the_strip_starts_at_the_preamp_and_ends_at_out() {

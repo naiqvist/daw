@@ -53,72 +53,92 @@ pub fn joint_y(rect: egui::Rect) -> f32 {
 /// and a run of pieces that are all one width reads as a table rather
 /// than as a machine. The JOINT does not vary — that is what lets any
 /// two of them mate — so the shapes can differ as much as they like.
+///
+/// No two neighbours on the strip share a width, which is what gives
+/// the run its rhythm: wide, wide, narrow, narrow, wide.
 pub fn width_of(kind: SectionKind) -> f32 {
     match kind {
         // The channel's own stages.
         SectionKind::Preamp => PREAMP_W,
         SectionKind::Tone => 248.0,
         SectionKind::Door => 236.0,
-        SectionKind::Cut => 188.0,
-        SectionKind::Hit => 152.0,
-        SectionKind::Pump => 160.0,
-        SectionKind::Grit => 172.0,
-        SectionKind::Shine => 148.0,
-        SectionKind::Phase => 180.0,
-        SectionKind::Smear => 156.0,
-        SectionKind::Ring => 164.0,
-        SectionKind::Out => 192.0,
-        // The ones with a picture to draw.
-        SectionKind::Four => 288.0,
+        SectionKind::Cut => 204.0,
+        SectionKind::Hit => 166.0,
+        SectionKind::Four => 256.0,
         SectionKind::Vca => 272.0,
-        SectionKind::Split => 248.0,
-        SectionKind::Drive => 232.0,
-        SectionKind::Drift => 236.0,
+        SectionKind::Split => 216.0,
+        SectionKind::Pump => 176.0,
+        SectionKind::Drive => 240.0,
+        SectionKind::Grit => 206.0,
+        SectionKind::Shine => 144.0,
+        SectionKind::Drift => 256.0,
+        SectionKind::Phase => 204.0,
+        SectionKind::Smear => 208.0,
+        SectionKind::Ring => 200.0,
         SectionKind::Spectra => 264.0,
-        SectionKind::Echo => 244.0,
+        SectionKind::Echo => 252.0,
         SectionKind::Room => 228.0,
+        SectionKind::Out => 176.0,
         // The desk's own.
-        SectionKind::Glue => 160.0,
-        SectionKind::Iron => 152.0,
-        SectionKind::Ceiling => 168.0,
-        SectionKind::Scope => 200.0,
-        SectionKind::Tape => 236.0,
-        SectionKind::Shadow => 220.0,
+        SectionKind::Glue => 182.0,
+        SectionKind::Iron => 166.0,
+        SectionKind::Ceiling => 190.0,
+        SectionKind::Scope => 216.0,
+        // The returns, which stand off the rail on their own.
+        SectionKind::Tape => 252.0,
+        SectionKind::Shadow => 232.0,
     }
 }
 
-/// The corner cuts a family wears, so the run reads as related but
-/// distinct pieces: dynamics heavy on top, tone heavy at the foot,
-/// motion a step in the top edge, space a step in the foot.
+/// The corner cuts a piece wears, as multiples of the house chamfer.
+///
+/// A family's leaning survives — dynamics heavy on top, tone heavy at
+/// the foot, motion a step in the top edge, space a step in the foot —
+/// but each card breaks it where its own silhouette wants to, so no two
+/// neighbours are cut alike and the run's corners are a rhythm rather
+/// than a rule.
 pub fn cuts(kind: SectionKind) -> (f32, f32, f32, f32) {
     let c = circuit::CHAMFER;
-    match kind {
-        SectionKind::Door
-        | SectionKind::Hit
-        | SectionKind::Vca
-        | SectionKind::Split
-        | SectionKind::Pump
-        | SectionKind::Glue
-        | SectionKind::Ceiling => (c * 2.0, c * 2.0, c, c),
-        SectionKind::Tone
-        | SectionKind::Cut
-        | SectionKind::Four
-        | SectionKind::Drive
-        | SectionKind::Grit
-        | SectionKind::Shine
-        | SectionKind::Iron => (c, c, c * 2.0, c * 2.0),
-        SectionKind::Drift
-        | SectionKind::Phase
-        | SectionKind::Smear
-        | SectionKind::Ring
-        | SectionKind::Spectra => (c * 2.0, c, c, c * 2.0),
-        SectionKind::Echo | SectionKind::Room | SectionKind::Tape | SectionKind::Shadow => {
-            (c, c * 2.0, c * 2.0, c)
-        }
-        SectionKind::Preamp => (c * 1.5, c * 0.75, c * 1.75, c),
-        SectionKind::Out | SectionKind::Scope => (c, c, c, c),
-    }
+    let (tl, tr, br, bl) = match kind {
+        // The channel.
+        SectionKind::Preamp => (1.5, 0.75, 1.75, 1.0),
+        SectionKind::Tone => (1.0, 1.0, 2.0, 2.0),
+        SectionKind::Door => (2.0, 2.0, 1.0, 1.0),
+        SectionKind::Cut => (0.5, 0.5, 2.5, 0.5),
+        SectionKind::Hit => (2.5, 0.5, 1.5, 2.5),
+        SectionKind::Four => (2.0, 1.5, 0.5, 0.5),
+        SectionKind::Vca => (2.25, 0.75, 2.25, 0.75),
+        SectionKind::Split => (2.25, 0.75, 0.75, 2.25),
+        SectionKind::Pump => (2.25, 0.5, 0.5, 2.25),
+        SectionKind::Drive => (2.0, 1.0, 0.5, 1.5),
+        SectionKind::Grit => (2.5, 0.5, 0.5, 2.5),
+        SectionKind::Shine => (1.0, 0.5, 2.0, 1.5),
+        SectionKind::Drift => (2.25, 0.5, 1.75, 0.75),
+        SectionKind::Phase => (2.0, 1.0, 2.0, 1.0),
+        SectionKind::Smear => (2.0, 0.5, 2.0, 0.5),
+        SectionKind::Ring => (2.0, 2.0, 2.0, 2.0),
+        SectionKind::Spectra => (1.5, 0.5, 2.75, 0.5),
+        SectionKind::Echo => (0.5, 2.0, 2.25, 1.25),
+        SectionKind::Room => (1.0, 1.0, 3.0, 3.0),
+        SectionKind::Out => (1.0, 0.75, 3.0, 1.5),
+        // The desk.
+        SectionKind::Glue => (0.75, 2.0, 0.75, 2.0),
+        SectionKind::Iron => (2.0, 0.75, 0.5, 0.5),
+        SectionKind::Ceiling => (0.5, 0.5, 2.5, 2.5),
+        SectionKind::Scope => (1.0, 1.5, 2.5, 1.5),
+        SectionKind::Tape => (2.5, 1.0, 1.0, 2.0),
+        SectionKind::Shadow => (1.5, 1.0, 3.0, 1.5),
+    };
+    (c * tl, c * tr, c * br, c * bl)
 }
+
+/// The lowest a crevice may be cut into a wall, as a share of the
+/// piece's height.
+///
+/// The JOINT is sacred: a tongue lies in a notch at a fixed height, and
+/// a bay that reached up into it would stop two pieces mating. Every bay
+/// starts below this, however short the band's tray becomes.
+const CREVICE_FLOOR: f32 = 0.24;
 
 /// A step cut into a piece's TOP edge: where along the width it falls
 /// and how far it drops. A piece with one is taller on the left than
@@ -127,6 +147,8 @@ pub fn cuts(kind: SectionKind) -> (f32, f32, f32, f32) {
 pub fn shoulder(kind: SectionKind) -> Option<(f32, f32)> {
     match kind {
         SectionKind::Door => Some((0.46, 15.0)),
+        SectionKind::Hit => Some((0.55, 13.0)),
+        SectionKind::Glue => Some((0.36, 11.0)),
         _ => None,
     }
 }
@@ -135,11 +157,35 @@ pub fn shoulder(kind: SectionKind) -> Option<(f32, f32)> {
 /// starts as a share of the height, how tall it is, and how deep. What
 /// a bay is FOR is the face beside it — a control that sits in the
 /// crevice rather than in the middle of the glass.
+///
+/// Roughly two thirds of the desk wears one, and no two neighbours wear
+/// the same combination, so the run's edges are a broken line rather
+/// than a rule.
 pub fn bay(kind: SectionKind) -> Option<(f32, f32, f32)> {
-    match kind {
-        SectionKind::Door => Some((0.63, 34.0, 16.0)),
-        _ => None,
-    }
+    let (at, tall, deep): (f32, f32, f32) = match kind {
+        SectionKind::Door => (0.63, 34.0, 16.0),
+        SectionKind::Four => (0.28, 34.0, 14.0),
+        SectionKind::Vca => (0.28, 32.0, 18.0),
+        SectionKind::Split => (0.40, 90.0, 20.0),
+        SectionKind::Pump => (0.30, 66.0, 15.0),
+        SectionKind::Drive => (0.26, 86.0, 18.0),
+        SectionKind::Grit => (0.26, 36.0, 20.0),
+        SectionKind::Drift => (0.42, 46.0, 18.0),
+        SectionKind::Phase => (0.66, 36.0, 15.0),
+        SectionKind::Smear => (0.26, 104.0, 15.0),
+        SectionKind::Ring => (0.58, 34.0, 14.0),
+        SectionKind::Spectra => (0.26, 52.0, 18.0),
+        SectionKind::Echo => (0.44, 34.0, 16.0),
+        SectionKind::Room => (0.33, 96.0, 22.0),
+        SectionKind::Out => (0.52, 42.0, 16.0),
+        SectionKind::Iron => (0.30, 58.0, 14.0),
+        SectionKind::Ceiling => (0.29, 30.0, 14.0),
+        SectionKind::Scope => (0.28, 108.0, 16.0),
+        SectionKind::Tape => (0.30, 44.0, 18.0),
+        SectionKind::Shadow => (0.26, 78.0, 18.0),
+        _ => return None,
+    };
+    Some((at.max(CREVICE_FLOOR), tall, deep))
 }
 
 /// A step cut into a piece's BOTTOM edge, on the right: how far along
@@ -147,6 +193,22 @@ pub fn bay(kind: SectionKind) -> Option<(f32, f32, f32)> {
 pub fn plinth(kind: SectionKind) -> Option<(f32, f32)> {
     match kind {
         SectionKind::Door => Some((0.58, 13.0)),
+        SectionKind::Hit => Some((0.46, 11.0)),
+        SectionKind::Four => Some((0.62, 12.0)),
+        SectionKind::Vca => Some((0.72, 15.0)),
+        SectionKind::Drive => Some((0.58, 12.0)),
+        SectionKind::Grit => Some((0.72, 12.0)),
+        SectionKind::Shine => Some((0.62, 14.0)),
+        SectionKind::Drift => Some((0.62, 14.0)),
+        SectionKind::Phase => Some((0.52, 14.0)),
+        SectionKind::Ring => Some((0.54, 14.0)),
+        SectionKind::Spectra => Some((0.42, 16.0)),
+        SectionKind::Echo => Some((0.60, 12.0)),
+        SectionKind::Room => Some((0.62, 18.0)),
+        SectionKind::Out => Some((0.72, 16.0)),
+        SectionKind::Ceiling => Some((0.72, 14.0)),
+        SectionKind::Scope => Some((0.62, 14.0)),
+        SectionKind::Tape => Some((0.62, 14.0)),
         _ => None,
     }
 }
@@ -433,7 +495,9 @@ pub fn plinth_rect(rect: egui::Rect, kind: SectionKind) -> Option<egui::Rect> {
 /// How tall a section's figure is at the top of its glass.
 pub fn figure_h(kind: SectionKind) -> f32 {
     match kind {
-        SectionKind::Preamp | SectionKind::Tone | SectionKind::Door => FIGURE_MAX_H,
+        // A section whose face IS its parameters is handed the whole
+        // glass; the rest get the figure band at the top of theirs.
+        kind if kind.owns_its_glass() => FIGURE_MAX_H,
         _ => 30.0,
     }
 }
@@ -977,7 +1041,9 @@ impl Stage {
                 value_ink,
             );
         }
-        if piece.kind != SectionKind::Preamp && column.rows.len() > row_offset + rows_shown {
+        // The "more below" arrow belongs to the generic table. A section
+        // whose face IS its parameters has no table and no more below.
+        if !piece.kind.owns_its_glass() && column.rows.len() > row_offset + rows_shown {
             let mut marks = Vec::new();
             circuit::annotation_arrow(
                 &mut marks,

@@ -72,6 +72,10 @@ pub struct VcaCore {
     settings: Settings,
     sample_rate: f32,
     detector: RmsDetector,
+    /// The same detector, on the SAME key signal but BEFORE the
+    /// sidechain high-pass: what the filter is holding back is the
+    /// difference between the two, and the card draws it.
+    raw: RmsDetector,
     sc_hp: OnePole,
     computer: GainComputer,
     ballistics: Ballistics,
@@ -79,7 +83,13 @@ pub struct VcaCore {
     /// the feedback.
     reduction_db: f32,
     makeup: f32,
+    /// Block peak of the OUTPUT, post-makeup, post-mix, in dBFS.
     level_db: f32,
+    /// Block max of the key level BEFORE the sidechain high-pass.
+    key_raw_db: f32,
+    /// Block max of the key level AFTER it — what the gain computer
+    /// was actually fed.
+    key_db: f32,
     most_reduced_db: f32,
 }
 
@@ -90,15 +100,19 @@ impl VcaCore {
             settings: Settings::of(params),
             sample_rate,
             detector: RmsDetector::new(),
+            raw: RmsDetector::new(),
             sc_hp: OnePole::new(),
             computer: GainComputer::new(),
             ballistics: Ballistics::new(),
             reduction_db: 0.0,
             makeup: 1.0,
-            level_db: -120.0,
+            level_db: p::FLOOR_DB,
+            key_raw_db: p::FLOOR_DB,
+            key_db: p::FLOOR_DB,
             most_reduced_db: 0.0,
         };
         core.detector.prepare(sample_rate, p::DETECT_MS);
+        core.raw.prepare(sample_rate, p::DETECT_MS);
         core.tune();
         core
     }
@@ -141,10 +155,13 @@ impl SectionCore for VcaCore {
 
     fn reset(&mut self) {
         self.detector.reset();
+        self.raw.reset();
         self.sc_hp.reset();
         self.ballistics.reset();
         self.reduction_db = 0.0;
-        self.level_db = -120.0;
+        self.level_db = p::FLOOR_DB;
+        self.key_raw_db = p::FLOOR_DB;
+        self.key_db = p::FLOOR_DB;
         self.most_reduced_db = 0.0;
     }
 
@@ -158,11 +175,17 @@ impl SectionCore for VcaCore {
         if s.mix <= 0.0 {
             self.reduction_db = 0.0;
             self.most_reduced_db = 0.0;
+            // A wire: in IS out, and there is no key, so the two key
+            // bands rest on the floor rather than lying about a level.
             self.level_db = peak_db(l, if stereo { &r[..n] } else { &[] });
+            self.key_raw_db = p::FLOOR_DB;
+            self.key_db = p::FLOOR_DB;
             return;
         }
         let mut most_reduced = 0.0f32;
-        let mut loudest = -120.0f32;
+        let mut loudest = p::FLOOR_DB;
+        let mut raw_loudest = p::FLOOR_DB;
+        let mut out_peak = 0.0f32;
         let key_hp = s.sc_hp > 20.5;
         for i in 0..n {
             let dry_l = l[i];
@@ -174,34 +197,74 @@ impl SectionCore for VcaCore {
             // The detector hears the output, pre-makeup, linked by the
             // louder side.
             let mut side = wet_l.abs().max(wet_r.abs());
+            // The key as the loop hears it before the filter: one
+            // one-pole tick, so the card can show what the high-pass
+            // takes out.
+            let raw_db = gain_to_db(self.raw.tick(side).max(p::FLOOR_GAIN));
             if key_hp {
                 side = self.sc_hp.tick_highpass(side);
             }
             let level = self.detector.tick(side);
-            let level_db = gain_to_db(level.max(1e-6));
+            let level_db = gain_to_db(level.max(p::FLOOR_GAIN));
             let target = self.computer.gain_db(level_db);
             self.reduction_db = self.ballistics.tick(target);
             loudest = loudest.max(level_db);
+            raw_loudest = raw_loudest.max(raw_db);
             most_reduced = most_reduced.min(self.reduction_db);
             let out_l = dry_l + (wet_l * self.makeup - dry_l) * s.mix;
             l[i] = out_l;
+            out_peak = out_peak.max(out_l.abs());
             if stereo {
-                r[i] = dry_r + (wet_r * self.makeup - dry_r) * s.mix;
+                let out_r = dry_r + (wet_r * self.makeup - dry_r) * s.mix;
+                r[i] = out_r;
+                out_peak = out_peak.max(out_r.abs());
             }
         }
-        self.level_db = loudest;
+        self.level_db = if out_peak <= p::FLOOR_GAIN {
+            p::FLOOR_DB
+        } else {
+            20.0 * out_peak.log10()
+        };
+        self.key_db = loudest;
+        self.key_raw_db = raw_loudest;
         self.most_reduced_db = most_reduced;
     }
 
+    /// Everything here is MEASURED; not one field is a setting the
+    /// card could read back off its own parameters.
+    ///
+    /// - `level_db`: the OUTPUT's peak over the block, post-makeup and
+    ///   post-mix, in dBFS. Range `FLOOR_DB` (silence) up through 0 and
+    ///   above, since makeup can push it over full scale. No smoothing:
+    ///   it is a block maximum, so it steps once per block.
+    /// - `reduction_db`: the DEEPEST gain the loop reached in the
+    ///   block, in dB, `<= 0`; 0 is no reduction. A block minimum of
+    ///   the same figure `bands[0]` carries, so it is the peak-hold and
+    ///   never reads shallower than `bands[0]`.
+    /// - `bands[0]`: the gain right now, in dB, `<= 0`, taken at the
+    ///   block's last sample. Its time constant is the user's own:
+    ///   `attack_ms` (0.1..30 ms) falling, `release_ms` (100..1200 ms,
+    ///   or the two constants of AUTO) rising. Practically 0 to about
+    ///   -24 dB.
+    /// - `bands[1]`: the key level BEFORE the sidechain high-pass, in
+    ///   dB, as a block maximum of a `DETECT_MS` (5 ms) RMS detector on
+    ///   the linked, rectified, pre-makeup OUTPUT — the feedback
+    ///   topology, so this is what came back round the loop. Range
+    ///   `FLOOR_DB` to roughly 0.
+    /// - `bands[2]`: the same level AFTER the high-pass — exactly what
+    ///   the gain computer was fed, on the same 5 ms window and the
+    ///   same block maximum, so `bands[1] - bands[2]` is the dB the
+    ///   filter held back and is 0 when the filter is bypassed
+    ///   (`sc_hp <= 20.5`).
+    ///
+    /// At MIX 0 the section is a wire: `level_db` is the input peak
+    /// (in equals out), `reduction_db` and `bands[0]` are 0, and the
+    /// two key bands rest at `FLOOR_DB` because no key is running.
     fn readout(&self) -> Readout {
         Readout {
             level_db: self.level_db,
             reduction_db: self.most_reduced_db,
-            bands: [
-                self.reduction_db,
-                self.settings.threshold_db,
-                self.settings.ratio,
-            ],
+            bands: [self.reduction_db, self.key_raw_db, self.key_db],
         }
     }
 }
@@ -211,8 +274,8 @@ fn peak_db(l: &[f32], r: &[f32]) -> f32 {
         .iter()
         .chain(r.iter())
         .fold(0.0f32, |peak, s| peak.max(s.abs()));
-    if peak <= 1e-6 {
-        -120.0
+    if peak <= p::FLOOR_GAIN {
+        p::FLOOR_DB
     } else {
         20.0 * peak.log10()
     }
@@ -448,6 +511,125 @@ mod tests {
         }
         for (x, y) in a.iter().zip(&b) {
             assert!((x - y).abs() < 1e-5);
+        }
+    }
+
+    /// The key bands carry a MEASURED level, not the threshold and the
+    /// ratio they used to carry: the same section, fed two sines twenty
+    /// dB apart, reports two key levels twenty dB apart.
+    #[test]
+    fn the_key_band_follows_the_sound() {
+        let n = FS as usize / 2;
+        let heard = |amp_db: f32| -> Readout {
+            // Threshold at the top, so almost nothing is taken and the
+            // band is reading the sound rather than the loop.
+            let mut core = core_with(&[(p::THRESHOLD, 0.0), (p::RATIO, 0.0)]);
+            run(&mut core, &sine(1_000.0, db(amp_db), n));
+            core.readout()
+        };
+        let loud = heard(-6.0);
+        let quiet = heard(-26.0);
+        assert!(
+            loud.bands[2] - quiet.bands[2] > 12.0,
+            "loud {} dB, quiet {} dB",
+            loud.bands[2],
+            quiet.bands[2]
+        );
+        // A rectified sine reads about 3 dB under its peak, so neither
+        // band can be the threshold (0) or the ratio (2.0).
+        assert!(loud.bands[1] < -6.0 && loud.bands[2] < -6.0);
+        assert!(quiet.bands[2] < -20.0);
+    }
+
+    /// The two key bands bracket the sidechain filter: bypassed they
+    /// agree exactly, and on a 40 Hz key at 400 Hz they are far apart,
+    /// which is the dB the filter is holding back.
+    #[test]
+    fn the_key_bands_bracket_the_sidechain_filter() {
+        let n = FS as usize;
+        let bass = sine(40.0, db(-6.0), n);
+        let mut open = core_with(&[(p::THRESHOLD, -30.0), (p::RATIO, 2.0), (p::SC_HP, 20.0)]);
+        run(&mut open, &bass);
+        let open = open.readout();
+        assert_eq!(
+            open.bands[1], open.bands[2],
+            "a bypassed filter must hold nothing back"
+        );
+
+        let mut keyed = core_with(&[(p::THRESHOLD, -30.0), (p::RATIO, 2.0), (p::SC_HP, 400.0)]);
+        run(&mut keyed, &bass);
+        let keyed = keyed.readout();
+        assert!(
+            keyed.bands[1] - keyed.bands[2] > 6.0,
+            "pre {} dB, post {} dB",
+            keyed.bands[1],
+            keyed.bands[2]
+        );
+        // Same sound into both, but the open sidechain ducked itself,
+        // and the key is tapped off that output: its pre-filter band
+        // sits lower for it.
+        assert!(
+            keyed.bands[1] > open.bands[1] + 3.0,
+            "keyed {} dB, open {} dB",
+            keyed.bands[1],
+            open.bands[1]
+        );
+    }
+
+    /// `level_db` is the OUTPUT, after makeup and after mix — not the
+    /// key it used to report.
+    #[test]
+    fn level_db_is_the_output() {
+        let n = FS as usize;
+        let tone = sine(1_000.0, db(-6.0), n);
+        let out_level = |edits: &[(u32, f32)]| -> f32 {
+            let mut core = core_with(edits);
+            run(&mut core, &tone);
+            core.readout().level_db
+        };
+        let plain = out_level(&[(p::THRESHOLD, -30.0), (p::RATIO, 1.0)]);
+        let made_up = out_level(&[(p::THRESHOLD, -30.0), (p::RATIO, 1.0), (p::MAKEUP, 6.0)]);
+        assert!(
+            (made_up - plain - 6.0).abs() < 0.5,
+            "plain {plain} dB, made up {made_up} dB"
+        );
+        // The input peaks at -6 dBFS; a compressed output is under it.
+        assert!(plain < -8.0, "that is not the output: {plain} dB");
+
+        // MIX at zero is a wire, so in equals out and there is no key.
+        let mut wire = core_with(&[(p::MIX, 0.0), (p::THRESHOLD, -40.0)]);
+        run(&mut wire, &tone);
+        let wire = wire.readout();
+        assert!(
+            (wire.level_db + 6.0).abs() < 0.2,
+            "wire {} dB",
+            wire.level_db
+        );
+        assert_eq!(wire.bands, [0.0, p::FLOOR_DB, p::FLOOR_DB]);
+    }
+
+    /// At its defaults the section reports REST: nothing before it has
+    /// heard anything, and nothing after a block of silence.
+    #[test]
+    fn at_its_defaults_it_reports_rest() {
+        let mut core = core_with(&[]);
+        let fresh = core.readout();
+        assert_eq!(fresh.level_db, p::FLOOR_DB);
+        assert_eq!(fresh.reduction_db, 0.0);
+        assert_eq!(fresh.bands, [0.0, p::FLOOR_DB, p::FLOOR_DB]);
+
+        let mut silence = vec![0.0f32; BLOCK * 4];
+        for start in (0..silence.len()).step_by(BLOCK) {
+            let end = start + BLOCK;
+            core.process(&mut silence[start..end], &mut [], &clock());
+        }
+        assert!(silence.iter().all(|s| *s == 0.0));
+        let rest = core.readout();
+        assert_eq!(rest.level_db, p::FLOOR_DB);
+        assert_eq!(rest.reduction_db, 0.0);
+        assert_eq!(rest.bands[0], 0.0);
+        for band in [rest.bands[1], rest.bands[2]] {
+            assert!((band - p::FLOOR_DB).abs() < 0.01, "{band} dB is not rest");
         }
     }
 
