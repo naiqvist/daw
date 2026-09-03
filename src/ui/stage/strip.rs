@@ -633,13 +633,28 @@ impl Stage {
         );
         let screen = painter.with_clip_rect(shown);
         let figure = figure_rect(rect, piece.kind);
+        let face = if piece.kind.owns_its_glass() {
+            glass
+        } else {
+            figure
+        };
         if is_in {
-            let face = if piece.kind.owns_its_glass() {
-                glass
-            } else {
-                figure
-            };
             self.draw_figure(&screen, piece, column, face, selected_row, level, phase);
+        } else if piece.kind.owns_its_glass() {
+            // A section whose parameters ARE its picture keeps the
+            // picture while it is out — behind a veil, with the word
+            // over it. A blank glass would say nothing about what the
+            // piece is, and the settings are still there waiting: this
+            // is a section switched out, not a section emptied.
+            self.draw_figure(&screen, piece, column, face, None, level, Phase::STILL);
+            screen.rect_filled(glass, 0.0, alpha.ground.color.gamma_multiply(0.72));
+            screen.text(
+                glass.center(),
+                egui::Align2::CENTER_CENTER,
+                "OUT",
+                row_font.clone(),
+                ink.gamma_multiply(0.8),
+            );
         } else {
             screen.text(
                 figure.center(),
