@@ -19,22 +19,28 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
+pub mod ceiling;
 pub mod cut;
 pub mod door;
 pub mod drift;
 pub mod drive;
 pub mod echo;
 pub mod four;
+pub mod glue;
 pub mod grit;
 pub mod hit;
+pub mod iron;
 pub mod out;
 pub mod phase;
 pub mod preamp;
 pub mod ring;
 pub mod room;
+pub mod scope;
+pub mod shadow;
 pub mod shine;
 pub mod smear;
 pub mod split;
+pub mod tape;
 pub mod tone;
 pub mod vca;
 
@@ -141,6 +147,12 @@ pub fn core_of(params: &SectionParams, sample_rate: f32, block: usize) -> Box<dy
         SectionKind::Ring => Box::new(ring::RingCore::new(params, sample_rate, block)),
         SectionKind::Echo => Box::new(echo::EchoCore::new(params, sample_rate, block)),
         SectionKind::Room => Box::new(room::RoomCore::new(params, sample_rate, block)),
+        SectionKind::Glue => Box::new(glue::GlueCore::new(params, sample_rate, block)),
+        SectionKind::Iron => Box::new(iron::IronCore::new(params, sample_rate, block)),
+        SectionKind::Ceiling => Box::new(ceiling::CeilingCore::new(params, sample_rate, block)),
+        SectionKind::Scope => Box::new(scope::ScopeCore::new(params, sample_rate, block)),
+        SectionKind::Tape => Box::new(tape::TapeCore::new(params, sample_rate, block)),
+        SectionKind::Shadow => Box::new(shadow::ShadowCore::new(params, sample_rate, block)),
         _ => Box::new(Wire::new(params)),
     }
 }
@@ -169,6 +181,12 @@ mod tests {
             if core.latency() > 0 {
                 // A section that looks ahead is a wire BEHIND its
                 // lookahead, which its own tests hold it to.
+                continue;
+            }
+            if kind.strip_index().is_none() {
+                // The desk's own — the buses', the mix's, the returns'
+                // — are always IN and always doing something. That is
+                // what makes them the desk rather than effects.
                 continue;
             }
             for len in [0usize, 1, 7, 256] {

@@ -293,6 +293,100 @@ fn bus_x(field: egui::Rect, slot: usize) -> f32 {
     Stage::head_rect(field, slot).center().x
 }
 
+/// A cut-glass outline used by the session's addressable modules.  The
+/// asymmetry is deliberate: these are readouts grown around a signal path,
+/// not ordinary buttons with their corners shaved off.
+fn relic_points(rect: egui::Rect) -> Vec<egui::Pos2> {
+    let cut = 7.0f32
+        .min(rect.width() / 8.0)
+        .min(rect.height() / 3.0)
+        .max(2.0);
+    vec![
+        egui::pos2(rect.left() + cut, rect.top()),
+        egui::pos2(rect.right() - cut * 1.8, rect.top()),
+        egui::pos2(rect.right(), rect.top() + cut),
+        egui::pos2(rect.right(), rect.bottom() - cut * 0.65),
+        egui::pos2(rect.right() - cut * 0.65, rect.bottom()),
+        egui::pos2(rect.left() + cut * 1.45, rect.bottom()),
+        egui::pos2(rect.left(), rect.bottom() - cut),
+        egui::pos2(rect.left(), rect.top() + cut * 0.72),
+    ]
+}
+
+fn relic_frame(
+    out: &mut Vec<egui::Shape>,
+    rect: egui::Rect,
+    fill: egui::Color32,
+    weight: Weight,
+    ink: egui::Color32,
+) {
+    let points = relic_points(rect);
+    out.push(egui::Shape::convex_polygon(
+        points.clone(),
+        fill,
+        egui::Stroke::NONE,
+    ));
+    out.push(egui::Shape::closed_line(
+        points,
+        egui::Stroke::new(weight.px(), ink),
+    ));
+}
+
+/// The session's recurring powered-lens mark.  It is intentionally built
+/// from simple geometry rather than borrowed iconography: a wide sensor,
+/// a core and a short data fall.  At head size it is a track module; at cell
+/// size it becomes the quiet "empty but addressable" state.
+fn relic_lens(
+    out: &mut Vec<egui::Shape>,
+    centre: egui::Pos2,
+    span: f32,
+    ink: egui::Color32,
+    core: egui::Color32,
+) {
+    let rise = span * 0.48;
+    let diamond = vec![
+        egui::pos2(centre.x - span, centre.y),
+        egui::pos2(centre.x, centre.y - rise),
+        egui::pos2(centre.x + span, centre.y),
+        egui::pos2(centre.x, centre.y + rise),
+    ];
+    out.push(egui::Shape::closed_line(
+        diamond,
+        egui::Stroke::new(Weight::Hair.px(), ink),
+    ));
+    out.push(egui::Shape::circle_stroke(
+        centre,
+        (span * 0.28).max(1.5),
+        egui::Stroke::new(Weight::Hair.px(), ink),
+    ));
+    out.push(egui::Shape::circle_filled(
+        centre,
+        (span * 0.10).max(1.0),
+        core,
+    ));
+    let fall = span * 0.58;
+    circuit::trace(
+        out,
+        &[
+            egui::pos2(centre.x, centre.y + rise),
+            egui::pos2(centre.x, centre.y + rise + fall),
+        ],
+        Weight::Hair,
+        ink,
+    );
+    for dx in [-span * 0.32, span * 0.32] {
+        circuit::trace(
+            out,
+            &[
+                egui::pos2(centre.x + dx * 0.55, centre.y + rise * 0.72),
+                egui::pos2(centre.x + dx, centre.y + rise + fall * 0.55),
+            ],
+            Weight::Hair,
+            ink,
+        );
+    }
+}
+
 fn device_family_word(family: Family) -> &'static str {
     match family {
         Family::Synths => "SYNTHS",
@@ -5246,10 +5340,10 @@ impl Stage {
         }
     }
 
-    /// The session's circuit board: one bus per shown track, one rail per
-    /// shown scene, and a junction wherever they meet.  It is painted
-    /// before heads and cells so those objects read as components soldered
-    /// over a continuous board rather than as a grid laid on top of them.
+    /// The session's powered display plane.  It is one continuous piece of
+    /// dark glass, with a data spine for the scenes and one vertical conduit
+    /// per track.  Heads and cells are painted over it as addressable
+    /// modules, so the session reads as a machine rather than a spreadsheet.
     fn draw_board(&self, painter: &egui::Painter, field: egui::Rect, phase: Phase) {
         let tracks = self.strip_window(field);
         if tracks.is_empty() {
@@ -5259,9 +5353,15 @@ impl Stage {
         let margin = design::px(design::space::ROOM);
         let head = Self::head_rect(field, 0);
         let seam = Self::master_rect(field).left() - column_gap() * 0.5;
+        let bottom = if rows.is_empty() {
+            head.bottom() + design::px(design::space::STEP)
+        } else {
+            scenes::slot_beneath(head, rows.len() - 1, row_gap(), section_gap()).bottom()
+                + design::px(design::space::STEP)
+        };
         let area = egui::Rect::from_min_max(
-            egui::pos2(head.left(), head.bottom()),
-            egui::pos2(seam, field.bottom() - margin),
+            egui::pos2(head.left() - ADDRESS_W, head.top()),
+            egui::pos2(seam, bottom.min(field.bottom() - margin)),
         );
         if !area.is_positive() {
             return;
@@ -5281,16 +5381,20 @@ impl Stage {
                     .y
             })
             .collect();
-        let edge = self.alphabet().edge.color;
-        let ground = self.alphabet().ground.color;
-        let board_ink = edge.gamma_multiply(0.72);
-        let dots = edge.gamma_multiply(0.38);
+        let alpha = self.alphabet();
+        let ground = alpha.ground.color;
+        let glass = alpha.well.color;
+        let structure = alpha.edge.color.gamma_multiply(0.56);
+        let powered = alpha.live_dim.color.gamma_multiply(0.52);
+        let spine_x = head.left() - 10.0;
         kit::cached(
             painter,
             egui::Id::new("stage-session-board"),
             area,
             (
-                board_ink,
+                glass,
+                structure,
+                powered,
                 ground,
                 tracks.len(),
                 rows.len(),
@@ -5298,8 +5402,96 @@ impl Stage {
                 rows.start,
             ),
             |out| {
-                circuit::lattice(out, area, design::px(design::space::VAST), dots);
-                circuit::board(out, area, &cols, &row_y, board_ink, ground);
+                // The aperture itself: a second inset cut makes this read as
+                // glass seated in a chassis, not a border around a table.
+                relic_frame(out, area, glass, Weight::Heavy, structure);
+                let inner = area.shrink(5.0);
+                out.push(egui::Shape::closed_line(
+                    relic_points(inner),
+                    egui::Stroke::new(Weight::Hair.px(), powered),
+                ));
+
+                // The left-hand scene spine.  Each row branches from this
+                // powered line before crossing the track conduits.
+                circuit::rail_weighted(
+                    out,
+                    egui::pos2(spine_x, head.bottom() - 6.0),
+                    egui::pos2(spine_x, area.bottom() - 9.0),
+                    &[],
+                    Weight::Heavy,
+                    powered,
+                );
+                for y in &row_y {
+                    let lane_top = *y - scenes::SLOT_H * 0.34;
+                    let lane_bottom = *y + scenes::SLOT_H * 0.34;
+                    circuit::trace(
+                        out,
+                        &[
+                            egui::pos2(area.left() + 7.0, *y),
+                            egui::pos2(spine_x, *y),
+                            egui::pos2(spine_x + 6.0, lane_top),
+                            egui::pos2(area.right() - 12.0, lane_top),
+                        ],
+                        Weight::Hair,
+                        structure,
+                    );
+                    circuit::trace(
+                        out,
+                        &[
+                            egui::pos2(spine_x + 6.0, lane_bottom),
+                            egui::pos2(area.right() - 22.0, lane_bottom),
+                            egui::pos2(area.right() - 14.0, *y),
+                            egui::pos2(area.right() - 7.0, *y),
+                        ],
+                        Weight::Hair,
+                        structure.gamma_multiply(0.76),
+                    );
+                    relic_lens(
+                        out,
+                        egui::pos2(spine_x, *y),
+                        4.5,
+                        powered,
+                        ground,
+                    );
+                }
+
+                // Every track descends from its head through all scene
+                // addresses.  The short cap above it makes the connection
+                // visible even where the filled cell hides the conduit.
+                for x in &cols {
+                    circuit::trace(
+                        out,
+                        &[
+                            egui::pos2(*x - 8.0, head.top() + 8.0),
+                            egui::pos2(*x, head.top() + 16.0),
+                            egui::pos2(*x, area.bottom() - 8.0),
+                        ],
+                        Weight::Hair,
+                        powered,
+                    );
+                    circuit::pad(
+                        out,
+                        egui::pos2(*x, area.bottom() - 8.0),
+                        circuit::PAD - 1.0,
+                        powered,
+                        true,
+                    );
+                }
+
+                circuit::pad(
+                    out,
+                    egui::pos2(area.left() + 7.0, area.top() + 7.0),
+                    circuit::PAD,
+                    powered,
+                    true,
+                );
+                circuit::pad(
+                    out,
+                    egui::pos2(area.right() - 11.0, area.bottom() - 7.0),
+                    circuit::PAD,
+                    powered,
+                    false,
+                );
             },
         );
 
@@ -5312,10 +5504,13 @@ impl Stage {
                 let mut shapes = Vec::new();
                 circuit::dashes(
                     &mut shapes,
-                    &[egui::pos2(x, area.top()), egui::pos2(x, area.bottom())],
+                    &[
+                        egui::pos2(x, head.bottom() - 5.0),
+                        egui::pos2(x, area.bottom() - 8.0),
+                    ],
                     phase.dash(),
                     Weight::Heavy,
-                    self.alphabet().live_dim.color,
+                    alpha.live.color,
                 );
                 for shape in shapes {
                     painter.add(shape);

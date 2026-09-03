@@ -8961,6 +8961,21 @@ pub mod console {
 
         pub const LEAN: u32 = 0;
 
+        /// The desk decided the rest: a bus compressor's ratio, its
+        /// attack, its knee, and an auto release.
+        pub const RATIO: f32 = 2.5;
+        pub const ATTACK_MS: f32 = 10.0;
+        pub const RELEASE_MS: f32 = 400.0;
+        pub const KNEE_DB: f32 = 6.0;
+        pub const DETECT_MS: f32 = 8.0;
+        /// The threshold the LEAN knob walks: nothing at the bottom,
+        /// well into the mix at the top.
+        pub const THRESHOLD_HIGH_DB: f32 = -6.0;
+        pub const THRESHOLD_LOW_DB: f32 = -34.0;
+        /// Half the reduction is given back, so leaning does not simply
+        /// turn the bus down.
+        pub const MAKEUP_SHARE: f32 = 0.5;
+
         pub const TABLE: &[ParamDef] = &[ParamDef {
             id: 0,
             name: "Lean",
@@ -8975,6 +8990,21 @@ pub mod console {
 
         pub const DRIVE: u32 = 0;
 
+        /// The transformer: the bottom is lifted before the curve and
+        /// put back after, so low frequencies drive the iron harder.
+        pub const LIFT_HZ: f32 = 120.0;
+        pub const LIFT_DB: f32 = 4.0;
+        /// How hard the curve is driven at full, and how far its bias
+        /// walks: a transformer's asymmetry grows with the flux, so the
+        /// even harmonics keep coming as the drive goes up rather than
+        /// settling at the floor's.
+        pub const CURVE_DRIVE: f32 = 3.0;
+        pub const BIAS_FLOOR: f32 = 0.08;
+        pub const BIAS_FULL: f32 = 0.55;
+        /// The level the stage is unity at: a −10 dBFS sine leaves as
+        /// it arrived, whatever the drive.
+        pub const UNITY_AT: f32 = 0.316;
+
         pub const TABLE: &[ParamDef] = &[ParamDef {
             id: 0,
             name: "Drive",
@@ -8987,11 +9017,25 @@ pub mod console {
     pub mod ceiling {
         use super::super::ParamDef;
 
+        /// The mix's ceiling, in dBFS, and the limiter's window. Not
+        /// knobs: the desk's last stage has one job and one setting.
+        pub const CEILING_DB: f32 = -0.3;
+        pub const LOOKAHEAD_MS: f32 = 1.5;
+        pub const RELEASE_MS: f32 = 120.0;
+
         pub const TABLE: &[ParamDef] = &[];
     }
 
     pub mod scope {
         use super::super::ParamDef;
+
+        /// The analyser's three bands, by their corners in Hz. Three
+        /// because three is what the telemetry channel carries; a bin
+        /// -by-bin spectrum wants a channel of its own.
+        pub const LOW_HZ: f32 = 200.0;
+        pub const HIGH_HZ: f32 = 2_500.0;
+        /// How fast the bands fall, in ms: slow enough to read.
+        pub const FALL_MS: f32 = 300.0;
 
         pub const TABLE: &[ParamDef] = &[];
     }
@@ -9005,6 +9049,23 @@ pub mod console {
         pub const FLUTTER: u32 = 3;
         pub const HISS: u32 = 4;
         pub const TONE: u32 = 5;
+
+        /// The longest the line holds, in ms.
+        pub const MAX_MS: f32 = 1_600.0;
+        /// Wow is slow and deep; flutter is fast and shallow. Rates in
+        /// Hz, depths as a share of the time at full.
+        pub const WOW_HZ: f32 = 0.7;
+        pub const WOW_DEPTH: f32 = 0.03;
+        pub const FLUTTER_HZ: f32 = 7.5;
+        pub const FLUTTER_DEPTH: f32 = 0.004;
+        /// The loop's soft top, and the tape's own floor in dBFS.
+        pub const LOOP_DRIVE: f32 = 0.4;
+        pub const HISS_DB: f32 = -60.0;
+        /// The hiss rides what the tape is carrying: an idle return is
+        /// silent, and a running one hisses under its repeats. How fast
+        /// that follower rises and falls, in ms.
+        pub const HISS_RISE_MS: f32 = 5.0;
+        pub const HISS_FALL_MS: f32 = 400.0;
 
         pub const TABLE: &[ParamDef] = &[
             ParamDef {
@@ -9058,6 +9119,16 @@ pub mod console {
         pub const PREDELAY: u32 = 0;
         pub const SIZE: u32 = 1;
         pub const DAMP: u32 = 2;
+
+        pub const MAX_PREDELAY_MS: f32 = 200.0;
+        /// The decay across the size knob, in seconds.
+        pub const SHORT_S: f32 = 0.8;
+        pub const LONG_S: f32 = 12.0;
+        /// The damping corner at no damp and at full, in Hz.
+        pub const DAMP_OPEN_HZ: f32 = 18_000.0;
+        pub const DAMP_SHUT_HZ: f32 = 1_200.0;
+        pub const DIFFUSION: f32 = 0.85;
+        pub const MODULATION: f32 = 8.0;
 
         pub const TABLE: &[ParamDef] = &[
             ParamDef {
