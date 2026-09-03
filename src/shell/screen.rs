@@ -1,10 +1,10 @@
-//! A black-material phosphor pass.
+//! A display-only phosphor pass.
 //!
-//! After egui has finished, this pass reads the whole offscreen frame. The
-//! shader decides what is a screen from the authored pixels themselves: any
-//! near-black field, plus the marks sitting immediately in that field, gets
-//! the phosphor treatment. That makes the sequencer, session, mixer and
-//! console glass one material without maintaining a second geometry map.
+//! UI code registers the exact apertures that are screens. After egui has
+//! finished, this pass redraws only those rectangles from the offscreen frame;
+//! the shader's near-black material gate then keeps bright controls and marks
+//! crisp inside each aperture. Dark chassis outside a registered display never
+//! enters the pass.
 
 use bytemuck::{Pod, Zeroable};
 use eframe::egui;
@@ -50,8 +50,8 @@ pub fn begin_frame(ctx: &egui::Context) {
 
 /// Report activity from one display aperture.
 ///
-/// Rectangles no longer decide where the shader runs; blackness does. The
-/// registrations remain only as activity probes for bloom and interference.
+/// The clipped rectangle is both the spatial mask and the activity source for
+/// this screen. Nothing outside a registered rectangle enters the CRT pass.
 pub fn register(painter: &egui::Painter, rect: egui::Rect, state: State) {
     let rect = rect.intersect(painter.clip_rect());
     if rect.width() < 2.0 || rect.height() < 2.0 {
@@ -81,6 +81,42 @@ struct GpuRegion {
     rect: [f32; 4],
     /// Activity, beat phase, then padding.
     state: [f32; 4],
+}
+
+fn gpu_regions(
+    regions: &[Region],
+    size: [u32; 2],
+    pixels_per_point: f32,
+    noise_frame: u32,
+) -> Vec<GpuRegion> {
+    if size[0] == 0 || size[1] == 0 || !pixels_per_point.is_finite() || pixels_per_point <= 0.0 {
+        return Vec::new();
+    }
+
+    let width = size[0] as f32;
+    let height = size[1] as f32;
+    regions
+        .iter()
+        .take(MAX_SCREENS)
+        .filter_map(|region| {
+            let left = (region.rect.left() * pixels_per_point / width).clamp(0.0, 1.0);
+            let top = (region.rect.top() * pixels_per_point / height).clamp(0.0, 1.0);
+            let right = (region.rect.right() * pixels_per_point / width).clamp(0.0, 1.0);
+            let bottom = (region.rect.bottom() * pixels_per_point / height).clamp(0.0, 1.0);
+            if right <= left || bottom <= top {
+                return None;
+            }
+            Some(GpuRegion {
+                rect: [left, top, right, bottom],
+                state: [
+                    region.state.activity,
+                    region.state.phase,
+                    noise_frame as f32,
+                    0.0,
+                ],
+            })
+        })
+        .collect()
 }
 
 /// The separate compositor that follows the exact frame copy.
@@ -215,27 +251,26 @@ impl Pass {
         generation: u64,
         target: &wgpu::TextureView,
         size: [u32; 2],
-        _pixels_per_point: f32,
+        pixels_per_point: f32,
         regions: &[Region],
     ) {
         if size[0] == 0 || size[1] == 0 {
+            return;
+        }
+        // A small modulus stays exactly representable after conversion to
+        // f32. The shader uses it only as a noise seed, not as displayed
+        // information or musical time.
+        let noise_frame = self.frame % 4096;
+        self.frame = self.frame.wrapping_add(1);
+        let gpu = gpu_regions(regions, size, pixels_per_point, noise_frame);
+        if gpu.is_empty() {
             return;
         }
         self.ensure_bind_group(device, source, generation);
         let Some((bind, _)) = &self.bind else {
             return;
         };
-        // A small modulus stays exactly representable after conversion to
-        // f32. The shader uses it only as a noise seed, not as displayed
-        // information or musical time.
-        let noise_frame = self.frame % 4096;
-        self.frame = self.frame.wrapping_add(1);
-        let state = aggregate_state(regions);
-        let gpu = GpuRegion {
-            rect: [0.0, 0.0, 1.0, 1.0],
-            state: [state.activity, state.phase, noise_frame as f32, 0.0],
-        };
-        queue.write_buffer(&self.regions, 0, bytemuck::bytes_of(&gpu));
+        queue.write_buffer(&self.regions, 0, bytemuck::cast_slice(&gpu));
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("screen_phosphor_pass"),
@@ -256,21 +291,8 @@ impl Pass {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, bind, &[]);
         pass.set_vertex_buffer(0, self.regions.slice(..));
-        pass.draw(0..3, 0..1);
+        pass.draw(0..3, 0..gpu.len() as u32);
     }
-}
-
-/// One frame has one global phosphor state. The most active registered
-/// aperture drives it; its phase follows the same probe so unrelated parked
-/// displays cannot reset a moving one.
-fn aggregate_state(regions: &[Region]) -> State {
-    regions
-        .iter()
-        .take(MAX_SCREENS)
-        .filter(|region| region.rect.is_positive())
-        .map(|region| region.state)
-        .max_by(|a, b| a.activity.total_cmp(&b.activity))
-        .unwrap_or_else(|| State::new(0.0, 0.0))
 }
 
 #[cfg(test)]
@@ -278,10 +300,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_shader_finds_screen_material_from_the_finished_frame() {
+    fn the_shader_gates_dark_material_inside_registered_screens() {
         let source = include_str!("screen.wgsl");
         assert!(source.contains("textureSample"));
         assert!(source.contains("screen_gate"));
+        assert!(source.contains("authored_luminance"));
+        assert!(!source.contains("context_luminance"));
         assert!(source.contains("mix(authored.rgb, crt, screen_gate)"));
         assert!(source.contains("emission"));
         assert!(source.contains("beam"));
@@ -301,19 +325,29 @@ mod tests {
     }
 
     #[test]
-    fn the_most_active_aperture_drives_the_whole_black_material() {
+    fn registered_apertures_remain_separate_gpu_rectangles() {
         let regions = [
             Region {
-                rect: egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(10.0, 10.0)),
+                rect: egui::Rect::from_min_max(egui::pos2(10.0, 20.0), egui::pos2(110.0, 120.0)),
                 state: State::new(0.25, 0.2),
             },
             Region {
-                rect: egui::Rect::from_min_max(egui::pos2(20.0, 20.0), egui::pos2(30.0, 30.0)),
+                rect: egui::Rect::from_min_max(egui::pos2(150.0, 40.0), egui::pos2(190.0, 90.0)),
                 state: State::new(0.75, 0.8),
             },
         ];
-        let state = aggregate_state(&regions);
-        assert_eq!(state.activity, 0.8);
-        assert_eq!(state.phase, 0.75);
+        let gpu = gpu_regions(&regions, [400, 300], 2.0, 17);
+        assert_eq!(gpu.len(), 2);
+        assert_eq!(gpu[0].rect, [0.05, 2.0 / 15.0, 0.55, 0.8]);
+        assert_eq!(gpu[0].state, [0.2, 0.25, 17.0, 0.0]);
+        assert_eq!(gpu[1].rect, [0.75, 4.0 / 15.0, 0.95, 0.6]);
+        assert_eq!(gpu[1].state, [0.8, 0.75, 17.0, 0.0]);
+        assert_ne!(gpu[0].rect, [0.0, 0.0, 1.0, 1.0]);
+        assert_ne!(gpu[1].rect, [0.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn absent_screens_produce_no_crt_draws() {
+        assert!(gpu_regions(&[], [1280, 800], 1.0, 0).is_empty());
     }
 }

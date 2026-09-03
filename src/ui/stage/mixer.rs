@@ -393,10 +393,10 @@ pub fn draw(
     );
 }
 
-/// A channel's casing. A track's is the deck's surface with the house
-/// edge; a return's is a WELL — a step down in value — with a dotted
-/// frame inset from its edge, so a return reads as a place things are
-/// sent into rather than a track that plays, from across the room.
+/// A channel's casing: dark powered glass with a cut outer shell, inset
+/// signal frame and hard service nodes. A return keeps the same machine
+/// language but breaks its inner frame into dashes, so it still reads as a
+/// destination rather than a source.
 fn draw_casing(
     painter: &egui::Painter,
     strip: egui::Rect,
@@ -405,29 +405,53 @@ fn draw_casing(
     variant: u8,
 ) {
     let mut casing = Vec::new();
-    circuit::panel_variant(
+    let powered = alpha
+        .live_dim
+        .color
+        .gamma_multiply(if is_return { 0.52 } else { 0.68 });
+    circuit::relic_frame(
         &mut casing,
         strip,
-        Some(if is_return {
-            alpha.well.color
+        if is_return {
+            alpha.ground.color
         } else {
-            alpha.surface.color
-        }),
-        alpha.ground.color,
-        Some((Weight::Hair, alpha.edge.color)),
-        variant,
+            alpha.well.color
+        },
+        Weight::Heavy,
+        powered,
     );
+    let frame = strip.shrink(5.0);
     if is_return {
-        let frame = strip.shrink(5.0);
-        let corners = [
-            frame.left_top(),
-            frame.right_top(),
-            frame.right_bottom(),
-            frame.left_bottom(),
-            frame.left_top(),
-        ];
-        circuit::dashes(&mut casing, &corners, 0.0, Weight::Hair, alpha.edge.color);
+        let mut points = circuit::relic_points(frame);
+        if let Some(first) = points.first().copied() {
+            points.push(first);
+        }
+        circuit::dashes(&mut casing, &points, 0.0, Weight::Hair, powered);
+    } else {
+        casing.push(egui::Shape::closed_line(
+            circuit::relic_points(frame),
+            egui::Stroke::new(Weight::Hair.px(), alpha.edge.color),
+        ));
     }
+    let upper = strip.top() + 8.0;
+    circuit::trace(
+        &mut casing,
+        &[
+            egui::pos2(strip.left() + 10.0, upper),
+            egui::pos2(strip.center().x - 8.0, upper),
+            egui::pos2(strip.center().x, upper + 8.0),
+            egui::pos2(strip.right() - 10.0, upper + 8.0),
+        ],
+        Weight::Hair,
+        powered,
+    );
+    circuit::pad(
+        &mut casing,
+        egui::pos2(strip.right() - 8.0, strip.bottom() - 8.0),
+        circuit::PAD - 1.0,
+        powered,
+        variant.is_multiple_of(2),
+    );
     for shape in casing {
         painter.add(shape);
     }
@@ -501,19 +525,16 @@ fn draw_sends(
         );
         let left = egui::pos2(zone.min.x + 16.0, y);
         let right = egui::pos2(zone.max.x - 4.0, y);
-        circuit::rail(&mut shapes, left, right, &[0.0, 1.0], alpha.edge.color);
+        let powered = alpha.live_dim.color.gamma_multiply(0.58);
+        circuit::rail(&mut shapes, left, right, &[0.0, 1.0], powered);
         let x = left.x + send.clamp(0.0, 1.0) * (right.x - left.x);
         let sending = *send > 0.0;
-        circuit::pad(
+        circuit::relic_node(
             &mut shapes,
             egui::pos2(x, y),
-            circuit::PAD,
-            if sending {
-                alpha.ink.color
-            } else {
-                alpha.edge.color
-            },
-            sending,
+            3.5,
+            if sending { alpha.ink.color } else { powered },
+            if sending { alpha.ink.color } else { powered },
         );
     }
     for shape in shapes {
@@ -550,12 +571,14 @@ fn draw_meters(
         egui::pos2(chart.max.x - fader_w - gap, chart.max.y),
     );
     let mut shapes = Vec::new();
-    circuit::octagon(
+    let powered = alpha.live_dim.color.gamma_multiply(0.66);
+    circuit::relic_frame(&mut shapes, well, alpha.ground.color, Weight::Hair, powered);
+    circuit::relic_node(
         &mut shapes,
-        well,
-        4.0,
-        Some(alpha.well.color),
-        Some((Weight::Hair, alpha.edge.color)),
+        well.center_top() + egui::vec2(0.0, 7.0),
+        5.0,
+        powered,
+        alpha.live_dim.color,
     );
 
     // The meter cells occupy floor-to-unity. The well itself continues
@@ -588,15 +611,7 @@ fn draw_meters(
             .map(|cell| cell_coverage(cell, place))
             .sum::<f32>()
             / CELLS as f32;
-        circuit::tick_bar(
-            &mut shapes,
-            lane,
-            CELLS,
-            lit,
-            ink,
-            alpha.surface.color,
-            false,
-        );
+        circuit::tick_bar(&mut shapes, lane, CELLS, lit, ink, alpha.well.color, false);
         if amp >= 1.0 {
             let cell_h = lane.height() / CELLS as f32;
             shapes.push(egui::Shape::rect_filled(
@@ -638,24 +653,15 @@ fn draw_meters(
         egui::pos2(fader_x, chart.min.y + 2.0),
         egui::pos2(fader_x, chart.max.y - 2.0),
         &[0.0, 1.0 - unity_place(), 1.0],
-        alpha.edge.color,
+        powered,
     );
     let handle_y = chart.max.y - chart.height() * place_of_amp(channel.gain);
-    circuit::trace(
-        &mut shapes,
-        &[
-            egui::pos2(fader_x - 7.0, handle_y),
-            egui::pos2(fader_x + 7.0, handle_y),
-        ],
-        Weight::Bold,
-        alpha.ink.color,
-    );
-    circuit::pad(
+    circuit::relic_node(
         &mut shapes,
         egui::pos2(fader_x, handle_y),
-        circuit::PAD,
+        7.0,
         alpha.ink.color,
-        true,
+        alpha.ink.color,
     );
     for shape in shapes {
         painter.add(shape);
@@ -671,7 +677,7 @@ fn draw_meters(
             egui::pos2(rail_x, chart.max.y),
         ],
         Weight::Hair,
-        alpha.edge.color,
+        powered.gamma_multiply(0.82),
     );
     for db in [0_i32, -6, -12, -24, -48] {
         let y = chart.max.y - chart.height() * place_of_db(db as f32);
@@ -679,7 +685,7 @@ fn draw_meters(
             &mut scale,
             egui::pos2(rail_x, y),
             circuit::PAD - 2.0,
-            alpha.edge.color,
+            powered,
             true,
         );
         block::paint(
@@ -689,7 +695,7 @@ fn draw_meters(
             egui::Align2::RIGHT_CENTER,
             block::unit::MICRO,
             &db.to_string(),
-            alpha.edge.color,
+            powered,
         );
     }
     for shape in scale {
@@ -707,7 +713,7 @@ fn draw_meters(
     );
 }
 
-/// Mute and solo, as two labelled squares.
+/// Mute and solo, as two small cut-glass keycaps.
 fn draw_switches(
     painter: &egui::Painter,
     zone: egui::Rect,
@@ -729,15 +735,21 @@ fn draw_switches(
     };
     for (x, on, label) in switches {
         let rect = egui::Rect::from_min_size(egui::pos2(x, zone.min.y), egui::vec2(size, size));
-        if on {
-            painter.rect_filled(rect, 0.0, alpha.ink.color);
-        } else {
-            painter.rect_stroke(
-                rect,
-                0.0,
-                egui::Stroke::new(1.0, alpha.edge.color),
-                egui::StrokeKind::Inside,
-            );
+        let powered = alpha.live_dim.color.gamma_multiply(0.64);
+        let mut shapes = Vec::new();
+        circuit::relic_frame(
+            &mut shapes,
+            rect,
+            if on {
+                alpha.ink.color
+            } else {
+                alpha.ground.color
+            },
+            if on { Weight::Bold } else { Weight::Hair },
+            if on { alpha.ink.color } else { powered },
+        );
+        for shape in shapes {
+            painter.add(shape);
         }
         block::paint(
             painter,
@@ -746,11 +758,7 @@ fn draw_switches(
             egui::Align2::CENTER_CENTER,
             block::unit::MICRO,
             label,
-            if on {
-                alpha.ground.color
-            } else {
-                alpha.edge.color
-            },
+            if on { alpha.ground.color } else { powered },
         );
     }
 }
@@ -767,14 +775,15 @@ fn draw_pan(
     let left = egui::pos2(zone.min.x + 4.0, rail_y);
     let right = egui::pos2(zone.max.x - 4.0, rail_y);
     let mut shapes = Vec::new();
-    circuit::rail(&mut shapes, left, right, &[0.0, 0.5, 1.0], alpha.edge.color);
+    let powered = alpha.live_dim.color.gamma_multiply(0.62);
+    circuit::rail(&mut shapes, left, right, &[0.0, 0.5, 1.0], powered);
     let x = left.x + channel.pan.clamp(-1.0, 1.0).mul_add(0.5, 0.5) * (right.x - left.x);
-    circuit::pad(
+    circuit::relic_node(
         &mut shapes,
         egui::pos2(x, rail_y),
-        circuit::PAD + 1.0,
+        5.0,
         alpha.ink.color,
-        true,
+        alpha.ink.color,
     );
     for shape in shapes {
         painter.add(shape);

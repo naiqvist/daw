@@ -93,6 +93,16 @@ const DETAIL_MIN_W: f32 = 64.0;
 const DEFAULT_PITCH: u8 = 60;
 const DEFAULT_VELOCITY: u8 = 100;
 
+/// The quiet powered trace shared by the sequencer's display modules.
+/// Active time still earns the full LIVE signal; this is the circuitry that
+/// says an idle address is awake and ready.
+fn relic_ink(ground: Polarity, strength: f32) -> egui::Color32 {
+    crate::design::Alphabet::for_polarity(ground)
+        .live_dim
+        .color
+        .gamma_multiply(strength)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct TrigSelection {
     pub(crate) step: usize,
@@ -298,14 +308,17 @@ impl SequenceGrid {
         let container = egui::Rect::from_min_size(origin, egui::vec2(full_width, full_height))
             .expand(PANEL_PAD);
         let mut casing = Vec::new();
-        circuit::panel_variant(
+        circuit::relic_frame(
             &mut casing,
             container,
-            Some(shade(PANEL_FILL, ground)),
-            shade(GROUND, ground),
-            Some((Weight::Hair, shade(EDGE, ground))),
-            2,
+            shade(PANEL_FILL, ground),
+            Weight::Heavy,
+            relic_ink(ground, 0.62),
         );
+        casing.push(egui::Shape::closed_line(
+            circuit::relic_points(container.shrink(4.0)),
+            egui::Stroke::new(Weight::Hair.px(), shade(EDGE, ground)),
+        ));
         for shape in casing {
             painter.add(shape);
         }
@@ -314,13 +327,12 @@ impl SequenceGrid {
             egui::pos2(container.max.x, origin.y + STATUS_HEIGHT),
         );
         let mut header_shapes = Vec::new();
-        circuit::panel_variant(
+        circuit::relic_frame(
             &mut header_shapes,
             header,
-            Some(shade(HEADER_FILL, ground)),
-            shade(PANEL_FILL, ground),
-            Some((Weight::Hair, shade(EDGE, ground))),
-            0,
+            shade(HEADER_FILL, ground),
+            Weight::Hair,
+            relic_ink(ground, 0.82),
         );
         for shape in header_shapes {
             painter.add(shape);
@@ -393,13 +405,10 @@ impl SequenceGrid {
                     // Nothing here answers the pointer or the keys.
                     if rect.intersect(window).is_positive() {
                         let mut shapes = Vec::new();
-                        circuit::octagon(
-                            &mut shapes,
-                            rect,
-                            circuit::CHAMFER,
-                            None,
-                            Some((Weight::Hair, shade(EDGE, ground).gamma_multiply(0.45))),
-                        );
+                        shapes.push(egui::Shape::closed_line(
+                            circuit::relic_points(rect),
+                            egui::Stroke::new(Weight::Hair.px(), relic_ink(ground, 0.34)),
+                        ));
                         cells.extend(shapes);
                         if step == self.steps() {
                             draw_clip_end(
@@ -436,7 +445,15 @@ impl SequenceGrid {
                 if response.hovered() && self.cursor_step != step {
                     // The pointer's presence is a tint, not an outline: a
                     // rule would say something, and hovering says nothing.
-                    cells.rect_filled(rect, 0.0, wash(SELECTION_WASH, ground));
+                    let mut shapes = Vec::new();
+                    circuit::relic_frame(
+                        &mut shapes,
+                        rect,
+                        wash(SELECTION_WASH, ground),
+                        Weight::Hair,
+                        relic_ink(ground, 0.72),
+                    );
+                    cells.extend(shapes);
                 }
                 self.draw_cell_events(&cells, rect, clip, lens, step, ground);
                 if self.cursor_step == step {
@@ -702,12 +719,12 @@ impl SequenceGrid {
         // a coarse cell.
         let face_fill = velocity_ink(note.velocity, ground);
         let mut shapes = Vec::new();
-        circuit::octagon(
+        circuit::relic_frame(
             &mut shapes,
             face,
-            circuit::CHAMFER,
-            Some(face_fill),
-            Some((Weight::Hair, shade(FACE_DETAIL_INK, ground))),
+            face_fill,
+            Weight::Hair,
+            shade(FACE_DETAIL_INK, ground),
         );
         circuit::pad(
             &mut shapes,
@@ -1398,13 +1415,22 @@ fn draw_row_address(
     ground: Polarity,
 ) {
     let row = (tick / TICKS_PER_BAR) % 16;
+    let node = right_top + egui::vec2(-31.0, cell_side.min(28.0) * 0.5);
+    let mut shapes = Vec::new();
+    circuit::relic_node(
+        &mut shapes,
+        node,
+        cell_side.min(22.0) * 0.42,
+        relic_ink(ground, 0.72),
+        shade(GROUND, ground),
+    );
+    for shape in shapes {
+        painter.add(shape);
+    }
     Sign::Register(row as u8).painted(
         painter,
         egui::Id::new(("sequencer-row-register", row)),
-        egui::Rect::from_center_size(
-            right_top + egui::vec2(-31.0, cell_side.min(28.0) * 0.5),
-            egui::Vec2::splat(cell_side.min(22.0)),
-        ),
+        egui::Rect::from_center_size(node, egui::Vec2::splat(cell_side.min(16.0))),
         Weight::Hair,
         shade(LABEL_INK, ground),
     );
@@ -1428,32 +1454,40 @@ fn draw_row_address(
     }
 }
 
-/// The ground under a step: a via at an ordinary address, a larger pad
-/// at a beat, and a junction where a bar's bus begins.
+/// The ground under a step: one dark cut-glass address. Beat and bar starts
+/// wake progressively larger cores, so timing hierarchy is still read before
+/// the labels while every step belongs to the same ancient display machine.
 fn draw_ground(painter: &egui::Painter, rect: egui::Rect, tick: usize, ground: Polarity) {
     let mut shapes = Vec::new();
-    if tick.is_multiple_of(TICKS_PER_BAR) {
-        circuit::junction(
+    let bar = tick.is_multiple_of(TICKS_PER_BAR);
+    let beat = tick.is_multiple_of(TICKS_PER_BAR / 4);
+    let power = relic_ink(
+        ground,
+        if bar {
+            0.88
+        } else if beat {
+            0.70
+        } else {
+            0.52
+        },
+    );
+    circuit::relic_frame(
+        &mut shapes,
+        rect,
+        beat_fill(tick, ground),
+        if bar { Weight::Bold } else { Weight::Hair },
+        power,
+    );
+    if bar || beat {
+        circuit::relic_node(
             &mut shapes,
             rect.center(),
-            shade(BAR_FILL, ground),
-            shade(GROUND, ground),
-        );
-    } else if tick.is_multiple_of(TICKS_PER_BAR / 4) {
-        circuit::pad(
-            &mut shapes,
-            rect.center(),
-            circuit::PAD + 2.0,
-            shade(BEAT_FILL, ground),
-            true,
+            if bar { 6.0 } else { 4.5 },
+            power,
+            if bar { power } else { shade(BEAT_FILL, ground) },
         );
     } else {
-        circuit::via(
-            &mut shapes,
-            rect.center(),
-            shade(EDGE, ground),
-            shade(GROUND, ground),
-        );
+        circuit::via(&mut shapes, rect.center(), power, shade(GROUND, ground));
     }
     for shape in shapes {
         painter.add(shape);
@@ -1582,8 +1616,14 @@ pub(crate) fn draw_cursor(painter: &egui::Painter, cell: egui::Rect, ground: Pol
     let rect = cell.expand(CURSOR_GAP);
     // The one place a rule is the sign: four corners, and nothing joins
     // them, so the cursor brackets a cell without boxing it.
-    painter.rect_filled(cell, 0.0, wash(CURSOR_WASH, ground));
     let mut shapes = Vec::new();
+    circuit::relic_frame(
+        &mut shapes,
+        cell,
+        wash(CURSOR_WASH, ground),
+        Weight::Bold,
+        relic_ink(ground, 0.92),
+    );
     circuit::brackets(
         &mut shapes,
         rect,

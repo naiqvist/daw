@@ -39,6 +39,7 @@ pub mod scope;
 pub mod shadow;
 pub mod shine;
 pub mod smear;
+pub mod spectra;
 pub mod split;
 pub mod tape;
 pub mod tone;
@@ -153,6 +154,7 @@ pub fn core_of(params: &SectionParams, sample_rate: f32, block: usize) -> Box<dy
         SectionKind::Scope => Box::new(scope::ScopeCore::new(params, sample_rate, block)),
         SectionKind::Tape => Box::new(tape::TapeCore::new(params, sample_rate, block)),
         SectionKind::Shadow => Box::new(shadow::ShadowCore::new(params, sample_rate, block)),
+        SectionKind::Spectra => Box::new(spectra::SpectraCore::new(params, sample_rate, block)),
         _ => Box::new(Wire::new(params)),
     }
 }

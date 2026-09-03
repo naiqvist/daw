@@ -293,100 +293,6 @@ fn bus_x(field: egui::Rect, slot: usize) -> f32 {
     Stage::head_rect(field, slot).center().x
 }
 
-/// A cut-glass outline used by the session's addressable modules.  The
-/// asymmetry is deliberate: these are readouts grown around a signal path,
-/// not ordinary buttons with their corners shaved off.
-fn relic_points(rect: egui::Rect) -> Vec<egui::Pos2> {
-    let cut = 7.0f32
-        .min(rect.width() / 8.0)
-        .min(rect.height() / 3.0)
-        .max(2.0);
-    vec![
-        egui::pos2(rect.left() + cut, rect.top()),
-        egui::pos2(rect.right() - cut * 1.8, rect.top()),
-        egui::pos2(rect.right(), rect.top() + cut),
-        egui::pos2(rect.right(), rect.bottom() - cut * 0.65),
-        egui::pos2(rect.right() - cut * 0.65, rect.bottom()),
-        egui::pos2(rect.left() + cut * 1.45, rect.bottom()),
-        egui::pos2(rect.left(), rect.bottom() - cut),
-        egui::pos2(rect.left(), rect.top() + cut * 0.72),
-    ]
-}
-
-fn relic_frame(
-    out: &mut Vec<egui::Shape>,
-    rect: egui::Rect,
-    fill: egui::Color32,
-    weight: Weight,
-    ink: egui::Color32,
-) {
-    let points = relic_points(rect);
-    out.push(egui::Shape::convex_polygon(
-        points.clone(),
-        fill,
-        egui::Stroke::NONE,
-    ));
-    out.push(egui::Shape::closed_line(
-        points,
-        egui::Stroke::new(weight.px(), ink),
-    ));
-}
-
-/// The session's recurring powered-lens mark.  It is intentionally built
-/// from simple geometry rather than borrowed iconography: a wide sensor,
-/// a core and a short data fall.  At head size it is a track module; at cell
-/// size it becomes the quiet "empty but addressable" state.
-fn relic_lens(
-    out: &mut Vec<egui::Shape>,
-    centre: egui::Pos2,
-    span: f32,
-    ink: egui::Color32,
-    core: egui::Color32,
-) {
-    let rise = span * 0.48;
-    let diamond = vec![
-        egui::pos2(centre.x - span, centre.y),
-        egui::pos2(centre.x, centre.y - rise),
-        egui::pos2(centre.x + span, centre.y),
-        egui::pos2(centre.x, centre.y + rise),
-    ];
-    out.push(egui::Shape::closed_line(
-        diamond,
-        egui::Stroke::new(Weight::Hair.px(), ink),
-    ));
-    out.push(egui::Shape::circle_stroke(
-        centre,
-        (span * 0.28).max(1.5),
-        egui::Stroke::new(Weight::Hair.px(), ink),
-    ));
-    out.push(egui::Shape::circle_filled(
-        centre,
-        (span * 0.10).max(1.0),
-        core,
-    ));
-    let fall = span * 0.58;
-    circuit::trace(
-        out,
-        &[
-            egui::pos2(centre.x, centre.y + rise),
-            egui::pos2(centre.x, centre.y + rise + fall),
-        ],
-        Weight::Hair,
-        ink,
-    );
-    for dx in [-span * 0.32, span * 0.32] {
-        circuit::trace(
-            out,
-            &[
-                egui::pos2(centre.x + dx * 0.55, centre.y + rise * 0.72),
-                egui::pos2(centre.x + dx, centre.y + rise + fall * 0.55),
-            ],
-            Weight::Hair,
-            ink,
-        );
-    }
-}
-
 fn device_family_word(family: Family) -> &'static str {
     match family {
         Family::Synths => "SYNTHS",
@@ -3895,16 +3801,33 @@ impl Stage {
         // The tray sets this while it draws; a covered tray leaves it
         // unset, and a menu with nowhere to point is not drawn.
         self.trig_anchor = None;
+        let screen_state = crate::shell::screen::State::new(
+            if phase.rolling { phase.beat } else { 0.0 },
+            if phase.rolling {
+                0.18 + phase.pulse() * 0.72
+            } else {
+                0.0
+            },
+        );
         if self.sample.is_some() {
             self.draw_sample_editor(&painter, field, phase);
+            if self.polarity == design::Polarity::Dark {
+                crate::shell::screen::register(&painter, field, screen_state);
+            }
         } else if self.help {
             self.draw_help(&painter, field);
+            if self.polarity == design::Polarity::Dark {
+                crate::shell::screen::register(&painter, field, screen_state);
+            }
         } else {
             // Stacked: the session above, the clip tray below. The tray
             // shows whatever clip the session cursor is on, and is only
             // FOCUSED once entered — Ableton's session over its clip
             // detail, an Elektron's track keys over its trig keys.
             self.draw_field(&painter, session, phase);
+            if self.polarity == design::Polarity::Dark {
+                crate::shell::screen::register(&painter, session, screen_state);
+            }
             // One detail region, and the band and the sequencer are two
             // things to put in it. The band wins while it is showing:
             // sound design and sequencing are separate spaces, and the
@@ -3913,6 +3836,9 @@ impl Stage {
                 self.draw_chain(ui.painter(), clip, phase);
             } else {
                 self.draw_clip(ui, clip);
+                if self.polarity == design::Polarity::Dark {
+                    crate::shell::screen::register(&painter, clip, screen_state);
+                }
             }
         }
         // Last, and over the top of everything in the field: the browser
@@ -3933,6 +3859,9 @@ impl Stage {
             // not drawn over the periphery on its way in.
             let painter = painter.with_clip_rect(field);
             self.draw_browser(&painter, slid);
+            if self.polarity == design::Polarity::Dark {
+                crate::shell::screen::register(&painter, slid, screen_state);
+            }
             // Its own edge, at wherever it has got to. Drawn with the
             // panel rather than with the other regions: a border that
             // waited at the destination would announce the arrival
@@ -5404,10 +5333,10 @@ impl Stage {
             |out| {
                 // The aperture itself: a second inset cut makes this read as
                 // glass seated in a chassis, not a border around a table.
-                relic_frame(out, area, glass, Weight::Heavy, structure);
+                circuit::relic_frame(out, area, glass, Weight::Heavy, structure);
                 let inner = area.shrink(5.0);
                 out.push(egui::Shape::closed_line(
-                    relic_points(inner),
+                    circuit::relic_points(inner),
                     egui::Stroke::new(Weight::Hair.px(), powered),
                 ));
 
@@ -5446,13 +5375,7 @@ impl Stage {
                         Weight::Hair,
                         structure.gamma_multiply(0.76),
                     );
-                    relic_lens(
-                        out,
-                        egui::pos2(spine_x, *y),
-                        4.5,
-                        powered,
-                        ground,
-                    );
+                    circuit::relic_node(out, egui::pos2(spine_x, *y), 4.5, powered, ground);
                 }
 
                 // Every track descends from its head through all scene
@@ -5551,11 +5474,21 @@ impl Stage {
             let index = first + slot;
             let rect = Self::head_rect(field, slot);
             let focused = lattice.cursor() == Some((index, 0));
-            let fill = if focused { cursor_shade } else { self.square() };
-            let figure_ink = if focused {
-                self.alphabet().ground.color
+            let alpha = self.alphabet();
+            let fill = if focused {
+                cursor_shade
             } else {
-                self.alphabet().ink.color
+                alpha.well.color
+            };
+            let figure_ink = if focused {
+                alpha.ground.color
+            } else {
+                alpha.ink.color
+            };
+            let powered = if focused {
+                alpha.ground.color
+            } else {
+                alpha.live_dim.color.gamma_multiply(0.78)
             };
             let rail_x = rect.left() + 18.0;
             let content_x = rect.left() + 36.0;
@@ -5563,31 +5496,48 @@ impl Stage {
                 painter,
                 egui::Id::new(("stage-track-head", index)),
                 rect,
-                (fill, self.alphabet().ground.color, figure_ink),
+                (fill, alpha.ground.color, figure_ink, powered),
                 |out| {
-                    circuit::panel_variant(
+                    circuit::relic_frame(out, rect, fill, Weight::Heavy, powered);
+                    out.push(egui::Shape::closed_line(
+                        circuit::relic_points(rect.shrink(4.0)),
+                        egui::Stroke::new(
+                            Weight::Hair.px(),
+                            if focused {
+                                alpha.well.color
+                            } else {
+                                alpha.edge.color
+                            },
+                        ),
+                    ));
+
+                    // The track's powered node feeds both its title plate
+                    // and the conduit that continues through its scenes.
+                    circuit::relic_node(
                         out,
-                        rect,
-                        Some(fill),
-                        self.alphabet().ground.color,
-                        Some((Weight::Hair, self.alphabet().edge.color)),
-                        index as u8,
-                    );
-                    circuit::rail(
-                        out,
-                        egui::pos2(rail_x, rect.top() + 7.0),
-                        egui::pos2(rail_x, rect.bottom() - 7.0),
-                        &[0.0, 1.0],
+                        egui::pos2(rail_x, rect.center().y - 2.0),
+                        10.0,
+                        powered,
                         figure_ink,
                     );
                     Sign::General((index % 32) as u8).paint(
                         out,
                         egui::Rect::from_center_size(
                             egui::pos2(rail_x, rect.center().y - 2.0),
-                            egui::Vec2::splat(16.0),
+                            egui::Vec2::splat(11.0),
                         ),
                         Weight::Hair,
                         figure_ink,
+                    );
+                    circuit::trace(
+                        out,
+                        &[
+                            egui::pos2(content_x, rect.top() + 7.0),
+                            egui::pos2(rect.right() - 26.0, rect.top() + 7.0),
+                            egui::pos2(rect.right() - 20.0, rect.top() + 13.0),
+                        ],
+                        Weight::Hair,
+                        powered,
                     );
                     circuit::pad(
                         out,
@@ -5603,6 +5553,15 @@ impl Stage {
                         figure_ink,
                         true,
                     );
+                    for offset in [0.0, 5.0, 10.0] {
+                        circuit::pad(
+                            out,
+                            egui::pos2(rect.right() - 28.0 + offset, rect.bottom() - 5.0),
+                            2.0,
+                            powered,
+                            offset == 10.0,
+                        );
+                    }
                 },
             );
             if focused {
@@ -5858,34 +5817,49 @@ impl Stage {
         let kind_font = egui::FontId::monospace(design::px(design::type_scale::MICRO));
         let head = Self::master_rect(field);
         let focused = self.session_address() == Some(Address::Master);
-        let fill = if focused { cursor_shade } else { self.square() };
+        let fill = if focused {
+            cursor_shade
+        } else {
+            alpha.well.color
+        };
         let (title_ink, kind_ink) = if focused {
             (alpha.ground.color, alpha.well.color)
         } else {
             (alpha.ink.color, alpha.ink.color)
         };
+        let powered = if focused {
+            alpha.ground.color
+        } else {
+            alpha.live_dim.color.gamma_multiply(0.78)
+        };
         kit::cached(
             painter,
             egui::Id::new("stage-master-head"),
             head,
-            (fill, alpha.ground.color, title_ink),
+            (fill, alpha.ground.color, title_ink, powered),
             |out| {
-                circuit::panel_variant(
-                    out,
-                    head,
-                    Some(fill),
-                    alpha.ground.color,
-                    Some((Weight::Heavy, title_ink)),
-                    3,
-                );
+                circuit::relic_frame(out, head, fill, Weight::Heavy, powered);
+                out.push(egui::Shape::closed_line(
+                    circuit::relic_points(head.shrink(4.0)),
+                    egui::Stroke::new(Weight::Hair.px(), alpha.edge.color),
+                ));
+                let core = egui::pos2(head.left() + 19.0, head.center().y - 2.0);
+                circuit::relic_node(out, core, 11.0, powered, title_ink);
                 Sign::Master.paint(
                     out,
-                    egui::Rect::from_center_size(
-                        egui::pos2(head.left() + 19.0, head.center().y),
-                        egui::Vec2::splat(25.0),
-                    ),
-                    Weight::Heavy,
+                    egui::Rect::from_center_size(core, egui::Vec2::splat(16.0)),
+                    Weight::Hair,
                     title_ink,
+                );
+                circuit::trace(
+                    out,
+                    &[
+                        egui::pos2(head.left() + 39.0, head.top() + 7.0),
+                        egui::pos2(head.right() - 20.0, head.top() + 7.0),
+                        egui::pos2(head.right() - 14.0, head.top() + 13.0),
+                    ],
+                    Weight::Hair,
+                    powered,
                 );
             },
         );
@@ -5936,14 +5910,19 @@ impl Stage {
             egui::pos2(seam, rail_bottom),
             &[0.0, 1.0],
             Weight::Heavy,
-            alpha.edge.color,
+            powered,
         );
         for (slot, _) in tracks.clone().enumerate() {
             let from = egui::pos2(bus_x(field, slot), head.top() - 1.0);
             let to = egui::pos2(seam, rail_top - slot as f32 * 1.5);
             let path = circuit::elbow(from, to);
-            circuit::trace(&mut rail_shapes, &path, Weight::Hair, alpha.edge.color);
-            circuit::pad(&mut rail_shapes, from, circuit::PAD, alpha.edge.color, true);
+            circuit::trace(
+                &mut rail_shapes,
+                &path,
+                Weight::Hair,
+                powered.gamma_multiply(0.72),
+            );
+            circuit::pad(&mut rail_shapes, from, circuit::PAD, powered, true);
         }
         if phase.rolling && self.playing.iter().any(Option::is_some) {
             circuit::dashes(
@@ -6084,11 +6063,33 @@ impl Stage {
         let head = Self::head_rect(field, 0);
         for (line, scene) in rows.clone().enumerate() {
             let rect = scenes::slot_beneath(head, line, gap, section_gap());
+            let alpha = self.alphabet();
             let ink = if focused_scene == Some(scene) {
-                self.alphabet().ink.color
+                alpha.ink.color
             } else {
-                self.alphabet().edge.color
+                alpha.ink.color.gamma_multiply(0.74)
             };
+            let powered = if focused_scene == Some(scene) {
+                alpha.ink.color
+            } else {
+                alpha.live_dim.color.gamma_multiply(0.72)
+            };
+            let node = egui::pos2(head.left() - 9.0, rect.center().y);
+            let mut shapes = Vec::new();
+            circuit::relic_node(&mut shapes, node, 6.0, powered, alpha.ground.color);
+            circuit::trace(
+                &mut shapes,
+                &[
+                    egui::pos2(head.left() - ADDRESS_W + 2.0, rect.center().y + 9.0),
+                    egui::pos2(head.left() - 29.0, rect.center().y + 9.0),
+                    egui::pos2(head.left() - 23.0, rect.center().y + 3.0),
+                ],
+                Weight::Hair,
+                powered,
+            );
+            for shape in shapes {
+                painter.add(shape);
+            }
             let number = format!("{:02}", scene + 1);
             block::paint(
                 painter,
@@ -6102,10 +6103,7 @@ impl Stage {
             Sign::Register((scene % 16) as u8).painted(
                 painter,
                 egui::Id::new(("stage-scene-register", scene)),
-                egui::Rect::from_center_size(
-                    egui::pos2(head.left() - 9.0, rect.center().y),
-                    egui::Vec2::splat(13.0),
-                ),
+                egui::Rect::from_center_size(node, egui::Vec2::splat(10.0)),
                 Weight::Hair,
                 ink,
             );
@@ -6119,42 +6117,59 @@ impl Stage {
                 let mark = scenes::mark(&self.song, track, scene);
                 let alpha = self.alphabet();
                 let fill = if here {
-                    Some(cursor_shade)
+                    cursor_shade
                 } else if mark.is_some() {
-                    Some(alpha.edge.color)
+                    alpha.surface.color
                 } else {
-                    None
+                    alpha.well.color
                 };
                 let figure_ink = if here {
                     alpha.ground.color
                 } else {
                     alpha.ink.color
                 };
-                let outline = if mark.is_some() || here {
-                    alpha.edge.color
+                let cell_power = if here {
+                    alpha.ground.color
+                } else if mark.is_some() {
+                    alpha.live_dim.color.gamma_multiply(0.82)
                 } else {
-                    alpha.edge.color.gamma_multiply(0.62)
+                    alpha.live_dim.color.gamma_multiply(0.48)
                 };
                 kit::cached(
                     painter,
                     egui::Id::new(("stage-scene-cell", track, scene)),
                     rect,
-                    (fill, figure_ink, outline, mark.is_some()),
+                    (fill, figure_ink, cell_power, mark.is_some()),
                     |out| {
-                        circuit::octagon(
-                            out,
-                            rect,
-                            circuit::CHAMFER,
-                            fill,
-                            Some((Weight::Hair, outline)),
-                        );
+                        circuit::relic_frame(out, rect, fill, Weight::Hair, cell_power);
                         if mark.is_none() {
-                            circuit::via(
+                            circuit::relic_node(
                                 out,
                                 rect.center(),
-                                figure_ink,
-                                fill.unwrap_or(alpha.ground.color),
+                                6.0,
+                                cell_power,
+                                if here { alpha.ground.color } else { cell_power },
                             );
+                        } else {
+                            circuit::trace(
+                                out,
+                                &[
+                                    egui::pos2(rect.left() + 8.0, rect.top() + 5.0),
+                                    egui::pos2(rect.center().x, rect.top() + 5.0),
+                                    egui::pos2(rect.center().x + 5.0, rect.top()),
+                                ],
+                                Weight::Hair,
+                                cell_power,
+                            );
+                            for offset in [0.0, 5.0, 10.0] {
+                                circuit::pad(
+                                    out,
+                                    egui::pos2(rect.right() - 20.0 + offset, rect.bottom() - 4.0),
+                                    2.0,
+                                    cell_power,
+                                    offset == 10.0,
+                                );
+                            }
                         }
                     },
                 );
@@ -6175,15 +6190,12 @@ impl Stage {
 
                 if self.playing_on(track) == Some(scene) {
                     let mut shapes = Vec::new();
-                    circuit::octagon(
-                        &mut shapes,
-                        rect,
-                        circuit::CHAMFER,
-                        None,
-                        Some((Weight::Heavy, alpha.live_dim.color)),
-                    );
+                    shapes.push(egui::Shape::closed_line(
+                        circuit::relic_points(rect),
+                        egui::Stroke::new(Weight::Heavy.px(), alpha.live_dim.color),
+                    ));
                     if phase.rolling {
-                        let mut path = circuit::octagon_points(rect.shrink(1.5), circuit::CHAMFER);
+                        let mut path = circuit::relic_points(rect.shrink(1.5));
                         if let Some(first) = path.first().copied() {
                             path.push(first);
                         }
@@ -6198,8 +6210,8 @@ impl Stage {
                     let live = motion::pulse_ink(alpha.live.color, alpha.live_dim.color, phase);
                     shapes.push(egui::Shape::rect_filled(
                         egui::Rect::from_min_size(
-                            egui::pos2(rect.left(), rect.top() + circuit::CHAMFER),
-                            egui::vec2(POINT, rect.height() - circuit::CHAMFER * 2.0),
+                            egui::pos2(rect.left(), rect.top() + 6.0),
+                            egui::vec2(POINT, rect.height() - 12.0),
                         ),
                         0.0,
                         live,

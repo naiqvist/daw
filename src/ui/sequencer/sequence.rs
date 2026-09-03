@@ -1,5 +1,6 @@
 //! The lower sequence region and its persistent UI-local state.
 
+use crate::design::{circuit, kit::Weight};
 use crate::ui::affordance::{Afford, Affords};
 use crate::ui::sequencer::grammar::Voice;
 use crate::ui::sequencer::roll::RollPanel;
@@ -57,12 +58,30 @@ pub(crate) fn editor_switch(
                 egui::Sense::click(),
             )
             .affords(Affords::Press);
-        if editor == current {
-            painter.rect_filled(
-                tab,
-                0.0,
-                crate::ui::sequencer::shade(EDITOR_ACTIVE_FILL, ground),
-            );
+        let alpha = crate::design::Alphabet::for_polarity(ground);
+        let active = editor == current;
+        let hovered = response.hovered() && !active;
+        let mut shell = Vec::new();
+        circuit::relic_frame(
+            &mut shell,
+            tab.shrink2(egui::vec2(1.0, 2.0)),
+            if active {
+                crate::ui::sequencer::shade(EDITOR_ACTIVE_FILL, ground)
+            } else if hovered {
+                crate::ui::sequencer::wash(EDITOR_RESTING_WASH, ground)
+            } else {
+                crate::ui::sequencer::shade(0, ground)
+            },
+            if active { Weight::Bold } else { Weight::Hair },
+            alpha
+                .live_dim
+                .color
+                .gamma_multiply(if active { 0.90 } else { 0.55 }),
+        );
+        for shape in shell {
+            painter.add(shape);
+        }
+        if active {
             painter.rect_filled(
                 egui::Rect::from_min_max(
                     tab.left_bottom() + egui::vec2(space::SM, -2.0),
@@ -70,12 +89,6 @@ pub(crate) fn editor_switch(
                 ),
                 0.0,
                 crate::ui::sequencer::shade(crate::ui::sequencer::INK_LEVEL, ground),
-            );
-        } else if response.hovered() {
-            painter.rect_filled(
-                tab,
-                0.0,
-                crate::ui::sequencer::wash(EDITOR_RESTING_WASH, ground),
             );
         }
         painter.text(

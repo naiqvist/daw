@@ -123,24 +123,14 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let bloom = 0.24 + activity * (0.18 + beat_decay * 0.08);
     let luminance = luma(base.rgb);
 
-    // Black is the screen material. Looking four physical pixels around the
-    // current one carries bright glyphs, cursors, traces and needles with the
-    // dark field they sit in, while a genuinely light panel remains exact.
-    // In this linear texture, 0.05 is roughly sRGB 63 and 0.13 roughly 101.
-    let context_luminance = min(
-        luma(authored.rgb),
-        min(
-            min(
-                luma(textureSample(frame, frame_sampler, clamp(in.uv + vec2<f32>( 4.0,  0.0) * pixel, safe_min, safe_max)).rgb),
-                luma(textureSample(frame, frame_sampler, clamp(in.uv + vec2<f32>(-4.0,  0.0) * pixel, safe_min, safe_max)).rgb),
-            ),
-            min(
-                luma(textureSample(frame, frame_sampler, clamp(in.uv + vec2<f32>( 0.0,  4.0) * pixel, safe_min, safe_max)).rgb),
-                luma(textureSample(frame, frame_sampler, clamp(in.uv + vec2<f32>( 0.0, -4.0) * pixel, safe_min, safe_max)).rgb),
-            ),
-        ),
-    );
-    let screen_gate = clamp((0.13 - context_luminance) / 0.08, 0.0, 1.0);
+    // Only this exact authored pixel decides whether it is screen material.
+    // Dark wells and surfaces receive the CRT treatment; text, glyphs,
+    // coloured state, light panels and the white cursor pass through byte for
+    // byte.  There is deliberately no neighbourhood admission here: bloom may
+    // land on dark glass around a mark, but the mark itself is never graded.
+    // In this linear texture 0.035 is about sRGB 52 and 0.060 about sRGB 69.
+    let authored_luminance = luma(authored.rgb);
+    let screen_gate = clamp((0.060 - authored_luminance) / 0.025, 0.0, 1.0);
 
     // One physical pixel of RGB misregistration, admitted only by bright
     // phosphor. Mixing rather than replacing keeps it a fringe, not a split

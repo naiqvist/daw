@@ -8711,6 +8711,20 @@ pub mod console {
         pub const VOICE_B: u32 = 5;
         pub const MIX: u32 = 6;
 
+        pub const MODE_FREEZE: u32 = 0;
+        pub const MODE_BLUR: u32 = 1;
+        pub const MODE_PITCH: u32 = 2;
+        pub const MODE_CHOIR: u32 = 3;
+        pub const MODE_ROBOT: u32 = 4;
+        /// The transform: a window long enough to hold a low note and
+        /// a quarter-window hop, which is the usual bargain between
+        /// smearing and cost.
+        pub const SIZE: usize = 1_024;
+        pub const HOP: usize = 256;
+        /// Blur at full holds this share of the last frame's shape,
+        /// per frame — so a blurred sound arrives late and leaves late.
+        pub const BLUR_HOLD: f32 = 0.94;
+
         pub const TABLE: &[ParamDef] = &[
             ParamDef {
                 id: 0,
@@ -8759,7 +8773,7 @@ pub mod console {
                 name: "Mix",
                 min: 0.0,
                 max: 100.0,
-                default: 50.0,
+                default: 0.0,
             },
         ];
     }

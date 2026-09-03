@@ -308,6 +308,77 @@ pub fn octagon(
     }
 }
 
+/// A cut-glass outline for powered display modules.  Its uneven shoulders
+/// make it read as a signal-grown housing rather than a conventional button.
+pub fn relic_points(rect: Rect) -> Vec<Pos2> {
+    let cut = 7.0f32
+        .min(rect.width() / 8.0)
+        .min(rect.height() / 3.0)
+        .max(2.0);
+    vec![
+        pos2(rect.left() + cut, rect.top()),
+        pos2(rect.right() - cut * 1.8, rect.top()),
+        pos2(rect.right(), rect.top() + cut),
+        pos2(rect.right(), rect.bottom() - cut * 0.65),
+        pos2(rect.right() - cut * 0.65, rect.bottom()),
+        pos2(rect.left() + cut * 1.45, rect.bottom()),
+        pos2(rect.left(), rect.bottom() - cut),
+        pos2(rect.left(), rect.top() + cut * 0.72),
+    ]
+}
+
+/// A filled cut-glass module in the powered-display construction family.
+pub fn relic_frame(out: &mut Vec<Shape>, rect: Rect, fill: Color32, weight: Weight, ink: Color32) {
+    if !rect.is_positive() {
+        return;
+    }
+    let points = relic_points(rect);
+    out.push(Shape::convex_polygon(points.clone(), fill, Stroke::NONE));
+    inked(out, &points, true, weight, ink);
+}
+
+/// A neutral powered node: a plus bus, square core and short data stem.
+/// It scales from a track module down to an empty grid address without
+/// suggesting an eye, face, creature or character.
+pub fn relic_node(out: &mut Vec<Shape>, centre: Pos2, span: f32, ink: Color32, core: Color32) {
+    let arm = span.max(2.0);
+    let rise = arm * 0.56;
+    let fall = arm * 0.72;
+    trace(
+        out,
+        &[
+            pos2(centre.x - arm, centre.y),
+            pos2(centre.x + arm, centre.y),
+        ],
+        Weight::Hair,
+        ink,
+    );
+    trace(
+        out,
+        &[
+            pos2(centre.x, centre.y - rise),
+            pos2(centre.x, centre.y + fall),
+        ],
+        Weight::Hair,
+        ink,
+    );
+    pad(out, centre, (arm * 0.34).clamp(2.0, PAD), core, true);
+    pad(
+        out,
+        pos2(centre.x - arm, centre.y),
+        (arm * 0.22).clamp(2.0, PAD - 1.0),
+        ink,
+        false,
+    );
+    pad(
+        out,
+        pos2(centre.x + arm, centre.y),
+        (arm * 0.22).clamp(2.0, PAD - 1.0),
+        ink,
+        false,
+    );
+}
+
 /// A large panel in the archive's later hand. The variants are a small
 /// construction family, not one branded silhouette stamped everywhere:
 /// long straight runs, at most one side notch, and selected diagonal cuts.
