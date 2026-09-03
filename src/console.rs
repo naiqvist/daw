@@ -592,6 +592,76 @@ pub mod cut_curve {
     }
 }
 
+/// DRIVE's five curves, green so the card draws what the core runs.
+/// Every curve has unit slope at zero; `k` is the drive.
+pub mod drive_curve {
+    use crate::params::console::drive as p;
+
+    /// The tube: asymmetric soft saturation with a heavier bias than
+    /// the preamp's iron — a triode's, so the even harmonics lead well
+    /// into the drive.
+    pub fn tube(x: f32, k: f32) -> f32 {
+        let b = p::TUBE_BIAS;
+        let tb = b.tanh();
+        let slope = k * (1.0 - tb * tb);
+        ((k * x + b).tanh() - tb) / slope
+    }
+
+    /// Tape: symmetric and round, the softest knee.
+    pub fn tape(x: f32, k: f32) -> f32 {
+        let y = k * x;
+        y / (1.0 + y * y).sqrt() / k
+    }
+
+    /// The transistor: symmetric, a hard knee, odd harmonics.
+    pub fn transistor(x: f32, k: f32) -> f32 {
+        let y = k * x;
+        y / (1.0 + y.abs().powf(3.5)).powf(1.0 / 3.5) / k
+    }
+
+    /// Fuzz: a starved stage — biased, then clipped flat.
+    pub fn fuzz(x: f32, k: f32) -> f32 {
+        let b = p::FUZZ_BIAS * (1.0 - 1.0 / k);
+        ((k * x + b).clamp(-1.0, 1.0) - b.clamp(-1.0, 1.0)) / k
+    }
+
+    /// The folder: a triangle wave of the input — identity inside the
+    /// rails, reflected outside.
+    pub fn fold(x: f32, k: f32) -> f32 {
+        let y = k * x;
+        let m = (y + 1.0) * 0.25;
+        let tri = 4.0 * (m - (m + 0.5).floor()).abs() - 1.0;
+        tri / k
+    }
+
+    /// The drive `k` a character reaches at `drive` (0..1).
+    pub fn drive_of(character: u32, drive: f32) -> f32 {
+        let full = match character {
+            p::TUBE => p::TUBE_DRIVE,
+            p::TAPE => p::TAPE_DRIVE,
+            p::TRANSISTOR => p::TRANSISTOR_DRIVE,
+            p::FUZZ => p::FUZZ_DRIVE,
+            _ => p::FOLD_DRIVE,
+        };
+        1.0 + full * drive.clamp(0.0, 1.0)
+    }
+
+    /// The character's transfer at `drive`, for `x` in −1..1.
+    pub fn transfer(character: u32, drive: f32, x: f32) -> f32 {
+        if drive <= 0.0 {
+            return x;
+        }
+        let k = drive_of(character, drive);
+        match character {
+            p::TUBE => tube(x, k),
+            p::TAPE => tape(x, k),
+            p::TRANSISTOR => transistor(x, k),
+            p::FUZZ => fuzz(x, k),
+            _ => fold(x, k),
+        }
+    }
+}
+
 /// What a section measured this frame, as the surface reads it: the
 /// green twin of the engine's readout, so a card can carry live figures
 /// without the surface importing the audio side. Level in dBFS,

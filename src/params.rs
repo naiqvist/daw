@@ -8290,6 +8290,28 @@ pub mod console {
         pub const MIX: u32 = 4;
         pub const OUT: u32 = 5;
 
+        pub const TUBE: u32 = 0;
+        pub const TAPE: u32 = 1;
+        pub const TRANSISTOR: u32 = 2;
+        pub const FUZZ: u32 = 3;
+        pub const FOLD: u32 = 4;
+        /// How hard each character drives its curve at full.
+        pub const TUBE_DRIVE: f32 = 4.0;
+        /// The tube's bias: a triode's asymmetry.
+        pub const TUBE_BIAS: f32 = 0.45;
+        pub const TAPE_DRIVE: f32 = 6.0;
+        pub const TRANSISTOR_DRIVE: f32 = 8.0;
+        pub const FUZZ_DRIVE: f32 = 24.0;
+        pub const FOLD_DRIVE: f32 = 4.0;
+        /// The tilts' pivot.
+        pub const TILT_HZ: f32 = 1_000.0;
+        /// Tape softens the top as it is driven: its corner falls from
+        /// the first figure toward the second.
+        pub const TAPE_TOP_HZ: f32 = 16_000.0;
+        pub const TAPE_TOP_DRIVEN_HZ: f32 = 5_000.0;
+        /// The fuzz's bias: the gate-like asymmetry of a starved fuzz.
+        pub const FUZZ_BIAS: f32 = 0.3;
+
         pub const TABLE: &[ParamDef] = &[
             ParamDef {
                 id: 0,
@@ -8303,7 +8325,7 @@ pub mod console {
                 name: "Drive",
                 min: 0.0,
                 max: 100.0,
-                default: 20.0,
+                default: 0.0,
             },
             ParamDef {
                 id: 2,
