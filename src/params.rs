@@ -8775,6 +8775,22 @@ pub mod console {
         pub const PINGPONG: u32 = 5;
         pub const MIX: u32 = 6;
 
+        pub const FREE: u32 = 0;
+        /// The synced divisions, in beats, in SYNC's order past FREE.
+        pub const SYNC_BEATS: [f32; 5] = [0.25, 0.5, 0.75, 1.0, 2.0];
+        /// The longest echo the line holds, in ms.
+        pub const MAX_MS: f32 = 2_000.0;
+        /// The loop's soft top: an analogue delay's repeats round off
+        /// rather than clip, which is why a hot feedback growls.
+        pub const LOOP_DRIVE: f32 = 0.35;
+        /// The wow: how far the head wanders at full, as a share of the
+        /// time, and how fast it wanders.
+        pub const WOW_DEPTH: f32 = 0.02;
+        pub const WOW_HZ: f32 = 0.6;
+        /// How long the time takes to reach a new setting: an analogue
+        /// delay glides rather than jumping, so a turn is a swoop.
+        pub const GLIDE_MS: f32 = 120.0;
+
         pub const TABLE: &[ParamDef] = &[
             ParamDef {
                 id: 0,
@@ -8823,7 +8839,7 @@ pub mod console {
                 name: "Mix",
                 min: 0.0,
                 max: 100.0,
-                default: 30.0,
+                default: 0.0,
             },
         ];
     }
@@ -8836,6 +8852,23 @@ pub mod console {
         pub const SIZE: u32 = 2;
         pub const DAMP: u32 = 3;
         pub const MIX: u32 = 4;
+
+        pub const ROOM: u32 = 0;
+        pub const HALL: u32 = 1;
+        /// The longest pre-delay, in ms.
+        pub const MAX_PREDELAY_MS: f32 = 200.0;
+        /// The damping corner at no damp and at full, in Hz.
+        pub const DAMP_OPEN_HZ: f32 = 18_000.0;
+        pub const DAMP_SHUT_HZ: f32 = 1_400.0;
+        /// The hall's decay at the smallest size and the largest, in
+        /// seconds, and its diffusion and modulation.
+        pub const HALL_SHORT_S: f32 = 0.6;
+        pub const HALL_LONG_S: f32 = 9.0;
+        pub const HALL_DIFFUSION: f32 = 0.8;
+        pub const HALL_MODULATION: f32 = 6.0;
+        /// The room's decay across its size.
+        pub const ROOM_DECAY_LOW: f32 = 0.3;
+        pub const ROOM_DECAY_HIGH: f32 = 0.92;
 
         pub const TABLE: &[ParamDef] = &[
             ParamDef {
@@ -8871,7 +8904,7 @@ pub mod console {
                 name: "Mix",
                 min: 0.0,
                 max: 100.0,
-                default: 25.0,
+                default: 0.0,
             },
         ];
     }

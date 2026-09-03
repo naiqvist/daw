@@ -283,6 +283,10 @@ mod tests {
         assert!(source.contains("textureSample"));
         assert!(source.contains("screen_gate"));
         assert!(source.contains("mix(authored.rgb, crt, screen_gate)"));
+        assert!(source.contains("deck_grade"));
+        assert!(source.contains("tech_circuit"));
+        assert!(source.contains("ancient_glyph"));
+        assert!(source.contains("SHEIKAH_CYAN"));
         assert!(source.contains("emission"));
         assert!(source.contains("beam"));
         assert!(source.contains("analog_noise"));

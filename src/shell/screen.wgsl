@@ -40,6 +40,23 @@ fn luma(colour: vec3<f32>) -> f32 {
     return dot(colour, vec3<f32>(0.2126, 0.7152, 0.0722));
 }
 
+// The cyberdeck's two emissive materials: Sheikah-blue information and the
+// warm ancient-tech nodes beneath it. Values are linear because the frame is
+// sampled from an sRGB texture.
+const SHEIKAH_CYAN: vec3<f32> = vec3<f32>(0.08, 0.72, 1.00);
+const ANCIENT_AMBER: vec3<f32> = vec3<f32>(1.00, 0.22, 0.025);
+
+// Neutral authored ink belongs to the glass and takes its cold-blue cast.
+// Saturated colours carry meaning in the UI, so they retain their hue.
+fn deck_grade(colour: vec3<f32>) -> vec3<f32> {
+    let light = luma(colour);
+    let high = max(max(colour.r, colour.g), colour.b);
+    let low = min(min(colour.r, colour.g), colour.b);
+    let neutral = 1.0 - clamp((high - low) * 8.0, 0.0, 1.0);
+    let cold_ink = vec3<f32>(light * 0.70, light * 1.02, light * 1.20);
+    return mix(colour * 1.06, cold_ink, neutral * 0.78);
+}
+
 // Integer noise keeps the grain pixel-sharp. There is no blurred noise
 // texture stretched over the panel: every value belongs to one screen pixel
 // and one compositor frame.
@@ -55,6 +72,50 @@ fn hash_u32(value: u32) -> u32 {
 fn analog_noise(pixel: vec2<u32>, tick: u32) -> f32 {
     let seed = pixel.x * 0x9e3779b9u ^ pixel.y * 0x85ebca6bu ^ tick * 0xc2b2ae35u;
     return f32(hash_u32(seed) & 0x00ffffffu) / 16777215.0;
+}
+
+// Sparse stepped traces and junctions, addressed in physical pixels. They
+// appear only in the deepest glass (the caller supplies that gate), so the
+// pattern gives empty space an ancient circuit logic without sitting over
+// text, meters, notes or selection marks.
+fn tech_circuit(pixel: vec2<u32>, activity: f32, beat_decay: f32) -> vec3<f32> {
+    let tile_size = vec2<u32>(48u, 32u);
+    let tile = pixel / tile_size;
+    let local = pixel % tile_size;
+    let seed = hash_u32(tile.x * 0x9e3779b9u ^ tile.y * 0x85ebca6bu);
+    let admitted = (seed & 3u) == 0u;
+    let row = 8u + ((seed >> 2u) & 1u) * 16u;
+    let column = 8u + ((seed >> 3u) & 3u) * 8u;
+    let horizontal = local.y == row && local.x >= 4u && local.x <= 43u;
+    let vertical = local.x == column && local.y >= min(row, 24u) && local.y <= 28u;
+    let line = select(0.0, 1.0, admitted && (horizontal || vertical));
+    let dx = abs(f32(local.x) - f32(column));
+    let dy = abs(f32(local.y) - f32(row));
+    let node = select(0.0, 1.0, admitted && dx <= 1.0 && dy <= 1.0);
+    let live = activity * (0.55 + beat_decay * 0.45);
+    return SHEIKAH_CYAN * line * (0.0065 + live * 0.0025)
+        + ANCIENT_AMBER * node * (0.014 + live * 0.012);
+}
+
+// A sparse watcher glyph: a diamond-eye, iris and falling data stroke. It is
+// deliberately assembled from one-pixel geometry instead of an image, so it
+// belongs to the same physical phosphor grid as the rest of the deck.
+fn ancient_glyph(pixel: vec2<u32>, activity: f32, beat_decay: f32) -> vec3<f32> {
+    let tile_size = vec2<u32>(192u, 128u);
+    let tile = pixel / tile_size;
+    let seed = hash_u32(tile.x * 0x27d4eb2du ^ tile.y * 0x165667b1u);
+    let admitted = (seed & 7u) == 0u;
+    let local = vec2<f32>(pixel % tile_size) - vec2<f32>(96.0, 58.0);
+    let dx = abs(local.x);
+    let eye = abs(abs(local.y) + dx * 0.32 - 6.0) <= 0.72 && dx <= 18.0;
+    let iris = abs(length(local) - 3.5) <= 0.72;
+    let data_drop = abs(local.x) <= 0.65 && local.y >= 7.0 && local.y <= 15.0;
+    let crown = abs(local.x) <= 0.65 && local.y >= -12.0 && local.y <= -7.0;
+    let blue = select(0.0, 1.0, admitted && (eye || data_drop || crown));
+    let amber = select(0.0, 1.0, admitted && iris);
+    let live = activity * (0.55 + beat_decay * 0.45);
+    return SHEIKAH_CYAN * blue * (0.008 + live * 0.004)
+        + ANCIENT_AMBER * amber * (0.018 + live * 0.014);
 }
 
 @fragment
@@ -147,7 +208,7 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     // image, and the green channel remains the stable centre line.
     let aberration_gate = clamp((luminance - 0.10) * 0.90, 0.0, 0.18);
     let separated = vec3<f32>(red_sample, base.g, blue_sample);
-    let phosphor = mix(base.rgb, separated, aberration_gate);
+    let phosphor = deck_grade(mix(base.rgb, separated, aberration_gate));
 
     // Fine luma grain lives mostly in the phosphor, with just enough in the
     // black floor to make the glass feel electrically awake. A rare bright
@@ -156,12 +217,23 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let grain_level = 0.005 + min(luminance * 0.018, 0.018) + activity * 0.003;
     let interference_seed = analog_noise(vec2<u32>(31u, pixel_address.y), tick);
     let interference = select(0.0, 0.020 + activity * 0.010, interference_seed > 0.996);
-    let noise_tint = vec3<f32>(0.72, 1.0, 0.91);
+    let noise_tint = vec3<f32>(0.26, 1.0, 1.20);
+
+    // True black becomes blue-black glass. The sparse circuitry lives below
+    // authored content and retreats rapidly as soon as a real pixel speaks.
+    let deep_glass = clamp((0.045 - luminance) / 0.045, 0.0, 1.0);
+    let glass_floor = vec3<f32>(0.0015, 0.0050, 0.0110) * deep_glass;
+    let circuitry = tech_circuit(pixel_address, activity, beat_decay) * deep_glass;
+    let glyph = ancient_glyph(pixel_address, activity, beat_decay) * deep_glass;
+    let graded_beam = deck_grade(beam) * vec3<f32>(0.78, 1.04, 1.14);
 
     let crt = max(
         phosphor * mask * scanline
-            + beam * bloom
-            + noise_tint * (grain * grain_level + interference),
+            + graded_beam * bloom
+            + noise_tint * (grain * grain_level + interference)
+            + glass_floor
+            + circuitry
+            + glyph,
         vec3<f32>(0.0),
     );
     return vec4<f32>(mix(authored.rgb, crt, screen_gate), authored.a);
