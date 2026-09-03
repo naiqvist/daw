@@ -214,20 +214,40 @@ impl Face<'_> {
     /// is addressing. The mark is not a row under the drawing: it is
     /// four bright corners just inside the instrument itself.
     pub fn mark(&self, lay: &impl Layout) {
+        self.mark_signed(lay, crate::ui::nav_cursor::Signature::Plain);
+    }
+
+    /// The same, but the mark BECOMES the instrument it is standing on:
+    /// squeezed by the reduction, opened by the gate, coloured by the
+    /// band, swept by the modulator. Every signature carries a measured
+    /// figure — see [`crate::ui::nav_cursor::Signature`] — so a cursor
+    /// that is moving is a cursor reading something.
+    pub fn mark_signed(&self, lay: &impl Layout, signature: crate::ui::nav_cursor::Signature) {
         let Some(param) = self.selected else {
             return;
         };
         let Some(rect) = lay.control(param) else {
             return;
         };
-        crate::ui::nav_cursor::claim(
+        crate::ui::nav_cursor::claim_signed(
             self.painter,
             ("stage-face-cursor", self.piece.index),
             rect,
             lay.cursor_kind(param),
             crate::ui::nav_cursor::Layer::Surface,
             self.focus(),
+            signature,
         );
+    }
+
+    /// Which cell of `of` the transport is inside, this beat. The one
+    /// place a face may read the clock, and it is the transport's clock.
+    pub fn beat_cell(&self, of: usize) -> crate::ui::nav_cursor::Signature {
+        let of = of.max(1);
+        crate::ui::nav_cursor::Signature::Beat {
+            cell: ((self.phase.beat * of as f32) as usize).min(of - 1),
+            of,
+        }
     }
 }
 

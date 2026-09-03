@@ -2,6 +2,7 @@
 //! actually running.
 
 use super::*;
+use crate::ui::nav_cursor;
 
 /// TONE's three bands, each its own hue, so a glance says which lever
 /// is which without a word being written. Warm at the bottom, violet
@@ -348,7 +349,24 @@ pub(super) fn draw(face: &Face<'_>) {
 
     // The cursor: the house brackets around whichever instrument
     // the keyboard is holding, and nothing else on the lay bright.
-    face.mark(&lay);
+    // The mark becomes the band it is standing on: the band's own hue
+    // on its corners, leaning up for a boost and down for a cut, and
+    // shut like a lid on a kill. What the cursor wears is what the
+    // engine is doing to that band.
+    face.mark_signed(
+        &lay,
+        match selected {
+            Some(band @ 0..=2) => nav_cursor::Signature::Band {
+                ink: inks[band],
+                amount: (gains[band] / 15.0).clamp(-1.0, 1.0),
+            },
+            Some(3) => nav_cursor::Signature::Sweep(face.place(p::MID_HZ) * 2.0 - 1.0),
+            Some(kill @ 4..=6) => {
+                nav_cursor::Signature::Aperture(if kills[kill - 4] { 0.0 } else { 1.0 })
+            }
+            _ => nav_cursor::Signature::Plain,
+        },
+    );
 }
 
 #[cfg(test)]

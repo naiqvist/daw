@@ -26,6 +26,72 @@ pub enum Kind {
     Prompt,
 }
 
+/// What the mark should BECOME while it stands here.
+///
+/// On most of the application the cursor is a cursor: four corners and
+/// some ticks. On a console card it can be the instrument it is standing
+/// on — the compressor's gain reduction squeezing its arms, the gate's
+/// aperture closing across it, the band's own hue on its corners, the
+/// modulator's sweep sliding a tick along its edge. Every one of these
+/// carries a MEASURED quantity: what the section reported of itself in
+/// the audio callback, or where the transport is. Nothing here breathes
+/// on its own.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Signature {
+    /// A cursor. Four corners, some ticks, nothing else.
+    Plain,
+    /// Gain reduction, 0 (none) to 1 (all of it). The arms pull in and
+    /// the mark itself is compressed, so the cursor is being squashed by
+    /// exactly what is squashing the sound.
+    Squeeze(f32),
+    /// A level, 0..1. It fills the mark's foot.
+    Level(f32),
+    /// A band: its hue, and how far it is boosted or cut, −1..1. The
+    /// corners take the hue and the mark leans up or down.
+    Band { ink: egui::Color32, amount: f32 },
+    /// A modulator's position, −1..1. A tick rides the mark's edges.
+    Sweep(f32),
+    /// How far open, 0 (shut) to 1. Two lids close across the mark.
+    Aperture(f32),
+    /// A place on a grid of cells: which one, of how many. The mark's
+    /// foot becomes the grid, and the cell the transport is inside is
+    /// the one that is lit.
+    Beat { cell: usize, of: usize },
+}
+
+impl Signature {
+    /// The scalar this signature eases, so a figure that arrives once a
+    /// block does not make the mark flicker at the frame rate.
+    fn amount(self) -> f32 {
+        match self {
+            Signature::Plain | Signature::Beat { .. } => 0.0,
+            Signature::Squeeze(v)
+            | Signature::Level(v)
+            | Signature::Sweep(v)
+            | Signature::Aperture(v)
+            | Signature::Band { amount: v, .. } => v,
+        }
+    }
+
+    /// The same signature carrying `amount` instead of its own.
+    fn with(self, amount: f32) -> Self {
+        match self {
+            Signature::Squeeze(_) => Signature::Squeeze(amount),
+            Signature::Level(_) => Signature::Level(amount),
+            Signature::Sweep(_) => Signature::Sweep(amount),
+            Signature::Aperture(_) => Signature::Aperture(amount),
+            Signature::Band { ink, .. } => Signature::Band { ink, amount },
+            other => other,
+        }
+    }
+
+    /// Two signatures are the same INSTRUMENT when they are the same
+    /// variant, whatever they currently read.
+    fn same_instrument(self, other: Self) -> bool {
+        core::mem::discriminant(&self) == core::mem::discriminant(&other)
+    }
+}
+
 /// Which compositional plane owns a target. A modal cursor must win over the
 /// still-visible surface beneath it regardless of paint order.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -42,6 +108,7 @@ struct Target {
     kind: Kind,
     layer: Layer,
     ink: egui::Color32,
+    signature: Signature,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -69,6 +136,24 @@ pub fn claim(
     layer: Layer,
     ink: egui::Color32,
 ) {
+    claim_signed(painter, id, rect, kind, layer, ink, Signature::Plain);
+}
+
+/// The same, but the mark takes the shape of what it is standing on.
+///
+/// A surface that has a measured figure for the thing under the cursor
+/// hands it over here, and the mark wears it for as long as it stands
+/// there. See [`Signature`].
+#[allow(clippy::too_many_arguments)]
+pub fn claim_signed(
+    painter: &egui::Painter,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    rect: egui::Rect,
+    kind: Kind,
+    layer: Layer,
+    ink: egui::Color32,
+    signature: Signature,
+) {
     let rect = rect.intersect(painter.clip_rect());
     if rect.width() < 2.0 || rect.height() < 2.0 {
         return;
@@ -79,6 +164,7 @@ pub fn claim(
         kind,
         layer,
         ink,
+        signature,
     };
     painter.ctx().data_mut(|data| {
         let registry = data.get_temp_mut_or_default::<Registry>(registry_id());
@@ -148,6 +234,15 @@ struct Motion {
     settle: Option<f32>,
     hops: u32,
     ink: egui::Color32,
+    /// The instrument the mark is wearing, and the figure it reads.
+    /// The figure is eased so a value that arrives once an audio block
+    /// does not make the mark flicker at the frame rate.
+    signature: Signature,
+    /// The launch. Set on every redirect and let go of, so the mark
+    /// gathers itself before the spring throws it — the one keyed
+    /// anticipation, and the reason a hop reads as a jump rather than
+    /// as a slide.
+    wind: f32,
 }
 
 impl Default for Motion {
@@ -167,6 +262,8 @@ impl Default for Motion {
             settle: None,
             hops: 0,
             ink: egui::Color32::WHITE,
+            signature: Signature::Plain,
+            wind: 0.0,
         }
     }
 }
@@ -179,6 +276,8 @@ struct Visual {
     velocity: egui::Vec2,
     settle: Option<(f32, u32)>,
     ink: egui::Color32,
+    signature: Signature,
+    wind: f32,
 }
 
 impl Motion {
@@ -199,6 +298,7 @@ impl Motion {
             self.size = target.rect.size();
             self.style = Style::for_kind(target.kind);
             self.ink = target.ink;
+            self.signature = target.signature;
             // The app has a keyboard address on its very first frame. Do not
             // make that address wait through a fade before it becomes legible;
             // subsequent disappearance and return still use the shared fade.
@@ -211,12 +311,30 @@ impl Motion {
                 self.hops = self.hops.wrapping_add(1);
                 self.moving = true;
                 self.settle = None;
+                self.wind = 1.0;
             }
             self.target_id = Some(target.id);
             self.target_kind = target.kind;
             self.destination = target.rect;
-            self.ink = target.ink;
+            // The ink walks rather than cuts, so crossing between two
+            // surfaces that carry different inks is one mark changing
+            // colour instead of two marks.
+            self.ink = approach_ink(self.ink, target.ink, 14.0, dt);
+            // A figure that arrives once an audio block is eased to the
+            // frame rate; a change of INSTRUMENT is not eased, because
+            // the mark has become a different thing.
+            self.signature = if self.signature.same_instrument(target.signature) {
+                target.signature.with(approach(
+                    self.signature.amount(),
+                    target.signature.amount(),
+                    26.0,
+                    dt,
+                ))
+            } else {
+                target.signature
+            };
         }
+        self.wind = approach(self.wind, 0.0, 21.0, dt);
 
         // A true second-order cursor: distance creates acceleration, velocity
         // carries it between panels, and damping catches it at the address.
@@ -263,25 +381,54 @@ impl Motion {
         let repaint = self.moving
             || self.settle.is_some()
             || self.opacity < 0.995
+            || self.wind > 0.01
             || error > 0.2
-            || speed > 0.2;
+            || speed > 0.2
+            || self.signature != Signature::Plain;
         (self.visual(), repaint)
     }
 
     fn visual(&self) -> Visual {
+        // At rest the mark lands on whole pixels: a hairline that has
+        // stopped moving should be one crisp line, not two grey ones.
+        let rect = egui::Rect::from_center_size(self.center, self.size);
+        let rect = if self.moving || self.settle.is_some() {
+            rect
+        } else {
+            egui::Rect::from_min_max(
+                egui::pos2(rect.min.x.round(), rect.min.y.round()),
+                egui::pos2(rect.max.x.round(), rect.max.y.round()),
+            )
+        };
         Visual {
-            rect: egui::Rect::from_center_size(self.center, self.size),
+            rect,
             style: self.style,
             opacity: self.opacity,
             velocity: self.center_velocity,
             settle: self.settle.map(|time| (time / SETTLE_SECONDS, self.hops)),
             ink: self.ink,
+            signature: self.signature,
+            wind: self.wind,
         }
     }
 }
 
 fn approach(value: f32, target: f32, speed: f32, dt: f32) -> f32 {
     egui::lerp(value..=target, 1.0 - (-speed * dt).exp())
+}
+
+/// The same, channel by channel, so the mark's ink walks between two
+/// surfaces rather than cutting.
+fn approach_ink(from: egui::Color32, to: egui::Color32, speed: f32, dt: f32) -> egui::Color32 {
+    let amount = 1.0 - (-speed * dt).exp();
+    let channel =
+        |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * amount).round() as u8;
+    egui::Color32::from_rgba_unmultiplied(
+        channel(from.r(), to.r()),
+        channel(from.g(), to.g()),
+        channel(from.b(), to.b()),
+        channel(from.a(), to.a()),
+    )
 }
 
 fn spring_vec2(position: &mut egui::Pos2, velocity: &mut egui::Vec2, target: egui::Pos2, dt: f32) {
@@ -335,24 +482,75 @@ fn draw(painter: &egui::Painter, visual: Visual) {
         rect = egui::Rect::from_center_size(rect.center(), rect.size() * scale);
         punch = ((progress * core::f32::consts::PI).sin() * 0.85).max(0.0);
     }
+    // The launch: the mark gathers itself the instant it is redirected
+    // and lets go as it travels. Keyed off the hop, not off a clock.
+    if visual.wind > 0.001 {
+        rect =
+            egui::Rect::from_center_size(rect.center(), rect.size() * (1.0 - 0.055 * visual.wind));
+    }
+    // Squash and stretch, from the mark's OWN velocity: it lengthens
+    // along the way it is going and narrows across it, and is exactly
+    // square the moment it stops. The stretch is the motion, not a
+    // decoration applied to it.
+    let speed = visual.velocity.length();
+    if speed > 24.0 {
+        let forward = visual.velocity / speed;
+        let reach = (speed / 1500.0).clamp(0.0, 0.14);
+        let (ax, ay) = (forward.x.abs(), forward.y.abs());
+        rect = egui::Rect::from_center_size(
+            rect.center(),
+            rect.size()
+                * egui::vec2(
+                    1.0 + reach * (ax - 0.55 * ay),
+                    1.0 + reach * (ay - 0.55 * ax),
+                ),
+        );
+    }
+    // A compressor squeezes the mark exactly as far as it is squeezing
+    // the sound: the frame draws in and the arms shorten.
+    let squeeze = match visual.signature {
+        Signature::Squeeze(amount) => amount.clamp(0.0, 1.0),
+        _ => 0.0,
+    };
+    if squeeze > 0.001 {
+        let short = rect.width().min(rect.height()).max(2.0);
+        rect = rect.shrink(short * 0.11 * squeeze);
+    }
 
     let ink = visual.ink.gamma_multiply(visual.opacity);
-    let stroke = egui::Stroke::new(1.5 + punch, ink);
+    // A band's mark wears the band's own hue, so the cursor standing on
+    // the low shelf is the same colour as the low shelf.
+    let corner_ink = match visual.signature {
+        Signature::Band { ink: hue, .. } => hue.gamma_multiply(visual.opacity),
+        _ => ink,
+    };
+    let stroke = egui::Stroke::new(1.5 + punch, corner_ink);
     let short = rect.width().min(rect.height()).max(2.0);
-    let arm_x = (rect.width() * visual.style.arm).clamp(4.0, 18.0);
-    let arm_y = (rect.height() * visual.style.arm).clamp(4.0, 18.0);
+    let arm = visual.style.arm * (1.0 - 0.45 * squeeze);
+    let arm_x = (rect.width() * arm).clamp(3.0, 18.0);
+    let arm_y = (rect.height() * arm).clamp(3.0, 18.0);
     let cut = (short * 0.16 * visual.style.cut).clamp(0.0, 4.0);
+    // A band leans: the corners on the side it is boosting toward reach
+    // further, so a boost and a cut are told apart before either number
+    // is read.
+    let lean = match visual.signature {
+        Signature::Band { amount, .. } => amount.clamp(-1.0, 1.0),
+        _ => 0.0,
+    };
     for (corner, sx, sy) in [
         (rect.left_top(), 1.0, 1.0),
         (rect.right_top(), -1.0, 1.0),
         (rect.right_bottom(), -1.0, -1.0),
         (rect.left_bottom(), 1.0, -1.0),
     ] {
+        // Up for a boost, down for a cut: the two corners the lean
+        // favours grow, the other two give way.
+        let favour = 1.0 + lean * sy * 0.5;
         painter.add(egui::Shape::line(
             vec![
-                corner + egui::vec2(0.0, sy * arm_y),
+                corner + egui::vec2(0.0, sy * arm_y * favour),
                 corner + egui::vec2(sx * cut, sy * cut),
-                corner + egui::vec2(sx * arm_x, 0.0),
+                corner + egui::vec2(sx * arm_x * favour, 0.0),
             ],
             stroke,
         ));
@@ -419,9 +617,10 @@ fn draw(painter: &egui::Painter, visual: Visual) {
         egui::Stroke::new(1.0, cross_ink),
     );
 
+    signature_marks(painter, rect, visual, ink);
+
     // Velocity becomes two short fins behind the moving mark. They are the
     // only motion-specific geometry and disappear completely at rest.
-    let speed = visual.velocity.length();
     if speed > 24.0 {
         let forward = visual.velocity / speed;
         let side = egui::vec2(-forward.y, forward.x);
@@ -440,19 +639,117 @@ fn draw(painter: &egui::Painter, visual: Visual) {
     }
 }
 
-/// Three short keyed endings, cycled rather than randomized. The last frame
+/// What the mark wears while it stands on a measured instrument.
+///
+/// Everything here is a quantity the engine reported or the transport
+/// knows. Standing still on a card whose section is doing nothing, all
+/// of it is inert; standing on one that is working, the mark works with
+/// it — which is the point: the cursor stops being a pointer at a
+/// control and becomes a reading of it.
+fn signature_marks(painter: &egui::Painter, rect: egui::Rect, visual: Visual, ink: egui::Color32) {
+    let short = rect.width().min(rect.height()).max(2.0);
+    match visual.signature {
+        Signature::Plain | Signature::Band { .. } | Signature::Squeeze(_) => {}
+
+        // A level fills the mark's foot, left to right.
+        Signature::Level(amount) => {
+            let amount = amount.clamp(0.0, 1.0);
+            let y = rect.bottom() + 2.0;
+            painter.line_segment(
+                [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                egui::Stroke::new(1.0, ink.gamma_multiply(0.28)),
+            );
+            if amount > 0.004 {
+                painter.line_segment(
+                    [
+                        egui::pos2(rect.left(), y),
+                        egui::pos2(egui::lerp(rect.x_range(), amount), y),
+                    ],
+                    egui::Stroke::new(2.0, ink),
+                );
+            }
+        }
+
+        // A modulator rides the mark: one tick on each long edge, at the
+        // sweep's own position, so the cursor breathes with the LFO that
+        // is actually running.
+        Signature::Sweep(at) => {
+            let at = ((at.clamp(-1.0, 1.0) + 1.0) * 0.5).clamp(0.0, 1.0);
+            let x = egui::lerp(rect.x_range(), at);
+            let reach = (short * 0.16).clamp(2.5, 6.0);
+            for y in [rect.top(), rect.bottom()] {
+                painter.line_segment(
+                    [egui::pos2(x, y - reach), egui::pos2(x, y + reach)],
+                    egui::Stroke::new(1.5, ink),
+                );
+            }
+        }
+
+        // An aperture closes across the mark: two lids meeting in the
+        // middle, as far shut as the gate is shut.
+        Signature::Aperture(open) => {
+            let open = open.clamp(0.0, 1.0);
+            let half = rect.height() * 0.5 * (1.0 - open);
+            let lid = ink.gamma_multiply(0.34 + 0.5 * (1.0 - open));
+            for (from, to) in [
+                (rect.top(), rect.top() + half),
+                (rect.bottom() - half, rect.bottom()),
+            ] {
+                if to - from > 0.5 {
+                    painter.rect_filled(
+                        egui::Rect::from_min_max(
+                            egui::pos2(rect.left(), from),
+                            egui::pos2(rect.right(), to),
+                        ),
+                        0.0,
+                        lid,
+                    );
+                }
+            }
+        }
+
+        // A place on a grid: the mark's foot becomes the grid, and the
+        // cell the transport is inside is the lit one.
+        Signature::Beat { cell, of } => {
+            if of == 0 {
+                return;
+            }
+            let y = rect.bottom() + 3.0;
+            let pitch = rect.width() / of as f32;
+            for i in 0..of {
+                let here = i == cell % of;
+                painter.line_segment(
+                    [
+                        egui::pos2(rect.left() + pitch * i as f32 + 1.0, y),
+                        egui::pos2(rect.left() + pitch * (i + 1) as f32 - 1.0, y),
+                    ],
+                    egui::Stroke::new(
+                        if here { 2.0 } else { 1.0 },
+                        if here { ink } else { ink.gamma_multiply(0.3) },
+                    ),
+                );
+            }
+        }
+    }
+}
+
+/// Five short keyed endings, cycled rather than randomized. The last frame
 /// is exactly identity so the cursor never leaves its target distorted.
 fn settle_scale(progress: f32, variant: u32) -> egui::Vec2 {
     let p = progress.clamp(0.0, 1.0);
-    let peak = match variant % 3 {
+    let peak = match variant % 5 {
         0 => egui::vec2(1.08, 0.95),
         1 => egui::vec2(0.96, 1.09),
-        _ => egui::vec2(1.07, 1.07),
+        2 => egui::vec2(1.07, 1.07),
+        3 => egui::vec2(1.05, 0.99),
+        _ => egui::vec2(0.99, 1.05),
     };
-    let recoil = match variant % 3 {
+    let recoil = match variant % 5 {
         0 => egui::vec2(0.985, 1.025),
         1 => egui::vec2(1.025, 0.985),
-        _ => egui::vec2(0.985, 0.985),
+        2 => egui::vec2(0.985, 0.985),
+        3 => egui::vec2(0.992, 1.012),
+        _ => egui::vec2(1.012, 0.992),
     };
     if p < 0.34 {
         egui::lerp(egui::Vec2::ONE..=peak, p / 0.34)
@@ -487,6 +784,87 @@ mod tests {
         assert!(row.side_ticks > row.cross);
         assert!(column.spine > row.spine);
         assert!(instrument.cross > column.cross);
+    }
+
+    /// A signature carries a figure, and the figure is what eases. A
+    /// change of INSTRUMENT is not eased: the mark has become a
+    /// different thing, and sliding between two different things would
+    /// say something untrue about both.
+    #[test]
+    fn a_signature_eases_its_figure_but_not_its_instrument() {
+        let squeeze = Signature::Squeeze(0.2);
+        assert_eq!(squeeze.amount(), 0.2);
+        assert_eq!(squeeze.with(0.9), Signature::Squeeze(0.9));
+        assert!(squeeze.same_instrument(Signature::Squeeze(0.9)));
+        assert!(!squeeze.same_instrument(Signature::Aperture(0.2)));
+        assert!(!squeeze.same_instrument(Signature::Plain));
+        // A band keeps its hue while its figure walks.
+        let band = Signature::Band {
+            ink: egui::Color32::RED,
+            amount: -0.5,
+        };
+        assert_eq!(band.amount(), -0.5);
+        assert_eq!(
+            band.with(0.25),
+            Signature::Band {
+                ink: egui::Color32::RED,
+                amount: 0.25
+            }
+        );
+        // The two that carry no figure ease nothing.
+        assert_eq!(Signature::Plain.amount(), 0.0);
+        assert_eq!(Signature::Beat { cell: 2, of: 4 }.amount(), 0.0);
+        assert_eq!(
+            Signature::Beat { cell: 2, of: 4 }.with(0.9),
+            Signature::Beat { cell: 2, of: 4 }
+        );
+    }
+
+    /// The plain mark is exactly what it always was: a signature is
+    /// something a surface OPTS INTO, never something that happens to a
+    /// cursor that did not ask.
+    #[test]
+    fn a_cursor_that_asked_for_nothing_wears_nothing() {
+        let mut motion = Motion::default();
+        let target = Target {
+            id: egui::Id::new("a"),
+            rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(40.0, 20.0)),
+            kind: Kind::Cell,
+            layer: Layer::Surface,
+            ink: egui::Color32::WHITE,
+            signature: Signature::Plain,
+        };
+        let (visual, _) = motion.advance(Some(target), 1.0 / 120.0);
+        assert_eq!(visual.signature, Signature::Plain);
+        assert_eq!(visual.wind, 0.0, "nothing was redirected, nothing wound up");
+    }
+
+    /// A hop winds the mark up and lets it go: the launch is keyed off
+    /// the redirect itself, so it cannot happen while the mark is still.
+    #[test]
+    fn a_redirect_winds_the_mark_up_and_it_lets_go() {
+        let mut motion = Motion::default();
+        let here = |x: f32, id: &'static str| Target {
+            id: egui::Id::new(id),
+            rect: egui::Rect::from_min_size(egui::pos2(x, 0.0), egui::vec2(40.0, 20.0)),
+            kind: Kind::Cell,
+            layer: Layer::Surface,
+            ink: egui::Color32::WHITE,
+            signature: Signature::Plain,
+        };
+        motion.advance(Some(here(0.0, "a")), 1.0 / 120.0);
+        let (wound, _) = motion.advance(Some(here(300.0, "b")), 1.0 / 120.0);
+        assert!(wound.wind > 0.5, "the hop did not wind the mark up");
+        let mut last = wound.wind;
+        for _ in 0..40 {
+            let (visual, _) = motion.advance(Some(here(300.0, "b")), 1.0 / 120.0);
+            assert!(
+                visual.wind <= last + 1e-6,
+                "the launch grew while travelling"
+            );
+            last = visual.wind;
+        }
+        assert!(last < 0.05, "the mark never let go: {last}");
     }
 
     #[test]

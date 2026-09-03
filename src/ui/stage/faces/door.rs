@@ -2,6 +2,7 @@
 //! controls living in the crevices its silhouette cuts.
 
 use super::*;
+use crate::ui::nav_cursor;
 
 /// DOOR's face, laid out once so the key that addresses an instrument
 /// and the art that answers cannot drift apart.
@@ -501,7 +502,38 @@ pub(super) fn draw(face: &Face<'_>) {
 
     // The cursor: the house brackets around whichever instrument
     // the keyboard is holding.
-    face.mark(&lay);
+    // The mark becomes the door. On the ladder it is squeezed by the
+    // gain the door is actually taking away; on the envelope and the
+    // key it opens and shuts with the leaf; on the chopper's grid it
+    // stands in the cell the transport is inside. Every one of them is
+    // a figure the engine reported, not a picture of one.
+    let taken = (1.0 - said.bands[1].clamp(0.0, 1.0)).clamp(0.0, 1.0);
+    face.mark_signed(
+        &lay,
+        match selected {
+            Some(param)
+                if param == p::THRESHOLD as usize
+                    || param == p::HYSTERESIS as usize
+                    || param == p::RATIO as usize
+                    || param == p::RANGE as usize =>
+            {
+                nav_cursor::Signature::Squeeze(taken)
+            }
+            Some(param)
+                if param == p::ATTACK as usize
+                    || param == p::HOLD as usize
+                    || param == p::RELEASE as usize
+                    || param == p::KEY_HP as usize
+                    || param == p::KEY_LP as usize =>
+            {
+                nav_cursor::Signature::Aperture(said.bands[1].clamp(0.0, 1.0))
+            }
+            Some(param) if param == p::DIVISION as usize || param == p::DUTY as usize => {
+                face.beat_cell(cells)
+            }
+            _ => nav_cursor::Signature::Plain,
+        },
+    );
 }
 
 #[cfg(test)]
