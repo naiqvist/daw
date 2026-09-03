@@ -89,7 +89,21 @@ impl RingCore {
     pub fn new(params: &SectionParams, sample_rate: f32, block: usize) -> Self {
         let settings = Settings::of(params);
         let waveform = waveform_of(settings.carrier);
-        let mut tables = vec![0.0; table_len(waveform)];
+        // Room for the LONGEST of the four carriers, taken once. The
+        // shape can change from the audio thread — a letter carries a
+        // carrier switch — and a resize there would be an allocation in
+        // the callback.
+        let widest = [
+            Waveform::Sine,
+            Waveform::Triangle,
+            Waveform::Square,
+            Waveform::Saw,
+        ]
+        .into_iter()
+        .map(table_len)
+        .max()
+        .unwrap_or(0);
+        let mut tables = vec![0.0; widest];
         build_tables(waveform, &mut tables);
         let mut osc = MipOsc::new();
         osc.prepare(sample_rate, waveform);
@@ -125,12 +139,15 @@ impl RingCore {
         self.settings
     }
 
-    /// Green zone: the carrier's tables, when the shape changed.
+    /// Red zone safe: the carrier's tables, when the shape changed.
+    ///
+    /// Called from `set_param`, which runs on the audio thread, so the
+    /// storage is never resized here — it was taken at full size once,
+    /// and a new shape is built INTO it.
     fn tune(&mut self) {
         let s = self.settings;
         let waveform = waveform_of(s.carrier);
-        if waveform != self.built || self.tables.len() != table_len(waveform) {
-            self.tables = vec![0.0; table_len(waveform)];
+        if waveform != self.built {
             build_tables(waveform, &mut self.tables);
             self.osc.prepare(self.sample_rate, waveform);
             self.built = waveform;

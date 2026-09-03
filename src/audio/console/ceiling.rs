@@ -21,6 +21,11 @@ pub struct CeilingCore {
     key: Vec<f32>,
     buf_l: Vec<f32>,
     buf_r: Vec<f32>,
+    /// A resident second side, for a mono block. The limiter is linked
+    /// and wants two channels; allocating one per block would be an
+    /// allocation in the callback, which is the one rule that outranks
+    /// everything else.
+    mirror: Vec<f32>,
     level_db: f32,
     most_reduced_db: f32,
     /// Where the limiter's smoothed gain STANDS at the block's last
@@ -35,7 +40,7 @@ pub struct CeilingCore {
 }
 
 impl CeilingCore {
-    pub fn new(_params: &SectionParams, sample_rate: f32, _block: usize) -> Self {
+    pub fn new(_params: &SectionParams, sample_rate: f32, block: usize) -> Self {
         let mut limiter = LookaheadLimiter::new();
         limiter.prepare(sample_rate, p::LOOKAHEAD_MS, p::RELEASE_MS);
         limiter.set_ceiling_db(p::CEILING_DB);
@@ -45,6 +50,7 @@ impl CeilingCore {
             key: vec![0.0; len],
             buf_l: vec![0.0; len],
             buf_r: vec![0.0; len],
+            mirror: vec![0.0; len.max(block.max(1))],
             level_db: p::SILENCE_DB,
             most_reduced_db: 0.0,
             held_gain_db: p::REST_GAIN_DB,
@@ -65,6 +71,7 @@ impl SectionCore for CeilingCore {
         self.key.fill(0.0);
         self.buf_l.fill(0.0);
         self.buf_r.fill(0.0);
+        self.mirror.fill(0.0);
         self.level_db = p::SILENCE_DB;
         self.most_reduced_db = 0.0;
         self.held_gain_db = p::REST_GAIN_DB;
@@ -98,15 +105,13 @@ impl SectionCore for CeilingCore {
                 &mut self.buf_r,
             );
         } else {
-            // Mono: the same limiter, both sides one signal.
-            let mut copy = l.to_vec();
-            self.limiter.process_linked(
-                l,
-                &mut copy,
-                &mut self.key,
-                &mut self.buf_l,
-                &mut self.buf_r,
-            );
+            // Mono: the same limiter, both sides one signal, through
+            // the resident mirror rather than a fresh buffer.
+            let room = n.min(self.mirror.len());
+            self.mirror[..room].copy_from_slice(&l[..room]);
+            let (mirror, key) = (&mut self.mirror[..room], &mut self.key);
+            self.limiter
+                .process_linked(l, mirror, key, &mut self.buf_l, &mut self.buf_r);
         }
         let peak = l
             .iter()
