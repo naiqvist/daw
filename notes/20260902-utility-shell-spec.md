@@ -20,6 +20,8 @@ is not a collection of stock desktop dialogs.
   edits the active field. Mouse hit targets mirror every keyboard target.
 - One modal authority: while a utility surface is open no key leaks into the
   song, transport, browser, palette, or device rack.
+- Full-screen authority: a utility room occupies the complete app viewport;
+  it is the current workspace, not a desktop dialog floating over the song.
 - One cursor: utility rows claim the same animated global cursor as the rest
   of the app, at a higher compositional layer.
 - Recoverable by default: opening or replacing a dirty song requires an

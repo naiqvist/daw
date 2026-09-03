@@ -12,8 +12,6 @@ use crate::ui::prefs::{AudioBackend, Autosave, CursorEnergy, ExportFormat, Expor
 use eframe::egui;
 use std::path::{Path, PathBuf};
 
-const PANEL_MAX_W: f32 = 1080.0;
-const PANEL_MAX_H: f32 = 680.0;
 const NAV_W: f32 = 172.0;
 const HEADER_H: f32 = 72.0;
 const FOOTER_H: f32 = 34.0;
@@ -933,13 +931,10 @@ impl Console {
     pub(super) fn draw(&mut self, ui: &mut egui::Ui, stage: &UtilitySnapshot) -> Option<Action> {
         let page = self.page?;
         let whole = ui.max_rect();
-        let panel = egui::Rect::from_center_size(
-            whole.center(),
-            egui::vec2(
-                (whole.width() - 40.0).min(PANEL_MAX_W).max(620.0),
-                (whole.height() - 36.0).min(PANEL_MAX_H).max(440.0),
-            ),
-        );
+        // Utility work is the foreground task, not a dialog floating over
+        // the song. The console therefore becomes the entire viewport while
+        // it owns input; the musical surface returns intact when it closes.
+        let panel = whole;
         let painter = ui
             .painter()
             .with_clip_rect(whole)
