@@ -399,7 +399,7 @@ impl SpectraCore {
         let frame_dt = p::HOP as f32 / sample_rate.max(1.0);
         let smooth = (-frame_dt / p::READOUT_TAU_S).exp();
         let mut core = Self {
-            params: params.clone(),
+            params: params.dense(),
             settings: Settings::of(params),
             fft,
             vocoder,

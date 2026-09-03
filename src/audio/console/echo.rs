@@ -95,7 +95,7 @@ impl EchoCore {
         wow.set_shape(LfoShape::Sine);
         wow.set_rate(p::WOW_HZ);
         let mut core = Self {
-            params: params.clone(),
+            params: params.dense(),
             settings,
             sample_rate,
             lines: [DelayLine::new(), DelayLine::new()],

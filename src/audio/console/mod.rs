@@ -164,6 +164,72 @@ pub fn core_of(params: &SectionParams, sample_rate: f32, block: usize) -> Box<dy
 mod tests {
     use super::*;
 
+    /// A KNOB TURN MAY NOT ALLOCATE.
+    ///
+    /// A letter reaches a section on the AUDIO THREAD, so `set_param`
+    /// runs in the red zone. This is the test that says so, and it is
+    /// here because the desk shipped without it and paid for it: every
+    /// section kept its settings in the document's SPARSE table, whose
+    /// `set` pushes the first time it sees an id — a Vec growing inside
+    /// the callback. The first turn of any knob on any section aborted
+    /// the process with an allocation of thirty-two bytes, which is a
+    /// `Vec<(u32, f32)>` taking its first four slots.
+    ///
+    /// `assert_no_alloc` aborts rather than fails, so a regression here
+    /// takes the whole test binary down. That is the correct volume for
+    /// this particular mistake.
+    #[test]
+    fn turning_a_knob_never_allocates() {
+        use assert_no_alloc::assert_no_alloc;
+        for kind in crate::console::SectionKind::ALL {
+            let params = crate::console::SectionParams::of(kind);
+            let mut core = core_of(&params, 48_000.0, 256);
+            let table = kind.table();
+            let mut l = [0.0f32; 64];
+            let mut r = [0.0f32; 64];
+            assert_no_alloc(|| {
+                for def in table {
+                    // Both ends of every range and a value between, so
+                    // a core that re-tunes on a change is made to.
+                    for value in [def.min, def.max, (def.min + def.max) * 0.5] {
+                        core.set_param(def.id, value);
+                    }
+                }
+                core.process(&mut l, &mut r, &clock());
+                let _ = core.readout();
+            });
+        }
+    }
+
+    /// The document's table stays sparse — only what somebody moved is
+    /// written down — while the audio side's is dense, so setting a
+    /// value there can only ever overwrite one.
+    #[test]
+    fn the_audio_sides_table_is_dense_and_the_documents_is_not() {
+        for kind in crate::console::SectionKind::ALL {
+            let sparse = crate::console::SectionParams::of(kind);
+            assert!(
+                sparse.values.is_empty(),
+                "{kind:?} was written down at rest"
+            );
+            let mut dense = sparse.dense();
+            assert_eq!(dense.values.len(), kind.table().len(), "{kind:?}");
+            // Dense carries the same answers the sparse one gave.
+            for def in kind.table() {
+                assert_eq!(dense.value(def.id), sparse.value(def.id), "{kind:?}");
+            }
+            // And setting anything leaves its length alone, which is the
+            // whole point: no push, no allocation.
+            let before = dense.values.len();
+            for def in kind.table() {
+                dense.set(def.id, def.max);
+                dense.set(def.id, def.min);
+            }
+            dense.set(9_999, 1.0);
+            assert_eq!(dense.values.len(), before, "{kind:?} grew its table");
+        }
+    }
+
     fn clock() -> Clock {
         Clock {
             playing: true,

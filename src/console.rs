@@ -943,6 +943,30 @@ impl SectionParams {
             .map_or(0.0, |def| def.default)
     }
 
+    /// A copy with EVERY parameter present, at whatever this table
+    /// says or the kind's default where it says nothing.
+    ///
+    /// The document keeps a section's settings sparsely: only what
+    /// somebody moved is written down, which is what makes a saved song
+    /// small and a default readable. The AUDIO side cannot afford that.
+    /// A knob turn arrives on the audio thread as a letter, and
+    /// [`Self::set`] on a sparse table PUSHES the first time it sees an
+    /// id — a Vec growing inside the callback, which is an allocation
+    /// in the one place that may never allocate. A dense table is
+    /// already the right length, so setting a value only ever
+    /// overwrites one.
+    pub fn dense(&self) -> Self {
+        Self {
+            kind: self.kind,
+            values: self
+                .kind
+                .table()
+                .iter()
+                .map(|def| (def.id, self.value(def.id)))
+                .collect(),
+        }
+    }
+
     pub fn set(&mut self, param: u32, value: f32) {
         let Some(def) = self.kind.table().iter().find(|def| def.id == param) else {
             return;

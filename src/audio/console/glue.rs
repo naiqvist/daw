@@ -35,7 +35,7 @@ pub struct GlueCore {
 impl GlueCore {
     pub fn new(params: &SectionParams, sample_rate: f32, _block: usize) -> Self {
         let mut core = Self {
-            params: params.clone(),
+            params: params.dense(),
             lean: 0.0,
             sample_rate,
             detector: RmsDetector::new(),

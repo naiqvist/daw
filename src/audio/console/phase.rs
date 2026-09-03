@@ -83,7 +83,7 @@ pub struct PhaseCore {
 impl PhaseCore {
     pub fn new(params: &SectionParams, sample_rate: f32, _block: usize) -> Self {
         let mut core = Self {
-            params: params.clone(),
+            params: params.dense(),
             settings: Settings::of(params),
             sample_rate,
             runs: [Disperser::new(), Disperser::new()],

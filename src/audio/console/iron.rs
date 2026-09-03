@@ -54,7 +54,7 @@ pub struct IronCore {
 impl IronCore {
     pub fn new(params: &SectionParams, sample_rate: f32, block: usize) -> Self {
         let mut core = Self {
-            params: params.clone(),
+            params: params.dense(),
             drive: 0.0,
             sample_rate,
             lift: [EqBand::new(), EqBand::new()],

@@ -68,7 +68,7 @@ fn peak_db(peak: f32, floor: f32) -> f32 {
 impl FourCore {
     pub fn new(params: &SectionParams, sample_rate: f32, _block: usize) -> Self {
         let mut core = Self {
-            params: params.clone(),
+            params: params.dense(),
             shape: Shape::of(params),
             sample_rate,
             bands: [[EqBand::new(); BANDS], [EqBand::new(); BANDS]],

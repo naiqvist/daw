@@ -115,7 +115,7 @@ impl RingCore {
         hold.prepare(sample_rate);
         hold.seed(0x686f_6c64);
         let mut core = Self {
-            params: params.clone(),
+            params: params.dense(),
             settings,
             sample_rate,
             osc,

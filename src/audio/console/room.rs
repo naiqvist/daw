@@ -110,7 +110,7 @@ impl RoomCore {
     pub fn new(params: &SectionParams, sample_rate: f32, block: usize) -> Self {
         let pre_max = (sample_rate * p::MAX_PREDELAY_MS / 1000.0).ceil() as usize + 4;
         let mut core = Self {
-            params: params.clone(),
+            params: params.dense(),
             settings: Settings::of(params),
             sample_rate,
             room: Reverb::new(),

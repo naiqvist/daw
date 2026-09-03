@@ -128,7 +128,7 @@ impl DoorCore {
         let settings = Settings::of(params);
         let lookahead = (sample_rate * p::LOOKAHEAD_MS / 1000.0).round() as usize;
         let mut core = Self {
-            params: params.clone(),
+            params: params.dense(),
             settings,
             sample_rate,
             lines: [DelayLine::new(), DelayLine::new()],

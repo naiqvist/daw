@@ -92,7 +92,7 @@ impl ToneCore {
     /// Green zone: every band prepared for the settings in hand.
     pub fn new(params: &SectionParams, sample_rate: f32, block: usize) -> Self {
         let mut core = Self {
-            params: params.clone(),
+            params: params.dense(),
             shape: Shape::of(params),
             sample_rate,
             lo: [EqBand::new(), EqBand::new()],

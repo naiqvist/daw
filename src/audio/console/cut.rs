@@ -131,7 +131,7 @@ fn peak_db(peak: f32) -> f32 {
 impl CutCore {
     pub fn new(params: &SectionParams, sample_rate: f32, block: usize) -> Self {
         let mut core = Self {
-            params: params.clone(),
+            params: params.dense(),
             shape: Shape::of(params),
             sample_rate,
             hp: [Loop::default(); 2],

@@ -185,7 +185,7 @@ impl DriftCore {
         let mut hiss = WhiteNoise::new();
         hiss.seed(0x6262_6421);
         let mut core = Self {
-            params: params.clone(),
+            params: params.dense(),
             settings: Settings::of(params),
             sample_rate,
             lines: [

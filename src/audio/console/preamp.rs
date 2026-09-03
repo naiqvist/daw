@@ -96,7 +96,7 @@ impl PreampCore {
     pub fn new(params: &SectionParams, sample_rate: f32, block: usize) -> Self {
         let settings = Settings::of(params);
         let mut core = Self {
-            params: params.clone(),
+            params: params.dense(),
             settings,
             sample_rate,
             trim: Smoother::new(),
