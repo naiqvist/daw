@@ -364,6 +364,38 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
             }
             return stage;
         }
+        if which.contains("-cross") {
+            // Where the band crosses off the channel and onto the desk:
+            // the strip's OUT, the gap the pair crosses, and the group
+            // bus's own sections with the rail's name climbing the seam.
+            for _ in 0..21 {
+                let _ = stage.apply(StageIntent::Step(Step::Right));
+            }
+            return stage;
+        }
+        if which.contains("-desk") {
+            // The far end of the band: the channel's OUT, the crossing
+            // onto the group bus, the mix, and the two returns standing
+            // off the rail with the loom running out to them. A send is
+            // opened so a cable is plainly carrying something.
+            use daw::params::console::out as op;
+            let track = stage.song().tracks.len() - 1;
+            let out = stage
+                .song()
+                .section(track, daw::console::SectionKind::Out)
+                .expect("every track has an out")
+                .id;
+            if let Some(device) = stage.song_mut().device_mut(out) {
+                device.set(op::SEND_TAPE, 62.0);
+                device.set(op::SEND_SHADOW, 28.0);
+            }
+            // Walk the cursor to the last piece on the desk: the band
+            // scrolls after it, so the shot is of the desk's own end.
+            for _ in 0..40 {
+                let _ = stage.apply(StageIntent::Step(Step::Right));
+            }
+            return stage;
+        }
         // The preamp leaned on: iron up, colour in, back to the trim row.
         let _ = stage.apply(StageIntent::Step(Step::Down));
         for _ in 0..6 {

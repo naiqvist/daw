@@ -1000,9 +1000,12 @@ impl Stage {
             painter.ctx().request_repaint();
         }
         if is_in && piece.kind.full_screen() {
+            // At the FOOT of the glass, not the top: the top of a
+            // section's glass is its figure, and a hint that sits over a
+            // drawing is a hint that has taken the drawing's place.
             painter.text(
-                egui::pos2(hole.right() - 6.0, hole.top() + 4.0),
-                egui::Align2::RIGHT_TOP,
+                egui::pos2(hole.right() - 6.0, hole.bottom() - 3.0),
+                egui::Align2::RIGHT_BOTTOM,
                 "⏎ FULL",
                 row_font.clone(),
                 edge,
