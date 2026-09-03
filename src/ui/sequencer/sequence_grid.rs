@@ -31,7 +31,7 @@ use crate::ui::affordance::{Afford, Affords};
 use crate::ui::sequencer::grammar::{Motion, Utterance, Voice};
 use crate::ui::sequencer::grid_resolution::{GridResolution, TICKS_PER_BAR};
 use crate::ui::sequencer::lens::LensView;
-use crate::ui::sequencer::registers::{Payload, Registers, TrigNote};
+use crate::ui::sequencer::registers::{GridRegion, Payload, Registers, TrigNote};
 use crate::ui::sequencer::sequence::{
     ClipView, EDITOR_SWITCH_WIDTH, Editor, Intent, NoteView, editor_switch,
 };
@@ -137,6 +137,13 @@ pub(crate) struct SequenceGrid {
     /// Active clip boundary; the four-bar lattice beyond it stays quiet.
     clip_ticks: usize,
     last_pitch: Pitch,
+    last_chord: Vec<Pitch>,
+    last_entry_tick: Option<usize>,
+    /// Tick-granular so a resolution change preserves the exact selected
+    /// time instead of reinterpreting old cell indices.
+    selected_ticks: Vec<bool>,
+    selection_clip: Option<u64>,
+    selection_anchor: Option<usize>,
     /// The last refusal, shown in the status line until the next sentence.
     /// Silence is forbidden: an unsupported verb answers out loud.
     refusal: Option<String>,
@@ -155,6 +162,11 @@ impl Default for SequenceGrid {
             view_tick: 0,
             clip_ticks: DEFAULT_PATTERN_TICKS,
             last_pitch: Pitch::from_midi(DEFAULT_PITCH),
+            last_chord: vec![Pitch::from_midi(DEFAULT_PITCH)],
+            last_entry_tick: None,
+            selected_ticks: vec![false; DEFAULT_PATTERN_TICKS],
+            selection_clip: None,
+            selection_anchor: None,
             refusal: None,
             cursor_rect: None,
         }
@@ -274,6 +286,14 @@ impl SequenceGrid {
         self.clip_ticks = clip
             .map_or(DEFAULT_PATTERN_TICKS, |clip| clip.length_ticks)
             .clamp(PATTERN_STEP_TICKS, DEFAULT_PATTERN_TICKS);
+        let clip_id = clip.map(|clip| clip.id);
+        if self.selection_clip != clip_id {
+            self.clear_selection();
+        } else {
+            for selected in &mut self.selected_ticks[self.clip_ticks..] {
+                *selected = false;
+            }
+        }
         self.cursor_step = self.cursor_step.min(self.steps() - 1);
         self.cursor_rect = None;
         if focused {
@@ -467,6 +487,9 @@ impl SequenceGrid {
 
                 let tick = step * step_ticks;
                 draw_ground(&cells, rect, tick, ground);
+                if self.range_selected(tick, step_ticks) {
+                    cells.rect_filled(rect, 0.0, wash(SELECTION_WASH, ground));
+                }
                 if response.hovered() && self.cursor_step != step {
                     // The pointer's presence is a tint, not an outline: a
                     // rule would say something, and hovering says nothing.
@@ -913,16 +936,21 @@ impl SequenceGrid {
         clip: Option<ClipView<'_>>,
         intents: &mut Vec<Intent>,
     ) {
+        if !ctx.input(|input| input.key_down(egui::Key::X)) {
+            self.selection_anchor = None;
+        }
+        let selecting = ctx.input(|input| input.key_down(egui::Key::X));
         let Some(utterance) = voice.sentence.consume(ctx) else {
             return;
         };
         self.refusal = None;
-        self.speak(utterance, voice.registers, clip, intents);
+        self.speak(utterance, selecting, voice.registers, clip, intents);
     }
 
     fn speak(
         &mut self,
         utterance: Utterance,
+        selecting: bool,
         registers: &mut Registers,
         clip: Option<ClipView<'_>>,
         intents: &mut Vec<Intent>,
@@ -935,6 +963,19 @@ impl SequenceGrid {
         // cell edits everything it holds and a fine one exactly one.
         let here = starts_in(clip, tick, span);
         match (utterance.verb, utterance.motion) {
+            (None, Some(motion)) if selecting => {
+                let Some(clip) = clip else {
+                    self.refusal = Some("SELECT: NO CLIP".to_owned());
+                    return;
+                };
+                self.prepare_selection(clip.id);
+                let anchor = *self.selection_anchor.get_or_insert(tick);
+                self.move_by(count * self.motion_steps(motion));
+                let cursor = self.cursor_tick();
+                let from = anchor.min(cursor);
+                let to = anchor.max(cursor).saturating_add(span);
+                self.select_range(from, to, true);
+            }
             // Hold-as-preposition: the same arrows, spoken while holding
             // the trig qualifier, edit the trig instead of travelling.
             (None, Some(motion @ (Motion::Up | Motion::Down))) if utterance.held => {
@@ -953,13 +994,47 @@ impl SequenceGrid {
                 self.refusal = Some("HOLD: UP OR DOWN".to_owned());
             }
             (None, Some(motion)) => self.move_by(count * self.motion_steps(motion)),
-            (Some(Verb::Act), _) => self.toggle(clip, intents),
+            (Some(Verb::Act), _) => {
+                if self.has_selection() {
+                    let chord = self.last_chord.clone();
+                    for target in self.selected_cells(span) {
+                        replace_chord(intents, target, span, &chord);
+                    }
+                } else {
+                    let chord = self.last_chord.clone();
+                    replace_chord(intents, tick, span, &chord);
+                    self.last_entry_tick = Some(tick);
+                    self.move_by(1);
+                }
+            }
+            (Some(Verb::Select), _) => {
+                // Key repeat belongs to X+arrow extension, not to toggling
+                // the anchor cell on and off while X remains held.
+                if selecting && self.selection_anchor.is_some() {
+                    return;
+                }
+                if let Some(clip) = clip {
+                    self.prepare_selection(clip.id);
+                    self.toggle_range(tick, span);
+                    self.selection_anchor = Some(tick);
+                } else {
+                    self.refusal = Some("SELECT: NO CLIP".to_owned());
+                }
+            }
+            (Some(Verb::SelectAll), _) => {
+                if let Some(clip) = clip {
+                    self.prepare_selection(clip.id);
+                    self.select_range(0, self.clip_ticks, true);
+                } else {
+                    self.refusal = Some("SELECT ALL: NO CLIP".to_owned());
+                }
+            }
             (Some(Verb::Delete), _) => {
-                for start in here
-                    .iter()
-                    .copied()
-                    .chain((here.is_empty()).then_some(tick))
-                {
+                let mut addressed = self.addressed_starts(clip, &here);
+                if addressed.is_empty() && !self.has_selection() {
+                    addressed.push(tick);
+                }
+                for start in addressed {
                     intents.push(Intent::Clear { tick: start });
                 }
             }
@@ -969,28 +1044,82 @@ impl SequenceGrid {
                 // Moving right, the last note moves first so none lands on
                 // a neighbour that has not moved yet; moving left, the
                 // first. An empty cell still speaks once, to be refused.
-                let mut order = here.clone();
+                let mut order = self.addressed_starts(clip, &here);
+                if order.is_empty() && !self.has_selection() {
+                    order.push(tick);
+                }
                 if delta_ticks > 0 {
                     order.reverse();
                 }
-                for start in order.into_iter().chain((here.is_empty()).then_some(tick)) {
-                    intents.push(Intent::Nudge {
-                        tick: start,
-                        delta_ticks,
-                    });
+                if self.selection_shift_fits(delta_ticks) {
+                    if self.has_selection() {
+                        let sources: std::collections::HashSet<_> = order.iter().copied().collect();
+                        let mut destinations: Vec<_> = order
+                            .iter()
+                            .map(|start| start.saturating_add_signed(delta_ticks))
+                            .filter(|target| !sources.contains(target))
+                            .collect();
+                        destinations.sort_unstable();
+                        destinations.dedup();
+                        for target in destinations {
+                            if !starts_in(clip, target, 1).is_empty() {
+                                intents.push(Intent::Clear { tick: target });
+                            }
+                        }
+                    }
+                    for start in order {
+                        intents.push(Intent::Nudge {
+                            tick: start,
+                            delta_ticks,
+                        });
+                    }
+                    self.shift_selection(delta_ticks);
+                    self.move_by(steps);
+                } else {
+                    self.refusal = Some("NUDGE: PATTERN EDGE".to_owned());
                 }
-                self.move_by(steps);
             }
             (
                 Some(Verb::Resize | Verb::StackResize),
                 Some(motion @ (Motion::Left | Motion::Right)),
             ) => {
                 let delta_ticks = count * self.motion_steps(motion) * span as isize;
-                for start in here
-                    .iter()
-                    .copied()
-                    .chain((here.is_empty()).then_some(tick))
-                {
+                if self.has_selection_for(clip) {
+                    let cells = self.selected_cells(span);
+                    let Some(first) = cells.first().copied() else {
+                        self.refusal = Some("RESIZE: NOTHING HERE".to_owned());
+                        return;
+                    };
+                    let old_width = cells.last().copied().unwrap_or(first) + span - first;
+                    let new_width = old_width.saturating_add_signed(delta_ticks).max(span);
+                    let addressed: Vec<_> = clip
+                        .into_iter()
+                        .flat_map(|clip| clip.notes.iter())
+                        .filter(|note| self.range_selected(note.start_ticks, 1))
+                        .copied()
+                        .collect();
+                    if addressed.is_empty() {
+                        self.refusal = Some("RESIZE: NOTHING HERE".to_owned());
+                    } else if new_width == old_width {
+                        self.refusal = Some("RESIZE: SELECTION EDGE".to_owned());
+                    } else {
+                        intents.extend(addressed.into_iter().map(|note| {
+                            let length =
+                                proportional_length(note.length_ticks, old_width, new_width);
+                            Intent::ResizeNote {
+                                tick: note.start_ticks,
+                                pitch: note.pitch,
+                                delta_ticks: length as isize - note.length_ticks as isize,
+                            }
+                        }));
+                    }
+                    return;
+                }
+                let mut addressed = self.addressed_starts(clip, &here);
+                if addressed.is_empty() && !self.has_selection() {
+                    addressed.push(tick);
+                }
+                for start in addressed {
                     intents.push(Intent::Resize {
                         tick: start,
                         delta_ticks,
@@ -1016,11 +1145,11 @@ impl SequenceGrid {
                 Some(Verb::Velocity | Verb::StackVelocity),
                 Some(motion @ (Motion::Up | Motion::Down)),
             ) => {
-                for start in here
-                    .iter()
-                    .copied()
-                    .chain((here.is_empty()).then_some(tick))
-                {
+                let mut addressed = self.addressed_starts(clip, &here);
+                if addressed.is_empty() && !self.has_selection() {
+                    addressed.push(tick);
+                }
+                for start in addressed {
                     intents.push(Intent::AdjustVelocity {
                         tick: start,
                         delta: count * if motion == Motion::Up { 1 } else { -1 },
@@ -1030,6 +1159,39 @@ impl SequenceGrid {
             (Some(Verb::Velocity | Verb::StackVelocity), Some(_)) => {
                 self.refusal = Some("VELOCITY: UP OR DOWN".to_owned());
             }
+            (Some(Verb::Yank | Verb::StackYank), _) if self.has_selection_for(clip) => {
+                let cells = self.selected_cells(span);
+                let Some(first) = cells.first().copied() else {
+                    self.refusal = Some("YANK: NOTHING HERE".to_owned());
+                    return;
+                };
+                let width_ticks = cells.last().copied().unwrap_or(first) + span - first;
+                let notes = clip
+                    .into_iter()
+                    .flat_map(|clip| clip.notes.iter())
+                    .filter(|note| self.range_selected(note.start_ticks, 1))
+                    .map(|note| {
+                        (
+                            note.start_ticks - first,
+                            TrigNote {
+                                pitch: note.pitch,
+                                length_ticks: note.length_ticks,
+                                velocity: note.velocity,
+                                probability: note.probability,
+                                enabled: note.enabled,
+                                muted: note.muted,
+                            },
+                        )
+                    })
+                    .collect();
+                registers.yank(Payload::GridRegion(GridRegion {
+                    width_ticks,
+                    cell_span: span,
+                    cells: cells.into_iter().map(|cell| cell - first).collect(),
+                    notes,
+                }));
+                self.refusal = Some("YANKED A GRID REGION".to_owned());
+            }
             (Some(Verb::Yank | Verb::StackYank), _) => match trig_at(clip, tick, span) {
                 Some(notes) => {
                     registers.yank(Payload::Trig(notes));
@@ -1037,6 +1199,42 @@ impl SequenceGrid {
                 }
                 None => self.refusal = Some("YANK: NOTHING HERE".to_owned()),
             },
+            (Some(Verb::Put | Verb::StackPut), _) if registers.grid_region().is_ok() => {
+                let region = registers
+                    .grid_region()
+                    .expect("the register kind was checked")
+                    .clone();
+                if tick.saturating_add(region.width_ticks) > self.clip_ticks {
+                    self.refusal = Some("PUT: PATTERN EDGE".to_owned());
+                    return;
+                }
+                for offset in &region.cells {
+                    let target = tick + offset;
+                    let starts = starts_in(clip, target, region.cell_span);
+                    if starts.is_empty() {
+                        intents.push(Intent::Clear { tick: target });
+                    } else {
+                        intents.extend(starts.into_iter().map(|tick| Intent::Clear { tick }));
+                    }
+                }
+                for (offset, note) in region.notes {
+                    let target = tick + offset;
+                    intents.push(Intent::AddNote {
+                        tick: target,
+                        pitch: note.pitch,
+                        length_ticks: note.length_ticks,
+                        velocity: note.velocity,
+                        probability: note.probability,
+                    });
+                    if note.muted {
+                        intents.push(Intent::SetNoteMuted {
+                            tick: target,
+                            pitch: note.pitch,
+                            muted: true,
+                        });
+                    }
+                }
+            }
             (Some(Verb::Put | Verb::StackPut), _) => match registers.trig() {
                 Ok(notes) => {
                     for start in here
@@ -1065,8 +1263,46 @@ impl SequenceGrid {
                 }
                 Err(refusal) => self.refusal = Some(refusal),
             },
-            (Some(Verb::Duplicate | Verb::StackDuplicate), _) => match trig_at(clip, tick, span) {
-                Some(notes) => {
+            (Some(Verb::Duplicate | Verb::StackDuplicate), _) => {
+                if self.has_selection_for(clip) {
+                    let cells = self.selected_cells(span);
+                    let Some(first) = cells.first().copied() else {
+                        return;
+                    };
+                    let width = cells
+                        .last()
+                        .copied()
+                        .unwrap_or(first)
+                        .saturating_add(span)
+                        .saturating_sub(first);
+                    let delta = width.saturating_mul(utterance.count.max(1));
+                    let Some(clip) = clip else { return };
+                    for note in clip.notes.iter().filter(|note| {
+                        self.selected_ticks
+                            .get(note.start_ticks)
+                            .copied()
+                            .unwrap_or(false)
+                    }) {
+                        let target = (note.start_ticks + delta) % self.clip_ticks;
+                        for start in starts_in(Some(clip), target, 1) {
+                            intents.push(Intent::Clear { tick: start });
+                        }
+                        intents.push(Intent::AddNote {
+                            tick: target,
+                            pitch: note.pitch,
+                            length_ticks: note.length_ticks,
+                            velocity: note.velocity,
+                            probability: note.probability,
+                        });
+                        if note.muted {
+                            intents.push(Intent::SetNoteMuted {
+                                tick: target,
+                                pitch: note.pitch,
+                                muted: true,
+                            });
+                        }
+                    }
+                } else if let Some(notes) = trig_at(clip, tick, span) {
                     // Yank-and-put-adjacent in one keystroke: the copy
                     // lands `count` steps ahead and the cursor rides
                     // along, Elektron style. The register is untouched —
@@ -1101,26 +1337,34 @@ impl SequenceGrid {
                         }
                     }
                     self.move_by(steps);
+                } else {
+                    self.refusal = Some("DUPLICATE: NOTHING HERE".to_owned());
                 }
-                None => self.refusal = Some("DUPLICATE: NOTHING HERE".to_owned()),
-            },
+            }
             (Some(Verb::Condition), _) => {
-                match clip.and_then(|clip| primary_at(clip, tick, span)) {
-                    Some(note) => {
+                let starts = self.addressed_starts(clip, &here);
+                if starts.is_empty() {
+                    self.refusal = Some("CONDITION: NOTHING HERE".to_owned());
+                } else {
+                    for start in starts {
+                        let current = clip
+                            .and_then(|clip| {
+                                clip.notes.iter().find(|note| note.start_ticks == start)
+                            })
+                            .map_or(1.0, |note| note.probability);
                         // `50 C` says fifty percent; bare C cycles the
                         // canonical ladder. A count of 1 is read as bare —
                         // a one-percent trig is a typo, not an intent.
                         let probability = if utterance.count > 1 {
                             (utterance.count.min(100)) as f32 / 100.0
                         } else {
-                            next_probability(note.probability)
+                            next_probability(current)
                         };
                         intents.push(Intent::SetProbability {
-                            tick: note.start_ticks,
+                            tick: start,
                             probability,
                         });
                     }
-                    None => self.refusal = Some("CONDITION: NOTHING HERE".to_owned()),
                 }
             }
             (Some(verb), _) => {
@@ -1188,22 +1432,175 @@ impl SequenceGrid {
     /// one on the cursor's tick when the cell is empty.
     pub(crate) fn enter_pitch(
         &mut self,
-        pitch: Pitch,
+        entry: crate::ui::sequencer::sequence::PitchEntry,
         clip: Option<ClipView<'_>>,
         intents: &mut Vec<Intent>,
     ) {
-        self.last_pitch = pitch;
+        if entry.pitches.is_empty()
+            || (entry.gesture == crate::ui::sequencer::midi_typing::EntryGesture::Repeat
+                && self.has_selection_for(clip))
+        {
+            return;
+        }
+        self.last_pitch = entry.pitches[0];
+        self.last_chord = entry.pitches;
         let span = self.resolution.step_ticks();
-        let tick = self.cursor_step * span;
-        intents.push(Intent::SetPrimary {
-            tick: clip
-                .and_then(|clip| primary_at(clip, tick, span))
-                .map_or(tick, |note| note.start_ticks),
-            pitch: self.last_pitch,
+        if self.has_selection_for(clip) {
+            for tick in self.selected_cells(span) {
+                replace_chord(intents, tick, span, &self.last_chord);
+            }
+            return;
+        }
+        let tick = match entry.gesture {
+            crate::ui::sequencer::midi_typing::EntryGesture::Join => {
+                self.last_entry_tick.unwrap_or_else(|| self.cursor_tick())
+            }
+            _ => self.cursor_tick(),
+        };
+        replace_chord(intents, tick, span, &self.last_chord);
+        self.last_entry_tick = Some(tick);
+        if entry.gesture != crate::ui::sequencer::midi_typing::EntryGesture::Join {
+            self.move_by(1);
+        }
+    }
+
+    pub(crate) fn has_selection(&self) -> bool {
+        self.selected_ticks.iter().any(|selected| *selected)
+    }
+
+    fn has_selection_for(&self, clip: Option<ClipView<'_>>) -> bool {
+        self.selection_clip == clip.map(|clip| clip.id) && self.has_selection()
+    }
+
+    fn prepare_selection(&mut self, clip: u64) {
+        if self.selection_clip != Some(clip) {
+            self.clear_selection();
+            self.selection_clip = Some(clip);
+        }
+    }
+
+    pub(crate) fn clear_selection(&mut self) {
+        self.selected_ticks.fill(false);
+        self.selection_clip = None;
+        self.selection_anchor = None;
+    }
+
+    fn range_selected(&self, tick: usize, span: usize) -> bool {
+        self.selected_ticks
+            .get(tick..tick.saturating_add(span).min(self.selected_ticks.len()))
+            .is_some_and(|range| range.iter().any(|selected| *selected))
+    }
+
+    fn select_range(&mut self, from: usize, to: usize, selected: bool) {
+        let end = to.min(self.selected_ticks.len()).min(self.clip_ticks);
+        for cell in self
+            .selected_ticks
+            .get_mut(from.min(end)..end)
+            .into_iter()
+            .flatten()
+        {
+            *cell = selected;
+        }
+    }
+
+    fn toggle_range(&mut self, tick: usize, span: usize) {
+        let selected = !self.range_selected(tick, span);
+        self.select_range(tick, tick.saturating_add(span), selected);
+    }
+
+    fn selected_cells(&self, span: usize) -> Vec<usize> {
+        (0..self.steps())
+            .map(|step| step * span)
+            .filter(|tick| self.range_selected(*tick, span))
+            .collect()
+    }
+
+    /// Model addresses of the sounding material touched by the geometric
+    /// selection. Selected empty cells stay holes; without a selection the
+    /// caller's ordinary cursor-cell addresses are retained.
+    fn addressed_starts(&self, clip: Option<ClipView<'_>>, fallback: &[usize]) -> Vec<usize> {
+        if !self.has_selection_for(clip) {
+            return fallback.to_vec();
+        }
+        let mut starts: Vec<_> = clip
+            .into_iter()
+            .flat_map(|clip| clip.notes.iter())
+            .filter(|note| {
+                self.selected_ticks
+                    .get(note.start_ticks)
+                    .copied()
+                    .unwrap_or(false)
+            })
+            .map(|note| note.start_ticks)
+            .collect();
+        starts.sort_unstable();
+        starts.dedup();
+        starts
+    }
+
+    fn selection_shift_fits(&self, delta_ticks: isize) -> bool {
+        if self.has_selection() {
+            self.selected_ticks
+                .iter()
+                .enumerate()
+                .filter(|(_, selected)| **selected)
+                .all(|(tick, _)| {
+                    let target = tick as isize + delta_ticks;
+                    (0..self.clip_ticks as isize).contains(&target)
+                })
+        } else {
+            let target = self.cursor_tick() as isize + delta_ticks;
+            (0..self.clip_ticks as isize).contains(&target)
+        }
+    }
+
+    fn shift_selection(&mut self, delta_ticks: isize) {
+        if !self.has_selection() {
+            return;
+        }
+        let mut moved = vec![false; self.selected_ticks.len()];
+        for (tick, selected) in self.selected_ticks.iter().copied().enumerate() {
+            if selected {
+                moved[(tick as isize + delta_ticks) as usize] = true;
+            }
+        }
+        self.selected_ticks = moved;
+        if let Some(anchor) = self.selection_anchor {
+            self.selection_anchor = Some((anchor as isize + delta_ticks) as usize);
+        }
+    }
+
+    pub(crate) fn addressed_ticks(&self) -> Vec<usize> {
+        if self.has_selection() {
+            self.selected_cells(self.resolution.step_ticks())
+        } else {
+            vec![self.cursor_tick()]
+        }
+    }
+
+    pub(crate) fn set_time_selected(&mut self, clip: u64, tick: usize, selected: bool) {
+        self.prepare_selection(clip);
+        let span = self.resolution.step_ticks();
+        let start = tick / span * span;
+        self.select_range(start, start.saturating_add(span), selected);
+    }
+}
+
+fn replace_chord(intents: &mut Vec<Intent>, tick: usize, span: usize, chord: &[Pitch]) {
+    intents.push(Intent::Clear { tick });
+    for &pitch in chord {
+        intents.push(Intent::AddEntryNote {
+            tick,
+            pitch,
             length_ticks: span,
             velocity: DEFAULT_VELOCITY,
         });
     }
+}
+
+fn proportional_length(length: usize, old_width: usize, new_width: usize) -> usize {
+    ((length as u128 * new_width as u128 + old_width as u128 / 2) / old_width.max(1) as u128).max(1)
+        as usize
 }
 
 /// The camera over the bar: the first tick each row shows, how many
@@ -2005,6 +2402,7 @@ mod tests {
                 motion,
                 held: false,
             },
+            false,
             registers,
             clip,
             &mut intents,
@@ -2039,6 +2437,7 @@ mod tests {
                 motion: Some(motion),
                 held: true,
             },
+            false,
             &mut registers,
             clip,
             &mut intents,
@@ -2113,6 +2512,64 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn sparse_selection_yank_put_preserves_its_cells_and_holes() {
+        let mut grid = SequenceGrid::default();
+        let mut registers = Registers::default();
+        let span = grid.resolution.step_ticks();
+        let notes = [
+            NoteView::from_midi(60, 0, span, 100, 1.0, true),
+            NoteView::from_midi(67, span * 2, span, 90, 0.75, true),
+        ];
+        let clip = one_note_clip(&notes);
+        grid.prepare_selection(clip.id);
+        grid.select_range(0, span * 3, true);
+
+        let yank = utter_on(
+            &mut grid,
+            &mut registers,
+            Some(clip),
+            Some(Verb::Yank),
+            None,
+            1,
+        );
+        assert!(yank.is_empty());
+        assert_eq!(registers.carried_sign().as_deref(), Some("G3"));
+
+        grid.cursor_step = 4;
+        let put = utter_on(
+            &mut grid,
+            &mut registers,
+            Some(clip),
+            Some(Verb::Put),
+            None,
+            1,
+        );
+        assert_eq!(
+            put.iter()
+                .filter_map(|intent| match intent {
+                    Intent::Clear { tick } => Some(*tick),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![span * 4, span * 5, span * 6],
+            "the empty middle cell was compressed away"
+        );
+        assert_eq!(
+            put.iter()
+                .filter_map(|intent| match intent {
+                    Intent::AddNote { tick, pitch, .. } => Some((*tick, *pitch)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                (span * 4, Pitch::from_midi(60)),
+                (span * 6, Pitch::from_midi(67)),
+            ]
+        );
+        assert!(grid.has_selection(), "put cleared the selection");
     }
 
     #[test]
@@ -2254,13 +2711,89 @@ mod tests {
     }
 
     #[test]
-    fn act_speaks_the_trig_toggle() {
+    fn act_enters_the_remembered_chord_and_advances() {
         let mut grid = SequenceGrid::default();
         let intents = utter(&mut grid, Some(Verb::Act), None, 1);
         assert!(matches!(
             intents.as_slice(),
-            [Intent::Toggle { tick: 0, .. }]
+            [
+                Intent::Clear { tick: 0 },
+                Intent::AddEntryNote { tick: 0, .. }
+            ]
         ));
+        assert_eq!(grid.cursor_tick(), PATTERN_STEP_TICKS);
+    }
+
+    #[test]
+    fn select_all_then_delete_addresses_every_note_and_keeps_the_selection() {
+        let notes = [
+            NoteView::from_midi(60, 0, 12, 100, 1.0, true),
+            NoteView::from_midi(64, 36, 12, 90, 1.0, true),
+        ];
+        let clip = one_note_clip(&notes);
+        let mut grid = SequenceGrid::default();
+        let mut registers = Registers::default();
+        assert!(
+            utter_on(
+                &mut grid,
+                &mut registers,
+                Some(clip),
+                Some(Verb::SelectAll),
+                None,
+                1,
+            )
+            .is_empty()
+        );
+        assert!(grid.has_selection());
+        assert_eq!(
+            utter_on(
+                &mut grid,
+                &mut registers,
+                Some(clip),
+                Some(Verb::Delete),
+                None,
+                1,
+            ),
+            vec![Intent::Clear { tick: 0 }, Intent::Clear { tick: 36 }]
+        );
+        assert!(grid.has_selection());
+    }
+
+    #[test]
+    fn selection_resize_scales_note_lengths_proportionally() {
+        let mut grid = SequenceGrid::default();
+        let span = grid.resolution.step_ticks();
+        let notes = [
+            NoteView::from_midi(60, 0, span, 100, 1.0, true),
+            NoteView::from_midi(64, span, span * 2, 100, 1.0, true),
+        ];
+        let clip = one_note_clip(&notes);
+        grid.prepare_selection(clip.id);
+        grid.select_range(0, span * 2, true);
+
+        let mut registers = Registers::default();
+        assert_eq!(
+            utter_on(
+                &mut grid,
+                &mut registers,
+                Some(clip),
+                Some(Verb::Resize),
+                Some(Motion::Right),
+                1,
+            ),
+            vec![
+                Intent::ResizeNote {
+                    tick: 0,
+                    pitch: Pitch::from_midi(60),
+                    delta_ticks: 6,
+                },
+                Intent::ResizeNote {
+                    tick: span,
+                    pitch: Pitch::from_midi(64),
+                    delta_ticks: 12,
+                },
+            ]
+        );
     }
 
     #[test]

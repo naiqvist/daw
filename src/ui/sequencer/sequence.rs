@@ -206,6 +206,15 @@ pub struct ClipView<'a> {
 
 pub use crate::intent::sequence::Intent;
 
+/// One computer/MIDI-keyboard step-entry event, including the complete
+/// chord still held after it and whether this event begins, extends, or
+/// repeats that held gesture.
+#[derive(Clone, Debug)]
+pub(crate) struct PitchEntry {
+    pub(crate) pitches: Vec<crate::pitch::Pitch>,
+    pub(crate) gesture: crate::ui::sequencer::midi_typing::EntryGesture,
+}
+
 pub struct Outcome {
     pub intents: Vec<Intent>,
     pub claim_focus: bool,
@@ -235,6 +244,35 @@ impl Default for Outcome {
 }
 
 impl SequencePanel {
+    pub(crate) fn has_selection(&self) -> bool {
+        self.grid.has_selection() || self.roll.has_selection()
+    }
+
+    fn clear_selection(&mut self) {
+        // A selection in the other projection is deliberately not a
+        // second hidden mode. Escape means let go of the selection, full
+        // stop, even if the editor was switched after making it.
+        self.grid.clear_selection();
+        self.roll.clear_selection();
+    }
+
+    /// Time cells addressed by the current projection. Roll pitch cells
+    /// that share time collapse to one entry, because a parameter lock
+    /// belongs to the trig rather than to an individual chord tone.
+    pub(crate) fn addressed_ticks(&self, clip: Option<ClipView<'_>>) -> Vec<usize> {
+        match clip.map_or(Editor::Grid, |clip| self.editor_for(clip.id)) {
+            Editor::Grid => self.grid.addressed_ticks(),
+            Editor::Roll => self.roll.addressed_ticks(),
+        }
+    }
+
+    pub(crate) fn set_time_selected(&mut self, clip: ClipView<'_>, tick: usize, selected: bool) {
+        match self.editor_for(clip.id) {
+            Editor::Grid => self.grid.set_time_selected(clip.id, tick, selected),
+            Editor::Roll => self.roll.set_time_selected(clip.id, tick, selected),
+        }
+    }
+
     /// What is under the cursor in whichever editor this clip is shown
     /// in: the same snapshot the inspector states, for a frame that
     /// wants to act on it.
@@ -284,7 +322,7 @@ impl SequencePanel {
         ui: &mut egui::Ui,
         focused: bool,
         mut voice: Voice<'_>,
-        entered_pitch: Option<crate::pitch::Pitch>,
+        entered_pitch: Option<PitchEntry>,
         clip: Option<ClipView<'_>>,
         lens: &crate::ui::sequencer::lens::LensView,
         ground: crate::design::Polarity,
@@ -307,19 +345,29 @@ impl SequencePanel {
             self.toggle_editor(clip.id);
         }
         let editor = clip.map_or(Editor::Grid, |clip| self.editor_for(clip.id));
+        if focused
+            && self.has_selection()
+            && ui
+                .ctx()
+                .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            self.clear_selection();
+        }
         // Each projection owns its own camera. Only the one on screen may
         // consume the shared zoom chords or move in response to them.
         match editor {
             Editor::Grid => self.grid.update_view(ui.ctx()),
             Editor::Roll => self.roll.update_view(ui.ctx()),
         }
-        if let Some(pitch) = entered_pitch {
+        if let Some(entry) = entered_pitch {
             match editor {
-                Editor::Grid => self.grid.enter_pitch(pitch, clip, &mut outcome.intents),
-                Editor::Roll => {
-                    self.roll
-                        .enter_pitch(pitch, &crate::pitch::default_key(), &mut outcome.intents)
-                }
+                Editor::Grid => self.grid.enter_pitch(entry, clip, &mut outcome.intents),
+                Editor::Roll => self.roll.enter_pitch(
+                    entry,
+                    &crate::pitch::default_key(),
+                    clip,
+                    &mut outcome.intents,
+                ),
             }
         }
         let content_rect = ui.available_rect_before_wrap();

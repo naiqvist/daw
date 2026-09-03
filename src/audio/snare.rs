@@ -314,6 +314,12 @@ impl SnareVoice {
         self.apply_param(param, value);
     }
 
+    pub fn plock_glide(&mut self, param: u32, alpha: f32) {
+        let live = self.params.get(param);
+        let base = self.base.get(param);
+        self.apply_param(param, live + (base - live) * alpha.clamp(0.0, 1.0));
+    }
+
     fn apply_param(&mut self, param: u32, value: f32) {
         self.params.set(param, value);
         match param {

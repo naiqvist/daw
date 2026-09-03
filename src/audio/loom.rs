@@ -528,6 +528,12 @@ impl LoomVoices {
         self.apply_param(param, value);
     }
 
+    pub fn plock_glide(&mut self, param: u32, alpha: f32) {
+        if let (Some(live), Some(base)) = (self.params.get(param), self.base.get(param)) {
+            self.apply_param(param, live + (base - live) * alpha.clamp(0.0, 1.0));
+        }
+    }
+
     /// The right channel the last render wrote, for the stereo node arm.
     pub fn right(&self, len: usize) -> &[f32] {
         self.scratch.right.get(..len).unwrap_or(&[])

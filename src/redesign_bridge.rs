@@ -263,6 +263,9 @@ impl App {
                 } => (tick, tick.saturating_add(default_length_ticks)),
                 Intent::AddNote {
                     tick, length_ticks, ..
+                }
+                | Intent::AddEntryNote {
+                    tick, length_ticks, ..
                 } => (tick, tick.saturating_add(length_ticks)),
                 Intent::Clear { tick }
                 | Intent::RemoveNote { tick, .. }
@@ -415,6 +418,23 @@ impl App {
                         muted: false,
                         plocks: Vec::new(),
                         prob: probability,
+                        cond: None,
+                    });
+                }
+                Intent::AddEntryNote {
+                    pitch,
+                    length_ticks,
+                    velocity,
+                    ..
+                } => {
+                    clip.notes.push(Note {
+                        pitch: as_midi(pitch),
+                        start: sequence_ticks_to_beats(tick),
+                        len: sequence_ticks_to_beats(length_ticks),
+                        vel: velocity,
+                        muted: false,
+                        plocks: Vec::new(),
+                        prob: 1.0,
                         cond: None,
                     });
                 }

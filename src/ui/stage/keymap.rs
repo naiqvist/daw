@@ -41,6 +41,9 @@ pub(super) enum ScopeContext {
     /// Escape puts it away; the sequencer's own grammar waits underneath
     /// until it is gone. Time and the ground stay global, as everywhere.
     TrigMenu,
+    /// The floating multi-cell parameter-lock graph owns all editing keys
+    /// until it commits or cancels.
+    Plock,
     /// The sample editor is up: one file, full screen, and the keys are
     /// the editor's — cursor, zoom, markers, slices, audition. A place
     /// of its own, like the browser, that Escape leaves.
@@ -53,7 +56,7 @@ pub(super) enum ScopeContext {
 
 impl ScopeContext {
     #[cfg(test)]
-    pub(super) const ALL: [Self; 10] = [
+    pub(super) const ALL: [Self; 11] = [
         Self::Root,
         Self::Nested,
         Self::Browser,
@@ -62,6 +65,7 @@ impl ScopeContext {
         Self::Clip,
         Self::Rename,
         Self::TrigMenu,
+        Self::Plock,
         Self::Sample,
         Self::Song,
     ];
@@ -71,6 +75,12 @@ impl ScopeContext {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StageIntent {
     Step(Step),
+    /// Toggle the grid cell under the cursor in the standing selection.
+    Select,
+    /// Select every address on the active grid.
+    SelectAll,
+    /// Extend an additive selection while the selection key is held.
+    SelectStep(Step),
     Enter,
     Escape,
     /// Toggle the song clock between parked and rolling.
@@ -148,10 +158,22 @@ pub enum StageIntent {
     /// Put the kept device down: after the cursor's device in the band,
     /// or at the end of the cursor's track from the session.
     Put,
+    /// Copy the addressed selection immediately after itself.
+    Duplicate,
     /// Summon the trig menu over the trig under the cursor.
     TrigMenu,
     /// Release the parameter lock under the trig menu's cursor.
     ClearLock,
+    /// Open the multi-cell parameter-lock graph.
+    PlockEditor,
+    PlockTab {
+        backwards: bool,
+    },
+    PlockFine(Step),
+    PlockAlgorithm,
+    PlockExtreme {
+        high: bool,
+    },
     /// An act in the sample editor, or the act of opening it.
     Sample(SampleIntent),
     /// Scan the library's folders again, so a pack dropped in while the
@@ -325,6 +347,12 @@ impl StageIntent {
             Self::Step(Step::Down) => "move down",
             Self::Step(Step::Left) => "move left",
             Self::Step(Step::Right) => "move right",
+            Self::Select => "toggle cell selection",
+            Self::SelectAll => "select all",
+            Self::SelectStep(Step::Up) => "select up",
+            Self::SelectStep(Step::Down) => "select down",
+            Self::SelectStep(Step::Left) => "select left",
+            Self::SelectStep(Step::Right) => "select right",
             Self::Enter => "go in",
             Self::Escape => "go out",
             Self::ToggleTransport => "stop / roll",
@@ -385,8 +413,16 @@ impl StageIntent {
             Self::Nudge => "nudge, then a direction",
             Self::Yank => "yank device",
             Self::Put => "put device",
+            Self::Duplicate => "duplicate selection",
             Self::TrigMenu => "trig menu",
             Self::ClearLock => "clear lock",
+            Self::PlockEditor => "parameter-lock graph",
+            Self::PlockTab { backwards: false } => "next editor region",
+            Self::PlockTab { backwards: true } => "previous editor region",
+            Self::PlockFine(_) => "fine graph adjustment",
+            Self::PlockAlgorithm => "algorithm picker",
+            Self::PlockExtreme { high: false } => "parameter minimum",
+            Self::PlockExtreme { high: true } => "parameter maximum",
             Self::Sample(intent) => intent.label(),
             Self::Rescan => "rescan library",
             Self::SongView => "session / song",
@@ -480,6 +516,12 @@ const BINDINGS: &[Binding] = &[
         StageIntent::ToggleTransport,
     ),
     Binding::new(ScopeContext::Browser, Key::Home, StageIntent::Rewind),
+    Binding::new(ScopeContext::Root, Key::X, StageIntent::Select),
+    Binding::new(ScopeContext::Nested, Key::X, StageIntent::Select),
+    Binding::new(ScopeContext::Song, Key::X, StageIntent::Select),
+    Binding::command(ScopeContext::Root, Key::A, StageIntent::SelectAll),
+    Binding::command(ScopeContext::Nested, Key::A, StageIntent::SelectAll),
+    Binding::command(ScopeContext::Song, Key::A, StageIntent::SelectAll),
     Binding::new(
         ScopeContext::Root,
         Key::ArrowUp,
@@ -830,10 +872,14 @@ const BINDINGS: &[Binding] = &[
     Binding::new(ScopeContext::Mixer, Key::W, StageIntent::Nudge),
     Binding::new(ScopeContext::Chain, Key::W, StageIntent::Nudge),
     Binding::new(ScopeContext::Chain, Key::Q, StageIntent::Yank),
+    Binding::new(ScopeContext::Root, Key::Q, StageIntent::Yank),
+    Binding::new(ScopeContext::Nested, Key::Q, StageIntent::Yank),
     Binding::new(ScopeContext::Chain, Key::E, StageIntent::Put),
     Binding::new(ScopeContext::Root, Key::E, StageIntent::Put),
     Binding::new(ScopeContext::Nested, Key::E, StageIntent::Put),
     Binding::new(ScopeContext::Mixer, Key::E, StageIntent::Put),
+    Binding::new(ScopeContext::Root, Key::D, StageIntent::Duplicate),
+    Binding::new(ScopeContext::Nested, Key::D, StageIntent::Duplicate),
     // Renaming: keep, let go, erase. Everything else is a letter, and
     // reaches the name as text rather than as a chord.
     Binding::new(ScopeContext::Rename, Key::Enter, StageIntent::Enter),
@@ -845,6 +891,7 @@ const BINDINGS: &[Binding] = &[
     // and Enter with both hands down asks what ELSE the trig can do.
     // Once up, it is a list and takes the list's keys, nothing more.
     Binding::command_shift(ScopeContext::Clip, Key::Enter, StageIntent::TrigMenu),
+    Binding::shift(ScopeContext::Clip, Key::Enter, StageIntent::PlockEditor),
     Binding::new(
         ScopeContext::TrigMenu,
         Key::ArrowUp,
@@ -907,6 +954,78 @@ const BINDINGS: &[Binding] = &[
     Binding::new(ScopeContext::TrigMenu, Key::Home, StageIntent::Rewind),
     Binding::new(ScopeContext::TrigMenu, Key::Questionmark, StageIntent::Help),
     Binding::command(ScopeContext::TrigMenu, Key::L, StageIntent::Ground),
+    // Multi-lock window: three Tab regions, bars on the arrows, X using
+    // the same selection word, and `/` for the keyboard-only algorithms.
+    Binding::new(
+        ScopeContext::Plock,
+        Key::ArrowUp,
+        StageIntent::Step(Step::Up),
+    ),
+    Binding::new(
+        ScopeContext::Plock,
+        Key::ArrowDown,
+        StageIntent::Step(Step::Down),
+    ),
+    Binding::new(
+        ScopeContext::Plock,
+        Key::ArrowLeft,
+        StageIntent::Step(Step::Left),
+    ),
+    Binding::new(
+        ScopeContext::Plock,
+        Key::ArrowRight,
+        StageIntent::Step(Step::Right),
+    ),
+    Binding::shift(
+        ScopeContext::Plock,
+        Key::ArrowUp,
+        StageIntent::PlockFine(Step::Up),
+    ),
+    Binding::shift(
+        ScopeContext::Plock,
+        Key::ArrowDown,
+        StageIntent::PlockFine(Step::Down),
+    ),
+    Binding::shift(
+        ScopeContext::Plock,
+        Key::ArrowLeft,
+        StageIntent::PlockFine(Step::Left),
+    ),
+    Binding::shift(
+        ScopeContext::Plock,
+        Key::ArrowRight,
+        StageIntent::PlockFine(Step::Right),
+    ),
+    Binding::new(ScopeContext::Plock, Key::X, StageIntent::Select),
+    Binding::new(ScopeContext::Plock, Key::Slash, StageIntent::PlockAlgorithm),
+    Binding::new(
+        ScopeContext::Plock,
+        Key::Tab,
+        StageIntent::PlockTab { backwards: false },
+    ),
+    Binding::shift(
+        ScopeContext::Plock,
+        Key::Tab,
+        StageIntent::PlockTab { backwards: true },
+    ),
+    Binding::new(
+        ScopeContext::Plock,
+        Key::Home,
+        StageIntent::PlockExtreme { high: false },
+    ),
+    Binding::new(
+        ScopeContext::Plock,
+        Key::End,
+        StageIntent::PlockExtreme { high: true },
+    ),
+    Binding::new(ScopeContext::Plock, Key::Enter, StageIntent::Enter),
+    Binding::new(ScopeContext::Plock, Key::Escape, StageIntent::Escape),
+    Binding::new(
+        ScopeContext::Plock,
+        Key::Space,
+        StageIntent::ToggleTransport,
+    ),
+    Binding::command(ScopeContext::Plock, Key::L, StageIntent::Ground),
     // The cutting room. Opened with ^E wherever the cursor addresses a
     // track, and with Enter on a sampler in the band. Once up, its keys
     // are its own; the globals stay.
@@ -1291,7 +1410,12 @@ pub(super) fn bindings_for(
 /// so the palette cannot come to hold a verb it has no word for.
 fn family(intent: StageIntent) -> &'static str {
     match intent {
-        StageIntent::Step(_) | StageIntent::Enter | StageIntent::Escape => "move",
+        StageIntent::Step(_)
+        | StageIntent::Select
+        | StageIntent::SelectAll
+        | StageIntent::SelectStep(_)
+        | StageIntent::Enter
+        | StageIntent::Escape => "move",
         StageIntent::ToggleTransport | StageIntent::Rewind => "time",
         StageIntent::Help
         | StageIntent::Browse
@@ -1311,8 +1435,14 @@ fn family(intent: StageIntent) -> &'static str {
         StageIntent::Nudge
         | StageIntent::Yank
         | StageIntent::Put
+        | StageIntent::Duplicate
         | StageIntent::TrigMenu
-        | StageIntent::ClearLock => "edit",
+        | StageIntent::ClearLock
+        | StageIntent::PlockEditor
+        | StageIntent::PlockTab { .. }
+        | StageIntent::PlockFine(_)
+        | StageIntent::PlockAlgorithm
+        | StageIntent::PlockExtreme { .. } => "edit",
         StageIntent::Sample(_) => "sample",
         StageIntent::Song(_) | StageIntent::RecordSong => "song",
         StageIntent::Bus => "mix",
@@ -1534,11 +1664,13 @@ mod tests {
                 Some(StageIntent::ToggleTransport),
                 "{scope:?} cannot stop or roll the song"
             );
-            assert_eq!(
-                dispatch(scope, StageInput::Chord(Modifiers::NONE, Key::Home)),
-                Some(StageIntent::Rewind),
-                "{scope:?} cannot return the song to the top"
-            );
+            if scope != ScopeContext::Plock {
+                assert_eq!(
+                    dispatch(scope, StageInput::Chord(Modifiers::NONE, Key::Home)),
+                    Some(StageIntent::Rewind),
+                    "{scope:?} cannot return the song to the top"
+                );
+            }
         }
     }
 

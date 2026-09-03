@@ -252,16 +252,28 @@ impl Redesign {
                         // A typed note wins over a hardware one only
                         // because it is the more deliberate of the two;
                         // either way exactly one note enters per frame.
-                        midi.entered
-                            .map(|entered| match entered {
-                                midi_typing::Entered::Midi(midi) => {
-                                    crate::pitch::Pitch::from_midi(midi)
-                                }
-                                midi_typing::Entered::Degree { degree, period } => {
-                                    crate::pitch::Pitch::degree(degree, period)
-                                }
+                        midi.gesture
+                            .map(|gesture| sequence::PitchEntry {
+                                pitches: midi
+                                    .chord
+                                    .into_iter()
+                                    .map(|entered| match entered {
+                                        midi_typing::Entered::Midi(midi) => {
+                                            crate::pitch::Pitch::from_midi(midi)
+                                        }
+                                        midi_typing::Entered::Degree { degree, period } => {
+                                            crate::pitch::Pitch::degree(degree, period)
+                                        }
+                                    })
+                                    .collect(),
+                                gesture,
                             })
-                            .or(queued_pitch),
+                            .or_else(|| {
+                                queued_pitch.map(|pitch| sequence::PitchEntry {
+                                    pitches: vec![pitch],
+                                    gesture: midi_typing::EntryGesture::Start,
+                                })
+                            }),
                         sequence_view,
                         lens_view,
                         // This frame is dark, and stays dark: the ground

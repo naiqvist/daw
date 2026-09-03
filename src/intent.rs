@@ -93,6 +93,16 @@ pub mod sequence {
             velocity: u8,
             probability: f32,
         },
+        /// Add one note while retaining the addressed trig's condition
+        /// and locks. Step entry uses this after clearing only the notes
+        /// at the address, so replacing a chord does not erase the
+        /// performance data already attached to that cell.
+        AddEntryNote {
+            tick: usize,
+            pitch: crate::pitch::Pitch,
+            length_ticks: usize,
+            velocity: u8,
+        },
         /// Set the condition sign on every note at `tick` (grammar: condition).
         SetProbability {
             tick: usize,

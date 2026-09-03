@@ -212,9 +212,10 @@ pub struct SeqEvent {
     rank: u8,
     pitch: u8,
     vel: u8,
-    /// Rank-1 (plock) events only: which parameter, and the locked value
-    /// — or a RESTORE (`value` NaN never travels; `restore` says it) that
-    /// puts the parameter back to the instrument's live base.
+    /// Rank-1 (plock) events only: which parameter, and the locked value.
+    /// On a RESTORE, zero means an immediate return to the live base and a
+    /// positive value is the fraction of the remaining distance used by one
+    /// point of a short de-click glide.
     param: u32,
     value: f32,
     restore: bool,
@@ -429,6 +430,22 @@ impl VoiceBank {
         }
     }
 
+    fn plock_glide(&mut self, param: u32, alpha: f32) {
+        use crate::params::seq;
+        let alpha = alpha.clamp(0.0, 1.0);
+        match param {
+            seq::ATTACK => {
+                let base = synth_attack_rate(self.base_attack_ms, self.sample_rate);
+                self.attack_rate += (base - self.attack_rate) * alpha;
+            }
+            seq::RELEASE => {
+                let base = synth_release_coeff(self.base_release_ms, self.sample_rate);
+                self.release_coeff += (base - self.release_coeff) * alpha;
+            }
+            _ => {}
+        }
+    }
+
     /// Red zone. Silence everything, now — what a discontinuity demands.
     ///
     /// Clears the VOICES, not the settings. `*self = default()` would take
@@ -596,6 +613,10 @@ trait Voices {
     /// snapshot, so a knob turned mid-playback is heard on every
     /// unlocked note.
     fn plock(&mut self, param: u32, value: Option<f32>);
+    /// Move the live lock value one prepared fraction toward its base.
+    /// The compiler emits a small fixed series for trigless restores;
+    /// `alpha == 1` lands exactly on the live knob.
+    fn plock_glide(&mut self, param: u32, alpha: f32);
     /// Render `out.len()` samples of the LEFT (or mono) channel.
     ///
     /// `at` is where this run starts within the segment. A mono
@@ -623,6 +644,9 @@ impl Voices for VoiceBank {
     fn plock(&mut self, param: u32, value: Option<f32>) {
         VoiceBank::plock(self, param, value);
     }
+    fn plock_glide(&mut self, param: u32, alpha: f32) {
+        VoiceBank::plock_glide(self, param, alpha);
+    }
     fn render(&mut self, out: &mut [f32], _at: usize, gain: &mut Ramp) {
         VoiceBank::render(self, out, gain);
     }
@@ -647,6 +671,9 @@ impl Voices for crate::audio::haze::Haze {
     }
     fn plock(&mut self, param: u32, value: Option<f32>) {
         crate::audio::haze::Haze::plock(self, param, value);
+    }
+    fn plock_glide(&mut self, param: u32, alpha: f32) {
+        crate::audio::haze::Haze::plock_glide(self, param, alpha);
     }
     fn render(&mut self, out: &mut [f32], at: usize, gain: &mut Ramp) {
         crate::audio::haze::Haze::render(self, out, at, gain);
@@ -677,6 +704,9 @@ impl Voices for crate::audio::kick::KickVoice {
     }
     fn plock(&mut self, param: u32, value: Option<f32>) {
         crate::audio::kick::KickVoice::plock(self, param, value);
+    }
+    fn plock_glide(&mut self, param: u32, alpha: f32) {
+        crate::audio::kick::KickVoice::plock_glide(self, param, alpha);
     }
     fn render(&mut self, out: &mut [f32], _at: usize, gain: &mut Ramp) {
         // The trait's contract is WRITE, not add: clear, fill, then ride
@@ -724,6 +754,9 @@ macro_rules! one_shot_drum_voices {
             fn plock(&mut self, param: u32, value: Option<f32>) {
                 <$voice>::plock(self, param, value);
             }
+            fn plock_glide(&mut self, param: u32, alpha: f32) {
+                <$voice>::plock_glide(self, param, alpha);
+            }
             fn render(&mut self, out: &mut [f32], _at: usize, gain: &mut Ramp) {
                 // The trait's contract is WRITE, not add: clear, fill,
                 // then ride the ramp. The voice itself adds, because that
@@ -764,6 +797,9 @@ impl Voices for crate::audio::acid::AcidVoice {
     fn plock(&mut self, param: u32, value: Option<f32>) {
         crate::audio::acid::AcidVoice::plock(self, param, value);
     }
+    fn plock_glide(&mut self, param: u32, alpha: f32) {
+        crate::audio::acid::AcidVoice::plock_glide(self, param, alpha);
+    }
     fn render(&mut self, out: &mut [f32], _at: usize, gain: &mut Ramp) {
         // The trait's contract is WRITE, not add: clear, fill, then ride
         // the ramp — which is where the LEVEL knob lives.
@@ -798,6 +834,9 @@ impl Voices for crate::audio::poly::PolyVoices {
     fn plock(&mut self, param: u32, value: Option<f32>) {
         crate::audio::poly::PolyVoices::plock(self, param, value);
     }
+    fn plock_glide(&mut self, param: u32, alpha: f32) {
+        crate::audio::poly::PolyVoices::plock_glide(self, param, alpha);
+    }
     fn render(&mut self, out: &mut [f32], at: usize, gain: &mut Ramp) {
         crate::audio::poly::PolyVoices::render(self, out, at, gain);
     }
@@ -820,6 +859,9 @@ impl Voices for crate::audio::loom::LoomVoices {
     }
     fn plock(&mut self, param: u32, value: Option<f32>) {
         crate::audio::loom::LoomVoices::plock(self, param, value);
+    }
+    fn plock_glide(&mut self, param: u32, alpha: f32) {
+        crate::audio::loom::LoomVoices::plock_glide(self, param, alpha);
     }
     fn render(&mut self, out: &mut [f32], at: usize, gain: &mut Ramp) {
         crate::audio::loom::LoomVoices::render(self, out, at, gain);
@@ -850,6 +892,9 @@ impl Voices for crate::audio::tine::TineVoices {
     fn plock(&mut self, param: u32, value: Option<f32>) {
         crate::audio::tine::TineVoices::plock(self, param, value);
     }
+    fn plock_glide(&mut self, param: u32, alpha: f32) {
+        crate::audio::tine::TineVoices::plock_glide(self, param, alpha);
+    }
     fn render(&mut self, out: &mut [f32], at: usize, gain: &mut Ramp) {
         crate::audio::tine::TineVoices::render(self, out, at, gain);
     }
@@ -870,6 +915,9 @@ impl Voices for crate::audio::sampler::SamplerVoices {
     }
     fn plock(&mut self, param: u32, value: Option<f32>) {
         crate::audio::sampler::SamplerVoices::plock(self, param, value);
+    }
+    fn plock_glide(&mut self, param: u32, alpha: f32) {
+        crate::audio::sampler::SamplerVoices::plock_glide(self, param, alpha);
     }
     fn render(&mut self, out: &mut [f32], at: usize, gain: &mut Ramp) {
         crate::audio::sampler::SamplerVoices::render(self, out, at, gain);
@@ -904,6 +952,7 @@ struct FxBase {
     node: u64,
     param: u32,
     base: f32,
+    live: f32,
 }
 
 /// The most effect locks one clock can post in one block. A fixed
@@ -1146,6 +1195,9 @@ impl PatternClock {
                     }
                     match ev.rank {
                         0 => voices.note_off(ev.pitch),
+                        1 if ev.node == 0 && ev.restore && ev.value > 0.0 => {
+                            voices.plock_glide(ev.param, ev.value)
+                        }
                         1 if ev.node == 0 => {
                             voices.plock(ev.param, if ev.restore { None } else { Some(ev.value) })
                         }
@@ -1209,11 +1261,53 @@ pub(crate) fn slice_frames(fractions: &[f64], frames: u64) -> Vec<u64> {
 /// than each carrying a copy of the clip-clamping rules — every one of
 /// which exists because of a specific hanging-note bug, and none of which
 /// should have to be fixed twice.
+const PLOCK_GLIDE_POINTS: u64 = 4;
+
+#[allow(clippy::too_many_arguments)]
+fn push_plock_restore(
+    events: &mut Vec<SeqEvent>,
+    off: u64,
+    stop: u64,
+    glide_samples: u64,
+    node: u64,
+    param: u32,
+    prob: f32,
+    cond: (u8, u8),
+    trig_key: u32,
+) {
+    let duration = stop.saturating_sub(off).min(glide_samples);
+    let points = PLOCK_GLIDE_POINTS.min(duration.saturating_add(1)).max(1);
+    for point in 0..points {
+        let sample = if points == 1 {
+            off
+        } else {
+            off + duration * point / (points - 1)
+        };
+        // Recurrent fractions land at equally spaced linear positions:
+        // 1/N of the remaining distance, then 1/(N-1), ending at 1.
+        let alpha = 1.0 / (points - point) as f32;
+        events.push(SeqEvent {
+            sample,
+            rank: 1,
+            pitch: 0,
+            vel: 0,
+            param,
+            value: alpha,
+            restore: true,
+            node,
+            prob,
+            cond,
+            trig_key,
+        });
+    }
+}
+
 fn compile_events(
     notes: &[Note],
     subloops: &[SubLoop],
     loop_len_beats: Option<f64>,
     samples_per_beat: f64,
+    plock_glide_samples: u64,
 ) -> Result<Vec<SeqEvent>, CompileError> {
     if let Some(len) = loop_len_beats
         && !(len.is_finite() && len > 0.0)
@@ -1244,7 +1338,8 @@ fn compile_events(
     // Sort by (beat, rank): offs before ons on exact ties.
     let mut events = Vec::with_capacity(notes.len() * 2);
     for n in &notes {
-        if n.len_beats <= 0.0 || n.vel == 0 {
+        let lock_only = n.vel == 0 && (!n.plocks.is_empty() || !n.fx_locks.is_empty());
+        if n.len_beats <= 0.0 || (n.vel == 0 && !lock_only) {
             continue; // degenerate notes never enter the engine
         }
         // Clip mode: a note starting past the loop is
@@ -1298,7 +1393,12 @@ fn compile_events(
             None => (0, 0),
         };
         let trig_key = (on as u32) ^ (u32::from(n.pitch) << 24);
-        for &param in &locked_anywhere {
+        let voice_params: Vec<u32> = if lock_only {
+            n.plocks.iter().map(|(param, _)| *param).collect()
+        } else {
+            locked_anywhere.clone()
+        };
+        for &param in &voice_params {
             let lock = n.plocks.iter().find(|(id, _)| *id == param);
             events.push(SeqEvent {
                 sample: on,
@@ -1314,7 +1414,15 @@ fn compile_events(
                 trig_key,
             });
         }
-        for &(node, param) in &fx_locked_anywhere {
+        let effect_params: Vec<(u64, u32)> = if lock_only {
+            n.fx_locks
+                .iter()
+                .map(|(node, param, _)| (*node, *param))
+                .collect()
+        } else {
+            fx_locked_anywhere.clone()
+        };
+        for &(node, param) in &effect_params {
             let lock = n
                 .fx_locks
                 .iter()
@@ -1333,32 +1441,94 @@ fn compile_events(
                 trig_key,
             });
         }
-        events.push(SeqEvent {
-            sample: on,
-            rank: 2,
-            pitch: n.pitch,
-            vel: n.vel,
-            param: 0,
-            value: 0.0,
-            restore: false,
-            node: 0,
-            prob,
-            cond,
-            trig_key,
-        });
-        events.push(SeqEvent {
-            sample: stamp(end),
-            rank: 0,
-            pitch: n.pitch,
-            vel: 0,
-            param: 0,
-            value: 0.0,
-            restore: false,
-            node: 0,
-            prob,
-            cond,
-            trig_key,
-        });
+        if lock_only {
+            let off = stamp(end);
+            for &(param, _) in &n.plocks {
+                let next = notes
+                    .iter()
+                    .filter(|future| {
+                        future.start_beats > n.start_beats
+                            && future.len_beats > 0.0
+                            && (future.vel > 0 || future.plocks.iter().any(|(id, _)| *id == param))
+                    })
+                    .map(|future| stamp(future.start_beats))
+                    .min();
+                let stop = next
+                    .into_iter()
+                    .chain(loop_len_beats.map(stamp))
+                    .min()
+                    .unwrap_or_else(|| off.saturating_add(plock_glide_samples));
+                push_plock_restore(
+                    &mut events,
+                    off,
+                    stop,
+                    plock_glide_samples,
+                    0,
+                    param,
+                    prob,
+                    cond,
+                    trig_key,
+                );
+            }
+            for &(node, param, _) in &n.fx_locks {
+                let next = notes
+                    .iter()
+                    .filter(|future| {
+                        future.start_beats > n.start_beats
+                            && future.len_beats > 0.0
+                            && (future.vel > 0
+                                || future
+                                    .fx_locks
+                                    .iter()
+                                    .any(|(target, id, _)| *target == node && *id == param))
+                    })
+                    .map(|future| stamp(future.start_beats))
+                    .min();
+                let stop = next
+                    .into_iter()
+                    .chain(loop_len_beats.map(stamp))
+                    .min()
+                    .unwrap_or_else(|| off.saturating_add(plock_glide_samples));
+                push_plock_restore(
+                    &mut events,
+                    off,
+                    stop,
+                    plock_glide_samples,
+                    node,
+                    param,
+                    prob,
+                    cond,
+                    trig_key,
+                );
+            }
+        } else {
+            events.push(SeqEvent {
+                sample: on,
+                rank: 2,
+                pitch: n.pitch,
+                vel: n.vel,
+                param: 0,
+                value: 0.0,
+                restore: false,
+                node: 0,
+                prob,
+                cond,
+                trig_key,
+            });
+            events.push(SeqEvent {
+                sample: stamp(end),
+                rank: 0,
+                pitch: n.pitch,
+                vel: 0,
+                param: 0,
+                value: 0.0,
+                restore: false,
+                node: 0,
+                prob,
+                cond,
+                trig_key,
+            });
+        }
     }
     // (sample, rank): off < plock < on on exact ties — see the plock
     // comment above for why the locks ride the middle.
@@ -5135,6 +5305,7 @@ impl Schedule {
             .find(|b| b.node == change.node && b.param == change.param)
         {
             base.base = change.value;
+            base.live = change.value;
         }
         self.apply_to(change.node, change.param, change.value);
     }
@@ -5335,17 +5506,25 @@ impl Schedule {
             if let Some((bus, fired)) = self.nodes[step.node].clock_mut().map(PatternClock::take_fx)
             {
                 for lock in &bus[..fired.min(FX_BUS)] {
-                    let value = if lock.restore {
-                        match self
-                            .fx_bases
-                            .iter()
-                            .find(|b| b.node == lock.node && b.param == lock.param)
-                        {
-                            Some(base) => base.base,
-                            None => continue,
+                    let value = match self
+                        .fx_bases
+                        .iter_mut()
+                        .find(|b| b.node == lock.node && b.param == lock.param)
+                    {
+                        Some(base) if lock.restore && lock.value > 0.0 => {
+                            base.live += (base.base - base.live) * lock.value.clamp(0.0, 1.0);
+                            base.live
                         }
-                    } else {
-                        lock.value
+                        Some(base) if lock.restore => {
+                            base.live = base.base;
+                            base.live
+                        }
+                        Some(base) => {
+                            base.live = lock.value;
+                            base.live
+                        }
+                        None if lock.restore => continue,
+                        None => lock.value,
                     };
                     if value.is_finite() {
                         Self::land(
@@ -6480,6 +6659,7 @@ impl GraphSpec {
             120.0
         };
         let samples_per_beat = f64::from(sample_rate) * 60.0 / bpm;
+        let plock_glide_samples = (u64::from(sample_rate) * 3).div_ceil(1_000).max(1);
         let n = self.order.len();
         let dense_of = |id: &NodeId| self.order.iter().position(|x| x == id);
 
@@ -6565,8 +6745,13 @@ impl GraphSpec {
                         loop_len_beats,
                         params,
                     }) => {
-                        let events =
-                            compile_events(notes, subloops, *loop_len_beats, samples_per_beat)?;
+                        let events = compile_events(
+                            notes,
+                            subloops,
+                            *loop_len_beats,
+                            samples_per_beat,
+                            plock_glide_samples,
+                        )?;
                         let mut voices = VoiceBank::default();
                         voices.prepare(sample_rate as f32, *params);
                         // RON round-trips NaN literals, so a hand-edited
@@ -6599,8 +6784,13 @@ impl GraphSpec {
                         loop_len_beats,
                         params,
                     }) => {
-                        let events =
-                            compile_events(notes, subloops, *loop_len_beats, samples_per_beat)?;
+                        let events = compile_events(
+                            notes,
+                            subloops,
+                            *loop_len_beats,
+                            samples_per_beat,
+                            plock_glide_samples,
+                        )?;
                         // Green zone: builds both wavetable sets and the
                         // chunk buffer; nothing allocates afterwards.
                         let mut voices = crate::audio::acid::AcidVoice::new();
@@ -6631,8 +6821,13 @@ impl GraphSpec {
                         loop_len_beats,
                         params,
                     }) => {
-                        let events =
-                            compile_events(notes, subloops, *loop_len_beats, samples_per_beat)?;
+                        let events = compile_events(
+                            notes,
+                            subloops,
+                            *loop_len_beats,
+                            samples_per_beat,
+                            plock_glide_samples,
+                        )?;
                         // Green zone: builds the sine tables the callback
                         // will read and nothing else allocates afterwards.
                         let mut voices = crate::audio::kick::KickVoice::new();
@@ -6665,8 +6860,13 @@ impl GraphSpec {
                         params,
                         slices,
                     }) => {
-                        let events =
-                            compile_events(notes, subloops, *loop_len_beats, samples_per_beat)?;
+                        let events = compile_events(
+                            notes,
+                            subloops,
+                            *loop_len_beats,
+                            samples_per_beat,
+                            plock_glide_samples,
+                        )?;
                         // GREEN ZONE: the file is decoded and resampled to
                         // the device rate HERE, once, behind a cache. An
                         // unreadable or absent file compiles to a SILENT
@@ -6731,8 +6931,13 @@ impl GraphSpec {
                         loop_len_beats,
                         params,
                     }) => {
-                        let events =
-                            compile_events(notes, subloops, *loop_len_beats, samples_per_beat)?;
+                        let events = compile_events(
+                            notes,
+                            subloops,
+                            *loop_len_beats,
+                            samples_per_beat,
+                            plock_glide_samples,
+                        )?;
                         // Green zone: whatever this voice needs to
                         // allocate, it allocates here and never again.
                         let mut voices = crate::audio::snare::SnareVoice::new();
@@ -6763,8 +6968,13 @@ impl GraphSpec {
                         loop_len_beats,
                         params,
                     }) => {
-                        let events =
-                            compile_events(notes, subloops, *loop_len_beats, samples_per_beat)?;
+                        let events = compile_events(
+                            notes,
+                            subloops,
+                            *loop_len_beats,
+                            samples_per_beat,
+                            plock_glide_samples,
+                        )?;
                         // Green zone: whatever this voice needs to
                         // allocate, it allocates here and never again.
                         let mut voices = crate::audio::tom::TomVoice::new();
@@ -6795,8 +7005,13 @@ impl GraphSpec {
                         loop_len_beats,
                         params,
                     }) => {
-                        let events =
-                            compile_events(notes, subloops, *loop_len_beats, samples_per_beat)?;
+                        let events = compile_events(
+                            notes,
+                            subloops,
+                            *loop_len_beats,
+                            samples_per_beat,
+                            plock_glide_samples,
+                        )?;
                         // Green zone: whatever this voice needs to
                         // allocate, it allocates here and never again.
                         let mut voices = crate::audio::hat::HatVoice::new();
@@ -6827,8 +7042,13 @@ impl GraphSpec {
                         loop_len_beats,
                         params,
                     }) => {
-                        let events =
-                            compile_events(notes, subloops, *loop_len_beats, samples_per_beat)?;
+                        let events = compile_events(
+                            notes,
+                            subloops,
+                            *loop_len_beats,
+                            samples_per_beat,
+                            plock_glide_samples,
+                        )?;
                         // Green zone: whatever this voice needs to
                         // allocate, it allocates here and never again.
                         let mut voices = crate::audio::handclap::HandclapVoice::new();
@@ -6859,8 +7079,13 @@ impl GraphSpec {
                         loop_len_beats,
                         params,
                     }) => {
-                        let events =
-                            compile_events(notes, subloops, *loop_len_beats, samples_per_beat)?;
+                        let events = compile_events(
+                            notes,
+                            subloops,
+                            *loop_len_beats,
+                            samples_per_beat,
+                            plock_glide_samples,
+                        )?;
                         // Green zone: this builds the tables, the delay
                         // rings and every buffer the callback will ever
                         // need. `block_frames` is the longest segment
@@ -6893,8 +7118,13 @@ impl GraphSpec {
                         loop_len_beats,
                         params,
                     }) => {
-                        let events =
-                            compile_events(notes, subloops, *loop_len_beats, samples_per_beat)?;
+                        let events = compile_events(
+                            notes,
+                            subloops,
+                            *loop_len_beats,
+                            samples_per_beat,
+                            plock_glide_samples,
+                        )?;
                         // Green zone: every resonator, every scratch
                         // buffer and the body's reel are born here.
                         let voices = crate::audio::tine::TineVoices::new(
@@ -6926,8 +7156,13 @@ impl GraphSpec {
                         loop_len_beats,
                         params,
                     }) => {
-                        let events =
-                            compile_events(notes, subloops, *loop_len_beats, samples_per_beat)?;
+                        let events = compile_events(
+                            notes,
+                            subloops,
+                            *loop_len_beats,
+                            samples_per_beat,
+                            plock_glide_samples,
+                        )?;
                         // Green zone: this builds every waveform table and
                         // every scratch buffer the callback will ever need.
                         // `block_frames` is the longest segment there can be.
@@ -6962,8 +7197,13 @@ impl GraphSpec {
                         loop_len_beats,
                         params,
                     }) => {
-                        let events =
-                            compile_events(notes, subloops, *loop_len_beats, samples_per_beat)?;
+                        let events = compile_events(
+                            notes,
+                            subloops,
+                            *loop_len_beats,
+                            samples_per_beat,
+                            plock_glide_samples,
+                        )?;
                         // Green zone: every waveform table and every
                         // scratch buffer the callback will ever need.
                         let voices = crate::audio::loom::LoomVoices::new(
@@ -7832,6 +8072,7 @@ impl GraphSpec {
                     node: node.to_bits(),
                     param: *param,
                     base: *base,
+                    live: *base,
                 })
                 .collect(),
             latency: output_dense.map_or(0, |out| {
@@ -12545,6 +12786,9 @@ mod tests {
                 None => self.log.push(format!("unlock {param}")),
             }
         }
+        fn plock_glide(&mut self, param: u32, alpha: f32) {
+            self.log.push(format!("glide {param} {alpha:.3}"));
+        }
         fn render(&mut self, out: &mut [f32], _at: usize, gain: &mut Ramp) {
             self.rendered += out.len();
             for s in out.iter_mut() {
@@ -12617,6 +12861,44 @@ mod tests {
             probe.log,
             ["on 60 v100 a0", "off 60", "on 67 v90 a1"],
             "off must land before the on at the same sample"
+        );
+    }
+
+    #[test]
+    fn the_pattern_clock_dispatches_the_whole_trigless_lock_glide() {
+        let events = compile_events(
+            &[Note {
+                start_beats: 0.0,
+                len_beats: 0.01,
+                pitch: 60,
+                vel: 0,
+                plocks: vec![(17, 0.75)],
+                fx_locks: Vec::new(),
+                prob: 1.0,
+                cond: None,
+            }],
+            &[],
+            None,
+            1_000.0,
+            3,
+        )
+        .unwrap();
+        let mut clock = PatternClock::new(0, 1_000.0);
+        let mut probe = Probe::default();
+        let mut out = [0.0f32; 16];
+        let mut ramp = Ramp::across(1.0, 1.0, out.len());
+        clock.run(&mut probe, &events, &mut out, &ctx(NO_INPUT), &mut ramp);
+
+        assert_eq!(
+            probe.log,
+            [
+                "lock 17=0.75",
+                "glide 17 0.250",
+                "glide 17 0.333",
+                "glide 17 0.500",
+                "glide 17 1.000",
+            ],
+            "a trigless lock must return to base without firing a note"
         );
     }
 
@@ -12978,6 +13260,39 @@ mod tests {
         });
     }
 
+    #[test]
+    fn a_trigless_lock_glide_does_not_allocate_while_rendering() {
+        let mut spec = GraphSpec::default();
+        let id = spec.push(NodeSpec::Poly {
+            notes: vec![Note {
+                start_beats: 0.0,
+                // At 120 bpm / 48 kHz this ends at sample 24, leaving the
+                // complete 144-sample (3 ms) return inside this block.
+                len_beats: 0.001,
+                pitch: 60,
+                vel: 0,
+                plocks: vec![(pp::F_CUTOFF, 150.0)],
+                fx_locks: Vec::new(),
+                prob: 1.0,
+                cond: None,
+            }],
+            subloops: Vec::new(),
+            loop_len_beats: None,
+            params: PolyParams::default(),
+        });
+        spec.set_output(id);
+        let mut sched = spec.compile(48_000, 256).unwrap();
+        let mut out = vec![0.0f32; 512];
+
+        assert_no_alloc::assert_no_alloc(|| {
+            sched.run(&mut out, &ctx(NO_INPUT));
+        });
+        assert!(
+            out.iter().all(|sample| *sample == 0.0),
+            "a trigless lock must not gate a voice"
+        );
+    }
+
     /// Stealing is age-based and never leaves a voice gated to nothing:
     /// more notes than voices must still end up silent after their offs.
     #[test]
@@ -13323,6 +13638,47 @@ mod tests {
             "the letter did not move the restore base: {darkened_base} vs first pass {bright}"
         );
     }
+
+    /// A trigless lock is a parameter gesture, never a silent MIDI note.
+    /// It takes effect at the selected cell and explicitly returns to the
+    /// live knob at the far edge of that cell.
+    #[test]
+    fn a_trigless_lock_compiles_to_a_bounded_lock_without_note_events() {
+        let notes = vec![Note {
+            start_beats: 0.25,
+            len_beats: 0.5,
+            pitch: 0,
+            vel: 0,
+            plocks: vec![(pp::F_CUTOFF, 321.0)],
+            fx_locks: vec![(77, 9, 0.75)],
+            prob: 1.0,
+            cond: None,
+        }];
+        let events = compile_events(&notes, &[], Some(1.0), 1_000.0, 3).expect("events");
+
+        assert_eq!(events.len(), 10, "two locks plus four-point returns");
+        assert!(events.iter().all(|event| event.rank == 1));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| !event.restore)
+                .map(|event| (event.sample, event.node, event.param))
+                .collect::<Vec<_>>(),
+            [(250, 0, pp::F_CUTOFF), (250, 77, 9)]
+        );
+        for (node, param) in [(0, pp::F_CUTOFF), (77, 9)] {
+            let restore: Vec<_> = events
+                .iter()
+                .filter(|event| event.restore && event.node == node && event.param == param)
+                .map(|event| (event.sample, event.value))
+                .collect();
+            assert_eq!(restore.len(), 4);
+            assert_eq!(restore.first().map(|event| event.0), Some(750));
+            assert_eq!(restore.last().map(|event| event.0), Some(753));
+            assert_eq!(restore.last().map(|event| event.1), Some(1.0));
+        }
+    }
+
     /// Trig conditions, on the shared clock: an A:B note fires only on
     /// pass A of every B cycles, its OFF stands down with it (no orphan
     /// off releasing someone else's voice), and probability is
@@ -13340,7 +13696,7 @@ mod tests {
                 prob,
                 cond,
             }];
-            compile_events(&notes, &[], Some(1.0), 1_000.0).unwrap()
+            compile_events(&notes, &[], Some(1.0), 1_000.0, 3).unwrap()
         };
         let run_cycles = |events: &[SeqEvent], cycles: u64| -> Vec<String> {
             let mut clock = PatternClock::new(1_000, 1_000.0);

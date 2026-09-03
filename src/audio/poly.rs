@@ -769,6 +769,12 @@ impl PolyVoices {
         self.apply_live(param, value);
     }
 
+    pub fn plock_glide(&mut self, param: u32, alpha: f32) {
+        if let (Some(live), Some(base)) = (self.params.get(param), self.base.get(param)) {
+            self.apply_live(param, live + (base - live) * alpha.clamp(0.0, 1.0));
+        }
+    }
+
     /// The live half of a parameter write: store and refresh caches.
     fn apply_live(&mut self, param: u32, value: f32) {
         self.params.set(param, value);

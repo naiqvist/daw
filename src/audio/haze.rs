@@ -573,6 +573,14 @@ impl Haze {
         self.retune();
     }
 
+    pub fn plock_glide(&mut self, param: u32, alpha: f32) {
+        if let (Some(live), Some(base)) = (self.params.get(param), self.base.get(param)) {
+            self.params
+                .set(param, live + (base - live) * alpha.clamp(0.0, 1.0));
+            self.retune();
+        }
+    }
+
     /// Rebuild only what a knob can change without allocating.
     ///
     /// Split out of [`Self::prepare`] because that one builds tables,

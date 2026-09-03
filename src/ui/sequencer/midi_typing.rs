@@ -86,15 +86,25 @@ pub(crate) struct Status {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EntryGesture {
+    Start,
+    Join,
+    Repeat,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Update {
     pub(crate) status: Status,
     pub(crate) entered: Option<Entered>,
+    pub(crate) chord: Vec<Entered>,
+    pub(crate) gesture: Option<EntryGesture>,
 }
 
 pub(crate) struct MidiTyping {
     enabled: bool,
     octave: i8,
     period_shift: i8,
+    held: Vec<Entered>,
 }
 
 impl Default for MidiTyping {
@@ -103,6 +113,7 @@ impl Default for MidiTyping {
             enabled: false,
             octave: DEFAULT_OCTAVE,
             period_shift: 0,
+            held: Vec::new(),
         }
     }
 }
@@ -125,6 +136,8 @@ impl MidiTyping {
         if ctx.egui_wants_keyboard_input() {
             return Update {
                 entered: None,
+                chord: self.held.clone(),
+                gesture: None,
                 status: Status {
                     enabled: self.enabled,
                     octave: self.octave,
@@ -147,6 +160,8 @@ impl MidiTyping {
         }
 
         let mut entered = None;
+        let mut chord = Vec::new();
+        let mut any_pitch_press = false;
         if self.enabled {
             let down =
                 ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Z));
@@ -159,9 +174,13 @@ impl MidiTyping {
                         self.octave = (self.octave + 1).min(OCTAVE_MAX);
                     }
                     for (key, semitone) in KEY_MAP {
-                        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, key)) {
-                            entered = Some(Entered::Midi(midi_pitch(self.octave, semitone)));
-                            break;
+                        let value = Entered::Midi(midi_pitch(self.octave, semitone));
+                        if ctx.input(|input| input.key_down(key)) {
+                            chord.push(value);
+                        }
+                        while ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, key)) {
+                            any_pitch_press = true;
+                            entered.get_or_insert(value);
                         }
                     }
                 }
@@ -172,18 +191,33 @@ impl MidiTyping {
                         self.period_shift = (self.period_shift + 1).min(PERIOD_MAX);
                     }
                     for (index, key) in DEGREE_KEYS.into_iter().enumerate() {
-                        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, key)) {
-                            let (degree, period) = degree_at(index, degrees);
-                            entered = Some(Entered::Degree {
-                                degree,
-                                period: period + i32::from(self.period_shift),
-                            });
-                            break;
+                        let (degree, period) = degree_at(index, degrees);
+                        let value = Entered::Degree {
+                            degree,
+                            period: period + i32::from(self.period_shift),
+                        };
+                        if ctx.input(|input| input.key_down(key)) {
+                            chord.push(value);
+                        }
+                        while ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, key)) {
+                            any_pitch_press = true;
+                            entered.get_or_insert(value);
                         }
                     }
                 }
             }
         }
+
+        let gesture = any_pitch_press.then(|| {
+            if self.held.is_empty() {
+                EntryGesture::Start
+            } else if chord != self.held {
+                EntryGesture::Join
+            } else {
+                EntryGesture::Repeat
+            }
+        });
+        self.held = chord.clone();
 
         Update {
             status: Status {
@@ -193,6 +227,8 @@ impl MidiTyping {
                 degree_mode: matches!(mode, EntryMode::Degree { .. }),
             },
             entered,
+            chord,
+            gesture,
         }
     }
 }
@@ -212,6 +248,29 @@ fn degree_at(index: usize, degrees: usize) -> (i32, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key(key: egui::Key, pressed: bool, repeat: bool) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn frame(ctx: &egui::Context, typing: &mut MidiTyping, events: Vec<egui::Event>) -> Update {
+        let mut update = None;
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                events,
+                ..egui::RawInput::default()
+            },
+            |ui| update = Some(typing.update(ui.ctx(), EntryMode::Chromatic)),
+        );
+        out.textures_delta.clear();
+        update.expect("typing update")
+    }
 
     #[test]
     fn ableton_core_map_is_one_chromatic_octave() {
@@ -254,5 +313,38 @@ mod tests {
                 "{key:?} is a global key"
             );
         }
+    }
+
+    #[test]
+    fn a_held_keyboard_gesture_starts_joins_repeats_and_tracks_releases() {
+        let ctx = egui::Context::default();
+        let mut typing = MidiTyping::default();
+
+        let first = frame(
+            &ctx,
+            &mut typing,
+            vec![
+                key(egui::Key::I, true, false),
+                key(egui::Key::A, true, false),
+            ],
+        );
+        assert_eq!(first.gesture, Some(EntryGesture::Start));
+        assert_eq!(first.chord, vec![Entered::Midi(48)]);
+
+        let repeat = frame(&ctx, &mut typing, vec![key(egui::Key::A, true, true)]);
+        assert_eq!(repeat.gesture, Some(EntryGesture::Repeat));
+        assert_eq!(repeat.chord, first.chord);
+
+        let joined = frame(&ctx, &mut typing, vec![key(egui::Key::D, true, false)]);
+        assert_eq!(joined.gesture, Some(EntryGesture::Join));
+        assert_eq!(joined.chord, vec![Entered::Midi(48), Entered::Midi(52)]);
+
+        let released = frame(&ctx, &mut typing, vec![key(egui::Key::A, false, false)]);
+        assert_eq!(released.gesture, None);
+        assert_eq!(released.chord, vec![Entered::Midi(52)]);
+
+        let remaining = frame(&ctx, &mut typing, vec![key(egui::Key::D, true, true)]);
+        assert_eq!(remaining.gesture, Some(EntryGesture::Repeat));
+        assert_eq!(remaining.chord, vec![Entered::Midi(52)]);
     }
 }

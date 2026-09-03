@@ -593,6 +593,14 @@ impl SamplerVoices {
         self.after_param(param);
     }
 
+    pub fn plock_glide(&mut self, param: u32, alpha: f32) {
+        if let (Some(live), Some(base)) = (self.live.get(param), self.base.get(param)) {
+            self.live
+                .set(param, live + (base - live) * alpha.clamp(0.0, 1.0));
+            self.after_param(param);
+        }
+    }
+
     /// The rows that are not simply read where they are used.
     fn after_param(&mut self, param: u32) {
         match param {

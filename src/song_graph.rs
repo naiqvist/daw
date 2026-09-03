@@ -747,7 +747,8 @@ fn notes_of(song: &Song, pattern: &Pattern, effects: &[(DeviceId, NodeId)]) -> V
     let mut notes = Vec::new();
     for step in 0..PATTERN_STEPS {
         let trig = pattern.trig(step);
-        if !trig.enabled {
+        let trigless = trig.notes.is_empty() && !trig.locks.is_empty();
+        if !trig.enabled && !trigless {
             continue;
         }
         let at = step * PATTERN_STEP_TICKS;
@@ -771,6 +772,35 @@ fn notes_of(song: &Song, pattern: &Pattern, effects: &[(DeviceId, NodeId)]) -> V
                 // the node its device became. A lock on a device that is not
                 // on the chain now — bypassed, or gone — is left out, not
                 // misdelivered.
+                plocks: trig
+                    .locks
+                    .iter()
+                    .filter(|lock| lock.device.is_none())
+                    .map(|lock| (lock.param, lock.value))
+                    .collect(),
+                fx_locks: trig
+                    .locks
+                    .iter()
+                    .filter_map(|lock| {
+                        let device = lock.device?;
+                        let (_, node) = effects.iter().find(|(id, _)| *id == device)?;
+                        Some((node.to_bits(), lock.param, lock.value))
+                    })
+                    .collect(),
+                prob: trig.probability,
+                cond: None,
+            });
+        }
+        if trigless {
+            // Velocity zero is the compiled graph's explicit lock-only
+            // event. Real notes are clamped to 1..=127; compile_events can
+            // therefore schedule a lock and its cell-boundary restore
+            // without a second public event type or a phantom voice.
+            notes.push(GraphNote {
+                start_beats: beats(at),
+                len_beats: beats(PATTERN_STEP_TICKS),
+                pitch: 0,
+                vel: 0,
                 plocks: trig
                     .locks
                     .iter()
@@ -1175,6 +1205,29 @@ mod tests {
         let notes = notes_of(&song, &pattern, &[]);
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].plocks, vec![(3, 0.25), (7, 0.9)]);
+    }
+
+    #[test]
+    fn a_trigless_lock_reaches_the_graph_without_inventing_a_note() {
+        let mut song = song_with_a_clip();
+        let trig = song.patterns[0].trig_mut(3);
+        trig.clear();
+        trig.set_lock(11, 0.42);
+        let pattern = song.patterns[0].clone();
+        let notes = notes_of(&song, &pattern, &[]);
+        let lock_only = notes
+            .iter()
+            .find(|note| note.vel == 0)
+            .expect("lock-only graph event");
+
+        assert_eq!(lock_only.start_beats, beats(3 * PATTERN_STEP_TICKS));
+        assert_eq!(lock_only.len_beats, beats(PATTERN_STEP_TICKS));
+        assert_eq!(lock_only.plocks, vec![(11, 0.42)]);
+        assert_eq!(
+            notes.iter().filter(|note| note.vel > 0).count(),
+            1,
+            "the trigless lock created an audible note"
+        );
     }
 
     /// Put `track`'s clip for scene zero into the session.

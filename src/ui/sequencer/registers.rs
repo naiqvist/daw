@@ -22,6 +22,37 @@ pub(crate) struct TrigNote {
     pub(crate) muted: bool,
 }
 
+/// A sparse time region from the folded step grid. `cells` carries the
+/// holes as well as the sounding cells; notes retain their exact offsets
+/// inside that mask.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct GridRegion {
+    pub(crate) width_ticks: usize,
+    pub(crate) cell_span: usize,
+    pub(crate) cells: Vec<usize>,
+    pub(crate) notes: Vec<(usize, TrigNote)>,
+}
+
+/// One note carried by a piano-roll region. `row` is measured downward
+/// from the selection's top pitch, so putting the region at the cursor
+/// preserves its melodic shape while translating its top-left corner.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RollRegionNote {
+    pub(crate) offset_ticks: isize,
+    pub(crate) row: u8,
+    pub(crate) source_midi: u8,
+    pub(crate) note: TrigNote,
+}
+
+/// A sparse time-by-pitch piano-roll region, including selected holes.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RollRegion {
+    pub(crate) width_steps: usize,
+    pub(crate) height: usize,
+    pub(crate) cells: Vec<(usize, u8)>,
+    pub(crate) notes: Vec<RollRegionNote>,
+}
+
 /// A yanked arrangement clip: the pattern's content travels WITH the
 /// clip (a deep copy, Elektron style), so a put never aliases the
 /// original — editing the copy cannot reach back.
@@ -41,6 +72,8 @@ pub(crate) enum Payload {
     Note(TrigNote),
     /// Every note that shared one step: a whole trig, locks and all.
     Trig(Vec<TrigNote>),
+    GridRegion(GridRegion),
+    RollRegion(RollRegion),
     #[cfg_attr(not(test), allow(dead_code))]
     Clip(ClipPayload),
 }
@@ -50,6 +83,8 @@ impl Payload {
         match self {
             Payload::Note(_) => "A NOTE",
             Payload::Trig(_) => "A TRIG",
+            Payload::GridRegion(_) => "A GRID REGION",
+            Payload::RollRegion(_) => "A ROLL REGION",
             Payload::Clip(_) => "A CLIP",
         }
     }
@@ -85,6 +120,22 @@ impl Registers {
         }
     }
 
+    pub(crate) fn grid_region(&self) -> Result<&GridRegion, String> {
+        match &self.default {
+            None => Err("PUT: NOTHING YANKED".to_owned()),
+            Some(Payload::GridRegion(region)) => Ok(region),
+            Some(other) => Err(format!("PUT: {} DOES NOT GO HERE", other.kind())),
+        }
+    }
+
+    pub(crate) fn roll_region(&self) -> Result<&RollRegion, String> {
+        match &self.default {
+            None => Err("PUT: NOTHING YANKED".to_owned()),
+            Some(Payload::RollRegion(region)) => Ok(region),
+            Some(other) => Err(format!("PUT: {} DOES NOT GO HERE", other.kind())),
+        }
+    }
+
     /// The register's content, if it holds a clip. Same refusal contract
     /// as [`Registers::trig`].
     #[cfg_attr(not(test), allow(dead_code))]
@@ -105,6 +156,8 @@ impl Registers {
             None => None,
             Some(Payload::Note(_)) => Some("N".to_owned()),
             Some(Payload::Trig(notes)) => Some(format!("T{}", notes.len())),
+            Some(Payload::GridRegion(region)) => Some(format!("G{}", region.cells.len())),
+            Some(Payload::RollRegion(region)) => Some(format!("R{}", region.cells.len())),
             Some(Payload::Clip(_)) => Some("C".to_owned()),
         }
     }

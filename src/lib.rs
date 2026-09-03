@@ -17,6 +17,7 @@ pub mod midi_input;
 pub mod param_law;
 pub mod params;
 pub mod pitch;
+pub mod plock_ops;
 pub mod render;
 pub mod sample_peaks;
 pub mod sequencing;

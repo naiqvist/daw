@@ -30,6 +30,7 @@ mod grid;
 mod keymap;
 mod mixer;
 mod ornament;
+mod plock_editor;
 mod sample;
 mod scenes;
 mod strip;
@@ -43,7 +44,7 @@ use crate::design::kit::{self, Weight};
 use crate::design::motion::{self, Phase};
 use crate::design::{block, circuit};
 use crate::sequencing::{DeviceId, PatternBlock};
-use arrangement::{Arrangement, Hold, Take};
+use arrangement::{Arrangement, ArrangementClipboard, Hold, Take};
 pub use arrangement::{ExportRequest, ExportState};
 
 use crate::design;
@@ -58,6 +59,7 @@ use crate::sequencing::{
 use crate::ui::glyph;
 use crate::ui::sequencer::{self, grammar, lens, midi_typing, registers, sequence};
 use eframe::egui;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use browser::{BrowserStatus, sample_nodes};
@@ -490,6 +492,45 @@ pub struct Opened {
     pub track: usize,
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+struct SessionSelection {
+    cells: HashSet<(usize, usize)>,
+    anchor: Option<(usize, usize)>,
+}
+
+impl SessionSelection {
+    fn clear(&mut self) {
+        self.cells.clear();
+        self.anchor = None;
+    }
+
+    fn toggle(&mut self, cell: (usize, usize)) {
+        if !self.cells.remove(&cell) {
+            self.cells.insert(cell);
+        }
+        self.anchor = Some(cell);
+    }
+
+    fn add_rectangle(&mut self, anchor: (usize, usize), cursor: (usize, usize)) {
+        for track in anchor.0.min(cursor.0)..=anchor.0.max(cursor.0) {
+            for scene in anchor.1.min(cursor.1)..=anchor.1.max(cursor.1) {
+                self.cells.insert((track, scene));
+            }
+        }
+        self.anchor = Some(anchor);
+    }
+}
+
+/// A geometric Session selection in relative coordinates. Every selected
+/// cell is retained, including an empty one, so sparse shapes keep their
+/// holes and spacing when put or duplicated.
+#[derive(Clone, Debug, PartialEq)]
+struct SessionClipboard {
+    width: usize,
+    height: usize,
+    cells: Vec<(usize, usize, Option<Clip>)>,
+}
+
 /// Why an intent could not change the stage state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RefusalReason {
@@ -571,6 +612,10 @@ pub struct Stage {
     /// sequencer. `None` while the nested level is the calibration field
     /// or there is no nested level.
     inside: Option<Opened>,
+    /// Persistent slot selection. Headers never enter this set.
+    session_selection: SessionSelection,
+    /// The last sparse slot region lifted with Q.
+    session_clipboard: Option<SessionClipboard>,
     /// The sequencer — the same one the second frame draws, lifted to a
     /// neutral home. It owns its own step cursor, resolution and editor
     /// choice; the stage owns WHERE it is drawn and WHEN it has the keys.
@@ -583,8 +628,15 @@ pub struct Stage {
     /// Letters as pitches, while `I` says so. Announced on the message
     /// strip, because a mode that does not announce itself is a trap.
     midi_typing: midi_typing::MidiTyping,
-    /// A pitch typed this frame, waiting for the sequencer to enter it.
-    entered_pitch: Option<Pitch>,
+    /// A held chord event typed this frame, waiting for the sequencer.
+    entered_pitch: Option<sequence::PitchEntry>,
+    /// Whether a step-entry key is physically held this frame. Repeated
+    /// letters from one held gesture are one musical edit, so history is
+    /// observed only after the last pitch (or Enter) comes up.
+    entry_held: bool,
+    /// A step-entry gesture has changed the pattern but has not reached its
+    /// key-up boundary yet.
+    entry_transaction: bool,
     /// The last notice — a refused edit in the sequencer's own words, or
     /// the value a mixer verb just set — held on the message strip until
     /// the next one replaces it.
@@ -689,6 +741,8 @@ pub struct Stage {
     arrangement: Arrangement,
     /// A block lifted off a lane with Q, waiting for E.
     block_clipboard: Option<PatternBlock>,
+    /// A sparse multi-track arrangement region lifted with Q.
+    arrangement_clipboard: Option<ArrangementClipboard>,
     /// Whether the arrangement takes down what the session plays.
     arming: bool,
     /// The blocks being written while it does; landed as one edit when
@@ -710,6 +764,9 @@ pub struct Stage {
     /// can put them back: the menu edits live, and leaving it without
     /// keeping means undoing what it did.
     trig_menu_kept: Option<(PatternId, usize, Vec<crate::sequencing::ParamLock>)>,
+    /// Separate floating transaction for shaping locks across selected
+    /// cells. Unlike the trig menu it may open over empty cells.
+    plock_editor: Option<plock_editor::Editor>,
     /// The sample editor, while it is up. A place of its own that takes
     /// the whole field, like the codebook, and the keys with it.
     sample: Option<SampleEditor>,
@@ -839,11 +896,15 @@ impl Stage {
             strip_offset: 0,
             scene_offset: 0,
             inside: None,
+            session_selection: SessionSelection::default(),
+            session_clipboard: None,
             sequencer: sequence::SequencePanel::default(),
             sentence: grammar::Sentence::default(),
             registers: registers::Registers::default(),
             midi_typing: midi_typing::MidiTyping::default(),
             entered_pitch: None,
+            entry_held: false,
+            entry_transaction: false,
             notice: None,
             library_service: LibraryService::start(config.clone()),
             library_snapshot: cached,
@@ -863,6 +924,7 @@ impl Stage {
             song_view: false,
             arrangement: Arrangement::default(),
             block_clipboard: None,
+            arrangement_clipboard: None,
             arming: false,
             takes: Vec::new(),
             telemetry: std::collections::HashMap::new(),
@@ -871,6 +933,7 @@ impl Stage {
             export_abandon: false,
             trig_menu: None,
             trig_menu_kept: None,
+            plock_editor: None,
             sample: None,
             sample_data: None,
             audition: None,
@@ -1463,8 +1526,34 @@ impl Stage {
         // pitch entry, and only a bare Escape leaves the clip.
         let grammar_owns_escape = self.inside.is_some()
             && self.trig_menu.is_none()
-            && (!self.sentence.is_empty() || self.midi_typing.enabled());
+            && self.plock_editor.is_none()
+            && (!self.sentence.is_empty()
+                || self.midi_typing.enabled()
+                || self.sequencer.has_selection());
         let scope = self.scope_context();
+        let selection_scope = matches!(
+            scope,
+            keymap::ScopeContext::Root | keymap::ScopeContext::Song
+        );
+        let selection_held = selection_scope && ui.input(|input| input.key_down(egui::Key::X));
+        let selection_pressed = selection_scope
+            && ui.input(|input| {
+                input.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Key {
+                            key: egui::Key::X,
+                            pressed: true,
+                            repeat: false,
+                            modifiers,
+                            ..
+                        } if *modifiers == egui::Modifiers::NONE
+                    )
+                })
+            });
+        if !selection_held {
+            self.end_surface_selection_gesture();
+        }
         let inputs = if palette_open {
             Vec::new()
         } else {
@@ -1510,28 +1599,50 @@ impl Stage {
         // the refusal re-arrives every frame, so pressing against a limit
         // reads as a held mark on that limit rather than as a dead key.
         for input in inputs {
-            let _ = self.handle_input(input);
+            let Some(mut intent) = keymap::dispatch(scope, input) else {
+                continue;
+            };
+            if intent == StageIntent::Select && !selection_pressed {
+                continue;
+            }
+            if selection_held && let StageIntent::Step(step) = intent {
+                intent = StageIntent::SelectStep(step);
+            }
+            let _ = self.apply(intent);
         }
 
         // Inside a clip, the letters may be pitches. This runs before the
         // sequencer draws so a typed note enters on the frame it was
         // typed, and after the stage's own chords so `^T` is never read
         // as a T.
+        let mut pitch_keys_held = false;
         self.entered_pitch = match self.inside {
             Some(opened) if self.scope_context() == keymap::ScopeContext::Clip => {
                 let mode = self.entry_mode(opened);
-                self.midi_typing
-                    .update(ui.ctx(), mode)
-                    .entered
-                    .map(|entered| match entered {
-                        midi_typing::Entered::Midi(midi) => Pitch::from_midi(midi),
-                        midi_typing::Entered::Degree { degree, period } => {
-                            Pitch::degree(degree, period)
-                        }
-                    })
+                let update = self.midi_typing.update(ui.ctx(), mode);
+                pitch_keys_held = !update.chord.is_empty();
+                update.gesture.map(|gesture| sequence::PitchEntry {
+                    pitches: update
+                        .chord
+                        .into_iter()
+                        .map(|entered| match entered {
+                            midi_typing::Entered::Midi(midi) => Pitch::from_midi(midi),
+                            midi_typing::Entered::Degree { degree, period } => {
+                                Pitch::degree(degree, period)
+                            }
+                        })
+                        .collect(),
+                    gesture,
+                })
             }
             _ => None,
         };
+        self.entry_held = self.scope_context() == keymap::ScopeContext::Clip
+            && (pitch_keys_held || ui.input(|input| input.key_down(egui::Key::Enter)));
+        if self.entry_transaction && !self.entry_held {
+            self.settle();
+            self.entry_transaction = false;
+        }
 
         // The view follows the cursor BEFORE anything is painted, so the
         // frame that shows a move has already scrolled to contain it —
@@ -1657,6 +1768,8 @@ impl Stage {
     fn scope_context(&self) -> keymap::ScopeContext {
         if self.sample.is_some() {
             keymap::ScopeContext::Sample
+        } else if self.plock_editor.is_some() {
+            keymap::ScopeContext::Plock
         } else if self.trig_menu.is_some() {
             keymap::ScopeContext::TrigMenu
         } else if self.renaming.is_some() {
@@ -1763,6 +1876,335 @@ impl Stage {
                 .map(|cursor| Address::of(cursor, self.song.tracks.len())),
             _ => None,
         }
+    }
+
+    fn end_surface_selection_gesture(&mut self) {
+        self.session_selection.anchor = None;
+        self.arrangement.end_selection_gesture();
+    }
+
+    fn select_surface_cell(&mut self) -> Result<(), RefusalReason> {
+        if self.in_song() {
+            self.arrangement.toggle_selection(&self.song);
+            self.notice = Some(format!(
+                "selected {} cells",
+                self.arrangement.selected.len()
+            ));
+            return Ok(());
+        }
+        match self.standing_on() {
+            Some(Address::Slot { track, scene }) => {
+                self.session_selection.toggle((track, scene));
+                self.notice = Some(format!(
+                    "selected {} slots",
+                    self.session_selection.cells.len()
+                ));
+                Ok(())
+            }
+            _ => Err(RefusalReason::Unavailable),
+        }
+    }
+
+    fn select_all_surface_cells(&mut self) -> Result<(), RefusalReason> {
+        if self.in_song() {
+            self.arrangement.selected.clear();
+            for (track, lane) in self.song.tracks.iter().enumerate() {
+                for block in &lane.blocks {
+                    self.arrangement.selected.extend(
+                        (block.start_tick..block.start_tick.saturating_add(block.length_ticks))
+                            .map(|tick| (track, tick)),
+                    );
+                }
+                for block in &lane.audio_blocks {
+                    self.arrangement
+                        .selected
+                        .extend((block.start_tick..block.end_tick()).map(|tick| (track, tick)));
+                }
+            }
+            if self.arrangement.selected.is_empty() {
+                return Err(RefusalReason::Empty);
+            }
+            self.arrangement.selection_anchor = None;
+            self.notice = Some(format!(
+                "selected {} arrangement cells",
+                self.arrangement.selected.len()
+            ));
+            return Ok(());
+        }
+        if self.focus.depth() != 1 || self.song.tracks.is_empty() {
+            return Err(RefusalReason::Unavailable);
+        }
+        self.session_selection.cells.clear();
+        for scene in 0..self.song.session.scenes.len() {
+            for track in 0..self.song.tracks.len() {
+                self.session_selection.cells.insert((track, scene));
+            }
+        }
+        self.session_selection.anchor = None;
+        self.notice = Some(format!(
+            "selected {} slots",
+            self.session_selection.cells.len()
+        ));
+        Ok(())
+    }
+
+    fn extend_surface_selection(&mut self, step: Step) -> Result<(), RefusalReason> {
+        if self.in_song() {
+            return self
+                .arrangement
+                .extend_selection(&self.song, step)
+                .then_some(())
+                .ok_or(RefusalReason::Edge(step));
+        }
+        let Some(Address::Slot { track, scene }) = self.standing_on() else {
+            return Err(RefusalReason::Unavailable);
+        };
+        let anchor = *self.session_selection.anchor.get_or_insert((track, scene));
+        if step == Step::Down
+            && self.on_last_scene()
+            && self.song.session.scenes.len() < scenes::MAX_SCENES
+        {
+            self.song
+                .session
+                .scenes
+                .push(crate::sequencing::Scene::default());
+            self.fit_session();
+            self.touched();
+        }
+        if !self.focus.step(step) {
+            return Err(RefusalReason::Edge(step));
+        }
+        let Some(Address::Slot { track, scene }) = self.standing_on() else {
+            return Err(RefusalReason::Unavailable);
+        };
+        self.session_selection.add_rectangle(anchor, (track, scene));
+        self.notice = Some(format!(
+            "selected {} slots",
+            self.session_selection.cells.len()
+        ));
+        Ok(())
+    }
+
+    /// Enter on a Session selection is a performance gesture. Each
+    /// selected track reads the cursor scene; selected cells on other
+    /// scenes only establish which tracks participate.
+    fn enter_session_selection(&mut self) -> Result<(), RefusalReason> {
+        let Some(Address::Slot { scene, .. }) = self.standing_on() else {
+            return Err(RefusalReason::Unavailable);
+        };
+        let mut tracks: Vec<_> = self
+            .session_selection
+            .cells
+            .iter()
+            .map(|(track, _)| *track)
+            .collect();
+        tracks.sort_unstable();
+        tracks.dedup();
+        if tracks.is_empty() {
+            return Err(RefusalReason::Empty);
+        }
+        self.fit_playing();
+        for track in tracks {
+            if let Some(playing) = self.playing.get_mut(track) {
+                *playing = self.song.slot_clip(track, scene).is_some().then_some(scene);
+            }
+        }
+        self.touched();
+        Ok(())
+    }
+
+    fn clear_session_selection_cells(&mut self) -> Result<(), RefusalReason> {
+        let cells: Vec<_> = self.session_selection.cells.iter().copied().collect();
+        let mut changed = false;
+        for (track, scene) in cells {
+            changed |= self.song.clear_slot(track, scene).is_some();
+        }
+        if changed {
+            self.touched();
+            Ok(())
+        } else {
+            Err(RefusalReason::Empty)
+        }
+    }
+
+    fn session_selection_bounds(&self) -> Option<(usize, usize, usize, usize)> {
+        let min_track = self
+            .session_selection
+            .cells
+            .iter()
+            .map(|(track, _)| *track)
+            .min()?;
+        let max_track = self
+            .session_selection
+            .cells
+            .iter()
+            .map(|(track, _)| *track)
+            .max()?;
+        let min_scene = self
+            .session_selection
+            .cells
+            .iter()
+            .map(|(_, scene)| *scene)
+            .min()?;
+        let max_scene = self
+            .session_selection
+            .cells
+            .iter()
+            .map(|(_, scene)| *scene)
+            .max()?;
+        Some((min_track, max_track, min_scene, max_scene))
+    }
+
+    fn selected_session_region(&self) -> Option<SessionClipboard> {
+        let (min_track, max_track, min_scene, max_scene) = self.session_selection_bounds()?;
+        let mut cells: Vec<_> = self
+            .session_selection
+            .cells
+            .iter()
+            .map(|(track, scene)| {
+                (
+                    track - min_track,
+                    scene - min_scene,
+                    self.song.slot_clip(*track, *scene),
+                )
+            })
+            .collect();
+        cells.sort_by_key(|(track, scene, _)| (*scene, *track));
+        Some(SessionClipboard {
+            width: max_track - min_track + 1,
+            height: max_scene - min_scene + 1,
+            cells,
+        })
+    }
+
+    fn ensure_session_scene(&mut self, scene: usize) -> bool {
+        if scene >= scenes::MAX_SCENES {
+            return false;
+        }
+        while self.song.session.scenes.len() <= scene {
+            self.song
+                .session
+                .scenes
+                .push(crate::sequencing::Scene::default());
+        }
+        self.fit_session();
+        true
+    }
+
+    fn set_session_slot(&mut self, track: usize, scene: usize, clip: Option<Clip>) -> bool {
+        if track >= self.song.tracks.len() || !self.ensure_session_scene(scene) {
+            return false;
+        }
+        let _ = self.song.clear_slot(track, scene);
+        if let Some(clip) = clip {
+            let track = self.song.tracks[track].id;
+            self.song.session.scenes[scene]
+                .slots
+                .push(crate::sequencing::Slot { track, clip });
+        }
+        true
+    }
+
+    fn write_session_region(
+        &mut self,
+        region: &SessionClipboard,
+        track: usize,
+        scene: usize,
+    ) -> Result<(), RefusalReason> {
+        if track.saturating_add(region.width) > self.song.tracks.len()
+            || scene.saturating_add(region.height) > scenes::MAX_SCENES
+        {
+            return Err(RefusalReason::Edge(
+                if track.saturating_add(region.width) > self.song.tracks.len() {
+                    Step::Right
+                } else {
+                    Step::Down
+                },
+            ));
+        }
+        for (column, row, clip) in &region.cells {
+            let _ = self.set_session_slot(track + column, scene + row, *clip);
+        }
+        self.touched();
+        Ok(())
+    }
+
+    fn yank_session_selection(&mut self) -> Result<(), RefusalReason> {
+        let region = self.selected_session_region().ok_or(RefusalReason::Empty)?;
+        let cells: Vec<_> = self.session_selection.cells.iter().copied().collect();
+        for (track, scene) in cells {
+            let _ = self.song.clear_slot(track, scene);
+        }
+        self.notice = Some(format!("yanked {} slots", region.cells.len()));
+        self.session_clipboard = Some(region);
+        self.touched();
+        Ok(())
+    }
+
+    fn put_session_selection(&mut self) -> Result<(), RefusalReason> {
+        let Some(Address::Slot { track, scene }) = self.standing_on() else {
+            return Err(RefusalReason::Unavailable);
+        };
+        let region = self.session_clipboard.clone().ok_or(RefusalReason::Empty)?;
+        self.write_session_region(&region, track, scene)?;
+        self.notice = Some(format!("put {} slots", region.cells.len()));
+        Ok(())
+    }
+
+    fn duplicate_session_selection(&mut self) -> Result<(), RefusalReason> {
+        let region = self.selected_session_region().ok_or(RefusalReason::Empty)?;
+        let (track, _, _, max_scene) = self
+            .session_selection_bounds()
+            .ok_or(RefusalReason::Empty)?;
+        self.write_session_region(&region, track, max_scene.saturating_add(1))?;
+        self.notice = Some(format!("duplicated {} slots", region.cells.len()));
+        Ok(())
+    }
+
+    fn nudge_session_selection(&mut self, step: Step) -> Result<(), RefusalReason> {
+        let cells: Vec<_> = self.session_selection.cells.iter().copied().collect();
+        if cells.is_empty() {
+            return Err(RefusalReason::Empty);
+        }
+        let target = |track: usize, scene: usize| match step {
+            Step::Left => track.checked_sub(1).map(|track| (track, scene)),
+            Step::Right => track.checked_add(1).map(|track| (track, scene)),
+            Step::Up => scene.checked_sub(1).map(|scene| (track, scene)),
+            Step::Down => scene.checked_add(1).map(|scene| (track, scene)),
+        };
+        let mut moved = Vec::with_capacity(cells.len());
+        for (track, scene) in &cells {
+            let (to_track, to_scene) = target(*track, *scene)
+                .filter(|(track, scene)| {
+                    *track < self.song.tracks.len() && *scene < scenes::MAX_SCENES
+                })
+                .ok_or(RefusalReason::Edge(step))?;
+            moved.push((to_track, to_scene, self.song.slot_clip(*track, *scene)));
+        }
+        if let Some(max_scene) = moved.iter().map(|(_, scene, _)| *scene).max() {
+            let _ = self.ensure_session_scene(max_scene);
+        }
+        for (track, scene) in &cells {
+            let _ = self.song.clear_slot(*track, *scene);
+        }
+        for (track, scene, clip) in &moved {
+            let _ = self.set_session_slot(*track, *scene, *clip);
+        }
+        self.session_selection.cells = moved
+            .iter()
+            .map(|(track, scene, _)| (*track, *scene))
+            .collect();
+        self.session_selection.anchor = self
+            .session_selection
+            .anchor
+            .and_then(|(track, scene)| target(track, scene));
+        let _ = self.focus.step(step);
+        self.notice = Some(format!(
+            "moved {} slots",
+            self.session_selection.cells.len()
+        ));
+        self.touched();
+        Ok(())
     }
 
     /// The session as drawn: the root lattice, and the shade its cursor
@@ -2271,6 +2713,147 @@ impl Stage {
         Some((id, step, trig_menu::menu_rows(track, pattern.trig(step))))
     }
 
+    fn open_plock_editor(&mut self) -> Result<(), RefusalReason> {
+        if self.plock_editor.is_some() {
+            return Ok(());
+        }
+        let shown = self.clip_in_view().ok_or(RefusalReason::Unavailable)?;
+        let pattern = self
+            .song
+            .pattern(shown.pattern)
+            .ok_or(RefusalReason::Unavailable)?;
+        let notes = sequencer::note_views(pattern, &self.song.key);
+        let clip = sequence::ClipView {
+            id: shown.pattern.0,
+            name: &pattern.name,
+            length_ticks: sequencer::pattern_length(&self.song, shown.pattern),
+            notes: &notes,
+            ghosts: &[],
+            slicing: self.slicing_track(shown.track),
+        };
+        let ticks = self.sequencer.addressed_ticks(Some(clip));
+        let first_step = ticks.first().copied().unwrap_or(0) / PATTERN_STEP_TICKS;
+        let track = self
+            .song
+            .tracks
+            .get(shown.track)
+            .ok_or(RefusalReason::Unavailable)?;
+        let rows = trig_menu::menu_rows(track, pattern.trig(first_step))
+            .into_iter()
+            .filter_map(|row| match row {
+                MenuRow::Param(row) => Some(row),
+                MenuRow::Slice(_) | MenuRow::Trig => None,
+            });
+        self.plock_editor =
+            plock_editor::Editor::open(shown.pattern, shown.track, ticks, rows, pattern);
+        self.plock_editor
+            .is_some()
+            .then_some(())
+            .ok_or(RefusalReason::Empty)
+    }
+
+    fn preview_plock_editor(&mut self) {
+        let Some(editor) = self.plock_editor.as_ref() else {
+            return;
+        };
+        if let Some(pattern) = self.song.pattern_mut(editor.pattern) {
+            editor.preview(pattern);
+            self.touched();
+        }
+    }
+
+    fn step_plock_editor(&mut self, step: Step, fine: bool) -> Result<(), RefusalReason> {
+        let editor = self
+            .plock_editor
+            .as_mut()
+            .ok_or(RefusalReason::Unavailable)?;
+        let before = editor.clone();
+        let (vertical, horizontal) = match step {
+            Step::Up => (1, 0),
+            Step::Down => (-1, 0),
+            Step::Left => (0, -1),
+            Step::Right => (0, 1),
+        };
+        editor.step(vertical, horizontal, fine);
+        if *editor == before {
+            return Err(RefusalReason::Edge(step));
+        }
+        self.preview_plock_editor();
+        Ok(())
+    }
+
+    fn select_plock_editor(&mut self) -> Result<(), RefusalReason> {
+        let changed = self
+            .plock_editor
+            .as_mut()
+            .ok_or(RefusalReason::Unavailable)?
+            .toggle();
+        if let Some((tick, selected)) = changed {
+            let shown = self.clip_in_view().ok_or(RefusalReason::Unavailable)?;
+            let pattern = self
+                .song
+                .pattern(shown.pattern)
+                .ok_or(RefusalReason::Unavailable)?;
+            let notes = sequencer::note_views(pattern, &self.song.key);
+            let clip = sequence::ClipView {
+                id: shown.pattern.0,
+                name: &pattern.name,
+                length_ticks: sequencer::pattern_length(&self.song, shown.pattern),
+                notes: &notes,
+                ghosts: &[],
+                slicing: self.slicing_track(shown.track),
+            };
+            self.sequencer.set_time_selected(clip, tick, selected);
+            self.preview_plock_editor();
+        }
+        Ok(())
+    }
+
+    fn enter_plock_editor(&mut self) -> Result<(), RefusalReason> {
+        if self
+            .plock_editor
+            .as_ref()
+            .is_some_and(|editor| editor.picker)
+        {
+            self.plock_editor
+                .as_mut()
+                .expect("editor is open")
+                .picker_enter();
+            self.preview_plock_editor();
+            return Ok(());
+        }
+        let editor = self.plock_editor.take().ok_or(RefusalReason::Unavailable)?;
+        if editor.dirty {
+            self.notice = Some(format!(
+                "{} locks across {} cells",
+                editor.selected_params.len(),
+                editor.active.iter().filter(|active| **active).count()
+            ));
+            self.touched();
+        }
+        Ok(())
+    }
+
+    fn escape_plock_editor(&mut self) -> Result<(), RefusalReason> {
+        if self
+            .plock_editor
+            .as_ref()
+            .is_some_and(|editor| editor.picker)
+        {
+            self.plock_editor
+                .as_mut()
+                .expect("editor is open")
+                .picker_escape();
+            return Ok(());
+        }
+        let editor = self.plock_editor.take().ok_or(RefusalReason::Unavailable)?;
+        if let Some(pattern) = self.song.pattern_mut(editor.pattern) {
+            editor.cancel(pattern);
+            self.touched();
+        }
+        Ok(())
+    }
+
     /// How many rows the menu's current page holds.
     fn trig_menu_rows(&self, menu: TrigMenu) -> usize {
         match menu.page {
@@ -2594,6 +3177,44 @@ impl Stage {
         let result = match intent {
             StageIntent::RecordSong => self.toggle_arming(),
             StageIntent::Escape if self.export.is_some() => self.abandon_export(),
+            StageIntent::PlockEditor => self.open_plock_editor(),
+            StageIntent::Step(step) if self.plock_editor.is_some() => {
+                self.step_plock_editor(step, false)
+            }
+            StageIntent::PlockFine(step) if self.plock_editor.is_some() => {
+                self.step_plock_editor(step, true)
+            }
+            StageIntent::Select if self.plock_editor.is_some() => self.select_plock_editor(),
+            StageIntent::PlockTab { backwards } if self.plock_editor.is_some() => {
+                self.plock_editor
+                    .as_mut()
+                    .expect("editor is open")
+                    .tab(backwards);
+                Ok(())
+            }
+            StageIntent::PlockAlgorithm if self.plock_editor.is_some() => {
+                self.plock_editor
+                    .as_mut()
+                    .expect("editor is open")
+                    .open_picker();
+                Ok(())
+            }
+            StageIntent::PlockExtreme { high } if self.plock_editor.is_some() => {
+                let editor = self.plock_editor.as_mut().expect("editor is open");
+                let before = editor.clone();
+                editor.extreme(high);
+                if *editor == before {
+                    Err(RefusalReason::Unavailable)
+                } else {
+                    self.preview_plock_editor();
+                    Ok(())
+                }
+            }
+            StageIntent::Enter if self.plock_editor.is_some() => self.enter_plock_editor(),
+            StageIntent::Escape if self.plock_editor.is_some() => self.escape_plock_editor(),
+            StageIntent::SelectAll => self.select_all_surface_cells(),
+            StageIntent::Select => self.select_surface_cell(),
+            StageIntent::SelectStep(step) => self.extend_surface_selection(step),
             // The song view's keys, while it holds them. Its own verbs
             // first; then the shared words, which mean the same act on
             // a block that they mean on a slot or a device.
@@ -2601,17 +3222,27 @@ impl Stage {
             StageIntent::Step(step) if self.in_song() => self.song_step(step),
             StageIntent::Enter if self.in_song() => self.song_enter(),
             StageIntent::Clear if self.in_song() => self.song_clear(),
-            StageIntent::Nudge if self.in_song() => match self.song_block() {
-                Some(_) => {
+            StageIntent::Nudge if self.in_song() => {
+                if self.arrangement.has_selection() || self.song_block().is_some() {
                     self.arrangement.hold = Some(Hold::Nudge);
                     self.notice = Some(Hold::Nudge.word().to_owned());
                     Ok(())
+                } else {
+                    Err(RefusalReason::Empty)
                 }
-                None => Err(RefusalReason::Empty),
-            },
+            }
             StageIntent::Yank if self.in_song() => self.song_yank(),
             StageIntent::Put if self.in_song() => self.song_put(),
+            StageIntent::Escape if self.in_song() && self.arrangement.has_selection() => {
+                self.arrangement.clear_selection();
+                Ok(())
+            }
             StageIntent::Escape if self.in_song() => self.song_escape(),
+            StageIntent::Step(step)
+                if nudging && !self.in_song() && !self.session_selection.cells.is_empty() =>
+            {
+                self.nudge_session_selection(step)
+            }
             StageIntent::Step(step @ (Step::Left | Step::Right)) if nudging => self.nudge(step),
             // The trig menu. Summoned over the trig under the cursor —
             // and only over a trig: an empty cell has nothing to say.
@@ -2795,6 +3426,23 @@ impl Stage {
                 }
                 Ok(())
             }
+            StageIntent::Enter if !self.session_selection.cells.is_empty() => {
+                self.enter_session_selection()
+            }
+            StageIntent::Yank if !self.session_selection.cells.is_empty() => {
+                self.yank_session_selection()
+            }
+            StageIntent::Put
+                if self.focus.depth() == 1
+                    && !self.song_view
+                    && self.session_clipboard.is_some() =>
+            {
+                self.put_session_selection()
+            }
+            StageIntent::Duplicate if !self.session_selection.cells.is_empty() => {
+                self.duplicate_session_selection()
+            }
+            StageIntent::Duplicate => Err(RefusalReason::Empty),
             StageIntent::Enter => match self
                 .browser
                 .as_ref()
@@ -2927,6 +3575,9 @@ impl Stage {
                 }
                 None => Err(RefusalReason::Empty),
             },
+            StageIntent::Clear if !self.session_selection.cells.is_empty() => {
+                self.clear_session_selection_cells()
+            }
             StageIntent::Clear => match self.standing_on() {
                 Some(Address::Slot { track, scene }) => {
                     let cleared = self.song.clear_slot(track, scene).is_some();
@@ -2941,7 +3592,10 @@ impl Stage {
             // whatever is outermost — the codebook first, then the
             // browser, then a scope.
             StageIntent::Escape => {
-                if self.help {
+                if !self.session_selection.cells.is_empty() {
+                    self.session_selection.clear();
+                    Ok(())
+                } else if self.help {
                     self.help = false;
                     Ok(())
                 } else if self.chain.is_some() {
@@ -3404,12 +4058,18 @@ impl Stage {
             }
             StageIntent::Yank => self.yank(),
             StageIntent::Put => self.put(),
+            StageIntent::PlockTab { .. }
+            | StageIntent::PlockFine(_)
+            | StageIntent::PlockAlgorithm
+            | StageIntent::PlockExtreme { .. } => Err(RefusalReason::Unavailable),
         };
         self.record_takes(&playing_before, was_recording);
         // Every intent ends at a settled song, which is what undo steps
         // back through. Undo and redo settle where they land, so the
         // observation is a no-op for them.
-        self.settle();
+        if self.plock_editor.is_none() {
+            self.settle();
+        }
         match result {
             Ok(()) => ApplyOutcome::Changed,
             Err(reason) => {
@@ -3900,6 +4560,7 @@ impl Stage {
         // is a callout, and a callout drawn under anything is a callout
         // pointing through it.
         self.draw_trig_menu(&painter, whole);
+        self.draw_plock_editor(&painter, whole);
         crate::ui::nav_cursor::paint(ui.ctx());
     }
 
@@ -4360,6 +5021,240 @@ impl Stage {
             }
             if menu.offset + visible < total {
                 hint(list_top + visible as f32 * trig_menu::ROW_H + 2.0, "v");
+            }
+        }
+    }
+
+    fn draw_plock_editor(&self, painter: &egui::Painter, whole: egui::Rect) {
+        let Some(editor) = self.plock_editor.as_ref() else {
+            return;
+        };
+        let alpha = self.alphabet();
+        let size = egui::vec2(
+            (whole.width() - 48.0).min(820.0),
+            (whole.height() - 48.0).min(520.0),
+        );
+        let panel = egui::Rect::from_center_size(whole.center(), size);
+        let inner = panel.shrink(16.0);
+        let head_h = 48.0;
+        let controls_h = 52.0;
+        let list_w = 190.0;
+        let body = egui::Rect::from_min_max(
+            egui::pos2(inner.left(), inner.top() + head_h),
+            egui::pos2(inner.right(), inner.bottom() - controls_h),
+        );
+        let list =
+            egui::Rect::from_min_max(body.min, egui::pos2(body.left() + list_w, body.bottom()));
+        let graphs = egui::Rect::from_min_max(
+            egui::pos2(list.right() + 12.0, body.top()),
+            body.right_bottom(),
+        );
+        let controls = egui::Rect::from_min_max(
+            egui::pos2(inner.left(), body.bottom() + 8.0),
+            inner.right_bottom(),
+        );
+        let mut shell = Vec::new();
+        circuit::panel_variant(
+            &mut shell,
+            panel,
+            Some(alpha.surface.color),
+            alpha.ground.color,
+            Some((Weight::Heavy, alpha.ink.color)),
+            2,
+        );
+        circuit::panel_frame_variant(
+            &mut shell,
+            panel.shrink(5.0),
+            Weight::Hair,
+            alpha.edge.color,
+            4,
+        );
+        painter.extend(shell);
+        block::paint(
+            painter,
+            egui::Id::new("stage-plock-title"),
+            inner.left_top(),
+            egui::Align2::LEFT_TOP,
+            block::unit::TITLE,
+            "PARAMETER LOCKS",
+            alpha.ink.color,
+        );
+        painter.text(
+            egui::pos2(inner.right(), inner.top() + 4.0),
+            egui::Align2::RIGHT_TOP,
+            format!(
+                "{} CELLS  ·  {} PARAMS",
+                editor.ticks.len(),
+                editor.selected_params.len()
+            ),
+            egui::FontId::monospace(11.0),
+            alpha.edge.color,
+        );
+
+        let row_h = 20.0;
+        let visible = (list.height() / row_h).floor().max(1.0) as usize;
+        let offset = editor
+            .param_cursor
+            .saturating_sub(visible.saturating_sub(1));
+        for (shown, param) in editor.params.iter().skip(offset).take(visible).enumerate() {
+            let index = offset + shown;
+            let row = egui::Rect::from_min_size(
+                egui::pos2(list.left(), list.top() + shown as f32 * row_h),
+                egui::vec2(list.width(), row_h),
+            );
+            let selected = editor.selected_params.contains(&index);
+            let cursor =
+                editor.focus == plock_editor::Focus::Parameters && editor.param_cursor == index;
+            if selected {
+                painter.rect_filled(row.shrink(1.0), 0.0, alpha.focus.color.gamma_multiply(0.22));
+            }
+            if cursor {
+                let mut marks = Vec::new();
+                circuit::brackets(&mut marks, row, 5.0, Weight::Bold, alpha.focus.color);
+                painter.extend(marks);
+            }
+            painter.text(
+                row.left_center() + egui::vec2(12.0, 0.0),
+                egui::Align2::LEFT_CENTER,
+                &param.name,
+                egui::FontId::monospace(11.0),
+                if selected {
+                    alpha.ink.color
+                } else {
+                    alpha.edge.color
+                },
+            );
+            painter.text(
+                row.right_center() - egui::vec2(4.0, 0.0),
+                egui::Align2::RIGHT_CENTER,
+                if selected { "X" } else { "·" },
+                egui::FontId::monospace(11.0),
+                if selected {
+                    alpha.live.color
+                } else {
+                    alpha.edge.color
+                },
+            );
+        }
+
+        let selected = editor.selected_param_indices();
+        let lanes = selected.len().max(1);
+        let lane_h = (graphs.height() / lanes as f32).max(24.0);
+        for (lane_index, &param_index) in selected.iter().enumerate() {
+            let lane = egui::Rect::from_min_max(
+                egui::pos2(graphs.left(), graphs.top() + lane_index as f32 * lane_h),
+                egui::pos2(
+                    graphs.right(),
+                    (graphs.top() + (lane_index + 1) as f32 * lane_h).min(graphs.bottom()),
+                ),
+            );
+            painter.rect_stroke(
+                lane.shrink(1.0),
+                0.0,
+                egui::Stroke::new(1.0, alpha.edge.color.gamma_multiply(0.7)),
+                egui::StrokeKind::Inside,
+            );
+            let param = &editor.params[param_index];
+            let bar_w = lane.width() / editor.ticks.len().max(1) as f32;
+            for cell in 0..editor.ticks.len() {
+                let x0 = lane.left() + cell as f32 * bar_w + 1.0;
+                let x1 = lane.left() + (cell + 1) as f32 * bar_w - 1.0;
+                let fraction = param.fraction(editor.displayed(param_index, cell));
+                let rect = egui::Rect::from_min_max(
+                    egui::pos2(x0, lane.bottom() - 3.0 - (lane.height() - 8.0) * fraction),
+                    egui::pos2(x1.max(x0 + 1.0), lane.bottom() - 3.0),
+                );
+                let active = editor.active[cell];
+                painter.rect_filled(
+                    rect,
+                    0.0,
+                    if active {
+                        alpha.live_dim.color
+                    } else {
+                        alpha.edge.color.gamma_multiply(0.28)
+                    },
+                );
+                if editor.focus == plock_editor::Focus::Graphs
+                    && editor.graph_lane == lane_index
+                    && editor.graph_cell == cell
+                {
+                    let mut marks = Vec::new();
+                    circuit::brackets(
+                        &mut marks,
+                        egui::Rect::from_min_max(
+                            egui::pos2(x0, lane.top() + 2.0),
+                            egui::pos2(x1.max(x0 + 1.0), lane.bottom() - 2.0),
+                        ),
+                        4.0,
+                        Weight::Bold,
+                        alpha.focus.color,
+                    );
+                    painter.extend(marks);
+                }
+            }
+        }
+
+        let control_on = editor.focus == plock_editor::Focus::Controls;
+        if control_on {
+            let mut marks = Vec::new();
+            circuit::brackets(&mut marks, controls, 7.0, Weight::Bold, alpha.focus.color);
+            painter.extend(marks);
+        }
+        painter.text(
+            controls.left_center() + egui::vec2(12.0, -8.0),
+            egui::Align2::LEFT_CENTER,
+            editor.algorithm.label(),
+            egui::FontId::monospace(13.0),
+            if control_on {
+                alpha.focus.color
+            } else {
+                alpha.ink.color
+            },
+        );
+        painter.text(
+            controls.left_center() + egui::vec2(12.0, 10.0),
+            egui::Align2::LEFT_CENTER,
+            editor.control_text(),
+            egui::FontId::monospace(10.0),
+            alpha.edge.color,
+        );
+        painter.text(
+            controls.right_center() - egui::vec2(8.0, 0.0),
+            egui::Align2::RIGHT_CENTER,
+            "TAB REGION   / ALGORITHMS   ENTER KEEP   ESC CANCEL",
+            egui::FontId::monospace(10.0),
+            alpha.edge.color,
+        );
+
+        if editor.picker {
+            let picker = egui::Rect::from_center_size(panel.center(), egui::vec2(250.0, 286.0));
+            painter.rect_filled(picker, 0.0, alpha.surface.color);
+            painter.rect_stroke(
+                picker,
+                0.0,
+                egui::Stroke::new(2.0, alpha.ink.color),
+                egui::StrokeKind::Inside,
+            );
+            for (index, algorithm) in plock_editor::Algorithm::ALL.iter().enumerate() {
+                let row = egui::Rect::from_min_size(
+                    picker.min + egui::vec2(12.0, 12.0 + index as f32 * 21.0),
+                    egui::vec2(picker.width() - 24.0, 20.0),
+                );
+                let on = *algorithm == editor.algorithm;
+                if on {
+                    painter.rect_filled(row, 0.0, alpha.focus.color.gamma_multiply(0.2));
+                }
+                painter.text(
+                    row.left_center() + egui::vec2(8.0, 0.0),
+                    egui::Align2::LEFT_CENTER,
+                    algorithm.label(),
+                    egui::FontId::monospace(12.0),
+                    if on {
+                        alpha.focus.color
+                    } else {
+                        alpha.ink.color
+                    },
+                );
             }
         }
     }
@@ -5341,7 +6236,7 @@ impl Stage {
         // While the trig menu is up the sequencer is seen and not heard
         // from: it keeps its cursor and its view, but the keys are the
         // menu's, so its grammar must not consume them underneath.
-        let keys = focused && self.trig_menu.is_none();
+        let keys = focused && self.trig_menu.is_none() && self.plock_editor.is_none();
 
         // The sequencer sits at the tray's left, inside the field's own
         // margin, and no wider than its natural width: a grid that
@@ -5373,7 +6268,18 @@ impl Stage {
         );
         self.trig_anchor = outcome.cursor_rect;
         if focused {
+            let edited = !outcome.intents.is_empty();
             self.apply_sequence(shown.pattern, &outcome.intents);
+            if edited {
+                if self.entry_held {
+                    self.entry_transaction = true;
+                } else {
+                    // Sequencer edits are normally produced while drawing,
+                    // outside `Stage::apply`; give each completed command
+                    // the same history boundary as a stage intent.
+                    self.settle();
+                }
+            }
             // The level under the cursor mirrors the sequencer's step, so
             // the ancestry strip tells the truth about where the performer is.
             if let Some(tick) = outcome.cursor_tick {
@@ -6583,10 +7489,13 @@ impl Stage {
             for (line, scene) in rows.clone().enumerate() {
                 let rect = scenes::slot_beneath(head, line, gap, section_gap());
                 let here = focused == Some(Address::Slot { track, scene });
+                let selected = self.session_selection.cells.contains(&(track, scene));
                 let mark = scenes::mark(&self.song, track, scene);
                 let alpha = self.alphabet();
                 let fill = if here {
                     cursor_shade
+                } else if selected {
+                    alpha.ink.color.gamma_multiply(0.34)
                 } else if mark.is_some() {
                     alpha.surface.color
                 } else {
@@ -6600,9 +7509,14 @@ impl Stage {
                 // Structure ink, not live ink. An empty address on the
                 // session is an empty place on a ruled sheet; spending
                 // the sounding hue on every one of them left nothing
-                // for the clips that are actually playing.
+                // for the clips that are actually playing. A SELECTED
+                // address is the exception: the hand has named it, so it
+                // is drawn in content ink like anything else the hand
+                // has hold of.
                 let cell_power = if here {
                     alpha.ground.color
+                } else if selected {
+                    alpha.ink.color
                 } else if mark.is_some() {
                     alpha.edge.color.gamma_multiply(1.25)
                 } else {
@@ -6612,14 +7526,14 @@ impl Stage {
                     painter,
                     egui::Id::new(("stage-scene-cell", track, scene)),
                     rect,
-                    (fill, figure_ink, cell_power, mark.is_some()),
+                    (fill, figure_ink, cell_power, mark.is_some(), selected),
                     |out| {
                         // AN EMPTY ADDRESS IS EMPTY. It gets the row's
                         // ruling and a registration tick at its left
                         // edge, and nothing else — no casing, no node.
                         // The sheet is ruled; the clips are what is
                         // written on it.
-                        if mark.is_none() && !here {
+                        if mark.is_none() && !here && !selected {
                             circuit::trace(
                                 out,
                                 &[
@@ -9020,6 +9934,47 @@ mod tests {
         assert_eq!(mark.label, "A1", "the slot is not named by its address");
     }
 
+    #[test]
+    fn sparse_session_selection_duplicates_down_and_keeps_real_holes() {
+        let mut stage = Stage::new();
+        drive(&mut stage, &[Key::ArrowDown, Key::Enter]);
+        let source = stage.song.slot_clip(0, 0).expect("source slot");
+        let _occupied_hole = stage.song.fill_slot(0, 3).expect("destination blocker");
+        stage.session_selection.cells.extend([(0, 0), (0, 1)]);
+
+        assert_eq!(stage.apply(StageIntent::Duplicate), ApplyOutcome::Changed);
+        assert_eq!(stage.song.slot_clip(0, 2), Some(source));
+        assert_eq!(
+            stage.song.slot_clip(0, 3),
+            None,
+            "the selected hole did not replace its destination"
+        );
+        assert_eq!(stage.session_selection.cells.len(), 2);
+    }
+
+    #[test]
+    fn session_select_all_then_delete_clears_every_slot_and_keeps_the_mask() {
+        let mut stage = Stage::new();
+        drive(&mut stage, &[Key::ArrowDown, Key::Enter]);
+        stage
+            .song
+            .session
+            .scenes
+            .push(crate::sequencing::Scene::default());
+        stage.fit_session();
+        let _ = stage.song.fill_slot(0, 1).expect("second slot");
+
+        assert_eq!(command(&mut stage, Key::A), ApplyOutcome::Changed);
+        let selected = stage.song.tracks.len() * stage.song.session.scenes.len();
+        assert_eq!(stage.session_selection.cells.len(), selected);
+        assert_eq!(stage.apply(StageIntent::Clear), ApplyOutcome::Changed);
+        assert!((0..stage.song.tracks.len()).all(|track| {
+            (0..stage.song.session.scenes.len())
+                .all(|scene| stage.song.slot_clip(track, scene).is_none())
+        }));
+        assert_eq!(stage.session_selection.cells.len(), selected);
+    }
+
     /// Fill the first slot of the first track and open it.
     fn into_clip(stage: &mut Stage) -> PatternId {
         drive(stage, &[Key::ArrowDown, Key::Enter]);
@@ -9345,6 +10300,67 @@ mod tests {
         // Undo covers the edits.
         assert_eq!(command(&mut stage, Key::Z), ApplyOutcome::Changed);
         assert_eq!(blocks(&stage).len(), 1);
+    }
+
+    #[test]
+    fn arrangement_selection_takes_whole_blocks_and_duplicates_as_one_region() {
+        let mut stage = Stage::new();
+        drive(&mut stage, &[Key::ArrowDown, Key::Enter]);
+        drive(&mut stage, &[Key::Tab]);
+        let pattern = match stage.song.slot_clip(0, 0) {
+            Some(Clip::Pattern(pattern)) => pattern,
+            None => panic!("pattern slot"),
+        };
+        let bar = arrangement::bar_ticks(&stage.song, 0);
+        stage.song.tracks[0].blocks.clear();
+        stage.song.tracks[0].audio_blocks.clear();
+        stage
+            .song
+            .place_block(0, pattern, 0, bar)
+            .expect("source block");
+
+        stage.arrangement.toggle_selection(&stage.song);
+        assert_eq!(
+            stage.arrangement.selected.len(),
+            bar,
+            "touching one cell did not select the whole block"
+        );
+        assert_eq!(
+            stage.apply(StageIntent::Song(SongIntent::Duplicate)),
+            ApplyOutcome::Changed
+        );
+        let starts: Vec<_> = stage.song.tracks[0]
+            .blocks
+            .iter()
+            .map(|block| block.start_tick)
+            .collect();
+        assert_eq!(starts, vec![0, bar]);
+        assert!(stage.arrangement.has_selection());
+
+        assert_eq!(stage.apply(StageIntent::Clear), ApplyOutcome::Changed);
+        assert_eq!(stage.song.tracks[0].blocks.len(), 1);
+        assert_eq!(stage.song.tracks[0].blocks[0].start_tick, bar);
+        assert!(stage.arrangement.has_selection());
+    }
+
+    #[test]
+    fn arrangement_select_all_then_delete_clears_every_block() {
+        let mut stage = Stage::new();
+        drive(&mut stage, &[Key::ArrowDown, Key::Enter]);
+        drive(&mut stage, &[Key::Tab]);
+        assert!(!stage.song.tracks[0].blocks.is_empty());
+
+        assert_eq!(command(&mut stage, Key::A), ApplyOutcome::Changed);
+        assert!(stage.arrangement.has_selection());
+        assert_eq!(stage.apply(StageIntent::Clear), ApplyOutcome::Changed);
+        assert!(
+            stage
+                .song
+                .tracks
+                .iter()
+                .all(|track| { track.blocks.is_empty() && track.audio_blocks.is_empty() })
+        );
+        assert!(stage.arrangement.has_selection());
     }
 
     /// The tray shows the block under the song cursor, and shifted
@@ -10459,6 +11475,63 @@ mod tests {
     }
 
     #[test]
+    fn the_plock_window_previews_then_commits_as_one_undo_step() {
+        let mut stage = Stage::new();
+        let id = into_clip(&mut stage);
+        let before = stage.song.clone();
+
+        assert_eq!(stage.apply(StageIntent::PlockEditor), ApplyOutcome::Changed);
+        stage.plock_editor.as_mut().expect("lock window").focus = plock_editor::Focus::Graphs;
+        assert_eq!(
+            stage.apply(StageIntent::Step(Step::Up)),
+            ApplyOutcome::Changed
+        );
+        assert!(
+            !stage
+                .song
+                .pattern(id)
+                .expect("pattern")
+                .trig(0)
+                .locks
+                .is_empty(),
+            "the live preview never reached the pattern"
+        );
+        assert_eq!(stage.apply(StageIntent::Enter), ApplyOutcome::Changed);
+        assert!(stage.plock_editor.is_none());
+
+        assert_eq!(command(&mut stage, Key::Z), ApplyOutcome::Changed);
+        assert_eq!(
+            stage.song, before,
+            "the transaction took more than one undo"
+        );
+    }
+
+    #[test]
+    fn escape_from_the_plock_window_restores_the_exact_lock_vectors() {
+        let mut stage = Stage::new();
+        let id = into_clip(&mut stage);
+        stage
+            .song
+            .pattern_mut(id)
+            .expect("pattern")
+            .trig_mut(0)
+            .set_lock(91, 0.33);
+        stage.settle();
+        let before = stage.song.clone();
+
+        assert_eq!(stage.apply(StageIntent::PlockEditor), ApplyOutcome::Changed);
+        stage.plock_editor.as_mut().expect("lock window").focus = plock_editor::Focus::Graphs;
+        assert_eq!(
+            stage.apply(StageIntent::Step(Step::Up)),
+            ApplyOutcome::Changed
+        );
+        assert_ne!(stage.song, before);
+        assert_eq!(stage.apply(StageIntent::Escape), ApplyOutcome::Changed);
+        assert_eq!(stage.song, before);
+        assert!(stage.plock_editor.is_none());
+    }
+
+    #[test]
     fn a_degree_track_types_degrees_and_an_absolute_track_types_notes() {
         let mut stage = Stage::new();
         let id = into_clip(&mut stage);
@@ -10850,6 +11923,10 @@ mod tests {
                     keymap::ScopeContext::TrigMenu => {
                         into_trig_menu(&mut stage);
                     }
+                    keymap::ScopeContext::Plock => {
+                        into_clip(&mut stage);
+                        let _ = stage.handle_key(Modifiers::SHIFT, Key::Enter);
+                    }
                     keymap::ScopeContext::Sample => {
                         into_sample_editor(&mut stage);
                     }
@@ -10879,8 +11956,15 @@ mod tests {
                         stage.nudging,
                         stage.clipboard.clone(),
                         stage.path.clone(),
-                        stage.trig_menu,
-                        stage.sample.clone(),
+                        (
+                            stage.trig_menu,
+                            stage.plock_editor.clone(),
+                            stage.sample.clone(),
+                            stage.session_selection.clone(),
+                            stage.session_clipboard.clone(),
+                            stage.block_clipboard.clone(),
+                            stage.arrangement_clipboard.clone(),
+                        ),
                         stage.library_generation,
                         stage.song_view,
                         stage.arrangement.clone(),
@@ -10908,8 +11992,15 @@ mod tests {
                                     stage.nudging,
                                     stage.clipboard.clone(),
                                     stage.path.clone(),
-                                    stage.trig_menu,
-                                    stage.sample.clone(),
+                                    (
+                                        stage.trig_menu,
+                                        stage.plock_editor.clone(),
+                                        stage.sample.clone(),
+                                        stage.session_selection.clone(),
+                                        stage.session_clipboard.clone(),
+                                        stage.block_clipboard.clone(),
+                                        stage.arrangement_clipboard.clone(),
+                                    ),
                                     stage.library_generation,
                                     stage.song_view,
                                     stage.arrangement.clone(),
@@ -10940,8 +12031,15 @@ mod tests {
                                     stage.nudging,
                                     stage.clipboard.clone(),
                                     stage.path.clone(),
-                                    stage.trig_menu,
-                                    stage.sample.clone(),
+                                    (
+                                        stage.trig_menu,
+                                        stage.plock_editor.clone(),
+                                        stage.sample.clone(),
+                                        stage.session_selection.clone(),
+                                        stage.session_clipboard.clone(),
+                                        stage.block_clipboard.clone(),
+                                        stage.arrangement_clipboard.clone(),
+                                    ),
                                     stage.library_generation,
                                     stage.song_view,
                                     stage.arrangement.clone(),
@@ -11000,6 +12098,10 @@ mod tests {
                 keymap::ScopeContext::TrigMenu => {
                     into_trig_menu(&mut stage);
                 }
+                keymap::ScopeContext::Plock => {
+                    into_clip(&mut stage);
+                    let _ = stage.handle_key(Modifiers::SHIFT, Key::Enter);
+                }
                 keymap::ScopeContext::Sample => {
                     into_sample_editor(&mut stage);
                 }
@@ -11021,11 +12123,19 @@ mod tests {
             );
 
             stage.transport.seek(crate::sequencing::TICKS_PER_BEAT);
-            assert_eq!(
-                stage.handle_key(Modifiers::NONE, Key::Home),
-                Some(ApplyOutcome::Changed)
-            );
-            assert_eq!(stage.transport.tick(), 0);
+            if scope == keymap::ScopeContext::Plock {
+                // In the graph, Home is the conventional value minimum;
+                // transport remains global on Space but does not steal the
+                // graph's editing key.
+                let _ = stage.handle_key(Modifiers::NONE, Key::Home);
+                assert_eq!(stage.transport.tick(), crate::sequencing::TICKS_PER_BEAT);
+            } else {
+                assert_eq!(
+                    stage.handle_key(Modifiers::NONE, Key::Home),
+                    Some(ApplyOutcome::Changed)
+                );
+                assert_eq!(stage.transport.tick(), 0);
+            }
             assert_eq!(stage.scope_context(), scope);
         }
     }
@@ -12145,6 +13255,10 @@ mod tests {
                 }
                 keymap::ScopeContext::TrigMenu => {
                     into_trig_menu(&mut stage);
+                }
+                keymap::ScopeContext::Plock => {
+                    into_clip(&mut stage);
+                    let _ = stage.handle_key(Modifiers::SHIFT, Key::Enter);
                 }
                 keymap::ScopeContext::Sample => {
                     into_sample_editor(&mut stage);

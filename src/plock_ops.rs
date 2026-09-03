@@ -102,6 +102,74 @@ pub fn ramp(values: &mut [f32], first: f32, last: f32, range: Range) {
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum Curve {
+    Linear,
+    Exponential,
+    Logarithmic,
+    S,
+}
+
+fn curve_at(t: f32, curve: Curve) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    match curve {
+        Curve::Linear => t,
+        Curve::Exponential => t * t,
+        Curve::Logarithmic => 1.0 - (1.0 - t) * (1.0 - t),
+        Curve::S => t * t * (3.0 - 2.0 * t),
+    }
+}
+
+/// A ramp whose horizontal coordinate is the cells' absolute time.
+/// Callers may omit holes from `positions`: their absence does not pull
+/// the remaining values together because normalization uses the supplied
+/// `first_position..last_position` bounds.
+pub fn ramp_positions(
+    values: &mut [f32],
+    positions: &[usize],
+    first_position: usize,
+    last_position: usize,
+    first: f32,
+    last: f32,
+    curve: Curve,
+    range: Range,
+) {
+    let width = last_position.saturating_sub(first_position).max(1) as f32;
+    for (slot, &position) in values.iter_mut().zip(positions) {
+        let t = position.saturating_sub(first_position) as f32 / width;
+        let shaped = curve_at(t, curve);
+        *slot = range.hold(first + (last - first) * shaped);
+    }
+}
+
+/// Draw fresh random values inside a requested sub-range and blend them
+/// with what is already present. The outer parameter range remains the
+/// final authority and the seed makes one preview reproducible.
+pub fn randomize_range(
+    values: &mut [f32],
+    min: f32,
+    max: f32,
+    amount: f32,
+    range: Range,
+    seed: u64,
+) {
+    let (lo, hi) = (
+        range.hold(min).min(range.hold(max)),
+        range.hold(min).max(range.hold(max)),
+    );
+    let amount = amount.clamp(0.0, 1.0);
+    let mut state = seed | 1;
+    for slot in values {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        let bits = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+        let unit = (bits >> 11) as f32 / (1u64 << 53) as f32;
+        let random = lo + (hi - lo) * unit;
+        *slot = range.hold(*slot + (random - *slot) * amount);
+    }
+}
+
 /// CRESCENDO: ramp from where the selection starts to the top of the
 /// range; DECRESCENDO takes it to the bottom.
 ///

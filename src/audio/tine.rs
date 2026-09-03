@@ -449,6 +449,13 @@ impl TineVoices {
         }
     }
 
+    pub fn plock_glide(&mut self, param: u32, alpha: f32) {
+        if let (Some(live), Some(base)) = (self.params.get(param), self.base.get(param)) {
+            self.params
+                .set(param, live + (base - live) * alpha.clamp(0.0, 1.0));
+        }
+    }
+
     pub fn params(&self) -> &TineParams {
         &self.params
     }

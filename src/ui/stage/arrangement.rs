@@ -13,10 +13,22 @@
 //! pages after the cursor. Every verb here acts on the block or cell
 //! under it, and the tray beneath shows that block's pattern.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use super::*;
-use crate::sequencing::{BlockId, PatternBlock, PatternId, TICKS_PER_BEAT, Track};
+use crate::sequencing::{AudioBlock, BlockId, PatternBlock, PatternId, TICKS_PER_BEAT, Track};
+
+/// Sparse arrangement material, positioned relative to the selection's
+/// top-left tick and track. The tick mask is kept separately from the
+/// blocks so empty selected cells remain meaningful spacing.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct ArrangementClipboard {
+    pub width_ticks: usize,
+    pub height: usize,
+    pub mask: Vec<(usize, usize)>,
+    pub patterns: Vec<(usize, usize, PatternBlock)>,
+    pub audio: Vec<(usize, usize, AudioBlock)>,
+}
 
 /// How many bars the time area spans, from the closest look to the
 /// widest. The closest shows beats as the grid; the rest walk in bars.
@@ -70,6 +82,10 @@ pub struct Arrangement {
     /// The last pattern placed on each track, so Enter on an empty cell
     /// lays the one the performer is building with.
     pub last_placed: HashMap<usize, PatternId>,
+    /// Tick-granular cells retain their exact time span if the view's
+    /// beat/bar grid changes after selection.
+    pub selected: BTreeSet<(usize, usize)>,
+    pub selection_anchor: Option<(usize, usize)>,
 }
 
 impl Default for Arrangement {
@@ -81,6 +97,8 @@ impl Default for Arrangement {
             zoom: DEFAULT_ZOOM,
             hold: None,
             last_placed: HashMap::new(),
+            selected: BTreeSet::new(),
+            selection_anchor: None,
         }
     }
 }
@@ -93,6 +111,100 @@ pub fn bar_ticks(song: &Song, tick: usize) -> usize {
 }
 
 impl Arrangement {
+    pub fn has_selection(&self) -> bool {
+        !self.selected.is_empty()
+    }
+
+    pub fn end_selection_gesture(&mut self) {
+        self.selection_anchor = None;
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selected.clear();
+        self.selection_anchor = None;
+    }
+
+    pub fn cell_selected(&self, track: usize, start: usize, end: usize) -> bool {
+        self.selected
+            .range((track, start)..(track, end))
+            .next()
+            .is_some()
+    }
+
+    pub fn toggle_selection(&mut self, song: &Song) {
+        let end = self.tick.saturating_add(self.grid_ticks(song));
+        let all = (self.tick..end).all(|tick| self.selected.contains(&(self.track, tick)));
+        for tick in self.tick..end {
+            if all {
+                self.selected.remove(&(self.track, tick));
+            } else {
+                self.selected.insert((self.track, tick));
+            }
+        }
+        self.expand_touching_blocks(song);
+        self.selection_anchor = Some((self.track, self.tick));
+    }
+
+    /// Move the cursor and add the anchor-to-cursor rectangle. Time is
+    /// stored as ticks, so later zoom changes redraw rather than reinterpret
+    /// the selection.
+    pub fn extend_selection(&mut self, song: &Song, step: Step) -> bool {
+        let anchor = *self.selection_anchor.get_or_insert((self.track, self.tick));
+        if !self.step(song, step) {
+            return false;
+        }
+        let first_track = anchor.0.min(self.track);
+        let last_track = anchor.0.max(self.track);
+        let first_tick = anchor.1.min(self.tick);
+        let last_tick = anchor
+            .1
+            .max(self.tick)
+            .saturating_add(self.grid_ticks(song));
+        for track in first_track..=last_track {
+            for tick in first_tick..last_tick {
+                self.selected.insert((track, tick));
+            }
+        }
+        self.expand_touching_blocks(song);
+        self.selection_anchor = Some(anchor);
+        true
+    }
+
+    /// Arrangement cells select content by intersection: touching any
+    /// part of a block adds that whole block to the exact tick mask.
+    fn expand_touching_blocks(&mut self, song: &Song) {
+        let mut whole = Vec::new();
+        for (track, lane) in song.tracks.iter().enumerate() {
+            for block in lane.blocks_in_time_order() {
+                if self.cell_selected(track, block.start_tick(), block.end_tick()) {
+                    whole.push((track, block.start_tick(), block.end_tick()));
+                }
+            }
+        }
+        for (track, start, end) in whole {
+            for tick in start..end {
+                self.selected.insert((track, tick));
+            }
+        }
+    }
+
+    pub fn selected_track_spans(&self) -> Vec<(usize, usize, usize)> {
+        let mut spans: Vec<(usize, usize, usize)> = Vec::new();
+        for &(track, tick) in &self.selected {
+            match spans.last_mut() {
+                Some((last_track, _, end)) if *last_track == track && tick <= *end => {
+                    *end = (*end).max(tick.saturating_add(1));
+                }
+                _ => spans.push((track, tick, tick.saturating_add(1))),
+            }
+        }
+        spans
+    }
+
+    pub fn block_selected(&self, track: usize, start: usize, end: usize) -> bool {
+        self.cell_selected(track, start, end)
+    }
+
     pub fn bars_across(&self) -> usize {
         BARS_ACROSS[self.zoom.min(BARS_ACROSS.len() - 1)]
     }
@@ -434,26 +546,45 @@ impl Stage {
             SongIntent::Marker => self.toggle_marker(),
             SongIntent::Export => self.request_export(),
             SongIntent::Resize => {
-                let (_, block) = self.song_block().ok_or(RefusalReason::Empty)?;
+                let length = if let Some((_, _, region)) = self.selected_arrangement_region() {
+                    region.width_ticks
+                } else {
+                    self.song_block()
+                        .ok_or(RefusalReason::Empty)?
+                        .1
+                        .length_ticks
+                };
                 self.arrangement.hold = Some(Hold::Resize);
                 self.notice = Some(format!(
                     "{} · {}",
                     Hold::Resize.word(),
-                    crate::ui::sequencer::grid_resolution::bars_label(block.length_ticks)
+                    crate::ui::sequencer::grid_resolution::bars_label(length)
                 ));
                 Ok(())
             }
             SongIntent::Stretch(step) => {
                 let bar = bar_ticks(&self.song, self.arrangement.tick);
-                self.resize_block(step, bar)
+                if self.arrangement.has_selection() {
+                    self.resize_arrangement_selection(step, bar)
+                } else {
+                    self.resize_block(step, bar)
+                }
             }
             SongIntent::Duplicate => {
-                let (track, block) = self.song_block().ok_or(RefusalReason::Empty)?;
-                let start = block.start_tick.saturating_add(block.length_ticks);
-                self.lay_block(track, block.pattern_id, start, block.length_ticks)?;
-                self.arrangement.tick = start;
-                self.arrangement.fit(&self.song);
-                Ok(())
+                if let Some((track, tick, region)) = self.selected_arrangement_region() {
+                    self.write_arrangement_region(
+                        &region,
+                        track,
+                        tick.saturating_add(region.width_ticks),
+                    )
+                } else {
+                    let (track, block) = self.song_block().ok_or(RefusalReason::Empty)?;
+                    let start = block.start_tick.saturating_add(block.length_ticks);
+                    self.lay_block(track, block.pattern_id, start, block.length_ticks)?;
+                    self.arrangement.tick = start;
+                    self.arrangement.fit(&self.song);
+                    Ok(())
+                }
             }
             SongIntent::Pick | SongIntent::PickBack => {
                 let (track, block) = self.song_block().ok_or(RefusalReason::Empty)?;
@@ -522,16 +653,283 @@ impl Stage {
         Ok(id)
     }
 
+    fn selected_arrangement_region(&self) -> Option<(usize, usize, ArrangementClipboard)> {
+        let min_track = self
+            .arrangement
+            .selected
+            .iter()
+            .map(|(track, _)| *track)
+            .min()?;
+        let max_track = self
+            .arrangement
+            .selected
+            .iter()
+            .map(|(track, _)| *track)
+            .max()?;
+        let min_tick = self
+            .arrangement
+            .selected
+            .iter()
+            .map(|(_, tick)| *tick)
+            .min()?;
+        let max_tick = self
+            .arrangement
+            .selected
+            .iter()
+            .map(|(_, tick)| *tick)
+            .max()?;
+        let mask = self
+            .arrangement
+            .selected
+            .iter()
+            .map(|(track, tick)| (track - min_track, tick - min_tick))
+            .collect();
+        let mut patterns = Vec::new();
+        let mut audio = Vec::new();
+        for (track, lane) in self.song.tracks.iter().enumerate() {
+            for block in &lane.blocks {
+                let end = block.start_tick.saturating_add(block.length_ticks);
+                if self
+                    .arrangement
+                    .block_selected(track, block.start_tick, end)
+                {
+                    patterns.push((
+                        track - min_track,
+                        block.start_tick - min_tick,
+                        block.clone(),
+                    ));
+                }
+            }
+            for block in &lane.audio_blocks {
+                if self
+                    .arrangement
+                    .block_selected(track, block.start_tick, block.end_tick())
+                {
+                    audio.push((
+                        track - min_track,
+                        block.start_tick - min_tick,
+                        block.clone(),
+                    ));
+                }
+            }
+        }
+        Some((
+            min_track,
+            min_tick,
+            ArrangementClipboard {
+                width_ticks: max_tick - min_tick + 1,
+                height: max_track - min_track + 1,
+                mask,
+                patterns,
+                audio,
+            },
+        ))
+    }
+
+    fn remove_arrangement_region_content(&mut self, region: &ArrangementClipboard) {
+        let pattern_ids: HashSet<_> = region
+            .patterns
+            .iter()
+            .map(|(_, _, block)| block.id)
+            .collect();
+        let audio_ids: HashSet<_> = region.audio.iter().map(|(_, _, block)| block.id).collect();
+        for lane in &mut self.song.tracks {
+            lane.blocks.retain(|block| !pattern_ids.contains(&block.id));
+            lane.audio_blocks
+                .retain(|block| !audio_ids.contains(&block.id));
+        }
+    }
+
+    /// Replace every destination touched by the sparse mask, then land
+    /// copies of its blocks with fresh ids. A selected empty cell therefore
+    /// remains an actual hole at the destination.
+    fn write_arrangement_region(
+        &mut self,
+        region: &ArrangementClipboard,
+        origin_track: usize,
+        origin_tick: usize,
+    ) -> Result<(), RefusalReason> {
+        if origin_track.saturating_add(region.height) > self.song.tracks.len() {
+            return Err(RefusalReason::Edge(Step::Down));
+        }
+        let destination: BTreeSet<_> = region
+            .mask
+            .iter()
+            .map(|(track, tick)| (origin_track + track, origin_tick + tick))
+            .collect();
+        for (track, lane) in self.song.tracks.iter_mut().enumerate() {
+            lane.blocks.retain(|block| {
+                let end = block.start_tick.saturating_add(block.length_ticks);
+                !destination
+                    .range((track, block.start_tick)..(track, end))
+                    .next()
+                    .is_some()
+            });
+            lane.audio_blocks.retain(|block| {
+                !destination
+                    .range((track, block.start_tick)..(track, block.end_tick()))
+                    .next()
+                    .is_some()
+            });
+        }
+        for (row, offset, kept) in &region.patterns {
+            let mut block = kept.clone();
+            block.id = self.song.mint_block_id();
+            block.start_tick = origin_tick.saturating_add(*offset);
+            self.song.tracks[origin_track + row].blocks.push(block);
+        }
+        for (row, offset, kept) in &region.audio {
+            let mut block = kept.clone();
+            block.id = self.song.mint_block_id();
+            block.start_tick = origin_tick.saturating_add(*offset);
+            self.song.tracks[origin_track + row]
+                .audio_blocks
+                .push(block);
+        }
+        for lane in &mut self.song.tracks {
+            lane.blocks.sort_by_key(|block| block.start_tick);
+            lane.audio_blocks.sort_by_key(|block| block.start_tick);
+        }
+        self.touched();
+        Ok(())
+    }
+
+    fn shift_arrangement_selection(&mut self, track_delta: isize, tick_delta: isize) {
+        self.arrangement.selected = self
+            .arrangement
+            .selected
+            .iter()
+            .map(|(track, tick)| {
+                (
+                    (*track as isize + track_delta) as usize,
+                    (*tick as isize + tick_delta) as usize,
+                )
+            })
+            .collect();
+        self.arrangement.selection_anchor =
+            self.arrangement.selection_anchor.map(|(track, tick)| {
+                (
+                    (track as isize + track_delta) as usize,
+                    (tick as isize + tick_delta) as usize,
+                )
+            });
+    }
+
+    fn nudge_arrangement_selection(&mut self, step: Step, by: usize) -> Result<(), RefusalReason> {
+        let (track, tick, region) = self
+            .selected_arrangement_region()
+            .ok_or(RefusalReason::Empty)?;
+        let (to_track, to_tick, track_delta, tick_delta) = match step {
+            Step::Left => (
+                track,
+                tick.checked_sub(by).ok_or(RefusalReason::Edge(step))?,
+                0,
+                -(by as isize),
+            ),
+            Step::Right => (track, tick.saturating_add(by), 0, by as isize),
+            Step::Up => (
+                track.checked_sub(1).ok_or(RefusalReason::Edge(step))?,
+                tick,
+                -1,
+                0,
+            ),
+            Step::Down => {
+                if track + region.height >= self.song.tracks.len() {
+                    return Err(RefusalReason::Edge(step));
+                }
+                (track + 1, tick, 1, 0)
+            }
+        };
+        self.remove_arrangement_region_content(&region);
+        self.write_arrangement_region(&region, to_track, to_tick)?;
+        self.shift_arrangement_selection(track_delta, tick_delta);
+        self.arrangement.track = (self.arrangement.track as isize + track_delta) as usize;
+        self.arrangement.tick = (self.arrangement.tick as isize + tick_delta) as usize;
+        self.arrangement.fit(&self.song);
+        Ok(())
+    }
+
+    /// Resize a multi-block region as one object: its left edge stays
+    /// fixed and every start/end is scaled by the same ratio. This keeps
+    /// spacing proportional instead of adding the same duration to every
+    /// block independently.
+    fn resize_arrangement_selection(&mut self, step: Step, by: usize) -> Result<(), RefusalReason> {
+        let (track, tick, region) = self
+            .selected_arrangement_region()
+            .ok_or(RefusalReason::Empty)?;
+        let old = region.width_ticks.max(1);
+        let minimum = self.arrangement.grid_ticks(&self.song).min(old).max(1);
+        let new = match step {
+            Step::Left => old.saturating_sub(by).max(minimum),
+            Step::Right => old.saturating_add(by),
+            _ => return Err(RefusalReason::Unavailable),
+        };
+        if new == old {
+            return Err(RefusalReason::Edge(step));
+        }
+        let scaled = |position: usize| -> usize {
+            ((position as u128 * new as u128 + old as u128 / 2) / old as u128) as usize
+        };
+        let mut resized = region.clone();
+        resized.width_ticks = new;
+        resized.mask = region
+            .mask
+            .iter()
+            .flat_map(|(row, at)| {
+                let start = scaled(*at).min(new.saturating_sub(1));
+                let end = scaled(at.saturating_add(1)).max(start + 1).min(new);
+                (start..end).map(move |tick| (*row, tick))
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        for (_, offset, block) in &mut resized.patterns {
+            let end = offset.saturating_add(block.length_ticks);
+            let start = scaled(*offset);
+            let end = scaled(end).max(start + 1);
+            *offset = start;
+            block.length_ticks = end - start;
+        }
+        for (_, offset, block) in &mut resized.audio {
+            let end = offset.saturating_add(block.length_ticks);
+            let start = scaled(*offset);
+            let end = scaled(end).max(start + 1);
+            *offset = start;
+            block.length_ticks = end - start;
+        }
+        self.remove_arrangement_region_content(&region);
+        self.write_arrangement_region(&resized, track, tick)?;
+        self.arrangement.selected = resized
+            .mask
+            .iter()
+            .map(|(row, at)| (track + row, tick + at))
+            .collect();
+        if self.arrangement.tick >= tick {
+            self.arrangement.tick = tick + scaled(self.arrangement.tick - tick);
+            self.arrangement.fit(&self.song);
+        }
+        self.notice = Some(crate::ui::sequencer::grid_resolution::bars_label(new));
+        Ok(())
+    }
+
     /// A step in the song view: the held verb's motion, or the cursor's.
     pub(super) fn song_step(&mut self, step: Step) -> Result<(), RefusalReason> {
         match self.arrangement.hold {
+            Some(Hold::Nudge) if self.arrangement.has_selection() => {
+                let grid = self.arrangement.grid_ticks(&self.song);
+                self.nudge_arrangement_selection(step, grid)
+            }
             Some(Hold::Nudge) if matches!(step, Step::Left | Step::Right) => {
                 let grid = self.arrangement.grid_ticks(&self.song);
                 self.move_block(step, grid)
             }
             Some(Hold::Resize) if matches!(step, Step::Left | Step::Right) => {
                 let grid = self.arrangement.grid_ticks(&self.song);
-                self.resize_block(step, grid)
+                if self.arrangement.has_selection() {
+                    self.resize_arrangement_selection(step, grid)
+                } else {
+                    self.resize_block(step, grid)
+                }
             }
             _ => self
                 .arrangement
@@ -590,6 +988,27 @@ impl Stage {
     /// Enter in the song view: a block opens in the tray; an empty cell
     /// takes a block, one pattern long or as long as the gap allows.
     pub(super) fn song_enter(&mut self) -> Result<(), RefusalReason> {
+        if self.arrangement.has_selection() {
+            let spans = self.arrangement.selected_track_spans();
+            if spans.is_empty() {
+                return Err(RefusalReason::Empty);
+            }
+            for (track, start, end) in spans {
+                let pattern = self
+                    .pattern_to_place(track)
+                    .ok_or(RefusalReason::Unavailable)?;
+                if let Some(lane) = self.song.tracks.get_mut(track) {
+                    lane.blocks.retain(|block| {
+                        block.start_tick.saturating_add(block.length_ticks) <= start
+                            || block.start_tick >= end
+                    });
+                    lane.audio_blocks
+                        .retain(|block| !block.intersects(start, end));
+                }
+                self.lay_block(track, pattern, start, end.saturating_sub(start))?;
+            }
+            return Ok(());
+        }
         let track = self.song_track().ok_or(RefusalReason::Unavailable)?;
         if let Some((track, block)) = self.song_block() {
             let entered = self
@@ -621,6 +1040,27 @@ impl Stage {
 
     /// Delete in the song view: the block under the cursor goes.
     pub(super) fn song_clear(&mut self) -> Result<(), RefusalReason> {
+        if self.arrangement.has_selection() {
+            let spans = self.arrangement.selected_track_spans();
+            let mut changed = false;
+            for (track, start, end) in spans {
+                if let Some(lane) = self.song.tracks.get_mut(track) {
+                    let before = lane.blocks.len() + lane.audio_blocks.len();
+                    lane.blocks.retain(|block| {
+                        block.start_tick.saturating_add(block.length_ticks) <= start
+                            || block.start_tick >= end
+                    });
+                    lane.audio_blocks
+                        .retain(|block| !block.intersects(start, end));
+                    changed |= before != lane.blocks.len() + lane.audio_blocks.len();
+                }
+            }
+            if changed {
+                self.touched();
+                return Ok(());
+            }
+            return Err(RefusalReason::Empty);
+        }
         if self.song_block().is_none()
             && let Some((track, block)) = self.song_audio_block()
         {
@@ -646,6 +1086,15 @@ impl Stage {
 
     /// Lift the block under the cursor off its lane and keep it.
     pub(super) fn song_yank(&mut self) -> Result<(), RefusalReason> {
+        if let Some((_, _, region)) = self.selected_arrangement_region() {
+            let count = region.patterns.len() + region.audio.len();
+            self.remove_arrangement_region_content(&region);
+            self.arrangement_clipboard = Some(region);
+            self.block_clipboard = None;
+            self.notice = Some(format!("yanked {count} blocks"));
+            self.touched();
+            return Ok(());
+        }
         let (track, block) = self.song_block().ok_or(RefusalReason::Empty)?;
         let taken = self
             .song
@@ -656,12 +1105,17 @@ impl Stage {
             .pattern(taken.pattern_id)
             .map(|pattern| format!("yanked {}", pattern.name));
         self.block_clipboard = Some(taken);
+        self.arrangement_clipboard = None;
         self.touched();
         Ok(())
     }
 
     /// Put the kept block down at the cursor, on the cursor's track.
     pub(super) fn song_put(&mut self) -> Result<(), RefusalReason> {
+        if let Some(region) = self.arrangement_clipboard.clone() {
+            let track = self.song_track().ok_or(RefusalReason::Unavailable)?;
+            return self.write_arrangement_region(&region, track, self.arrangement.tick);
+        }
         let kept = self.block_clipboard.clone().ok_or(RefusalReason::Empty)?;
         let track = self.song_track().ok_or(RefusalReason::Unavailable)?;
         let start = self.arrangement.tick;
@@ -965,16 +1419,27 @@ impl Stage {
                     continue;
                 }
                 let here = cursor_block == Some(block.id);
+                let selected = self
+                    .arrangement
+                    .block_selected(track, block.start_tick, end);
                 let playing = sounding && block.start_tick <= now && now < end;
                 let fill = if here {
                     cursor_shade
+                } else if selected {
+                    cursor_shade.gamma_multiply(0.55)
                 } else if playing {
                     alpha.live_dim.color
                 } else {
                     edge
                 };
                 let figure = if here || playing { ground } else { ink };
-                let outline = if playing { alpha.live.color } else { edge };
+                let outline = if selected {
+                    ink
+                } else if playing {
+                    alpha.live.color
+                } else {
+                    edge
+                };
                 let pattern = self.song.pattern(block.pattern_id);
                 let pattern_len = pattern.map_or(1, |p| p.length_ticks.max(1));
                 let step_ticks = PATTERN_STEP_TICKS.max(1);
@@ -1076,13 +1541,24 @@ impl Stage {
                 if rect.width() < 2.0 {
                     continue;
                 }
+                let selected = self
+                    .arrangement
+                    .block_selected(track, block.start_tick, end);
                 let playing = sounding && block.start_tick <= now && now < end;
-                let fill = if playing {
+                let fill = if selected {
+                    cursor_shade.gamma_multiply(0.55)
+                } else if playing {
                     alpha.live_dim.color
                 } else {
                     self.square()
                 };
-                let outline = if playing { alpha.live.color } else { edge };
+                let outline = if selected {
+                    ink
+                } else if playing {
+                    alpha.live.color
+                } else {
+                    edge
+                };
                 let figure = if playing { ground } else { ink };
                 kit::cached(
                     painter,
@@ -1126,6 +1602,30 @@ impl Stage {
         }
 
         self.draw_song_marks(painter, &frame, phase);
+
+        // Empty selected cells retain a visible wash. Filled cells are
+        // represented by the whole selected block above.
+        let grid = self.arrangement.grid_ticks(&self.song);
+        for &(track, tick) in &self.arrangement.selected {
+            if tick % grid != 0
+                || !shown.contains(&track)
+                || tick < frame.view_start
+                || tick >= frame.view_end()
+            {
+                continue;
+            }
+            let end = tick.saturating_add(grid);
+            if self.song.tracks[track]
+                .blocks_in_time_order()
+                .iter()
+                .any(|block| block.intersects(tick, end))
+            {
+                continue;
+            }
+            let lane = frame.lane(track - frame.row_offset);
+            let rect = frame.span(lane.shrink2(egui::vec2(0.0, 3.0)), tick, tick + grid);
+            painter.rect_filled(rect, 0.0, cursor_shade.gamma_multiply(0.22));
+        }
 
         // The playhead: a heavy rule in the live ink from the ruler to
         // the foot of the lanes, breathing with the beat, with its

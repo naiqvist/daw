@@ -2560,6 +2560,7 @@ impl Pattern {
             | Intent::Resize { tick, .. }
             | Intent::ResizeNote { tick, .. }
             | Intent::AddNote { tick, .. }
+            | Intent::AddEntryNote { tick, .. }
             | Intent::SetProbability { tick, .. }
             | Intent::AdjustVelocity { tick, .. }
             | Intent::AdjustNoteVelocity { tick, .. }
@@ -2640,6 +2641,16 @@ impl Pattern {
                 trig.add_tone_at(note);
                 trig.probability = probability.clamp(0.01, 1.0);
             }
+            Intent::AddEntryNote {
+                pitch,
+                length_ticks,
+                velocity,
+                ..
+            } => {
+                let mut note = Note::with_pitch(pitch, length_ticks, velocity);
+                note.micro_ticks = micro;
+                self.trig_mut(step).add_tone_at(note);
+            }
             Intent::SetProbability { probability, .. } => {
                 self.trig_mut(step).probability = probability.clamp(0.01, 1.0);
             }
@@ -2676,21 +2687,17 @@ impl Pattern {
                 };
                 note.muted = muted;
             }
-            // Locks belong to the STEP, not to a note: they say what the
-            // voice does when the trig fires, and a trig fires once
-            // however many notes it holds. A step with nothing on it has
-            // no firing to lock.
+            // Locks belong to the STEP, not to a note. An empty step may
+            // therefore carry a trigless lock: the compiler turns it into
+            // a bounded lock/restore pair without inventing a note.
             Intent::SetLock {
                 device,
                 param,
                 value,
                 ..
             } => {
-                let trig = self.trig_mut(step);
-                if trig.notes.is_empty() {
-                    return Some("lock: no trig here");
-                }
-                trig.set_lock_on(device.map(DeviceId), param, value);
+                self.trig_mut(step)
+                    .set_lock_on(device.map(DeviceId), param, value);
             }
             Intent::ClearLock { device, param, .. } => {
                 if !self
@@ -4651,10 +4658,10 @@ mod tick_tests {
     }
 
     /// A lock is one per parameter, replaced rather than doubled, and
-    /// released by name. Locking an empty step is refused: there is no
-    /// firing to lock.
+    /// released by name. An empty step holds a trigless lock without
+    /// acquiring a note.
     #[test]
-    fn locks_are_one_per_parameter_and_need_a_trig() {
+    fn locks_are_one_per_parameter_and_may_be_trigless() {
         use crate::intent::sequence::Intent;
         let mut pattern = Pattern::default();
         assert_eq!(
@@ -4664,8 +4671,10 @@ mod tick_tests {
                 param: 3,
                 value: 0.5
             }),
-            Some("lock: no trig here")
+            None
         );
+        assert!(pattern.trig(0).notes.is_empty());
+        assert_eq!(pattern.trig(0).lock(3), Some(0.5));
         pattern.toggle(0, Note::new(60, PATTERN_STEP_TICKS, 100));
         assert_eq!(
             pattern.apply(&Intent::SetLock {
@@ -4720,6 +4729,37 @@ mod tick_tests {
             Some(0.5),
             "clearing the effect's took the voice's"
         );
+    }
+
+    #[test]
+    fn entry_note_replacement_keeps_condition_and_locks() {
+        use crate::intent::sequence::Intent;
+        let mut pattern = Pattern::default();
+        pattern.apply(&toggle(0));
+        pattern.apply(&Intent::SetProbability {
+            tick: 0,
+            probability: 0.25,
+        });
+        pattern.apply(&Intent::SetLock {
+            tick: 0,
+            device: None,
+            param: 7,
+            value: 0.75,
+        });
+
+        pattern.apply(&Intent::Clear { tick: 0 });
+        pattern.apply(&Intent::AddEntryNote {
+            tick: 0,
+            pitch: Pitch::from_midi(67),
+            length_ticks: PATTERN_STEP_TICKS,
+            velocity: 110,
+        });
+
+        let trig = pattern.trig(0);
+        assert_eq!(trig.probability, 0.25);
+        assert_eq!(trig.lock(7), Some(0.75));
+        assert_eq!(trig.notes.len(), 1);
+        assert_eq!(trig.notes[0].pitch, Pitch::from_midi(67));
     }
 
     /// A pattern is named by where it lives: track, bank, slot.
