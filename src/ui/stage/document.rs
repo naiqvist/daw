@@ -23,8 +23,13 @@ struct Document {
 }
 
 const VERSION: u32 = 1;
+const BACKUP_LIMIT: usize = 20;
 
 /// Write `song` to `path`, making the directory if it is not there.
+///
+/// The named document is replaced only after a complete temporary sibling
+/// has reached disk. A crash while serialising or writing therefore leaves
+/// either the previous document or the next one, never half of either.
 pub fn save(path: &Path, song: &Song) -> Result<(), String> {
     let document = Document {
         version: VERSION,
@@ -35,7 +40,101 @@ pub fn save(path: &Path, song: &Song) -> Result<(), String> {
     if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
     }
-    std::fs::write(path, text).map_err(|error| error.to_string())
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "project path has no file name".to_owned())?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let temp = path.with_file_name(format!(".{name}.{}.{nonce}.writing", std::process::id()));
+    let write = (|| {
+        let mut file = std::fs::File::create(&temp).map_err(|error| error.to_string())?;
+        use std::io::Write as _;
+        file.write_all(text.as_bytes())
+            .map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+        std::fs::rename(&temp, path).map_err(|error| error.to_string())
+    })();
+    if write.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    write
+}
+
+/// Give a Save-As path the stage document suffix unless it already names a
+/// stage or compatible legacy document.
+pub fn with_extension(path: &Path) -> PathBuf {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return path.to_path_buf();
+    };
+    if name.ends_with(".stage.ron") || name.ends_with(".daw.ron") {
+        return path.to_path_buf();
+    }
+    let stem = name.strip_suffix(".ron").unwrap_or(name);
+    path.with_file_name(format!("{stem}.{EXTENSION}"))
+}
+
+/// The first unused numbered sibling of `path`, retaining compound project
+/// suffixes and ordinary one-part suffixes such as `.wav`.
+pub fn available_path(path: &Path) -> PathBuf {
+    if !path.exists() {
+        return path.to_path_buf();
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("untitled");
+    let (stem, suffix) = if let Some(stem) = name.strip_suffix(".stage.ron") {
+        (stem, ".stage.ron")
+    } else if let Some(stem) = name.strip_suffix(".daw.ron") {
+        (stem, ".daw.ron")
+    } else if let Some(dot) = name.rfind('.').filter(|dot| *dot > 0) {
+        (&name[..dot], &name[dot..])
+    } else {
+        (name, "")
+    };
+    (2..)
+        .map(|number| path.with_file_name(format!("{stem} {number}{suffix}")))
+        .find(|candidate| !candidate.exists())
+        .expect("the integers do not run out")
+}
+
+/// Preserve the document that is about to be overwritten. Backups live in a
+/// machine-local project folder, never beside samples, and the newest twenty
+/// copies of one project are retained.
+pub fn backup(path: &Path, home: &Path) -> Result<Option<PathBuf>, String> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let directory = home.join("backups");
+    std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    let prefix = format!("{}-", title(path));
+    let destination = available_path(
+        &directory.join(format!("{prefix}{}.stage.ron", super::arrangement::stamp())),
+    );
+    std::fs::copy(path, &destination).map_err(|error| error.to_string())?;
+
+    let mut siblings: Vec<_> = std::fs::read_dir(&directory)
+        .map_err(|error| error.to_string())?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".stage.ron"))
+        })
+        .filter_map(|entry| {
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some((modified, entry.path()))
+        })
+        .collect();
+    siblings.sort_by_key(|(modified, _)| *modified);
+    let excess = siblings.len().saturating_sub(BACKUP_LIMIT);
+    for (_, old) in siblings.into_iter().take(excess) {
+        std::fs::remove_file(old).map_err(|error| error.to_string())?;
+    }
+    Ok(Some(destination))
 }
 
 /// Read a song from `path`: one the stage saved, or a project the first
@@ -158,5 +257,54 @@ mod tests {
         let second = untitled_in(&home);
         assert_eq!(second, home.join("untitled 2.stage.ron"));
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn save_as_paths_keep_compound_extensions_and_number_safely() {
+        let root = scratch("available");
+        std::fs::create_dir_all(&root).expect("a folder");
+        assert_eq!(
+            with_extension(&root.join("signal")),
+            root.join("signal.stage.ron")
+        );
+        assert_eq!(
+            with_extension(&root.join("signal.ron")),
+            root.join("signal.stage.ron")
+        );
+        assert_eq!(
+            with_extension(&root.join("signal.daw.ron")),
+            root.join("signal.daw.ron")
+        );
+        let first = root.join("signal.stage.ron");
+        save(&first, &Song::default()).expect("first exists");
+        assert_eq!(available_path(&first), root.join("signal 2.stage.ron"));
+        let wav = root.join("signal.wav");
+        std::fs::write(&wav, []).expect("wav placeholder");
+        assert_eq!(available_path(&wav), root.join("signal 2.wav"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn overwriting_can_preserve_a_loadable_backup() {
+        let root = scratch("backup");
+        let path = root.join("song.stage.ron");
+        let mut first = Song::default();
+        first.rename_track(0, "Before");
+        save(&path, &first).expect("original saves");
+        let preserved = backup(&path, &root)
+            .expect("backup succeeds")
+            .expect("existing project has a backup");
+        let mut second = first.clone();
+        second.rename_track(0, "After");
+        save(&path, &second).expect("replacement saves");
+        assert_eq!(
+            load(&preserved).expect("backup loads").tracks[0].name,
+            "Before"
+        );
+        assert_eq!(
+            load(&path).expect("new project loads").tracks[0].name,
+            "After"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

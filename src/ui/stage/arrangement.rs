@@ -1395,6 +1395,12 @@ pub struct ExportRequest {
     pub start_tick: usize,
     pub end_tick: usize,
     pub path: std::path::PathBuf,
+    pub format: crate::ui::prefs::ExportFormat,
+    /// `None` follows the running device's rate.
+    pub rate_hz: Option<u32>,
+    /// Silence rendered after the musical range so time-based effects can
+    /// decay without changing where the requested range begins or ends.
+    pub tail_seconds: u32,
 }
 
 /// An export under way, as the strip shows it.
@@ -1478,6 +1484,7 @@ impl Stage {
             return;
         };
         self.export_request = None;
+        self.utility.export_finished(&export.path, &result);
         self.notice = Some(match result {
             Ok(()) => format!("exported → {}", export.path.display()),
             Err(error) => format!("export failed: {error}"),
@@ -1513,10 +1520,42 @@ impl Stage {
                 |stem| stem.to_string_lossy().into_owned(),
             );
         let path = home.join("renders").join(format!("{name}-{}.wav", stamp()));
+        self.request_export_to(
+            start,
+            end,
+            path,
+            crate::ui::prefs::ExportFormat::Int24,
+            None,
+            0,
+        )
+    }
+
+    /// Queue a fully specified offline render. The utility console owns the
+    /// choices; this seam only validates and snapshots them for the host.
+    pub(super) fn request_export_to(
+        &mut self,
+        start: usize,
+        end: usize,
+        path: std::path::PathBuf,
+        format: crate::ui::prefs::ExportFormat,
+        rate_hz: Option<u32>,
+        tail_seconds: u32,
+    ) -> Result<(), RefusalReason> {
+        if self.export.is_some() {
+            self.notice = Some("EXPORT · already rendering".to_owned());
+            return Err(RefusalReason::Unavailable);
+        }
+        if end <= start {
+            self.notice = Some("EXPORT · nothing to render".to_owned());
+            return Err(RefusalReason::Empty);
+        }
         self.export_request = Some(ExportRequest {
             start_tick: start,
             end_tick: end,
             path: path.clone(),
+            format,
+            rate_hz,
+            tail_seconds,
         });
         self.export = Some(ExportState {
             path,

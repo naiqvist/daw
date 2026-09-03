@@ -89,6 +89,44 @@ pub struct UiPrefs {
     pub audio_rate_hz: Option<u32>,
     #[serde(default)]
     pub audio_buffer_frames: Option<u32>,
+
+    /// Where new project documents and their recovery files live. A path is
+    /// machine-local; the stage still refuses a first save when neither this
+    /// nor a host-provided home exists.
+    #[serde(default)]
+    pub project_folder: Option<String>,
+    /// Periodic recovery cadence. Kept as a vocabulary rather than a naked
+    /// integer so a corrupt value cannot turn into a save storm.
+    #[serde(default)]
+    pub autosave: Autosave,
+    /// Negative flags make an old preferences blob choose the safe answer.
+    #[serde(default)]
+    pub disable_backups: bool,
+    #[serde(default)]
+    pub skip_dirty_confirmation: bool,
+    /// The stage's two viewing grounds. Dark is the house default, so the
+    /// stored bit names the exception.
+    #[serde(default)]
+    pub light_ground: bool,
+    #[serde(default)]
+    pub reduced_motion: bool,
+    #[serde(default)]
+    pub cursor_energy: CursorEnergy,
+    #[serde(default)]
+    pub hide_tooltips: bool,
+
+    /// Defaults for the export console. These affect a future file, never the
+    /// project being edited, and therefore remain machine-local.
+    #[serde(default)]
+    pub export_format: ExportFormat,
+    #[serde(default)]
+    pub export_rate_hz: Option<u32>,
+    #[serde(default)]
+    pub export_tail: ExportTail,
+    /// Successful destinations, newest first. This is a convenience trail,
+    /// not part of the song's history.
+    #[serde(default)]
+    pub recent_exports: Vec<String>,
 }
 
 /// Which backend the audio engine should open.
@@ -101,6 +139,140 @@ pub enum AudioBackend {
     Jack,
     Alsa,
     Pulse,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Autosave {
+    Off,
+    OneMinute,
+    TwoMinutes,
+    #[default]
+    FiveMinutes,
+    TenMinutes,
+    FifteenMinutes,
+}
+
+impl Autosave {
+    pub const ALL: [Self; 6] = [
+        Self::Off,
+        Self::OneMinute,
+        Self::TwoMinutes,
+        Self::FiveMinutes,
+        Self::TenMinutes,
+        Self::FifteenMinutes,
+    ];
+
+    pub const fn minutes(self) -> Option<u64> {
+        match self {
+            Self::Off => None,
+            Self::OneMinute => Some(1),
+            Self::TwoMinutes => Some(2),
+            Self::FiveMinutes => Some(5),
+            Self::TenMinutes => Some(10),
+            Self::FifteenMinutes => Some(15),
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "OFF",
+            Self::OneMinute => "1 MIN",
+            Self::TwoMinutes => "2 MIN",
+            Self::FiveMinutes => "5 MIN",
+            Self::TenMinutes => "10 MIN",
+            Self::FifteenMinutes => "15 MIN",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CursorEnergy {
+    Quiet,
+    #[default]
+    Normal,
+    High,
+}
+
+impl CursorEnergy {
+    pub const ALL: [Self; 3] = [Self::Quiet, Self::Normal, Self::High];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Quiet => "QUIET",
+            Self::Normal => "NORMAL",
+            Self::High => "HIGH",
+        }
+    }
+}
+
+/// UI vocabulary for the three formats the offline writer actually supports.
+/// The host translates this into `audio::bounce::BounceFormat`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ExportFormat {
+    Float32,
+    #[default]
+    Int24,
+    Int16,
+}
+
+impl ExportFormat {
+    pub const ALL: [Self; 3] = [Self::Float32, Self::Int24, Self::Int16];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Float32 => "32-BIT FLOAT",
+            Self::Int24 => "24-BIT PCM",
+            Self::Int16 => "16-BIT PCM",
+        }
+    }
+
+    pub const fn bytes_per_stereo_frame(self) -> u64 {
+        match self {
+            Self::Float32 => 8,
+            Self::Int24 => 6,
+            Self::Int16 => 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ExportTail {
+    None,
+    OneSecond,
+    #[default]
+    TwoSeconds,
+    FiveSeconds,
+    TenSeconds,
+}
+
+impl ExportTail {
+    pub const ALL: [Self; 5] = [
+        Self::None,
+        Self::OneSecond,
+        Self::TwoSeconds,
+        Self::FiveSeconds,
+        Self::TenSeconds,
+    ];
+
+    pub const fn seconds(self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::OneSecond => 1,
+            Self::TwoSeconds => 2,
+            Self::FiveSeconds => 5,
+            Self::TenSeconds => 10,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::None => "0 S",
+            Self::OneSecond => "1 S",
+            Self::TwoSeconds => "2 S",
+            Self::FiveSeconds => "5 S",
+            Self::TenSeconds => "10 S",
+        }
+    }
 }
 
 impl UiPrefs {
@@ -135,6 +307,18 @@ mod tests {
             audio_device: Some("Speakers".to_owned()),
             audio_rate_hz: Some(44_100),
             audio_buffer_frames: Some(512),
+            project_folder: Some("/tmp/songs".to_owned()),
+            autosave: Autosave::TwoMinutes,
+            disable_backups: true,
+            skip_dirty_confirmation: true,
+            light_ground: true,
+            reduced_motion: true,
+            cursor_energy: CursorEnergy::High,
+            hide_tooltips: true,
+            export_format: ExportFormat::Float32,
+            export_rate_hz: Some(96_000),
+            export_tail: ExportTail::FiveSeconds,
+            recent_exports: vec!["/tmp/mix.wav".to_owned()],
         };
         let back = UiPrefs::from_ron_or_default(&prefs.to_ron().unwrap());
         assert_eq!(prefs, back);
@@ -152,6 +336,9 @@ mod tests {
         // visible rather than with the app apparently missing its chrome.
         assert!(!prefs.browser_hidden);
         assert!(!prefs.lower_hidden);
+        assert_eq!(prefs.autosave, Autosave::FiveMinutes);
+        assert_eq!(prefs.export_format, ExportFormat::Int24);
+        assert_eq!(prefs.export_tail, ExportTail::TwoSeconds);
     }
 
     /// A file written by a NEWER build carries fields we do not know.
