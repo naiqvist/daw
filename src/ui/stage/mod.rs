@@ -25,6 +25,7 @@ mod arrangement;
 mod browser;
 mod chain;
 mod document;
+mod faces;
 mod grid;
 mod keymap;
 mod mixer;
