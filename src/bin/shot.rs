@@ -128,7 +128,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut subject = Subject::default();
     let mut jobs = Vec::new();
     let mut screen_regions = Vec::new();
-    for _ in 0..2 {
+    let key_frames = posed_key_frames(&which);
+    for pass in 0..(2 + key_frames.len()) {
         // A pose named `-full` is shot as the app would look fullscreen:
         // the stage reads that from the viewport, exactly as it does in
         // the real shell, so the cut corners show.
@@ -148,6 +149,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     egui::vec2(logical_w, logical_h),
                 )),
                 viewports,
+                // A pose may need KEYS: the sequencer's grammar reads
+                // egui's input directly rather than taking an intent, so
+                // a selection can only be posed by pressing for it. One
+                // frame per key, then the two passes that draw.
+                events: key_frames.get(pass).cloned().unwrap_or_default(),
                 ..Default::default()
             },
             |ui| {
@@ -318,6 +324,40 @@ fn posed_history(hot: f32) -> daw::ui::device::scope::History {
 /// Intents rather than keystrokes: the harness has no keyboard, and the
 /// intent vocabulary is the same thing a key would have produced — so a
 /// shot is of the surface the keys reach, not of a back door into it.
+/// The keys a pose presses before it is drawn.
+///
+/// Only for the harness. The sequencer's grammar consumes egui input
+/// where it stands, so a state the keyboard reaches — a selection, a
+/// sentence in progress — cannot be posed any other way.
+fn posed_key_frames(which: &str) -> Vec<Vec<egui::Event>> {
+    let press = |key: egui::Key, modifiers: egui::Modifiers| {
+        [true, false].map(move |pressed| egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed,
+            repeat: false,
+            modifiers,
+        })
+    };
+    // One FRAME per key, because the grammar takes at most one key from
+    // a frame — the same discipline the real keyboard has.
+    let mut frames: Vec<Vec<egui::Event>> = Vec::new();
+    if which.contains("-select") {
+        // X goes down and STAYS down: extension is read from that key's
+        // state, not from a modifier. Then three cells of travel.
+        frames.push(
+            press(egui::Key::X, egui::Modifiers::NONE)
+                .into_iter()
+                .take(1)
+                .collect(),
+        );
+        for _ in 0..3 {
+            frames.push(press(egui::Key::ArrowRight, egui::Modifiers::NONE).to_vec());
+        }
+    }
+    frames
+}
+
 /// A block of telemetry a section might plausibly have measured, so a
 /// headless shot can show a card WORKING rather than parked.
 ///

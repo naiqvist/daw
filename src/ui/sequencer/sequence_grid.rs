@@ -51,6 +51,13 @@ const GRAT_TICK: f32 = 4.0;
 const RULER_MAJOR: f32 = 9.0;
 const RULER_MEDIUM: f32 = 6.0;
 const RULER_MINOR: f32 = 3.0;
+/// How far a selected cell is lifted off the field, as a share of the
+/// content ink. Deliberately slight: the RAIL and its end stops carry
+/// the reading, and the trigs written on the field must stay the
+/// brightest thing on it.
+const SELECTION_LIFT: f32 = 0.07;
+/// How far an end stop's foot turns inward.
+const SELECTION_FOOT: f32 = 5.0;
 const ROW_GAP: f32 = space::MD;
 const STATUS_HEIGHT: f32 = 24.0;
 const ROW_ADDRESS_WIDTH: f32 = 48.0;
@@ -69,7 +76,7 @@ const BAR_FILL: u8 = 24;
 const NOTE_Y_INSET: f32 = space::XXS;
 /// How far a wash lifts what is under it, toward the figure.
 const CURSOR_WASH: u8 = 14;
-const SELECTION_WASH: u8 = 8;
+const HOVER_WASH: u8 = 8;
 /// The present moment's own width. A hairline would be lost against a
 /// lit cell; wider than this and it stops being a moment.
 const PLAYHEAD_W: f32 = 2.0;
@@ -488,7 +495,8 @@ impl SequenceGrid {
                 let tick = step * step_ticks;
                 draw_ground(&cells, rect, tick, ground);
                 if self.range_selected(tick, step_ticks) {
-                    cells.rect_filled(rect, 0.0, wash(SELECTION_WASH, ground));
+                    let (opens, closes) = self.run_edges(tick, step_ticks);
+                    draw_selection(&cells, rect, opens, closes, ground);
                 }
                 if response.hovered() && self.cursor_step != step {
                     // The pointer's presence is a tint, not an outline: a
@@ -496,7 +504,7 @@ impl SequenceGrid {
                     cells.add(egui::Shape::rect_filled(
                         rect,
                         0.0,
-                        wash(SELECTION_WASH, ground),
+                        wash(HOVER_WASH, ground),
                     ));
                 }
                 self.draw_cell_events(&cells, rect, clip, lens, step, ground);
@@ -1508,6 +1516,23 @@ impl SequenceGrid {
         self.select_range(tick, tick.saturating_add(span), selected);
     }
 
+    /// Whether the selected cell at `tick` OPENS a run and whether it
+    /// CLOSES one — the two facts a bracket needs.
+    ///
+    /// Asked of the selection itself rather than of the row, so a run
+    /// that carries on to the next line gets one mark at its true start
+    /// and one at its true end, and the lines between it are plain
+    /// rail. That is what a reader needs to know: not where the drawing
+    /// wrapped, but where the interval begins and ends.
+    fn run_edges(&self, tick: usize, span: usize) -> (bool, bool) {
+        if !self.range_selected(tick, span) {
+            return (false, false);
+        }
+        let opens = tick < span || !self.range_selected(tick - span, span);
+        let closes = !self.range_selected(tick + span, span);
+        (opens, closes)
+    }
+
     fn selected_cells(&self, span: usize) -> Vec<usize> {
         (0..self.steps())
             .map(|step| step * span)
@@ -1975,6 +2000,74 @@ fn draw_ground(painter: &egui::Painter, rect: egui::Rect, tick: usize, ground: P
     }
 }
 
+/// THE SPAN: a selection is an INTERVAL, so it is marked the way an
+/// interval is marked on a chart — a rail along the run with an end
+/// stop at each end of it — and not by tinting cells one at a time.
+///
+/// A tint says "these"; a bracket says "from here to here", which is
+/// the fact the hand has just stated and the one a wash cannot carry.
+/// It also has to differ from the pointer's tint, which is the same
+/// gesture at a glance and means nothing at all.
+///
+/// The cells inside are lifted in CONTENT ink rather than structure
+/// ink: everywhere else on this surface the ruling is structure, but a
+/// selected address is something the hand has hold of, and those are
+/// drawn in the ink the hand's own marks use.
+fn draw_selection(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    opens: bool,
+    closes: bool,
+    ground: Polarity,
+) {
+    let ink = crate::design::Alphabet::for_polarity(ground).ink.color;
+    // The band takes the gap either side, so a run reads as one
+    // continuous interval rather than as a row of lozenges.
+    let band = egui::Rect::from_min_max(
+        egui::pos2(rect.left() - CELL_GAP * 0.5, rect.top()),
+        egui::pos2(rect.right() + CELL_GAP * 0.5, rect.bottom()),
+    );
+    let mut shapes = vec![egui::Shape::rect_filled(
+        band,
+        0.0,
+        ink.gamma_multiply(SELECTION_LIFT),
+    )];
+    // The rail along the head of the run.
+    let rail = rect.top() + 2.5;
+    circuit::trace(
+        &mut shapes,
+        &[
+            egui::pos2(band.left(), rail),
+            egui::pos2(band.right(), rail),
+        ],
+        Weight::Heavy,
+        ink,
+    );
+    // The end stops: a full-height post with a foot turned inward, so
+    // the two ends of a run are told apart from its middle at a glance.
+    for (at, x, inward) in [
+        (opens, band.left() + 0.5, 1.0f32),
+        (closes, band.right() - 0.5, -1.0),
+    ] {
+        if !at {
+            continue;
+        }
+        circuit::trace(
+            &mut shapes,
+            &[
+                egui::pos2(x, rail - 2.0),
+                egui::pos2(x, rect.bottom()),
+                egui::pos2(x + inward * SELECTION_FOOT, rect.bottom()),
+            ],
+            Weight::Heavy,
+            ink,
+        );
+    }
+    for shape in shapes {
+        painter.add(shape);
+    }
+}
+
 /// The zoom as a sign on the status line: silent at one, `×2` and up
 /// beyond it. A magnification the eye cannot see stated is a trap.
 fn zoom_sign(zoom: usize) -> String {
@@ -2138,6 +2231,106 @@ pub(crate) fn draw_cursor(
 mod tests {
     use super::*;
     use crate::sequencing::PATTERN_STEPS;
+
+    /// The whole of it, spoken: X opens a run at the cursor, held
+    /// arrows extend it, and the drawing is handed one head and one
+    /// tail for the interval — not four separate cells.
+    #[test]
+    fn selecting_and_extending_makes_one_run_with_two_ends() {
+        let notes = [];
+        let clip = one_note_clip(&notes);
+        let mut grid = SequenceGrid::default();
+        let span = grid.resolution.step_ticks();
+        let mut registers = Registers::default();
+        assert!(!grid.has_selection(), "a fresh grid has nothing selected");
+
+        // X on the cursor's cell.
+        utter_on(
+            &mut grid,
+            &mut registers,
+            Some(clip),
+            Some(Verb::Select),
+            None,
+            1,
+        );
+        assert!(
+            grid.has_selection(),
+            "X selected nothing: {:?}",
+            grid.refusal
+        );
+        assert_eq!(
+            grid.run_edges(0, span),
+            (true, true),
+            "one cell is both ends"
+        );
+
+        // Arrows WITH THE SELECT KEY HELD widen it to four cells: one
+        // head, two plain, one tail. The gesture is X held, not a
+        // modifier — the grid reads that key's state directly.
+        for _ in 0..3 {
+            utter_selecting(&mut grid, Some(clip), Motion::Right, 1);
+        }
+        let selected: Vec<usize> = (0..8)
+            .map(|step| step * span)
+            .filter(|tick| grid.range_selected(*tick, span))
+            .collect();
+        assert_eq!(selected.len(), 4, "the run is {selected:?}");
+        assert_eq!(grid.run_edges(selected[0], span), (true, false));
+        assert_eq!(grid.run_edges(selected[1], span), (false, false));
+        assert_eq!(grid.run_edges(selected[3], span), (false, true));
+        // Letting the SELECT key go is what drops the anchor, and
+        // that is read in `keyboard` from the key's own state rather
+        // than spoken here, so it is not this layer's to assert.
+    }
+
+    /// A selection is drawn as an INTERVAL, so the drawing has to know
+    /// where each run begins and ends. Asked of the selection rather
+    /// than of the row, a run that carries on to the next line keeps one
+    /// mark at its true start and one at its true end.
+    #[test]
+    fn a_run_knows_where_it_opens_and_where_it_closes() {
+        let mut grid = SequenceGrid::default();
+        let span = grid.resolution.step_ticks();
+        // Steps 2, 3 and 4 selected: one run, three cells.
+        for step in 2..5 {
+            for tick in step * span..(step + 1) * span {
+                grid.selected_ticks[tick] = true;
+            }
+        }
+        assert_eq!(grid.run_edges(2 * span, span), (true, false), "the head");
+        assert_eq!(grid.run_edges(3 * span, span), (false, false), "the middle");
+        assert_eq!(grid.run_edges(4 * span, span), (false, true), "the tail");
+        // An unselected cell is neither.
+        assert_eq!(grid.run_edges(5 * span, span), (false, false));
+        assert_eq!(grid.run_edges(0, span), (false, false));
+
+        // A lone cell is both ends of its own run.
+        let mut one = SequenceGrid::default();
+        for tick in 9 * span..10 * span {
+            one.selected_ticks[tick] = true;
+        }
+        assert_eq!(one.run_edges(9 * span, span), (true, true));
+
+        // Two runs with a hole between them are two runs, not one.
+        let mut two = SequenceGrid::default();
+        for step in [1usize, 2, 6, 7] {
+            for tick in step * span..(step + 1) * span {
+                two.selected_ticks[tick] = true;
+            }
+        }
+        assert_eq!(two.run_edges(1 * span, span), (true, false));
+        assert_eq!(two.run_edges(2 * span, span), (false, true));
+        assert_eq!(two.run_edges(6 * span, span), (true, false));
+        assert_eq!(two.run_edges(7 * span, span), (false, true));
+
+        // A run that reaches the first cell opens there rather than
+        // asking about a tick that does not exist.
+        let mut edge = SequenceGrid::default();
+        for tick in 0..span {
+            edge.selected_ticks[tick] = true;
+        }
+        assert_eq!(edge.run_edges(0, span), (true, true));
+    }
 
     #[test]
     fn horizontal_cursor_wraps_through_rows_and_pattern_end() {
@@ -2419,6 +2612,32 @@ mod tests {
             ghosts: &[],
             slicing: false,
         }
+    }
+
+    /// Spoken while the SELECT key is held down, which is what extends a
+    /// run: the grid reads X's key state, not a modifier.
+    fn utter_selecting(
+        grid: &mut SequenceGrid,
+        clip: Option<ClipView<'_>>,
+        motion: Motion,
+        count: usize,
+    ) -> Vec<Intent> {
+        let mut registers = Registers::default();
+        let mut intents = Vec::new();
+        grid.refusal = None;
+        grid.speak(
+            Utterance {
+                count,
+                verb: None,
+                motion: Some(motion),
+                held: false,
+            },
+            true,
+            &mut registers,
+            clip,
+            &mut intents,
+        );
+        intents
     }
 
     fn utter_held(
