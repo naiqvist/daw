@@ -27,8 +27,11 @@ pub mod four;
 pub mod grit;
 pub mod hit;
 pub mod out;
+pub mod phase;
 pub mod preamp;
+pub mod ring;
 pub mod shine;
+pub mod smear;
 pub mod split;
 pub mod tone;
 pub mod vca;
@@ -131,6 +134,9 @@ pub fn core_of(params: &SectionParams, sample_rate: f32, block: usize) -> Box<dy
         SectionKind::Four => Box::new(four::FourCore::new(params, sample_rate, block)),
         SectionKind::Shine => Box::new(shine::ShineCore::new(params, sample_rate, block)),
         SectionKind::Out => Box::new(out::OutCore::new(params, sample_rate, block)),
+        SectionKind::Phase => Box::new(phase::PhaseCore::new(params, sample_rate, block)),
+        SectionKind::Smear => Box::new(smear::SmearCore::new(params, sample_rate, block)),
+        SectionKind::Ring => Box::new(ring::RingCore::new(params, sample_rate, block)),
         _ => Box::new(Wire::new(params)),
     }
 }

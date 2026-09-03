@@ -8573,6 +8573,16 @@ pub mod console {
         pub const FEEDBACK: u32 = 3;
         pub const OFFSET: u32 = 4;
 
+        /// How many allpass sections each position runs.
+        pub const STAGE_COUNTS: [u32; 6] = [2, 4, 6, 8, 12, 16];
+        /// The sweep's ends, in Hz: the notches walk between them.
+        pub const LOW_HZ: f32 = 200.0;
+        pub const HIGH_HZ: f32 = 6_000.0;
+        /// The allpass sections' Q — the phaser's resonance.
+        pub const STAGE_Q: f32 = 0.7;
+        /// The feedback path's soft top, so a fed-back phaser sings.
+        pub const FEEDBACK_KNEE: f32 = 0.8;
+
         pub const TABLE: &[ParamDef] = &[
             ParamDef {
                 id: 0,
@@ -8593,7 +8603,7 @@ pub mod console {
                 name: "Depth",
                 min: 0.0,
                 max: 100.0,
-                default: 60.0,
+                default: 0.0,
             },
             ParamDef {
                 id: 3,
@@ -8618,13 +8628,17 @@ pub mod console {
         pub const AMOUNT: u32 = 0;
         pub const CENTRE: u32 = 1;
 
+        /// The allpass sections' Q: high, so each one's phase turns
+        /// sharply and the smear is a chirp rather than a wash.
+        pub const STAGE_Q: f32 = 1.2;
+
         pub const TABLE: &[ParamDef] = &[
             ParamDef {
                 id: 0,
                 name: "Amount",
                 min: 0.0,
                 max: 32.0,
-                default: 8.0,
+                default: 0.0,
             },
             ParamDef {
                 id: 1,
@@ -8643,6 +8657,16 @@ pub mod console {
         pub const HZ: u32 = 1;
         pub const HOLD_RATE: u32 = 2;
         pub const MIX: u32 = 3;
+
+        pub const SINE: u32 = 0;
+        pub const TRIANGLE: u32 = 1;
+        pub const SQUARE: u32 = 2;
+        pub const NOISE: u32 = 3;
+        /// How far the sample-and-hold walks the carrier, in octaves.
+        pub const HOLD_OCTAVES: f32 = 1.5;
+        /// The noise carrier's band: a low-pass, so it is a hiss
+        /// modulator and not a bit crusher.
+        pub const NOISE_HZ: f32 = 3_000.0;
 
         pub const TABLE: &[ParamDef] = &[
             ParamDef {
@@ -8671,7 +8695,7 @@ pub mod console {
                 name: "Mix",
                 min: 0.0,
                 max: 100.0,
-                default: 50.0,
+                default: 0.0,
             },
         ];
     }
