@@ -41,8 +41,9 @@ fn luma(colour: vec3<f32>) -> f32 {
 }
 
 // Integer noise keeps the grain pixel-sharp. There is no blurred noise
-// texture stretched over the panel: every value belongs to one screen pixel
-// and one compositor frame.
+// texture stretched over the panel: every value belongs to one screen pixel.
+// The address is deliberately time-independent so the grain stays fixed to
+// the glass instead of crawling from frame to frame.
 fn hash_u32(value: u32) -> u32 {
     var x = value;
     x = x ^ (x >> 16u);
@@ -52,8 +53,8 @@ fn hash_u32(value: u32) -> u32 {
     return x ^ (x >> 16u);
 }
 
-fn analog_noise(pixel: vec2<u32>, tick: u32) -> f32 {
-    let seed = pixel.x * 0x9e3779b9u ^ pixel.y * 0x85ebca6bu ^ tick * 0xc2b2ae35u;
+fn analog_noise(pixel: vec2<u32>) -> f32 {
+    let seed = pixel.x * 0x9e3779b9u ^ pixel.y * 0x85ebca6bu ^ 0xc2b2ae35u;
     return f32(hash_u32(seed) & 0x00ffffffu) / 16777215.0;
 }
 
@@ -69,13 +70,12 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let pixel = vec2<f32>(1.0) / dimensions;
     let screen_pixel = floor(in.uv * dimensions);
     let pixel_address = vec2<u32>(screen_pixel);
-    let tick = u32(in.state.z);
 
     // A real analogue line occasionally loses horizontal lock for one pixel.
     // It is a hard, short displacement rather than a soft deformation of the
     // whole aperture. A second seed keeps left and right equally likely.
-    let line_seed = analog_noise(vec2<u32>(0u, pixel_address.y), tick / 2u);
-    let direction_seed = analog_noise(vec2<u32>(pixel_address.y, 19u), tick / 3u);
+    let line_seed = analog_noise(vec2<u32>(0u, pixel_address.y));
+    let direction_seed = analog_noise(vec2<u32>(pixel_address.y, 19u));
     let line_direction = select(-1.0, 1.0, direction_seed > 0.5);
     let line_kick = select(0.0, line_direction, line_seed > 0.995);
     let safe_min = in.rect.xy + pixel * 0.5;
@@ -108,7 +108,9 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     beam += emission(signal_uv + vec2<f32>( 0.0,  2.0) * pixel, in.rect) * 0.07;
     beam += emission(signal_uv + vec2<f32>( 0.0, -2.0) * pixel, in.rect) * 0.07;
 
-    let scanline = select(0.76, 1.0, (u32(screen_pixel.y) & 1u) == 0u);
+    // Nearly latent scanlines: enough to break a perfectly digital fill at
+    // close range, but not enough to stripe the interface at normal size.
+    let scanline = select(0.975, 1.0, (u32(screen_pixel.y) & 1u) == 0u);
     let triad = u32(screen_pixel.x) % 3u;
     let mask = vec3<f32>(
         select(0.86, 1.0, triad == 0u),
@@ -142,9 +144,9 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     // Fine luma grain lives mostly in the phosphor, with just enough in the
     // black floor to make the glass feel electrically awake. A rare bright
     // row is the screen's horizontal interference, never a panel-wide wash.
-    let grain = analog_noise(pixel_address, tick) - 0.5;
+    let grain = analog_noise(pixel_address) - 0.5;
     let grain_level = 0.005 + min(luminance * 0.018, 0.018) + activity * 0.003;
-    let interference_seed = analog_noise(vec2<u32>(31u, pixel_address.y), tick);
+    let interference_seed = analog_noise(vec2<u32>(31u, pixel_address.y));
     let interference = select(0.0, 0.020 + activity * 0.010, interference_seed > 0.996);
     let noise_tint = vec3<f32>(0.72, 1.0, 0.91);
 

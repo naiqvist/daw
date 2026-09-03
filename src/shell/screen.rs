@@ -83,12 +83,7 @@ struct GpuRegion {
     state: [f32; 4],
 }
 
-fn gpu_regions(
-    regions: &[Region],
-    size: [u32; 2],
-    pixels_per_point: f32,
-    noise_frame: u32,
-) -> Vec<GpuRegion> {
+fn gpu_regions(regions: &[Region], size: [u32; 2], pixels_per_point: f32) -> Vec<GpuRegion> {
     if size[0] == 0 || size[1] == 0 || !pixels_per_point.is_finite() || pixels_per_point <= 0.0 {
         return Vec::new();
     }
@@ -108,12 +103,7 @@ fn gpu_regions(
             }
             Some(GpuRegion {
                 rect: [left, top, right, bottom],
-                state: [
-                    region.state.activity,
-                    region.state.phase,
-                    noise_frame as f32,
-                    0.0,
-                ],
+                state: [region.state.activity, region.state.phase, 0.0, 0.0],
             })
         })
         .collect()
@@ -126,8 +116,6 @@ pub struct Pass {
     sampler: wgpu::Sampler,
     regions: wgpu::Buffer,
     bind: Option<(wgpu::BindGroup, u64)>,
-    /// A short wrapping clock for temporal phosphor grain.
-    frame: u32,
 }
 
 impl Pass {
@@ -212,7 +200,6 @@ impl Pass {
             sampler,
             regions,
             bind: None,
-            frame: 0,
         }
     }
 
@@ -257,12 +244,7 @@ impl Pass {
         if size[0] == 0 || size[1] == 0 {
             return;
         }
-        // A small modulus stays exactly representable after conversion to
-        // f32. The shader uses it only as a noise seed, not as displayed
-        // information or musical time.
-        let noise_frame = self.frame % 4096;
-        self.frame = self.frame.wrapping_add(1);
-        let gpu = gpu_regions(regions, size, pixels_per_point, noise_frame);
+        let gpu = gpu_regions(regions, size, pixels_per_point);
         if gpu.is_empty() {
             return;
         }
@@ -336,18 +318,18 @@ mod tests {
                 state: State::new(0.75, 0.8),
             },
         ];
-        let gpu = gpu_regions(&regions, [400, 300], 2.0, 17);
+        let gpu = gpu_regions(&regions, [400, 300], 2.0);
         assert_eq!(gpu.len(), 2);
         assert_eq!(gpu[0].rect, [0.05, 2.0 / 15.0, 0.55, 0.8]);
-        assert_eq!(gpu[0].state, [0.2, 0.25, 17.0, 0.0]);
+        assert_eq!(gpu[0].state, [0.2, 0.25, 0.0, 0.0]);
         assert_eq!(gpu[1].rect, [0.75, 4.0 / 15.0, 0.95, 0.6]);
-        assert_eq!(gpu[1].state, [0.8, 0.75, 17.0, 0.0]);
+        assert_eq!(gpu[1].state, [0.8, 0.75, 0.0, 0.0]);
         assert_ne!(gpu[0].rect, [0.0, 0.0, 1.0, 1.0]);
         assert_ne!(gpu[1].rect, [0.0, 0.0, 1.0, 1.0]);
     }
 
     #[test]
     fn absent_screens_produce_no_crt_draws() {
-        assert!(gpu_regions(&[], [1280, 800], 1.0, 0).is_empty());
+        assert!(gpu_regions(&[], [1280, 800], 1.0).is_empty());
     }
 }

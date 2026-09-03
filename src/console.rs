@@ -302,6 +302,13 @@ impl SectionKind {
         }
     }
 
+    /// Whether the section draws every one of its parameters as an
+    /// instrument on its own glass, and so needs no table of names and
+    /// numbers under them.
+    pub fn owns_its_glass(self) -> bool {
+        matches!(self, SectionKind::Preamp | SectionKind::Tone)
+    }
+
     /// Where on the strip this section stands, or `None` for a bus,
     /// mix or return section.
     pub fn strip_index(self) -> Option<usize> {

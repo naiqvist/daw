@@ -47,13 +47,43 @@ pub fn joint_y(rect: egui::Rect) -> f32 {
 }
 
 /// The width of a piece for `kind`.
+///
+/// Every section has its own, because a desk is not a row of identical
+/// modules: what a section needs to show decides how much face it gets,
+/// and a run of pieces that are all one width reads as a table rather
+/// than as a machine. The JOINT does not vary — that is what lets any
+/// two of them mate — so the shapes can differ as much as they like.
 pub fn width_of(kind: SectionKind) -> f32 {
-    if kind == SectionKind::Preamp {
-        return PREAMP_W;
-    }
-    match kind.width() {
-        Width::Narrow => NARROW_W,
-        Width::Wide => CHAIN_W,
+    match kind {
+        // The channel's own stages.
+        SectionKind::Preamp => PREAMP_W,
+        SectionKind::Tone => 212.0,
+        SectionKind::Door => 176.0,
+        SectionKind::Cut => 188.0,
+        SectionKind::Hit => 152.0,
+        SectionKind::Pump => 160.0,
+        SectionKind::Grit => 172.0,
+        SectionKind::Shine => 148.0,
+        SectionKind::Phase => 180.0,
+        SectionKind::Smear => 156.0,
+        SectionKind::Ring => 164.0,
+        SectionKind::Out => 192.0,
+        // The ones with a picture to draw.
+        SectionKind::Four => 288.0,
+        SectionKind::Vca => 272.0,
+        SectionKind::Split => 248.0,
+        SectionKind::Drive => 232.0,
+        SectionKind::Drift => 236.0,
+        SectionKind::Spectra => 264.0,
+        SectionKind::Echo => 244.0,
+        SectionKind::Room => 228.0,
+        // The desk's own.
+        SectionKind::Glue => 160.0,
+        SectionKind::Iron => 152.0,
+        SectionKind::Ceiling => 168.0,
+        SectionKind::Scope => 200.0,
+        SectionKind::Tape => 236.0,
+        SectionKind::Shadow => 220.0,
     }
 }
 
@@ -235,7 +265,7 @@ pub fn recess(rect: egui::Rect) -> egui::Rect {
 /// How tall a section's figure is at the top of its glass.
 pub fn figure_h(kind: SectionKind) -> f32 {
     match kind {
-        SectionKind::Preamp => FIGURE_MAX_H,
+        SectionKind::Preamp | SectionKind::Tone => FIGURE_MAX_H,
         _ => 30.0,
     }
 }
@@ -604,7 +634,7 @@ impl Stage {
         let screen = painter.with_clip_rect(shown);
         let figure = figure_rect(rect, piece.kind);
         if is_in {
-            let face = if piece.kind == SectionKind::Preamp {
+            let face = if piece.kind.owns_its_glass() {
                 glass
             } else {
                 figure
@@ -625,7 +655,9 @@ impl Stage {
         // inverse block; a wide piece's gauges as runs of cells.
         // PREAMP's five parameters are already the five instruments on
         // its face, so it has no second, generic table under them.
-        let rows_shown = if piece.kind == SectionKind::Preamp {
+        // A section that owns its glass has drawn every parameter as an
+        // instrument already, so it gets no second, generic table.
+        let rows_shown = if piece.kind.owns_its_glass() {
             0
         } else {
             rows_shown
@@ -1015,6 +1047,110 @@ fn preamp_face(glass: egui::Rect) -> PreampFace {
     }
 }
 
+/// TONE's three bands, each its own hue, so a glance says which lever
+/// is which without a word being written. Warm at the bottom, violet
+/// in the middle, the deck's own live cyan at the top: the order a
+/// spectrum is drawn in everywhere.
+const TONE_LO_INK: egui::Color32 = egui::Color32::from_rgb(255, 138, 62);
+const TONE_MID_INK: egui::Color32 = egui::Color32::from_rgb(186, 122, 255);
+const TONE_HI_INK: egui::Color32 = egui::Color32::from_rgb(139, 245, 255);
+
+/// How many squares a band lights at full boost or full cut, and so
+/// how much each one is worth.
+const TONE_CELLS: usize = 6;
+/// The face's frequency span, in Hz: what the horizontal axis means.
+const TONE_LOW_HZ: f32 = 30.0;
+const TONE_HIGH_HZ: f32 = 18_000.0;
+
+/// Where `hz` falls across `field`, by octaves rather than by hertz —
+/// which is how the ear reads a spectrum and how the band that moves
+/// should move.
+fn tone_x(field: egui::Rect, hz: f32) -> f32 {
+    let span = (TONE_HIGH_HZ / TONE_LOW_HZ).log2();
+    let at = (hz.max(1.0) / TONE_LOW_HZ).log2() / span;
+    egui::lerp(field.x_range(), at.clamp(0.0, 1.0))
+}
+
+/// TONE's seven parameters as seven places on the glass. Authored
+/// together, so the key that addresses one and the art that answers
+/// cannot drift apart.
+#[derive(Clone, Copy, Debug)]
+struct ToneFace {
+    /// The whole picture: the curve's field and the bands' ground.
+    field: egui::Rect,
+    /// One column per band, the middle one wherever its frequency
+    /// puts it.
+    columns: [egui::Rect; 3],
+    /// The rail the middle band slides along, and the kill pads.
+    sweep: egui::Rect,
+    kills: [egui::Rect; 3],
+}
+
+impl ToneFace {
+    fn controls(self) -> [(u32, egui::Rect); 7] {
+        use crate::params::console::tone as p;
+        [
+            (p::LO, self.columns[0]),
+            (p::MID, self.columns[1]),
+            (p::HI, self.columns[2]),
+            (p::MID_HZ, self.sweep),
+            (p::KILL_LO, self.kills[0]),
+            (p::KILL_MID, self.kills[1]),
+            (p::KILL_HI, self.kills[2]),
+        ]
+    }
+
+    fn control(self, param: usize) -> Option<egui::Rect> {
+        self.controls()
+            .into_iter()
+            .find_map(|(id, rect)| (id as usize == param).then_some(rect))
+    }
+}
+
+/// Where everything stands, given the glass and where the middle band
+/// has been swept to.
+fn tone_face(glass: egui::Rect, mid_hz: f32) -> ToneFace {
+    use crate::params::console::tone as p;
+    let inner = glass.shrink2(egui::vec2(6.0, 4.0));
+    let kill_h = 12.0;
+    let sweep_h = 9.0;
+    let field = egui::Rect::from_min_max(
+        inner.min,
+        egui::pos2(
+            inner.right(),
+            (inner.bottom() - kill_h - sweep_h - 6.0).max(inner.top() + 20.0),
+        ),
+    );
+    let sweep = egui::Rect::from_min_max(
+        egui::pos2(inner.left(), field.bottom() + 3.0),
+        egui::pos2(inner.right(), field.bottom() + 3.0 + sweep_h),
+    );
+    let column_w = (field.width() * 0.18).clamp(14.0, 34.0);
+    let column = |hz: f32| {
+        let x = tone_x(field, hz).clamp(
+            field.left() + column_w * 0.5,
+            field.right() - column_w * 0.5,
+        );
+        egui::Rect::from_min_max(
+            egui::pos2(x - column_w * 0.5, field.top()),
+            egui::pos2(x + column_w * 0.5, field.bottom()),
+        )
+    };
+    let columns = [column(p::LO_HZ), column(mid_hz), column(p::HI_HZ)];
+    let kills = columns.map(|c| {
+        egui::Rect::from_min_max(
+            egui::pos2(c.center().x - kill_h * 0.5, sweep.bottom() + 3.0),
+            egui::pos2(c.center().x + kill_h * 0.5, sweep.bottom() + 3.0 + kill_h),
+        )
+    });
+    ToneFace {
+        field,
+        columns,
+        sweep,
+        kills,
+    }
+}
+
 fn mix_ink(a: egui::Color32, b: egui::Color32, amount: f32) -> egui::Color32 {
     let amount = amount.clamp(0.0, 1.0);
     let channel =
@@ -1046,6 +1182,7 @@ impl Stage {
             SectionKind::Preamp => {
                 self.draw_preamp_figure(painter, piece, column, glass, selected, level, phase)
             }
+            SectionKind::Tone => self.draw_tone_figure(painter, piece, glass, selected, phase),
             _ => {
                 painter.text(
                     glass.center(),
@@ -1055,6 +1192,250 @@ impl Stage {
                     alpha.edge.color,
                 );
             }
+        }
+    }
+
+    /// TONE: three bands, three hues, and no words.
+    ///
+    /// Each band is a stack of SQUARES standing on the zero line —
+    /// lit upward for a boost, downward for a cut, one square for
+    /// every two and a half dB. The middle band's stack SLIDES along
+    /// the face to wherever its frequency is set, so sweeping it is
+    /// watching the band walk up the spectrum rather than watching a
+    /// number climb. Under each stack is its kill pad, which fills
+    /// with the band's own hue when the band is gone; and behind all
+    /// three, faintly, is the response the engine is actually running,
+    /// computed from the same coefficients, so what is drawn is what
+    /// is heard.
+    ///
+    /// Nothing here is labelled. A square that is lit is a decibel
+    /// that is happening.
+    fn draw_tone_figure(
+        &self,
+        painter: &egui::Painter,
+        piece: Piece,
+        glass: egui::Rect,
+        selected: Option<usize>,
+        phase: Phase,
+    ) {
+        use crate::params::console::tone as p;
+        let alpha = self.alphabet();
+        let edge = alpha.edge.color;
+        let (_, id) = self.band_device(piece.index).unzip();
+        let device = id.and_then(|id| self.song.device(id));
+        let value = |param: u32| device.map_or(0.0, |device| device.value(param));
+        let gains = [value(p::LO), value(p::MID), value(p::HI)];
+        let kills = [
+            value(p::KILL_LO) >= 0.5,
+            value(p::KILL_MID) >= 0.5,
+            value(p::KILL_HI) >= 0.5,
+        ];
+        let inks = [TONE_LO_INK, TONE_MID_INK, TONE_HI_INK];
+
+        // The swept band walks rather than jumps.
+        let mid_hz = painter.ctx().animate_value_with_time(
+            egui::Id::new(("stage-tone-mid", piece.index)),
+            value(p::MID_HZ),
+            0.16,
+        );
+        let face = tone_face(glass, mid_hz.max(1.0));
+        let mut shapes = Vec::new();
+
+        // The ground: a hairline lattice, the zero line bright across
+        // the middle, and a tick at each decade so the axis is a
+        // spectrum and not a strip.
+        circuit::lattice(
+            &mut shapes,
+            face.field,
+            design::px(design::space::ROOM),
+            edge.gamma_multiply(0.4),
+        );
+        let zero_y = face.field.center().y;
+        circuit::trace(
+            &mut shapes,
+            &[
+                egui::pos2(face.field.left(), zero_y),
+                egui::pos2(face.field.right(), zero_y),
+            ],
+            Weight::Hair,
+            edge.gamma_multiply(1.2),
+        );
+        for hz in [100.0, 1_000.0, 10_000.0] {
+            let x = tone_x(face.field, hz);
+            circuit::trace(
+                &mut shapes,
+                &[
+                    egui::pos2(x, face.field.bottom() - 3.0),
+                    egui::pos2(x, face.field.bottom()),
+                ],
+                Weight::Hair,
+                edge.gamma_multiply(0.8),
+            );
+        }
+
+        // The response the engine is running, drawn from its own
+        // coefficients: the one line on the face that is measured
+        // rather than set.
+        let shape = device.map(|device| {
+            let mut params = crate::console::SectionParams::of(crate::console::SectionKind::Tone);
+            for (id, value) in &device.overrides {
+                params.set(*id, *value);
+            }
+            crate::console::tone_curve::Shape::of(&params)
+        });
+        if let Some(shape) = shape {
+            let sample_rate = 48_000.0;
+            let curve: Vec<egui::Pos2> = (0..=48)
+                .map(|i| {
+                    let at = i as f32 / 48.0;
+                    let hz = TONE_LOW_HZ * (TONE_HIGH_HZ / TONE_LOW_HZ).powf(at);
+                    let db = crate::console::tone_curve::response_db(&shape, sample_rate, hz);
+                    egui::pos2(
+                        egui::lerp(face.field.x_range(), at),
+                        zero_y - (db / 18.0).clamp(-1.0, 1.0) * face.field.height() * 0.46,
+                    )
+                })
+                .collect();
+            circuit::trace(&mut shapes, &curve, Weight::Hair, alpha.ink.color);
+        }
+
+        // The three stacks.
+        let cell_pitch = (face.field.height() * 0.46 / TONE_CELLS as f32).min(17.0);
+        let cell = (cell_pitch - 3.0)
+            .max(5.0)
+            .min(face.columns[0].width() - 2.0);
+        for band in 0..3 {
+            let column = face.columns[band];
+            let ink = inks[band];
+            let x = column.center().x;
+            let lit = painter.ctx().animate_value_with_time(
+                egui::Id::new(("stage-tone-band", piece.index, band)),
+                (gains[band] / 15.0).clamp(-1.0, 1.0),
+                0.14,
+            );
+            let killed = kills[band];
+            // The post the squares stand on.
+            circuit::trace(
+                &mut shapes,
+                &[
+                    egui::pos2(x, zero_y - cell_pitch * TONE_CELLS as f32),
+                    egui::pos2(x, zero_y + cell_pitch * TONE_CELLS as f32),
+                ],
+                Weight::Hair,
+                edge.gamma_multiply(if killed { 0.4 } else { 0.7 }),
+            );
+            for step in 1..=TONE_CELLS {
+                let reach = step as f32 / TONE_CELLS as f32;
+                for up in [true, false] {
+                    let awake = !killed
+                        && if up {
+                            lit > 0.0 && reach <= lit + 0.001
+                        } else {
+                            lit < 0.0 && reach <= -lit + 0.001
+                        };
+                    let y = if up {
+                        zero_y - cell_pitch * step as f32
+                    } else {
+                        zero_y + cell_pitch * step as f32
+                    };
+                    let square =
+                        egui::Rect::from_center_size(egui::pos2(x, y), egui::Vec2::splat(cell));
+                    if awake {
+                        // A lit square is solid in the band's hue and
+                        // brighter the further out it stands, with a
+                        // wash of the same hue around it — the light a
+                        // lit thing throws on the glass beside it.
+                        shapes.push(egui::Shape::rect_filled(
+                            square.expand(2.0),
+                            0.0,
+                            ink.gamma_multiply(0.22),
+                        ));
+                        shapes.push(egui::Shape::rect_filled(
+                            square,
+                            0.0,
+                            mix_ink(ink.gamma_multiply(0.7), ink, reach),
+                        ));
+                    } else {
+                        shapes.push(egui::Shape::rect_stroke(
+                            square,
+                            0.0,
+                            egui::Stroke::new(
+                                Weight::Hair.px(),
+                                edge.gamma_multiply(if killed { 0.35 } else { 0.6 }),
+                            ),
+                            egui::StrokeKind::Inside,
+                        ));
+                    }
+                }
+            }
+            // A killed band: the stack is struck through in its own
+            // hue, which is the one mark on this face that means STOP.
+            if killed {
+                let top = zero_y - cell_pitch * TONE_CELLS as f32;
+                let bottom = zero_y + cell_pitch * TONE_CELLS as f32;
+                let arm = column.width() * 0.36;
+                for (a, b) in [
+                    (egui::pos2(x - arm, top), egui::pos2(x + arm, bottom)),
+                    (egui::pos2(x + arm, top), egui::pos2(x - arm, bottom)),
+                ] {
+                    circuit::trace(&mut shapes, &[a, b], Weight::Heavy, ink);
+                }
+            }
+        }
+
+        // The sweep rail: the middle band's own axis, with its stack's
+        // foot riding it and the two fixed bands marked as posts.
+        circuit::rail(
+            &mut shapes,
+            egui::pos2(face.sweep.left(), face.sweep.center().y),
+            egui::pos2(face.sweep.right(), face.sweep.center().y),
+            &[0.0, 0.25, 0.5, 0.75, 1.0],
+            edge.gamma_multiply(0.8),
+        );
+        for (band, ink) in [(0usize, TONE_LO_INK), (2, TONE_HI_INK)] {
+            circuit::pad(
+                &mut shapes,
+                egui::pos2(face.columns[band].center().x, face.sweep.center().y),
+                circuit::PAD - 2.0,
+                ink.gamma_multiply(0.7),
+                false,
+            );
+        }
+        let rider = egui::Rect::from_center_size(
+            egui::pos2(face.columns[1].center().x, face.sweep.center().y),
+            egui::vec2(9.0, face.sweep.height()),
+        );
+        shapes.push(egui::Shape::rect_filled(rider, 0.0, TONE_MID_INK));
+
+        // The kill pads: hollow while the band sounds, filled in its
+        // own hue the moment it does not.
+        for band in 0..3 {
+            let pad = face.kills[band];
+            if kills[band] {
+                shapes.push(egui::Shape::rect_filled(pad, 0.0, inks[band]));
+            } else {
+                shapes.push(egui::Shape::rect_stroke(
+                    pad,
+                    0.0,
+                    egui::Stroke::new(Weight::Hair.px(), inks[band].gamma_multiply(0.55)),
+                    egui::StrokeKind::Inside,
+                ));
+            }
+        }
+        painter.extend(shapes);
+
+        // The cursor: the house brackets around whichever instrument
+        // the keyboard is holding, and nothing else on the face bright.
+        if let Some(rect) = selected.and_then(|param| face.control(param)) {
+            let mut cursor = Vec::new();
+            circuit::brackets(
+                &mut cursor,
+                rect.expand(2.0),
+                6.0,
+                Weight::Bold,
+                motion::pulse_ink(alpha.live.color, alpha.ink.color, phase),
+            );
+            painter.extend(cursor);
         }
     }
 
@@ -1509,9 +1890,99 @@ impl Stage {
 mod tests {
     use super::*;
 
+    /// Every piece has its own footprint, and the joint they mate on
+    /// does not vary with it — which is what lets a run of different
+    /// shapes still snap together.
+    #[test]
+    fn every_section_has_its_own_width_and_the_same_joint() {
+        let mut seen: Vec<(SectionKind, f32)> = Vec::new();
+        for kind in SectionKind::ALL {
+            let w = width_of(kind);
+            assert!(w >= 140.0 && w <= 300.0, "{kind:?} is {w} wide");
+            seen.push((kind, w));
+        }
+        // Neighbours on the strip do not share a width: the run reads
+        // as a machine rather than as a table.
+        for pair in SectionKind::STRIP.windows(2) {
+            assert!(
+                (width_of(pair[0]) - width_of(pair[1])).abs() > 0.5,
+                "{:?} and {:?} are the same width",
+                pair[0],
+                pair[1]
+            );
+        }
+        // However wide they are, the joint is in the same place.
+        let a = egui::Rect::from_min_size(
+            egui::pos2(0.0, 40.0),
+            egui::vec2(width_of(SectionKind::Hit), 200.0),
+        );
+        let b = egui::Rect::from_min_size(
+            egui::pos2(0.0, 40.0),
+            egui::vec2(width_of(SectionKind::Four), 200.0),
+        );
+        assert_eq!(joint_y(a), joint_y(b));
+    }
+
+    /// Every TONE parameter has a place on the glass, they do not
+    /// overlap, and the middle band's stack stands where its frequency
+    /// says it does.
+    #[test]
+    fn every_tone_parameter_has_one_instrument() {
+        use crate::params::console::tone as p;
+        let glass = egui::Rect::from_min_size(egui::pos2(20.0, 60.0), egui::vec2(200.0, 190.0));
+        let face = tone_face(glass, 1_000.0);
+        let controls = face.controls();
+        for (_, rect) in controls {
+            assert!(rect.is_positive(), "an instrument has no room");
+            assert!(glass.contains_rect(rect), "an instrument left the glass");
+        }
+        for table in SectionKind::Tone.table() {
+            assert!(
+                face.control(table.id as usize).is_some(),
+                "{} has no instrument",
+                table.name
+            );
+        }
+        // The three stacks stand apart, low to high, left to right.
+        assert!(face.columns[0].right() <= face.columns[1].left());
+        assert!(face.columns[1].right() <= face.columns[2].left());
+        // And the middle one walks when it is swept.
+        let low = tone_face(glass, 250.0).columns[1].center().x;
+        let high = tone_face(glass, 5_000.0).columns[1].center().x;
+        assert!(
+            high > low + 20.0,
+            "the swept band did not move: {low} to {high}"
+        );
+        // Each kill pad stands under its own band.
+        for band in 0..3 {
+            assert!(
+                (face.kills[band].center().x - face.columns[band].center().x).abs() < 1.0,
+                "kill {band} is not under its band"
+            );
+        }
+        let _ = p::MID_HZ;
+    }
+
+    /// The face's axis is read in octaves, so a decade takes the same
+    /// room wherever it sits.
+    #[test]
+    fn the_tone_axis_is_octaves_not_hertz() {
+        let field = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(300.0, 100.0));
+        let a = tone_x(field, 100.0) - tone_x(field, 50.0);
+        let b = tone_x(field, 8_000.0) - tone_x(field, 4_000.0);
+        assert!((a - b).abs() < 0.5, "an octave is {a} here and {b} there");
+        assert!(tone_x(field, 20.0) >= field.left());
+        assert!(tone_x(field, 30_000.0) <= field.right());
+    }
+
+    /// The preamp's chassis is its own — a width and a set of corner
+    /// cuts that no neighbour shares. It is no longer the WIDEST of
+    /// them: every section is sized by what it has to show, and TONE
+    /// has a spectrum to lay three bands across.
     #[test]
     fn preamp_owns_a_distinct_chassis_footprint() {
-        assert!(width_of(SectionKind::Preamp) > width_of(SectionKind::Tone));
+        assert_ne!(width_of(SectionKind::Preamp), width_of(SectionKind::Tone));
+        assert_ne!(width_of(SectionKind::Preamp), width_of(SectionKind::Door));
         assert_ne!(cuts(SectionKind::Preamp), cuts(SectionKind::Tone));
     }
 

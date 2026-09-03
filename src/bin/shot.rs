@@ -340,6 +340,30 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
         // out as pieces; a few sections switched IN, the cursor on one.
         let _ = stage.apply(StageIntent::NewInstrumentTrack);
         let _ = stage.apply(StageIntent::Devices);
+        if which.contains("-tone") {
+            // TONE in, leaned on: a low boost, a mid cut swept up, the
+            // top killed, and the cursor on the swept band.
+            use daw::params::console::tone as tp;
+            let track = stage.song().tracks.len() - 1;
+            let tone = stage
+                .song()
+                .section(track, daw::console::SectionKind::Tone)
+                .expect("every track has a tone")
+                .id;
+            if let Some(device) = stage.song_mut().device_mut(tone) {
+                device.bypassed = false;
+                device.set(tp::LO, 11.0);
+                device.set(tp::MID, -7.0);
+                device.set(tp::MID_HZ, 2_600.0);
+                device.set(tp::KILL_HI, 1.0);
+            }
+            // The cursor onto TONE's swept band.
+            let _ = stage.apply(StageIntent::Step(Step::Right));
+            for _ in 0..3 {
+                let _ = stage.apply(StageIntent::Step(Step::Down));
+            }
+            return stage;
+        }
         // The preamp leaned on: iron up, colour in, back to the trim row.
         let _ = stage.apply(StageIntent::Step(Step::Down));
         for _ in 0..6 {
