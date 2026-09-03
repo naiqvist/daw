@@ -8169,6 +8169,17 @@ pub mod console {
         pub const MID_DB: u32 = 6;
         pub const HIGH_DB: u32 = 7;
 
+        /// The most a band's dynamics move it, in dB, at full amount.
+        pub const REACH_DB: f32 = 12.0;
+        /// Each band's own ballistics, fixed: the bottom slow, the top
+        /// quick. Attack and release in ms, low, mid, high.
+        pub const ATTACK_MS: [f32; 3] = [20.0, 10.0, 5.0];
+        pub const RELEASE_MS: [f32; 3] = [200.0, 120.0, 80.0];
+        /// The detector's window per band, and the long average a
+        /// band is held against.
+        pub const DETECT_MS: [f32; 3] = [30.0, 15.0, 8.0];
+        pub const AVERAGE_MS: f32 = 1_500.0;
+
         pub const TABLE: &[ParamDef] = &[
             ParamDef {
                 id: 0,

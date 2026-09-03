@@ -23,6 +23,7 @@ pub mod cut;
 pub mod door;
 pub mod hit;
 pub mod preamp;
+pub mod split;
 pub mod tone;
 pub mod vca;
 
@@ -117,6 +118,7 @@ pub fn core_of(params: &SectionParams, sample_rate: f32, block: usize) -> Box<dy
         SectionKind::Cut => Box::new(cut::CutCore::new(params, sample_rate, block)),
         SectionKind::Hit => Box::new(hit::HitCore::new(params, sample_rate, block)),
         SectionKind::Vca => Box::new(vca::VcaCore::new(params, sample_rate, block)),
+        SectionKind::Split => Box::new(split::SplitCore::new(params, sample_rate, block)),
         _ => Box::new(Wire::new(params)),
     }
 }
