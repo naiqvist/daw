@@ -22,6 +22,9 @@ use crate::console::{SectionKind, Width};
 
 /// A narrow piece's width; a wide piece is the chain card's.
 pub const NARROW_W: f32 = 184.0;
+/// PREAMP gets one extra grid-and-a-half for its meter and transformer
+/// bank. It is still compact, but no longer shares TONE's exact footprint.
+pub const PREAMP_W: f32 = 196.0;
 /// How far the tongue reaches into the next piece.
 pub const TONGUE: f32 = 12.0;
 /// The tongue's height, and the notch's.
@@ -45,6 +48,9 @@ pub fn joint_y(rect: egui::Rect) -> f32 {
 
 /// The width of a piece for `kind`.
 pub fn width_of(kind: SectionKind) -> f32 {
+    if kind == SectionKind::Preamp {
+        return PREAMP_W;
+    }
     match kind.width() {
         Width::Narrow => NARROW_W,
         Width::Wide => CHAIN_W,
@@ -79,7 +85,8 @@ fn cuts(kind: SectionKind) -> (f32, f32, f32, f32) {
         SectionKind::Echo | SectionKind::Room | SectionKind::Tape | SectionKind::Shadow => {
             (c, c * 2.0, c * 2.0, c)
         }
-        SectionKind::Preamp | SectionKind::Out | SectionKind::Scope => (c, c, c, c),
+        SectionKind::Preamp => (c * 1.5, c * 0.75, c * 1.75, c),
+        SectionKind::Out | SectionKind::Scope => (c, c, c, c),
     }
 }
 
@@ -402,6 +409,18 @@ impl Stage {
             alpha.surface.color
         };
         let mut shapes = Vec::new();
+        // A piece stands one hard step above the field. The shadow is
+        // the same cut body translated once: no blur and no gradient.
+        body_fill(
+            &mut shapes,
+            piece
+                .rect
+                .translate(egui::vec2(circuit::SHADOW_X, circuit::SHADOW_Y)),
+            piece.kind,
+            piece.notch,
+            circuit::shadow_ink(alpha.ground.color),
+            alpha.ground.color,
+        );
         body_fill(
             &mut shapes,
             piece.rect,
@@ -443,11 +462,24 @@ impl Stage {
         };
         let edge = alpha.edge.color;
         let focused = cursor.is_some_and(|(col, _)| col == piece.index);
+        let selected_row = cursor.and_then(|(col, row)| (col == piece.index).then_some(row));
         let row_font = egui::FontId::monospace(design::px(design::type_scale::MICRO));
 
         let mut shapes = Vec::new();
         if piece.tongue {
             tongue_fill(&mut shapes, rect, fill);
+        }
+        if piece.kind == SectionKind::Preamp {
+            preamp_crown(
+                &mut shapes,
+                rect,
+                if is_in {
+                    alpha.well.color
+                } else {
+                    alpha.ground.color
+                },
+                edge,
+            );
         }
         let mut path = outline(rect, piece.kind, piece.notch, piece.tongue);
         path.push(path[0]);
@@ -503,16 +535,16 @@ impl Stage {
         // is dark: the frame dim, no figure, its rows in the edge ink.
         let hole = recess(rect);
         if hole.is_positive() {
-            screen_frame(
-                &mut shapes,
-                hole,
-                if is_in {
-                    edge
-                } else {
-                    edge.gamma_multiply(0.55)
-                },
-                alpha.ground.color,
-            );
+            let screen_edge = if is_in {
+                edge
+            } else {
+                edge.gamma_multiply(0.55)
+            };
+            if piece.kind == SectionKind::Preamp {
+                preamp_screen_frame(&mut shapes, hole, screen_edge, alpha.ground.color, fill);
+            } else {
+                screen_frame(&mut shapes, hole, screen_edge, alpha.ground.color);
+            }
         }
         // The IN pad on the head's right: lit while IN, fixed for a
         // section the desk never lets out.
@@ -572,7 +604,12 @@ impl Stage {
         let screen = painter.with_clip_rect(shown);
         let figure = figure_rect(rect, piece.kind);
         if is_in {
-            self.draw_figure(&screen, piece, column, figure, level, phase);
+            let face = if piece.kind == SectionKind::Preamp {
+                glass
+            } else {
+                figure
+            };
+            self.draw_figure(&screen, piece, column, face, selected_row, level, phase);
         } else {
             screen.text(
                 figure.center(),
@@ -586,6 +623,13 @@ impl Stage {
         // The rows, on the glass under the figure: a terminal's table —
         // the name, a leader of dots, the value; the cursor's row an
         // inverse block; a wide piece's gauges as runs of cells.
+        // PREAMP's five parameters are already the five instruments on
+        // its face, so it has no second, generic table under them.
+        let rows_shown = if piece.kind == SectionKind::Preamp {
+            0
+        } else {
+            rows_shown
+        };
         let wide = piece.kind.width() == Width::Wide;
         let top = rows_top(rect, piece.kind);
         let text_ink = if is_in { ink } else { edge };
@@ -699,7 +743,7 @@ impl Stage {
                 value_ink,
             );
         }
-        if column.rows.len() > row_offset + rows_shown {
+        if piece.kind != SectionKind::Preamp && column.rows.len() > row_offset + rows_shown {
             let mut marks = Vec::new();
             circuit::annotation_arrow(
                 &mut marks,
@@ -728,6 +772,27 @@ impl Stage {
                 "⏎ FULL",
                 row_font.clone(),
                 edge,
+            );
+        }
+
+        // Register the glass itself, after its contents exist. The local
+        // phosphor pass reads those real pixels, so glyphs, curves, needles
+        // and the cursor emit while the vector casing stays untouched.
+        if glass.is_positive() && self.polarity == design::Polarity::Dark {
+            let meter = level.unwrap_or(0.0).clamp(0.0, 1.0);
+            let addressed = if selected_row.is_some() { 0.20 } else { 0.0 };
+            let activity = if sounding && phase.rolling {
+                meter.max(0.22 + phase.pulse() * 0.58)
+            } else {
+                (meter * 0.32_f32).max(addressed)
+            };
+            crate::shell::screen::register(
+                painter,
+                glass.shrink(1.0),
+                crate::shell::screen::State::new(
+                    if phase.rolling { phase.beat } else { 0.0 },
+                    activity,
+                ),
             );
         }
     }
@@ -781,6 +846,84 @@ pub fn screen_frame(
     }
 }
 
+/// PREAMP alone carries a stepped crown above its glass. The darker solid
+/// plate and the short calibration cuts read as a replaceable input module,
+/// not a texture painted over every device in the chain.
+fn preamp_crown(
+    out: &mut Vec<egui::Shape>,
+    rect: egui::Rect,
+    fill: egui::Color32,
+    edge: egui::Color32,
+) {
+    let plate = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 4.0, rect.top() + 3.0),
+        egui::pos2(rect.right() - 4.0, rect.top() + HEAD_H - 3.0),
+    );
+    let (l, t, r, b) = (plate.left(), plate.top(), plate.right(), plate.bottom());
+    let points = vec![
+        egui::pos2(l + 5.0, t),
+        egui::pos2(r - 20.0, t),
+        egui::pos2(r - 14.0, t + 6.0),
+        egui::pos2(r, t + 6.0),
+        egui::pos2(r, b - 5.0),
+        egui::pos2(r - 5.0, b),
+        egui::pos2(l + 16.0, b),
+        egui::pos2(l + 11.0, b - 5.0),
+        egui::pos2(l, b - 5.0),
+        egui::pos2(l, t + 5.0),
+    ];
+    out.push(egui::Shape::convex_polygon(
+        points.clone(),
+        fill,
+        egui::Stroke::NONE,
+    ));
+    let mut outline = points;
+    outline.push(outline[0]);
+    circuit::trace(out, &outline, Weight::Hair, edge.gamma_multiply(0.72));
+    for i in 0..3 {
+        let x = r - 43.0 + i as f32 * 6.0;
+        circuit::trace(
+            out,
+            &[egui::pos2(x, t + 5.0), egui::pos2(x + 4.0, t + 9.0)],
+            Weight::Hair,
+            edge,
+        );
+    }
+}
+
+/// The PREAMP glass is a real two-layer aperture: a hard-backed outer
+/// bezel, then an alternate-cut inner keyline. Its two square mounts are
+/// deliberately sparse so the screen still reads before its decoration.
+fn preamp_screen_frame(
+    out: &mut Vec<egui::Shape>,
+    hole: egui::Rect,
+    edge: egui::Color32,
+    ground: egui::Color32,
+    casing: egui::Color32,
+) {
+    circuit::panel_variant(
+        out,
+        hole,
+        Some(ground),
+        casing,
+        Some((Weight::Heavy, edge)),
+        0,
+    );
+    circuit::panel_frame_variant(
+        out,
+        hole.shrink(3.0),
+        Weight::Hair,
+        edge.gamma_multiply(0.58),
+        3,
+    );
+    for at in [
+        egui::pos2(hole.left() - 5.0, hole.top() + 11.0),
+        egui::pos2(hole.right() + 5.0, hole.bottom() - 11.0),
+    ] {
+        circuit::pad(out, at, circuit::PAD - 1.0, edge, false);
+    }
+}
+
 /// Where the preamp's needle turns: low on the glass, right of centre,
 /// leaving the trim ring its third on the left.
 fn preamp_pivot(figure: egui::Rect) -> egui::Pos2 {
@@ -794,6 +937,96 @@ fn on_arc(c: egui::Pos2, r: f32, deg: f32) -> egui::Pos2 {
     egui::pos2(c.x + r * a.cos(), c.y - r * a.sin())
 }
 
+/// The five PREAMP parameters have five different instruments. Their
+/// rectangles are authored together so the keyboard address and the
+/// thing it illuminates cannot drift apart.
+#[derive(Clone, Copy, Debug)]
+struct PreampFace {
+    meter: egui::Rect,
+    trim: egui::Rect,
+    iron: egui::Rect,
+    character: egui::Rect,
+    phase: egui::Rect,
+    colour: egui::Rect,
+}
+
+impl PreampFace {
+    fn controls(self) -> [(u32, egui::Rect); 5] {
+        use crate::params::console::preamp as p;
+        [
+            (p::TRIM, self.trim),
+            (p::IRON, self.iron),
+            (p::CHARACTER, self.character),
+            (p::PHASE, self.phase),
+            (p::COLOUR, self.colour),
+        ]
+    }
+
+    fn control(self, param: usize) -> Option<egui::Rect> {
+        self.controls()
+            .into_iter()
+            .find_map(|(id, rect)| (id as usize == param).then_some(rect))
+    }
+}
+
+fn preamp_face(glass: egui::Rect) -> PreampFace {
+    let x = glass.shrink2(egui::vec2(5.0, 0.0));
+    let meter = egui::Rect::from_min_max(
+        x.min,
+        egui::pos2(x.right(), (x.top() + FIGURE_MAX_H).min(x.bottom())),
+    );
+    let controls = egui::Rect::from_min_max(
+        egui::pos2(x.left(), (meter.bottom() + 4.0).min(x.bottom())),
+        egui::pos2(x.right(), (x.bottom() - 4.0).max(meter.bottom() + 4.0)),
+    );
+    let gap = 3.0;
+    let usable = (controls.height() - gap * 3.0).max(4.0);
+    let trim_h = usable * 0.20;
+    let iron_h = usable * 0.30;
+    let character_h = usable * 0.20;
+    let buttons_h = (usable - trim_h - iron_h - character_h).max(1.0);
+    let trim = egui::Rect::from_min_size(controls.min, egui::vec2(controls.width(), trim_h));
+    let iron = egui::Rect::from_min_size(
+        egui::pos2(controls.left(), trim.bottom() + gap),
+        egui::vec2(controls.width(), iron_h),
+    );
+    let character = egui::Rect::from_min_size(
+        egui::pos2(controls.left(), iron.bottom() + gap),
+        egui::vec2(controls.width(), character_h),
+    );
+    let button_row = egui::Rect::from_min_size(
+        egui::pos2(controls.left(), character.bottom() + gap),
+        egui::vec2(controls.width(), buttons_h),
+    );
+    let button_gap = 4.0;
+    let button_w = ((button_row.width() - button_gap) * 0.5).max(1.0);
+    let phase = egui::Rect::from_min_size(button_row.min, egui::vec2(button_w, buttons_h));
+    let colour = egui::Rect::from_min_size(
+        egui::pos2(phase.right() + button_gap, button_row.top()),
+        egui::vec2(button_w, buttons_h),
+    );
+    PreampFace {
+        meter,
+        trim,
+        iron,
+        character,
+        phase,
+        colour,
+    }
+}
+
+fn mix_ink(a: egui::Color32, b: egui::Color32, amount: f32) -> egui::Color32 {
+    let amount = amount.clamp(0.0, 1.0);
+    let channel =
+        |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * amount).round() as u8;
+    egui::Color32::from_rgba_unmultiplied(
+        channel(a.r(), b.r()),
+        channel(a.g(), b.g()),
+        channel(a.b(), b.b()),
+        channel(a.a(), b.a()),
+    )
+}
+
 impl Stage {
     /// The section's figure on its glass. Every section draws its own;
     /// one not yet written shows its word.
@@ -803,6 +1036,7 @@ impl Stage {
         piece: Piece,
         column: &chain::Column,
         glass: egui::Rect,
+        selected: Option<usize>,
         level: Option<f32>,
         phase: Phase,
     ) {
@@ -810,7 +1044,7 @@ impl Stage {
         let row_font = egui::FontId::monospace(design::px(design::type_scale::MICRO));
         match piece.kind {
             SectionKind::Preamp => {
-                self.draw_preamp_figure(painter, piece, column, glass, level, phase)
+                self.draw_preamp_figure(painter, piece, column, glass, selected, level, phase)
             }
             _ => {
                 painter.text(
@@ -824,16 +1058,18 @@ impl Stage {
         }
     }
 
-    /// PREAMP: a trim ring with a pointer on the left; the VU arc with
-    /// its needle on the right, the transfer curve faint behind it; the
-    /// character's word over the arc; PHASE and COLOUR as lit buttons at
-    /// the foot.
+    /// PREAMP: the meter remains the shared signal picture, then every
+    /// parameter gets its own instrument. TRM is a small bipolar bar;
+    /// IRON is the large heat bar; CHARACTER is a pair of transfer
+    /// curves; PHASE is the phase glyph; COLOUR is the CLR pad. The
+    /// keyboard cursor lives inside whichever instrument it addresses.
     fn draw_preamp_figure(
         &self,
         painter: &egui::Painter,
         piece: Piece,
         column: &chain::Column,
         glass: egui::Rect,
+        selected: Option<usize>,
         level: Option<f32>,
         phase: Phase,
     ) {
@@ -852,42 +1088,46 @@ impl Stage {
         let flip = value(p::PHASE) >= 0.5;
         let colour = value(p::COLOUR) >= 0.5;
         let _ = column;
+        let face = preamp_face(glass);
+        let trim_place = painter.ctx().animate_value_with_time(
+            egui::Id::new(("stage-preamp-trim", piece.index)),
+            ((trim + 24.0) / 48.0).clamp(0.0, 1.0),
+            0.14,
+        );
+        let iron_place = painter.ctx().animate_value_with_time(
+            egui::Id::new(("stage-preamp-iron", piece.index)),
+            iron,
+            0.22,
+        );
         let mut shapes = Vec::new();
 
-        // The trim ring: a stepped rotary, one tick per 4 dB, the
-        // pointer at the value, unity marked.
-        let ring = egui::pos2(glass.left() + glass.width() * 0.18, glass.center().y + 2.0);
-        let r = (glass.height() * 0.36).min(glass.width() * 0.14);
-        for step in 0..=12 {
-            let deg = 225.0 - step as f32 * 22.5;
-            let long = step % 3 == 0;
-            let a = on_arc(ring, r + 2.0, deg);
-            let b = on_arc(ring, r + if long { 6.0 } else { 4.0 }, deg);
-            circuit::trace(
-                &mut shapes,
-                &[a, b],
-                Weight::Hair,
-                if step == 6 { ink } else { edge },
-            );
-        }
-        shapes.push(egui::Shape::circle_stroke(
-            ring,
-            r,
-            egui::Stroke::new(Weight::Hair.px(), edge),
-        ));
-        let deg = 225.0 - (trim + 24.0) / 48.0 * 270.0;
-        circuit::trace(
+        // A nested, solid meter subassembly sits inside the screen. The
+        // well-coloured bezel and black inner glass make depth using only
+        // plane changes and hard shadows.
+        circuit::panel_variant(
             &mut shapes,
-            &[ring, on_arc(ring, r - 1.0, deg)],
-            Weight::Heavy,
-            ink,
+            face.meter,
+            Some(alpha.well.color),
+            alpha.ground.color,
+            Some((Weight::Hair, edge)),
+            2,
         );
-        circuit::pad(&mut shapes, ring, circuit::PAD - 1.0, ink, true);
+        let meter_glass = face.meter.shrink(3.0);
+        circuit::panel_variant(
+            &mut shapes,
+            meter_glass,
+            Some(alpha.ground.color),
+            alpha.well.color,
+            Some((Weight::Hair, edge.gamma_multiply(0.62))),
+            0,
+        );
 
         // The VU: an arc from −20 to +3, the top three dB in the live
-        // ink, the needle from the pivot at the channel's level.
-        let pivot = preamp_pivot(glass);
-        let radius = (glass.height() - 12.0).min(glass.width() * 0.3);
+        // ink, the needle from the pivot at the channel's level. It is
+        // not a sixth control: it is what comes out of the five below.
+        let meter = meter_glass.shrink2(egui::vec2(4.0, 2.0));
+        let pivot = preamp_pivot(meter);
+        let radius = (meter.height() - 10.0).min(meter.width() * 0.31);
         let (start, end) = (150.0, 30.0);
         let arc: Vec<egui::Pos2> = (0..=24)
             .map(|i| on_arc(pivot, radius, start + (end - start) * i as f32 / 24.0))
@@ -920,11 +1160,33 @@ impl Stage {
                 },
             );
         }
-        // The transfer, faint, behind the needle: the stage's curve at
-        // the current drive, drawn across the arc's chord.
+        // The transfer has its own little scope to the LEFT of the VU.
+        // Keeping its right edge clear of the arc means the curve can
+        // bend hard without ever becoming a second meter needle.
+        let chord_right = (pivot.x - radius * 0.90 - 3.0)
+            .max(meter.left() + 18.0)
+            .min(meter.right());
         let chord = egui::Rect::from_min_max(
-            egui::pos2(pivot.x - radius * 0.8, pivot.y - radius * 0.95),
-            egui::pos2(pivot.x + radius * 0.8, pivot.y - radius * 0.15),
+            egui::pos2(meter.left() + 2.0, meter.top() + 7.0),
+            egui::pos2(chord_right, meter.bottom() - 7.0),
+        );
+        circuit::trace(
+            &mut shapes,
+            &[
+                egui::pos2(chord.left(), chord.center().y),
+                egui::pos2(chord.right(), chord.center().y),
+            ],
+            Weight::Hair,
+            edge.gamma_multiply(0.45),
+        );
+        circuit::trace(
+            &mut shapes,
+            &[
+                egui::pos2(chord.center().x, chord.top()),
+                egui::pos2(chord.center().x, chord.bottom()),
+            ],
+            Weight::Hair,
+            edge.gamma_multiply(0.45),
         );
         let curve: Vec<egui::Pos2> = (0..=20)
             .map(|i| {
@@ -941,12 +1203,15 @@ impl Stage {
             &curve,
             Weight::Hair,
             if iron > 0.0 {
-                alpha.live_dim.color
+                mix_ink(
+                    alpha.live_dim.color,
+                    alpha.jeopardy_latent.color,
+                    iron * 0.65,
+                )
             } else {
                 edge.gamma_multiply(0.5)
             },
         );
-        let _ = live;
         // The needle.
         let db = level.map_or(-60.0, |peak| {
             if peak <= 1e-6 {
@@ -960,77 +1225,295 @@ impl Stage {
             &mut shapes,
             &[pivot, on_arc(pivot, radius - 2.0, needle)],
             Weight::Heavy,
-            if db >= 0.0 { alpha.live.color } else { ink },
+            if db >= 0.0 { alpha.live.color } else { live },
         );
         circuit::pad(&mut shapes, pivot, circuit::PAD, ink, true);
+        circuit::pad(
+            &mut shapes,
+            egui::pos2(meter_glass.right() - 7.0, meter_glass.top() + 7.0),
+            circuit::PAD - 1.0,
+            if db >= 0.0 {
+                alpha.jeopardy_active.color
+            } else {
+                edge
+            },
+            db >= 0.0,
+        );
 
-        // The buttons: PHASE lit red as the hardware does, COLOUR lit in
-        // the live ink.
-        let button =
-            |shapes: &mut Vec<egui::Shape>, at: egui::Pos2, on: bool, lit: egui::Color32| {
-                let square = egui::Rect::from_center_size(at, egui::Vec2::splat(7.0));
-                shapes.push(egui::Shape::rect_filled(
-                    square,
-                    0.0,
-                    if on { lit } else { alpha.ground.color },
-                ));
-                shapes.push(egui::Shape::rect_stroke(
-                    square,
-                    0.0,
-                    egui::Stroke::new(Weight::Hair.px(), if on { lit } else { edge }),
-                    egui::StrokeKind::Inside,
-                ));
+        // TRM: deliberately little. It is bipolar about the bright
+        // centre post, with only the run between unity and the smooth
+        // moving cursor awake.
+        circuit::panel_frame_variant(&mut shapes, face.trim, Weight::Hair, edge, 3);
+        let trim_bar = egui::Rect::from_min_max(
+            egui::pos2(face.trim.left() + 30.0, face.trim.center().y - 5.0),
+            egui::pos2(face.trim.right() - 6.0, face.trim.center().y + 5.0),
+        );
+        let trim_segments = 17usize;
+        for i in 0..trim_segments {
+            let t = i as f32 / (trim_segments - 1) as f32;
+            let x = egui::lerp(trim_bar.x_range(), t);
+            let from = trim_place.min(0.5);
+            let to = trim_place.max(0.5);
+            let awake = t >= from - 0.001 && t <= to + 0.001;
+            let cursor = (t - trim_place).abs() < 0.5 / (trim_segments - 1) as f32;
+            let h = if cursor {
+                trim_bar.height()
+            } else if i % 4 == 0 {
+                7.0
+            } else {
+                4.0
             };
+            circuit::trace(
+                &mut shapes,
+                &[
+                    egui::pos2(x, trim_bar.center().y - h * 0.5),
+                    egui::pos2(x, trim_bar.center().y + h * 0.5),
+                ],
+                if cursor { Weight::Heavy } else { Weight::Hair },
+                if awake {
+                    ink
+                } else {
+                    edge.gamma_multiply(0.65)
+                },
+            );
+        }
+        let unity_x = egui::lerp(trim_bar.x_range(), 0.5);
+        circuit::pad(
+            &mut shapes,
+            egui::pos2(unity_x, trim_bar.center().y),
+            circuit::PAD - 2.0,
+            alpha.focus.color,
+            true,
+        );
+
+        // IRON: a larger bank. More of it wakes with drive and every
+        // live segment moves from the bone ink toward the alphabet's
+        // hot hue as the stage is leaned on.
+        circuit::panel_variant(
+            &mut shapes,
+            face.iron,
+            Some(alpha.well.color),
+            alpha.ground.color,
+            Some((Weight::Hair, edge)),
+            1,
+        );
+        let iron_bar = egui::Rect::from_min_max(
+            egui::pos2(face.iron.left() + 38.0, face.iron.top() + 6.0),
+            egui::pos2(face.iron.right() - 6.0, face.iron.bottom() - 6.0),
+        );
+        let iron_segments = 14usize;
+        for i in 0..iron_segments {
+            let n = iron_segments as f32;
+            let t0 = i as f32 / n;
+            let t1 = (i + 1) as f32 / n;
+            let at = (i as f32 + 0.5) / n;
+            let cell = egui::Rect::from_min_max(
+                egui::pos2(
+                    egui::lerp(iron_bar.x_range(), t0),
+                    iron_bar.bottom() - iron_bar.height() * (0.45 + at * 0.55),
+                ),
+                egui::pos2(egui::lerp(iron_bar.x_range(), t1) - 1.0, iron_bar.bottom()),
+            );
+            let awake = at <= iron_place;
+            let warmth = (iron_place * 0.78 + at * 0.22).clamp(0.0, 1.0);
+            shapes.push(egui::Shape::rect_filled(
+                cell,
+                0.0,
+                if awake {
+                    mix_ink(ink, alpha.jeopardy_active.color, warmth)
+                } else {
+                    edge.gamma_multiply(0.55)
+                },
+            ));
+        }
+
+        // CHARACTER: not another bar. The two actual transfer families
+        // face each other; the selected path is the readable one.
+        circuit::panel_frame_variant(&mut shapes, face.character, Weight::Hair, edge, 2);
+        let split_x = face.character.center().x;
+        circuit::trace(
+            &mut shapes,
+            &[
+                egui::pos2(split_x, face.character.top() + 3.0),
+                egui::pos2(split_x, face.character.bottom() - 3.0),
+            ],
+            Weight::Hair,
+            edge,
+        );
+        for (right, is_steel) in [(false, false), (true, true)] {
+            let half = if right {
+                egui::Rect::from_min_max(
+                    egui::pos2(split_x, face.character.top()),
+                    face.character.max,
+                )
+            } else {
+                egui::Rect::from_min_max(
+                    face.character.min,
+                    egui::pos2(split_x, face.character.bottom()),
+                )
+            };
+            let chosen = steel == is_steel;
+            let plot = egui::Rect::from_min_max(
+                egui::pos2(half.left() + 20.0, half.top() + 4.0),
+                egui::pos2(half.right() - 5.0, half.bottom() - 4.0),
+            );
+            let curve: Vec<egui::Pos2> = (0..=12)
+                .map(|i| {
+                    let x = -1.0 + 2.0 * i as f32 / 12.0;
+                    let y = crate::console::preamp_curve::transfer(0.72, is_steel, x);
+                    egui::pos2(
+                        plot.left() + (x + 1.0) * 0.5 * plot.width(),
+                        plot.bottom() - (y + 1.0) * 0.5 * plot.height(),
+                    )
+                })
+                .collect();
+            circuit::trace(
+                &mut shapes,
+                &curve,
+                if chosen { Weight::Heavy } else { Weight::Hair },
+                if chosen {
+                    ink
+                } else {
+                    edge.gamma_multiply(0.7)
+                },
+            );
+            circuit::pad(
+                &mut shapes,
+                egui::pos2(half.left() + 12.0, half.center().y),
+                circuit::PAD - 1.0,
+                if chosen { ink } else { edge },
+                chosen,
+            );
+        }
+
+        // PHASE and COLOUR are switches, so they are buttons and
+        // nothing else: the existing phase glyph, and CLR.
+        let button = |shapes: &mut Vec<egui::Shape>,
+                      rect: egui::Rect,
+                      on: bool,
+                      lit: egui::Color32,
+                      variant: u8| {
+            circuit::panel_variant(
+                shapes,
+                rect,
+                Some(if on { lit } else { alpha.ground.color }),
+                alpha.ground.color,
+                Some((Weight::Hair, if on { lit } else { edge })),
+                variant,
+            );
+            circuit::pad(
+                shapes,
+                egui::pos2(rect.right() - 7.0, rect.top() + 7.0),
+                circuit::PAD - 1.0,
+                if on { alpha.ground.color } else { edge },
+                on,
+            );
+        };
         button(
             &mut shapes,
-            egui::pos2(glass.right() - 9.0, glass.bottom() - 8.0),
+            face.phase,
             flip,
             alpha.jeopardy_active.color,
+            3,
         );
-        button(
-            &mut shapes,
-            egui::pos2(glass.right() - 9.0, glass.bottom() - 20.0),
-            colour,
-            alpha.live.color,
-        );
+        button(&mut shapes, face.colour, colour, alpha.live.color, 0);
         painter.extend(shapes);
 
+        let button_ink = |on: bool| if on { alpha.ground.color } else { ink };
+        let meter_font = egui::FontId::monospace((font.size * 0.72).max(7.0));
         painter.text(
-            egui::pos2(glass.right() - 16.0, glass.bottom() - 8.0),
-            egui::Align2::RIGHT_CENTER,
-            "Ø",
-            font.clone(),
+            egui::pos2(meter_glass.left() + 8.0, meter_glass.top() + 4.0),
+            egui::Align2::LEFT_TOP,
+            "XFR",
+            meter_font.clone(),
             edge,
         );
         painter.text(
-            egui::pos2(glass.right() - 16.0, glass.bottom() - 20.0),
-            egui::Align2::RIGHT_CENTER,
-            "CLR",
-            font.clone(),
-            edge,
-        );
-        block::paint(
-            painter,
-            egui::Id::new(("stage-preamp-character", piece.index)),
-            egui::pos2(glass.right() - 5.0, glass.top() + 2.0),
+            egui::pos2(meter_glass.right() - 13.0, meter_glass.top() + 3.0),
             egui::Align2::RIGHT_TOP,
-            block::unit::MICRO,
-            if steel { "STEEL" } else { "IRON" },
-            if iron > 0.0 { ink } else { edge },
+            "PK",
+            meter_font.clone(),
+            if db >= 0.0 {
+                alpha.jeopardy_active.color
+            } else {
+                edge
+            },
         );
         painter.text(
-            egui::pos2(ring.x, glass.bottom() - 2.0),
-            egui::Align2::CENTER_BOTTOM,
-            format!("{trim:+.0}"),
-            font,
+            egui::pos2(pivot.x, meter_glass.top() + 3.0),
+            egui::Align2::CENTER_TOP,
+            "VU / dB",
+            meter_font,
+            edge,
+        );
+        painter.text(
+            egui::pos2(face.trim.left() + 6.0, face.trim.center().y),
+            egui::Align2::LEFT_CENTER,
+            "TRM",
+            font.clone(),
             ink,
         );
+        painter.text(
+            egui::pos2(face.iron.left() + 6.0, face.iron.center().y),
+            egui::Align2::LEFT_CENTER,
+            "IRON",
+            font.clone(),
+            mix_ink(ink, alpha.jeopardy_active.color, iron_place),
+        );
+        painter.text(
+            egui::pos2(face.character.left() + 7.0, face.character.center().y),
+            egui::Align2::LEFT_CENTER,
+            "FE",
+            font.clone(),
+            if steel { edge } else { ink },
+        );
+        painter.text(
+            egui::pos2(face.character.center().x + 7.0, face.character.center().y),
+            egui::Align2::LEFT_CENTER,
+            "ST",
+            font.clone(),
+            if steel { ink } else { edge },
+        );
+        painter.text(
+            face.phase.center(),
+            egui::Align2::CENTER_CENTER,
+            "Ø",
+            font.clone(),
+            button_ink(flip),
+        );
+        painter.text(
+            face.colour.center(),
+            egui::Align2::CENTER_CENTER,
+            "CLR",
+            font.clone(),
+            button_ink(colour),
+        );
+
+        // The cursor is not a sixth row below the drawing. Four bright
+        // corners sit just inside the addressed instrument itself.
+        if let Some(rect) = selected.and_then(|param| face.control(param)) {
+            let mut cursor = Vec::new();
+            circuit::brackets(
+                &mut cursor,
+                rect.shrink(2.0),
+                5.0,
+                Weight::Bold,
+                alpha.focus.color,
+            );
+            painter.extend(cursor);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preamp_owns_a_distinct_chassis_footprint() {
+        assert!(width_of(SectionKind::Preamp) > width_of(SectionKind::Tone));
+        assert_ne!(cuts(SectionKind::Preamp), cuts(SectionKind::Tone));
+    }
 
     /// A piece with both joints has an outline with a step in on the
     /// left and out on the right, at the same height, so two mate.
@@ -1083,5 +1566,46 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// PREAMP has no fallback table: every table position maps to one
+    /// bespoke instrument, once, and the meter maps to none.
+    #[test]
+    fn every_preamp_parameter_has_one_instrument() {
+        use crate::params::console::preamp as p;
+        let glass = egui::Rect::from_min_size(egui::pos2(40.0, 500.0), egui::vec2(158.0, 200.0));
+        let face = preamp_face(glass);
+        let controls = face.controls();
+        assert_eq!(
+            controls.map(|(id, _)| id),
+            [p::TRIM, p::IRON, p::CHARACTER, p::PHASE, p::COLOUR]
+        );
+        for (index, (id, rect)) in controls.iter().enumerate() {
+            assert_eq!(face.control(*id as usize), Some(*rect));
+            assert!(glass.contains_rect(*rect), "parameter {id} left the glass");
+            assert!(rect.is_positive(), "parameter {id} lost its instrument");
+            assert!(
+                !face.meter.intersects(*rect),
+                "parameter {id} invaded the meter"
+            );
+            for (other_id, other) in &controls[index + 1..] {
+                assert!(
+                    !rect.intersects(*other),
+                    "parameters {id} and {other_id} overlap"
+                );
+            }
+        }
+    }
+
+    /// The IRON bank is deliberately the largest single-parameter
+    /// instrument, while the two binary parameters share the last row.
+    #[test]
+    fn iron_owns_the_big_bar_and_the_switches_share_the_foot() {
+        let glass = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(158.0, 200.0));
+        let face = preamp_face(glass);
+        assert!(face.iron.height() > face.trim.height());
+        assert!(face.iron.height() > face.character.height());
+        assert_eq!(face.phase.y_range(), face.colour.y_range());
+        assert!(face.phase.right() < face.colour.left());
     }
 }

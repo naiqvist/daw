@@ -11,7 +11,7 @@
 //! So the frame goes somewhere we can read it:
 //!
 //! ```text
-//!   egui ──▶ offscreen texture ──▶ post pass ──▶ swapchain ──▶ present
+//!   egui ──▶ offscreen ──▶ exact copy ──▶ registered screen phosphor ──▶ present
 //! ```
 //!
 //! # What we took on
@@ -23,11 +23,11 @@
 //! that changing the shell does not silently discard a machine's
 //! preferences.
 //!
-//! # The post pass is blank
+//! # The frame post pass is blank
 //!
 //! It copies the finished frame to the swapchain unchanged. The stage keeps
-//! the offscreen seam so a treatment can be explored later without touching
-//! windowing or input code.
+//! its CRT material in a second, explicitly registered screen-only pass; the
+//! old whole-frame treatment is not involved.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -36,6 +36,7 @@ use std::sync::Arc;
 use eframe::egui;
 
 pub mod post;
+pub mod screen;
 
 /// What the shell needs from the application it runs.
 ///
@@ -201,6 +202,7 @@ struct Live {
     renderer: egui_wgpu::Renderer,
     offscreen: Offscreen,
     post: post::Post,
+    screens: screen::Pass,
     generation: u64,
 }
 
@@ -322,11 +324,10 @@ impl<A: Host> Shell<A> {
             false,
         );
         let app = &mut self.app;
-        let mut output = live
-            .egui
-            .egui_ctx()
-            .clone()
-            .run_ui(raw_input, |ui| app.ui(ui));
+        let ctx = live.egui.egui_ctx().clone();
+        screen::begin_frame(&ctx);
+        let mut output = ctx.run_ui(raw_input, |ui| app.ui(ui));
+        let screen_regions = screen::take(&ctx);
         live.egui
             .handle_platform_output(&live.window, output.platform_output);
 
@@ -411,6 +412,17 @@ impl<A: Host> Shell<A> {
             &live.offscreen.view,
             live.offscreen.generation,
             &target,
+        );
+        live.screens.draw(
+            &live.device,
+            &live.queue,
+            &mut encoder,
+            &live.offscreen.view,
+            live.offscreen.generation,
+            &target,
+            size,
+            pixels_per_point,
+            &screen_regions,
         );
 
         live.queue
@@ -519,6 +531,7 @@ impl<A: Host> Shell<A> {
         );
         let renderer = egui_wgpu::Renderer::new(&device, format, Default::default());
         let post = post::Post::new(&device, format);
+        let screens = screen::Pass::new(&device, format);
         let offscreen = Offscreen::new(&device, format, size, 0);
 
         if std::env::var("DAW_SHELL_DEBUG").is_ok() {
@@ -541,6 +554,7 @@ impl<A: Host> Shell<A> {
             renderer,
             offscreen,
             post,
+            screens,
             generation: 0,
         })
     }

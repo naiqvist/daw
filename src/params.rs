@@ -7994,6 +7994,18 @@ pub mod console {
         pub const HIGH_DB: u32 = 10;
         pub const HIGH_SHAPE: u32 = 11;
 
+        pub const SHELF: u32 = 0;
+        pub const BELL: u32 = 1;
+        /// The shelves' Q.
+        pub const SHELF_Q: f32 = 0.7;
+        /// The inductor bump: a passive low shelf resonates a little
+        /// just inside its corner, which is why an old EQ's bottom is
+        /// tight. A bell at this share of the corner, this much of the
+        /// shelf's own gain, at this Q.
+        pub const INDUCTOR_AT: f32 = 1.6;
+        pub const INDUCTOR_SHARE: f32 = 0.28;
+        pub const INDUCTOR_Q: f32 = 1.1;
+
         pub const TABLE: &[ParamDef] = &[
             ParamDef {
                 id: 0,
@@ -8432,6 +8444,15 @@ pub mod console {
         pub const TUNE: u32 = 1;
         pub const MIX: u32 = 2;
 
+        /// The top the exciter works on is taken off with this slope.
+        pub const SPLIT_ORDER: u32 = 2;
+        /// How hard the top is driven at full amount, and the bias that
+        /// makes the exciter's even harmonics.
+        pub const DRIVE: f32 = 8.0;
+        pub const BIAS: f32 = 0.35;
+        /// What the generated top is added back at, at full amount.
+        pub const RETURN: f32 = 0.7;
+
         pub const TABLE: &[ParamDef] = &[
             ParamDef {
                 id: 0,
@@ -8838,6 +8859,13 @@ pub mod console {
         pub const BASS_MONO: u32 = 1;
         pub const SEND_TAPE: u32 = 2;
         pub const SEND_SHADOW: u32 = 3;
+
+        /// Width is off at unity; bass mono is off at the bottom of its
+        /// range.
+        pub const WIDTH_OFF: f32 = 100.0;
+        pub const BASS_MONO_OFF_HZ: f32 = 0.0;
+        /// The crossover that takes the bottom to mono.
+        pub const BASS_ORDER: u32 = 2;
 
         pub const TABLE: &[ParamDef] = &[
             ParamDef {

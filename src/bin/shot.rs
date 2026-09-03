@@ -76,8 +76,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // sRGB, the same as the app's surface, so the bytes read back are
     // already encoded the way a PNG wants them.
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("card"),
+    let raw_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("card_raw"),
         size: wgpu::Extent3d {
             width: size[0],
             height: size[1],
@@ -87,12 +87,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let raw_view = raw_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("card_final"),
+        size: wgpu::Extent3d {
+            width: size[0],
+            height: size[1],
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
     let mut renderer = egui_wgpu::Renderer::new(&device, format, Default::default());
+    let mut screen_pass = daw::shell::screen::Pass::new(&device, format);
     let screen = egui_wgpu::ScreenDescriptor {
         size_in_pixels: size,
         pixels_per_point: scale,
@@ -107,6 +127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // reports 3000 vertices tessellated.
     let mut subject = Subject::default();
     let mut jobs = Vec::new();
+    let mut screen_regions = Vec::new();
     for _ in 0..2 {
         // A pose named `-full` is shot as the app would look fullscreen:
         // the stage reads that from the viewport, exactly as it does in
@@ -119,6 +140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ..Default::default()
             },
         );
+        daw::shell::screen::begin_frame(&ctx);
         let mut out = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -147,6 +169,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     });
             },
         );
+        screen_regions = daw::shell::screen::take(&ctx);
         // OWNED and drained on every path — `TexturesDelta` panics in its
         // destructor if it is dropped with work still in it.
         let mut textures = std::mem::take(&mut out.textures_delta);
@@ -170,7 +193,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("card"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &view,
+                view: &raw_view,
                 resolve_target: None,
                 depth_slice: None,
                 ops: wgpu::Operations {
@@ -185,6 +208,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
         renderer.render(&mut pass.forget_lifetime(), &jobs, &screen);
     }
+    encoder.copy_texture_to_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &raw_texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::Extent3d {
+            width: size[0],
+            height: size[1],
+            depth_or_array_layers: 1,
+        },
+    );
+    screen_pass.draw(
+        &device,
+        &queue,
+        &mut encoder,
+        &raw_view,
+        0,
+        &view,
+        size,
+        scale,
+        &screen_regions,
+    );
 
     // ---- read it back ------------------------------------------------
     // Rows in a copy destination must start on a 256-byte boundary.
@@ -325,6 +378,24 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
                     coarse: true,
                 });
             }
+        }
+        if which.contains("-live") {
+            let _ = stage.apply(StageIntent::ToggleTransport);
+            stage.set_position(6.1);
+            let tracks = vec![
+                daw::ui::stage::Level {
+                    left: 0.72,
+                    right: 0.58,
+                };
+                stage.song().tracks.len()
+            ];
+            stage.set_levels(
+                &tracks,
+                daw::ui::stage::Level {
+                    left: 0.66,
+                    right: 0.61,
+                },
+            );
         }
     } else if which.contains("song") {
         // The song view: three instrument tracks and an audio track,

@@ -53,11 +53,11 @@ use sequence::NoteView;
 /// bytes are not a perceptual space — which is the same argument the
 /// design alphabet's ladder is built on.
 pub fn shade(level: u8, ground: design::Polarity) -> egui::Color32 {
-    // Bone, not grey: the same warm tint the alphabet's ladder wears, so
-    // the sequencer's levels and the frame's rungs are one material.
+    // Chrome, not grey: the same cold tint the alphabet's ladder wears,
+    // with red still carrying the exact level this projection promises.
     match ground {
-        design::Polarity::Dark => design::bone(level),
-        design::Polarity::Light => design::bone(MIRROR[level as usize]),
+        design::Polarity::Dark => design::chrome(level),
+        design::Polarity::Light => design::chrome(MIRROR[level as usize]),
     }
 }
 

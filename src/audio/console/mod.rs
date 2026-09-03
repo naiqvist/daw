@@ -23,9 +23,12 @@ pub mod cut;
 pub mod door;
 pub mod drift;
 pub mod drive;
+pub mod four;
 pub mod grit;
 pub mod hit;
+pub mod out;
 pub mod preamp;
+pub mod shine;
 pub mod split;
 pub mod tone;
 pub mod vca;
@@ -125,6 +128,9 @@ pub fn core_of(params: &SectionParams, sample_rate: f32, block: usize) -> Box<dy
         SectionKind::Drive => Box::new(drive::DriveCore::new(params, sample_rate, block)),
         SectionKind::Grit => Box::new(grit::GritCore::new(params, sample_rate, block)),
         SectionKind::Drift => Box::new(drift::DriftCore::new(params, sample_rate, block)),
+        SectionKind::Four => Box::new(four::FourCore::new(params, sample_rate, block)),
+        SectionKind::Shine => Box::new(shine::ShineCore::new(params, sample_rate, block)),
+        SectionKind::Out => Box::new(out::OutCore::new(params, sample_rate, block)),
         _ => Box::new(Wire::new(params)),
     }
 }

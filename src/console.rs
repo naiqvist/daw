@@ -417,7 +417,7 @@ pub mod tone_curve {
 
     /// A biquad's magnitude at `hz`, from its coefficients
     /// `[b0, b1, b2, a1, a2]`.
-    fn biquad_db(coeffs: [f32; 5], hz: f32, sample_rate: f32) -> f32 {
+    pub fn biquad_db(coeffs: [f32; 5], hz: f32, sample_rate: f32) -> f32 {
         let w = 2.0 * core::f32::consts::PI * hz / sample_rate;
         let (c1, s1) = (w.cos(), w.sin());
         let (c2, s2) = ((2.0 * w).cos(), (2.0 * w).sin());
@@ -659,6 +659,111 @@ pub mod drive_curve {
             p::FUZZ => fuzz(x, k),
             _ => fold(x, k),
         }
+    }
+}
+
+/// FOUR's shape, green so the card draws the curve the core runs.
+pub mod four_curve {
+    use crate::dsp::filters::{BandShape, EqBand};
+    use crate::params::console::four as p;
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct Band {
+        pub hz: f32,
+        pub db: f32,
+        pub q: f32,
+        pub shape: BandShape,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct Shape {
+        pub bands: [Band; 4],
+        /// The inductor bump under a low SHELF, when there is one.
+        pub inductor: Option<Band>,
+    }
+
+    impl Shape {
+        pub fn of(params: &super::SectionParams) -> Self {
+            let table = super::SectionKind::Four.table();
+            let clamp = |id: u32| {
+                let value = params.value(id);
+                table
+                    .iter()
+                    .find(|def| def.id == id)
+                    .map_or(value, |def| def.clamp(value))
+            };
+            let low_bell = clamp(p::LOW_SHAPE) >= 0.5;
+            let high_bell = clamp(p::HIGH_SHAPE) >= 0.5;
+            let low = Band {
+                hz: clamp(p::LOW_HZ),
+                db: clamp(p::LOW_DB),
+                q: if low_bell { 0.8 } else { p::SHELF_Q },
+                shape: if low_bell {
+                    BandShape::Bell
+                } else {
+                    BandShape::LowShelf
+                },
+            };
+            Self {
+                bands: [
+                    low,
+                    Band {
+                        hz: clamp(p::LMF_HZ),
+                        db: clamp(p::LMF_DB),
+                        q: clamp(p::LMF_Q),
+                        shape: BandShape::Bell,
+                    },
+                    Band {
+                        hz: clamp(p::HMF_HZ),
+                        db: clamp(p::HMF_DB),
+                        q: clamp(p::HMF_Q),
+                        shape: BandShape::Bell,
+                    },
+                    Band {
+                        hz: clamp(p::HIGH_HZ),
+                        db: clamp(p::HIGH_DB),
+                        q: if high_bell { 0.8 } else { p::SHELF_Q },
+                        shape: if high_bell {
+                            BandShape::Bell
+                        } else {
+                            BandShape::HighShelf
+                        },
+                    },
+                ],
+                // A passive low shelf resonates just inside its corner;
+                // a bell there, opposite in sign to the shelf, is what
+                // makes an old EQ's bottom tight rather than woolly.
+                inductor: (!low_bell && low.db != 0.0).then(|| Band {
+                    hz: low.hz * p::INDUCTOR_AT,
+                    db: -low.db * p::INDUCTOR_SHARE,
+                    q: p::INDUCTOR_Q,
+                    shape: BandShape::Bell,
+                }),
+            }
+        }
+
+        pub fn is_flat(&self) -> bool {
+            self.bands.iter().all(|band| band.db == 0.0)
+        }
+
+        /// Every band the core runs, the inductor included.
+        pub fn all(&self) -> impl Iterator<Item = &Band> {
+            self.bands.iter().chain(self.inductor.iter())
+        }
+    }
+
+    /// The whole section's response at `hz`, in dB.
+    pub fn response_db(shape: &Shape, sample_rate: f32, hz: f32) -> f32 {
+        let mut db = 0.0;
+        let mut band = EqBand::new();
+        for want in shape.all() {
+            if want.db == 0.0 {
+                continue;
+            }
+            band.prepare(sample_rate, want.hz, want.q, want.db, want.shape);
+            db += super::tone_curve::biquad_db(band.coeffs(), hz, sample_rate);
+        }
+        db
     }
 }
 

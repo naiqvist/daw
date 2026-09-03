@@ -56,15 +56,23 @@ use eframe::egui::Color32;
 
 // ------------------------------------------------------------------ tint
 
-/// The bone tint: the ladder is warm, the way traces on a black board are
-/// bone rather than white. Red is the channel the ladder is measured on,
-/// so it keeps the grey's byte and the others sit a little under it.
-/// Chroma stays far below the point where the eye would call it a hue.
-pub const fn bone(level: u8) -> Color32 {
+/// The cold chrome tint. Red is the channel the ladder is measured on,
+/// so it keeps the grey's byte while green and blue sit a little above it.
+/// This is metal rather than neon: chroma stays below the point where the
+/// eye would call it a third hue, leaving cyan and vermilion their jobs.
+pub const fn chrome(level: u8) -> Color32 {
     let r = level as u32;
-    let g = (r * 965 + 500) / 1000;
-    let b = (r * 900 + 500) / 1000;
+    let g = (r * 1_055 + 500) / 1_000;
+    let b = (r * 1_111 + 500) / 1_000;
+    let g = if g > 255 { 255 } else { g };
+    let b = if b > 255 { 255 } else { b };
     Color32::from_rgb(level, g as u8, b as u8)
+}
+
+/// Compatibility name for the sequencer surfaces that predate the chrome
+/// pass. It is the same neutral ladder, not a second palette.
+pub const fn bone(level: u8) -> Color32 {
+    chrome(level)
 }
 
 /// The most chroma a resting rung may carry, as a share of its brightest
@@ -186,15 +194,14 @@ impl Alphabet {
 /// not a preference. The gaps are deliberately uneven — see the module
 /// note on budgeted separation.
 pub mod lstar {
-    /// The original black-ground projection. These values are stable: dark
-    /// remains the default and is not redesigned to make room for light.
+    /// The black-chrome projection. Dark remains the house default.
     pub mod dark {
-        pub const GROUND: f32 = 0.0;
-        pub const WELL: f32 = 2.7;
-        pub const SURFACE: f32 = 5.5;
-        pub const EDGE: f32 = 20.0;
-        pub const INK: f32 = 60.0;
-        pub const FOCUS: f32 = 95.0;
+        pub const GROUND: f32 = 1.1;
+        pub const WELL: f32 = 4.0;
+        pub const SURFACE: f32 = 17.1;
+        pub const EDGE: f32 = 29.7;
+        pub const INK: f32 = 70.4;
+        pub const FOCUS: f32 = 98.3;
         pub const LADDER: [f32; 6] = [GROUND, WELL, SURFACE, EDGE, INK, FOCUS];
     }
 
@@ -215,12 +222,12 @@ pub mod lstar {
     /// cost, but it is paid by the GROUND being paper rather than by the
     /// marks on it failing to separate.
     pub mod light {
-        pub const GROUND: f32 = 96.0;
-        pub const WELL: f32 = 93.3;
-        pub const SURFACE: f32 = 90.5;
-        pub const EDGE: f32 = 76.0;
-        pub const INK: f32 = 36.0;
-        pub const FOCUS: f32 = 1.0;
+        pub const GROUND: f32 = 96.9;
+        pub const WELL: f32 = 94.1;
+        pub const SURFACE: f32 = 81.0;
+        pub const EDGE: f32 = 68.1;
+        pub const INK: f32 = 27.5;
+        pub const FOCUS: f32 = 0.3;
         pub const LADDER: [f32; 6] = [GROUND, WELL, SURFACE, EDGE, INK, FOCUS];
     }
 
@@ -246,35 +253,35 @@ pub mod lstar {
 
 /// The ground: what the screen is when nothing has been said.
 pub const GROUND: Signal = Signal {
-    color: Color32::from_gray(0),
+    color: chrome(4),
     tier: Tier::Ground,
     channels: &[Channel::Luminance],
 };
 
 /// A recess below the surfaces. See [`lstar::WELL`].
 pub const WELL: Signal = Signal {
-    color: bone(10),
+    color: chrome(14),
     tier: Tier::Structure,
     channels: &[Channel::Luminance, Channel::Position],
 };
 
 /// A resting object's fill.
 pub const SURFACE: Signal = Signal {
-    color: bone(18),
+    color: chrome(42),
     tier: Tier::Structure,
     channels: &[Channel::Luminance],
 };
 
 /// A resting object's boundary; also the periphery's hairlines.
 pub const EDGE: Signal = Signal {
-    color: bone(48),
+    color: chrome(70),
     tier: Tier::Structure,
     channels: &[Channel::Luminance],
 };
 
 /// Readable marks on a surface: names, values, refusal words.
 pub const INK: Signal = Signal {
-    color: bone(145),
+    color: chrome(172),
     tier: Tier::Content,
     channels: &[Channel::Luminance],
 };
@@ -286,7 +293,7 @@ pub const INK: Signal = Signal {
 /// must survive a bad glance. Inversion (this as fill, [`GROUND`] as ink)
 /// is its validated form.
 pub const FOCUS: Signal = Signal {
-    color: bone(241),
+    color: chrome(250),
     tier: Tier::Exception,
     channels: &[Channel::Luminance, Channel::Position],
 };
@@ -295,37 +302,37 @@ pub const FOCUS: Signal = Signal {
 // comes from value and the display around it, while hue remains reserved for
 // jeopardy and the sounding present.
 const LIGHT_GROUND: Signal = Signal {
-    color: bone(243),
+    color: chrome(246),
     tier: Tier::Ground,
     channels: &[Channel::Luminance],
 };
 
 const LIGHT_WELL: Signal = Signal {
-    color: bone(236),
+    color: chrome(238),
     tier: Tier::Structure,
     channels: &[Channel::Luminance, Channel::Position],
 };
 
 const LIGHT_SURFACE: Signal = Signal {
-    color: bone(228),
+    color: chrome(201),
     tier: Tier::Structure,
     channels: &[Channel::Luminance],
 };
 
 const LIGHT_EDGE: Signal = Signal {
-    color: bone(187),
+    color: chrome(166),
     tier: Tier::Structure,
     channels: &[Channel::Luminance],
 };
 
 const LIGHT_INK: Signal = Signal {
-    color: bone(85),
+    color: chrome(65),
     tier: Tier::Content,
     channels: &[Channel::Luminance],
 };
 
 const LIGHT_FOCUS: Signal = Signal {
-    color: bone(4),
+    color: chrome(1),
     tier: Tier::Exception,
     channels: &[Channel::Luminance, Channel::Position],
 };
@@ -348,8 +355,8 @@ const LIGHT_FOCUS: Signal = Signal {
 pub mod hue {
     /// Degrees on the hue circle. Kept as data so the separation between
     /// the two meanings is checkable rather than assumed.
-    pub const JEOPARDY_DEG: f32 = 11.0;
-    pub const LIVE_DEG: f32 = 190.0;
+    pub const JEOPARDY_DEG: f32 = 354.0;
+    pub const LIVE_DEG: f32 = 185.0;
     /// How far apart two meanings must sit to stay distinct in a glance.
     pub const MIN_SEPARATION_DEG: f32 = 90.0;
 }
@@ -360,14 +367,14 @@ pub mod hue {
 /// The latent step is the loaded spring — nothing lost yet, but the next
 /// event matters. Never carried on hue alone.
 pub const JEOPARDY_LATENT: Signal = Signal {
-    color: Color32::from_rgb(166, 62, 38),
+    color: Color32::from_rgb(194, 48, 58),
     tier: Tier::Alarm,
     channels: &[Channel::Hue, Channel::Text],
 };
 
 /// The same meaning, discharging: it is happening now.
 pub const JEOPARDY_ACTIVE: Signal = Signal {
-    color: Color32::from_rgb(255, 94, 58),
+    color: Color32::from_rgb(255, 58, 78),
     tier: Tier::Alarm,
     channels: &[Channel::Hue, Channel::Text, Channel::Luminance],
 };
@@ -377,14 +384,14 @@ pub const JEOPARDY_ACTIVE: Signal = Signal {
 pub const LIVE: Signal = Signal {
     // Pale, nearly white: the glow of a rune that has woken, not a
     // coloured light. Still the same hue, still its own meaning.
-    color: Color32::from_rgb(186, 232, 240),
+    color: Color32::from_rgb(139, 245, 255),
     tier: Tier::Exception,
     channels: &[Channel::Hue, Channel::Position],
 };
 
 /// The same meaning, quieter: present but not the subject.
 pub const LIVE_DIM: Signal = Signal {
-    color: Color32::from_rgb(96, 140, 148),
+    color: Color32::from_rgb(55, 151, 166),
     tier: Tier::Exception,
     channels: &[Channel::Hue, Channel::Position],
 };
@@ -392,13 +399,13 @@ pub const LIVE_DIM: Signal = Signal {
 /// Paper-ground jeopardy: pigment rather than emitted light. The active
 /// step goes darker, increasing its distance from the paper.
 const LIGHT_JEOPARDY_LATENT: Signal = Signal {
-    color: Color32::from_rgb(179, 106, 90),
+    color: Color32::from_rgb(174, 73, 82),
     tier: Tier::Alarm,
     channels: &[Channel::Hue, Channel::Text],
 };
 
 const LIGHT_JEOPARDY_ACTIVE: Signal = Signal {
-    color: Color32::from_rgb(142, 56, 43),
+    color: Color32::from_rgb(139, 34, 51),
     tier: Tier::Alarm,
     channels: &[Channel::Hue, Channel::Text, Channel::Luminance],
 };
@@ -406,13 +413,13 @@ const LIGHT_JEOPARDY_ACTIVE: Signal = Signal {
 /// Paper-ground sounding present. Like jeopardy, greater intensity means
 /// more ink rather than more emitted light.
 const LIGHT_LIVE: Signal = Signal {
-    color: Color32::from_rgb(59, 112, 121),
+    color: Color32::from_rgb(20, 102, 119),
     tier: Tier::Exception,
     channels: &[Channel::Hue, Channel::Position],
 };
 
 const LIGHT_LIVE_DIM: Signal = Signal {
-    color: Color32::from_rgb(104, 145, 151),
+    color: Color32::from_rgb(70, 130, 143),
     tier: Tier::Exception,
     channels: &[Channel::Hue, Channel::Position],
 };
@@ -796,10 +803,10 @@ mod tests {
     }
 
     /// Colour is an exception by construction: most of the alphabet is
-    /// grey, and everything a calm screen draws is. The grey is BONE — a
-    /// warm tint, the same on every rung — but a tint is not a hue: its
+    /// grey, and everything a calm screen draws is. The grey is CHROME — a
+    /// cold tint, the same on every rung — but a tint is not a hue: its
     /// chroma stays under the floor at which the eye would name a colour,
-    /// and the hue it does carry is one warm hue for the whole ladder.
+    /// and the hue it does carry is one cold hue for the whole ladder.
     #[test]
     fn the_resting_alphabet_is_only_tinted() {
         for alphabet in BOTH {
@@ -813,8 +820,8 @@ mod tests {
                 if color.r() > 8 {
                     let h = hue_degrees(color);
                     assert!(
-                        (20.0..=60.0).contains(&h),
-                        "the bone tint drifted off warm: {color:?} at {h}°"
+                        (180.0..=230.0).contains(&h),
+                        "the chrome tint drifted off cold: {color:?} at {h}°"
                     );
                 }
             }
@@ -831,7 +838,7 @@ mod tests {
         for pair in hues.windows(2) {
             assert!(
                 (pair[0] - pair[1]).abs() < 12.0,
-                "the ladder's warmth is uneven: {hues:?}"
+                "the ladder's chrome tint is uneven: {hues:?}"
             );
         }
     }

@@ -118,13 +118,32 @@ const CLIP_HELP_EXAMPLES: [(&str, &str); 16] = [
 /// is for the distances between things, not for how big a zone is.
 const PERIPHERY_H: f32 = 64.0;
 
-/// The frame's side rails: how much of the surface material shows to the
+/// The frame's side rails: how much of the dark casing shows to the
 /// left and right of the field. With the vitals and message strips this
 /// closes the periphery into one continuous casing, so the field is a
 /// window CUT INTO the deck rather than a band laid between two bars.
 /// Kept small on purpose — it is a frame, not a margin — and, like
 /// `PERIPHERY_H`, a layout dimension settled by eye rather than a rung.
 const FRAME_W: f32 = 12.0;
+
+/// The fixed casing under every aperture. In the house-dark projection it
+/// is true black, below even the field ground; in daylight it remains a
+/// darker metal around the paper-bright displays.
+fn shell_base(polarity: design::Polarity) -> egui::Color32 {
+    match polarity {
+        design::Polarity::Dark => design::chrome(0),
+        design::Polarity::Light => design::chrome(150),
+    }
+}
+
+/// The raised plates bolted to the casing. Still below ordinary cards and
+/// display faces, but far enough from the base for the shell to have depth.
+fn shell_plate(polarity: design::Polarity) -> egui::Color32 {
+    match polarity {
+        design::Polarity::Dark => design::chrome(32),
+        design::Polarity::Light => design::chrome(190),
+    }
+}
 
 /// The corner the deck gives up when it IS the screen. Windowed, the
 /// compositor owns the corners and the frame keeps its bevels at the
@@ -409,7 +428,7 @@ impl Layout {
         // app, while the browser is content and sits with the content.
         //
         // The band stands off the window's sides by the frame rail, so
-        // the surface material runs unbroken from the vitals, down both
+        // the shell material runs unbroken from the vitals, down both
         // sides, into the message strip.
         let band = egui::Rect::from_min_max(
             egui::pos2(whole.min.x + FRAME_W, vitals.max.y),
@@ -3564,11 +3583,21 @@ impl Stage {
         // that owns its own appearance.
         //
         // The casing is painted first and the field is cut out of it: the
-        // whole window is surface material, and the field is the one
+        // whole window is shell material, and the field is the one
         // place the ground shows through. Vitals, message strip and the
         // two side rails are therefore one continuous frame, not four
         // pieces that happen to touch.
-        painter.rect_filled(whole, 0.0, self.alphabet().surface.color);
+        painter.rect_filled(whole, 0.0, shell_base(self.polarity));
+        // The field is a physical cut into that metal plane. One opaque,
+        // offset silhouette supplies depth without blur, gloss or a
+        // gradient; the ground laid next covers its upper-left overlap.
+        painter.rect_filled(
+            field
+                .translate(egui::vec2(circuit::SHADOW_X, circuit::SHADOW_Y))
+                .intersect(whole),
+            0.0,
+            circuit::shadow_ink(self.alphabet().ground.color),
+        );
         painter.rect_filled(field, 0.0, self.alphabet().ground.color);
         // The ground's own material. Quietest thing on the surface, says
         // nothing, and therefore may cover everything — and what it does
@@ -3579,6 +3608,7 @@ impl Stage {
             self.alphabet().surface.color,
             design::px(design::space::VAST),
         );
+        self.draw_shell_plating(&painter, vitals, transport, message, field, phase);
         // The regions get an edge each.
         //
         // This is a DEPARTURE from the rule above, and worth saying so
@@ -3673,49 +3703,61 @@ impl Stage {
                 painter.extend(rings);
             }
         }
-        // The register: a rail with pads just before the seam, where the
-        // breadcrumb never reaches. Structure rung.
+        // The meter register: the song's real beat count and current beat,
+        // just before the transport aperture. No fixed barcode masquerades
+        // as telemetry here; every pad is one beat in the active meter.
         {
             let edge = self.alphabet().edge.color;
+            let active = if phase.rolling {
+                self.alphabet().live.color
+            } else {
+                self.alphabet().ink.color
+            };
             let room = design::px(design::space::ROOM);
             let strip = egui::Rect::from_min_max(
                 egui::pos2(transport.min.x - room * 12.0, vitals.min.y + room * 0.6),
                 egui::pos2(transport.min.x - room, vitals.max.y - room * 0.6),
             );
             if strip.min.x > breadcrumb.min.x + room * 10.0 {
+                let place = self.transport.place(&self.song);
                 kit::cached(
                     &painter,
                     egui::Id::new("stage-register"),
                     strip,
-                    edge,
+                    (edge, active, place.beat, place.beats_per_bar),
                     |out| {
                         let y = strip.center().y;
-                        circuit::rail(
+                        circuit::trace(
                             out,
-                            egui::pos2(strip.min.x + strip.height(), y),
-                            egui::pos2(strip.max.x, y),
-                            &[0.0, 0.2, 0.45, 0.7, 1.0],
-                            edge,
-                        );
-                        Sign::Dipper.paint(
-                            out,
-                            egui::Rect::from_center_size(
-                                egui::pos2(strip.min.x + strip.height() * 0.5, y),
-                                egui::Vec2::splat(strip.height()),
-                            ),
+                            &[
+                                egui::pos2(strip.min.x + 8.0, y),
+                                egui::pos2(strip.max.x - 8.0, y),
+                            ],
                             Weight::Hair,
                             edge,
                         );
-                        let mut rng = kit::Rng::seeded("register");
-                        circuit::barcode(
-                            out,
-                            egui::Rect::from_min_max(
-                                egui::pos2(strip.max.x - 70.0, y + 4.0),
-                                egui::pos2(strip.max.x, strip.max.y),
-                            ),
-                            &mut rng,
-                            edge,
-                        );
+                        let beats = place.beats_per_bar.clamp(1, 16);
+                        let run = strip.width() - 32.0;
+                        for beat in 1..=beats {
+                            let t = if beats == 1 {
+                                0.5
+                            } else {
+                                (beat - 1) as f32 / (beats - 1) as f32
+                            };
+                            let at = egui::pos2(strip.left() + 16.0 + run * t, y);
+                            let current = beat == place.beat.min(beats);
+                            circuit::pad(
+                                out,
+                                at,
+                                if current {
+                                    circuit::PAD + 1.0
+                                } else {
+                                    circuit::PAD - 1.0
+                                },
+                                if current { active } else { edge },
+                                current,
+                            );
+                        }
                     },
                 );
             }
@@ -3751,68 +3793,7 @@ impl Stage {
         self.draw_stream(&painter, stream_screen(vitals, transport), phase);
         self.draw_engine(&painter, message);
         self.draw_transport(&painter, transport);
-        // The badge. Instruments have them, and this is the one piece of
-        // ornament here that carries nothing at all.
-        // It is a SEAL now — a brush ring with a register glyph inside —
-        // and after it the colophon: two glyphs and a barcode, the
-        // maker's mark of a deck that was handed down rather than
-        // bought. None of it varies with anything.
-        {
-            let ink_col = self.alphabet().ink.color;
-            let edge = self.alphabet().edge.color;
-            let r = design::px(design::space::STEP) * 0.8;
-            let c = egui::pos2(
-                message.min.x + design::px(design::space::ROOM) + r * 0.5,
-                message.center().y,
-            );
-            let zone = egui::Rect::from_center_size(c, egui::Vec2::splat(r * 2.8));
-            kit::cached(
-                &painter,
-                egui::Id::new("stage-badge"),
-                zone,
-                ink_col,
-                |out| {
-                    Sign::Engine.paint(
-                        out,
-                        egui::Rect::from_center_size(c, egui::Vec2::splat(r * 2.2)),
-                        Weight::Hair,
-                        ink_col,
-                    );
-                },
-            );
-            let gx = c.x + r + design::px(design::space::ROOM);
-            let gs = design::px(design::space::ROOM) * 1.2;
-            let colophon = egui::Rect::from_min_max(
-                egui::pos2(gx, message.min.y),
-                egui::pos2(gx + gs * 2.5 + 80.0, message.max.y),
-            );
-            kit::cached(
-                &painter,
-                egui::Id::new("stage-colophon"),
-                colophon,
-                edge,
-                |out| {
-                    for (i, sign) in [Sign::Codex, Sign::Archive].into_iter().enumerate() {
-                        let cell = egui::Rect::from_center_size(
-                            egui::pos2(gx + gs * (0.5 + 1.15 * i as f32), c.y),
-                            egui::Vec2::splat(gs * 0.8),
-                        );
-                        sign.paint(out, cell, Weight::Hair, edge);
-                    }
-                    let bx = gx + gs * 2.5;
-                    let mut rng = kit::Rng::seeded("colophon");
-                    circuit::barcode(
-                        out,
-                        egui::Rect::from_center_size(
-                            egui::pos2(bx + 36.0, c.y),
-                            egui::vec2(72.0, gs * 0.7),
-                        ),
-                        &mut rng,
-                        edge,
-                    );
-                },
-            );
-        }
+        self.draw_shell_register(&painter, message);
         self.draw_message(&painter, message);
         // The codebook takes the whole field while it is up. It is a
         // DISPLAY mode, not a scope: focus never enters it, and the
@@ -3873,6 +3854,202 @@ impl Stage {
         // is a callout, and a callout drawn under anything is a callout
         // pointing through it.
         self.draw_trig_menu(&painter, whole);
+    }
+
+    /// The fixed shell: two raised faceplates, a recessed transport glass,
+    /// an engraved message well, focus-depth cells on the left rail, and
+    /// the actual master level on the right. The geometry is ceremonial;
+    /// every changing mark is a value already owned by the stage.
+    fn draw_shell_plating(
+        &self,
+        painter: &egui::Painter,
+        vitals: egui::Rect,
+        transport: egui::Rect,
+        message: egui::Rect,
+        field: egui::Rect,
+        phase: Phase,
+    ) {
+        let alpha = self.alphabet();
+        let base = shell_base(self.polarity);
+        let plate = shell_plate(self.polarity);
+        let edge = alpha.edge.color;
+        let mut shell = Vec::new();
+
+        // A thin raised insert runs down each side. The true-black base is
+        // left visible around it, while the focus and level instruments sit
+        // on metal rather than floating in the void.
+        for rail in [
+            egui::Rect::from_min_max(
+                egui::pos2(vitals.left() + 3.0, field.top() + 3.0),
+                egui::pos2(field.left() - 2.0, field.bottom() - 3.0),
+            ),
+            egui::Rect::from_min_max(
+                egui::pos2(field.right() + 2.0, field.top() + 3.0),
+                egui::pos2(vitals.right() - 3.0, field.bottom() - 3.0),
+            ),
+        ] {
+            shell.push(egui::Shape::rect_filled(rail, 0.0, plate));
+        }
+
+        for (rect, variant) in [
+            (vitals.shrink2(egui::vec2(2.0, 3.0)), 2),
+            (message.shrink2(egui::vec2(2.0, 3.0)), 3),
+        ] {
+            circuit::panel_variant(
+                &mut shell,
+                rect,
+                Some(plate),
+                base,
+                Some((Weight::Heavy, edge)),
+                variant,
+            );
+            circuit::panel_frame_variant(
+                &mut shell,
+                rect.shrink(3.0),
+                Weight::Hair,
+                edge.gamma_multiply(0.48),
+                variant.wrapping_add(1),
+            );
+        }
+
+        // Time is a display, not text printed on the chassis.
+        let clock_glass = transport.shrink2(egui::vec2(5.0, 8.0));
+        circuit::panel_variant(
+            &mut shell,
+            clock_glass,
+            Some(alpha.ground.color),
+            plate,
+            Some((Weight::Heavy, edge)),
+            1,
+        );
+        circuit::panel_frame_variant(
+            &mut shell,
+            clock_glass.shrink(3.0),
+            Weight::Hair,
+            edge.gamma_multiply(0.55),
+            3,
+        );
+
+        // Messages are engraved into a long dark trough in the lower plate.
+        let message_well = message.shrink2(egui::vec2(5.0, 9.0));
+        circuit::panel_variant(
+            &mut shell,
+            message_well,
+            Some(alpha.ground.color),
+            plate,
+            Some((Weight::Hair, edge)),
+            0,
+        );
+        circuit::panel_frame_variant(
+            &mut shell,
+            message_well.shrink(3.0),
+            Weight::Hair,
+            edge.gamma_multiply(0.42),
+            2,
+        );
+
+        // The rails themselves are structural seams with hard angular
+        // shoulders. Their changing contents are added below.
+        for x in [field.left() - FRAME_W * 0.5, field.right() + FRAME_W * 0.5] {
+            let top = field.top() + 8.0;
+            let bottom = field.bottom() - 8.0;
+            circuit::trace(
+                &mut shell,
+                &[
+                    egui::pos2(x, top),
+                    egui::pos2(x, top + 18.0),
+                    egui::pos2(x + 3.0, top + 21.0),
+                    egui::pos2(x + 3.0, bottom - 21.0),
+                    egui::pos2(x, bottom - 18.0),
+                    egui::pos2(x, bottom),
+                ],
+                Weight::Hair,
+                edge,
+            );
+        }
+
+        // Left rail: one real cell per focus level, up to the stack's cap.
+        let depth = self.focus.depth().min(MAX_DEPTH);
+        let left_x = field.left() - FRAME_W * 0.5;
+        for level in 0..MAX_DEPTH {
+            circuit::pad(
+                &mut shell,
+                egui::pos2(left_x, field.top() + 42.0 + level as f32 * 12.0),
+                circuit::PAD,
+                if level < depth { alpha.ink.color } else { edge },
+                level < depth,
+            );
+        }
+
+        // Right rail: the real master peak, repeated at the casing edge so
+        // level remains visible while any field or overlay owns the centre.
+        let master = self.meters.master().level.peak().clamp(0.0, 1.0);
+        let meter = egui::Rect::from_min_max(
+            egui::pos2(field.right() + 3.0, field.top() + 28.0),
+            egui::pos2(field.right() + 9.0, field.bottom() - 28.0),
+        );
+        circuit::tick_bar(
+            &mut shell,
+            meter,
+            32,
+            master,
+            if phase.rolling {
+                alpha.live.color
+            } else {
+                alpha.ink.color
+            },
+            edge.gamma_multiply(0.45),
+            false,
+        );
+        painter.extend(shell);
+    }
+
+    /// The bottom-left register is state, not a maker's mark: engine life,
+    /// track count, scene count and focus depth. The binary cells keep the
+    /// inherited-machine character while their labels make the facts honest.
+    fn draw_shell_register(&self, painter: &egui::Painter, message: egui::Rect) {
+        let alpha = self.alphabet();
+        let y = message.center().y;
+        let engine_ink = if self.vitals.running() {
+            alpha.live.color
+        } else {
+            alpha.edge.color
+        };
+        let mut marks = Vec::new();
+        Sign::Engine.paint(
+            &mut marks,
+            egui::Rect::from_center_size(
+                egui::pos2(message.left() + 22.0, y),
+                egui::Vec2::splat(18.0),
+            ),
+            Weight::Hair,
+            engine_ink,
+        );
+        let facts = [
+            ('T', self.song.tracks.len().min(255) as u32),
+            ('S', self.song.session.scenes.len().min(255) as u32),
+            ('D', self.focus.depth().min(255) as u32),
+        ];
+        let font = egui::FontId::monospace(9.0);
+        for (index, (label, value)) in facts.into_iter().enumerate() {
+            let x = message.left() + 48.0 + index as f32 * 44.0;
+            painter.text(
+                egui::pos2(x, y),
+                egui::Align2::LEFT_CENTER,
+                label,
+                font.clone(),
+                alpha.edge.color,
+            );
+            circuit::binary(
+                &mut marks,
+                egui::pos2(x + 10.0, y - 1.5),
+                2.5,
+                value,
+                8,
+                alpha.ink.color,
+            );
+        }
+        painter.extend(marks);
     }
 
     /// The trig menu: a chamfered casing over the sequencer with a wedge
@@ -5923,6 +6100,7 @@ impl Stage {
         // were drawn for.
         let k = screen.height() / 30.0;
         let alpha = self.alphabet();
+        let plate = shell_plate(self.polarity);
         let stream = self.vitals.stream().copied();
         let running = self.vitals.running();
         let facts = stream.map(|s| {
@@ -5939,15 +6117,28 @@ impl Stage {
             painter,
             egui::Id::new("stage-stream-screen"),
             screen,
-            (alpha.ground.color, alpha.edge.color, alpha.ink.color, facts),
+            (
+                alpha.ground.color,
+                plate,
+                alpha.edge.color,
+                alpha.ink.color,
+                facts,
+            ),
             |out| {
                 circuit::panel_variant(
                     out,
                     screen,
                     Some(alpha.ground.color),
-                    alpha.surface.color,
+                    plate,
                     Some((Weight::Hair, alpha.edge.color)),
                     2,
+                );
+                circuit::panel_frame_variant(
+                    out,
+                    screen.shrink(3.0 * k),
+                    Weight::Hair,
+                    alpha.edge.color.gamma_multiply(0.48),
+                    0,
                 );
                 let inner = screen.shrink2(egui::vec2(10.0 * k, 5.0 * k));
                 let y = inner.center().y;
@@ -6069,6 +6260,20 @@ impl Stage {
             circuit::trace(&mut marks, &foot, Weight::Hair, alpha.edge.color);
         }
         painter.extend(marks);
+        if self.polarity == design::Polarity::Dark {
+            crate::shell::screen::register(
+                painter,
+                screen.shrink2(egui::vec2(5.0 * k, 4.0 * k)),
+                crate::shell::screen::State::new(
+                    if phase.rolling { phase.beat } else { 0.0 },
+                    if running {
+                        0.18 + phase.pulse() * 0.72
+                    } else {
+                        0.0
+                    },
+                ),
+            );
+        }
     }
 
     fn draw_breadcrumb(&self, painter: &egui::Painter, zone: egui::Rect) {
@@ -6206,31 +6411,87 @@ impl Stage {
         let center_y = zone.center().y;
         let mut right = zone.max.x - margin;
 
-        // The clock's face: a sigil wheel at the strip's shoulder. The
-        // one instrument on the periphery, and it does not turn.
+        // The clock's face: an actual meter wheel at the strip's shoulder.
+        // One angular pad per score beat, the current beat filled, and the
+        // denominator cut into the hub. It looks ceremonial because the
+        // song's meter is radial here, not because fake runes were added.
         {
             let r = (zone.height() * 0.36).min(22.0);
             let c = egui::pos2(zone.min.x + margin + r, center_y);
-            let ink_col = self.alphabet().ink.color;
-            let ground = self.alphabet().ground.color;
+            let alpha = self.alphabet();
+            let ink_col = alpha.ink.color;
+            let ground = alpha.ground.color;
+            let current_ink = if self.transport.motion().is_rolling() {
+                alpha.live.color
+            } else {
+                ink_col
+            };
+            let denominator: Vec<u8> = place
+                .denominator
+                .to_string()
+                .bytes()
+                .map(|byte| byte - b'0')
+                .collect();
             let face = egui::Rect::from_center_size(c, egui::Vec2::splat(r * 2.4));
             kit::cached(
                 painter,
                 egui::Id::new("stage-clock"),
                 face,
-                (ink_col, ground),
+                (
+                    ink_col,
+                    current_ink,
+                    ground,
+                    place.beat,
+                    place.beats_per_bar,
+                    place.denominator,
+                ),
                 |out| {
                     out.push(egui::Shape::circle_stroke(
                         c,
                         r,
                         egui::Stroke::new(Weight::Heavy.px(), ink_col),
                     ));
-                    Sign::Dipper.paint(
-                        out,
-                        egui::Rect::from_center_size(c, egui::Vec2::splat(r * 1.3)),
-                        Weight::Hair,
-                        ink_col,
-                    );
+                    out.push(egui::Shape::circle_stroke(
+                        c,
+                        r - 5.0,
+                        egui::Stroke::new(Weight::Hair.px(), alpha.edge.color),
+                    ));
+                    let beats = place.beats_per_bar.max(1);
+                    for beat in 1..=beats {
+                        let angle = -std::f32::consts::FRAC_PI_2
+                            + std::f32::consts::TAU * (beat - 1) as f32 / beats as f32;
+                        let at = c + egui::vec2(angle.cos(), angle.sin()) * (r - 2.5);
+                        let current = beat == place.beat.min(beats);
+                        circuit::pad(
+                            out,
+                            at,
+                            if current {
+                                circuit::PAD + 1.0
+                            } else {
+                                circuit::PAD - 1.0
+                            },
+                            if current {
+                                current_ink
+                            } else {
+                                alpha.edge.color
+                            },
+                            current,
+                        );
+                    }
+                    let digit_w = 8.0;
+                    let start = c.x - denominator.len() as f32 * digit_w * 0.5;
+                    for (index, digit) in denominator.iter().copied().enumerate() {
+                        Sign::Numeral(digit).paint(
+                            out,
+                            egui::Rect::from_center_size(
+                                egui::pos2(start + digit_w * (index as f32 + 0.5), c.y),
+                                egui::Vec2::splat(8.0),
+                            ),
+                            Weight::Hair,
+                            ink_col,
+                        );
+                    }
+                    circuit::brackets(out, face.shrink(2.0), 5.0, Weight::Hair, alpha.edge.color);
                 },
             );
         }
@@ -6312,6 +6573,24 @@ impl Stage {
                 block::unit::MICRO,
                 "REC",
                 self.alphabet().jeopardy_active.color,
+            );
+        }
+        let phase = Phase::of(
+            self.transport.motion().is_rolling(),
+            self.transport.beat_phase(),
+        );
+        if self.polarity == design::Polarity::Dark {
+            crate::shell::screen::register(
+                painter,
+                zone.shrink2(egui::vec2(8.0, 11.0)),
+                crate::shell::screen::State::new(
+                    if phase.rolling { phase.beat } else { 0.0 },
+                    if phase.rolling {
+                        0.24 + phase.pulse() * 0.70
+                    } else {
+                        0.0
+                    },
+                ),
             );
         }
     }
@@ -11054,6 +11333,21 @@ mod tests {
             focus < light_ground,
             "focus is lighter than the paper it sits on"
         );
+    }
+
+    #[test]
+    fn the_outer_shell_stays_below_every_working_plane() {
+        for polarity in [design::Polarity::Dark, design::Polarity::Light] {
+            let alpha = design::Alphabet::for_polarity(polarity);
+            let base = design::lightness_of(shell_base(polarity));
+            let plate = design::lightness_of(shell_plate(polarity));
+            let ground = design::lightness_of(alpha.ground.color);
+            let surface = design::lightness_of(alpha.surface.color);
+
+            assert!(base < plate, "the casing did not sit below its faceplate");
+            assert!(base < ground, "the casing did not sit below the field");
+            assert!(plate < surface, "the faceplate competed with a card");
+        }
     }
 
     #[test]

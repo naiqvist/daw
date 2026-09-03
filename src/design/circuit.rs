@@ -22,7 +22,11 @@ pub const PAD: f32 = 5.0;
 pub const VIA: f32 = 3.0;
 /// The corner a frame gives up. The same size everywhere — it reads as a
 /// bevel on a made object, never as a shape of its own.
-pub const CHAMFER: f32 = 6.0;
+pub const CHAMFER: f32 = 8.0;
+/// Flat, hard-edged depth for constructed panels. Never blurred and never
+/// feathered: the offset is another cut silhouette, not simulated light.
+pub const SHADOW_X: f32 = 3.0;
+pub const SHADOW_Y: f32 = 4.0;
 /// One dash, and the gap after it.
 pub const DASH: f32 = 8.0;
 
@@ -321,6 +325,69 @@ pub fn panel(
     panel_variant(out, rect, fill, ground, stroke, 0);
 }
 
+/// Fill one asymmetric casing, including its cutouts. Kept separate from
+/// the outline so the same exact silhouette can be laid once as a hard
+/// shadow and once as the metal face.
+fn panel_body(
+    out: &mut Vec<Shape>,
+    rect: Rect,
+    c: f32,
+    s: f32,
+    variant: u8,
+    fill: Color32,
+    mask: Color32,
+) {
+    let (l, t, r, b) = (rect.left(), rect.top(), rect.right(), rect.bottom());
+    let side_a = t + rect.height() * 0.27;
+    let side_b = (side_a + c * 1.35).min(b - c);
+    let lower_a = t + rect.height() * 0.62;
+    let lower_b = (lower_a + c * 1.35).min(b - c);
+    out.push(Shape::rect_filled(rect, 0.0, fill));
+    let triangle = |out: &mut Vec<Shape>, points| {
+        out.push(Shape::convex_polygon(points, mask, Stroke::NONE));
+    };
+    match variant % 4 {
+        0 => {
+            triangle(out, vec![pos2(l, t), pos2(l + c, t), pos2(l, t + c)]);
+            triangle(out, vec![pos2(r, b), pos2(r - c, b), pos2(r, b - c)]);
+        }
+        1 => {
+            triangle(out, vec![pos2(r, t), pos2(r - c, t), pos2(r, t + c)]);
+            triangle(out, vec![pos2(l, b), pos2(l + c, b), pos2(l, b - c)]);
+            out.push(Shape::rect_filled(
+                Rect::from_min_max(pos2(r - s, side_a), pos2(r, side_b)),
+                0.0,
+                mask,
+            ));
+        }
+        2 => {
+            triangle(out, vec![pos2(r, t), pos2(r - c, t), pos2(r, t + c)]);
+            out.push(Shape::rect_filled(
+                Rect::from_min_max(pos2(l, b - c), pos2(l + s, b)),
+                0.0,
+                mask,
+            ));
+        }
+        _ => {
+            triangle(out, vec![pos2(r, b), pos2(r - c, b), pos2(r, b - c)]);
+            out.push(Shape::rect_filled(
+                Rect::from_min_max(pos2(l, lower_a), pos2(l + s, lower_b)),
+                0.0,
+                mask,
+            ));
+        }
+    }
+}
+
+/// The one shadow ink, projected for dark metal or light paper.
+pub fn shadow_ink(ground: Color32) -> Color32 {
+    if ground.r().max(ground.g()).max(ground.b()) > 127 {
+        Color32::from_black_alpha(88)
+    } else {
+        Color32::from_black_alpha(232)
+    }
+}
+
 /// One of four related, deliberately non-uniform panel constructions.
 pub fn panel_variant(
     out: &mut Vec<Shape>,
@@ -333,11 +400,11 @@ pub fn panel_variant(
     if !rect.is_positive() {
         return;
     }
-    let c = 6.0_f32
+    let c = CHAMFER
         .min(rect.width() / 10.0)
         .min(rect.height() / 5.0)
         .max(1.0);
-    let s = (c * 1.8).min(rect.width() / 7.0);
+    let s = (c * 2.2).min(rect.width() / 6.0);
     let (l, t, r, b) = (rect.left(), rect.top(), rect.right(), rect.bottom());
     let variant = variant % 4;
     let side_a = t + rect.height() * 0.27;
@@ -393,41 +460,16 @@ pub fn panel_variant(
     };
 
     if let Some(fill) = fill {
-        out.push(Shape::rect_filled(rect, 0.0, fill));
-        let triangle = |out: &mut Vec<Shape>, points| {
-            out.push(Shape::convex_polygon(points, ground, Stroke::NONE));
-        };
-        match variant {
-            0 => {
-                triangle(out, vec![pos2(l, t), pos2(l + c, t), pos2(l, t + c)]);
-                triangle(out, vec![pos2(r, b), pos2(r - c, b), pos2(r, b - c)]);
-            }
-            1 => {
-                triangle(out, vec![pos2(r, t), pos2(r - c, t), pos2(r, t + c)]);
-                triangle(out, vec![pos2(l, b), pos2(l + c, b), pos2(l, b - c)]);
-                out.push(Shape::rect_filled(
-                    Rect::from_min_max(pos2(r - s, side_a), pos2(r, side_b)),
-                    0.0,
-                    ground,
-                ));
-            }
-            2 => {
-                triangle(out, vec![pos2(r, t), pos2(r - c, t), pos2(r, t + c)]);
-                out.push(Shape::rect_filled(
-                    Rect::from_min_max(pos2(l, b - c), pos2(l + s, b)),
-                    0.0,
-                    ground,
-                ));
-            }
-            _ => {
-                triangle(out, vec![pos2(r, b), pos2(r - c, b), pos2(r, b - c)]);
-                out.push(Shape::rect_filled(
-                    Rect::from_min_max(pos2(l, lower_a), pos2(l + s, lower_b)),
-                    0.0,
-                    ground,
-                ));
-            }
-        }
+        panel_body(
+            out,
+            rect.translate(vec2(SHADOW_X, SHADOW_Y)),
+            c,
+            s,
+            variant,
+            shadow_ink(ground),
+            ground,
+        );
+        panel_body(out, rect, c, s, variant, fill, ground);
     }
 
     if let Some((weight, ink)) = stroke {
@@ -1059,10 +1101,15 @@ mod tests {
             barcode(&mut out, rect, &mut Rng::new(1), INK);
             cases.push(("barcode", out));
             for (name, shapes) in cases {
+                let bounds = if name == "panel_variant" {
+                    rect.expand(SHADOW_X.max(SHADOW_Y) + 3.0)
+                } else {
+                    within
+                };
                 for s in &shapes {
                     for p in points_of(s) {
                         assert!(
-                            within.contains(p),
+                            bounds.contains(p),
                             "{name} at {side}: {p:?} outside {rect:?}"
                         );
                     }
@@ -1136,5 +1183,28 @@ mod tests {
                 assert_ne!(variants[a], variants[b], "variants {a} and {b} repeated");
             }
         }
+    }
+
+    #[test]
+    fn a_filled_panel_casts_one_hard_offset_silhouette() {
+        let rect = r(180.0, 90.0);
+        let mut out = Vec::new();
+        panel_variant(
+            &mut out,
+            rect,
+            Some(INK),
+            GROUND,
+            Some((Weight::Hair, INK)),
+            0,
+        );
+        let Some(Shape::Rect(shadow)) = out.first() else {
+            panic!("the panel did not lay its shadow first")
+        };
+        assert_eq!(
+            shadow.rect,
+            rect.translate(vec2(SHADOW_X, SHADOW_Y)),
+            "the shadow blurred or lost its fixed offset"
+        );
+        assert_eq!(shadow.corner_radius, eframe::egui::CornerRadius::ZERO);
     }
 }
