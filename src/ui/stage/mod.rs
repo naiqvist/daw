@@ -280,6 +280,27 @@ const CHAIN_PITCH: f32 = 24.0;
 /// A card's head: the family seal, the terse title, and a sample's name.
 const CHAIN_HEAD_H: f32 = 40.0;
 
+/// The LOOM: a lane along the foot of the band where the two sends run
+/// out to their returns and the returns run back into the mix. It costs
+/// the cards one row and buys the one thing a list of devices can never
+/// say — that the signal does not only go left to right.
+const LOOM_H: f32 = 15.0;
+/// The gap the band opens where it crosses from one rail of the desk to
+/// the next. Wide enough for the pair to cross it visibly and for the
+/// rail's name to climb beside them.
+const RAIL_GAP: f32 = 34.0;
+/// The two returns' cables. A send is followed by eye, so each return
+/// owns a colour: TAPE warm like the oxide, SHADOW cold like a plate.
+const RETURN_INK: [egui::Color32; 2] = [
+    egui::Color32::from_rgb(230, 170, 96),
+    egui::Color32::from_rgb(130, 176, 255),
+];
+
+/// A cable's ink at `amount` of its full strength.
+fn tint(ink: egui::Color32, amount: f32) -> egui::Color32 {
+    ink.gamma_multiply(amount.clamp(0.0, 1.0))
+}
+
 /// The gutter left of the session where each scene's address is written.
 /// A layout dimension: two digits of the smallest type and a breath, and
 /// it is reserved whether or not there are scenes to number, so the
@@ -1308,13 +1329,7 @@ impl Stage {
     /// strip's sections, in the band's order.
     fn band_device(&self, col: usize) -> Option<(usize, DeviceId)> {
         let track = self.addressed_track()?;
-        let lane = &self.song.tracks[track];
-        let device = if col < lane.chain.len() {
-            &lane.chain[col]
-        } else {
-            lane.strip.get(col - lane.chain.len())?
-        };
-        Some((track, device.id))
+        Some((track, chain::device_at(&self.song, track, col)?))
     }
 
     /// The device under the band's cursor, chain or strip.
@@ -1343,15 +1358,13 @@ impl Stage {
         let Some(track) = self.addressed_track() else {
             return (0, 0);
         };
-        let lane = &self.song.tracks[track];
-        let rows = lane
-            .chain
+        let band = chain::band_devices(&self.song, track);
+        let rows = band
             .iter()
-            .chain(lane.strip.iter())
-            .map(|device| device.kind.spec().params.len())
+            .map(|(_, device)| device.kind.spec().params.len())
             .max()
             .unwrap_or(0);
-        (lane.chain.len() + lane.strip.len(), rows)
+        (band.len(), rows)
     }
 
     /// The track the session's cursor ADDRESSES, whether or not focus is
@@ -4606,12 +4619,39 @@ impl Stage {
             .iter()
             .map(|column| column.section.map_or(CHAIN_W, strip::width_of))
             .collect();
+        // Two pieces mate only when they stand on the SAME rail: a
+        // channel's sections are one run, its group bus's another, the
+        // mix's another. Where the band crosses from one rail to the
+        // next it opens a gap, and the pair crosses it as a visible
+        // cable with the rail's name engraved over it — because that
+        // crossing is a real thing about the desk, not a seam to hide.
+        // A return mates with nothing at all: it is a parallel path.
         let mates = |i: usize| -> bool {
             i + 1 < columns.len()
                 && columns[i].section.is_some()
                 && columns[i + 1].section.is_some()
+                && columns[i].lane == columns[i + 1].lane
         };
-        let step = |i: usize| -> f32 { widths[i] + if mates(i) { 0.0 } else { gap } };
+        // Where the band crosses rails it opens the wider gap, so the
+        // cable and the rail's name have room to be seen.
+        let crossing = |i: usize| -> bool {
+            i + 1 < columns.len()
+                && columns[i].section.is_some()
+                && columns[i + 1].section.is_some()
+                && columns[i].lane != columns[i + 1].lane
+                && columns[i].lane.in_series()
+                && columns[i + 1].lane.in_series()
+        };
+        let step = |i: usize| -> f32 {
+            widths[i]
+                + if mates(i) {
+                    0.0
+                } else if crossing(i) {
+                    RAIL_GAP
+                } else {
+                    gap
+                }
+        };
         let avail = tray.width() - margin * 2.0;
 
         // The rail scrolls so the cursor's piece is on screen: the first
@@ -4646,7 +4686,7 @@ impl Stage {
                 i,
                 egui::Rect::from_min_max(
                     egui::pos2(x, tray.top()),
-                    egui::pos2(x + widths[i], tray.bottom() - margin),
+                    egui::pos2(x + widths[i], tray.bottom() - margin - LOOM_H),
                 ),
             ));
             x += step(i);
@@ -4665,6 +4705,18 @@ impl Stage {
             let (left_index, left_rect) = pair[0];
             let (right_index, right_rect) = pair[1];
             if columns[left_index].section.is_some() && columns[right_index].section.is_some() {
+                let (left_lane, right_lane) = (columns[left_index].lane, columns[right_index].lane);
+                if left_lane == right_lane {
+                    // Joined. There is nothing between them to draw.
+                    continue;
+                }
+                if !left_lane.in_series() || !right_lane.in_series() {
+                    // A return is reached by its cable, not by the rail.
+                    continue;
+                }
+                self.draw_rail_crossing(
+                    painter, left_rect, right_rect, right_lane, sounding, phase,
+                );
                 continue;
             }
             let from = egui::pos2(left_rect.right(), signal_y);
@@ -4713,7 +4765,11 @@ impl Stage {
                             index: *i,
                             rect: *rect,
                             kind,
-                            notch: *i > 0 && columns[*i - 1].section.is_some(),
+                            // A return is off the rail, so it wears a
+                            // notch for its send cable and leaves by a
+                            // pad rather than by a tongue.
+                            notch: !columns[*i].lane.in_series()
+                                || (*i > 0 && columns[*i - 1].section.is_some()),
                             tongue: mates(*i),
                         },
                         &columns[*i],
@@ -4758,6 +4814,223 @@ impl Stage {
                 pitch,
             );
         }
+        self.draw_loom(
+            painter,
+            egui::Rect::from_min_max(
+                egui::pos2(tray.left() + margin, tray.bottom() - margin - LOOM_H),
+                egui::pos2(tray.right() - margin, tray.bottom() - margin),
+            ),
+            track,
+            &columns,
+            &layout,
+            sounding,
+            phase,
+        );
+    }
+
+    /// Where the band crosses from one rail of the desk to the next:
+    /// the channel's last section into its group bus, the bus into the
+    /// mix.
+    ///
+    /// The pair crosses a real gap, and the rail it is arriving on is
+    /// named climbing beside it. This is the one place on the band
+    /// where a card does NOT plug into its neighbour, and it is the
+    /// place where the signal stops being one track's and becomes the
+    /// desk's — so the eye is told, rather than left to guess from a
+    /// change of seal.
+    fn draw_rail_crossing(
+        &self,
+        painter: &egui::Painter,
+        left: egui::Rect,
+        right: egui::Rect,
+        lane: chain::Lane,
+        sounding: bool,
+        phase: Phase,
+    ) {
+        let alpha = self.alphabet();
+        let jy = strip::joint_y(right);
+        let from_x = left.right();
+        let to_x = right.left() + strip::TONGUE;
+        let mut shapes = Vec::new();
+        for dy in [-4.0, 4.0] {
+            let path = [egui::pos2(from_x, jy + dy), egui::pos2(to_x, jy + dy)];
+            circuit::trace(&mut shapes, &path, Weight::Hair, alpha.edge.color);
+            if sounding && phase.rolling {
+                circuit::dashes(
+                    &mut shapes,
+                    &path,
+                    phase.dash(),
+                    Weight::Heavy,
+                    alpha.live_dim.color,
+                );
+            }
+            circuit::pad(
+                &mut shapes,
+                egui::pos2(from_x, jy + dy),
+                circuit::PAD - 1.0,
+                alpha.edge.color,
+                true,
+            );
+        }
+        // A hairline dropped the height of the band marks the seam, so
+        // the run of pieces reads as two runs rather than as one long
+        // one with a gap in it.
+        let seam = (from_x + to_x) * 0.5;
+        circuit::trace(
+            &mut shapes,
+            &[
+                egui::pos2(seam, right.top() + strip::HEAD_H),
+                egui::pos2(seam, jy + 14.0),
+            ],
+            Weight::Hair,
+            alpha.edge.color.gamma_multiply(0.5),
+        );
+        painter.extend(shapes);
+        if let Some(name) = lane.seal(&self.song) {
+            block::paint_vertical(
+                painter,
+                egui::pos2(seam - 5.0, right.bottom() - 6.0),
+                block::unit::MICRO,
+                &name,
+                alpha.edge.color,
+            );
+        }
+    }
+
+    /// The LOOM: the two sends leaving the channel's OUT for their
+    /// returns, and the two returns landing back in the mix.
+    ///
+    /// A list of devices left to right can only say that the signal
+    /// goes one way. It does not: OUT taps a share of the channel into
+    /// TAPE and into SHADOW, and what those two make comes back into
+    /// the mix beside everything else. So the sends are drawn as what
+    /// they are — cables, running the length of the desk along the
+    /// band's foot, out on the upper pair and home on the lower, each
+    /// return its own colour. A cable is as bright as its send is open,
+    /// so a closed send is a cable that is plainly not carrying
+    /// anything, and the dashes on it travel with the beat.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_loom(
+        &self,
+        painter: &egui::Painter,
+        loom: egui::Rect,
+        track: usize,
+        columns: &[chain::Column],
+        layout: &[(usize, egui::Rect)],
+        sounding: bool,
+        phase: Phase,
+    ) {
+        use crate::params::console::out as p;
+        if !loom.is_positive() {
+            return;
+        }
+        let alpha = self.alphabet();
+        let seen = |at: usize| layout.iter().find(|(i, _)| *i == at).map(|(_, r)| *r);
+        let column_of =
+            |want: &dyn Fn(&chain::Column) -> bool| columns.iter().position(|c| want(c));
+
+        // The three places a cable touches: where the send leaves, where
+        // it lands, and where the return comes home.
+        let out_col = column_of(&|column: &chain::Column| {
+            column.lane == chain::Lane::Channel
+                && column.section == Some(crate::console::SectionKind::Out)
+        });
+        let mix_col = column_of(&|column: &chain::Column| column.lane == chain::Lane::Mix);
+        let out_rect = out_col.and_then(seen);
+        let mix_rect = mix_col.and_then(seen);
+
+        // How open each send is: what OUT measured of itself last block
+        // when the engine is running, and what the hand set when it is
+        // not.
+        let sends = out_col
+            .and_then(|col| chain::device_at(&self.song, track, col))
+            .map(|id| {
+                let said = self.telemetry(id);
+                let set = self.song.device(id);
+                let value = |param: u32| set.map_or(0.0, |device| device.value(param)) / 100.0;
+                if said.bands[1] > 0.0 || said.bands[2] > 0.0 {
+                    [said.bands[1] / 100.0, said.bands[2] / 100.0]
+                } else {
+                    [value(p::SEND_TAPE), value(p::SEND_SHADOW)]
+                }
+            })
+            .unwrap_or([0.0, 0.0]);
+
+        let mut shapes = Vec::new();
+        for index in 0..2 {
+            let ink = RETURN_INK[index];
+            let open = sends[index].clamp(0.0, 1.0);
+            let ret_col =
+                column_of(&|column: &chain::Column| column.lane == chain::Lane::Return(index));
+            let ret_rect = ret_col.and_then(seen);
+            // Out on the upper pair, home on the lower, each return
+            // keeping its own line so two cables never read as one.
+            let out_y = loom.top() + 3.0 + index as f32 * 3.0;
+            let home_y = loom.bottom() - 3.0 - index as f32 * 3.0;
+            let carrying = open > 0.005;
+            let cable = if carrying {
+                tint(ink, 0.35 + 0.65 * open)
+            } else {
+                alpha.edge.color.gamma_multiply(0.55)
+            };
+
+            // The send: down out of OUT's foot, along the loom, up into
+            // the return's notch.
+            let from_x = out_rect.map_or(loom.left(), |rect| rect.center().x + 10.0 * index as f32);
+            let to_x = ret_rect.map_or(loom.right(), |rect| rect.left() + strip::TONGUE);
+            let send = vec![
+                egui::pos2(from_x, out_rect.map_or(out_y, |rect| rect.bottom())),
+                egui::pos2(from_x, out_y),
+                egui::pos2(to_x, out_y),
+                egui::pos2(to_x, ret_rect.map_or(out_y, |rect| strip::joint_y(rect))),
+            ];
+            circuit::trace(&mut shapes, &send, Weight::Hair, cable);
+            if carrying && sounding && phase.rolling {
+                circuit::dashes(&mut shapes, &send, phase.dash(), Weight::Heavy, ink);
+            }
+            if let Some(rect) = out_rect {
+                // The tap: a pad on the channel's foot that fills as the
+                // send opens. It is the send, not a picture of it.
+                circuit::pad(
+                    &mut shapes,
+                    egui::pos2(from_x, rect.bottom()),
+                    circuit::PAD,
+                    cable,
+                    carrying,
+                );
+            }
+
+            // The way home: out of the return's right edge, along the
+            // loom, up into the mix's notch.
+            let home_from = ret_rect.map_or(loom.right(), |rect| rect.right());
+            let home_to = mix_rect.map_or(loom.left(), |rect| rect.left() + strip::TONGUE);
+            let home = vec![
+                egui::pos2(
+                    home_from,
+                    ret_rect.map_or(home_y, |rect| strip::joint_y(rect)),
+                ),
+                egui::pos2(home_from + 6.0, home_y),
+                egui::pos2(home_to, home_y),
+                egui::pos2(
+                    home_to,
+                    mix_rect.map_or(home_y, |rect| strip::joint_y(rect)),
+                ),
+            ];
+            circuit::trace(&mut shapes, &home, Weight::Hair, cable);
+            if carrying && sounding && phase.rolling {
+                circuit::dashes(&mut shapes, &home, phase.dash(), Weight::Heavy, ink);
+            }
+            if let Some(rect) = ret_rect {
+                circuit::pad(
+                    &mut shapes,
+                    egui::pos2(rect.right(), strip::joint_y(rect)),
+                    circuit::PAD - 1.0,
+                    cable,
+                    carrying,
+                );
+            }
+        }
+        painter.extend(shapes);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -11810,12 +12083,23 @@ mod tests {
 
     /// A track with no chain still has its strip: the band opens on the
     /// console's twenty sections, PREAMP first, and V is the one key.
+    ///
+    /// And it does not stop at the channel. The band is the whole
+    /// signal path — the strip, then the group bus this track feeds,
+    /// then the mix, and last the two returns — so walking right along
+    /// it is walking the signal from the instrument to the speakers.
     #[test]
     fn a_track_with_no_devices_still_has_its_strip_to_show() {
         let mut stage = Stage::new();
         assert_eq!(drive(&mut stage, &[Key::V]), vec![ApplyOutcome::Changed]);
         let (cols, _) = stage.chain_shape();
-        assert_eq!(cols, crate::console::SectionKind::STRIP.len());
+        assert_eq!(
+            cols,
+            crate::console::SectionKind::STRIP.len()
+                + crate::console::SectionKind::BUS.len()
+                + crate::console::SectionKind::MIX.len()
+                + crate::console::SectionKind::RETURNS.len()
+        );
         let (_, id) = stage
             .band_cursor_device()
             .expect("a device under the cursor");
@@ -12023,7 +12307,70 @@ mod tests {
             "the band closed over a strip that is always there"
         );
         let (cols, _) = stage.chain_shape();
-        assert_eq!(cols, crate::console::SectionKind::STRIP.len());
+        assert_eq!(
+            cols,
+            crate::console::SectionKind::STRIP.len()
+                + crate::console::SectionKind::BUS.len()
+                + crate::console::SectionKind::MIX.len()
+                + crate::console::SectionKind::RETURNS.len()
+        );
+    }
+
+    /// The desk is selectable from the band, and it is the SAME desk
+    /// whichever track you reach it from — walking right off the end of
+    /// a channel lands on the group bus, then the mix, then the two
+    /// returns, and a parameter moved there is moved on the console.
+    #[test]
+    fn the_band_walks_off_the_channel_and_onto_the_desk() {
+        use crate::console::SectionKind;
+        let mut stage = Stage::new();
+        assert_eq!(drive(&mut stage, &[Key::V]), vec![ApplyOutcome::Changed]);
+        let columns = chain::band(&stage.song, 0);
+        let last_channel = SectionKind::STRIP.len() - 1;
+        assert_eq!(columns[last_channel].section, Some(SectionKind::Out));
+
+        // The group bus this track feeds, and it is that rail's device.
+        let bus = stage.song.tracks[0].bus as usize;
+        let (_, glue) = stage
+            .band_device(last_channel + 1)
+            .expect("the bus's first section");
+        assert_eq!(columns[last_channel + 1].lane, chain::Lane::Bus(bus));
+        assert!(
+            stage.song.console.buses[bus]
+                .sections
+                .iter()
+                .any(|device| device.id == glue),
+            "the band's bus section is not on the bus"
+        );
+
+        // The mix, and the two returns at the end of the walk.
+        let mix_at = last_channel + 1 + SectionKind::BUS.len();
+        let (_, mix) = stage.band_device(mix_at).expect("the mix's first section");
+        assert!(
+            stage
+                .song
+                .console
+                .mix
+                .sections
+                .iter()
+                .any(|device| device.id == mix)
+        );
+        let last = columns.len() - 1;
+        assert_eq!(columns[last].lane, chain::Lane::Return(1));
+        assert_eq!(columns[last].section, Some(SectionKind::Shadow));
+        let (_, shadow) = stage.band_device(last).expect("the last return");
+        assert!(
+            stage.song.console.aux[1]
+                .sections
+                .iter()
+                .any(|device| device.id == shadow)
+        );
+
+        // The desk is never switched out, however it is reached.
+        for at in [last_channel + 1, mix_at, last] {
+            let kind = columns[at].section.expect("a section");
+            assert!(kind.always_in(), "{kind:?} could be taken out");
+        }
     }
 
     #[test]
@@ -12478,10 +12825,15 @@ mod tests {
             Some(format!("yanked {}", crate::devices::DeviceKind::Sat.spec().name).as_str())
         );
         // The band is one narrower and the cursor is still inside it.
-        // (Two chain cards, and the strip's twenty pieces after them.)
+        // (Two chain cards, the strip's twenty pieces, then the desk.)
         assert_eq!(
             stage.chain.as_ref().map(FocusLattice::cols),
-            Some(2 + crate::console::SectionKind::STRIP.len())
+            Some(
+                2 + crate::console::SectionKind::STRIP.len()
+                    + crate::console::SectionKind::BUS.len()
+                    + crate::console::SectionKind::MIX.len()
+                    + crate::console::SectionKind::RETURNS.len()
+            )
         );
         assert_eq!(
             stage.chain.as_ref().and_then(FocusLattice::cursor),

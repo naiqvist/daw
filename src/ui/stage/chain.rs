@@ -40,6 +40,48 @@ pub struct Row {
     pub choice: usize,
 }
 
+/// Which rail of the desk a column stands on.
+///
+/// The band is the whole signal path, not just the track's own part of
+/// it: after the strip's OUT come the group bus's sections, then the
+/// mix's, so walking right along the band is walking the signal from
+/// the instrument to the speakers. The two returns are the one thing
+/// that is NOT in series — they are fed by the sends and they land back
+/// in the mix — so they stand apart at the end of the walk and their
+/// cables are drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lane {
+    /// The track's own: its chain, then its channel strip.
+    Channel,
+    /// The group bus this track feeds, by index.
+    Bus(usize),
+    /// The mix bus every group feeds.
+    Mix,
+    /// A return, by index. Fed by a send, not by the path.
+    Return(usize),
+}
+
+impl Lane {
+    /// The rail's name, engraved where the band crosses from one rail
+    /// to the next.
+    pub fn seal(self, song: &Song) -> Option<String> {
+        match self {
+            Lane::Channel => None,
+            Lane::Bus(index) => song.console.buses.get(index).map(|rail| rail.name.clone()),
+            Lane::Mix => Some(song.console.mix.name.clone()),
+            Lane::Return(index) => song.console.aux.get(index).map(|rail| rail.name.clone()),
+        }
+    }
+
+    /// Two columns on rails that are IN SERIES mate: a channel's OUT
+    /// tongue lies in its bus's GLUE notch, and the bus's IRON in the
+    /// mix's. A return mates with nothing — it is a parallel path, and
+    /// standing apart is how the eye is told so.
+    pub fn in_series(self) -> bool {
+        !matches!(self, Lane::Return(_))
+    }
+}
+
 /// One device, as a column of the band.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Column {
@@ -60,6 +102,8 @@ pub struct Column {
     /// Which section of the console this column is, when it is one:
     /// drawn as a piece of the strip rather than as a card.
     pub section: Option<crate::console::SectionKind>,
+    /// Which rail it stands on.
+    pub lane: Lane,
 }
 
 /// The devices on `track`'s chain, in signal order. An empty vector is a
@@ -71,21 +115,64 @@ pub fn columns(song: &Song, track: usize) -> Vec<Column> {
         .unwrap_or_default()
 }
 
-/// The whole band: the chain, then the strip's sections in the desk's
-/// order. Never empty for a track that exists — the strip is always
-/// there — and empty for one that does not.
-pub fn band(song: &Song, track: usize) -> Vec<Column> {
-    song.tracks
-        .get(track)
-        .map(|track| {
-            track
-                .chain
+/// The whole signal path as a run of devices, each with the rail it
+/// stands on: the track's chain, its channel strip, the group bus it
+/// feeds, the mix, and last the two returns.
+///
+/// One order, used by the drawing, by the cursor's lattice and by the
+/// lookup from a column to its device — so the three can never disagree
+/// about what the cursor is standing on.
+pub fn band_devices(song: &Song, track: usize) -> Vec<(Lane, &Device)> {
+    let Some(lane) = song.tracks.get(track) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(Lane, &Device)> = lane
+        .chain
+        .iter()
+        .chain(lane.strip.iter())
+        .map(|device| (Lane::Channel, device))
+        .collect();
+    let bus = lane.bus as usize;
+    if let Some(rail) = song.console.buses.get(bus) {
+        out.extend(rail.sections.iter().map(|device| (Lane::Bus(bus), device)));
+    }
+    out.extend(
+        song.console
+            .mix
+            .sections
+            .iter()
+            .map(|device| (Lane::Mix, device)),
+    );
+    for (index, rail) in song.console.aux.iter().enumerate() {
+        out.extend(
+            rail.sections
                 .iter()
-                .chain(track.strip.iter())
-                .map(column)
-                .collect()
+                .map(|device| (Lane::Return(index), device)),
+        );
+    }
+    out
+}
+
+/// The device a band column addresses, by the same order the band is
+/// laid in.
+pub fn device_at(song: &Song, track: usize, col: usize) -> Option<crate::sequencing::DeviceId> {
+    band_devices(song, track)
+        .get(col)
+        .map(|(_, device)| device.id)
+}
+
+/// The whole band, drawn. Never empty for a track that exists — the
+/// strip and the desk are always there — and empty for one that does
+/// not.
+pub fn band(song: &Song, track: usize) -> Vec<Column> {
+    band_devices(song, track)
+        .into_iter()
+        .map(|(lane, device)| {
+            let mut column = column(device);
+            column.lane = lane;
+            column
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 /// One device reduced to what the band draws.
@@ -106,6 +193,7 @@ pub fn column(device: &Device) -> Column {
             crate::devices::DeviceKind::Console(kind) => Some(kind),
             _ => None,
         },
+        lane: Lane::Channel,
         // The two tables are parallel by construction — the automation
         // target picker already walks them zipped — so a row is one
         // parameter's numbers beside its words.
@@ -435,6 +523,71 @@ mod tests {
         assert_eq!(column.code, DeviceKind::Poly.spec().prefix);
         assert!(column.instrument, "an instrument did not say so");
         assert!(!column.bypassed);
+    }
+
+    /// The band does not stop at the channel. It is the whole path:
+    /// the chain, the strip, the group bus this track feeds, the mix,
+    /// and last the two returns — which are the one part of it that is
+    /// NOT in series, and say so by standing apart.
+    #[test]
+    fn the_band_is_the_whole_signal_path() {
+        use crate::console::SectionKind;
+        let (song, track) = song_with(DeviceKind::Acid);
+        let band = band(&song, track);
+        let lanes: Vec<Lane> = band.iter().map(|column| column.lane).collect();
+        let channel = lanes.iter().filter(|lane| **lane == Lane::Channel).count();
+        assert_eq!(
+            channel,
+            1 + SectionKind::STRIP.len(),
+            "the instrument and the strip are the channel's own"
+        );
+        // The bus this track feeds, then the mix, then the returns —
+        // in that order, because that is the order the signal takes.
+        let bus = song.tracks[track].bus as usize;
+        let rest: Vec<Lane> = lanes[channel..].to_vec();
+        let mut want = vec![Lane::Bus(bus); SectionKind::BUS.len()];
+        want.extend(vec![Lane::Mix; SectionKind::MIX.len()]);
+        want.push(Lane::Return(0));
+        want.push(Lane::Return(1));
+        assert_eq!(rest, want);
+        // Every column of it addresses a real device, once.
+        let mut ids: Vec<u64> = (0..band.len())
+            .map(|col| device_at(&song, track, col).expect("a device").0)
+            .collect();
+        let all = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), all, "the band addressed one device twice");
+        assert_eq!(device_at(&song, track, band.len()), None);
+    }
+
+    /// A return is a parallel path, so it mates with nothing. Every
+    /// other rail is in series and its pieces join.
+    #[test]
+    fn only_a_return_stands_off_the_rail() {
+        assert!(Lane::Channel.in_series());
+        assert!(Lane::Bus(2).in_series());
+        assert!(Lane::Mix.in_series());
+        assert!(!Lane::Return(0).in_series());
+        assert!(!Lane::Return(1).in_series());
+    }
+
+    /// Every rail the band crosses onto can name itself, so the seam
+    /// is never an unexplained gap.
+    #[test]
+    fn every_rail_the_band_crosses_onto_has_a_name() {
+        let (song, track) = song_with(DeviceKind::Acid);
+        for column in band(&song, track) {
+            match column.lane {
+                Lane::Channel => assert_eq!(column.lane.seal(&song), None),
+                lane => {
+                    let name = lane
+                        .seal(&song)
+                        .unwrap_or_else(|| panic!("{lane:?} unnamed"));
+                    assert!(!name.is_empty(), "{lane:?} has an empty name");
+                }
+            }
+        }
     }
 
     #[test]
