@@ -124,6 +124,10 @@ impl Vitals {
         self.stream.as_ref()
     }
 
+    pub fn health(&self) -> Option<&Health> {
+        self.health.as_ref()
+    }
+
     /// Let `dt` seconds of flash burn down.
     pub fn tick(&mut self, dt: f32) {
         self.flash = (self.flash - dt.max(0.0)).max(0.0);

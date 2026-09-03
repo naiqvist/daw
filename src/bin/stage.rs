@@ -34,14 +34,18 @@ use daw::audio::AuditionBuffer;
 use daw::audio::bounce::{BounceFormat, BounceOptions, bounce_automated};
 use daw::audio::material;
 use daw::audio::transport::TransportCmd;
-use daw::audio::{Engine, EngineConfig, StreamHealth};
+use daw::audio::{AudioApi, Engine, EngineConfig, StreamHealth};
 use daw::design::Polarity;
 use daw::install_stage_fonts;
-use daw::library::{LibraryConfig, LibrarySnapshot};
+use daw::library::LibraryConfig;
 use daw::params;
 use daw::shell;
 use daw::song_graph::{self, MASTER_METER, SongNodes};
-use daw::ui::stage::{EngineState, Health, Level, SampleData, Stage, Stream};
+use daw::ui::prefs::{AudioBackend, STORAGE_KEY, UiPrefs};
+use daw::ui::stage::{
+    AudioDeviceChoice, AudioSettings, EngineState, Health, Level, SampleData, Stage, Stream,
+    UtilityHostRequest,
+};
 use daw::ui::theme::Theme;
 use eframe::egui;
 
@@ -65,6 +69,36 @@ fn library_config() -> LibraryConfig {
     config
 }
 
+fn audio_api(backend: AudioBackend) -> AudioApi {
+    match backend {
+        AudioBackend::Jack => AudioApi::Jack,
+        AudioBackend::Alsa => AudioApi::Alsa,
+        AudioBackend::Pulse => AudioApi::Pulse,
+    }
+}
+
+fn engine_config(prefs: &UiPrefs) -> EngineConfig {
+    let base = EngineConfig::default();
+    EngineConfig {
+        api: audio_api(prefs.audio_backend),
+        output_device: prefs.audio_device.clone(),
+        sample_rate: prefs.audio_rate_hz.unwrap_or(base.sample_rate),
+        buffer_frames: prefs.audio_buffer_frames.unwrap_or(base.buffer_frames),
+        channels: base.channels,
+    }
+}
+
+fn requested_engine_config(settings: AudioSettings) -> EngineConfig {
+    let base = EngineConfig::default();
+    EngineConfig {
+        api: audio_api(settings.backend),
+        output_device: settings.device,
+        sample_rate: settings.rate_hz.unwrap_or(base.sample_rate),
+        buffer_frames: settings.buffer_frames.unwrap_or(base.buffer_frames),
+        channels: base.channels,
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     keep_the_stream_driven();
     shell::run("daw — stage", [1280.0, 800.0], [720.0, 480.0], App::new)
@@ -82,12 +116,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// sleep; pipewire-jack reads them from this variable. A user who set the
 /// variable themselves is left alone.
 fn keep_the_stream_driven() {
-    // The quantum is forced to the engine's own block: PipeWire hands a
-    // JACK client the graph's quantum whatever the client asked for, and
-    // a block larger than the arena is refused as silence — which reads
-    // as a stalled engine.
-    const PROPS: &str =
-        "{ node.always-process = true node.want-driver = true node.force-quantum = 256 }";
+    // The stream request now carries the user's buffer choice, so the node
+    // must not pin a second, contradictory quantum in its environment.
+    const PROPS: &str = "{ node.always-process = true node.want-driver = true }";
     if std::env::var_os("PIPEWIRE_PROPS").is_none() {
         // Set before any thread exists — the engine's are made in
         // `App::new` — which is what makes this sound.
@@ -102,7 +133,8 @@ struct App {
     /// its own marks from the alphabet, but stock widgets — text edits,
     /// scrollbars, the palette's own frame — read the runtime theme, and
     /// a light page with dark scrollbars is two grounds on one screen.
-    ground: Option<Polarity>,
+    presentation: Option<(Polarity, daw::ui::tokens::Density, bool)>,
+    last_autosave: std::time::Instant,
 }
 
 /// A render in flight: the fraction done, the flag that stops it, and
@@ -125,6 +157,9 @@ struct Audio {
     /// legitimate state — the stage still runs, and says so — not a
     /// reason to refuse to start.
     engine: Option<Engine>,
+    /// The backend that owns `engine`. The negotiated stream does not repeat
+    /// it, so retaining the exact request is what makes diagnostics honest.
+    api: AudioApi,
     /// Why there is no engine, if there is none. Kept rather than
     /// swallowed: silence with no explanation is the failure this project
     /// spends the most effort avoiding.
@@ -174,8 +209,9 @@ struct Audio {
 const FIRST_BLOCK_GRACE: std::time::Duration = std::time::Duration::from_millis(1500);
 
 impl Audio {
-    fn start() -> Self {
-        let (engine, trouble) = match Engine::start(EngineConfig::default()) {
+    fn start(config: EngineConfig) -> Self {
+        let api = config.api;
+        let (engine, trouble) = match Engine::start(config) {
             Ok(engine) => (Some(engine), None),
             Err(error) => (None, Some(error.to_string())),
         };
@@ -183,6 +219,7 @@ impl Audio {
             started: std::time::Instant::now(),
             fell_back: false,
             engine,
+            api,
             trouble,
             built: None,
             built_song: false,
@@ -199,6 +236,39 @@ impl Audio {
         }
     }
 
+    /// Replace only the live stream. An offline export belongs to the host,
+    /// not that stream, and therefore survives an audio-device restart.
+    fn restart(&mut self, config: EngineConfig) -> Result<Stream, String> {
+        let api = config.api;
+        self.engine = None;
+        match Engine::start(config) {
+            Ok(engine) => {
+                self.engine = Some(engine);
+                self.api = api;
+                self.trouble = None;
+                self.started = std::time::Instant::now();
+                self.fell_back = false;
+                self.built = None;
+                self.built_song = false;
+                self.mixed = None;
+                self.nodes = None;
+                self.rolling = false;
+                self.bpm = 0.0;
+                self.seeks = 0;
+                self.looped = None;
+                self.seek_block = None;
+                self.stream()
+                    .ok_or_else(|| "audio stream opened without stream information".to_owned())
+            }
+            Err(error) => {
+                let error = error.to_string();
+                self.api = api;
+                self.trouble = Some(error.clone());
+                Err(error)
+            }
+        }
+    }
+
     /// The stage asked for a render: build the arrangement's graph and
     /// bounce it on a thread; report progress back every frame until it
     /// ends. Runs with or without an engine — a render is offline.
@@ -206,19 +276,25 @@ impl Audio {
         if let Some(request) = stage.take_export() {
             stage.export_taken();
             let (spec, _) = song_graph::build_song(stage.song());
-            let sample_rate = self
-                .engine
-                .as_ref()
-                .map_or(48_000, |engine| engine.info().sample_rate);
+            let sample_rate = request.rate_hz.unwrap_or_else(|| {
+                self.engine
+                    .as_ref()
+                    .map_or(48_000, |engine| engine.info().sample_rate)
+            });
             let bpm = stage.song().bpm_at(request.start_tick, stage.bpm());
             let ticks = f64::from(daw::sequencing::TICKS_PER_BEAT as u32);
+            let musical_beats = (request.end_tick - request.start_tick) as f64 / ticks;
             let opts = BounceOptions {
                 sample_rate,
                 block_frames: 256,
                 bpm,
-                length_beats: (request.end_tick - request.start_tick) as f64 / ticks,
+                length_beats: musical_beats + f64::from(request.tail_seconds) * bpm / 60.0,
                 start_beats: request.start_tick as f64 / ticks,
-                format: BounceFormat::Int24,
+                format: match request.format {
+                    daw::ui::prefs::ExportFormat::Float32 => BounceFormat::Float32,
+                    daw::ui::prefs::ExportFormat::Int24 => BounceFormat::Int24,
+                    daw::ui::prefs::ExportFormat::Int16 => BounceFormat::Int16,
+                },
             };
             if let Some(dir) = request.path.parent() {
                 let _ = std::fs::create_dir_all(dir);
@@ -245,6 +321,9 @@ impl Audio {
                     },
                 )
                 .map_err(|error| error.to_string());
+                if result.is_err() {
+                    let _ = std::fs::remove_file(&path);
+                }
                 if let Ok(mut slot) = done.lock() {
                     *slot = Some(result);
                 }
@@ -376,7 +455,7 @@ impl Audio {
             latency_frames: info.latency_frames.map(|frames| frames as u32),
             inputs: info.in_channels.min(255) as u8,
             outputs: info.out_channels.min(255) as u8,
-            backend: EngineConfig::default().api.label(),
+            backend: self.api.label(),
         })
     }
 
@@ -419,6 +498,7 @@ impl Audio {
             Ok(engine) => {
                 eprintln!("stage: the ALSA engine is up: {:?}", engine.info());
                 self.engine = Some(engine);
+                self.api = AudioApi::Alsa;
                 self.trouble = None;
             }
             Err(error) => {
@@ -629,33 +709,114 @@ fn samples_at(engine: &Engine, tick: usize, bpm: f64) -> u64 {
 }
 
 impl App {
-    fn new(_storage: &shell::Storage) -> Self {
-        let audio = Audio::start();
+    fn new(storage: &shell::Storage) -> Self {
+        let prefs: UiPrefs = storage.get(STORAGE_KEY).unwrap_or_default();
+        let library_config = storage
+            .get(daw::library::CONFIG_STORAGE_KEY)
+            .unwrap_or_else(library_config);
+        let library_snapshot = storage
+            .get(daw::library::CACHE_STORAGE_KEY)
+            .unwrap_or_default();
+        let cli_path = std::env::args_os().nth(1).map(std::path::PathBuf::from);
+
+        let mut stage = Stage::with_library(library_config, library_snapshot);
+        // Songs live under the music folder unless a preference gives them a
+        // more particular home. The utility restore applies that preference
+        // after this host fallback has been established.
+        if let Some(home) = std::env::var_os("HOME") {
+            stage.set_home(std::path::PathBuf::from(home).join("Music").join("daw"));
+        }
+        stage.restore_preferences(prefs, cli_path.is_none());
+
+        let audio = Audio::start(engine_config(stage.preferences()));
         if let Some(trouble) = &audio.trouble {
             // stderr rather than the surface: the stage has one message
             // strip and it belongs to the musician, not to the console.
             eprintln!("stage: no audio engine — {trouble}");
         }
-        let mut stage = Stage::with_library(library_config(), LibrarySnapshot::default());
-        // Songs live under the music folder unless one is opened from
-        // somewhere else. Said here rather than guessed by the stage, so
-        // a headless stage never writes to disk by accident.
-        if let Some(home) = std::env::var_os("HOME") {
-            stage.set_home(std::path::PathBuf::from(home).join("Music").join("daw"));
-        }
         // `cargo run --bin stage -- song.stage.ron` opens that song. A
         // file that will not open is said on stderr and the stage opens
         // empty, rather than refusing to start over a path.
-        if let Some(path) = std::env::args_os().nth(1)
-            && let Err(error) = stage.open(std::path::PathBuf::from(path))
+        if let Some(path) = cli_path
+            && let Err(error) = stage.open(path)
         {
             eprintln!("stage: could not open the song — {error}");
         }
         Self {
             stage,
             audio,
-            ground: None,
+            presentation: None,
+            last_autosave: std::time::Instant::now(),
         }
+    }
+
+    fn serve_utility_request(&mut self) {
+        let Some(request) = self.stage.take_utility_host_request() else {
+            return;
+        };
+        match request {
+            UtilityHostRequest::ScanAudio(backend) => {
+                let api = audio_api(backend);
+                let devices: Vec<_> = daw::audio::output_devices(api)
+                    .into_iter()
+                    .map(|device| AudioDeviceChoice {
+                        name: device.name,
+                        output_channels: device.output_channels,
+                        input_channels: device.input_channels,
+                        is_default_output: device.is_default_output,
+                        preferred_rate_hz: device.preferred_sample_rate,
+                        rates_hz: device.sample_rates,
+                    })
+                    .collect();
+                let status = if !api.compiled() {
+                    format!(
+                        "{} BACKEND IS NOT IN THIS BUILD",
+                        api.label().to_uppercase()
+                    )
+                } else if devices.is_empty() {
+                    format!("{} · NO OUTPUT DEVICES", api.label().to_uppercase())
+                } else {
+                    format!(
+                        "{} · {} OUTPUT DEVICE(S)",
+                        api.label().to_uppercase(),
+                        devices.len()
+                    )
+                };
+                self.stage.set_audio_devices(backend, devices);
+                self.stage.set_audio_preferences_status(status);
+            }
+            UtilityHostRequest::RestartAudio(settings) => {
+                match self.audio.restart(requested_engine_config(settings)) {
+                    Ok(stream) => self.stage.set_audio_preferences_status(format!(
+                        "RUNNING · {} · {} HZ · {} FR · {:.2} MS",
+                        stream.backend,
+                        stream.sample_rate,
+                        stream.buffer_frames,
+                        stream.latency_ms().unwrap_or_default()
+                    )),
+                    Err(error) => self
+                        .stage
+                        .set_audio_preferences_status(format!("RESTART FAILED · {error}")),
+                }
+            }
+        }
+    }
+
+    fn autosave_recovery(&mut self) {
+        if !self.stage.is_dirty() {
+            self.last_autosave = std::time::Instant::now();
+            return;
+        }
+        let Some(period) = self.stage.autosave_period() else {
+            return;
+        };
+        if self.last_autosave.elapsed() < period {
+            return;
+        }
+        if let Err(error) = self.stage.write_recovery() {
+            eprintln!("stage: recovery failed — {error}");
+        }
+        self.last_autosave = std::time::Instant::now();
     }
 }
 
@@ -665,7 +826,14 @@ impl shell::Host for App {
     /// can pass through `shell::post` before presentation.
     fn startup(&mut self, ctx: &egui::Context) {
         install_stage_fonts(ctx);
-        Theme::dark().apply(ctx);
+        let prefs = self.stage.preferences();
+        let mut theme = if prefs.light_ground {
+            Theme::light()
+        } else {
+            Theme::dark()
+        };
+        theme.set_density(prefs.density);
+        theme.apply(ctx);
     }
 
     /// eframe 0.36 hands the app a `Ui` rather than a `Context` and a
@@ -690,20 +858,40 @@ impl shell::Host for App {
         // theme rebuilds egui's whole style, which is not a thing to do
         // sixty times a second for an answer that is usually the same.
         let polarity = self.stage.polarity();
-        if self.ground != Some(polarity) {
-            match polarity {
+        let density = self.stage.preferences().density;
+        let hide_tooltips = self.stage.preferences().hide_tooltips;
+        let presentation = (polarity, density, hide_tooltips);
+        if self.presentation != Some(presentation) {
+            let mut theme = match polarity {
                 Polarity::Dark => Theme::dark(),
                 Polarity::Light => Theme::light(),
-            }
-            .apply(ui.ctx());
-            self.ground = Some(polarity);
+            };
+            theme.set_density(density);
+            theme.apply(ui.ctx());
+            ui.ctx().all_styles_mut(|style| {
+                if hide_tooltips {
+                    style.interaction.tooltip_delay = f32::INFINITY;
+                    style.explanation_tooltips = false;
+                    style.url_in_tooltip = false;
+                }
+            });
+            self.presentation = Some(presentation);
         }
 
         self.stage.show(ui);
+        self.serve_utility_request();
         self.audio.follow(&mut self.stage);
+        self.autosave_recovery();
         // A meter that only moves when the mouse does is not a meter.
         ui.ctx().request_repaint();
     }
 
-    fn save(&mut self, _storage: &mut shell::Storage) {}
+    fn save(&mut self, storage: &mut shell::Storage) {
+        storage.set(STORAGE_KEY, self.stage.preferences());
+        storage.set(
+            daw::library::CONFIG_STORAGE_KEY,
+            self.stage.library_preferences(),
+        );
+        storage.set(daw::library::CACHE_STORAGE_KEY, self.stage.library_cache());
+    }
 }

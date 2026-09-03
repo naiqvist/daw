@@ -99,6 +99,7 @@ pub enum Layer {
     Surface,
     Overlay,
     Palette,
+    Utility,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -120,6 +121,49 @@ fn registry_id() -> egui::Id {
 
 fn motion_id() -> egui::Id {
     egui::Id::new("global-qwerty-cursor-motion")
+}
+
+fn settings_id() -> egui::Id {
+    egui::Id::new("global-qwerty-cursor-settings")
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Settings {
+    reduced_motion: bool,
+    energy: f32,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            reduced_motion: false,
+            energy: 1.0,
+        }
+    }
+}
+
+/// Apply machine-local presentation preferences without making them part of
+/// any target. The cursor remains one object; only its motion budget and ink
+/// weight change.
+pub fn configure(
+    ctx: &egui::Context,
+    reduced_motion: bool,
+    energy: crate::ui::prefs::CursorEnergy,
+) {
+    let energy = match energy {
+        crate::ui::prefs::CursorEnergy::Quiet => 0.68,
+        crate::ui::prefs::CursorEnergy::Normal => 1.0,
+        crate::ui::prefs::CursorEnergy::High => 1.32,
+    };
+    ctx.data_mut(|data| {
+        data.insert_temp(
+            settings_id(),
+            Settings {
+                reduced_motion,
+                energy,
+            },
+        );
+    });
 }
 
 /// Clear only this frame's target. Motion remains persistent across frames.
@@ -281,7 +325,7 @@ struct Visual {
 }
 
 impl Motion {
-    fn advance(&mut self, target: Option<Target>, dt: f32) -> (Visual, bool) {
+    fn advance(&mut self, target: Option<Target>, dt: f32, settings: Settings) -> (Visual, bool) {
         let dt = dt.clamp(1.0 / 240.0, 1.0 / 30.0);
         let Some(target) = target else {
             self.opacity = approach(self.opacity, 0.0, FADE_SPEED, dt);
@@ -336,26 +380,40 @@ impl Motion {
         }
         self.wind = approach(self.wind, 0.0, 21.0, dt);
 
-        // A true second-order cursor: distance creates acceleration, velocity
-        // carries it between panels, and damping catches it at the address.
-        // Two bounded substeps keep a dropped frame from changing the feel.
-        let sub_dt = dt * 0.5;
-        for _ in 0..2 {
-            spring_vec2(
-                &mut self.center,
-                &mut self.center_velocity,
-                self.destination.center(),
-                sub_dt,
-            );
-            spring_size(
-                &mut self.size,
-                &mut self.size_velocity,
-                self.destination.size(),
-                sub_dt,
-            );
+        if settings.reduced_motion {
+            self.center = self.destination.center();
+            self.size = self.destination.size();
+            self.center_velocity = egui::Vec2::ZERO;
+            self.size_velocity = egui::Vec2::ZERO;
+            self.moving = false;
+            self.settle = None;
+        } else {
+            // A true second-order cursor: distance creates acceleration,
+            // velocity carries it between panels, and damping catches it at
+            // the address. Two bounded substeps keep a dropped frame from
+            // changing the feel.
+            let sub_dt = dt * 0.5;
+            for _ in 0..2 {
+                spring_vec2(
+                    &mut self.center,
+                    &mut self.center_velocity,
+                    self.destination.center(),
+                    sub_dt,
+                );
+                spring_size(
+                    &mut self.size,
+                    &mut self.size_velocity,
+                    self.destination.size(),
+                    sub_dt,
+                );
+            }
         }
         self.size = self.size.max(egui::Vec2::splat(2.0));
-        let style_amount = 1.0 - (-STYLE_SPEED * dt).exp();
+        let style_amount = if settings.reduced_motion {
+            1.0
+        } else {
+            1.0 - (-STYLE_SPEED * dt).exp()
+        };
         self.style
             .approach(Style::for_kind(target.kind), style_amount);
         self.opacity = approach(self.opacity, 1.0, FADE_SPEED, dt);
@@ -454,9 +512,10 @@ pub fn paint(ctx: &egui::Context) {
             .and_then(|registry| registry.0)
     });
     let dt = ctx.input(|input| input.stable_dt);
+    let settings = ctx.data(|data| data.get_temp::<Settings>(settings_id()).unwrap_or_default());
     let (visual, repaint) = ctx.data_mut(|data| {
         data.get_temp_mut_or_default::<Motion>(motion_id())
-            .advance(target, dt)
+            .advance(target, dt, settings)
     });
     if repaint {
         ctx.request_repaint();
@@ -471,10 +530,10 @@ pub fn paint(ctx: &egui::Context) {
             egui::Id::new("global-qwerty-cursor-overlay"),
         ))
         .with_clip_rect(ctx.content_rect());
-    draw(&painter, visual);
+    draw(&painter, visual, settings.energy);
 }
 
-fn draw(painter: &egui::Painter, visual: Visual) {
+fn draw(painter: &egui::Painter, visual: Visual, energy: f32) {
     let mut rect = visual.rect.expand(3.0);
     let mut punch = 0.0;
     if let Some((progress, variant)) = visual.settle {
@@ -517,14 +576,18 @@ fn draw(painter: &egui::Painter, visual: Visual) {
         rect = rect.shrink(short * 0.11 * squeeze);
     }
 
-    let ink = visual.ink.gamma_multiply(visual.opacity);
+    // The mark's strength is the opacity it has faded to, times the
+    // ENERGY the preferences ask of it — a cursor somebody has turned
+    // down is turned down everywhere, signature included.
+    let strength = (visual.opacity * energy.min(1.0)).clamp(0.0, 1.0);
+    let ink = visual.ink.gamma_multiply(strength);
     // A band's mark wears the band's own hue, so the cursor standing on
     // the low shelf is the same colour as the low shelf.
     let corner_ink = match visual.signature {
-        Signature::Band { ink: hue, .. } => hue.gamma_multiply(visual.opacity),
+        Signature::Band { ink: hue, .. } => hue.gamma_multiply(strength),
         _ => ink,
     };
-    let stroke = egui::Stroke::new(1.5 + punch, corner_ink);
+    let stroke = egui::Stroke::new((1.5 + punch) * energy, corner_ink);
     let short = rect.width().min(rect.height()).max(2.0);
     let arm = visual.style.arm * (1.0 - 0.45 * squeeze);
     let arm_x = (rect.width() * arm).clamp(3.0, 18.0);
@@ -834,7 +897,7 @@ mod tests {
             ink: egui::Color32::WHITE,
             signature: Signature::Plain,
         };
-        let (visual, _) = motion.advance(Some(target), 1.0 / 120.0);
+        let (visual, _) = motion.advance(Some(target), 1.0 / 120.0, Settings::default());
         assert_eq!(visual.signature, Signature::Plain);
         assert_eq!(visual.wind, 0.0, "nothing was redirected, nothing wound up");
     }
@@ -852,12 +915,13 @@ mod tests {
             ink: egui::Color32::WHITE,
             signature: Signature::Plain,
         };
-        motion.advance(Some(here(0.0, "a")), 1.0 / 120.0);
-        let (wound, _) = motion.advance(Some(here(300.0, "b")), 1.0 / 120.0);
+        motion.advance(Some(here(0.0, "a")), 1.0 / 120.0, Settings::default());
+        let (wound, _) = motion.advance(Some(here(300.0, "b")), 1.0 / 120.0, Settings::default());
         assert!(wound.wind > 0.5, "the hop did not wind the mark up");
         let mut last = wound.wind;
         for _ in 0..40 {
-            let (visual, _) = motion.advance(Some(here(300.0, "b")), 1.0 / 120.0);
+            let (visual, _) =
+                motion.advance(Some(here(300.0, "b")), 1.0 / 120.0, Settings::default());
             assert!(
                 visual.wind <= last + 1e-6,
                 "the launch grew while travelling"

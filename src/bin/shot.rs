@@ -968,6 +968,61 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
             let _ = stage.apply(StageIntent::Step(Step::Down));
         }
     }
+    if which.contains("utility") {
+        use daw::ui::stage::{AudioDeviceChoice, EngineState, Health, Stream, UtilityPage};
+
+        let mut prefs = stage.preferences().clone();
+        prefs.project_folder = Some("/home/operator/Music/daw".to_owned());
+        prefs.recent_projects = vec![
+            "/archive/helios-sequence.stage.ron".to_owned(),
+            "/archive/night-transmission.stage.ron".to_owned(),
+            "/removable/oracle-session.stage.ron".to_owned(),
+        ];
+        let page = if which.contains("preferences") {
+            UtilityPage::Preferences
+        } else if which.contains("export") {
+            UtilityPage::Export
+        } else if which.contains("diagnostics") {
+            UtilityPage::Diagnostics
+        } else {
+            UtilityPage::Projects
+        };
+        stage.restore_preferences(prefs, page == UtilityPage::Projects);
+        stage.set_health(Health {
+            state: EngineState::Running,
+            xruns: 1,
+            load: 0.17,
+        });
+        stage.set_stream(Some(Stream {
+            sample_rate: 48_000,
+            buffer_frames: 256,
+            latency_frames: Some(512),
+            inputs: 2,
+            outputs: 2,
+            backend: "JACK",
+        }));
+        stage.set_audio_devices(
+            daw::ui::prefs::AudioBackend::Jack,
+            vec![AudioDeviceChoice {
+                name: "Cyberdeck I/O".to_owned(),
+                output_channels: 8,
+                input_channels: 8,
+                is_default_output: true,
+                preferred_rate_hz: 48_000,
+                rates_hz: vec![44_100, 48_000, 96_000],
+            }],
+        );
+
+        if page == UtilityPage::Export {
+            if stage.song().end_tick() == 0 {
+                let _ = stage.apply(StageIntent::SongView);
+                let _ = stage.apply(StageIntent::Enter);
+            }
+        }
+        if page != UtilityPage::Projects {
+            stage.open_utility(page);
+        }
+    }
     stage
 }
 

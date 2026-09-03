@@ -37,6 +37,7 @@ mod strip;
 mod tracks;
 mod transport;
 mod trig_menu;
+mod utility;
 mod vitals;
 
 use crate::design::codex::Sign;
@@ -46,6 +47,9 @@ use crate::design::{block, circuit};
 use crate::sequencing::{DeviceId, PatternBlock};
 use arrangement::{Arrangement, ArrangementClipboard, Hold, Take};
 pub use arrangement::{ExportRequest, ExportState};
+pub use utility::{
+    AudioDeviceChoice, AudioSettings, HostRequest as UtilityHostRequest, Page as UtilityPage,
+};
 
 use crate::design;
 use crate::devices::{DeviceKind, Family};
@@ -597,6 +601,9 @@ pub struct Stage {
     /// standing chrome: a permanent key list is ambient information, and
     /// ambient information is what this stage spends its budget avoiding.
     help: bool,
+    /// Project, machine, render and diagnostics surfaces. One modal owner so
+    /// utility keys cannot leak through to the musical surface beneath it.
+    utility: utility::Console,
     /// Latest refusal in this frame. Cleared at the next `show`, and drawn
     /// from one site after every key has been applied.
     refusal: Option<Refusal>,
@@ -892,6 +899,7 @@ impl Stage {
             browser: None,
             browser_leaving: None,
             help: false,
+            utility: utility::Console::default(),
             refusal: None,
             strip_offset: 0,
             scene_offset: 0,
@@ -1204,10 +1212,11 @@ impl Stage {
         let path = path.into();
         let song = document::load(&path)?;
         self.notice = Some(format!("opened {}", document::title(&path)));
-        self.path = Some(path);
+        self.path = Some(path.clone());
         self.replace_song(song);
         self.history = History::new(self.song.clone());
         self.dirty = false;
+        self.utility.remember_project(&path);
         Ok(())
     }
 
@@ -1219,10 +1228,37 @@ impl Stage {
             (None, Some(home)) => document::untitled_in(home),
             (None, None) => return Err("nowhere to save: no songs folder".to_owned()),
         };
+        if !self.utility.prefs().disable_backups
+            && let Some(home) = self.home.as_deref()
+        {
+            document::backup(&path, home)?;
+        }
         document::save(&path, &self.song)?;
         self.notice = Some(format!("saved {}", path.display()));
-        self.path = Some(path);
+        self.path = Some(path.clone());
         self.dirty = false;
+        self.remove_recovery();
+        self.utility.remember_project(&path);
+        Ok(())
+    }
+
+    /// Write the current song to a particular document and make that the
+    /// project's new home. Callers that do not intend to overwrite should
+    /// first use [`document::available_path`]; the utility shell performs an
+    /// explicit overwrite interlock before it reaches this method.
+    pub fn save_as(&mut self, path: impl Into<PathBuf>) -> Result<(), String> {
+        let path = document::with_extension(&path.into());
+        if !self.utility.prefs().disable_backups
+            && let Some(home) = self.home.as_deref()
+        {
+            document::backup(&path, home)?;
+        }
+        document::save(&path, &self.song)?;
+        self.notice = Some(format!("saved {}", path.display()));
+        self.path = Some(path.clone());
+        self.dirty = false;
+        self.remove_recovery();
+        self.utility.remember_project(&path);
         Ok(())
     }
 
@@ -1493,27 +1529,38 @@ impl Stage {
 
     /// Draw one frame: read the keyboard, advance time, paint the stage.
     pub fn show(&mut self, ui: &mut egui::Ui) {
+        crate::ui::nav_cursor::configure(
+            ui.ctx(),
+            self.utility.prefs().reduced_motion,
+            self.utility.prefs().cursor_energy,
+        );
         crate::ui::nav_cursor::begin_frame(ui.ctx());
         self.refusal = None;
         self.poll_library(ui.ctx());
+        // A utility room is a true modal: it gets the frame's keyboard
+        // before the musical surface and may close itself with Escape.
+        self.update_utility(ui.ctx());
+        let utility_open = self.utility.is_open();
 
         // `:` summons the palette, the same key it answers to in the frame
         // before this one. Checked before anything else reads the
         // keyboard, and not while it is already open, so a held key
         // cannot reset what has been typed into it.
-        if !self.palette.is_open()
+        if !utility_open
+            && !self.palette.is_open()
             && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Colon))
         {
             self.palette.open();
         }
-        if let Some(intent) = self.pump_palette(ui.ctx()) {
+        if !utility_open && let Some(intent) = self.pump_palette(ui.ctx()) {
             let _ = self.apply(intent);
         }
+        let utility_open = self.utility.is_open();
         // While the palette is open it owns the keyboard OUTRIGHT. It
         // consumes the keys it uses itself; this is about the rest —
         // typing "mute" to find a verb must not also play the transport
         // on its way past.
-        let palette_open = self.palette.is_open();
+        let palette_open = self.palette.is_open() || utility_open;
 
         // Hold the last browser for the length of its exit.
         if self.browser.is_some() {
@@ -1609,6 +1656,12 @@ impl Stage {
                 intent = StageIntent::SelectStep(step);
             }
             let _ = self.apply(intent);
+            // The machine room takes the keyboard the moment it opens:
+            // the rest of this frame's keys belong to it, not to the
+            // surface underneath.
+            if self.utility.is_open() {
+                break;
+            }
         }
 
         // Inside a clip, the letters may be pitches. This runs before the
@@ -1617,6 +1670,7 @@ impl Stage {
         // as a T.
         let mut pitch_keys_held = false;
         self.entered_pitch = match self.inside {
+            _ if self.utility.is_open() => None,
             Some(opened) if self.scope_context() == keymap::ScopeContext::Clip => {
                 let mode = self.entry_mode(opened);
                 let update = self.midi_typing.update(ui.ctx(), mode);
@@ -3175,6 +3229,22 @@ impl Stage {
         let playing_before = self.playing.clone();
         let was_recording = self.recording_song();
         let result = match intent {
+            StageIntent::ProjectManager => {
+                self.open_utility(utility::Page::Projects);
+                Ok(())
+            }
+            StageIntent::Preferences => {
+                self.open_utility(utility::Page::Preferences);
+                Ok(())
+            }
+            StageIntent::ExportConsole => {
+                self.open_utility(utility::Page::Export);
+                Ok(())
+            }
+            StageIntent::Diagnostics => {
+                self.open_utility(utility::Page::Diagnostics);
+                Ok(())
+            }
             StageIntent::RecordSong => self.toggle_arming(),
             StageIntent::Escape if self.export.is_some() => self.abandon_export(),
             StageIntent::PlockEditor => self.open_plock_editor(),
@@ -4561,6 +4631,9 @@ impl Stage {
         // pointing through it.
         self.draw_trig_menu(&painter, whole);
         self.draw_plock_editor(&painter, whole);
+        // Last of all, because the machine room is not part of the
+        // musical surface: it stands in front of the whole of it.
+        self.draw_utility(ui);
         crate::ui::nav_cursor::paint(ui.ctx());
     }
 
@@ -10554,6 +10627,9 @@ mod tests {
         assert_eq!(command(&mut stage, Key::X), ApplyOutcome::Changed);
         let request = stage.take_export().expect("a request");
         assert_eq!((request.start_tick, request.end_tick), (0, end));
+        assert_eq!(request.format, crate::ui::prefs::ExportFormat::Int24);
+        assert_eq!(request.rate_hz, None);
+        assert_eq!(request.tail_seconds, 0);
         assert!(request.path.starts_with("/tmp/daw-test-home/renders"));
         assert_eq!(
             request.path.extension().and_then(|e| e.to_str()),
@@ -11970,7 +12046,7 @@ mod tests {
                         stage.arrangement.clone(),
                         stage.arming,
                         stage.takes.clone(),
-                        stage.export.clone(),
+                        (stage.export.clone(), stage.utility.page()),
                     ),
                 );
 
@@ -12006,7 +12082,7 @@ mod tests {
                                     stage.arrangement.clone(),
                                     stage.arming,
                                     stage.takes.clone(),
-                                    stage.export.clone(),
+                                    (stage.export.clone(), stage.utility.page()),
                                 ),
                             ),
                             before,
@@ -12045,7 +12121,7 @@ mod tests {
                                     stage.arrangement.clone(),
                                     stage.arming,
                                     stage.takes.clone(),
-                                    stage.export.clone(),
+                                    (stage.export.clone(), stage.utility.page()),
                                 ),
                             ),
                             before,

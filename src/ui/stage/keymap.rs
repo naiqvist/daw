@@ -89,6 +89,14 @@ pub enum StageIntent {
     Rewind,
     /// Show or hide the codebook for the current scope.
     Help,
+    /// Open the machine-level project/startup deck.
+    ProjectManager,
+    /// Open audio, project, library, and interface preferences.
+    Preferences,
+    /// Open the fully specified offline render console.
+    ExportConsole,
+    /// Open the engine, library, recovery, and build report.
+    Diagnostics,
     /// Summon the browser, or dismiss it. Focus goes with it.
     Browse,
     /// Add one printable character to the browser's filter.
@@ -358,6 +366,10 @@ impl StageIntent {
             Self::ToggleTransport => "stop / roll",
             Self::Rewind => "return to top",
             Self::Help => "this list",
+            Self::ProjectManager => "project deck",
+            Self::Preferences => "preferences",
+            Self::ExportConsole => "export console",
+            Self::Diagnostics => "system diagnostics",
             Self::Browse => "browse",
             Self::TypeChar(_) => "type to filter",
             Self::Backspace => "erase filter",
@@ -498,6 +510,49 @@ impl Binding {
 
 /// The single source of truth for the stage keyboard vocabulary.
 const BINDINGS: &[Binding] = &[
+    // The machine room is global. These four chords are table data in every
+    // scope so the dispatcher, palette, and help surface all tell the same
+    // truth about reaching it.
+    Binding::command(ScopeContext::Root, Key::O, StageIntent::ProjectManager),
+    Binding::command(ScopeContext::Root, Key::Comma, StageIntent::Preferences),
+    Binding::command_shift(ScopeContext::Root, Key::E, StageIntent::ExportConsole),
+    Binding::command_shift(ScopeContext::Root, Key::D, StageIntent::Diagnostics),
+    Binding::command(ScopeContext::Nested, Key::O, StageIntent::ProjectManager),
+    Binding::command(ScopeContext::Nested, Key::Comma, StageIntent::Preferences),
+    Binding::command_shift(ScopeContext::Nested, Key::E, StageIntent::ExportConsole),
+    Binding::command_shift(ScopeContext::Nested, Key::D, StageIntent::Diagnostics),
+    Binding::command(ScopeContext::Browser, Key::O, StageIntent::ProjectManager),
+    Binding::command(ScopeContext::Browser, Key::Comma, StageIntent::Preferences),
+    Binding::command_shift(ScopeContext::Browser, Key::E, StageIntent::ExportConsole),
+    Binding::command_shift(ScopeContext::Browser, Key::D, StageIntent::Diagnostics),
+    Binding::command(ScopeContext::Mixer, Key::O, StageIntent::ProjectManager),
+    Binding::command(ScopeContext::Mixer, Key::Comma, StageIntent::Preferences),
+    Binding::command_shift(ScopeContext::Mixer, Key::E, StageIntent::ExportConsole),
+    Binding::command_shift(ScopeContext::Mixer, Key::D, StageIntent::Diagnostics),
+    Binding::command(ScopeContext::Chain, Key::O, StageIntent::ProjectManager),
+    Binding::command(ScopeContext::Chain, Key::Comma, StageIntent::Preferences),
+    Binding::command_shift(ScopeContext::Chain, Key::E, StageIntent::ExportConsole),
+    Binding::command_shift(ScopeContext::Chain, Key::D, StageIntent::Diagnostics),
+    Binding::command(ScopeContext::Clip, Key::O, StageIntent::ProjectManager),
+    Binding::command(ScopeContext::Clip, Key::Comma, StageIntent::Preferences),
+    Binding::command_shift(ScopeContext::Clip, Key::E, StageIntent::ExportConsole),
+    Binding::command_shift(ScopeContext::Clip, Key::D, StageIntent::Diagnostics),
+    Binding::command(ScopeContext::Rename, Key::O, StageIntent::ProjectManager),
+    Binding::command(ScopeContext::Rename, Key::Comma, StageIntent::Preferences),
+    Binding::command_shift(ScopeContext::Rename, Key::E, StageIntent::ExportConsole),
+    Binding::command_shift(ScopeContext::Rename, Key::D, StageIntent::Diagnostics),
+    Binding::command(ScopeContext::TrigMenu, Key::O, StageIntent::ProjectManager),
+    Binding::command(ScopeContext::TrigMenu, Key::Comma, StageIntent::Preferences),
+    Binding::command_shift(ScopeContext::TrigMenu, Key::E, StageIntent::ExportConsole),
+    Binding::command_shift(ScopeContext::TrigMenu, Key::D, StageIntent::Diagnostics),
+    Binding::command(ScopeContext::Sample, Key::O, StageIntent::ProjectManager),
+    Binding::command(ScopeContext::Sample, Key::Comma, StageIntent::Preferences),
+    Binding::command_shift(ScopeContext::Sample, Key::E, StageIntent::ExportConsole),
+    Binding::command_shift(ScopeContext::Sample, Key::D, StageIntent::Diagnostics),
+    Binding::command(ScopeContext::Song, Key::O, StageIntent::ProjectManager),
+    Binding::command(ScopeContext::Song, Key::Comma, StageIntent::Preferences),
+    Binding::command_shift(ScopeContext::Song, Key::E, StageIntent::ExportConsole),
+    Binding::command_shift(ScopeContext::Song, Key::D, StageIntent::Diagnostics),
     // Time is global rather than conditioned by where focus stands. It is
     // still repeated as table data for every scope: the dispatcher has no
     // hidden universal-key path, and the codebook can therefore report the
@@ -1423,6 +1478,10 @@ fn family(intent: StageIntent) -> &'static str {
         | StageIntent::Ground
         | StageIntent::SongView => "view",
         StageIntent::TypeChar(_) | StageIntent::Backspace | StageIntent::Rescan => "browse",
+        StageIntent::ProjectManager
+        | StageIntent::Preferences
+        | StageIntent::ExportConsole
+        | StageIntent::Diagnostics => "system",
         StageIntent::NewAudioTrack | StageIntent::NewInstrumentTrack => "track",
         StageIntent::Clear | StageIntent::Launch | StageIntent::LaunchScene => "session",
         StageIntent::Gain { .. }
