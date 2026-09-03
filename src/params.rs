@@ -8089,47 +8089,56 @@ pub mod console {
         pub const RATIO: u32 = 1;
         pub const ATTACK: u32 = 2;
         pub const RELEASE: u32 = 3;
-        pub const KNEE: u32 = 4;
+        pub const MAKEUP: u32 = 4;
         pub const SC_HP: u32 = 5;
-        pub const TOPOLOGY: u32 = 6;
-        pub const MIX: u32 = 7;
-        pub const MAKEUP: u32 = 8;
+        pub const MIX: u32 = 6;
+
+        /// The bus compressor's steps, as printed on the box.
+        pub const RATIO_VALUES: [f32; 3] = [2.0, 4.0, 10.0];
+        pub const ATTACK_MS: [f32; 6] = [0.1, 0.3, 1.0, 3.0, 10.0, 30.0];
+        /// The last position is AUTO: two time constants at once.
+        pub const RELEASE_MS: [f32; 4] = [100.0, 300.0, 600.0, 1200.0];
+        pub const RELEASE_AUTO: usize = 4;
+        /// The knee the detector and the feedback give it, fixed.
+        pub const KNEE_DB: f32 = 3.0;
+        /// The detector's window: fast, a peak more than an average.
+        pub const DETECT_MS: f32 = 5.0;
 
         pub const TABLE: &[ParamDef] = &[
             ParamDef {
                 id: 0,
                 name: "Threshold",
-                min: -60.0,
+                min: -40.0,
                 max: 0.0,
-                default: -18.0,
+                default: -10.0,
             },
             ParamDef {
                 id: 1,
                 name: "Ratio",
-                min: 1.0,
-                max: 20.0,
-                default: 4.0,
+                min: 0.0,
+                max: 2.0,
+                default: 1.0,
             },
             ParamDef {
                 id: 2,
                 name: "Attack",
-                min: 0.1,
-                max: 100.0,
-                default: 10.0,
+                min: 0.0,
+                max: 5.0,
+                default: 3.0,
             },
             ParamDef {
                 id: 3,
                 name: "Release",
-                min: 10.0,
-                max: 2000.0,
-                default: 100.0,
+                min: 0.0,
+                max: 4.0,
+                default: 4.0,
             },
             ParamDef {
                 id: 4,
-                name: "Knee",
+                name: "Makeup",
                 min: 0.0,
                 max: 24.0,
-                default: 6.0,
+                default: 0.0,
             },
             ParamDef {
                 id: 5,
@@ -8140,24 +8149,10 @@ pub mod console {
             },
             ParamDef {
                 id: 6,
-                name: "Topology",
-                min: 0.0,
-                max: 1.0,
-                default: 0.0,
-            },
-            ParamDef {
-                id: 7,
                 name: "Mix",
                 min: 0.0,
                 max: 100.0,
                 default: 100.0,
-            },
-            ParamDef {
-                id: 8,
-                name: "Makeup",
-                min: 0.0,
-                max: 24.0,
-                default: 0.0,
             },
         ];
     }

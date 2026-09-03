@@ -24,6 +24,7 @@ pub mod door;
 pub mod hit;
 pub mod preamp;
 pub mod tone;
+pub mod vca;
 
 use crate::audio::graph::Readout;
 use crate::console::{SectionKind, SectionParams};
@@ -115,6 +116,7 @@ pub fn core_of(params: &SectionParams, sample_rate: f32, block: usize) -> Box<dy
         SectionKind::Door => Box::new(door::DoorCore::new(params, sample_rate, block)),
         SectionKind::Cut => Box::new(cut::CutCore::new(params, sample_rate, block)),
         SectionKind::Hit => Box::new(hit::HitCore::new(params, sample_rate, block)),
+        SectionKind::Vca => Box::new(vca::VcaCore::new(params, sample_rate, block)),
         _ => Box::new(Wire::new(params)),
     }
 }
@@ -133,7 +135,8 @@ mod tests {
     }
 
     /// A wire is a wire: whatever goes in comes out, at every block
-    /// length, for every kind.
+    /// length, for every kind at its defaults — on a quiet signal, so
+    /// a compressor's default threshold is not crossed.
     #[test]
     fn every_kind_compiles_to_something_that_passes_sound_through() {
         for kind in SectionKind::ALL {
@@ -145,7 +148,7 @@ mod tests {
                 continue;
             }
             for len in [0usize, 1, 7, 256] {
-                let mut l: Vec<f32> = (0..len).map(|i| (i as f32 * 0.1).sin()).collect();
+                let mut l: Vec<f32> = (0..len).map(|i| (i as f32 * 0.1).sin() * 0.01).collect();
                 let mut r: Vec<f32> = l.iter().map(|s| -s).collect();
                 let (before_l, before_r) = (l.clone(), r.clone());
                 core.process(&mut l, &mut r, &clock());
