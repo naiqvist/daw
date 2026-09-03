@@ -11909,6 +11909,58 @@ mod tests {
         assert!(!stage.song.tracks[0].solo);
     }
 
+    /// A KNOB ON A DEVICE IS A LETTER TOO.
+    ///
+    /// The same division as a fader's, and the one a hand actually
+    /// reaches for: turning a parameter on an instrument must reach the
+    /// running node without rebuilding the graph, and it must bump the
+    /// mix revision or the host never sends it at all — which is heard
+    /// as a knob that does nothing until something else forces a
+    /// recompile.
+    #[test]
+    fn a_knob_on_a_device_is_a_letter_and_reaches_the_engine() {
+        let mut stage = Stage::new();
+        let id = stage
+            .song_mut()
+            .add_device(0, crate::devices::DeviceKind::Kick)
+            .expect("a kick");
+        assert_eq!(stage.apply(StageIntent::Devices), ApplyOutcome::Changed);
+        // Onto a parameter row of the kick's own card.
+        assert_eq!(
+            stage.apply(StageIntent::Step(Step::Down)),
+            ApplyOutcome::Changed
+        );
+        let (graph, mix) = (stage.revision(), stage.mix_revision());
+        let before = stage
+            .song()
+            .device(id)
+            .map(|device| device.overrides.clone())
+            .unwrap_or_default();
+
+        let outcome = stage.apply(StageIntent::Param {
+            up: true,
+            coarse: true,
+        });
+        assert_eq!(outcome, ApplyOutcome::Changed, "the knob refused to turn");
+        assert_ne!(
+            stage.song().device(id).map(|d| d.overrides.clone()),
+            Some(before),
+            "the knob did not move the document"
+        );
+        assert_eq!(
+            stage.revision(),
+            graph,
+            "turning a knob rebuilt the graph — the sound would stop on every turn"
+        );
+        assert_ne!(
+            stage.mix_revision(),
+            mix,
+            "the knob never reached the engine: the host only sends letters when the \
+             mix revision moves, so this would not be heard until something else \
+             forced a recompile"
+        );
+    }
+
     /// The division the whole audio path depends on: a level rides a
     /// letter to a running node, a switch rebuilds the graph. Getting
     /// this backwards would either stop the sound on every fader press or

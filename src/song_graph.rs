@@ -66,6 +66,15 @@ pub struct SongNodes {
     pub telemetry: Vec<(DeviceId, usize)>,
 }
 
+/// Put `node` in the letter table WITHOUT a telemetry slot.
+///
+/// A voice is addressable — a knob on an instrument must ride a letter
+/// like any other knob — but it reports no figures of its own, and the
+/// telemetry slots are the console's. See [`register`].
+fn address(nodes: &mut SongNodes, id: DeviceId, node: NodeId) {
+    nodes.devices.push((id, node));
+}
+
 /// Put `node` in the tables: its letters, and its telemetry slot while
 /// there is one to give.
 fn register(spec: &mut GraphSpec, nodes: &mut SongNodes, id: DeviceId, node: NodeId) {
@@ -261,6 +270,12 @@ pub fn build(song: &Song, playing: &[Option<usize>]) -> (GraphSpec, SongNodes) {
             continue;
         };
         let voice = spec.push(instrument);
+        // The instrument is a device with knobs like any other, so it
+        // goes in the letter table. Leaving it out meant a turn on a
+        // kick was heard only when something ELSE rebuilt the graph.
+        if let Some(head) = track.chain.first().filter(|device| device.is_instrument()) {
+            address(&mut nodes, head.id, voice);
+        }
         // The effects, in signal order, each fed by the one before it. A
         // BYPASSED effect is simply not built: the signal passes it by,
         // which is what bypass means, and costs nothing to run.
@@ -581,6 +596,12 @@ pub fn build_song(song: &Song) -> (GraphSpec, SongNodes) {
             && let Some(instrument) = voice_of(track, notes, None)
         {
             let voice = spec.push(instrument);
+            // The instrument is a device with knobs like any other, so it
+            // goes in the letter table. Leaving it out meant a turn on a
+            // kick was heard only when something ELSE rebuilt the graph.
+            if let Some(head) = track.chain.first().filter(|device| device.is_instrument()) {
+                address(&mut nodes, head.id, voice);
+            }
             let mut effects: Vec<(DeviceId, NodeId)> = Vec::new();
             let mut tail = voice;
             // The chain's effects, then the strip's sections that are IN, in
@@ -777,6 +798,53 @@ fn notes_of(song: &Song, pattern: &Pattern, effects: &[(DeviceId, NodeId)]) -> V
 mod tests {
     use super::*;
 
+    /// WHICH DEVICES A LETTER CAN REACH.
+    ///
+    /// The host sends a knob turn to every device in `nodes.devices` and
+    /// to nothing else, so this table is the exact set of things a turn
+    /// can be heard on without a rebuild. An instrument that is playing
+    /// is in it. A section that is switched OUT is NOT — it was never
+    /// built, because a section that is out is not in the signal path —
+    /// so its knobs move the document and nothing else until it is
+    /// switched in, which rebuilds and compiles the value in.
+    ///
+    /// That is correct, and it is also the thing most likely to be read
+    /// as a knob that does not work.
+    #[test]
+    fn a_letter_reaches_what_is_built_and_nothing_else() {
+        use crate::console::SectionKind;
+        let mut song = song_with_a_clip();
+        let kick = song
+            .add_device(0, crate::devices::DeviceKind::Kick)
+            .expect("a kick on the track");
+        let tone = song
+            .section(0, SectionKind::Tone)
+            .expect("every channel has a tone")
+            .id;
+        // TONE is out at its defaults, as every switchable section is.
+        assert!(song.device(tone).is_some_and(|device| device.bypassed));
+
+        let (_, nodes) = build(&song, &playing(&song));
+        let reaches =
+            |id: crate::sequencing::DeviceId| nodes.devices.iter().any(|(other, _)| *other == id);
+        assert!(
+            reaches(kick),
+            "the instrument is not in the letter table: a knob on it could not be \
+             heard without rebuilding the graph"
+        );
+        assert!(!reaches(tone), "a switched-out section was built anyway");
+
+        // Switched IN, it is built and a letter reaches it.
+        if let Some(device) = song.device_mut(tone) {
+            device.bypassed = false;
+        }
+        let (_, nodes) = build(&song, &playing(&song));
+        assert!(
+            nodes.devices.iter().any(|(other, _)| *other == tone),
+            "a switched-in section is still not in the letter table"
+        );
+    }
+
     /// A send is a real path, not a number on a card: opening one on a
     /// channel's OUT puts that channel into the return's rail, and the
     /// return lands in the mix. Closed, the tap is still built — it
@@ -934,17 +1002,46 @@ mod tests {
     /// rails alike, no two on one slot.
     #[test]
     fn every_built_device_reports_under_its_own_slot() {
-        let song = song_with_a_clip();
+        let mut song = song_with_a_clip();
+        // With an instrument on the track, so the case that the letter
+        // table is WIDER than the telemetry table is actually covered.
+        let voice = song
+            .add_device(0, crate::devices::DeviceKind::Kick)
+            .expect("a kick");
         for (spec, nodes) in [build(&song, &playing(&song)), build_song(&song)] {
             let _ = spec;
-            // A device reports once. `devices` may hold a device more
-            // than once — a channel's OUT owns its send taps as well as
-            // its own node, so a letter reaches all of them — so the
-            // count to match is DISTINCT devices, not table entries.
+            // Telemetry is the CONSOLE's: every section that reached
+            // the graph reports, and nothing else does. The letter
+            // table is wider than that — an instrument is addressable
+            // so a knob on it can be heard, and a channel's OUT owns
+            // its send taps as well as its own node — so the two
+            // tables are not the same length and never were meant to
+            // be. What must hold is that everything telemetered is
+            // addressable, and that no two share a slot.
             let mut addressed: Vec<u64> = nodes.devices.iter().map(|(id, _)| id.0).collect();
             addressed.sort_unstable();
             addressed.dedup();
-            assert_eq!(nodes.telemetry.len(), addressed.len());
+            for (id, _) in &nodes.telemetry {
+                assert!(
+                    addressed.contains(&id.0),
+                    "a device reports figures no letter can reach"
+                );
+            }
+            assert!(
+                nodes.telemetry.len() <= addressed.len(),
+                "more reporters than devices"
+            );
+            // The instrument is the case that makes them differ: a
+            // knob on it rides a letter, and it has no figures of its
+            // own to report.
+            assert!(
+                addressed.contains(&voice.0),
+                "the instrument is unaddressable"
+            );
+            assert!(
+                !nodes.telemetry.iter().any(|(id, _)| *id == voice),
+                "the instrument took a telemetry slot it has nothing to put in"
+            );
             let mut slots: Vec<usize> = nodes.telemetry.iter().map(|(_, slot)| *slot).collect();
             slots.sort_unstable();
             slots.dedup();
