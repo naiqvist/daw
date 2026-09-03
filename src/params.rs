@@ -8467,6 +8467,36 @@ pub mod console {
         pub const WIDTH: u32 = 4;
         pub const MIX: u32 = 5;
 
+        pub const CHORUS: u32 = 0;
+        pub const FLANGER: u32 = 1;
+        pub const VIBRATO: u32 = 2;
+        pub const ENSEMBLE: u32 = 3;
+        /// Each mode's line: the delay it sits at and how far the sweep
+        /// reaches at full depth, in ms, chorus, flanger, vibrato,
+        /// ensemble.
+        pub const BASE_MS: [f32; 4] = [7.0, 1.0, 4.0, 6.0];
+        pub const SWEEP_MS: [f32; 4] = [4.0, 3.5, 3.0, 3.0];
+        /// The longest line any mode needs, in ms.
+        pub const MAX_MS: f32 = 16.0;
+        /// The bucket brigade's band: its clock's anti-alias filters,
+        /// duller the longer the line, in Hz for the short line and the
+        /// long one.
+        pub const BBD_SHORT_HZ: f32 = 12_000.0;
+        pub const BBD_LONG_HZ: f32 = 8_000.0;
+        /// The brigade's floor and its knee: a little hiss and a soft
+        /// top, both fixed.
+        pub const BBD_NOISE_DB: f32 = -72.0;
+        pub const BBD_KNEE: f32 = 0.6;
+        /// The sweep is not a metronome: a slow random walk wobbles the
+        /// rate and the depth by these shares.
+        pub const DRIFT_HZ: f32 = 0.3;
+        pub const DRIFT_RATE: f32 = 0.06;
+        pub const DRIFT_DEPTH: f32 = 0.05;
+        /// The ensemble's second, fast sweep: its rate in Hz and its
+        /// reach in ms.
+        pub const ENSEMBLE_FAST_HZ: f32 = 5.7;
+        pub const ENSEMBLE_FAST_MS: f32 = 0.35;
+
         pub const TABLE: &[ParamDef] = &[
             ParamDef {
                 id: 0,
@@ -8508,7 +8538,7 @@ pub mod console {
                 name: "Mix",
                 min: 0.0,
                 max: 100.0,
-                default: 50.0,
+                default: 0.0,
             },
         ];
     }

@@ -21,6 +21,7 @@
 
 pub mod cut;
 pub mod door;
+pub mod drift;
 pub mod drive;
 pub mod grit;
 pub mod hit;
@@ -123,6 +124,7 @@ pub fn core_of(params: &SectionParams, sample_rate: f32, block: usize) -> Box<dy
         SectionKind::Split => Box::new(split::SplitCore::new(params, sample_rate, block)),
         SectionKind::Drive => Box::new(drive::DriveCore::new(params, sample_rate, block)),
         SectionKind::Grit => Box::new(grit::GritCore::new(params, sample_rate, block)),
+        SectionKind::Drift => Box::new(drift::DriftCore::new(params, sample_rate, block)),
         _ => Box::new(Wire::new(params)),
     }
 }
