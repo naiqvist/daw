@@ -22,6 +22,7 @@
 pub mod cut;
 pub mod door;
 pub mod drive;
+pub mod grit;
 pub mod hit;
 pub mod preamp;
 pub mod split;
@@ -121,6 +122,7 @@ pub fn core_of(params: &SectionParams, sample_rate: f32, block: usize) -> Box<dy
         SectionKind::Vca => Box::new(vca::VcaCore::new(params, sample_rate, block)),
         SectionKind::Split => Box::new(split::SplitCore::new(params, sample_rate, block)),
         SectionKind::Drive => Box::new(drive::DriveCore::new(params, sample_rate, block)),
+        SectionKind::Grit => Box::new(grit::GritCore::new(params, sample_rate, block)),
         _ => Box::new(Wire::new(params)),
     }
 }

@@ -3894,6 +3894,18 @@ pub static CONSOLE: &[DeviceSpec] = &[
                 group: "Grit",
                 choices: &[],
             },
+            ParamLabel {
+                name: "Post LP",
+                unit: "Hz",
+                group: "Grit",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Mix",
+                unit: "%",
+                group: "Grit",
+                choices: &[],
+            },
         ],
     },
     DeviceSpec {

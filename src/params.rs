@@ -8365,6 +8365,19 @@ pub mod console {
         pub const BITS: u32 = 1;
         pub const JITTER: u32 = 2;
         pub const HISS: u32 = 3;
+        pub const POST: u32 = 4;
+        pub const MIX: u32 = 5;
+
+        /// The converter is off at the top of its range and the post
+        /// filter is off at the top of its.
+        pub const RATE_OFF_HZ: f32 = 48_000.0;
+        pub const POST_OFF_HZ: f32 = 20_000.0;
+        /// Jitter at full wobbles the clock by this share of the rate.
+        pub const JITTER_DEPTH: f32 = 0.35;
+        /// Hiss at full, in dBFS.
+        pub const HISS_DB: f32 = -30.0;
+        /// The post filter's slope: enough to take the images off.
+        pub const POST_ORDER: u32 = 4;
 
         pub const TABLE: &[ParamDef] = &[
             ParamDef {
@@ -8394,6 +8407,20 @@ pub mod console {
                 min: 0.0,
                 max: 100.0,
                 default: 0.0,
+            },
+            ParamDef {
+                id: 4,
+                name: "Post LP",
+                min: 200.0,
+                max: 20000.0,
+                default: 20000.0,
+            },
+            ParamDef {
+                id: 5,
+                name: "Mix",
+                min: 0.0,
+                max: 100.0,
+                default: 100.0,
             },
         ];
     }
