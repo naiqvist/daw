@@ -1,7 +1,8 @@
 //! The lower sequence region and its persistent UI-local state.
 
-use crate::design::{circuit, kit::Weight};
+use crate::design::kit::Weight;
 use crate::ui::affordance::{Afford, Affords};
+use crate::ui::sequencer::chrome;
 use crate::ui::sequencer::grammar::Voice;
 use crate::ui::sequencer::roll::RollPanel;
 use crate::ui::sequencer::sequence_grid::SequenceGrid;
@@ -78,7 +79,7 @@ pub(crate) fn editor_switch(
                 crate::ui::sequencer::shade(0, ground)
             },
         ));
-        circuit::trace(
+        chrome::trace(
             &mut shell,
             &[
                 egui::pos2(plate.left(), plate.bottom()),

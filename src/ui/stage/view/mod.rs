@@ -12,6 +12,7 @@
 //! (never summoned here, so it never owns the keys), and every surface
 //! the old view drew.
 
+mod band;
 mod chassis;
 mod heads;
 mod input;
@@ -180,11 +181,12 @@ impl Stage {
         let enter_held = ui.input(|input| input.key_down(egui::Key::Enter));
         self.take_pitch_entry(update, enter_held);
 
-        let field = Layout::of(ui.available_rect_before_wrap()).field;
+        let layout = Layout::of(ui.available_rect_before_wrap());
+        let field = layout.field;
         self.follow_cursor(
             heads::capacity(field.width()),
             lattice::capacity(field),
-            HOLDS_EVERYTHING,
+            band::capacity(layout.tray),
         );
 
         let dt = ui.ctx().input(|input| input.stable_dt);
@@ -207,7 +209,13 @@ impl Stage {
         self.draw_heads(painter, layout.field);
         self.draw_lattice(painter, layout.field);
         self.draw_status(painter, layout.status);
-        self.draw_tray(ui, layout.tray);
+        // One detail region, and the band and the sequencer are two
+        // things to put in it. The band wins while it is showing.
+        if self.chain.is_some() {
+            self.draw_band(ui.painter(), layout.tray);
+        } else {
+            self.draw_tray(ui, layout.tray);
+        }
         let mut inspector = inspector();
         if inspector.open {
             let panel = egui::Rect::from_min_max(

@@ -11,9 +11,10 @@
 //! Per-pitch removal needs no private intent: it speaks `Clear` then
 //! re-adds the survivors, exactly the way put replaces a trig.
 
-use crate::design::{Polarity, circuit, kit::Weight, motion::pulse_ink};
+use crate::design::{Polarity, kit::Weight, motion::pulse_ink};
 use crate::pitch::Pitch;
 use crate::sequencing::PATTERN_STEPS;
+use crate::ui::sequencer::chrome;
 use crate::ui::sequencer::grammar::{Motion, Utterance, Voice};
 use crate::ui::sequencer::registers::{Payload, RollRegion, RollRegionNote, TrigNote};
 use crate::ui::sequencer::sequence::{
@@ -251,7 +252,7 @@ impl RollPanel {
                 painter.rect_filled(lane, 0.0, shade(LANE_DARK, ground));
             }
             let mut lane_shapes = Vec::new();
-            circuit::trace(
+            chrome::trace(
                 &mut lane_shapes,
                 &[lane.left_bottom(), lane.right_bottom()],
                 Weight::Hair,
@@ -260,7 +261,7 @@ impl RollPanel {
             for step in self.view_step..=self.view_step + self.visible_steps() {
                 if step.is_multiple_of(16) {
                     let x = lanes.left() + (step - self.view_step) as f32 * step_w;
-                    circuit::via(
+                    chrome::via(
                         &mut lane_shapes,
                         egui::pos2(x, lane.center().y),
                         shade(EDGE, ground),
@@ -300,7 +301,7 @@ impl RollPanel {
                 Weight::Hair
             };
             let mut shapes = Vec::new();
-            circuit::trace(
+            chrome::trace(
                 &mut shapes,
                 &[egui::pos2(x, lanes.top()), egui::pos2(x, lanes.bottom())],
                 weight,
@@ -404,16 +405,16 @@ impl RollPanel {
                 let alpha = crate::ui::sequencer::alphabet(ground);
                 let ink = pulse_ink(alpha.live.color, alpha.live_dim.color, phase);
                 let mut shapes = Vec::new();
-                circuit::trace(
+                chrome::trace(
                     &mut shapes,
                     &[egui::pos2(x, lanes.top()), egui::pos2(x, lanes.bottom())],
                     Weight::Heavy,
                     ink,
                 );
-                circuit::pad(
+                chrome::pad(
                     &mut shapes,
                     egui::pos2(x, lanes.top()),
-                    circuit::PAD + 1.0,
+                    chrome::PAD + 1.0,
                     ink,
                     true,
                 );
@@ -469,7 +470,7 @@ impl RollPanel {
         );
         if ghost {
             let mut shapes = Vec::new();
-            circuit::octagon(
+            chrome::octagon(
                 &mut shapes,
                 rect,
                 3.0,
@@ -491,23 +492,23 @@ impl RollPanel {
             velocity_ink(note.velocity, ground)
         };
         let mut shapes = Vec::new();
-        circuit::octagon(
+        chrome::octagon(
             &mut shapes,
             rect,
             3.0,
             Some(ink),
             Some((Weight::Hair, shade(LANE_RULE, ground))),
         );
-        circuit::pad(
+        chrome::pad(
             &mut shapes,
             rect.left_center(),
-            circuit::PAD - 1.0,
+            chrome::PAD - 1.0,
             shade(INK_LEVEL, ground),
             true,
         );
         draw_lock_marks(&mut shapes, rect, note.locks, ground);
         if selected {
-            circuit::octagon(
+            chrome::octagon(
                 &mut shapes,
                 rect,
                 3.0,

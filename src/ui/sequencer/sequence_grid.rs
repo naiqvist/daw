@@ -24,10 +24,11 @@
 //! the cells they cross. A rule is drawn only where a rule is the sign
 //! (the cursor's corners); nothing is furniture.
 
-use crate::design::{Polarity, block, circuit, codex::Sign, kit::Weight, motion::pulse_ink};
+use crate::design::{Polarity, codex::Sign, kit::Weight, motion::pulse_ink};
 use crate::pitch::Pitch;
 use crate::sequencing::{DEFAULT_PATTERN_TICKS, GRID_COLUMNS, GRID_ROWS, PATTERN_STEP_TICKS};
 use crate::ui::affordance::{Afford, Affords};
+use crate::ui::sequencer::chrome;
 use crate::ui::sequencer::grammar::{Motion, Utterance, Voice};
 use crate::ui::sequencer::grid_resolution::{GridResolution, TICKS_PER_BAR};
 use crate::ui::sequencer::lens::LensView;
@@ -354,8 +355,8 @@ impl SequenceGrid {
             0.0,
             shade(PANEL_FILL, ground),
         ));
-        circuit::panel_frame(&mut casing, container, Weight::Heavy, rule_ink(ground, 0.8));
-        circuit::corner_pads(&mut casing, container.shrink(4.0), shade(EDGE, ground));
+        chrome::panel_frame(&mut casing, container, Weight::Heavy, rule_ink(ground, 0.8));
+        chrome::corner_pads(&mut casing, container.shrink(4.0), shade(EDGE, ground));
         for shape in casing {
             painter.add(shape);
         }
@@ -369,7 +370,7 @@ impl SequenceGrid {
             0.0,
             shade(HEADER_FILL, ground),
         ));
-        circuit::trace(
+        chrome::trace(
             &mut header_shapes,
             &[
                 egui::pos2(header.left(), header.bottom() + 0.5),
@@ -452,7 +453,7 @@ impl SequenceGrid {
                         // baseline runs on so the row still reads as a
                         // row, and nothing else is drawn.
                         let mut shapes = Vec::new();
-                        circuit::trace(
+                        chrome::trace(
                             &mut shapes,
                             &[
                                 egui::pos2(rect.left() - CELL_GAP * 0.5, rect.bottom() + 0.5),
@@ -551,19 +552,13 @@ impl SequenceGrid {
                     let alpha = crate::ui::sequencer::alphabet(ground);
                     let ink = pulse_ink(alpha.live.color, alpha.live_dim.color, phase);
                     let mut shapes = Vec::new();
-                    circuit::trace(
+                    chrome::trace(
                         &mut shapes,
                         &[head.center_top(), head.center_bottom()],
                         Weight::Heavy,
                         ink,
                     );
-                    circuit::pad(
-                        &mut shapes,
-                        head.center_top(),
-                        circuit::PAD + 1.0,
-                        ink,
-                        true,
-                    );
+                    chrome::pad(&mut shapes, head.center_top(), chrome::PAD + 1.0, ink, true);
                     for shape in shapes {
                         cells.add(shape);
                     }
@@ -614,7 +609,7 @@ impl SequenceGrid {
             } else {
                 RULER_MINOR
             };
-            circuit::trace(
+            chrome::trace(
                 &mut shapes,
                 &[egui::pos2(x, foot), egui::pos2(x, foot - reach)],
                 if bar { Weight::Heavy } else { Weight::Hair },
@@ -687,7 +682,7 @@ impl SequenceGrid {
         let note_at = rect.left_center() + egui::vec2(EDITOR_SWITCH_WIDTH + space::SM, 0.0);
         let words_at = note_at + egui::vec2(16.0, 0.0);
         let mut shapes = Vec::new();
-        circuit::annotation_arrow(
+        chrome::annotation_arrow(
             &mut shapes,
             note_at,
             words_at - egui::vec2(3.0, 0.0),
@@ -748,16 +743,16 @@ impl SequenceGrid {
                 if let Some(tail) = note_span_rect(rect, tick, span, held) {
                     let ink = tail_ink(held.velocity, ground);
                     let mut shapes = Vec::new();
-                    circuit::trace(
+                    chrome::trace(
                         &mut shapes,
                         &[tail.left_center(), tail.right_center()],
                         Weight::Hair,
                         ink,
                     );
-                    circuit::pad(
+                    chrome::pad(
                         &mut shapes,
                         tail.right_center(),
-                        circuit::PAD - 1.0,
+                        chrome::PAD - 1.0,
                         ink,
                         true,
                     );
@@ -781,7 +776,7 @@ impl SequenceGrid {
         let face_fill = velocity_ink(note.velocity, ground);
         let mut shapes = Vec::new();
         shapes.push(egui::Shape::rect_filled(face, 0.0, face_fill));
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 face.left_top(),
@@ -793,10 +788,10 @@ impl SequenceGrid {
             Weight::Hair,
             shade(FACE_DETAIL_INK, ground),
         );
-        circuit::pad(
+        chrome::pad(
             &mut shapes,
             face.left_center(),
-            circuit::PAD,
+            chrome::PAD,
             shade(FACE_INK, ground),
             true,
         );
@@ -1687,7 +1682,7 @@ fn deviation_sign(note: &NoteView) -> String {
 
 fn draw_edge_tag(painter: &egui::Painter, rect: egui::Rect, words: &str, ground: Polarity) {
     let mut shapes = Vec::new();
-    circuit::octagon(
+    chrome::octagon(
         &mut shapes,
         rect,
         2.0,
@@ -1729,7 +1724,7 @@ pub(crate) fn draw_lock_marks(
         if x + 2.0 > face.right() - 4.0 {
             break;
         }
-        circuit::pad(out, egui::pos2(x, y), 3.0, live, true);
+        chrome::pad(out, egui::pos2(x, y), 3.0, live, true);
         x += 5.0;
     }
 }
@@ -1755,14 +1750,14 @@ pub(crate) fn draw_clip_end(
 ) {
     let ink = shade(INK_LEVEL, ground);
     let mut shapes = Vec::new();
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[egui::pos2(x, top), egui::pos2(x, bottom)],
         Weight::Heavy,
         ink,
     );
-    circuit::pad(&mut shapes, egui::pos2(x, top), circuit::PAD, ink, true);
-    circuit::pad(&mut shapes, egui::pos2(x, bottom), circuit::PAD, ink, true);
+    chrome::pad(&mut shapes, egui::pos2(x, top), chrome::PAD, ink, true);
+    chrome::pad(&mut shapes, egui::pos2(x, bottom), chrome::PAD, ink, true);
     painter.extend(shapes);
     painter.text(
         egui::pos2(x + 4.0, top + 2.0),
@@ -1881,7 +1876,7 @@ fn draw_row_address(
     let arm = cell_side.min(22.0) * 0.42;
     for i in 0..=(row % 4) {
         let y = node.y - arm + i as f32 * 3.0;
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(node.x - arm, y),
@@ -1901,13 +1896,11 @@ fn draw_row_address(
         Weight::Hair,
         shade(LABEL_INK, ground),
     );
-    block::paint(
-        painter,
-        egui::Id::new(("sequencer-row-address", row, first_step)),
+    painter.text(
         right_top,
         egui::Align2::RIGHT_TOP,
-        block::unit::MICRO,
-        &format!("{first_step:02}"),
+        format!("{first_step:02}"),
+        egui::FontId::new(font::MINI_LABEL, egui::FontFamily::Monospace),
         shade(INK_LEVEL, ground),
     );
     if cell_side >= 32.0 {
@@ -1957,7 +1950,7 @@ fn draw_ground(painter: &egui::Painter, rect: egui::Rect, tick: usize, ground: P
     // empty address on a graticule is empty.
     let x = (band.left()).floor() + 0.5;
     if bar {
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(x, rect.top() - 2.0),
@@ -1967,14 +1960,14 @@ fn draw_ground(painter: &egui::Painter, rect: egui::Rect, tick: usize, ground: P
             rule_ink(ground, 1.15),
         );
     } else if beat {
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
             Weight::Hair,
             rule_ink(ground, 0.85),
         );
     } else {
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(x, rect.bottom() + 0.5),
@@ -1986,7 +1979,7 @@ fn draw_ground(painter: &egui::Painter, rect: egui::Rect, tick: usize, ground: P
     }
     // The baseline the ticks stand on, drawn cell by cell so it is one
     // unbroken rule across the row.
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             egui::pos2(band.left(), rect.bottom() + 0.5),
@@ -2034,7 +2027,7 @@ fn draw_selection(
     )];
     // The rail along the head of the run.
     let rail = rect.top() + 2.5;
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             egui::pos2(band.left(), rail),
@@ -2052,7 +2045,7 @@ fn draw_selection(
         if !at {
             continue;
         }
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(x, rail - 2.0),
@@ -2200,7 +2193,7 @@ pub(crate) fn draw_cursor(
         0.0,
         wash(CURSOR_WASH, ground),
     ));
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             cell.left_top(),

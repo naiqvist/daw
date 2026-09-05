@@ -3,7 +3,8 @@
 //! Values are placeholders sourced from the UI grid selection. The eventual
 //! sequence model can provide the same snapshot without changing this view.
 
-use crate::design::{Polarity, circuit, kit::Weight};
+use crate::design::{Polarity, kit::Weight};
+use crate::ui::sequencer::chrome;
 use crate::ui::sequencer::grid_resolution::length_label;
 use crate::ui::sequencer::layout_grid::{GridArea, LayoutGrid};
 use crate::ui::sequencer::lens::degree_label;
@@ -55,7 +56,7 @@ pub(crate) fn show(
 ) {
     let painter = ui.painter_at(rect);
     let mut panel = Vec::new();
-    circuit::panel_variant(
+    chrome::panel_variant(
         &mut panel,
         rect,
         Some(shade(PANEL_FILL, ground)),
@@ -72,7 +73,7 @@ pub(crate) fn show(
         egui::pos2(rect.right(), rect.top() + HEADER_HEIGHT),
     );
     let mut header = Vec::new();
-    circuit::panel_variant(
+    chrome::panel_variant(
         &mut header,
         header_rect,
         Some(shade(HEADER_FILL, ground)),

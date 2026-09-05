@@ -162,6 +162,7 @@ pub fn install_stage_fonts(ctx: &egui::Context) -> &'static str {
             "iA Writer Quattro S Bold (bundled)"
         }
     };
+    let has_profont = std::fs::metadata(PROFONT_PATH).is_ok();
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
         let list = fonts.families.entry(family).or_default();
         list.insert(0, "departure".to_owned());
@@ -170,6 +171,11 @@ pub fn install_stage_fonts(ctx: &egui::Context) -> &'static str {
         // remain behind all three.
         list.insert(1, "typewriter".to_owned());
         list.insert(2, "terminus".to_owned());
+        // The console's face leads when this machine has it, so every
+        // widget that asks for "monospace" speaks in it too.
+        if has_profont {
+            list.insert(0, "profont".to_owned());
+        }
     }
     fonts.families.insert(
         egui::FontFamily::Name(INSCRIPTION.into()),
