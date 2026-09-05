@@ -65,7 +65,7 @@ pub fn width_of(kind: SectionKind) -> f32 {
         SectionKind::Preamp => PREAMP_W,
         SectionKind::Tone => 424.0,
         SectionKind::Door => 496.0,
-        SectionKind::Cut => 204.0,
+        SectionKind::Cut => 468.0,
         SectionKind::Hit => 166.0,
         SectionKind::Four => 256.0,
         SectionKind::Vca => 272.0,

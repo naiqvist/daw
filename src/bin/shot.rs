@@ -725,6 +725,31 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
                 backend: "JACK",
             }));
         }
+    } else if which.contains("cut") && which.contains("stage") {
+        // Both blades in, the low one resonant, and the crunch leaned
+        // on — so the plot has slopes, a peak and heat in it.
+        use daw::devices::DeviceKind;
+        let _ = stage.song_mut().add_device(0, DeviceKind::Poly);
+        {
+            use daw::params::console::cut as p;
+            let song = stage.song_mut();
+            if let Some(device) = song
+                .section(0, daw::console::SectionKind::Cut)
+                .map(|device| device.id)
+                .and_then(|id| song.device_mut(id))
+            {
+                device.bypassed = false;
+                device.set(p::HP_HZ, 220.0);
+                device.set(p::HP_RES, 72.0);
+                device.set(p::LP_HZ, 6000.0);
+                device.set(p::LP_RES, 20.0);
+                device.set(p::CRUNCH, 55.0);
+            }
+        }
+        let _ = stage.apply(StageIntent::Devices);
+        for _ in 0..4 {
+            let _ = stage.apply(StageIntent::Step(Step::Right));
+        }
     } else if which.contains("door") {
         // The gate, keyed on a narrow band and ducking rather than
         // slamming, so the lane, the envelope and the key all say
