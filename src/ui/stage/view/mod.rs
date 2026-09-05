@@ -21,6 +21,7 @@ mod inspector;
 mod lattice;
 mod mixer;
 mod palette;
+mod sample;
 mod song;
 mod status;
 mod tray;
@@ -210,7 +211,10 @@ impl Stage {
         painter.rect_filled(whole, 0.0, palette::colours().ground);
         let layout = Layout::of(whole);
         self.draw_title(painter, layout.title);
-        if self.song_view {
+        if self.sample.is_some() {
+            // The cutting room takes the whole field.
+            self.draw_sample(painter, layout.field);
+        } else if self.song_view {
             // The field turned over: the song's arrangement in the
             // session's place.
             self.draw_song(painter, layout.field);
