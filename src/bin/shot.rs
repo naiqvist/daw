@@ -725,6 +725,30 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
                 backend: "JACK",
             }));
         }
+    } else if which.contains("tone") && which.contains("stage") {
+        // The desk's equaliser, with a low boost hard enough to light
+        // the iron and a killed top, so the curve shows both.
+        use daw::devices::DeviceKind;
+        let _ = stage.song_mut().add_device(0, DeviceKind::Poly);
+        {
+            use daw::params::console::tone as p;
+            let song = stage.song_mut();
+            if let Some(device) = song
+                .section(0, daw::console::SectionKind::Tone)
+                .map(|device| device.id)
+                .and_then(|id| song.device_mut(id))
+            {
+                device.bypassed = false;
+                device.set(p::LO, 9.5);
+                device.set(p::MID, -4.0);
+                device.set(p::MID_HZ, 2200.0);
+                device.set(p::KILL_HI, 1.0);
+            }
+        }
+        let _ = stage.apply(StageIntent::Devices);
+        for _ in 0..2 {
+            let _ = stage.apply(StageIntent::Step(Step::Right));
+        }
     } else if which.contains("preamp") {
         // The head of the channel strip, with the stage leaned on so
         // the curve bends and the ladder has rungs to show.

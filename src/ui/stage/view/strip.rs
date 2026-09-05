@@ -63,7 +63,7 @@ pub fn width_of(kind: SectionKind) -> f32 {
     match kind {
         // The channel's own stages.
         SectionKind::Preamp => PREAMP_W,
-        SectionKind::Tone => 248.0,
+        SectionKind::Tone => 424.0,
         SectionKind::Door => 236.0,
         SectionKind::Cut => 204.0,
         SectionKind::Hit => 166.0,
