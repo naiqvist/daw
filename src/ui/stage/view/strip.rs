@@ -100,11 +100,13 @@ pub fn width_of(kind: SectionKind) -> f32 {
 /// neighbours are cut alike and the run's corners are a rhythm rather
 /// than a rule.
 pub fn cuts(kind: SectionKind) -> (f32, f32, f32, f32) {
-    // The console keys only the ends of a row; a band of pieces is one
-    // run, so every piece is square. The section's identity is its
-    // width, its face and its route — not a corner of its own.
+    // The console's window: two opposite corners cut at the house
+    // chamfer, the other two square — keyed, so it reads as a component
+    // that fits one way round. Every piece the same; the section's
+    // identity is its width, its face and its route, not a corner.
     let _ = kind;
-    (0.0, 0.0, 0.0, 0.0)
+    let c = chrome::CHAMFER;
+    (c, 0.0, c, 0.0)
 }
 
 /// The lowest a crevice may be cut into a wall, as a share of the
@@ -1076,40 +1078,21 @@ pub fn screen_frame(
     edge: egui::Color32,
     ground: egui::Color32,
 ) {
+    // A chamfered window: the ground, one keyed outline, and a header
+    // rule a title's height down — nothing inside the frame but the
+    // face itself.
     out.push(egui::Shape::rect_filled(hole, 0.0, ground));
     chrome::panel_frame_variant(out, hole, Weight::Hair, edge, 0);
-    let inner = hole.shrink(3.0);
+    let y = (hole.min.y + 12.0).round() - 0.5;
     chrome::trace(
         out,
         &[
-            inner.left_top(),
-            inner.right_top(),
-            inner.right_bottom(),
-            inner.left_bottom(),
-            inner.left_top(),
+            egui::pos2(hole.min.x + chrome::CHAMFER, y),
+            egui::pos2(hole.max.x - 1.0, y),
         ],
         Weight::Hair,
-        edge.gamma_multiply(0.5),
+        edge.gamma_multiply(0.6),
     );
-    let tick = 5.0;
-    for (corner, dx, dy) in [
-        (inner.left_top(), 1.0, 1.0),
-        (inner.right_top(), -1.0, 1.0),
-        (inner.right_bottom(), -1.0, -1.0),
-        (inner.left_bottom(), 1.0, -1.0),
-    ] {
-        let c = corner + egui::vec2(dx * 2.0, dy * 2.0);
-        chrome::trace(
-            out,
-            &[
-                c + egui::vec2(0.0, dy * tick),
-                c,
-                c + egui::vec2(dx * tick, 0.0),
-            ],
-            Weight::Hair,
-            edge,
-        );
-    }
 }
 
 /// PREAMP alone carries a stepped crown above its glass. The darker solid
