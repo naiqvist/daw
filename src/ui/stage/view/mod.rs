@@ -26,8 +26,21 @@ use eframe::egui;
 /// needs to move to keep the cursor in sight.
 const HOLDS_EVERYTHING: usize = usize::MAX;
 
+/// The watched theme, made on first use.
+fn skin() -> std::sync::MutexGuard<'static, palette::Skin> {
+    static SKIN: std::sync::OnceLock<std::sync::Mutex<palette::Skin>> = std::sync::OnceLock::new();
+    SKIN.get_or_init(|| std::sync::Mutex::new(palette::Skin::new(palette::theme_path())))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 impl Stage {
     pub fn show(&mut self, ui: &mut egui::Ui) {
+        // The theme file, once a frame: an edit from the picker lands on
+        // the next frame, and a frame is asked for so it shows.
+        if skin().poll() {
+            ui.ctx().request_repaint();
+        }
         self.begin_frame();
         if self.poll_library() {
             ui.ctx()
