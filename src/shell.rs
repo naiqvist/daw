@@ -11,7 +11,7 @@
 //! So the frame goes somewhere we can read it:
 //!
 //! ```text
-//!   egui ──▶ offscreen ──▶ exact copy ──▶ registered screen phosphor ──▶ present
+//!   egui ──▶ offscreen ──▶ bloom + glass ──▶ registered screen phosphor ──▶ present
 //! ```
 //!
 //! # What we took on
@@ -408,8 +408,10 @@ impl<A: Host> Shell<A> {
         // --- and then, after everything -------------------------------
         live.post.draw(
             &live.device,
+            &live.queue,
             &mut encoder,
             &live.offscreen.view,
+            live.offscreen.size,
             live.offscreen.generation,
             &target,
         );
