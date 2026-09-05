@@ -41,6 +41,9 @@ use daw::targets::{
     self, DEVICE_TARGET_PREFIX, ParameterRegistry, ParameterSpec, TRACK_PAN_TARGET,
     TRACK_VOLUME_TARGET, device_target, track_send_index,
 };
+// `shell::post` is shared with the library target, where creative constants
+// resolve through `crate::tune!`. Give the binary crate the same root name.
+use daw::tune;
 use daw::ui::action::UiAction;
 use daw::ui::affordance::{Afford, Affords};
 use daw::ui::device;

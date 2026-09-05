@@ -1190,59 +1190,35 @@ mod tests {
         assert_eq!(joint_y(a), joint_y(b));
     }
 
-    /// DOOR's silhouette is not a box: a step in the top edge, a bay in
-    /// the right wall and a plinth at the foot. The joint is untouched
-    /// by all of it, which is what lets it still plug into TONE.
+    /// DOOR keeps the bay and plinth its face is laid out around, but its
+    /// chassis is the same keyed card as every other section.
     #[test]
-    fn the_door_is_an_irregular_shape_that_still_mates() {
+    fn the_door_keeps_its_face_geometry_inside_the_standard_chassis() {
         let piece = egui::Rect::from_min_size(
             egui::pos2(0.0, 40.0),
             egui::vec2(width_of(SectionKind::Door), 240.0),
         );
-        assert!(shoulder(SectionKind::Door).is_some());
+        assert_eq!(cuts(SectionKind::Door), cuts(SectionKind::Tone));
+        assert!(shoulder(SectionKind::Door).is_none());
         assert!(bay(SectionKind::Door).is_some());
         assert!(plinth(SectionKind::Door).is_some());
-        assert!(shoulder(SectionKind::Tone).is_none(), "TONE is a plain box");
 
-        let door = outline(piece, SectionKind::Door, true, true);
-        // The top edge is at two heights, and the right wall comes in.
-        let top = piece.top();
-        let highest = door.iter().map(|p| p.y).fold(f32::MAX, f32::min);
-        assert!((highest - top).abs() < 0.01);
-        assert!(
-            door.iter().any(|p| p.y > top + 10.0 && p.y < top + 20.0),
-            "no step in the top edge"
-        );
-        assert!(
-            door.iter()
-                .any(|p| p.x < piece.right() - 10.0 && p.x > piece.right() - 20.0),
-            "no bay in the right wall"
-        );
-        // The notch and the tongue are where every other piece's are.
-        let jy = joint_y(piece);
-        assert!(door.iter().any(
-            |p| (p.x - piece.left()).abs() < 0.01 && (p.y - (jy - JOINT_H * 0.5)).abs() < 0.01
-        ));
-        assert!(
-            door.iter()
-                .any(|p| (p.x - (piece.right() + TONGUE)).abs() < 0.01)
-        );
-        // And the glass keeps out of every crevice.
+        // The screen still keeps clear of the face's bay and plinth. With
+        // shoulders removed, it begins on the same line as a plain face.
         let glass = recess_of(piece, SectionKind::Door);
-        assert!(glass.top() > recess_of(piece, SectionKind::Tone).top());
-        assert!(glass.right() < recess_of(piece, SectionKind::Tone).right());
-        assert!(glass.bottom() < recess_of(piece, SectionKind::Tone).bottom());
+        let plain = recess_of(piece, SectionKind::Tone);
+        assert_eq!(glass.top(), plain.top());
+        assert!(glass.right() < plain.right());
+        assert!(glass.bottom() < plain.bottom());
     }
 
-    /// The preamp's chassis is its own — a width and a set of corner
-    /// cuts that no neighbour shares. It is no longer the WIDEST of
-    /// them: every section is sized by what it has to show, and TONE
-    /// has a spectrum to lay three bands across.
+    /// PREAMP keeps the width its face needs while wearing the same keyed
+    /// chassis as every other section.
     #[test]
-    fn preamp_owns_a_distinct_chassis_footprint() {
+    fn preamp_owns_a_distinct_width_inside_the_standard_chassis() {
         assert_ne!(width_of(SectionKind::Preamp), width_of(SectionKind::Tone));
         assert_ne!(width_of(SectionKind::Preamp), width_of(SectionKind::Door));
-        assert_ne!(cuts(SectionKind::Preamp), cuts(SectionKind::Tone));
+        assert_eq!(cuts(SectionKind::Preamp), cuts(SectionKind::Tone));
     }
 
     /// A piece with both joints has an outline with a step in on the

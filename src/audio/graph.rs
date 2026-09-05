@@ -13654,7 +13654,9 @@ mod tests {
             prob: 1.0,
             cond: None,
         }];
-        let events = compile_events(&notes, &[], Some(1.0), 1_000.0, 3).expect("events");
+        let Ok(events) = compile_events(&notes, &[], Some(1.0), 1_000.0, 3) else {
+            panic!("events did not compile");
+        };
 
         assert_eq!(events.len(), 10, "two locks plus four-point returns");
         assert!(events.iter().all(|event| event.rank == 1));

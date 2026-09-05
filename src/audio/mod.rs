@@ -1337,7 +1337,9 @@ mod device_tests {
         } else if std::env::var("DAW_TEST_API").as_deref() == Ok("alsa") {
             config.api = AudioApi::Alsa;
         }
-        let mut engine = Engine::start(config).expect("an engine");
+        let Ok(mut engine) = Engine::start(config) else {
+            panic!("the test engine did not start");
+        };
         std::thread::sleep(std::time::Duration::from_millis(1500));
         let block = engine.latest_block().block;
         eprintln!("blocks after 1.5 s: {block}, info {:?}", engine.info());
