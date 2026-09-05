@@ -21,6 +21,7 @@ mod help;
 mod input;
 mod inspector;
 mod lattice;
+mod log;
 mod mixer;
 mod palette;
 mod room;
@@ -28,6 +29,7 @@ mod sample;
 mod song;
 mod status;
 mod strip;
+mod telemetry;
 mod tray;
 mod utility;
 
@@ -91,6 +93,15 @@ fn inspector() -> std::sync::MutexGuard<'static, inspector::Inspector> {
     static I: std::sync::OnceLock<std::sync::Mutex<inspector::Inspector>> =
         std::sync::OnceLock::new();
     I.get_or_init(|| std::sync::Mutex::new(inspector::Inspector::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The log and the trace, made on first use.
+fn telemetry() -> std::sync::MutexGuard<'static, telemetry::Telemetry> {
+    static T: std::sync::OnceLock<std::sync::Mutex<telemetry::Telemetry>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(telemetry::Telemetry::default()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -208,6 +219,7 @@ impl Stage {
                 stage_inputs
             })
         };
+        let bound: Vec<keymap::StageInput> = inputs.clone();
         self.take_inputs(inputs, selection_held, selection_pressed);
 
         // Inside a clip, the letters may be pitches. Read after the
@@ -228,6 +240,30 @@ impl Stage {
 
         let dt = ui.ctx().input(|input| input.stable_dt);
         self.tick_clock(dt);
+        // The log and the trace: what changed this frame, and the mix.
+        {
+            let master = self.meters.master().level;
+            let facts = telemetry::Was_::new(
+                self.transport.motion(),
+                &self.playing,
+                self.inside.map(|o| (o.pattern.0, o.track)),
+                self.chain.is_some(),
+                self.browser.is_some(),
+                self.help,
+                self.mixing,
+                self.song_view,
+                self.sample.is_some(),
+                self.utility.is_open(),
+                self.dirty,
+                self.song.tracks.len(),
+                self.song.session.scenes.len(),
+                self.refusal
+                    .as_ref()
+                    .map(|r| format!("{:?}", r.reason).to_ascii_lowercase()),
+                self.notice.clone(),
+            );
+            telemetry().observe(dt, &bound, facts, master.left.max(master.right));
+        }
         if self.wants_repaint() {
             ui.ctx().request_repaint();
         }
@@ -286,6 +322,7 @@ impl Stage {
                 self.draw_mixer(painter, layout.field);
             } else {
                 self.draw_lattice(painter, layout.field);
+                self.draw_log(painter, layout.field);
             }
         }
         // Over the field: the browser is a window above the work, not a

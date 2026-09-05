@@ -39,6 +39,41 @@ pub(super) fn status_h() -> f32 {
 }
 /// Between one reading and the next.
 const GAP: f32 = 18.0;
+/// The mix trace's width on the strip.
+/// @tune 40..300 px
+const TRACE_W: f32 = 120.0;
+
+/// The wall's clock, hh:mm:ss, from the system.
+fn wall_clock() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Local time without a timezone crate: read the offset from `date`'s
+    // convention is not worth a dependency; the clock is UTC and says so.
+    let (h, m, s) = ((secs / 3600) % 24, (secs / 60) % 60, secs % 60);
+    format!("{h:02}:{m:02}:{s:02}z")
+}
+
+/// The width a row of readings takes, as `row` lays it out.
+fn total_width(readings: &[Reading]) -> f32 {
+    let width = |s: &str| s.chars().count() as f32 * TYPE_PX * 0.6;
+    readings
+        .iter()
+        .map(|r| {
+            width(r.label)
+                + 6.0
+                + width(&r.value)
+                + if r.meter.is_some() {
+                    6.0 + LOAD_SEGMENTS as f32 * 5.0
+                } else {
+                    0.0
+                }
+                + GAP
+        })
+        .sum::<f32>()
+        - GAP
+}
 
 /// One `label value` pair, the value in whatever colour its state earns.
 struct Reading {
@@ -304,6 +339,37 @@ impl super::super::Stage {
         if let Some(s) = stream {
             right.push(reading("", s.backend, Tone::Fact));
         }
-        row(painter, 0.0, y, &right, Some(strip.max.x - PAD));
+        // The session's clock and the wall's, and the mix's trace: the
+        // last seconds of the master meter, one sample a frame.
+        let (uptime, trace): (f32, Vec<f32>) = {
+            let t = super::telemetry();
+            (t.uptime, t.trace.iter().copied().collect())
+        };
+        right.push(reading("up", super::telemetry::stamp(uptime), Tone::Fact));
+        right.push(reading("", wall_clock(), Tone::Fact));
+        let end = row(painter, 0.0, y, &right, Some(strip.max.x - PAD));
+        let c = palette::colours();
+        let w = crate::tune!(TRACE_W);
+        let x1 = strip.max.x - PAD - (end - 0.0).max(0.0) * 0.0 - total_width(&right) - GAP;
+        let x0 = x1 - w;
+        let track = egui::Rect::from_min_max(egui::pos2(x0, y - 5.0), egui::pos2(x1, y + 5.0));
+        painter.rect_filled(track, 0.0, c.panel);
+        let n = trace.len().max(1) as f32;
+        let mut pts: Vec<egui::Pos2> = trace
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                egui::pos2(
+                    x0 + w * i as f32 / n,
+                    track.max.y - track.height() * v.clamp(0.0, 1.0),
+                )
+            })
+            .collect();
+        if pts.len() >= 2 {
+            painter.add(egui::Shape::line(
+                std::mem::take(&mut pts),
+                egui::Stroke::new(1.0, c.nominal),
+            ));
+        }
     }
 }
