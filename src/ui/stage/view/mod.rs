@@ -268,6 +268,8 @@ impl Stage {
         let painter = ui.painter();
         painter.rect_filled(whole, 0.0, palette::colours().ground);
         let layout = Layout::of(whole);
+        // The field is registered to the glass: marks at its corners.
+        chassis::marks(painter, layout.field.shrink(4.0), 10.0);
         self.draw_title(painter, layout.title);
         if self.sample.is_some() {
             // The cutting room takes the whole field.

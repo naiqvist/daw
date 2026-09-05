@@ -106,6 +106,20 @@ pub fn keyed(painter: &egui::Painter, rect: egui::Rect, focused: bool, key: Key)
     }
 }
 
+/// Registration marks: four short brackets in rule at a region's corners,
+/// the way an overlay is registered to the screen it is laid on.
+pub fn marks(painter: &egui::Painter, rect: egui::Rect, arm: f64) {
+    let c = palette::colours();
+    let mut arms = Vec::new();
+    bracket::corners(&bounds_of(rect), bracket::Arms::all(arm), &mut arms);
+    for arm in &arms {
+        painter.add(egui::Shape::line(
+            arm.iter().copied().map(to_pos).collect(),
+            egui::Stroke::new(1.0, c.rule),
+        ));
+    }
+}
+
 /// Four brackets and no outline: the cursor at cell scale.
 pub fn brackets(painter: &egui::Painter, rect: egui::Rect, arm: f64) {
     let c = palette::colours();

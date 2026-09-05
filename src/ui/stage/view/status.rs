@@ -15,6 +15,12 @@ use crate::ui::stage::transport::{DEFAULT_BPM, DEFAULT_METER, Motion};
 use crate::ui::stage::vitals::{EngineState, LOAD_WORTH_SAYING};
 use eframe::egui;
 
+/// One beat cell on the strip.
+/// @tune 4..16 px
+const BEAT: f32 = 7.0;
+/// The load meter's segments.
+const LOAD_SEGMENTS: usize = 8;
+
 /// The title row's height.
 /// @tune 12..40 px
 pub(super) const TITLE_H: f32 = 22.0;
@@ -39,6 +45,9 @@ struct Reading {
     label: &'static str,
     value: String,
     tone: Tone,
+    /// A budgeted reading's share of its budget, drawn as a meter after
+    /// the value.
+    meter: Option<f32>,
 }
 
 #[derive(Clone, Copy)]
@@ -55,6 +64,7 @@ fn reading(label: &'static str, value: impl Into<String>, tone: Tone) -> Reading
         label,
         value: value.into(),
         tone,
+        meter: None,
     }
 }
 
@@ -65,14 +75,24 @@ fn row(
     y: f32,
     readings: &[Reading],
     align_right: Option<f32>,
-) {
+) -> f32 {
     let c = palette::colours();
     let font = egui::FontId::new(TYPE_PX, egui::FontFamily::Name(PROFONT.into()));
     let width = |s: &str| s.chars().count() as f32 * TYPE_PX * 0.6;
     if let Some(right) = align_right {
         let total: f32 = readings
             .iter()
-            .map(|r| width(r.label) + 6.0 + width(&r.value) + GAP)
+            .map(|r| {
+                width(r.label)
+                    + 6.0
+                    + width(&r.value)
+                    + if r.meter.is_some() {
+                        6.0 + LOAD_SEGMENTS as f32 * 5.0
+                    } else {
+                        0.0
+                    }
+                    + GAP
+            })
             .sum::<f32>()
             - GAP;
         x = right - total;
@@ -100,8 +120,24 @@ fn row(
             font.clone(),
             colour,
         );
-        x += width(&r.value) + GAP;
+        x += width(&r.value);
+        if let Some(share) = r.meter {
+            // A graduated meter: segments, the first `share` of them in the
+            // reading's own colour, the rest in rule.
+            x += 6.0;
+            let lit = (share.clamp(0.0, 1.0) * LOAD_SEGMENTS as f32).round() as usize;
+            for i in 0..LOAD_SEGMENTS {
+                let seg = egui::Rect::from_min_max(
+                    egui::pos2(x + i as f32 * 5.0, y - 4.0),
+                    egui::pos2(x + i as f32 * 5.0 + 3.0, y + 4.0),
+                );
+                painter.rect_filled(seg, 0.0, if i < lit { colour } else { c.rule });
+            }
+            x += LOAD_SEGMENTS as f32 * 5.0;
+        }
+        x += GAP;
     }
+    x - GAP
 }
 
 impl super::super::Stage {
@@ -123,7 +159,26 @@ impl super::super::Stage {
                 Tone::Fact,
             ),
         ];
-        row(painter, strip.min.x + PAD, y, &left, None);
+        let end = row(painter, strip.min.x + PAD, y, &left, None);
+        // Where the keys stand, in coordinates: it follows the cursor.
+        let at = match (self.inside, self.session_address()) {
+            (Some(opened), _) => {
+                format!("clip {:02}  tr {:02}", opened.pattern.0, opened.track + 1)
+            }
+            (None, Some(super::super::Address::Head { track })) => format!("tr {:02}", track + 1),
+            (None, Some(super::super::Address::Slot { track, scene })) => {
+                format!("tr {:02}  sc {:02}", track + 1, scene + 1)
+            }
+            (None, Some(super::super::Address::Master)) => "master".to_owned(),
+            (None, None) => "--".to_owned(),
+        };
+        row(
+            painter,
+            end + GAP * 2.0,
+            y,
+            &[reading("at", at, Tone::Fact)],
+            None,
+        );
         // The document: its file, and whether it has unsaved work.
         let name = self
             .path
@@ -156,6 +211,7 @@ impl super::super::Stage {
             Motion::Rolling => reading("", "ROLLING", Tone::Nominal),
             Motion::Recording => reading("", "RECORDING", Tone::Alert),
         };
+        let rolling = self.transport.motion().is_rolling();
         let left = [
             reading("bar", place.readout(), Tone::Fact),
             reading("bpm", format!("{bpm:.1}"), Tone::Fact),
@@ -163,7 +219,34 @@ impl super::super::Stage {
             reading("", self.transport.mode().word(), Tone::Fact),
             motion,
         ];
-        row(painter, strip.min.x + PAD, y, &left, None);
+        let end = row(painter, strip.min.x + PAD, y, &left, None);
+        // The beat, as cells: one per beat of the bar, the current one
+        // lit while rolling. It changes because the beat changed —
+        // reporting, not motion.
+        let c = palette::colours();
+        let beat = crate::tune!(BEAT);
+        let mut bx = end + GAP;
+        for i in 1..=place.beats_per_bar.max(1) {
+            let cell = egui::Rect::from_center_size(
+                egui::pos2(bx + beat * 0.5, y),
+                egui::vec2(beat, beat),
+            );
+            let on = rolling && i == place.beat;
+            painter.rect_filled(cell, 0.0, if on { c.nominal } else { c.rule });
+            bx += beat + 3.0;
+        }
+        // A refused keystroke, named where it happened, for the frame it
+        // happened in: under key repeat it reads as a held mark.
+        if let Some(refusal) = &self.refusal {
+            let word = format!("{:?}", refusal.reason).to_ascii_lowercase();
+            row(
+                painter,
+                bx + GAP,
+                y,
+                &[reading("refused", word, Tone::Alert)],
+                None,
+            );
+        }
 
         // The engine. An honest absence occupies its space.
         let stream = self.vitals.stream();

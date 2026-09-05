@@ -201,10 +201,24 @@ impl Stage {
             egui::pos2(inner.min.x, inner.min.y + TYPE_PX + 4.0),
             egui::Align2::LEFT_TOP,
             name,
-            font,
+            font.clone(),
             if face.muted { c.dim } else { c.fg },
         );
 
+        // Arming: the track under the cursor is the one a take will be
+        // written to, and says so.
+        if self.arming && cursor {
+            painter.text(
+                egui::pos2(
+                    inner.max.x - 2.0 * PIP - 10.0,
+                    inner.min.y + PIP * 0.5 + 2.0,
+                ),
+                egui::Align2::RIGHT_CENTER,
+                "ARM",
+                font.clone(),
+                c.alert,
+            );
+        }
         // The two bits, top right beside the number: M and S as pips —
         // rule when off, alert when on.
         for (i, on) in [(0, face.muted), (1, face.solo)] {
