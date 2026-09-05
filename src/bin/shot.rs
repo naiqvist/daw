@@ -725,6 +725,34 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
                 backend: "JACK",
             }));
         }
+    } else if which.contains("split") {
+        // Three bands doing three different things: the bottom held in,
+        // the top let out, the mid nudged, with the corners moved off
+        // their defaults so the strip is cut somewhere deliberate.
+        use daw::devices::DeviceKind;
+        let _ = stage.song_mut().add_device(0, DeviceKind::Poly);
+        {
+            use daw::params::console::split as p;
+            let song = stage.song_mut();
+            if let Some(device) = song
+                .section(0, daw::console::SectionKind::Split)
+                .map(|device| device.id)
+                .and_then(|id| song.device_mut(id))
+            {
+                device.bypassed = false;
+                device.set(p::LOW_HZ, 180.0);
+                device.set(p::HIGH_HZ, 3200.0);
+                device.set(p::LOW, 65.0);
+                device.set(p::MID, 15.0);
+                device.set(p::HIGH, -40.0);
+                device.set(p::LOW_DB, 1.5);
+                device.set(p::HIGH_DB, -2.0);
+            }
+        }
+        let _ = stage.apply(StageIntent::Devices);
+        for _ in 0..8 {
+            let _ = stage.apply(StageIntent::Step(Step::Right));
+        }
     } else if which.contains("vca") {
         // The bus compressor working: a low threshold and a fast attack,
         // with the sidechain filter in, so the needle has somewhere to
