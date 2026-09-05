@@ -77,16 +77,36 @@ impl super::super::Stage {
         let scenes = self.shown_scenes(field);
         let seam = egui::Stroke::new(1.0, c.rule);
 
-        // The gutter: scene numbers, a coordinate each.
+        // The gutter: scene numbers, a coordinate each, and a graduated
+        // rule beside them — a tick per row, a longer one every fourth,
+        // so a row can be found by eye without reading.
         let gutter_x = field.min.x + crate::tune!(MARGIN) + crate::tune!(GUTTER) - 6.0;
+        let rule_x =
+            (field.min.x + crate::tune!(MARGIN) + crate::tune!(GUTTER) - 2.0).round() - 0.5;
         for (row, scene) in scenes.clone().enumerate() {
             let y = top(field) + (row as f32 + 0.5) * crate::tune!(ROW_H);
             painter.text(
-                egui::pos2(gutter_x, y),
+                egui::pos2(gutter_x - 4.0, y),
                 egui::Align2::RIGHT_CENTER,
                 format!("{:02}", scene + 1),
                 font.clone(),
                 c.dim,
+            );
+            let tick_y = (top(field) + row as f32 * crate::tune!(ROW_H)).round() - 0.5;
+            let reach = if scene % 4 == 0 { 6.0 } else { 3.0 };
+            painter.line_segment(
+                [
+                    egui::pos2(rule_x - reach, tick_y),
+                    egui::pos2(rule_x, tick_y),
+                ],
+                seam,
+            );
+        }
+        if !scenes.is_empty() {
+            let bottom = top(field) + scenes.len() as f32 * crate::tune!(ROW_H);
+            painter.line_segment(
+                [egui::pos2(rule_x, top(field)), egui::pos2(rule_x, bottom)],
+                seam,
             );
         }
 

@@ -18,6 +18,7 @@ mod input;
 mod inspector;
 mod lattice;
 mod palette;
+mod status;
 mod utility;
 
 use super::key::{Key, Mods};
@@ -27,6 +28,30 @@ use eframe::egui;
 /// An axis nothing is drawn along yet can hold everything: no offset
 /// needs to move to keep the cursor in sight.
 const HOLDS_EVERYTHING: usize = usize::MAX;
+
+/// The window carved: a title row, the field, a status strip.
+struct Layout {
+    title: egui::Rect,
+    field: egui::Rect,
+    status: egui::Rect,
+}
+
+impl Layout {
+    fn of(whole: egui::Rect) -> Self {
+        let title_h = status::title_h();
+        let status_h = status::status_h();
+        let title =
+            egui::Rect::from_min_max(whole.min, egui::pos2(whole.max.x, whole.min.y + title_h));
+        let status =
+            egui::Rect::from_min_max(egui::pos2(whole.min.x, whole.max.y - status_h), whole.max);
+        let field = egui::Rect::from_min_max(title.left_bottom(), status.right_top());
+        Self {
+            title,
+            field,
+            status,
+        }
+    }
+}
 
 /// The watched overrides, made on first use.
 fn overrides() -> std::sync::MutexGuard<'static, crate::tune::Overrides> {
@@ -147,7 +172,7 @@ impl Stage {
         let enter_held = ui.input(|input| input.key_down(egui::Key::Enter));
         self.take_pitch_entry(update, enter_held);
 
-        let field = ui.available_rect_before_wrap();
+        let field = Layout::of(ui.available_rect_before_wrap()).field;
         self.follow_cursor(
             heads::capacity(field.width()),
             lattice::capacity(field),
@@ -168,8 +193,11 @@ impl Stage {
         let whole = ui.available_rect_before_wrap();
         let painter = ui.painter();
         painter.rect_filled(whole, 0.0, palette::colours().ground);
-        self.draw_heads(painter, whole);
-        self.draw_lattice(painter, whole);
+        let layout = Layout::of(whole);
+        self.draw_title(painter, layout.title);
+        self.draw_heads(painter, layout.field);
+        self.draw_lattice(painter, layout.field);
+        self.draw_status(painter, layout.status);
         let mut inspector = inspector();
         if inspector.open {
             let panel = egui::Rect::from_min_max(
