@@ -28,8 +28,23 @@ const ROW_H: f32 = 14.0;
 /// Between two band columns. Wide enough that one column's figure and
 /// the next column's name cannot be read as one line.
 const COLUMN_GAP: f32 = 13.0;
-/// The response's window, in dB either way.
-const SPAN_DB: f32 = 16.0;
+/// The windows the response may be drawn in, in dB either way.
+///
+/// Fixed at the widest, a curve reaching seven dB used the middle third
+/// of the glass and left the rest empty. Fitted exactly to the curve, it
+/// would never look like anything but a full-scale wiggle. So it steps:
+/// the smallest window that holds the curve with air to spare, and the
+/// one in force is written on the glass, because a plot whose scale
+/// moves without saying so is a plot that lies.
+const SPANS_DB: [f32; 6] = [3.0, 6.0, 9.0, 12.0, 18.0, 24.0];
+
+/// The window that holds `peak` with room above it.
+fn span_for(peak: f32) -> f32 {
+    SPANS_DB
+        .into_iter()
+        .find(|span| peak * 1.18 <= *span)
+        .unwrap_or(SPANS_DB[SPANS_DB.len() - 1])
+}
 const HZ_MIN: f32 = 20.0;
 const HZ_MAX: f32 = 20_000.0;
 /// The rate the response is drawn at.
@@ -155,7 +170,18 @@ pub(super) fn draw(face: &Face<'_>) {
         ),
     );
     let x_of = |hz: f32| plot.left() + place_of_hz(hz) * plot.width();
-    let y_of = |db: f32| plot.center().y - (db / SPAN_DB).clamp(-1.2, 1.2) * plot.height() * 0.5;
+    // The window comes from the curve, in steps: swept once here so the
+    // grid, the traces and the handles all agree on the same scale.
+    let span = span_for(
+        (0..=48)
+            .map(|i| {
+                let hz = HZ_MIN * (HZ_MAX / HZ_MIN).powf(i as f32 / 48.0);
+                fc::response_db(&shape, DRAWN_AT, hz).abs()
+            })
+            .chain(shape.bands.iter().map(|band| band.db.abs()))
+            .fold(0.0f32, f32::max),
+    );
+    let y_of = |db: f32| plot.center().y - (db / span).clamp(-1.15, 1.15) * plot.height() * 0.5;
 
     // ---- The zones: the ground IS the meter. -------------------------
     let edges = [
@@ -191,7 +217,7 @@ pub(super) fn draw(face: &Face<'_>) {
             edge.gamma_multiply(0.55),
         );
     }
-    for db in [-12.0f32, 12.0] {
+    for db in [-span * 0.5, span * 0.5] {
         chrome::trace(
             &mut shapes,
             &[
@@ -425,7 +451,7 @@ pub(super) fn draw(face: &Face<'_>) {
         if flat {
             "WIRE".to_owned()
         } else {
-            "IN".to_owned()
+            format!("+/-{span:.0}dB")
         },
         if flat { edge } else { alpha.live.color },
     );
@@ -526,6 +552,33 @@ mod tests {
                 assert_eq!(column[row].y_range(), y, "row {row} is ragged");
             }
         }
+    }
+
+    /// The window steps to the curve rather than standing still or
+    /// following it exactly: it always holds the peak with air to
+    /// spare, it never shrinks under the smallest step, and a bigger
+    /// curve never gets a smaller window.
+    #[test]
+    fn the_window_steps_to_the_curve_it_holds() {
+        for peak in [0.0f32, 0.5, 2.0, 3.0, 5.0, 7.5, 11.0, 15.0, 30.0] {
+            let span = span_for(peak);
+            assert!(
+                span >= peak || span == SPANS_DB[SPANS_DB.len() - 1],
+                "a peak of {peak} did not fit {span}"
+            );
+            assert!(SPANS_DB.contains(&span), "{span} is not one of the steps");
+        }
+        assert_eq!(span_for(0.0), SPANS_DB[0]);
+        // Monotone: leaning on a band can only widen the window.
+        let mut last = 0.0;
+        for peak in [0.0f32, 1.0, 2.5, 4.0, 6.0, 9.0, 14.0, 20.0, 40.0] {
+            let span = span_for(peak);
+            assert!(span >= last, "{peak} narrowed the window to {span}");
+            last = span;
+        }
+        // The air is real: a peak exactly on a step gets the next one up,
+        // so a curve never runs along the top of the glass.
+        assert!(span_for(SPANS_DB[1]) > SPANS_DB[1]);
     }
 
     /// The zones are cut on the two frequencies the section measures on,
