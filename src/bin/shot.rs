@@ -725,6 +725,34 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
                 backend: "JACK",
             }));
         }
+    } else if which.contains("vca") {
+        // The bus compressor working: a low threshold and a fast attack,
+        // with the sidechain filter in, so the needle has somewhere to
+        // be and the key bars differ.
+        use daw::devices::DeviceKind;
+        let _ = stage.song_mut().add_device(0, DeviceKind::Poly);
+        {
+            use daw::params::console::vca as p;
+            let song = stage.song_mut();
+            if let Some(device) = song
+                .section(0, daw::console::SectionKind::Vca)
+                .map(|device| device.id)
+                .and_then(|id| song.device_mut(id))
+            {
+                device.bypassed = false;
+                device.set(p::THRESHOLD, -22.0);
+                device.set(p::RATIO, 1.0);
+                device.set(p::ATTACK, 2.0);
+                device.set(p::RELEASE, p::RELEASE_AUTO as f32);
+                device.set(p::MAKEUP, 6.0);
+                device.set(p::SC_HP, 120.0);
+                device.set(p::MIX, 100.0);
+            }
+        }
+        let _ = stage.apply(StageIntent::Devices);
+        for _ in 0..7 {
+            let _ = stage.apply(StageIntent::Step(Step::Right));
+        }
     } else if which.contains("four") {
         // The console EQ with all four bands moved and the low one left
         // a shelf, so the inductor's bump is in the picture.

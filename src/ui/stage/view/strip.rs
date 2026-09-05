@@ -68,7 +68,7 @@ pub fn width_of(kind: SectionKind) -> f32 {
         SectionKind::Cut => 468.0,
         SectionKind::Hit => 412.0,
         SectionKind::Four => 516.0,
-        SectionKind::Vca => 272.0,
+        SectionKind::Vca => 484.0,
         SectionKind::Split => 216.0,
         SectionKind::Pump => 176.0,
         SectionKind::Drive => 240.0,

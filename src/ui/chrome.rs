@@ -71,6 +71,21 @@ pub fn trace(out: &mut Vec<Shape>, path: &[Pos2], weight: Weight, ink: Color32) 
     ));
 }
 
+/// A SMOOTH path: the same stroke, without the pixel snapping.
+///
+/// [`trace`] snaps every point to the grid, which is what keeps a rule
+/// or a rail from blurring across two rows of pixels. On a curve it does
+/// the opposite: an arc snapped to integers climbs in visible steps, and
+/// a needle swung along one wobbles as it moves. Anything continuous —
+/// an arc, a transfer, a frequency response, an envelope — goes through
+/// here instead.
+pub fn curve(out: &mut Vec<Shape>, path: &[Pos2], weight: Weight, ink: Color32) {
+    if path.len() < 2 {
+        return;
+    }
+    out.push(Shape::line(path.to_vec(), Stroke::new(weight.px(), ink)));
+}
+
 /// A small square.
 pub fn pad(out: &mut Vec<Shape>, centre: Pos2, side: f32, ink: Color32, filled: bool) {
     let rect = Rect::from_center_size(centre, eframe::egui::Vec2::splat(side));
