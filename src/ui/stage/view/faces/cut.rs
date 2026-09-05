@@ -129,29 +129,20 @@ fn hz_word(hz: f32) -> String {
     }
 }
 
-/// The response, plotted into a grid of character cells.
+/// The plot's GROUND, in character cells: the decades and the line the
+/// curve is measured from.
 ///
-/// Returns the ground grid and the curve grid as lines, so each can be
-/// painted in its own ink in one call per row rather than one per cell.
-fn plot_lines(
-    shape: &crate::console::cut_curve::Shape,
-    cols: usize,
-    rows: usize,
-) -> (Vec<String>, Vec<String>) {
-    use crate::console::cut_curve as cc;
+/// The grid stays text — it is ruling, and ruling made of `:` and `-` is
+/// what a terminal's graph paper looks like. The curve itself is not:
+/// a filter skirt is a continuous thing and quantising it to a cell
+/// grid threw away the very steepness the section exists to have.
+fn ground_lines(cols: usize, rows: usize) -> Vec<String> {
     if cols == 0 || rows == 0 {
-        return (Vec::new(), Vec::new());
+        return Vec::new();
     }
     let mut ground = vec![vec![' '; cols]; rows];
-    let mut curve = vec![vec![' '; cols]; rows];
-    let row_of = |db: f32| {
-        let t = ((TOP_DB - db) / (TOP_DB - FLOOR_DB)).clamp(0.0, 1.0);
-        ((t * (rows - 1) as f32).round() as usize).min(rows - 1)
-    };
-    // The ground: the decades, and the line the curve is measured from.
-    let unity = row_of(0.0);
-    for (col, cell) in ground[unity].iter_mut().enumerate() {
-        let _ = col;
+    let unity = row_of(0.0, rows);
+    for cell in ground[unity].iter_mut() {
         *cell = '-';
     }
     for hz in [100.0f32, 1_000.0, 10_000.0] {
@@ -160,43 +151,16 @@ fn plot_lines(
             line[col] = if r == unity { '+' } else { ':' };
         }
     }
-    // The curve. Each column's glyph says what it is doing there.
-    let db_at = |col: usize| {
-        let t = col as f32 / (cols.max(2) - 1) as f32;
-        cc::response_db(shape, HZ_MIN * (HZ_MAX / HZ_MIN).powf(t))
-    };
-    let mut last = row_of(db_at(0));
-    for col in 0..cols {
-        let here = row_of(db_at(col));
-        let next = row_of(db_at((col + 1).min(cols - 1)));
-        // A cell where the curve turns over is standing on a resonance.
-        let peak = here <= last && here <= next && here < unity;
-        let glyph = if peak {
-            '#'
-        } else if next < here {
-            '/'
-        } else if next > here {
-            '\\'
-        } else {
-            '='
-        };
-        curve[here][col] = glyph;
-        // A skirt steeper than one cell per column is drawn as the wall
-        // it is, so a 24 dB/octave slope does not become a dotted line.
-        let (from, to) = (here.min(next), here.max(next));
-        if to - from > 1 {
-            for line in curve.iter_mut().take(to).skip(from + 1) {
-                line[col] = '|';
-            }
-        }
-        last = here;
-    }
-    let join = |grid: Vec<Vec<char>>| -> Vec<String> {
-        grid.into_iter()
-            .map(|line| line.into_iter().collect())
-            .collect()
-    };
-    (join(ground), join(curve))
+    ground
+        .into_iter()
+        .map(|line| line.into_iter().collect())
+        .collect()
+}
+
+/// Which cell row a level falls on, for the ruling.
+fn row_of(db: f32, rows: usize) -> usize {
+    let t = ((TOP_DB - db) / (TOP_DB - FLOOR_DB)).clamp(0.0, 1.0);
+    ((t * (rows.max(2) - 1) as f32).round() as usize).min(rows.saturating_sub(1))
 }
 
 pub(super) fn draw(face: &Face<'_>) {
@@ -243,28 +207,64 @@ pub(super) fn draw(face: &Face<'_>) {
     );
     let cols = (field.width() / cw).floor().max(0.0) as usize;
     let rows = (field.height() / ch).floor().max(0.0) as usize;
-    let (ground, curve) = plot_lines(&shape, cols, rows);
-    for (i, line) in ground.iter().enumerate() {
+    for (i, line) in ground_lines(cols, rows).iter().enumerate() {
         painter.text(
             egui::pos2(field.left(), field.top() + i as f32 * ch),
             egui::Align2::LEFT_TOP,
             line,
             font.clone(),
-            edge.gamma_multiply(0.45),
+            edge.gamma_multiply(0.40),
         );
     }
-    // The curve takes the crunch's heat as it is leaned on: the one
-    // thing about this section a response cannot say.
+    // The curve is a real curve, laid over the ruling. It takes the
+    // crunch's heat as it is leaned on: the one thing about this
+    // section a response cannot otherwise say.
     let curve_ink = tool::mix_ink(ink, alpha.jeopardy_latent.color, crunch / 100.0);
-    for (i, line) in curve.iter().enumerate() {
-        painter.text(
-            egui::pos2(field.left(), field.top() + i as f32 * ch),
-            egui::Align2::LEFT_TOP,
-            line,
-            font.clone(),
-            curve_ink,
+    // Plotted against the SAME grid the ruling uses, so the trace and
+    // the line it is measured from cannot drift apart.
+    let plotted = egui::Rect::from_min_max(
+        field.min,
+        egui::pos2(
+            field.left() + cols.max(1) as f32 * cw,
+            field.top() + rows.max(1) as f32 * ch,
+        ),
+    );
+    // A smooth y, not the cell's: the ruling is quantised, the curve is
+    // not, and the two agree at 0 dB because that is where the line is.
+    let y_smooth = |db: f32| {
+        let t = ((TOP_DB - db) / (TOP_DB - FLOOR_DB)).clamp(0.0, 1.0);
+        plotted.top() + (t * (rows.max(2) - 1) as f32 + 0.5) * ch
+    };
+    let steps = (cols.max(8) * 3).min(360);
+    let trace: Vec<egui::Pos2> = (0..=steps)
+        .map(|i| {
+            let t = i as f32 / steps as f32;
+            let hz = HZ_MIN * (HZ_MAX / HZ_MIN).powf(t);
+            egui::pos2(
+                plotted.left() + t * (plotted.width() - cw) + cw * 0.5,
+                y_smooth(cc::response_db(&shape, hz)),
+            )
+        })
+        .collect();
+    let mut curve_shapes = Vec::new();
+    chrome::trace(&mut curve_shapes, &trace, Weight::Heavy, curve_ink);
+    // Where each blade stands, on the curve it bends.
+    for (hz, off) in [(shape.hp_hz, shape.hp_off()), (shape.lp_hz, shape.lp_off())] {
+        if off {
+            continue;
+        }
+        chrome::pad(
+            &mut curve_shapes,
+            egui::pos2(
+                plotted.left() + place_of_hz(hz) * (plotted.width() - cw) + cw * 0.5,
+                y_smooth(cc::response_db(&shape, hz)),
+            ),
+            chrome::PAD,
+            alpha.live.color,
+            true,
         );
     }
+    painter.extend(curve_shapes);
 
     // ---- Everything else is a line of text. --------------------------
     let label = |at: egui::Pos2, align: egui::Align2, text: String, ink| {
@@ -474,46 +474,70 @@ mod tests {
         assert_eq!(meter_n(1.0, RING_CELLS), "[#####]");
     }
 
-    /// The plot is a rectangle of cells: every line the same length, and
-    /// the curve drawn on every column.
+    /// The ruling is a rectangle of cells: every line the same length,
+    /// and the line the curve is measured from is on every one of them.
     #[test]
-    fn the_plot_is_a_rectangle_of_cells_with_a_curve_on_every_column() {
-        use crate::console::SectionKind;
-        let params = crate::console::SectionParams::of(SectionKind::Cut);
-        let shape = crate::console::cut_curve::Shape::of(&params);
-        let (ground, curve) = plot_lines(&shape, 40, 12);
+    fn the_ruling_is_a_rectangle_of_cells() {
+        let ground = ground_lines(40, 12);
         assert_eq!(ground.len(), 12);
-        assert_eq!(curve.len(), 12);
-        for line in ground.iter().chain(curve.iter()) {
+        for line in &ground {
             assert_eq!(line.chars().count(), 40, "a line came out ragged");
         }
-        for col in 0..40 {
-            assert!(
-                curve.iter().any(|line| line.chars().nth(col) != Some(' ')),
-                "column {col} has no curve on it"
+        // The unity line runs the width of the plot.
+        let unity = &ground[row_of(0.0, 12)];
+        assert!(
+            unity.chars().filter(|c| *c == '-' || *c == '+').count() > 30,
+            "the unity line is not drawn across: {unity:?}"
+        );
+        // Three decades are ruled, top to bottom.
+        for line in &ground {
+            assert_eq!(
+                line.chars().filter(|c| *c == ':' || *c == '+').count(),
+                3,
+                "a row is missing its decades"
             );
         }
     }
 
-    /// A parked filter is a flat line, and a filter brought in is not.
+    /// A level's row falls where it should, and never off the grid.
     #[test]
-    fn parking_both_blades_flattens_the_plot() {
+    fn a_level_lands_on_its_own_row() {
+        assert_eq!(row_of(TOP_DB, 12), 0);
+        assert_eq!(row_of(FLOOR_DB, 12), 11);
+        assert!(row_of(0.0, 12) > 0 && row_of(0.0, 12) < 11);
+        // Off either end of the window is clamped onto the grid.
+        assert_eq!(row_of(999.0, 12), 0);
+        assert_eq!(row_of(-999.0, 12), 11);
+    }
+
+    /// The trace is drawn from the section's own response: parked, it
+    /// is a wire at 0 dB; brought in, it is not.
+    #[test]
+    fn the_trace_follows_the_response_the_core_runs() {
         use crate::console::SectionKind;
+        use crate::console::cut_curve as cc;
         use crate::params::console::cut as p;
         let mut params = crate::console::SectionParams::of(SectionKind::Cut);
-        let flat = crate::console::cut_curve::Shape::of(&params);
+        let flat = cc::Shape::of(&params);
         assert!(flat.is_off());
-        let (_, curve) = plot_lines(&flat, 40, 12);
-        let rows_used = |curve: &[String]| {
-            curve
-                .iter()
-                .filter(|line| line.chars().any(|c| c != ' '))
-                .count()
-        };
-        assert_eq!(rows_used(&curve), 1, "a wire took more than one row");
+        for hz in [20.0f32, 200.0, 2_000.0, 20_000.0] {
+            assert!(
+                cc::response_db(&flat, hz).abs() < 0.01,
+                "a parked pair of blades bent the wire at {hz} Hz"
+            );
+        }
         params.set(p::HP_HZ, 1_000.0);
-        let cut = crate::console::cut_curve::Shape::of(&params);
-        let (_, curve) = plot_lines(&cut, 40, 12);
-        assert!(rows_used(&curve) > 1, "a real cut drew a flat line");
+        let cut = cc::Shape::of(&params);
+        assert!(
+            cc::response_db(&cut, 50.0) < -12.0,
+            "a high-pass at 1k left 50 Hz alone"
+        );
+        // Not zero up top: the low-pass parked at 20 kHz is a two-pole
+        // at 20 kHz, so its skirt is already worth about a dB at 10 —
+        // the analytic response says so and the card draws what it says.
+        assert!(
+            cc::response_db(&cut, 10_000.0).abs() < 2.0,
+            "the passband moved further than the parked blade explains"
+        );
     }
 }
