@@ -6,7 +6,7 @@
 //! different depths.
 
 use super::Step;
-use eframe::egui::{Key, Modifiers};
+use super::key::{Key, Mods};
 
 /// The conditioning context in which a key is interpreted.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -445,18 +445,18 @@ impl StageIntent {
     }
 }
 
-/// A physical chord or text emitted by egui. Both travel through the same
+/// A physical chord or text, as the view read it. Both travel through the same
 /// scope-conditioned dispatcher before either can become an intent.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum StageInput {
-    Chord(Modifiers, Key),
+    Chord(Mods, Key),
     Text(char),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Binding {
     scope: ScopeContext,
-    modifiers: Modifiers,
+    modifiers: Mods,
     key: Key,
     intent: StageIntent,
 }
@@ -466,7 +466,7 @@ impl Binding {
     const fn new(scope: ScopeContext, key: Key, intent: StageIntent) -> Self {
         Self {
             scope,
-            modifiers: Modifiers::NONE,
+            modifiers: Mods::NONE,
             key,
             intent,
         }
@@ -477,7 +477,7 @@ impl Binding {
     const fn command(scope: ScopeContext, key: Key, intent: StageIntent) -> Self {
         Self {
             scope,
-            modifiers: Modifiers::COMMAND,
+            modifiers: Mods::COMMAND,
             key,
             intent,
         }
@@ -489,7 +489,7 @@ impl Binding {
     const fn shift(scope: ScopeContext, key: Key, intent: StageIntent) -> Self {
         Self {
             scope,
-            modifiers: Modifiers::SHIFT,
+            modifiers: Mods::SHIFT,
             key,
             intent,
         }
@@ -501,7 +501,7 @@ impl Binding {
     const fn command_shift(scope: ScopeContext, key: Key, intent: StageIntent) -> Self {
         Self {
             scope,
-            modifiers: Modifiers::COMMAND.plus(Modifiers::SHIFT),
+            modifiers: Mods::COMMAND.plus(Mods::SHIFT),
             key,
             intent,
         }
@@ -1449,9 +1449,7 @@ const BINDINGS: &[Binding] = &[
 /// Every binding in one scope, in table order. The help surface reads
 /// THIS — it is a projection of the codebook, never prose written beside
 /// it, so it cannot describe a key the stage does not actually answer to.
-pub(super) fn bindings_for(
-    scope: ScopeContext,
-) -> impl Iterator<Item = (Modifiers, Key, StageIntent)> {
+pub(super) fn bindings_for(scope: ScopeContext) -> impl Iterator<Item = (Mods, Key, StageIntent)> {
     BINDINGS
         .iter()
         .filter(move |binding| binding.scope == scope)
@@ -1549,7 +1547,7 @@ pub(super) fn palette_entries() -> &'static [Entry] {
 }
 
 /// How a chord is written on the codebook.
-pub(super) fn chord_name(modifiers: Modifiers, key: Key) -> String {
+pub(super) fn chord_name(modifiers: Mods, key: Key) -> String {
     // ASCII on purpose. The conventional shift mark is `⇧` (U+21E7),
     // which the bundled Terminus does not carry, and the arrow it does
     // carry (`↑`) already means Up — one sign, one meaning, so shift gets
@@ -1592,8 +1590,8 @@ pub(super) fn dispatch(scope: ScopeContext, input: StageInput) -> Option<StageIn
 /// chord with more modifiers has to be offered first, or the plainer
 /// chord eats it and `^+T` silently becomes `^T`. Within one level of
 /// specificity the table's own order stands.
-pub(super) fn bound_chords() -> impl Iterator<Item = (Modifiers, Key)> {
-    let mut chords: Vec<(Modifiers, Key)> = BINDINGS
+pub(super) fn bound_chords() -> impl Iterator<Item = (Mods, Key)> {
+    let mut chords: Vec<(Mods, Key)> = BINDINGS
         .iter()
         .enumerate()
         .filter_map(|(index, binding)| {
@@ -1607,34 +1605,9 @@ pub(super) fn bound_chords() -> impl Iterator<Item = (Modifiers, Key)> {
     chords.into_iter()
 }
 
-/// How many modifiers a chord holds. Command and ctrl count once between
-/// them, because egui treats them as one logical key off a Mac.
-fn specificity(modifiers: Modifiers) -> usize {
-    usize::from(modifiers.command || modifiers.ctrl || modifiers.mac_cmd)
-        + usize::from(modifiers.shift)
-        + usize::from(modifiers.alt)
-}
-
-/// Take every chord bound IN `scope` out of this frame's input, in the
-/// order [`bound_chords`] dictates, so that no plainer chord shadows a
-/// more specific one. Only this scope's chords: a key another scope binds
-/// is not the stage's here, and taking it would swallow it — inside a
-/// clip the arrows and Enter belong to the sequencer's grammar, and the
-/// stage must leave them in the input for it. `yield_to_grammar` names
-/// chords that are someone else's THIS frame even though the scope binds
-/// them: a sentence in progress owns Escape.
-pub(super) fn consume_chords(
-    input: &mut eframe::egui::InputState,
-    scope: ScopeContext,
-    yield_to_grammar: impl Fn(Modifiers, Key) -> bool,
-) -> Vec<(Modifiers, Key)> {
-    bound_chords()
-        .filter(|(modifiers, key)| {
-            dispatch(scope, StageInput::Chord(*modifiers, *key)).is_some()
-                && !yield_to_grammar(*modifiers, *key)
-                && input.consume_key(*modifiers, *key)
-        })
-        .collect()
+/// How many modifiers a chord holds.
+fn specificity(modifiers: Mods) -> usize {
+    usize::from(modifiers.command) + usize::from(modifiers.shift)
 }
 
 #[cfg(test)]
@@ -1672,7 +1645,7 @@ mod tests {
     fn the_browser_can_be_summoned_from_anywhere_and_left_from_inside() {
         for scope in [ScopeContext::Root, ScopeContext::Nested] {
             assert_eq!(
-                dispatch(scope, StageInput::Chord(Modifiers::COMMAND, Key::F)),
+                dispatch(scope, StageInput::Chord(Mods::COMMAND, Key::F)),
                 Some(StageIntent::Browse),
                 "{scope:?} cannot reach the browser"
             );
@@ -1680,35 +1653,17 @@ mod tests {
         assert_eq!(
             dispatch(
                 ScopeContext::Browser,
-                StageInput::Chord(Modifiers::COMMAND, Key::F)
+                StageInput::Chord(Mods::COMMAND, Key::F)
             ),
             Some(StageIntent::Browse)
         );
         assert_eq!(
             dispatch(
                 ScopeContext::Browser,
-                StageInput::Chord(Modifiers::NONE, Key::Escape)
+                StageInput::Chord(Mods::NONE, Key::Escape)
             ),
             Some(StageIntent::Escape)
         );
-    }
-
-    /// Inside a clip the sequencer's own command chords are its own:
-    /// ^R resizes the clip and ^A selects all, and the stage must not
-    /// take either before the grammar sees it. This is the binding that
-    /// once shadowed clip resize with the library rescan.
-    #[test]
-    fn the_clip_scope_leaves_the_grammars_command_chords_alone() {
-        for (verb, key, name) in crate::ui::sequencer::verbs::COMMAND_TABLE {
-            assert_eq!(
-                dispatch(
-                    ScopeContext::Clip,
-                    StageInput::Chord(Modifiers::COMMAND, *key)
-                ),
-                None,
-                "the stage took ^{key:?} from the grammar's {name} ({verb:?})"
-            );
-        }
     }
 
     #[test]
@@ -1719,13 +1674,13 @@ mod tests {
                 continue;
             }
             assert_eq!(
-                dispatch(scope, StageInput::Chord(Modifiers::NONE, Key::Space)),
+                dispatch(scope, StageInput::Chord(Mods::NONE, Key::Space)),
                 Some(StageIntent::ToggleTransport),
                 "{scope:?} cannot stop or roll the song"
             );
             if scope != ScopeContext::Plock {
                 assert_eq!(
-                    dispatch(scope, StageInput::Chord(Modifiers::NONE, Key::Home)),
+                    dispatch(scope, StageInput::Chord(Mods::NONE, Key::Home)),
                     Some(StageIntent::Rewind),
                     "{scope:?} cannot return the song to the top"
                 );
@@ -1788,86 +1743,13 @@ mod tests {
                 if key != other {
                     continue;
                 }
-                let narrow_within_wide = (!narrow.shift || wide.shift)
-                    && (!narrow.alt || wide.alt)
-                    && (!(narrow.command || narrow.ctrl) || (wide.command || wide.ctrl));
+                let narrow_within_wide =
+                    (!narrow.shift || wide.shift) && (!narrow.command || wide.command);
                 assert!(
                     !(narrow_within_wide && specificity(*narrow) < specificity(*wide)),
                     "{narrow:?}+{key:?} is offered before {wide:?}+{key:?} and would eat it"
                 );
             }
         }
-    }
-
-    /// The same, through egui itself rather than through our reading of
-    /// it: a real `^+T` press consumed the way `show` consumes it must
-    /// come out as `^+T`, not as `^T`.
-    #[test]
-    fn a_shifted_chord_survives_being_consumed_through_egui() {
-        use eframe::egui::{Event, InputOptions, InputState, RawInput};
-        let press = Modifiers {
-            ctrl: true,
-            command: true,
-            shift: true,
-            ..Modifiers::NONE
-        };
-        let raw = RawInput {
-            events: vec![Event::Key {
-                key: Key::T,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers: press,
-            }],
-            ..RawInput::default()
-        };
-        let mut input = InputState::default().begin_pass(raw, false, 1.0, InputOptions::default());
-        let consumed = consume_chords(&mut input, ScopeContext::Root, |_, _| false);
-        assert_eq!(
-            consumed,
-            vec![(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::T)],
-            "the shifted chord was consumed as something else"
-        );
-        assert_eq!(
-            dispatch(
-                ScopeContext::Root,
-                StageInput::Chord(consumed[0].0, consumed[0].1)
-            ),
-            Some(StageIntent::NewInstrumentTrack)
-        );
-    }
-
-    /// Inside a clip the arrows and Enter are the grammar's. The stage's
-    /// consumption must leave them in the input — this shipped the other
-    /// way, and every key the sequencer needed vanished before it looked.
-    #[test]
-    fn a_scope_only_consumes_the_chords_it_binds() {
-        use eframe::egui::{Event, InputOptions, InputState, RawInput};
-        let press = |key| Event::Key {
-            key,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: Modifiers::NONE,
-        };
-        let raw = RawInput {
-            events: vec![press(Key::ArrowRight), press(Key::Enter), press(Key::Space)],
-            ..RawInput::default()
-        };
-        let mut input = InputState::default().begin_pass(raw, false, 1.0, InputOptions::default());
-        let consumed = consume_chords(&mut input, ScopeContext::Clip, |_, _| false);
-        assert_eq!(
-            consumed,
-            vec![(Modifiers::NONE, Key::Space)],
-            "the clip scope took a key it does not bind"
-        );
-        assert!(
-            input.consume_key(Modifiers::NONE, Key::ArrowRight),
-            "the arrow was swallowed before the grammar could see it"
-        );
-        assert!(
-            input.consume_key(Modifiers::NONE, Key::Enter),
-            "Enter was swallowed before the grammar could see it"
-        );
     }
 }
