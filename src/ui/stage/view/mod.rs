@@ -40,6 +40,8 @@ use crate::design::kit::{self, Weight};
 use crate::design::motion::{self, Phase};
 use crate::design::{self, block};
 use crate::ui::chrome;
+use crate::ui::stage::RefusalReason;
+use crate::ui::stage::grid::Step;
 use eframe::egui;
 
 /// An axis nothing is drawn along yet can hold everything: no offset
@@ -266,6 +268,22 @@ impl Stage {
                 self.notice.clone(),
             );
             telemetry().observe(dt, &bound, facts, master.left.max(master.right));
+        }
+        // The refusal is drawn where it happened: the wall the cursor
+        // pressed against lights on the mark itself, not only named on
+        // the strip. A step that had nowhere to go lights that side; a
+        // refusal with no direction to it lights the whole frame.
+        if let Some(refusal) = self.refusal {
+            use crate::ui::nav_cursor::Wall;
+            let wall = match refusal.reason {
+                RefusalReason::Edge(Step::Up) => Wall::Up,
+                RefusalReason::Edge(Step::Down) => Wall::Down,
+                RefusalReason::Edge(Step::Left) => Wall::Left,
+                RefusalReason::Edge(Step::Right) => Wall::Right,
+                RefusalReason::AtTop => Wall::Left,
+                _ => Wall::All,
+            };
+            crate::ui::nav_cursor::refuse(ui.ctx(), wall, palette::colours().alert);
         }
         if self.wants_repaint() {
             ui.ctx().request_repaint();

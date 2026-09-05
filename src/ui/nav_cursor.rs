@@ -224,6 +224,122 @@ pub fn claim_signed(
     });
 }
 
+/// The side of the cursor a refusal happened on. A step that had no
+/// neighbour pressed against one wall; a refusal with no direction to it
+/// — nothing there, no deeper to go — presses against all four.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Wall {
+    #[default]
+    Up,
+    Down,
+    Left,
+    Right,
+    All,
+}
+
+/// The standing refusal: which wall, and when it was last pressed.
+#[derive(Clone, Copy, Debug, Default)]
+struct Refused {
+    wall: Wall,
+    ink: egui::Color32,
+    age: f32,
+}
+
+fn refusal_id() -> egui::Id {
+    egui::Id::new("global-qwerty-cursor-refusal")
+}
+
+/// How long the wall stays lit after the last press. Under key repeat
+/// the refusal re-arrives every frame and the wall simply stays on.
+/// @tune 0.05..1.0 s
+const WALL_LIFE: f32 = 0.22;
+/// The wall's thickness.
+/// @tune 1..8 px
+const WALL_W: f32 = 3.0;
+
+/// Report that the keyboard pressed against a limit this frame. The mark
+/// draws the wall it hit, on the cursor, for a moment after.
+pub fn refuse(ctx: &egui::Context, wall: Wall, ink: egui::Color32) {
+    ctx.data_mut(|data| {
+        data.insert_temp(
+            refusal_id(),
+            Refused {
+                wall,
+                ink,
+                age: 0.0,
+            },
+        )
+    });
+}
+
+/// The wall to draw this frame, aged by `dt`, or `None` once it has
+/// burned out.
+fn standing_wall(ctx: &egui::Context, dt: f32) -> Option<(Wall, egui::Color32, f32)> {
+    ctx.data_mut(|data| {
+        let refused = data.get_temp::<Refused>(refusal_id())?;
+        let age = refused.age + dt;
+        if age >= WALL_LIFE {
+            data.remove_temp::<Refused>(refusal_id());
+            return None;
+        }
+        data.insert_temp(
+            refusal_id(),
+            Refused {
+                wall: refused.wall,
+                ink: refused.ink,
+                age,
+            },
+        );
+        Some((refused.wall, refused.ink, 1.0 - age / WALL_LIFE))
+    })
+}
+
+/// Draw the wall the cursor pressed against: a bar laid along that side
+/// of the mark, in the refusal's own ink, fading as it lets go.
+fn draw_wall(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    wall: Wall,
+    strength: f32,
+    ink: egui::Color32,
+) {
+    let ink = egui::Color32::from_rgba_unmultiplied(
+        ink.r(),
+        ink.g(),
+        ink.b(),
+        (255.0 * strength.clamp(0.0, 1.0)) as u8,
+    );
+    let w = WALL_W;
+    let sides: &[Wall] = match wall {
+        Wall::All => &[Wall::Up, Wall::Down, Wall::Left, Wall::Right],
+        one => std::slice::from_ref(match one {
+            Wall::Up => &Wall::Up,
+            Wall::Down => &Wall::Down,
+            Wall::Left => &Wall::Left,
+            _ => &Wall::Right,
+        }),
+    };
+    for side in sides {
+        let bar = match side {
+            Wall::Up => {
+                egui::Rect::from_min_max(rect.left_top(), egui::pos2(rect.max.x, rect.min.y + w))
+            }
+            Wall::Down => egui::Rect::from_min_max(
+                egui::pos2(rect.min.x, rect.max.y - w),
+                rect.right_bottom(),
+            ),
+            Wall::Left => {
+                egui::Rect::from_min_max(rect.left_top(), egui::pos2(rect.min.x + w, rect.max.y))
+            }
+            _ => egui::Rect::from_min_max(
+                egui::pos2(rect.max.x - w, rect.min.y),
+                rect.right_bottom(),
+            ),
+        };
+        painter.rect_filled(bar, 0.0, ink);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Style {
     arm: f32,
@@ -534,6 +650,12 @@ pub fn paint(ctx: &egui::Context) {
         ))
         .with_clip_rect(ctx.content_rect());
     draw(&painter, visual, settings.energy);
+    // The wall, over the mark: where the keyboard pressed and got
+    // nothing. It burns out on its own, so ask for the frames.
+    if let Some((wall, ink, strength)) = standing_wall(ctx, dt) {
+        draw_wall(&painter, visual.rect.expand(3.0), wall, strength, ink);
+        ctx.request_repaint();
+    }
 }
 
 fn draw(painter: &egui::Painter, visual: Visual, energy: f32) {
