@@ -725,6 +725,35 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
                 backend: "JACK",
             }));
         }
+    } else if which.contains("door") {
+        // The gate, keyed on a narrow band and ducking rather than
+        // slamming, so the lane, the envelope and the key all say
+        // something.
+        use daw::devices::DeviceKind;
+        let _ = stage.song_mut().add_device(0, DeviceKind::Poly);
+        {
+            use daw::params::console::door as p;
+            let song = stage.song_mut();
+            if let Some(device) = song
+                .section(0, daw::console::SectionKind::Door)
+                .map(|device| device.id)
+                .and_then(|id| song.device_mut(id))
+            {
+                device.bypassed = false;
+                device.set(p::THRESHOLD, -28.0);
+                device.set(p::HYSTERESIS, 6.0);
+                device.set(p::ATTACK, 1.2);
+                device.set(p::HOLD, 40.0);
+                device.set(p::RELEASE, 180.0);
+                device.set(p::RANGE, 24.0);
+                device.set(p::KEY_HP, 120.0);
+                device.set(p::KEY_LP, 4000.0);
+            }
+        }
+        let _ = stage.apply(StageIntent::Devices);
+        for _ in 0..3 {
+            let _ = stage.apply(StageIntent::Step(Step::Right));
+        }
     } else if which.contains("tone") && which.contains("stage") {
         // The desk's equaliser, with a low boost hard enough to light
         // the iron and a killed top, so the curve shows both.

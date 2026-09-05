@@ -1,39 +1,56 @@
-//! DOOR's face: a doorway, a ladder, an envelope and a window, with two
-//! controls living in the crevices its silhouette cuts.
+//! DOOR's face: what the door is listening to, when it opens, and how
+//! far it shuts.
+//!
+//! A gate is a switch with timing, so the card is two pictures of time
+//! and one of frequency:
+//!
+//! - The **LANE** is the level with the threshold standing on it, and the
+//!   hysteresis drawn as the band it really is — the door opens at the
+//!   top of that band and does not shut until the bottom, which is why
+//!   it never chatters. The live level rides the lane.
+//! - The **ENVELOPE** is the opening itself, to scale in milliseconds:
+//!   the two-millisecond lookahead before it, the attack, the hold, the
+//!   release, and the floor RANGE lets it fall to. A door that ducks
+//!   instead of slamming has a floor you can see. In RHYTHM the same
+//!   picture becomes the beat grid, cut at the duty.
+//! - The **KEY** is the sidechain's passband between its two filters, so
+//!   "the door listens to the drum it is on" is a band on a scale rather
+//!   than two numbers.
 
 use super::*;
 use crate::ui::chrome;
-use crate::ui::nav_cursor;
 
-/// DOOR's face, laid out once so the key that addresses an instrument
-/// and the art that answers cannot drift apart.
-///
-/// The LADDER carries four of them at once, because they are four
-/// facts about one line: where the door decides (the threshold notch),
-/// how far under that it will not change its mind (the hysteresis
-/// notch), how steeply it lets go below (the slope), and how far down
-/// that fall is allowed to go (the floor). The DOORWAY beside it is
-/// not a control at all — it is the door, open as far as the sound has
-/// opened it.
+/// One numeric row in the right-hand column.
+/// @tune 9..24 px
+const ROW_H: f32 = 13.0;
+/// The room a row keeps for its word.
+/// @tune 16..64 px
+const GUTTER: f32 = 34.0;
+/// The share of the glass the two time pictures take.
+/// @tune 0.4..0.8
+const TIME_SHARE: f32 = 0.56;
+/// The gap between the card's two columns.
+const COLUMN_GAP: f32 = 7.0;
+/// The lane's window: the door's own threshold range.
+const LANE_MIN_DB: f32 = -60.0;
+const LANE_MAX_DB: f32 = 0.0;
+/// The key plot's decades.
+const HZ_MIN: f32 = 20.0;
+const HZ_MAX: f32 = 20_000.0;
+
+/// DOOR's twelve parameters and the rectangle each one owns.
 #[derive(Clone, Copy, Debug)]
 struct DoorFace {
-    ladder: egui::Rect,
-    doorway: egui::Rect,
-    /// The three parts of one envelope: the rise, the plateau, the fall.
+    mode: egui::Rect,
+    threshold: egui::Rect,
+    hysteresis: egui::Rect,
     attack: egui::Rect,
     hold: egui::Rect,
     release: egui::Rect,
-    /// The threshold notch, the hysteresis notch under it, the slope
-    /// below that, and the floor it flattens onto.
-    threshold: egui::Rect,
-    hysteresis: egui::Rect,
-    ratio: egui::Rect,
-    range: egui::Rect,
-    /// The key's window: two posts on a spectrum.
     key_hp: egui::Rect,
     key_lp: egui::Rect,
-    /// The mode, and the beat grid the chopper runs on.
-    mode: egui::Rect,
+    ratio: egui::Rect,
+    range: egui::Rect,
     division: egui::Rect,
     duty: egui::Rect,
 }
@@ -44,129 +61,28 @@ impl DoorFace {
         [
             (p::MODE, self.mode),
             (p::THRESHOLD, self.threshold),
-            (p::RATIO, self.ratio),
+            (p::HYSTERESIS, self.hysteresis),
             (p::ATTACK, self.attack),
             (p::HOLD, self.hold),
             (p::RELEASE, self.release),
-            (p::RANGE, self.range),
             (p::KEY_HP, self.key_hp),
             (p::KEY_LP, self.key_lp),
-            (p::HYSTERESIS, self.hysteresis),
+            (p::RATIO, self.ratio),
+            (p::RANGE, self.range),
             (p::DIVISION, self.division),
             (p::DUTY, self.duty),
         ]
     }
 
-    fn control(self, param: usize) -> Option<egui::Rect> {
-        self.controls()
-            .into_iter()
-            .find_map(|(id, rect)| (id as usize == param).then_some(rect))
+    /// The envelope's whole picture: the three timing controls laid end
+    /// to end, which is also the plot they are drawn in.
+    fn envelope(self) -> egui::Rect {
+        self.attack.union(self.hold).union(self.release)
     }
-}
 
-/// Where a level stands on the ladder, top being silence and bottom
-/// being the quietest the face draws.
-fn door_ladder_y(ladder: egui::Rect, db: f32) -> f32 {
-    let at = ((db + 72.0) / 72.0).clamp(0.0, 1.0);
-    egui::lerp(ladder.bottom()..=ladder.top(), at)
-}
-
-fn door_face(
-    glass: egui::Rect,
-    piece: egui::Rect,
-    threshold_db: f32,
-    hysteresis_db: f32,
-    range_db: f32,
-) -> DoorFace {
-    let inner = glass.shrink2(egui::vec2(6.0, 4.0));
-    let top_h = (inner.height() * 0.44).clamp(56.0, 104.0);
-    let top = egui::Rect::from_min_max(inner.min, egui::pos2(inner.right(), inner.top() + top_h));
-    let ladder_w = (top.width() * 0.34).clamp(40.0, 86.0);
-    let ladder = egui::Rect::from_min_max(top.min, egui::pos2(top.left() + ladder_w, top.bottom()));
-    let doorway = egui::Rect::from_min_max(
-        egui::pos2(ladder.right() + 8.0, top.top()),
-        egui::pos2(top.right(), top.bottom()),
-    );
-    // The ladder's four regions, each a band of it wide enough to take
-    // the cursor's brackets.
-    let notch = |db: f32| {
-        let y = door_ladder_y(ladder, db);
-        egui::Rect::from_min_max(
-            egui::pos2(ladder.left(), y - 5.0),
-            egui::pos2(ladder.right(), y + 5.0),
-        )
-    };
-    let threshold = notch(threshold_db);
-    let hysteresis = notch(threshold_db - hysteresis_db);
-    let floor_db = (threshold_db - range_db).max(-72.0);
-    let range = notch(floor_db);
-    let ratio = egui::Rect::from_min_max(
-        egui::pos2(ladder.left(), hysteresis.bottom()),
-        egui::pos2(ladder.right(), range.top().max(hysteresis.bottom() + 4.0)),
-    );
-
-    let rest = egui::Rect::from_min_max(egui::pos2(inner.left(), top.bottom() + 5.0), inner.max);
-    let gap = 4.0;
-    let env_h = (rest.height() * 0.44).max(22.0);
-    let envelope = egui::Rect::from_min_max(rest.min, egui::pos2(rest.right(), rest.top() + env_h));
-    // The rise, the plateau and the fall each take a third of the
-    // drawing, which is where they are grabbed.
-    let third = envelope.width() / 3.0;
-    let attack = egui::Rect::from_min_max(
-        envelope.min,
-        egui::pos2(envelope.left() + third, envelope.bottom()),
-    );
-    let hold = egui::Rect::from_min_max(
-        egui::pos2(attack.right(), envelope.top()),
-        egui::pos2(attack.right() + third, envelope.bottom()),
-    );
-    let release = egui::Rect::from_min_max(
-        egui::pos2(hold.right(), envelope.top()),
-        egui::pos2(envelope.right(), envelope.bottom()),
-    );
-
-    let key_h = ((rest.height() - env_h - gap * 2.0) * 0.42).max(12.0);
-    let key = egui::Rect::from_min_max(
-        egui::pos2(rest.left(), envelope.bottom() + gap),
-        egui::pos2(rest.right(), envelope.bottom() + gap + key_h),
-    );
-    let key_hp = egui::Rect::from_min_max(key.min, egui::pos2(key.center().x, key.bottom()));
-    let key_lp = egui::Rect::from_min_max(egui::pos2(key.center().x, key.top()), key.max);
-
-    // The MODE sits in the bay cut into the right wall, and the beat
-    // GRID lies along the plinth at the foot — the two crevices the
-    // silhouette leaves, each holding the control that suits its shape:
-    // a tall narrow slot for a switch, a long low shelf for a row of
-    // cells. What is left of the glass is the foot strip between them.
-    let foot = egui::Rect::from_min_max(egui::pos2(rest.left(), key.bottom() + gap), rest.max);
-    let mode = bay_rect(piece, SectionKind::Door).unwrap_or_else(|| {
-        egui::Rect::from_min_max(
-            foot.min,
-            egui::pos2(foot.left() + foot.width() * 0.2, foot.bottom()),
-        )
-    });
-    let grid = plinth_rect(piece, SectionKind::Door).unwrap_or(foot);
-    // The grid says two things: how many cells (the division) and how
-    // much of each is open (the duty). The top half is grabbed for one
-    // and the bottom half for the other.
-    let division = egui::Rect::from_min_max(grid.min, egui::pos2(grid.right(), grid.center().y));
-    let duty = egui::Rect::from_min_max(egui::pos2(grid.left(), grid.center().y), grid.max);
-
-    DoorFace {
-        ladder,
-        doorway,
-        attack,
-        hold,
-        release,
-        threshold,
-        hysteresis,
-        ratio,
-        range,
-        key_hp,
-        key_lp,
-        mode,
-        division,
-        duty,
+    /// The key plot: its two filters own a half each.
+    fn key(self) -> egui::Rect {
+        self.key_hp.union(self.key_lp)
     }
 }
 
@@ -176,403 +92,533 @@ impl Layout for DoorFace {
     }
 }
 
-/// DOOR: a doorway, a ladder, an envelope and a window.
-///
-/// The LADDER on the left is the decision, drawn as one line: a
-/// bright notch where the door opens, a dimmer one under it where
-/// it will not change its mind again, a slope below that whose
-/// steepness is the ratio, and a floor where the fall stops. The
-/// key's own level rides the ladder as a column, so what the door
-/// is listening to and what it decided are the same picture.
-///
-/// The DOORWAY beside it is not a control: it is the door, its leaf
-/// standing as far open as the sound has opened it.
-///
-/// Under them, one ENVELOPE drawn as it is heard — a rise, a
-/// plateau and a fall, each the width of its own time — and one
-/// WINDOW showing the band the key listens through. At the foot,
-/// the mode: an ear, or a beat grid whose cells are the division
-/// and whose lit share is the duty.
+fn door_face(glass: egui::Rect) -> DoorFace {
+    let x = glass.shrink2(egui::vec2(5.0, 2.0));
+    let left_w = (x.width() - COLUMN_GAP) * crate::tune!(TIME_SHARE);
+    let left = egui::Rect::from_min_max(x.min, egui::pos2(x.left() + left_w, x.bottom()));
+    let right = egui::Rect::from_min_max(egui::pos2(left.right() + COLUMN_GAP, x.top()), x.max);
+    let row_h = crate::tune!(ROW_H);
+
+    // Left: the mode, the lane, then the envelope with the whole rest.
+    let mode = egui::Rect::from_min_size(left.min, egui::vec2(left.width(), row_h + 3.0));
+    let lane_h = row_h + 8.0;
+    let lane = egui::Rect::from_min_size(
+        egui::pos2(left.left(), mode.bottom() + 3.0),
+        egui::vec2(left.width(), lane_h),
+    );
+    // The threshold owns the whole lane. Hysteresis is a figure among
+    // the figures: a cell on the lane could hold its word or its number
+    // but not both, and a cell that holds neither is decoration.
+    let threshold = lane;
+    // The envelope, cut into its three times. They are drawn as one
+    // picture and addressed as three, which is what they are.
+    let env = egui::Rect::from_min_max(egui::pos2(left.left(), lane.bottom() + 4.0), left.max);
+    let third = env.width() / 3.0;
+    let slice = |i: usize| {
+        egui::Rect::from_min_size(
+            egui::pos2(env.left() + i as f32 * third, env.top()),
+            egui::vec2(third - 1.0, env.height()),
+        )
+    };
+    let (attack, hold, release) = (slice(0), slice(1), slice(2));
+
+    // Right: the key's passband, then the figures.
+    let key_h = (right.height() * 0.34).clamp(46.0, 80.0);
+    let key = egui::Rect::from_min_size(right.min, egui::vec2(right.width(), key_h));
+    let half = key.width() * 0.5;
+    let key_hp = egui::Rect::from_min_size(key.min, egui::vec2(half - 1.0, key.height()));
+    let key_lp = egui::Rect::from_min_size(
+        egui::pos2(key.left() + half, key.top()),
+        egui::vec2(half, key.height()),
+    );
+    let row = |i: usize| {
+        egui::Rect::from_min_size(
+            egui::pos2(right.left(), key.bottom() + 4.0 + i as f32 * (row_h + 1.0)),
+            egui::vec2(right.width(), row_h),
+        )
+    };
+    DoorFace {
+        mode,
+        threshold,
+        attack,
+        hold,
+        release,
+        key_hp,
+        key_lp,
+        hysteresis: row(0),
+        ratio: row(1),
+        range: row(2),
+        division: row(3),
+        duty: row(4),
+    }
+}
+
+/// Where a frequency stands across the key plot, on the log scale.
+fn place_of_hz(hz: f32) -> f32 {
+    ((hz.max(1.0).log10() - HZ_MIN.log10()) / (HZ_MAX.log10() - HZ_MIN.log10())).clamp(0.0, 1.0)
+}
+
+/// Where a level stands along the lane.
+fn place_of_db(db: f32) -> f32 {
+    ((db - LANE_MIN_DB) / (LANE_MAX_DB - LANE_MIN_DB)).clamp(0.0, 1.0)
+}
+
 pub(super) fn draw(face: &Face<'_>) {
     use crate::params::console::door as p;
     let painter = face.painter;
-    let piece = face.piece;
     let glass = face.glass;
-    let selected = face.selected;
-    let phase = face.phase;
     let alpha = face.alpha;
     let edge = alpha.edge.color;
     let ink = alpha.ink.color;
-    let live = motion::pulse_ink(alpha.live.color, alpha.live_dim.color, phase);
-    let value = |param: u32| face.value(param);
-    let said = face.said;
-    let rhythm = value(p::MODE).round() as u32 == p::MODE_RHYTHM;
-    let threshold_db = value(p::THRESHOLD);
-    let hysteresis_db = value(p::HYSTERESIS);
-    let range_db = value(p::RANGE);
-    let lay = door_face(glass, piece.rect, threshold_db, hysteresis_db, range_db);
-    // How far the door stands open, smoothed so the leaf swings
-    // rather than snaps between frames.
-    let open = painter.ctx().animate_value_with_time(
-        egui::Id::new(("stage-door-open", piece.index)),
-        if said.bands[1] > 0.0 {
-            said.bands[1].clamp(0.0, 1.0)
-        } else {
-            1.0
-        },
-        0.09,
-    );
+    let font = egui::FontId::monospace(design::px(design::type_scale::MICRO));
+    let lay = door_face(glass);
+    let value = |id: u32| face.value(id);
+    let rhythm = value(p::MODE) >= 0.5;
+    let threshold = value(p::THRESHOLD);
+    let hysteresis = value(p::HYSTERESIS);
+    let attack = value(p::ATTACK);
+    let hold = value(p::HOLD);
+    let release = value(p::RELEASE);
+    let range = value(p::RANGE);
+    let ratio = value(p::RATIO);
+    let key_hp = value(p::KEY_HP);
+    let key_lp = value(p::KEY_LP);
+    let division = value(p::DIVISION).round().clamp(0.0, 5.0) as usize;
+    let duty = value(p::DUTY);
+    // What the section measured of itself last block: the level it saw
+    // and how far it is holding the door shut right now.
+    let level_db = face.said.level_db;
+    let shut_db = face.said.reduction_db.abs();
     let mut shapes = Vec::new();
 
-    // ---- the ladder: threshold, hysteresis, ratio, range -------
-    chrome::panel_frame_variant(&mut shapes, lay.ladder, Weight::Hair, edge, 1);
-    let ladder = lay.ladder.shrink2(egui::vec2(4.0, 3.0));
-    let rail_x = ladder.left() + 9.0;
-    chrome::trace(
-        &mut shapes,
-        &[
-            egui::pos2(rail_x, ladder.top()),
-            egui::pos2(rail_x, ladder.bottom()),
-        ],
-        Weight::Hair,
-        edge.gamma_multiply(0.8),
-    );
-    // The key's level, as a column climbing the rail.
-    let key_y = door_ladder_y(lay.ladder, said.bands[2]);
-    if said.bands[2] > -71.0 {
-        shapes.push(egui::Shape::rect_filled(
-            egui::Rect::from_min_max(
-                egui::pos2(rail_x - 3.0, key_y),
-                egui::pos2(rail_x + 3.0, ladder.bottom()),
-            ),
-            0.0,
-            live.gamma_multiply(0.85),
-        ));
-    }
-    // The decision: the threshold's notch bright, the hysteresis
-    // notch under it dim, the slope between the two floors.
-    let threshold_y = door_ladder_y(lay.ladder, threshold_db);
-    let hyst_y = door_ladder_y(lay.ladder, threshold_db - hysteresis_db);
-    let floor_y = door_ladder_y(lay.ladder, (threshold_db - range_db).max(-72.0));
-    chrome::trace(
-        &mut shapes,
-        &[
-            egui::pos2(rail_x - 6.0, threshold_y),
-            egui::pos2(ladder.right(), threshold_y),
-        ],
-        Weight::Heavy,
-        ink,
-    );
-    chrome::trace(
-        &mut shapes,
-        &[
-            egui::pos2(rail_x - 4.0, hyst_y),
-            egui::pos2(ladder.right() - 6.0, hyst_y),
-        ],
-        Weight::Hair,
-        alpha.jeopardy_latent.color,
-    );
-    // The slope: how fast the gain falls under the threshold. Its
-    // angle IS the ratio, and it flattens where the range stops it.
-    let slope_left = ladder.right() - 4.0;
-    let ratio = value(p::RATIO).max(1.0);
-    let reach = ((floor_y - hyst_y) / (ratio * 3.0)).clamp(4.0, ladder.width() - 14.0);
-    let corner = egui::pos2(slope_left - reach, floor_y);
-    chrome::trace(
-        &mut shapes,
-        &[egui::pos2(slope_left, hyst_y), corner],
-        Weight::Heavy,
-        tool::mix_ink(ink, alpha.jeopardy_active.color, 0.4),
-    );
-    chrome::trace(
-        &mut shapes,
-        &[corner, egui::pos2(ladder.left() + 2.0, floor_y)],
-        Weight::Hair,
-        edge.gamma_multiply(1.2),
-    );
-
-    // ---- the doorway: the leaf, as far open as the sound has it
-    chrome::panel_variant(
-        &mut shapes,
-        lay.doorway,
-        Some(alpha.well.color),
-        alpha.ground.color,
-        Some((Weight::Hair, edge)),
-        2,
-    );
-    let jamb = lay.doorway.shrink(5.0);
-    shapes.push(egui::Shape::rect_filled(jamb, 0.0, alpha.ground.color));
-    // The frame it swings in, and the plate it closes onto.
-    chrome::trace(
-        &mut shapes,
-        &[
-            jamb.left_bottom(),
-            jamb.left_top(),
-            jamb.right_top(),
-            jamb.right_bottom(),
-        ],
-        Weight::Hair,
-        edge.gamma_multiply(1.1),
-    );
-    shapes.push(egui::Shape::rect_filled(
-        egui::Rect::from_min_max(egui::pos2(jamb.left(), jamb.bottom() - 2.0), jamb.max),
-        0.0,
-        edge,
-    ));
-    // The opening the leaf swings into, and the leaf itself: shut,
-    // it covers the whole jamb; open, it has swung to the side.
-    // The leaf never vanishes: thrown wide it stands against the
-    // wall, shut it covers the opening. A door with no leaf in it
-    // is a hole.
-    let leaf_w = jamb.width() * (0.22 + 0.78 * (1.0 - open).clamp(0.0, 1.0));
-    if leaf_w > 0.5 {
-        let leaf =
-            egui::Rect::from_min_max(egui::pos2(jamb.right() - leaf_w, jamb.top()), jamb.max);
-        shapes.push(egui::Shape::rect_filled(
-            leaf,
-            0.0,
-            tool::mix_ink(alpha.surface.color, alpha.jeopardy_latent.color, 0.35),
-        ));
-        chrome::trace(
-            &mut shapes,
-            &[leaf.left_top(), leaf.left_bottom()],
-            Weight::Heavy,
-            ink,
+    // ---- MODE: two cells, the standing one in brackets. --------------
+    chrome::panel_frame_variant(&mut shapes, lay.mode, Weight::Hair, edge, 2);
+    let mode_half = lay.mode.width() * 0.5;
+    for i in 0..2 {
+        let cell = egui::Rect::from_min_size(
+            egui::pos2(lay.mode.left() + i as f32 * mode_half, lay.mode.top()),
+            egui::vec2(mode_half, lay.mode.height()),
         );
-    }
-    // The light through the opening, and the hinges it swings on.
-    let gap = egui::Rect::from_min_max(jamb.min, egui::pos2(jamb.right() - leaf_w, jamb.bottom()));
-    if gap.width() > 1.0 {
-        // What comes through: brighter the wider it stands, and a
-        // sill of light along the floor of the opening.
-        shapes.push(egui::Shape::rect_filled(
-            gap,
-            0.0,
-            live.gamma_multiply(0.05 + 0.13 * open),
-        ));
-        shapes.push(egui::Shape::rect_filled(
-            egui::Rect::from_min_max(
-                egui::pos2(gap.left(), gap.bottom() - 3.0),
-                egui::pos2(gap.right(), gap.bottom()),
-            ),
-            0.0,
-            live.gamma_multiply(0.35 + 0.5 * open),
-        ));
-    }
-    for at in [0.25, 0.5, 0.75] {
-        chrome::pad(
-            &mut shapes,
-            egui::pos2(jamb.right() + 1.0, egui::lerp(jamb.y_range(), at)),
-            chrome::PAD - 2.0,
-            edge,
-            false,
-        );
-    }
-
-    // ---- the envelope: rise, plateau, fall ---------------------
-    let env = egui::Rect::from_min_max(lay.attack.min, lay.release.max);
-    chrome::panel_frame_variant(&mut shapes, env, Weight::Hair, edge, 3);
-    let shape_of = |ms: f32, most: f32| (ms / most).clamp(0.02, 1.0).sqrt();
-    let rise = shape_of(value(p::ATTACK), 100.0);
-    let plateau = shape_of(value(p::HOLD), 500.0);
-    let fall = shape_of(value(p::RELEASE), 2_000.0);
-    let inner = env.shrink2(egui::vec2(5.0, 4.0));
-    let base = inner.bottom();
-    let peak = inner.top();
-    // Each time takes its own third of the drawing, and within that
-    // third the corner slides: a long attack leans, a short one
-    // stands up.
-    let a_end = egui::lerp(lay.attack.x_range(), rise.clamp(0.1, 0.95));
-    let h_end = egui::lerp(lay.hold.x_range(), plateau.clamp(0.05, 0.95));
-    let r_end = egui::lerp(lay.release.x_range(), fall.clamp(0.1, 0.95));
-    let envelope = vec![
-        egui::pos2(inner.left(), base),
-        egui::pos2(a_end, peak),
-        egui::pos2(h_end.max(a_end), peak),
-        egui::pos2(r_end.max(h_end), base),
-        egui::pos2(inner.right(), base),
-    ];
-    chrome::trace(&mut shapes, &envelope, Weight::Heavy, ink);
-    for x in [a_end, h_end] {
-        chrome::trace(
-            &mut shapes,
-            &[egui::pos2(x, peak), egui::pos2(x, base)],
-            Weight::Hair,
-            edge.gamma_multiply(0.7),
-        );
-    }
-    // The door's own gain rides the envelope's height, so the
-    // drawing moves with the sound it is describing.
-    shapes.push(egui::Shape::rect_filled(
-        egui::Rect::from_min_max(
-            egui::pos2(inner.left(), egui::lerp(base..=peak, open)),
-            egui::pos2(inner.right(), base),
-        ),
-        0.0,
-        live.gamma_multiply(0.12),
-    ));
-
-    // ---- the key's window -------------------------------------
-    let key = egui::Rect::from_min_max(lay.key_hp.min, lay.key_lp.max);
-    chrome::trace(
-        &mut shapes,
-        &[
-            egui::pos2(key.left(), key.center().y),
-            egui::pos2(key.right(), key.center().y),
-        ],
-        Weight::Hair,
-        edge.gamma_multiply(0.8),
-    );
-    let hp_x = tool::octave_x(key, value(p::KEY_HP));
-    let lp_x = tool::octave_x(key, value(p::KEY_LP));
-    shapes.push(egui::Shape::rect_filled(
-        egui::Rect::from_min_max(
-            egui::pos2(hp_x, key.top() + 2.0),
-            egui::pos2(lp_x.max(hp_x + 1.0), key.bottom() - 2.0),
-        ),
-        0.0,
-        live.gamma_multiply(0.3),
-    ));
-    for (x, out) in [(hp_x, true), (lp_x, false)] {
-        let post = egui::Rect::from_min_max(
-            egui::pos2(x - 2.0, key.top()),
-            egui::pos2(x + 2.0, key.bottom()),
-        );
-        shapes.push(egui::Shape::rect_filled(post, 0.0, ink));
-        let _ = out;
-    }
-
-    // ---- the mode, and the grid the chopper runs on ------------
-    let mode = lay.mode;
-    if rhythm {
-        // A beat: a filled square with its own pulse.
-        shapes.push(egui::Shape::rect_filled(
-            mode.shrink(3.0),
-            0.0,
-            tool::mix_ink(alpha.live_dim.color, alpha.live.color, phase.dash()),
-        ));
-    } else {
-        // An ear: two arcs listening.
-        for r in [3.0f32, 6.0] {
-            let arc: Vec<egui::Pos2> = (0..=12)
-                .map(|i| on_arc(mode.center(), r, -60.0 + 120.0 * i as f32 / 12.0))
-                .collect();
-            chrome::trace(&mut shapes, &arc, Weight::Hair, ink);
+        if rhythm == (i == 1) {
+            chrome::brackets(&mut shapes, cell.shrink(2.0), 4.0, Weight::Hair, ink);
         }
     }
-    let grid = egui::Rect::from_min_max(lay.division.min, lay.duty.max);
-    let cells = match value(p::DIVISION).round().max(0.0) as usize {
-        0 => 2usize,
-        1 => 4,
-        2 => 8,
-        3 => 16,
-        4 => 3,
-        _ => 6,
-    };
-    let duty = (value(p::DUTY) / 100.0).clamp(0.0, 1.0);
-    let step = grid.width() / cells as f32;
-    for cell in 0..cells {
-        let x0 = grid.left() + step * cell as f32;
-        let lit = egui::Rect::from_min_max(
-            egui::pos2(x0, grid.top() + 1.0),
-            egui::pos2(x0 + (step - 1.0) * duty, grid.bottom() - 1.0),
-        );
-        let whole = egui::Rect::from_min_max(
-            egui::pos2(x0, grid.top() + 1.0),
-            egui::pos2(x0 + step - 1.0, grid.bottom() - 1.0),
-        );
-        shapes.push(egui::Shape::rect_stroke(
-            whole,
-            0.0,
-            egui::Stroke::new(Weight::Hair.px(), edge.gamma_multiply(0.8)),
-            egui::StrokeKind::Inside,
-        ));
-        if lit.width() > 0.5 {
+
+    // ---- LANE: the level, the threshold, and the hysteresis band. ----
+    chrome::panel_variant(
+        &mut shapes,
+        lay.threshold,
+        Some(alpha.ground.color),
+        alpha.well.color,
+        Some((Weight::Hair, edge.gamma_multiply(0.62))),
+        0,
+    );
+    let lane = egui::Rect::from_min_max(
+        egui::pos2(
+            lay.threshold.left() + crate::tune!(GUTTER),
+            lay.threshold.top() + 4.0,
+        ),
+        egui::pos2(lay.threshold.right() - 44.0, lay.threshold.bottom() - 4.0),
+    );
+    if lane.is_positive() {
+        // The signal, as far as it got.
+        if level_db > LANE_MIN_DB {
             shapes.push(egui::Shape::rect_filled(
-                lit,
+                egui::Rect::from_min_max(
+                    lane.min,
+                    egui::pos2(
+                        lane.left() + place_of_db(level_db) * lane.width(),
+                        lane.bottom(),
+                    ),
+                ),
                 0.0,
-                if rhythm {
-                    live.gamma_multiply(0.85)
+                if level_db >= threshold {
+                    alpha.live.color
                 } else {
-                    edge.gamma_multiply(1.1)
+                    edge
                 },
             ));
+        }
+        // The band between opening and shutting. The door opens at the
+        // top of it and does not shut until the bottom — drawn, because
+        // that gap is the whole reason it never chatters.
+        let open_at = lane.left() + place_of_db(threshold) * lane.width();
+        let shut_at = lane.left() + place_of_db(threshold - hysteresis) * lane.width();
+        if hysteresis > 0.0 {
+            shapes.push(egui::Shape::rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(shut_at, lane.top()),
+                    egui::pos2(open_at, lane.bottom()),
+                ),
+                0.0,
+                alpha.jeopardy_latent.color.gamma_multiply(0.25),
+            ));
+        }
+        for (x, weight) in [(open_at, Weight::Heavy), (shut_at, Weight::Hair)] {
+            chrome::trace(
+                &mut shapes,
+                &[
+                    egui::pos2(x, lane.top() - 2.0),
+                    egui::pos2(x, lane.bottom() + 2.0),
+                ],
+                weight,
+                alpha.jeopardy_latent.color,
+            );
+        }
+    }
+
+    // ---- ENVELOPE: the opening, to scale in milliseconds. ------------
+    let env = lay.envelope();
+    chrome::panel_variant(
+        &mut shapes,
+        env,
+        Some(alpha.ground.color),
+        alpha.well.color,
+        Some((Weight::Hair, edge.gamma_multiply(0.62))),
+        0,
+    );
+    let plot = egui::Rect::from_min_max(
+        egui::pos2(env.left() + 7.0, env.top() + font.size + 5.0),
+        egui::pos2(env.right() - 7.0, env.bottom() - font.size - 6.0),
+    );
+    // The floor the door falls to: RANGE is how far it shuts, and a
+    // door that ducks rather than slams has a floor you can see.
+    let floor = (1.0 - range / 80.0).clamp(0.0, 1.0);
+    let span_ms = (p::LOOKAHEAD_MS + attack + hold + release).max(1.0);
+    let x_at = |ms: f32| plot.left() + (ms / span_ms).clamp(0.0, 1.0) * plot.width();
+    let y_at = |open: f32| plot.bottom() - open.clamp(0.0, 1.0) * plot.height();
+    for line in [0.0f32, 1.0] {
+        chrome::trace(
+            &mut shapes,
+            &[
+                egui::pos2(plot.left(), y_at(line)),
+                egui::pos2(plot.right(), y_at(line)),
+            ],
+            Weight::Hair,
+            edge.gamma_multiply(0.35),
+        );
+    }
+    let shape: Vec<egui::Pos2> = if rhythm {
+        // RHYTHM: the beat grid, cut at the duty. The picture is the
+        // same envelope, repeated on the division.
+        let open_share = (duty / 100.0).clamp(0.0, 1.0);
+        vec![
+            egui::pos2(plot.left(), y_at(floor)),
+            egui::pos2(plot.left(), y_at(1.0)),
+            egui::pos2(plot.left() + open_share * plot.width(), y_at(1.0)),
+            egui::pos2(plot.left() + open_share * plot.width(), y_at(floor)),
+            egui::pos2(plot.right(), y_at(floor)),
+        ]
+    } else {
+        vec![
+            egui::pos2(x_at(0.0), y_at(floor)),
+            egui::pos2(x_at(p::LOOKAHEAD_MS), y_at(floor)),
+            egui::pos2(x_at(p::LOOKAHEAD_MS + attack), y_at(1.0)),
+            egui::pos2(x_at(p::LOOKAHEAD_MS + attack + hold), y_at(1.0)),
+            egui::pos2(x_at(span_ms), y_at(floor)),
+        ]
+    };
+    chrome::trace(&mut shapes, &shape, Weight::Heavy, ink);
+    // The lookahead: the door is already moving before the transient
+    // arrives, which is the point of it.
+    if !rhythm {
+        chrome::dashes(
+            &mut shapes,
+            &[
+                egui::pos2(x_at(p::LOOKAHEAD_MS), plot.top()),
+                egui::pos2(x_at(p::LOOKAHEAD_MS), plot.bottom()),
+            ],
+            0.0,
+            Weight::Hair,
+            alpha.live_dim.color,
+        );
+    }
+    // Where the door stands right now, from what the section measured.
+    if shut_db > 0.1 {
+        let now = (1.0 - shut_db / 80.0).clamp(0.0, 1.0);
+        chrome::trace(
+            &mut shapes,
+            &[
+                egui::pos2(plot.left(), y_at(now)),
+                egui::pos2(plot.right(), y_at(now)),
+            ],
+            Weight::Hair,
+            alpha.jeopardy_latent.color,
+        );
+    }
+
+    // ---- KEY: the passband the door is listening through. ------------
+    let key = lay.key();
+    chrome::panel_variant(
+        &mut shapes,
+        key,
+        Some(alpha.ground.color),
+        alpha.well.color,
+        Some((Weight::Hair, edge.gamma_multiply(0.62))),
+        0,
+    );
+    let band = egui::Rect::from_min_max(
+        egui::pos2(key.left() + 6.0, key.top() + font.size + 4.0),
+        egui::pos2(key.right() - 6.0, key.bottom() - font.size - 4.0),
+    );
+    if band.is_positive() {
+        for hz in [100.0f32, 1_000.0, 10_000.0] {
+            chrome::trace(
+                &mut shapes,
+                &[
+                    egui::pos2(band.left() + place_of_hz(hz) * band.width(), band.top()),
+                    egui::pos2(band.left() + place_of_hz(hz) * band.width(), band.bottom()),
+                ],
+                Weight::Hair,
+                edge.gamma_multiply(0.30),
+            );
+        }
+        let a = band.left() + place_of_hz(key_hp) * band.width();
+        let b = band.left() + place_of_hz(key_lp) * band.width();
+        shapes.push(egui::Shape::rect_filled(
+            egui::Rect::from_min_max(egui::pos2(a, band.top()), egui::pos2(b, band.bottom())),
+            0.0,
+            alpha.live_dim.color,
+        ));
+        for x in [a, b] {
+            chrome::trace(
+                &mut shapes,
+                &[
+                    egui::pos2(x, band.top() - 2.0),
+                    egui::pos2(x, band.bottom() + 2.0),
+                ],
+                Weight::Heavy,
+                alpha.live.color,
+            );
         }
     }
     painter.extend(shapes);
 
-    // The cursor: the house brackets around whichever instrument
-    // the keyboard is holding.
-    // The mark becomes the door. On the ladder it is squeezed by the
-    // gain the door is actually taking away; on the envelope and the
-    // key it opens and shuts with the leaf; on the chopper's grid it
-    // stands in the cell the transport is inside. Every one of them is
-    // a figure the engine reported, not a picture of one.
-    let taken = (1.0 - said.bands[1].clamp(0.0, 1.0)).clamp(0.0, 1.0);
-    face.mark_signed(
-        &lay,
-        match selected {
-            Some(param)
-                if param == p::THRESHOLD as usize
-                    || param == p::HYSTERESIS as usize
-                    || param == p::RATIO as usize
-                    || param == p::RANGE as usize =>
-            {
-                nav_cursor::Signature::Squeeze(taken)
-            }
-            Some(param)
-                if param == p::ATTACK as usize
-                    || param == p::HOLD as usize
-                    || param == p::RELEASE as usize
-                    || param == p::KEY_HP as usize
-                    || param == p::KEY_LP as usize =>
-            {
-                nav_cursor::Signature::Aperture(said.bands[1].clamp(0.0, 1.0))
-            }
-            Some(param) if param == p::DIVISION as usize || param == p::DUTY as usize => {
-                face.beat_cell(cells)
-            }
-            _ => nav_cursor::Signature::Plain,
+    // ---- The figures. One size, one gutter. --------------------------
+    let label = |at: egui::Pos2, align: egui::Align2, text: String, ink| {
+        painter.text(at, align, text, font.clone(), ink);
+    };
+    const PAD_X: f32 = 8.0;
+    // The gutter is as wide as the longest word that stands in it, plus
+    // air. Guessing at it is how a bar comes to be drawn over a label.
+    let gutter = ["HYST", "RATIO", "RANGE", "DIV", "DUTY", "THRES"]
+        .into_iter()
+        .map(|word| {
+            painter
+                .layout_no_wrap(word.to_owned(), font.clone(), ink)
+                .rect
+                .width()
+        })
+        .fold(0.0f32, f32::max)
+        + 8.0;
+    for (i, word) in ["KEY", "RHYTHM"].into_iter().enumerate() {
+        let cell = egui::Rect::from_min_size(
+            egui::pos2(lay.mode.left() + i as f32 * mode_half, lay.mode.top()),
+            egui::vec2(mode_half, lay.mode.height()),
+        );
+        label(
+            cell.center(),
+            egui::Align2::CENTER_CENTER,
+            word.to_owned(),
+            if rhythm == (i == 1) { ink } else { edge },
+        );
+    }
+    label(
+        egui::pos2(lay.threshold.left() + 3.0, lay.threshold.center().y),
+        egui::Align2::LEFT_CENTER,
+        "THRES".to_owned(),
+        edge,
+    );
+    label(
+        egui::pos2(lay.threshold.right() - 4.0, lay.threshold.center().y),
+        egui::Align2::RIGHT_CENTER,
+        format!("{threshold:.0}"),
+        ink,
+    );
+    label(
+        egui::pos2(env.left() + PAD_X, env.top() + 2.0),
+        egui::Align2::LEFT_TOP,
+        if rhythm { "GRID" } else { "ENVELOPE" }.to_owned(),
+        edge,
+    );
+    label(
+        egui::pos2(env.right() - PAD_X, env.top() + 2.0),
+        egui::Align2::RIGHT_TOP,
+        if rhythm {
+            format!("1/{:.0}", 1.0 / p::DIVISION_BEATS[division].max(0.001))
+        } else {
+            format!("{span_ms:.0}ms")
+        },
+        ink,
+    );
+    // The three times, each under the part of the picture it shapes.
+    if !rhythm {
+        for (rect, word, ms) in [
+            (lay.attack, "A", attack),
+            (lay.hold, "H", hold),
+            (lay.release, "R", release),
+        ] {
+            label(
+                egui::pos2(rect.center().x, env.bottom() - 2.0),
+                egui::Align2::CENTER_BOTTOM,
+                if ms >= 100.0 {
+                    format!("{word} {ms:.0}")
+                } else {
+                    format!("{word} {ms:.1}")
+                },
+                ink,
+            );
+        }
+    } else {
+        label(
+            egui::pos2(env.center().x, env.bottom() - 2.0),
+            egui::Align2::CENTER_BOTTOM,
+            format!("DUTY {duty:.0}%"),
+            ink,
+        );
+    }
+    label(
+        egui::pos2(key.left() + PAD_X, key.top() + 2.0),
+        egui::Align2::LEFT_TOP,
+        "KEY".to_owned(),
+        edge,
+    );
+    label(
+        egui::pos2(key.right() - PAD_X, key.top() + 2.0),
+        egui::Align2::RIGHT_TOP,
+        if key_hp <= 21.0 && key_lp >= 19_000.0 {
+            "WIDE".to_owned()
+        } else {
+            "BAND".to_owned()
+        },
+        if key_hp <= 21.0 && key_lp >= 19_000.0 {
+            edge
+        } else {
+            alpha.live.color
         },
     );
+    let hz_word = |hz: f32| {
+        if hz >= 1000.0 {
+            format!("{:.1}k", hz / 1000.0)
+        } else {
+            format!("{hz:.0}")
+        }
+    };
+    label(
+        egui::pos2(key.left() + PAD_X, key.bottom() - 2.0),
+        egui::Align2::LEFT_BOTTOM,
+        hz_word(key_hp),
+        ink,
+    );
+    label(
+        egui::pos2(key.right() - PAD_X, key.bottom() - 2.0),
+        egui::Align2::RIGHT_BOTTOM,
+        hz_word(key_lp),
+        ink,
+    );
+    // The figures that are only figures. A bar behind each, so the row
+    // is still a picture at a glance.
+    for (rect, word, place, said) in [
+        (
+            lay.hysteresis,
+            "HYST",
+            hysteresis / 12.0,
+            format!("{hysteresis:.0}dB"),
+        ),
+        (
+            lay.ratio,
+            "RATIO",
+            (ratio - 1.5) / 18.5,
+            format!("{ratio:.0}:1"),
+        ),
+        (lay.range, "RANGE", range / 80.0, format!("{range:.0}dB")),
+        (
+            lay.division,
+            "DIV",
+            division as f32 / 5.0,
+            format!("1/{:.0}", 1.0 / p::DIVISION_BEATS[division].max(0.001)),
+        ),
+        (lay.duty, "DUTY", duty / 100.0, format!("{duty:.0}%")),
+    ] {
+        // In KEY mode the rhythm's two figures are not what the door is
+        // doing, and they say so rather than lying quietly.
+        let asleep = !rhythm && (rect == lay.division || rect == lay.duty);
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + gutter, rect.center().y - 2.0),
+            egui::pos2(rect.right() - 42.0, rect.center().y + 2.0),
+        );
+        if bar.is_positive() {
+            painter.rect_filled(bar, 0.0, edge.gamma_multiply(0.35));
+            if !asleep {
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        bar.min,
+                        egui::pos2(
+                            bar.left() + place.clamp(0.0, 1.0) * bar.width(),
+                            bar.bottom(),
+                        ),
+                    ),
+                    0.0,
+                    ink,
+                );
+            }
+        }
+        label(
+            egui::pos2(rect.left() + 2.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            word.to_owned(),
+            edge,
+        );
+        label(
+            egui::pos2(rect.right() - 3.0, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            if asleep { "--".to_owned() } else { said },
+            if asleep { edge } else { ink },
+        );
+    }
+
+    face.mark(&lay);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::console::SectionKind;
+
+    fn glass() -> egui::Rect {
+        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(450.0, 210.0))
+    }
 
     #[test]
-    fn every_door_parameter_has_one_instrument() {
-        let piece = egui::Rect::from_min_size(
-            egui::pos2(30.0, 40.0),
-            egui::vec2(width_of(SectionKind::Door), 240.0),
-        );
-        let glass = recess_of(piece, SectionKind::Door).shrink(3.0);
-        let face = door_face(glass, piece, -30.0, 6.0, 40.0);
-        for table in SectionKind::Door.table() {
-            let rect = face
-                .control(table.id as usize)
-                .unwrap_or_else(|| panic!("{} has no instrument", table.name));
-            assert!(rect.is_positive(), "{} has no room", table.name);
-            assert!(piece.contains_rect(rect), "{} left the piece", table.name);
+    fn every_door_parameter_has_its_own_instrument() {
+        let face = door_face(glass());
+        let controls = face.controls();
+        for (index, (id, rect)) in controls.iter().enumerate() {
+            assert!(
+                glass().contains_rect(*rect),
+                "parameter {id} left the glass"
+            );
+            assert!(rect.is_positive(), "parameter {id} lost its instrument");
+            for (other, other_rect) in &controls[index + 1..] {
+                assert!(
+                    !rect.intersects(*other_rect),
+                    "parameters {id} and {other} overlap"
+                );
+            }
         }
-        // The ladder reads top to bottom: the threshold, the give under
-        // it, the slope, then the floor.
-        assert!(face.threshold.center().y < face.hysteresis.center().y);
-        assert!(face.hysteresis.center().y <= face.ratio.center().y);
-        assert!(face.ratio.center().y <= face.range.center().y);
-        // The envelope is three parts of one drawing, in order.
-        assert!(face.attack.right() <= face.hold.left() + 0.01);
-        assert!(face.hold.right() <= face.release.left() + 0.01);
-        // And the crevices hold what the glass has no room for.
-        assert!(
-            !glass.contains_rect(face.mode),
-            "the mode is not in its bay"
-        );
-        assert!(
-            !glass.contains_rect(face.division),
-            "the grid is not on its plinth"
-        );
+    }
+
+    /// The two time pictures own the left, the key and the figures the
+    /// right, and the envelope's three times lie end to end.
+    #[test]
+    fn the_door_reads_as_time_on_the_left_and_frequency_on_the_right() {
+        let face = door_face(glass());
+        assert!(face.threshold.right() <= face.hysteresis.left());
+        assert!(face.attack.right() <= face.hold.left());
+        assert!(face.hold.right() <= face.release.left());
+        assert_eq!(face.attack.y_range(), face.release.y_range());
+        assert!(face.envelope().right() <= face.key().left());
+        assert!(face.key_hp.right() <= face.key_lp.left());
+        // The envelope is the biggest picture on the card.
+        assert!(face.envelope().area() > face.key().area());
     }
 }

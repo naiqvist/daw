@@ -64,7 +64,7 @@ pub fn width_of(kind: SectionKind) -> f32 {
         // The channel's own stages.
         SectionKind::Preamp => PREAMP_W,
         SectionKind::Tone => 424.0,
-        SectionKind::Door => 236.0,
+        SectionKind::Door => 496.0,
         SectionKind::Cut => 204.0,
         SectionKind::Hit => 166.0,
         SectionKind::Four => 256.0,
@@ -1169,7 +1169,7 @@ mod tests {
             // instrument on it — a transfer curve, a harmonic ladder —
             // needs the room, and a section that does not, does not get
             // it. The floor is what keeps a card from becoming a label.
-            assert!(w >= 140.0 && w <= 480.0, "{kind:?} is {w} wide");
+            assert!(w >= 140.0 && w <= 520.0, "{kind:?} is {w} wide");
             seen.push((kind, w));
         }
         // Neighbours on the strip do not share a width: the run reads
