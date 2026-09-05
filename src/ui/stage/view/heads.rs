@@ -2,11 +2,12 @@
 //! field, the master pinned right, and the cursor on one of them.
 //!
 //! Identity plus the two-bit state. A head says what its track IS —
-//! name, number, the family sign of its instrument — and the two things
-//! about it that change while you watch and cost most to miss: whether
-//! it is muted or soloed, and whether it is sounding now. Level, pan,
-//! sends and clips are other surfaces' to show; a head that showed them
-//! would be a card.
+//! number and name — and the two things about it that change while you
+//! watch and cost most to miss: whether it is muted or soloed, and
+//! whether it is sounding now. Level, pan, sends and clips are other
+//! surfaces' to show; a head that showed them would be a card. The
+//! instrument's family sign was tried here and taken off: it read as a
+//! waveform, and a head is not a scope.
 //!
 //! Filled chamfered plates, no outlines. Rest is the `surface` rung, a
 //! muted head sinks to `well`, and the cursor's head is the one
@@ -14,26 +15,24 @@
 //! `ground`. Sounding is a `live` bar along the plate's foot.
 
 use super::*;
-use crate::ui::glyph;
 
 /// The field's inset from the window, on every side.
 pub(super) const MARGIN: f32 = 16.0;
 /// One head's plate.
-pub(super) const HEAD_W: f32 = 128.0;
-pub(super) const HEAD_H: f32 = 56.0;
+pub(super) const HEAD_W: f32 = 96.0;
+pub(super) const HEAD_H: f32 = 44.0;
 /// Between two heads, and between the last head and the master.
 pub(super) const GAP: f32 = 8.0;
 /// The corner every plate gives up. One size everywhere, so it reads as
 /// how things here are made and never as a shape of its own.
-pub(super) const CHAMFER: f32 = 8.0;
+pub(super) const CHAMFER: f32 = 6.0;
 /// The two state pips and the sounding bar, inside the plate.
-const PIP: f32 = 10.0;
-const PIP_CHAMFER: f32 = 2.5;
-const BAR_H: f32 = 4.0;
-const INSET: f32 = 8.0;
-const NAME_PX: f32 = 13.0;
-const NUMBER_PX: f32 = 10.0;
-const SIGN: f32 = 18.0;
+const PIP: f32 = 8.0;
+const PIP_CHAMFER: f32 = 2.0;
+const BAR_H: f32 = 3.0;
+const INSET: f32 = 6.0;
+const NAME_PX: f32 = 12.0;
+const NUMBER_PX: f32 = 9.0;
 
 /// How many track heads fit across a field this wide, leaving the
 /// master its own column. Never fewer than one, or the cursor would
@@ -105,7 +104,6 @@ pub(super) fn standing(address: Option<Address>, track: Option<usize>) -> Standi
 struct Face<'a> {
     number: Option<usize>,
     name: &'a str,
-    sign: Option<glyph::Glyph>,
     muted: bool,
     solo: bool,
     sounding: bool,
@@ -130,7 +128,6 @@ impl Stage {
             let face = Face {
                 number: Some(track + 1),
                 name: &head.name,
-                sign: self.track_sigil(track),
                 muted: head.muted,
                 solo: head.solo,
                 sounding: self.playing.get(track).copied().flatten().is_some(),
@@ -141,7 +138,6 @@ impl Stage {
         let master = Face {
             number: None,
             name: "MASTER",
-            sign: None,
             muted: false,
             solo: false,
             sounding: false,
@@ -180,41 +176,31 @@ impl Stage {
                 word,
             );
         }
-        if let Some(sign) = face.sign {
-            let cell = egui::Rect::from_min_size(
-                egui::pos2(inner.max.x - SIGN, inner.min.y),
-                egui::vec2(SIGN, SIGN),
-            );
-            glyph::paint(painter, cell, sign, word);
-        }
         // The name, on its own row, clipped by character so it never
-        // runs into the sign's column or off the plate.
-        let fits = ((inner.width() - SIGN - 4.0) / (NAME_PX * 0.62))
-            .floor()
-            .max(1.0) as usize;
+        // runs off the plate.
+        let fits = (inner.width() / (NAME_PX * 0.62)).floor().max(1.0) as usize;
         let name: String = face.name.chars().take(fits).collect();
         painter.text(
-            egui::pos2(inner.min.x, inner.min.y + NUMBER_PX + 6.0),
+            egui::pos2(inner.min.x, inner.min.y + NUMBER_PX + 4.0),
             egui::Align2::LEFT_TOP,
             name,
             egui::FontId::monospace(NAME_PX),
             word,
         );
 
-        // The two bits, bottom right: M and S as pips, lit when on.
-        let pips_y = inner.max.y - PIP;
+        // The two bits, top right beside the number: M and S as pips,
+        // lit when on.
+        let pips_y = inner.min.y + 1.0;
         for (i, on) in [(0, face.muted), (1, face.solo)] {
             let x = inner.max.x - PIP - i as f32 * (PIP + 4.0);
             let pip = egui::Rect::from_min_size(egui::pos2(x, pips_y), egui::vec2(PIP, PIP));
             painter.add(plate(pip, PIP_CHAMFER, if on { word } else { quiet }));
         }
-        // Sounding: a live bar along the foot, left of the pips.
+        // Sounding: a live bar along the foot.
         if face.sounding {
-            let bar = egui::Rect::from_min_max(
-                egui::pos2(inner.min.x, inner.max.y - BAR_H),
-                egui::pos2(inner.max.x - 2.0 * PIP - 8.0, inner.max.y),
-            );
-            painter.add(plate(bar, 1.5, alpha.live.color));
+            let bar =
+                egui::Rect::from_min_max(egui::pos2(inner.min.x, inner.max.y - BAR_H), inner.max);
+            painter.add(plate(bar, 1.0, alpha.live.color));
         }
         // The cursor in this column but below the head: a focus bar under
         // the foot, pointing at where it is.
