@@ -50,6 +50,16 @@ fn keyed(rect: Rect) -> Vec<Pos2> {
         .collect()
 }
 
+/// The keyed chamfer's outline, closed, for a caller that wants to dash
+/// or fill it its own way.
+pub fn keyed_outline(rect: Rect) -> Vec<Pos2> {
+    let mut pts = keyed(rect);
+    if let Some(first) = pts.first().copied() {
+        pts.push(first);
+    }
+    pts
+}
+
 /// A straight hairline along `path`.
 pub fn trace(out: &mut Vec<Shape>, path: &[Pos2], weight: Weight, ink: Color32) {
     if path.len() < 2 {

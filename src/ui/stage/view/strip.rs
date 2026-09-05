@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! The strip band: the console's sections as interlocking pieces.
 //!
 //! A section's card is a chamfered casing with a TONGUE on its right
@@ -687,26 +688,10 @@ impl Stage {
         let row_font = egui::FontId::monospace(design::px(design::type_scale::MICRO));
 
         let mut shapes = Vec::new();
-        if piece.tongue {
-            tongue_fill(&mut shapes, rect, fill);
-        }
-        if piece.kind == SectionKind::Preamp {
-            preamp_crown(
-                &mut shapes,
-                rect,
-                if is_in {
-                    alpha.well.color
-                } else {
-                    alpha.ground.color
-                },
-                edge,
-            );
-        }
-        let mut path = outline(rect, piece.kind, piece.notch, piece.tongue);
-        path.push(path[0]);
-        // The casing's line: a hairline in edge at rest, the live chassis
-        // under the cursor, and dashed while the section is OUT — the
-        // console's reading of focus and of a thing switched off.
+        // A basic chamfered card: the console's keyed outline, solid while
+        // the section is IN — the live chassis under the cursor — and
+        // dashed while it is OUT.
+        let path = chrome::keyed_outline(rect);
         if is_in {
             chrome::trace(
                 &mut shapes,
@@ -733,30 +718,6 @@ impl Stage {
         );
 
         // The signal: through the figure when IN, along the foot when OUT.
-        // No cables: the signal path is not drawn through a card.
-        let routes: [Vec<egui::Pos2>; 2] = [Vec::new(), Vec::new()];
-        for path in &routes {
-            chrome::trace(
-                &mut shapes,
-                path,
-                Weight::Hair,
-                if is_in { ink } else { edge.gamma_multiply(1.3) },
-            );
-            if sounding && phase.rolling {
-                chrome::dashes(
-                    &mut shapes,
-                    path,
-                    phase.dash(),
-                    Weight::Heavy,
-                    alpha.live_dim.color,
-                );
-            }
-            // Contacts: a pad where the pair lands and where it leaves.
-            if let (Some(first), Some(last)) = (path.first(), path.last()) {
-                chrome::pad(&mut shapes, *first, chrome::PAD - 1.0, ink, is_in);
-                chrome::pad(&mut shapes, *last, chrome::PAD - 1.0, ink, is_in);
-            }
-        }
 
         // The screen: the piece's casing is the shell, and this is the
         // glass set into it — the ground showing through a double
@@ -769,37 +730,15 @@ impl Stage {
             } else {
                 edge.gamma_multiply(0.55)
             };
-            if piece.kind == SectionKind::Preamp {
-                preamp_screen_frame(&mut shapes, hole, screen_edge, alpha.ground.color, fill);
-            } else {
-                screen_frame(&mut shapes, hole, screen_edge, alpha.ground.color);
-            }
+            screen_frame(&mut shapes, hole, screen_edge, alpha.ground.color);
         }
         // The IN pad on the head's right: lit while IN, fixed for a
         // section the desk never lets out.
-        chrome::pad(
-            &mut shapes,
-            egui::pos2(rect.right() - 12.0, rect.top() + HEAD_H * 0.5),
-            chrome::PAD + 1.0,
-            if is_in { alpha.live.color } else { edge },
-            is_in,
-        );
-        if piece.kind.always_in() {
-            chrome::via(
-                &mut shapes,
-                egui::pos2(rect.right() - 12.0, rect.top() + HEAD_H * 0.5),
-                edge,
-                fill,
-            );
-        }
         painter.extend(shapes);
 
         // The name, in the block face, over the joint's rail.
         painter.text(
-            egui::pos2(
-                rect.left() + if piece.notch { TONGUE + 8.0 } else { 10.0 },
-                rect.top() + 6.0,
-            ),
+            egui::pos2(rect.left() + 10.0, rect.top() + 6.0),
             egui::Align2::LEFT_TOP,
             piece.kind.name(),
             egui::FontId::monospace(11.0),
@@ -810,20 +749,7 @@ impl Stage {
         // top to bottom with a scan line at the edge, the way a terminal
         // painted a page. Once painted it stays.
         let glass = hole.shrink(3.0);
-        let reveal = if focused {
-            painter.ctx().animate_bool_with_time(
-                egui::Id::new(("stage-piece-reveal", piece.index)),
-                true,
-                REVEAL_S,
-            )
-        } else {
-            painter.ctx().animate_bool_with_time(
-                egui::Id::new(("stage-piece-reveal", piece.index)),
-                false,
-                0.0,
-            );
-            1.0
-        };
+        let reveal = 1.0;
         let shown = egui::Rect::from_min_max(
             glass.min,
             egui::pos2(glass.max.x, glass.min.y + glass.height() * reveal),

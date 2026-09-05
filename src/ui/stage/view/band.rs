@@ -424,15 +424,6 @@ impl Stage {
             alpha.edge.color.gamma_multiply(0.5),
         );
         painter.extend(shapes);
-        if let Some(name) = lane.seal(&self.song) {
-            painter.text(
-                egui::pos2(seam - 5.0, right.bottom() - 6.0),
-                egui::Align2::RIGHT_BOTTOM,
-                &name,
-                egui::FontId::monospace(11.0),
-                alpha.edge.color,
-            );
-        }
     }
 
     /// The LOOM: the two sends leaving the channel's OUT for their
