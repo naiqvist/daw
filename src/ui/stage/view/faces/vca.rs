@@ -24,7 +24,7 @@ use crate::ui::chrome;
 
 /// One control's row.
 /// @tune 10..24 px
-const ROW_H: f32 = 14.0;
+pub(super) const ROW_H: f32 = 17.0;
 /// The share of the glass the meter takes.
 /// @tune 0.25..0.7
 const METER_SHARE: f32 = 0.42;
@@ -324,8 +324,11 @@ pub(super) fn draw(face: &Face<'_>) {
     // ---- The key: what the sidechain filter took off. ----------------
     chrome::panel_frame_variant(&mut shapes, lay.key, Weight::Hair, edge, 3);
     painter.extend(shapes);
-    let label = |at: egui::Pos2, align: egui::Align2, text: String, ink| {
-        painter.text(at, align, text, font.clone(), ink);
+    // Every word goes through the ledger: it measures where each one
+    // lands and refuses, in a debug build, to let two of them crowd.
+    let mut words = tool::Ledger::new(painter, font.clone(), "VCA");
+    let mut label = |at: egui::Pos2, align: egui::Align2, text: String, ink: egui::Color32| {
+        words.text(at, align, text, ink);
     };
     // Both key rows are placed by one rule, off the type's own height:
     // the word and the bar it labels share a centre, and the pair is
@@ -468,6 +471,8 @@ pub(super) fn draw(face: &Face<'_>) {
             ink,
         );
     }
+
+    words.finish();
 
     face.mark(&lay);
 }

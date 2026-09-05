@@ -493,6 +493,95 @@ pub fn norm(value: f32, min: f32, max: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    /// The ledger is only worth trusting if it FAILS when it should, so
+    /// this drives it both ways with the real font at the real size.
+    #[test]
+    fn the_ledger_reports_words_that_crowd_and_passes_words_that_do_not() {
+        let ctx = egui::Context::default();
+        // The pass's texture deltas have to be taken off it, or dropping
+        // the output panics. Nothing here draws to a screen; the font
+        // atlas is wanted only so the words measure truthfully.
+        let mut output = ctx.run_ui(Default::default(), |ctx| {
+            let painter = ctx.layer_painter(egui::LayerId::debug());
+            let font = egui::FontId::monospace(design::px(design::type_scale::MICRO));
+            let ink = egui::Color32::WHITE;
+            let box_h = painter
+                .layout_no_wrap("M".to_owned(), font.clone(), ink)
+                .size()
+                .y;
+
+            // Two words in the same place: the plainest collision there
+            // is, and the one a card produces when a value grows.
+            let mut ledger = Ledger::new(&painter, font.clone(), "TEST");
+            ledger.text(egui::pos2(50.0, 50.0), egui::Align2::LEFT_TOP, "RATIO", ink);
+            ledger.text(egui::pos2(50.0, 50.0), egui::Align2::LEFT_TOP, "4:1", ink);
+            assert!(ledger.collision().is_some(), "a word on a word passed");
+
+            // Side by side with less than the air they owe.
+            let mut ledger = Ledger::new(&painter, font.clone(), "TEST");
+            let w = painter
+                .layout_no_wrap("RATIO".to_owned(), font.clone(), ink)
+                .size()
+                .x;
+            ledger.text(egui::pos2(50.0, 50.0), egui::Align2::LEFT_TOP, "RATIO", ink);
+            ledger.text(
+                egui::pos2(50.0 + w + AIR * 0.5, 50.0),
+                egui::Align2::LEFT_TOP,
+                "4:1",
+                ink,
+            );
+            assert!(
+                ledger.collision().is_some(),
+                "two words a pixel apart passed"
+            );
+
+            // The same pair with their air: allowed.
+            let mut ledger = Ledger::new(&painter, font.clone(), "TEST");
+            ledger.text(egui::pos2(50.0, 50.0), egui::Align2::LEFT_TOP, "RATIO", ink);
+            ledger.text(
+                egui::pos2(50.0 + w + AIR + 1.0, 50.0),
+                egui::Align2::LEFT_TOP,
+                "4:1",
+                ink,
+            );
+            assert!(ledger.collision().is_none(), "two spaced words failed");
+
+            // Stacked rows whose BOXES nearly touch are fine: the box is
+            // ascent, descent and leading, so the ink is well clear.
+            // This is the case the first rule got wrong.
+            let mut ledger = Ledger::new(&painter, font.clone(), "TEST");
+            ledger.text(egui::pos2(50.0, 50.0), egui::Align2::LEFT_TOP, "HYST", ink);
+            ledger.text(
+                egui::pos2(50.0, 50.0 + box_h + 1.0),
+                egui::Align2::LEFT_TOP,
+                "RATIO",
+                ink,
+            );
+            assert!(
+                ledger.collision().is_none(),
+                "two rows one pixel apart were called a collision"
+            );
+
+            // Stacked rows that genuinely overlap are not.
+            let mut ledger = Ledger::new(&painter, font.clone(), "TEST");
+            ledger.text(egui::pos2(50.0, 50.0), egui::Align2::LEFT_TOP, "HYST", ink);
+            ledger.text(
+                egui::pos2(50.0, 50.0 + box_h * 0.5),
+                egui::Align2::LEFT_TOP,
+                "RATIO",
+                ink,
+            );
+            assert!(ledger.collision().is_some(), "overlapping rows passed");
+
+            // An empty word is not a word, and cannot collide with one.
+            let mut ledger = Ledger::new(&painter, font.clone(), "TEST");
+            ledger.text(egui::pos2(50.0, 50.0), egui::Align2::LEFT_TOP, "", ink);
+            ledger.text(egui::pos2(50.0, 50.0), egui::Align2::LEFT_TOP, "MIX", ink);
+            assert!(ledger.collision().is_none(), "an empty word collided");
+        });
+        output.textures_delta.clear();
+    }
+
     use super::*;
 
     #[test]
@@ -613,5 +702,118 @@ mod tests {
         assert_ne!(MID_INK, HI_INK);
         assert!(LO_INK.r() > LO_INK.b(), "the low band is warm");
         assert!(HI_INK.b() > HI_INK.r(), "the high band is cold");
+    }
+}
+
+// ─── words, and the promise that they do not sit on each other ────────
+
+/// A face's words, written down as they are drawn.
+///
+/// Every card here is laid out by hand — figures right-aligned against
+/// bars, words in gutters, readings in headers — and a card that fits at
+/// one setting can collide at another, because the text changes with the
+/// value. `-100` is wider than `+0`, `AUTO` is wider than `600`, and a
+/// gutter sized by eye for `MIX` is too narrow for `RELEASE`.
+///
+/// Eyeballing a render catches that only for the settings that happen to
+/// be on screen. So the drawing keeps a ledger: every word is measured
+/// where it lands, and at the end of the face the ledger checks that no
+/// two of them overlap. In a debug build — which is what every shot and
+/// every run of the stage is — a collision panics and names both words
+/// and the section they are on, instead of waiting to be noticed.
+///
+/// It is not a substitute for a test; it is the thing that makes the
+/// tests it fails under worth writing. Any pose that draws the card
+/// exercises it, at that pose's real values, with the real font.
+pub(super) struct Ledger<'a> {
+    painter: &'a egui::Painter,
+    font: egui::FontId,
+    what: &'static str,
+    placed: Vec<(Rect, String)>,
+}
+
+impl<'a> Ledger<'a> {
+    pub(super) fn new(painter: &'a egui::Painter, font: egui::FontId, what: &'static str) -> Self {
+        Self {
+            painter,
+            font,
+            what,
+            placed: Vec::new(),
+        }
+    }
+
+    /// Draw a word and remember where it went.
+    pub(super) fn text(
+        &mut self,
+        at: Pos2,
+        align: egui::Align2,
+        text: impl Into<String>,
+        ink: Color32,
+    ) {
+        let text = text.into();
+        if text.is_empty() {
+            return;
+        }
+        let galley = self
+            .painter
+            .layout_no_wrap(text.clone(), self.font.clone(), ink);
+        let rect = align.anchor_size(at, galley.size());
+        self.painter.galley(rect.min, galley, ink);
+        self.placed.push((rect, text));
+    }
+}
+
+/// The air two words must leave each other ACROSS, in pixels.
+///
+/// Not zero. Words that merely fail to overlap still read as one run —
+/// "180" hard against "MID/HI" is a collision to the eye whatever the
+/// rectangles say — and at this size a couple of pixels is the
+/// difference between a figure and a word that happens to start with a
+/// digit.
+pub(super) const AIR: f32 = 2.5;
+
+/// The air they must leave each other DOWN.
+///
+/// Much less, and for a reason: a galley's width is the glyphs' own
+/// advance, so two words side by side are as close as they look. Its
+/// HEIGHT is ascent, descent and leading — a sixteen-pixel box around
+/// an eleven-pixel glyph — so two rows whose boxes nearly touch still
+/// have five clear pixels between the ink. Demanding the same air both
+/// ways rejects rows that read perfectly well, which is how a rule
+/// stops being believed.
+pub(super) const AIR_DOWN: f32 = 0.5;
+
+impl Ledger<'_> {
+    /// The first pair of words that are too close, if any two are.
+    ///
+    /// Each word is grown by half the air it owes before the test, so
+    /// two that merely touch are reported: the ledger is about how the
+    /// card READS, not about whether two rectangles happen to share a
+    /// pixel.
+    pub(super) fn collision(&self) -> Option<(&(Rect, String), &(Rect, String))> {
+        for (index, first) in self.placed.iter().enumerate() {
+            for second in &self.placed[index + 1..] {
+                let air = egui::vec2(AIR * 0.5, AIR_DOWN * 0.5);
+                if first.0.expand2(air).intersects(second.0.expand2(air)) {
+                    return Some((first, second));
+                }
+            }
+        }
+        None
+    }
+
+    /// Close the ledger. In a debug build a collision panics here,
+    /// naming both words and the card they are on.
+    pub(super) fn finish(self) {
+        if let Some(((a_rect, a), (b_rect, b))) = self.collision() {
+            // The rectangles are in the message because the words alone
+            // do not say WHICH way they crowd, and the fix is different
+            // for two rows too close and two columns too close.
+            debug_assert!(
+                false,
+                "{}: {a:?} at {a_rect:?} crowds {b:?} at {b_rect:?}",
+                self.what
+            );
+        }
     }
 }

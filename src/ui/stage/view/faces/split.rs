@@ -42,7 +42,7 @@ use crate::ui::chrome;
 
 /// One band's row of controls.
 /// @tune 10..24 px
-const ROW_H: f32 = 15.0;
+pub(super) const ROW_H: f32 = 18.0;
 /// The strip's share of the glass. It is the meter and the crossover at
 /// once, so it takes the room a picture takes.
 /// @tune 0.3..0.8
@@ -287,8 +287,11 @@ pub(super) fn draw(face: &Face<'_>) {
     painter.extend(shapes);
 
     // ---- The words and the rows. -------------------------------------
-    let label = |at: egui::Pos2, align: egui::Align2, text: String, ink| {
-        painter.text(at, align, text, font.clone(), ink);
+    // Every word goes through the ledger, which measures where it lands
+    // and refuses, in a debug build, to let two of them share a place.
+    let mut words = tool::Ledger::new(painter, font.clone(), "SPLIT");
+    let mut label = |at: egui::Pos2, align: egui::Align2, text: String, ink: egui::Color32| {
+        words.text(at, align, text, ink);
     };
     let hz_word = |hz: f32| {
         if hz >= 1000.0 {
@@ -420,14 +423,14 @@ pub(super) fn draw(face: &Face<'_>) {
         })
         .fold(0.0f32, f32::max)
         + 6.0;
-    let words = ["LOW", "MID", "HIGH"];
+    let names = ["LOW", "MID", "HIGH"];
     for i in 0..3 {
         let hue = hues[i];
         let row = lay.amount[i];
         label(
             egui::pos2(row.left() + 2.0, row.center().y),
             egui::Align2::LEFT_CENTER,
-            words[i].to_owned(),
+            names[i].to_owned(),
             hue,
         );
         // The amount, bipolar about the average it holds against: to the
@@ -501,6 +504,8 @@ pub(super) fn draw(face: &Face<'_>) {
             if gains[i] == 0.0 { edge } else { ink },
         );
     }
+
+    words.finish();
 
     face.mark(&lay);
 }

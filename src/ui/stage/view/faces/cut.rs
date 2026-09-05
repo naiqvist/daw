@@ -24,7 +24,7 @@ use crate::ui::chrome;
 
 /// One readout row on the right.
 /// @tune 9..24 px
-const ROW_H: f32 = 14.0;
+pub(super) const ROW_H: f32 = 17.0;
 /// The share of the glass the character plot takes.
 /// @tune 0.4..0.8
 const PLOT_SHARE: f32 = 0.56;
@@ -267,8 +267,11 @@ pub(super) fn draw(face: &Face<'_>) {
     painter.extend(curve_shapes);
 
     // ---- Everything else is a line of text. --------------------------
-    let label = |at: egui::Pos2, align: egui::Align2, text: String, ink| {
-        painter.text(at, align, text, font.clone(), ink);
+    // Every word goes through the ledger: it measures where each one
+    // lands and refuses, in a debug build, to let two of them crowd.
+    let mut words = tool::Ledger::new(painter, font.clone(), "CUT");
+    let mut label = |at: egui::Pos2, align: egui::Align2, text: String, ink: egui::Color32| {
+        words.text(at, align, text, ink);
     };
     label(
         egui::pos2(lay.plot.left() + 6.0, lay.plot.top() + 2.0),
@@ -422,6 +425,8 @@ pub(super) fn draw(face: &Face<'_>) {
         line(painter, y, word, said, tone);
         y += ch + 1.0;
     }
+
+    words.finish();
 
     face.mark(&lay);
 }

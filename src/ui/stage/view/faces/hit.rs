@@ -20,7 +20,7 @@ use crate::ui::chrome;
 
 /// One lever's row.
 /// @tune 10..28 px
-const ROW_H: f32 = 16.0;
+pub(super) const ROW_H: f32 = 18.0;
 /// The share of the glass the note takes. It is the device.
 /// @tune 0.4..0.8
 const NOTE_SHARE: f32 = 0.58;
@@ -233,8 +233,11 @@ pub(super) fn draw(face: &Face<'_>) {
     painter.extend(shapes);
 
     // ---- The three levers, bipolar about a bright centre. ------------
-    let label = |at: egui::Pos2, align: egui::Align2, text: String, ink| {
-        painter.text(at, align, text, font.clone(), ink);
+    // Every word goes through the ledger: it measures where each one
+    // lands and refuses, in a debug build, to let two of them crowd.
+    let mut words = tool::Ledger::new(painter, font.clone(), "HIT");
+    let mut label = |at: egui::Pos2, align: egui::Align2, text: String, ink: egui::Color32| {
+        words.text(at, align, text, ink);
     };
     // The value column is as wide as the widest figure that can stand
     // in it, measured, not guessed — a signed dB reading with its unit.
@@ -439,6 +442,8 @@ pub(super) fn draw(face: &Face<'_>) {
         format!("{:.0}ms", crate::tune!(SPAN_MS)),
         edge,
     );
+
+    words.finish();
 
     face.mark(&lay);
 }

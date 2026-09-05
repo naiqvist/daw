@@ -21,7 +21,7 @@ use crate::ui::chrome;
 
 /// One band's row in the right-hand column.
 /// @tune 10..30 px
-const ROW_H: f32 = 17.0;
+pub(super) const ROW_H: f32 = 17.0;
 /// The gap between the two columns.
 /// @tune 2..24 px
 const COLUMN_GAP: f32 = 7.0;
@@ -394,8 +394,11 @@ pub(super) fn draw(face: &Face<'_>) {
     painter.extend(shapes);
 
     // ---- The labels. One size, measured before they are drawn. -------
-    let label = |at: egui::Pos2, align: egui::Align2, text: String, ink| {
-        painter.text(at, align, text, font.clone(), ink);
+    // Every word goes through the ledger: it measures where each one
+    // lands and refuses, in a debug build, to let two of them crowd.
+    let mut words = tool::Ledger::new(painter, font.clone(), "TONE");
+    let mut label = |at: egui::Pos2, align: egui::Align2, text: String, ink: egui::Color32| {
+        words.text(at, align, text, ink);
     };
     const PAD_X: f32 = 8.0;
     label(
@@ -497,6 +500,8 @@ pub(super) fn draw(face: &Face<'_>) {
             edge
         },
     );
+
+    words.finish();
 
     face.mark(&lay);
 }

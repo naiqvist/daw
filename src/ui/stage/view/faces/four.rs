@@ -24,7 +24,7 @@ use crate::ui::chrome;
 
 /// One control's row inside a band column.
 /// @tune 10..24 px
-const ROW_H: f32 = 14.0;
+pub(super) const ROW_H: f32 = 17.0;
 /// Between two band columns. Wide enough that one column's figure and
 /// the next column's name cannot be read as one line.
 const COLUMN_GAP: f32 = 13.0;
@@ -301,8 +301,11 @@ pub(super) fn draw(face: &Face<'_>) {
     painter.extend(shapes);
 
     // ---- The four columns. -------------------------------------------
-    let label = |at: egui::Pos2, align: egui::Align2, text: String, ink| {
-        painter.text(at, align, text, font.clone(), ink);
+    // Every word goes through the ledger: it measures where each one
+    // lands and refuses, in a debug build, to let two of them crowd.
+    let mut words = tool::Ledger::new(painter, font.clone(), "FOUR");
+    let mut label = |at: egui::Pos2, align: egui::Align2, text: String, ink: egui::Color32| {
+        words.text(at, align, text, ink);
     };
     let hz_word = |hz: f32| {
         if hz >= 1000.0 {
@@ -311,7 +314,7 @@ pub(super) fn draw(face: &Face<'_>) {
             format!("{hz:.0}")
         }
     };
-    let words = ["LOW", "LMF", "HMF", "HIGH"];
+    let names = ["LOW", "LMF", "HMF", "HIGH"];
     for (i, band) in shape.bands.iter().enumerate() {
         let hue = hues[i];
         let column = lay.cells[i];
@@ -335,7 +338,7 @@ pub(super) fn draw(face: &Face<'_>) {
         label(
             egui::pos2(column[0].left() + 2.0, column[0].center().y),
             egui::Align2::LEFT_CENTER,
-            words[i].to_owned(),
+            names[i].to_owned(),
             hue,
         );
         label(
@@ -491,6 +494,8 @@ pub(super) fn draw(face: &Face<'_>) {
             if quiet { edge } else { alpha.live.color },
         );
     }
+
+    words.finish();
 
     face.mark(&lay);
 }

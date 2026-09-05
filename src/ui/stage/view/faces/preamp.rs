@@ -214,7 +214,10 @@ pub(super) fn draw(face: &Face<'_>) {
     let place_of = |value: f32| ((value - floor_db) / (head_db - floor_db)).clamp(0.0, 1.0);
     let scale_w = 30.0f32.min(lay.meter.width() * 0.38);
     let column = egui::Rect::from_min_max(
-        egui::pos2(lay.meter.left() + 7.0, lay.meter.top() + 22.0),
+        // Below the header, with room for the scale's top figure: that
+        // figure is CENTRED on the column's first line, so half of it
+        // stands above the line and would sit in the header's lap.
+        egui::pos2(lay.meter.left() + 7.0, lay.meter.top() + 32.0),
         egui::pos2(lay.meter.right() - scale_w - 4.0, lay.meter.bottom() - 7.0),
     );
     // The cells. Straight, stacked, and the ones above unity in alert,
@@ -572,8 +575,11 @@ pub(super) fn draw(face: &Face<'_>) {
 
     // ---- The micro labels. Every one of them a measured thing. ------
     let button_ink = |on: bool| if on { alpha.ground.color } else { ink };
-    let label = |at: egui::Pos2, align: egui::Align2, text: String, ink| {
-        painter.text(at, align, text, micro.clone(), ink);
+    // Every word goes through the ledger: it measures where each one
+    // lands and refuses, in a debug build, to let two of them crowd.
+    let mut words = tool::Ledger::new(painter, micro.clone(), "PREAMP");
+    let mut label = |at: egui::Pos2, align: egui::Align2, text: String, ink: egui::Color32| {
+        words.text(at, align, text, ink);
     };
     // How wide a word is, in this one type size.
     let span = |text: &str| {
@@ -761,6 +767,8 @@ pub(super) fn draw(face: &Face<'_>) {
 
     // The cursor is not a sixth row below the drawing. Four bright
     // corners sit just inside the addressed instrument itself.
+    words.finish();
+
     face.mark(&lay);
 }
 

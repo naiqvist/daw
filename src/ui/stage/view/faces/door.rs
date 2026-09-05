@@ -22,7 +22,7 @@ use crate::ui::chrome;
 
 /// One numeric row in the right-hand column.
 /// @tune 9..24 px
-const ROW_H: f32 = 13.0;
+pub(super) const ROW_H: f32 = 17.0;
 /// The room a row keeps for its word.
 /// @tune 16..64 px
 const GUTTER: f32 = 34.0;
@@ -395,8 +395,11 @@ pub(super) fn draw(face: &Face<'_>) {
     painter.extend(shapes);
 
     // ---- The figures. One size, one gutter. --------------------------
-    let label = |at: egui::Pos2, align: egui::Align2, text: String, ink| {
-        painter.text(at, align, text, font.clone(), ink);
+    // Every word goes through the ledger: it measures where each one
+    // lands and refuses, in a debug build, to let two of them crowd.
+    let mut words = tool::Ledger::new(painter, font.clone(), "DOOR");
+    let mut label = |at: egui::Pos2, align: egui::Align2, text: String, ink: egui::Color32| {
+        words.text(at, align, text, ink);
     };
     const PAD_X: f32 = 8.0;
     // The gutter is as wide as the longest word that stands in it, plus
@@ -576,6 +579,8 @@ pub(super) fn draw(face: &Face<'_>) {
             if asleep { edge } else { ink },
         );
     }
+
+    words.finish();
 
     face.mark(&lay);
 }
