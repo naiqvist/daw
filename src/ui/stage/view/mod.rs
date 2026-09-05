@@ -15,6 +15,7 @@ mod band;
 mod browser;
 mod callouts;
 mod chassis;
+mod faces;
 mod heads;
 mod help;
 mod input;
@@ -26,11 +27,16 @@ mod room;
 mod sample;
 mod song;
 mod status;
+mod strip;
 mod tray;
 mod utility;
 
 use super::key::{Key, Mods};
 use super::*;
+use crate::design::codex::Sign;
+use crate::design::kit::{self, Weight};
+use crate::design::motion::{self, Phase};
+use crate::design::{self, block, circuit};
 use eframe::egui;
 
 /// An axis nothing is drawn along yet can hold everything: no offset
@@ -208,7 +214,7 @@ impl Stage {
         self.follow_cursor(
             heads::capacity(field.width()),
             lattice::capacity(field),
-            band::capacity(layout.tray),
+            Self::chain_capacity(layout.tray),
         );
 
         let dt = ui.ctx().input(|input| input.stable_dt);
@@ -279,7 +285,11 @@ impl Stage {
         // One detail region, and the band and the sequencer are two
         // things to put in it. The band wins while it is showing.
         let anchor = if self.chain.is_some() {
-            self.draw_band(ui.painter(), layout.tray);
+            let phase = Phase::of(
+                self.transport.motion().is_rolling(),
+                self.transport.beat_phase(),
+            );
+            self.draw_chain(ui.painter(), layout.tray, phase);
             None
         } else {
             self.draw_tray(ui, layout.tray)

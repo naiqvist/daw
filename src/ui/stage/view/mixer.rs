@@ -17,7 +17,8 @@ use super::heads;
 use super::palette;
 use crate::PROFONT;
 use crate::ui::stage::mixer::{
-    CELLS, Channel, cell_coverage, channels, gain_label, pan_label, place_of_amp, unity_place,
+    CELLS, Channel, SWITCH_H, cell_coverage, channels, gain_label, pan_label, place_of_amp,
+    unity_place,
 };
 use eframe::egui;
 
@@ -39,6 +40,37 @@ const SEND_H: f32 = 14.0;
 const INSET: f32 = 8.0;
 const TYPE_PX: f32 = 12.0;
 const GAP: f32 = 2.0;
+
+/// Where a send's rail runs inside a strip.
+///
+/// The mixer draws the cable that leaves it, and the cable must land on
+/// the rail rather than near it — so the one piece of arithmetic that
+/// places the rail is shared rather than repeated.
+pub fn send_y(strip: egui::Rect, gap: f32, sends: usize, switches: bool, slot: usize) -> f32 {
+    let inner = strip.shrink(gap.max(3.0));
+    let pan_top = inner.max.y - PAN_H;
+    let switch_h = if switches { SWITCH_H + gap } else { 0.0 };
+    let sends_top = pan_top - switch_h - (sends as f32 * SEND_H + gap);
+    sends_top + slot as f32 * SEND_H + SEND_H * 0.5
+}
+
+/// Where the send's mark stands on that rail, across the strip.
+pub fn send_x(strip: egui::Rect, gap: f32, send: f32) -> f32 {
+    let inner = strip.shrink(gap.max(3.0));
+    let left = inner.min.x + 16.0;
+    let right = inner.max.x - 4.0;
+    left + send.clamp(0.0, 1.0) * (right - left)
+}
+
+/// Where a channel strip hangs: everything from beneath the head down to
+/// the foot of the field. The column IS the track's address, so the strip
+/// takes exactly the head's width and never computes one of its own.
+pub fn strip_beneath(head: egui::Rect, bottom: f32, gap: f32) -> egui::Rect {
+    egui::Rect::from_min_max(
+        egui::pos2(head.min.x, head.max.y + gap),
+        egui::pos2(head.max.x, bottom),
+    )
+}
 
 impl super::super::Stage {
     pub(super) fn draw_mixer(&self, painter: &egui::Painter, field: egui::Rect) {
