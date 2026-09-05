@@ -60,7 +60,7 @@ fn to_pos(p: (f64, f64)) -> egui::Pos2 {
 pub enum Key {
     /// The leftmost: its two left corners cut.
     Left,
-    /// In the run: top-left and bottom-right, the console's own key.
+    /// In the run: square. Only the ends of a row are keyed.
     Centre,
     /// The rightmost: its two right corners cut.
     Right,
@@ -79,7 +79,7 @@ pub fn keyed(painter: &egui::Painter, rect: egui::Rect, focused: bool, key: Key)
         .min(rect.height() as f64 / 3.0);
     let corners = match key {
         Key::Left => chamfer::Corners::left(cut),
-        Key::Centre => chamfer::Corners::diagonal(cut),
+        Key::Centre => chamfer::Corners::default(),
         Key::Right => chamfer::Corners::right(cut),
         Key::Both => chamfer::Corners::all(cut),
     };
