@@ -3834,10 +3834,10 @@ fn carved_chord(chord: &str) -> String {
         chord = rest;
     }
     words.push(match chord {
-        "←" => "LEFT",
-        "→" => "RIGHT",
-        "↑" => "UP",
-        "↓" => "DOWN",
+        "←" | "⏴" => "LEFT",
+        "→" | "⏵" => "RIGHT",
+        "↑" | "⏶" => "UP",
+        "↓" | "⏷" => "DOWN",
         other => other,
     });
     words.join(" ").to_ascii_uppercase()

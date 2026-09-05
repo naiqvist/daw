@@ -7,20 +7,22 @@
 //! before is on `mvp-port` at 2ee4b64, the worked example of the contract
 //! in `notes/20260905-ui-seam-contract.md`.
 //!
-//! Not yet on this glass, and so not yet reachable: the sequencer (a
-//! shared toolkit widget that is shown to be driven), the command palette
-//! (never summoned here, so it never owns the keys), and every surface
-//! the old view drew.
+//! Every surface the inventory names is on this glass now, drawn in the
+//! console's chassis and palette; the sequencer and the command palette
+//! are the shared widgets, lifted through the palette and pumped here.
 
 mod band;
 mod browser;
+mod callouts;
 mod chassis;
 mod heads;
+mod help;
 mod input;
 mod inspector;
 mod lattice;
 mod mixer;
 mod palette;
+mod room;
 mod sample;
 mod song;
 mod status;
@@ -120,6 +122,22 @@ impl Stage {
         self.update_utility(ui.ctx());
         let utility_open = self.utility.is_open();
 
+        // `:` summons the palette. Checked before anything else reads the
+        // keyboard, and not while it is already open, so a held key
+        // cannot reset what has been typed into it.
+        if !utility_open
+            && !self.palette.is_open()
+            && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Colon))
+        {
+            self.palette.open();
+        }
+        if !utility_open && let Some(intent) = self.pump_palette(ui.ctx()) {
+            let _ = self.apply(intent);
+        }
+        let utility_open = self.utility.is_open();
+        // While the palette is open it owns the keyboard OUTRIGHT.
+        let palette_open = self.palette.is_open() || utility_open;
+
         self.hold_browser_for_exit();
 
         let collect_text = self.collects_text();
@@ -142,7 +160,7 @@ impl Stage {
                     )
                 })
             });
-        let inputs = if utility_open {
+        let inputs = if palette_open {
             Vec::new()
         } else {
             ui.input_mut(|input| {
@@ -202,6 +220,31 @@ impl Stage {
         self.draw(ui);
     }
 
+    /// Pump the command palette while it is open; a chosen command comes
+    /// back as the intent it names. The palette is stock chrome, so it
+    /// reads the runtime theme rather than the console's palette.
+    fn pump_palette(&mut self, ctx: &egui::Context) -> Option<StageIntent> {
+        if !self.palette.is_open() {
+            return None;
+        }
+        let scope = self.scope_context();
+        let entries: Vec<&keymap::Entry> = keymap::palette_entries()
+            .iter()
+            .filter(|entry| entry.scope == scope)
+            .collect();
+        let commands: Vec<crate::ui::palette::Command> =
+            entries.iter().map(|entry| entry.command).collect();
+        let theme = crate::ui::theme::Theme::dark();
+        let choice = self.palette.show(ctx, &theme, &commands, &[])?;
+        let crate::ui::palette::Choice::Command(id) = choice else {
+            return None;
+        };
+        entries
+            .iter()
+            .find(|entry| entry.command.id == id)
+            .map(|entry| entry.intent)
+    }
+
     /// The ground, and on it what has been drawn so far.
     fn draw(&mut self, ui: &mut egui::Ui) {
         crate::ui::sequencer::set_projection(Some(palette::lift));
@@ -231,14 +274,22 @@ impl Stage {
         // Over the field: the browser is a window above the work, not a
         // division of it.
         self.draw_browser(painter, layout.field);
+        self.draw_help(painter, layout.field);
         self.draw_status(painter, layout.status);
         // One detail region, and the band and the sequencer are two
         // things to put in it. The band wins while it is showing.
-        if self.chain.is_some() {
+        let anchor = if self.chain.is_some() {
             self.draw_band(ui.painter(), layout.tray);
+            None
         } else {
-            self.draw_tray(ui, layout.tray);
-        }
+            self.draw_tray(ui, layout.tray)
+        };
+        // Over everything in the field: a callout is about one thing, and
+        // a callout drawn under anything is a callout pointing through it.
+        self.draw_callouts(ui.painter(), whole, anchor);
+        // Last of all, because the machine room is not part of the musical
+        // surface: it stands in front of the whole of it.
+        self.draw_room(ui.painter(), whole);
         let mut inspector = inspector();
         if inspector.open {
             let panel = egui::Rect::from_min_max(

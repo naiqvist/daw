@@ -39,7 +39,9 @@ pub(super) fn tray_h() -> f32 {
 
 impl super::super::Stage {
     /// Draw the tray, and let the sequencer act on the keys it owns.
-    pub(super) fn draw_tray(&mut self, ui: &mut egui::Ui, tray: egui::Rect) {
+    /// Draw the tray; report where the sequencer's cursor cell is, for a
+    /// callout to point at.
+    pub(super) fn draw_tray(&mut self, ui: &mut egui::Ui, tray: egui::Rect) -> Option<egui::Rect> {
         let c = palette::colours();
         let font = egui::FontId::new(TYPE_PX, egui::FontFamily::Name(PROFONT.into()));
         let left = tray.min.x + crate::tune!(MARGIN) + crate::tune!(GUTTER);
@@ -69,10 +71,10 @@ impl super::super::Stage {
                 font,
                 c.dim,
             );
-            return;
+            return None;
         };
         let Some(pattern) = self.song.pattern(shown.pattern) else {
-            return;
+            return None;
         };
         // The label row: which clip, how long, which lens.
         let length = sequencer::pattern_length(&self.song, shown.pattern);
@@ -145,6 +147,7 @@ impl super::super::Stage {
             self.polarity,
             playhead,
         );
+        let anchor = outcome.cursor_rect;
         if focused {
             let edited = !outcome.intents.is_empty();
             self.apply_sequence(shown.pattern, &outcome.intents);
@@ -180,5 +183,6 @@ impl super::super::Stage {
                 let _ = self.apply(StageIntent::Enter);
             }
         }
+        anchor
     }
 }
