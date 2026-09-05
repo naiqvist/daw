@@ -355,7 +355,7 @@ pub(super) fn draw(face: &Face<'_>) {
     label(
         egui::pos2(dial_glass.left() + 6.0, dial_glass.top() + 3.0),
         egui::Align2::LEFT_TOP,
-        "GAIN REDUCTION".to_owned(),
+        "GR".to_owned(),
         edge,
     );
     label(
