@@ -105,13 +105,15 @@ pub enum HostRequest {
     RestartAudio(AudioSettings),
 }
 
+/// One remembered project, inspected on disk: the view lays these out
+/// on the boot plate, so the facts are its to read.
 #[derive(Clone, Debug)]
-struct Recent {
-    path: PathBuf,
-    title: String,
-    folder: String,
-    detail: String,
-    missing: bool,
+pub(in crate::ui::stage) struct Recent {
+    pub(in crate::ui::stage) path: PathBuf,
+    pub(in crate::ui::stage) title: String,
+    pub(in crate::ui::stage) folder: String,
+    pub(in crate::ui::stage) detail: String,
+    pub(in crate::ui::stage) missing: bool,
 }
 
 impl Recent {
