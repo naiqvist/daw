@@ -22,6 +22,10 @@ struct Params {
     vignette: f32,
     grain: f32,
     bleed: f32,
+    alarm: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 };
 
 @group(0) @binding(0) var<uniform> p: Params;
@@ -86,6 +90,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // settles toward the cool ground instead of reading as a dark filter.
     let v = p.vignette * d * d;
     col *= vec3<f32>(1.0 - v * 1.15, 1.0 - v, 1.0 - v * 0.85);
+    // The alarm: while an xrun's flash is held, the glass edge leans
+    // toward the fault hue — the whole screen says what the strip says.
+    let edge = smoothstep(0.25, 0.75, d) * p.alarm;
+    col = mix(col, vec3<f32>(0.42, 0.14, 0.26), edge * 0.35);
 
     // Fixed per pixel, not per frame: static grain reads as tube texture,
     // animated grain reads as noise and forces a repaint every frame.

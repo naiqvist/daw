@@ -43,16 +43,20 @@ const GAP: f32 = 18.0;
 /// @tune 40..300 px
 const TRACE_W: f32 = 120.0;
 
-/// The wall's clock, hh:mm:ss, from the system.
-fn wall_clock() -> String {
+/// The wall's clock, hh:mm:ss, local: the system's seconds and the
+/// machine's offset, read once at startup.
+fn wall_clock(tz_offset: i64) -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    // Local time without a timezone crate: read the offset from `date`'s
-    // convention is not worth a dependency; the clock is UTC and says so.
-    let (h, m, s) = ((secs / 3600) % 24, (secs / 60) % 60, secs % 60);
-    format!("{h:02}:{m:02}:{s:02}z")
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+        + tz_offset;
+    let (h, m, s) = (
+        (secs / 3600).rem_euclid(24),
+        (secs / 60).rem_euclid(60),
+        secs.rem_euclid(60),
+    );
+    format!("{h:02}:{m:02}:{s:02}")
 }
 
 /// The width a row of readings takes, as `row` lays it out.
@@ -221,15 +225,18 @@ impl super::super::Stage {
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "untitled".to_owned());
-        let doc = [reading(
-            "song",
-            if self.dirty {
-                format!("{name} *")
-            } else {
-                name
-            },
-            if self.dirty { Tone::Alert } else { Tone::Fact },
-        )];
+        let doc = [
+            reading("daw", env!("CARGO_PKG_VERSION"), Tone::Absent),
+            reading(
+                "song",
+                if self.dirty {
+                    format!("{name} *")
+                } else {
+                    name
+                },
+                if self.dirty { Tone::Alert } else { Tone::Fact },
+            ),
+        ];
         row(painter, 0.0, y, &doc, Some(strip.max.x - PAD));
         let _ = c;
     }
@@ -247,6 +254,7 @@ impl super::super::Stage {
             Motion::Recording => reading("", "RECORDING", Tone::Alert),
         };
         let rolling = self.transport.motion().is_rolling();
+        let last_chord = super::telemetry().last_chord.clone();
         let left = [
             reading("bar", place.readout(), Tone::Fact),
             reading("bpm", format!("{bpm:.1}"), Tone::Fact),
@@ -270,13 +278,18 @@ impl super::super::Stage {
             painter.rect_filled(cell, 0.0, if on { c.nominal } else { c.rule });
             bx += beat + 3.0;
         }
-        // A refused keystroke, named where it happened, for the frame it
-        // happened in: under key repeat it reads as a held mark.
+        // The last chord the codebook bound, until the next one; and a
+        // refused keystroke named for the frame it was refused in, so
+        // under key repeat it reads as a held mark.
+        let mut kx = bx + GAP;
+        if let Some(chord) = last_chord {
+            kx = row(painter, kx, y, &[reading("key", chord, Tone::Fact)], None) + GAP;
+        }
         if let Some(refusal) = &self.refusal {
             let word = format!("{:?}", refusal.reason).to_ascii_lowercase();
             row(
                 painter,
-                bx + GAP,
+                kx,
                 y,
                 &[reading("refused", word, Tone::Alert)],
                 None,
@@ -341,12 +354,12 @@ impl super::super::Stage {
         }
         // The session's clock and the wall's, and the mix's trace: the
         // last seconds of the master meter, one sample a frame.
-        let (uptime, trace): (f32, Vec<f32>) = {
+        let (uptime, trace, tz): (f32, Vec<f32>, i64) = {
             let t = super::telemetry();
-            (t.uptime, t.trace.iter().copied().collect())
+            (t.uptime, t.trace.iter().copied().collect(), t.tz_offset)
         };
         right.push(reading("up", super::telemetry::stamp(uptime), Tone::Fact));
-        right.push(reading("", wall_clock(), Tone::Fact));
+        right.push(reading("", wall_clock(tz), Tone::Fact));
         let end = row(painter, 0.0, y, &right, Some(strip.max.x - PAD));
         let c = palette::colours();
         let w = crate::tune!(TRACE_W);

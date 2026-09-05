@@ -49,14 +49,46 @@ struct Was {
     notice: Option<String>,
 }
 
-#[derive(Default)]
 pub struct Telemetry {
     /// Seconds since the view first drew.
     pub uptime: f32,
+    /// The machine's offset from UTC in seconds, read once from `date`
+    /// when the view first draws — one process at startup, never again.
+    pub tz_offset: i64,
+    /// The last chord the codebook bound, until the next replaces it.
+    pub last_chord: Option<String>,
     pub lines: VecDeque<Line>,
     pub trace: VecDeque<f32>,
     was: Was,
     primed: bool,
+}
+
+impl Default for Telemetry {
+    fn default() -> Self {
+        let tz_offset = std::process::Command::new("date")
+            .arg("+%z")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| {
+                let s = s.trim();
+                let sign = if s.starts_with('-') { -1 } else { 1 };
+                let digits: String = s.chars().filter(|c| c.is_ascii_digit()).collect();
+                let hh: i64 = digits.get(0..2)?.parse().ok()?;
+                let mm: i64 = digits.get(2..4)?.parse().ok()?;
+                Some(sign * (hh * 3600 + mm * 60))
+            })
+            .unwrap_or(0);
+        Self {
+            uptime: 0.0,
+            tz_offset,
+            last_chord: None,
+            lines: VecDeque::new(),
+            trace: VecDeque::new(),
+            was: Was::default(),
+            primed: false,
+        }
+    }
 }
 
 impl Telemetry {
@@ -78,7 +110,9 @@ impl Telemetry {
         self.uptime += dt.clamp(0.0, 0.25);
         for input in chords {
             if let StageInput::Chord(mods, key) = input {
-                self.push("KEY", carve(*mods, *key));
+                let chord = carve(*mods, *key);
+                self.last_chord = Some(chord.clone());
+                self.push("KEY", chord);
             }
         }
         let now = now.0;

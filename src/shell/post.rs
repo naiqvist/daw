@@ -14,6 +14,22 @@
 
 const BLOOM_DIV: u32 = 4;
 
+/// The alarm the view raised this frame, as thousandths, for the pass to
+/// read: the one thing about the glass a surface decides.
+static ALARM: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Raise (or lower) the alarm: `0.0` calm, `1.0` an xrun just happened.
+pub fn set_alarm(level: f32) {
+    ALARM.store(
+        (level.clamp(0.0, 1.0) * 1000.0) as u32,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+fn alarm() -> f32 {
+    ALARM.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0
+}
+
 /// How much of the bright pass is added back.
 /// @tune 0..1
 const BLOOM: f32 = 0.30;
@@ -46,6 +62,10 @@ pub struct Params {
     pub grain: f32,
     /// How much a bright pixel spills sideways, as a tube's beam does.
     pub bleed: f32,
+    /// The alarm: how far the vignette leans toward the fault hue. Set by
+    /// the view while vitals holds an xrun's flash; zero otherwise.
+    pub alarm: f32,
+    pub _pad: [f32; 3],
 }
 
 impl Default for Params {
@@ -58,6 +78,8 @@ impl Default for Params {
             vignette: VIGNETTE,
             grain: GRAIN,
             bleed: BLEED,
+            alarm: 0.0,
+            _pad: [0.0; 3],
         }
     }
 }
@@ -301,6 +323,7 @@ impl Post {
         self.params.vignette = crate::tune!(VIGNETTE);
         self.params.grain = crate::tune!(GRAIN);
         self.params.bleed = crate::tune!(BLEED);
+        self.params.alarm = alarm();
         queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&self.params));
         let Some(b) = &self.bound else {
             return;
@@ -418,12 +441,13 @@ mod tests {
             "vignette",
             "grain",
             "bleed",
+            "alarm",
         ] {
             assert!(
                 source.contains(&format!("{field}:")),
                 "shader lacks {field}"
             );
         }
-        assert_eq!(std::mem::size_of::<super::Params>(), 32);
+        assert_eq!(std::mem::size_of::<super::Params>(), 48);
     }
 }

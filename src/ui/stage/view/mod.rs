@@ -240,6 +240,9 @@ impl Stage {
 
         let dt = ui.ctx().input(|input| input.stable_dt);
         self.tick_clock(dt);
+        // The alarm on the glass: an xrun's flash, for as long as vitals
+        // holds it.
+        crate::shell::post::set_alarm(if self.vitals.flashing() { 1.0 } else { 0.0 });
         // The log and the trace: what changed this frame, and the mix.
         {
             let master = self.meters.master().level;
