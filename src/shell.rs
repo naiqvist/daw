@@ -504,17 +504,21 @@ impl<A: Host> Shell<A> {
         let physical = window.inner_size();
         let size = [physical.width.max(1), physical.height.max(1)];
         let caps = surface.get_capabilities(&adapter);
-        // sRGB where it is offered. The offscreen target takes the SAME
-        // format, so sampling it decodes to linear and writing back
-        // re-encodes — which is what makes the bypass exact rather than
-        // approximately exact.
-        let format = caps
-            .formats
-            .iter()
-            .copied()
-            .find(wgpu::TextureFormat::is_srgb)
-            .or_else(|| caps.formats.first().copied())
-            .ok_or("the surface offers no format")?;
+        // An 8-bit GAMMA-SPACE format, deliberately, and the offscreen
+        // target takes the same one. egui renders in gamma space; an sRGB
+        // surface would decode the scene to linear light on the way into
+        // the glass, and the bloom, the scanline and the grain — tuned on
+        // gamma values, as the cockpit's are — would come back re-encoded
+        // eight times too strong. Not merely "non-sRGB": that also matches
+        // Rgba16Float, which is linear and silently brightens everything.
+        let format = [
+            wgpu::TextureFormat::Bgra8Unorm,
+            wgpu::TextureFormat::Rgba8Unorm,
+        ]
+        .into_iter()
+        .find(|f| caps.formats.contains(f))
+        .or_else(|| caps.formats.first().copied())
+        .ok_or("the surface offers no format")?;
         let mut config = surface
             .get_default_config(&adapter, size[0], size[1])
             .ok_or("the surface is not usable with this adapter")?;
