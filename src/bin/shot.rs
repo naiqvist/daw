@@ -725,6 +725,30 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
                 backend: "JACK",
             }));
         }
+    } else if which.contains("pump") {
+        // The cam cut deep and square, so the lobe profile is plain and
+        // the follower is somewhere interesting on it.
+        use daw::devices::DeviceKind;
+        let _ = stage.song_mut().add_device(0, DeviceKind::Poly);
+        {
+            use daw::params::console::pump as p;
+            let song = stage.song_mut();
+            if let Some(device) = song
+                .section(0, daw::console::SectionKind::Pump)
+                .map(|device| device.id)
+                .and_then(|id| song.device_mut(id))
+            {
+                device.bypassed = false;
+                device.set(p::DIVISION, 2.0);
+                device.set(p::DEPTH, 80.0);
+                device.set(p::SHAPE, 25.0);
+                device.set(p::HOLD, 30.0);
+            }
+        }
+        let _ = stage.apply(StageIntent::Devices);
+        for _ in 0..9 {
+            let _ = stage.apply(StageIntent::Step(Step::Right));
+        }
     } else if which.contains("split") {
         // Three bands doing three different things: the bottom held in,
         // the top let out, the mid nudged, with the corners moved off

@@ -11,6 +11,12 @@
 //! gap moves. The card is complete, the machine turns, and it is
 //! plainly not connected to anything. The day the core lands, the gap
 //! closes and the rest of the drawing is already true.
+//!
+//! The gap is also said in words — NO CORE at the head, UNSHIPPED at
+//! the break — because a drawing that has to be interpreted to be
+//! believed is not yet honest. Every other card on the strip states its
+//! condition in a word (WIRE, IN, FLAT); this one has the most
+//! important condition of any of them and had none.
 
 use super::*;
 use crate::console::SectionParams;
@@ -28,6 +34,9 @@ struct Lay {
     depth: egui::Rect,
     shape: egui::Rect,
     hold: egui::Rect,
+    /// Where the division is READ. Its instrument is the disc; this is
+    /// only the number, and it needs a row of its own like any other.
+    div_read: egui::Rect,
     /// Where the pushrod would land if the section had a core.
     seat: egui::Pos2,
 }
@@ -43,31 +52,48 @@ impl Layout for Lay {
     }
 }
 
-fn lay(glass: egui::Rect, bay: Option<egui::Rect>) -> Lay {
-    let inner = glass.shrink2(egui::vec2(5.0, 4.0));
-    let (w, h) = (inner.width(), inner.height());
-    let cam = egui::Rect::from_center_size(
-        egui::pos2(inner.center().x, inner.top() + 0.28 * h),
-        egui::vec2((0.46 * h).min(0.62 * w), (0.46 * h).min(0.62 * w)),
+fn lay(glass: egui::Rect, _bay: Option<egui::Rect>) -> Lay {
+    // The glass is not the frame: it runs wider than the casing draws.
+    let inner = egui::Rect::from_min_max(
+        egui::pos2(glass.left() + 5.0, glass.top() + 4.0),
+        egui::pos2(glass.right() - 20.0, glass.bottom() - 4.0),
     );
-    let row = |top: f32, height: f32| {
-        egui::Rect::from_min_max(
-            egui::pos2(inner.left(), top),
-            egui::pos2(inner.right(), top + height),
+    let gear_w = inner.width() * 0.52;
+    let gear =
+        egui::Rect::from_min_max(inner.min, egui::pos2(inner.left() + gear_w, inner.bottom()));
+    let column = egui::Rect::from_min_max(egui::pos2(gear.right() + 8.0, inner.top()), inner.max);
+    // The disc takes the head of the gear bay; the pushrod hangs from it
+    // and stops short of the seat at the bay's foot.
+    let side = (gear.width() * 0.78).min(gear.height() * 0.52);
+    let cam = egui::Rect::from_center_size(
+        egui::pos2(gear.center().x, gear.top() + side * 0.5 + ROW_H),
+        egui::vec2(side, side),
+    );
+    let row = |i: usize| {
+        egui::Rect::from_min_size(
+            egui::pos2(
+                column.left(),
+                column.top() + ROW_H + 4.0 + i as f32 * (ROW_H + 2.0),
+            ),
+            egui::vec2(column.width(), ROW_H),
         )
     };
-    let foot = inner.bottom() - 2.0;
     Lay {
         cam,
-        // The lobes ARE the division: the disc is its instrument.
+        // The lobes ARE the division: the disc is its instrument, and
+        // the row beside it only reads the number off.
         division: cam,
-        // The lift the follower takes is the depth.
-        depth: row(cam.bottom() + 6.0, 14.0),
-        shape: row(cam.bottom() + 24.0, 14.0),
-        hold: bay.unwrap_or_else(|| row(cam.bottom() + 42.0, 14.0)),
-        seat: egui::pos2(cam.center().x, foot),
+        div_read: row(0),
+        depth: row(1),
+        shape: row(2),
+        hold: row(3),
+        seat: egui::pos2(cam.center().x, gear.bottom() - 4.0),
     }
 }
+
+/// One readout row.
+/// @tune 12..26 px
+pub(super) const ROW_H: f32 = 18.0;
 
 /// The cam's radius at angle `t` (turns), for a wheel of `lobes` cut to
 /// `depth` with a profile from square to sinusoidal at `shape`, and a
@@ -109,12 +135,16 @@ pub(super) fn draw(face: &Face<'_>) {
     let rim: Vec<egui::Pos2> = (0..=96)
         .map(|i| {
             let t = i as f32 / 96.0;
-            let r = radius * (0.45 + 0.55 * lobe(t, lobes, depth, shape, hold));
+            // The wheel turns under a fixed follower, so the profile is
+            // read at the angle PLUS the turn. Drawn without it the rim
+            // stood still while the follower rose off it, which is the
+            // one thing a cam drawing must not do.
+            let r = radius * (0.45 + 0.55 * lobe(t + turn, lobes, depth, shape, hold));
             tool::on_arc(centre, r, 90.0 - t * 360.0)
         })
         .collect();
-    chrome::trace(&mut shapes, &rim, Weight::Heavy, ink);
-    chrome::trace(
+    chrome::curve(&mut shapes, &rim, Weight::Heavy, ink);
+    chrome::curve(
         &mut shapes,
         &tool::arc(centre, radius, 0.0, 360.0, 48),
         Weight::Hair,
@@ -182,10 +212,31 @@ pub(super) fn draw(face: &Face<'_>) {
 
     // DEPTH, SHAPE and HOLD, each drawn as what it does to the lobe:
     // how deep it cuts, how square it is, how long it dwells.
+    // The room a row's word and its figure keep, measured: an instrument
+    // drawn across the whole row is drawn under both of them.
+    let font = egui::FontId::monospace(design::px(design::type_scale::MICRO));
+    let span = |text: &str| {
+        face.painter
+            .layout_no_wrap(text.to_owned(), font.clone(), ink)
+            .rect
+            .width()
+    };
+    let gutter = ["DEPTH", "SHAPE", "HOLD", "DIV"]
+        .into_iter()
+        .map(span)
+        .fold(0.0f32, f32::max)
+        + 8.0;
+    let figure = span("100") + 8.0;
+    let between = |rect: egui::Rect| {
+        egui::Rect::from_min_max(
+            egui::pos2(rect.left() + gutter, rect.top()),
+            egui::pos2(rect.right() - figure, rect.bottom()),
+        )
+    };
     for (rect, param, value) in [(lay.depth, p::DEPTH, depth), (lay.shape, p::SHAPE, shape)] {
         tool::slider(
             &mut shapes,
-            rect.shrink2(egui::vec2(4.0, 4.0)),
+            between(rect).shrink2(egui::vec2(0.0, 4.0)),
             value,
             9,
             tool::mix_ink(ink, face.focus(), face.lit(param)),
@@ -198,7 +249,7 @@ pub(super) fn draw(face: &Face<'_>) {
     // is the dwell and whose cell count is the division.
     tool::beat_grid(
         &mut shapes,
-        lay.hold.shrink(2.0),
+        between(lay.hold).shrink2(egui::vec2(0.0, 3.0)),
         lobes.min(8),
         1.0 - hold / 0.6,
         Some(((turn * lobes as f32) as usize).min(lobes.saturating_sub(1))),
@@ -208,6 +259,66 @@ pub(super) fn draw(face: &Face<'_>) {
     tool::halo(&mut shapes, lay.hold, face.lit(p::HOLD), face.focus());
 
     face.painter.extend(shapes);
+
+    // ---- The words. -------------------------------------------------
+    let mut words = tool::Ledger::new(face.painter, font.clone(), "PUMP");
+    let head = egui::Rect::from_min_max(
+        egui::pos2(lay.cam.left() - 20.0, lay.cam.top() - ROW_H - 6.0),
+        egui::pos2(lay.hold.right(), lay.cam.top() - 6.0),
+    );
+    words.text(
+        egui::pos2(head.left() + 2.0, head.center().y),
+        egui::Align2::LEFT_CENTER,
+        "CAM",
+        edge,
+    );
+    // The one condition that matters more than any setting on the card.
+    words.text(
+        egui::pos2(head.right() - 2.0, head.center().y),
+        egui::Align2::RIGHT_CENTER,
+        "NO CORE",
+        face.focus(),
+    );
+    // The break in the pushrod, named.
+    let gap_mid = egui::lerp(gap_top..=lay.seat.y, 0.5);
+    words.text(
+        egui::pos2(contact.x + 9.0, gap_mid),
+        egui::Align2::LEFT_CENTER,
+        "UNSHIPPED",
+        tool::fade(edge, 1.2),
+    );
+    // The division reads off the disc beside it: a bar cut into lobes.
+    words.text(
+        egui::pos2(lay.div_read.left() + 2.0, lay.div_read.center().y),
+        egui::Align2::LEFT_CENTER,
+        "DIV",
+        edge,
+    );
+    words.text(
+        egui::pos2(lay.div_read.right() - 2.0, lay.div_read.center().y),
+        egui::Align2::RIGHT_CENTER,
+        format!("1/{lobes}"),
+        ink,
+    );
+    for (rect, word, said) in [
+        (lay.depth, "DEPTH", format!("{:.0}", face.value(p::DEPTH))),
+        (lay.shape, "SHAPE", format!("{:.0}", face.value(p::SHAPE))),
+        (lay.hold, "HOLD", format!("{:.0}", face.value(p::HOLD))),
+    ] {
+        words.text(
+            egui::pos2(rect.left() + 2.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            word,
+            edge,
+        );
+        words.text(
+            egui::pos2(rect.right() - 2.0, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            said,
+            ink,
+        );
+    }
+    words.finish();
 
     // The mark stands on the grid the cam is cut to.
     face.mark_signed(&lay, face.beat_cell(lobes.min(8)));
@@ -268,6 +379,26 @@ mod tests {
                 let v = lobe(i as f32 / 24.0, lobes, 1.0, 0.3, 0.4);
                 assert!((0.0..=1.0).contains(&v), "the cam left its range: {v}");
             }
+        }
+    }
+
+    /// The wheel turns under the follower, so the rim must be read at
+    /// the angle PLUS the turn. Drawn without it the profile stood
+    /// still while the follower rose off it — a cam whose follower
+    /// floats is not a cam.
+    #[test]
+    fn the_follower_stands_on_the_rim_at_every_turn() {
+        let (lobes, depth, shape, hold) = (4usize, 0.8, 0.25, 0.3);
+        for i in 0..16 {
+            let turn = i as f32 / 16.0;
+            // The follower rides at the top of the wheel, which is the
+            // rim's own t = 0.
+            let under_it = lobe(0.0 + turn, lobes, depth, shape, hold);
+            let lift = lobe(turn, lobes, depth, shape, hold);
+            assert!(
+                (under_it - lift).abs() < 1e-6,
+                "at turn {turn} the rim reads {under_it} and the follower sits at {lift}"
+            );
         }
     }
 
