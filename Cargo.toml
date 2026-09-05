@@ -6,6 +6,22 @@ edition = "2024"
 [workspace]
 
 [dependencies]
+
+# --- corpus kernels — GREEN ---
+# The same geometry and colour the cockpit draws with, so the two apps are
+# two panels of one console. `package =` renames where a kernel's name
+# would collide with a module here.
+chamfer      = { path = "/home/naiqvist/Corpus/kernels/geometry/chamfer" }
+bracket      = { path = "/home/naiqvist/Corpus/kernels/geometry/bracket" }
+dash         = { path = "/home/naiqvist/Corpus/kernels/raster/dash" }
+corpus_rect  = { package = "rect", path = "/home/naiqvist/Corpus/kernels/geometry/rect" }
+corpus_panel = { package = "panel", path = "/home/naiqvist/Corpus/alloys/geometry/panel" }
+truncate     = { path = "/home/naiqvist/Corpus/kernels/typography/truncate" }
+tunable      = { path = "/home/naiqvist/Corpus/kernels/code/tunable" }
+theme_file   = { package = "theme", path = "/home/naiqvist/Corpus/kernels/color/theme" }
+oklab        = { path = "/home/naiqvist/Corpus/kernels/color/oklab" }
+contrast     = { path = "/home/naiqvist/Corpus/kernels/color/contrast" }
+watch        = { path = "/home/naiqvist/Corpus/kernels/io/watch" }
 # --- audio i/o — RED ZONE ---
 rtaudio           = { version = "0.8.0", features = ["jack_linux"] }
 

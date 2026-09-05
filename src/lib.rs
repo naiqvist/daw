@@ -121,6 +121,10 @@ const INSCRIPTION_CANDIDATES: &[&str] = &[
     "/usr/share/fonts/gsfonts/URWGothic-Book.otf",
 ];
 
+/// The named family the stage's view sets its console type in.
+pub const PROFONT: &str = "profont";
+const PROFONT_PATH: &str = "/usr/share/fonts/TTF/ProFontIIxNerdFontMono-Regular.ttf";
+
 pub fn install_stage_fonts(ctx: &egui::Context) -> &'static str {
     let mut fonts = egui::FontDefinitions::default();
     fonts
@@ -183,6 +187,22 @@ pub fn install_stage_fonts(ctx: &egui::Context) -> &'static str {
         ],
     );
     install_plaque(&mut fonts);
+    // The console's face, shared with the cockpit: ProFont, from wherever
+    // this machine keeps it. The view asks for it by name; when it is
+    // missing the name resolves to the typewriter, and nothing breaks.
+    let profont: Vec<String> = match std::fs::read(PROFONT_PATH) {
+        Ok(bytes) => {
+            fonts.font_data.insert(
+                "profont".to_owned(),
+                Arc::new(egui::FontData::from_owned(bytes)),
+            );
+            vec!["profont".to_owned(), "typewriter".to_owned()]
+        }
+        Err(_) => vec!["typewriter".to_owned()],
+    };
+    fonts
+        .families
+        .insert(egui::FontFamily::Name(PROFONT.into()), profont);
     ctx.set_fonts(fonts);
     label
 }

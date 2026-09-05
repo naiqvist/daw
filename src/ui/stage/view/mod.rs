@@ -12,8 +12,10 @@
 //! (never summoned here, so it never owns the keys), and every surface
 //! the old view drew.
 
+mod chassis;
 mod heads;
 mod input;
+mod palette;
 mod utility;
 
 use super::key::{Key, Mods};
@@ -121,7 +123,7 @@ impl Stage {
     fn draw(&self, ui: &mut egui::Ui) {
         let whole = ui.available_rect_before_wrap();
         let painter = ui.painter();
-        painter.rect_filled(whole, 0.0, self.alphabet().ground.color);
+        painter.rect_filled(whole, 0.0, palette::colours().ground);
         self.draw_heads(painter, whole);
     }
 }

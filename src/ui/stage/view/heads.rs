@@ -9,30 +9,28 @@
 //! instrument's family sign was tried here and taken off: it read as a
 //! waveform, and a head is not a scope.
 //!
-//! Filled chamfered plates, no outlines. Rest is the `surface` rung, a
-//! muted head sinks to `well`, and the cursor's head is the one
-//! `focus`-bright thing on the glass with its words cut out of it in
-//! `ground`. Sounding is a `live` bar along the plate's foot.
+//! Each head wears the console's chassis: a keyed chamfered outline,
+//! dashed at rest, solid with brackets for the cursor's. The number is a
+//! label (blue), the name is body text, sounding is a nominal bar along
+//! the foot, and the two pips go to alert when they are on — a muted
+//! track is a thing that wants you.
 
+use super::palette;
 use super::*;
+use crate::PROFONT;
 
 /// The field's inset from the window, on every side.
 pub(super) const MARGIN: f32 = 16.0;
 /// One head's plate.
 pub(super) const HEAD_W: f32 = 96.0;
-pub(super) const HEAD_H: f32 = 44.0;
+pub(super) const HEAD_H: f32 = 48.0;
 /// Between two heads, and between the last head and the master.
 pub(super) const GAP: f32 = 8.0;
-/// The corner every plate gives up. One size everywhere, so it reads as
-/// how things here are made and never as a shape of its own.
-pub(super) const CHAMFER: f32 = 6.0;
 /// The two state pips and the sounding bar, inside the plate.
-const PIP: f32 = 8.0;
-const PIP_CHAMFER: f32 = 2.0;
-const BAR_H: f32 = 3.0;
-const INSET: f32 = 6.0;
-const NAME_PX: f32 = 12.0;
-const NUMBER_PX: f32 = 9.0;
+const PIP: f32 = 7.0;
+const BAR_H: f32 = 2.0;
+const INSET: f32 = 8.0;
+const TYPE_PX: f32 = 12.0;
 
 /// How many track heads fit across a field this wide, leaving the
 /// master its own column. Never fewer than one, or the cursor would
@@ -60,23 +58,6 @@ pub(super) fn master_rect(field: egui::Rect) -> egui::Rect {
         egui::pos2(field.max.x - MARGIN - HEAD_W, field.min.y + MARGIN),
         egui::vec2(HEAD_W, HEAD_H),
     )
-}
-
-/// A rectangle with its four corners cut, as a filled figure.
-pub(super) fn plate(rect: egui::Rect, chamfer: f32, fill: egui::Color32) -> egui::Shape {
-    let c = chamfer.min(rect.width() / 2.0).min(rect.height() / 2.0);
-    let (l, r, t, b) = (rect.min.x, rect.max.x, rect.min.y, rect.max.y);
-    let points = vec![
-        egui::pos2(l + c, t),
-        egui::pos2(r - c, t),
-        egui::pos2(r, t + c),
-        egui::pos2(r, b - c),
-        egui::pos2(r - c, b),
-        egui::pos2(l + c, b),
-        egui::pos2(l, b - c),
-        egui::pos2(l, t + c),
-    ];
-    egui::Shape::convex_polygon(points, fill, egui::Stroke::NONE)
 }
 
 /// What the cursor makes of one head.
@@ -147,24 +128,10 @@ impl Stage {
     }
 
     fn draw_head(&self, painter: &egui::Painter, rect: egui::Rect, face: &Face<'_>) {
-        let alpha = self.alphabet();
+        let c = palette::colours();
         let cursor = face.standing == Standing::Cursor;
-        // The plate, then everything on it cut out in the ground's own
-        // colour when it is the cursor's — one bright thing, its words
-        // holes in it.
-        let fill = if cursor {
-            alpha.focus.color
-        } else if face.muted {
-            alpha.well.color
-        } else {
-            alpha.surface.color
-        };
-        let (word, quiet) = if cursor {
-            (alpha.ground.color, alpha.edge.color)
-        } else {
-            (alpha.ink.color, alpha.edge.color)
-        };
-        painter.add(plate(rect, CHAMFER, fill));
+        chassis::frame(painter, rect, cursor);
+        let font = egui::FontId::new(TYPE_PX, egui::FontFamily::Name(PROFONT.into()));
 
         let inner = rect.shrink(INSET);
         if let Some(number) = face.number {
@@ -172,44 +139,44 @@ impl Stage {
                 inner.left_top(),
                 egui::Align2::LEFT_TOP,
                 format!("{number:02}"),
-                egui::FontId::monospace(NUMBER_PX),
-                word,
+                font.clone(),
+                c.label,
             );
         }
         // The name, on its own row, clipped by character so it never
-        // runs off the plate.
-        let fits = (inner.width() / (NAME_PX * 0.62)).floor().max(1.0) as usize;
+        // runs off the chassis.
+        let fits = (inner.width() / (TYPE_PX * 0.6)).floor().max(1.0) as usize;
         let name: String = face.name.chars().take(fits).collect();
         painter.text(
-            egui::pos2(inner.min.x, inner.min.y + NUMBER_PX + 4.0),
+            egui::pos2(inner.min.x, inner.min.y + TYPE_PX + 4.0),
             egui::Align2::LEFT_TOP,
             name,
-            egui::FontId::monospace(NAME_PX),
-            word,
+            font,
+            if face.muted { c.dim } else { c.fg },
         );
 
-        // The two bits, top right beside the number: M and S as pips,
-        // lit when on.
-        let pips_y = inner.min.y + 1.0;
+        // The two bits, top right beside the number: M and S as pips —
+        // rule when off, alert when on.
         for (i, on) in [(0, face.muted), (1, face.solo)] {
             let x = inner.max.x - PIP - i as f32 * (PIP + 4.0);
-            let pip = egui::Rect::from_min_size(egui::pos2(x, pips_y), egui::vec2(PIP, PIP));
-            painter.add(plate(pip, PIP_CHAMFER, if on { word } else { quiet }));
+            let pip =
+                egui::Rect::from_min_size(egui::pos2(x, inner.min.y + 2.0), egui::vec2(PIP, PIP));
+            painter.rect_filled(pip, 0.0, if on { c.alert } else { c.rule });
         }
-        // Sounding: a live bar along the foot.
+        // Sounding: a nominal bar along the foot.
         if face.sounding {
             let bar =
                 egui::Rect::from_min_max(egui::pos2(inner.min.x, inner.max.y - BAR_H), inner.max);
-            painter.add(plate(bar, 1.0, alpha.live.color));
+            painter.rect_filled(bar, 0.0, c.nominal);
         }
-        // The cursor in this column but below the head: a focus bar under
-        // the foot, pointing at where it is.
+        // The cursor in this column but below the head: a chassis bar
+        // under the foot, pointing at where it is.
         if face.standing == Standing::Column {
             let bar = egui::Rect::from_min_max(
-                egui::pos2(rect.min.x + CHAMFER, rect.max.y + 3.0),
-                egui::pos2(rect.max.x - CHAMFER, rect.max.y + 3.0 + BAR_H),
+                egui::pos2(rect.min.x + 6.0, rect.max.y + 3.0),
+                egui::pos2(rect.max.x - 6.0, rect.max.y + 3.0 + BAR_H),
             );
-            painter.add(plate(bar, 1.5, alpha.focus.color));
+            painter.rect_filled(bar, 0.0, c.chassis);
         }
     }
 }
@@ -268,24 +235,5 @@ mod tests {
                 _ => assert_eq!((bright, columns), (1, 0)),
             }
         }
-    }
-
-    #[test]
-    fn a_plate_gives_up_exactly_its_corners() {
-        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 50.0));
-        let egui::Shape::Path(path) = plate(rect, 8.0, egui::Color32::WHITE) else {
-            panic!("a plate is a filled path");
-        };
-        assert_eq!(path.points.len(), 8);
-        assert!(path.points.iter().all(|p| rect.contains(*p)));
-        // A chamfer larger than the plate is cut down to it.
-        let egui::Shape::Path(tiny) = plate(
-            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(4.0, 4.0)),
-            8.0,
-            egui::Color32::WHITE,
-        ) else {
-            panic!()
-        };
-        assert!(tiny.points.iter().all(|p| p.x >= 0.0 && p.x <= 4.0));
     }
 }

@@ -553,6 +553,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bracket"
+version = "0.1.0"
+dependencies = [
+ "rect",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -681,6 +688,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "chamfer"
+version = "0.1.0"
+dependencies = [
+ "rect",
+]
+
+[[package]]
 name = "clack-common"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -763,6 +777,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ca0197aee26d1ae37445ee532fefce43251d24cc7c166799f4d46817f1d3973"
 dependencies = [
  "crossbeam-utils",
+]
+
+[[package]]
+name = "contrast"
+version = "0.1.0"
+dependencies = [
+ "luminance",
 ]
 
 [[package]]
@@ -914,15 +935,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
+name = "dash"
+version = "0.1.0"
+
+[[package]]
 name = "daw"
 version = "0.1.0"
 dependencies = [
  "assert_no_alloc",
  "basedrop",
+ "bracket",
  "bytemuck",
+ "chamfer",
  "clack-host",
+ "contrast",
  "creek",
  "crossbeam-channel",
+ "dash",
  "eframe",
  "egui",
  "egui-wgpu",
@@ -932,16 +961,23 @@ dependencies = [
  "hound",
  "lyon",
  "midir",
+ "oklab",
+ "panel",
  "parking_lot",
  "pollster",
+ "rect",
  "ron",
  "rtaudio",
  "rtrb 0.4.0",
  "serde",
  "symphonium",
+ "theme",
  "thiserror 2.0.20",
  "thunderdome",
  "triple_buffer",
+ "truncate",
+ "tunable",
+ "watch",
  "wgpu",
  "winit",
 ]
@@ -2010,6 +2046,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
+name = "luminance"
+version = "0.1.0"
+
+[[package]]
 name = "lyon"
 version = "1.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2558,6 +2598,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "oklab"
+version = "0.1.0"
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2599,6 +2643,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "36820e9051aca1014ddc75770aab4d68bc1e9e632f0f5627c4086bc216fb583b"
 dependencies = [
  "ttf-parser",
+]
+
+[[package]]
+name = "panel"
+version = "0.1.0"
+dependencies = [
+ "bracket",
+ "chamfer",
+ "dash",
+ "rect",
 ]
 
 [[package]]
@@ -2931,6 +2985,10 @@ checksum = "f821338fddb99d089116342c46e9f1fbf3828dba077674613e734e01d6ea8677"
 dependencies = [
  "rustfft",
 ]
+
+[[package]]
+name = "rect"
+version = "0.1.0"
 
 [[package]]
 name = "redox_syscall"
@@ -3707,6 +3765,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "theme"
+version = "0.1.0"
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3883,10 +3945,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "truncate"
+version = "0.1.0"
+
+[[package]]
 name = "ttf-parser"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
+
+[[package]]
+name = "tunable"
+version = "0.1.0"
 
 [[package]]
 name = "type-map"
@@ -4084,6 +4154,10 @@ checksum = "7ef64dbcc55df09c7e5a46182d181c2cfa3e925f3da937ea764728b4bbb9dcbf"
 dependencies = [
  "unicode-ident",
 ]
+
+[[package]]
+name = "watch"
+version = "0.1.0"
 
 [[package]]
 name = "wayland-backend"
