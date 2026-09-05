@@ -14,6 +14,22 @@
 
 const BLOOM_DIV: u32 = 4;
 
+/// How much of the bright pass is added back.
+/// @tune 0..1
+const BLOOM: f32 = 0.30;
+/// How much a scanline takes.
+/// @tune 0..0.5
+const SCANLINE: f32 = 0.10;
+/// Chromatic aberration at the edge, in pixels.
+/// @tune 0..2 px
+const ABERRATION: f32 = 0.35;
+/// How far the field edge falls toward the cool ground.
+/// @tune 0..1
+const VIGNETTE: f32 = 0.22;
+/// Static grain, as a share of full scale.
+/// @tune 0..0.1
+const GRAIN: f32 = 0.015;
+
 /// What the glass does, as the shader reads it.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -31,11 +47,11 @@ impl Default for Params {
     fn default() -> Self {
         Self {
             resolution: [1.0, 1.0],
-            bloom: 0.30,
-            scanline: 0.10,
-            aberration: 0.35,
-            vignette: 0.22,
-            grain: 0.015,
+            bloom: BLOOM,
+            scanline: SCANLINE,
+            aberration: ABERRATION,
+            vignette: VIGNETTE,
+            grain: GRAIN,
             _pad: 0.0,
         }
     }
@@ -274,6 +290,11 @@ impl Post {
     ) {
         self.ensure_bound(device, source, size, generation);
         self.params.resolution = [size[0].max(1) as f32, size[1].max(1) as f32];
+        self.params.bloom = crate::tune!(BLOOM);
+        self.params.scanline = crate::tune!(SCANLINE);
+        self.params.aberration = crate::tune!(ABERRATION);
+        self.params.vignette = crate::tune!(VIGNETTE);
+        self.params.grain = crate::tune!(GRAIN);
         queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&self.params));
         let Some(b) = &self.bound else {
             return;

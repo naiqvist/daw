@@ -15,21 +15,27 @@ use corpus_rect::Rect as KRect;
 use eframe::egui;
 
 /// How much is taken off the two keyed corners.
+/// @tune 0..40 px
 const CUT: f64 = 9.0;
 /// Bracket arm length on the focused chassis.
+/// @tune 4..60 px
 const ARM: f64 = 12.0;
 /// How far inside the outline the brackets sit.
+/// @tune 0..24 px
 const INSET: f64 = 4.0;
-/// A dash on an unfocused outline, and the gap after it.
+/// A dash on an unfocused outline.
+/// @tune 2..30 px
 const DASH: f64 = 6.0;
+/// The gap after that dash.
+/// @tune 2..30 px
 const GAP: f64 = 4.0;
 
 fn style() -> panel::Style {
     panel::Style {
-        cut: CUT,
-        arm: ARM,
-        inset: INSET,
-        dash: dash::Pattern::new(DASH, GAP),
+        cut: crate::tune!(CUT),
+        arm: crate::tune!(ARM),
+        inset: crate::tune!(INSET),
+        dash: dash::Pattern::new(crate::tune!(DASH), crate::tune!(GAP)),
     }
 }
 

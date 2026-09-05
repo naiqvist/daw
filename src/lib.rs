@@ -27,6 +27,7 @@ pub mod song_graph;
 pub mod targets;
 pub mod tempo;
 pub mod theory;
+pub mod tune;
 pub mod ui;
 
 use eframe::egui;

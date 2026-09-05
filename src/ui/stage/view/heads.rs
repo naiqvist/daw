@@ -20,11 +20,16 @@ use super::*;
 use crate::PROFONT;
 
 /// The field's inset from the window, on every side.
+/// @tune 0..64 px
 pub(super) const MARGIN: f32 = 16.0;
-/// One head's plate.
+/// One head's width.
+/// @tune 48..200 px
 pub(super) const HEAD_W: f32 = 96.0;
+/// One head's height.
+/// @tune 24..96 px
 pub(super) const HEAD_H: f32 = 48.0;
 /// Between two heads, and between the last head and the master.
+/// @tune 0..32 px
 pub(super) const GAP: f32 = 8.0;
 /// The two state pips and the sounding bar, inside the plate.
 const PIP: f32 = 7.0;
@@ -36,18 +41,22 @@ const TYPE_PX: f32 = 12.0;
 /// master its own column. Never fewer than one, or the cursor would
 /// have nowhere to stand.
 pub(super) fn capacity(field_w: f32) -> usize {
-    let usable = field_w - MARGIN * 2.0 - (HEAD_W + GAP);
-    ((usable / (HEAD_W + GAP)).floor().max(1.0)) as usize
+    let usable = field_w - crate::tune!(MARGIN) * 2.0 - (crate::tune!(HEAD_W) + crate::tune!(GAP));
+    ((usable / (crate::tune!(HEAD_W) + crate::tune!(GAP)))
+        .floor()
+        .max(1.0)) as usize
 }
 
 /// The `slot`th shown head's plate.
 pub(super) fn head_rect(field: egui::Rect, slot: usize) -> egui::Rect {
     egui::Rect::from_min_size(
         egui::pos2(
-            field.min.x + MARGIN + slot as f32 * (HEAD_W + GAP),
-            field.min.y + MARGIN,
+            field.min.x
+                + crate::tune!(MARGIN)
+                + slot as f32 * (crate::tune!(HEAD_W) + crate::tune!(GAP)),
+            field.min.y + crate::tune!(MARGIN),
         ),
-        egui::vec2(HEAD_W, HEAD_H),
+        egui::vec2(crate::tune!(HEAD_W), crate::tune!(HEAD_H)),
     )
 }
 
@@ -55,8 +64,11 @@ pub(super) fn head_rect(field: egui::Rect, slot: usize) -> egui::Rect {
 /// scrolls past: it belongs to the song, not to anything in it.
 pub(super) fn master_rect(field: egui::Rect) -> egui::Rect {
     egui::Rect::from_min_size(
-        egui::pos2(field.max.x - MARGIN - HEAD_W, field.min.y + MARGIN),
-        egui::vec2(HEAD_W, HEAD_H),
+        egui::pos2(
+            field.max.x - crate::tune!(MARGIN) - crate::tune!(HEAD_W),
+            field.min.y + crate::tune!(MARGIN),
+        ),
+        egui::vec2(crate::tune!(HEAD_W), crate::tune!(HEAD_H)),
     )
 }
 
@@ -196,10 +208,10 @@ mod tests {
         assert!(n >= 1);
         for slot in 1..n {
             let (a, b) = (head_rect(f, slot - 1), head_rect(f, slot));
-            assert_eq!(b.min.x - a.max.x, GAP);
+            assert_eq!(b.min.x - a.max.x, crate::tune!(GAP));
             assert_eq!(a.min.y, b.min.y);
         }
-        assert!(head_rect(f, n - 1).max.x + GAP <= master_rect(f).min.x);
+        assert!(head_rect(f, n - 1).max.x + crate::tune!(GAP) <= master_rect(f).min.x);
     }
 
     #[test]

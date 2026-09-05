@@ -15,6 +15,7 @@
 mod chassis;
 mod heads;
 mod input;
+mod inspector;
 mod palette;
 mod utility;
 
@@ -25,6 +26,26 @@ use eframe::egui;
 /// An axis nothing is drawn along yet can hold everything: no offset
 /// needs to move to keep the cursor in sight.
 const HOLDS_EVERYTHING: usize = usize::MAX;
+
+/// The watched overrides, made on first use.
+fn overrides() -> std::sync::MutexGuard<'static, crate::tune::Overrides> {
+    static O: std::sync::OnceLock<std::sync::Mutex<crate::tune::Overrides>> =
+        std::sync::OnceLock::new();
+    O.get_or_init(|| {
+        std::sync::Mutex::new(crate::tune::Overrides::new(crate::tune::overrides_path()))
+    })
+    .lock()
+    .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The inspector, made on first use.
+fn inspector() -> std::sync::MutexGuard<'static, inspector::Inspector> {
+    static I: std::sync::OnceLock<std::sync::Mutex<inspector::Inspector>> =
+        std::sync::OnceLock::new();
+    I.get_or_init(|| std::sync::Mutex::new(inspector::Inspector::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// The watched theme, made on first use.
 fn skin() -> std::sync::MutexGuard<'static, palette::Skin> {
@@ -38,8 +59,17 @@ impl Stage {
     pub fn show(&mut self, ui: &mut egui::Ui) {
         // The theme file, once a frame: an edit from the picker lands on
         // the next frame, and a frame is asked for so it shows.
-        if skin().poll() {
+        if skin().poll() | overrides().poll() {
             ui.ctx().request_repaint();
+        }
+        // The backtick opens the knobs. A view key, not the codebook's:
+        // it is about the glass, not the song.
+        if ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Backtick)) {
+            let mut i = inspector();
+            i.open = !i.open;
+            if i.open {
+                i.rescan();
+            }
         }
         self.begin_frame();
         if self.poll_library() {
@@ -138,5 +168,15 @@ impl Stage {
         let painter = ui.painter();
         painter.rect_filled(whole, 0.0, palette::colours().ground);
         self.draw_heads(painter, whole);
+        let mut inspector = inspector();
+        if inspector.open {
+            let panel = egui::Rect::from_min_max(
+                egui::pos2(whole.max.x - inspector::WIDTH, whole.min.y),
+                whole.max,
+            );
+            let mut child =
+                ui.new_child(egui::UiBuilder::new().max_rect(panel).id_salt("inspector"));
+            inspector.ui(&mut child);
+        }
     }
 }
