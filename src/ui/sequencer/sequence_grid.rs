@@ -116,7 +116,7 @@ const DEFAULT_VELOCITY: u8 = 100;
 /// quietest thing on the screen. LIVE is reserved here for what is
 /// actually sounding, which is what makes a sounding thing visible.
 fn rule_ink(ground: Polarity, strength: f32) -> egui::Color32 {
-    crate::design::Alphabet::for_polarity(ground)
+    crate::ui::sequencer::alphabet(ground)
         .edge
         .color
         .gamma_multiply(strength)
@@ -548,7 +548,7 @@ impl SequenceGrid {
                 )
                 .intersect(window);
                 if head.is_positive() {
-                    let alpha = crate::design::Alphabet::for_polarity(ground);
+                    let alpha = crate::ui::sequencer::alphabet(ground);
                     let ink = pulse_ink(alpha.live.color, alpha.live_dim.color, phase);
                     let mut shapes = Vec::new();
                     circuit::trace(
@@ -1722,7 +1722,7 @@ pub(crate) fn draw_lock_marks(
     if locks == 0 || face.width() < 14.0 || face.height() < 10.0 {
         return;
     }
-    let live = crate::design::Alphabet::for_polarity(ground).live.color;
+    let live = crate::ui::sequencer::alphabet(ground).live.color;
     let y = face.bottom() - 4.0;
     let mut x = face.left() + 7.0;
     for _ in 0..locks.min(4) {
@@ -1737,7 +1737,7 @@ pub(crate) fn draw_lock_marks(
 /// The veil laid over everything past a clip's end: the ground, mostly
 /// opaque, so what is beyond is seen but not read.
 pub(crate) fn clip_veil(ground: Polarity) -> egui::Color32 {
-    crate::design::Alphabet::for_polarity(ground)
+    crate::ui::sequencer::alphabet(ground)
         .ground
         .color
         .gamma_multiply(0.62)
@@ -2020,7 +2020,7 @@ fn draw_selection(
     closes: bool,
     ground: Polarity,
 ) {
-    let ink = crate::design::Alphabet::for_polarity(ground).ink.color;
+    let ink = crate::ui::sequencer::alphabet(ground).ink.color;
     // The band takes the gap either side, so a run reads as one
     // continuous interval rather than as a row of lozenges.
     let band = egui::Rect::from_min_max(

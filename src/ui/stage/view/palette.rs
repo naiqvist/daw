@@ -125,6 +125,24 @@ impl Colours {
 
 static CURRENT: RwLock<Colours> = RwLock::new(Colours::DEFAULT);
 
+/// The design alphabet, seen through the console: what the shared
+/// sequencer draws in once it is on this glass. Tiers and channels are
+/// the alphabet's own; only the colours change.
+pub fn lift(mut a: crate::design::Alphabet) -> crate::design::Alphabet {
+    let c = colours();
+    a.ground.color = c.ground;
+    a.well.color = c.ground;
+    a.surface.color = c.panel;
+    a.edge.color = c.edge;
+    a.ink.color = c.fg;
+    a.focus.color = c.alert;
+    a.jeopardy_latent.color = c.alert;
+    a.jeopardy_active.color = c.fault;
+    a.live.color = c.nominal;
+    a.live_dim.color = c.select;
+    a
+}
+
 /// The colours in force this frame.
 pub fn colours() -> Colours {
     CURRENT.read().map(|c| *c).unwrap_or(Colours::DEFAULT)

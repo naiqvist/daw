@@ -58,7 +58,7 @@ pub(crate) fn editor_switch(
                 egui::Sense::click(),
             )
             .affords(Affords::Press);
-        let alpha = crate::design::Alphabet::for_polarity(ground);
+        let alpha = crate::ui::sequencer::alphabet(ground);
         let active = editor == current;
         let hovered = response.hovered() && !active;
         // A selector on the case: square, and marked by an UNDERSCORE

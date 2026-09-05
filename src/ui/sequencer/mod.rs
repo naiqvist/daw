@@ -332,3 +332,30 @@ mod tests {
         );
     }
 }
+
+// ------------------------------------------------------------- projection
+//
+// The sequencer draws in the design alphabet. A frame that projects the
+// alphabet through its own palette registers a lift here, and every
+// colour the grid and the roll resolve passes through it. Unset, it is
+// the alphabet itself, so a frame that never calls this sees no change.
+
+static PROJECTION: std::sync::RwLock<
+    Option<fn(crate::design::Alphabet) -> crate::design::Alphabet>,
+> = std::sync::RwLock::new(None);
+
+/// Register (or clear) the lift the sequencer's colours pass through.
+pub fn set_projection(lift: Option<fn(crate::design::Alphabet) -> crate::design::Alphabet>) {
+    if let Ok(mut w) = PROJECTION.write() {
+        *w = lift;
+    }
+}
+
+/// The alphabet the sequencer draws in, on this ground, lifted.
+pub fn alphabet(ground: crate::design::Polarity) -> crate::design::Alphabet {
+    let base = *crate::design::Alphabet::for_polarity(ground);
+    match PROJECTION.read().ok().and_then(|p| *p) {
+        Some(lift) => lift(base),
+        None => base,
+    }
+}

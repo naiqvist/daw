@@ -19,6 +19,7 @@ mod inspector;
 mod lattice;
 mod palette;
 mod status;
+mod tray;
 mod utility;
 
 use super::key::{Key, Mods};
@@ -33,6 +34,7 @@ const HOLDS_EVERYTHING: usize = usize::MAX;
 struct Layout {
     title: egui::Rect,
     field: egui::Rect,
+    tray: egui::Rect,
     status: egui::Rect,
 }
 
@@ -44,10 +46,16 @@ impl Layout {
             egui::Rect::from_min_max(whole.min, egui::pos2(whole.max.x, whole.min.y + title_h));
         let status =
             egui::Rect::from_min_max(egui::pos2(whole.min.x, whole.max.y - status_h), whole.max);
-        let field = egui::Rect::from_min_max(title.left_bottom(), status.right_top());
+        let band = egui::Rect::from_min_max(title.left_bottom(), status.right_top());
+        // The tray is cut off the FOOT of the band, fixed: the session
+        // above keeps its shape whether or not the tray has a clip.
+        let tray_top = (band.max.y - tray::tray_h()).max(band.min.y);
+        let field = egui::Rect::from_min_max(band.min, egui::pos2(band.max.x, tray_top));
+        let tray = egui::Rect::from_min_max(egui::pos2(band.min.x, tray_top), band.max);
         Self {
             title,
             field,
+            tray,
             status,
         }
     }
@@ -189,7 +197,8 @@ impl Stage {
     }
 
     /// The ground, and on it what has been drawn so far.
-    fn draw(&self, ui: &mut egui::Ui) {
+    fn draw(&mut self, ui: &mut egui::Ui) {
+        crate::ui::sequencer::set_projection(Some(palette::lift));
         let whole = ui.available_rect_before_wrap();
         let painter = ui.painter();
         painter.rect_filled(whole, 0.0, palette::colours().ground);
@@ -198,6 +207,7 @@ impl Stage {
         self.draw_heads(painter, layout.field);
         self.draw_lattice(painter, layout.field);
         self.draw_status(painter, layout.status);
+        self.draw_tray(ui, layout.tray);
         let mut inspector = inspector();
         if inspector.open {
             let panel = egui::Rect::from_min_max(

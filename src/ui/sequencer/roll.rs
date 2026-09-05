@@ -401,7 +401,7 @@ impl RollPanel {
             let steps = tick as f32 / STEP_TICKS as f32;
             let x = lanes.left() + (steps - self.view_step as f32) * step_w;
             if x >= lanes.left() && x <= lanes.right() {
-                let alpha = crate::design::Alphabet::for_polarity(ground);
+                let alpha = crate::ui::sequencer::alphabet(ground);
                 let ink = pulse_ink(alpha.live.color, alpha.live_dim.color, phase);
                 let mut shapes = Vec::new();
                 circuit::trace(
