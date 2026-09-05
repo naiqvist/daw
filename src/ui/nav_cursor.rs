@@ -595,7 +595,8 @@ fn draw(painter: &egui::Painter, visual: Visual, energy: f32) {
     let arm = visual.style.arm * (1.0 - 0.45 * squeeze);
     let arm_x = (rect.width() * arm).clamp(3.0, 18.0);
     let arm_y = (rect.height() * arm).clamp(3.0, 18.0);
-    let cut = (short * 0.16 * visual.style.cut).clamp(0.0, 4.0);
+    // The console's bracket is an L: no cut at the corner.
+    let cut = 0.0 * visual.style.cut;
     // A band leans: the corners on the side it is boosting toward reach
     // further, so a boost and a cut are told apart before either number
     // is read.
@@ -622,67 +623,13 @@ fn draw(painter: &egui::Painter, visual: Visual, energy: f32) {
         ));
     }
 
-    let tick_ink = ink.gamma_multiply(visual.style.side_ticks.clamp(0.0, 1.0));
-    let tick_stroke = egui::Stroke::new(1.0 + punch * 0.35, tick_ink);
-    let tick = (short * 0.16).clamp(2.0, 6.0);
-    painter.line_segment(
-        [
-            rect.left_center() - egui::vec2(tick, 0.0),
-            rect.left_center() + egui::vec2(tick, 0.0),
-        ],
-        tick_stroke,
+    // Brackets alone say "this one": the console draws no ticks, spines
+    // or cross inside a cursor.
+    let _ = (
+        visual.style.side_ticks,
+        visual.style.spine,
+        visual.style.cross,
     );
-    painter.line_segment(
-        [
-            rect.right_center() - egui::vec2(tick, 0.0),
-            rect.right_center() + egui::vec2(tick, 0.0),
-        ],
-        tick_stroke,
-    );
-    painter.line_segment(
-        [
-            rect.center_top() - egui::vec2(0.0, tick),
-            rect.center_top() + egui::vec2(0.0, tick),
-        ],
-        tick_stroke,
-    );
-    painter.line_segment(
-        [
-            rect.center_bottom() - egui::vec2(0.0, tick),
-            rect.center_bottom() + egui::vec2(0.0, tick),
-        ],
-        tick_stroke,
-    );
-
-    let spine_ink = ink.gamma_multiply((visual.style.spine * 0.72).clamp(0.0, 1.0));
-    let spine_h = rect.height() * 0.22;
-    for x in [rect.left() - 2.0, rect.right() + 2.0] {
-        painter.line_segment(
-            [
-                egui::pos2(x, rect.center().y - spine_h),
-                egui::pos2(x, rect.center().y + spine_h),
-            ],
-            egui::Stroke::new(1.0, spine_ink),
-        );
-    }
-
-    let cross_ink = ink.gamma_multiply((visual.style.cross * 0.82).clamp(0.0, 1.0));
-    let cross = (short * 0.11).clamp(2.0, 5.0);
-    painter.line_segment(
-        [
-            rect.center() - egui::vec2(cross, 0.0),
-            rect.center() + egui::vec2(cross, 0.0),
-        ],
-        egui::Stroke::new(1.0, cross_ink),
-    );
-    painter.line_segment(
-        [
-            rect.center() - egui::vec2(0.0, cross),
-            rect.center() + egui::vec2(0.0, cross),
-        ],
-        egui::Stroke::new(1.0, cross_ink),
-    );
-
     signature_marks(painter, rect, visual, ink);
 
     // Velocity becomes two short fins behind the moving mark. They are the
