@@ -39,10 +39,6 @@ mod utility;
 mod view;
 mod vitals;
 
-use crate::design::codex::Sign;
-use crate::design::kit::{self, Weight};
-use crate::design::motion::{self, Phase};
-use crate::design::{block, circuit};
 use crate::sequencing::{DeviceId, PatternBlock};
 use arrangement::{Arrangement, ArrangementClipboard, Hold, Take};
 pub use arrangement::{ExportRequest, ExportState};
@@ -57,16 +53,16 @@ use crate::library::{LibraryConfig, LibraryService, LibrarySnapshot};
 use crate::pitch::Pitch;
 use crate::sequencing::{
     Clip, Device, GRID_COLUMNS as PATTERN_COLS, GRID_ROWS as PATTERN_ROWS, PATTERN_STEP_TICKS,
-    PATTERN_STEPS, PatternId, PitchAuthority, Song, TrackKind,
+    PatternId, PitchAuthority, Song, TrackKind,
 };
 use crate::ui::glyph;
-use crate::ui::sequencer::{self, grammar, lens, midi_typing, registers, sequence};
+use crate::ui::sequencer::{self, grammar, midi_typing, registers, sequence};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use browser::{BrowserStatus, sample_nodes};
 use sample::{Page as SamplePage, SampleEditor};
-use trig_menu::{LockRow, MenuRow, Page, SliceRow, TrigAction, TrigMenu};
+use trig_menu::{MenuRow, Page, TrigAction, TrigMenu};
 
 pub use browser::{Browser, EntryKind, Node, Row, Shelf};
 pub use grid::{
