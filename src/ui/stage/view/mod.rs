@@ -15,6 +15,7 @@ mod band;
 mod browser;
 mod callouts;
 mod chassis;
+mod desk;
 mod faces;
 mod heads;
 mod help;
@@ -343,6 +344,7 @@ impl Stage {
                 self.draw_mixer(painter, layout.field);
             } else {
                 self.draw_lattice(painter, layout.field);
+                self.draw_desk(painter, layout.field);
                 self.draw_log(painter, layout.field);
             }
         }
