@@ -30,8 +30,8 @@ pub(super) const TRAY_H: f32 = 272.0;
 /// @tune 400..1600 px
 const WIDE: f32 = 1080.0;
 /// The tray's own label row.
-const LABEL_H: f32 = 18.0;
-const TYPE_PX: f32 = 12.0;
+pub(super) const LABEL_H: f32 = 18.0;
+pub(super) const TYPE_PX: f32 = 12.0;
 
 pub(super) fn tray_h() -> f32 {
     crate::tune!(TRAY_H)

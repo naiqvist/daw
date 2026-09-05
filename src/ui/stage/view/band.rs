@@ -8,6 +8,7 @@
 
 use super::palette;
 use super::*;
+use crate::PROFONT;
 use crate::ui::chrome;
 use crate::ui::stage::chain;
 use eframe::egui;
@@ -137,9 +138,13 @@ impl Stage {
     /// ones. A pure function of the tray, like every other capacity here.
     pub(super) fn chain_capacity(tray: egui::Rect) -> usize {
         let margin = design::px(design::space::ROOM);
-        let cards = chain::rows_that_fit(tray.height() - margin - CHAIN_HEAD_H, CHAIN_PITCH);
+        let cards = chain::rows_that_fit(
+            tray.height() - super::tray::LABEL_H - margin - CHAIN_HEAD_H,
+            CHAIN_PITCH,
+        );
         let pieces = chain::rows_that_fit(
             tray.height()
+                - super::tray::LABEL_H
                 - margin
                 - (strip::HEAD_H + 4.0 + 3.0 + strip::FIGURE_MAX_H + 4.0)
                 - strip::FOOT_H
@@ -225,6 +230,25 @@ impl Stage {
         let gap = column_gap();
         let head_h = CHAIN_HEAD_H;
         let pitch = CHAIN_PITCH;
+        // The label row, like the clip tray's: which track's band this
+        // is, how long it is, and which device the cursor is on. Then
+        // the cards stand under it.
+        let cursor_col_label = lattice
+            .cursor()
+            .map_or(0, |(col, _)| col)
+            .min(columns.len() - 1);
+        self.draw_band_label(
+            painter,
+            tray,
+            track,
+            columns.len(),
+            cursor_col_label,
+            columns[cursor_col_label].title,
+        );
+        let tray = egui::Rect::from_min_max(
+            egui::pos2(tray.min.x, tray.min.y + super::tray::LABEL_H),
+            tray.max,
+        );
         let body_top = tray.min.y + head_h;
         let rows_shown = Self::chain_capacity(tray);
         let _ = chain::rows_that_fit(tray.max.y - margin - body_top, pitch);
@@ -563,6 +587,69 @@ impl Stage {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// The band's label row: `band tr 03 · 4 devices · dev 02 title`,
+    /// set the way the clip tray sets its own, over the same seam.
+    fn draw_band_label(
+        &self,
+        painter: &egui::Painter,
+        tray: egui::Rect,
+        track: usize,
+        devices: usize,
+        cursor_col: usize,
+        title: &str,
+    ) {
+        let c = palette::colours();
+        let px = super::tray::TYPE_PX;
+        let font = egui::FontId::new(px, egui::FontFamily::Name(PROFONT.into()));
+        let left = tray.min.x + super::heads::margin() + super::heads::gutter();
+        let label_y = tray.min.y + super::tray::LABEL_H * 0.5;
+        let y = tray.min.y.round() - 0.5;
+        painter.line_segment(
+            [
+                egui::pos2(left, y),
+                egui::pos2(tray.max.x - super::heads::margin(), y),
+            ],
+            egui::Stroke::new(1.0, c.rule),
+        );
+        let mut x = left;
+        let count = if devices == 1 {
+            "1 device".to_owned()
+        } else {
+            format!("{devices} devices")
+        };
+        for (label, value, tone) in [
+            ("band", String::new(), c.fg),
+            ("tr", format!("{:02}", track + 1), c.fg),
+            ("", count, c.dim),
+            (
+                "dev",
+                format!("{:02} {}", cursor_col + 1, title.to_ascii_lowercase()),
+                c.fg,
+            ),
+        ] {
+            if !label.is_empty() {
+                painter.text(
+                    egui::pos2(x, label_y),
+                    egui::Align2::LEFT_CENTER,
+                    label,
+                    font.clone(),
+                    c.label,
+                );
+                x += (label.len() as f32 + 1.0) * px * 0.6;
+            }
+            if !value.is_empty() {
+                painter.text(
+                    egui::pos2(x, label_y),
+                    egui::Align2::LEFT_CENTER,
+                    &value,
+                    font.clone(),
+                    tone,
+                );
+                x += (value.chars().count() as f32 + 2.5) * px * 0.6;
+            }
+        }
+    }
+
     fn draw_chain_card(
         &self,
         painter: &egui::Painter,
