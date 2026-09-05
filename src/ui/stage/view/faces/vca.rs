@@ -93,7 +93,7 @@ fn vca_face(glass: egui::Rect) -> VcaFace {
         rest.min,
         egui::pos2(rest.right() - rows_w - COLUMN_GAP, rest.bottom()),
     );
-    let key_h = (row_h * 2.0 + 6.0).min(plots.height() * 0.4);
+    let key_h = (row_h * 2.0 + 8.0).min(plots.height() * 0.44);
     let knee = egui::Rect::from_min_max(
         plots.min,
         egui::pos2(plots.right(), plots.bottom() - key_h - 4.0),
@@ -327,10 +327,26 @@ pub(super) fn draw(face: &Face<'_>) {
     let label = |at: egui::Pos2, align: egui::Align2, text: String, ink| {
         painter.text(at, align, text, font.clone(), ink);
     };
+    // Both key rows are placed by one rule, off the type's own height:
+    // the word and the bar it labels share a centre, and the pair is
+    // centred in the panel. Magic offsets put the second word half
+    // outside the frame.
+    let ch = painter
+        .layout_no_wrap("M".to_owned(), font.clone(), ink)
+        .rect
+        .height();
+    let key_word_w = painter
+        .layout_no_wrap("HRD".to_owned(), font.clone(), ink)
+        .rect
+        .width();
+    let key_row_y = |i: usize| {
+        let pair = ch * 2.0 + 2.0;
+        lay.key.center().y - pair * 0.5 + ch * 0.5 + i as f32 * (ch + 2.0)
+    };
     let key_bar = |i: usize, db: f32, tone: egui::Color32| {
-        let row = egui::Rect::from_min_size(
-            egui::pos2(lay.key.left() + 34.0, lay.key.top() + 4.0 + i as f32 * 9.0),
-            egui::vec2(lay.key.width() - 42.0, 5.0),
+        let row = egui::Rect::from_min_max(
+            egui::pos2(lay.key.left() + key_word_w + 8.0, key_row_y(i) - 2.5),
+            egui::pos2(lay.key.right() - 5.0, key_row_y(i) + 2.5),
         );
         if !row.is_positive() {
             return;
@@ -398,18 +414,14 @@ pub(super) fn draw(face: &Face<'_>) {
         format!("{ratio:.0}:1"),
         ink,
     );
-    label(
-        egui::pos2(lay.key.left() + 3.0, lay.key.top() + 4.0),
-        egui::Align2::LEFT_TOP,
-        "KEY".to_owned(),
-        edge,
-    );
-    label(
-        egui::pos2(lay.key.left() + 3.0, lay.key.top() + 13.0),
-        egui::Align2::LEFT_TOP,
-        "HRD".to_owned(),
-        edge,
-    );
+    for (i, word) in ["KEY", "HRD"].into_iter().enumerate() {
+        label(
+            egui::pos2(lay.key.left() + 4.0, key_row_y(i)),
+            egui::Align2::LEFT_CENTER,
+            word.to_owned(),
+            edge,
+        );
+    }
     for (rect, word, said) in [
         (lay.threshold, "THRES", format!("{threshold:.0}")),
         (lay.ratio, "RATIO", format!("{ratio:.0}:1")),
