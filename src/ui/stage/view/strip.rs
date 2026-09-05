@@ -733,11 +733,8 @@ impl Stage {
         );
 
         // The signal: through the figure when IN, along the foot when OUT.
-        let routes = if is_in {
-            route(rect, piece.kind, piece.notch, piece.tongue)
-        } else {
-            bypass(rect, piece.notch, piece.tongue)
-        };
+        // No cables: the signal path is not drawn through a card.
+        let routes: [Vec<egui::Pos2>; 2] = [Vec::new(), Vec::new()];
         for path in &routes {
             chrome::trace(
                 &mut shapes,

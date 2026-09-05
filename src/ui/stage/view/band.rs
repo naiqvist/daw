@@ -29,7 +29,9 @@ const CHAIN_HEAD_H: f32 = 40.0;
 /// out to their returns and the returns run back into the mix. It costs
 /// the cards one row and buys the one thing a list of devices can never
 /// say — that the signal does not only go left to right.
-const LOOM_H: f32 = 15.0;
+const LOOM_H: f32 = 0.0; // no loom: the cards stand alone
+#[allow(dead_code)]
+const LOOM_H_WAS: f32 = 15.0;
 
 /// The gap the band opens where it crosses from one rail of the desk to
 /// the next. Wide enough for the pair to cross it visibly and for the
@@ -243,22 +245,12 @@ impl Stage {
         // cable with the rail's name engraved over it — because that
         // crossing is a real thing about the desk, not a seam to hide.
         // A return mates with nothing at all: it is a parallel path.
-        let mates = |i: usize| -> bool {
-            i + 1 < columns.len()
-                && columns[i].section.is_some()
-                && columns[i + 1].section.is_some()
-                && columns[i].lane == columns[i + 1].lane
-        };
+        // Standard cards: nothing mates, nothing crosses, and the gap
+        // between any two is the gap.
+        let mates = |_i: usize| -> bool { false };
         // Where the band crosses rails it opens the wider gap, so the
         // cable and the rail's name have room to be seen.
-        let crossing = |i: usize| -> bool {
-            i + 1 < columns.len()
-                && columns[i].section.is_some()
-                && columns[i + 1].section.is_some()
-                && columns[i].lane != columns[i + 1].lane
-                && columns[i].lane.in_series()
-                && columns[i + 1].lane.in_series()
-        };
+        let crossing = |_i: usize| -> bool { false };
         let step = |i: usize| -> f32 {
             widths[i]
                 + if mates(i) {
@@ -311,65 +303,7 @@ impl Stage {
         if layout.is_empty() {
             return;
         }
-
-        // The signal between cards, and from the last card into the
-        // first piece's notch. Between two pieces there is no trace to
-        // draw: they are joined. A bypassed card bends the trace upward
-        // before it arrives, as it always did.
-        let signal_y = tray.top() + head_h - 5.0;
         let sounding = self.playing_on(track).is_some();
-        for pair in layout.windows(2) {
-            let (left_index, left_rect) = pair[0];
-            let (right_index, right_rect) = pair[1];
-            if columns[left_index].section.is_some() && columns[right_index].section.is_some() {
-                let (left_lane, right_lane) = (columns[left_index].lane, columns[right_index].lane);
-                if left_lane == right_lane {
-                    // Joined. There is nothing between them to draw.
-                    continue;
-                }
-                if !left_lane.in_series() || !right_lane.in_series() {
-                    // A return is reached by its cable, not by the rail.
-                    continue;
-                }
-                self.draw_rail_crossing(
-                    painter, left_rect, right_rect, right_lane, sounding, phase,
-                );
-                continue;
-            }
-            let from = egui::pos2(left_rect.right(), signal_y);
-            let right_is_piece = columns[right_index].section.is_some();
-            let to = if right_is_piece {
-                egui::pos2(
-                    right_rect.left() + strip::TONGUE,
-                    strip::joint_y(right_rect),
-                )
-            } else {
-                egui::pos2(right_rect.left(), signal_y)
-            };
-            let path = if columns[right_index].bypassed && !right_is_piece {
-                let lift = gap.min(8.0);
-                vec![
-                    from,
-                    egui::pos2(from.x + lift, signal_y - lift),
-                    egui::pos2(to.x - lift, signal_y - lift),
-                    to,
-                ]
-            } else {
-                chrome::elbow(from, to)
-            };
-            let mut shapes = Vec::new();
-            chrome::trace(&mut shapes, &path, Weight::Hair, self.glass().edge.color);
-            if sounding && phase.rolling {
-                chrome::dashes(
-                    &mut shapes,
-                    &path,
-                    phase.dash(),
-                    Weight::Heavy,
-                    self.glass().live_dim.color,
-                );
-            }
-            painter.extend(shapes);
-        }
 
         // The pieces: every body first, so a tongue laid afterwards lies
         // in its neighbour's notch rather than under it.
@@ -385,8 +319,7 @@ impl Stage {
                             // A return is off the rail, so it wears a
                             // notch for its send cable and leaves by a
                             // pad rather than by a tongue.
-                            notch: !columns[*i].lane.in_series()
-                                || (*i > 0 && columns[*i - 1].section.is_some()),
+                            notch: false,
                             tongue: mates(*i),
                         },
                         &columns[*i],
@@ -431,18 +364,6 @@ impl Stage {
                 pitch,
             );
         }
-        self.draw_loom(
-            painter,
-            egui::Rect::from_min_max(
-                egui::pos2(tray.left() + margin, tray.bottom() - margin - LOOM_H),
-                egui::pos2(tray.right() - margin, tray.bottom() - margin),
-            ),
-            track,
-            &columns,
-            &layout,
-            sounding,
-            phase,
-        );
     }
 
     /// Where the band crosses from one rail of the desk to the next:
