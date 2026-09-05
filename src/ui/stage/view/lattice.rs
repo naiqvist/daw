@@ -35,6 +35,16 @@ const INSET: f32 = 6.0;
 const TYPE_PX: f32 = 12.0;
 
 /// Where the first row begins.
+/// One scene's row, live.
+pub(super) fn row_h() -> f32 {
+    crate::tune!(ROW_H)
+}
+
+/// The gap under the heads, live.
+pub(super) fn head_gap() -> f32 {
+    crate::tune!(HEAD_GAP)
+}
+
 pub(super) fn top(field: egui::Rect) -> f32 {
     heads::head_rect(field, 0).max.y + crate::tune!(HEAD_GAP)
 }
