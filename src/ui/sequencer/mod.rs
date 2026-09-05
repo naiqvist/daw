@@ -54,11 +54,16 @@ use sequence::NoteView;
 /// bytes are not a perceptual space — which is the same argument the
 /// design alphabet's ladder is built on.
 pub fn shade(level: u8, ground: design::Polarity) -> egui::Color32 {
-    // Chrome, not grey: the same cold tint the alphabet's ladder wears,
-    // with red still carrying the exact level this projection promises.
-    match ground {
-        design::Polarity::Dark => design::chrome(level),
-        design::Polarity::Light => design::chrome(MIRROR[level as usize]),
+    let level = match ground {
+        design::Polarity::Dark => level,
+        design::Polarity::Light => MIRROR[level as usize],
+    };
+    // A frame that projects the ladder through its own ground gets every
+    // level as a shade of that ground; otherwise chrome, not grey — the
+    // same cold tint the alphabet's ladder wears.
+    match SHADE.read().ok().and_then(|s| *s) {
+        Some(lift) => lift(f32::from(level) / 255.0),
+        None => design::chrome(level),
     }
 }
 
@@ -344,6 +349,16 @@ mod tests {
 static PROJECTION: std::sync::RwLock<
     Option<fn(crate::design::Alphabet) -> crate::design::Alphabet>,
 > = std::sync::RwLock::new(None);
+
+static SHADE: std::sync::RwLock<Option<fn(f32) -> egui::Color32>> = std::sync::RwLock::new(None);
+
+/// Register (or clear) the ladder the sequencer's levels are read on:
+/// `0` the ground, `1` the reading surface.
+pub fn set_shade(lift: Option<fn(f32) -> egui::Color32>) {
+    if let Ok(mut w) = SHADE.write() {
+        *w = lift;
+    }
+}
 
 /// Register (or clear) the lift the sequencer's colours pass through.
 pub fn set_projection(lift: Option<fn(crate::design::Alphabet) -> crate::design::Alphabet>) {

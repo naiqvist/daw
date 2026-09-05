@@ -125,16 +125,31 @@ impl Colours {
 
 static CURRENT: RwLock<Colours> = RwLock::new(Colours::DEFAULT);
 
+/// A shade of the ground: the ground's own hue and chroma, its lightness
+/// raised by `t` of the way toward the reading surface. `0` is the
+/// ground, `1` is as light as ink. Every neutral the shared widgets need
+/// is one of these, so nothing on the glass is grey.
+pub fn shade(t: f32) -> Color32 {
+    let c = colours();
+    let [l, chroma, h] = to_lch(c.ground);
+    let ink_l = to_lch(c.ink)[0];
+    let t = f64::from(t.clamp(0.0, 1.0));
+    let lch = [l + (ink_l - l) * t, chroma * (1.0 + 1.5 * t), h];
+    to_color32(lch)
+}
+
 /// The design alphabet, seen through the console: what the shared
-/// sequencer draws in once it is on this glass. Tiers and channels are
-/// the alphabet's own; only the colours change.
+/// sequencer draws in once it is on this glass. Its neutral ladder —
+/// ground, well, surface, edge, ink, focus — becomes shades of the
+/// ground; its signals become the console's types. Tiers and channels
+/// are the alphabet's own.
 pub fn lift(mut a: crate::design::Alphabet) -> crate::design::Alphabet {
     let c = colours();
-    a.ground.color = c.ground;
-    a.well.color = c.ground;
-    a.surface.color = c.panel;
-    a.edge.color = c.edge;
-    a.ink.color = c.fg;
+    a.ground.color = shade(0.0);
+    a.well.color = shade(0.0);
+    a.surface.color = shade(0.10);
+    a.edge.color = shade(0.28);
+    a.ink.color = shade(0.62);
     a.focus.color = c.alert;
     a.jeopardy_latent.color = c.alert;
     a.jeopardy_active.color = c.fault;

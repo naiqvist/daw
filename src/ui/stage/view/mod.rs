@@ -201,6 +201,7 @@ impl Stage {
     /// The ground, and on it what has been drawn so far.
     fn draw(&mut self, ui: &mut egui::Ui) {
         crate::ui::sequencer::set_projection(Some(palette::lift));
+        crate::ui::sequencer::set_shade(Some(palette::shade));
         let whole = ui.available_rect_before_wrap();
         let painter = ui.painter();
         painter.rect_filled(whole, 0.0, palette::colours().ground);
