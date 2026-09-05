@@ -22,6 +22,9 @@ use crate::PROFONT;
 /// The field's inset from the window, on every side.
 /// @tune 0..64 px
 pub(super) const MARGIN: f32 = 16.0;
+/// The scene gutter, left of the first column: room for a row's number.
+/// @tune 0..64 px
+pub(super) const GUTTER: f32 = 28.0;
 /// One head's width.
 /// @tune 48..200 px
 pub(super) const HEAD_W: f32 = 96.0;
@@ -41,7 +44,10 @@ const TYPE_PX: f32 = 12.0;
 /// master its own column. Never fewer than one, or the cursor would
 /// have nowhere to stand.
 pub(super) fn capacity(field_w: f32) -> usize {
-    let usable = field_w - crate::tune!(MARGIN) * 2.0 - (crate::tune!(HEAD_W) + crate::tune!(GAP));
+    let usable = field_w
+        - crate::tune!(MARGIN) * 2.0
+        - crate::tune!(GUTTER)
+        - (crate::tune!(HEAD_W) + crate::tune!(GAP));
     ((usable / (crate::tune!(HEAD_W) + crate::tune!(GAP)))
         .floor()
         .max(1.0)) as usize
@@ -53,6 +59,7 @@ pub(super) fn head_rect(field: egui::Rect, slot: usize) -> egui::Rect {
         egui::pos2(
             field.min.x
                 + crate::tune!(MARGIN)
+                + crate::tune!(GUTTER)
                 + slot as f32 * (crate::tune!(HEAD_W) + crate::tune!(GAP)),
             field.min.y + crate::tune!(MARGIN),
         ),
@@ -180,15 +187,6 @@ impl Stage {
             let bar =
                 egui::Rect::from_min_max(egui::pos2(inner.min.x, inner.max.y - BAR_H), inner.max);
             painter.rect_filled(bar, 0.0, c.nominal);
-        }
-        // The cursor in this column but below the head: a chassis bar
-        // under the foot, pointing at where it is.
-        if face.standing == Standing::Column {
-            let bar = egui::Rect::from_min_max(
-                egui::pos2(rect.min.x + 6.0, rect.max.y + 3.0),
-                egui::pos2(rect.max.x - 6.0, rect.max.y + 3.0 + BAR_H),
-            );
-            painter.rect_filled(bar, 0.0, c.chassis);
         }
     }
 }

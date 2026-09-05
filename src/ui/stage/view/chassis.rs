@@ -54,6 +54,19 @@ fn to_pos(p: (f64, f64)) -> egui::Pos2 {
     egui::pos2(p.0 as f32, p.1 as f32)
 }
 
+/// Four brackets and no outline: the cursor at cell scale.
+pub fn brackets(painter: &egui::Painter, rect: egui::Rect, arm: f64) {
+    let c = palette::colours();
+    let mut arms = Vec::new();
+    bracket::corners(&bounds_of(rect), bracket::Arms::all(arm), &mut arms);
+    for arm in &arms {
+        painter.add(egui::Shape::line(
+            arm.iter().copied().map(to_pos).collect(),
+            egui::Stroke::new(1.5, c.alert),
+        ));
+    }
+}
+
 /// Draw a chassis around `rect`.
 pub fn frame(painter: &egui::Painter, rect: egui::Rect, focused: bool) {
     let c = palette::colours();

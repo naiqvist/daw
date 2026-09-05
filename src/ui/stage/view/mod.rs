@@ -16,6 +16,7 @@ mod chassis;
 mod heads;
 mod input;
 mod inspector;
+mod lattice;
 mod palette;
 mod utility;
 
@@ -149,7 +150,7 @@ impl Stage {
         let field = ui.available_rect_before_wrap();
         self.follow_cursor(
             heads::capacity(field.width()),
-            HOLDS_EVERYTHING,
+            lattice::capacity(field),
             HOLDS_EVERYTHING,
         );
 
@@ -168,6 +169,7 @@ impl Stage {
         let painter = ui.painter();
         painter.rect_filled(whole, 0.0, palette::colours().ground);
         self.draw_heads(painter, whole);
+        self.draw_lattice(painter, whole);
         let mut inspector = inspector();
         if inspector.open {
             let panel = egui::Rect::from_min_max(
