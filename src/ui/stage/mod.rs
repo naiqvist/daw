@@ -313,6 +313,20 @@ pub enum RefusalReason {
     Unavailable,
 }
 
+/// The last parameter a hand moved: which device, which knob, and what
+/// it now reads. One place on the screen says this, so a control that
+/// is a picture rather than a row of words can still be read in
+/// figures the moment it is touched.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Touch {
+    /// The device's terse machine address, as the band's header cuts it.
+    pub device: &'static str,
+    /// The parameter's own word.
+    pub name: &'static str,
+    /// Its value, formatted with the catalog's unit.
+    pub value: String,
+}
+
 /// A rejected application. The intent remains attached to its reason so
 /// future callers can report precisely what the stage declined.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -365,6 +379,10 @@ pub struct Stage {
     /// Project, machine, render and diagnostics surfaces. One modal owner so
     /// utility keys cannot leak through to the musical surface beneath it.
     utility: utility::Console,
+    /// The last parameter moved, until another replaces it. Unlike a
+    /// refusal this is NOT cleared each frame: the readout is meant to
+    /// still be there a moment after your hand has left the knob.
+    touch: Option<Touch>,
     /// Latest refusal in this frame. Cleared at the next `show`, and drawn
     /// from one site after every key has been applied.
     refusal: Option<Refusal>,
@@ -656,6 +674,7 @@ impl Stage {
             browser_leaving: None,
             help: false,
             utility: utility::Console::default(),
+            touch: None,
             refusal: None,
             strip_offset: 0,
             scene_offset: 0,
@@ -1227,6 +1246,11 @@ impl Stage {
 
     /// Note that what sounds has changed. Called by the edits that change
     /// it and by nothing else — see [`Self::revision`].
+    /// The last parameter a hand moved, for the one readout that says so.
+    pub(in crate::ui::stage) fn last_touch(&self) -> Option<&Touch> {
+        self.touch.as_ref()
+    }
+
     fn touched(&mut self) {
         self.revision = self.revision.wrapping_add(1);
     }
@@ -3504,8 +3528,13 @@ impl Stage {
                             let before = lane.value(param);
                             lane.set(param, before + step);
                             let after = lane.value(param);
-                            self.notice =
-                                Some(format!("{name} {}", chain::format_param(def, label, after)));
+                            let reading = chain::format_param(def, label, after);
+                            self.touch = Some(Touch {
+                                device: spec.prefix,
+                                name,
+                                value: reading.clone(),
+                            });
+                            self.notice = Some(format!("{name} {reading}"));
                             if after == before {
                                 // The end of the range, said the way the
                                 // edge of a grid is said.

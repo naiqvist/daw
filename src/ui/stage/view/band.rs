@@ -648,6 +648,95 @@ impl Stage {
                 x += (value.chars().count() as f32 + 2.5) * px * 0.6;
             }
         }
+        self.draw_touch(painter, tray, label_y, &font);
+    }
+
+    /// The touch readout: the last knob your hand moved, in figures, at
+    /// the right end of the band's own header.
+    ///
+    /// A card whose controls are pictures — a curve, a ladder, a needle
+    /// — is read faster than a table but says no numbers. This is where
+    /// the number goes, and it is one place rather than one per card, so
+    /// the eye learns where to look. It fades once the hand has left,
+    /// because a figure that stays forever stops meaning "just now".
+    fn draw_touch(
+        &self,
+        painter: &egui::Painter,
+        tray: egui::Rect,
+        label_y: f32,
+        font: &egui::FontId,
+    ) {
+        let Some(touch) = self.last_touch() else {
+            return;
+        };
+        let c = palette::colours();
+        let said = format!("{} {} {}", touch.device, touch.name, touch.value);
+        // The age lives with the drawing rather than in the core: the
+        // core knows WHAT was touched, the view knows how long ago.
+        let id = egui::Id::new("band-touch-age");
+        let dt = painter.ctx().input(|input| input.stable_dt);
+        let age = painter.ctx().data_mut(|data| {
+            let held = data.get_temp::<(String, f32)>(id);
+            let age = match held {
+                Some((was, age)) if was == said => age + dt,
+                _ => 0.0,
+            };
+            data.insert_temp(id, (said.clone(), age));
+            age
+        });
+        /// How long the reading stands before it begins to go.
+        /// @tune 0.5..20 s
+        const HOLD: f32 = 3.0;
+        /// How long it takes to go, once it starts.
+        /// @tune 0.1..8 s
+        const FADE: f32 = 1.6;
+        let strength = 1.0 - ((age - crate::tune!(HOLD)) / crate::tune!(FADE)).clamp(0.0, 1.0);
+        if strength <= 0.01 {
+            return;
+        }
+        if age < crate::tune!(HOLD) + crate::tune!(FADE) {
+            painter.ctx().request_repaint();
+        }
+        let px = font.size;
+        let right = tray.max.x - super::heads::margin();
+        let width = (said.chars().count() as f32 + 1.0) * px * 0.6;
+        let dim = |ink: egui::Color32| {
+            egui::Color32::from_rgba_unmultiplied(
+                ink.r(),
+                ink.g(),
+                ink.b(),
+                (255.0 * strength) as u8,
+            )
+        };
+        // The word that says this is a reading and not a heading. It
+        // stands its own width clear of the figures, or it runs into
+        // them the moment a parameter has a long name.
+        let stem = ("touch".len() as f32 + 1.5) * px * 0.6;
+        painter.text(
+            egui::pos2(right - width - stem, label_y),
+            egui::Align2::LEFT_CENTER,
+            "touch",
+            font.clone(),
+            dim(c.label),
+        );
+        let mut x = right - width;
+        for (word, ink) in [(touch.device, c.dim), (touch.name, c.label)] {
+            painter.text(
+                egui::pos2(x, label_y),
+                egui::Align2::LEFT_CENTER,
+                word,
+                font.clone(),
+                dim(ink),
+            );
+            x += (word.chars().count() as f32 + 1.0) * px * 0.6;
+        }
+        painter.text(
+            egui::pos2(x, label_y),
+            egui::Align2::LEFT_CENTER,
+            &touch.value,
+            font.clone(),
+            dim(c.fg),
+        );
     }
 
     fn draw_chain_card(
