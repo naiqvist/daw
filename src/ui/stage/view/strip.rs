@@ -100,38 +100,11 @@ pub fn width_of(kind: SectionKind) -> f32 {
 /// neighbours are cut alike and the run's corners are a rhythm rather
 /// than a rule.
 pub fn cuts(kind: SectionKind) -> (f32, f32, f32, f32) {
-    let c = chrome::CHAMFER;
-    let (tl, tr, br, bl) = match kind {
-        // The channel.
-        SectionKind::Preamp => (1.5, 0.75, 1.75, 1.0),
-        SectionKind::Tone => (1.0, 1.0, 2.0, 2.0),
-        SectionKind::Door => (2.0, 2.0, 1.0, 1.0),
-        SectionKind::Cut => (0.5, 0.5, 2.5, 0.5),
-        SectionKind::Hit => (2.5, 0.5, 1.5, 2.5),
-        SectionKind::Four => (2.0, 1.5, 0.5, 0.5),
-        SectionKind::Vca => (2.25, 0.75, 2.25, 0.75),
-        SectionKind::Split => (2.25, 0.75, 0.75, 2.25),
-        SectionKind::Pump => (2.25, 0.5, 0.5, 2.25),
-        SectionKind::Drive => (2.0, 1.0, 0.5, 1.5),
-        SectionKind::Grit => (2.5, 0.5, 0.5, 2.5),
-        SectionKind::Shine => (1.0, 0.5, 2.0, 1.5),
-        SectionKind::Drift => (2.25, 0.5, 1.75, 0.75),
-        SectionKind::Phase => (2.0, 1.0, 2.0, 1.0),
-        SectionKind::Smear => (2.0, 0.5, 2.0, 0.5),
-        SectionKind::Ring => (2.0, 2.0, 2.0, 2.0),
-        SectionKind::Spectra => (1.5, 0.5, 2.75, 0.5),
-        SectionKind::Echo => (0.5, 2.0, 2.25, 1.25),
-        SectionKind::Room => (1.0, 1.0, 3.0, 3.0),
-        SectionKind::Out => (1.0, 0.75, 3.0, 1.5),
-        // The desk.
-        SectionKind::Glue => (0.75, 2.0, 0.75, 2.0),
-        SectionKind::Iron => (2.0, 0.75, 0.5, 0.5),
-        SectionKind::Ceiling => (0.5, 0.5, 2.5, 2.5),
-        SectionKind::Scope => (1.0, 1.5, 2.5, 1.5),
-        SectionKind::Tape => (2.5, 1.0, 1.0, 2.0),
-        SectionKind::Shadow => (1.5, 1.0, 3.0, 1.5),
-    };
-    (c * tl, c * tr, c * br, c * bl)
+    // The console keys only the ends of a row; a band of pieces is one
+    // run, so every piece is square. The section's identity is its
+    // width, its face and its route — not a corner of its own.
+    let _ = kind;
+    (0.0, 0.0, 0.0, 0.0)
 }
 
 /// The lowest a crevice may be cut into a wall, as a share of the
@@ -147,12 +120,9 @@ const CREVICE_FLOOR: f32 = 0.24;
 /// on the right, which is what stops a run of them reading as a row of
 /// boxes.
 pub fn shoulder(kind: SectionKind) -> Option<(f32, f32)> {
-    match kind {
-        SectionKind::Door => Some((0.46, 15.0)),
-        SectionKind::Hit => Some((0.55, 13.0)),
-        SectionKind::Glue => Some((0.36, 11.0)),
-        _ => None,
-    }
+    // No steps in a top edge: a piece is a plain component.
+    let _ = kind;
+    None
 }
 
 /// A bay cut into a piece's RIGHT wall, under the joint: where it
@@ -667,24 +637,13 @@ impl Stage {
         column: &chain::Column,
     ) {
         let alpha = self.glass();
-        let fill = if column.bypassed {
-            alpha.ground.color
-        } else {
-            alpha.surface.color
-        };
+        // A casing is outlined on the ground, like every chassis on the
+        // console; it is not a plate, and it casts no shadow.
+        let fill = alpha.ground.color;
+        let _ = column;
         let mut shapes = Vec::new();
         // A piece stands one hard step above the field. The shadow is
         // the same cut body translated once: no blur and no gradient.
-        body_fill(
-            &mut shapes,
-            piece
-                .rect
-                .translate(egui::vec2(chrome::SHADOW_X, chrome::SHADOW_Y)),
-            piece.kind,
-            piece.notch,
-            chrome::shadow_ink(alpha.ground.color),
-            alpha.ground.color,
-        );
         body_fill(
             &mut shapes,
             piece.rect,
@@ -714,11 +673,7 @@ impl Stage {
         let alpha = self.glass();
         let rect = piece.rect;
         let is_in = !column.bypassed;
-        let fill = if is_in {
-            alpha.surface.color
-        } else {
-            alpha.ground.color
-        };
+        let fill = alpha.ground.color;
         let ink = if is_in {
             alpha.ink.color
         } else {
@@ -747,12 +702,23 @@ impl Stage {
         }
         let mut path = outline(rect, piece.kind, piece.notch, piece.tongue);
         path.push(path[0]);
-        chrome::trace(
-            &mut shapes,
-            &path,
-            if focused { Weight::Heavy } else { Weight::Hair },
-            if focused { alpha.ink.color } else { edge },
-        );
+        // The casing's line: a hairline in edge at rest, the live chassis
+        // under the cursor, and dashed while the section is OUT — the
+        // console's reading of focus and of a thing switched off.
+        if is_in {
+            chrome::trace(
+                &mut shapes,
+                &path,
+                Weight::Hair,
+                if focused {
+                    palette::colours().chassis
+                } else {
+                    edge
+                },
+            );
+        } else {
+            chrome::dashes(&mut shapes, &path, 0.0, Weight::Hair, edge);
+        }
         // The head's foot: a rule under the name band, short of the walls.
         chrome::trace(
             &mut shapes,

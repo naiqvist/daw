@@ -146,7 +146,7 @@ pub fn shade(t: f32) -> Color32 {
 pub fn lift(mut a: crate::design::Alphabet) -> crate::design::Alphabet {
     let c = colours();
     a.ground.color = shade(0.0);
-    a.well.color = shade(0.0);
+    a.well.color = shade(0.06);
     a.surface.color = shade(0.10);
     a.edge.color = shade(0.28);
     a.ink.color = shade(0.62);
