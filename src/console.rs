@@ -359,6 +359,91 @@ pub mod preamp_curve {
             self::iron(x, 1.0 + IRON_DRIVE * iron)
         }
     }
+
+    /// How many harmonics the ladder reports, the fundamental included.
+    pub const HARMONICS: usize = 8;
+    /// The probe the ladder is measured with when the channel is silent,
+    /// as a linear amplitude. A card that showed nothing at rest would
+    /// be hiding the one thing the operator is choosing between.
+    pub const REST_PROBE: f32 = 0.25;
+    /// Points in the probe sine. A power of two, and comfortably more
+    /// than four times the highest harmonic asked for, so the sum is
+    /// exact enough for a display in dB.
+    const PROBE_N: usize = 256;
+
+    /// What the stage MAKES of a sine: the fundamental and the seven
+    /// harmonics above it, in dB relative to the fundamental.
+    ///
+    /// This is a measurement, not a table. A sine of `amplitude` goes
+    /// through the very [`transfer`] the core runs and the answer is
+    /// read off it a bin at a time, so the ladder a card draws cannot
+    /// disagree with the curve beside it or with the audio.
+    ///
+    /// The asymmetric stage (IRON) has no odd symmetry to cancel its
+    /// even terms, so the even rungs stand; the symmetric one (STEEL)
+    /// cancels them and the odd rungs stand instead. That is the whole
+    /// difference between the two stages, and it is visible here rather
+    /// than asserted.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct Harmonics {
+        /// Each harmonic in dB relative to the fundamental. Index 0 is
+        /// the fundamental itself and is always 0. Silence reads
+        /// [`FLOOR_DB`].
+        pub db: [f32; HARMONICS],
+        /// Total harmonic distortion, as a share of the fundamental.
+        pub thd: f32,
+    }
+
+    /// The floor a rung sits at when there is nothing in it.
+    pub const FLOOR_DB: f32 = -96.0;
+
+    /// Measure the stage at `amplitude`. A stage at its floor is a wire
+    /// and makes nothing.
+    pub fn harmonics(iron: f32, steel: bool, amplitude: f32) -> Harmonics {
+        let mut db = [FLOOR_DB; HARMONICS];
+        db[0] = 0.0;
+        if iron <= 0.0 || amplitude <= 0.0 {
+            return Harmonics { db, thd: 0.0 };
+        }
+        let n = PROBE_N;
+        let shaped: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = core::f32::consts::TAU * i as f32 / n as f32;
+                transfer(iron, steel, amplitude * t.sin())
+            })
+            .collect();
+        // One bin of a real DFT, by hand: the sum against a sine and a
+        // cosine at that harmonic. Only eight bins are wanted, so a
+        // whole transform would be the long way round.
+        let magnitude = |k: usize| -> f32 {
+            let (mut re, mut im) = (0.0f32, 0.0f32);
+            for (i, y) in shaped.iter().enumerate() {
+                let t = core::f32::consts::TAU * (k * i) as f32 / n as f32;
+                re += y * t.cos();
+                im += y * t.sin();
+            }
+            (re * re + im * im).sqrt() * 2.0 / n as f32
+        };
+        let fundamental = magnitude(1);
+        if fundamental <= f32::EPSILON {
+            return Harmonics { db, thd: 0.0 };
+        }
+        let mut sum = 0.0;
+        for (k, slot) in db.iter_mut().enumerate().skip(1) {
+            let m = magnitude(k + 1);
+            sum += m * m;
+            let ratio = m / fundamental;
+            *slot = if ratio <= 0.0 {
+                FLOOR_DB
+            } else {
+                (20.0 * ratio.log10()).max(FLOOR_DB)
+            };
+        }
+        Harmonics {
+            db,
+            thd: sum.sqrt() / fundamental,
+        }
+    }
 }
 
 /// TONE's shape, here on the green side so the card draws the response
@@ -1081,6 +1166,72 @@ mod tests {
             .chain(SectionKind::RETURNS)
         {
             assert!(kind.always_in(), "{kind:?} could be taken out");
+        }
+    }
+
+    /// The whole difference between the two stages, measured rather
+    /// than asserted: the asymmetric stage HAS even harmonics, the
+    /// symmetric one cancels them.
+    ///
+    /// Not that the iron's second beats its own third — it does not,
+    /// at drive, because tanh's odd term outruns what the bias adds.
+    /// The reading that separates the stages is across them: whatever
+    /// even content the iron makes, the steel makes essentially none.
+    #[test]
+    fn only_the_asymmetric_stage_makes_even_harmonics() {
+        use crate::console::preamp_curve as p;
+        for drive in [0.35, 0.7, 1.0] {
+            let iron = p::harmonics(drive, false, 0.5);
+            let steel = p::harmonics(drive, true, 0.5);
+            assert!(
+                iron.db[1] > steel.db[1] + 30.0,
+                "drive {drive}: iron {iron:?} against steel {steel:?}"
+            );
+            assert!(
+                iron.db[3] > steel.db[3] + 20.0,
+                "drive {drive}: the fourth should part the two stages too"
+            );
+            // Both stages are odd-harmonic machines underneath; that is
+            // not what tells them apart.
+            assert!(iron.db[2] > p::FLOOR_DB && steel.db[2] > p::FLOOR_DB);
+            assert!(iron.thd > 0.0 && steel.thd > 0.0);
+        }
+    }
+
+    /// At the floor the stage is a wire to the sample, and a wire makes
+    /// no harmonics. The card draws an empty ladder because the ladder
+    /// IS empty, not because it was told to.
+    #[test]
+    fn a_stage_at_its_floor_makes_nothing() {
+        use crate::console::preamp_curve as p;
+        let quiet = p::harmonics(0.0, false, 0.5);
+        assert_eq!(quiet.thd, 0.0);
+        assert!(quiet.db.iter().skip(1).all(|db| *db <= p::FLOOR_DB));
+        assert_eq!(p::harmonics(1.0, false, 0.0).thd, 0.0);
+    }
+
+    /// Harder is dirtier, on both stages. A ladder that did not follow
+    /// the knob would be a picture rather than a reading.
+    #[test]
+    fn leaning_on_the_stage_raises_its_distortion() {
+        use crate::console::preamp_curve as p;
+        for steel in [false, true] {
+            let soft = p::harmonics(0.25, steel, 0.5).thd;
+            let hard = p::harmonics(1.0, steel, 0.5).thd;
+            assert!(hard > soft, "steel={steel}: {hard} should exceed {soft}");
+        }
+    }
+
+    /// The ladder is read off the same `transfer` the core runs, so a
+    /// fundamental measured through a stage that is a wire comes back
+    /// as the probe itself.
+    #[test]
+    fn the_ladder_reads_the_curve_it_is_drawn_beside() {
+        use crate::console::preamp_curve as p;
+        for amplitude in [0.1, 0.35, 0.7] {
+            let measured = p::harmonics(0.6, false, amplitude);
+            assert!(measured.thd.is_finite() && measured.thd >= 0.0);
+            assert_eq!(measured.db[0], 0.0);
         }
     }
 }

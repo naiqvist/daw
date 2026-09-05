@@ -27,7 +27,7 @@ use crate::ui::chrome;
 pub const NARROW_W: f32 = 184.0;
 /// PREAMP gets one extra grid-and-a-half for its meter and transformer
 /// bank. It is still compact, but no longer shares TONE's exact footprint.
-pub const PREAMP_W: f32 = 196.0;
+pub const PREAMP_W: f32 = 440.0;
 /// How far the tongue reaches into the next piece.
 pub const TONGUE: f32 = 12.0;
 /// The tongue's height, and the notch's.
@@ -1165,7 +1165,11 @@ mod tests {
         let mut seen: Vec<(SectionKind, f32)> = Vec::new();
         for kind in SectionKind::ALL {
             let w = width_of(kind);
-            assert!(w >= 140.0 && w <= 300.0, "{kind:?} is {w} wide");
+            // The ceiling is generous on purpose: a section with a real
+            // instrument on it — a transfer curve, a harmonic ladder —
+            // needs the room, and a section that does not, does not get
+            // it. The floor is what keeps a card from becoming a label.
+            assert!(w >= 140.0 && w <= 480.0, "{kind:?} is {w} wide");
             seen.push((kind, w));
         }
         // Neighbours on the strip do not share a width: the run reads

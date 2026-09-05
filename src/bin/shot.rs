@@ -725,6 +725,31 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
                 backend: "JACK",
             }));
         }
+    } else if which.contains("preamp") {
+        // The head of the channel strip, with the stage leaned on so
+        // the curve bends and the ladder has rungs to show.
+        use daw::devices::DeviceKind;
+        for kind in [DeviceKind::Poly] {
+            let _ = stage.song_mut().add_device(0, kind);
+        }
+        {
+            use daw::params::console::preamp as p;
+            let song = stage.song_mut();
+            if let Some(device) = song
+                .section(0, daw::console::SectionKind::Preamp)
+                .map(|device| device.id)
+                .and_then(|id| song.device_mut(id))
+            {
+                device.set(p::TRIM, 3.0);
+                device.set(p::IRON, 68.0);
+                device.set(p::COLOUR, 1.0);
+            }
+        }
+        let _ = stage.apply(StageIntent::Devices);
+        // Right along the band to the strip's first section.
+        for _ in 0..1 {
+            let _ = stage.apply(StageIntent::Step(Step::Right));
+        }
     } else if which.contains("chain") {
         // A voice and two effects, with a few values moved off their
         // defaults so the band has something to distinguish.
