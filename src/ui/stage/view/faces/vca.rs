@@ -374,7 +374,9 @@ pub(super) fn draw(face: &Face<'_>) {
     );
     for db in [0.0f32, 6.0, 20.0] {
         label(
-            on_dial(pivot, radius - 14.0, deg_of_reduction(db)),
+            // Well inside the arc: the ticks reach in six from it, so a
+            // figure any closer sits on their ends.
+            on_dial(pivot, radius - 22.0, deg_of_reduction(db)),
             egui::Align2::CENTER_CENTER,
             format!("{db:.0}"),
             if db >= 10.0 {
