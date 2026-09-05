@@ -45,6 +45,11 @@ pub(super) fn margin() -> f32 {
     crate::tune!(MARGIN)
 }
 
+/// The scene gutter, live.
+pub(super) fn gutter() -> f32 {
+    crate::tune!(GUTTER)
+}
+
 /// How many track heads fit across a field this wide, leaving the
 /// master its own column. Never fewer than one, or the cursor would
 /// have nowhere to stand.

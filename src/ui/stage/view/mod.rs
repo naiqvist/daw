@@ -21,6 +21,7 @@ mod inspector;
 mod lattice;
 mod mixer;
 mod palette;
+mod song;
 mod status;
 mod tray;
 mod utility;
@@ -209,13 +210,19 @@ impl Stage {
         painter.rect_filled(whole, 0.0, palette::colours().ground);
         let layout = Layout::of(whole);
         self.draw_title(painter, layout.title);
-        self.draw_heads(painter, layout.field);
-        // The mixer replaces the scene rows and gives them back: the
-        // heads never move across the change, so the eye keeps its place.
-        if self.mixing {
-            self.draw_mixer(painter, layout.field);
+        if self.song_view {
+            // The field turned over: the song's arrangement in the
+            // session's place.
+            self.draw_song(painter, layout.field);
         } else {
-            self.draw_lattice(painter, layout.field);
+            self.draw_heads(painter, layout.field);
+            // The mixer replaces the scene rows and gives them back: the
+            // heads never move across the change, so the eye keeps its place.
+            if self.mixing {
+                self.draw_mixer(painter, layout.field);
+            } else {
+                self.draw_lattice(painter, layout.field);
+            }
         }
         // Over the field: the browser is a window above the work, not a
         // division of it.
