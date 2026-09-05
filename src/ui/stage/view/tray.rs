@@ -33,20 +33,8 @@ const WIDE: f32 = 1080.0;
 pub(super) const LABEL_H: f32 = 18.0;
 pub(super) const TYPE_PX: f32 = 12.0;
 
-/// The most the tray may grow to when the session leaves room. A card
-/// that took the whole window would leave the session with nowhere to
-/// stand and nothing to be addressed from.
-/// @tune 200..900 px
-pub(super) const TRAY_MAX: f32 = 520.0;
-
-/// The tray's floor: what it keeps even under a deep session.
 pub(super) fn tray_h() -> f32 {
     crate::tune!(TRAY_H)
-}
-
-/// Its ceiling.
-pub(super) fn tray_max() -> f32 {
-    crate::tune!(TRAY_MAX).max(crate::tune!(TRAY_H))
 }
 
 impl super::super::Stage {
@@ -135,16 +123,11 @@ impl super::super::Stage {
         // While a callout is up the sequencer is seen and not heard from.
         let keys = focused && self.trig_menu.is_none() && self.plock_editor.is_none();
 
-        // The sequencer keeps a size the eye has learned — across, and
-        // now down as well. The tray grows with the room the session
-        // leaves, and the grid centres itself in what it is handed, so
-        // handing it the whole of a tall tray floats it away from its
-        // own label. It gets the height it always had, at the top.
         let area = egui::Rect::from_min_max(
             egui::pos2(left, tray.min.y + LABEL_H),
             egui::pos2(
                 (tray.max.x - crate::tune!(MARGIN)).min(left + crate::tune!(WIDE)),
-                tray.max.y.min(tray.min.y + crate::tune!(TRAY_H)),
+                tray.max.y,
             ),
         );
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(area).id_salt("stage-clip"));

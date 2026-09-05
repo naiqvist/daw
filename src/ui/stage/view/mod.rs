@@ -58,17 +58,7 @@ struct Layout {
 }
 
 impl Layout {
-    /// How much of the band the session wants: its heads, the gap under
-    /// them, one row per scene, and the field's own margin.
-    fn session_h(band: egui::Rect, scenes: usize) -> f32 {
-        let head = heads::head_rect(band, 0);
-        (head.max.y - band.min.y)
-            + lattice::head_gap()
-            + scenes as f32 * lattice::row_h()
-            + heads::margin()
-    }
-
-    fn of(whole: egui::Rect, scenes: usize) -> Self {
+    fn of(whole: egui::Rect) -> Self {
         let title_h = status::title_h();
         let status_h = status::status_h();
         let title =
@@ -76,23 +66,9 @@ impl Layout {
         let status =
             egui::Rect::from_min_max(egui::pos2(whole.min.x, whole.max.y - status_h), whole.max);
         let band = egui::Rect::from_min_max(title.left_bottom(), status.right_top());
-        // The tray is cut off the FOOT of the band, and it takes
-        // whatever the session does not need.
-        //
-        // A fixed slice left the field half empty on any song with a
-        // handful of scenes, while the device cards — which carry
-        // curves, ladders and plots that want every pixel — sat in a
-        // sixth of the window. The session asks for what its heads and
-        // its scenes actually occupy; the tray gets the rest, floored so
-        // a deep song never crushes the cards and capped so a shallow
-        // one does not hand them absurd height.
-        let tray_top = {
-            let wanted = tray::tray_h();
-            let ceiling = tray::tray_max();
-            let session = Self::session_h(band, scenes);
-            let room = (band.height() - session).clamp(wanted, ceiling);
-            (band.max.y - room).max(band.min.y)
-        };
+        // The tray is cut off the FOOT of the band, fixed: the session
+        // above keeps its shape whether or not the tray has a clip.
+        let tray_top = (band.max.y - tray::tray_h()).max(band.min.y);
         let field = egui::Rect::from_min_max(band.min, egui::pos2(band.max.x, tray_top));
         let tray = egui::Rect::from_min_max(egui::pos2(band.min.x, tray_top), band.max);
         Self {
@@ -257,10 +233,7 @@ impl Stage {
         let enter_held = ui.input(|input| input.key_down(egui::Key::Enter));
         self.take_pitch_entry(update, enter_held);
 
-        let layout = Layout::of(
-            ui.available_rect_before_wrap(),
-            self.song.session.scenes.len(),
-        );
+        let layout = Layout::of(ui.available_rect_before_wrap());
         let field = layout.field;
         self.follow_cursor(
             heads::capacity(field.width()),
@@ -352,7 +325,7 @@ impl Stage {
         let whole = ui.available_rect_before_wrap();
         let painter = ui.painter();
         painter.rect_filled(whole, 0.0, palette::colours().ground);
-        let layout = Layout::of(whole, self.song.session.scenes.len());
+        let layout = Layout::of(whole);
         // The field is registered to the glass: marks at its corners.
         chassis::marks(painter, layout.field.shrink(4.0), 10.0);
         self.draw_title(painter, layout.title);
