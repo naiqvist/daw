@@ -69,9 +69,9 @@ pub enum Key {
     Both,
 }
 
-/// A chassis keyed by where it stands. Solid with brackets on the square
-/// corners when focused, dashed when not — the same reading as `frame`,
-/// with the corners chosen by position rather than fixed.
+/// A chassis keyed by where it stands. Solid when focused, dashed when
+/// not; the cursor itself is the overlay's (`ui::nav_cursor`), so no
+/// brackets are drawn here.
 pub fn keyed(painter: &egui::Painter, rect: egui::Rect, focused: bool, key: Key) {
     let c = palette::colours();
     let cut = CUT
@@ -94,23 +94,6 @@ pub fn keyed(painter: &egui::Painter, rect: egui::Rect, focused: bool, key: Key)
             outline.iter().copied().map(to_pos).collect(),
             egui::Stroke::new(1.0, c.chassis),
         ));
-        // Brackets on the corners that are still square; a bracket over
-        // a cut corner is a muddle.
-        let arm = |corner: f64| if corner == 0.0 { ARM } else { 0.0 };
-        let arms = bracket::Arms {
-            top_left: arm(corners.top_left),
-            top_right: arm(corners.top_right),
-            bottom_right: arm(corners.bottom_right),
-            bottom_left: arm(corners.bottom_left),
-        };
-        let mut brackets = Vec::new();
-        bracket::corners(&bounds.inset(INSET), arms, &mut brackets);
-        for arm in &brackets {
-            painter.add(egui::Shape::line(
-                arm.iter().copied().map(to_pos).collect(),
-                egui::Stroke::new(1.5, c.alert),
-            ));
-        }
     } else {
         let mut closed = outline.clone();
         closed.push(outline[0]);

@@ -169,7 +169,14 @@ impl super::super::Stage {
                 );
             }
             if on {
-                chassis::brackets(painter, rect, 6.0);
+                crate::ui::nav_cursor::claim(
+                    painter,
+                    ("archive", i),
+                    rect,
+                    crate::ui::nav_cursor::Kind::Row,
+                    crate::ui::nav_cursor::Layer::Surface,
+                    c.alert,
+                );
             }
         }
         if rows.len() > first + capacity {

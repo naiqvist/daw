@@ -171,6 +171,16 @@ impl Stage {
         let c = palette::colours();
         let cursor = face.standing == Standing::Cursor;
         chassis::keyed(painter, rect, cursor, face.key);
+        if cursor {
+            crate::ui::nav_cursor::claim(
+                painter,
+                ("head", face.number),
+                rect,
+                crate::ui::nav_cursor::Kind::Column,
+                crate::ui::nav_cursor::Layer::Surface,
+                c.alert,
+            );
+        }
         let font = egui::FontId::new(TYPE_PX, egui::FontFamily::Name(PROFONT.into()));
 
         let inner = rect.shrink(INSET);

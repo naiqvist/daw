@@ -286,7 +286,14 @@ impl super::super::Stage {
                 }
             }
             if on {
-                chassis::brackets(painter, rect, 5.0);
+                crate::ui::nav_cursor::claim(
+                    painter,
+                    ("trig-menu", i),
+                    rect,
+                    crate::ui::nav_cursor::Kind::Row,
+                    crate::ui::nav_cursor::Layer::Overlay,
+                    c.alert,
+                );
             }
         }
         if overflow {
@@ -403,7 +410,14 @@ impl super::super::Stage {
                 if selected { c.fg } else { c.dim },
             );
             if on {
-                chassis::brackets(painter, rect, 5.0);
+                crate::ui::nav_cursor::claim(
+                    painter,
+                    ("plock-param", i),
+                    rect,
+                    crate::ui::nav_cursor::Kind::Row,
+                    crate::ui::nav_cursor::Layer::Overlay,
+                    c.alert,
+                );
             }
         }
 
@@ -475,13 +489,16 @@ impl super::super::Stage {
                     && editor.graph_lane == li
                     && editor.graph_cell == cell;
                 if on {
-                    chassis::brackets(
+                    crate::ui::nav_cursor::claim(
                         painter,
+                        ("plock-cell", li, cell),
                         egui::Rect::from_min_max(
                             egui::pos2(x0, lane.min.y),
                             egui::pos2(x0 + cell_w, lane.max.y),
                         ),
-                        4.0,
+                        crate::ui::nav_cursor::Kind::Cell,
+                        crate::ui::nav_cursor::Layer::Overlay,
+                        c.alert,
                     );
                 }
             }

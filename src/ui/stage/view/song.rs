@@ -11,7 +11,7 @@
 //! with a wash between them.
 
 use super::heads;
-use super::{chassis, palette};
+use super::palette;
 use crate::PROFONT;
 use crate::sequencing::TICKS_PER_BEAT;
 use crate::ui::stage::arrangement::bar_ticks;
@@ -273,7 +273,14 @@ impl super::super::Stage {
                     );
                 }
                 if on_row && under == Some(i) {
-                    chassis::brackets(painter, rect, 6.0);
+                    crate::ui::nav_cursor::claim(
+                        painter,
+                        ("block", track, i),
+                        rect,
+                        crate::ui::nav_cursor::Kind::Block,
+                        crate::ui::nav_cursor::Layer::Surface,
+                        c.alert,
+                    );
                 }
             }
             // Audio blocks: an outline, the sample's own thing.

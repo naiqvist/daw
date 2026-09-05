@@ -276,6 +276,17 @@ impl super::super::Stage {
                 [egui::pos2(x, inner.min.y), egui::pos2(x, inner.max.y)],
                 egui::Stroke::new(1.5, c.bright),
             );
+            crate::ui::nav_cursor::claim(
+                painter,
+                "cut-cursor",
+                egui::Rect::from_min_max(
+                    egui::pos2(x - 4.0, inner.min.y),
+                    egui::pos2(x + 4.0, inner.max.y),
+                ),
+                crate::ui::nav_cursor::Kind::Playhead,
+                crate::ui::nav_cursor::Layer::Surface,
+                c.alert,
+            );
             let secs = editor.cursor;
             painter.text(
                 egui::pos2(x + 3.0, inner.max.y - TYPE_PX - 2.0),

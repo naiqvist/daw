@@ -7,8 +7,11 @@
 
 use eframe::egui;
 
-const SPRING: f32 = 285.0;
-const DAMPING: f32 = 25.0;
+// Stiffer than it was (285 / 25): the mark gets going faster and lands
+// sooner; damping scaled with the square root of the spring, so the
+// overshoot keeps the same character.
+const SPRING: f32 = 560.0;
+const DAMPING: f32 = 35.0;
 const STYLE_SPEED: f32 = 15.0;
 const FADE_SPEED: f32 = 18.0;
 const SETTLE_SECONDS: f32 = 0.13;

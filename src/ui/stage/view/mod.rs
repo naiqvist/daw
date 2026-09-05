@@ -104,6 +104,14 @@ fn skin() -> std::sync::MutexGuard<'static, palette::Skin> {
 
 impl Stage {
     pub fn show(&mut self, ui: &mut egui::Ui) {
+        // One keyboard cursor for the whole application: surfaces claim
+        // the rectangle they address, and the overlay owns the mark.
+        crate::ui::nav_cursor::configure(
+            ui.ctx(),
+            self.utility.prefs().reduced_motion,
+            self.utility.prefs().cursor_energy,
+        );
+        crate::ui::nav_cursor::begin_frame(ui.ctx());
         // The theme file, once a frame: an edit from the picker lands on
         // the next frame, and a frame is asked for so it shows.
         if skin().poll() | overrides().poll() {
@@ -300,6 +308,7 @@ impl Stage {
         // Last of all, because the machine room is not part of the musical
         // surface: it stands in front of the whole of it.
         self.draw_room(ui.painter(), whole);
+        crate::ui::nav_cursor::paint(ui.ctx());
         let mut inspector = inspector();
         if inspector.open {
             let panel = egui::Rect::from_min_max(

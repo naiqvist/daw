@@ -174,7 +174,14 @@ impl super::super::Stage {
                 );
             }
             if on {
-                chassis::brackets(painter, rect, 5.0);
+                crate::ui::nav_cursor::claim(
+                    painter,
+                    ("room", i),
+                    rect,
+                    crate::ui::nav_cursor::Kind::Row,
+                    crate::ui::nav_cursor::Layer::Utility,
+                    c.alert,
+                );
             }
         }
 
@@ -237,7 +244,14 @@ impl super::super::Stage {
                 let on = i == self.utility.confirm_row;
                 if on {
                     painter.rect_filled(rect, 0.0, c.select);
-                    chassis::brackets(painter, rect, 5.0);
+                    crate::ui::nav_cursor::claim(
+                        painter,
+                        ("confirm", i),
+                        rect,
+                        crate::ui::nav_cursor::Kind::Row,
+                        crate::ui::nav_cursor::Layer::Utility,
+                        c.alert,
+                    );
                 }
                 painter.text(
                     egui::pos2(rect.min.x + 4.0, rect.center().y),

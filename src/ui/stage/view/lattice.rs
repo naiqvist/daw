@@ -17,7 +17,7 @@
 //! edge.
 
 use super::heads::{self, GUTTER, HEAD_W, MARGIN};
-use super::{chassis, palette};
+use super::palette;
 use crate::PROFONT;
 use crate::sequencing::Clip;
 use eframe::egui;
@@ -31,9 +31,6 @@ const HEAD_GAP: f32 = 8.0;
 /// The empty slot's dot.
 /// @tune 1..6 px
 const DOT: f32 = 2.0;
-/// The cursor's bracket arms.
-/// @tune 4..16 px
-const ARM: f64 = 7.0;
 const INSET: f32 = 6.0;
 const TYPE_PX: f32 = 12.0;
 
@@ -149,7 +146,14 @@ impl super::super::Stage {
                 let y = rect.max.y.round() - 0.5;
                 painter.line_segment([egui::pos2(rect.min.x, y), egui::pos2(rect.max.x, y)], seam);
                 if address == Some(super::super::Address::Slot { track, scene }) {
-                    chassis::brackets(painter, rect, crate::tune!(ARM));
+                    crate::ui::nav_cursor::claim(
+                        painter,
+                        ("slot", track, scene),
+                        rect,
+                        crate::ui::nav_cursor::Kind::Cell,
+                        crate::ui::nav_cursor::Layer::Surface,
+                        c.alert,
+                    );
                 }
             }
         }
