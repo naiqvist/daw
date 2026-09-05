@@ -725,6 +725,38 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
                 backend: "JACK",
             }));
         }
+    } else if which.contains("four") {
+        // The console EQ with all four bands moved and the low one left
+        // a shelf, so the inductor's bump is in the picture.
+        use daw::devices::DeviceKind;
+        let _ = stage.song_mut().add_device(0, DeviceKind::Poly);
+        {
+            use daw::params::console::four as p;
+            let song = stage.song_mut();
+            if let Some(device) = song
+                .section(0, daw::console::SectionKind::Four)
+                .map(|device| device.id)
+                .and_then(|id| song.device_mut(id))
+            {
+                device.bypassed = false;
+                device.set(p::LOW_HZ, 90.0);
+                device.set(p::LOW_DB, 7.5);
+                device.set(p::LOW_SHAPE, p::SHELF as f32);
+                device.set(p::LMF_HZ, 420.0);
+                device.set(p::LMF_DB, -5.0);
+                device.set(p::LMF_Q, 1.4);
+                device.set(p::HMF_HZ, 3200.0);
+                device.set(p::HMF_DB, 4.0);
+                device.set(p::HMF_Q, 0.8);
+                device.set(p::HIGH_HZ, 11000.0);
+                device.set(p::HIGH_DB, 6.0);
+                device.set(p::HIGH_SHAPE, p::SHELF as f32);
+            }
+        }
+        let _ = stage.apply(StageIntent::Devices);
+        for _ in 0..6 {
+            let _ = stage.apply(StageIntent::Step(Step::Right));
+        }
     } else if which.contains("hit") {
         // The transient shaper, posed by the suffix so one card can be
         // seen at rest, leaning on the strike, and leaning on the tail.

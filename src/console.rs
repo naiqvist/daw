@@ -961,6 +961,22 @@ pub mod four_curve {
         }
     }
 
+    /// ONE band's contribution at `hz`, in dB.
+    ///
+    /// The sum hides the parts: two mids fighting each other read as one
+    /// gentle curve, and the inductor's bump is invisible inside the
+    /// shelf it belongs to. The card draws each band behind the
+    /// composite, and this is what it draws them from — the same
+    /// coefficients [`response_db`] adds up.
+    pub fn band_db(band: &Band, sample_rate: f32, hz: f32) -> f32 {
+        if band.db == 0.0 {
+            return 0.0;
+        }
+        let mut one = EqBand::new();
+        one.prepare(sample_rate, band.hz, band.q, band.db, band.shape);
+        super::tone_curve::biquad_db(one.coeffs(), hz, sample_rate)
+    }
+
     /// The whole section's response at `hz`, in dB.
     pub fn response_db(shape: &Shape, sample_rate: f32, hz: f32) -> f32 {
         let mut db = 0.0;
