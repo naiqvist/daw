@@ -165,6 +165,38 @@ impl super::super::Stage {
         let mid = inner.center().y;
         let half = inner.height() * 0.5 - 2.0;
 
+        // A ruler in seconds along the top of the glass: a tick every
+        // tenth, a longer one with its number every half — the file's own
+        // time, at the sample rate the file has.
+        {
+            let step = 0.1_f64;
+            let mut t = (from / step).floor() * step;
+            let ry = inner.min.y.round() - 0.5;
+            while t <= to {
+                if t >= from {
+                    let x = px(t).round() - 0.5;
+                    let major = ((t / 0.5).round() * 0.5 - t).abs() < 1e-6;
+                    painter.line_segment(
+                        [
+                            egui::pos2(x, ry),
+                            egui::pos2(x, ry + if major { 6.0 } else { 3.0 }),
+                        ],
+                        egui::Stroke::new(1.0, c.rule),
+                    );
+                    if major {
+                        painter.text(
+                            egui::pos2(x + 3.0, ry + 1.0),
+                            egui::Align2::LEFT_TOP,
+                            format!("{t:.1}s"),
+                            font.clone(),
+                            c.dim,
+                        );
+                    }
+                }
+                t += step;
+            }
+        }
+
         // Peaks: one column per pixel.
         let columns = inner.width().floor().max(1.0) as usize;
         let bins = data.peaks.columns(Some(&data.samples), from, to, columns);
@@ -226,8 +258,8 @@ impl super::super::Stage {
                         egui::Stroke::new(1.0, c.alert),
                     );
                     painter.text(
-                        egui::pos2(x + 3.0, inner.min.y),
-                        egui::Align2::LEFT_TOP,
+                        egui::pos2(x + 3.0, inner.max.y - TYPE_PX - 4.0),
+                        egui::Align2::LEFT_BOTTOM,
                         word,
                         font.clone(),
                         c.alert,

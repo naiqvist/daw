@@ -98,6 +98,13 @@ impl super::super::Stage {
 
         // The tree, its window kept around the cursor.
         let rows = browser.rows();
+        let most = rows
+            .iter()
+            .filter_map(|r| browser.node_at(&r.path))
+            .filter(|n| n.is_branch())
+            .map(|n| n.leaves())
+            .max()
+            .unwrap_or(0);
         let top = inner.min.y + TITLE_H + 4.0;
         let row_h = crate::tune!(ROW_H);
         let capacity = ((inner.max.y - top) / row_h).floor().max(1.0) as usize;
@@ -167,6 +174,25 @@ impl super::super::Stage {
                     font.clone(),
                     c.dim,
                 );
+                // The count as a small meter against the fullest shelf.
+                if most > 0 {
+                    let w = 24.0;
+                    let x1 = inner.max.x - 4.0 * ch;
+                    let track = egui::Rect::from_min_max(
+                        egui::pos2(x1 - w, cy - 1.0),
+                        egui::pos2(x1, cy + 1.0),
+                    );
+                    painter.rect_filled(track, 0.0, c.rule);
+                    let share = node.leaves() as f32 / most as f32;
+                    painter.rect_filled(
+                        egui::Rect::from_min_max(
+                            track.min,
+                            egui::pos2(track.min.x + w * share, track.max.y),
+                        ),
+                        0.0,
+                        c.edge,
+                    );
+                }
             }
             if on {
                 crate::ui::nav_cursor::claim(

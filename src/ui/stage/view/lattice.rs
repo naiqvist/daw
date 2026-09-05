@@ -158,6 +158,44 @@ impl super::super::Stage {
             }
         }
 
+        // The sounding slot, annotated: a leader out to the margin and the
+        // word there, so what is playing can be read without hunting.
+        let last_right = tracks
+            .clone()
+            .last()
+            .map(|_| cell(field, tracks.len().saturating_sub(1), 0).max.x);
+        if let Some(right_edge) = last_right {
+            for (slot, track) in tracks.clone().enumerate() {
+                let Some(scene) = self.playing.get(track).copied().flatten() else {
+                    continue;
+                };
+                let Some(row) = scenes.clone().position(|s| s == scene) else {
+                    continue;
+                };
+                let rect = cell(field, slot, row);
+                let y = rect.center().y.round() - 0.5;
+                let x0 = rect.max.x + 2.0;
+                let x1 = right_edge + 14.0;
+                painter.line_segment([egui::pos2(x0, y), egui::pos2(x1, y)], seam);
+                painter.rect_filled(
+                    egui::Rect::from_center_size(egui::pos2(x1, y), egui::vec2(3.0, 3.0)),
+                    0.0,
+                    c.nominal,
+                );
+                let word = match self.song.slot_clip(track, scene) {
+                    Some(Clip::Pattern(id)) => format!("PLAYING {:02}", id.0),
+                    None => "PLAYING --".to_owned(),
+                };
+                painter.text(
+                    egui::pos2(x1 + 6.0, y),
+                    egui::Align2::LEFT_CENTER,
+                    word,
+                    font.clone(),
+                    c.nominal,
+                );
+            }
+        }
+
         // The master column: the desk's edge, one hairline down its centre.
         let master = heads::master_rect(field);
         if !scenes.is_empty() {
