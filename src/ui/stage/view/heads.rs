@@ -118,6 +118,7 @@ struct Face<'a> {
     solo: bool,
     sounding: bool,
     standing: Standing,
+    key: chassis::Key,
 }
 
 impl Stage {
@@ -133,7 +134,9 @@ impl Stage {
 
     pub(super) fn draw_heads(&self, painter: &egui::Painter, field: egui::Rect) {
         let address = self.session_address();
-        for (slot, track) in self.shown_tracks(field.width()).enumerate() {
+        let shown = self.shown_tracks(field.width());
+        let (first, last) = (shown.start, shown.end.saturating_sub(1));
+        for (slot, track) in shown.clone().enumerate() {
             let head = &self.song.tracks[track];
             let face = Face {
                 number: Some(track + 1),
@@ -142,6 +145,13 @@ impl Stage {
                 solo: head.solo,
                 sounding: self.playing.get(track).copied().flatten().is_some(),
                 standing: standing(address, Some(track)),
+                key: match (track == first, track == last) {
+                    // Alone, it is still the leftmost: its brackets stay.
+                    (true, true) => chassis::Key::Left,
+                    (true, false) => chassis::Key::Left,
+                    (false, true) => chassis::Key::Right,
+                    (false, false) => chassis::Key::Centre,
+                },
             };
             self.draw_head(painter, head_rect(field, slot), &face);
         }
@@ -152,6 +162,7 @@ impl Stage {
             solo: false,
             sounding: false,
             standing: standing(address, None),
+            key: chassis::Key::Right,
         };
         self.draw_head(painter, master_rect(field), &master);
     }
@@ -159,7 +170,7 @@ impl Stage {
     fn draw_head(&self, painter: &egui::Painter, rect: egui::Rect, face: &Face<'_>) {
         let c = palette::colours();
         let cursor = face.standing == Standing::Cursor;
-        chassis::frame(painter, rect, cursor);
+        chassis::keyed(painter, rect, cursor, face.key);
         let font = egui::FontId::new(TYPE_PX, egui::FontFamily::Name(PROFONT.into()));
 
         let inner = rect.shrink(INSET);

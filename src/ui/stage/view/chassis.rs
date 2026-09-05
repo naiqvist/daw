@@ -54,6 +54,75 @@ fn to_pos(p: (f64, f64)) -> egui::Pos2 {
     egui::pos2(p.0 as f32, p.1 as f32)
 }
 
+/// Where a component stands in its row, which decides which corners it
+/// gives up: the ends are keyed outward, the middle on the diagonal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Key {
+    /// The leftmost: its two left corners cut.
+    Left,
+    /// In the run: top-left and bottom-right, the console's own key.
+    Centre,
+    /// The rightmost: its two right corners cut.
+    Right,
+    /// Every corner cut: a badge, not a component. Kept for the odd
+    /// plaque; a lone head is still the leftmost.
+    Both,
+}
+
+/// A chassis keyed by where it stands. Solid with brackets on the square
+/// corners when focused, dashed when not — the same reading as `frame`,
+/// with the corners chosen by position rather than fixed.
+pub fn keyed(painter: &egui::Painter, rect: egui::Rect, focused: bool, key: Key) {
+    let c = palette::colours();
+    let cut = CUT
+        .min(rect.width() as f64 / 3.0)
+        .min(rect.height() as f64 / 3.0);
+    let corners = match key {
+        Key::Left => chamfer::Corners::left(cut),
+        Key::Centre => chamfer::Corners::diagonal(cut),
+        Key::Right => chamfer::Corners::right(cut),
+        Key::Both => chamfer::Corners::all(cut),
+    };
+    let bounds = bounds_of(rect);
+    let mut outline = Vec::new();
+    chamfer::polygon(&bounds, corners, &mut outline);
+    if outline.is_empty() {
+        return;
+    }
+    if focused {
+        painter.add(egui::Shape::closed_line(
+            outline.iter().copied().map(to_pos).collect(),
+            egui::Stroke::new(1.0, c.chassis),
+        ));
+        // Brackets on the corners that are still square; a bracket over
+        // a cut corner is a muddle.
+        let arm = |corner: f64| if corner == 0.0 { ARM } else { 0.0 };
+        let arms = bracket::Arms {
+            top_left: arm(corners.top_left),
+            top_right: arm(corners.top_right),
+            bottom_right: arm(corners.bottom_right),
+            bottom_left: arm(corners.bottom_left),
+        };
+        let mut brackets = Vec::new();
+        bracket::corners(&bounds.inset(INSET), arms, &mut brackets);
+        for arm in &brackets {
+            painter.add(egui::Shape::line(
+                arm.iter().copied().map(to_pos).collect(),
+                egui::Stroke::new(1.5, c.alert),
+            ));
+        }
+    } else {
+        let mut closed = outline.clone();
+        closed.push(outline[0]);
+        let mut dashes = Vec::new();
+        dash::dashes(&closed, &dash::Pattern::new(DASH, GAP), &mut dashes);
+        let hairline = egui::Stroke::new(1.0, c.edge);
+        for (a, b) in &dashes {
+            painter.line_segment([to_pos(*a), to_pos(*b)], hairline);
+        }
+    }
+}
+
 /// Four brackets and no outline: the cursor at cell scale.
 pub fn brackets(painter: &egui::Painter, rect: egui::Rect, arm: f64) {
     let c = palette::colours();
