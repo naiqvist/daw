@@ -10,6 +10,7 @@ struct Params {
     aberration: f32,
     vignette: f32,
     grain: f32,
+    bleed: f32,
 };
 
 @group(0) @binding(0) var<uniform> p: Params;

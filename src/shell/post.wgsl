@@ -21,6 +21,7 @@ struct Params {
     aberration: f32,
     vignette: f32,
     grain: f32,
+    bleed: f32,
 };
 
 @group(0) @binding(0) var<uniform> p: Params;
@@ -62,6 +63,18 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     );
 
     col += textureSample(bloom_tex, smp, uv).rgb * p.bloom;
+
+    // Phosphor bleed: a bright pixel spills a little into its horizontal
+    // neighbours, the way a tube's beam does and film grain does not.
+    // Only the bright part spills, so the ground stays clean.
+    let px = 1.0 / p.resolution.x;
+    let n1 = textureSample(scene, smp, uv + vec2<f32>(px, 0.0)).rgb
+        + textureSample(scene, smp, uv - vec2<f32>(px, 0.0)).rgb;
+    let n2 = textureSample(scene, smp, uv + vec2<f32>(2.0 * px, 0.0)).rgb
+        + textureSample(scene, smp, uv - vec2<f32>(2.0 * px, 0.0)).rgb;
+    let spill = n1 * 0.5 + n2 * 0.25;
+    let bright = smoothstep(0.35, 0.9, max(max(spill.r, spill.g), spill.b));
+    col += spill * bright * p.bleed * 0.25;
 
     // Scanlines on a 2-physical-pixel period. Cosine rather than a step so it
     // does not alias into moire when the window is an odd height.

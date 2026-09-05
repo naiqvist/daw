@@ -26,9 +26,13 @@ const ABERRATION: f32 = 0.35;
 /// How far the field edge falls toward the cool ground.
 /// @tune 0..1
 const VIGNETTE: f32 = 0.22;
-/// Static grain, as a share of full scale.
+/// Static grain, as a share of full scale. Kept faint: grain reads as
+/// film, and this is a tube.
 /// @tune 0..0.1
-const GRAIN: f32 = 0.015;
+const GRAIN: f32 = 0.006;
+/// Phosphor bleed: how much a bright pixel spills into its neighbours.
+/// @tune 0..1
+const BLEED: f32 = 0.5;
 
 /// What the glass does, as the shader reads it.
 #[repr(C)]
@@ -40,7 +44,8 @@ pub struct Params {
     pub aberration: f32,
     pub vignette: f32,
     pub grain: f32,
-    pub _pad: f32,
+    /// How much a bright pixel spills sideways, as a tube's beam does.
+    pub bleed: f32,
 }
 
 impl Default for Params {
@@ -52,7 +57,7 @@ impl Default for Params {
             aberration: ABERRATION,
             vignette: VIGNETTE,
             grain: GRAIN,
-            _pad: 0.0,
+            bleed: BLEED,
         }
     }
 }
@@ -295,6 +300,7 @@ impl Post {
         self.params.aberration = crate::tune!(ABERRATION);
         self.params.vignette = crate::tune!(VIGNETTE);
         self.params.grain = crate::tune!(GRAIN);
+        self.params.bleed = crate::tune!(BLEED);
         queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&self.params));
         let Some(b) = &self.bound else {
             return;
@@ -411,6 +417,7 @@ mod tests {
             "aberration",
             "vignette",
             "grain",
+            "bleed",
         ] {
             assert!(
                 source.contains(&format!("{field}:")),
