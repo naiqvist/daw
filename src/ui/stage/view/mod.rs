@@ -12,6 +12,7 @@
 //! (never summoned here, so it never owns the keys), and every surface
 //! the old view drew.
 
+mod heads;
 mod input;
 mod utility;
 
@@ -19,8 +20,8 @@ use super::key::{Key, Mods};
 use super::*;
 use eframe::egui;
 
-/// A view that shows nothing can hold everything: no offset ever needs
-/// to move to keep the cursor in sight.
+/// An axis nothing is drawn along yet can hold everything: no offset
+/// needs to move to keep the cursor in sight.
 const HOLDS_EVERYTHING: usize = usize::MAX;
 
 impl Stage {
@@ -100,7 +101,12 @@ impl Stage {
         let enter_held = ui.input(|input| input.key_down(egui::Key::Enter));
         self.take_pitch_entry(update, enter_held);
 
-        self.follow_cursor(HOLDS_EVERYTHING, HOLDS_EVERYTHING, HOLDS_EVERYTHING);
+        let field = ui.available_rect_before_wrap();
+        self.follow_cursor(
+            heads::capacity(field.width()),
+            HOLDS_EVERYTHING,
+            HOLDS_EVERYTHING,
+        );
 
         let dt = ui.ctx().input(|input| input.stable_dt);
         self.tick_clock(dt);
@@ -111,10 +117,11 @@ impl Stage {
         self.draw(ui);
     }
 
-    /// The ground, and nothing on it.
+    /// The ground, and on it what has been drawn so far.
     fn draw(&self, ui: &mut egui::Ui) {
         let whole = ui.available_rect_before_wrap();
-        ui.painter()
-            .rect_filled(whole, 0.0, self.alphabet().ground.color);
+        let painter = ui.painter();
+        painter.rect_filled(whole, 0.0, self.alphabet().ground.color);
+        self.draw_heads(painter, whole);
     }
 }
