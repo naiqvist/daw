@@ -16,6 +16,7 @@
 use super::*;
 use crate::console::SectionParams;
 use crate::params::console::tape as p;
+use crate::ui::chrome;
 use crate::ui::nav_cursor;
 
 /// How many passes the loop is drawn holding at full feedback.
@@ -99,13 +100,13 @@ pub(super) fn draw(face: &Face<'_>) {
         span.center().y,
     );
     for (hub, filled) in [(record, true), (play, false)] {
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &tool::arc(hub, 8.0, 0.0, 360.0, 20),
             Weight::Hair,
             tool::fade(edge, 1.1),
         );
-        circuit::pad(&mut shapes, hub, circuit::PAD - 1.0, ink, filled);
+        chrome::pad(&mut shapes, hub, chrome::PAD - 1.0, ink, filled);
     }
 
     // THE TAPE: a path from one capstan to the other, bowed slowly by
@@ -121,12 +122,12 @@ pub(super) fn draw(face: &Face<'_>) {
             egui::pos2(x, span.center().y + bow + shiver)
         })
         .collect();
-    circuit::trace(&mut shapes, &path, Weight::Heavy, face.live());
+    chrome::trace(&mut shapes, &path, Weight::Heavy, face.live());
     // The passes: one ghost span per lap the feedback will keep.
     let passes = (feedback * PASSES as f32).round() as usize;
     for lap in 1..=passes {
         let drop = lap as f32 * 4.0;
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(record.x, span.center().y + drop),
@@ -143,7 +144,7 @@ pub(super) fn draw(face: &Face<'_>) {
     let grains = (face.place(p::HISS) * GRAINS as f32).round() as usize;
     for i in 0..grains {
         let t = grain(i);
-        circuit::dot(
+        chrome::dot(
             &mut shapes,
             egui::pos2(
                 egui::lerp(record.x..=play.x, t),

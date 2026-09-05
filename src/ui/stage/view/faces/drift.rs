@@ -14,6 +14,7 @@
 use super::*;
 use crate::console::SectionParams;
 use crate::params::console::drift as p;
+use crate::ui::chrome;
 use crate::ui::nav_cursor;
 
 /// How many buckets the line is drawn with.
@@ -98,7 +99,7 @@ pub(super) fn draw(face: &Face<'_>) {
             ),
         );
         if cell.is_positive() {
-            circuit::trace(
+            chrome::trace(
                 &mut shapes,
                 &[
                     cell.left_top(),
@@ -118,7 +119,7 @@ pub(super) fn draw(face: &Face<'_>) {
     let reach = line.width() * 0.5 * (0.06 + 0.94 * depth);
     let middle = line.center().x;
     for stop in [middle - reach, middle + reach] {
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(stop, line.top() - 4.0),
@@ -143,7 +144,7 @@ pub(super) fn draw(face: &Face<'_>) {
             )
             .clamp(-1.0, 1.0);
         let at = middle + reach * sweep * if side == 0 { spread } else { -spread };
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(at, line.top() - 6.0),
@@ -152,10 +153,10 @@ pub(super) fn draw(face: &Face<'_>) {
             Weight::Heavy,
             hue,
         );
-        circuit::pad(
+        chrome::pad(
             &mut shapes,
             egui::pos2(at, line.top() - 6.0),
-            circuit::PAD - 1.0,
+            chrome::PAD - 1.0,
             hue,
             true,
         );
@@ -168,7 +169,7 @@ pub(super) fn draw(face: &Face<'_>) {
     for i in 0..4 {
         let y = egui::lerp((slot.top() + 4.0)..=(slot.bottom() - 4.0), i as f32 / 3.0);
         let here = i == mode;
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(slot.left() + 2.0, y),
@@ -199,7 +200,7 @@ pub(super) fn draw(face: &Face<'_>) {
     let fb = face.swing(p::FEEDBACK);
     let arc_rect = lay.feedback;
     let lift = arc_rect.height() * 0.5 * fb;
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             egui::pos2(arc_rect.right() - 2.0, arc_rect.center().y),
@@ -209,10 +210,10 @@ pub(super) fn draw(face: &Face<'_>) {
         Weight::Hair,
         tool::mix_ink(tool::fade(edge, 0.8), ink, fb.abs()),
     );
-    circuit::pad(
+    chrome::pad(
         &mut shapes,
         egui::pos2(arc_rect.left() + 2.0, arc_rect.center().y),
-        circuit::PAD - 2.0,
+        chrome::PAD - 2.0,
         ink,
         fb.abs() > 0.01,
     );

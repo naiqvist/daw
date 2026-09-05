@@ -2,6 +2,7 @@
 //! controls living in the crevices its silhouette cuts.
 
 use super::*;
+use crate::ui::chrome;
 use crate::ui::nav_cursor;
 
 /// DOOR's face, laid out once so the key that addresses an instrument
@@ -224,10 +225,10 @@ pub(super) fn draw(face: &Face<'_>) {
     let mut shapes = Vec::new();
 
     // ---- the ladder: threshold, hysteresis, ratio, range -------
-    circuit::panel_frame_variant(&mut shapes, lay.ladder, Weight::Hair, edge, 1);
+    chrome::panel_frame_variant(&mut shapes, lay.ladder, Weight::Hair, edge, 1);
     let ladder = lay.ladder.shrink2(egui::vec2(4.0, 3.0));
     let rail_x = ladder.left() + 9.0;
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             egui::pos2(rail_x, ladder.top()),
@@ -253,7 +254,7 @@ pub(super) fn draw(face: &Face<'_>) {
     let threshold_y = door_ladder_y(lay.ladder, threshold_db);
     let hyst_y = door_ladder_y(lay.ladder, threshold_db - hysteresis_db);
     let floor_y = door_ladder_y(lay.ladder, (threshold_db - range_db).max(-72.0));
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             egui::pos2(rail_x - 6.0, threshold_y),
@@ -262,7 +263,7 @@ pub(super) fn draw(face: &Face<'_>) {
         Weight::Heavy,
         ink,
     );
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             egui::pos2(rail_x - 4.0, hyst_y),
@@ -277,13 +278,13 @@ pub(super) fn draw(face: &Face<'_>) {
     let ratio = value(p::RATIO).max(1.0);
     let reach = ((floor_y - hyst_y) / (ratio * 3.0)).clamp(4.0, ladder.width() - 14.0);
     let corner = egui::pos2(slope_left - reach, floor_y);
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[egui::pos2(slope_left, hyst_y), corner],
         Weight::Heavy,
         tool::mix_ink(ink, alpha.jeopardy_active.color, 0.4),
     );
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[corner, egui::pos2(ladder.left() + 2.0, floor_y)],
         Weight::Hair,
@@ -291,7 +292,7 @@ pub(super) fn draw(face: &Face<'_>) {
     );
 
     // ---- the doorway: the leaf, as far open as the sound has it
-    circuit::panel_variant(
+    chrome::panel_variant(
         &mut shapes,
         lay.doorway,
         Some(alpha.well.color),
@@ -302,7 +303,7 @@ pub(super) fn draw(face: &Face<'_>) {
     let jamb = lay.doorway.shrink(5.0);
     shapes.push(egui::Shape::rect_filled(jamb, 0.0, alpha.ground.color));
     // The frame it swings in, and the plate it closes onto.
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             jamb.left_bottom(),
@@ -332,7 +333,7 @@ pub(super) fn draw(face: &Face<'_>) {
             0.0,
             tool::mix_ink(alpha.surface.color, alpha.jeopardy_latent.color, 0.35),
         ));
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[leaf.left_top(), leaf.left_bottom()],
             Weight::Heavy,
@@ -359,10 +360,10 @@ pub(super) fn draw(face: &Face<'_>) {
         ));
     }
     for at in [0.25, 0.5, 0.75] {
-        circuit::pad(
+        chrome::pad(
             &mut shapes,
             egui::pos2(jamb.right() + 1.0, egui::lerp(jamb.y_range(), at)),
-            circuit::PAD - 2.0,
+            chrome::PAD - 2.0,
             edge,
             false,
         );
@@ -370,7 +371,7 @@ pub(super) fn draw(face: &Face<'_>) {
 
     // ---- the envelope: rise, plateau, fall ---------------------
     let env = egui::Rect::from_min_max(lay.attack.min, lay.release.max);
-    circuit::panel_frame_variant(&mut shapes, env, Weight::Hair, edge, 3);
+    chrome::panel_frame_variant(&mut shapes, env, Weight::Hair, edge, 3);
     let shape_of = |ms: f32, most: f32| (ms / most).clamp(0.02, 1.0).sqrt();
     let rise = shape_of(value(p::ATTACK), 100.0);
     let plateau = shape_of(value(p::HOLD), 500.0);
@@ -391,9 +392,9 @@ pub(super) fn draw(face: &Face<'_>) {
         egui::pos2(r_end.max(h_end), base),
         egui::pos2(inner.right(), base),
     ];
-    circuit::trace(&mut shapes, &envelope, Weight::Heavy, ink);
+    chrome::trace(&mut shapes, &envelope, Weight::Heavy, ink);
     for x in [a_end, h_end] {
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[egui::pos2(x, peak), egui::pos2(x, base)],
             Weight::Hair,
@@ -413,7 +414,7 @@ pub(super) fn draw(face: &Face<'_>) {
 
     // ---- the key's window -------------------------------------
     let key = egui::Rect::from_min_max(lay.key_hp.min, lay.key_lp.max);
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             egui::pos2(key.left(), key.center().y),
@@ -456,7 +457,7 @@ pub(super) fn draw(face: &Face<'_>) {
             let arc: Vec<egui::Pos2> = (0..=12)
                 .map(|i| on_arc(mode.center(), r, -60.0 + 120.0 * i as f32 / 12.0))
                 .collect();
-            circuit::trace(&mut shapes, &arc, Weight::Hair, ink);
+            chrome::trace(&mut shapes, &arc, Weight::Hair, ink);
         }
     }
     let grid = egui::Rect::from_min_max(lay.division.min, lay.duty.max);

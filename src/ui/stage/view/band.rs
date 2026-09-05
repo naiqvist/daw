@@ -6,7 +6,9 @@
 //! coloured with: the design alphabet seen through the console's palette
 //! (`Stage::glass`), so the faces are the faces and the room is this one.
 
+use super::palette;
 use super::*;
+use crate::ui::chrome;
 use crate::ui::stage::chain;
 use eframe::egui;
 
@@ -165,7 +167,7 @@ impl Stage {
                 }
                 // The plaque is the tray's own casing while nothing is in
                 // it, so it carries the frame weight rather than a rule's.
-                circuit::panel_frame_variant(out, plaque, Weight::Heavy, edge, 2);
+                chrome::panel_frame_variant(out, plaque, Weight::Heavy, edge, 2);
                 let c = plaque.center();
                 let side = plaque.height() * 0.7;
                 Sign::Dipper.paint(
@@ -178,7 +180,7 @@ impl Stage {
                 let unit = 8.0;
                 for row in 0..3 {
                     let y = plaque.min.y + m + row as f32 * (unit + 2.0);
-                    circuit::binary(
+                    chrome::binary(
                         out,
                         egui::pos2(plaque.min.x + m, y),
                         unit,
@@ -187,7 +189,7 @@ impl Stage {
                         edge,
                     );
                 }
-                circuit::rail(
+                chrome::rail(
                     out,
                     egui::pos2(plaque.max.x - m - 140.0, plaque.max.y - m),
                     egui::pos2(plaque.max.x - m, plaque.max.y - m),
@@ -353,12 +355,12 @@ impl Stage {
                     to,
                 ]
             } else {
-                circuit::elbow(from, to)
+                chrome::elbow(from, to)
             };
             let mut shapes = Vec::new();
-            circuit::trace(&mut shapes, &path, Weight::Hair, self.glass().edge.color);
+            chrome::trace(&mut shapes, &path, Weight::Hair, self.glass().edge.color);
             if sounding && phase.rolling {
-                circuit::dashes(
+                chrome::dashes(
                     &mut shapes,
                     &path,
                     phase.dash(),
@@ -469,9 +471,9 @@ impl Stage {
         let mut shapes = Vec::new();
         for dy in [-4.0, 4.0] {
             let path = [egui::pos2(from_x, jy + dy), egui::pos2(to_x, jy + dy)];
-            circuit::trace(&mut shapes, &path, Weight::Hair, alpha.edge.color);
+            chrome::trace(&mut shapes, &path, Weight::Hair, alpha.edge.color);
             if sounding && phase.rolling {
-                circuit::dashes(
+                chrome::dashes(
                     &mut shapes,
                     &path,
                     phase.dash(),
@@ -479,10 +481,10 @@ impl Stage {
                     alpha.live_dim.color,
                 );
             }
-            circuit::pad(
+            chrome::pad(
                 &mut shapes,
                 egui::pos2(from_x, jy + dy),
-                circuit::PAD - 1.0,
+                chrome::PAD - 1.0,
                 alpha.edge.color,
                 true,
             );
@@ -491,7 +493,7 @@ impl Stage {
         // the run of pieces reads as two runs rather than as one long
         // one with a gap in it.
         let seam = (from_x + to_x) * 0.5;
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(seam, right.top() + strip::HEAD_H),
@@ -502,11 +504,11 @@ impl Stage {
         );
         painter.extend(shapes);
         if let Some(name) = lane.seal(&self.song) {
-            block::paint_vertical(
-                painter,
+            painter.text(
                 egui::pos2(seam - 5.0, right.bottom() - 6.0),
-                block::unit::MICRO,
+                egui::Align2::RIGHT_BOTTOM,
                 &name,
+                egui::FontId::monospace(11.0),
                 alpha.edge.color,
             );
         }
@@ -599,17 +601,17 @@ impl Stage {
                 egui::pos2(to_x, out_y),
                 egui::pos2(to_x, ret_rect.map_or(out_y, |rect| strip::joint_y(rect))),
             ];
-            circuit::trace(&mut shapes, &send, Weight::Hair, cable);
+            chrome::trace(&mut shapes, &send, Weight::Hair, cable);
             if carrying && sounding && phase.rolling {
-                circuit::dashes(&mut shapes, &send, phase.dash(), Weight::Heavy, ink);
+                chrome::dashes(&mut shapes, &send, phase.dash(), Weight::Heavy, ink);
             }
             if let Some(rect) = out_rect {
                 // The tap: a pad on the channel's foot that fills as the
                 // send opens. It is the send, not a picture of it.
-                circuit::pad(
+                chrome::pad(
                     &mut shapes,
                     egui::pos2(from_x, rect.bottom()),
-                    circuit::PAD,
+                    chrome::PAD,
                     cable,
                     carrying,
                 );
@@ -631,15 +633,15 @@ impl Stage {
                     mix_rect.map_or(home_y, |rect| strip::joint_y(rect)),
                 ),
             ];
-            circuit::trace(&mut shapes, &home, Weight::Hair, cable);
+            chrome::trace(&mut shapes, &home, Weight::Hair, cable);
             if carrying && sounding && phase.rolling {
-                circuit::dashes(&mut shapes, &home, phase.dash(), Weight::Heavy, ink);
+                chrome::dashes(&mut shapes, &home, phase.dash(), Weight::Heavy, ink);
             }
             if let Some(rect) = ret_rect {
-                circuit::pad(
+                chrome::pad(
                     &mut shapes,
                     egui::pos2(rect.right(), strip::joint_y(rect)),
-                    circuit::PAD - 1.0,
+                    chrome::PAD - 1.0,
                     cable,
                     carrying,
                 );
@@ -681,7 +683,7 @@ impl Stage {
                 family_ink,
             ),
             |out| {
-                circuit::panel_variant(
+                chrome::panel_variant(
                     out,
                     card,
                     Some(alpha.surface.color),
@@ -689,11 +691,11 @@ impl Stage {
                     Some((Weight::Hair, alpha.edge.color)),
                     index as u8,
                 );
-                circuit::trace(
+                chrome::trace(
                     out,
                     &[
-                        egui::pos2(card.left() + circuit::CHAMFER, head.bottom()),
-                        egui::pos2(card.right() - circuit::CHAMFER, head.bottom()),
+                        egui::pos2(card.left() + chrome::CHAMFER, head.bottom()),
+                        egui::pos2(card.right() - chrome::CHAMFER, head.bottom()),
                     ],
                     Weight::Hair,
                     alpha.edge.color,
@@ -704,7 +706,7 @@ impl Stage {
                     egui::pos2(card.left(), head.bottom() - 5.0),
                     egui::pos2(card.right(), head.bottom() - 5.0),
                 ] {
-                    circuit::pad(out, point, circuit::PAD, family_ink, true);
+                    chrome::pad(out, point, chrome::PAD, family_ink, true);
                 }
                 Sign::Seal(crate::ui::stage::browser::family_mark(column.family)).paint(
                     out,
@@ -715,10 +717,10 @@ impl Stage {
                     Weight::Hair,
                     family_ink,
                 );
-                circuit::pad(
+                chrome::pad(
                     out,
                     egui::pos2(head.right() - 11.0, head.center().y),
-                    circuit::PAD + 1.0,
+                    chrome::PAD + 1.0,
                     family_ink,
                     !column.bypassed,
                 );
@@ -731,13 +733,11 @@ impl Stage {
         // size (POLY, SAT, REVERB), rather than shrinking prose into an
         // unreadable seven-pixel imitation of the face.
         let title = column.code.to_ascii_uppercase();
-        block::paint(
-            painter,
-            egui::Id::new(("stage-chain-title", index)),
+        painter.text(
             egui::pos2(head.left() + 30.0, head.top() + 5.0),
             egui::Align2::LEFT_TOP,
-            block::unit::MICRO,
             &title,
+            egui::FontId::monospace(11.0),
             family_ink,
         );
         if let Some(sample) = &column.sample {
@@ -777,7 +777,7 @@ impl Stage {
             let y0 = body_top + first_line as f32 * pitch + pitch * 0.5;
             let y1 = body_top + last_line as f32 * pitch + pitch * 0.5;
             let mut shapes = Vec::new();
-            circuit::rail(
+            chrome::rail(
                 &mut shapes,
                 egui::pos2(x, y0),
                 egui::pos2(x, y1.max(y0 + 1.0)),
@@ -816,14 +816,14 @@ impl Stage {
                 // The cursor row is the brightest thing on the card:
                 // ground-coloured words on the focus ink, so the row
                 // under the hand is never the hardest one to read.
-                painter.rect_filled(rect, 0.0, alpha.focus.color);
+                painter.rect_filled(rect, 0.0, alpha.live_dim.color);
                 crate::ui::nav_cursor::claim(
                     painter,
                     ("stage-chain-row-cursor", index, row_offset + line),
                     rect,
                     crate::ui::nav_cursor::Kind::Row,
                     crate::ui::nav_cursor::Layer::Surface,
-                    alpha.ink.color,
+                    palette::colours().alert,
                 );
             }
             // Read at the ink, not the edge: a card is a table to be
@@ -831,14 +831,14 @@ impl Stage {
             // lean into. A value moved off its default steps up once
             // more, to the focus ink, so the edits are found at a glance.
             let value_ink = if on_row {
-                alpha.ground.color
+                palette::colours().bright
             } else if row.edited {
                 alpha.focus.color
             } else {
                 alpha.ink.color
             };
             let name_ink = if on_row {
-                alpha.ground.color
+                palette::colours().bright
             } else {
                 alpha.ink.color
             };
@@ -867,7 +867,7 @@ impl Stage {
             );
             let mut shapes = Vec::new();
             if row.choices > 0 {
-                circuit::choice_bar(
+                chrome::choice_bar(
                     &mut shapes,
                     gauge,
                     row.choices,
@@ -880,7 +880,7 @@ impl Stage {
                     },
                 );
             } else {
-                circuit::tick_bar(
+                chrome::tick_bar(
                     &mut shapes,
                     gauge,
                     12,
@@ -908,7 +908,7 @@ impl Stage {
 
         if column.rows.len() > row_offset + rows_shown {
             let mut shapes = Vec::new();
-            circuit::annotation_arrow(
+            chrome::annotation_arrow(
                 &mut shapes,
                 egui::pos2(card.center().x, card.bottom() - 2.0),
                 egui::pos2(card.center().x, card.bottom() + 8.0),
@@ -993,7 +993,7 @@ impl Stage {
                 if to <= from {
                     continue;
                 }
-                circuit::trace(
+                chrome::trace(
                     &mut shapes,
                     &[egui::pos2(from, y), egui::pos2(to, y)],
                     Weight::Hair,
@@ -1009,24 +1009,24 @@ impl Stage {
                 else {
                     continue;
                 };
-                circuit::pad(
+                chrome::pad(
                     &mut shapes,
                     egui::pos2(mixer::send_x(*strip, inner, open), y),
-                    circuit::PAD - 1.0,
+                    chrome::PAD - 1.0,
                     tint(ink, 0.3 + 0.7 * open),
                     open > 0.005,
                 );
             }
             // And where it lands: the return's own column, tapped on its
             // wall so the cable plainly arrives somewhere.
-            circuit::pad(
+            chrome::pad(
                 &mut shapes,
                 egui::pos2(ret_strip.left(), y),
-                circuit::PAD,
+                chrome::PAD,
                 ink,
                 true,
             );
-            circuit::trace(
+            chrome::trace(
                 &mut shapes,
                 &[
                     egui::pos2(ret_strip.left(), y),

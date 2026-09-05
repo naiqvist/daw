@@ -15,6 +15,7 @@
 use super::*;
 use crate::console::SectionParams;
 use crate::params::console::pump as p;
+use crate::ui::chrome;
 use crate::ui::nav_cursor;
 
 /// The divisions the cam can be cut for, in lobes per bar.
@@ -112,16 +113,16 @@ pub(super) fn draw(face: &Face<'_>) {
             tool::on_arc(centre, r, 90.0 - t * 360.0)
         })
         .collect();
-    circuit::trace(&mut shapes, &rim, Weight::Heavy, ink);
-    circuit::trace(
+    chrome::trace(&mut shapes, &rim, Weight::Heavy, ink);
+    chrome::trace(
         &mut shapes,
         &tool::arc(centre, radius, 0.0, 360.0, 48),
         Weight::Hair,
         tool::fade(edge, 0.4),
     );
-    circuit::pad(&mut shapes, centre, circuit::PAD, ink, true);
+    chrome::pad(&mut shapes, centre, chrome::PAD, ink, true);
     // The keyway: one mark on the disc, so the turning is visible.
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             centre,
@@ -137,7 +138,7 @@ pub(super) fn draw(face: &Face<'_>) {
     let lift = lobe(turn, lobes, depth, shape, hold);
     let ride = radius * (0.45 + 0.55 * lift);
     let contact = tool::on_arc(centre, ride, 90.0);
-    circuit::octagon(
+    chrome::octagon(
         &mut shapes,
         egui::Rect::from_center_size(contact, egui::vec2(9.0, 9.0)),
         2.0,
@@ -150,13 +151,13 @@ pub(super) fn draw(face: &Face<'_>) {
     // it would drive is being driven, and the card says so rather than
     // miming a duck that is not happening.
     let gap_top = egui::lerp(lay.cam.bottom()..=lay.seat.y, 0.55);
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[contact, egui::pos2(contact.x, gap_top)],
         Weight::Heavy,
         ink,
     );
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             egui::pos2(lay.seat.x - 9.0, lay.seat.y),
@@ -168,7 +169,7 @@ pub(super) fn draw(face: &Face<'_>) {
     // The gap itself, marked so it reads as unshipped and not as a
     // drawing that ran out of room.
     for y in [gap_top + 4.0, lay.seat.y - 6.0] {
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(contact.x - 5.0, y),

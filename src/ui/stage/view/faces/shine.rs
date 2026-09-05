@@ -15,6 +15,7 @@
 use super::*;
 use crate::console::SectionParams;
 use crate::params::console::shine as p;
+use crate::ui::chrome;
 use crate::ui::nav_cursor;
 
 /// The most emission lines the plate shows at full amount.
@@ -91,7 +92,7 @@ pub(super) fn draw(face: &Face<'_>) {
     ));
     for i in 0..7 {
         let x = egui::lerp(bore.x_range(), i as f32 / 6.0);
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(x, bore.top() - 2.0),
@@ -115,7 +116,7 @@ pub(super) fn draw(face: &Face<'_>) {
         tool::fade(edge, 0.8),
         egui::Stroke::NONE,
     ));
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[egui::pos2(lay.plate.left(), lay.prism.y - 12.0), lay.prism],
         Weight::Hair,
@@ -129,7 +130,7 @@ pub(super) fn draw(face: &Face<'_>) {
     let field = lay.plate.shrink(3.0);
     for hz in [1_000.0, 4_000.0, 12_000.0] {
         let x = tool::octave_x(lay.plate, hz);
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(x, field.bottom() - 3.0),
@@ -139,7 +140,7 @@ pub(super) fn draw(face: &Face<'_>) {
             tool::fade(edge, 0.7),
         );
     }
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             egui::pos2(tune_x, lay.plate.top()),
@@ -163,7 +164,7 @@ pub(super) fn draw(face: &Face<'_>) {
         // A line's height falls with its order, as a harmonic series
         // does; its brightness is the tube's heat through the shutter.
         let tall = field.height() * (0.85 / (i as f32 + 1.0).sqrt());
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(x, field.bottom()),
@@ -192,7 +193,7 @@ pub(super) fn draw(face: &Face<'_>) {
         0.0,
         tool::fade(ink, 0.5),
     ));
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             shutter.left_top(),

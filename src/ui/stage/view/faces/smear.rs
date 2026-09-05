@@ -17,6 +17,7 @@
 use super::*;
 use crate::console::SectionParams;
 use crate::params::console::smear as p;
+use crate::ui::chrome;
 use crate::ui::nav_cursor;
 
 /// One bar per rung of the spectrum.
@@ -82,7 +83,7 @@ pub(super) fn draw(face: &Face<'_>) {
 
     // THE ZERO RAIL: where every transient enters. Everything to the
     // right of it is time the section is adding.
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             egui::pos2(field.left(), field.top()),
@@ -117,7 +118,7 @@ pub(super) fn draw(face: &Face<'_>) {
     // THE CARRIAGE: the centre, drawn as the line the bow is built
     // around, with the apex mark where the holding is deepest.
     let centre_y = rung_y(field, face.anim("centre", face.value(p::CENTRE), 0.12));
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             egui::pos2(field.left() - 4.0, centre_y),
@@ -151,7 +152,7 @@ pub(super) fn draw(face: &Face<'_>) {
             continue;
         }
         let x = time_x(field, age.min(SPAN_MS));
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[egui::pos2(x, field.top()), egui::pos2(x, field.bottom())],
             Weight::Hair,
@@ -160,10 +161,10 @@ pub(super) fn draw(face: &Face<'_>) {
                 (0.20 + 0.6 * strength.clamp(0.0, 1.0)) / (index as f32 + 1.0),
             ),
         );
-        circuit::pad(
+        chrome::pad(
             &mut shapes,
             egui::pos2(x, centre_y),
-            circuit::PAD - 1.0,
+            chrome::PAD - 1.0,
             face.live(),
             index == 0,
         );
@@ -178,7 +179,7 @@ pub(super) fn draw(face: &Face<'_>) {
     for i in 0..PLATES {
         let y = rack.bottom() - (i as f32 + 0.5) * pitch;
         let on = i < stages;
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(rack.left() + 1.0, y),

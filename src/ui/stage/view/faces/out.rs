@@ -14,6 +14,7 @@
 use super::*;
 use crate::console::SectionParams;
 use crate::params::console::out as p;
+use crate::ui::chrome;
 use crate::ui::nav_cursor;
 
 /// The two returns' inks, the same the loom and the mixer use.
@@ -80,7 +81,7 @@ pub(super) fn draw(face: &Face<'_>) {
     let centre = field.center();
     let reach = field.width().min(field.height()) * 0.46;
     for degrees in [45.0f32, 135.0] {
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 tool::on_arc(centre, reach, degrees),
@@ -90,7 +91,7 @@ pub(super) fn draw(face: &Face<'_>) {
             tool::fade(edge, 0.45),
         );
     }
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             egui::pos2(centre.x, centre.y - reach),
@@ -113,11 +114,11 @@ pub(super) fn draw(face: &Face<'_>) {
             )
         })
         .collect();
-    circuit::trace(&mut shapes, &blob, Weight::Heavy, face.live());
+    chrome::trace(&mut shapes, &blob, Weight::Heavy, face.live());
     // The jaws themselves, standing where the width has put them.
     for side in [-1.0f32, 1.0] {
         let x = centre.x + side * reach * 0.78 * spread.max(0.06);
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(x, centre.y - reach * 0.5),
@@ -164,10 +165,10 @@ pub(super) fn draw(face: &Face<'_>) {
             tool::fade(edge, 0.6),
             6.0,
         );
-        circuit::pad(
+        chrome::pad(
             &mut shapes,
             egui::pos2(rect.left() + 4.0, rect.center().y),
-            circuit::PAD,
+            chrome::PAD,
             tool::fade(hue, 0.3 + 0.7 * open),
             open > 0.005,
         );

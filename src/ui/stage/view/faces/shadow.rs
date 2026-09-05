@@ -15,6 +15,7 @@
 use super::*;
 use crate::console::SectionParams;
 use crate::params::console::shadow as p;
+use crate::ui::chrome;
 use crate::ui::nav_cursor;
 
 /// The springs the plate hangs on, per side.
@@ -76,7 +77,7 @@ pub(super) fn draw(face: &Face<'_>) {
     let rolling = if face.phase.rolling { 1.0 } else { 0.0 };
 
     // THE FRAME: fixed, because a plate's frame is what it is hung from.
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             lay.frame.left_top(),
@@ -120,14 +121,14 @@ pub(super) fn draw(face: &Face<'_>) {
                 egui::pos2(egui::lerp(sheet.x_range(), s), y + bow)
             })
             .collect();
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &flex,
             Weight::Hair,
             tool::fade(ink, 0.28 + 0.4 * ringing),
         );
     }
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             sheet.left_top(),
@@ -157,7 +158,7 @@ pub(super) fn draw(face: &Face<'_>) {
                     )
                 })
                 .collect();
-            circuit::trace(&mut shapes, &coil, Weight::Hair, tool::fade(edge, 0.8));
+            chrome::trace(&mut shapes, &coil, Weight::Hair, tool::fade(edge, 0.8));
         }
     }
     tool::halo(&mut shapes, lay.size, face.lit(p::SIZE), face.focus());
@@ -170,13 +171,13 @@ pub(super) fn draw(face: &Face<'_>) {
         egui::lerp(throw.x_range(), 1.0 - gap.clamp(0.04, 0.92)),
         throw.center().y,
     );
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[driver, egui::pos2(sheet.center().x, sheet.top())],
         Weight::Hair,
         tool::mix_ink(tool::fade(edge, 0.9), face.live(), ringing),
     );
-    circuit::octagon(
+    chrome::octagon(
         &mut shapes,
         egui::Rect::from_center_size(driver, egui::vec2(9.0, 9.0)),
         2.0,
@@ -195,7 +196,7 @@ pub(super) fn draw(face: &Face<'_>) {
         let t = (i as f32 + 0.5) / PADS as f32;
         let x = egui::lerp(bar.x_range(), t);
         let on = i < pads;
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(x, bar.bottom() - 2.0),
@@ -209,7 +210,7 @@ pub(super) fn draw(face: &Face<'_>) {
             },
         );
     }
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             egui::pos2(bar.left(), bar.bottom() - 1.0),

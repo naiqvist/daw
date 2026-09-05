@@ -17,6 +17,7 @@
 
 use super::*;
 use crate::params::console::glue as p;
+use crate::ui::chrome;
 
 /// The beam's travel at full reduction, in degrees. A steelyard does not
 /// swing far; this is enough that a decibel is visible and not so much
@@ -197,13 +198,13 @@ pub(super) fn draw(face: &Face<'_>) {
         0.0,
         face.alpha.surface.color,
     ));
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[rig.column.left_top(), rig.column.left_bottom()],
         Weight::Hair,
         edge,
     );
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[rig.column.right_top(), rig.column.right_bottom()],
         Weight::Hair,
@@ -217,7 +218,7 @@ pub(super) fn draw(face: &Face<'_>) {
     let arm_r = (rig.right_tip - rig.wedge).length().max(1.0);
     for step in 0..3 {
         let angle = SWING_DEG.to_radians() * step as f32 / 2.0;
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 on_beam(rig.wedge, angle, 0.62 * arm_r, 0.0),
@@ -228,7 +229,7 @@ pub(super) fn draw(face: &Face<'_>) {
         );
     }
     // The shadow index: the deepest the beam has been, easing back down.
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[rig.wedge, on_beam(rig.wedge, rig.ghost, 0.80 * arm_r, 0.0)],
         Weight::Hair,
@@ -265,7 +266,7 @@ pub(super) fn draw(face: &Face<'_>) {
         ));
         let mut y = over.top() + 1.0;
         while y < over.bottom() {
-            circuit::trace(
+            chrome::trace(
                 &mut shapes,
                 &[egui::pos2(over.left(), y), egui::pos2(over.right(), y)],
                 Weight::Hair,
@@ -279,7 +280,7 @@ pub(super) fn draw(face: &Face<'_>) {
     // configures, so the card cannot draw a compressor that is not
     // there.
     let settle = level + crate::console::glue_curve::gain_db(level, said.bands[2]);
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             egui::pos2(
@@ -298,7 +299,7 @@ pub(super) fn draw(face: &Face<'_>) {
     // each wall so it stays visible under the water. It brightens with
     // the poise, because the weight and the waterline are one thing.
     let rim_ink = tool::mix_ink(ink, face.focus(), lit);
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             egui::pos2(rig.pan.left() - if lit > 0.5 { 5.0 } else { 4.0 }, rim),
@@ -309,7 +310,7 @@ pub(super) fn draw(face: &Face<'_>) {
     );
     // The vessel itself: an open-topped U, so the eye reads a container
     // rather than a bar chart.
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             rig.pan.left_top(),
@@ -325,7 +326,7 @@ pub(super) fn draw(face: &Face<'_>) {
 
     // ── the beam: two flanges, which are the stereo pair ──────────────
     for side in [-1.5f32, 1.5] {
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 on_beam(
@@ -346,7 +347,7 @@ pub(super) fn draw(face: &Face<'_>) {
     }
     for (tip, sign) in [(rig.left_tip, -1.0f32), (rig.right_tip, 1.0)] {
         let d = sign * (tip - rig.wedge).length();
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 on_beam(rig.wedge, rig.tilt, d, 3.5),
@@ -366,7 +367,7 @@ pub(super) fn draw(face: &Face<'_>) {
         ink,
         egui::Stroke::NONE,
     ));
-    circuit::junction(&mut shapes, rig.wedge, ink, face.ground());
+    chrome::junction(&mut shapes, rig.wedge, ink, face.ground());
 
     // ── the poise, and the scale it stands on ─────────────────────────
     // The graduations rotate with the BEAM, not with the screen, because
@@ -377,7 +378,7 @@ pub(super) fn draw(face: &Face<'_>) {
         let d = egui::lerp((0.16 * arm_r)..=(arm_r - 6.0), at);
         let here = (at - standing).abs() < 0.5 / (ARM_TICKS - 1) as f32;
         let reach = if here { 7.0 } else { 4.0 + 2.0 * lit };
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 on_beam(rig.wedge, rig.tilt, d, 0.0),
@@ -399,8 +400,8 @@ pub(super) fn draw(face: &Face<'_>) {
         (rig.poise.center() - rig.wedge).length(),
         0.0,
     );
-    circuit::trace(&mut shapes, &[seat, rig.poise.center()], Weight::Hair, ink);
-    circuit::octagon(
+    chrome::trace(&mut shapes, &[seat, rig.poise.center()], Weight::Hair, ink);
+    chrome::octagon(
         &mut shapes,
         egui::Rect::from_center_size(rig.poise.center(), egui::vec2(11.0, 11.0)),
         2.0,
@@ -418,13 +419,13 @@ pub(super) fn draw(face: &Face<'_>) {
         egui::pos2(rig.inner.left() + 6.0, rig.pan.top() + 14.0),
     ];
     for (index, at) in pour.into_iter().enumerate() {
-        circuit::via(&mut shapes, at, ink, face.ground());
+        chrome::via(&mut shapes, at, ink, face.ground());
         let corner = if index == 0 {
             rig.pan.left_top()
         } else {
             egui::pos2(rig.pan.left() + 4.0, rig.pan.top())
         };
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[at, corner],
             Weight::Hair,
@@ -432,9 +433,9 @@ pub(super) fn draw(face: &Face<'_>) {
         );
     }
     let knot = egui::pos2(rig.left_tip.x, rig.left_tip.y + 12.0);
-    circuit::trace(&mut shapes, &[rig.left_tip, knot], Weight::Hair, ink);
+    chrome::trace(&mut shapes, &[rig.left_tip, knot], Weight::Hair, ink);
     for corner in [rig.pan.left_top(), rig.pan.right_top()] {
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[knot, corner],
             Weight::Hair,
@@ -449,13 +450,13 @@ pub(super) fn draw(face: &Face<'_>) {
             (rig.right_tip.x + post.x) * 0.5 + slack,
             (rig.right_tip.y + post.y) * 0.5,
         );
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[rig.right_tip, middle, post],
             Weight::Hair,
             tool::fade(live, 0.7),
         );
-        circuit::pad(&mut shapes, post, circuit::PAD - 2.0, ink, true);
+        chrome::pad(&mut shapes, post, chrome::PAD - 2.0, ink, true);
     }
 
     face.painter.extend(shapes);

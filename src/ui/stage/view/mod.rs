@@ -36,7 +36,8 @@ use super::*;
 use crate::design::codex::Sign;
 use crate::design::kit::{self, Weight};
 use crate::design::motion::{self, Phase};
-use crate::design::{self, block, circuit};
+use crate::design::{self, block};
+use crate::ui::chrome;
 use eframe::egui;
 
 /// An axis nothing is drawn along yet can hold everything: no offset

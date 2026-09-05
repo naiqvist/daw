@@ -14,6 +14,7 @@
 use super::*;
 use crate::console::SectionParams;
 use crate::params::console::ring as p;
+use crate::ui::chrome;
 use crate::ui::nav_cursor;
 
 /// The four carriers the bridge can be fed.
@@ -106,7 +107,7 @@ pub(super) fn draw(face: &Face<'_>) {
         egui::pos2(b.right(), b.center().y),
     );
     for (from, to) in [(top, right), (right, bottom), (bottom, left), (left, top)] {
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[from, to],
             Weight::Hair,
@@ -126,7 +127,7 @@ pub(super) fn draw(face: &Face<'_>) {
             hue,
             egui::Stroke::NONE,
         ));
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 mid + along * 4.5 + across * 4.0,
@@ -137,18 +138,18 @@ pub(super) fn draw(face: &Face<'_>) {
         );
     }
     // The carrier transformer across the middle, and the signal down it.
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[left, right],
         Weight::Hair,
         tool::fade(edge, 0.6),
     );
-    circuit::pad(&mut shapes, top, circuit::PAD - 1.0, ink, true);
-    circuit::pad(&mut shapes, bottom, circuit::PAD - 1.0, ink, true);
+    chrome::pad(&mut shapes, top, chrome::PAD - 1.0, ink, true);
+    chrome::pad(&mut shapes, bottom, chrome::PAD - 1.0, ink, true);
     // AT MIX ZERO the bridge is shorted out by a jumper, which is what
     // a wire looks like, and no amount of carrier changes that.
     if mix < 0.005 {
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(b.left() - 6.0, b.center().y),
@@ -188,7 +189,7 @@ pub(super) fn draw(face: &Face<'_>) {
             )
         })
         .collect();
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &wave,
         Weight::Heavy,
@@ -204,7 +205,7 @@ pub(super) fn draw(face: &Face<'_>) {
             i as f32 / (CARRIERS - 1) as f32,
         );
         let here = i == carrier;
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(slot.left() + 2.0, y),
@@ -222,7 +223,7 @@ pub(super) fn draw(face: &Face<'_>) {
     let reach = face.place(p::HOLD_RATE);
     let mid = fence.center();
     for side in [-1.0f32, 1.0] {
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(
@@ -238,7 +239,7 @@ pub(super) fn draw(face: &Face<'_>) {
             tool::mix_ink(tool::fade(edge, 0.9), face.focus(), face.lit(p::HOLD_RATE)),
         );
     }
-    circuit::pad(&mut shapes, mid, circuit::PAD - 1.0, face.live(), true);
+    chrome::pad(&mut shapes, mid, chrome::PAD - 1.0, face.live(), true);
     tool::halo(&mut shapes, fence, face.lit(p::HOLD_RATE), face.focus());
 
     // MIX: the balance between the bridge and the wire round it.

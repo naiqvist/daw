@@ -12,6 +12,7 @@
 //! it has gone. The scar on the beam is what the worst block cost.
 
 use super::*;
+use crate::ui::chrome;
 use crate::ui::nav_cursor;
 
 /// The scale the card is drawn on, from the beam downward.
@@ -109,7 +110,7 @@ pub(super) fn draw(face: &Face<'_>) {
     ));
     // The ceiling, scribed on the column's own scale.
     let ceiling_y = tool::level_y(lay.column, said.bands[0], FLOOR_DB);
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             egui::pos2(lay.column.left() - 2.0, ceiling_y),
@@ -135,7 +136,7 @@ pub(super) fn draw(face: &Face<'_>) {
         tool::fade(face.hot(), 0.5),
     ));
     // Over it, where it will meet the ceiling.
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             egui::pos2(
@@ -171,7 +172,7 @@ pub(super) fn draw(face: &Face<'_>) {
         0.0,
         tool::fade(edge, 1.2),
     ));
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             egui::pos2(lay.piston.left() + 1.0, face_y),
@@ -181,7 +182,7 @@ pub(super) fn draw(face: &Face<'_>) {
         tool::mix_ink(ink, face.hot(), held),
     );
     // The rod, so the piston is plainly hung from the beam.
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             egui::pos2(lay.piston.center().x, lay.beam.bottom()),

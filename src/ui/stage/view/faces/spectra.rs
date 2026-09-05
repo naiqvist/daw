@@ -15,6 +15,7 @@
 use super::*;
 use crate::console::SectionParams;
 use crate::params::console::spectra as p;
+use crate::ui::chrome;
 use crate::ui::nav_cursor;
 
 /// The teeth the rake is drawn with.
@@ -106,7 +107,7 @@ pub(super) fn draw(face: &Face<'_>) {
     // the section actually works on.
     for i in 0..=8 {
         let x = egui::lerp(field.x_range(), i as f32 / 8.0);
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(x, field.bottom() - if i % 2 == 0 { 5.0 } else { 3.0 }),
@@ -129,7 +130,7 @@ pub(super) fn draw(face: &Face<'_>) {
                     continue;
                 }
                 let mass = (t * core::f32::consts::PI).sin();
-                circuit::trace(
+                chrome::trace(
                     &mut shapes,
                     &[
                         egui::pos2(x, field.bottom()),
@@ -157,7 +158,7 @@ pub(super) fn draw(face: &Face<'_>) {
         // Blur smears the teeth into each other; flux is how alive the
         // frame is, and it lights the tips.
         let tooth = field.height() * (0.15 + 0.75 * mass * height) * (1.0 - 0.35 * blur);
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(x, field.bottom()),
@@ -173,14 +174,14 @@ pub(super) fn draw(face: &Face<'_>) {
     }
     // The centre of mass itself: one post, with the spread bracketed
     // either side of it.
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[egui::pos2(at, field.top()), egui::pos2(at, field.bottom())],
         Weight::Heavy,
         tool::mix_ink(face.live(), face.focus(), face.lit(p::PITCH)),
     );
     for side in [-1.0f32, 1.0] {
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(at + side * wide * 0.5, field.top() + 3.0),
@@ -200,7 +201,7 @@ pub(super) fn draw(face: &Face<'_>) {
             i as f32 / (MODES - 1) as f32,
         );
         let here = i == mode;
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(slot.left() + 2.0, y),
@@ -215,7 +216,7 @@ pub(super) fn draw(face: &Face<'_>) {
     // FREEZE: a latch that is closed or open, and when it is closed the
     // rake above has already stopped moving of its own accord.
     let latch = lay.freeze;
-    circuit::octagon(
+    chrome::octagon(
         &mut shapes,
         latch.shrink(2.0),
         2.0,

@@ -16,6 +16,7 @@
 use super::*;
 use crate::console::SectionParams;
 use crate::params::console::vca as p;
+use crate::ui::chrome;
 use crate::ui::nav_cursor;
 
 /// The key columns' scale: silence at the foot, full scale at the head.
@@ -142,7 +143,7 @@ pub(super) fn draw(face: &Face<'_>) {
     // THE THRESHOLD: scribed across both columns, with a stub through
     // each wall so it stays readable under the key.
     let scribe = lay.threshold.center().y;
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             egui::pos2(lay.key.left() - 4.0, scribe),
@@ -162,7 +163,7 @@ pub(super) fn draw(face: &Face<'_>) {
     // drawn where the signal it removes would have been.
     let cut = tool::norm(face.value(p::SC_HP), 20.0, 500.0);
     let wedge = lay.sc_hp;
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             wedge.left_bottom(),
@@ -198,7 +199,7 @@ pub(super) fn draw(face: &Face<'_>) {
         lay.vice.center().y..=lay.vice.top() + 1.0,
         1.0 - held.clamp(0.0, 1.0),
     );
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             egui::pos2(lay.vice.left(), mark),

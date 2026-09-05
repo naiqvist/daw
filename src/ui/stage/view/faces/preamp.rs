@@ -2,6 +2,7 @@
 //! instruments that ARE the five parameters.
 
 use super::*;
+use crate::ui::chrome;
 
 /// The five PREAMP parameters have five different instruments. Their
 /// rectangles are authored together so the keyboard address and the
@@ -128,7 +129,7 @@ pub(super) fn draw(face: &Face<'_>) {
     // A nested, solid meter subassembly sits inside the screen. The
     // well-coloured bezel and black inner glass make depth using only
     // plane changes and hard shadows.
-    circuit::panel_variant(
+    chrome::panel_variant(
         &mut shapes,
         lay.meter,
         Some(alpha.well.color),
@@ -137,7 +138,7 @@ pub(super) fn draw(face: &Face<'_>) {
         2,
     );
     let meter_glass = lay.meter.shrink(3.0);
-    circuit::panel_variant(
+    chrome::panel_variant(
         &mut shapes,
         meter_glass,
         Some(alpha.ground.color),
@@ -156,7 +157,7 @@ pub(super) fn draw(face: &Face<'_>) {
     let arc: Vec<egui::Pos2> = (0..=24)
         .map(|i| on_arc(pivot, radius, start + (end - start) * i as f32 / 24.0))
         .collect();
-    circuit::trace(&mut shapes, &arc, Weight::Heavy, edge.gamma_multiply(1.25));
+    chrome::trace(&mut shapes, &arc, Weight::Heavy, edge.gamma_multiply(1.25));
     let deg_of = |db: f32| start + (end - start) * ((db + 20.0) / 23.0).clamp(0.0, 1.0);
     let hot: Vec<egui::Pos2> = (0..=6)
         .map(|i| {
@@ -167,10 +168,10 @@ pub(super) fn draw(face: &Face<'_>) {
             )
         })
         .collect();
-    circuit::trace(&mut shapes, &hot, Weight::Heavy, alpha.live_dim.color);
+    chrome::trace(&mut shapes, &hot, Weight::Heavy, alpha.live_dim.color);
     for db in [-20.0, -10.0, -5.0, 0.0, 3.0] {
         let d = deg_of(db);
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 on_arc(pivot, radius - 4.0, d),
@@ -194,7 +195,7 @@ pub(super) fn draw(face: &Face<'_>) {
         egui::pos2(meter.left() + 2.0, meter.top() + 7.0),
         egui::pos2(chord_right, meter.bottom() - 7.0),
     );
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             egui::pos2(chord.left(), chord.center().y),
@@ -203,7 +204,7 @@ pub(super) fn draw(face: &Face<'_>) {
         Weight::Hair,
         edge.gamma_multiply(0.45),
     );
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             egui::pos2(chord.center().x, chord.top()),
@@ -222,7 +223,7 @@ pub(super) fn draw(face: &Face<'_>) {
             )
         })
         .collect();
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &curve,
         Weight::Hair,
@@ -245,17 +246,17 @@ pub(super) fn draw(face: &Face<'_>) {
         }
     });
     let needle = deg_of(db);
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[pivot, on_arc(pivot, radius - 2.0, needle)],
         Weight::Heavy,
         if db >= 0.0 { alpha.live.color } else { live },
     );
-    circuit::pad(&mut shapes, pivot, circuit::PAD, ink, true);
-    circuit::pad(
+    chrome::pad(&mut shapes, pivot, chrome::PAD, ink, true);
+    chrome::pad(
         &mut shapes,
         egui::pos2(meter_glass.right() - 7.0, meter_glass.top() + 7.0),
-        circuit::PAD - 1.0,
+        chrome::PAD - 1.0,
         if db >= 0.0 {
             alpha.jeopardy_active.color
         } else {
@@ -267,7 +268,7 @@ pub(super) fn draw(face: &Face<'_>) {
     // TRM: deliberately little. It is bipolar about the bright
     // centre post, with only the run between unity and the smooth
     // moving cursor awake.
-    circuit::panel_frame_variant(&mut shapes, lay.trim, Weight::Hair, edge, 3);
+    chrome::panel_frame_variant(&mut shapes, lay.trim, Weight::Hair, edge, 3);
     let trim_bar = egui::Rect::from_min_max(
         egui::pos2(lay.trim.left() + 30.0, lay.trim.center().y - 5.0),
         egui::pos2(lay.trim.right() - 6.0, lay.trim.center().y + 5.0),
@@ -287,7 +288,7 @@ pub(super) fn draw(face: &Face<'_>) {
         } else {
             4.0
         };
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(x, trim_bar.center().y - h * 0.5),
@@ -302,10 +303,10 @@ pub(super) fn draw(face: &Face<'_>) {
         );
     }
     let unity_x = egui::lerp(trim_bar.x_range(), 0.5);
-    circuit::pad(
+    chrome::pad(
         &mut shapes,
         egui::pos2(unity_x, trim_bar.center().y),
-        circuit::PAD - 2.0,
+        chrome::PAD - 2.0,
         alpha.focus.color,
         true,
     );
@@ -313,7 +314,7 @@ pub(super) fn draw(face: &Face<'_>) {
     // IRON: a larger bank. More of it wakes with drive and every
     // live segment moves from the bone ink toward the alphabet's
     // hot hue as the stage is leaned on.
-    circuit::panel_variant(
+    chrome::panel_variant(
         &mut shapes,
         lay.iron,
         Some(alpha.well.color),
@@ -353,9 +354,9 @@ pub(super) fn draw(face: &Face<'_>) {
 
     // CHARACTER: not another bar. The two actual transfer families
     // lay each other; the selected path is the readable one.
-    circuit::panel_frame_variant(&mut shapes, lay.character, Weight::Hair, edge, 2);
+    chrome::panel_frame_variant(&mut shapes, lay.character, Weight::Hair, edge, 2);
     let split_x = lay.character.center().x;
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             egui::pos2(split_x, lay.character.top() + 3.0),
@@ -388,7 +389,7 @@ pub(super) fn draw(face: &Face<'_>) {
                 )
             })
             .collect();
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &curve,
             if chosen { Weight::Heavy } else { Weight::Hair },
@@ -398,10 +399,10 @@ pub(super) fn draw(face: &Face<'_>) {
                 edge.gamma_multiply(0.7)
             },
         );
-        circuit::pad(
+        chrome::pad(
             &mut shapes,
             egui::pos2(half.left() + 12.0, half.center().y),
-            circuit::PAD - 1.0,
+            chrome::PAD - 1.0,
             if chosen { ink } else { edge },
             chosen,
         );
@@ -414,7 +415,7 @@ pub(super) fn draw(face: &Face<'_>) {
                   on: bool,
                   lit: egui::Color32,
                   variant: u8| {
-        circuit::panel_variant(
+        chrome::panel_variant(
             shapes,
             rect,
             Some(if on { lit } else { alpha.ground.color }),
@@ -422,10 +423,10 @@ pub(super) fn draw(face: &Face<'_>) {
             Some((Weight::Hair, if on { lit } else { edge })),
             variant,
         );
-        circuit::pad(
+        chrome::pad(
             shapes,
             egui::pos2(rect.right() - 7.0, rect.top() + 7.0),
-            circuit::PAD - 1.0,
+            chrome::PAD - 1.0,
             if on { alpha.ground.color } else { edge },
             on,
         );

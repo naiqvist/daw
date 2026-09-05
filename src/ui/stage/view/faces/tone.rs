@@ -2,6 +2,7 @@
 //! actually running.
 
 use super::*;
+use crate::ui::chrome;
 use crate::ui::nav_cursor;
 
 /// TONE's three bands, each its own hue, so a glance says which lever
@@ -161,14 +162,14 @@ pub(super) fn draw(face: &Face<'_>) {
     // The ground: a hairline lattice, the zero line bright across
     // the middle, and a tick at each decade so the axis is a
     // spectrum and not a strip.
-    circuit::lattice(
+    chrome::lattice(
         &mut shapes,
         lay.field,
         design::px(design::space::ROOM),
         edge.gamma_multiply(0.4),
     );
     let zero_y = lay.field.center().y;
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             egui::pos2(lay.field.left(), zero_y),
@@ -179,7 +180,7 @@ pub(super) fn draw(face: &Face<'_>) {
     );
     for hz in [100.0, 1_000.0, 10_000.0] {
         let x = tone_x(lay.field, hz);
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(x, lay.field.bottom() - 3.0),
@@ -207,7 +208,7 @@ pub(super) fn draw(face: &Face<'_>) {
                 )
             })
             .collect();
-        circuit::trace(&mut shapes, &curve, Weight::Hair, alpha.ink.color);
+        chrome::trace(&mut shapes, &curve, Weight::Hair, alpha.ink.color);
     }
 
     // The three stacks, each HANGING FROM THE CURVE at its own
@@ -251,7 +252,7 @@ pub(super) fn draw(face: &Face<'_>) {
             (lit.abs() * TONE_CELLS as f32).round() as usize
         };
         let reach = TONE_CELL_PITCH * (steps.max(1) as f32) + 3.0;
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(x, top),
@@ -297,7 +298,7 @@ pub(super) fn draw(face: &Face<'_>) {
                 (egui::pos2(x - arm, top + 3.0), egui::pos2(x + arm, bottom)),
                 (egui::pos2(x + arm, top + 3.0), egui::pos2(x - arm, bottom)),
             ] {
-                circuit::trace(
+                chrome::trace(
                     &mut shapes,
                     &[a, b],
                     Weight::Heavy,
@@ -309,7 +310,7 @@ pub(super) fn draw(face: &Face<'_>) {
 
     // The sweep rail: the middle band's own axis, with its stack's
     // foot riding it and the two fixed bands marked as posts.
-    circuit::rail(
+    chrome::rail(
         &mut shapes,
         egui::pos2(lay.sweep.left(), lay.sweep.center().y),
         egui::pos2(lay.sweep.right(), lay.sweep.center().y),
@@ -317,10 +318,10 @@ pub(super) fn draw(face: &Face<'_>) {
         edge.gamma_multiply(0.8),
     );
     for (band, ink) in [(0usize, TONE_LO_INK), (2, TONE_HI_INK)] {
-        circuit::pad(
+        chrome::pad(
             &mut shapes,
             egui::pos2(lay.columns[band].center().x, lay.sweep.center().y),
-            circuit::PAD - 2.0,
+            chrome::PAD - 2.0,
             ink.gamma_multiply(0.7),
             false,
         );

@@ -14,6 +14,7 @@
 use super::*;
 use crate::console::SectionParams;
 use crate::params::console::room as p;
+use crate::ui::chrome;
 use crate::ui::nav_cursor;
 
 /// How many felt pads a wall carries at full damping.
@@ -110,7 +111,7 @@ pub(super) fn draw(face: &Face<'_>) {
             ),
         ));
     }
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             walls.left_top(),
@@ -130,7 +131,7 @@ pub(super) fn draw(face: &Face<'_>) {
     for i in 0..pads {
         let t = (i as f32 + 0.5) / PADS as f32;
         let y = egui::lerp(walls.y_range(), t);
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(walls.right() - 5.0, y),
@@ -140,7 +141,7 @@ pub(super) fn draw(face: &Face<'_>) {
             tool::mix_ink(tool::fade(edge, 1.2), face.focus(), face.lit(p::DAMP)),
         );
         let x = egui::lerp(walls.x_range(), t);
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(x, walls.top() + 1.0),
@@ -161,13 +162,13 @@ pub(super) fn draw(face: &Face<'_>) {
         egui::lerp(run.x_range(), 1.0 - gap.clamp(0.05, 1.0)),
         run.center().y,
     );
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[source, egui::pos2(walls.left(), run.center().y)],
         Weight::Hair,
         tool::mix_ink(tool::fade(edge, 0.9), face.live(), strike),
     );
-    circuit::octagon(
+    chrome::octagon(
         &mut shapes,
         egui::Rect::from_center_size(source, egui::vec2(9.0 + 4.0 * strike, 9.0 + 4.0 * strike)),
         2.0,
@@ -180,7 +181,7 @@ pub(super) fn draw(face: &Face<'_>) {
     let slot = lay.algo;
     for (i, here) in [(0usize, !hall), (1, hall)] {
         let y = egui::lerp((slot.top() + 4.0)..=(slot.bottom() - 4.0), i as f32);
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(slot.left() + 2.0, y),

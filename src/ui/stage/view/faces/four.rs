@@ -14,6 +14,7 @@
 use super::*;
 use crate::console::SectionParams;
 use crate::params::console::four as p;
+use crate::ui::chrome;
 use crate::ui::nav_cursor;
 
 /// The face's decibel span, top to bottom.
@@ -128,7 +129,7 @@ pub(super) fn draw(face: &Face<'_>) {
 
     // The ruling: the unity line across the middle, a tick per decade.
     let zero = tool::db_y(field, 0.0, SPAN_DB);
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             egui::pos2(field.left(), zero),
@@ -139,7 +140,7 @@ pub(super) fn draw(face: &Face<'_>) {
     );
     for hz in [100.0, 1_000.0, 10_000.0] {
         let x = tool::octave_x(field, hz);
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(x, field.bottom() - 3.0),
@@ -157,7 +158,7 @@ pub(super) fn draw(face: &Face<'_>) {
     let spine = tool::response(field, 56, SPAN_DB, |hz| {
         crate::console::four_curve::response_db(&shape, 48_000.0, hz)
     });
-    circuit::trace(&mut shapes, &spine, Weight::Heavy, ink);
+    chrome::trace(&mut shapes, &spine, Weight::Heavy, ink);
 
     // THE FOUR ARMS. Each grips the spine where its frequency puts it,
     // reaches down to its own rail, and carries its width as a pad.
@@ -166,7 +167,7 @@ pub(super) fn draw(face: &Face<'_>) {
         let grip = lay.gain[i].center();
         let lit = face.lit(db_id).max(face.lit(hz_id)).max(face.lit(width_id));
         // The arm: from the pad, up through the rail, to the spine.
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(grip.x, lay.width[i].center().y),
@@ -177,7 +178,7 @@ pub(super) fn draw(face: &Face<'_>) {
         );
         // The grip itself, sized by how far this arm is bending.
         let bend = (face.value(db_id) / 15.0).clamp(-1.0, 1.0);
-        circuit::octagon(
+        chrome::octagon(
             &mut shapes,
             egui::Rect::from_center_size(
                 grip,
@@ -190,7 +191,7 @@ pub(super) fn draw(face: &Face<'_>) {
         tool::halo(&mut shapes, lay.gain[i], face.lit(db_id), face.focus());
 
         // The frequency rail: the arm's foot slides along the spectrum.
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(lay.freq[i].left(), lay.freq[i].center().y),
@@ -199,10 +200,10 @@ pub(super) fn draw(face: &Face<'_>) {
             Weight::Hair,
             tool::fade(hue, 0.4 + 0.6 * face.lit(hz_id)),
         );
-        circuit::pad(
+        chrome::pad(
             &mut shapes,
             egui::pos2(grip.x, lay.freq[i].center().y),
-            circuit::PAD - 1.0,
+            chrome::PAD - 1.0,
             hue,
             true,
         );
@@ -225,11 +226,11 @@ pub(super) fn draw(face: &Face<'_>) {
             } else {
                 egui::pos2(pad.center().x + run * 7.0, top)
             });
-            circuit::trace(&mut shapes, &path, Weight::Hair, tool::fade(hue, 0.9));
+            chrome::trace(&mut shapes, &path, Weight::Hair, tool::fade(hue, 0.9));
         } else {
             let narrow = tool::norm(face.value(width_id), 0.3, 4.0);
             let half = egui::lerp(7.0..=1.5, narrow);
-            circuit::trace(
+            chrome::trace(
                 &mut shapes,
                 &[
                     egui::pos2(pad.center().x - half, pad.bottom() - 2.0),

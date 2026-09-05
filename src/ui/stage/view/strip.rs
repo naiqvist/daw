@@ -17,8 +17,10 @@
 //! Every section's figure is a placeholder until its effect is written:
 //! a recess with the section's word in it. The routes are real.
 
+use super::palette;
 use super::*;
 use crate::console::{SectionKind, Width};
+use crate::ui::chrome;
 
 /// A narrow piece's width; a wide piece is the chain card's.
 pub const NARROW_W: f32 = 184.0;
@@ -98,7 +100,7 @@ pub fn width_of(kind: SectionKind) -> f32 {
 /// neighbours are cut alike and the run's corners are a rhythm rather
 /// than a rule.
 pub fn cuts(kind: SectionKind) -> (f32, f32, f32, f32) {
-    let c = circuit::CHAMFER;
+    let c = chrome::CHAMFER;
     let (tl, tr, br, bl) = match kind {
         // The channel.
         SectionKind::Preamp => (1.5, 0.75, 1.75, 1.0),
@@ -221,7 +223,7 @@ pub fn outline(rect: egui::Rect, kind: SectionKind, notch: bool, tongue: bool) -
     let (l, t, r, b) = (rect.left(), rect.top(), rect.right(), rect.bottom());
     let jy = joint_y(rect);
     let (jt, jb) = (jy - JOINT_H * 0.5, jy + JOINT_H * 0.5);
-    let c = circuit::CHAMFER * 0.6;
+    let c = chrome::CHAMFER * 0.6;
     let mut points = vec![egui::pos2(l + tl, t)];
     // The top edge, with its step where the piece has one: along, down
     // the riser at the chamfer's angle, and on at the lower level.
@@ -304,7 +306,7 @@ pub fn body_fill(
     // not do honestly — and a step, a bay and a notch are all concave.
     let (tl, tr, br, bl) = cuts(kind);
     let (l, t, r, b) = (rect.left(), rect.top(), rect.right(), rect.bottom());
-    let c = circuit::CHAMFER * 0.6;
+    let c = chrome::CHAMFER * 0.6;
     out.push(egui::Shape::rect_filled(rect, 0.0, fill));
     let tri = |out: &mut Vec<egui::Shape>, pts: Vec<egui::Pos2>| {
         out.push(egui::Shape::convex_polygon(pts, ground, egui::Stroke::NONE));
@@ -433,7 +435,7 @@ pub fn tongue_fill(out: &mut Vec<egui::Shape>, rect: egui::Rect, fill: egui::Col
     let r = rect.right();
     let jy = joint_y(rect);
     let (jt, jb) = (jy - JOINT_H * 0.5, jy + JOINT_H * 0.5);
-    let c = circuit::CHAMFER * 0.6;
+    let c = chrome::CHAMFER * 0.6;
     out.push(egui::Shape::convex_polygon(
         vec![
             egui::pos2(r - 0.5, jt),
@@ -545,13 +547,13 @@ pub fn route(
     let over = |y: f32, from: egui::Pos2, to: egui::Pos2| -> Vec<egui::Pos2> {
         let mut path = vec![from];
         path.extend(
-            circuit::elbow(from, egui::pos2(hole.left() - 6.0, y))
+            chrome::elbow(from, egui::pos2(hole.left() - 6.0, y))
                 .into_iter()
                 .skip(1),
         );
         path.push(egui::pos2(hole.right() + 6.0, y));
         path.extend(
-            circuit::elbow(egui::pos2(hole.right() + 6.0, y), to)
+            chrome::elbow(egui::pos2(hole.right() + 6.0, y), to)
                 .into_iter()
                 .skip(1),
         );
@@ -566,27 +568,27 @@ pub fn route(
         let right_wall = hole.right() - 8.0;
         let mut top = vec![a];
         top.extend(
-            circuit::elbow(a, egui::pos2(left_wall, pivot.y - 3.0))
+            chrome::elbow(a, egui::pos2(left_wall, pivot.y - 3.0))
                 .into_iter()
                 .skip(1),
         );
         top.push(pivot);
         top.push(egui::pos2(right_wall, pivot.y - 3.0));
         top.extend(
-            circuit::elbow(egui::pos2(right_wall, pivot.y - 3.0), a_end)
+            chrome::elbow(egui::pos2(right_wall, pivot.y - 3.0), a_end)
                 .into_iter()
                 .skip(1),
         );
         let mut bottom = vec![b];
         bottom.extend(
-            circuit::elbow(b, egui::pos2(left_wall - 4.0, pivot.y + 3.0))
+            chrome::elbow(b, egui::pos2(left_wall - 4.0, pivot.y + 3.0))
                 .into_iter()
                 .skip(1),
         );
         bottom.push(pivot);
         bottom.push(egui::pos2(right_wall + 4.0, pivot.y + 3.0));
         bottom.extend(
-            circuit::elbow(egui::pos2(right_wall + 4.0, pivot.y + 3.0), b_end)
+            chrome::elbow(egui::pos2(right_wall + 4.0, pivot.y + 3.0), b_end)
                 .into_iter()
                 .skip(1),
         );
@@ -630,13 +632,13 @@ pub fn bypass(rect: egui::Rect, notch: bool, tongue: bool) -> [Vec<egui::Pos2>; 
         let to = egui::pos2(x1, jy + dy);
         let mut path = vec![from];
         path.extend(
-            circuit::elbow(from, egui::pos2(x0 + 18.0, y))
+            chrome::elbow(from, egui::pos2(x0 + 18.0, y))
                 .into_iter()
                 .skip(1),
         );
         path.push(egui::pos2(x1 - 18.0, y));
         path.extend(
-            circuit::elbow(egui::pos2(x1 - 18.0, y), to)
+            chrome::elbow(egui::pos2(x1 - 18.0, y), to)
                 .into_iter()
                 .skip(1),
         );
@@ -677,10 +679,10 @@ impl Stage {
             &mut shapes,
             piece
                 .rect
-                .translate(egui::vec2(circuit::SHADOW_X, circuit::SHADOW_Y)),
+                .translate(egui::vec2(chrome::SHADOW_X, chrome::SHADOW_Y)),
             piece.kind,
             piece.notch,
-            circuit::shadow_ink(alpha.ground.color),
+            chrome::shadow_ink(alpha.ground.color),
             alpha.ground.color,
         );
         body_fill(
@@ -745,14 +747,14 @@ impl Stage {
         }
         let mut path = outline(rect, piece.kind, piece.notch, piece.tongue);
         path.push(path[0]);
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &path,
             if focused { Weight::Heavy } else { Weight::Hair },
             if focused { alpha.ink.color } else { edge },
         );
         // The head's foot: a rule under the name band, short of the walls.
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(rect.left() + 8.0, rect.top() + HEAD_H),
@@ -769,14 +771,14 @@ impl Stage {
             bypass(rect, piece.notch, piece.tongue)
         };
         for path in &routes {
-            circuit::trace(
+            chrome::trace(
                 &mut shapes,
                 path,
                 Weight::Hair,
                 if is_in { ink } else { edge.gamma_multiply(1.3) },
             );
             if sounding && phase.rolling {
-                circuit::dashes(
+                chrome::dashes(
                     &mut shapes,
                     path,
                     phase.dash(),
@@ -786,8 +788,8 @@ impl Stage {
             }
             // Contacts: a pad where the pair lands and where it leaves.
             if let (Some(first), Some(last)) = (path.first(), path.last()) {
-                circuit::pad(&mut shapes, *first, circuit::PAD - 1.0, ink, is_in);
-                circuit::pad(&mut shapes, *last, circuit::PAD - 1.0, ink, is_in);
+                chrome::pad(&mut shapes, *first, chrome::PAD - 1.0, ink, is_in);
+                chrome::pad(&mut shapes, *last, chrome::PAD - 1.0, ink, is_in);
             }
         }
 
@@ -810,15 +812,15 @@ impl Stage {
         }
         // The IN pad on the head's right: lit while IN, fixed for a
         // section the desk never lets out.
-        circuit::pad(
+        chrome::pad(
             &mut shapes,
             egui::pos2(rect.right() - 12.0, rect.top() + HEAD_H * 0.5),
-            circuit::PAD + 1.0,
+            chrome::PAD + 1.0,
             if is_in { alpha.live.color } else { edge },
             is_in,
         );
         if piece.kind.always_in() {
-            circuit::via(
+            chrome::via(
                 &mut shapes,
                 egui::pos2(rect.right() - 12.0, rect.top() + HEAD_H * 0.5),
                 edge,
@@ -828,16 +830,14 @@ impl Stage {
         painter.extend(shapes);
 
         // The name, in the block face, over the joint's rail.
-        block::paint(
-            painter,
-            egui::Id::new(("stage-piece-name", piece.index)),
+        painter.text(
             egui::pos2(
                 rect.left() + if piece.notch { TONGUE + 8.0 } else { 10.0 },
                 rect.top() + 6.0,
             ),
             egui::Align2::LEFT_TOP,
-            block::unit::MICRO,
             piece.kind.name(),
+            egui::FontId::monospace(11.0),
             ink,
         );
 
@@ -942,24 +942,28 @@ impl Stage {
             );
             let on_row = focused && cursor == Some((piece.index, row_offset + line));
             if on_row {
-                screen.rect_filled(row_rect, 0.0, alpha.focus.color);
+                screen.rect_filled(row_rect, 0.0, alpha.live_dim.color);
                 crate::ui::nav_cursor::claim(
                     &screen,
                     ("stage-strip-row-cursor", piece.index, row_offset + line),
                     row_rect,
                     crate::ui::nav_cursor::Kind::Row,
                     crate::ui::nav_cursor::Layer::Surface,
-                    alpha.ground.color,
+                    palette::colours().alert,
                 );
             }
             let value_ink = if on_row {
-                alpha.ground.color
+                palette::colours().bright
             } else if row.edited {
                 alpha.focus.color
             } else {
                 text_ink
             };
-            let name_ink = if on_row { alpha.ground.color } else { text_ink };
+            let name_ink = if on_row {
+                palette::colours().bright
+            } else {
+                text_ink
+            };
             let value_w = painter
                 .layout_no_wrap(row.value.clone(), row_font.clone(), value_ink)
                 .rect
@@ -1008,7 +1012,7 @@ impl Stage {
             let mut x = row_rect.left() + 2.0 + name_w + cell_w;
             let mut dots = Vec::new();
             while x < leader_end {
-                circuit::dot(
+                chrome::dot(
                     &mut dots,
                     egui::pos2(x, row_rect.center().y + 3.0),
                     if on_row { alpha.ground.color } else { edge },
@@ -1020,16 +1024,9 @@ impl Stage {
                 let mut marks = Vec::new();
                 let rest = if on_row { alpha.surface.color } else { edge };
                 if row.choices > 0 {
-                    circuit::choice_bar(
-                        &mut marks,
-                        gauge,
-                        row.choices,
-                        row.choice,
-                        value_ink,
-                        rest,
-                    );
+                    chrome::choice_bar(&mut marks, gauge, row.choices, row.choice, value_ink, rest);
                 } else {
-                    circuit::tick_bar(&mut marks, gauge, 12, row.place, value_ink, rest, true);
+                    chrome::tick_bar(&mut marks, gauge, 12, row.place, value_ink, rest, true);
                 }
                 screen.extend(marks);
             }
@@ -1045,7 +1042,7 @@ impl Stage {
         // whose face IS its parameters has no table and no more below.
         if !piece.kind.owns_its_glass() && column.rows.len() > row_offset + rows_shown {
             let mut marks = Vec::new();
-            circuit::annotation_arrow(
+            chrome::annotation_arrow(
                 &mut marks,
                 egui::pos2(glass.center().x, glass.bottom() - 10.0),
                 egui::pos2(glass.center().x, glass.bottom() - 1.0),
@@ -1056,7 +1053,7 @@ impl Stage {
         if reveal < 1.0 {
             let y = shown.max.y;
             let mut scan = Vec::new();
-            circuit::trace(
+            chrome::trace(
                 &mut scan,
                 &[egui::pos2(glass.left(), y), egui::pos2(glass.right(), y)],
                 Weight::Heavy,
@@ -1114,9 +1111,9 @@ pub fn screen_frame(
     ground: egui::Color32,
 ) {
     out.push(egui::Shape::rect_filled(hole, 0.0, ground));
-    circuit::panel_frame_variant(out, hole, Weight::Hair, edge, 0);
+    chrome::panel_frame_variant(out, hole, Weight::Hair, edge, 0);
     let inner = hole.shrink(3.0);
-    circuit::trace(
+    chrome::trace(
         out,
         &[
             inner.left_top(),
@@ -1136,7 +1133,7 @@ pub fn screen_frame(
         (inner.left_bottom(), 1.0, -1.0),
     ] {
         let c = corner + egui::vec2(dx * 2.0, dy * 2.0);
-        circuit::trace(
+        chrome::trace(
             out,
             &[
                 c + egui::vec2(0.0, dy * tick),
@@ -1182,10 +1179,10 @@ fn preamp_crown(
     ));
     let mut outline = points;
     outline.push(outline[0]);
-    circuit::trace(out, &outline, Weight::Hair, edge.gamma_multiply(0.72));
+    chrome::trace(out, &outline, Weight::Hair, edge.gamma_multiply(0.72));
     for i in 0..3 {
         let x = r - 43.0 + i as f32 * 6.0;
-        circuit::trace(
+        chrome::trace(
             out,
             &[egui::pos2(x, t + 5.0), egui::pos2(x + 4.0, t + 9.0)],
             Weight::Hair,
@@ -1204,7 +1201,7 @@ fn preamp_screen_frame(
     ground: egui::Color32,
     casing: egui::Color32,
 ) {
-    circuit::panel_variant(
+    chrome::panel_variant(
         out,
         hole,
         Some(ground),
@@ -1212,7 +1209,7 @@ fn preamp_screen_frame(
         Some((Weight::Heavy, edge)),
         0,
     );
-    circuit::panel_frame_variant(
+    chrome::panel_frame_variant(
         out,
         hole.shrink(3.0),
         Weight::Hair,
@@ -1223,7 +1220,7 @@ fn preamp_screen_frame(
         egui::pos2(hole.left() - 5.0, hole.top() + 11.0),
         egui::pos2(hole.right() + 5.0, hole.bottom() - 11.0),
     ] {
-        circuit::pad(out, at, circuit::PAD - 1.0, edge, false);
+        chrome::pad(out, at, chrome::PAD - 1.0, edge, false);
     }
 }
 

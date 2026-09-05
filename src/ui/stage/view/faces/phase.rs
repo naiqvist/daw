@@ -14,6 +14,7 @@
 use super::*;
 use crate::console::SectionParams;
 use crate::params::console::phase as p;
+use crate::ui::chrome;
 use crate::ui::nav_cursor;
 
 /// The stage counts the switch steps through: two per position.
@@ -79,10 +80,10 @@ pub(super) fn draw(face: &Face<'_>) {
     let fb = face.swing(p::FEEDBACK);
 
     // THE SPECTRUM the rakes bite into, ruled by decade.
-    circuit::lattice(&mut shapes, field, 18.0, tool::fade(edge, 0.30));
+    chrome::lattice(&mut shapes, field, 18.0, tool::fade(edge, 0.30));
     for hz in [200.0, 1_000.0, 6_000.0] {
         let x = tool::octave_x(field, hz);
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(x, field.bottom() - 3.0),
@@ -120,7 +121,7 @@ pub(super) fn draw(face: &Face<'_>) {
         let span = 1.4f32;
         let left = tool::octave_x(field, centre / span.exp2());
         let right = tool::octave_x(field, centre * span.exp2());
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[egui::pos2(left, spine), egui::pos2(right, spine)],
             Weight::Heavy,
@@ -136,17 +137,17 @@ pub(super) fn draw(face: &Face<'_>) {
             // The teeth are longest at the comb's centre, which is
             // where a phaser's notches actually are deepest.
             let reach = bite * (0.35 + 0.65 * (t * core::f32::consts::PI).sin());
-            circuit::trace(
+            chrome::trace(
                 &mut shapes,
                 &[egui::pos2(x, spine), egui::pos2(x, spine + dir * reach)],
                 Weight::Hair,
                 tool::fade(hue, 0.55 + 0.45 * fb.abs()),
             );
         }
-        circuit::pad(
+        chrome::pad(
             &mut shapes,
             egui::pos2(left, spine),
-            circuit::PAD - 2.0,
+            chrome::PAD - 2.0,
             hue,
             true,
         );
@@ -210,26 +211,26 @@ pub(super) fn draw(face: &Face<'_>) {
     let dial = lay.offset;
     let centre = egui::pos2(dial.center().x, dial.center().y);
     let radius = (dial.width().min(dial.height()) * 0.42).max(6.0);
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &tool::arc(centre, radius, 0.0, 360.0, 28),
         Weight::Hair,
         tool::fade(edge, 0.7),
     );
     let turn = face.value(p::OFFSET);
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[centre, tool::on_arc(centre, radius, 90.0)],
         Weight::Hair,
         ink,
     );
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[centre, tool::on_arc(centre, radius, 90.0 - turn)],
         Weight::Heavy,
         tool::mix_ink(face.live(), face.focus(), face.lit(p::OFFSET)),
     );
-    circuit::pad(&mut shapes, centre, circuit::PAD - 2.0, ink, true);
+    chrome::pad(&mut shapes, centre, chrome::PAD - 2.0, ink, true);
     tool::halo(&mut shapes, dial, face.lit(p::OFFSET), face.focus());
 
     face.painter.extend(shapes);

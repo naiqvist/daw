@@ -15,6 +15,7 @@
 use super::*;
 use crate::console::SectionParams;
 use crate::params::console::iron as p;
+use crate::ui::chrome;
 use crate::ui::nav_cursor;
 
 struct Lay {
@@ -58,7 +59,7 @@ pub(super) fn draw(face: &Face<'_>) {
     tool::well(&mut shapes, lay.scope, face.ground(), edge);
     let field = lay.scope.shrink(4.0);
     let centre = field.center();
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             egui::pos2(field.left(), centre.y),
@@ -67,7 +68,7 @@ pub(super) fn draw(face: &Face<'_>) {
         Weight::Hair,
         tool::fade(edge, 0.5),
     );
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             egui::pos2(centre.x, field.top()),
@@ -76,7 +77,7 @@ pub(super) fn draw(face: &Face<'_>) {
         Weight::Hair,
         tool::fade(edge, 0.5),
     );
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[field.left_bottom(), field.right_top()],
         Weight::Hair,
@@ -108,7 +109,7 @@ pub(super) fn draw(face: &Face<'_>) {
             )
         })
         .collect();
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &loop_path,
         Weight::Heavy,
@@ -116,12 +117,12 @@ pub(super) fn draw(face: &Face<'_>) {
     );
     // The two shoulders: where the core has run out of iron.
     for side in [-1.0f32, 1.0] {
-        circuit::pad(
+        chrome::pad(
             &mut shapes,
             // The curve is normalised so its ends are exactly the
             // shoulders: one unit of flux at one unit of drive.
             egui::pos2(centre.x + side * half_w, centre.y - side * half_h),
-            circuit::PAD - 2.0,
+            chrome::PAD - 2.0,
             tool::fade(face.hot(), 0.3 + 0.7 * drive),
             drive > 0.02,
         );

@@ -14,6 +14,7 @@
 use super::*;
 use crate::console::SectionParams;
 use crate::params::console::split as p;
+use crate::ui::chrome;
 use crate::ui::nav_cursor;
 
 /// How far a ray bends, in points, at the section's full reach.
@@ -125,7 +126,7 @@ pub(super) fn draw(face: &Face<'_>) {
     }
     for (rect, param) in [(lay.low_hz, p::LOW_HZ), (lay.high_hz, p::HIGH_HZ)] {
         let x = rect.center().x;
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(x, rail.top() - 2.0),
@@ -134,10 +135,10 @@ pub(super) fn draw(face: &Face<'_>) {
             Weight::Hair,
             tool::mix_ink(tool::fade(edge, 0.7), face.focus(), face.lit(param)),
         );
-        circuit::pad(
+        chrome::pad(
             &mut shapes,
             egui::pos2(x, rail.center().y),
-            circuit::PAD,
+            chrome::PAD,
             ink,
             true,
         );
@@ -160,13 +161,13 @@ pub(super) fn draw(face: &Face<'_>) {
             0.09,
         );
         let exit = y - applied * BEND;
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[egui::pos2(lay.field.left(), y), egui::pos2(lens.left(), y)],
             Weight::Hair,
             tool::fade(hue, 0.55),
         );
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(lens.right(), y),
@@ -193,7 +194,7 @@ pub(super) fn draw(face: &Face<'_>) {
                     )
                 })
                 .collect();
-            circuit::trace(&mut shapes, &bow, Weight::Hair, tool::fade(hue, 0.9));
+            chrome::trace(&mut shapes, &bow, Weight::Hair, tool::fade(hue, 0.9));
         }
         tool::halo(&mut shapes, lens, face.lit(amount_id), face.focus());
 

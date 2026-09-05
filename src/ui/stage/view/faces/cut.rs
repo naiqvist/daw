@@ -15,6 +15,7 @@
 use super::*;
 use crate::console::SectionParams;
 use crate::params::console::cut as p;
+use crate::ui::chrome;
 use crate::ui::nav_cursor;
 
 /// How tall a resonance spike stands at full ring.
@@ -89,10 +90,10 @@ pub(super) fn draw(face: &Face<'_>) {
 
     // The ground: the spectrum, ruled by decade so the axis is a
     // spectrum and not a strip.
-    circuit::lattice(&mut shapes, field, 18.0, tool::fade(edge, 0.35));
+    chrome::lattice(&mut shapes, field, 18.0, tool::fade(edge, 0.35));
     for hz in [100.0, 1_000.0, 10_000.0] {
         let x = tool::octave_x(field, hz);
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(x, field.bottom() - 3.0),
@@ -135,7 +136,7 @@ pub(super) fn draw(face: &Face<'_>) {
                 tool::fade(edge, 0.30),
             ));
         }
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[egui::pos2(x, field.top()), egui::pos2(x, field.bottom())],
             Weight::Heavy,
@@ -160,7 +161,7 @@ pub(super) fn draw(face: &Face<'_>) {
         );
         let height = field.height() * SPIKE * ring;
         let peak = egui::pos2(x, field.center().y - height);
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(x - 5.0, field.center().y),
@@ -170,10 +171,10 @@ pub(super) fn draw(face: &Face<'_>) {
             Weight::Hair,
             tool::mix_ink(ink, face.hot(), ring),
         );
-        circuit::pad(
+        chrome::pad(
             &mut shapes,
             peak,
-            circuit::PAD - 2.0,
+            chrome::PAD - 2.0,
             tool::mix_ink(ink, face.hot(), ring),
             ring > 0.02,
         );

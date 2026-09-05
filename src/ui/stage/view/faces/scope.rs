@@ -15,6 +15,7 @@
 //! balanced.
 
 use super::*;
+use crate::ui::chrome;
 use crate::ui::nav_cursor;
 
 /// The band scale the plate is read on.
@@ -72,7 +73,7 @@ pub(super) fn draw(face: &Face<'_>) {
     // THE PLATE: the triangle, its three corners marked in the band
     // hues the whole desk uses, and a lattice of thirds inside so the
     // point is read against something.
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             lay.corners[0],
@@ -89,7 +90,7 @@ pub(super) fn draw(face: &Face<'_>) {
             let from = lay.corners[a] + (lay.corners[b] - lay.corners[a]) * t;
             let c = (a + 2) % 3;
             let to = lay.corners[c] + (lay.corners[b] - lay.corners[c]) * t;
-            circuit::trace(
+            chrome::trace(
                 &mut shapes,
                 &[from, to],
                 Weight::Hair,
@@ -111,16 +112,16 @@ pub(super) fn draw(face: &Face<'_>) {
         weights[band] = share.max(0.001);
         let corner = lay.corners[band];
         let inward = (lay.plate.center() - corner).normalized();
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[corner, corner + inward * (lay.plate.width() * 0.30 * share)],
             Weight::Heavy,
             tool::fade(tool::BAND_INK[band], 0.35 + 0.65 * share),
         );
-        circuit::pad(
+        chrome::pad(
             &mut shapes,
             corner,
-            circuit::PAD,
+            chrome::PAD,
             tool::BAND_INK[band],
             share > 0.02,
         );
@@ -131,7 +132,7 @@ pub(super) fn draw(face: &Face<'_>) {
     // same place rather than a mark that has wandered.
     let at = point(lay.corners, weights);
     let loud = tool::norm(said.level_db, FLOOR_DB, 0.0);
-    circuit::octagon(
+    chrome::octagon(
         &mut shapes,
         egui::Rect::from_center_size(at, egui::vec2(5.0 + 9.0 * loud, 5.0 + 9.0 * loud)),
         2.0,
@@ -139,7 +140,7 @@ pub(super) fn draw(face: &Face<'_>) {
         Some((Weight::Hair, ink)),
     );
     // The dead centre, for the balance a mix is read against.
-    circuit::via(
+    chrome::via(
         &mut shapes,
         point(lay.corners, [1.0, 1.0, 1.0]),
         tool::fade(edge, 1.1),

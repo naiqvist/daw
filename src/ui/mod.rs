@@ -65,6 +65,7 @@
 
 pub mod action;
 pub mod affordance;
+pub mod chrome;
 pub mod device;
 pub mod gallery;
 pub mod glyph;

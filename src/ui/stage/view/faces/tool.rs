@@ -11,10 +11,11 @@
 //! twenty-seventh kind of knob.
 //!
 //! Every function here takes a `&mut Vec<Shape>` and adds to it, the
-//! way [`crate::design::circuit`] does, so a face builds one batch and
+//! way [`crate::ui::chrome`] does, so a face builds one batch and
 //! hands it to the painter once.
 
 use super::*;
+use crate::ui::chrome;
 use eframe::egui::{Color32, Pos2, Rect, Shape, Vec2, pos2, vec2};
 
 // ─── the axes a filter is drawn on ────────────────────────────────────
@@ -110,7 +111,7 @@ pub fn cells(
     for i in 0..count {
         let centre = from + step * i as f32;
         let on = i < lit;
-        circuit::pad(out, centre, side, if on { ink } else { rest }, on);
+        chrome::pad(out, centre, side, if on { ink } else { rest }, on);
     }
 }
 
@@ -134,7 +135,7 @@ pub fn stack(
     for i in 0..steps.max(1) {
         let centre = pos2(anchor.x, anchor.y + dir * (i as f32 + 0.5) * pitch);
         let on = i < steps;
-        circuit::pad(out, centre, side, if on { ink } else { rest }, on);
+        chrome::pad(out, centre, side, if on { ink } else { rest }, on);
     }
     pos2(anchor.x, anchor.y + dir * steps as f32 * pitch)
 }
@@ -165,8 +166,8 @@ pub fn needle(
     ink: Color32,
     hub: Color32,
 ) {
-    circuit::trace(out, &[pivot, on_arc(pivot, radius, degrees)], weight, ink);
-    circuit::pad(out, pivot, circuit::PAD, hub, true);
+    chrome::trace(out, &[pivot, on_arc(pivot, radius, degrees)], weight, ink);
+    chrome::pad(out, pivot, chrome::PAD, hub, true);
 }
 
 /// A stepped rotary: a ring of `steps` ticks with the chosen one long
@@ -192,21 +193,21 @@ pub fn rota(
         let d = deg(i as f32);
         let on = (at - i as f32).abs() < 0.5;
         let inner = if on { radius - 6.0 } else { radius - 3.0 };
-        circuit::trace(
+        chrome::trace(
             out,
             &[on_arc(centre, inner, d), on_arc(centre, radius, d)],
             if on { Weight::Heavy } else { Weight::Hair },
             if on { ink } else { rest },
         );
     }
-    circuit::trace(out, &arc(centre, radius, from, to, 20), Weight::Hair, rest);
-    circuit::trace(
+    chrome::trace(out, &arc(centre, radius, from, to, 20), Weight::Hair, rest);
+    chrome::trace(
         out,
         &[centre, on_arc(centre, radius - 7.0, deg(at))],
         Weight::Heavy,
         ink,
     );
-    circuit::pad(out, centre, circuit::PAD - 1.0, ink, true);
+    chrome::pad(out, centre, chrome::PAD - 1.0, ink, true);
 }
 
 /// A travelling square on a rail: the rail ruled, the graduations
@@ -230,7 +231,7 @@ pub fn slider(
     } else {
         (rail.center_bottom(), rail.center_top())
     };
-    circuit::trace(out, &[a, b], Weight::Hair, rest);
+    chrome::trace(out, &[a, b], Weight::Hair, rest);
     for i in 0..ticks {
         let t = if ticks > 1 {
             i as f32 / (ticks - 1) as f32
@@ -239,10 +240,10 @@ pub fn slider(
         };
         let p = a + (b - a) * t;
         let n = if flat { vec2(0.0, 2.5) } else { vec2(2.5, 0.0) };
-        circuit::trace(out, &[p - n, p + n], Weight::Hair, rest);
+        chrome::trace(out, &[p - n, p + n], Weight::Hair, rest);
     }
     let here = a + (b - a) * at;
-    circuit::pad(out, here, cell, ink, true);
+    chrome::pad(out, here, cell, ink, true);
     here
 }
 
@@ -281,7 +282,7 @@ pub fn swing_rail(
         } else {
             vec2(reach, 0.0)
         };
-        circuit::trace(
+        chrome::trace(
             out,
             &[p - n, p + n],
             if on { Weight::Heavy } else { Weight::Hair },
@@ -289,7 +290,7 @@ pub fn swing_rail(
         );
     }
     let centre = a + (b - a) * 0.5;
-    circuit::pad(out, centre, circuit::PAD - 2.0, rest, true);
+    chrome::pad(out, centre, chrome::PAD - 2.0, rest, true);
 }
 
 /// A comb: `n` uprights across the rect, each as tall as `height`
@@ -308,7 +309,7 @@ pub fn comb(
     for i in 0..n {
         let x = rect.left() + pitch * (i as f32 + 0.5);
         let h = (height(i).clamp(0.0, 1.0) * rect.height()).max(1.0);
-        circuit::trace(
+        chrome::trace(
             out,
             &[pos2(x, rect.bottom()), pos2(x, rect.bottom() - h)],
             Weight::Hair,
@@ -343,7 +344,7 @@ pub fn beat_grid(
             continue;
         }
         let here = playing == Some(i);
-        circuit::trace(
+        chrome::trace(
             out,
             &[
                 cell.left_top(),
@@ -378,7 +379,7 @@ pub fn beat_grid(
 pub fn iris(out: &mut Vec<Shape>, rect: Rect, open: f32, ink: Color32, rest: Color32) {
     let open = open.clamp(0.0, 1.0);
     let half = rect.height() * 0.5 * (1.0 - open);
-    circuit::trace(
+    chrome::trace(
         out,
         &[
             rect.left_top(),
@@ -399,7 +400,7 @@ pub fn iris(out: &mut Vec<Shape>, rect: Rect, open: f32, ink: Color32, rest: Col
         }
     }
     let gap = rect.center().y;
-    circuit::trace(
+    chrome::trace(
         out,
         &[pos2(rect.left(), gap), pos2(rect.right(), gap)],
         Weight::Hair,
@@ -416,7 +417,7 @@ pub fn halo(out: &mut Vec<Shape>, rect: Rect, amount: f32, ink: Color32) {
         return;
     }
     let grown = rect.expand(1.0 + amount * 2.0);
-    circuit::trace(
+    chrome::trace(
         out,
         &[
             grown.left_top(),
@@ -437,7 +438,7 @@ pub fn well(out: &mut Vec<Shape>, rect: Rect, ground: Color32, edge: Color32) {
         return;
     }
     out.push(Shape::rect_filled(rect, 0.0, ground));
-    circuit::panel_frame_variant(out, rect, Weight::Hair, edge, 0);
+    chrome::panel_frame_variant(out, rect, Weight::Hair, edge, 0);
 }
 
 // ─── ink ──────────────────────────────────────────────────────────────

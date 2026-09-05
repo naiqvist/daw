@@ -15,6 +15,7 @@
 use super::*;
 use crate::console::SectionParams;
 use crate::params::console::grit as p;
+use crate::ui::chrome;
 use crate::ui::nav_cursor;
 
 /// The most treads the staircase draws at the fastest clock.
@@ -102,7 +103,7 @@ pub(super) fn draw(face: &Face<'_>) {
             i as f32 / (RUNGS_MAX - 1) as f32,
         );
         let on = i < kept;
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[egui::pos2(lay.bits.left(), y), egui::pos2(field.right(), y)],
             Weight::Hair,
@@ -112,10 +113,10 @@ pub(super) fn draw(face: &Face<'_>) {
                 tool::fade(edge, 0.14)
             },
         );
-        circuit::pad(
+        chrome::pad(
             &mut shapes,
             egui::pos2(lay.bits.left() + 4.0, y),
-            circuit::PAD - 2.0,
+            chrome::PAD - 2.0,
             if on { ink } else { tool::fade(edge, 0.3) },
             on,
         );
@@ -142,7 +143,7 @@ pub(super) fn draw(face: &Face<'_>) {
         stair.push(egui::pos2(field.left() + step * i as f32 + skew, y));
         stair.push(egui::pos2(field.left() + step * (i as f32 + 1.0) + skew, y));
     }
-    circuit::trace(&mut shapes, &stair, Weight::Heavy, face.live());
+    chrome::trace(&mut shapes, &stair, Weight::Heavy, face.live());
     tool::halo(&mut shapes, lay.rate, face.lit(p::RATE), face.focus());
 
     // THE LID: the post filter, a wall coming down over the aliasing
@@ -156,7 +157,7 @@ pub(super) fn draw(face: &Face<'_>) {
         0.0,
         tool::fade(edge, 0.9),
     ));
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             egui::pos2(lid.left(), lid.top() + drop),
@@ -173,7 +174,7 @@ pub(super) fn draw(face: &Face<'_>) {
     for i in 0..11 {
         let t = i as f32 / 10.0;
         let x = egui::lerp(wob.x_range(), t);
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(x, wob.center().y - 4.0 - wobble(i) * jitter * 4.0),
@@ -188,7 +189,7 @@ pub(super) fn draw(face: &Face<'_>) {
     let speck = lay.hiss;
     let grains = (face.place(p::HISS) * 28.0).round() as usize;
     for i in 0..grains {
-        circuit::dot(
+        chrome::dot(
             &mut shapes,
             egui::pos2(
                 egui::lerp(speck.x_range(), (wobble(i * 3) + 1.0) * 0.5),

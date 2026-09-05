@@ -16,6 +16,7 @@
 use super::*;
 use crate::console::SectionParams;
 use crate::params::console::drive as p;
+use crate::ui::chrome;
 use crate::ui::nav_cursor;
 
 /// The five characters the section can wear.
@@ -109,7 +110,7 @@ pub(super) fn draw(face: &Face<'_>) {
     // saturation, and it is arithmetic, not an impression of one.
     tool::well(&mut shapes, lay.chord, face.ground(), edge);
     let bench = lay.chord.shrink(3.0);
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[bench.left_bottom(), bench.right_top()],
         Weight::Hair,
@@ -125,7 +126,7 @@ pub(super) fn draw(face: &Face<'_>) {
             )
         })
         .collect();
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &curve,
         Weight::Heavy,
@@ -146,7 +147,7 @@ pub(super) fn draw(face: &Face<'_>) {
         tool::mix_ink(ink, face.hot(), heat),
     ));
     for side in [press.left() + 3.0, press.right() - 3.0] {
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(side, press.top()),
@@ -169,14 +170,14 @@ pub(super) fn draw(face: &Face<'_>) {
             )
         })
         .collect();
-    circuit::trace(&mut shapes, &wave, Weight::Hair, face.live());
+    chrome::trace(&mut shapes, &wave, Weight::Hair, face.live());
     // The swarf: shavings thrown off the press, as many as there is
     // dirt in what leaves.
     let swarf = (dirt * 9.0).round() as usize;
     for i in 0..swarf {
         let t = (i as f32 + 0.5) / 9.0;
         let x = egui::lerp(press.x_range(), t);
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(x, platen_y - 2.0),
@@ -197,7 +198,7 @@ pub(super) fn draw(face: &Face<'_>) {
             i as f32 / (CHARACTERS - 1) as f32,
         );
         let here = i as u32 == character;
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(slot.left() + 2.0, y),
@@ -219,7 +220,7 @@ pub(super) fn draw(face: &Face<'_>) {
         let swing = face.swing(param) * 0.42;
         let (cx, cy) = (rect.center().x, rect.center().y);
         let arm = rect.width() * 0.42;
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(cx - arm, cy + arm * swing),
@@ -238,10 +239,10 @@ pub(super) fn draw(face: &Face<'_>) {
             egui::Stroke::NONE,
         ));
         if let Some(share) = measured {
-            circuit::pad(
+            chrome::pad(
                 &mut shapes,
                 egui::pos2(egui::lerp((cx - arm)..=(cx + arm), share), cy - 6.0),
-                circuit::PAD - 1.0,
+                chrome::PAD - 1.0,
                 face.live(),
                 true,
             );

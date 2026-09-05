@@ -14,6 +14,7 @@
 use super::*;
 use crate::console::SectionParams;
 use crate::params::console::echo as p;
+use crate::ui::chrome;
 use crate::ui::nav_cursor;
 
 /// The divisions the sync switch steps through, and free.
@@ -128,7 +129,7 @@ pub(super) fn draw(face: &Face<'_>) {
     for lap in (1..=laps).rev() {
         let shrunk = ring.shrink(lap as f32 * 3.0);
         if shrunk.is_positive() {
-            circuit::trace(
+            chrome::trace(
                 &mut shapes,
                 &path(shrunk),
                 Weight::Hair,
@@ -136,16 +137,16 @@ pub(super) fn draw(face: &Face<'_>) {
             );
         }
     }
-    circuit::trace(&mut shapes, &path(ring), Weight::Heavy, ink);
+    chrome::trace(&mut shapes, &path(ring), Weight::Heavy, ink);
     tool::halo(&mut shapes, lay.loop_rect, face.lit(p::TIME), face.focus());
 
     // THE RECORD HEAD, fixed at the loop's top-left; and THE PLAY HEAD,
     // which stands where the wow the engine measured has put it.
-    circuit::pad(&mut shapes, ring.left_top(), circuit::PAD, ink, true);
+    chrome::pad(&mut shapes, ring.left_top(), chrome::PAD, ink, true);
     let wander = said.bands[1];
     let drift = (wander / 8.0).clamp(-1.0, 1.0) * ring.width() * 0.12;
     let head = egui::pos2(ring.right() + drift, ring.center().y);
-    circuit::octagon(
+    chrome::octagon(
         &mut shapes,
         egui::Rect::from_center_size(head, egui::vec2(9.0, 9.0)),
         2.0,
@@ -156,7 +157,7 @@ pub(super) fn draw(face: &Face<'_>) {
     // is read against what it may do.
     for side in [-1.0f32, 1.0] {
         let reach = ring.width() * 0.12 * face.place(p::WOW);
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(ring.right() + side * reach, ring.center().y - 5.0),
@@ -171,13 +172,13 @@ pub(super) fn draw(face: &Face<'_>) {
     // is exactly what the section does to them.
     let cross = lay.pingpong;
     if ping {
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[cross.left_top(), cross.right_bottom()],
             Weight::Heavy,
             face.live(),
         );
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[cross.right_top(), cross.left_bottom()],
             Weight::Heavy,
@@ -185,7 +186,7 @@ pub(super) fn draw(face: &Face<'_>) {
         );
     } else {
         for y in [cross.top() + 4.0, cross.bottom() - 4.0] {
-            circuit::trace(
+            chrome::trace(
                 &mut shapes,
                 &[egui::pos2(cross.left(), y), egui::pos2(cross.right(), y)],
                 Weight::Hair,
@@ -206,7 +207,7 @@ pub(super) fn draw(face: &Face<'_>) {
             i as f32 / (DIVISIONS - 1) as f32,
         );
         let here = i == chosen;
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(slot.left() + 2.0, y),
@@ -237,7 +238,7 @@ pub(super) fn draw(face: &Face<'_>) {
     );
     let tone = lay.tone;
     let open = tool::norm(face.value(p::TONE), 200.0, 12_000.0);
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             egui::pos2(tone.left() + 2.0, tone.bottom() - 2.0),

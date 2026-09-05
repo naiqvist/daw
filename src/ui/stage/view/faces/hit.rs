@@ -14,6 +14,7 @@
 use super::*;
 use crate::console::SectionParams;
 use crate::params::console::hit as p;
+use crate::ui::chrome;
 use crate::ui::nav_cursor;
 
 /// How far the hammer's arm swings, in degrees, at a full lever.
@@ -89,7 +90,7 @@ pub(super) fn draw(face: &Face<'_>) {
         0.0,
         tool::fade(edge, 0.9),
     ));
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             egui::pos2(lay.anvil.left() - 6.0, lay.anvil.top() - 2.0),
@@ -106,21 +107,21 @@ pub(super) fn draw(face: &Face<'_>) {
     let rest = 90.0 - RAISE_DEG * raise;
     let angle = face.anim("arm", rest + (90.0 - rest) * blow, 0.05);
     let head = tool::on_arc(lay.pivot, lay.reach, angle - 90.0);
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &tool::arc(lay.pivot, lay.reach, -90.0, angle - 90.0, 12),
         Weight::Hair,
         tool::fade(edge, 0.45),
     );
-    circuit::trace(&mut shapes, &[lay.pivot, head], Weight::Heavy, ink);
-    circuit::octagon(
+    chrome::trace(&mut shapes, &[lay.pivot, head], Weight::Heavy, ink);
+    chrome::octagon(
         &mut shapes,
         egui::Rect::from_center_size(head, egui::vec2(13.0, 13.0)),
         3.0,
         Some(tool::mix_ink(ink, face.hot(), blow)),
         Some((Weight::Hair, edge)),
     );
-    circuit::pad(&mut shapes, lay.pivot, circuit::PAD, ink, true);
+    chrome::pad(&mut shapes, lay.pivot, chrome::PAD, ink, true);
     tool::halo(&mut shapes, lay.attack, face.lit(p::ATTACK), face.focus());
 
     // THE WEDGE: what the strike leaves behind. Its reach is the lever;
@@ -129,7 +130,7 @@ pub(super) fn draw(face: &Face<'_>) {
     let reach = wedge.width() * (0.12 + 0.88 * face.place(p::SUSTAIN));
     let lifted = face.swing(p::SUSTAIN) >= 0.0;
     let tip = egui::pos2(wedge.left() + reach, wedge.bottom() - wedge.height() * tail);
-    circuit::trace(
+    chrome::trace(
         &mut shapes,
         &[
             egui::pos2(wedge.left(), wedge.bottom()),
@@ -143,7 +144,7 @@ pub(super) fn draw(face: &Face<'_>) {
         let at = (i as f32 + 0.5) / 8.0;
         let x = wedge.left() + reach * at;
         let y = egui::lerp(wedge.bottom()..=tip.y, 1.0 - at);
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[egui::pos2(x, wedge.bottom()), egui::pos2(x, y)],
             Weight::Hair,
@@ -164,7 +165,7 @@ pub(super) fn draw(face: &Face<'_>) {
         };
         let x = egui::lerp(rasp.x_range(), at);
         let lean = if i % 2 == 0 { 3.0 } else { -3.0 };
-        circuit::trace(
+        chrome::trace(
             &mut shapes,
             &[
                 egui::pos2(x, rasp.bottom()),

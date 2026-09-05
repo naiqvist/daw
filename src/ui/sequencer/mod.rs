@@ -17,7 +17,7 @@
 //! pitch is read and entered), and the sequencing contract for what the
 //! edits compile to.
 
-pub mod chrome;
+pub use crate::ui::chrome;
 pub mod grammar;
 pub mod grid_resolution;
 pub mod layout_grid;
