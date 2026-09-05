@@ -32,7 +32,12 @@ const SPAN_MS: f32 = 420.0;
 /// @tune 40..800 ms
 const DECAY_MS: f32 = 220.0;
 /// The window the note is drawn in, in dB.
+///
+/// The ceiling is above the range a lever can reach, not at 0 dB: a note
+/// lifted the full twelve stands twelve dB over its own peak, and a plot
+/// that stopped at the peak would push the lift into the card's header.
 const FLOOR_DB: f32 = -42.0;
+const CEILING_DB: f32 = crate::params::console::hit::RANGE_DB + 3.0;
 /// How many instants of the note are plotted.
 const POINTS: usize = 160;
 /// How the time axis is warped.
@@ -125,7 +130,7 @@ pub(super) fn draw(face: &Face<'_>) {
         0,
     );
     let plot = egui::Rect::from_min_max(
-        egui::pos2(lay.note.left() + 7.0, lay.note.top() + font.size + 5.0),
+        egui::pos2(lay.note.left() + 7.0, lay.note.top() + font.size + 8.0),
         egui::pos2(lay.note.right() - 7.0, lay.note.bottom() - font.size - 6.0),
     );
     let x_at = |ms: f32| {
@@ -133,7 +138,8 @@ pub(super) fn draw(face: &Face<'_>) {
         plot.left() + t.powf(crate::tune!(TIME_WARP)) * plot.width()
     };
     let y_at = |db: f32| {
-        plot.bottom() - ((db - FLOOR_DB) / -FLOOR_DB).clamp(0.0, 1.2) * plot.height() / 1.2
+        let t = ((db - FLOOR_DB) / (CEILING_DB - FLOOR_DB)).clamp(0.0, 1.0);
+        plot.bottom() - t * plot.height()
     };
     // The strike's own window: the millisecond or two the section calls
     // a strike, marked, because every reading on this card divides at it.
