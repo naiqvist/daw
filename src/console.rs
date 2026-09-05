@@ -446,6 +446,119 @@ pub mod preamp_curve {
     }
 }
 
+/// HIT's shape, green side: what the section does to a note.
+///
+/// A transient shaper cannot be drawn from its knobs. What it does at
+/// any instant depends on where in a note you are — the strike is a
+/// millisecond, the tail is most of a second — so the only honest
+/// picture is a note run THROUGH it.
+///
+/// That is what this does, with the kernel itself: a model hit goes
+/// through the very [`crate::dsp::dynamics::TransientSplit`] the core
+/// runs, and the tail is the same two followers on the same time
+/// constants, so the gain here is the gain there:
+///
+/// ```text
+/// db = RANGE_DB * (attack * strike + sustain * tail)
+/// ```
+pub mod hit_curve {
+    use crate::dsp::dynamics::TransientSplit;
+    use crate::params::console::hit as p;
+
+    /// The rate the model is run at. The split's fast attack is a
+    /// twentieth of a millisecond, so a coarser model would not have a
+    /// strike in it at all.
+    const RATE: f32 = 48_000.0;
+
+    /// One instant of the model note.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct Point {
+        /// Milliseconds since the note began.
+        pub ms: f32,
+        /// The note as it arrived, in dB from its own peak.
+        pub plain_db: f32,
+        /// What the section adds there, in dB. Signed.
+        pub gain_db: f32,
+        /// The strike's weight at that instant, 0..1.
+        pub strike: f32,
+        /// The tail's share at that instant, 0..1.
+        pub tail: f32,
+    }
+
+    /// A model hit: a fast rise, then an exponential decay.
+    fn envelope(ms: f32, decay_ms: f32) -> f32 {
+        const RISE_MS: f32 = 1.0;
+        if ms < 0.0 {
+            return 0.0;
+        }
+        let rise = (ms / RISE_MS).clamp(0.0, 1.0);
+        rise * (-(ms) / decay_ms.max(1.0)).exp()
+    }
+
+    /// Run a note through the section and report `points` instants of
+    /// it, evenly spaced across `span_ms`.
+    ///
+    /// `attack` and `sustain` are the levers in −1..1, as
+    /// `hit::Settings` resolves them.
+    pub fn trace(
+        attack: f32,
+        sustain: f32,
+        decay_ms: f32,
+        span_ms: f32,
+        points: usize,
+    ) -> Vec<Point> {
+        let span_ms = span_ms.max(1.0);
+        let samples = ((span_ms * 1e-3 * RATE) as usize).max(points.max(2));
+        let mut split = TransientSplit::new();
+        split.prepare(RATE, p::WINDOW_MS);
+        // The tail's two followers, on the section's own constants.
+        let coeff = |ms: f32| 1.0 - (-1.0 / (ms * 1e-3 * RATE)).exp();
+        let (quick_release, long_release) = (coeff(p::TAIL_QUICK_MS), coeff(p::TAIL_LONG_MS));
+        let (mut quick, mut long) = (0.0f32, 0.0f32);
+        let mut out = Vec::with_capacity(points);
+        let mut weight = [0.0f32; 1];
+        let mut next = 0usize;
+        for i in 0..samples {
+            let ms = i as f32 / RATE * 1e3;
+            let x = envelope(ms, decay_ms);
+            split.process(&[x], &mut weight);
+            let strike = weight[0];
+            if x > quick {
+                quick = x;
+            } else {
+                quick += (x - quick) * quick_release;
+            }
+            if x > long {
+                long = x;
+            } else {
+                long += (x - long) * long_release;
+            }
+            let tail = if long > p::LEVEL_FLOOR {
+                ((long - quick) / long).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            // Report evenly across the span, whatever the rate.
+            let want = next * samples / points.max(1);
+            if i >= want && out.len() < points {
+                out.push(Point {
+                    ms,
+                    plain_db: if x > p::LEVEL_FLOOR {
+                        20.0 * x.log10()
+                    } else {
+                        -120.0
+                    },
+                    gain_db: p::RANGE_DB * (attack * strike + sustain * tail),
+                    strike,
+                    tail,
+                });
+                next += 1;
+            }
+        }
+        out
+    }
+}
+
 /// TONE's shape, here on the green side so the card draws the response
 /// the core runs: the same bands, prepared the same way, read at a
 /// frequency. A killed band is the cut filter the core runs in its
@@ -1232,6 +1345,62 @@ mod tests {
             let measured = p::harmonics(0.6, false, amplitude);
             assert!(measured.thd.is_finite() && measured.thd >= 0.0);
             assert_eq!(measured.db[0], 0.0);
+        }
+    }
+
+    /// At rest the section is a wire to the sample, and the model says
+    /// so at every instant of the note rather than only on average.
+    #[test]
+    fn a_hit_at_rest_touches_nothing() {
+        let trace = crate::console::hit_curve::trace(0.0, 0.0, 250.0, 400.0, 64);
+        assert_eq!(trace.len(), 64);
+        for point in &trace {
+            assert_eq!(point.gain_db, 0.0, "the wire moved at {} ms", point.ms);
+        }
+    }
+
+    /// The two levers reach different parts of the note: ATTACK lands on
+    /// the strike and is gone by the tail, SUSTAIN does the opposite.
+    /// That separation is the whole device.
+    #[test]
+    fn attack_lands_on_the_strike_and_sustain_on_the_tail() {
+        use crate::params::console::hit as p;
+        let struck = crate::console::hit_curve::trace(1.0, 0.0, 250.0, 400.0, 200);
+        let held = crate::console::hit_curve::trace(0.0, 1.0, 250.0, 400.0, 200);
+        let early = |trace: &[crate::console::hit_curve::Point]| {
+            trace
+                .iter()
+                .filter(|point| point.ms <= p::WINDOW_MS)
+                .fold(0.0f32, |most, point| most.max(point.gain_db))
+        };
+        let late = |trace: &[crate::console::hit_curve::Point]| {
+            trace
+                .iter()
+                .filter(|point| point.ms >= 200.0)
+                .fold(0.0f32, |most, point| most.max(point.gain_db))
+        };
+        assert!(early(&struck) > 6.0, "attack did not lift the strike");
+        assert!(late(&struck) < 1.0, "attack reached the tail");
+        assert!(late(&held) > 3.0, "sustain did not lift the tail");
+        assert!(early(&held) < 1.0, "sustain reached the strike");
+    }
+
+    /// Neither lever can move a note further than the range it is given,
+    /// in either direction.
+    #[test]
+    fn no_lever_moves_a_note_past_its_range() {
+        use crate::params::console::hit as p;
+        for (attack, sustain) in [(1.0, 1.0), (-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0)] {
+            for point in crate::console::hit_curve::trace(attack, sustain, 250.0, 400.0, 128) {
+                assert!(
+                    point.gain_db.abs() <= p::RANGE_DB + 0.01,
+                    "{attack}/{sustain} moved {} dB at {} ms",
+                    point.gain_db,
+                    point.ms
+                );
+                assert!((0.0..=1.0).contains(&point.strike));
+                assert!((0.0..=1.0).contains(&point.tail));
+            }
         }
     }
 }

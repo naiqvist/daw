@@ -725,6 +725,38 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
                 backend: "JACK",
             }));
         }
+    } else if which.contains("hit") {
+        // The transient shaper, posed by the suffix so one card can be
+        // seen at rest, leaning on the strike, and leaning on the tail.
+        use daw::devices::DeviceKind;
+        let _ = stage.song_mut().add_device(0, DeviceKind::Poly);
+        {
+            use daw::params::console::hit as p;
+            let (attack, sustain, bright) = if which.contains("soft") {
+                (-70.0, 40.0, 0.0)
+            } else if which.contains("tail") {
+                (0.0, 80.0, 0.0)
+            } else if which.contains("rest") {
+                (0.0, 0.0, 0.0)
+            } else {
+                (85.0, -30.0, 60.0)
+            };
+            let song = stage.song_mut();
+            if let Some(device) = song
+                .section(0, daw::console::SectionKind::Hit)
+                .map(|device| device.id)
+                .and_then(|id| song.device_mut(id))
+            {
+                device.bypassed = false;
+                device.set(p::ATTACK, attack);
+                device.set(p::SUSTAIN, sustain);
+                device.set(p::BRIGHT, bright);
+            }
+        }
+        let _ = stage.apply(StageIntent::Devices);
+        for _ in 0..5 {
+            let _ = stage.apply(StageIntent::Step(Step::Right));
+        }
     } else if which.contains("cut") && which.contains("stage") {
         // Both blades in, the low one resonant, and the crunch leaned
         // on — so the plot has slopes, a peak and heat in it.
