@@ -18,6 +18,7 @@ mod heads;
 mod input;
 mod inspector;
 mod lattice;
+mod mixer;
 mod palette;
 mod status;
 mod tray;
@@ -208,7 +209,13 @@ impl Stage {
         let layout = Layout::of(whole);
         self.draw_title(painter, layout.title);
         self.draw_heads(painter, layout.field);
-        self.draw_lattice(painter, layout.field);
+        // The mixer replaces the scene rows and gives them back: the
+        // heads never move across the change, so the eye keeps its place.
+        if self.mixing {
+            self.draw_mixer(painter, layout.field);
+        } else {
+            self.draw_lattice(painter, layout.field);
+        }
         self.draw_status(painter, layout.status);
         // One detail region, and the band and the sequencer are two
         // things to put in it. The band wins while it is showing.

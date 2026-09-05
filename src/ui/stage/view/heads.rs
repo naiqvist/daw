@@ -40,6 +40,11 @@ const BAR_H: f32 = 2.0;
 const INSET: f32 = 8.0;
 const TYPE_PX: f32 = 12.0;
 
+/// The field's inset, live.
+pub(super) fn margin() -> f32 {
+    crate::tune!(MARGIN)
+}
+
 /// How many track heads fit across a field this wide, leaving the
 /// master its own column. Never fewer than one, or the cursor would
 /// have nowhere to stand.
