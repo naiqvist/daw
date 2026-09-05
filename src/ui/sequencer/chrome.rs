@@ -107,6 +107,17 @@ pub fn panel_frame(out: &mut Vec<Shape>, rect: Rect, weight: Weight, ink: Color3
     octagon(out, rect, 0.0, None, Some((weight, ink)));
 }
 
+/// A panel's outline alone; the variant is ignored here.
+pub fn panel_frame_variant(
+    out: &mut Vec<Shape>,
+    rect: Rect,
+    weight: Weight,
+    ink: Color32,
+    _variant: u8,
+) {
+    octagon(out, rect, 0.0, None, Some((weight, ink)));
+}
+
 /// Corner marks: four brackets, the console's way of saying "this area".
 pub fn corner_pads(out: &mut Vec<Shape>, rect: Rect, ink: Color32) {
     let mut arms = Vec::new();

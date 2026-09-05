@@ -17,13 +17,10 @@
 //! learning either vocabulary. That is the same rule panels follow: name
 //! the wish, let the app perform it.
 
+use crate::design::kit::Weight;
 use crate::ui::affordance::{Afford, Affords};
 use crate::ui::theme::Theme;
 use crate::ui::tokens::{font, space};
-use crate::{
-    design::kit::Weight,
-    design::{block, circuit},
-};
 use eframe::egui;
 
 /// One thing the palette can run. `id` is what comes back when it is
@@ -311,19 +308,17 @@ impl Palette {
                     .fill(theme.surface_raised)
                     .inner_margin(egui::Margin::same(theme.sp(space::SM) as i8))
                     .show(ui, |ui| {
-                        let title_h = block::height(block::unit::MICRO) + theme.sp(space::XS);
+                        let title_h = font::LABEL + theme.sp(space::XS);
                         let (title_rect, _) = ui.allocate_exact_size(
                             egui::vec2(ui.available_width(), title_h),
                             egui::Sense::hover(),
                         );
-                        block::paint(
-                            ui.painter(),
-                            egui::Id::new("command-palette-title"),
+                        ui.painter().text(
                             title_rect.left_top(),
                             egui::Align2::LEFT_TOP,
-                            block::unit::MICRO,
                             "COMMAND",
-                            theme.text,
+                            egui::FontId::monospace(font::LABEL),
+                            theme.text_muted,
                         );
 
                         let (search_rect, _) = ui.allocate_exact_size(
@@ -331,7 +326,7 @@ impl Palette {
                             egui::Sense::hover(),
                         );
                         let mut search_shapes = Vec::new();
-                        circuit::panel_variant(
+                        crate::ui::sequencer::chrome::panel_variant(
                             &mut search_shapes,
                             search_rect,
                             Some(theme.bg),
@@ -339,10 +334,10 @@ impl Palette {
                             Some((Weight::Hair, theme.outline)),
                             2,
                         );
-                        circuit::pad(
+                        crate::ui::sequencer::chrome::pad(
                             &mut search_shapes,
                             egui::pos2(search_rect.right() - 9.0, search_rect.center().y),
-                            circuit::PAD - 1.0,
+                            crate::ui::sequencer::chrome::PAD - 1.0,
                             theme.outline,
                             true,
                         );
@@ -431,14 +426,14 @@ impl Palette {
                 // wholly in the margin, so the fill follows the casing
                 // without a late background shape washing over content.
                 mask_palette_shell(&mut shell_shapes, contents.response.rect, theme.bg);
-                circuit::panel_frame_variant(
+                crate::ui::sequencer::chrome::panel_frame_variant(
                     &mut shell_shapes,
                     contents.response.rect,
                     Weight::Heavy,
                     theme.text,
                     3,
                 );
-                circuit::panel_frame_variant(
+                crate::ui::sequencer::chrome::panel_frame_variant(
                     &mut shell_shapes,
                     contents.response.rect.shrink(5.0),
                     Weight::Hair,
@@ -496,7 +491,7 @@ impl Palette {
         };
         if fill != egui::Color32::TRANSPARENT {
             let mut shapes = Vec::new();
-            circuit::panel_variant(
+            crate::ui::sequencer::chrome::panel_variant(
                 &mut shapes,
                 rect,
                 Some(fill),

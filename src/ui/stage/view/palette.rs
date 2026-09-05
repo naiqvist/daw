@@ -158,6 +158,30 @@ pub fn lift(mut a: crate::design::Alphabet) -> crate::design::Alphabet {
     a
 }
 
+/// The runtime theme the stock widgets read, in the console's colours:
+/// every role of `ui::theme::Theme` mapped onto a role of ours, so a
+/// widget that was never taught the palette still sits in the same room.
+pub fn theme() -> crate::ui::theme::Theme {
+    let c = colours();
+    let mut t = crate::ui::theme::Theme::dark();
+    t.bg = c.ground;
+    t.surface = c.panel;
+    t.surface_raised = c.ground;
+    t.surface_sunken = c.ground;
+    t.text = c.fg;
+    t.text_muted = c.dim;
+    t.text_value = c.bright;
+    t.outline = c.chassis;
+    t.divider = c.rule;
+    t.focus = c.alert;
+    t.accent = c.chassis;
+    t.accent_muted = c.select;
+    t.ok = c.nominal;
+    t.warn = c.alert;
+    t.danger = c.fault;
+    t
+}
+
 /// The colours in force this frame.
 pub fn colours() -> Colours {
     CURRENT.read().map(|c| *c).unwrap_or(Colours::DEFAULT)

@@ -234,7 +234,7 @@ impl Stage {
             .collect();
         let commands: Vec<crate::ui::palette::Command> =
             entries.iter().map(|entry| entry.command).collect();
-        let theme = crate::ui::theme::Theme::dark();
+        let theme = palette::theme();
         let choice = self.palette.show(ctx, &theme, &commands, &[])?;
         let crate::ui::palette::Choice::Command(id) = choice else {
             return None;
