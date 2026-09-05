@@ -13,6 +13,7 @@
 //! the old view drew.
 
 mod band;
+mod browser;
 mod chassis;
 mod heads;
 mod input;
@@ -216,6 +217,9 @@ impl Stage {
         } else {
             self.draw_lattice(painter, layout.field);
         }
+        // Over the field: the browser is a window above the work, not a
+        // division of it.
+        self.draw_browser(painter, layout.field);
         self.draw_status(painter, layout.status);
         // One detail region, and the band and the sequencer are two
         // things to put in it. The band wins while it is showing.
