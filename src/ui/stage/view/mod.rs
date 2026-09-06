@@ -357,27 +357,38 @@ impl Stage {
         self.draw_status(painter, layout.status);
         // One detail region, and the band and the sequencer are two
         // things to put in it. The band wins while it is showing.
-        let anchor = if self.chain.is_some() {
-            let phase = Phase::of(
-                self.transport.motion().is_rolling(),
-                self.transport.beat_phase(),
-            );
-            // Three shapes, one sequence. The rail is the corridor, the
-            // dock is all of it at once and none of it in detail, and
-            // the bento is the page — drawn last of all, over
-            // everything, because it is a view of one thing rather than
-            // a window over another.
-            match self.band_view() {
-                crate::ui::stage::BandView::Rail => {
-                    self.draw_chain(ui.painter(), layout.tray, phase)
-                }
-                crate::ui::stage::BandView::Dock | crate::ui::stage::BandView::Bento => {
-                    self.draw_dock(ui.painter(), layout.tray)
-                }
+        // Three shapes, one sequence. The RAIL takes the whole tray and
+        // the sequencer gives it up. The DOCK does not: it is small
+        // enough to stand at the FOOT of the sequencer, so the clip you
+        // are editing and the path it goes through are both on screen —
+        // which is most of the reason to have a minified chain at all.
+        // The BENTO is neither; it opens over the lot.
+        let anchor = match (self.chain.is_some(), self.band_view()) {
+            (true, crate::ui::stage::BandView::Rail) => {
+                let phase = Phase::of(
+                    self.transport.motion().is_rolling(),
+                    self.transport.beat_phase(),
+                );
+                self.draw_chain(ui.painter(), layout.tray, phase);
+                None
             }
-            None
-        } else {
-            self.draw_tray(ui, layout.tray)
+            (true, _) => {
+                let dock = dock::height(layout.tray, self.dock_len());
+                let above = egui::Rect::from_min_max(
+                    layout.tray.min,
+                    egui::pos2(layout.tray.max.x, layout.tray.max.y - dock),
+                );
+                let anchor = self.draw_tray(ui, above);
+                self.draw_dock(
+                    ui.painter(),
+                    egui::Rect::from_min_max(
+                        egui::pos2(layout.tray.min.x, above.max.y),
+                        layout.tray.max,
+                    ),
+                );
+                anchor
+            }
+            (false, _) => self.draw_tray(ui, layout.tray),
         };
         // Over everything in the field: a callout is about one thing, and
         // a callout drawn under anything is a callout pointing through it.

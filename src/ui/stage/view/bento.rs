@@ -32,8 +32,20 @@ const COVER: f32 = 0.94;
 /// @tune 2..20 px
 const CELL_GAP: f32 = 6.0;
 /// The smallest a cell may be before the grid takes a column away.
+///
+/// This is not a taste: it is the width of the WIDEST section face, and
+/// every cell is the same size, so every cell has to be that. A cell
+/// narrower than the face it holds does not show a smaller card — it
+/// shows a card with its words on top of each other, which is exactly
+/// what the ledger refuses to let happen.
+///
+/// So the bento would rather show six devices properly than thirty-one
+/// badly. It pages, and the reading order runs on across the break.
+/// @tune 200..520 px
+const CELL_MIN_W: f32 = 520.0;
+/// And the height one needs before its instruments are worth drawing.
 /// @tune 80..260 px
-const CELL_MIN_W: f32 = 132.0;
+const CELL_MIN_H: f32 = 190.0;
 /// One parameter row inside a cell.
 /// @tune 8..20 px
 const PARAM_H: f32 = 11.0;
@@ -49,16 +61,36 @@ fn grid(area: egui::Rect, cells: usize) -> (usize, f32) {
     (across, width)
 }
 
-/// Where the `index`th cell stands.
-fn cell_rect(area: egui::Rect, cells: usize, index: usize) -> egui::Rect {
-    let (across, width) = grid(area, cells);
+/// How many rows of cells the page can show at the height a face needs.
+fn rows_shown(area: egui::Rect) -> usize {
+    (((area.height() + CELL_GAP) / (crate::tune!(CELL_MIN_H) + CELL_GAP)).floor()).max(1.0) as usize
+}
+
+/// The first row on the page, so the cursor's row is on it.
+///
+/// A page of twenty-nine devices at the size their faces were drawn to
+/// does not fit a screen, and shrinking them until it does is how you
+/// get a grid of unreadable cards. So the bento pages, and the reading
+/// order runs on across the break.
+fn first_row(area: egui::Rect, cells: usize, cursor: Option<usize>) -> usize {
+    let (across, _) = grid(area, cells);
     let rows = cells.div_ceil(across).max(1);
-    let height = (area.height() - CELL_GAP * (rows.saturating_sub(1)) as f32) / rows as f32;
+    let shown = rows_shown(area).min(rows);
+    let on = cursor.map_or(0, |index| index / across);
+    on.saturating_sub(shown.saturating_sub(1))
+        .min(rows.saturating_sub(shown))
+}
+
+/// Where the `index`th cell stands, given the first row on the page.
+fn cell_rect(area: egui::Rect, cells: usize, first: usize, index: usize) -> egui::Rect {
+    let (across, width) = grid(area, cells);
+    let shown = rows_shown(area);
+    let height = (area.height() - CELL_GAP * (shown.saturating_sub(1)) as f32) / shown as f32;
     let (col, row) = (index % across, index / across);
     egui::Rect::from_min_size(
         egui::pos2(
             area.left() + col as f32 * (width + CELL_GAP),
-            area.top() + row as f32 * (height + CELL_GAP),
+            area.top() + (row as f32 - first as f32) * (height + CELL_GAP),
         ),
         egui::vec2(width, height),
     )
@@ -81,6 +113,11 @@ impl super::super::Stage {
         let font = egui::FontId::new(TYPE_PX, egui::FontFamily::Name(PROFONT.into()));
         let micro = egui::FontId::new(TYPE_PX - 2.0, egui::FontFamily::Name(PROFONT.into()));
         let cursor = lattice.cursor().map(|(col, _)| col);
+        let phase = Phase::of(
+            self.transport.motion().is_rolling(),
+            self.transport.beat_phase(),
+        );
+        let level = self.playing_on(track).is_some().then_some(1.0);
 
         // The page holds the field down behind it: this is a view of one
         // thing, not a window over another.
@@ -104,8 +141,18 @@ impl super::super::Stage {
         if !area.is_positive() {
             return;
         }
+        let first = first_row(area, columns.len(), cursor);
+        let (across, _) = grid(area, columns.len());
+        let shown = rows_shown(area);
+        let on_page = |index: usize| {
+            let row = index / across;
+            row >= first && row < first + shown
+        };
         for (index, column) in columns.iter().enumerate() {
-            let cell = cell_rect(area, columns.len(), index);
+            if !on_page(index) {
+                continue;
+            }
+            let cell = cell_rect(area, columns.len(), first, index);
             let on = cursor == Some(index);
             chrome::panel_variant(
                 &mut shapes,
@@ -152,13 +199,24 @@ impl super::super::Stage {
         painter.text(
             egui::pos2(page.right() - 12.0, page.top() + 6.0),
             egui::Align2::RIGHT_TOP,
-            format!("{} devices · first to last", columns.len()),
+            {
+                let last = ((first + shown) * across).min(columns.len());
+                format!(
+                    "{:02}-{:02} of {} · first to last",
+                    first * across + 1,
+                    last,
+                    columns.len()
+                )
+            },
             font.clone(),
             c.dim,
         );
 
         for (index, column) in columns.iter().enumerate() {
-            let cell = cell_rect(area, columns.len(), index);
+            if !on_page(index) {
+                continue;
+            }
+            let cell = cell_rect(area, columns.len(), first, index);
             let on = cursor == Some(index);
             let word_ink = if column.bypassed {
                 c.dim
@@ -191,6 +249,33 @@ impl super::super::Stage {
                     micro.clone(),
                     c.dim,
                 );
+            }
+            // The section's OWN face, on the cell's glass. This is the
+            // whole point of opening the chain out: the cards were drawn
+            // to be read, and the bento is where there is room to read
+            // them. A device that is not a console section — a chain
+            // effect — has no face, and falls back to its parameters as
+            // bars.
+            if let Some(kind) = column.section {
+                let glass = egui::Rect::from_min_max(
+                    egui::pos2(cell.left() + 6.0, cell.top() + TYPE_PX + 8.0),
+                    egui::pos2(cell.right() - 6.0, cell.bottom() - 6.0),
+                );
+                if glass.is_positive() {
+                    let piece = strip::Piece {
+                        index,
+                        rect: cell,
+                        kind,
+                        notch: false,
+                        tongue: false,
+                    };
+                    let selected = lattice
+                        .cursor()
+                        .filter(|(col, _)| *col == index)
+                        .map(|(_, row)| row);
+                    self.draw_figure(painter, piece, column, glass, selected, level, phase);
+                }
+                continue;
             }
             // As many parameters as the cell has room for, as bars: at
             // this size a value is a length, not a figure.
@@ -226,11 +311,11 @@ impl super::super::Stage {
                 }
             }
         }
-        if let Some(index) = cursor {
+        if let Some(index) = cursor.filter(|index| on_page(*index)) {
             crate::ui::nav_cursor::claim(
                 painter,
                 ("stage-bento-cell", index),
-                cell_rect(area, columns.len(), index),
+                cell_rect(area, columns.len(), first, index),
                 crate::ui::nav_cursor::Kind::Cell,
                 crate::ui::nav_cursor::Layer::Overlay,
                 c.alert,
@@ -244,7 +329,7 @@ mod tests {
     use super::*;
 
     fn area() -> egui::Rect {
-        egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1200.0, 700.0))
+        egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1200.0, 640.0))
     }
 
     /// The grid reads like a page: along a row, then down. This is the
@@ -253,12 +338,11 @@ mod tests {
     fn the_cells_read_first_to_last_in_reading_order() {
         let (a, n) = (area(), 29usize);
         let (across, _) = grid(a, n);
-        assert!(across > 1);
+        assert!(across >= 1);
         for i in 1..n {
-            let (before, here) = (cell_rect(a, n, i - 1), cell_rect(a, n, i));
+            let (before, here) = (cell_rect(a, n, 0, i - 1), cell_rect(a, n, 0, i));
             if i % across == 0 {
-                // A new row starts at the left, below the last one.
-                assert!(here.left() < before.left(), "row {i} did not return");
+                assert!(here.left() <= before.left(), "row {i} did not return");
                 assert!(here.top() > before.top(), "row {i} did not descend");
             } else {
                 assert!(before.right() <= here.left() + 0.01, "cell {i} went back");
@@ -270,35 +354,70 @@ mod tests {
         }
     }
 
-    /// Every cell is the same size and the grid fills its area: a bento
-    /// with a ragged last row is still a bento, but one whose cells
-    /// changed size by position would not be a grid at all.
+    /// Every cell is the same size. It has to be: a cell holds a section
+    /// FACE, the faces were drawn to a width, and the widest of them
+    /// sets it for all — a cell that shrank to fit its neighbour would
+    /// be a card with its words on top of each other.
     #[test]
-    fn the_cells_are_one_size_and_fill_the_page() {
+    fn the_cells_are_one_size_and_wide_enough_for_a_face() {
         let (a, n) = (area(), 29usize);
-        let first = cell_rect(a, n, 0);
+        let first = cell_rect(a, n, 0, 0);
         for i in 0..n {
-            assert_eq!(cell_rect(a, n, i).size(), first.size(), "cell {i} differs");
+            // To a tolerance: the positions accumulate a column at a
+            // time, so two cells of the same size can differ in the last
+            // bit of a float without differing on the glass.
+            let size = cell_rect(a, n, 0, i).size();
             assert!(
-                a.expand(0.01).contains_rect(cell_rect(a, n, i)),
-                "cell {i} left the page"
+                (size - first.size()).length() < 0.01,
+                "cell {i} is a different size: {size:?} against {:?}",
+                first.size()
             );
         }
-        // The row of cells spans the area, less its gaps.
+        assert!(
+            first.width() >= crate::tune!(CELL_MIN_W) - 0.01,
+            "a cell came out narrower than the faces it holds"
+        );
+        assert!(first.height() >= crate::tune!(CELL_MIN_H) - 0.01);
+        // A row of cells spans the area, less its gaps.
         let (across, width) = grid(a, n);
         let spanned = width * across as f32 + CELL_GAP * (across - 1) as f32;
         assert!((spanned - a.width()).abs() < 0.01, "the grid left a margin");
     }
 
-    /// One device is one cell filling the page, and a page too narrow
-    /// for the smallest cell still lays out a column.
+    /// The page follows the cursor, and the reading order runs on across
+    /// the break rather than restarting.
+    #[test]
+    fn the_page_follows_the_cursor() {
+        let (a, n) = (area(), 29usize);
+        let (across, _) = grid(a, n);
+        let shown = rows_shown(a);
+        let rows = n.div_ceil(across);
+        assert!(rows > shown, "this page should need more than one screen");
+        // Early on, the first row is the first row.
+        assert_eq!(first_row(a, n, Some(0)), 0);
+        // At the end, the last page — and never past it.
+        let last = first_row(a, n, Some(n - 1));
+        assert_eq!(last, rows - shown);
+        // Every cursor lands on a page that contains it.
+        for index in 0..n {
+            let first = first_row(a, n, Some(index));
+            let row = index / across;
+            assert!(
+                row >= first && row < first + shown,
+                "cell {index} fell off its own page"
+            );
+        }
+    }
+
+    /// One device is one cell, and a page too narrow for the smallest
+    /// cell still lays out a column rather than dividing by zero.
     #[test]
     fn the_grid_survives_its_ends() {
         let a = area();
         assert_eq!(grid(a, 1).0, 1);
-        assert!((cell_rect(a, 1, 0).width() - a.width()).abs() < 0.01);
         let thin = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(40.0, 300.0));
         assert_eq!(grid(thin, 8).0, 1);
-        assert!(cell_rect(thin, 8, 7).is_positive());
+        assert!(rows_shown(thin) >= 1);
+        assert!(cell_rect(thin, 8, 0, 7).is_positive());
     }
 }

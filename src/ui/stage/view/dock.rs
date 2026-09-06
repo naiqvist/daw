@@ -51,7 +51,33 @@ fn across(area: egui::Rect) -> usize {
         .max(1.0) as usize
 }
 
+/// How tall the dock is for `count` chips in a tray this wide.
+///
+/// The dock stands at the FOOT of the sequencer rather than in its
+/// place: it is small enough to, and having the clip and the path it
+/// runs through on screen at once is most of the reason to minify a
+/// chain at all. So it says how much room it needs and the sequencer
+/// takes the rest.
+pub(super) fn height(tray: egui::Rect, count: usize) -> f32 {
+    let area = egui::Rect::from_min_max(
+        egui::pos2(
+            tray.min.x + super::heads::margin() + super::heads::gutter(),
+            tray.min.y,
+        ),
+        egui::pos2(tray.max.x - super::heads::margin(), tray.max.y),
+    );
+    let rows = count.div_ceil(across(area).max(1)).max(1);
+    rows as f32 * (crate::tune!(CHIP_H) + CHIP_GAP) + CHIP_GAP * 2.0
+}
+
 impl super::super::Stage {
+    /// How many chips the dock has to lay out.
+    pub(super) fn dock_len(&self) -> usize {
+        self.addressed_track()
+            .map(|track| chain::band(&self.song, track).len())
+            .unwrap_or(0)
+    }
+
     /// Draw the dock. Returns nothing: the chips are a picture of the
     /// same lattice the rail walks, so the keys are unchanged.
     pub(super) fn draw_dock(&self, painter: &egui::Painter, tray: egui::Rect) {
@@ -71,9 +97,9 @@ impl super::super::Stage {
         let area = egui::Rect::from_min_max(
             egui::pos2(
                 tray.min.x + super::heads::margin() + super::heads::gutter(),
-                tray.min.y + super::tray::LABEL_H + 4.0,
+                tray.min.y + CHIP_GAP,
             ),
-            egui::pos2(tray.max.x - super::heads::margin(), tray.max.y - 4.0),
+            egui::pos2(tray.max.x - super::heads::margin(), tray.max.y - CHIP_GAP),
         );
         if !area.is_positive() {
             return;
