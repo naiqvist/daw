@@ -51,6 +51,19 @@ const CELL_MIN_H: f32 = 190.0;
 const PARAM_H: f32 = 11.0;
 const TYPE_PX: f32 = 12.0;
 
+/// How the open chain is travelled.
+///
+/// The two share everything except the shape of the walk: same cells,
+/// same size, same order, same faces. ROW keeps the signal in a line and
+/// scrolls sideways; GRID wraps and pages. Which one is right depends on
+/// whether you are following a signal or looking for something, so the
+/// card does not choose.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Flow {
+    Row,
+    Grid,
+}
+
 /// How many cells fit across `area`, and how wide each one is.
 fn grid(area: egui::Rect, cells: usize) -> (usize, f32) {
     let across = ((area.width() + CELL_GAP) / (crate::tune!(CELL_MIN_W) + CELL_GAP))
@@ -62,8 +75,17 @@ fn grid(area: egui::Rect, cells: usize) -> (usize, f32) {
 }
 
 /// How many rows of cells the page can show at the height a face needs.
-fn rows_shown(area: egui::Rect) -> usize {
-    (((area.height() + CELL_GAP) / (crate::tune!(CELL_MIN_H) + CELL_GAP)).floor()).max(1.0) as usize
+///
+/// A ROW walk has exactly one, whatever the height — which is what makes
+/// its cells tall: the whole page belongs to the one line of devices.
+fn rows_shown(area: egui::Rect, flow: Flow) -> usize {
+    match flow {
+        Flow::Row => 1,
+        Flow::Grid => {
+            (((area.height() + CELL_GAP) / (crate::tune!(CELL_MIN_H) + CELL_GAP)).floor()).max(1.0)
+                as usize
+        }
+    }
 }
 
 /// The first row on the page, so the cursor's row is on it.
@@ -72,25 +94,52 @@ fn rows_shown(area: egui::Rect) -> usize {
 /// does not fit a screen, and shrinking them until it does is how you
 /// get a grid of unreadable cards. So the bento pages, and the reading
 /// order runs on across the break.
-fn first_row(area: egui::Rect, cells: usize, cursor: Option<usize>) -> usize {
+fn first_row(area: egui::Rect, cells: usize, cursor: Option<usize>, flow: Flow) -> usize {
     let (across, _) = grid(area, cells);
-    let rows = cells.div_ceil(across).max(1);
-    let shown = rows_shown(area).min(rows);
-    let on = cursor.map_or(0, |index| index / across);
-    on.saturating_sub(shown.saturating_sub(1))
-        .min(rows.saturating_sub(shown))
+    let lines = match flow {
+        // A row walk has one line of every device, and "first" counts
+        // along it rather than down.
+        Flow::Row => cells.max(1),
+        Flow::Grid => cells.div_ceil(across).max(1),
+    };
+    let shown = rows_shown(area, flow).min(lines);
+    let step = match flow {
+        Flow::Row => across.max(1),
+        Flow::Grid => 1,
+    };
+    let on = match flow {
+        Flow::Row => cursor.unwrap_or(0),
+        Flow::Grid => cursor.map_or(0, |index| index / across),
+    };
+    match flow {
+        // Keep the cursor's cell on screen, and never scroll past the
+        // last full page.
+        Flow::Row => on
+            .saturating_sub(step.saturating_sub(1))
+            .min(cells.saturating_sub(step)),
+        Flow::Grid => on
+            .saturating_sub(shown.saturating_sub(1))
+            .min(lines.saturating_sub(shown)),
+    }
 }
 
 /// Where the `index`th cell stands, given the first row on the page.
-fn cell_rect(area: egui::Rect, cells: usize, first: usize, index: usize) -> egui::Rect {
+fn cell_rect(area: egui::Rect, cells: usize, first: usize, index: usize, flow: Flow) -> egui::Rect {
     let (across, width) = grid(area, cells);
-    let shown = rows_shown(area);
+    let shown = rows_shown(area, flow);
     let height = (area.height() - CELL_GAP * (shown.saturating_sub(1)) as f32) / shown as f32;
-    let (col, row) = (index % across, index / across);
+    let (col, row) = match flow {
+        // One line: the walk is along it, so "first" slides the column.
+        Flow::Row => (index as isize - first as isize, 0isize),
+        Flow::Grid => (
+            (index % across) as isize,
+            index as isize / across as isize - first as isize,
+        ),
+    };
     egui::Rect::from_min_size(
         egui::pos2(
             area.left() + col as f32 * (width + CELL_GAP),
-            area.top() + (row as f32 - first as f32) * (height + CELL_GAP),
+            area.top() + row as f32 * (height + CELL_GAP),
         ),
         egui::vec2(width, height),
     )
@@ -98,7 +147,7 @@ fn cell_rect(area: egui::Rect, cells: usize, first: usize, index: usize) -> egui
 
 impl super::super::Stage {
     /// Draw the bento over the whole window.
-    pub(super) fn draw_bento(&self, painter: &egui::Painter, whole: egui::Rect) {
+    pub(super) fn draw_bento(&self, painter: &egui::Painter, whole: egui::Rect, flow: Flow) {
         let Some(lattice) = self.chain.as_ref() else {
             return;
         };
@@ -141,18 +190,21 @@ impl super::super::Stage {
         if !area.is_positive() {
             return;
         }
-        let first = first_row(area, columns.len(), cursor);
+        let first = first_row(area, columns.len(), cursor, flow);
         let (across, _) = grid(area, columns.len());
-        let shown = rows_shown(area);
-        let on_page = |index: usize| {
-            let row = index / across;
-            row >= first && row < first + shown
+        let shown = rows_shown(area, flow);
+        let on_page = |index: usize| match flow {
+            Flow::Row => index >= first && index < first + across,
+            Flow::Grid => {
+                let row = index / across;
+                row >= first && row < first + shown
+            }
         };
         for (index, column) in columns.iter().enumerate() {
             if !on_page(index) {
                 continue;
             }
-            let cell = cell_rect(area, columns.len(), first, index);
+            let cell = cell_rect(area, columns.len(), first, index, flow);
             let on = cursor == Some(index);
             chrome::panel_variant(
                 &mut shapes,
@@ -200,11 +252,17 @@ impl super::super::Stage {
             egui::pos2(page.right() - 12.0, page.top() + 6.0),
             egui::Align2::RIGHT_TOP,
             {
-                let last = ((first + shown) * across).min(columns.len());
+                let (from, to) = match flow {
+                    Flow::Row => (first, (first + across).min(columns.len())),
+                    Flow::Grid => (
+                        first * across,
+                        ((first + shown) * across).min(columns.len()),
+                    ),
+                };
                 format!(
                     "{:02}-{:02} of {} · first to last",
-                    first * across + 1,
-                    last,
+                    from + 1,
+                    to,
                     columns.len()
                 )
             },
@@ -216,7 +274,7 @@ impl super::super::Stage {
             if !on_page(index) {
                 continue;
             }
-            let cell = cell_rect(area, columns.len(), first, index);
+            let cell = cell_rect(area, columns.len(), first, index, flow);
             let on = cursor == Some(index);
             let word_ink = if column.bypassed {
                 c.dim
@@ -315,7 +373,7 @@ impl super::super::Stage {
             crate::ui::nav_cursor::claim(
                 painter,
                 ("stage-bento-cell", index),
-                cell_rect(area, columns.len(), first, index),
+                cell_rect(area, columns.len(), first, index, flow),
                 crate::ui::nav_cursor::Kind::Cell,
                 crate::ui::nav_cursor::Layer::Overlay,
                 c.alert,
@@ -340,7 +398,10 @@ mod tests {
         let (across, _) = grid(a, n);
         assert!(across >= 1);
         for i in 1..n {
-            let (before, here) = (cell_rect(a, n, 0, i - 1), cell_rect(a, n, 0, i));
+            let (before, here) = (
+                cell_rect(a, n, 0, i - 1, Flow::Grid),
+                cell_rect(a, n, 0, i, Flow::Grid),
+            );
             if i % across == 0 {
                 assert!(here.left() <= before.left(), "row {i} did not return");
                 assert!(here.top() > before.top(), "row {i} did not descend");
@@ -361,12 +422,12 @@ mod tests {
     #[test]
     fn the_cells_are_one_size_and_wide_enough_for_a_face() {
         let (a, n) = (area(), 29usize);
-        let first = cell_rect(a, n, 0, 0);
+        let first = cell_rect(a, n, 0, 0, Flow::Grid);
         for i in 0..n {
             // To a tolerance: the positions accumulate a column at a
             // time, so two cells of the same size can differ in the last
             // bit of a float without differing on the glass.
-            let size = cell_rect(a, n, 0, i).size();
+            let size = cell_rect(a, n, 0, i, Flow::Grid).size();
             assert!(
                 (size - first.size()).length() < 0.01,
                 "cell {i} is a different size: {size:?} against {:?}",
@@ -390,21 +451,56 @@ mod tests {
     fn the_page_follows_the_cursor() {
         let (a, n) = (area(), 29usize);
         let (across, _) = grid(a, n);
-        let shown = rows_shown(a);
+        let shown = rows_shown(a, Flow::Grid);
         let rows = n.div_ceil(across);
         assert!(rows > shown, "this page should need more than one screen");
         // Early on, the first row is the first row.
-        assert_eq!(first_row(a, n, Some(0)), 0);
+        assert_eq!(first_row(a, n, Some(0), Flow::Grid), 0);
         // At the end, the last page — and never past it.
-        let last = first_row(a, n, Some(n - 1));
+        let last = first_row(a, n, Some(n - 1), Flow::Grid);
         assert_eq!(last, rows - shown);
         // Every cursor lands on a page that contains it.
         for index in 0..n {
-            let first = first_row(a, n, Some(index));
+            let first = first_row(a, n, Some(index), Flow::Grid);
             let row = index / across;
             assert!(
                 row >= first && row < first + shown,
                 "cell {index} fell off its own page"
+            );
+        }
+    }
+
+    /// The row walk keeps the signal in a line and slides along it: one
+    /// row whatever the height, every cell on it, and the cursor always
+    /// on screen.
+    #[test]
+    fn the_row_walk_stays_on_one_line() {
+        let (a, n) = (area(), 29usize);
+        assert_eq!(rows_shown(a, Flow::Row), 1);
+        let (across, _) = grid(a, n);
+        // Every cell shares a row, and each is a cell's width along.
+        for i in 1..n {
+            let before = cell_rect(a, n, 0, i - 1, Flow::Row);
+            let here = cell_rect(a, n, 0, i, Flow::Row);
+            assert!(
+                (before.top() - here.top()).abs() < 0.01,
+                "cell {i} left the line"
+            );
+            assert!(before.right() <= here.left() + 0.01, "cell {i} went back");
+        }
+        // A cell is taller here than in the grid: the whole page belongs
+        // to one line, which is what the row walk buys.
+        assert!(
+            cell_rect(a, n, 0, 0, Flow::Row).height() > cell_rect(a, n, 0, 0, Flow::Grid).height()
+        );
+        // The walk follows the cursor and stops at the end.
+        assert_eq!(first_row(a, n, Some(0), Flow::Row), 0);
+        assert_eq!(first_row(a, n, Some(n - 1), Flow::Row), n - across);
+        for index in 0..n {
+            let first = first_row(a, n, Some(index), Flow::Row);
+            assert!(
+                index >= first && index < first + across,
+                "cell {index} walked off its own screen"
             );
         }
     }
@@ -417,7 +513,7 @@ mod tests {
         assert_eq!(grid(a, 1).0, 1);
         let thin = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(40.0, 300.0));
         assert_eq!(grid(thin, 8).0, 1);
-        assert!(rows_shown(thin) >= 1);
-        assert!(cell_rect(thin, 8, 0, 7).is_positive());
+        assert!(rows_shown(thin, Flow::Grid) >= 1);
+        assert!(cell_rect(thin, 8, 0, 7, Flow::Grid).is_positive());
     }
 }

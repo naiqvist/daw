@@ -725,7 +725,7 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
                 backend: "JACK",
             }));
         }
-    } else if which.contains("dock") || which.contains("bento") {
+    } else if which.contains("dock") || which.contains("bento") || which.contains("scroll") {
         // The chain in its other two shapes: the minified dock under the
         // sequencer, and the page it opens into.
         use daw::devices::DeviceKind;
@@ -734,6 +734,9 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
         }
         let _ = stage.apply(StageIntent::Devices);
         let _ = stage.apply(StageIntent::BandView);
+        if which.contains("scroll") || which.contains("bento") {
+            let _ = stage.apply(StageIntent::BandView);
+        }
         if which.contains("bento") {
             let _ = stage.apply(StageIntent::BandView);
         }

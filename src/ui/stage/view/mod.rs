@@ -396,8 +396,14 @@ impl Stage {
         // The bento covers the musical surface rather than sitting in
         // it, so it goes over everything the surface draws — and under
         // the machine room, which is not part of the surface at all.
-        if self.band_view() == crate::ui::stage::BandView::Bento {
-            self.draw_bento(ui.painter(), whole);
+        match self.band_view() {
+            crate::ui::stage::BandView::Scroll => {
+                self.draw_bento(ui.painter(), whole, bento::Flow::Row)
+            }
+            crate::ui::stage::BandView::Bento => {
+                self.draw_bento(ui.painter(), whole, bento::Flow::Grid)
+            }
+            _ => {}
         }
         // Last of all, because the machine room is not part of the musical
         // surface: it stands in front of the whole of it.

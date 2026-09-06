@@ -322,14 +322,25 @@ pub enum RefusalReason {
 ///
 /// RAIL is the rail. DOCK minifies it to one chip per device under the
 /// sequencer, which fits the whole signal path on screen at once at the
-/// cost of showing none of it in detail. BENTO opens it to near the
-/// whole window as a grid read first to last in reading order — left to
-/// right, then down — so the signal path reads the way a page does.
+/// cost of showing none of it in detail.
+///
+/// The other two open it out to near the whole window at the size the
+/// cards were drawn to, and differ only in how you travel it. SCROLL
+/// lays them in ONE row and walks sideways, which keeps the signal in a
+/// line — the order is never in doubt and there is no break to read
+/// across, but you only ever see the couple of devices either side of
+/// where you are. BENTO lays them in a GRID read first to last in
+/// reading order, which puts six on screen at once at the cost of a
+/// wrap.
+///
+/// Both are wanted, and which is right depends on whether you are
+/// following a signal or looking for something.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum BandView {
     #[default]
     Rail,
     Dock,
+    Scroll,
     Bento,
 }
 
@@ -338,15 +349,22 @@ impl BandView {
     pub fn next(self) -> Self {
         match self {
             Self::Rail => Self::Dock,
-            Self::Dock => Self::Bento,
+            Self::Dock => Self::Scroll,
+            Self::Scroll => Self::Bento,
             Self::Bento => Self::Rail,
         }
+    }
+
+    /// Whether this presentation opens over the whole window.
+    pub fn is_open(self) -> bool {
+        matches!(self, Self::Scroll | Self::Bento)
     }
 
     pub fn word(self) -> &'static str {
         match self {
             Self::Rail => "rail",
             Self::Dock => "dock",
+            Self::Scroll => "scroll",
             Self::Bento => "bento",
         }
     }
