@@ -1,29 +1,45 @@
-//! DRIFT's face: a bucket brigade with two heads sweeping it.
+//! DRIFT's face: the line, and where its sweep has got to.
 //!
-//! After the bucket-brigade delay chip the section models. The line of
-//! buckets runs across the glass, and two read heads ride it — one per
-//! side. Where each head stands is not a picture of an LFO: it is the
-//! LFO, the section's own sweep at the block's last sample, so the
-//! heads walk at the rate that is actually running and stop dead when
-//! the section is a wire.
+//! One kind of delay line and four ways of sweeping it, so the card is a
+//! picture of the line: a lane in milliseconds with the mode's own delay
+//! marked on it, the reach the sweep covers shaded either side, and the
+//! two sides' sweeps riding it where they actually are this instant.
 //!
-//! DEPTH is how far apart the end stops are; WIDTH is how far the two
-//! heads are pushed apart inside them, so a wide setting is visibly two
-//! machines and a narrow one is visibly one.
+//! Those two markers come from the section's own readout, not from the
+//! knobs, and that is what makes WIDTH legible: at nothing the two sit
+//! on top of each other, and as it opens they part. A number could tell
+//! you the width; only two markers can show you that the sides are on
+//! opposite errands.
+//!
+//! The SWEEP panel draws the shape the mode uses — a triangle for the
+//! chorus and the flanger, as the CE-1's was, a sine for the vibrato and
+//! the ensemble. It is drawn as the nominal shape and said to be
+//! nominal, because the real one is not a metronome: a slow random walk
+//! wobbles the rate and the depth by a few percent so two bars never
+//! sweep alike, and a card that drew a perfect triangle and left it at
+//! that would be promising a steadiness the section does not have.
+//!
+//! TOP is the one piece of bucket-brigade physics worth a number: the
+//! line is band-limited by its own clock, and it is duller the longer it
+//! is. The figure moves as the sweep moves, because the line really is
+//! getting darker and brighter as it sweeps.
 
 use super::*;
-use crate::console::SectionParams;
-use crate::params::console::drift as p;
 use crate::ui::chrome;
-use crate::ui::nav_cursor;
 
-/// How many buckets the line is drawn with.
-const BUCKETS: usize = 22;
+/// One control's row.
+/// @tune 12..26 px
+pub(super) const ROW_H: f32 = 18.0;
+const COLUMN_GAP: f32 = 8.0;
+/// The four modes, in the order the parameter numbers them.
+const MODES: [&str; 4] = ["CHORUS", "FLANGER", "VIBRATO", "ENSEMBLE"];
 
-struct Lay {
-    /// The line of buckets the heads ride.
-    line: egui::Rect,
+/// DRIFT's six controls.
+#[derive(Clone, Copy, Debug)]
+struct DriftFace {
     mode: egui::Rect,
+    lane: egui::Rect,
+    sweep: egui::Rect,
     rate: egui::Rect,
     depth: egui::Rect,
     feedback: egui::Rect,
@@ -31,8 +47,9 @@ struct Lay {
     mix: egui::Rect,
 }
 
-impl Layout for Lay {
+impl Layout for DriftFace {
     fn controls(&self) -> Vec<(u32, egui::Rect)> {
+        use crate::params::console::drift as p;
         vec![
             (p::MODE, self.mode),
             (p::RATE, self.rate),
@@ -44,263 +61,430 @@ impl Layout for Lay {
     }
 }
 
-fn lay(glass: egui::Rect, bay: Option<egui::Rect>, plinth: Option<egui::Rect>) -> Lay {
-    let inner = glass.shrink2(egui::vec2(5.0, 4.0));
-    let (w, h) = (inner.width(), inner.height());
-    let line = egui::Rect::from_min_max(
-        egui::pos2(inner.left(), inner.top() + 0.14 * h),
-        egui::pos2(inner.right(), inner.top() + 0.44 * h),
+fn drift_face(glass: egui::Rect) -> DriftFace {
+    let x = egui::Rect::from_min_max(
+        egui::pos2(glass.left() + 5.0, glass.top() + 3.0),
+        egui::pos2(glass.right() - 20.0, glass.bottom() - 12.0),
     );
-    let row = |top: f32, from: f32, to: f32| {
-        egui::Rect::from_min_max(
-            egui::pos2(inner.left() + w * from, top),
-            egui::pos2(inner.left() + w * to, top + 14.0),
+    let mode = egui::Rect::from_min_size(x.min, egui::vec2(x.width(), ROW_H));
+    let body = egui::Rect::from_min_max(egui::pos2(x.left(), mode.bottom() + 4.0), x.max);
+    let left_w = (body.width() - COLUMN_GAP) * 0.54;
+    let left = egui::Rect::from_min_max(body.min, egui::pos2(body.left() + left_w, body.bottom()));
+    let right =
+        egui::Rect::from_min_max(egui::pos2(left.right() + COLUMN_GAP, body.top()), body.max);
+    // The lane takes the head of the left column and the sweep its foot.
+    let sweep_h = (left.height() * 0.42).clamp(38.0, 80.0);
+    let lane = egui::Rect::from_min_max(
+        left.min,
+        egui::pos2(left.right(), left.bottom() - sweep_h - 4.0),
+    );
+    let sweep = egui::Rect::from_min_max(egui::pos2(left.left(), lane.bottom() + 4.0), left.max);
+    let rows_h = ROW_H * 5.0 + 4.0;
+    let top = (right.bottom() - rows_h).max(right.top());
+    let row = |i: usize| {
+        egui::Rect::from_min_size(
+            egui::pos2(right.left(), top + i as f32 * (ROW_H + 1.0)),
+            egui::vec2(right.width(), ROW_H),
         )
     };
-    let first = line.bottom() + 22.0;
-    Lay {
-        line,
-        // The DEPTH is the stops the heads run between: the line itself.
-        depth: line,
-        mode: bay.unwrap_or_else(|| {
-            egui::Rect::from_min_max(
-                egui::pos2(inner.right() - 22.0, inner.top()),
-                egui::pos2(inner.right(), inner.top() + 24.0),
-            )
-        }),
-        rate: row(first, 0.0, 0.46),
-        feedback: row(first, 0.54, 1.0),
-        width: row(first + 19.0, 0.0, 0.46),
-        mix: plinth.unwrap_or_else(|| row(first + 19.0, 0.54, 1.0)),
+    DriftFace {
+        mode,
+        lane,
+        sweep,
+        rate: row(0),
+        depth: row(1),
+        feedback: row(2),
+        width: row(3),
+        mix: row(4),
+    }
+}
+
+/// The line's top, in Hz, at a delay of `ms`.
+///
+/// A bucket brigade is band-limited by its own clock's anti-alias
+/// filters, and the longer the line the slower the clock: the same
+/// section is duller at seven milliseconds than at one.
+fn top_hz(ms: f32) -> f32 {
+    use crate::params::console::drift as p;
+    let t = (ms / p::MAX_MS).clamp(0.0, 1.0);
+    egui::lerp(p::BBD_SHORT_HZ..=p::BBD_LONG_HZ, t)
+}
+
+/// The nominal sweep at `turn` of a cycle: a triangle for the modes that
+/// used one, a sine for the modes that used one. −1..1.
+fn sweep_at(mode: u32, turn: f32) -> f32 {
+    use crate::params::console::drift as p;
+    let t = turn.rem_euclid(1.0);
+    if mode == p::CHORUS || mode == p::FLANGER {
+        // A triangle: up for half a turn, down for the other half.
+        if t < 0.5 {
+            -1.0 + 4.0 * t
+        } else {
+            3.0 - 4.0 * t
+        }
+    } else {
+        (t * core::f32::consts::TAU).sin()
     }
 }
 
 pub(super) fn draw(face: &Face<'_>) {
-    let lay = lay(face.glass, face.bay(), face.plinth());
-    let (ink, edge) = (face.ink(), face.edge());
-    let said = face.said;
+    use crate::params::console::drift as p;
+    let painter = face.painter;
+    let alpha = face.alpha;
+    let edge = alpha.edge.color;
+    let ink = alpha.ink.color;
+    let font = egui::FontId::monospace(design::px(design::type_scale::MICRO));
+    let lay = drift_face(face.glass);
+    let mode = face.value(p::MODE).round().clamp(0.0, 3.0) as u32;
+    let rate = face.value(p::RATE);
+    let depth = face.value(p::DEPTH) / 100.0;
+    let feedback = face.value(p::FEEDBACK) / 100.0;
+    let width = face.value(p::WIDTH) / 100.0;
+    let mix = face.value(p::MIX) / 100.0;
+    let wire = mix <= 0.0;
+    // Where each side's sweep actually stood at the end of the block.
+    let swept = [face.said.bands[1], face.said.bands[2]];
+    let base = p::BASE_MS[mode as usize];
+    let reach = p::SWEEP_MS[mode as usize] * depth;
+    let delay = |side: usize| (base + swept[side] * reach).clamp(0.0, p::MAX_MS);
+
     let mut shapes = Vec::new();
 
-    let depth = face.anim("depth", face.place(p::DEPTH), 0.10);
-    let width = face.anim("width", face.place(p::WIDTH), 0.10);
-    let mix = face.place(p::MIX);
-
-    // THE LINE: the buckets, each one a cell the charge is walked
-    // through. They dim toward the far end, as a bucket brigade does.
-    let line = lay.line;
-    let pitch = line.width() / BUCKETS as f32;
-    for i in 0..BUCKETS {
-        let t = (i as f32 + 0.5) / BUCKETS as f32;
-        let cell = egui::Rect::from_min_max(
-            egui::pos2(line.left() + pitch * i as f32 + 1.0, line.center().y - 5.0),
-            egui::pos2(
-                line.left() + pitch * (i as f32 + 1.0) - 1.0,
-                line.center().y + 5.0,
-            ),
-        );
-        if cell.is_positive() {
-            chrome::trace(
-                &mut shapes,
-                &[
-                    cell.left_top(),
-                    cell.right_top(),
-                    cell.right_bottom(),
-                    cell.left_bottom(),
-                    cell.left_top(),
-                ],
-                Weight::Hair,
-                tool::fade(edge, 0.65 - 0.35 * t),
-            );
-        }
-    }
-
-    // THE END STOPS: how far of the line the heads may use. Depth is
-    // the travel, so at nothing the two stops meet and nothing moves.
-    let reach = line.width() * 0.5 * (0.06 + 0.94 * depth);
-    let middle = line.center().x;
-    for stop in [middle - reach, middle + reach] {
-        chrome::trace(
-            &mut shapes,
-            &[
-                egui::pos2(stop, line.top() - 4.0),
-                egui::pos2(stop, line.bottom() + 4.0),
-            ],
-            Weight::Hair,
-            tool::mix_ink(tool::fade(edge, 0.9), face.focus(), face.lit(p::DEPTH)),
-        );
-    }
-    tool::halo(&mut shapes, lay.line, face.lit(p::DEPTH), face.focus());
-
-    // THE TWO HEADS: the section's own sweeps, one per side, pushed
-    // apart by the width. Nothing here runs on a clock; if the section
-    // is flat the sweeps are zero and the heads stand still.
-    let spread = 0.15 + 0.85 * width;
-    for (side, hue) in [(0usize, ink), (1, face.live())] {
-        let sweep = face
-            .anim(
-                if side == 0 { "sweep-l" } else { "sweep-r" },
-                said.bands[side + 1].clamp(-1.0, 1.0),
-                0.03,
-            )
-            .clamp(-1.0, 1.0);
-        let at = middle + reach * sweep * if side == 0 { spread } else { -spread };
-        chrome::trace(
-            &mut shapes,
-            &[
-                egui::pos2(at, line.top() - 6.0),
-                egui::pos2(at, line.bottom() + 6.0),
-            ],
-            Weight::Heavy,
-            hue,
-        );
-        chrome::pad(
-            &mut shapes,
-            egui::pos2(at, line.top() - 6.0),
-            chrome::PAD - 1.0,
-            hue,
-            true,
-        );
-    }
-    tool::halo(&mut shapes, lay.width, face.lit(p::WIDTH), face.focus());
-
-    // MODE: four detents in the bay, a tall slot in the right wall.
-    let slot = lay.mode;
-    let mode = face.value(p::MODE).round().clamp(0.0, 3.0) as usize;
-    for i in 0..4 {
-        let y = egui::lerp((slot.top() + 4.0)..=(slot.bottom() - 4.0), i as f32 / 3.0);
-        let here = i == mode;
-        chrome::trace(
-            &mut shapes,
-            &[
-                egui::pos2(slot.left() + 2.0, y),
-                egui::pos2(slot.right() - if here { 1.0 } else { 4.0 }, y),
-            ],
-            if here { Weight::Heavy } else { Weight::Hair },
-            if here { ink } else { tool::fade(edge, 0.7) },
-        );
-    }
-    tool::halo(&mut shapes, slot, face.lit(p::MODE), face.focus());
-
-    // RATE: a gauge, but the thing that says the rate is the heads. So
-    // the gauge is small and the head is the reading.
-    tool::slider(
+    // ---- The mode strip. ---------------------------------------------
+    chrome::panel_frame_variant(&mut shapes, lay.mode, Weight::Hair, edge, 2);
+    let cell_w = lay.mode.width() / MODES.len() as f32;
+    let mode_cell = |i: usize| {
+        egui::Rect::from_min_size(
+            egui::pos2(lay.mode.left() + i as f32 * cell_w, lay.mode.top()),
+            egui::vec2(cell_w, lay.mode.height()),
+        )
+    };
+    chrome::brackets(
         &mut shapes,
-        lay.rate.shrink2(egui::vec2(4.0, 4.0)),
-        face.place(p::RATE),
-        9,
-        tool::mix_ink(ink, face.focus(), face.lit(p::RATE)),
-        tool::fade(edge, 0.6),
-        6.0,
+        mode_cell(mode as usize).shrink(2.0),
+        4.0,
+        Weight::Hair,
+        ink,
     );
-    tool::halo(&mut shapes, lay.rate, face.lit(p::RATE), face.focus());
 
-    // FEEDBACK: an arc from the line's far end back to its head, above
-    // for a positive loop and below for an inverted one — which is what
-    // the sign of a bucket brigade's feedback actually does.
-    let fb = face.swing(p::FEEDBACK);
-    let arc_rect = lay.feedback;
-    let lift = arc_rect.height() * 0.5 * fb;
+    // ---- The lane: the line, in milliseconds. ------------------------
+    chrome::panel_variant(
+        &mut shapes,
+        lay.lane,
+        Some(alpha.ground.color),
+        alpha.well.color,
+        Some((Weight::Hair, edge.gamma_multiply(0.62))),
+        0,
+    );
+    let field = egui::Rect::from_min_max(
+        egui::pos2(lay.lane.left() + 8.0, lay.lane.top() + font.size + 6.0),
+        egui::pos2(lay.lane.right() - 8.0, lay.lane.bottom() - font.size - 6.0),
+    );
+    let x_at = |ms: f32| field.left() + (ms / p::MAX_MS).clamp(0.0, 1.0) * field.width();
+    // The reach: everywhere the sweep can put the line.
+    if reach > 0.0 {
+        shapes.push(egui::Shape::rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(x_at(base - reach), field.top()),
+                egui::pos2(x_at(base + reach), field.bottom()),
+            ),
+            0.0,
+            alpha.live_dim.color.gamma_multiply(0.35),
+        ));
+    }
+    // The line the mode sits on with no sweep at all.
     chrome::trace(
         &mut shapes,
         &[
-            egui::pos2(arc_rect.right() - 2.0, arc_rect.center().y),
-            egui::pos2(arc_rect.center().x, arc_rect.center().y - lift),
-            egui::pos2(arc_rect.left() + 2.0, arc_rect.center().y),
+            egui::pos2(x_at(base), field.top()),
+            egui::pos2(x_at(base), field.bottom()),
         ],
         Weight::Hair,
-        tool::mix_ink(tool::fade(edge, 0.8), ink, fb.abs()),
+        edge.gamma_multiply(1.1),
     );
-    chrome::pad(
-        &mut shapes,
-        egui::pos2(arc_rect.left() + 2.0, arc_rect.center().y),
-        chrome::PAD - 2.0,
-        ink,
-        fb.abs() > 0.01,
-    );
-    tool::halo(&mut shapes, arc_rect, face.lit(p::FEEDBACK), face.focus());
-
-    // WIDTH and MIX, two rails at the foot.
-    for (rect, param, value) in [(lay.width, p::WIDTH, width), (lay.mix, p::MIX, mix)] {
-        tool::slider(
+    for ms in [0.0f32, 4.0, 8.0, 12.0, 16.0] {
+        chrome::trace(
             &mut shapes,
-            rect.shrink2(egui::vec2(4.0, 4.0)),
-            value,
-            9,
-            tool::mix_ink(ink, face.focus(), face.lit(param)),
-            tool::fade(edge, 0.6),
-            6.0,
+            &[
+                egui::pos2(x_at(ms), field.bottom() - 3.0),
+                egui::pos2(x_at(ms), field.bottom()),
+            ],
+            Weight::Hair,
+            edge,
         );
-        tool::halo(&mut shapes, rect, face.lit(param), face.focus());
+    }
+    // The two sides, where they are. At no width they sit on each other;
+    // as it opens they part, which is the whole of what width does.
+    if !wire {
+        for (side, tone) in [(0usize, alpha.live.color), (1, alpha.jeopardy_latent.color)] {
+            let x = x_at(delay(side));
+            let y = if side == 0 {
+                field.top() + field.height() * 0.32
+            } else {
+                field.top() + field.height() * 0.68
+            };
+            chrome::trace(
+                &mut shapes,
+                &[egui::pos2(x, field.top()), egui::pos2(x, field.bottom())],
+                Weight::Heavy,
+                tone,
+            );
+            chrome::pad(&mut shapes, egui::pos2(x, y), chrome::PAD + 1.0, tone, true);
+        }
     }
 
-    face.painter.extend(shapes);
-
-    // The mark rides the sweep that is actually running.
-    face.mark_signed(
-        &lay,
-        nav_cursor::Signature::Sweep(said.bands[1].clamp(-1.0, 1.0)),
+    // ---- The sweep's own shape. --------------------------------------
+    chrome::panel_variant(
+        &mut shapes,
+        lay.sweep,
+        Some(alpha.ground.color),
+        alpha.well.color,
+        Some((Weight::Hair, edge.gamma_multiply(0.62))),
+        0,
     );
+    let wave = egui::Rect::from_min_max(
+        egui::pos2(lay.sweep.left() + 8.0, lay.sweep.top() + font.size + 5.0),
+        egui::pos2(lay.sweep.right() - 8.0, lay.sweep.bottom() - 5.0),
+    );
+    if wave.is_positive() {
+        chrome::trace(
+            &mut shapes,
+            &[
+                egui::pos2(wave.left(), wave.center().y),
+                egui::pos2(wave.right(), wave.center().y),
+            ],
+            Weight::Hair,
+            edge.gamma_multiply(0.5),
+        );
+        let shape: Vec<egui::Pos2> = (0..=96)
+            .map(|i| {
+                let t = i as f32 / 96.0;
+                egui::pos2(
+                    wave.left() + t * wave.width(),
+                    wave.center().y - sweep_at(mode, t * 2.0) * depth * wave.height() * 0.44,
+                )
+            })
+            .collect();
+        chrome::curve(
+            &mut shapes,
+            &shape,
+            Weight::Heavy,
+            if wire { edge.gamma_multiply(0.9) } else { ink },
+        );
+    }
+    painter.extend(shapes);
+
+    // ---- The words. --------------------------------------------------
+    let mut words = tool::Ledger::new(painter, font.clone(), "DRIFT");
+    let span = |text: &str| {
+        painter
+            .layout_no_wrap(text.to_owned(), font.clone(), ink)
+            .rect
+            .width()
+    };
+    let gutter = ["RATE", "DEPTH", "FEEDBACK", "WIDTH", "MIX"]
+        .into_iter()
+        .map(span)
+        .fold(0.0f32, f32::max)
+        + 6.0;
+    let figure = span("-100") + 6.0;
+    for (i, word) in MODES.into_iter().enumerate() {
+        words.text(
+            mode_cell(i).center(),
+            egui::Align2::CENTER_CENTER,
+            word,
+            if i as u32 == mode { ink } else { edge },
+        );
+    }
+    words.text(
+        egui::pos2(lay.lane.left() + 8.0, lay.lane.top() + 2.0),
+        egui::Align2::LEFT_TOP,
+        "LINE",
+        edge,
+    );
+    // The line's own top, at the delay it is actually sitting at: the
+    // brigade is duller the longer it runs.
+    words.text(
+        egui::pos2(lay.lane.right() - 8.0, lay.lane.top() + 2.0),
+        egui::Align2::RIGHT_TOP,
+        if wire {
+            "WIRE".to_owned()
+        } else {
+            format!("{base:.0}ms · top {:.1}k", top_hz(delay(0)) / 1000.0)
+        },
+        if wire { edge } else { alpha.live.color },
+    );
+    words.text(
+        egui::pos2(field.left(), lay.lane.bottom() - 2.0),
+        egui::Align2::LEFT_BOTTOM,
+        "0",
+        edge,
+    );
+    words.text(
+        egui::pos2(field.right(), lay.lane.bottom() - 2.0),
+        egui::Align2::RIGHT_BOTTOM,
+        format!("{:.0}", p::MAX_MS),
+        edge,
+    );
+    words.text(
+        egui::pos2(lay.sweep.left() + 8.0, lay.sweep.top() + 2.0),
+        egui::Align2::LEFT_TOP,
+        "SWEEP",
+        edge,
+    );
+    // Nominal, and said to be: the real sweep wanders by a few percent.
+    words.text(
+        egui::pos2(lay.sweep.right() - 8.0, lay.sweep.top() + 2.0),
+        egui::Align2::RIGHT_TOP,
+        format!("{rate:.2}Hz NOM"),
+        edge,
+    );
+    for (rect, word, share, said, tone) in [
+        (
+            lay.rate,
+            "RATE",
+            (rate / 10.0).clamp(0.0, 1.0),
+            format!("{rate:.2}"),
+            alpha.live.color,
+        ),
+        (
+            lay.depth,
+            "DEPTH",
+            depth,
+            format!("{:.0}", depth * 100.0),
+            alpha.live.color,
+        ),
+        (
+            lay.feedback,
+            "FEEDBACK",
+            feedback.abs(),
+            format!("{:+.0}", feedback * 100.0),
+            alpha.jeopardy_latent.color,
+        ),
+        (
+            lay.width,
+            "WIDTH",
+            width,
+            format!("{:.0}", width * 100.0),
+            alpha.live.color,
+        ),
+        (
+            lay.mix,
+            "MIX",
+            mix,
+            format!("{:.0}", mix * 100.0),
+            alpha.live.color,
+        ),
+    ] {
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + gutter, rect.center().y - 2.5),
+            egui::pos2(rect.right() - figure, rect.center().y + 2.5),
+        );
+        if bar.is_positive() {
+            painter.rect_filled(bar, 0.0, edge.gamma_multiply(0.35));
+            if share > 0.0 {
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        bar.min,
+                        egui::pos2(
+                            bar.left() + share.clamp(0.0, 1.0) * bar.width(),
+                            bar.bottom(),
+                        ),
+                    ),
+                    0.0,
+                    tone,
+                );
+            }
+        }
+        words.text(
+            egui::pos2(rect.left() + 2.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            word,
+            edge,
+        );
+        words.text(
+            egui::pos2(rect.right() - 2.0, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            said,
+            ink,
+        );
+    }
+    words.finish();
+
+    face.mark(&lay);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::console::SectionKind;
 
-    fn laid() -> (egui::Rect, Lay) {
-        let piece = egui::Rect::from_min_size(
-            egui::pos2(20.0, 30.0),
-            egui::vec2(strip::width_of(SectionKind::Drift), 250.0),
-        );
-        let glass = strip::recess_of(piece, SectionKind::Drift).shrink(3.0);
-        (
-            piece,
-            lay(
-                glass,
-                strip::bay_rect(piece, SectionKind::Drift),
-                strip::plinth_rect(piece, SectionKind::Drift),
-            ),
-        )
+    fn glass() -> egui::Rect {
+        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(470.0, 210.0))
     }
 
     #[test]
-    fn every_drift_parameter_has_one_instrument() {
-        let (piece, lay) = laid();
-        for def in SectionKind::Drift.table() {
-            let rect = lay
-                .control(def.id as usize)
-                .unwrap_or_else(|| panic!("{} has no instrument", def.name));
-            assert!(rect.is_positive(), "{} has no room", def.name);
-            assert!(
-                piece.expand(strip::TONGUE).contains_rect(rect),
-                "{} left the piece",
-                def.name
-            );
-        }
-        assert_eq!(lay.controls().len(), 6);
-        let _ = SectionParams::of(SectionKind::Drift);
-    }
-
-    /// The two heads run between the stops and never leave them, at any
-    /// width and any point of the sweep.
-    #[test]
-    fn the_heads_stay_between_their_stops() {
-        let (_, lay) = laid();
-        let middle = lay.line.center().x;
-        for depth in [0.0f32, 0.5, 1.0] {
-            let reach = lay.line.width() * 0.5 * (0.06 + 0.94 * depth);
-            for width in [0.0f32, 1.0] {
-                let spread = 0.15 + 0.85 * width;
-                for sweep in [-1.0f32, 0.0, 1.0] {
-                    for side in [1.0f32, -1.0] {
-                        let at = middle + reach * sweep * spread * side;
-                        assert!(
-                            at >= middle - reach - 0.01 && at <= middle + reach + 0.01,
-                            "a head left its stops"
-                        );
-                    }
-                }
+    fn every_drift_control_has_its_own_place() {
+        let face = drift_face(glass());
+        let controls = face.controls();
+        assert_eq!(controls.len(), 6);
+        for (index, (id, rect)) in controls.iter().enumerate() {
+            assert!(glass().contains_rect(*rect), "control {id} left the glass");
+            assert!(rect.is_positive(), "control {id} lost its place");
+            for (other, other_rect) in &controls[index + 1..] {
+                assert!(
+                    !rect.intersects(*other_rect),
+                    "controls {id} and {other} overlap"
+                );
             }
         }
+        assert!(!face.lane.intersects(face.sweep));
+    }
+
+    /// The line is duller the longer it is, which is the brigade's own
+    /// physics and the reason the figure moves as the sweep moves.
+    #[test]
+    fn a_longer_line_is_a_darker_line() {
+        use crate::params::console::drift as p;
+        assert!((top_hz(0.0) - p::BBD_SHORT_HZ).abs() < 1.0);
+        assert!((top_hz(p::MAX_MS) - p::BBD_LONG_HZ).abs() < 1.0);
+        let mut last = f32::MAX;
+        for i in 0..=16 {
+            let hz = top_hz(i as f32);
+            assert!(hz <= last, "the line got brighter as it got longer");
+            last = hz;
+        }
+        // Past the ends it holds rather than running away.
+        assert_eq!(top_hz(-5.0), p::BBD_SHORT_HZ);
+        assert_eq!(top_hz(p::MAX_MS * 3.0), p::BBD_LONG_HZ);
+    }
+
+    /// Two modes sweep on a triangle and two on a sine, and every one of
+    /// them stays inside the rails and comes back where it started.
+    #[test]
+    fn the_sweep_is_the_shape_the_mode_used() {
+        use crate::params::console::drift as p;
+        for mode in [p::CHORUS, p::FLANGER, p::VIBRATO, p::ENSEMBLE] {
+            for i in 0..=32 {
+                let v = sweep_at(mode, i as f32 / 32.0);
+                assert!((-1.001..=1.001).contains(&v), "mode {mode} left the rails");
+            }
+            // A cycle is a cycle: the shape repeats.
+            for i in 0..8 {
+                let t = i as f32 / 8.0;
+                assert!(
+                    (sweep_at(mode, t) - sweep_at(mode, t + 1.0)).abs() < 1e-5,
+                    "mode {mode} did not repeat"
+                );
+            }
+        }
+        // The triangle is straight between its corners; the sine is not.
+        let straight = |mode: u32| {
+            let a = sweep_at(mode, 0.1);
+            let b = sweep_at(mode, 0.2);
+            let c = sweep_at(mode, 0.3);
+            ((a + c) * 0.5 - b).abs()
+        };
+        assert!(straight(p::CHORUS) < 1e-4, "the chorus was not a triangle");
+        assert!(straight(p::VIBRATO) > 1e-3, "the vibrato was not a sine");
     }
 }

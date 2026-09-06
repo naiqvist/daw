@@ -725,6 +725,32 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
                 backend: "JACK",
             }));
         }
+    } else if which.contains("drift") {
+        // The flanger, swept deep with feedback and full width, so the
+        // reach is wide and the two sides stand apart on the lane.
+        use daw::devices::DeviceKind;
+        let _ = stage.song_mut().add_device(0, DeviceKind::Poly);
+        {
+            use daw::params::console::drift as p;
+            let song = stage.song_mut();
+            if let Some(device) = song
+                .section(0, daw::console::SectionKind::Drift)
+                .map(|device| device.id)
+                .and_then(|id| song.device_mut(id))
+            {
+                device.bypassed = false;
+                device.set(p::MODE, p::FLANGER as f32);
+                device.set(p::RATE, 0.35);
+                device.set(p::DEPTH, 75.0);
+                device.set(p::FEEDBACK, 55.0);
+                device.set(p::WIDTH, 100.0);
+                device.set(p::MIX, 60.0);
+            }
+        }
+        let _ = stage.apply(StageIntent::Devices);
+        for _ in 0..13 {
+            let _ = stage.apply(StageIntent::Step(Step::Right));
+        }
     } else if which.contains("shine") {
         // The exciter leaning on a high corner, so the even rungs stand
         // clear of the odd ones and the split is plainly a split.
