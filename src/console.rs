@@ -405,6 +405,97 @@ pub mod harmonic {
     }
 }
 
+/// PHASE's response, green side.
+///
+/// A phaser is not a filter with notches drawn on it — the notches are
+/// what happens when a swept ALLPASS run, which changes no magnitude at
+/// all, is added back to the dry signal and the two disagree. So the
+/// card cannot draw notches by placing them; it has to compute the
+/// disagreement, which is what this does.
+///
+/// A second-order allpass has unit magnitude and a phase that runs from
+/// zero to a FULL turn through its corner. Cascade `stages` of them and
+/// the phase multiplies. Add the dry back and the sum is `1 + A`, which
+/// nulls wherever the run has arrived at an odd half-turn — and a full
+/// turn per section means one null per section.
+///
+/// FEEDBACK is in the sum too, as `A / (1 - k·A)`: it sharpens the
+/// notches into resonances, which is what a fed-back phaser does.
+pub mod phase_curve {
+    use crate::params::console::phase as p;
+
+    /// One second-order allpass section's phase at `hz`, in radians,
+    /// for a corner at `corner` and the section's fixed Q.
+    ///
+    /// The analogue prototype's: `-2·atan2(ω/Q·ω0, ω0² − ω²)`, which
+    /// runs from 0 through −π at the corner to −2π well above it.
+    pub fn section_phase(hz: f32, corner: f32) -> f32 {
+        let w = hz.max(1.0);
+        let w0 = corner.max(1.0);
+        let num = w * w0 / p::STAGE_Q;
+        let den = w0 * w0 - w * w;
+        -2.0 * num.atan2(den)
+    }
+
+    /// The whole section's magnitude at `hz`, in dB: the allpass run
+    /// with its feedback, added to the dry.
+    pub fn response_db(stages: u32, corner: f32, feedback: f32, hz: f32) -> f32 {
+        if stages == 0 {
+            return 0.0;
+        }
+        let phi = section_phase(hz, corner) * stages as f32;
+        let (sin, cos) = phi.sin_cos();
+        // The run, as a complex number of unit magnitude.
+        let (ar, ai) = (cos, sin);
+        // Through the feedback: A / (1 − k·A).
+        let k = feedback.clamp(-0.95, 0.95);
+        let (dr, di) = (1.0 - k * ar, -k * ai);
+        let den = dr * dr + di * di;
+        let (hr, hi) = if den <= f32::EPSILON {
+            (ar, ai)
+        } else {
+            ((ar * dr + ai * di) / den, (ai * dr - ar * di) / den)
+        };
+        // Added back to the dry, and halved so an untouched signal reads
+        // as zero rather than as six dB of nothing.
+        let (sr, si) = (1.0 + hr, hi);
+        let mag = (sr * sr + si * si).sqrt() * 0.5;
+        if mag <= 1e-6 {
+            -120.0
+        } else {
+            20.0 * mag.log10()
+        }
+    }
+
+    /// How many notches a stage count puts in the spectrum.
+    ///
+    /// One per section, and this disagrees with the section's own prose,
+    /// which says "two of them at four sections, eight at sixteen" —
+    /// the classic pedal count, where a stage is a FIRST-order allpass
+    /// worth half a turn each and two are needed per notch.
+    ///
+    /// The kernel does not do that. `Disperser` runs SVF sections in
+    /// allpass mode, and an SVF is two-pole: every section is worth a
+    /// whole turn on its own, so every section is worth a notch. The
+    /// count here is measured off [`response_db`] rather than taken from
+    /// the prose, and a test counts the dips to keep the two together.
+    pub fn notches(stages: u32) -> u32 {
+        stages
+    }
+
+    /// Where the sweep has taken the corner, for a sweep value in −1..1.
+    pub fn corner_at(sweep: f32, depth: f32) -> f32 {
+        let reach = sweep.clamp(-1.0, 1.0) * depth.clamp(0.0, 1.0);
+        // The sweep walks the corner between the two ends, in octaves,
+        // because that is how the ear hears a phaser move.
+        let low = p::LOW_HZ.max(1.0).log2();
+        let high = p::HIGH_HZ.max(1.0).log2();
+        let mid = (low + high) * 0.5;
+        let half = (high - low) * 0.5;
+        2f32.powf(mid + reach * half)
+    }
+}
+
 /// SHINE's curve, green side.
 ///
 /// The exciter takes the top off, drives it hard enough to grow

@@ -725,6 +725,31 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
                 backend: "JACK",
             }));
         }
+    } else if which.contains("phase") {
+        // A long run swept deep with feedback, so the teeth are many and
+        // the ring has both its marks well apart.
+        use daw::devices::DeviceKind;
+        let _ = stage.song_mut().add_device(0, DeviceKind::Poly);
+        {
+            use daw::params::console::phase as p;
+            let song = stage.song_mut();
+            if let Some(device) = song
+                .section(0, daw::console::SectionKind::Phase)
+                .map(|device| device.id)
+                .and_then(|id| song.device_mut(id))
+            {
+                device.bypassed = false;
+                device.set(p::STAGES, 3.0);
+                device.set(p::RATE, 0.25);
+                device.set(p::DEPTH, 80.0);
+                device.set(p::FEEDBACK, 60.0);
+                device.set(p::OFFSET, 140.0);
+            }
+        }
+        let _ = stage.apply(StageIntent::Devices);
+        for _ in 0..14 {
+            let _ = stage.apply(StageIntent::Step(Step::Right));
+        }
     } else if which.contains("drift") {
         // The flanger, swept deep with feedback and full width, so the
         // reach is wide and the two sides stand apart on the lane.
