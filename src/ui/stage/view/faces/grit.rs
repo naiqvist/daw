@@ -11,15 +11,20 @@
 //! it is set to — so with JITTER up the staircase visibly stumbles,
 //! because the clock really is wobbling block to block.
 //!
-//! # The faces
+//! # The face
 //!
-//! Each of the four degradations carries a small face that minds it, and
-//! one big one on the plate minds the lot. They are cute on purpose and
-//! they are not decoration: a face is a reading you can take from the
+//! ONE face, on the converter, minding the lot. It is cute on purpose
+//! and it is not decoration: a face is a reading you can take from the
 //! corner of your eye, which is what you want from a section whose four
 //! controls all make things worse in different ways.
 //!
-//! `-_-` is asleep — that control is doing nothing at all. Then `._.`,
+//! It was one per control first. Four of them in a column read as a
+//! column of glyphs rather than as a face — the joke stops being a joke
+//! at the second one, and the row it sat in already had a bar and a
+//! figure saying the same thing. One face, on the picture, watching
+//! everything.
+//!
+//! `-_-` is asleep — nothing is being done to the sound. Then `._.`,
 //! `o_o`, `0_0` as it is leaned on, and `>_<` at the end of its range.
 //! While a value is still moving, the face is `O_O`: startled. That is
 //! not a timer — it is the gap between where the knob is and where the
@@ -255,7 +260,6 @@ pub(super) fn draw(face: &Face<'_>) {
         .map(span)
         .fold(0.0f32, f32::max)
         + 6.0;
-    let mood_w = span("O_O") + 6.0;
     let figure = span("48.0k") + 6.0;
     let hz_word = |hz: f32| {
         if hz >= 1000.0 {
@@ -264,7 +268,7 @@ pub(super) fn draw(face: &Face<'_>) {
             format!("{hz:.0}")
         }
     };
-    for (i, (rect, word, share, said, wears)) in [
+    for (rect, word, share, said, damage) in [
         (lay.rate, "RATE", rate_amount, hz_word(rate), true),
         (lay.bits, "BITS", bits_amount, format!("{bits:.0}"), true),
         (
@@ -287,18 +291,12 @@ pub(super) fn draw(face: &Face<'_>) {
             false,
         ),
         (lay.mix, "MIX", mix, format!("{:.0}", mix * 100.0), false),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        // POST and MIX wear no face: they are the remedies, not the
-        // damage, and a face on them would be saying the wrong thing.
+    ] {
+        // POST and MIX are the remedies rather than the damage, so
+        // their bars take the live ink and not the hot one.
         let bar = egui::Rect::from_min_max(
             egui::pos2(rect.left() + gutter, rect.center().y - 2.5),
-            egui::pos2(
-                rect.right() - figure - if wears { mood_w } else { 0.0 },
-                rect.center().y + 2.5,
-            ),
+            egui::pos2(rect.right() - figure, rect.center().y + 2.5),
         );
         if bar.is_positive() {
             painter.rect_filled(bar, 0.0, edge.gamma_multiply(0.35));
@@ -312,7 +310,7 @@ pub(super) fn draw(face: &Face<'_>) {
                         ),
                     ),
                     0.0,
-                    if wears {
+                    if damage {
                         tool::mix_ink(ink, alpha.jeopardy_latent.color, share)
                     } else {
                         alpha.live.color
@@ -326,19 +324,6 @@ pub(super) fn draw(face: &Face<'_>) {
             word,
             edge,
         );
-        if wears {
-            let seen = mood(eased[i], travel[i]);
-            words.text(
-                egui::pos2(rect.right() - figure - 3.0, rect.center().y),
-                egui::Align2::RIGHT_CENTER,
-                seen,
-                if seen == "-_-" {
-                    edge
-                } else {
-                    tool::mix_ink(ink, alpha.jeopardy_latent.color, eased[i])
-                },
-            );
-        }
         words.text(
             egui::pos2(rect.right() - 2.0, rect.center().y),
             egui::Align2::RIGHT_CENTER,
