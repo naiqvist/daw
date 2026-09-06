@@ -320,6 +320,147 @@ impl SectionKind {
     }
 }
 
+/// What a curve MAKES of a sine, measured rather than tabulated.
+///
+/// Two sections on the desk grow harmonics on purpose and both want the
+/// same reading: which rungs stand, and how much distortion in total.
+/// The measurement is the same either way — push a sine through the very
+/// function the core runs and read the answer off a bin at a time — so
+/// it lives once, here, and the curves hand themselves in.
+pub mod harmonic {
+    /// How many harmonics a ladder reports, the fundamental included.
+    pub const COUNT: usize = 8;
+    /// The floor a rung sits at when there is nothing in it.
+    pub const FLOOR_DB: f32 = -96.0;
+    /// Points in the probe sine. A power of two, and comfortably more
+    /// than four times the highest harmonic asked for.
+    const PROBE_N: usize = 256;
+
+    /// A curve's harmonics, in dB relative to its fundamental.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct Harmonics {
+        /// Index 0 is the fundamental and is always 0. Silence reads
+        /// [`FLOOR_DB`].
+        pub db: [f32; COUNT],
+        /// Total harmonic distortion, as a share of the fundamental.
+        pub thd: f32,
+    }
+
+    impl Harmonics {
+        /// A curve that is doing nothing.
+        pub fn none() -> Self {
+            let mut db = [FLOOR_DB; COUNT];
+            db[0] = 0.0;
+            Self { db, thd: 0.0 }
+        }
+    }
+
+    /// Measure `shape` at `amplitude`.
+    ///
+    /// An asymmetric curve has no odd symmetry to cancel its even terms,
+    /// so its even rungs stand; a symmetric one cancels them and the odd
+    /// rungs stand instead. That difference is what these ladders are
+    /// drawn to show, and it falls out of the arithmetic rather than
+    /// being asserted anywhere.
+    pub fn measure(shape: impl Fn(f32) -> f32, amplitude: f32) -> Harmonics {
+        if amplitude <= 0.0 {
+            return Harmonics::none();
+        }
+        let n = PROBE_N;
+        let shaped: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = core::f32::consts::TAU * i as f32 / n as f32;
+                shape(amplitude * t.sin())
+            })
+            .collect();
+        // One bin of a real DFT, by hand: only eight are wanted, so a
+        // whole transform would be the long way round.
+        let magnitude = |k: usize| -> f32 {
+            let (mut re, mut im) = (0.0f32, 0.0f32);
+            for (i, y) in shaped.iter().enumerate() {
+                let t = core::f32::consts::TAU * (k * i) as f32 / n as f32;
+                re += y * t.cos();
+                im += y * t.sin();
+            }
+            (re * re + im * im).sqrt() * 2.0 / n as f32
+        };
+        let fundamental = magnitude(1);
+        if fundamental <= f32::EPSILON {
+            return Harmonics::none();
+        }
+        let mut out = Harmonics::none();
+        let mut sum = 0.0;
+        for (k, slot) in out.db.iter_mut().enumerate().skip(1) {
+            let m = magnitude(k + 1);
+            sum += m * m;
+            let ratio = m / fundamental;
+            *slot = if ratio <= 0.0 {
+                FLOOR_DB
+            } else {
+                (20.0 * ratio.log10()).max(FLOOR_DB)
+            };
+        }
+        out.thd = sum.sqrt() / fundamental;
+        out
+    }
+}
+
+/// SHINE's curve, green side.
+///
+/// The exciter takes the top off, drives it hard enough to grow
+/// harmonics that were never there, and adds it back under the whole
+/// sound. The curve is the same asymmetric form the preamp's iron uses
+/// and for the same reason — an asymmetric curve makes EVEN harmonics,
+/// the octave above rather than the fifth, which is what makes an
+/// exciter read as sheen and not as distortion. Only the bias and the
+/// drive differ, and both are the section's own.
+pub mod shine_curve {
+    use crate::params::console::shine as p;
+
+    /// The exciter's transfer at `amount` (0..1), for `x` in −1..1.
+    /// Unit slope at zero, so the drive changes colour before level.
+    pub fn transfer(amount: f32, x: f32) -> f32 {
+        if amount <= 0.0 {
+            return x;
+        }
+        let k = 1.0 + p::DRIVE * amount;
+        let b = p::BIAS;
+        let tb = b.tanh();
+        let slope = k * (1.0 - tb * tb);
+        ((k * x + b).tanh() - tb) / slope
+    }
+
+    /// The same drive with the bias taken out: a SYMMETRIC curve.
+    ///
+    /// Not a thing the section can be set to — it is the comparison the
+    /// card is drawn against. A symmetric curve of the same strength
+    /// makes almost no even harmonics at all, so the exciter's evens are
+    /// visibly the bias's doing and not the drive's.
+    pub fn symmetric(amount: f32, x: f32) -> f32 {
+        if amount <= 0.0 {
+            return x;
+        }
+        let k = 1.0 + p::DRIVE * amount;
+        (k * x).tanh() / k.tanh()
+    }
+
+    /// What a symmetric curve of the same strength would make.
+    pub fn without_bias(amount: f32, amplitude: f32) -> super::harmonic::Harmonics {
+        if amount <= 0.0 {
+            return super::harmonic::Harmonics::none();
+        }
+        super::harmonic::measure(|x| symmetric(amount, x), amplitude)
+    }
+
+    /// What the exciter makes of a sine at `amount`.
+    pub fn harmonics(amount: f32, amplitude: f32) -> super::harmonic::Harmonics {
+        if amount <= 0.0 {
+            return super::harmonic::Harmonics::none();
+        }
+        super::harmonic::measure(|x| transfer(amount, x), amplitude)
+    }
+}
+
 /// PREAMP's two curves, here on the green side so the card can draw
 /// the transfer the core runs. `iron` is the drive, 0..1; `x` in −1..1.
 /// Unit slope at zero — the drive changes colour before level.
@@ -361,88 +502,37 @@ pub mod preamp_curve {
     }
 
     /// How many harmonics the ladder reports, the fundamental included.
-    pub const HARMONICS: usize = 8;
+    pub const HARMONICS: usize = super::harmonic::COUNT;
     /// The probe the ladder is measured with when the channel is silent,
     /// as a linear amplitude. A card that showed nothing at rest would
     /// be hiding the one thing the operator is choosing between.
     pub const REST_PROBE: f32 = 0.25;
-    /// Points in the probe sine. A power of two, and comfortably more
-    /// than four times the highest harmonic asked for, so the sum is
-    /// exact enough for a display in dB.
-    const PROBE_N: usize = 256;
+    /// The floor a rung sits at when there is nothing in it.
+    pub const FLOOR_DB: f32 = super::harmonic::FLOOR_DB;
 
     /// What the stage MAKES of a sine: the fundamental and the seven
     /// harmonics above it, in dB relative to the fundamental.
     ///
-    /// This is a measurement, not a table. A sine of `amplitude` goes
-    /// through the very [`transfer`] the core runs and the answer is
-    /// read off it a bin at a time, so the ladder a card draws cannot
-    /// disagree with the curve beside it or with the audio.
+    /// The measurement itself is [`super::harmonic::measure`], shared
+    /// with the exciter, which grows harmonics for the same reason from
+    /// a curve of the same shape. What is the preamp's own is WHICH
+    /// curve goes in: the transfer the core is running at this drive
+    /// and this stage.
     ///
     /// The asymmetric stage (IRON) has no odd symmetry to cancel its
     /// even terms, so the even rungs stand; the symmetric one (STEEL)
     /// cancels them and the odd rungs stand instead. That is the whole
     /// difference between the two stages, and it is visible here rather
     /// than asserted.
-    #[derive(Clone, Copy, Debug, PartialEq)]
-    pub struct Harmonics {
-        /// Each harmonic in dB relative to the fundamental. Index 0 is
-        /// the fundamental itself and is always 0. Silence reads
-        /// [`FLOOR_DB`].
-        pub db: [f32; HARMONICS],
-        /// Total harmonic distortion, as a share of the fundamental.
-        pub thd: f32,
-    }
-
-    /// The floor a rung sits at when there is nothing in it.
-    pub const FLOOR_DB: f32 = -96.0;
+    pub type Harmonics = super::harmonic::Harmonics;
 
     /// Measure the stage at `amplitude`. A stage at its floor is a wire
     /// and makes nothing.
     pub fn harmonics(iron: f32, steel: bool, amplitude: f32) -> Harmonics {
-        let mut db = [FLOOR_DB; HARMONICS];
-        db[0] = 0.0;
-        if iron <= 0.0 || amplitude <= 0.0 {
-            return Harmonics { db, thd: 0.0 };
+        if iron <= 0.0 {
+            return Harmonics::none();
         }
-        let n = PROBE_N;
-        let shaped: Vec<f32> = (0..n)
-            .map(|i| {
-                let t = core::f32::consts::TAU * i as f32 / n as f32;
-                transfer(iron, steel, amplitude * t.sin())
-            })
-            .collect();
-        // One bin of a real DFT, by hand: the sum against a sine and a
-        // cosine at that harmonic. Only eight bins are wanted, so a
-        // whole transform would be the long way round.
-        let magnitude = |k: usize| -> f32 {
-            let (mut re, mut im) = (0.0f32, 0.0f32);
-            for (i, y) in shaped.iter().enumerate() {
-                let t = core::f32::consts::TAU * (k * i) as f32 / n as f32;
-                re += y * t.cos();
-                im += y * t.sin();
-            }
-            (re * re + im * im).sqrt() * 2.0 / n as f32
-        };
-        let fundamental = magnitude(1);
-        if fundamental <= f32::EPSILON {
-            return Harmonics { db, thd: 0.0 };
-        }
-        let mut sum = 0.0;
-        for (k, slot) in db.iter_mut().enumerate().skip(1) {
-            let m = magnitude(k + 1);
-            sum += m * m;
-            let ratio = m / fundamental;
-            *slot = if ratio <= 0.0 {
-                FLOOR_DB
-            } else {
-                (20.0 * ratio.log10()).max(FLOOR_DB)
-            };
-        }
-        Harmonics {
-            db,
-            thd: sum.sqrt() / fundamental,
-        }
+        super::harmonic::measure(|x| transfer(iron, steel, x), amplitude)
     }
 }
 

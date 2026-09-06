@@ -725,6 +725,29 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
                 backend: "JACK",
             }));
         }
+    } else if which.contains("shine") {
+        // The exciter leaning on a high corner, so the even rungs stand
+        // clear of the odd ones and the split is plainly a split.
+        use daw::devices::DeviceKind;
+        let _ = stage.song_mut().add_device(0, DeviceKind::Poly);
+        {
+            use daw::params::console::shine as p;
+            let song = stage.song_mut();
+            if let Some(device) = song
+                .section(0, daw::console::SectionKind::Shine)
+                .map(|device| device.id)
+                .and_then(|id| song.device_mut(id))
+            {
+                device.bypassed = false;
+                device.set(p::AMOUNT, 70.0);
+                device.set(p::TUNE, 6_500.0);
+                device.set(p::MIX, 65.0);
+            }
+        }
+        let _ = stage.apply(StageIntent::Devices);
+        for _ in 0..12 {
+            let _ = stage.apply(StageIntent::Step(Step::Right));
+        }
     } else if which.contains("grit") {
         // A slow clock and a short word, so the staircase is plainly a
         // staircase, with jitter and hiss up enough to wake the faces.
