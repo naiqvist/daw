@@ -725,6 +725,32 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
                 backend: "JACK",
             }));
         }
+    } else if which.contains("grit") {
+        // A slow clock and a short word, so the staircase is plainly a
+        // staircase, with jitter and hiss up enough to wake the faces.
+        use daw::devices::DeviceKind;
+        let _ = stage.song_mut().add_device(0, DeviceKind::Poly);
+        {
+            use daw::params::console::grit as p;
+            let song = stage.song_mut();
+            if let Some(device) = song
+                .section(0, daw::console::SectionKind::Grit)
+                .map(|device| device.id)
+                .and_then(|id| song.device_mut(id))
+            {
+                device.bypassed = false;
+                device.set(p::RATE, 6_000.0);
+                device.set(p::BITS, 5.0);
+                device.set(p::JITTER, 45.0);
+                device.set(p::HISS, 20.0);
+                device.set(p::POST, 9_000.0);
+                device.set(p::MIX, 100.0);
+            }
+        }
+        let _ = stage.apply(StageIntent::Devices);
+        for _ in 0..11 {
+            let _ = stage.apply(StageIntent::Step(Step::Right));
+        }
     } else if which.contains("drive") {
         // The folder, driven hard, with the tilts leaning opposite ways
         // so the pair reads as a pair.
