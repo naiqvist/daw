@@ -725,6 +725,32 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
                 backend: "JACK",
             }));
         }
+    } else if which.contains("drive") {
+        // The folder, driven hard, with the tilts leaning opposite ways
+        // so the pair reads as a pair.
+        use daw::devices::DeviceKind;
+        let _ = stage.song_mut().add_device(0, DeviceKind::Poly);
+        {
+            use daw::params::console::drive as p;
+            let song = stage.song_mut();
+            if let Some(device) = song
+                .section(0, daw::console::SectionKind::Drive)
+                .map(|device| device.id)
+                .and_then(|id| song.device_mut(id))
+            {
+                device.bypassed = false;
+                device.set(p::CHARACTER, p::FOLD as f32);
+                device.set(p::DRIVE, 62.0);
+                device.set(p::TILT_PRE, 3.5);
+                device.set(p::TILT_POST, -2.0);
+                device.set(p::MIX, 80.0);
+                device.set(p::OUT, -3.0);
+            }
+        }
+        let _ = stage.apply(StageIntent::Devices);
+        for _ in 0..10 {
+            let _ = stage.apply(StageIntent::Step(Step::Right));
+        }
     } else if which.contains("pump") {
         // The cam cut deep and square, so the lobe profile is plain and
         // the follower is somewhere interesting on it.
