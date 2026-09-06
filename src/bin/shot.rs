@@ -725,6 +725,32 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
                 backend: "JACK",
             }));
         }
+    } else if which.contains("spectra") {
+        // The choir, mixed in, so the mode strip and the two voices
+        // are both saying something.
+        use daw::devices::DeviceKind;
+        let _ = stage.song_mut().add_device(0, DeviceKind::Poly);
+        {
+            use daw::params::console::spectra as p;
+            let song = stage.song_mut();
+            if let Some(device) = song
+                .section(0, daw::console::SectionKind::Spectra)
+                .map(|device| device.id)
+                .and_then(|id| song.device_mut(id))
+            {
+                device.bypassed = false;
+                device.set(p::MODE, p::MODE_CHOIR as f32);
+                device.set(p::BLUR, 30.0);
+                device.set(p::PITCH, -5.0);
+                device.set(p::VOICE_A, 3.0);
+                device.set(p::VOICE_B, 7.0);
+                device.set(p::MIX, 70.0);
+            }
+        }
+        let _ = stage.apply(StageIntent::Devices);
+        for _ in 0..17 {
+            let _ = stage.apply(StageIntent::Step(Step::Right));
+        }
     } else if which.contains("ring") {
         // A carrier above the note, so the difference tones fold below
         // the fundamental and the scatter is plainly inharmonic.

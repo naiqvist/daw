@@ -78,7 +78,7 @@ pub fn width_of(kind: SectionKind) -> f32 {
         SectionKind::Phase => 466.0,
         SectionKind::Smear => 452.0,
         SectionKind::Ring => 442.0,
-        SectionKind::Spectra => 264.0,
+        SectionKind::Spectra => 486.0,
         SectionKind::Echo => 252.0,
         SectionKind::Room => 228.0,
         SectionKind::Out => 176.0,

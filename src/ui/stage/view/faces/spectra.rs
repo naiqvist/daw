@@ -1,31 +1,56 @@
-//! SPECTRA's face: a standing rake of partials on the bin lattice.
+//! SPECTRA's face: the frame, the bins, and the three numbers that
+//! describe what is in them.
 //!
-//! A phase vocoder works on a linear bin axis, not an octave one, so
-//! this is the one card on the desk whose spectrum is drawn linearly —
-//! and it looks different from every other card for exactly that
-//! reason. The rake is where the section's own analysis says the sound
-//! is: its centre of mass, how wide that mass is spread, and how much
-//! the frame moved since the last one.
+//! This is the only section on the desk that is not analogue in its
+//! bones. It cuts the sound into frames, transforms them, changes them
+//! as numbers and puts them back — so the card is drawn as the machine
+//! it is, in cells and in fixed-width figures, on the bin axis rather
+//! than on the ear's.
 //!
-//! A frozen frame stops moving because the flux the engine measured
-//! goes to nothing, not because the card was told to stop. The two
-//! choir voices stand as ghost rakes at their own intervals, so a
-//! chord is visible as a chord.
+//! # What it does NOT draw
+//!
+//! It does not draw a spectrum. The section reports three descriptors of
+//! its analysed frame — the CENTROID, where the spectrum's mass sits;
+//! the SPREAD, how far it is scattered about that; and the FLUX, how
+//! fast it is changing — and it does not report the bins themselves.
+//!
+//! A card could take those three and paint a plausible bell across the
+//! axis, and it would look like a spectrum analyser and be a lie: it
+//! would show peaks that were never measured. So the field shows exactly
+//! what was measured and no more — a marked bin for the centroid, a lit
+//! run of bins for the spread either side of it, and the rest of the
+//! grid dark. What is dark is not silence. It is unmeasured, which is a
+//! different thing and worth being able to tell apart.
+//!
+//! # The frame block
+//!
+//! The rest is arithmetic the section cannot hide: the window, the hop,
+//! the overlap that falls out of the two, how many bins that makes, how
+//! much of the spectrum one bin covers, and the latency the transform
+//! costs — which the graph really does pay back.
 
 use super::*;
-use crate::console::SectionParams;
-use crate::params::console::spectra as p;
 use crate::ui::chrome;
-use crate::ui::nav_cursor;
 
-/// The teeth the rake is drawn with.
-const TEETH: usize = 26;
-/// The five things the section can be.
-const MODES: usize = 5;
+/// One control's row.
+/// @tune 12..26 px
+pub(super) const ROW_H: f32 = 18.0;
+const COLUMN_GAP: f32 = 8.0;
+/// The bin field's cells across and down.
+/// @tune 16..96
+const CELLS_ACROSS: usize = 48;
+/// @tune 3..16
+const CELLS_DOWN: usize = 7;
+/// The rate the frame's arithmetic is reported at.
+const DRAWN_AT: f32 = 48_000.0;
+/// The five modes, in the order the parameter numbers them.
+const MODES: [&str; 5] = ["FREEZE", "BLUR", "PITCH", "CHOIR", "ROBOT"];
 
-struct Lay {
-    field: egui::Rect,
+/// SPECTRA's seven controls.
+#[derive(Clone, Copy, Debug)]
+struct SpectraFace {
     mode: egui::Rect,
+    field: egui::Rect,
     freeze: egui::Rect,
     blur: egui::Rect,
     pitch: egui::Rect,
@@ -34,8 +59,9 @@ struct Lay {
     mix: egui::Rect,
 }
 
-impl Layout for Lay {
+impl Layout for SpectraFace {
     fn controls(&self) -> Vec<(u32, egui::Rect)> {
+        use crate::params::console::spectra as p;
         vec![
             (p::MODE, self.mode),
             (p::FREEZE, self.freeze),
@@ -48,280 +74,393 @@ impl Layout for Lay {
     }
 }
 
-fn lay(glass: egui::Rect, bay: Option<egui::Rect>, plinth: Option<egui::Rect>) -> Lay {
-    let inner = glass.shrink2(egui::vec2(5.0, 4.0));
-    let (w, h) = (inner.width(), inner.height());
-    let field =
-        egui::Rect::from_min_max(inner.min, egui::pos2(inner.right(), inner.top() + 0.46 * h));
-    let row = |top: f32, from: f32, to: f32| {
-        egui::Rect::from_min_max(
-            egui::pos2(inner.left() + w * from, top),
-            egui::pos2(inner.left() + w * to, top + 13.0),
+fn spectra_face(glass: egui::Rect) -> SpectraFace {
+    let x = egui::Rect::from_min_max(
+        egui::pos2(glass.left() + 5.0, glass.top() + 3.0),
+        egui::pos2(glass.right() - 20.0, glass.bottom() - 12.0),
+    );
+    let mode = egui::Rect::from_min_size(x.min, egui::vec2(x.width(), ROW_H));
+    let body = egui::Rect::from_min_max(egui::pos2(x.left(), mode.bottom() + 4.0), x.max);
+    // Six knobs need six rows and the field needs height, so they take a
+    // column each. The frame's arithmetic does not get a panel of its
+    // own — it is fixed, it never moves, and it reads better as one line
+    // of figures along the field's foot than as a table nobody consults.
+    let right_w = (body.width() * 0.42).clamp(150.0, 230.0);
+    let field = egui::Rect::from_min_max(
+        body.min,
+        egui::pos2(body.right() - right_w - COLUMN_GAP, body.bottom()),
+    );
+    let right = egui::Rect::from_min_max(egui::pos2(body.right() - right_w, body.top()), body.max);
+    let rows_h = ROW_H * 6.0 + 5.0;
+    let top = (right.bottom() - rows_h).max(right.top());
+    let row = |i: usize| {
+        egui::Rect::from_min_size(
+            egui::pos2(right.left(), top + i as f32 * (ROW_H + 1.0)),
+            egui::vec2(right.width(), ROW_H),
         )
     };
-    let first = field.bottom() + 7.0;
-    Lay {
-        // PITCH is the rake itself: shifting it walks the whole comb.
-        pitch: field,
+    SpectraFace {
+        mode,
         field,
-        mode: bay.unwrap_or_else(|| {
-            egui::Rect::from_min_max(
-                egui::pos2(inner.right() - 18.0, inner.top()),
-                egui::pos2(inner.right(), inner.top() + 28.0),
-            )
-        }),
-        freeze: row(first, 0.0, 0.20),
-        blur: row(first, 0.26, 1.0),
-        voice_a: row(first + 17.0, 0.0, 0.46),
-        voice_b: row(first + 17.0, 0.54, 1.0),
-        mix: plinth.unwrap_or_else(|| row(first + 34.0, 0.0, 1.0)),
+        freeze: row(0),
+        blur: row(1),
+        pitch: row(2),
+        voice_a: row(3),
+        voice_b: row(4),
+        mix: row(5),
     }
 }
 
-/// A rake standing at `centre` with `spread`, shifted by `semitones`.
-fn rake(field: egui::Rect, centre: f32, spread: f32, semitones: f32) -> (f32, f32) {
-    // A semitone is a ratio, and the axis is linear in bins, so a shift
-    // MULTIPLIES the centre — which is why a pitched-up rake spreads
-    // out as it climbs, exactly as the vocoder's own bins do.
-    let shifted = (centre * 2f32.powf(semitones / 12.0)).clamp(0.0, 1.0);
-    let width = (spread * 2f32.powf(semitones / 12.0)).clamp(0.01, 1.0);
-    (egui::lerp(field.x_range(), shifted), field.width() * width)
+/// The frame's arithmetic, which is fixed by the transform and not by
+/// any knob: bins, what one bin covers in hertz, the overlap, and the
+/// latency the graph pays back.
+fn frame_facts(rate: f32) -> (usize, f32, usize, f32) {
+    use crate::params::console::spectra as p;
+    let bins = p::SIZE / 2 + 1;
+    let per_bin = rate / p::SIZE as f32;
+    let overlap = p::SIZE / p::HOP.max(1);
+    let latency_ms = p::SIZE as f32 / rate * 1e3;
+    (bins, per_bin, overlap, latency_ms)
+}
+
+/// Which cells of the field a centroid and spread light.
+///
+/// Returns the cell the centroid falls in and the run either side of it
+/// the spread covers, both on the same 0..1 bin axis the section
+/// measures on. Nothing outside that run is claimed to be anything.
+fn lit_cells(centroid: f32, spread: f32, across: usize) -> (usize, usize, usize) {
+    let across = across.max(1);
+    let last = across - 1;
+    let at = ((centroid.clamp(0.0, 1.0) * last as f32).round() as usize).min(last);
+    let reach = (spread.clamp(0.0, 1.0) * last as f32).round() as usize;
+    (at, at.saturating_sub(reach), (at + reach).min(last))
 }
 
 pub(super) fn draw(face: &Face<'_>) {
-    let lay = lay(face.glass, face.bay(), face.plinth());
-    let (ink, edge) = (face.ink(), face.edge());
-    let said = face.said;
-    let field = lay.field;
+    use crate::params::console::spectra as p;
+    let painter = face.painter;
+    let alpha = face.alpha;
+    let edge = alpha.edge.color;
+    let ink = alpha.ink.color;
+    let font = egui::FontId::monospace(design::px(design::type_scale::MICRO));
+    let lay = spectra_face(face.glass);
+    let mode = face.value(p::MODE).round().clamp(0.0, 4.0) as usize;
+    let freeze = face.value(p::FREEZE) >= 0.5;
+    let blur = face.value(p::BLUR) / 100.0;
+    let pitch = face.value(p::PITCH);
+    let voice_a = face.value(p::VOICE_A);
+    let voice_b = face.value(p::VOICE_B);
+    let mix = face.value(p::MIX) / 100.0;
+    let wire = mix <= 0.0;
+    // The three descriptors, and the frame's own loudest bin.
+    let centroid = face.said.bands[0];
+    let spread = face.said.bands[1];
+    let flux = face.said.bands[2];
+    let peak_db = face.said.reduction_db;
+    let measured = centroid > 0.0 || spread > 0.0;
+
     let mut shapes = Vec::new();
 
-    let centroid = face.anim("centroid", said.bands[0].clamp(0.0, 1.0), 0.09);
-    let spread = face.anim("spread", said.bands[1].clamp(0.0, 1.0), 0.11);
-    let flux = face.anim("flux", said.bands[2].clamp(0.0, 1.0), 0.08);
-    let height = tool::norm(said.reduction_db, -60.0, 0.0);
-    let frozen = face.value(p::FREEZE) >= 0.5;
-    let mode = face.value(p::MODE).round().clamp(0.0, 4.0) as usize;
-    let blur = face.place(p::BLUR);
+    // ---- The mode strip. ---------------------------------------------
+    chrome::panel_frame_variant(&mut shapes, lay.mode, Weight::Hair, edge, 2);
+    let mode_w = lay.mode.width() / MODES.len() as f32;
+    let mode_cell = |i: usize| {
+        egui::Rect::from_min_size(
+            egui::pos2(lay.mode.left() + i as f32 * mode_w, lay.mode.top()),
+            egui::vec2(mode_w, lay.mode.height()),
+        )
+    };
+    chrome::brackets(
+        &mut shapes,
+        mode_cell(mode).shrink(2.0),
+        4.0,
+        Weight::Hair,
+        ink,
+    );
 
-    // THE BIN LATTICE: linear, and ruled as such, because that is what
-    // the section actually works on.
-    for i in 0..=8 {
-        let x = egui::lerp(field.x_range(), i as f32 / 8.0);
-        chrome::trace(
-            &mut shapes,
-            &[
-                egui::pos2(x, field.bottom() - if i % 2 == 0 { 5.0 } else { 3.0 }),
-                egui::pos2(x, field.bottom()),
-            ],
-            Weight::Hair,
-            tool::fade(edge, 0.6),
-        );
+    // ---- The bin field. ----------------------------------------------
+    chrome::panel_variant(
+        &mut shapes,
+        lay.field,
+        Some(alpha.ground.color),
+        alpha.well.color,
+        Some((Weight::Hair, edge.gamma_multiply(0.62))),
+        0,
+    );
+    let grid = egui::Rect::from_min_max(
+        egui::pos2(lay.field.left() + 8.0, lay.field.top() + font.size + 6.0),
+        egui::pos2(
+            lay.field.right() - 8.0,
+            lay.field.bottom() - font.size - 6.0,
+        ),
+    );
+    let across = crate::tune!(CELLS_ACROSS).max(1);
+    let down = crate::tune!(CELLS_DOWN).max(1);
+    let cw = grid.width() / across as f32;
+    let ch = grid.height() / down as f32;
+    let (at, from, to) = lit_cells(centroid, spread, across);
+    for col in 0..across {
+        for row in 0..down {
+            let cell = egui::Rect::from_min_size(
+                egui::pos2(grid.left() + col as f32 * cw, grid.top() + row as f32 * ch),
+                egui::vec2(cw - 1.0, ch - 1.0),
+            );
+            // Dark is UNMEASURED, not silent. Only the run the section
+            // actually reported is lit, and the centre column of it is
+            // the centroid itself.
+            let lit = measured && !wire && col >= from && col <= to;
+            let ink_here = if !lit {
+                edge.gamma_multiply(0.30)
+            } else if col == at {
+                alpha.live.color
+            } else {
+                // Away from the centroid the run fades, which is the
+                // spread being a deviation and not a boundary.
+                let reach = (to - from).max(1) as f32 * 0.5;
+                let away = (col as f32 - at as f32).abs() / reach;
+                tool::mix_ink(alpha.live.color, alpha.live_dim.color, away.clamp(0.0, 1.0))
+                    .gamma_multiply(1.0 - 0.45 * away.clamp(0.0, 1.0))
+            };
+            shapes.push(egui::Shape::rect_filled(cell, 0.0, ink_here));
+        }
+    }
+    // The flux, as a bar under the grid: how fast the frame is changing.
+    let flux_bar = egui::Rect::from_min_max(
+        egui::pos2(grid.left(), grid.bottom() + 2.0),
+        egui::pos2(grid.right(), grid.bottom() + 4.0),
+    );
+    if flux_bar.is_positive() {
+        shapes.push(egui::Shape::rect_filled(
+            flux_bar,
+            0.0,
+            edge.gamma_multiply(0.35),
+        ));
+        if flux > 0.0 && !wire {
+            // Quantised to the same cells as the grid: this card counts
+            // rather than measures.
+            let cells = (flux.clamp(0.0, 1.0) * across as f32).round().max(1.0);
+            shapes.push(egui::Shape::rect_filled(
+                egui::Rect::from_min_max(
+                    flux_bar.min,
+                    egui::pos2(flux_bar.left() + cells * cw, flux_bar.bottom()),
+                ),
+                0.0,
+                alpha.jeopardy_latent.color,
+            ));
+        }
     }
 
-    // THE TWO CHOIR VOICES, behind: ghost rakes at their own intervals,
-    // drawn only when the section is actually a choir.
-    if mode == 3 {
-        for (param, tag) in [(p::VOICE_A, "va"), (p::VOICE_B, "vb")] {
-            let (at, wide) = rake(field, centroid, spread, face.value(param));
-            for i in 0..TEETH {
-                let t = (i as f32 + 0.5) / TEETH as f32;
-                let x = at - wide * 0.5 + wide * t;
-                if x < field.left() || x > field.right() {
-                    continue;
-                }
-                let mass = (t * core::f32::consts::PI).sin();
-                chrome::trace(
-                    &mut shapes,
-                    &[
-                        egui::pos2(x, field.bottom()),
-                        egui::pos2(x, field.bottom() - field.height() * 0.45 * mass * height),
-                    ],
-                    Weight::Hair,
-                    tool::fade(tool::MID_INK, 0.26),
+    painter.extend(shapes);
+
+    // ---- The words. --------------------------------------------------
+    let mut words = tool::Ledger::new(painter, font.clone(), "SPECTRA");
+    let span = |text: &str| {
+        painter
+            .layout_no_wrap(text.to_owned(), font.clone(), ink)
+            .rect
+            .width()
+    };
+    let (_bins, per_bin, overlap, latency_ms) = frame_facts(DRAWN_AT);
+    for (i, word) in MODES.into_iter().enumerate() {
+        words.text(
+            mode_cell(i).center(),
+            egui::Align2::CENTER_CENTER,
+            word,
+            if i == mode { ink } else { edge },
+        );
+    }
+    words.text(
+        egui::pos2(lay.field.left() + 8.0, lay.field.top() + 2.0),
+        egui::Align2::LEFT_TOP,
+        format!("BINS DC-{:.0}k", DRAWN_AT / 2000.0),
+        edge,
+    );
+    // What the field IS, said plainly, because it is not a spectrum.
+    words.text(
+        egui::pos2(lay.field.right() - 8.0, lay.field.top() + 2.0),
+        egui::Align2::RIGHT_TOP,
+        if wire {
+            "WIRE".to_owned()
+        } else if measured {
+            format!(
+                "C{:03} S{:03}",
+                (centroid * 999.0) as u32,
+                (spread * 999.0) as u32
+            )
+        } else {
+            "NO FRAME".to_owned()
+        },
+        if wire || !measured {
+            edge
+        } else {
+            alpha.live.color
+        },
+    );
+    // The frame's arithmetic, on one line along the foot: fixed by the
+    // transform, none of it a knob, and none of it worth a table.
+    words.text(
+        egui::pos2(grid.left(), lay.field.bottom() - 2.0),
+        egui::Align2::LEFT_BOTTOM,
+        format!(
+            "{}/{} {overlap}x {per_bin:.0}Hz {latency_ms:.0}ms",
+            p::SIZE,
+            p::HOP
+        ),
+        edge,
+    );
+    // The knobs. The one the mode actually uses is the bright one; the
+    // rest are still there and still say what they are set to, because
+    // changing mode should not make a number vanish.
+    let gutter = ["FREEZE", "BLUR", "PITCH", "VOICE A", "VOICE B", "MIX"]
+        .into_iter()
+        .map(span)
+        .fold(0.0f32, f32::max)
+        + 6.0;
+    let figure = span("-12.0") + 6.0;
+    for (rect, word, share, said, used) in [
+        (
+            lay.freeze,
+            "FREEZE",
+            if freeze { 1.0 } else { 0.0 },
+            if freeze { "HELD" } else { "OFF" }.to_owned(),
+            mode == p::MODE_FREEZE as usize,
+        ),
+        (
+            lay.blur,
+            "BLUR",
+            blur,
+            format!("{:.0}", blur * 100.0),
+            mode == p::MODE_BLUR as usize,
+        ),
+        (
+            lay.pitch,
+            "PITCH",
+            (pitch + 24.0) / 48.0,
+            format!("{pitch:+.0}"),
+            mode == p::MODE_PITCH as usize,
+        ),
+        (
+            lay.voice_a,
+            "VOICE A",
+            (voice_a + 12.0) / 24.0,
+            format!("{voice_a:+.0}"),
+            mode == p::MODE_CHOIR as usize,
+        ),
+        (
+            lay.voice_b,
+            "VOICE B",
+            (voice_b + 12.0) / 24.0,
+            format!("{voice_b:+.0}"),
+            mode == p::MODE_CHOIR as usize,
+        ),
+        (lay.mix, "MIX", mix, format!("{:.0}", mix * 100.0), true),
+    ] {
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + gutter, rect.center().y - 2.5),
+            egui::pos2(rect.right() - figure, rect.center().y + 2.5),
+        );
+        if bar.is_positive() {
+            painter.rect_filled(bar, 0.0, edge.gamma_multiply(0.3));
+            if share > 0.0 {
+                // Quantised into cells, like everything else here.
+                let steps = 24.0;
+                let lit = (share.clamp(0.0, 1.0) * steps).round().max(1.0);
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        bar.min,
+                        egui::pos2(bar.left() + lit / steps * bar.width(), bar.bottom()),
+                    ),
+                    0.0,
+                    if used { alpha.live.color } else { edge },
                 );
             }
-            let _ = tag;
         }
-    }
-
-    // THE RAKE: where the analysis says the sound is, how wide it is
-    // spread, and how much it moved. A frozen frame stops shimmering
-    // because the MEASURED flux went to nothing.
-    let (at, wide) = rake(field, centroid, spread, face.value(p::PITCH));
-    for i in 0..TEETH {
-        let t = (i as f32 + 0.5) / TEETH as f32;
-        let x = at - wide * 0.5 + wide * t;
-        if x < field.left() || x > field.right() {
-            continue;
-        }
-        let mass = (t * core::f32::consts::PI).sin();
-        // Blur smears the teeth into each other; flux is how alive the
-        // frame is, and it lights the tips.
-        let tooth = field.height() * (0.15 + 0.75 * mass * height) * (1.0 - 0.35 * blur);
-        chrome::trace(
-            &mut shapes,
-            &[
-                egui::pos2(x, field.bottom()),
-                egui::pos2(x, field.bottom() - tooth),
-            ],
-            if flux > 0.25 {
-                Weight::Heavy
-            } else {
-                Weight::Hair
-            },
-            tool::mix_ink(tool::fade(ink, 0.55), face.live(), flux),
+        words.text(
+            egui::pos2(rect.left() + 2.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            word,
+            if used { ink } else { edge },
+        );
+        words.text(
+            egui::pos2(rect.right() - 2.0, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            said,
+            if used { ink } else { edge },
         );
     }
-    // The centre of mass itself: one post, with the spread bracketed
-    // either side of it.
-    chrome::trace(
-        &mut shapes,
-        &[egui::pos2(at, field.top()), egui::pos2(at, field.bottom())],
-        Weight::Heavy,
-        tool::mix_ink(face.live(), face.focus(), face.lit(p::PITCH)),
-    );
-    for side in [-1.0f32, 1.0] {
-        chrome::trace(
-            &mut shapes,
-            &[
-                egui::pos2(at + side * wide * 0.5, field.top() + 3.0),
-                egui::pos2(at + side * wide * 0.5, field.top() + 9.0),
-            ],
-            Weight::Hair,
-            tool::fade(edge, 1.1),
-        );
-    }
-    tool::halo(&mut shapes, lay.pitch, face.lit(p::PITCH), face.focus());
+    words.finish();
 
-    // MODE: five detents in the bay.
-    let slot = lay.mode;
-    for i in 0..MODES {
-        let y = egui::lerp(
-            (slot.top() + 4.0)..=(slot.bottom() - 4.0),
-            i as f32 / (MODES - 1) as f32,
-        );
-        let here = i == mode;
-        chrome::trace(
-            &mut shapes,
-            &[
-                egui::pos2(slot.left() + 2.0, y),
-                egui::pos2(slot.right() - if here { 1.0 } else { 4.0 }, y),
-            ],
-            if here { Weight::Heavy } else { Weight::Hair },
-            if here { ink } else { tool::fade(edge, 0.7) },
-        );
-    }
-    tool::halo(&mut shapes, slot, face.lit(p::MODE), face.focus());
-
-    // FREEZE: a latch that is closed or open, and when it is closed the
-    // rake above has already stopped moving of its own accord.
-    let latch = lay.freeze;
-    chrome::octagon(
-        &mut shapes,
-        latch.shrink(2.0),
-        2.0,
-        Some(if frozen { face.live() } else { face.ground() }),
-        Some((Weight::Hair, if frozen { ink } else { edge })),
-    );
-    tool::halo(&mut shapes, latch, face.lit(p::FREEZE), face.focus());
-
-    // BLUR, the two voices, and MIX: four rails at the foot, the voices
-    // bipolar because an interval goes either way.
-    tool::slider(
-        &mut shapes,
-        lay.blur.shrink2(egui::vec2(4.0, 4.0)),
-        blur,
-        9,
-        tool::mix_ink(ink, face.focus(), face.lit(p::BLUR)),
-        tool::fade(edge, 0.6),
-        6.0,
-    );
-    tool::halo(&mut shapes, lay.blur, face.lit(p::BLUR), face.focus());
-    for (rect, param) in [(lay.voice_a, p::VOICE_A), (lay.voice_b, p::VOICE_B)] {
-        tool::swing_rail(
-            &mut shapes,
-            rect.shrink2(egui::vec2(4.0, 4.0)),
-            face.swing(param),
-            13,
-            tool::mix_ink(tool::MID_INK, face.focus(), face.lit(param)),
-            tool::fade(edge, 0.55),
-        );
-        tool::halo(&mut shapes, rect, face.lit(param), face.focus());
-    }
-    tool::slider(
-        &mut shapes,
-        lay.mix.shrink2(egui::vec2(4.0, 4.0)),
-        face.place(p::MIX),
-        9,
-        tool::mix_ink(ink, face.focus(), face.lit(p::MIX)),
-        tool::fade(edge, 0.6),
-        6.0,
-    );
-    tool::halo(&mut shapes, lay.mix, face.lit(p::MIX), face.focus());
-
-    face.painter.extend(shapes);
-
-    // The mark sweeps with the centre of mass: standing on this card,
-    // the cursor is the spectrum's own centroid.
-    face.mark_signed(&lay, nav_cursor::Signature::Sweep(centroid * 2.0 - 1.0));
+    face.mark(&lay);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::console::SectionKind;
 
-    fn laid() -> (egui::Rect, Lay) {
-        let piece = egui::Rect::from_min_size(
-            egui::pos2(20.0, 30.0),
-            egui::vec2(strip::width_of(SectionKind::Spectra), 250.0),
-        );
-        let glass = strip::recess_of(piece, SectionKind::Spectra).shrink(3.0);
-        (
-            piece,
-            lay(
-                glass,
-                strip::bay_rect(piece, SectionKind::Spectra),
-                strip::plinth_rect(piece, SectionKind::Spectra),
-            ),
-        )
+    fn glass() -> egui::Rect {
+        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(480.0, 210.0))
     }
 
     #[test]
-    fn every_spectra_parameter_has_one_instrument() {
-        let (piece, lay) = laid();
-        for def in SectionKind::Spectra.table() {
-            let rect = lay
-                .control(def.id as usize)
-                .unwrap_or_else(|| panic!("{} has no instrument", def.name));
-            assert!(rect.is_positive(), "{} has no room", def.name);
-            assert!(
-                piece.expand(strip::TONGUE).contains_rect(rect),
-                "{} left the piece",
-                def.name
-            );
+    fn every_spectra_control_has_its_own_place() {
+        let face = spectra_face(glass());
+        let controls = face.controls();
+        assert_eq!(controls.len(), 7);
+        for (index, (id, rect)) in controls.iter().enumerate() {
+            assert!(glass().contains_rect(*rect), "control {id} left the glass");
+            assert!(rect.is_positive(), "control {id} lost its place");
+            for (other, other_rect) in &controls[index + 1..] {
+                assert!(!rect.intersects(*other_rect), "{id} and {other} overlap");
+            }
         }
-        assert_eq!(lay.controls().len(), 7);
-        let _ = SectionParams::of(SectionKind::Spectra);
+        assert!(!face.field.intersects(face.mix));
     }
 
-    /// A shift is a RATIO on a linear bin axis, so pitching up walks
-    /// the rake right and widens it — which is what the vocoder does.
+    /// The frame's arithmetic is arithmetic, not a table of numbers
+    /// somebody typed: the overlap falls out of the window and the hop,
+    /// the bin count out of the window, and the latency out of the
+    /// window and the rate.
     #[test]
-    fn a_pitch_shift_multiplies_the_rake_rather_than_sliding_it() {
-        let (_, lay) = laid();
-        let (at, wide) = rake(lay.field, 0.25, 0.10, 0.0);
-        let (up, wider) = rake(lay.field, 0.25, 0.10, 12.0);
-        assert!(up > at + 10.0, "an octave up did not move the rake");
-        assert!(wider > wide, "an octave up did not widen it");
-        let (down, narrower) = rake(lay.field, 0.25, 0.10, -12.0);
-        assert!(down < at, "an octave down did not move the rake");
-        assert!(narrower < wide);
-        // And it never leaves the field, however far it is pushed.
-        for shift in [-24.0f32, 24.0] {
-            let (x, w) = rake(lay.field, 0.9, 0.5, shift);
-            assert!(x >= lay.field.left() - 0.01 && x <= lay.field.right() + 0.01);
-            assert!(w > 0.0 && w <= lay.field.width() + 0.01);
+    fn the_frame_block_is_computed_from_the_transform() {
+        use crate::params::console::spectra as p;
+        let (bins, per_bin, overlap, latency) = frame_facts(48_000.0);
+        assert_eq!(bins, p::SIZE / 2 + 1);
+        assert_eq!(overlap, p::SIZE / p::HOP);
+        assert!((per_bin - 48_000.0 / p::SIZE as f32).abs() < 1e-3);
+        assert!((latency - p::SIZE as f32 / 48.0).abs() < 1e-3);
+        // At twice the rate a bin is twice as wide and the latency half.
+        let (_, wide, _, quick) = frame_facts(96_000.0);
+        assert!((wide - per_bin * 2.0).abs() < 1e-3);
+        assert!((quick - latency * 0.5).abs() < 1e-3);
+    }
+
+    /// The field lights only what was measured. A card that painted a
+    /// bell across the axis from these two numbers would be showing
+    /// peaks nobody reported, so the run is exactly the spread either
+    /// side of the centroid and no wider.
+    #[test]
+    fn the_field_lights_only_the_run_that_was_measured() {
+        let across = 48;
+        // A lone partial: spread near zero, so one cell or thereabouts.
+        let (at, from, to) = lit_cells(0.5, 0.0, across);
+        assert_eq!((from, to), (at, at), "a spreadless frame lit a range");
+        // Broadband: a wide run about where the mass is.
+        let (at, from, to) = lit_cells(0.5, 0.20, across);
+        assert!(from < at && to > at);
+        assert_eq!(at - from, to - at, "the run was not centred");
+        // Against an edge it is NOT centred, and should not be: there
+        // are no bins below DC to light, so the run stops. Drawing the
+        // missing half anyway would be inventing spectrum again.
+        let (at, from, to) = lit_cells(0.05, 0.30, across);
+        assert_eq!(from, 0, "the run ran past DC");
+        assert!(to - at > at - from, "the run did not stop at the edge");
+        // Silence reports exactly zero and lights the first cell only.
+        let (at, from, to) = lit_cells(0.0, 0.0, across);
+        assert_eq!((at, from, to), (0, 0, 0));
+        // Nothing ever runs off the grid, at any reading.
+        for (c, s) in [(0.0f32, 1.0f32), (1.0, 1.0), (0.9, 0.5), (1.5, 2.0)] {
+            let (at, from, to) = lit_cells(c, s, across);
+            assert!(at < across && from <= at && to < across);
         }
     }
 }
