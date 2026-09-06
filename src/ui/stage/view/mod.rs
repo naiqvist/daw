@@ -12,12 +12,10 @@
 //! are the shared widgets, lifted through the palette and pumped here.
 
 mod band;
-mod bento;
 mod browser;
 mod callouts;
 mod chassis;
 mod desk;
-mod dock;
 mod faces;
 mod heads;
 mod help;
@@ -357,54 +355,19 @@ impl Stage {
         self.draw_status(painter, layout.status);
         // One detail region, and the band and the sequencer are two
         // things to put in it. The band wins while it is showing.
-        // Three shapes, one sequence. The RAIL takes the whole tray and
-        // the sequencer gives it up. The DOCK does not: it is small
-        // enough to stand at the FOOT of the sequencer, so the clip you
-        // are editing and the path it goes through are both on screen —
-        // which is most of the reason to have a minified chain at all.
-        // The BENTO is neither; it opens over the lot.
-        let anchor = match (self.chain.is_some(), self.band_view()) {
-            (true, crate::ui::stage::BandView::Rail) => {
-                let phase = Phase::of(
-                    self.transport.motion().is_rolling(),
-                    self.transport.beat_phase(),
-                );
-                self.draw_chain(ui.painter(), layout.tray, phase);
-                None
-            }
-            (true, _) => {
-                let dock = dock::height(layout.tray, self.dock_len());
-                let above = egui::Rect::from_min_max(
-                    layout.tray.min,
-                    egui::pos2(layout.tray.max.x, layout.tray.max.y - dock),
-                );
-                let anchor = self.draw_tray(ui, above);
-                self.draw_dock(
-                    ui.painter(),
-                    egui::Rect::from_min_max(
-                        egui::pos2(layout.tray.min.x, above.max.y),
-                        layout.tray.max,
-                    ),
-                );
-                anchor
-            }
-            (false, _) => self.draw_tray(ui, layout.tray),
+        let anchor = if self.chain.is_some() {
+            let phase = Phase::of(
+                self.transport.motion().is_rolling(),
+                self.transport.beat_phase(),
+            );
+            self.draw_chain(ui.painter(), layout.tray, phase);
+            None
+        } else {
+            self.draw_tray(ui, layout.tray)
         };
         // Over everything in the field: a callout is about one thing, and
         // a callout drawn under anything is a callout pointing through it.
         self.draw_callouts(ui.painter(), whole, anchor);
-        // The bento covers the musical surface rather than sitting in
-        // it, so it goes over everything the surface draws — and under
-        // the machine room, which is not part of the surface at all.
-        match self.band_view() {
-            crate::ui::stage::BandView::Scroll => {
-                self.draw_bento(ui.painter(), whole, bento::Flow::Row)
-            }
-            crate::ui::stage::BandView::Bento => {
-                self.draw_bento(ui.painter(), whole, bento::Flow::Grid)
-            }
-            _ => {}
-        }
         // Last of all, because the machine room is not part of the musical
         // surface: it stands in front of the whole of it.
         self.draw_room(ui.painter(), whole);

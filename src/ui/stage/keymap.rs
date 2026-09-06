@@ -137,8 +137,6 @@ pub enum StageIntent {
     /// Show or hide the chain band: the addressed track's devices, and
     /// every parameter each one has.
     Devices,
-    /// Cycle how the chain is presented: rail, dock, bento.
-    BandView,
     /// Move the parameter under the cursor. `coarse` is the tenth-of-range
     /// press, for crossing a span rather than settling in it.
     Param {
@@ -402,7 +400,6 @@ impl StageIntent {
             Self::Mute => "mute",
             Self::Solo => "solo",
             Self::Devices => "devices",
-            Self::BandView => "band view",
             Self::Param {
                 up: true,
                 coarse: false,
@@ -726,11 +723,6 @@ const BINDINGS: &[Binding] = &[
     Binding::command(ScopeContext::Nested, Key::D, StageIntent::Devices),
     Binding::command(ScopeContext::Mixer, Key::D, StageIntent::Devices),
     Binding::command(ScopeContext::Chain, Key::D, StageIntent::Devices),
-    // The chain's PRESENTATION, beside the key that opens it: V shows
-    // the band, Shift+V changes what shape it is shown in.
-    Binding::shift(ScopeContext::Root, Key::V, StageIntent::BandView),
-    Binding::shift(ScopeContext::Nested, Key::V, StageIntent::BandView),
-    Binding::shift(ScopeContext::Chain, Key::V, StageIntent::BandView),
     // Inside the band: bare arrows walk it — across the devices, down the
     // parameters — and a shifted arrow moves the value under the cursor,
     // the same gesture the mixer's pan already answers to.
@@ -1494,7 +1486,7 @@ fn family(intent: StageIntent) -> &'static str {
         | StageIntent::Pan { .. }
         | StageIntent::Mute
         | StageIntent::Solo => "mixer",
-        StageIntent::Devices | StageIntent::BandView | StageIntent::Param { .. } => "devices",
+        StageIntent::Devices | StageIntent::Param { .. } => "devices",
         StageIntent::Undo | StageIntent::Redo | StageIntent::Save => "document",
         StageIntent::Rename | StageIntent::DeleteTrack => "track",
         StageIntent::Nudge

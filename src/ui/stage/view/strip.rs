@@ -1120,7 +1120,7 @@ impl Stage {
     /// not the engine — which is what keeps a card honest: it can only
     /// draw what has already been measured or already been set.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn draw_figure(
+    fn draw_figure(
         &self,
         painter: &egui::Painter,
         piece: Piece,
