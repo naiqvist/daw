@@ -725,6 +725,33 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
                 backend: "JACK",
             }));
         }
+    } else if which.contains("echo") {
+        // Synced eighths with ping-pong and a dark loop, so the rings
+        // alternate halves and go dull as they go out.
+        use daw::devices::DeviceKind;
+        let _ = stage.song_mut().add_device(0, DeviceKind::Poly);
+        {
+            use daw::params::console::echo as p;
+            let song = stage.song_mut();
+            if let Some(device) = song
+                .section(0, daw::console::SectionKind::Echo)
+                .map(|device| device.id)
+                .and_then(|id| song.device_mut(id))
+            {
+                device.bypassed = false;
+                device.set(p::SYNC, 2.0);
+                device.set(p::TIME, 375.0);
+                device.set(p::FEEDBACK, 62.0);
+                device.set(p::TONE, 2_200.0);
+                device.set(p::WOW, 25.0);
+                device.set(p::PINGPONG, 1.0);
+                device.set(p::MIX, 45.0);
+            }
+        }
+        let _ = stage.apply(StageIntent::Devices);
+        for _ in 0..18 {
+            let _ = stage.apply(StageIntent::Step(Step::Right));
+        }
     } else if which.contains("spectra") {
         // The choir, mixed in, so the mode strip and the two voices
         // are both saying something.

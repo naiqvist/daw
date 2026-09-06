@@ -79,7 +79,7 @@ pub fn width_of(kind: SectionKind) -> f32 {
         SectionKind::Smear => 452.0,
         SectionKind::Ring => 442.0,
         SectionKind::Spectra => 486.0,
-        SectionKind::Echo => 252.0,
+        SectionKind::Echo => 498.0,
         SectionKind::Room => 228.0,
         SectionKind::Out => 176.0,
         // The desk's own.

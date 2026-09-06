@@ -1,31 +1,71 @@
-//! ECHO's face: the loop, drawn as a closed circuit.
+//! ECHO's face: the repeats as rings, and the two sides as halves.
 //!
-//! A delay is a piece of signal going round, so the card is the round
-//! trip: a loop with a record head where the signal enters, a play head
-//! where it comes back, and a lap for every time the feedback will
-//! carry it round again.
+//! A delay drawn along a line is a delay drawn as a ruler. This one is
+//! drawn as what it is — a loop — so time is RADIUS: the dry is the
+//! centre, the first repeat is the first ring, and every pass after it
+//! is a ring further out. Equal repeats are equally spaced rings, so the
+//! rhythm of the thing is a shape rather than a row of numbers.
 //!
-//! The loop's SIZE is the time the line is actually reading — the
-//! glided time, so a change of division is watched sliding rather than
-//! jumping — and the play head WANDERS off it by exactly the wow the
-//! engine reported, which is the one thing about a delay that no
-//! setting can tell you.
+//! The circle is cut in half down the middle and the halves are the two
+//! sides. A repeat is drawn as an ARC on the half it comes back on, so
+//! ping-pong is immediately what it looks like: arcs alternating left,
+//! right, left, right, out from the centre. At no spread both halves
+//! carry every ring and the picture is symmetrical, which is also what
+//! that setting sounds like.
+//!
+//! # What the rings say
+//!
+//! Their reach is the level after that many passes of feedback, and
+//! their INK is how much of the top has survived: the loop has a tone
+//! control inside it, so each pass is duller than the last, and the
+//! rings recede toward the ground as well as thinning. A delay whose
+//! repeats only got quieter would be a digital one.
+//!
+//! # The beat circles
+//!
+//! The section reports one beat in milliseconds at the tempo the block
+//! actually ran at, so the beat circles are drawn from the transport
+//! rather than assumed. In SYNC the ring arcs sit on them. In FREE they
+//! do not, and how far off is the one question a delay actually raises.
+//!
+//! # The head
+//!
+//! The innermost ring is drawn at the time the line is READING, not the
+//! time it is set to: the section glides rather than jumping, so a turn
+//! of TIME swoops the ring outward, and WOW wobbles it, which is the
+//! whole difference between this and a digital delay.
 
 use super::*;
-use crate::console::SectionParams;
-use crate::params::console::echo as p;
 use crate::ui::chrome;
-use crate::ui::nav_cursor;
 
-/// The divisions the sync switch steps through, and free.
-const DIVISIONS: usize = 6;
-/// The longest loop the card draws, in milliseconds.
-const SPAN_MS: f32 = 1_200.0;
-/// The most ghost laps drawn at full feedback.
-const LAPS: usize = 5;
+/// One control's row.
+/// @tune 12..26 px
+pub(super) const ROW_H: f32 = 17.0;
+const COLUMN_GAP: f32 = 7.0;
+/// The quietest repeat worth a ring, in dB.
+/// @tune -60..-12
+const TAIL_DB: f32 = -40.0;
+/// The most rings drawn, whatever the feedback.
+const RINGS_MAX: usize = 24;
+/// The least room between two rings, in pixels.
+///
+/// A train of twelve rings in a dial fifty pixels across is not a train,
+/// it is a smudge. So the dial draws as many repeats as it can SEPARATE
+/// and says how many that is out of how many there are — a picture that
+/// cannot be resolved is worse than one that admits it is showing part.
+/// @tune 4..20 px
+const RING_GAP: f32 = 9.0;
+/// The frequency the ink's dulling is measured at, in Hz.
+///
+/// A stated one, because "duller" has to be duller than something. It
+/// is the top of the band a repeat is judged on: how much of four
+/// kilohertz has survived n passes of the loop's tone filter.
+const TOP_HZ: f32 = 4_000.0;
 
-struct Lay {
-    loop_rect: egui::Rect,
+/// ECHO's seven controls.
+#[derive(Clone, Copy, Debug)]
+struct EchoFace {
+    rings: egui::Rect,
     sync: egui::Rect,
     time: egui::Rect,
     feedback: egui::Rect,
@@ -35,8 +75,9 @@ struct Lay {
     mix: egui::Rect,
 }
 
-impl Layout for Lay {
+impl Layout for EchoFace {
     fn controls(&self) -> Vec<(u32, egui::Rect)> {
+        use crate::params::console::echo as p;
         vec![
             (p::SYNC, self.sync),
             (p::TIME, self.time),
@@ -49,290 +90,463 @@ impl Layout for Lay {
     }
 }
 
-fn lay(glass: egui::Rect, bay: Option<egui::Rect>, plinth: Option<egui::Rect>) -> Lay {
-    let inner = glass.shrink2(egui::vec2(5.0, 4.0));
-    let (w, h) = (inner.width(), inner.height());
-    let loop_rect = egui::Rect::from_min_max(
-        egui::pos2(inner.left() + 0.06 * w, inner.top() + 0.06 * h),
-        egui::pos2(inner.right() - 0.06 * w, inner.top() + 0.44 * h),
+fn echo_face(glass: egui::Rect) -> EchoFace {
+    let x = egui::Rect::from_min_max(
+        egui::pos2(glass.left() + 5.0, glass.top() + 3.0),
+        egui::pos2(glass.right() - 20.0, glass.bottom() - 12.0),
     );
-    let row = |top: f32, from: f32, to: f32| {
-        egui::Rect::from_min_max(
-            egui::pos2(inner.left() + w * from, top),
-            egui::pos2(inner.left() + w * to, top + 13.0),
+    // Seven controls in two columns, so the rings keep a square of the
+    // card rather than a slot.
+    let col_w = ((x.width() - COLUMN_GAP * 2.0) * 0.30).clamp(110.0, 160.0);
+    let rings = egui::Rect::from_min_max(
+        x.min,
+        egui::pos2(x.right() - col_w * 2.0 - COLUMN_GAP * 2.0, x.bottom()),
+    );
+    let cell = |col: usize, row: usize| {
+        egui::Rect::from_min_size(
+            egui::pos2(
+                rings.right() + COLUMN_GAP + col as f32 * (col_w + COLUMN_GAP),
+                x.top() + row as f32 * (ROW_H + 1.0),
+            ),
+            egui::vec2(col_w, ROW_H),
         )
     };
-    let first = loop_rect.bottom() + 8.0;
-    Lay {
-        // TIME is the loop's own circumference.
-        time: loop_rect,
-        loop_rect,
-        sync: bay.unwrap_or_else(|| {
-            egui::Rect::from_min_max(
-                egui::pos2(inner.right() - 18.0, inner.top()),
-                egui::pos2(inner.right(), inner.top() + 30.0),
-            )
-        }),
-        feedback: row(first, 0.0, 0.46),
-        tone: row(first, 0.54, 1.0),
-        wow: row(first + 17.0, 0.0, 0.46),
-        pingpong: row(first + 17.0, 0.54, 0.72),
-        mix: plinth.unwrap_or_else(|| row(first + 17.0, 0.78, 1.0)),
+    EchoFace {
+        rings,
+        sync: cell(0, 0),
+        time: cell(0, 1),
+        feedback: cell(0, 2),
+        tone: cell(0, 3),
+        wow: cell(1, 0),
+        pingpong: cell(1, 1),
+        mix: cell(1, 2),
     }
 }
 
-pub(super) fn draw(face: &Face<'_>) {
-    let lay = lay(face.glass, face.bay(), face.plinth());
-    let (ink, edge) = (face.ink(), face.edge());
-    let said = face.said;
-    let mut shapes = Vec::new();
-
-    let feedback = face.place(p::FEEDBACK);
-    let ping = face.value(p::PINGPONG) >= 0.5;
-    // The LIVE time the line is reading, glided — so changing division
-    // is watched sliding rather than jumping.
-    let live_ms = if said.bands[0] > 0.0 {
-        said.bands[0]
+/// What a sync setting is called. Index 0 is FREE and the rest are the
+/// section's own beats, so the word and the arithmetic cannot name
+/// different divisions.
+fn sync_word(sync: usize) -> String {
+    use crate::params::console::echo as p;
+    if sync == 0 || sync > p::SYNC_BEATS.len() {
+        return "FREE".to_owned();
+    }
+    let beats = p::SYNC_BEATS[sync - 1];
+    if beats >= 1.0 {
+        format!("{beats:.0}bt")
     } else {
-        face.value(p::TIME)
-    };
-    let size = face.anim("size", (live_ms / SPAN_MS).clamp(0.05, 1.0), 0.10);
+        format!("1/{:.0}", 4.0 / beats)
+    }
+}
 
-    // THE LOOP: a rounded circuit whose size is the delay itself. A
-    // short delay is a small loop and a long one fills the card.
-    let full = lay.loop_rect;
-    let ring = egui::Rect::from_center_size(
-        full.center(),
-        egui::vec2(
-            full.width() * (0.25 + 0.75 * size),
-            full.height() * (0.35 + 0.65 * size),
+/// How many repeats are worth drawing at this feedback.
+fn rings_at(feedback: f32) -> usize {
+    let fb = feedback.clamp(0.0, 0.99);
+    if fb <= 0.0 {
+        return 1;
+    }
+    let passes = (TAIL_DB / (20.0 * fb.log10())).ceil();
+    (passes.max(1.0) as usize).min(RINGS_MAX)
+}
+
+/// How much of [`TOP_HZ`] survives `passes` through a one-pole at
+/// `corner`, 0..1.
+///
+/// The loop's tone filter runs once per pass, so this is its magnitude
+/// raised to the pass count — which is why a repeat goes dull far faster
+/// than it goes quiet.
+fn top_left(corner: f32, passes: usize) -> f32 {
+    let ratio = TOP_HZ / corner.max(1.0);
+    let once = 1.0 / (1.0 + ratio * ratio).sqrt();
+    once.powi(passes as i32).clamp(0.0, 1.0)
+}
+
+pub(super) fn draw(face: &Face<'_>) {
+    use crate::params::console::echo as p;
+    let painter = face.painter;
+    let alpha = face.alpha;
+    let edge = alpha.edge.color;
+    let ink = alpha.ink.color;
+    let font = egui::FontId::monospace(design::px(design::type_scale::MICRO));
+    let lay = echo_face(face.glass);
+    // Index 0 is FREE; the rest line up with the section's own beats.
+    let sync = face.value(p::SYNC).round().clamp(0.0, 5.0) as usize;
+    let set_ms = face.value(p::TIME);
+    let feedback = face.value(p::FEEDBACK) / 100.0;
+    let tone = face.value(p::TONE);
+    let wow = face.value(p::WOW) / 100.0;
+    let spread = if face.value(p::PINGPONG) >= 0.5 {
+        1.0
+    } else {
+        0.0
+    };
+    let mix = face.value(p::MIX) / 100.0;
+    let wire = mix <= 0.0;
+    // What the line is actually doing: the glided time, the head's
+    // wander, the beat as the transport ran it, and the loop's bite.
+    let live_ms = if face.said.bands[0] > 0.0 {
+        face.said.bands[0]
+    } else {
+        set_ms
+    };
+    let wander = face.said.bands[1];
+    let beat_ms = face.said.bands[2];
+    let bite = face.said.reduction_db;
+
+    let mut shapes = Vec::new();
+    chrome::panel_variant(
+        &mut shapes,
+        lay.rings,
+        Some(alpha.ground.color),
+        alpha.well.color,
+        Some((Weight::Hair, edge.gamma_multiply(0.62))),
+        0,
+    );
+    let dial = egui::Rect::from_min_max(
+        egui::pos2(lay.rings.left() + 7.0, lay.rings.top() + font.size + 5.0),
+        egui::pos2(
+            lay.rings.right() - 7.0,
+            lay.rings.bottom() - font.size - 5.0,
         ),
     );
-    let path = |rect: egui::Rect| {
-        let c = 6.0f32.min(rect.width() * 0.4).min(rect.height() * 0.4);
-        vec![
-            egui::pos2(rect.left() + c, rect.top()),
-            egui::pos2(rect.right() - c, rect.top()),
-            egui::pos2(rect.right(), rect.top() + c),
-            egui::pos2(rect.right(), rect.bottom() - c),
-            egui::pos2(rect.right() - c, rect.bottom()),
-            egui::pos2(rect.left() + c, rect.bottom()),
-            egui::pos2(rect.left(), rect.bottom() - c),
-            egui::pos2(rect.left(), rect.top() + c),
-            egui::pos2(rect.left() + c, rect.top()),
-        ]
+    let centre = dial.center();
+    let reach = (dial.width().min(dial.height()) * 0.5 - 2.0).max(6.0);
+    let audible = rings_at(feedback);
+    // As many as the dial can hold apart, which is not always as many as
+    // there are.
+    let rings = audible.min((reach / crate::tune!(RING_GAP)).floor().max(1.0) as usize);
+    // The scale: the outermost ring drawn reaches the edge.
+    let furthest = (live_ms + wander.abs()) * rings as f32;
+    let r_at = |ms: f32| (ms / furthest.max(1.0)).clamp(0.0, 1.0) * reach;
+    let arc = |from: f32, to: f32, r: f32| -> Vec<egui::Pos2> {
+        (0..=36)
+            .map(|i| {
+                let t = from + (to - from) * i as f32 / 36.0;
+                let a = t.to_radians();
+                egui::pos2(centre.x + r * a.cos(), centre.y - r * a.sin())
+            })
+            .collect()
     };
-    // THE LAPS: one ghost loop per time the feedback will carry it
-    // round again, each dimmer than the last. A loop at nothing has
-    // none, which is a delay with one repeat.
-    let laps = (feedback * LAPS as f32).round() as usize;
-    for lap in (1..=laps).rev() {
-        let shrunk = ring.shrink(lap as f32 * 3.0);
-        if shrunk.is_positive() {
-            chrome::trace(
+    // The beat circles, from the tempo the block actually ran at.
+    if beat_ms > 0.0 {
+        let mut beat = beat_ms;
+        while beat <= furthest && beat > 0.0 {
+            chrome::curve(
                 &mut shapes,
-                &path(shrunk),
+                &arc(0.0, 360.0, r_at(beat)),
                 Weight::Hair,
-                tool::fade(face.live(), 0.5 / (lap as f32 + 1.0)),
+                edge.gamma_multiply(0.55),
             );
+            beat += beat_ms;
         }
     }
-    chrome::trace(&mut shapes, &path(ring), Weight::Heavy, ink);
-    tool::halo(&mut shapes, lay.loop_rect, face.lit(p::TIME), face.focus());
-
-    // THE RECORD HEAD, fixed at the loop's top-left; and THE PLAY HEAD,
-    // which stands where the wow the engine measured has put it.
-    chrome::pad(&mut shapes, ring.left_top(), chrome::PAD, ink, true);
-    let wander = said.bands[1];
-    let drift = (wander / 8.0).clamp(-1.0, 1.0) * ring.width() * 0.12;
-    let head = egui::pos2(ring.right() + drift, ring.center().y);
-    chrome::octagon(
-        &mut shapes,
-        egui::Rect::from_center_size(head, egui::vec2(9.0, 9.0)),
-        2.0,
-        Some(face.live()),
-        Some((Weight::Hair, ink)),
-    );
-    // The wow's own reach, marked either side of the head so the wander
-    // is read against what it may do.
-    for side in [-1.0f32, 1.0] {
-        let reach = ring.width() * 0.12 * face.place(p::WOW);
-        chrome::trace(
-            &mut shapes,
-            &[
-                egui::pos2(ring.right() + side * reach, ring.center().y - 5.0),
-                egui::pos2(ring.right() + side * reach, ring.center().y + 5.0),
-            ],
-            Weight::Hair,
-            tool::fade(edge, 0.9),
-        );
-    }
-
-    // PING-PONG: when it is on, the loop's two sides are crossed, which
-    // is exactly what the section does to them.
-    let cross = lay.pingpong;
-    if ping {
-        chrome::trace(
-            &mut shapes,
-            &[cross.left_top(), cross.right_bottom()],
-            Weight::Heavy,
-            face.live(),
-        );
-        chrome::trace(
-            &mut shapes,
-            &[cross.right_top(), cross.left_bottom()],
-            Weight::Heavy,
-            face.live(),
-        );
-    } else {
-        for y in [cross.top() + 4.0, cross.bottom() - 4.0] {
-            chrome::trace(
-                &mut shapes,
-                &[egui::pos2(cross.left(), y), egui::pos2(cross.right(), y)],
-                Weight::Hair,
-                tool::fade(edge, 1.0),
-            );
-        }
-    }
-    tool::halo(&mut shapes, cross, face.lit(p::PINGPONG), face.focus());
-
-    // SYNC: the divisions, in the bay. The one that is chosen is the
-    // one the loop is actually running, and the free position is the
-    // bottom detent.
-    let slot = lay.sync;
-    let chosen = face.value(p::SYNC).round().clamp(0.0, 5.0) as usize;
-    for i in 0..DIVISIONS {
-        let y = egui::lerp(
-            (slot.top() + 4.0)..=(slot.bottom() - 4.0),
-            i as f32 / (DIVISIONS - 1) as f32,
-        );
-        let here = i == chosen;
-        chrome::trace(
-            &mut shapes,
-            &[
-                egui::pos2(slot.left() + 2.0, y),
-                egui::pos2(slot.right() - if here { 1.0 } else { 4.0 }, y),
-            ],
-            if here { Weight::Heavy } else { Weight::Hair },
-            if here { ink } else { tool::fade(edge, 0.7) },
-        );
-    }
-    tool::halo(&mut shapes, slot, face.lit(p::SYNC), face.focus());
-
-    // FEEDBACK, TONE, WOW and MIX: four rails at the foot. TONE is the
-    // filter in the loop, so its rail is drawn as a wedge shutting.
-    tool::slider(
-        &mut shapes,
-        lay.feedback.shrink2(egui::vec2(4.0, 4.0)),
-        feedback,
-        9,
-        tool::mix_ink(ink, face.focus(), face.lit(p::FEEDBACK)),
-        tool::fade(edge, 0.6),
-        6.0,
-    );
-    tool::halo(
-        &mut shapes,
-        lay.feedback,
-        face.lit(p::FEEDBACK),
-        face.focus(),
-    );
-    let tone = lay.tone;
-    let open = tool::norm(face.value(p::TONE), 200.0, 12_000.0);
+    // The line down the middle: the two halves are the two sides.
     chrome::trace(
         &mut shapes,
         &[
-            egui::pos2(tone.left() + 2.0, tone.bottom() - 2.0),
-            egui::pos2(
-                egui::lerp((tone.left() + 2.0)..=(tone.right() - 2.0), open.max(0.05)),
-                tone.top() + 2.0,
-            ),
-            egui::pos2(
-                egui::lerp((tone.left() + 2.0)..=(tone.right() - 2.0), open.max(0.05)),
-                tone.bottom() - 2.0,
-            ),
+            egui::pos2(centre.x, centre.y - reach),
+            egui::pos2(centre.x, centre.y + reach),
         ],
         Weight::Hair,
-        tool::mix_ink(tool::fade(edge, 0.9), ink, open),
+        edge.gamma_multiply(0.7),
     );
-    tool::halo(&mut shapes, tone, face.lit(p::TONE), face.focus());
-    for (rect, param) in [(lay.wow, p::WOW), (lay.mix, p::MIX)] {
-        tool::slider(
+    // The repeats. Each one is an arc on the half it comes back on, as
+    // far out as its time and as bright as what is left of it.
+    if !wire {
+        for n in 1..=rings {
+            let ms = live_ms * n as f32 + wander;
+            if ms <= 0.0 || ms > furthest {
+                continue;
+            }
+            let level = feedback.powi(n as i32 - 1);
+            let top = top_left(tone, n);
+            // Ping-pong: the odd repeats come back on one side and the
+            // even ones on the other, and at no spread both halves
+            // carry every ring.
+            let sides: &[(f32, f32)] = if spread <= 0.01 {
+                &[(90.0, 270.0), (270.0, 450.0)]
+            } else if n % 2 == 1 {
+                &[(270.0, 450.0)]
+            } else {
+                &[(90.0, 270.0)]
+            };
+            // Dulling moves a ring toward the DIM ink, not toward the
+            // ground. A repeat that has lost its top is still a repeat,
+            // and a train whose later rings vanish into the background
+            // is not showing the tail — it is hiding it.
+            let tone_ink = tool::mix_ink(
+                alpha.live.color,
+                alpha.live_dim.color,
+                (1.0 - top).clamp(0.0, 1.0),
+            );
+            for (from, to) in sides {
+                chrome::curve(
+                    &mut shapes,
+                    &arc(*from, *to, r_at(ms)),
+                    if level > 0.5 {
+                        Weight::Heavy
+                    } else {
+                        Weight::Hair
+                    },
+                    // And a floor under the level, so the quietest ring
+                    // in the train is faint rather than absent.
+                    tone_ink.gamma_multiply(0.35 + 0.65 * level),
+                );
+            }
+        }
+        // The head: the innermost ring, where the line is READING. It
+        // swoops when the time is turned and wobbles with the wow.
+        chrome::pad(
             &mut shapes,
-            rect.shrink2(egui::vec2(4.0, 4.0)),
-            face.place(param),
-            9,
-            tool::mix_ink(ink, face.focus(), face.lit(param)),
-            tool::fade(edge, 0.6),
-            6.0,
+            egui::pos2(centre.x, centre.y - r_at(live_ms + wander)),
+            chrome::PAD,
+            alpha.jeopardy_latent.color,
+            true,
         );
-        tool::halo(&mut shapes, rect, face.lit(param), face.focus());
     }
+    chrome::pad(&mut shapes, centre, chrome::PAD - 1.0, ink, true);
+    painter.extend(shapes);
 
-    face.painter.extend(shapes);
-
-    // The mark wanders with the play head: the wow is on the cursor too.
-    face.mark_signed(
-        &lay,
-        nav_cursor::Signature::Sweep((wander / 8.0).clamp(-1.0, 1.0)),
+    // ---- The words. --------------------------------------------------
+    let mut words = tool::Ledger::new(painter, font.clone(), "ECHO");
+    let span = |text: &str| {
+        painter
+            .layout_no_wrap(text.to_owned(), font.clone(), ink)
+            .rect
+            .width()
+    };
+    let gutter = ["FEEDBACK", "PING", "SYNC"]
+        .into_iter()
+        .map(span)
+        .fold(0.0f32, f32::max)
+        + 5.0;
+    words.text(
+        egui::pos2(lay.rings.left() + 8.0, lay.rings.top() + 2.0),
+        egui::Align2::LEFT_TOP,
+        "REPEATS",
+        edge,
     );
+    words.text(
+        egui::pos2(lay.rings.right() - 8.0, lay.rings.top() + 2.0),
+        egui::Align2::RIGHT_TOP,
+        if wire {
+            "WIRE".to_owned()
+        } else if rings < audible {
+            format!("{live_ms:.0}ms {rings}/{audible}")
+        } else {
+            format!("{live_ms:.0}ms x{audible}")
+        },
+        if wire { edge } else { alpha.live.color },
+    );
+    // The one question a delay raises, answered along the foot.
+    words.text(
+        egui::pos2(lay.rings.left() + 8.0, lay.rings.bottom() - 2.0),
+        egui::Align2::LEFT_BOTTOM,
+        sync_word(sync),
+        if sync == 0 { edge } else { alpha.live.color },
+    );
+    words.text(
+        egui::pos2(lay.rings.right() - 8.0, lay.rings.bottom() - 2.0),
+        egui::Align2::RIGHT_BOTTOM,
+        if beat_ms > 0.0 {
+            format!("beat {beat_ms:.0}")
+        } else {
+            "beat --".to_owned()
+        },
+        if beat_ms > 0.0 { ink } else { edge },
+    );
+    let hz_word = |hz: f32| {
+        if hz >= 1000.0 {
+            format!("{:.1}k", hz / 1000.0)
+        } else {
+            format!("{hz:.0}")
+        }
+    };
+    for (rect, word, share, said, tone_ink) in [
+        (
+            lay.sync,
+            "SYNC",
+            sync as f32 / 5.0,
+            sync_word(sync),
+            alpha.live.color,
+        ),
+        (
+            lay.time,
+            "TIME",
+            (live_ms / 1000.0).clamp(0.0, 1.0),
+            format!("{live_ms:.0}"),
+            alpha.jeopardy_latent.color,
+        ),
+        (
+            lay.feedback,
+            "FEEDBACK",
+            feedback,
+            format!("{:.0}", feedback * 100.0),
+            alpha.live.color,
+        ),
+        (
+            lay.tone,
+            "TONE",
+            (tone / 20_000.0).clamp(0.0, 1.0),
+            hz_word(tone),
+            alpha.live.color,
+        ),
+        (
+            lay.wow,
+            "WOW",
+            wow,
+            format!("{:.0}", wow * 100.0),
+            alpha.jeopardy_latent.color,
+        ),
+        (
+            lay.pingpong,
+            "PING",
+            spread,
+            if spread > 0.0 { "ON" } else { "OFF" }.to_owned(),
+            alpha.live.color,
+        ),
+        (
+            lay.mix,
+            "MIX",
+            mix,
+            format!("{:.0}", mix * 100.0),
+            alpha.live.color,
+        ),
+    ] {
+        let figure = span("20.0k") + 4.0;
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + gutter, rect.center().y - 2.0),
+            egui::pos2(rect.right() - figure, rect.center().y + 2.0),
+        );
+        if bar.is_positive() {
+            painter.rect_filled(bar, 0.0, edge.gamma_multiply(0.3));
+            if share > 0.0 {
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        bar.min,
+                        egui::pos2(
+                            bar.left() + share.clamp(0.0, 1.0) * bar.width(),
+                            bar.bottom(),
+                        ),
+                    ),
+                    0.0,
+                    tone_ink,
+                );
+            }
+        }
+        words.text(
+            egui::pos2(rect.left() + 1.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            word,
+            edge,
+        );
+        words.text(
+            egui::pos2(rect.right() - 1.0, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            said,
+            ink,
+        );
+    }
+    // The loop's bite, under the two columns: what the soft top took at
+    // this block's hottest sample.
+    let bite_y = lay.tone.bottom() + ROW_H * 0.5 + 3.0;
+    if bite_y < lay.rings.bottom() {
+        words.text(
+            egui::pos2(lay.wow.left() + 1.0, bite_y),
+            egui::Align2::LEFT_CENTER,
+            "BITE",
+            edge,
+        );
+        words.text(
+            egui::pos2(lay.mix.right() - 1.0, bite_y),
+            egui::Align2::RIGHT_CENTER,
+            if bite >= -0.05 {
+                "--".to_owned()
+            } else {
+                format!("{bite:.1}dB")
+            },
+            if bite >= -0.05 {
+                edge
+            } else {
+                alpha.jeopardy_latent.color
+            },
+        );
+    }
+    words.finish();
+
+    face.mark(&lay);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::console::SectionKind;
 
-    fn laid() -> (egui::Rect, Lay) {
-        let piece = egui::Rect::from_min_size(
-            egui::pos2(20.0, 30.0),
-            egui::vec2(strip::width_of(SectionKind::Echo), 250.0),
-        );
-        let glass = strip::recess_of(piece, SectionKind::Echo).shrink(3.0);
-        (
-            piece,
-            lay(
-                glass,
-                strip::bay_rect(piece, SectionKind::Echo),
-                strip::plinth_rect(piece, SectionKind::Echo),
-            ),
-        )
+    fn glass() -> egui::Rect {
+        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(500.0, 210.0))
     }
 
     #[test]
-    fn every_echo_parameter_has_one_instrument() {
-        let (piece, lay) = laid();
-        for def in SectionKind::Echo.table() {
-            let rect = lay
-                .control(def.id as usize)
-                .unwrap_or_else(|| panic!("{} has no instrument", def.name));
-            assert!(rect.is_positive(), "{} has no room", def.name);
+    fn every_echo_control_has_its_own_cell() {
+        let face = echo_face(glass());
+        let controls = face.controls();
+        assert_eq!(controls.len(), 7);
+        for (index, (id, rect)) in controls.iter().enumerate() {
+            assert!(glass().contains_rect(*rect), "control {id} left the glass");
+            assert!(rect.is_positive(), "control {id} lost its cell");
             assert!(
-                piece.expand(strip::TONGUE).contains_rect(rect),
-                "{} left the piece",
-                def.name
+                !face.rings.intersects(*rect),
+                "control {id} invaded the rings"
             );
+            for (other, other_rect) in &controls[index + 1..] {
+                assert!(!rect.intersects(*other_rect), "{id} and {other} overlap");
+            }
         }
-        assert_eq!(lay.controls().len(), 7);
-        let _ = SectionParams::of(SectionKind::Echo);
     }
 
-    /// The loop's size is the delay: a longer time is a bigger circuit,
-    /// and it never grows past the space it was given.
+    /// The train is as long as the feedback earns: no feedback is one
+    /// repeat, and more feedback is more rings, up to the cap.
     #[test]
-    fn a_longer_delay_is_a_bigger_loop() {
-        let (_, lay) = laid();
-        let ring = |ms: f32| {
-            let size = (ms / SPAN_MS).clamp(0.05, 1.0);
-            egui::Rect::from_center_size(
-                lay.loop_rect.center(),
-                egui::vec2(
-                    lay.loop_rect.width() * (0.25 + 0.75 * size),
-                    lay.loop_rect.height() * (0.35 + 0.65 * size),
-                ),
-            )
-        };
-        assert!(ring(1_000.0).width() > ring(120.0).width() + 20.0);
-        assert!(lay.loop_rect.contains_rect(ring(SPAN_MS * 4.0)));
-        assert!(ring(1.0).width() > 4.0, "a short delay vanished");
+    fn the_train_is_as_long_as_the_feedback_earns() {
+        assert_eq!(rings_at(0.0), 1);
+        let mut last = 0;
+        for fb in [0.1f32, 0.35, 0.6, 0.8, 0.95] {
+            let n = rings_at(fb);
+            assert!(n >= last, "more feedback gave a shorter train");
+            assert!(n <= RINGS_MAX);
+            last = n;
+        }
+        // At the top of the range it is the cap and not an eternity.
+        assert_eq!(rings_at(0.99), RINGS_MAX);
+        // A repeat at the tail really is under the floor it was chosen
+        // for, so the train stops where it stops honestly.
+        let fb = 0.6f32;
+        let n = rings_at(fb);
+        let tail_db = 20.0 * fb.powi(n as i32).log10();
+        assert!(tail_db <= TAIL_DB + 6.0, "the train ran on to {tail_db} dB");
+    }
+
+    /// Each pass is duller than the last, and far faster than it is
+    /// quieter — which is the thing the rings' ink is drawn to show.
+    #[test]
+    fn the_repeats_go_dull_faster_than_they_go_quiet() {
+        // A dark tone eats the top in a couple of passes.
+        let dark = top_left(1_000.0, 1);
+        assert!(dark < 0.3, "one pass at 1k left {dark} of 4k");
+        assert!(top_left(1_000.0, 4) < dark);
+        // An open tone leaves it nearly alone.
+        assert!(top_left(20_000.0, 1) > 0.95);
+        // Monotone in passes, at any corner.
+        for corner in [500.0f32, 2_000.0, 8_000.0] {
+            let mut last = 1.0;
+            for n in 1..6 {
+                let left = top_left(corner, n);
+                assert!(left <= last, "pass {n} at {corner} was brighter");
+                last = left;
+            }
+        }
+        // And it outruns the level: at a middling tone and feedback the
+        // fourth repeat has lost more top than volume.
+        let level = 0.6f32.powi(3);
+        assert!(top_left(3_000.0, 4) < level, "the top outlasted the level");
     }
 }
