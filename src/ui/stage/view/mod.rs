@@ -12,10 +12,12 @@
 //! are the shared widgets, lifted through the palette and pumped here.
 
 mod band;
+mod bento;
 mod browser;
 mod callouts;
 mod chassis;
 mod desk;
+mod dock;
 mod faces;
 mod heads;
 mod help;
@@ -360,7 +362,19 @@ impl Stage {
                 self.transport.motion().is_rolling(),
                 self.transport.beat_phase(),
             );
-            self.draw_chain(ui.painter(), layout.tray, phase);
+            // Three shapes, one sequence. The rail is the corridor, the
+            // dock is all of it at once and none of it in detail, and
+            // the bento is the page — drawn last of all, over
+            // everything, because it is a view of one thing rather than
+            // a window over another.
+            match self.band_view() {
+                crate::ui::stage::BandView::Rail => {
+                    self.draw_chain(ui.painter(), layout.tray, phase)
+                }
+                crate::ui::stage::BandView::Dock | crate::ui::stage::BandView::Bento => {
+                    self.draw_dock(ui.painter(), layout.tray)
+                }
+            }
             None
         } else {
             self.draw_tray(ui, layout.tray)
@@ -368,6 +382,12 @@ impl Stage {
         // Over everything in the field: a callout is about one thing, and
         // a callout drawn under anything is a callout pointing through it.
         self.draw_callouts(ui.painter(), whole, anchor);
+        // The bento covers the musical surface rather than sitting in
+        // it, so it goes over everything the surface draws — and under
+        // the machine room, which is not part of the surface at all.
+        if self.band_view() == crate::ui::stage::BandView::Bento {
+            self.draw_bento(ui.painter(), whole);
+        }
         // Last of all, because the machine room is not part of the musical
         // surface: it stands in front of the whole of it.
         self.draw_room(ui.painter(), whole);

@@ -313,6 +313,45 @@ pub enum RefusalReason {
     Unavailable,
 }
 
+/// How the console chain is presented.
+///
+/// The band is a long horizontal rail, and a rail is the wrong shape for
+/// a run of twenty-nine devices: most of it is off screen, and walking
+/// it is walking a corridor. So the chain has three presentations and
+/// the operator picks.
+///
+/// RAIL is the rail. DOCK minifies it to one chip per device under the
+/// sequencer, which fits the whole signal path on screen at once at the
+/// cost of showing none of it in detail. BENTO opens it to near the
+/// whole window as a grid read first to last in reading order — left to
+/// right, then down — so the signal path reads the way a page does.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BandView {
+    #[default]
+    Rail,
+    Dock,
+    Bento,
+}
+
+impl BandView {
+    /// The next presentation round the ring.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Rail => Self::Dock,
+            Self::Dock => Self::Bento,
+            Self::Bento => Self::Rail,
+        }
+    }
+
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Rail => "rail",
+            Self::Dock => "dock",
+            Self::Bento => "bento",
+        }
+    }
+}
+
 /// The last parameter a hand moved: which device, which knob, and what
 /// it now reads. One place on the screen says this, so a control that
 /// is a picture rather than a row of words can still be read in
@@ -379,6 +418,10 @@ pub struct Stage {
     /// Project, machine, render and diagnostics surfaces. One modal owner so
     /// utility keys cannot leak through to the musical surface beneath it.
     utility: utility::Console,
+    /// How the chain is presented. A view mode like `mixing` and
+    /// `song_view`, and kept beside them for the same reason: the
+    /// keyboard changes it, so the core owns it.
+    band_view: BandView,
     /// The last parameter moved, until another replaces it. Unlike a
     /// refusal this is NOT cleared each frame: the readout is meant to
     /// still be there a moment after your hand has left the knob.
@@ -674,6 +717,7 @@ impl Stage {
             browser_leaving: None,
             help: false,
             utility: utility::Console::default(),
+            band_view: BandView::default(),
             touch: None,
             refusal: None,
             strip_offset: 0,
@@ -1246,6 +1290,11 @@ impl Stage {
 
     /// Note that what sounds has changed. Called by the edits that change
     /// it and by nothing else — see [`Self::revision`].
+    /// How the chain is being presented.
+    pub(in crate::ui::stage) fn band_view(&self) -> BandView {
+        self.band_view
+    }
+
     /// The last parameter a hand moved, for the one readout that says so.
     pub(in crate::ui::stage) fn last_touch(&self) -> Option<&Touch> {
         self.touch.as_ref()
@@ -3482,6 +3531,13 @@ impl Stage {
             // Summoning the band takes focus with it, exactly as the
             // browser does; dismissing gives focus back to the session,
             // whose cursor was never touched.
+            StageIntent::BandView => {
+                // A presentation, not an edit: it cannot fail and it
+                // touches nothing the song remembers.
+                self.band_view = self.band_view.next();
+                self.notice = Some(format!("band {}", self.band_view.word()));
+                Ok(())
+            }
             StageIntent::Devices => {
                 if self.chain.is_some() {
                     self.chain = None;
@@ -6165,7 +6221,7 @@ mod tests {
                         stage.arrangement.clone(),
                         stage.arming,
                         stage.takes.clone(),
-                        (stage.export.clone(), stage.utility.page()),
+                        (stage.export.clone(), stage.utility.page(), stage.band_view),
                     ),
                 );
 
@@ -6201,7 +6257,7 @@ mod tests {
                                     stage.arrangement.clone(),
                                     stage.arming,
                                     stage.takes.clone(),
-                                    (stage.export.clone(), stage.utility.page()),
+                                    (stage.export.clone(), stage.utility.page(), stage.band_view,),
                                 ),
                             ),
                             before,
@@ -6240,7 +6296,7 @@ mod tests {
                                     stage.arrangement.clone(),
                                     stage.arming,
                                     stage.takes.clone(),
-                                    (stage.export.clone(), stage.utility.page()),
+                                    (stage.export.clone(), stage.utility.page(), stage.band_view,),
                                 ),
                             ),
                             before,
