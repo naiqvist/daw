@@ -1,22 +1,28 @@
-//! PUMP's face: valve gear, with the pushrod deliberately unshipped.
+//! PUMP's face: the duck itself, drawn over a bar, and plainly not
+//! connected to anything.
 //!
-//! A cam turns on the transport's own beat, its lobes are the division,
-//! their height is the depth, their profile is the shape, and the
-//! follower rides them. Everything on this card is real and everything
-//! on it is honest — including the one fact the others do not have to
-//! tell: the section's DSP has not been written. It is still a wire.
+//! The section is a rhythmic ducker: a gain that falls on the grid and
+//! comes back. So the card draws that gain across one bar — the curve
+//! repeating at the DIVISION, falling as far as the DEPTH, with the
+//! SHAPE deciding whether it drops square or swings, and the HOLD
+//! deciding how long it stays down. The beat grid is under it and the
+//! transport's own position rides along it.
 //!
-//! So the pushrod is drawn UNSHIPPED. It hangs off the follower with a
-//! visible gap where it would meet the channel, and nothing below the
-//! gap moves. The card is complete, the machine turns, and it is
-//! plainly not connected to anything. The day the core lands, the gap
-//! closes and the rest of the drawing is already true.
+//! It was a cam wheel before. The mechanism was honest and the profile
+//! was the real one, but a lobed disc in a large empty bay does not read
+//! as a duck to anyone who has not already been told it is one, and the
+//! bay was mostly air. This is the same function drawn along the axis it
+//! happens on, which is the axis DOOR's envelope and HIT's note are
+//! already drawn along.
 //!
-//! The gap is also said in words — NO CORE at the head, UNSHIPPED at
-//! the break — because a drawing that has to be interpreted to be
-//! believed is not yet honest. Every other card on the strip states its
-//! condition in a word (WIRE, IN, FLAT); this one has the most
-//! important condition of any of them and had none.
+//! # It is still a wire
+//!
+//! The section's DSP has not been written. Nothing on this card is
+//! guesswork about what it would do — the curve is the very function a
+//! core would run — but nothing is being done, so the curve is drawn as
+//! a GHOST: dashed, dim, with NO CORE at the head and PASSING at the
+//! foot. A card that drew a confident solid curve would be claiming an
+//! effect that is not in the signal.
 
 use super::*;
 use crate::console::SectionParams;
@@ -28,17 +34,14 @@ use crate::ui::nav_cursor;
 const LOBES: [usize; 5] = [1, 2, 4, 8, 16];
 
 struct Lay {
-    /// The cam's disc, and the follower riding it.
-    cam: egui::Rect,
+    /// The duck across a bar. The lobes ARE the division, so the plot is
+    /// that parameter's own instrument.
+    plot: egui::Rect,
     division: egui::Rect,
+    div_read: egui::Rect,
     depth: egui::Rect,
     shape: egui::Rect,
     hold: egui::Rect,
-    /// Where the division is READ. Its instrument is the disc; this is
-    /// only the number, and it needs a row of its own like any other.
-    div_read: egui::Rect,
-    /// Where the pushrod would land if the section had a core.
-    seat: egui::Pos2,
 }
 
 impl Layout for Lay {
@@ -52,48 +55,38 @@ impl Layout for Lay {
     }
 }
 
+/// One readout row.
+/// @tune 12..26 px
+pub(super) const ROW_H: f32 = 18.0;
+
 fn lay(glass: egui::Rect, _bay: Option<egui::Rect>) -> Lay {
     // The glass is not the frame: it runs wider than the casing draws.
     let inner = egui::Rect::from_min_max(
-        egui::pos2(glass.left() + 5.0, glass.top() + 4.0),
+        egui::pos2(glass.left() + 5.0, glass.top() + 3.0),
         egui::pos2(glass.right() - 20.0, glass.bottom() - 4.0),
     );
-    let gear_w = inner.width() * 0.52;
-    let gear =
-        egui::Rect::from_min_max(inner.min, egui::pos2(inner.left() + gear_w, inner.bottom()));
-    let column = egui::Rect::from_min_max(egui::pos2(gear.right() + 8.0, inner.top()), inner.max);
-    // The disc takes the head of the gear bay; the pushrod hangs from it
-    // and stops short of the seat at the bay's foot.
-    let side = (gear.width() * 0.78).min(gear.height() * 0.52);
-    let cam = egui::Rect::from_center_size(
-        egui::pos2(gear.center().x, gear.top() + side * 0.5 + ROW_H),
-        egui::vec2(side, side),
+    // From the foot up: four rows, then the plot takes the rest.
+    let rows_h = ROW_H * 4.0 + 3.0;
+    let rows_top = inner.bottom() - rows_h;
+    let plot = egui::Rect::from_min_max(
+        inner.min,
+        egui::pos2(inner.right(), (rows_top - 5.0).max(inner.top() + 30.0)),
     );
     let row = |i: usize| {
         egui::Rect::from_min_size(
-            egui::pos2(
-                column.left(),
-                column.top() + ROW_H + 4.0 + i as f32 * (ROW_H + 2.0),
-            ),
-            egui::vec2(column.width(), ROW_H),
+            egui::pos2(inner.left(), rows_top + i as f32 * (ROW_H + 1.0)),
+            egui::vec2(inner.width(), ROW_H),
         )
     };
     Lay {
-        cam,
-        // The lobes ARE the division: the disc is its instrument, and
-        // the row beside it only reads the number off.
-        division: cam,
+        plot,
+        division: plot,
         div_read: row(0),
         depth: row(1),
         shape: row(2),
         hold: row(3),
-        seat: egui::pos2(cam.center().x, gear.bottom() - 4.0),
     }
 }
-
-/// One readout row.
-/// @tune 12..26 px
-pub(super) const ROW_H: f32 = 18.0;
 
 /// The cam's radius at angle `t` (turns), for a wheel of `lobes` cut to
 /// `depth` with a profile from square to sinusoidal at `shape`, and a
@@ -118,6 +111,7 @@ fn lobe(t: f32, lobes: usize, depth: f32, shape: f32, hold: f32) -> f32 {
 pub(super) fn draw(face: &Face<'_>) {
     let lay = lay(face.glass, face.bay());
     let (ink, edge) = (face.ink(), face.edge());
+    let font = egui::FontId::monospace(design::px(design::type_scale::MICRO));
     let mut shapes = Vec::new();
 
     let step = face.value(p::DIVISION).round().clamp(0.0, 4.0) as usize;
@@ -125,96 +119,94 @@ pub(super) fn draw(face: &Face<'_>) {
     let depth = face.anim("depth", face.place(p::DEPTH), 0.10);
     let shape = face.anim("shape", face.place(p::SHAPE), 0.10);
     let hold = face.anim("hold", face.place(p::HOLD), 0.10) * 0.6;
-    // The cam turns on the TRANSPORT's beat, and stands still when the
-    // transport does. There is no other clock on this card.
+    // The transport's own beat. There is no other clock on this card.
     let turn = face.phase.beat;
 
-    // THE CAM: its outline is the very profile the section would run.
-    let centre = lay.cam.center();
-    let radius = lay.cam.width() * 0.5;
-    let rim: Vec<egui::Pos2> = (0..=96)
-        .map(|i| {
-            let t = i as f32 / 96.0;
-            // The wheel turns under a fixed follower, so the profile is
-            // read at the angle PLUS the turn. Drawn without it the rim
-            // stood still while the follower rose off it, which is the
-            // one thing a cam drawing must not do.
-            let r = radius * (0.45 + 0.55 * lobe(t + turn, lobes, depth, shape, hold));
-            tool::on_arc(centre, r, 90.0 - t * 360.0)
-        })
-        .collect();
-    chrome::curve(&mut shapes, &rim, Weight::Heavy, ink);
-    chrome::curve(
+    // ---- The duck, across a bar. ------------------------------------
+    chrome::panel_variant(
         &mut shapes,
-        &tool::arc(centre, radius, 0.0, 360.0, 48),
-        Weight::Hair,
-        tool::fade(edge, 0.4),
+        lay.plot,
+        Some(face.alpha.ground.color),
+        face.alpha.well.color,
+        Some((Weight::Hair, tool::fade(edge, 0.62))),
+        0,
     );
-    chrome::pad(&mut shapes, centre, chrome::PAD, ink, true);
-    // The keyway: one mark on the disc, so the turning is visible.
-    chrome::trace(
-        &mut shapes,
-        &[
-            centre,
-            tool::on_arc(centre, radius * 0.5, 90.0 - turn * 360.0),
-        ],
-        Weight::Hair,
-        tool::fade(edge, 1.1),
+    let field = egui::Rect::from_min_max(
+        egui::pos2(lay.plot.left() + 7.0, lay.plot.top() + font.size + 6.0),
+        egui::pos2(lay.plot.right() - 7.0, lay.plot.bottom() - font.size - 5.0),
     );
-    tool::halo(&mut shapes, lay.cam, face.lit(p::DIVISION), face.focus());
-
-    // THE FOLLOWER: it rides the rim at the transport's own angle, so
-    // the lift under it is the duck the section would be applying.
-    let lift = lobe(turn, lobes, depth, shape, hold);
-    let ride = radius * (0.45 + 0.55 * lift);
-    let contact = tool::on_arc(centre, ride, 90.0);
-    chrome::octagon(
-        &mut shapes,
-        egui::Rect::from_center_size(contact, egui::vec2(9.0, 9.0)),
-        2.0,
-        Some(face.live()),
-        Some((Weight::Hair, ink)),
-    );
-
-    // THE PUSHROD, UNSHIPPED. It reaches down from the follower and
-    // stops short: the section's core has not been written, so nothing
-    // it would drive is being driven, and the card says so rather than
-    // miming a duck that is not happening.
-    let gap_top = egui::lerp(lay.cam.bottom()..=lay.seat.y, 0.55);
-    chrome::trace(
-        &mut shapes,
-        &[contact, egui::pos2(contact.x, gap_top)],
-        Weight::Heavy,
-        ink,
-    );
-    chrome::trace(
-        &mut shapes,
-        &[
-            egui::pos2(lay.seat.x - 9.0, lay.seat.y),
-            egui::pos2(lay.seat.x + 9.0, lay.seat.y),
-        ],
-        Weight::Heavy,
-        tool::fade(edge, 1.1),
-    );
-    // The gap itself, marked so it reads as unshipped and not as a
-    // drawing that ran out of room.
-    for y in [gap_top + 4.0, lay.seat.y - 6.0] {
+    let x_at = |t: f32| field.left() + t.clamp(0.0, 1.0) * field.width();
+    let y_at = |gain: f32| field.bottom() - gain.clamp(0.0, 1.0) * field.height();
+    // The grid the duck is cut to: one cell per lobe, so the division is
+    // legible as a rhythm and not only as a number.
+    for i in 0..=lobes {
+        let x = x_at(i as f32 / lobes as f32);
         chrome::trace(
             &mut shapes,
-            &[
-                egui::pos2(contact.x - 5.0, y),
-                egui::pos2(contact.x + 5.0, y),
-            ],
+            &[egui::pos2(x, field.top()), egui::pos2(x, field.bottom())],
             Weight::Hair,
-            tool::fade(edge, 0.9),
+            tool::fade(edge, if i % lobes == 0 { 0.9 } else { 0.35 }),
         );
     }
+    // Unity, and the floor the depth would reach.
+    chrome::trace(
+        &mut shapes,
+        &[
+            egui::pos2(field.left(), y_at(1.0)),
+            egui::pos2(field.right(), y_at(1.0)),
+        ],
+        Weight::Hair,
+        tool::fade(edge, 0.8),
+    );
+    if depth > 0.01 {
+        chrome::dashes(
+            &mut shapes,
+            &[
+                egui::pos2(field.left(), y_at(1.0 - depth)),
+                egui::pos2(field.right(), y_at(1.0 - depth)),
+            ],
+            0.0,
+            Weight::Hair,
+            tool::fade(edge, 0.6),
+        );
+    }
+    // The curve, GHOSTED: this is what the section would do, and the
+    // section is a wire, so it is drawn as a thing not happening.
+    let duck: Vec<egui::Pos2> = (0..=160)
+        .map(|i| {
+            let t = i as f32 / 160.0;
+            egui::pos2(x_at(t), y_at(lobe(t, lobes, depth, shape, hold)))
+        })
+        .collect();
+    chrome::dashes(
+        &mut shapes,
+        &duck,
+        0.0,
+        Weight::Heavy,
+        tool::fade(ink, 0.75),
+    );
+    // Where the transport stands, and what the duck would be there.
+    let here = turn.fract();
+    let now = lobe(here, lobes, depth, shape, hold);
+    chrome::trace(
+        &mut shapes,
+        &[
+            egui::pos2(x_at(here), field.top()),
+            egui::pos2(x_at(here), field.bottom()),
+        ],
+        Weight::Hair,
+        face.live(),
+    );
+    chrome::pad(
+        &mut shapes,
+        egui::pos2(x_at(here), y_at(now)),
+        chrome::PAD,
+        face.live(),
+        true,
+    );
+    tool::halo(&mut shapes, lay.plot, face.lit(p::DIVISION), face.focus());
 
-    // DEPTH, SHAPE and HOLD, each drawn as what it does to the lobe:
-    // how deep it cuts, how square it is, how long it dwells.
-    // The room a row's word and its figure keep, measured: an instrument
-    // drawn across the whole row is drawn under both of them.
-    let font = egui::FontId::monospace(design::px(design::type_scale::MICRO));
+    // ---- The rows. --------------------------------------------------
     let span = |text: &str| {
         face.painter
             .layout_no_wrap(text.to_owned(), font.clone(), ink)
@@ -236,7 +228,7 @@ pub(super) fn draw(face: &Face<'_>) {
     for (rect, param, value) in [(lay.depth, p::DEPTH, depth), (lay.shape, p::SHAPE, shape)] {
         tool::slider(
             &mut shapes,
-            between(rect).shrink2(egui::vec2(0.0, 4.0)),
+            between(rect).shrink2(egui::vec2(0.0, 5.0)),
             value,
             9,
             tool::mix_ink(ink, face.focus(), face.lit(param)),
@@ -245,11 +237,9 @@ pub(super) fn draw(face: &Face<'_>) {
         );
         tool::halo(&mut shapes, rect, face.lit(param), face.focus());
     }
-    // HOLD is the dwell, so it is drawn as a beat grid whose lit share
-    // is the dwell and whose cell count is the division.
     tool::beat_grid(
         &mut shapes,
-        between(lay.hold).shrink2(egui::vec2(0.0, 3.0)),
+        between(lay.hold).shrink2(egui::vec2(0.0, 4.0)),
         lobes.min(8),
         1.0 - hold / 0.6,
         Some(((turn * lobes as f32) as usize).min(lobes.saturating_sub(1))),
@@ -257,50 +247,37 @@ pub(super) fn draw(face: &Face<'_>) {
         tool::fade(edge, 0.5),
     );
     tool::halo(&mut shapes, lay.hold, face.lit(p::HOLD), face.focus());
-
     face.painter.extend(shapes);
 
     // ---- The words. -------------------------------------------------
     let mut words = tool::Ledger::new(face.painter, font.clone(), "PUMP");
-    let head = egui::Rect::from_min_max(
-        egui::pos2(lay.cam.left() - 20.0, lay.cam.top() - ROW_H - 6.0),
-        egui::pos2(lay.hold.right(), lay.cam.top() - 6.0),
-    );
     words.text(
-        egui::pos2(head.left() + 2.0, head.center().y),
-        egui::Align2::LEFT_CENTER,
-        "CAM",
+        egui::pos2(lay.plot.left() + 8.0, lay.plot.top() + 2.0),
+        egui::Align2::LEFT_TOP,
+        "DUCK",
         edge,
     );
-    // The one condition that matters more than any setting on the card.
+    // The condition that matters more than any setting on the card.
     words.text(
-        egui::pos2(head.right() - 2.0, head.center().y),
-        egui::Align2::RIGHT_CENTER,
+        egui::pos2(lay.plot.right() - 8.0, lay.plot.top() + 2.0),
+        egui::Align2::RIGHT_TOP,
         "NO CORE",
         face.focus(),
     );
-    // The break in the pushrod, named.
-    let gap_mid = egui::lerp(gap_top..=lay.seat.y, 0.5);
     words.text(
-        egui::pos2(contact.x + 9.0, gap_mid),
-        egui::Align2::LEFT_CENTER,
-        "UNSHIPPED",
-        tool::fade(edge, 1.2),
+        egui::pos2(field.left(), lay.plot.bottom() - 2.0),
+        egui::Align2::LEFT_BOTTOM,
+        "PASSING",
+        tool::fade(edge, 1.1),
     );
-    // The division reads off the disc beside it: a bar cut into lobes.
     words.text(
-        egui::pos2(lay.div_read.left() + 2.0, lay.div_read.center().y),
-        egui::Align2::LEFT_CENTER,
-        "DIV",
+        egui::pos2(field.right(), lay.plot.bottom() - 2.0),
+        egui::Align2::RIGHT_BOTTOM,
+        "1 BAR",
         edge,
     );
-    words.text(
-        egui::pos2(lay.div_read.right() - 2.0, lay.div_read.center().y),
-        egui::Align2::RIGHT_CENTER,
-        format!("1/{lobes}"),
-        ink,
-    );
     for (rect, word, said) in [
+        (lay.div_read, "DIV", format!("1/{lobes}")),
         (lay.depth, "DEPTH", format!("{:.0}", face.value(p::DEPTH))),
         (lay.shape, "SHAPE", format!("{:.0}", face.value(p::SHAPE))),
         (lay.hold, "HOLD", format!("{:.0}", face.value(p::HOLD))),
@@ -320,7 +297,7 @@ pub(super) fn draw(face: &Face<'_>) {
     }
     words.finish();
 
-    // The mark stands on the grid the cam is cut to.
+    // The mark stands on the grid the duck is cut to.
     face.mark_signed(&lay, face.beat_cell(lobes.min(8)));
 }
 
@@ -382,36 +359,30 @@ mod tests {
         }
     }
 
-    /// The wheel turns under the follower, so the rim must be read at
-    /// the angle PLUS the turn. Drawn without it the profile stood
-    /// still while the follower rose off it — a cam whose follower
-    /// floats is not a cam.
+    /// The duck repeats on the division, and it falls ON the beat and
+    /// recovers between beats — which is the way round a pump works and
+    /// the opposite of what a first reading of the profile suggests.
+    ///
+    /// The lobe is not a dip in an otherwise open gain. It sits at the
+    /// FLOOR as each beat lands, then climbs. So the thing to hold is
+    /// that every beat bites and every gap recovers.
     #[test]
-    fn the_follower_stands_on_the_rim_at_every_turn() {
-        let (lobes, depth, shape, hold) = (4usize, 0.8, 0.25, 0.3);
-        for i in 0..16 {
-            let turn = i as f32 / 16.0;
-            // The follower rides at the top of the wheel, which is the
-            // rim's own t = 0.
-            let under_it = lobe(0.0 + turn, lobes, depth, shape, hold);
-            let lift = lobe(turn, lobes, depth, shape, hold);
-            assert!(
-                (under_it - lift).abs() < 1e-6,
-                "at turn {turn} the rim reads {under_it} and the follower sits at {lift}"
-            );
+    fn the_duck_falls_on_the_beat_and_recovers_between() {
+        for lobes in [1usize, 2, 4, 8, 16] {
+            let (depth, shape, hold) = (0.8, 0.5, 0.2);
+            for i in 0..lobes {
+                let beat = i as f32 / lobes as f32;
+                assert!(
+                    lobe(beat, lobes, depth, shape, hold) < 1.0 - depth * 0.9,
+                    "beat {i} of {lobes} did not duck"
+                );
+                // Somewhere before the next beat it comes back up.
+                let recovered = (1..20).any(|k| {
+                    let t = beat + (k as f32 / 20.0) / lobes as f32;
+                    lobe(t, lobes, depth, shape, hold) > 1.0 - depth * 0.25
+                });
+                assert!(recovered, "the gain never recovered after beat {i}");
+            }
         }
-    }
-
-    /// The pushrod is unshipped, and the gap is real: the follower's rod
-    /// stops well short of the seat.
-    #[test]
-    fn the_pushrod_does_not_reach_its_seat() {
-        let (_, lay) = laid();
-        let gap_top = egui::lerp(lay.cam.bottom()..=lay.seat.y, 0.55);
-        assert!(
-            lay.seat.y - gap_top > 10.0,
-            "the gap that says the core is a wire has closed"
-        );
-        assert!(gap_top > lay.cam.bottom());
     }
 }
