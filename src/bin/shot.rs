@@ -725,6 +725,28 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
                 backend: "JACK",
             }));
         }
+    } else if which.contains("smear") {
+        // A long run turning low, so the bottom is held back hard and
+        // the arrival curve has somewhere to go.
+        use daw::devices::DeviceKind;
+        let _ = stage.song_mut().add_device(0, DeviceKind::Poly);
+        {
+            use daw::params::console::smear as p;
+            let song = stage.song_mut();
+            if let Some(device) = song
+                .section(0, daw::console::SectionKind::Smear)
+                .map(|device| device.id)
+                .and_then(|id| song.device_mut(id))
+            {
+                device.bypassed = false;
+                device.set(p::AMOUNT, 24.0);
+                device.set(p::CENTRE, 700.0);
+            }
+        }
+        let _ = stage.apply(StageIntent::Devices);
+        for _ in 0..15 {
+            let _ = stage.apply(StageIntent::Step(Step::Right));
+        }
     } else if which.contains("phase") {
         // A long run swept deep with feedback, so the teeth are many and
         // the ring has both its marks well apart.
