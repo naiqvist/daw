@@ -725,6 +725,30 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
                 backend: "JACK",
             }));
         }
+    } else if which.contains("ring") {
+        // A carrier above the note, so the difference tones fold below
+        // the fundamental and the scatter is plainly inharmonic.
+        use daw::devices::DeviceKind;
+        let _ = stage.song_mut().add_device(0, DeviceKind::Poly);
+        {
+            use daw::params::console::ring as p;
+            let song = stage.song_mut();
+            if let Some(device) = song
+                .section(0, daw::console::SectionKind::Ring)
+                .map(|device| device.id)
+                .and_then(|id| song.device_mut(id))
+            {
+                device.bypassed = false;
+                device.set(p::CARRIER, p::TRIANGLE as f32);
+                device.set(p::HZ, 330.0);
+                device.set(p::HOLD_RATE, 6.0);
+                device.set(p::MIX, 80.0);
+            }
+        }
+        let _ = stage.apply(StageIntent::Devices);
+        for _ in 0..16 {
+            let _ = stage.apply(StageIntent::Step(Step::Right));
+        }
     } else if which.contains("smear") {
         // A long run turning low, so the bottom is held back hard and
         // the arrival curve has somewhere to go.
