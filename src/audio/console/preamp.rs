@@ -17,10 +17,11 @@
 //! changes colour before it changes level; what level it does take is
 //! the curve's own compression of the peaks, which is the stage's.
 //!
-//! Latency: the oversampler's, and only while the curve runs. The floor
-//! is a wire to the sample and reports none; the two or three samples
-//! the curve adds are paid when it is leaned on, and the change is
-//! well under a millisecond.
+//! Latency: the oversampler's fixed round trip. PREAMP is structural, and
+//! the round trip stays in circuit even when IRON is at zero so a live drive
+//! change cannot move the channel by 35 samples. At the floor the stage is
+//! therefore a wire *behind that declared latency*, not an unreported
+//! zero-latency side door around the antialias filters.
 
 use crate::audio::console::{Clock, SectionCore};
 use crate::audio::graph::Readout;
@@ -157,7 +158,7 @@ impl PreampCore {
         transfer(self.settings.iron, self.settings.steel, x)
     }
 
-    /// Whether the stage is a wire right now.
+    /// Whether the stage is an identity apart from its fixed latency.
     pub fn is_wire(&self) -> bool {
         let s = self.settings;
         s.trim_db == 0.0 && s.iron == 0.0 && !s.flip && !s.colour && self.trim.current() == 1.0
@@ -190,6 +191,15 @@ impl PreampCore {
             self.unlift[ch].process(io);
         }
         self.dc[ch].process(io);
+    }
+
+    /// Keep the antialias round trip warm while the nonlinear curve is at
+    /// its floor. This is the phase-coherent bypass for a structural stage:
+    /// the graph sees one constant delay however the IRON knob moves.
+    fn round_trip_one(&mut self, ch: usize, io: &mut [f32]) {
+        let lane = &mut self.lane[..io.len() * 2];
+        self.over[ch].up(io, lane);
+        self.over[ch].down(lane, io);
     }
 }
 
@@ -226,7 +236,7 @@ impl SectionCore for PreampCore {
     }
 
     fn latency(&self) -> usize {
-        0
+        self.over[0].latency()
     }
 
     fn process(&mut self, l: &mut [f32], r: &mut [f32], _clock: &Clock) {
@@ -237,31 +247,36 @@ impl SectionCore for PreampCore {
         let stereo = r.len() >= n;
         let s = self.settings;
 
-        // The wire: nothing touched, not even the level's memory moved
-        // by a multiply — the promise is equality.
+        // The setting can be an identity, but PREAMP remains behind its
+        // fixed antialias round trip. Skipping it here made an IRON letter
+        // move the whole channel by the filter's group delay.
         let trim_settled = self.trim.current() == 1.0 && s.trim_db == 0.0;
-        if trim_settled && s.iron == 0.0 && !s.flip && !s.colour {
-            self.level_db = peak_db(l, if stereo { &r[..n] } else { &[] });
-            return;
-        }
 
         // PHASE, then TRIM as a ramp so a turn glides.
         let sign = if s.flip { -1.0 } else { 1.0 };
-        self.trim.process(&mut self.ramp[..n]);
-        for (x, g) in l.iter_mut().zip(&self.ramp[..n]) {
-            *x *= g * sign;
-        }
-        if stereo {
-            for (x, g) in r[..n].iter_mut().zip(&self.ramp[..n]) {
+        if !trim_settled || s.flip {
+            self.trim.process(&mut self.ramp[..n]);
+            for (x, g) in l.iter_mut().zip(&self.ramp[..n]) {
                 *x *= g * sign;
+            }
+            if stereo {
+                for (x, g) in r[..n].iter_mut().zip(&self.ramp[..n]) {
+                    *x *= g * sign;
+                }
             }
         }
 
-        // The stage, when leaned on.
+        // The stage is always the same length. At the floor only the
+        // identity round trip runs; leaned on, the curve lives between it.
         if s.iron > 0.0 {
             self.drive_one(0, l);
             if stereo {
                 self.drive_one(1, &mut r[..n]);
+            }
+        } else {
+            self.round_trip_one(0, l);
+            if stereo {
+                self.round_trip_one(1, &mut r[..n]);
             }
         }
 
@@ -360,20 +375,33 @@ mod tests {
         20.0 * (bin(hz * h as f32) / bin(hz).max(1e-9)).log10()
     }
 
-    /// At the floor the stage is a wire: every sample equal, for every
-    /// block length.
+    /// At the floor the stage is a wire behind the antialias round trip.
+    /// The impulse pins the delay the graph must compensate and the two
+    /// sides pin one shared topology rather than a mono-only shortcut.
     #[test]
-    fn the_floor_is_a_wire_to_the_sample() {
+    fn the_floor_is_a_wire_behind_its_reported_latency() {
         let mut core = core_with(&[]);
         assert!(core.is_wire());
-        for len in [0usize, 1, 7, 64, BLOCK] {
-            let l = sine(440.0, 0.5, len);
-            let r: Vec<f32> = l.iter().map(|s| -s).collect();
-            let (ol, or) = run(&mut core, &l, &r);
-            assert_eq!(ol, l, "left changed at {len}");
-            assert_eq!(or, r, "right changed at {len}");
-        }
-        assert_eq!(core.latency(), 0);
+        let ahead = core.latency();
+        assert_eq!(ahead, Oversampler2x::new().latency());
+        let mut l = vec![0.0f32; BLOCK];
+        let mut r = vec![0.0f32; BLOCK];
+        l[0] = 1.0;
+        r[0] = -1.0;
+        core.process(&mut l, &mut r, &clock());
+        let peak = l
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+            .expect("an impulse has a peak");
+        assert_eq!(peak.0, ahead);
+        assert!(peak.1.abs() > 0.9, "the round trip lost the impulse");
+        assert!(
+            l.iter()
+                .zip(&r)
+                .all(|(a, b)| (*a + *b).abs() <= f32::EPSILON),
+            "the stereo lanes must remain equal and opposite"
+        );
     }
 
     /// Trim is a gain: −6 dB halves a sine once the ramp has settled.
@@ -390,10 +418,12 @@ mod tests {
     /// Phase flips the sign, exactly.
     #[test]
     fn phase_flips_the_sign() {
-        let mut core = core_with(&[(p::PHASE, 1.0)]);
         let l = sine(440.0, 0.5, BLOCK);
+        let mut plain = core_with(&[]);
+        let (reference, _) = run(&mut plain, &l, &[]);
+        let mut core = core_with(&[(p::PHASE, 1.0)]);
         let (ol, _) = run(&mut core, &l, &[]);
-        for (a, b) in ol.iter().zip(&l) {
+        for (a, b) in ol.iter().zip(&reference) {
             assert!((a + b).abs() < 1e-6);
         }
     }

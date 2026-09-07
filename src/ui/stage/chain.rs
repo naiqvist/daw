@@ -14,7 +14,7 @@
 //! hand-laid-out thirty-nine times.
 
 use crate::design::codex::ParamFamily;
-use crate::devices::{Family, ParamLabel};
+use crate::devices::{DeviceKind, Family, ParamLabel};
 use crate::params::ParamDef;
 use crate::sequencing::{Device, Song};
 
@@ -38,6 +38,75 @@ pub struct Row {
     pub choices: usize,
     /// Which position the value stands on, when it is a list.
     pub choice: usize,
+}
+
+/// The sampler facts that turn its chain column into an instrument face.
+///
+/// A generic device can be understood as a table of parameters. A sampler
+/// cannot: its material, trim, loop, and cuts are the thing being played.
+/// This small projection keeps the Stage view out of the document model while
+/// giving it enough authored truth to draw that material around the same
+/// parameter rows every other card exposes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SamplerFace {
+    /// Full path, used only to match the peak data the host has handed Stage.
+    pub path: Option<std::path::PathBuf>,
+    /// Classic, one-shot, or slice, as an index into `MODE_NAMES`.
+    pub mode: usize,
+    /// The part of the source that plays, as file fractions.
+    pub start: f32,
+    pub end: f32,
+    /// Off, forward, or ping-pong, as an index into `LOOP_NAMES`.
+    pub loop_mode: usize,
+    /// A fraction of the trimmed region, not of the whole file.
+    pub loop_start: f32,
+    /// Grid, onset, or hand-authored, as an index into
+    /// `SLICE_SOURCE_NAMES`.
+    pub slice_source: usize,
+    /// The grid count used when no authored table has replaced it.
+    pub slice_count: usize,
+    /// Authored slice starts, already normalized by the song model.
+    pub slices: Vec<f64>,
+    pub reversed: bool,
+}
+
+impl SamplerFace {
+    fn from_device(device: &Device) -> Self {
+        use crate::params::sampler as sp;
+
+        let choice = |value: f32, choices: usize| {
+            if value.is_finite() {
+                value.round().max(0.0) as usize
+            } else {
+                0
+            }
+            .min(choices.saturating_sub(1))
+        };
+        let fraction = |value: f32, fallback: f32| {
+            if value.is_finite() {
+                value.clamp(0.0, 1.0)
+            } else {
+                fallback
+            }
+        };
+
+        Self {
+            path: device.sample.clone(),
+            mode: choice(device.value(sp::MODE), sp::MODE_NAMES.len()),
+            start: fraction(device.value(sp::START), 0.0),
+            end: fraction(device.value(sp::END), 1.0),
+            loop_mode: choice(device.value(sp::LOOP_MODE), sp::LOOP_NAMES.len()),
+            loop_start: fraction(device.value(sp::LOOP_START), 0.0),
+            slice_source: choice(device.value(sp::SLICE_SOURCE), sp::SLICE_SOURCE_NAMES.len()),
+            slice_count: if device.value(sp::SLICES).is_finite() {
+                device.value(sp::SLICES).round().clamp(1.0, sp::SLICES_MAX) as usize
+            } else {
+                1
+            },
+            slices: device.slices.clone(),
+            reversed: device.value(sp::REVERSE) >= 0.5,
+        }
+    }
 }
 
 /// Which rail of the desk a column stands on.
@@ -98,6 +167,10 @@ pub struct Column {
     /// kind, and on a sampler with nothing loaded yet — which is the one
     /// fact about a sampler its parameter table cannot show.
     pub sample: Option<String>,
+    /// The material-facing state for a sampler card; absent on every other
+    /// device. Kept beside `sample` because the latter remains the compact
+    /// header label shared by the generic card contract.
+    pub sampler: Option<SamplerFace>,
     pub rows: Vec<Row>,
     /// Which section of the console this column is, when it is one:
     /// drawn as a piece of the strip rather than as a card.
@@ -106,8 +179,8 @@ pub struct Column {
     pub lane: Lane,
 }
 
-/// The devices on `track`'s chain, in signal order. An empty vector is a
-/// track with no chain, which sounds the default voice.
+/// The devices on `track`'s chain, in signal order. New tracks include
+/// exact-unity input and output gain utilities around their editable chain.
 pub fn columns(song: &Song, track: usize) -> Vec<Column> {
     song.tracks
         .get(track)
@@ -179,8 +252,8 @@ pub fn band(song: &Song, track: usize) -> Vec<Column> {
 pub fn column(device: &Device) -> Column {
     let spec = device.kind.spec();
     Column {
-        title: spec.name,
-        code: spec.prefix,
+        title: device.role.title().unwrap_or(spec.name),
+        code: device.role.code().unwrap_or(spec.prefix),
         family: spec.family,
         instrument: spec.instrument,
         bypassed: device.bypassed,
@@ -189,6 +262,7 @@ pub fn column(device: &Device) -> Column {
             .as_deref()
             .and_then(|path| path.file_name())
             .map(|name| name.to_string_lossy().into_owned()),
+        sampler: (device.kind == DeviceKind::Sampler).then(|| SamplerFace::from_device(device)),
         section: match device.kind {
             crate::devices::DeviceKind::Console(kind) => Some(kind),
             _ => None,
@@ -412,12 +486,25 @@ mod tests {
         (song, 0)
     }
 
+    fn added_id(song: &Song, kind: DeviceKind) -> crate::sequencing::DeviceId {
+        song.tracks[0]
+            .chain
+            .iter()
+            .find(|device| device.kind == kind && device.role.is_normal())
+            .expect("the added device")
+            .id
+    }
+
+    fn added_column(song: &Song, kind: DeviceKind) -> Column {
+        column(song.device(added_id(song, kind)).expect("the added device"))
+    }
+
     #[test]
     fn a_column_carries_the_whole_table_and_not_a_selection() {
         // The claim the card tier makes: everything is reachable here.
         for kind in [DeviceKind::Poly, DeviceKind::Reverb, DeviceKind::Sat] {
             let (song, track) = song_with(kind);
-            let column = columns(&song, track).pop().expect("one device");
+            let column = added_column(&song, kind);
             assert_eq!(
                 column.rows.len(),
                 kind.spec().params.len(),
@@ -433,13 +520,13 @@ mod tests {
     #[test]
     fn a_row_says_whether_anybody_moved_it() {
         let (mut song, track) = song_with(DeviceKind::Sat);
-        let at_rest = columns(&song, track).pop().expect("one device");
+        let at_rest = added_column(&song, DeviceKind::Sat);
         assert!(
             at_rest.rows.iter().all(|row| !row.edited),
             "a device fresh from the catalog claimed edits"
         );
 
-        let id = song.tracks[0].chain[0].id;
+        let id = added_id(&song, DeviceKind::Sat);
         let drive = crate::params::sat::DRIVE;
         let def = *crate::params::sat::TABLE
             .iter()
@@ -449,7 +536,7 @@ mod tests {
             .expect("there")
             .set(drive, def.default + (def.max - def.default) / 2.0);
 
-        let edited = columns(&song, track).pop().expect("one device");
+        let edited = added_column(&song, DeviceKind::Sat);
         let moved: Vec<&str> = edited
             .rows
             .iter()
@@ -462,7 +549,7 @@ mod tests {
     #[test]
     fn a_repeated_name_is_told_apart_and_a_unique_one_is_left_alone() {
         let (song, track) = song_with(DeviceKind::Poly);
-        let column = columns(&song, track).pop().expect("one device");
+        let column = added_column(&song, DeviceKind::Poly);
         let names: Vec<&str> = column.rows.iter().map(|row| row.name.as_str()).collect();
 
         // Two oscillators, each with a Wave — and they must not read the
@@ -485,7 +572,7 @@ mod tests {
 
         // And a name that never repeated is left as it was.
         let (song, track) = song_with(DeviceKind::Sat);
-        let column = columns(&song, track).pop().expect("one device");
+        let column = added_column(&song, DeviceKind::Sat);
         assert!(
             column.rows.iter().any(|row| row.name == "Drive"),
             "a unique name was qualified for nothing"
@@ -518,7 +605,7 @@ mod tests {
     #[test]
     fn a_column_says_what_kind_of_thing_it_is() {
         let (song, track) = song_with(DeviceKind::Poly);
-        let column = columns(&song, track).pop().expect("one device");
+        let column = added_column(&song, DeviceKind::Poly);
         assert_eq!(column.title, DeviceKind::Poly.spec().name);
         assert_eq!(column.code, DeviceKind::Poly.spec().prefix);
         assert!(column.instrument, "an instrument did not say so");
@@ -538,8 +625,8 @@ mod tests {
         let channel = lanes.iter().filter(|lane| **lane == Lane::Channel).count();
         assert_eq!(
             channel,
-            1 + SectionKind::STRIP.len(),
-            "the instrument and the strip are the channel's own"
+            3 + SectionKind::STRIP.len(),
+            "the instrument, boundary gains, and strip are the channel's own"
         );
         // The bus this track feeds, then the mix, then the returns —
         // in that order, because that is the order the signal takes.
@@ -604,17 +691,23 @@ mod tests {
             titles,
             [
                 DeviceKind::Poly.spec().name,
+                "INPUT GAIN",
                 DeviceKind::Reverb.spec().name,
                 DeviceKind::Sat.spec().name,
+                "OUTPUT GAIN",
             ],
             "the band did not draw the chain in the order the graph runs it"
         );
     }
 
     #[test]
-    fn a_track_with_no_chain_has_no_columns() {
+    fn a_new_track_shows_its_boundary_gain_columns() {
         let song = Song::default();
-        assert!(columns(&song, 0).is_empty());
+        let titles: Vec<_> = columns(&song, 0)
+            .iter()
+            .map(|column| column.title)
+            .collect();
+        assert_eq!(titles, ["INPUT GAIN", "OUTPUT GAIN"]);
         assert!(
             columns(&song, 99).is_empty(),
             "a track that is not there drew"
@@ -627,8 +720,8 @@ mod tests {
         song.add_track(TrackKind::Audio);
         song.add_device(1, DeviceKind::Reverb).expect("effect");
         let columns = columns(&song, 1);
-        assert_eq!(columns.len(), 1);
-        assert!(!columns[0].instrument);
+        assert_eq!(columns.len(), 3);
+        assert!(columns.iter().all(|column| !column.instrument));
     }
 
     #[test]
@@ -680,10 +773,10 @@ mod tests {
     #[test]
     fn a_choice_is_shown_by_name_and_a_range_by_number() {
         let (mut song, track) = song_with(DeviceKind::Poly);
-        let id = song.tracks[0].chain[0].id;
+        let id = added_id(&song, DeviceKind::Poly);
         let wave = crate::params::poly::A_WAVE;
         song.device_mut(id).expect("there").set(wave, 2.0);
-        let column = columns(&song, track).pop().expect("one device");
+        let column = added_column(&song, DeviceKind::Poly);
         let row = column
             .rows
             .iter()
@@ -719,12 +812,56 @@ mod tests {
     #[test]
     fn a_sampler_column_names_its_file() {
         let (mut song, track) = song_with(DeviceKind::Sampler);
-        let bare = columns(&song, track).pop().expect("one device");
+        let bare = added_column(&song, DeviceKind::Sampler);
         assert_eq!(bare.sample, None);
-        let id = song.tracks[0].chain[0].id;
+        let id = added_id(&song, DeviceKind::Sampler);
         song.device_mut(id).expect("there").sample = Some("/kits/909/kick 01.wav".into());
-        let loaded = columns(&song, track).pop().expect("one device");
+        let loaded = added_column(&song, DeviceKind::Sampler);
         assert_eq!(loaded.sample.as_deref(), Some("kick 01.wav"));
+    }
+
+    #[test]
+    fn a_sampler_column_carries_the_material_state_its_face_needs() {
+        use crate::params::sampler as sp;
+
+        let (mut song, _) = song_with(DeviceKind::Sampler);
+        let id = added_id(&song, DeviceKind::Sampler);
+        let device = song.device_mut(id).expect("the sampler");
+        device.sample = Some("/kits/amen.wav".into());
+        device.set(sp::MODE, sp::MODE_SLICE);
+        device.set(sp::START, 0.125);
+        device.set(sp::END, 0.875);
+        device.set(sp::LOOP_MODE, sp::LOOP_PINGPONG);
+        device.set(sp::LOOP_START, 0.4);
+        device.set(sp::SLICE_SOURCE, sp::SLICE_CUSTOM);
+        device.set(sp::REVERSE, 1.0);
+        device.set_slices([0.0, 0.25, 0.625]);
+
+        let column = added_column(&song, DeviceKind::Sampler);
+        let face = column.sampler.expect("a dedicated sampler face");
+        assert_eq!(
+            face.path.as_deref(),
+            Some(std::path::Path::new("/kits/amen.wav"))
+        );
+        assert_eq!(face.mode, sp::MODE_SLICE as usize);
+        assert_eq!((face.start, face.end), (0.125, 0.875));
+        assert_eq!(face.loop_mode, sp::LOOP_PINGPONG as usize);
+        assert_eq!(face.loop_start, 0.4);
+        assert_eq!(face.slice_source, sp::SLICE_CUSTOM as usize);
+        assert_eq!(face.slices, [0.0, 0.25, 0.625]);
+        assert!(face.reversed);
+    }
+
+    #[test]
+    fn only_the_sampler_gets_a_material_face() {
+        for kind in [DeviceKind::Poly, DeviceKind::Sat, DeviceKind::Utility] {
+            let (song, _) = song_with(kind);
+            assert!(
+                added_column(&song, kind).sampler.is_none(),
+                "{} grew a sampler face",
+                kind.spec().name
+            );
+        }
     }
 
     #[test]

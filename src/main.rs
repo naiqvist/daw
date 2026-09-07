@@ -9415,6 +9415,7 @@ impl App {
         // mixer data the projection will hear.
         loaded_song.normalize_group_depths();
         loaded_song.normalize_mixer();
+        loaded_song.normalize_timeline();
         let mut loaded_song_track_map = doc.song_track_map.clone();
         apply_project_doc(doc, &mut self.arrangement, &mut self.transport);
         loaded_song_track_map.retain(|track_id, legacy_index| {
@@ -22544,7 +22545,6 @@ mod tests {
         assert_eq!(back.tracks[0].monitor, crate::track::Monitor::Auto);
     }
 
-    #[test]
     /// A count-in suppresses CAPTURE, not the transport: armed and
     /// rolling stay true throughout, so nothing has to be re-armed when
     /// the bars run out.

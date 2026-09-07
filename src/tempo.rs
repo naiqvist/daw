@@ -2,9 +2,9 @@
 //!
 //! Built green-side, once, and read by the compiler that stamps events.
 //! Contract rule 1 says every event is timeline-sample-stamped (u64), and
-//! rule 4 says sequences ride immutable compiled chunks — so the table is
-//! consumed BEFORE anything crosses to the audio thread. The callback
-//! converts nothing and never sees a tempo.
+//! rule 4 says sequences ride immutable compiled chunks. The green-side
+//! compiler stamps events through this table, then the schedule owns one
+//! immutable copy so the callback can do bounded read-only clock lookups.
 //!
 //! Tempo is constant between marks. A prefix sum over constant segments is
 //! exact; an integrated ramp accumulates float error along a long
@@ -53,11 +53,7 @@ impl TempoTable {
         } else {
             48_000.0
         };
-        let fallback = if fallback_bpm.is_finite() && fallback_bpm > 0.0 {
-            fallback_bpm
-        } else {
-            120.0
-        };
+        let fallback = song.bpm_at(0, fallback_bpm);
 
         // Usable marks only, in time order. An unusable bpm is dropped
         // rather than trusted: it would make a tick worth infinity
@@ -136,12 +132,47 @@ impl TempoTable {
         self.segments[at]
     }
 
+    fn segment_for_beat(&self, beat: f64) -> Segment {
+        let tick = beat.max(0.0) * TICKS_PER_BEAT as f64;
+        let at = self
+            .segments
+            .partition_point(|segment| segment.start_tick as f64 <= tick)
+            .saturating_sub(1);
+        self.segments[at]
+    }
+
+    fn segment_for_sample(&self, sample: u64) -> Segment {
+        let at = self
+            .segments
+            .partition_point(|segment| segment.start_sample.round().max(0.0) as u64 <= sample)
+            .saturating_sub(1);
+        self.segments[at]
+    }
+
     /// The absolute sample `tick` falls on. This is the only conversion,
     /// and it happens here rather than anywhere near the callback.
     pub fn sample_at(&self, tick: usize) -> u64 {
         let segment = self.segment_for_tick(tick);
         let sample = segment.start_sample
             + (tick.saturating_sub(segment.start_tick)) as f64 * segment.samples_per_tick;
+        if sample.is_finite() && sample >= 0.0 {
+            sample.round() as u64
+        } else {
+            0
+        }
+    }
+
+    /// The absolute sample a possibly fractional musical beat falls on.
+    /// This keeps deliberately off-grid graph events off-grid while using
+    /// the same piecewise map as Song ticks.
+    pub fn sample_at_beat(&self, beat: f64) -> u64 {
+        if !beat.is_finite() || beat <= 0.0 {
+            return 0;
+        }
+        let segment = self.segment_for_beat(beat);
+        let tick = beat * TICKS_PER_BEAT as f64;
+        let sample = segment.start_sample
+            + (tick - segment.start_tick as f64).max(0.0) * segment.samples_per_tick;
         if sample.is_finite() && sample >= 0.0 {
             sample.round() as u64
         } else {
@@ -171,6 +202,37 @@ impl TempoTable {
         } else {
             segment.start_tick
         }
+    }
+
+    /// The continuous musical beat at an absolute timeline sample. Unlike
+    /// [`Self::tick_at`], this keeps the sub-tick fraction needed by synced
+    /// DSP and a smoothly moving playhead.
+    pub fn beat_at_sample(&self, sample: u64) -> f64 {
+        let segment = self.segment_for_sample(sample);
+        if segment.samples_per_tick <= 0.0 {
+            return segment.start_tick as f64 / TICKS_PER_BEAT as f64;
+        }
+        let into = (sample as f64 - segment.start_sample).max(0.0) / segment.samples_per_tick;
+        (segment.start_tick as f64 + into) / TICKS_PER_BEAT as f64
+    }
+
+    /// Musical beats advanced by one sample in the constant-tempo span
+    /// containing `sample`.
+    pub fn beats_per_sample_at(&self, sample: u64) -> f64 {
+        let segment = self.segment_for_sample(sample);
+        1.0 / (segment.samples_per_tick * TICKS_PER_BEAT as f64)
+    }
+
+    /// The next tempo boundary after `sample`, in absolute sample space.
+    /// A live or offline block splitter uses this before handing DSP one
+    /// constant `beats_per_sample` value.
+    pub fn next_change_after(&self, sample: u64) -> Option<u64> {
+        let at = self
+            .segments
+            .partition_point(|segment| segment.start_sample.round().max(0.0) as u64 <= sample);
+        self.segments
+            .get(at)
+            .map(|segment| segment.start_sample.round().max(0.0) as u64)
     }
 
     /// How long one tick lasts at `tick` — what a ramp generator needs.
@@ -204,6 +266,16 @@ mod tests {
         assert_eq!(table.sample_at(0), 0);
         assert_eq!(table.sample_at(TICKS_PER_BEAT), 24_000, "one beat = 0.5s");
         assert_eq!(table.sample_at(TICKS_PER_BEAT * 2), 48_000);
+    }
+
+    #[test]
+    fn the_song_base_tempo_is_the_empty_maps_authority() {
+        let mut song = song();
+        assert!(song.set_base_bpm(80.0));
+        assert!(!song.set_base_bpm(80.0));
+        let table = TempoTable::build(&song, SR, 120.0);
+        assert_eq!(table.sample_at(TICKS_PER_BEAT), 36_000);
+        assert_eq!(song.bpm_at(0, 999.0), 80.0);
     }
 
     /// A mark at zero replaces the fallback outright.
@@ -263,6 +335,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn continuous_clock_changes_slope_at_the_exact_mark() {
+        let mut song = song();
+        song.set_tempo_mark(0, 120.0);
+        song.set_tempo_mark(TICKS_PER_BEAT, 60.0);
+        let table = TempoTable::build(&song, SR, 120.0);
+
+        assert_eq!(table.sample_at_beat(1.0), 24_000);
+        assert_eq!(table.sample_at_beat(2.0), 72_000);
+        assert_eq!(table.next_change_after(0), Some(24_000));
+        assert_eq!(table.next_change_after(24_000), None);
+        assert!((table.beat_at_sample(12_000) - 0.5).abs() < 1e-12);
+        assert!((table.beat_at_sample(48_000) - 1.5).abs() < 1e-12);
+        assert!((table.beats_per_sample_at(12_000) - 1.0 / 24_000.0).abs() < 1e-15);
+        assert!((table.beats_per_sample_at(48_000) - 1.0 / 48_000.0).abs() < 1e-15);
+    }
+
     /// A tempo nobody could mean is dropped, not stored and not trusted.
     #[test]
     fn an_unusable_tempo_is_refused() {
@@ -290,6 +379,10 @@ mod tests {
         song.set_tempo_mark(0, 120.0);
         song.set_tempo_mark(48, 130.0);
         song.set_tempo_mark(48, 135.0);
+        assert!(
+            !song.set_tempo_mark(48, 135.0),
+            "an identical write is a no-op"
+        );
         let ticks: Vec<usize> = song.tempo.iter().map(|mark| mark.tick).collect();
         assert_eq!(ticks, vec![0, 48, 96]);
         assert_eq!(song.bpm_at(48, 120.0), 135.0, "the later write won");
@@ -306,10 +399,17 @@ mod tests {
         let mut song = song();
         assert_eq!(song.meter_at(0, (4, 4)), (4, 4), "fallback when empty");
         assert!(song.set_meter_mark(TICKS_PER_BEAT * 4, 3, 4));
+        assert!(
+            !song.set_meter_mark(TICKS_PER_BEAT * 4, 3, 4),
+            "an identical write is a no-op"
+        );
         assert!(!song.set_meter_mark(0, 0, 4));
         assert!(!song.set_meter_mark(0, 4, 0));
         assert_eq!(song.meter_at(0, (4, 4)), (4, 4));
         assert_eq!(song.meter_at(TICKS_PER_BEAT * 4, (4, 4)), (3, 4));
+        assert!(song.remove_meter_mark(TICKS_PER_BEAT * 4));
+        assert!(!song.remove_meter_mark(TICKS_PER_BEAT * 4));
+        assert_eq!(song.meter_at(TICKS_PER_BEAT * 4, (4, 4)), (4, 4));
     }
 
     /// A document written before the map loads, and means what it did.
@@ -317,8 +417,12 @@ mod tests {
     fn a_pre_map_document_still_loads_at_one_tempo() {
         let song = song();
         let text = ron::ser::to_string(&song).expect("serializes");
-        let older = text.replace("tempo:[],", "").replace("meter:[],", "");
+        let older = text
+            .replace("bpm:120.0,", "")
+            .replace("tempo:[],", "")
+            .replace("meter:[],", "");
         let back: Song = ron::from_str(&older).expect("older document loads");
+        assert_eq!(back.base_bpm(), 120.0);
         assert!(back.tempo.is_empty());
         assert!(back.meter.is_empty());
         let table = TempoTable::build(&back, SR, 120.0);

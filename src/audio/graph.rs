@@ -8,12 +8,13 @@
 
 use crate::audio::modulation::{ModEdit, ModPlan, ModSpec};
 use creek::{ReadDiskStream, SeekMode, SymphoniaDecoder};
+use std::collections::HashMap;
 use std::f32::consts::TAU;
 
 /// A node's permanent name tag: a `thunderdome` generational index. The slot
 /// may be reused after a removal, but the generation changes — so a stale id
 /// can never address the wrong node, only nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub struct NodeId(thunderdome::Index);
 
 impl NodeId {
@@ -953,6 +954,10 @@ struct FxBase {
     param: u32,
     base: f32,
     live: f32,
+    /// A pattern lock is the top performance layer. Automation may keep
+    /// moving the value underneath it, but cannot erase the lock before its
+    /// explicit restore event arrives.
+    locked: bool,
 }
 
 /// The most effect locks one clock can post in one block. A fixed
@@ -1064,7 +1069,15 @@ impl PatternClock {
         // handler below would "reconcile" by killing the voices the
         // new cycle had just started. Deriving both from
         // `loop_samples` makes them agree by construction.
-        let absolute = (ctx.beat * spb).max(0.0) as u64;
+        // A one-shot arrangement is already stamped in the transport's
+        // absolute sample domain, including through tempo-map changes. A
+        // looping session clip instead owns a synthetic, fixed-tempo sample
+        // domain so its integer modulus and its event stamps stay identical.
+        let absolute = if self.loop_samples == 0 {
+            ctx.position
+        } else {
+            (ctx.beat * spb).max(0.0) as u64
+        };
         let (mut cycle, mut phase) = match absolute.checked_div(self.loop_samples) {
             Some(cyc) => (cyc as i64, absolute % self.loop_samples),
             // No loop: one linear pass, position is the phase.
@@ -1772,6 +1785,20 @@ pub enum Node {
     /// Sums its wired inputs, then applies a ramped master gain
     /// (ParamChange 0 = gain). Stereo out; mono inputs are centered.
     Mixer { gain: f32, target_gain: f32 },
+    /// One calibrated console path. Inputs sum stereo, then each side runs
+    /// its own identity-stable tolerance/noise state. Free-running within a
+    /// graph; reset on discontinuity so a repeated render starts identically.
+    DeskPath {
+        left: crate::dsp::desk::DeskPath,
+        right: crate::dsp::desk::DeskPath,
+    },
+    /// Directional, frequency-shaped coupling from one physical channel into
+    /// its neighbour's bus. Kept as an ordinary feed-forward graph node so
+    /// the analog personality never introduces feedback.
+    DeskBleed {
+        left: crate::dsp::desk::DeskBleed,
+        right: crate::dsp::desk::DeskBleed,
+    },
     /// A SEND: the same sum and ramped gain as a mixer, but it listens
     /// for ONE named parameter of the device that owns it, as a
     /// percentage. It exists so a channel can be tapped into a return
@@ -1791,16 +1818,27 @@ pub enum Node {
         target_pan: f32,
         gain: f32,
         target_gain: f32,
+        /// A compiled Song lane owns this level. Its target is the exact
+        /// endpoint of the current deterministic control segment, so the
+        /// ramp must land there instead of continuing across the device
+        /// block like an ordinary fader letter.
+        gain_is_timeline_automated: bool,
     },
     /// Streams an audio file from disk (creek: decode on its own IO thread,
-    /// RT-safe reads here). Timeline-locked: file frame N plays at timeline
-    /// sample N (1:1 — no resampling yet, so a file at another rate plays
-    /// detuned; surfaced in the lab). Multichannel files mix down to the mono
-    /// slot. On read error the stream is FLAGGED dead, never dropped — a drop
+    /// RT-safe reads here). Timeline-locked: the green-side compile guarantees
+    /// a stream at the device rate, converting a mismatched WAV into the
+    /// importer's deterministic cache before this node exists. Multichannel
+    /// files preserve their first two channels. On read error the stream is
+    /// FLAGGED dead, never dropped — a drop
     /// here would join an IO thread inside the callback; the schedule swap
     /// disposes of it on the UI thread like everything else.
     AudioClip {
         stream: Option<ReadDiskStream<SymphoniaDecoder>>,
+        /// Short looping files are resident so sub-block loops never issue
+        /// hundreds of creek seek messages from one callback. Shared Arc
+        /// storage comes from the sampler material cache; long takes keep
+        /// streaming and never consume arrangement-sized RAM.
+        resident: Option<crate::audio::material::Material>,
         file_frames: u64,
         /// Timeline sample at which this clip becomes audible. Compiled from
         /// musical time; runtime and callback state never store beats here.
@@ -1868,6 +1906,12 @@ pub enum Node {
         /// shared ring would interleave the channels' histories.
         left_buf: Vec<f32>,
         right_buf: Vec<f32>,
+    },
+    /// A live one-input, stereo-f32 CLAP effect. The processor and all pointer
+    /// tables are prepared off-thread; basedrop returns them to the instance's
+    /// dedicated control thread when this schedule retires.
+    Clap {
+        processor: basedrop::Owned<crate::clap_host::ClapGraphProcessor>,
     },
     Seq {
         events: Vec<SeqEvent>,
@@ -2612,6 +2656,8 @@ impl Node {
             | NodeSpec::Disperser { .. }
             | NodeSpec::Tilt { .. }
             | NodeSpec::Phaser { .. } => 2,
+            NodeSpec::Clap { .. } | NodeSpec::DeskPath { .. } | NodeSpec::DeskBleed { .. } => 2,
+            NodeSpec::LatencyBypass { effect } => Self::channels(effect),
             NodeSpec::Delay { channels, .. } => (*channels).clamp(1, 2),
             NodeSpec::Mixer { .. }
             | NodeSpec::Send { .. }
@@ -2720,11 +2766,34 @@ impl Node {
                 *gain = *target_gain; // land exactly, no float drift
             }
 
+            Node::DeskPath { left, right } => {
+                let r = out.r.as_deref_mut().unwrap_or(&mut []);
+                sum_inputs_stereo(inputs, out.l, r);
+                if ctx.discontinuity {
+                    left.reset_signal();
+                    right.reset_signal();
+                }
+                left.process(out.l);
+                right.process(r);
+            }
+
+            Node::DeskBleed { left, right } => {
+                let r = out.r.as_deref_mut().unwrap_or(&mut []);
+                sum_inputs_stereo(inputs, out.l, r);
+                if ctx.discontinuity {
+                    left.reset();
+                    right.reset();
+                }
+                left.process(out.l);
+                right.process(r);
+            }
+
             Node::Pan {
                 pan,
                 target_pan,
                 gain,
                 target_gain,
+                gain_is_timeline_automated,
             } => {
                 // Mono uses constant-power placement. Stereo uses a balance
                 // law: centre preserves both channels, while either extreme
@@ -2734,17 +2803,17 @@ impl Node {
                 let src_r = input.and_then(|input| input.r);
                 let r = out.r.as_deref_mut().unwrap_or(&mut []);
                 let mut ramp = Ramp::across(*pan, *target_pan, out_len);
-                // The LEVEL ramps across what is left of the block, not
-                // across this segment. Letters are drained once per block,
-                // above the segment loop, so a fader jump is already in
-                // `target_gain` when segment 0 runs — and a block split at
-                // a loop point can make that segment one frame long. Spread
-                // over the segment, a 1.0 -> 0.0 move would then be a
-                // one-sample step, which is a click. Pan is left segment
-                // scoped on purpose: it redistributes bounded energy
-                // between two channels, where gain scales it without bound.
-                let remaining = ctx.block_frames.saturating_sub(ctx.offset).max(out_len);
-                let mut level = Ramp::across(*gain, *target_gain, remaining);
+                // An automation target is the endpoint of this deterministic
+                // control segment. An ordinary letter, however, is drained
+                // once per device block and must keep its block-long glide
+                // even when tempo/loop boundaries split that block into a
+                // one-frame segment.
+                let gain_span = if *gain_is_timeline_automated {
+                    out_len
+                } else {
+                    ctx.block_frames.saturating_sub(ctx.offset).max(out_len)
+                };
+                let mut level = Ramp::across(*gain, *target_gain, gain_span);
                 for i in 0..out_len {
                     let p = ramp.next();
                     let g = level.next();
@@ -2767,13 +2836,12 @@ impl Node {
                         }
                     }
                 }
-                // Pan lands exactly at the end of every segment; the
-                // level lands exactly at the end of the BLOCK, and keeps
-                // where it got to in between — otherwise the block-long
-                // ramp above would be undone by every segment boundary.
+                // Pan is segment-scoped. Automated gain is too; an ordinary
+                // fader carries its intermediate value across transport
+                // splits and lands exactly only at the end of the block.
                 *pan = *target_pan;
-                if ctx.offset + out_len >= ctx.block_frames {
-                    *gain = *target_gain; // land exactly, no float drift
+                if *gain_is_timeline_automated || ctx.offset + out_len >= ctx.block_frames {
+                    *gain = *target_gain;
                 } else {
                     *gain = level.value;
                 }
@@ -2781,6 +2849,7 @@ impl Node {
 
             Node::AudioClip {
                 stream,
+                resident,
                 fade_in,
                 fade_out,
                 fade_in_curve,
@@ -2803,13 +2872,13 @@ impl Node {
                 if let Some(r) = out.r.as_deref_mut() {
                     r.fill(0.0);
                 }
-                let (Some(st), false, true) = (stream.as_mut(), *failed, ctx.playing) else {
-                    // Stopped, failed, or no stream: silence. A pause keeps
+                if *failed || !ctx.playing || (stream.is_none() && resident.is_none()) {
+                    // Stopped, failed, or no source: silence. A pause keeps
                     // gain settled so resuming at the same position is
                     // seamless; a discontinuity below starts a fresh ramp.
                     *gain = *target_gain;
                     return;
-                };
+                }
                 if *file_frames == 0 || *source_frames == 0 || *timeline_frames == 0 {
                     return;
                 }
@@ -2858,82 +2927,124 @@ impl Node {
                 } else {
                     *source_start + local_frame
                 };
-                if ctx.discontinuity || want != *next_frame {
-                    // Seek is an async request; until data is ready, reads
-                    // yield silence — creek's documented behavior, accepted.
-                    if st.seek(want as usize, SeekMode::Auto).is_err() {
-                        *failed = true;
-                        return;
-                    }
-                    *next_frame = want;
-                }
-                // Read in runs, splitting at the loop wrap. HARD-BOUNDED:
-                // trusting read() to make progress is an unbounded-time path
-                // (buffering reads can advance creek's playhead while
-                // reporting zero frames). 8 attempts covers any legitimate
-                // segment; anything needing more is a stalled stream, which
-                // renders silence for the remainder of this block.
-                let mut done = 0usize;
-                let mut attempts = 0u32;
-                let source_end = source_start.saturating_add(*source_frames);
-                while done < active_len && attempts < 8 {
-                    attempts += 1;
-                    let until_wrap = source_end.saturating_sub(*next_frame) as usize;
-                    let want_now = (active_len - done).min(until_wrap);
-                    if want_now == 0 {
-                        if !*loop_clip {
-                            break;
+                if let Some(material) = resident.as_ref() {
+                    // Small loops are random-access resident material. That
+                    // turns even a one-frame brace into one bounded memory
+                    // walk instead of one creek seek message per sample.
+                    let source_at = |local: u64| {
+                        if *loop_clip {
+                            let head = loop_from.saturating_sub(*source_start);
+                            let tail = source_start
+                                .saturating_add(*source_frames)
+                                .saturating_sub(*loop_from);
+                            if local < head || tail == 0 {
+                                source_start.saturating_add(local)
+                            } else {
+                                loop_from.saturating_add((local - head) % tail)
+                            }
+                        } else {
+                            source_start.saturating_add(local)
                         }
-                        // Exactly at the wrap: request the BRACE's start
-                        // again, which need not be the region's start and
-                        // need not be file frame zero.
-                        if st.seek(*loop_from as usize, SeekMode::Auto).is_err() {
+                    };
+                    let left = material.channel(0);
+                    let right = if material.channels > 1 {
+                        material.channel(1)
+                    } else {
+                        left
+                    };
+                    for i in 0..active_len {
+                        let source = source_at(local_frame.saturating_add(i as u64)) as usize;
+                        if let (Some(dst), Some(sample)) =
+                            (out.l.get_mut(write_start + i), left.get(source))
+                        {
+                            *dst = *sample;
+                        }
+                    }
+                    if let Some(dst_right) = out.r.as_deref_mut() {
+                        for i in 0..active_len {
+                            let source = source_at(local_frame.saturating_add(i as u64)) as usize;
+                            if let (Some(dst), Some(sample)) =
+                                (dst_right.get_mut(write_start + i), right.get(source))
+                            {
+                                *dst = *sample;
+                            }
+                        }
+                    }
+                    *next_frame = source_at(local_frame.saturating_add(active_len as u64));
+                } else if let Some(st) = stream.as_mut() {
+                    if ctx.discontinuity || want != *next_frame {
+                        // Seek is an async request; until data is ready, reads
+                        // yield silence — creek's documented behavior.
+                        if st.seek(want as usize, SeekMode::Auto).is_err() {
                             *failed = true;
                             return;
                         }
-                        *next_frame = *loop_from;
-                        continue;
+                        *next_frame = want;
                     }
-                    match st.read(want_now) {
-                        Ok(data) => {
-                            let got = data.num_frames().min(want_now);
-                            if got == 0 {
-                                break; // EOF or stalled: silence the rest
+                    // Read in runs, splitting at the loop wrap. HARD-BOUNDED
+                    // by the output frames: each success advances at least
+                    // one and a zero read breaks.
+                    let mut done = 0usize;
+                    let mut reads_left = active_len;
+                    let source_end = source_start.saturating_add(*source_frames);
+                    while done < active_len && reads_left > 0 {
+                        reads_left -= 1;
+                        if *next_frame >= source_end {
+                            if !*loop_clip {
+                                break;
                             }
-                            // ch0 -> L; ch1 -> R (mono files: same to both).
-                            let src_l = data.read_channel(0);
-                            let dst = write_start + done;
-                            for (d, s) in out.l[dst..dst + got].iter_mut().zip(src_l.iter()) {
-                                *d = *s;
+                            // Exactly at the wrap: request the BRACE's start
+                            // again, which need not be the region's start.
+                            if st.seek(*loop_from as usize, SeekMode::Auto).is_err() {
+                                *failed = true;
+                                return;
                             }
-                            if let Some(r) = out.r.as_deref_mut() {
-                                let src_r = if data.num_channels() > 1 {
-                                    data.read_channel(1)
-                                } else {
-                                    src_l
-                                };
-                                for (d, s) in r[dst..dst + got].iter_mut().zip(src_r.iter()) {
+                            *next_frame = *loop_from;
+                        }
+                        let until_wrap = source_end.saturating_sub(*next_frame) as usize;
+                        let want_now = (active_len - done).min(until_wrap);
+                        if want_now == 0 {
+                            break;
+                        }
+                        match st.read(want_now) {
+                            Ok(data) => {
+                                let got = data.num_frames().min(want_now);
+                                if got == 0 {
+                                    break; // EOF or stalled: silence the rest
+                                }
+                                // ch0 -> L; ch1 -> R (mono: same to both).
+                                let src_l = data.read_channel(0);
+                                let dst = write_start + done;
+                                for (d, s) in out.l[dst..dst + got].iter_mut().zip(src_l.iter()) {
                                     *d = *s;
                                 }
-                            }
-                            // Creek's own playhead is the truth — a buffering
-                            // read can advance it without delivering frames,
-                            // and a drifted mirror here means reading forever.
-                            *next_frame = st.playhead() as u64;
-                            if *loop_clip && *next_frame >= source_end {
-                                if st.seek(*loop_from as usize, SeekMode::Auto).is_err() {
-                                    *failed = true;
-                                    return;
+                                if let Some(r) = out.r.as_deref_mut() {
+                                    let src_r = if data.num_channels() > 1 {
+                                        data.read_channel(1)
+                                    } else {
+                                        src_l
+                                    };
+                                    for (d, s) in r[dst..dst + got].iter_mut().zip(src_r.iter()) {
+                                        *d = *s;
+                                    }
                                 }
-                                *next_frame = *loop_from;
+                                // Creek's own playhead is the truth.
+                                *next_frame = st.playhead() as u64;
+                                if *loop_clip && *next_frame >= source_end {
+                                    if st.seek(*loop_from as usize, SeekMode::Auto).is_err() {
+                                        *failed = true;
+                                        return;
+                                    }
+                                    *next_frame = *loop_from;
+                                }
+                                done += got;
                             }
-                            done += got;
-                        }
-                        Err(_) => {
-                            // Flag and silence; the stream is disposed of on
-                            // the UI thread with the schedule, never here.
-                            *failed = true;
-                            break;
+                            Err(_) => {
+                                // Flag and silence; schedule disposal joins
+                                // the stream on the green side.
+                                *failed = true;
+                                break;
+                            }
                         }
                     }
                 }
@@ -3284,19 +3395,49 @@ impl Node {
                     crate::dsp::mem::clear(left_buf);
                     crate::dsp::mem::clear(right_buf);
                 }
-                sum_inputs_mono(inputs, out.l);
-                left.process_exact(out.l, left_buf);
                 if let Some(r) = out.r.as_deref_mut() {
-                    r.fill(0.0);
-                    for input in inputs {
-                        // A mono producer feeds both sides, the same rule
-                        // the rest of the graph centres mono by.
-                        let src = input.r.unwrap_or(input.l);
-                        for (d, s) in r.iter_mut().zip(src.iter()) {
-                            *d += *s;
-                        }
-                    }
+                    // A stereo delay is two independent wires. Folding both
+                    // input sides into the left here doubled centred mono and
+                    // leaked the right channel across the field — exactly the
+                    // phase error PDC exists to prevent.
+                    sum_inputs_stereo(inputs, out.l, r);
+                    left.process_exact(out.l, left_buf);
                     right.process_exact(r, right_buf);
+                } else {
+                    sum_inputs_mono(inputs, out.l);
+                    left.process_exact(out.l, left_buf);
+                }
+            }
+
+            Node::Clap { processor } => {
+                let Some(right) = out.r.as_deref_mut() else {
+                    out.l.fill(0.0);
+                    return;
+                };
+                let result = processor.process_filled(
+                    out_len,
+                    out.l,
+                    right,
+                    ctx.discontinuity,
+                    |left, right| {
+                        left.fill(0.0);
+                        right.fill(0.0);
+                        for input in inputs {
+                            for (destination, source) in left.iter_mut().zip(input.l) {
+                                *destination += *source;
+                            }
+                            let source = input.r.unwrap_or(input.l);
+                            for (destination, source) in right.iter_mut().zip(source) {
+                                *destination += *source;
+                            }
+                        }
+                    },
+                );
+                if result.is_err() {
+                    // A plugin failure is explicit silence, never stale arena
+                    // contents or a partially-written native buffer.
+                    out.l.fill(0.0);
+                    right.fill(0.0);
                 }
             }
 
@@ -4319,7 +4460,12 @@ impl Node {
             // No parameters: compile decides a delay's length, and it
             // cannot change without a recompile — a letter that moved it
             // would slide the track it is compensating.
-            Node::Silence | Node::Input { .. } | Node::Delay { .. } => {}
+            Node::Silence
+            | Node::Input { .. }
+            | Node::Delay { .. }
+            | Node::Clap { .. }
+            | Node::DeskPath { .. }
+            | Node::DeskBleed { .. } => {}
             // Every knob is a live letter, including the two pitch
             // envelopes' times — the voice rebuilds its envelope timings
             // when one moves, so a decay turned mid-pattern is heard on
@@ -4954,6 +5100,199 @@ pub struct ParamChange {
     pub value: f32,
 }
 
+/// One authored point in a graph-owned automation lane. Musical time stays
+/// in beats until compile, when the arrangement tempo table turns it into an
+/// absolute sample stamp. `bend` has the Song curve's `-1..=1` meaning.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AutomationPoint {
+    pub beat: f64,
+    pub value: f32,
+    pub bend: f32,
+}
+
+/// Green-zone automation resolved to one concrete node parameter.
+#[derive(Debug, Clone, PartialEq)]
+struct AutomationLaneSpec {
+    node: NodeId,
+    param: u32,
+    base: f32,
+    points: Vec<AutomationPoint>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TimedAutomationPoint {
+    sample: u64,
+    value: f32,
+    bend: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct TimedAutomationLane {
+    node: u64,
+    param: u32,
+    base: f32,
+    points: Vec<TimedAutomationPoint>,
+}
+
+impl TimedAutomationLane {
+    /// Callback-safe curve evaluation. Points are compiled sorted and unique;
+    /// the partition is logarithmic and bounded by immutable project data.
+    fn value_at(&self, sample: u64) -> f32 {
+        let Some(first) = self.points.first() else {
+            return self.base;
+        };
+        if sample < first.sample {
+            return self.base;
+        }
+        let upper = self.points.partition_point(|point| point.sample <= sample);
+        let at = upper.saturating_sub(1);
+        let a = self.points[at];
+        let Some(&b) = self.points.get(at + 1) else {
+            return a.value;
+        };
+        let span = b.sample.saturating_sub(a.sample);
+        if span == 0 {
+            return b.value;
+        }
+        let t = (sample.saturating_sub(a.sample) as f32 / span as f32).clamp(0.0, 1.0);
+        let bend = a.bend.clamp(-1.0, 1.0);
+        let shaped = if bend == 0.0 {
+            t
+        } else if bend > 0.0 {
+            t.powf(1.0 + bend * 5.0)
+        } else {
+            1.0 - (1.0 - t).powf(1.0 + -bend * 5.0)
+        };
+        (b.value - a.value).mul_add(shaped, a.value)
+    }
+}
+
+/// Immutable sample-stamped automation carried by a Schedule. Evaluation is
+/// aligned to absolute sample quanta, so device callback size, UI frame rate,
+/// and offline render block size cannot change the performance.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct AutomationPlan {
+    lanes: Vec<TimedAutomationLane>,
+    /// Exact authored boundaries, shared by all lanes for cheap segment cuts.
+    boundaries: Vec<u64>,
+}
+
+/// A sub-millisecond control interval at 44.1/48 kHz. Authored breakpoints
+/// are additional exact boundaries; bends are piecewise-linearized within
+/// these deterministic spans and node smoothers join their endpoints.
+const AUTOMATION_QUANTUM: u64 = 32;
+
+impl AutomationPlan {
+    fn compile(
+        lanes: &[AutomationLaneSpec],
+        samples_per_beat: f64,
+        timeline: Option<&crate::tempo::TempoTable>,
+    ) -> Self {
+        let mut compiled = Self::default();
+        for lane in lanes {
+            let mut points: Vec<TimedAutomationPoint> = lane
+                .points
+                .iter()
+                .filter(|point| point.beat.is_finite() && point.value.is_finite())
+                .map(|point| {
+                    let beat = point.beat.max(0.0);
+                    let sample = timeline.map_or_else(
+                        || (beat * samples_per_beat).round().max(0.0) as u64,
+                        |map| map.sample_at_beat(beat),
+                    );
+                    TimedAutomationPoint {
+                        sample,
+                        value: point.value,
+                        bend: if point.bend.is_finite() {
+                            point.bend.clamp(-1.0, 1.0)
+                        } else {
+                            0.0
+                        },
+                    }
+                })
+                .collect();
+            points.sort_by_key(|point| point.sample);
+            // Same-sample points cannot describe a segment. Preserve the
+            // authored last-wins rule deterministically after tempo rounding.
+            let mut unique: Vec<TimedAutomationPoint> = Vec::with_capacity(points.len());
+            for point in points {
+                if let Some(last) = unique.last_mut()
+                    && last.sample == point.sample
+                {
+                    *last = point;
+                } else {
+                    unique.push(point);
+                }
+            }
+            if unique.is_empty() {
+                continue;
+            }
+            compiled
+                .boundaries
+                .extend(unique.iter().map(|point| point.sample));
+            compiled.lanes.push(TimedAutomationLane {
+                node: lane.node.to_bits(),
+                param: lane.param,
+                base: lane.base,
+                points: unique,
+            });
+        }
+        compiled.boundaries.sort_unstable();
+        compiled.boundaries.dedup();
+        compiled
+    }
+
+    fn is_empty(&self) -> bool {
+        self.lanes.is_empty()
+    }
+
+    fn next_boundary_after(&self, sample: u64) -> Option<u64> {
+        self.boundaries
+            .get(
+                self.boundaries
+                    .partition_point(|boundary| *boundary <= sample),
+            )
+            .copied()
+    }
+
+    /// The fixed control-grid approximation of one authored curve. If a
+    /// caller's block ends inside a control span, return the point on the SAME
+    /// line between the surrounding absolute boundaries; the next callback
+    /// therefore resumes that line instead of inventing a new curve segment.
+    fn value_at(&self, lane: &TimedAutomationLane, sample: u64) -> f32 {
+        let Some(first) = lane.points.first() else {
+            return lane.base;
+        };
+        if sample < first.sample {
+            return lane.base;
+        }
+        let lower_quantum = sample / AUTOMATION_QUANTUM * AUTOMATION_QUANTUM;
+        let upper_quantum = lower_quantum.saturating_add(AUTOMATION_QUANTUM);
+        let split = self
+            .boundaries
+            .partition_point(|boundary| *boundary <= sample);
+        let lower = self
+            .boundaries
+            .get(split.saturating_sub(1))
+            .copied()
+            .unwrap_or(0)
+            .max(lower_quantum);
+        let upper = self
+            .boundaries
+            .get(split)
+            .copied()
+            .unwrap_or(u64::MAX)
+            .min(upper_quantum);
+        if sample <= lower || upper <= lower {
+            return lane.value_at(sample);
+        }
+        let from = lane.value_at(lower);
+        let to = lane.value_at(upper);
+        let along = (sample - lower) as f32 / (upper - lower) as f32;
+        (to - from).mul_add(along, from)
+    }
+}
+
 /// One wired input as the callback sees it: left channel, and a right channel
 /// when the producer is stereo. Mono sources into stereo consumers are
 /// centered by the consumer reading `l` for both sides.
@@ -5077,6 +5416,125 @@ impl Ramp {
 /// Points past the clip's span are dropped rather than clamped onto its
 /// end, where they would pile up and make the last segment's
 /// interpolation divide by zero.
+/// Resolve an absolute arrangement node into the piecewise timeline's sample
+/// domain while retaining the scalar compiler as the one event validator.
+///
+/// `samples_per_beat` is only a carrier unit here: multiplying the rewritten
+/// beat by it in `compile_events` returns the map's absolute sample. Valid
+/// one-shot subloops are expanded before mapping because a nonlinear tempo
+/// map cannot be applied correctly after beat-relative repetition.
+fn resolve_timeline_spec(
+    spec: &mut NodeSpec,
+    timeline: &crate::tempo::TempoTable,
+    samples_per_beat: f64,
+) {
+    let rewrite_notes = |notes: &mut Vec<Note>, subloops: &mut Vec<SubLoop>| {
+        if !subloops.is_empty()
+            && let Ok(expanded) = expand_subloops(notes, subloops)
+        {
+            *notes = expanded;
+            subloops.clear();
+        }
+        for note in notes {
+            let start = note.start_beats;
+            let end = start + note.len_beats;
+            let on = timeline.sample_at_beat(start);
+            let off = timeline.sample_at_beat(end);
+            note.start_beats = on as f64 / samples_per_beat;
+            note.len_beats = off.saturating_sub(on) as f64 / samples_per_beat;
+        }
+    };
+
+    match spec {
+        NodeSpec::Seq {
+            notes,
+            subloops,
+            loop_len_beats: None,
+            ..
+        }
+        | NodeSpec::Tine {
+            notes,
+            subloops,
+            loop_len_beats: None,
+            ..
+        }
+        | NodeSpec::Poly {
+            notes,
+            subloops,
+            loop_len_beats: None,
+            ..
+        }
+        | NodeSpec::Loom {
+            notes,
+            subloops,
+            loop_len_beats: None,
+            ..
+        }
+        | NodeSpec::Haze {
+            notes,
+            subloops,
+            loop_len_beats: None,
+            ..
+        }
+        | NodeSpec::Kick {
+            notes,
+            subloops,
+            loop_len_beats: None,
+            ..
+        }
+        | NodeSpec::Acid {
+            notes,
+            subloops,
+            loop_len_beats: None,
+            ..
+        }
+        | NodeSpec::Sampler {
+            notes,
+            subloops,
+            loop_len_beats: None,
+            ..
+        }
+        | NodeSpec::Snare {
+            notes,
+            subloops,
+            loop_len_beats: None,
+            ..
+        }
+        | NodeSpec::Tom {
+            notes,
+            subloops,
+            loop_len_beats: None,
+            ..
+        }
+        | NodeSpec::Hat {
+            notes,
+            subloops,
+            loop_len_beats: None,
+            ..
+        }
+        | NodeSpec::Handclap {
+            notes,
+            subloops,
+            loop_len_beats: None,
+            ..
+        } => rewrite_notes(notes, subloops),
+        NodeSpec::AudioClip {
+            start_beats,
+            length_beats,
+            ..
+        } => {
+            let start = *start_beats;
+            let on = timeline.sample_at_beat(start);
+            if let Some(length) = *length_beats {
+                let off = timeline.sample_at_beat(start + length);
+                *length_beats = Some(off.saturating_sub(on) as f64 / samples_per_beat);
+            }
+            *start_beats = on as f64 / samples_per_beat;
+        }
+        _ => {}
+    }
+}
+
 fn sorted_envelope(points: &[(u64, f32)], span: u64) -> Vec<(u64, f32)> {
     let mut out: Vec<(u64, f32)> = points
         .iter()
@@ -5086,6 +5544,53 @@ fn sorted_envelope(points: &[(u64, f32)], span: u64) -> Vec<(u64, f32)> {
     out.sort_by_key(|(at, _)| *at);
     out.dedup_by_key(|(at, _)| *at);
     out
+}
+
+/// Map one frame boundary between sample-rate domains without passing a
+/// large project position through `f32`. Boundaries are rounded, not lengths:
+/// callers map both ends and subtract, so adjoining edits cannot acquire a
+/// one-frame hole from two independent rounds.
+fn frame_at_rate(frame: u64, from_rate: u32, to_rate: u32) -> u64 {
+    if from_rate == 0 || to_rate == 0 || from_rate == to_rate {
+        return frame;
+    }
+    let numerator = u128::from(frame)
+        .saturating_mul(u128::from(to_rate))
+        .saturating_add(u128::from(from_rate / 2));
+    (numerator / u128::from(from_rate)).min(u128::from(u64::MAX)) as u64
+}
+
+/// Open an arrangement stream at the device rate. Imports ordinarily arrive
+/// pre-converted, so this is a no-op. It is still an engine invariant rather
+/// than a UI convention: reopening a 48 kHz project on a 44.1 kHz interface
+/// may never detune every take. A mismatched WAV is converted into the same
+/// deterministic float cache the importer uses, green-side, then streamed by
+/// creek exactly like a native-rate file.
+fn audio_stream_at_rate(
+    path: &std::path::Path,
+    device_rate: u32,
+) -> Option<(ReadDiskStream<SymphoniaDecoder>, u64, u32)> {
+    let mut opts = creek::ReadStreamOptions::<SymphoniaDecoder>::default();
+    // One permanent cache for the region head and one for a later loop brace.
+    // The callback can then wrap either place without depending on disk seek
+    // latency. This is bounded stream-owned memory prepared off the callback.
+    opts.num_caches = 2;
+    let direct = ReadDiskStream::<SymphoniaDecoder>::new(path.to_path_buf(), 0, opts).ok()?;
+    let original_frames = direct.info().num_frames as u64;
+    let original_rate = direct.info().sample_rate.unwrap_or(device_rate);
+    if original_rate == device_rate || original_rate == 0 || device_rate == 0 {
+        return Some((direct, original_frames, original_rate.max(device_rate)));
+    }
+    drop(direct);
+
+    let converted = crate::library::import_wav(path, device_rate).ok()?;
+    let mut opts = creek::ReadStreamOptions::<SymphoniaDecoder>::default();
+    opts.num_caches = 2;
+    let stream = ReadDiskStream::<SymphoniaDecoder>::new(converted.path, 0, opts).ok()?;
+    if stream.info().sample_rate != Some(device_rate) {
+        return None;
+    }
+    Some((stream, original_frames, original_rate))
 }
 
 /// Serde fallbacks for a reverb written before the network replaced the
@@ -5101,6 +5606,29 @@ fn reverb_diffusion_default() -> f32 {
 
 fn unity() -> f32 {
     1.0
+}
+
+/// Green-zone construction for a dry path that keeps a declared latency.
+fn latency_passthrough_node(samples: usize) -> Node {
+    if samples == 0 {
+        return Node::Mixer {
+            gain: 1.0,
+            target_gain: 1.0,
+        };
+    }
+    let len = crate::dsp::delay::buffer_len(samples);
+    let mut left = crate::dsp::delay::DelayLine::new();
+    let mut right = crate::dsp::delay::DelayLine::new();
+    left.prepare(samples);
+    right.prepare(samples);
+    left.set_delay(samples as f32);
+    right.set_delay(samples as f32);
+    Node::Delay {
+        left,
+        right,
+        left_buf: vec![0.0; len],
+        right_buf: vec![0.0; len],
+    }
 }
 
 /// A buffer reference of 1 or 2 arena slots (a mono or stereo edge). Stored
@@ -5138,6 +5666,10 @@ pub struct Schedule {
     /// carry the epoch they were addressed under and the callback bins the
     /// ones that no longer match.
     epoch: u64,
+    /// Piecewise musical clock for an arrangement schedule. Allocated and
+    /// cloned only at compile; the callback performs read-only lookups and
+    /// the whole schedule retires to the green thread.
+    timeline: Option<crate::tempo::TempoTable>,
     nodes: Vec<Node>,
     steps: Vec<Step>,
     arena: Arena,
@@ -5179,6 +5711,9 @@ pub struct Schedule {
     /// the walk, so the values a node reads this segment are this
     /// segment's.
     modulation: ModPlan,
+    /// Sample-stamped Song automation, evaluated inside the callback rather
+    /// than sampled by UI repaint or offline render-block cadence.
+    automation: AutomationPlan,
     /// The knob behind every effect parameter some note locks: what a
     /// restore returns to. Letters move it, so a knob turned mid-playback
     /// is heard on every unlocked note, as with the voice's own locks.
@@ -5236,6 +5771,69 @@ impl Default for Readout {
 const NO_METER: u8 = u8::MAX;
 
 impl Schedule {
+    /// Beat at one absolute transport sample. Arrangement schedules answer
+    /// from their compiled tempo map; session schedules retain the scalar
+    /// transport clock they have always used.
+    pub fn beat_at(&self, position: u64, fallback: crate::audio::transport::TimeMap) -> f64 {
+        self.timeline.as_ref().map_or_else(
+            || fallback.samples_to_beats(position),
+            |timeline| timeline.beat_at_sample(position),
+        )
+    }
+
+    /// Beats advanced per sample in the constant-tempo span at `position`.
+    pub fn beats_per_sample_at(
+        &self,
+        position: u64,
+        fallback: crate::audio::transport::TimeMap,
+    ) -> f64 {
+        self.timeline.as_ref().map_or_else(
+            || fallback.beats_per_sample(),
+            |timeline| timeline.beats_per_sample_at(position),
+        )
+    }
+
+    /// Bound one transport segment so it cannot cross a tempo mark. The
+    /// returned value is always in `1..=remaining` when `remaining > 0`.
+    pub fn frames_until_tempo_change(&self, position: u64, remaining: usize) -> usize {
+        if remaining == 0 {
+            return 0;
+        }
+        self.timeline
+            .as_ref()
+            .and_then(|timeline| timeline.next_change_after(position))
+            .map_or(remaining, |boundary| {
+                let distance = boundary.saturating_sub(position).max(1);
+                if distance >= remaining as u64 {
+                    remaining
+                } else {
+                    distance as usize
+                }
+            })
+    }
+
+    /// Bound one transport segment at every timing authority the compiled
+    /// graph owns: tempo marks, authored automation points, and the absolute
+    /// automation control grid. The grid is anchored to timeline sample zero,
+    /// so changing callback or bounce block size cannot move a curve.
+    pub fn frames_until_control_change(&self, position: u64, remaining: usize) -> usize {
+        let mut limited = self.frames_until_tempo_change(position, remaining);
+        if limited == 0 || self.automation.is_empty() {
+            return limited;
+        }
+        let to_quantum = AUTOMATION_QUANTUM - position % AUTOMATION_QUANTUM;
+        limited = limited.min(to_quantum.min(usize::MAX as u64) as usize);
+        if let Some(boundary) = self.automation.next_boundary_after(position) {
+            limited = limited.min(
+                boundary
+                    .saturating_sub(position)
+                    .max(1)
+                    .min(usize::MAX as u64) as usize,
+            );
+        }
+        limited.max(1)
+    }
+
     /// GREEN ZONE ONLY — blocks, but never forever. Wait until every disk
     /// stream is buffered so an offline render cannot contain buffering
     /// silence. Returns false on timeout — a stalled stream must surface as
@@ -5305,9 +5903,16 @@ impl Schedule {
             .find(|b| b.node == change.node && b.param == change.param)
         {
             base.base = change.value;
-            base.live = change.value;
+            if !base.locked {
+                base.live = change.value;
+            }
         }
-        self.apply_to(change.node, change.param, change.value);
+        let value = self
+            .fx_bases
+            .iter()
+            .find(|b| b.node == change.node && b.param == change.param)
+            .map_or(change.value, |base| base.live);
+        self.apply_to(change.node, change.param, value);
     }
 
     /// Land a value on a node's parameter, or on its modulation base
@@ -5344,6 +5949,31 @@ impl Schedule {
             } else if let Some(node) = nodes.get_mut(dense as usize) {
                 node.apply(param, value);
             }
+        }
+    }
+
+    /// Land an effect lock after modulation has already been evaluated for
+    /// this segment. A modulated target must be recomposed from the new base
+    /// and the CURRENT wire outputs now; the ordinary `land` door correctly
+    /// waits for evaluation and is used by letters/automation before it.
+    fn land_effect_lock(
+        nodes: &mut [Node],
+        modulation: &mut ModPlan,
+        slot_table: &[(u32, u32)],
+        node: u64,
+        param: u32,
+        value: f32,
+    ) {
+        let slot = node as u32 as usize;
+        let generation = (node >> 32) as u32;
+        if let Some(&(g, dense)) = slot_table.get(slot)
+            && g == generation
+            && let Some(node) = nodes.get_mut(dense as usize)
+        {
+            let value = modulation
+                .rebase_evaluated_target(dense as usize, param, value)
+                .unwrap_or(value);
+            node.apply(param, value);
         }
     }
 
@@ -5419,6 +6049,17 @@ impl Schedule {
         self.latency
     }
 
+    /// Red zone: stop every live CLAP processor before this schedule crosses
+    /// back to green for destruction. Bounded by the immutable node count;
+    /// basedrop makes the later ownership drop a lock-free enqueue.
+    pub fn prepare_for_retirement(&mut self) {
+        for node in &mut self.nodes {
+            if let Node::Clap { processor } = node {
+                processor.prepare_for_retirement();
+            }
+        }
+    }
+
     /// Red zone: this segment's modulation telemetry, for the UI's scopes.
     pub fn modulation(&self) -> &ModPlan {
         &self.modulation
@@ -5439,12 +6080,56 @@ impl Schedule {
         self.modulation.apply_edit(edit);
     }
 
+    fn apply_timeline_automation(&mut self, ctx: &ProcessCtx<'_>) {
+        if self.automation.is_empty() {
+            return;
+        }
+        // Nodes ramp from the endpoint reached by the previous deterministic
+        // control segment to this one's endpoint. A stopped transport reads
+        // exactly at its frozen cursor instead of inventing forward motion.
+        let sample = if ctx.playing {
+            ctx.position.saturating_add(ctx.len as u64)
+        } else {
+            ctx.position
+        };
+        let Schedule {
+            automation,
+            fx_bases,
+            nodes,
+            modulation,
+            slot_table,
+            ..
+        } = self;
+        for lane in &automation.lanes {
+            let value = automation.value_at(lane, sample);
+            if !value.is_finite() {
+                continue;
+            }
+            if let Some(base) = fx_bases
+                .iter_mut()
+                .find(|base| base.node == lane.node && base.param == lane.param)
+            {
+                base.base = value;
+                if base.locked {
+                    Self::land(
+                        nodes, modulation, slot_table, lane.node, lane.param, base.live,
+                    );
+                    continue;
+                }
+                base.live = value;
+            }
+            Self::land(nodes, modulation, slot_table, lane.node, lane.param, value);
+        }
+    }
+
     /// Red zone: walk the chart in dependency order for ONE transport
     /// segment, then copy the output node's slot to every device channel.
     /// Buffers are planar; the segment is `ctx.offset..ctx.offset + ctx.len`
     /// within the block. All node buffers are `ctx.len` long.
     pub fn run(&mut self, output: &mut [f32], ctx: &ProcessCtx<'_>) {
         let len = ctx.len;
+
+        self.apply_timeline_automation(ctx);
 
         // Modulation first, so every node reads THIS segment's values. A
         // segment is the right grain rather than a block: a loop wrap ends
@@ -5513,21 +6198,26 @@ impl Schedule {
                     {
                         Some(base) if lock.restore && lock.value > 0.0 => {
                             base.live += (base.base - base.live) * lock.value.clamp(0.0, 1.0);
+                            if lock.value >= 1.0 {
+                                base.locked = false;
+                            }
                             base.live
                         }
                         Some(base) if lock.restore => {
                             base.live = base.base;
+                            base.locked = false;
                             base.live
                         }
                         Some(base) => {
                             base.live = lock.value;
+                            base.locked = true;
                             base.live
                         }
                         None if lock.restore => continue,
                         None => lock.value,
                     };
                     if value.is_finite() {
-                        Self::land(
+                        Self::land_effect_lock(
                             &mut self.nodes,
                             &mut self.modulation,
                             &self.slot_table,
@@ -5651,10 +6341,24 @@ pub enum CompileError {
     TooManyInputs,
     #[error("the output node no longer exists")]
     DanglingOutput,
+    #[error("an automation lane references a node that no longer exists")]
+    DanglingAutomation,
     #[error("a subloop is malformed (end <= start, repeats 0 or > 64) or overlaps another")]
     BadSubLoop,
     #[error("a clip loop length must be a positive, finite number of beats")]
     BadClipLen,
+    #[error("tempo table sample rate does not match graph compile sample rate")]
+    TempoSampleRateMismatch,
+    #[error("live CLAP device `{plugin_id}` has no trusted runtime binding")]
+    MissingClapRuntime { plugin_id: String },
+    #[error("CLAP device `{plugin_id}` could not be prepared: {detail}")]
+    ClapPrepare { plugin_id: String, detail: String },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum ClapBindError {
+    #[error("CLAP factory identity does not match the persisted device")]
+    IdentityMismatch,
 }
 
 impl NodeSpec {
@@ -5688,6 +6392,10 @@ impl NodeSpec {
 #[derive(Default)]
 pub struct GraphSpec {
     nodes: thunderdome::Arena<NodeSpec>,
+    /// Green-only recipes for live CLAP specs, keyed by the same permanent
+    /// name tag as the node. Kept outside `NodeSpec` so that persisted specs
+    /// stay cloneable and never pretend a unique native instance can clone.
+    clap_factories: HashMap<NodeId, crate::clap_host::ClapNodeFactory>,
     /// Wires: (from, to). Summing order at a mixer is wire insertion order —
     /// irrelevant to the sum, stable for debugging.
     wires: Vec<(NodeId, NodeId)>,
@@ -5711,6 +6419,10 @@ pub struct GraphSpec {
     /// resolved to a node and param id by whoever built the graph — the
     /// only place that knows both halves.
     modulation: ModSpec,
+    /// Song automation with target strings already resolved to permanent
+    /// graph node ids. Compile stamps its beats through the same tempo map as
+    /// notes and audio clips.
+    automation: Vec<AutomationLaneSpec>,
     /// The knob behind every effect parameter a note locks, so the
     /// schedule can restore it. Registered by the compiler that knows
     /// the device's value; a lock on a parameter nobody registered is
@@ -5732,6 +6444,24 @@ pub enum NodeSpec {
     },
     Mixer {
         gain: f32,
+    },
+    /// A project-seeded analog path. Identities are already split left/right
+    /// by the graph builder and never derive from node or track order.
+    DeskPath {
+        project_seed: u64,
+        left_identity: u64,
+        right_identity: u64,
+        noise_enabled: bool,
+    },
+    /// Tiny directional coupling between adjacent physical channel paths.
+    /// `from` and `to` are permanent left/right identities, so moving a
+    /// track in the document cannot redraw the desk.
+    DeskBleed {
+        project_seed: u64,
+        from_left: u64,
+        from_right: u64,
+        to_left: u64,
+        to_right: u64,
     },
     /// A tap into a return: a gain node that takes its amount from
     /// `param` of the device it is registered under, as a percentage.
@@ -6261,6 +6991,23 @@ pub enum NodeSpec {
         #[serde(default)]
         params: crate::audio::modulato::ModulatoParams,
     },
+    /// A persisted CLAP effect identity. A live model must be bound to a
+    /// [`ClapNodeFactory`](crate::clap_host::ClapNodeFactory) with
+    /// [`GraphSpec::push_clap`]; an explicit missing model compiles to a dry
+    /// delay of its last-known latency so the rest of the mix stays aligned.
+    Clap {
+        device: crate::clap_host::PluginDeviceModel,
+    },
+    /// A bypassed effect's dry, phase-stable place in a chain.
+    ///
+    /// Keeping the original spec only as a latency declaration lets compile
+    /// prepare a plain delay at the actual device sample rate. The effect is
+    /// never instantiated and receives no parameter letters, but bypassing a
+    /// lookahead, FFT, oversampled or plug-in processor cannot move the track
+    /// against its siblings.
+    LatencyBypass {
+        effect: Box<NodeSpec>,
+    },
     /// Plugin delay compensation, inserted by COMPILE — never by a user and
     /// never by the graph builder.
     ///
@@ -6338,6 +7085,37 @@ impl GraphSpec {
         }
     }
 
+    /// Add a live CLAP effect and bind its trusted, cloneable compile recipe.
+    pub fn push_clap(
+        &mut self,
+        plugin: crate::clap_host::ClapDeviceState,
+        factory: crate::clap_host::ClapNodeFactory,
+    ) -> Result<NodeId, ClapBindError> {
+        if !factory.matches(&plugin) {
+            return Err(ClapBindError::IdentityMismatch);
+        }
+        let id = self.push(NodeSpec::Clap {
+            device: crate::clap_host::PluginDeviceModel::Clap { plugin },
+        });
+        self.clap_factories.insert(id, factory);
+        Ok(id)
+    }
+
+    /// Add the durable placeholder used when a project plugin cannot resolve.
+    /// It passes dry audio delayed by the plugin's last-known latency.
+    pub fn push_missing_clap(
+        &mut self,
+        plugin: crate::clap_host::ClapDeviceState,
+        reason: impl Into<String>,
+    ) -> NodeId {
+        self.push(NodeSpec::Clap {
+            device: crate::clap_host::PluginDeviceModel::Missing {
+                plugin,
+                reason: reason.into(),
+            },
+        })
+    }
+
     pub fn push(&mut self, node: NodeSpec) -> NodeId {
         let id = NodeId(self.nodes.insert(node));
         self.order.push(id);
@@ -6348,8 +7126,10 @@ impl GraphSpec {
     /// dead: letters addressed to it are binned, never redelivered.
     pub fn remove(&mut self, id: NodeId) {
         self.nodes.remove(id.0);
+        self.clap_factories.remove(&id);
         self.order.retain(|n| *n != id);
         self.wires.retain(|(a, b)| *a != id && *b != id);
+        self.automation.retain(|lane| lane.node != id);
         if self.output == Some(id) {
             self.output = None;
         }
@@ -6427,6 +7207,27 @@ impl GraphSpec {
         self.modulation = modulation;
     }
 
+    /// Add or replace one complete automation lane. The builder calls this
+    /// after resolving the Song target against its owning track/device; a
+    /// later lane for the same node/parameter is the explicit winner.
+    pub fn automate(&mut self, node: NodeId, param: u32, base: f32, points: Vec<AutomationPoint>) {
+        let lane = AutomationLaneSpec {
+            node,
+            param,
+            base: if base.is_finite() { base } else { 0.0 },
+            points,
+        };
+        if let Some(existing) = self
+            .automation
+            .iter_mut()
+            .find(|existing| existing.node == node && existing.param == param)
+        {
+            *existing = lane;
+        } else {
+            self.automation.push(lane);
+        }
+    }
+
     /// The modulation this graph will compile.
     pub fn modulation(&self) -> &ModSpec {
         &self.modulation
@@ -6444,7 +7245,7 @@ impl GraphSpec {
     /// track in time as the user turned it, which is why the Filter's drive
     /// stage is permanently in its path rather than switched in at drive
     /// > 0.
-    fn spec_latency(spec: &NodeSpec) -> usize {
+    fn spec_latency(spec: &NodeSpec, sample_rate: u32) -> usize {
         match spec {
             // The half-band round trip of the 2x drive stage.
             // Both run their shaping at 2x, and both keep the round
@@ -6466,6 +7267,29 @@ impl GraphSpec {
             NodeSpec::Resyn { .. } => crate::audio::resyn::LATENCY,
             NodeSpec::Sibyl { .. } => crate::audio::sibyl::LATENCY,
             NodeSpec::Umbra { .. } => crate::audio::umbra::LATENCY,
+            // These console cores look ahead or frame audio and report a real
+            // delay. Keep the pure formulas beside PDC and pin them against
+            // each core's `latency()` in tests.
+            NodeSpec::Section { params } => match params.kind {
+                crate::console::SectionKind::Preamp
+                | crate::console::SectionKind::Cut
+                | crate::console::SectionKind::Drive
+                | crate::console::SectionKind::Iron => {
+                    crate::dsp::shaper::Oversampler2x::new().latency()
+                }
+                crate::console::SectionKind::Door => {
+                    (sample_rate as f32 * crate::params::console::door::LOOKAHEAD_MS / 1_000.0)
+                        .round() as usize
+                }
+                crate::console::SectionKind::Ceiling => ((sample_rate as f32
+                    * crate::params::console::ceiling::LOOKAHEAD_MS
+                    / 1_000.0) as usize)
+                    .max(1),
+                crate::console::SectionKind::Spectra => crate::params::console::spectra::SIZE * 2,
+                _ => 0,
+            },
+            NodeSpec::Clap { device } => device.plugin().latency_samples(),
+            NodeSpec::LatencyBypass { effect } => Self::spec_latency(effect, sample_rate),
             NodeSpec::Delay { samples, .. } => *samples,
             _ => 0,
         }
@@ -6493,7 +7317,7 @@ impl GraphSpec {
     ///
     /// Returns `None` when nothing needs compensating, which is the common
     /// case and skips the copy entirely.
-    fn compensate(&self) -> Option<GraphSpec> {
+    fn compensate(&self, sample_rate: u32) -> Option<GraphSpec> {
         // Dense indices, in insertion order — the same correspondence the
         // compiler uses.
         let n = self.order.len();
@@ -6501,7 +7325,11 @@ impl GraphSpec {
         let latency: Vec<usize> = self
             .order
             .iter()
-            .map(|id| self.nodes.get(id.0).map_or(0, Self::spec_latency))
+            .map(|id| {
+                self.nodes
+                    .get(id.0)
+                    .map_or(0, |spec| Self::spec_latency(spec, sample_rate))
+            })
             .collect();
         if latency.iter().all(|l| *l == 0) {
             return None; // nothing in the graph is late
@@ -6555,6 +7383,14 @@ impl GraphSpec {
         }
         let mapped = |dense: usize| -> Option<NodeId> { remap.get(dense).copied().flatten() };
 
+        // Runtime-only CLAP factories follow their persisted node through the
+        // same remap. The recipe clones; a live native processor never does.
+        for (node, factory) in &self.clap_factories {
+            if let Some(mapped_node) = dense_of(node).and_then(mapped) {
+                out.clap_factories.insert(mapped_node, factory.clone());
+            }
+        }
+
         let mut spliced = false;
         for (from, to) in &self.wires {
             let (Some(f), Some(t)) = (dense_of(from), dense_of(to)) else {
@@ -6594,6 +7430,21 @@ impl GraphSpec {
                 out.meter(*slot, m);
             }
         }
+        for (slot, node) in &self.taps {
+            if let Some(mapped_node) = dense_of(node).and_then(mapped) {
+                out.tap(*slot, mapped_node);
+            }
+        }
+        for (slot, node) in &self.telemetry {
+            if let Some(mapped_node) = dense_of(node).and_then(mapped) {
+                out.telemetry(*slot, mapped_node);
+            }
+        }
+        for (node, param, base) in &self.fx_bases {
+            if let Some(mapped_node) = dense_of(node).and_then(mapped) {
+                out.lock_base(mapped_node, *param, *base);
+            }
+        }
         // Modulation addresses nodes by id, and every id just changed.
         let mut modulation = self.modulation.clone();
         modulation.wires.retain_mut(|wire| {
@@ -6608,6 +7459,11 @@ impl GraphSpec {
             }
         });
         out.set_modulation(modulation);
+        for lane in &self.automation {
+            if let Some(node) = dense_of(&lane.node).and_then(mapped) {
+                out.automate(node, lane.param, lane.base, lane.points.clone());
+            }
+        }
         Some(out)
     }
 
@@ -6632,10 +7488,40 @@ impl GraphSpec {
         // graph whose paths already agree, and needs to know nothing about
         // latency. `compensate` returns None when there is nothing to do,
         // which is every graph with no latency-bearing node in it.
-        if let Some(aligned) = self.compensate() {
-            return aligned.compile_inner(sample_rate, block_frames, bpm);
+        self.compile_resolved(sample_rate, block_frames, bpm, None)
+    }
+
+    /// Compile a one-shot arrangement against its complete piecewise tempo
+    /// map. Session-launcher clips deliberately keep using
+    /// [`Self::compile_at_tempo`]: their loop clock is clip-relative rather
+    /// than an absolute song timeline.
+    pub fn compile_with_tempo_table(
+        &self,
+        sample_rate: u32,
+        block_frames: usize,
+        fallback_bpm: f64,
+        timeline: &crate::tempo::TempoTable,
+    ) -> Result<Schedule, CompileError> {
+        if timeline.sample_rate() != f64::from(sample_rate) {
+            return Err(CompileError::TempoSampleRateMismatch);
         }
-        self.compile_inner(sample_rate, block_frames, bpm)
+        self.compile_resolved(sample_rate, block_frames, fallback_bpm, Some(timeline))
+    }
+
+    fn compile_resolved(
+        &self,
+        sample_rate: u32,
+        block_frames: usize,
+        bpm: f64,
+        timeline: Option<&crate::tempo::TempoTable>,
+    ) -> Result<Schedule, CompileError> {
+        // Alignment first, on a copy: everything below then compiles a
+        // graph whose paths already agree. The musical timeline remains a
+        // separate immutable compile input and therefore survives the copy.
+        if let Some(aligned) = self.compensate(sample_rate) {
+            return aligned.compile_inner(sample_rate, block_frames, bpm, timeline);
+        }
+        self.compile_inner(sample_rate, block_frames, bpm, timeline)
     }
 
     fn compile_inner(
@@ -6643,6 +7529,7 @@ impl GraphSpec {
         sample_rate: u32,
         block_frames: usize,
         bpm: f64,
+        timeline: Option<&crate::tempo::TempoTable>,
     ) -> Result<Schedule, CompileError> {
         // Clamped to the same range the transport accepts, not merely
         // tested for positivity. The node now trusts the COMPILED tempo
@@ -6662,6 +7549,13 @@ impl GraphSpec {
         let plock_glide_samples = (u64::from(sample_rate) * 3).div_ceil(1_000).max(1);
         let n = self.order.len();
         let dense_of = |id: &NodeId| self.order.iter().position(|x| x == id);
+        if self
+            .automation
+            .iter()
+            .any(|lane| dense_of(&lane.node).is_none())
+        {
+            return Err(CompileError::DanglingAutomation);
+        }
 
         // Wires as dense indices, refusing dangles up front.
         let mut in_wires: Vec<Vec<usize>> = vec![Vec::new(); n]; // per node: who feeds it
@@ -6700,8 +7594,19 @@ impl GraphSpec {
             .order
             .iter()
             .map(|id| -> Result<Node, CompileError> {
+                // Map resolution is green-zone work. The editable spec keeps
+                // musical beats; this temporary copy expresses absolute map
+                // samples in the scalar compiler's unit so every existing
+                // event/clip validation remains one shared implementation.
+                let resolved = timeline.and_then(|timeline| {
+                    self.nodes.get(id.0).cloned().map(|mut spec| {
+                        resolve_timeline_spec(&mut spec, timeline, samples_per_beat);
+                        spec
+                    })
+                });
+                let spec = resolved.as_ref().or_else(|| self.nodes.get(id.0));
                 // Ids in `order` always resolve: push/remove keep them in sync.
-                Ok(match self.nodes.get(id.0) {
+                Ok(match spec {
                     Some(NodeSpec::Silence) | None => Node::Silence,
                     Some(NodeSpec::Sine { freq, amp }) => Node::Sine {
                         phase: 0.0,
@@ -6712,28 +7617,68 @@ impl GraphSpec {
                         sample_rate: sample_rate as f32,
                     },
                     Some(NodeSpec::Input { channel }) => Node::Input { channel: *channel },
-                    Some(NodeSpec::Delay { samples, .. }) => {
-                        // One ring per channel, sized here and never
-                        // resized: the callback only reads and writes.
-                        let max = (*samples).max(1);
-                        let len = crate::dsp::delay::buffer_len(max);
-                        let mut left = crate::dsp::delay::DelayLine::new();
-                        let mut right = crate::dsp::delay::DelayLine::new();
-                        left.prepare(max);
-                        right.prepare(max);
-                        left.set_delay(max as f32);
-                        right.set_delay(max as f32);
-                        Node::Delay {
-                            left,
-                            right,
-                            left_buf: vec![0.0; len],
-                            right_buf: vec![0.0; len],
+                    Some(NodeSpec::Delay { samples, .. }) => latency_passthrough_node(*samples),
+                    Some(NodeSpec::LatencyBypass { effect }) => {
+                        latency_passthrough_node(Self::spec_latency(effect, sample_rate))
+                    }
+                    Some(NodeSpec::Clap { device }) => {
+                        let plugin = device.plugin();
+                        if device.is_missing() {
+                            latency_passthrough_node(plugin.latency_samples())
+                        } else {
+                            let factory = self.clap_factories.get(id).ok_or_else(|| {
+                                CompileError::MissingClapRuntime {
+                                    plugin_id: plugin.key.plugin_id.as_str().to_owned(),
+                                }
+                            })?;
+                            let processor = factory
+                                .prepare(plugin, sample_rate, block_frames)
+                                .map_err(|error| CompileError::ClapPrepare {
+                                    plugin_id: plugin.key.plugin_id.as_str().to_owned(),
+                                    detail: error.to_string(),
+                                })?;
+                            Node::Clap { processor }
                         }
                     }
                     Some(NodeSpec::Mixer { gain }) => Node::Mixer {
                         gain: 0.0, // ramp in, same reasoning as sine amp
                         target_gain: *gain,
                     },
+                    Some(NodeSpec::DeskPath {
+                        project_seed,
+                        left_identity,
+                        right_identity,
+                        noise_enabled,
+                    }) => {
+                        let mut left = crate::dsp::desk::DeskPath::new();
+                        let mut right = crate::dsp::desk::DeskPath::new();
+                        left.prepare(
+                            sample_rate as f32,
+                            *project_seed,
+                            *left_identity,
+                            *noise_enabled,
+                        );
+                        right.prepare(
+                            sample_rate as f32,
+                            *project_seed,
+                            *right_identity,
+                            *noise_enabled,
+                        );
+                        Node::DeskPath { left, right }
+                    }
+                    Some(NodeSpec::DeskBleed {
+                        project_seed,
+                        from_left,
+                        from_right,
+                        to_left,
+                        to_right,
+                    }) => {
+                        let mut left = crate::dsp::desk::DeskBleed::new();
+                        let mut right = crate::dsp::desk::DeskBleed::new();
+                        left.prepare(sample_rate as f32, *project_seed, *from_left, *to_left);
+                        right.prepare(sample_rate as f32, *project_seed, *from_right, *to_right);
+                        Node::DeskBleed { left, right }
+                    }
                     Some(NodeSpec::Send { gain, param }) => Node::Send {
                         gain: 0.0, // ramp in, so a send never arrives as a click
                         target_gain: *gain,
@@ -7244,19 +8189,40 @@ impl GraphSpec {
                         fade_out_shape,
                         envelope,
                     }) => {
-                        // Green zone: opening spawns creek's IO thread and
-                        // touches the filesystem — compile is where that lives.
-                        // An unopenable file compiles to a silent, failed clip
-                        // rather than refusing the whole graph: a missing
-                        // sample should not mute the project.
-                        let opts = creek::ReadStreamOptions::<SymphoniaDecoder>::default();
-                        match ReadDiskStream::<SymphoniaDecoder>::new(path.clone(), 0, opts) {
-                            Ok(mut st) => {
+                        // Green zone: opening (and, if the interface rate
+                        // changed, cache conversion) touches disk and may
+                        // spawn creek's worker. An unreadable file is a
+                        // silent failed clip rather than a refused project.
+                        match audio_stream_at_rate(path, sample_rate) {
+                            Some((mut st, original_frames, original_rate)) => {
                                 let frames = st.info().num_frames as u64;
-                                let source_start = (*source_offset_frames).min(frames);
-                                let available = frames.saturating_sub(source_start);
-                                let source_frames =
-                                    (*source_frames).unwrap_or(available).min(available);
+                                // Edit coordinates belong to the rate of the
+                                // file named by the spec. Map BOUNDARIES into
+                                // the prepared stream's domain so trim, brace,
+                                // fade and envelope all preserve seconds.
+                                let original_start = (*source_offset_frames).min(original_frames);
+                                let original_available =
+                                    original_frames.saturating_sub(original_start);
+                                let original_len = (*source_frames)
+                                    .unwrap_or(original_available)
+                                    .min(original_available);
+                                let original_end = original_start.saturating_add(original_len);
+                                let source_start =
+                                    frame_at_rate(original_start, original_rate, sample_rate)
+                                        .min(frames);
+                                let source_end =
+                                    frame_at_rate(original_end, original_rate, sample_rate)
+                                        .min(frames)
+                                        .max(source_start);
+                                let source_frames = source_end.saturating_sub(source_start);
+                                let original_loop = original_start.saturating_add(
+                                    (*loop_start_frames).min(original_len.saturating_sub(1)),
+                                );
+                                let loop_from =
+                                    frame_at_rate(original_loop, original_rate, sample_rate).clamp(
+                                        source_start,
+                                        source_end.saturating_sub(1).max(source_start),
+                                    );
                                 let timeline_start =
                                     ((*start_beats).max(0.0) * samples_per_beat).round() as u64;
                                 let timeline_frames = (*length_beats).map_or_else(
@@ -7269,40 +8235,49 @@ impl GraphSpec {
                                     },
                                     |beats| (beats.max(0.0) * samples_per_beat).round() as u64,
                                 );
-                                // Pin the default cache (index 0) at the file
-                                // start: loop wraps then serve from RAM
-                                // instead of waiting on a disk seek. The seek
-                                // after it is REQUIRED — creek only starts
-                                // prefetching once a seek arrives (its own
-                                // examples do new -> cache -> seek), and
-                                // without it is_ready() stays false forever.
-                                // Green zone — this is compile.
+                                // Pin both legal jump targets. The seek after
+                                // them is required: creek begins prefetch only
+                                // after a seek (new -> cache -> seek).
                                 let _ = st.cache(0, source_start as usize);
+                                if loop_from != source_start && st.num_caches() > 1 {
+                                    let _ = st.cache(1, loop_from as usize);
+                                }
                                 let _ = st.seek(source_start as usize, SeekMode::Auto);
                                 Node::AudioClip {
                                     stream: Some(st),
+                                    resident: if *loop_clip && frames <= 65_536 {
+                                        crate::audio::material::load_cached(path, sample_rate).ok()
+                                    } else {
+                                        None
+                                    },
                                     file_frames: frames,
                                     timeline_start,
                                     timeline_frames,
                                     source_start,
                                     source_frames,
                                     loop_clip: *loop_clip,
-                                    // Clamped into the played region, and
-                                    // NEVER onto its end: a brace of zero
-                                    // length would be a modulus by zero in
-                                    // the callback, which is a panic on the
-                                    // audio thread.
-                                    loop_from: source_start.saturating_add(
-                                        (*loop_start_frames).min(source_frames.saturating_sub(1)),
-                                    ),
+                                    // Clamped into the played region, never
+                                    // onto its end (zero-length modulus is a
+                                    // callback panic).
+                                    loop_from,
                                     gain: 0.0, // ramp in
                                     target_gain: *gain,
                                     // Clamped to the span they live on:
                                     // a fade longer than its clip would
                                     // never reach full level, and two
                                     // that overlap would fight.
-                                    fade_in: (*fade_in_frames).min(timeline_frames),
-                                    fade_out: (*fade_out_frames).min(timeline_frames),
+                                    fade_in: frame_at_rate(
+                                        *fade_in_frames,
+                                        original_rate,
+                                        sample_rate,
+                                    )
+                                    .min(timeline_frames),
+                                    fade_out: frame_at_rate(
+                                        *fade_out_frames,
+                                        original_rate,
+                                        sample_rate,
+                                    )
+                                    .min(timeline_frames),
                                     fade_in_curve: crate::params::clip::Curve::new(*fade_in_shape),
                                     fade_out_curve: crate::params::clip::Curve::new(
                                         *fade_out_shape,
@@ -7312,14 +8287,26 @@ impl GraphSpec {
                                     // assuming it rises, and sorting it
                                     // there would be both an allocation
                                     // and an unbounded path.
-                                    envelope: sorted_envelope(envelope, timeline_frames),
+                                    envelope: sorted_envelope(
+                                        &envelope
+                                            .iter()
+                                            .map(|(at, gain)| {
+                                                (
+                                                    frame_at_rate(*at, original_rate, sample_rate),
+                                                    *gain,
+                                                )
+                                            })
+                                            .collect::<Vec<_>>(),
+                                        timeline_frames,
+                                    ),
                                     envelope_cursor: 0,
                                     failed: false,
                                     next_frame: source_start,
                                 }
                             }
-                            Err(_) => Node::AudioClip {
+                            None => Node::AudioClip {
                                 stream: None,
+                                resident: None,
                                 file_frames: 0,
                                 timeline_start: 0,
                                 timeline_frames: 0,
@@ -7372,6 +8359,9 @@ impl GraphSpec {
                             // which reads as a glitch, not as politeness.
                             gain: level,
                             target_gain: level,
+                            gain_is_timeline_automated: self.automation.iter().any(|lane| {
+                                lane.node == *id && lane.param == crate::params::pan::GAIN
+                            }),
                         }
                     }
                     Some(NodeSpec::Reverb {
@@ -8044,6 +9034,7 @@ impl GraphSpec {
 
         Ok(Schedule {
             epoch: next_schedule_epoch(),
+            timeline: timeline.cloned(),
             nodes,
             steps,
             arena: Arena::new(num_slots.max(1), block_frames),
@@ -8062,6 +9053,7 @@ impl GraphSpec {
             modulation: ModPlan::compile(&self.modulation, sample_rate as f32, |node| {
                 self.order.iter().position(|id| *id == node)
             }),
+            automation: AutomationPlan::compile(&self.automation, samples_per_beat, timeline),
             // The deepest path to the output. Compensation has already made
             // every path agree, so summing along any one of them gives the
             // same answer; the walk below takes the max regardless.
@@ -8073,6 +9065,7 @@ impl GraphSpec {
                     param: *param,
                     base: *base,
                     live: *base,
+                    locked: false,
                 })
                 .collect(),
             latency: output_dense.map_or(0, |out| {
@@ -8086,7 +9079,7 @@ impl GraphSpec {
                                     .order
                                     .get(f)
                                     .and_then(|id| self.nodes.get(id.0))
-                                    .map_or(0, Self::spec_latency)
+                                    .map_or(0, |spec| Self::spec_latency(spec, sample_rate))
                         })
                         .max()
                         .unwrap_or(0);
@@ -8096,7 +9089,7 @@ impl GraphSpec {
                         .order
                         .get(out)
                         .and_then(|id| self.nodes.get(id.0))
-                        .map_or(0, Self::spec_latency)
+                        .map_or(0, |spec| Self::spec_latency(spec, sample_rate))
             }),
         })
     }
@@ -8120,6 +9113,352 @@ mod tests {
             prob: 1.0,
             cond: None,
         }
+    }
+
+    #[test]
+    fn automation_is_sample_stamped_and_same_sample_points_are_last_wins() {
+        let mut spec = GraphSpec::default();
+        let gain = spec.push(NodeSpec::Mixer { gain: 1.0 });
+        spec.set_output(gain);
+        spec.automate(
+            gain,
+            0,
+            1.0,
+            vec![
+                AutomationPoint {
+                    beat: 0.0,
+                    value: 0.25,
+                    bend: 0.0,
+                },
+                // Also rounds to sample zero. Authored order is the tie
+                // breaker, exactly as it is in the Song lane.
+                AutomationPoint {
+                    beat: 0.000_001,
+                    value: 0.5,
+                    bend: 0.0,
+                },
+                AutomationPoint {
+                    beat: 1.0,
+                    value: 1.0,
+                    bend: 0.0,
+                },
+            ],
+        );
+        let sched = spec.compile_at_tempo(48_000, 256, 120.0).unwrap();
+        let lane = &sched.automation.lanes[0];
+        assert_eq!(lane.points.len(), 2);
+        assert_eq!(lane.points[0].sample, 0);
+        assert_eq!(lane.points[0].value, 0.5);
+        assert_eq!(lane.points[1].sample, 24_000);
+        assert_eq!(sched.automation.value_at(lane, 12_000), 0.75);
+    }
+
+    #[test]
+    fn automation_uses_the_arrangement_tempo_table_and_absolute_control_grid() {
+        let mut song = crate::sequencing::Song::default();
+        assert!(song.set_tempo_mark(0, 120.0));
+        assert!(song.set_tempo_mark(crate::sequencing::TICKS_PER_BEAT, 60.0));
+        let timeline = crate::tempo::TempoTable::build(&song, 48_000.0, 120.0);
+        let mut spec = GraphSpec::default();
+        let gain = spec.push(NodeSpec::Mixer { gain: 1.0 });
+        spec.set_output(gain);
+        spec.automate(
+            gain,
+            0,
+            1.0,
+            vec![AutomationPoint {
+                beat: 2.0,
+                value: 0.0,
+                bend: 0.0,
+            }],
+        );
+        let sched = spec
+            .compile_with_tempo_table(48_000, 257, 120.0, &timeline)
+            .unwrap();
+        assert_eq!(sched.automation.lanes[0].points[0].sample, 72_000);
+        assert_eq!(sched.frames_until_control_change(113, 257), 15);
+        assert_eq!(sched.frames_until_control_change(71_999, 257), 1);
+    }
+
+    #[test]
+    fn pattern_lock_stays_above_moving_automation_until_restore() {
+        let mut spec = GraphSpec::default();
+        let gain = spec.push(NodeSpec::Mixer { gain: 1.0 });
+        spec.set_output(gain);
+        spec.lock_base(gain, 0, 1.0);
+        spec.automate(
+            gain,
+            0,
+            1.0,
+            vec![
+                AutomationPoint {
+                    beat: 0.0,
+                    value: 1.0,
+                    bend: 0.0,
+                },
+                AutomationPoint {
+                    beat: 1.0,
+                    value: 0.0,
+                    bend: 0.0,
+                },
+            ],
+        );
+        let mut sched = spec.compile_at_tempo(48_000, 256, 120.0).unwrap();
+        let node = gain.to_bits();
+        sched.fx_bases[0].live = 0.25;
+        sched.fx_bases[0].locked = true;
+        sched.apply_to(node, 0, 0.25);
+
+        let mut out = [0.0; 512];
+        let during_curve = ProcessCtx {
+            position: 11_744,
+            beat: 11_744.0 / 24_000.0,
+            ..ctx(NO_INPUT)
+        };
+        sched.run(&mut out, &during_curve);
+        assert_eq!(sched.fx_bases[0].live, 0.25, "the lock stays on top");
+        assert!(
+            (sched.fx_bases[0].base - 0.5).abs() < 0.001,
+            "the curve continues underneath the lock: {}",
+            sched.fx_bases[0].base
+        );
+
+        // Model the explicit final restore event. The next timeline segment
+        // is then free to own the audible target again.
+        sched.fx_bases[0].live = sched.fx_bases[0].base;
+        sched.fx_bases[0].locked = false;
+        let after_restore = ProcessCtx {
+            position: 12_000,
+            beat: 0.5,
+            ..ctx(NO_INPUT)
+        };
+        sched.run(&mut out, &after_restore);
+        assert_ne!(sched.fx_bases[0].live, 0.25);
+    }
+
+    fn modulated_trigless_effect_lock_schedule() -> (Schedule, usize) {
+        use crate::audio::modulation::{Chain, ModKind, ModShape, ModSpec, Modulator, WireSpec};
+
+        let mut spec = GraphSpec::default();
+        let mix = spec.push(NodeSpec::Mixer { gain: 0.5 });
+        let seq = spec.push(NodeSpec::Seq {
+            notes: vec![Note {
+                start_beats: 0.0,
+                // At 1 kHz and 60 bpm the lock holds for eight samples;
+                // its four-point restore then fires at samples 8..=11.
+                len_beats: 0.008,
+                pitch: 60,
+                vel: 0,
+                plocks: Vec::new(),
+                fx_locks: vec![(mix.to_bits(), crate::params::mixer::GAIN, 1.0)],
+                prob: 1.0,
+                cond: None,
+            }],
+            subloops: Vec::new(),
+            loop_len_beats: None,
+            params: SynthParams::default(),
+        });
+        spec.connect(seq, mix);
+        spec.set_output(mix);
+        spec.lock_base(mix, crate::params::mixer::GAIN, 0.5);
+        spec.set_modulation(ModSpec {
+            sources: vec![Modulator {
+                id: 1,
+                kind: ModKind::Lfo {
+                    shape: ModShape::Square,
+                    rate_beats: 1.0,
+                    free: false,
+                    hz: 1.0,
+                },
+            }],
+            wires: vec![WireSpec {
+                id: 2,
+                source: 1,
+                node: mix,
+                param: crate::params::mixer::GAIN,
+                min: 0.0,
+                max: 2.0,
+                log: false,
+                base: 0.5,
+                chain: Chain {
+                    depth: 0.1,
+                    curve: 0.0,
+                    steps: 0,
+                    smooth_ms: 0.0,
+                },
+                enabled: true,
+                solo: false,
+            }],
+        });
+
+        let schedule = spec.compile_at_tempo(1_000, 16, 60.0).unwrap();
+        let dense = schedule
+            .nodes
+            .iter()
+            .position(|node| matches!(node, Node::Mixer { .. }))
+            .unwrap();
+        (schedule, dense)
+    }
+
+    fn run_effect_lock_segment(
+        schedule: &mut Schedule,
+        output: &mut [f32],
+        position: u64,
+        len: usize,
+        discontinuity: bool,
+    ) {
+        schedule.run(
+            output,
+            &ProcessCtx {
+                device_input: NO_INPUT,
+                in_channels: 2,
+                block_frames: 16,
+                offset: position as usize,
+                len,
+                playing: true,
+                position,
+                beat: position as f64 / 1_000.0,
+                beats_per_sample: 1.0 / 1_000.0,
+                discontinuity,
+            },
+        );
+    }
+
+    fn assert_modulated_mixer_value(schedule: &Schedule, dense: usize, expected: f32) {
+        let actual = schedule
+            .modulation
+            .values()
+            .find(|(node, param, _)| *node == dense && *param == crate::params::mixer::GAIN)
+            .map(|(_, _, value)| value)
+            .unwrap();
+        assert!(
+            (actual - expected).abs() < 1e-6,
+            "modulation plan held {actual}, expected {expected}"
+        );
+        let Node::Mixer { gain, target_gain } = &schedule.nodes[dense] else {
+            panic!("target was not a mixer");
+        };
+        assert!(
+            (*target_gain - expected).abs() < 1e-6,
+            "downstream target held {target_gain}, expected {expected}"
+        );
+        assert!(
+            (*gain - expected).abs() < 1e-6,
+            "downstream node rendered with {gain}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn a_modulated_effect_lock_recomposes_in_its_firing_segment() {
+        let (mut schedule, dense) = modulated_trigless_effect_lock_schedule();
+        let mut output = [0.0; 32];
+
+        // Square is +1 here: depth .1 across a 0..2 span contributes +.2.
+        // The sample-zero lock changes the base from .5 to 1.0, so the
+        // downstream mixer must see 1.2 during this very segment, not .7.
+        run_effect_lock_segment(&mut schedule, &mut output, 0, 8, true);
+
+        assert_eq!(schedule.fx_bases[0].live, 1.0);
+        assert!(schedule.fx_bases[0].locked);
+        assert_modulated_mixer_value(&schedule, dense, 1.2);
+    }
+
+    #[test]
+    fn a_modulated_effect_lock_restore_recomposes_in_its_firing_segment() {
+        let (mut schedule, dense) = modulated_trigless_effect_lock_schedule();
+        let mut output = [0.0; 32];
+        run_effect_lock_segment(&mut schedule, &mut output, 0, 8, true);
+
+        // The bounded return fires one point per sample. At the final point
+        // the live base is back at .5; current +.2 modulation must therefore
+        // land .7 before the downstream mixer renders sample 11.
+        for position in 8..=11 {
+            run_effect_lock_segment(&mut schedule, &mut output, position, 1, false);
+        }
+
+        assert_eq!(schedule.fx_bases[0].live, 0.5);
+        assert!(!schedule.fx_bases[0].locked);
+        assert_modulated_mixer_value(&schedule, dense, 0.7);
+    }
+
+    #[test]
+    fn arrangement_compile_stamps_events_and_clock_through_the_tempo_map() {
+        let mut song = crate::sequencing::Song::default();
+        assert!(song.set_tempo_mark(0, 120.0));
+        assert!(song.set_tempo_mark(crate::sequencing::TICKS_PER_BEAT, 60.0));
+        let timeline = crate::tempo::TempoTable::build(&song, 48_000.0, 120.0);
+
+        let mut spec = GraphSpec::default();
+        let seq = spec.push(NodeSpec::Seq {
+            notes: vec![test_note(2.0)],
+            subloops: Vec::new(),
+            loop_len_beats: None,
+            params: Default::default(),
+        });
+        spec.set_output(seq);
+        let schedule = spec
+            .compile_with_tempo_table(48_000, 256, 120.0, &timeline)
+            .expect("the mapped arrangement compiles");
+
+        let Node::Seq { events, clock, .. } = &schedule.nodes[0] else {
+            panic!("the sequence node changed kind")
+        };
+        assert_eq!(clock.loop_samples, 0, "arrangement events stay one-shot");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].sample, 72_000, "beat 2 follows the slower span");
+        assert_eq!(
+            events[1].sample, 84_000,
+            "the note length uses that span too"
+        );
+        assert_eq!(schedule.frames_until_tempo_change(0, 48_000), 24_000);
+        let fallback = crate::audio::transport::TimeMap {
+            bpm: 120.0,
+            sample_rate: 48_000.0,
+        };
+        assert!((schedule.beat_at(48_000, fallback) - 1.5).abs() < 1e-12);
+        assert!((schedule.beats_per_sample_at(48_000, fallback) - 1.0 / 48_000.0).abs() < 1e-15);
+    }
+
+    #[test]
+    fn a_tempo_table_from_another_sample_rate_is_refused() {
+        let song = crate::sequencing::Song::default();
+        let timeline = crate::tempo::TempoTable::build(&song, 48_000.0, 120.0);
+        assert_eq!(
+            GraphSpec::default()
+                .compile_with_tempo_table(44_100, 256, 120.0, &timeline)
+                .err(),
+            Some(CompileError::TempoSampleRateMismatch)
+        );
+    }
+
+    #[test]
+    fn dense_tempo_map_can_split_more_than_sixty_four_times_in_one_block() {
+        let mut song = crate::sequencing::Song::default();
+        assert!(song.set_base_bpm(999.0));
+        for tick in 1..=96 {
+            let bpm = if tick % 2 == 0 { 998.0 } else { 999.0 };
+            assert!(song.set_tempo_mark(tick, bpm));
+        }
+        let timeline = crate::tempo::TempoTable::build(&song, 48_000.0, 999.0);
+        let schedule = GraphSpec::default()
+            .compile_with_tempo_table(48_000, 8_192, 999.0, &timeline)
+            .expect("the dense map compiles");
+
+        let mut position = 0u64;
+        let mut remaining = 8_192usize;
+        let mut segments = 0usize;
+        while remaining > 0 {
+            let len = schedule.frames_until_tempo_change(position, remaining);
+            assert!((1..=remaining).contains(&len));
+            position += len as u64;
+            remaining -= len;
+            segments += 1;
+        }
+        assert!(
+            segments > 64,
+            "the fixture was not dense enough: {segments}"
+        );
+        assert_eq!(position, 8_192);
     }
 
     /// Swing shifts ONLY the odd on-grid steps, and only when the grid is
@@ -9535,6 +10874,10 @@ mod tests {
         let mut c = ctx(NO_INPUT);
         c.playing = true;
         c.beat = beat;
+        // One-shot arrangements are stamped and played in the absolute
+        // sample domain. Keep this synthetic context internally coherent:
+        // a test seek to beat 100 must not still claim it is at sample zero.
+        c.position = (beat / c.beats_per_sample).round().max(0.0) as u64;
         c.discontinuity = disc;
         c
     }
@@ -9686,6 +11029,183 @@ mod tests {
         assert_eq!(expanded_len_beats(4.0, &subs), 6.0);
     }
 
+    fn clap_state(id: &str, latency: u32) -> crate::clap_host::ClapDeviceState {
+        crate::clap_host::ClapDeviceState {
+            key: crate::clap_host::PluginKey {
+                library_path: std::path::PathBuf::from("/plugins/test.clap"),
+                plugin_id: crate::clap_host::PluginId::new(id).unwrap(),
+            },
+            display_name: "Test CLAP".to_owned(),
+            state: None,
+            reported_latency_samples: latency,
+        }
+    }
+
+    #[test]
+    fn an_unbound_live_clap_device_is_refused_not_faked() {
+        let mut spec = GraphSpec::default();
+        let node = spec.push(NodeSpec::Clap {
+            device: crate::clap_host::PluginDeviceModel::Clap {
+                plugin: clap_state("org.example.unbound", 0),
+            },
+        });
+        spec.set_output(node);
+        assert!(matches!(
+            spec.compile(48_000, 64),
+            Err(CompileError::MissingClapRuntime { plugin_id })
+                if plugin_id == "org.example.unbound"
+        ));
+    }
+
+    #[test]
+    fn a_missing_clap_device_is_a_latency_preserving_dry_path() {
+        const FRAMES: usize = 64;
+        const LATENCY: usize = 7;
+        let mut spec = GraphSpec::default();
+        let left = spec.push(NodeSpec::Input { channel: 0 });
+        let missing = spec.push_missing_clap(
+            clap_state("org.example.missing", LATENCY as u32),
+            "not installed",
+        );
+        let right = spec.push(NodeSpec::Input { channel: 1 });
+        let mix = spec.push(NodeSpec::Mixer { gain: 1.0 });
+        spec.connect(left, missing);
+        spec.connect(missing, mix);
+        spec.connect(right, mix);
+        spec.set_output(mix);
+
+        let mut schedule = spec.compile(48_000, FRAMES).unwrap();
+        assert_eq!(schedule.latency(), LATENCY);
+        let silence = [0.0f32; FRAMES * 2];
+        let mut output = [0.0f32; FRAMES * 2];
+        schedule.run(
+            &mut output,
+            &ProcessCtx {
+                device_input: &silence,
+                in_channels: 2,
+                block_frames: FRAMES,
+                offset: 0,
+                len: FRAMES,
+                playing: true,
+                position: 0,
+                beat: 0.0,
+                beats_per_sample: 120.0 / 60.0 / 48_000.0,
+                discontinuity: true,
+            },
+        );
+
+        // ProcessCtx input is planar: channel 0 begins at 0 and channel 1
+        // begins at FRAMES. Unequal impulses prove that both graph legs reach
+        // the compensated sum; accidentally reading channel 0 twice would
+        // produce 2.0 instead of 1.25.
+        let mut input = [0.0f32; FRAMES * 2];
+        input[0] = 1.0;
+        input[FRAMES] = 0.25;
+        assert_no_alloc::assert_no_alloc(|| {
+            schedule.run(
+                &mut output,
+                &ProcessCtx {
+                    device_input: &input,
+                    in_channels: 2,
+                    block_frames: FRAMES,
+                    offset: 0,
+                    len: FRAMES,
+                    playing: true,
+                    position: FRAMES as u64,
+                    beat: FRAMES as f64 * 120.0 / 60.0 / 48_000.0,
+                    beats_per_sample: 120.0 / 60.0 / 48_000.0,
+                    discontinuity: false,
+                },
+            );
+        });
+        assert!(output[..LATENCY].iter().all(|sample| *sample == 0.0));
+        assert!(
+            output[FRAMES..FRAMES + LATENCY]
+                .iter()
+                .all(|sample| *sample == 0.0)
+        );
+        assert_eq!(output[LATENCY], 1.25);
+        assert_eq!(output[FRAMES + LATENCY], 1.25);
+    }
+
+    #[test]
+    fn compensation_preserves_runtime_and_every_named_side_table() {
+        let Ok(executable) = std::env::current_exe() else {
+            panic!("the current test executable must have a path");
+        };
+        // SAFETY: this test never loads the executable as a plugin. It only
+        // needs a canonical trusted-path value to exercise identity remapping.
+        let Ok(trusted) = (unsafe { crate::clap_host::TrustedPluginPath::from_path(&executable) })
+        else {
+            panic!("the current test executable path must canonicalize");
+        };
+        let Ok(plugin_id) = crate::clap_host::PluginId::new("org.example.remap") else {
+            panic!("the fixture plugin id must be valid");
+        };
+        let mut plugin = clap_state("org.example.remap", 11);
+        plugin.key.library_path = trusted.path().to_path_buf();
+        let factory = crate::clap_host::ClapNodeFactory::new(trusted, plugin_id);
+
+        let mut spec = GraphSpec::default();
+        let source = spec.push(NodeSpec::Sine {
+            freq: 440.0,
+            amp: 0.1,
+        });
+        let clap = spec.push_clap(plugin, factory).unwrap();
+        let mix = spec.push(NodeSpec::Mixer { gain: 1.0 });
+        spec.connect(source, clap);
+        spec.connect(clap, mix);
+        spec.connect(source, mix);
+        spec.set_output(mix);
+        spec.meter(1, clap);
+        spec.tap(2, clap);
+        spec.telemetry(3, clap);
+        spec.lock_base(clap, 99, 0.75);
+
+        let Some(aligned) = spec.compensate(48_000) else {
+            panic!("the CLAP leg must need compensation");
+        };
+        let Some(mapped) = aligned
+            .iter_ordered()
+            .find_map(|(id, node)| matches!(node, NodeSpec::Clap { .. }).then_some(id))
+        else {
+            panic!("the CLAP node must survive compensation");
+        };
+        assert_eq!(aligned.clap_factories.len(), 1);
+        assert!(aligned.clap_factories.contains_key(&mapped));
+        assert!(aligned.meters.contains(&(1, mapped)));
+        assert!(aligned.taps.contains(&(2, mapped)));
+        assert!(aligned.telemetry.contains(&(3, mapped)));
+        assert!(aligned.fx_bases.contains(&(mapped, 99, 0.75)));
+    }
+
+    #[test]
+    fn console_latency_formulas_match_the_real_cores_and_schedule() {
+        for kind in [
+            crate::console::SectionKind::Preamp,
+            crate::console::SectionKind::Cut,
+            crate::console::SectionKind::Drive,
+            crate::console::SectionKind::Iron,
+            crate::console::SectionKind::Door,
+            crate::console::SectionKind::Ceiling,
+            crate::console::SectionKind::Spectra,
+        ] {
+            let params = crate::console::SectionParams::of(kind);
+            let core = crate::audio::console::core_of(&params, 48_000.0, 64);
+            let expected = core.latency();
+            assert!(expected > 0, "{kind:?} must declare its real delay");
+
+            let mut spec = GraphSpec::default();
+            let section = spec.push(NodeSpec::Section { params });
+            spec.set_output(section);
+            assert_eq!(
+                spec.compile(48_000, 64).unwrap().latency(),
+                expected,
+                "{kind:?} graph latency drifted from its core"
+            );
+        }
+    }
+
     /// Two paths into one mixer, one of them through a latency-bearing
     /// node, must arrive together.
     ///
@@ -9773,7 +11293,7 @@ mod tests {
         spec.connect(src, mix); // the early leg
         spec.set_output(mix);
 
-        let Some(aligned) = spec.compensate() else {
+        let Some(aligned) = spec.compensate(48_000) else {
             panic!("a graph with a limiter in one leg needs compensating");
         };
         let delays: Vec<usize> = aligned
@@ -9834,7 +11354,7 @@ mod tests {
         spec.connect(src, mix); // the early leg
         spec.set_output(mix);
 
-        let Some(aligned) = spec.compensate() else {
+        let Some(aligned) = spec.compensate(48_000) else {
             panic!("this graph needs compensating");
         };
         let delays: Vec<usize> = aligned
@@ -9869,7 +11389,7 @@ mod tests {
         let mix = spec.push(NodeSpec::Mixer { gain: 1.0 });
         spec.connect(a, mix);
         spec.set_output(mix);
-        assert!(spec.compensate().is_none());
+        assert!(spec.compensate(48_000).is_none());
         assert_eq!(spec.compile(48_000, 256).unwrap().latency(), 0);
     }
 
@@ -9895,7 +11415,7 @@ mod tests {
         spec.connect(src, f);
         spec.set_output(f);
         assert!(
-            spec.compensate().is_none(),
+            spec.compensate(48_000).is_none(),
             "one path cannot be out of step with itself"
         );
         assert_eq!(
@@ -11837,11 +13357,29 @@ mod tests {
         path
     }
 
+    fn rate_test_wav(name: &str, sample_rate: u32, frames: u32) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("daw-test-{name}-{sample_rate}.wav"));
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        for frame in 0..frames {
+            writer
+                .write_sample((frame as f32 / sample_rate as f32 * 440.0 * TAU).sin() * 0.5)
+                .unwrap();
+        }
+        writer.finalize().unwrap();
+        path
+    }
+
     fn constant_test_wav(name: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!("daw-test-{name}.wav"));
         let spec = hound::WavSpec {
             channels: 1,
-            sample_rate: 48_000,
+            sample_rate: 480,
             bits_per_sample: 16,
             sample_format: hound::SampleFormat::Int,
         };
@@ -11872,6 +13410,98 @@ mod tests {
         });
         spec.set_output(c);
         spec.compile(48_000, 256).unwrap()
+    }
+
+    #[test]
+    fn audio_clip_compile_converts_every_frame_coordinate_to_the_device_rate() {
+        let path = rate_test_wav("rate-domain", 44_100, 44_100);
+        let mut spec = GraphSpec::default();
+        let clip = spec.push(NodeSpec::AudioClip {
+            path: path.clone(),
+            start_beats: 0.0,
+            length_beats: None,
+            source_offset_frames: 4_410,
+            source_frames: Some(8_820),
+            loop_clip: true,
+            loop_start_frames: 2_205,
+            gain: 1.0,
+            fade_in_frames: 441,
+            fade_out_frames: 882,
+            fade_in_shape: 0.0,
+            fade_out_shape: 0.0,
+            envelope: vec![(0, 1.0), (4_410, 0.5)],
+        });
+        spec.set_output(clip);
+        let sched = spec.compile(48_000, 256).unwrap();
+        let Node::AudioClip {
+            file_frames,
+            source_start,
+            source_frames,
+            loop_from,
+            fade_in,
+            fade_out,
+            envelope,
+            ..
+        } = &sched.nodes[0]
+        else {
+            panic!("the clip compiled to its stream node");
+        };
+        assert_eq!(*file_frames, 48_000);
+        assert_eq!(*source_start, 4_800);
+        assert_eq!(*source_frames, 9_600);
+        assert_eq!(*loop_from, 7_200);
+        assert_eq!(*fade_in, 480);
+        assert_eq!(*fade_out, 960);
+        assert_eq!(envelope, &[(0, 1.0), (4_800, 0.5)]);
+
+        let cached = crate::library::import_wav(&path, 48_000).unwrap().path;
+        drop(sched);
+        std::fs::remove_file(cached).ok();
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn audio_clip_frame_mapping_is_exact_for_common_rate_changes() {
+        assert_eq!(frame_at_rate(44_100, 44_100, 48_000), 48_000);
+        assert_eq!(frame_at_rate(96_000, 96_000, 48_000), 48_000);
+        assert_eq!(frame_at_rate(48_000, 48_000, 44_100), 44_100);
+        let start = frame_at_rate(u64::MAX - 10, 44_100, 48_000);
+        assert_eq!(start, u64::MAX, "extreme coordinates saturate, not wrap");
+    }
+
+    #[test]
+    fn a_one_frame_audio_loop_can_fill_a_whole_callback() {
+        let path = std::env::temp_dir().join(format!(
+            "daw-test-one-frame-loop-{}.wav",
+            std::process::id()
+        ));
+        let mut writer = hound::WavWriter::create(
+            &path,
+            hound::WavSpec {
+                channels: 1,
+                sample_rate: 48_000,
+                bits_per_sample: 32,
+                sample_format: hound::SampleFormat::Float,
+            },
+        )
+        .unwrap();
+        writer.write_sample(0.5f32).unwrap();
+        writer.finalize().unwrap();
+        let mut sched = clip_audio_sched(path.clone(), true);
+        assert!(sched.wait_streams_ready(std::time::Duration::from_secs(2)));
+        let mut out = vec![0.0; 512];
+        let mut context = play_ctx(0.0, true);
+        context.position = 0;
+        sched.run(&mut out, &context);
+        context.discontinuity = false;
+        context.position = 256;
+        sched.run(&mut out, &context);
+        assert!(
+            out[..256].iter().all(|sample| *sample > 0.49),
+            "the loop must not stop at the old eight-read ceiling"
+        );
+        drop(sched);
+        std::fs::remove_file(path).ok();
     }
 
     /// Run blocks at increasing positions until sound appears (the IO thread
@@ -12713,6 +14343,49 @@ mod tests {
             panic!("node 1 is the pan");
         };
         assert_eq!(gain, 0.0, "and the block still lands exactly on target");
+    }
+
+    /// A Song lane is deliberately different from a live fader letter: its
+    /// value names the current fixed-grid control segment's endpoint, so it
+    /// must arrive exactly there regardless of the device block size.
+    #[test]
+    fn timeline_automation_lands_the_fader_at_the_control_segment_end() {
+        const SAMPLES_PER_BEAT: f64 = 24_000.0;
+        let mut spec = GraphSpec::default();
+        let source = spec.push(NodeSpec::Sine {
+            freq: 1_000.0,
+            amp: 0.5,
+        });
+        let fader = spec.push(NodeSpec::Pan {
+            pan: 0.0,
+            gain: 1.0,
+        });
+        spec.connect(source, fader);
+        spec.set_output(fader);
+        spec.automate(
+            fader,
+            crate::params::pan::GAIN,
+            1.0,
+            vec![AutomationPoint {
+                beat: 32.0 / SAMPLES_PER_BEAT,
+                value: 0.0,
+                bend: 0.0,
+            }],
+        );
+
+        let mut sched = spec.compile(48_000, 256).unwrap();
+        let mut out = vec![0.0f32; 512];
+        let mut first_control_segment = play_ctx(0.0, true);
+        first_control_segment.len = 32;
+        sched.run(&mut out, &first_control_segment);
+
+        let Node::Pan { gain, .. } = sched.nodes[1] else {
+            panic!("node 1 is the pan");
+        };
+        assert_eq!(
+            gain, 0.0,
+            "the automated endpoint belongs to sample 32, not block sample 256"
+        );
     }
 
     /// A project file can say anything. A non-finite or out-of-range level

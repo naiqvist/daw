@@ -16,21 +16,24 @@
 //!
 //! # What it does not do yet, stated rather than implied
 //!
-//! No device chains (nothing can add one), no sends or returns (the same),
-//! no group summing (a group lane carries no clip, so it contributes no
-//! sound of its own — muting THROUGH a group still works, because
-//! [`Song::audible`] is what decides who reaches the graph at all), and no
-//! p-locks or trig conditions: those are engine features the Song's own
-//! `Trig` has no field for, and inventing one here would put a second
-//! answer beside the model.
+//! Positional group nesting and trig conditions are not compiled here yet.
+//! Parameter locks and automation are; fixed desk buses, returns, channel
+//! strips, device chains, clip playback and monitored audio inputs are part
+//! of both builders. The session model currently carries pattern clips only,
+//! so recorded audio plays from the arrangement rather than a launcher slot.
 //!
 //! Every one of those is an addition to this file, not a rewrite of it.
 
-use crate::audio::graph::{GraphSpec, MAX_METERS, NodeId, NodeSpec, Note as GraphNote};
+use crate::audio::graph::{
+    AutomationPoint as GraphAutomationPoint, GraphSpec, MAX_METERS, MAX_NODE_INPUTS, NodeId,
+    NodeSpec, Note as GraphNote,
+};
+use crate::audio::modulation::{ModSpec, WireSpec};
 use crate::devices::DeviceKind;
 use crate::pitch::nearest_midi;
 use crate::sequencing::{
-    Clip, Device, DeviceId, PATTERN_STEP_TICKS, PATTERN_STEPS, Pattern, Song, TICKS_PER_BEAT, Track,
+    Clip, DeskPathIdentity, DeskPersonality, Device, DeviceId, PATTERN_STEP_TICKS, PATTERN_STEPS,
+    Pattern, Song, TICKS_PER_BEAT, Track,
 };
 
 /// The master's meter slot: the LAST one, so the tracks can take theirs in
@@ -55,15 +58,38 @@ pub struct SongNodes {
     /// The master's output stage, always present — a song with nothing in
     /// it still has somewhere for the meter and the master gain to live.
     pub master: NodeId,
-    /// Every device that reached the graph, by id: chain effects, strip
-    /// sections, and the desk's own. A knob turn rides a letter to its
-    /// node through this table rather than rebuilding the schedule.
+    /// Every REAL device that reached the graph, by id: chain effects,
+    /// strip sections, and the desk's own. Exactly one row per id. A knob
+    /// turn rides a letter to its node through this table rather than
+    /// rebuilding the schedule.
     pub devices: Vec<(DeviceId, NodeId)>,
+    /// Machine-generated nodes that answer to a device's parameter letters
+    /// without being a second device. The channel OUT's two return taps are
+    /// the current case. Kept apart from `devices` so resolving an automation
+    /// target by instance id can never depend on whichever duplicate row a
+    /// linear search happens to meet first.
+    pub param_aliases: Vec<(DeviceId, NodeId)>,
+    /// The two concrete post-fader return taps for each track. Stable target
+    /// strings (`track.send.a`, `track.send.b`) resolve through this table,
+    /// not through OUT's aliases, so the destination is unambiguous.
+    pub sends: Vec<[Option<NodeId>; 2]>,
     /// Which telemetry slot each of those reports under, in the order
     /// they were built. The host reads the slot and hands the stage the
     /// device's id, so a card finds its own figures by the device it
     /// draws.
     pub telemetry: Vec<(DeviceId, usize)>,
+}
+
+impl SongNodes {
+    /// Every node which listens to a device-instance parameter letter.
+    ///
+    /// Most instances yield one row. OUT additionally yields its generated
+    /// send taps, explicitly and after the real device. Static knob sync uses
+    /// this iterator; automation uses the typed output/send/device tables
+    /// above so one target never relies on alias ordering.
+    pub fn device_letter_nodes(&self) -> impl Iterator<Item = (DeviceId, NodeId)> + '_ {
+        self.devices.iter().chain(&self.param_aliases).copied()
+    }
 }
 
 /// Put `node` in the letter table WITHOUT a telemetry slot.
@@ -98,9 +124,54 @@ pub const MIX_METER: usize = 30;
 struct Desk {
     /// The first node of each group bus's rail.
     buses: Vec<NodeId>,
+    /// The output and permanent identity of each group bus. Bus-to-bus
+    /// coupling is tapped here and joins the master sum without feeding a
+    /// neighbour backwards through its nonlinear rail.
+    bus_outputs: Vec<(NodeId, DeskPathIdentity)>,
     /// The first node of each return's rail, in the console's order:
     /// TAPE, then SHADOW. A channel taps itself into these.
     aux: Vec<NodeId>,
+    /// Every structural rail output that belongs in the master sum. The
+    /// reduction tree is sealed only after track and crosstalk feeds exist.
+    master_feeds: Vec<NodeId>,
+    /// Final output of MIX, after its GLUE, IRON, CEILING, and SCOPE run.
+    mix_out: NodeId,
+}
+
+#[derive(Clone, Copy)]
+struct ChannelRoute {
+    out: NodeId,
+    /// `None` is the direct-master fallback for a document with no buses.
+    bus: Option<usize>,
+    identity: DeskPathIdentity,
+}
+
+/// One real stereo personality node from the persisted project draw and a
+/// permanent model identity. Side keys never depend on graph insertion order.
+fn personality_of(personality: DeskPersonality, identity: DeskPathIdentity) -> NodeSpec {
+    let (left_identity, right_identity) = identity.stereo_keys();
+    NodeSpec::DeskPath {
+        project_seed: personality.seed,
+        left_identity,
+        right_identity,
+        noise_enabled: personality.noise_enabled,
+    }
+}
+
+fn bleed_of(
+    personality: DeskPersonality,
+    from: DeskPathIdentity,
+    to: DeskPathIdentity,
+) -> NodeSpec {
+    let (from_left, from_right) = from.stereo_keys();
+    let (to_left, to_right) = to.stereo_keys();
+    NodeSpec::DeskBleed {
+        project_seed: personality.seed,
+        from_left,
+        from_right,
+        to_left,
+        to_right,
+    }
 }
 
 /// One rail — a bus, the mix, a return — as nodes: its sections in
@@ -109,58 +180,68 @@ struct Desk {
 fn rail(
     spec: &mut GraphSpec,
     rail: &crate::sequencing::Rail,
+    personality: DeskPersonality,
     nodes: &mut SongNodes,
 ) -> (NodeId, NodeId) {
     let out = spec.push(NodeSpec::Pan {
         pan: rail.pan,
         gain: rail.volume,
     });
-    let mut first = None;
-    let mut tail = None;
+    // The personality is the rail's input stage: even an otherwise-idle bus
+    // has its own bounded noise floor, and downstream structural processors
+    // hear that floor exactly as they hear summed program material.
+    let personality = spec.push(personality_of(personality, DeskPathIdentity::Rail(rail.id)));
+    let first = personality;
+    let mut tail = personality;
     for device in &rail.sections {
         let Some(node) = effect_of(device) else {
             continue;
         };
         let node = spec.push(node);
         register(spec, nodes, device.id, node);
-        if let Some(previous) = tail {
-            spec.connect(previous, node);
-        }
-        first.get_or_insert(node);
-        tail = Some(node);
+        spec.connect(tail, node);
+        tail = node;
     }
-    if let Some(tail) = tail {
-        spec.connect(tail, out);
-    }
-    (first.unwrap_or(out), out)
+    spec.connect(tail, out);
+    (first, out)
 }
 
-/// The desk: the mix rail into the master, the buses and the returns
-/// into the mix, every rail metered. Built before any track, so the
-/// tracks have somewhere to go.
+/// The desk: buses and returns sum at the live master fader, then traverse
+/// the MIX rail, with every rail metered. The fader must be BEFORE MIX's
+/// CEILING: a post-ceiling boost would make the safety stage a decoration.
+/// Built before any track, so the tracks have somewhere to go.
 fn desk(spec: &mut GraphSpec, song: &Song, nodes: &mut SongNodes, master: NodeId) -> Desk {
-    let (mix_in, mix_out) = rail(spec, &song.console.mix, nodes);
-    spec.connect(mix_out, master);
+    let (mix_in, mix_out) = rail(spec, &song.console.mix, song.desk_personality, nodes);
+    spec.connect(master, mix_in);
     spec.meter(MIX_METER, mix_out);
     let mut buses = Vec::with_capacity(song.console.buses.len());
+    let mut bus_outputs = Vec::with_capacity(song.console.buses.len());
+    let mut master_feeds = Vec::with_capacity(song.console.buses.len() + song.console.aux.len());
     for (index, bus) in song.console.buses.iter().enumerate() {
-        let (bus_in, bus_out) = rail(spec, bus, nodes);
-        spec.connect(bus_out, mix_in);
+        let (bus_in, bus_out) = rail(spec, bus, song.desk_personality, nodes);
         if BUS_METER_BASE + index < RETURN_METER_BASE {
             spec.meter(BUS_METER_BASE + index, bus_out);
         }
         buses.push(bus_in);
+        bus_outputs.push((bus_out, DeskPathIdentity::Rail(bus.id)));
+        master_feeds.push(bus_out);
     }
     let mut aux = Vec::with_capacity(song.console.aux.len());
     for (index, rail_of) in song.console.aux.iter().enumerate() {
-        let (aux_in, aux_out) = rail(spec, rail_of, nodes);
-        spec.connect(aux_out, mix_in);
+        let (aux_in, aux_out) = rail(spec, rail_of, song.desk_personality, nodes);
         if RETURN_METER_BASE + index < MIX_METER {
             spec.meter(RETURN_METER_BASE + index, aux_out);
         }
         aux.push(aux_in);
+        master_feeds.push(aux_out);
     }
-    Desk { buses, aux }
+    Desk {
+        buses,
+        bus_outputs,
+        aux,
+        master_feeds,
+        mix_out,
+    }
 }
 
 /// The two parameters of OUT that are the sends, in the console's return
@@ -181,7 +262,15 @@ const SEND_PARAMS: [u32; 2] = [
 /// as well as the section, and moving a send is a letter rather than a
 /// recompile. A send at zero still builds its node: it ramps, so opening
 /// one is a fade rather than a click.
-fn sends(spec: &mut GraphSpec, track: &Track, out: NodeId, desk: &Desk, nodes: &mut SongNodes) {
+fn sends(
+    spec: &mut GraphSpec,
+    track_index: usize,
+    track: &Track,
+    out: NodeId,
+    desk: &Desk,
+    aux_sources: &mut [Vec<NodeId>],
+    nodes: &mut SongNodes,
+) {
     let Some(section) = track
         .strip
         .iter()
@@ -198,21 +287,144 @@ fn sends(spec: &mut GraphSpec, track: &Track, out: NodeId, desk: &Desk, nodes: &
             param,
         });
         spec.connect(out, node);
-        spec.connect(node, *aux_in);
+        if let Some(sources) = aux_sources.get_mut(index) {
+            sources.push(node);
+        } else {
+            // Defensive fallback for a malformed desk projection. The normal
+            // vectors are constructed from this same `desk.aux` length.
+            spec.connect(node, *aux_in);
+        }
         // The tap answers to the section's letters, and takes no
         // telemetry slot: it has nothing of its own to report.
-        nodes.devices.push((section.id, node));
+        nodes.param_aliases.push((section.id, node));
+        if let Some(row) = nodes.sends.get_mut(track_index)
+            && let Some(slot) = row.get_mut(index)
+        {
+            *slot = Some(node);
+        }
     }
 }
 
-/// The bus a track's output lands on: its own, or the last one when
-/// the desk has fewer than it names.
-fn bus_of(desk: &Desk, track: &crate::sequencing::Track, master: NodeId) -> NodeId {
-    desk.buses
-        .get(usize::from(track.bus))
-        .or(desk.buses.last())
-        .copied()
-        .unwrap_or(master)
+/// The bus a track's output lands on: its own, or the last one when the desk
+/// has fewer than it names. `None` is a desk with no buses: direct master.
+fn bus_of(desk: &Desk, track: &crate::sequencing::Track) -> Option<usize> {
+    (!desk.buses.is_empty()).then(|| usize::from(track.bus).min(desk.buses.len() - 1))
+}
+
+fn feed_bus(
+    bus_sources: &mut [Vec<NodeId>],
+    master_sources: &mut Vec<NodeId>,
+    bus: Option<usize>,
+    source: NodeId,
+) {
+    if let Some(sources) = bus.and_then(|index| bus_sources.get_mut(index)) {
+        sources.push(source);
+    } else {
+        master_sources.push(source);
+    }
+}
+
+/// Add one directional, feed-forward coupling in each direction between
+/// adjacent active physical channels. It lands in the NEIGHBOUR's bus, so a
+/// pair assigned to different groups produces actual cross-bus leakage rather
+/// than a decorative gain change on one sum.
+fn add_adjacent_crosstalk(
+    spec: &mut GraphSpec,
+    personality: DeskPersonality,
+    routes: &[Option<ChannelRoute>],
+    bus_sources: &mut [Vec<NodeId>],
+    master_sources: &mut Vec<NodeId>,
+) {
+    for pair in routes.windows(2) {
+        let [Some(left), Some(right)] = pair else {
+            continue;
+        };
+        for (from, to) in [(*left, *right), (*right, *left)] {
+            let bleed = spec.push(bleed_of(personality, from.identity, to.identity));
+            spec.connect(from.out, bleed);
+            feed_bus(bus_sources, master_sources, to.bus, bleed);
+        }
+    }
+}
+
+/// Group rails are adjacent physical paths too. Each directional tap joins
+/// the master sum after its source bus, which models output-stage coupling
+/// without creating the two-way graph cycle that injecting it back into the
+/// neighbour's input would imply.
+fn add_adjacent_bus_crosstalk(
+    spec: &mut GraphSpec,
+    personality: DeskPersonality,
+    desk: &Desk,
+    master_sources: &mut Vec<NodeId>,
+) {
+    for pair in desk.bus_outputs.windows(2) {
+        let [(left, left_identity), (right, right_identity)] = pair else {
+            continue;
+        };
+        for (from, from_identity, to_identity) in [
+            (*left, *left_identity, *right_identity),
+            (*right, *right_identity, *left_identity),
+        ] {
+            let bleed = spec.push(bleed_of(personality, from_identity, to_identity));
+            spec.connect(from, bleed);
+            master_sources.push(bleed);
+        }
+    }
+}
+
+/// Seal an arbitrary number of channel/send feeds into fixed-fan-in graph
+/// trees. A 24-channel song must not become uncompilable merely because one
+/// group or return receives more than eight paths.
+fn connect_reduced(spec: &mut GraphSpec, sources: &mut Vec<NodeId>, destination: NodeId) {
+    if let Some(sum) = mix_track_sources(spec, std::mem::take(sources)) {
+        spec.connect(sum, destination);
+    }
+}
+
+fn seal_desk_feeds(
+    spec: &mut GraphSpec,
+    desk: &Desk,
+    master: NodeId,
+    bus_sources: &mut [Vec<NodeId>],
+    aux_sources: &mut [Vec<NodeId>],
+    master_sources: &mut Vec<NodeId>,
+) {
+    for (sources, destination) in bus_sources.iter_mut().zip(&desk.buses) {
+        connect_reduced(spec, sources, *destination);
+    }
+    for (sources, destination) in aux_sources.iter_mut().zip(&desk.aux) {
+        connect_reduced(spec, sources, *destination);
+    }
+    connect_reduced(spec, master_sources, master);
+}
+
+/// Add the live device-input sources an audio channel is actually monitoring.
+///
+/// A selected route is only a remembered choice until monitor IN is active,
+/// or monitor AUTO meets an armed channel. Stereo routes are placed left and
+/// right before they join the channel source bus, exactly like the engine's
+/// other compiler; an unavailable hardware channel is silence in `Node::Input`.
+fn push_monitored_input(spec: &mut GraphSpec, track: &Track, sources: &mut Vec<NodeId>) {
+    if track.is_group
+        || track.kind != crate::sequencing::TrackKind::Audio
+        || !track.monitor.hears(track.armed)
+    {
+        return;
+    }
+    match track.input {
+        crate::sequencing::TrackInput::None => {}
+        crate::sequencing::TrackInput::Mono(channel) => {
+            sources.push(spec.push(NodeSpec::Input { channel }));
+        }
+        crate::sequencing::TrackInput::Stereo(left, right) => {
+            for (channel, pan) in [(left, -1.0), (right, 1.0)] {
+                let input = spec.push(NodeSpec::Input { channel });
+                let placed = spec.push(NodeSpec::Pan { pan, gain: 1.0 });
+                spec.connect(input, placed);
+                sources.push(placed);
+            }
+        }
+    }
 }
 
 /// Compile `song` into a graph, playing whatever `playing` says.
@@ -223,9 +435,9 @@ fn bus_of(desk: &Desk, track: &crate::sequencing::Track, master: NodeId) -> Node
 /// row is firing every clip in it, and a performer who could only ever
 /// fire whole rows would be using less than the model already holds.
 ///
-/// Nothing playing anywhere is a legitimate state and not an empty case:
-/// it is the transport rolling with nothing fired, which must produce a
-/// graph that runs and is silent rather than no graph at all.
+/// Nothing launched anywhere is a legitimate state and not an empty case:
+/// it is the transport rolling with nothing fired. The graph still runs;
+/// only an explicitly monitored hardware input may sound in that state.
 pub fn build(song: &Song, playing: &[Option<usize>]) -> (GraphSpec, SongNodes) {
     let mut spec = GraphSpec::default();
     // The master exists before anything can feed it: a song with nothing
@@ -237,15 +449,21 @@ pub fn build(song: &Song, playing: &[Option<usize>]) -> (GraphSpec, SongNodes) {
         meters: vec![None; song.tracks.len()],
         master,
         devices: Vec::new(),
+        param_aliases: Vec::new(),
+        sends: vec![[None; 2]; song.tracks.len()],
         telemetry: Vec::new(),
     };
     let desk = desk(&mut spec, song, &mut nodes, master);
+    let mut bus_sources: Vec<Vec<NodeId>> = (0..desk.buses.len()).map(|_| Vec::new()).collect();
+    let mut aux_sources: Vec<Vec<NodeId>> = (0..desk.aux.len()).map(|_| Vec::new()).collect();
+    let mut master_sources = desk.master_feeds.clone();
+    let mut channel_routes = vec![None; song.tracks.len()];
 
     for (index, track) in song.tracks.iter().enumerate() {
         if !song.audible(index) {
             continue;
         }
-        let Some(pattern) = playing
+        let pattern = playing
             .get(index)
             .copied()
             .flatten()
@@ -253,43 +471,55 @@ pub fn build(song: &Song, playing: &[Option<usize>]) -> (GraphSpec, SongNodes) {
             .and_then(|scene| scene.clip(track.id))
             .and_then(|clip| match clip {
                 Clip::Pattern(id) => song.patterns.iter().find(|pattern| pattern.id == id),
-            })
-        else {
+            });
+
+        let mut sources = Vec::new();
+        let mut voice = None;
+        if let Some(pattern) = pattern {
+            let notes = notes_of(song, pattern, &[]);
+            if !notes.is_empty()
+                && let Some(instrument) = voice_of(track, notes, Some(beats(pattern.length_ticks)))
+            {
+                let node = spec.push(instrument);
+                sources.push(node);
+                voice = Some(node);
+                // The instrument is a device with knobs like any other, so it
+                // goes in the letter table. Leaving it out meant a turn on a
+                // kick was heard only when something ELSE rebuilt the graph.
+                if let Some(head) = track.chain.first().filter(|device| device.is_instrument()) {
+                    address(&mut nodes, head.id, node);
+                }
+            }
+        }
+        push_monitored_input(&mut spec, track, &mut sources);
+        let Some(source) = mix_track_sources(&mut spec, sources) else {
+            // No launched notes and no live input being monitored.
             continue;
         };
 
-        let notes = notes_of(song, pattern, &[]);
-        if notes.is_empty() {
-            // A voice with nothing to play is not silence worth paying a
-            // node for — and a meter that never moves says the same thing
-            // as no meter, which is what an absent slot already means.
-            continue;
-        }
-
-        let Some(instrument) = voice_of(track, notes, Some(beats(pattern.length_ticks))) else {
-            continue;
-        };
-        let voice = spec.push(instrument);
-        // The instrument is a device with knobs like any other, so it
-        // goes in the letter table. Leaving it out meant a turn on a
-        // kick was heard only when something ELSE rebuilt the graph.
-        if let Some(head) = track.chain.first().filter(|device| device.is_instrument()) {
-            address(&mut nodes, head.id, voice);
-        }
         // The effects, in signal order, each fed by the one before it. A
-        // BYPASSED effect is simply not built: the signal passes it by,
-        // which is what bypass means, and costs nothing to run.
+        // bypassed effect becomes a dry latency shadow: none of its DSP is
+        // instantiated, but bypassing it cannot pull this track earlier than
+        // its siblings and turn an A/B comparison into a timing comparison.
         let mut effects: Vec<(DeviceId, NodeId)> = Vec::new();
-        let mut tail = voice;
+        let mut tail = source;
         // The chain's effects, then the strip's sections that are IN, in
         // the desk's order: one run of nodes, each fed by the one before.
         for device in track.chain.iter().chain(track.strip.iter()) {
-            if device.is_instrument() || device.bypassed {
+            if device.is_instrument() {
                 continue;
             }
             let Some(node) = effect_of(device) else {
                 continue;
             };
+            if device.bypassed {
+                let node = spec.push(NodeSpec::LatencyBypass {
+                    effect: Box::new(node),
+                });
+                spec.connect(tail, node);
+                tail = node;
+                continue;
+            }
             let node = spec.push(node);
             spec.connect(tail, node);
             effects.push((device.id, node));
@@ -299,7 +529,9 @@ pub fn build(song: &Song, playing: &[Option<usize>]) -> (GraphSpec, SongNodes) {
         // Now the effects have ids, the notes can name them: the voice's
         // notes are cut again with every effect lock addressed, and every
         // locked effect parameter registers the knob it returns to.
-        if !effects.is_empty() {
+        if let (Some(voice), Some(pattern)) = (voice, pattern)
+            && !effects.is_empty()
+        {
             if let Some(notes) = spec.node_mut(voice).and_then(NodeSpec::notes_mut) {
                 *notes = notes_of(song, pattern, &effects);
             }
@@ -320,6 +552,16 @@ pub fn build(song: &Song, playing: &[Option<usize>]) -> (GraphSpec, SongNodes) {
                 }
             }
         }
+        // The permanent path personality belongs to the channel strip, after
+        // every insert and before the one post-fader/pan output stage. This
+        // keeps established source -> insert routing intact while making the
+        // path audible to the bus, sends, and meter alike.
+        let personality = spec.push(personality_of(
+            song.desk_personality,
+            DeskPathIdentity::Track(track.id),
+        ));
+        spec.connect(tail, personality);
+        tail = personality;
         // The fader and the pan are ONE node, which is why the meter tapped
         // from it reads post-fader and post-pan — what a mixer meter is
         // expected to show.
@@ -328,9 +570,24 @@ pub fn build(song: &Song, playing: &[Option<usize>]) -> (GraphSpec, SongNodes) {
             gain: track.volume,
         });
         spec.connect(tail, out);
-        // Into the desk: the channel's bus, never the master directly.
-        spec.connect(out, bus_of(&desk, track, master));
-        sends(&mut spec, track, out, &desk, &mut nodes);
+        // Collect desk feeds first; a reduction tree seals them after every
+        // channel exists, keeping the graph's fixed fan-in invariant.
+        let bus = bus_of(&desk, track);
+        feed_bus(&mut bus_sources, &mut master_sources, bus, out);
+        channel_routes[index] = Some(ChannelRoute {
+            out,
+            bus,
+            identity: DeskPathIdentity::Track(track.id),
+        });
+        sends(
+            &mut spec,
+            index,
+            track,
+            out,
+            &desk,
+            &mut aux_sources,
+            &mut nodes,
+        );
         nodes.outputs[index] = Some(out);
 
         if index < TRACK_METERS {
@@ -339,8 +596,28 @@ pub fn build(song: &Song, playing: &[Option<usize>]) -> (GraphSpec, SongNodes) {
         }
     }
 
-    spec.meter(MASTER_METER, master);
-    spec.set_output(master);
+    add_adjacent_crosstalk(
+        &mut spec,
+        song.desk_personality,
+        &channel_routes,
+        &mut bus_sources,
+        &mut master_sources,
+    );
+    add_adjacent_bus_crosstalk(&mut spec, song.desk_personality, &desk, &mut master_sources);
+    seal_desk_feeds(
+        &mut spec,
+        &desk,
+        master,
+        &mut bus_sources,
+        &mut aux_sources,
+        &mut master_sources,
+    );
+    // The master fader remains the live-addressable `SongNodes::master`, but
+    // the heard and metered master is AFTER MIX's safety processing.
+    install_automation(&mut spec, song, &nodes);
+    install_modulation(&mut spec, song, &nodes);
+    spec.meter(MASTER_METER, desk.mix_out);
+    spec.set_output(desk.mix_out);
     (spec, nodes)
 }
 
@@ -554,6 +831,45 @@ fn beats(ticks: usize) -> f64 {
     ticks as f64 / TICKS_PER_BEAT as f64
 }
 
+/// Reduce a track's voices and audio clips to one bounded-input source.
+///
+/// `Node::Pan` consumes one input, so wiring several clips straight into it
+/// does not mix them. A reduction tree also keeps a track with a library-sized
+/// number of placements below the graph's fixed fan-in ceiling. This is all
+/// green-side graph construction; the callback sees only the compiled mixers.
+fn mix_track_sources(spec: &mut GraphSpec, mut sources: Vec<NodeId>) -> Option<NodeId> {
+    while sources.len() > 1 {
+        let mut next = Vec::with_capacity(sources.len().div_ceil(MAX_NODE_INPUTS));
+        for group in sources.chunks(MAX_NODE_INPUTS) {
+            if let [only] = group {
+                next.push(*only);
+                continue;
+            }
+            let sum = spec.push(NodeSpec::Mixer { gain: 1.0 });
+            for source in group {
+                spec.connect(*source, sum);
+            }
+            next.push(sum);
+        }
+        sources = next;
+    }
+    sources.pop()
+}
+
+/// An authored clip-envelope point, from the model's dB into the node's
+/// linear gain. These are the same bounds the clip editor enforces. Keeping
+/// the conversion here means the callback only multiplies already-compiled
+/// values, as required by the sequencing contract.
+fn audio_envelope_gain(db: f32) -> f32 {
+    const FLOOR_DB: f32 = -60.0;
+    const CEIL_DB: f32 = 6.0;
+    if !db.is_finite() || db <= FLOOR_DB {
+        0.0
+    } else {
+        crate::dsp::arith::db_to_gain(db.min(CEIL_DB))
+    }
+}
+
 /// The SONG: every track's blocks laid on the timeline, as the graph
 /// plays them. The session's `build` plays one scene and loops it; this
 /// plays the arrangement once from the top, so no node loops and every
@@ -562,8 +878,8 @@ fn beats(ticks: usize) -> f64 {
 /// A pattern block plays its pattern from the block's start, repeated
 /// to fill the block and cut at its end. An audio block streams its
 /// file from the block's start. Effects, pan, and the master are the
-/// track's as in the session; a track with nothing placed on it is
-/// not built at all.
+/// track's as in the session; a track with neither placed content nor a
+/// monitored live input is not built at all.
 pub fn build_song(song: &Song) -> (GraphSpec, SongNodes) {
     let mut spec = GraphSpec::default();
     let master = spec.push(NodeSpec::Mixer { gain: song.master });
@@ -572,90 +888,140 @@ pub fn build_song(song: &Song) -> (GraphSpec, SongNodes) {
         meters: vec![None; song.tracks.len()],
         master,
         devices: Vec::new(),
+        param_aliases: Vec::new(),
+        sends: vec![[None; 2]; song.tracks.len()],
         telemetry: Vec::new(),
     };
     let desk = desk(&mut spec, song, &mut nodes, master);
+    let mut bus_sources: Vec<Vec<NodeId>> = (0..desk.buses.len()).map(|_| Vec::new()).collect();
+    let mut aux_sources: Vec<Vec<NodeId>> = (0..desk.aux.len()).map(|_| Vec::new()).collect();
+    let mut master_sources = desk.master_feeds.clone();
+    let mut channel_routes = vec![None; song.tracks.len()];
 
     for (index, track) in song.tracks.iter().enumerate() {
         if !song.audible(index) {
             continue;
         }
         let notes = notes_of_blocks(song, track, &[]);
-        let audio = audio_blocks_of(song, track);
-        if notes.is_empty() && audio.is_empty() {
-            continue;
-        }
-
-        let out = spec.push(NodeSpec::Pan {
-            pan: track.pan,
-            gain: track.volume,
-        });
-        // The voice and its chain, as the session builds them, when
-        // there are notes to play.
-        if !notes.is_empty()
-            && let Some(instrument) = voice_of(track, notes, None)
-        {
-            let voice = spec.push(instrument);
+        let mut sources = Vec::new();
+        let voice = if notes.is_empty() {
+            None
+        } else {
+            voice_of(track, notes, None).map(|instrument| {
+                let voice = spec.push(instrument);
+                sources.push(voice);
+                voice
+            })
+        };
+        if let Some(voice) = voice {
             // The instrument is a device with knobs like any other, so it
             // goes in the letter table. Leaving it out meant a turn on a
             // kick was heard only when something ELSE rebuilt the graph.
             if let Some(head) = track.chain.first().filter(|device| device.is_instrument()) {
                 address(&mut nodes, head.id, voice);
             }
-            let mut effects: Vec<(DeviceId, NodeId)> = Vec::new();
-            let mut tail = voice;
-            // The chain's effects, then the strip's sections that are IN, in
-            // the desk's order: one run of nodes, each fed by the one before.
-            for device in track.chain.iter().chain(track.strip.iter()) {
-                if device.is_instrument() || device.bypassed {
-                    continue;
-                }
-                let Some(node) = effect_of(device) else {
+        }
+        push_monitored_input(&mut spec, track, &mut sources);
+        for clip in audio_blocks_of(song, track) {
+            sources.push(spec.push(clip));
+        }
+        let Some(source) = mix_track_sources(&mut spec, sources) else {
+            // This includes a reversed clip whose cache render is not ready:
+            // silence is honest; opening its forward file would play it wrong.
+            continue;
+        };
+
+        // Pattern voices and recorded clips share the track's insert chain
+        // and complete channel strip. They are sources of one channel, not a
+        // dry side-door around its processing.
+        let mut effects: Vec<(DeviceId, NodeId)> = Vec::new();
+        let mut tail = source;
+        for device in track.chain.iter().chain(track.strip.iter()) {
+            if device.is_instrument() {
+                continue;
+            }
+            let Some(node) = effect_of(device) else {
+                continue;
+            };
+            if device.bypassed {
+                let node = spec.push(NodeSpec::LatencyBypass {
+                    effect: Box::new(node),
+                });
+                spec.connect(tail, node);
+                tail = node;
+                continue;
+            }
+            let node = spec.push(node);
+            spec.connect(tail, node);
+            effects.push((device.id, node));
+            register(&mut spec, &mut nodes, device.id, node);
+            tail = node;
+        }
+
+        // Once the effects have ids, pattern locks can name exactly the node
+        // they ride. Audio-only tracks still build the same effects above,
+        // but have no note events and therefore no locks to compile.
+        if let Some(voice) = voice
+            && !effects.is_empty()
+        {
+            if let Some(notes) = spec.node_mut(voice).and_then(NodeSpec::notes_mut) {
+                *notes = notes_of_blocks(song, track, &effects);
+            }
+            for block in &track.blocks {
+                let Some(pattern) = song.pattern(block.pattern_id) else {
                     continue;
                 };
-                let node = spec.push(node);
-                spec.connect(tail, node);
-                effects.push((device.id, node));
-                register(&mut spec, &mut nodes, device.id, node);
-                tail = node;
-            }
-            if !effects.is_empty() {
-                if let Some(notes) = spec.node_mut(voice).and_then(NodeSpec::notes_mut) {
-                    *notes = notes_of_blocks(song, track, &effects);
-                }
-                for block in &track.blocks {
-                    let Some(pattern) = song.pattern(block.pattern_id) else {
-                        continue;
-                    };
-                    for step in 0..PATTERN_STEPS {
-                        for lock in &pattern.trig(step).locks {
-                            let Some(id) = lock.device else {
-                                continue;
-                            };
-                            if let Some((_, node)) =
-                                effects.iter().find(|(device, _)| *device == id)
-                                && let Some(device) = track
-                                    .chain
-                                    .iter()
-                                    .chain(track.strip.iter())
-                                    .find(|device| device.id == id)
-                            {
-                                spec.lock_base(*node, lock.param, device.value(lock.param));
-                            }
+                for step in 0..PATTERN_STEPS {
+                    for lock in &pattern.trig(step).locks {
+                        let Some(id) = lock.device else {
+                            continue;
+                        };
+                        if let Some((_, node)) = effects.iter().find(|(device, _)| *device == id)
+                            && let Some(device) = track
+                                .chain
+                                .iter()
+                                .chain(track.strip.iter())
+                                .find(|device| device.id == id)
+                        {
+                            spec.lock_base(*node, lock.param, device.value(lock.param));
                         }
                     }
                 }
             }
-            spec.connect(tail, out);
         }
-        // Audio blocks feed the output beside the chain: a clip is
-        // recorded sound, and the chain is the voice's.
-        for clip in audio {
-            let node = spec.push(clip);
-            spec.connect(node, out);
-        }
-        spec.connect(out, bus_of(&desk, track, master));
-        sends(&mut spec, track, out, &desk, &mut nodes);
+
+        // One stable physical path for the complete channel. Its identity is
+        // the persisted TrackId, so moving the track cannot redraw it.
+        let personality = spec.push(personality_of(
+            song.desk_personality,
+            DeskPathIdentity::Track(track.id),
+        ));
+        spec.connect(tail, personality);
+        tail = personality;
+
+        // One permanent output stage after the whole channel path: meter,
+        // post-fader sends, pan and bus routing all hear the same result.
+        let out = spec.push(NodeSpec::Pan {
+            pan: track.pan,
+            gain: track.volume,
+        });
+        spec.connect(tail, out);
+        let bus = bus_of(&desk, track);
+        feed_bus(&mut bus_sources, &mut master_sources, bus, out);
+        channel_routes[index] = Some(ChannelRoute {
+            out,
+            bus,
+            identity: DeskPathIdentity::Track(track.id),
+        });
+        sends(
+            &mut spec,
+            index,
+            track,
+            out,
+            &desk,
+            &mut aux_sources,
+            &mut nodes,
+        );
         nodes.outputs[index] = Some(out);
         if index < TRACK_METERS {
             spec.meter(index, out);
@@ -663,9 +1029,459 @@ pub fn build_song(song: &Song) -> (GraphSpec, SongNodes) {
         }
     }
 
-    spec.meter(MASTER_METER, master);
-    spec.set_output(master);
+    add_adjacent_crosstalk(
+        &mut spec,
+        song.desk_personality,
+        &channel_routes,
+        &mut bus_sources,
+        &mut master_sources,
+    );
+    add_adjacent_bus_crosstalk(&mut spec, song.desk_personality, &desk, &mut master_sources);
+    seal_desk_feeds(
+        &mut spec,
+        &desk,
+        master,
+        &mut bus_sources,
+        &mut aux_sources,
+        &mut master_sources,
+    );
+    install_automation(&mut spec, song, &nodes);
+    install_modulation(&mut spec, song, &nodes);
+    spec.meter(MASTER_METER, desk.mix_out);
+    spec.set_output(desk.mix_out);
     (spec, nodes)
+}
+
+/// Turn the graph's beat clock into the Song's file-format time.
+///
+/// This conversion is deliberately shared by the live host and offline
+/// bounce. Both sample an envelope at the start of the audio they are about
+/// to run, and both floor to the whole tick the Song editor addresses. A
+/// corrupt clock is the top of the song rather than a fabricated far-future
+/// point.
+pub fn automation_tick(beat: f64) -> usize {
+    if !beat.is_finite() || beat <= 0.0 {
+        0
+    } else {
+        (beat * TICKS_PER_BEAT as f64) as usize
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AutomationBinding {
+    node: NodeId,
+    param: u32,
+    base: f32,
+    min: f32,
+    max: f32,
+    scale: f32,
+}
+
+/// Put Song-owned curves inside the immutable audio schedule. This is the
+/// timing path; [`automation_letters`] remains the public one-shot evaluator
+/// for previews/tests, but live and bounce no longer depend on how often a UI
+/// frame or render block happens to call it.
+fn install_automation(spec: &mut GraphSpec, song: &Song, nodes: &SongNodes) {
+    for (track_index, track) in song.tracks.iter().enumerate() {
+        for (envelope_index, envelope) in track.automation.iter().enumerate() {
+            if envelope.points.is_empty()
+                || track.automation[..envelope_index]
+                    .iter()
+                    .any(|earlier| earlier.target == envelope.target)
+            {
+                continue;
+            }
+            let Some(binding) =
+                automation_binding(track_index, track, envelope.target.as_str(), nodes)
+            else {
+                continue;
+            };
+            let points = envelope
+                .points
+                .iter()
+                .filter(|point| point.value.is_finite())
+                .map(|point| GraphAutomationPoint {
+                    beat: point.tick as f64 / TICKS_PER_BEAT as f64,
+                    value: point.value.clamp(binding.min, binding.max) * binding.scale,
+                    bend: if point.bend.is_finite() {
+                        point.bend.clamp(-1.0, 1.0)
+                    } else {
+                        0.0
+                    },
+                })
+                .collect();
+            spec.automate(
+                binding.node,
+                binding.param,
+                binding.base.clamp(binding.min, binding.max) * binding.scale,
+                points,
+            );
+        }
+    }
+}
+
+/// Put the Song's authored modulation inside the same immutable graph used
+/// by live playback and offline bounce.
+///
+/// Target resolution deliberately goes through [`automation_binding`]: it is
+/// already the one ownership-checked translation from a stable target string
+/// to the concrete node and parameter minted by this build. The send scale is
+/// applied to the base AND bounds here because modulation runs in the node's
+/// units, while the Song stores the two channel sends normalized.
+fn install_modulation(spec: &mut GraphSpec, song: &Song, nodes: &SongNodes) {
+    let wires = song
+        .mod_wires
+        .iter()
+        .filter_map(|wire| {
+            let track = song.tracks.get(wire.track)?;
+            let binding = automation_binding(wire.track, track, &wire.target, nodes)?;
+            let scale = binding.scale;
+            Some(WireSpec {
+                id: wire.id,
+                source: wire.source,
+                node: binding.node,
+                param: binding.param,
+                min: binding.min * scale,
+                max: binding.max * scale,
+                log: modulation_target_is_log(track, &wire.target),
+                base: binding.base * scale,
+                chain: wire.chain(),
+                enabled: wire.enabled,
+                solo: wire.solo,
+            })
+        })
+        .collect();
+    spec.set_modulation(ModSpec {
+        // Unwired sources stay in the plan: their engine telemetry is what
+        // lets a newly-created LFO visibly move before it has a destination.
+        sources: song.modulators.clone(),
+        wires,
+    });
+}
+
+/// Whether equal travel on this target means equal ratio. This is the same
+/// mapping used by the device cards: frequency and time controls sweep in
+/// ratios, while dB/semitone values are already logarithmic units and remain
+/// linear here.
+pub(crate) fn modulation_target_is_log(track: &Track, target: &str) -> bool {
+    let Some((id, rest)) = target
+        .strip_prefix(crate::targets::DEVICE_TARGET_PREFIX)
+        .and_then(|rest| rest.split_once('.'))
+    else {
+        return false;
+    };
+    let Ok(id) = id.parse::<u64>() else {
+        return false;
+    };
+    let Some((prefix, parameter)) = rest.split_once('.') else {
+        return false;
+    };
+    let Some(device) = track
+        .chain
+        .iter()
+        .chain(track.strip.iter())
+        .find(|device| device.id == DeviceId(id) && device.kind.spec().prefix == prefix)
+    else {
+        return false;
+    };
+    let Some(param) = device
+        .kind
+        .spec()
+        .params
+        .iter()
+        .find(|def| def.name == parameter)
+        .map(|def| def.id)
+    else {
+        return false;
+    };
+    use crate::ui::device;
+    match device.kind {
+        DeviceKind::Flint
+        | DeviceKind::Sibyl
+        | DeviceKind::Ferric
+        | DeviceKind::Umbra
+        | DeviceKind::Gauge
+        | DeviceKind::Tine
+        | DeviceKind::Rack
+        | DeviceKind::Console(_) => false,
+        DeviceKind::Tone => param == crate::params::tone::FREQ,
+        DeviceKind::Sigil => param == crate::params::sigil::FREQ,
+        DeviceKind::Poly => device::poly_is_log(param),
+        DeviceKind::Loom => device::loom::loom_is_log(param),
+        DeviceKind::Haze => device::haze::haze_is_log(param),
+        DeviceKind::Sampler => device::sampler_is_log(param),
+        DeviceKind::Kick => device::kick::kick_is_log(param),
+        DeviceKind::Snare => device::snare_is_log(param),
+        DeviceKind::Tom => device::tom_is_log(param),
+        DeviceKind::Hat => device::hat_is_log(param),
+        DeviceKind::Handclap => device::handclap_is_log(param),
+        DeviceKind::Limiter => device::limiter_is_log(param),
+        DeviceKind::SineSynth => device::sine_synth_is_log(param),
+        DeviceKind::Reverb => device::reverb::reverb_is_log(param),
+        DeviceKind::Sat => device::sat_is_log(param),
+        DeviceKind::Lofi => device::lofi_is_log(param),
+        DeviceKind::Sheen => device::sheen_is_log(param),
+        DeviceKind::Disperser => device::disperser_is_log(param),
+        DeviceKind::Tilt => device::tilt_is_log(param),
+        DeviceKind::Phaser => device::phaser_is_log(param),
+        DeviceKind::Echo => device::echo_is_log(param),
+        DeviceKind::Eq => device::eq_is_log(param),
+        DeviceKind::Filter => device::filter_is_log(param),
+        DeviceKind::Glue => device::glue_is_log(param),
+        DeviceKind::Clamp => device::clamp::clamp_is_log(param),
+        DeviceKind::Prism => device::prism::prism_is_log(param),
+        DeviceKind::Gate => device::gate_is_log(param),
+        DeviceKind::Strip => device::strip_is_log(param),
+        DeviceKind::Resyn => device::resyn_is_log(param),
+        DeviceKind::Acid => device::acid_is_log(param),
+        DeviceKind::Modulato => device::modulato::modulato_is_log(param),
+        DeviceKind::Utility => device::utility_is_log(param),
+    }
+}
+
+/// The exact units returned for one wire in engine telemetry. Kept beside
+/// target resolution so the UI does not rebuild its allocated destination
+/// catalog per wire (and so sends retain their graph-side percent scale).
+pub(crate) fn modulation_target_span(track: &Track, target: &str) -> Option<f32> {
+    if crate::targets::track_send_index(target).is_some() {
+        // The Song stores sends as 0..1; their graph nodes speak 0..100.
+        return Some(100.0);
+    }
+    let (min, max) = crate::targets::span_of(target)?;
+    Some(crate::audio::modulation::wire_span(
+        min,
+        max,
+        modulation_target_is_log(track, target),
+    ))
+}
+
+fn automation_binding(
+    track_index: usize,
+    track: &Track,
+    target: &str,
+    nodes: &SongNodes,
+) -> Option<AutomationBinding> {
+    match target {
+        crate::sequencing::TRACK_VOLUME => {
+            let def = crate::params::pan::TABLE
+                .iter()
+                .find(|def| def.id == crate::params::pan::GAIN)?;
+            Some(AutomationBinding {
+                node: nodes.outputs.get(track_index).copied().flatten()?,
+                param: crate::params::pan::GAIN,
+                base: track.volume,
+                min: def.min,
+                max: def.max,
+                scale: 1.0,
+            })
+        }
+        crate::sequencing::TRACK_PAN => {
+            let def = crate::params::pan::TABLE
+                .iter()
+                .find(|def| def.id == crate::params::pan::PAN)?;
+            Some(AutomationBinding {
+                node: nodes.outputs.get(track_index).copied().flatten()?,
+                param: crate::params::pan::PAN,
+                base: track.pan,
+                min: def.min,
+                max: def.max,
+                scale: 1.0,
+            })
+        }
+        _ => automation_send_binding(track_index, track, target, nodes)
+            .or_else(|| automation_device_binding(track, target, nodes)),
+    }
+}
+
+fn automation_send_binding(
+    track_index: usize,
+    track: &Track,
+    target: &str,
+    nodes: &SongNodes,
+) -> Option<AutomationBinding> {
+    let index = crate::targets::track_send_index(target)?;
+    let param = *SEND_PARAMS.get(index)?;
+    let node = nodes
+        .sends
+        .get(track_index)?
+        .get(index)
+        .copied()
+        .flatten()?;
+    let section = track
+        .strip
+        .iter()
+        .find(|device| device.kind == DeviceKind::Console(crate::console::SectionKind::Out))?;
+    Some(AutomationBinding {
+        node,
+        param,
+        base: section.value(param) * 0.01,
+        min: 0.0,
+        max: 1.0,
+        scale: 100.0,
+    })
+}
+
+fn automation_device_binding(
+    track: &Track,
+    target: &str,
+    nodes: &SongNodes,
+) -> Option<AutomationBinding> {
+    let (id, rest) = target
+        .strip_prefix(crate::targets::DEVICE_TARGET_PREFIX)?
+        .split_once('.')?;
+    let id = DeviceId(id.parse().ok()?);
+    let (prefix, param_name) = rest.split_once('.')?;
+    let device = track
+        .chain
+        .iter()
+        .chain(track.strip.iter())
+        .find(|device| device.id == id)?;
+    let device_spec = device.kind.spec();
+    if device_spec.prefix != prefix {
+        return None;
+    }
+    let def = device_spec
+        .params
+        .iter()
+        .find(|def| def.name == param_name)?;
+    Some(AutomationBinding {
+        node: nodes
+            .devices
+            .iter()
+            .find_map(|(device, node)| (*device == id).then_some(*node))?,
+        param: def.id,
+        base: device.value(def.id),
+        min: def.min,
+        max: def.max,
+        scale: 1.0,
+    })
+}
+
+/// Resolve every active stored envelope at one Song tick into concrete engine
+/// letters.
+///
+/// This is the ONE evaluator used by Stage's live host and its offline
+/// renderer. It emits only targets which actually carry points; static knobs
+/// are already in the compiled graph. Track level and pan land on the track's
+/// output node, the two canonical send targets land on their explicit return
+/// taps, and a device target lands on the one real node registered for that
+/// instance. Device ownership is checked against the track carrying the
+/// envelope, so a stale or hand-edited target can never automate a different
+/// track's identically-shaped device.
+///
+/// Unsupported targets are intentionally silent: master, bus and return rails
+/// do not yet own automation envelopes in [`Song`], and a bypassed or otherwise
+/// uncompiled device has no node to receive a letter. The fixed analog desk has
+/// exactly two channel sends; targets C through H remain valid file-format
+/// names for the legacy configurable-return model but do not invent routes in
+/// this graph.
+pub fn automation_letters(
+    song: &Song,
+    nodes: &SongNodes,
+    tick: usize,
+    out: &mut Vec<crate::audio::graph::ParamChange>,
+) {
+    for (track_index, track) in song.tracks.iter().enumerate() {
+        for (envelope_index, envelope) in track.automation.iter().enumerate() {
+            if envelope.points.is_empty()
+                || track.automation[..envelope_index]
+                    .iter()
+                    .any(|earlier| earlier.target == envelope.target)
+            {
+                continue;
+            }
+            let target = envelope.target.as_str();
+            let binding = match target {
+                crate::sequencing::TRACK_VOLUME => {
+                    let Some(node) = nodes.outputs.get(track_index).copied().flatten() else {
+                        continue;
+                    };
+                    Some((node, crate::params::pan::GAIN, track.volume_at(tick)))
+                }
+                crate::sequencing::TRACK_PAN => {
+                    let Some(node) = nodes.outputs.get(track_index).copied().flatten() else {
+                        continue;
+                    };
+                    Some((node, crate::params::pan::PAN, track.pan_at(tick)))
+                }
+                _ => send_binding(track_index, track, target, nodes, tick)
+                    .or_else(|| device_binding(track, target, nodes, tick)),
+            };
+            let Some((node, param, value)) = binding else {
+                continue;
+            };
+            if value.is_finite() {
+                out.push(crate::audio::graph::ParamChange {
+                    node: node.to_bits(),
+                    param,
+                    value,
+                });
+            }
+        }
+    }
+}
+
+/// Resolve one of the analog desk's two canonical post-fader sends.
+///
+/// The OUT section stores its knobs as percentages while automation's stable
+/// `track.send.*` targets use normalized gain. The letter goes back to the
+/// Send node as a percentage because that node deliberately speaks OUT's
+/// parameter protocol; the unit conversion happens here, once.
+fn send_binding(
+    track_index: usize,
+    track: &Track,
+    target: &str,
+    nodes: &SongNodes,
+    tick: usize,
+) -> Option<(NodeId, u32, f32)> {
+    let index = crate::targets::track_send_index(target)?;
+    let param = *SEND_PARAMS.get(index)?;
+    let node = nodes
+        .sends
+        .get(track_index)?
+        .get(index)
+        .copied()
+        .flatten()?;
+    let section = track
+        .strip
+        .iter()
+        .find(|device| device.kind == DeviceKind::Console(crate::console::SectionKind::Out))?;
+    let base = (section.value(param) * 0.01).clamp(0.0, 1.0);
+    let value = track.value_at(target, tick, base).clamp(0.0, 1.0);
+    Some((node, param, value * 100.0))
+}
+
+/// Resolve `dev.<instance>.<kind>.<parameter>` against the device on THIS
+/// track, then against the graph's one-device/one-node table.
+fn device_binding(
+    track: &Track,
+    target: &str,
+    nodes: &SongNodes,
+    tick: usize,
+) -> Option<(NodeId, u32, f32)> {
+    let (id, rest) = target
+        .strip_prefix(crate::targets::DEVICE_TARGET_PREFIX)?
+        .split_once('.')?;
+    let id = DeviceId(id.parse().ok()?);
+    let (prefix, param_name) = rest.split_once('.')?;
+    let device = track
+        .chain
+        .iter()
+        .chain(track.strip.iter())
+        .find(|device| device.id == id)?;
+    let spec = device.kind.spec();
+    if spec.prefix != prefix {
+        return None;
+    }
+    let def = spec.params.iter().find(|def| def.name == param_name)?;
+    let node = nodes
+        .devices
+        .iter()
+        .find_map(|(device, node)| (*device == id).then_some(*node))?;
+    let value = track
+        .value_at(target, tick, device.value(def.id))
+        .clamp(def.min, def.max);
+    Some((node, def.id, value))
 }
 
 /// A track's pattern blocks as notes in song time: each block plays its
@@ -708,31 +1524,59 @@ fn audio_blocks_of(song: &Song, track: &Track) -> Vec<NodeSpec> {
     track
         .audio_blocks
         .iter()
-        .map(|block| {
+        .filter_map(|block| {
             let source = &block.source;
+            // Transpose/detune and reversal are rendered green-side. The
+            // current `path` is the transposed render when one is applied;
+            // `playing_path` adds the reverse cache when requested and
+            // deliberately returns None while that cache is not ready.
+            let path = source.playing_path()?;
             // A clip-relative loop brace is in ticks; the node wants the
-            // loop's start in the file's own frames, at the tempo the
-            // block starts under.
-            let bpm = song.bpm_at(block.start_tick, 120.0).max(1.0);
-            let frames_per_beat = 60.0 / bpm * f64::from(source.sample_rate.max(1));
-            let loop_start_frames = block.loop_brace.as_ref().map_or(0, |brace| {
-                (beats(brace.start_tick) * frames_per_beat).round() as u64
-            });
-            NodeSpec::AudioClip {
-                path: source.path.clone(),
+            // loop's start in the file's own frames. Resolve the complete
+            // song map at the file rate so a brace spanning a tempo mark
+            // keeps its authored musical endpoints instead of stretching
+            // the whole region at only the block's opening tempo.
+            let timeline = crate::tempo::TempoTable::build(
+                song,
+                f64::from(source.sample_rate.max(1)),
+                song.bpm,
+            );
+            let block_sample = timeline.sample_at(block.start_tick);
+            let (played_frames, loop_start_frames, has_brace) = block
+                .loop_brace
+                .filter(|brace| brace.length_ticks > 0 && source.source_frames > 0)
+                .map_or((source.source_frames, 0, false), |brace| {
+                    let start_tick = block.start_tick.saturating_add(brace.start_tick);
+                    let end_tick = start_tick.saturating_add(brace.length_ticks);
+                    let end = timeline
+                        .sample_at(end_tick)
+                        .saturating_sub(block_sample)
+                        .clamp(1, source.source_frames);
+                    let start = timeline
+                        .sample_at(start_tick)
+                        .saturating_sub(block_sample)
+                        .min(end.saturating_sub(1));
+                    (end, start, true)
+                });
+            Some(NodeSpec::AudioClip {
+                path,
                 start_beats: beats(block.start_tick),
                 length_beats: Some(beats(block.length_ticks)),
-                source_offset_frames: source.source_offset,
-                source_frames: Some(source.source_frames),
-                loop_clip: source.looped || block.loop_brace.is_some(),
+                source_offset_frames: source.playing_offset(),
+                source_frames: Some(played_frames),
+                loop_clip: source.looped || has_brace,
                 loop_start_frames,
                 gain: source.gain,
-                fade_in_frames: 0,
-                fade_out_frames: 0,
-                fade_in_shape: 0.0,
-                fade_out_shape: 0.0,
-                envelope: Vec::new(),
-            }
+                fade_in_frames: source.fade_in,
+                fade_out_frames: source.fade_out,
+                fade_in_shape: source.fade_in_curve,
+                fade_out_shape: source.fade_out_curve,
+                envelope: source
+                    .envelope
+                    .iter()
+                    .map(|(at, db)| (*at, audio_envelope_gain(*db)))
+                    .collect(),
+            })
         })
         .collect()
 }
@@ -878,7 +1722,8 @@ mod tests {
     /// A send is a real path, not a number on a card: opening one on a
     /// channel's OUT puts that channel into the return's rail, and the
     /// return lands in the mix. Closed, the tap is still built — it
-    /// ramps, so opening one is a fade rather than a click.
+    /// ramps, so opening one is a fade rather than a click. Generated taps
+    /// live in the alias table, never as duplicate device identities.
     #[test]
     fn a_send_taps_the_channel_into_its_return() {
         use crate::console::SectionKind;
@@ -891,12 +1736,17 @@ mod tests {
             .id;
         // Closed: the taps exist, and they are the OUT section's.
         let (_, nodes) = build(&song, &playing(&song));
-        let taps = nodes.devices.iter().filter(|(id, _)| *id == out).count();
         assert_eq!(
-            taps,
-            1 + song.console.aux.len(),
-            "the OUT section and one tap per return"
+            nodes.devices.iter().filter(|(id, _)| *id == out).count(),
+            1,
+            "OUT is one device, however many taps it owns"
         );
+        let taps = nodes
+            .param_aliases
+            .iter()
+            .filter(|(id, _)| *id == out)
+            .count();
+        assert_eq!(taps, song.console.aux.len(), "one generated tap per return");
         // Every tap has exactly one telemetry slot between them all:
         // the section reports, the taps have nothing of their own.
         assert_eq!(
@@ -909,7 +1759,7 @@ mod tests {
         }
         let (spec, nodes) = build(&song, &playing(&song));
         let opened: Vec<f32> = nodes
-            .devices
+            .param_aliases
             .iter()
             .filter(|(id, _)| *id == out)
             .filter_map(|(_, node)| match spec.node(*node) {
@@ -921,6 +1771,131 @@ mod tests {
         assert!(
             (opened[0] - 0.5).abs() < 0.001,
             "the send did not reach its tap: {opened:?}"
+        );
+    }
+
+    /// Every supported Song target resolves to its own concrete node and
+    /// parameter. In particular, OUT remains one device while send A takes
+    /// the explicit tap address beside it — no duplicate-id search decides
+    /// which one automation happened to reach.
+    #[test]
+    fn automation_targets_resolve_without_device_alias_ambiguity() {
+        use crate::console::SectionKind;
+        use crate::params::{console::tone, sat};
+
+        let mut song = song_with_a_clip();
+        let sat_id = song.add_device(0, DeviceKind::Sat).expect("a sat insert");
+        let tone_id = song
+            .section(0, SectionKind::Tone)
+            .expect("the fixed strip has TONE")
+            .id;
+        song.device_mut(tone_id).expect("tone section").bypassed = false;
+
+        let sat_target = crate::targets::device_target(
+            sat_id.0,
+            DeviceKind::Sat.spec(),
+            sat::TABLE
+                .iter()
+                .find(|def| def.id == sat::DRIVE)
+                .expect("drive definition")
+                .name,
+        );
+        let tone_target = crate::targets::device_target(
+            tone_id.0,
+            DeviceKind::Console(SectionKind::Tone).spec(),
+            tone::TABLE
+                .iter()
+                .find(|def| def.id == tone::MID)
+                .expect("mid definition")
+                .name,
+        );
+        let track = &mut song.tracks[0];
+        for (target, value) in [
+            (crate::sequencing::TRACK_VOLUME.to_owned(), 0.25),
+            (crate::sequencing::TRACK_PAN.to_owned(), -0.5),
+            ("track.send.a".to_owned(), 0.75),
+            (sat_target, 2.0),
+            (tone_target, 3.0),
+        ] {
+            track.insert_point(&target, 0, value);
+        }
+
+        let (_, nodes) = build_song(&song);
+        let mut letters = Vec::new();
+        automation_letters(&song, &nodes, 0, &mut letters);
+
+        let out = nodes.outputs[0].expect("track output");
+        let send = nodes.sends[0][0].expect("send A tap");
+        let sat_node = nodes
+            .devices
+            .iter()
+            .find_map(|(id, node)| (*id == sat_id).then_some(*node))
+            .expect("sat node");
+        let tone_node = nodes
+            .devices
+            .iter()
+            .find_map(|(id, node)| (*id == tone_id).then_some(*node))
+            .expect("tone node");
+        let says = |node: NodeId, param: u32, value: f32| {
+            letters.iter().any(|letter| {
+                letter.node == node.to_bits()
+                    && letter.param == param
+                    && (letter.value - value).abs() < 1e-6
+            })
+        };
+        assert!(says(out, crate::params::pan::GAIN, 0.25));
+        assert!(says(out, crate::params::pan::PAN, -0.5));
+        assert!(says(send, crate::params::console::out::SEND_TAPE, 75.0));
+        assert!(
+            says(sat_node, sat::DRIVE, 2.0),
+            "sat target did not resolve: {letters:?}"
+        );
+        assert!(
+            says(tone_node, tone::MID, 3.0),
+            "strip target did not resolve: {letters:?}"
+        );
+
+        let mut ids: Vec<_> = nodes.devices.iter().map(|(id, _)| *id).collect();
+        let count = ids.len();
+        ids.sort_by_key(|id| id.0);
+        ids.dedup();
+        assert_eq!(ids.len(), count, "the real-device table contains an alias");
+        assert!(
+            nodes.param_aliases.iter().any(|(_, node)| *node == send),
+            "the send tap was not named as an alias"
+        );
+    }
+
+    /// An instance id is not enough: the envelope must live on the track
+    /// which owns that instance. A stale cross-track target is orphaned,
+    /// never delivered to the other lane's effect.
+    #[test]
+    fn device_automation_cannot_cross_a_track_boundary() {
+        use crate::params::sat;
+
+        let mut song = song_with_a_clip();
+        song.add_track(TrackKind::Instrument);
+        song.tracks[1].blocks = song.tracks[0].blocks.clone();
+        let second = song
+            .add_device(1, DeviceKind::Sat)
+            .expect("an effect on track two");
+        let target = crate::targets::device_target(
+            second.0,
+            DeviceKind::Sat.spec(),
+            sat::TABLE
+                .iter()
+                .find(|def| def.id == sat::DRIVE)
+                .expect("drive definition")
+                .name,
+        );
+        song.tracks[0].insert_point(&target, 0, 0.9);
+
+        let (_, nodes) = build_song(&song);
+        let mut letters = Vec::new();
+        automation_letters(&song, &nodes, 0, &mut letters);
+        assert!(
+            !letters.iter().any(|letter| letter.param == sat::DRIVE),
+            "track one's envelope reached track two's device"
         );
     }
     use crate::sequencing::{Note, Scene, Slot, TrackKind};
@@ -948,6 +1923,87 @@ mod tests {
             }],
         };
         song
+    }
+
+    #[test]
+    fn both_song_compilers_install_the_same_modulation_plan() {
+        let mut song = song_with_a_clip();
+        let source = song.add_lfo().expect("an LFO fits");
+        let wire = song
+            .add_mod_wire(source, 0, crate::sequencing::TRACK_PAN)
+            .expect("a pan wire fits");
+
+        for (spec, nodes) in [build(&song, &playing(&song)), build_song(&song)] {
+            let modulation = spec.modulation();
+            assert_eq!(modulation.sources, song.modulators);
+            assert_eq!(modulation.wires.len(), 1);
+            let compiled = &modulation.wires[0];
+            assert_eq!(compiled.id, wire);
+            assert_eq!(compiled.source, source);
+            assert_eq!(compiled.node, nodes.outputs[0].expect("a channel output"));
+            assert_eq!(compiled.param, crate::params::pan::PAN);
+            assert_eq!(
+                (compiled.min, compiled.max, compiled.base),
+                (-1.0, 1.0, 0.0)
+            );
+            assert!(!compiled.log);
+        }
+    }
+
+    #[test]
+    fn modulation_resolves_instance_log_law_and_send_units() {
+        let mut song = song_with_a_clip();
+        let source = song.add_lfo().expect("an LFO fits");
+        let filter = song
+            .add_device(0, DeviceKind::Filter)
+            .expect("a filter fits");
+        let target = crate::targets::device_target(filter.0, DeviceKind::Filter.spec(), "cutoff");
+        song.add_mod_wire(source, 0, target)
+            .expect("the cutoff resolves");
+        song.add_mod_wire(source, 0, crate::targets::TRACK_SEND_TARGETS[0])
+            .expect("the analog send resolves");
+
+        let (spec, nodes) = build_song(&song);
+        let filter_node = nodes
+            .devices
+            .iter()
+            .find_map(|(id, node)| (*id == filter).then_some(*node))
+            .expect("the filter compiled");
+        let cutoff = spec
+            .modulation()
+            .wires
+            .iter()
+            .find(|wire| wire.node == filter_node && wire.param == crate::params::filter::CUTOFF)
+            .expect("the cutoff wire compiled");
+        assert!(cutoff.log, "a frequency wire was mapped linearly");
+
+        let send_node = nodes.sends[0][0].expect("send A compiled");
+        let send = spec
+            .modulation()
+            .wires
+            .iter()
+            .find(|wire| wire.node == send_node)
+            .expect("the send wire compiled");
+        assert_eq!((send.min, send.max), (0.0, 100.0));
+        assert!((0.0..=100.0).contains(&send.base));
+    }
+
+    fn audio_block(
+        id: u64,
+        start_tick: usize,
+        length_ticks: usize,
+    ) -> crate::sequencing::AudioBlock {
+        crate::sequencing::AudioBlock {
+            id: crate::sequencing::BlockId(id),
+            name: format!("take {id}"),
+            start_tick,
+            length_ticks,
+            source: ron::from_str(
+                r#"(path:"/x/take.wav",sample_rate:48000,source_offset:0,source_frames:96000,gain:1.0,looped:false)"#,
+            )
+            .expect("a minimal source deserializes from its required fields"),
+            loop_brace: None,
+        }
     }
 
     /// The song compiler lays a block's pattern at the block's start,
@@ -1027,6 +2083,368 @@ mod tests {
         );
     }
 
+    /// The Song owns rich audio-source metadata; compiling its timeline must
+    /// not quietly replace those edits with the old zero-value defaults.
+    #[test]
+    fn audio_blocks_keep_their_render_path_region_fades_and_envelope() {
+        let mut song = song_with_a_clip();
+        song.tracks[0].blocks.clear();
+        let mut block = audio_block(
+            8,
+            crate::sequencing::TICKS_PER_BEAT * 2,
+            crate::sequencing::TICKS_PER_BEAT * 4,
+        );
+        block.source.path = std::path::PathBuf::from("/x/pitched-take.wav");
+        block.source.transpose = 7.0;
+        block.source.detune = -12.0;
+        block.source.transposed_from = Some(std::path::PathBuf::from("/x/original-take.wav"));
+        block.source.applied_ratio = 1.49;
+        block.source.source_offset = 321;
+        block.source.source_frames = 48_000;
+        block.source.gain = 0.625;
+        block.source.fade_in = 480;
+        block.source.fade_out = 960;
+        block.source.fade_in_curve = -0.25;
+        block.source.fade_out_curve = 0.75;
+        block.source.envelope = vec![
+            (0, -60.0),
+            (12_000, -6.0),
+            (24_000, 9.0),
+            (36_000, f32::NAN),
+        ];
+        block.loop_brace = Some(crate::sequencing::LoopBrace {
+            start_tick: crate::sequencing::TICKS_PER_BEAT / 2,
+            length_ticks: crate::sequencing::TICKS_PER_BEAT,
+        });
+        let authored = block.source.clone();
+        song.tracks[0].audio_blocks.push(block);
+
+        let (spec, _) = build_song(&song);
+        let clip = spec
+            .iter_ordered()
+            .find_map(|(_, node)| matches!(node, NodeSpec::AudioClip { .. }).then_some(node))
+            .expect("the audio block compiled");
+        let NodeSpec::AudioClip {
+            path,
+            source_offset_frames,
+            source_frames,
+            loop_clip,
+            loop_start_frames,
+            gain,
+            fade_in_frames,
+            fade_out_frames,
+            fade_in_shape,
+            fade_out_shape,
+            envelope,
+            ..
+        } = clip
+        else {
+            unreachable!("selected only AudioClip above")
+        };
+        assert_eq!(
+            path, &authored.path,
+            "the current transpose render is played"
+        );
+        assert_eq!(*source_offset_frames, authored.playing_offset());
+        assert_eq!(*source_frames, Some(36_000), "the brace end caps the pass");
+        assert!(*loop_clip);
+        assert_eq!(*loop_start_frames, 12_000, "the brace start is the wrap");
+        assert_eq!(*gain, authored.gain);
+        assert_eq!(*fade_in_frames, authored.fade_in);
+        assert_eq!(*fade_out_frames, authored.fade_out);
+        assert_eq!(*fade_in_shape, authored.fade_in_curve);
+        assert_eq!(*fade_out_shape, authored.fade_out_curve);
+        assert_eq!(envelope[0], (0, 0.0), "the envelope floor is silence");
+        assert!(
+            (envelope[1].1 - crate::dsp::arith::db_to_gain(-6.0)).abs() < 1e-6,
+            "dB is compiled to linear gain"
+        );
+        assert!(
+            (envelope[2].1 - crate::dsp::arith::db_to_gain(6.0)).abs() < 1e-6,
+            "the authored ceiling is enforced"
+        );
+        assert_eq!(envelope[3], (36_000, 0.0), "a corrupt value is safe");
+    }
+
+    #[test]
+    fn an_audio_loop_brace_integrates_tempo_marks_inside_the_clip() {
+        let mut song = song_with_a_clip();
+        song.tracks[0].blocks.clear();
+        let block_start = TICKS_PER_BEAT * 2;
+        let mut block = audio_block(81, block_start, TICKS_PER_BEAT * 4);
+        block.loop_brace = Some(crate::sequencing::LoopBrace {
+            start_tick: 0,
+            length_ticks: TICKS_PER_BEAT * 2,
+        });
+        song.tempo.push(crate::sequencing::TempoMark {
+            tick: block_start + TICKS_PER_BEAT,
+            bpm: 60.0,
+        });
+        song.tracks[0].audio_blocks.push(block);
+
+        let (spec, _) = build_song(&song);
+        let (frames, loop_start) = spec
+            .iter_ordered()
+            .find_map(|(_, node)| match node {
+                NodeSpec::AudioClip {
+                    source_frames,
+                    loop_start_frames,
+                    ..
+                } => Some((*source_frames, *loop_start_frames)),
+                _ => None,
+            })
+            .expect("the audio block compiled");
+        assert_eq!(loop_start, 0);
+        assert_eq!(
+            frames,
+            Some(72_000),
+            "one beat at 120 and one at 60 must occupy 24k + 48k source frames"
+        );
+    }
+
+    /// Reverse is a green-side rendered cache. Until it exists, playing the
+    /// forward file would be an audible lie, so the block must compile quiet.
+    #[test]
+    fn a_reverse_waiting_for_its_cache_does_not_play_forward() {
+        let mut song = song_with_a_clip();
+        song.tracks[0].blocks.clear();
+        let mut block = audio_block(9, 0, crate::sequencing::TICKS_PER_BEAT * 4);
+        block.source.path = std::env::temp_dir().join(format!(
+            "daw-song-graph-no-reverse-cache-{}.wav",
+            std::process::id()
+        ));
+        block.source.file_frames = block.source.source_frames;
+        block.source.reversed = true;
+        assert_eq!(
+            block.source.playing_path(),
+            None,
+            "the fixture unexpectedly has a reverse render"
+        );
+        song.tracks[0].audio_blocks.push(block);
+
+        let (spec, nodes) = build_song(&song);
+        assert!(
+            !spec
+                .iter_ordered()
+                .any(|(_, node)| matches!(node, NodeSpec::AudioClip { .. })),
+            "the forward file leaked in while reversal was pending"
+        );
+        assert_eq!(nodes.outputs[0], None, "a silent channel costs no path");
+    }
+
+    /// Recorded sound is a channel source just like its instrument: every
+    /// active insert and strip section must precede the fader, meter and bus.
+    #[test]
+    fn an_audio_block_traverses_the_insert_chain_and_channel_strip() {
+        use crate::console::SectionKind;
+        let mut song = song_with_a_clip();
+        song.tracks[0].blocks.clear();
+        let reverb = song
+            .add_device(0, DeviceKind::Reverb)
+            .expect("an insert on the audio channel");
+        let tone = song
+            .section(0, SectionKind::Tone)
+            .expect("the fixed strip has TONE")
+            .id;
+        song.device_mut(tone).expect("the section exists").bypassed = false;
+        song.tracks[0]
+            .audio_blocks
+            .push(audio_block(10, 0, crate::sequencing::TICKS_PER_BEAT * 4));
+
+        let (spec, nodes) = build_song(&song);
+        let clip = spec
+            .iter_ordered()
+            .find_map(|(id, node)| matches!(node, NodeSpec::AudioClip { .. }).then_some(id))
+            .expect("the clip node");
+        let out = nodes.outputs[0].expect("the channel output");
+        let active: Vec<DeviceId> = song.tracks[0]
+            .chain
+            .iter()
+            .chain(song.tracks[0].strip.iter())
+            .filter(|device| {
+                !device.is_instrument() && !device.bypassed && effect_of(device).is_some()
+            })
+            .map(|device| device.id)
+            .collect();
+        assert!(active.contains(&reverb));
+        assert!(active.contains(&tone));
+
+        let path: Vec<(DeviceId, NodeId)> = active
+            .iter()
+            .map(|device| {
+                (
+                    *device,
+                    nodes
+                        .devices
+                        .iter()
+                        .find_map(|(id, node)| (*id == *device).then_some(*node))
+                        .expect("every active channel device is registered"),
+                )
+            })
+            .collect();
+        let reaches =
+            |from: NodeId, to: NodeId| {
+                let mut frontier = vec![from];
+                let mut seen = Vec::new();
+                while let Some(node) = frontier.pop() {
+                    if node == to {
+                        return true;
+                    }
+                    if seen.contains(&node) {
+                        continue;
+                    }
+                    seen.push(node);
+                    frontier.extend(spec.wires().iter().filter_map(|(wire_from, wire_to)| {
+                        (*wire_from == node).then_some(*wire_to)
+                    }));
+                }
+                false
+            };
+        let mut previous = clip;
+        for (device, node) in path.iter().copied() {
+            // Generated send aliases live in a separate table, so this is
+            // always the actual section node in the channel path.
+            assert!(
+                reaches(previous, node),
+                "device {device:?} at {node:?} was bypassed after {previous:?}; outgoing: {:?}; path: {:?}",
+                spec.wires()
+                    .iter()
+                    .filter(|(from, _)| *from == previous)
+                    .collect::<Vec<_>>(),
+                path
+            );
+            previous = node;
+        }
+        let channel_keys = DeskPathIdentity::Track(song.tracks[0].id).stereo_keys();
+        let personality = spec
+            .iter_ordered()
+            .find_map(|(id, node)| match node {
+                NodeSpec::DeskPath {
+                    left_identity,
+                    right_identity,
+                    ..
+                } if (*left_identity, *right_identity) == channel_keys => Some(id),
+                _ => None,
+            })
+            .expect("the physical channel path");
+        assert!(spec.wires().contains(&(previous, personality)));
+        assert!(spec.wires().contains(&(personality, out)));
+        assert!(
+            !spec.wires().contains(&(clip, out)),
+            "the old dry side-door still reaches the fader"
+        );
+    }
+
+    /// Pan has one input, so overlapping placements need an explicit source
+    /// bus. Both clips must reach that sum before any channel processing.
+    #[test]
+    fn overlapping_audio_blocks_are_summed_before_the_channel_path() {
+        let mut song = song_with_a_clip();
+        song.tracks[0].blocks.clear();
+        song.tracks[0]
+            .audio_blocks
+            .push(audio_block(11, 0, crate::sequencing::TICKS_PER_BEAT * 4));
+        song.tracks[0]
+            .audio_blocks
+            .push(audio_block(12, 0, crate::sequencing::TICKS_PER_BEAT * 4));
+
+        let (spec, nodes) = build_song(&song);
+        let clips: Vec<NodeId> = spec
+            .iter_ordered()
+            .filter_map(|(id, node)| matches!(node, NodeSpec::AudioClip { .. }).then_some(id))
+            .collect();
+        assert_eq!(clips.len(), 2);
+        let sum = spec
+            .wires()
+            .iter()
+            .find_map(|(from, to)| {
+                (*from == clips[0]
+                    && matches!(spec.node(*to), Some(NodeSpec::Mixer { gain }) if *gain == 1.0))
+                .then_some(*to)
+            })
+            .expect("the first clip reaches a source sum");
+        assert!(spec.wires().contains(&(clips[1], sum)));
+        let out = nodes.outputs[0].expect("the channel output");
+        assert!(!spec.wires().contains(&(clips[0], out)));
+        assert!(!spec.wires().contains(&(clips[1], out)));
+    }
+
+    /// Route selection alone is quiet; IN and armed AUTO are the two states
+    /// that put hardware input into both session and arrangement compilers.
+    #[test]
+    fn monitored_audio_input_uses_the_channel_path_in_both_builders() {
+        use crate::sequencing::{Monitor, TrackInput};
+
+        fn assert_input_count(song: &Song, expected: usize) {
+            let playing = vec![None; song.tracks.len()];
+            for (spec, nodes) in [build(song, &playing), build_song(song)] {
+                assert_eq!(
+                    spec.iter_ordered()
+                        .filter(|(_, node)| matches!(node, NodeSpec::Input { .. }))
+                        .count(),
+                    expected
+                );
+                assert_eq!(nodes.outputs[0].is_some(), expected > 0);
+            }
+        }
+
+        let mut song = song_with_a_clip();
+        song.tracks[0].kind = TrackKind::Audio;
+        song.tracks[0].blocks.clear();
+        song.tracks[0].input = TrackInput::Mono(3);
+        song.tracks[0].armed = true;
+        song.tracks[0].monitor = Monitor::Off;
+        assert_input_count(&song, 0);
+        song.tracks[0].armed = false;
+        song.tracks[0].monitor = Monitor::Auto;
+        assert_input_count(&song, 0);
+        song.tracks[0].armed = true;
+        assert_input_count(&song, 1);
+        song.tracks[0].armed = false;
+        song.tracks[0].monitor = Monitor::In;
+
+        let insert = song
+            .add_device(0, DeviceKind::Reverb)
+            .expect("a monitored insert");
+        let playing = vec![None; song.tracks.len()];
+        for (spec, nodes) in [build(&song, &playing), build_song(&song)] {
+            let input = spec
+                .iter_ordered()
+                .find_map(|(id, node)| matches!(node, NodeSpec::Input { channel: 3 }).then_some(id))
+                .expect("monitor IN builds the selected route");
+            let effect = nodes
+                .devices
+                .iter()
+                .find_map(|(id, node)| (*id == insert).then_some(*node))
+                .expect("the monitored insert is registered");
+            let input_gain = song.tracks[0]
+                .chain
+                .iter()
+                .find(|device| device.role == crate::sequencing::DeviceRole::InputGain)
+                .and_then(|device| {
+                    nodes
+                        .devices
+                        .iter()
+                        .find_map(|(id, node)| (*id == device.id).then_some(*node))
+                })
+                .expect("the input gain is registered");
+            assert!(
+                spec.wires().contains(&(input, input_gain)),
+                "live input bypassed the insert/strip path"
+            );
+            assert!(
+                spec.iter_ordered().any(|(id, _)| id == effect),
+                "the monitored insert left the graph"
+            );
+            assert!(nodes.outputs[0].is_some());
+        }
+
+        song.tracks[0].input = TrackInput::Stereo(4, 5);
+        assert_input_count(&song, 2);
+        song.tracks[0].kind = TrackKind::Instrument;
+        assert_input_count(&song, 0);
+    }
+
     /// Every device that reaches the graph gets a telemetry slot of its
     /// own, in both builders: the strip's IN sections and the desk's
     /// rails alike, no two on one slot.
@@ -1043,11 +2461,11 @@ mod tests {
             // Telemetry is the CONSOLE's: every section that reached
             // the graph reports, and nothing else does. The letter
             // table is wider than that — an instrument is addressable
-            // so a knob on it can be heard, and a channel's OUT owns
-            // its send taps as well as its own node — so the two
-            // tables are not the same length and never were meant to
-            // be. What must hold is that everything telemetered is
-            // addressable, and that no two share a slot.
+            // so a knob on it can be heard, but has no telemetry — so the
+            // two tables are not the same length and never were meant to
+            // be. Generated OUT taps live in `param_aliases`; they are not
+            // duplicate devices. What must hold is that everything
+            // telemetered is addressable, and that no two share a slot.
             let mut addressed: Vec<u64> = nodes.devices.iter().map(|(id, _)| id.0).collect();
             addressed.sort_unstable();
             addressed.dedup();
@@ -1099,31 +2517,73 @@ mod tests {
         }
     }
 
-    /// The arrangement's graph renders offline, which is what the song
-    /// view's export runs: a song with a note in its first block, two
-    /// bars of it, to a wav with sound in it.
+    /// The arrangement's stored curve lives in the compiled schedule. The
+    /// sustained note is silent for the first half and audible in the second,
+    /// and two unrelated render quanta produce the same samples.
     #[test]
-    fn the_arrangement_renders_offline() {
-        let song = song_with_a_clip();
+    fn stored_automation_shapes_the_offline_arrangement() {
+        let mut song = song_with_a_clip();
+        song.patterns[0]
+            .trig_mut(0)
+            .set_primary(Note::new(60, TICKS_PER_BEAT * 4, 100));
+        song.tracks[0].insert_point(crate::sequencing::TRACK_VOLUME, 0, 0.0);
+        song.tracks[0].insert_point(crate::sequencing::TRACK_VOLUME, TICKS_PER_BEAT * 2, 0.0);
+        song.tracks[0].insert_point(crate::sequencing::TRACK_VOLUME, TICKS_PER_BEAT * 9 / 4, 1.0);
         let (spec, _) = build_song(&song);
-        let path = std::env::temp_dir().join("daw-song-graph-export.wav");
-        let opts = crate::audio::bounce::BounceOptions {
-            sample_rate: 48_000,
-            block_frames: 256,
-            bpm: 120.0,
-            length_beats: 8.0,
-            start_beats: 0.0,
-            format: crate::audio::bounce::BounceFormat::Int24,
+        let render = |block_frames: usize| {
+            let path = std::env::temp_dir().join(format!(
+                "daw-song-graph-automated-export-{}-{block_frames}.wav",
+                std::process::id()
+            ));
+            let opts = crate::audio::bounce::BounceOptions {
+                sample_rate: 48_000,
+                block_frames,
+                bpm: 120.0,
+                length_beats: 4.0,
+                start_beats: 0.0,
+                format: crate::audio::bounce::BounceFormat::Float32,
+            };
+            crate::audio::bounce::bounce_automated(&spec, &opts, &path, |_, _| {}, |_| true)
+                .expect("the internally automated arrangement renders");
+            let samples: Vec<f32> = hound::WavReader::open(&path)
+                .expect("the export exists")
+                .samples::<f32>()
+                .map(Result::unwrap)
+                .collect();
+            let _ = std::fs::remove_file(&path);
+            samples
         };
-        crate::audio::bounce::bounce_automated(&spec, &opts, &path, |_, _| {}, |_| true)
-            .expect("the arrangement renders");
-        let peak = hound::WavReader::open(&path)
-            .expect("the export exists")
-            .samples::<i32>()
-            .map(Result::unwrap)
-            .fold(0, |peak: i32, s| peak.max(s.abs()));
-        let _ = std::fs::remove_file(&path);
-        assert!(peak > 0, "the block's note sounds in the export");
+        let samples = render(256);
+        let odd_quantum = render(113);
+        let (first_mismatch, max_delta) = samples.iter().zip(&odd_quantum).enumerate().fold(
+            (None, 0.0f32),
+            |(first, peak), (index, (a, b))| {
+                let delta = (*a - *b).abs();
+                (first.or((delta != 0.0).then_some(index)), peak.max(delta))
+            },
+        );
+        assert_eq!(
+            samples.len(),
+            odd_quantum.len(),
+            "the musical range changed with the offline render block size"
+        );
+        assert!(
+            max_delta <= f32::EPSILON,
+            "automation changed with the offline render block size: first mismatch {first_mismatch:?}, max delta {max_delta}"
+        );
+        let rms = |from_seconds: f32, to_seconds: f32| {
+            let from = (from_seconds * 48_000.0) as usize * 2;
+            let to = ((to_seconds * 48_000.0) as usize * 2).min(samples.len());
+            let window = &samples[from.min(to)..to];
+            (window.iter().map(|sample| sample * sample).sum::<f32>() / window.len().max(1) as f32)
+                .sqrt()
+        };
+        let held_silent = rms(0.20, 0.80);
+        let opened = rms(1.30, 1.80);
+        assert!(
+            opened > held_silent * 8.0 + 1e-4,
+            "the render stayed flat: silent rms {held_silent}, open rms {opened}"
+        );
     }
 
     /// A sampler's authored slices ride into its node spec as the
@@ -1247,7 +2707,8 @@ mod tests {
 
     #[test]
     fn a_song_with_nothing_launched_still_runs_and_is_silent() {
-        let song = song_with_a_clip();
+        let mut song = song_with_a_clip();
+        song.desk_personality.noise_enabled = false;
         let (spec, nodes) = build(&song, &[]);
         assert_eq!(voices(&spec), 0, "something sounded with nothing launched");
         assert!(nodes.outputs.iter().all(Option::is_none));
@@ -1291,6 +2752,7 @@ mod tests {
     #[test]
     fn a_track_playing_a_scene_it_has_no_clip_in_is_silent() {
         let mut song = song_with_a_clip();
+        song.desk_personality.noise_enabled = false;
         // Point the track at a scene that holds nothing for it.
         song.session.scenes[1] = Scene { slots: Vec::new() };
         let (spec, nodes) = build(&song, &[Some(1)]);
@@ -1324,6 +2786,314 @@ mod tests {
         let (_, nodes) = build(&song, &playing(&song));
         assert_eq!(nodes.meters[0], Some(0), "the track took the master's slot");
         assert_ne!(nodes.meters[0], Some(MASTER_METER));
+    }
+
+    #[test]
+    fn master_gain_precedes_mix_ceiling_and_final_output_in_both_builders() {
+        let mut song = song_with_a_clip();
+        song.master = 1.5;
+        let first_id = song
+            .console
+            .mix
+            .sections
+            .first()
+            .expect("MIX has a head")
+            .id;
+        let ceiling_id = song
+            .console
+            .mix
+            .section(crate::console::SectionKind::Ceiling)
+            .expect("MIX has its safety stage")
+            .id;
+        let last_id = song.console.mix.sections.last().expect("MIX has a tail").id;
+        let mix_keys = DeskPathIdentity::Rail(song.console.mix.id).stereo_keys();
+
+        for (spec, nodes) in [build(&song, &playing(&song)), build_song(&song)] {
+            let device_node = |id| {
+                nodes
+                    .devices
+                    .iter()
+                    .find_map(|(device, node)| (*device == id).then_some(*node))
+                    .expect("MIX section reached the graph")
+            };
+            let first = device_node(first_id);
+            let ceiling = device_node(ceiling_id);
+            let last = device_node(last_id);
+            let mix_personality = spec
+                .iter_ordered()
+                .find_map(|(id, node)| match node {
+                    NodeSpec::DeskPath {
+                        left_identity,
+                        right_identity,
+                        ..
+                    } if (*left_identity, *right_identity) == mix_keys => Some(id),
+                    _ => None,
+                })
+                .expect("MIX personality reached the graph");
+            let output = spec.output().expect("the graph has a final output");
+
+            assert!(
+                spec.wires().contains(&(nodes.master, mix_personality)),
+                "master gain was not before MIX"
+            );
+            assert!(
+                spec.wires().contains(&(mix_personality, first)),
+                "MIX personality did not precede its sections"
+            );
+            assert_ne!(output, nodes.master, "master gain remained post-ceiling");
+            assert!(
+                spec.wires().contains(&(ceiling, last)),
+                "MIX safety stage was not before its final scope"
+            );
+            assert!(
+                spec.wires().contains(&(last, output)),
+                "final output bypassed the complete MIX run"
+            );
+            assert!(
+                matches!(spec.node(nodes.master), Some(NodeSpec::Mixer { gain }) if *gain == 1.5),
+                "SongNodes::master stopped naming the live fader"
+            );
+        }
+    }
+
+    #[test]
+    fn adjacent_channels_have_stable_directional_cross_bus_crosstalk() {
+        let mut song = song_with_a_clip();
+        let blocks = song.tracks[0].blocks.clone();
+        song.add_track(TrackKind::Instrument);
+        song.tracks[1].blocks = blocks;
+        song.tracks[0].bus = 0;
+        song.tracks[0].bus_by_hand = true;
+        song.tracks[1].bus = 1;
+        song.tracks[1].bus_by_hand = true;
+        also_playing(&mut song, 1);
+
+        let first = DeskPathIdentity::Track(song.tracks[0].id).stereo_keys();
+        let second = DeskPathIdentity::Track(song.tracks[1].id).stereo_keys();
+        for (spec, _) in [build(&song, &playing(&song)), build_song(&song)] {
+            let paths: Vec<_> = spec
+                .iter_ordered()
+                .filter_map(|(_, node)| match node {
+                    NodeSpec::DeskBleed {
+                        from_left,
+                        from_right,
+                        to_left,
+                        to_right,
+                        ..
+                    } => Some(((*from_left, *from_right), (*to_left, *to_right))),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                paths.len(),
+                8,
+                "one channel pair plus three adjacent bus pairs need both directions"
+            );
+            assert!(paths.contains(&(first, second)));
+            assert!(paths.contains(&(second, first)));
+            for pair in song.console.buses.windows(2) {
+                let left = DeskPathIdentity::Rail(pair[0].id).stereo_keys();
+                let right = DeskPathIdentity::Rail(pair[1].id).stereo_keys();
+                assert!(paths.contains(&(left, right)));
+                assert!(paths.contains(&(right, left)));
+            }
+            spec.compile(48_000, 128)
+                .expect("the coupled cross-bus graph must run");
+        }
+    }
+
+    #[test]
+    fn dense_bus_and_return_fan_in_is_reduced_before_compile() {
+        let mut song = song_with_a_clip();
+        let blocks = song.tracks[0].blocks.clone();
+        song.tracks[0].bus = 0;
+        song.tracks[0].bus_by_hand = true;
+        for _ in 1..10 {
+            let index = song.tracks.len();
+            song.add_track(TrackKind::Instrument);
+            song.tracks[index].blocks = blocks.clone();
+            song.tracks[index].bus = 0;
+            song.tracks[index].bus_by_hand = true;
+            also_playing(&mut song, index);
+        }
+
+        for (spec, _) in [build(&song, &playing(&song)), build_song(&song)] {
+            assert_eq!(
+                spec.iter_ordered()
+                    .filter(|(_, node)| matches!(node, NodeSpec::DeskBleed { .. }))
+                    .count(),
+                24,
+                "ten channels and four buses need every adjacent pair in both directions"
+            );
+            spec.compile(48_000, 128)
+                .expect("more than eight bus and return feeds need reduction trees");
+        }
+    }
+
+    fn render_empty_desk(noise_enabled: bool) -> (Vec<f32>, usize) {
+        use crate::audio::graph::ProcessCtx;
+
+        let mut song = Song::default();
+        song.tracks.clear();
+        song.desk_personality.noise_enabled = noise_enabled;
+        let (spec, _) = build_song(&song);
+        let personalities = spec
+            .iter_ordered()
+            .filter(|(_, node)| matches!(node, NodeSpec::DeskPath { .. }))
+            .count();
+        let mut schedule = spec.compile(48_000, 256).expect("desk compiles");
+        let input = [0.0f32; 512];
+        let mut output = vec![0.0f32; 512];
+        let beats_per_sample = 120.0 / 60.0 / 48_000.0;
+        for block in 0..40u64 {
+            let ctx = ProcessCtx {
+                device_input: &input,
+                in_channels: 2,
+                block_frames: 256,
+                offset: 0,
+                len: 256,
+                playing: true,
+                position: block * 256,
+                beat: block as f64 * 256.0 * beats_per_sample,
+                beats_per_sample,
+                discontinuity: block == 0,
+            };
+            if block == 39 {
+                assert_no_alloc::assert_no_alloc(|| schedule.run(&mut output, &ctx));
+            } else {
+                schedule.run(&mut output, &ctx);
+            }
+        }
+        (output, personalities)
+    }
+
+    #[test]
+    fn compiled_structural_rails_make_noise_and_global_defeat_is_exact() {
+        let (enabled, personalities) = render_empty_desk(true);
+        assert_eq!(
+            personalities,
+            crate::sequencing::BUS_COUNT + crate::sequencing::RETURN_NAMES.len() + 1,
+            "every bus, return, and MIX needs one personality node"
+        );
+        let peak = enabled
+            .iter()
+            .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+        assert!(peak > 1.0e-8, "enabled desk rendered exact silence");
+
+        let (defeated, defeated_personalities) = render_empty_desk(false);
+        assert_eq!(defeated_personalities, personalities);
+        assert!(
+            defeated.iter().all(|sample| sample.to_bits() == 0),
+            "measurement defeat left an additive signal"
+        );
+    }
+
+    #[test]
+    fn compiled_song_personality_is_split_block_bit_exact() {
+        use crate::audio::graph::ProcessCtx;
+
+        let mut song = Song::default();
+        song.tracks.clear();
+        let (whole_spec, _) = build_song(&song);
+        let (split_spec, _) = build_song(&song);
+        let mut whole = whole_spec.compile(48_000, 256).expect("whole compiles");
+        let mut split = split_spec.compile(48_000, 256).expect("split compiles");
+        let input = [0.0f32; 512];
+        let beats_per_sample = 120.0 / 60.0 / 48_000.0;
+        let mut scratch_a = vec![0.0f32; 512];
+        let mut scratch_b = vec![0.0f32; 512];
+
+        // Settle graph-level ramps and MIX's latency with identical history.
+        for block in 0..40u64 {
+            let ctx = ProcessCtx {
+                device_input: &input,
+                in_channels: 2,
+                block_frames: 256,
+                offset: 0,
+                len: 256,
+                playing: true,
+                position: block * 256,
+                beat: block as f64 * 256.0 * beats_per_sample,
+                beats_per_sample,
+                discontinuity: block == 0,
+            };
+            whole.run(&mut scratch_a, &ctx);
+            split.run(&mut scratch_b, &ctx);
+        }
+        assert_eq!(scratch_a, scratch_b, "identical schedules already diverged");
+
+        let position = 40 * 256;
+        let mut whole_out = vec![0.0f32; 512];
+        let mut split_out = vec![0.0f32; 512];
+        let whole_ctx = ProcessCtx {
+            device_input: &input,
+            in_channels: 2,
+            block_frames: 256,
+            offset: 0,
+            len: 256,
+            playing: true,
+            position,
+            beat: position as f64 * beats_per_sample,
+            beats_per_sample,
+            discontinuity: false,
+        };
+        whole.run(&mut whole_out, &whole_ctx);
+
+        let first = ProcessCtx {
+            device_input: &input,
+            in_channels: 2,
+            block_frames: 256,
+            offset: 0,
+            len: 97,
+            playing: true,
+            position,
+            beat: position as f64 * beats_per_sample,
+            beats_per_sample,
+            discontinuity: false,
+        };
+        split.run(&mut split_out, &first);
+        let rest_position = position + 97;
+        let rest = ProcessCtx {
+            device_input: &input,
+            in_channels: 2,
+            block_frames: 256,
+            offset: 97,
+            len: 159,
+            playing: true,
+            position: rest_position,
+            beat: rest_position as f64 * beats_per_sample,
+            beats_per_sample,
+            discontinuity: false,
+        };
+        split.run(&mut split_out, &rest);
+        assert_eq!(whole_out, split_out);
+    }
+
+    #[test]
+    fn every_compiled_channel_and_rail_gets_stable_stereo_identity() {
+        let song = song_with_a_clip();
+        let (spec, _) = build_song(&song);
+        let paths: Vec<(u64, u64)> = spec
+            .iter_ordered()
+            .filter_map(|(_, node)| match node {
+                NodeSpec::DeskPath {
+                    left_identity,
+                    right_identity,
+                    ..
+                } => Some((*left_identity, *right_identity)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            paths.len(),
+            song.tracks.len()
+                + crate::sequencing::BUS_COUNT
+                + crate::sequencing::RETURN_NAMES.len()
+                + 1
+        );
+        let expected_track = DeskPathIdentity::Track(song.tracks[0].id).stereo_keys();
+        assert!(paths.contains(&expected_track));
+        assert!(paths.iter().all(|(left, right)| left != right));
     }
 
     /// The one that matters: a song, a launched scene, and actual sound
@@ -1384,6 +3154,10 @@ mod tests {
 
         let mut song = song_with_a_clip();
         song.tracks[0].muted = true;
+        // Exact-silence assertions are measurements. Structural buses remain
+        // physical paths even when a channel is muted, so use the persisted
+        // global measurement defeat rather than confusing a floor with leak.
+        song.desk_personality.noise_enabled = false;
         let (spec, _) = build(&song, &playing(&song));
         let mut schedule = spec.compile(48_000, 256).expect("the graph must run");
 
@@ -1585,10 +3359,16 @@ mod tests {
     }
 
     #[test]
-    fn a_bypassed_effect_is_passed_by_rather_than_built() {
+    fn a_bypassed_effect_is_dry_but_keeps_its_latency() {
         let mut song = song_with_a_clip();
         song.add_device(0, DeviceKind::Poly).expect("instrument");
         let sat = song.add_device(0, DeviceKind::Sat).expect("effect");
+
+        let active_latency = build(&song, &playing(&song))
+            .0
+            .compile(48_000, 256)
+            .expect("active graph")
+            .latency();
         song.device_mut(sat).expect("there").bypassed = true;
 
         let (spec, _) = build(&song, &playing(&song));
@@ -1597,6 +3377,19 @@ mod tests {
                 .iter_ordered()
                 .any(|(_, node)| matches!(node, NodeSpec::Sat { .. })),
             "a bypassed effect was still built"
+        );
+        assert!(
+            spec.iter_ordered().any(|(_, node)| matches!(
+                node,
+                NodeSpec::LatencyBypass { effect }
+                    if matches!(effect.as_ref(), NodeSpec::Sat { .. })
+            )),
+            "the bypass lost the effect's latency declaration"
+        );
+        let bypassed_latency = spec.compile(48_000, 256).expect("bypassed graph").latency();
+        assert_eq!(
+            bypassed_latency, active_latency,
+            "bypassing the saturator moved the channel"
         );
         // And the signal still arrives: bypass is a pass, not a cut.
         assert!(

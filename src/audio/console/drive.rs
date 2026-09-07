@@ -14,9 +14,11 @@
 //! chooses what is driven — tilt up and the top breaks first, tilt
 //! down and the bottom does — and a TILT after it puts the balance
 //! back or leans it. MIX blends against the dry; OUT trims. At DRIVE
-//! zero with both tilts flat and OUT at zero the section is a wire to
-//! the sample. The curves live green in `crate::console::drive_curve`
-//! so the card draws what the core runs.
+//! zero with both tilts flat and OUT at zero the section is a wire behind
+//! the fixed antialias round-trip latency. Dry and wet each traverse their
+//! own identical round trip, so MIX never crossfades a 35-sample-late wet
+//! signal against an immediate dry signal. The curves live green in
+//! `crate::console::drive_curve` so the card draws what the core runs.
 
 use crate::audio::console::{Clock, SectionCore};
 use crate::audio::graph::Readout;
@@ -88,6 +90,10 @@ pub struct DriveCore {
     /// The pivot's own one-pole, per channel, run over the OUTPUT: what
     /// it passes is the bottom, so what it does not is the top share.
     share: [OnePole; 2],
+    /// A matched identity round trip for the parallel dry leg. The wet
+    /// oversampler cannot serve both paths: its history has already advanced
+    /// by the time the dry copy is processed.
+    dry_over: [Oversampler2x; 2],
     over: [Oversampler2x; 2],
     dc: [DcBlocker; 2],
     lane: Vec<f32>,
@@ -113,6 +119,7 @@ impl DriveCore {
             post: [Tilt::new(), Tilt::new()],
             top: [OnePole::new(), OnePole::new()],
             share: [OnePole::new(), OnePole::new()],
+            dry_over: [Oversampler2x::new(), Oversampler2x::new()],
             over: [Oversampler2x::new(), Oversampler2x::new()],
             dc: [DcBlocker::new(), DcBlocker::new()],
             lane: vec![0.0; Oversampler2x::scratch_len(block.max(1))],
@@ -127,6 +134,7 @@ impl DriveCore {
             top_share: 0.0,
         };
         for ch in 0..2 {
+            core.dry_over[ch].prepare();
             core.over[ch].prepare();
             core.dc[ch].prepare(sample_rate);
             core.share[ch].prepare(sample_rate, p::TILT_HZ);
@@ -155,27 +163,40 @@ impl DriveCore {
     fn run(&mut self, ch: usize, io: &mut [f32]) {
         let n = io.len();
         let s = self.settings;
-        let wet = s.drive > 0.0 && s.mix > 0.0;
+        let driven = s.drive > 0.0;
+        let wet = driven && s.mix > 0.0;
         if s.tilt_pre_db != 0.0 {
             self.pre[ch].process(io);
         }
-        if wet {
-            let dry = &mut self.dry[..n];
-            dry.copy_from_slice(io);
-            let lane = &mut self.lane[..n * 2];
-            self.over[ch].up(io, lane);
+
+        // Both legs carry the SAME linear-phase antialias response. Apart
+        // from keeping the section's latency constant, this avoids the comb
+        // filter made by mixing an immediate dry copy with a late wet path.
+        let dry = &mut self.dry[..n];
+        dry.copy_from_slice(io);
+        let lane = &mut self.lane[..n * 2];
+        self.dry_over[ch].up(dry, lane);
+        self.dry_over[ch].down(lane, dry);
+        self.over[ch].up(io, lane);
+        if driven {
             let (character, k) = (s.character, self.k);
             let mut hottest = 0.0f32;
             for x in lane.iter_mut() {
                 hottest = hottest.max((*x * k).abs());
                 *x = curve(character, k, *x);
             }
-            self.over[ch].down(lane, io);
-            self.heat = self.heat.max((hottest / p::HEAT_FULL).min(1.0));
+            if wet {
+                self.heat = self.heat.max((hottest / p::HEAT_FULL).min(1.0));
+            }
+        }
+        self.over[ch].down(lane, io);
+        if driven {
             if s.character == p::TAPE {
                 self.top[ch].process_lowpass(io);
             }
             self.dc[ch].process(io);
+        }
+        if wet {
             if s.mix < 1.0 {
                 for (y, x) in io.iter_mut().zip(dry.iter()) {
                     *y = *x + (*y - *x) * s.mix;
@@ -193,6 +214,8 @@ impl DriveCore {
             let scale = 1.0 / n as f32;
             let ratio = (added * scale).sqrt() / (clean * scale).sqrt().max(p::DIRT_FLOOR);
             self.dirt = self.dirt.max(ratio.min(1.0));
+        } else {
+            io.copy_from_slice(dry);
         }
         if s.tilt_post_db != 0.0 {
             self.post[ch].process(io);
@@ -235,6 +258,7 @@ impl SectionCore for DriveCore {
             self.post[ch].reset();
             self.top[ch].reset();
             self.share[ch].reset();
+            self.dry_over[ch].reset();
             self.over[ch].reset();
             self.dc[ch].reset();
         }
@@ -244,6 +268,10 @@ impl SectionCore for DriveCore {
         self.input_db = p::INPUT_FLOOR_DB;
         self.dirt = 0.0;
         self.top_share = 0.0;
+    }
+
+    fn latency(&self) -> usize {
+        self.over[0].latency()
     }
 
     fn process(&mut self, l: &mut [f32], r: &mut [f32], _clock: &Clock) {
@@ -264,11 +292,11 @@ impl SectionCore for DriveCore {
         self.input_peak = self.input_peak.max(heard);
         let held = self.input_peak.max(p::ENERGY_FLOOR);
         self.input_db = (20.0 * held.log10()).max(p::INPUT_FLOOR_DB);
-        if !self.settings.is_wire() {
-            self.run(0, l);
-            if stereo {
-                self.run(1, &mut r[..n]);
-            }
+        // The compiled section always has one fixed latency. `run` keeps
+        // both its dry and wet antialias paths warm even at the floor.
+        self.run(0, l);
+        if stereo {
+            self.run(1, &mut r[..n]);
         }
         let (mut peak, mut all, mut low) = self.scan(0, l);
         if stereo {
@@ -405,19 +433,32 @@ mod tests {
     }
 
     #[test]
-    fn the_floor_is_a_wire_to_the_sample() {
+    fn the_floor_is_a_wire_behind_the_reported_latency() {
         let mut core = core_with(&[(p::CHARACTER, 3.0), (p::MIX, 100.0), (p::DRIVE, 0.0)]);
         assert!(core.settings().is_wire());
-        for len in [0usize, 1, 7, BLOCK] {
-            let l = sine(440.0, 0.5, len);
-            let r: Vec<f32> = l.iter().map(|s| -s).collect();
-            let (mut ol, mut or) = (l.clone(), r.clone());
-            core.process(&mut ol, &mut or, &clock());
-            assert_eq!(ol, l);
-            assert_eq!(or, r);
-        }
-        let mut dry = core_with(&[(p::DRIVE, 80.0), (p::MIX, 0.0)]);
+        let ahead = core.latency();
+        assert_eq!(ahead, Oversampler2x::new().latency());
+        let mut l = vec![0.0f32; BLOCK];
+        let mut r = vec![0.0f32; BLOCK];
+        l[0] = 1.0;
+        r[0] = -1.0;
+        core.process(&mut l, &mut r, &clock());
+        let peak = l
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+            .expect("an impulse has a peak");
+        assert_eq!(peak.0, ahead);
+        assert!(peak.1.abs() > 0.9, "the round trip lost the impulse");
+        assert!(
+            l.iter()
+                .zip(&r)
+                .all(|(a, b)| (*a + *b).abs() <= f32::EPSILON),
+            "the stereo lanes must remain equal and opposite"
+        );
+        let dry = core_with(&[(p::DRIVE, 80.0), (p::MIX, 0.0)]);
         assert!(dry.settings().is_wire(), "mix at zero is dry");
+        assert_eq!(dry.latency(), ahead);
     }
 
     /// Each character has its own harmonics: the tube is even, the
@@ -503,14 +544,16 @@ mod tests {
         let full_out = run(&mut full, &l);
         let mut half = core_with(&[(p::CHARACTER, 3.0), (p::DRIVE, 100.0), (p::MIX, 50.0)]);
         let half_out = run(&mut half, &l);
+        let mut wire = core_with(&[(p::DRIVE, 0.0)]);
+        let wire_out = run(&mut wire, &l);
         let wet_diff = rms(&full_out[n / 2..]
             .iter()
-            .zip(&l[n / 2..])
+            .zip(&wire_out[n / 2..])
             .map(|(a, b)| a - b)
             .collect::<Vec<_>>());
         let half_diff = rms(&half_out[n / 2..]
             .iter()
-            .zip(&l[n / 2..])
+            .zip(&wire_out[n / 2..])
             .map(|(a, b)| a - b)
             .collect::<Vec<_>>());
         assert!(

@@ -33,7 +33,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // for the widest card: sibyl's nine cells.
     let frame = which.starts_with("stage");
     let (logical_w, logical_h) = if frame {
-        (1280.0f32, 800.0f32)
+        if which.contains("-compact") {
+            (720.0f32, 480.0f32)
+        } else {
+            (1280.0f32, 800.0f32)
+        }
     } else {
         (540.0f32, 248.0f32)
     };
@@ -355,6 +359,14 @@ fn posed_key_frames(which: &str) -> Vec<Vec<egui::Event>> {
             frames.push(press(egui::Key::ArrowRight, egui::Modifiers::NONE).to_vec());
         }
     }
+    if which.contains("browser-find") {
+        frames.push(vec![egui::Event::Text("reverb".to_owned())]);
+        // Filtered rows retain their real ancestry. Stand on the surviving
+        // device rather than its open parents so both PATH and YIELD speak.
+        for _ in 0..3 {
+            frames.push(press(egui::Key::ArrowDown, egui::Modifiers::NONE).to_vec());
+        }
+    }
     frames
 }
 
@@ -425,7 +437,49 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
     if stage.polarity() != want {
         let _ = stage.apply(StageIntent::Ground);
     }
-    if which.contains("strip") {
+    if which.contains("modulation") {
+        // A working patchbay: two differently-clocked LFOs and an envelope
+        // follower, each with a real route and measured callback values. The
+        // selected first route opens directly into the response shaper.
+        let _ = stage.apply(StageIntent::NewInstrumentTrack);
+        let (first, second, follower, wire_a, wire_b, wire_c) = {
+            use daw::audio::modulation::{ModKind, ModShape};
+            let song = stage.song_mut();
+            let first = song.add_lfo().expect("LFO capacity");
+            let second = song.add_lfo().expect("LFO capacity");
+            let follower = song.add_follower(1).expect("follower track");
+            song.modulators[1].kind = ModKind::Lfo {
+                shape: ModShape::Triangle,
+                rate_beats: 0.5,
+                free: false,
+                hz: 2.0,
+            };
+            let wire_a = song
+                .add_mod_wire(first, 0, daw::targets::TRACK_VOLUME_TARGET)
+                .expect("volume route");
+            let wire_b = song
+                .add_mod_wire(second, 0, daw::targets::TRACK_PAN_TARGET)
+                .expect("pan route");
+            let wire_c = song
+                .add_mod_wire(follower, 1, daw::targets::TRACK_VOLUME_TARGET)
+                .expect("follower route");
+            song.mod_wires[0].depth = 0.38;
+            song.mod_wires[0].curve = -0.24;
+            song.mod_wires[0].steps = 8;
+            song.mod_wires[0].smooth_ms = 20.0;
+            (first, second, follower, wire_a, wire_b, wire_c)
+        };
+        let _ = stage.apply(StageIntent::Modulation);
+        // Targets -> Response on the already-patched first destination.
+        let _ = stage.apply(StageIntent::ModTab { backwards: false });
+        let _ = stage.apply(StageIntent::Enter);
+        let _ = (first, second, follower);
+        stage.set_modulation_readings(
+            &[0.72, -0.35, 0.58],
+            &[wire_a, wire_b, wire_c],
+            &[0.21, -0.16, -0.11],
+        );
+    } else if which.contains("strip") {
         // The strip band: an instrument track, its console strip laid
         // out as pieces; a few sections switched IN, the cursor on one.
         let _ = stage.apply(StageIntent::NewInstrumentTrack);
@@ -560,6 +614,33 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
                 },
             );
         }
+    } else if which.contains("plock") {
+        // The multi-note parameter-lock editor, deliberately scrolled past
+        // its first page and carrying a real edit. This pose catches the two
+        // regressions that made the live panel feel dead: a cursor walking
+        // into clipped rows and a value change too small to read.
+        let _ = stage.apply(StageIntent::Step(Step::Down));
+        let _ = stage.apply(StageIntent::Enter);
+        if let Some(daw::sequencing::Clip::Pattern(id)) = stage.song().slot_clip(0, 0) {
+            if let Some(pattern) = stage.song_mut().pattern_mut(id) {
+                for step in [0usize, 4, 8, 12] {
+                    pattern.toggle(
+                        step,
+                        daw::sequencing::Note::new(
+                            60 + step as u8 / 2,
+                            daw::sequencing::PATTERN_STEP_TICKS,
+                            100,
+                        ),
+                    );
+                }
+            }
+        }
+        let _ = stage.apply(StageIntent::Enter);
+        let _ = stage.apply(StageIntent::PlockEditor);
+        for _ in 0..40 {
+            let _ = stage.apply(StageIntent::Step(Step::Down));
+        }
+        let _ = stage.apply(StageIntent::Step(Step::Right));
     } else if which.contains("song") {
         // The song view: three instrument tracks and an audio track,
         // blocks laid along the first two, the cursor on one, the song
@@ -657,6 +738,13 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
         if which.contains("zoom") {
             let _ = stage.apply(StageIntent::Song(SongIntent::ZoomIn));
             let _ = stage.apply(StageIntent::Song(SongIntent::ZoomIn));
+        }
+        if which.contains("meter") {
+            // A real denominator change inside the posed Song: enough to
+            // prove the ruler follows 7/8 beats, then restarts in 3/4.
+            let seven_eighths = daw::sequencing::TICKS_PER_BEAT * 7 / 2;
+            let _ = stage.song_mut().set_meter_mark(0, 7, 8);
+            let _ = stage.song_mut().set_meter_mark(seven_eighths * 2, 3, 4);
         }
     } else if which.contains("browser") {
         let _ = stage.apply(StageIntent::Browse);
@@ -1244,6 +1332,48 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
             }
         }
         let _ = stage.apply(StageIntent::Mix);
+    } else if which.contains("sampler-card") {
+        // The sampler as it appears in the Stage chain: material on the
+        // left, the ordinary keyboard parameter bank on the right, and a
+        // loaded peak map so trim, loop, and slices can all be inspected.
+        use daw::params::sampler as sp;
+        use daw::ui::stage::SampleData;
+        let id = stage
+            .song_mut()
+            .add_device(0, daw::devices::DeviceKind::Sampler)
+            .expect("a sampler");
+        let path = std::path::PathBuf::from("/shot/amen-neural-break.wav");
+        if let Some(device) = stage.song_mut().device_mut(id) {
+            device.sample = Some(path.clone());
+            device.set(sp::MODE, sp::MODE_SLICE);
+            device.set(sp::START, 0.08);
+            device.set(sp::END, 0.91);
+            device.set(sp::LOOP_MODE, sp::LOOP_FORWARD);
+            device.set(sp::LOOP_START, 0.56);
+            device.set(sp::SLICE_SOURCE, sp::SLICE_TRANSIENTS);
+            device.set(sp::REVERSE, 1.0);
+            device.set_slices([0.0, 0.11, 0.24, 0.38, 0.50, 0.64, 0.78, 0.89]);
+        }
+        let rate = 48_000u32;
+        let frames = rate as usize * 2;
+        let samples: Vec<f32> = (0..frames)
+            .map(|i| {
+                let t = i as f32 / rate as f32;
+                let hit = (t * 4.0).fract() / 4.0;
+                let env = (-hit * 15.0).exp();
+                let body = (t * 92.0 * std::f32::consts::TAU).sin() * 0.58;
+                let snap = (t * 2_700.0 * std::f32::consts::TAU).sin() * 0.28 * (-hit * 70.0).exp();
+                (body * env + snap).clamp(-1.0, 1.0)
+            })
+            .collect();
+        stage.set_sample(SampleData::from_planar(
+            path,
+            std::sync::Arc::new(samples),
+            1,
+            frames as u64,
+            rate,
+        ));
+        let _ = stage.apply(StageIntent::Devices);
     } else if which.contains("sample") {
         // A sampler on the first track with a synthesized file — a
         // decaying tone struck four times, so onsets exist to find —

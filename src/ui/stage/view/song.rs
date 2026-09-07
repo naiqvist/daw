@@ -13,7 +13,7 @@
 use super::heads;
 use super::palette;
 use crate::PROFONT;
-use crate::sequencing::TICKS_PER_BEAT;
+use crate::sequencing::{Song, TICKS_PER_BEAT};
 use crate::ui::stage::arrangement::bar_ticks;
 use eframe::egui;
 
@@ -45,6 +45,80 @@ fn label_every(bar_px: f32) -> usize {
     } else {
         8
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MetricBar {
+    tick: usize,
+    end: usize,
+    number: usize,
+    beat_ticks: usize,
+}
+
+fn notated_beat_ticks(denominator: u32) -> usize {
+    (TICKS_PER_BEAT.saturating_mul(4) / denominator.max(1) as usize).max(1)
+}
+
+/// Bars which touch the visible interval, in metric order.
+///
+/// A meter mark begins a new bar even when it interrupts the old one. The
+/// bar number therefore comes from walking real metric segments, not from
+/// dividing an absolute tick by whichever signature happens to be visible.
+fn metric_bars(song: &Song, start: usize, end: usize) -> Vec<MetricBar> {
+    if end < start {
+        return Vec::new();
+    }
+
+    let opening = song.meter_at(0, (4, 4));
+    let mut segments = vec![(0usize, opening.1)];
+    for mark in song
+        .meter
+        .iter()
+        .filter(|mark| mark.tick > 0 && mark.numerator > 0 && mark.denominator > 0)
+    {
+        match segments.last_mut() {
+            Some(last) if last.0 == mark.tick => last.1 = mark.denominator,
+            Some(last) if last.0 < mark.tick => segments.push((mark.tick, mark.denominator)),
+            _ => {}
+        }
+    }
+
+    let mut bars = Vec::new();
+    let mut number = 0usize;
+    for (index, &(origin, denominator)) in segments.iter().enumerate() {
+        let segment_end = segments
+            .get(index + 1)
+            .map_or(usize::MAX, |&(tick, _)| tick);
+        let length = bar_ticks(song, origin).max(1);
+
+        if segment_end <= start {
+            let span = segment_end.saturating_sub(origin);
+            number = number.saturating_add(span.saturating_add(length - 1) / length);
+            continue;
+        }
+
+        let offset = start.saturating_sub(origin) / length;
+        number = number.saturating_add(offset);
+        let mut tick = origin.saturating_add(offset.saturating_mul(length));
+        while tick <= end && tick < segment_end {
+            let bar_end = tick.saturating_add(length).min(segment_end);
+            if bar_end <= tick {
+                break;
+            }
+            bars.push(MetricBar {
+                tick,
+                end: bar_end,
+                number,
+                beat_ticks: notated_beat_ticks(denominator),
+            });
+            number = number.saturating_add(1);
+            tick = bar_end;
+        }
+        if segment_end > end {
+            break;
+        }
+    }
+    bars
 }
 
 struct Frame {
@@ -125,45 +199,43 @@ impl super::super::Stage {
         let hair = egui::Stroke::new(1.0, c.rule);
         let arr = &self.arrangement;
 
-        // The ruler: a tick per bar, a number where there is room.
-        let bar = bar_ticks(&self.song, f.view_start).max(1);
-        let bar_px = bar as f32 * f.px_per_tick;
-        let every = label_every(bar_px);
+        // The ruler: successive metric boundaries, with the denominator's
+        // own beats inside each bar. A meter mark is a fresh bar origin.
         let ry = f.ruler.max.y.round() - 0.5;
         painter.line_segment(
             [egui::pos2(f.ruler.min.x, ry), egui::pos2(f.ruler.max.x, ry)],
             hair,
         );
-        let first_bar = f.view_start / bar;
-        let last_bar = f.view_end() / bar + 1;
-        for b in first_bar..=last_bar {
-            let x = f.x(b * bar).round() - 0.5;
-            if x < f.ruler.min.x - 1.0 || x > f.ruler.max.x {
-                continue;
-            }
-            let long = b % every == 0;
-            painter.line_segment(
-                [
-                    egui::pos2(x, ry - if long { 6.0 } else { 3.0 }),
-                    egui::pos2(x, ry),
-                ],
-                hair,
-            );
-            if long {
-                painter.text(
-                    egui::pos2(x + 3.0, f.ruler.min.y),
-                    egui::Align2::LEFT_TOP,
-                    format!("{:03}", b + 1),
-                    font.clone(),
-                    c.dim,
+        for bar in metric_bars(&self.song, f.view_start, f.view_end()) {
+            let bar_px = bar.end.saturating_sub(bar.tick) as f32 * f.px_per_tick;
+            let long = bar.number % label_every(bar_px) == 0;
+            let x = f.x(bar.tick).round() - 0.5;
+            if x >= f.ruler.min.x - 1.0 && x <= f.ruler.max.x {
+                painter.line_segment(
+                    [
+                        egui::pos2(x, ry - if long { 6.0 } else { 3.0 }),
+                        egui::pos2(x, ry),
+                    ],
+                    hair,
                 );
+                if long {
+                    painter.text(
+                        egui::pos2(x + 3.0, f.ruler.min.y),
+                        egui::Align2::LEFT_TOP,
+                        format!("{:03}", bar.number + 1),
+                        font.clone(),
+                        c.dim,
+                    );
+                }
             }
-            // Beat ticks inside a bar, when a bar is wide enough to hold them.
             if bar_px >= 60.0 {
-                let beats = bar / TICKS_PER_BEAT;
-                for k in 1..beats {
-                    let bx = f.x(b * bar + k * TICKS_PER_BEAT).round() - 0.5;
-                    painter.line_segment([egui::pos2(bx, ry - 2.0), egui::pos2(bx, ry)], hair);
+                let mut beat = bar.tick.saturating_add(bar.beat_ticks);
+                while beat < bar.end {
+                    let bx = f.x(beat).round() - 0.5;
+                    if bx >= f.ruler.min.x && bx <= f.ruler.max.x {
+                        painter.line_segment([egui::pos2(bx, ry - 2.0), egui::pos2(bx, ry)], hair);
+                    }
+                    beat = beat.saturating_add(bar.beat_ticks);
                 }
             }
         }
@@ -377,6 +449,51 @@ impl super::super::Stage {
             0.0,
             egui::Stroke::new(1.0, c.chassis),
             egui::StrokeKind::Inside,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ruler_bars_restart_at_meter_marks_and_use_notated_beats() {
+        let mut song = Song::default();
+        assert!(song.set_meter_mark(0, 7, 8));
+        let seven_eighths = TICKS_PER_BEAT * 7 / 2;
+        let change = seven_eighths * 2 + 5;
+        assert!(song.set_meter_mark(change, 3, 4));
+
+        let bars = metric_bars(&song, seven_eighths + 1, change + TICKS_PER_BEAT * 3);
+        assert_eq!(
+            bars,
+            vec![
+                MetricBar {
+                    tick: seven_eighths,
+                    end: seven_eighths * 2,
+                    number: 1,
+                    beat_ticks: TICKS_PER_BEAT / 2,
+                },
+                MetricBar {
+                    tick: seven_eighths * 2,
+                    end: change,
+                    number: 2,
+                    beat_ticks: TICKS_PER_BEAT / 2,
+                },
+                MetricBar {
+                    tick: change,
+                    end: change + TICKS_PER_BEAT * 3,
+                    number: 3,
+                    beat_ticks: TICKS_PER_BEAT,
+                },
+                MetricBar {
+                    tick: change + TICKS_PER_BEAT * 3,
+                    end: change + TICKS_PER_BEAT * 6,
+                    number: 4,
+                    beat_ticks: TICKS_PER_BEAT,
+                },
+            ]
         );
     }
 }

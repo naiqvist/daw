@@ -28,6 +28,28 @@ const ROW_H: f32 = 18.0;
 const TYPE_PX: f32 = 12.0;
 const INSET: f32 = 10.0;
 
+/// A human ruler interval that leaves roughly one label every 72 pixels.
+/// The editor's geometry is normalized; only the labels speak seconds.
+fn ruler_step_seconds(visible_seconds: f64, width: f32) -> f64 {
+    if !visible_seconds.is_finite() || visible_seconds <= 0.0 || width <= 0.0 {
+        return 1.0;
+    }
+    let labels = (f64::from(width) / 72.0).max(1.0);
+    let raw = visible_seconds / labels;
+    let decade = 10.0_f64.powf(raw.log10().floor());
+    let unit = raw / decade;
+    let nice = if unit <= 1.0 {
+        1.0
+    } else if unit <= 2.0 {
+        2.0
+    } else if unit <= 5.0 {
+        5.0
+    } else {
+        10.0
+    };
+    nice * decade
+}
+
 impl super::super::Stage {
     pub(super) fn draw_sample(&self, painter: &egui::Painter, field: egui::Rect) {
         let Some(editor) = self.sample.as_ref() else {
@@ -50,11 +72,11 @@ impl super::super::Stage {
         painter.text(
             egui::pos2(x, ty),
             egui::Align2::LEFT_CENTER,
-            "cut",
+            "SAMPLE LAB //",
             font.clone(),
             c.label,
         );
-        x += 4.0 * ch;
+        x += 14.0 * ch;
         let name = data
             .and_then(|d| d.path.file_name())
             .map(|n| n.to_string_lossy().into_owned())
@@ -88,6 +110,7 @@ impl super::super::Stage {
             }
             x += (page.word().len() as f32 + 2.0) * ch;
         }
+        let active_slice = device.and_then(|device| editor.slice_at(device));
         let facts: Vec<(&str, String)> = match data {
             Some(d) => vec![
                 ("len", format!("{:.2}s", d.seconds())),
@@ -101,7 +124,20 @@ impl super::super::Stage {
                         "off".into()
                     },
                 ),
-                ("slices", editor.count.to_string()),
+                (
+                    "slice",
+                    active_slice.map_or_else(
+                        || "--".to_owned(),
+                        |index| {
+                            format!(
+                                "{:02}/{:02}",
+                                index + 1,
+                                device.map_or(0, |device| device.slices.len())
+                            )
+                        },
+                    ),
+                ),
+                ("grid", editor.count.to_string()),
             ],
             None => vec![
                 ("len", "--".into()),
@@ -156,26 +192,30 @@ impl super::super::Stage {
             );
             return;
         };
-        // The editor speaks in seconds, as the sampler does.
-        let length = data.seconds().max(f64::EPSILON);
-        let from = editor.view_from;
-        let to = editor.view_to().min(length);
-        let span = (to - from).max(1.0);
-        let px = |frame: f64| inner.min.x + inner.width() * ((frame - from) / span) as f32;
+        // Cursor, view, trim, slices, audition and Peaks::columns all share
+        // one coordinate system: normalized fractions of the file. Seconds
+        // are derived exactly once, at the ruler/readout boundary.
+        let length_seconds = data.seconds().max(0.0);
+        let from = editor.view_from.clamp(0.0, 1.0);
+        let to = editor.view_to().clamp(from, 1.0);
+        let span = (to - from).max(f64::EPSILON);
+        let px = |at: f64| inner.min.x + inner.width() * ((at - from) / span) as f32;
         let mid = inner.center().y;
         let half = inner.height() * 0.5 - 2.0;
 
-        // A ruler in seconds along the top of the glass: a tick every
-        // tenth, a longer one with its number every half — the file's own
-        // time, at the sample rate the file has.
-        {
-            let step = 0.1_f64;
-            let mut t = (from / step).floor() * step;
+        // A ruler in seconds along the top of the glass. Its interval adapts
+        // to the zoom, while positions remain normalized file fractions.
+        if length_seconds > 0.0 && length_seconds.is_finite() {
+            let start_seconds = from * length_seconds;
+            let end_seconds = to * length_seconds;
+            let major_step = ruler_step_seconds(end_seconds - start_seconds, inner.width());
+            let step = major_step / 5.0;
+            let mut t = (start_seconds / step).floor() * step;
             let ry = inner.min.y.round() - 0.5;
-            while t <= to {
-                if t >= from {
-                    let x = px(t).round() - 0.5;
-                    let major = ((t / 0.5).round() * 0.5 - t).abs() < 1e-6;
+            while t <= end_seconds + step * 0.5 {
+                if t >= start_seconds {
+                    let x = px(t / length_seconds).round() - 0.5;
+                    let major = ((t / major_step).round() * major_step - t).abs() < step * 1e-4;
                     painter.line_segment(
                         [
                             egui::pos2(x, ry),
@@ -187,7 +227,7 @@ impl super::super::Stage {
                         painter.text(
                             egui::pos2(x + 3.0, ry + 1.0),
                             egui::Align2::LEFT_TOP,
-                            format!("{t:.1}s"),
+                            crate::ui::stage::sample::time_word(t / length_seconds, length_seconds),
                             font.clone(),
                             c.dim,
                         );
@@ -226,8 +266,8 @@ impl super::super::Stage {
 
         // The trim: what the sampler keeps, and what it does not.
         if let Some(device) = device {
-            let start = f64::from(device.value(sp::START)) * length;
-            let end = f64::from(device.value(sp::END)) * length;
+            let start = f64::from(device.value(sp::START));
+            let end = f64::from(device.value(sp::END));
             let g = c.ground;
             let wash = egui::Color32::from_rgba_unmultiplied(g.r(), g.g(), g.b(), 140);
             if start > from {
@@ -249,6 +289,24 @@ impl super::super::Stage {
                     0.0,
                     wash,
                 );
+            }
+            // The slice under the cursor is a region, not merely a numbered
+            // fence. A quiet selection wash makes it immediately clear what
+            // audition, delete and per-trig slice assignment will address.
+            if let Some(index) = active_slice {
+                let a = device.slices[index].max(from);
+                let b = device.slices.get(index + 1).copied().unwrap_or(end).min(to);
+                if b > a {
+                    let s = c.select;
+                    painter.rect_filled(
+                        egui::Rect::from_min_max(
+                            egui::pos2(px(a), inner.min.y),
+                            egui::pos2(px(b), inner.max.y),
+                        ),
+                        0.0,
+                        egui::Color32::from_rgba_unmultiplied(s.r(), s.g(), s.b(), 54),
+                    );
+                }
             }
             for (frame, word) in [(start, "in"), (end, "out")] {
                 if frame >= from && frame <= to {
@@ -274,14 +332,25 @@ impl super::super::Stage {
                 let x = px(*slice).round() - 0.5;
                 painter.line_segment(
                     [egui::pos2(x, inner.min.y), egui::pos2(x, inner.max.y)],
-                    egui::Stroke::new(1.0, c.chassis),
+                    egui::Stroke::new(
+                        if active_slice == Some(i) { 2.0 } else { 1.0 },
+                        if active_slice == Some(i) {
+                            c.alert
+                        } else {
+                            c.chassis
+                        },
+                    ),
                 );
                 painter.text(
                     egui::pos2(x + 3.0, inner.max.y),
                     egui::Align2::LEFT_BOTTOM,
                     format!("{:02}", i + 1),
                     font.clone(),
-                    c.label,
+                    if active_slice == Some(i) {
+                        c.bright
+                    } else {
+                        c.label
+                    },
                 );
             }
         }
@@ -319,11 +388,10 @@ impl super::super::Stage {
                 crate::ui::nav_cursor::Layer::Surface,
                 c.alert,
             );
-            let secs = editor.cursor;
             painter.text(
                 egui::pos2(x + 3.0, inner.max.y - TYPE_PX - 2.0),
                 egui::Align2::LEFT_BOTTOM,
-                format!("{secs:.3}s"),
+                crate::ui::stage::sample::time_word(editor.cursor, length_seconds),
                 font.clone(),
                 c.bright,
             );
@@ -335,12 +403,9 @@ impl super::super::Stage {
             egui::pos2(wave.max.x, room.max.y),
         );
         painter.rect_filled(overview, 0.0, c.panel);
-        let all = data.peaks.columns(
-            None,
-            0.0,
-            length,
-            overview.width().floor().max(1.0) as usize,
-        );
+        let all = data
+            .peaks
+            .columns(None, 0.0, 1.0, overview.width().floor().max(1.0) as usize);
         let omid = overview.center().y;
         let ohalf = overview.height() * 0.5 - 1.0;
         for (i, bin) in all.iter().enumerate() {
@@ -353,7 +418,7 @@ impl super::super::Stage {
                 egui::Stroke::new(1.0, c.edge),
             );
         }
-        let ox = |at: f64| overview.min.x + overview.width() * (at / length) as f32;
+        let ox = |at: f64| overview.min.x + overview.width() * at as f32;
         painter.rect_stroke(
             egui::Rect::from_min_max(
                 egui::pos2(ox(from), overview.min.y),
@@ -394,5 +459,18 @@ impl super::super::Stage {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ruler_step_seconds;
+
+    #[test]
+    fn ruler_intervals_are_nice_and_follow_the_visible_duration() {
+        assert_eq!(ruler_step_seconds(1.0, 720.0), 0.1);
+        assert_eq!(ruler_step_seconds(10.0, 720.0), 1.0);
+        assert_eq!(ruler_step_seconds(90.0, 720.0), 10.0);
+        assert_eq!(ruler_step_seconds(0.0, 720.0), 1.0);
     }
 }

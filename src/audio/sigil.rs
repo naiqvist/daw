@@ -20,6 +20,7 @@ use crate::params::sigil as p;
 
 /// The block is walked in chunks so the scratch is a fixed size.
 const CHUNK: usize = 128;
+const CARRIER_WAVES: [Waveform; 3] = [Waveform::Sine, Waveform::Triangle, Waveform::Square];
 
 /// The knobs, in engine units.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -99,31 +100,43 @@ impl SigilParams {
     }
 }
 
+fn waveform_slot(waveform: Waveform) -> usize {
+    match waveform {
+        Waveform::Sine => 0,
+        Waveform::Triangle => 1,
+        Waveform::Square => 2,
+        _ => 0,
+    }
+}
+
 /// One ring.
 #[derive(Debug, Clone)]
 pub struct SigilCore {
     params: SigilParams,
     sample_rate: f32,
-    /// Which waveform the tables currently hold, so a shape change
-    /// rebuilds them ONCE rather than every block.
+    /// Which already-built waveform the oscillator currently addresses.
     built: Option<Waveform>,
     osc: MipOsc,
-    tables: Vec<f32>,
+    /// Every selectable carrier table. A SHAPE letter only selects a slice;
+    /// Fourier synthesis never reaches the callback.
+    tables: [Vec<f32>; CARRIER_WAVES.len()],
     scratch: Vec<f32>,
 }
 
 impl SigilCore {
     pub fn new(sample_rate: f32, params: &SigilParams) -> Self {
+        let tables = core::array::from_fn(|index| {
+            let waveform = CARRIER_WAVES[index];
+            let mut data = vec![0.0; crate::dsp::osc::table_len(waveform)];
+            crate::dsp::osc::build_tables(waveform, &mut data);
+            data
+        });
         let mut core = Self {
             params: *params,
             sample_rate: 48_000.0,
             built: None,
             osc: MipOsc::new(),
-            // Sized for the LARGEST waveform's table set, so a shape
-            // change never needs the heap. Square is the deepest of the
-            // three; sizing for what is loaded would allocate on the
-            // audio thread the first time somebody turned the knob.
-            tables: Vec::new(),
+            tables,
             scratch: vec![0.0; CHUNK],
         };
         core.params.sanitize();
@@ -138,26 +151,17 @@ impl SigilCore {
         } else {
             48_000.0
         };
-        let widest = [Waveform::Sine, Waveform::Triangle, Waveform::Square]
-            .iter()
-            .map(|w| crate::dsp::osc::table_len(*w))
-            .max()
-            .unwrap_or(0);
-        self.tables.clear();
-        self.tables.resize(widest, 0.0);
         self.built = None;
-        self.rebuild();
+        self.select_waveform();
         self.reset();
     }
 
-    /// Green zone: build the table set the current shape needs, if it is
-    /// not the one already loaded.
-    fn rebuild(&mut self) {
+    /// Red-zone-safe O(1) selection of an already-built table set.
+    fn select_waveform(&mut self) {
         let waveform = self.params.waveform();
         if self.built == Some(waveform) {
             return;
         }
-        crate::dsp::osc::build_tables(waveform, &mut self.tables);
         self.osc.prepare(self.sample_rate, waveform);
         self.osc.set_freq(self.params.freq);
         self.built = Some(waveform);
@@ -186,7 +190,7 @@ impl SigilCore {
     /// `in * 1.0` — the exact identity, bit for bit, not an
     /// approximation that happens to sound dry.
     pub fn process(&mut self, l: &mut [f32], r: &mut [f32]) {
-        self.rebuild();
+        self.select_waveform();
         self.osc.set_freq(self.params.freq);
 
         let n = l.len().min(r.len());
@@ -201,7 +205,8 @@ impl SigilCore {
             let Some(buf) = self.scratch.get_mut(..take) else {
                 return;
             };
-            self.osc.process(buf, &self.tables);
+            let waveform = self.params.waveform();
+            self.osc.process(buf, &self.tables[waveform_slot(waveform)]);
 
             for i in 0..take {
                 let carrier = buf.get(i).copied().unwrap_or(0.0);
@@ -356,5 +361,17 @@ mod tests {
             (params.freq - p::TABLE.iter().find(|d| d.id == p::FREQ).unwrap().default).abs() < 1e-6,
             "a broken value falls back to the table"
         );
+    }
+
+    #[test]
+    fn changing_carrier_mid_stream_is_allocation_free() {
+        let mut sigil = core(|params| params.mix = 1.0);
+        let (mut l, mut r) = (vec![0.25f32; 256], vec![-0.25f32; 256]);
+        assert_no_alloc::assert_no_alloc(|| {
+            for shape in 0..p::SHAPE_NAMES.len() {
+                sigil.set_param(p::SHAPE, shape as f32);
+                sigil.process(&mut l, &mut r);
+            }
+        });
     }
 }

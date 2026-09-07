@@ -9,12 +9,13 @@
 //! place exists here.
 //!
 //! Sounding is a state, not a motion: the sounding slot's pad steps up
-//! to `select` and its number to `bright`, and nothing moves. The cursor
-//! is four brackets and no outline — lighter than the head's chassis, at
-//! cell scale. A held selection is `select` ground on its cells. Scene
-//! numbers stand in the gutter in `dim`: a coordinate, not a name. The
-//! master column carries one `rule` hairline down its centre, the desk's
-//! edge.
+//! to `select`, its number to `bright`, and a nominal rail says which of
+//! the equally selected-looking cells is actually making sound. Nothing
+//! moves. The cursor is four brackets and no outline — lighter than the
+//! head's chassis, at cell scale. A held selection is `select` ground on
+//! its cells. Scene numbers stand in the gutter in `dim`: a coordinate,
+//! not a name. The master column carries one `rule` hairline down its
+//! centre, the desk's edge.
 
 use super::heads::{self, GUTTER, HEAD_W, MARGIN};
 use super::palette;
@@ -31,6 +32,9 @@ const HEAD_GAP: f32 = 8.0;
 /// The empty slot's dot.
 /// @tune 1..6 px
 const DOT: f32 = 2.0;
+/// The live rail inside a sounding slot.
+/// @tune 1..6 px
+const LIVE_RAIL_W: f32 = 2.0;
 const INSET: f32 = 6.0;
 const TYPE_PX: f32 = 12.0;
 
@@ -122,6 +126,20 @@ impl super::super::Stage {
                 };
                 if let Some(fill) = pad {
                     painter.rect_filled(rect, 0.0, fill);
+                }
+                // Selection and playback may occupy the same cell. The
+                // selection keeps its teal ground; this real sounding
+                // state gets the nominal rail, static and independent of
+                // the playhead's phase.
+                if sounding {
+                    let rail = egui::Rect::from_min_max(
+                        egui::pos2(rect.min.x + 1.0, rect.min.y + 2.0),
+                        egui::pos2(
+                            rect.min.x + 1.0 + crate::tune!(LIVE_RAIL_W),
+                            rect.max.y - 2.0,
+                        ),
+                    );
+                    painter.rect_filled(rail, 0.0, c.nominal);
                 }
                 match clip {
                     Some(Clip::Pattern(id)) => {

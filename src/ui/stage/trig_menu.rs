@@ -72,6 +72,9 @@ pub(super) struct LockRow {
     /// The effect's short name, before the parameter's, on an effect's
     /// row; empty on the voice's.
     pub(super) prefix: &'static str,
+    /// A structural instance qualifier where otherwise identical devices
+    /// bookend the chain (the default input/output gain trims).
+    pub(super) instance: Option<&'static str>,
     /// The knob's value: the voice's setting, which every unlocked trig
     /// sounds.
     pub(super) knob: f32,
@@ -187,6 +190,7 @@ pub(super) fn menu_rows(track: &Track, trig: &Trig) -> Vec<MenuRow> {
                     label,
                     device: None,
                     prefix: "",
+                    instance: None,
                     knob: device.map_or(def.default, |device| device.value(def.id)),
                     lock: trig.lock(def.id),
                 })
@@ -203,6 +207,7 @@ pub(super) fn menu_rows(track: &Track, trig: &Trig) -> Vec<MenuRow> {
                 label,
                 device: Some(effect.id),
                 prefix: spec.prefix,
+                instance: effect.role.code(),
                 knob: effect.value(def.id),
                 lock: trig.lock_on(Some(effect.id), def.id),
             })

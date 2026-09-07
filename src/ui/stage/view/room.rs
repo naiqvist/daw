@@ -20,7 +20,7 @@
 use super::heads;
 use super::{chassis, palette};
 use crate::PROFONT;
-use crate::ui::stage::utility::{Confirm, Page, PrefPage};
+use crate::ui::stage::utility::{Confirm, FIRST_RECENT_ROW, Page, PrefPage};
 use crate::ui::stage::vitals::EngineState;
 use eframe::egui;
 
@@ -60,7 +60,9 @@ const SCRIM: u8 = 200;
 /// groups, or the recents column. Indices are `Console::project_rows`'.
 const GROUPS: [(&str, std::ops::Range<usize>); 3] =
     [("START", 0..3), ("KEEP", 3..5), ("MACHINE", 5..7)];
-const FIRST_RECENT_ROW: usize = 7;
+
+/// The keys the plate answers to, as the foot says them.
+const PLATE_KEYS: &str = "↑↓ move · enter choose · 1–9 open a recent · esc to the field";
 
 /// Trim a string to `max` columns, marking the cut, so a long path
 /// never runs under the column beside it.
@@ -524,6 +526,13 @@ impl super::super::Stage {
             painter.text(
                 egui::pos2(rect.min.x + ch, cy),
                 egui::Align2::LEFT_CENTER,
+                "!",
+                font.clone(),
+                c.alert,
+            );
+            painter.text(
+                egui::pos2(rect.min.x + ch * 3.0, cy),
+                egui::Align2::LEFT_CENTER,
                 "RECOVER AUTOSAVE",
                 font.clone(),
                 c.alert,
@@ -568,8 +577,20 @@ impl super::super::Stage {
             } else {
                 c.fg
             };
+            // The digit that opens it, for the first nine; a blank for
+            // the rest so the titles still stand in one column.
+            let digit = i - FIRST_RECENT_ROW - usize::from(recovery.is_some());
+            if digit < 9 {
+                painter.text(
+                    egui::pos2(rect.min.x + ch, cy),
+                    egui::Align2::LEFT_CENTER,
+                    (digit + 1).to_string(),
+                    font.clone(),
+                    c.label,
+                );
+            }
             let title = painter.text(
-                egui::pos2(rect.min.x + ch, cy),
+                egui::pos2(rect.min.x + ch * 3.0, cy),
                 egui::Align2::LEFT_CENTER,
                 &recent.title,
                 font.clone(),
@@ -604,7 +625,7 @@ impl super::super::Stage {
         painter.text(
             egui::pos2(inner.min.x, fy),
             egui::Align2::LEFT_CENTER,
-            "↑↓ move · enter choose · esc to the field · , preferences",
+            PLATE_KEYS,
             font.clone(),
             c.dim,
         );
@@ -612,7 +633,7 @@ impl super::super::Stage {
             Some(status) => (status.clone(), c.fg),
             None => (format!("home {}", self.utility.project_folder), c.dim),
         };
-        let used = "↑↓ move · enter choose · esc to the field · , preferences".len() + 3;
+        let used = PLATE_KEYS.chars().count() + 3;
         let room = ((inner.width() / ch) as usize).saturating_sub(used);
         painter.text(
             egui::pos2(inner.max.x, fy),

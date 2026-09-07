@@ -6,11 +6,12 @@
 //! the engine has not made yet is `--`, and it keeps its place so the
 //! row never jumps. Labels are blue (a name), values are body text, and
 //! a value with a BUDGET is coloured by whether it is inside it —
-//! `nominal` when fine, `alert` when not, `fault` for the one thing the
-//! machine reports as broken about itself: an xrun.
+//! `nominal` when fine, `alert` when not, and `fault` for a stalled or
+//! errored engine—or for an xrun while that engine is otherwise running.
 
-use super::palette;
+use super::{chassis, palette};
 use crate::PROFONT;
+use crate::ui::stage::keymap::ScopeContext;
 use crate::ui::stage::transport::{DEFAULT_BPM, DEFAULT_METER, Motion};
 use crate::ui::stage::vitals::{EngineState, LOAD_WORTH_SAYING};
 use eframe::egui;
@@ -29,6 +30,9 @@ pub(super) const TITLE_H: f32 = 22.0;
 pub(super) const STATUS_H: f32 = 22.0;
 const TYPE_PX: f32 = 12.0;
 const PAD: f32 = 16.0;
+/// Air between a field's blue name and its value. One ProFont cell keeps
+/// `scope SESSION` and `cmd :` legible as two tokens.
+const VALUE_GAP: f32 = TYPE_PX * 0.8;
 
 /// The rows' heights, live.
 pub(super) fn title_h() -> f32 {
@@ -62,11 +66,11 @@ fn wall_clock(tz_offset: i64) -> String {
 /// The width a row of readings takes, as `row` lays it out.
 fn total_width(readings: &[Reading]) -> f32 {
     let width = |s: &str| s.chars().count() as f32 * TYPE_PX * 0.6;
-    readings
+    let occupied = readings
         .iter()
         .map(|r| {
             width(r.label)
-                + 6.0
+                + VALUE_GAP
                 + width(&r.value)
                 + if r.meter.is_some() {
                     6.0 + LOAD_SEGMENTS as f32 * 5.0
@@ -75,8 +79,12 @@ fn total_width(readings: &[Reading]) -> f32 {
                 }
                 + GAP
         })
-        .sum::<f32>()
-        - GAP
+        .sum::<f32>();
+    if readings.is_empty() {
+        0.0
+    } else {
+        occupied - GAP
+    }
 }
 
 /// One `label value` pair, the value in whatever colour its state earns.
@@ -91,6 +99,7 @@ struct Reading {
 
 #[derive(Clone, Copy)]
 enum Tone {
+    Identity,
     Fact,
     Absent,
     Nominal,
@@ -107,6 +116,34 @@ fn reading(label: &'static str, value: impl Into<String>, tone: Tone) -> Reading
     }
 }
 
+fn metered(label: &'static str, value: impl Into<String>, tone: Tone, share: f32) -> Reading {
+    Reading {
+        label,
+        value: value.into(),
+        tone,
+        meter: Some(share.clamp(0.0, 1.0)),
+    }
+}
+
+/// The keyboard authority currently holding the workstation. This is the
+/// command-centre breadcrumb: a core state, never a decorative mode name.
+fn scope_word(scope: ScopeContext) -> &'static str {
+    match scope {
+        ScopeContext::Root => "SESSION",
+        ScopeContext::Nested => "FIELD",
+        ScopeContext::Browser => "BROWSER",
+        ScopeContext::Mixer => "MIXER",
+        ScopeContext::Chain => "CHAIN",
+        ScopeContext::Clip => "CLIP",
+        ScopeContext::Rename => "RENAME",
+        ScopeContext::TrigMenu => "TRIG",
+        ScopeContext::Plock => "PLOCK",
+        ScopeContext::Modulation => "MOD",
+        ScopeContext::Sample => "SAMPLE",
+        ScopeContext::Song => "SONG",
+    }
+}
+
 /// Lay readings left to right from `x`, returning where the row ended.
 fn row(
     painter: &egui::Painter,
@@ -119,22 +156,7 @@ fn row(
     let font = egui::FontId::new(TYPE_PX, egui::FontFamily::Name(PROFONT.into()));
     let width = |s: &str| s.chars().count() as f32 * TYPE_PX * 0.6;
     if let Some(right) = align_right {
-        let total: f32 = readings
-            .iter()
-            .map(|r| {
-                width(r.label)
-                    + 6.0
-                    + width(&r.value)
-                    + if r.meter.is_some() {
-                        6.0 + LOAD_SEGMENTS as f32 * 5.0
-                    } else {
-                        0.0
-                    }
-                    + GAP
-            })
-            .sum::<f32>()
-            - GAP;
-        x = right - total;
+        x = right - total_width(readings);
     }
     for r in readings {
         painter.text(
@@ -144,8 +166,9 @@ fn row(
             font.clone(),
             c.label,
         );
-        x += width(r.label) + 6.0;
+        x += width(r.label) + VALUE_GAP;
         let colour = match r.tone {
+            Tone::Identity => c.dir,
             Tone::Fact => c.fg,
             Tone::Absent => c.dim,
             Tone::Nominal => c.nominal,
@@ -182,10 +205,20 @@ fn row(
 impl super::super::Stage {
     /// The title row: what this surface is, and the document's shape.
     pub(super) fn draw_title(&self, painter: &egui::Painter, strip: egui::Rect) {
-        let c = palette::colours();
+        chassis::instrument_rail(painter, strip);
         let y = strip.center().y;
         let left = [
-            reading("", "SESSION", Tone::Fact),
+            reading("", "STAGE", Tone::Identity),
+            reading("scope", scope_word(self.scope_context()), Tone::Fact),
+            reading(
+                "cmd",
+                if self.palette.is_open() { "OPEN" } else { ":" },
+                if self.palette.is_open() {
+                    Tone::Nominal
+                } else {
+                    Tone::Absent
+                },
+            ),
             reading("tr", format!("{:02}", self.song.tracks.len()), Tone::Fact),
             reading(
                 "sc",
@@ -199,6 +232,7 @@ impl super::super::Stage {
             ),
         ];
         let end = row(painter, strip.min.x + PAD, y, &left, None);
+        chassis::rail_splice(painter, strip, end + GAP);
         // Where the keys stand, in coordinates: it follows the cursor.
         let at = match (self.inside, self.session_address()) {
             (Some(opened), _) => {
@@ -237,12 +271,14 @@ impl super::super::Stage {
                 if self.dirty { Tone::Alert } else { Tone::Fact },
             ),
         ];
+        let doc_start = strip.max.x - PAD - total_width(&doc);
+        chassis::rail_splice(painter, strip, doc_start - GAP * 0.5);
         row(painter, 0.0, y, &doc, Some(strip.max.x - PAD));
-        let _ = c;
     }
 
     /// The status strip: the transport, then the engine.
     pub(super) fn draw_status(&self, painter: &egui::Painter, strip: egui::Rect) {
+        chassis::instrument_rail(painter, strip);
         let y = strip.center().y;
         let tick = self.transport.tick();
         let place = self.transport.place(&self.song);
@@ -282,12 +318,14 @@ impl super::super::Stage {
         // refused keystroke named for the frame it was refused in, so
         // under key repeat it reads as a held mark.
         let mut kx = bx + GAP;
+        let mut transport_end = bx;
         if let Some(chord) = last_chord {
             kx = row(painter, kx, y, &[reading("key", chord, Tone::Fact)], None) + GAP;
+            transport_end = kx;
         }
         if let Some(refusal) = &self.refusal {
             let word = format!("{:?}", refusal.reason).to_ascii_lowercase();
-            row(
+            transport_end = row(
                 painter,
                 kx,
                 y,
@@ -318,9 +356,15 @@ impl super::super::Stage {
                 None => reading("io", "--", Tone::Absent),
             },
         ];
+        // At the reference 1280-wide canvas keep the operational core
+        // legible rather than letting diagnostics collide with transport.
+        // The full I/O and wall-clock register reappears on wide consoles.
+        if strip.width() < 1500.0 {
+            right.retain(|reading| !matches!(reading.label, "lat" | "io"));
+        }
         match health {
             Some(h) => {
-                right.push(reading(
+                right.push(metered(
                     "load",
                     format!("{:.0}%", h.load * 100.0),
                     if h.load < LOAD_WORTH_SAYING {
@@ -328,29 +372,52 @@ impl super::super::Stage {
                     } else {
                         Tone::Alert
                     },
+                    h.load,
                 ));
+                let engine_fault = matches!(
+                    &h.state,
+                    EngineState::Stalled { .. } | EngineState::Errored(_)
+                );
                 right.push(reading(
                     "xruns",
                     h.xruns.to_string(),
                     if h.xruns == 0 {
                         Tone::Nominal
+                    } else if engine_fault {
+                        // The stopped engine owns the one fault colour; the
+                        // xrun count remains visible as attention/history.
+                        Tone::Alert
                     } else {
                         Tone::Fault
                     },
                 ));
-                right.push(match h.state {
+                right.push(match &h.state {
                     EngineState::Running => reading("", "RUNNING", Tone::Nominal),
-                    _ => reading("", "ABSENT", Tone::Absent),
+                    // A machine without an audio device is a legitimate
+                    // editing state, not a defect. Stalls and backend errors
+                    // are the two states that earn the rare fault colour.
+                    EngineState::Absent => reading("", "ABSENT", Tone::Absent),
+                    EngineState::Stalled { .. } => reading("", "STALLED", Tone::Fault),
+                    EngineState::Errored(_) => reading("", "ERROR", Tone::Fault),
                 });
             }
             None => {
-                right.push(reading("load", "--", Tone::Absent));
+                right.push(metered("load", "--", Tone::Absent, 0.0));
                 right.push(reading("xruns", "--", Tone::Absent));
                 right.push(absent());
             }
         }
-        if let Some(s) = stream {
+        if let Some(s) = stream.filter(|_| strip.width() >= 900.0) {
             right.push(reading("", s.backend, Tone::Fact));
+        }
+        // On the minimum supported canvas, keep the state that answers
+        // "is audio healthy?" and release the setup facts to wider desks.
+        // This gives transport and engine each an honest, non-overlapping
+        // half instead of drawing two complete rows through one another.
+        if strip.width() < 900.0 {
+            right.retain(|reading| {
+                matches!(reading.label, "load" | "xruns") || reading.label.is_empty()
+            });
         }
         // The session's clock and the wall's, and the mix's trace: the
         // last seconds of the master meter, one sample a frame.
@@ -358,31 +425,72 @@ impl super::super::Stage {
             let t = super::telemetry();
             (t.uptime, t.trace.iter().copied().collect(), t.tz_offset)
         };
-        right.push(reading("up", super::telemetry::stamp(uptime), Tone::Fact));
-        right.push(reading("", wall_clock(tz), Tone::Fact));
-        let end = row(painter, 0.0, y, &right, Some(strip.max.x - PAD));
+        if strip.width() >= 1500.0 {
+            right.push(reading("up", super::telemetry::stamp(uptime), Tone::Fact));
+            right.push(reading("", wall_clock(tz), Tone::Fact));
+        }
+        let right_start = strip.max.x - PAD - total_width(&right);
+        chassis::rail_splice(painter, strip, right_start - GAP * 0.5);
+        row(painter, right_start, y, &right, None);
         let c = palette::colours();
         let w = crate::tune!(TRACE_W);
-        let x1 = strip.max.x - PAD - (end - 0.0).max(0.0) * 0.0 - total_width(&right) - GAP;
+        let x1 = right_start - GAP;
         let x0 = x1 - w;
         let track = egui::Rect::from_min_max(egui::pos2(x0, y - 5.0), egui::pos2(x1, y + 5.0));
-        painter.rect_filled(track, 0.0, c.panel);
         let n = trace.len().max(1) as f32;
-        let mut pts: Vec<egui::Pos2> = trace
-            .iter()
-            .enumerate()
-            .map(|(i, v)| {
-                egui::pos2(
-                    x0 + w * i as f32 / n,
-                    track.max.y - track.height() * v.clamp(0.0, 1.0),
-                )
-            })
-            .collect();
+        let has_room = x0 >= transport_end + GAP;
+        if has_room {
+            painter.rect_filled(track, 0.0, c.ground);
+        }
+        let mut pts: Vec<egui::Pos2> = if has_room && track.width() >= 24.0 {
+            trace
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    egui::pos2(
+                        x0 + track.width() * i as f32 / n,
+                        track.max.y - track.height() * v.clamp(0.0, 1.0),
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         if pts.len() >= 2 {
             painter.add(egui::Shape::line(
                 std::mem::take(&mut pts),
                 egui::Stroke::new(1.0, c.nominal),
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_reading_group_takes_no_negative_space() {
+        assert_eq!(total_width(&[]), 0.0);
+    }
+
+    #[test]
+    fn load_meters_are_bounded_without_falsifying_the_value_word() {
+        let high = metered("load", "140%", Tone::Alert, 1.4);
+        let low = metered("load", "-2%", Tone::Nominal, -0.02);
+        assert_eq!(high.value, "140%");
+        assert_eq!(high.meter, Some(1.0));
+        assert_eq!(low.value, "-2%");
+        assert_eq!(low.meter, Some(0.0));
+    }
+
+    #[test]
+    fn every_keyboard_scope_has_a_terse_truthful_breadcrumb() {
+        let words: Vec<&str> = ScopeContext::ALL.into_iter().map(scope_word).collect();
+        assert_eq!(words.len(), ScopeContext::ALL.len());
+        assert!(words.iter().all(|word| !word.is_empty() && word.len() <= 7));
+        assert_eq!(scope_word(ScopeContext::Root), "SESSION");
+        assert_eq!(scope_word(ScopeContext::Mixer), "MIXER");
+        assert_eq!(scope_word(ScopeContext::Song), "SONG");
     }
 }

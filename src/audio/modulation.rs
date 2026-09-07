@@ -249,6 +249,18 @@ pub fn wire_chain(
     if out.is_finite() { out } else { target }
 }
 
+/// The distance one full-depth wire travels in the target's modulation
+/// domain. Ratio controls speak octaves; ordinary controls speak their native
+/// linear units. Shared by the callback and telemetry normalization so the
+/// scope depicts exactly what the engine applied.
+pub fn wire_span(min: f32, max: f32, log: bool) -> f32 {
+    if log && min.is_finite() && max.is_finite() && min > 0.0 && max >= min {
+        (max / min).log2()
+    } else {
+        max - min
+    }
+}
+
 /// [`wire_chain`] addressed by a whole [`ModWire`] — the UI's spelling.
 pub fn wire_contribution(
     wire: &ModWire,
@@ -446,6 +458,23 @@ struct PlanTarget {
     dirty: bool,
 }
 
+impl PlanTarget {
+    /// Combine one base with an already-evaluated wire contribution using
+    /// exactly the same scale and guard rails as the normal segment pass.
+    fn compose(&self, contribution: f32) -> f32 {
+        let value = if self.log {
+            self.base * contribution.exp2()
+        } else {
+            self.base + contribution
+        };
+        if value.is_finite() {
+            value.clamp(self.min, self.max)
+        } else {
+            self.min
+        }
+    }
+}
+
 /// The compiled modulation plan. Vectors are sized at compile and never
 /// resized afterwards; the callback only reads and writes in place.
 #[derive(Clone, Debug, Default)]
@@ -612,6 +641,39 @@ impl ModPlan {
             .map(|t| &mut t.base)
     }
 
+    /// Red zone. Change a target's base AFTER this segment has already been
+    /// evaluated, then compose it with the wire outputs from that same
+    /// evaluation. This is the effect-lock door: re-running `evaluate`
+    /// would advance free LFOs and smoothing twice, while waiting for the
+    /// next segment would make the lock (and its restore) late.
+    ///
+    /// The returned value is recorded as written because the caller lands it
+    /// on the node immediately. `None` means the parameter is not modulated.
+    pub(crate) fn rebase_evaluated_target(
+        &mut self,
+        node: usize,
+        param: u32,
+        base: f32,
+    ) -> Option<f32> {
+        let target_index = self
+            .targets
+            .iter()
+            .position(|target| target.node == node && target.param == param)?;
+        let contribution = self
+            .wires
+            .iter()
+            .filter(|wire| wire.target == target_index)
+            .map(|wire| wire.output)
+            .sum();
+        let target = &mut self.targets[target_index];
+        target.base = base;
+        let value = target.compose(contribution);
+        target.value = value;
+        target.written = value;
+        target.dirty = false;
+        Some(value)
+    }
+
     /// Red zone. Deliver one modulation letter, by the id the UI knows. An
     /// edit for a wire or source that is not in this plan — deleted, or
     /// past the cap — finds nothing and is binned, the same way a
@@ -706,11 +768,7 @@ impl ModPlan {
             // fraction of the range as a RATIO — the same meaning depth
             // has on a linear span, moved to the scale the ear uses for
             // this parameter.
-            let span = if target.log {
-                (target.max / target.min).log2()
-            } else {
-                target.max - target.min
-            };
+            let span = wire_span(target.min, target.max, target.log);
             let output = wire_chain(wire.chain, source.value, span, wire.previous, dt, muted);
             wire.previous = Some(output);
             wire.output = output;
@@ -721,19 +779,9 @@ impl ModPlan {
             // wire outputs is octaves, and `base × 2^octaves` is what
             // "±2 octaves of wobble around the knob" means. Same clamp
             // either way.
-            let value = if target.log {
-                target.base * target.value.exp2()
-            } else {
-                target.base + target.value
-            };
-            // The last door before a node. A non-finite base (from a
-            // letter carrying junk) would otherwise walk straight through
-            // `clamp`, which returns NaN for NaN.
-            let value = if value.is_finite() {
-                value.clamp(target.min, target.max)
-            } else {
-                target.min
-            };
+            // `compose` is also the effect-lock path, so a late base change
+            // in this segment cannot disagree with the regular evaluation.
+            let value = target.compose(target.value);
             target.value = value;
             // Bookkeeping for `writes` in the same pass, so the mirror and
             // the flag cannot drift apart. `run` always consumes `writes`

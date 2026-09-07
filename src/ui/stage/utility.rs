@@ -195,6 +195,11 @@ pub(super) enum Action {
     OpenPage(Page),
 }
 
+/// Where the recents begin on the projects page: after the seven fixed
+/// rows (new, path, open, save, save-as, boot, clean) and before any
+/// recovery offer. The plate in `view::room` lays the rows out by this.
+pub(in crate::ui::stage) const FIRST_RECENT_ROW: usize = 7;
+
 #[derive(Clone, Debug)]
 pub(super) struct Console {
     pub(in crate::ui::stage) page: Option<Page>,
@@ -321,6 +326,22 @@ impl Console {
         self.confirm = None;
     }
 
+    /// The remembered project at `index`, chosen in one key: the plate
+    /// labels each recent with a digit, so the digit does what walking
+    /// the cursor there and pressing Enter would — open it, or forget it
+    /// if the disk no longer has it. Only on the projects page, and only
+    /// while no field is being typed into.
+    pub(super) fn pick_recent(&mut self, index: usize, stage: &UtilitySnapshot) -> Option<Action> {
+        if self.page != Some(Page::Projects) || self.editing.is_some() || self.confirm.is_some() {
+            return None;
+        }
+        if index >= self.recents.len() {
+            return None;
+        }
+        self.row = FIRST_RECENT_ROW + usize::from(self.recovery.is_some()) + index;
+        self.activate(stage)
+    }
+
     pub(super) fn remember_project(&mut self, path: &Path) {
         let entry = path.display().to_string();
         self.prefs.recent_projects.retain(|known| *known != entry);
@@ -403,7 +424,9 @@ impl Console {
 
     pub(super) fn rows(&self, stage: &UtilitySnapshot) -> usize {
         match self.page {
-            Some(Page::Projects) => 7 + usize::from(self.recovery.is_some()) + self.recents.len(),
+            Some(Page::Projects) => {
+                FIRST_RECENT_ROW + usize::from(self.recovery.is_some()) + self.recents.len()
+            }
             Some(Page::Preferences) => match self.pref_page {
                 PrefPage::Audio => 9,
                 PrefPage::Projects => 7,
@@ -487,7 +510,12 @@ impl Console {
                     }
                     2 => self.prefs.autosave = cycle(&Autosave::ALL, self.prefs.autosave, delta),
                     3 => self.prefs.disable_backups = !self.prefs.disable_backups,
-                    4 => self.prefs.skip_dirty_confirmation = !self.prefs.skip_dirty_confirmation,
+                    // Kept as a serialized compatibility row, but project
+                    // replacement is never allowed to bypass the dirty
+                    // interlock. Older preference files may still carry the
+                    // retired bit; changing it here must not mint an unsafe
+                    // path around Save / Discard / Cancel.
+                    4 => self.prefs.skip_dirty_confirmation = false,
                     5 => self.prefs.skip_splash = !self.prefs.skip_splash,
                     _ => {}
                 },
@@ -573,7 +601,7 @@ impl Console {
                 }
                 6 => Some(Action::CleanMissing),
                 index => {
-                    let mut index = index - 7;
+                    let mut index = index - FIRST_RECENT_ROW;
                     if let Some(recovery) = &self.recovery {
                         if index == 0 {
                             return Some(Action::Recover(recovery.clone()));
@@ -943,11 +971,7 @@ impl Console {
                     "BACKUP BEFORE SAVE",
                     on_off(!self.prefs.disable_backups),
                 ),
-                DisplayRow::new(
-                    "GUARD",
-                    "CONFIRM DIRTY REPLACE",
-                    on_off(!self.prefs.skip_dirty_confirmation),
-                ),
+                DisplayRow::new("GUARD", "CONFIRM DIRTY REPLACE", "ALWAYS ON"),
                 DisplayRow::new("BOOT", "SHOW PROJECT DECK", on_off(!self.prefs.skip_splash)),
                 DisplayRow::new(
                     "CLEAN",
@@ -1482,7 +1506,7 @@ impl Stage {
     }
 
     fn request_project_op(&mut self, op: ProjectOp) {
-        if self.dirty && !self.utility.prefs().skip_dirty_confirmation {
+        if self.dirty {
             self.utility.confirm = Some(Confirm::Replace(op));
             self.utility.confirm_row = 0;
         } else {
@@ -1849,6 +1873,31 @@ mod tests {
     }
 
     #[test]
+    fn a_digit_picks_the_recent_it_labels() {
+        let mut console = Console::default();
+        console.prefs.recent_projects = vec![
+            "/nowhere/first.stage.ron".to_owned(),
+            "/nowhere/second.stage.ron".to_owned(),
+        ];
+        console.restore(console.prefs.clone(), None, true);
+        assert_eq!(console.page(), Some(Page::Projects));
+
+        // Neither file exists, so the digit's act is to forget it — the
+        // same act Enter performs on that row.
+        let picked = console.pick_recent(1, &snapshot());
+        assert!(
+            matches!(&picked, Some(Action::ForgetRecent(path)) if path == Path::new("/nowhere/second.stage.ron")),
+            "{picked:?}"
+        );
+        assert_eq!(console.row, FIRST_RECENT_ROW + 1);
+
+        // Past the end, nothing; while typing a path, nothing.
+        assert!(console.pick_recent(5, &snapshot()).is_none());
+        console.editing = Some(Field::ProjectPath);
+        assert!(console.pick_recent(0, &snapshot()).is_none());
+    }
+
+    #[test]
     fn recents_are_deduplicated_newest_first_and_bounded() {
         let mut console = Console::default();
         for index in 0..RECENT_LIMIT + 4 {
@@ -1902,6 +1951,25 @@ mod tests {
             Some(Confirm::Replace(ProjectOp::New))
         ));
         assert_eq!(stage.song, before, "the guarded project was replaced early");
+    }
+
+    #[test]
+    fn legacy_skip_guard_preference_cannot_bypass_dirty_replacement() {
+        let mut stage = Stage::new();
+        stage.dirty = true;
+        stage.utility.prefs.skip_dirty_confirmation = true;
+        let before = stage.song.clone();
+
+        stage.request_project_op(ProjectOp::New);
+
+        assert!(matches!(
+            stage.utility.confirm,
+            Some(Confirm::Replace(ProjectOp::New))
+        ));
+        assert_eq!(
+            stage.song, before,
+            "the legacy guard bit replaced a dirty song"
+        );
     }
 
     #[test]

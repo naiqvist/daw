@@ -11,6 +11,11 @@ use crate::sequencing::{PATTERN_STEP_TICKS, ParamLock, Pattern, PatternId};
 
 use super::trig_menu::LockRow;
 
+/// One ordinary nudge crosses the useful range in forty presses. The old
+/// hundred-press span made a working arrow look dead in an 80 px graph.
+const COARSE_FRACTION: f32 = 0.025;
+const FINE_FRACTION: f32 = 0.0025;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Focus {
     Parameters,
@@ -87,6 +92,8 @@ pub(super) struct Param {
     pub(super) max: f32,
     pub(super) step: f32,
     pub(super) base: f32,
+    pub(super) unit: &'static str,
+    pub(super) choices: &'static [&'static str],
 }
 
 impl Param {
@@ -105,6 +112,16 @@ impl Param {
         } else {
             ((value - self.min) / span).clamp(0.0, 1.0)
         }
+    }
+
+    /// A lock value in the same words as the device card: named choices
+    /// stay named, continuous parameters retain their unit.
+    pub(super) fn face(&self, value: f32) -> String {
+        if !self.choices.is_empty() {
+            let at = (value - self.min).round().max(0.0) as usize;
+            return self.choices[at.min(self.choices.len() - 1)].to_uppercase();
+        }
+        crate::ui::stage::chain::format_value(value, self.unit.trim())
     }
 }
 
@@ -156,24 +173,41 @@ impl Editor {
         if ticks.is_empty() {
             return None;
         }
+        let rows: Vec<_> = rows.into_iter().collect();
         let params: Vec<_> = rows
-            .into_iter()
-            .map(|row| Param {
-                device: row.device.map(|device| device.0),
-                id: row.def.id,
-                name: if row.prefix.is_empty() {
-                    row.label.name.to_uppercase()
+            .iter()
+            .map(|row| {
+                let duplicated = rows
+                    .iter()
+                    .filter(|other| {
+                        other.device == row.device && other.label.name == row.label.name
+                    })
+                    .count()
+                    > 1;
+                let parameter = if duplicated && !row.label.group.is_empty() {
+                    format!("{} {}", row.label.group, row.label.name)
                 } else {
-                    format!("{} {}", row.prefix, row.label.name).to_uppercase()
-                },
-                min: row.def.min,
-                max: row.def.max,
-                step: if row.label.choices.is_empty() {
-                    0.0
-                } else {
-                    1.0
-                },
-                base: row.knob,
+                    row.label.name.to_owned()
+                };
+                let owner = row
+                    .instance
+                    .or_else(|| (!row.prefix.is_empty()).then_some(row.prefix));
+                let name = owner.map_or(parameter.clone(), |owner| format!("{owner} {parameter}"));
+                Param {
+                    device: row.device.map(|device| device.0),
+                    id: row.def.id,
+                    name: name.to_uppercase(),
+                    min: row.def.min,
+                    max: row.def.max,
+                    step: if row.label.choices.is_empty() {
+                        0.0
+                    } else {
+                        1.0
+                    },
+                    base: row.knob,
+                    unit: row.label.unit,
+                    choices: row.label.choices,
+                }
             })
             .collect();
         if params.is_empty() {
@@ -240,6 +274,106 @@ impl Editor {
             .unwrap_or_else(|| self.params.get(param).map_or(0.0, |param| param.base))
     }
 
+    /// How many addressed, active notes actually hold this parameter.
+    pub(super) fn lock_count(&self, param: usize) -> usize {
+        self.active
+            .iter()
+            .enumerate()
+            .filter(|(cell, active)| {
+                **active
+                    && self
+                        .locks
+                        .get(param)
+                        .and_then(|values| values.get(*cell))
+                        .copied()
+                        .flatten()
+                        .is_some()
+            })
+            .count()
+    }
+
+    /// The active cells' standing value as one reading, or a range when the
+    /// selection intentionally carries different locks.
+    pub(super) fn value_text(&self, param: usize) -> String {
+        let Some(def) = self.params.get(param) else {
+            return "--".to_owned();
+        };
+        let mut values = self
+            .active
+            .iter()
+            .enumerate()
+            .filter_map(|(cell, active)| active.then_some(self.displayed(param, cell)));
+        let Some(first) = values.next() else {
+            return def.face(def.base);
+        };
+        let (mut low, mut high) = (first, first);
+        for value in values {
+            low = low.min(value);
+            high = high.max(value);
+        }
+        let tolerance = if def.step > 0.0 {
+            def.step * 0.25
+        } else {
+            (def.max - def.min).abs() * 0.000_05
+        };
+        if (high - low).abs() <= tolerance {
+            def.face(first)
+        } else {
+            format!("{}…{}", def.face(low), def.face(high))
+        }
+    }
+
+    /// Put the keyboard hand on a parameter. Pointer selection replaces the
+    /// set by default; Shift-click can extend it without a second mode.
+    pub(super) fn point_parameter(&mut self, index: usize, extend: bool) {
+        if self.params.is_empty() {
+            return;
+        }
+        self.param_cursor = index.min(self.params.len() - 1);
+        self.focus = Focus::Parameters;
+        self.picker = false;
+        if extend {
+            if !self.selected_params.remove(&self.param_cursor) {
+                self.selected_params.insert(self.param_cursor);
+            }
+        } else {
+            self.selected_params.clear();
+            self.selected_params.insert(self.param_cursor);
+        }
+        self.graph_lane = self
+            .selected_param_indices()
+            .iter()
+            .position(|param| *param == self.param_cursor)
+            .unwrap_or(0);
+    }
+
+    /// Put the hand on one graph cell. Used by both direct pointing and the
+    /// keyboard's explicit lane navigation.
+    pub(super) fn point_graph(&mut self, lane: usize, cell: usize) {
+        let lanes = self.selected_param_indices();
+        if lanes.is_empty() || self.ticks.is_empty() {
+            return;
+        }
+        self.graph_lane = lane.min(lanes.len() - 1);
+        self.graph_cell = cell.min(self.ticks.len() - 1);
+        self.focus = Focus::Graphs;
+        self.picker = false;
+    }
+
+    pub(super) fn move_graph_lane(&mut self, down: bool) -> bool {
+        let lanes = self.selected_params.len();
+        if lanes == 0 {
+            return false;
+        }
+        let before = self.graph_lane;
+        self.graph_lane = if down {
+            self.graph_lane.saturating_add(1).min(lanes - 1)
+        } else {
+            self.graph_lane.saturating_sub(1)
+        };
+        self.graph_lane != before
+    }
+
     pub(super) fn tab(&mut self, backwards: bool) {
         self.focus = self.focus.next(backwards);
         self.picker = false;
@@ -274,22 +408,97 @@ impl Editor {
         }
     }
 
+    /// Select everything in the zone the hand is currently in. In the
+    /// parameter list that means every parameter; in the graph it means
+    /// every addressed trig. This keeps Ctrl+A local and predictable.
+    pub(super) fn select_all(&mut self) -> Vec<(usize, bool)> {
+        match self.focus {
+            Focus::Parameters | Focus::Controls => {
+                self.selected_params = (0..self.params.len()).collect();
+                self.graph_lane = self
+                    .graph_lane
+                    .min(self.selected_params.len().saturating_sub(1));
+                Vec::new()
+            }
+            Focus::Graphs => {
+                self.active.fill(true);
+                self.ticks
+                    .iter()
+                    .copied()
+                    .map(|tick| (tick, true))
+                    .collect()
+            }
+        }
+    }
+
+    /// Delete is surgical in the graph and broad in the parameter list:
+    /// one visible bar under the graph cursor, or every active cell for
+    /// the selected parameter rows.
+    pub(super) fn clear_locks(&mut self) -> bool {
+        let mut changed = false;
+        match self.focus {
+            Focus::Graphs => {
+                if let Some(&param) = self.selected_param_indices().get(self.graph_lane)
+                    && self.active.get(self.graph_cell).copied().unwrap_or(false)
+                    && self.locks[param][self.graph_cell].take().is_some()
+                {
+                    changed = true;
+                }
+            }
+            Focus::Parameters => {
+                // A plain list edit targets the row under the hand. Once a
+                // multi-parameter set explicitly includes that row, Delete
+                // becomes the useful bulk clear for the whole set.
+                let params = if self.selected_params.len() > 1
+                    && self.selected_params.contains(&self.param_cursor)
+                {
+                    self.selected_param_indices()
+                } else {
+                    vec![self.param_cursor]
+                };
+                for param in params {
+                    for (cell, active) in self.active.iter().copied().enumerate() {
+                        if active && self.locks[param][cell].take().is_some() {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            Focus::Controls => {
+                for param in self.selected_param_indices() {
+                    for (cell, active) in self.active.iter().copied().enumerate() {
+                        if active && self.locks[param][cell].take().is_some() {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        self.dirty |= changed;
+        changed
+    }
+
     pub(super) fn step(&mut self, vertical: i32, horizontal: i32, fine: bool) {
         if self.picker {
             let at = Algorithm::ALL
                 .iter()
                 .position(|algorithm| *algorithm == self.algorithm)
                 .unwrap_or(0) as i32;
-            let delta = if vertical != 0 { vertical } else { horizontal };
+            let delta = if vertical != 0 { -vertical } else { horizontal };
             let len = Algorithm::ALL.len() as i32;
             self.algorithm = Algorithm::ALL[(at + delta).rem_euclid(len) as usize];
             return;
         }
         match self.focus {
             Focus::Parameters => {
-                self.param_cursor = (self.param_cursor as i32 - vertical)
-                    .clamp(0, self.params.len().saturating_sub(1) as i32)
-                    as usize;
+                if vertical != 0 {
+                    self.param_cursor = (self.param_cursor as i32 - vertical)
+                        .clamp(0, self.params.len().saturating_sub(1) as i32)
+                        as usize;
+                }
+                if horizontal != 0 {
+                    self.adjust_parameter(self.param_cursor, horizontal > 0, fine);
+                }
             }
             Focus::Graphs => {
                 if horizontal != 0 {
@@ -316,21 +525,103 @@ impl Editor {
     }
 
     pub(super) fn extreme(&mut self, high: bool) {
-        if self.focus != Focus::Graphs {
+        match self.focus {
+            Focus::Parameters => {
+                let param = self.param_cursor.min(self.params.len().saturating_sub(1));
+                self.address_parameter(param);
+                let value = if high {
+                    self.params[param].max
+                } else {
+                    self.params[param].min
+                };
+                for (cell, active) in self.active.iter().copied().enumerate() {
+                    if active {
+                        self.locks[param][cell] = Some(value);
+                        self.dirty = true;
+                    }
+                }
+            }
+            Focus::Graphs => {
+                let Some(&param) = self.selected_param_indices().get(self.graph_lane) else {
+                    return;
+                };
+                let value = if high {
+                    self.params[param].max
+                } else {
+                    self.params[param].min
+                };
+                if self.active.get(self.graph_cell).copied().unwrap_or(false) {
+                    self.locks[param][self.graph_cell] = Some(value);
+                    self.dirty = true;
+                }
+            }
+            Focus::Controls => {}
+        }
+    }
+
+    fn include_parameter(&mut self, param: usize) {
+        self.selected_params.insert(param);
+        self.graph_lane = self
+            .selected_param_indices()
+            .iter()
+            .position(|candidate| *candidate == param)
+            .unwrap_or(0);
+    }
+
+    /// A direct value edit addresses the row under the hand. An explicit X
+    /// inclusion survives because the row is already selected; merely walking
+    /// away from the default row does not leave a ghost lane behind.
+    fn address_parameter(&mut self, param: usize) {
+        if !self.selected_params.contains(&param) {
+            self.selected_params.clear();
+        }
+        self.include_parameter(param);
+    }
+
+    fn value_step(&self, param: usize, fine: bool) -> f32 {
+        let range = self.params[param].range();
+        if range.step > 0.0 {
+            range.step
+        } else {
+            range.span() * if fine { FINE_FRACTION } else { COARSE_FRACTION }
+        }
+    }
+
+    fn adjust_parameter(&mut self, param: usize, up: bool, fine: bool) {
+        if param >= self.params.len() {
             return;
         }
-        let Some(&param) = self.selected_param_indices().get(self.graph_lane) else {
-            return;
-        };
-        let value = if high {
-            self.params[param].max
-        } else {
-            self.params[param].min
-        };
-        if self.active.get(self.graph_cell).copied().unwrap_or(false) {
-            self.locks[param][self.graph_cell] = Some(value);
+        self.address_parameter(param);
+        let range = self.params[param].range();
+        let delta = self.value_step(param, fine) * if up { 1.0 } else { -1.0 };
+        for cell in 0..self.active.len() {
+            if !self.active[cell] {
+                continue;
+            }
+            let value = range.hold(self.displayed(param, cell) + delta);
+            self.locks[param][cell] = Some(value);
             self.dirty = true;
         }
+    }
+
+    /// Direct manipulation in the graph: a vertical fraction becomes the
+    /// parameter's value and a lock immediately, exactly like an arrow edit.
+    pub(super) fn set_graph_fraction(&mut self, lane: usize, cell: usize, fraction: f32) -> bool {
+        let Some(&param) = self.selected_param_indices().get(lane) else {
+            return false;
+        };
+        if !self.active.get(cell).copied().unwrap_or(false) {
+            return false;
+        }
+        self.point_graph(lane, cell);
+        let def = &self.params[param];
+        let value = def
+            .range()
+            .hold(def.min + def.range().span() * fraction.clamp(0.0, 1.0));
+        let changed = self.locks[param].get(cell).copied().flatten() != Some(value);
+        self.locks[param][cell] = Some(value);
+        self.dirty |= changed;
+        changed
     }
 
     fn adjust_bar(&mut self, up: bool, fine: bool) {
@@ -341,13 +632,7 @@ impl Editor {
             return;
         }
         let range = self.params[param].range();
-        let step = if range.step > 0.0 {
-            range.step
-        } else if fine {
-            range.span() / 1000.0
-        } else {
-            range.span() / 100.0
-        };
+        let step = self.value_step(param, fine);
         let value = self.displayed(param, self.graph_cell) + if up { step } else { -step };
         self.locks[param][self.graph_cell] = Some(range.hold(value));
         self.dirty = true;
@@ -597,6 +882,20 @@ impl Editor {
     }
 }
 
+/// A centred, cursor-following slice of a long list. The caller supplies the
+/// capacity its real rectangle can show, so no model-side pixel state leaks
+/// into the editor transaction.
+pub(super) fn visible_span(cursor: usize, len: usize, capacity: usize) -> (usize, usize) {
+    let capacity = capacity.max(1).min(len.max(1));
+    if len <= capacity {
+        return (0, len);
+    }
+    let start = cursor
+        .saturating_sub(capacity / 2)
+        .min(len.saturating_sub(capacity));
+    (start, (start + capacity).min(len))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -670,5 +969,65 @@ mod tests {
         editor.control_cursor = 2;
         editor.step(1, 0, false);
         assert_eq!(editor.curve, Curve::Exponential);
+    }
+
+    #[test]
+    fn select_all_and_delete_follow_the_focused_zone() {
+        let (_, mut editor) = editor();
+        editor.select_all();
+        assert_eq!(editor.selected_params.len(), editor.params.len());
+
+        editor.focus = Focus::Graphs;
+        editor.active[1] = false;
+        assert_eq!(editor.select_all().len(), editor.ticks.len());
+        assert!(editor.active.iter().all(|active| *active));
+
+        editor.locks[0][0] = Some(editor.params[0].base);
+        editor.graph_lane = 0;
+        editor.graph_cell = 0;
+        assert!(editor.clear_locks());
+        assert_eq!(editor.locks[0][0], None);
+        assert!(editor.dirty);
+    }
+
+    #[test]
+    fn parameter_arrows_navigate_then_edit_the_row_under_the_hand() {
+        let (_, mut editor) = editor();
+        let base = editor.params[1].base;
+
+        editor.step(-1, 0, false);
+        assert_eq!(editor.param_cursor, 1, "Down did not choose the next row");
+        editor.step(0, 1, false);
+
+        assert_eq!(editor.selected_params, BTreeSet::from([1]));
+        assert!(editor.locks[1].iter().all(Option::is_some));
+        assert!(
+            editor.displayed(1, 0) > base,
+            "Right did not raise the lock"
+        );
+        assert!(editor.dirty);
+    }
+
+    #[test]
+    fn graph_lanes_can_be_addressed_and_edited_independently() {
+        let (_, mut editor) = editor();
+        editor.selected_params.insert(1);
+        editor.focus = Focus::Graphs;
+        let first = editor.locks[0].clone();
+
+        assert!(editor.move_graph_lane(true));
+        assert_eq!(editor.graph_lane, 1);
+        editor.step(1, 0, false);
+
+        assert_eq!(editor.locks[0], first);
+        assert!(editor.locks[1][0].is_some());
+    }
+
+    #[test]
+    fn a_long_parameter_window_always_contains_its_cursor() {
+        assert_eq!(visible_span(0, 62, 12), (0, 12));
+        assert_eq!(visible_span(31, 62, 12), (25, 37));
+        assert_eq!(visible_span(61, 62, 12), (50, 62));
+        assert_eq!(visible_span(1, 3, 12), (0, 3));
     }
 }

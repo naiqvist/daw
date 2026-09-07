@@ -54,6 +54,54 @@ fn to_pos(p: (f64, f64)) -> egui::Pos2 {
     egui::pos2(p.0 as f32, p.1 as f32)
 }
 
+/// A recessed instrument rail. Title and status use the same material as
+/// the rest of the console, but their two hairlines make the boundary
+/// explicit instead of relying on a decorative change of colour.
+pub fn instrument_rail(painter: &egui::Painter, rect: egui::Rect) {
+    if rect.is_negative() || rect.height() < 1.0 {
+        return;
+    }
+    let c = palette::colours();
+    painter.rect_filled(rect, 0.0, c.panel);
+    let stroke = egui::Stroke::new(1.0, c.rule);
+    let top = rect.min.y.round() - 0.5;
+    let bottom = rect.max.y.round() - 0.5;
+    painter.line_segment(
+        [egui::pos2(rect.min.x, top), egui::pos2(rect.max.x, top)],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(rect.min.x, bottom),
+            egui::pos2(rect.max.x, bottom),
+        ],
+        stroke,
+    );
+}
+
+/// A splice between two real groups of readings on an instrument rail.
+/// The centre terminal is structural: one per semantic boundary supplied by
+/// the caller, never repeated as an ornamental grid.
+pub fn rail_splice(painter: &egui::Painter, rect: egui::Rect, x: f32) {
+    if x <= rect.min.x || x >= rect.max.x || rect.height() < 8.0 {
+        return;
+    }
+    let c = palette::colours();
+    let x = x.round() - 0.5;
+    painter.line_segment(
+        [
+            egui::pos2(x, rect.min.y + 4.0),
+            egui::pos2(x, rect.max.y - 4.0),
+        ],
+        egui::Stroke::new(1.0, c.edge),
+    );
+    painter.rect_filled(
+        egui::Rect::from_center_size(egui::pos2(x, rect.center().y), egui::vec2(2.0, 2.0)),
+        0.0,
+        c.chassis,
+    );
+}
+
 /// Where a component stands in its row, which decides which corners it
 /// gives up: the ends are keyed outward, the middle on the diagonal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

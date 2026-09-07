@@ -23,6 +23,22 @@ use crate::params::tone as p;
 
 /// The block is walked in chunks so the scratch is a fixed size.
 const CHUNK: usize = 128;
+const TONAL_WAVES: [Waveform; 4] = [
+    Waveform::Sine,
+    Waveform::Triangle,
+    Waveform::Saw,
+    Waveform::Square,
+];
+
+fn waveform_slot(waveform: Waveform) -> usize {
+    match waveform {
+        Waveform::Sine => 0,
+        Waveform::Triangle => 1,
+        Waveform::Saw => 2,
+        Waveform::Square => 3,
+        _ => 0,
+    }
+}
 
 /// The knobs, in engine units.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -117,11 +133,12 @@ impl ToneParams {
 pub struct ToneCore {
     params: ToneParams,
     sample_rate: f32,
-    /// Which waveform the tables currently hold, so a shape change
-    /// rebuilds them ONCE rather than every block.
+    /// Which already-built waveform the oscillator currently addresses.
     built: Option<Waveform>,
     osc: MipOsc,
-    tables: Vec<f32>,
+    /// Every selectable tonal table. A SHAPE letter only changes the slice
+    /// selected from this bank; Fourier synthesis never reaches the callback.
+    tables: [Vec<f32>; TONAL_WAVES.len()],
     white: WhiteNoise,
     pink: PinkNoise,
     scratch: Vec<f32>,
@@ -129,16 +146,18 @@ pub struct ToneCore {
 
 impl ToneCore {
     pub fn new(sample_rate: f32, params: &ToneParams) -> Self {
+        let tables = core::array::from_fn(|index| {
+            let waveform = TONAL_WAVES[index];
+            let mut data = vec![0.0; crate::dsp::osc::table_len(waveform)];
+            crate::dsp::osc::build_tables(waveform, &mut data);
+            data
+        });
         let mut core = Self {
             params: *params,
             sample_rate: 48_000.0,
             built: None,
             osc: MipOsc::new(),
-            // Sized for the LARGEST waveform's table set, so a shape
-            // change never needs the heap. Sine is one level and Square
-            // is ten; sizing for what is loaded would allocate on the
-            // audio thread the first time somebody turned the knob.
-            tables: Vec::new(),
+            tables,
             white: WhiteNoise::new(),
             pink: PinkNoise::new(),
             scratch: vec![0.0; CHUNK],
@@ -155,28 +174,15 @@ impl ToneCore {
         } else {
             48_000.0
         };
-        let widest = [
-            Waveform::Sine,
-            Waveform::Triangle,
-            Waveform::Saw,
-            Waveform::Square,
-        ]
-        .iter()
-        .map(|w| crate::dsp::osc::table_len(*w))
-        .max()
-        .unwrap_or(0);
-        self.tables.clear();
-        self.tables.resize(widest, 0.0);
         self.built = None;
         self.white.seed(0x7A57_0001);
         self.pink.seed(0x7A57_0002);
-        self.rebuild();
+        self.select_waveform();
         self.reset();
     }
 
-    /// Green zone: build the table set the current shape needs, if it is
-    /// not the one already loaded.
-    fn rebuild(&mut self) {
+    /// Red-zone-safe O(1) selection of an already-built table set.
+    fn select_waveform(&mut self) {
         let Some(waveform) = self.params.waveform() else {
             self.built = None;
             return;
@@ -184,7 +190,6 @@ impl ToneCore {
         if self.built == Some(waveform) {
             return;
         }
-        crate::dsp::osc::build_tables(waveform, &mut self.tables);
         self.osc.prepare(self.sample_rate, waveform);
         self.osc.set_freq(self.params.freq);
         self.built = Some(waveform);
@@ -211,10 +216,7 @@ impl ToneCore {
 
     /// Red zone: put the signal into the pair, in place.
     pub fn process(&mut self, l: &mut [f32], r: &mut [f32]) {
-        // A shape change rebuilds tables, which is green-zone work — but
-        // it happens between blocks, from the same letter that moved the
-        // knob, and the buffer it writes into is already the right size.
-        self.rebuild();
+        self.select_waveform();
         self.osc.set_freq(self.params.freq);
 
         let n = l.len().min(r.len());
@@ -239,7 +241,8 @@ impl ToneCore {
                     self.white.process(buf);
                 }
             } else {
-                self.osc.process(buf, &self.tables);
+                let waveform = self.params.waveform().unwrap_or(Waveform::Sine);
+                self.osc.process(buf, &self.tables[waveform_slot(waveform)]);
             }
 
             for i in 0..take {
@@ -388,8 +391,8 @@ mod tests {
         }
     }
 
-    /// A shape change must not allocate on the audio thread — the tables
-    /// are sized for the widest waveform at prepare for exactly this.
+    /// A shape change must not allocate on the audio thread — every tonal
+    /// table is prepared before streaming and the callback only selects one.
     #[test]
     fn changing_shape_mid_stream_does_not_allocate() {
         let mut c = core(|_| {});

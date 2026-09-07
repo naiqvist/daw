@@ -215,7 +215,8 @@ impl Stage {
     /// the screen, and lands whatever it asked for on the pattern.
     /// The chain band: the addressed track's devices, in signal order,
     /// each carrying its whole parameter table as a scrolling list.
-    pub(super) fn draw_chain(&self, painter: &egui::Painter, tray: egui::Rect, phase: Phase) {
+    pub(super) fn draw_chain(&mut self, ui: &mut egui::Ui, tray: egui::Rect, phase: Phase) {
+        let painter = ui.painter().clone();
         let Some(lattice) = self.chain.as_ref() else {
             return;
         };
@@ -238,7 +239,7 @@ impl Stage {
             .map_or(0, |(col, _)| col)
             .min(columns.len() - 1);
         self.draw_band_label(
-            painter,
+            &painter,
             tray,
             track,
             columns.len(),
@@ -260,7 +261,18 @@ impl Stage {
         // sections take no gap between them.
         let widths: Vec<f32> = columns
             .iter()
-            .map(|column| column.section.map_or(CHAIN_W, strip::width_of))
+            .map(|column| {
+                column.section.map_or_else(
+                    || {
+                        if column.sampler.is_some() {
+                            super::sampler_card::WIDTH
+                        } else {
+                            CHAIN_W
+                        }
+                    },
+                    strip::width_of,
+                )
+            })
             .collect();
         // Two pieces mate only when they stand on the SAME rail: a
         // channel's sections are one run, its group bus's another, the
@@ -352,7 +364,7 @@ impl Stage {
             })
             .collect();
         for (piece, column) in &pieces {
-            self.draw_piece_body(painter, *piece, column);
+            self.draw_piece_body(&painter, *piece, column);
         }
         let level = self
             .meters
@@ -361,7 +373,7 @@ impl Stage {
             .map(|reading| reading.level.peak());
         for (piece, column) in &pieces {
             self.draw_piece_face(
-                painter,
+                &painter,
                 *piece,
                 column,
                 cursor,
@@ -372,12 +384,28 @@ impl Stage {
                 level,
             );
         }
+        let mut open_sampler = None;
         for (index, rect) in &layout {
             if columns[*index].section.is_some() {
                 continue;
             }
+            if columns[*index].sampler.is_some() {
+                if self.draw_sampler_chain_card(
+                    ui,
+                    *rect,
+                    &columns[*index],
+                    *index,
+                    cursor,
+                    self.chain_offset,
+                    rows_shown,
+                    head_h,
+                ) {
+                    open_sampler = Some(*index);
+                }
+                continue;
+            }
             self.draw_chain_card(
-                painter,
+                &painter,
                 *rect,
                 &columns[*index],
                 *index,
@@ -387,6 +415,12 @@ impl Stage {
                 head_h,
                 pitch,
             );
+        }
+        if let Some(index) = open_sampler {
+            if let Some(lattice) = self.chain.as_mut() {
+                lattice.focus_col(index);
+            }
+            let _ = self.apply(StageIntent::Sample(SampleIntent::Open));
         }
     }
 

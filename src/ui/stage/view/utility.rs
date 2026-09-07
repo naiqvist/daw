@@ -154,6 +154,23 @@ impl Console {
         if key(ctx, egui::Modifiers::NONE, egui::Key::Enter) {
             return self.activate(stage);
         }
+        // A digit opens the recent it labels on the projects page.
+        const DIGITS: [egui::Key; 9] = [
+            egui::Key::Num1,
+            egui::Key::Num2,
+            egui::Key::Num3,
+            egui::Key::Num4,
+            egui::Key::Num5,
+            egui::Key::Num6,
+            egui::Key::Num7,
+            egui::Key::Num8,
+            egui::Key::Num9,
+        ];
+        for (index, digit) in DIGITS.iter().enumerate() {
+            if key(ctx, egui::Modifiers::NONE, *digit) {
+                return self.pick_recent(index, stage);
+            }
+        }
         None
     }
 }

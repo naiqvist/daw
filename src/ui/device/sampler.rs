@@ -16,12 +16,11 @@
 //! It also draws the waveform, the region, the loop and the slice
 //! markers, read-only.
 //!
-//! The DRAGGABLE half of the plot — the start, end, loop and slice
-//! handles, each its own interaction, each with a pointer test — is
-//! `notes/sampler-card-handoff.md` and is deliberately not here yet. The
-//! seam is [`SamplerOutcome`]: everything the plot could ever want to say
-//! already has a field, so adding the handles is filling those in rather
-//! than changing this file's shape.
+//! The plot is directly editable: start, end, loop and slice handles each
+//! own their interaction, the body pans and zooms about the pointer, and
+//! the same surface expands full size without changing gesture grammar.
+//! Every edit leaves through [`SamplerOutcome`] so the card never owns a
+//! second, drifting copy of the instrument.
 
 use super::{
     Footprint, Mapping, Param, ParamEdit, Unit, Well, Wells, card, metrics, poly_widgets, switch,
@@ -774,8 +773,7 @@ fn footer(
 
 /// The waveform, the region, the loop and the slices.
 ///
-/// READ-ONLY for now. The drag handles are the other half of this card
-/// and land through [`SamplerOutcome`] — see the module header.
+/// Every handle lands through [`SamplerOutcome`] — see the module header.
 /// The furthest the display will zoom in. Sixty-four times over a
 /// five-minute file is about five seconds across the plot, which is close
 /// enough to place a marker inside a hi-hat and far enough that the

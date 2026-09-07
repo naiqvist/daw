@@ -1,5 +1,4 @@
-//! PUMP's face: the duck itself, drawn over a bar, and plainly not
-//! connected to anything.
+//! PUMP's face: the duck itself, drawn over a bar.
 //!
 //! The section is a rhythmic ducker: a gain that falls on the grid and
 //! comes back. So the card draws that gain across one bar — the curve
@@ -15,23 +14,15 @@
 //! happens on, which is the axis DOOR's envelope and HIT's note are
 //! already drawn along.
 //!
-//! # It is still a wire
-//!
-//! The section's DSP has not been written. Nothing on this card is
-//! guesswork about what it would do — the curve is the very function a
-//! core would run — but nothing is being done, so the curve is drawn as
-//! a GHOST: dashed, dim, with NO CORE at the head and PASSING at the
-//! foot. A card that drew a confident solid curve would be claiming an
-//! effect that is not in the signal.
+//! The curve comes from [`crate::console::pump_curve`], the same green-side
+//! law the audio core evaluates. The live pad is the core's measured VCA
+//! gain; it is deliberately parked on the right rail instead of pretending
+//! the quarter-note UI phase can identify a position inside a whole bar.
 
 use super::*;
-use crate::console::SectionParams;
+use crate::console::{SectionParams, pump_curve};
 use crate::params::console::pump as p;
 use crate::ui::chrome;
-use crate::ui::nav_cursor;
-
-/// The divisions the cam can be cut for, in lobes per bar.
-const LOBES: [usize; 5] = [1, 2, 4, 8, 16];
 
 struct Lay {
     /// The duck across a bar. The lobes ARE the division, so the plot is
@@ -88,24 +79,10 @@ fn lay(glass: egui::Rect, _bay: Option<egui::Rect>) -> Lay {
     }
 }
 
-/// The cam's radius at angle `t` (turns), for a wheel of `lobes` cut to
-/// `depth` with a profile from square to sinusoidal at `shape`, and a
-/// dwell of `hold` at the top of each lobe.
-fn lobe(t: f32, lobes: usize, depth: f32, shape: f32, hold: f32) -> f32 {
+/// The shared VCA law repeated across one four-beat bar for the face.
+fn gain_across_bar(t: f32, lobes: usize, depth: f32, shape: f32, hold: f32) -> f32 {
     let phase = (t * lobes as f32).fract();
-    // The dwell: the lobe sits at its peak for this share of a turn.
-    let dwell = hold.clamp(0.0, 0.9);
-    let run = (1.0 - dwell).max(1e-3);
-    let x = if phase < dwell {
-        0.0
-    } else {
-        (phase - dwell) / run
-    };
-    // Square at one end of SHAPE, a raised cosine at the other.
-    let soft = 0.5 - 0.5 * (x * core::f32::consts::TAU).cos();
-    let hard = if x < 0.5 { 0.0 } else { 1.0 };
-    let profile = egui::lerp(hard..=soft, shape.clamp(0.0, 1.0));
-    1.0 - depth.clamp(0.0, 1.0) * (1.0 - profile)
+    pump_curve::gain_at_phase(phase, depth, shape, hold)
 }
 
 pub(super) fn draw(face: &Face<'_>) {
@@ -115,12 +92,10 @@ pub(super) fn draw(face: &Face<'_>) {
     let mut shapes = Vec::new();
 
     let step = face.value(p::DIVISION).round().clamp(0.0, 4.0) as usize;
-    let lobes = LOBES[step];
+    let lobes = pump_curve::lobes_per_bar(step);
     let depth = face.anim("depth", face.place(p::DEPTH), 0.10);
     let shape = face.anim("shape", face.place(p::SHAPE), 0.10);
-    let hold = face.anim("hold", face.place(p::HOLD), 0.10) * 0.6;
-    // The transport's own beat. There is no other clock on this card.
-    let turn = face.phase.beat;
+    let hold = face.anim("hold", pump_curve::hold_share(face.value(p::HOLD)), 0.10);
 
     // ---- The duck, across a bar. ------------------------------------
     chrome::panel_variant(
@@ -170,36 +145,35 @@ pub(super) fn draw(face: &Face<'_>) {
             tool::fade(edge, 0.6),
         );
     }
-    // The curve, GHOSTED: this is what the section would do, and the
-    // section is a wire, so it is drawn as a thing not happening.
+    // The solid curve is the exact law the core applies.
     let duck: Vec<egui::Pos2> = (0..=160)
         .map(|i| {
             let t = i as f32 / 160.0;
-            egui::pos2(x_at(t), y_at(lobe(t, lobes, depth, shape, hold)))
+            egui::pos2(x_at(t), y_at(gain_across_bar(t, lobes, depth, shape, hold)))
         })
         .collect();
-    chrome::dashes(
-        &mut shapes,
-        &duck,
-        0.0,
-        Weight::Heavy,
-        tool::fade(ink, 0.75),
-    );
-    // Where the transport stands, and what the duck would be there.
-    let here = turn.fract();
-    let now = lobe(here, lobes, depth, shape, hold);
+    chrome::trace(&mut shapes, &duck, Weight::Heavy, ink);
+    // The core publishes its actual linked-VCA gain. Put it on the output
+    // rail: the UI only carries quarter-note phase, which cannot honestly
+    // locate whole- or half-note divisions inside this four-beat plot.
+    let measured = if face.phase.rolling {
+        face.said.bands[0].clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let now = face.anim("gain", measured, 0.035);
     chrome::trace(
         &mut shapes,
         &[
-            egui::pos2(x_at(here), field.top()),
-            egui::pos2(x_at(here), field.bottom()),
+            egui::pos2(field.right() - 5.0, y_at(now)),
+            egui::pos2(field.right(), y_at(now)),
         ],
-        Weight::Hair,
+        Weight::Heavy,
         face.live(),
     );
     chrome::pad(
         &mut shapes,
-        egui::pos2(x_at(here), y_at(now)),
+        egui::pos2(field.right(), y_at(now)),
         chrome::PAD,
         face.live(),
         true,
@@ -241,8 +215,8 @@ pub(super) fn draw(face: &Face<'_>) {
         &mut shapes,
         between(lay.hold).shrink2(egui::vec2(0.0, 4.0)),
         lobes.min(8),
-        1.0 - hold / 0.6,
-        Some(((turn * lobes as f32) as usize).min(lobes.saturating_sub(1))),
+        1.0 - hold / pump_curve::MAX_HOLD_SHARE,
+        None,
         tool::mix_ink(ink, face.focus(), face.lit(p::HOLD)),
         tool::fade(edge, 0.5),
     );
@@ -257,17 +231,25 @@ pub(super) fn draw(face: &Face<'_>) {
         "DUCK",
         edge,
     );
-    // The condition that matters more than any setting on the card.
     words.text(
         egui::pos2(lay.plot.right() - 8.0, lay.plot.top() + 2.0),
         egui::Align2::RIGHT_TOP,
-        "NO CORE",
+        if face.phase.rolling {
+            "VCA LIVE"
+        } else {
+            "VCA READY"
+        },
         face.focus(),
     );
+    let reduction_db = if now <= 1e-6 {
+        -120.0
+    } else {
+        20.0 * now.log10()
+    };
     words.text(
         egui::pos2(field.left(), lay.plot.bottom() - 2.0),
         egui::Align2::LEFT_BOTTOM,
-        "PASSING",
+        format!("{reduction_db:+.1} DB"),
         tool::fade(edge, 1.1),
     );
     words.text(
@@ -336,24 +318,30 @@ mod tests {
     /// The cam's profile is the duck it would apply: cut to depth, held
     /// at the top for the dwell, and square or soft with the shape.
     #[test]
-    fn the_lobe_is_the_duck_the_section_would_apply() {
+    fn the_bar_curve_is_the_duck_the_section_applies() {
         // No depth is a round wheel: nothing ducks.
         for i in 0..8 {
             let t = i as f32 / 8.0;
-            assert!((lobe(t, 4, 0.0, 0.5, 0.0) - 1.0).abs() < 1e-5);
+            assert!((gain_across_bar(t, 4, 0.0, 0.5, 0.0) - 1.0).abs() < 1e-5);
         }
         // Full depth reaches the floor at the start of a lobe and comes
         // back to the top by its end.
-        assert!(lobe(0.0, 1, 1.0, 1.0, 0.0) < 0.05, "the lobe never bit");
-        assert!(lobe(0.5, 1, 1.0, 1.0, 0.0) > 0.95, "the lobe never let go");
+        assert!(
+            gain_across_bar(0.0, 1, 1.0, 1.0, 0.0) < 0.05,
+            "the lobe never bit"
+        );
+        assert!(
+            gain_across_bar(0.5, 1, 1.0, 1.0, 0.0) > 0.95,
+            "the lobe never let go"
+        );
         // The dwell holds the floor: at a long hold the first part of
         // every turn is flat.
-        let held = lobe(0.1, 1, 1.0, 1.0, 0.5);
+        let held = gain_across_bar(0.1, 1, 1.0, 1.0, 0.5);
         assert!(held < 0.05, "the dwell did not hold: {held}");
         // And it never leaves its own range, at any setting.
         for lobes in [1usize, 2, 4, 8, 16] {
             for i in 0..24 {
-                let v = lobe(i as f32 / 24.0, lobes, 1.0, 0.3, 0.4);
+                let v = gain_across_bar(i as f32 / 24.0, lobes, 1.0, 0.3, 0.4);
                 assert!((0.0..=1.0).contains(&v), "the cam left its range: {v}");
             }
         }
@@ -373,13 +361,13 @@ mod tests {
             for i in 0..lobes {
                 let beat = i as f32 / lobes as f32;
                 assert!(
-                    lobe(beat, lobes, depth, shape, hold) < 1.0 - depth * 0.9,
+                    gain_across_bar(beat, lobes, depth, shape, hold) < 1.0 - depth * 0.9,
                     "beat {i} of {lobes} did not duck"
                 );
                 // Somewhere before the next beat it comes back up.
                 let recovered = (1..20).any(|k| {
                     let t = beat + (k as f32 / 20.0) / lobes as f32;
-                    lobe(t, lobes, depth, shape, hold) > 1.0 - depth * 0.25
+                    gain_across_bar(t, lobes, depth, shape, hold) > 1.0 - depth * 0.25
                 });
                 assert!(recovered, "the gain never recovered after beat {i}");
             }

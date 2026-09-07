@@ -5,7 +5,10 @@
 //! Xone:92's VCF is and why a slow sweep across a whole track stays
 //! musical: twelve dB an octave is a lever, not a switch. Each has a
 //! FREQ and a RES; parked at its resting end — 20 Hz, 20 kHz — a filter
-//! is off, and with both parked the section is a wire to the sample.
+//! is off, and with both parked the section is a wire behind the fixed
+//! antialias round-trip latency. The round trip remains warm while the
+//! filters are parked so moving a live frequency control never moves the
+//! channel in time.
 //!
 //! The opinions, baked in:
 //!
@@ -231,6 +234,10 @@ impl SectionCore for CutCore {
         self.in_db = p::SILENT_DB;
     }
 
+    fn latency(&self) -> usize {
+        self.over[0].latency()
+    }
+
     fn process(&mut self, l: &mut [f32], r: &mut [f32], _clock: &Clock) {
         let n = l.len();
         if n == 0 || n * 2 > self.lane.len() {
@@ -244,11 +251,13 @@ impl SectionCore for CutCore {
         // buffers, so `in_db - level_db` is this section's own loss and
         // nothing else's.
         self.in_db = peak_db(peak_of(l, r, n, stereo));
-        if !self.shape.is_off() {
-            self.run(0, l);
-            if stereo {
-                self.run(1, &mut r[..n]);
-            }
+        // Even a parked CUT traverses the identity antialias round trip.
+        // Its parameters arrive as live letters, so skipping the filters at
+        // rest would make the channel jump by their 35-sample group delay as
+        // soon as either blade moved.
+        self.run(0, l);
+        if stereo {
+            self.run(1, &mut r[..n]);
         }
         self.level_db = peak_db(peak_of(l, r, n, stereo));
     }
@@ -353,17 +362,29 @@ mod tests {
     }
 
     #[test]
-    fn both_parked_is_a_wire_to_the_sample() {
+    fn both_parked_are_a_wire_behind_the_reported_latency() {
         let mut core = core_with(&[(p::HP_RES, 80.0), (p::LP_RES, 80.0)]);
         assert!(core.shape().is_off());
-        for len in [0usize, 1, 7, BLOCK] {
-            let l = sine(440.0, 0.5, len);
-            let r: Vec<f32> = l.iter().map(|s| -s).collect();
-            let (mut ol, mut or) = (l.clone(), r.clone());
-            core.process(&mut ol, &mut or, &clock());
-            assert_eq!(ol, l);
-            assert_eq!(or, r);
-        }
+        let ahead = core.latency();
+        assert_eq!(ahead, Oversampler2x::new().latency());
+        let mut l = vec![0.0f32; BLOCK];
+        let mut r = vec![0.0f32; BLOCK];
+        l[0] = 1.0;
+        r[0] = -1.0;
+        core.process(&mut l, &mut r, &clock());
+        let peak = l
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+            .expect("an impulse has a peak");
+        assert_eq!(peak.0, ahead);
+        assert!(peak.1.abs() > 0.9, "the round trip lost the impulse");
+        assert!(
+            l.iter()
+                .zip(&r)
+                .all(|(a, b)| (*a + *b).abs() <= f32::EPSILON),
+            "the stereo lanes must remain equal and opposite"
+        );
     }
 
     /// Each filter is twelve dB an octave from its corner, and leaves
@@ -489,7 +510,7 @@ mod tests {
         }
     }
 
-    /// At its defaults the section is a wire, and a wire says so: both
+    /// At its defaults the section is a delayed wire, and says so: both
     /// rings dark, and the input peak equal to the output level, which
     /// is a loss of nothing. On silence the whole readout is at rest.
     #[test]
@@ -503,7 +524,14 @@ mod tests {
 
         let l = sine(440.0, 0.5, BLOCK * 4);
         let out = run(&mut core, &l);
-        assert_eq!(out, l, "the defaults are not a wire");
+        let ahead = core.latency();
+        for i in ahead..out.len() {
+            assert!(
+                (out[i] - l[i - ahead]).abs() < 0.01,
+                "the parked round trip moved sample {i} by {}",
+                out[i] - l[i - ahead]
+            );
+        }
         let said = core.readout();
         assert_eq!(said.bands[0], 0.0, "a parked HP rang");
         assert_eq!(said.bands[1], 0.0, "a parked LP rang");

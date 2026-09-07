@@ -92,6 +92,7 @@ pub mod adsr;
 pub mod arith;
 pub mod crossover;
 pub mod delay;
+pub mod desk;
 pub mod dynamics;
 pub mod fdn;
 pub mod fft;

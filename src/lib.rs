@@ -6,6 +6,7 @@
 
 pub mod audio;
 pub mod audio_source;
+pub mod clap_host;
 pub mod console;
 pub mod design;
 pub mod devices;
@@ -18,6 +19,7 @@ pub mod param_law;
 pub mod params;
 pub mod pitch;
 pub mod plock_ops;
+pub mod record;
 pub mod render;
 pub mod sample_peaks;
 pub mod sequencing;

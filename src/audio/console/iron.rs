@@ -14,7 +14,6 @@
 use crate::audio::console::{Clock, SectionCore};
 use crate::audio::graph::Readout;
 use crate::console::SectionParams;
-use crate::console::preamp_curve;
 use crate::dsp::filters::{BandShape, DcBlocker, EqBand};
 use crate::dsp::shaper::Oversampler2x;
 use crate::params::console::iron as p;
@@ -202,6 +201,10 @@ impl SectionCore for IronCore {
         self.bottom = 0.0;
     }
 
+    fn latency(&self) -> usize {
+        self.over[0].latency()
+    }
+
     fn process(&mut self, l: &mut [f32], r: &mut [f32], _clock: &Clock) {
         let n = l.len();
         if n == 0 || n * 2 > self.lane.len() {
@@ -359,6 +362,7 @@ mod tests {
     fn there_is_no_bypass() {
         let mut core = core_with(0.0);
         assert!(core.drive() > 0.0, "the floor reached zero");
+        assert_eq!(core.latency(), Oversampler2x::new().latency());
         let l = sine(100.0, 0.4, BLOCK);
         let out = run(&mut core, &l);
         assert!(out != l, "the floor was a wire");

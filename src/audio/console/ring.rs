@@ -61,13 +61,25 @@ fn waveform_of(carrier: u32) -> Waveform {
     }
 }
 
+const TONE_CARRIERS: [Waveform; 3] = [Waveform::Sine, Waveform::Triangle, Waveform::Square];
+
+fn carrier_index(carrier: u32) -> usize {
+    match carrier {
+        p::TRIANGLE => 1,
+        p::SQUARE => 2,
+        _ => 0,
+    }
+}
+
 pub struct RingCore {
     params: SectionParams,
     settings: Settings,
     sample_rate: f32,
     osc: MipOsc,
-    /// The tables the oscillator reads, built for the carrier in hand.
-    tables: Vec<f32>,
+    /// Every tonal carrier's tables, built before the core can reach the
+    /// callback. A carrier letter therefore selects one slice in O(1);
+    /// it never performs Fourier synthesis on the audio thread.
+    tables: [Vec<f32>; TONE_CARRIERS.len()],
     built: Waveform,
     noise: WhiteNoise,
     band: OnePole,
@@ -89,22 +101,16 @@ impl RingCore {
     pub fn new(params: &SectionParams, sample_rate: f32, block: usize) -> Self {
         let settings = Settings::of(params);
         let waveform = waveform_of(settings.carrier);
-        // Room for the LONGEST of the four carriers, taken once. The
-        // shape can change from the audio thread — a letter carries a
-        // carrier switch — and a resize there would be an allocation in
-        // the callback.
-        let widest = [
-            Waveform::Sine,
-            Waveform::Triangle,
-            Waveform::Square,
-            Waveform::Saw,
-        ]
-        .into_iter()
-        .map(table_len)
-        .max()
-        .unwrap_or(0);
-        let mut tables = vec![0.0; widest];
-        build_tables(waveform, &mut tables);
+        // Green zone: pay for all tonal carriers once. `set_param` runs on
+        // the audio thread, and building even one of these is hundreds of
+        // thousands of transcendental operations despite being allocation
+        // free.
+        let tables = core::array::from_fn(|index| {
+            let waveform = TONE_CARRIERS[index];
+            let mut data = vec![0.0; table_len(waveform)];
+            build_tables(waveform, &mut data);
+            data
+        });
         let mut osc = MipOsc::new();
         osc.prepare(sample_rate, waveform);
         let mut noise = WhiteNoise::new();
@@ -139,16 +145,12 @@ impl RingCore {
         self.settings
     }
 
-    /// Red zone safe: the carrier's tables, when the shape changed.
-    ///
-    /// Called from `set_param`, which runs on the audio thread, so the
-    /// storage is never resized here — it was taken at full size once,
-    /// and a new shape is built INTO it.
+    /// Red zone safe: select the already-built carrier and update its cheap
+    /// scalar controls. `set_param` calls this on the audio thread.
     fn tune(&mut self) {
         let s = self.settings;
         let waveform = waveform_of(s.carrier);
         if waveform != self.built {
-            build_tables(waveform, &mut self.tables);
             self.osc.prepare(self.sample_rate, waveform);
             self.built = waveform;
         }
@@ -215,14 +217,16 @@ impl SectionCore for RingCore {
                     hz = s.hz * 2f32.powf(p::HOLD_OCTAVES * *step);
                     self.osc.set_freq(hz);
                     let mut one = [0.0f32; 1];
-                    self.osc.process(&mut one, &self.tables);
+                    self.osc
+                        .process(&mut one, &self.tables[carrier_index(s.carrier)]);
                     *c = one[0];
                 }
                 // Where the walk left the carrier at the block's end.
                 self.carrier_hz = hz;
             } else {
                 self.osc.set_freq(s.hz);
-                self.osc.process(carrier, &self.tables);
+                self.osc
+                    .process(carrier, &self.tables[carrier_index(s.carrier)]);
                 self.carrier_hz = s.hz;
             }
             let mut sum = 0.0f32;
@@ -462,6 +466,19 @@ mod tests {
         core.set_param(99, 1.0);
         core.set_param(p::MIX, 0.0);
         assert!(core.settings().is_wire());
+    }
+
+    #[test]
+    fn switching_tonal_carriers_is_allocation_free_in_the_callback() {
+        let mut core = core_with(&[(p::MIX, 100.0)]);
+        let mut l = sine(440.0, 0.5, BLOCK);
+        let mut r = l.clone();
+        assert_no_alloc::assert_no_alloc(|| {
+            for carrier in [p::SINE, p::TRIANGLE, p::SQUARE] {
+                core.set_param(p::CARRIER, carrier as f32);
+                core.process(&mut l, &mut r, &clock());
+            }
+        });
     }
 
     /// bands[0] is the carrier's LIVE frequency, not the HZ letter: it

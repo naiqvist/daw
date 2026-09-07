@@ -24,9 +24,11 @@ mod inspector;
 mod lattice;
 mod log;
 mod mixer;
+mod modulation;
 mod palette;
 mod room;
 mod sample;
+mod sampler_card;
 mod song;
 mod status;
 mod strip;
@@ -48,6 +50,19 @@ use eframe::egui;
 /// An axis nothing is drawn along yet can hold everything: no offset
 /// needs to move to keep the cursor in sight.
 const HOLDS_EVERYTHING: usize = usize::MAX;
+
+/// Timeline statements exposed by the command centre. The palette owns
+/// discovery and text entry; parsing and mutation stay in the stage core.
+const TIMELINE_COMMANDS: [crate::ui::palette::TypedCommand; 2] = [
+    crate::ui::palette::TypedCommand {
+        name: "tempo",
+        usage: "tempo <bpm>  |  tempo clear",
+    },
+    crate::ui::palette::TypedCommand {
+        name: "meter",
+        usage: "meter <N>/<D>  |  meter clear",
+    },
+];
 
 /// The window carved: a title row, the field, a status strip.
 struct Layout {
@@ -174,21 +189,25 @@ impl Stage {
         let scope = self.scope_context();
         let selection_scope = self.selection_scope();
         let selection_held = selection_scope && ui.input(|input| input.key_down(egui::Key::X));
-        let selection_pressed = selection_scope
-            && ui.input(|input| {
-                input.events.iter().any(|event| {
-                    matches!(
-                        event,
-                        egui::Event::Key {
-                            key: egui::Key::X,
-                            pressed: true,
-                            repeat: false,
-                            modifiers,
-                            ..
-                        } if *modifiers == egui::Modifiers::NONE
-                    )
-                })
-            });
+        // X is a held gesture only on Root/Song, but it is also a one-shot
+        // command in modal scopes (the p-lock editor's INCLUDE toggle).
+        // Observe the physical, non-repeating press everywhere so those
+        // scopes receive X exactly once while a held surface gesture can
+        // still extend with the arrows.
+        let selection_pressed = ui.input(|input| {
+            input.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Key {
+                        key: egui::Key::X,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                        ..
+                    } if *modifiers == egui::Modifiers::NONE
+                )
+            })
+        });
         let inputs = if palette_open {
             Vec::new()
         } else {
@@ -236,7 +255,11 @@ impl Stage {
         let layout = Layout::of(ui.available_rect_before_wrap());
         let field = layout.field;
         self.follow_cursor(
-            heads::capacity(field.width()),
+            if self.mixing {
+                mixer::track_capacity(field.width())
+            } else {
+                heads::capacity(field.width())
+            },
             lattice::capacity(field),
             Self::chain_capacity(layout.tray),
         );
@@ -308,14 +331,19 @@ impl Stage {
         let commands: Vec<crate::ui::palette::Command> =
             entries.iter().map(|entry| entry.command).collect();
         let theme = palette::theme();
-        let choice = self.palette.show(ctx, &theme, &commands, &[])?;
-        let crate::ui::palette::Choice::Command(id) = choice else {
-            return None;
-        };
-        entries
-            .iter()
-            .find(|entry| entry.command.id == id)
-            .map(|entry| entry.intent)
+        match self
+            .palette
+            .show(ctx, &theme, &commands, &TIMELINE_COMMANDS)?
+        {
+            crate::ui::palette::Choice::Command(id) => entries
+                .iter()
+                .find(|entry| entry.command.id == id)
+                .map(|entry| entry.intent),
+            crate::ui::palette::Choice::Typed(line) => {
+                let _ = self.apply_timeline_command(&line);
+                None
+            }
+        }
     }
 
     /// The ground, and on it what has been drawn so far.
@@ -323,48 +351,66 @@ impl Stage {
         crate::ui::sequencer::set_projection(Some(palette::lift));
         crate::ui::sequencer::set_shade(Some(palette::shade));
         let whole = ui.available_rect_before_wrap();
-        let painter = ui.painter();
+        let painter = ui.painter().clone();
         painter.rect_filled(whole, 0.0, palette::colours().ground);
         let layout = Layout::of(whole);
+        let modulation_room = egui::Rect::from_min_max(layout.field.min, layout.tray.max);
         // The field is registered to the glass: marks at its corners.
-        chassis::marks(painter, layout.field.shrink(4.0), 10.0);
-        self.draw_title(painter, layout.title);
-        if self.sample.is_some() {
-            // The cutting room takes the whole field.
-            self.draw_sample(painter, layout.field);
-        } else if self.song_view {
-            // The field turned over: the song's arrangement in the
-            // session's place.
-            self.draw_song(painter, layout.field);
-        } else {
-            self.draw_heads(painter, layout.field);
-            // The mixer replaces the scene rows and gives them back: the
-            // heads never move across the change, so the eye keeps its place.
-            if self.mixing {
-                self.draw_mixer(painter, layout.field);
+        chassis::marks(
+            &painter,
+            if self.modulation.is_some() {
+                modulation_room.shrink(4.0)
             } else {
-                self.draw_lattice(painter, layout.field);
-                self.draw_desk(painter, layout.field);
-                self.draw_log(painter, layout.field);
-            }
-        }
-        // Over the field: the browser is a window above the work, not a
-        // division of it.
-        self.draw_browser(painter, layout.field);
-        self.draw_help(painter, layout.field);
-        self.draw_status(painter, layout.status);
-        // One detail region, and the band and the sequencer are two
-        // things to put in it. The band wins while it is showing.
-        let anchor = if self.chain.is_some() {
-            let phase = Phase::of(
-                self.transport.motion().is_rolling(),
-                self.transport.beat_phase(),
-            );
-            self.draw_chain(ui.painter(), layout.tray, phase);
+                layout.field.shrink(4.0)
+            },
+            10.0,
+        );
+        self.draw_title(&painter, layout.title);
+        let anchor = if self.modulation.is_some() {
+            // A project-wide patchbay needs both the field and its detail
+            // band. The session remains exactly where it was underneath and
+            // comes back with its cursor intact when the workspace closes.
+            self.draw_modulation(ui, modulation_room);
+            self.draw_help(&painter, modulation_room);
             None
         } else {
-            self.draw_tray(ui, layout.tray)
+            if self.sample.is_some() {
+                // The cutting room takes the whole field.
+                self.draw_sample(&painter, layout.field);
+            } else if self.song_view {
+                // The field turned over: the song's arrangement in the
+                // session's place.
+                self.draw_song(&painter, layout.field);
+            } else {
+                self.draw_heads(&painter, layout.field);
+                // The mixer replaces the scene rows and gives them back: the
+                // heads never move across the change, so the eye keeps its place.
+                if self.mixing {
+                    self.draw_mixer(&painter, layout.field);
+                } else {
+                    self.draw_lattice(&painter, layout.field);
+                    self.draw_desk(&painter, layout.field);
+                    self.draw_log(&painter, layout.field);
+                }
+            }
+            // Over the field: the browser is a window above the work, not a
+            // division of it.
+            self.draw_browser(&painter, layout.field);
+            self.draw_help(&painter, layout.field);
+            // One detail region, and the band and the sequencer are two
+            // things to put in it. The band wins while it is showing.
+            if self.chain.is_some() {
+                let phase = Phase::of(
+                    self.transport.motion().is_rolling(),
+                    self.transport.beat_phase(),
+                );
+                self.draw_chain(ui, layout.tray, phase);
+                None
+            } else {
+                self.draw_tray(ui, layout.tray)
+            }
         };
+        self.draw_status(&painter, layout.status);
         // Over everything in the field: a callout is about one thing, and
         // a callout drawn under anything is a callout pointing through it.
         self.draw_callouts(ui.painter(), whole, anchor);
@@ -382,5 +428,109 @@ impl Stage {
                 ui.new_child(egui::UiBuilder::new().max_rect(panel).id_salt("inspector"));
             inspector.ui(&mut child);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::stage::keymap::ScopeContext;
+
+    /// One actual frame, including the event-consumption layer that a direct
+    /// core `handle_key` test intentionally bypasses.
+    fn frame_key(stage: &mut Stage, ctx: &egui::Context, key: egui::Key, repeat: bool) {
+        frame_chord(stage, ctx, egui::Modifiers::NONE, key, repeat);
+    }
+
+    fn frame_chord(
+        stage: &mut Stage,
+        ctx: &egui::Context,
+        modifiers: egui::Modifiers,
+        key: egui::Key,
+        repeat: bool,
+    ) {
+        let event = egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: true,
+            repeat,
+            modifiers,
+        };
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1_280.0, 800.0),
+                )),
+                // Leave the key down between frames: an OS repeat is a
+                // second press event on that same held key, not a release and
+                // a fresh press.
+                events: vec![event],
+                ..Default::default()
+            },
+            |ui| stage.show(ui),
+        );
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn an_actual_plock_frame_accepts_x_once_and_ignores_repeat() {
+        let mut stage = Stage::new();
+        stage.set_palette_open(false);
+        crate::ui::stage::tests::into_clip(&mut stage);
+        assert_eq!(stage.apply(StageIntent::PlockEditor), ApplyOutcome::Changed);
+        stage
+            .plock_editor
+            .as_mut()
+            .expect("lock editor")
+            .param_cursor = 1;
+        let ctx = egui::Context::default();
+        crate::install_stage_fonts(&ctx);
+
+        frame_key(&mut stage, &ctx, egui::Key::X, false);
+        let after_press = stage.plock_editor.clone();
+        assert!(
+            after_press
+                .as_ref()
+                .expect("lock editor")
+                .selected_params
+                .contains(&1)
+        );
+
+        frame_key(&mut stage, &ctx, egui::Key::X, true);
+        assert_eq!(stage.plock_editor, after_press);
+    }
+
+    #[test]
+    fn an_actual_modulation_frame_opens_adds_and_patches_without_a_mouse() {
+        let mut stage = Stage::new();
+        stage.set_palette_open(false);
+        let ctx = egui::Context::default();
+        crate::install_stage_fonts(&ctx);
+
+        frame_chord(
+            &mut stage,
+            &ctx,
+            egui::Modifiers {
+                ctrl: true,
+                command: true,
+                shift: true,
+                ..Default::default()
+            },
+            egui::Key::M,
+            false,
+        );
+        assert_eq!(stage.scope_context(), ScopeContext::Modulation);
+
+        frame_key(&mut stage, &ctx, egui::Key::L, false);
+        assert_eq!(stage.song.modulators.len(), 1);
+
+        frame_key(&mut stage, &ctx, egui::Key::Tab, false);
+        assert_eq!(
+            stage.modulation.as_ref().expect("panel").focus,
+            crate::ui::stage::modulation::Focus::Targets
+        );
+        frame_key(&mut stage, &ctx, egui::Key::X, false);
+        assert_eq!(stage.song.mod_wires.len(), 1);
     }
 }

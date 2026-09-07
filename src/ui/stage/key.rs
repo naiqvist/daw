@@ -25,6 +25,7 @@ pub enum Key {
     E,
     F,
     G,
+    I,
     L,
     M,
     N,
@@ -51,6 +52,7 @@ pub enum Key {
     Equals,
     Escape,
     F2,
+    F9,
     Home,
     Minus,
     OpenBracket,
@@ -74,6 +76,7 @@ impl Key {
             Self::E => "E",
             Self::F => "F",
             Self::G => "G",
+            Self::I => "I",
             Self::L => "L",
             Self::M => "M",
             Self::N => "N",
@@ -100,6 +103,7 @@ impl Key {
             Self::Equals => "Equals",
             Self::Escape => "Escape",
             Self::F2 => "F2",
+            Self::F9 => "F9",
             Self::Home => "Home",
             Self::Minus => "Minus",
             Self::OpenBracket => "OpenBracket",
@@ -138,7 +142,7 @@ impl Key {
     /// Every key there is, for a test that starts from a toolkit's key
     /// and has to find ours.
     #[cfg(test)]
-    pub const ALL: [Key; 43] = [
+    pub const ALL: [Key; 45] = [
         Key::A,
         Key::B,
         Key::C,
@@ -146,6 +150,7 @@ impl Key {
         Key::E,
         Key::F,
         Key::G,
+        Key::I,
         Key::L,
         Key::M,
         Key::N,
@@ -172,6 +177,7 @@ impl Key {
         Key::Equals,
         Key::Escape,
         Key::F2,
+        Key::F9,
         Key::Home,
         Key::Minus,
         Key::OpenBracket,
@@ -185,34 +191,45 @@ impl Key {
     ];
 }
 
-/// The modifiers a chord may hold. Two, because the codebook uses two:
-/// command (ctrl off a Mac, and egui already treats the pair as one
-/// logical key) and shift. Alt is not a code this app spends.
+/// The modifiers a chord may hold. The codebook currently spends command
+/// (ctrl off a Mac, and egui already treats the pair as one logical key)
+/// and shift. Alt is carried as well even before it has a binding: losing it
+/// here lets an Alt chord fall through to an unrelated unmodified command.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Mods {
     pub command: bool,
     pub shift: bool,
+    pub alt: bool,
 }
 
 impl Mods {
     pub const NONE: Self = Self {
         command: false,
         shift: false,
+        alt: false,
     };
     pub const COMMAND: Self = Self {
         command: true,
         shift: false,
+        alt: false,
     };
     pub const SHIFT: Self = Self {
         command: false,
         shift: true,
+        alt: false,
+    };
+    pub const ALT: Self = Self {
+        command: false,
+        shift: false,
+        alt: true,
     };
 
-    /// Both held.
+    /// Both sets held.
     pub const fn plus(self, rhs: Self) -> Self {
         Self {
             command: self.command || rhs.command,
             shift: self.shift || rhs.shift,
+            alt: self.alt || rhs.alt,
         }
     }
 }
@@ -223,9 +240,10 @@ mod tests {
 
     #[test]
     fn plus_holds_both_and_none_holds_neither() {
-        let both = Mods::COMMAND.plus(Mods::SHIFT);
-        assert!(both.command && both.shift);
+        let all = Mods::COMMAND.plus(Mods::SHIFT).plus(Mods::ALT);
+        assert!(all.command && all.shift && all.alt);
         assert_eq!(Mods::NONE.plus(Mods::NONE), Mods::NONE);
         assert_ne!(Mods::COMMAND, Mods::SHIFT);
+        assert_ne!(Mods::ALT, Mods::NONE);
     }
 }

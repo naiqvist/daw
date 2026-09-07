@@ -6,20 +6,49 @@
 //! This is also the proof of the timeline-locked contract: a bounce of the
 //! same project is deterministic, byte for byte.
 
-use crate::audio::graph::{CompileError, GraphSpec, ProcessCtx};
+use crate::audio::graph::{CompileError, GraphSpec, ProcessCtx, Schedule};
 use crate::audio::transport::{Transport, TransportCmd};
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BounceError {
     #[error("cancelled")]
     Cancelled,
+    #[error("render block size must be at least one frame")]
+    InvalidBlockFrames,
     #[error("compile: {0}")]
     Compile(#[from] CompileError),
     #[error("wav: {0}")]
     Wav(#[from] hound::Error),
     #[error("a disk stream did not become ready within {0:?} — stalled or unreadable file")]
     StreamTimeout(std::time::Duration),
+}
+
+/// A render owns the processing thread, so it must stop every live plug-in on
+/// that same thread before the schedule crosses back to control-side drop.
+/// RAII covers cancellation, writer failures and stream timeouts as well as
+/// the successful path.
+struct RenderSchedule(Schedule);
+
+impl Deref for RenderSchedule {
+    type Target = Schedule;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for RenderSchedule {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for RenderSchedule {
+    fn drop(&mut self) {
+        self.0.prepare_for_retirement();
+    }
 }
 
 /// What the samples are written as.
@@ -29,10 +58,11 @@ pub enum BounceError {
 /// pulled back. The integer formats are the ones a mix is DELIVERED in, and
 /// they clip: there is no headroom above full scale to keep.
 ///
-/// Neither integer format dithers. At 24 bits the truncation floor sits
-/// below any room's, and at 16 it is a known, deliberate omission rather
-/// than an oversight — dither is a decision with a sound, and it belongs
-/// beside a mastering stage rather than inside a file writer.
+/// Integer delivery is quantized with deterministic TPDF dither at its own
+/// least-significant bit. Float32 is the engine's arithmetic unchanged. The
+/// generator is reset for each render, so two bounces of one project remain
+/// byte-identical while quiet 16-bit tails do not acquire correlated
+/// quantization distortion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BounceFormat {
     #[default]
@@ -136,21 +166,71 @@ pub fn bounce_automated(
     spec: &GraphSpec,
     opts: &BounceOptions,
     path: &Path,
+    letters: impl FnMut(f64, &mut Vec<crate::audio::graph::ParamChange>),
+    progress: impl FnMut(f32) -> bool,
+) -> Result<(), BounceError> {
+    bounce_automated_resolved(spec, opts, path, None, letters, progress)
+}
+
+/// Render an absolute arrangement against its complete piecewise tempo map.
+/// Session-launcher loops deliberately use [`bounce_automated`] instead: a
+/// launched clip owns one clip-relative scalar clock, while an arrangement's
+/// events and audio regions live on the Song timeline.
+pub fn bounce_automated_with_tempo_table(
+    spec: &GraphSpec,
+    opts: &BounceOptions,
+    path: &Path,
+    timeline: &crate::tempo::TempoTable,
+    letters: impl FnMut(f64, &mut Vec<crate::audio::graph::ParamChange>),
+    progress: impl FnMut(f32) -> bool,
+) -> Result<(), BounceError> {
+    bounce_automated_resolved(spec, opts, path, Some(timeline), letters, progress)
+}
+
+fn bounce_automated_resolved(
+    spec: &GraphSpec,
+    opts: &BounceOptions,
+    path: &Path,
+    timeline: Option<&crate::tempo::TempoTable>,
     mut letters: impl FnMut(f64, &mut Vec<crate::audio::graph::ParamChange>),
     mut progress: impl FnMut(f32) -> bool,
 ) -> Result<(), BounceError> {
-    let mut sched = spec.compile_at_tempo(opts.sample_rate, opts.block_frames, opts.bpm)?;
+    if opts.block_frames == 0 {
+        return Err(BounceError::InvalidBlockFrames);
+    }
+    let mut sched = RenderSchedule(match timeline {
+        Some(timeline) => {
+            spec.compile_with_tempo_table(opts.sample_rate, opts.block_frames, opts.bpm, timeline)?
+        }
+        None => spec.compile_at_tempo(opts.sample_rate, opts.block_frames, opts.bpm)?,
+    });
     let mut transport = Transport::new(opts.sample_rate as f64);
     transport.apply(TransportCmd::SetTempo(opts.bpm));
     transport.apply(TransportCmd::Play);
-    let total_samples = transport.map.beats_to_samples(opts.length_beats.max(0.0));
+    let total_samples = timeline.map_or_else(
+        || transport.map.beats_to_samples(opts.length_beats.max(0.0)),
+        |timeline| timeline.sample_at_beat(opts.length_beats.max(0.0)),
+    );
     // The head that is rendered and thrown away, never written.
-    let skip_samples = transport
-        .map
-        .beats_to_samples(opts.start_beats.max(0.0))
+    let skip_samples = timeline
+        .map_or_else(
+            || transport.map.beats_to_samples(opts.start_beats.max(0.0)),
+            |timeline| timeline.sample_at_beat(opts.start_beats.max(0.0)),
+        )
         .min(total_samples);
+    // A schedule's declared latency is real output delay. The musical range
+    // remains `[skip_samples, total_samples)`, so render far enough to hear
+    // its end and shift BOTH write boundaries by the same amount. Otherwise
+    // a latent graph writes silence at the head, drops the same number of
+    // samples at the tail, and exports a later range from the wrong place.
+    let graph_latency = sched.latency() as u64;
+    let render_samples = total_samples.saturating_add(graph_latency);
+    let write_from = skip_samples
+        .saturating_add(graph_latency)
+        .min(render_samples);
 
     let mut writer = hound::WavWriter::create(path, opts.format.wav_spec(opts.sample_rate))?;
+    let mut dither = Dither::new();
 
     let frames = opts.block_frames;
     let mut block = vec![0.0f32; frames * 2]; // planar L then R
@@ -158,11 +238,11 @@ pub fn bounce_automated(
     let mut rendered: u64 = 0;
 
     let mut pending: Vec<crate::audio::graph::ParamChange> = Vec::new();
-    while rendered < total_samples {
-        let want = frames.min((total_samples - rendered) as usize);
+    while rendered < render_samples {
+        let want = frames.min((render_samples - rendered) as usize);
         // Automation for the block about to run, before it runs.
         pending.clear();
-        letters(transport.map.samples_to_beats(rendered), &mut pending);
+        letters(sched.beat_at(rendered, transport.map), &mut pending);
         for change in pending.drain(..) {
             sched.apply(change);
         }
@@ -183,7 +263,9 @@ pub fn bounce_automated(
 
         let mut done = 0usize;
         while done < want {
-            let seg = transport.next_segment(want - done);
+            let remaining = want - done;
+            let limited = sched.frames_until_control_change(transport.position(), remaining);
+            let seg = transport.next_segment(limited);
             let ctx = ProcessCtx {
                 device_input: &no_input,
                 in_channels: 2,
@@ -192,8 +274,8 @@ pub fn bounce_automated(
                 len: seg.len,
                 playing: seg.playing,
                 position: seg.position,
-                beat: seg.beat,
-                beats_per_sample: transport.map.beats_per_sample(),
+                beat: sched.beat_at(seg.position, transport.map),
+                beats_per_sample: sched.beats_per_sample_at(seg.position, transport.map),
                 discontinuity: seg.discontinuity,
             };
             sched.run(&mut block, &ctx);
@@ -201,13 +283,19 @@ pub fn bounce_automated(
         }
 
         for i in 0..want {
-            if rendered + i as u64 >= skip_samples {
-                write_frame(&mut writer, opts.format, block[i], block[frames + i])?;
+            if rendered + i as u64 >= write_from {
+                write_frame(
+                    &mut writer,
+                    opts.format,
+                    block[i],
+                    block[frames + i],
+                    &mut dither,
+                )?;
             }
         }
         rendered += want as u64;
-        let at = if total_samples > 0 {
-            rendered as f32 / total_samples as f32
+        let at = if render_samples > 0 {
+            rendered as f32 / render_samples as f32
         } else {
             1.0
         };
@@ -230,6 +318,7 @@ fn write_frame<W: std::io::Write + std::io::Seek>(
     format: BounceFormat,
     l: f32,
     r: f32,
+    dither: &mut Dither,
 ) -> Result<(), hound::Error> {
     match format {
         BounceFormat::Float32 => {
@@ -240,15 +329,65 @@ fn write_frame<W: std::io::Write + std::io::Seek>(
         // and +1.0 are symmetric: the alternative rounds +1.0 up past what
         // the format can hold and wraps it to silence.
         BounceFormat::Int24 => {
-            writer.write_sample(to_int(l, 23))?;
-            writer.write_sample(to_int(r, 23))?;
+            writer.write_sample(dither.quantize(l, 23, Channel::Left))?;
+            writer.write_sample(dither.quantize(r, 23, Channel::Right))?;
         }
         BounceFormat::Int16 => {
-            writer.write_sample(to_int(l, 15) as i16)?;
-            writer.write_sample(to_int(r, 15) as i16)?;
+            writer.write_sample(dither.quantize(l, 15, Channel::Left) as i16)?;
+            writer.write_sample(dither.quantize(r, 15, Channel::Right) as i16)?;
         }
     }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum Channel {
+    Left,
+    Right,
+}
+
+/// Two independent deterministic TPDF streams, one for each output channel.
+/// State is render-owned and green-zone; the offline writer is not an audio
+/// callback, but bounded integer arithmetic keeps this cheap and reproducible.
+struct Dither {
+    left: u64,
+    right: u64,
+}
+
+impl Dither {
+    fn new() -> Self {
+        Self {
+            left: 0x6a09_e667_f3bc_c909,
+            right: 0xbb67_ae85_84ca_a73b,
+        }
+    }
+
+    fn uniform(state: &mut u64) -> f32 {
+        // xorshift64*: take the high 24 bits, exactly representable in f32.
+        let mut x = *state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        *state = x;
+        let bits = (x.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 40) as u32;
+        bits as f32 * (1.0 / 16_777_216.0)
+    }
+
+    fn quantize(&mut self, sample: f32, bits: u32, channel: Channel) -> i32 {
+        if !sample.is_finite() {
+            return 0;
+        }
+        let state = match channel {
+            Channel::Left => &mut self.left,
+            Channel::Right => &mut self.right,
+        };
+        // The difference of two independent rectangular samples is TPDF in
+        // (-1, 1) LSB: enough to decorrelate rounding without a 6 dB excess.
+        let noise_lsb = Self::uniform(state) - Self::uniform(state);
+        let scale = ((1u32 << bits) - 1) as f32;
+        let dithered = sample.clamp(-1.0, 1.0) + noise_lsb / scale;
+        to_int(dithered, bits)
+    }
 }
 
 /// A sample as a `bits`-plus-sign integer, CLIPPED at full scale. A mix
@@ -298,6 +437,117 @@ mod tests {
         u64::from(reader.duration())
     }
 
+    fn float_mono(name: &str, samples: &[f32]) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "daw-test-bounce-latency-{name}-{}.wav",
+            std::process::id()
+        ));
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48_000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        for &sample in samples {
+            writer.write_sample(sample).unwrap();
+        }
+        writer.finalize().unwrap();
+        path
+    }
+
+    fn audio_through_latency(path: &Path, source_frames: usize, latency: usize) -> GraphSpec {
+        let mut spec = GraphSpec::default();
+        let clip = spec.push(NodeSpec::AudioClip {
+            path: path.to_owned(),
+            start_beats: 0.0,
+            length_beats: None,
+            source_offset_frames: 0,
+            source_frames: Some(source_frames as u64),
+            loop_clip: false,
+            loop_start_frames: 0,
+            gain: 1.0,
+            fade_in_frames: 0,
+            fade_out_frames: 0,
+            fade_in_shape: 0.0,
+            fade_out_shape: 0.0,
+            envelope: Vec::new(),
+        });
+        let output = if latency == 0 {
+            clip
+        } else {
+            let delay = spec.push(NodeSpec::Delay {
+                samples: latency,
+                channels: 2,
+            });
+            spec.connect(clip, delay);
+            delay
+        };
+        spec.set_output(output);
+        spec
+    }
+
+    fn sample_range(end: usize, start: usize) -> BounceOptions {
+        BounceOptions {
+            sample_rate: 48_000,
+            block_frames: 16,
+            bpm: 60.0,
+            length_beats: end as f64 / 48_000.0,
+            start_beats: start as f64 / 48_000.0,
+            format: BounceFormat::Float32,
+        }
+    }
+
+    fn float_wav(path: &Path) -> Vec<f32> {
+        hound::WavReader::open(path)
+            .unwrap()
+            .samples::<f32>()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn mapped_bounce_uses_piecewise_time_for_the_render_range() {
+        let mut song = crate::sequencing::Song::default();
+        assert!(song.set_tempo_mark(0, 120.0));
+        assert!(song.set_tempo_mark(crate::sequencing::TICKS_PER_BEAT, 60.0));
+        let timeline = crate::tempo::TempoTable::build(&song, 48_000.0, 120.0);
+        let path = std::env::temp_dir().join("daw-test-tempo-map-range.wav");
+        bounce_automated_with_tempo_table(
+            &GraphSpec::default(),
+            &BounceOptions {
+                sample_rate: 48_000,
+                block_frames: 257,
+                bpm: 120.0,
+                length_beats: 2.0,
+                ..Default::default()
+            },
+            &path,
+            &timeline,
+            |_, _| {},
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(frames(&path), 72_000, "24k fast + 48k slow samples");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_zero_frame_block_is_refused_without_creating_a_file() {
+        let path = std::env::temp_dir().join("daw-test-zero-frame-bounce.wav");
+        let _ = std::fs::remove_file(&path);
+        let result = bounce(
+            &ping(0.6),
+            &BounceOptions {
+                block_frames: 0,
+                ..Default::default()
+            },
+            &path,
+        );
+        assert!(matches!(result, Err(BounceError::InvalidBlockFrames)));
+        assert!(!path.exists(), "an invalid render left a file behind");
+    }
+
     /// A later start writes a shorter file, and what it writes is the TAIL
     /// of the same render — not a fresh one begun at that beat.
     #[test]
@@ -342,6 +592,82 @@ mod tests {
         assert_eq!(&all[all.len() - end.len()..], &end[..]);
     }
 
+    #[test]
+    fn graph_latency_neither_leads_with_silence_nor_truncates_the_last_impulse() {
+        const N: usize = 67;
+        const LATENCY: usize = 23;
+        let mut source = vec![0.0f32; N];
+        // Audio clips deliberately ramp in on their first block. Put the head
+        // probe inside that block but beyond its zero-valued first sample, and
+        // compare against the otherwise-identical zero-latency render.
+        source[8] = 0.75;
+        source[N - 1] = -0.5;
+        let input = float_mono("edge-impulses-source", &source);
+        let clean = std::env::temp_dir().join(format!(
+            "daw-test-bounce-latency-edge-clean-{}.wav",
+            std::process::id()
+        ));
+        let output = std::env::temp_dir().join(format!(
+            "daw-test-bounce-latency-edge-output-{}.wav",
+            std::process::id()
+        ));
+        bounce(
+            &audio_through_latency(&input, N, 0),
+            &sample_range(N, 0),
+            &clean,
+        )
+        .unwrap();
+        bounce(
+            &audio_through_latency(&input, N, LATENCY),
+            &sample_range(N, 0),
+            &output,
+        )
+        .unwrap();
+        let rendered = float_wav(&output);
+        let left: Vec<f32> = rendered.chunks_exact(2).map(|frame| frame[0]).collect();
+        let clean_left: Vec<f32> = float_wav(&clean)
+            .chunks_exact(2)
+            .map(|frame| frame[0])
+            .collect();
+        assert_eq!(left.len(), N);
+        assert_eq!(left, clean_left, "latency shifted or truncated the range");
+        assert_ne!(left[8].to_bits(), 0, "the head probe became silence");
+        assert_eq!(left[N - 1].to_bits(), (-0.5f32).to_bits());
+        std::fs::remove_file(input).unwrap();
+        std::fs::remove_file(clean).unwrap();
+        std::fs::remove_file(output).unwrap();
+    }
+
+    #[test]
+    fn a_latent_range_is_the_same_timeline_slice_as_a_zero_latency_range() {
+        const N: usize = 97;
+        const START: usize = 31;
+        const LATENCY: usize = 23;
+        let source: Vec<f32> = (0..N).map(|i| (i as f32 + 1.0) / 128.0 - 0.5).collect();
+        let input = float_mono("range-source", &source);
+        let clean = std::env::temp_dir().join(format!(
+            "daw-test-bounce-range-clean-{}.wav",
+            std::process::id()
+        ));
+        let latent = std::env::temp_dir().join(format!(
+            "daw-test-bounce-range-latent-{}.wav",
+            std::process::id()
+        ));
+        let opts = sample_range(N, START);
+        bounce(&audio_through_latency(&input, N, 0), &opts, &clean).unwrap();
+        bounce(&audio_through_latency(&input, N, LATENCY), &opts, &latent).unwrap();
+        let clean_samples = float_wav(&clean);
+        let latent_samples = float_wav(&latent);
+        assert_eq!(frames(&latent), (N - START) as u64);
+        assert_eq!(
+            latent_samples, clean_samples,
+            "graph latency shifted the requested range"
+        );
+        for path in [input, clean, latent] {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
     /// The integer formats land where they say they do, and CLIP rather
     /// than wrap when the mix is over.
     #[test]
@@ -370,6 +696,33 @@ mod tests {
         assert_eq!(spec.bits_per_sample, 16);
         assert_eq!(spec.sample_format, hound::SampleFormat::Int);
         assert_eq!(spec.channels, 2);
+    }
+
+    #[test]
+    fn integer_dither_is_tpdf_independent_and_repeatable() {
+        let render = || {
+            let mut dither = Dither::new();
+            (0..4096)
+                .map(|_| {
+                    (
+                        dither.quantize(0.0, 15, Channel::Left),
+                        dither.quantize(0.0, 15, Channel::Right),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let a = render();
+        let b = render();
+        assert_eq!(a, b, "the render seed must make delivery repeatable");
+        assert!(a.iter().any(|(l, _)| *l != 0), "silence was not dithered");
+        assert!(
+            a.iter().any(|(l, r)| l != r),
+            "left and right reused one correlated noise stream"
+        );
+        assert!(
+            a.iter()
+                .all(|(l, r)| (-1..=1).contains(l) && (-1..=1).contains(r))
+        );
     }
 
     /// Automation reaches an offline render: the same song, rendered once

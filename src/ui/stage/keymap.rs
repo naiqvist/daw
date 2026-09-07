@@ -44,6 +44,9 @@ pub(super) enum ScopeContext {
     /// The floating multi-cell parameter-lock graph owns all editing keys
     /// until it commits or cancels.
     Plock,
+    /// The project-wide modulation patchbay: source bank, destination
+    /// browser, and response shaper share one keyboard-owned workspace.
+    Modulation,
     /// The sample editor is up: one file, full screen, and the keys are
     /// the editor's — cursor, zoom, markers, slices, audition. A place
     /// of its own, like the browser, that Escape leaves.
@@ -56,7 +59,7 @@ pub(super) enum ScopeContext {
 
 impl ScopeContext {
     #[cfg(test)]
-    pub(super) const ALL: [Self; 11] = [
+    pub(super) const ALL: [Self; 12] = [
         Self::Root,
         Self::Nested,
         Self::Browser,
@@ -66,6 +69,7 @@ impl ScopeContext {
         Self::Rename,
         Self::TrigMenu,
         Self::Plock,
+        Self::Modulation,
         Self::Sample,
         Self::Song,
     ];
@@ -85,6 +89,8 @@ pub enum StageIntent {
     Escape,
     /// Toggle the song clock between parked and rolling.
     ToggleTransport,
+    /// Start recording every armed track, or stop and commit the take.
+    ToggleRecord,
     /// Return the song clock to the top without changing its motion.
     Rewind,
     /// Show or hide the codebook for the current scope.
@@ -108,6 +114,15 @@ pub enum StageIntent {
     /// Append an instrument track to the song — a MIDI track, in the
     /// words the chord is described in.
     NewInstrumentTrack,
+    /// Arm or disarm the addressed audio or instrument track.
+    ToggleTrackArm,
+    /// Walk the addressed audio track through the current interface's
+    /// available input routes.
+    CycleTrackInput {
+        back: bool,
+    },
+    /// Off, In, Auto for the addressed audio track.
+    CycleTrackMonitor,
     /// Empty the session slot the cursor stands on.
     Clear,
     /// Fire the scene the cursor stands in, or stop it if it is already
@@ -178,10 +193,38 @@ pub enum StageIntent {
         backwards: bool,
     },
     PlockFine(Step),
+    /// Address another selected parameter lane without changing its value.
+    PlockLane {
+        down: bool,
+    },
     PlockAlgorithm,
     PlockExtreme {
         high: bool,
     },
+    /// Open or close the project-wide modulation workspace.
+    Modulation,
+    /// Move focus between source, destination, and response zones.
+    ModTab {
+        backwards: bool,
+    },
+    /// Change the addressed response control. Shift asks for fine motion.
+    ModAdjust {
+        increase: bool,
+        fine: bool,
+    },
+    ModAddLfo,
+    ModAddFollower,
+    ModShape {
+        forward: bool,
+    },
+    ModRate {
+        faster: bool,
+    },
+    ModClock,
+    ModToggleWire,
+    ModBypass,
+    ModSolo,
+    ModDelete,
     /// An act in the sample editor, or the act of opening it.
     Sample(SampleIntent),
     /// Scan the library's folders again, so a pack dropped in while the
@@ -364,6 +407,7 @@ impl StageIntent {
             Self::Enter => "go in",
             Self::Escape => "go out",
             Self::ToggleTransport => "stop / roll",
+            Self::ToggleRecord => "record armed tracks",
             Self::Rewind => "return to top",
             Self::Help => "this list",
             Self::ProjectManager => "project deck",
@@ -375,6 +419,10 @@ impl StageIntent {
             Self::Backspace => "erase filter",
             Self::NewAudioTrack => "new audio track",
             Self::NewInstrumentTrack => "new midi track",
+            Self::ToggleTrackArm => "arm track",
+            Self::CycleTrackInput { back: false } => "next track input",
+            Self::CycleTrackInput { back: true } => "previous track input",
+            Self::CycleTrackMonitor => "track monitor mode",
             Self::Clear => "clear slot",
             Self::Launch => "launch clip",
             Self::LaunchScene => "launch scene",
@@ -432,9 +480,41 @@ impl StageIntent {
             Self::PlockTab { backwards: false } => "next editor region",
             Self::PlockTab { backwards: true } => "previous editor region",
             Self::PlockFine(_) => "fine graph adjustment",
+            Self::PlockLane { down: false } => "previous parameter lane",
+            Self::PlockLane { down: true } => "next parameter lane",
             Self::PlockAlgorithm => "algorithm picker",
             Self::PlockExtreme { high: false } => "parameter minimum",
             Self::PlockExtreme { high: true } => "parameter maximum",
+            Self::Modulation => "modulation workspace",
+            Self::ModTab { backwards: false } => "next modulation zone",
+            Self::ModTab { backwards: true } => "previous modulation zone",
+            Self::ModAdjust {
+                increase: false,
+                fine: false,
+            } => "less modulation",
+            Self::ModAdjust {
+                increase: true,
+                fine: false,
+            } => "more modulation",
+            Self::ModAdjust {
+                increase: false,
+                fine: true,
+            } => "less modulation, finely",
+            Self::ModAdjust {
+                increase: true,
+                fine: true,
+            } => "more modulation, finely",
+            Self::ModAddLfo => "add LFO",
+            Self::ModAddFollower => "add follower",
+            Self::ModShape { forward: false } => "previous LFO shape",
+            Self::ModShape { forward: true } => "next LFO shape",
+            Self::ModRate { faster: false } => "slower modulation",
+            Self::ModRate { faster: true } => "faster modulation",
+            Self::ModClock => "sync / free",
+            Self::ModToggleWire => "patch / unpatch",
+            Self::ModBypass => "bypass modulation wire",
+            Self::ModSolo => "solo modulation wire",
+            Self::ModDelete => "delete modulation selection",
             Self::Sample(intent) => intent.label(),
             Self::Rescan => "rescan library",
             Self::SongView => "session / song",
@@ -571,6 +651,19 @@ const BINDINGS: &[Binding] = &[
         StageIntent::ToggleTransport,
     ),
     Binding::new(ScopeContext::Browser, Key::Home, StageIntent::Rewind),
+    // Record is the dedicated transport key and remains the shortest way
+    // both into and out of a take from every musical scope.
+    Binding::new(ScopeContext::Root, Key::F9, StageIntent::ToggleRecord),
+    Binding::new(ScopeContext::Nested, Key::F9, StageIntent::ToggleRecord),
+    Binding::new(ScopeContext::Browser, Key::F9, StageIntent::ToggleRecord),
+    Binding::new(ScopeContext::Mixer, Key::F9, StageIntent::ToggleRecord),
+    Binding::new(ScopeContext::Chain, Key::F9, StageIntent::ToggleRecord),
+    Binding::new(ScopeContext::Clip, Key::F9, StageIntent::ToggleRecord),
+    Binding::new(ScopeContext::Rename, Key::F9, StageIntent::ToggleRecord),
+    Binding::new(ScopeContext::TrigMenu, Key::F9, StageIntent::ToggleRecord),
+    Binding::new(ScopeContext::Plock, Key::F9, StageIntent::ToggleRecord),
+    Binding::new(ScopeContext::Sample, Key::F9, StageIntent::ToggleRecord),
+    Binding::new(ScopeContext::Song, Key::F9, StageIntent::ToggleRecord),
     Binding::new(ScopeContext::Root, Key::X, StageIntent::Select),
     Binding::new(ScopeContext::Nested, Key::X, StageIntent::Select),
     Binding::new(ScopeContext::Song, Key::X, StageIntent::Select),
@@ -818,6 +911,69 @@ const BINDINGS: &[Binding] = &[
         Key::T,
         StageIntent::NewInstrumentTrack,
     ),
+    // The selected track's recording cluster: arm, source, monitor. Kept
+    // off the clip scope because its letters belong to pitch entry and the
+    // sequencer grammar there.
+    Binding::new(ScopeContext::Root, Key::A, StageIntent::ToggleTrackArm),
+    Binding::new(ScopeContext::Nested, Key::A, StageIntent::ToggleTrackArm),
+    Binding::new(ScopeContext::Mixer, Key::A, StageIntent::ToggleTrackArm),
+    Binding::new(ScopeContext::Chain, Key::A, StageIntent::ToggleTrackArm),
+    Binding::new(ScopeContext::Song, Key::A, StageIntent::ToggleTrackArm),
+    Binding::new(
+        ScopeContext::Root,
+        Key::I,
+        StageIntent::CycleTrackInput { back: false },
+    ),
+    Binding::new(
+        ScopeContext::Nested,
+        Key::I,
+        StageIntent::CycleTrackInput { back: false },
+    ),
+    Binding::new(
+        ScopeContext::Mixer,
+        Key::I,
+        StageIntent::CycleTrackInput { back: false },
+    ),
+    Binding::new(
+        ScopeContext::Chain,
+        Key::I,
+        StageIntent::CycleTrackInput { back: false },
+    ),
+    Binding::new(
+        ScopeContext::Song,
+        Key::I,
+        StageIntent::CycleTrackInput { back: false },
+    ),
+    Binding::shift(
+        ScopeContext::Root,
+        Key::I,
+        StageIntent::CycleTrackInput { back: true },
+    ),
+    Binding::shift(
+        ScopeContext::Nested,
+        Key::I,
+        StageIntent::CycleTrackInput { back: true },
+    ),
+    Binding::shift(
+        ScopeContext::Mixer,
+        Key::I,
+        StageIntent::CycleTrackInput { back: true },
+    ),
+    Binding::shift(
+        ScopeContext::Chain,
+        Key::I,
+        StageIntent::CycleTrackInput { back: true },
+    ),
+    Binding::shift(
+        ScopeContext::Song,
+        Key::I,
+        StageIntent::CycleTrackInput { back: true },
+    ),
+    Binding::shift(ScopeContext::Root, Key::A, StageIntent::CycleTrackMonitor),
+    Binding::shift(ScopeContext::Nested, Key::A, StageIntent::CycleTrackMonitor),
+    Binding::shift(ScopeContext::Mixer, Key::A, StageIntent::CycleTrackMonitor),
+    Binding::shift(ScopeContext::Chain, Key::A, StageIntent::CycleTrackMonitor),
+    Binding::shift(ScopeContext::Song, Key::A, StageIntent::CycleTrackMonitor),
     // Clearing a slot is the one destructive verb on the session, and it
     // is unmodified on purpose: it destroys a PLACE-holder, not content —
     // the pattern stays in the song — so it may sit under the fingers.
@@ -947,6 +1103,7 @@ const BINDINGS: &[Binding] = &[
     // Once up, it is a list and takes the list's keys, nothing more.
     Binding::command_shift(ScopeContext::Clip, Key::Enter, StageIntent::TrigMenu),
     Binding::shift(ScopeContext::Clip, Key::Enter, StageIntent::PlockEditor),
+    Binding::command(ScopeContext::Clip, Key::P, StageIntent::PlockEditor),
     Binding::new(
         ScopeContext::TrigMenu,
         Key::ArrowUp,
@@ -1051,7 +1208,20 @@ const BINDINGS: &[Binding] = &[
         Key::ArrowRight,
         StageIntent::PlockFine(Step::Right),
     ),
+    Binding::command(
+        ScopeContext::Plock,
+        Key::ArrowUp,
+        StageIntent::PlockLane { down: false },
+    ),
+    Binding::command(
+        ScopeContext::Plock,
+        Key::ArrowDown,
+        StageIntent::PlockLane { down: true },
+    ),
     Binding::new(ScopeContext::Plock, Key::X, StageIntent::Select),
+    Binding::command(ScopeContext::Plock, Key::A, StageIntent::SelectAll),
+    Binding::new(ScopeContext::Plock, Key::Delete, StageIntent::ClearLock),
+    Binding::new(ScopeContext::Plock, Key::Backspace, StageIntent::ClearLock),
     Binding::new(ScopeContext::Plock, Key::Slash, StageIntent::PlockAlgorithm),
     Binding::new(
         ScopeContext::Plock,
@@ -1081,6 +1251,139 @@ const BINDINGS: &[Binding] = &[
         StageIntent::ToggleTransport,
     ),
     Binding::command(ScopeContext::Plock, Key::L, StageIntent::Ground),
+    // The modulation room. ^+M reaches it from every non-transactional
+    // musical surface and closes it from inside. Within it, Tab moves among
+    // the three zones; arrows address and shape; the direct letter verbs are
+    // deliberately mnemonic because patching is a flow, not a form.
+    Binding::command_shift(ScopeContext::Root, Key::M, StageIntent::Modulation),
+    Binding::command_shift(ScopeContext::Nested, Key::M, StageIntent::Modulation),
+    Binding::command_shift(ScopeContext::Browser, Key::M, StageIntent::Modulation),
+    Binding::command_shift(ScopeContext::Mixer, Key::M, StageIntent::Modulation),
+    Binding::command_shift(ScopeContext::Chain, Key::M, StageIntent::Modulation),
+    Binding::command_shift(ScopeContext::Clip, Key::M, StageIntent::Modulation),
+    Binding::command_shift(ScopeContext::Song, Key::M, StageIntent::Modulation),
+    Binding::command_shift(ScopeContext::Modulation, Key::M, StageIntent::Modulation),
+    Binding::new(
+        ScopeContext::Modulation,
+        Key::ArrowUp,
+        StageIntent::Step(Step::Up),
+    ),
+    Binding::new(
+        ScopeContext::Modulation,
+        Key::ArrowDown,
+        StageIntent::Step(Step::Down),
+    ),
+    Binding::new(
+        ScopeContext::Modulation,
+        Key::ArrowLeft,
+        StageIntent::Step(Step::Left),
+    ),
+    Binding::new(
+        ScopeContext::Modulation,
+        Key::ArrowRight,
+        StageIntent::Step(Step::Right),
+    ),
+    Binding::shift(
+        ScopeContext::Modulation,
+        Key::ArrowLeft,
+        StageIntent::ModAdjust {
+            increase: false,
+            fine: true,
+        },
+    ),
+    Binding::shift(
+        ScopeContext::Modulation,
+        Key::ArrowRight,
+        StageIntent::ModAdjust {
+            increase: true,
+            fine: true,
+        },
+    ),
+    Binding::new(
+        ScopeContext::Modulation,
+        Key::Tab,
+        StageIntent::ModTab { backwards: false },
+    ),
+    Binding::shift(
+        ScopeContext::Modulation,
+        Key::Tab,
+        StageIntent::ModTab { backwards: true },
+    ),
+    Binding::new(ScopeContext::Modulation, Key::Enter, StageIntent::Enter),
+    Binding::new(ScopeContext::Modulation, Key::X, StageIntent::ModToggleWire),
+    Binding::new(ScopeContext::Modulation, Key::L, StageIntent::ModAddLfo),
+    Binding::new(
+        ScopeContext::Modulation,
+        Key::F,
+        StageIntent::ModAddFollower,
+    ),
+    Binding::new(
+        ScopeContext::Modulation,
+        Key::OpenBracket,
+        StageIntent::ModShape { forward: false },
+    ),
+    Binding::new(
+        ScopeContext::Modulation,
+        Key::CloseBracket,
+        StageIntent::ModShape { forward: true },
+    ),
+    Binding::new(
+        ScopeContext::Modulation,
+        Key::Minus,
+        StageIntent::ModRate { faster: false },
+    ),
+    Binding::new(
+        ScopeContext::Modulation,
+        Key::Equals,
+        StageIntent::ModRate { faster: true },
+    ),
+    Binding::new(
+        ScopeContext::Modulation,
+        Key::Plus,
+        StageIntent::ModRate { faster: true },
+    ),
+    Binding::new(ScopeContext::Modulation, Key::M, StageIntent::ModClock),
+    Binding::new(ScopeContext::Modulation, Key::B, StageIntent::ModBypass),
+    Binding::new(ScopeContext::Modulation, Key::S, StageIntent::ModSolo),
+    Binding::new(
+        ScopeContext::Modulation,
+        Key::Delete,
+        StageIntent::ModDelete,
+    ),
+    Binding::new(
+        ScopeContext::Modulation,
+        Key::Backspace,
+        StageIntent::ModDelete,
+    ),
+    Binding::new(ScopeContext::Modulation, Key::Escape, StageIntent::Escape),
+    Binding::new(
+        ScopeContext::Modulation,
+        Key::Space,
+        StageIntent::ToggleTransport,
+    ),
+    Binding::new(ScopeContext::Modulation, Key::Home, StageIntent::Rewind),
+    Binding::new(ScopeContext::Modulation, Key::F9, StageIntent::ToggleRecord),
+    Binding::new(
+        ScopeContext::Modulation,
+        Key::Questionmark,
+        StageIntent::Help,
+    ),
+    Binding::command(ScopeContext::Modulation, Key::L, StageIntent::Ground),
+    Binding::command(ScopeContext::Modulation, Key::Z, StageIntent::Undo),
+    Binding::command_shift(ScopeContext::Modulation, Key::Z, StageIntent::Redo),
+    Binding::command(ScopeContext::Modulation, Key::S, StageIntent::Save),
+    Binding::command(
+        ScopeContext::Modulation,
+        Key::O,
+        StageIntent::ProjectManager,
+    ),
+    Binding::command(
+        ScopeContext::Modulation,
+        Key::Comma,
+        StageIntent::Preferences,
+    ),
+    Binding::command_shift(ScopeContext::Modulation, Key::E, StageIntent::ExportConsole),
+    Binding::command_shift(ScopeContext::Modulation, Key::D, StageIntent::Diagnostics),
     // The cutting room. Opened with ^E wherever the cursor addresses a
     // track, and with Enter on a sampler in the band. Once up, its keys
     // are its own; the globals stay.
@@ -1469,7 +1772,7 @@ fn family(intent: StageIntent) -> &'static str {
         | StageIntent::SelectStep(_)
         | StageIntent::Enter
         | StageIntent::Escape => "move",
-        StageIntent::ToggleTransport | StageIntent::Rewind => "time",
+        StageIntent::ToggleTransport | StageIntent::ToggleRecord | StageIntent::Rewind => "time",
         StageIntent::Help
         | StageIntent::Browse
         | StageIntent::Mix
@@ -1480,7 +1783,11 @@ fn family(intent: StageIntent) -> &'static str {
         | StageIntent::Preferences
         | StageIntent::ExportConsole
         | StageIntent::Diagnostics => "system",
-        StageIntent::NewAudioTrack | StageIntent::NewInstrumentTrack => "track",
+        StageIntent::NewAudioTrack
+        | StageIntent::NewInstrumentTrack
+        | StageIntent::ToggleTrackArm
+        | StageIntent::CycleTrackInput { .. }
+        | StageIntent::CycleTrackMonitor => "track",
         StageIntent::Clear | StageIntent::Launch | StageIntent::LaunchScene => "session",
         StageIntent::Gain { .. }
         | StageIntent::Pan { .. }
@@ -1498,8 +1805,21 @@ fn family(intent: StageIntent) -> &'static str {
         | StageIntent::PlockEditor
         | StageIntent::PlockTab { .. }
         | StageIntent::PlockFine(_)
+        | StageIntent::PlockLane { .. }
         | StageIntent::PlockAlgorithm
         | StageIntent::PlockExtreme { .. } => "edit",
+        StageIntent::Modulation
+        | StageIntent::ModTab { .. }
+        | StageIntent::ModAdjust { .. }
+        | StageIntent::ModAddLfo
+        | StageIntent::ModAddFollower
+        | StageIntent::ModShape { .. }
+        | StageIntent::ModRate { .. }
+        | StageIntent::ModClock
+        | StageIntent::ModToggleWire
+        | StageIntent::ModBypass
+        | StageIntent::ModSolo
+        | StageIntent::ModDelete => "modulation",
         StageIntent::Sample(_) => "sample",
         StageIntent::Song(_) | StageIntent::RecordSong => "song",
         StageIntent::Bus => "mix",
@@ -1751,5 +2071,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn modulation_has_a_safe_global_door_and_its_own_x_verb() {
+        let open = Mods::COMMAND.plus(Mods::SHIFT);
+        for scope in [
+            ScopeContext::Root,
+            ScopeContext::Nested,
+            ScopeContext::Browser,
+            ScopeContext::Mixer,
+            ScopeContext::Chain,
+            ScopeContext::Clip,
+            ScopeContext::Song,
+            ScopeContext::Modulation,
+        ] {
+            assert_eq!(
+                dispatch(scope, StageInput::Chord(open, Key::M)),
+                Some(StageIntent::Modulation),
+                "{scope:?} cannot reach the modulation workspace"
+            );
+        }
+        for transactional in [
+            ScopeContext::Rename,
+            ScopeContext::TrigMenu,
+            ScopeContext::Plock,
+            ScopeContext::Sample,
+        ] {
+            assert_eq!(
+                dispatch(transactional, StageInput::Chord(open, Key::M)),
+                None
+            );
+        }
+        assert_eq!(
+            dispatch(
+                ScopeContext::Modulation,
+                StageInput::Chord(Mods::NONE, Key::X)
+            ),
+            Some(StageIntent::ModToggleWire)
+        );
     }
 }

@@ -177,16 +177,33 @@ pub struct Place {
 
 impl Place {
     pub fn of(song: &Song, tick: usize) -> Self {
-        let (numerator, denominator) = song.meter_at(tick, DEFAULT_METER);
-        let beats_per_bar = numerator.max(1) as usize;
+        // A meter mark begins a new bar. Walk the (already sorted) marks
+        // before the playhead and count each completed meter span with the
+        // signature which governed it. A partial span still occupied a bar,
+        // so a mark placed off the previous bar line advances the number
+        // rather than making two differently-shaped bars share an address.
+        let mut segment_start = 0usize;
+        let mut meter = DEFAULT_METER;
+        let mut bars_before = 0usize;
+        for mark in song.meter.iter().filter(|mark| mark.tick <= tick) {
+            if mark.tick > segment_start {
+                let bar_ticks = ticks_per_bar(meter);
+                let span = mark.tick.saturating_sub(segment_start);
+                bars_before = bars_before.saturating_add(span.div_ceil(bar_ticks));
+            }
+            segment_start = mark.tick;
+            meter = (mark.numerator.max(1), mark.denominator.max(1));
+        }
 
-        // Whole beats since the top, then split into bars and the beat
-        // within one. Only correct while the meter is constant from the
-        // start; a mid-song meter change needs the marks walked in order,
-        // which is worth doing when meter marks are actually editable.
-        let beat_index = tick / TICKS_PER_BEAT;
+        let (numerator, denominator) = meter;
+        let beats_per_bar = numerator as usize;
+        let beat_ticks = ticks_per_beat(denominator);
+        let into = tick.saturating_sub(segment_start);
+        let beat_index = into / beat_ticks;
         Self {
-            bar: beat_index / beats_per_bar + 1,
+            bar: bars_before
+                .saturating_add(beat_index / beats_per_bar)
+                .saturating_add(1),
             beat: beat_index % beats_per_bar + 1,
             beats_per_bar,
             denominator,
@@ -201,6 +218,18 @@ impl Place {
     pub fn readout(&self) -> String {
         format!("{:03}.{:02}", self.bar, self.beat)
     }
+}
+
+/// Song ticks occupied by one denominator-note beat. `TICKS_PER_BEAT` is a
+/// quarter note, so 8 means half that many ticks and 2 means twice as many.
+/// Hostile odd denominators remain bounded and usable rather than producing a
+/// zero-length bar.
+fn ticks_per_beat(denominator: u32) -> usize {
+    (TICKS_PER_BEAT.saturating_mul(4) / denominator.max(1) as usize).max(1)
+}
+
+fn ticks_per_bar((numerator, denominator): (u32, u32)) -> usize {
+    ticks_per_beat(denominator).saturating_mul(numerator.max(1) as usize)
 }
 
 #[cfg(test)]
@@ -301,10 +330,41 @@ mod tests {
         assert_eq!(Place::of(&song, 0).beats_per_bar, 4);
 
         assert!(song.set_meter_mark(0, 7, 8));
-        let place = Place::of(&song, TICKS_PER_BEAT * 7);
+        let place = Place::of(&song, (TICKS_PER_BEAT / 2) * 7);
         assert_eq!(place.beats_per_bar, 7);
         assert_eq!(place.denominator, 8);
-        assert_eq!((place.bar, place.beat), (2, 1), "seven beats is one bar");
+        assert_eq!((place.bar, place.beat), (2, 1), "seven eighths is one bar");
+    }
+
+    #[test]
+    fn bar_count_walks_meter_changes_without_renumbering_the_song() {
+        let mut song = Song::default();
+        let four_four_bar = TICKS_PER_BEAT * 4;
+        assert!(song.set_meter_mark(four_four_bar * 2, 3, 4));
+        let three_four_bar = TICKS_PER_BEAT * 3;
+        assert!(song.set_meter_mark(four_four_bar * 2 + three_four_bar * 2, 7, 8));
+
+        assert_eq!(Place::of(&song, four_four_bar * 2).readout(), "003.01");
+        assert_eq!(
+            Place::of(&song, four_four_bar * 2 + three_four_bar).readout(),
+            "004.01"
+        );
+        let seven_eighth_bar = (TICKS_PER_BEAT / 2) * 7;
+        assert_eq!(
+            Place::of(
+                &song,
+                four_four_bar * 2 + three_four_bar * 2 + seven_eighth_bar
+            )
+            .readout(),
+            "006.01"
+        );
+    }
+
+    #[test]
+    fn an_off_grid_meter_mark_starts_a_fresh_bar() {
+        let mut song = Song::default();
+        assert!(song.set_meter_mark(TICKS_PER_BEAT * 2, 3, 4));
+        assert_eq!(Place::of(&song, TICKS_PER_BEAT * 2).readout(), "002.01");
     }
 
     #[test]

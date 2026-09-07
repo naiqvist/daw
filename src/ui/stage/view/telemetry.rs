@@ -4,7 +4,7 @@
 //! Nothing here is fabricated and nothing runs on a timer. Each frame the
 //! view compares the core's state with the frame before and writes a
 //! line for what changed — a launch, a stop, a refusal, a chord, a door
-//! opened — stamped with the session's own clock. The trace is the
+//! opened — stamped with the view's measured uptime. The trace is the
 //! master meter's reading, one sample per frame while sound passes.
 //! Both are the view's memory, not the document's: a project reopened
 //! tomorrow starts with an empty log.
@@ -19,10 +19,32 @@ pub const LINES: usize = 40;
 /// How many trace samples the strip keeps.
 pub const TRACE: usize = 240;
 
+/// How urgently a logged fact should be read. This is assigned where
+/// the fact is observed, never inferred later from its prose.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Severity {
+    Info,
+    /// A transport or clip actually became live.
+    Live,
+    /// The machine refused something or left work requiring attention.
+    Attention,
+}
+
+impl Severity {
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Info => "INFO",
+            Self::Live => "LIVE",
+            Self::Attention => "ATTN",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Line {
-    /// Session seconds when it happened.
+    /// View uptime in seconds when it happened.
     pub at: f32,
+    pub severity: Severity,
     /// A short, capitalised verb: LAUNCH, STOP, REFUSED, KEY …
     pub verb: &'static str,
     /// The rest, in words.
@@ -92,12 +114,13 @@ impl Default for Telemetry {
 }
 
 impl Telemetry {
-    fn push(&mut self, verb: &'static str, what: impl Into<String>) {
+    fn push(&mut self, severity: Severity, verb: &'static str, what: impl Into<String>) {
         if self.lines.len() == LINES {
             self.lines.pop_front();
         }
         self.lines.push_back(Line {
             at: self.uptime,
+            severity,
             verb,
             what: what.into(),
         });
@@ -112,7 +135,7 @@ impl Telemetry {
             if let StageInput::Chord(mods, key) = input {
                 let chord = carve(*mods, *key);
                 self.last_chord = Some(chord.clone());
-                self.push("KEY", chord);
+                self.push(Severity::Info, "KEY", chord);
             }
         }
         let now = now.0;
@@ -120,28 +143,32 @@ impl Telemetry {
             let was = self.was.clone();
             if now.motion != was.motion {
                 match now.motion {
-                    Some(Motion::Rolling) => self.push("ROLL", ""),
-                    Some(Motion::Recording) => self.push("RECORD", ""),
-                    Some(Motion::Stopped) => self.push("STOP", ""),
+                    Some(Motion::Rolling) => self.push(Severity::Live, "ROLL", ""),
+                    Some(Motion::Recording) => self.push(Severity::Live, "RECORD", ""),
+                    Some(Motion::Stopped) => self.push(Severity::Info, "STOP", ""),
                     None => {}
                 }
             }
             for (track, (a, b)) in was.playing.iter().zip(now.playing.iter()).enumerate() {
                 if a != b {
                     match b {
-                        Some(scene) => {
-                            self.push("LAUNCH", format!("tr{:02} sc{:02}", track + 1, scene + 1))
-                        }
-                        None => self.push("SILENCE", format!("tr{:02}", track + 1)),
+                        Some(scene) => self.push(
+                            Severity::Live,
+                            "LAUNCH",
+                            format!("tr{:02} sc{:02}", track + 1, scene + 1),
+                        ),
+                        None => self.push(Severity::Info, "SILENCE", format!("tr{:02}", track + 1)),
                     }
                 }
             }
             if now.inside != was.inside {
                 match now.inside {
-                    Some((pattern, track)) => {
-                        self.push("ENTER", format!("clip {pattern:02} tr{:02}", track + 1))
-                    }
-                    None => self.push("LEAVE", "clip"),
+                    Some((pattern, track)) => self.push(
+                        Severity::Info,
+                        "ENTER",
+                        format!("clip {pattern:02} tr{:02}", track + 1),
+                    ),
+                    None => self.push(Severity::Info, "LEAVE", "clip"),
                 }
             }
             for (name, a, b) in [
@@ -154,35 +181,43 @@ impl Telemetry {
                 ("machine room", was.room, now.room),
             ] {
                 if a != b {
-                    self.push(if b { "OPEN" } else { "CLOSE" }, name);
+                    self.push(Severity::Info, if b { "OPEN" } else { "CLOSE" }, name);
                 }
             }
             if now.tracks != was.tracks {
-                self.push("TRACKS", format!("{} -> {}", was.tracks, now.tracks));
+                self.push(
+                    Severity::Info,
+                    "TRACKS",
+                    format!("{} -> {}", was.tracks, now.tracks),
+                );
             }
             if now.scenes != was.scenes {
-                self.push("SCENES", format!("{} -> {}", was.scenes, now.scenes));
+                self.push(
+                    Severity::Info,
+                    "SCENES",
+                    format!("{} -> {}", was.scenes, now.scenes),
+                );
             }
             if now.dirty && !was.dirty {
-                self.push("EDIT", "unsaved");
+                self.push(Severity::Attention, "EDIT", "unsaved");
             }
             if !now.dirty && was.dirty {
-                self.push("SAVED", "");
+                self.push(Severity::Info, "SAVED", "");
             }
             if now.refusal.is_some()
                 && now.refusal != was.refusal
                 && let Some(reason) = &now.refusal
             {
-                self.push("REFUSED", reason.clone());
+                self.push(Severity::Attention, "REFUSED", reason.clone());
             }
             if now.notice.is_some()
                 && now.notice != was.notice
                 && let Some(notice) = &now.notice
             {
-                self.push("NOTICE", notice.clone());
+                self.push(Severity::Attention, "NOTICE", notice.clone());
             }
         } else {
-            self.push("BOOT", "view up");
+            self.push(Severity::Info, "BOOT", "view up");
         }
         self.was = now;
         self.primed = true;
@@ -245,4 +280,22 @@ pub fn stamp(at: f32) -> String {
     let m = (at / 60.0).floor() as u32;
     let s = at - m as f32 * 60.0;
     format!("{m:02}:{s:04.1}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn severity_words_are_stable_console_columns() {
+        assert_eq!(Severity::Info.word(), "INFO");
+        assert_eq!(Severity::Live.word(), "LIVE");
+        assert_eq!(Severity::Attention.word(), "ATTN");
+    }
+
+    #[test]
+    fn uptime_is_fixed_width_to_a_tenth() {
+        assert_eq!(stamp(0.0), "00:00.0");
+        assert_eq!(stamp(65.25), "01:05.2");
+    }
 }

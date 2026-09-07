@@ -31,20 +31,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use daw::audio::AuditionBuffer;
-use daw::audio::bounce::{BounceFormat, BounceOptions, bounce_automated};
+use daw::audio::bounce::{BounceFormat, BounceOptions, bounce_automated_with_tempo_table};
 use daw::audio::material;
+use daw::audio::modulation::{ModEdit, WireEdit};
 use daw::audio::transport::TransportCmd;
 use daw::audio::{AudioApi, Engine, EngineConfig, StreamHealth};
 use daw::design::Polarity;
 use daw::install_stage_fonts;
 use daw::library::LibraryConfig;
+use daw::midi_input::{MidiEvent, MidiInput};
 use daw::params;
+use daw::record::{MidiRecorder, MidiTake, Recorder};
 use daw::shell;
 use daw::song_graph::{self, MASTER_METER, SongNodes};
+use daw::tempo::TempoTable;
 use daw::ui::prefs::{AudioBackend, STORAGE_KEY, UiPrefs};
 use daw::ui::stage::{
-    AudioDeviceChoice, AudioSettings, EngineState, Health, Level, SampleData, Stage, Stream,
-    UtilityHostRequest,
+    AudioDeviceChoice, AudioSettings, EngineState, Health, Level, SampleData, Stage, StageIntent,
+    Stream, UtilityHostRequest,
 };
 use daw::ui::theme::Theme;
 use eframe::egui;
@@ -135,6 +139,29 @@ struct App {
     /// a light page with dark scrollbars is two grounds on one screen.
     presentation: Option<(Polarity, daw::ui::tokens::Density, bool)>,
     last_autosave: std::time::Instant,
+    close: CloseInterlock,
+    close_error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum CloseInterlock {
+    #[default]
+    Idle,
+    StoppingTake,
+    Confirm,
+    Exit,
+}
+
+/// A clean idle project needs no modal. A live take must be closed before
+/// its newly dirty document can be judged; an already dirty project asks.
+fn close_interlock_for(dirty: bool, recording_busy: bool) -> Option<CloseInterlock> {
+    if recording_busy {
+        Some(CloseInterlock::StoppingTake)
+    } else if dirty {
+        Some(CloseInterlock::Confirm)
+    } else {
+        None
+    }
 }
 
 /// A render in flight: the fraction done, the flag that stops it, and
@@ -143,6 +170,31 @@ struct ExportJob {
     progress: Arc<Mutex<f32>>,
     cancel: Arc<AtomicBool>,
     done: Arc<Mutex<Option<Result<(), String>>>>,
+}
+
+struct ActiveRecording {
+    start_sample: u64,
+    start_block: u64,
+    last_block: u64,
+    last_sample: u64,
+    sample_rate: u32,
+    latency_frames: u64,
+    overruns_at_start: u64,
+    has_audio: bool,
+    errors: Vec<String>,
+}
+
+struct PendingFinish {
+    stop_block: u64,
+    wait_for_audio: bool,
+    deadline: std::time::Instant,
+    audio_started_at: u64,
+    sample_rate: u32,
+    latency_frames: u64,
+    overruns: u64,
+    elapsed_frames: u64,
+    midi_takes: Vec<MidiTake>,
+    errors: Vec<String>,
 }
 
 /// The engine, and everything needed to keep it agreeing with the stage.
@@ -157,6 +209,23 @@ struct Audio {
     /// legitimate state — the stage still runs, and says so — not a
     /// reason to refuse to start.
     engine: Option<Engine>,
+    /// The one consumer of the engine's capture ring. It stays beside the
+    /// engine for the life of that stream; taking it twice would split one
+    /// recording into two incomplete readers.
+    recorder: Option<Recorder>,
+    /// Hardware MIDI is green-zone input. The first available port is kept
+    /// open and retried when controllers are plugged in after launch.
+    midi_input: MidiInput,
+    midi_recorder: MidiRecorder,
+    midi_refreshed: std::time::Instant,
+    /// A capture in progress and, after Stop, the take waiting for one
+    /// callback boundary before its file is finalized.
+    recording: Option<ActiveRecording>,
+    finishing: Option<PendingFinish>,
+    /// Deepest compiled signal-path latency. Read before the schedule moves
+    /// to the callback, then combined with the stream latency when a take
+    /// begins so placement is compensated against what was heard.
+    schedule_latency_frames: u64,
     /// The backend that owns `engine`. The negotiated stream does not repeat
     /// it, so retaining the exact request is what makes diagnostics honest.
     api: AudioApi,
@@ -169,6 +238,10 @@ struct Audio {
     /// Whether the graph built was the arrangement's. A mode change is
     /// a rebuild even when the song has not changed.
     built_song: bool,
+    /// The arrangement schedule's immutable piecewise sample clock. Session
+    /// mode is deliberately `None`: launched clips keep their scalar,
+    /// clip-relative loop clock.
+    tempo: Option<TempoTable>,
     /// The mix revision whose values the live schedule is carrying.
     ///
     /// Separate from `built` because these two changes are answered in
@@ -207,22 +280,45 @@ struct Audio {
 /// How long a freshly started backend gets to deliver its first block
 /// before it is given up on.
 const FIRST_BLOCK_GRACE: std::time::Duration = std::time::Duration::from_millis(1500);
+const MIDI_REFRESH_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+const CAPTURE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 
 impl Audio {
     fn start(config: EngineConfig) -> Self {
         let api = config.api;
-        let (engine, trouble) = match Engine::start(config) {
+        let (mut engine, trouble) = match Engine::start(config) {
             Ok(engine) => (Some(engine), None),
             Err(error) => (None, Some(error.to_string())),
         };
+        let recorder = engine.as_mut().and_then(|engine| {
+            let info = engine.info();
+            engine
+                .take_capture()
+                .map(|input| Recorder::new(input, info.in_channels, info.sample_rate))
+        });
+        let mut midi_input = MidiInput::default();
+        midi_input.refresh();
+        if !midi_input.ports().is_empty()
+            && let Err(error) = midi_input.connect(0)
+        {
+            eprintln!("stage: {error}");
+        }
         Self {
             started: std::time::Instant::now(),
             fell_back: false,
             engine,
+            recorder,
+            midi_input,
+            midi_recorder: MidiRecorder::default(),
+            midi_refreshed: std::time::Instant::now(),
+            recording: None,
+            finishing: None,
+            schedule_latency_frames: 0,
             api,
             trouble,
             built: None,
             built_song: false,
+            tempo: None,
             mixed: None,
             nodes: None,
             rolling: false,
@@ -239,10 +335,18 @@ impl Audio {
     /// Replace only the live stream. An offline export belongs to the host,
     /// not that stream, and therefore survives an audio-device restart.
     fn restart(&mut self, config: EngineConfig) -> Result<Stream, String> {
+        if self.recording_busy() {
+            return Err("stop recording before restarting audio".to_owned());
+        }
         let api = config.api;
         self.engine = None;
+        self.recorder = None;
         match Engine::start(config) {
-            Ok(engine) => {
+            Ok(mut engine) => {
+                let info = engine.info();
+                self.recorder = engine
+                    .take_capture()
+                    .map(|input| Recorder::new(input, info.in_channels, info.sample_rate));
                 self.engine = Some(engine);
                 self.api = api;
                 self.trouble = None;
@@ -250,6 +354,7 @@ impl Audio {
                 self.fell_back = false;
                 self.built = None;
                 self.built_song = false;
+                self.tempo = None;
                 self.mixed = None;
                 self.nodes = None;
                 self.rolling = false;
@@ -257,6 +362,7 @@ impl Audio {
                 self.seeks = 0;
                 self.looped = None;
                 self.seek_block = None;
+                self.schedule_latency_frames = 0;
                 self.stream()
                     .ok_or_else(|| "audio stream opened without stream information".to_owned())
             }
@@ -275,20 +381,36 @@ impl Audio {
     fn serve_export(&mut self, stage: &mut Stage) {
         if let Some(request) = stage.take_export() {
             stage.export_taken();
-            let (spec, _) = song_graph::build_song(stage.song());
+            // The render thread owns one immutable document snapshot and the
+            // node addresses minted with its graph. Live playback calls the
+            // same evaluator below; only the clock feeding it differs.
+            let song = stage.song().clone();
+            let (spec, _) = song_graph::build_song(&song);
             let sample_rate = request.rate_hz.unwrap_or_else(|| {
                 self.engine
                     .as_ref()
                     .map_or(48_000, |engine| engine.info().sample_rate)
             });
-            let bpm = stage.song().bpm_at(request.start_tick, stage.bpm());
             let ticks = f64::from(daw::sequencing::TICKS_PER_BEAT as u32);
-            let musical_beats = (request.end_tick - request.start_tick) as f64 / ticks;
+            let bpm = song.base_bpm();
+            let timeline = TempoTable::build(&song, f64::from(sample_rate), bpm);
+            // BounceOptions::length_beats is the absolute render END, not
+            // the post-trim duration: the renderer runs the pre-roll from
+            // zero so effects and automation arrive at a later range with
+            // their real history, then discards `start_beats`.
+            // Tail is real time, so add it in samples and ask the map for the
+            // corresponding musical end instead of multiplying by whichever
+            // one tempo happened to be active at the selection edge.
+            let tail_samples =
+                (f64::from(request.tail_seconds) * f64::from(sample_rate)).round() as u64;
+            let end_sample = timeline
+                .sample_at(request.end_tick)
+                .saturating_add(tail_samples);
             let opts = BounceOptions {
                 sample_rate,
                 block_frames: 256,
                 bpm,
-                length_beats: musical_beats + f64::from(request.tail_seconds) * bpm / 60.0,
+                length_beats: timeline.beat_at_sample(end_sample),
                 start_beats: request.start_tick as f64 / ticks,
                 format: match request.format {
                     daw::ui::prefs::ExportFormat::Float32 => BounceFormat::Float32,
@@ -308,10 +430,11 @@ impl Audio {
                 (job.progress.clone(), job.cancel.clone(), job.done.clone());
             let path = request.path.clone();
             std::thread::spawn(move || {
-                let result = bounce_automated(
+                let result = bounce_automated_with_tempo_table(
                     &spec,
                     &opts,
                     &path,
+                    &timeline,
                     |_, _| {},
                     |fraction| {
                         if let Ok(mut slot) = progress.lock() {
@@ -459,6 +582,267 @@ impl Audio {
         })
     }
 
+    fn recording_busy(&self) -> bool {
+        self.recording.is_some() || self.finishing.is_some()
+    }
+
+    /// Controllers can appear after launch. Re-scan only while disconnected,
+    /// then open the first port deterministically; selection can grow into a
+    /// utility surface without changing the capture contract here.
+    fn refresh_midi(&mut self) {
+        if self.midi_input.connected().is_some()
+            || self.midi_refreshed.elapsed() < MIDI_REFRESH_EVERY
+        {
+            return;
+        }
+        self.midi_refreshed = std::time::Instant::now();
+        self.midi_input.refresh();
+        if !self.midi_input.ports().is_empty()
+            && let Err(error) = self.midi_input.connect(0)
+        {
+            eprintln!("stage: {error}");
+        }
+    }
+
+    fn begin_recording(&mut self, stage: &mut Stage) {
+        if self.finishing.is_some() {
+            stage.recording_failed("the previous take is still closing");
+            return;
+        }
+        let routes = stage.record_routes();
+        let requested_midi = stage.midi_record_tracks();
+        let Some(engine) = self.engine.as_mut() else {
+            stage.recording_failed("no audio clock");
+            return;
+        };
+        let info = engine.info();
+        let snapshot = engine.latest_block();
+        let start_sample = samples_at(engine, stage.tick(), stage.bpm(), self.tempo.as_ref());
+
+        let midi_tracks = if self.midi_input.connected().is_some() {
+            requested_midi.clone()
+        } else {
+            Vec::new()
+        };
+        if routes.is_empty() && midi_tracks.is_empty() {
+            stage.recording_failed(if requested_midi.is_empty() {
+                "nothing is armed"
+            } else {
+                "no MIDI input is connected"
+            });
+            return;
+        }
+
+        if !routes.is_empty() {
+            let Some(recorder) = self.recorder.as_mut() else {
+                stage.recording_failed("capture ring is unavailable");
+                return;
+            };
+            if let Err(error) = recorder.begin(&routes, &stage.recording_directory()) {
+                stage.recording_failed(error.to_string());
+                return;
+            }
+        }
+
+        // Messages waiting before the record edge are not part of this take.
+        let _ = self.midi_input.drain();
+        self.midi_recorder.begin(&midi_tracks);
+        if !routes.is_empty() {
+            engine.set_capturing(true);
+        }
+        let mut errors = Vec::new();
+        if !requested_midi.is_empty() && midi_tracks.is_empty() {
+            errors.push("MIDI: no input connected".to_owned());
+        }
+        let start_sample = if snapshot.block == 0 {
+            start_sample
+        } else {
+            snapshot.position.max(start_sample)
+        };
+        self.recording = Some(ActiveRecording {
+            start_sample,
+            start_block: snapshot.block,
+            last_block: snapshot.block,
+            last_sample: start_sample,
+            sample_rate: info.sample_rate,
+            latency_frames: info.latency_frames.unwrap_or(0) as u64 + self.schedule_latency_frames,
+            overruns_at_start: engine.capture_overruns(),
+            has_audio: !routes.is_empty(),
+            errors,
+        });
+        stage.recording_started(routes.len(), midi_tracks.len());
+    }
+
+    /// Drain controller messages at frame rate and pin their relative timing
+    /// to the newest engine block. The midir stamp preserves order within a
+    /// batch; the engine sample clock is the canonical timeline written into
+    /// the take.
+    fn pump_midi(&mut self) {
+        self.refresh_midi();
+        let events = self.midi_input.drain();
+        let looped = self.looped;
+        let Some(active) = self.recording.as_mut() else {
+            return;
+        };
+        if !self.midi_recorder.recording() {
+            return;
+        }
+        let Some(engine) = self.engine.as_mut() else {
+            return;
+        };
+        let snapshot = engine.latest_block();
+        // `BlockSnapshot::position` is already the transport position after
+        // the published block — the exact start of the next live block.
+        // Adding `frames` again stamps every controller message one complete
+        // hardware quantum late. Until one newer block arrives, retain the
+        // record edge so an old snapshot cannot place a pre-roll message.
+        let fresh = snapshot.block > active.start_block;
+        let now = if fresh {
+            snapshot.position
+        } else {
+            active.start_sample
+        };
+        let wrapped = snapshot.block > active.last_block && now < active.last_sample;
+        if snapshot.block > active.last_block {
+            if wrapped {
+                let (close_sample, resume_sample) = looped
+                    .filter(|(start, end)| *start < *end)
+                    .map_or((active.last_sample, now), |(start, end)| (end, start));
+                self.midi_recorder
+                    .discontinuity(close_sample, resume_sample);
+            }
+            active.last_block = snapshot.block;
+            active.last_sample = now;
+        }
+        if events.is_empty() {
+            return;
+        }
+        let newest_stamp = events.last().map_or(0, |(stamp, _)| *stamp);
+        for (stamp, event) in events {
+            let micros = newest_stamp.saturating_sub(stamp);
+            let behind = ((u128::from(micros) * u128::from(active.sample_rate)) / 1_000_000)
+                .min(u128::from(u64::MAX)) as u64;
+            let sample = if fresh {
+                midi_sample_behind(now, behind, looped, wrapped)
+            } else {
+                active.start_sample
+            };
+            match event {
+                MidiEvent::NoteOn { note, velocity } => {
+                    self.midi_recorder.note_on(sample, note, velocity)
+                }
+                MidiEvent::NoteOff { note } => self.midi_recorder.note_off(sample, note),
+            }
+        }
+    }
+
+    /// Cross the Stop edge. Audio capture is disabled immediately, but its
+    /// WAV stays open until a later callback block proves no producer can
+    /// still be writing the tail.
+    fn request_recording_finish(&mut self) {
+        let Some(active) = self.recording.take() else {
+            return;
+        };
+        let (stop_block, stop_sample, audio_started_at, overruns) = self
+            .engine
+            .as_mut()
+            .map(|engine| {
+                let snapshot = engine.latest_block();
+                if active.has_audio {
+                    engine.set_capturing(false);
+                }
+                (
+                    snapshot.block,
+                    // `pump_midi` already followed any loop/seek edge on this
+                    // frame, so this is the exact side of the discontinuity
+                    // on which still-held controller notes must close.
+                    active.last_sample,
+                    if active.has_audio {
+                        engine.capture_start()
+                    } else {
+                        active.start_sample
+                    },
+                    engine
+                        .capture_overruns()
+                        .saturating_sub(active.overruns_at_start),
+                )
+            })
+            .unwrap_or((0, active.start_sample, active.start_sample, 0));
+        let stop_sample = stop_sample.max(active.start_sample);
+        let wait_for_audio =
+            active.has_audio && self.recorder.as_ref().is_some_and(Recorder::recording);
+        self.finishing = Some(PendingFinish {
+            stop_block,
+            wait_for_audio,
+            deadline: std::time::Instant::now() + CAPTURE_DRAIN_TIMEOUT,
+            audio_started_at,
+            sample_rate: active.sample_rate,
+            latency_frames: active.latency_frames,
+            overruns,
+            elapsed_frames: stop_sample.saturating_sub(active.start_sample),
+            midi_takes: self.midi_recorder.finish(stop_sample),
+            errors: active.errors,
+        });
+    }
+
+    fn finish_recording_if_ready(&mut self, stage: &mut Stage, force: bool) {
+        let Some(pending) = self.finishing.as_ref() else {
+            return;
+        };
+        if pending.wait_for_audio
+            && !force
+            && std::time::Instant::now() < pending.deadline
+            && self
+                .engine
+                .as_mut()
+                .is_some_and(|engine| engine.latest_block().block <= pending.stop_block)
+        {
+            return;
+        }
+        if let Some(recorder) = self.recorder.as_mut() {
+            recorder.poll();
+        }
+        let pending = self.finishing.take().expect("finish checked above");
+        let mut frames = 0;
+        let (audio_takes, record_errors) = if pending.wait_for_audio {
+            if let Some(recorder) = self.recorder.as_mut() {
+                frames = recorder.frames();
+                recorder.finish()
+            } else {
+                (Vec::new(), Vec::new())
+            }
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let mut errors = pending.errors;
+        errors.extend(record_errors.into_iter().map(|error| error.to_string()));
+        stage.commit_recording(
+            audio_takes,
+            pending.midi_takes,
+            pending.audio_started_at,
+            pending.sample_rate,
+            pending.latency_frames,
+            pending.overruns,
+            frames.max(pending.elapsed_frames),
+            errors,
+        );
+    }
+
+    fn drive_recording(&mut self, stage: &mut Stage) {
+        self.pump_midi();
+        match (stage.recording(), self.recording.is_some()) {
+            (true, false) => self.begin_recording(stage),
+            (false, true) => self.request_recording_finish(),
+            _ => {}
+        }
+        if self.recording.is_some()
+            && let Some(recorder) = self.recorder.as_mut()
+        {
+            recorder.poll();
+        }
+        self.finish_recording_if_ready(stage, false);
+    }
+
     /// Make the engine agree with the stage, then hand back what it heard.
     /// A backend that opened but never delivers is not an engine. JACK
     /// through PipeWire's shim has been seen to do exactly that — the
@@ -467,7 +851,7 @@ impl Audio {
     /// grace period for its first block, and then the engine is started
     /// again on ALSA, once. Everything the host remembered about the
     /// old engine is forgotten with it, so the schedule is sent afresh.
-    fn fall_back_if_dead(&mut self) {
+    fn fall_back_if_dead(&mut self, stage: &mut Stage) {
         if self.fell_back {
             return;
         }
@@ -477,6 +861,12 @@ impl Audio {
         if engine.latest_block().block > 0 || self.started.elapsed() < FIRST_BLOCK_GRACE {
             return;
         }
+        if self.recording.is_some() {
+            self.pump_midi();
+            stage.recording_failed("audio engine stopped; closing take");
+            self.request_recording_finish();
+        }
+        self.finish_recording_if_ready(stage, true);
         self.fell_back = true;
         eprintln!(
             "stage: the audio backend delivered no blocks in {:.1} s — starting again on ALSA",
@@ -494,9 +884,14 @@ impl Audio {
             api: daw::audio::AudioApi::Alsa,
             ..EngineConfig::default()
         };
+        self.recorder = None;
         match Engine::start(config) {
-            Ok(engine) => {
+            Ok(mut engine) => {
                 eprintln!("stage: the ALSA engine is up: {:?}", engine.info());
+                let info = engine.info();
+                self.recorder = engine
+                    .take_capture()
+                    .map(|input| Recorder::new(input, info.in_channels, info.sample_rate));
                 self.engine = Some(engine);
                 self.api = AudioApi::Alsa;
                 self.trouble = None;
@@ -508,17 +903,20 @@ impl Audio {
         }
         self.started = std::time::Instant::now();
         self.built = None;
+        self.built_song = false;
+        self.tempo = None;
         self.mixed = None;
         self.nodes = None;
         self.rolling = false;
         self.seeks = 0;
         self.seek_block = None;
         self.looped = None;
+        self.schedule_latency_frames = 0;
     }
 
     fn follow(&mut self, stage: &mut Stage) {
         self.serve_export(stage);
-        self.fall_back_if_dead();
+        self.fall_back_if_dead(stage);
         // Told every frame rather than once: a stage that opened without
         // an engine and one whose engine went away are the same state,
         // and the surface should say so either way — and a block dropped
@@ -528,6 +926,8 @@ impl Audio {
         stage.set_stream(self.stream());
         self.serve_cutting_room(stage);
         let Some(engine) = &mut self.engine else {
+            stage.clear_modulation_readings();
+            self.drive_recording(stage);
             return;
         };
         engine.collect_trash();
@@ -537,21 +937,57 @@ impl Audio {
         // derived from the song afterwards.
         if self.built != Some(stage.revision()) || self.built_song != stage.song_mode() {
             let info = engine.info();
-            let (spec, nodes) = if stage.song_mode() {
+            let song_mode = stage.song_mode();
+            let mode_changed = self.built_song != song_mode;
+            let base_bpm = stage.song().base_bpm();
+            let timeline = song_mode
+                .then(|| TempoTable::build(stage.song(), f64::from(info.sample_rate), base_bpm));
+            let timeline_changed = self.tempo.as_ref() != timeline.as_ref();
+            let (spec, nodes) = if song_mode {
                 song_graph::build_song(stage.song())
             } else {
                 song_graph::build(stage.song(), stage.playing())
             };
-            self.built_song = stage.song_mode();
-            match spec.compile(info.sample_rate, info.max_frames) {
-                Ok(schedule) => match engine.set_schedule(Box::new(schedule)) {
-                    Ok(()) => {
-                        self.nodes = Some(nodes);
-                        self.built = Some(stage.revision());
-                        self.trouble = None;
+            let compiled = match timeline.as_ref() {
+                Some(timeline) => spec.compile_with_tempo_table(
+                    info.sample_rate,
+                    info.max_frames,
+                    base_bpm,
+                    timeline,
+                ),
+                None => spec.compile_at_tempo(info.sample_rate, info.max_frames, stage.bpm()),
+            };
+            match compiled {
+                Ok(schedule) => {
+                    self.schedule_latency_frames = schedule.latency() as u64;
+                    match engine.set_schedule(Box::new(schedule)) {
+                        Ok(()) => {
+                            self.nodes = Some(nodes);
+                            self.built = Some(stage.revision());
+                            self.built_song = song_mode;
+                            self.tempo = timeline;
+                            // A new map changes the meaning of the transport's
+                            // absolute sample. Relocate once at the schedule
+                            // seam so the musician's tick stays put; ordinary
+                            // graph rebuilds under an unchanged map do not seek.
+                            if mode_changed || timeline_changed {
+                                let snapshot = engine.latest_block();
+                                let samples = samples_at(
+                                    engine,
+                                    stage.tick(),
+                                    stage.bpm(),
+                                    self.tempo.as_ref(),
+                                );
+                                if engine.transport(TransportCmd::Seek(samples)) {
+                                    self.seeks = stage.seeks();
+                                    self.seek_block = Some(snapshot.block);
+                                }
+                            }
+                            self.trouble = None;
+                        }
+                        Err(error) => self.trouble = Some(error.to_string()),
                     }
-                    Err(error) => self.trouble = Some(error.to_string()),
-                },
+                }
                 Err(error) => self.trouble = Some(format!("graph refused: {error}")),
             }
         }
@@ -565,69 +1001,101 @@ impl Audio {
         // compiler reads them from the song), so this only ever has to
         // catch up the changes a rebuild did not.
         if self.mixed != Some(stage.mix_revision()) {
+            let mut delivered = true;
             if let Some(nodes) = &self.nodes {
                 for (index, output) in nodes.outputs.iter().enumerate() {
                     let (Some(node), Some(track)) = (output, stage.song().tracks.get(index)) else {
                         continue;
                     };
-                    engine.set_param(*node, params::pan::GAIN, track.volume);
-                    engine.set_param(*node, params::pan::PAN, track.pan);
+                    delivered &= engine.set_param(*node, params::pan::GAIN, track.volume);
+                    delivered &= engine.set_param(*node, params::pan::PAN, track.pan);
                 }
+                delivered &=
+                    engine.set_param(nodes.master, params::mixer::GAIN, stage.song().master);
                 // Every knob on every device that reached the graph: a
                 // turn is a letter, not a rebuild. Sent whole rather than
                 // as a diff, because a diff needs a memory of what the
                 // engine was last told and the song itself is that.
-                for (id, node) in &nodes.devices {
-                    if let Some(device) = stage.song().device(*id) {
+                for (id, node) in nodes.device_letter_nodes() {
+                    if let Some(device) = stage.song().device(id) {
                         for (param, value) in &device.overrides {
-                            engine.set_param(*node, *param, *value);
+                            delivered &= engine.set_param(node, *param, *value);
                         }
                     }
                 }
+                // Source and response changes share the stage's live-value
+                // revision with faders and device knobs. Send each complete
+                // value as one idempotent letter: if the modulation ring is
+                // full, `mixed` stays dirty and the authoritative Song state
+                // is retried in full next frame.
+                for source in &stage.song().modulators {
+                    delivered &= engine.set_modulation(ModEdit::Source {
+                        id: source.id,
+                        kind: source.kind,
+                    });
+                }
+                for wire in &stage.song().mod_wires {
+                    delivered &= engine.set_modulation(ModEdit::Wire(WireEdit {
+                        id: wire.id,
+                        chain: wire.chain(),
+                        enabled: wire.enabled,
+                        solo: wire.solo,
+                    }));
+                }
             }
-            self.mixed = Some(stage.mix_revision());
+            if delivered {
+                self.mixed = Some(stage.mix_revision());
+            }
         }
 
         // Tempo before motion: a transport told to roll should already
         // know how fast.
         let bpm = stage.bpm();
         if bpm != self.bpm {
-            engine.transport(TransportCmd::SetTempo(bpm));
-            self.bpm = bpm;
+            if engine.transport(TransportCmd::SetTempo(bpm)) {
+                self.bpm = bpm;
+            }
         }
 
         // Where the stage moved its own clock — a return to the top —
         // the engine is sent there too, and its position is not read
         // back until a block written after the seek has arrived.
         let snapshot = engine.latest_block();
-        if stage.seeks() != self.seeks {
-            let samples = samples_at(engine, stage.tick(), bpm);
-            engine.transport(TransportCmd::Seek(samples));
-            self.seeks = stage.seeks();
-            self.seek_block = Some(snapshot.block);
+        let seeked = stage.seeks() != self.seeks;
+        if seeked {
+            let samples = samples_at(engine, stage.tick(), bpm, self.tempo.as_ref());
+            if engine.transport(TransportCmd::Seek(samples)) {
+                self.seeks = stage.seeks();
+                self.seek_block = Some(snapshot.block);
+            }
         }
 
         // The brace: the engine loops the song's timeline while the
         // song plays with the brace on, and runs free otherwise.
-        let looped = stage
-            .loop_region()
-            .map(|(start, end)| (samples_at(engine, start, bpm), samples_at(engine, end, bpm)));
+        let looped = stage.loop_region().map(|(start, end)| {
+            (
+                samples_at(engine, start, bpm, self.tempo.as_ref()),
+                samples_at(engine, end, bpm, self.tempo.as_ref()),
+            )
+        });
         if looped != self.looped {
-            engine.transport(match looped {
+            if engine.transport(match looped {
                 Some((start, end)) => TransportCmd::SetLoop { start, end },
                 None => TransportCmd::ClearLoop,
-            });
-            self.looped = looped;
+            }) {
+                self.looped = looped;
+            }
         }
 
         let rolling = stage.rolling();
         if rolling != self.rolling {
-            engine.transport(if rolling {
+            if engine.transport(if rolling {
                 TransportCmd::Play
             } else {
                 TransportCmd::Stop
-            });
-            self.rolling = rolling;
+            }) {
+                self.rolling = rolling;
+            }
         }
 
         // The playhead is what SOUNDED rather than what was counted: the
@@ -696,13 +1164,50 @@ impl Audio {
             }
         }
         stage.set_telemetry(&self.telemetry);
+        // The callback's readings are the only truthful scopes: sources are
+        // in Song order, while compiled wires return their stable ids because
+        // an unresolved destination may leave a hole in document order.
+        stage.set_modulation_readings(
+            &snapshot.mod_sources,
+            &snapshot.mod_wire_ids,
+            &snapshot.mod_wires,
+        );
+        self.drive_recording(stage);
     }
+}
+
+/// Move a controller timestamp backwards on the musical sample clock.
+///
+/// Ordinarily this is saturating subtraction. When the newest callback block
+/// crossed an active loop boundary, however, an older event in the same MIDI
+/// batch belongs at the loop tail rather than before the loop head. Keep the
+/// result inside the brace and permit batches wider than one pass by reducing
+/// the distance modulo the loop span.
+fn midi_sample_behind(now: u64, behind: u64, looped: Option<(u64, u64)>, wrapped: bool) -> u64 {
+    let Some((start, end)) = looped.filter(|(start, end)| wrapped && start < end) else {
+        return now.saturating_sub(behind);
+    };
+    if now < start || now >= end {
+        return now.saturating_sub(behind);
+    }
+    let span = end - start;
+    let offset = now - start;
+    let back = behind % span;
+    let mapped = if back <= offset {
+        offset - back
+    } else {
+        span - (back - offset)
+    };
+    start + mapped
 }
 
 /// A song tick as a sample position, at the tempo the engine is running.
 /// The same arithmetic the engine's own time map does, done here once so
 /// a seek lands where the stage's readout says it is.
-fn samples_at(engine: &Engine, tick: usize, bpm: f64) -> u64 {
+fn samples_at(engine: &Engine, tick: usize, bpm: f64, tempo: Option<&TempoTable>) -> u64 {
+    if let Some(tempo) = tempo {
+        return tempo.sample_at(tick);
+    }
     let beats = tick as f64 / daw::sequencing::TICKS_PER_BEAT as f64;
     let sample_rate = f64::from(engine.info().sample_rate);
     (beats * 60.0 / bpm.max(1.0) * sample_rate).round() as u64
@@ -747,6 +1252,8 @@ impl App {
             audio,
             presentation: None,
             last_autosave: std::time::Instant::now(),
+            close: CloseInterlock::Idle,
+            close_error: None,
         }
     }
 
@@ -803,6 +1310,13 @@ impl App {
     }
 
     fn autosave_recovery(&mut self) {
+        // Discard means the recovery copy is deliberately gone. The close
+        // frame still reaches this method after the modal handles D, so an
+        // exit-approved dirty song must not recreate the sidecar it just
+        // removed.
+        if self.close == CloseInterlock::Exit {
+            return;
+        }
         if !self.stage.is_dirty() {
             self.last_autosave = std::time::Instant::now();
             return;
@@ -817,6 +1331,74 @@ impl App {
             eprintln!("stage: recovery failed — {error}");
         }
         self.last_autosave = std::time::Instant::now();
+    }
+
+    fn show_close_interlock(&mut self, ui: &mut egui::Ui) {
+        let stopping = self.close == CloseInterlock::StoppingTake;
+        let (save, discard, cancel) = ui.input_mut(|input| {
+            let cancel = input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+                || input.consume_key(egui::Modifiers::NONE, egui::Key::C);
+            let save = !stopping && input.consume_key(egui::Modifiers::NONE, egui::Key::S);
+            let discard = !stopping && input.consume_key(egui::Modifiers::NONE, egui::Key::D);
+            (save, discard, cancel)
+        });
+
+        ui.painter()
+            .rect_filled(ui.max_rect(), 0.0, ui.visuals().panel_fill);
+        ui.with_layout(
+            egui::Layout::top_down(egui::Align::Center).with_main_align(egui::Align::Center),
+            |ui| {
+                ui.heading(if stopping {
+                    "CLOSING RECORDED TAKE"
+                } else {
+                    "UNSAVED PROJECT"
+                });
+                ui.add_space(8.0);
+                ui.label(if stopping {
+                    "Waiting for the audio callback to release the final block."
+                } else {
+                    "S  SAVE    D  DISCARD    C / ESC  CANCEL"
+                });
+                if let Some(error) = &self.close_error {
+                    ui.add_space(8.0);
+                    ui.colored_label(
+                        ui.visuals().error_fg_color,
+                        format!("SAVE FAILED · {error}"),
+                    );
+                }
+            },
+        );
+
+        if cancel {
+            self.close = CloseInterlock::Idle;
+            self.close_error = None;
+        } else if save {
+            match self.stage.save() {
+                Ok(()) => {
+                    self.close = CloseInterlock::Exit;
+                    self.close_error = None;
+                }
+                Err(error) => {
+                    // Failed save is never approval to lose the project.
+                    self.close = CloseInterlock::Confirm;
+                    self.close_error = Some(error);
+                }
+            }
+        } else if discard {
+            self.stage.discard_recovery();
+            self.close = CloseInterlock::Exit;
+            self.close_error = None;
+        }
+    }
+
+    fn advance_close_interlock(&mut self) {
+        if self.close == CloseInterlock::StoppingTake && !self.audio.recording_busy() {
+            self.close = if self.stage.is_dirty() {
+                CloseInterlock::Confirm
+            } else {
+                CloseInterlock::Exit
+            };
+        }
     }
 }
 
@@ -878,9 +1460,14 @@ impl shell::Host for App {
             self.presentation = Some(presentation);
         }
 
-        self.stage.show(ui);
-        self.serve_utility_request();
+        if self.close == CloseInterlock::Idle {
+            self.stage.show(ui);
+            self.serve_utility_request();
+        } else {
+            self.show_close_interlock(ui);
+        }
         self.audio.follow(&mut self.stage);
+        self.advance_close_interlock();
         self.autosave_recovery();
         // A meter that only moves when the mouse does is not a meter.
         ui.ctx().request_repaint();
@@ -893,5 +1480,73 @@ impl shell::Host for App {
             self.stage.library_preferences(),
         );
         storage.set(daw::library::CACHE_STORAGE_KEY, self.stage.library_cache());
+    }
+
+    fn close_requested(&mut self) -> bool {
+        if self.close == CloseInterlock::Exit {
+            return true;
+        }
+        if self.close != CloseInterlock::Idle {
+            return false;
+        }
+        let Some(interlock) = close_interlock_for(
+            self.stage.is_dirty(),
+            self.stage.recording() || self.audio.recording_busy(),
+        ) else {
+            return true;
+        };
+        if interlock == CloseInterlock::StoppingTake && self.stage.recording() {
+            let _ = self.stage.apply(StageIntent::ToggleRecord);
+        }
+        self.close = interlock;
+        self.close_error = None;
+        false
+    }
+
+    fn wants_exit(&self) -> bool {
+        self.close == CloseInterlock::Exit
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clean_idle_close_needs_no_interlock() {
+        assert_eq!(close_interlock_for(false, false), None);
+    }
+
+    #[test]
+    fn dirty_close_confirms_and_recording_closes_first() {
+        assert_eq!(
+            close_interlock_for(true, false),
+            Some(CloseInterlock::Confirm)
+        );
+        assert_eq!(
+            close_interlock_for(false, true),
+            Some(CloseInterlock::StoppingTake)
+        );
+    }
+
+    #[test]
+    fn midi_batch_timestamps_walk_back_across_the_loop_tail() {
+        let looped = Some((1_000, 2_000));
+        assert_eq!(midi_sample_behind(1_010, 5, looped, true), 1_005);
+        assert_eq!(
+            midi_sample_behind(1_010, 20, looped, true),
+            1_990,
+            "a pre-wrap event was placed before the loop head"
+        );
+        assert_eq!(
+            midi_sample_behind(1_010, 20, looped, false),
+            990,
+            "an ordinary first pass was incorrectly wrapped"
+        );
+        assert_eq!(
+            midi_sample_behind(1_010, 1_020, looped, true),
+            1_990,
+            "a batch wider than one loop did not retain its musical position"
+        );
     }
 }

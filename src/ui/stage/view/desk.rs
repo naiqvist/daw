@@ -1,7 +1,7 @@
 //! The desk block: the console's own rails, measured every frame and
 //! until now shown nowhere. Four group buses, two returns and the mix,
-//! each a hairline meter with its held peak — the one instrument on the
-//! session that reads the desk rather than the song.
+//! each a stereo pair of hairline meters with its held peaks — the one
+//! instrument on the session that reads the desk rather than the song.
 //!
 //! It stands at the head of the right column, over the log, because the
 //! two are the same kind of thing: what the machine is doing, said in
@@ -16,28 +16,81 @@ use eframe::egui;
 /// One rail's row.
 /// @tune 8..24 px
 const ROW_H: f32 = 14.0;
+/// A real division of the desk: group buses, returns, or the main mix.
+/// @tune 8..24 px
+const GROUP_H: f32 = 12.0;
 const TYPE_PX: f32 = 11.0;
 /// The gap under the block, before the log's own header.
 /// @tune 0..40 px
-const FOOT: f32 = 28.0;
+const FOOT: f32 = 20.0;
 /// The meter's bar, inside its row.
 /// @tune 2..12 px
-const BAR_H: f32 = 4.0;
+const BAR_H: f32 = 3.0;
 
-/// The rails, in the graph's slot order, with the name each goes by.
-const RAILS: [(&str, usize); vitals::DESK_METERS] = [
-    ("bus 1", vitals::BUS_METER),
-    ("bus 2", vitals::BUS_METER + 1),
-    ("bus 3", vitals::BUS_METER + 2),
-    ("bus 4", vitals::BUS_METER + 3),
-    ("ret a", vitals::RETURN_METER),
-    ("ret b", vitals::RETURN_METER + 1),
-    ("mix", vitals::MIX_METER),
+const BUSES: [(&str, usize); 4] = [
+    ("01", vitals::BUS_METER),
+    ("02", vitals::BUS_METER + 1),
+    ("03", vitals::BUS_METER + 2),
+    ("04", vitals::BUS_METER + 3),
 ];
+const RETURNS: [(&str, usize); 2] = [("A", vitals::RETURN_METER), ("B", vitals::RETURN_METER + 1)];
+const MAIN: [(&str, usize); 1] = [("MIX", vitals::MIX_METER)];
+
+struct Group {
+    name: &'static str,
+    rails: &'static [(&'static str, usize)],
+}
+
+const GROUPS: [Group; 3] = [
+    Group {
+        name: "GROUP BUS",
+        rails: &BUSES,
+    },
+    Group {
+        name: "RETURNS",
+        rails: &RETURNS,
+    },
+    Group {
+        name: "MAIN",
+        rails: &MAIN,
+    },
+];
+
+fn meter_lane(
+    painter: &egui::Painter,
+    lane: egui::Rect,
+    level: f32,
+    peak: f32,
+    c: palette::Colours,
+) {
+    painter.rect_filled(lane, 0.0, c.rule);
+    if level > 0.0 {
+        let fill = egui::Rect::from_min_max(
+            lane.min,
+            egui::pos2(
+                lane.min.x + lane.width() * level.clamp(0.0, 1.0),
+                lane.max.y,
+            ),
+        );
+        painter.rect_filled(fill, 0.0, if level >= 1.0 { c.alert } else { c.nominal });
+    }
+    if peak > 0.0 {
+        let x = lane.min.x + lane.width() * peak.clamp(0.0, 1.0);
+        painter.line_segment(
+            [
+                egui::pos2(x, lane.min.y - 1.0),
+                egui::pos2(x, lane.max.y + 1.0),
+            ],
+            egui::Stroke::new(1.0, if peak >= 1.0 { c.alert } else { c.fg }),
+        );
+    }
+}
 
 /// The block's height, so the log knows where it may start.
 pub(super) fn height() -> f32 {
-    RAILS.len() as f32 * crate::tune!(ROW_H) + FOOT
+    vitals::DESK_METERS as f32 * crate::tune!(ROW_H)
+        + GROUPS.len() as f32 * crate::tune!(GROUP_H)
+        + FOOT
 }
 
 impl super::super::Stage {
@@ -49,10 +102,30 @@ impl super::super::Stage {
         let font = egui::FontId::new(TYPE_PX, egui::FontFamily::Name(PROFONT.into()));
         let ch = TYPE_PX * 0.6;
         let top = heads::master_rect(field).max.y + 12.0;
+        let master = heads::master_rect(field);
+        let bar_x0 = x0 + ch * 5.0;
+        let pair_gap = ch * 1.5;
+        let lane_w = ((x1 - bar_x0 - pair_gap) * 0.5).max(1.0);
+        let lane_left_x = bar_x0;
+        let lane_right_x = bar_x0 + lane_w + pair_gap;
         painter.text(
             egui::pos2(x0, top - 4.0),
             egui::Align2::LEFT_BOTTOM,
             "DESK",
+            font.clone(),
+            c.label,
+        );
+        painter.text(
+            egui::pos2(lane_left_x + lane_w * 0.5, top - 4.0),
+            egui::Align2::CENTER_BOTTOM,
+            "L",
+            font.clone(),
+            c.label,
+        );
+        painter.text(
+            egui::pos2(lane_right_x + lane_w * 0.5, top - 4.0),
+            egui::Align2::CENTER_BOTTOM,
+            "R",
             font.clone(),
             c.label,
         );
@@ -61,47 +134,57 @@ impl super::super::Stage {
             [egui::pos2(x0, seam), egui::pos2(x1, seam)],
             egui::Stroke::new(1.0, c.rule),
         );
-        // The bar runs from after the longest name to the column's edge,
-        // so every rail's meter starts and ends on the same two lines.
-        let bar_x0 = x0 + ch * 7.0;
-        for (i, (name, slot)) in RAILS.iter().enumerate() {
-            let y = top + (i as f32 + 0.5) * crate::tune!(ROW_H);
-            let reading = self.meters.rail(*slot);
-            let level = reading.level.left.max(reading.level.right);
-            let peak = reading.peak.left.max(reading.peak.right);
+        // The block belongs to the pinned master column. Join its head
+        // to that real column rule instead of leaving MASTER floating at
+        // the edge of an unrelated-looking list.
+        painter.line_segment(
+            [egui::pos2(x1, seam), egui::pos2(master.center().x, seam)],
+            egui::Stroke::new(1.0, c.edge),
+        );
+        // The same two columns carry every rail. No max-of-stereo
+        // collapse: a left/right imbalance remains visible all the way
+        // through the four buses, the two returns, and the main mix.
+        let mut y = top;
+        for group in GROUPS {
+            let gy = y + crate::tune!(GROUP_H) * 0.5;
             painter.text(
-                egui::pos2(x0, y),
+                egui::pos2(x0, gy),
                 egui::Align2::LEFT_CENTER,
-                *name,
+                group.name,
                 font.clone(),
-                if level > 0.0 { c.fg } else { c.dim },
+                c.label,
             );
-            let lane = egui::Rect::from_min_max(
-                egui::pos2(bar_x0, y - BAR_H * 0.5),
-                egui::pos2(x1, y + BAR_H * 0.5),
+            let rule_x0 = x0 + (group.name.chars().count() as f32 + 2.5) * ch;
+            painter.line_segment(
+                [egui::pos2(rule_x0, gy), egui::pos2(x1, gy)],
+                egui::Stroke::new(1.0, c.rule),
             );
-            painter.rect_filled(lane, 0.0, c.rule);
-            if level > 0.0 {
-                let fill = egui::Rect::from_min_max(
-                    lane.min,
-                    egui::pos2(
-                        lane.min.x + lane.width() * level.clamp(0.0, 1.0),
-                        lane.max.y,
-                    ),
+            y += crate::tune!(GROUP_H);
+            for &(name, slot) in group.rails {
+                let reading = self.meters.rail(slot);
+                let row = egui::Rect::from_min_max(
+                    egui::pos2(x0, y),
+                    egui::pos2(x1, y + crate::tune!(ROW_H)),
                 );
-                painter.rect_filled(fill, 0.0, if level >= 1.0 { c.alert } else { c.nominal });
-            }
-            // The held peak: a tick standing on the lane where the rail
-            // last got to, alert once it has reached the top.
-            if peak > 0.0 {
-                let x = lane.min.x + lane.width() * peak.clamp(0.0, 1.0);
-                painter.line_segment(
-                    [
-                        egui::pos2(x, lane.min.y - 1.0),
-                        egui::pos2(x, lane.max.y + 1.0),
-                    ],
-                    egui::Stroke::new(1.0, if peak >= 1.0 { c.alert } else { c.fg }),
+                let active = reading.level.left.max(reading.level.right) > 0.0;
+                painter.text(
+                    egui::pos2(x0, row.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    name,
+                    font.clone(),
+                    if active { c.fg } else { c.dim },
                 );
+                for (lane_x, level, peak) in [
+                    (lane_left_x, reading.level.left, reading.peak.left),
+                    (lane_right_x, reading.level.right, reading.peak.right),
+                ] {
+                    let lane = egui::Rect::from_center_size(
+                        egui::pos2(lane_x + lane_w * 0.5, row.center().y),
+                        egui::vec2(lane_w, crate::tune!(BAR_H)),
+                    );
+                    meter_lane(painter, lane, level, peak, c);
+                }
+                y += crate::tune!(ROW_H);
             }
         }
     }

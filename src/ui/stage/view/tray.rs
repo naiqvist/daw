@@ -8,11 +8,12 @@
 //! design alphabet, lifted through the console's palette
 //! (`palette::lift`) so the grid sits in the same room as the chassis.
 //!
-//! A tray with no clip under the cursor is quiet, and says so with a
-//! label rather than a blank: `clip --`.
+//! A tray with no clip under the cursor is quiet, but remains a pane: its
+//! recessed body stays on the glass and says `clip --` / `no clip at
+//! cursor`. Absence does not make half the console look unfinished.
 
 use super::heads::{GUTTER, MARGIN};
-use super::palette;
+use super::{chassis, palette};
 use crate::PROFONT;
 use crate::sequencing::{
     GRID_COLUMNS as PATTERN_COLS, PATTERN_STEP_TICKS, PATTERN_STEPS, TICKS_PER_BEAT,
@@ -32,6 +33,12 @@ const WIDE: f32 = 1080.0;
 /// The tray's own label row.
 pub(super) const LABEL_H: f32 = 18.0;
 pub(super) const TYPE_PX: f32 = 12.0;
+/// The quiet editor keeps the same inspector/content split as a live one.
+/// @tune 160..420 px
+const QUIET_INSPECTOR_W: f32 = 260.0;
+/// The quiet pane's one header row.
+/// @tune 14..40 px
+const QUIET_HEAD_H: f32 = 26.0;
 
 pub(super) fn tray_h() -> f32 {
     crate::tune!(TRAY_H)
@@ -45,16 +52,23 @@ impl super::super::Stage {
         let c = palette::colours();
         let font = egui::FontId::new(TYPE_PX, egui::FontFamily::Name(PROFONT.into()));
         let left = tray.min.x + crate::tune!(MARGIN) + crate::tune!(GUTTER);
+        let right = tray.max.x - crate::tune!(MARGIN);
         let label_y = tray.min.y + LABEL_H * 0.5;
         // The seam between the lattice and the tray.
         let y = tray.min.y.round() - 0.5;
         ui.painter().line_segment(
-            [
-                egui::pos2(left, y),
-                egui::pos2(tray.max.x - crate::tune!(MARGIN), y),
-            ],
+            [egui::pos2(left, y), egui::pos2(right, y)],
             egui::Stroke::new(1.0, c.rule),
         );
+        // The editor is a standing instrument, whether or not the
+        // addressed slot can feed it. Its body is the same recessed
+        // material as the console's other instrument rails; the values
+        // inside are still honestly absent.
+        let body = egui::Rect::from_min_max(
+            egui::pos2(left, tray.min.y + LABEL_H),
+            egui::pos2(right, tray.max.y - 1.0),
+        );
+        chassis::instrument_rail(ui.painter(), body);
 
         let Some(shown) = self.clip_in_view() else {
             ui.painter().text(
@@ -66,6 +80,59 @@ impl super::super::Stage {
             );
             ui.painter().text(
                 egui::pos2(left + TYPE_PX * 0.6 * 5.0, label_y),
+                egui::Align2::LEFT_CENTER,
+                "--",
+                font.clone(),
+                c.dim,
+            );
+            ui.painter().text(
+                egui::pos2(right, label_y),
+                egui::Align2::RIGHT_CENTER,
+                "NO CLIP AT CURSOR",
+                font.clone(),
+                c.dim,
+            );
+            let split_x =
+                (body.min.x + crate::tune!(QUIET_INSPECTOR_W)).min(body.max.x - TYPE_PX * 12.0);
+            let header_y = body.min.y + crate::tune!(QUIET_HEAD_H) * 0.5;
+            let header_seam = (body.min.y + crate::tune!(QUIET_HEAD_H)).round() - 0.5;
+            ui.painter().line_segment(
+                [
+                    egui::pos2(body.min.x, header_seam),
+                    egui::pos2(body.max.x, header_seam),
+                ],
+                egui::Stroke::new(1.0, c.rule),
+            );
+            ui.painter().line_segment(
+                [
+                    egui::pos2(split_x.round() - 0.5, body.min.y),
+                    egui::pos2(split_x.round() - 0.5, body.max.y),
+                ],
+                egui::Stroke::new(1.0, c.rule),
+            );
+            ui.painter().text(
+                egui::pos2(body.min.x + 10.0, header_y),
+                egui::Align2::LEFT_CENTER,
+                "TRIG",
+                font.clone(),
+                c.label,
+            );
+            ui.painter().text(
+                egui::pos2(body.min.x + 10.0 + 5.0 * TYPE_PX * 0.6, header_y),
+                egui::Align2::LEFT_CENTER,
+                "--",
+                font.clone(),
+                c.dim,
+            );
+            ui.painter().text(
+                egui::pos2(split_x + 10.0, header_y),
+                egui::Align2::LEFT_CENTER,
+                "SEQUENCE",
+                font.clone(),
+                c.label,
+            );
+            ui.painter().text(
+                egui::pos2(split_x + 10.0 + 9.0 * TYPE_PX * 0.6, header_y),
                 egui::Align2::LEFT_CENTER,
                 "--",
                 font,

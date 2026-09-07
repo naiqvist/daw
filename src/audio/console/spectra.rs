@@ -133,10 +133,6 @@ struct Side {
 /// How many frames are cut at a time.
 const FRAMES_AT_ONCE: usize = 4;
 
-/// The longest block the section answers. The graph's arena never
-/// hands a node more.
-const MAX_BLOCK: usize = 4096;
-
 impl Side {
     /// `prime` is the queue's head start; `delay` is what the section
     /// tells the graph it costs, which is where the round-trip test
@@ -717,7 +713,7 @@ impl SectionCore for SpectraCore {
 
     fn process(&mut self, l: &mut [f32], r: &mut [f32], _clock: &Clock) {
         let n = l.len();
-        if n == 0 || n > MAX_BLOCK {
+        if n == 0 {
             return;
         }
         let stereo = r.len() >= n;
@@ -1212,5 +1208,28 @@ mod tests {
         core.set_param(99, 1.0);
         core.set_param(p::MIX, 0.0);
         assert!(core.settings().is_wire());
+    }
+
+    #[test]
+    fn a_render_block_over_4096_frames_still_runs_the_spectral_machine() {
+        let input = sine(997.0, 0.4, 5_003);
+        let mut whole = input.clone();
+        let mut split = input.clone();
+        let edits = [
+            (p::MODE, p::MODE_BLUR as f32),
+            (p::BLUR, 65.0),
+            (p::MIX, 100.0),
+        ];
+        let mut one = core_with(&edits);
+        let mut pieces = core_with(&edits);
+        one.process(&mut whole, &mut [], &clock());
+        for chunk in split.chunks_mut(257) {
+            pieces.process(chunk, &mut [], &clock());
+        }
+        assert_eq!(whole, split, "SPECTRA changed with the caller's block size");
+        assert_ne!(
+            whole, input,
+            "the oversized block silently bypassed SPECTRA"
+        );
     }
 }

@@ -569,16 +569,26 @@ impl App {
                 // The seek that aims it rides `pending_seek`, consumed just
                 // after; Play-while-playing is a no-op, so this is safe
                 // whatever state the engine is in.
-                UiAction::PlaySelection => engine.transport(TransportCmd::Play),
+                UiAction::PlaySelection => {
+                    let _ = engine.transport(TransportCmd::Play);
+                }
                 // Halt, hold — the engine's Stop.
-                UiAction::Pause => engine.transport(TransportCmd::Stop),
+                UiAction::Pause => {
+                    let _ = engine.transport(TransportCmd::Stop);
+                }
                 // Halt AND rewind — the engine's Return.
-                UiAction::Stop => engine.transport(TransportCmd::Return),
+                UiAction::Stop => {
+                    let _ = engine.transport(TransportCmd::Return);
+                }
                 // Rewind without halting: a seek leaves `playing` alone.
-                UiAction::Return => engine.transport(TransportCmd::Seek(0)),
-                UiAction::SetTempo(bpm) => engine.transport(TransportCmd::SetTempo(
-                    bpm.clamp(limits::BPM_MIN, limits::BPM_MAX),
-                )),
+                UiAction::Return => {
+                    let _ = engine.transport(TransportCmd::Seek(0));
+                }
+                UiAction::SetTempo(bpm) => {
+                    let _ = engine.transport(TransportCmd::SetTempo(
+                        bpm.clamp(limits::BPM_MIN, limits::BPM_MAX),
+                    ));
+                }
                 _ => {}
             }
         }
@@ -606,13 +616,17 @@ impl App {
             None
         };
         if want != self.sent_loop {
-            if let Some(engine) = &mut self.engine {
+            let accepted = if let Some(engine) = &mut self.engine {
                 match want {
                     Some((start, end)) => engine.transport(TransportCmd::SetLoop { start, end }),
                     None => engine.transport(TransportCmd::ClearLoop),
                 }
+            } else {
+                false
+            };
+            if accepted {
+                self.sent_loop = want;
             }
-            self.sent_loop = want;
         }
 
         self.sync_pans();

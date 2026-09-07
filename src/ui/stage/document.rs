@@ -9,7 +9,10 @@
 //! back. What the stage writes, the stage can read; nothing else is
 //! promised.
 
-use crate::sequencing::Song;
+use crate::{
+    audio::modulation::{ModWire, Modulator},
+    sequencing::Song,
+};
 use std::path::{Path, PathBuf};
 
 /// The suffix a song the stage saved carries.
@@ -22,8 +25,52 @@ struct Document {
     song: Song,
 }
 
-const VERSION: u32 = 1;
+/// The first frame's wrapper is a different document format. In particular,
+/// RON writes its BPM as a bare float, not as `Some(float)`, so pretending it
+/// is an optional field on the stage document rejects the very files this
+/// importer exists to open.
+#[derive(Debug, serde::Deserialize)]
+struct LegacyDocument {
+    #[serde(rename = "version")]
+    _version: u32,
+    bpm: f64,
+    /// The first-frame DAW keeps modulation beside its canonical Song.
+    /// Import it explicitly so opening one of those projects in Stage does
+    /// not silently leave a working patch bay behind.
+    #[serde(default)]
+    modulators: Vec<Modulator>,
+    #[serde(default)]
+    mod_wires: Vec<ModWire>,
+    #[serde(default)]
+    next_modulator_id: u64,
+    song: Song,
+}
+
+const VERSION: u32 = 3;
 const BACKUP_LIMIT: usize = 20;
+
+/// Move a stage-native document to the current in-memory shape. Versions zero
+/// and one predate the default input/output gain utilities; installing their
+/// exact-unity nodes is an audible no-op with explicit stable ids. Keeping the
+/// step here makes a version we do not understand a refusal rather than a
+/// lossy best guess.
+fn migrate(version: u32, mut song: Song) -> Result<Song, String> {
+    match version {
+        0 | 1 => song.install_default_track_gains(),
+        2 | VERSION => {}
+        future => {
+            return Err(format!(
+                "project version {future} is newer than this build (supports through {VERSION})"
+            ));
+        }
+    }
+    song.normalize_group_depths();
+    song.normalize_mixer();
+    song.normalize_chains();
+    song.normalize_modulation();
+    song.normalize_timeline();
+    Ok(song)
+}
 
 /// Write `song` to `path`, making the directory if it is not there.
 ///
@@ -142,12 +189,38 @@ pub fn backup(path: &Path, home: &Path) -> Result<Option<PathBuf>, String> {
 /// first frame repairs it, so nothing downstream ever sees illegal data.
 pub fn load(path: &Path) -> Result<Song, String> {
     let text = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
+    // `.daw.ron` is the first frame's wrapper. Its version numbers belong to
+    // that application rather than this document schema; the compatible Song
+    // inside is intentionally imported and repaired. Everything else is a
+    // stage-native document and must pass this format's version gate.
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".daw.ron"))
+        && let Ok(legacy) = ron::from_str::<LegacyDocument>(&text)
+    {
+        let mut song = legacy.song;
+        let _ = song.set_base_bpm(legacy.bpm);
+        // These are the editable, saved modulation facts in the first-frame
+        // document. They are authoritative even when empty; its nested Song
+        // is a projection and may contain stale defaults.
+        song.modulators = legacy.modulators;
+        song.mod_wires = legacy.mod_wires;
+        song.next_modulation_id = legacy.next_modulator_id;
+        song.install_default_track_gains();
+        song.normalize_group_depths();
+        song.normalize_mixer();
+        song.normalize_chains();
+        song.normalize_modulation();
+        song.normalize_timeline();
+        return Ok(song);
+    }
+    // Stage may save back to the path a legacy project already owns. Its
+    // native wrapper has no top-level BPM, which distinguishes it from the
+    // first-frame format and lets that `.daw.ron` reopen without dropping the
+    // modulation now stored inside Song.
     let document: Document = ron::from_str(&text).map_err(|error| error.to_string())?;
-    let mut song = document.song;
-    song.normalize_group_depths();
-    song.normalize_mixer();
-    song.normalize_chains();
-    Ok(song)
+    migrate(document.version, document.song)
 }
 
 /// Where a song with no file of its own is saved, inside the songs
@@ -184,7 +257,7 @@ pub fn title(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sequencing::TrackKind;
+    use crate::sequencing::{DeviceRole, TRACK_VOLUME, TrackKind};
 
     fn scratch(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("daw-stage-{}-{name}", std::process::id()))
@@ -193,9 +266,23 @@ mod tests {
     #[test]
     fn a_song_comes_back_as_it_went() {
         let mut song = Song::default();
+        assert!(song.set_base_bpm(87.0));
         song.add_track(TrackKind::Audio);
         song.rename_track(0, "Keys");
         song.fill_slot(0, 3).expect("a slot fills");
+        let source = song.add_lfo().expect("a modulation source fits");
+        let wire = song
+            .add_mod_wire(source, 0, TRACK_VOLUME)
+            .expect("a modulation wire fits");
+        let response = song
+            .mod_wires
+            .iter_mut()
+            .find(|candidate| candidate.id == wire)
+            .expect("the new wire is present");
+        response.depth = -0.42;
+        response.curve = 0.35;
+        response.steps = 7;
+        response.smooth_ms = 85.0;
         let path = scratch("round.stage.ron");
         save(&path, &song).expect("saves");
         let back = load(&path).expect("loads");
@@ -218,15 +305,141 @@ mod tests {
         // models. Serde leaves them alone.
         let mut song = Song::default();
         song.rename_track(0, "From the first frame");
+        let mut modulation = Song::default();
+        let source = modulation.add_lfo().expect("a source fits");
+        modulation
+            .add_mod_wire(source, 0, TRACK_VOLUME)
+            .expect("a wire fits");
         let song_text = ron::ser::to_string(&song).expect("encodes");
+        let sources = ron::ser::to_string(&modulation.modulators).expect("sources encode");
+        let wires = ron::ser::to_string(&modulation.mod_wires).expect("wires encode");
         let path = scratch("legacy.daw.ron");
         std::fs::write(
             &path,
-            format!("(version: 9, bpm: 120.0, metronome: false, song: {song_text}, clips: [])"),
+            format!(
+                "(version: 9, bpm: 93.0, metronome: false, modulators: {sources}, mod_wires: {wires}, next_modulator_id: {}, song: {song_text}, clips: [])",
+                modulation.next_modulation_id
+            ),
         )
         .expect("writes");
         let back = load(&path).expect("the song inside opens");
         assert_eq!(back.tracks[0].name, "From the first frame");
+        assert_eq!(back.base_bpm(), 93.0, "the wrapper tempo was discarded");
+        assert_eq!(back.modulators, modulation.modulators);
+        assert_eq!(back.mod_wires, modulation.mod_wires);
+        assert_eq!(back.next_modulation_id, modulation.next_modulation_id);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn saving_back_to_a_legacy_path_keeps_native_modulation_on_reopen() {
+        let song = Song::default();
+        let mut modulation = Song::default();
+        let source = modulation.add_lfo().expect("a source fits");
+        modulation
+            .add_mod_wire(source, 0, TRACK_VOLUME)
+            .expect("a wire fits");
+        let song_text = ron::ser::to_string(&song).expect("song encodes");
+        let sources = ron::ser::to_string(&modulation.modulators).expect("sources encode");
+        let wires = ron::ser::to_string(&modulation.mod_wires).expect("wires encode");
+        let path = scratch("legacy-save-reopen.daw.ron");
+        std::fs::write(
+            &path,
+            format!(
+                "(version: 9, bpm: 120.0, modulators: {sources}, mod_wires: {wires}, next_modulator_id: {}, song: {song_text})",
+                modulation.next_modulation_id
+            ),
+        )
+        .expect("legacy project writes");
+
+        let imported = load(&path).expect("legacy project imports");
+        save(&path, &imported).expect("Stage saves to the existing legacy path");
+        let reopened = load(&path).expect("the Stage-native wrapper reopens by shape");
+        assert_eq!(reopened.modulators, imported.modulators);
+        assert_eq!(reopened.mod_wires, imported.mod_wires);
+        assert_eq!(reopened.next_modulation_id, imported.next_modulation_id);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_future_stage_document_is_refused_without_touching_it() {
+        let song_text = ron::ser::to_string(&Song::default()).expect("encodes");
+        let path = scratch("future.stage.ron");
+        let text = format!("(version: 99, song: {song_text})");
+        std::fs::write(&path, &text).expect("writes");
+        let error = load(&path).expect_err("a future schema opened by guessing");
+        assert!(error.contains("newer than this build"));
+        assert_eq!(std::fs::read_to_string(&path).expect("still there"), text);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn version_zero_takes_the_explicit_migration_path() {
+        let mut song = Song::default();
+        song.rename_track(0, "Migrated");
+        let song_text = ron::ser::to_string(&song).expect("encodes");
+        let path = scratch("v0.stage.ron");
+        std::fs::write(&path, format!("(version: 0, song: {song_text})")).expect("writes");
+        let back = load(&path).expect("version zero migrates");
+        assert_eq!(back.tracks[0].name, "Migrated");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn version_one_installs_boundary_gains_once() {
+        let mut song = Song::default();
+        song.tracks[0].chain.clear();
+        let song_text = ron::ser::to_string(&song).expect("encodes");
+        let path = scratch("v1-gains.stage.ron");
+        std::fs::write(&path, format!("(version: 1, song: {song_text})")).expect("writes");
+
+        let back = load(&path).expect("version one migrates");
+        let roles: Vec<_> = back.tracks[0]
+            .chain
+            .iter()
+            .map(|device| device.role)
+            .collect();
+        assert_eq!(roles, [DeviceRole::InputGain, DeviceRole::OutputGain]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn current_projects_remember_removed_boundary_gains() {
+        let mut song = Song::default();
+        song.tracks[0].chain.clear();
+        let path = scratch("v2-removed-gains.stage.ron");
+        save(&path, &song).expect("saves");
+
+        let back = load(&path).expect("loads");
+        assert!(back.tracks[0].chain.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn loading_repairs_hostile_timeline_maps_before_the_ui_sees_them() {
+        let mut song = Song::default();
+        song.meter.push(crate::sequencing::MeterMark {
+            tick: 0,
+            numerator: u32::MAX,
+            denominator: 1,
+        });
+        song.tempo.push(crate::sequencing::TempoMark {
+            tick: 96,
+            bpm: 90.0,
+        });
+        song.tempo.push(crate::sequencing::TempoMark {
+            tick: 48,
+            bpm: 110.0,
+        });
+        let path = scratch("hostile-timeline.stage.ron");
+        save(&path, &song).expect("saves");
+
+        let back = load(&path).expect("loads after repair");
+        assert!(back.meter.is_empty());
+        assert_eq!(
+            back.tempo.iter().map(|mark| mark.tick).collect::<Vec<_>>(),
+            [48, 96]
+        );
         let _ = std::fs::remove_file(&path);
     }
 

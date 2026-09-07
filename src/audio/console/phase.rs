@@ -174,7 +174,7 @@ impl SectionCore for PhaseCore {
 
     fn process(&mut self, l: &mut [f32], r: &mut [f32], _clock: &Clock) {
         let n = l.len();
-        if n == 0 || n > MAX_BLOCK {
+        if n == 0 {
             return;
         }
         let stereo = r.len() >= n;
@@ -189,23 +189,23 @@ impl SectionCore for PhaseCore {
             // Where the control clock falls in this block, decided once
             // so both sides tune at the same samples.
             let mut tune_at = [false; MAX_BLOCK];
-            let mut since = self.since;
-            for slot in tune_at.iter_mut().take(n) {
-                if since == 0 {
-                    *slot = true;
+            for start in (0..n).step_by(MAX_BLOCK) {
+                let end = (start + MAX_BLOCK).min(n);
+                let width = end - start;
+                let mut since = self.since;
+                for slot in tune_at.iter_mut().take(width) {
+                    *slot = since == 0;
+                    since = (since + 1) % CONTROL;
                 }
-                since = (since + 1) % CONTROL;
-            }
-            self.since = since;
-            self.run(0, l, &tune_at[..n]);
-            if stereo {
-                self.run(1, &mut r[..n], &tune_at[..n]);
-            } else {
-                // Mono: side 1's run never happened, so its LFO did not
-                // advance and its sweep would go stale and freeze half
-                // the readout. On a mono block there is one sweep, and
-                // both sides report it.
-                self.sweep_now[1] = self.sweep_now[0];
+                self.since = since;
+                self.run(0, &mut l[start..end], &tune_at[..width]);
+                if stereo {
+                    self.run(1, &mut r[start..end], &tune_at[..width]);
+                } else {
+                    // Mono: side 1's run never happened, so its LFO did not
+                    // advance. One sweep is the whole truth for this block.
+                    self.sweep_now[1] = self.sweep_now[0];
+                }
             }
         }
         let peak = l
@@ -258,9 +258,8 @@ impl SectionCore for PhaseCore {
     }
 }
 
-/// The longest block the section answers: the graph's arena never
-/// hands a node more, and a stack array is what keeps the control
-/// clock allocation-free.
+/// Stack scratch per chunk. Longer public render blocks are walked through
+/// several fixed chunks so they cannot silently bypass the section.
 const MAX_BLOCK: usize = 4096;
 
 #[cfg(test)]
@@ -620,5 +619,21 @@ mod tests {
         core.set_param(p::FEEDBACK, 200.0);
         assert!((core.settings().feedback - 0.9).abs() < 1e-6);
         core.set_param(99, 1.0);
+    }
+
+    #[test]
+    fn a_public_render_block_larger_than_the_stack_chunk_still_runs_the_phaser() {
+        let input = sine(733.0, 0.4, MAX_BLOCK + 907);
+        let mut whole = input.clone();
+        let mut split = input.clone();
+        let edits = [(p::DEPTH, 80.0), (p::RATE, 1.7), (p::FEEDBACK, 35.0)];
+        let mut one = core_with(&edits);
+        let mut pieces = core_with(&edits);
+        one.process(&mut whole, &mut [], &clock());
+        for chunk in split.chunks_mut(MAX_BLOCK) {
+            pieces.process(chunk, &mut [], &clock());
+        }
+        assert_eq!(whole, split, "internal chunking changed the phaser clock");
+        assert_ne!(whole, input, "the oversized block silently bypassed PHASE");
     }
 }

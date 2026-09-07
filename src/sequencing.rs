@@ -10,6 +10,9 @@
 //! projection, never here and never in the callback
 //! (`notes/20260831-pitch-lens-spec.md`).
 
+use crate::audio::modulation::{
+    MAX_MOD_SOURCES, MAX_MOD_WIRES, ModKind, ModShape, ModWire, Modulator,
+};
 use crate::console::SectionKind;
 use crate::devices::DeviceKind;
 use crate::pitch::{Key, Pitch, default_key};
@@ -196,6 +199,58 @@ pub struct PatternId(pub u64);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct TrackId(pub u64);
 
+/// The one project-wide draw of the analog desk.
+///
+/// This is musical state: reopening or offline-rendering a project must use
+/// the same component tolerances and noise streams. `noise_enabled` is the
+/// global measurement defeat; switching it off never removes tolerance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct DeskPersonality {
+    #[serde(default = "default_desk_seed")]
+    pub seed: u64,
+    #[serde(default = "enabled")]
+    pub noise_enabled: bool,
+}
+
+fn default_desk_seed() -> u64 {
+    crate::dsp::desk::DEFAULT_PROJECT_SEED
+}
+
+fn enabled() -> bool {
+    true
+}
+
+impl Default for DeskPersonality {
+    fn default() -> Self {
+        Self {
+            seed: default_desk_seed(),
+            noise_enabled: true,
+        }
+    }
+}
+
+impl DeskPersonality {
+    /// Green-zone bridge from persisted identity to a prepared red-zone path.
+    pub fn prepare_path(
+        self,
+        path: &mut crate::dsp::desk::DeskPath,
+        sample_rate: f32,
+        identity: DeskPathIdentity,
+    ) {
+        path.prepare(
+            sample_rate,
+            self.seed,
+            identity.personality_key(),
+            self.noise_enabled,
+        );
+    }
+
+    /// The stable component draw without constructing processing state.
+    pub fn traits(self, identity: DeskPathIdentity) -> crate::dsp::desk::PathTraits {
+        crate::dsp::desk::PathTraits::derive(self.seed, identity.personality_key())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct BlockId(pub u64);
 
@@ -209,12 +264,59 @@ pub struct BlockId(pub u64);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct DeviceId(pub u64);
 
+/// A device's structural job inside a track chain.
+///
+/// Ordinary devices remain freely placeable. The two gain utilities carried
+/// by a new track are named roles so insertion and normalization can keep the
+/// input trim immediately after the source and the output trim at the tail,
+/// without guessing that every Utility somebody adds by hand is structural.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize,
+)]
+pub enum DeviceRole {
+    #[default]
+    Normal,
+    InputGain,
+    OutputGain,
+}
+
+impl DeviceRole {
+    pub const fn is_normal(&self) -> bool {
+        matches!(self, Self::Normal)
+    }
+
+    pub const fn is_boundary(self) -> bool {
+        !matches!(self, Self::Normal)
+    }
+
+    pub const fn title(self) -> Option<&'static str> {
+        match self {
+            Self::Normal => None,
+            Self::InputGain => Some("INPUT GAIN"),
+            Self::OutputGain => Some("OUTPUT GAIN"),
+        }
+    }
+
+    pub const fn code(self) -> Option<&'static str> {
+        match self {
+            Self::Normal => None,
+            Self::InputGain => Some("in"),
+            Self::OutputGain => Some("out"),
+        }
+    }
+}
+
 /// One device on a track: what it is, whether it is passing sound
 /// through, and the parameters that differ from its defaults.
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Device {
     pub id: DeviceId,
     pub kind: DeviceKind,
+    /// Normal user device, or one of the two default track-boundary trims.
+    /// Absent from older documents means Normal; boundary roles are only
+    /// minted by new-track construction or the explicit document migration.
+    #[serde(default, skip_serializing_if = "DeviceRole::is_normal")]
+    pub role: DeviceRole,
     /// Passing sound through untouched. NOT the same as removing it: a
     /// bypassed device keeps its place, its id and its settings, so the
     /// comparison it exists to support is one keystroke each way.
@@ -255,11 +357,19 @@ impl Device {
         Self {
             id,
             kind,
+            role: DeviceRole::Normal,
             bypassed: false,
             overrides: Vec::new(),
             sample: None,
             slices: Vec::new(),
         }
+    }
+
+    /// One exact-unity Utility fixed to a track boundary by default.
+    pub fn track_gain(id: DeviceId, role: DeviceRole) -> Self {
+        let mut device = Self::new(id, DeviceKind::Utility);
+        device.role = role;
+        device
     }
 
     /// Replace the slice table: sorted, distinct, inside the file, and no
@@ -664,10 +774,58 @@ pub const BUS_COUNT: usize = 4;
 pub const BUS_NAMES: [&str; BUS_COUNT] = ["DRUM", "BASS", "MUSIC", "TAPE"];
 pub const RETURN_NAMES: [&str; 2] = ["TAPE", "SHADOW"];
 
+/// Permanent identity of one structural desk rail.
+///
+/// `Unassigned` exists only to load projects written before rail identities;
+/// [`Song::furnish`] assigns the canonical role once. After that the id moves
+/// with the rail, so component tolerance never follows Vec order.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize,
+)]
+pub enum RailId {
+    #[default]
+    Unassigned,
+    Bus(u8),
+    Return(u8),
+    Mix,
+}
+
+/// A permanent channel or rail address for the desk personality.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum DeskPathIdentity {
+    Track(TrackId),
+    Rail(RailId),
+}
+
+impl DeskPathIdentity {
+    /// Stable numeric key passed into the dependency-free DSP layer. Domain
+    /// tags are explicit so Track 0, Bus 0, Return 0, and MIX are not aliases.
+    pub const fn personality_key(self) -> u64 {
+        match self {
+            Self::Track(TrackId(id)) => {
+                0x5452_4143_4B00_0000 ^ id.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            }
+            Self::Rail(RailId::Bus(id)) => 0x4255_5300_0000_0000 ^ id as u64,
+            Self::Rail(RailId::Return(id)) => 0x5245_5455_524E_0000 ^ id as u64,
+            Self::Rail(RailId::Mix) => 0x4D49_5800_0000_0000,
+            Self::Rail(RailId::Unassigned) => 0x554E_4153_5349_474E,
+        }
+    }
+
+    /// Two decorrelated but identity-stable sides of the same physical path.
+    pub const fn stereo_keys(self) -> (u64, u64) {
+        let base = self.personality_key();
+        (base ^ 0x4C45_4654_0000_0001, base ^ 0x5249_4748_5400_0002)
+    }
+}
+
 /// A bus, the mix, or a return: a run of sections that are never taken
 /// out, a level and a pan.
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Rail {
+    /// Stable component identity. It is not the rail's display position.
+    #[serde(default)]
+    pub id: RailId,
     #[serde(default)]
     pub name: String,
     #[serde(default)]
@@ -679,8 +837,9 @@ pub struct Rail {
 }
 
 impl Rail {
-    fn named(name: &str) -> Self {
+    fn named(name: &str, id: RailId) -> Self {
         Self {
+            id,
             name: name.to_owned(),
             sections: Vec::new(),
             volume: 1.0,
@@ -710,7 +869,7 @@ pub struct Console {
 }
 
 fn mix_rail() -> Rail {
-    Rail::named("MIX")
+    Rail::named("MIX", RailId::Mix)
 }
 
 impl Default for Console {
@@ -730,16 +889,27 @@ impl Console {
     /// order; whatever is already there is kept.
     fn furnish(&mut self) {
         for (index, name) in BUS_NAMES.iter().enumerate() {
+            let id = RailId::Bus(index as u8);
             if self.buses.len() <= index {
-                self.buses.push(Rail::named(name));
+                self.buses.push(Rail::named(name, id));
+            }
+            if self.buses[index].id == RailId::Unassigned {
+                self.buses[index].id = id;
             }
             furnish_run(&mut self.buses[index].sections, &SectionKind::BUS);
         }
         self.buses.truncate(BUS_COUNT);
+        if self.mix.id == RailId::Unassigned {
+            self.mix.id = RailId::Mix;
+        }
         furnish_run(&mut self.mix.sections, &SectionKind::MIX);
         for (index, name) in RETURN_NAMES.iter().enumerate() {
+            let id = RailId::Return(index as u8);
             if self.aux.len() <= index {
-                self.aux.push(Rail::named(name));
+                self.aux.push(Rail::named(name, id));
+            }
+            if self.aux[index].id == RailId::Unassigned {
+                self.aux[index].id = id;
             }
             furnish_run(
                 &mut self.aux[index].sections,
@@ -1222,9 +1392,26 @@ impl ReturnTrack {
 /// infinity samples and hang the compile that tried to stamp it.
 const MIN_BPM: f64 = 1.0;
 const MAX_BPM: f64 = 1000.0;
+/// A practical upper fence for a time-signature numerator. This keeps one
+/// grid cell bounded even when a project was hand edited, while covering
+/// compound and additive meters well beyond ordinary notation.
+pub const MAX_METER_NUMERATOR: u32 = 32;
+/// Conventional meters use a power-of-two note value. Sixty-fourth notes are
+/// the finest unit this sequencer's 48 PPQN grid can describe honestly.
+pub const MAX_METER_DENOMINATOR: u32 = 64;
+
+fn default_song_bpm() -> f64 {
+    120.0
+}
 
 fn usable_bpm(bpm: f64) -> bool {
     bpm.is_finite() && (MIN_BPM..=MAX_BPM).contains(&bpm)
+}
+
+fn usable_meter(numerator: u32, denominator: u32) -> bool {
+    (1..=MAX_METER_NUMERATOR).contains(&numerator)
+        && denominator.is_power_of_two()
+        && denominator <= MAX_METER_DENOMINATOR
 }
 
 /// How many scenes a new session offers: enough rows that a sketch has
@@ -1287,6 +1474,11 @@ impl Default for Session {
 pub struct Song {
     pub tracks: Vec<Track>,
     pub patterns: Vec<Pattern>,
+    /// Tempo before the first map mark (and everywhere when the map is
+    /// empty). Persisted on the Song so importing an older project cannot
+    /// silently replace its wrapper tempo with a host-local default.
+    #[serde(default = "default_song_bpm")]
+    pub bpm: f64,
     /// The master's fader, as LINEAR amplitude. 1.0 is unity.
     ///
     /// One number and no pan: a master pan is a thing to reach for when
@@ -1319,6 +1511,9 @@ pub struct Song {
     /// the sections that are never taken out. Furnished on load.
     #[serde(default)]
     pub console: Console,
+    /// Project-seeded component draw and its global measurement/noise defeat.
+    #[serde(default)]
+    pub desk_personality: DeskPersonality,
     /// The song view's loop brace, in song ticks, and whether the
     /// transport runs it while the song plays. Kept apart so the brace
     /// can be switched off without being lost.
@@ -1334,6 +1529,19 @@ pub struct Song {
     /// session, which reads exactly as it did before.
     #[serde(default)]
     pub session: Session,
+    /// Project modulation sources. They are authored here and compiled into
+    /// the graph with the rest of the song; the callback never reads this
+    /// editable Vec directly.
+    #[serde(default)]
+    pub modulators: Vec<Modulator>,
+    /// Source-to-parameter relationships, addressed by stable source and
+    /// device ids plus the track index that owns the target.
+    #[serde(default)]
+    pub mod_wires: Vec<ModWire>,
+    /// Monotonic identity mint shared by sources and wires. Zero in an older
+    /// document is repaired past every identity already in use.
+    #[serde(default)]
+    pub next_modulation_id: u64,
     /// The project-level harmonic context. Degree anchors resolve against
     /// it; absolute anchors never read it.
     pub key: Key,
@@ -1347,11 +1555,74 @@ pub struct Song {
     pub next_track_id: u64,
 }
 
+fn default_track_chain() -> Vec<Device> {
+    vec![
+        Device::track_gain(DeviceId(0), DeviceRole::InputGain),
+        Device::track_gain(DeviceId(0), DeviceRole::OutputGain),
+    ]
+}
+
+/// The device instance named by one stable target string.
+fn modulation_target_device(target: &str) -> Option<DeviceId> {
+    let (id, _) = target
+        .strip_prefix(crate::targets::DEVICE_TARGET_PREFIX)?
+        .split_once('.')?;
+    id.parse().ok().map(DeviceId)
+}
+
+/// Whether a modulation target still belongs to this exact track.
+///
+/// Kept beside the document repair rather than the UI picker: a hand-edited
+/// file gets the same ownership check even when no surface is ever opened.
+fn modulation_target_exists(track: &Track, target: &str) -> bool {
+    if matches!(target, TRACK_VOLUME | TRACK_PAN) {
+        return true;
+    }
+    if let Some(send) = crate::targets::track_send_index(target) {
+        return send < RETURN_NAMES.len();
+    }
+    let Some((id, rest)) = target
+        .strip_prefix(crate::targets::DEVICE_TARGET_PREFIX)
+        .and_then(|rest| rest.split_once('.'))
+    else {
+        return false;
+    };
+    let Ok(id) = id.parse::<u64>() else {
+        return false;
+    };
+    let Some((prefix, parameter)) = rest.split_once('.') else {
+        return false;
+    };
+    track
+        .chain
+        .iter()
+        .chain(track.strip.iter())
+        .find(|device| device.id == DeviceId(id))
+        .is_some_and(|device| {
+            let spec = device.kind.spec();
+            spec.prefix == prefix && spec.params.iter().any(|def| def.name == parameter)
+        })
+}
+
+/// Pick one free, non-zero modulation identity. At most eighty identities
+/// can be live, so the low-id fallback is bounded even if a hostile file used
+/// `u64::MAX` and left no number above its claimed maximum.
+fn free_modulation_id(used: &std::collections::HashSet<u64>, preferred: u64) -> u64 {
+    let preferred = preferred.max(1);
+    if !used.contains(&preferred) {
+        return preferred;
+    }
+    (1..=(MAX_MOD_SOURCES + MAX_MOD_WIRES + 1) as u64)
+        .find(|id| !used.contains(id))
+        .unwrap_or(preferred)
+}
+
 impl Default for Song {
     fn default() -> Self {
         let pattern = Pattern::default();
         let pattern_id = pattern.id;
         let mut song = Self {
+            bpm: default_song_bpm(),
             master: 1.0,
             tracks: vec![Track {
                 id: TrackId(1),
@@ -1373,7 +1644,7 @@ impl Default for Song {
                 sends: Vec::new(),
                 is_group: false,
                 folded: false,
-                chain: Vec::new(),
+                chain: default_track_chain(),
                 strip: Vec::new(),
                 bus: 0,
                 bus_by_hand: false,
@@ -1387,10 +1658,14 @@ impl Default for Song {
             tempo: Vec::new(),
             meter: Vec::new(),
             console: Console::default(),
+            desk_personality: DeskPersonality::default(),
             loop_brace: None,
             loop_on: false,
             locators: Vec::new(),
             session: Session::default(),
+            modulators: Vec::new(),
+            mod_wires: Vec::new(),
+            next_modulation_id: 0,
             key: default_key(),
             next_track_id: 2,
         };
@@ -1400,6 +1675,184 @@ impl Default for Song {
 }
 
 impl Song {
+    /// Refuse before the callback's fixed source table would silently drop a
+    /// visible modulator.
+    pub fn modulators_full(&self) -> bool {
+        self.modulators.len() >= MAX_MOD_SOURCES
+    }
+
+    /// Refuse before the callback's fixed wire table would silently drop a
+    /// visible relationship.
+    pub fn mod_wires_full(&self) -> bool {
+        self.mod_wires.len() >= MAX_MOD_WIRES
+    }
+
+    /// Mint from one source shared by modulators and wires. The counter is
+    /// repaired from the live content first, so missing or stale counters in
+    /// older documents cannot reuse an identity.
+    fn mint_modulation_id(&mut self) -> u64 {
+        let used: std::collections::HashSet<u64> = self
+            .modulators
+            .iter()
+            .map(|source| source.id)
+            .chain(self.mod_wires.iter().map(|wire| wire.id))
+            .collect();
+        let highest = used.iter().copied().max().unwrap_or(0);
+        let id = free_modulation_id(
+            &used,
+            self.next_modulation_id.max(highest.saturating_add(1)),
+        );
+        self.next_modulation_id = id.saturating_add(1);
+        id
+    }
+
+    /// Add the useful default LFO: a synced one-bar sine.
+    pub fn add_lfo(&mut self) -> Option<u64> {
+        if self.modulators_full() {
+            return None;
+        }
+        let id = self.mint_modulation_id();
+        self.modulators.push(Modulator {
+            id,
+            kind: ModKind::Lfo {
+                shape: ModShape::Sine,
+                rate_beats: 4.0,
+                free: false,
+                hz: 1.0,
+            },
+        });
+        Some(id)
+    }
+
+    /// Add an envelope follower listening to `track`'s post-channel meter.
+    pub fn add_follower(&mut self, track: usize) -> Option<u64> {
+        if self.modulators_full() || track >= self.tracks.len() {
+            return None;
+        }
+        let id = self.mint_modulation_id();
+        self.modulators.push(Modulator {
+            id,
+            kind: ModKind::Follower { track },
+        });
+        Some(id)
+    }
+
+    /// Add one unique source-to-target relationship at the established
+    /// modest default depth. Invalid, duplicate and over-cap wires refuse.
+    pub fn add_mod_wire(
+        &mut self,
+        source: u64,
+        track: usize,
+        target: impl Into<String>,
+    ) -> Option<u64> {
+        let target = target.into();
+        if self.mod_wires_full()
+            || !self
+                .modulators
+                .iter()
+                .any(|modulator| modulator.id == source)
+            || !self
+                .tracks
+                .get(track)
+                .is_some_and(|lane| modulation_target_exists(lane, &target))
+            || self
+                .mod_wires
+                .iter()
+                .any(|wire| wire.source == source && wire.track == track && wire.target == target)
+        {
+            return None;
+        }
+        let id = self.mint_modulation_id();
+        self.mod_wires.push(ModWire {
+            id,
+            source,
+            track,
+            target,
+            depth: 0.25,
+            ..ModWire::default()
+        });
+        Some(id)
+    }
+
+    /// Remove a source and every relationship hanging from it.
+    pub fn remove_modulator(&mut self, id: u64) -> bool {
+        let before = self.modulators.len();
+        self.modulators.retain(|modulator| modulator.id != id);
+        if self.modulators.len() == before {
+            return false;
+        }
+        self.mod_wires.retain(|wire| wire.source != id);
+        true
+    }
+
+    /// Repair modulation read from disk before either compiler sees it.
+    ///
+    /// The editable vectors are green-zone state. The fixed caps here match
+    /// the arrays published by the callback, so every retained item is both
+    /// audible and observable; invalid relationships are removed rather than
+    /// left on screen pretending to work.
+    pub fn normalize_modulation(&mut self) {
+        let tracks = self.tracks.len();
+        self.modulators.retain(|modulator| match modulator.kind {
+            ModKind::Follower { track } => track < tracks,
+            ModKind::Lfo { rate_beats, hz, .. } => {
+                rate_beats.is_finite() && rate_beats > 0.0 && hz.is_finite() && hz > 0.0
+            }
+        });
+        self.modulators.truncate(MAX_MOD_SOURCES);
+
+        let mut next = self
+            .next_modulation_id
+            .max(
+                self.modulators
+                    .iter()
+                    .map(|source| source.id)
+                    .chain(self.mod_wires.iter().map(|wire| wire.id))
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_add(1),
+            )
+            .max(1);
+        let mut used = std::collections::HashSet::new();
+        for source in &mut self.modulators {
+            if source.id == 0 || !used.insert(source.id) {
+                source.id = free_modulation_id(&used, next);
+                used.insert(source.id);
+                next = source.id.saturating_add(1);
+            }
+        }
+        let source_ids = used.clone();
+        let lanes = &self.tracks;
+        let mut routes = std::collections::HashSet::new();
+        self.mod_wires.retain(|wire| {
+            source_ids.contains(&wire.source)
+                && wire.track < lanes.len()
+                && wire.depth.is_finite()
+                && wire.curve.is_finite()
+                && wire.smooth_ms.is_finite()
+                && lanes
+                    .get(wire.track)
+                    .is_some_and(|track| modulation_target_exists(track, &wire.target))
+                // One visible patch row represents one audible route. A
+                // hostile or legacy document must not leave a second,
+                // invisible copy summing behind the first.
+                && routes.insert((wire.source, wire.track, wire.target.clone()))
+        });
+        self.mod_wires.truncate(MAX_MOD_WIRES);
+        for wire in &mut self.mod_wires {
+            wire.depth = wire.depth.clamp(-1.0, 1.0);
+            wire.curve = wire.curve.clamp(-1.0, 1.0);
+            wire.steps = wire.steps.min(64);
+            wire.smooth_ms = wire.smooth_ms.clamp(0.0, 2_000.0);
+            if wire.id == 0 || !used.insert(wire.id) {
+                wire.id = free_modulation_id(&used, next);
+                used.insert(wire.id);
+                next = wire.id.saturating_add(1);
+            }
+        }
+        self.next_modulation_id = free_modulation_id(&used, next);
+    }
+
     /// Append a new, empty track of `kind` and return its id.
     ///
     /// Document editing, not scheduling: an empty track carries no events,
@@ -1441,7 +1894,7 @@ impl Song {
             sends: Vec::new(),
             is_group: false,
             folded: false,
-            chain: Vec::new(),
+            chain: default_track_chain(),
             strip: Vec::new(),
             bus: 0,
             bus_by_hand: false,
@@ -1480,6 +1933,30 @@ impl Song {
         if index >= self.tracks.len() {
             return None;
         }
+        let orphaned: std::collections::HashSet<u64> = self
+            .modulators
+            .iter()
+            .filter_map(|modulator| {
+                matches!(modulator.kind, ModKind::Follower { track } if track == index)
+                    .then_some(modulator.id)
+            })
+            .collect();
+        self.modulators
+            .retain(|modulator| !orphaned.contains(&modulator.id));
+        for modulator in &mut self.modulators {
+            if let ModKind::Follower { track } = &mut modulator.kind
+                && *track > index
+            {
+                *track -= 1;
+            }
+        }
+        self.mod_wires
+            .retain(|wire| wire.track != index && !orphaned.contains(&wire.source));
+        for wire in &mut self.mod_wires {
+            if wire.track > index {
+                wire.track -= 1;
+            }
+        }
         let track = self.tracks.remove(index);
         for scene in &mut self.session.scenes {
             scene.slots.retain(|slot| slot.track != track.id);
@@ -1503,6 +1980,23 @@ impl Song {
             return false;
         }
         self.tracks.swap(index, to);
+        let shifted = |track: usize| {
+            if track == index {
+                to
+            } else if track == to {
+                index
+            } else {
+                track
+            }
+        };
+        for modulator in &mut self.modulators {
+            if let ModKind::Follower { track } = &mut modulator.kind {
+                *track = shifted(*track);
+            }
+        }
+        for wire in &mut self.mod_wires {
+            wire.track = shifted(wire.track);
+        }
         self.normalize_group_depths();
         true
     }
@@ -1649,16 +2143,76 @@ impl Song {
         for track in &mut self.tracks {
             let audio = track.kind == TrackKind::Audio;
             let mut instrument = None;
+            let mut input_gain = None;
+            let mut output_gain = None;
             let mut effects = Vec::with_capacity(track.chain.len());
-            for device in track.chain.drain(..) {
+            for mut device in track.chain.drain(..) {
+                // Only Utility can carry a boundary role. A malformed role
+                // on another kind becomes an ordinary device rather than
+                // moving that device to a surprising end of the chain.
+                if device.kind != DeviceKind::Utility {
+                    device.role = DeviceRole::Normal;
+                }
+                match device.role {
+                    DeviceRole::InputGain if input_gain.is_none() => {
+                        input_gain = Some(device);
+                        continue;
+                    }
+                    DeviceRole::OutputGain if output_gain.is_none() => {
+                        output_gain = Some(device);
+                        continue;
+                    }
+                    DeviceRole::InputGain | DeviceRole::OutputGain => {
+                        // A corrupt duplicate remains audible and editable,
+                        // but loses structural authority.
+                        device.role = DeviceRole::Normal;
+                    }
+                    DeviceRole::Normal => {}
+                }
                 if !device.is_instrument() {
                     effects.push(device);
                 } else if !audio && instrument.is_none() {
                     instrument = Some(device);
                 }
             }
-            track.chain = instrument.into_iter().chain(effects).collect();
+            track.chain = instrument
+                .into_iter()
+                .chain(input_gain)
+                .chain(effects)
+                .chain(output_gain)
+                .collect();
         }
+    }
+
+    /// Add the exact-unity boundary trims to tracks from a document version
+    /// written before they existed. Idempotent and deliberately not called on
+    /// every load: after migration a performer may remove either default and
+    /// a current-version document preserves that choice.
+    pub fn install_default_track_gains(&mut self) {
+        let mut next = self.mint_device_id();
+        for track in &mut self.tracks {
+            if !track
+                .chain
+                .iter()
+                .any(|device| device.role == DeviceRole::InputGain)
+            {
+                track
+                    .chain
+                    .push(Device::track_gain(DeviceId(next), DeviceRole::InputGain));
+                next = next.saturating_add(1);
+            }
+            if !track
+                .chain
+                .iter()
+                .any(|device| device.role == DeviceRole::OutputGain)
+            {
+                track
+                    .chain
+                    .push(Device::track_gain(DeviceId(next), DeviceRole::OutputGain));
+                next = next.saturating_add(1);
+            }
+        }
+        self.normalize_chains();
     }
 
     /// Put `kind` on `track`, at the head if it is an instrument and at
@@ -1702,6 +2256,10 @@ impl Song {
             return None;
         }
         device.id = DeviceId(self.mint_device_id());
+        // Clipboard insertion is a copy of the processing settings, not of a
+        // track's structural boundary authority. A copied input trim is an
+        // ordinary Utility on the destination.
+        device.role = DeviceRole::Normal;
         self.place_device(track, at, device)
     }
 
@@ -1736,25 +2294,52 @@ impl Song {
     /// clamped behind the head and inside the chain.
     fn place_device(&mut self, track: usize, at: usize, device: Device) -> Option<DeviceId> {
         let id = device.id;
-        let chain = &mut self.tracks.get_mut(track)?.chain;
-        if device.is_instrument() {
-            // A second instrument REPLACES the first rather than joining
-            // it: a track sounds one voice, and the head is that voice.
-            chain.retain(|existing| !existing.is_instrument());
-            chain.insert(0, device);
-        } else {
-            let first = usize::from(chain.first().is_some_and(Device::is_instrument));
-            let at = at.clamp(first, chain.len());
-            chain.insert(at, device);
+        let removed_instrument = {
+            let chain = &mut self.tracks.get_mut(track)?.chain;
+            if device.is_instrument() {
+                // A second instrument REPLACES the first rather than joining
+                // it: a track sounds one voice, and the head is that voice.
+                let removed = chain
+                    .iter()
+                    .find(|existing| existing.is_instrument())
+                    .map(|existing| existing.id);
+                chain.retain(|existing| !existing.is_instrument());
+                chain.insert(0, device);
+                removed
+            } else {
+                let mut first = usize::from(chain.first().is_some_and(Device::is_instrument));
+                if chain
+                    .get(first)
+                    .is_some_and(|device| device.role == DeviceRole::InputGain)
+                {
+                    first += 1;
+                }
+                let last = chain
+                    .iter()
+                    .position(|device| device.role == DeviceRole::OutputGain)
+                    .unwrap_or(chain.len());
+                let at = at.clamp(first, last);
+                chain.insert(at, device);
+                None
+            }
+        };
+        if let Some(removed) = removed_instrument {
+            self.mod_wires
+                .retain(|wire| modulation_target_device(&wire.target) != Some(removed));
         }
         Some(id)
     }
 
     /// Take a device off a track. `None` means there was no such device.
     pub fn remove_device(&mut self, track: usize, id: DeviceId) -> Option<Device> {
-        let chain = &mut self.tracks.get_mut(track)?.chain;
-        let at = chain.iter().position(|device| device.id == id)?;
-        Some(chain.remove(at))
+        let removed = {
+            let chain = &mut self.tracks.get_mut(track)?.chain;
+            let at = chain.iter().position(|device| device.id == id)?;
+            chain.remove(at)
+        };
+        self.mod_wires
+            .retain(|wire| modulation_target_device(&wire.target) != Some(id));
+        Some(removed)
     }
 
     /// Move a device one place along its chain. `false` means it was
@@ -1771,7 +2356,11 @@ impl Song {
         if to >= chain.len() {
             return false;
         }
-        if chain[at].is_instrument() || chain[to].is_instrument() {
+        if chain[at].is_instrument()
+            || chain[to].is_instrument()
+            || chain[at].role.is_boundary()
+            || chain[to].role.is_boundary()
+        {
             return false;
         }
         chain.swap(at, to);
@@ -1813,6 +2402,7 @@ impl Song {
                 self.tracks[index].bus = self.bus_for(index);
             }
         }
+        self.normalize_modulation();
     }
 
     /// The bus a track belongs on by what it is: drums to A, bass to B,
@@ -1931,23 +2521,66 @@ impl Song {
         true
     }
 
-    /// The tempo in force at `tick`, or `fallback` before the first mark
-    /// (and everywhere, when the map is empty).
+    /// The persisted tempo before the first mark, repaired at its read
+    /// boundary so a hostile hand-edited document cannot poison timing.
+    pub fn base_bpm(&self) -> f64 {
+        if usable_bpm(self.bpm) {
+            self.bpm
+        } else {
+            default_song_bpm()
+        }
+    }
+
+    /// Replace the persisted pre-map tempo. Returns false for invalid or
+    /// identical input so callers can keep dirty/history semantics exact.
+    pub fn set_base_bpm(&mut self, bpm: f64) -> bool {
+        if !usable_bpm(bpm) || self.bpm == bpm {
+            return false;
+        }
+        self.bpm = bpm;
+        true
+    }
+
+    /// The tempo in force at `tick`. `fallback` remains an API compatibility
+    /// safety net for a corrupt base value; valid Songs use their persisted
+    /// base before the first mark and everywhere when the map is empty.
     pub fn bpm_at(&self, tick: usize, fallback: f64) -> f64 {
+        let opening = if usable_bpm(self.bpm) {
+            self.bpm
+        } else if usable_bpm(fallback) {
+            fallback
+        } else {
+            default_song_bpm()
+        };
         self.tempo
             .iter()
             .filter(|mark| mark.tick <= tick && usable_bpm(mark.bpm))
-            .next_back()
-            .map_or(fallback, |mark| mark.bpm)
+            .max_by_key(|mark| mark.tick)
+            .map_or(opening, |mark| mark.bpm)
     }
 
     /// The meter in force at `tick`, or `fallback` before the first mark.
     pub fn meter_at(&self, tick: usize, fallback: (u32, u32)) -> (u32, u32) {
         self.meter
             .iter()
-            .filter(|mark| mark.tick <= tick && mark.numerator > 0 && mark.denominator > 0)
-            .next_back()
+            .filter(|mark| mark.tick <= tick && usable_meter(mark.numerator, mark.denominator))
+            .max_by_key(|mark| mark.tick)
             .map_or(fallback, |mark| (mark.numerator, mark.denominator))
+    }
+
+    /// Repair timeline maps at every persistence boundary. Invalid marks are
+    /// dropped, maps are sorted, and duplicate positions collapse to one
+    /// deterministic value so all downstream partition-point and ruler logic
+    /// sees the same canonical shape.
+    pub fn normalize_timeline(&mut self) {
+        self.bpm = self.base_bpm();
+        self.tempo.retain(|mark| usable_bpm(mark.bpm));
+        self.tempo.sort_by_key(|mark| mark.tick);
+        self.tempo.dedup_by_key(|mark| mark.tick);
+        self.meter
+            .retain(|mark| usable_meter(mark.numerator, mark.denominator));
+        self.meter.sort_by_key(|mark| mark.tick);
+        self.meter.dedup_by_key(|mark| mark.tick);
     }
 
     /// Place or move a tempo mark. A mark already at `tick` takes the new
@@ -1958,6 +2591,9 @@ impl Song {
         }
         let at = self.tempo.partition_point(|mark| mark.tick < tick);
         if self.tempo.get(at).is_some_and(|mark| mark.tick == tick) {
+            if self.tempo[at].bpm == bpm {
+                return false;
+            }
             self.tempo[at].bpm = bpm;
         } else {
             self.tempo.insert(at, TempoMark { tick, bpm });
@@ -1975,7 +2611,7 @@ impl Song {
 
     /// Place or move a meter mark. A degenerate signature is refused.
     pub fn set_meter_mark(&mut self, tick: usize, numerator: u32, denominator: u32) -> bool {
-        if numerator == 0 || denominator == 0 {
+        if !usable_meter(numerator, denominator) {
             return false;
         }
         let at = self.meter.partition_point(|mark| mark.tick < tick);
@@ -1989,10 +2625,22 @@ impl Song {
             .get(at)
             .is_some_and(|existing| existing.tick == tick)
         {
+            if self.meter[at] == mark {
+                return false;
+            }
             self.meter[at] = mark;
         } else {
             self.meter.insert(at, mark);
         }
+        true
+    }
+
+    /// Remove the meter mark exactly at `tick`, and say whether one went.
+    pub fn remove_meter_mark(&mut self, tick: usize) -> bool {
+        let Some(at) = self.meter.iter().position(|mark| mark.tick == tick) else {
+            return false;
+        };
+        self.meter.remove(at);
         true
     }
 
@@ -3023,6 +3671,166 @@ mod tests {
     }
 
     #[test]
+    fn desk_seed_noise_defeat_and_rail_ids_are_project_state() {
+        let mut song = Song::default();
+        song.desk_personality.seed = 0xCAFE_F00D_1234_5678;
+        song.desk_personality.noise_enabled = false;
+
+        let encoded = ron::ser::to_string(&song).expect("song serializes");
+        let decoded: Song = ron::from_str(&encoded).expect("song deserializes");
+        assert_eq!(decoded.desk_personality, song.desk_personality);
+        assert_eq!(decoded.console.buses[0].id, RailId::Bus(0));
+        assert_eq!(decoded.console.buses[3].id, RailId::Bus(3));
+        assert_eq!(decoded.console.aux[0].id, RailId::Return(0));
+        assert_eq!(decoded.console.aux[1].id, RailId::Return(1));
+        assert_eq!(decoded.console.mix.id, RailId::Mix);
+    }
+
+    #[test]
+    fn a_pre_personality_document_gets_the_documented_deterministic_default() {
+        let song = Song::default();
+        let encoded = ron::ser::to_string(&song).expect("song serializes");
+        let personality = ron::ser::to_string(&song.desk_personality)
+            .expect("personality serializes independently");
+        let field = format!("desk_personality:{personality},");
+        assert!(
+            encoded.contains(&field),
+            "test could not find the new field"
+        );
+        let older = encoded.replacen(&field, "", 1);
+        let decoded: Song = ron::from_str(&older).expect("older song still loads");
+        assert_eq!(decoded.desk_personality, DeskPersonality::default());
+    }
+
+    #[test]
+    fn personality_follows_permanent_track_and_rail_identity_not_order() {
+        let mut song = Song::default();
+        let second = song.add_track(TrackKind::Audio);
+        let first = song.tracks[0].id;
+        let personality = song.desk_personality;
+        let first_traits = personality.traits(DeskPathIdentity::Track(first));
+        let second_traits = personality.traits(DeskPathIdentity::Track(second));
+        assert_ne!(first_traits, second_traits);
+
+        assert!(song.move_track(0, true));
+        assert_eq!(song.tracks[0].id, second);
+        assert_eq!(
+            personality.traits(DeskPathIdentity::Track(first)),
+            first_traits
+        );
+        assert_eq!(
+            personality.traits(DeskPathIdentity::Track(second)),
+            second_traits
+        );
+
+        let bus_zero = song.console.buses[0].id;
+        let bus_zero_traits = personality.traits(DeskPathIdentity::Rail(bus_zero));
+        song.console.buses.swap(0, 1);
+        song.furnish();
+        let moved = song
+            .console
+            .buses
+            .iter()
+            .find(|rail| rail.id == bus_zero)
+            .expect("the rail identity moved with its rail");
+        assert_eq!(
+            personality.traits(DeskPathIdentity::Rail(moved.id)),
+            bus_zero_traits
+        );
+    }
+
+    #[test]
+    fn old_unassigned_rails_are_claimed_once_and_never_readdressed() {
+        let mut song = Song::default();
+        for rail in &mut song.console.buses {
+            rail.id = RailId::Unassigned;
+        }
+        for rail in &mut song.console.aux {
+            rail.id = RailId::Unassigned;
+        }
+        song.console.mix.id = RailId::Unassigned;
+        song.furnish();
+        assert_eq!(
+            song.console
+                .buses
+                .iter()
+                .map(|rail| rail.id)
+                .collect::<Vec<_>>(),
+            [
+                RailId::Bus(0),
+                RailId::Bus(1),
+                RailId::Bus(2),
+                RailId::Bus(3),
+            ]
+        );
+        assert_eq!(
+            song.console
+                .aux
+                .iter()
+                .map(|rail| rail.id)
+                .collect::<Vec<_>>(),
+            [RailId::Return(0), RailId::Return(1)]
+        );
+        assert_eq!(song.console.mix.id, RailId::Mix);
+    }
+
+    #[test]
+    fn hostile_timeline_marks_normalize_to_a_bounded_sorted_map() {
+        let mut song = Song::default();
+        song.bpm = f64::NAN;
+        song.tempo = vec![
+            TempoMark {
+                tick: 96,
+                bpm: 90.0,
+            },
+            TempoMark {
+                tick: 0,
+                bpm: f64::INFINITY,
+            },
+            TempoMark {
+                tick: 48,
+                bpm: 110.0,
+            },
+        ];
+        song.meter = vec![
+            MeterMark {
+                tick: 96,
+                numerator: u32::MAX,
+                denominator: 1,
+            },
+            MeterMark {
+                tick: 48,
+                numerator: 7,
+                denominator: 8,
+            },
+            MeterMark {
+                tick: 0,
+                numerator: 5,
+                denominator: 3,
+            },
+        ];
+
+        song.normalize_timeline();
+
+        assert_eq!(song.base_bpm(), 120.0);
+        assert_eq!(
+            song.tempo.iter().map(|mark| mark.tick).collect::<Vec<_>>(),
+            [48, 96]
+        );
+        assert_eq!(
+            song.meter,
+            vec![MeterMark {
+                tick: 48,
+                numerator: 7,
+                denominator: 8,
+            }]
+        );
+        assert!(!song.set_meter_mark(0, u32::MAX, 1));
+        assert!(!song.set_meter_mark(0, 5, 3));
+        assert!(!song.set_meter_mark(0, 4, 128));
+    }
+
+    #[test]
     fn block_creation_rejects_overlap_and_keeps_timeline_ordered() {
         let mut song = Song::default();
         assert!(
@@ -3450,6 +4258,124 @@ mod track_tests {
 }
 
 #[cfg(test)]
+mod modulation_model_tests {
+    use super::*;
+
+    #[test]
+    fn an_older_song_defaults_to_an_empty_modulation_page() {
+        let text = ron::ser::to_string(&Song::default()).expect("serializes");
+        let older = text
+            .replace("modulators:[],", "")
+            .replace("mod_wires:[],", "")
+            .replace("next_modulation_id:1,", "");
+        assert!(!older.contains("modulators"));
+        assert!(!older.contains("mod_wires"));
+        let mut song: Song = ron::from_str(&older).expect("an older Song still opens");
+        assert!(song.modulators.is_empty());
+        assert!(song.mod_wires.is_empty());
+        assert_eq!(song.add_lfo(), Some(1));
+    }
+
+    #[test]
+    fn modulation_follows_track_surgery_and_device_removal() {
+        let mut song = Song::default();
+        song.add_track(TrackKind::Instrument);
+        let source = song.add_follower(0).expect("a follower fits");
+        song.add_mod_wire(source, 1, TRACK_PAN)
+            .expect("a wire fits");
+
+        assert!(song.move_track(0, true));
+        assert!(matches!(
+            song.modulators[0].kind,
+            ModKind::Follower { track: 1 }
+        ));
+        assert_eq!(song.mod_wires[0].track, 0);
+
+        let effect = song
+            .add_device(0, DeviceKind::Filter)
+            .expect("a filter fits");
+        let cutoff = crate::targets::device_target(effect.0, DeviceKind::Filter.spec(), "cutoff");
+        song.add_mod_wire(source, 0, cutoff)
+            .expect("the instance target resolves");
+        assert_eq!(song.mod_wires.len(), 2);
+        song.remove_device(0, effect).expect("the filter leaves");
+        assert_eq!(song.mod_wires.len(), 1, "its wire left with it");
+
+        song.remove_track(1).expect("the followed track leaves");
+        assert!(song.modulators.is_empty());
+        assert!(song.mod_wires.is_empty());
+    }
+
+    #[test]
+    fn hostile_modulation_is_bounded_repaired_and_pruned() {
+        let mut song = Song::default();
+        song.modulators = vec![
+            Modulator {
+                id: 4,
+                kind: ModKind::Lfo {
+                    shape: ModShape::Saw,
+                    rate_beats: 2.0,
+                    free: false,
+                    hz: 1.0,
+                },
+            },
+            Modulator {
+                id: 0,
+                kind: ModKind::Follower { track: 0 },
+            },
+            Modulator {
+                id: 9,
+                kind: ModKind::Follower { track: 99 },
+            },
+        ];
+        song.mod_wires = vec![
+            ModWire {
+                id: 0,
+                source: 4,
+                track: 0,
+                target: TRACK_PAN.to_owned(),
+                depth: 9.0,
+                curve: -3.0,
+                steps: u32::MAX,
+                smooth_ms: 9_000.0,
+                ..ModWire::default()
+            },
+            ModWire {
+                id: 8,
+                source: 99,
+                track: 0,
+                target: TRACK_PAN.to_owned(),
+                ..ModWire::default()
+            },
+            ModWire {
+                id: 12,
+                source: 4,
+                track: 0,
+                target: TRACK_PAN.to_owned(),
+                depth: -0.5,
+                ..ModWire::default()
+            },
+        ];
+
+        song.normalize_modulation();
+        assert_eq!(song.modulators.len(), 2, "orphan follower survived");
+        assert!(song.modulators.iter().all(|source| source.id != 0));
+        assert_eq!(
+            song.mod_wires.len(),
+            1,
+            "a dangling or duplicate route survived"
+        );
+        let wire = &song.mod_wires[0];
+        assert_ne!(wire.id, 0);
+        assert_eq!(wire.depth, 1.0);
+        assert_eq!(wire.curve, -1.0);
+        assert_eq!(wire.steps, 64);
+        assert_eq!(wire.smooth_ms, 2_000.0);
+        assert!(song.next_modulation_id != 0);
+    }
+}
+
+#[cfg(test)]
 mod mixer_tests {
     use super::*;
 
@@ -3690,9 +4616,12 @@ mod chain_tests {
 
     #[test]
     fn a_song_written_before_devices_still_opens_and_sounds_the_same() {
-        // The empty chain is the meaningful default: an instrument track
-        // with nothing on it sounds what it always sounded.
-        let text = ron::ser::to_string(&Song::default()).expect("serializes");
+        // A missing chain field still means the old empty chain at the
+        // serde layer. The document migration is what installs the two
+        // unity-gain boundary devices for an old project.
+        let mut song = Song::default();
+        song.tracks[0].chain.clear();
+        let text = ron::ser::to_string(&song).expect("serializes");
         let older = text.replace("chain:[],", "");
         assert!(
             !older.contains("chain"),
@@ -3700,6 +4629,21 @@ mod chain_tests {
         );
         let loaded: Song = ron::from_str(&older).expect("a pre-chain project must still open");
         assert!(loaded.tracks[0].chain.is_empty());
+    }
+
+    #[test]
+    fn every_new_track_starts_between_two_unity_gain_utilities() {
+        let song = song();
+        for track in &song.tracks {
+            assert_eq!(track.chain.len(), 2);
+            assert_eq!(track.chain[0].kind, DeviceKind::Utility);
+            assert_eq!(track.chain[0].role, DeviceRole::InputGain);
+            assert_eq!(track.chain[1].kind, DeviceKind::Utility);
+            assert_eq!(track.chain[1].role, DeviceRole::OutputGain);
+            assert_ne!(track.chain[0].id, track.chain[1].id);
+            assert_ne!(track.chain[0].id, DeviceId(0));
+            assert_ne!(track.chain[1].id, DeviceId(0));
+        }
     }
 
     #[test]
@@ -3714,7 +4658,7 @@ mod chain_tests {
         let kinds: Vec<DeviceId> = song.tracks[0].chain.iter().map(|d| d.id).collect();
         assert_eq!(
             kinds,
-            [poly, reverb],
+            [poly, DeviceId(1), reverb, DeviceId(2)],
             "the instrument did not take the head the effect was already occupying"
         );
     }
@@ -3726,7 +4670,7 @@ mod chain_tests {
         let second = song.add_device(0, DeviceKind::Haze).expect("another");
         assert_eq!(
             song.tracks[0].chain.len(),
-            1,
+            3,
             "two instruments on one track"
         );
         assert_eq!(song.tracks[0].chain[0].id, second);
@@ -3756,7 +4700,7 @@ mod chain_tests {
             "an effect would not move later"
         );
         let order: Vec<DeviceId> = song.tracks[0].chain.iter().map(|d| d.id).collect();
-        assert_eq!(order, [poly, b, a]);
+        assert_eq!(order, [poly, DeviceId(1), b, a, DeviceId(2)]);
 
         assert!(
             !song.move_device(0, b, false),
@@ -3787,7 +4731,7 @@ mod chain_tests {
         // Asked for the head, an effect lands right behind it.
         let put = song.insert_device(0, 0, taken.clone()).expect("put");
         let order: Vec<DeviceId> = song.tracks[0].chain.iter().map(|d| d.id).collect();
-        assert_eq!(order, [poly, put, a, b]);
+        assert_eq!(order, [poly, DeviceId(1), put, a, b, DeviceId(2)]);
         assert_ne!(put, b, "the put device kept an id that is in use");
         let device = song.device(put).expect("there");
         assert!(device.bypassed, "the bypass did not travel");
@@ -3806,14 +4750,15 @@ mod chain_tests {
             .insert_device(0, 99, taken.clone())
             .expect("put past the tail");
         assert_ne!(again, put);
-        assert_eq!(song.tracks[0].chain.len(), 5);
-        assert_eq!(song.tracks[0].chain.last().map(|d| d.id), Some(again));
+        assert_eq!(song.tracks[0].chain.len(), 7);
+        assert_eq!(song.tracks[0].chain[5].id, again);
+        assert_eq!(song.tracks[0].chain.last().map(|d| d.id), Some(DeviceId(2)));
 
         // An instrument put anywhere replaces the head.
         let head = song.remove_device(0, poly).expect("there");
         let replaced = song.insert_device(0, 3, head).expect("put");
         assert_eq!(song.tracks[0].chain[0].id, replaced);
-        assert_eq!(song.tracks[0].chain.len(), 5);
+        assert_eq!(song.tracks[0].chain.len(), 7);
 
         // And an audio track refuses it, as it refuses every instrument.
         let head = song.remove_device(0, replaced).expect("there");
@@ -3854,7 +4799,13 @@ mod chain_tests {
         let kinds: Vec<DeviceKind> = song.tracks[0].chain.iter().map(|d| d.kind).collect();
         assert_eq!(
             kinds,
-            [DeviceKind::Poly, DeviceKind::Reverb, DeviceKind::Echo],
+            [
+                DeviceKind::Poly,
+                DeviceKind::Utility,
+                DeviceKind::Reverb,
+                DeviceKind::Echo,
+                DeviceKind::Utility,
+            ],
             "the head was not repaired, or the effects were rearranged with it"
         );
     }
@@ -3870,7 +4821,10 @@ mod chain_tests {
             .push(Device::new(DeviceId(2), DeviceKind::Reverb));
         song.normalize_chains();
         let kinds: Vec<DeviceKind> = song.tracks[1].chain.iter().map(|d| d.kind).collect();
-        assert_eq!(kinds, [DeviceKind::Reverb]);
+        assert_eq!(
+            kinds,
+            [DeviceKind::Utility, DeviceKind::Reverb, DeviceKind::Utility]
+        );
     }
 
     #[test]

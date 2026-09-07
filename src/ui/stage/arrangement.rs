@@ -106,8 +106,73 @@ impl Default for Arrangement {
 /// The ticks in one bar at `tick`, from the song's meter there.
 pub fn bar_ticks(song: &Song, tick: usize) -> usize {
     let (num, den) = song.meter_at(tick, (4, 4));
-    let beats = (u64::from(num) * 4 / u64::from(den.max(1))).max(1) as usize;
-    beats * TICKS_PER_BEAT
+    (u64::from(num.max(1))
+        .saturating_mul(TICKS_PER_BEAT as u64)
+        .saturating_mul(4)
+        / u64::from(den.max(1)))
+    .max(1) as usize
+}
+
+/// One notated beat at `tick`. `TICKS_PER_BEAT` is a quarter note, so
+/// 7/8 advances in 24-tick eighth-note beats rather than 48-tick quarters.
+fn beat_ticks(song: &Song, tick: usize) -> usize {
+    let (_, denominator) = song.meter_at(tick, (4, 4));
+    (TICKS_PER_BEAT.saturating_mul(4) / denominator.max(1) as usize).max(1)
+}
+
+fn meter_origin(song: &Song, tick: usize) -> usize {
+    song.meter
+        .iter()
+        .filter(|mark| mark.tick <= tick && usable_meter_mark(mark))
+        .max_by_key(|mark| mark.tick)
+        .map_or(0, |mark| mark.tick)
+}
+
+fn usable_meter_mark(mark: &crate::sequencing::MeterMark) -> bool {
+    (1..=crate::sequencing::MAX_METER_NUMERATOR).contains(&mark.numerator)
+        && mark.denominator.is_power_of_two()
+        && mark.denominator <= crate::sequencing::MAX_METER_DENOMINATOR
+}
+
+/// The next bar line, treating a meter mark as a fresh bar even when it was
+/// authored off the previous signature's grid.
+fn next_bar_tick(song: &Song, tick: usize) -> usize {
+    let origin = meter_origin(song, tick);
+    let length = bar_ticks(song, tick).max(1);
+    let nominal =
+        origin.saturating_add((tick.saturating_sub(origin) / length + 1).saturating_mul(length));
+    song.meter
+        .iter()
+        .filter(|mark| mark.tick > tick && usable_meter_mark(mark))
+        .min_by_key(|mark| mark.tick)
+        .map_or(nominal, |mark| nominal.min(mark.tick))
+}
+
+fn next_grid_tick(song: &Song, tick: usize, beat_grid: bool) -> usize {
+    if !beat_grid {
+        return next_bar_tick(song, tick);
+    }
+    let origin = meter_origin(song, tick);
+    let length = beat_ticks(song, tick).max(1);
+    let nominal =
+        origin.saturating_add((tick.saturating_sub(origin) / length + 1).saturating_mul(length));
+    song.meter
+        .iter()
+        .filter(|mark| mark.tick > tick && usable_meter_mark(mark))
+        .min_by_key(|mark| mark.tick)
+        .map_or(nominal, |mark| nominal.min(mark.tick))
+}
+
+fn previous_grid_tick(song: &Song, tick: usize, beat_grid: bool) -> usize {
+    let before = tick.saturating_sub(1);
+    let origin = meter_origin(song, before);
+    let length = if beat_grid {
+        beat_ticks(song, before)
+    } else {
+        bar_ticks(song, before)
+    }
+    .max(1);
+    origin + before.saturating_sub(origin) / length * length
 }
 
 impl Arrangement {
@@ -218,21 +283,33 @@ impl Arrangement {
     /// bar otherwise.
     pub fn grid_ticks(&self, song: &Song) -> usize {
         if self.beat_grid() {
-            TICKS_PER_BEAT
+            beat_ticks(song, self.tick)
         } else {
-            bar_ticks(song, self.tick)
+            next_bar_tick(song, self.tick)
+                .saturating_sub(self.tick)
+                .max(1)
         }
     }
 
     /// The ticks the time area spans.
     pub fn view_len(&self, song: &Song) -> usize {
-        (self.bars_across() * bar_ticks(song, self.view_start)).max(1)
+        let mut end = self.view_start;
+        for _ in 0..self.bars_across() {
+            end = next_bar_tick(song, end);
+        }
+        end.saturating_sub(self.view_start).max(1)
     }
 
     /// `tick` brought down onto the grid.
     pub fn snap(&self, song: &Song, tick: usize) -> usize {
-        let grid = self.grid_ticks(song).max(1);
-        tick / grid * grid
+        let origin = meter_origin(song, tick);
+        let grid = if self.beat_grid() {
+            beat_ticks(song, tick)
+        } else {
+            bar_ticks(song, tick)
+        }
+        .max(1);
+        origin + tick.saturating_sub(origin) / grid * grid
     }
 
     /// The view pages after the cursor: the page the cursor is on, and
@@ -251,14 +328,12 @@ impl Arrangement {
                 if self.tick == 0 {
                     return false;
                 }
-                let grid = self.grid_ticks(song);
-                self.tick = self.snap(song, self.tick.saturating_sub(grid));
+                self.tick = previous_grid_tick(song, self.tick, self.beat_grid());
                 self.fit(song);
                 true
             }
             Step::Right => {
-                let grid = self.grid_ticks(song);
-                self.tick = self.snap(song, self.tick) + grid;
+                self.tick = next_grid_tick(song, self.tick, self.beat_grid());
                 self.fit(song);
                 true
             }
@@ -1071,6 +1146,45 @@ pub(in crate::ui::stage) mod tests {
         assert!(!arr.step(&song, Step::Down), "walked past the last track");
         assert!(arr.step(&song, Step::Up));
         assert!(!arr.step(&song, Step::Up), "walked above the first track");
+    }
+
+    #[test]
+    fn denominator_and_meter_marks_define_the_grid() {
+        let mut song = song_with_tracks(1);
+        assert!(song.set_meter_mark(0, 7, 8));
+        assert_eq!(bar_ticks(&song, 0), TICKS_PER_BEAT * 7 / 2);
+
+        let mut arr = Arrangement::default();
+        assert_eq!(arr.grid_ticks(&song), TICKS_PER_BEAT * 7 / 2);
+        assert!(arr.zoom(&song, true));
+        assert_eq!(arr.grid_ticks(&song), TICKS_PER_BEAT / 2);
+
+        // A mark between old beats is itself the next grid boundary and a
+        // fresh metric origin, rather than being stepped over.
+        let mark = TICKS_PER_BEAT / 2 + 5;
+        assert!(song.set_meter_mark(mark, 3, 4));
+        arr.tick = TICKS_PER_BEAT / 2;
+        assert!(arr.step(&song, Step::Right));
+        assert_eq!(arr.tick, mark);
+        assert!(arr.step(&song, Step::Right));
+        assert_eq!(arr.tick, mark + TICKS_PER_BEAT);
+        assert!(arr.step(&song, Step::Left));
+        assert_eq!(arr.tick, mark);
+    }
+
+    #[test]
+    fn hostile_meter_data_cannot_turn_one_selection_into_an_unbounded_walk() {
+        let mut song = song_with_tracks(1);
+        song.meter.push(crate::sequencing::MeterMark {
+            tick: 0,
+            numerator: u32::MAX,
+            denominator: 1,
+        });
+        assert_eq!(bar_ticks(&song, 0), TICKS_PER_BEAT * 4);
+
+        let mut arr = Arrangement::default();
+        arr.toggle_selection(&song);
+        assert_eq!(arr.selected.len(), TICKS_PER_BEAT * 4);
     }
 
     /// Left at the start refuses; Right pages the view along after the

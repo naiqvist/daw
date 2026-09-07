@@ -53,6 +53,21 @@ pub trait Host {
     /// Machine-local preferences, on the way out and at intervals.
     fn save(&mut self, storage: &mut Storage);
 
+    /// The window manager asked to close the application. Returning false
+    /// keeps the window alive so a host with unsaved work can put up its own
+    /// Save / Discard / Cancel interlock. Hosts without documents retain the
+    /// ordinary immediate-close behaviour.
+    fn close_requested(&mut self) -> bool {
+        true
+    }
+
+    /// A deferred close was approved from inside the application's UI. The
+    /// shell checks after each presented frame so a confirmation surface does
+    /// not need to know or import winit.
+    fn wants_exit(&self) -> bool {
+        false
+    }
+
     /// Once, after the context exists and before the first frame —
     /// fonts, zoom, the restored theme. Under eframe this was whatever
     /// `App::new` did with `CreationContext::egui_ctx`; the context now
@@ -247,12 +262,18 @@ impl<A: Host> winit::application::ApplicationHandler for Shell<A> {
 
         match event {
             winit::event::WindowEvent::CloseRequested => {
-                // The one place preferences MUST be written: an exit
-                // that dropped them would lose thirty seconds of
-                // settings and look like a bug in the settings.
-                self.app.save(&mut self.storage);
-                self.storage.flush();
-                event_loop.exit();
+                if self.app.close_requested() {
+                    // The one place preferences MUST be written: an exit
+                    // that dropped them would lose thirty seconds of
+                    // settings and look like a bug in the settings.
+                    self.app.save(&mut self.storage);
+                    self.storage.flush();
+                    event_loop.exit();
+                } else {
+                    // The host has made its interlock visible. Ensure it gets
+                    // a frame even when the application was otherwise idle.
+                    live.window.request_redraw();
+                }
             }
             winit::event::WindowEvent::Resized(size) => {
                 self.resize([size.width, size.height]);
@@ -441,6 +462,13 @@ impl<A: Host> Shell<A> {
             self.app.save(&mut self.storage);
             self.storage.flush();
             self.last_save = std::time::Instant::now();
+        }
+
+        if self.app.wants_exit() {
+            self.app.save(&mut self.storage);
+            self.storage.flush();
+            event_loop.exit();
+            return;
         }
 
         // The app asks for frames when it has something moving — a

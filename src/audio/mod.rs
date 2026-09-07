@@ -515,7 +515,9 @@ pub struct BlockSnapshot {
     /// difference between attributing and guessing.
     pub last_xrun_block: u64,
 
-    /// Transport, as of this block's start.
+    /// Transport immediately after this block: the next block's start. The
+    /// samples and meters above describe the block which ended here, while
+    /// this edge is the clock a frame-rate input service timestamps against.
     pub playing: bool,
     pub position: u64,
     pub beat: f64,
@@ -615,6 +617,9 @@ const PARAM_RING: usize = 256;
 const MOD_RING: usize = 128;
 const TRANSPORT_RING: usize = 64;
 const AUDITION_RING: usize = 8;
+const SHUTDOWN_RUNNING: u8 = 0;
+const SHUTDOWN_REQUESTED: u8 = 1;
+const SHUTDOWN_ACKNOWLEDGED: u8 = 2;
 
 /// Take at most `max` letters from `rx`, handing each to `apply`. Returns
 /// how many were taken.
@@ -644,6 +649,32 @@ fn drain_bounded<T>(rx: &mut rtrb::Consumer<T>, max: usize, mut apply: impl FnMu
         taken += 1;
     }
     taken
+}
+
+/// Move callback-owned retired values toward the green-side collector.
+///
+/// A failed `rtrb::Producer::push` returns ownership of the value. Ignoring
+/// that error would DROP it on the audio thread, so a full ring puts the value
+/// straight back into its fixed callback-owned slot. No value is destroyed by
+/// this function, and the walk is bounded by `N`.
+fn flush_retirement_backlog<T, const N: usize>(
+    tx: &mut rtrb::Producer<T>,
+    backlog: &mut [Option<T>; N],
+) {
+    for slot in backlog {
+        let Some(item) = slot.take() else {
+            continue;
+        };
+        match tx.push(item) {
+            Ok(()) => {}
+            Err(rtrb::PushError::Full(item)) => {
+                *slot = Some(item);
+                // This producer is the only writer. If this push found the
+                // ring full, every later push in the same pass would too.
+                break;
+            }
+        }
+    }
 }
 
 /// Owns the running audio stream. Dropping this stops it.
@@ -696,6 +727,10 @@ pub struct Engine {
     /// means the recording has a HOLE in it, which the user must be told
     /// about — it is not a dropout that can be heard and shrugged off.
     capture_overruns: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Control asks the callback to stop active plug-in processors before
+    /// stream teardown; the callback acknowledges after doing so on its own
+    /// thread. This is an atomic edge, never a blocking red-zone command.
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicU8>,
 }
 
 impl Engine {
@@ -794,6 +829,20 @@ impl Engine {
         let mut transport = Transport::new(cfg.sample_rate as f64);
         let (mut trash_tx, trash_rx) = rtrb::RingBuffer::<Box<Schedule>>::new(4);
         let mut schedule: Option<Box<Schedule>> = None;
+        // Retirements which cannot cross the trash ring yet remain owned by
+        // the callback in fixed storage. Four slots match the most schedules
+        // we can accept in one block; once they are full, schedule handoff
+        // simply waits for the green side to collect rather than freeing an
+        // old graph in the red zone.
+        let mut retirement_backlog: [Option<Box<Schedule>>; SCHEDULE_RING] =
+            std::array::from_fn(|_| None);
+        // A newly compiled chart has fresh sequencer cursors. Its first
+        // segment must therefore be treated like a seek, even when the
+        // transport itself continued seamlessly while the green side rebuilt
+        // the graph. Without this edge, a mid-play swap starts each fresh
+        // cursor at event zero and can fire the whole elapsed arrangement in
+        // one callback.
+        let mut schedule_discontinuity = false;
 
         // Captured input on its way to a file. Sized for four seconds of
         // every input channel, which is far more backlog than a green
@@ -808,6 +857,8 @@ impl Engine {
         let callback_capturing = std::sync::Arc::clone(&capturing);
         let callback_capture_start = std::sync::Arc::clone(&capture_start);
         let callback_overruns = std::sync::Arc::clone(&capture_overruns);
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(SHUTDOWN_RUNNING));
+        let callback_shutdown = std::sync::Arc::clone(&shutdown);
         // Whether the run in progress has already stamped its start. Owned
         // by the callback alone, so it needs no atomic.
         let mut capture_stamped = false;
@@ -866,10 +917,43 @@ impl Engine {
                         return;
                     };
 
-                    // Swap in a newer schedule if one arrived. Pop and push are
-                    // lock-free and constant-time; the old Box goes back to the
-                    // UI thread to be dropped there.
-                    drain_bounded(&mut schedule_rx, SCHEDULE_RING, |mut new_schedule| {
+                    // CLAP start/stop belong to the processing thread. Keep
+                    // the stream alive until this edge is acknowledged; all
+                    // later callbacks stay silent while control tears down.
+                    let shutdown_state =
+                        callback_shutdown.load(std::sync::atomic::Ordering::Acquire);
+                    if shutdown_state != SHUTDOWN_RUNNING {
+                        if shutdown_state == SHUTDOWN_REQUESTED {
+                            if let Some(active) = schedule.as_mut() {
+                                active.prepare_for_retirement();
+                            }
+                            callback_shutdown
+                                .store(SHUTDOWN_ACKNOWLEDGED, std::sync::atomic::Ordering::Release);
+                        }
+                        output.fill(0.0);
+                        return;
+                    }
+
+                    // Swap in newer schedules if they arrived. Each retiring
+                    // Box first gets a guaranteed callback-owned slot; only
+                    // the green side ever drops it. This is slightly more
+                    // ceremony than ignoring a full-ring error, but that error
+                    // OWNS the Box and would otherwise run its destructor here.
+                    flush_retirement_backlog(&mut trash_tx, &mut retirement_backlog);
+                    let mut schedules_taken = 0usize;
+                    while schedules_taken < SCHEDULE_RING {
+                        let retire_slot = if schedule.is_some() {
+                            retirement_backlog.iter().position(Option::is_none)
+                        } else {
+                            // No old schedule means no retirement slot needed.
+                            Some(SCHEDULE_RING)
+                        };
+                        let Some(retire_slot) = retire_slot else {
+                            break;
+                        };
+                        let Ok(mut new_schedule) = schedule_rx.pop() else {
+                            break;
+                        };
                         // Modulation memory rides across the seam: a
                         // recompile happens for a clip drag or a tempo
                         // nudge, once a second, while audio plays — and a
@@ -877,12 +961,14 @@ impl Engine {
                         if let Some(old) = schedule.as_ref() {
                             new_schedule.adopt_modulation_continuity(old);
                         }
-                        if let Some(old) = schedule.replace(new_schedule) {
-                            // If trash is somehow full the old schedule leaks
-                            // until stream teardown — still never freed here.
-                            let _ = trash_tx.push(old);
+                        if let Some(mut old) = schedule.replace(new_schedule) {
+                            old.prepare_for_retirement();
+                            retirement_backlog[retire_slot] = Some(old);
                         }
-                    });
+                        schedule_discontinuity = true;
+                        schedules_taken += 1;
+                    }
+                    flush_retirement_backlog(&mut trash_tx, &mut retirement_backlog);
 
                     // Parameter letters in arrival order; each apply is two
                     // indexes and a store. The count is the bound — the ring's
@@ -952,13 +1038,44 @@ impl Engine {
                         }
                     } else {
                         // Segment loop: split the block at transport events so
-                        // loop points are sample-accurate. Progress is proven
-                        // (every segment >= 1 frame); the bound is belt and
-                        // braces against the impossible.
+                        // loop points and tempo marks are sample-accurate.
+                        // Every segment is at least one frame, so `frames`
+                        // iterations is a complete hard bound even for a map
+                        // with a boundary on every sample.
                         let mut done = 0usize;
-                        let mut segments = 0u32;
-                        while done < frames && segments < 64 {
-                            let seg = transport.next_segment(frames - done);
+                        let mut segments_left = frames;
+                        while done < frames && segments_left > 0 {
+                            // A ProcessCtx carries one constant tempo. Bound
+                            // the transport's ordinary loop segment at the
+                            // arrangement schedule's next tempo mark as well,
+                            // so a mark is sample-exact without mutating or
+                            // allocating any map state in the callback.
+                            let remaining = frames - done;
+                            // A stopped clock cannot cross a tempo boundary:
+                            // its position is frozen. Walking the same nearby
+                            // boundary once per output sample would only repeat
+                            // identical work, so stopped monitoring is always
+                            // one segment.
+                            let limited = if transport.playing() {
+                                schedule.as_ref().map_or(remaining, |schedule| {
+                                    schedule.frames_until_control_change(
+                                        transport.position(),
+                                        remaining,
+                                    )
+                                })
+                            } else {
+                                remaining
+                            };
+                            let seg = transport.next_segment(limited);
+                            let beat = schedule.as_ref().map_or(seg.beat, |schedule| {
+                                schedule.beat_at(seg.position, transport.map)
+                            });
+                            let beats_per_sample = schedule.as_ref().map_or_else(
+                                || transport.map.beats_per_sample(),
+                                |schedule| {
+                                    schedule.beats_per_sample_at(seg.position, transport.map)
+                                },
+                            );
                             let ctx = ProcessCtx {
                                 device_input: input,
                                 in_channels,
@@ -967,12 +1084,17 @@ impl Engine {
                                 len: seg.len,
                                 playing: seg.playing,
                                 position: seg.position,
-                                beat: seg.beat,
-                                beats_per_sample: transport.map.beats_per_sample(),
-                                discontinuity: seg.discontinuity,
+                                beat,
+                                beats_per_sample,
+                                discontinuity: seg.discontinuity || schedule_discontinuity,
                             };
                             match schedule.as_mut() {
-                                Some(s) => s.run(output, &ctx),
+                                Some(s) => {
+                                    s.run(output, &ctx);
+                                    // One segment is enough to reseek every
+                                    // PatternClock in the immutable schedule.
+                                    schedule_discontinuity = false;
+                                }
                                 None => {
                                     for ch in 0..out_channels {
                                         let start = ch * frames + done;
@@ -981,10 +1103,10 @@ impl Engine {
                                 }
                             }
                             done += seg.len;
-                            segments += 1;
+                            segments_left -= 1;
                         }
                         if done < frames {
-                            // Segment bound tripped (cannot happen by proof):
+                            // A segment returned zero despite its contract:
                             // fail to silence, not to stale buffer contents.
                             for ch in 0..out_channels {
                                 let start = ch * frames + done;
@@ -1092,6 +1214,11 @@ impl Engine {
                     let work_ns = t0.elapsed().as_nanos() as u64;
                     work_max_ns = work_max_ns.max(work_ns);
 
+                    let position = transport.position();
+                    let beat = schedule.as_ref().map_or_else(
+                        || transport.map.samples_to_beats(position),
+                        |schedule| schedule.beat_at(position, transport.map),
+                    );
                     telemetry_in.write(BlockSnapshot {
                         block,
                         frames: output.len() / out_channels,
@@ -1110,8 +1237,8 @@ impl Engine {
                         overflows,
                         last_xrun_block,
                         playing: transport.playing(),
-                        position: transport.position(),
-                        beat: transport.map.samples_to_beats(transport.position()),
+                        position,
+                        beat,
                         oversized_blocks,
                     });
                 });
@@ -1135,6 +1262,7 @@ impl Engine {
             capturing,
             capture_start,
             capture_overruns,
+            shutdown,
             last_seen_block: 0,
             last_advance: Instant::now(),
         })
@@ -1265,40 +1393,59 @@ impl Engine {
         }
     }
 
-    /// Send one transport command. Ring order makes multi-command gestures
-    /// (stop + seek + play) atomic with respect to audio.
-    pub fn transport(&mut self, cmd: TransportCmd) {
-        let _ = self.transport_tx.push(cmd);
+    /// Send one transport command, reporting whether the callback mailbox
+    /// accepted it. Callers which mirror transport state must only advance
+    /// that mirror after `true`, so a full ring is retried on their next
+    /// green-zone pass instead of silently losing the gesture.
+    pub fn transport(&mut self, cmd: TransportCmd) -> bool {
+        self.transport_tx.push(cmd).is_ok()
     }
 
     /// Send one parameter change, addressed by the node's permanent name tag.
-    /// If the ring is momentarily full (a knob dragged faster than the
-    /// callback drains), the newest value is the one that matters — dropping
-    /// this letter is fine, the next one supersedes it.
-    pub fn set_param(&mut self, node: NodeId, param: u32, value: f32) {
-        let _ = self.param_tx.push(Stamped {
-            epoch: self.epoch,
-            item: ParamChange {
-                node: node.to_bits(),
-                param,
-                value,
-            },
-        });
+    /// If the ring is momentarily full, return `false`. State-sync callers
+    /// then keep their revision dirty and resend the complete current state
+    /// on the next green-zone pass.
+    pub fn set_param(&mut self, node: NodeId, param: u32, value: f32) -> bool {
+        self.param_tx
+            .push(Stamped {
+                epoch: self.epoch,
+                item: ParamChange {
+                    node: node.to_bits(),
+                    param,
+                    value,
+                },
+            })
+            .is_ok()
     }
 
     /// Send one modulation edit — a wire's chain, or a source's definition.
-    /// Dropped on a full ring for the same reason a parameter letter is:
-    /// these carry whole state, so the next one supersedes this one.
-    pub fn set_modulation(&mut self, edit: modulation::ModEdit) {
-        let _ = self.mod_tx.push(Stamped {
-            epoch: self.epoch,
-            item: edit,
-        });
+    /// Returns whether the callback mailbox accepted the complete edit.
+    pub fn set_modulation(&mut self, edit: modulation::ModEdit) -> bool {
+        self.mod_tx
+            .push(Stamped {
+                epoch: self.epoch,
+                item: edit,
+            })
+            .is_ok()
     }
 }
 
 impl Drop for Engine {
     fn drop(&mut self) {
+        // A processor which started in the callback must stop there too.
+        // Request one final silent callback and wait a bounded interval while
+        // the stream is still alive. A backend which has already died cannot
+        // acknowledge; stream teardown remains the only possible fallback.
+        self.capturing
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.shutdown
+            .store(SHUTDOWN_REQUESTED, std::sync::atomic::Ordering::Release);
+        let deadline = Instant::now() + std::time::Duration::from_millis(100);
+        while self.shutdown.load(std::sync::atomic::Ordering::Acquire) != SHUTDOWN_ACKNOWLEDGED
+            && Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
         // Stop the callback first, then drop both ends of its audition ring;
         // every Owned queued or held there can now reach the collector before
         // the collector itself leaves this green thread.
@@ -1316,14 +1463,6 @@ impl Drop for Engine {
 mod device_tests {
     use super::*;
 
-    /// A DIAGNOSTIC, not a check: it prints what this machine can see, so
-    /// "the device picker is empty" can be answered without a GUI.
-    ///
-    /// `#[ignore]` because it talks to real hardware — the answer depends
-    /// on what is plugged in and whether a JACK server is up, which is
-    /// not something a test suite should have an opinion about. Run it
-    /// with `cargo test -- --ignored --nocapture list_the_output_devices`.
-    #[test]
     /// Does a backend deliver blocks at all on this machine? `#[ignore]`
     /// because it opens real hardware. `DAW_TEST_API=pulse` or `alsa`
     /// tries another backend — which is how the JACK shim's silence was
@@ -1346,6 +1485,14 @@ mod device_tests {
         assert!(block > 0, "no callback ran");
     }
 
+    /// A DIAGNOSTIC, not a check: it prints what this machine can see, so
+    /// "the device picker is empty" can be answered without a GUI.
+    ///
+    /// `#[ignore]` because it talks to real hardware — the answer depends
+    /// on what is plugged in and whether a JACK server is up, which is
+    /// not something a test suite should have an opinion about. Run it
+    /// with `cargo test -- --ignored --nocapture list_the_output_devices`.
+    #[test]
     #[ignore]
     fn list_the_output_devices() {
         for api in AudioApi::ALL {
@@ -1431,6 +1578,17 @@ mod audition_tests {
 #[cfg(test)]
 mod drain_tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct DropSpy(Arc<AtomicUsize>);
+
+    impl Drop for DropSpy {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     /// THE test. A producer that writes while the callback drains is what
     /// makes `while let Ok(..) = pop()` unbounded, and it is made
@@ -1480,6 +1638,37 @@ mod drain_tests {
         let _ = tx.push(1);
         assert_eq!(drain_bounded(&mut rx, 0, |_| {}), 0);
         assert!(rx.pop().is_ok(), "and the letter is untouched");
+    }
+
+    #[test]
+    fn a_full_retirement_ring_keeps_ownership_in_the_fixed_backlog() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let (mut tx, mut rx) = rtrb::RingBuffer::new(1);
+        tx.push(DropSpy(Arc::clone(&dropped)))
+            .expect("the ring starts empty");
+        let mut backlog = [
+            Some(DropSpy(Arc::clone(&dropped))),
+            Some(DropSpy(Arc::clone(&dropped))),
+        ];
+
+        flush_retirement_backlog(&mut tx, &mut backlog);
+        assert_eq!(
+            dropped.load(Ordering::Relaxed),
+            0,
+            "red-side push dropped a value"
+        );
+        assert!(backlog.iter().all(Option::is_some));
+
+        drop(rx.pop().expect("the green side takes the resident value"));
+        flush_retirement_backlog(&mut tx, &mut backlog);
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(backlog.iter().filter(|slot| slot.is_some()).count(), 1);
+
+        drop(rx.pop().expect("the first retirement crossed"));
+        flush_retirement_backlog(&mut tx, &mut backlog);
+        drop(rx.pop().expect("the second retirement crossed"));
+        assert!(backlog.iter().all(Option::is_none));
+        assert_eq!(dropped.load(Ordering::Relaxed), 3);
     }
 
     /// Order is preserved: these are letters, and a stop+seek+play gesture

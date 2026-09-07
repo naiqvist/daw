@@ -939,10 +939,10 @@ impl SequenceGrid {
         clip: Option<ClipView<'_>>,
         intents: &mut Vec<Intent>,
     ) {
-        if !ctx.input(|input| input.key_down(egui::Key::X)) {
+        if !ctx.input(|input| input.key_down(egui::Key::X) || input.modifiers.shift) {
             self.selection_anchor = None;
         }
-        let selecting = ctx.input(|input| input.key_down(egui::Key::X));
+        let selecting = ctx.input(|input| input.key_down(egui::Key::X) || input.modifiers.shift);
         let Some(utterance) = voice.sentence.consume(ctx) else {
             return;
         };

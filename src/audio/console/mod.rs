@@ -12,10 +12,9 @@
 //! needs is made in `new`, which runs green.
 //!
 //! Which kinds exist, what they are called and what their tables hold is
-//! the green side's business: `crate::console`. This module only knows
-//! how to make a core for a kind — and, until each section is written,
-//! makes a WIRE for it: a core that passes its input through untouched,
-//! so the desk is whole and silent-in-silent-out from the first day.
+//! the green side's business: `crate::console`. This module makes one real
+//! core for every kind. The registry is an exhaustive match on purpose: a
+//! new section cannot compile as a silent placeholder by accident.
 
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
@@ -33,6 +32,7 @@ pub mod iron;
 pub mod out;
 pub mod phase;
 pub mod preamp;
+pub mod pump;
 pub mod ring;
 pub mod room;
 pub mod scope;
@@ -79,55 +79,8 @@ pub trait SectionCore: Send {
     }
 }
 
-/// The core that is not written yet: a wire. Holds its settings so a
-/// letter is not lost, and passes sound through untouched.
-pub struct Wire {
-    kind: SectionKind,
-    values: [f32; MAX_PARAMS],
-}
-
-/// The widest table any section has, with room to spare.
-pub const MAX_PARAMS: usize = 16;
-
-impl Wire {
-    pub fn new(params: &SectionParams) -> Self {
-        let mut values = [0.0; MAX_PARAMS];
-        for (index, def) in params.kind.table().iter().enumerate().take(MAX_PARAMS) {
-            values[index] = def.clamp(params.value(def.id));
-        }
-        Self {
-            kind: params.kind,
-            values,
-        }
-    }
-
-    pub fn kind(&self) -> SectionKind {
-        self.kind
-    }
-
-    pub fn value(&self, param: u32) -> f32 {
-        self.values.get(param as usize).copied().unwrap_or(0.0)
-    }
-}
-
-impl SectionCore for Wire {
-    fn set_param(&mut self, param: u32, value: f32) {
-        let Some(def) = self.kind.table().get(param as usize) else {
-            return;
-        };
-        if let Some(slot) = self.values.get_mut(param as usize) {
-            *slot = def.clamp(value);
-        }
-    }
-
-    fn reset(&mut self) {}
-
-    fn process(&mut self, _l: &mut [f32], _r: &mut [f32], _clock: &Clock) {}
-}
-
 /// Green zone: the core for a section, at a sample rate and block size.
-/// Every kind is a [`Wire`] until its section is written; the match is
-/// where each one will take its place.
+/// The exhaustive match is a build-time completeness check for the desk.
 pub fn core_of(params: &SectionParams, sample_rate: f32, block: usize) -> Box<dyn SectionCore> {
     match params.kind {
         SectionKind::Preamp => Box::new(preamp::PreampCore::new(params, sample_rate, block)),
@@ -137,6 +90,7 @@ pub fn core_of(params: &SectionParams, sample_rate: f32, block: usize) -> Box<dy
         SectionKind::Hit => Box::new(hit::HitCore::new(params, sample_rate, block)),
         SectionKind::Vca => Box::new(vca::VcaCore::new(params, sample_rate, block)),
         SectionKind::Split => Box::new(split::SplitCore::new(params, sample_rate, block)),
+        SectionKind::Pump => Box::new(pump::PumpCore::new(params, sample_rate, block)),
         SectionKind::Drive => Box::new(drive::DriveCore::new(params, sample_rate, block)),
         SectionKind::Grit => Box::new(grit::GritCore::new(params, sample_rate, block)),
         SectionKind::Drift => Box::new(drift::DriftCore::new(params, sample_rate, block)),
@@ -155,7 +109,6 @@ pub fn core_of(params: &SectionParams, sample_rate: f32, block: usize) -> Box<dy
         SectionKind::Tape => Box::new(tape::TapeCore::new(params, sample_rate, block)),
         SectionKind::Shadow => Box::new(shadow::ShadowCore::new(params, sample_rate, block)),
         SectionKind::Spectra => Box::new(spectra::SpectraCore::new(params, sample_rate, block)),
-        _ => Box::new(Wire::new(params)),
     }
 }
 
@@ -238,9 +191,9 @@ mod tests {
         }
     }
 
-    /// A wire is a wire: whatever goes in comes out, at every block
-    /// length, for every kind at its defaults — on a quiet signal, so
-    /// a compressor's default threshold is not crossed.
+    /// Every optional section whose resting controls describe bypass passes
+    /// a quiet signal at every block length. PUMP is the one intentional
+    /// exception: once put IN, its useful resting depth is already audible.
     #[test]
     fn every_kind_compiles_to_something_that_passes_sound_through() {
         for kind in SectionKind::ALL {
@@ -257,6 +210,13 @@ mod tests {
                 // what makes them the desk rather than effects.
                 continue;
             }
+            if kind == SectionKind::Pump {
+                // PUMP is deliberately ready to hear when it is put IN:
+                // its resting DEPTH is halfway down. Its bypass lives at
+                // DEPTH zero (and, at the desk level, in the section being
+                // OUT), which pump's own tests hold sample-exact.
+                continue;
+            }
             for len in [0usize, 1, 7, 256] {
                 let mut l: Vec<f32> = (0..len).map(|i| (i as f32 * 0.1).sin() * 0.01).collect();
                 let mut r: Vec<f32> = l.iter().map(|s| -s).collect();
@@ -267,6 +227,30 @@ mod tests {
             }
             core.reset();
             assert_eq!(core.latency(), 0);
+        }
+    }
+
+    /// Live parameter letters must never move a channel in time. Every
+    /// oversampled structural section therefore keeps one fixed round-trip
+    /// delay at its floor, midpoint, and ceiling settings.
+    #[test]
+    fn oversampled_sections_keep_one_declared_latency_at_every_setting() {
+        let expected = crate::dsp::shaper::Oversampler2x::new().latency();
+        for kind in [
+            SectionKind::Preamp,
+            SectionKind::Cut,
+            SectionKind::Drive,
+            SectionKind::Iron,
+        ] {
+            let params = SectionParams::of(kind);
+            let mut core = core_of(&params, 48_000.0, 128);
+            assert_eq!(core.latency(), expected, "{kind:?} at defaults");
+            for def in kind.table() {
+                for value in [def.min, def.max, (def.min + def.max) * 0.5] {
+                    core.set_param(def.id, value);
+                    assert_eq!(core.latency(), expected, "{kind:?} {:?}={value}", def.id);
+                }
+            }
         }
     }
 
@@ -309,16 +293,5 @@ mod tests {
         let said = schedule.telemetry();
         assert!(said[5].level_db > -20.0, "slot 5 read {}", said[5].level_db);
         assert_eq!(said[4].level_db, Readout::default().level_db);
-    }
-
-    /// A letter lands clamped, and an id the table lacks is dropped.
-    #[test]
-    fn a_wire_keeps_its_settings_within_the_table() {
-        let params = SectionParams::of(SectionKind::Tone);
-        let mut wire = Wire::new(&params);
-        wire.set_param(crate::params::console::tone::LO, 40.0);
-        assert_eq!(wire.value(crate::params::console::tone::LO), 15.0);
-        wire.set_param(99, 1.0);
-        assert_eq!(wire.value(99), 0.0);
     }
 }

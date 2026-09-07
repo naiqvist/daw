@@ -168,6 +168,7 @@ impl Transport {
     pub fn next_segment(&mut self, remaining: usize) -> Segment {
         debug_assert!(remaining >= 1);
         let seg_start = self.pos;
+        let segment_playing = self.playing;
 
         let len = if !self.playing {
             remaining // position frozen; the graph still runs (monitoring)
@@ -187,20 +188,31 @@ impl Transport {
         // linear continuation; stop/resume at the same position stays equal.
         let discontinuity = self.playing && self.continuity != Some(seg_start);
 
-        if self.playing {
-            self.pos += len as u64;
-            self.continuity = Some(self.pos); // linear continuation, pre-wrap
-            if let Some((start, end)) = self.loop_region
-                && self.pos == end
-            {
-                self.pos = start;
+        if segment_playing {
+            if let Some(next) = self.pos.checked_add(len as u64) {
+                self.pos = next;
+                self.continuity = Some(self.pos); // linear continuation, pre-wrap
+                if let Some((start, end)) = self.loop_region
+                    && self.pos == end
+                {
+                    self.pos = start;
+                }
+            } else {
+                // There is no representable sample after u64::MAX. Sound the
+                // requested final segment against its clamped start, then park
+                // and stop; wrapping or panicking in the callback would turn a
+                // malformed seek into either the wrong song position or an
+                // audio-thread crash.
+                self.pos = u64::MAX;
+                self.continuity = None;
+                self.playing = false;
             }
         }
 
         Segment {
             position: seg_start,
             len,
-            playing: self.playing,
+            playing: segment_playing,
             beat: self.map.samples_to_beats(seg_start),
             discontinuity,
         }
@@ -300,6 +312,22 @@ mod tests {
         tr.apply(TransportCmd::Play);
         let segs = drive(&mut tr, 64);
         assert_eq!(segs[0].position, 999);
+    }
+
+    #[test]
+    fn a_seek_at_the_end_of_the_sample_clock_clamps_and_stops_without_wrapping() {
+        let mut tr = t();
+        tr.apply(TransportCmd::Seek(u64::MAX));
+        tr.apply(TransportCmd::Play);
+        let segment = tr.next_segment(256);
+        assert_eq!(segment.position, u64::MAX);
+        assert_eq!(segment.len, 256);
+        assert!(segment.playing, "the requested final segment still sounds");
+        assert_eq!(tr.position(), u64::MAX);
+        assert!(!tr.playing(), "the unrepresentable continuation is stopped");
+        let parked = tr.next_segment(256);
+        assert!(!parked.playing);
+        assert_eq!(parked.position, u64::MAX);
     }
 
     #[test]

@@ -194,10 +194,10 @@ impl RollPanel {
         }
         self.cursor_step = self.cursor_step.min(self.clip_steps - 1);
         self.cursor_rect = None;
-        if !ui.input(|input| input.key_down(egui::Key::X)) {
+        if !ui.input(|input| input.key_down(egui::Key::X) || input.modifiers.shift) {
             self.selection_anchor = None;
         }
-        let selecting = ui.input(|input| input.key_down(egui::Key::X));
+        let selecting = ui.input(|input| input.key_down(egui::Key::X) || input.modifiers.shift);
         if focused && let Some(utterance) = voice.sentence.consume(ui.ctx()) {
             self.refusal = None;
             self.speak(utterance, selecting, voice, clip, intents);

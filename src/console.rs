@@ -320,6 +320,100 @@ impl SectionKind {
     }
 }
 
+/// PUMP's control-voltage curve, shared by the red-side core and the
+/// green-side face.
+///
+/// `phase` is position within one selected note division, `depth` and
+/// `shape` are normalized 0..1, and `hold` is the share of that division
+/// spent at the floor. Keeping the law above the audio/UI split means the
+/// curve on the glass is the one multiplying the samples.
+pub mod pump_curve {
+    /// Whole, half, quarter, eighth, and sixteenth notes in the engine's
+    /// quarter-note beat unit.
+    pub const DIVISION_BEATS: [f64; 5] = [4.0, 2.0, 1.0, 0.5, 0.25];
+    /// The same choices as cells across one four-beat bar.
+    pub const LOBES_PER_BAR: [usize; 5] = [1, 2, 4, 8, 16];
+    /// HOLD never consumes the whole step: the VCA always has room to open.
+    pub const MAX_HOLD_SHARE: f32 = 0.6;
+
+    #[inline(always)]
+    pub fn division_beats(index: usize) -> f64 {
+        match index {
+            0 => 4.0,
+            1 => 2.0,
+            2 => 1.0,
+            3 => 0.5,
+            _ => 0.25,
+        }
+    }
+
+    pub fn lobes_per_bar(index: usize) -> usize {
+        match index {
+            0 => 1,
+            1 => 2,
+            2 => 4,
+            3 => 8,
+            _ => 16,
+        }
+    }
+
+    /// Map the surface's percent control to a fraction of one division.
+    pub fn hold_share(percent: f32) -> f32 {
+        percent.clamp(0.0, 100.0) / 100.0 * MAX_HOLD_SHARE
+    }
+
+    /// The linked VCA gain at one normalized step phase.
+    #[inline(always)]
+    pub fn gain_at_phase(phase: f32, depth: f32, shape: f32, hold: f32) -> f32 {
+        if depth == 0.0
+            || !phase.is_finite()
+            || !depth.is_finite()
+            || !shape.is_finite()
+            || !hold.is_finite()
+        {
+            return 1.0;
+        }
+        let phase = phase.rem_euclid(1.0);
+        let dwell = hold.clamp(0.0, 0.9);
+        let run = (1.0 - dwell).max(1e-3);
+        let x = if phase < dwell {
+            0.0
+        } else {
+            (phase - dwell) / run
+        };
+        let soft = 0.5 - 0.5 * (x * core::f32::consts::TAU).cos();
+        let hard = if x < 0.5 { 0.0 } else { 1.0 };
+        let profile = hard + (soft - hard) * shape.clamp(0.0, 1.0);
+        1.0 - depth.clamp(0.0, 1.0) * (1.0 - profile)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn the_cam_has_the_reference_shape() {
+            assert_eq!(gain_at_phase(0.0, 0.75, 0.0, 0.0), 0.25);
+            assert_eq!(gain_at_phase(0.499, 0.75, 0.0, 0.0), 0.25);
+            assert_eq!(gain_at_phase(0.5, 0.75, 0.0, 0.0), 1.0);
+            assert_eq!(gain_at_phase(0.999, 0.75, 0.0, 0.0), 1.0);
+            assert!((gain_at_phase(0.25, 0.75, 1.0, 0.0) - 0.625).abs() < 1e-6);
+            assert_eq!(gain_at_phase(0.5, 0.75, 1.0, 0.0), 1.0);
+            assert!((gain_at_phase(0.75, 0.75, 1.0, 0.0) - 0.625).abs() < 1e-6);
+        }
+
+        #[test]
+        fn division_views_and_hold_travel_stay_in_step() {
+            for index in 0..DIVISION_BEATS.len() {
+                assert_eq!(division_beats(index), DIVISION_BEATS[index]);
+                assert_eq!(lobes_per_bar(index), LOBES_PER_BAR[index]);
+            }
+            assert_eq!(hold_share(0.0), 0.0);
+            assert_eq!(hold_share(100.0), MAX_HOLD_SHARE);
+        }
+    }
+}
+
 /// What a curve MAKES of a sine, measured rather than tabulated.
 ///
 /// Two sections on the desk grow harmonics on purpose and both want the

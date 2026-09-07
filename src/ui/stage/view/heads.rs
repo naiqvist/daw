@@ -1,10 +1,10 @@
 //! The track heads: one plate per shown track across the top of the
 //! field, the master pinned right, and the cursor on one of them.
 //!
-//! Identity plus the two-bit state. A head says what its track IS —
-//! number and name — and the two things about it that change while you
-//! watch and cost most to miss: whether it is muted or soloed, and
-//! whether it is sounding now. Level, pan, sends and clips are other
+//! Identity plus live state. A head says what its track IS — number and
+//! name — and the things about it that change while you watch and cost
+//! most to miss: mute, solo, arm, routed input, and whether it is sounding
+//! or recording now. Level, pan, sends and clips are other
 //! surfaces' to show; a head that showed them would be a card. The
 //! instrument's family sign was tried here and taken off: it read as a
 //! waveform, and a head is not a scope.
@@ -48,6 +48,18 @@ pub(super) fn margin() -> f32 {
 /// The scene gutter, live.
 pub(super) fn gutter() -> f32 {
     crate::tune!(GUTTER)
+}
+
+pub(super) fn head_width() -> f32 {
+    crate::tune!(HEAD_W)
+}
+
+pub(super) fn head_height() -> f32 {
+    crate::tune!(HEAD_H)
+}
+
+pub(super) fn gap() -> f32 {
+    crate::tune!(GAP)
 }
 
 /// How many track heads fit across a field this wide, leaving the
@@ -116,6 +128,9 @@ struct Face<'a> {
     name: &'a str,
     muted: bool,
     solo: bool,
+    armed: bool,
+    recording: bool,
+    input: Option<String>,
     sounding: bool,
     standing: Standing,
     key: chassis::Key,
@@ -129,7 +144,12 @@ impl Stage {
             return 0..0;
         }
         let first = self.strip_offset.min(count - 1);
-        first..first.saturating_add(capacity(field_w)).min(count)
+        let visible = if self.mixing {
+            super::mixer::track_capacity(field_w)
+        } else {
+            capacity(field_w)
+        };
+        first..first.saturating_add(visible).min(count)
     }
 
     pub(super) fn draw_heads(&self, painter: &egui::Painter, field: egui::Rect) {
@@ -143,6 +163,10 @@ impl Stage {
                 name: &head.name,
                 muted: head.muted,
                 solo: head.solo,
+                armed: head.armed,
+                recording: self.recording() && head.armed,
+                input: (head.kind == crate::sequencing::TrackKind::Audio)
+                    .then(|| format!("{} {}", head.input.label(), head.monitor.label())),
                 sounding: self.playing.get(track).copied().flatten().is_some(),
                 standing: standing(address, Some(track)),
                 key: match (track == first, track == last) {
@@ -160,6 +184,9 @@ impl Stage {
             name: "MASTER",
             muted: false,
             solo: false,
+            armed: false,
+            recording: false,
+            input: None,
             sounding: false,
             standing: standing(address, None),
             key: chassis::Key::Right,
@@ -193,28 +220,55 @@ impl Stage {
                 c.label,
             );
         }
-        // The name, on its own row, clipped by character so it never
-        // runs off the chassis.
-        let fits = (inner.width() / (TYPE_PX * 0.6)).floor().max(1.0) as usize;
+        // The name and an audio lane's route share the second row. Reserve
+        // the route's measured width before clipping the name, so input 1/2
+        // never overwrites the identity it belongs to.
+        let input_width = face.input.as_ref().map_or(0.0, |input| {
+            input.chars().count() as f32 * TYPE_PX * 0.6 + 5.0
+        });
+        let fits = ((inner.width() - input_width) / (TYPE_PX * 0.6))
+            .floor()
+            .max(1.0) as usize;
         let name: String = face.name.chars().take(fits).collect();
         painter.text(
             egui::pos2(inner.min.x, inner.min.y + TYPE_PX + 4.0),
             egui::Align2::LEFT_TOP,
             name,
             font.clone(),
-            if face.muted { c.dim } else { c.fg },
+            if face.recording {
+                c.alert
+            } else if face.muted {
+                c.dim
+            } else {
+                c.fg
+            },
         );
+        if let Some(input) = &face.input {
+            painter.text(
+                egui::pos2(inner.max.x, inner.min.y + TYPE_PX + 4.0),
+                egui::Align2::RIGHT_TOP,
+                input,
+                font.clone(),
+                if face.armed { c.alert } else { c.label },
+            );
+        }
 
-        // Arming: the track under the cursor is the one a take will be
-        // written to, and says so.
-        if self.arming && cursor {
+        // Track recording is independent of session-to-song capture. Both
+        // are explicit words rather than overloading the same red pip.
+        if face.armed || (self.arming && cursor) {
             painter.text(
                 egui::pos2(
                     inner.max.x - 2.0 * PIP - 10.0,
                     inner.min.y + PIP * 0.5 + 2.0,
                 ),
                 egui::Align2::RIGHT_CENTER,
-                "ARM",
+                if face.recording {
+                    "REC"
+                } else if face.armed {
+                    "ARM"
+                } else {
+                    "SONG"
+                },
                 font.clone(),
                 c.alert,
             );
@@ -228,10 +282,10 @@ impl Stage {
             painter.rect_filled(pip, 0.0, if on { c.alert } else { c.rule });
         }
         // Sounding: a nominal bar along the foot.
-        if face.sounding {
+        if face.sounding || face.recording {
             let bar =
                 egui::Rect::from_min_max(egui::pos2(inner.min.x, inner.max.y - BAR_H), inner.max);
-            painter.rect_filled(bar, 0.0, c.nominal);
+            painter.rect_filled(bar, 0.0, if face.recording { c.alert } else { c.nominal });
         }
     }
 }

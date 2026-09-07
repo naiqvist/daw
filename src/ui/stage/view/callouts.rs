@@ -35,7 +35,7 @@ const EDITOR_INSET: f32 = 40.0;
 
 impl super::super::Stage {
     pub(super) fn draw_callouts(
-        &self,
+        &mut self,
         painter: &egui::Painter,
         whole: egui::Rect,
         anchor: Option<egui::Rect>,
@@ -307,35 +307,61 @@ impl super::super::Stage {
         }
     }
 
-    fn draw_plock_editor(&self, painter: &egui::Painter, whole: egui::Rect) {
+    fn draw_plock_editor(&mut self, painter: &egui::Painter, whole: egui::Rect) {
         let Some(editor) = self.plock_editor.as_ref() else {
             return;
         };
+        #[derive(Clone, Copy)]
+        enum Action {
+            Parameter(usize, bool),
+            Graph {
+                lane: usize,
+                cell: usize,
+                fraction: f32,
+            },
+            Controls,
+            OpenPicker,
+            Choose(Algorithm),
+        }
+
         let c = palette::colours();
         let font = egui::FontId::new(TYPE_PX, egui::FontFamily::Name(PROFONT.into()));
         let ch = TYPE_PX * 0.6;
+        let (pointer, pressed, extend) = painter.ctx().input(|input| {
+            (
+                input.pointer.interact_pos(),
+                input.pointer.primary_pressed(),
+                input.modifiers.shift || input.modifiers.command,
+            )
+        });
+        let mut action = None;
         let panel = whole.shrink(crate::tune!(EDITOR_INSET));
         painter.rect_filled(panel, 0.0, c.ground);
         chassis::frame(painter, panel, true);
         let inner = panel.shrink(INSET + 4.0);
 
-        // The head: what is being edited, the algorithm, the zone.
+        // The head: address, selection size, and the zone that owns the
+        // arrows. The zone is signal-coloured rather than buried in prose.
         let hy = inner.min.y + HEAD_H * 0.5;
         painter.text(
             egui::pos2(inner.min.x, hy),
             egui::Align2::LEFT_CENTER,
-            "PLOCK",
+            format!(
+                "PLOCK  PAT {:02} · TR {:02}",
+                editor.pattern.0,
+                editor.track + 1
+            ),
             font.clone(),
             c.label,
         );
         painter.text(
-            egui::pos2(inner.min.x + 7.0 * ch, hy),
-            egui::Align2::LEFT_CENTER,
+            egui::pos2(inner.center().x, hy),
+            egui::Align2::CENTER_CENTER,
             format!(
-                "pat {:02}  tr {:02}  {} ticks",
-                editor.pattern.0,
-                editor.track + 1,
-                editor.ticks.len()
+                "{} NOTES · {} ACTIVE · {} PARAMS",
+                editor.ticks.len(),
+                editor.active.iter().filter(|active| **active).count(),
+                editor.selected_params.len(),
             ),
             font.clone(),
             c.fg,
@@ -348,70 +374,145 @@ impl super::super::Stage {
         painter.text(
             egui::pos2(inner.max.x, hy),
             egui::Align2::RIGHT_CENTER,
-            format!("{}  ·  {}", editor.algorithm.label(), zone),
+            format!("{}{}", if editor.dirty { "* " } else { "" }, zone),
             font.clone(),
-            c.dim,
+            c.alert,
         );
-        if editor.dirty {
-            painter.text(
-                egui::pos2(inner.max.x - 26.0 * ch, hy),
-                egui::Align2::RIGHT_CENTER,
-                "*",
-                font.clone(),
-                c.alert,
-            );
-        }
         let seam = (inner.min.y + HEAD_H + 4.0).round() - 0.5;
         painter.line_segment(
             [egui::pos2(inner.min.x, seam), egui::pos2(inner.max.x, seam)],
             egui::Stroke::new(1.0, c.rule),
         );
 
-        // Three zones: parameters left, graphs right, controls along the foot.
-        let controls_h = 24.0;
+        // Three visibly framed zones: parameters left, lock values right,
+        // transformations along the foot. Tab moves between these exact
+        // frames; pointing can enter any of them directly.
+        let controls_h = 52.0;
         let body = egui::Rect::from_min_max(
             egui::pos2(inner.min.x, seam + 6.0),
-            egui::pos2(inner.max.x, inner.max.y - controls_h),
+            egui::pos2(inner.max.x, inner.max.y - controls_h - 6.0),
         );
-        let params_w = (body.width() * 0.3).clamp(140.0, 280.0);
+        let params_w = (body.width() * 0.34).clamp(170.0, 330.0);
         let params =
             egui::Rect::from_min_max(body.min, egui::pos2(body.min.x + params_w, body.max.y));
         let graphs =
             egui::Rect::from_min_max(egui::pos2(params.max.x + 12.0, body.min.y), body.max);
+        let controls =
+            egui::Rect::from_min_max(egui::pos2(inner.min.x, body.max.y + 6.0), inner.max);
+        painter.rect_filled(params, 0.0, c.panel);
+        painter.rect_filled(graphs, 0.0, c.panel);
+        painter.rect_filled(controls, 0.0, c.panel);
+        chassis::frame(painter, params, editor.focus == Focus::Parameters);
+        chassis::frame(painter, graphs, editor.focus == Focus::Graphs);
+        chassis::frame(painter, controls, editor.focus == Focus::Controls);
 
         let row_h = crate::tune!(ROW_H);
         let in_params = editor.focus == Focus::Parameters;
-        for (i, param) in editor.params.iter().enumerate() {
-            let y = params.min.y + i as f32 * row_h;
-            if y + row_h > params.max.y {
-                break;
-            }
+        let zone_head = 21.0;
+        let param_body = egui::Rect::from_min_max(
+            egui::pos2(params.min.x + 4.0, params.min.y + zone_head),
+            egui::pos2(params.max.x - 4.0, params.max.y - 4.0),
+        );
+        let param_capacity = (param_body.height() / row_h).floor().max(1.0) as usize;
+        let (param_start, param_end) = crate::ui::stage::plock_editor::visible_span(
+            editor.param_cursor,
+            editor.params.len(),
+            param_capacity,
+        );
+        painter.text(
+            egui::pos2(params.min.x + 7.0, params.min.y + zone_head * 0.5),
+            egui::Align2::LEFT_CENTER,
+            "PARAMS  ↑↓ ROW · ←→ VALUE",
+            font.clone(),
+            if in_params { c.bright } else { c.label },
+        );
+        painter.text(
+            egui::pos2(params.max.x - 7.0, params.min.y + zone_head * 0.5),
+            egui::Align2::RIGHT_CENTER,
+            format!(
+                "{}–{} / {}",
+                param_start + 1,
+                param_end,
+                editor.params.len()
+            ),
+            font.clone(),
+            c.dim,
+        );
+        let list_painter = painter.with_clip_rect(param_body);
+        let active_count = editor.active.iter().filter(|active| **active).count();
+        for (slot, i) in (param_start..param_end).enumerate() {
+            let param = &editor.params[i];
+            let y = param_body.min.y + slot as f32 * row_h;
             let rect = egui::Rect::from_min_max(
-                egui::pos2(params.min.x, y),
-                egui::pos2(params.max.x, y + row_h),
+                egui::pos2(param_body.min.x, y),
+                egui::pos2(param_body.max.x, y + row_h),
             );
             let selected = editor.selected_params.contains(&i);
             let on = in_params && editor.param_cursor == i;
-            if on {
-                painter.rect_filled(rect, 0.0, c.select);
+            let hovered = pointer.is_some_and(|point| rect.contains(point));
+            if on || hovered {
+                list_painter.rect_filled(rect, 0.0, c.select);
             }
-            painter.text(
+            if pressed && hovered && !editor.picker {
+                action = Some(Action::Parameter(i, extend));
+            }
+            list_painter.text(
                 egui::pos2(rect.min.x + 2.0, rect.center().y),
                 egui::Align2::LEFT_CENTER,
                 if selected { "+" } else { " " },
                 font.clone(),
                 c.chassis,
             );
-            painter.text(
+            let value_w = (rect.width() * 0.48).clamp(86.0, 146.0);
+            let name_rect = egui::Rect::from_min_max(
+                rect.min,
+                egui::pos2(rect.max.x - value_w - 4.0, rect.max.y),
+            );
+            list_painter.with_clip_rect(name_rect).text(
                 egui::pos2(rect.min.x + 2.0 * ch, rect.center().y),
                 egui::Align2::LEFT_CENTER,
                 &param.name,
                 font.clone(),
                 if selected { c.fg } else { c.dim },
             );
+            let locked = editor.lock_count(i);
+            let state = if locked == 0 {
+                format!("BASE {}", editor.value_text(i))
+            } else if active_count <= 1 {
+                format!("LOCK {}", editor.value_text(i))
+            } else {
+                format!("{locked}/{active_count} {}", editor.value_text(i))
+            };
+            list_painter.text(
+                egui::pos2(rect.max.x - 2.0, rect.center().y),
+                egui::Align2::RIGHT_CENTER,
+                state,
+                font.clone(),
+                if locked > 0 { c.alert } else { c.dim },
+            );
+            let standing = editor.displayed(
+                i,
+                editor.graph_cell.min(editor.ticks.len().saturating_sub(1)),
+            );
+            let rail = egui::Rect::from_min_max(
+                egui::pos2(rect.min.x + 2.0 * ch, rect.max.y - 2.0),
+                egui::pos2(rect.max.x - 2.0, rect.max.y - 1.0),
+            );
+            list_painter.rect_filled(rail, 0.0, c.rule);
+            list_painter.rect_filled(
+                egui::Rect::from_min_max(
+                    rail.min,
+                    egui::pos2(
+                        rail.min.x + rail.width() * param.fraction(standing),
+                        rail.max.y,
+                    ),
+                ),
+                0.0,
+                if locked > 0 { c.alert } else { c.chassis },
+            );
             if on {
                 crate::ui::nav_cursor::claim(
-                    painter,
+                    &list_painter,
                     ("plock-param", i),
                     rect,
                     crate::ui::nav_cursor::Kind::Row,
@@ -421,60 +522,147 @@ impl super::super::Stage {
             }
         }
 
-        // Graphs: one lane per selected parameter, a bar per tick.
+        // Graphs: a useful-height window of selected parameters, and a
+        // cursor-following window of addressed notes. One lane now fills the
+        // available editor instead of becoming an 80 px postage stamp.
         let lanes = editor.selected_param_indices();
-        let ticks = editor.ticks.len().max(1);
-        let lane_h = if lanes.is_empty() {
-            0.0
-        } else {
-            ((graphs.height() - 4.0 * lanes.len() as f32) / lanes.len() as f32).clamp(18.0, 80.0)
-        };
-        let cell_w = graphs.width() / ticks as f32;
-        for (li, &pi) in lanes.iter().enumerate() {
+        let graph_body = egui::Rect::from_min_max(
+            egui::pos2(graphs.min.x + 4.0, graphs.min.y + zone_head),
+            egui::pos2(graphs.max.x - 4.0, graphs.max.y - 4.0),
+        );
+        let lane_capacity = lanes.len().min(6).max(1);
+        let (lane_start, lane_end) = crate::ui::stage::plock_editor::visible_span(
+            editor.graph_lane,
+            lanes.len(),
+            lane_capacity,
+        );
+        let shown_lanes = lane_end.saturating_sub(lane_start).max(1);
+        let lane_gap = 5.0;
+        let lane_h = ((graph_body.height() - lane_gap * shown_lanes.saturating_sub(1) as f32)
+            / shown_lanes as f32)
+            .max(24.0);
+        let cell_capacity = ((graph_body.width() / 14.0).floor() as usize).max(1);
+        let (cell_start, cell_end) = crate::ui::stage::plock_editor::visible_span(
+            editor.graph_cell,
+            editor.ticks.len(),
+            cell_capacity,
+        );
+        let shown_cells = cell_end.saturating_sub(cell_start).max(1);
+        let cell_w = graph_body.width() / shown_cells as f32;
+        painter.text(
+            egui::pos2(graphs.min.x + 7.0, graphs.min.y + zone_head * 0.5),
+            egui::Align2::LEFT_CENTER,
+            "LOCK VALUES  ←→ NOTE · ↑↓ VALUE · CTRL↑↓ LANE",
+            font.clone(),
+            if editor.focus == Focus::Graphs {
+                c.bright
+            } else {
+                c.label
+            },
+        );
+        painter.text(
+            egui::pos2(graphs.max.x - 7.0, graphs.min.y + zone_head * 0.5),
+            egui::Align2::RIGHT_CENTER,
+            format!(
+                "P {}–{} / {} · N {}–{} / {}",
+                lane_start + usize::from(!lanes.is_empty()),
+                lane_end,
+                lanes.len(),
+                cell_start + usize::from(!editor.ticks.is_empty()),
+                cell_end,
+                editor.ticks.len()
+            ),
+            font.clone(),
+            c.dim,
+        );
+        let graph_painter = painter.with_clip_rect(graph_body);
+        for (shown, li) in (lane_start..lane_end).enumerate() {
+            let Some(&pi) = lanes.get(li) else {
+                continue;
+            };
             let Some(param) = editor.params.get(pi) else {
                 continue;
             };
-            let top = graphs.min.y + li as f32 * (lane_h + 4.0);
-            if top + lane_h > graphs.max.y {
-                break;
-            }
+            let top = graph_body.min.y + shown as f32 * (lane_h + lane_gap);
             let lane = egui::Rect::from_min_max(
-                egui::pos2(graphs.min.x, top),
-                egui::pos2(graphs.max.x, top + lane_h),
+                egui::pos2(graph_body.min.x, top),
+                egui::pos2(graph_body.max.x, (top + lane_h).min(graph_body.max.y)),
             );
-            painter.rect_filled(lane, 0.0, c.panel);
-            painter.text(
+            graph_painter.rect_filled(lane, 0.0, c.ground);
+            let lane_focused = editor.focus == Focus::Graphs && editor.graph_lane == li;
+            if lane_focused {
+                graph_painter.rect_stroke(
+                    lane,
+                    0.0,
+                    egui::Stroke::new(1.0, c.chassis),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            graph_painter.text(
                 egui::pos2(lane.min.x + 3.0, lane.min.y + 1.0),
                 egui::Align2::LEFT_TOP,
                 &param.name,
                 font.clone(),
-                c.label,
+                if lane_focused { c.bright } else { c.label },
             );
-            let base_y = lane.max.y - lane.height() * param.fraction(param.base);
-            painter.line_segment(
+            let focus_cell = editor.graph_cell.min(editor.ticks.len().saturating_sub(1));
+            let focus_value = editor.displayed(pi, focus_cell);
+            let focus_locked = editor
+                .locks
+                .get(pi)
+                .and_then(|values| values.get(focus_cell))
+                .copied()
+                .flatten()
+                .is_some();
+            graph_painter.text(
+                egui::pos2(lane.max.x - 4.0, lane.min.y + 1.0),
+                egui::Align2::RIGHT_TOP,
+                format!(
+                    "{} · {}",
+                    if focus_locked { "LOCK" } else { "BASE" },
+                    param.face(focus_value)
+                ),
+                font.clone(),
+                if focus_locked { c.alert } else { c.dim },
+            );
+            let plot = egui::Rect::from_min_max(
+                egui::pos2(lane.min.x + 2.0, lane.min.y + row_h),
+                egui::pos2(lane.max.x - 2.0, lane.max.y - 3.0),
+            );
+            let base_y = plot.max.y - plot.height() * param.fraction(param.base);
+            graph_painter.line_segment(
                 [
-                    egui::pos2(lane.min.x, base_y.round() - 0.5),
-                    egui::pos2(lane.max.x, base_y.round() - 0.5),
+                    egui::pos2(plot.min.x, base_y.round() - 0.5),
+                    egui::pos2(plot.max.x, base_y.round() - 0.5),
                 ],
                 egui::Stroke::new(1.0, c.edge),
             );
-            for cell in 0..ticks {
-                let x0 = lane.min.x + cell as f32 * cell_w;
+            for (shown_cell, cell) in (cell_start..cell_end).enumerate() {
+                let x0 = plot.min.x + shown_cell as f32 * cell_w;
+                let cell_rect = egui::Rect::from_min_max(
+                    egui::pos2(x0, plot.min.y),
+                    egui::pos2((x0 + cell_w).min(plot.max.x), plot.max.y),
+                );
                 let active = editor.active.get(cell).copied().unwrap_or(false);
                 let value = editor.displayed(pi, cell);
                 let f = param.fraction(value);
-                let bar = egui::Rect::from_min_max(
-                    egui::pos2(x0 + 1.0, lane.max.y - lane.height() * f),
-                    egui::pos2(x0 + cell_w - 1.0, lane.max.y),
-                );
+                let value_y = plot.max.y - plot.height() * f;
                 let locked = editor
                     .locks
                     .get(pi)
-                    .and_then(|l| l.get(cell))
+                    .and_then(|values| values.get(cell))
                     .copied()
                     .flatten()
                     .is_some();
-                painter.rect_filled(
+                let on = lane_focused && editor.graph_cell == cell;
+                if on {
+                    graph_painter.rect_filled(cell_rect, 0.0, c.select);
+                }
+                let bar = egui::Rect::from_min_max(
+                    egui::pos2(x0 + 2.0, value_y.min(plot.max.y - 2.0)),
+                    egui::pos2((x0 + cell_w - 2.0).max(x0 + 3.0), plot.max.y),
+                );
+                graph_painter.rect_filled(
                     bar,
                     0.0,
                     if !active {
@@ -485,17 +673,46 @@ impl super::super::Stage {
                         c.chassis
                     },
                 );
-                let on = editor.focus == Focus::Graphs
-                    && editor.graph_lane == li
-                    && editor.graph_cell == cell;
+                // The cap is visible even at zero, so a minimum/base value
+                // cannot collapse to a mathematically correct invisible bar.
+                graph_painter.line_segment(
+                    [
+                        egui::pos2(x0 + 2.0, value_y.clamp(plot.min.y, plot.max.y - 1.0)),
+                        egui::pos2(
+                            (x0 + cell_w - 2.0).max(x0 + 3.0),
+                            value_y.clamp(plot.min.y, plot.max.y - 1.0),
+                        ),
+                    ],
+                    egui::Stroke::new(2.0, if locked { c.alert } else { c.chassis }),
+                );
+                if shown_cells <= 24 {
+                    graph_painter.text(
+                        egui::pos2(cell_rect.center().x, plot.max.y - 2.0),
+                        egui::Align2::CENTER_BOTTOM,
+                        format!(
+                            "{:02}",
+                            editor.ticks[cell] / crate::sequencing::PATTERN_STEP_TICKS + 1
+                        ),
+                        font.clone(),
+                        c.dim,
+                    );
+                }
+                if pressed
+                    && !editor.picker
+                    && pointer.is_some_and(|point| cell_rect.contains(point))
+                {
+                    let point = pointer.expect("tested above");
+                    action = Some(Action::Graph {
+                        lane: li,
+                        cell,
+                        fraction: 1.0 - ((point.y - plot.min.y) / plot.height().max(1.0)),
+                    });
+                }
                 if on {
                     crate::ui::nav_cursor::claim(
-                        painter,
+                        &graph_painter,
                         ("plock-cell", li, cell),
-                        egui::Rect::from_min_max(
-                            egui::pos2(x0, lane.min.y),
-                            egui::pos2(x0 + cell_w, lane.max.y),
-                        ),
+                        cell_rect,
                         crate::ui::nav_cursor::Kind::Cell,
                         crate::ui::nav_cursor::Layer::Overlay,
                         c.alert,
@@ -504,12 +721,24 @@ impl super::super::Stage {
             }
         }
 
-        // Controls: the algorithm's own words, along the foot.
-        let cy = inner.max.y - controls_h * 0.5;
+        // Controls: named, clickable, and with its own cursor claim. The
+        // second line is deliberately local help for the open modal.
+        let controls_hovered = pointer.is_some_and(|point| controls.contains(point));
+        if pressed && controls_hovered && !editor.picker {
+            action = Some(Action::Controls);
+        }
+        let control_y = controls.min.y + 14.0;
+        let algo_rect = egui::Rect::from_min_max(
+            egui::pos2(controls.min.x + 6.0, controls.min.y + 3.0),
+            egui::pos2(controls.min.x + 26.0 * ch, controls.min.y + 25.0),
+        );
+        if pressed && !editor.picker && pointer.is_some_and(|point| algo_rect.contains(point)) {
+            action = Some(Action::OpenPicker);
+        }
         painter.text(
-            egui::pos2(inner.min.x, cy),
+            egui::pos2(controls.min.x + 7.0, control_y),
             egui::Align2::LEFT_CENTER,
-            editor.control_text(),
+            format!("/ {}", editor.algorithm.label()),
             font.clone(),
             if editor.focus == Focus::Controls {
                 c.bright
@@ -517,6 +746,41 @@ impl super::super::Stage {
                 c.fg
             },
         );
+        painter.text(
+            egui::pos2(controls.center().x, control_y),
+            egui::Align2::CENTER_CENTER,
+            editor.control_text(),
+            font.clone(),
+            if editor.focus == Focus::Controls {
+                c.alert
+            } else {
+                c.fg
+            },
+        );
+        painter.text(
+            egui::pos2(controls.min.x + 7.0, controls.max.y - 10.0),
+            egui::Align2::LEFT_CENTER,
+            "TAB ZONE · X INCLUDE · CTRL+A ALL · DEL CLEAR",
+            font.clone(),
+            c.dim,
+        );
+        painter.text(
+            egui::pos2(controls.max.x - 7.0, controls.max.y - 10.0),
+            egui::Align2::RIGHT_CENTER,
+            "ENTER COMMIT · ESC CANCEL",
+            font.clone(),
+            c.dim,
+        );
+        if editor.focus == Focus::Controls && !editor.picker {
+            crate::ui::nav_cursor::claim(
+                painter,
+                ("plock-controls", editor.control_cursor),
+                controls.shrink(3.0),
+                crate::ui::nav_cursor::Kind::Row,
+                crate::ui::nav_cursor::Layer::Overlay,
+                c.alert,
+            );
+        }
 
         // The picker, over everything, while it is up.
         if editor.picker {
@@ -535,6 +799,17 @@ impl super::super::Stage {
                 );
                 if on {
                     painter.rect_filled(rect, 0.0, c.select);
+                    crate::ui::nav_cursor::claim(
+                        painter,
+                        ("plock-algorithm", i),
+                        rect,
+                        crate::ui::nav_cursor::Kind::Row,
+                        crate::ui::nav_cursor::Layer::Overlay,
+                        c.alert,
+                    );
+                }
+                if pressed && pointer.is_some_and(|point| rect.contains(point)) {
+                    action = Some(Action::Choose(*algo));
                 }
                 painter.text(
                     egui::pos2(rect.min.x + 2.0, rect.center().y),
@@ -544,6 +819,53 @@ impl super::super::Stage {
                     if on { c.bright } else { c.fg },
                 );
             }
+        }
+
+        // Pointer actions land after the immutable paint snapshot. Requesting
+        // a frame makes the new address/value visible immediately, while lock
+        // edits alone enter the normal preview/recompile path.
+        let mut preview = false;
+        match action {
+            Some(Action::Parameter(index, extend)) => {
+                if let Some(editor) = self.plock_editor.as_mut() {
+                    editor.point_parameter(index, extend);
+                }
+            }
+            Some(Action::Graph {
+                lane,
+                cell,
+                fraction,
+            }) => {
+                preview = self
+                    .plock_editor
+                    .as_mut()
+                    .is_some_and(|editor| editor.set_graph_fraction(lane, cell, fraction));
+            }
+            Some(Action::Controls) => {
+                if let Some(editor) = self.plock_editor.as_mut() {
+                    editor.focus = Focus::Controls;
+                    editor.picker = false;
+                }
+            }
+            Some(Action::OpenPicker) => {
+                if let Some(editor) = self.plock_editor.as_mut() {
+                    editor.open_picker();
+                }
+            }
+            Some(Action::Choose(algorithm)) => {
+                if let Some(editor) = self.plock_editor.as_mut() {
+                    editor.algorithm = algorithm;
+                    editor.picker_enter();
+                    preview = true;
+                }
+            }
+            None => {}
+        }
+        if preview {
+            self.preview_plock_editor();
+        }
+        if action.is_some() {
+            painter.ctx().request_repaint();
         }
     }
 }

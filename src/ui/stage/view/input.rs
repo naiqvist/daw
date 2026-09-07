@@ -20,6 +20,7 @@ pub(super) fn egui_key(key: Key) -> egui::Key {
         Key::E => egui::Key::E,
         Key::F => egui::Key::F,
         Key::G => egui::Key::G,
+        Key::I => egui::Key::I,
         Key::L => egui::Key::L,
         Key::M => egui::Key::M,
         Key::N => egui::Key::N,
@@ -46,6 +47,7 @@ pub(super) fn egui_key(key: Key) -> egui::Key {
         Key::Equals => egui::Key::Equals,
         Key::Escape => egui::Key::Escape,
         Key::F2 => egui::Key::F2,
+        Key::F9 => egui::Key::F9,
         Key::Home => egui::Key::Home,
         Key::Minus => egui::Key::Minus,
         Key::OpenBracket => egui::Key::OpenBracket,
@@ -69,7 +71,37 @@ pub(super) fn egui_mods(mods: Mods) -> egui::Modifiers {
     if mods.shift {
         out = out.plus(egui::Modifiers::SHIFT);
     }
+    if mods.alt {
+        out = out.plus(egui::Modifiers::ALT);
+    }
     out
+}
+
+/// Consume the same logical chord egui would, except Alt has to agree
+/// exactly. egui deliberately treats an extra Alt as insignificant because
+/// some keyboard layouts need it to type a symbol. That is right for a text
+/// field and wrong at the stage's command edge: Alt+A must never arm a track
+/// merely because A is bound and Alt is not.
+fn consume_stage_key(input: &mut egui::InputState, modifiers: Mods, key: Key) -> bool {
+    let wanted_mods = egui_mods(modifiers);
+    let wanted_key = egui_key(key);
+    let mut count = 0usize;
+    input.events.retain(|event| {
+        let matches = matches!(
+            event,
+            egui::Event::Key {
+                key,
+                modifiers,
+                pressed: true,
+                ..
+            } if *key == wanted_key
+                && modifiers.alt == wanted_mods.alt
+                && modifiers.matches_logically(wanted_mods)
+        );
+        count += usize::from(matches);
+        !matches
+    });
+    count > 0
 }
 
 /// Take, out of this frame's input, every chord the codebook binds in
@@ -89,7 +121,7 @@ pub(super) fn consume_chords(
         .filter(|(modifiers, key)| {
             keymap::dispatch(scope, keymap::StageInput::Chord(*modifiers, *key)).is_some()
                 && !yield_to_grammar(*modifiers, *key)
-                && input.consume_key(egui_mods(*modifiers), egui_key(*key))
+                && consume_stage_key(input, *modifiers, *key)
         })
         .collect()
 }
@@ -158,6 +190,35 @@ mod tests {
             ),
             Some(StageIntent::NewInstrumentTrack)
         );
+    }
+
+    /// Alt is not silently discarded at the toolkit boundary. The event
+    /// remains available to a surface that owns Alt, and no plain command
+    /// fires in its place.
+    #[test]
+    fn an_alt_chord_never_falls_through_to_an_unmodified_binding() {
+        use eframe::egui::{Event, InputOptions, InputState, RawInput};
+        let raw = RawInput {
+            events: vec![Event::Key {
+                key: egui::Key::A,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::ALT,
+            }],
+            ..RawInput::default()
+        };
+        let mut input = InputState::default().begin_pass(raw, false, 1.0, InputOptions::default());
+        let consumed = consume_chords(&mut input, ScopeContext::Root, |_, _| false);
+        assert!(
+            consumed.is_empty(),
+            "Alt+A was misread as the stage's unmodified A binding"
+        );
+        assert!(
+            input.consume_key(egui::Modifiers::ALT, egui::Key::A),
+            "the rejected Alt chord was swallowed instead of left for its owner"
+        );
+        assert_eq!(egui_mods(Mods::ALT), egui::Modifiers::ALT);
     }
 
     /// Inside a clip the arrows and Enter are the grammar's. The stage's

@@ -1,5 +1,7 @@
 //! The log column: what the machine has been doing, in the field's
-//! empty right, newest at the foot and brightest.
+//! empty right, newest at the foot and brightest. Every row names its
+//! measured uptime and its severity before the event, so attention does
+//! not depend on reading the prose first.
 
 use super::heads;
 use super::{palette, telemetry};
@@ -13,6 +15,14 @@ const WIDTH: f32 = 300.0;
 /// @tune 10..24 px
 const ROW_H: f32 = 15.0;
 const TYPE_PX: f32 = 11.0;
+
+fn severity_colour(severity: telemetry::Severity, c: palette::Colours) -> egui::Color32 {
+    match severity {
+        telemetry::Severity::Info => c.label,
+        telemetry::Severity::Live => c.nominal,
+        telemetry::Severity::Attention => c.alert,
+    }
+}
 
 /// The right column both the desk block and the log stand in: right of
 /// the lattice, left of the master, or nothing at all when the field is
@@ -46,7 +56,8 @@ impl super::super::Stage {
         // under it.
         let top = master.max.y + 12.0 + super::desk::height();
         let bottom = field.max.y - margin;
-        let rows = ((bottom - top) / crate::tune!(ROW_H)).floor().max(1.0) as usize;
+        let body_top = top + crate::tune!(ROW_H);
+        let rows = ((bottom - body_top) / crate::tune!(ROW_H)).floor().max(0.0) as usize;
         let lines: Vec<telemetry::Line> = {
             let t = super::telemetry();
             t.lines.iter().rev().take(rows).cloned().collect()
@@ -61,6 +72,29 @@ impl super::super::Stage {
         let seam = top.round() - 0.5;
         painter.line_segment(
             [egui::pos2(x0, seam), egui::pos2(x1, seam)],
+            egui::Stroke::new(1.0, c.rule),
+        );
+        // The columns are part of the instrument: UPTIME is this view's
+        // clock, SEV is assigned where the fact is observed, and the
+        // specific event and its object remain separate fields.
+        let header_y = top + crate::tune!(ROW_H) * 0.5;
+        for (offset, word) in [
+            (0.0, "UPTIME"),
+            (8.0, "SEV"),
+            (14.0, "EVENT"),
+            (23.5, "DETAIL"),
+        ] {
+            painter.text(
+                egui::pos2(x0 + offset * ch, header_y),
+                egui::Align2::LEFT_CENTER,
+                word,
+                font.clone(),
+                c.label,
+            );
+        }
+        let header_seam = body_top.round() - 0.5;
+        painter.line_segment(
+            [egui::pos2(x0, header_seam), egui::pos2(x1, header_seam)],
             egui::Stroke::new(1.0, c.rule),
         );
         // Newest at the foot, brightest; older lines climb and fade.
@@ -83,12 +117,19 @@ impl super::super::Stage {
             painter.text(
                 egui::pos2(x0 + 8.0 * ch, y),
                 egui::Align2::LEFT_CENTER,
+                line.severity.word(),
+                font.clone(),
+                severity_colour(line.severity, c),
+            );
+            painter.text(
+                egui::pos2(x0 + 14.0 * ch, y),
+                egui::Align2::LEFT_CENTER,
                 line.verb,
                 font.clone(),
                 if i == 0 { c.label } else { ink },
             );
             painter.text(
-                egui::pos2(x0 + 16.0 * ch, y),
+                egui::pos2(x0 + 23.5 * ch, y),
                 egui::Align2::LEFT_CENTER,
                 &line.what,
                 font.clone(),
