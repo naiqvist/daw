@@ -268,6 +268,8 @@ impl Stage {
                             super::sampler_card::WIDTH
                         } else if column.scomp.is_some() {
                             super::scomp_card::WIDTH
+                        } else if column.stab.is_some() {
+                            super::stab_card::WIDTH
                         } else {
                             CHAIN_W
                         }
@@ -396,6 +398,19 @@ impl Stage {
         }
         for (index, rect) in &layout {
             if columns[*index].section.is_some() {
+                continue;
+            }
+            if columns[*index].stab.is_some() {
+                self.draw_stab_chain_card(
+                    ui,
+                    *rect,
+                    &columns[*index],
+                    *index,
+                    cursor,
+                    self.chain_offset,
+                    rows_shown,
+                    head_h,
+                );
                 continue;
             }
             if columns[*index].scomp.is_some() {

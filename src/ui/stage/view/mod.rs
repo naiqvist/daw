@@ -32,6 +32,7 @@ mod sample;
 mod sampler_card;
 mod scomp_card;
 mod song;
+mod stab_card;
 mod status;
 mod strip;
 mod telemetry;

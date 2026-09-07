@@ -173,6 +173,46 @@ impl ScompFace {
     }
 }
 
+/// What a STAB card draws from: the knobs as the device holds them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StabFace {
+    pub params: crate::audio::stab::StabParams,
+}
+
+impl StabFace {
+    pub fn from_device(device: &Device) -> Self {
+        let mut params = crate::audio::stab::StabParams::default();
+        for (id, value) in &device.overrides {
+            params.set(*id, *value);
+        }
+        Self { params }
+    }
+
+    /// The chord's notes as semitones above the played key.
+    pub fn notes(&self) -> ([i32; crate::params::stab::NOTES], usize) {
+        self.params.voicing()
+    }
+
+    /// The chord as a keyboard player names it, on C: `Cm7 / Eb`.
+    pub fn word(&self) -> String {
+        const NAMES: [&str; 12] = [
+            "C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B",
+        ];
+        let chord = self.params.chord.round().max(0.0) as usize;
+        let name = crate::params::stab::CHORD_NAMES
+            .get(chord)
+            .copied()
+            .unwrap_or("?");
+        let (notes, count) = self.notes();
+        let bass = notes.first().copied().unwrap_or(0).rem_euclid(12) as usize;
+        let mut word = format!("C{name}");
+        if count > 0 && bass != 0 {
+            word.push_str(&format!(" / {}", NAMES[bass]));
+        }
+        word
+    }
+}
+
 /// One device, as a column of the band.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Column {
@@ -196,6 +236,9 @@ pub struct Column {
     /// The bounce-facing state for an sCOMP card; absent on every other
     /// device.
     pub scomp: Option<ScompFace>,
+    /// The chord-facing state for a STAB card; absent on every other
+    /// device.
+    pub stab: Option<StabFace>,
     pub rows: Vec<Row>,
     /// Which section of the console this column is, when it is one:
     /// drawn as a piece of the strip rather than as a card.
@@ -289,6 +332,7 @@ pub fn column(device: &Device) -> Column {
             .map(|name| name.to_string_lossy().into_owned()),
         sampler: (device.kind == DeviceKind::Sampler).then(|| SamplerFace::from_device(device)),
         scomp: (device.kind == DeviceKind::Scomp).then(|| ScompFace::from_device(device)),
+        stab: (device.kind == DeviceKind::Stab).then(|| StabFace::from_device(device)),
         section: match device.kind {
             crate::devices::DeviceKind::Console(kind) => Some(kind),
             _ => None,
