@@ -55,9 +55,20 @@ pub enum Key {
     F9,
     Home,
     Minus,
+    Num0,
+    Num1,
+    Num2,
+    Num3,
+    Num4,
+    Num5,
+    Num6,
+    Num7,
+    Num8,
+    Num9,
     OpenBracket,
     PageDown,
     PageUp,
+    Period,
     Plus,
     Questionmark,
     Slash,
@@ -106,9 +117,20 @@ impl Key {
             Self::F9 => "F9",
             Self::Home => "Home",
             Self::Minus => "Minus",
+            Self::Num0 => "0",
+            Self::Num1 => "1",
+            Self::Num2 => "2",
+            Self::Num3 => "3",
+            Self::Num4 => "4",
+            Self::Num5 => "5",
+            Self::Num6 => "6",
+            Self::Num7 => "7",
+            Self::Num8 => "8",
+            Self::Num9 => "9",
             Self::OpenBracket => "OpenBracket",
             Self::PageDown => "PageDown",
             Self::PageUp => "PageUp",
+            Self::Period => "Period",
             Self::Plus => "Plus",
             Self::Questionmark => "Questionmark",
             Self::Slash => "Slash",
@@ -126,6 +148,7 @@ impl Key {
             Self::ArrowRight => "⏵",
             Self::ArrowUp => "⏶",
             Self::Comma => ",",
+            Self::Period => ".",
             Self::Minus => "−",
             Self::Plus => "+",
             Self::Equals => "=",
@@ -139,10 +162,31 @@ impl Key {
 }
 
 impl Key {
+    /// The digit a number key carries, if it is one. `Num0` reads as
+    /// ten, because the row is counted from one: the tenth thing sits
+    /// under the key to the right of nine.
+    pub fn digit(self) -> Option<usize> {
+        Some(match self {
+            Self::Num1 => 1,
+            Self::Num2 => 2,
+            Self::Num3 => 3,
+            Self::Num4 => 4,
+            Self::Num5 => 5,
+            Self::Num6 => 6,
+            Self::Num7 => 7,
+            Self::Num8 => 8,
+            Self::Num9 => 9,
+            Self::Num0 => 10,
+            _ => return None,
+        })
+    }
+}
+
+impl Key {
     /// Every key there is, for a test that starts from a toolkit's key
     /// and has to find ours.
     #[cfg(test)]
-    pub const ALL: [Key; 45] = [
+    pub const ALL: [Key; 56] = [
         Key::A,
         Key::B,
         Key::C,
@@ -180,9 +224,20 @@ impl Key {
         Key::F9,
         Key::Home,
         Key::Minus,
+        Key::Num0,
+        Key::Num1,
+        Key::Num2,
+        Key::Num3,
+        Key::Num4,
+        Key::Num5,
+        Key::Num6,
+        Key::Num7,
+        Key::Num8,
+        Key::Num9,
         Key::OpenBracket,
         Key::PageDown,
         Key::PageUp,
+        Key::Period,
         Key::Plus,
         Key::Questionmark,
         Key::Slash,

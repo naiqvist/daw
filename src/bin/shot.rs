@@ -1457,6 +1457,25 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
                 let _ = stage.apply(StageIntent::Sample(SampleIntent::ZoomIn));
             }
         }
+        // `-hold`: the nearest marker taken in hand, so the held state
+        // and its legend can be looked at.
+        if which.contains("-hold") {
+            let _ = stage.apply(StageIntent::Sample(SampleIntent::Grab));
+        }
+        // `-loop`: a forward loop from a third of the way in, with a
+        // long crossfade and fades, so every ramp the sampler has is on
+        // the picture.
+        if which.contains("-loop") {
+            use daw::params::sampler as sp;
+            if let Some(device) = stage.song_mut().device_mut(id) {
+                device.set(sp::LOOP_MODE, sp::LOOP_FORWARD);
+                device.set(sp::LOOP_START, 0.33);
+                device.set(sp::LOOP_XFADE, 120.0);
+                device.set(sp::FADE_IN, 60.0);
+                device.set(sp::FADE_OUT, 200.0);
+                device.set(sp::GAIN, 4.0);
+            }
+        }
     } else if which.contains("clip") {
         // Down onto a slot, fill it, and go in: the sequencer and the
         // trig inspector are what this shot is for. Give the new pattern

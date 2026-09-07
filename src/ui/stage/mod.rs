@@ -2489,6 +2489,11 @@ impl Stage {
             self.trig_menu = None;
             return Ok(());
         }
+        let seconds = self.sample_data.as_ref().map_or(0.0, SampleData::seconds);
+        // An audition that has run out is over, whatever key comes next.
+        if let Some(editor) = &mut self.sample {
+            editor.settle(seconds);
+        }
         let Some((editor, device)) = self.edited_sampler() else {
             return Err(RefusalReason::Unavailable);
         };
@@ -2498,12 +2503,12 @@ impl Stage {
             .sample_data
             .as_ref()
             .map_or(1 << 40, |data| data.frames);
-        let seconds = self.sample_data.as_ref().map_or(0.0, SampleData::seconds);
         let word = |at: f64| sample::time_word(at, seconds);
         match intent {
             SampleIntent::Open => unreachable!("handled above"),
             SampleIntent::Left { coarse } | SampleIntent::Right { coarse } => {
                 let right = matches!(intent, SampleIntent::Right { .. });
+                let grabbed = editor.grabbed;
                 let mut next = editor;
                 if !next.step(right, coarse) {
                     return Err(RefusalReason::Edge(if right {
@@ -2513,6 +2518,10 @@ impl Stage {
                     }));
                 }
                 self.sample = Some(next);
+                // A marker in hand goes where the cursor goes.
+                if let Some(marker) = grabbed {
+                    self.carry_marker(marker, &device)?;
+                }
                 Ok(())
             }
             SampleIntent::JumpPrev | SampleIntent::JumpNext => {
@@ -2569,8 +2578,28 @@ impl Stage {
                     SampleIntent::SetEnd => (sp::END, "end"),
                     _ => (sp::LOOP_START, "loop"),
                 };
-                let after = self.set_sampler_param(param, at as f32)?;
-                self.notice = Some(format!("{name} {}", word(f64::from(after))));
+                // The loop lives inside the trim, as a share of it.
+                let value = if param == sp::LOOP_START {
+                    sample::loop_of(&device, at)
+                } else {
+                    at as f32
+                };
+                let after = self.set_sampler_param(param, value)?;
+                let shown = if param == sp::LOOP_START {
+                    let device = self
+                        .song
+                        .device(editor.device)
+                        .ok_or(RefusalReason::Unavailable)?;
+                    sample::loop_at(device)
+                } else {
+                    f64::from(after)
+                };
+                self.notice = Some(format!("{name} {}", word(shown)));
+                Ok(())
+            }
+            SampleIntent::AddSlice if editor.grabbed.is_some() => {
+                // Enter, with a marker in hand, is the hand opening.
+                self.drop_marker();
                 Ok(())
             }
             SampleIntent::AddSlice => {
@@ -2667,7 +2696,22 @@ impl Stage {
                         self.notice = Some(format!("gain {after:+.1} dB"));
                         Ok(())
                     }
-                    SamplePage::Trim => Err(RefusalReason::Unavailable),
+                    SamplePage::Trim => {
+                        let before = device.value(sp::LOOP_XFADE);
+                        let after = self.set_sampler_param(
+                            sp::LOOP_XFADE,
+                            before + if more { 5.0 } else { -5.0 },
+                        )?;
+                        if after == before {
+                            return Err(RefusalReason::Edge(if more {
+                                Step::Up
+                            } else {
+                                Step::Down
+                            }));
+                        }
+                        self.notice = Some(format!("loop crossfade {after:.0} ms"));
+                        Ok(())
+                    }
                 }
             }
             SampleIntent::Eager | SampleIntent::Shyer => {
@@ -2750,11 +2794,186 @@ impl Stage {
                 };
                 self.audition = Some(Audition::of(path, from, to));
                 let mut e = editor;
-                e.playing = Some((from, to));
+                e.play(from, to);
+                self.sample = Some(e);
+                Ok(())
+            }
+            SampleIntent::Grab => {
+                if editor.grabbed.is_some() {
+                    self.drop_marker();
+                    return Ok(());
+                }
+                let Some(marker) = editor.nearest_marker(&device) else {
+                    return Err(RefusalReason::Empty);
+                };
+                let at = match marker {
+                    sample::Marker::Start => f64::from(device.value(sp::START)),
+                    sample::Marker::End => f64::from(device.value(sp::END)),
+                    sample::Marker::Loop => sample::loop_at(&device),
+                    sample::Marker::Slice(index) => device.slices[index],
+                };
+                let mut e = editor;
+                e.seek(at);
+                e.grabbed = Some(marker);
+                self.notice = Some(format!(
+                    "holding {} · arrows move it, Enter drops",
+                    marker.word()
+                ));
+                self.sample = Some(e);
+                Ok(())
+            }
+            SampleIntent::Fit => {
+                let (a, b) = match editor.slice_at(&device) {
+                    Some(index) => SampleEditor::slice_bounds(&device, index)
+                        .ok_or(RefusalReason::Unavailable)?,
+                    None => {
+                        let start = f64::from(device.value(sp::START));
+                        let end = f64::from(device.value(sp::END));
+                        if end > start {
+                            (start, end)
+                        } else {
+                            (0.0, 1.0)
+                        }
+                    }
+                };
+                let mut e = editor;
+                if !e.fit(a, b, frames) {
+                    return Err(RefusalReason::Edge(Step::Up));
+                }
+                self.sample = Some(e);
+                Ok(())
+            }
+            SampleIntent::Whole => {
+                let mut e = editor;
+                if !e.whole() {
+                    return Err(RefusalReason::Edge(Step::Down));
+                }
+                self.sample = Some(e);
+                Ok(())
+            }
+            SampleIntent::Split => {
+                let Some(index) = editor.slice_at(&device) else {
+                    return Err(RefusalReason::Empty);
+                };
+                let (a, b) =
+                    SampleEditor::slice_bounds(&device, index).ok_or(RefusalReason::Unavailable)?;
+                let middle = (a + b) * 0.5;
+                let at = match (&self.sample_data, editor.snap) {
+                    (Some(data), true) => data.snapped(middle),
+                    _ => middle,
+                };
+                if at <= a || at >= b {
+                    return Err(RefusalReason::Unavailable);
+                }
+                let mut slices = device.slices.clone();
+                slices.push(at);
+                let count = self.set_sampler_slices(slices)?;
+                self.notice = Some(format!(
+                    "slice {:02} split at {} · {count} slices",
+                    index + 1,
+                    word(at)
+                ));
+                Ok(())
+            }
+            SampleIntent::PrevSlice | SampleIntent::NextSlice | SampleIntent::Pick(_) => {
+                if device.slices.is_empty() {
+                    return Err(RefusalReason::Empty);
+                }
+                let index = match intent {
+                    SampleIntent::Pick(number) => {
+                        let index = number.saturating_sub(1);
+                        if index >= device.slices.len() {
+                            return Err(RefusalReason::Unavailable);
+                        }
+                        index
+                    }
+                    SampleIntent::PrevSlice => match editor.slice_at(&device) {
+                        Some(0) | None => return Err(RefusalReason::Edge(Step::Left)),
+                        Some(index) => index - 1,
+                    },
+                    _ => match editor.slice_at(&device) {
+                        Some(index) if index + 1 < device.slices.len() => index + 1,
+                        _ => return Err(RefusalReason::Edge(Step::Right)),
+                    },
+                };
+                let (from, to) =
+                    SampleEditor::slice_bounds(&device, index).ok_or(RefusalReason::Unavailable)?;
+                let mut e = editor;
+                e.seek(from);
+                if let Some(path) = device.sample.as_deref() {
+                    self.audition = Some(Audition::of(path, from, to));
+                    e.play(from, to);
+                }
+                self.notice = Some(format!(
+                    "slice {:02} · {} to {}",
+                    index + 1,
+                    word(from),
+                    word(to)
+                ));
                 self.sample = Some(e);
                 Ok(())
             }
         }
+    }
+
+    /// Let go of the marker in hand.
+    fn drop_marker(&mut self) {
+        if let Some(editor) = &mut self.sample
+            && let Some(marker) = editor.grabbed.take()
+        {
+            self.notice = Some(format!("{} placed", marker.word()));
+        }
+    }
+
+    /// Put the marker in hand where the cursor now stands. The trim's
+    /// ends may not cross; a slice keeps its place in the table, which
+    /// is re-sorted underneath, so it is found again by where it went.
+    fn carry_marker(
+        &mut self,
+        marker: sample::Marker,
+        device: &crate::sequencing::Device,
+    ) -> Result<(), RefusalReason> {
+        use crate::params::sampler as sp;
+        let at = self.placed();
+        match marker {
+            sample::Marker::Start => {
+                let end = f64::from(device.value(sp::END));
+                self.set_sampler_param(sp::START, at.min(end) as f32)?;
+            }
+            sample::Marker::End => {
+                let start = f64::from(device.value(sp::START));
+                self.set_sampler_param(sp::END, at.max(start) as f32)?;
+            }
+            sample::Marker::Loop => {
+                self.set_sampler_param(sp::LOOP_START, sample::loop_of(device, at))?;
+            }
+            sample::Marker::Slice(index) => {
+                let mut slices = device.slices.clone();
+                let Some(slot) = slices.get_mut(index) else {
+                    return Err(RefusalReason::Unavailable);
+                };
+                *slot = at;
+                self.set_sampler_slices(slices)?;
+                let moved = self
+                    .song
+                    .device(
+                        self.sample
+                            .as_ref()
+                            .map(|e| e.device)
+                            .ok_or(RefusalReason::Unavailable)?,
+                    )
+                    .and_then(|device| {
+                        device
+                            .slices
+                            .iter()
+                            .position(|slice| (*slice - at).abs() < 1e-9)
+                    });
+                if let (Some(editor), Some(index)) = (&mut self.sample, moved) {
+                    editor.grabbed = Some(sample::Marker::Slice(index));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Whether `track`'s voice is a sampler in slice mode; the grid then
@@ -3529,6 +3748,10 @@ impl Stage {
             }
             // The cutting room. Its own vocabulary, over one file.
             StageIntent::Sample(intent) => self.apply_sample(intent),
+            StageIntent::Escape if self.sample.as_ref().is_some_and(|e| e.grabbed.is_some()) => {
+                self.drop_marker();
+                Ok(())
+            }
             StageIntent::Escape if self.sample.is_some() => {
                 self.sample = None;
                 self.audition_stop = true;
@@ -5717,7 +5940,10 @@ mod tests {
         );
         let device = stage.song.device(id).expect("device");
         assert!(device.value(sp::END) > device.value(sp::START));
-        assert_eq!(device.value(sp::LOOP_START), device.value(sp::END));
+        // The loop is a share of the trim, as the engine reads it: placed
+        // at the out point, it is the whole of it.
+        assert_eq!(device.value(sp::LOOP_START), 1.0);
+        assert!((sample::loop_at(device) - f64::from(device.value(sp::END))).abs() < 1e-6);
     }
 
     /// Slices: Enter cuts at the cursor and puts the sampler in slice
@@ -5835,6 +6061,217 @@ mod tests {
     /// P asks the host to play the slice under the cursor; with no
     /// slices, the trim; Shift+P the whole file. Each is one request,
     /// taken once.
+    /// A sampler with a synthesized file, the editor up, and snap off so
+    /// a placed marker lands exactly where the cursor stood.
+    fn into_cutting_room_free(stage: &mut Stage) -> crate::sequencing::DeviceId {
+        let id = into_sample_editor(stage);
+        stage.set_sample(synthetic_sample("/tmp/nowhere/break.wav"));
+        assert_eq!(drive(stage, &[Key::Z]), vec![ApplyOutcome::Changed]);
+        assert!(!stage.sample.as_ref().unwrap().snap);
+        id
+    }
+
+    fn seek(stage: &mut Stage, at: f64) {
+        stage.sample.as_mut().expect("the editor").seek(at);
+    }
+
+    /// The loop is kept as a share of the trim, so L placed at a file
+    /// fraction lands where the picture shows it, and the engine agrees.
+    #[test]
+    fn the_loop_is_placed_inside_the_trim_and_read_back_where_it_was_put() {
+        use crate::params::sampler as sp;
+        let mut stage = Stage::new();
+        let id = into_cutting_room_free(&mut stage);
+        seek(&mut stage, 0.25);
+        assert_eq!(drive(&mut stage, &[Key::S]), vec![ApplyOutcome::Changed]);
+        seek(&mut stage, 0.75);
+        assert_eq!(drive(&mut stage, &[Key::E]), vec![ApplyOutcome::Changed]);
+        seek(&mut stage, 0.5);
+        assert_eq!(drive(&mut stage, &[Key::L]), vec![ApplyOutcome::Changed]);
+        let device = stage.song.device(id).expect("the sampler");
+        assert!(
+            (device.value(sp::LOOP_START) - 0.5).abs() < 1e-6,
+            "halfway through the trim, not the file: {}",
+            device.value(sp::LOOP_START)
+        );
+        assert!((sample::loop_at(device) - 0.5).abs() < 1e-6);
+        // +/- on the TRIM page is the loop crossfade.
+        let before = device.value(sp::LOOP_XFADE);
+        assert_eq!(drive(&mut stage, &[Key::Plus]), vec![ApplyOutcome::Changed]);
+        let device = stage.song.device(id).expect("the sampler");
+        assert!((device.value(sp::LOOP_XFADE) - before - 5.0).abs() < 1e-6);
+    }
+
+    /// +Enter takes hold of the nearest marker, the arrows carry it,
+    /// Enter opens the hand without cutting a slice, and Escape opens
+    /// the hand without leaving the room.
+    #[test]
+    fn a_marker_in_hand_goes_where_the_arrows_take_it_and_enter_lets_go() {
+        use crate::params::sampler as sp;
+        let mut stage = Stage::new();
+        let id = into_cutting_room_free(&mut stage);
+        stage
+            .song
+            .device_mut(id)
+            .expect("the sampler")
+            .set_slices([0.2, 0.6]);
+        // Every table starts at the head of the file: the cuts are
+        // slices one and two.
+        seek(&mut stage, 0.22);
+        assert_eq!(
+            stage.handle_key(Mods::SHIFT, Key::Enter),
+            Some(ApplyOutcome::Changed)
+        );
+        let editor = stage.sample.as_ref().unwrap();
+        assert_eq!(editor.grabbed, Some(sample::Marker::Slice(1)));
+        assert!(
+            (editor.cursor - 0.2).abs() < 1e-9,
+            "the cursor went to the marker"
+        );
+        assert_eq!(
+            drive(&mut stage, &[Key::ArrowRight]),
+            vec![ApplyOutcome::Changed]
+        );
+        let cursor = stage.sample.as_ref().unwrap().cursor;
+        assert!(cursor > 0.2);
+        let device = stage.song.device(id).expect("the sampler");
+        assert!(
+            (device.slices[1] - cursor).abs() < 1e-9,
+            "the slice did not follow: {:?} vs {cursor}",
+            device.slices
+        );
+        assert_eq!(
+            drive(&mut stage, &[Key::Enter]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(stage.sample.as_ref().unwrap().grabbed, None);
+        assert_eq!(
+            stage.song.device(id).unwrap().slices.len(),
+            3,
+            "Enter with a marker in hand cut a slice"
+        );
+        // Carry a slice past its neighbour: it keeps being the one in hand.
+        seek(&mut stage, 0.21);
+        assert_eq!(
+            stage.handle_key(Mods::SHIFT, Key::Enter),
+            Some(ApplyOutcome::Changed)
+        );
+        for _ in 0..4 {
+            let _ = stage.handle_key(Mods::SHIFT, Key::ArrowRight);
+        }
+        let cursor = stage.sample.as_ref().unwrap().cursor;
+        assert!(cursor > 0.6, "{cursor}");
+        assert_eq!(
+            stage.sample.as_ref().unwrap().grabbed,
+            Some(sample::Marker::Slice(2))
+        );
+        let device = stage.song.device(id).expect("the sampler");
+        assert!(
+            (device.slices[2] - cursor).abs() < 1e-9,
+            "{:?}",
+            device.slices
+        );
+        assert!((device.slices[1] - 0.6).abs() < 1e-9);
+        assert_eq!(
+            drive(&mut stage, &[Key::Escape]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(stage.sample.as_ref().unwrap().grabbed, None);
+        assert_eq!(
+            stage.scope_context(),
+            keymap::ScopeContext::Sample,
+            "Escape left the room"
+        );
+        // The in point, held and carried, may not cross the out point.
+        seek(&mut stage, 0.0);
+        assert_eq!(
+            stage.handle_key(Mods::SHIFT, Key::Enter),
+            Some(ApplyOutcome::Changed)
+        );
+        assert_eq!(
+            stage.sample.as_ref().unwrap().grabbed,
+            Some(sample::Marker::Start)
+        );
+        for _ in 0..80 {
+            let _ = stage.handle_key(Mods::SHIFT, Key::ArrowRight);
+        }
+        let device = stage.song.device(id).expect("the sampler");
+        assert!(device.value(sp::START) <= device.value(sp::END));
+    }
+
+    /// A digit goes to that slice and sounds it; the comma and the
+    /// period walk the table and sound each step; the ends refuse.
+    #[test]
+    fn digits_pick_a_slice_and_the_comma_and_period_walk_them_sounding_each() {
+        let mut stage = Stage::new();
+        let id = into_cutting_room_free(&mut stage);
+        stage
+            .song
+            .device_mut(id)
+            .expect("the sampler")
+            .set_slices([0.0, 0.25, 0.5, 0.75]);
+        assert_eq!(drive(&mut stage, &[Key::Num3]), vec![ApplyOutcome::Changed]);
+        assert!((stage.sample.as_ref().unwrap().cursor - 0.5).abs() < 1e-9);
+        let asked = stage.take_audition().expect("the slice sounds");
+        assert_eq!((asked.from, asked.to), (0.5, 0.75));
+        assert!(stage.sample.as_ref().unwrap().playing.is_some());
+        assert!(matches!(
+            drive(&mut stage, &[Key::Num9])[0],
+            ApplyOutcome::Refused(_)
+        ));
+        assert_eq!(
+            drive(&mut stage, &[Key::Period]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert!((stage.sample.as_ref().unwrap().cursor - 0.75).abs() < 1e-9);
+        assert_eq!((stage.take_audition().unwrap().from), 0.75);
+        assert!(matches!(
+            drive(&mut stage, &[Key::Period])[0],
+            ApplyOutcome::Refused(_)
+        ));
+        assert_eq!(
+            drive(&mut stage, &[Key::Comma]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert!((stage.sample.as_ref().unwrap().cursor - 0.5).abs() < 1e-9);
+    }
+
+    /// X halves the slice under the cursor; F fits the view to it, and
+    /// +F shows the whole file again.
+    #[test]
+    fn x_halves_the_slice_under_the_cursor_and_f_fits_the_view_to_it() {
+        let mut stage = Stage::new();
+        let id = into_cutting_room_free(&mut stage);
+        stage
+            .song
+            .device_mut(id)
+            .expect("the sampler")
+            .set_slices([0.0, 0.5]);
+        seek(&mut stage, 0.6);
+        assert_eq!(drive(&mut stage, &[Key::X]), vec![ApplyOutcome::Changed]);
+        let slices = stage.song.device(id).unwrap().slices.clone();
+        assert_eq!(slices.len(), 3);
+        assert!((slices[2] - 0.75).abs() < 1e-9, "{slices:?}");
+        assert_eq!(drive(&mut stage, &[Key::F]), vec![ApplyOutcome::Changed]);
+        let editor = stage.sample.as_ref().unwrap();
+        assert!(editor.view_from < 0.5 && editor.view_to() > 0.75 && editor.view_span < 0.5);
+        assert_eq!(
+            stage.handle_key(Mods::SHIFT, Key::F),
+            Some(ApplyOutcome::Changed)
+        );
+        let editor = stage.sample.as_ref().unwrap();
+        assert_eq!((editor.view_from, editor.view_span), (0.0, 1.0));
+        // With no slices, F fits the trim.
+        let _ = drive(&mut stage, &[Key::C]);
+        seek(&mut stage, 0.3);
+        let _ = drive(&mut stage, &[Key::S]);
+        seek(&mut stage, 0.4);
+        let _ = drive(&mut stage, &[Key::E]);
+        assert_eq!(drive(&mut stage, &[Key::F]), vec![ApplyOutcome::Changed]);
+        let editor = stage.sample.as_ref().unwrap();
+        assert!(editor.view_from < 0.3 && editor.view_to() > 0.4 && editor.view_span < 0.2);
+    }
+
     #[test]
     fn audition_asks_the_host_for_the_right_range() {
         use crate::params::sampler as sp;

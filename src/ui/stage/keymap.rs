@@ -346,6 +346,21 @@ pub enum SampleIntent {
     /// Play the slice or the trim under the cursor.
     Audition,
     AuditionAll,
+    /// Take hold of the nearest marker — in, out, loop, or a slice — so
+    /// the arrows move it; or let go of the one held.
+    Grab,
+    /// The view fitted to the slice under the cursor, or to the trim.
+    Fit,
+    /// The whole file in view.
+    Whole,
+    /// Cut the slice under the cursor in two, at its middle.
+    Split,
+    /// The previous or next slice, stepped to and sounded.
+    PrevSlice,
+    NextSlice,
+    /// A slice by its number on the row of digits, stepped to and
+    /// sounded. Ten sits under the zero.
+    Pick(usize),
 }
 
 impl SampleIntent {
@@ -382,6 +397,13 @@ impl SampleIntent {
             Self::Snap => "zero snap",
             Self::Audition => "audition",
             Self::AuditionAll => "audition all",
+            Self::Grab => "grab or drop the nearest marker",
+            Self::Fit => "fit the view to the slice or trim",
+            Self::Whole => "the whole file in view",
+            Self::Split => "split the slice in half",
+            Self::PrevSlice => "previous slice, played",
+            Self::NextSlice => "next slice, played",
+            Self::Pick(_) => "slice by number, played",
         }
     }
 }
@@ -1576,6 +1598,91 @@ const BINDINGS: &[Binding] = &[
         ScopeContext::Sample,
         Key::P,
         StageIntent::Sample(SampleIntent::AuditionAll),
+    ),
+    // The hand on a marker: +Enter takes hold of the nearest one, the
+    // arrows carry it, Enter or Escape lets go. F fits the view to what
+    // the cursor is in; +F shows the whole file. X halves a slice. The
+    // comma and the period walk the slices and sound each; a digit goes
+    // straight to one.
+    Binding::shift(
+        ScopeContext::Sample,
+        Key::Enter,
+        StageIntent::Sample(SampleIntent::Grab),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::F,
+        StageIntent::Sample(SampleIntent::Fit),
+    ),
+    Binding::shift(
+        ScopeContext::Sample,
+        Key::F,
+        StageIntent::Sample(SampleIntent::Whole),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::X,
+        StageIntent::Sample(SampleIntent::Split),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::Comma,
+        StageIntent::Sample(SampleIntent::PrevSlice),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::Period,
+        StageIntent::Sample(SampleIntent::NextSlice),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::Num1,
+        StageIntent::Sample(SampleIntent::Pick(1)),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::Num2,
+        StageIntent::Sample(SampleIntent::Pick(2)),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::Num3,
+        StageIntent::Sample(SampleIntent::Pick(3)),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::Num4,
+        StageIntent::Sample(SampleIntent::Pick(4)),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::Num5,
+        StageIntent::Sample(SampleIntent::Pick(5)),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::Num6,
+        StageIntent::Sample(SampleIntent::Pick(6)),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::Num7,
+        StageIntent::Sample(SampleIntent::Pick(7)),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::Num8,
+        StageIntent::Sample(SampleIntent::Pick(8)),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::Num9,
+        StageIntent::Sample(SampleIntent::Pick(9)),
+    ),
+    Binding::new(
+        ScopeContext::Sample,
+        Key::Num0,
+        StageIntent::Sample(SampleIntent::Pick(10)),
     ),
     Binding::new(ScopeContext::Sample, Key::Escape, StageIntent::Escape),
     Binding::new(
