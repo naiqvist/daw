@@ -1332,6 +1332,23 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
             }
         }
         let _ = stage.apply(StageIntent::Mix);
+    } else if which.contains("stab") {
+        // STAB on the first track, voiced as a ninth in second inversion,
+        // and the band open on it. `-browse` opens the browser instead.
+        let id = stage
+            .song_mut()
+            .add_device(0, daw::devices::DeviceKind::Stab)
+            .expect("a stab");
+        if let Some(device) = stage.song_mut().device_mut(id) {
+            device.set(daw::params::stab::CHORD, 6.0);
+            device.set(daw::params::stab::INVERSION, 2.0);
+            device.set(daw::params::stab::OPEN, 1.0);
+        }
+        if which.contains("-browse") {
+            let _ = stage.apply(StageIntent::Browse);
+        } else {
+            let _ = stage.apply(StageIntent::Devices);
+        }
     } else if which.contains("forge") {
         // sCOMP on the first track, its forge open over it. `-band`
         // leaves the band showing instead, for the card.
