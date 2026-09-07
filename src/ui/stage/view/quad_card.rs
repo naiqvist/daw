@@ -30,8 +30,69 @@ fn algo_name(params: &QuadParams) -> &'static str {
         .unwrap_or("?")
 }
 
-/// The routing on a grid. `shown` is the operator to light, if any;
-/// `px` the type size, which sets the box size with it.
+/// Where each operator stands in the routing picture: a column and a
+/// row. Carriers stand on the bottom row, left to right in panel order;
+/// a modulator stands directly over the first operator it feeds, and
+/// where several modulators feed one operator they fan out over it.
+/// The picture is then as wide as it needs to be and no wider.
+pub(super) fn routing_places(algo: qp::Algorithm) -> ([(f32, usize); qp::OPS], f32, usize) {
+    // A subtree's width: the widest row of the modulators over it.
+    fn width(algo: qp::Algorithm, op: usize) -> f32 {
+        let feeders: Vec<usize> = algo
+            .edges
+            .iter()
+            .filter(|(_, c)| *c == op)
+            .map(|(m, _)| *m)
+            // Each modulator is placed over the FIRST operator it feeds.
+            .filter(|m| algo.edges.iter().find(|(mm, _)| mm == m).map(|(_, c)| *c) == Some(op))
+            .collect();
+        if feeders.is_empty() {
+            1.0
+        } else {
+            feeders
+                .iter()
+                .map(|m| width(algo, *m))
+                .sum::<f32>()
+                .max(1.0)
+        }
+    }
+    fn place(
+        algo: qp::Algorithm,
+        op: usize,
+        left: f32,
+        row: usize,
+        out: &mut [(f32, usize); qp::OPS],
+    ) {
+        let w = width(algo, op);
+        out[op] = (left + w * 0.5, row);
+        let mut x = left;
+        let mut feeders: Vec<usize> = algo
+            .edges
+            .iter()
+            .filter(|(_, c)| *c == op)
+            .map(|(m, _)| *m)
+            .filter(|m| algo.edges.iter().find(|(mm, _)| mm == m).map(|(_, c)| *c) == Some(op))
+            .collect();
+        feeders.sort_unstable();
+        for m in feeders {
+            place(algo, m, x, row + 1, out);
+            x += width(algo, m);
+        }
+    }
+    let mut out = [(0.0, 0usize); qp::OPS];
+    let mut x = 0.0;
+    let mut carriers: Vec<usize> = algo.carriers.to_vec();
+    carriers.sort_unstable();
+    for c in carriers {
+        place(algo, c, x, 0, &mut out);
+        x += width(algo, c);
+    }
+    let rows = out.iter().map(|(_, row)| *row).max().unwrap_or(0) + 1;
+    (out, x.max(1.0), rows)
+}
+
+/// The routing, drawn as the tree it is. `shown` is the operator to
+/// light, if any; `px` the type size, which sets the box size with it.
 pub(super) fn draw_routing(
     painter: &egui::Painter,
     rect: egui::Rect,
@@ -42,18 +103,23 @@ pub(super) fn draw_routing(
     let c = palette::colours();
     let font = face::font(px);
     let algo = p.algorithm();
-    let rows = (0..qp::OPS).map(|op| depth(algo, op)).max().unwrap_or(0) + 1;
-    let cell_w = rect.width() / qp::OPS as f32;
-    let cell_h = rect.height() / rows as f32;
-    let box_w = (cell_w - 10.0).clamp(24.0, px * 10.0);
-    let box_h = (cell_h - 8.0).clamp(14.0, px * 3.6);
-    let centre = |op: usize| {
-        egui::pos2(
-            rect.left() + (op as f32 + 0.5) * cell_w,
-            rect.bottom() - (depth(algo, op) as f32 + 0.5) * cell_h,
+    let (places, columns, rows) = routing_places(algo);
+    // Boxes of one size, the picture centred in the frame.
+    let box_w = (px * 9.0).min(rect.width() / columns - 8.0).max(24.0);
+    let box_h = (px * 3.4).min(rect.height() / rows as f32 - 8.0).max(14.0);
+    let col_w = box_w + 12.0;
+    let row_h = box_h + px * 1.4;
+    let total_w = col_w * columns;
+    let total_h = row_h * rows as f32;
+    let left = rect.center().x - total_w * 0.5;
+    let bottom = rect.center().y + total_h * 0.5;
+    let boxed = |op: usize| {
+        let (col, row) = places[op];
+        egui::Rect::from_center_size(
+            egui::pos2(left + col * col_w, bottom - (row as f32 + 0.5) * row_h),
+            egui::vec2(box_w, box_h),
         )
     };
-    let boxed = |op: usize| egui::Rect::from_center_size(centre(op), egui::vec2(box_w, box_h));
     // Edges first, under the boxes: a straight drop when the two share
     // a column, an elbow halfway between when they do not.
     for (m, carrier) in algo.edges {
@@ -68,7 +134,6 @@ pub(super) fn draw_routing(
             painter.line_segment([egui::pos2(from.x, mid), egui::pos2(to.x, mid)], stroke);
             painter.line_segment([egui::pos2(to.x, mid), to], stroke);
         }
-        // An arrowhead at the carrier.
         let a = 3.0;
         painter.line_segment([to, egui::pos2(to.x - a, to.y - a)], stroke);
         painter.line_segment([to, egui::pos2(to.x + a, to.y - a)], stroke);
@@ -108,6 +173,7 @@ pub(super) fn draw_routing(
         } else {
             c.dim
         };
+        let cells = ((box_w - 2.0) / (px * 0.56)) as usize;
         if box_h >= px * 2.6 {
             painter.text(
                 egui::pos2(r.center().x, r.top() + px * 0.75 + 1.0),
@@ -121,7 +187,7 @@ pub(super) fn draw_routing(
                 egui::Align2::CENTER_CENTER,
                 super::fit_cells(
                     &op_word(knobs.ratio, knobs.fixed, knobs.hz, knobs.wave),
-                    ((box_w - 2.0) / (px * 0.56)) as usize,
+                    cells,
                 )
                 .trim_end()
                 .to_owned(),
@@ -138,7 +204,7 @@ pub(super) fn draw_routing(
                         op + 1,
                         op_word(knobs.ratio, knobs.fixed, knobs.hz, knobs.wave)
                     ),
-                    ((box_w - 2.0) / (px * 0.56)) as usize,
+                    cells,
                 )
                 .trim_end()
                 .to_owned(),
@@ -146,7 +212,6 @@ pub(super) fn draw_routing(
                 name_ink,
             );
         }
-        // The level, as a bar along the foot of the box.
         let foot = egui::Rect::from_min_max(
             egui::pos2(r.left() + 2.0, r.bottom() - 3.0),
             egui::pos2(
@@ -253,6 +318,25 @@ impl super::super::Stage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_routing_stands_carriers_on_the_floor_and_modulators_over_what_they_feed() {
+        // The serial stack: one column, four rows.
+        let (places, columns, rows) = routing_places(qp::ALGORITHMS[0]);
+        assert_eq!((columns, rows), (1.0, 4));
+        assert!((0..4).all(|op| (places[op].0 - 0.5).abs() < 1e-6 && places[op].1 == op));
+        // Everything into op 1: three columns over one carrier, centred.
+        let (places, columns, rows) = routing_places(qp::ALGORITHMS[5]);
+        assert_eq!((columns, rows), (3.0, 2));
+        assert!((places[0].0 - 1.5).abs() < 1e-6);
+        let mut tops: Vec<f32> = (1..4).map(|op| places[op].0).collect();
+        tops.sort_by(f32::total_cmp);
+        assert_eq!(tops, vec![0.5, 1.5, 2.5]);
+        // Four carriers: one row, in panel order.
+        let (places, columns, rows) = routing_places(qp::ALGORITHMS[7]);
+        assert_eq!((columns, rows), (4.0, 1));
+        assert!((0..4).all(|op| (places[op].0 - (op as f32 + 0.5)).abs() < 1e-6));
+    }
 
     #[test]
     fn the_face_names_the_routing() {
