@@ -4,9 +4,9 @@
 //! knob values cannot show it. This wider face keeps the ordinary
 //! scrolling parameter rail on its right, so keyboard editing stays
 //! uniform, and gives its left to the take: every pass of it, stacked
-//! on one time axis, in the forge's own acid on black — a window into
-//! the room, cut in the deck. The forge itself is one explicit door
-//! away: the ENTER FORGE plate, or the FORGE row turned up.
+//! on one time axis, in the deck's own inks — a window into the forge.
+//! The forge itself is one explicit door away: the ENTER FORGE plate,
+//! or the FORGE row turned up.
 
 use super::{chassis, palette};
 use crate::PROFONT;
@@ -30,19 +30,6 @@ const PARAM_HEAD_H: f32 = 19.0;
 const FACT_H: f32 = 30.0;
 const LAB_W: f32 = 118.0;
 
-/// The forge's inks, borrowed for the window into it.
-fn acid() -> Color32 {
-    Color32::from_rgb(0xB6, 0xFF, 0x1A)
-}
-fn hot() -> Color32 {
-    Color32::from_rgb(0xFF, 0x2B, 0xD6)
-}
-fn violet() -> Color32 {
-    Color32::from_rgb(0x8C, 0x6C, 0xFF)
-}
-fn black() -> Color32 {
-    Color32::from_rgb(0x0A, 0x07, 0x12)
-}
 fn alpha(c: Color32, a: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
 }
@@ -172,10 +159,10 @@ fn draw_header(
         .affords(Affords::Press);
     let open_ink = if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        painter.rect_filled(layout.lab, 0.0, alpha(hot(), 60));
+        painter.rect_filled(layout.lab, 0.0, colours.select);
         colours.bright
     } else {
-        hot()
+        colours.alert
     };
     painter.rect_stroke(
         layout.lab,
@@ -197,11 +184,11 @@ fn draw_header(
 /// time axis, acid on black.
 fn draw_plot(painter: &egui::Painter, rect: egui::Rect, card: Option<&ScompCard>) {
     let colours = palette::colours();
-    painter.rect_filled(rect, 0.0, black());
+    painter.rect_filled(rect, 0.0, colours.panel);
     painter.rect_stroke(
         rect,
         0.0,
-        egui::Stroke::new(1.0, alpha(violet(), 160)),
+        egui::Stroke::new(1.0, colours.rule),
         egui::StrokeKind::Inside,
     );
     let inner = rect.shrink(4.0);
@@ -235,7 +222,7 @@ fn draw_plot(painter: &egui::Painter, rect: egui::Rect, card: Option<&ScompCard>
                 format!("P{k}")
             },
             font.clone(),
-            if last { hot() } else { violet() },
+            if last { colours.bright } else { colours.label },
         );
         let share = card.lens.get(k).copied().unwrap_or(0) as f32 / longest;
         let wave = egui::Rect::from_min_max(
@@ -246,7 +233,11 @@ fn draw_plot(painter: &egui::Painter, rect: egui::Rect, card: Option<&ScompCard>
         let half = wave.height() * 0.5 - 0.5;
         let columns = wave.width().floor().max(1.0) as usize;
         let bins = peaks.columns(None, 0.0, 1.0, columns);
-        let ink = if last { acid() } else { alpha(acid(), 120) };
+        let ink = if last {
+            colours.edge
+        } else {
+            alpha(colours.edge, 140)
+        };
         for (i, bin) in bins.iter().enumerate() {
             let x = wave.min.x + i as f32 + 0.5;
             painter.line_segment(
@@ -264,7 +255,7 @@ fn draw_plot(painter: &egui::Painter, rect: egui::Rect, card: Option<&ScompCard>
                     egui::pos2(inner.max.x + 1.0, y0 + lane_h + 1.0),
                 ),
                 0.0,
-                egui::Stroke::new(1.0, alpha(hot(), 180)),
+                egui::Stroke::new(1.0, colours.alert),
                 egui::StrokeKind::Outside,
             );
         }
@@ -355,11 +346,7 @@ fn draw_params(
         );
         let selected = cursor == Some((index, row_index));
         if selected {
-            painter.rect_filled(
-                row_rect,
-                0.0,
-                if door { alpha(hot(), 70) } else { c.select },
-            );
+            painter.rect_filled(row_rect, 0.0, c.select);
             crate::ui::nav_cursor::claim(
                 painter,
                 ("stage-scomp-param-cursor", index, row_index),
@@ -372,7 +359,7 @@ fn draw_params(
         let ink = if selected {
             c.bright
         } else if door {
-            hot()
+            c.alert
         } else if row.edited {
             c.alert
         } else {

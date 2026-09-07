@@ -1,13 +1,12 @@
-//! The forge, painted: sCOMP's room in its own colours.
+//! The forge, painted: sCOMP's room, in the deck's own hand.
 //!
-//! The stage is a cool stone deck; the forge is the one door on it that
-//! opens onto somewhere else — black, ultraviolet, hazard-striped, the
-//! waveform in acid. Deliberate: this instrument is a bounce chain
-//! wearing a synth's name, and its room should look like the machine
-//! it is rather than a page of the stage. The palette lives here and
-//! nowhere else, so the deck's own hues are untouched.
+//! The same chassis, inks and rules as the cutting room, so the two
+//! rooms read as two doors on one deck: the waveform in the edge ink
+//! with its rms in chassis, the pass on show washed in select with an
+//! alert frame, the cursor's row in select, alert for what re-renders.
 
 use super::heads;
+use super::{chassis, palette};
 use crate::PROFONT;
 use crate::params::scomp as sp;
 use crate::ui::stage::chain;
@@ -18,105 +17,15 @@ use egui::Color32;
 /// The column of rows, its width.
 /// @tune 200..420 px
 const ROWS_W: f32 = 300.0;
-/// The hazard stripe across the head of the room.
-/// @tune 4..14 px
-const HAZARD_H: f32 = 7.0;
 const TITLE_H: f32 = 22.0;
 const ROW_H: f32 = 17.0;
 const TYPE_PX: f32 = 12.0;
 const INSET: f32 = 10.0;
 const LANE_GAP: f32 = 6.0;
 const LEGEND_H: f32 = 18.0;
-/// A cut corner's reach.
-const CHAMFER: f32 = 9.0;
-
-/// Cybergoth: black ground, ultraviolet, acid, one hot pink.
-struct Goth {
-    ground: Color32,
-    panel: Color32,
-    ink: Color32,
-    hot: Color32,
-    violet: Color32,
-    dim: Color32,
-    fg: Color32,
-    hazard: Color32,
-    black: Color32,
-}
-
-fn goth() -> Goth {
-    Goth {
-        ground: Color32::from_rgb(0x0A, 0x07, 0x12),
-        panel: Color32::from_rgb(0x11, 0x0C, 0x1E),
-        ink: Color32::from_rgb(0xB6, 0xFF, 0x1A),
-        hot: Color32::from_rgb(0xFF, 0x2B, 0xD6),
-        violet: Color32::from_rgb(0x8C, 0x6C, 0xFF),
-        dim: Color32::from_rgb(0x4A, 0x44, 0x66),
-        fg: Color32::from_rgb(0xE8, 0xE4, 0xFF),
-        hazard: Color32::from_rgb(0xF5, 0xD9, 0x0A),
-        black: Color32::from_rgb(0x05, 0x04, 0x08),
-    }
-}
 
 fn alpha(c: Color32, a: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
-}
-
-/// A frame with its corners cut, the forge's own chassis.
-fn cut_frame(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    stroke: egui::Stroke,
-    fill: Option<Color32>,
-) {
-    let c = CHAMFER.min(rect.width() * 0.25).min(rect.height() * 0.25);
-    let points = vec![
-        egui::pos2(rect.min.x + c, rect.min.y),
-        egui::pos2(rect.max.x - c, rect.min.y),
-        egui::pos2(rect.max.x, rect.min.y + c),
-        egui::pos2(rect.max.x, rect.max.y - c),
-        egui::pos2(rect.max.x - c, rect.max.y),
-        egui::pos2(rect.min.x + c, rect.max.y),
-        egui::pos2(rect.min.x, rect.max.y - c),
-        egui::pos2(rect.min.x, rect.min.y + c),
-    ];
-    if let Some(fill) = fill {
-        painter.add(egui::Shape::convex_polygon(
-            points.clone(),
-            fill,
-            egui::Stroke::NONE,
-        ));
-    }
-    painter.add(egui::Shape::closed_line(points, stroke));
-}
-
-/// Hazard stripes: yellow and black, leaning right.
-fn hazard(painter: &egui::Painter, rect: egui::Rect, g: &Goth) {
-    painter.rect_filled(rect, 0.0, g.black);
-    let step = rect.height() * 2.0;
-    let mut x = rect.min.x - rect.height();
-    while x < rect.max.x + rect.height() {
-        let points = vec![
-            egui::pos2(x.max(rect.min.x), rect.max.y),
-            egui::pos2(
-                (x + rect.height()).clamp(rect.min.x, rect.max.x),
-                rect.min.y,
-            ),
-            egui::pos2(
-                (x + rect.height() * 2.0).clamp(rect.min.x, rect.max.x),
-                rect.min.y,
-            ),
-            egui::pos2(
-                (x + rect.height()).clamp(rect.min.x, rect.max.x),
-                rect.max.y,
-            ),
-        ];
-        painter.add(egui::Shape::convex_polygon(
-            points,
-            g.hazard,
-            egui::Stroke::NONE,
-        ));
-        x += step;
-    }
 }
 
 fn legend() -> [(&'static str, &'static str); 8] {
@@ -137,7 +46,7 @@ impl super::super::Stage {
         let Some(forge) = self.forge.as_ref() else {
             return;
         };
-        let g = goth();
+        let c = palette::colours();
         let font = egui::FontId::new(TYPE_PX, egui::FontFamily::Name(PROFONT.into()));
         let ch = TYPE_PX * 0.6;
         let margin = heads::margin();
@@ -145,28 +54,28 @@ impl super::super::Stage {
             egui::pos2(field.min.x + margin + heads::gutter(), field.min.y + margin),
             egui::pos2(field.max.x - margin, field.max.y - margin),
         );
-        // The ground: the deck's field goes black under this room.
-        painter.rect_filled(field, 0.0, g.ground);
         let device = self.song.device(forge.device);
         let params = device.map(Forge::params_of).unwrap_or_default();
 
-        // The hazard stripe, and the title on it.
-        let hazard_h = crate::tune!(HAZARD_H);
-        hazard(
-            painter,
-            egui::Rect::from_min_size(room.min, egui::vec2(room.width(), hazard_h)),
-            &g,
-        );
-        let ty = room.min.y + hazard_h + TITLE_H * 0.5;
+        // The title row: the room, the device, the facts.
+        let ty = room.min.y + TITLE_H * 0.5;
         let mut x = room.min.x;
         painter.text(
             egui::pos2(x, ty),
             egui::Align2::LEFT_CENTER,
-            "sCOMP // FORGE",
+            "FORGE //",
             font.clone(),
-            g.hot,
+            c.label,
         );
-        x += 16.0 * ch;
+        x += 9.0 * ch;
+        painter.text(
+            egui::pos2(x, ty),
+            egui::Align2::LEFT_CENTER,
+            "sCOMP",
+            font.clone(),
+            c.dir,
+        );
+        x += 7.0 * ch;
         let shown = forge.shown();
         let lanes = forge.lanes();
         let seconds = forge.take.as_ref().map_or(0.0, |take| take.seconds());
@@ -184,7 +93,7 @@ impl super::super::Stage {
             egui::Align2::LEFT_CENTER,
             &title,
             font.clone(),
-            g.violet,
+            c.fg,
         );
         let on_show = if shown == 0 {
             "ON SHOW: SOURCE".to_owned()
@@ -196,13 +105,13 @@ impl super::super::Stage {
             egui::Align2::RIGHT_CENTER,
             &on_show,
             font.clone(),
-            g.ink,
+            c.nominal,
         );
 
         // The rows' column on the right; the lanes take the rest.
         let rows_w = crate::tune!(ROWS_W);
         let legend_h = crate::tune!(LEGEND_H);
-        let top = room.min.y + hazard_h + TITLE_H + 4.0;
+        let top = room.min.y + TITLE_H + 4.0;
         let lanes_rect = egui::Rect::from_min_max(
             egui::pos2(room.min.x, top),
             egui::pos2(room.max.x - rows_w - 12.0, room.max.y - legend_h - 4.0),
@@ -218,7 +127,7 @@ impl super::super::Stage {
                 egui::Align2::LEFT_CENTER,
                 chord,
                 font.clone(),
-                g.hot,
+                c.bright,
             );
             lx += (chord.chars().count() as f32 + 1.0) * ch;
             painter.text(
@@ -226,18 +135,13 @@ impl super::super::Stage {
                 egui::Align2::LEFT_CENTER,
                 word,
                 font.clone(),
-                g.dim,
+                c.dim,
             );
             lx += (word.chars().count() as f32 + 2.5) * ch;
         }
 
         // The lanes: every pass on one time axis, the longest setting it.
-        cut_frame(
-            painter,
-            lanes_rect,
-            egui::Stroke::new(1.0, g.violet),
-            Some(g.panel),
-        );
+        chassis::frame(painter, lanes_rect, true);
         let inner = lanes_rect.shrink(INSET);
         if let Some(take) = forge.take.as_ref().filter(|take| !take.passes.is_empty()) {
             let rate = f64::from(take.sample_rate.max(1));
@@ -271,7 +175,7 @@ impl super::super::Stage {
                     egui::Align2::LEFT_CENTER,
                     &word,
                     font.clone(),
-                    if live { g.hot } else { g.violet },
+                    if live { c.bright } else { c.label },
                 );
                 // The wave, on the shared axis: this pass's share of the
                 // longest.
@@ -280,22 +184,16 @@ impl super::super::Stage {
                     egui::pos2(wave_x0, lane.min.y),
                     egui::pos2(wave_x0 + wave_w * share, lane.max.y),
                 );
+                let strip = egui::Rect::from_min_max(
+                    egui::pos2(wave_x0, lane.min.y),
+                    egui::pos2(inner.max.x, lane.max.y),
+                );
                 if live {
-                    painter.rect_filled(
-                        egui::Rect::from_min_max(
-                            egui::pos2(wave_x0, lane.min.y),
-                            egui::pos2(inner.max.x, lane.max.y),
-                        ),
-                        0.0,
-                        alpha(g.hot, 18),
-                    );
+                    painter.rect_filled(strip, 0.0, alpha(c.select, 54));
                     painter.rect_stroke(
-                        egui::Rect::from_min_max(
-                            egui::pos2(wave_x0 - 2.0, lane.min.y - 1.0),
-                            egui::pos2(inner.max.x + 2.0, lane.max.y + 1.0),
-                        ),
+                        strip.expand(1.5),
                         0.0,
-                        egui::Stroke::new(1.0, g.hot),
+                        egui::Stroke::new(1.0, c.alert),
                         egui::StrokeKind::Outside,
                     );
                 }
@@ -306,16 +204,16 @@ impl super::super::Stage {
                         egui::pos2(wave_x0, mid.round() - 0.5),
                         egui::pos2(inner.max.x, mid.round() - 0.5),
                     ],
-                    egui::Stroke::new(1.0, alpha(g.dim, 120)),
+                    egui::Stroke::new(1.0, c.rule),
                 );
                 let columns = wave.width().floor().max(1.0) as usize;
                 if let Some(peaks) = forge.peaks.get(k) {
                     let bins = peaks.columns(Some(pass), 0.0, 1.0, columns);
-                    let ink = if live { g.ink } else { alpha(g.ink, 120) };
+                    let ink = if live { c.edge } else { alpha(c.edge, 140) };
                     let body = if live {
-                        alpha(g.violet, 200)
+                        c.chassis
                     } else {
-                        alpha(g.violet, 90)
+                        alpha(c.chassis, 120)
                     };
                     for (i, bin) in bins.iter().enumerate() {
                         let x = wave.min.x + i as f32 + 0.5;
@@ -338,7 +236,7 @@ impl super::super::Stage {
                     let x = wave.max.x.round() - 0.5;
                     painter.line_segment(
                         [egui::pos2(x, lane.min.y), egui::pos2(x, lane.max.y)],
-                        egui::Stroke::new(1.0, alpha(g.hazard, 160)),
+                        egui::Stroke::new(1.0, alpha(c.alert, 160)),
                     );
                 }
             }
@@ -360,7 +258,7 @@ impl super::super::Stage {
                         egui::pos2(x.round() - 0.5, ry),
                         egui::pos2(x.round() - 0.5, ry + 4.0),
                     ],
-                    egui::Stroke::new(1.0, g.dim),
+                    egui::Stroke::new(1.0, c.rule),
                 );
                 let label = format!("{t:.2}s");
                 if x + label.len() as f32 * ch <= inner.max.x {
@@ -369,7 +267,7 @@ impl super::super::Stage {
                         egui::Align2::LEFT_TOP,
                         label,
                         font.clone(),
-                        g.dim,
+                        c.dim,
                     );
                 }
                 t += step;
@@ -380,18 +278,13 @@ impl super::super::Stage {
                 egui::Align2::CENTER_CENTER,
                 "no take",
                 font.clone(),
-                g.dim,
+                c.dim,
             );
         }
 
-        // The rows: every knob, grouped, the cursor's row hot. More
+        // The rows: every knob, grouped, the cursor's row lit. More
         // lines than fit scroll, the cursor's line kept in view.
-        cut_frame(
-            painter,
-            col,
-            egui::Stroke::new(1.0, g.violet),
-            Some(g.panel),
-        );
+        chassis::frame(painter, col, false);
         let inner = col.shrink(INSET);
         let Some(device) = device else {
             return;
@@ -429,7 +322,7 @@ impl super::super::Stage {
                         egui::Align2::LEFT_CENTER,
                         *group,
                         font.clone(),
-                        g.violet,
+                        c.label,
                     );
                 }
                 Line::Row(index) => {
@@ -437,20 +330,18 @@ impl super::super::Stage {
                     let live = *index == forge.row;
                     let baked = sp::baked(id);
                     if live {
-                        painter.rect_filled(
-                            egui::Rect::from_min_max(
-                                egui::pos2(inner.min.x - 4.0, y - ROW_H * 0.5),
-                                egui::pos2(inner.max.x + 4.0, y + ROW_H * 0.5),
-                            ),
-                            0.0,
-                            alpha(g.hot, 40),
+                        let row_rect = egui::Rect::from_min_max(
+                            egui::pos2(inner.min.x - 4.0, y - ROW_H * 0.5),
+                            egui::pos2(inner.max.x + 4.0, y + ROW_H * 0.5),
                         );
-                        painter.line_segment(
-                            [
-                                egui::pos2(inner.min.x - 6.0, y - ROW_H * 0.5),
-                                egui::pos2(inner.min.x - 6.0, y + ROW_H * 0.5),
-                            ],
-                            egui::Stroke::new(2.0, g.hot),
+                        painter.rect_filled(row_rect, 0.0, c.select);
+                        crate::ui::nav_cursor::claim(
+                            painter,
+                            ("forge-row-cursor", *index),
+                            row_rect,
+                            crate::ui::nav_cursor::Kind::Row,
+                            crate::ui::nav_cursor::Layer::Surface,
+                            c.alert,
                         );
                     }
                     let (name, value) = spec
@@ -470,7 +361,7 @@ impl super::super::Stage {
                         egui::Align2::LEFT_CENTER,
                         &name,
                         font.clone(),
-                        if live { g.fg } else { g.dim },
+                        if live { c.bright } else { c.dim },
                     );
                     if baked {
                         painter.text(
@@ -478,7 +369,7 @@ impl super::super::Stage {
                             egui::Align2::LEFT_CENTER,
                             "*",
                             font.clone(),
-                            alpha(g.hazard, if live { 255 } else { 120 }),
+                            alpha(c.alert, if live { 255 } else { 140 }),
                         );
                     }
                     painter.text(
@@ -486,7 +377,7 @@ impl super::super::Stage {
                         egui::Align2::RIGHT_CENTER,
                         &value,
                         font.clone(),
-                        if live { g.ink } else { g.fg },
+                        if live { c.bright } else { c.fg },
                     );
                 }
             }
@@ -498,7 +389,7 @@ impl super::super::Stage {
                 egui::Align2::LEFT_BOTTOM,
                 format!("+{}", lines.len() - first - fit),
                 font.clone(),
-                g.dim,
+                c.dim,
             );
         }
         painter.text(
@@ -506,7 +397,7 @@ impl super::super::Stage {
             egui::Align2::RIGHT_BOTTOM,
             "* re-renders the take",
             font,
-            alpha(g.hazard, 140),
+            alpha(c.alert, 160),
         );
     }
 }
