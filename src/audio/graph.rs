@@ -926,6 +926,31 @@ impl Voices for crate::audio::scomp::ScompVoices {
     }
 }
 
+/// The house chord synth as an instrument the clock can play.
+impl Voices for crate::audio::stab::StabVoices {
+    fn all_sound_off(&mut self) {
+        crate::audio::stab::StabVoices::all_sound_off(self);
+    }
+    fn release_all(&mut self) {
+        crate::audio::stab::StabVoices::release_all(self);
+    }
+    fn note_off(&mut self, pitch: u8) {
+        crate::audio::stab::StabVoices::note_off(self, pitch);
+    }
+    fn note_on(&mut self, pitch: u8, vel: u8, age: u64) {
+        crate::audio::stab::StabVoices::note_on(self, pitch, vel, age);
+    }
+    fn plock(&mut self, param: u32, value: Option<f32>) {
+        crate::audio::stab::StabVoices::plock(self, param, value);
+    }
+    fn plock_glide(&mut self, param: u32, alpha: f32) {
+        crate::audio::stab::StabVoices::plock_glide(self, param, alpha);
+    }
+    fn render(&mut self, out: &mut [f32], at: usize, gain: &mut Ramp) {
+        crate::audio::stab::StabVoices::render(self, out, at, gain);
+    }
+}
+
 impl Voices for crate::audio::sampler::SamplerVoices {
     fn all_sound_off(&mut self) {
         crate::audio::sampler::SamplerVoices::all_sound_off(self);
@@ -1959,6 +1984,14 @@ pub enum Node {
         gain: f32,
         target_gain: f32,
     },
+    /// The house chord synth. One key, one chord.
+    Stab {
+        events: Vec<SeqEvent>,
+        clock: PatternClock,
+        voices: Box<crate::audio::stab::StabVoices>,
+        gain: f32,
+        target_gain: f32,
+    },
     /// The bounced sine. Its take was rendered when the node was built;
     /// the voices only read it.
     Scomp {
@@ -2664,6 +2697,7 @@ impl Node {
             | NodeSpec::Poly { .. }
             | NodeSpec::Tine { .. }
             | NodeSpec::Scomp { .. }
+            | NodeSpec::Stab { .. }
             | NodeSpec::Sampler { .. }
             | NodeSpec::Modulato { .. }
             | NodeSpec::Sat { .. }
@@ -2719,6 +2753,7 @@ impl Node {
             Node::Gauge { core } => Some(core.readout()),
             Node::Tine { voices, .. } => Some(voices.readout()),
             Node::Scomp { voices, .. } => Some(voices.readout()),
+            Node::Stab { voices, .. } => Some(voices.readout()),
             Node::Prism { core } => Some(core.readout()),
             Node::Gate { core } => Some(core.readout()),
             Node::Section { core } => Some(core.readout()),
@@ -3356,6 +3391,23 @@ impl Node {
                 }
             }
 
+            Node::Stab {
+                events,
+                clock,
+                voices,
+                gain,
+                target_gain,
+            } => {
+                let mut ramp = Ramp::across(*gain, *target_gain, out_len);
+                clock.run(voices.as_mut(), events, out.l, ctx, &mut ramp);
+                *gain = *target_gain;
+                if let Some(r) = out.r.as_deref_mut() {
+                    let right = voices.right(out_len);
+                    for (d, s) in r.iter_mut().zip(right.iter()) {
+                        *d = *s;
+                    }
+                }
+            }
             Node::Poly {
                 events,
                 clock,
@@ -4478,6 +4530,7 @@ impl Node {
             Node::Seq { clock, .. }
             | Node::Tine { clock, .. }
             | Node::Scomp { clock, .. }
+            | Node::Stab { clock, .. }
             | Node::Poly { clock, .. }
             | Node::Loom { clock, .. }
             | Node::Haze { clock, .. }
@@ -5059,6 +5112,20 @@ impl Node {
                 voices.set_param(param, value);
             }
 
+            Node::Stab {
+                target_gain,
+                voices,
+                ..
+            } => {
+                let Some(value) = crate::params::clamp(crate::params::stab::TABLE, param, value)
+                else {
+                    return;
+                };
+                if param == crate::params::stab::LEVEL {
+                    *target_gain = value;
+                }
+                voices.set_param(param, value);
+            }
             Node::Poly {
                 target_gain,
                 voices,
@@ -5529,6 +5596,12 @@ fn resolve_timeline_spec(
             ..
         }
         | NodeSpec::Scomp {
+            notes,
+            subloops,
+            loop_len_beats: None,
+            ..
+        }
+        | NodeSpec::Stab {
             notes,
             subloops,
             loop_len_beats: None,
@@ -6445,6 +6518,7 @@ impl NodeSpec {
             NodeSpec::Seq { notes, .. }
             | NodeSpec::Tine { notes, .. }
             | NodeSpec::Scomp { notes, .. }
+            | NodeSpec::Stab { notes, .. }
             | NodeSpec::Poly { notes, .. }
             | NodeSpec::Loom { notes, .. }
             | NodeSpec::Haze { notes, .. }
@@ -6918,6 +6992,15 @@ pub enum NodeSpec {
         #[serde(default)]
         params: crate::audio::tine::TineParams,
     },
+    /// STAB: the house chord synth, one key a chord. Timeline-locked as
+    /// `Tine` is; stereo out, the detuned pairs spread across it.
+    Stab {
+        notes: Vec<Note>,
+        subloops: Vec<SubLoop>,
+        loop_len_beats: Option<f64>,
+        #[serde(default)]
+        params: crate::audio::stab::StabParams,
+    },
     /// sCOMP: a sine bounced through a compressor, rendered to a take
     /// when the node is built and played like a sample. Timeline-locked
     /// as `Tine` is. Stereo out, the same on both sides, so the strip
@@ -7129,6 +7212,7 @@ impl GraphSpec {
                 NodeSpec::Seq { notes, .. }
                 | NodeSpec::Tine { notes, .. }
                 | NodeSpec::Scomp { notes, .. }
+                | NodeSpec::Stab { notes, .. }
                 | NodeSpec::Poly { notes, .. }
                 | NodeSpec::Haze { notes, .. }
                 | NodeSpec::Kick { notes, .. }
@@ -8223,6 +8307,42 @@ impl GraphSpec {
                         }
                     }
 
+                    Some(NodeSpec::Stab {
+                        notes,
+                        subloops,
+                        loop_len_beats,
+                        params,
+                    }) => {
+                        let events = compile_events(
+                            notes,
+                            subloops,
+                            *loop_len_beats,
+                            samples_per_beat,
+                            plock_glide_samples,
+                        )?;
+                        let voices = crate::audio::stab::StabVoices::new(
+                            sample_rate as f32,
+                            block_frames,
+                            *params,
+                        );
+                        let gain = if params.level.is_finite() {
+                            params.level.clamp(0.0, crate::params::stab::LEVEL_MAX)
+                        } else {
+                            crate::audio::stab::StabParams::default().level
+                        };
+                        Node::Stab {
+                            events,
+                            clock: PatternClock::new(
+                                loop_len_beats
+                                    .map(|len| (len * samples_per_beat).round().max(0.0) as u64)
+                                    .unwrap_or(0),
+                                samples_per_beat,
+                            ),
+                            voices: Box::new(voices),
+                            gain,
+                            target_gain: gain,
+                        }
+                    }
                     Some(NodeSpec::Poly {
                         notes,
                         subloops,

@@ -134,6 +134,7 @@ pub(crate) fn compile_chain(
             | DeviceState::Loom(_)
             | DeviceState::Tine(_)
             | DeviceState::Scomp(_)
+            | DeviceState::Stab(_)
             | DeviceState::Haze(_)
             | DeviceState::Sampler(_)
             | DeviceState::Kick(_)
@@ -612,6 +613,12 @@ pub(crate) fn build_graph_spec(
                         params,
                     },
                     DeviceState::Scomp(params) => NodeSpec::Scomp {
+                        notes,
+                        subloops: Vec::new(),
+                        loop_len_beats,
+                        params,
+                    },
+                    DeviceState::Stab(params) => NodeSpec::Stab {
                         notes,
                         subloops: Vec::new(),
                         loop_len_beats,

@@ -42,6 +42,7 @@ pub mod scomp;
 pub mod sibyl;
 pub mod sigil;
 pub mod snare;
+pub mod stab;
 pub mod strip;
 pub mod tine;
 pub mod tom;

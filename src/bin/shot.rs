@@ -1852,6 +1852,25 @@ fn draw(which: &str, ui: &mut egui::Ui, theme: &Theme, subject: &mut Subject) {
                 &history,
             );
         }
+        "stab" => {
+            let mut state = device::stab::StabUi::default();
+            let mut page = 0;
+            device::stab::stab_card(ui, theme, &mut state, &mut page, 2.0);
+        }
+        "stab-open" => {
+            let mut state = device::stab::StabUi::default();
+            state.set_norm(
+                daw::params::stab::CHORD,
+                device::stab::stab_norm(daw::params::stab::CHORD, 6.0),
+            );
+            state.set_norm(
+                daw::params::stab::INVERSION,
+                device::stab::stab_norm(daw::params::stab::INVERSION, 2.0),
+            );
+            state.set_norm(daw::params::stab::OPEN, 1.0);
+            let mut page = 0;
+            device::stab::stab_card(ui, theme, &mut state, &mut page, 3.0);
+        }
         "tine" => {
             let mut state = device::tine::TineUi::default();
             device::tine::tine_card(ui, theme, &mut state, 3.0);

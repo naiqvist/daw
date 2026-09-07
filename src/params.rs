@@ -56,6 +56,291 @@ pub fn def(table: &'static [ParamDef], id: u32) -> &'static ParamDef {
     &table[id as usize]
 }
 
+/// STAB: the house chord synth. One key is a chord; the chord, its
+/// inversion and its voicing are knobs, so a pattern of single notes
+/// plays a progression. See [`crate::audio::stab`].
+pub mod stab {
+    use super::ParamDef;
+
+    pub const CHORD: u32 = 0;
+    pub const INVERSION: u32 = 1;
+    pub const OPEN: u32 = 2;
+    pub const OCTAVE: u32 = 3;
+    pub const STRUM: u32 = 4;
+    pub const TONE: u32 = 5;
+    pub const DETUNE: u32 = 6;
+    pub const WIDTH: u32 = 7;
+    pub const ATTACK: u32 = 8;
+    pub const DECAY: u32 = 9;
+    pub const SUSTAIN: u32 = 10;
+    pub const RELEASE: u32 = 11;
+    pub const CUTOFF: u32 = 12;
+    pub const RESO: u32 = 13;
+    pub const ENV: u32 = 14;
+    pub const FENV: u32 = 15;
+    pub const DRIVE: u32 = 16;
+    pub const CRUSH: u32 = 17;
+    pub const RATE: u32 = 18;
+    pub const LEVEL: u32 = 19;
+
+    /// The most notes a chord has.
+    pub const NOTES: usize = 5;
+
+    /// The chords, as semitones above the root. The list a house record
+    /// needs: triads, sevenths, ninths, the suspensions, the sixths.
+    pub const CHORDS: &[(&str, &[i32])] = &[
+        ("maj", &[0, 4, 7]),
+        ("min", &[0, 3, 7]),
+        ("7", &[0, 4, 7, 10]),
+        ("m7", &[0, 3, 7, 10]),
+        ("maj7", &[0, 4, 7, 11]),
+        ("9", &[0, 4, 7, 10, 14]),
+        ("m9", &[0, 3, 7, 10, 14]),
+        ("maj9", &[0, 4, 7, 11, 14]),
+        ("add9", &[0, 4, 7, 14]),
+        ("sus2", &[0, 2, 7]),
+        ("sus4", &[0, 5, 7]),
+        ("6", &[0, 4, 7, 9]),
+        ("m6", &[0, 3, 7, 9]),
+        ("dim", &[0, 3, 6]),
+    ];
+    pub const CHORD_NAMES: &[&str] = &[
+        "maj", "min", "7", "m7", "maj7", "9", "m9", "maj9", "add9", "sus2", "sus4", "6", "m6",
+        "dim",
+    ];
+    pub const INVERSION_NAMES: &[&str] = &["root", "1st", "2nd", "3rd", "4th"];
+    pub const OPEN_NAMES: &[&str] = &["close", "open"];
+    pub const OCTAVE_NAMES: &[&str] = &["-2", "-1", "0", "+1", "+2"];
+    pub const LEVEL_MAX: f32 = 2.0;
+
+    /// The chord's notes as semitones above the played key, voiced:
+    /// inverted by carrying the lowest notes up an octave, and opened
+    /// by dropping the second note from the top an octave — the
+    /// drop-two voicing, which is how a stab gets wide without getting
+    /// muddy. Returns the notes and how many there are; the rest of the
+    /// array is unused. No allocation: the audio thread calls this.
+    pub fn voicing(chord: usize, inversion: usize, open: bool) -> ([i32; NOTES], usize) {
+        let (_, intervals) = CHORDS.get(chord).copied().unwrap_or(CHORDS[0]);
+        let count = intervals.len().min(NOTES);
+        let mut notes = [0i32; NOTES];
+        for (slot, interval) in notes.iter_mut().zip(intervals.iter()) {
+            *slot = *interval;
+        }
+        // Inversion: the lowest note goes up an octave, `inversion`
+        // times. A ninth sits above the raised root, so the notes are
+        // put back in order each time rather than assumed to be.
+        for _ in 0..inversion.min(count.saturating_sub(1)) {
+            notes[0] += 12;
+            sort(&mut notes[..count]);
+        }
+        if open && count >= 3 {
+            notes[count - 2] -= 12;
+            sort(&mut notes[..count]);
+        }
+        (notes, count)
+    }
+
+    /// An insertion sort: five notes at most, and no allocation.
+    fn sort(notes: &mut [i32]) {
+        for i in 1..notes.len() {
+            let mut j = i;
+            while j > 0 && notes[j - 1] > notes[j] {
+                notes.swap(j - 1, j);
+                j -= 1;
+            }
+        }
+    }
+
+    pub const TABLE: &[ParamDef] = &[
+        ParamDef {
+            id: CHORD,
+            name: "chord",
+            min: 0.0,
+            max: 13.0,
+            default: 3.0,
+        },
+        ParamDef {
+            id: INVERSION,
+            name: "inversion",
+            min: 0.0,
+            max: 4.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: OPEN,
+            name: "voicing",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: OCTAVE,
+            name: "octave",
+            min: -2.0,
+            max: 2.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: STRUM,
+            name: "strum",
+            min: 0.0,
+            max: 60.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: TONE,
+            name: "tone",
+            min: 0.0,
+            max: 1.0,
+            default: 0.35,
+        },
+        ParamDef {
+            id: DETUNE,
+            name: "detune",
+            min: 0.0,
+            max: 50.0,
+            default: 8.0,
+        },
+        ParamDef {
+            id: WIDTH,
+            name: "width",
+            min: 0.0,
+            max: 1.0,
+            default: 0.6,
+        },
+        ParamDef {
+            id: ATTACK,
+            name: "attack",
+            min: 0.0,
+            max: 500.0,
+            default: 2.0,
+        },
+        ParamDef {
+            id: DECAY,
+            name: "decay",
+            min: 5.0,
+            max: 3_000.0,
+            default: 350.0,
+        },
+        ParamDef {
+            id: SUSTAIN,
+            name: "sustain",
+            min: 0.0,
+            max: 1.0,
+            default: 0.2,
+        },
+        ParamDef {
+            id: RELEASE,
+            name: "release",
+            min: 5.0,
+            max: 3_000.0,
+            default: 180.0,
+        },
+        ParamDef {
+            id: CUTOFF,
+            name: "cutoff",
+            min: 100.0,
+            max: 18_000.0,
+            default: 6_000.0,
+        },
+        ParamDef {
+            id: RESO,
+            name: "reso",
+            min: 0.5,
+            max: 12.0,
+            default: 0.9,
+        },
+        ParamDef {
+            id: ENV,
+            name: "env",
+            min: 0.0,
+            max: 6.0,
+            default: 2.5,
+        },
+        ParamDef {
+            id: FENV,
+            name: "env decay",
+            min: 5.0,
+            max: 2_000.0,
+            default: 220.0,
+        },
+        ParamDef {
+            id: DRIVE,
+            name: "drive",
+            min: 1.0,
+            max: 32.0,
+            default: 1.5,
+        },
+        ParamDef {
+            id: CRUSH,
+            name: "crush",
+            min: 2.0,
+            max: 16.0,
+            default: 16.0,
+        },
+        ParamDef {
+            id: RATE,
+            name: "rate",
+            min: 1_000.0,
+            max: 48_000.0,
+            default: 48_000.0,
+        },
+        ParamDef {
+            id: LEVEL,
+            name: "level",
+            min: 0.0,
+            max: LEVEL_MAX,
+            default: 0.8,
+        },
+    ];
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn the_chord_list_and_its_names_agree_and_voicings_stay_sorted() {
+            assert_eq!(CHORDS.len(), CHORD_NAMES.len());
+            for ((name, intervals), listed) in CHORDS.iter().zip(CHORD_NAMES) {
+                assert_eq!(name, listed);
+                assert!(intervals.len() <= NOTES && intervals[0] == 0);
+                assert!(intervals.windows(2).all(|w| w[0] < w[1]));
+            }
+            let (notes, count) = voicing(0, 0, false);
+            assert_eq!((&notes[..count], count), (&[0, 4, 7][..], 3));
+            let (notes, count) = voicing(0, 1, false);
+            assert_eq!(&notes[..count], &[4, 7, 12], "first inversion");
+            let (notes, count) = voicing(0, 2, false);
+            assert_eq!(&notes[..count], &[7, 12, 16], "second inversion");
+            let (notes, count) = voicing(4, 3, false);
+            assert_eq!(&notes[..count], &[11, 12, 16, 19], "maj7 third inversion");
+            let (notes, count) = voicing(0, 4, false);
+            assert_eq!(
+                &notes[..count],
+                &[7, 12, 16],
+                "a triad has no fourth inversion"
+            );
+            let (notes, count) = voicing(4, 0, true);
+            assert_eq!(
+                &notes[..count],
+                &[-5, 0, 4, 11],
+                "drop-two: the fifth goes under"
+            );
+            for chord in 0..CHORDS.len() {
+                for inversion in 0..5 {
+                    for open in [false, true] {
+                        let (notes, count) = voicing(chord, inversion, open);
+                        assert!(
+                            notes[..count].windows(2).all(|w| w[0] < w[1]),
+                            "{chord} {inversion} {open}: {notes:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// sCOMP: a sine, squashed into a sound. See [`crate::scomp`].
 pub mod scomp {
     use super::ParamDef;

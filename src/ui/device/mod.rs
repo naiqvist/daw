@@ -132,6 +132,7 @@ pub mod sibyl;
 pub mod sigil;
 pub mod snare;
 pub mod spectrum;
+pub mod stab;
 pub mod strip;
 pub mod switch;
 pub mod synth;
