@@ -11,8 +11,13 @@
 //!
 //! Phase modulation, as every FM synth since the DX7 actually is: a
 //! modulator's output is added to its carrier's phase, scaled by an
-//! index, so a level knob is a brightness knob. The sine is a table
-//! read, not a `sin` per operator per voice per sample.
+//! index, so a level knob is a brightness knob. The waves are table
+//! reads, not a `sin` per operator per voice per sample: the sine, the
+//! TX81Z's half and rectified sines, a soft square, and noise. Each
+//! operator also has its own velocity depth and a level scaling across
+//! the keyboard, and may sit at a fixed frequency instead of a ratio;
+//! the envelopes' decay and release shorten up the keyboard by KEY
+//! RATE, as every acoustic thing's do.
 
 use crate::dsp::adsr::Adsr;
 use crate::dsp::filters::{Mode as FilterMode, Svf};
@@ -42,6 +47,16 @@ pub struct Op {
     pub decay: f32,
     pub sustain: f32,
     pub release: f32,
+    /// The shape, an index into `WAVE_NAMES`.
+    pub wave: f32,
+    /// Whether the operator sits at `hz` rather than at `ratio` times
+    /// the note.
+    pub fixed: f32,
+    pub hz: f32,
+    /// How much of the key's velocity reaches this operator's level.
+    pub vel: f32,
+    /// Level scaling across the keyboard, in dB per octave from C4.
+    pub keyscale: f32,
 }
 
 impl Default for Op {
@@ -54,6 +69,11 @@ impl Default for Op {
             decay: 400.0,
             sustain: 0.3,
             release: 250.0,
+            wave: 0.0,
+            fixed: 0.0,
+            hz: 440.0,
+            vel: 0.5,
+            keyscale: 0.0,
         }
     }
 }
@@ -82,6 +102,8 @@ pub struct QuadParams {
     pub drive: f32,
     pub velocity: f32,
     pub level: f32,
+    /// How much the envelopes' decay and release shorten up the keyboard.
+    pub key_rate: f32,
 }
 
 impl Default for QuadParams {
@@ -107,6 +129,7 @@ impl Default for QuadParams {
             drive: 1.0,
             velocity: 0.6,
             level: 0.8,
+            key_rate: 0.3,
         };
         for def in p::TABLE {
             me.set(def.id, def.default);
@@ -133,6 +156,11 @@ impl QuadParams {
                 p::DECAY => op.decay = value,
                 p::SUSTAIN => op.sustain = value,
                 p::RELEASE => op.release = value,
+                p::WAVE => op.wave = value,
+                p::FIXED => op.fixed = value,
+                p::HZ => op.hz = value,
+                p::VEL => op.vel = value,
+                p::KEYSCALE => op.keyscale = value,
                 _ => {}
             }
             return;
@@ -157,6 +185,7 @@ impl QuadParams {
             p::DRIVE => self.drive = value,
             p::VELOCITY => self.velocity = value,
             p::LEVEL => self.level = value,
+            p::KEY_RATE => self.key_rate = value,
             _ => {}
         }
     }
@@ -172,6 +201,11 @@ impl QuadParams {
                 p::DECAY => op.decay,
                 p::SUSTAIN => op.sustain,
                 p::RELEASE => op.release,
+                p::WAVE => op.wave,
+                p::FIXED => op.fixed,
+                p::HZ => op.hz,
+                p::VEL => op.vel,
+                p::KEYSCALE => op.keyscale,
                 _ => return None,
             });
         }
@@ -195,6 +229,7 @@ impl QuadParams {
             p::DRIVE => self.drive,
             p::VELOCITY => self.velocity,
             p::LEVEL => self.level,
+            p::KEY_RATE => self.key_rate,
             _ => return None,
         })
     }
@@ -244,6 +279,11 @@ struct Voice {
     out: [f32; OPS],
     env: [Adsr; OPS],
     filter: Svf,
+    /// Each operator's level for this key: velocity depth and key
+    /// scaling, worked out once at the note.
+    key_gain: [f32; OPS],
+    /// The noise wave's generator, one per voice.
+    noise: u32,
 }
 
 impl Voice {
@@ -260,6 +300,8 @@ impl Voice {
             out: [0.0; OPS],
             env: [Adsr::new(), Adsr::new(), Adsr::new(), Adsr::new()],
             filter: Svf::new(),
+            key_gain: [1.0; OPS],
+            noise: 0x9E37_79B9,
         }
     }
 }
@@ -269,7 +311,8 @@ pub struct QuadVoices {
     params: QuadParams,
     base: QuadParams,
     sample_rate: f32,
-    sine: Vec<f32>,
+    /// The shapes, one table each, in `WAVE_NAMES` order but for noise.
+    waves: [Vec<f32>; 4],
     voices: Vec<Voice>,
     /// Scratch: one voice's block, its operator envelopes, the sum.
     block: Vec<f32>,
@@ -294,16 +337,29 @@ fn sine_at(table: &[f32], turns: f32) -> f32 {
 
 impl QuadVoices {
     pub fn new(sample_rate: f32, block: usize, params: QuadParams) -> Self {
-        let mut sine = vec![0.0f32; TABLE + 1];
-        for (i, slot) in sine.iter_mut().enumerate() {
-            *slot = (i as f32 / TABLE as f32 * core::f32::consts::TAU).sin();
+        let mut waves: [Vec<f32>; 4] = [
+            vec![0.0f32; TABLE + 1],
+            vec![0.0f32; TABLE + 1],
+            vec![0.0f32; TABLE + 1],
+            vec![0.0f32; TABLE + 1],
+        ];
+        for i in 0..=TABLE {
+            let t = i as f32 / TABLE as f32 * core::f32::consts::TAU;
+            let sine = t.sin();
+            waves[0][i] = sine;
+            // The half sine: the positive lobe, then rest.
+            waves[1][i] = sine.max(0.0);
+            // The rectified sine, centred: every lobe up, then the DC out.
+            waves[2][i] = sine.abs() * 2.0 - 4.0 / core::f32::consts::PI;
+            // A soft square: the sine leaned on, not a step.
+            waves[3][i] = (sine * 4.0).tanh() / 4.0f32.tanh();
         }
         let n = block.max(HOP);
         let mut me = Self {
             params,
             base: params,
             sample_rate: 48_000.0,
-            sine,
+            waves,
             voices: (0..VOICES).map(|_| Voice::new()).collect(),
             block: vec![0.0; n],
             envs: [vec![0.0; n], vec![0.0; n], vec![0.0; n], vec![0.0; n]],
@@ -444,6 +500,23 @@ impl QuadVoices {
         v.phase = [0.0; OPS];
         v.out = [0.0; OPS];
         v.filter.reset();
+        // The key's own levels and rates: velocity depth and dB-per-octave
+        // scaling per operator, and every envelope's decay and release
+        // shortened up the keyboard by KEY RATE.
+        let octaves = (f32::from(pitch) - 60.0) / 12.0;
+        let rate = (-octaves * self.params.key_rate).exp2().clamp(0.125, 8.0);
+        for (k, op) in self.params.ops.iter().enumerate() {
+            let touch = 1.0 - op.vel + op.vel * v.vel;
+            let scaled = (op.keyscale * octaves / 20.0 * core::f32::consts::LN_10).exp();
+            v.key_gain[k] = (touch * scaled).clamp(0.0, 4.0);
+            v.env[k].prepare(
+                self.sample_rate,
+                op.attack,
+                op.decay * rate,
+                op.sustain,
+                op.release * rate,
+            );
+        }
         for env in v.env.iter_mut() {
             env.gate_on();
         }
@@ -480,7 +553,7 @@ impl QuadVoices {
             3 => FilterMode::Notch,
             _ => FilterMode::Lowpass,
         };
-        let sine = &self.sine;
+        let waves = &self.waves;
         let mut sounding = 0usize;
         for vi in 0..self.voices.len() {
             if !self.voices[vi].active {
@@ -499,8 +572,8 @@ impl QuadVoices {
                         env.process(buf);
                     }
                 }
-                // Velocity: the modulators' levels are what a harder
-                // key brightens; the carriers' what it loudens.
+                // Velocity: each operator has its own depth, worked out
+                // at the note; the master depth loudens the carriers.
                 let touch = 1.0 - p.velocity + p.velocity * v.vel;
                 let t = v.elapsed as f32 / sr;
                 let bend_all = p.pitch1 * rise_fall(t, p.p1_rise, p.p1_fall);
@@ -515,7 +588,11 @@ impl QuadVoices {
                         } else {
                             0.0
                         };
-                    let hz = v.base_hz * op.ratio * (op.fine / 1200.0 + bend / 12.0).exp2();
+                    let hz = if op.fixed.round() >= 1.0 {
+                        op.hz * (op.fine / 1200.0 + bend / 12.0).exp2()
+                    } else {
+                        v.base_hz * op.ratio * (op.fine / 1200.0 + bend / 12.0).exp2()
+                    };
                     inc[k] = (hz / sr).clamp(0.0, 0.5);
                 }
                 for s in 0..take {
@@ -536,9 +613,21 @@ impl QuadVoices {
                             turns += v.out[k] * p.feedback * FEEDBACK_TURNS;
                         }
                         let env = self.envs[k].get(s).copied().unwrap_or(0.0);
-                        let level =
-                            op.level * env * if p::is_modulator(algo, k) { touch } else { 1.0 };
-                        let y = sine_at(sine, v.phase[k] + turns) * level;
+                        let level = op.level * env * v.key_gain[k];
+                        let wave = op.wave.round().max(0.0) as usize;
+                        let sample = if wave >= waves.len() {
+                            // Noise: a new value every sample, the phase
+                            // ignored. An xorshift, so it costs nothing.
+                            let mut x = v.noise;
+                            x ^= x << 13;
+                            x ^= x >> 17;
+                            x ^= x << 5;
+                            v.noise = x;
+                            (x as f32 / u32::MAX as f32) * 2.0 - 1.0
+                        } else {
+                            sine_at(&waves[wave], v.phase[k] + turns)
+                        };
+                        let y = sample * level;
                         v.phase[k] = (v.phase[k] + inc[k]).fract();
                         next[k] = y;
                     }
@@ -640,6 +729,8 @@ mod tests {
         let d = QuadParams::default();
         assert_eq!(d.ops[0].level, 1.0);
         assert_eq!(d.ops[1].ratio, 2.0);
+        assert_eq!(d.ops[2].vel, 0.5);
+        assert_eq!(d.key_rate, 0.3);
     }
 
     #[test]
@@ -729,6 +820,113 @@ mod tests {
         assert_eq!(rise_fall(0.0, 0.0, 100.0), 1.0);
         assert!(rise_fall(0.5, 0.0, 100.0) < 0.01);
         assert!((rise_fall(0.05, 100.0, 100.0) - 0.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn waves_fixed_frequency_key_scaling_and_key_rate_do_what_they_say() {
+        let crossings = |xs: &[f32]| {
+            xs.windows(2)
+                .filter(|w| (w[0] < 0.0) != (w[1] < 0.0))
+                .count()
+        };
+        // A carrier alone: each wave is a different sound, all finite.
+        let mut last: Vec<f32> = Vec::new();
+        for wave in 0..p::WAVE_NAMES.len() {
+            let mut params = QuadParams::default();
+            params.ops[1].level = 0.0;
+            params.ops[0].wave = wave as f32;
+            params.cutoff = 20_000.0;
+            let mut v = QuadVoices::new(FS, 256, params);
+            v.note_on(57, 100, 1);
+            let out = run(&mut v, 4_800);
+            assert!(out.iter().all(|x| x.is_finite()), "wave {wave}");
+            assert!(rms(&out) > 0.03, "wave {wave} is silent");
+            if wave > 0 {
+                assert!(
+                    out.iter()
+                        .zip(last.iter())
+                        .any(|(a, b)| (a - b).abs() > 0.01),
+                    "wave {wave} is wave {}",
+                    wave - 1
+                );
+            }
+            last = out;
+        }
+        // Fixed: the operator ignores the key.
+        let mut params = QuadParams::default();
+        params.ops[1].level = 0.0;
+        params.ops[0].fixed = 1.0;
+        params.ops[0].hz = 440.0;
+        params.cutoff = 20_000.0;
+        let mut low = QuadVoices::new(FS, 256, params);
+        let mut high = QuadVoices::new(FS, 256, params);
+        low.note_on(45, 100, 1);
+        high.note_on(81, 100, 1);
+        let a = run(&mut low, 960);
+        let b = run(&mut high, 960);
+        assert!(
+            (crossings(&a) as i32 - crossings(&b) as i32).abs() <= 1,
+            "{} vs {}",
+            crossings(&a),
+            crossings(&b)
+        );
+        // Key scaling: -12 dB per octave leaves a note an octave up a quarter as loud.
+        let mut params = QuadParams::default();
+        params.ops[1].level = 0.0;
+        params.ops[0].keyscale = -12.0;
+        params.ops[0].vel = 0.0;
+        params.velocity = 0.0;
+        params.cutoff = 20_000.0;
+        params.key_rate = 0.0;
+        let mut c4 = QuadVoices::new(FS, 256, params);
+        let mut c5 = QuadVoices::new(FS, 256, params);
+        c4.note_on(60, 100, 1);
+        c5.note_on(72, 100, 1);
+        let a = run(&mut c4, 2_400);
+        let b = run(&mut c5, 2_400);
+        let ratio = rms(&b) / rms(&a);
+        assert!(
+            (ratio - 0.25).abs() < 0.06,
+            "an octave up at -12 dB/oct came out at {ratio}"
+        );
+        // Key rate: the same note two octaves up decays sooner.
+        let mut params = QuadParams::default();
+        params.ops[1].level = 0.0;
+        params.ops[0].sustain = 0.0;
+        params.ops[0].decay = 400.0;
+        params.key_rate = 1.0;
+        params.cutoff = 20_000.0;
+        let mut slow = QuadVoices::new(FS, 256, params);
+        let mut fast = QuadVoices::new(FS, 256, params);
+        slow.note_on(48, 100, 1);
+        fast.note_on(72, 100, 1);
+        let _ = run(&mut slow, 9_600);
+        let _ = run(&mut fast, 9_600);
+        let a = run(&mut slow, 2_400);
+        let b = run(&mut fast, 2_400);
+        assert!(rms(&b) < rms(&a) * 0.5, "{} vs {}", rms(&b), rms(&a));
+        // Per-operator velocity: a modulator with full depth brightens
+        // with the key; with none it does not.
+        for (depth, expect_more) in [(1.0f32, true), (0.0, false)] {
+            let mut params = QuadParams::default();
+            params.ops[1].level = 1.0;
+            params.ops[1].vel = depth;
+            params.velocity = 0.0;
+            let mut soft = QuadVoices::new(FS, 256, params);
+            let mut hard = QuadVoices::new(FS, 256, params);
+            soft.note_on(48, 10, 1);
+            hard.note_on(48, 127, 1);
+            let ys = run(&mut soft, 2_400);
+            let yh = run(&mut hard, 2_400);
+            let brighter = brightness(&yh) > brightness(&ys) * 1.2;
+            assert_eq!(
+                brighter,
+                expect_more,
+                "depth {depth}: {} vs {}",
+                brightness(&yh),
+                brightness(&ys)
+            );
+        }
     }
 
     #[test]

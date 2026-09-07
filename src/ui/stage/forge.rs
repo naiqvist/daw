@@ -83,7 +83,7 @@ pub(super) const ROWS: [(&str, u32); 22] = [
 
 /// QUAD's rows, in signal order: each operator, the routing, the two
 /// pitch envelopes, the filter, the output.
-pub(super) const QUAD_ROWS: [(&str, u32); 47] = [
+pub(super) const QUAD_ROWS: [(&str, u32); 68] = [
     ("OP 1", qp::op_param(0, qp::RATIO)),
     ("OP 1", qp::op_param(0, qp::FINE)),
     ("OP 1", qp::op_param(0, qp::LEVEL_OP)),
@@ -91,6 +91,11 @@ pub(super) const QUAD_ROWS: [(&str, u32); 47] = [
     ("OP 1", qp::op_param(0, qp::DECAY)),
     ("OP 1", qp::op_param(0, qp::SUSTAIN)),
     ("OP 1", qp::op_param(0, qp::RELEASE)),
+    ("OP 1", qp::op_param(0, qp::WAVE)),
+    ("OP 1", qp::op_param(0, qp::FIXED)),
+    ("OP 1", qp::op_param(0, qp::HZ)),
+    ("OP 1", qp::op_param(0, qp::VEL)),
+    ("OP 1", qp::op_param(0, qp::KEYSCALE)),
     ("OP 2", qp::op_param(1, qp::RATIO)),
     ("OP 2", qp::op_param(1, qp::FINE)),
     ("OP 2", qp::op_param(1, qp::LEVEL_OP)),
@@ -98,6 +103,11 @@ pub(super) const QUAD_ROWS: [(&str, u32); 47] = [
     ("OP 2", qp::op_param(1, qp::DECAY)),
     ("OP 2", qp::op_param(1, qp::SUSTAIN)),
     ("OP 2", qp::op_param(1, qp::RELEASE)),
+    ("OP 2", qp::op_param(1, qp::WAVE)),
+    ("OP 2", qp::op_param(1, qp::FIXED)),
+    ("OP 2", qp::op_param(1, qp::HZ)),
+    ("OP 2", qp::op_param(1, qp::VEL)),
+    ("OP 2", qp::op_param(1, qp::KEYSCALE)),
     ("OP 3", qp::op_param(2, qp::RATIO)),
     ("OP 3", qp::op_param(2, qp::FINE)),
     ("OP 3", qp::op_param(2, qp::LEVEL_OP)),
@@ -105,6 +115,11 @@ pub(super) const QUAD_ROWS: [(&str, u32); 47] = [
     ("OP 3", qp::op_param(2, qp::DECAY)),
     ("OP 3", qp::op_param(2, qp::SUSTAIN)),
     ("OP 3", qp::op_param(2, qp::RELEASE)),
+    ("OP 3", qp::op_param(2, qp::WAVE)),
+    ("OP 3", qp::op_param(2, qp::FIXED)),
+    ("OP 3", qp::op_param(2, qp::HZ)),
+    ("OP 3", qp::op_param(2, qp::VEL)),
+    ("OP 3", qp::op_param(2, qp::KEYSCALE)),
     ("OP 4", qp::op_param(3, qp::RATIO)),
     ("OP 4", qp::op_param(3, qp::FINE)),
     ("OP 4", qp::op_param(3, qp::LEVEL_OP)),
@@ -112,6 +127,11 @@ pub(super) const QUAD_ROWS: [(&str, u32); 47] = [
     ("OP 4", qp::op_param(3, qp::DECAY)),
     ("OP 4", qp::op_param(3, qp::SUSTAIN)),
     ("OP 4", qp::op_param(3, qp::RELEASE)),
+    ("OP 4", qp::op_param(3, qp::WAVE)),
+    ("OP 4", qp::op_param(3, qp::FIXED)),
+    ("OP 4", qp::op_param(3, qp::HZ)),
+    ("OP 4", qp::op_param(3, qp::VEL)),
+    ("OP 4", qp::op_param(3, qp::KEYSCALE)),
     ("ROUTE", qp::ALGO),
     ("ROUTE", qp::FEEDBACK),
     ("PITCH 1", qp::PITCH1),
@@ -131,6 +151,7 @@ pub(super) const QUAD_ROWS: [(&str, u32); 47] = [
     ("OUT", qp::DRIVE),
     ("OUT", qp::VELOCITY),
     ("OUT", qp::LEVEL),
+    ("OUT", qp::KEY_RATE),
 ];
 
 /// Which instrument the room is open on. The room's grammar is one

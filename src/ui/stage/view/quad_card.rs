@@ -14,7 +14,7 @@ use crate::design::kit::Weight;
 use crate::params::quad as qp;
 use crate::ui::affordance::{Afford, Affords};
 use crate::ui::chrome;
-use crate::ui::device::quad::depth;
+use crate::ui::device::quad::{depth, op_word};
 use crate::ui::stage::chain::{self, QuadFace};
 use eframe::egui;
 
@@ -254,7 +254,11 @@ fn draw_plot(painter: &egui::Painter, rect: egui::Rect, face: &QuadFace) {
         painter.text(
             egui::pos2(r.center().x, r.center().y - 2.0),
             egui::Align2::CENTER_CENTER,
-            format!("{}:{:.2}", op + 1, knobs.ratio),
+            format!(
+                "{}:{}",
+                op + 1,
+                op_word(knobs.ratio, knobs.fixed, knobs.hz, knobs.wave)
+            ),
             font.clone(),
             if knobs.level > 0.02 { c.bright } else { c.dim },
         );

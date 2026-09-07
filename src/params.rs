@@ -390,10 +390,10 @@ pub mod stab {
 pub mod quad {
     use super::ParamDef;
 
-    /// The operators' rows: seven per operator, in this order, so an
+    /// The operators' rows: twelve per operator, in this order, so an
     /// operator's parameter id is `op * PER_OP + field`.
     pub const OPS: usize = 4;
-    pub const PER_OP: u32 = 7;
+    pub const PER_OP: u32 = 12;
     pub const RATIO: u32 = 0;
     pub const FINE: u32 = 1;
     pub const LEVEL_OP: u32 = 2;
@@ -401,6 +401,11 @@ pub mod quad {
     pub const DECAY: u32 = 4;
     pub const SUSTAIN: u32 = 5;
     pub const RELEASE: u32 = 6;
+    pub const WAVE: u32 = 7;
+    pub const FIXED: u32 = 8;
+    pub const HZ: u32 = 9;
+    pub const VEL: u32 = 10;
+    pub const KEYSCALE: u32 = 11;
     /// Operator `op` (from zero), field `field`.
     pub const fn op_param(op: usize, field: u32) -> u32 {
         op as u32 * PER_OP + field
@@ -410,25 +415,26 @@ pub mod quad {
         (param < OPS as u32 * PER_OP).then(|| ((param / PER_OP) as usize, param % PER_OP))
     }
 
-    pub const ALGO: u32 = 28;
-    pub const FEEDBACK: u32 = 29;
-    pub const PITCH1: u32 = 30;
-    pub const PITCH1_RISE: u32 = 31;
-    pub const PITCH1_FALL: u32 = 32;
-    pub const PITCH2: u32 = 33;
-    pub const PITCH2_RISE: u32 = 34;
-    pub const PITCH2_FALL: u32 = 35;
-    pub const FMODE: u32 = 36;
-    pub const CUTOFF: u32 = 37;
-    pub const RESO: u32 = 38;
-    pub const FENV: u32 = 39;
-    pub const FENV_ATT: u32 = 40;
-    pub const FENV_DEC: u32 = 41;
-    pub const KEYTRACK: u32 = 42;
-    pub const DIST: u32 = 43;
-    pub const DRIVE: u32 = 44;
-    pub const VELOCITY: u32 = 45;
-    pub const LEVEL: u32 = 46;
+    pub const ALGO: u32 = 48;
+    pub const FEEDBACK: u32 = 49;
+    pub const PITCH1: u32 = 50;
+    pub const PITCH1_RISE: u32 = 51;
+    pub const PITCH1_FALL: u32 = 52;
+    pub const PITCH2: u32 = 53;
+    pub const PITCH2_RISE: u32 = 54;
+    pub const PITCH2_FALL: u32 = 55;
+    pub const FMODE: u32 = 56;
+    pub const CUTOFF: u32 = 57;
+    pub const RESO: u32 = 58;
+    pub const FENV: u32 = 59;
+    pub const FENV_ATT: u32 = 60;
+    pub const FENV_DEC: u32 = 61;
+    pub const KEYTRACK: u32 = 62;
+    pub const DIST: u32 = 63;
+    pub const DRIVE: u32 = 64;
+    pub const VELOCITY: u32 = 65;
+    pub const LEVEL: u32 = 66;
+    pub const KEY_RATE: u32 = 67;
 
     pub const ALGO_NAMES: &[&str] = &[
         "4>3>2>1",
@@ -442,6 +448,12 @@ pub mod quad {
     ];
     pub const FMODE_NAMES: &[&str] = &["lp", "hp", "bp", "notch"];
     pub const DIST_NAMES: &[&str] = &["off", "soft", "hard", "fold"];
+    /// An operator's shape: the sine, the TX81Z's half and rectified
+    /// sines, a soft square, and noise — which is a modulator's grit and
+    /// a carrier's breath.
+    pub const WAVE_NAMES: &[&str] = &["sine", "half", "rect", "square", "noise"];
+    pub const WAVE_NOISE: f32 = 4.0;
+    pub const FIXED_NAMES: &[&str] = &["ratio", "fixed"];
     pub const LEVEL_MAX: f32 = 2.0;
 
     /// A routing shape: which operator modulates which, and which
@@ -552,283 +564,430 @@ pub mod quad {
         },
         ParamDef {
             id: 7,
+            name: "op1 wave",
+            min: 0.0,
+            max: 4.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: 8,
+            name: "op1 fixed",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: 9,
+            name: "op1 hz",
+            min: 1.0,
+            max: 10000.0,
+            default: 440.0,
+        },
+        ParamDef {
+            id: 10,
+            name: "op1 vel",
+            min: 0.0,
+            max: 1.0,
+            default: 0.5,
+        },
+        ParamDef {
+            id: 11,
+            name: "op1 keyscale",
+            min: -12.0,
+            max: 12.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: 12,
             name: "op2 ratio",
             min: 0.2,
             max: 16.0,
             default: 2.0,
         },
         ParamDef {
-            id: 8,
+            id: 13,
             name: "op2 fine",
             min: -100.0,
             max: 100.0,
             default: 0.0,
         },
         ParamDef {
-            id: 9,
+            id: 14,
             name: "op2 level",
             min: 0.0,
             max: 1.0,
             default: 0.6,
         },
         ParamDef {
-            id: 10,
+            id: 15,
             name: "op2 attack",
             min: 0.0,
             max: 2000.0,
             default: 1.0,
         },
         ParamDef {
-            id: 11,
+            id: 16,
             name: "op2 decay",
             min: 1.0,
             max: 4000.0,
             default: 400.0,
         },
         ParamDef {
-            id: 12,
+            id: 17,
             name: "op2 sustain",
             min: 0.0,
             max: 1.0,
             default: 0.3,
         },
         ParamDef {
-            id: 13,
+            id: 18,
             name: "op2 release",
             min: 1.0,
             max: 4000.0,
             default: 250.0,
         },
         ParamDef {
-            id: 14,
+            id: 19,
+            name: "op2 wave",
+            min: 0.0,
+            max: 4.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: 20,
+            name: "op2 fixed",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: 21,
+            name: "op2 hz",
+            min: 1.0,
+            max: 10000.0,
+            default: 440.0,
+        },
+        ParamDef {
+            id: 22,
+            name: "op2 vel",
+            min: 0.0,
+            max: 1.0,
+            default: 0.5,
+        },
+        ParamDef {
+            id: 23,
+            name: "op2 keyscale",
+            min: -12.0,
+            max: 12.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: 24,
             name: "op3 ratio",
             min: 0.2,
             max: 16.0,
             default: 1.0,
         },
         ParamDef {
-            id: 15,
+            id: 25,
             name: "op3 fine",
             min: -100.0,
             max: 100.0,
             default: 0.0,
         },
         ParamDef {
-            id: 16,
+            id: 26,
             name: "op3 level",
             min: 0.0,
             max: 1.0,
             default: 0.0,
         },
         ParamDef {
-            id: 17,
+            id: 27,
             name: "op3 attack",
             min: 0.0,
             max: 2000.0,
             default: 1.0,
         },
         ParamDef {
-            id: 18,
+            id: 28,
             name: "op3 decay",
             min: 1.0,
             max: 4000.0,
             default: 400.0,
         },
         ParamDef {
-            id: 19,
+            id: 29,
             name: "op3 sustain",
             min: 0.0,
             max: 1.0,
             default: 0.3,
         },
         ParamDef {
-            id: 20,
+            id: 30,
             name: "op3 release",
             min: 1.0,
             max: 4000.0,
             default: 250.0,
         },
         ParamDef {
-            id: 21,
+            id: 31,
+            name: "op3 wave",
+            min: 0.0,
+            max: 4.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: 32,
+            name: "op3 fixed",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: 33,
+            name: "op3 hz",
+            min: 1.0,
+            max: 10000.0,
+            default: 440.0,
+        },
+        ParamDef {
+            id: 34,
+            name: "op3 vel",
+            min: 0.0,
+            max: 1.0,
+            default: 0.5,
+        },
+        ParamDef {
+            id: 35,
+            name: "op3 keyscale",
+            min: -12.0,
+            max: 12.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: 36,
             name: "op4 ratio",
             min: 0.2,
             max: 16.0,
             default: 1.0,
         },
         ParamDef {
-            id: 22,
+            id: 37,
             name: "op4 fine",
             min: -100.0,
             max: 100.0,
             default: 0.0,
         },
         ParamDef {
-            id: 23,
+            id: 38,
             name: "op4 level",
             min: 0.0,
             max: 1.0,
             default: 0.0,
         },
         ParamDef {
-            id: 24,
+            id: 39,
             name: "op4 attack",
             min: 0.0,
             max: 2000.0,
             default: 1.0,
         },
         ParamDef {
-            id: 25,
+            id: 40,
             name: "op4 decay",
             min: 1.0,
             max: 4000.0,
             default: 400.0,
         },
         ParamDef {
-            id: 26,
+            id: 41,
             name: "op4 sustain",
             min: 0.0,
             max: 1.0,
             default: 0.3,
         },
         ParamDef {
-            id: 27,
+            id: 42,
             name: "op4 release",
             min: 1.0,
             max: 4000.0,
             default: 250.0,
         },
         ParamDef {
-            id: ALGO,
+            id: 43,
+            name: "op4 wave",
+            min: 0.0,
+            max: 4.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: 44,
+            name: "op4 fixed",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: 45,
+            name: "op4 hz",
+            min: 1.0,
+            max: 10000.0,
+            default: 440.0,
+        },
+        ParamDef {
+            id: 46,
+            name: "op4 vel",
+            min: 0.0,
+            max: 1.0,
+            default: 0.5,
+        },
+        ParamDef {
+            id: 47,
+            name: "op4 keyscale",
+            min: -12.0,
+            max: 12.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: 48,
             name: "algo",
             min: 0.0,
             max: 7.0,
             default: 0.0,
         },
         ParamDef {
-            id: FEEDBACK,
+            id: 49,
             name: "feedback",
             min: 0.0,
             max: 1.0,
             default: 0.0,
         },
         ParamDef {
-            id: PITCH1,
+            id: 50,
             name: "pitch 1",
             min: -48.0,
             max: 48.0,
             default: 0.0,
         },
         ParamDef {
-            id: PITCH1_RISE,
+            id: 51,
             name: "p1 rise",
             min: 0.0,
             max: 2000.0,
             default: 0.0,
         },
         ParamDef {
-            id: PITCH1_FALL,
+            id: 52,
             name: "p1 fall",
             min: 1.0,
             max: 4000.0,
             default: 200.0,
         },
         ParamDef {
-            id: PITCH2,
+            id: 53,
             name: "pitch 2",
             min: -48.0,
             max: 48.0,
             default: 0.0,
         },
         ParamDef {
-            id: PITCH2_RISE,
+            id: 54,
             name: "p2 rise",
             min: 0.0,
             max: 2000.0,
             default: 0.0,
         },
         ParamDef {
-            id: PITCH2_FALL,
+            id: 55,
             name: "p2 fall",
             min: 1.0,
             max: 4000.0,
             default: 200.0,
         },
         ParamDef {
-            id: FMODE,
+            id: 56,
             name: "filter",
             min: 0.0,
             max: 3.0,
             default: 0.0,
         },
         ParamDef {
-            id: CUTOFF,
+            id: 57,
             name: "cutoff",
             min: 20.0,
             max: 20000.0,
             default: 12000.0,
         },
         ParamDef {
-            id: RESO,
+            id: 58,
             name: "reso",
             min: 0.5,
             max: 20.0,
             default: 0.8,
         },
         ParamDef {
-            id: FENV,
+            id: 59,
             name: "f env",
             min: -6.0,
             max: 6.0,
             default: 0.0,
         },
         ParamDef {
-            id: FENV_ATT,
+            id: 60,
             name: "f attack",
             min: 0.0,
             max: 2000.0,
             default: 0.0,
         },
         ParamDef {
-            id: FENV_DEC,
+            id: 61,
             name: "f decay",
             min: 1.0,
             max: 4000.0,
             default: 300.0,
         },
         ParamDef {
-            id: KEYTRACK,
+            id: 62,
             name: "keytrack",
             min: 0.0,
             max: 1.0,
             default: 0.5,
         },
         ParamDef {
-            id: DIST,
+            id: 63,
             name: "dist",
             min: 0.0,
             max: 3.0,
             default: 0.0,
         },
         ParamDef {
-            id: DRIVE,
+            id: 64,
             name: "drive",
             min: 1.0,
             max: 32.0,
             default: 1.0,
         },
         ParamDef {
-            id: VELOCITY,
+            id: 65,
             name: "velocity",
             min: 0.0,
             max: 1.0,
             default: 0.6,
         },
         ParamDef {
-            id: LEVEL,
+            id: 66,
             name: "level",
             min: 0.0,
             max: 2.0,
             default: 0.8,
+        },
+        ParamDef {
+            id: 67,
+            name: "key rate",
+            min: 0.0,
+            max: 1.0,
+            default: 0.3,
         },
     ];
 
@@ -841,16 +1000,18 @@ pub mod quad {
             for (i, def) in TABLE.iter().enumerate() {
                 assert_eq!(def.id, i as u32, "{}", def.name);
             }
+            assert_eq!(TABLE.len(), OPS * PER_OP as usize + 20);
             assert_eq!(op_of(op_param(2, SUSTAIN)), Some((2, SUSTAIN)));
+            assert_eq!(op_of(op_param(3, KEYSCALE)), Some((3, KEYSCALE)));
             assert_eq!(op_of(ALGO), None);
             assert_eq!(ALGO_NAMES.len(), ALGORITHMS.len());
+            assert_eq!(WAVE_NAMES.len(), WAVE_NOISE as usize + 1);
             for algo in ALGORITHMS {
                 assert!(!algo.carriers.is_empty());
                 for (m, c) in algo.edges {
                     assert!(*m > *c, "modulators sit above their carriers: {m}>{c}");
                     assert!(*m < OPS && *c < OPS);
                 }
-                // Every operator is heard or heard through: nothing is dead.
                 for op in 0..OPS {
                     assert!(
                         algo.carriers.contains(&op) || algo.edges.iter().any(|(m, _)| *m == op),

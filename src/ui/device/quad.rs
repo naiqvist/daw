@@ -26,16 +26,34 @@ const fn op_row(op: usize) -> [u32; 7] {
         qp::op_param(op, qp::RELEASE),
     ]
 }
+/// The operator's second page: its shape and how the key reaches it.
+const fn op_key_row(op: usize) -> [u32; 5] {
+    [
+        qp::op_param(op, qp::WAVE),
+        qp::op_param(op, qp::FIXED),
+        qp::op_param(op, qp::HZ),
+        qp::op_param(op, qp::VEL),
+        qp::op_param(op, qp::KEYSCALE),
+    ]
+}
 const OP1: [u32; 7] = op_row(0);
 const OP2: [u32; 7] = op_row(1);
 const OP3: [u32; 7] = op_row(2);
 const OP4: [u32; 7] = op_row(3);
+const OP1K: [u32; 5] = op_key_row(0);
+const OP2K: [u32; 5] = op_key_row(1);
+const OP3K: [u32; 5] = op_key_row(2);
+const OP4K: [u32; 5] = op_key_row(3);
 
-const PAGES: [(&str, &[u32]); 7] = [
+const PAGES: [(&str, &[u32]); 11] = [
     ("op 1", &OP1),
+    ("1 key", &OP1K),
     ("op 2", &OP2),
+    ("2 key", &OP2K),
     ("op 3", &OP3),
+    ("3 key", &OP3K),
     ("op 4", &OP4),
+    ("4 key", &OP4K),
     (
         "route",
         &[
@@ -61,19 +79,22 @@ const PAGES: [(&str, &[u32]); 7] = [
             qp::KEYTRACK,
         ],
     ),
-    ("out", &[qp::DIST, qp::DRIVE, qp::VELOCITY, qp::LEVEL]),
+    (
+        "out",
+        &[qp::DIST, qp::DRIVE, qp::VELOCITY, qp::LEVEL, qp::KEY_RATE],
+    ),
 ];
 
 const CELL_UNITS: usize = 2;
 const FOOTER_ROWS: usize = CELL_UNITS;
 const HEADER_ROWS: usize = 1;
-const COUNT: usize = 47;
+const COUNT: usize = 68;
 
 pub fn pages() -> usize {
     PAGES.len()
 }
 
-/// Forty-seven cells: past serde's array limit, and never persisted —
+/// Sixty-eight cells: past serde's array limit, and never persisted —
 /// the rack rebuilds it from the engine's knobs every frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct QuadUi {
@@ -114,8 +135,11 @@ impl QuadUi {
 fn percent_row(param: u32) -> bool {
     matches!(
         qp::op_of(param),
-        Some((_, qp::LEVEL_OP)) | Some((_, qp::SUSTAIN))
-    ) || matches!(param, qp::FEEDBACK | qp::KEYTRACK | qp::VELOCITY)
+        Some((_, qp::LEVEL_OP)) | Some((_, qp::SUSTAIN)) | Some((_, qp::VEL))
+    ) || matches!(
+        param,
+        qp::FEEDBACK | qp::KEYTRACK | qp::VELOCITY | qp::KEY_RATE
+    )
 }
 
 fn param_of(id: u32) -> Param {
@@ -149,7 +173,12 @@ fn param_of(id: u32) -> Param {
             qp::ATTACK => linear("attack", Unit::Ms),
             qp::DECAY => log("decay", Unit::Ms),
             qp::SUSTAIN => Param::percent("sustain"),
-            _ => log("release", Unit::Ms),
+            qp::RELEASE => log("release", Unit::Ms),
+            qp::WAVE => Param::choice("wave", qp::WAVE_NAMES),
+            qp::FIXED => Param::choice("fixed", qp::FIXED_NAMES),
+            qp::HZ => log("hz", Unit::Hz),
+            qp::VEL => Param::percent("vel"),
+            _ => linear("keyscale", Unit::Db).bipolar(),
         }
     } else {
         match id {
@@ -171,6 +200,7 @@ fn param_of(id: u32) -> Param {
             qp::DIST => Param::choice("dist", qp::DIST_NAMES),
             qp::DRIVE => log("drive", Unit::Ratio),
             qp::VELOCITY => Param::percent("velocity"),
+            qp::KEY_RATE => Param::percent("key rate"),
             _ => Param::percent("level"),
         }
     };
@@ -207,13 +237,14 @@ pub fn quad_norm(param: u32, value: f32) -> f32 {
 }
 
 pub fn quad_is_discrete(param: u32) -> bool {
-    matches!(param, qp::ALGO | qp::FMODE | qp::DIST)
+    matches!(qp::op_of(param), Some((_, qp::WAVE)) | Some((_, qp::FIXED)))
+        || matches!(param, qp::ALGO | qp::FMODE | qp::DIST)
 }
 
 pub fn quad_is_log(param: u32) -> bool {
     matches!(
         qp::op_of(param),
-        Some((_, qp::RATIO)) | Some((_, qp::DECAY)) | Some((_, qp::RELEASE))
+        Some((_, qp::RATIO)) | Some((_, qp::DECAY)) | Some((_, qp::RELEASE)) | Some((_, qp::HZ))
     ) || matches!(
         param,
         qp::PITCH1_FALL | qp::PITCH2_FALL | qp::CUTOFF | qp::RESO | qp::FENV_DEC | qp::DRIVE
@@ -250,6 +281,28 @@ pub fn face_width(ui: &egui::Ui, theme: &Theme) -> f32 {
             cells + ui.spacing().item_spacing.x * row.len().saturating_sub(1) as f32
         })
         .fold(0.0, f32::max)
+}
+
+/// What an operator's box says of its pitch: the ratio, or the fixed
+/// hertz, and the shape when it is not the sine.
+pub fn op_word(ratio: f32, fixed: f32, hz: f32, wave: f32) -> String {
+    let pitch = if fixed.round() >= 1.0 {
+        format!("{hz:.0}Hz")
+    } else {
+        format!("x{ratio:.2}")
+    };
+    let wave = wave.round().max(0.0) as usize;
+    if wave == 0 {
+        pitch
+    } else {
+        format!(
+            "{pitch} {}",
+            crate::params::quad::WAVE_NAMES
+                .get(wave)
+                .copied()
+                .unwrap_or("?")
+        )
+    }
 }
 
 /// Where each operator stands in the routing picture: its row is how
@@ -429,9 +482,14 @@ fn routing(ui: &mut egui::Ui, theme: &Theme, state: &QuadUi, voices: f32) {
             r.center(),
             egui::Align2::CENTER_CENTER,
             format!(
-                "{} x{:.1}",
+                "{} {}",
                 op + 1,
-                state.value(qp::op_param(op, qp::RATIO))
+                op_word(
+                    state.value(qp::op_param(op, qp::RATIO)),
+                    state.value(qp::op_param(op, qp::FIXED)),
+                    state.value(qp::op_param(op, qp::HZ)),
+                    state.value(qp::op_param(op, qp::WAVE)),
+                )
             ),
             mini.clone(),
             theme.text,

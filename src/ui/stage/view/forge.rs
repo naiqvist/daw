@@ -508,6 +508,7 @@ fn draw_quad_room(
 
     // The routing: boxes stacked over the carriers they feed.
     let depth = crate::ui::device::quad::depth;
+    let op_word = crate::ui::device::quad::op_word;
     let rows = (0..qp::OPS).map(|op| depth(algo, op)).max().unwrap_or(0) + 1;
     let box_w = (route.width() / qp::OPS as f32 - 24.0).clamp(40.0, 150.0);
     let box_h = ((route.height() - 10.0 * (rows as f32 - 1.0)) / rows as f32).clamp(16.0, 44.0);
@@ -562,7 +563,12 @@ fn draw_quad_room(
         painter.text(
             egui::pos2(r.center().x, r.center().y - 3.0),
             egui::Align2::CENTER_CENTER,
-            format!("OP {}  x{:.2} {:+.0}ct", op + 1, knobs.ratio, knobs.fine),
+            format!(
+                "OP {}  {} {:+.0}ct",
+                op + 1,
+                op_word(knobs.ratio, knobs.fixed, knobs.hz, knobs.wave),
+                knobs.fine
+            ),
             font.clone(),
             if live { c.bright } else { c.fg },
         );
