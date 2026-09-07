@@ -418,41 +418,41 @@ mod tests {
             "sat.rs",
             "echo.rs",
             "eq.rs",
-            "probe.rs",  // the headless pointer harness: test-only, draws nothing
-            "glue.rs",   // a card: its size is the sum of what it holds
-            "kick.rs",   // ditto
-            "haze.rs",   // a card: its size is the widest of its four pages
-            "clamp.rs",  // a card: its size is the sum of what it holds
-            "flint.rs",  // ditto
-            "sibyl.rs",  // ditto
-            "ferric.rs", // ditto
-            "umbra.rs",  // ditto
-            "tone.rs",   // ditto
-            "sigil.rs",  // ditto
-            "tine.rs",   // ditto
-            "scomp.rs",  // ditto
-            "stab.rs",   // ditto
-            "quad.rs",   // ditto
-            "gauge.rs",  // ditto
-            "prism.rs",  // a card: its size is the sum of what it holds
-            "limiter.rs", // ditto
-            "lofi.rs",   // ditto
-            "sheen.rs",  // ditto
+            "probe.rs",     // the headless pointer harness: test-only, draws nothing
+            "glue.rs",      // a card: its size is the sum of what it holds
+            "kick.rs",      // ditto
+            "haze.rs",      // a card: its size is the widest of its four pages
+            "clamp.rs",     // a card: its size is the sum of what it holds
+            "flint.rs",     // ditto
+            "sibyl.rs",     // ditto
+            "ferric.rs",    // ditto
+            "umbra.rs",     // ditto
+            "tone.rs",      // ditto
+            "sigil.rs",     // ditto
+            "tine.rs",      // ditto
+            "scomp.rs",     // ditto
+            "stab.rs",      // ditto
+            "quad.rs",      // ditto
+            "gauge.rs",     // ditto
+            "prism.rs",     // a card: its size is the sum of what it holds
+            "limiter.rs",   // ditto
+            "lofi.rs",      // ditto
+            "sheen.rs",     // ditto
             "disperser.rs", // ditto
-            "tilt.rs",   // ditto
-            "phaser.rs", // ditto
-            "gate.rs",   // ditto
-            "strip.rs",  // ditto
-            "resyn.rs",  // ditto
-            "acid.rs",   // ditto
-            "rack.rs",   // a container: its size is what it holds
-            "modulato.rs", // ditto
-            "sampler.rs", // ditto
-            "snare.rs",  // ditto
-            "tom.rs",    // ditto
-            "hat.rs",    // ditto
-            "handclap.rs", // ditto
-            "utility.rs", // ditto
+            "tilt.rs",      // ditto
+            "phaser.rs",    // ditto
+            "gate.rs",      // ditto
+            "strip.rs",     // ditto
+            "resyn.rs",     // ditto
+            "acid.rs",      // ditto
+            "rack.rs",      // a container: its size is what it holds
+            "modulato.rs",  // ditto
+            "sampler.rs",   // ditto
+            "snare.rs",     // ditto
+            "tom.rs",       // ditto
+            "hat.rs",       // ditto
+            "handclap.rs",  // ditto
+            "utility.rs",   // ditto
         ];
         let mut missing: Vec<String> = Vec::new();
         for path in module_files("device") {
