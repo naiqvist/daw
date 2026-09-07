@@ -3099,6 +3099,12 @@ pub static DEVICES: &[DeviceSpec] = &[
                 group: "Grit",
                 choices: &[],
             },
+            ParamLabel {
+                name: "Omit",
+                unit: "",
+                group: "Chord",
+                choices: daw::params::stab::OMIT_NAMES,
+            },
         ],
     },
     DeviceSpec {

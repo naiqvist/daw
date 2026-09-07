@@ -54,6 +54,7 @@ pub struct StabParams {
     pub crush_bits: f32,
     pub rate_hz: f32,
     pub level: f32,
+    pub omit: f32,
 }
 
 impl Default for StabParams {
@@ -86,6 +87,7 @@ impl Default for StabParams {
             crush_bits: d(p::CRUSH),
             rate_hz: d(p::RATE),
             level: d(p::LEVEL),
+            omit: d(p::OMIT),
         }
     }
 }
@@ -117,6 +119,7 @@ impl StabParams {
             p::CRUSH => self.crush_bits = value,
             p::RATE => self.rate_hz = value,
             p::LEVEL => self.level = value,
+            p::OMIT => self.omit = value,
             _ => {}
         }
     }
@@ -143,6 +146,7 @@ impl StabParams {
             p::CRUSH => self.crush_bits,
             p::RATE => self.rate_hz,
             p::LEVEL => self.level,
+            p::OMIT => self.omit,
             _ => return None,
         })
     }
@@ -166,6 +170,7 @@ impl StabParams {
             self.chord.round().max(0.0) as usize,
             self.inversion.round().max(0.0) as usize,
             self.open.round() >= 1.0,
+            self.omit.round().max(0.0) as usize,
         )
     }
 }

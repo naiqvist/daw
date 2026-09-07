@@ -1343,6 +1343,9 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
             device.set(daw::params::stab::CHORD, 6.0);
             device.set(daw::params::stab::INVERSION, 2.0);
             device.set(daw::params::stab::OPEN, 1.0);
+            if which.contains("-rootless") {
+                device.set(daw::params::stab::OMIT, 1.0);
+            }
         }
         if which.contains("-browse") {
             let _ = stage.apply(StageIntent::Browse);

@@ -18,7 +18,14 @@ use eframe::egui;
 const PAGES: [(&str, &[u32]); 4] = [
     (
         "chord",
-        &[sp::CHORD, sp::INVERSION, sp::OPEN, sp::OCTAVE, sp::STRUM],
+        &[
+            sp::CHORD,
+            sp::INVERSION,
+            sp::OPEN,
+            sp::OMIT,
+            sp::OCTAVE,
+            sp::STRUM,
+        ],
     ),
     (
         "tone",
@@ -54,7 +61,7 @@ pub fn pages() -> usize {
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct StabUi {
-    pub norms: [f32; 20],
+    pub norms: [f32; 21],
 }
 
 impl Default for StabUi {
@@ -65,7 +72,7 @@ impl Default for StabUi {
 
 impl StabUi {
     pub fn from_engine(get: impl Fn(u32) -> f32) -> Self {
-        let mut norms = [0.0; 20];
+        let mut norms = [0.0; 21];
         for (i, slot) in norms.iter_mut().enumerate() {
             let id = i as u32;
             *slot = stab_norm(id, get(id));
@@ -116,6 +123,7 @@ fn param_of(id: u32) -> Param {
         sp::INVERSION => Param::choice("inv", sp::INVERSION_NAMES),
         sp::OPEN => Param::choice("voicing", sp::OPEN_NAMES),
         sp::OCTAVE => Param::choice("octave", sp::OCTAVE_NAMES),
+        sp::OMIT => Param::choice("omit", sp::OMIT_NAMES),
         sp::STRUM => linear("strum", Unit::Ms),
         sp::TONE => Param::percent("tone"),
         sp::DETUNE => linear("detune", Unit::Cents),
@@ -165,7 +173,10 @@ pub fn stab_norm(param: u32, value: f32) -> f32 {
 }
 
 pub fn stab_is_discrete(param: u32) -> bool {
-    matches!(param, sp::CHORD | sp::INVERSION | sp::OPEN | sp::OCTAVE)
+    matches!(
+        param,
+        sp::CHORD | sp::INVERSION | sp::OPEN | sp::OCTAVE | sp::OMIT
+    )
 }
 
 pub fn stab_is_log(param: u32) -> bool {
@@ -213,6 +224,7 @@ pub fn chord_notes(state: &StabUi) -> ([i32; sp::NOTES], usize) {
         state.value(sp::CHORD).round().max(0.0) as usize,
         state.value(sp::INVERSION).round().max(0.0) as usize,
         state.value(sp::OPEN).round() >= 1.0,
+        state.value(sp::OMIT).round().max(0.0) as usize,
     )
 }
 

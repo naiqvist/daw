@@ -82,6 +82,13 @@ pub mod stab {
     pub const CRUSH: u32 = 17;
     pub const RATE: u32 = 18;
     pub const LEVEL: u32 = 19;
+    /// A chord tone left out: a rootless voicing over a bass, a bare
+    /// fifth, the third dropped so the chord stops saying major or
+    /// minor. Counted by chord tone, not by pitch, so it means the same
+    /// thing in every chord that has that tone.
+    pub const OMIT: u32 = 20;
+
+    pub const OMIT_NAMES: &[&str] = &["none", "root", "3rd", "5th", "7th", "9th"];
 
     /// The most notes a chord has.
     pub const NOTES: usize = 5;
@@ -119,12 +126,25 @@ pub mod stab {
     /// drop-two voicing, which is how a stab gets wide without getting
     /// muddy. Returns the notes and how many there are; the rest of the
     /// array is unused. No allocation: the audio thread calls this.
-    pub fn voicing(chord: usize, inversion: usize, open: bool) -> ([i32; NOTES], usize) {
+    pub fn voicing(
+        chord: usize,
+        inversion: usize,
+        open: bool,
+        omit: usize,
+    ) -> ([i32; NOTES], usize) {
         let (_, intervals) = CHORDS.get(chord).copied().unwrap_or(CHORDS[0]);
-        let count = intervals.len().min(NOTES);
         let mut notes = [0i32; NOTES];
-        for (slot, interval) in notes.iter_mut().zip(intervals.iter()) {
-            *slot = *interval;
+        let mut count = 0usize;
+        // The chord tones in the table are root, third, fifth, seventh,
+        // ninth, in that order; an omission names one by its place. A
+        // chord with fewer tones than the omission asks for keeps them
+        // all — and a chord is never omitted down to a single note.
+        for (place, interval) in intervals.iter().enumerate().take(NOTES) {
+            if omit > 0 && place + 1 == omit && intervals.len() > 2 {
+                continue;
+            }
+            notes[count] = *interval;
+            count += 1;
         }
         // Inversion: the lowest note goes up an octave, `inversion`
         // times. A ninth sits above the raised root, so the notes are
@@ -292,6 +312,13 @@ pub mod stab {
             max: LEVEL_MAX,
             default: 0.8,
         },
+        ParamDef {
+            id: OMIT,
+            name: "omit",
+            min: 0.0,
+            max: 5.0,
+            default: 0.0,
+        },
     ];
 
     #[cfg(test)]
@@ -306,21 +333,21 @@ pub mod stab {
                 assert!(intervals.len() <= NOTES && intervals[0] == 0);
                 assert!(intervals.windows(2).all(|w| w[0] < w[1]));
             }
-            let (notes, count) = voicing(0, 0, false);
+            let (notes, count) = voicing(0, 0, false, 0);
             assert_eq!((&notes[..count], count), (&[0, 4, 7][..], 3));
-            let (notes, count) = voicing(0, 1, false);
+            let (notes, count) = voicing(0, 1, false, 0);
             assert_eq!(&notes[..count], &[4, 7, 12], "first inversion");
-            let (notes, count) = voicing(0, 2, false);
+            let (notes, count) = voicing(0, 2, false, 0);
             assert_eq!(&notes[..count], &[7, 12, 16], "second inversion");
-            let (notes, count) = voicing(4, 3, false);
+            let (notes, count) = voicing(4, 3, false, 0);
             assert_eq!(&notes[..count], &[11, 12, 16, 19], "maj7 third inversion");
-            let (notes, count) = voicing(0, 4, false);
+            let (notes, count) = voicing(0, 4, false, 0);
             assert_eq!(
                 &notes[..count],
                 &[7, 12, 16],
                 "a triad has no fourth inversion"
             );
-            let (notes, count) = voicing(4, 0, true);
+            let (notes, count) = voicing(4, 0, true, 0);
             assert_eq!(
                 &notes[..count],
                 &[-5, 0, 4, 11],
@@ -329,14 +356,32 @@ pub mod stab {
             for chord in 0..CHORDS.len() {
                 for inversion in 0..5 {
                     for open in [false, true] {
-                        let (notes, count) = voicing(chord, inversion, open);
-                        assert!(
-                            notes[..count].windows(2).all(|w| w[0] < w[1]),
-                            "{chord} {inversion} {open}: {notes:?}"
-                        );
+                        for omit in 0..OMIT_NAMES.len() {
+                            let (notes, count) = voicing(chord, inversion, open, omit);
+                            assert!(count >= 2, "{chord} {inversion} {open} {omit} left {count}");
+                            assert!(
+                                notes[..count].windows(2).all(|w| w[0] < w[1]),
+                                "{chord} {inversion} {open} {omit}: {notes:?}"
+                            );
+                        }
                     }
                 }
             }
+            // Omissions, by chord tone.
+            let (notes, count) = voicing(3, 0, false, 1);
+            assert_eq!(&notes[..count], &[3, 7, 10], "m7 without its root");
+            let (notes, count) = voicing(0, 0, false, 2);
+            assert_eq!(&notes[..count], &[0, 7], "a bare fifth");
+            let (notes, count) = voicing(6, 0, false, 3);
+            assert_eq!(&notes[..count], &[0, 3, 10, 14], "m9 without its fifth");
+            let (notes, count) = voicing(0, 0, false, 4);
+            assert_eq!(
+                &notes[..count],
+                &[0, 4, 7],
+                "a triad has no seventh to omit"
+            );
+            let (notes, count) = voicing(6, 1, false, 1);
+            assert_eq!(&notes[..count], &[7, 10, 14, 15], "rootless, then inverted");
         }
     }
 }

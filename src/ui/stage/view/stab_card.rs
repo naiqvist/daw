@@ -132,12 +132,16 @@ fn draw_header(
         egui::Align2::LEFT_BOTTOM,
         super::fit_cells(
             &format!(
-                "{} · {inversion} · {} · {} · x{:.1}",
+                "{} · {inversion} · {}{} · {} · x{:.1}",
                 face.word(),
                 if p.open.round() >= 1.0 {
                     "open"
                 } else {
                     "close"
+                },
+                match p.omit.round().max(0.0) as usize {
+                    0 => String::new(),
+                    omit => format!(" · no {}", sp::OMIT_NAMES.get(omit).copied().unwrap_or("?")),
                 },
                 tone_word(p.tone),
                 p.drive
@@ -462,6 +466,13 @@ mod tests {
             StabFace::from_device(&device).word(),
             "Cmaj / E",
             "drop-two on a triad puts the third under"
+        );
+        device.set(sp::OPEN, 0.0);
+        device.set(sp::OMIT, 1.0);
+        assert_eq!(
+            StabFace::from_device(&device).word(),
+            "Cmaj / E",
+            "rootless: the third is the bass"
         );
         assert_eq!(tone_word(0.0), "sine");
         assert_eq!(tone_word(1.0), "drawbars");
