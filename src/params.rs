@@ -82,7 +82,12 @@ pub mod scomp {
     pub const TUNE: u32 = 19;
     pub const ROOT: u32 = 20;
     pub const LEVEL: u32 = 21;
+    /// A door, not a knob: turning it up opens the forge. It reads as a
+    /// switch so the band's grammar reaches it like any other row, and
+    /// it never stays on — the stage answers it and puts it back.
+    pub const OPEN: u32 = 22;
 
+    pub const OPEN_NAMES: &[&str] = &["-", "open"];
     pub const MAX_PASSES: usize = 8;
     pub const PASS_NAMES: &[&str] = &["1", "2", "3", "4", "5", "6", "7", "8"];
     pub const FILTER_BAND: f32 = 0.0;
@@ -99,7 +104,7 @@ pub mod scomp {
     /// audio thread, so the host rebuilds the graph instead, exactly as
     /// it does for a slice table.
     pub fn baked(param: u32) -> bool {
-        !matches!(param, AMP_A | AMP_R | TUNE | ROOT | LEVEL)
+        !matches!(param, AMP_A | AMP_R | TUNE | ROOT | LEVEL | OPEN)
     }
 
     pub const TABLE: &[ParamDef] = &[
@@ -256,6 +261,13 @@ pub mod scomp {
             min: 0.0,
             max: LEVEL_MAX,
             default: 0.8,
+        },
+        ParamDef {
+            id: OPEN,
+            name: "forge",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
         },
     ];
 }

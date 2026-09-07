@@ -46,6 +46,7 @@ const PAGES: [(&str, &[u32]); 4] = [
             sp::TUNE,
             sp::ROOT,
             sp::LEVEL,
+            sp::OPEN,
         ],
     ),
 ];
@@ -62,7 +63,7 @@ pub fn pages() -> usize {
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct ScompUi {
-    pub norms: [f32; 22],
+    pub norms: [f32; 23],
 }
 
 impl Default for ScompUi {
@@ -73,7 +74,7 @@ impl Default for ScompUi {
 
 impl ScompUi {
     pub fn from_engine(get: impl Fn(u32) -> f32) -> Self {
-        let mut norms = [0.0; 22];
+        let mut norms = [0.0; 23];
         for (i, slot) in norms.iter_mut().enumerate() {
             let id = i as u32;
             *slot = scomp_norm(id, get(id));
@@ -137,6 +138,7 @@ fn param_of(id: u32) -> Param {
         sp::AMP_R => log("amp r", Unit::Ms),
         sp::TUNE => linear("tune", Unit::Semitones).bipolar(),
         sp::ROOT => linear("root", Unit::Note),
+        sp::OPEN => Param::choice("forge", sp::OPEN_NAMES),
         _ => Param::percent("level"),
     };
     p.with_default(shown(id, def.default))
@@ -170,7 +172,7 @@ pub fn scomp_norm(param: u32, value: f32) -> f32 {
 }
 
 pub fn scomp_is_discrete(param: u32) -> bool {
-    matches!(param, sp::PASSES | sp::FILTER)
+    matches!(param, sp::PASSES | sp::FILTER | sp::OPEN)
 }
 
 pub fn scomp_is_log(param: u32) -> bool {

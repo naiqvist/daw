@@ -2962,6 +2962,12 @@ pub static DEVICES: &[DeviceSpec] = &[
                 group: "Play",
                 choices: &[],
             },
+            ParamLabel {
+                name: "Forge",
+                unit: "",
+                group: "Play",
+                choices: daw::params::scomp::OPEN_NAMES,
+            },
         ],
     },
     DeviceSpec {

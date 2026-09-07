@@ -30,6 +30,7 @@ mod palette;
 mod room;
 mod sample;
 mod sampler_card;
+mod scomp_card;
 mod song;
 mod status;
 mod strip;

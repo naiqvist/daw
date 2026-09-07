@@ -64,6 +64,7 @@ use std::path::{Path, PathBuf};
 
 use browser::{BrowserStatus, sample_nodes};
 use forge::Forge;
+pub(in crate::ui::stage) use forge::ScompCard;
 use sample::{Page as SamplePage, SampleEditor};
 use trig_menu::{MenuRow, Page, TrigAction, TrigMenu};
 
@@ -578,6 +579,9 @@ pub struct Stage {
     /// across the editor closing and opening again on the same file, so
     /// the second look is instant; replaced when the file differs.
     sample_data: Option<SampleData>,
+    /// The pictures the band's sCOMP cards draw: one take's peaks per
+    /// device, kept while its baked knobs stand.
+    scomp_cards: Vec<ScompCard>,
     /// A range the host is asked to play, until it takes it.
     audition: Option<Audition>,
     /// Whether the host is asked to stop what it is auditioning.
@@ -829,6 +833,7 @@ impl Stage {
             sample: None,
             forge: None,
             sample_data: None,
+            scomp_cards: Vec::new(),
             audition: None,
             audition_stop: false,
             nudging: false,
@@ -4570,6 +4575,18 @@ impl Stage {
                         .find(|(def, _)| def.id == param)
                     {
                         None => Err(RefusalReason::Unavailable),
+                        // sCOMP's door: a turn up opens the forge and the
+                        // row stays where it was.
+                        Some((def, _))
+                            if spec.kind == DeviceKind::Scomp
+                                && def.id == crate::params::scomp::OPEN =>
+                        {
+                            if up {
+                                self.apply_forge(ForgeIntent::Open)
+                            } else {
+                                Err(RefusalReason::Edge(Step::Down))
+                            }
+                        }
                         Some((def, label)) => {
                             let step =
                                 chain::step_of(def, label, coarse) * if up { 1.0 } else { -1.0 };
@@ -6321,6 +6338,53 @@ mod tests {
             bare.apply(StageIntent::Forge(ForgeIntent::Open)),
             ApplyOutcome::Refused(_)
         ));
+    }
+
+    /// The band's FORGE row is a door: turned up, the forge opens; turned
+    /// down, it refuses; either way the row never reads as on.
+    #[test]
+    fn the_forge_row_on_the_card_is_a_door() {
+        use crate::params::scomp as sp;
+        let mut stage = Stage::new();
+        let id = stage
+            .song
+            .add_device(0, crate::devices::DeviceKind::Scomp)
+            .expect("an sCOMP");
+        stage.song.device_mut(id).unwrap().set(sp::TAKE, 0.25);
+        assert_eq!(stage.apply(StageIntent::Devices), ApplyOutcome::Changed);
+        let row = crate::devices::DeviceKind::Scomp
+            .spec()
+            .params
+            .iter()
+            .position(|def| def.id == sp::OPEN)
+            .expect("the door is a row");
+        for _ in 0..row {
+            let _ = stage.apply(StageIntent::Step(Step::Down));
+        }
+        assert_eq!(
+            stage.chained_param().map(|(_, _, param)| param),
+            Some(sp::OPEN)
+        );
+        assert!(matches!(
+            stage.apply(StageIntent::Param {
+                up: false,
+                coarse: false
+            }),
+            ApplyOutcome::Refused(_)
+        ));
+        assert_eq!(
+            stage.apply(StageIntent::Param {
+                up: true,
+                coarse: false
+            }),
+            ApplyOutcome::Changed
+        );
+        assert_eq!(stage.scope_context(), keymap::ScopeContext::Forge);
+        assert_eq!(
+            stage.song.device(id).unwrap().value(sp::OPEN),
+            0.0,
+            "the door stayed open"
+        );
     }
 
     /// A sampler with a synthesized file, the editor up, and snap off so

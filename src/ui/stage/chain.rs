@@ -151,6 +151,28 @@ impl Lane {
     }
 }
 
+/// What an sCOMP card draws from: the knobs as the device holds them,
+/// and the key of the take they bake, so a card can tell whether the
+/// picture it cached is still the picture.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScompFace {
+    pub params: crate::scomp::ScompParams,
+    pub key: crate::scomp::Baked,
+}
+
+impl ScompFace {
+    pub fn from_device(device: &Device) -> Self {
+        let mut params = crate::scomp::ScompParams::default();
+        for (id, value) in &device.overrides {
+            params.set(*id, *value);
+        }
+        Self {
+            key: params.baked(),
+            params,
+        }
+    }
+}
+
 /// One device, as a column of the band.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Column {
@@ -171,6 +193,9 @@ pub struct Column {
     /// device. Kept beside `sample` because the latter remains the compact
     /// header label shared by the generic card contract.
     pub sampler: Option<SamplerFace>,
+    /// The bounce-facing state for an sCOMP card; absent on every other
+    /// device.
+    pub scomp: Option<ScompFace>,
     pub rows: Vec<Row>,
     /// Which section of the console this column is, when it is one:
     /// drawn as a piece of the strip rather than as a card.
@@ -263,6 +288,7 @@ pub fn column(device: &Device) -> Column {
             .and_then(|path| path.file_name())
             .map(|name| name.to_string_lossy().into_owned()),
         sampler: (device.kind == DeviceKind::Sampler).then(|| SamplerFace::from_device(device)),
+        scomp: (device.kind == DeviceKind::Scomp).then(|| ScompFace::from_device(device)),
         section: match device.kind {
             crate::devices::DeviceKind::Console(kind) => Some(kind),
             _ => None,

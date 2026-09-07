@@ -23,6 +23,35 @@ use crate::sequencing::{Device, DeviceId};
 /// The rate the picture is rendered at. The engine renders at its own;
 /// the take is the same shape at any.
 pub(super) const RENDER_RATE: u32 = 48_000;
+/// The band's cards render at half that: a card is a thumbnail, and the
+/// shape survives.
+pub(super) const CARD_RATE: u32 = 24_000;
+
+/// What an sCOMP card in the band draws: the peaks of every pass of the
+/// take its knobs bake, and how long each pass is. Kept on the stage,
+/// keyed on the baked knobs, so the band renders a take once per change
+/// rather than once per frame.
+#[derive(Clone, Debug)]
+pub struct ScompCard {
+    pub(super) key: Baked,
+    pub(super) lens: Vec<usize>,
+    pub(super) peaks: Vec<Arc<Peaks>>,
+}
+
+impl ScompCard {
+    pub(super) fn render(params: &ScompParams) -> Self {
+        let take = crate::scomp::render(params, CARD_RATE);
+        Self {
+            key: params.baked(),
+            lens: take.passes.iter().map(|pass| pass.len()).collect(),
+            peaks: take
+                .passes
+                .iter()
+                .map(|pass| Arc::new(Peaks::build(pass, 1, pass.len() as u64, CARD_RATE)))
+                .collect(),
+        }
+    }
+}
 
 /// The rows, in signal order, each with the group it sits under.
 pub(super) const ROWS: [(&str, u32); 22] = [
@@ -202,7 +231,12 @@ mod tests {
     fn every_row_is_a_table_id_once_and_groups_are_contiguous() {
         let mut ids: Vec<u32> = ROWS.iter().map(|(_, id)| *id).collect();
         ids.sort_unstable();
-        let mut expect: Vec<u32> = sp::TABLE.iter().map(|def| def.id).collect();
+        // Every knob but the door, which is the band's, not the forge's.
+        let mut expect: Vec<u32> = sp::TABLE
+            .iter()
+            .map(|def| def.id)
+            .filter(|id| *id != sp::OPEN)
+            .collect();
         expect.sort_unstable();
         assert_eq!(ids, expect);
         let mut seen: Vec<&str> = Vec::new();

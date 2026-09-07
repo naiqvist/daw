@@ -266,6 +266,8 @@ impl Stage {
                     || {
                         if column.sampler.is_some() {
                             super::sampler_card::WIDTH
+                        } else if column.scomp.is_some() {
+                            super::scomp_card::WIDTH
                         } else {
                             CHAIN_W
                         }
@@ -385,8 +387,30 @@ impl Stage {
             );
         }
         let mut open_sampler = None;
+        let mut open_forge = None;
+        // The sCOMP cards' pictures, rendered where their knobs moved.
+        for column in &columns {
+            if let Some(face) = column.scomp.as_ref() {
+                self.refresh_scomp_card(face);
+            }
+        }
         for (index, rect) in &layout {
             if columns[*index].section.is_some() {
+                continue;
+            }
+            if columns[*index].scomp.is_some() {
+                if self.draw_scomp_chain_card(
+                    ui,
+                    *rect,
+                    &columns[*index],
+                    *index,
+                    cursor,
+                    self.chain_offset,
+                    rows_shown,
+                    head_h,
+                ) {
+                    open_forge = Some(*index);
+                }
                 continue;
             }
             if columns[*index].sampler.is_some() {
@@ -421,6 +445,12 @@ impl Stage {
                 lattice.focus_col(index);
             }
             let _ = self.apply(StageIntent::Sample(SampleIntent::Open));
+        }
+        if let Some(index) = open_forge {
+            if let Some(lattice) = self.chain.as_mut() {
+                lattice.focus_col(index);
+            }
+            let _ = self.apply(StageIntent::Forge(crate::ui::stage::ForgeIntent::Open));
         }
     }
 

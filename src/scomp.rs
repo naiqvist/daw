@@ -57,6 +57,9 @@ pub struct ScompParams {
     pub tune_st: f32,
     pub root: f32,
     pub level: f32,
+    /// The door's reading. Always zero at rest; the stage answers a
+    /// turn and puts it back.
+    pub open: f32,
 }
 
 impl Default for ScompParams {
@@ -91,6 +94,7 @@ impl Default for ScompParams {
             tune_st: d(p::TUNE),
             root: d(p::ROOT),
             level: d(p::LEVEL),
+            open: d(p::OPEN),
         }
     }
 }
@@ -124,6 +128,7 @@ impl ScompParams {
             p::TUNE => self.tune_st = value,
             p::ROOT => self.root = value,
             p::LEVEL => self.level = value,
+            p::OPEN => self.open = value,
             _ => {}
         }
     }
@@ -152,6 +157,7 @@ impl ScompParams {
             p::TUNE => self.tune_st,
             p::ROOT => self.root,
             p::LEVEL => self.level,
+            p::OPEN => self.open,
             _ => return None,
         })
     }
@@ -576,7 +582,10 @@ mod tests {
         for def in p::TABLE {
             assert_eq!(
                 p::baked(def.id),
-                !matches!(def.id, p::AMP_A | p::AMP_R | p::TUNE | p::ROOT | p::LEVEL)
+                !matches!(
+                    def.id,
+                    p::AMP_A | p::AMP_R | p::TUNE | p::ROOT | p::LEVEL | p::OPEN
+                )
             );
         }
         // ROOT is baked: the take is rendered at it.
