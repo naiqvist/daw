@@ -506,81 +506,8 @@ fn draw_quad_room(
     let route = egui::Rect::from_min_max(inner.min, egui::pos2(inner.max.x, split - 8.0));
     let lower = egui::Rect::from_min_max(egui::pos2(inner.min.x, split + 8.0), inner.max);
 
-    // The routing: boxes stacked over the carriers they feed.
-    let depth = crate::ui::device::quad::depth;
-    let op_word = crate::ui::device::quad::op_word;
-    let rows = (0..qp::OPS).map(|op| depth(algo, op)).max().unwrap_or(0) + 1;
-    let box_w = (route.width() / qp::OPS as f32 - 24.0).clamp(40.0, 150.0);
-    let box_h = ((route.height() - 10.0 * (rows as f32 - 1.0)) / rows as f32).clamp(16.0, 44.0);
-    let centre = |op: usize| {
-        egui::pos2(
-            route.left() + (op as f32 + 0.5) * route.width() / qp::OPS as f32,
-            route.bottom() - box_h * 0.5 - depth(algo, op) as f32 * (box_h + 10.0),
-        )
-    };
-    for (m, carrier) in algo.edges {
-        painter.line_segment(
-            [centre(*m), centre(*carrier)],
-            egui::Stroke::new(1.0, c.chassis),
-        );
-    }
-    if p.feedback > 0.005 {
-        let at = centre(qp::OPS - 1);
-        let r = egui::Rect::from_center_size(
-            egui::pos2(at.x + box_w * 0.5 + 9.0, at.y),
-            egui::vec2(12.0, box_h * 0.8),
-        );
-        painter.rect_stroke(
-            r,
-            0.0,
-            egui::Stroke::new(1.0, c.nominal),
-            egui::StrokeKind::Inside,
-        );
-        painter.text(
-            egui::pos2(r.right() + 3.0, r.center().y),
-            egui::Align2::LEFT_CENTER,
-            format!("fb {:.0}%", p.feedback * 100.0),
-            font.clone(),
-            c.nominal,
-        );
-    }
-    for op in 0..qp::OPS {
-        let knobs = &p.ops[op];
-        let r = egui::Rect::from_center_size(centre(op), egui::vec2(box_w, box_h));
-        let carrier = algo.carriers.contains(&op);
-        let live = op == shown;
-        let ink = if carrier { c.alert } else { c.edge };
-        painter.rect_filled(r, 0.0, alpha(ink, (30.0 + 120.0 * knobs.level) as u8));
-        painter.rect_stroke(
-            r,
-            0.0,
-            egui::Stroke::new(
-                if live { 2.0 } else { 1.0 },
-                if live { c.bright } else { ink },
-            ),
-            egui::StrokeKind::Inside,
-        );
-        painter.text(
-            egui::pos2(r.center().x, r.center().y - 3.0),
-            egui::Align2::CENTER_CENTER,
-            format!(
-                "OP {}  {} {:+.0}ct",
-                op + 1,
-                op_word(knobs.ratio, knobs.fixed, knobs.hz, knobs.wave),
-                knobs.fine
-            ),
-            font.clone(),
-            if live { c.bright } else { c.fg },
-        );
-        let foot = egui::Rect::from_min_max(
-            egui::pos2(r.left() + 3.0, r.bottom() - 5.0),
-            egui::pos2(
-                r.left() + 3.0 + (r.width() - 6.0) * knobs.level.clamp(0.0, 1.0),
-                r.bottom() - 2.0,
-            ),
-        );
-        painter.rect_filled(foot, 0.0, if live { c.bright } else { ink });
-    }
+    // The routing, on the same grid the card draws, larger.
+    super::quad_card::draw_routing(painter, route, p, Some(shown), 12.0);
 
     // Three panels: the operators' envelopes, the pitch envelopes, the
     // filter's.

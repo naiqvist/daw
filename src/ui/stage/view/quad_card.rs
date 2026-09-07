@@ -1,230 +1,87 @@
-//! QUAD in the Stage chain.
+//! QUAD in the Stage chain: the routing, on the shared instrument face.
 //!
 //! An FM synth's one fact that a parameter table cannot show is the
-//! routing: which operator feeds which, and which are heard. This wider
-//! face keeps the scrolling parameter rail on its right and gives its
-//! left to that picture — operators as boxes, modulators stacked over
-//! the carriers they feed, each box carrying its ratio and its level —
-//! with the two pitch envelopes and the filter's read out beneath.
+//! routing: which operator feeds which, and which are heard. The
+//! picture lays the operators on a grid — one column each, in panel
+//! order, modulators on the rows above the carriers they feed — and
+//! draws each edge as a straight drop or an elbow, so a serial stack
+//! reads as a stack and a fan-in as a fan. The same routine draws the
+//! room's picture, larger.
 
-use super::{chassis, palette};
-use crate::PROFONT;
-use crate::design::codex::Sign;
-use crate::design::kit::Weight;
+use super::face::{self, Head, Layout, RowMark};
+use super::palette;
+use crate::audio::quad::QuadParams;
 use crate::params::quad as qp;
-use crate::ui::affordance::{Afford, Affords};
-use crate::ui::chrome;
 use crate::ui::device::quad::{depth, op_word};
-use crate::ui::stage::chain::{self, QuadFace};
+use crate::ui::stage::chain;
 use eframe::egui;
+use egui::Color32;
 
-pub(super) const WIDTH: f32 = 478.0;
+pub(super) use super::face::WIDTH;
 
-const PAD: f32 = 9.0;
-const GAP: f32 = 10.0;
-const PARAM_W: f32 = 188.0;
-const PARAM_HEAD_H: f32 = 19.0;
-const FACT_H: f32 = 30.0;
-const LAB_W: f32 = 118.0;
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Layout {
-    head: egui::Rect,
-    lab: egui::Rect,
-    visual: egui::Rect,
-    plot: egui::Rect,
-    facts: egui::Rect,
-    params: egui::Rect,
+fn alpha(c: Color32, a: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
 }
 
-impl Layout {
-    fn of(card: egui::Rect, head_h: f32) -> Option<Self> {
-        if card.width() < PARAM_W + PAD * 2.0 + 80.0 || card.height() < head_h + FACT_H + 30.0 {
-            return None;
-        }
-        let head = egui::Rect::from_min_size(card.min, egui::vec2(card.width(), head_h));
-        let lab = egui::Rect::from_min_max(
-            egui::pos2(head.right() - LAB_W - 7.0, head.top() + 6.0),
-            egui::pos2(head.right() - 7.0, head.bottom() - 6.0),
-        );
-        let body = egui::Rect::from_min_max(
-            egui::pos2(card.left() + PAD, head.bottom() + PAD),
-            egui::pos2(card.right() - PAD, card.bottom() - PAD),
-        );
-        let params =
-            egui::Rect::from_min_max(egui::pos2(body.right() - PARAM_W, body.top()), body.max);
-        let visual =
-            egui::Rect::from_min_max(body.min, egui::pos2(params.left() - GAP, body.bottom()));
-        let facts = egui::Rect::from_min_max(
-            egui::pos2(visual.left(), visual.bottom() - FACT_H),
-            visual.max,
-        );
-        let plot =
-            egui::Rect::from_min_max(visual.min, egui::pos2(visual.right(), facts.top() - 6.0));
-        Some(Self {
-            head,
-            lab,
-            visual,
-            plot,
-            facts,
-            params,
-        })
-    }
-}
-
-fn algo_name(face: &QuadFace) -> &'static str {
+fn algo_name(params: &QuadParams) -> &'static str {
     qp::ALGO_NAMES
-        .get(face.params.algo.round().max(0.0) as usize)
+        .get(params.algo.round().max(0.0) as usize)
         .copied()
         .unwrap_or("?")
 }
 
-fn draw_header(
-    ui: &mut egui::Ui,
-    layout: Layout,
-    face: &QuadFace,
-    column: &chain::Column,
-    index: usize,
-    selected: bool,
-    alpha: &crate::design::Alphabet,
-) -> bool {
-    let painter = ui.painter();
-    let colours = palette::colours();
-    let family_ink = if column.bypassed {
-        alpha.edge.color
-    } else {
-        alpha.ink.color
-    };
-    let font = egui::FontId::new(10.0, egui::FontFamily::Name(PROFONT.into()));
-    let mut seal = Vec::new();
-    Sign::Seal(crate::ui::stage::browser::family_mark(column.family)).paint(
-        &mut seal,
-        egui::Rect::from_center_size(
-            egui::pos2(layout.head.left() + 16.0, layout.head.center().y),
-            egui::Vec2::splat(19.0),
-        ),
-        Weight::Hair,
-        family_ink,
-    );
-    for shape in seal {
-        painter.add(shape);
-    }
-    painter.text(
-        egui::pos2(layout.head.left() + 31.0, layout.head.top() + 5.0),
-        egui::Align2::LEFT_TOP,
-        "QUAD // FM ENGINE",
-        font.clone(),
-        if selected {
-            colours.bright
-        } else {
-            colours.dir
-        },
-    );
-    let p = &face.params;
-    let fmode = qp::FMODE_NAMES
-        .get(p.fmode.round() as usize)
-        .copied()
-        .unwrap_or("lp");
-    let dist = qp::DIST_NAMES
-        .get(p.dist.round() as usize)
-        .copied()
-        .unwrap_or("off");
-    painter.text(
-        egui::pos2(layout.head.left() + 31.0, layout.head.bottom() - 5.0),
-        egui::Align2::LEFT_BOTTOM,
-        super::fit_cells(
-            &format!(
-                "fb {:.0}% · {fmode} {:.1}k · {dist} x{:.1} · vel {:.0}%",
-                p.feedback * 100.0,
-                p.cutoff / 1000.0,
-                p.drive,
-                p.velocity * 100.0
-            ),
-            44,
-        ),
-        font,
-        family_ink,
-    );
-    painter.text(
-        egui::pos2(layout.lab.left() - 10.0, layout.head.center().y),
-        egui::Align2::RIGHT_CENTER,
-        algo_name(face),
-        egui::FontId::new(13.0, egui::FontFamily::Name(PROFONT.into())),
-        colours.nominal,
-    );
-    // The door to the room, a real pointer target.
-    let response = ui
-        .interact(
-            layout.lab,
-            egui::Id::new(("stage-quad-forge", index)),
-            egui::Sense::click(),
-        )
-        .affords(Affords::Press);
-    let open_ink = if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        painter.rect_filled(layout.lab, 0.0, colours.select);
-        colours.bright
-    } else {
-        colours.alert
-    };
-    painter.rect_stroke(
-        layout.lab,
-        0.0,
-        egui::Stroke::new(1.0, open_ink),
-        egui::StrokeKind::Inside,
-    );
-    painter.text(
-        layout.lab.center(),
-        egui::Align2::CENTER_CENTER,
-        "ENTER  FORGE >",
-        egui::FontId::new(10.0, egui::FontFamily::Name(PROFONT.into())),
-        open_ink,
-    );
-    response.clicked()
-}
-
-/// The routing: operators as boxes, modulators over their carriers.
-fn draw_plot(painter: &egui::Painter, rect: egui::Rect, face: &QuadFace) {
+/// The routing on a grid. `shown` is the operator to light, if any;
+/// `px` the type size, which sets the box size with it.
+pub(super) fn draw_routing(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    p: &QuadParams,
+    shown: Option<usize>,
+    px: f32,
+) {
     let c = palette::colours();
-    painter.rect_filled(rect, 0.0, c.panel);
-    painter.rect_stroke(
-        rect,
-        0.0,
-        egui::Stroke::new(1.0, c.rule),
-        egui::StrokeKind::Inside,
-    );
-    let body = rect.shrink(8.0);
-    if body.width() < 60.0 || body.height() < 24.0 {
-        return;
-    }
-    let font = egui::FontId::new(9.0, egui::FontFamily::Name(PROFONT.into()));
-    let p = &face.params;
+    let font = face::font(px);
     let algo = p.algorithm();
     let rows = (0..qp::OPS).map(|op| depth(algo, op)).max().unwrap_or(0) + 1;
-    let box_w = (body.width() / qp::OPS as f32 - 8.0).max(16.0);
-    let box_h = ((body.height() - 6.0 * (rows as f32 - 1.0)) / rows as f32)
-        .min(30.0)
-        .max(12.0);
+    let cell_w = rect.width() / qp::OPS as f32;
+    let cell_h = rect.height() / rows as f32;
+    let box_w = (cell_w - 10.0).clamp(24.0, px * 10.0);
+    let box_h = (cell_h - 8.0).clamp(14.0, px * 3.6);
     let centre = |op: usize| {
-        let x = body.left() + (op as f32 + 0.5) * body.width() / qp::OPS as f32;
-        let y = body.bottom() - box_h * 0.5 - depth(algo, op) as f32 * (box_h + 6.0);
-        egui::pos2(x, y)
+        egui::pos2(
+            rect.left() + (op as f32 + 0.5) * cell_w,
+            rect.bottom() - (depth(algo, op) as f32 + 0.5) * cell_h,
+        )
     };
+    let boxed = |op: usize| egui::Rect::from_center_size(centre(op), egui::vec2(box_w, box_h));
+    // Edges first, under the boxes: a straight drop when the two share
+    // a column, an elbow halfway between when they do not.
     for (m, carrier) in algo.edges {
-        painter.line_segment(
-            [centre(*m), centre(*carrier)],
-            egui::Stroke::new(1.0, c.chassis),
-        );
+        let from = egui::pos2(boxed(*m).center().x, boxed(*m).bottom());
+        let to = egui::pos2(boxed(*carrier).center().x, boxed(*carrier).top());
+        let stroke = egui::Stroke::new(1.0, c.chassis);
+        if (from.x - to.x).abs() < 0.5 {
+            painter.line_segment([from, to], stroke);
+        } else {
+            let mid = (from.y + to.y) * 0.5;
+            painter.line_segment([from, egui::pos2(from.x, mid)], stroke);
+            painter.line_segment([egui::pos2(from.x, mid), egui::pos2(to.x, mid)], stroke);
+            painter.line_segment([egui::pos2(to.x, mid), to], stroke);
+        }
+        // An arrowhead at the carrier.
+        let a = 3.0;
+        painter.line_segment([to, egui::pos2(to.x - a, to.y - a)], stroke);
+        painter.line_segment([to, egui::pos2(to.x + a, to.y - a)], stroke);
     }
-    // Feedback: a loop drawn beside the top operator.
-    if p.feedback > 0.005 {
-        let at = centre(qp::OPS - 1);
-        let r = egui::Rect::from_center_size(
-            egui::pos2(at.x + box_w * 0.5 + 6.0, at.y),
-            egui::vec2(8.0, box_h * 0.8),
+    // Feedback: a loop off the right side of its operator.
+    if p.feedback.abs() > 0.005 {
+        let r = boxed(p.feedback_op());
+        let loop_rect = egui::Rect::from_min_max(
+            egui::pos2(r.right() + 2.0, r.top() + 3.0),
+            egui::pos2(r.right() + 8.0, r.bottom() - 3.0),
         );
         painter.rect_stroke(
-            r,
+            loop_rect,
             0.0,
             egui::Stroke::new(1.0, c.nominal),
             egui::StrokeKind::Inside,
@@ -232,36 +89,63 @@ fn draw_plot(painter: &egui::Painter, rect: egui::Rect, face: &QuadFace) {
     }
     for op in 0..qp::OPS {
         let knobs = &p.ops[op];
-        let r = egui::Rect::from_center_size(centre(op), egui::vec2(box_w, box_h));
+        let r = boxed(op);
         let carrier = algo.carriers.contains(&op);
+        let live = shown == Some(op);
         let ink = if carrier { c.alert } else { c.edge };
-        painter.rect_filled(
-            r,
-            0.0,
-            egui::Color32::from_rgba_unmultiplied(
-                ink.r(),
-                ink.g(),
-                ink.b(),
-                (30.0 + 120.0 * knobs.level) as u8,
-            ),
-        );
+        painter.rect_filled(r, 0.0, alpha(ink, (28.0 + 110.0 * knobs.level) as u8));
         painter.rect_stroke(
             r,
             0.0,
-            egui::Stroke::new(1.0, ink),
+            egui::Stroke::new(
+                if live { 2.0 } else { 1.0 },
+                if live { c.bright } else { ink },
+            ),
             egui::StrokeKind::Inside,
         );
-        painter.text(
-            egui::pos2(r.center().x, r.center().y - 2.0),
-            egui::Align2::CENTER_CENTER,
-            format!(
-                "{}:{}",
-                op + 1,
-                op_word(knobs.ratio, knobs.fixed, knobs.hz, knobs.wave)
-            ),
-            font.clone(),
-            if knobs.level > 0.02 { c.bright } else { c.dim },
-        );
+        let name_ink = if live || knobs.level > 0.02 {
+            c.bright
+        } else {
+            c.dim
+        };
+        if box_h >= px * 2.6 {
+            painter.text(
+                egui::pos2(r.center().x, r.top() + px * 0.75 + 1.0),
+                egui::Align2::CENTER_CENTER,
+                format!("OP {}", op + 1),
+                font.clone(),
+                name_ink,
+            );
+            painter.text(
+                egui::pos2(r.center().x, r.top() + px * 1.9 + 1.0),
+                egui::Align2::CENTER_CENTER,
+                super::fit_cells(
+                    &op_word(knobs.ratio, knobs.fixed, knobs.hz, knobs.wave),
+                    ((box_w - 2.0) / (px * 0.56)) as usize,
+                )
+                .trim_end()
+                .to_owned(),
+                font.clone(),
+                if knobs.level > 0.02 { c.fg } else { c.dim },
+            );
+        } else {
+            painter.text(
+                egui::pos2(r.center().x, r.center().y - 1.5),
+                egui::Align2::CENTER_CENTER,
+                super::fit_cells(
+                    &format!(
+                        "{} {}",
+                        op + 1,
+                        op_word(knobs.ratio, knobs.fixed, knobs.hz, knobs.wave)
+                    ),
+                    ((box_w - 2.0) / (px * 0.56)) as usize,
+                )
+                .trim_end()
+                .to_owned(),
+                font.clone(),
+                name_ink,
+            );
+        }
         // The level, as a bar along the foot of the box.
         let foot = egui::Rect::from_min_max(
             egui::pos2(r.left() + 2.0, r.bottom() - 3.0),
@@ -270,137 +154,7 @@ fn draw_plot(painter: &egui::Painter, rect: egui::Rect, face: &QuadFace) {
                 r.bottom() - 1.0,
             ),
         );
-        painter.rect_filled(foot, 0.0, c.bright);
-    }
-}
-
-fn draw_facts(painter: &egui::Painter, rect: egui::Rect, face: &QuadFace) {
-    let colours = palette::colours();
-    let font = egui::FontId::new(8.5, egui::FontFamily::Name(PROFONT.into()));
-    let p = &face.params;
-    let facts = [
-        (
-            "PITCH 1",
-            format!("{:+.0}st {:.0}/{:.0}ms", p.pitch1, p.p1_rise, p.p1_fall),
-        ),
-        (
-            "PITCH 2",
-            format!("{:+.0}st {:.0}/{:.0}ms", p.pitch2, p.p2_rise, p.p2_fall),
-        ),
-        ("FILTER", format!("{:+.1}oct {:.0}ms", p.fenv, p.fenv_dec)),
-    ];
-    let w = rect.width() / facts.len() as f32;
-    for (i, (label, value)) in facts.iter().enumerate() {
-        let x = rect.left() + w * i as f32;
-        painter.text(
-            egui::pos2(x, rect.top() + 4.0),
-            egui::Align2::LEFT_TOP,
-            *label,
-            font.clone(),
-            colours.label,
-        );
-        painter.text(
-            egui::pos2(x, rect.bottom() - 4.0),
-            egui::Align2::LEFT_BOTTOM,
-            super::fit_cells(value, ((w / 5.5) as usize).max(4)),
-            font.clone(),
-            colours.fg,
-        );
-    }
-}
-
-fn draw_params(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    column: &chain::Column,
-    index: usize,
-    cursor: Option<(usize, usize)>,
-    row_offset: usize,
-    rows_shown: usize,
-) {
-    let c = palette::colours();
-    chassis::instrument_rail(painter, rect);
-    let head = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), PARAM_HEAD_H));
-    painter.text(
-        egui::pos2(head.left() + 6.0, head.center().y),
-        egui::Align2::LEFT_CENTER,
-        "PARAM BANK // UP/DN  LEFT/RIGHT",
-        egui::FontId::new(8.5, egui::FontFamily::Name(PROFONT.into())),
-        c.label,
-    );
-    let body = egui::Rect::from_min_max(egui::pos2(rect.left(), head.bottom()), rect.max);
-    if rows_shown == 0 || body.height() <= 1.0 {
-        return;
-    }
-    let pitch = (body.height() / rows_shown as f32).min(24.0).max(13.0);
-    let font = egui::FontId::new(9.5, egui::FontFamily::Name(PROFONT.into()));
-    let cell_w = painter
-        .layout_no_wrap("M".to_owned(), font.clone(), c.fg)
-        .rect
-        .width()
-        .max(1.0);
-    for line in 0..rows_shown {
-        let Some(row) = column.rows.get(row_offset + line) else {
-            break;
-        };
-        let row_index = row_offset + line;
-        let row_rect = egui::Rect::from_min_size(
-            egui::pos2(body.left() + 4.0, body.top() + line as f32 * pitch),
-            egui::vec2(body.width() - 8.0, pitch),
-        );
-        let selected = cursor == Some((index, row_index));
-        if selected {
-            painter.rect_filled(row_rect, 0.0, c.select);
-            crate::ui::nav_cursor::claim(
-                painter,
-                ("stage-quad-param-cursor", index, row_index),
-                row_rect,
-                crate::ui::nav_cursor::Kind::Row,
-                crate::ui::nav_cursor::Layer::Surface,
-                c.alert,
-            );
-        }
-        let ink = if selected {
-            c.bright
-        } else if row.edited {
-            c.alert
-        } else {
-            c.fg
-        };
-        let value_cells = 9usize;
-        let name_cells = ((row_rect.width() / cell_w).floor() as usize)
-            .saturating_sub(value_cells + 2)
-            .max(3);
-        painter.text(
-            egui::pos2(row_rect.left() + 4.0, row_rect.center().y - 1.0),
-            egui::Align2::LEFT_CENTER,
-            super::fit_cells(&row.name, name_cells),
-            font.clone(),
-            ink,
-        );
-        painter.text(
-            egui::pos2(row_rect.right() - 4.0, row_rect.center().y - 1.0),
-            egui::Align2::RIGHT_CENTER,
-            super::fit_cells(&row.value, value_cells),
-            font.clone(),
-            ink,
-        );
-        let rail = egui::Rect::from_min_max(
-            egui::pos2(row_rect.left() + 4.0, row_rect.bottom() - 3.0),
-            egui::pos2(row_rect.right() - 4.0, row_rect.bottom() - 2.0),
-        );
-        painter.rect_filled(rail, 0.0, c.rule);
-        painter.rect_filled(
-            egui::Rect::from_min_max(
-                rail.min,
-                egui::pos2(
-                    rail.left() + rail.width() * row.place.clamp(0.0, 1.0),
-                    rail.bottom(),
-                ),
-            ),
-            0.0,
-            if selected { c.bright } else { c.chassis },
-        );
+        painter.rect_filled(foot, 0.0, if live { c.bright } else { ink });
     }
 }
 
@@ -422,56 +176,65 @@ impl super::super::Stage {
         let Some(face) = column.quad.as_ref() else {
             return false;
         };
-        let Some(layout) = Layout::of(card, head_h) else {
+        let Some(layout) = Layout::of(card, head_h, true) else {
             return false;
         };
         let painter = ui.painter().clone();
-        let alpha = self.glass();
+        let alpha_ = self.glass();
         let selected = cursor.is_some_and(|(col, _)| col == index);
-        let mut shell = Vec::new();
-        chrome::panel_variant(
-            &mut shell,
-            card,
-            Some(alpha.surface.color),
-            alpha.ground.color,
-            Some((
-                if selected {
-                    Weight::Heavy
-                } else {
-                    Weight::Hair
-                },
-                if selected {
-                    alpha.focus.color
-                } else {
-                    alpha.edge.color
-                },
-            )),
-            index as u8,
+        face::draw_shell(&painter, card, layout, index, selected, &alpha_);
+        let p = &face.params;
+        let fmode = qp::FMODE_NAMES
+            .get(p.fmode.round() as usize)
+            .copied()
+            .unwrap_or("lp");
+        let dist = qp::DIST_NAMES
+            .get(p.dist.round() as usize)
+            .copied()
+            .unwrap_or("off");
+        let mode = qp::MONO_NAMES
+            .get(p.mono.round() as usize)
+            .copied()
+            .unwrap_or("poly");
+        let head = Head {
+            title: "QUAD // FM ENGINE",
+            subtitle: format!(
+                "{fmode} {:.1}k · {dist} x{:.1} · {mode} · uni {}",
+                p.cutoff / 1000.0,
+                p.drive,
+                p.unison_count()
+            ),
+            word: algo_name(p).to_owned(),
+            plate: Some("ENTER  FORGE >"),
+        };
+        let opened = face::draw_head(
+            ui,
+            layout,
+            column,
+            index,
+            selected,
+            &alpha_,
+            &head,
+            "stage-quad-forge",
         );
-        chrome::trace(
-            &mut shell,
+        let inner = face::frame_plot(&painter, layout.plot);
+        draw_routing(&painter, inner, p, None, 9.0);
+        face::draw_facts(
+            &painter,
+            layout.facts,
             &[
-                egui::pos2(card.left() + chrome::CHAMFER, layout.head.bottom()),
-                egui::pos2(card.right() - chrome::CHAMFER, layout.head.bottom()),
+                (
+                    "PITCH 1",
+                    format!("{:+.0}st {:.0}/{:.0}ms", p.pitch1, p.p1_rise, p.p1_fall),
+                ),
+                (
+                    "PITCH 2",
+                    format!("{:+.0}st {:.0}/{:.0}ms", p.pitch2, p.p2_rise, p.p2_fall),
+                ),
+                ("FILTER", format!("{:+.1}oct {:.0}ms", p.fenv, p.fenv_dec)),
             ],
-            Weight::Hair,
-            alpha.edge.color,
         );
-        for point in [
-            egui::pos2(card.center().x, card.top()),
-            egui::pos2(card.center().x, card.bottom()),
-            egui::pos2(card.left(), layout.head.bottom() - 5.0),
-            egui::pos2(card.right(), layout.head.bottom() - 5.0),
-        ] {
-            chrome::pad(&mut shell, point, chrome::PAD, alpha.ink.color, true);
-        }
-        for shape in shell {
-            painter.add(shape);
-        }
-        let opened = draw_header(ui, layout, face, column, index, selected, &alpha);
-        draw_plot(&painter, layout.plot, face);
-        draw_facts(&painter, layout.facts, face);
-        draw_params(
+        face::draw_params(
             &painter,
             layout.params,
             column,
@@ -479,6 +242,9 @@ impl super::super::Stage {
             cursor,
             row_offset,
             rows_shown,
+            "stage-quad-param-cursor",
+            "PARAM BANK // UP/DN  LEFT/RIGHT",
+            &|_| RowMark::default(),
         );
         opened
     }
@@ -489,21 +255,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_quad_face_reserves_a_routing_picture_and_a_parameter_rail() {
-        let card = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(WIDTH, 236.0));
-        let layout = Layout::of(card, 40.0).expect("a full QUAD card");
-        assert!(layout.plot.width() > layout.params.width());
-        assert!(layout.plot.height() > FACT_H);
-        assert_eq!(layout.params.width(), PARAM_W);
-        assert!(!layout.plot.intersects(layout.params));
-    }
-
-    #[test]
     fn the_face_names_the_routing() {
         use crate::sequencing::{Device, DeviceId};
         let mut device = Device::new(DeviceId(1), crate::devices::DeviceKind::Quad);
-        assert_eq!(algo_name(&QuadFace::from_device(&device)), "4>3>2>1");
+        assert_eq!(
+            algo_name(&chain::QuadFace::from_device(&device).params),
+            "4>3>2>1"
+        );
         device.set(qp::ALGO, 7.0);
-        assert_eq!(algo_name(&QuadFace::from_device(&device)), "1+2+3+4");
+        assert_eq!(
+            algo_name(&chain::QuadFace::from_device(&device).params),
+            "1+2+3+4"
+        );
     }
 }

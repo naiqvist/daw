@@ -1,30 +1,30 @@
 //! QUAD — the four-operator FM workhorse.
 //!
-//! Four sine operators, each with a ratio to the note, a fine detune,
-//! a level and its own ADSR; eight routing shapes from a single serial
-//! stack to four carriers side by side; feedback on the top operator.
-//! Two pitch envelopes — one that bends every operator, the DX pitch
+//! Four operators, each with a ratio to the note or a fixed frequency,
+//! a fine detune, a level and its own ADSR, a shape, a velocity depth
+//! and a key scaling; eight routing shapes from a single serial stack
+//! to four carriers side by side; signed feedback on any operator. Two
+//! pitch envelopes — one that bends every operator, the DX pitch
 //! envelope, and one that bends only the modulators, which sweeps the
-//! harmonicity while the fundamental stays put. Then a multi-mode
+//! harmonicity while the fundamental stays put. Two LFOs per voice,
+//! each with a delay and a fade-in, to pitch, the modulators' levels,
+//! the carriers' levels and the filter. Unison stacks up to four
+//! detuned copies of the whole operator stack across the field; mono
+//! and legato modes with glide make it a bass. Then a multi-mode
 //! filter with its own attack-decay envelope and keytrack, per voice,
 //! and after the sum, a distortion stage.
 //!
 //! Phase modulation, as every FM synth since the DX7 actually is: a
 //! modulator's output is added to its carrier's phase, scaled by an
 //! index, so a level knob is a brightness knob. The waves are table
-//! reads, not a `sin` per operator per voice per sample: the sine, the
-//! TX81Z's half and rectified sines, a soft square, and noise. Each
-//! operator also has its own velocity depth and a level scaling across
-//! the keyboard, and may sit at a fixed frequency instead of a ratio;
-//! the envelopes' decay and release shorten up the keyboard by KEY
-//! RATE, as every acoustic thing's do.
+//! reads, not a `sin` per operator per voice per sample.
 
 use crate::dsp::adsr::Adsr;
 use crate::dsp::filters::{Mode as FilterMode, Svf};
 use crate::dsp::interp::linear;
 use crate::dsp::shaper::{Mode as ShapeMode, Waveshaper};
 use crate::params::quad as p;
-use crate::params::quad::{Algorithm, OPS};
+use crate::params::quad::{Algorithm, LFOS, OPS, UNISON_MAX};
 
 pub const VOICES: usize = 8;
 const TABLE: usize = 2048;
@@ -35,6 +35,8 @@ const HOP: usize = 32;
 const INDEX_TURNS: f32 = 1.5;
 /// Feedback's own index: a full turn is a saw already.
 const FEEDBACK_TURNS: f32 = 0.5;
+/// The most keys mono mode remembers as held.
+const HELD: usize = 16;
 
 /// One operator's knobs.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -78,6 +80,35 @@ impl Default for Op {
     }
 }
 
+/// One LFO's knobs.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Lfo {
+    pub rate: f32,
+    pub shape: f32,
+    pub delay: f32,
+    pub fade: f32,
+    pub pitch: f32,
+    pub modulators: f32,
+    pub amp: f32,
+    pub filter: f32,
+}
+
+impl Default for Lfo {
+    fn default() -> Self {
+        Self {
+            rate: 5.0,
+            shape: 0.0,
+            delay: 0.0,
+            fade: 0.0,
+            pitch: 0.0,
+            modulators: 0.0,
+            amp: 0.0,
+            filter: 0.0,
+        }
+    }
+}
+
 /// The knobs, in engine units.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -104,6 +135,13 @@ pub struct QuadParams {
     pub level: f32,
     /// How much the envelopes' decay and release shorten up the keyboard.
     pub key_rate: f32,
+    pub unison: f32,
+    pub udetune: f32,
+    pub width: f32,
+    pub mono: f32,
+    pub glide: f32,
+    pub fb_op: f32,
+    pub lfos: [Lfo; LFOS],
 }
 
 impl Default for QuadParams {
@@ -130,6 +168,13 @@ impl Default for QuadParams {
             velocity: 0.6,
             level: 0.8,
             key_rate: 0.3,
+            unison: 1.0,
+            udetune: 10.0,
+            width: 0.5,
+            mono: 0.0,
+            glide: 0.0,
+            fb_op: 3.0,
+            lfos: [Lfo::default(); LFOS],
         };
         for def in p::TABLE {
             me.set(def.id, def.default);
@@ -139,6 +184,15 @@ impl Default for QuadParams {
 }
 
 impl QuadParams {
+    fn lfo_of(param: u32) -> Option<(usize, u32)> {
+        if param < p::LFO1_RATE {
+            return None;
+        }
+        let rel = param - p::LFO1_RATE;
+        let lfo = (rel / p::PER_LFO) as usize;
+        (lfo < LFOS).then_some((lfo, rel % p::PER_LFO))
+    }
+
     pub fn set(&mut self, param: u32, value: f32) {
         let Some(def) = p::TABLE.iter().find(|def| def.id == param) else {
             return;
@@ -165,6 +219,23 @@ impl QuadParams {
             }
             return;
         }
+        if let Some((lfo, field)) = Self::lfo_of(param) {
+            let Some(lfo) = self.lfos.get_mut(lfo) else {
+                return;
+            };
+            match field {
+                p::LFO_RATE => lfo.rate = value,
+                p::LFO_SHAPE => lfo.shape = value,
+                p::LFO_DELAY => lfo.delay = value,
+                p::LFO_FADE => lfo.fade = value,
+                p::LFO_PITCH => lfo.pitch = value,
+                p::LFO_MOD => lfo.modulators = value,
+                p::LFO_AMP => lfo.amp = value,
+                p::LFO_FILTER => lfo.filter = value,
+                _ => {}
+            }
+            return;
+        }
         match param {
             p::ALGO => self.algo = value,
             p::FEEDBACK => self.feedback = value,
@@ -186,6 +257,12 @@ impl QuadParams {
             p::VELOCITY => self.velocity = value,
             p::LEVEL => self.level = value,
             p::KEY_RATE => self.key_rate = value,
+            p::UNISON => self.unison = value,
+            p::UDETUNE => self.udetune = value,
+            p::WIDTH => self.width = value,
+            p::MONO => self.mono = value,
+            p::GLIDE => self.glide = value,
+            p::FB_OP => self.fb_op = value,
             _ => {}
         }
     }
@@ -206,6 +283,20 @@ impl QuadParams {
                 p::HZ => op.hz,
                 p::VEL => op.vel,
                 p::KEYSCALE => op.keyscale,
+                _ => return None,
+            });
+        }
+        if let Some((lfo, field)) = Self::lfo_of(param) {
+            let lfo = self.lfos.get(lfo)?;
+            return Some(match field {
+                p::LFO_RATE => lfo.rate,
+                p::LFO_SHAPE => lfo.shape,
+                p::LFO_DELAY => lfo.delay,
+                p::LFO_FADE => lfo.fade,
+                p::LFO_PITCH => lfo.pitch,
+                p::LFO_MOD => lfo.modulators,
+                p::LFO_AMP => lfo.amp,
+                p::LFO_FILTER => lfo.filter,
                 _ => return None,
             });
         }
@@ -230,6 +321,12 @@ impl QuadParams {
             p::VELOCITY => self.velocity,
             p::LEVEL => self.level,
             p::KEY_RATE => self.key_rate,
+            p::UNISON => self.unison,
+            p::UDETUNE => self.udetune,
+            p::WIDTH => self.width,
+            p::MONO => self.mono,
+            p::GLIDE => self.glide,
+            p::FB_OP => self.fb_op,
             _ => return None,
         })
     }
@@ -250,6 +347,23 @@ impl QuadParams {
     pub fn algorithm(&self) -> Algorithm {
         p::algorithm(self.algo)
     }
+
+    /// How many copies of the stack a note plays.
+    pub fn unison_count(&self) -> usize {
+        (self.unison.round().max(1.0) as usize).min(UNISON_MAX)
+    }
+
+    pub fn is_mono(&self) -> bool {
+        self.mono.round() >= p::MONO_MONO
+    }
+
+    pub fn is_legato(&self) -> bool {
+        self.mono.round() >= p::MONO_LEGATO
+    }
+
+    pub fn feedback_op(&self) -> usize {
+        (self.fb_op.round().max(0.0) as usize).min(OPS - 1)
+    }
 }
 
 /// A rise-then-fall envelope in seconds: linear up over `rise`, then an
@@ -267,6 +381,18 @@ fn rise_fall(t: f32, rise_ms: f32, fall_ms: f32) -> f32 {
     }
 }
 
+/// The unison copies' detune positions, `-1..=1`, for `count` copies.
+fn unison_positions(count: usize) -> [f32; UNISON_MAX] {
+    let mut out = [0.0f32; UNISON_MAX];
+    if count <= 1 {
+        return out;
+    }
+    for (u, slot) in out.iter_mut().enumerate().take(count) {
+        *slot = u as f32 / (count - 1) as f32 * 2.0 - 1.0;
+    }
+    out
+}
+
 struct Voice {
     active: bool,
     held: bool,
@@ -275,15 +401,21 @@ struct Voice {
     vel: f32,
     elapsed: u64,
     base_hz: f32,
-    phase: [f32; OPS],
-    out: [f32; OPS],
+    /// Semitones still to glide, decaying to nothing.
+    glide_semis: f32,
+    phase: [[f32; OPS]; UNISON_MAX],
+    out: [[f32; OPS]; UNISON_MAX],
     env: [Adsr; OPS],
-    filter: Svf,
+    filter_l: Svf,
+    filter_r: Svf,
     /// Each operator's level for this key: velocity depth and key
     /// scaling, worked out once at the note.
     key_gain: [f32; OPS],
     /// The noise wave's generator, one per voice.
     noise: u32,
+    lfo_phase: [f32; LFOS],
+    /// The sample-and-hold's held value, per LFO.
+    lfo_hold: [f32; LFOS],
 }
 
 impl Voice {
@@ -296,13 +428,59 @@ impl Voice {
             vel: 1.0,
             elapsed: 0,
             base_hz: 440.0,
-            phase: [0.0; OPS],
-            out: [0.0; OPS],
+            glide_semis: 0.0,
+            phase: [[0.0; OPS]; UNISON_MAX],
+            out: [[0.0; OPS]; UNISON_MAX],
             env: [Adsr::new(), Adsr::new(), Adsr::new(), Adsr::new()],
-            filter: Svf::new(),
+            filter_l: Svf::new(),
+            filter_r: Svf::new(),
             key_gain: [1.0; OPS],
             noise: 0x9E37_79B9,
+            lfo_phase: [0.0; LFOS],
+            lfo_hold: [0.0; LFOS],
         }
+    }
+
+    fn rand(&mut self) -> f32 {
+        let mut x = self.noise;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.noise = x;
+        (x as f32 / u32::MAX as f32) * 2.0 - 1.0
+    }
+
+    /// The LFO's value for the coming hop, `-1..=1`, with its delay and
+    /// fade applied, and its phase advanced by `hop_seconds`.
+    fn lfo(&mut self, i: usize, lfo: &Lfo, t: f32, hop_seconds: f32) -> f32 {
+        let delay = lfo.delay.max(0.0) / 1000.0;
+        let fade = lfo.fade.max(0.0) / 1000.0;
+        let depth = if t < delay {
+            0.0
+        } else if fade > 0.0 {
+            ((t - delay) / fade).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let phase = self.lfo_phase[i];
+        let value = match lfo.shape.round() as u8 {
+            1 => 1.0 - 4.0 * (phase - 0.5).abs(),
+            2 => {
+                if phase < 0.5 {
+                    1.0
+                } else {
+                    -1.0
+                }
+            }
+            3 => self.lfo_hold[i],
+            _ => (phase * core::f32::consts::TAU).sin(),
+        };
+        let next = phase + lfo.rate.max(0.0) * hop_seconds;
+        if next >= 1.0 {
+            self.lfo_hold[i] = self.rand();
+        }
+        self.lfo_phase[i] = next.fract();
+        value * depth
     }
 }
 
@@ -314,10 +492,16 @@ pub struct QuadVoices {
     /// The shapes, one table each, in `WAVE_NAMES` order but for noise.
     waves: [Vec<f32>; 4],
     voices: Vec<Voice>,
-    /// Scratch: one voice's block, its operator envelopes, the sum.
-    block: Vec<f32>,
+    /// Mono mode's memory of the keys held, oldest first.
+    held: [u8; HELD],
+    held_len: usize,
+    /// Scratch: one voice's block, both sides, its operator envelopes,
+    /// the sums.
+    block_l: Vec<f32>,
+    block_r: Vec<f32>,
     envs: [Vec<f32>; OPS],
     left: Vec<f32>,
+    right: Vec<f32>,
     stash: Vec<f32>,
     shaper: Waveshaper,
     said_voices: f32,
@@ -361,9 +545,13 @@ impl QuadVoices {
             sample_rate: 48_000.0,
             waves,
             voices: (0..VOICES).map(|_| Voice::new()).collect(),
-            block: vec![0.0; n],
+            held: [0; HELD],
+            held_len: 0,
+            block_l: vec![0.0; n],
+            block_r: vec![0.0; n],
             envs: [vec![0.0; n], vec![0.0; n], vec![0.0; n], vec![0.0; n]],
             left: vec![0.0; n],
+            right: vec![0.0; n],
             stash: vec![0.0; n],
             shaper: Waveshaper::new(),
             said_voices: 0.0,
@@ -448,9 +636,11 @@ impl QuadVoices {
             for env in v.env.iter_mut() {
                 env.reset();
             }
-            v.filter.reset();
-            v.out = [0.0; OPS];
+            v.filter_l.reset();
+            v.filter_r.reset();
+            v.out = [[0.0; OPS]; UNISON_MAX];
         }
+        self.held_len = 0;
         self.said_voices = 0.0;
     }
 
@@ -463,9 +653,52 @@ impl QuadVoices {
                 }
             }
         }
+        self.held_len = 0;
+    }
+
+    fn forget_held(&mut self, pitch: u8) {
+        let mut i = 0;
+        while i < self.held_len {
+            if self.held[i] == pitch {
+                for j in i..self.held_len.saturating_sub(1) {
+                    self.held[j] = self.held[j + 1];
+                }
+                self.held_len -= 1;
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    fn remember_held(&mut self, pitch: u8) {
+        self.forget_held(pitch);
+        if self.held_len == HELD {
+            for j in 0..HELD - 1 {
+                self.held[j] = self.held[j + 1];
+            }
+            self.held_len -= 1;
+        }
+        self.held[self.held_len] = pitch;
+        self.held_len += 1;
     }
 
     pub fn note_off(&mut self, pitch: u8) {
+        self.forget_held(pitch);
+        if self.params.is_mono() {
+            // A key still held takes the voice back, legato.
+            if self.held_len > 0 {
+                let back = self.held[self.held_len - 1];
+                if let Some(v) = self.voices.iter_mut().find(|v| v.active && v.held) {
+                    if v.pitch == pitch {
+                        let from = v.pitch;
+                        v.pitch = back;
+                        v.base_hz = 440.0 * ((f32::from(back) - 69.0) / 12.0).exp2();
+                        v.glide_semis += f32::from(from) - f32::from(back);
+                    }
+                    return;
+                }
+            }
+        }
         for v in self.voices.iter_mut() {
             if v.held && v.pitch == pitch {
                 v.held = false;
@@ -477,48 +710,77 @@ impl QuadVoices {
     }
 
     pub fn note_on(&mut self, pitch: u8, vel: u8, age: u64) {
-        let slot = self.voices.iter().position(|v| !v.active).or_else(|| {
-            self.voices
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, v)| v.age)
-                .map(|(i, _)| i)
-        });
-        let Some(index) = slot else {
-            return;
+        let mono = self.params.is_mono();
+        let legato = self.params.is_legato();
+        if mono {
+            self.remember_held(pitch);
+        }
+        // Mono: the one sounding voice takes the new key, gliding from
+        // where it was; legato does not even restart the envelopes.
+        let sounding = mono
+            .then(|| self.voices.iter().position(|v| v.active))
+            .flatten();
+        let index = match sounding {
+            Some(index) => index,
+            None => {
+                let slot = self.voices.iter().position(|v| !v.active).or_else(|| {
+                    self.voices
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, v)| v.age)
+                        .map(|(i, _)| i)
+                });
+                let Some(index) = slot else {
+                    return;
+                };
+                index
+            }
         };
+        let glide_on = self.params.glide > 0.0;
+        let octaves = (f32::from(pitch) - 60.0) / 12.0;
+        let rate = (-octaves * self.params.key_rate).exp2().clamp(0.125, 8.0);
+        let params = self.params;
+        let sr = self.sample_rate;
         let Some(v) = self.voices.get_mut(index) else {
             return;
         };
+        let retrigger = !(sounding.is_some() && legato);
+        if sounding.is_some() && glide_on {
+            v.glide_semis += f32::from(v.pitch) - f32::from(pitch);
+        } else {
+            v.glide_semis = 0.0;
+        }
         v.active = true;
         v.held = true;
         v.pitch = pitch;
         v.age = age;
         v.vel = (f32::from(vel) / 127.0).clamp(0.0, 1.0);
-        v.elapsed = 0;
         v.base_hz = 440.0 * ((f32::from(pitch) - 69.0) / 12.0).exp2();
-        v.phase = [0.0; OPS];
-        v.out = [0.0; OPS];
-        v.filter.reset();
         // The key's own levels and rates: velocity depth and dB-per-octave
         // scaling per operator, and every envelope's decay and release
         // shortened up the keyboard by KEY RATE.
-        let octaves = (f32::from(pitch) - 60.0) / 12.0;
-        let rate = (-octaves * self.params.key_rate).exp2().clamp(0.125, 8.0);
-        for (k, op) in self.params.ops.iter().enumerate() {
+        for (k, op) in params.ops.iter().enumerate() {
             let touch = 1.0 - op.vel + op.vel * v.vel;
             let scaled = (op.keyscale * octaves / 20.0 * core::f32::consts::LN_10).exp();
             v.key_gain[k] = (touch * scaled).clamp(0.0, 4.0);
             v.env[k].prepare(
-                self.sample_rate,
+                sr,
                 op.attack,
                 op.decay * rate,
                 op.sustain,
                 op.release * rate,
             );
         }
-        for env in v.env.iter_mut() {
-            env.gate_on();
+        if retrigger {
+            v.elapsed = 0;
+            v.phase = [[0.0; OPS]; UNISON_MAX];
+            v.out = [[0.0; OPS]; UNISON_MAX];
+            v.lfo_phase = [0.0; LFOS];
+            v.filter_l.reset();
+            v.filter_r.reset();
+            for env in v.env.iter_mut() {
+                env.gate_on();
+            }
         }
     }
 
@@ -538,7 +800,12 @@ impl QuadVoices {
 
     fn render_block(&mut self, out: &mut [f32], at: usize, gain: &mut crate::audio::graph::Ramp) {
         let n = out.len();
-        for slot in self.left.iter_mut().take(n) {
+        for slot in self
+            .left
+            .iter_mut()
+            .take(n)
+            .chain(self.right.iter_mut().take(n))
+        {
             *slot = 0.0;
         }
         let p = self.params;
@@ -546,12 +813,22 @@ impl QuadVoices {
         let sr = self.sample_rate;
         let nyquist = sr * 0.45;
         let carriers = algo.carriers.len().max(1) as f32;
-        let carrier_scale = 1.0 / carriers.sqrt();
+        let count = p.unison_count();
+        let positions = unison_positions(count);
+        let scale = 1.0 / (carriers * count as f32).sqrt();
+        let fb_op = p.feedback_op();
         let fmode = match p.fmode.round() as u8 {
             1 => FilterMode::Highpass,
             2 => FilterMode::BandpassUnity,
             3 => FilterMode::Notch,
             _ => FilterMode::Lowpass,
+        };
+        // Glide: a share of what is left, per hop, so it lands in about
+        // GLIDE milliseconds.
+        let glide_keep = if p.glide > 0.0 {
+            (-(HOP as f32) / (sr * p.glide / 1000.0 / 4.0)).exp()
+        } else {
+            0.0
         };
         let waves = &self.waves;
         let mut sounding = 0usize;
@@ -561,26 +838,39 @@ impl QuadVoices {
             }
             let mut done = 0usize;
             while done < n {
-                let take = (n - done).min(HOP).min(self.block.len());
+                let take = (n - done).min(HOP).min(self.block_l.len());
                 if take == 0 {
                     break;
                 }
                 let v = &mut self.voices[vi];
-                // The operators' envelopes, a hop at a time.
                 for (k, env) in v.env.iter_mut().enumerate() {
                     if let Some(buf) = self.envs[k].get_mut(..take) {
                         env.process(buf);
                     }
                 }
-                // Velocity: each operator has its own depth, worked out
-                // at the note; the master depth loudens the carriers.
                 let touch = 1.0 - p.velocity + p.velocity * v.vel;
                 let t = v.elapsed as f32 / sr;
-                let bend_all = p.pitch1 * rise_fall(t, p.p1_rise, p.p1_fall);
+                let hop_seconds = take as f32 / sr;
+                // The LFOs, once a hop.
+                let mut lfo_pitch = 0.0f32;
+                let mut lfo_mod = 0.0f32;
+                let mut lfo_amp = 0.0f32;
+                let mut lfo_filter = 0.0f32;
+                for (i, lfo) in p.lfos.iter().enumerate() {
+                    let value = v.lfo(i, lfo, t, hop_seconds);
+                    lfo_pitch += value * lfo.pitch;
+                    lfo_mod += value * lfo.modulators;
+                    lfo_amp += value * lfo.amp;
+                    lfo_filter += value * lfo.filter;
+                }
+                let mod_scale = (1.0 + lfo_mod).clamp(0.0, 2.0);
+                let amp_scale = (1.0 + lfo_amp).clamp(0.0, 2.0);
+                v.glide_semis *= glide_keep;
+                let bend_all =
+                    p.pitch1 * rise_fall(t, p.p1_rise, p.p1_fall) + lfo_pitch + v.glide_semis;
                 let bend_mod = p.pitch2 * rise_fall(t, p.p2_rise, p.p2_fall);
-                // The operators' increments for this hop: ratio, fine,
-                // and the two bends.
-                let mut inc = [0.0f32; OPS];
+                // The operators' increments for this hop, per unison copy.
+                let mut inc = [[0.0f32; OPS]; UNISON_MAX];
                 for (k, op) in p.ops.iter().enumerate() {
                     let bend = bend_all
                         + if p::is_modulator(algo, k) {
@@ -588,69 +878,85 @@ impl QuadVoices {
                         } else {
                             0.0
                         };
-                    let hz = if op.fixed.round() >= 1.0 {
-                        op.hz * (op.fine / 1200.0 + bend / 12.0).exp2()
-                    } else {
-                        v.base_hz * op.ratio * (op.fine / 1200.0 + bend / 12.0).exp2()
-                    };
-                    inc[k] = (hz / sr).clamp(0.0, 0.5);
+                    for u in 0..count {
+                        let detune = positions[u] * p.udetune / 100.0;
+                        let hz = if op.fixed.round() >= 1.0 {
+                            op.hz * (op.fine / 1200.0 + (bend + detune) / 12.0).exp2()
+                        } else {
+                            v.base_hz
+                                * op.ratio
+                                * (op.fine / 1200.0 + (bend + detune) / 12.0).exp2()
+                        };
+                        inc[u][k] = (hz / sr).clamp(0.0, 0.5);
+                    }
                 }
                 for s in 0..take {
-                    // Top operator first: a modulator is always above the
-                    // operator it feeds, so one pass in descending order
-                    // is the whole graph. Feedback reads the top's own
-                    // last output.
-                    let mut next = [0.0f32; OPS];
-                    for k in (0..OPS).rev() {
-                        let op = &p.ops[k];
-                        let mut turns = 0.0f32;
-                        for (m, c) in algo.edges {
-                            if *c == k {
-                                turns += next[*m] * INDEX_TURNS;
+                    let mut l = 0.0f32;
+                    let mut r = 0.0f32;
+                    for u in 0..count {
+                        let mut next = [0.0f32; OPS];
+                        for k in (0..OPS).rev() {
+                            let op = &p.ops[k];
+                            let mut turns = 0.0f32;
+                            for (m, c) in algo.edges {
+                                if *c == k {
+                                    turns += next[*m] * INDEX_TURNS;
+                                }
                             }
+                            if k == fb_op {
+                                turns += v.out[u][k] * p.feedback * FEEDBACK_TURNS;
+                            }
+                            let env = self.envs[k].get(s).copied().unwrap_or(0.0);
+                            let is_mod = p::is_modulator(algo, k);
+                            let level = op.level
+                                * env
+                                * v.key_gain[k]
+                                * if is_mod { mod_scale } else { amp_scale };
+                            let wave = op.wave.round().max(0.0) as usize;
+                            let sample = if wave >= waves.len() {
+                                v.rand()
+                            } else {
+                                sine_at(&waves[wave], v.phase[u][k] + turns)
+                            };
+                            let y = sample * level;
+                            v.phase[u][k] = (v.phase[u][k] + inc[u][k]).fract();
+                            next[k] = y;
                         }
-                        if k == OPS - 1 {
-                            turns += v.out[k] * p.feedback * FEEDBACK_TURNS;
+                        v.out[u] = next;
+                        let mut y = 0.0f32;
+                        for c in algo.carriers {
+                            y += next[*c];
                         }
-                        let env = self.envs[k].get(s).copied().unwrap_or(0.0);
-                        let level = op.level * env * v.key_gain[k];
-                        let wave = op.wave.round().max(0.0) as usize;
-                        let sample = if wave >= waves.len() {
-                            // Noise: a new value every sample, the phase
-                            // ignored. An xorshift, so it costs nothing.
-                            let mut x = v.noise;
-                            x ^= x << 13;
-                            x ^= x >> 17;
-                            x ^= x << 5;
-                            v.noise = x;
-                            (x as f32 / u32::MAX as f32) * 2.0 - 1.0
-                        } else {
-                            sine_at(&waves[wave], v.phase[k] + turns)
-                        };
-                        let y = sample * level;
-                        v.phase[k] = (v.phase[k] + inc[k]).fract();
-                        next[k] = y;
+                        let (gl, gr) = crate::dsp::pan::spread(positions[u] * p.width);
+                        l += y * gl;
+                        r += y * gr;
                     }
-                    v.out = next;
-                    let mut y = 0.0f32;
-                    for c in algo.carriers {
-                        y += next[*c];
+                    if let Some(slot) = self.block_l.get_mut(s) {
+                        *slot = l * scale * touch;
                     }
-                    if let Some(slot) = self.block.get_mut(s) {
-                        *slot = y * carrier_scale * touch;
+                    if let Some(slot) = self.block_r.get_mut(s) {
+                        *slot = r * scale * touch;
                     }
                     v.elapsed += 1;
                 }
-                // The filter, its cutoff riding its envelope and the key.
+                // The filter, its cutoff riding its envelope, the key,
+                // and the LFOs.
                 let fe = rise_fall(t, p.fenv_att, p.fenv_dec) * p.fenv;
                 let key = p.keytrack * (f32::from(v.pitch) - 60.0) / 12.0;
-                let hz = (p.cutoff * (fe + key).exp2()).clamp(20.0, nyquist);
-                v.filter.prepare(sr, hz, p.reso);
-                if let Some(block) = self.block.get_mut(..take) {
-                    v.filter.process(block, fmode);
-                    for (i, x) in block.iter().enumerate() {
+                let hz = (p.cutoff * (fe + key + lfo_filter).exp2()).clamp(20.0, nyquist);
+                v.filter_l.prepare(sr, hz, p.reso);
+                v.filter_r.prepare(sr, hz, p.reso);
+                if let (Some(bl), Some(br)) =
+                    (self.block_l.get_mut(..take), self.block_r.get_mut(..take))
+                {
+                    v.filter_l.process(bl, fmode);
+                    v.filter_r.process(br, fmode);
+                    for i in 0..take {
                         if let Some(slot) = self.left.get_mut(done + i) {
-                            *slot += *x;
+                            *slot += bl[i];
+                        }
+                        if let Some(slot) = self.right.get_mut(done + i) {
+                            *slot += br[i];
                         }
                     }
                 }
@@ -666,21 +972,24 @@ impl QuadVoices {
             }
         }
         self.said_voices = sounding as f32;
-        if p.dist.round() >= 1.0
-            && let Some(l) = self.left.get_mut(..n)
-        {
-            self.shaper.process(l);
+        if p.dist.round() >= 1.0 {
+            if let Some(l) = self.left.get_mut(..n) {
+                self.shaper.process(l);
+            }
+            if let Some(r) = self.right.get_mut(..n) {
+                self.shaper.process(r);
+            }
         }
         let level = p.level;
         for i in 0..n {
             let g = gain.next() * level;
             let l = self.left.get(i).copied().unwrap_or(0.0) * g;
-            let l = if l.is_finite() { l } else { 0.0 };
+            let r = self.right.get(i).copied().unwrap_or(0.0) * g;
             if let Some(slot) = out.get_mut(i) {
-                *slot = l;
+                *slot = if l.is_finite() { l } else { 0.0 };
             }
             if let Some(slot) = self.stash.get_mut(at + i) {
-                *slot = l;
+                *slot = if r.is_finite() { r } else { 0.0 };
             }
         }
     }
@@ -719,6 +1028,21 @@ mod tests {
         if all > 0.0 { hp / all } else { 0.0 }
     }
 
+    fn crossings(xs: &[f32]) -> usize {
+        xs.windows(2)
+            .filter(|w| (w[0] < 0.0) != (w[1] < 0.0))
+            .count()
+    }
+
+    /// A carrier alone, wide open, no envelopes in the way.
+    fn plain() -> QuadParams {
+        let mut params = QuadParams::default();
+        params.ops[1].level = 0.0;
+        params.cutoff = 20_000.0;
+        params.key_rate = 0.0;
+        params
+    }
+
     #[test]
     fn every_parameter_reaches_its_field() {
         let mut voices = QuadVoices::new(FS, 256, QuadParams::default());
@@ -731,12 +1055,13 @@ mod tests {
         assert_eq!(d.ops[1].ratio, 2.0);
         assert_eq!(d.ops[2].vel, 0.5);
         assert_eq!(d.key_rate, 0.3);
+        assert_eq!(d.lfos[1].rate, 5.0);
+        assert_eq!(d.feedback_op(), 3);
     }
 
     #[test]
     fn a_note_sounds_and_a_modulator_brightens_it() {
-        let mut dull = QuadParams::default();
-        dull.ops[1].level = 0.0;
+        let dull = plain();
         let mut a = QuadVoices::new(FS, 256, dull);
         a.note_on(57, 100, 1);
         let quiet = run(&mut a, 4_800);
@@ -764,55 +1089,66 @@ mod tests {
     }
 
     #[test]
-    fn every_algorithm_renders_finite_with_feedback_and_distortion() {
+    fn every_algorithm_renders_finite_with_feedback_on_any_operator_and_distortion() {
         for algo in 0..p::ALGORITHMS.len() {
-            let mut params = QuadParams::default();
-            params.algo = algo as f32;
-            params.feedback = 1.0;
-            params.dist = 3.0;
-            params.drive = 20.0;
-            for op in params.ops.iter_mut() {
-                op.level = 1.0;
+            for (fb_op, feedback) in [(3usize, 1.0f32), (0, -1.0), (1, 1.0)] {
+                let mut params = QuadParams::default();
+                params.algo = algo as f32;
+                params.feedback = feedback;
+                params.fb_op = fb_op as f32;
+                params.dist = 3.0;
+                params.drive = 20.0;
+                params.unison = 2.0;
+                for op in params.ops.iter_mut() {
+                    op.level = 1.0;
+                }
+                let mut voices = QuadVoices::new(FS, 256, params);
+                voices.note_on(48, 127, 1);
+                voices.note_on(55, 90, 2);
+                let out = run(&mut voices, 9_600);
+                assert!(
+                    out.iter().all(|x| x.is_finite() && x.abs() <= 1.0 + 1e-3),
+                    "algo {algo} fb {fb_op}"
+                );
+                assert!(rms(&out) > 0.05, "algo {algo} fb {fb_op} is silent");
             }
-            let mut voices = QuadVoices::new(FS, 256, params);
-            voices.note_on(48, 127, 1);
-            voices.note_on(55, 90, 2);
-            let out = run(&mut voices, 9_600);
-            assert!(
-                out.iter().all(|x| x.is_finite() && x.abs() <= 1.0 + 1e-3),
-                "algo {algo}"
-            );
-            assert!(rms(&out) > 0.05, "algo {algo} is silent");
         }
+        // Feedback on the carrier changes the sound; its sign changes it again.
+        let mut none = plain();
+        none.feedback = 0.0;
+        let mut pos = plain();
+        pos.fb_op = 0.0;
+        pos.feedback = 1.0;
+        let mut neg = pos;
+        neg.feedback = -1.0;
+        let render = |params: QuadParams| {
+            let mut v = QuadVoices::new(FS, 256, params);
+            v.note_on(48, 100, 1);
+            run(&mut v, 4_800)
+        };
+        let (a, b, c) = (render(none), render(pos), render(neg));
+        assert!(
+            brightness(&b) > brightness(&a) * 1.5,
+            "{} vs {}",
+            brightness(&b),
+            brightness(&a)
+        );
+        assert!(b.iter().zip(c.iter()).any(|(x, y)| (x - y).abs() > 0.05));
     }
 
     #[test]
     fn the_pitch_envelopes_bend_and_the_second_only_bends_modulators() {
-        // A carrier alone, bent an octave up at the start: the first
-        // hop has twice the zero crossings of the settled tail.
-        let mut params = QuadParams::default();
-        params.ops[1].level = 0.0;
+        let mut params = plain();
         params.pitch1 = 12.0;
         params.p1_rise = 0.0;
         params.p1_fall = 4_000.0;
-        params.fmode = 0.0;
-        params.cutoff = 20_000.0;
         let mut v = QuadVoices::new(FS, 256, params);
         v.note_on(69, 100, 1);
         let early = run(&mut v, 960);
-        let crossings = |xs: &[f32]| {
-            xs.windows(2)
-                .filter(|w| (w[0] < 0.0) != (w[1] < 0.0))
-                .count()
-        };
-        // 440 Hz at an octave up is 880 Hz: about 35 crossings in 20 ms.
         assert!(crossings(&early) > 28, "{}", crossings(&early));
-        // The second envelope bends nothing when only a carrier sounds.
-        let mut params = QuadParams::default();
-        params.ops[1].level = 0.0;
+        let mut params = plain();
         params.pitch2 = 12.0;
         params.p2_fall = 4_000.0;
-        params.cutoff = 20_000.0;
         let mut v = QuadVoices::new(FS, 256, params);
         v.note_on(69, 100, 1);
         let early = run(&mut v, 960);
@@ -824,18 +1160,10 @@ mod tests {
 
     #[test]
     fn waves_fixed_frequency_key_scaling_and_key_rate_do_what_they_say() {
-        let crossings = |xs: &[f32]| {
-            xs.windows(2)
-                .filter(|w| (w[0] < 0.0) != (w[1] < 0.0))
-                .count()
-        };
-        // A carrier alone: each wave is a different sound, all finite.
         let mut last: Vec<f32> = Vec::new();
         for wave in 0..p::WAVE_NAMES.len() {
-            let mut params = QuadParams::default();
-            params.ops[1].level = 0.0;
+            let mut params = plain();
             params.ops[0].wave = wave as f32;
-            params.cutoff = 20_000.0;
             let mut v = QuadVoices::new(FS, 256, params);
             v.note_on(57, 100, 1);
             let out = run(&mut v, 4_800);
@@ -852,32 +1180,20 @@ mod tests {
             }
             last = out;
         }
-        // Fixed: the operator ignores the key.
-        let mut params = QuadParams::default();
-        params.ops[1].level = 0.0;
+        let mut params = plain();
         params.ops[0].fixed = 1.0;
         params.ops[0].hz = 440.0;
-        params.cutoff = 20_000.0;
         let mut low = QuadVoices::new(FS, 256, params);
         let mut high = QuadVoices::new(FS, 256, params);
         low.note_on(45, 100, 1);
         high.note_on(81, 100, 1);
         let a = run(&mut low, 960);
         let b = run(&mut high, 960);
-        assert!(
-            (crossings(&a) as i32 - crossings(&b) as i32).abs() <= 1,
-            "{} vs {}",
-            crossings(&a),
-            crossings(&b)
-        );
-        // Key scaling: -12 dB per octave leaves a note an octave up a quarter as loud.
-        let mut params = QuadParams::default();
-        params.ops[1].level = 0.0;
+        assert!((crossings(&a) as i32 - crossings(&b) as i32).abs() <= 1);
+        let mut params = plain();
         params.ops[0].keyscale = -12.0;
         params.ops[0].vel = 0.0;
         params.velocity = 0.0;
-        params.cutoff = 20_000.0;
-        params.key_rate = 0.0;
         let mut c4 = QuadVoices::new(FS, 256, params);
         let mut c5 = QuadVoices::new(FS, 256, params);
         c4.note_on(60, 100, 1);
@@ -889,13 +1205,10 @@ mod tests {
             (ratio - 0.25).abs() < 0.06,
             "an octave up at -12 dB/oct came out at {ratio}"
         );
-        // Key rate: the same note two octaves up decays sooner.
-        let mut params = QuadParams::default();
-        params.ops[1].level = 0.0;
+        let mut params = plain();
         params.ops[0].sustain = 0.0;
         params.ops[0].decay = 400.0;
         params.key_rate = 1.0;
-        params.cutoff = 20_000.0;
         let mut slow = QuadVoices::new(FS, 256, params);
         let mut fast = QuadVoices::new(FS, 256, params);
         slow.note_on(48, 100, 1);
@@ -905,8 +1218,6 @@ mod tests {
         let a = run(&mut slow, 2_400);
         let b = run(&mut fast, 2_400);
         assert!(rms(&b) < rms(&a) * 0.5, "{} vs {}", rms(&b), rms(&a));
-        // Per-operator velocity: a modulator with full depth brightens
-        // with the key; with none it does not.
         for (depth, expect_more) in [(1.0f32, true), (0.0, false)] {
             let mut params = QuadParams::default();
             params.ops[1].level = 1.0;
@@ -919,18 +1230,182 @@ mod tests {
             let ys = run(&mut soft, 2_400);
             let yh = run(&mut hard, 2_400);
             let brighter = brightness(&yh) > brightness(&ys) * 1.2;
-            assert_eq!(
-                brighter,
-                expect_more,
-                "depth {depth}: {} vs {}",
-                brightness(&yh),
-                brightness(&ys)
-            );
+            assert_eq!(brighter, expect_more, "depth {depth}");
         }
     }
 
     #[test]
-    fn the_filter_envelope_and_velocity_change_the_tone_and_all_sound_off_silences() {
+    fn unison_spreads_the_field_and_width_zero_folds_it_back() {
+        let mut params = plain();
+        params.unison = 4.0;
+        params.udetune = 20.0;
+        params.width = 1.0;
+        let mut wide = QuadVoices::new(FS, 256, params);
+        wide.note_on(57, 100, 1);
+        let l = run(&mut wide, 4_800);
+        let r = wide.right(4_800).to_vec();
+        assert!(l.iter().all(|x| x.is_finite()) && rms(&l) > 0.05);
+        assert!(
+            l.iter().zip(r.iter()).any(|(a, b)| (a - b).abs() > 0.02),
+            "the sides are the same"
+        );
+        params.width = 0.0;
+        let mut narrow = QuadVoices::new(FS, 256, params);
+        narrow.note_on(57, 100, 1);
+        let l = run(&mut narrow, 4_800);
+        let r = narrow.right(4_800).to_vec();
+        assert!(l.iter().zip(r.iter()).all(|(a, b)| (a - b).abs() < 1e-5));
+        // Detuned copies beat: the level breathes where one copy is flat.
+        let mut one = plain();
+        one.unison = 1.0;
+        let mut single = QuadVoices::new(FS, 256, one);
+        single.note_on(57, 100, 1);
+        let _ = run(&mut single, 4_800);
+        let s = run(&mut single, 4_800);
+        let mut detuned = QuadVoices::new(FS, 256, params);
+        detuned.note_on(57, 100, 1);
+        let _ = run(&mut detuned, 4_800);
+        let d = run(&mut detuned, 4_800);
+        let spread = |xs: &[f32]| {
+            let chunks: Vec<f32> = xs.chunks(480).map(rms).collect();
+            let hi = chunks.iter().cloned().fold(0.0f32, f32::max);
+            let lo = chunks.iter().cloned().fold(1.0f32, f32::min);
+            hi - lo
+        };
+        assert!(
+            spread(&d) > spread(&s) * 2.0,
+            "{} vs {}",
+            spread(&d),
+            spread(&s)
+        );
+    }
+
+    #[test]
+    fn mono_holds_one_voice_and_legato_glides_without_retriggering() {
+        let mut params = plain();
+        params.mono = p::MONO_MONO;
+        params.glide = 200.0;
+        let mut v = QuadVoices::new(FS, 256, params);
+        v.note_on(45, 100, 1);
+        let _ = run(&mut v, 2_400);
+        v.note_on(57, 100, 2);
+        let _ = run(&mut v, 64);
+        assert_eq!(v.readout().bands[0], 1.0, "mono sounded two voices");
+        // Just after the second key the pitch is still near the first:
+        // the glide has 200 ms to go.
+        let early = run(&mut v, 2_400);
+        let _ = run(&mut v, 48_000);
+        let late = run(&mut v, 2_400);
+        assert!(
+            crossings(&late) > crossings(&early) + 4,
+            "no glide: {} then {}",
+            crossings(&early),
+            crossings(&late)
+        );
+        // Letting the second key go returns to the first, still held.
+        v.note_off(57);
+        let _ = run(&mut v, 48_000);
+        assert_eq!(v.readout().bands[0], 1.0, "the held key was dropped");
+        let back = run(&mut v, 2_400);
+        assert!(
+            crossings(&back) < crossings(&late),
+            "did not return to the lower key"
+        );
+        v.note_off(45);
+        let _ = run(&mut v, 48_000);
+        assert_eq!(v.readout().bands[0], 0.0);
+        // Legato: a second key while the first is held keeps the
+        // envelope where it was rather than starting over.
+        let mut params = plain();
+        params.mono = p::MONO_LEGATO;
+        params.ops[0].attack = 400.0;
+        let mut v = QuadVoices::new(FS, 256, params);
+        v.note_on(45, 100, 1);
+        let _ = run(&mut v, 24_000);
+        let settled = rms(&run(&mut v, 960));
+        v.note_on(52, 100, 2);
+        let after = rms(&run(&mut v, 960));
+        assert!(
+            after > settled * 0.7,
+            "legato restarted the attack: {settled} -> {after}"
+        );
+        let mut params = plain();
+        params.mono = p::MONO_MONO;
+        params.ops[0].attack = 400.0;
+        let mut v = QuadVoices::new(FS, 256, params);
+        v.note_on(45, 100, 1);
+        let _ = run(&mut v, 24_000);
+        v.note_on(52, 100, 2);
+        let after = rms(&run(&mut v, 960));
+        assert!(
+            after < settled * 0.5,
+            "mono did not retrigger: {settled} -> {after}"
+        );
+    }
+
+    #[test]
+    fn the_lfos_wobble_pitch_breathe_level_and_brighten_and_wait_their_delay() {
+        // Vibrato: the pitch differs between the halves of a cycle.
+        let mut params = plain();
+        params.lfos[0].rate = 2.0;
+        params.lfos[0].pitch = 12.0;
+        let mut v = QuadVoices::new(FS, 256, params);
+        v.note_on(57, 100, 1);
+        let a = run(&mut v, 2_400);
+        let _ = run(&mut v, 9_600);
+        let b = run(&mut v, 2_400);
+        assert!(
+            (crossings(&a) as i32 - crossings(&b) as i32).abs() > 6,
+            "{} vs {}",
+            crossings(&a),
+            crossings(&b)
+        );
+        // Tremolo: the level breathes.
+        let mut params = plain();
+        params.lfos[1].rate = 2.0;
+        params.lfos[1].amp = 1.0;
+        let mut v = QuadVoices::new(FS, 256, params);
+        v.note_on(57, 100, 1);
+        let _ = run(&mut v, 4_800);
+        let loud = rms(&run(&mut v, 1_200));
+        let _ = run(&mut v, 9_600);
+        let quiet = rms(&run(&mut v, 1_200));
+        assert!(
+            (loud - quiet).abs() > loud.max(quiet) * 0.4,
+            "{loud} vs {quiet}"
+        );
+        // Delay: for the first half second an LFO with a delay does nothing.
+        let mut params = plain();
+        params.lfos[0].rate = 6.0;
+        params.lfos[0].amp = 1.0;
+        params.lfos[0].delay = 500.0;
+        let mut v = QuadVoices::new(FS, 256, params);
+        v.note_on(57, 100, 1);
+        let _ = run(&mut v, 2_400);
+        let steady: Vec<f32> = run(&mut v, 9_600).chunks(480).map(rms).collect();
+        let wobble = steady.iter().cloned().fold(0.0f32, f32::max)
+            - steady.iter().cloned().fold(1.0f32, f32::min);
+        assert!(wobble < 0.05, "the LFO did not wait: {wobble}");
+        // Brightness: an LFO on the modulators moves the harmonics.
+        let mut params = QuadParams::default();
+        params.ops[1].level = 1.0;
+        params.lfos[0].rate = 1.0;
+        params.lfos[0].modulators = 1.0;
+        params.lfos[0].shape = 2.0;
+        let mut v = QuadVoices::new(FS, 256, params);
+        v.note_on(48, 100, 1);
+        let up = brightness(&run(&mut v, 4_800));
+        let _ = run(&mut v, 19_200);
+        let down = brightness(&run(&mut v, 4_800));
+        assert!((up - down).abs() > up.max(down) * 0.3, "{up} vs {down}");
+        let mut v = QuadVoices::new(FS, 256, params);
+        v.note_on(48, 100, 1);
+        v.all_sound_off();
+        assert!(run(&mut v, 256).iter().all(|x| *x == 0.0));
+    }
+
+    #[test]
+    fn the_filter_envelope_and_velocity_change_the_tone() {
         let mut open = QuadParams::default();
         open.ops[1].level = 1.0;
         open.cutoff = 300.0;
@@ -944,12 +1419,7 @@ mod tests {
         b.note_on(48, 100, 1);
         let ya = run(&mut a, 2_400);
         let yb = run(&mut b, 2_400);
-        assert!(
-            brightness(&ya) > brightness(&yb) * 1.5,
-            "{} vs {}",
-            brightness(&ya),
-            brightness(&yb)
-        );
+        assert!(brightness(&ya) > brightness(&yb) * 1.5);
         let mut soft = QuadParams::default();
         soft.ops[1].level = 1.0;
         soft.velocity = 1.0;
@@ -960,8 +1430,5 @@ mod tests {
         let ys = run(&mut s, 2_400);
         let yh = run(&mut h, 2_400);
         assert!(rms(&yh) > rms(&ys) * 2.0);
-        assert!(brightness(&yh) > brightness(&ys));
-        h.all_sound_off();
-        assert!(run(&mut h, 256).iter().all(|x| *x == 0.0));
     }
 }

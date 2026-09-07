@@ -45,7 +45,22 @@ const OP2K: [u32; 5] = op_key_row(1);
 const OP3K: [u32; 5] = op_key_row(2);
 const OP4K: [u32; 5] = op_key_row(3);
 
-const PAGES: [(&str, &[u32]); 11] = [
+const fn lfo_row(lfo: usize) -> [u32; 8] {
+    [
+        qp::lfo_param(lfo, qp::LFO_RATE),
+        qp::lfo_param(lfo, qp::LFO_SHAPE),
+        qp::lfo_param(lfo, qp::LFO_DELAY),
+        qp::lfo_param(lfo, qp::LFO_FADE),
+        qp::lfo_param(lfo, qp::LFO_PITCH),
+        qp::lfo_param(lfo, qp::LFO_MOD),
+        qp::lfo_param(lfo, qp::LFO_AMP),
+        qp::lfo_param(lfo, qp::LFO_FILTER),
+    ]
+}
+const LFO1: [u32; 8] = lfo_row(0);
+const LFO2: [u32; 8] = lfo_row(1);
+
+const PAGES: [(&str, &[u32]); 14] = [
     ("op 1", &OP1),
     ("1 key", &OP1K),
     ("op 2", &OP2),
@@ -59,6 +74,7 @@ const PAGES: [(&str, &[u32]); 11] = [
         &[
             qp::ALGO,
             qp::FEEDBACK,
+            qp::FB_OP,
             qp::PITCH1,
             qp::PITCH1_RISE,
             qp::PITCH1_FALL,
@@ -80,6 +96,12 @@ const PAGES: [(&str, &[u32]); 11] = [
         ],
     ),
     (
+        "voice",
+        &[qp::UNISON, qp::UDETUNE, qp::WIDTH, qp::MONO, qp::GLIDE],
+    ),
+    ("lfo 1", &LFO1),
+    ("lfo 2", &LFO2),
+    (
         "out",
         &[qp::DIST, qp::DRIVE, qp::VELOCITY, qp::LEVEL, qp::KEY_RATE],
     ),
@@ -88,13 +110,13 @@ const PAGES: [(&str, &[u32]); 11] = [
 const CELL_UNITS: usize = 2;
 const FOOTER_ROWS: usize = CELL_UNITS;
 const HEADER_ROWS: usize = 1;
-const COUNT: usize = 68;
+const COUNT: usize = 90;
 
 pub fn pages() -> usize {
     PAGES.len()
 }
 
-/// Sixty-eight cells: past serde's array limit, and never persisted —
+/// Ninety cells: past serde's array limit, and never persisted —
 /// the rack rebuilds it from the engine's knobs every frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct QuadUi {
@@ -138,8 +160,15 @@ fn percent_row(param: u32) -> bool {
         Some((_, qp::LEVEL_OP)) | Some((_, qp::SUSTAIN)) | Some((_, qp::VEL))
     ) || matches!(
         param,
-        qp::FEEDBACK | qp::KEYTRACK | qp::VELOCITY | qp::KEY_RATE
-    )
+        qp::KEYTRACK | qp::VELOCITY | qp::KEY_RATE | qp::WIDTH
+    ) || matches!(lfo_field(param), Some(qp::LFO_MOD) | Some(qp::LFO_AMP))
+}
+
+/// Which LFO field a row is, if it is one.
+fn lfo_field(param: u32) -> Option<u32> {
+    (qp::LFO1_RATE..qp::LFO1_RATE + qp::PER_LFO * qp::LFOS as u32)
+        .contains(&param)
+        .then(|| (param - qp::LFO1_RATE) % qp::PER_LFO)
 }
 
 fn param_of(id: u32) -> Param {
@@ -183,7 +212,31 @@ fn param_of(id: u32) -> Param {
     } else {
         match id {
             qp::ALGO => Param::choice("algo", qp::ALGO_NAMES),
-            qp::FEEDBACK => Param::percent("feedback"),
+            qp::FEEDBACK => Param::new(
+                "feedback",
+                Mapping::Linear {
+                    min: -100.0,
+                    max: 100.0,
+                },
+                Unit::Percent,
+            )
+            .bipolar(),
+            qp::FB_OP => Param::choice("fb op", qp::FB_OP_NAMES),
+            qp::UNISON => Param::choice("unison", qp::UNISON_NAMES),
+            qp::UDETUNE => linear("detune", Unit::Cents),
+            qp::WIDTH => Param::percent("width"),
+            qp::MONO => Param::choice("mode", qp::MONO_NAMES),
+            qp::GLIDE => linear("glide", Unit::Ms),
+            _ if lfo_field(id) == Some(qp::LFO_RATE) => log("rate", Unit::Hz),
+            _ if lfo_field(id) == Some(qp::LFO_SHAPE) => {
+                Param::choice("shape", qp::LFO_SHAPE_NAMES)
+            }
+            _ if lfo_field(id) == Some(qp::LFO_DELAY) => linear("delay", Unit::Ms),
+            _ if lfo_field(id) == Some(qp::LFO_FADE) => linear("fade", Unit::Ms),
+            _ if lfo_field(id) == Some(qp::LFO_PITCH) => linear("pitch", Unit::Semitones),
+            _ if lfo_field(id) == Some(qp::LFO_MOD) => Param::percent("mod"),
+            _ if lfo_field(id) == Some(qp::LFO_AMP) => Param::percent("amp"),
+            _ if lfo_field(id) == Some(qp::LFO_FILTER) => linear("filter", Unit::Plain).bipolar(),
             qp::PITCH1 => linear("pitch 1", Unit::Semitones).bipolar(),
             qp::PITCH1_RISE => linear("rise 1", Unit::Ms),
             qp::PITCH1_FALL => log("fall 1", Unit::Ms),
@@ -208,7 +261,11 @@ fn param_of(id: u32) -> Param {
 }
 
 fn shown(param: u32, value: f32) -> f32 {
-    if param == qp::LEVEL {
+    if param == qp::UNISON {
+        value - 1.0
+    } else if param == qp::FEEDBACK {
+        value * 100.0
+    } else if param == qp::LEVEL {
         value / qp::LEVEL_MAX * 100.0
     } else if percent_row(param) {
         value * 100.0
@@ -218,7 +275,11 @@ fn shown(param: u32, value: f32) -> f32 {
 }
 
 fn natural(param: u32, value: f32) -> f32 {
-    let raw = if param == qp::LEVEL {
+    let raw = if param == qp::UNISON {
+        value + 1.0
+    } else if param == qp::FEEDBACK {
+        value / 100.0
+    } else if param == qp::LEVEL {
         value / 100.0 * qp::LEVEL_MAX
     } else if percent_row(param) {
         value / 100.0
@@ -238,7 +299,11 @@ pub fn quad_norm(param: u32, value: f32) -> f32 {
 
 pub fn quad_is_discrete(param: u32) -> bool {
     matches!(qp::op_of(param), Some((_, qp::WAVE)) | Some((_, qp::FIXED)))
-        || matches!(param, qp::ALGO | qp::FMODE | qp::DIST)
+        || matches!(
+            param,
+            qp::ALGO | qp::FMODE | qp::DIST | qp::FB_OP | qp::UNISON | qp::MONO
+        )
+        || lfo_field(param) == Some(qp::LFO_SHAPE)
 }
 
 pub fn quad_is_log(param: u32) -> bool {
@@ -248,7 +313,7 @@ pub fn quad_is_log(param: u32) -> bool {
     ) || matches!(
         param,
         qp::PITCH1_FALL | qp::PITCH2_FALL | qp::CUTOFF | qp::RESO | qp::FENV_DEC | qp::DRIVE
-    )
+    ) || lfo_field(param) == Some(qp::LFO_RATE)
 }
 
 pub fn quad_edits(state: &QuadUi) -> Vec<ParamEdit> {
@@ -630,6 +695,8 @@ mod tests {
         assert_eq!((depth(serial, 0), depth(serial, 3)), (0, 3));
         let flat = qp::ALGORITHMS[7];
         assert!((0..qp::OPS).all(|op| depth(flat, op) == 0));
+        assert_eq!(lfo_field(qp::LFO2_AMP), Some(qp::LFO_AMP));
+        assert_eq!(lfo_field(qp::GLIDE), None);
         assert!(quad_is_discrete(qp::ALGO) && !quad_is_discrete(qp::CUTOFF));
         assert!(quad_is_log(qp::op_param(2, qp::RATIO)) && !quad_is_log(qp::FEEDBACK));
     }

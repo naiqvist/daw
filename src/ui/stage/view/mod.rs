@@ -16,6 +16,7 @@ mod browser;
 mod callouts;
 mod chassis;
 mod desk;
+mod face;
 mod faces;
 mod forge;
 mod heads;
