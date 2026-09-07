@@ -27,6 +27,7 @@ mod log;
 mod mixer;
 mod modulation;
 mod palette;
+mod quad_card;
 mod room;
 mod sample;
 mod sampler_card;

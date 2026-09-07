@@ -386,6 +386,484 @@ pub mod stab {
     }
 }
 
+/// QUAD: the four-operator FM workhorse. See [`crate::audio::quad`].
+pub mod quad {
+    use super::ParamDef;
+
+    /// The operators' rows: seven per operator, in this order, so an
+    /// operator's parameter id is `op * PER_OP + field`.
+    pub const OPS: usize = 4;
+    pub const PER_OP: u32 = 7;
+    pub const RATIO: u32 = 0;
+    pub const FINE: u32 = 1;
+    pub const LEVEL_OP: u32 = 2;
+    pub const ATTACK: u32 = 3;
+    pub const DECAY: u32 = 4;
+    pub const SUSTAIN: u32 = 5;
+    pub const RELEASE: u32 = 6;
+    /// Operator `op` (from zero), field `field`.
+    pub const fn op_param(op: usize, field: u32) -> u32 {
+        op as u32 * PER_OP + field
+    }
+    /// Which operator and field a row is, if it is an operator's.
+    pub fn op_of(param: u32) -> Option<(usize, u32)> {
+        (param < OPS as u32 * PER_OP).then(|| ((param / PER_OP) as usize, param % PER_OP))
+    }
+
+    pub const ALGO: u32 = 28;
+    pub const FEEDBACK: u32 = 29;
+    pub const PITCH1: u32 = 30;
+    pub const PITCH1_RISE: u32 = 31;
+    pub const PITCH1_FALL: u32 = 32;
+    pub const PITCH2: u32 = 33;
+    pub const PITCH2_RISE: u32 = 34;
+    pub const PITCH2_FALL: u32 = 35;
+    pub const FMODE: u32 = 36;
+    pub const CUTOFF: u32 = 37;
+    pub const RESO: u32 = 38;
+    pub const FENV: u32 = 39;
+    pub const FENV_ATT: u32 = 40;
+    pub const FENV_DEC: u32 = 41;
+    pub const KEYTRACK: u32 = 42;
+    pub const DIST: u32 = 43;
+    pub const DRIVE: u32 = 44;
+    pub const VELOCITY: u32 = 45;
+    pub const LEVEL: u32 = 46;
+
+    pub const ALGO_NAMES: &[&str] = &[
+        "4>3>2>1",
+        "4>3>1 2>1",
+        "4>2 3>2>1",
+        "4>3>2 +1",
+        "4>3 2>1",
+        "4,3,2>1",
+        "4>3 +2 +1",
+        "1+2+3+4",
+    ];
+    pub const FMODE_NAMES: &[&str] = &["lp", "hp", "bp", "notch"];
+    pub const DIST_NAMES: &[&str] = &["off", "soft", "hard", "fold"];
+    pub const LEVEL_MAX: f32 = 2.0;
+
+    /// A routing shape: which operator modulates which, and which
+    /// operators are heard. Operators are numbered from one as on the
+    /// panel; the arrays index from zero.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Algorithm {
+        /// `(modulator, carrier)` pairs, modulator into carrier.
+        pub edges: &'static [(usize, usize)],
+        /// The operators that reach the output.
+        pub carriers: &'static [usize],
+    }
+
+    pub const ALGORITHMS: [Algorithm; 8] = [
+        Algorithm {
+            edges: &[(3, 2), (2, 1), (1, 0)],
+            carriers: &[0],
+        },
+        Algorithm {
+            edges: &[(3, 2), (2, 0), (1, 0)],
+            carriers: &[0],
+        },
+        Algorithm {
+            edges: &[(3, 1), (2, 1), (1, 0)],
+            carriers: &[0],
+        },
+        Algorithm {
+            edges: &[(3, 2), (2, 1)],
+            carriers: &[1, 0],
+        },
+        Algorithm {
+            edges: &[(3, 2), (1, 0)],
+            carriers: &[2, 0],
+        },
+        Algorithm {
+            edges: &[(3, 0), (2, 0), (1, 0)],
+            carriers: &[0],
+        },
+        Algorithm {
+            edges: &[(3, 2)],
+            carriers: &[2, 1, 0],
+        },
+        Algorithm {
+            edges: &[],
+            carriers: &[3, 2, 1, 0],
+        },
+    ];
+
+    pub fn algorithm(index: f32) -> Algorithm {
+        ALGORITHMS[(index.round().max(0.0) as usize).min(ALGORITHMS.len() - 1)]
+    }
+
+    /// Whether operator `op` is a modulator in `algo` — the ones the
+    /// second pitch envelope bends.
+    pub fn is_modulator(algo: Algorithm, op: usize) -> bool {
+        algo.edges.iter().any(|(m, _)| *m == op)
+    }
+
+    pub const TABLE: &[ParamDef] = &[
+        ParamDef {
+            id: 0,
+            name: "op1 ratio",
+            min: 0.2,
+            max: 16.0,
+            default: 1.0,
+        },
+        ParamDef {
+            id: 1,
+            name: "op1 fine",
+            min: -100.0,
+            max: 100.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: 2,
+            name: "op1 level",
+            min: 0.0,
+            max: 1.0,
+            default: 1.0,
+        },
+        ParamDef {
+            id: 3,
+            name: "op1 attack",
+            min: 0.0,
+            max: 2000.0,
+            default: 1.0,
+        },
+        ParamDef {
+            id: 4,
+            name: "op1 decay",
+            min: 1.0,
+            max: 4000.0,
+            default: 800.0,
+        },
+        ParamDef {
+            id: 5,
+            name: "op1 sustain",
+            min: 0.0,
+            max: 1.0,
+            default: 0.7,
+        },
+        ParamDef {
+            id: 6,
+            name: "op1 release",
+            min: 1.0,
+            max: 4000.0,
+            default: 250.0,
+        },
+        ParamDef {
+            id: 7,
+            name: "op2 ratio",
+            min: 0.2,
+            max: 16.0,
+            default: 2.0,
+        },
+        ParamDef {
+            id: 8,
+            name: "op2 fine",
+            min: -100.0,
+            max: 100.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: 9,
+            name: "op2 level",
+            min: 0.0,
+            max: 1.0,
+            default: 0.6,
+        },
+        ParamDef {
+            id: 10,
+            name: "op2 attack",
+            min: 0.0,
+            max: 2000.0,
+            default: 1.0,
+        },
+        ParamDef {
+            id: 11,
+            name: "op2 decay",
+            min: 1.0,
+            max: 4000.0,
+            default: 400.0,
+        },
+        ParamDef {
+            id: 12,
+            name: "op2 sustain",
+            min: 0.0,
+            max: 1.0,
+            default: 0.3,
+        },
+        ParamDef {
+            id: 13,
+            name: "op2 release",
+            min: 1.0,
+            max: 4000.0,
+            default: 250.0,
+        },
+        ParamDef {
+            id: 14,
+            name: "op3 ratio",
+            min: 0.2,
+            max: 16.0,
+            default: 1.0,
+        },
+        ParamDef {
+            id: 15,
+            name: "op3 fine",
+            min: -100.0,
+            max: 100.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: 16,
+            name: "op3 level",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: 17,
+            name: "op3 attack",
+            min: 0.0,
+            max: 2000.0,
+            default: 1.0,
+        },
+        ParamDef {
+            id: 18,
+            name: "op3 decay",
+            min: 1.0,
+            max: 4000.0,
+            default: 400.0,
+        },
+        ParamDef {
+            id: 19,
+            name: "op3 sustain",
+            min: 0.0,
+            max: 1.0,
+            default: 0.3,
+        },
+        ParamDef {
+            id: 20,
+            name: "op3 release",
+            min: 1.0,
+            max: 4000.0,
+            default: 250.0,
+        },
+        ParamDef {
+            id: 21,
+            name: "op4 ratio",
+            min: 0.2,
+            max: 16.0,
+            default: 1.0,
+        },
+        ParamDef {
+            id: 22,
+            name: "op4 fine",
+            min: -100.0,
+            max: 100.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: 23,
+            name: "op4 level",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: 24,
+            name: "op4 attack",
+            min: 0.0,
+            max: 2000.0,
+            default: 1.0,
+        },
+        ParamDef {
+            id: 25,
+            name: "op4 decay",
+            min: 1.0,
+            max: 4000.0,
+            default: 400.0,
+        },
+        ParamDef {
+            id: 26,
+            name: "op4 sustain",
+            min: 0.0,
+            max: 1.0,
+            default: 0.3,
+        },
+        ParamDef {
+            id: 27,
+            name: "op4 release",
+            min: 1.0,
+            max: 4000.0,
+            default: 250.0,
+        },
+        ParamDef {
+            id: ALGO,
+            name: "algo",
+            min: 0.0,
+            max: 7.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: FEEDBACK,
+            name: "feedback",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: PITCH1,
+            name: "pitch 1",
+            min: -48.0,
+            max: 48.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: PITCH1_RISE,
+            name: "p1 rise",
+            min: 0.0,
+            max: 2000.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: PITCH1_FALL,
+            name: "p1 fall",
+            min: 1.0,
+            max: 4000.0,
+            default: 200.0,
+        },
+        ParamDef {
+            id: PITCH2,
+            name: "pitch 2",
+            min: -48.0,
+            max: 48.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: PITCH2_RISE,
+            name: "p2 rise",
+            min: 0.0,
+            max: 2000.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: PITCH2_FALL,
+            name: "p2 fall",
+            min: 1.0,
+            max: 4000.0,
+            default: 200.0,
+        },
+        ParamDef {
+            id: FMODE,
+            name: "filter",
+            min: 0.0,
+            max: 3.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: CUTOFF,
+            name: "cutoff",
+            min: 20.0,
+            max: 20000.0,
+            default: 12000.0,
+        },
+        ParamDef {
+            id: RESO,
+            name: "reso",
+            min: 0.5,
+            max: 20.0,
+            default: 0.8,
+        },
+        ParamDef {
+            id: FENV,
+            name: "f env",
+            min: -6.0,
+            max: 6.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: FENV_ATT,
+            name: "f attack",
+            min: 0.0,
+            max: 2000.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: FENV_DEC,
+            name: "f decay",
+            min: 1.0,
+            max: 4000.0,
+            default: 300.0,
+        },
+        ParamDef {
+            id: KEYTRACK,
+            name: "keytrack",
+            min: 0.0,
+            max: 1.0,
+            default: 0.5,
+        },
+        ParamDef {
+            id: DIST,
+            name: "dist",
+            min: 0.0,
+            max: 3.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: DRIVE,
+            name: "drive",
+            min: 1.0,
+            max: 32.0,
+            default: 1.0,
+        },
+        ParamDef {
+            id: VELOCITY,
+            name: "velocity",
+            min: 0.0,
+            max: 1.0,
+            default: 0.6,
+        },
+        ParamDef {
+            id: LEVEL,
+            name: "level",
+            min: 0.0,
+            max: 2.0,
+            default: 0.8,
+        },
+    ];
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn ids_are_positions_and_algorithms_are_well_formed() {
+            for (i, def) in TABLE.iter().enumerate() {
+                assert_eq!(def.id, i as u32, "{}", def.name);
+            }
+            assert_eq!(op_of(op_param(2, SUSTAIN)), Some((2, SUSTAIN)));
+            assert_eq!(op_of(ALGO), None);
+            assert_eq!(ALGO_NAMES.len(), ALGORITHMS.len());
+            for algo in ALGORITHMS {
+                assert!(!algo.carriers.is_empty());
+                for (m, c) in algo.edges {
+                    assert!(*m > *c, "modulators sit above their carriers: {m}>{c}");
+                    assert!(*m < OPS && *c < OPS);
+                }
+                // Every operator is heard or heard through: nothing is dead.
+                for op in 0..OPS {
+                    assert!(
+                        algo.carriers.contains(&op) || algo.edges.iter().any(|(m, _)| *m == op),
+                        "{algo:?}: op {op} goes nowhere"
+                    );
+                }
+            }
+            assert!(is_modulator(ALGORITHMS[0], 3) && !is_modulator(ALGORITHMS[0], 0));
+            assert!(!is_modulator(ALGORITHMS[7], 3));
+        }
+    }
+}
+
 /// sCOMP: a sine, squashed into a sound. See [`crate::scomp`].
 pub mod scomp {
     use super::ParamDef;

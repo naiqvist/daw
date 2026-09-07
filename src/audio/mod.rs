@@ -36,6 +36,7 @@ pub mod poly;
 pub mod preamp;
 pub mod prism;
 pub mod project;
+pub mod quad;
 pub mod resyn;
 pub mod sampler;
 pub mod scomp;

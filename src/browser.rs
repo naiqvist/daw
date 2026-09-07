@@ -130,6 +130,10 @@ impl Default for Browser {
                                     load: DeviceKind::Stab,
                                 },
                                 BrowserItem {
+                                    name: "Quad",
+                                    load: DeviceKind::Quad,
+                                },
+                                BrowserItem {
                                     name: "Haze",
                                     load: DeviceKind::Haze,
                                 },

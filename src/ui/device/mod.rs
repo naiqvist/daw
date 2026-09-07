@@ -118,6 +118,7 @@ pub mod prism;
 /// broken once. Nothing references it outside tests, so it costs a
 /// release build nothing.
 pub mod probe;
+pub mod quad;
 pub mod rack;
 pub mod readout;
 pub mod resyn;

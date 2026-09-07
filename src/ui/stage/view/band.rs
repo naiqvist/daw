@@ -270,6 +270,8 @@ impl Stage {
                             super::scomp_card::WIDTH
                         } else if column.stab.is_some() {
                             super::stab_card::WIDTH
+                        } else if column.quad.is_some() {
+                            super::quad_card::WIDTH
                         } else {
                             CHAIN_W
                         }
@@ -398,6 +400,19 @@ impl Stage {
         }
         for (index, rect) in &layout {
             if columns[*index].section.is_some() {
+                continue;
+            }
+            if columns[*index].quad.is_some() {
+                self.draw_quad_chain_card(
+                    ui,
+                    *rect,
+                    &columns[*index],
+                    *index,
+                    cursor,
+                    self.chain_offset,
+                    rows_shown,
+                    head_h,
+                );
                 continue;
             }
             if columns[*index].stab.is_some() {

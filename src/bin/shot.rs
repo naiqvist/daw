@@ -1332,6 +1332,27 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
             }
         }
         let _ = stage.apply(StageIntent::Mix);
+    } else if which.contains("quad") {
+        // QUAD on the first track, a bright two-operator bell with a
+        // pitch bend and the band open on it.
+        let id = stage
+            .song_mut()
+            .add_device(0, daw::devices::DeviceKind::Quad)
+            .expect("a quad");
+        if let Some(device) = stage.song_mut().device_mut(id) {
+            use daw::params::quad as q;
+            device.set(q::ALGO, 3.0);
+            device.set(q::op_param(1, q::LEVEL_OP), 0.8);
+            device.set(q::op_param(2, q::LEVEL_OP), 0.6);
+            device.set(q::op_param(3, q::LEVEL_OP), 0.5);
+            device.set(q::op_param(3, q::RATIO), 3.5);
+            device.set(q::FEEDBACK, 0.3);
+            device.set(q::PITCH2, 7.0);
+            device.set(q::FENV, 2.0);
+            device.set(q::DIST, 1.0);
+            device.set(q::DRIVE, 3.0);
+        }
+        let _ = stage.apply(StageIntent::Devices);
     } else if which.contains("stab") {
         // STAB on the first track, voiced as a ninth in second inversion,
         // and the band open on it. `-browse` opens the browser instead.
@@ -1871,6 +1892,11 @@ fn draw(which: &str, ui: &mut egui::Ui, theme: &Theme, subject: &mut Subject) {
                 },
                 &history,
             );
+        }
+        "quad" => {
+            let mut state = device::quad::QuadUi::default();
+            let mut page = 0;
+            device::quad::quad_card(ui, theme, &mut state, &mut page, 2.0);
         }
         "stab" => {
             let mut state = device::stab::StabUi::default();

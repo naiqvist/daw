@@ -213,6 +213,22 @@ impl StabFace {
     }
 }
 
+/// What a QUAD card draws from: the knobs as the device holds them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct QuadFace {
+    pub params: crate::audio::quad::QuadParams,
+}
+
+impl QuadFace {
+    pub fn from_device(device: &Device) -> Self {
+        let mut params = crate::audio::quad::QuadParams::default();
+        for (id, value) in &device.overrides {
+            params.set(*id, *value);
+        }
+        Self { params }
+    }
+}
+
 /// One device, as a column of the band.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Column {
@@ -239,6 +255,9 @@ pub struct Column {
     /// The chord-facing state for a STAB card; absent on every other
     /// device.
     pub stab: Option<StabFace>,
+    /// The routing-facing state for a QUAD card; absent on every other
+    /// device.
+    pub quad: Option<QuadFace>,
     pub rows: Vec<Row>,
     /// Which section of the console this column is, when it is one:
     /// drawn as a piece of the strip rather than as a card.
@@ -333,6 +352,7 @@ pub fn column(device: &Device) -> Column {
         sampler: (device.kind == DeviceKind::Sampler).then(|| SamplerFace::from_device(device)),
         scomp: (device.kind == DeviceKind::Scomp).then(|| ScompFace::from_device(device)),
         stab: (device.kind == DeviceKind::Stab).then(|| StabFace::from_device(device)),
+        quad: (device.kind == DeviceKind::Quad).then(|| QuadFace::from_device(device)),
         section: match device.kind {
             crate::devices::DeviceKind::Console(kind) => Some(kind),
             _ => None,

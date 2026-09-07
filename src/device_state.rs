@@ -247,6 +247,7 @@ pub enum DeviceState {
     Tine(daw::audio::tine::TineParams),
     Scomp(daw::scomp::ScompParams),
     Stab(daw::audio::stab::StabParams),
+    Quad(daw::audio::quad::QuadParams),
     Haze(daw::audio::haze::HazeParams),
     Sampler(daw::audio::sampler::SamplerParams),
     Kick(daw::audio::kick::KickParams),
@@ -305,6 +306,7 @@ impl DeviceState {
             DeviceKind::Tine => Self::Tine(daw::audio::tine::TineParams::default()),
             DeviceKind::Scomp => Self::Scomp(daw::scomp::ScompParams::default()),
             DeviceKind::Stab => Self::Stab(daw::audio::stab::StabParams::default()),
+            DeviceKind::Quad => Self::Quad(daw::audio::quad::QuadParams::default()),
             DeviceKind::Haze => Self::Haze(daw::audio::haze::HazeParams::default()),
             DeviceKind::Sampler => Self::Sampler(daw::audio::sampler::SamplerParams::default()),
             DeviceKind::Kick => Self::Kick(daw::audio::kick::KickParams::default()),
@@ -353,6 +355,7 @@ impl DeviceState {
             Self::Tine(_) => DeviceKind::Tine,
             Self::Scomp(_) => DeviceKind::Scomp,
             Self::Stab(_) => DeviceKind::Stab,
+            Self::Quad(_) => DeviceKind::Quad,
             Self::Haze(_) => DeviceKind::Haze,
             Self::Sampler(_) => DeviceKind::Sampler,
             Self::Kick(_) => DeviceKind::Kick,
@@ -410,6 +413,7 @@ impl DeviceState {
             Self::Tine(p) => p.get(param),
             Self::Scomp(p) => p.get(param),
             Self::Stab(p) => p.get(param),
+            Self::Quad(p) => p.get(param),
             Self::Haze(p) => p.get(param),
             Self::Flint(p) => p.get(param),
             Self::Sibyl(p) => p.get(param),
@@ -541,6 +545,7 @@ impl DeviceState {
             Self::Tine(p) => p.set(param, value),
             Self::Scomp(p) => p.set(param, value),
             Self::Stab(p) => p.set(param, value),
+            Self::Quad(p) => p.set(param, value),
             Self::Haze(p) => p.set(param, value),
             Self::Flint(p) => p.set(param, value),
             Self::Sibyl(p) => p.set(param, value),
@@ -930,6 +935,7 @@ pub fn card_pages(kind: DeviceKind) -> usize {
         DeviceKind::Sampler => device::sampler::pages(),
         DeviceKind::Scomp => device::scomp::pages(),
         DeviceKind::Stab => device::stab::pages(),
+        DeviceKind::Quad => device::quad::pages(),
         _ => 1,
     }
 }
@@ -955,6 +961,14 @@ pub fn stab_knobs(params: daw::audio::stab::StabParams) -> device::stab::StabUi 
         params
             .get(id)
             .unwrap_or_else(|| daw::params::def(daw::params::stab::TABLE, id).default)
+    })
+}
+
+pub fn quad_knobs(params: daw::audio::quad::QuadParams) -> device::quad::QuadUi {
+    device::quad::QuadUi::from_engine(|id| {
+        params
+            .get(id)
+            .unwrap_or_else(|| daw::params::def(daw::params::quad::TABLE, id).default)
     })
 }
 
@@ -1070,6 +1084,7 @@ pub fn device_norm(kind: DeviceKind, param: u32, value: f32) -> f32 {
         DeviceKind::Tine => device::tine::tine_norm(param, value),
         DeviceKind::Scomp => device::scomp::scomp_norm(param, value),
         DeviceKind::Stab => device::stab::stab_norm(param, value),
+        DeviceKind::Quad => device::quad::quad_norm(param, value),
         DeviceKind::Haze => device::haze::haze_norm(param, value),
         DeviceKind::Sampler => device::sampler_norm(param, value),
         DeviceKind::Kick => device::kick::kick_norm(param, value),
@@ -1131,6 +1146,7 @@ pub fn device_is_discrete(kind: DeviceKind, param: u32) -> bool {
         DeviceKind::Tine => false,
         DeviceKind::Scomp => device::scomp::scomp_is_discrete(param),
         DeviceKind::Stab => device::stab::stab_is_discrete(param),
+        DeviceKind::Quad => device::quad::quad_is_discrete(param),
         // Nothing on the pad synth snaps: every row is a sweep.
         DeviceKind::Haze => false,
         DeviceKind::Sampler => device::sampler_is_discrete(param),
@@ -1191,6 +1207,7 @@ pub fn device_is_log(kind: DeviceKind, param: u32) -> bool {
         DeviceKind::Tine => false,
         DeviceKind::Scomp => device::scomp::scomp_is_log(param),
         DeviceKind::Stab => device::stab::stab_is_log(param),
+        DeviceKind::Quad => device::quad::quad_is_log(param),
         DeviceKind::Haze => device::haze::haze_is_log(param),
         DeviceKind::Sampler => device::sampler_is_log(param),
         DeviceKind::Kick => device::kick::kick_is_log(param),
@@ -1249,6 +1266,7 @@ pub fn device_value(kind: DeviceKind, param: u32, norm: f32) -> f32 {
         DeviceKind::Tine => device::tine::tine_value(param, norm),
         DeviceKind::Scomp => device::scomp::scomp_value(param, norm),
         DeviceKind::Stab => device::stab::stab_value(param, norm),
+        DeviceKind::Quad => device::quad::quad_value(param, norm),
         DeviceKind::Haze => device::haze::haze_value(param, norm),
         DeviceKind::Sampler => device::sampler_value(param, norm),
         DeviceKind::Kick => device::kick::kick_value(param, norm),
