@@ -403,7 +403,7 @@ impl Stage {
                 continue;
             }
             if columns[*index].quad.is_some() {
-                self.draw_quad_chain_card(
+                if self.draw_quad_chain_card(
                     ui,
                     *rect,
                     &columns[*index],
@@ -412,7 +412,9 @@ impl Stage {
                     self.chain_offset,
                     rows_shown,
                     head_h,
-                );
+                ) {
+                    open_forge = Some(*index);
+                }
                 continue;
             }
             if columns[*index].stab.is_some() {

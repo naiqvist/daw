@@ -8,9 +8,11 @@
 use super::heads;
 use super::{chassis, palette};
 use crate::PROFONT;
+use crate::audio::quad::QuadParams;
+use crate::params::quad as qp;
 use crate::params::scomp as sp;
 use crate::ui::stage::chain;
-use crate::ui::stage::forge::{Forge, ROWS};
+use crate::ui::stage::forge::{Forge, Subject};
 use eframe::egui;
 use egui::Color32;
 
@@ -28,16 +30,70 @@ fn alpha(c: Color32, a: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
 }
 
-fn legend() -> [(&'static str, &'static str); 8] {
-    [
-        ("Up Dn", "row"),
-        ("< >", "turn"),
-        ("+< >", "coarse"),
-        ("Tab", "group"),
-        ("R", "reset"),
-        (", .", "pass"),
-        ("0-8", "show"),
-        ("Esc", "leave"),
+fn legend(subject: Subject) -> [(&'static str, &'static str); 8] {
+    match subject {
+        Subject::Scomp => [
+            ("Up Dn", "row"),
+            ("< >", "turn"),
+            ("+< >", "coarse"),
+            ("Tab", "group"),
+            ("R", "reset"),
+            (", .", "pass"),
+            ("0-8", "show"),
+            ("Esc", "leave"),
+        ],
+        Subject::Quad => [
+            ("Up Dn", "row"),
+            ("< >", "turn"),
+            ("+< >", "coarse"),
+            ("Tab", "group"),
+            ("R", "reset"),
+            (", .", "operator"),
+            ("0-3", "show"),
+            ("Esc", "leave"),
+        ],
+    }
+}
+
+/// A rise-then-fall envelope, as the voices shape it, as a polyline
+/// across `rect`: `seconds` of it, the rise then the fall to nothing.
+fn rise_fall_curve(rect: egui::Rect, rise_ms: f32, fall_ms: f32, seconds: f32) -> Vec<egui::Pos2> {
+    let rise = rise_ms.max(0.0) / 1000.0;
+    let fall = fall_ms.max(1.0) / 1000.0;
+    let n = 48usize;
+    (0..=n)
+        .map(|i| {
+            let t = seconds * i as f32 / n as f32;
+            let y = if t < rise {
+                t / rise.max(1.0e-6)
+            } else {
+                (-(t - rise) / (fall / 5.0)).exp()
+            };
+            egui::pos2(
+                rect.left() + rect.width() * i as f32 / n as f32,
+                rect.bottom() - rect.height() * y.clamp(0.0, 1.0),
+            )
+        })
+        .collect()
+}
+
+/// An ADSR, as a polyline: attack up, decay to the sustain, a held
+/// stretch, then the release — the held stretch fixed, so the shape
+/// reads as attack/decay/release lengths against each other.
+fn adsr_curve(rect: egui::Rect, op: &crate::audio::quad::Op) -> Vec<egui::Pos2> {
+    let a = op.attack.max(0.0) / 1000.0;
+    let d = op.decay.max(1.0) / 1000.0;
+    let r = op.release.max(1.0) / 1000.0;
+    let hold = 0.4f32;
+    let total = (a + d + hold + r).max(0.05);
+    let x = |t: f32| rect.left() + rect.width() * (t / total).clamp(0.0, 1.0);
+    let y = |v: f32| rect.bottom() - rect.height() * v.clamp(0.0, 1.0);
+    vec![
+        egui::pos2(x(0.0), y(0.0)),
+        egui::pos2(x(a), y(1.0)),
+        egui::pos2(x(a + d), y(op.sustain)),
+        egui::pos2(x(a + d + hold), y(op.sustain)),
+        egui::pos2(x(total), y(0.0)),
     ]
 }
 
@@ -55,7 +111,9 @@ impl super::super::Stage {
             egui::pos2(field.max.x - margin, field.max.y - margin),
         );
         let device = self.song.device(forge.device);
+        let subject = forge.subject;
         let params = device.map(Forge::params_of).unwrap_or_default();
+        let quad = device.map(Forge::quad_params_of).unwrap_or_default();
 
         // The title row: the room, the device, the facts.
         let ty = room.min.y + TITLE_H * 0.5;
@@ -71,7 +129,10 @@ impl super::super::Stage {
         painter.text(
             egui::pos2(x, ty),
             egui::Align2::LEFT_CENTER,
-            "sCOMP",
+            match subject {
+                Subject::Scomp => "sCOMP",
+                Subject::Quad => "QUAD",
+            },
             font.clone(),
             c.dir,
         );
@@ -79,15 +140,36 @@ impl super::super::Stage {
         let shown = forge.shown();
         let lanes = forge.lanes();
         let seconds = forge.take.as_ref().map_or(0.0, |take| take.seconds());
-        let title = format!(
-            "tr {:02}  ·  {} pass{}  ·  take {:.2}s -> {:.2}s  ·  root {:.1} Hz",
-            forge.track + 1,
-            params.pass_count(),
-            if params.pass_count() == 1 { "" } else { "es" },
-            params.take_s,
-            seconds,
-            params.root_hz(),
-        );
+        let title = match subject {
+            Subject::Scomp => format!(
+                "tr {:02}  ·  {} pass{}  ·  take {:.2}s -> {:.2}s  ·  root {:.1} Hz",
+                forge.track + 1,
+                params.pass_count(),
+                if params.pass_count() == 1 { "" } else { "es" },
+                params.take_s,
+                seconds,
+                params.root_hz(),
+            ),
+            Subject::Quad => format!(
+                "tr {:02}  ·  {}  ·  fb {:.0}%  ·  {} {:.1}k  ·  {} x{:.1}",
+                forge.track + 1,
+                qp::ALGO_NAMES
+                    .get(quad.algo.round().max(0.0) as usize)
+                    .copied()
+                    .unwrap_or("?"),
+                quad.feedback * 100.0,
+                qp::FMODE_NAMES
+                    .get(quad.fmode.round() as usize)
+                    .copied()
+                    .unwrap_or("lp"),
+                quad.cutoff / 1000.0,
+                qp::DIST_NAMES
+                    .get(quad.dist.round() as usize)
+                    .copied()
+                    .unwrap_or("off"),
+                quad.drive,
+            ),
+        };
         painter.text(
             egui::pos2(x, ty),
             egui::Align2::LEFT_CENTER,
@@ -95,10 +177,10 @@ impl super::super::Stage {
             font.clone(),
             c.fg,
         );
-        let on_show = if shown == 0 {
-            "ON SHOW: SOURCE".to_owned()
-        } else {
-            format!("ON SHOW: PASS {shown} of {}", lanes.saturating_sub(1))
+        let on_show = match subject {
+            Subject::Quad => format!("ON SHOW: OP {}", shown + 1),
+            Subject::Scomp if shown == 0 => "ON SHOW: SOURCE".to_owned(),
+            Subject::Scomp => format!("ON SHOW: PASS {shown} of {}", lanes.saturating_sub(1)),
         };
         painter.text(
             egui::pos2(room.max.x, ty),
@@ -121,7 +203,7 @@ impl super::super::Stage {
         // The legend, under the lanes.
         let ly = lanes_rect.max.y + 4.0 + legend_h * 0.5;
         let mut lx = lanes_rect.min.x;
-        for (chord, word) in legend() {
+        for (chord, word) in legend(subject) {
             painter.text(
                 egui::pos2(lx, ly),
                 egui::Align2::LEFT_CENTER,
@@ -141,9 +223,12 @@ impl super::super::Stage {
         }
 
         // The lanes: every pass on one time axis, the longest setting it.
+        // Or, for QUAD, the routing and the envelopes.
         chassis::frame(painter, lanes_rect, true);
         let inner = lanes_rect.shrink(INSET);
-        if let Some(take) = forge.take.as_ref().filter(|take| !take.passes.is_empty()) {
+        if subject == Subject::Quad {
+            draw_quad_room(painter, inner, &quad, shown, &font, ch);
+        } else if let Some(take) = forge.take.as_ref().filter(|take| !take.passes.is_empty()) {
             let rate = f64::from(take.sample_rate.max(1));
             let longest = take
                 .passes
@@ -294,9 +379,10 @@ impl super::super::Stage {
             Header(&'static str),
             Row(usize),
         }
-        let mut lines: Vec<Line> = Vec::with_capacity(ROWS.len() + 8);
+        let rows = forge.rows();
+        let mut lines: Vec<Line> = Vec::with_capacity(rows.len() + 8);
         let mut last_group = "";
-        for (index, (group, _)) in ROWS.iter().enumerate() {
+        for (index, (group, _)) in rows.iter().enumerate() {
             if *group != last_group {
                 lines.push(Line::Header(group));
                 last_group = group;
@@ -326,9 +412,9 @@ impl super::super::Stage {
                     );
                 }
                 Line::Row(index) => {
-                    let (_, id) = ROWS[*index];
+                    let (_, id) = rows[*index];
                     let live = *index == forge.row;
-                    let baked = sp::baked(id);
+                    let baked = subject == Subject::Scomp && sp::baked(id);
                     if live {
                         let row_rect = egui::Rect::from_min_max(
                             egui::pos2(inner.min.x - 4.0, y - ROW_H * 0.5),
@@ -392,12 +478,224 @@ impl super::super::Stage {
                 c.dim,
             );
         }
-        painter.text(
-            egui::pos2(inner.max.x, inner.max.y),
-            egui::Align2::RIGHT_BOTTOM,
-            "* re-renders the take",
-            font,
-            alpha(c.alert, 160),
+        if subject == Subject::Scomp {
+            painter.text(
+                egui::pos2(inner.max.x, inner.max.y),
+                egui::Align2::RIGHT_BOTTOM,
+                "* re-renders the take",
+                font,
+                alpha(c.alert, 160),
+            );
+        }
+    }
+}
+
+/// QUAD's picture: the routing across the top, the operators' envelopes,
+/// the two pitch envelopes and the filter's beneath.
+fn draw_quad_room(
+    painter: &egui::Painter,
+    inner: egui::Rect,
+    p: &QuadParams,
+    shown: usize,
+    font: &egui::FontId,
+    ch: f32,
+) {
+    let c = palette::colours();
+    let algo = p.algorithm();
+    let split = inner.min.y + inner.height() * 0.48;
+    let route = egui::Rect::from_min_max(inner.min, egui::pos2(inner.max.x, split - 8.0));
+    let lower = egui::Rect::from_min_max(egui::pos2(inner.min.x, split + 8.0), inner.max);
+
+    // The routing: boxes stacked over the carriers they feed.
+    let depth = crate::ui::device::quad::depth;
+    let rows = (0..qp::OPS).map(|op| depth(algo, op)).max().unwrap_or(0) + 1;
+    let box_w = (route.width() / qp::OPS as f32 - 24.0).clamp(40.0, 150.0);
+    let box_h = ((route.height() - 10.0 * (rows as f32 - 1.0)) / rows as f32).clamp(16.0, 44.0);
+    let centre = |op: usize| {
+        egui::pos2(
+            route.left() + (op as f32 + 0.5) * route.width() / qp::OPS as f32,
+            route.bottom() - box_h * 0.5 - depth(algo, op) as f32 * (box_h + 10.0),
+        )
+    };
+    for (m, carrier) in algo.edges {
+        painter.line_segment(
+            [centre(*m), centre(*carrier)],
+            egui::Stroke::new(1.0, c.chassis),
         );
     }
+    if p.feedback > 0.005 {
+        let at = centre(qp::OPS - 1);
+        let r = egui::Rect::from_center_size(
+            egui::pos2(at.x + box_w * 0.5 + 9.0, at.y),
+            egui::vec2(12.0, box_h * 0.8),
+        );
+        painter.rect_stroke(
+            r,
+            0.0,
+            egui::Stroke::new(1.0, c.nominal),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            egui::pos2(r.right() + 3.0, r.center().y),
+            egui::Align2::LEFT_CENTER,
+            format!("fb {:.0}%", p.feedback * 100.0),
+            font.clone(),
+            c.nominal,
+        );
+    }
+    for op in 0..qp::OPS {
+        let knobs = &p.ops[op];
+        let r = egui::Rect::from_center_size(centre(op), egui::vec2(box_w, box_h));
+        let carrier = algo.carriers.contains(&op);
+        let live = op == shown;
+        let ink = if carrier { c.alert } else { c.edge };
+        painter.rect_filled(r, 0.0, alpha(ink, (30.0 + 120.0 * knobs.level) as u8));
+        painter.rect_stroke(
+            r,
+            0.0,
+            egui::Stroke::new(
+                if live { 2.0 } else { 1.0 },
+                if live { c.bright } else { ink },
+            ),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            egui::pos2(r.center().x, r.center().y - 3.0),
+            egui::Align2::CENTER_CENTER,
+            format!("OP {}  x{:.2} {:+.0}ct", op + 1, knobs.ratio, knobs.fine),
+            font.clone(),
+            if live { c.bright } else { c.fg },
+        );
+        let foot = egui::Rect::from_min_max(
+            egui::pos2(r.left() + 3.0, r.bottom() - 5.0),
+            egui::pos2(
+                r.left() + 3.0 + (r.width() - 6.0) * knobs.level.clamp(0.0, 1.0),
+                r.bottom() - 2.0,
+            ),
+        );
+        painter.rect_filled(foot, 0.0, if live { c.bright } else { ink });
+    }
+
+    // Three panels: the operators' envelopes, the pitch envelopes, the
+    // filter's.
+    let gap = 10.0;
+    let panel_w = (lower.width() - gap * 2.0) / 3.0;
+    let panel = |i: usize| {
+        egui::Rect::from_min_max(
+            egui::pos2(lower.left() + (panel_w + gap) * i as f32, lower.top()),
+            egui::pos2(
+                lower.left() + (panel_w + gap) * i as f32 + panel_w,
+                lower.bottom(),
+            ),
+        )
+    };
+    let head_h = 14.0;
+    let plot_of = |r: egui::Rect| {
+        egui::Rect::from_min_max(
+            egui::pos2(r.left() + 2.0, r.top() + head_h + 2.0),
+            r.max - egui::vec2(2.0, 2.0),
+        )
+    };
+    for (i, title) in ["OPERATOR ENVELOPES", "PITCH ENVELOPES", "FILTER"]
+        .iter()
+        .enumerate()
+    {
+        let r = panel(i);
+        painter.rect_filled(r, 0.0, c.panel);
+        painter.rect_stroke(
+            r,
+            0.0,
+            egui::Stroke::new(1.0, c.rule),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            egui::pos2(r.left() + 4.0, r.top() + head_h * 0.5),
+            egui::Align2::LEFT_CENTER,
+            *title,
+            font.clone(),
+            c.label,
+        );
+    }
+    // Operators' ADSRs, the one on show bright.
+    let plot = plot_of(panel(0));
+    for op in 0..qp::OPS {
+        if op == shown {
+            continue;
+        }
+        painter.add(egui::Shape::line(
+            adsr_curve(plot, &p.ops[op]),
+            egui::Stroke::new(1.0, alpha(c.edge, 110)),
+        ));
+    }
+    painter.add(egui::Shape::line(
+        adsr_curve(plot, &p.ops[shown]),
+        egui::Stroke::new(2.0, c.bright),
+    ));
+    let op = &p.ops[shown];
+    painter.text(
+        egui::pos2(plot.right() - 2.0, plot.top() + 2.0),
+        egui::Align2::RIGHT_TOP,
+        format!(
+            "op {} · {:.0}/{:.0}/{:.0}%/{:.0}",
+            shown + 1,
+            op.attack,
+            op.decay,
+            op.sustain * 100.0,
+            op.release
+        ),
+        font.clone(),
+        c.dim,
+    );
+    // The two pitch envelopes over two seconds, zero at the middle.
+    let plot = plot_of(panel(1));
+    let mid = plot.center().y;
+    painter.line_segment(
+        [egui::pos2(plot.left(), mid), egui::pos2(plot.right(), mid)],
+        egui::Stroke::new(1.0, c.rule),
+    );
+    for (amount, rise, fall, ink, word) in [
+        (p.pitch1, p.p1_rise, p.p1_fall, c.alert, "1 all"),
+        (p.pitch2, p.p2_rise, p.p2_fall, c.nominal, "2 mod"),
+    ] {
+        let half = egui::Rect::from_min_max(
+            egui::pos2(plot.left(), plot.top()),
+            egui::pos2(plot.right(), mid),
+        );
+        let mut points = rise_fall_curve(half, rise, fall, 2.0);
+        let scale = (amount / 48.0).clamp(-1.0, 1.0);
+        for point in points.iter_mut() {
+            point.y = mid - (mid - point.y) * scale;
+        }
+        painter.add(egui::Shape::line(points, egui::Stroke::new(1.5, ink)));
+        let _ = word;
+    }
+    painter.text(
+        egui::pos2(plot.right() - 2.0, plot.top() + 2.0),
+        egui::Align2::RIGHT_TOP,
+        format!("1 {:+.0}st  2 {:+.0}st", p.pitch1, p.pitch2),
+        font.clone(),
+        c.dim,
+    );
+    // The filter's envelope, and its numbers.
+    let plot = plot_of(panel(2));
+    let points = rise_fall_curve(plot, p.fenv_att, p.fenv_dec, 2.0);
+    painter.add(egui::Shape::line(points, egui::Stroke::new(1.5, c.alert)));
+    painter.text(
+        egui::pos2(plot.right() - 2.0, plot.top() + 2.0),
+        egui::Align2::RIGHT_TOP,
+        format!(
+            "{} {:.0}Hz q{:.1} {:+.1}oct kt{:.0}%",
+            qp::FMODE_NAMES
+                .get(p.fmode.round() as usize)
+                .copied()
+                .unwrap_or("lp"),
+            p.cutoff,
+            p.reso,
+            p.fenv,
+            p.keytrack * 100.0
+        ),
+        font.clone(),
+        c.dim,
+    );
+    let _ = ch;
 }

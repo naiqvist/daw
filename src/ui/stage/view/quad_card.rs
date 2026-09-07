@@ -12,6 +12,7 @@ use crate::PROFONT;
 use crate::design::codex::Sign;
 use crate::design::kit::Weight;
 use crate::params::quad as qp;
+use crate::ui::affordance::{Afford, Affords};
 use crate::ui::chrome;
 use crate::ui::device::quad::depth;
 use crate::ui::stage::chain::{self, QuadFace};
@@ -24,10 +25,12 @@ const GAP: f32 = 10.0;
 const PARAM_W: f32 = 188.0;
 const PARAM_HEAD_H: f32 = 19.0;
 const FACT_H: f32 = 30.0;
+const LAB_W: f32 = 118.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Layout {
     head: egui::Rect,
+    lab: egui::Rect,
     visual: egui::Rect,
     plot: egui::Rect,
     facts: egui::Rect,
@@ -40,6 +43,10 @@ impl Layout {
             return None;
         }
         let head = egui::Rect::from_min_size(card.min, egui::vec2(card.width(), head_h));
+        let lab = egui::Rect::from_min_max(
+            egui::pos2(head.right() - LAB_W - 7.0, head.top() + 6.0),
+            egui::pos2(head.right() - 7.0, head.bottom() - 6.0),
+        );
         let body = egui::Rect::from_min_max(
             egui::pos2(card.left() + PAD, head.bottom() + PAD),
             egui::pos2(card.right() - PAD, card.bottom() - PAD),
@@ -56,6 +63,7 @@ impl Layout {
             egui::Rect::from_min_max(visual.min, egui::pos2(visual.right(), facts.top() - 6.0));
         Some(Self {
             head,
+            lab,
             visual,
             plot,
             facts,
@@ -72,13 +80,15 @@ fn algo_name(face: &QuadFace) -> &'static str {
 }
 
 fn draw_header(
-    painter: &egui::Painter,
+    ui: &mut egui::Ui,
     layout: Layout,
     face: &QuadFace,
     column: &chain::Column,
+    index: usize,
     selected: bool,
     alpha: &crate::design::Alphabet,
-) {
+) -> bool {
+    let painter = ui.painter();
     let colours = palette::colours();
     let family_ink = if column.bypassed {
         alpha.edge.color
@@ -136,12 +146,41 @@ fn draw_header(
         family_ink,
     );
     painter.text(
-        egui::pos2(layout.head.right() - 10.0, layout.head.center().y),
+        egui::pos2(layout.lab.left() - 10.0, layout.head.center().y),
         egui::Align2::RIGHT_CENTER,
         algo_name(face),
-        egui::FontId::new(15.0, egui::FontFamily::Name(PROFONT.into())),
-        colours.alert,
+        egui::FontId::new(13.0, egui::FontFamily::Name(PROFONT.into())),
+        colours.nominal,
     );
+    // The door to the room, a real pointer target.
+    let response = ui
+        .interact(
+            layout.lab,
+            egui::Id::new(("stage-quad-forge", index)),
+            egui::Sense::click(),
+        )
+        .affords(Affords::Press);
+    let open_ink = if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        painter.rect_filled(layout.lab, 0.0, colours.select);
+        colours.bright
+    } else {
+        colours.alert
+    };
+    painter.rect_stroke(
+        layout.lab,
+        0.0,
+        egui::Stroke::new(1.0, open_ink),
+        egui::StrokeKind::Inside,
+    );
+    painter.text(
+        layout.lab.center(),
+        egui::Align2::CENTER_CENTER,
+        "ENTER  FORGE >",
+        egui::FontId::new(10.0, egui::FontFamily::Name(PROFONT.into())),
+        open_ink,
+    );
+    response.clicked()
 }
 
 /// The routing: operators as boxes, modulators over their carriers.
@@ -362,7 +401,8 @@ fn draw_params(
 }
 
 impl super::super::Stage {
-    /// Draw the QUAD face.
+    /// Draw the QUAD face. Returns true when the pointer asked to enter
+    /// the forge; keyboard Enter continues through the normal map.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn draw_quad_chain_card(
         &self,
@@ -374,12 +414,12 @@ impl super::super::Stage {
         row_offset: usize,
         rows_shown: usize,
         head_h: f32,
-    ) {
+    ) -> bool {
         let Some(face) = column.quad.as_ref() else {
-            return;
+            return false;
         };
         let Some(layout) = Layout::of(card, head_h) else {
-            return;
+            return false;
         };
         let painter = ui.painter().clone();
         let alpha = self.glass();
@@ -424,7 +464,7 @@ impl super::super::Stage {
         for shape in shell {
             painter.add(shape);
         }
-        draw_header(&painter, layout, face, column, selected, &alpha);
+        let opened = draw_header(ui, layout, face, column, index, selected, &alpha);
         draw_plot(&painter, layout.plot, face);
         draw_facts(&painter, layout.facts, face);
         draw_params(
@@ -436,6 +476,7 @@ impl super::super::Stage {
             row_offset,
             rows_shown,
         );
+        opened
     }
 }
 

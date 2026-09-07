@@ -15,6 +15,8 @@
 
 use std::sync::Arc;
 
+use crate::audio::quad::QuadParams;
+use crate::params::quad as qp;
 use crate::params::scomp as sp;
 use crate::sample_peaks::Peaks;
 use crate::scomp::{Baked, ScompParams, Take};
@@ -79,9 +81,70 @@ pub(super) const ROWS: [(&str, u32); 22] = [
     ("PLAY", sp::LEVEL),
 ];
 
+/// QUAD's rows, in signal order: each operator, the routing, the two
+/// pitch envelopes, the filter, the output.
+pub(super) const QUAD_ROWS: [(&str, u32); 47] = [
+    ("OP 1", qp::op_param(0, qp::RATIO)),
+    ("OP 1", qp::op_param(0, qp::FINE)),
+    ("OP 1", qp::op_param(0, qp::LEVEL_OP)),
+    ("OP 1", qp::op_param(0, qp::ATTACK)),
+    ("OP 1", qp::op_param(0, qp::DECAY)),
+    ("OP 1", qp::op_param(0, qp::SUSTAIN)),
+    ("OP 1", qp::op_param(0, qp::RELEASE)),
+    ("OP 2", qp::op_param(1, qp::RATIO)),
+    ("OP 2", qp::op_param(1, qp::FINE)),
+    ("OP 2", qp::op_param(1, qp::LEVEL_OP)),
+    ("OP 2", qp::op_param(1, qp::ATTACK)),
+    ("OP 2", qp::op_param(1, qp::DECAY)),
+    ("OP 2", qp::op_param(1, qp::SUSTAIN)),
+    ("OP 2", qp::op_param(1, qp::RELEASE)),
+    ("OP 3", qp::op_param(2, qp::RATIO)),
+    ("OP 3", qp::op_param(2, qp::FINE)),
+    ("OP 3", qp::op_param(2, qp::LEVEL_OP)),
+    ("OP 3", qp::op_param(2, qp::ATTACK)),
+    ("OP 3", qp::op_param(2, qp::DECAY)),
+    ("OP 3", qp::op_param(2, qp::SUSTAIN)),
+    ("OP 3", qp::op_param(2, qp::RELEASE)),
+    ("OP 4", qp::op_param(3, qp::RATIO)),
+    ("OP 4", qp::op_param(3, qp::FINE)),
+    ("OP 4", qp::op_param(3, qp::LEVEL_OP)),
+    ("OP 4", qp::op_param(3, qp::ATTACK)),
+    ("OP 4", qp::op_param(3, qp::DECAY)),
+    ("OP 4", qp::op_param(3, qp::SUSTAIN)),
+    ("OP 4", qp::op_param(3, qp::RELEASE)),
+    ("ROUTE", qp::ALGO),
+    ("ROUTE", qp::FEEDBACK),
+    ("PITCH 1", qp::PITCH1),
+    ("PITCH 1", qp::PITCH1_RISE),
+    ("PITCH 1", qp::PITCH1_FALL),
+    ("PITCH 2", qp::PITCH2),
+    ("PITCH 2", qp::PITCH2_RISE),
+    ("PITCH 2", qp::PITCH2_FALL),
+    ("FILTER", qp::FMODE),
+    ("FILTER", qp::CUTOFF),
+    ("FILTER", qp::RESO),
+    ("FILTER", qp::FENV),
+    ("FILTER", qp::FENV_ATT),
+    ("FILTER", qp::FENV_DEC),
+    ("FILTER", qp::KEYTRACK),
+    ("OUT", qp::DIST),
+    ("OUT", qp::DRIVE),
+    ("OUT", qp::VELOCITY),
+    ("OUT", qp::LEVEL),
+];
+
+/// Which instrument the room is open on. The room's grammar is one
+/// thing; what it draws, and what the digits pick, is the subject's.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Subject {
+    Scomp,
+    Quad,
+}
+
 /// The room, while it is up.
 #[derive(Clone, Debug)]
 pub(super) struct Forge {
+    pub(super) subject: Subject,
     pub(super) track: usize,
     pub(super) device: DeviceId,
     /// The row under the cursor, an index into [`ROWS`].
@@ -95,8 +158,9 @@ pub(super) struct Forge {
 }
 
 impl Forge {
-    pub(super) fn open(track: usize, device: DeviceId) -> Self {
+    pub(super) fn open(track: usize, device: DeviceId, subject: Subject) -> Self {
         Self {
+            subject,
             track,
             device,
             row: 0,
@@ -117,8 +181,29 @@ impl Forge {
         params
     }
 
+    /// QUAD's knobs as the device holds them.
+    pub(super) fn quad_params_of(device: &Device) -> QuadParams {
+        let mut params = QuadParams::default();
+        for (id, value) in &device.overrides {
+            params.set(*id, *value);
+        }
+        params
+    }
+
+    /// The rows the room shows: the subject's.
+    pub(super) fn rows(&self) -> &'static [(&'static str, u32)] {
+        match self.subject {
+            Subject::Scomp => &ROWS,
+            Subject::Quad => &QUAD_ROWS,
+        }
+    }
+
     /// Render again if the baked knobs moved. Returns whether it did.
+    /// Only sCOMP has a take; QUAD's picture is its knobs.
     pub(super) fn refresh(&mut self, device: &Device) -> bool {
+        if self.subject != Subject::Scomp {
+            return false;
+        }
         let params = Self::params_of(device);
         let key = params.baked();
         if self.key == Some(key) && self.take.is_some() {
@@ -136,26 +221,32 @@ impl Forge {
     }
 
     pub(super) fn param(&self) -> u32 {
-        ROWS.get(self.row).map_or(sp::PASSES, |(_, id)| *id)
+        self.rows().get(self.row).map_or(0, |(_, id)| *id)
     }
 
-    /// How many passes the take on show has, source included.
+    /// How many things the digits can put on show: sCOMP's passes,
+    /// source included; QUAD's operators.
     pub(super) fn lanes(&self) -> usize {
-        self.take.as_ref().map_or(0, |take| take.passes.len())
+        match self.subject {
+            Subject::Scomp => self.take.as_ref().map_or(0, |take| take.passes.len()),
+            Subject::Quad => qp::OPS,
+        }
     }
 
-    /// The pass on show, as an index into the take's passes.
+    /// The pass — or operator — on show. sCOMP shows its last pass
+    /// until told otherwise; QUAD its first operator.
     pub(super) fn shown(&self) -> usize {
         let lanes = self.lanes();
-        match self.pass {
-            Some(pass) if pass < lanes => pass,
-            _ => lanes.saturating_sub(1),
+        match (self.subject, self.pass) {
+            (_, Some(pass)) if pass < lanes => pass,
+            (Subject::Scomp, _) => lanes.saturating_sub(1),
+            (Subject::Quad, _) => 0,
         }
     }
 
     pub(super) fn step_row(&mut self, down: bool) -> bool {
         let next = if down {
-            (self.row + 1).min(ROWS.len() - 1)
+            (self.row + 1).min(self.rows().len() - 1)
         } else {
             self.row.saturating_sub(1)
         };
@@ -168,15 +259,16 @@ impl Forge {
 
     /// The first row of the next group, round.
     pub(super) fn next_group(&mut self) -> bool {
-        let here = ROWS.get(self.row).map(|(group, _)| *group);
+        let rows = self.rows();
+        let here = rows.get(self.row).map(|(group, _)| *group);
         let mut index = self.row;
-        for _ in 0..ROWS.len() {
-            index = (index + 1) % ROWS.len();
-            if ROWS.get(index).map(|(group, _)| *group) != here {
-                let group = ROWS.get(index).map(|(group, _)| *group);
+        for _ in 0..rows.len() {
+            index = (index + 1) % rows.len();
+            if rows.get(index).map(|(group, _)| *group) != here {
+                let group = rows.get(index).map(|(group, _)| *group);
                 // Walk back to the group's first row, in case the walk
                 // landed mid-group after wrapping.
-                while index > 0 && ROWS.get(index - 1).map(|(g, _)| *g) == group {
+                while index > 0 && rows.get(index - 1).map(|(g, _)| *g) == group {
                     index -= 1;
                 }
                 self.row = index;
@@ -249,9 +341,26 @@ mod tests {
     }
 
     #[test]
+    fn a_quad_room_has_quads_rows_and_its_operators_on_show() {
+        let device = Device::new(DeviceId(9), DeviceKind::Quad);
+        let mut forge = Forge::open(0, device.id, Subject::Quad);
+        assert!(!forge.refresh(&device), "QUAD renders no take");
+        assert_eq!(forge.rows().len(), qp::TABLE.len());
+        let mut ids: Vec<u32> = forge.rows().iter().map(|(_, id)| *id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (0..qp::TABLE.len() as u32).collect::<Vec<_>>());
+        assert_eq!(forge.param(), qp::op_param(0, qp::RATIO));
+        assert_eq!((forge.lanes(), forge.shown()), (4, 0));
+        assert!(forge.pick_pass(3) && forge.shown() == 3);
+        assert!(!forge.pick_pass(4));
+        assert!(forge.next_group());
+        assert_eq!(forge.param(), qp::op_param(1, qp::RATIO));
+    }
+
+    #[test]
     fn the_take_is_rendered_once_per_change_of_the_baked_knobs() {
         let mut device = device();
-        let mut forge = Forge::open(0, device.id);
+        let mut forge = Forge::open(0, device.id, Subject::Scomp);
         assert!(forge.refresh(&device), "nothing rendered on open");
         assert_eq!(forge.lanes(), 4, "the source and three passes");
         assert_eq!(forge.peaks.len(), 4);
@@ -267,7 +376,7 @@ mod tests {
     #[test]
     fn rows_groups_and_passes_walk_and_refuse_at_their_ends() {
         let device = device();
-        let mut forge = Forge::open(0, device.id);
+        let mut forge = Forge::open(0, device.id, Subject::Scomp);
         forge.refresh(&device);
         assert!(!forge.step_row(false), "stepped above the first row");
         assert!(forge.step_row(true));

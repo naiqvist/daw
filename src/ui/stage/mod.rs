@@ -63,8 +63,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use browser::{BrowserStatus, sample_nodes};
-use forge::Forge;
 pub(in crate::ui::stage) use forge::ScompCard;
+use forge::{Forge, Subject as ForgeSubject};
 use sample::{Page as SamplePage, SampleEditor};
 use trig_menu::{MenuRow, Page, TrigAction, TrigMenu};
 
@@ -2439,27 +2439,31 @@ impl Stage {
         Some((editor, device))
     }
 
-    /// The sCOMP a forge would open on: the device under the band's
-    /// cursor if the band is up, else the head of the addressed track.
-    fn scomp_target(&self) -> Result<(usize, crate::sequencing::DeviceId), RefusalReason> {
+    /// The device a forge would open on — an sCOMP or a QUAD — under the
+    /// band's cursor if the band is up, else the head of the addressed
+    /// track.
+    fn forge_target(
+        &self,
+    ) -> Result<(usize, crate::sequencing::DeviceId, ForgeSubject), RefusalReason> {
+        let subject = |kind: DeviceKind| match kind {
+            DeviceKind::Scomp => Some(ForgeSubject::Scomp),
+            DeviceKind::Quad => Some(ForgeSubject::Quad),
+            _ => None,
+        };
         if let Some((track, device)) = self.chained_device() {
             let device = &self.song.tracks[track].chain[device];
-            return if device.kind == DeviceKind::Scomp {
-                Ok((track, device.id))
-            } else {
-                Err(RefusalReason::Unavailable)
-            };
+            return subject(device.kind)
+                .map(|subject| (track, device.id, subject))
+                .ok_or(RefusalReason::Unavailable);
         }
         let track = self.addressed_track().ok_or(RefusalReason::Empty)?;
         let head = self.song.tracks[track]
             .chain
             .first()
             .ok_or(RefusalReason::Empty)?;
-        if head.kind == DeviceKind::Scomp {
-            Ok((track, head.id))
-        } else {
-            Err(RefusalReason::Unavailable)
-        }
+        subject(head.kind)
+            .map(|subject| (track, head.id, subject))
+            .ok_or(RefusalReason::Unavailable)
     }
 
     /// Render the forge's take again if its knobs moved.
@@ -2480,8 +2484,8 @@ impl Stage {
     fn apply_forge(&mut self, intent: ForgeIntent) -> Result<(), RefusalReason> {
         use crate::params::scomp as sp;
         if intent == ForgeIntent::Open {
-            let (track, id) = self.scomp_target()?;
-            self.forge = Some(Forge::open(track, id));
+            let (track, id, subject) = self.forge_target()?;
+            self.forge = Some(Forge::open(track, id, subject));
             self.sample = None;
             self.trig_menu = None;
             self.refresh_forge();
@@ -2491,6 +2495,7 @@ impl Stage {
             return Err(RefusalReason::Unavailable);
         };
         let id = forge.device;
+        let subject = forge.subject;
         match intent {
             ForgeIntent::Open => unreachable!("handled above"),
             ForgeIntent::Up | ForgeIntent::Down => {
@@ -2586,7 +2591,7 @@ impl Stage {
                     value: reading.clone(),
                 });
                 self.notice = Some(format!("{} {reading}", label.name));
-                if sp::baked(param) {
+                if subject == ForgeSubject::Scomp && sp::baked(param) {
                     self.touched();
                 }
                 self.remixed();
@@ -3918,7 +3923,7 @@ impl Stage {
             // The band's Enter opens the device's own room: the sampler's
             // is the cutting room, sCOMP's is the forge.
             StageIntent::Sample(SampleIntent::Open)
-                if self.sampler_target().is_err() && self.scomp_target().is_ok() =>
+                if self.sampler_target().is_err() && self.forge_target().is_ok() =>
             {
                 self.apply_forge(ForgeIntent::Open)
             }
@@ -6338,6 +6343,56 @@ mod tests {
             bare.apply(StageIntent::Forge(ForgeIntent::Open)),
             ApplyOutcome::Refused(_)
         ));
+    }
+
+    /// Enter on a QUAD in the band opens the same room on QUAD's rows,
+    /// where a digit puts an operator on show and a turn is a letter.
+    #[test]
+    fn the_forge_opens_on_a_quad_with_its_own_rows() {
+        use crate::params::quad as qp;
+        let mut stage = Stage::new();
+        let id = stage
+            .song
+            .add_device(0, crate::devices::DeviceKind::Quad)
+            .expect("a quad");
+        assert_eq!(stage.apply(StageIntent::Devices), ApplyOutcome::Changed);
+        assert_eq!(
+            drive(&mut stage, &[Key::Enter]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(stage.scope_context(), keymap::ScopeContext::Forge);
+        let forge = stage.forge.as_ref().unwrap();
+        assert_eq!((forge.device, forge.subject), (id, ForgeSubject::Quad));
+        assert_eq!(forge.param(), qp::op_param(0, qp::RATIO));
+        let graph = stage.revision();
+        assert_eq!(
+            drive(&mut stage, &[Key::ArrowRight]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_ne!(
+            stage
+                .song
+                .device(id)
+                .unwrap()
+                .value(qp::op_param(0, qp::RATIO)),
+            1.0
+        );
+        assert_eq!(
+            stage.revision(),
+            graph,
+            "a QUAD knob is a letter, not a rebuild"
+        );
+        assert_eq!(drive(&mut stage, &[Key::Num3]), vec![ApplyOutcome::Changed]);
+        assert_eq!(stage.forge.as_ref().unwrap().shown(), 3);
+        assert!(matches!(
+            drive(&mut stage, &[Key::Num5])[0],
+            ApplyOutcome::Refused(_)
+        ));
+        assert_eq!(
+            drive(&mut stage, &[Key::Escape]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert!(stage.forge.is_none());
     }
 
     /// The band's FORGE row is a door: turned up, the forge opens; turned

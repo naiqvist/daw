@@ -1353,6 +1353,10 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
             device.set(q::DRIVE, 3.0);
         }
         let _ = stage.apply(StageIntent::Devices);
+        if which.contains("-forge") {
+            let _ = stage.apply(StageIntent::Forge(daw::ui::stage::ForgeIntent::Open));
+            let _ = stage.apply(StageIntent::Forge(daw::ui::stage::ForgeIntent::Pick(1)));
+        }
     } else if which.contains("stab") {
         // STAB on the first track, voiced as a ninth in second inversion,
         // and the band open on it. `-browse` opens the browser instead.
