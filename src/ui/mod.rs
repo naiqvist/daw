@@ -430,6 +430,7 @@ mod tests {
             "tone.rs",      // ditto
             "sigil.rs",     // ditto
             "tine.rs",      // ditto
+            "scomp.rs",     // ditto
             "gauge.rs",     // ditto
             "prism.rs",     // a card: its size is the sum of what it holds
             "limiter.rs",   // ditto

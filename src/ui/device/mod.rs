@@ -124,6 +124,7 @@ pub mod resyn;
 pub mod reverb;
 pub mod sampler;
 pub mod sat;
+pub mod scomp;
 pub mod scope;
 pub mod shaper;
 pub mod sheen;

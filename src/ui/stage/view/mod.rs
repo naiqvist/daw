@@ -17,6 +17,7 @@ mod callouts;
 mod chassis;
 mod desk;
 mod faces;
+mod forge;
 mod heads;
 mod help;
 mod input;
@@ -377,6 +378,9 @@ impl Stage {
             if self.sample.is_some() {
                 // The cutting room takes the whole field.
                 self.draw_sample(&painter, layout.field);
+            } else if self.forge.is_some() {
+                // So does the forge.
+                self.draw_forge(&painter, layout.field);
             } else if self.song_view {
                 // The field turned over: the song's arrangement in the
                 // session's place.

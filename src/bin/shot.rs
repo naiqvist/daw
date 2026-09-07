@@ -1332,6 +1332,21 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
             }
         }
         let _ = stage.apply(StageIntent::Mix);
+    } else if which.contains("forge") {
+        // sCOMP on the first track, its forge open over it. `-band`
+        // leaves the band showing instead, for the card.
+        let id = stage
+            .song_mut()
+            .add_device(0, daw::devices::DeviceKind::Scomp)
+            .expect("an sCOMP");
+        let _ = id;
+        let _ = stage.apply(StageIntent::Devices);
+        if !which.contains("-band") {
+            let _ = stage.apply(StageIntent::Forge(daw::ui::stage::ForgeIntent::Open));
+            if which.contains("-source") {
+                let _ = stage.apply(StageIntent::Forge(daw::ui::stage::ForgeIntent::Pick(0)));
+            }
+        }
     } else if which.contains("sampler-card") {
         // The sampler as it appears in the Stage chain: material on the
         // left, the ordinary keyboard parameter bank on the right, and a

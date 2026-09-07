@@ -38,6 +38,7 @@ pub mod prism;
 pub mod project;
 pub mod resyn;
 pub mod sampler;
+pub mod scomp;
 pub mod sibyl;
 pub mod sigil;
 pub mod snare;

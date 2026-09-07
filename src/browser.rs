@@ -122,6 +122,10 @@ impl Default for Browser {
                                     load: DeviceKind::Tine,
                                 },
                                 BrowserItem {
+                                    name: "sComp",
+                                    load: DeviceKind::Scomp,
+                                },
+                                BrowserItem {
                                     name: "Haze",
                                     load: DeviceKind::Haze,
                                 },

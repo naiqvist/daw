@@ -56,6 +56,210 @@ pub fn def(table: &'static [ParamDef], id: u32) -> &'static ParamDef {
     &table[id as usize]
 }
 
+/// sCOMP: a sine, squashed into a sound. See [`crate::scomp`].
+pub mod scomp {
+    use super::ParamDef;
+
+    pub const PASSES: u32 = 0;
+    pub const TAKE: u32 = 1;
+    pub const DROP: u32 = 2;
+    pub const DROP_MS: u32 = 3;
+    pub const DECAY: u32 = 4;
+    pub const FILTER: u32 = 5;
+    pub const HARMONIC: u32 = 6;
+    pub const RESO: u32 = 7;
+    pub const SWEEP: u32 = 8;
+    pub const DRIFT: u32 = 9;
+    pub const THRESH: u32 = 10;
+    pub const RATIO: u32 = 11;
+    pub const ATTACK: u32 = 12;
+    pub const RELEASE: u32 = 13;
+    pub const MAKEUP: u32 = 14;
+    pub const DRIVE: u32 = 15;
+    pub const SHIFT: u32 = 16;
+    pub const AMP_A: u32 = 17;
+    pub const AMP_R: u32 = 18;
+    pub const TUNE: u32 = 19;
+    pub const ROOT: u32 = 20;
+    pub const LEVEL: u32 = 21;
+
+    pub const MAX_PASSES: usize = 8;
+    pub const PASS_NAMES: &[&str] = &["1", "2", "3", "4", "5", "6", "7", "8"];
+    pub const FILTER_BAND: f32 = 0.0;
+    pub const FILTER_NOTCH: f32 = 1.0;
+    pub const FILTER_COMB: f32 = 2.0;
+    pub const FILTER_NAMES: &[&str] = &["band", "notch", "comb"];
+    /// The longest a take may grow to, in seconds, however far down the
+    /// passes pitch it.
+    pub const MAX_TAKE_S: f32 = 8.0;
+    pub const LEVEL_MAX: f32 = 2.0;
+
+    /// The rows that are BAKED into the take: a change to any of them is
+    /// a new render, not a letter. The engine never re-renders on the
+    /// audio thread, so the host rebuilds the graph instead, exactly as
+    /// it does for a slice table.
+    pub fn baked(param: u32) -> bool {
+        !matches!(param, AMP_A | AMP_R | TUNE | ROOT | LEVEL)
+    }
+
+    pub const TABLE: &[ParamDef] = &[
+        ParamDef {
+            id: PASSES,
+            name: "passes",
+            min: 1.0,
+            max: 8.0,
+            default: 3.0,
+        },
+        ParamDef {
+            id: TAKE,
+            name: "take",
+            min: 0.25,
+            max: 4.0,
+            default: 1.5,
+        },
+        ParamDef {
+            id: DROP,
+            name: "drop",
+            min: 0.0,
+            max: 36.0,
+            default: 12.0,
+        },
+        ParamDef {
+            id: DROP_MS,
+            name: "dropms",
+            min: 5.0,
+            max: 2_000.0,
+            default: 120.0,
+        },
+        ParamDef {
+            id: DECAY,
+            name: "decay",
+            min: 0.05,
+            max: 4.0,
+            default: 1.2,
+        },
+        ParamDef {
+            id: FILTER,
+            name: "filter",
+            min: 0.0,
+            max: 2.0,
+            default: FILTER_BAND,
+        },
+        ParamDef {
+            id: HARMONIC,
+            name: "harmonic",
+            min: 0.5,
+            max: 32.0,
+            default: 3.0,
+        },
+        ParamDef {
+            id: RESO,
+            name: "reso",
+            min: 0.5,
+            max: 40.0,
+            default: 8.0,
+        },
+        ParamDef {
+            id: SWEEP,
+            name: "sweep",
+            min: -4.0,
+            max: 4.0,
+            default: -1.5,
+        },
+        ParamDef {
+            id: DRIFT,
+            name: "drift",
+            min: -24.0,
+            max: 24.0,
+            default: 7.0,
+        },
+        ParamDef {
+            id: THRESH,
+            name: "thresh",
+            min: -60.0,
+            max: 0.0,
+            default: -30.0,
+        },
+        ParamDef {
+            id: RATIO,
+            name: "ratio",
+            min: 1.0,
+            max: 100.0,
+            default: 20.0,
+        },
+        ParamDef {
+            id: ATTACK,
+            name: "attack",
+            min: 0.1,
+            max: 100.0,
+            default: 1.0,
+        },
+        ParamDef {
+            id: RELEASE,
+            name: "release",
+            min: 5.0,
+            max: 1_000.0,
+            default: 60.0,
+        },
+        ParamDef {
+            id: MAKEUP,
+            name: "makeup",
+            min: 0.0,
+            max: 36.0,
+            default: 18.0,
+        },
+        ParamDef {
+            id: DRIVE,
+            name: "drive",
+            min: 1.0,
+            max: 32.0,
+            default: 6.0,
+        },
+        ParamDef {
+            id: SHIFT,
+            name: "shift",
+            min: -24.0,
+            max: 24.0,
+            default: -5.0,
+        },
+        ParamDef {
+            id: AMP_A,
+            name: "amp a",
+            min: 0.0,
+            max: 500.0,
+            default: 2.0,
+        },
+        ParamDef {
+            id: AMP_R,
+            name: "amp r",
+            min: 5.0,
+            max: 2_000.0,
+            default: 120.0,
+        },
+        ParamDef {
+            id: TUNE,
+            name: "tune",
+            min: -24.0,
+            max: 24.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: ROOT,
+            name: "root",
+            min: 0.0,
+            max: 127.0,
+            default: 36.0,
+        },
+        ParamDef {
+            id: LEVEL,
+            name: "level",
+            min: 0.0,
+            max: LEVEL_MAX,
+            default: 0.8,
+        },
+    ];
+}
+
 /// The built-in sequencer synth (`Node::Seq`, the SineSynth device).
 pub mod seq {
     use super::ParamDef;

@@ -901,6 +901,31 @@ impl Voices for crate::audio::tine::TineVoices {
     }
 }
 
+/// The bounced sine as an instrument the clock can play.
+impl Voices for crate::audio::scomp::ScompVoices {
+    fn all_sound_off(&mut self) {
+        crate::audio::scomp::ScompVoices::all_sound_off(self);
+    }
+    fn release_all(&mut self) {
+        crate::audio::scomp::ScompVoices::release_all(self);
+    }
+    fn note_off(&mut self, pitch: u8) {
+        crate::audio::scomp::ScompVoices::note_off(self, pitch);
+    }
+    fn note_on(&mut self, pitch: u8, vel: u8, age: u64) {
+        crate::audio::scomp::ScompVoices::note_on(self, pitch, vel, age);
+    }
+    fn plock(&mut self, param: u32, value: Option<f32>) {
+        crate::audio::scomp::ScompVoices::plock(self, param, value);
+    }
+    fn plock_glide(&mut self, param: u32, alpha: f32) {
+        crate::audio::scomp::ScompVoices::plock_glide(self, param, alpha);
+    }
+    fn render(&mut self, out: &mut [f32], at: usize, gain: &mut Ramp) {
+        crate::audio::scomp::ScompVoices::render(self, out, at, gain);
+    }
+}
+
 impl Voices for crate::audio::sampler::SamplerVoices {
     fn all_sound_off(&mut self) {
         crate::audio::sampler::SamplerVoices::all_sound_off(self);
@@ -1934,6 +1959,15 @@ pub enum Node {
         gain: f32,
         target_gain: f32,
     },
+    /// The bounced sine. Its take was rendered when the node was built;
+    /// the voices only read it.
+    Scomp {
+        events: Vec<SeqEvent>,
+        clock: PatternClock,
+        voices: Box<crate::audio::scomp::ScompVoices>,
+        gain: f32,
+        target_gain: f32,
+    },
     Poly {
         events: Vec<SeqEvent>,
         /// Where the pattern is — the SAME clock `Seq` uses.
@@ -2629,6 +2663,7 @@ impl Node {
             | NodeSpec::Loom { .. }
             | NodeSpec::Poly { .. }
             | NodeSpec::Tine { .. }
+            | NodeSpec::Scomp { .. }
             | NodeSpec::Sampler { .. }
             | NodeSpec::Modulato { .. }
             | NodeSpec::Sat { .. }
@@ -2683,6 +2718,7 @@ impl Node {
             Node::Umbra { core } => Some(core.readout()),
             Node::Gauge { core } => Some(core.readout()),
             Node::Tine { voices, .. } => Some(voices.readout()),
+            Node::Scomp { voices, .. } => Some(voices.readout()),
             Node::Prism { core } => Some(core.readout()),
             Node::Gate { core } => Some(core.readout()),
             Node::Section { core } => Some(core.readout()),
@@ -3291,6 +3327,24 @@ impl Node {
             } => {
                 // `Poly`'s shape exactly — which is the clock earning its
                 // keep for the fifth instrument running.
+                let mut ramp = Ramp::across(*gain, *target_gain, out_len);
+                clock.run(voices.as_mut(), events, out.l, ctx, &mut ramp);
+                *gain = *target_gain;
+                if let Some(r) = out.r.as_deref_mut() {
+                    let right = voices.right(out_len);
+                    for (d, s) in r.iter_mut().zip(right.iter()) {
+                        *d = *s;
+                    }
+                }
+            }
+
+            Node::Scomp {
+                events,
+                clock,
+                voices,
+                gain,
+                target_gain,
+            } => {
                 let mut ramp = Ramp::across(*gain, *target_gain, out_len);
                 clock.run(voices.as_mut(), events, out.l, ctx, &mut ramp);
                 *gain = *target_gain;
@@ -4423,6 +4477,7 @@ impl Node {
         match self {
             Node::Seq { clock, .. }
             | Node::Tine { clock, .. }
+            | Node::Scomp { clock, .. }
             | Node::Poly { clock, .. }
             | Node::Loom { clock, .. }
             | Node::Haze { clock, .. }
@@ -4989,6 +5044,21 @@ impl Node {
                 }
                 voices.set_param(param, value);
             }
+            Node::Scomp {
+                target_gain,
+                voices,
+                ..
+            } => {
+                let Some(value) = crate::params::clamp(crate::params::scomp::TABLE, param, value)
+                else {
+                    return;
+                };
+                if param == crate::params::scomp::LEVEL {
+                    *target_gain = value;
+                }
+                voices.set_param(param, value);
+            }
+
             Node::Poly {
                 target_gain,
                 voices,
@@ -5453,6 +5523,12 @@ fn resolve_timeline_spec(
             ..
         }
         | NodeSpec::Tine {
+            notes,
+            subloops,
+            loop_len_beats: None,
+            ..
+        }
+        | NodeSpec::Scomp {
             notes,
             subloops,
             loop_len_beats: None,
@@ -6368,6 +6444,7 @@ impl NodeSpec {
         match self {
             NodeSpec::Seq { notes, .. }
             | NodeSpec::Tine { notes, .. }
+            | NodeSpec::Scomp { notes, .. }
             | NodeSpec::Poly { notes, .. }
             | NodeSpec::Loom { notes, .. }
             | NodeSpec::Haze { notes, .. }
@@ -6841,6 +6918,17 @@ pub enum NodeSpec {
         #[serde(default)]
         params: crate::audio::tine::TineParams,
     },
+    /// sCOMP: a sine bounced through a compressor, rendered to a take
+    /// when the node is built and played like a sample. Timeline-locked
+    /// as `Tine` is. Stereo out, the same on both sides, so the strip
+    /// after it sees what every other instrument gives it.
+    Scomp {
+        notes: Vec<Note>,
+        subloops: Vec<SubLoop>,
+        loop_len_beats: Option<f64>,
+        #[serde(default)]
+        params: crate::scomp::ScompParams,
+    },
     Poly {
         notes: Vec<Note>,
         subloops: Vec<SubLoop>,
@@ -7040,6 +7128,7 @@ impl GraphSpec {
             match spec {
                 NodeSpec::Seq { notes, .. }
                 | NodeSpec::Tine { notes, .. }
+                | NodeSpec::Scomp { notes, .. }
                 | NodeSpec::Poly { notes, .. }
                 | NodeSpec::Haze { notes, .. }
                 | NodeSpec::Kick { notes, .. }
@@ -8095,6 +8184,45 @@ impl GraphSpec {
                             target_gain: gain,
                         }
                     }
+                    Some(NodeSpec::Scomp {
+                        notes,
+                        subloops,
+                        loop_len_beats,
+                        params,
+                    }) => {
+                        let events = compile_events(
+                            notes,
+                            subloops,
+                            *loop_len_beats,
+                            samples_per_beat,
+                            plock_glide_samples,
+                        )?;
+                        // Green zone: the take is rendered here, every
+                        // pass of it, and the voices are born over it.
+                        let voices = crate::audio::scomp::ScompVoices::new(
+                            sample_rate as f32,
+                            block_frames,
+                            *params,
+                        );
+                        let gain = if params.level.is_finite() {
+                            params.level.clamp(0.0, crate::params::scomp::LEVEL_MAX)
+                        } else {
+                            crate::scomp::ScompParams::default().level
+                        };
+                        Node::Scomp {
+                            events,
+                            clock: PatternClock::new(
+                                loop_len_beats
+                                    .map(|len| (len * samples_per_beat).round().max(0.0) as u64)
+                                    .unwrap_or(0),
+                                samples_per_beat,
+                            ),
+                            voices: Box::new(voices),
+                            gain,
+                            target_gain: gain,
+                        }
+                    }
+
                     Some(NodeSpec::Poly {
                         notes,
                         subloops,

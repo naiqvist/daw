@@ -141,6 +141,7 @@ fn scope_word(scope: ScopeContext) -> &'static str {
         ScopeContext::Modulation => "MOD",
         ScopeContext::Sample => "SAMPLE",
         ScopeContext::Song => "SONG",
+        ScopeContext::Forge => "FORGE",
     }
 }
 

@@ -22,6 +22,7 @@ pub mod plock_ops;
 pub mod record;
 pub mod render;
 pub mod sample_peaks;
+pub mod scomp;
 pub mod sequencing;
 pub mod shell;
 pub mod slice;

@@ -1124,6 +1124,16 @@ pub(crate) fn draw_device_card(
             let history = histories.get(&instance.id).cloned().unwrap_or_default();
             device::glue_card(ui, theme, &mut knobs, &history)
         }
+        DeviceState::Scomp(params) => {
+            let mut knobs = scomp_knobs(params);
+            let mut page = usize::from(instance.page);
+            let made = device::scomp::scomp_card(ui, theme, &mut knobs, &mut page);
+            let page = page.min(u8::MAX as usize) as u8;
+            if page != instance.page {
+                edits.pages.push((instance.id, page));
+            }
+            made
+        }
         DeviceState::Tine(params) => {
             let mut knobs = tine_knobs(params);
             let voices = histories

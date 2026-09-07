@@ -55,11 +55,15 @@ pub(super) enum ScopeContext {
     /// a block. The tray beneath shows the block's pattern; the verbs
     /// here move, size, and lay blocks.
     Song,
+    /// The forge is up: one sCOMP, full screen, its passes stacked and
+    /// its knobs as rows. A place of its own, like the sample editor,
+    /// that Escape leaves.
+    Forge,
 }
 
 impl ScopeContext {
     #[cfg(test)]
-    pub(super) const ALL: [Self; 12] = [
+    pub(super) const ALL: [Self; 13] = [
         Self::Root,
         Self::Nested,
         Self::Browser,
@@ -72,6 +76,7 @@ impl ScopeContext {
         Self::Modulation,
         Self::Sample,
         Self::Song,
+        Self::Forge,
     ];
 }
 
@@ -227,6 +232,8 @@ pub enum StageIntent {
     ModDelete,
     /// An act in the sample editor, or the act of opening it.
     Sample(SampleIntent),
+    /// An act in the forge, or the act of opening it.
+    Forge(ForgeIntent),
     /// Scan the library's folders again, so a pack dropped in while the
     /// stage runs turns up without a restart.
     Rescan,
@@ -361,6 +368,53 @@ pub enum SampleIntent {
     /// A slice by its number on the row of digits, stepped to and
     /// sounded. Ten sits under the zero.
     Pick(usize),
+}
+
+/// What the forge can be told. Its own enum, like the sample editor's,
+/// so the room's vocabulary is one thing.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ForgeIntent {
+    /// Open the forge on the sCOMP under the cursor.
+    Open,
+    /// The row above, or below.
+    Up,
+    Down,
+    /// Turn the row's knob down, or up.
+    Left {
+        coarse: bool,
+    },
+    Right {
+        coarse: bool,
+    },
+    /// The next group of rows, round.
+    Group,
+    /// The row back to its default.
+    Reset,
+    /// The previous or next pass on show.
+    PrevPass,
+    NextPass,
+    /// A pass on show by its number on the row of digits; zero is the
+    /// source.
+    Pick(usize),
+}
+
+impl ForgeIntent {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Open => "forge",
+            Self::Up => "row up",
+            Self::Down => "row down",
+            Self::Left { coarse: false } => "turn down",
+            Self::Left { coarse: true } => "turn down, coarsely",
+            Self::Right { coarse: false } => "turn up",
+            Self::Right { coarse: true } => "turn up, coarsely",
+            Self::Group => "next group",
+            Self::Reset => "reset the row",
+            Self::PrevPass => "previous pass on show",
+            Self::NextPass => "next pass on show",
+            Self::Pick(_) => "pass on show, by number",
+        }
+    }
 }
 
 impl SampleIntent {
@@ -538,6 +592,7 @@ impl StageIntent {
             Self::ModSolo => "solo modulation wire",
             Self::ModDelete => "delete modulation selection",
             Self::Sample(intent) => intent.label(),
+            Self::Forge(intent) => intent.label(),
             Self::Rescan => "rescan library",
             Self::SongView => "session / song",
             Self::Bus => "next bus",
@@ -1696,6 +1751,121 @@ const BINDINGS: &[Binding] = &[
     Binding::command(ScopeContext::Sample, Key::Z, StageIntent::Undo),
     Binding::command_shift(ScopeContext::Sample, Key::Z, StageIntent::Redo),
     Binding::command(ScopeContext::Sample, Key::S, StageIntent::Save),
+    // The forge. Entered from the band with Enter on an sCOMP, the same
+    // door the sampler's room has. Once up, the arrows are its rows and
+    // knobs; the globals stay.
+    Binding::new(
+        ScopeContext::Forge,
+        Key::ArrowUp,
+        StageIntent::Forge(ForgeIntent::Up),
+    ),
+    Binding::new(
+        ScopeContext::Forge,
+        Key::ArrowDown,
+        StageIntent::Forge(ForgeIntent::Down),
+    ),
+    Binding::new(
+        ScopeContext::Forge,
+        Key::ArrowLeft,
+        StageIntent::Forge(ForgeIntent::Left { coarse: false }),
+    ),
+    Binding::new(
+        ScopeContext::Forge,
+        Key::ArrowRight,
+        StageIntent::Forge(ForgeIntent::Right { coarse: false }),
+    ),
+    Binding::shift(
+        ScopeContext::Forge,
+        Key::ArrowLeft,
+        StageIntent::Forge(ForgeIntent::Left { coarse: true }),
+    ),
+    Binding::shift(
+        ScopeContext::Forge,
+        Key::ArrowRight,
+        StageIntent::Forge(ForgeIntent::Right { coarse: true }),
+    ),
+    Binding::new(
+        ScopeContext::Forge,
+        Key::Tab,
+        StageIntent::Forge(ForgeIntent::Group),
+    ),
+    Binding::new(
+        ScopeContext::Forge,
+        Key::R,
+        StageIntent::Forge(ForgeIntent::Reset),
+    ),
+    Binding::new(
+        ScopeContext::Forge,
+        Key::Comma,
+        StageIntent::Forge(ForgeIntent::PrevPass),
+    ),
+    Binding::new(
+        ScopeContext::Forge,
+        Key::Period,
+        StageIntent::Forge(ForgeIntent::NextPass),
+    ),
+    Binding::new(
+        ScopeContext::Forge,
+        Key::Num0,
+        StageIntent::Forge(ForgeIntent::Pick(0)),
+    ),
+    Binding::new(
+        ScopeContext::Forge,
+        Key::Num1,
+        StageIntent::Forge(ForgeIntent::Pick(1)),
+    ),
+    Binding::new(
+        ScopeContext::Forge,
+        Key::Num2,
+        StageIntent::Forge(ForgeIntent::Pick(2)),
+    ),
+    Binding::new(
+        ScopeContext::Forge,
+        Key::Num3,
+        StageIntent::Forge(ForgeIntent::Pick(3)),
+    ),
+    Binding::new(
+        ScopeContext::Forge,
+        Key::Num4,
+        StageIntent::Forge(ForgeIntent::Pick(4)),
+    ),
+    Binding::new(
+        ScopeContext::Forge,
+        Key::Num5,
+        StageIntent::Forge(ForgeIntent::Pick(5)),
+    ),
+    Binding::new(
+        ScopeContext::Forge,
+        Key::Num6,
+        StageIntent::Forge(ForgeIntent::Pick(6)),
+    ),
+    Binding::new(
+        ScopeContext::Forge,
+        Key::Num7,
+        StageIntent::Forge(ForgeIntent::Pick(7)),
+    ),
+    Binding::new(
+        ScopeContext::Forge,
+        Key::Num8,
+        StageIntent::Forge(ForgeIntent::Pick(8)),
+    ),
+    Binding::new(ScopeContext::Forge, Key::Escape, StageIntent::Escape),
+    Binding::new(
+        ScopeContext::Forge,
+        Key::Space,
+        StageIntent::ToggleTransport,
+    ),
+    Binding::new(ScopeContext::Forge, Key::Home, StageIntent::Rewind),
+    Binding::new(ScopeContext::Forge, Key::Questionmark, StageIntent::Help),
+    Binding::command(ScopeContext::Forge, Key::L, StageIntent::Ground),
+    Binding::command(ScopeContext::Forge, Key::Z, StageIntent::Undo),
+    Binding::command_shift(ScopeContext::Forge, Key::Z, StageIntent::Redo),
+    Binding::command(ScopeContext::Forge, Key::S, StageIntent::Save),
+    Binding::command(ScopeContext::Forge, Key::O, StageIntent::ProjectManager),
+    Binding::command(ScopeContext::Forge, Key::Comma, StageIntent::Preferences),
+    Binding::command_shift(ScopeContext::Forge, Key::E, StageIntent::ExportConsole),
+    Binding::command_shift(ScopeContext::Forge, Key::D, StageIntent::Diagnostics),
+    Binding::new(ScopeContext::Forge, Key::F9, StageIntent::ToggleRecord),
     // The library, read again. From the browser, where the result is
     // seen, and from every place the browser can be summoned from.
     Binding::command(ScopeContext::Browser, Key::R, StageIntent::Rescan),
@@ -1928,6 +2098,7 @@ fn family(intent: StageIntent) -> &'static str {
         | StageIntent::ModSolo
         | StageIntent::ModDelete => "modulation",
         StageIntent::Sample(_) => "sample",
+        StageIntent::Forge(_) => "forge",
         StageIntent::Song(_) | StageIntent::RecordSong => "song",
         StageIntent::Bus => "mix",
     }
@@ -2204,6 +2375,7 @@ mod tests {
             ScopeContext::TrigMenu,
             ScopeContext::Plock,
             ScopeContext::Sample,
+            ScopeContext::Forge,
         ] {
             assert_eq!(
                 dispatch(transactional, StageInput::Chord(open, Key::M)),

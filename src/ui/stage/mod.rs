@@ -25,6 +25,7 @@ mod arrangement;
 mod browser;
 mod chain;
 mod document;
+mod forge;
 mod grid;
 mod key;
 mod keymap;
@@ -62,6 +63,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use browser::{BrowserStatus, sample_nodes};
+use forge::Forge;
 use sample::{Page as SamplePage, SampleEditor};
 use trig_menu::{MenuRow, Page, TrigAction, TrigMenu};
 
@@ -69,7 +71,7 @@ pub use browser::{Browser, EntryKind, Node, Row, Shelf};
 pub use grid::{
     FocusColumn, FocusGrid, FocusLattice, FocusRow, FocusScope, FocusStack, Miniature, Step,
 };
-pub use keymap::{SampleIntent, SongIntent, StageIntent};
+pub use keymap::{ForgeIntent, SampleIntent, SongIntent, StageIntent};
 pub use mixer::Reading;
 pub use sample::{Audition, SampleData};
 pub use scenes::Address;
@@ -570,6 +572,8 @@ pub struct Stage {
     /// The sample editor, while it is up. A place of its own that takes
     /// the whole field, like the codebook, and the keys with it.
     sample: Option<SampleEditor>,
+    /// The forge, while it is up: one sCOMP, full screen.
+    forge: Option<Forge>,
     /// The file the editor shows, once the host has handed it in. Kept
     /// across the editor closing and opening again on the same file, so
     /// the second look is instant; replaced when the file differs.
@@ -823,6 +827,7 @@ impl Stage {
             mod_wire_scopes: std::collections::HashMap::new(),
             mod_wire_gesture: false,
             sample: None,
+            forge: None,
             sample_data: None,
             audition: None,
             audition_stop: false,
@@ -1702,6 +1707,8 @@ impl Stage {
             keymap::ScopeContext::Modulation
         } else if self.sample.is_some() {
             keymap::ScopeContext::Sample
+        } else if self.forge.is_some() {
+            keymap::ScopeContext::Forge
         } else if self.plock_editor.is_some() {
             keymap::ScopeContext::Plock
         } else if self.trig_menu.is_some() {
@@ -2425,6 +2432,163 @@ impl Stage {
         let editor = self.sample.as_ref()?;
         let device = self.song.device(editor.device)?;
         Some((editor, device))
+    }
+
+    /// The sCOMP a forge would open on: the device under the band's
+    /// cursor if the band is up, else the head of the addressed track.
+    fn scomp_target(&self) -> Result<(usize, crate::sequencing::DeviceId), RefusalReason> {
+        if let Some((track, device)) = self.chained_device() {
+            let device = &self.song.tracks[track].chain[device];
+            return if device.kind == DeviceKind::Scomp {
+                Ok((track, device.id))
+            } else {
+                Err(RefusalReason::Unavailable)
+            };
+        }
+        let track = self.addressed_track().ok_or(RefusalReason::Empty)?;
+        let head = self.song.tracks[track]
+            .chain
+            .first()
+            .ok_or(RefusalReason::Empty)?;
+        if head.kind == DeviceKind::Scomp {
+            Ok((track, head.id))
+        } else {
+            Err(RefusalReason::Unavailable)
+        }
+    }
+
+    /// Render the forge's take again if its knobs moved.
+    fn refresh_forge(&mut self) {
+        let Some(id) = self.forge.as_ref().map(|forge| forge.device) else {
+            return;
+        };
+        let Some(device) = self.song.device(id).cloned() else {
+            self.forge = None;
+            return;
+        };
+        if let Some(forge) = self.forge.as_mut() {
+            forge.refresh(&device);
+        }
+    }
+
+    /// Everything the forge can be told.
+    fn apply_forge(&mut self, intent: ForgeIntent) -> Result<(), RefusalReason> {
+        use crate::params::scomp as sp;
+        if intent == ForgeIntent::Open {
+            let (track, id) = self.scomp_target()?;
+            self.forge = Some(Forge::open(track, id));
+            self.sample = None;
+            self.trig_menu = None;
+            self.refresh_forge();
+            return Ok(());
+        }
+        let Some(forge) = self.forge.as_ref() else {
+            return Err(RefusalReason::Unavailable);
+        };
+        let id = forge.device;
+        match intent {
+            ForgeIntent::Open => unreachable!("handled above"),
+            ForgeIntent::Up | ForgeIntent::Down => {
+                let down = intent == ForgeIntent::Down;
+                let moved = self
+                    .forge
+                    .as_mut()
+                    .is_some_and(|forge| forge.step_row(down));
+                if moved {
+                    Ok(())
+                } else {
+                    Err(RefusalReason::Edge(if down {
+                        Step::Down
+                    } else {
+                        Step::Up
+                    }))
+                }
+            }
+            ForgeIntent::Group => {
+                let moved = self.forge.as_mut().is_some_and(Forge::next_group);
+                if moved {
+                    Ok(())
+                } else {
+                    Err(RefusalReason::Unavailable)
+                }
+            }
+            ForgeIntent::PrevPass | ForgeIntent::NextPass => {
+                let next = intent == ForgeIntent::NextPass;
+                let moved = self
+                    .forge
+                    .as_mut()
+                    .is_some_and(|forge| forge.step_pass(next));
+                if moved {
+                    Ok(())
+                } else {
+                    Err(RefusalReason::Edge(if next {
+                        Step::Right
+                    } else {
+                        Step::Left
+                    }))
+                }
+            }
+            ForgeIntent::Pick(pass) => {
+                let moved = self
+                    .forge
+                    .as_mut()
+                    .is_some_and(|forge| forge.pick_pass(pass));
+                if moved {
+                    Ok(())
+                } else {
+                    Err(RefusalReason::Unavailable)
+                }
+            }
+            ForgeIntent::Left { .. } | ForgeIntent::Right { .. } | ForgeIntent::Reset => {
+                let coarse = matches!(
+                    intent,
+                    ForgeIntent::Left { coarse: true } | ForgeIntent::Right { coarse: true }
+                );
+                let param = forge.param();
+                let spec = self
+                    .song
+                    .device(id)
+                    .map(|device| device.kind.spec())
+                    .ok_or(RefusalReason::Unavailable)?;
+                let (def, label) = spec
+                    .params
+                    .iter()
+                    .zip(spec.labels)
+                    .find(|(def, _)| def.id == param)
+                    .ok_or(RefusalReason::Unavailable)?;
+                let device = self.song.device_mut(id).ok_or(RefusalReason::Unavailable)?;
+                let before = device.value(param);
+                let target = match intent {
+                    ForgeIntent::Reset => def.default,
+                    ForgeIntent::Left { .. } => before - chain::step_of(def, label, coarse),
+                    _ => before + chain::step_of(def, label, coarse),
+                };
+                // Refuse before touching the device: a reset to where it
+                // already stands must not leave an override behind.
+                if def.clamp(target) == before {
+                    return Err(match intent {
+                        ForgeIntent::Left { .. } => RefusalReason::Edge(Step::Down),
+                        ForgeIntent::Right { .. } => RefusalReason::Edge(Step::Up),
+                        _ => RefusalReason::Unavailable,
+                    });
+                }
+                device.set(param, target);
+                let after = device.value(param);
+                let reading = chain::format_param(def, label, after);
+                self.touch = Some(Touch {
+                    device: spec.prefix,
+                    name: label.name,
+                    value: reading.clone(),
+                });
+                self.notice = Some(format!("{} {reading}", label.name));
+                if sp::baked(param) {
+                    self.touched();
+                }
+                self.remixed();
+                self.refresh_forge();
+                Ok(())
+            }
+        }
     }
 
     /// Where a placed marker lands: the cursor, walked back to a zero
@@ -3746,8 +3910,20 @@ impl Stage {
                 self.notice = Some("scanning the library".to_owned());
                 Ok(())
             }
+            // The band's Enter opens the device's own room: the sampler's
+            // is the cutting room, sCOMP's is the forge.
+            StageIntent::Sample(SampleIntent::Open)
+                if self.sampler_target().is_err() && self.scomp_target().is_ok() =>
+            {
+                self.apply_forge(ForgeIntent::Open)
+            }
             // The cutting room. Its own vocabulary, over one file.
             StageIntent::Sample(intent) => self.apply_sample(intent),
+            StageIntent::Forge(intent) => self.apply_forge(intent),
+            StageIntent::Escape if self.forge.is_some() => {
+                self.forge = None;
+                Ok(())
+            }
             StageIntent::Escape if self.sample.as_ref().is_some_and(|e| e.grabbed.is_some()) => {
                 self.drop_marker();
                 Ok(())
@@ -4423,6 +4599,14 @@ impl Stage {
                                 // already running, exactly as a fader
                                 // does — the chain does not rebuild
                                 // because somebody turned something.
+                                // Except a knob baked into a take: that
+                                // is a new render, and a render is a
+                                // rebuild, as a slice table is.
+                                if spec.kind == DeviceKind::Scomp
+                                    && crate::params::scomp::baked(param)
+                                {
+                                    self.touched();
+                                }
                                 self.remixed();
                                 Ok(())
                             }
@@ -6061,6 +6245,84 @@ mod tests {
     /// P asks the host to play the slice under the cursor; with no
     /// slices, the trim; Shift+P the whole file. Each is one request,
     /// taken once.
+    /// An sCOMP on track one with a short take, and the forge up over it.
+    fn into_forge(stage: &mut Stage) -> crate::sequencing::DeviceId {
+        let id = stage
+            .song
+            .add_device(0, crate::devices::DeviceKind::Scomp)
+            .expect("an sCOMP on the track");
+        stage
+            .song
+            .device_mut(id)
+            .expect("the device")
+            .set(crate::params::scomp::TAKE, 0.25);
+        assert_eq!(stage.apply(StageIntent::Devices), ApplyOutcome::Changed);
+        assert_eq!(drive(stage, &[Key::Enter]), vec![ApplyOutcome::Changed]);
+        assert_eq!(stage.scope_context(), keymap::ScopeContext::Forge);
+        id
+    }
+
+    /// Enter on an sCOMP in the band opens the forge, as it opens the
+    /// cutting room on a sampler; a turn of a baked knob is a rebuild
+    /// and a new take, a turn of a played knob is a letter.
+    #[test]
+    fn the_forge_opens_on_an_scomp_and_a_baked_knob_is_a_rebuild() {
+        use crate::params::scomp as sp;
+        let mut stage = Stage::new();
+        let id = into_forge(&mut stage);
+        let forge = stage.forge.as_ref().expect("the forge");
+        assert_eq!(forge.device, id);
+        assert_eq!(forge.lanes(), 4, "the take was not rendered on open");
+        let (graph, mix) = (stage.revision(), stage.mix_revision());
+        // PASSES is the first row: turn it up.
+        assert_eq!(
+            drive(&mut stage, &[Key::ArrowRight]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(stage.song.device(id).unwrap().value(sp::PASSES), 4.0);
+        assert_ne!(stage.revision(), graph, "a baked knob did not rebuild");
+        assert_eq!(
+            stage.forge.as_ref().unwrap().lanes(),
+            5,
+            "the picture did not follow"
+        );
+        // LEVEL is the last row: a letter, not a rebuild.
+        let graph = stage.revision();
+        while stage.forge.as_ref().unwrap().param() != sp::LEVEL {
+            let _ = drive(&mut stage, &[Key::ArrowDown]);
+        }
+        assert_eq!(
+            drive(&mut stage, &[Key::ArrowLeft]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert_eq!(stage.revision(), graph, "a played knob rebuilt the graph");
+        assert_ne!(stage.mix_revision(), mix);
+        // R resets the row; the edge refuses; Escape leaves.
+        assert_eq!(drive(&mut stage, &[Key::R]), vec![ApplyOutcome::Changed]);
+        assert_eq!(
+            stage.song.device(id).unwrap().value(sp::LEVEL),
+            crate::scomp::ScompParams::default().level
+        );
+        assert!(matches!(
+            drive(&mut stage, &[Key::ArrowDown])[0],
+            ApplyOutcome::Refused(_)
+        ));
+        assert_eq!(drive(&mut stage, &[Key::Num0]), vec![ApplyOutcome::Changed]);
+        assert_eq!(stage.forge.as_ref().unwrap().shown(), 0);
+        assert_eq!(
+            drive(&mut stage, &[Key::Escape]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert!(stage.forge.is_none());
+        assert_eq!(stage.scope_context(), keymap::ScopeContext::Chain);
+        // Enter on a bare track with no sCOMP refuses, as the room does.
+        let mut bare = Stage::new();
+        assert!(matches!(
+            bare.apply(StageIntent::Forge(ForgeIntent::Open)),
+            ApplyOutcome::Refused(_)
+        ));
+    }
+
     /// A sampler with a synthesized file, the editor up, and snap off so
     /// a placed marker lands exactly where the cursor stood.
     fn into_cutting_room_free(stage: &mut Stage) -> crate::sequencing::DeviceId {
@@ -7382,6 +7644,9 @@ mod tests {
                     keymap::ScopeContext::Sample => {
                         into_sample_editor(&mut stage);
                     }
+                    keymap::ScopeContext::Forge => {
+                        into_forge(&mut stage);
+                    }
                     keymap::ScopeContext::Song => {
                         let _ = stage.handle_key(Mods::NONE, Key::Tab);
                     }
@@ -7413,6 +7678,7 @@ mod tests {
                             stage.plock_editor.clone(),
                             stage.modulation.clone(),
                             stage.sample.clone(),
+                            stage.forge.as_ref().map(|forge| (forge.row, forge.pass)),
                             stage.session_selection.clone(),
                             stage.session_clipboard.clone(),
                             stage.block_clipboard.clone(),
@@ -7450,6 +7716,7 @@ mod tests {
                                         stage.plock_editor.clone(),
                                         stage.modulation.clone(),
                                         stage.sample.clone(),
+                                        stage.forge.as_ref().map(|forge| (forge.row, forge.pass)),
                                         stage.session_selection.clone(),
                                         stage.session_clipboard.clone(),
                                         stage.block_clipboard.clone(),
@@ -7490,6 +7757,7 @@ mod tests {
                                         stage.plock_editor.clone(),
                                         stage.modulation.clone(),
                                         stage.sample.clone(),
+                                        stage.forge.as_ref().map(|forge| (forge.row, forge.pass)),
                                         stage.session_selection.clone(),
                                         stage.session_clipboard.clone(),
                                         stage.block_clipboard.clone(),
@@ -7562,6 +7830,9 @@ mod tests {
                 }
                 keymap::ScopeContext::Sample => {
                     into_sample_editor(&mut stage);
+                }
+                keymap::ScopeContext::Forge => {
+                    into_forge(&mut stage);
                 }
                 keymap::ScopeContext::Song => {
                     let _ = stage.handle_key(Mods::NONE, Key::Tab);
@@ -8715,6 +8986,9 @@ mod tests {
                 }
                 keymap::ScopeContext::Sample => {
                     into_sample_editor(&mut stage);
+                }
+                keymap::ScopeContext::Forge => {
+                    into_forge(&mut stage);
                 }
                 keymap::ScopeContext::Song => {
                     let _ = stage.handle_key(Mods::NONE, Key::Tab);
