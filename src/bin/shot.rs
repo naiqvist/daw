@@ -1428,6 +1428,14 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
                 let _ = stage.apply(StageIntent::Group(daw::ui::stage::Step::Down));
             }
         }
+    } else if which.contains("console-off") {
+        // The band stepped onto a console section, switched OUT, so the
+        // cursor has to be seen on a veiled face.
+        let _ = stage.apply(StageIntent::Devices);
+        for _ in 0..3 {
+            let _ = stage.apply(StageIntent::Step(daw::ui::stage::Step::Right));
+        }
+        let _ = stage.apply(StageIntent::Step(daw::ui::stage::Step::Down));
     } else if which.contains("bypass") {
         // A brick, then a saturator switched OFF, and the band's cursor
         // stepped onto the switched-off card.

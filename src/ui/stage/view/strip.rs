@@ -704,7 +704,19 @@ impl Stage {
                 },
             );
         } else {
-            chrome::dashes(&mut shapes, &path, 0.0, Weight::Hair, edge);
+            // Dashed while OUT, and in the chassis ink while the cursor
+            // is on it: an OUT section is still a place the hand goes.
+            chrome::dashes(
+                &mut shapes,
+                &path,
+                0.0,
+                Weight::Hair,
+                if focused {
+                    palette::colours().chassis
+                } else {
+                    edge
+                },
+            );
         }
         // The head's foot: a rule under the name band, short of the walls.
         chrome::trace(
@@ -779,8 +791,18 @@ impl Stage {
             // picture while it is out — behind a veil, with the word
             // over it. A blank glass would say nothing about what the
             // piece is, and the settings are still there waiting: this
-            // is a section switched out, not a section emptied.
-            self.draw_figure(&screen, piece, column, face, None, level, Phase::STILL);
+            // is a section switched out, not a section emptied. The
+            // cursor still stands on its parameter: a section can be
+            // set while it is out, and the hand has to see where it is.
+            self.draw_figure(
+                &screen,
+                piece,
+                column,
+                face,
+                selected_row,
+                level,
+                Phase::STILL,
+            );
             screen.rect_filled(glass, 0.0, alpha.ground.color.gamma_multiply(0.72));
             screen.text(
                 glass.center(),
