@@ -19,7 +19,6 @@
 //! index, so a level knob is a brightness knob. The waves are table
 //! reads, not a `sin` per operator per voice per sample.
 
-use crate::dsp::adsr::Adsr;
 use crate::dsp::filters::{Mode as FilterMode, Svf};
 use crate::dsp::interp::linear;
 use crate::dsp::shaper::{Mode as ShapeMode, Oversampler2x, Waveshaper};
@@ -59,6 +58,13 @@ pub struct Op {
     pub vel: f32,
     /// Level scaling across the keyboard, in dB per octave from C4.
     pub keyscale: f32,
+    /// The envelope's further stages: a wait before the attack, a first
+    /// decay to the break level, a second to the sustain, and how the
+    /// decays bend.
+    pub delay: f32,
+    pub break_level: f32,
+    pub decay2: f32,
+    pub curve: f32,
 }
 
 impl Default for Op {
@@ -76,6 +82,195 @@ impl Default for Op {
             hz: 440.0,
             vel: 0.5,
             keyscale: 0.0,
+            delay: 0.0,
+            break_level: 1.0,
+            decay2: 400.0,
+            curve: 0.0,
+        }
+    }
+}
+
+/// An operator's envelope: delay, attack, a decay to the break level,
+/// a second decay to the sustain, the sustain, and the release — the
+/// stages a DX has, with a curve for the decays. Times in samples, the
+/// key's rate scaling already applied.
+#[derive(Debug, Clone, Copy)]
+pub struct OpEnv {
+    stage: EnvStage,
+    /// Samples spent in the stage.
+    at: u32,
+    /// The stage's length in samples, and the level it started from.
+    length: u32,
+    from: f32,
+    value: f32,
+    delay: u32,
+    attack: u32,
+    decay: u32,
+    decay2: u32,
+    release: u32,
+    break_level: f32,
+    sustain: f32,
+    curve: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvStage {
+    Idle,
+    Delay,
+    Attack,
+    Decay,
+    Decay2,
+    Sustain,
+    Release,
+}
+
+impl OpEnv {
+    fn new() -> Self {
+        Self {
+            stage: EnvStage::Idle,
+            at: 0,
+            length: 0,
+            from: 0.0,
+            value: 0.0,
+            delay: 0,
+            attack: 0,
+            decay: 1,
+            decay2: 1,
+            release: 1,
+            break_level: 1.0,
+            sustain: 0.0,
+            curve: 0.0,
+        }
+    }
+
+    /// Green zone: the stages' lengths, `rate` scaling the decays and
+    /// the release as the key asks.
+    fn prepare(&mut self, sample_rate: f32, op: &Op, rate: f32) {
+        let samples = |ms: f32| ((ms.max(0.0) / 1000.0 * sample_rate) as u32).max(1);
+        self.delay = if op.delay > 0.0 { samples(op.delay) } else { 0 };
+        self.attack = if op.attack > 0.0 {
+            samples(op.attack)
+        } else {
+            0
+        };
+        self.decay = samples(op.decay * rate);
+        self.decay2 = samples(op.decay2 * rate);
+        self.release = samples(op.release * rate);
+        self.break_level = op.break_level.clamp(0.0, 1.0);
+        self.sustain = op.sustain.clamp(0.0, 1.0);
+        self.curve = op.curve.clamp(-1.0, 1.0);
+    }
+
+    fn enter(&mut self, stage: EnvStage) {
+        self.stage = stage;
+        self.at = 0;
+        self.from = self.value;
+        self.length = match stage {
+            EnvStage::Delay => self.delay,
+            EnvStage::Attack => self.attack,
+            EnvStage::Decay => self.decay,
+            EnvStage::Decay2 => self.decay2,
+            EnvStage::Release => self.release,
+            EnvStage::Idle | EnvStage::Sustain => 0,
+        };
+    }
+
+    /// Whether the break is in play: at the top it is no break at all,
+    /// and the one decay runs to the sustain — the ADSR the knobs read
+    /// as until BREAK is pulled down.
+    fn broken(&self) -> bool {
+        self.break_level < 0.999
+    }
+
+    /// The stage's target, and whether it bends.
+    fn target(&self) -> (f32, bool) {
+        match self.stage {
+            EnvStage::Delay => (0.0, false),
+            EnvStage::Attack => (1.0, false),
+            EnvStage::Decay => (
+                if self.broken() {
+                    self.break_level
+                } else {
+                    self.sustain
+                },
+                true,
+            ),
+            EnvStage::Decay2 => (self.sustain, true),
+            EnvStage::Sustain => (self.sustain, false),
+            EnvStage::Release | EnvStage::Idle => (0.0, true),
+        }
+    }
+
+    fn next_stage(&self) -> EnvStage {
+        match self.stage {
+            EnvStage::Delay => EnvStage::Attack,
+            EnvStage::Attack => EnvStage::Decay,
+            EnvStage::Decay => {
+                if self.broken() {
+                    EnvStage::Decay2
+                } else {
+                    EnvStage::Sustain
+                }
+            }
+            EnvStage::Decay2 | EnvStage::Sustain => EnvStage::Sustain,
+            EnvStage::Release | EnvStage::Idle => EnvStage::Idle,
+        }
+    }
+
+    pub fn gate_on(&mut self) {
+        self.value = 0.0;
+        self.enter(if self.delay > 0 {
+            EnvStage::Delay
+        } else {
+            EnvStage::Attack
+        });
+        // An instant stage is stepped over at once.
+        while self.length == 0 && !matches!(self.stage, EnvStage::Sustain | EnvStage::Idle) {
+            self.value = self.target().0;
+            self.enter(self.next_stage());
+        }
+    }
+
+    pub fn gate_off(&mut self) {
+        if self.stage != EnvStage::Idle {
+            self.enter(EnvStage::Release);
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.stage = EnvStage::Idle;
+        self.value = 0.0;
+        self.at = 0;
+    }
+
+    pub fn active(&self) -> bool {
+        self.stage != EnvStage::Idle
+    }
+
+    pub fn stage(&self) -> EnvStage {
+        self.stage
+    }
+
+    /// Red zone: the next `out.len()` values.
+    pub fn process(&mut self, out: &mut [f32]) {
+        for slot in out.iter_mut() {
+            match self.stage {
+                EnvStage::Idle => self.value = 0.0,
+                EnvStage::Sustain => self.value = self.sustain,
+                _ => {
+                    let (target, bent) = self.target();
+                    self.at += 1;
+                    let p = self.at as f32 / self.length.max(1) as f32;
+                    let p = if bent { p::bend(self.curve, p) } else { p };
+                    self.value = self.from + (target - self.from) * p.min(1.0);
+                    if self.at >= self.length {
+                        self.value = target;
+                        let next = self.next_stage();
+                        self.enter(next);
+                    }
+                }
+            }
+            *slot = self.value;
         }
     }
 }
@@ -225,6 +420,10 @@ impl QuadParams {
                 p::HZ => op.hz = value,
                 p::VEL => op.vel = value,
                 p::KEYSCALE => op.keyscale = value,
+                p::DELAY => op.delay = value,
+                p::BREAK => op.break_level = value,
+                p::DECAY2 => op.decay2 = value,
+                p::CURVE => op.curve = value,
                 _ => {}
             }
             return;
@@ -307,6 +506,10 @@ impl QuadParams {
                 p::HZ => op.hz,
                 p::VEL => op.vel,
                 p::KEYSCALE => op.keyscale,
+                p::DELAY => op.delay,
+                p::BREAK => op.break_level,
+                p::DECAY2 => op.decay2,
+                p::CURVE => op.curve,
                 _ => return None,
             });
         }
@@ -469,7 +672,7 @@ struct Voice {
     glide_semis: f32,
     phase: [[f32; OPS]; UNISON_MAX],
     out: [[f32; OPS]; UNISON_MAX],
-    env: [Adsr; OPS],
+    env: [OpEnv; OPS],
     filter_l: Svf,
     filter_r: Svf,
     /// Each operator's level for this key: velocity depth and key
@@ -498,7 +701,7 @@ impl Voice {
             glide_semis: 0.0,
             phase: [[0.0; OPS]; UNISON_MAX],
             out: [[0.0; OPS]; UNISON_MAX],
-            env: [Adsr::new(), Adsr::new(), Adsr::new(), Adsr::new()],
+            env: [OpEnv::new(), OpEnv::new(), OpEnv::new(), OpEnv::new()],
             filter_l: Svf::new(),
             filter_r: Svf::new(),
             key_gain: [1.0; OPS],
@@ -650,7 +853,7 @@ impl QuadVoices {
         let p = self.params;
         for v in self.voices.iter_mut() {
             for (env, op) in v.env.iter_mut().zip(p.ops.iter()) {
-                env.prepare(sr, op.attack, op.decay, op.sustain, op.release);
+                env.prepare(sr, op, 1.0);
             }
             v.over_l.prepare();
             v.over_r.prepare();
@@ -839,13 +1042,7 @@ impl QuadVoices {
             let touch = 1.0 - op.vel + op.vel * v.vel;
             let scaled = (op.keyscale * octaves / 20.0 * core::f32::consts::LN_10).exp();
             v.key_gain[k] = (touch * scaled).clamp(0.0, 4.0);
-            v.env[k].prepare(
-                sr,
-                op.attack,
-                op.decay * rate,
-                op.sustain,
-                op.release * rate,
-            );
+            v.env[k].prepare(sr, op, rate);
         }
         if retrigger {
             v.elapsed = 0;
@@ -928,7 +1125,7 @@ impl QuadVoices {
                 // the key held.
                 if looping && v.held {
                     for env in v.env.iter_mut() {
-                        if env.stage() == crate::dsp::adsr::AdsrStage::Sustain {
+                        if env.stage() == EnvStage::Sustain {
                             env.gate_on();
                         }
                     }
@@ -1621,6 +1818,106 @@ mod tests {
             brightness(&b),
             brightness(&a)
         );
+    }
+
+    #[test]
+    fn the_envelope_walks_its_stages_and_bends_its_decays() {
+        let op = Op {
+            delay: 10.0,
+            attack: 10.0,
+            decay: 100.0,
+            break_level: 0.5,
+            decay2: 100.0,
+            sustain: 0.2,
+            release: 50.0,
+            curve: 0.0,
+            ..Default::default()
+        };
+        let mut env = OpEnv::new();
+        env.prepare(1_000.0, &op, 1.0);
+        env.gate_on();
+        assert_eq!(env.stage(), EnvStage::Delay);
+        let mut out = vec![0.0; 10];
+        env.process(&mut out);
+        assert!(out.iter().all(|x| *x == 0.0), "the delay sounded");
+        assert_eq!(env.stage(), EnvStage::Attack);
+        env.process(&mut out);
+        assert!((out[9] - 1.0).abs() < 1e-6, "attack peaked at {}", out[9]);
+        assert_eq!(env.stage(), EnvStage::Decay);
+        let mut out = vec![0.0; 100];
+        env.process(&mut out);
+        assert!(
+            (out[49] - 0.75).abs() < 0.02,
+            "a straight decay was at {} halfway",
+            out[49]
+        );
+        assert!((out[99] - 0.5).abs() < 1e-6, "the break level: {}", out[99]);
+        assert_eq!(env.stage(), EnvStage::Decay2);
+        env.process(&mut out);
+        assert!((out[99] - 0.2).abs() < 1e-6, "the sustain: {}", out[99]);
+        assert_eq!(env.stage(), EnvStage::Sustain);
+        env.gate_off();
+        let mut out = vec![0.0; 50];
+        env.process(&mut out);
+        assert!(out[49].abs() < 1e-6 && !env.active());
+        // With the break at the top there is one decay, to the sustain.
+        let mut plain_env = OpEnv::new();
+        plain_env.prepare(
+            1_000.0,
+            &Op {
+                break_level: 1.0,
+                attack: 0.0,
+                delay: 0.0,
+                ..op
+            },
+            1.0,
+        );
+        plain_env.gate_on();
+        let mut out = vec![0.0; 100];
+        plain_env.process(&mut out);
+        assert!(
+            (out[99] - 0.2).abs() < 1e-6,
+            "one decay to the sustain: {}",
+            out[99]
+        );
+        assert_eq!(plain_env.stage(), EnvStage::Sustain);
+        let mut bent = OpEnv::new();
+        bent.prepare(
+            1_000.0,
+            &Op {
+                curve: 1.0,
+                attack: 0.0,
+                delay: 0.0,
+                ..op
+            },
+            1.0,
+        );
+        bent.gate_on();
+        assert_eq!(
+            bent.stage(),
+            EnvStage::Decay,
+            "no delay, no attack: straight to the decay"
+        );
+        let mut out = vec![0.0; 100];
+        bent.process(&mut out);
+        assert!(
+            out[49] > 0.9,
+            "a curve of one had fallen to {} halfway",
+            out[49]
+        );
+        let mut params = plain();
+        params.ops[0].attack = 0.0;
+        params.ops[0].decay = 50.0;
+        params.ops[0].break_level = 0.1;
+        params.ops[0].decay2 = 200.0;
+        params.ops[0].sustain = 1.0;
+        let mut v = QuadVoices::new(FS, 256, params);
+        v.note_on(57, 100, 1);
+        let _ = run(&mut v, 2_400);
+        let low = rms(&run(&mut v, 480));
+        let _ = run(&mut v, 24_000);
+        let high = rms(&run(&mut v, 480));
+        assert!(high > low * 3.0, "no second decay upward: {low} -> {high}");
     }
 
     #[test]

@@ -73,24 +73,58 @@ fn rise_fall_curve(rect: egui::Rect, rise_ms: f32, fall_ms: f32, seconds: f32) -
         .collect()
 }
 
-/// An ADSR, as a polyline: attack up, decay to the sustain, a held
-/// stretch, then the release — the held stretch fixed, so the shape
-/// reads as attack/decay/release lengths against each other.
-fn adsr_curve(rect: egui::Rect, op: &crate::audio::quad::Op) -> Vec<egui::Pos2> {
+/// An operator's envelope as the voices walk it: delay, attack, the
+/// first decay to the break level, the second to the sustain, a held
+/// stretch, then the release — the decays bent by the curve, and the
+/// held stretch fixed so the stages read against each other. Returns
+/// the polyline and the stage corners.
+fn adsr_curve(rect: egui::Rect, op: &crate::audio::quad::Op) -> (Vec<egui::Pos2>, Vec<egui::Pos2>) {
+    let w = op.delay.max(0.0) / 1000.0;
     let a = op.attack.max(0.0) / 1000.0;
     let d = op.decay.max(1.0) / 1000.0;
+    let d2 = op.decay2.max(1.0) / 1000.0;
     let r = op.release.max(1.0) / 1000.0;
     let hold = 0.4f32;
-    let total = (a + d + hold + r).max(0.05);
+    let d2 = if op.break_level < 0.999 { d2 } else { 0.0 };
+    let total = (w + a + d + d2 + hold + r).max(0.05);
     let x = |t: f32| rect.left() + rect.width() * (t / total).clamp(0.0, 1.0);
     let y = |v: f32| rect.bottom() - rect.height() * v.clamp(0.0, 1.0);
-    vec![
-        egui::pos2(x(0.0), y(0.0)),
-        egui::pos2(x(a), y(1.0)),
-        egui::pos2(x(a + d), y(op.sustain)),
-        egui::pos2(x(a + d + hold), y(op.sustain)),
-        egui::pos2(x(total), y(0.0)),
-    ]
+    let mut points = vec![egui::pos2(x(0.0), y(0.0))];
+    let mut corners = Vec::new();
+    let mut t = 0.0f32;
+    let bent = |points: &mut Vec<egui::Pos2>, from: f32, to: f32, start: f32, len: f32| {
+        for i in 1..=12 {
+            let p = i as f32 / 12.0;
+            let v = from + (to - from) * qp::bend(op.curve, p);
+            points.push(egui::pos2(x(start + len * p), y(v)));
+        }
+    };
+    if w > 0.0 {
+        t += w;
+        points.push(egui::pos2(x(t), y(0.0)));
+        corners.push(egui::pos2(x(t), y(0.0)));
+    }
+    t += a;
+    points.push(egui::pos2(x(t), y(1.0)));
+    corners.push(egui::pos2(x(t), y(1.0)));
+    if op.break_level < 0.999 {
+        bent(&mut points, 1.0, op.break_level, t, d);
+        t += d;
+        corners.push(egui::pos2(x(t), y(op.break_level)));
+        bent(&mut points, op.break_level, op.sustain, t, d2);
+        t += d2;
+    } else {
+        // No break: one decay to the sustain, and the second is not spent.
+        bent(&mut points, 1.0, op.sustain, t, d);
+        t += d;
+    }
+    corners.push(egui::pos2(x(t), y(op.sustain)));
+    t += hold;
+    points.push(egui::pos2(x(t), y(op.sustain)));
+    corners.push(egui::pos2(x(t), y(op.sustain)));
+    bent(&mut points, op.sustain, 0.0, t, r);
+    corners.push(egui::pos2(x(total), y(0.0)));
+    (points, corners)
 }
 
 impl super::super::Stage {
@@ -679,18 +713,12 @@ fn draw_quad_room(
         if op == shown {
             continue;
         }
-        curve(
-            painter,
-            plot,
-            adsr_curve(plot, &p.ops[op]),
-            alpha(c.edge, 120),
-            1.0,
-            0,
-        );
+        let (points, _) = adsr_curve(plot, &p.ops[op]);
+        curve(painter, plot, points, alpha(c.edge, 120), 1.0, 0);
     }
-    let points = adsr_curve(plot, &p.ops[shown]);
-    curve(painter, plot, points.clone(), c.bright, 1.5, 28);
-    for point in &points {
+    let (points, corners) = adsr_curve(plot, &p.ops[shown]);
+    curve(painter, plot, points, c.bright, 1.5, 28);
+    for point in &corners {
         painter.circle_filled(*point, 2.0, c.bright);
     }
     let op = &p.ops[shown];
@@ -698,12 +726,15 @@ fn draw_quad_room(
         egui::pos2(plot.right(), plot.top() - 2.0),
         egui::Align2::RIGHT_BOTTOM,
         format!(
-            "OP {}  A {:.0}  D {:.0}  S {:.0}%  R {:.0}",
-            shown + 1,
+            "{:.0}·{:.0}·{:.0}>{:.0}%·{:.0}·{:.0}%·{:.0}  c{:+.1}",
+            op.delay,
             op.attack,
             op.decay,
+            op.break_level * 100.0,
+            op.decay2,
             op.sustain * 100.0,
-            op.release
+            op.release,
+            op.curve
         ),
         small.clone(),
         c.dim,
@@ -711,7 +742,7 @@ fn draw_quad_room(
     painter.text(
         egui::pos2(plot.left(), plot.bottom() + 3.0),
         egui::Align2::LEFT_TOP,
-        "attack · decay · hold · release",
+        "W · A · D>break · D2 · hold · R",
         small.clone(),
         c.dim,
     );

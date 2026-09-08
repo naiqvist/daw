@@ -27,23 +27,27 @@ const fn op_row(op: usize) -> [u32; 7] {
     ]
 }
 /// The operator's second page: its shape and how the key reaches it.
-const fn op_key_row(op: usize) -> [u32; 5] {
+const fn op_key_row(op: usize) -> [u32; 9] {
     [
         qp::op_param(op, qp::WAVE),
         qp::op_param(op, qp::FIXED),
         qp::op_param(op, qp::HZ),
         qp::op_param(op, qp::VEL),
         qp::op_param(op, qp::KEYSCALE),
+        qp::op_param(op, qp::DELAY),
+        qp::op_param(op, qp::BREAK),
+        qp::op_param(op, qp::DECAY2),
+        qp::op_param(op, qp::CURVE),
     ]
 }
 const OP1: [u32; 7] = op_row(0);
 const OP2: [u32; 7] = op_row(1);
 const OP3: [u32; 7] = op_row(2);
 const OP4: [u32; 7] = op_row(3);
-const OP1K: [u32; 5] = op_key_row(0);
-const OP2K: [u32; 5] = op_key_row(1);
-const OP3K: [u32; 5] = op_key_row(2);
-const OP4K: [u32; 5] = op_key_row(3);
+const OP1K: [u32; 9] = op_key_row(0);
+const OP2K: [u32; 9] = op_key_row(1);
+const OP3K: [u32; 9] = op_key_row(2);
+const OP4K: [u32; 9] = op_key_row(3);
 
 const fn lfo_row(lfo: usize) -> [u32; 8] {
     [
@@ -138,13 +142,13 @@ const PAGES: [(&str, &[u32]); 17] = [
 const CELL_UNITS: usize = 2;
 const FOOTER_ROWS: usize = CELL_UNITS;
 const HEADER_ROWS: usize = 1;
-const COUNT: usize = 112;
+const COUNT: usize = 128;
 
 pub fn pages() -> usize {
     PAGES.len()
 }
 
-/// A hundred and twelve cells: past serde's array limit, and never persisted —
+/// A hundred and twenty-eight cells: past serde's array limit, and never persisted —
 /// the rack rebuilds it from the engine's knobs every frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct QuadUi {
@@ -185,7 +189,10 @@ impl QuadUi {
 fn percent_row(param: u32) -> bool {
     matches!(
         qp::op_of(param),
-        Some((_, qp::LEVEL_OP)) | Some((_, qp::SUSTAIN)) | Some((_, qp::VEL))
+        Some((_, qp::LEVEL_OP))
+            | Some((_, qp::SUSTAIN))
+            | Some((_, qp::VEL))
+            | Some((_, qp::BREAK))
     ) || matches!(
         param,
         qp::KEYTRACK | qp::VELOCITY | qp::KEY_RATE | qp::WIDTH
@@ -237,7 +244,11 @@ fn param_of(id: u32) -> Param {
             qp::FIXED => Param::choice("fixed", qp::FIXED_NAMES),
             qp::HZ => log("hz", Unit::Hz),
             qp::VEL => Param::percent("vel"),
-            _ => linear("keyscale", Unit::Db).bipolar(),
+            qp::KEYSCALE => linear("keyscale", Unit::Db).bipolar(),
+            qp::DELAY => linear("delay", Unit::Ms),
+            qp::BREAK => Param::percent("break"),
+            qp::DECAY2 => log("decay 2", Unit::Ms),
+            _ => linear("curve", Unit::Plain).bipolar(),
         }
     } else {
         match id {
@@ -350,7 +361,11 @@ pub fn quad_is_discrete(param: u32) -> bool {
 pub fn quad_is_log(param: u32) -> bool {
     matches!(
         qp::op_of(param),
-        Some((_, qp::RATIO)) | Some((_, qp::DECAY)) | Some((_, qp::RELEASE)) | Some((_, qp::HZ))
+        Some((_, qp::RATIO))
+            | Some((_, qp::DECAY))
+            | Some((_, qp::RELEASE))
+            | Some((_, qp::HZ))
+            | Some((_, qp::DECAY2))
     ) || matches!(
         param,
         qp::PITCH1_FALL | qp::PITCH2_FALL | qp::CUTOFF | qp::RESO | qp::FENV_DEC | qp::DRIVE

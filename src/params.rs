@@ -390,10 +390,10 @@ pub mod stab {
 pub mod quad {
     use super::ParamDef;
 
-    /// The operators' rows: twelve per operator, in this order, so an
+    /// The operators' rows: sixteen per operator, in this order, so an
     /// operator's parameter id is `op * PER_OP + field`.
     pub const OPS: usize = 4;
-    pub const PER_OP: u32 = 12;
+    pub const PER_OP: u32 = 16;
     pub const RATIO: u32 = 0;
     pub const FINE: u32 = 1;
     pub const LEVEL_OP: u32 = 2;
@@ -406,6 +406,10 @@ pub mod quad {
     pub const HZ: u32 = 9;
     pub const VEL: u32 = 10;
     pub const KEYSCALE: u32 = 11;
+    pub const DELAY: u32 = 12;
+    pub const BREAK: u32 = 13;
+    pub const DECAY2: u32 = 14;
+    pub const CURVE: u32 = 15;
     /// Operator `op` (from zero), field `field`.
     pub const fn op_param(op: usize, field: u32) -> u32 {
         op as u32 * PER_OP + field
@@ -415,56 +419,73 @@ pub mod quad {
         (param < OPS as u32 * PER_OP).then(|| ((param / PER_OP) as usize, param % PER_OP))
     }
 
-    pub const ALGO: u32 = 48;
-    pub const FEEDBACK: u32 = 49;
-    pub const PITCH1: u32 = 50;
-    pub const PITCH1_RISE: u32 = 51;
-    pub const PITCH1_FALL: u32 = 52;
-    pub const PITCH2: u32 = 53;
-    pub const PITCH2_RISE: u32 = 54;
-    pub const PITCH2_FALL: u32 = 55;
-    pub const FMODE: u32 = 56;
-    pub const CUTOFF: u32 = 57;
-    pub const RESO: u32 = 58;
-    pub const FENV: u32 = 59;
-    pub const FENV_ATT: u32 = 60;
-    pub const FENV_DEC: u32 = 61;
-    pub const KEYTRACK: u32 = 62;
-    pub const DIST: u32 = 63;
-    pub const DRIVE: u32 = 64;
-    pub const VELOCITY: u32 = 65;
-    pub const LEVEL: u32 = 66;
-    pub const KEY_RATE: u32 = 67;
-    pub const UNISON: u32 = 68;
-    pub const UDETUNE: u32 = 69;
-    pub const WIDTH: u32 = 70;
-    pub const MONO: u32 = 71;
-    pub const GLIDE: u32 = 72;
-    pub const FB_OP: u32 = 73;
-    pub const LFO1_RATE: u32 = 74;
-    pub const LFO1_SHAPE: u32 = 75;
-    pub const LFO1_DELAY: u32 = 76;
-    pub const LFO1_FADE: u32 = 77;
-    pub const LFO1_PITCH: u32 = 78;
-    pub const LFO1_MOD: u32 = 79;
-    pub const LFO1_AMP: u32 = 80;
-    pub const LFO1_FILTER: u32 = 81;
-    pub const LFO2_RATE: u32 = 82;
-    pub const LFO2_SHAPE: u32 = 83;
-    pub const LFO2_DELAY: u32 = 84;
-    pub const LFO2_FADE: u32 = 85;
-    pub const LFO2_PITCH: u32 = 86;
-    pub const LFO2_MOD: u32 = 87;
-    pub const LFO2_AMP: u32 = 88;
-    pub const LFO2_FILTER: u32 = 89;
+    pub const ALGO: u32 = 64;
+    pub const FEEDBACK: u32 = 65;
+    pub const PITCH1: u32 = 66;
+    pub const PITCH1_RISE: u32 = 67;
+    pub const PITCH1_FALL: u32 = 68;
+    pub const PITCH2: u32 = 69;
+    pub const PITCH2_RISE: u32 = 70;
+    pub const PITCH2_FALL: u32 = 71;
+    pub const FMODE: u32 = 72;
+    pub const CUTOFF: u32 = 73;
+    pub const RESO: u32 = 74;
+    pub const FENV: u32 = 75;
+    pub const FENV_ATT: u32 = 76;
+    pub const FENV_DEC: u32 = 77;
+    pub const KEYTRACK: u32 = 78;
+    pub const DIST: u32 = 79;
+    pub const DRIVE: u32 = 80;
+    pub const VELOCITY: u32 = 81;
+    pub const LEVEL: u32 = 82;
+    pub const KEY_RATE: u32 = 83;
+    pub const UNISON: u32 = 84;
+    pub const UDETUNE: u32 = 85;
+    pub const WIDTH: u32 = 86;
+    pub const MONO: u32 = 87;
+    pub const GLIDE: u32 = 88;
+    pub const FB_OP: u32 = 89;
+    pub const LFO1_RATE: u32 = 90;
+    pub const LFO1_SHAPE: u32 = 91;
+    pub const LFO1_DELAY: u32 = 92;
+    pub const LFO1_FADE: u32 = 93;
+    pub const LFO1_PITCH: u32 = 94;
+    pub const LFO1_MOD: u32 = 95;
+    pub const LFO1_AMP: u32 = 96;
+    pub const LFO1_FILTER: u32 = 97;
+    pub const LFO2_RATE: u32 = 98;
+    pub const LFO2_SHAPE: u32 = 99;
+    pub const LFO2_DELAY: u32 = 100;
+    pub const LFO2_FADE: u32 = 101;
+    pub const LFO2_PITCH: u32 = 102;
+    pub const LFO2_MOD: u32 = 103;
+    pub const LFO2_AMP: u32 = 104;
+    pub const LFO2_FILTER: u32 = 105;
+
+    /// The two LFOs' rows are laid out alike: `LFO2_RATE - LFO1_RATE`
+    /// apart.
+    pub const LFOS: usize = 2;
+    pub const PER_LFO: u32 = LFO2_RATE - LFO1_RATE;
+    pub const fn lfo_param(lfo: usize, field: u32) -> u32 {
+        LFO1_RATE + lfo as u32 * PER_LFO + field
+    }
+    pub const LFO_RATE: u32 = 0;
+    pub const LFO_SHAPE: u32 = 1;
+    pub const LFO_DELAY: u32 = 2;
+    pub const LFO_FADE: u32 = 3;
+    pub const LFO_PITCH: u32 = 4;
+    pub const LFO_MOD: u32 = 5;
+    pub const LFO_AMP: u32 = 6;
+    pub const LFO_FILTER: u32 = 7;
+
     /// The free routing matrix: `MATRIX + from * OPS + to` is how much of
     /// operator `from` reaches operator `to`'s phase, self included.
     /// Used when ALGO is the matrix.
-    pub const MATRIX: u32 = 90;
+    pub const MATRIX: u32 = 106;
     /// Each operator's level to the output, in matrix mode.
-    pub const OUT: u32 = 106;
-    pub const ENV_LOOP: u32 = 110;
-    pub const OVERSAMPLE: u32 = 111;
+    pub const OUT: u32 = 122;
+    pub const ENV_LOOP: u32 = 126;
+    pub const OVERSAMPLE: u32 = 127;
     pub const fn matrix_param(from: usize, to: usize) -> u32 {
         MATRIX + (from * OPS + to) as u32
     }
@@ -489,22 +510,6 @@ pub mod quad {
     pub const ALGO_MATRIX: f32 = 8.0;
     pub const LOOP_NAMES: &[&str] = &["off", "held"];
     pub const OVERSAMPLE_NAMES: &[&str] = &["1x", "2x"];
-
-    /// The two LFOs' rows are laid out alike: `LFO2_RATE - LFO1_RATE`
-    /// apart.
-    pub const LFOS: usize = 2;
-    pub const PER_LFO: u32 = LFO2_RATE - LFO1_RATE;
-    pub const fn lfo_param(lfo: usize, field: u32) -> u32 {
-        LFO1_RATE + lfo as u32 * PER_LFO + field
-    }
-    pub const LFO_RATE: u32 = 0;
-    pub const LFO_SHAPE: u32 = 1;
-    pub const LFO_DELAY: u32 = 2;
-    pub const LFO_FADE: u32 = 3;
-    pub const LFO_PITCH: u32 = 4;
-    pub const LFO_MOD: u32 = 5;
-    pub const LFO_AMP: u32 = 6;
-    pub const LFO_FILTER: u32 = 7;
 
     pub const ALGO_NAMES: &[&str] = &[
         "4>3>2>1",
@@ -597,6 +602,15 @@ pub mod quad {
         algo.edges.iter().any(|(m, _)| *m == op)
     }
 
+    /// How a decay's progress `p` in `0..=1` is bent by CURVE: nought is
+    /// straight, up is slow to start and quick to finish, down the
+    /// reverse. The same rule the room draws with.
+    pub fn bend(curve: f32, p: f32) -> f32 {
+        let p = p.clamp(0.0, 1.0);
+        let k = (curve.clamp(-1.0, 1.0) * 2.0).exp2();
+        p.powf(k)
+    }
+
     pub const TABLE: &[ParamDef] = &[
         ParamDef {
             id: 0,
@@ -684,699 +698,811 @@ pub mod quad {
         },
         ParamDef {
             id: 12,
+            name: "op1 delay",
+            min: 0.00,
+            max: 2000.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 13,
+            name: "op1 break",
+            min: 0.00,
+            max: 1.00,
+            default: 1.00,
+        },
+        ParamDef {
+            id: 14,
+            name: "op1 decay 2",
+            min: 1.00,
+            max: 8000.00,
+            default: 400.00,
+        },
+        ParamDef {
+            id: 15,
+            name: "op1 curve",
+            min: -1.00,
+            max: 1.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 16,
             name: "op2 ratio",
             min: 0.25,
             max: 16.00,
             default: 2.00,
         },
         ParamDef {
-            id: 13,
+            id: 17,
             name: "op2 fine",
             min: -100.00,
             max: 100.00,
             default: 0.00,
         },
         ParamDef {
-            id: 14,
+            id: 18,
             name: "op2 level",
             min: 0.00,
             max: 1.00,
             default: 0.55,
         },
         ParamDef {
-            id: 15,
+            id: 19,
             name: "op2 attack",
             min: 0.00,
             max: 2000.00,
             default: 1.00,
         },
         ParamDef {
-            id: 16,
+            id: 20,
             name: "op2 decay",
             min: 1.00,
             max: 4000.00,
             default: 400.00,
         },
         ParamDef {
-            id: 17,
+            id: 21,
             name: "op2 sustain",
             min: 0.00,
             max: 1.00,
             default: 0.30,
         },
         ParamDef {
-            id: 18,
+            id: 22,
             name: "op2 release",
             min: 1.00,
             max: 4000.00,
             default: 250.00,
         },
         ParamDef {
-            id: 19,
+            id: 23,
             name: "op2 wave",
             min: 0.00,
             max: 4.00,
             default: 0.00,
         },
         ParamDef {
-            id: 20,
+            id: 24,
             name: "op2 fixed",
             min: 0.00,
             max: 1.00,
             default: 0.00,
         },
         ParamDef {
-            id: 21,
+            id: 25,
             name: "op2 hz",
             min: 1.00,
             max: 10000.00,
             default: 440.00,
         },
         ParamDef {
-            id: 22,
+            id: 26,
             name: "op2 vel",
             min: 0.00,
             max: 1.00,
             default: 0.50,
         },
         ParamDef {
-            id: 23,
+            id: 27,
             name: "op2 keyscale",
             min: -12.00,
             max: 12.00,
             default: 0.00,
         },
         ParamDef {
-            id: 24,
+            id: 28,
+            name: "op2 delay",
+            min: 0.00,
+            max: 2000.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 29,
+            name: "op2 break",
+            min: 0.00,
+            max: 1.00,
+            default: 1.00,
+        },
+        ParamDef {
+            id: 30,
+            name: "op2 decay 2",
+            min: 1.00,
+            max: 8000.00,
+            default: 400.00,
+        },
+        ParamDef {
+            id: 31,
+            name: "op2 curve",
+            min: -1.00,
+            max: 1.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 32,
             name: "op3 ratio",
             min: 0.25,
             max: 16.00,
             default: 1.00,
         },
         ParamDef {
-            id: 25,
+            id: 33,
             name: "op3 fine",
             min: -100.00,
             max: 100.00,
             default: 0.00,
         },
         ParamDef {
-            id: 26,
+            id: 34,
             name: "op3 level",
             min: 0.00,
             max: 1.00,
             default: 0.00,
         },
         ParamDef {
-            id: 27,
+            id: 35,
             name: "op3 attack",
             min: 0.00,
             max: 2000.00,
             default: 1.00,
         },
         ParamDef {
-            id: 28,
+            id: 36,
             name: "op3 decay",
             min: 1.00,
             max: 4000.00,
             default: 400.00,
         },
         ParamDef {
-            id: 29,
+            id: 37,
             name: "op3 sustain",
             min: 0.00,
             max: 1.00,
             default: 0.30,
         },
         ParamDef {
-            id: 30,
+            id: 38,
             name: "op3 release",
             min: 1.00,
             max: 4000.00,
             default: 250.00,
         },
         ParamDef {
-            id: 31,
+            id: 39,
             name: "op3 wave",
             min: 0.00,
             max: 4.00,
             default: 0.00,
         },
         ParamDef {
-            id: 32,
+            id: 40,
             name: "op3 fixed",
             min: 0.00,
             max: 1.00,
             default: 0.00,
         },
         ParamDef {
-            id: 33,
+            id: 41,
             name: "op3 hz",
             min: 1.00,
             max: 10000.00,
             default: 440.00,
         },
         ParamDef {
-            id: 34,
+            id: 42,
             name: "op3 vel",
             min: 0.00,
             max: 1.00,
             default: 0.50,
         },
         ParamDef {
-            id: 35,
+            id: 43,
             name: "op3 keyscale",
             min: -12.00,
             max: 12.00,
             default: 0.00,
         },
         ParamDef {
-            id: 36,
+            id: 44,
+            name: "op3 delay",
+            min: 0.00,
+            max: 2000.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 45,
+            name: "op3 break",
+            min: 0.00,
+            max: 1.00,
+            default: 1.00,
+        },
+        ParamDef {
+            id: 46,
+            name: "op3 decay 2",
+            min: 1.00,
+            max: 8000.00,
+            default: 400.00,
+        },
+        ParamDef {
+            id: 47,
+            name: "op3 curve",
+            min: -1.00,
+            max: 1.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 48,
             name: "op4 ratio",
             min: 0.25,
             max: 16.00,
             default: 1.00,
         },
         ParamDef {
-            id: 37,
+            id: 49,
             name: "op4 fine",
             min: -100.00,
             max: 100.00,
             default: 0.00,
         },
         ParamDef {
-            id: 38,
+            id: 50,
             name: "op4 level",
             min: 0.00,
             max: 1.00,
             default: 0.00,
         },
         ParamDef {
-            id: 39,
+            id: 51,
             name: "op4 attack",
             min: 0.00,
             max: 2000.00,
             default: 1.00,
         },
         ParamDef {
-            id: 40,
+            id: 52,
             name: "op4 decay",
             min: 1.00,
             max: 4000.00,
             default: 400.00,
         },
         ParamDef {
-            id: 41,
+            id: 53,
             name: "op4 sustain",
             min: 0.00,
             max: 1.00,
             default: 0.30,
         },
         ParamDef {
-            id: 42,
+            id: 54,
             name: "op4 release",
             min: 1.00,
             max: 4000.00,
             default: 250.00,
         },
         ParamDef {
-            id: 43,
+            id: 55,
             name: "op4 wave",
             min: 0.00,
             max: 4.00,
             default: 0.00,
         },
         ParamDef {
-            id: 44,
+            id: 56,
             name: "op4 fixed",
             min: 0.00,
             max: 1.00,
             default: 0.00,
         },
         ParamDef {
-            id: 45,
+            id: 57,
             name: "op4 hz",
             min: 1.00,
             max: 10000.00,
             default: 440.00,
         },
         ParamDef {
-            id: 46,
+            id: 58,
             name: "op4 vel",
             min: 0.00,
             max: 1.00,
             default: 0.50,
         },
         ParamDef {
-            id: 47,
+            id: 59,
             name: "op4 keyscale",
             min: -12.00,
             max: 12.00,
             default: 0.00,
         },
         ParamDef {
-            id: 48,
-            name: "algo",
-            min: 0.00,
-            max: 8.00,
-            default: 0.00,
-        },
-        ParamDef {
-            id: 49,
-            name: "feedback",
-            min: -1.00,
-            max: 1.00,
-            default: 0.00,
-        },
-        ParamDef {
-            id: 50,
-            name: "pitch 1",
-            min: -48.00,
-            max: 48.00,
-            default: 0.00,
-        },
-        ParamDef {
-            id: 51,
-            name: "p1 rise",
-            min: 0.00,
-            max: 2000.00,
-            default: 0.00,
-        },
-        ParamDef {
-            id: 52,
-            name: "p1 fall",
-            min: 1.00,
-            max: 4000.00,
-            default: 200.00,
-        },
-        ParamDef {
-            id: 53,
-            name: "pitch 2",
-            min: -48.00,
-            max: 48.00,
-            default: 0.00,
-        },
-        ParamDef {
-            id: 54,
-            name: "p2 rise",
-            min: 0.00,
-            max: 2000.00,
-            default: 0.00,
-        },
-        ParamDef {
-            id: 55,
-            name: "p2 fall",
-            min: 1.00,
-            max: 4000.00,
-            default: 200.00,
-        },
-        ParamDef {
-            id: 56,
-            name: "filter",
-            min: 0.00,
-            max: 3.00,
-            default: 0.00,
-        },
-        ParamDef {
-            id: 57,
-            name: "cutoff",
-            min: 20.00,
-            max: 20000.00,
-            default: 12000.00,
-        },
-        ParamDef {
-            id: 58,
-            name: "reso",
-            min: 0.50,
-            max: 20.00,
-            default: 0.80,
-        },
-        ParamDef {
-            id: 59,
-            name: "f env",
-            min: -6.00,
-            max: 6.00,
-            default: 0.00,
-        },
-        ParamDef {
             id: 60,
-            name: "f attack",
+            name: "op4 delay",
             min: 0.00,
             max: 2000.00,
             default: 0.00,
         },
         ParamDef {
             id: 61,
+            name: "op4 break",
+            min: 0.00,
+            max: 1.00,
+            default: 1.00,
+        },
+        ParamDef {
+            id: 62,
+            name: "op4 decay 2",
+            min: 1.00,
+            max: 8000.00,
+            default: 400.00,
+        },
+        ParamDef {
+            id: 63,
+            name: "op4 curve",
+            min: -1.00,
+            max: 1.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 64,
+            name: "algo",
+            min: 0.00,
+            max: 8.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 65,
+            name: "feedback",
+            min: -1.00,
+            max: 1.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 66,
+            name: "pitch 1",
+            min: -48.00,
+            max: 48.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 67,
+            name: "p1 rise",
+            min: 0.00,
+            max: 2000.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 68,
+            name: "p1 fall",
+            min: 1.00,
+            max: 4000.00,
+            default: 200.00,
+        },
+        ParamDef {
+            id: 69,
+            name: "pitch 2",
+            min: -48.00,
+            max: 48.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 70,
+            name: "p2 rise",
+            min: 0.00,
+            max: 2000.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 71,
+            name: "p2 fall",
+            min: 1.00,
+            max: 4000.00,
+            default: 200.00,
+        },
+        ParamDef {
+            id: 72,
+            name: "filter",
+            min: 0.00,
+            max: 3.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 73,
+            name: "cutoff",
+            min: 20.00,
+            max: 20000.00,
+            default: 12000.00,
+        },
+        ParamDef {
+            id: 74,
+            name: "reso",
+            min: 0.50,
+            max: 20.00,
+            default: 0.80,
+        },
+        ParamDef {
+            id: 75,
+            name: "f env",
+            min: -6.00,
+            max: 6.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 76,
+            name: "f attack",
+            min: 0.00,
+            max: 2000.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 77,
             name: "f decay",
             min: 1.00,
             max: 4000.00,
             default: 300.00,
         },
         ParamDef {
-            id: 62,
+            id: 78,
             name: "keytrack",
             min: 0.00,
             max: 1.00,
             default: 0.50,
         },
         ParamDef {
-            id: 63,
+            id: 79,
             name: "dist",
             min: 0.00,
             max: 3.00,
             default: 0.00,
         },
         ParamDef {
-            id: 64,
+            id: 80,
             name: "drive",
             min: 1.00,
             max: 32.00,
             default: 1.00,
         },
         ParamDef {
-            id: 65,
+            id: 81,
             name: "velocity",
             min: 0.00,
             max: 1.00,
             default: 0.60,
         },
         ParamDef {
-            id: 66,
+            id: 82,
             name: "level",
             min: 0.00,
             max: 2.00,
             default: 0.80,
         },
         ParamDef {
-            id: 67,
+            id: 83,
             name: "key rate",
             min: 0.00,
             max: 1.00,
             default: 0.30,
         },
         ParamDef {
-            id: 68,
+            id: 84,
             name: "unison",
             min: 1.00,
             max: 4.00,
             default: 1.00,
         },
         ParamDef {
-            id: 69,
+            id: 85,
             name: "udetune",
             min: 0.00,
             max: 50.00,
             default: 10.00,
         },
         ParamDef {
-            id: 70,
+            id: 86,
             name: "width",
             min: 0.00,
             max: 1.00,
             default: 0.50,
         },
         ParamDef {
-            id: 71,
+            id: 87,
             name: "mode",
             min: 0.00,
             max: 2.00,
             default: 0.00,
         },
         ParamDef {
-            id: 72,
+            id: 88,
             name: "glide",
             min: 0.00,
             max: 2000.00,
             default: 0.00,
         },
         ParamDef {
-            id: 73,
+            id: 89,
             name: "fb op",
             min: 0.00,
             max: 3.00,
             default: 3.00,
         },
         ParamDef {
-            id: 74,
+            id: 90,
             name: "lfo1 rate",
             min: 0.05,
             max: 20.00,
             default: 5.00,
         },
         ParamDef {
-            id: 75,
+            id: 91,
             name: "lfo1 shape",
             min: 0.00,
             max: 3.00,
             default: 0.00,
         },
         ParamDef {
-            id: 76,
+            id: 92,
             name: "lfo1 delay",
             min: 0.00,
             max: 4000.00,
             default: 0.00,
         },
         ParamDef {
-            id: 77,
+            id: 93,
             name: "lfo1 fade",
             min: 0.00,
             max: 4000.00,
             default: 0.00,
         },
         ParamDef {
-            id: 78,
+            id: 94,
             name: "lfo1 pitch",
             min: 0.00,
             max: 12.00,
             default: 0.00,
         },
         ParamDef {
-            id: 79,
+            id: 95,
             name: "lfo1 mod",
             min: 0.00,
             max: 1.00,
             default: 0.00,
         },
         ParamDef {
-            id: 80,
+            id: 96,
             name: "lfo1 amp",
             min: 0.00,
             max: 1.00,
             default: 0.00,
         },
         ParamDef {
-            id: 81,
+            id: 97,
             name: "lfo1 filter",
             min: -4.00,
             max: 4.00,
             default: 0.00,
         },
         ParamDef {
-            id: 82,
+            id: 98,
             name: "lfo2 rate",
             min: 0.05,
             max: 20.00,
             default: 5.00,
         },
         ParamDef {
-            id: 83,
+            id: 99,
             name: "lfo2 shape",
             min: 0.00,
             max: 3.00,
             default: 0.00,
         },
         ParamDef {
-            id: 84,
+            id: 100,
             name: "lfo2 delay",
             min: 0.00,
             max: 4000.00,
             default: 0.00,
         },
         ParamDef {
-            id: 85,
+            id: 101,
             name: "lfo2 fade",
             min: 0.00,
             max: 4000.00,
             default: 0.00,
         },
         ParamDef {
-            id: 86,
+            id: 102,
             name: "lfo2 pitch",
             min: 0.00,
             max: 12.00,
             default: 0.00,
         },
         ParamDef {
-            id: 87,
+            id: 103,
             name: "lfo2 mod",
             min: 0.00,
             max: 1.00,
             default: 0.00,
         },
         ParamDef {
-            id: 88,
+            id: 104,
             name: "lfo2 amp",
             min: 0.00,
             max: 1.00,
             default: 0.00,
         },
         ParamDef {
-            id: 89,
+            id: 105,
             name: "lfo2 filter",
             min: -4.00,
             max: 4.00,
             default: 0.00,
         },
         ParamDef {
-            id: 90,
+            id: 106,
             name: "1>1",
             min: 0.00,
             max: 1.00,
             default: 0.00,
         },
         ParamDef {
-            id: 91,
+            id: 107,
             name: "1>2",
             min: 0.00,
             max: 1.00,
             default: 0.00,
         },
         ParamDef {
-            id: 92,
+            id: 108,
             name: "1>3",
             min: 0.00,
             max: 1.00,
             default: 0.00,
         },
         ParamDef {
-            id: 93,
+            id: 109,
             name: "1>4",
             min: 0.00,
             max: 1.00,
             default: 0.00,
         },
         ParamDef {
-            id: 94,
+            id: 110,
             name: "2>1",
             min: 0.00,
             max: 1.00,
             default: 1.00,
         },
         ParamDef {
-            id: 95,
+            id: 111,
             name: "2>2",
             min: 0.00,
             max: 1.00,
             default: 0.00,
         },
         ParamDef {
-            id: 96,
+            id: 112,
             name: "2>3",
             min: 0.00,
             max: 1.00,
             default: 0.00,
         },
         ParamDef {
-            id: 97,
+            id: 113,
             name: "2>4",
             min: 0.00,
             max: 1.00,
             default: 0.00,
         },
         ParamDef {
-            id: 98,
+            id: 114,
             name: "3>1",
             min: 0.00,
             max: 1.00,
             default: 0.00,
         },
         ParamDef {
-            id: 99,
+            id: 115,
             name: "3>2",
             min: 0.00,
             max: 1.00,
             default: 1.00,
         },
         ParamDef {
-            id: 100,
+            id: 116,
             name: "3>3",
             min: 0.00,
             max: 1.00,
             default: 0.00,
         },
         ParamDef {
-            id: 101,
+            id: 117,
             name: "3>4",
             min: 0.00,
             max: 1.00,
             default: 0.00,
         },
         ParamDef {
-            id: 102,
+            id: 118,
             name: "4>1",
             min: 0.00,
             max: 1.00,
             default: 0.00,
         },
         ParamDef {
-            id: 103,
+            id: 119,
             name: "4>2",
             min: 0.00,
             max: 1.00,
             default: 0.00,
         },
         ParamDef {
-            id: 104,
+            id: 120,
             name: "4>3",
             min: 0.00,
             max: 1.00,
             default: 1.00,
         },
         ParamDef {
-            id: 105,
+            id: 121,
             name: "4>4",
             min: 0.00,
             max: 1.00,
             default: 0.00,
         },
         ParamDef {
-            id: 106,
+            id: 122,
             name: "out 1",
             min: 0.00,
             max: 1.00,
             default: 1.00,
         },
         ParamDef {
-            id: 107,
+            id: 123,
             name: "out 2",
             min: 0.00,
             max: 1.00,
             default: 0.00,
         },
         ParamDef {
-            id: 108,
+            id: 124,
             name: "out 3",
             min: 0.00,
             max: 1.00,
             default: 0.00,
         },
         ParamDef {
-            id: 109,
+            id: 125,
             name: "out 4",
             min: 0.00,
             max: 1.00,
             default: 0.00,
         },
         ParamDef {
-            id: 110,
+            id: 126,
             name: "env loop",
             min: 0.00,
             max: 1.00,
             default: 0.00,
         },
         ParamDef {
-            id: 111,
+            id: 127,
             name: "oversample",
             min: 0.00,
             max: 1.00,
@@ -1393,17 +1519,20 @@ pub mod quad {
             for (i, def) in TABLE.iter().enumerate() {
                 assert_eq!(def.id, i as u32, "{}", def.name);
             }
-            assert_eq!(TABLE.len(), OPS * PER_OP as usize + 42 + 16 + 4 + 2);
-            assert_eq!(matrix_of(matrix_param(3, 0)), Some((3, 0)));
-            assert_eq!(out_of(out_param(2)), Some(2));
-            assert_eq!(matrix_of(OUT), None);
-            assert_eq!(ALGO_NAMES.len(), ALGORITHMS.len() + 1);
+            assert_eq!(TABLE.len(), 128);
             assert_eq!(op_of(op_param(2, SUSTAIN)), Some((2, SUSTAIN)));
-            assert_eq!(op_of(op_param(3, KEYSCALE)), Some((3, KEYSCALE)));
+            assert_eq!(op_of(op_param(3, CURVE)), Some((3, CURVE)));
             assert_eq!(op_of(ALGO), None);
             assert_eq!(lfo_param(1, LFO_FILTER), LFO2_FILTER);
             assert_eq!(lfo_param(0, LFO_SHAPE), LFO1_SHAPE);
+            assert_eq!(matrix_of(matrix_param(3, 0)), Some((3, 0)));
+            assert_eq!(out_of(out_param(2)), Some(2));
+            assert_eq!(matrix_of(OUT), None);
+            assert_eq!(OVERSAMPLE as usize + 1, TABLE.len());
+            assert_eq!(ALGO_NAMES.len(), ALGORITHMS.len() + 1);
             assert_eq!(WAVE_NAMES.len(), WAVE_NOISE as usize + 1);
+            assert!((bend(0.0, 0.5) - 0.5).abs() < 1e-6);
+            assert!(bend(1.0, 0.5) < 0.3 && bend(-1.0, 0.5) > 0.7);
             for algo in ALGORITHMS {
                 assert!(!algo.carriers.is_empty());
                 for (m, c) in algo.edges {

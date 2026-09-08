@@ -3189,6 +3189,30 @@ pub static DEVICES: &[DeviceSpec] = &[
                 choices: &[],
             },
             ParamLabel {
+                name: "Delay",
+                unit: "ms",
+                group: "Op 1",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Break",
+                unit: "",
+                group: "Op 1",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Decay 2",
+                unit: "ms",
+                group: "Op 1",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Curve",
+                unit: "",
+                group: "Op 1",
+                choices: &[],
+            },
+            ParamLabel {
                 name: "Ratio",
                 unit: "x",
                 group: "Op 2",
@@ -3261,6 +3285,30 @@ pub static DEVICES: &[DeviceSpec] = &[
                 choices: &[],
             },
             ParamLabel {
+                name: "Delay",
+                unit: "ms",
+                group: "Op 2",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Break",
+                unit: "",
+                group: "Op 2",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Decay 2",
+                unit: "ms",
+                group: "Op 2",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Curve",
+                unit: "",
+                group: "Op 2",
+                choices: &[],
+            },
+            ParamLabel {
                 name: "Ratio",
                 unit: "x",
                 group: "Op 3",
@@ -3333,6 +3381,30 @@ pub static DEVICES: &[DeviceSpec] = &[
                 choices: &[],
             },
             ParamLabel {
+                name: "Delay",
+                unit: "ms",
+                group: "Op 3",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Break",
+                unit: "",
+                group: "Op 3",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Decay 2",
+                unit: "ms",
+                group: "Op 3",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Curve",
+                unit: "",
+                group: "Op 3",
+                choices: &[],
+            },
+            ParamLabel {
                 name: "Ratio",
                 unit: "x",
                 group: "Op 4",
@@ -3401,6 +3473,30 @@ pub static DEVICES: &[DeviceSpec] = &[
             ParamLabel {
                 name: "Keyscale",
                 unit: "dB/oct",
+                group: "Op 4",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Delay",
+                unit: "ms",
+                group: "Op 4",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Break",
+                unit: "",
+                group: "Op 4",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Decay 2",
+                unit: "ms",
+                group: "Op 4",
+                choices: &[],
+            },
+            ParamLabel {
+                name: "Curve",
+                unit: "",
                 group: "Op 4",
                 choices: &[],
             },

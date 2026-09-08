@@ -1349,6 +1349,10 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
             device.set(q::op_param(3, q::WAVE), 2.0);
             device.set(q::op_param(2, q::FIXED), 1.0);
             device.set(q::op_param(2, q::HZ), 1_200.0);
+            device.set(q::op_param(1, q::BREAK), 0.35);
+            device.set(q::op_param(1, q::DECAY2), 900.0);
+            device.set(q::op_param(1, q::CURVE), 0.6);
+            device.set(q::op_param(1, q::DELAY), 60.0);
             device.set(q::FEEDBACK, 0.3);
             device.set(q::PITCH2, 7.0);
             device.set(q::FENV, 2.0);
