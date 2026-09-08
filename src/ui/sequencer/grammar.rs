@@ -75,6 +75,10 @@ pub(crate) struct Utterance {
 pub(crate) struct Sentence {
     count: usize,
     pending: Option<Verb>,
+    /// A mode the grid is in — the Euclidean mode — and the line it
+    /// shows for it. While one is on, the sentence is not empty: Escape
+    /// is spoken as CANCEL rather than leaving the clip.
+    modal: Option<String>,
 }
 
 impl Sentence {
@@ -85,6 +89,18 @@ impl Sentence {
             while ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, *key)) {
                 self.feed_digit(digit);
             }
+        }
+        if self.modal.is_some()
+            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            self.count = 0;
+            self.pending = None;
+            return Some(Utterance {
+                count: 0,
+                verb: Some(Verb::Cancel),
+                motion: None,
+                held: false,
+            });
         }
         if !self.is_empty()
             && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
@@ -127,7 +143,22 @@ impl Sentence {
     }
 
     /// The sentence so far, for the status line. Empty when at rest.
+    /// Put the grid's mode on the sentence, or take it off.
+    pub(crate) fn set_modal(&mut self, hud: Option<String>) {
+        self.modal = hud;
+    }
+
+    pub(crate) fn is_modal(&self) -> bool {
+        self.modal.is_some()
+    }
+
     pub(crate) fn display(&self) -> String {
+        if let Some(hud) = &self.modal {
+            return match self.count {
+                0 => hud.clone(),
+                count => format!("{count} · {hud}"),
+            };
+        }
         match (self.count, self.pending) {
             (0, None) => String::new(),
             (0, Some(verb)) => format!("{} …", verb.name()),
@@ -137,7 +168,7 @@ impl Sentence {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.count == 0 && self.pending.is_none()
+        self.count == 0 && self.pending.is_none() && self.modal.is_none()
     }
 
     fn feed_digit(&mut self, digit: usize) {
@@ -207,6 +238,41 @@ mod tests {
         let utterance = sentence.feed_motion(Motion::Right, false);
         assert_eq!(utterance.count, 42);
         assert_eq!(utterance.verb, None);
+        assert!(sentence.is_empty());
+    }
+
+    #[test]
+    fn a_mode_on_the_sentence_holds_escape_and_shows_its_line() {
+        let mut sentence = Sentence::default();
+        assert!(sentence.is_empty() && !sentence.is_modal());
+        sentence.set_modal(Some("EUCLID 3/16".to_owned()));
+        assert!(!sentence.is_empty() && sentence.is_modal());
+        assert_eq!(sentence.display(), "EUCLID 3/16");
+        sentence.feed_digit(2);
+        assert_eq!(sentence.display(), "2 · EUCLID 3/16");
+        // Escape while modal is CANCEL, and the count goes with it.
+        let ctx = egui::Context::default();
+        let mut run = ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ui| {
+                let spoken = sentence.consume(ui.ctx());
+                assert_eq!(
+                    spoken.map(|u| (u.verb, u.count)),
+                    Some((Some(Verb::Cancel), 0))
+                );
+            },
+        );
+        run.textures_delta.clear();
+        sentence.set_modal(None);
         assert!(sentence.is_empty());
     }
 

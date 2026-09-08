@@ -65,6 +65,8 @@ fn verb_hint(verb: Verb) -> &'static str {
         Verb::Search => "find by name in this panel's world",
         Verb::StackYank => "copy the whole note stack into the register",
         Verb::StackPut => "replace this step with the yanked stack",
+        Verb::Euclid => "Euclidean mode: arrows cycle the rhythm, ENTER keeps, ESC puts it back",
+        Verb::Cancel => "leave the mode and put back what was there",
     }
 }
 

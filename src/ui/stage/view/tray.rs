@@ -219,7 +219,8 @@ impl super::super::Stage {
             let edited = !outcome.intents.is_empty();
             self.apply_sequence(shown.pattern, &outcome.intents);
             if edited {
-                if self.entry_held {
+                // A mode's edits are one edit: settled when the mode ends.
+                if self.entry_held || self.sentence.is_modal() {
                     self.entry_transaction = true;
                 } else {
                     // Sequencer edits are produced while drawing, outside

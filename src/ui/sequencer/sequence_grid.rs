@@ -155,6 +155,8 @@ pub(crate) struct SequenceGrid {
     /// The last refusal, shown in the status line until the next sentence.
     /// Silence is forbidden: an unsupported verb answers out loud.
     refusal: Option<String>,
+    /// The Euclidean mode while it is on.
+    euclid: Option<crate::ui::sequencer::euclid::Euclid>,
     /// Where the cursor's cell was drawn this frame, so a surface over
     /// the grid can point at the thing under the cursor. A fact about
     /// the last draw, never about the model: `None` until drawn.
@@ -176,6 +178,7 @@ impl Default for SequenceGrid {
             selection_clip: None,
             selection_anchor: None,
             refusal: None,
+            euclid: None,
             cursor_rect: None,
         }
     }
@@ -948,6 +951,42 @@ impl SequenceGrid {
         };
         self.refusal = None;
         self.speak(utterance, selecting, voice.registers, clip, intents);
+        // The sentence carries the mode's line, and owns Escape while
+        // the mode is on.
+        voice.sentence.set_modal(
+            self.euclid
+                .as_ref()
+                .map(crate::ui::sequencer::euclid::Euclid::hud),
+        );
+    }
+
+    /// Lay a rhythm on the pattern: one toggle per step whose state
+    /// differs from what the mode last laid. A toggle rather than a
+    /// clear, so a step switched off keeps its notes for the way back,
+    /// and a step switched on gets its old notes back when it had any.
+    fn lay_euclid(
+        &mut self,
+        mode: &mut crate::ui::sequencer::euclid::Euclid,
+        target: &[bool],
+        intents: &mut Vec<Intent>,
+    ) {
+        for (step, wanted) in target.iter().enumerate() {
+            if mode.current.get(step).copied().unwrap_or(false) == *wanted {
+                continue;
+            }
+            intents.push(Intent::Toggle {
+                tick: step * PATTERN_STEP_TICKS,
+                default_pitch: self.last_pitch,
+                default_length_ticks: PATTERN_STEP_TICKS,
+                default_velocity: DEFAULT_VELOCITY,
+            });
+        }
+        mode.current = target.to_vec();
+    }
+
+    /// Whether the Euclidean mode is on.
+    pub(crate) fn in_euclid(&self) -> bool {
+        self.euclid.is_some()
     }
 
     fn speak(
@@ -965,7 +1004,50 @@ impl SequenceGrid {
         // verb on the cell is spoken once per such tick, so a coarse
         // cell edits everything it holds and a fine one exactly one.
         let here = starts_in(clip, tick, span);
+        // The Euclidean mode, while it is on: the arrows cycle the
+        // rhythm, Enter keeps it, Escape (spoken as CANCEL) puts the
+        // old steps back, and nothing else is a sentence here.
+        if let Some(mut mode) = self.euclid.take() {
+            match (utterance.verb, utterance.motion) {
+                (Some(Verb::Act | Verb::Euclid), _) => {}
+                (Some(Verb::Cancel), _) => {
+                    let before = mode.before.clone();
+                    self.lay_euclid(&mut mode, &before, intents);
+                }
+                (None, Some(motion)) => {
+                    mode.adjust(motion, utterance.count.max(1));
+                    let target = mode.target();
+                    self.lay_euclid(&mut mode, &target, intents);
+                    self.euclid = Some(mode);
+                }
+                _ => {
+                    self.refusal = Some("EUCLID: ARROWS, ENTER OR ESC".to_owned());
+                    self.euclid = Some(mode);
+                }
+            }
+            return;
+        }
         match (utterance.verb, utterance.motion) {
+            (Some(Verb::Euclid), _) => {
+                let Some(clip) = clip else {
+                    self.refusal = Some("EUCLID: NO CLIP".to_owned());
+                    return;
+                };
+                let steps = (clip.length_ticks / PATTERN_STEP_TICKS)
+                    .clamp(1, crate::sequencing::PATTERN_STEPS);
+                let lit: Vec<bool> = (0..steps)
+                    .map(|step| {
+                        clip.notes
+                            .iter()
+                            .any(|note| note.start_ticks == step * PATTERN_STEP_TICKS)
+                    })
+                    .collect();
+                let mut mode = crate::ui::sequencer::euclid::Euclid::enter(lit);
+                let target = mode.target();
+                self.lay_euclid(&mut mode, &target, intents);
+                self.euclid = Some(mode);
+            }
+            (Some(Verb::Cancel), _) => {}
             (None, Some(motion)) if selecting => {
                 let Some(clip) = clip else {
                     self.refusal = Some("SELECT: NO CLIP".to_owned());
@@ -2533,6 +2615,224 @@ mod tests {
             1,
         );
         assert_eq!(intents, vec![Intent::Clear { tick: 6 }]);
+    }
+
+    /// A sixteen-step clip with a hit on each of `steps`.
+    fn hits_on(steps: &[usize]) -> Vec<NoteView> {
+        steps
+            .iter()
+            .map(|step| {
+                NoteView::from_midi(
+                    60,
+                    step * PATTERN_STEP_TICKS,
+                    PATTERN_STEP_TICKS,
+                    100,
+                    1.0,
+                    true,
+                )
+            })
+            .collect()
+    }
+
+    fn sixteen(notes: &[NoteView]) -> ClipView<'_> {
+        ClipView {
+            id: 1,
+            name: "test",
+            length_ticks: 16 * PATTERN_STEP_TICKS,
+            notes,
+            ghosts: &[],
+            slicing: false,
+        }
+    }
+
+    fn toggled_steps(intents: &[Intent]) -> Vec<usize> {
+        intents
+            .iter()
+            .filter_map(|intent| match intent {
+                Intent::Toggle { tick, .. } => Some(tick / PATTERN_STEP_TICKS),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn e_enters_the_euclidean_mode_with_as_many_hits_as_were_lit() {
+        let notes = hits_on(&[0, 2]);
+        let clip = sixteen(&notes);
+        let mut grid = SequenceGrid::default();
+        let mut registers = Registers::default();
+        let intents = utter_on(
+            &mut grid,
+            &mut registers,
+            Some(clip),
+            Some(Verb::Euclid),
+            None,
+            1,
+        );
+        // Two hits in sixteen: steps 0 and 8. Step 2 goes off, 8 comes on.
+        assert_eq!(toggled_steps(&intents), vec![2, 8]);
+        assert!(grid.in_euclid());
+        let mode = grid.euclid.clone().expect("the mode is on");
+        assert_eq!((mode.steps, mode.hits, mode.rotation), (16, 2, 0));
+        assert!(mode.hud().starts_with("EUCLID 2/16"));
+        // Without a clip there is nothing to lay a rhythm on.
+        let mut bare = SequenceGrid::default();
+        let intents = utter_on(&mut bare, &mut registers, None, Some(Verb::Euclid), None, 1);
+        assert!(intents.is_empty() && !bare.in_euclid());
+        assert_eq!(bare.refusal.as_deref(), Some("EUCLID: NO CLIP"));
+    }
+
+    #[test]
+    fn the_arrows_cycle_the_rhythm_and_only_the_changed_steps_are_toggled() {
+        let notes = hits_on(&[0, 2]);
+        let clip = sixteen(&notes);
+        let mut grid = SequenceGrid::default();
+        let mut registers = Registers::default();
+        let _ = utter_on(
+            &mut grid,
+            &mut registers,
+            Some(clip),
+            Some(Verb::Euclid),
+            None,
+            1,
+        );
+        // Up: three hits — x....x....x..... — from x.......x.......
+        let intents = utter_on(
+            &mut grid,
+            &mut registers,
+            Some(clip),
+            None,
+            Some(Motion::Up),
+            1,
+        );
+        assert_eq!(toggled_steps(&intents), vec![5, 8, 10]);
+        // A count rides the arrow: two more hits at once.
+        let intents = utter_on(
+            &mut grid,
+            &mut registers,
+            Some(clip),
+            None,
+            Some(Motion::Up),
+            2,
+        );
+        assert_eq!(grid.euclid.as_ref().map(|m| m.hits), Some(5));
+        assert!(!intents.is_empty());
+        // Right turns the whole rhythm one step later.
+        let before = grid.euclid.clone().expect("on").current;
+        let _ = utter_on(
+            &mut grid,
+            &mut registers,
+            Some(clip),
+            None,
+            Some(Motion::Right),
+            1,
+        );
+        let after = grid.euclid.clone().expect("on").current;
+        assert_eq!(after[1..], before[..15]);
+        assert_eq!(after[0], before[15]);
+        // Another verb is not a sentence in this mode, and the mode stays.
+        let intents = utter_on(
+            &mut grid,
+            &mut registers,
+            Some(clip),
+            Some(Verb::Yank),
+            None,
+            1,
+        );
+        assert!(intents.is_empty() && grid.in_euclid());
+        assert_eq!(
+            grid.refusal.as_deref(),
+            Some("EUCLID: ARROWS, ENTER OR ESC")
+        );
+    }
+
+    #[test]
+    fn enter_keeps_the_rhythm_and_escape_puts_the_old_steps_back() {
+        let notes = hits_on(&[0, 2, 3]);
+        let clip = sixteen(&notes);
+        let mut grid = SequenceGrid::default();
+        let mut registers = Registers::default();
+        let _ = utter_on(
+            &mut grid,
+            &mut registers,
+            Some(clip),
+            Some(Verb::Euclid),
+            None,
+            1,
+        );
+        let _ = utter_on(
+            &mut grid,
+            &mut registers,
+            Some(clip),
+            None,
+            Some(Motion::Up),
+            1,
+        );
+        // Enter: nothing more is laid, and the mode is off.
+        let intents = utter_on(
+            &mut grid,
+            &mut registers,
+            Some(clip),
+            Some(Verb::Act),
+            None,
+            1,
+        );
+        assert!(intents.is_empty() && !grid.in_euclid());
+
+        // Again, then Escape: every step is put back as it was.
+        let mut grid = SequenceGrid::default();
+        let _ = utter_on(
+            &mut grid,
+            &mut registers,
+            Some(clip),
+            Some(Verb::Euclid),
+            None,
+            1,
+        );
+        let _ = utter_on(
+            &mut grid,
+            &mut registers,
+            Some(clip),
+            None,
+            Some(Motion::Up),
+            2,
+        );
+        let _ = utter_on(
+            &mut grid,
+            &mut registers,
+            Some(clip),
+            None,
+            Some(Motion::Left),
+            1,
+        );
+        let laid = grid.euclid.clone().expect("on").current;
+        let intents = utter_on(
+            &mut grid,
+            &mut registers,
+            Some(clip),
+            Some(Verb::Cancel),
+            None,
+            1,
+        );
+        assert!(!grid.in_euclid());
+        let before = vec![
+            true, false, true, true, false, false, false, false, false, false, false, false, false,
+            false, false, false,
+        ];
+        let expected: Vec<usize> = (0..16)
+            .filter(|step| laid[*step] != before[*step])
+            .collect();
+        assert_eq!(toggled_steps(&intents), expected);
+        // Cancel outside the mode is nothing.
+        let intents = utter_on(
+            &mut grid,
+            &mut registers,
+            Some(clip),
+            Some(Verb::Cancel),
+            None,
+            1,
+        );
+        assert!(intents.is_empty());
     }
 
     #[test]

@@ -18,6 +18,7 @@
 //! edits compile to.
 
 pub use crate::ui::chrome;
+pub mod euclid;
 pub mod grammar;
 pub mod grid_resolution;
 pub mod layout_grid;

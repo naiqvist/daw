@@ -52,6 +52,12 @@ pub(crate) enum Verb {
     StackYank,
     /// Put a yanked stack instead of one note.
     StackPut,
+    /// Enter the Euclidean mode on the step grid: the arrows then cycle
+    /// rhythms, Enter keeps one, Escape puts the old steps back.
+    Euclid,
+    /// Escape while a mode is on. Never on a key of its own: the grammar
+    /// speaks it when Escape lands on a modal sentence.
+    Cancel,
 }
 
 /// The whole vocabulary: verb, key, display name. Tests hold every column
@@ -65,7 +71,9 @@ pub(crate) const TABLE: &[(Verb, egui::Key, &str)] = &[
     // right hand owns the arrows: reach beats mnemonics. Q/W/E form the
     // move-and-copy cluster (nudge lives on W below).
     (Verb::Yank, egui::Key::Q, "YANK"),
-    (Verb::Put, egui::Key::E, "PUT"),
+    // E is the Euclidean mode; PUT moved to P for it, its mnemonic.
+    (Verb::Euclid, egui::Key::E, "EUCLID"),
+    (Verb::Put, egui::Key::P, "PUT"),
     (Verb::Duplicate, egui::Key::D, "DUPLICATE"),
     (Verb::Nudge, egui::Key::W, "NUDGE"),
     (Verb::Resize, egui::Key::R, "RESIZE"),
@@ -87,7 +95,7 @@ pub(crate) const TABLE: &[(Verb, egui::Key, &str)] = &[
 pub(crate) const SHIFT_TABLE: &[(Verb, egui::Key, &str)] = &[
     (Verb::StackYank, egui::Key::Q, "STACK YANK"),
     (Verb::StackNudge, egui::Key::W, "STACK NUDGE"),
-    (Verb::StackPut, egui::Key::E, "STACK PUT"),
+    (Verb::StackPut, egui::Key::P, "STACK PUT"),
     (Verb::StackDuplicate, egui::Key::D, "STACK DUPLICATE"),
     (Verb::StackResize, egui::Key::R, "STACK RESIZE"),
     (Verb::StackVelocity, egui::Key::F, "STACK VELOCITY"),
@@ -102,6 +110,9 @@ pub(crate) const COMMAND_TABLE: &[(Verb, egui::Key, &str)] = &[
 
 impl Verb {
     pub(crate) fn name(self) -> &'static str {
+        if self == Self::Cancel {
+            return "CANCEL";
+        }
         TABLE
             .iter()
             .chain(SHIFT_TABLE)

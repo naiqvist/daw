@@ -2173,7 +2173,7 @@ impl Stage {
         });
         self.entry_held =
             self.scope_context() == keymap::ScopeContext::Clip && (pitch_keys_held || enter_held);
-        if self.entry_transaction && !self.entry_held {
+        if self.entry_transaction && !self.entry_held && !self.sentence.is_modal() {
             self.settle();
             self.entry_transaction = false;
         }
