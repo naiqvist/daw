@@ -349,6 +349,13 @@ pub enum ApplyOutcome {
     Refused(Refusal),
 }
 
+/// A kit pad taken by Q: its file and its rows, as `(sub, value)`.
+#[derive(Clone, Debug, PartialEq)]
+struct PadClip {
+    path: PathBuf,
+    values: Vec<(u32, f32)>,
+}
+
 /// Everything the stage knows. Every field added here should have to
 /// justify itself — this is the mutable core that the rest of the surface
 /// will be a pure function of.
@@ -541,6 +548,12 @@ pub struct Stage {
     takes: Vec<Take>,
     /// What every section measured this frame, by device.
     telemetry: std::collections::HashMap<DeviceId, crate::console::Telemetry>,
+    /// What the instruments said about themselves this frame, by device:
+    /// a kit's lit pads, a brick's hits.
+    readouts: std::collections::HashMap<DeviceId, crate::console::Telemetry>,
+    /// A kit pad in the hand: its file and its twenty-five rows, taken
+    /// by Q on a pad's rows and put by E on another's.
+    pad_clipboard: Option<PadClip>,
     /// A render the host has been asked for, until it takes it.
     export_request: Option<ExportRequest>,
     /// The render under way, for the strip.
@@ -824,6 +837,8 @@ impl Stage {
             arming: false,
             takes: Vec::new(),
             telemetry: std::collections::HashMap::new(),
+            readouts: std::collections::HashMap::new(),
+            pad_clipboard: None,
             export_request: None,
             export: None,
             export_abandon: false,
@@ -1210,6 +1225,19 @@ impl Stage {
         for (id, figures) in said {
             self.telemetry.insert(*id, *figures);
         }
+    }
+
+    /// Hand the band what the instruments said about themselves.
+    pub fn set_readouts(&mut self, said: &[(DeviceId, crate::console::Telemetry)]) {
+        self.readouts.clear();
+        for (id, figures) in said {
+            self.readouts.insert(*id, *figures);
+        }
+    }
+
+    /// An instrument's own figures this frame, if the engine tapped it.
+    pub(crate) fn readout(&self, id: DeviceId) -> Option<&crate::console::Telemetry> {
+        self.readouts.get(&id)
     }
 
     /// Hand the modulation workspace the engine's measured source values and
@@ -1603,6 +1631,197 @@ impl Stage {
         // A jump lands the group's first row at the TOP of the bank, so
         // the whole group reads down from it — a page turn, not a scroll.
         self.chain_offset = target;
+        Ok(())
+    }
+
+    /// P on the band: hear the instrument under the cursor without a
+    /// trig — a kit's pad in play, a brick's file, a sampler's file —
+    /// through the host's audition voice, from its START.
+    fn hear(&mut self) -> Result<(), RefusalReason> {
+        use crate::params::{brick as bp, kit as kp, sampler as sp};
+        if let Some((_, id, pad)) = self.kit_pad_in_play() {
+            let kit = self.song.device(id).ok_or(RefusalReason::Unavailable)?;
+            let path = kit
+                .pads
+                .get(pad)
+                .filter(|path| !path.as_os_str().is_empty())
+                .ok_or(RefusalReason::Empty)?;
+            let start = f64::from(kit.value(kp::pad_param(pad, bp::START)));
+            self.audition = Some(Audition::of(path, start, 1.0));
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            self.notice = Some(format!("pad {} · {name}", pad + 1));
+            return Ok(());
+        }
+        let (track, index) = self.chained_device().ok_or(RefusalReason::Unavailable)?;
+        let device = &self.song.tracks[track].chain[index];
+        let path = device.sample.as_deref().ok_or(match device.kind {
+            DeviceKind::Sampler | DeviceKind::Brick => RefusalReason::Empty,
+            _ => RefusalReason::Unavailable,
+        })?;
+        let start = match device.kind {
+            DeviceKind::Sampler => f64::from(device.value(sp::START)),
+            _ => f64::from(device.value(bp::START)),
+        };
+        self.audition = Some(Audition::of(path, start, 1.0));
+        self.notice = Some(format!(
+            "{} · {}",
+            device.kind.spec().name,
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ));
+        Ok(())
+    }
+
+    /// The pad's file and rows, as a clip.
+    fn clip_of(kit: &crate::sequencing::Device, pad: usize) -> PadClip {
+        use crate::params::kit as kp;
+        PadClip {
+            path: kit.pads.get(pad).cloned().unwrap_or_default(),
+            values: (0..kp::PER_PAD)
+                .map(|sub| (sub, kit.value(kp::pad_param(pad, sub))))
+                .collect(),
+        }
+    }
+
+    /// Lay a clip on `pad`.
+    fn lay_clip(kit: &mut crate::sequencing::Device, pad: usize, clip: &PadClip) {
+        use crate::params::kit as kp;
+        if kit.pads.len() < kp::PADS {
+            kit.pads.resize(kp::PADS, PathBuf::new());
+        }
+        kit.pads[pad] = clip.path.clone();
+        for (sub, value) in &clip.values {
+            kit.set(kp::pad_param(pad, *sub), *value);
+        }
+    }
+
+    /// Q on a pad's rows: take the pad — file and rows — into the hand.
+    /// The pad stays; a kit is not shorter for it.
+    fn yank_pad(&mut self) -> Result<(), RefusalReason> {
+        let (_, id, pad) = self
+            .kit_pad_under_cursor()
+            .ok_or(RefusalReason::Unavailable)?;
+        let kit = self.song.device(id).ok_or(RefusalReason::Unavailable)?;
+        let clip = Self::clip_of(kit, pad);
+        self.notice = Some(format!("yanked pad {}", pad + 1));
+        self.pad_clipboard = Some(clip);
+        Ok(())
+    }
+
+    /// E on a pad's rows with a pad in hand: lay it here.
+    fn put_pad(&mut self) -> Result<(), RefusalReason> {
+        let (_, id, pad) = self
+            .kit_pad_under_cursor()
+            .ok_or(RefusalReason::Unavailable)?;
+        let clip = self.pad_clipboard.clone().ok_or(RefusalReason::Empty)?;
+        let kit = self.song.device_mut(id).ok_or(RefusalReason::Unavailable)?;
+        Self::lay_clip(kit, pad, &clip);
+        self.notice = Some(format!("put pad {}", pad + 1));
+        self.touched();
+        Ok(())
+    }
+
+    /// Delete on a pad's rows: an empty pad, at the table's defaults.
+    fn clear_pad(&mut self) -> Result<(), RefusalReason> {
+        use crate::params::kit as kp;
+        let (_, id, pad) = self
+            .kit_pad_under_cursor()
+            .ok_or(RefusalReason::Unavailable)?;
+        let kit = self.song.device_mut(id).ok_or(RefusalReason::Unavailable)?;
+        let empty = PadClip {
+            path: PathBuf::new(),
+            values: (0..kp::PER_PAD)
+                .map(|sub| {
+                    (
+                        sub,
+                        crate::params::def(kp::TABLE, kp::pad_param(pad, sub)).default,
+                    )
+                })
+                .collect(),
+        };
+        Self::lay_clip(kit, pad, &empty);
+        self.notice = Some(format!("cleared pad {}", pad + 1));
+        self.touched();
+        Ok(())
+    }
+
+    /// X on a pad's rows: swap it with the pad in hand — file and rows
+    /// both — so a kit is rearranged with the two hands it has.
+    fn swap_pad(&mut self) -> Result<(), RefusalReason> {
+        use crate::params::kit as kp;
+        let (_, id, pad) = self
+            .kit_pad_under_cursor()
+            .ok_or(RefusalReason::Unavailable)?;
+        let kit = self.song.device_mut(id).ok_or(RefusalReason::Unavailable)?;
+        let hand = (kit.value(kp::PAD).round().max(0.0) as usize).min(kp::PADS - 1);
+        if hand == pad {
+            return Err(RefusalReason::Unavailable);
+        }
+        let (a, b) = (Self::clip_of(kit, pad), Self::clip_of(kit, hand));
+        Self::lay_clip(kit, pad, &b);
+        Self::lay_clip(kit, hand, &a);
+        self.notice = Some(format!("swapped pads {} and {}", pad + 1, hand + 1));
+        self.touched();
+        Ok(())
+    }
+
+    /// Shift+Enter on a file in the browser: every file beside it in
+    /// its folder, in name order, onto the addressed track's kit from
+    /// the pad in hand — a kit from a folder in one stroke.
+    fn fill_kit(&mut self) -> Result<(), RefusalReason> {
+        use crate::params::kit as kp;
+        let Some(EntryKind::Sample(picked)) = self
+            .browser
+            .as_ref()
+            .and_then(Browser::selected)
+            .map(|node| node.kind.clone())
+        else {
+            return Err(RefusalReason::Unavailable);
+        };
+        let track = self.addressed_track().ok_or(RefusalReason::Unavailable)?;
+        let head = self.song.tracks[track]
+            .chain
+            .first()
+            .filter(|device| device.kind == DeviceKind::Kit)
+            .ok_or(RefusalReason::Unavailable)?;
+        let id = head.id;
+        let folder = picked.parent().map(std::path::Path::to_path_buf);
+        let mut files: Vec<PathBuf> = self
+            .library_snapshot
+            .assets
+            .iter()
+            .map(|asset| asset.path.clone())
+            .filter(|path| path.parent().map(std::path::Path::to_path_buf) == folder)
+            .collect();
+        if !files.iter().any(|path| *path == picked) {
+            files.push(picked.clone());
+        }
+        files.sort();
+        files.dedup();
+        let kit = self.song.device_mut(id).ok_or(RefusalReason::Unavailable)?;
+        let from = (kit.value(kp::PAD).round().max(0.0) as usize).min(kp::PADS - 1);
+        if kit.pads.len() < kp::PADS {
+            kit.pads.resize(kp::PADS, PathBuf::new());
+        }
+        let room = kp::PADS - from;
+        let laid = files.len().min(room);
+        for (offset, path) in files.iter().take(room).enumerate() {
+            kit.pads[from + offset] = path.clone();
+        }
+        let next = (from + laid).min(kp::PADS - 1);
+        kit.set(kp::PAD, next as f32);
+        let name = folder
+            .as_deref()
+            .and_then(std::path::Path::file_name)
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.notice = Some(format!("{laid} pads from {name} · pad {} first", from + 1));
+        self.fit_session();
+        self.touched();
         Ok(())
     }
 
@@ -2419,7 +2638,10 @@ impl Stage {
     /// and answers with `set_sample`.
     pub fn wanted_sample(&self) -> Option<&Path> {
         let path = if let Some(editor) = &self.sample {
-            self.song.device(editor.device)?.sample.as_deref()?
+            match &editor.stand_in {
+                Some(stand_in) => stand_in.sample.as_deref()?,
+                None => self.song.device(editor.device)?.sample.as_deref()?,
+            }
         } else if self.trig_menu.is_some() {
             // The menu's slice strip shows the track's file.
             let shown = self.clip_in_view()?;
@@ -2518,9 +2740,83 @@ impl Stage {
         }
     }
 
+    /// The kit pad the band's cursor is on: the kit's id and the pad,
+    /// when the cursor stands on one of a kit's pad rows.
+    fn kit_pad_under_cursor(&self) -> Option<(usize, DeviceId, usize)> {
+        let (track, index) = self.chained_device()?;
+        let device = &self.song.tracks[track].chain[index];
+        if device.kind != DeviceKind::Kit {
+            return None;
+        }
+        let (_, row) = self.chain.as_ref()?.cursor()?;
+        let (pad, _) = crate::params::kit::pad_of(row as u32)?;
+        Some((track, device.id, pad))
+    }
+
+    /// The kit the band's cursor is on, and the pad in play: the one the
+    /// cursor's row belongs to, else the pad in hand.
+    fn kit_pad_in_play(&self) -> Option<(usize, DeviceId, usize)> {
+        if let Some(found) = self.kit_pad_under_cursor() {
+            return Some(found);
+        }
+        let (track, index) = self.chained_device()?;
+        let device = &self.song.tracks[track].chain[index];
+        (device.kind == DeviceKind::Kit).then(|| {
+            let pad = (device.value(crate::params::kit::PAD).round().max(0.0) as usize)
+                .min(crate::params::kit::PADS - 1);
+            (track, device.id, pad)
+        })
+    }
+
+    /// A sampler standing in for a kit pad, so the cutting room can open
+    /// on it: the pad's file, and its START, REVERSE, TUNE and FINE under
+    /// the sampler's names. Everything else stands at the sampler's
+    /// defaults, and the room refuses to move it.
+    fn stand_in_for(kit: &crate::sequencing::Device, pad: usize) -> crate::sequencing::Device {
+        use crate::params::{brick as bp, kit as kp, sampler as sp};
+        let mut stand_in = crate::sequencing::Device::new(kit.id, DeviceKind::Sampler);
+        stand_in.sample = kit
+            .pads
+            .get(pad)
+            .filter(|path| !path.as_os_str().is_empty())
+            .cloned();
+        for (theirs, mine) in [
+            (sp::START, bp::START),
+            (sp::REVERSE, bp::REVERSE),
+            (sp::TUNE, bp::TUNE),
+            (sp::FINE, bp::FINE),
+        ] {
+            stand_in.set(theirs, kit.value(kp::pad_param(pad, mine)));
+        }
+        stand_in
+    }
+
+    /// Refresh the editor's stand-in from the kit it stands for.
+    fn refresh_stand_in(&mut self) {
+        let Some(editor) = &self.sample else {
+            return;
+        };
+        let Some(pad) = editor.pad else {
+            return;
+        };
+        let Some(kit) = self.song.device(editor.device) else {
+            return;
+        };
+        let stand_in = Self::stand_in_for(kit, pad);
+        if let Some(editor) = &mut self.sample {
+            editor.stand_in = Some(stand_in);
+        }
+    }
+
     /// The editor's device, while the editor is up and the device stands.
     fn edited_sampler(&self) -> Option<(&SampleEditor, &crate::sequencing::Device)> {
         let editor = self.sample.as_ref()?;
+        if let Some(stand_in) = &editor.stand_in {
+            // A kit pad: the room works on the stand-in, while the kit
+            // still stands.
+            self.song.device(editor.device)?;
+            return Some((editor, stand_in));
+        }
         let device = self.song.device(editor.device)?;
         Some((editor, device))
     }
@@ -2788,10 +3084,31 @@ impl Stage {
     /// Set one of the editor's sampler parameters, as a letter to the
     /// running node — the same road a knob in the band takes.
     fn set_sampler_param(&mut self, param: u32, value: f32) -> Result<f32, RefusalReason> {
+        use crate::params::{brick as bp, kit as kp, sampler as sp};
         let id = self.sample.as_ref().map(|editor| editor.device);
+        let pad = self.sample.as_ref().and_then(|editor| editor.pad);
         let device = id
             .and_then(|id| self.song.device_mut(id))
             .ok_or(RefusalReason::Unavailable)?;
+        if let Some(pad) = pad {
+            // A kit pad: the four rows the stand-in shares go to the
+            // pad; the sampler's other rows have no pad to go to.
+            let mine = match param {
+                sp::START => bp::START,
+                sp::REVERSE => bp::REVERSE,
+                sp::TUNE => bp::TUNE,
+                sp::FINE => bp::FINE,
+                _ => return Err(RefusalReason::Unavailable),
+            };
+            let row = kp::pad_param(pad, mine);
+            if !device.set(row, value) {
+                return Err(RefusalReason::Unavailable);
+            }
+            let after = device.value(row);
+            self.refresh_stand_in();
+            self.remixed();
+            return Ok(after);
+        }
         if !device.set(param, value) {
             return Err(RefusalReason::Unavailable);
         }
@@ -2804,6 +3121,14 @@ impl Stage {
     /// is baked at compile, not sent as a letter.
     fn set_sampler_slices(&mut self, slices: Vec<f64>) -> Result<usize, RefusalReason> {
         use crate::params::sampler as sp;
+        if self
+            .sample
+            .as_ref()
+            .is_some_and(|editor| editor.pad.is_some())
+        {
+            // A pad is one hit; it has no slices to lay.
+            return Err(RefusalReason::Unavailable);
+        }
         let id = self.sample.as_ref().map(|editor| editor.device);
         let device = id
             .and_then(|id| self.song.device_mut(id))
@@ -2825,6 +3150,21 @@ impl Stage {
     fn apply_sample(&mut self, intent: SampleIntent) -> Result<(), RefusalReason> {
         use crate::params::sampler as sp;
         if intent == SampleIntent::Open {
+            // A kit pad opens the room on a stand-in sampler.
+            if let Some((track, id, pad)) = self.kit_pad_in_play() {
+                let kit = self.song.device(id).ok_or(RefusalReason::Unavailable)?;
+                let stand_in = Self::stand_in_for(kit, pad);
+                if stand_in.sample.is_none() {
+                    return Err(RefusalReason::Empty);
+                }
+                let cursor = f64::from(stand_in.value(sp::START));
+                let mut editor = SampleEditor::open(track, id, cursor);
+                editor.pad = Some(pad);
+                editor.stand_in = Some(stand_in);
+                self.sample = Some(editor);
+                self.trig_menu = None;
+                return Ok(());
+            }
             let (track, id) = self.sampler_target()?;
             let device = self.song.device(id).ok_or(RefusalReason::Unavailable)?;
             if device.sample.is_none() {
@@ -4410,6 +4750,17 @@ impl Stage {
             // inside a track, or in the browser there is nothing it could
             // honestly mean. An empty slot is not an error, but it is not
             // a change either, and says so.
+            // A kit pad's own verbs, while the cursor stands on its rows.
+            StageIntent::Hear => self.hear(),
+            StageIntent::Yank if self.kit_pad_under_cursor().is_some() => self.yank_pad(),
+            StageIntent::Put
+                if self.kit_pad_under_cursor().is_some() && self.pad_clipboard.is_some() =>
+            {
+                self.put_pad()
+            }
+            StageIntent::Clear if self.kit_pad_under_cursor().is_some() => self.clear_pad(),
+            StageIntent::SwapPad => self.swap_pad(),
+            StageIntent::Fill => self.fill_kit(),
             StageIntent::Clear if self.chain.is_some() => match self.chained_device() {
                 Some((track, device)) => {
                     let id = self.song.tracks[track].chain[device].id;
@@ -8083,7 +8434,11 @@ mod tests {
                     (
                         stage.renaming.clone(),
                         stage.nudging,
-                        stage.clipboard.clone(),
+                        (
+                            stage.clipboard.clone(),
+                            stage.pad_clipboard.clone(),
+                            stage.audition.clone(),
+                        ),
                         stage.path.clone(),
                         (
                             stage.trig_menu,
@@ -8124,7 +8479,11 @@ mod tests {
                                 (
                                     stage.renaming.clone(),
                                     stage.nudging,
-                                    stage.clipboard.clone(),
+                                    (
+                                        stage.clipboard.clone(),
+                                        stage.pad_clipboard.clone(),
+                                        stage.audition.clone(),
+                                    ),
                                     stage.path.clone(),
                                     (
                                         stage.trig_menu,
@@ -8169,7 +8528,11 @@ mod tests {
                                 (
                                     stage.renaming.clone(),
                                     stage.nudging,
-                                    stage.clipboard.clone(),
+                                    (
+                                        stage.clipboard.clone(),
+                                        stage.pad_clipboard.clone(),
+                                        stage.audition.clone(),
+                                    ),
                                     stage.path.clone(),
                                     (
                                         stage.trig_menu,
@@ -10513,6 +10876,227 @@ mod tests {
                 EntryKind::Sample(PathBuf::from(path)),
             )],
             BrowserStatus::Ready,
+        );
+    }
+
+    // ---------------------------------------------------------- kit ---
+
+    /// A kit at the head of the first track: kick, snare and hat on
+    /// the first three pads, the snare trimmed and in group B.
+    fn kit_on_track(stage: &mut Stage) -> DeviceId {
+        use crate::params::{brick as bp, kit as kp};
+        let id = stage
+            .song
+            .add_device(0, crate::devices::DeviceKind::Kit)
+            .expect("a kit");
+        let kit = stage.song.device_mut(id).expect("the kit stands");
+        kit.pads = (0..kp::PADS)
+            .map(|pad| match pad {
+                0 => PathBuf::from("/kits/909/kick.wav"),
+                1 => PathBuf::from("/kits/909/snare.wav"),
+                2 => PathBuf::from("/kits/909/hat.wav"),
+                _ => PathBuf::new(),
+            })
+            .collect();
+        kit.set(kp::pad_param(1, bp::START), 0.25);
+        kit.set(kp::pad_param(1, kp::GROUP), 2.0);
+        id
+    }
+
+    fn pad_row(stage: &mut Stage, jumps: usize) {
+        for _ in 0..jumps {
+            assert_eq!(
+                stage.apply(StageIntent::Group(Step::Down)),
+                ApplyOutcome::Changed
+            );
+        }
+    }
+
+    #[test]
+    fn p_on_the_band_hears_the_pad_in_play_from_its_start() {
+        let mut stage = Stage::new();
+        kit_on_track(&mut stage);
+        assert_eq!(stage.apply(StageIntent::Devices), ApplyOutcome::Changed);
+        // On a kit-wide row: the pad in hand, pad 1.
+        assert_eq!(stage.apply(StageIntent::Hear), ApplyOutcome::Changed);
+        let heard = stage.audition.clone().expect("an audition was asked for");
+        assert_eq!(heard.path, PathBuf::from("/kits/909/kick.wav"));
+        assert_eq!(heard.from, 0.0);
+        assert_eq!(stage.notice.as_deref(), Some("pad 1 · kick.wav"));
+        // On pad 2's rows: pad 2, from its START.
+        pad_row(&mut stage, 2);
+        assert_eq!(stage.apply(StageIntent::Hear), ApplyOutcome::Changed);
+        let heard = stage.audition.clone().expect("an audition was asked for");
+        assert_eq!(heard.path, PathBuf::from("/kits/909/snare.wav"));
+        assert!((heard.from - 0.25).abs() < 1e-6);
+        // An empty pad has nothing to hear.
+        pad_row(&mut stage, 2);
+        assert!(matches!(
+            stage.apply(StageIntent::Hear),
+            ApplyOutcome::Refused(_)
+        ));
+    }
+
+    #[test]
+    fn q_e_x_and_delete_on_a_pads_rows_work_the_pad_not_the_device() {
+        use crate::params::{brick as bp, kit as kp};
+        let mut stage = Stage::new();
+        let id = kit_on_track(&mut stage);
+        assert_eq!(stage.apply(StageIntent::Devices), ApplyOutcome::Changed);
+        // Yank pad 2 — the kit is not shorter for it.
+        pad_row(&mut stage, 2);
+        assert_eq!(stage.apply(StageIntent::Yank), ApplyOutcome::Changed);
+        assert_eq!(stage.song.tracks[0].chain[0].id, id, "yank took the device");
+        let clip = stage.pad_clipboard.clone().expect("a pad in hand");
+        assert_eq!(clip.path, PathBuf::from("/kits/909/snare.wav"));
+        assert!(clip.values.contains(&(kp::GROUP, 2.0)));
+        // Put it on pad 3: file and rows both.
+        pad_row(&mut stage, 1);
+        assert_eq!(stage.apply(StageIntent::Put), ApplyOutcome::Changed);
+        let kit = stage.song.device(id).expect("the kit stands");
+        assert_eq!(kit.pads[2], PathBuf::from("/kits/909/snare.wav"));
+        assert_eq!(kit.value(kp::pad_param(2, kp::GROUP)), 2.0);
+        assert!((kit.value(kp::pad_param(2, bp::START)) - 0.25).abs() < 1e-6);
+        // Swap pad 4 with the pad in hand, pad 1: the kick moves up.
+        pad_row(&mut stage, 1);
+        assert_eq!(stage.apply(StageIntent::SwapPad), ApplyOutcome::Changed);
+        let kit = stage.song.device(id).expect("the kit stands");
+        assert_eq!(kit.pads[3], PathBuf::from("/kits/909/kick.wav"));
+        assert!(kit.pads[0].as_os_str().is_empty());
+        // Delete on pad 4: empty, at the defaults — and the kit stays.
+        assert_eq!(stage.apply(StageIntent::Clear), ApplyOutcome::Changed);
+        let kit = stage.song.device(id).expect("the kit stands");
+        assert!(kit.pads[3].as_os_str().is_empty());
+        assert_eq!(kit.value(kp::pad_param(3, kp::ON)), 1.0);
+        // Back on a kit-wide row, Delete is still the device's.
+        for _ in 0..4 {
+            let _ = stage.apply(StageIntent::Group(Step::Up));
+        }
+        assert_eq!(stage.apply(StageIntent::Clear), ApplyOutcome::Changed);
+        assert!(stage.song.device(id).is_none(), "the kit should be gone");
+    }
+
+    #[test]
+    fn the_cutting_room_opens_on_a_pad_through_a_stand_in_sampler() {
+        use crate::params::{brick as bp, kit as kp, sampler as sp};
+        let mut stage = Stage::new();
+        let id = kit_on_track(&mut stage);
+        assert_eq!(stage.apply(StageIntent::Devices), ApplyOutcome::Changed);
+        pad_row(&mut stage, 2);
+        assert_eq!(
+            stage.apply(StageIntent::Sample(SampleIntent::Open)),
+            ApplyOutcome::Changed
+        );
+        let editor = stage.sample.clone().expect("the room is open");
+        assert_eq!(editor.pad, Some(1));
+        let stand_in = editor.stand_in.expect("a stand-in sampler");
+        assert_eq!(stand_in.sample, Some(PathBuf::from("/kits/909/snare.wav")));
+        assert!((stand_in.value(sp::START) - 0.25).abs() < 1e-6);
+        assert_eq!(
+            stage.wanted_sample(),
+            Some(std::path::Path::new("/kits/909/snare.wav"))
+        );
+        // START moves the pad's own START, and the stand-in follows.
+        assert!(stage.set_sampler_param(sp::START, 0.5).is_ok());
+        let kit = stage.song.device(id).expect("the kit stands");
+        assert!((kit.value(kp::pad_param(1, bp::START)) - 0.5).abs() < 1e-6);
+        let stand_in = stage
+            .sample
+            .clone()
+            .and_then(|e| e.stand_in)
+            .expect("a stand-in");
+        assert!((stand_in.value(sp::START) - 0.5).abs() < 1e-6);
+        // The sampler's other rows have no pad to go to.
+        assert!(stage.set_sampler_param(sp::END, 0.9).is_err());
+        assert!(stage.set_sampler_slices(vec![0.5]).is_err());
+        // An empty pad has no room to open.
+        let _ = stage.apply(StageIntent::Escape);
+        pad_row(&mut stage, 2);
+        assert!(matches!(
+            stage.apply(StageIntent::Sample(SampleIntent::Open)),
+            ApplyOutcome::Refused(_)
+        ));
+    }
+
+    #[test]
+    fn shift_enter_on_a_file_fills_the_kit_from_its_folder() {
+        use crate::params::kit as kp;
+        let mut stage = Stage::new();
+        let id = kit_on_track(&mut stage);
+        stage
+            .song
+            .device_mut(id)
+            .expect("the kit stands")
+            .set(kp::PAD, 2.0);
+        let asset = |path: &str| crate::library::AssetRecord {
+            path: PathBuf::from(path),
+            relative_path: PathBuf::from(path.trim_start_matches("/kits/")),
+            location_id: "kits".to_owned(),
+            name: std::path::Path::new(path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            extension: "wav".to_owned(),
+            bytes: 1,
+            modified_unix_secs: None,
+            tags: Vec::new(),
+        };
+        stage.library_snapshot.assets = vec![
+            asset("/kits/909/snare.wav"),
+            asset("/kits/808/cowbell.wav"),
+            asset("/kits/909/kick.wav"),
+            asset("/kits/909/clap.wav"),
+            asset("/kits/909/hat.wav"),
+        ];
+        browser_with_a_sample(&mut stage, "/kits/909/kick.wav");
+        let mut filled = None;
+        for _ in 0..400 {
+            let here = stage
+                .browser
+                .as_ref()
+                .and_then(Browser::selected)
+                .map(|node| (node.label.clone(), node.is_branch()));
+            match here {
+                Some((label, false)) if label == "kick.wav" => {
+                    filled = stage.handle_key(Mods::SHIFT, Key::Enter);
+                    break;
+                }
+                Some((_, true)) => {
+                    let _ = stage.handle_key(Mods::NONE, Key::Enter);
+                    let _ = stage.handle_key(Mods::NONE, Key::ArrowDown);
+                }
+                _ => {
+                    let _ = stage.handle_key(Mods::NONE, Key::ArrowDown);
+                }
+            }
+        }
+        assert_eq!(filled, Some(ApplyOutcome::Changed));
+        let kit = stage.song.device(id).expect("the kit stands");
+        // The folder's four files, in name order, from the pad in hand.
+        let laid: Vec<&str> = (2..6)
+            .map(|pad| kit.pads[pad].to_str().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            laid,
+            [
+                "/kits/909/clap.wav",
+                "/kits/909/hat.wav",
+                "/kits/909/kick.wav",
+                "/kits/909/snare.wav"
+            ]
+        );
+        assert!(
+            kit.pads[6].as_os_str().is_empty(),
+            "the other folder crept in"
+        );
+        assert_eq!(
+            kit.value(kp::PAD),
+            6.0,
+            "the hand should move past what was laid"
+        );
+        assert_eq!(
+            stage.notice.as_deref(),
+            Some("4 pads from 909 · pad 3 first")
         );
     }
 

@@ -271,6 +271,8 @@ struct Audio {
     levels: Vec<Level>,
     /// The same for the console's telemetry.
     telemetry: Vec<(daw::sequencing::DeviceId, daw::console::Telemetry)>,
+    /// The instruments' readouts, by device, refreshed each frame.
+    readouts: Vec<(daw::sequencing::DeviceId, daw::console::Telemetry)>,
     /// When the engine was started, and whether it has already been
     /// started again on the fallback backend.
     started: std::time::Instant,
@@ -327,6 +329,7 @@ impl Audio {
             seek_block: None,
             levels: Vec::new(),
             telemetry: Vec::new(),
+            readouts: Vec::new(),
             looped: None,
             export: None,
         }
@@ -1180,6 +1183,24 @@ impl Audio {
             }
         }
         stage.set_telemetry(&self.telemetry);
+        // What the instruments say about themselves, by device.
+        self.readouts.clear();
+        if let Some(nodes) = &self.nodes {
+            for (id, slot) in &nodes.readouts {
+                let Some(said) = snapshot.device_readouts.get(*slot) else {
+                    continue;
+                };
+                self.readouts.push((
+                    *id,
+                    daw::console::Telemetry {
+                        level_db: said.level_db,
+                        reduction_db: said.reduction_db,
+                        bands: said.bands,
+                    },
+                ));
+            }
+        }
+        stage.set_readouts(&self.readouts);
         // The callback's readings are the only truthful scopes: sources are
         // in Song order, while compiled wires return their stable ids because
         // an unresolved destination may leave a hole in document order.

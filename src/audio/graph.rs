@@ -6652,6 +6652,11 @@ impl Schedule {
                 readout.level_db = readout.level_db.max(said.level_db);
                 // Reduction is negative, so "most" is the minimum.
                 readout.reduction_db = readout.reduction_db.min(said.reduction_db);
+                // The bands too — a kit's lit pads, a brick's hit count
+                // — the most of each across the block.
+                for (mine, theirs) in readout.bands.iter_mut().zip(said.bands) {
+                    *mine = mine.max(theirs);
+                }
             }
             // The console's telemetry, accumulated the same way: the
             // loudest and the most reduced across the block's segments.

@@ -84,6 +84,13 @@ impl ScopeContext {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StageIntent {
     Step(Step),
+    /// Hear the instrument under the band's cursor without a trig: a
+    /// kit's pad in play, a brick's or a sampler's file.
+    Hear,
+    /// Swap the kit pad under the cursor with the pad in hand.
+    SwapPad,
+    /// Fill the addressed track's kit from the browsed file's folder.
+    Fill,
     /// Jump the band's row cursor to the next or previous parameter
     /// group — the next pad of a kit, the next operator of an FM synth —
     /// rather than walking every row between.
@@ -567,6 +574,9 @@ impl StageIntent {
             Self::Nudge => "nudge, then a direction",
             Self::Yank => "yank device",
             Self::Put => "put device",
+            Self::Hear => "hear the pad",
+            Self::SwapPad => "swap pad with the hand",
+            Self::Fill => "fill kit from folder",
             Self::Duplicate => "duplicate selection",
             Self::TrigMenu => "trig menu",
             Self::ClearLock => "clear lock",
@@ -914,6 +924,9 @@ const BINDINGS: &[Binding] = &[
     // Inside the band: bare arrows walk it — across the devices, down the
     // parameters — and a shifted arrow moves the value under the cursor,
     // the same gesture the mixer's pan already answers to.
+    Binding::new(ScopeContext::Chain, Key::P, StageIntent::Hear),
+    Binding::new(ScopeContext::Chain, Key::X, StageIntent::SwapPad),
+    Binding::shift(ScopeContext::Browser, Key::Enter, StageIntent::Fill),
     Binding::new(
         ScopeContext::Chain,
         Key::PageUp,
@@ -2125,6 +2138,9 @@ fn family(intent: StageIntent) -> &'static str {
         StageIntent::Nudge
         | StageIntent::Yank
         | StageIntent::Put
+        | StageIntent::Hear
+        | StageIntent::SwapPad
+        | StageIntent::Fill
         | StageIntent::Duplicate
         | StageIntent::TrigMenu
         | StageIntent::ClearLock

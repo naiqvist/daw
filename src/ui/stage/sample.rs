@@ -123,6 +123,10 @@ pub(super) struct SampleEditor {
     pub(super) playing: Option<Playing>,
     /// The marker in hand, if one is: the arrows carry it with the cursor.
     pub(super) grabbed: Option<Marker>,
+    /// The kit pad this room is open on, when it is a pad and not a
+    /// sampler; `stand_in` is then the sampler standing for it.
+    pub(super) pad: Option<usize>,
+    pub(super) stand_in: Option<crate::sequencing::Device>,
 }
 
 /// The least of the file a view may show: sixty-four frames' worth is
@@ -154,6 +158,8 @@ impl SampleEditor {
             snap: true,
             playing: None,
             grabbed: None,
+            pad: None,
+            stand_in: None,
         }
     }
 

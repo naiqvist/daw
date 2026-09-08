@@ -78,6 +78,10 @@ pub struct SongNodes {
     /// device's id, so a card finds its own figures by the device it
     /// draws.
     pub telemetry: Vec<(DeviceId, usize)>,
+    /// Which readout slot each INSTRUMENT reports under — what its
+    /// voices say about themselves: a kit's lit pads, a brick's hits.
+    /// The host reads the slot and hands the stage the device's id.
+    pub readouts: Vec<(DeviceId, usize)>,
 }
 
 impl SongNodes {
@@ -99,6 +103,18 @@ impl SongNodes {
 /// telemetry slots are the console's. See [`register`].
 fn address(nodes: &mut SongNodes, id: DeviceId, node: NodeId) {
     nodes.devices.push((id, node));
+}
+
+/// Put a VOICE in the letter table, and tap what it says about itself
+/// while there is a readout slot to give. Meter slots are the tracks';
+/// readout slots are the instruments'.
+fn address_voice(spec: &mut GraphSpec, nodes: &mut SongNodes, id: DeviceId, node: NodeId) {
+    address(nodes, id, node);
+    let slot = nodes.readouts.len();
+    if slot < crate::audio::graph::MAX_METERS {
+        spec.tap(slot, node);
+        nodes.readouts.push((id, slot));
+    }
 }
 
 /// Put `node` in the tables: its letters, and its telemetry slot while
@@ -452,6 +468,7 @@ pub fn build(song: &Song, playing: &[Option<usize>]) -> (GraphSpec, SongNodes) {
         param_aliases: Vec::new(),
         sends: vec![[None; 2]; song.tracks.len()],
         telemetry: Vec::new(),
+        readouts: Vec::new(),
     };
     let desk = desk(&mut spec, song, &mut nodes, master);
     let mut bus_sources: Vec<Vec<NodeId>> = (0..desk.buses.len()).map(|_| Vec::new()).collect();
@@ -487,7 +504,7 @@ pub fn build(song: &Song, playing: &[Option<usize>]) -> (GraphSpec, SongNodes) {
                 // goes in the letter table. Leaving it out meant a turn on a
                 // kick was heard only when something ELSE rebuilt the graph.
                 if let Some(head) = track.chain.first().filter(|device| device.is_instrument()) {
-                    address(&mut nodes, head.id, node);
+                    address_voice(&mut spec, &mut nodes, head.id, node);
                 }
             }
         }
@@ -920,6 +937,7 @@ pub fn build_song(song: &Song) -> (GraphSpec, SongNodes) {
         param_aliases: Vec::new(),
         sends: vec![[None; 2]; song.tracks.len()],
         telemetry: Vec::new(),
+        readouts: Vec::new(),
     };
     let desk = desk(&mut spec, song, &mut nodes, master);
     let mut bus_sources: Vec<Vec<NodeId>> = (0..desk.buses.len()).map(|_| Vec::new()).collect();
@@ -947,7 +965,7 @@ pub fn build_song(song: &Song) -> (GraphSpec, SongNodes) {
             // goes in the letter table. Leaving it out meant a turn on a
             // kick was heard only when something ELSE rebuilt the graph.
             if let Some(head) = track.chain.first().filter(|device| device.is_instrument()) {
-                address(&mut nodes, head.id, voice);
+                address_voice(&mut spec, &mut nodes, head.id, voice);
             }
         }
         push_monitored_input(&mut spec, track, &mut sources);

@@ -1413,6 +1413,16 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
                 rate,
             ));
         }
+        // Two pads sounding, as the engine would say it: a mask in the
+        // second band, the last hit in the third.
+        stage.set_readouts(&[(
+            id,
+            daw::console::Telemetry {
+                level_db: -6.0,
+                reduction_db: 0.0,
+                bands: [3.0, (1 << 0 | 1 << 4) as f32, 5.0],
+            },
+        )]);
         if which.contains("-jump") {
             for _ in 0..3 {
                 let _ = stage.apply(StageIntent::Group(daw::ui::stage::Step::Down));

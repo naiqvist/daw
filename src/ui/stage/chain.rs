@@ -289,6 +289,8 @@ impl KitFace {
 /// One device, as a column of the band.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Column {
+    /// The device's id, so a card can find its own figures.
+    pub id: crate::sequencing::DeviceId,
     pub title: &'static str,
     /// The catalog's compact machine address. It is stable enough for
     /// automation targets and short enough to cut into a card header.
@@ -401,6 +403,7 @@ pub fn band(song: &Song, track: usize) -> Vec<Column> {
 pub fn column(device: &Device) -> Column {
     let spec = device.kind.spec();
     Column {
+        id: device.id,
         title: device.role.title().unwrap_or(spec.name),
         code: device.role.code().unwrap_or(spec.prefix),
         family: spec.family,

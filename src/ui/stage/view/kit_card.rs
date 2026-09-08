@@ -178,6 +178,7 @@ fn draw_pads(
     face: &KitFace,
     in_hand: usize,
     under: Option<usize>,
+    lit: u32,
 ) {
     let c = palette::colours();
     let inner = face::frame_plot(painter, rect);
@@ -207,7 +208,10 @@ fn draw_pads(
         let knobs = &p.pads[pad];
         let file = face.file(pad);
         let quiet = !knobs.is_on() || solo.is_some_and(|s| s != pad);
-        let fill = if pad == in_hand {
+        let sounding = lit & (1 << pad) != 0;
+        let fill = if sounding {
+            alpha(c.nominal, 70)
+        } else if pad == in_hand {
             alpha(c.select, 60)
         } else if file.is_some() {
             alpha(c.edge, 40)
@@ -215,7 +219,9 @@ fn draw_pads(
             alpha(c.ground, 90)
         };
         painter.rect_filled(cell, 0.0, fill);
-        let edge = if pad == in_hand {
+        let edge = if sounding {
+            egui::Stroke::new(1.0, c.nominal)
+        } else if pad == in_hand {
             egui::Stroke::new(1.0, c.select)
         } else {
             egui::Stroke::new(1.0, c.rule)
@@ -363,7 +369,11 @@ impl super::super::Stage {
             &head,
             "stage-kit",
         );
-        draw_pads(&painter, layout.plot, face, in_hand, under);
+        // The engine's word on which pads sound, when it has one.
+        let lit = self
+            .readout(column.id)
+            .map_or(0, |said| said.bands[1].max(0.0).min(u32::MAX as f32) as u32);
+        draw_pads(&painter, layout.plot, face, in_hand, under, lit);
         face::draw_facts(
             &painter,
             layout.facts,
@@ -410,7 +420,7 @@ impl super::super::Stage {
             row_offset,
             rows_shown,
             "stage-kit-param-cursor",
-            "PARAM BANK // PGUP/PGDN: PAD",
+            "BANK // PGDN PAD · P HEAR · Q E X DEL",
             &|_| RowMark::default(),
         );
     }
