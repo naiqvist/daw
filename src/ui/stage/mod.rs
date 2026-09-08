@@ -2549,6 +2549,92 @@ impl Stage {
                     Err(RefusalReason::Unavailable)
                 }
             }
+            ForgeIntent::Snapshot => {
+                let rows: Vec<(u32, f32)> = {
+                    let device = self.song.device(id).ok_or(RefusalReason::Unavailable)?;
+                    forge
+                        .rows()
+                        .iter()
+                        .map(|(_, row)| (*row, device.value(*row)))
+                        .collect()
+                };
+                if let Some(forge) = self.forge.as_mut() {
+                    forge.snapshot = Some(rows);
+                }
+                self.notice = Some("snapshot held · B trades with it".to_owned());
+                Ok(())
+            }
+            ForgeIntent::Swap => {
+                let Some(held) = self.forge.as_ref().and_then(|forge| forge.snapshot.clone())
+                else {
+                    return Err(RefusalReason::Empty);
+                };
+                let mut now = Vec::with_capacity(held.len());
+                let mut changed = false;
+                {
+                    let device = self.song.device_mut(id).ok_or(RefusalReason::Unavailable)?;
+                    for (row, value) in &held {
+                        let before = device.value(*row);
+                        now.push((*row, before));
+                        device.set(*row, *value);
+                        changed |= device.value(*row) != before;
+                    }
+                }
+                if let Some(forge) = self.forge.as_mut() {
+                    forge.snapshot = Some(now);
+                }
+                if !changed {
+                    return Err(RefusalReason::Unavailable);
+                }
+                self.notice = Some("traded with the snapshot".to_owned());
+                self.touch_forge_rows(subject);
+                Ok(())
+            }
+            ForgeIntent::Mutate | ForgeIntent::Randomise => {
+                let all = intent == ForgeIntent::Randomise;
+                let spec = self
+                    .song
+                    .device(id)
+                    .map(|device| device.kind.spec())
+                    .ok_or(RefusalReason::Unavailable)?;
+                let rows: Vec<u32> = forge.rows().iter().map(|(_, row)| *row).collect();
+                let mut changed = false;
+                for row in rows {
+                    let rollable = self.forge.as_ref().is_some_and(|forge| forge.rollable(row));
+                    if !rollable {
+                        continue;
+                    }
+                    let Some(def) = spec.params.iter().find(|def| def.id == row) else {
+                        continue;
+                    };
+                    let Some(forge) = self.forge.as_mut() else {
+                        break;
+                    };
+                    let (touch, spin) = (forge.roll(), forge.roll());
+                    // Mutate touches one row in four, and only a little.
+                    if !all && touch > 0.25 {
+                        continue;
+                    }
+                    let Some(device) = self.song.device_mut(id) else {
+                        break;
+                    };
+                    let before = device.value(row);
+                    let span = def.max - def.min;
+                    let target = if all {
+                        def.min + span * spin
+                    } else {
+                        before + span * (spin - 0.5) * 0.1
+                    };
+                    device.set(row, target);
+                    changed |= device.value(row) != before;
+                }
+                if !changed {
+                    return Err(RefusalReason::Unavailable);
+                }
+                self.notice = Some(if all { "randomised" } else { "mutated" }.to_owned());
+                self.touch_forge_rows(subject);
+                Ok(())
+            }
             ForgeIntent::Left { .. } | ForgeIntent::Right { .. } | ForgeIntent::Reset => {
                 let coarse = matches!(
                     intent,
@@ -3088,6 +3174,16 @@ impl Stage {
                 Ok(())
             }
         }
+    }
+
+    /// After the dice or a trade moved rows: a render for an sCOMP,
+    /// letters for everything, and the picture again.
+    fn touch_forge_rows(&mut self, subject: ForgeSubject) {
+        if subject == ForgeSubject::Scomp {
+            self.touched();
+        }
+        self.remixed();
+        self.refresh_forge();
     }
 
     /// Let go of the marker in hand.
@@ -6395,6 +6491,84 @@ mod tests {
         assert!(stage.forge.is_none());
     }
 
+    /// The room's dice and its A/B: a snapshot is held, a trade puts it
+    /// on the device and holds what was there, mutate moves a few rows
+    /// a little, randomise moves every rollable row, and none of them
+    /// touches the level.
+    #[test]
+    fn the_forge_has_dice_and_an_a_b() {
+        use crate::params::quad as qp;
+        let mut stage = Stage::new();
+        let id = stage
+            .song
+            .add_device(0, crate::devices::DeviceKind::Quad)
+            .expect("a quad");
+        assert_eq!(stage.apply(StageIntent::Devices), ApplyOutcome::Changed);
+        assert_eq!(
+            drive(&mut stage, &[Key::Enter]),
+            vec![ApplyOutcome::Changed]
+        );
+        assert!(
+            matches!(drive(&mut stage, &[Key::B])[0], ApplyOutcome::Refused(_)),
+            "a trade with nothing held"
+        );
+        assert_eq!(drive(&mut stage, &[Key::S]), vec![ApplyOutcome::Changed]);
+        let level = stage.song.device(id).unwrap().value(qp::LEVEL);
+        let cutoff = stage.song.device(id).unwrap().value(qp::CUTOFF);
+        assert_eq!(drive(&mut stage, &[Key::X]), vec![ApplyOutcome::Changed]);
+        let device = stage.song.device(id).unwrap();
+        assert_eq!(device.value(qp::LEVEL), level, "randomise moved the level");
+        assert_eq!(
+            device.value(qp::MONO),
+            0.0,
+            "randomise changed the voice mode"
+        );
+        let defaults = crate::audio::quad::QuadParams::default();
+        let moved = qp::TABLE
+            .iter()
+            .filter(|def| device.value(def.id) != defaults.get(def.id).unwrap_or(0.0))
+            .count();
+        assert!(
+            moved > qp::TABLE.len() / 2,
+            "randomise moved only {moved} rows"
+        );
+        // Trade: the defaults come back, and the random set is held.
+        assert_eq!(drive(&mut stage, &[Key::B]), vec![ApplyOutcome::Changed]);
+        assert_eq!(stage.song.device(id).unwrap().value(qp::CUTOFF), cutoff);
+        assert_eq!(drive(&mut stage, &[Key::B]), vec![ApplyOutcome::Changed]);
+        assert_ne!(
+            stage.song.device(id).unwrap().value(qp::CUTOFF),
+            cutoff,
+            "the trade did not bring the random set back"
+        );
+        // Mutate moves a few rows, a little.
+        let read = |stage: &Stage| -> Vec<f32> {
+            qp::TABLE
+                .iter()
+                .map(|def| stage.song.device(id).unwrap().value(def.id))
+                .collect()
+        };
+        let before = read(&stage);
+        assert_eq!(drive(&mut stage, &[Key::M]), vec![ApplyOutcome::Changed]);
+        let after = read(&stage);
+        let touched = before
+            .iter()
+            .zip(after.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(
+            touched > 0 && touched < qp::TABLE.len() / 2,
+            "mutate touched {touched} rows"
+        );
+        for (def, (a, b)) in qp::TABLE.iter().zip(before.iter().zip(after.iter())) {
+            assert!(
+                (a - b).abs() <= (def.max - def.min) * 0.06 + 1e-6,
+                "{} jumped {a} -> {b}",
+                def.name
+            );
+        }
+    }
+
     /// The band's FORGE row is a door: turned up, the forge opens; turned
     /// down, it refuses; either way the row never reads as on.
     #[test]
@@ -7797,7 +7971,10 @@ mod tests {
                             stage.plock_editor.clone(),
                             stage.modulation.clone(),
                             stage.sample.clone(),
-                            stage.forge.as_ref().map(|forge| (forge.row, forge.pass)),
+                            stage
+                                .forge
+                                .as_ref()
+                                .map(|forge| (forge.row, forge.pass, forge.snapshot.is_some())),
                             stage.session_selection.clone(),
                             stage.session_clipboard.clone(),
                             stage.block_clipboard.clone(),
@@ -7835,7 +8012,11 @@ mod tests {
                                         stage.plock_editor.clone(),
                                         stage.modulation.clone(),
                                         stage.sample.clone(),
-                                        stage.forge.as_ref().map(|forge| (forge.row, forge.pass)),
+                                        stage.forge.as_ref().map(|forge| (
+                                            forge.row,
+                                            forge.pass,
+                                            forge.snapshot.is_some()
+                                        )),
                                         stage.session_selection.clone(),
                                         stage.session_clipboard.clone(),
                                         stage.block_clipboard.clone(),
@@ -7876,7 +8057,11 @@ mod tests {
                                         stage.plock_editor.clone(),
                                         stage.modulation.clone(),
                                         stage.sample.clone(),
-                                        stage.forge.as_ref().map(|forge| (forge.row, forge.pass)),
+                                        stage.forge.as_ref().map(|forge| (
+                                            forge.row,
+                                            forge.pass,
+                                            forge.snapshot.is_some()
+                                        )),
                                         stage.session_selection.clone(),
                                         stage.session_clipboard.clone(),
                                         stage.block_clipboard.clone(),

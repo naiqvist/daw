@@ -83,7 +83,7 @@ pub(super) const ROWS: [(&str, u32); 22] = [
 
 /// QUAD's rows, in signal order: each operator, the routing, the two
 /// pitch envelopes, the filter, the output.
-pub(super) const QUAD_ROWS: [(&str, u32); 90] = [
+pub(super) const QUAD_ROWS: [(&str, u32); 112] = [
     ("OP 1", qp::op_param(0, qp::RATIO)),
     ("OP 1", qp::op_param(0, qp::FINE)),
     ("OP 1", qp::op_param(0, qp::LEVEL_OP)),
@@ -135,11 +135,32 @@ pub(super) const QUAD_ROWS: [(&str, u32); 90] = [
     ("ROUTE", qp::ALGO),
     ("ROUTE", qp::FEEDBACK),
     ("ROUTE", qp::FB_OP),
+    ("MATRIX", qp::matrix_param(0, 0)),
+    ("MATRIX", qp::matrix_param(0, 1)),
+    ("MATRIX", qp::matrix_param(0, 2)),
+    ("MATRIX", qp::matrix_param(0, 3)),
+    ("MATRIX", qp::matrix_param(1, 0)),
+    ("MATRIX", qp::matrix_param(1, 1)),
+    ("MATRIX", qp::matrix_param(1, 2)),
+    ("MATRIX", qp::matrix_param(1, 3)),
+    ("MATRIX", qp::matrix_param(2, 0)),
+    ("MATRIX", qp::matrix_param(2, 1)),
+    ("MATRIX", qp::matrix_param(2, 2)),
+    ("MATRIX", qp::matrix_param(2, 3)),
+    ("MATRIX", qp::matrix_param(3, 0)),
+    ("MATRIX", qp::matrix_param(3, 1)),
+    ("MATRIX", qp::matrix_param(3, 2)),
+    ("MATRIX", qp::matrix_param(3, 3)),
+    ("MATRIX", qp::out_param(0)),
+    ("MATRIX", qp::out_param(1)),
+    ("MATRIX", qp::out_param(2)),
+    ("MATRIX", qp::out_param(3)),
     ("VOICE", qp::UNISON),
     ("VOICE", qp::UDETUNE),
     ("VOICE", qp::WIDTH),
     ("VOICE", qp::MONO),
     ("VOICE", qp::GLIDE),
+    ("VOICE", qp::ENV_LOOP),
     ("PITCH 1", qp::PITCH1),
     ("PITCH 1", qp::PITCH1_RISE),
     ("PITCH 1", qp::PITCH1_FALL),
@@ -174,6 +195,7 @@ pub(super) const QUAD_ROWS: [(&str, u32); 90] = [
     ("OUT", qp::VELOCITY),
     ("OUT", qp::LEVEL),
     ("OUT", qp::KEY_RATE),
+    ("OUT", qp::OVERSAMPLE),
 ];
 
 /// Which instrument the room is open on. The room's grammar is one
@@ -198,6 +220,11 @@ pub(super) struct Forge {
     key: Option<Baked>,
     pub(super) take: Option<Take>,
     pub(super) peaks: Vec<Arc<Peaks>>,
+    /// The other side of an A/B: every row's value, held.
+    pub(super) snapshot: Option<Vec<(u32, f32)>>,
+    /// The dice for mutate and randomise: an xorshift, so a test can
+    /// seed it and the room owes nothing to the clock.
+    pub(super) seed: u32,
 }
 
 impl Forge {
@@ -211,6 +238,27 @@ impl Forge {
             key: None,
             take: None,
             peaks: Vec::new(),
+            snapshot: None,
+            seed: 0x2545_F491,
+        }
+    }
+
+    /// A number in `0..1`, and the next seed.
+    pub(super) fn roll(&mut self) -> f32 {
+        let mut x = self.seed;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.seed = x;
+        (x >> 8) as f32 / (1u32 << 24) as f32
+    }
+
+    /// The rows the dice may touch: everything but the loudness, the
+    /// doors and the switches that change what the room is.
+    pub(super) fn rollable(&self, id: u32) -> bool {
+        match self.subject {
+            Subject::Scomp => !matches!(id, sp::LEVEL | sp::OPEN | sp::ROOT),
+            Subject::Quad => !matches!(id, qp::LEVEL | qp::OVERSAMPLE | qp::MONO | qp::UNISON),
         }
     }
 
@@ -381,6 +429,20 @@ mod tests {
                 seen.push(group);
             }
         }
+    }
+
+    #[test]
+    fn the_dice_are_seeded_and_spare_the_rows_that_change_the_room() {
+        let device = Device::new(DeviceId(9), DeviceKind::Quad);
+        let mut a = Forge::open(0, device.id, Subject::Quad);
+        let mut b = Forge::open(0, device.id, Subject::Quad);
+        let rolls: Vec<f32> = (0..8).map(|_| a.roll()).collect();
+        assert_eq!(rolls, (0..8).map(|_| b.roll()).collect::<Vec<_>>());
+        assert!(rolls.iter().all(|r| (0.0..1.0).contains(r)));
+        assert!(rolls.windows(2).any(|w| w[0] != w[1]));
+        assert!(a.rollable(qp::CUTOFF) && !a.rollable(qp::LEVEL) && !a.rollable(qp::MONO));
+        let c = Forge::open(0, DeviceId(1), Subject::Scomp);
+        assert!(c.rollable(sp::DRIVE) && !c.rollable(sp::OPEN) && !c.rollable(sp::LEVEL));
     }
 
     #[test]

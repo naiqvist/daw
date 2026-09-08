@@ -22,7 +22,7 @@
 use crate::dsp::adsr::Adsr;
 use crate::dsp::filters::{Mode as FilterMode, Svf};
 use crate::dsp::interp::linear;
-use crate::dsp::shaper::{Mode as ShapeMode, Waveshaper};
+use crate::dsp::shaper::{Mode as ShapeMode, Oversampler2x, Waveshaper};
 use crate::params::quad as p;
 use crate::params::quad::{Algorithm, LFOS, OPS, UNISON_MAX};
 
@@ -142,6 +142,12 @@ pub struct QuadParams {
     pub glide: f32,
     pub fb_op: f32,
     pub lfos: [Lfo; LFOS],
+    /// `matrix[from][to]`: how much of `from` reaches `to`'s phase.
+    pub matrix: [[f32; OPS]; OPS],
+    /// Each operator's level to the output, in matrix mode.
+    pub out: [f32; OPS],
+    pub env_loop: f32,
+    pub oversample: f32,
 }
 
 impl Default for QuadParams {
@@ -175,6 +181,10 @@ impl Default for QuadParams {
             glide: 0.0,
             fb_op: 3.0,
             lfos: [Lfo::default(); LFOS],
+            matrix: [[0.0; OPS]; OPS],
+            out: [0.0; OPS],
+            env_loop: 0.0,
+            oversample: 0.0,
         };
         for def in p::TABLE {
             me.set(def.id, def.default);
@@ -216,6 +226,18 @@ impl QuadParams {
                 p::VEL => op.vel = value,
                 p::KEYSCALE => op.keyscale = value,
                 _ => {}
+            }
+            return;
+        }
+        if let Some((from, to)) = p::matrix_of(param) {
+            if let Some(cell) = self.matrix.get_mut(from).and_then(|row| row.get_mut(to)) {
+                *cell = value;
+            }
+            return;
+        }
+        if let Some(op) = p::out_of(param) {
+            if let Some(slot) = self.out.get_mut(op) {
+                *slot = value;
             }
             return;
         }
@@ -263,6 +285,8 @@ impl QuadParams {
             p::MONO => self.mono = value,
             p::GLIDE => self.glide = value,
             p::FB_OP => self.fb_op = value,
+            p::ENV_LOOP => self.env_loop = value,
+            p::OVERSAMPLE => self.oversample = value,
             _ => {}
         }
     }
@@ -285,6 +309,12 @@ impl QuadParams {
                 p::KEYSCALE => op.keyscale,
                 _ => return None,
             });
+        }
+        if let Some((from, to)) = p::matrix_of(param) {
+            return self.matrix.get(from).and_then(|row| row.get(to)).copied();
+        }
+        if let Some(op) = p::out_of(param) {
+            return self.out.get(op).copied();
         }
         if let Some((lfo, field)) = Self::lfo_of(param) {
             let lfo = self.lfos.get(lfo)?;
@@ -327,6 +357,8 @@ impl QuadParams {
             p::MONO => self.mono,
             p::GLIDE => self.glide,
             p::FB_OP => self.fb_op,
+            p::ENV_LOOP => self.env_loop,
+            p::OVERSAMPLE => self.oversample,
             _ => return None,
         })
     }
@@ -363,6 +395,38 @@ impl QuadParams {
 
     pub fn feedback_op(&self) -> usize {
         (self.fb_op.round().max(0.0) as usize).min(OPS - 1)
+    }
+
+    pub fn is_matrix(&self) -> bool {
+        p::is_matrix(self.algo)
+    }
+
+    /// Whether operator `op` reaches the output: a carrier of the
+    /// shape, or an operator with an OUT level in the matrix.
+    pub fn is_heard(&self, op: usize) -> bool {
+        if self.is_matrix() {
+            self.out.get(op).is_some_and(|level| *level > 0.001)
+        } else {
+            self.algorithm().carriers.contains(&op)
+        }
+    }
+
+    /// Whether operator `op` modulates another: the second pitch
+    /// envelope's and the LFOs' notion of a modulator.
+    pub fn is_modulating(&self, op: usize) -> bool {
+        if self.is_matrix() {
+            self.matrix.get(op).is_some_and(|row| {
+                row.iter()
+                    .enumerate()
+                    .any(|(to, amount)| to != op && *amount > 0.001)
+            })
+        } else {
+            p::is_modulator(self.algorithm(), op)
+        }
+    }
+
+    pub fn oversampled(&self) -> bool {
+        self.oversample.round() >= 1.0
     }
 }
 
@@ -416,6 +480,9 @@ struct Voice {
     lfo_phase: [f32; LFOS],
     /// The sample-and-hold's held value, per LFO.
     lfo_hold: [f32; LFOS],
+    /// The halfband pair for 2x, one per side.
+    over_l: Oversampler2x,
+    over_r: Oversampler2x,
 }
 
 impl Voice {
@@ -438,6 +505,8 @@ impl Voice {
             noise: 0x9E37_79B9,
             lfo_phase: [0.0; LFOS],
             lfo_hold: [0.0; LFOS],
+            over_l: Oversampler2x::new(),
+            over_r: Oversampler2x::new(),
         }
     }
 
@@ -499,6 +568,9 @@ pub struct QuadVoices {
     /// the sums.
     block_l: Vec<f32>,
     block_r: Vec<f32>,
+    /// The operators' run at twice the rate, before the halfband.
+    up_l: Vec<f32>,
+    up_r: Vec<f32>,
     envs: [Vec<f32>; OPS],
     left: Vec<f32>,
     right: Vec<f32>,
@@ -549,6 +621,8 @@ impl QuadVoices {
             held_len: 0,
             block_l: vec![0.0; n],
             block_r: vec![0.0; n],
+            up_l: vec![0.0; HOP * 2],
+            up_r: vec![0.0; HOP * 2],
             envs: [vec![0.0; n], vec![0.0; n], vec![0.0; n], vec![0.0; n]],
             left: vec![0.0; n],
             right: vec![0.0; n],
@@ -578,6 +652,8 @@ impl QuadVoices {
             for (env, op) in v.env.iter_mut().zip(p.ops.iter()) {
                 env.prepare(sr, op.attack, op.decay, op.sustain, op.release);
             }
+            v.over_l.prepare();
+            v.over_r.prepare();
         }
         let mode = match p.dist.round() as u8 {
             2 => ShapeMode::HardClip,
@@ -810,13 +886,16 @@ impl QuadVoices {
         }
         let p = self.params;
         let algo = p.algorithm();
+        let matrix = p.is_matrix();
         let sr = self.sample_rate;
         let nyquist = sr * 0.45;
-        let carriers = algo.carriers.len().max(1) as f32;
+        let heard = (0..OPS).filter(|op| p.is_heard(*op)).count().max(1) as f32;
         let count = p.unison_count();
         let positions = unison_positions(count);
-        let scale = 1.0 / (carriers * count as f32).sqrt();
+        let scale = 1.0 / (heard * count as f32).sqrt();
         let fb_op = p.feedback_op();
+        let over = p.oversampled();
+        let rate_mul = if over { 2.0 } else { 1.0 };
         let fmode = match p.fmode.round() as u8 {
             1 => FilterMode::Highpass,
             2 => FilterMode::BandpassUnity,
@@ -831,6 +910,7 @@ impl QuadVoices {
             0.0
         };
         let waves = &self.waves;
+        let looping = p.env_loop.round() >= 1.0;
         let mut sounding = 0usize;
         for vi in 0..self.voices.len() {
             if !self.voices[vi].active {
@@ -843,6 +923,16 @@ impl QuadVoices {
                     break;
                 }
                 let v = &mut self.voices[vi];
+                // Looping envelopes: one that has reached its sustain
+                // while the key is down starts again — a rhythm from
+                // the key held.
+                if looping && v.held {
+                    for env in v.env.iter_mut() {
+                        if env.stage() == crate::dsp::adsr::AdsrStage::Sustain {
+                            env.gate_on();
+                        }
+                    }
+                }
                 for (k, env) in v.env.iter_mut().enumerate() {
                     if let Some(buf) = self.envs[k].get_mut(..take) {
                         env.process(buf);
@@ -851,7 +941,6 @@ impl QuadVoices {
                 let touch = 1.0 - p.velocity + p.velocity * v.vel;
                 let t = v.elapsed as f32 / sr;
                 let hop_seconds = take as f32 / sr;
-                // The LFOs, once a hop.
                 let mut lfo_pitch = 0.0f32;
                 let mut lfo_mod = 0.0f32;
                 let mut lfo_amp = 0.0f32;
@@ -869,15 +958,13 @@ impl QuadVoices {
                 let bend_all =
                     p.pitch1 * rise_fall(t, p.p1_rise, p.p1_fall) + lfo_pitch + v.glide_semis;
                 let bend_mod = p.pitch2 * rise_fall(t, p.p2_rise, p.p2_fall);
-                // The operators' increments for this hop, per unison copy.
+                // The operators' increments for this hop, per unison
+                // copy, at the rate the loop runs at.
                 let mut inc = [[0.0f32; OPS]; UNISON_MAX];
+                let mut is_mod = [false; OPS];
                 for (k, op) in p.ops.iter().enumerate() {
-                    let bend = bend_all
-                        + if p::is_modulator(algo, k) {
-                            bend_mod
-                        } else {
-                            0.0
-                        };
+                    is_mod[k] = p.is_modulating(k);
+                    let bend = bend_all + if is_mod[k] { bend_mod } else { 0.0 };
                     for u in 0..count {
                         let detune = positions[u] * p.udetune / 100.0;
                         let hz = if op.fixed.round() >= 1.0 {
@@ -887,10 +974,14 @@ impl QuadVoices {
                                 * op.ratio
                                 * (op.fine / 1200.0 + (bend + detune) / 12.0).exp2()
                         };
-                        inc[u][k] = (hz / sr).clamp(0.0, 0.5);
+                        inc[u][k] = (hz / (sr * rate_mul)).clamp(0.0, 0.5);
                     }
                 }
-                for s in 0..take {
+                let steps = if over { take * 2 } else { take };
+                for s in 0..steps {
+                    // The envelope for this step: at 2x, each envelope
+                    // sample serves two steps.
+                    let es = if over { s / 2 } else { s };
                     let mut l = 0.0f32;
                     let mut r = 0.0f32;
                     for u in 0..count {
@@ -898,20 +989,33 @@ impl QuadVoices {
                         for k in (0..OPS).rev() {
                             let op = &p.ops[k];
                             let mut turns = 0.0f32;
-                            for (m, c) in algo.edges {
-                                if *c == k {
-                                    turns += next[*m] * INDEX_TURNS;
+                            if matrix {
+                                // Any into any, the last sample's outputs:
+                                // one sample of delay lets a loop of any
+                                // shape close without an order.
+                                for m in 0..OPS {
+                                    let amount = p.matrix[m][k];
+                                    if amount > 0.0 {
+                                        let index =
+                                            if m == k { FEEDBACK_TURNS } else { INDEX_TURNS };
+                                        turns += v.out[u][m] * amount * index;
+                                    }
+                                }
+                            } else {
+                                for (m, c) in algo.edges {
+                                    if *c == k {
+                                        turns += next[*m] * INDEX_TURNS;
+                                    }
+                                }
+                                if k == fb_op {
+                                    turns += v.out[u][k] * p.feedback * FEEDBACK_TURNS;
                                 }
                             }
-                            if k == fb_op {
-                                turns += v.out[u][k] * p.feedback * FEEDBACK_TURNS;
-                            }
-                            let env = self.envs[k].get(s).copied().unwrap_or(0.0);
-                            let is_mod = p::is_modulator(algo, k);
+                            let env = self.envs[k].get(es).copied().unwrap_or(0.0);
                             let level = op.level
                                 * env
                                 * v.key_gain[k]
-                                * if is_mod { mod_scale } else { amp_scale };
+                                * if is_mod[k] { mod_scale } else { amp_scale };
                             let wave = op.wave.round().max(0.0) as usize;
                             let sample = if wave >= waves.len() {
                                 v.rand()
@@ -924,20 +1028,45 @@ impl QuadVoices {
                         }
                         v.out[u] = next;
                         let mut y = 0.0f32;
-                        for c in algo.carriers {
-                            y += next[*c];
+                        if matrix {
+                            for k in 0..OPS {
+                                y += next[k] * p.out[k];
+                            }
+                        } else {
+                            for c in algo.carriers {
+                                y += next[*c];
+                            }
                         }
                         let (gl, gr) = crate::dsp::pan::spread(positions[u] * p.width);
                         l += y * gl;
                         r += y * gr;
                     }
-                    if let Some(slot) = self.block_l.get_mut(s) {
+                    let (dst_l, dst_r) = if over {
+                        (self.up_l.get_mut(s), self.up_r.get_mut(s))
+                    } else {
+                        (self.block_l.get_mut(s), self.block_r.get_mut(s))
+                    };
+                    if let Some(slot) = dst_l {
                         *slot = l * scale * touch;
                     }
-                    if let Some(slot) = self.block_r.get_mut(s) {
+                    if let Some(slot) = dst_r {
                         *slot = r * scale * touch;
                     }
-                    v.elapsed += 1;
+                    if !over || s % 2 == 1 {
+                        v.elapsed += 1;
+                    }
+                }
+                if over {
+                    if let (Some(up), Some(down)) =
+                        (self.up_l.get(..take * 2), self.block_l.get_mut(..take))
+                    {
+                        v.over_l.down(up, down);
+                    }
+                    if let (Some(up), Some(down)) =
+                        (self.up_r.get(..take * 2), self.block_r.get_mut(..take))
+                    {
+                        v.over_r.down(up, down);
+                    }
                 }
                 // The filter, its cutoff riding its envelope, the key,
                 // and the LFOs.
@@ -963,7 +1092,7 @@ impl QuadVoices {
                 done += take;
             }
             let v = &mut self.voices[vi];
-            let alive = algo.carriers.iter().any(|c| v.env[*c].active());
+            let alive = (0..OPS).any(|k| p.is_heard(k) && v.env[k].active());
             if alive {
                 sounding += 1;
             } else {
@@ -1402,6 +1531,96 @@ mod tests {
         v.note_on(48, 100, 1);
         v.all_sound_off();
         assert!(run(&mut v, 256).iter().all(|x| *x == 0.0));
+    }
+
+    #[test]
+    fn the_matrix_routes_any_into_any_and_out_levels_choose_what_is_heard() {
+        // The matrix at its defaults is the serial stack: the same sound
+        // as shape 0, one sample later.
+        let mut shape = QuadParams::default();
+        shape.ops[1].level = 1.0;
+        let mut matrix = shape;
+        matrix.algo = p::ALGO_MATRIX;
+        let render = |params: QuadParams| {
+            let mut v = QuadVoices::new(FS, 256, params);
+            v.note_on(48, 100, 1);
+            run(&mut v, 4_800)
+        };
+        let (a, b) = (render(shape), render(matrix));
+        assert!(rms(&b) > 0.05 && b.iter().all(|x| x.is_finite()));
+        assert!(
+            (brightness(&a) - brightness(&b)).abs() < brightness(&a) * 0.5,
+            "{} vs {}",
+            brightness(&a),
+            brightness(&b)
+        );
+        // Op 2 into itself and out: heard, and fed back.
+        let mut params = QuadParams::default();
+        params.algo = p::ALGO_MATRIX;
+        params.matrix = [[0.0; OPS]; OPS];
+        params.out = [0.0, 1.0, 0.0, 0.0];
+        params.ops[1].level = 1.0;
+        let clean = render(params);
+        params.matrix[1][1] = 1.0;
+        let fed = render(params);
+        assert!(rms(&clean) > 0.05 && rms(&fed) > 0.05);
+        assert!(
+            brightness(&fed) > brightness(&clean) * 1.5,
+            "{} vs {}",
+            brightness(&fed),
+            brightness(&clean)
+        );
+        // Nothing out: silence, and the voice ends when its heard
+        // envelopes do — with none heard, at once.
+        params.out = [0.0; OPS];
+        let none = render(params);
+        assert!(none.iter().all(|x| x.abs() < 1e-6));
+        // A loop between two operators closes.
+        params.out = [1.0, 0.0, 0.0, 0.0];
+        params.matrix = [[0.0; OPS]; OPS];
+        params.matrix[0][1] = 0.6;
+        params.matrix[1][0] = 0.6;
+        let ring = render(params);
+        assert!(ring.iter().all(|x| x.is_finite() && x.abs() <= 1.0 + 1e-3));
+        assert!(rms(&ring) > 0.05);
+    }
+
+    #[test]
+    fn a_looping_envelope_restarts_while_held_and_two_x_matches_one_x() {
+        let mut params = plain();
+        params.ops[0].attack = 0.0;
+        params.ops[0].decay = 100.0;
+        params.ops[0].sustain = 0.05;
+        params.env_loop = 1.0;
+        let mut v = QuadVoices::new(FS, 256, params);
+        v.note_on(57, 100, 1);
+        let out = run(&mut v, 48_000);
+        // The level climbs back up again and again: many loud stretches
+        // over a second rather than one fall to the floor.
+        let loud: Vec<bool> = out.chunks(480).map(|c| rms(c) > 0.15).collect();
+        let rises = loud.windows(2).filter(|w| !w[0] && w[1]).count();
+        assert!(rises >= 4, "the envelope looped {rises} times");
+        // Oversampling: the same sound, a little cleaner, no louder.
+        let mut params = QuadParams::default();
+        params.ops[1].level = 1.0;
+        params.ops[3].level = 1.0;
+        params.algo = 0.0;
+        let mut one = QuadVoices::new(FS, 256, params);
+        params.oversample = 1.0;
+        let mut two = QuadVoices::new(FS, 256, params);
+        one.note_on(84, 100, 1);
+        two.note_on(84, 100, 1);
+        let a = run(&mut one, 4_800);
+        let b = run(&mut two, 4_800);
+        assert!(b.iter().all(|x| x.is_finite()));
+        let (ra, rb) = (rms(&a), rms(&b));
+        assert!((ra - rb).abs() < ra.max(rb) * 0.35, "{ra} vs {rb}");
+        assert!(
+            brightness(&b) <= brightness(&a) * 1.1,
+            "2x got harsher: {} vs {}",
+            brightness(&b),
+            brightness(&a)
+        );
     }
 
     #[test]

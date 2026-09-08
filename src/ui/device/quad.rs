@@ -60,7 +60,22 @@ const fn lfo_row(lfo: usize) -> [u32; 8] {
 const LFO1: [u32; 8] = lfo_row(0);
 const LFO2: [u32; 8] = lfo_row(1);
 
-const PAGES: [(&str, &[u32]); 14] = [
+const fn matrix_rows(from: usize) -> [u32; 8] {
+    [
+        qp::matrix_param(from, 0),
+        qp::matrix_param(from, 1),
+        qp::matrix_param(from, 2),
+        qp::matrix_param(from, 3),
+        qp::matrix_param(from + 1, 0),
+        qp::matrix_param(from + 1, 1),
+        qp::matrix_param(from + 1, 2),
+        qp::matrix_param(from + 1, 3),
+    ]
+}
+const MTX12: [u32; 8] = matrix_rows(0);
+const MTX34: [u32; 8] = matrix_rows(2);
+
+const PAGES: [(&str, &[u32]); 17] = [
     ("op 1", &OP1),
     ("1 key", &OP1K),
     ("op 2", &OP2),
@@ -95,6 +110,19 @@ const PAGES: [(&str, &[u32]); 14] = [
             qp::KEYTRACK,
         ],
     ),
+    ("mtx 1-2", &MTX12),
+    ("mtx 3-4", &MTX34),
+    (
+        "mtx out",
+        &[
+            qp::out_param(0),
+            qp::out_param(1),
+            qp::out_param(2),
+            qp::out_param(3),
+            qp::ENV_LOOP,
+            qp::OVERSAMPLE,
+        ],
+    ),
     (
         "voice",
         &[qp::UNISON, qp::UDETUNE, qp::WIDTH, qp::MONO, qp::GLIDE],
@@ -110,13 +138,13 @@ const PAGES: [(&str, &[u32]); 14] = [
 const CELL_UNITS: usize = 2;
 const FOOTER_ROWS: usize = CELL_UNITS;
 const HEADER_ROWS: usize = 1;
-const COUNT: usize = 90;
+const COUNT: usize = 112;
 
 pub fn pages() -> usize {
     PAGES.len()
 }
 
-/// Ninety cells: past serde's array limit, and never persisted —
+/// A hundred and twelve cells: past serde's array limit, and never persisted —
 /// the rack rebuilds it from the engine's knobs every frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct QuadUi {
@@ -162,6 +190,8 @@ fn percent_row(param: u32) -> bool {
         param,
         qp::KEYTRACK | qp::VELOCITY | qp::KEY_RATE | qp::WIDTH
     ) || matches!(lfo_field(param), Some(qp::LFO_MOD) | Some(qp::LFO_AMP))
+        || qp::matrix_of(param).is_some()
+        || qp::out_of(param).is_some()
 }
 
 /// Which LFO field a row is, if it is one.
@@ -227,6 +257,10 @@ fn param_of(id: u32) -> Param {
             qp::WIDTH => Param::percent("width"),
             qp::MONO => Param::choice("mode", qp::MONO_NAMES),
             qp::GLIDE => linear("glide", Unit::Ms),
+            qp::ENV_LOOP => Param::choice("env loop", qp::LOOP_NAMES),
+            qp::OVERSAMPLE => Param::choice("2x", qp::OVERSAMPLE_NAMES),
+            _ if qp::matrix_of(id).is_some() => Param::percent("into"),
+            _ if qp::out_of(id).is_some() => Param::percent("out"),
             _ if lfo_field(id) == Some(qp::LFO_RATE) => log("rate", Unit::Hz),
             _ if lfo_field(id) == Some(qp::LFO_SHAPE) => {
                 Param::choice("shape", qp::LFO_SHAPE_NAMES)
@@ -301,7 +335,14 @@ pub fn quad_is_discrete(param: u32) -> bool {
     matches!(qp::op_of(param), Some((_, qp::WAVE)) | Some((_, qp::FIXED)))
         || matches!(
             param,
-            qp::ALGO | qp::FMODE | qp::DIST | qp::FB_OP | qp::UNISON | qp::MONO
+            qp::ALGO
+                | qp::FMODE
+                | qp::DIST
+                | qp::FB_OP
+                | qp::UNISON
+                | qp::MONO
+                | qp::ENV_LOOP
+                | qp::OVERSAMPLE
         )
         || lfo_field(param) == Some(qp::LFO_SHAPE)
 }

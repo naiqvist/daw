@@ -91,6 +91,117 @@ pub(super) fn routing_places(algo: qp::Algorithm) -> ([(f32, usize); qp::OPS], f
     (out, x.max(1.0), rows)
 }
 
+/// The matrix, drawn as the grid it is: a row per source, a column
+/// per destination, each cell filled by how much, the diagonal being
+/// feedback; and a column at the right for what each operator sends
+/// to the output.
+fn draw_matrix(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    p: &QuadParams,
+    shown: Option<usize>,
+    px: f32,
+) {
+    let c = palette::colours();
+    let font = face::font(px);
+    let n = qp::OPS as f32;
+    let label = px * 2.4;
+    let gap = px * 0.8;
+    let cell = ((rect.width() - label - gap) / (n + 1.0))
+        .min((rect.height() - label) / n)
+        .max(10.0);
+    let total_w = label + cell * n + gap + cell;
+    let total_h = label + cell * n;
+    let left = rect.center().x - total_w * 0.5;
+    let top = rect.center().y - total_h * 0.5;
+    let at = |col: usize, row: usize| {
+        egui::Rect::from_min_size(
+            egui::pos2(
+                left + label + cell * col as f32,
+                top + label + cell * row as f32,
+            ),
+            egui::vec2(cell, cell),
+        )
+    };
+    let out_at = |row: usize| {
+        egui::Rect::from_min_size(
+            egui::pos2(
+                left + label + cell * n + gap,
+                top + label + cell * row as f32,
+            ),
+            egui::vec2(cell, cell),
+        )
+    };
+    painter.text(
+        egui::pos2(left + label + cell * n * 0.5, top + label * 0.35),
+        egui::Align2::CENTER_CENTER,
+        "INTO",
+        font.clone(),
+        c.label,
+    );
+    painter.text(
+        egui::pos2(
+            left + label + cell * n + gap + cell * 0.5,
+            top + label * 0.35,
+        ),
+        egui::Align2::CENTER_CENTER,
+        "OUT",
+        font.clone(),
+        c.label,
+    );
+    let number = |r: egui::Rect, amount: f32| {
+        if amount > 0.005 && cell >= px * 2.2 {
+            painter.text(
+                r.center(),
+                egui::Align2::CENTER_CENTER,
+                format!("{:.0}", amount * 100.0),
+                font.clone(),
+                if amount > 0.5 { c.ground } else { c.fg },
+            );
+        }
+    };
+    for k in 0..qp::OPS {
+        let live = shown == Some(k);
+        painter.text(
+            egui::pos2(left + label + cell * (k as f32 + 0.5), top + label * 0.8),
+            egui::Align2::CENTER_CENTER,
+            format!("{}", k + 1),
+            font.clone(),
+            if live { c.bright } else { c.dim },
+        );
+        painter.text(
+            egui::pos2(left + label * 0.45, top + label + cell * (k as f32 + 0.5)),
+            egui::Align2::CENTER_CENTER,
+            format!("OP{}", k + 1),
+            font.clone(),
+            if live { c.bright } else { c.fg },
+        );
+        for to in 0..qp::OPS {
+            let r = at(to, k).shrink(1.0);
+            let amount = p.matrix[k][to].clamp(0.0, 1.0);
+            let ink = if k == to { c.nominal } else { c.edge };
+            painter.rect_filled(r, 0.0, alpha(ink, (18.0 + 200.0 * amount) as u8));
+            painter.rect_stroke(
+                r,
+                0.0,
+                egui::Stroke::new(1.0, alpha(ink, 90)),
+                egui::StrokeKind::Inside,
+            );
+            number(r, amount);
+        }
+        let r = out_at(k).shrink(1.0);
+        let amount = p.out[k].clamp(0.0, 1.0);
+        painter.rect_filled(r, 0.0, alpha(c.alert, (18.0 + 200.0 * amount) as u8));
+        painter.rect_stroke(
+            r,
+            0.0,
+            egui::Stroke::new(1.0, alpha(c.alert, 110)),
+            egui::StrokeKind::Inside,
+        );
+        number(r, amount);
+    }
+}
+
 /// The routing, drawn as the tree it is. `shown` is the operator to
 /// light, if any; `px` the type size, which sets the box size with it.
 pub(super) fn draw_routing(
@@ -102,6 +213,10 @@ pub(super) fn draw_routing(
 ) {
     let c = palette::colours();
     let font = face::font(px);
+    if p.is_matrix() {
+        draw_matrix(painter, rect, p, shown, px);
+        return;
+    }
     let algo = p.algorithm();
     let (places, columns, rows) = routing_places(algo);
     // Boxes of one size, the picture centred in the frame.

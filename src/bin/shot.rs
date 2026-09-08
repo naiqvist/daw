@@ -1356,6 +1356,19 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
             device.set(q::DRIVE, 3.0);
         }
         let _ = stage.apply(StageIntent::Devices);
+        if which.contains("-matrix") {
+            use daw::params::quad as q;
+            if let Some(device) = stage.song_mut().device_mut(id) {
+                device.set(q::ALGO, q::ALGO_MATRIX);
+                device.set(q::matrix_param(3, 2), 0.7);
+                device.set(q::matrix_param(2, 0), 0.5);
+                device.set(q::matrix_param(1, 0), 0.8);
+                device.set(q::matrix_param(1, 1), 0.3);
+                device.set(q::matrix_param(3, 1), 0.4);
+                device.set(q::out_param(0), 1.0);
+                device.set(q::out_param(2), 0.4);
+            }
+        }
         if which.contains("-forge") {
             let _ = stage.apply(StageIntent::Forge(daw::ui::stage::ForgeIntent::Open));
             let _ = stage.apply(StageIntent::Forge(daw::ui::stage::ForgeIntent::Pick(1)));

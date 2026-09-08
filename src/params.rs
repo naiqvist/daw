@@ -457,6 +457,38 @@ pub mod quad {
     pub const LFO2_MOD: u32 = 87;
     pub const LFO2_AMP: u32 = 88;
     pub const LFO2_FILTER: u32 = 89;
+    /// The free routing matrix: `MATRIX + from * OPS + to` is how much of
+    /// operator `from` reaches operator `to`'s phase, self included.
+    /// Used when ALGO is the matrix.
+    pub const MATRIX: u32 = 90;
+    /// Each operator's level to the output, in matrix mode.
+    pub const OUT: u32 = 106;
+    pub const ENV_LOOP: u32 = 110;
+    pub const OVERSAMPLE: u32 = 111;
+    pub const fn matrix_param(from: usize, to: usize) -> u32 {
+        MATRIX + (from * OPS + to) as u32
+    }
+    pub const fn out_param(op: usize) -> u32 {
+        OUT + op as u32
+    }
+    /// Which matrix cell a row is, if it is one.
+    pub fn matrix_of(param: u32) -> Option<(usize, usize)> {
+        (MATRIX..OUT).contains(&param).then(|| {
+            (
+                ((param - MATRIX) / OPS as u32) as usize,
+                ((param - MATRIX) % OPS as u32) as usize,
+            )
+        })
+    }
+    pub fn out_of(param: u32) -> Option<usize> {
+        (OUT..OUT + OPS as u32)
+            .contains(&param)
+            .then(|| (param - OUT) as usize)
+    }
+    /// ALGO's last choice: the matrix rather than a shape.
+    pub const ALGO_MATRIX: f32 = 8.0;
+    pub const LOOP_NAMES: &[&str] = &["off", "held"];
+    pub const OVERSAMPLE_NAMES: &[&str] = &["1x", "2x"];
 
     /// The two LFOs' rows are laid out alike: `LFO2_RATE - LFO1_RATE`
     /// apart.
@@ -483,6 +515,7 @@ pub mod quad {
         "4,3,2>1",
         "4>3 +2 +1",
         "1+2+3+4",
+        "matrix",
     ];
     pub const FMODE_NAMES: &[&str] = &["lp", "hp", "bp", "notch"];
     pub const DIST_NAMES: &[&str] = &["off", "soft", "hard", "fold"];
@@ -548,8 +581,14 @@ pub mod quad {
         },
     ];
 
+    /// The shape ALGO names; the matrix reads as the flat shape for
+    /// everything that only needs to know which operators are heard.
     pub fn algorithm(index: f32) -> Algorithm {
         ALGORITHMS[(index.round().max(0.0) as usize).min(ALGORITHMS.len() - 1)]
+    }
+
+    pub fn is_matrix(index: f32) -> bool {
+        index.round() >= ALGO_MATRIX
     }
 
     /// Whether operator `op` is a modulator in `algo` — the ones the
@@ -899,7 +938,7 @@ pub mod quad {
             id: 48,
             name: "algo",
             min: 0.00,
-            max: 7.00,
+            max: 8.00,
             default: 0.00,
         },
         ParamDef {
@@ -1189,6 +1228,160 @@ pub mod quad {
             max: 4.00,
             default: 0.00,
         },
+        ParamDef {
+            id: 90,
+            name: "1>1",
+            min: 0.00,
+            max: 1.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 91,
+            name: "1>2",
+            min: 0.00,
+            max: 1.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 92,
+            name: "1>3",
+            min: 0.00,
+            max: 1.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 93,
+            name: "1>4",
+            min: 0.00,
+            max: 1.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 94,
+            name: "2>1",
+            min: 0.00,
+            max: 1.00,
+            default: 1.00,
+        },
+        ParamDef {
+            id: 95,
+            name: "2>2",
+            min: 0.00,
+            max: 1.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 96,
+            name: "2>3",
+            min: 0.00,
+            max: 1.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 97,
+            name: "2>4",
+            min: 0.00,
+            max: 1.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 98,
+            name: "3>1",
+            min: 0.00,
+            max: 1.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 99,
+            name: "3>2",
+            min: 0.00,
+            max: 1.00,
+            default: 1.00,
+        },
+        ParamDef {
+            id: 100,
+            name: "3>3",
+            min: 0.00,
+            max: 1.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 101,
+            name: "3>4",
+            min: 0.00,
+            max: 1.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 102,
+            name: "4>1",
+            min: 0.00,
+            max: 1.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 103,
+            name: "4>2",
+            min: 0.00,
+            max: 1.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 104,
+            name: "4>3",
+            min: 0.00,
+            max: 1.00,
+            default: 1.00,
+        },
+        ParamDef {
+            id: 105,
+            name: "4>4",
+            min: 0.00,
+            max: 1.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 106,
+            name: "out 1",
+            min: 0.00,
+            max: 1.00,
+            default: 1.00,
+        },
+        ParamDef {
+            id: 107,
+            name: "out 2",
+            min: 0.00,
+            max: 1.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 108,
+            name: "out 3",
+            min: 0.00,
+            max: 1.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 109,
+            name: "out 4",
+            min: 0.00,
+            max: 1.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 110,
+            name: "env loop",
+            min: 0.00,
+            max: 1.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 111,
+            name: "oversample",
+            min: 0.00,
+            max: 1.00,
+            default: 0.00,
+        },
     ];
 
     #[cfg(test)]
@@ -1200,13 +1393,16 @@ pub mod quad {
             for (i, def) in TABLE.iter().enumerate() {
                 assert_eq!(def.id, i as u32, "{}", def.name);
             }
-            assert_eq!(TABLE.len(), OPS * PER_OP as usize + 42);
+            assert_eq!(TABLE.len(), OPS * PER_OP as usize + 42 + 16 + 4 + 2);
+            assert_eq!(matrix_of(matrix_param(3, 0)), Some((3, 0)));
+            assert_eq!(out_of(out_param(2)), Some(2));
+            assert_eq!(matrix_of(OUT), None);
+            assert_eq!(ALGO_NAMES.len(), ALGORITHMS.len() + 1);
             assert_eq!(op_of(op_param(2, SUSTAIN)), Some((2, SUSTAIN)));
             assert_eq!(op_of(op_param(3, KEYSCALE)), Some((3, KEYSCALE)));
             assert_eq!(op_of(ALGO), None);
             assert_eq!(lfo_param(1, LFO_FILTER), LFO2_FILTER);
             assert_eq!(lfo_param(0, LFO_SHAPE), LFO1_SHAPE);
-            assert_eq!(ALGO_NAMES.len(), ALGORITHMS.len());
             assert_eq!(WAVE_NAMES.len(), WAVE_NOISE as usize + 1);
             for algo in ALGORITHMS {
                 assert!(!algo.carriers.is_empty());

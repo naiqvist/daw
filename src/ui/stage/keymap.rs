@@ -396,6 +396,14 @@ pub enum ForgeIntent {
     /// A pass on show by its number on the row of digits; zero is the
     /// source.
     Pick(usize),
+    /// Hold every row's value as the other side of an A/B.
+    Snapshot,
+    /// Trade the rows for the held snapshot, and hold what they were.
+    Swap,
+    /// Nudge a few rows a little, at random.
+    Mutate,
+    /// Every row somewhere new, at random.
+    Randomise,
 }
 
 impl ForgeIntent {
@@ -413,6 +421,10 @@ impl ForgeIntent {
             Self::PrevPass => "previous pass on show",
             Self::NextPass => "next pass on show",
             Self::Pick(_) => "pass on show, by number",
+            Self::Snapshot => "hold a snapshot",
+            Self::Swap => "trade with the snapshot",
+            Self::Mutate => "mutate a little",
+            Self::Randomise => "randomise everything",
         }
     }
 }
@@ -1848,6 +1860,26 @@ const BINDINGS: &[Binding] = &[
         ScopeContext::Forge,
         Key::Num8,
         StageIntent::Forge(ForgeIntent::Pick(8)),
+    ),
+    Binding::new(
+        ScopeContext::Forge,
+        Key::S,
+        StageIntent::Forge(ForgeIntent::Snapshot),
+    ),
+    Binding::new(
+        ScopeContext::Forge,
+        Key::B,
+        StageIntent::Forge(ForgeIntent::Swap),
+    ),
+    Binding::new(
+        ScopeContext::Forge,
+        Key::M,
+        StageIntent::Forge(ForgeIntent::Mutate),
+    ),
+    Binding::new(
+        ScopeContext::Forge,
+        Key::X,
+        StageIntent::Forge(ForgeIntent::Randomise),
     ),
     Binding::new(ScopeContext::Forge, Key::Escape, StageIntent::Escape),
     Binding::new(

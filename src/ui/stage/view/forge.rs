@@ -30,29 +30,25 @@ fn alpha(c: Color32, a: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
 }
 
-fn legend(subject: Subject) -> [(&'static str, &'static str); 8] {
-    match subject {
-        Subject::Scomp => [
-            ("Up Dn", "row"),
-            ("< >", "turn"),
-            ("+< >", "coarse"),
-            ("Tab", "group"),
-            ("R", "reset"),
-            (", .", "pass"),
-            ("0-8", "show"),
-            ("Esc", "leave"),
-        ],
-        Subject::Quad => [
-            ("Up Dn", "row"),
-            ("< >", "turn"),
-            ("+< >", "coarse"),
-            ("Tab", "group"),
-            ("R", "reset"),
-            (", .", "operator"),
-            ("0-3", "show"),
-            ("Esc", "leave"),
-        ],
-    }
+fn legend(subject: Subject) -> Vec<(&'static str, &'static str)> {
+    let (walk, show) = match subject {
+        Subject::Scomp => ("pass", "0-8"),
+        Subject::Quad => ("operator", "0-3"),
+    };
+    vec![
+        ("Up Dn", "row"),
+        ("< >", "turn"),
+        ("+< >", "coarse"),
+        ("Tab", "group"),
+        ("R", "reset"),
+        (", .", walk),
+        (show, "show"),
+        ("S", "snapshot"),
+        ("B", "a/b"),
+        ("M", "mutate"),
+        ("X", "random"),
+        ("Esc", "leave"),
+    ]
 }
 
 /// A rise-then-fall envelope, as the voices shape it, as a polyline
@@ -204,6 +200,11 @@ impl super::super::Stage {
         let ly = lanes_rect.max.y + 4.0 + legend_h * 0.5;
         let mut lx = lanes_rect.min.x;
         for (chord, word) in legend(subject) {
+            let width =
+                (chord.chars().count() as f32 + 1.0 + word.chars().count() as f32 + 2.5) * ch;
+            if lx + width > lanes_rect.max.x {
+                break;
+            }
             painter.text(
                 egui::pos2(lx, ly),
                 egui::Align2::LEFT_CENTER,
