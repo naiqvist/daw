@@ -536,6 +536,22 @@ impl Audio {
                 }
             }
         }
+        // The band's small pictures — a kit's pads — one file a frame.
+        if let Some(path) = stage.wanted_thumb().map(std::path::Path::to_path_buf) {
+            let data = match material::load_cached(&path, rate) {
+                Ok(loaded) => SampleData::from_planar(
+                    path,
+                    loaded.samples.clone(),
+                    loaded.channels,
+                    loaded.frames,
+                    loaded.sample_rate,
+                ),
+                Err(_) => {
+                    SampleData::from_planar(path, std::sync::Arc::new(Vec::new()), 1, 0, rate)
+                }
+            };
+            stage.set_thumb(data);
+        }
         if stage.take_audition_stop()
             && let Some(engine) = &mut self.engine
         {

@@ -306,6 +306,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// A few seconds of plausible level history, so a metering pose shows a
 /// trace rather than a flat line. `hot` pushes the whole thing up.
+/// Which of the kit pose's files this is, by name order.
+fn names_index(path: &std::path::Path) -> usize {
+    const NAMES: [&str; 11] = [
+        "kick", "snare", "rim", "clap", "hat", "hat-open", "shaker", "ride", "tom-lo", "tom-hi",
+        "crash",
+    ];
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    NAMES.iter().position(|n| *n == stem).unwrap_or(0)
+}
+
 fn posed_history(hot: f32) -> daw::ui::device::scope::History {
     use daw::ui::device::scope::{History, Reading};
     let mut h = History::default();
@@ -1371,6 +1384,35 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
             device.set(kp::pad_param(0, daw::params::brick::DROP), 12.0);
         }
         let _ = stage.apply(StageIntent::Devices);
+        // The pads' pictures: a hit each, longer and noisier up the kit.
+        use daw::ui::stage::SampleData;
+        let rate = 48_000u32;
+        let mut seed = 0x9e37_79b9u32;
+        while let Some(path) = stage.wanted_thumb().map(std::path::Path::to_path_buf) {
+            let index = names_index(&path);
+            let frames = rate as usize / 12 * (1 + index % 5);
+            let tone = 50.0 + 40.0 * index as f32;
+            let noise = (index as f32 / 10.0).clamp(0.0, 1.0);
+            let samples: Vec<f32> = (0..frames)
+                .map(|i| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    let t = i as f32 / rate as f32;
+                    let env = (-t * (12.0 - noise * 6.0)).exp();
+                    let hiss = (seed as f32 / u32::MAX as f32) * 2.0 - 1.0;
+                    let sine = (t * tone * std::f32::consts::TAU).sin();
+                    (env * ((1.0 - noise) * sine + noise * hiss) * 0.9).clamp(-1.0, 1.0)
+                })
+                .collect();
+            stage.set_thumb(SampleData::from_planar(
+                path,
+                std::sync::Arc::new(samples),
+                1,
+                frames as u64,
+                rate,
+            ));
+        }
         if which.contains("-jump") {
             for _ in 0..3 {
                 let _ = stage.apply(StageIntent::Group(daw::ui::stage::Step::Down));

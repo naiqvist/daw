@@ -579,6 +579,11 @@ pub struct Stage {
     /// across the editor closing and opening again on the same file, so
     /// the second look is instant; replaced when the file differs.
     sample_data: Option<SampleData>,
+    /// Files the band draws small — a kit's pads — by path. Filled one
+    /// file a frame through `wanted_thumb`, so a kit's sixteen files
+    /// arrive without a stall, and capped so a long session of kits does
+    /// not hoard them.
+    thumbs: std::collections::HashMap<PathBuf, SampleData>,
     /// The pictures the band's sCOMP cards draw: one take's peaks per
     /// device, kept while its baked knobs stand.
     scomp_cards: Vec<ScompCard>,
@@ -833,6 +838,7 @@ impl Stage {
             sample: None,
             forge: None,
             sample_data: None,
+            thumbs: std::collections::HashMap::new(),
             scomp_cards: Vec::new(),
             audition: None,
             audition_stop: false,
@@ -2445,6 +2451,36 @@ impl Stage {
     /// The host's answer: the file, as the stage may hold it.
     pub fn set_sample(&mut self, data: SampleData) {
         self.sample_data = Some(data);
+    }
+
+    /// A file the band wants small and does not have yet: the next pad
+    /// of a kit on the open chain. One a frame; `None` when the shelf
+    /// is complete or no kit is showing.
+    pub fn wanted_thumb(&self) -> Option<&Path> {
+        self.chain.as_ref()?;
+        let track = self.song.tracks.get(self.addressed_track()?)?;
+        track
+            .chain
+            .iter()
+            .filter(|device| device.kind == DeviceKind::Kit)
+            .flat_map(|device| device.pads.iter())
+            .filter(|path| !path.as_os_str().is_empty())
+            .find(|path| !self.thumbs.contains_key(path.as_path()))
+            .map(PathBuf::as_path)
+    }
+
+    /// The host's answer to `wanted_thumb`.
+    pub fn set_thumb(&mut self, data: SampleData) {
+        const SHELF: usize = 128;
+        if self.thumbs.len() >= SHELF {
+            self.thumbs.clear();
+        }
+        self.thumbs.insert(data.path.clone(), data);
+    }
+
+    /// A file the band holds small, if it does.
+    pub(crate) fn thumb(&self, path: &Path) -> Option<&SampleData> {
+        self.thumbs.get(path)
     }
 
     /// A range to play, if the editor asked for one since the last take.

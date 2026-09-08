@@ -14,7 +14,9 @@ use crate::ui::stage::chain::{self, KitFace};
 use eframe::egui;
 use egui::Color32;
 
-pub(super) use super::face::WIDTH;
+/// Wider than the shared face: sixteen cells and a picture of the pad
+/// in hand both need their room.
+pub(super) const WIDTH: f32 = super::face::WIDTH + 150.0;
 
 fn alpha(c: Color32, a: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
@@ -44,6 +46,129 @@ fn stem(path: &std::path::Path, cells: usize) -> String {
 /// The pad the band's cursor row belongs to, if it is on a pad row.
 fn pad_under(cursor_row: Option<usize>) -> Option<usize> {
     kp::pad_of(cursor_row? as u32).map(|(pad, _)| pad)
+}
+
+/// The pad's file, above the bank: the one the cursor is on, else the
+/// one in hand. The START mark and the hit's shape sit over it, as on
+/// the brick's own face.
+fn draw_wave(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    face: &KitFace,
+    pad: usize,
+    data: Option<&crate::ui::stage::SampleData>,
+) {
+    let c = palette::colours();
+    let small = face::font(8.5);
+    let micro = face::font(7.5);
+    let label_h = 11.0;
+    let knobs = &face.params.pads[pad];
+    let file = face.file(pad);
+    let name = file
+        .map(|path| stem(path, 18))
+        .unwrap_or_else(|| "no file".to_owned());
+    painter.text(
+        egui::pos2(rect.left() + 4.0, rect.top()),
+        egui::Align2::LEFT_TOP,
+        format!("PAD {:02} · {}", pad + 1, key_name(face.params.key_of(pad))),
+        micro.clone(),
+        c.label,
+    );
+    painter.text(
+        egui::pos2(rect.right() - 4.0, rect.top()),
+        egui::Align2::RIGHT_TOP,
+        match data {
+            Some(data) if data.frames > 0 => format!("{name} · {:.2}s", data.seconds()),
+            _ => name,
+        },
+        micro,
+        c.dim,
+    );
+    let frame = egui::Rect::from_min_max(egui::pos2(rect.left(), rect.top() + label_h), rect.max);
+    let inner = face::frame_plot(painter, frame);
+    let mid = inner.center().y;
+    let half = inner.height() * 0.5 - 1.0;
+    painter.line_segment(
+        [
+            egui::pos2(inner.left(), mid.round() - 0.5),
+            egui::pos2(inner.right(), mid.round() - 0.5),
+        ],
+        egui::Stroke::new(1.0, c.rule),
+    );
+    let Some(data) = data.filter(|data| data.frames > 0) else {
+        painter.text(
+            inner.center(),
+            egui::Align2::CENTER_CENTER,
+            if file.is_some() {
+                "loading"
+            } else {
+                "browse a hit onto the pad"
+            },
+            small,
+            c.dim,
+        );
+        return;
+    };
+    let columns = inner.width().floor().max(1.0) as usize;
+    let bins = data.peaks.columns(None, 0.0, 1.0, columns);
+    for (i, bin) in bins.iter().enumerate() {
+        let x = inner.min.x + i as f32 + 0.5;
+        painter.line_segment(
+            [
+                egui::pos2(x, mid - bin.max.clamp(-1.0, 1.0) * half),
+                egui::pos2(x, mid - bin.min.clamp(-1.0, 1.0) * half),
+            ],
+            egui::Stroke::new(1.0, c.edge),
+        );
+    }
+    let b = &knobs.brick;
+    let start = f64::from(b.start.clamp(0.0, 1.0));
+    let px = |at: f64| inner.min.x + inner.width() * at as f32;
+    if b.reversed() {
+        painter.rect_filled(
+            egui::Rect::from_min_max(egui::pos2(px(1.0 - start), inner.min.y), inner.max),
+            0.0,
+            alpha(c.ground, 140),
+        );
+    } else if start > 0.0 {
+        painter.rect_filled(
+            egui::Rect::from_min_max(inner.min, egui::pos2(px(start), inner.max.y)),
+            0.0,
+            alpha(c.ground, 140),
+        );
+    }
+    let sx = px(if b.reversed() { 1.0 - start } else { start }).round() - 0.5;
+    painter.line_segment(
+        [egui::pos2(sx, inner.min.y), egui::pos2(sx, inner.max.y)],
+        egui::Stroke::new(1.0, c.alert),
+    );
+    let seconds = data.seconds().max(0.01) as f32;
+    let decay = b.decay * face.params.tight;
+    let levels = crate::ui::device::brick::hit_shape(
+        b.attack,
+        decay,
+        b.curve,
+        b.punch,
+        seconds,
+        columns.max(2),
+    );
+    let peak = levels.iter().cloned().fold(0.0f32, f32::max).max(1.0e-3);
+    let points: Vec<egui::Pos2> = levels
+        .iter()
+        .enumerate()
+        .map(|(i, level)| {
+            let x = if b.reversed() {
+                inner.max.x - inner.width() * i as f32 / columns.max(1) as f32
+            } else {
+                inner.min.x + inner.width() * i as f32 / columns.max(1) as f32
+            };
+            egui::pos2(
+                x,
+                inner.max.y - inner.height() * (level / peak).clamp(0.0, 1.0),
+            )
+        })
+        .collect();
+    painter.add(egui::Shape::line(points, egui::Stroke::new(1.5, c.nominal)));
 }
 
 /// The grid.
@@ -116,13 +241,15 @@ fn draw_pads(
             Some(path) => stem(path, cells),
             None => "·".to_owned(),
         };
-        painter.text(
-            egui::pos2(cell.left() + 3.0, cell.center().y + 1.0),
-            egui::Align2::LEFT_CENTER,
-            word,
-            small.clone(),
-            ink,
+        let name_at = egui::pos2(cell.left() + 3.0, cell.center().y + 1.0);
+        let galley = painter.layout_no_wrap(word, small.clone(), ink);
+        let name_rect = egui::Align2::LEFT_CENTER.anchor_size(name_at, galley.size());
+        painter.rect_filled(
+            name_rect.expand2(egui::vec2(1.0, 0.0)),
+            0.0,
+            alpha(c.panel, 210),
         );
+        painter.galley(name_rect.min, galley, ink);
         // The foot: a mute or solo word, the group letter, the pan.
         let foot = cell.bottom() - 2.0;
         let state = if !knobs.is_on() {
@@ -258,9 +385,25 @@ impl super::super::Stage {
                 ),
             ],
         );
+        // The picture takes the top of the rail; the bank keeps the rest.
+        let shown = under.unwrap_or(in_hand);
+        let wave_h = (layout.params.height() * 0.42).clamp(48.0, 96.0);
+        let wave =
+            egui::Rect::from_min_size(layout.params.min, egui::vec2(layout.params.width(), wave_h));
+        let bank = egui::Rect::from_min_max(
+            egui::pos2(layout.params.left(), wave.bottom() + 6.0),
+            layout.params.max,
+        );
+        draw_wave(
+            &painter,
+            wave,
+            face,
+            shown,
+            face.file(shown).and_then(|path| self.thumb(path)),
+        );
         face::draw_params(
             &painter,
-            layout.params,
+            bank,
             column,
             index,
             cursor,
