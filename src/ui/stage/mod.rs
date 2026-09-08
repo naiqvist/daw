@@ -5088,6 +5088,9 @@ impl Stage {
                     self.chain = None;
                     Ok(())
                 } else {
+                    // From a room, the room closes first: the band is the
+                    // device view, and one view is up at a time.
+                    self.leave_rooms();
                     let (cols, rows) = self.chain_shape();
                     if cols == 0 {
                         // A track with no devices has no band to show. Not
@@ -5290,6 +5293,8 @@ impl Stage {
                 None => Err(RefusalReason::Unavailable),
             },
             StageIntent::DeleteTrack => self.delete_track(),
+            StageIntent::DuplicateTracks => self.duplicate_tracks(),
+            StageIntent::DuplicateScene => self.duplicate_scenes(),
             StageIntent::Nudge => {
                 // Only where there is something to move. Spoken from the
                 // browser or inside a clip it would wait for a motion
@@ -5432,6 +5437,142 @@ impl Stage {
     /// Take the track under the cursor out of the song. The cursor stays
     /// at the same place on the strip, which is now the next track along
     /// — or the last one, if it was the last that went.
+    /// Ctrl+D: the selected tracks, each copied beside its original.
+    /// The session selection names them when it has any; else the track
+    /// under the cursor, wherever the cursor is standing.
+    fn duplicate_tracks(&mut self) -> Result<(), RefusalReason> {
+        let mut wanted: Vec<usize> = if self.session_selection.cells.is_empty() {
+            self.focused_track().into_iter().collect()
+        } else {
+            self.session_selection
+                .cells
+                .iter()
+                .map(|(track, _)| *track)
+                .collect()
+        };
+        wanted.retain(|track| *track < self.song.tracks.len());
+        wanted.sort_unstable();
+        wanted.dedup();
+        if wanted.is_empty() {
+            return Err(RefusalReason::Empty);
+        }
+        // Last first, so each insertion leaves the earlier indices alone.
+        let mut made = Vec::with_capacity(wanted.len());
+        for index in wanted.iter().rev() {
+            let Some(to) = self.song.duplicate_track(*index) else {
+                continue;
+            };
+            if to <= self.playing.len() {
+                self.playing.insert(to, None);
+            }
+            made.push(to);
+        }
+        if made.is_empty() {
+            return Err(RefusalReason::Unavailable);
+        }
+        // The copies were made from the bottom up: the first made is the
+        // last on the strip. The cursor lands on the copy of the track
+        // it stood on — the lowest copy, made last.
+        let first = *made.last().unwrap_or(&0);
+        self.notice = Some(match made.len() {
+            1 => format!("+ {}", self.song.tracks[first].name),
+            n => format!("+ {n} tracks"),
+        });
+        self.session_selection.clear();
+        self.fit_playing();
+        self.fit_session();
+        if self.song_view {
+            self.arrangement.track = first;
+        }
+        let standing_on_the_session = self.standing_on().is_some();
+        if let FocusScope::Lattice(lattice) = self.focus.root_mut()
+            && standing_on_the_session
+        {
+            lattice.focus_col(first);
+        }
+        self.touched();
+        Ok(())
+    }
+
+    /// Ctrl+Shift+I: the selected scenes, each copied beneath its
+    /// original with its own patterns. The session selection names them
+    /// when it has any; else the scene under the cursor.
+    fn duplicate_scenes(&mut self) -> Result<(), RefusalReason> {
+        let mut wanted: Vec<usize> = if self.session_selection.cells.is_empty() {
+            match self.standing_on() {
+                Some(Address::Slot { scene, .. }) => vec![scene],
+                Some(_) => return Err(RefusalReason::Unavailable),
+                None => return Err(RefusalReason::Unavailable),
+            }
+        } else {
+            self.session_selection
+                .cells
+                .iter()
+                .map(|(_, scene)| *scene)
+                .collect()
+        };
+        wanted.retain(|scene| *scene < self.song.session.scenes.len());
+        wanted.sort_unstable();
+        wanted.dedup();
+        if wanted.is_empty() {
+            return Err(RefusalReason::Empty);
+        }
+        let mut made = Vec::with_capacity(wanted.len());
+        for index in wanted.iter().rev() {
+            let Some(to) = self.song.duplicate_scene(*index) else {
+                continue;
+            };
+            // What is playing keeps playing its own scene, one further
+            // down where the copy pushed it.
+            for slot in self.playing.iter_mut().flatten() {
+                if *slot >= to {
+                    *slot += 1;
+                }
+            }
+            made.push(to);
+        }
+        if made.is_empty() {
+            return Err(RefusalReason::Edge(Step::Down));
+        }
+        let first = *made.last().unwrap_or(&0);
+        self.notice = Some(match made.len() {
+            1 => format!("+ scene {}", first + 1),
+            n => format!("+ {n} scenes"),
+        });
+        self.session_selection.clear();
+        self.fit_session();
+        // The cursor lands on the copy of the scene it stood on.
+        let standing_on_the_session = self.standing_on().is_some();
+        if let FocusScope::Lattice(lattice) = self.focus.root_mut()
+            && standing_on_the_session
+        {
+            let row = first + 1;
+            while lattice.cursor().is_some_and(|(_, r)| r < row) && lattice.step(Step::Down) {}
+            while lattice.cursor().is_some_and(|(_, r)| r > row) && lattice.step(Step::Up) {}
+        }
+        self.touched();
+        Ok(())
+    }
+
+    /// Close whatever room is open — the cutting room, the forge, the
+    /// trig menu, the plock editor, the modulation workspace — the way
+    /// Escape would, so the band can take the tray.
+    fn leave_rooms(&mut self) {
+        if self.modulation.is_some() {
+            let _ = self.close_modulation();
+        }
+        if self.plock_editor.is_some() {
+            let _ = self.escape_plock_editor();
+        }
+        self.forge = None;
+        if self.sample.take().is_some() {
+            self.audition_stop = true;
+        }
+        if self.trig_menu.is_some() {
+            let _ = self.escape_trig_menu();
+        }
+    }
+
     fn delete_track(&mut self) -> Result<(), RefusalReason> {
         let index = self.focused_track().ok_or(RefusalReason::Unavailable)?;
         if self.song.tracks.len() <= 1 {
@@ -5586,6 +5727,13 @@ mod tests {
         stage
             .handle_key(Mods::COMMAND, key)
             .unwrap_or_else(|| panic!("unbound chord in stage sequence: ^{key:?}"))
+    }
+
+    /// V: the device band, from wherever the hand is.
+    fn band(stage: &mut Stage) -> ApplyOutcome {
+        stage
+            .handle_key(Mods::NONE, Key::V)
+            .unwrap_or_else(|| panic!("V is unbound where the band was asked for"))
     }
 
     fn command_shift(stage: &mut Stage, key: Key) -> ApplyOutcome {
@@ -6001,7 +6149,7 @@ mod tests {
             .add_device(0, crate::devices::DeviceKind::Sat)
             .expect("effect");
         let sat_rows = crate::devices::DeviceKind::Sat.spec().params.len();
-        assert_eq!(command(&mut stage, Key::D), ApplyOutcome::Changed);
+        assert_eq!(band(&mut stage), ApplyOutcome::Changed);
         for _ in 0..sat_rows + 4 {
             let _ = drive(&mut stage, &[Key::ArrowDown]);
         }
@@ -9446,7 +9594,7 @@ mod tests {
                 .add_device(0, crate::devices::DeviceKind::Sat)
                 .expect("an effect goes on an instrument track");
         }
-        assert_eq!(command(stage, Key::D), ApplyOutcome::Changed);
+        assert_eq!(band(stage), ApplyOutcome::Changed);
         assert_eq!(drive(stage, &[Key::Tab]), vec![ApplyOutcome::Changed]);
         assert_eq!(stage.scope_context(), keymap::ScopeContext::Chain);
     }
@@ -10071,7 +10219,7 @@ mod tests {
             .song
             .add_device(0, crate::devices::DeviceKind::Reverb)
             .expect("effect");
-        assert_eq!(command(&mut stage, Key::D), ApplyOutcome::Changed);
+        assert_eq!(band(&mut stage), ApplyOutcome::Changed);
 
         assert_eq!(
             stage.handle_key(Mods::NONE, Key::Tab),
@@ -10621,7 +10769,7 @@ mod tests {
             .song
             .add_device(0, DeviceKind::Reverb)
             .expect("effect");
-        assert_eq!(command(stage, Key::D), ApplyOutcome::Changed);
+        assert_eq!(band(stage), ApplyOutcome::Changed);
         [poly, sat, reverb]
     }
 
@@ -10783,7 +10931,7 @@ mod tests {
 
         // An instrument does not go on an audio track, by any door.
         let _ = drive(&mut stage, &[Key::ArrowLeft]);
-        let _ = command(&mut stage, Key::D);
+        let _ = band(&mut stage);
         let _ = drive(&mut stage, &[Key::Q]);
         assert_eq!(
             stage.clipboard.as_ref().map(|d| d.kind),
@@ -10819,7 +10967,7 @@ mod tests {
             .song
             .add_device(0, crate::devices::DeviceKind::Poly)
             .expect("instrument");
-        let _ = command(&mut stage, Key::D);
+        let _ = band(&mut stage);
         // Row zero of the poly is osc A's wave: a list of eight.
         let wave = crate::params::poly::A_WAVE;
         assert_eq!(
@@ -10877,6 +11025,204 @@ mod tests {
             )],
             BrowserStatus::Ready,
         );
+    }
+
+    #[test]
+    fn v_opens_the_band_from_a_room_and_closes_the_room_behind_it() {
+        let mut stage = Stage::new();
+        kit_on_track(&mut stage);
+        // From the cutting room, open on a pad.
+        assert_eq!(band(&mut stage), ApplyOutcome::Changed);
+        pad_row(&mut stage, 2);
+        assert_eq!(
+            stage.apply(StageIntent::Sample(SampleIntent::Open)),
+            ApplyOutcome::Changed
+        );
+        assert!(stage.sample.is_some());
+        // V inside the room: the band is already up, so V closes it.
+        assert_eq!(band(&mut stage), ApplyOutcome::Changed);
+        assert!(stage.chain.is_none());
+        // V again: the room goes, the band comes.
+        assert_eq!(band(&mut stage), ApplyOutcome::Changed);
+        assert!(
+            stage.sample.is_none(),
+            "the room stayed open under the band"
+        );
+        assert!(stage.chain.is_some());
+        assert!(
+            stage.audition_stop,
+            "the room left without stopping its audition"
+        );
+    }
+
+    // --------------------------------------------------- duplicates ---
+
+    /// A pattern in the slot, with its first step lit.
+    fn lit_clip(stage: &mut Stage, track: usize, scene: usize) -> PatternId {
+        let id = stage.song.fill_slot(track, scene).expect("a pattern");
+        stage
+            .song
+            .pattern_mut(id)
+            .expect("the pattern stands")
+            .trig_mut(0)
+            .enabled = true;
+        id
+    }
+
+    #[test]
+    fn ctrl_d_copies_the_track_under_the_cursor_with_its_own_devices_and_patterns() {
+        use crate::params::kit as kp;
+        let mut stage = Stage::new();
+        let kit = kit_on_track(&mut stage);
+        let before = stage.song.tracks.len();
+        let original = lit_clip(&mut stage, 0, 0);
+        let later = lit_clip(&mut stage, 0, 2);
+        let device_target =
+            crate::targets::device_target(kit.0, crate::devices::DeviceKind::Kit.spec(), "level");
+        stage.song.tracks[0]
+            .automation
+            .push(crate::sequencing::Envelope {
+                target: device_target.clone(),
+                points: Vec::new(),
+            });
+
+        assert_eq!(command(&mut stage, Key::D), ApplyOutcome::Changed);
+
+        assert_eq!(stage.song.tracks.len(), before + 1);
+        let (source, copy) = (&stage.song.tracks[0], &stage.song.tracks[1]);
+        assert_eq!(copy.name, "Instrument 01 copy");
+        assert_ne!(copy.id, source.id);
+        assert_eq!(copy.chain.len(), source.chain.len());
+        for (mine, theirs) in copy.chain.iter().zip(&source.chain) {
+            assert_eq!(mine.kind, theirs.kind);
+            assert_ne!(mine.id, theirs.id, "a device id was shared");
+        }
+        assert_eq!(copy.chain[0].pads, source.chain[0].pads, "the kit's files");
+        assert_eq!(copy.chain[0].value(kp::pad_param(1, kp::GROUP)), 2.0);
+        // The envelope names the COPY's kit.
+        let new_kit = copy.chain[0].id;
+        assert_eq!(
+            copy.automation[0].target,
+            crate::targets::device_target(
+                new_kit.0,
+                crate::devices::DeviceKind::Kit.spec(),
+                "level"
+            )
+        );
+        assert_eq!(source.automation[0].target, device_target);
+        // Its own patterns, with the same steps lit.
+        for (scene, theirs) in [(0, original), (2, later)] {
+            let Some(Clip::Pattern(mine)) = stage.song.slot_clip(1, scene) else {
+                panic!("scene {scene} has no clip on the copy");
+            };
+            assert_ne!(mine, theirs, "scene {scene} shares a pattern");
+            assert!(stage.song.pattern(mine).expect("stands").trig(0).enabled);
+        }
+        assert!(stage.song.slot_clip(1, 1).is_none());
+        // Focus and the playing table follow the strip.
+        assert_eq!(stage.session_address().and_then(Address::track), Some(1));
+        assert_eq!(stage.playing.len(), stage.song.tracks.len());
+        assert_eq!(stage.notice.as_deref(), Some("+ Instrument 01 copy"));
+        // Editing the copy's clip leaves the original's alone.
+        let Some(Clip::Pattern(mine)) = stage.song.slot_clip(1, 0) else {
+            panic!("no clip");
+        };
+        stage
+            .song
+            .pattern_mut(mine)
+            .expect("stands")
+            .trig_mut(3)
+            .enabled = true;
+        assert!(
+            !stage
+                .song
+                .pattern(original)
+                .expect("stands")
+                .trig(3)
+                .enabled
+        );
+    }
+
+    #[test]
+    fn ctrl_d_with_a_session_selection_copies_every_selected_track_beside_itself() {
+        let mut stage = Stage::new();
+        assert_eq!(command_shift(&mut stage, Key::T), ApplyOutcome::Changed);
+        stage.session_selection.cells.insert((0, 0));
+        stage.session_selection.cells.insert((1, 1));
+        stage.session_selection.cells.insert((0, 1));
+
+        assert_eq!(command(&mut stage, Key::D), ApplyOutcome::Changed);
+
+        let names: Vec<&str> = stage.song.tracks.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "Instrument 01",
+                "Instrument 01 copy",
+                "Instrument 02",
+                "Instrument 02 copy"
+            ]
+        );
+        assert!(stage.session_selection.cells.is_empty());
+        assert_eq!(stage.notice.as_deref(), Some("+ 2 tracks"));
+        // A second copy of the first finds a free name.
+        let _ = stage.handle_key(Mods::NONE, Key::ArrowLeft);
+        if let FocusScope::Lattice(lattice) = stage.focus.root_mut() {
+            lattice.focus_col(0);
+        }
+        assert_eq!(command(&mut stage, Key::D), ApplyOutcome::Changed);
+        assert_eq!(stage.song.tracks[1].name, "Instrument 01 copy 2");
+    }
+
+    #[test]
+    fn ctrl_shift_i_copies_the_scene_under_the_cursor_with_its_own_patterns() {
+        let mut stage = Stage::new();
+        let original = lit_clip(&mut stage, 0, 1);
+        let scenes = stage.song.session.scenes.len();
+        drive(&mut stage, &[Key::ArrowDown, Key::ArrowDown]);
+        assert_eq!(
+            stage.session_address(),
+            Some(Address::Slot { track: 0, scene: 1 })
+        );
+
+        assert_eq!(command_shift(&mut stage, Key::I), ApplyOutcome::Changed);
+
+        assert_eq!(stage.song.session.scenes.len(), scenes + 1);
+        let Some(Clip::Pattern(mine)) = stage.song.slot_clip(0, 2) else {
+            panic!("the copy has no clip");
+        };
+        assert_ne!(mine, original);
+        assert!(stage.song.pattern(mine).expect("stands").trig(0).enabled);
+        assert_eq!(
+            stage.song.pattern(mine).expect("stands").name,
+            Song::pattern_address(0, 2)
+        );
+        // The original scene is untouched and the cursor is on the copy.
+        assert_eq!(stage.song.slot_clip(0, 1), Some(Clip::Pattern(original)));
+        assert_eq!(
+            stage.session_address(),
+            Some(Address::Slot { track: 0, scene: 2 })
+        );
+        assert_eq!(stage.notice.as_deref(), Some("+ scene 3"));
+        // On a head there is no scene to copy.
+        drive(&mut stage, &[Key::ArrowUp, Key::ArrowUp, Key::ArrowUp]);
+        assert_eq!(stage.session_address(), Some(Address::Head { track: 0 }));
+        assert!(matches!(
+            command_shift(&mut stage, Key::I),
+            ApplyOutcome::Refused(_)
+        ));
+    }
+
+    #[test]
+    fn a_duplicated_track_keeps_the_playing_table_and_followers_in_step() {
+        let mut stage = Stage::new();
+        assert_eq!(command_shift(&mut stage, Key::T), ApplyOutcome::Changed);
+        stage.playing = vec![Some(0), Some(3)];
+        if let FocusScope::Lattice(lattice) = stage.focus.root_mut() {
+            lattice.focus_col(0);
+        }
+        assert_eq!(command(&mut stage, Key::D), ApplyOutcome::Changed);
+        assert_eq!(stage.playing, vec![Some(0), None, Some(3)]);
     }
 
     // ---------------------------------------------------------- kit ---

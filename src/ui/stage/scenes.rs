@@ -86,7 +86,7 @@ pub fn lattice_rows(song: &Song) -> usize {
 /// The most scenes a session holds: twenty-six banks of sixteen, which
 /// is where the bank letters run out. The session has no bottom before
 /// that — Down on the last scene makes the next one.
-pub const MAX_SCENES: usize = 26 * 16;
+pub const MAX_SCENES: usize = crate::sequencing::MAX_SESSION_SCENES;
 
 /// What a filled slot draws: one glyph for the kind of clip, one number
 /// for which one. Reduced from the model every frame, never stored.

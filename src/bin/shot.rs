@@ -1428,6 +1428,26 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
                 let _ = stage.apply(StageIntent::Group(daw::ui::stage::Step::Down));
             }
         }
+    } else if which.contains("bypass") {
+        // A brick, then a saturator switched OFF, and the band's cursor
+        // stepped onto the switched-off card.
+        let _ = stage
+            .song_mut()
+            .add_device(0, daw::devices::DeviceKind::Brick)
+            .expect("a brick");
+        let _ = stage
+            .song_mut()
+            .add_device(0, daw::devices::DeviceKind::Sat)
+            .expect("a sat");
+        let _ = stage.apply(StageIntent::Devices);
+        let _ = stage.apply(StageIntent::Step(daw::ui::stage::Step::Right));
+        if !which.contains("-on") {
+            let _ = stage.apply(StageIntent::Mute);
+        }
+        if which.contains("-back") {
+            let _ = stage.apply(StageIntent::Step(daw::ui::stage::Step::Left));
+            let _ = stage.apply(StageIntent::Step(daw::ui::stage::Step::Right));
+        }
     } else if which.contains("brick") {
         // BRICK on the first track with a synthesized kick — a tone
         // falling from 180 Hz with a click on it — and the band open.

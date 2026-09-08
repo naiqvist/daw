@@ -87,6 +87,12 @@ pub enum StageIntent {
     /// Hear the instrument under the band's cursor without a trig: a
     /// kit's pad in play, a brick's or a sampler's file.
     Hear,
+    /// Copy the selected tracks — the session selection's, else the one
+    /// the cursor is on — each beside its original.
+    DuplicateTracks,
+    /// Copy the selected scenes — the session selection's, else the one
+    /// the cursor is on — each beneath its original.
+    DuplicateScene,
     /// Swap the kit pad under the cursor with the pad in hand.
     SwapPad,
     /// Fill the addressed track's kit from the browsed file's folder.
@@ -575,6 +581,8 @@ impl StageIntent {
             Self::Yank => "yank device",
             Self::Put => "put device",
             Self::Hear => "hear the pad",
+            Self::DuplicateTracks => "duplicate track",
+            Self::DuplicateScene => "duplicate scene",
             Self::SwapPad => "swap pad with the hand",
             Self::Fill => "fill kit from folder",
             Self::Duplicate => "duplicate selection",
@@ -917,13 +925,18 @@ const BINDINGS: &[Binding] = &[
     // back.
     Binding::new(ScopeContext::Mixer, Key::Escape, StageIntent::Escape),
     // The chain band, reachable from wherever the strip is pointing.
-    Binding::command(ScopeContext::Root, Key::D, StageIntent::Devices),
-    Binding::command(ScopeContext::Nested, Key::D, StageIntent::Devices),
-    Binding::command(ScopeContext::Mixer, Key::D, StageIntent::Devices),
-    Binding::command(ScopeContext::Chain, Key::D, StageIntent::Devices),
     // Inside the band: bare arrows walk it — across the devices, down the
     // parameters — and a shifted arrow moves the value under the cursor,
     // the same gesture the mixer's pan already answers to.
+    Binding::command(ScopeContext::Root, Key::D, StageIntent::DuplicateTracks),
+    Binding::command(ScopeContext::Nested, Key::D, StageIntent::DuplicateTracks),
+    Binding::command(ScopeContext::Mixer, Key::D, StageIntent::DuplicateTracks),
+    Binding::command(ScopeContext::Chain, Key::D, StageIntent::DuplicateTracks),
+    Binding::command(ScopeContext::Song, Key::D, StageIntent::DuplicateTracks),
+    Binding::command_shift(ScopeContext::Root, Key::I, StageIntent::DuplicateScene),
+    Binding::command_shift(ScopeContext::Nested, Key::I, StageIntent::DuplicateScene),
+    Binding::command_shift(ScopeContext::Mixer, Key::I, StageIntent::DuplicateScene),
+    Binding::command_shift(ScopeContext::Chain, Key::I, StageIntent::DuplicateScene),
     Binding::new(ScopeContext::Chain, Key::P, StageIntent::Hear),
     Binding::new(ScopeContext::Chain, Key::X, StageIntent::SwapPad),
     Binding::shift(ScopeContext::Browser, Key::Enter, StageIntent::Fill),
@@ -2035,7 +2048,6 @@ const BINDINGS: &[Binding] = &[
         StageIntent::Song(SongIntent::Resize),
     ),
     Binding::command(ScopeContext::Song, Key::M, StageIntent::Mix),
-    Binding::command(ScopeContext::Song, Key::D, StageIntent::Devices),
     Binding::command(ScopeContext::Song, Key::B, StageIntent::Browse),
     Binding::command(ScopeContext::Song, Key::L, StageIntent::Ground),
     Binding::command(ScopeContext::Song, Key::Z, StageIntent::Undo),
@@ -2075,13 +2087,21 @@ const BINDINGS: &[Binding] = &[
     Binding::command(ScopeContext::Mixer, Key::Space, StageIntent::RecordSong),
     Binding::command(ScopeContext::Song, Key::Space, StageIntent::RecordSong),
     // The device view on one key: V opens the strip band on the
-    // cursor's track from wherever a track is addressed, and closes it
-    // from inside. ^D stays as the old hand.
+    // cursor's track from wherever the hand is standing — the session,
+    // the mixer, the song, a clip, a room — closing the room it was in,
+    // and closes the band from inside it. Only the two scopes that type
+    // letters keep V as a letter. ^D is the duplicate's now.
     Binding::new(ScopeContext::Root, Key::V, StageIntent::Devices),
     Binding::new(ScopeContext::Nested, Key::V, StageIntent::Devices),
     Binding::new(ScopeContext::Mixer, Key::V, StageIntent::Devices),
     Binding::new(ScopeContext::Song, Key::V, StageIntent::Devices),
     Binding::new(ScopeContext::Chain, Key::V, StageIntent::Devices),
+    Binding::new(ScopeContext::Clip, Key::V, StageIntent::Devices),
+    Binding::new(ScopeContext::TrigMenu, Key::V, StageIntent::Devices),
+    Binding::new(ScopeContext::Plock, Key::V, StageIntent::Devices),
+    Binding::new(ScopeContext::Modulation, Key::V, StageIntent::Devices),
+    Binding::new(ScopeContext::Sample, Key::V, StageIntent::Devices),
+    Binding::new(ScopeContext::Forge, Key::V, StageIntent::Devices),
     // A section IN or OUT: the desk's button, on the band's Shift+Enter
     // as well as the M the effects already answer to.
     Binding::shift(ScopeContext::Chain, Key::Enter, StageIntent::Mute),
@@ -2134,7 +2154,10 @@ fn family(intent: StageIntent) -> &'static str {
         | StageIntent::Solo => "mixer",
         StageIntent::Devices | StageIntent::Param { .. } => "devices",
         StageIntent::Undo | StageIntent::Redo | StageIntent::Save => "document",
-        StageIntent::Rename | StageIntent::DeleteTrack => "track",
+        StageIntent::Rename
+        | StageIntent::DeleteTrack
+        | StageIntent::DuplicateTracks
+        | StageIntent::DuplicateScene => "track",
         StageIntent::Nudge
         | StageIntent::Yank
         | StageIntent::Put

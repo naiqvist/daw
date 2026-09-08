@@ -1460,6 +1460,10 @@ impl Scene {
     }
 }
 
+/// The most scenes a session holds: twenty-six banks of sixteen, where
+/// the bank letters run out. The stage's `scenes::MAX_SCENES` is this.
+pub const MAX_SESSION_SCENES: usize = 26 * 16;
+
 /// The session: scenes down, tracks across, a clip where they meet.
 /// Document data beside the arrangement, not a view of it — a clip in a
 /// slot is not on the timeline until something places it there.
@@ -1969,6 +1973,196 @@ impl Song {
         }
         self.normalize_group_depths();
         Some(track)
+    }
+
+    /// A copy of the track at `index`, put right after it, and the copy's
+    /// index. `None` means there is no such track.
+    ///
+    /// What the copy owns: a fresh track id; its own name; its chain and
+    /// strip with FRESH device ids, so a letter to one never lands on the
+    /// other; its own copies of every pattern its slots and blocks used,
+    /// so editing the copy's clip leaves the original's alone — the
+    /// session's own duplicate shares a pattern between slots, but a
+    /// duplicated TRACK is meant to diverge; its automation and its
+    /// modulation wires re-addressed to the new devices; its clips in
+    /// every scene. It is not armed: two tracks recording one input is
+    /// never what was asked for. Modulation followers and wires on later
+    /// tracks shift down one, as they shift up on removal.
+    pub fn duplicate_track(&mut self, index: usize) -> Option<usize> {
+        let source = self.tracks.get(index)?.clone();
+        let to = index.checked_add(1)?;
+        let mut copy = source.clone();
+        copy.id = TrackId(self.mint_track_id());
+        copy.name = self.duplicate_name(&source.name);
+        copy.armed = false;
+        // Fresh device ids, remembering the map for the wires.
+        let mut next_device = self.mint_device_id();
+        let mut renamed: Vec<(u64, u64)> = Vec::new();
+        for device in copy.chain.iter_mut().chain(copy.strip.iter_mut()) {
+            renamed.push((device.id.0, next_device));
+            device.id = DeviceId(next_device);
+            next_device = next_device.saturating_add(1);
+        }
+        let readdress = |target: &str| -> String {
+            let Some(rest) = target.strip_prefix(crate::targets::DEVICE_TARGET_PREFIX) else {
+                return target.to_owned();
+            };
+            let Some((id, tail)) = rest.split_once('.') else {
+                return target.to_owned();
+            };
+            let Some(new) = id
+                .parse::<u64>()
+                .ok()
+                .and_then(|old| renamed.iter().find(|(from, _)| *from == old))
+                .map(|(_, new)| *new)
+            else {
+                return target.to_owned();
+            };
+            format!("{}{new}.{tail}", crate::targets::DEVICE_TARGET_PREFIX)
+        };
+        for envelope in &mut copy.automation {
+            envelope.target = readdress(&envelope.target);
+        }
+        // Its own patterns: one copy per pattern the track used, however
+        // many places it used it.
+        let mut used: Vec<PatternId> = source
+            .blocks
+            .iter()
+            .map(|block| block.pattern_id)
+            .chain(
+                self.session
+                    .scenes
+                    .iter()
+                    .filter_map(|scene| scene.clip(source.id).map(|Clip::Pattern(id)| id)),
+            )
+            .collect();
+        used.sort_unstable_by_key(|id| id.0);
+        used.dedup();
+        let mut copied: Vec<(PatternId, PatternId)> = Vec::new();
+        for id in used {
+            let Some(pattern) = self.pattern(id).cloned() else {
+                continue;
+            };
+            let Some(fresh) = self.allocate_pattern(pattern.name.clone()) else {
+                continue;
+            };
+            if let Some(slot) = self.pattern_mut(fresh) {
+                *slot = Pattern {
+                    id: fresh,
+                    ..pattern
+                };
+            }
+            copied.push((id, fresh));
+        }
+        let copy_of = |id: PatternId| {
+            copied
+                .iter()
+                .find(|(from, _)| *from == id)
+                .map_or(id, |(_, to)| *to)
+        };
+        let mut next_block = self.mint_block_id().0;
+        for block in &mut copy.blocks {
+            block.id = BlockId(next_block);
+            next_block = next_block.saturating_add(1);
+            block.pattern_id = copy_of(block.pattern_id);
+        }
+        for block in &mut copy.audio_blocks {
+            block.id = BlockId(next_block);
+            next_block = next_block.saturating_add(1);
+        }
+        // Later tracks are one further down.
+        for modulator in &mut self.modulators {
+            if let ModKind::Follower { track } = &mut modulator.kind
+                && *track >= to
+            {
+                *track += 1;
+            }
+        }
+        for wire in &mut self.mod_wires {
+            if wire.track >= to {
+                wire.track += 1;
+            }
+        }
+        // The source's wires, again, onto the copy's devices.
+        let mine: Vec<ModWire> = self
+            .mod_wires
+            .iter()
+            .filter(|wire| wire.track == index)
+            .cloned()
+            .collect();
+        for wire in mine {
+            let id = self.mint_modulation_id();
+            self.mod_wires.push(ModWire {
+                id,
+                track: to,
+                target: readdress(&wire.target),
+                ..wire
+            });
+        }
+        let copy_id = copy.id;
+        self.tracks.insert(to, copy);
+        for scene in &mut self.session.scenes {
+            if let Some(Clip::Pattern(id)) = scene.clip(source.id) {
+                scene.slots.push(Slot {
+                    track: copy_id,
+                    clip: Clip::Pattern(copy_of(id)),
+                });
+            }
+        }
+        self.normalize_group_depths();
+        Some(to)
+    }
+
+    /// `Kick copy`, then `Kick copy 2`: a name no track has yet.
+    fn duplicate_name(&self, name: &str) -> String {
+        let base = format!("{name} copy");
+        let taken = |candidate: &str| self.tracks.iter().any(|track| track.name == candidate);
+        if !taken(&base) {
+            return base;
+        }
+        (2..)
+            .map(|n| format!("{base} {n}"))
+            .find(|candidate| !taken(candidate))
+            .unwrap_or(base)
+    }
+
+    /// A copy of the scene at `index`, put right after it, and the copy's
+    /// index. Every clip in it gets its own pattern, so the copy is a
+    /// place to vary from rather than a second door to the same room.
+    /// `None` means there is no such scene, or the session is full.
+    pub fn duplicate_scene(&mut self, index: usize) -> Option<usize> {
+        let source = self.session.scenes.get(index)?.clone();
+        let to = index.checked_add(1)?;
+        if self.session.scenes.len() >= MAX_SESSION_SCENES {
+            return None;
+        }
+        let mut slots = Vec::with_capacity(source.slots.len());
+        for slot in &source.slots {
+            let Clip::Pattern(id) = slot.clip;
+            let Some(pattern) = self.pattern(id).cloned() else {
+                continue;
+            };
+            let track_index = self.tracks.iter().position(|track| track.id == slot.track);
+            let name = track_index.map_or(pattern.name.clone(), |track| {
+                Song::pattern_address(track, to)
+            });
+            let Some(fresh) = self.allocate_pattern(name) else {
+                continue;
+            };
+            if let Some(made) = self.pattern_mut(fresh) {
+                *made = Pattern {
+                    id: fresh,
+                    name: made.name.clone(),
+                    ..pattern
+                };
+            }
+            slots.push(Slot {
+                track: slot.track,
+                clip: Clip::Pattern(fresh),
+            });
+        }
+        self.session.scenes.insert(to, Scene { slots });
+        Some(to)
     }
 
     /// Swap the track at `index` with its neighbour. `false` means it was
