@@ -1001,6 +1001,31 @@ impl Voices for crate::audio::brick::BrickVoices {
     }
 }
 
+/// The kit as an instrument the clock can play.
+impl Voices for crate::audio::kit::KitVoices {
+    fn all_sound_off(&mut self) {
+        crate::audio::kit::KitVoices::all_sound_off(self);
+    }
+    fn release_all(&mut self) {
+        crate::audio::kit::KitVoices::release_all(self);
+    }
+    fn note_off(&mut self, pitch: u8) {
+        crate::audio::kit::KitVoices::note_off(self, pitch);
+    }
+    fn note_on(&mut self, pitch: u8, vel: u8, age: u64) {
+        crate::audio::kit::KitVoices::note_on(self, pitch, vel, age);
+    }
+    fn plock(&mut self, param: u32, value: Option<f32>) {
+        crate::audio::kit::KitVoices::plock(self, param, value);
+    }
+    fn plock_glide(&mut self, param: u32, alpha: f32) {
+        crate::audio::kit::KitVoices::plock_glide(self, param, alpha);
+    }
+    fn render(&mut self, out: &mut [f32], at: usize, gain: &mut Ramp) {
+        crate::audio::kit::KitVoices::render(self, out, at, gain);
+    }
+}
+
 impl Voices for crate::audio::sampler::SamplerVoices {
     fn all_sound_off(&mut self) {
         crate::audio::sampler::SamplerVoices::all_sound_off(self);
@@ -2043,6 +2068,14 @@ pub enum Node {
         gain: f32,
         target_gain: f32,
     },
+    /// The drum kit: sixteen bricks, loaded when the node was built.
+    Kit {
+        events: Vec<SeqEvent>,
+        clock: PatternClock,
+        voices: Box<crate::audio::kit::KitVoices>,
+        gain: f32,
+        target_gain: f32,
+    },
     /// The four-operator FM synth.
     Quad {
         events: Vec<SeqEvent>,
@@ -2767,6 +2800,7 @@ impl Node {
             | NodeSpec::Stab { .. }
             | NodeSpec::Quad { .. }
             | NodeSpec::Brick { .. }
+            | NodeSpec::Kit { .. }
             | NodeSpec::Sampler { .. }
             | NodeSpec::Modulato { .. }
             | NodeSpec::Sat { .. }
@@ -2825,6 +2859,7 @@ impl Node {
             Node::Stab { voices, .. } => Some(voices.readout()),
             Node::Quad { voices, .. } => Some(voices.readout()),
             Node::Brick { voices, .. } => Some(voices.readout()),
+            Node::Kit { voices, .. } => Some(voices.readout()),
             Node::Prism { core } => Some(core.readout()),
             Node::Gate { core } => Some(core.readout()),
             Node::Section { core } => Some(core.readout()),
@@ -3497,6 +3532,23 @@ impl Node {
                 }
             }
             Node::Brick {
+                events,
+                clock,
+                voices,
+                gain,
+                target_gain,
+            } => {
+                let mut ramp = Ramp::across(*gain, *target_gain, out_len);
+                clock.run(voices.as_mut(), events, out.l, ctx, &mut ramp);
+                *gain = *target_gain;
+                if let Some(r) = out.r.as_deref_mut() {
+                    let right = voices.right(out_len);
+                    for (d, s) in r.iter_mut().zip(right.iter()) {
+                        *d = *s;
+                    }
+                }
+            }
+            Node::Kit {
                 events,
                 clock,
                 voices,
@@ -4638,6 +4690,7 @@ impl Node {
             | Node::Stab { clock, .. }
             | Node::Quad { clock, .. }
             | Node::Brick { clock, .. }
+            | Node::Kit { clock, .. }
             | Node::Poly { clock, .. }
             | Node::Loom { clock, .. }
             | Node::Haze { clock, .. }
@@ -5261,6 +5314,20 @@ impl Node {
                 }
                 voices.set_param(param, value);
             }
+            Node::Kit {
+                target_gain,
+                voices,
+                ..
+            } => {
+                let Some(value) = crate::params::clamp(crate::params::kit::TABLE, param, value)
+                else {
+                    return;
+                };
+                if param == crate::params::kit::LEVEL {
+                    *target_gain = value;
+                }
+                voices.set_param(param, value);
+            }
             Node::Poly {
                 target_gain,
                 voices,
@@ -5749,6 +5816,12 @@ fn resolve_timeline_spec(
             ..
         }
         | NodeSpec::Brick {
+            notes,
+            subloops,
+            loop_len_beats: None,
+            ..
+        }
+        | NodeSpec::Kit {
             notes,
             subloops,
             loop_len_beats: None,
@@ -6668,6 +6741,7 @@ impl NodeSpec {
             | NodeSpec::Stab { notes, .. }
             | NodeSpec::Quad { notes, .. }
             | NodeSpec::Brick { notes, .. }
+            | NodeSpec::Kit { notes, .. }
             | NodeSpec::Poly { notes, .. }
             | NodeSpec::Loom { notes, .. }
             | NodeSpec::Haze { notes, .. }
@@ -7152,6 +7226,17 @@ pub enum NodeSpec {
         #[serde(default)]
         params: crate::audio::brick::BrickParams,
     },
+    /// KIT: sixteen bricks across the keyboard. The pads' files are
+    /// loaded at compile; a missing or empty one is a silent pad.
+    Kit {
+        notes: Vec<Note>,
+        subloops: Vec<SubLoop>,
+        loop_len_beats: Option<f64>,
+        #[serde(default)]
+        paths: Vec<std::path::PathBuf>,
+        #[serde(default)]
+        params: Box<crate::audio::kit::KitParams>,
+    },
     /// QUAD: four-operator FM. Timeline-locked as `Tine` is; stereo out,
     /// the same on both sides.
     Quad {
@@ -7384,6 +7469,7 @@ impl GraphSpec {
                 | NodeSpec::Stab { notes, .. }
                 | NodeSpec::Quad { notes, .. }
                 | NodeSpec::Brick { notes, .. }
+                | NodeSpec::Kit { notes, .. }
                 | NodeSpec::Poly { notes, .. }
                 | NodeSpec::Haze { notes, .. }
                 | NodeSpec::Kick { notes, .. }
@@ -8584,6 +8670,57 @@ impl GraphSpec {
                             crate::audio::brick::BrickParams::default().level
                         };
                         Node::Brick {
+                            events,
+                            clock: PatternClock::new(
+                                loop_len_beats
+                                    .map(|len| (len * samples_per_beat).round().max(0.0) as u64)
+                                    .unwrap_or(0),
+                                samples_per_beat,
+                            ),
+                            voices: Box::new(voices),
+                            gain,
+                            target_gain: gain,
+                        }
+                    }
+                    Some(NodeSpec::Kit {
+                        notes,
+                        subloops,
+                        loop_len_beats,
+                        paths,
+                        params,
+                    }) => {
+                        let events = compile_events(
+                            notes,
+                            subloops,
+                            *loop_len_beats,
+                            samples_per_beat,
+                            plock_glide_samples,
+                        )?;
+                        let materials = paths
+                            .iter()
+                            .map(|path| {
+                                if path.as_os_str().is_empty() {
+                                    crate::audio::material::Material::empty()
+                                } else {
+                                    crate::audio::material::load_cached(path, sample_rate)
+                                        .unwrap_or_else(|_| {
+                                            crate::audio::material::Material::empty()
+                                        })
+                                }
+                            })
+                            .collect();
+                        let voices = crate::audio::kit::KitVoices::new(
+                            sample_rate as f32,
+                            block_frames,
+                            **params,
+                            materials,
+                        );
+                        let gain = if params.level.is_finite() {
+                            params.level.clamp(0.0, crate::params::kit::LEVEL_MAX)
+                        } else {
+                            crate::audio::kit::KitParams::default().level
+                        };
+                        Node::Kit {
                             events,
                             clock: PatternClock::new(
                                 loop_len_beats

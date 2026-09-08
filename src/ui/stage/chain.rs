@@ -250,6 +250,42 @@ impl BrickFace {
     }
 }
 
+/// What a KIT card draws from: the knobs as the device holds them, and
+/// the pads' files.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KitFace {
+    pub params: crate::audio::kit::KitParams,
+    pub pads: Vec<std::path::PathBuf>,
+}
+
+impl KitFace {
+    pub fn from_device(device: &Device) -> Self {
+        let mut params = crate::audio::kit::KitParams::default();
+        for (id, value) in &device.overrides {
+            params.set(*id, *value);
+        }
+        Self {
+            params,
+            pads: device.pads.clone(),
+        }
+    }
+
+    /// The file on pad `pad`, if one is.
+    pub fn file(&self, pad: usize) -> Option<&std::path::Path> {
+        self.pads
+            .get(pad)
+            .filter(|path| !path.as_os_str().is_empty())
+            .map(std::path::PathBuf::as_path)
+    }
+
+    /// How many pads have a file.
+    pub fn loaded(&self) -> usize {
+        (0..crate::params::kit::PADS)
+            .filter(|pad| self.file(*pad).is_some())
+            .count()
+    }
+}
+
 /// One device, as a column of the band.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Column {
@@ -282,6 +318,8 @@ pub struct Column {
     /// The hit-facing state for a BRICK card; absent on every other
     /// device.
     pub brick: Option<BrickFace>,
+    /// The pad-facing state for a KIT card; absent on every other device.
+    pub kit: Option<KitFace>,
     pub rows: Vec<Row>,
     /// Which section of the console this column is, when it is one:
     /// drawn as a piece of the strip rather than as a card.
@@ -378,6 +416,7 @@ pub fn column(device: &Device) -> Column {
         stab: (device.kind == DeviceKind::Stab).then(|| StabFace::from_device(device)),
         quad: (device.kind == DeviceKind::Quad).then(|| QuadFace::from_device(device)),
         brick: (device.kind == DeviceKind::Brick).then(|| BrickFace::from_device(device)),
+        kit: (device.kind == DeviceKind::Kit).then(|| KitFace::from_device(device)),
         section: match device.kind {
             crate::devices::DeviceKind::Console(kind) => Some(kind),
             _ => None,

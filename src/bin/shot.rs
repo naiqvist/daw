@@ -1332,6 +1332,50 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
             }
         }
         let _ = stage.apply(StageIntent::Mix);
+    } else if which.contains("kit") {
+        // KIT on the first track: eleven pads named, hats in group A,
+        // a pad muted, one panned wide, and the band open on it.
+        let id = stage
+            .song_mut()
+            .add_device(0, daw::devices::DeviceKind::Kit)
+            .expect("a kit");
+        use daw::params::kit as kp;
+        if let Some(device) = stage.song_mut().device_mut(id) {
+            let names = [
+                "kick.wav",
+                "snare.wav",
+                "rim.wav",
+                "clap.wav",
+                "hat.wav",
+                "hat-open.wav",
+                "shaker.wav",
+                "ride.wav",
+                "tom-lo.wav",
+                "tom-hi.wav",
+                "crash.wav",
+            ];
+            device.pads = (0..kp::PADS)
+                .map(|i| {
+                    names
+                        .get(i)
+                        .map(|n| std::path::PathBuf::from(format!("/kits/909/{n}")))
+                        .unwrap_or_default()
+                })
+                .collect();
+            device.set(kp::PAD, 11.0);
+            device.set(kp::pad_param(4, kp::GROUP), 1.0);
+            device.set(kp::pad_param(5, kp::GROUP), 1.0);
+            device.set(kp::pad_param(6, kp::ON), 0.0);
+            device.set(kp::pad_param(7, kp::PAN), 0.6);
+            device.set(kp::pad_param(2, kp::PAN), -0.4);
+            device.set(kp::pad_param(0, daw::params::brick::DROP), 12.0);
+        }
+        let _ = stage.apply(StageIntent::Devices);
+        if which.contains("-jump") {
+            for _ in 0..3 {
+                let _ = stage.apply(StageIntent::Group(daw::ui::stage::Step::Down));
+            }
+        }
     } else if which.contains("brick") {
         // BRICK on the first track with a synthesized kick — a tone
         // falling from 180 Hz with a click on it — and the band open.

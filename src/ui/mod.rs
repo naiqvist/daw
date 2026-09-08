@@ -434,6 +434,7 @@ mod tests {
             "stab.rs",      // ditto
             "quad.rs",      // ditto
             "brick.rs",     // ditto
+            "kit.rs",       // ditto
             "gauge.rs",     // ditto
             "prism.rs",     // a card: its size is the sum of what it holds
             "limiter.rs",   // ditto

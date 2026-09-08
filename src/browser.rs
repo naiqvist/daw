@@ -138,6 +138,10 @@ impl Default for Browser {
                                     load: DeviceKind::Brick,
                                 },
                                 BrowserItem {
+                                    name: "Kit",
+                                    load: DeviceKind::Kit,
+                                },
+                                BrowserItem {
                                     name: "Haze",
                                     load: DeviceKind::Haze,
                                 },

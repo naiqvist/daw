@@ -1124,6 +1124,13 @@ pub(crate) fn draw_device_card(
             let history = histories.get(&instance.id).cloned().unwrap_or_default();
             device::glue_card(ui, theme, &mut knobs, &history)
         }
+        // The kit is a stage instrument; the old rack only names it.
+        DeviceState::Kit(_) => {
+            device::card::card_sized(ui, theme, "kit", control::DEVICE_TALL_H, |ui| {
+                ui.label("KIT — open it on the stage");
+            });
+            Vec::new()
+        }
         DeviceState::Brick(params) => {
             let mut knobs = brick_knobs(params);
             let mut page = usize::from(instance.page);

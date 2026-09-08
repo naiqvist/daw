@@ -84,6 +84,10 @@ impl ScopeContext {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StageIntent {
     Step(Step),
+    /// Jump the band's row cursor to the next or previous parameter
+    /// group — the next pad of a kit, the next operator of an FM synth —
+    /// rather than walking every row between.
+    Group(Step),
     /// Toggle the grid cell under the cursor in the standing selection.
     Select,
     /// Select every address on the active grid.
@@ -486,6 +490,8 @@ impl StageIntent {
             Self::Step(Step::Down) => "move down",
             Self::Step(Step::Left) => "move left",
             Self::Step(Step::Right) => "move right",
+            Self::Group(Step::Up | Step::Left) => "previous group",
+            Self::Group(_) => "next group",
             Self::Select => "toggle cell selection",
             Self::SelectAll => "select all",
             Self::SelectStep(Step::Up) => "select up",
@@ -908,6 +914,16 @@ const BINDINGS: &[Binding] = &[
     // Inside the band: bare arrows walk it — across the devices, down the
     // parameters — and a shifted arrow moves the value under the cursor,
     // the same gesture the mixer's pan already answers to.
+    Binding::new(
+        ScopeContext::Chain,
+        Key::PageUp,
+        StageIntent::Group(Step::Up),
+    ),
+    Binding::new(
+        ScopeContext::Chain,
+        Key::PageDown,
+        StageIntent::Group(Step::Down),
+    ),
     Binding::new(
         ScopeContext::Chain,
         Key::ArrowLeft,
@@ -2076,6 +2092,7 @@ pub(super) fn bindings_for(scope: ScopeContext) -> impl Iterator<Item = (Mods, K
 fn family(intent: StageIntent) -> &'static str {
     match intent {
         StageIntent::Step(_)
+        | StageIntent::Group(_)
         | StageIntent::Select
         | StageIntent::SelectAll
         | StageIntent::SelectStep(_)

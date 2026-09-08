@@ -350,6 +350,11 @@ pub struct Device {
     /// asks for. Meaningless on any other kind, and kept empty there.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub slices: Vec<f64>,
+    /// A kit's files, one per pad in pad order; an empty path is a pad
+    /// with nothing on it. Meaningless on any other kind, and kept empty
+    /// there. On the device for the same reason `sample` is.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pads: Vec<std::path::PathBuf>,
 }
 
 impl Device {
@@ -362,6 +367,7 @@ impl Device {
             overrides: Vec::new(),
             sample: None,
             slices: Vec::new(),
+            pads: Vec::new(),
         }
     }
 

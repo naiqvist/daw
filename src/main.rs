@@ -6064,6 +6064,7 @@ fn plockable_params(track: &Track) -> Vec<piano_roll::PlockParam> {
         DeviceKind::Stab => daw::params::stab::LEVEL,
         DeviceKind::Quad => daw::params::quad::LEVEL,
         DeviceKind::Brick => daw::params::brick::LEVEL,
+        DeviceKind::Kit => daw::params::kit::LEVEL,
         DeviceKind::Haze => daw::params::haze::LEVEL,
         DeviceKind::Sampler => daw::params::sampler::GAIN,
         DeviceKind::SineSynth => daw::params::seq::GAIN,

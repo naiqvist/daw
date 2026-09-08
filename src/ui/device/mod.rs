@@ -96,6 +96,7 @@ pub mod handclap;
 pub mod hat;
 pub mod haze;
 pub mod kick;
+pub mod kit;
 pub mod knob;
 pub mod limiter;
 pub mod lofi;

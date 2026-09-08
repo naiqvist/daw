@@ -24,6 +24,7 @@ mod heads;
 mod help;
 mod input;
 mod inspector;
+mod kit_card;
 mod lattice;
 mod log;
 mod mixer;

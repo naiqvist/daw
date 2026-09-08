@@ -137,6 +137,7 @@ pub(crate) fn compile_chain(
             | DeviceState::Stab(_)
             | DeviceState::Quad(_)
             | DeviceState::Brick(_)
+            | DeviceState::Kit(_)
             | DeviceState::Haze(_)
             | DeviceState::Sampler(_)
             | DeviceState::Kick(_)
@@ -642,6 +643,16 @@ pub(crate) fn build_graph_spec(
                             params,
                         }
                     }
+                    // The old rack has no way to hand a kit its files:
+                    // the kit is built for the stage, and compiles silent
+                    // here.
+                    DeviceState::Kit(params) => NodeSpec::Kit {
+                        notes,
+                        subloops: Vec::new(),
+                        loop_len_beats,
+                        paths: Vec::new(),
+                        params: Box::new(params),
+                    },
                     DeviceState::Poly(params) => NodeSpec::Poly {
                         notes,
                         subloops: Vec::new(),

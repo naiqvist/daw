@@ -274,6 +274,8 @@ impl Stage {
                             super::quad_card::WIDTH
                         } else if column.brick.is_some() {
                             super::brick_card::WIDTH
+                        } else if column.kit.is_some() {
+                            super::kit_card::WIDTH
                         } else {
                             CHAIN_W
                         }
@@ -402,6 +404,19 @@ impl Stage {
         }
         for (index, rect) in &layout {
             if columns[*index].section.is_some() {
+                continue;
+            }
+            if columns[*index].kit.is_some() {
+                self.draw_kit_chain_card(
+                    ui,
+                    *rect,
+                    &columns[*index],
+                    *index,
+                    cursor,
+                    self.chain_offset,
+                    rows_shown,
+                    head_h,
+                );
                 continue;
             }
             if columns[*index].brick.is_some() {

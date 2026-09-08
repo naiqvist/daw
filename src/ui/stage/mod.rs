@@ -1550,6 +1550,56 @@ impl Stage {
     }
 
     /// Bring the band's row back inside the device under its cursor.
+    /// PageUp/PageDown on the band: the row cursor jumps to the first
+    /// row of the next group, or of the previous one. A device with one
+    /// group has nowhere to jump and says so as an edge.
+    fn jump_group(&mut self, step: Step) -> Result<(), RefusalReason> {
+        let Some((col, row)) = self.chain.as_ref().and_then(FocusLattice::cursor) else {
+            return Err(RefusalReason::Unavailable);
+        };
+        let labels = self
+            .band_device(col)
+            .and_then(|(_, id)| self.song.device(id))
+            .map(|device| device.kind.spec().labels)
+            .unwrap_or(&[]);
+        if labels.is_empty() {
+            return Err(RefusalReason::Unavailable);
+        }
+        let group_at = |r: usize| labels.get(r).map_or("", |label| label.group);
+        let start_of = |r: usize| {
+            (0..=r)
+                .rev()
+                .take_while(|&q| group_at(q) == group_at(r))
+                .last()
+                .unwrap_or(r)
+        };
+        let target = match step {
+            Step::Down | Step::Right => {
+                (row + 1..labels.len()).find(|&r| group_at(r) != group_at(row))
+            }
+            Step::Up | Step::Left => {
+                let start = start_of(row);
+                (start > 0).then(|| start_of(start - 1))
+            }
+        };
+        let Some(target) = target else {
+            return Err(RefusalReason::Edge(step));
+        };
+        let Some(lattice) = self.chain.as_mut() else {
+            return Err(RefusalReason::Unavailable);
+        };
+        let toward = if target > row { Step::Down } else { Step::Up };
+        while lattice.cursor().is_some_and(|(_, r)| r != target) {
+            if !lattice.step(toward) {
+                break;
+            }
+        }
+        // A jump lands the group's first row at the TOP of the bank, so
+        // the whole group reads down from it — a page turn, not a scroll.
+        self.chain_offset = target;
+        Ok(())
+    }
+
     fn clamp_chain_row(&mut self) {
         let Some(track) = self.addressed_track() else {
             return;
@@ -4111,6 +4161,7 @@ impl Stage {
             StageIntent::Param { up, .. } if nudging && self.chain.is_some() => {
                 self.nudge(if up { Step::Right } else { Step::Left })
             }
+            StageIntent::Group(step) if self.chain.is_some() => self.jump_group(step),
             StageIntent::Step(step) if self.chain.is_some() => {
                 let moved = self.chain.as_mut().expect("the band is showing").step(step);
                 if moved {
@@ -4151,6 +4202,8 @@ impl Stage {
                         .ok_or(RefusalReason::Edge(Step::Down))
                 }
             }
+            // Groups are a band idea; nowhere else has them.
+            StageIntent::Group(_) => Err(RefusalReason::Unavailable),
             StageIntent::Step(step) => match &mut self.browser {
                 Some(browser) => browser
                     .step(step)
@@ -5025,6 +5078,34 @@ impl Stage {
             .unwrap_or_default();
         // A sampler or a brick at the head takes the file; anything else
         // gets a sampler put in front of it.
+        // A kit at the head takes the file on the pad in hand, then
+        // holds out the next pad: sixteen picks in a row fill a kit.
+        if let Some(head) = self.song.tracks[track]
+            .chain
+            .first()
+            .filter(|device| device.kind == DeviceKind::Kit)
+        {
+            use crate::params::kit as kp;
+            let id = head.id;
+            let mut landed = None;
+            if let Some(device) = self.song.device_mut(id) {
+                let pad = (device.value(kp::PAD).round().max(0.0) as usize).min(kp::PADS - 1);
+                if device.pads.len() < kp::PADS {
+                    device.pads.resize(kp::PADS, PathBuf::new());
+                }
+                device.pads[pad] = path;
+                let next = (pad + 1) % kp::PADS;
+                device.set(kp::PAD, next as f32);
+                landed = Some((pad, next));
+            }
+            let Some((pad, next)) = landed else {
+                return Err(RefusalReason::Unavailable);
+            };
+            self.notice = Some(format!("pad {} · {name} · pad {} next", pad + 1, next + 1));
+            self.fit_session();
+            self.touched();
+            return Ok(());
+        }
         let head_is_sampler = self.song.tracks[track]
             .chain
             .first()

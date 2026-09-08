@@ -27,6 +27,7 @@ pub mod handclap;
 pub mod hat;
 pub mod haze;
 pub mod kick;
+pub mod kit;
 pub mod lens;
 pub mod limiter;
 pub mod loom;

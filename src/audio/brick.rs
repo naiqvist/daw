@@ -346,6 +346,21 @@ impl BrickVoices {
         self.said_voices = 0.0;
     }
 
+    /// Fade whatever is sounding, the way a new hit under CUT does. A
+    /// kit's choke groups call this across pads.
+    pub fn choke(&mut self) {
+        for v in self.voices.iter_mut() {
+            if v.active && v.cut == 0 {
+                v.cut = CUT_SAMPLES;
+            }
+        }
+    }
+
+    /// How many hits are sounding.
+    pub fn sounding(&self) -> usize {
+        self.voices.iter().filter(|v| v.active).count()
+    }
+
     /// A one-shot has nothing to release: the hit runs its course.
     pub fn release_all(&mut self) {}
 
