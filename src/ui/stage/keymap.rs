@@ -492,6 +492,23 @@ impl SampleIntent {
 }
 
 impl StageIntent {
+    /// What this intent is called on the help surface IN `scope`: the
+    /// few verbs that mean something else on the band say so there.
+    pub(super) fn label_in(self, scope: ScopeContext) -> &'static str {
+        if scope == ScopeContext::Chain {
+            match self {
+                Self::Clear => return "delete device / pad",
+                Self::Mute => return "bypass or in/out",
+                Self::Sample(SampleIntent::Open) => return "open its room",
+                Self::Yank => return "yank device / pad",
+                Self::Put => return "put device / pad",
+                Self::Hear => return "hear pad or file",
+                _ => {}
+            }
+        }
+        self.label()
+    }
+
     /// What this intent is called on the help surface.
     ///
     /// A `match` rather than a lookup table on purpose: a new intent that
@@ -505,7 +522,7 @@ impl StageIntent {
             Self::Step(Step::Right) => "move right",
             Self::Group(Step::Up | Step::Left) => "previous group",
             Self::Group(_) => "next group",
-            Self::Select => "toggle cell selection",
+            Self::Select => "select this cell",
             Self::SelectAll => "select all",
             Self::SelectStep(Step::Up) => "select up",
             Self::SelectStep(Step::Down) => "select down",
@@ -514,7 +531,7 @@ impl StageIntent {
             Self::Enter => "go in",
             Self::Escape => "go out",
             Self::ToggleTransport => "stop / roll",
-            Self::ToggleRecord => "record armed tracks",
+            Self::ToggleRecord => "record armed",
             Self::Rewind => "return to top",
             Self::Help => "this list",
             Self::ProjectManager => "project deck",
@@ -528,8 +545,8 @@ impl StageIntent {
             Self::NewInstrumentTrack => "new midi track",
             Self::ToggleTrackArm => "arm track",
             Self::CycleTrackInput { back: false } => "next track input",
-            Self::CycleTrackInput { back: true } => "previous track input",
-            Self::CycleTrackMonitor => "track monitor mode",
+            Self::CycleTrackInput { back: true } => "track input back",
+            Self::CycleTrackMonitor => "track monitor",
             Self::Clear => "clear slot",
             Self::Launch => "launch clip",
             Self::LaunchScene => "launch scene",
@@ -577,18 +594,18 @@ impl StageIntent {
             Self::Save => "save",
             Self::Rename => "rename track",
             Self::DeleteTrack => "delete track",
-            Self::Nudge => "nudge, then a direction",
+            Self::Nudge => "nudge, then arrow",
             Self::Yank => "yank device",
             Self::Put => "put device",
             Self::Hear => "hear the pad",
             Self::DuplicateTracks => "duplicate track",
             Self::DuplicateScene => "duplicate scene",
-            Self::SwapPad => "swap pad with the hand",
+            Self::SwapPad => "swap pad with hand",
             Self::Fill => "fill kit from folder",
             Self::Duplicate => "duplicate selection",
             Self::TrigMenu => "trig menu",
             Self::ClearLock => "clear lock",
-            Self::PlockEditor => "parameter-lock graph",
+            Self::PlockEditor => "plock graph",
             Self::PlockTab { backwards: false } => "next editor region",
             Self::PlockTab { backwards: true } => "previous editor region",
             Self::PlockFine(_) => "fine graph adjustment",
@@ -597,7 +614,7 @@ impl StageIntent {
             Self::PlockAlgorithm => "algorithm picker",
             Self::PlockExtreme { high: false } => "parameter minimum",
             Self::PlockExtreme { high: true } => "parameter maximum",
-            Self::Modulation => "modulation workspace",
+            Self::Modulation => "modulation",
             Self::ModTab { backwards: false } => "next modulation zone",
             Self::ModTab { backwards: true } => "previous modulation zone",
             Self::ModAdjust {
@@ -633,7 +650,7 @@ impl StageIntent {
             Self::SongView => "session / song",
             Self::Bus => "next bus",
             Self::Song(intent) => intent.label(),
-            Self::RecordSong => "record session into song",
+            Self::RecordSong => "record to song",
         }
     }
 }
@@ -2221,7 +2238,7 @@ pub(super) fn palette_entries() -> &'static [Entry] {
                     command: crate::ui::palette::Command::new(
                         id,
                         family(binding.intent),
-                        binding.intent.label(),
+                        binding.intent.label_in(binding.scope),
                     )
                     .hint(chord),
                     intent: binding.intent,

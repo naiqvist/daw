@@ -109,6 +109,38 @@ pub(crate) const COMMAND_TABLE: &[(Verb, egui::Key, &str)] = &[
 ];
 
 impl Verb {
+    /// What the verb does, in a codebook row's worth of words.
+    pub(crate) fn brief(self) -> &'static str {
+        match self {
+            Self::Act => "toggle step / enter",
+            Self::Delete => "delete note / sel",
+            Self::Select => "select here",
+            Self::SelectAll => "select all steps",
+            Self::Yank => "yank to register",
+            Self::Put => "put register here",
+            Self::Duplicate => "copy N steps on",
+            Self::Nudge => "then arrow: move",
+            Self::Resize => "then ←/→: resize",
+            Self::ClipResize => "then ←/→: clip len",
+            Self::Velocity => "then ↑/↓: velocity",
+            Self::Mute => "mute note / sel",
+            Self::Solo => "solo track",
+            Self::Arm => "arm track",
+            Self::Monitor => "cycle monitor",
+            Self::Rename => "rename clip",
+            Self::Condition => "chance; 50 C = 50%",
+            Self::Search => "find by name",
+            Self::Euclid => "euclid mode",
+            Self::Cancel => "leave the mode",
+            Self::StackYank => "yank whole stack",
+            Self::StackPut => "put yanked stack",
+            Self::StackDuplicate => "copy stack N on",
+            Self::StackNudge => "then arrow: stack",
+            Self::StackResize => "then ←/→: stack",
+            Self::StackVelocity => "then ↑/↓: stack vel",
+        }
+    }
+
     pub(crate) fn name(self) -> &'static str {
         if self == Self::Cancel {
             return "CANCEL";

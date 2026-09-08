@@ -762,6 +762,15 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
     } else if which.contains("browser") {
         let _ = stage.apply(StageIntent::Browse);
     } else if which.contains("help") {
+        // The codebook over the session, the band, or a clip.
+        if which.contains("-chain") {
+            let _ = stage.apply(StageIntent::Devices);
+        } else if which.contains("-clip") {
+            // Down onto a slot; Enter fills it; Enter again goes in.
+            let _ = stage.apply(StageIntent::Step(daw::ui::stage::Step::Down));
+            let _ = stage.apply(StageIntent::Enter);
+            let _ = stage.apply(StageIntent::Enter);
+        }
         let _ = stage.apply(StageIntent::Help);
     } else if which.contains("palette") {
         // Opening state is the pose: it shows the full current vocabulary

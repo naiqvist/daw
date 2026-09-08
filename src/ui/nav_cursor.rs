@@ -174,6 +174,13 @@ pub fn begin_frame(ctx: &egui::Context) {
     ctx.data_mut(|data| data.insert_temp(registry_id(), Registry::default()));
 }
 
+/// Forget every claim made so far this frame: a surface that has just
+/// been covered — the field under the codebook — must not show its
+/// cursor through the cover. Claims made after this stand.
+pub fn dismiss(ctx: &egui::Context) {
+    begin_frame(ctx);
+}
+
 /// Offer the keyboard's active rectangle to the global cursor.
 pub fn claim(
     painter: &egui::Painter,
