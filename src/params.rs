@@ -1552,6 +1552,226 @@ pub mod quad {
     }
 }
 
+/// BRICK: the drum one-shot sampler with an opinion. See
+/// [`crate::audio::brick`].
+pub mod brick {
+    use super::ParamDef;
+
+    pub const TUNE: u32 = 0;
+    pub const FINE: u32 = 1;
+    pub const KEY: u32 = 2;
+    pub const START: u32 = 3;
+    pub const REVERSE: u32 = 4;
+    pub const ATTACK: u32 = 5;
+    pub const DECAY: u32 = 6;
+    pub const CURVE: u32 = 7;
+    pub const DROP: u32 = 8;
+    pub const DROP_MS: u32 = 9;
+    pub const PUNCH: u32 = 10;
+    pub const BODY: u32 = 11;
+    pub const BODY_HZ: u32 = 12;
+    pub const SNAP: u32 = 13;
+    pub const BITS: u32 = 14;
+    pub const RATE: u32 = 15;
+    pub const GRIT: u32 = 16;
+    pub const CUTOFF: u32 = 17;
+    pub const RESO: u32 = 18;
+    pub const CHOKE: u32 = 19;
+    pub const VELOCITY: u32 = 20;
+    pub const LEVEL: u32 = 21;
+
+    pub const KEY_NAMES: &[&str] = &["fixed", "track"];
+    pub const REVERSE_NAMES: &[&str] = &["fwd", "rev"];
+    pub const CHOKE_NAMES: &[&str] = &["cut", "ring"];
+    pub const LEVEL_MAX: f32 = 2.0;
+    /// The sampling rate the character is tuned to: a classic 12-bit
+    /// drum machine's, which is why the default sits there.
+    pub const CLASSIC_RATE: f32 = 26_040.0;
+
+    /// How the decay falls, by CURVE: nought is a straight line, up is
+    /// the quick fall and long tail a drum has, down lingers then drops.
+    /// `p` is the decay's progress, `0..=1`; the result is the level.
+    pub fn fall(curve: f32, p: f32) -> f32 {
+        let p = p.clamp(0.0, 1.0);
+        let k = (curve.clamp(-1.0, 1.0) * 2.0).exp2();
+        (1.0 - p).powf(k)
+    }
+
+    pub const TABLE: &[ParamDef] = &[
+        ParamDef {
+            id: 0,
+            name: "tune",
+            min: -24.00,
+            max: 24.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 1,
+            name: "fine",
+            min: -100.00,
+            max: 100.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 2,
+            name: "key",
+            min: 0.00,
+            max: 1.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 3,
+            name: "start",
+            min: 0.00,
+            max: 1.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 4,
+            name: "reverse",
+            min: 0.00,
+            max: 1.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 5,
+            name: "attack",
+            min: 0.00,
+            max: 50.00,
+            default: 0.50,
+        },
+        ParamDef {
+            id: 6,
+            name: "decay",
+            min: 10.00,
+            max: 4000.00,
+            default: 600.00,
+        },
+        ParamDef {
+            id: 7,
+            name: "curve",
+            min: -1.00,
+            max: 1.00,
+            default: 0.30,
+        },
+        ParamDef {
+            id: 8,
+            name: "drop",
+            min: 0.00,
+            max: 36.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 9,
+            name: "drop ms",
+            min: 5.00,
+            max: 500.00,
+            default: 60.00,
+        },
+        ParamDef {
+            id: 10,
+            name: "punch",
+            min: 0.00,
+            max: 1.00,
+            default: 0.40,
+        },
+        ParamDef {
+            id: 11,
+            name: "body",
+            min: 0.00,
+            max: 1.00,
+            default: 0.30,
+        },
+        ParamDef {
+            id: 12,
+            name: "body hz",
+            min: 40.00,
+            max: 250.00,
+            default: 90.00,
+        },
+        ParamDef {
+            id: 13,
+            name: "snap",
+            min: 0.00,
+            max: 1.00,
+            default: 0.20,
+        },
+        ParamDef {
+            id: 14,
+            name: "bits",
+            min: 4.00,
+            max: 16.00,
+            default: 12.00,
+        },
+        ParamDef {
+            id: 15,
+            name: "rate",
+            min: 8000.00,
+            max: 48000.00,
+            default: 26040.00,
+        },
+        ParamDef {
+            id: 16,
+            name: "grit",
+            min: 1.00,
+            max: 32.00,
+            default: 1.50,
+        },
+        ParamDef {
+            id: 17,
+            name: "cutoff",
+            min: 40.00,
+            max: 20000.00,
+            default: 20000.00,
+        },
+        ParamDef {
+            id: 18,
+            name: "reso",
+            min: 0.50,
+            max: 12.00,
+            default: 0.70,
+        },
+        ParamDef {
+            id: 19,
+            name: "choke",
+            min: 0.00,
+            max: 1.00,
+            default: 0.00,
+        },
+        ParamDef {
+            id: 20,
+            name: "velocity",
+            min: 0.00,
+            max: 1.00,
+            default: 0.70,
+        },
+        ParamDef {
+            id: 21,
+            name: "level",
+            min: 0.00,
+            max: 2.00,
+            default: 0.90,
+        },
+    ];
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn ids_are_positions_and_the_fall_bends() {
+            for (i, def) in TABLE.iter().enumerate() {
+                assert_eq!(def.id, i as u32, "{}", def.name);
+            }
+            assert_eq!(TABLE.len(), 22);
+            assert!((fall(0.0, 0.5) - 0.5).abs() < 1e-6);
+            assert!(fall(1.0, 0.5) < 0.1, "a drum's fall is quick");
+            assert!(fall(-1.0, 0.5) > 0.8);
+            assert_eq!(fall(0.3, 1.0), 0.0);
+        }
+    }
+}
+
 /// sCOMP: a sine, squashed into a sound. See [`crate::scomp`].
 pub mod scomp {
     use super::ParamDef;

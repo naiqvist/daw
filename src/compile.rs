@@ -136,6 +136,7 @@ pub(crate) fn compile_chain(
             | DeviceState::Scomp(_)
             | DeviceState::Stab(_)
             | DeviceState::Quad(_)
+            | DeviceState::Brick(_)
             | DeviceState::Haze(_)
             | DeviceState::Sampler(_)
             | DeviceState::Kick(_)
@@ -631,6 +632,16 @@ pub(crate) fn build_graph_spec(
                         loop_len_beats,
                         params,
                     },
+                    DeviceState::Brick(params) => {
+                        let source = track.sampler_sources.get(&head.id);
+                        NodeSpec::Brick {
+                            notes,
+                            subloops: Vec::new(),
+                            loop_len_beats,
+                            path: source.map(|s| s.path.clone()).unwrap_or_default(),
+                            params,
+                        }
+                    }
                     DeviceState::Poly(params) => NodeSpec::Poly {
                         notes,
                         subloops: Vec::new(),

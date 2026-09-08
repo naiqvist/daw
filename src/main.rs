@@ -91,12 +91,12 @@ mod record;
 use focus::Focus;
 mod device_state;
 use device_state::{
-    DeviceInstance, DeviceState, EchoParams, acid_knobs, card_pages, clamp_knobs, device_edits,
-    device_is_discrete, device_is_log, device_value, disperser_knobs, echo_knobs, eq_knobs,
-    ferric_knobs, flint_knobs, gate_knobs, gauge_knobs, glue_knobs, lofi_knobs, loom_knobs,
-    phaser_knobs, poly_knobs, prism_knobs, quad_knobs, resyn_knobs, reverb_knobs, sat_knobs,
-    scomp_knobs, sheen_knobs, sibyl_knobs, sigil_knobs, stab_knobs, strip_knobs, synth_knobs,
-    tilt_knobs, tine_knobs, tone_knobs, umbra_knobs, unit_zoom, utility_knobs,
+    DeviceInstance, DeviceState, EchoParams, acid_knobs, brick_knobs, card_pages, clamp_knobs,
+    device_edits, device_is_discrete, device_is_log, device_value, disperser_knobs, echo_knobs,
+    eq_knobs, ferric_knobs, flint_knobs, gate_knobs, gauge_knobs, glue_knobs, lofi_knobs,
+    loom_knobs, phaser_knobs, poly_knobs, prism_knobs, quad_knobs, resyn_knobs, reverb_knobs,
+    sat_knobs, scomp_knobs, sheen_knobs, sibyl_knobs, sigil_knobs, stab_knobs, strip_knobs,
+    synth_knobs, tilt_knobs, tine_knobs, tone_knobs, umbra_knobs, unit_zoom, utility_knobs,
 };
 mod shell;
 use arrangement::*;
@@ -6063,6 +6063,7 @@ fn plockable_params(track: &Track) -> Vec<piano_roll::PlockParam> {
         DeviceKind::Scomp => daw::params::scomp::LEVEL,
         DeviceKind::Stab => daw::params::stab::LEVEL,
         DeviceKind::Quad => daw::params::quad::LEVEL,
+        DeviceKind::Brick => daw::params::brick::LEVEL,
         DeviceKind::Haze => daw::params::haze::LEVEL,
         DeviceKind::Sampler => daw::params::sampler::GAIN,
         DeviceKind::SineSynth => daw::params::seq::GAIN,

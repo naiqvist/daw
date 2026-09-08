@@ -976,6 +976,31 @@ impl Voices for crate::audio::quad::QuadVoices {
     }
 }
 
+/// The drum one-shot as an instrument the clock can play.
+impl Voices for crate::audio::brick::BrickVoices {
+    fn all_sound_off(&mut self) {
+        crate::audio::brick::BrickVoices::all_sound_off(self);
+    }
+    fn release_all(&mut self) {
+        crate::audio::brick::BrickVoices::release_all(self);
+    }
+    fn note_off(&mut self, pitch: u8) {
+        crate::audio::brick::BrickVoices::note_off(self, pitch);
+    }
+    fn note_on(&mut self, pitch: u8, vel: u8, age: u64) {
+        crate::audio::brick::BrickVoices::note_on(self, pitch, vel, age);
+    }
+    fn plock(&mut self, param: u32, value: Option<f32>) {
+        crate::audio::brick::BrickVoices::plock(self, param, value);
+    }
+    fn plock_glide(&mut self, param: u32, alpha: f32) {
+        crate::audio::brick::BrickVoices::plock_glide(self, param, alpha);
+    }
+    fn render(&mut self, out: &mut [f32], at: usize, gain: &mut Ramp) {
+        crate::audio::brick::BrickVoices::render(self, out, at, gain);
+    }
+}
+
 impl Voices for crate::audio::sampler::SamplerVoices {
     fn all_sound_off(&mut self) {
         crate::audio::sampler::SamplerVoices::all_sound_off(self);
@@ -2009,6 +2034,15 @@ pub enum Node {
         gain: f32,
         target_gain: f32,
     },
+    /// The drum one-shot sampler. Its file was loaded when the node
+    /// was built.
+    Brick {
+        events: Vec<SeqEvent>,
+        clock: PatternClock,
+        voices: Box<crate::audio::brick::BrickVoices>,
+        gain: f32,
+        target_gain: f32,
+    },
     /// The four-operator FM synth.
     Quad {
         events: Vec<SeqEvent>,
@@ -2732,6 +2766,7 @@ impl Node {
             | NodeSpec::Scomp { .. }
             | NodeSpec::Stab { .. }
             | NodeSpec::Quad { .. }
+            | NodeSpec::Brick { .. }
             | NodeSpec::Sampler { .. }
             | NodeSpec::Modulato { .. }
             | NodeSpec::Sat { .. }
@@ -2789,6 +2824,7 @@ impl Node {
             Node::Scomp { voices, .. } => Some(voices.readout()),
             Node::Stab { voices, .. } => Some(voices.readout()),
             Node::Quad { voices, .. } => Some(voices.readout()),
+            Node::Brick { voices, .. } => Some(voices.readout()),
             Node::Prism { core } => Some(core.readout()),
             Node::Gate { core } => Some(core.readout()),
             Node::Section { core } => Some(core.readout()),
@@ -3444,6 +3480,23 @@ impl Node {
                 }
             }
             Node::Quad {
+                events,
+                clock,
+                voices,
+                gain,
+                target_gain,
+            } => {
+                let mut ramp = Ramp::across(*gain, *target_gain, out_len);
+                clock.run(voices.as_mut(), events, out.l, ctx, &mut ramp);
+                *gain = *target_gain;
+                if let Some(r) = out.r.as_deref_mut() {
+                    let right = voices.right(out_len);
+                    for (d, s) in r.iter_mut().zip(right.iter()) {
+                        *d = *s;
+                    }
+                }
+            }
+            Node::Brick {
                 events,
                 clock,
                 voices,
@@ -4584,6 +4637,7 @@ impl Node {
             | Node::Scomp { clock, .. }
             | Node::Stab { clock, .. }
             | Node::Quad { clock, .. }
+            | Node::Brick { clock, .. }
             | Node::Poly { clock, .. }
             | Node::Loom { clock, .. }
             | Node::Haze { clock, .. }
@@ -5193,6 +5247,20 @@ impl Node {
                 }
                 voices.set_param(param, value);
             }
+            Node::Brick {
+                target_gain,
+                voices,
+                ..
+            } => {
+                let Some(value) = crate::params::clamp(crate::params::brick::TABLE, param, value)
+                else {
+                    return;
+                };
+                if param == crate::params::brick::LEVEL {
+                    *target_gain = value;
+                }
+                voices.set_param(param, value);
+            }
             Node::Poly {
                 target_gain,
                 voices,
@@ -5675,6 +5743,12 @@ fn resolve_timeline_spec(
             ..
         }
         | NodeSpec::Quad {
+            notes,
+            subloops,
+            loop_len_beats: None,
+            ..
+        }
+        | NodeSpec::Brick {
             notes,
             subloops,
             loop_len_beats: None,
@@ -6593,6 +6667,7 @@ impl NodeSpec {
             | NodeSpec::Scomp { notes, .. }
             | NodeSpec::Stab { notes, .. }
             | NodeSpec::Quad { notes, .. }
+            | NodeSpec::Brick { notes, .. }
             | NodeSpec::Poly { notes, .. }
             | NodeSpec::Loom { notes, .. }
             | NodeSpec::Haze { notes, .. }
@@ -7066,6 +7141,17 @@ pub enum NodeSpec {
         #[serde(default)]
         params: crate::audio::tine::TineParams,
     },
+    /// BRICK: the drum one-shot sampler. Its file is loaded at compile
+    /// as the sampler's is; an empty path compiles to a silent brick.
+    Brick {
+        notes: Vec<Note>,
+        subloops: Vec<SubLoop>,
+        loop_len_beats: Option<f64>,
+        #[serde(default)]
+        path: std::path::PathBuf,
+        #[serde(default)]
+        params: crate::audio::brick::BrickParams,
+    },
     /// QUAD: four-operator FM. Timeline-locked as `Tine` is; stereo out,
     /// the same on both sides.
     Quad {
@@ -7297,6 +7383,7 @@ impl GraphSpec {
                 | NodeSpec::Scomp { notes, .. }
                 | NodeSpec::Stab { notes, .. }
                 | NodeSpec::Quad { notes, .. }
+                | NodeSpec::Brick { notes, .. }
                 | NodeSpec::Poly { notes, .. }
                 | NodeSpec::Haze { notes, .. }
                 | NodeSpec::Kick { notes, .. }
@@ -8451,6 +8538,52 @@ impl GraphSpec {
                             crate::audio::quad::QuadParams::default().level
                         };
                         Node::Quad {
+                            events,
+                            clock: PatternClock::new(
+                                loop_len_beats
+                                    .map(|len| (len * samples_per_beat).round().max(0.0) as u64)
+                                    .unwrap_or(0),
+                                samples_per_beat,
+                            ),
+                            voices: Box::new(voices),
+                            gain,
+                            target_gain: gain,
+                        }
+                    }
+                    Some(NodeSpec::Brick {
+                        notes,
+                        subloops,
+                        loop_len_beats,
+                        path,
+                        params,
+                    }) => {
+                        let events = compile_events(
+                            notes,
+                            subloops,
+                            *loop_len_beats,
+                            samples_per_beat,
+                            plock_glide_samples,
+                        )?;
+                        // Green zone: the file, from the cache, at the
+                        // device's rate. A missing file is a silent brick.
+                        let material = if path.as_os_str().is_empty() {
+                            crate::audio::material::Material::empty()
+                        } else {
+                            crate::audio::material::load_cached(path, sample_rate)
+                                .unwrap_or_else(|_| crate::audio::material::Material::empty())
+                        };
+                        let voices = crate::audio::brick::BrickVoices::new(
+                            sample_rate as f32,
+                            block_frames,
+                            *params,
+                            material,
+                        );
+                        let gain = if params.level.is_finite() {
+                            params.level.clamp(0.0, crate::params::brick::LEVEL_MAX)
+                        } else {
+                            crate::audio::brick::BrickParams::default().level
+                        };
+                        Node::Brick {
                             events,
                             clock: PatternClock::new(
                                 loop_len_beats

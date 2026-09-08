@@ -229,6 +229,27 @@ impl QuadFace {
     }
 }
 
+/// What a BRICK card draws from: the knobs as the device holds them,
+/// and the file it hits.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BrickFace {
+    pub params: crate::audio::brick::BrickParams,
+    pub path: Option<std::path::PathBuf>,
+}
+
+impl BrickFace {
+    pub fn from_device(device: &Device) -> Self {
+        let mut params = crate::audio::brick::BrickParams::default();
+        for (id, value) in &device.overrides {
+            params.set(*id, *value);
+        }
+        Self {
+            params,
+            path: device.sample.clone(),
+        }
+    }
+}
+
 /// One device, as a column of the band.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Column {
@@ -258,6 +279,9 @@ pub struct Column {
     /// The routing-facing state for a QUAD card; absent on every other
     /// device.
     pub quad: Option<QuadFace>,
+    /// The hit-facing state for a BRICK card; absent on every other
+    /// device.
+    pub brick: Option<BrickFace>,
     pub rows: Vec<Row>,
     /// Which section of the console this column is, when it is one:
     /// drawn as a piece of the strip rather than as a card.
@@ -353,6 +377,7 @@ pub fn column(device: &Device) -> Column {
         scomp: (device.kind == DeviceKind::Scomp).then(|| ScompFace::from_device(device)),
         stab: (device.kind == DeviceKind::Stab).then(|| StabFace::from_device(device)),
         quad: (device.kind == DeviceKind::Quad).then(|| QuadFace::from_device(device)),
+        brick: (device.kind == DeviceKind::Brick).then(|| BrickFace::from_device(device)),
         section: match device.kind {
             crate::devices::DeviceKind::Console(kind) => Some(kind),
             _ => None,

@@ -683,6 +683,19 @@ fn voice_of(
         DeviceKind::Scomp => voice!(Scomp, crate::scomp::ScompParams, head),
         DeviceKind::Stab => voice!(Stab, crate::audio::stab::StabParams, head),
         DeviceKind::Quad => voice!(Quad, crate::audio::quad::QuadParams, head),
+        DeviceKind::Brick => {
+            let mut params = crate::audio::brick::BrickParams::default();
+            for (id, value) in &head.overrides {
+                params.set(*id, *value);
+            }
+            NodeSpec::Brick {
+                notes,
+                subloops: Vec::new(),
+                loop_len_beats,
+                path: head.sample.clone().unwrap_or_default(),
+                params,
+            }
+        }
         DeviceKind::Acid => voice!(Acid, crate::audio::acid::AcidParams, head),
         DeviceKind::Kick => voice!(Kick, crate::audio::kick::KickParams, head),
         DeviceKind::Snare => voice!(Snare, crate::audio::snare::SnareParams, head),
@@ -1216,6 +1229,7 @@ pub(crate) fn modulation_target_is_log(track: &Track, target: &str) -> bool {
         DeviceKind::Scomp => device::scomp::scomp_is_log(param),
         DeviceKind::Stab => device::stab::stab_is_log(param),
         DeviceKind::Quad => device::quad::quad_is_log(param),
+        DeviceKind::Brick => device::brick::brick_is_log(param),
         DeviceKind::Kick => device::kick::kick_is_log(param),
         DeviceKind::Snare => device::snare_is_log(param),
         DeviceKind::Tom => device::tom_is_log(param),

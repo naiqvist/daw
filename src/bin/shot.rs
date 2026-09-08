@@ -1332,6 +1332,40 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
             }
         }
         let _ = stage.apply(StageIntent::Mix);
+    } else if which.contains("brick") {
+        // BRICK on the first track with a synthesized kick — a tone
+        // falling from 180 Hz with a click on it — and the band open.
+        use daw::ui::stage::SampleData;
+        let id = stage
+            .song_mut()
+            .add_device(0, daw::devices::DeviceKind::Brick)
+            .expect("a brick");
+        let path = std::path::PathBuf::from("/shot/kick.wav");
+        if let Some(device) = stage.song_mut().device_mut(id) {
+            device.sample = Some(path.clone());
+            device.set(daw::params::brick::DROP, 12.0);
+            device.set(daw::params::brick::BODY, 0.5);
+        }
+        let rate = 48_000u32;
+        let frames = rate as usize / 3;
+        let samples: Vec<f32> = (0..frames)
+            .map(|i| {
+                let t = i as f32 / rate as f32;
+                let hz = 55.0 + 125.0 * (-t * 30.0).exp();
+                let env = (-t * 9.0).exp();
+                (0.9 * env * (t * hz * std::f32::consts::TAU).sin()
+                    + if i < 40 { 0.4 } else { 0.0 })
+                .clamp(-1.0, 1.0)
+            })
+            .collect();
+        stage.set_sample(SampleData::from_planar(
+            path,
+            std::sync::Arc::new(samples),
+            1,
+            frames as u64,
+            rate,
+        ));
+        let _ = stage.apply(StageIntent::Devices);
     } else if which.contains("quad") {
         // QUAD on the first track, a bright two-operator bell with a
         // pitch bend and the band open on it.
@@ -1921,6 +1955,11 @@ fn draw(which: &str, ui: &mut egui::Ui, theme: &Theme, subject: &mut Subject) {
             let mut state = device::quad::QuadUi::default();
             let mut page = 0;
             device::quad::quad_card(ui, theme, &mut state, &mut page, 2.0);
+        }
+        "brick" => {
+            let mut state = device::brick::BrickUi::default();
+            let mut page = 1;
+            device::brick::brick_card(ui, theme, &mut state, &mut page, 1.0);
         }
         "stab" => {
             let mut state = device::stab::StabUi::default();

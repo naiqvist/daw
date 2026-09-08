@@ -134,6 +134,10 @@ impl Default for Browser {
                                     load: DeviceKind::Quad,
                                 },
                                 BrowserItem {
+                                    name: "Brick",
+                                    load: DeviceKind::Brick,
+                                },
+                                BrowserItem {
                                     name: "Haze",
                                     load: DeviceKind::Haze,
                                 },

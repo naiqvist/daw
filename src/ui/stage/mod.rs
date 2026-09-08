@@ -2380,7 +2380,7 @@ impl Stage {
             track
                 .chain
                 .iter()
-                .find(|device| device.kind == DeviceKind::Sampler)?
+                .find(|device| matches!(device.kind, DeviceKind::Sampler | DeviceKind::Brick))?
                 .sample
                 .as_deref()?
         } else {
@@ -5023,10 +5023,12 @@ impl Stage {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
+        // A sampler or a brick at the head takes the file; anything else
+        // gets a sampler put in front of it.
         let head_is_sampler = self.song.tracks[track]
             .chain
             .first()
-            .is_some_and(|device| device.kind == DeviceKind::Sampler);
+            .is_some_and(|device| matches!(device.kind, DeviceKind::Sampler | DeviceKind::Brick));
         let id = if head_is_sampler {
             self.song.tracks[track].chain[0].id
         } else {

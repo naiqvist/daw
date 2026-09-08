@@ -12,6 +12,7 @@
 //! are the shared widgets, lifted through the palette and pumped here.
 
 mod band;
+mod brick_card;
 mod browser;
 mod callouts;
 mod chassis;

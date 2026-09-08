@@ -75,6 +75,7 @@
 pub mod acid;
 pub mod adjust;
 pub mod bezier;
+pub mod brick;
 pub mod card;
 pub mod clamp;
 pub mod design;

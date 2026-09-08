@@ -12,6 +12,7 @@
 
 pub mod acid;
 pub mod bounce;
+pub mod brick;
 pub mod clamp;
 pub mod console;
 pub mod eq;
