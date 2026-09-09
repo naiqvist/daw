@@ -134,6 +134,12 @@ pub enum StageIntent {
     /// Left and Right with the deck up: the previous or next cell.
     SlotStep(Step),
     HeroTool(u8),
+    /// Tab with a tall panel up: the keys move INTO the panel's own
+    /// controls, on to its next one, and back out to the cell strip.
+    /// `back` walks the other way.
+    HeroFocus {
+        back: bool,
+    },
     /// P in the song view: the session clip matrix, up or away.
     Matrix,
     /// Enter in the matrix: lay the cell's clip, or the row's scene, at
@@ -664,6 +670,8 @@ impl StageIntent {
             } => "coarse slot down",
             Self::StepKeys => "step keys",
             Self::Slide => "slide lock",
+            Self::HeroFocus { back: false } => "into the picture",
+            Self::HeroFocus { back: true } => "back through the picture",
             Self::HeroTool(verb) => {
                 crate::pages::hero_tools(crate::devices::DeviceKind::Sampler, "Sample")
                     .iter()
@@ -2652,6 +2660,10 @@ fn deck_bindings() -> Vec<(Mods, Key, StageIntent)> {
             .iter()
             .map(|t| (Mods::NONE, t.key, StageIntent::HeroTool(t.verb))),
     );
+    // A machine with a tall panel has controls the eight cells cannot
+    // hold. Tab is how the keys get to them, and how they come back.
+    out.push((Mods::SHIFT, Key::Tab, StageIntent::HeroFocus { back: true }));
+    out.push((Mods::NONE, Key::Tab, StageIntent::HeroFocus { back: false }));
     out.extend(cell_arrows());
     out
 }
@@ -2843,6 +2855,7 @@ fn family(intent: StageIntent) -> &'static str {
         | StageIntent::Window(_)
         | StageIntent::Slide
         | StageIntent::HeroTool(_)
+        | StageIntent::HeroFocus { .. }
         | StageIntent::Deck
         | StageIntent::SlotStep(_) => "pages",
         StageIntent::Lab

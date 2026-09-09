@@ -48,6 +48,7 @@ pub mod project;
 pub mod quad;
 pub mod resyn;
 pub mod ring;
+pub mod rom;
 pub mod sampler;
 pub mod scomp;
 pub mod sibyl;

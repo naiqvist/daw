@@ -98,18 +98,108 @@ pub struct HeroHandle {
     pub at: f32,
     pub value: f32,
 }
+/// A tall panel's LIST: a resident library the machine offers, and the
+/// row its cell is on. Plain data — the view windows it, draws the
+/// headings and hit-tests the rows; the machine only says what it has.
+///
+/// Not the rompler's alone: any machine with a library it browses rather
+/// than a file it loads can hand one of these over.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ListHero {
+    pub title: String,
+    pub rows: Vec<ListRow>,
+    /// The row the cell is on, and what a click has to move.
+    pub selected: usize,
+    /// The parameter a click writes: the cell the list IS.
+    pub param: u32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ListRow {
+    /// The heading this row sits under. A change of group starts a new
+    /// one; the same string repeated stays in the one above.
+    pub group: &'static str,
+    pub name: &'static str,
+    /// What the row is, in a few characters: "10z", "5z +7st", "3z shot".
+    pub detail: String,
+    /// Which of the machine's slots are on this row, for the margin:
+    /// "1", "2", "12", or empty.
+    pub tags: String,
+}
+
+impl ListHero {
+    /// The first row of the next group, or of the previous one, wrapping
+    /// like a sub-page does. ONE arithmetic: the category tools and the
+    /// cursor's own sideways step are the same movement.
+    pub fn group_jump(&self, forward: bool) -> usize {
+        let mut groups: Vec<&'static str> = Vec::new();
+        for row in &self.rows {
+            if !groups.contains(&row.group) {
+                groups.push(row.group);
+            }
+        }
+        if groups.is_empty() {
+            return 0;
+        }
+        let here = self
+            .rows
+            .get(self.selected)
+            .and_then(|row| groups.iter().position(|group| *group == row.group))
+            .unwrap_or(0);
+        let there = if forward {
+            (here + 1) % groups.len()
+        } else {
+            (here + groups.len() - 1) % groups.len()
+        };
+        let Some(wanted) = groups.get(there) else {
+            return self.selected;
+        };
+        self.rows
+            .iter()
+            .position(|row| row.group == *wanted)
+            .unwrap_or(self.selected)
+    }
+}
+
+/// One thing in a tall panel the CURSOR can stand on.
+///
+/// Derived from the panel the machine already hands over — a list offers
+/// its rows, a waveform offers its brackets — so a machine declares
+/// nothing twice, and a panel cannot grow a control the keyboard cannot
+/// reach.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum HeroTarget {
+    /// The rows of a list. The parameter is the cell the list IS.
+    Rows { param: u32 },
+    /// One handle on a waveform, at a fraction of the material.
+    Handle { param: u32, at: f32 },
+}
+
+impl HeroTarget {
+    pub fn param(self) -> u32 {
+        match self {
+            Self::Rows { param } | Self::Handle { param, .. } => param,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeroHeight {
     Band,
     Tall,
 }
 pub fn hero_height(kind: DeviceKind, page: &str) -> HeroHeight {
-    if kind == DeviceKind::Sampler
-        && matches!(page, "Sample" | "Loop" | "Time" | "File" | "Loop detail")
-    {
-        HeroHeight::Tall
-    } else {
-        HeroHeight::Band
+    match kind {
+        // The sampler's own waveform, and everything cut from it.
+        DeviceKind::Sampler
+            if matches!(page, "Sample" | "Loop" | "Time" | "File" | "Loop detail") =>
+        {
+            HeroHeight::Tall
+        }
+        // ROM browses a bank: the PCM list and the zone map of the row it
+        // is on, side by side, are the machine's front panel.
+        DeviceKind::Rom if matches!(page, "Osc 1" | "Osc 2") => HeroHeight::Tall,
+        _ => HeroHeight::Band,
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,6 +212,16 @@ pub fn hero_tools(kind: DeviceKind, page: &str) -> &'static [HeroTool] {
     use crate::ui::stage::key::Key;
     if hero_height(kind, page) != HeroHeight::Tall {
         return &[];
+    }
+    if kind == DeviceKind::Rom {
+        // The same keys the sampler's tools use, because the deck binds
+        // key to VERB once and for all; a verb's meaning is the
+        // machine's, and so is the word on it.
+        return if page == "Osc 2" {
+            ROM_TOOLS_TWO
+        } else {
+            ROM_TOOLS_ONE
+        };
     }
     &[
         HeroTool {
@@ -186,6 +286,65 @@ pub fn hero_tools(kind: DeviceKind, page: &str) -> &'static [HeroTool] {
         },
     ]
 }
+
+/// ROM's tools: browse the bank by category, hear the row's PCM, send it
+/// to the other oscillator, and pin it to its own root. Every one but
+/// HEAR is a parameter edit, so it undoes once and locks on a step.
+const ROM_TOOLS_ONE: &[HeroTool] = &[
+    HeroTool {
+        key: crate::ui::stage::key::Key::G,
+        word: "CAT <",
+        verb: 1,
+    },
+    HeroTool {
+        key: crate::ui::stage::key::Key::C,
+        word: "CAT >",
+        verb: 2,
+    },
+    HeroTool {
+        key: crate::ui::stage::key::Key::O,
+        word: "TO OSC 2",
+        verb: 6,
+    },
+    HeroTool {
+        key: crate::ui::stage::key::Key::P,
+        word: "HEAR",
+        verb: 7,
+    },
+    HeroTool {
+        key: crate::ui::stage::key::Key::T,
+        word: "FIXED",
+        verb: 8,
+    },
+];
+
+const ROM_TOOLS_TWO: &[HeroTool] = &[
+    HeroTool {
+        key: crate::ui::stage::key::Key::G,
+        word: "CAT <",
+        verb: 1,
+    },
+    HeroTool {
+        key: crate::ui::stage::key::Key::C,
+        word: "CAT >",
+        verb: 2,
+    },
+    HeroTool {
+        key: crate::ui::stage::key::Key::O,
+        word: "TO OSC 1",
+        verb: 6,
+    },
+    HeroTool {
+        key: crate::ui::stage::key::Key::P,
+        word: "HEAR",
+        verb: 7,
+    },
+    HeroTool {
+        key: crate::ui::stage::key::Key::T,
+        word: "FIXED",
+        verb: 8,
+    },
+];
 
 /// One curve of a picture. A LIT series is the selected cell's: drawn
 /// bright and washed to the baseline; the rest are thin lines.
@@ -401,6 +560,7 @@ pub fn key_table(kind: DeviceKind) -> Option<&'static KeyTable> {
         DeviceKind::Vox => Some(&crate::params::vox::KEYS),
         DeviceKind::Pipe => Some(&crate::params::pipe::KEYS),
         DeviceKind::Glass => Some(&crate::params::glass::KEYS),
+        DeviceKind::Rom => Some(&crate::params::rom::KEYS),
         DeviceKind::Acid => Some(&crate::params::acid::KEYS),
         _ => None,
     }
@@ -426,6 +586,8 @@ pub fn fx_sections(kind: DeviceKind) -> Option<&'static [SectionKind]> {
         DeviceKind::Vox => Some(crate::params::vox::FX_SECTIONS),
         DeviceKind::Pipe => Some(crate::params::pipe::FX_SECTIONS),
         DeviceKind::Glass => Some(crate::params::glass::FX_SECTIONS),
+        // ROM brings its ensemble; colour, echo and room from the lane.
+        DeviceKind::Rom => Some(crate::params::rom::FX_SECTIONS),
         // The acid has only its drive: colour, ducking, echo and room.
         DeviceKind::Acid => Some(&[
             SectionKind::Drive,
@@ -752,6 +914,43 @@ mod tests {
     use crate::lane::Lane;
     use crate::sequencing::Song;
     use std::collections::HashSet;
+
+    /// The list's sideways step: the first row of the next group, and
+    /// wrapping at both ends. One arithmetic for the category tools and
+    /// for the cursor.
+    #[test]
+    fn a_group_jump_lands_on_the_first_of_a_group_and_wraps() {
+        let row = |group: &'static str, name: &'static str| ListRow {
+            group,
+            name,
+            detail: String::new(),
+            tags: String::new(),
+        };
+        let list = |selected: usize| ListHero {
+            title: String::new(),
+            rows: vec![
+                row("A", "one"),
+                row("A", "two"),
+                row("B", "three"),
+                row("C", "four"),
+            ],
+            selected,
+            param: 0,
+        };
+        assert_eq!(list(0).group_jump(true), 2);
+        assert_eq!(list(1).group_jump(true), 2);
+        assert_eq!(list(2).group_jump(true), 3);
+        assert_eq!(list(3).group_jump(true), 0, "the last group wraps");
+        assert_eq!(list(0).group_jump(false), 3, "the first group wraps back");
+        assert_eq!(list(3).group_jump(false), 2);
+        let empty = ListHero {
+            title: String::new(),
+            rows: Vec::new(),
+            selected: 0,
+            param: 0,
+        };
+        assert_eq!(empty.group_jump(true), 0);
+    }
 
     #[test]
     fn derived_section_pages_cover_every_parameter_once() {

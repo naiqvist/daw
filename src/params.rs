@@ -24,6 +24,7 @@ pub mod pipe;
 pub mod pluck;
 pub mod prism_voice;
 pub mod ring;
+pub mod rom;
 pub mod table;
 pub mod vox;
 
@@ -13516,6 +13517,7 @@ mod tests {
         ("vox", vox::TABLE),
         ("pipe", pipe::TABLE),
         ("glass", glass::TABLE),
+        ("rom", rom::TABLE),
         ("limiter", limiter::TABLE),
         ("lofi", lofi::TABLE),
         ("sheen", sheen::TABLE),

@@ -156,6 +156,7 @@ pub(crate) fn compile_chain(
             | DeviceState::Vox(_)
             | DeviceState::Pipe(_)
             | DeviceState::Glass(_)
+            | DeviceState::Rom(_)
             | DeviceState::Acid(_) => {}
             DeviceState::Utility(params) => {
                 let node = spec.push(NodeSpec::Utility { params });
@@ -795,6 +796,12 @@ pub(crate) fn build_graph_spec(
                         params,
                     },
                     DeviceState::Pipe(params) => NodeSpec::Pipe {
+                        notes,
+                        subloops: Vec::new(),
+                        loop_len_beats,
+                        params,
+                    },
+                    DeviceState::Rom(params) => NodeSpec::Rom {
                         notes,
                         subloops: Vec::new(),
                         loop_len_beats,

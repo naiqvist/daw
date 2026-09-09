@@ -981,6 +981,10 @@ pub(crate) fn draw_device_card(
             ui.label("GLASS — edited on the stage's pages");
             Vec::new()
         }
+        DeviceState::Rom(_) => {
+            ui.label("ROM — edited on the stage's pages");
+            Vec::new()
+        }
         DeviceState::Sampler(params) => {
             let mut knobs = device::SamplerUi::from_engine(|id| params.get(id).unwrap_or_default());
             let face = samplers.get(&instance.id);

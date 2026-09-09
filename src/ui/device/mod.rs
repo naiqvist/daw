@@ -300,6 +300,7 @@ coverage_parameter_surface!(
 );
 coverage_parameter_surface!(vox, vox_norm, vox_value, vox_is_discrete, vox_is_log);
 coverage_parameter_surface!(pipe, pipe_norm, pipe_value, pipe_is_discrete, pipe_is_log);
+coverage_parameter_surface!(rom, rom_norm, rom_value, rom_is_discrete, rom_is_log);
 coverage_parameter_surface!(
     glass,
     glass_norm,

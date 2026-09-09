@@ -182,6 +182,10 @@ impl Default for Browser {
                                     load: DeviceKind::Glass,
                                 },
                                 BrowserItem {
+                                    name: "ROM",
+                                    load: DeviceKind::Rom,
+                                },
+                                BrowserItem {
                                     name: "Acid",
                                     load: DeviceKind::Acid,
                                 },

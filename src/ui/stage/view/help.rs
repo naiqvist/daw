@@ -125,9 +125,21 @@ impl super::super::Stage {
             let entry = entries
                 .iter()
                 .find(|e| e.scope == scope && e.intent == intent);
-            let meaning = entry
-                .map(|e| e.command.title.to_owned())
-                .unwrap_or_else(|| format!("{intent:?}"));
+            // A tool key means what the MACHINE on this track says it
+            // means: the verb is shared, the word is not.
+            let live_tool = match intent {
+                super::super::StageIntent::HeroTool(verb) => self
+                    .deck_hero_tools()
+                    .iter()
+                    .find(|tool| tool.verb == verb)
+                    .map(|tool| tool.word.to_lowercase()),
+                _ => None,
+            };
+            let meaning = live_tool.unwrap_or_else(|| {
+                entry
+                    .map(|e| e.command.title.to_owned())
+                    .unwrap_or_else(|| format!("{intent:?}"))
+            });
             let family = entry.map_or("other", |e| e.command.group);
             match by_family.iter_mut().find(|(name, _)| *name == family) {
                 Some((_, rows)) => rows.push(Row { chord, meaning }),

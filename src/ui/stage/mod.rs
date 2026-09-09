@@ -24,6 +24,7 @@
 mod arrangement;
 mod browser;
 mod chain;
+mod composer;
 mod deck;
 mod document;
 mod forge;
@@ -34,7 +35,6 @@ mod kiln;
 mod lab;
 mod matrix;
 mod midi_lab;
-mod composer;
 mod mixer;
 mod modulation;
 mod plock_editor;
@@ -4514,7 +4514,25 @@ impl Stage {
         let result = match intent {
             StageIntent::Page(key) => self.page(key, false),
             StageIntent::PageBack(key) => self.page(key, true),
-            StageIntent::Slot(slot) => self.select_deck_slot(slot),
+            StageIntent::Slot(slot) => {
+                self.leave_hero_focus();
+                self.select_deck_slot(slot)
+            }
+            // With the keys inside a tall panel, the arrows are the
+            // panel's cursor rather than the cell strip's: they follow
+            // the focused target's own axis. Escape hands them back
+            // before it closes the window, and a digit does too.
+            StageIntent::HeroFocus { back } => self.hero_focus(back),
+            StageIntent::Turn { up, coarse } if self.deck.hero_focus.is_some() => {
+                self.hero_focus_arrow(if up { Step::Up } else { Step::Down }, coarse)
+            }
+            StageIntent::SlotStep(step) if self.deck.hero_focus.is_some() => {
+                self.hero_focus_arrow(step, false)
+            }
+            StageIntent::Escape if self.deck.hero_focus.is_some() => {
+                self.leave_hero_focus();
+                Ok(())
+            }
             StageIntent::Turn { up, coarse } => self.turn(up, coarse),
             StageIntent::StepKeys => self.toggle_step_keys(),
             StageIntent::StepKey(key) => self.step_key_intent(key),

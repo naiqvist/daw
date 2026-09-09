@@ -920,6 +920,7 @@ coverage_voices!(crate::audio::pluck::PluckVoices);
 coverage_voices!(crate::audio::vox::VoxVoices);
 coverage_voices!(crate::audio::pipe::PipeVoices);
 coverage_voices!(crate::audio::glass::GlassVoices);
+coverage_voices!(crate::audio::rom::RomVoices);
 
 impl Voices for crate::audio::poly::PolyVoices {
     fn all_sound_off(&mut self) {
@@ -2393,6 +2394,15 @@ pub enum Node {
         gain: f32,
         target_gain: f32,
     },
+    /// ROM: the rompler. Stereo, like every instrument whose voices are
+    /// panned before they sum.
+    Rom {
+        events: Vec<SeqEvent>,
+        clock: PatternClock,
+        voices: Box<crate::audio::rom::RomVoices>,
+        gain: f32,
+        target_gain: f32,
+    },
     /// Modulato. Everything it owns is inside the effect; this arm is a
     /// wire and a discontinuity cut.
     Modulato {
@@ -2993,6 +3003,7 @@ impl Node {
             | NodeSpec::Vox { .. }
             | NodeSpec::Pipe { .. }
             | NodeSpec::Glass { .. }
+            | NodeSpec::Rom { .. }
             | NodeSpec::Poly { .. }
             | NodeSpec::Tine { .. }
             | NodeSpec::Scomp { .. }
@@ -3783,6 +3794,22 @@ impl Node {
                 }
             }
             Node::Glass {
+                events,
+                clock,
+                voices,
+                gain,
+                target_gain,
+            } => {
+                let mut ramp = Ramp::across(*gain, *target_gain, out_len);
+                clock.run(voices.as_mut(), events, out.l, ctx, &mut ramp);
+                *gain = *target_gain;
+                if let Some(right) = out.r.as_deref_mut() {
+                    for (dst, src) in right.iter_mut().zip(voices.right(out_len)) {
+                        *dst = *src;
+                    }
+                }
+            }
+            Node::Rom {
                 events,
                 clock,
                 voices,
@@ -5073,6 +5100,7 @@ impl Node {
             | Node::Vox { clock, .. }
             | Node::Pipe { clock, .. }
             | Node::Glass { clock, .. }
+            | Node::Rom { clock, .. }
             | Node::Clay { clock, .. } => Some(clock),
             _ => None,
         }
@@ -5320,6 +5348,13 @@ impl Node {
             }
             Node::Glass { voices, .. } => {
                 let Some(value) = crate::params::clamp(crate::params::glass::TABLE, param, value)
+                else {
+                    return;
+                };
+                voices.set_param(param, value);
+            }
+            Node::Rom { voices, .. } => {
+                let Some(value) = crate::params::clamp(crate::params::rom::TABLE, param, value)
                 else {
                     return;
                 };
@@ -6419,6 +6454,12 @@ fn resolve_timeline_spec(
             loop_len_beats: None,
             ..
         }
+        | NodeSpec::Rom {
+            notes,
+            subloops,
+            loop_len_beats: None,
+            ..
+        }
         | NodeSpec::Clay {
             notes,
             subloops,
@@ -7405,6 +7446,7 @@ impl NodeSpec {
             | NodeSpec::Vox { notes, .. }
             | NodeSpec::Pipe { notes, .. }
             | NodeSpec::Glass { notes, .. }
+            | NodeSpec::Rom { notes, .. }
             | NodeSpec::Clay { notes, .. } => Some(notes),
             _ => None,
         }
@@ -8138,6 +8180,13 @@ pub enum NodeSpec {
         #[serde(default)]
         params: crate::audio::glass::GlassParams,
     },
+    Rom {
+        notes: Vec<Note>,
+        subloops: Vec<SubLoop>,
+        loop_len_beats: Option<f64>,
+        #[serde(default)]
+        params: crate::audio::rom::RomParams,
+    },
     /// Modulato: chorus, flanger and vibrato, which are one effect.
     ///
     /// Stereo in, stereo out — the two sides run their own line and their
@@ -8223,6 +8272,7 @@ impl GraphSpec {
                 | NodeSpec::Vox { notes, .. }
                 | NodeSpec::Pipe { notes, .. }
                 | NodeSpec::Glass { notes, .. }
+                | NodeSpec::Rom { notes, .. }
                 | NodeSpec::Clay { notes, .. } => swing_note_starts(notes, grid, swing),
                 _ => {}
             }
@@ -9530,6 +9580,43 @@ impl GraphSpec {
                         voices.prepare(sample_rate as f32, block_frames, *params);
 
                         Node::Pipe {
+                            events,
+                            clock: PatternClock::new(
+                                loop_len_beats
+                                    .map(|len| (len * samples_per_beat).round().max(0.0) as u64)
+                                    .unwrap_or(0),
+                                samples_per_beat,
+                            ),
+                            voices: Box::new(voices),
+                            gain: 1.0,
+                            target_gain: 1.0,
+                        }
+                    }
+                    Some(NodeSpec::Rom {
+                        notes,
+                        subloops,
+                        loop_len_beats,
+                        params,
+                    }) => {
+                        let events = compile_events(
+                            notes,
+                            subloops,
+                            *loop_len_beats,
+                            samples_per_beat,
+                            plock_glide_samples,
+                        )?;
+                        let mut voices = crate::audio::rom::RomVoices::new();
+                        // The bank is built green-side, once per rate, and
+                        // shared by every ROM track: the audio thread never
+                        // opens a file.
+                        voices.prepare(
+                            sample_rate as f32,
+                            block_frames,
+                            *params,
+                            crate::audio::rom::bank::bank(sample_rate),
+                        );
+
+                        Node::Rom {
                             events,
                             clock: PatternClock::new(
                                 loop_len_beats

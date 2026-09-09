@@ -822,6 +822,7 @@ fn voice_for(
         DeviceKind::Vox => voice!(Vox, crate::audio::vox::VoxParams, head),
         DeviceKind::Pipe => voice!(Pipe, crate::audio::pipe::PipeParams, head),
         DeviceKind::Glass => voice!(Glass, crate::audio::glass::GlassParams, head),
+        DeviceKind::Rom => voice!(Rom, crate::audio::rom::RomParams, head),
         DeviceKind::Sampler => {
             let mut params = crate::audio::sampler::SamplerParams::default();
             for (id, value) in &head.overrides {
@@ -1445,6 +1446,7 @@ pub(crate) fn modulation_target_is_log(track: &Track, target: &str) -> bool {
         DeviceKind::Vox => crate::params::vox::LOG.contains(&param),
         DeviceKind::Pipe => crate::params::pipe::LOG.contains(&param),
         DeviceKind::Glass => crate::params::glass::LOG.contains(&param),
+        DeviceKind::Rom => crate::params::rom::LOG.contains(&param),
         DeviceKind::Limiter => device::limiter_is_log(param),
         DeviceKind::SineSynth => device::sine_synth_is_log(param),
         DeviceKind::Reverb => device::reverb::reverb_is_log(param),

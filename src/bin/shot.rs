@@ -518,6 +518,8 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
             daw::devices::DeviceKind::Pipe
         } else if which.contains("glass") {
             daw::devices::DeviceKind::Glass
+        } else if which.contains("rom") {
+            daw::devices::DeviceKind::Rom
         } else if which.contains("thump") {
             stage.song_mut().set_lane(0, daw::lane::Lane::Drum);
             daw::devices::DeviceKind::Thump
@@ -607,10 +609,14 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
             "vox",
             "pipe",
             "glass",
+            "rom",
         ]
         .iter()
         .any(|name| which.contains(name));
-        let page = if coverage_pose && which.contains("-fltr") {
+        let page = if coverage_pose && which.contains("-vintage") {
+            // F8 is the machine's own key: ROM keeps its converter there.
+            PageKey::All
+        } else if coverage_pose && which.contains("-fltr") {
             PageKey::Fltr
         } else if coverage_pose && which.contains("-amp") {
             PageKey::Amp
@@ -668,6 +674,11 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
         }
         if which.contains("stage-steps") {
             let _ = stage.apply(StageIntent::StepKeys);
+        }
+        // A pose with the keys inside the tall panel, so the cursor's
+        // place can be looked at rather than assumed.
+        if which.contains("-focus") {
+            let _ = stage.apply(StageIntent::HeroFocus { back: false });
         }
     } else if which.contains("midi") {
         stage.pose_midi_lab(which);

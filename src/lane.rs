@@ -216,6 +216,7 @@ const PLAIN: LaneKind = LaneKind {
         DeviceKind::Vox,
         DeviceKind::Pipe,
         DeviceKind::Glass,
+        DeviceKind::Rom,
     ],
     defaults: &[],
 };

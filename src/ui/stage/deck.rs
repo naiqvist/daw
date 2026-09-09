@@ -23,6 +23,10 @@ pub(super) struct Deck {
     pub(super) open: bool,
     pub(super) sample_zoom: bool,
     pub(super) sample_profile: u8,
+    /// Which of the tall panel's own targets has the keys, when the
+    /// panel has them at all. `None` is the ordinary state: the eight
+    /// cells are the control.
+    pub(super) hero_focus: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -224,6 +228,14 @@ impl Stage {
                 }
                 crate::audio::glass::hero(&params, page.title, selected)
             }
+            DeviceKind::Rom => {
+                let mut params = crate::audio::rom::RomParams::default();
+                for def in crate::params::rom::TABLE {
+                    let value = self.deck_machine_value(track, def.id)?;
+                    params.set(def.id, value);
+                }
+                crate::audio::rom::hero(&params, page.title, selected)
+            }
             DeviceKind::Thump => {
                 let mut params = crate::audio::thump::ThumpParams::default();
                 for (id, value) in &machine.overrides {
@@ -250,7 +262,7 @@ impl Stage {
     }
 
     /// The hero and cell describe the same addressed note, including a held lock.
-    fn deck_machine_value(&self, track: usize, param: u32) -> Option<f32> {
+    pub(super) fn deck_machine_value(&self, track: usize, param: u32) -> Option<f32> {
         let machine = self.song.tracks.get(track)?.machine.as_ref()?;
         let lock = self
             .addressing_steps()
@@ -271,6 +283,7 @@ impl Stage {
     pub(super) fn toggle_deck(&mut self) -> Result<(), RefusalReason> {
         if self.deck.open {
             self.deck.open = false;
+            self.deck.hero_focus = None;
             return Ok(());
         }
         let key = self.deck.lit.unwrap_or(PageKey::Trig);
@@ -285,6 +298,7 @@ impl Stage {
     /// memory for the next V.
     pub(super) fn close_deck(&mut self) {
         self.deck.open = false;
+        self.deck.hero_focus = None;
     }
 
     /// Left and Right with the deck up: the previous or next cell, with
@@ -332,6 +346,9 @@ impl Stage {
         };
         self.leave_rooms();
         self.chain = None;
+        // A different page is a different panel: the keys come back to
+        // the cells rather than standing on a target that has gone.
+        self.deck.hero_focus = None;
 
         // A key with nothing under it still lights, and the window says
         // so: a press is never refused, and the row never lies about

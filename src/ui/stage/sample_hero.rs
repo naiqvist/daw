@@ -38,11 +38,18 @@ impl Stage {
         let d = self.song.tracks.get(track)?.machine.as_ref()?;
         (d.kind == DeviceKind::Sampler).then_some(d.id)
     }
+    /// The track's machine, whatever kind it is. The tall panel, its
+    /// tools and their edits belong to the MACHINE — the sampler was
+    /// only the first one to want them.
+    pub(super) fn deck_hero_device(&self) -> Option<DeviceId> {
+        let track = self.deck_track()?;
+        Some(self.song.tracks.get(track)?.machine.as_ref()?.id)
+    }
     pub(super) fn deck_hero_height(&self) -> HeroHeight {
         let Some((_, page)) = self.selected_page() else {
             return HeroHeight::Band;
         };
-        let Some(id) = self.deck_sample_device() else {
+        let Some(id) = self.deck_hero_device() else {
             return HeroHeight::Band;
         };
         self.song.device(id).map_or(HeroHeight::Band, |d| {
@@ -56,7 +63,7 @@ impl Stage {
         let Some((_, page)) = self.selected_page() else {
             return &[];
         };
-        let Some(id) = self.deck_sample_device() else {
+        let Some(id) = self.deck_hero_device() else {
             return &[];
         };
         self.song
@@ -227,9 +234,13 @@ impl Stage {
     }
 
     pub(super) fn hero_edit(&mut self, edits: &[(u32, f32)]) -> Result<(), RefusalReason> {
-        let id = self
-            .deck_sample_device()
-            .ok_or(RefusalReason::Unavailable)?;
+        let id = self.deck_hero_device().ok_or(RefusalReason::Unavailable)?;
+        let spec = self
+            .song
+            .device(id)
+            .ok_or(RefusalReason::Empty)?
+            .kind
+            .spec();
         let steps = self.addressed_step_numbers();
         if self.addressing_steps()
             && !steps.is_empty()
@@ -239,7 +250,7 @@ impl Stage {
                 .iter()
                 .flat_map(|step| {
                     edits.iter().filter_map(move |(param, value)| {
-                        crate::params::clamp(p::TABLE, *param, *value).map(|value| {
+                        crate::params::clamp(spec.params, *param, *value).map(|value| {
                             crate::ui::sequencer::sequence::Intent::SetLock {
                                 tick: step * PATTERN_STEP_TICKS,
                                 device: None,
@@ -261,20 +272,239 @@ impl Stage {
             }
             self.remixed();
         }
-        if let Some((param, value)) = edits.last() {
-            let spec = DeviceKind::Sampler.spec();
-            if let Some(label) = spec.labels.get(*param as usize) {
-                self.touch = Some(Touch {
-                    device: spec.prefix,
-                    name: label.name,
-                    value: format!("{value:.3}"),
-                });
-            }
+        if let Some((param, value)) = edits.last()
+            && let Some(label) = spec.labels.get(*param as usize)
+        {
+            self.touch = Some(Touch {
+                device: spec.prefix,
+                name: label.name,
+                value: format!("{value:.3}"),
+            });
         }
         Ok(())
     }
 
+    /// The tall panel's LIST, when the machine on this page browses a
+    /// library. ROM's bank is the only one so far.
+    pub(super) fn deck_hero_list(&self) -> Option<crate::pages::ListHero> {
+        if !self.deck.open {
+            return None;
+        }
+        let (track, page) = self.selected_page()?;
+        let machine = self.song.tracks.get(track)?.machine.as_ref()?;
+        if machine.kind != DeviceKind::Rom {
+            return None;
+        }
+        let mut params = crate::audio::rom::RomParams::default();
+        for def in crate::params::rom::TABLE {
+            let value = self.deck_machine_value(track, def.id)?;
+            params.set(def.id, value);
+        }
+        crate::audio::rom::pcm_list(&params, page.title)
+    }
+
+    /// Everything in this page's tall panel the cursor can stand on, in
+    /// the order Tab walks them. Derived from the panel itself: a list
+    /// offers its rows, a waveform offers its brackets.
+    pub(super) fn deck_hero_targets(&self) -> Vec<crate::pages::HeroTarget> {
+        use crate::pages::HeroTarget;
+        if self.deck_hero_height() != HeroHeight::Tall {
+            return Vec::new();
+        }
+        if let Some(list) = self.deck_hero_list() {
+            return vec![HeroTarget::Rows { param: list.param }];
+        }
+        self.deck_hero()
+            .and_then(|hero| hero.waveform)
+            .map(|wave| {
+                wave.handles
+                    .iter()
+                    .map(|handle| HeroTarget::Handle {
+                        param: handle.param,
+                        at: handle.at,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The target the keys are on, if they are in the panel at all.
+    pub(super) fn deck_hero_focus(&self) -> Option<crate::pages::HeroTarget> {
+        let at = self.deck.hero_focus?;
+        self.deck_hero_targets().get(at).copied()
+    }
+
+    /// Tab: take the keys into the panel, then on to its next target,
+    /// then back out to the cell strip. Shift walks the other way.
+    pub(super) fn hero_focus(&mut self, back: bool) -> Result<(), RefusalReason> {
+        let targets = self.deck_hero_targets();
+        if targets.is_empty() {
+            return Err(RefusalReason::Unavailable);
+        }
+        self.deck.hero_focus = match (self.deck.hero_focus, back) {
+            (None, false) => Some(0),
+            (None, true) => Some(targets.len() - 1),
+            (Some(at), false) => (at + 1 < targets.len()).then_some(at + 1),
+            (Some(at), true) => at.checked_sub(1),
+        };
+        Ok(())
+    }
+
+    /// Escape, and every gesture that changes what the panel is showing:
+    /// the keys go back to the cells.
+    pub(super) fn leave_hero_focus(&mut self) -> bool {
+        self.deck.hero_focus.take().is_some()
+    }
+
+    /// The arrows, while the panel has the keys. They follow the
+    /// TARGET's own axis: a list is walked up and down and its groups
+    /// sideways; a bracket slides along the waveform it lives on, finely
+    /// with the horizontal arrows and in bigger steps with the vertical.
+    pub(super) fn hero_focus_arrow(
+        &mut self,
+        step: super::Step,
+        coarse: bool,
+    ) -> Result<(), RefusalReason> {
+        use super::Step;
+        let target = self.deck_hero_focus().ok_or(RefusalReason::Unavailable)?;
+        match target {
+            crate::pages::HeroTarget::Rows { param } => {
+                let list = self.deck_hero_list().ok_or(RefusalReason::Unavailable)?;
+                let last = list.rows.len().saturating_sub(1);
+                let to = match step {
+                    Step::Up if coarse => list.group_jump(false),
+                    Step::Down if coarse => list.group_jump(true),
+                    Step::Up => list.selected.saturating_sub(1),
+                    Step::Down => (list.selected + 1).min(last),
+                    Step::Left => list.group_jump(false),
+                    Step::Right => list.group_jump(true),
+                };
+                if to == list.selected {
+                    return Err(RefusalReason::Edge(step));
+                }
+                self.hero_edit(&[(param, to as f32)])?;
+                self.settle();
+                Ok(())
+            }
+            crate::pages::HeroTarget::Handle { param, at } => {
+                let grain = match step {
+                    Step::Up | Step::Down => 0.05,
+                    Step::Left | Step::Right => 0.005,
+                } * if coarse { 4.0 } else { 1.0 };
+                let to = match step {
+                    Step::Up | Step::Right => at + grain,
+                    Step::Down | Step::Left => at - grain,
+                };
+                if (to.clamp(0.0, 1.0) - at).abs() < f32::EPSILON {
+                    return Err(RefusalReason::Edge(step));
+                }
+                self.hero_set_handle(param, to.clamp(0.0, 1.0))?;
+                self.settle();
+                Ok(())
+            }
+        }
+    }
+
+    /// Pick a row of the list with the pointer: the same parameter edit
+    /// the PCM cell makes, so it undoes once and locks on a held step.
+    pub(super) fn hero_pick_row(&mut self, row: usize) -> Result<(), RefusalReason> {
+        let list = self.deck_hero_list().ok_or(RefusalReason::Unavailable)?;
+        if row >= list.rows.len() {
+            return Err(RefusalReason::Unavailable);
+        }
+        if row == list.selected {
+            return Ok(());
+        }
+        self.hero_edit(&[(list.param, row as f32)])?;
+        self.settle();
+        Ok(())
+    }
+
+    /// ROM's tools. The keys are the deck's; the meanings are ROM's.
+    /// Everything but HEAR is a parameter edit, so it undoes once and
+    /// lands as a lock when steps are held.
+    fn rom_hero_tool(&mut self, verb: u8) -> Result<(), RefusalReason> {
+        let (track, page) = self.selected_page().ok_or(RefusalReason::Unavailable)?;
+        let page = page.title;
+        if !crate::pages::hero_tools(DeviceKind::Rom, page)
+            .iter()
+            .any(|tool| tool.verb == verb)
+        {
+            return Err(RefusalReason::Unavailable);
+        }
+        use crate::params::rom as rp;
+        let second = page == "Osc 2";
+        let (mine, other, key) = if second {
+            (rp::PCM2, rp::PCM1, rp::KEY2)
+        } else {
+            (rp::PCM1, rp::PCM2, rp::KEY1)
+        };
+        let at = self
+            .deck_machine_value(track, mine)
+            .unwrap_or(0.0)
+            .round()
+            .max(0.0) as usize;
+        match verb {
+            // The category jump: what the cut CAT cell was for, as a key.
+            1 | 2 => {
+                let list = self.deck_hero_list().ok_or(RefusalReason::Unavailable)?;
+                let to = list.group_jump(verb == 2);
+                self.hero_edit(&[(mine, to as f32)])?;
+                self.settle();
+                Ok(())
+            }
+            // Layer what is under the cursor onto the other oscillator.
+            6 => {
+                self.hero_edit(&[(other, at as f32)])?;
+                self.settle();
+                let name = crate::audio::rom::bank::MULTIS
+                    .get(at)
+                    .map_or("", |multi| multi.name);
+                self.notice = Some(format!("{name} on osc {}", if second { 1 } else { 2 }));
+                Ok(())
+            }
+            // Hear the PCM itself, from the cache, with nothing else in
+            // the path: the one tool that is not an edit.
+            7 => {
+                let path =
+                    crate::audio::rom::audition_file(at, 48_000).ok_or(RefusalReason::Empty)?;
+                self.audition = Some(super::Audition::of(&path, 0.0, 1.0));
+                let name = crate::audio::rom::bank::MULTIS
+                    .get(at)
+                    .map_or("", |multi| multi.name);
+                self.notice = Some(format!("hear {name}"));
+                Ok(())
+            }
+            // Pin the sample to its own root, or let it track again.
+            8 => {
+                let tracking = self.deck_machine_value(track, key).unwrap_or(1.0) > 0.5;
+                self.hero_edit(&[(key, if tracking { 0.0 } else { 1.0 })])?;
+                self.settle();
+                self.notice = Some(
+                    if tracking {
+                        "fixed pitch"
+                    } else {
+                        "key tracking"
+                    }
+                    .to_owned(),
+                );
+                Ok(())
+            }
+            _ => Err(RefusalReason::Unavailable),
+        }
+    }
+
     pub(super) fn hero_tool(&mut self, verb: u8) -> Result<(), RefusalReason> {
+        // A machine with its own tools answers first: the sampler's
+        // PRINT must not fire on someone else's key.
+        if self
+            .deck_hero_device()
+            .and_then(|id| self.song.device(id))
+            .map(|device| device.kind)
+            == Some(DeviceKind::Rom)
+        {
+            return self.rom_hero_tool(verb);
+        }
         if verb == 11 && !self.deck_hero_tools().is_empty() {
             return self.request_sampler_print();
         }
@@ -691,7 +921,7 @@ impl Stage {
 mod tests {
     use super::*;
     use crate::pages::PageKey;
-    use crate::ui::stage::{SampleData, StageIntent};
+    use crate::ui::stage::{SampleData, StageIntent, Step};
     fn setup() -> Stage {
         let mut stage = Stage::new();
         let id = stage.song.add_device(0, DeviceKind::Sampler).unwrap();
@@ -709,6 +939,244 @@ mod tests {
         let _ = stage.apply(StageIntent::Page(PageKey::Src));
         stage
     }
+    /// THE KEYBOARD REACHES EVERY TARGET THE POINTER DOES. Tab walks
+    /// into the panel, through its controls, and back out to the cells;
+    /// every target it stands on moves with the arrows.
+    #[test]
+    fn tab_walks_every_panel_target_and_the_arrows_move_it() {
+        for (name, mut stage) in [("rom", rom_stage(0)), ("slice", setup())] {
+            let targets = stage.deck_hero_targets();
+            assert!(
+                !targets.is_empty(),
+                "{name} has a tall panel with no target"
+            );
+            assert!(stage.deck.hero_focus.is_none(), "{name} started inside");
+            for (at, target) in targets.iter().enumerate() {
+                assert_eq!(
+                    stage.apply(StageIntent::HeroFocus { back: false }),
+                    super::super::ApplyOutcome::Changed
+                );
+                assert_eq!(stage.deck_hero_focus(), Some(*target), "{name} target {at}");
+                // Every target answers an arrow along its own axis.
+                let before = stage.song.clone();
+                let moved = [Step::Down, Step::Up, Step::Left, Step::Right]
+                    .into_iter()
+                    .any(|step| {
+                        let _ = stage.hero_focus_arrow(step, false);
+                        stage.song != before
+                    });
+                assert!(moved, "{name} target {at} does not answer the arrows");
+            }
+            // One more Tab hands the keys back to the cell strip.
+            let _ = stage.apply(StageIntent::HeroFocus { back: false });
+            assert!(stage.deck.hero_focus.is_none(), "{name} never let go");
+        }
+    }
+
+    #[test]
+    fn the_cursor_walks_the_list_by_row_and_its_groups_sideways() {
+        use crate::params::rom as rp;
+        let mut stage = rom_stage(0);
+        let _ = stage.apply(StageIntent::HeroFocus { back: false });
+        let row = |stage: &Stage| rom_value(stage, rp::PCM1);
+
+        // Down and up are the list's own axis: one row at a time.
+        let _ = stage.hero_focus_arrow(Step::Down, false);
+        assert_eq!(row(&stage), 1.0);
+        let _ = stage.hero_focus_arrow(Step::Down, false);
+        assert_eq!(row(&stage), 2.0);
+        let _ = stage.hero_focus_arrow(Step::Up, false);
+        assert_eq!(row(&stage), 1.0);
+        // Sideways is by group, and so is a coarse turn.
+        let _ = stage.hero_focus_arrow(Step::Right, false);
+        assert_eq!(row(&stage), 3.0, "Right did not jump the group");
+        let _ = stage.hero_focus_arrow(Step::Up, true);
+        assert_eq!(row(&stage), 0.0, "a coarse turn is a group");
+        // The top of the list is an edge, not a wrap.
+        assert!(stage.hero_focus_arrow(Step::Up, false).is_err());
+        assert_eq!(row(&stage), 0.0);
+    }
+
+    /// Escape hands the keys back before it closes the window, and a
+    /// digit takes them to the cell it selects.
+    #[test]
+    fn the_keys_come_back_to_the_strip_by_escape_or_by_a_digit() {
+        let mut stage = rom_stage(0);
+        let _ = stage.apply(StageIntent::HeroFocus { back: false });
+        assert!(stage.deck_hero_focus().is_some());
+        let _ = stage.apply(StageIntent::Escape);
+        assert!(stage.deck_hero_focus().is_none(), "escape left the panel");
+        assert!(stage.deck.open, "escape closed the window too early");
+        let _ = stage.apply(StageIntent::Escape);
+        assert!(!stage.deck.open, "a second escape closes the window");
+
+        let mut stage = rom_stage(0);
+        let _ = stage.apply(StageIntent::HeroFocus { back: false });
+        let _ = stage.apply(StageIntent::Slot(3));
+        assert!(stage.deck_hero_focus().is_none());
+        assert_eq!(stage.deck.slot, 3);
+    }
+
+    /// With the keys on the strip, the arrows are the strip's: the
+    /// panel takes nothing it was not given.
+    #[test]
+    fn the_cell_strip_keeps_the_arrows_until_the_panel_is_asked_for() {
+        use crate::params::rom as rp;
+        let mut stage = rom_stage(0);
+        let _ = stage.apply(StageIntent::Slot(1));
+        let before = rom_value(&stage, rp::TUNE1);
+        let _ = stage.apply(StageIntent::Turn {
+            up: true,
+            coarse: false,
+        });
+        assert!(
+            rom_value(&stage, rp::TUNE1) > before,
+            "the cell's own turn was stolen"
+        );
+        assert_eq!(rom_value(&stage, rp::PCM1), 0.0, "the list moved instead");
+        // A page with no tall panel cannot be entered at all.
+        let mut band = rom_stage(2);
+        assert!(band.hero_focus(false).is_err());
+        assert!(band.deck_hero_focus().is_none());
+    }
+
+    /// ROM on the deck: the bank list, and tools whose keys are the
+    /// sampler's while their meanings are ROM's.
+    fn rom_stage(page_taps: usize) -> Stage {
+        let mut stage = Stage::new();
+        let _ = stage.song.add_device(0, DeviceKind::Rom).unwrap();
+        let _ = stage.apply(StageIntent::Page(PageKey::Src));
+        for _ in 0..page_taps {
+            let _ = stage.apply(StageIntent::Page(PageKey::Src));
+        }
+        stage
+    }
+
+    fn rom_value(stage: &Stage, param: u32) -> f32 {
+        stage.song.tracks[0]
+            .machine
+            .as_ref()
+            .map_or(0.0, |machine| machine.value(param))
+    }
+
+    #[test]
+    fn roms_oscillator_pages_are_tall_and_carry_the_bank() {
+        let stage = rom_stage(0);
+        assert_eq!(stage.deck_hero_height(), HeroHeight::Tall);
+        let list = stage.deck_hero_list().expect("the bank");
+        assert_eq!(list.rows.len(), crate::audio::rom::bank::MULTIS.len());
+        assert_eq!(list.selected, 0);
+        assert_eq!(list.param, crate::params::rom::PCM1);
+        // Both oscillators start on the first row, and the margin says so.
+        assert_eq!(list.rows[0].tags, "12");
+        let words: Vec<&str> = stage.deck_hero_tools().iter().map(|t| t.word).collect();
+        assert_eq!(words, ["CAT <", "CAT >", "TO OSC 2", "HEAR", "FIXED"]);
+        // The second page addresses the second oscillator.
+        let second = rom_stage(1);
+        assert_eq!(
+            second.deck_hero_list().map(|list| list.param),
+            Some(crate::params::rom::PCM2)
+        );
+        assert!(
+            second
+                .deck_hero_tools()
+                .iter()
+                .any(|tool| tool.word == "TO OSC 1")
+        );
+        // The Layer page is an ordinary band picture with no list.
+        let layer = rom_stage(2);
+        assert_eq!(layer.deck_hero_height(), HeroHeight::Band);
+        assert!(layer.deck_hero_list().is_none());
+        assert!(layer.deck_hero_tools().is_empty());
+    }
+
+    #[test]
+    fn the_category_tools_jump_by_group_wrap_and_undo_once() {
+        use crate::params::rom as rp;
+        let mut stage = rom_stage(0);
+        let before = stage.song.clone();
+        let _ = stage.apply(StageIntent::HeroTool(2));
+        assert_eq!(rom_value(&stage, rp::PCM1), 3.0, "CAT > left Tone");
+        let _ = stage.apply(StageIntent::HeroTool(2));
+        assert_eq!(rom_value(&stage, rp::PCM1), 0.0, "CAT > did not wrap");
+        let _ = stage.apply(StageIntent::HeroTool(1));
+        assert_eq!(rom_value(&stage, rp::PCM1), 3.0, "CAT < did not wrap back");
+        for _ in 0..3 {
+            let _ = stage.apply(StageIntent::Undo);
+        }
+        assert_eq!(stage.song, before, "each jump is one undo step");
+    }
+
+    #[test]
+    fn the_layer_tool_sends_the_row_across_and_fixed_pins_the_pitch() {
+        use crate::params::rom as rp;
+        let mut stage = rom_stage(0);
+        let id = stage.song.tracks[0].machine.as_ref().unwrap().id;
+        stage.song.device_mut(id).unwrap().set(rp::PCM1, 2.0);
+        let _ = stage.apply(StageIntent::HeroTool(6));
+        assert_eq!(rom_value(&stage, rp::PCM2), 2.0, "the row did not cross");
+        assert_eq!(rom_value(&stage, rp::PCM1), 2.0, "the source moved");
+        assert_eq!(stage.notice.as_deref(), Some("Octave on osc 2"));
+        // The list now marks the row for both oscillators.
+        let list = stage.deck_hero_list().expect("the bank");
+        assert_eq!(list.rows[2].tags, "12");
+
+        let _ = stage.apply(StageIntent::HeroTool(8));
+        assert_eq!(rom_value(&stage, rp::KEY1), 0.0, "FIXED did not pin");
+        let _ = stage.apply(StageIntent::HeroTool(8));
+        assert_eq!(rom_value(&stage, rp::KEY1), 1.0, "FIXED did not release");
+    }
+
+    /// HEAR plays the PCM straight from the cache and never renders one:
+    /// with a baked bank it points at the file, without one it says so.
+    #[test]
+    fn hear_reads_the_cache_and_writes_nothing() {
+        let mut stage = rom_stage(0);
+        let _ = stage.apply(StageIntent::HeroTool(7));
+        match stage.audition.as_ref() {
+            Some(audition) => assert!(
+                audition.path.exists(),
+                "the audition points at a file that is not there"
+            ),
+            None => assert!(
+                stage
+                    .notice
+                    .as_deref()
+                    .is_some_and(|notice| notice.contains("baked")),
+                "no audition and no word about why"
+            ),
+        }
+    }
+
+    /// A row is the PCM cell: picking one is the same edit, and the
+    /// sampler's own tools stay out of it.
+    #[test]
+    fn picking_a_row_moves_the_cell_and_undoes_once() {
+        use crate::params::rom as rp;
+        let mut stage = rom_stage(0);
+        let before = stage.song.clone();
+        let _ = stage.hero_pick_row(4);
+        assert_eq!(rom_value(&stage, rp::PCM1), 4.0);
+        let _ = stage.apply(StageIntent::Undo);
+        assert_eq!(stage.song, before, "a pick is one undo step");
+        // A row that is not there is refused, and the row already under
+        // the cursor is not an edit at all.
+        assert!(stage.hero_pick_row(99).is_err());
+        assert!(stage.hero_pick_row(0).is_ok());
+        assert_eq!(stage.song, before);
+    }
+
+    /// The sampler's PRINT lives on the same key as nothing of ROM's:
+    /// pressing it on a ROM track must refuse, not print a sampler.
+    #[test]
+    fn a_sampler_tool_does_not_fire_on_a_rom_track() {
+        let mut stage = rom_stage(0);
+        let before = stage.song.clone();
+        assert!(stage.hero_tool(11).is_err());
+        assert!(stage.hero_tool(0).is_err());
+        assert_eq!(stage.song, before);
+    }
+
     #[test]
     fn authored_slices_profiles_and_new_parameters_survive_roundtrip() {
         let mut stage = setup();

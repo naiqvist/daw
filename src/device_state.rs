@@ -268,6 +268,7 @@ pub enum DeviceState {
     Vox(daw::audio::vox::VoxParams),
     Pipe(daw::audio::pipe::PipeParams),
     Glass(daw::audio::glass::GlassParams),
+    Rom(daw::audio::rom::RomParams),
     Reverb(ReverbParams),
     Sat(SatParams),
     Lofi(LofiParams),
@@ -342,6 +343,7 @@ impl DeviceState {
             DeviceKind::Vox => Self::Vox(daw::audio::vox::VoxParams::default()),
             DeviceKind::Pipe => Self::Pipe(daw::audio::pipe::PipeParams::default()),
             DeviceKind::Glass => Self::Glass(daw::audio::glass::GlassParams::default()),
+            DeviceKind::Rom => Self::Rom(daw::audio::rom::RomParams::default()),
             DeviceKind::Reverb => Self::Reverb(ReverbParams::default()),
             DeviceKind::Sat => Self::Sat(SatParams::default()),
             DeviceKind::Lofi => Self::Lofi(LofiParams::default()),
@@ -404,6 +406,7 @@ impl DeviceState {
             Self::Vox(_) => DeviceKind::Vox,
             Self::Pipe(_) => DeviceKind::Pipe,
             Self::Glass(_) => DeviceKind::Glass,
+            Self::Rom(_) => DeviceKind::Rom,
             Self::Reverb(_) => DeviceKind::Reverb,
             Self::Sat(_) => DeviceKind::Sat,
             Self::Lofi(_) => DeviceKind::Lofi,
@@ -505,6 +508,9 @@ impl DeviceState {
                 .get(param as usize)
                 .map(|_| p.get(param)),
             Self::Glass(p) => daw::params::glass::TABLE
+                .get(param as usize)
+                .map(|_| p.get(param)),
+            Self::Rom(p) => daw::params::rom::TABLE
                 .get(param as usize)
                 .map(|_| p.get(param)),
             Self::Reverb(p) => match param {
@@ -643,6 +649,7 @@ impl DeviceState {
             Self::Vox(p) => p.set(param, value),
             Self::Pipe(p) => p.set(param, value),
             Self::Glass(p) => p.set(param, value),
+            Self::Rom(p) => p.set(param, value),
             Self::Reverb(p) => match param {
                 reverb::PREDELAY => p.predelay_ms = value,
                 reverb::SIZE => p.size = value,
@@ -1197,6 +1204,7 @@ pub fn device_norm(kind: DeviceKind, param: u32, value: f32) -> f32 {
         DeviceKind::Vox => device::vox_norm(param, value),
         DeviceKind::Pipe => device::pipe_norm(param, value),
         DeviceKind::Glass => device::glass_norm(param, value),
+        DeviceKind::Rom => device::rom_norm(param, value),
         DeviceKind::Limiter => device::limiter_norm(param, value),
         DeviceKind::Reverb => device::reverb_norm(param, value),
         DeviceKind::Sat => device::sat_norm(param, value),
@@ -1273,6 +1281,7 @@ pub fn device_is_discrete(kind: DeviceKind, param: u32) -> bool {
         DeviceKind::Vox => device::vox_is_discrete(param),
         DeviceKind::Pipe => device::pipe_is_discrete(param),
         DeviceKind::Glass => device::glass_is_discrete(param),
+        DeviceKind::Rom => device::rom_is_discrete(param),
         DeviceKind::Limiter => device::limiter_is_discrete(param),
         DeviceKind::Sat => device::sat_is_discrete(param),
         DeviceKind::Lofi => device::lofi_is_discrete(param),
@@ -1346,6 +1355,7 @@ pub fn device_is_log(kind: DeviceKind, param: u32) -> bool {
         DeviceKind::Vox => device::vox_is_log(param),
         DeviceKind::Pipe => device::pipe_is_log(param),
         DeviceKind::Glass => device::glass_is_log(param),
+        DeviceKind::Rom => device::rom_is_log(param),
         DeviceKind::Limiter => device::limiter_is_log(param),
         DeviceKind::SineSynth => device::sine_synth_is_log(param),
         DeviceKind::Sat => device::sat_is_log(param),
@@ -1418,6 +1428,7 @@ pub fn device_value(kind: DeviceKind, param: u32, norm: f32) -> f32 {
         DeviceKind::Vox => device::vox_value(param, norm),
         DeviceKind::Pipe => device::pipe_value(param, norm),
         DeviceKind::Glass => device::glass_value(param, norm),
+        DeviceKind::Rom => device::rom_value(param, norm),
         DeviceKind::Limiter => device::limiter_value(param, norm),
         DeviceKind::Reverb => device::reverb_value(param, norm),
         DeviceKind::Sat => device::sat_value(param, norm),

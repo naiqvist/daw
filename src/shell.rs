@@ -23,11 +23,15 @@
 //! that changing the shell does not silently discard a machine's
 //! preferences.
 //!
-//! # The frame post pass is blank
+//! # The two passes over a finished frame
 //!
-//! It copies the finished frame to the swapchain unchanged. The stage keeps
-//! its CRT material in a second, explicitly registered screen-only pass; the
-//! old whole-frame treatment is not involved.
+//! The frame pass copies the offscreen to the swapchain and, on the DARK
+//! ground, carries the whole-field treatment with it: bloom, phosphor
+//! bleed, scanlines, a vignette and static grain. On the light ground
+//! every one of those terms is zero and the pass is the plain copy —
+//! see [`post::draw`]. The stage's per-aperture CRT material is a
+//! second, explicitly registered screen-only pass, which the light
+//! ground does not register at all.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -435,6 +439,7 @@ impl<A: Host> Shell<A> {
             live.offscreen.size,
             live.offscreen.generation,
             &target,
+            post::ground_is_light(&ctx),
         );
         live.screens.draw(
             &live.device,

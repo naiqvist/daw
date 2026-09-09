@@ -236,7 +236,8 @@ impl Stage {
             )
             .shrink2(egui::vec2(4.0, 4.0));
             if index == self.deck_selected_slot() {
-                if self.deck_hero_height() == crate::pages::HeroHeight::Tall {
+                let away = self.deck_hero_focus().is_some();
+                if self.deck_hero_height() == crate::pages::HeroHeight::Tall && !away {
                     crate::ui::nav_cursor::claim(
                         painter,
                         ("material-cell", index),
@@ -249,7 +250,10 @@ impl Stage {
                 painter.rect_stroke(
                     cell,
                     0.0,
-                    egui::Stroke::new(1.5, c.bright),
+                    egui::Stroke::new(
+                        if away { 1.0 } else { 1.5 },
+                        if away { c.dim } else { c.bright },
+                    ),
                     egui::StrokeKind::Inside,
                 );
             }
@@ -357,6 +361,12 @@ impl Stage {
             egui::StrokeKind::Inside,
         );
         let plot = panel.shrink(6.0);
+        // A machine that browses a library gets the left of the panel for
+        // its list; the picture keeps the right and is drawn by the same
+        // one routine as every other machine's.
+        let list = self.deck_hero_list();
+        let layout = list.as_ref().map(|_| ListLayout::of(plot));
+        let plot = layout.as_ref().map_or(plot, |layout| layout.map);
         if plot.is_positive() {
             for quarter in 1..4 {
                 let x = plot.left() + plot.width() * quarter as f32 / 4.0;
@@ -393,8 +403,230 @@ impl Stage {
         if let Some(hero) = self.deck_hero()
             && plot.is_positive()
         {
-            draw_hero(&painter, plot, &hero);
+            draw_hero(
+                &painter,
+                plot,
+                &hero,
+                match self.deck_hero_focus() {
+                    Some(crate::pages::HeroTarget::Handle { param, .. }) => Some(param),
+                    _ => None,
+                },
+            );
         }
+        if let (Some(list), Some(layout)) = (&list, &layout) {
+            draw_list_hero(
+                &painter,
+                layout,
+                list,
+                self.deck_hero_tools(),
+                self.deck_hero_focus().is_some(),
+            );
+        }
+    }
+}
+
+/// The tall panel when a machine browses a library: the list on the
+/// left, the machine's ordinary picture on the right, tools underneath.
+pub(super) struct ListLayout {
+    pub(super) list: egui::Rect,
+    pub(super) map: egui::Rect,
+    pub(super) tools: egui::Rect,
+    pub(super) row_h: f32,
+}
+
+impl ListLayout {
+    pub(super) fn of(plot: egui::Rect) -> Self {
+        let tools = egui::Rect::from_min_max(
+            egui::pos2(plot.left(), plot.bottom() - 22.0),
+            plot.right_bottom(),
+        );
+        let body = egui::Rect::from_min_max(
+            plot.min + egui::vec2(0.0, 14.0),
+            egui::pos2(plot.right(), tools.top() - 6.0),
+        );
+        let width = (body.width() * 0.38).clamp(140.0, 320.0);
+        let list = egui::Rect::from_min_max(
+            body.min,
+            egui::pos2((body.left() + width).min(body.right()), body.bottom()),
+        );
+        let map = egui::Rect::from_min_max(
+            egui::pos2((list.right() + 14.0).min(body.right()), body.top()),
+            body.max,
+        );
+        Self {
+            list,
+            map,
+            tools,
+            row_h: 15.0,
+        }
+    }
+
+    /// How many lines fit.
+    pub(super) fn visible(&self) -> usize {
+        (self.list.height() / self.row_h).floor().max(1.0) as usize
+    }
+
+    /// The first line drawn, so the selected row is on screen and near
+    /// the middle of a long list.
+    pub(super) fn window(&self, lines: &[ListLine], selected: usize) -> usize {
+        let visible = self.visible();
+        if lines.len() <= visible {
+            return 0;
+        }
+        let at = lines
+            .iter()
+            .position(|line| *line == ListLine::Row(selected))
+            .unwrap_or(0);
+        at.saturating_sub(visible / 2)
+            .min(lines.len().saturating_sub(visible))
+    }
+
+    /// The rectangle of one drawn line.
+    pub(super) fn line_rect(&self, slot: usize) -> egui::Rect {
+        egui::Rect::from_min_size(
+            self.list.min + egui::vec2(0.0, slot as f32 * self.row_h),
+            egui::vec2(self.list.width(), self.row_h),
+        )
+    }
+}
+
+/// One line of the panel: a group's heading, or one of its rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ListLine {
+    Head(&'static str),
+    Row(usize),
+}
+
+/// The panel's lines: a group heading is a line of its own, and so is
+/// every row. ONE function, so the pointer and the paint can never
+/// disagree about what is where.
+pub(super) fn list_lines(rows: &[crate::pages::ListRow]) -> Vec<ListLine> {
+    let mut out = Vec::new();
+    let mut group = "";
+    for (at, row) in rows.iter().enumerate() {
+        if row.group != group {
+            group = row.group;
+            out.push(ListLine::Head(group));
+        }
+        out.push(ListLine::Row(at));
+    }
+    out
+}
+
+fn draw_list_hero(
+    painter: &egui::Painter,
+    layout: &ListLayout,
+    list: &crate::pages::ListHero,
+    tools: &[crate::pages::HeroTool],
+    focused: bool,
+) {
+    let c = palette::colours();
+    let font = egui::FontId::new(11.0, egui::FontFamily::Name(PROFONT.into()));
+    let small = egui::FontId::new(9.0, egui::FontFamily::Name(PROFONT.into()));
+    painter.text(
+        egui::pos2(layout.list.right(), layout.list.top() - 13.0),
+        egui::Align2::RIGHT_TOP,
+        &list.title,
+        small.clone(),
+        c.dim,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(layout.list.right() + 7.0, layout.list.top()),
+            egui::pos2(layout.list.right() + 7.0, layout.list.bottom()),
+        ],
+        egui::Stroke::new(1.0, c.edge),
+    );
+    let lines = list_lines(&list.rows);
+    let first = layout.window(&lines, list.selected);
+    let body = painter.with_clip_rect(painter.clip_rect().intersect(layout.list));
+    for (slot, line) in lines.iter().skip(first).take(layout.visible()).enumerate() {
+        let rect = layout.line_rect(slot);
+        let at = match line {
+            ListLine::Head(group) => {
+                body.text(
+                    rect.left_top() + egui::vec2(1.0, 2.0),
+                    egui::Align2::LEFT_TOP,
+                    group.to_uppercase(),
+                    small.clone(),
+                    c.dim,
+                );
+                continue;
+            }
+            ListLine::Row(at) => *at,
+        };
+        let Some(row) = list.rows.get(at) else {
+            continue;
+        };
+        let chosen = at == list.selected;
+        if chosen && focused {
+            // The app's own cursor, so the keys are visibly HERE and not
+            // on the cell strip below.
+            crate::ui::nav_cursor::claim(
+                painter,
+                ("hero-row", at),
+                rect,
+                crate::ui::nav_cursor::Kind::Row,
+                crate::ui::nav_cursor::Layer::Overlay,
+                c.bright,
+            );
+        }
+        if chosen {
+            body.rect_filled(rect, 0.0, c.bright.linear_multiply(0.16));
+            body.rect_stroke(
+                rect,
+                0.0,
+                egui::Stroke::new(1.0, c.bright),
+                egui::StrokeKind::Inside,
+            );
+        }
+        let ink = if chosen { c.bright } else { c.fg };
+        body.text(
+            rect.left_top() + egui::vec2(22.0, 1.0),
+            egui::Align2::LEFT_TOP,
+            row.name,
+            font.clone(),
+            ink,
+        );
+        if !row.tags.is_empty() {
+            // Which oscillators are on this row, in the margin. The
+            // same size as the name: it is read as often.
+            body.text(
+                rect.left_top() + egui::vec2(3.0, 1.0),
+                egui::Align2::LEFT_TOP,
+                &row.tags,
+                font.clone(),
+                if chosen { c.bright } else { c.select },
+            );
+        }
+        body.text(
+            rect.right_top() + egui::vec2(-2.0, 3.0),
+            egui::Align2::RIGHT_TOP,
+            &row.detail,
+            small.clone(),
+            c.dim,
+        );
+    }
+    if lines.len() > layout.visible() {
+        // A list longer than the panel says so, rather than pretending
+        // the rows below do not exist.
+        body.text(
+            layout.list.right_bottom() + egui::vec2(-2.0, -11.0),
+            egui::Align2::RIGHT_TOP,
+            format!("{}/{}", list.selected + 1, list.rows.len()),
+            small.clone(),
+            c.dim,
+        );
+    }
+    let width = layout.tools.width() / tools.len().max(1) as f32;
+    for (at, tool) in tools.iter().enumerate() {
+        painter.text(
+            layout.tools.min + egui::vec2(at as f32 * width + 2.0, 4.0),
+            egui::Align2::LEFT_TOP,
+            format!("{} {}", tool.key.name(), tool.word),
+            small.clone(),
+            c.dim,
+        );
     }
 }
 
@@ -402,9 +634,14 @@ impl Stage {
 /// dashed verticals, every series a line and the lit ones washed to the
 /// baseline strip by strip (a convex fill of a concave curve would be a
 /// wedge), corner marks on the live curve.
-fn draw_hero(painter: &egui::Painter, plot: egui::Rect, hero: &crate::pages::Hero) {
+fn draw_hero(
+    painter: &egui::Painter,
+    plot: egui::Rect,
+    hero: &crate::pages::Hero,
+    focus: Option<u32>,
+) {
     if let Some(wave) = &hero.waveform {
-        draw_wave_hero(painter, plot, &hero.title, wave);
+        draw_wave_hero(painter, plot, &hero.title, wave, focus);
         return;
     }
     let c = palette::colours();
@@ -610,6 +847,44 @@ impl Stage {
         let Some(hero) = self.deck_hero() else {
             return;
         };
+        if let Some(list) = self.deck_hero_list() {
+            let layout = ListLayout::of(self.deck_wave_rect(field));
+            let lines = list_lines(&list.rows);
+            let first = layout.window(&lines, list.selected);
+            for (slot, line) in lines.iter().skip(first).take(layout.visible()).enumerate() {
+                let ListLine::Row(row) = line else { continue };
+                let response = ui
+                    .interact(
+                        layout.line_rect(slot),
+                        egui::Id::new(("hero-row", *row)),
+                        egui::Sense::click(),
+                    )
+                    .affords(Affords::Press);
+                if response.clicked() {
+                    let _ = self.hero_pick_row(*row);
+                }
+            }
+            let tools = self.deck_hero_tools();
+            let width = layout.tools.width() / tools.len().max(1) as f32;
+            for (at, tool) in tools.iter().enumerate() {
+                let cell = egui::Rect::from_min_size(
+                    layout.tools.min + egui::vec2(at as f32 * width, 0.0),
+                    egui::vec2(width, layout.tools.height()),
+                );
+                if ui
+                    .interact(
+                        cell,
+                        egui::Id::new(("hero-tool", tool.verb)),
+                        egui::Sense::click(),
+                    )
+                    .affords(Affords::Press)
+                    .clicked()
+                {
+                    let _ = self.apply(crate::ui::stage::StageIntent::HeroTool(tool.verb));
+                }
+            }
+            return;
+        }
         let Some(wave) = hero.waveform else {
             return;
         };
@@ -697,6 +972,7 @@ fn draw_wave_hero(
     plot: egui::Rect,
     title: &str,
     data: &crate::pages::WaveHero,
+    focus: Option<u32>,
 ) {
     let c = palette::colours();
     let layout = WaveLayout::of(plot);
@@ -761,6 +1037,22 @@ fn draw_wave_hero(
         c.bright,
         c.bright.linear_multiply(0.3),
     );
+    if let Some(param) = focus
+        && let Some(handle) = data.handles.iter().find(|handle| handle.param == param)
+    {
+        let at = x(handle.at);
+        crate::ui::nav_cursor::claim(
+            painter,
+            ("hero-handle", param),
+            egui::Rect::from_min_max(
+                egui::pos2(at - 7.0, layout.wave.top()),
+                egui::pos2(at + 7.0, layout.wave.bottom()),
+            ),
+            crate::ui::nav_cursor::Kind::Cell,
+            crate::ui::nav_cursor::Layer::Overlay,
+            c.bright,
+        );
+    }
     for (i, at) in data.slices.iter().enumerate() {
         let at = x(*at);
         body.line_segment(

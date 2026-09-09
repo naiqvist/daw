@@ -55,6 +55,8 @@ pub enum DeviceKind {
     Vox,
     Pipe,
     Glass,
+    /// ROM: the rompler. Factory multisamples, baked from recipes.
+    Rom,
     Reverb,
     Sat,
     Lofi,
@@ -329,6 +331,15 @@ pub static DEVICES: &[DeviceSpec] = &[
         prefix: "pipe",
         params: daw::params::pipe::TABLE,
         labels: daw::params::pipe::LABELS,
+    },
+    DeviceSpec {
+        kind: DeviceKind::Rom,
+        name: "rom",
+        instrument: true,
+        family: Family::Sampling,
+        prefix: "rom",
+        params: daw::params::rom::TABLE,
+        labels: daw::params::rom::LABELS,
     },
     DeviceSpec {
         kind: DeviceKind::Glass,

@@ -16,6 +16,7 @@ mod brick_card;
 mod browser;
 mod callouts;
 mod chassis;
+mod composer;
 mod deck;
 mod desk;
 mod face;
@@ -31,11 +32,12 @@ mod lattice;
 mod log;
 mod matrix;
 mod midi_lab;
-mod composer;
 mod mixer;
 mod modulation;
 mod palette;
 mod quad_card;
+#[cfg(test)]
+mod rom_tests;
 mod room;
 mod sample;
 mod sampler_card;
@@ -217,6 +219,13 @@ impl Stage {
         // The console's colours follow the ground: the light file reads
         // while the ground is turned over.
         palette::set_polarity(self.polarity);
+        // And so does the glass. The whole-field treatment is an
+        // emissive idea; on paper there is no tube to simulate, so the
+        // shell hands the light ground the frame as it was authored.
+        crate::shell::post::set_ground_light(
+            ui.ctx(),
+            self.polarity == crate::design::Polarity::Light,
+        );
         let utility_open = self.utility.is_open();
 
         // `:` summons the palette. Checked before anything else reads the
