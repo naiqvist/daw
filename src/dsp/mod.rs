@@ -90,6 +90,8 @@ pub type LaneFrame = [f32; LANES];
 
 pub mod adsr;
 pub mod arith;
+pub mod coverage_physical;
+pub mod coverage_spine;
 pub mod crossover;
 pub mod delay;
 pub mod desk;
@@ -107,3 +109,9 @@ pub mod pan;
 pub mod ramps;
 pub mod reverb;
 pub mod shaper;
+
+pub mod sample_read;
+
+pub mod bessel;
+pub mod contact;
+pub mod modal;

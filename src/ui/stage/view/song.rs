@@ -339,7 +339,7 @@ impl super::super::Stage {
                     painter.text(
                         egui::pos2(rect.min.x + 4.0, rect.center().y),
                         egui::Align2::LEFT_CENTER,
-                        format!("{:02}", block.pattern_id.0),
+                        self.song.tag_of(block.pattern_id),
                         font.clone(),
                         c.fg,
                     );

@@ -59,10 +59,14 @@ use crate::dsp::lofi::Downsampler;
 use crate::dsp::ramps::Fade;
 use crate::dsp::shaper::{Mode as ShapeMode, Oversampler2x, Waveshaper};
 use crate::params::sampler as sp;
+mod advanced;
+mod picture;
+use crate::dsp::sample_read::SampleReader;
+pub use picture::hero;
 
 /// Voices. Eight is what a chopped break needs and twice what a bassline
 /// does; the cost of one is a gather and two filters.
-pub const VOICES: usize = 8;
+pub const VOICES: usize = 16;
 
 /// Control-chunk length, in samples. 32 at 48 kHz is 0.67 ms — the same
 /// number `kick.rs` and `poly.rs` use, for the same reason.
@@ -128,6 +132,42 @@ pub struct SamplerParams {
     /// The slice a note plays in slice mode, from one. Locked per trig
     /// like any other row; the note itself is a pitch against the root.
     pub slice: f32,
+    pub playback: f32,
+    pub time: f32,
+    pub speed: f32,
+    pub window_ms: f32,
+    pub transient: f32,
+    pub loop_size: f32,
+    pub loop_fade: f32,
+    pub scan: f32,
+    pub travel: f32,
+    pub motion_mode: f32,
+    pub loop_units: f32,
+    pub loop_exit: f32,
+    pub play_mode: f32,
+    pub voice_count: f32,
+    pub glide_ms: f32,
+    pub spread: f32,
+    pub env_pitch: f32,
+    pub env_position: f32,
+    pub env_size: f32,
+    pub env_filter: f32,
+    pub start_jitter: f32,
+    pub pitch_jitter: f32,
+    pub seed: f32,
+    pub slip: f32,
+    pub attack_shape: f32,
+    pub filter_slope: f32,
+    pub comb_focus: f32,
+    pub comb_feed: f32,
+    pub comb_damp: f32,
+    pub comb_mix: f32,
+    pub source_beats: f32,
+    pub fit_beats: f32,
+    pub slice_thru: f32,
+    pub hard: f32,
+    pub sense: f32,
+    pub min_gap_ms: f32,
 }
 
 impl Default for SamplerParams {
@@ -174,6 +214,42 @@ impl Default for SamplerParams {
             gain_db: at(sp::GAIN),
             pan: at(sp::PAN),
             slice: at(sp::SLICE),
+            playback: at(sp::PLAYBACK),
+            time: at(sp::TIME),
+            speed: at(sp::SPEED),
+            window_ms: at(sp::WINDOW),
+            transient: at(sp::TRANSIENT),
+            loop_size: at(sp::LOOP_SIZE),
+            loop_fade: at(sp::LOOP_FADE),
+            scan: at(sp::SCAN),
+            travel: at(sp::TRAVEL),
+            motion_mode: at(sp::MOTION_MODE),
+            loop_units: at(sp::LOOP_UNITS),
+            loop_exit: at(sp::LOOP_EXIT),
+            play_mode: at(sp::PLAY_MODE),
+            voice_count: at(sp::VOICE_COUNT),
+            glide_ms: at(sp::GLIDE),
+            spread: at(sp::SPREAD),
+            env_pitch: at(sp::ENV_PITCH),
+            env_position: at(sp::ENV_POSITION),
+            env_size: at(sp::ENV_SIZE),
+            env_filter: at(sp::ENV_FILTER),
+            start_jitter: at(sp::START_JITTER),
+            pitch_jitter: at(sp::PITCH_JITTER),
+            seed: at(sp::SEED),
+            slip: at(sp::SLIP),
+            attack_shape: at(sp::ATTACK_SHAPE),
+            filter_slope: at(sp::FILTER_SLOPE),
+            comb_focus: at(sp::COMB_FOCUS),
+            comb_feed: at(sp::COMB_FEED),
+            comb_damp: at(sp::COMB_DAMP),
+            comb_mix: at(sp::COMB_MIX),
+            source_beats: at(sp::SOURCE_BEATS),
+            fit_beats: at(sp::FIT_BEATS),
+            slice_thru: at(sp::SLICE_THRU),
+            hard: at(sp::HARD),
+            sense: at(sp::SENSE),
+            min_gap_ms: at(sp::MIN_GAP),
         }
     }
 }
@@ -223,6 +299,43 @@ impl SamplerParams {
             sp::GAIN => self.gain_db = value,
             sp::PAN => self.pan = value,
             sp::SLICE => self.slice = value,
+            sp::PLAYBACK => self.playback = value,
+            sp::TIME => self.time = value,
+            sp::SPEED => self.speed = value,
+            sp::WINDOW => self.window_ms = value,
+            sp::TRANSIENT => self.transient = value,
+            sp::LOOP_SIZE => self.loop_size = value,
+            sp::LOOP_FADE => self.loop_fade = value,
+            sp::SCAN => self.scan = value,
+            sp::TRAVEL => self.travel = value,
+            sp::MOTION_MODE => self.motion_mode = value,
+            sp::LOOP_UNITS => self.loop_units = value,
+            sp::LOOP_EXIT => self.loop_exit = value,
+            sp::PLAY_MODE => self.play_mode = value,
+            sp::VOICE_COUNT => self.voice_count = value,
+            sp::GLIDE => self.glide_ms = value,
+            sp::SPREAD => self.spread = value,
+            sp::ENV_PITCH => self.env_pitch = value,
+            sp::ENV_POSITION => self.env_position = value,
+            sp::ENV_SIZE => self.env_size = value,
+            sp::ENV_FILTER => self.env_filter = value,
+            sp::START_JITTER => self.start_jitter = value,
+            sp::PITCH_JITTER => self.pitch_jitter = value,
+            sp::SEED => self.seed = value,
+            sp::SLIP => self.slip = value,
+            sp::ATTACK_SHAPE => self.attack_shape = value,
+            sp::FILTER_SLOPE => self.filter_slope = value,
+            sp::COMB_FOCUS => self.comb_focus = value,
+            sp::COMB_FEED => self.comb_feed = value,
+            sp::COMB_DAMP => self.comb_damp = value,
+            sp::COMB_MIX => self.comb_mix = value,
+            sp::SOURCE_BEATS => self.source_beats = value,
+            sp::FIT_BEATS => self.fit_beats = value,
+            sp::SLICE_THRU => self.slice_thru = value,
+            sp::HARD => self.hard = value,
+            sp::SENSE => self.sense = value,
+            sp::MIN_GAP => self.min_gap_ms = value,
+
             _ => {}
         }
     }
@@ -267,6 +380,43 @@ impl SamplerParams {
             sp::GAIN => self.gain_db,
             sp::PAN => self.pan,
             sp::SLICE => self.slice,
+            sp::PLAYBACK => self.playback,
+            sp::TIME => self.time,
+            sp::SPEED => self.speed,
+            sp::WINDOW => self.window_ms,
+            sp::TRANSIENT => self.transient,
+            sp::LOOP_SIZE => self.loop_size,
+            sp::LOOP_FADE => self.loop_fade,
+            sp::SCAN => self.scan,
+            sp::TRAVEL => self.travel,
+            sp::MOTION_MODE => self.motion_mode,
+            sp::LOOP_UNITS => self.loop_units,
+            sp::LOOP_EXIT => self.loop_exit,
+            sp::PLAY_MODE => self.play_mode,
+            sp::VOICE_COUNT => self.voice_count,
+            sp::GLIDE => self.glide_ms,
+            sp::SPREAD => self.spread,
+            sp::ENV_PITCH => self.env_pitch,
+            sp::ENV_POSITION => self.env_position,
+            sp::ENV_SIZE => self.env_size,
+            sp::ENV_FILTER => self.env_filter,
+            sp::START_JITTER => self.start_jitter,
+            sp::PITCH_JITTER => self.pitch_jitter,
+            sp::SEED => self.seed,
+            sp::SLIP => self.slip,
+            sp::ATTACK_SHAPE => self.attack_shape,
+            sp::FILTER_SLOPE => self.filter_slope,
+            sp::COMB_FOCUS => self.comb_focus,
+            sp::COMB_FEED => self.comb_feed,
+            sp::COMB_DAMP => self.comb_damp,
+            sp::COMB_MIX => self.comb_mix,
+            sp::SOURCE_BEATS => self.source_beats,
+            sp::FIT_BEATS => self.fit_beats,
+            sp::SLICE_THRU => self.slice_thru,
+            sp::HARD => self.hard,
+            sp::SENSE => self.sense,
+            sp::MIN_GAP => self.min_gap_ms,
+
             _ => return None,
         })
     }
@@ -319,6 +469,25 @@ enum Looping {
 /// alternative and this is simply the simpler one.
 #[derive(Debug, Clone, Copy)]
 struct Voice {
+    sample_rate: f32,
+    source_frames: f64,
+    patch: SamplerParams,
+    locks: [u64; 2],
+    reader: SampleReader,
+    use_reader: bool,
+    released_tail: bool,
+    motion_phase: f64,
+    pitch_drift: f32,
+    filter2_l: Svf,
+    filter2_r: Svf,
+    attack_split: crate::dsp::dynamics::TransientSplit,
+    comb_l: crate::dsp::delay::FeedbackDelay,
+    comb_r: crate::dsp::delay::FeedbackDelay,
+    steal_l: f32,
+    steal_r: f32,
+    steal_left: usize,
+    last_l: f32,
+    last_r: f32,
     active: bool,
     /// True from note-on until the gate drops. Separate from `active`,
     /// which stays true through the release.
@@ -380,6 +549,26 @@ struct Voice {
 impl Voice {
     fn new() -> Self {
         Self {
+            sample_rate: 48_000.0,
+            source_frames: 0.0,
+            patch: SamplerParams::default(),
+            locks: [0; 2],
+            reader: SampleReader::new(),
+            use_reader: false,
+            released_tail: false,
+            motion_phase: 0.0,
+            pitch_drift: 0.0,
+            filter2_l: Svf::new(),
+            filter2_r: Svf::new(),
+            attack_split: crate::dsp::dynamics::TransientSplit::new(),
+            comb_l: crate::dsp::delay::FeedbackDelay::new(),
+            comb_r: crate::dsp::delay::FeedbackDelay::new(),
+            steal_l: 0.0,
+            steal_r: 0.0,
+            steal_left: 0,
+            last_l: 0.0,
+            last_r: 0.0,
+
             active: false,
             gated: false,
             pitch: 60,
@@ -485,6 +674,9 @@ impl Scratch {
 
 /// The sampler: material, settings, and eight voices that read it.
 pub struct SamplerVoices {
+    locks: [u64; 2],
+    beats_per_sample: f64,
+    comb_buffers: Vec<(Vec<f32>, Vec<f32>)>,
     material: Material,
     /// What letters set — the base a plock restore returns to.
     base: SamplerParams,
@@ -498,12 +690,25 @@ pub struct SamplerVoices {
     /// allocation anywhere near the callback.
     slices: [u64; MAX_SLICES],
     slice_count: usize,
+    onsets: [u64; MAX_SLICES],
+    onset_count: usize,
     scratch: Scratch,
 }
 
 impl SamplerVoices {
     pub fn new(sample_rate: f32, block: usize, params: SamplerParams, material: Material) -> Self {
         let mut bank = Self {
+            locks: [0; 2],
+            beats_per_sample: 120.0 / 60.0 / f64::from(sample_rate.max(1.0)),
+            comb_buffers: (0..VOICES)
+                .map(|_| {
+                    let n = crate::dsp::delay::FeedbackDelay::needed_len(
+                        (sample_rate.max(1.0) * 0.5) as usize,
+                    );
+                    (vec![0.0; n], vec![0.0; n])
+                })
+                .collect(),
+
             material,
             base: params,
             live: params,
@@ -515,9 +720,20 @@ impl SamplerVoices {
             voices: core::array::from_fn(|_| Voice::new()),
             slices: [0; MAX_SLICES],
             slice_count: 0,
+            onsets: [0; MAX_SLICES],
+            onset_count: 0,
             scratch: Scratch::new(block),
         };
         bank.prepare();
+        let onsets = crate::slice::transients_of_spaced(
+            &crate::slice::Planar::from(&bank.material),
+            params.sense,
+            params.min_gap_ms,
+        );
+        bank.onset_count = onsets.len().min(MAX_SLICES);
+        for (dst, src) in bank.onsets.iter_mut().zip(onsets) {
+            *dst = src;
+        }
         bank
     }
 
@@ -577,6 +793,15 @@ impl SamplerVoices {
     pub fn set_param(&mut self, param: u32, value: f32) {
         self.base.set(param, value);
         self.live.set(param, value);
+        for v in &mut self.voices {
+            let locked = v
+                .locks
+                .get(param as usize / 64)
+                .is_some_and(|bits| bits & (1u64 << (param % 64)) != 0);
+            if !locked {
+                v.patch.set(param, value);
+            }
+        }
         self.after_param(param);
     }
 
@@ -590,13 +815,32 @@ impl SamplerVoices {
                 }
             }
         }
-        self.after_param(param);
+        if let Some(bits) = self.locks.get_mut(param as usize / 64) {
+            if value.is_some() {
+                *bits |= 1u64 << (param % 64);
+            } else {
+                *bits &= !(1u64 << (param % 64));
+            }
+        }
     }
 
     pub fn plock_glide(&mut self, param: u32, alpha: f32) {
+        let age = self.voices.iter().filter(|v| v.active).map(|v| v.age).max();
         if let (Some(live), Some(base)) = (self.live.get(param), self.base.get(param)) {
             self.live
                 .set(param, live + (base - live) * alpha.clamp(0.0, 1.0));
+            for v in &mut self.voices {
+                if v.active
+                    && Some(v.age) == age
+                    && v.locks
+                        .get(param as usize / 64)
+                        .is_some_and(|bits| bits & (1u64 << (param % 64)) != 0)
+                    && let Some(value) = v.patch.get(param)
+                {
+                    v.patch
+                        .set(param, value + (base - value) * alpha.clamp(0.0, 1.0));
+                }
+            }
             self.after_param(param);
         }
     }
@@ -605,9 +849,9 @@ impl SamplerVoices {
     fn after_param(&mut self, param: u32) {
         match param {
             sp::AMP_A | sp::AMP_D | sp::AMP_S | sp::AMP_R => {
-                let p = self.live;
                 let sr = self.sample_rate;
                 for v in self.voices.iter_mut() {
+                    let p = v.patch;
                     v.amp.prepare(
                         sr,
                         p.amp_attack_ms,
@@ -618,9 +862,9 @@ impl SamplerVoices {
                 }
             }
             sp::MOD_A | sp::MOD_D | sp::MOD_S | sp::MOD_R => {
-                let p = self.live;
                 let sr = self.sample_rate;
                 for v in self.voices.iter_mut() {
+                    let p = v.patch;
                     v.moden.prepare(
                         sr,
                         p.mod_attack_ms,
@@ -631,10 +875,10 @@ impl SamplerVoices {
                 }
             }
             sp::BITS => {
-                let bits = self.live.bits;
                 for v in self.voices.iter_mut() {
-                    v.crush_l.set_bits(bits);
-                    v.crush_r.set_bits(bits);
+                    let p = v.patch;
+                    v.crush_l.set_bits(p.bits);
+                    v.crush_r.set_bits(p.bits);
                 }
             }
             _ => {}
@@ -662,11 +906,15 @@ impl SamplerVoices {
     pub fn note_off(&mut self, pitch: u8) {
         // A one-shot ignores the gate going down: the sample IS the
         // gesture, the same contract `KickVoice` keeps.
-        if self.live.one_shot() {
-            return;
-        }
         for v in self.voices.iter_mut() {
-            if v.active && v.gated && v.pitch == pitch {
+            if v.active && v.gated && v.pitch == pitch && !v.patch.one_shot() {
+                if v.patch.loop_exit >= 0.5 && v.use_reader {
+                    v.reader.exit_loop();
+                    v.released_tail = true;
+                    v.looping = Looping::Off;
+                    v.gated = false;
+                    continue;
+                }
                 v.gated = false;
                 v.amp.gate_off();
                 v.moden.gate_off();
@@ -681,6 +929,19 @@ impl SamplerVoices {
         let p = self.live;
         let sr = self.sample_rate;
         let frames = self.material.frames as f64;
+        if p.play_mode.round() == 2.0 {
+            if let Some(v) = self.voices.iter_mut().find(|v| v.active && v.gated) {
+                v.pitch = pitch;
+                v.patch = p;
+                v.locks = self.locks;
+                return;
+            }
+        }
+        if p.play_mode.round() == 1.0 {
+            for v in &mut self.voices {
+                v.cut_now();
+            }
+        }
 
         // Where in the material this note reads, and at what ratio.
         let Some((lo, hi, ratio_semitones)) = self.region_for(pitch) else {
@@ -704,6 +965,9 @@ impl SamplerVoices {
         };
 
         let vel = f32::from(vel) / 127.0;
+        v.patch = p;
+        v.locks = self.locks;
+        v.released_tail = false;
         v.active = true;
         v.gated = true;
         v.pitch = pitch;
@@ -731,13 +995,9 @@ impl SamplerVoices {
         v.pos = if p.reversed() { hi } else { lo } + start_shift;
         v.pos = v.pos.clamp(lo, hi);
 
-        // Loops. Slice mode ignores them: a slice IS the span, and a loop
-        // inside one is a different feature wearing the same knob.
-        let loop_mode = if p.slicing() {
-            sp::LOOP_OFF
-        } else {
-            p.loop_mode.round()
-        };
+        // Legacy geometry; the advanced reader resolves an independent
+        // sustain span, including loops inside a slice.
+        let loop_mode = p.loop_mode.round();
         let loop_lo = (lo + (hi - lo) * f64::from(p.loop_start.clamp(0.0, 1.0))).clamp(lo, hi);
         let loop_len = hi - loop_lo;
         v.loop_lo = loop_lo;
@@ -779,6 +1039,13 @@ impl SamplerVoices {
         v.over_r.reset();
         v.crush_l.reset();
         v.crush_r.reset();
+        Self::prepare_note(v, p, sr);
+        Self::start_reader(v, p, sr, self.beats_per_sample, frames);
+        v.reader.set_onsets(&self.onsets[..self.onset_count]);
+        if let Some((left, right)) = self.comb_buffers.get_mut(slot) {
+            left.fill(0.0);
+            right.fill(0.0);
+        }
         v.amp.gate_on();
         v.moden.gate_on();
     }
@@ -811,6 +1078,11 @@ impl SamplerVoices {
             } else {
                 frames
             };
+            let hi = if p.slice_thru >= 0.5 { frames } else { hi };
+            let span = hi - lo;
+            let start = lo + span * f64::from(p.start.clamp(0.0, 1.0));
+            let end = lo + span * f64::from(p.end.clamp(0.0, 1.0));
+            let (lo, hi) = (start, end.max(start));
             if hi - lo < 2.0 {
                 return None;
             }
@@ -831,12 +1103,13 @@ impl SamplerVoices {
     /// A free voice, or the best one to steal: a releasing voice before a
     /// held one, and the oldest before the newest.
     fn steal(&mut self) -> usize {
-        if let Some(v) = (0..VOICES).find(|i| self.voices.get(*i).is_some_and(|v| !v.active)) {
+        let count = (self.live.voice_count.round() as usize).clamp(1, VOICES);
+        if let Some(v) = (0..count).find(|i| self.voices.get(*i).is_some_and(|v| !v.active)) {
             return v;
         }
         let mut best = 0usize;
         let mut key = (true, u64::MAX);
-        for (i, v) in self.voices.iter().enumerate() {
+        for (i, v) in self.voices.iter().take(count).enumerate() {
             if (v.gated, v.age) < key {
                 key = (v.gated, v.age);
                 best = i;
@@ -847,6 +1120,9 @@ impl SamplerVoices {
         // room to ramp in, and the new note's own fade-in covers the
         // seam.
         if let Some(v) = self.voices.get_mut(best) {
+            v.steal_l = v.last_l;
+            v.steal_r = v.last_r;
+            v.steal_left = 64;
             v.silence();
         }
         best
@@ -903,14 +1179,21 @@ impl SamplerVoices {
                 return;
             }
             if voice.chunk_left == 0 {
-                Self::retune(voice, &self.live, self.sample_rate);
+                let patch = voice.patch;
+                Self::retune(voice, &patch, self.sample_rate);
+                Self::update_reader(voice, &patch, self.sample_rate, self.beats_per_sample);
                 voice.chunk_left = CHUNK;
             }
             let n = (out.len() - done).min(voice.chunk_left).min(CHUNK);
             if n == 0 {
                 return;
             }
-            Self::render_chunk(voice, &self.live, &self.material, &mut self.scratch, n);
+            let patch = voice.patch;
+            Self::render_chunk(voice, &patch, &self.material, &mut self.scratch, n);
+            if let Some(buffers) = self.comb_buffers.get_mut(index) {
+                Self::finish_voice(voice, &patch, &mut self.scratch, n, buffers);
+            }
+
             // Saturating, because `render_chunk` can end the voice
             // mid-chunk — the span ran out, the envelope finished, the
             // choke ramp landed — and `silence` zeroes this on its way
@@ -921,7 +1204,8 @@ impl SamplerVoices {
             let (Some(l), Some(r)) = (self.scratch.l.get(..n), self.scratch.r.get(..n)) else {
                 return;
             };
-            let (pan_l, pan_r) = (voice.pan_l, voice.pan_r);
+            let note_gain = 10f32.powf((voice.patch.gain_db - self.base.gain_db) / 20.0);
+            let (pan_l, pan_r) = (voice.pan_l * note_gain, voice.pan_r * note_gain);
             for (i, (a, b)) in l.iter().zip(r.iter()).enumerate() {
                 if let Some(d) = out.get_mut(done + i) {
                     *d += *a * pan_l;
@@ -950,11 +1234,27 @@ impl SamplerVoices {
         } else {
             0.0
         };
-        v.inc = v.base_inc * 2f64.powf(f64::from(semitones) / 12.0);
+        let target = 2f64.powf(
+            f64::from(
+                f32::from(v.pitch) - p.root
+                    + p.tune
+                    + p.fine / 100.0
+                    + v.pitch_drift
+                    + semitones
+                    + p.env_pitch * env,
+            ) / 12.0,
+        );
+        let glide = if p.glide_ms > 0.0 {
+            1.0 - (-(CHUNK as f64) / (f64::from(sr) * f64::from(p.glide_ms) * 0.001)).exp()
+        } else {
+            1.0
+        };
+        v.inc += (target - v.inc) * glide;
 
         // Filter: cutoff from the knob, keytrack and the envelope.
         let keytrack = p.keytrack * (f32::from(v.pitch) - 60.0) / 12.0;
         let octaves = keytrack
+            + p.env_filter * env / 12.0
             + if dest == sp::DEST_CUTOFF {
                 depth * sp::DEST_CUTOFF_OCTAVES
             } else {
@@ -967,6 +1267,8 @@ impl SamplerVoices {
         if (hz - v.filter_hz).abs() > 0.01 || (q - v.filter_q).abs() > 0.001 {
             v.filter_l.prepare(sr, hz, q);
             v.filter_r.prepare(sr, hz, q);
+            v.filter2_l.prepare(sr, hz, 0.707);
+            v.filter2_r.prepare(sr, hz, 0.707);
             v.filter_hz = hz;
             v.filter_q = q;
         }
@@ -1025,8 +1327,14 @@ impl SamplerVoices {
         // after the loop they would use the position the chunk ended at,
         // and a fade-out would arrive thirty-two samples late.
         for i in 0..n {
-            let (a, b) = Self::read(v, left, right);
             let g = Self::edge_gain(v);
+            let (a, b) = if v.use_reader {
+                let pair = v.reader.tick(left, right);
+                v.pos = v.reader.position();
+                (pair[0], pair[1])
+            } else {
+                Self::read(v, left, right)
+            };
             if let Some(s) = scratch.l.get_mut(i) {
                 *s = a;
             }
@@ -1036,7 +1344,14 @@ impl SamplerVoices {
             if let Some(s) = scratch.edge.get_mut(i) {
                 *s = g;
             }
-            Self::advance(v);
+            if v.use_reader {
+                v.since_gate = v.since_gate.saturating_add(1);
+                if !v.reader.active() {
+                    v.active = false;
+                }
+            } else {
+                Self::advance(v);
+            }
             if !v.active {
                 // The span finished mid-chunk. Everything after it is
                 // silence, and the fade-out has already brought the last
@@ -1067,19 +1382,6 @@ impl SamplerVoices {
         }
         if let Some(menv) = scratch.menv.get_mut(..n) {
             v.moden.process(menv);
-        }
-
-        let vel_gain = 1.0 - p.velocity * (1.0 - v.vel);
-        for i in 0..n {
-            let e = scratch.env.get(i).copied().unwrap_or(0.0);
-            let edge = scratch.edge.get(i).copied().unwrap_or(0.0);
-            let g = e * vel_gain * edge;
-            if let Some(s) = scratch.l.get_mut(i) {
-                *s *= g;
-            }
-            if let Some(s) = scratch.r.get_mut(i) {
-                *s *= g;
-            }
         }
 
         // The choke / steal ramp, advanced ONCE and applied to both
@@ -1116,6 +1418,14 @@ impl SamplerVoices {
             }
             if let Some(r) = scratch.r.get_mut(..n) {
                 v.filter_r.process(r, mode);
+            }
+            if p.filter_slope >= 0.5 {
+                if let Some(l) = scratch.l.get_mut(..n) {
+                    v.filter2_l.process(l, mode);
+                }
+                if let Some(r) = scratch.r.get_mut(..n) {
+                    v.filter2_r.process(r, mode);
+                }
             }
         }
 
@@ -1267,12 +1577,12 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    const SR: f32 = 48_000.0;
-    const BLOCK: usize = 256;
+    pub(super) const SR: f32 = 48_000.0;
+    pub(super) const BLOCK: usize = 256;
 
     /// Material whose left channel is `f(frame)` and whose right is
     /// `f(frame) + 1`, so a channel swap is visible.
-    fn material(frames: u64, f: impl Fn(u64) -> f32) -> Material {
+    pub(super) fn material(frames: u64, f: impl Fn(u64) -> f32) -> Material {
         let mut samples = Vec::with_capacity(frames as usize * 2);
         for i in 0..frames {
             samples.push(f(i));
@@ -1292,7 +1602,7 @@ mod tests {
     }
 
     /// A tone, which is what most of these want to look at.
-    fn tone(frames: u64) -> Material {
+    pub(super) fn tone(frames: u64) -> Material {
         material(frames, |i| {
             (std::f32::consts::TAU * 400.0 * i as f32 / SR).sin() * 0.5
         })
@@ -1300,7 +1610,7 @@ mod tests {
 
     /// Every colour stage at the bottom of its range, every envelope held
     /// open, no fades: the configuration the transparency claim is about.
-    fn transparent() -> SamplerParams {
+    pub(super) fn transparent() -> SamplerParams {
         let mut p = SamplerParams::default();
         p.drive = 0.0;
         p.rate_hz = 48_000.0;
@@ -1312,19 +1622,25 @@ mod tests {
         p.mod_depth = 0.0;
         p.fade_in_ms = 0.0;
         p.fade_out_ms = 0.0;
+        p.loop_fade = 0.0;
+        p.loop_xfade_ms = 0.0;
         p.amp_attack_ms = 0.1;
         p.amp_sustain = 1.0;
         p.velocity = 0.0;
         p
     }
 
-    fn bank(p: SamplerParams, m: Material) -> SamplerVoices {
+    pub(super) fn bank(p: SamplerParams, m: Material) -> SamplerVoices {
         SamplerVoices::new(SR, BLOCK, p, m)
     }
 
     /// Render `frames` samples in blocks of `block`, returning both
     /// channels.
-    fn run(voices: &mut SamplerVoices, frames: usize, block: usize) -> (Vec<f32>, Vec<f32>) {
+    pub(super) fn run(
+        voices: &mut SamplerVoices,
+        frames: usize,
+        block: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
         let mut left = Vec::with_capacity(frames);
         let mut right = Vec::with_capacity(frames);
         let mut done = 0;
@@ -1526,6 +1842,7 @@ mod tests {
         p.loop_mode = sp::LOOP_FORWARD;
         p.loop_start = 0.5;
         p.loop_xfade_ms = 5.0;
+        p.loop_fade = 0.4;
         p.end = 0.5;
         p.amp_decay_ms = 16_000.0;
         let mut v = bank(p, m);
@@ -1558,7 +1875,8 @@ mod tests {
         let mut v = bank(p, m);
         v.note_on(60, 127, 0);
         let (l, _) = run(&mut v, 4_000, BLOCK);
-        for (i, s) in l.iter().enumerate().skip(64) {
+        // The recorded attack precedes entry into the sustain loop.
+        for (i, s) in l.iter().enumerate().skip(188) {
             assert!(
                 (0.18..=0.77).contains(s),
                 "sample {i} read {s}, which is outside the loop"
@@ -1892,8 +2210,8 @@ mod tests {
         }
         assert_eq!(
             sp::TABLE.len(),
-            37,
-            "the brief says thirty-six rows, and the slice row makes thirty-seven"
+            sp::MIN_GAP as usize + 1,
+            "the parameter ids remain contiguous and old ids are stable"
         );
     }
 
@@ -1912,3 +2230,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod advanced_tests;

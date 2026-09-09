@@ -228,3 +228,206 @@ pub use utility::{
     UtilityUi, utility_card, utility_edits, utility_is_discrete, utility_is_log, utility_norm,
     utility_value,
 };
+
+// The coverage instruments present the same parameter contract on every surface.
+macro_rules! coverage_parameter_surface {
+    ($module:ident, $norm:ident, $value:ident, $discrete:ident, $log:ident) => {
+        pub fn $discrete(param: u32) -> bool {
+            crate::params::$module::DISCRETE.contains(&param)
+        }
+        pub fn $log(param: u32) -> bool {
+            crate::params::$module::LOG.contains(&param)
+        }
+        pub fn $norm(param: u32, value: f32) -> f32 {
+            let Some(def) = crate::params::$module::TABLE.get(param as usize) else {
+                return 0.0;
+            };
+            let value = if value.is_finite() {
+                value.clamp(def.min, def.max)
+            } else {
+                def.default
+            };
+            if $log(param) && def.min > 0.0 {
+                ((value / def.min).ln() / (def.max / def.min).ln()).clamp(0.0, 1.0)
+            } else {
+                ((value - def.min) / (def.max - def.min)).clamp(0.0, 1.0)
+            }
+        }
+        pub fn $value(param: u32, norm: f32) -> f32 {
+            let Some(def) = crate::params::$module::TABLE.get(param as usize) else {
+                return 0.0;
+            };
+            let norm = if norm.is_finite() {
+                norm.clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let v = if $log(param) && def.min > 0.0 {
+                def.min * (def.max / def.min).powf(norm)
+            } else {
+                def.min + (def.max - def.min) * norm
+            };
+            if $discrete(param) {
+                v.round().clamp(def.min, def.max)
+            } else {
+                v
+            }
+        }
+    };
+}
+coverage_parameter_surface!(
+    table,
+    table_norm,
+    table_value,
+    table_is_discrete,
+    table_is_log
+);
+coverage_parameter_surface!(ring, ring_norm, ring_value, ring_is_discrete, ring_is_log);
+coverage_parameter_surface!(
+    prism_voice,
+    prism_voice_norm,
+    prism_voice_value,
+    prism_voice_is_discrete,
+    prism_voice_is_log
+);
+coverage_parameter_surface!(mass, mass_norm, mass_value, mass_is_discrete, mass_is_log);
+coverage_parameter_surface!(
+    pluck,
+    pluck_norm,
+    pluck_value,
+    pluck_is_discrete,
+    pluck_is_log
+);
+coverage_parameter_surface!(vox, vox_norm, vox_value, vox_is_discrete, vox_is_log);
+coverage_parameter_surface!(pipe, pipe_norm, pipe_value, pipe_is_discrete, pipe_is_log);
+coverage_parameter_surface!(
+    glass,
+    glass_norm,
+    glass_value,
+    glass_is_discrete,
+    glass_is_log
+);
+
+/// The DRUM voice has no card: its surface is the pages. The old
+/// binary's state machinery still asks these four questions of every
+/// kind, so they are answered from the table alone.
+/// CLAY, the same four answers from its own table: nothing discrete,
+/// nothing logarithmic (the macros are unit ranges).
+pub fn clay_norm(param: u32, value: f32) -> f32 {
+    let Some(def) = crate::params::clay::TABLE
+        .iter()
+        .find(|def| def.id == param)
+    else {
+        return 0.0;
+    };
+    ((value - def.min) / (def.max - def.min)).clamp(0.0, 1.0)
+}
+
+pub fn clay_is_discrete(_param: u32) -> bool {
+    false
+}
+
+pub fn clay_is_log(_param: u32) -> bool {
+    false
+}
+
+pub fn clay_value(param: u32, norm: f32) -> f32 {
+    let Some(def) = crate::params::clay::TABLE
+        .iter()
+        .find(|def| def.id == param)
+    else {
+        return 0.0;
+    };
+    def.min + (def.max - def.min) * norm.clamp(0.0, 1.0)
+}
+
+/// THUMP, the same four answers from its own table.
+pub fn thump_norm(param: u32, value: f32) -> f32 {
+    let Some(def) = crate::params::thump::TABLE
+        .iter()
+        .find(|def| def.id == param)
+    else {
+        return 0.0;
+    };
+    if thump_is_log(param) {
+        (value.max(def.min) / def.min).ln() / (def.max / def.min).ln()
+    } else {
+        ((value - def.min) / (def.max - def.min)).clamp(0.0, 1.0)
+    }
+}
+
+pub fn thump_is_discrete(param: u32) -> bool {
+    matches!(
+        param,
+        crate::params::thump::MODE | crate::params::thump::SAT_SHAPE
+    )
+}
+
+pub fn thump_is_log(param: u32) -> bool {
+    param == crate::params::thump::COLOR
+}
+
+pub fn thump_value(param: u32, norm: f32) -> f32 {
+    let Some(def) = crate::params::thump::TABLE
+        .iter()
+        .find(|def| def.id == param)
+    else {
+        return 0.0;
+    };
+    let norm = norm.clamp(0.0, 1.0);
+    let value = if thump_is_log(param) {
+        def.min * (def.max / def.min).powf(norm)
+    } else {
+        def.min + (def.max - def.min) * norm
+    };
+    if thump_is_discrete(param) {
+        value.round()
+    } else {
+        value
+    }
+}
+
+pub fn drum_norm(param: u32, value: f32) -> f32 {
+    let Some(def) = crate::params::drum::TABLE
+        .iter()
+        .find(|def| def.id == param)
+    else {
+        return 0.0;
+    };
+    if drum_is_log(param) {
+        (value.max(def.min) / def.min).ln() / (def.max / def.min).ln()
+    } else {
+        ((value - def.min) / (def.max - def.min)).clamp(0.0, 1.0)
+    }
+}
+
+pub fn drum_is_discrete(param: u32) -> bool {
+    matches!(
+        param,
+        crate::params::drum::MODEL | crate::params::drum::FTYPE
+    )
+}
+
+pub fn drum_is_log(param: u32) -> bool {
+    param == crate::params::drum::CUTOFF
+}
+
+pub fn drum_value(param: u32, norm: f32) -> f32 {
+    let Some(def) = crate::params::drum::TABLE
+        .iter()
+        .find(|def| def.id == param)
+    else {
+        return 0.0;
+    };
+    let norm = norm.clamp(0.0, 1.0);
+    let value = if drum_is_log(param) {
+        def.min * (def.max / def.min).powf(norm)
+    } else {
+        def.min + (def.max - def.min) * norm
+    };
+    if drum_is_discrete(param) {
+        value.round()
+    } else {
+        value
+    }
+}

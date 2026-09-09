@@ -134,6 +134,7 @@ fn scope_word(scope: ScopeContext) -> &'static str {
         ScopeContext::Browser => "BROWSER",
         ScopeContext::Mixer => "MIXER",
         ScopeContext::Chain => "CHAIN",
+        ScopeContext::Steps => "STEPS",
         ScopeContext::Clip => "CLIP",
         ScopeContext::Rename => "RENAME",
         ScopeContext::TrigMenu => "TRIG",
@@ -142,6 +143,12 @@ fn scope_word(scope: ScopeContext) -> &'static str {
         ScopeContext::Sample => "SAMPLE",
         ScopeContext::Song => "SONG",
         ScopeContext::Forge => "FORGE",
+        ScopeContext::Deck => "DECK",
+        ScopeContext::Matrix => "MATRIX",
+        ScopeContext::Lab => "LAB",
+        ScopeContext::Kiln => "KILN",
+        ScopeContext::KilnFilter => "FILTER",
+        ScopeContext::MidiLab => "MIDILAB",
     }
 }
 
@@ -237,7 +244,11 @@ impl super::super::Stage {
         // Where the keys stand, in coordinates: it follows the cursor.
         let at = match (self.inside, self.session_address()) {
             (Some(opened), _) => {
-                format!("clip {:02}  tr {:02}", opened.pattern.0, opened.track + 1)
+                format!(
+                    "clip {}  tr {:02}",
+                    self.song.tag_of(opened.pattern),
+                    opened.track + 1
+                )
             }
             (None, Some(super::super::Address::Head { track })) => format!("tr {:02}", track + 1),
             (None, Some(super::super::Address::Slot { track, scene })) => {

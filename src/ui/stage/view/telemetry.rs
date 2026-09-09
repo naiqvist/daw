@@ -56,7 +56,8 @@ pub struct Line {
 struct Was {
     motion: Option<Motion>,
     playing: Vec<Option<usize>>,
-    inside: Option<(u64, usize)>,
+    /// The open clip's tag and track.
+    inside: Option<(String, usize)>,
     chain: bool,
     browser: bool,
     help: bool,
@@ -114,6 +115,12 @@ impl Default for Telemetry {
 }
 
 impl Telemetry {
+    /// A thing a document lost on the way in. The core hands these over
+    /// after an open; they are the migration's receipt.
+    pub fn dropped(&mut self, what: impl Into<String>) {
+        self.push(Severity::Attention, "DROPPED", what);
+    }
+
     fn push(&mut self, severity: Severity, verb: &'static str, what: impl Into<String>) {
         if self.lines.len() == LINES {
             self.lines.pop_front();
@@ -162,11 +169,11 @@ impl Telemetry {
                 }
             }
             if now.inside != was.inside {
-                match now.inside {
+                match now.inside.clone() {
                     Some((pattern, track)) => self.push(
                         Severity::Info,
                         "ENTER",
-                        format!("clip {pattern:02} tr{:02}", track + 1),
+                        format!("clip {pattern} tr{:02}", track + 1),
                     ),
                     None => self.push(Severity::Info, "LEAVE", "clip"),
                 }
@@ -236,7 +243,7 @@ impl Was_ {
     pub fn new(
         motion: Motion,
         playing: &[Option<usize>],
-        inside: Option<(u64, usize)>,
+        inside: Option<(String, usize)>,
         chain: bool,
         browser: bool,
         help: bool,

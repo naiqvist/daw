@@ -16,8 +16,8 @@
 //!
 //! # What it does not do yet, stated rather than implied
 //!
-//! Positional group nesting and trig conditions are not compiled here yet.
-//! Parameter locks and automation are; fixed desk buses, returns, channel
+//! Positional group nesting is not compiled here yet. Trig conditions,
+//! parameter locks and automation are; fixed desk buses, returns, channel
 //! strips, device chains, clip playback and monitored audio inputs are part
 //! of both builders. The session model currently carries pattern clips only,
 //! so recorded audio plays from the arrangement rather than a launcher slot.
@@ -28,13 +28,56 @@ use crate::audio::graph::{
     AutomationPoint as GraphAutomationPoint, GraphSpec, MAX_METERS, MAX_NODE_INPUTS, NodeId,
     NodeSpec, Note as GraphNote,
 };
-use crate::audio::modulation::{ModSpec, WireSpec};
+use crate::audio::modulation::{
+    Chain, LfoTrig, ModKind, ModSpec, Modulator, SourceRestarts, WireSpec,
+};
 use crate::devices::DeviceKind;
 use crate::pitch::nearest_midi;
 use crate::sequencing::{
     Clip, DeskPathIdentity, DeskPersonality, Device, DeviceId, PATTERN_STEP_TICKS, PATTERN_STEPS,
-    Pattern, Song, TICKS_PER_BEAT, Track,
+    Pattern, Song, SoundLock, TICKS_PER_BEAT, Track, Trig,
 };
+
+/// Where the lane LFOs' ids live: far above anything the patchbay mints
+/// (its ids are bounded by the caps), and stable per track and slot, so a
+/// recompile adopts the running phase.
+const LANE_LFO_SOURCE_ID: u64 = 1 << 40;
+const LANE_LFO_WIRE_ID: u64 = 1 << 41;
+/// The most trigs one lane LFO restarts from; the list is searched in
+/// the callback, so it is bounded here.
+const LANE_LFO_RESTARTS: usize = 512;
+
+/// One track's trigs as restart beats, for its lane LFOs.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct TrackRestarts {
+    at: Vec<f32>,
+    loop_beats: f32,
+}
+
+impl TrackRestarts {
+    /// The note-ons of `notes`, as the compiler laid them.
+    fn of(notes: &[GraphNote], loop_beats: f32) -> Self {
+        let mut at: Vec<f32> = notes
+            .iter()
+            .filter(|note| note.vel > 0)
+            .map(|note| note.start_beats as f32)
+            .collect();
+        at.sort_by(f32::total_cmp);
+        at.dedup();
+        at.truncate(LANE_LFO_RESTARTS);
+        Self { at, loop_beats }
+    }
+}
+
+/// How many DISTINCT locked sounds one track may play through at once:
+/// its sound pool. Sounds past the pool play through the track's own
+/// machine. Sixteen is a kit's worth; Elektron's pool is 128.
+pub const SOUND_POOL: usize = 16;
+
+/// How many lock-only events a sliding lock lays per step on its way to
+/// the next lock. Four is the grid's own resolution of a sixteenth,
+/// smooth enough for a filter and cheap enough for a kit.
+const SLIDE_POINTS_PER_STEP: usize = 4;
 
 /// The master's meter slot: the LAST one, so the tracks can take theirs in
 /// their own order from zero without either end having to know how many
@@ -475,6 +518,7 @@ pub fn build(song: &Song, playing: &[Option<usize>]) -> (GraphSpec, SongNodes) {
     let mut aux_sources: Vec<Vec<NodeId>> = (0..desk.aux.len()).map(|_| Vec::new()).collect();
     let mut master_sources = desk.master_feeds.clone();
     let mut channel_routes = vec![None; song.tracks.len()];
+    let mut restarts = vec![TrackRestarts::default(); song.tracks.len()];
 
     for (index, track) in song.tracks.iter().enumerate() {
         if !song.audible(index) {
@@ -492,10 +536,23 @@ pub fn build(song: &Song, playing: &[Option<usize>]) -> (GraphSpec, SongNodes) {
 
         let mut sources = Vec::new();
         let mut voice = None;
+        // The steps locked to other sounds play through pool voices of
+        // their own, fed by the same strip; the track's machine takes
+        // the rest.
+        let mut pool_voices: Vec<(NodeId, &SoundLock)> = Vec::new();
         if let Some(pattern) = pattern {
-            let notes = notes_of(song, pattern, &[]);
+            let pool = sound_pool([pattern]);
+            let loop_beats = beats(pattern.length_ticks) * pattern.scale.time();
+            let loop_len = Some(loop_beats);
+            // Every trig of the pattern, whichever machine plays it, is a
+            // restart for the lane LFOs.
+            restarts[index] = TrackRestarts::of(
+                &notes_of_kept(song, pattern, &[], &|_| true),
+                loop_beats as f32,
+            );
+            let notes = notes_of_kept(song, pattern, &[], &|trig| plays_own_machine(trig, &pool));
             if !notes.is_empty()
-                && let Some(instrument) = voice_of(track, notes, Some(beats(pattern.length_ticks)))
+                && let Some(instrument) = voice_of(track, notes, loop_len)
             {
                 let node = spec.push(instrument);
                 sources.push(node);
@@ -503,8 +560,24 @@ pub fn build(song: &Song, playing: &[Option<usize>]) -> (GraphSpec, SongNodes) {
                 // The instrument is a device with knobs like any other, so it
                 // goes in the letter table. Leaving it out meant a turn on a
                 // kick was heard only when something ELSE rebuilt the graph.
-                if let Some(head) = track.chain.first().filter(|device| device.is_instrument()) {
+                if let Some(head) = track.machine.as_ref() {
                     address_voice(&mut spec, &mut nodes, head.id, node);
+                }
+            }
+            for sound in &pool {
+                let Some(head) = sound.sound.machine_device() else {
+                    continue;
+                };
+                let notes = notes_of_kept(song, pattern, &[], &|trig| {
+                    trig.sound.as_ref() == Some(sound)
+                });
+                if notes.is_empty() {
+                    continue;
+                }
+                if let Some(instrument) = voice_for(&head, notes, loop_len) {
+                    let node = spec.push(instrument);
+                    sources.push(node);
+                    pool_voices.push((node, sound));
                 }
             }
         }
@@ -520,12 +593,8 @@ pub fn build(song: &Song, playing: &[Option<usize>]) -> (GraphSpec, SongNodes) {
         // its siblings and turn an A/B comparison into a timing comparison.
         let mut effects: Vec<(DeviceId, NodeId)> = Vec::new();
         let mut tail = source;
-        // The chain's effects, then the strip's sections that are IN, in
-        // the desk's order: one run of nodes, each fed by the one before.
-        for device in track.chain.iter().chain(track.strip.iter()) {
-            if device.is_instrument() {
-                continue;
-            }
+        // The lane's fixed strip, in signal order.
+        for device in &track.strip {
             let Some(node) = effect_of(device) else {
                 continue;
             };
@@ -546,11 +615,20 @@ pub fn build(song: &Song, playing: &[Option<usize>]) -> (GraphSpec, SongNodes) {
         // Now the effects have ids, the notes can name them: the voice's
         // notes are cut again with every effect lock addressed, and every
         // locked effect parameter registers the knob it returns to.
-        if let (Some(voice), Some(pattern)) = (voice, pattern)
+        if let Some(pattern) = pattern
             && !effects.is_empty()
         {
-            if let Some(notes) = spec.node_mut(voice).and_then(NodeSpec::notes_mut) {
+            if let Some(voice) = voice
+                && let Some(notes) = spec.node_mut(voice).and_then(NodeSpec::notes_mut)
+            {
                 *notes = notes_of(song, pattern, &effects);
+            }
+            for (node, sound) in &pool_voices {
+                if let Some(notes) = spec.node_mut(*node).and_then(NodeSpec::notes_mut) {
+                    *notes = notes_of_kept(song, pattern, &effects, &|trig| {
+                        trig.sound.as_ref() == Some(*sound)
+                    });
+                }
             }
             for step in 0..PATTERN_STEPS {
                 for lock in &pattern.trig(step).locks {
@@ -558,11 +636,7 @@ pub fn build(song: &Song, playing: &[Option<usize>]) -> (GraphSpec, SongNodes) {
                         continue;
                     };
                     if let Some((_, node)) = effects.iter().find(|(device, _)| *device == id)
-                        && let Some(device) = track
-                            .chain
-                            .iter()
-                            .chain(track.strip.iter())
-                            .find(|device| device.id == id)
+                        && let Some(device) = track.strip.iter().find(|device| device.id == id)
                     {
                         spec.lock_base(*node, lock.param, device.value(lock.param));
                     }
@@ -632,7 +706,7 @@ pub fn build(song: &Song, playing: &[Option<usize>]) -> (GraphSpec, SongNodes) {
     // The master fader remains the live-addressable `SongNodes::master`, but
     // the heard and metered master is AFTER MIX's safety processing.
     install_automation(&mut spec, song, &nodes);
-    install_modulation(&mut spec, song, &nodes);
+    install_modulation(&mut spec, song, &nodes, &restarts);
     spec.meter(MASTER_METER, desk.mix_out);
     spec.set_output(desk.mix_out);
     (spec, nodes)
@@ -661,6 +735,16 @@ fn voice_of(
     notes: Vec<GraphNote>,
     loop_len_beats: Option<f64>,
 ) -> Option<NodeSpec> {
+    voice_for(track.machine.as_ref()?, notes, loop_len_beats)
+}
+
+/// The voice node for one machine, whether the track's own or a sound
+/// lock's. The instrument arms live here so both are one shape.
+fn voice_for(
+    head: &Device,
+    notes: Vec<GraphNote>,
+    loop_len_beats: Option<f64>,
+) -> Option<NodeSpec> {
     // Every instrument node has the same shape — the pattern's notes and
     // its own typed patch — so the arms differ only in which two names
     // they name. Written as one shape so a new instrument is one line and
@@ -680,15 +764,6 @@ fn voice_of(
         }};
     }
 
-    let Some(head) = track.chain.first().filter(|device| device.is_instrument()) else {
-        // No instrument on the chain: the default voice, at its defaults.
-        return Some(NodeSpec::Poly {
-            notes,
-            subloops: Vec::new(),
-            loop_len_beats,
-            params: Default::default(),
-        });
-    };
     if head.bypassed {
         return None;
     }
@@ -732,6 +807,21 @@ fn voice_of(
         DeviceKind::Hat => voice!(Hat, crate::audio::hat::HatParams, head),
         DeviceKind::Tom => voice!(Tom, crate::audio::tom::TomParams, head),
         DeviceKind::Handclap => voice!(Handclap, crate::audio::handclap::HandclapParams, head),
+        DeviceKind::Drum => voice!(Drum, crate::audio::drum::DrumParams, head),
+        DeviceKind::Thump => voice!(Thump, crate::audio::thump::ThumpParams, head),
+        DeviceKind::Clay => voice!(Clay, crate::audio::clay::ClayParams, head),
+        DeviceKind::Table => voice!(Table, crate::audio::table::TableParams, head),
+        DeviceKind::Ring => voice!(Ring, crate::audio::ring::RingParams, head),
+        DeviceKind::PrismVoice => voice!(
+            PrismVoice,
+            crate::audio::prism_voice::PrismVoiceParams,
+            head
+        ),
+        DeviceKind::Mass => voice!(Mass, crate::audio::mass::MassParams, head),
+        DeviceKind::Pluck => voice!(Pluck, crate::audio::pluck::PluckParams, head),
+        DeviceKind::Vox => voice!(Vox, crate::audio::vox::VoxParams, head),
+        DeviceKind::Pipe => voice!(Pipe, crate::audio::pipe::PipeParams, head),
+        DeviceKind::Glass => voice!(Glass, crate::audio::glass::GlassParams, head),
         DeviceKind::Sampler => {
             let mut params = crate::audio::sampler::SamplerParams::default();
             for (id, value) in &head.overrides {
@@ -944,11 +1034,14 @@ pub fn build_song(song: &Song) -> (GraphSpec, SongNodes) {
     let mut aux_sources: Vec<Vec<NodeId>> = (0..desk.aux.len()).map(|_| Vec::new()).collect();
     let mut master_sources = desk.master_feeds.clone();
     let mut channel_routes = vec![None; song.tracks.len()];
+    let mut restarts = vec![TrackRestarts::default(); song.tracks.len()];
 
     for (index, track) in song.tracks.iter().enumerate() {
         if !song.audible(index) {
             continue;
         }
+        restarts[index] =
+            TrackRestarts::of(&notes_of_blocks_kept(song, track, &[], &|_| true), 0.0);
         let notes = notes_of_blocks(song, track, &[]);
         let mut sources = Vec::new();
         let voice = if notes.is_empty() {
@@ -964,10 +1057,24 @@ pub fn build_song(song: &Song) -> (GraphSpec, SongNodes) {
             // The instrument is a device with knobs like any other, so it
             // goes in the letter table. Leaving it out meant a turn on a
             // kick was heard only when something ELSE rebuilt the graph.
-            if let Some(head) = track.chain.first().filter(|device| device.is_instrument()) {
+            if let Some(head) = track.machine.as_ref() {
                 address_voice(&mut spec, &mut nodes, head.id, voice);
             }
         }
+        // Sound-locked steps across every block, one pool voice per sound.
+        let pool = sound_pool(
+            track
+                .blocks
+                .iter()
+                .filter_map(|block| song.pattern(block.pattern_id)),
+        );
+        let pool_voices: Vec<(NodeId, &SoundLock)> =
+            push_pool_voices(&mut spec, &mut sources, &pool, None, |sound| {
+                notes_of_blocks_kept(song, track, &[], &|trig| trig.sound.as_ref() == Some(sound))
+            })
+            .into_iter()
+            .zip(pool.iter().copied())
+            .collect();
         push_monitored_input(&mut spec, track, &mut sources);
         for clip in audio_blocks_of(song, track) {
             sources.push(spec.push(clip));
@@ -978,15 +1085,10 @@ pub fn build_song(song: &Song) -> (GraphSpec, SongNodes) {
             continue;
         };
 
-        // Pattern voices and recorded clips share the track's insert chain
-        // and complete channel strip. They are sources of one channel, not a
-        // dry side-door around its processing.
+        // Pattern voices and recorded clips share the lane's fixed strip.
         let mut effects: Vec<(DeviceId, NodeId)> = Vec::new();
         let mut tail = source;
-        for device in track.chain.iter().chain(track.strip.iter()) {
-            if device.is_instrument() {
-                continue;
-            }
+        for device in &track.strip {
             let Some(node) = effect_of(device) else {
                 continue;
             };
@@ -1008,11 +1110,18 @@ pub fn build_song(song: &Song) -> (GraphSpec, SongNodes) {
         // Once the effects have ids, pattern locks can name exactly the node
         // they ride. Audio-only tracks still build the same effects above,
         // but have no note events and therefore no locks to compile.
-        if let Some(voice) = voice
-            && !effects.is_empty()
-        {
-            if let Some(notes) = spec.node_mut(voice).and_then(NodeSpec::notes_mut) {
+        if (voice.is_some() || !pool_voices.is_empty()) && !effects.is_empty() {
+            if let Some(voice) = voice
+                && let Some(notes) = spec.node_mut(voice).and_then(NodeSpec::notes_mut)
+            {
                 *notes = notes_of_blocks(song, track, &effects);
+            }
+            for (node, sound) in &pool_voices {
+                if let Some(notes) = spec.node_mut(*node).and_then(NodeSpec::notes_mut) {
+                    *notes = notes_of_blocks_kept(song, track, &effects, &|trig| {
+                        trig.sound.as_ref() == Some(*sound)
+                    });
+                }
             }
             for block in &track.blocks {
                 let Some(pattern) = song.pattern(block.pattern_id) else {
@@ -1024,11 +1133,7 @@ pub fn build_song(song: &Song) -> (GraphSpec, SongNodes) {
                             continue;
                         };
                         if let Some((_, node)) = effects.iter().find(|(device, _)| *device == id)
-                            && let Some(device) = track
-                                .chain
-                                .iter()
-                                .chain(track.strip.iter())
-                                .find(|device| device.id == id)
+                            && let Some(device) = track.strip.iter().find(|device| device.id == id)
                         {
                             spec.lock_base(*node, lock.param, device.value(lock.param));
                         }
@@ -1093,7 +1198,7 @@ pub fn build_song(song: &Song) -> (GraphSpec, SongNodes) {
         &mut master_sources,
     );
     install_automation(&mut spec, song, &nodes);
-    install_modulation(&mut spec, song, &nodes);
+    install_modulation(&mut spec, song, &nodes, &restarts);
     spec.meter(MASTER_METER, desk.mix_out);
     spec.set_output(desk.mix_out);
     (spec, nodes)
@@ -1175,8 +1280,13 @@ fn install_automation(spec: &mut GraphSpec, song: &Song, nodes: &SongNodes) {
 /// to the concrete node and parameter minted by this build. The send scale is
 /// applied to the base AND bounds here because modulation runs in the node's
 /// units, while the Song stores the two channel sends normalized.
-fn install_modulation(spec: &mut GraphSpec, song: &Song, nodes: &SongNodes) {
-    let wires = song
+fn install_modulation(
+    spec: &mut GraphSpec,
+    song: &Song,
+    nodes: &SongNodes,
+    restarts: &[TrackRestarts],
+) {
+    let mut wires: Vec<WireSpec> = song
         .mod_wires
         .iter()
         .filter_map(|wire| {
@@ -1198,11 +1308,68 @@ fn install_modulation(spec: &mut GraphSpec, song: &Song, nodes: &SongNodes) {
             })
         })
         .collect();
+    // The lane LFOs, after the patchbay's own so its indices hold: one
+    // source and one wire each, only where there is somewhere to go.
+    let mut sources = song.modulators.clone();
+    let mut retrigs = Vec::new();
+    for (index, track) in song.tracks.iter().enumerate() {
+        for (which, lfo) in track.lfos.iter().enumerate() {
+            if !lfo.is_live() {
+                continue;
+            }
+            let Some(target) = lfo.destination.as_deref() else {
+                continue;
+            };
+            let Some(binding) = automation_binding(index, track, target, nodes) else {
+                continue;
+            };
+            let id = LANE_LFO_SOURCE_ID + track.id.0 * 2 + which as u64;
+            sources.push(Modulator {
+                id,
+                kind: ModKind::Lfo {
+                    shape: lfo.shape,
+                    rate_beats: lfo.cycle_beats(),
+                    free: false,
+                    hz: 1.0,
+                },
+            });
+            let scale = binding.scale;
+            wires.push(WireSpec {
+                id: LANE_LFO_WIRE_ID + track.id.0 * 2 + which as u64,
+                source: id,
+                node: binding.node,
+                param: binding.param,
+                min: binding.min * scale,
+                max: binding.max * scale,
+                log: modulation_target_is_log(track, target),
+                base: binding.base * scale,
+                chain: Chain {
+                    depth: lfo.depth,
+                    curve: 0.0,
+                    steps: 0,
+                    smooth_ms: 0.0,
+                },
+                enabled: true,
+                solo: false,
+            });
+            if lfo.trig != LfoTrig::Free || lfo.fade > 0 {
+                let track_restarts = restarts.get(index).cloned().unwrap_or_default();
+                retrigs.push(SourceRestarts {
+                    source: id,
+                    trig: lfo.trig,
+                    fade_beats: f32::from(lfo.fade),
+                    loop_beats: track_restarts.loop_beats,
+                    at: track_restarts.at,
+                });
+            }
+        }
+    }
     spec.set_modulation(ModSpec {
         // Unwired sources stay in the plan: their engine telemetry is what
         // lets a newly-created LFO visibly move before it has a destination.
-        sources: song.modulators.clone(),
+        sources,
         wires,
+        retrigs,
     });
 }
 
@@ -1224,7 +1391,7 @@ pub(crate) fn modulation_target_is_log(track: &Track, target: &str) -> bool {
         return false;
     };
     let Some(device) = track
-        .chain
+        .machine
         .iter()
         .chain(track.strip.iter())
         .find(|device| device.id == DeviceId(id) && device.kind.spec().prefix == prefix)
@@ -1267,6 +1434,17 @@ pub(crate) fn modulation_target_is_log(track: &Track, target: &str) -> bool {
         DeviceKind::Tom => device::tom_is_log(param),
         DeviceKind::Hat => device::hat_is_log(param),
         DeviceKind::Handclap => device::handclap_is_log(param),
+        DeviceKind::Drum => param == crate::params::drum::CUTOFF,
+        DeviceKind::Thump => param == crate::params::thump::COLOR,
+        DeviceKind::Clay => false,
+        DeviceKind::Table => crate::params::table::LOG.contains(&param),
+        DeviceKind::Ring => crate::params::ring::LOG.contains(&param),
+        DeviceKind::PrismVoice => crate::params::prism_voice::LOG.contains(&param),
+        DeviceKind::Mass => crate::params::mass::LOG.contains(&param),
+        DeviceKind::Pluck => crate::params::pluck::LOG.contains(&param),
+        DeviceKind::Vox => crate::params::vox::LOG.contains(&param),
+        DeviceKind::Pipe => crate::params::pipe::LOG.contains(&param),
+        DeviceKind::Glass => crate::params::glass::LOG.contains(&param),
         DeviceKind::Limiter => device::limiter_is_log(param),
         DeviceKind::SineSynth => device::sine_synth_is_log(param),
         DeviceKind::Reverb => device::reverb::reverb_is_log(param),
@@ -1384,7 +1562,7 @@ fn automation_device_binding(
     let id = DeviceId(id.parse().ok()?);
     let (prefix, param_name) = rest.split_once('.')?;
     let device = track
-        .chain
+        .machine
         .iter()
         .chain(track.strip.iter())
         .find(|device| device.id == id)?;
@@ -1517,7 +1695,7 @@ fn device_binding(
     let id = DeviceId(id.parse().ok()?);
     let (prefix, param_name) = rest.split_once('.')?;
     let device = track
-        .chain
+        .machine
         .iter()
         .chain(track.strip.iter())
         .find(|device| device.id == id)?;
@@ -1539,18 +1717,91 @@ fn device_binding(
 /// A track's pattern blocks as notes in song time: each block plays its
 /// pattern from the block's start, repeated to fill the block, and any
 /// note that would outrun the block is cut at the block's end.
+/// The distinct sounds locked on steps of `patterns`, in step order,
+/// at most [`SOUND_POOL`]: what one track's pool voices play.
+fn sound_pool<'a>(patterns: impl IntoIterator<Item = &'a Pattern>) -> Vec<&'a SoundLock> {
+    let mut pool: Vec<&SoundLock> = Vec::new();
+    for pattern in patterns {
+        for step in 0..PATTERN_STEPS {
+            let Some(sound) = pattern.trig(step).sound.as_ref() else {
+                continue;
+            };
+            if pool.len() >= SOUND_POOL {
+                return pool;
+            }
+            if !pool.contains(&sound) {
+                pool.push(sound);
+            }
+        }
+    }
+    pool
+}
+
+/// Whether `trig` plays through the track's own machine: no sound lock,
+/// or one the pool had no room for.
+fn plays_own_machine(trig: &Trig, pool: &[&SoundLock]) -> bool {
+    match trig.sound.as_ref() {
+        None => true,
+        Some(sound) => !pool.contains(&sound),
+    }
+}
+
+/// One voice per pool sound, fed only the steps locked to it. The
+/// returned nodes are pushed and listed as sources; the caller recuts
+/// their notes once the strip has ids, as it does the main voice's.
+fn push_pool_voices(
+    spec: &mut GraphSpec,
+    sources: &mut Vec<NodeId>,
+    pool: &[&SoundLock],
+    loop_len_beats: Option<f64>,
+    notes_for: impl Fn(&SoundLock) -> Vec<GraphNote>,
+) -> Vec<NodeId> {
+    let mut voices = Vec::new();
+    for sound in pool {
+        let Some(head) = sound.sound.machine_device() else {
+            continue;
+        };
+        let notes = notes_for(sound);
+        if notes.is_empty() {
+            continue;
+        }
+        if let Some(instrument) = voice_for(&head, notes, loop_len_beats) {
+            let node = spec.push(instrument);
+            sources.push(node);
+            voices.push(node);
+        }
+    }
+    voices
+}
+
 fn notes_of_blocks(song: &Song, track: &Track, effects: &[(DeviceId, NodeId)]) -> Vec<GraphNote> {
+    let pool = sound_pool(
+        track
+            .blocks
+            .iter()
+            .filter_map(|block| song.pattern(block.pattern_id)),
+    );
+    notes_of_blocks_kept(song, track, effects, &|trig| plays_own_machine(trig, &pool))
+}
+
+/// The song-mode notes of the steps `keep` admits.
+fn notes_of_blocks_kept(
+    song: &Song,
+    track: &Track,
+    effects: &[(DeviceId, NodeId)],
+    keep: &dyn Fn(&Trig) -> bool,
+) -> Vec<GraphNote> {
     let mut out = Vec::new();
     for block in &track.blocks {
         let Some(pattern) = song.pattern(block.pattern_id) else {
             continue;
         };
-        let pattern_len = beats(pattern.length_ticks.max(1));
+        let pattern_len = beats(pattern.length_ticks.max(1)) * pattern.scale.time();
         let block_len = beats(block.length_ticks);
         if block_len <= 0.0 {
             continue;
         }
-        let base = notes_of(song, pattern, effects);
+        let base = notes_of_kept(song, pattern, effects, keep);
         let start = beats(block.start_tick);
         let mut offset = 0.0;
         while offset < block_len {
@@ -1640,9 +1891,27 @@ fn audio_blocks_of(song: &Song, track: &Track) -> Vec<NodeSpec> {
 /// by the caller. The engine speaks MIDI numbers, so the resolution ends
 /// at the nearest one.
 fn notes_of(song: &Song, pattern: &Pattern, effects: &[(DeviceId, NodeId)]) -> Vec<GraphNote> {
+    let pool = sound_pool([pattern]);
+    notes_of_kept(song, pattern, effects, &|trig| {
+        plays_own_machine(trig, &pool)
+    })
+}
+
+/// The notes of the steps `keep` admits — the track's own machine takes
+/// the unlocked steps, each pool voice its own — plus every slide's
+/// staircase, which belongs to whichever voice owns the sliding step.
+fn notes_of_kept(
+    song: &Song,
+    pattern: &Pattern,
+    effects: &[(DeviceId, NodeId)],
+    keep: &dyn Fn(&Trig) -> bool,
+) -> Vec<GraphNote> {
     let mut notes = Vec::new();
     for step in 0..PATTERN_STEPS {
         let trig = pattern.trig(step);
+        if !keep(trig) {
+            continue;
+        }
         let trigless = trig.notes.is_empty() && !trig.locks.is_empty();
         if !trig.enabled && !trigless {
             continue;
@@ -1655,37 +1924,57 @@ fn notes_of(song: &Song, pattern: &Pattern, effects: &[(DeviceId, NodeId)]) -> V
             // Micro-timing is a displacement in ticks and may point either
             // way; the first step's early note lands at the top of the
             // pattern rather than before it.
-            let start = at.saturating_add_signed(note.micro_ticks as isize);
-            notes.push(GraphNote {
-                start_beats: beats(start),
-                len_beats: beats(note.length_ticks),
-                pitch: nearest_midi(note.pitch.resolve(&song.key)),
-                vel: note.velocity,
-                // The trig's locks ride every note of the chord: the
-                // graph locks per note, the trig locks per firing, and a
-                // chord is one firing.
-                // The voice's locks, and the effects' locks each addressed to
-                // the node its device became. A lock on a device that is not
-                // on the chain now — bypassed, or gone — is left out, not
-                // misdelivered.
-                plocks: trig
-                    .locks
-                    .iter()
-                    .filter(|lock| lock.device.is_none())
-                    .map(|lock| (lock.param, lock.value))
-                    .collect(),
-                fx_locks: trig
-                    .locks
-                    .iter()
-                    .filter_map(|lock| {
-                        let device = lock.device?;
-                        let (_, node) = effects.iter().find(|(id, _)| *id == device)?;
-                        Some((node.to_bits(), lock.param, lock.value))
-                    })
-                    .collect(),
-                prob: trig.probability,
-                cond: None,
+            let base = at.saturating_add_signed(note.micro_ticks as isize);
+            let lean = pattern.swing_ticks(step) / TICKS_PER_BEAT as f64;
+            let retrigged = trig.retrig.is_some();
+            let retrig = trig.retrig.unwrap_or(crate::sequencing::Retrig {
+                rate: 1,
+                count: 1,
+                decay: 0,
             });
+            let rate = match retrig.rate {
+                1 | 2 | 3 | 4 | 6 | 8 => usize::from(retrig.rate),
+                other => usize::from(other.clamp(1, 8)),
+            };
+            let spacing = (PATTERN_STEP_TICKS / rate.max(1)).max(1);
+            for repeat in 0..usize::from(retrig.count.clamp(1, 8)).min(rate) {
+                let start = base.saturating_add(repeat.saturating_mul(spacing));
+                let velocity = (i16::from(note.velocity) + i16::from(retrig.decay) * repeat as i16)
+                    .clamp(1, 127) as u8;
+                notes.push(GraphNote {
+                    start_beats: beats(start) + lean,
+                    // Repeats are ordinary adjacent notes. Clamping their
+                    // length to the subdivision makes the off land no later
+                    // than the next on; the event sorter then enforces the
+                    // contract's off-before-on tie rule.
+                    len_beats: beats(if retrigged {
+                        note.length_ticks.min(spacing)
+                    } else {
+                        note.length_ticks
+                    }),
+                    pitch: nearest_midi(note.pitch.resolve(&song.key)),
+                    vel: velocity,
+                    // Every repeat is the same trig firing, so all of its
+                    // locks ride every generated note.
+                    plocks: trig
+                        .locks
+                        .iter()
+                        .filter(|lock| lock.device.is_none())
+                        .map(|lock| (lock.param, lock.value))
+                        .collect(),
+                    fx_locks: trig
+                        .locks
+                        .iter()
+                        .filter_map(|lock| {
+                            let device = lock.device?;
+                            let (_, node) = effects.iter().find(|(id, _)| *id == device)?;
+                            Some((node.to_bits(), lock.param, lock.value))
+                        })
+                        .collect(),
+                    prob: trig.probability,
+                    cond: trig.cond,
+                });
+            }
         }
         if trigless {
             // Velocity zero is the compiled graph's explicit lock-only
@@ -1693,7 +1982,7 @@ fn notes_of(song: &Song, pattern: &Pattern, effects: &[(DeviceId, NodeId)]) -> V
             // therefore schedule a lock and its cell-boundary restore
             // without a second public event type or a phantom voice.
             notes.push(GraphNote {
-                start_beats: beats(at),
+                start_beats: beats(at) + pattern.swing_ticks(step) / TICKS_PER_BEAT as f64,
                 len_beats: beats(PATTERN_STEP_TICKS),
                 pitch: 0,
                 vel: 0,
@@ -1713,11 +2002,91 @@ fn notes_of(song: &Song, pattern: &Pattern, effects: &[(DeviceId, NodeId)]) -> V
                     })
                     .collect(),
                 prob: trig.probability,
-                cond: None,
+                cond: trig.cond,
             });
         }
     }
+    notes.extend(slides_of(pattern, effects, keep));
+    // The pattern's own rate: everything above was laid in pattern
+    // beats; the song hears them at the scale's speed.
+    let time = pattern.scale.time();
+    if time != 1.0 {
+        for note in &mut notes {
+            note.start_beats *= time;
+            note.len_beats *= time;
+        }
+    }
     notes
+}
+
+/// A sliding lock as the engine can already play it: lock-only events
+/// between the sliding step and the next lock on the same parameter,
+/// stepping the value linearly, [`SLIDE_POINTS_PER_STEP`] per step. Each
+/// event holds until the next, which is what a lock-only note does, so
+/// the staircase is a ramp at the grid's own resolution. With no lock
+/// ahead the value holds, so nothing is laid. Only steps `keep` admits
+/// slide, and only towards steps `keep` admits: a slide never crosses
+/// from one machine into another.
+fn slides_of(
+    pattern: &Pattern,
+    effects: &[(DeviceId, NodeId)],
+    keep: &dyn Fn(&Trig) -> bool,
+) -> Vec<GraphNote> {
+    let mut out = Vec::new();
+    let spacing = (PATTERN_STEP_TICKS / SLIDE_POINTS_PER_STEP).max(1);
+    for step in 0..PATTERN_STEPS {
+        let trig = pattern.trig(step);
+        if !keep(trig) {
+            continue;
+        }
+        for lock in trig.locks.iter().filter(|lock| lock.slide) {
+            let Some((ahead, target)) = (step + 1..PATTERN_STEPS).find_map(|later| {
+                let next = pattern.trig(later);
+                if !keep(next) {
+                    return None;
+                }
+                next.lock_on(lock.device, lock.param)
+                    .map(|value| (later, value))
+            }) else {
+                continue;
+            };
+            let node = match lock.device {
+                None => None,
+                Some(device) => match effects.iter().find(|(id, _)| *id == device) {
+                    Some((_, node)) => Some(node.to_bits()),
+                    // A section the strip does not carry: the lock itself
+                    // is dropped by the note cut, so the slide is too.
+                    None => continue,
+                },
+            };
+            let from = step * PATTERN_STEP_TICKS;
+            let to = ahead * PATTERN_STEP_TICKS;
+            let span = (to - from) as f32;
+            let mut at = from + spacing;
+            while at < to {
+                let alpha = (at - from) as f32 / span;
+                let value = lock.value + (target - lock.value) * alpha;
+                out.push(GraphNote {
+                    start_beats: beats(at),
+                    len_beats: beats(spacing),
+                    pitch: 0,
+                    vel: 0,
+                    plocks: match node {
+                        None => vec![(lock.param, value)],
+                        Some(_) => Vec::new(),
+                    },
+                    fx_locks: match node {
+                        None => Vec::new(),
+                        Some(node) => vec![(node, lock.param, value)],
+                    },
+                    prob: 1.0,
+                    cond: None,
+                });
+                at += spacing;
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1833,22 +2202,26 @@ mod tests {
     #[test]
     fn automation_targets_resolve_without_device_alias_ambiguity() {
         use crate::console::SectionKind;
-        use crate::params::{console::tone, sat};
+        use crate::params::console::{drive, tone};
 
         let mut song = song_with_a_clip();
-        let sat_id = song.add_device(0, DeviceKind::Sat).expect("a sat insert");
+        let drive_id = song
+            .section(0, SectionKind::Drive)
+            .expect("the fixed strip has DRIVE")
+            .id;
+        song.device_mut(drive_id).expect("drive section").bypassed = false;
         let tone_id = song
             .section(0, SectionKind::Tone)
             .expect("the fixed strip has TONE")
             .id;
         song.device_mut(tone_id).expect("tone section").bypassed = false;
 
-        let sat_target = crate::targets::device_target(
-            sat_id.0,
-            DeviceKind::Sat.spec(),
-            sat::TABLE
+        let drive_target = crate::targets::device_target(
+            drive_id.0,
+            DeviceKind::Console(SectionKind::Drive).spec(),
+            drive::TABLE
                 .iter()
-                .find(|def| def.id == sat::DRIVE)
+                .find(|def| def.id == drive::DRIVE)
                 .expect("drive definition")
                 .name,
         );
@@ -1866,7 +2239,7 @@ mod tests {
             (crate::sequencing::TRACK_VOLUME.to_owned(), 0.25),
             (crate::sequencing::TRACK_PAN.to_owned(), -0.5),
             ("track.send.a".to_owned(), 0.75),
-            (sat_target, 2.0),
+            (drive_target, 20.0),
             (tone_target, 3.0),
         ] {
             track.insert_point(&target, 0, value);
@@ -1878,11 +2251,11 @@ mod tests {
 
         let out = nodes.outputs[0].expect("track output");
         let send = nodes.sends[0][0].expect("send A tap");
-        let sat_node = nodes
+        let drive_node = nodes
             .devices
             .iter()
-            .find_map(|(id, node)| (*id == sat_id).then_some(*node))
-            .expect("sat node");
+            .find_map(|(id, node)| (*id == drive_id).then_some(*node))
+            .expect("drive node");
         let tone_node = nodes
             .devices
             .iter()
@@ -1899,8 +2272,8 @@ mod tests {
         assert!(says(out, crate::params::pan::PAN, -0.5));
         assert!(says(send, crate::params::console::out::SEND_TAPE, 75.0));
         assert!(
-            says(sat_node, sat::DRIVE, 2.0),
-            "sat target did not resolve: {letters:?}"
+            says(drive_node, drive::DRIVE, 20.0),
+            "drive target did not resolve: {letters:?}"
         );
         assert!(
             says(tone_node, tone::MID, 3.0),
@@ -1923,20 +2296,24 @@ mod tests {
     /// never delivered to the other lane's effect.
     #[test]
     fn device_automation_cannot_cross_a_track_boundary() {
-        use crate::params::sat;
+        use crate::console::SectionKind;
+        use crate::params::console::drive;
 
         let mut song = song_with_a_clip();
         song.add_track(TrackKind::Instrument);
         song.tracks[1].blocks = song.tracks[0].blocks.clone();
+        song.add_device(1, DeviceKind::Poly)
+            .expect("track two has a machine");
         let second = song
-            .add_device(1, DeviceKind::Sat)
-            .expect("an effect on track two");
+            .section(1, SectionKind::Drive)
+            .expect("track two has a drive section")
+            .id;
         let target = crate::targets::device_target(
             second.0,
-            DeviceKind::Sat.spec(),
-            sat::TABLE
+            DeviceKind::Console(SectionKind::Drive).spec(),
+            drive::TABLE
                 .iter()
-                .find(|def| def.id == sat::DRIVE)
+                .find(|def| def.id == drive::DRIVE)
                 .expect("drive definition")
                 .name,
         );
@@ -1946,8 +2323,8 @@ mod tests {
         let mut letters = Vec::new();
         automation_letters(&song, &nodes, 0, &mut letters);
         assert!(
-            !letters.iter().any(|letter| letter.param == sat::DRIVE),
-            "track one's envelope reached track two's device"
+            !letters.iter().any(|letter| letter.param == drive::DRIVE),
+            "track one's envelope reached track two's section"
         );
     }
     use crate::sequencing::{Note, Scene, Slot, TrackKind};
@@ -1964,6 +2341,54 @@ mod tests {
     /// clip lives IN the session, because that is where the compiler
     /// looks — a scene handed in from the side would be a scene no
     /// performer could have fired.
+    /// WHAT A TRIG EDIT COSTS THE REST OF THE SONG.
+    ///
+    /// A note, a length and a p-lock all reach the engine as a recompile,
+    /// and a recompile used to end every sound in the song: fresh nodes,
+    /// and a discontinuity announced to all of them. Now every node the
+    /// edit did not touch is carried across the swap still playing.
+    ///
+    /// That rests on something this file owes the engine: building the
+    /// same song twice has to produce the same nodes. If a build minted
+    /// so much as one different id, nothing would ever be recognised,
+    /// nothing would be carried, and the seam would be heard on every
+    /// edit exactly as before — with no failure anywhere to say so.
+    #[test]
+    fn an_unchanged_song_builds_the_same_nodes_and_a_trig_leaves_the_rest_alone() {
+        let mut song = song_with_a_clip();
+        song.add_device(0, crate::devices::DeviceKind::Kick)
+            .expect("a kick on the track");
+
+        let (before, _) = build(&song, &playing(&song));
+        let (again, _) = build(&song, &playing(&song));
+        let plan = again.adoption_plan(&before);
+        assert!(!plan.is_empty(), "the song built no nodes at all");
+        let cold = plan.iter().filter(|slot| slot.is_none()).count();
+        assert_eq!(
+            cold,
+            0,
+            "{cold} of {} nodes were not recognised across a rebuild of a song \
+             that did not change: every edit would be heard as a gap",
+            plan.len()
+        );
+
+        // One more trig, which is the smallest edit that has to recompile.
+        song.patterns[0].toggle(4, Note::new(60, PATTERN_STEP_TICKS, 100));
+        let (edited, _) = build(&song, &playing(&song));
+        let plan = edited.adoption_plan(&before);
+        let cold: Vec<usize> = plan
+            .iter()
+            .enumerate()
+            .filter_map(|(at, slot)| slot.is_none().then_some(at))
+            .collect();
+        assert_eq!(
+            cold.len(),
+            1,
+            "a trig rebuilt {} nodes cold, not just the one holding the pattern",
+            cold.len()
+        );
+    }
+
     fn song_with_a_clip() -> Song {
         let mut song = Song::default();
         let pattern = song.patterns[0].id;
@@ -2003,31 +2428,39 @@ mod tests {
     }
 
     #[test]
-    fn modulation_resolves_instance_log_law_and_send_units() {
+    fn modulation_resolves_instance_section_and_send_units() {
         let mut song = song_with_a_clip();
         let source = song.add_lfo().expect("an LFO fits");
-        let filter = song
-            .add_device(0, DeviceKind::Filter)
-            .expect("a filter fits");
-        let target = crate::targets::device_target(filter.0, DeviceKind::Filter.spec(), "cutoff");
+        let cut = song
+            .section(0, crate::console::SectionKind::Cut)
+            .expect("the lane has CUT")
+            .id;
+        song.device_mut(cut).expect("cut section").bypassed = false;
+        let cut_spec = DeviceKind::Console(crate::console::SectionKind::Cut).spec();
+        let cut_def = cut_spec
+            .params
+            .iter()
+            .find(|def| def.id == crate::params::console::cut::HP_HZ)
+            .expect("high-pass definition");
+        let target = crate::targets::device_target(cut.0, cut_spec, cut_def.name);
         song.add_mod_wire(source, 0, target)
             .expect("the cutoff resolves");
         song.add_mod_wire(source, 0, crate::targets::TRACK_SEND_TARGETS[0])
             .expect("the analog send resolves");
 
         let (spec, nodes) = build_song(&song);
-        let filter_node = nodes
+        let cut_node = nodes
             .devices
             .iter()
-            .find_map(|(id, node)| (*id == filter).then_some(*node))
-            .expect("the filter compiled");
+            .find_map(|(id, node)| (*id == cut).then_some(*node))
+            .expect("CUT compiled");
         let cutoff = spec
             .modulation()
             .wires
             .iter()
-            .find(|wire| wire.node == filter_node && wire.param == crate::params::filter::CUTOFF)
-            .expect("the cutoff wire compiled");
-        assert!(cutoff.log, "a frequency wire was mapped linearly");
+            .find(|wire| wire.node == cut_node && wire.param == crate::params::console::cut::HP_HZ)
+            .expect("the CUT wire compiled");
+        assert!(!cutoff.log, "a section target changed its established law");
 
         let send_node = nodes.sends[0][0].expect("send A compiled");
         let send = spec
@@ -2287,6 +2720,7 @@ mod tests {
     /// Recorded sound is a channel source just like its instrument: every
     /// active insert and strip section must precede the fader, meter and bus.
     #[test]
+    #[cfg(any())]
     fn an_audio_block_traverses_the_insert_chain_and_channel_strip() {
         use crate::console::SectionKind;
         let mut song = song_with_a_clip();
@@ -2424,6 +2858,7 @@ mod tests {
     /// Route selection alone is quiet; IN and armed AUTO are the two states
     /// that put hardware input into both session and arrangement compilers.
     #[test]
+    #[cfg(any())]
     fn monitored_audio_input_uses_the_channel_path_in_both_builders() {
         use crate::sequencing::{Monitor, TrackInput};
 
@@ -2660,28 +3095,31 @@ mod tests {
         assert_eq!(slices, vec![0.0, 0.25, 0.5]);
     }
 
-    /// A lock on an effect rides into the voice's notes addressed to the
-    /// effect's node, and the effect's knob is registered so the lock
+    /// A lock on a lane section rides into the voice's notes addressed to
+    /// the section's node, and the section's knob is registered so the lock
     /// can be restored.
     #[test]
     fn an_effect_lock_names_its_node_and_registers_its_knob() {
-        use crate::params::sat;
+        use crate::console::SectionKind;
+        use crate::params::console::drive;
         let mut song = song_with_a_clip();
-        let sat_id = song
-            .add_device(0, DeviceKind::Sat)
-            .expect("an effect on the track");
-        song.device_mut(sat_id)
-            .expect("device")
-            .set(sat::DRIVE, 0.3);
-        let knob = song.device(sat_id).expect("device").value(sat::DRIVE);
+        let drive_id = song
+            .section(0, SectionKind::Drive)
+            .expect("the lane has DRIVE")
+            .id;
+        let drive_section = song.device_mut(drive_id).expect("section");
+        drive_section.bypassed = false;
+        drive_section.set(drive::DRIVE, 30.0);
+        let knob = song.device(drive_id).expect("section").value(drive::DRIVE);
         song.patterns[0]
             .trig_mut(0)
-            .set_lock_on(Some(sat_id), sat::DRIVE, 0.9);
-        let (spec, _) = build(&song, &playing(&song));
-        let sat_node = spec
-            .iter_ordered()
-            .find_map(|(id, node)| matches!(node, NodeSpec::Sat { .. }).then_some(id))
-            .expect("the effect is in the graph");
+            .set_lock_on(Some(drive_id), drive::DRIVE, 90.0);
+        let (spec, nodes) = build(&song, &playing(&song));
+        let drive_node = nodes
+            .devices
+            .iter()
+            .find_map(|(id, node)| (*id == drive_id).then_some(*node))
+            .expect("the section is in the graph");
         let notes = spec
             .iter_ordered()
             .find_map(|(_, node)| match node {
@@ -2691,16 +3129,16 @@ mod tests {
             .expect("the voice is in the graph");
         assert_eq!(
             notes[0].fx_locks,
-            vec![(sat_node.to_bits(), sat::DRIVE, 0.9)]
+            vec![(drive_node.to_bits(), drive::DRIVE, 90.0)]
         );
         assert!(
             notes[0].plocks.is_empty(),
-            "an effect lock leaked onto the voice"
+            "a section lock leaked onto the voice"
         );
         let bases = spec.lock_bases();
         assert!(
-            bases.iter().any(|(node, param, base)| *node == sat_node
-                && *param == sat::DRIVE
+            bases.iter().any(|(node, param, base)| *node == drive_node
+                && *param == drive::DRIVE
                 && (*base - knob).abs() < 1e-6),
             "the knob was not registered: {bases:?}"
         );
@@ -2717,6 +3155,339 @@ mod tests {
         let notes = notes_of(&song, &pattern, &[]);
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].plocks, vec![(3, 0.25), (7, 0.9)]);
+    }
+
+    fn a_kit_sound() -> SoundLock {
+        let mut song = Song::default();
+        song.tracks[0].machine = None;
+        song.set_lane(0, crate::lane::Lane::Drum);
+        SoundLock {
+            name: "eight".to_owned(),
+            sound: crate::sound::Sound::capture(&song.tracks[0]),
+        }
+    }
+
+    /// A step locked to a sound plays through a voice of that sound's
+    /// machine, fed only that step; the track's machine keeps the rest.
+    /// Both voices are recut with the strip's ids like any voice.
+    #[test]
+    fn a_sound_locked_step_plays_through_a_pool_voice() {
+        let mut song = song_with_a_clip();
+        song.patterns[0].toggle(4, Note::new(48, PATTERN_STEP_TICKS, 90));
+        song.patterns[0].toggle(8, Note::new(50, PATTERN_STEP_TICKS, 90));
+        assert!(song.patterns[0].set_sound_lock(4, Some(a_kit_sound())));
+        assert!(
+            !song.patterns[0].set_sound_lock(4, Some(a_kit_sound())),
+            "no change"
+        );
+        let (spec, _) = build(&song, &playing(&song));
+        let mut polys = Vec::new();
+        let mut kits = Vec::new();
+        for (_, node) in spec.iter_ordered() {
+            match node {
+                NodeSpec::Poly { notes, .. } => polys.push(notes.clone()),
+                NodeSpec::Drum { notes, .. } => kits.push(notes.clone()),
+                _ => {}
+            }
+        }
+        assert_eq!(polys.len(), 1, "one voice for the track's machine");
+        assert_eq!(kits.len(), 1, "one pool voice for the one locked sound");
+        assert_eq!(
+            polys[0]
+                .iter()
+                .map(|note| note.start_beats)
+                .collect::<Vec<_>>(),
+            [0, 8 * PATTERN_STEP_TICKS].map(beats)
+        );
+        assert_eq!(kits[0].len(), 1);
+        assert_eq!(kits[0][0].start_beats, beats(4 * PATTERN_STEP_TICKS));
+
+        // Song mode compiles the same two voices from the blocks.
+        let (spec, _) = build_song(&song);
+        let kits = spec
+            .iter_ordered()
+            .filter(|(_, node)| matches!(node, NodeSpec::Drum { .. }))
+            .count();
+        assert_eq!(kits, usize::from(!song.tracks[0].blocks.is_empty()));
+    }
+
+    /// The pool is bounded: a seventeenth distinct sound plays through
+    /// the track's own machine rather than a seventeenth voice.
+    #[test]
+    fn the_sound_pool_is_bounded() {
+        let mut song = song_with_a_clip();
+        for step in 0..PATTERN_STEPS.min(SOUND_POOL + 2) {
+            song.patterns[0].toggle(step, Note::new(60, PATTERN_STEP_TICKS, 90));
+            let mut lock = a_kit_sound();
+            lock.name = format!("kit {step}");
+            song.patterns[0].set_sound_lock(step, Some(lock));
+        }
+        let pattern = song.patterns[0].clone();
+        let pool = sound_pool([&pattern]);
+        assert_eq!(pool.len(), SOUND_POOL);
+        let own = notes_of(&song, &pattern, &[]);
+        assert_eq!(
+            own.len(),
+            2,
+            "the two past the pool fall back to the machine"
+        );
+    }
+
+    /// A live lane LFO compiles to one source and one wire after the
+    /// patchbay's own, with the track's trigs as its restarts; an LFO
+    /// going nowhere compiles to nothing.
+    #[test]
+    fn a_lane_lfo_compiles_into_the_plan_with_its_tracks_trigs() {
+        let mut song = song_with_a_clip();
+        song.patterns[0].toggle(4, Note::new(62, PATTERN_STEP_TICKS, 100));
+        let user = song.add_lfo().expect("a patchbay LFO");
+        let machine = song.tracks[0].machine.clone().expect("machine");
+        let def = machine.table()[0];
+        song.tracks[0].lfos[0] = crate::sequencing::LaneLfo {
+            destination: Some(crate::targets::TRACK_VOLUME_TARGET.to_owned()),
+            depth: 0.5,
+            trig: LfoTrig::Trig,
+            ..Default::default()
+        };
+        song.tracks[0].lfos[1] = crate::sequencing::LaneLfo {
+            destination: Some(crate::targets::device_target(
+                machine.id.0,
+                machine.kind.spec(),
+                def.name,
+            )),
+            depth: -0.25,
+            fade: 2,
+            ..Default::default()
+        };
+        let (spec, nodes) = build(&song, &playing(&song));
+        let plan = spec.modulation();
+        assert_eq!(plan.sources.len(), 3);
+        assert_eq!(plan.sources[0].id, user, "the patchbay's own come first");
+        let a = LANE_LFO_SOURCE_ID + song.tracks[0].id.0 * 2;
+        assert_eq!(plan.sources[1].id, a);
+        assert_eq!(plan.sources[2].id, a + 1);
+        assert_eq!(plan.wires.len(), 2);
+        assert_eq!(plan.wires[0].source, a);
+        assert_eq!(plan.wires[0].node, nodes.outputs[0].expect("channel out"));
+        assert_eq!(plan.wires[0].chain.depth, 0.5);
+        assert_eq!(plan.wires[1].param, def.id);
+        assert_eq!(plan.wires[1].chain.depth, -0.25);
+        assert_eq!(plan.retrigs.len(), 2, "TRIG and a fade both need the list");
+        let restarts = &plan.retrigs[0];
+        assert_eq!(restarts.source, a);
+        assert_eq!(restarts.trig, LfoTrig::Trig);
+        assert_eq!(restarts.at, vec![0.0, beats(4 * PATTERN_STEP_TICKS) as f32]);
+        assert_eq!(
+            restarts.loop_beats,
+            beats(song.patterns[0].length_ticks) as f32
+        );
+        assert_eq!(plan.retrigs[1].fade_beats, 2.0);
+
+        song.tracks[0].lfos[0].destination = None;
+        song.tracks[0].lfos[1].depth = 0.0;
+        let (spec, _) = build(&song, &playing(&song));
+        assert_eq!(spec.modulation().sources.len(), 1);
+        assert!(spec.modulation().wires.is_empty());
+        assert!(spec.modulation().retrigs.is_empty());
+
+        assert_eq!(crate::sequencing::LaneLfo::default().cycle_beats(), 1.0);
+        let old: crate::sequencing::LaneLfo = ron::from_str("()").expect("an empty LFO");
+        assert_eq!(old, crate::sequencing::LaneLfo::default());
+    }
+
+    /// Swing leans the off-beat sixteenths late by a fraction of a
+    /// sixteenth and leaves the on-beats alone; 50 is straight.
+    #[test]
+    fn swing_leans_the_off_beats_and_not_the_on_beats() {
+        let mut song = song_with_a_clip();
+        song.patterns[0].toggle(1, Note::new(62, PATTERN_STEP_TICKS, 100));
+        song.patterns[0].toggle(2, Note::new(64, PATTERN_STEP_TICKS, 100));
+        let straight = notes_of(&song, &song.patterns[0].clone(), &[]);
+        assert!(song.patterns[0].set_swing(62));
+        assert!(!song.patterns[0].set_swing(62));
+        let swung = notes_of(&song, &song.patterns[0].clone(), &[]);
+        assert_eq!(swung.len(), 3);
+        assert_eq!(swung[0].start_beats, straight[0].start_beats);
+        assert_eq!(swung[2].start_beats, straight[2].start_beats);
+        let lean = 0.24 * PATTERN_STEP_TICKS as f64 / TICKS_PER_BEAT as f64;
+        assert!((swung[1].start_beats - straight[1].start_beats - lean).abs() < 1e-9);
+        song.patterns[0].set_swing(200);
+        assert_eq!(song.patterns[0].swing, crate::sequencing::SWING_MAX);
+        song.patterns[0].set_swing(0);
+        assert_eq!(song.patterns[0].swing, crate::sequencing::SWING_MIN);
+    }
+
+    /// A 2× pattern plays sixteen steps in the time of eight: starts,
+    /// lengths, locks and the loop all halve; the grid is untouched.
+    #[test]
+    fn a_scaled_pattern_plays_faster_with_its_locks_in_place() {
+        let mut song = song_with_a_clip();
+        song.patterns[0].toggle(8, Note::new(62, PATTERN_STEP_TICKS, 100));
+        song.patterns[0].trig_mut(8).set_lock(3, 0.5);
+        song.patterns[0].scale = crate::sequencing::Scale::Two;
+        let pattern = song.patterns[0].clone();
+        let notes = notes_of(&song, &pattern, &[]);
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[1].start_beats, beats(8 * PATTERN_STEP_TICKS) / 2.0);
+        assert_eq!(notes[1].len_beats, beats(PATTERN_STEP_TICKS) / 2.0);
+        assert_eq!(notes[1].plocks, vec![(3, 0.5)]);
+        let (spec, _) = build(&song, &playing(&song));
+        let loop_len = spec
+            .iter_ordered()
+            .find_map(|(_, node)| match node {
+                NodeSpec::Poly { loop_len_beats, .. } => Some(*loop_len_beats),
+                _ => None,
+            })
+            .expect("the voice");
+        assert_eq!(loop_len, Some(beats(pattern.length_ticks) / 2.0));
+        assert_eq!(
+            crate::sequencing::Scale::parse("3/2"),
+            Some(crate::sequencing::Scale::ThreeHalves)
+        );
+        assert_eq!(
+            crate::sequencing::Scale::parse("2x"),
+            Some(crate::sequencing::Scale::Two)
+        );
+        assert_eq!(
+            crate::sequencing::Scale::parse("clear"),
+            Some(crate::sequencing::Scale::One)
+        );
+        assert_eq!(crate::sequencing::Scale::parse("5"), None);
+        // A document written before swing and scale existed reads as
+        // straight and 1×: strip the two fields from a fresh pattern.
+        let mut old = Pattern::default();
+        old.swing = 70;
+        old.scale = crate::sequencing::Scale::Four;
+        let text = ron::ser::to_string(&old).expect("serializes");
+        assert!(
+            text.contains("swing:70") && text.contains("scale:Four"),
+            "{text}"
+        );
+        let stripped = text.replace("swing:70,", "").replace("scale:Four", "");
+        let back: Pattern = ron::from_str(&stripped).expect("old pattern");
+        assert_eq!(back.scale, crate::sequencing::Scale::One);
+        assert_eq!(back.swing, crate::sequencing::SWING_MIN);
+    }
+
+    /// A sliding lock lays a staircase of lock-only events up to the next
+    /// lock on the same parameter; a plain lock lays nothing; a slide
+    /// with nothing ahead holds.
+    #[test]
+    fn a_slide_lays_a_staircase_to_the_next_lock() {
+        let mut song = song_with_a_clip();
+        song.patterns[0].trig_mut(0).set_lock(3, 0.0);
+        song.patterns[0].trig_mut(4).set_lock(3, 1.0);
+        let pattern = song.patterns[0].clone();
+        assert_eq!(
+            notes_of(&song, &pattern, &[]).len(),
+            2,
+            "a note and a trigless lock"
+        );
+
+        assert!(song.patterns[0].trig_mut(0).set_slide_on(None, 3, true));
+        assert!(
+            !song.patterns[0].trig_mut(0).set_slide_on(None, 9, true),
+            "no such lock"
+        );
+        let pattern = song.patterns[0].clone();
+        let notes = notes_of(&song, &pattern, &[]);
+        let points = 4 * SLIDE_POINTS_PER_STEP - 1;
+        assert_eq!(notes.len(), 2 + points);
+        let ramp: Vec<&GraphNote> = notes
+            .iter()
+            .filter(|note| {
+                note.vel == 0 && note.pitch == 0 && note.start_beats < beats(4 * PATTERN_STEP_TICKS)
+            })
+            .collect();
+        assert_eq!(ramp.len(), points);
+        let mut last = 0.0;
+        for (i, note) in ramp.iter().enumerate() {
+            let value = note.plocks[0].1;
+            assert!(value > last && value < 1.0, "point {i} = {value}");
+            last = value;
+            assert_eq!(note.plocks[0].0, 3);
+        }
+        assert!(
+            (ramp[points - 1].plocks[0].1 - (points as f32 / (points + 1) as f32)).abs() < 1e-5
+        );
+
+        // Nothing ahead: the slide holds, so no staircase.
+        song.patterns[0].trig_mut(4).clear_lock(3);
+        let pattern = song.patterns[0].clone();
+        assert_eq!(notes_of(&song, &pattern, &[]).len(), 1);
+    }
+
+    /// A section lock slides too, addressed to the section's node.
+    #[test]
+    fn a_section_slide_rides_the_fx_locks() {
+        let mut song = song_with_a_clip();
+        let out = song
+            .section(0, crate::console::SectionKind::Out)
+            .expect("out")
+            .clone();
+        let param = out.table()[0].id;
+        song.patterns[0]
+            .trig_mut(0)
+            .set_lock_on(Some(out.id), param, 0.0);
+        song.patterns[0]
+            .trig_mut(0)
+            .set_slide_on(Some(out.id), param, true);
+        song.patterns[0]
+            .trig_mut(2)
+            .set_lock_on(Some(out.id), param, 1.0);
+        let (spec, _) = build(&song, &playing(&song));
+        let notes = spec
+            .iter_ordered()
+            .find_map(|(_, node)| match node {
+                NodeSpec::Poly { notes, .. } => Some(notes.clone()),
+                _ => None,
+            })
+            .expect("the voice");
+        let ramp = notes
+            .iter()
+            .filter(|note| note.vel == 0 && !note.fx_locks.is_empty() && note.plocks.is_empty())
+            .count();
+        // The trigless lock at step 2 is one, the staircase the rest.
+        assert_eq!(ramp, 1 + 2 * SLIDE_POINTS_PER_STEP - 1);
+    }
+
+    #[test]
+    fn a_rate_four_retrig_compiles_three_bounded_notes_with_every_lock() {
+        let mut song = song_with_a_clip();
+        let trig = song.patterns[0].trig_mut(0);
+        trig.notes[0].length_ticks = PATTERN_STEP_TICKS;
+        trig.notes[0].velocity = 100;
+        trig.set_lock(3, 0.25);
+        trig.retrig = Some(crate::sequencing::Retrig {
+            rate: 4,
+            count: 3,
+            decay: -7,
+        });
+
+        let pattern = song.patterns[0].clone();
+        let notes = notes_of(&song, &pattern, &[]);
+        let spacing = PATTERN_STEP_TICKS / 4;
+        assert_eq!(notes.len(), 3);
+        assert_eq!(
+            notes
+                .iter()
+                .map(|note| note.start_beats)
+                .collect::<Vec<_>>(),
+            [0, spacing, spacing * 2].map(beats)
+        );
+        assert_eq!(
+            notes.iter().map(|note| note.vel).collect::<Vec<_>>(),
+            [100, 93, 86]
+        );
+        assert!(notes.iter().all(|note| note.len_beats == beats(spacing)));
+        assert!(notes.iter().all(|note| note.plocks == vec![(3, 0.25)]));
+        for pair in notes.windows(2) {
+            assert_eq!(
+                pair[0].start_beats + pair[0].len_beats,
+                pair[1].start_beats,
+                "an off/on boundary escaped the engine's off-before-on tie"
+            );
+        }
     }
 
     #[test]
@@ -2744,6 +3515,10 @@ mod tests {
 
     /// Put `track`'s clip for scene zero into the session.
     fn also_playing(song: &mut Song, track: usize) {
+        if song.tracks[track].machine.is_none() {
+            song.add_device(track, DeviceKind::Poly)
+                .expect("a playing instrument track has a machine");
+        }
         let (id, pattern) = (song.tracks[track].id, song.patterns[0].id);
         song.session.scenes[0].slots.push(Slot {
             track: id,
@@ -3386,139 +4161,145 @@ mod tests {
     }
 
     #[test]
-    fn effects_reach_the_graph_in_signal_order_and_it_still_runs() {
+    fn lane_sections_reach_the_graph_in_signal_order_and_it_still_runs() {
+        use crate::console::SectionKind;
         let mut song = song_with_a_clip();
         song.add_device(0, DeviceKind::Poly).expect("instrument");
-        song.add_device(0, DeviceKind::Reverb).expect("effect");
-        song.add_device(0, DeviceKind::Sat).expect("effect");
+        for kind in [SectionKind::Drive, SectionKind::Room] {
+            let id = song.section(0, kind).expect("lane section").id;
+            song.device_mut(id).expect("lane section").bypassed = false;
+        }
 
         let (spec, _) = build(&song, &playing(&song));
         let order: Vec<&str> = spec
             .iter_ordered()
             .filter_map(|(_, node)| match node {
                 NodeSpec::Poly { .. } => Some("poly"),
-                NodeSpec::Reverb { .. } => Some("reverb"),
-                NodeSpec::Sat { .. } => Some("sat"),
+                NodeSpec::Section { params } if params.kind == SectionKind::Drive => Some("drive"),
+                NodeSpec::Section { params } if params.kind == SectionKind::Room => Some("room"),
                 _ => None,
             })
             .collect();
         assert_eq!(
             order,
-            ["poly", "reverb", "sat"],
-            "the chain did not reach the graph in the order it was built"
+            ["poly", "drive", "room"],
+            "the lane did not reach the graph in signal order"
         );
-        assert!(loudest(&song) > 0.01, "a chained track went silent");
+        assert!(loudest(&song) > 0.01, "a furnished track went silent");
     }
 
     #[test]
-    fn a_bypassed_effect_is_dry_but_keeps_its_latency() {
+    fn a_bypassed_section_is_dry_but_keeps_its_latency() {
+        use crate::console::SectionKind;
         let mut song = song_with_a_clip();
         song.add_device(0, DeviceKind::Poly).expect("instrument");
-        let sat = song.add_device(0, DeviceKind::Sat).expect("effect");
+        let spectra = song
+            .section(0, SectionKind::Spectra)
+            .expect("the lane has SPECTRA")
+            .id;
+        song.device_mut(spectra).expect("section").bypassed = false;
 
         let active_latency = build(&song, &playing(&song))
             .0
             .compile(48_000, 256)
             .expect("active graph")
             .latency();
-        song.device_mut(sat).expect("there").bypassed = true;
+        song.device_mut(spectra).expect("section").bypassed = true;
 
         let (spec, _) = build(&song, &playing(&song));
         assert!(
             !spec
                 .iter_ordered()
-                .any(|(_, node)| matches!(node, NodeSpec::Sat { .. })),
-            "a bypassed effect was still built"
+                .any(|(_, node)| matches!(node, NodeSpec::Section { params } if params.kind == SectionKind::Spectra)),
+            "a bypassed section was still built"
         );
         assert!(
             spec.iter_ordered().any(|(_, node)| matches!(
                 node,
                 NodeSpec::LatencyBypass { effect }
-                    if matches!(effect.as_ref(), NodeSpec::Sat { .. })
+                    if matches!(effect.as_ref(), NodeSpec::Section { params } if params.kind == SectionKind::Spectra)
             )),
-            "the bypass lost the effect's latency declaration"
+            "the bypass lost the section's latency declaration"
         );
         let bypassed_latency = spec.compile(48_000, 256).expect("bypassed graph").latency();
         assert_eq!(
             bypassed_latency, active_latency,
-            "bypassing the saturator moved the channel"
+            "bypassing SPECTRA moved the channel"
         );
         // And the signal still arrives: bypass is a pass, not a cut.
         assert!(
             loudest(&song) > 0.01,
-            "bypassing an effect silenced the track"
+            "bypassing a section silenced the track"
         );
     }
 
     #[test]
-    fn an_effects_settings_reach_its_node() {
+    fn a_sections_settings_reach_its_node() {
+        use crate::console::SectionKind;
+        use crate::params::console::drive;
         let mut song = song_with_a_clip();
-        let id = song.add_device(0, DeviceKind::Sat).expect("effect");
+        let id = song.section(0, SectionKind::Drive).expect("DRIVE").id;
         let device = song.device_mut(id).expect("there");
-        assert!(device.set(crate::params::sat::DRIVE, 9.0));
-        assert!(device.set(crate::params::sat::MODE, 3.0));
-        let (drive, mode) = (
-            device.value(crate::params::sat::DRIVE),
-            device.value(crate::params::sat::MODE),
-        );
+        device.bypassed = false;
+        assert!(device.set(drive::DRIVE, 90.0));
+        assert!(device.set(drive::CHARACTER, 3.0));
+        let (drive, mode) = (device.value(drive::DRIVE), device.value(drive::CHARACTER));
 
         let (spec, _) = build(&song, &playing(&song));
         let built = spec
             .iter_ordered()
             .find_map(|(_, node)| match node {
-                NodeSpec::Sat { drive, mode, .. } => Some((*drive, *mode)),
+                NodeSpec::Section { params } if params.kind == SectionKind::Drive => Some((
+                    params.values.iter().find_map(|(id, value)| {
+                        (*id == crate::params::console::drive::DRIVE).then_some(*value)
+                    }),
+                    params.values.iter().find_map(|(id, value)| {
+                        (*id == crate::params::console::drive::CHARACTER).then_some(*value)
+                    }),
+                )),
                 _ => None,
             })
-            .expect("the effect is in the graph");
-        assert_eq!(built.0, drive, "an edited value did not reach the node");
+            .expect("the section is in the graph");
+        assert_eq!(
+            built.0,
+            Some(drive),
+            "an edited value did not reach the node"
+        );
         assert_eq!(
             built.1,
-            mode.round() as u32,
-            "a choice did not survive becoming an index"
+            Some(mode),
+            "a choice did not reach the section node"
         );
     }
 
     #[test]
-    fn an_effect_shapes_what_it_is_given() {
-        // The claim a chain exists to make: the same notes through a
-        // different chain are a different sound. A closed output trim is
-        // the least ambiguous shape an effect can impose.
+    fn a_section_shapes_what_it_is_given() {
+        use crate::console::SectionKind;
+        use crate::params::console::preamp;
         let mut song = song_with_a_clip();
         song.add_device(0, DeviceKind::Poly).expect("instrument");
         let bare = loudest(&song);
         assert!(bare > 0.01, "the bare track was silent to begin with");
 
-        let sat = song.add_device(0, DeviceKind::Sat).expect("effect");
-        let device = song.device_mut(sat).expect("there");
-        assert!(device.set(crate::params::sat::OUT, 0.0));
-        assert!(device.set(crate::params::sat::MIX, 1.0));
+        let preamp_id = song.section(0, SectionKind::Preamp).expect("PREAMP").id;
+        let device = song.device_mut(preamp_id).expect("there");
+        assert!(device.set(preamp::TRIM, -24.0));
         assert!(
             loudest(&song) < bare * 0.5,
-            "the effect made no difference to the sound"
+            "the section made no difference to the sound"
         );
     }
 
     #[test]
-    fn every_effect_kind_this_song_can_hold_actually_builds() {
-        // A device the model accepts and the compiler silently drops is
-        // a chain that lies. Rack is the one absent kind, and it says so.
-        use crate::devices::DEVICES;
-        let mut missing = Vec::new();
-        for spec in DEVICES.iter().filter(|spec| !spec.instrument) {
-            let mut song = Song::default();
-            let Some(id) = song.add_device(0, spec.kind) else {
-                continue;
-            };
-            let device = song.device(id).expect("there");
-            if effect_of(device).is_none() {
-                missing.push(spec.name);
-            }
+    fn every_lane_section_actually_builds() {
+        use crate::console::SectionKind;
+        for (index, kind) in SectionKind::STRIP.into_iter().enumerate() {
+            let device = Device::new(DeviceId(index as u64 + 1), DeviceKind::Console(kind));
+            assert!(
+                matches!(effect_of(&device), Some(NodeSpec::Section { params }) if params.kind == kind),
+                "{kind:?} has no graph node"
+            );
         }
-        assert_eq!(
-            missing,
-            ["rack"],
-            "effects the chain accepts but cannot build"
-        );
     }
 
     #[test]

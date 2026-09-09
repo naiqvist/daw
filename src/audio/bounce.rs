@@ -914,6 +914,7 @@ mod tests {
         spec.set_output(mix);
 
         spec.set_modulation(ModSpec {
+            retrigs: Vec::new(),
             sources: vec![Modulator {
                 id: 1,
                 kind: ModKind::Lfo {
@@ -982,6 +983,7 @@ mod tests {
         spec.meter(0, mix);
 
         spec.set_modulation(ModSpec {
+            retrigs: Vec::new(),
             sources: vec![Modulator {
                 id: 1,
                 kind: ModKind::Follower { track: 0 },

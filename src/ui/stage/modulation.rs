@@ -299,7 +299,11 @@ pub(super) fn targets(song: &Song, track: usize) -> Vec<Target> {
             });
         }
     }
-    push_device_targets(&mut out, track, &lane.chain);
+    // The machine first, then the strip: a lane LFO's destination is any
+    // slot on any page, and the machine's are the pages that matter most.
+    if let Some(machine) = lane.machine.as_ref() {
+        push_device_targets(&mut out, track, std::slice::from_ref(machine));
+    }
     push_device_targets(&mut out, track, &lane.strip);
     out
 }
@@ -867,8 +871,22 @@ mod tests {
         let rows = targets(&song, 0);
         assert!(rows.iter().any(|target| target.id == "track.volume"));
         assert!(rows.iter().any(|target| target.id == "track.send.a"));
-        assert!(rows.iter().any(|target| target.group.starts_with("IN ")));
-        assert!(rows.iter().any(|target| target.group.starts_with("OUT ")));
+        let preamp = song
+            .section(0, crate::console::SectionKind::Preamp)
+            .expect("plain lane preamp")
+            .id;
+        let out = song
+            .section(0, crate::console::SectionKind::Out)
+            .expect("plain lane out")
+            .id;
+        assert!(
+            rows.iter()
+                .any(|target| target.id.starts_with(&format!("dev.{}.", preamp.0)))
+        );
+        assert!(
+            rows.iter()
+                .any(|target| target.id.starts_with(&format!("dev.{}.", out.0)))
+        );
         assert!(rows.iter().any(|target| target.id.starts_with("dev.")));
         let pan = rows
             .iter()
@@ -991,21 +1009,31 @@ mod tests {
     }
 
     #[test]
-    fn a_log_target_scope_uses_the_engines_octave_domain() {
+    fn a_section_target_scope_uses_the_engines_linear_domain() {
         let mut stage = Stage::new();
         stage.set_palette_open(false);
         stage.open_modulation().unwrap();
-        let filter = stage.song.add_device(0, DeviceKind::Filter).unwrap();
-        let target = crate::targets::device_target(filter.0, DeviceKind::Filter.spec(), "cutoff");
+        let cut = stage
+            .song
+            .section(0, crate::console::SectionKind::Cut)
+            .expect("plain lane cut")
+            .id;
+        let spec = DeviceKind::Console(crate::console::SectionKind::Cut).spec();
+        let def = spec
+            .params
+            .iter()
+            .find(|def| def.id == crate::params::console::cut::HP_HZ)
+            .expect("high-pass row");
+        let target = crate::targets::device_target(cut.0, spec, def.name);
         let source = stage.song.add_lfo().unwrap();
         let wire = stage.song.add_mod_wire(source, 0, &target).unwrap();
         let row = targets(&stage.song, 0)
             .into_iter()
             .find(|candidate| candidate.id == target)
             .unwrap();
-        let octave_span = crate::audio::modulation::wire_span(row.min, row.max, true);
+        let span = crate::audio::modulation::wire_span(row.min, row.max, false);
 
-        stage.set_modulation_readings(&[0.0], &[wire], &[octave_span * 0.5]);
+        stage.set_modulation_readings(&[0.0], &[wire], &[span * 0.5]);
         let plotted = stage.mod_wire_scopes[&wire].back().copied().unwrap();
         assert!((plotted - 0.5).abs() < 1.0e-6);
     }

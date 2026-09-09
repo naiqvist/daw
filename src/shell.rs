@@ -563,7 +563,8 @@ impl<A: Host> Shell<A> {
             None,
             Some(device.limits().max_texture_dimension_2d as usize),
         );
-        let renderer = egui_wgpu::Renderer::new(&device, format, Default::default());
+        let mut renderer = egui_wgpu::Renderer::new(&device, format, Default::default());
+        crate::ui::kiln::install(&mut renderer, format);
         let post = post::Post::new(&device, format);
         let screens = screen::Pass::new(&device, format);
         let offscreen = Offscreen::new(&device, format, size, 0);

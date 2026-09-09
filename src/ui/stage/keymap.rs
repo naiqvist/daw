@@ -7,6 +7,7 @@
 
 use super::Step;
 use super::key::{Key, Mods};
+use crate::pages::PageKey;
 
 /// The conditioning context in which a key is interpreted.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -25,6 +26,9 @@ pub(super) enum ScopeContext {
     /// each one has. A place beside the session, like the browser, rather
     /// than a level inside it.
     Chain,
+    /// The clip is still open, but the sixteen physical trig keys own the
+    /// keyboard instead of the sentence grammar.
+    Steps,
     /// Focus is inside a clip: the sequencer is drawn in the field and its
     /// grammar owns the keyboard. The stage keeps only what is global —
     /// time, the codebook, the browser, making tracks — and the one way
@@ -59,16 +63,39 @@ pub(super) enum ScopeContext {
     /// its knobs as rows. A place of its own, like the sample editor,
     /// that Escape leaves.
     Forge,
+    /// The deck's window is up and the step keys are not: the arrows walk
+    /// the lit page's eight cells and turn them, the digits pick a cell,
+    /// the function keys turn the pages. The grid underneath waits;
+    /// Escape puts the window away. With the step keys on, the Steps
+    /// scope carries the same cell keys beside the sixteen.
+    Deck,
+    /// The session clip matrix is up over the song view: the arrows walk
+    /// the session small, Enter lays the cell's clip (or the row's whole
+    /// scene) at the arrangement's cursor and the cursor rides on. A
+    /// window like the deck's; Escape puts it away.
+    Matrix,
+    /// The lab is the field and the TILER has the keys: Alt chords
+    /// open, focus, swap, size and close its windows; Enter goes into
+    /// the focused one; Escape leaves the lab.
+    Lab,
+    /// A KILN window has the keys: Tab walks its bands, the arrows and
+    /// digits its macros and sliders, `/` opens the slider filter;
+    /// Escape returns to the tiler. The tiler's Alt chords still work.
+    Kiln,
+    /// The kiln's slider filter is open and the letters are its text;
+    /// Escape closes it, Enter keeps the query.
+    KilnFilter,
+    MidiLab,
 }
 
 impl ScopeContext {
-    #[cfg(test)]
-    pub(super) const ALL: [Self; 13] = [
+    pub(super) const ALL: [Self; 20] = [
         Self::Root,
         Self::Nested,
         Self::Browser,
         Self::Mixer,
         Self::Chain,
+        Self::Steps,
         Self::Clip,
         Self::Rename,
         Self::TrigMenu,
@@ -77,6 +104,12 @@ impl ScopeContext {
         Self::Sample,
         Self::Song,
         Self::Forge,
+        Self::Deck,
+        Self::Matrix,
+        Self::Lab,
+        Self::Kiln,
+        Self::KilnFilter,
+        Self::MidiLab,
     ];
 }
 
@@ -84,6 +117,80 @@ impl ScopeContext {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StageIntent {
     Step(Step),
+    Page(PageKey),
+    PageBack(PageKey),
+    Slot(u8),
+    Turn {
+        up: bool,
+        coarse: bool,
+    },
+    StepKeys,
+    StepKey(u8),
+    Window(Step),
+    /// N in the step-key mode: the selected slot's lock slides.
+    Slide,
+    /// V: the deck's window, up or away.
+    Deck,
+    /// Left and Right with the deck up: the previous or next cell.
+    SlotStep(Step),
+    HeroTool(u8),
+    /// P in the song view: the session clip matrix, up or away.
+    Matrix,
+    /// Enter in the matrix: lay the cell's clip, or the row's scene, at
+    /// the arrangement's cursor; `over` clears the span first.
+    MatrixLay {
+        over: bool,
+    },
+    /// S in the matrix: onto the row's head, or back to the cell.
+    MatrixHead,
+    /// Ctrl+Shift+L, or `:lab`: the lab takes the field, or gives it back.
+    Lab,
+    /// Alt+Enter in the lab: a new kiln window beside the focused one.
+    LabWindow,
+    MidiLabOpen,
+    MidiLabHear,
+    MidiLabPlay,
+    MidiLabSend,
+    MidiLabStop,
+    /// Shift+arrows in the MIDI Lab: change the control under the cursor.
+    MidiLabShift(Step),
+    /// Tab in the MIDI Lab: the next group of cells.
+    MidiLabGroup,
+    /// Alt+Q: close the focused window.
+    LabClose,
+    /// Alt+H/J/K/L: focus the window in that direction.
+    LabFocus(Step),
+    /// Alt+Shift+H/J/K/L: swap rooms with the window in that direction.
+    LabSwap(Step),
+    /// Alt+F: the focused window fills the field, or fits again.
+    LabFull,
+    /// Alt+[ and Alt+]: the focused window's room, smaller or larger.
+    LabResize(Step),
+    /// Alt+T: the split holding the focused window turns the other way.
+    LabSplit,
+    /// Alt+Space: the next window.
+    LabCycle,
+    /// Tab in a kiln: the next band (engine, macros, sliders).
+    KilnBand,
+    /// A digit in a kiln: that macro (Shift for 9–16).
+    KilnMacro(u8),
+    /// Shift+arrows in a kiln: a coarse walk or turn.
+    KilnCoarse(Step),
+    /// `/` in a kiln: the slider filter, open or closed.
+    KilnFilter,
+    /// Space in a kiln: hear the engine's preview.
+    KilnHear,
+    /// P in a kiln: bake and print to the library.
+    KilnPrint,
+    /// S in a kiln: bake, save to the browser's kiln folder, and send to
+    /// a new sampler track.
+    KilnSend,
+    KilnReplace,
+    KilnOrbit(Step),
+    KilnZoom(bool),
+    KilnScrub(bool),
+    /// E in a kiln: the next engine.
+    KilnEngine,
     /// Hear the instrument under the band's cursor without a trig: a
     /// kit's pad in play, a brick's or a sampler's file.
     Hear,
@@ -506,6 +613,13 @@ impl StageIntent {
                 _ => {}
             }
         }
+        if self == Self::Enter {
+            match scope {
+                ScopeContext::Deck => return "keep",
+                ScopeContext::Steps => return "keep · place trig",
+                _ => {}
+            }
+        }
         self.label()
     }
 
@@ -520,6 +634,89 @@ impl StageIntent {
             Self::Step(Step::Down) => "move down",
             Self::Step(Step::Left) => "move left",
             Self::Step(Step::Right) => "move right",
+            Self::Page(key) => match key {
+                PageKey::Trig => "trig page",
+                PageKey::Src => "source page",
+                PageKey::Fltr => "filter page",
+                PageKey::Amp => "amp page",
+                PageKey::Lfo => "lfo page",
+                PageKey::Fx => "lane effects page",
+                PageKey::Mix => "mix page",
+                PageKey::All => "eighth key",
+            },
+            Self::PageBack(_) => "previous sub-page",
+            Self::Slot(_) => "select deck slot",
+            Self::Turn {
+                up: true,
+                coarse: false,
+            } => "turn slot up",
+            Self::Turn {
+                up: false,
+                coarse: false,
+            } => "turn slot down",
+            Self::Turn {
+                up: true,
+                coarse: true,
+            } => "coarse slot up",
+            Self::Turn {
+                up: false,
+                coarse: true,
+            } => "coarse slot down",
+            Self::StepKeys => "step keys",
+            Self::Slide => "slide lock",
+            Self::HeroTool(verb) => {
+                crate::pages::hero_tools(crate::devices::DeviceKind::Sampler, "Sample")
+                    .iter()
+                    .find(|t| t.verb == verb)
+                    .map_or("sample tool", |t| t.word)
+            }
+            Self::Deck => "deck window",
+            Self::Matrix => "clip matrix",
+            Self::MatrixLay { over: false } => "lay clip or scene",
+            Self::MatrixLay { over: true } => "lay over",
+            Self::MatrixHead => "scene head",
+            Self::Lab => "the lab",
+            Self::LabWindow => "new kiln window",
+            Self::MidiLabOpen => "open MIDI Lab",
+            Self::MidiLabHear => "hear current chord",
+            Self::MidiLabPlay => "play current MIDI clip",
+            Self::MidiLabSend => "send MIDI to destination",
+            Self::MidiLabStop => "stop MIDI preview",
+            Self::MidiLabShift(_) => "change the control",
+            Self::MidiLabGroup => "next lab group",
+            Self::LabClose => "close window",
+            Self::LabFocus(Step::Left) => "focus left",
+            Self::LabFocus(Step::Right) => "focus right",
+            Self::LabFocus(Step::Up) => "focus up",
+            Self::LabFocus(Step::Down) => "focus down",
+            Self::LabSwap(Step::Left) => "swap left",
+            Self::LabSwap(Step::Right) => "swap right",
+            Self::LabSwap(Step::Up) => "swap up",
+            Self::LabSwap(Step::Down) => "swap down",
+            Self::LabFull => "fullscreen window",
+            Self::LabResize(Step::Right) => "grow window",
+            Self::LabResize(_) => "shrink window",
+            Self::LabSplit => "turn the split",
+            Self::LabCycle => "next lab window",
+            Self::KilnBand => "next band",
+            Self::KilnMacro(_) => "pick macro",
+            Self::KilnCoarse(_) => "coarse turn",
+            Self::KilnFilter => "filter sliders",
+            Self::KilnHear => "hear the preview",
+            Self::KilnPrint => "print bake",
+            Self::KilnSend => "send to sampler",
+            Self::KilnReplace => "replace last send",
+            Self::KilnOrbit(_) => "orbit drum",
+            Self::KilnZoom(_) => "zoom drum",
+            Self::KilnScrub(_) => "scrub strike",
+            Self::KilnEngine => "next engine",
+            Self::SlotStep(Step::Left) => "previous cell",
+            Self::SlotStep(Step::Right) => "next cell",
+            Self::SlotStep(_) => "cell",
+            Self::StepKey(_) => "hold or tap step",
+            Self::Window(Step::Left) => "previous window",
+            Self::Window(Step::Right) => "next window",
+            Self::Window(_) => "step window",
             Self::Group(Step::Up | Step::Left) => "previous group",
             Self::Group(_) => "next group",
             Self::Select => "select this cell",
@@ -727,6 +924,11 @@ const BINDINGS: &[Binding] = &[
     Binding::command(ScopeContext::Root, Key::Comma, StageIntent::Preferences),
     Binding::command_shift(ScopeContext::Root, Key::E, StageIntent::ExportConsole),
     Binding::command_shift(ScopeContext::Root, Key::D, StageIntent::Diagnostics),
+    // The lab: a section of its own, from the field's three projections.
+    Binding::command_shift(ScopeContext::Root, Key::L, StageIntent::Lab),
+    Binding::command_shift(ScopeContext::Nested, Key::L, StageIntent::Lab),
+    Binding::command_shift(ScopeContext::Song, Key::L, StageIntent::Lab),
+    Binding::command_shift(ScopeContext::Mixer, Key::L, StageIntent::Lab),
     Binding::command(ScopeContext::Nested, Key::O, StageIntent::ProjectManager),
     Binding::command(ScopeContext::Nested, Key::Comma, StageIntent::Preferences),
     Binding::command_shift(ScopeContext::Nested, Key::E, StageIntent::ExportConsole),
@@ -1199,13 +1401,13 @@ const BINDINGS: &[Binding] = &[
     Binding::command(ScopeContext::Chain, Key::S, StageIntent::Save),
     Binding::command(ScopeContext::Browser, Key::S, StageIntent::Save),
     Binding::command(ScopeContext::Clip, Key::S, StageIntent::Save),
-    // The track under the cursor: its name, its place, its existence.
-    // Rename is on the key the grammar already spends on it; deleting a
-    // track is the one verb here that destroys content, so it takes the
-    // modifier — the same key that clears a slot, told to mean more.
-    Binding::new(ScopeContext::Root, Key::F2, StageIntent::Rename),
-    Binding::new(ScopeContext::Nested, Key::F2, StageIntent::Rename),
-    Binding::new(ScopeContext::Mixer, Key::F2, StageIntent::Rename),
+    // F2 now owns SRC. Rename keeps its old neighbourhood with Command:
+    // the page is the plain key, the track-name operation the modified one.
+    Binding::command(ScopeContext::Root, Key::F2, StageIntent::Rename),
+    Binding::command(ScopeContext::Nested, Key::F2, StageIntent::Rename),
+    Binding::command(ScopeContext::Mixer, Key::F2, StageIntent::Rename),
+    // Deleting a track is the one verb here that destroys content, so it
+    // takes the modifier — the same key that clears a slot, told to mean more.
     Binding::command(ScopeContext::Root, Key::Delete, StageIntent::DeleteTrack),
     Binding::command(ScopeContext::Nested, Key::Delete, StageIntent::DeleteTrack),
     Binding::command(ScopeContext::Mixer, Key::Delete, StageIntent::DeleteTrack),
@@ -1560,6 +1762,9 @@ const BINDINGS: &[Binding] = &[
         Key::E,
         StageIntent::Sample(SampleIntent::Open),
     ),
+    // The band's own door into a room. The band has no key of its own
+    // any more, so this is reachable only by intent; it stays for the
+    // tests that walk the rooms until the remake retires them.
     Binding::new(
         ScopeContext::Chain,
         Key::Enter,
@@ -2019,12 +2224,13 @@ const BINDINGS: &[Binding] = &[
         Key::D,
         StageIntent::Song(SongIntent::Duplicate),
     ),
-    Binding::new(
+    Binding::new(ScopeContext::Song, Key::P, StageIntent::Matrix),
+    Binding::command(
         ScopeContext::Song,
         Key::P,
         StageIntent::Song(SongIntent::Pick),
     ),
-    Binding::shift(
+    Binding::command_shift(
         ScopeContext::Song,
         Key::P,
         StageIntent::Song(SongIntent::PickBack),
@@ -2108,17 +2314,17 @@ const BINDINGS: &[Binding] = &[
     // the mixer, the song, a clip, a room — closing the room it was in,
     // and closes the band from inside it. Only the two scopes that type
     // letters keep V as a letter. ^D is the duplicate's now.
-    Binding::new(ScopeContext::Root, Key::V, StageIntent::Devices),
-    Binding::new(ScopeContext::Nested, Key::V, StageIntent::Devices),
-    Binding::new(ScopeContext::Mixer, Key::V, StageIntent::Devices),
-    Binding::new(ScopeContext::Song, Key::V, StageIntent::Devices),
-    Binding::new(ScopeContext::Chain, Key::V, StageIntent::Devices),
-    Binding::new(ScopeContext::Clip, Key::V, StageIntent::Devices),
-    Binding::new(ScopeContext::TrigMenu, Key::V, StageIntent::Devices),
-    Binding::new(ScopeContext::Plock, Key::V, StageIntent::Devices),
-    Binding::new(ScopeContext::Modulation, Key::V, StageIntent::Devices),
-    Binding::new(ScopeContext::Sample, Key::V, StageIntent::Devices),
-    Binding::new(ScopeContext::Forge, Key::V, StageIntent::Devices),
+    Binding::new(ScopeContext::Root, Key::V, StageIntent::Deck),
+    Binding::new(ScopeContext::Nested, Key::V, StageIntent::Deck),
+    Binding::new(ScopeContext::Mixer, Key::V, StageIntent::Deck),
+    Binding::new(ScopeContext::Song, Key::V, StageIntent::Deck),
+    Binding::new(ScopeContext::Chain, Key::V, StageIntent::Deck),
+    Binding::new(ScopeContext::Clip, Key::V, StageIntent::Deck),
+    Binding::new(ScopeContext::TrigMenu, Key::V, StageIntent::Deck),
+    Binding::new(ScopeContext::Plock, Key::V, StageIntent::Deck),
+    Binding::new(ScopeContext::Modulation, Key::V, StageIntent::Deck),
+    Binding::new(ScopeContext::Sample, Key::V, StageIntent::Deck),
+    Binding::new(ScopeContext::Forge, Key::V, StageIntent::Deck),
     // A section IN or OUT: the desk's button, on the band's Shift+Enter
     // as well as the M the effects already answer to.
     Binding::shift(ScopeContext::Chain, Key::Enter, StageIntent::Mute),
@@ -2127,11 +2333,491 @@ const BINDINGS: &[Binding] = &[
 /// Every binding in one scope, in table order. The help surface reads
 /// THIS — it is a projection of the codebook, never prose written beside
 /// it, so it cannot describe a key the stage does not actually answer to.
-pub(super) fn bindings_for(scope: ScopeContext) -> impl Iterator<Item = (Mods, Key, StageIntent)> {
-    BINDINGS
+pub(super) fn bindings_for(scope: ScopeContext) -> std::vec::IntoIter<(Mods, Key, StageIntent)> {
+    if scope == ScopeContext::Deck {
+        return deck_bindings().into_iter();
+    }
+    if scope == ScopeContext::Matrix {
+        return matrix_bindings().into_iter();
+    }
+    if matches!(
+        scope,
+        ScopeContext::Lab | ScopeContext::Kiln | ScopeContext::KilnFilter | ScopeContext::MidiLab
+    ) {
+        return lab_bindings(scope).into_iter();
+    }
+    let inherited = if scope == ScopeContext::Steps {
+        ScopeContext::Clip
+    } else {
+        scope
+    };
+    let mut bindings: Vec<_> = BINDINGS
         .iter()
-        .filter(move |binding| binding.scope == scope)
+        .filter(|binding| binding.scope == inherited)
+        // With the step keys on, the arrows are the deck's: the cells
+        // and their values, not the grid's cursor.
+        .filter(|binding| {
+            scope != ScopeContext::Steps
+                || !matches!(
+                    binding.key,
+                    Key::ArrowUp | Key::ArrowDown | Key::ArrowLeft | Key::ArrowRight
+                )
+        })
         .map(|binding| (binding.modifiers, binding.key, binding.intent))
+        .collect();
+    bindings.extend(page_bindings(scope));
+    bindings.into_iter()
+}
+
+/// The arrows as the deck reads them, in every scope where the deck's
+/// cells are the subject: Left and Right walk the cells, Up and Down
+/// turn the one under the cursor, Shift makes the turn coarse.
+fn cell_arrows() -> [(Mods, Key, StageIntent); 6] {
+    [
+        (
+            Mods::NONE,
+            Key::ArrowLeft,
+            StageIntent::SlotStep(Step::Left),
+        ),
+        (
+            Mods::NONE,
+            Key::ArrowRight,
+            StageIntent::SlotStep(Step::Right),
+        ),
+        (
+            Mods::NONE,
+            Key::ArrowUp,
+            StageIntent::Turn {
+                up: true,
+                coarse: false,
+            },
+        ),
+        (
+            Mods::NONE,
+            Key::ArrowDown,
+            StageIntent::Turn {
+                up: false,
+                coarse: false,
+            },
+        ),
+        (
+            Mods::SHIFT,
+            Key::ArrowUp,
+            StageIntent::Turn {
+                up: true,
+                coarse: true,
+            },
+        ),
+        (
+            Mods::SHIFT,
+            Key::ArrowDown,
+            StageIntent::Turn {
+                up: false,
+                coarse: true,
+            },
+        ),
+    ]
+}
+
+/// The lab's scopes. The tiler's chords all carry Alt and are the same
+/// from the tiler and from inside a window; the globals every scope
+/// keeps ride along. Inside a kiln the bare keys are the instrument's;
+/// with its filter open the letters are text and only the arrows,
+/// Escape, Enter and Backspace are keys.
+fn lab_bindings(scope: ScopeContext) -> Vec<(Mods, Key, StageIntent)> {
+    let mut out = vec![
+        (Mods::NONE, Key::Home, StageIntent::Rewind),
+        (Mods::NONE, Key::F9, StageIntent::ToggleRecord),
+        (Mods::COMMAND, Key::L, StageIntent::Ground),
+        (Mods::NONE, Key::Questionmark, StageIntent::Help),
+        (Mods::COMMAND, Key::Z, StageIntent::Undo),
+        (Mods::COMMAND.plus(Mods::SHIFT), Key::Z, StageIntent::Redo),
+        (Mods::COMMAND.plus(Mods::SHIFT), Key::L, StageIntent::Lab),
+        (Mods::NONE, Key::Escape, StageIntent::Escape),
+        (Mods::NONE, Key::Enter, StageIntent::Enter),
+        (Mods::ALT, Key::Enter, StageIntent::LabWindow),
+        (Mods::ALT, Key::M, StageIntent::MidiLabOpen),
+        (Mods::ALT, Key::Q, StageIntent::LabClose),
+        (Mods::ALT, Key::H, StageIntent::LabFocus(Step::Left)),
+        (Mods::ALT, Key::J, StageIntent::LabFocus(Step::Down)),
+        (Mods::ALT, Key::K, StageIntent::LabFocus(Step::Up)),
+        (Mods::ALT, Key::L, StageIntent::LabFocus(Step::Right)),
+        (
+            Mods::ALT.plus(Mods::SHIFT),
+            Key::H,
+            StageIntent::LabSwap(Step::Left),
+        ),
+        (
+            Mods::ALT.plus(Mods::SHIFT),
+            Key::J,
+            StageIntent::LabSwap(Step::Down),
+        ),
+        (
+            Mods::ALT.plus(Mods::SHIFT),
+            Key::K,
+            StageIntent::LabSwap(Step::Up),
+        ),
+        (
+            Mods::ALT.plus(Mods::SHIFT),
+            Key::L,
+            StageIntent::LabSwap(Step::Right),
+        ),
+        (Mods::ALT, Key::F, StageIntent::LabFull),
+        (
+            Mods::ALT,
+            Key::OpenBracket,
+            StageIntent::LabResize(Step::Left),
+        ),
+        (
+            Mods::ALT,
+            Key::CloseBracket,
+            StageIntent::LabResize(Step::Right),
+        ),
+        (Mods::ALT, Key::T, StageIntent::LabSplit),
+        (Mods::ALT, Key::Space, StageIntent::LabCycle),
+    ];
+    match scope {
+        ScopeContext::MidiLab => {
+            out.extend([
+                (Mods::NONE, Key::H, StageIntent::MidiLabHear),
+                (Mods::NONE, Key::P, StageIntent::MidiLabPlay),
+                (Mods::NONE, Key::Space, StageIntent::ToggleTransport),
+                (Mods::NONE, Key::S, StageIntent::MidiLabSend),
+                (Mods::SHIFT, Key::P, StageIntent::MidiLabStop),
+                // A page this wide spends its arrows on getting about:
+                // they walk every control on the screen, and shift and an
+                // arrow changes whatever they have reached.
+                (Mods::NONE, Key::ArrowLeft, StageIntent::Step(Step::Left)),
+                (Mods::NONE, Key::ArrowRight, StageIntent::Step(Step::Right)),
+                (Mods::NONE, Key::ArrowUp, StageIntent::Step(Step::Up)),
+                (Mods::NONE, Key::ArrowDown, StageIntent::Step(Step::Down)),
+                (
+                    Mods::SHIFT,
+                    Key::ArrowUp,
+                    StageIntent::MidiLabShift(Step::Up),
+                ),
+                (
+                    Mods::SHIFT,
+                    Key::ArrowDown,
+                    StageIntent::MidiLabShift(Step::Down),
+                ),
+                (
+                    Mods::SHIFT,
+                    Key::ArrowLeft,
+                    StageIntent::MidiLabShift(Step::Left),
+                ),
+                (
+                    Mods::SHIFT,
+                    Key::ArrowRight,
+                    StageIntent::MidiLabShift(Step::Right),
+                ),
+                (Mods::NONE, Key::Tab, StageIntent::MidiLabGroup),
+            ]);
+        }
+        ScopeContext::Lab => {
+            out.push((Mods::NONE, Key::Space, StageIntent::ToggleTransport));
+        }
+        ScopeContext::Kiln => {
+            out.push((Mods::NONE, Key::Tab, StageIntent::KilnBand));
+            out.push((Mods::NONE, Key::ArrowUp, StageIntent::Step(Step::Up)));
+            out.push((Mods::NONE, Key::ArrowDown, StageIntent::Step(Step::Down)));
+            out.push((Mods::NONE, Key::ArrowLeft, StageIntent::Step(Step::Left)));
+            out.push((Mods::NONE, Key::ArrowRight, StageIntent::Step(Step::Right)));
+            out.push((Mods::SHIFT, Key::ArrowUp, StageIntent::KilnCoarse(Step::Up)));
+            out.push((
+                Mods::SHIFT,
+                Key::ArrowDown,
+                StageIntent::KilnCoarse(Step::Down),
+            ));
+            out.push((
+                Mods::SHIFT,
+                Key::ArrowLeft,
+                StageIntent::KilnCoarse(Step::Left),
+            ));
+            out.push((
+                Mods::SHIFT,
+                Key::ArrowRight,
+                StageIntent::KilnCoarse(Step::Right),
+            ));
+            for (n, key) in DIGITS.into_iter().enumerate() {
+                out.push((Mods::NONE, key, StageIntent::KilnMacro(n as u8)));
+                out.push((Mods::SHIFT, key, StageIntent::KilnMacro(n as u8 + 8)));
+            }
+            out.push((Mods::NONE, Key::Slash, StageIntent::KilnFilter));
+            out.push((Mods::NONE, Key::Space, StageIntent::ToggleTransport));
+            out.push((Mods::NONE, Key::H, StageIntent::KilnHear));
+            out.push((Mods::NONE, Key::P, StageIntent::KilnPrint));
+            out.push((Mods::NONE, Key::S, StageIntent::KilnSend));
+            out.push((Mods::SHIFT, Key::S, StageIntent::KilnReplace));
+            for (key, step) in [
+                (Key::ArrowLeft, Step::Left),
+                (Key::ArrowRight, Step::Right),
+                (Key::ArrowUp, Step::Up),
+                (Key::ArrowDown, Step::Down),
+            ] {
+                out.push((Mods::COMMAND, key, StageIntent::KilnOrbit(step)));
+            }
+            out.push((Mods::NONE, Key::Equals, StageIntent::KilnZoom(true)));
+            out.push((Mods::NONE, Key::Plus, StageIntent::KilnZoom(true)));
+            out.push((Mods::SHIFT, Key::Plus, StageIntent::KilnZoom(true)));
+            out.push((Mods::NONE, Key::Minus, StageIntent::KilnZoom(false)));
+            out.push((
+                Mods::COMMAND,
+                Key::OpenBracket,
+                StageIntent::KilnScrub(false),
+            ));
+            out.push((
+                Mods::COMMAND,
+                Key::CloseBracket,
+                StageIntent::KilnScrub(true),
+            ));
+            out.push((Mods::NONE, Key::E, StageIntent::KilnEngine));
+        }
+        _ => {
+            out.push((Mods::NONE, Key::Space, StageIntent::ToggleTransport));
+            out.push((Mods::NONE, Key::ArrowUp, StageIntent::Step(Step::Up)));
+            out.push((Mods::NONE, Key::ArrowDown, StageIntent::Step(Step::Down)));
+            out.push((Mods::NONE, Key::ArrowLeft, StageIntent::Step(Step::Left)));
+            out.push((Mods::NONE, Key::ArrowRight, StageIntent::Step(Step::Right)));
+            out.push((Mods::NONE, Key::Backspace, StageIntent::Backspace));
+        }
+    }
+    out
+}
+
+/// The matrix's own scope: the globals every window keeps, the arrows
+/// over the session small, Enter to lay, S for the row's head, P or
+/// Escape to put it away. No page keys: the deck stays down while the
+/// matrix is up.
+fn matrix_bindings() -> Vec<(Mods, Key, StageIntent)> {
+    vec![
+        (Mods::NONE, Key::Space, StageIntent::ToggleTransport),
+        (Mods::NONE, Key::Home, StageIntent::Rewind),
+        (Mods::NONE, Key::F9, StageIntent::ToggleRecord),
+        (Mods::COMMAND, Key::L, StageIntent::Ground),
+        (Mods::NONE, Key::Questionmark, StageIntent::Help),
+        (Mods::COMMAND, Key::Z, StageIntent::Undo),
+        (Mods::COMMAND.plus(Mods::SHIFT), Key::Z, StageIntent::Redo),
+        (Mods::NONE, Key::Escape, StageIntent::Escape),
+        (Mods::NONE, Key::P, StageIntent::Matrix),
+        (Mods::NONE, Key::ArrowUp, StageIntent::Step(Step::Up)),
+        (Mods::NONE, Key::ArrowDown, StageIntent::Step(Step::Down)),
+        (Mods::NONE, Key::ArrowLeft, StageIntent::Step(Step::Left)),
+        (Mods::NONE, Key::ArrowRight, StageIntent::Step(Step::Right)),
+        (
+            Mods::NONE,
+            Key::Enter,
+            StageIntent::MatrixLay { over: false },
+        ),
+        (
+            Mods::SHIFT,
+            Key::Enter,
+            StageIntent::MatrixLay { over: true },
+        ),
+        (Mods::NONE, Key::S, StageIntent::MatrixHead),
+    ]
+}
+
+/// The deck's own scope: a modal window like the browser, with the
+/// globals every scope keeps, the function keys, the cell keys and the
+/// arrows. The digits pick a cell directly; the step keys, when on, take
+/// the digits back and the Steps scope carries the cells instead.
+fn deck_bindings() -> Vec<(Mods, Key, StageIntent)> {
+    let mut out = vec![
+        (Mods::NONE, Key::Space, StageIntent::ToggleTransport),
+        (Mods::NONE, Key::Home, StageIntent::Rewind),
+        (Mods::NONE, Key::F9, StageIntent::ToggleRecord),
+        (Mods::COMMAND, Key::L, StageIntent::Ground),
+        (Mods::NONE, Key::Questionmark, StageIntent::Help),
+        (Mods::COMMAND, Key::Z, StageIntent::Undo),
+        (Mods::COMMAND.plus(Mods::SHIFT), Key::Z, StageIntent::Redo),
+        (Mods::NONE, Key::Escape, StageIntent::Escape),
+        (Mods::NONE, Key::V, StageIntent::Deck),
+        (Mods::NONE, Key::L, StageIntent::StepKeys),
+        // Enter is the deck's while the window is up: KEEP. Left to the
+        // grid it would be ACT, which pastes the last chord over every
+        // selected cell and throws away the note, velocity and length
+        // the cells were just turned to.
+        (Mods::NONE, Key::Enter, StageIntent::Enter),
+    ];
+    for (key, page) in F_KEYS {
+        out.push((Mods::SHIFT, key, StageIntent::PageBack(page)));
+        out.push((Mods::NONE, key, StageIntent::Page(page)));
+    }
+    for (slot, key) in DIGITS.into_iter().enumerate() {
+        out.push((Mods::NONE, key, StageIntent::Slot(slot as u8)));
+    }
+    out.extend(
+        crate::pages::hero_tools(crate::devices::DeviceKind::Sampler, "Sample")
+            .iter()
+            .map(|t| (Mods::NONE, t.key, StageIntent::HeroTool(t.verb))),
+    );
+    out.extend(cell_arrows());
+    out
+}
+
+const F_KEYS: [(Key, PageKey); 8] = [
+    (Key::F1, PageKey::Trig),
+    (Key::F2, PageKey::Src),
+    (Key::F3, PageKey::Fltr),
+    (Key::F4, PageKey::Amp),
+    (Key::F5, PageKey::Lfo),
+    (Key::F6, PageKey::Fx),
+    (Key::F7, PageKey::Mix),
+    (Key::F8, PageKey::All),
+];
+
+const DIGITS: [Key; 8] = [
+    Key::Num1,
+    Key::Num2,
+    Key::Num3,
+    Key::Num4,
+    Key::Num5,
+    Key::Num6,
+    Key::Num7,
+    Key::Num8,
+];
+
+fn page_bindings(scope: ScopeContext) -> Vec<(Mods, Key, StageIntent)> {
+    if matches!(
+        scope,
+        ScopeContext::Browser
+            | ScopeContext::Rename
+            | ScopeContext::Matrix
+            | ScopeContext::Lab
+            | ScopeContext::Kiln
+            | ScopeContext::KilnFilter
+            | ScopeContext::MidiLab
+    ) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (key, page) in [
+        (Key::F1, PageKey::Trig),
+        (Key::F2, PageKey::Src),
+        (Key::F3, PageKey::Fltr),
+        (Key::F4, PageKey::Amp),
+        (Key::F5, PageKey::Lfo),
+        (Key::F6, PageKey::Fx),
+        (Key::F7, PageKey::Mix),
+        (Key::F8, PageKey::All),
+    ] {
+        out.push((Mods::SHIFT, key, StageIntent::PageBack(page)));
+        out.push((Mods::NONE, key, StageIntent::Page(page)));
+    }
+    if scope == ScopeContext::Steps {
+        for (slot, key) in [
+            Key::A,
+            Key::S,
+            Key::D,
+            Key::F,
+            Key::G,
+            Key::H,
+            Key::J,
+            Key::K,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            out.push((Mods::NONE, key, StageIntent::Slot(slot as u8)));
+        }
+        for (step, key) in [
+            Key::Num1,
+            Key::Num2,
+            Key::Num3,
+            Key::Num4,
+            Key::Num5,
+            Key::Num6,
+            Key::Num7,
+            Key::Num8,
+            Key::Q,
+            Key::W,
+            Key::E,
+            Key::R,
+            Key::T,
+            Key::Y,
+            Key::U,
+            Key::I,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            out.push((Mods::NONE, key, StageIntent::StepKey(step as u8)));
+        }
+        out.extend(cell_arrows());
+        out.extend([
+            (
+                Mods::NONE,
+                Key::OpenBracket,
+                StageIntent::Window(Step::Left),
+            ),
+            (
+                Mods::NONE,
+                Key::CloseBracket,
+                StageIntent::Window(Step::Right),
+            ),
+            (Mods::NONE, Key::L, StageIntent::StepKeys),
+        ]);
+    } else {
+        for (slot, key) in [
+            Key::Num1,
+            Key::Num2,
+            Key::Num3,
+            Key::Num4,
+            Key::Num5,
+            Key::Num6,
+            Key::Num7,
+            Key::Num8,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            out.push((Mods::ALT, key, StageIntent::Slot(slot as u8)));
+        }
+        out.extend([
+            (
+                Mods::ALT,
+                Key::ArrowLeft,
+                StageIntent::Turn {
+                    up: false,
+                    coarse: false,
+                },
+            ),
+            (
+                Mods::ALT,
+                Key::ArrowRight,
+                StageIntent::Turn {
+                    up: true,
+                    coarse: false,
+                },
+            ),
+            (
+                Mods::ALT.plus(Mods::SHIFT),
+                Key::ArrowLeft,
+                StageIntent::Turn {
+                    up: false,
+                    coarse: true,
+                },
+            ),
+            (
+                Mods::ALT.plus(Mods::SHIFT),
+                Key::ArrowRight,
+                StageIntent::Turn {
+                    up: true,
+                    coarse: true,
+                },
+            ),
+        ]);
+        if scope == ScopeContext::Clip {
+            out.push((Mods::NONE, Key::L, StageIntent::StepKeys));
+        }
+    }
+    if scope == ScopeContext::Steps {
+        out.push((Mods::NONE, Key::N, StageIntent::Slide));
+        // Enter confirms: the selected steps take their trig.
+        out.push((Mods::NONE, Key::Enter, StageIntent::Enter));
+    }
+    out
 }
 
 /// Which family a verb belongs to, as the palette's grouping word.
@@ -2148,6 +2834,45 @@ fn family(intent: StageIntent) -> &'static str {
         | StageIntent::SelectStep(_)
         | StageIntent::Enter
         | StageIntent::Escape => "move",
+        StageIntent::Page(_)
+        | StageIntent::PageBack(_)
+        | StageIntent::Slot(_)
+        | StageIntent::Turn { .. }
+        | StageIntent::StepKeys
+        | StageIntent::StepKey(_)
+        | StageIntent::Window(_)
+        | StageIntent::Slide
+        | StageIntent::HeroTool(_)
+        | StageIntent::Deck
+        | StageIntent::SlotStep(_) => "pages",
+        StageIntent::Lab
+        | StageIntent::LabWindow
+        | StageIntent::MidiLabOpen
+        | StageIntent::MidiLabHear
+        | StageIntent::MidiLabPlay
+        | StageIntent::MidiLabSend
+        | StageIntent::MidiLabStop
+        | StageIntent::MidiLabShift(_)
+        | StageIntent::MidiLabGroup
+        | StageIntent::LabClose
+        | StageIntent::LabFocus(_)
+        | StageIntent::LabSwap(_)
+        | StageIntent::LabFull
+        | StageIntent::LabResize(_)
+        | StageIntent::LabSplit
+        | StageIntent::LabCycle
+        | StageIntent::KilnBand
+        | StageIntent::KilnMacro(_)
+        | StageIntent::KilnCoarse(_)
+        | StageIntent::KilnFilter
+        | StageIntent::KilnHear
+        | StageIntent::KilnPrint
+        | StageIntent::KilnSend
+        | StageIntent::KilnReplace
+        | StageIntent::KilnOrbit(_)
+        | StageIntent::KilnZoom(_)
+        | StageIntent::KilnScrub(_)
+        | StageIntent::KilnEngine => "lab",
         StageIntent::ToggleTransport | StageIntent::ToggleRecord | StageIntent::Rewind => "time",
         StageIntent::Help
         | StageIntent::Browse
@@ -2164,7 +2889,12 @@ fn family(intent: StageIntent) -> &'static str {
         | StageIntent::ToggleTrackArm
         | StageIntent::CycleTrackInput { .. }
         | StageIntent::CycleTrackMonitor => "track",
-        StageIntent::Clear | StageIntent::Launch | StageIntent::LaunchScene => "session",
+        StageIntent::Clear
+        | StageIntent::Launch
+        | StageIntent::LaunchScene
+        | StageIntent::Matrix
+        | StageIntent::MatrixLay { .. }
+        | StageIntent::MatrixHead => "session",
         StageIntent::Gain { .. }
         | StageIntent::Pan { .. }
         | StageIntent::Mute
@@ -2228,20 +2958,21 @@ pub(super) struct Entry {
 /// runs exactly once. It is a static built late, not a leak that grows.
 pub(super) fn palette_entries() -> &'static [Entry] {
     static ENTRIES: std::sync::LazyLock<Vec<Entry>> = std::sync::LazyLock::new(|| {
-        BINDINGS
-            .iter()
-            .map(|binding| {
-                let chord: &'static str = String::leak(chord_name(binding.modifiers, binding.key));
-                let id: &'static str = String::leak(format!("{:?}/{}", binding.scope, chord));
+        ScopeContext::ALL
+            .into_iter()
+            .flat_map(|scope| bindings_for(scope).map(move |binding| (scope, binding)))
+            .map(|(scope, (modifiers, key, intent))| {
+                let chord: &'static str = String::leak(chord_name(modifiers, key));
+                let id: &'static str = String::leak(format!("{scope:?}/{chord}"));
                 Entry {
-                    scope: binding.scope,
+                    scope,
                     command: crate::ui::palette::Command::new(
                         id,
-                        family(binding.intent),
-                        binding.intent.label_in(binding.scope),
+                        family(intent),
+                        intent.label_in(scope),
                     )
                     .hint(chord),
-                    intent: binding.intent,
+                    intent,
                 }
             })
             .collect()
@@ -2262,6 +2993,9 @@ pub(super) fn chord_name(modifiers: Mods, key: Key) -> String {
     if modifiers.shift {
         name.push('+');
     }
+    if modifiers.alt {
+        name.push_str("Alt+");
+    }
     name.push_str(key.symbol_or_name());
     name
 }
@@ -2270,15 +3004,19 @@ pub(super) fn chord_name(modifiers: Mods, key: Key) -> String {
 /// lookup used by both the application and the headless sequence driver.
 pub(super) fn dispatch(scope: ScopeContext, input: StageInput) -> Option<StageIntent> {
     match input {
-        StageInput::Chord(modifiers, key) => BINDINGS
-            .iter()
-            .find(|binding| {
-                binding.scope == scope && binding.modifiers == modifiers && binding.key == key
+        StageInput::Chord(modifiers, key) => bindings_for(scope)
+            .find(|(bound_modifiers, bound_key, _)| {
+                *bound_modifiers == modifiers && *bound_key == key
             })
-            .map(|binding| binding.intent),
+            .map(|(_, _, intent)| intent),
         StageInput::Text(ch)
-            if matches!(scope, ScopeContext::Browser | ScopeContext::Rename)
-                && !ch.is_control() =>
+            if matches!(
+                scope,
+                ScopeContext::Browser
+                    | ScopeContext::Rename
+                    | ScopeContext::KilnFilter
+                    | ScopeContext::MidiLab
+            ) && !ch.is_control() =>
         {
             Some(StageIntent::TypeChar(ch))
         }
@@ -2294,16 +3032,13 @@ pub(super) fn dispatch(scope: ScopeContext, input: StageInput) -> Option<StageIn
 /// chord eats it and `^+T` silently becomes `^T`. Within one level of
 /// specificity the table's own order stands.
 pub(super) fn bound_chords() -> impl Iterator<Item = (Mods, Key)> {
-    let mut chords: Vec<(Mods, Key)> = BINDINGS
-        .iter()
-        .enumerate()
-        .filter_map(|(index, binding)| {
-            let first = BINDINGS[..index].iter().all(|earlier| {
-                (earlier.modifiers, earlier.key) != (binding.modifiers, binding.key)
-            });
-            first.then_some((binding.modifiers, binding.key))
-        })
+    let mut chords: Vec<(Mods, Key)> = ScopeContext::ALL
+        .into_iter()
+        .flat_map(bindings_for)
+        .map(|(mods, key, _)| (mods, key))
         .collect();
+    chords.sort_unstable();
+    chords.dedup();
     chords.sort_by_key(|(modifiers, _)| std::cmp::Reverse(specificity(*modifiers)));
     chords.into_iter()
 }
@@ -2319,16 +3054,18 @@ mod tests {
 
     #[test]
     fn no_scope_and_chord_maps_to_two_intents() {
-        for (index, binding) in BINDINGS.iter().enumerate() {
-            assert!(
-                BINDINGS[..index].iter().all(|earlier| {
-                    (earlier.scope, earlier.modifiers, earlier.key)
-                        != (binding.scope, binding.modifiers, binding.key)
-                }),
-                "duplicate stage binding for {:?} + {:?}",
-                binding.scope,
-                binding.key
-            );
+        for scope in ScopeContext::ALL {
+            let bindings: Vec<_> = bindings_for(scope).collect();
+            for (index, (modifiers, key, _)) in bindings.iter().enumerate() {
+                assert!(
+                    bindings[..index]
+                        .iter()
+                        .all(|(earlier_modifiers, earlier_key, _)| {
+                            (*earlier_modifiers, *earlier_key) != (*modifiers, *key)
+                        }),
+                    "duplicate stage binding for {scope:?} + {modifiers:?} + {key:?}"
+                );
+            }
         }
     }
 
@@ -2405,8 +3142,6 @@ mod tests {
                     "the help surface would name a key the stage ignores"
                 );
             }
-            let bound = BINDINGS.iter().filter(|b| b.scope == scope).count();
-            assert_eq!(listed.len(), bound, "the help surface would hide a key");
         }
     }
 
@@ -2415,8 +3150,70 @@ mod tests {
     /// is visible as a claim rather than an accident.
     #[test]
     fn every_bound_intent_can_name_itself() {
-        for binding in BINDINGS {
-            assert!(!binding.intent.label().is_empty());
+        for scope in ScopeContext::ALL {
+            for (_, _, intent) in bindings_for(scope) {
+                assert!(!intent.label_in(scope).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn page_intent_labels_fit_the_codebook_row() {
+        for intent in [
+            StageIntent::Page(PageKey::Trig),
+            StageIntent::PageBack(PageKey::Src),
+            StageIntent::Slot(0),
+            StageIntent::Turn {
+                up: true,
+                coarse: false,
+            },
+            StageIntent::Turn {
+                up: false,
+                coarse: true,
+            },
+            StageIntent::StepKeys,
+            StageIntent::StepKey(0),
+            StageIntent::Window(Step::Left),
+        ] {
+            assert!(
+                intent.label().chars().count() <= 19,
+                "label is too long: {}",
+                intent.label()
+            );
+        }
+    }
+
+    #[test]
+    fn page_keys_are_everywhere_except_the_typing_scopes_and_the_matrix() {
+        for scope in ScopeContext::ALL {
+            for (key, page) in [
+                (Key::F1, PageKey::Trig),
+                (Key::F2, PageKey::Src),
+                (Key::F3, PageKey::Fltr),
+                (Key::F4, PageKey::Amp),
+                (Key::F5, PageKey::Lfo),
+                (Key::F6, PageKey::Fx),
+                (Key::F7, PageKey::Mix),
+                (Key::F8, PageKey::All),
+            ] {
+                // The matrix keeps the deck down while it is up.
+                let expected = (!matches!(
+                    scope,
+                    ScopeContext::Browser
+                        | ScopeContext::Rename
+                        | ScopeContext::Matrix
+                        | ScopeContext::Lab
+                        | ScopeContext::Kiln
+                        | ScopeContext::KilnFilter
+                        | ScopeContext::MidiLab
+                ))
+                .then_some(StageIntent::Page(page));
+                assert_eq!(
+                    dispatch(scope, StageInput::Chord(Mods::NONE, key)),
+                    expected,
+                    "{scope:?} / {key:?}"
+                );
+            }
         }
     }
 

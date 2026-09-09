@@ -394,13 +394,26 @@ impl Pitch {
     }
 
     /// Move by chromatic semitones without changing the kind of address.
-    /// Twelve semitones is exactly one octave; a scale-degree pitch remains
-    /// degree-addressed and therefore still follows later key changes.
+    /// Twelve semitones is exactly one octave.
+    ///
+    /// An ABSOLUTE pitch moves its anchor: the note IS the new note, and
+    /// every surface names it so, with its bend (the offset) carried
+    /// along untouched. A scale-degree pitch has no chromatic step
+    /// without its key, so it keeps its address and takes the shift as
+    /// an offset — and therefore still follows later key changes.
     pub fn shifted_semitones(self, delta: isize) -> Self {
-        let cents = f64::from(self.offset_cents) + delta as f64 * 100.0;
-        Self {
-            anchor: self.anchor,
-            offset_cents: cents.clamp(f64::from(f32::MIN), f64::from(f32::MAX)) as f32,
+        match self.anchor {
+            Anchor::Absolute(hz) => Self {
+                anchor: Anchor::Absolute(hz * (delta as f64 / 12.0).exp2()),
+                offset_cents: self.offset_cents,
+            },
+            Anchor::Degree { .. } => {
+                let cents = f64::from(self.offset_cents) + delta as f64 * 100.0;
+                Self {
+                    anchor: self.anchor,
+                    offset_cents: cents.clamp(f64::from(f32::MIN), f64::from(f32::MAX)) as f32,
+                }
+            }
         }
     }
 
@@ -833,13 +846,21 @@ mod tests {
     }
 
     #[test]
-    fn chromatic_shift_preserves_the_anchor_and_twelve_semitones_is_an_octave() {
+    fn chromatic_shift_keeps_the_kind_of_address_and_twelve_semitones_is_an_octave() {
         let key = twelve_tet(midi_to_hz(60));
         for pitch in [Pitch::absolute(327.03), Pitch::degree(4, 1)] {
             let up = pitch.shifted_semitones(12);
             let down = pitch.shifted_semitones(-12);
-            assert_eq!(up.anchor, pitch.anchor);
-            assert_eq!(down.anchor, pitch.anchor);
+            // The KIND of address survives: a degree stays a degree, an
+            // absolute stays absolute (and moves, which is the point).
+            assert_eq!(
+                std::mem::discriminant(&up.anchor),
+                std::mem::discriminant(&pitch.anchor)
+            );
+            if let Anchor::Degree { .. } = pitch.anchor {
+                assert_eq!(up.anchor, pitch.anchor);
+                assert_eq!(down.anchor, pitch.anchor);
+            }
             assert!(close(up.resolve(&key), pitch.resolve(&key) * 2.0, 1e-6));
             assert!(close(down.resolve(&key), pitch.resolve(&key) / 2.0, 1e-6));
         }
@@ -1215,5 +1236,27 @@ mod tests {
         assert_eq!(pitches[1], Pitch::absolute(880.0));
         assert_eq!(pitches[2], Pitch::degree(1, -1));
         assert_eq!(pitches[3], Pitch::degree(3, 0));
+    }
+
+    #[test]
+    fn a_semitone_shift_moves_an_absolute_note_and_offsets_a_degree() {
+        let c4 = Pitch::from_midi(60);
+        let up = c4.shifted_semitones(7);
+        assert!(matches!(up.anchor, Anchor::Absolute(hz) if (hz - midi_to_hz(67)).abs() < 1e-6));
+        assert_eq!(up.offset_cents, 0.0, "the bend rides along, unchanged");
+        let bent = Pitch {
+            anchor: Anchor::Absolute(midi_to_hz(60)),
+            offset_cents: 20.0,
+        };
+        assert_eq!(bent.shifted_semitones(-12).offset_cents, 20.0);
+        let degree = Pitch::degree(2, 0).shifted_semitones(1);
+        assert!(matches!(
+            degree.anchor,
+            Anchor::Degree {
+                degree: 2,
+                period: 0
+            }
+        ));
+        assert_eq!(degree.offset_cents, 100.0);
     }
 }

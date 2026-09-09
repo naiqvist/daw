@@ -18,6 +18,15 @@
 //! equal to their index — so `TABLE[FOO as usize]` is the definition of
 //! `FOO` — names are unique, and every default lies inside its range.
 
+pub mod glass;
+pub mod mass;
+pub mod pipe;
+pub mod pluck;
+pub mod prism_voice;
+pub mod ring;
+pub mod table;
+pub mod vox;
+
 /// One knob of one device, in ENGINE units (Hz, ms, linear gain — never
 /// normalized widget positions).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -6728,6 +6737,891 @@ pub mod hat {
 /// built: a short burst of band-passed noise retriggered a few times a
 /// few milliseconds apart, over one longer decaying tail of the same
 /// noise. The unevenness of the burst spacing is the whole realism.
+/// The DRUM voice: one machine, five models, three pages. The first
+/// machine written for the pages, and the shape every new one ships in:
+/// a table and a key table, side by side.
+pub mod drum {
+    use super::ParamDef;
+    use crate::pages::{KeyTable, MachineKey, SubPage};
+
+    pub const MODEL: u32 = 0;
+    pub const TUNE: u32 = 1;
+    pub const DECAY: u32 = 2;
+    pub const SWEEP: u32 = 3;
+    pub const SNAP: u32 = 4;
+    pub const TONE: u32 = 5;
+    pub const NOISE: u32 = 6;
+    pub const DRIVE: u32 = 7;
+    pub const FTYPE: u32 = 8;
+    pub const CUTOFF: u32 = 9;
+    pub const RESO: u32 = 10;
+    pub const FENV: u32 = 11;
+    pub const FATTACK: u32 = 12;
+    pub const FDECAY: u32 = 13;
+    pub const FTRACK: u32 = 14;
+    pub const ATTACK: u32 = 15;
+    pub const AMP_DECAY: u32 = 16;
+    pub const VEL: u32 = 17;
+    pub const LEVEL: u32 = 18;
+    /// What the excluded-gain machinery and the old binary call the level.
+    pub const GAIN: u32 = LEVEL;
+
+    pub const TUNE_MIN: f32 = -24.0;
+    pub const TUNE_MAX: f32 = 24.0;
+    pub const MODELS: f32 = 4.0;
+
+    pub const TABLE: &[ParamDef] = &[
+        ParamDef {
+            id: MODEL,
+            name: "model",
+            min: 0.0,
+            max: MODELS,
+            default: 0.0,
+        },
+        ParamDef {
+            id: TUNE,
+            name: "tune",
+            min: TUNE_MIN,
+            max: TUNE_MAX,
+            default: 0.0,
+        },
+        ParamDef {
+            id: DECAY,
+            name: "decay",
+            min: 10.0,
+            max: 2_000.0,
+            default: 300.0,
+        },
+        ParamDef {
+            id: SWEEP,
+            name: "sweep",
+            min: 0.0,
+            max: 48.0,
+            default: 12.0,
+        },
+        ParamDef {
+            id: SNAP,
+            name: "snap",
+            min: 0.0,
+            max: 1.0,
+            default: 0.4,
+        },
+        ParamDef {
+            id: TONE,
+            name: "tone",
+            min: 0.0,
+            max: 1.0,
+            default: 0.5,
+        },
+        ParamDef {
+            id: NOISE,
+            name: "noise",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: DRIVE,
+            name: "drive",
+            min: 0.0,
+            max: 1.0,
+            default: 0.2,
+        },
+        ParamDef {
+            id: FTYPE,
+            name: "filter type",
+            min: 0.0,
+            max: 2.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: CUTOFF,
+            name: "cutoff",
+            min: 20.0,
+            max: 20_000.0,
+            default: 20_000.0,
+        },
+        ParamDef {
+            id: RESO,
+            name: "reso",
+            min: 0.5,
+            max: 12.0,
+            default: 0.7,
+        },
+        ParamDef {
+            id: FENV,
+            name: "filter env",
+            min: -48.0,
+            max: 48.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: FATTACK,
+            name: "filter attack",
+            min: 0.0,
+            max: 500.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: FDECAY,
+            name: "filter decay",
+            min: 5.0,
+            max: 2_000.0,
+            default: 100.0,
+        },
+        ParamDef {
+            id: FTRACK,
+            name: "key track",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: ATTACK,
+            name: "attack",
+            min: 0.0,
+            max: 100.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: AMP_DECAY,
+            name: "amp decay",
+            min: 10.0,
+            max: 3_000.0,
+            default: 2_000.0,
+        },
+        ParamDef {
+            id: VEL,
+            name: "velocity",
+            min: 0.0,
+            max: 1.0,
+            default: 1.0,
+        },
+        ParamDef {
+            id: LEVEL,
+            name: "level",
+            min: 0.0,
+            max: 2.0,
+            default: 0.9,
+        },
+    ];
+
+    /// The drum's function keys: SRC, FLTR and AMP, one sub-page each.
+    /// TRIG, LFO, FX and MIX are the track's.
+    pub const KEYS: KeyTable = [
+        None,
+        Some(MachineKey {
+            word: "SRC",
+            subpages: &[SubPage {
+                title: "Voice",
+                slots: [
+                    Some(MODEL),
+                    Some(TUNE),
+                    Some(DECAY),
+                    Some(SWEEP),
+                    Some(SNAP),
+                    Some(TONE),
+                    Some(NOISE),
+                    Some(DRIVE),
+                ],
+            }],
+        }),
+        Some(MachineKey {
+            word: "FLTR",
+            subpages: &[SubPage {
+                title: "Filter",
+                slots: [
+                    Some(FTYPE),
+                    Some(CUTOFF),
+                    Some(RESO),
+                    Some(FENV),
+                    Some(FATTACK),
+                    Some(FDECAY),
+                    Some(FTRACK),
+                    None,
+                ],
+            }],
+        }),
+        Some(MachineKey {
+            word: "AMP",
+            subpages: &[SubPage {
+                title: "Amp",
+                slots: [
+                    Some(ATTACK),
+                    Some(AMP_DECAY),
+                    Some(VEL),
+                    Some(LEVEL),
+                    None,
+                    None,
+                    None,
+                    None,
+                ],
+            }],
+        }),
+        None,
+        None,
+        None,
+        None,
+    ];
+}
+
+pub mod thump {
+    use super::ParamDef;
+    use crate::pages::{KeyTable, MachineKey, SubPage};
+
+    pub const TUNE: u32 = 0;
+    pub const CLICK: u32 = 1;
+    pub const CLICK_TIME: u32 = 2;
+    pub const BEND: u32 = 3;
+    pub const BEND_TIME: u32 = 4;
+    pub const CURVE: u32 = 5;
+    pub const PHASE: u32 = 6;
+    pub const NOISE: u32 = 7;
+    pub const NOISE_DECAY: u32 = 8;
+    pub const COLOR: u32 = 9;
+    pub const RESO: u32 = 10;
+    pub const MODE: u32 = 11;
+    pub const TRACK: u32 = 12;
+    pub const ATTACK: u32 = 13;
+    pub const DECAY: u32 = 14;
+    pub const SUSTAIN: u32 = 15;
+    pub const RELEASE: u32 = 16;
+    pub const VEL: u32 = 17;
+    pub const VEL_CLICK: u32 = 18;
+    pub const LEVEL: u32 = 19;
+    pub const SAT_DRIVE: u32 = 20;
+    pub const SAT_SHAPE: u32 = 21;
+    pub const SAT_BIAS: u32 = 22;
+    pub const SAT_MIX: u32 = 23;
+    pub const COMP_THRESH: u32 = 24;
+    pub const COMP_RATIO: u32 = 25;
+    pub const COMP_ATTACK: u32 = 26;
+    pub const COMP_RELEASE: u32 = 27;
+    pub const COMP_KNEE: u32 = 28;
+    pub const COMP_MAKEUP: u32 = 29;
+    pub const COMP_MIX: u32 = 30;
+    pub const DISP_AMOUNT: u32 = 31;
+    pub const DISP_FOCUS: u32 = 32;
+    pub const DISP_WIDTH: u32 = 33;
+    pub const DISP_FOLLOW: u32 = 34;
+    pub const DISP_MIX: u32 = 35;
+    /// What the excluded-gain machinery and the old binary call the level.
+    pub const GAIN: u32 = LEVEL;
+
+    pub const TUNE_MIN: f32 = -24.0;
+    pub const TUNE_MAX: f32 = 24.0;
+
+    pub const TABLE: &[ParamDef] = &[
+        ParamDef {
+            id: TUNE,
+            name: "tune",
+            min: -24.0,
+            max: 24.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: CLICK,
+            name: "click",
+            min: 0.0,
+            max: 60.0,
+            default: 24.0,
+        },
+        ParamDef {
+            id: CLICK_TIME,
+            name: "click time",
+            min: 1.0,
+            max: 60.0,
+            default: 8.0,
+        },
+        ParamDef {
+            id: BEND,
+            name: "bend",
+            min: 0.0,
+            max: 36.0,
+            default: 12.0,
+        },
+        ParamDef {
+            id: BEND_TIME,
+            name: "bend time",
+            min: 20.0,
+            max: 2000.0,
+            default: 150.0,
+        },
+        ParamDef {
+            id: CURVE,
+            name: "curve",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: PHASE,
+            name: "phase",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: NOISE,
+            name: "noise",
+            min: 0.0,
+            max: 1.0,
+            default: 0.3,
+        },
+        ParamDef {
+            id: NOISE_DECAY,
+            name: "noise decay",
+            min: 1.0,
+            max: 300.0,
+            default: 20.0,
+        },
+        ParamDef {
+            id: COLOR,
+            name: "color",
+            min: 200.0,
+            max: 12000.0,
+            default: 3000.0,
+        },
+        ParamDef {
+            id: RESO,
+            name: "reso",
+            min: 0.5,
+            max: 12.0,
+            default: 1.0,
+        },
+        ParamDef {
+            id: MODE,
+            name: "noise mode",
+            min: 0.0,
+            max: 2.0,
+            default: 1.0,
+        },
+        ParamDef {
+            id: TRACK,
+            name: "track",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: ATTACK,
+            name: "attack",
+            min: 0.0,
+            max: 100.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: DECAY,
+            name: "decay",
+            min: 10.0,
+            max: 3000.0,
+            default: 400.0,
+        },
+        ParamDef {
+            id: SUSTAIN,
+            name: "sustain",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: RELEASE,
+            name: "release",
+            min: 5.0,
+            max: 3000.0,
+            default: 200.0,
+        },
+        ParamDef {
+            id: VEL,
+            name: "velocity",
+            min: 0.0,
+            max: 1.0,
+            default: 1.0,
+        },
+        ParamDef {
+            id: VEL_CLICK,
+            name: "vel click",
+            min: 0.0,
+            max: 1.0,
+            default: 0.5,
+        },
+        ParamDef {
+            id: LEVEL,
+            name: "level",
+            min: 0.0,
+            max: 2.0,
+            default: 0.9,
+        },
+        ParamDef {
+            id: SAT_DRIVE,
+            name: "sat drive",
+            min: 0.0,
+            max: 1.0,
+            default: 0.2,
+        },
+        ParamDef {
+            id: SAT_SHAPE,
+            name: "sat shape",
+            min: 0.0,
+            max: 4.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: SAT_BIAS,
+            name: "sat bias",
+            min: -1.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: SAT_MIX,
+            name: "sat mix",
+            min: 0.0,
+            max: 1.0,
+            default: 1.0,
+        },
+        ParamDef {
+            id: COMP_THRESH,
+            name: "comp thresh",
+            min: -48.0,
+            max: 0.0,
+            default: -12.0,
+        },
+        ParamDef {
+            id: COMP_RATIO,
+            name: "comp ratio",
+            min: 1.0,
+            max: 20.0,
+            default: 4.0,
+        },
+        ParamDef {
+            id: COMP_ATTACK,
+            name: "comp attack",
+            min: 0.1,
+            max: 100.0,
+            default: 5.0,
+        },
+        ParamDef {
+            id: COMP_RELEASE,
+            name: "comp release",
+            min: 10.0,
+            max: 1000.0,
+            default: 80.0,
+        },
+        ParamDef {
+            id: COMP_KNEE,
+            name: "comp knee",
+            min: 0.0,
+            max: 24.0,
+            default: 6.0,
+        },
+        ParamDef {
+            id: COMP_MAKEUP,
+            name: "comp makeup",
+            min: 0.0,
+            max: 24.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: COMP_MIX,
+            name: "comp mix",
+            min: 0.0,
+            max: 1.0,
+            default: 1.0,
+        },
+        ParamDef {
+            id: DISP_AMOUNT,
+            name: "disperse",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: DISP_FOCUS,
+            name: "focus",
+            min: 1.0,
+            max: 16.0,
+            default: 2.0,
+        },
+        ParamDef {
+            id: DISP_WIDTH,
+            name: "width",
+            min: 0.1,
+            max: 4.0,
+            default: 0.7,
+        },
+        ParamDef {
+            id: DISP_FOLLOW,
+            name: "follow",
+            min: 0.0,
+            max: 1.0,
+            default: 1.0,
+        },
+        ParamDef {
+            id: DISP_MIX,
+            name: "disperse mix",
+            min: 0.0,
+            max: 1.0,
+            default: 1.0,
+        },
+    ];
+
+    /// The kick's function keys: SRC (the sine, the noise), AMP (the
+    /// ADSR) and FX (its own saturator, compressor and disperser, after
+    /// the lane's). TRIG, FLTR, LFO and MIX are the track's.
+    pub const KEYS: KeyTable = [
+        None,
+        Some(MachineKey {
+            word: "SRC",
+            subpages: &[
+                SubPage {
+                    title: "Sine",
+                    slots: [
+                        Some(TUNE),
+                        Some(CLICK),
+                        Some(CLICK_TIME),
+                        Some(BEND),
+                        Some(BEND_TIME),
+                        Some(CURVE),
+                        Some(PHASE),
+                        None,
+                    ],
+                },
+                SubPage {
+                    title: "Noise",
+                    slots: [
+                        Some(NOISE),
+                        Some(NOISE_DECAY),
+                        Some(COLOR),
+                        Some(RESO),
+                        Some(MODE),
+                        Some(TRACK),
+                        None,
+                        None,
+                    ],
+                },
+            ],
+        }),
+        None,
+        Some(MachineKey {
+            word: "AMP",
+            subpages: &[SubPage {
+                title: "Amp",
+                slots: [
+                    Some(ATTACK),
+                    Some(DECAY),
+                    Some(SUSTAIN),
+                    Some(RELEASE),
+                    Some(VEL),
+                    Some(VEL_CLICK),
+                    Some(LEVEL),
+                    None,
+                ],
+            }],
+        }),
+        None,
+        Some(MachineKey {
+            word: "FX",
+            subpages: &[
+                SubPage {
+                    title: "Sat",
+                    slots: [
+                        Some(SAT_DRIVE),
+                        Some(SAT_SHAPE),
+                        Some(SAT_BIAS),
+                        Some(SAT_MIX),
+                        None,
+                        None,
+                        None,
+                        None,
+                    ],
+                },
+                SubPage {
+                    title: "Comp",
+                    slots: [
+                        Some(COMP_THRESH),
+                        Some(COMP_RATIO),
+                        Some(COMP_ATTACK),
+                        Some(COMP_RELEASE),
+                        Some(COMP_KNEE),
+                        Some(COMP_MAKEUP),
+                        Some(COMP_MIX),
+                        None,
+                    ],
+                },
+                SubPage {
+                    title: "Disperse",
+                    slots: [
+                        Some(DISP_AMOUNT),
+                        Some(DISP_FOCUS),
+                        Some(DISP_WIDTH),
+                        Some(DISP_FOLLOW),
+                        Some(DISP_MIX),
+                        None,
+                        None,
+                        None,
+                    ],
+                },
+            ],
+        }),
+        None,
+        None,
+    ];
+}
+
+pub mod clay {
+    use super::ParamDef;
+    use crate::pages::{KeyTable, MachineKey, SubPage};
+
+    pub const MATTER: u32 = 0;
+    pub const SIZE: u32 = 1;
+    pub const STRIKE: u32 = 2;
+    pub const DROP: u32 = 3;
+    pub const DAMP: u32 = 4;
+    pub const WIRES: u32 = 5;
+    pub const FEED: u32 = 6;
+    pub const TONE: u32 = 7;
+    pub const KEY: u32 = 8;
+    pub const ATTACK: u32 = 9;
+    pub const DECAY: u32 = 10;
+    pub const RELEASE: u32 = 11;
+    pub const VEL: u32 = 12;
+    pub const LEVEL: u32 = 13;
+    pub const CRACK: u32 = 14;
+    pub const BRIGHT: u32 = 15;
+    pub const CRACK_MIX: u32 = 16;
+    pub const BLOOM_SIZE: u32 = 17;
+    pub const BLOOM_DECAY: u32 = 18;
+    pub const BLOOM_DAMP: u32 = 19;
+    pub const BLOOM_MIX: u32 = 20;
+    /// What the excluded-gain machinery and the old binary call the level.
+    pub const GAIN: u32 = LEVEL;
+
+    pub const TABLE: &[ParamDef] = &[
+        ParamDef {
+            id: MATTER,
+            name: "matter",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: SIZE,
+            name: "size",
+            min: 0.0,
+            max: 1.0,
+            default: 0.15,
+        },
+        ParamDef {
+            id: STRIKE,
+            name: "strike",
+            min: 0.0,
+            max: 1.0,
+            default: 0.3,
+        },
+        ParamDef {
+            id: DROP,
+            name: "drop",
+            min: 0.0,
+            max: 36.0,
+            default: 24.0,
+        },
+        ParamDef {
+            id: DAMP,
+            name: "damp",
+            min: 0.0,
+            max: 1.0,
+            default: 0.5,
+        },
+        ParamDef {
+            id: WIRES,
+            name: "wires",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: FEED,
+            name: "feed",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: TONE,
+            name: "tone",
+            min: 0.0,
+            max: 1.0,
+            default: 0.2,
+        },
+        ParamDef {
+            id: KEY,
+            name: "key",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: ATTACK,
+            name: "attack",
+            min: 0.0,
+            max: 50.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: DECAY,
+            name: "decay",
+            min: 0.25,
+            max: 4.0,
+            default: 1.0,
+        },
+        ParamDef {
+            id: RELEASE,
+            name: "release",
+            min: 5.0,
+            max: 2000.0,
+            default: 60.0,
+        },
+        ParamDef {
+            id: VEL,
+            name: "velocity",
+            min: 0.0,
+            max: 1.0,
+            default: 1.0,
+        },
+        ParamDef {
+            id: LEVEL,
+            name: "level",
+            min: 0.0,
+            max: 2.0,
+            default: 0.9,
+        },
+        ParamDef {
+            id: CRACK,
+            name: "crack",
+            min: -1.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: BRIGHT,
+            name: "bright",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: CRACK_MIX,
+            name: "crack mix",
+            min: 0.0,
+            max: 1.0,
+            default: 1.0,
+        },
+        ParamDef {
+            id: BLOOM_SIZE,
+            name: "bloom size",
+            min: 0.0,
+            max: 1.0,
+            default: 0.3,
+        },
+        ParamDef {
+            id: BLOOM_DECAY,
+            name: "bloom decay",
+            min: 0.0,
+            max: 1.0,
+            default: 0.5,
+        },
+        ParamDef {
+            id: BLOOM_DAMP,
+            name: "bloom damp",
+            min: 0.0,
+            max: 1.0,
+            default: 0.5,
+        },
+        ParamDef {
+            id: BLOOM_MIX,
+            name: "bloom mix",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+        },
+    ];
+
+    /// CLAY's keys: SRC is the three macros and the cells beneath them,
+    /// AMP the envelope and KEY, FX its own crack and bloom. TRIG, FLTR,
+    /// LFO and MIX are the track's.
+    pub const KEYS: KeyTable = [
+        None,
+        Some(MachineKey {
+            word: "SRC",
+            subpages: &[SubPage {
+                title: "Clay",
+                slots: [
+                    Some(MATTER),
+                    Some(SIZE),
+                    Some(STRIKE),
+                    Some(DROP),
+                    Some(DAMP),
+                    Some(WIRES),
+                    Some(FEED),
+                    Some(TONE),
+                ],
+            }],
+        }),
+        None,
+        Some(MachineKey {
+            word: "AMP",
+            subpages: &[SubPage {
+                title: "Amp",
+                slots: [
+                    Some(ATTACK),
+                    Some(DECAY),
+                    Some(RELEASE),
+                    Some(KEY),
+                    Some(VEL),
+                    Some(LEVEL),
+                    None,
+                    None,
+                ],
+            }],
+        }),
+        None,
+        Some(MachineKey {
+            word: "FX",
+            subpages: &[
+                SubPage {
+                    title: "Crack",
+                    slots: [
+                        Some(CRACK),
+                        Some(BRIGHT),
+                        Some(CRACK_MIX),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ],
+                },
+                SubPage {
+                    title: "Bloom",
+                    slots: [
+                        Some(BLOOM_SIZE),
+                        Some(BLOOM_DECAY),
+                        Some(BLOOM_DAMP),
+                        Some(BLOOM_MIX),
+                        None,
+                        None,
+                        None,
+                        None,
+                    ],
+                },
+            ],
+        }),
+        None,
+        None,
+    ];
+}
+
 pub mod handclap {
     use super::ParamDef;
 
@@ -8206,6 +9100,54 @@ pub mod sampler {
     // ------------------------------------------------------- discretes ---
 
     /// What a note MEANS. See the brief's mode table.
+
+    // SLICE additions: old ids 0..36 remain stable in saved sounds.
+    pub const PLAYBACK: u32 = 37;
+    pub const TIME: u32 = 38;
+    pub const SPEED: u32 = 39;
+    pub const WINDOW: u32 = 40;
+    pub const TRANSIENT: u32 = 41;
+    pub const LOOP_SIZE: u32 = 42;
+    pub const LOOP_FADE: u32 = 43;
+    pub const SCAN: u32 = 44;
+    pub const TRAVEL: u32 = 45;
+    pub const MOTION_MODE: u32 = 46;
+    pub const LOOP_UNITS: u32 = 47;
+    pub const LOOP_EXIT: u32 = 48;
+    pub const PLAY_MODE: u32 = 49;
+    pub const VOICE_COUNT: u32 = 50;
+    pub const GLIDE: u32 = 51;
+    pub const SPREAD: u32 = 52;
+    pub const ENV_PITCH: u32 = 53;
+    pub const ENV_POSITION: u32 = 54;
+    pub const ENV_SIZE: u32 = 55;
+    pub const ENV_FILTER: u32 = 56;
+    pub const START_JITTER: u32 = 57;
+    pub const PITCH_JITTER: u32 = 58;
+    pub const SEED: u32 = 59;
+    pub const SLIP: u32 = 60;
+    pub const ATTACK_SHAPE: u32 = 61;
+    pub const FILTER_SLOPE: u32 = 62;
+    pub const COMB_FOCUS: u32 = 63;
+    pub const COMB_FEED: u32 = 64;
+    pub const COMB_DAMP: u32 = 65;
+    pub const COMB_MIX: u32 = 66;
+    pub const SOURCE_BEATS: u32 = 67;
+    pub const FIT_BEATS: u32 = 68;
+    pub const SLICE_THRU: u32 = 69;
+    pub const HARD: u32 = 70;
+    pub const SENSE: u32 = 71;
+    pub const MIN_GAP: u32 = 72;
+    pub const PLAYBACK_NAMES: &[&str] = &["REPITCH", "BEATS", "SMOOTH", "GRAIN"];
+    pub const MOTION_MODE_NAMES: &[&str] = &["WRAP", "BOUNCE", "STOP"];
+    pub const LOOP_UNITS_NAMES: &[&str] = &["FREE", "BEAT", "NOTE"];
+    pub const LOOP_EXIT_NAMES: &[&str] = &["FADE", "TAIL"];
+    pub const PLAY_MODE_NAMES: &[&str] = &["POLY", "MONO", "LEGATO"];
+    pub const SLIP_NAMES: &[&str] = &["OFF", "ON"];
+    pub const FILTER_SLOPE_NAMES: &[&str] = &["12dB", "24dB"];
+    pub const SLICE_THRU_NAMES: &[&str] = &["SLICE", "THRU"];
+    pub const HARD_NAMES: &[&str] = &["SOFT", "HARD"];
+
     pub const MODE_CLASSIC: f32 = 0.0;
     pub const MODE_ONE_SHOT: f32 = 1.0;
     pub const MODE_SLICE: f32 = 2.0;
@@ -8280,7 +9222,10 @@ pub mod sampler {
     /// Which page each row belongs to, for the card's tab strip. Parallel
     /// to [`TABLE`] and checked against it by a test, because a row that
     /// no page claims is a row nobody can reach.
-    pub const PAGES: &[&str] = &["sample", "loop", "shape", "mod", "dirt"];
+    pub const PAGES: &[&str] = &[
+        "sample", "loop", "shape", "mod", "dirt", "time", "motion", "voice", "routes", "comb",
+        "source",
+    ];
 
     pub fn page_of(id: u32) -> usize {
         match id {
@@ -8288,6 +9233,12 @@ pub mod sampler {
             LOOP_MODE..=CHOKE => 1,
             AMP_A..=KEYTRACK => 2,
             MOD_A..=VELOCITY => 3,
+            PLAYBACK..=TRANSIENT => 5,
+            LOOP_SIZE..=LOOP_EXIT => 6,
+            PLAY_MODE..=ENV_SIZE => 7,
+            ENV_FILTER..=FILTER_SLOPE => 8,
+            COMB_FOCUS..=COMB_MIX => 9,
+            SOURCE_BEATS..=MIN_GAP => 10,
             _ => 4,
         }
     }
@@ -8570,6 +9521,475 @@ pub mod sampler {
             max: SLICES_MAX,
             default: 1.0,
         },
+        ParamDef {
+            id: PLAYBACK,
+            name: "playback",
+            min: 0.0,
+            max: 3.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: TIME,
+            name: "time",
+            min: 25.0,
+            max: 1600.0,
+            default: 100.0,
+        },
+        ParamDef {
+            id: SPEED,
+            name: "speed",
+            min: -200.0,
+            max: 200.0,
+            default: 100.0,
+        },
+        ParamDef {
+            id: WINDOW,
+            name: "window_ms",
+            min: 5.0,
+            max: 200.0,
+            default: 40.0,
+        },
+        ParamDef {
+            id: TRANSIENT,
+            name: "transient",
+            min: 0.0,
+            max: 1.0,
+            default: 1.0,
+        },
+        ParamDef {
+            id: LOOP_SIZE,
+            name: "loop_size",
+            min: 1e-05,
+            max: 1.0,
+            default: 1.0,
+        },
+        ParamDef {
+            id: LOOP_FADE,
+            name: "loop_fade",
+            min: 0.0,
+            max: 0.5,
+            default: 0.15,
+        },
+        ParamDef {
+            id: SCAN,
+            name: "scan",
+            min: -1.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: TRAVEL,
+            name: "travel",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: MOTION_MODE,
+            name: "motion_mode",
+            min: 0.0,
+            max: 2.0,
+            default: 1.0,
+        },
+        ParamDef {
+            id: LOOP_UNITS,
+            name: "loop_units",
+            min: 0.0,
+            max: 2.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: LOOP_EXIT,
+            name: "loop_exit",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: PLAY_MODE,
+            name: "play_mode",
+            min: 0.0,
+            max: 2.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: VOICE_COUNT,
+            name: "voice_count",
+            min: 1.0,
+            max: 16.0,
+            default: 16.0,
+        },
+        ParamDef {
+            id: GLIDE,
+            name: "glide_ms",
+            min: 0.0,
+            max: 1000.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: SPREAD,
+            name: "spread",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: ENV_PITCH,
+            name: "env_pitch",
+            min: -48.0,
+            max: 48.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: ENV_POSITION,
+            name: "env_position",
+            min: -1.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: ENV_SIZE,
+            name: "env_size",
+            min: -1.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: ENV_FILTER,
+            name: "env_filter",
+            min: -60.0,
+            max: 60.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: START_JITTER,
+            name: "start_jitter",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: PITCH_JITTER,
+            name: "pitch_jitter",
+            min: 0.0,
+            max: 100.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: SEED,
+            name: "seed",
+            min: 0.0,
+            max: 65535.0,
+            default: 1.0,
+        },
+        ParamDef {
+            id: SLIP,
+            name: "slip",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: ATTACK_SHAPE,
+            name: "attack_shape",
+            min: -1.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: FILTER_SLOPE,
+            name: "filter_slope",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: COMB_FOCUS,
+            name: "comb_focus",
+            min: 0.25,
+            max: 16.0,
+            default: 1.0,
+        },
+        ParamDef {
+            id: COMB_FEED,
+            name: "comb_feed",
+            min: -0.95,
+            max: 0.95,
+            default: 0.6,
+        },
+        ParamDef {
+            id: COMB_DAMP,
+            name: "comb_damp",
+            min: 20.0,
+            max: 20000.0,
+            default: 6000.0,
+        },
+        ParamDef {
+            id: COMB_MIX,
+            name: "comb_mix",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: SOURCE_BEATS,
+            name: "source_beats",
+            min: 0.0,
+            max: 64.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: FIT_BEATS,
+            name: "fit_beats",
+            min: 0.0,
+            max: 64.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: SLICE_THRU,
+            name: "slice_thru",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: HARD,
+            name: "hard",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+        },
+        ParamDef {
+            id: SENSE,
+            name: "sense",
+            min: 0.0,
+            max: 1.0,
+            default: 0.5,
+        },
+        ParamDef {
+            id: MIN_GAP,
+            name: "min_gap_ms",
+            min: 10.0,
+            max: 500.0,
+            default: 50.0,
+        },
+    ];
+    pub fn extra_percent(id: u32) -> bool {
+        matches!(
+            id,
+            TRANSIENT
+                | LOOP_SIZE
+                | LOOP_FADE
+                | SCAN
+                | TRAVEL
+                | SPREAD
+                | ENV_POSITION
+                | ENV_SIZE
+                | START_JITTER
+                | ATTACK_SHAPE
+                | COMB_FEED
+                | COMB_MIX
+                | SENSE
+        )
+    }
+    pub fn extra_choices(id: u32) -> &'static [&'static str] {
+        match id {
+            PLAYBACK => PLAYBACK_NAMES,
+            MOTION_MODE => MOTION_MODE_NAMES,
+            LOOP_UNITS => LOOP_UNITS_NAMES,
+            LOOP_EXIT => LOOP_EXIT_NAMES,
+            PLAY_MODE => PLAY_MODE_NAMES,
+            SLIP => SLIP_NAMES,
+            FILTER_SLOPE => FILTER_SLOPE_NAMES,
+            SLICE_THRU => SLICE_THRU_NAMES,
+            HARD => HARD_NAMES,
+            _ => &[],
+        }
+    }
+
+    pub const KEYS: crate::pages::KeyTable = [
+        None,
+        Some(crate::pages::MachineKey {
+            word: "SRC",
+            subpages: &[
+                crate::pages::SubPage {
+                    title: "Sample",
+                    slots: [
+                        Some(MODE),
+                        Some(SLICE),
+                        Some(START),
+                        Some(END),
+                        Some(TUNE),
+                        Some(REVERSE),
+                        Some(SLICE_THRU),
+                        Some(ROOT),
+                    ],
+                },
+                crate::pages::SubPage {
+                    title: "Loop",
+                    slots: [
+                        Some(LOOP_MODE),
+                        Some(LOOP_START),
+                        Some(LOOP_SIZE),
+                        Some(LOOP_FADE),
+                        Some(SCAN),
+                        Some(TRAVEL),
+                        Some(MOTION_MODE),
+                        Some(LOOP_EXIT),
+                    ],
+                },
+                crate::pages::SubPage {
+                    title: "Time",
+                    slots: [
+                        Some(PLAYBACK),
+                        Some(TIME),
+                        Some(SPEED),
+                        Some(WINDOW),
+                        Some(TRANSIENT),
+                        Some(SOURCE_BEATS),
+                        Some(FIT_BEATS),
+                        Some(SLIP),
+                    ],
+                },
+                crate::pages::SubPage {
+                    title: "File",
+                    slots: [
+                        Some(SLICES),
+                        Some(SLICE_SOURCE),
+                        Some(SENSE),
+                        Some(MIN_GAP),
+                        Some(FADE_IN),
+                        Some(FADE_OUT),
+                        Some(HARD),
+                        Some(FINE),
+                    ],
+                },
+                crate::pages::SubPage {
+                    title: "Loop detail",
+                    slots: [
+                        Some(LOOP_UNITS),
+                        Some(LOOP_XFADE),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ],
+                },
+            ],
+        }),
+        Some(crate::pages::MachineKey {
+            word: "FLTR",
+            subpages: &[crate::pages::SubPage {
+                title: "Filter",
+                slots: [
+                    Some(FILT_MODE),
+                    Some(CUTOFF),
+                    Some(RES),
+                    Some(KEYTRACK),
+                    Some(FILTER_SLOPE),
+                    Some(ENV_FILTER),
+                    Some(ATTACK_SHAPE),
+                    None,
+                ],
+            }],
+        }),
+        Some(crate::pages::MachineKey {
+            word: "AMP",
+            subpages: &[
+                crate::pages::SubPage {
+                    title: "Amp",
+                    slots: [
+                        Some(AMP_A),
+                        Some(AMP_D),
+                        Some(AMP_S),
+                        Some(AMP_R),
+                        Some(VELOCITY),
+                        Some(GAIN),
+                        Some(PAN),
+                        None,
+                    ],
+                },
+                crate::pages::SubPage {
+                    title: "Voice",
+                    slots: [
+                        Some(PLAY_MODE),
+                        Some(VOICE_COUNT),
+                        Some(CHOKE),
+                        Some(SPREAD),
+                        Some(GLIDE),
+                        Some(PITCH_JITTER),
+                        Some(START_JITTER),
+                        None,
+                    ],
+                },
+            ],
+        }),
+        Some(crate::pages::MachineKey {
+            word: "LFO",
+            subpages: &[
+                crate::pages::SubPage {
+                    title: "Envelope",
+                    slots: [
+                        Some(MOD_A),
+                        Some(MOD_D),
+                        Some(MOD_S),
+                        Some(MOD_R),
+                        Some(MOD_DEST),
+                        Some(MOD_DEPTH),
+                        Some(SEED),
+                        None,
+                    ],
+                },
+                crate::pages::SubPage {
+                    title: "Routes",
+                    slots: [
+                        Some(ENV_PITCH),
+                        Some(ENV_POSITION),
+                        Some(ENV_SIZE),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ],
+                },
+            ],
+        }),
+        Some(crate::pages::MachineKey {
+            word: "FX",
+            subpages: &[
+                crate::pages::SubPage {
+                    title: "Colour",
+                    slots: [
+                        Some(DRIVE),
+                        Some(RATE),
+                        Some(BITS),
+                        Some(PREAMP),
+                        None,
+                        None,
+                        None,
+                        None,
+                    ],
+                },
+                crate::pages::SubPage {
+                    title: "Comb",
+                    slots: [
+                        Some(COMB_FOCUS),
+                        Some(COMB_FEED),
+                        Some(COMB_DAMP),
+                        Some(COMB_MIX),
+                        None,
+                        None,
+                        None,
+                        None,
+                    ],
+                },
+            ],
+        }),
+        None,
+        None,
     ];
 }
 
@@ -8840,6 +10260,7 @@ pub mod sampler {
 /// generic monosynth wearing the name.
 pub mod acid {
     use super::ParamDef;
+    use crate::pages::{KeyTable, MachineKey, SubPage};
 
     pub const WAVE: u32 = 0;
     pub const TUNE: u32 = 1;
@@ -8973,6 +10394,50 @@ pub mod acid {
             max: 2.0,
             default: 0.8,
         },
+    ];
+    /// The acid's function keys: SRC (the oscillator, its glide and
+    /// accent, the drive and level) and FLTR (the filter that is the
+    /// instrument, with its envelope). The amp has no knobs, so AMP
+    /// stays the lane's. TRIG, LFO, FX and MIX are the track's.
+    pub const KEYS: KeyTable = [
+        None,
+        Some(MachineKey {
+            word: "SRC",
+            subpages: &[SubPage {
+                title: "Acid",
+                slots: [
+                    Some(WAVE),
+                    Some(TUNE),
+                    Some(GLIDE),
+                    Some(ACCENT),
+                    Some(DRIVE),
+                    Some(LEVEL),
+                    None,
+                    None,
+                ],
+            }],
+        }),
+        Some(MachineKey {
+            word: "FLTR",
+            subpages: &[SubPage {
+                title: "Filter",
+                slots: [
+                    Some(CUTOFF),
+                    Some(RESONANCE),
+                    Some(ENV_MOD),
+                    Some(DECAY),
+                    None,
+                    None,
+                    None,
+                    None,
+                ],
+            }],
+        }),
+        None,
+        None,
+        None,
+        None,
+        None,
     ];
 }
 
@@ -12040,6 +13505,17 @@ mod tests {
         ("tom", tom::TABLE),
         ("hat", hat::TABLE),
         ("handclap", handclap::TABLE),
+        ("drum", drum::TABLE),
+        ("thump", thump::TABLE),
+        ("clay", clay::TABLE),
+        ("table", table::TABLE),
+        ("ring", ring::TABLE),
+        ("prism_voice", prism_voice::TABLE),
+        ("mass", mass::TABLE),
+        ("pluck", pluck::TABLE),
+        ("vox", vox::TABLE),
+        ("pipe", pipe::TABLE),
+        ("glass", glass::TABLE),
         ("limiter", limiter::TABLE),
         ("lofi", lofi::TABLE),
         ("sheen", sheen::TABLE),

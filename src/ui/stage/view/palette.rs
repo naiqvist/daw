@@ -22,9 +22,15 @@
 //! does not exist, so a missing file or a missing role changes nothing.
 //! The lock is read once per colour per frame: nothing, and it buys
 //! recolouring the whole stage without stopping it.
+//!
+//! Two files, one per POLARITY: `daw.theme` for the dark ground and
+//! `daw-light.theme` for the light one (seeded with gruvbox light). The
+//! ground turned over (^L, or the light-ground preference) reads the
+//! other file; every role keeps its meaning, only its colour changes.
 
 use eframe::egui::Color32;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Every colour the view knows how to name.
 #[derive(Clone, Copy, Debug)]
@@ -59,6 +65,10 @@ pub struct Colours {
     pub alert: Color32,
     /// A defect the machine reports about itself. At most one on screen.
     pub fault: Color32,
+    /// The drum lane's hue: a type of channel, worn by its head. The one
+    /// role that names something musical rather than something the
+    /// machine says about itself.
+    pub drum: Color32,
 }
 
 /// The ground's channels, so a mix blends toward the real thing.
@@ -78,6 +88,7 @@ const BLUE: [u32; 3] = [0x6c, 0xa8, 0xe0];
 const GREEN: [u32; 3] = [0x74, 0xd1, 0x8c];
 const ORANGE: [u32; 3] = [0xf2, 0x9a, 0x4a];
 const PINK: [u32; 3] = [0xe8, 0x7f, 0xb0];
+const VIOLET: [u32; 3] = [0xa9, 0x8c, 0xf0];
 
 impl Colours {
     pub const DEFAULT: Colours = Colours {
@@ -96,13 +107,42 @@ impl Colours {
         nominal: mix(GREEN, 78),
         alert: mix(ORANGE, 92),
         fault: mix(PINK, 88),
+        drum: mix(VIOLET, 84),
+    };
+}
+
+/// Gruvbox light, on the same roles: the paper ground, the dark ink,
+/// aqua for the machine, blue for a name, green for fine, orange for
+/// wants-you, red for broken, purple for the drum lane.
+const fn rgb(v: u32) -> Color32 {
+    Color32::from_rgb((v >> 16) as u8, (v >> 8) as u8, v as u8)
+}
+
+impl Colours {
+    pub const GRUVBOX_LIGHT: Colours = Colours {
+        ground: rgb(0xfbf1c7),
+        ink: rgb(0x282828),
+        panel: rgb(0xf2e5bc),
+        bright: rgb(0x282828),
+        fg: rgb(0x3c3836),
+        dim: rgb(0x7c6f64),
+        rule: rgb(0xebdbb2),
+        edge: rgb(0xd5c4a1),
+        chassis: rgb(0x427b58),
+        select: rgb(0xd9e0c6),
+        label: rgb(0x076678),
+        dir: rgb(0x458588),
+        nominal: rgb(0x79740e),
+        alert: rgb(0xaf3a03),
+        fault: rgb(0x9d0006),
+        drum: rgb(0x8f3f71),
     };
 }
 
 impl Colours {
     /// Every role by name, so a file and this struct cannot disagree
     /// about what a role is called.
-    fn slots(&mut self) -> [(&'static str, &mut Color32); 15] {
+    fn slots(&mut self) -> [(&'static str, &mut Color32); 16] {
         [
             ("ground", &mut self.ground),
             ("ink", &mut self.ink),
@@ -119,11 +159,24 @@ impl Colours {
             ("nominal", &mut self.nominal),
             ("alert", &mut self.alert),
             ("fault", &mut self.fault),
+            ("drum", &mut self.drum),
         ]
     }
 }
 
 static CURRENT: RwLock<Colours> = RwLock::new(Colours::DEFAULT);
+static CURRENT_LIGHT: RwLock<Colours> = RwLock::new(Colours::GRUVBOX_LIGHT);
+/// Whether the ground is turned over this frame: the light file reads.
+static LIGHT: AtomicBool = AtomicBool::new(false);
+
+/// Which polarity the colours answer for. The view says so once a
+/// frame, from the stage's own polarity.
+pub fn set_polarity(polarity: crate::design::Polarity) {
+    LIGHT.store(
+        polarity == crate::design::Polarity::Light,
+        Ordering::Relaxed,
+    );
+}
 
 /// A shade of the ground: the ground's own hue and chroma, its lightness
 /// raised by `t` of the way toward the reading surface. `0` is the
@@ -182,21 +235,34 @@ pub fn theme() -> crate::ui::theme::Theme {
     t
 }
 
-/// The colours in force this frame.
+/// The colours in force this frame, for the ground's polarity.
 pub fn colours() -> Colours {
-    CURRENT.read().map(|c| *c).unwrap_or(Colours::DEFAULT)
+    if LIGHT.load(Ordering::Relaxed) {
+        CURRENT_LIGHT
+            .read()
+            .map(|c| *c)
+            .unwrap_or(Colours::GRUVBOX_LIGHT)
+    } else {
+        CURRENT.read().map(|c| *c).unwrap_or(Colours::DEFAULT)
+    }
 }
 
 /// Where the theme lives: beside the cockpit's, one console.
 pub fn theme_path() -> std::path::PathBuf {
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    home.unwrap_or_default().join("Corpus").join("daw.theme")
+    crate::corpus::dir().join("daw.theme")
 }
 
-/// The theme file, watched.
+/// The light ground's theme, beside it.
+pub fn light_theme_path() -> std::path::PathBuf {
+    crate::corpus::dir().join("daw-light.theme")
+}
+
+/// The theme files, watched: the dark ground's and the light ground's.
 pub struct Skin {
     path: std::path::PathBuf,
     settle: watch::Settle,
+    light_path: std::path::PathBuf,
+    light_settle: watch::Settle,
     /// Bumps each time a theme lands; a caller that caches by colour can
     /// key on it.
     pub generation: u64,
@@ -205,17 +271,19 @@ pub struct Skin {
 }
 
 impl Skin {
-    /// Watch `path`, seeding it with the defaults if it does not exist.
+    /// Watch `path` and its light sibling, seeding each with its
+    /// defaults if it does not exist.
     pub fn new(path: std::path::PathBuf) -> Self {
-        if !path.exists() {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::write(&path, to_text(&Colours::DEFAULT));
-        }
+        let light_path = path
+            .parent()
+            .map_or_else(|| light_theme_path(), |dir| dir.join("daw-light.theme"));
+        seed(&path, &Colours::DEFAULT);
+        seed(&light_path, &Colours::GRUVBOX_LIGHT);
         Self {
             path,
             settle: watch::Settle::new(3),
+            light_path,
+            light_settle: watch::Settle::new(3),
             generation: 0,
             status: String::new(),
         }
@@ -223,36 +291,83 @@ impl Skin {
 
     /// Once a frame. `true` when a new theme just took effect.
     pub fn poll(&mut self) -> bool {
-        if !self.settle.observe(watch::fingerprint(&self.path)) {
-            return false;
+        let dark = if self.settle.observe(watch::fingerprint(&self.path)) {
+            Self::load(
+                &self.path,
+                &Colours::DEFAULT,
+                &CURRENT,
+                &mut self.status,
+                "theme",
+            )
+        } else {
+            false
+        };
+        let light = if self
+            .light_settle
+            .observe(watch::fingerprint(&self.light_path))
+        {
+            Self::load(
+                &self.light_path,
+                &Colours::GRUVBOX_LIGHT,
+                &CURRENT_LIGHT,
+                &mut self.status,
+                "light theme",
+            )
+        } else {
+            false
+        };
+        if dark || light {
+            self.generation += 1;
         }
-        let Ok(text) = std::fs::read_to_string(&self.path) else {
-            self.status = "theme unreadable".to_owned();
+        dark || light
+    }
+
+    /// Read one file into its slot, over `base` for the roles it leaves
+    /// unnamed. `true` when it took.
+    fn load(
+        path: &std::path::Path,
+        base: &Colours,
+        into: &RwLock<Colours>,
+        status: &mut String,
+        what: &str,
+    ) -> bool {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            *status = format!("{what} unreadable");
             return false;
         };
         match theme_file::parse(&text) {
             Ok(parsed) => {
-                let (next, found) = apply(&parsed);
+                let (next, found) = apply(&parsed, base);
                 let ratio = contrast::ratio(srgb(next.fg), srgb(next.ground));
-                if let Ok(mut w) = CURRENT.write() {
+                if let Ok(mut w) = into.write() {
                     *w = next;
                 }
-                self.generation += 1;
-                self.status = format!("theme: {found} roles, fg/ground {ratio:.1}:1");
+                *status = format!("{what}: {found} roles, fg/ground {ratio:.1}:1");
                 true
             }
             Err(e) => {
-                self.status = format!("theme refused: {e:?}");
+                *status = format!("{what} refused: {e:?}");
                 false
             }
         }
     }
 }
 
-/// The defaults with every role the file names replaced, and how many
-/// that was.
-fn apply(parsed: &theme_file::Theme) -> (Colours, usize) {
-    let mut next = Colours::DEFAULT;
+/// Write `colours` to `path` as a theme file, when there is none.
+fn seed(path: &std::path::Path, colours: &Colours) {
+    if path.exists() {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, to_text(colours));
+}
+
+/// `base` with every role the file names replaced, and how many that
+/// was.
+fn apply(parsed: &theme_file::Theme, base: &Colours) -> (Colours, usize) {
+    let mut next = *base;
     let mut found = 0;
     for (name, slot) in next.slots() {
         if let Some(lch) = parsed.get(name) {
@@ -299,14 +414,39 @@ fn to_text(colours: &Colours) -> String {
 mod tests {
     use super::*;
 
+    /// The light ground is paper, not a dimmer dark: its ground is
+    /// light, its ink dark, and they read against each other.
+    #[test]
+    fn gruvbox_light_is_light_and_reads() {
+        let c = Colours::GRUVBOX_LIGHT;
+        assert!(to_lch(c.ground)[0] > 0.9, "the ground is not light");
+        assert!(to_lch(c.ink)[0] < 0.4, "the ink is not dark");
+        assert!(contrast::ratio(srgb(c.fg), srgb(c.ground)) > 7.0);
+        assert!(contrast::ratio(srgb(c.dim), srgb(c.ground)) > 3.0);
+        // The roles keep their meanings: the machine's hue, a name's, and
+        // the alarm's are still three hues.
+        assert_ne!(c.chassis, c.label);
+        assert_ne!(c.alert, c.nominal);
+    }
+
+    /// The colours answer for the ground's polarity.
+    #[test]
+    fn the_colours_follow_the_polarity() {
+        set_polarity(crate::design::Polarity::Light);
+        let light = colours();
+        set_polarity(crate::design::Polarity::Dark);
+        let dark = colours();
+        assert!(to_lch(light.ground)[0] > to_lch(dark.ground)[0]);
+    }
+
     /// A theme written from the defaults reads back as the defaults, to
     /// within a byte per channel — the file is a faithful copy, not a
     /// slow drift.
     #[test]
     fn the_defaults_survive_a_trip_through_the_file() {
         let parsed = theme_file::parse(&to_text(&Colours::DEFAULT)).expect("our own text parses");
-        let (back, found) = apply(&parsed);
-        assert_eq!(found, 15);
+        let (back, found) = apply(&parsed, &Colours::DEFAULT);
+        assert_eq!(found, 16);
         let mut a = Colours::DEFAULT;
         let mut b = back;
         for ((name, x), (_, y)) in a.slots().into_iter().zip(b.slots()) {
@@ -323,7 +463,7 @@ mod tests {
     #[test]
     fn a_missing_role_changes_nothing() {
         let parsed = theme_file::parse("alert 0.9 0.2 1.0\n").expect("parses");
-        let (next, found) = apply(&parsed);
+        let (next, found) = apply(&parsed, &Colours::DEFAULT);
         assert_eq!(found, 1);
         assert_eq!(next.ground, Colours::DEFAULT.ground);
         assert_ne!(next.alert, Colours::DEFAULT.alert);

@@ -10,7 +10,7 @@
 //!
 //! Lifted out of `main.rs` unchanged.
 
-use crate::devices::{DEVICES, DeviceSpec};
+use crate::devices::{CONSOLE, DEVICES, DeviceSpec};
 
 pub const TRACK_VOLUME_TARGET: &str = "track.volume";
 pub const TRACK_PAN_TARGET: &str = "track.pan";
@@ -116,7 +116,7 @@ impl Default for ParameterRegistry {
         // The device rows are walked out of DEVICES: range and default come
         // from `daw::params`, words from the device's labels. Adding a
         // device adds its rows here without an edit.
-        for device in DEVICES {
+        for device in DEVICES.iter().chain(CONSOLE.iter()) {
             for (def, label) in device.params.iter().zip(device.labels) {
                 registry.register(ParameterSpec {
                     id: format!("{}.{}", device.prefix, def.name),

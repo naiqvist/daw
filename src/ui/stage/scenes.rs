@@ -99,13 +99,6 @@ pub struct Mark {
     pub label: String,
 }
 
-/// A pattern's name as a cell on `track_index` shows it: the address
-/// with this track's own prefix dropped.
-pub fn slot_label(name: &str, track_index: usize) -> String {
-    let prefix = format!("T{} ", track_index + 1);
-    name.strip_prefix(&prefix).unwrap_or(name).to_owned()
-}
-
 /// The mark for the slot at `scene` on the track at `track_index`, or
 /// `None` for an empty slot (and for a place that does not exist, which
 /// draws the same way: as nothing).
@@ -116,10 +109,7 @@ pub fn mark(song: &Song, track_index: usize, scene: usize) -> Option<Mark> {
         // cell, the way a trig is a solid thing in a step.
         Clip::Pattern(id) => Mark {
             glyph: glyph::DOT,
-            label: song
-                .pattern(id)
-                .map(|pattern| slot_label(&pattern.name, track_index))
-                .unwrap_or_else(|| format!("{:02}", id.0)),
+            label: song.tag_of(id),
         },
     })
 }
@@ -155,7 +145,7 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_slot_draws_nothing_and_a_filled_one_draws_its_address() {
+    fn an_empty_slot_draws_nothing_and_a_filled_one_draws_its_tag() {
         let mut song = Song::default();
         assert_eq!(mark(&song, 0, 0), None);
         song.fill_slot(0, 0).expect("fill");
@@ -163,7 +153,7 @@ mod tests {
             mark(&song, 0, 0),
             Some(Mark {
                 glyph: glyph::DOT,
-                label: "A1".to_owned(),
+                label: "a1".to_owned(),
             })
         );
         assert_eq!(
@@ -178,18 +168,10 @@ mod tests {
         );
     }
 
-    /// The cell drops its own track from the address and keeps the
-    /// rest; a name that is not an address shows whole.
+    /// A cell shows the clip's TAG: its track's letter and its number
+    /// on that track, minted when the clip was made.
     #[test]
-    fn a_cell_shows_the_address_without_its_own_track() {
-        assert_eq!(slot_label("T1 A1", 0), "A1");
-        assert_eq!(slot_label("T3 B12", 2), "B12");
-        assert_eq!(
-            slot_label("T3 B12", 0),
-            "T3 B12",
-            "another track's prefix was dropped"
-        );
-        assert_eq!(slot_label("P02", 0), "P02");
+    fn a_cell_shows_the_clips_tag() {
         let mut song = Song::default();
         while song.session.scenes.len() < 18 {
             song.session
@@ -197,7 +179,7 @@ mod tests {
                 .push(crate::sequencing::Scene::default());
         }
         song.fill_slot(0, 17).expect("fill");
-        assert_eq!(mark(&song, 0, 17).map(|m| m.label), Some("B2".to_owned()));
+        assert_eq!(mark(&song, 0, 17).map(|m| m.label), Some("a1".to_owned()));
     }
 
     #[test]

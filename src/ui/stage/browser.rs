@@ -90,16 +90,18 @@ pub mod glyph {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Shelf {
     Devices,
+    Sounds,
     Samples,
     Projects,
 }
 
 impl Shelf {
-    pub const ALL: [Self; 3] = [Self::Devices, Self::Samples, Self::Projects];
+    pub const ALL: [Self; 4] = [Self::Devices, Self::Sounds, Self::Samples, Self::Projects];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Devices => "Devices",
+            Self::Sounds => "Sounds",
             Self::Samples => "Samples",
             Self::Projects => "Projects",
         }
@@ -117,6 +119,9 @@ pub enum EntryKind {
     Group,
     /// An instrument or effect, ready to head or join a chain.
     Device(DeviceKind),
+    /// A saved sound: a lane word, a machine and a strip, ready to land
+    /// on the addressed track. Kits are drum sounds and live here too.
+    Sound(PathBuf),
     /// A file on disk that can be auditioned.
     Sample(PathBuf),
     /// A song that can be opened.
@@ -247,11 +252,14 @@ fn section_mark(section: Section) -> Glyph {
 /// The device shelf, as the registry files it.
 ///
 /// Built by walking `Section` and `Family` rather than from a list kept
-/// here: the registry is the only catalog, so adding a device there makes
-/// it browsable — and filed correctly — without touching this.
+/// here: the registry is the only catalog, so adding an instrument there
+/// makes it browsable — and filed correctly — without touching this. Effects
+/// are retained in the registry only for old-document migration; lanes name
+/// their own fixed sections and the browser must not offer a second path.
 pub(super) fn device_nodes() -> Vec<Node> {
     Section::ALL
         .into_iter()
+        .filter(|section| *section == Section::Instruments)
         .map(|section| {
             let families = Family::ALL
                 .into_iter()
@@ -260,6 +268,9 @@ pub(super) fn device_nodes() -> Vec<Node> {
                     let devices = DEVICES
                         .iter()
                         .filter(|spec| spec.family == family)
+                        // Only machines with pages are offered: the old
+                        // instruments are reference, kept for old songs.
+                        .filter(|spec| crate::pages::has_pages(spec.kind))
                         .map(|spec| {
                             // The registry already writes these as names
                             // a reader would say out loud — "808 hat",
@@ -272,8 +283,61 @@ pub(super) fn device_nodes() -> Vec<Node> {
                     Node::branch(family.label(), EntryKind::Group, devices)
                         .marked(family_mark(family))
                 })
+                // A family with nothing on the shelf is not a heading.
+                .filter(|family| !family.children.is_empty())
                 .collect();
             Node::branch(section.label(), EntryKind::Group, families).marked(section_mark(section))
+        })
+        .collect()
+}
+
+/// The Devices shelf as `lane` would show it: the lane's own shelf of
+/// machines first, as one group named by the lane, then the registry
+/// as it is. A shelf is a recommendation; nothing is removed.
+pub(super) fn device_nodes_for(lane: crate::lane::Lane) -> Vec<Node> {
+    let shelf = lane.shelf();
+    let mut nodes = Vec::with_capacity(1 + Section::ALL.len());
+    if !shelf.is_empty() {
+        let leaves = shelf
+            .iter()
+            .map(|kind| Node::leaf(kind.spec().name, EntryKind::Device(*kind)))
+            .collect();
+        nodes.push(Node::branch(
+            format!("{} shelf", lane.name()),
+            EntryKind::Group,
+            leaves,
+        ));
+    }
+    nodes.extend(device_nodes());
+    nodes
+}
+
+/// The sound library as rows: one group per lane kind, `first` ahead of
+/// the rest, one leaf per sound. Read from the folder now, like the
+/// songs, because a small folder is not a scan. No library, no rows.
+pub(super) fn sound_nodes(dir: Option<&std::path::Path>, first: crate::lane::Lane) -> Vec<Node> {
+    let Some(dir) = dir else {
+        return Vec::new();
+    };
+    let records = crate::sound::list(dir);
+    let mut lanes: Vec<String> = Vec::new();
+    for record in &records {
+        if !lanes.contains(&record.lane) {
+            lanes.push(record.lane.clone());
+        }
+    }
+    lanes.sort_by_key(|lane| (lane != first.name(), lane.clone()));
+    lanes
+        .into_iter()
+        .map(|lane| {
+            let leaves = records
+                .iter()
+                .filter(|record| record.lane == lane)
+                .map(|record| {
+                    Node::leaf(record.name.clone(), EntryKind::Sound(record.path.clone()))
+                })
+                .collect();
+            Node::branch(lane, EntryKind::Group, leaves)
         })
         .collect()
 }
@@ -290,6 +354,38 @@ pub(super) fn sample_nodes(assets: &[AssetRecord]) -> Vec<Node> {
             )
         })
         .collect()
+}
+
+/// Like project_nodes: directory names are read only when refreshing the shelf.
+pub(super) fn sample_nodes_with_kiln(assets: &[AssetRecord]) -> Vec<Node> {
+    let kiln = crate::kiln::files::directory();
+    let mut nodes = sample_nodes(assets);
+    nodes.retain(|node| !matches!(&node.kind,EntryKind::Sample(path) if path.starts_with(&kiln)));
+    let mut printed: Vec<_> = std::fs::read_dir(&kiln)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "wav"))
+        .collect();
+    printed.sort();
+    nodes.push(Node::branch(
+        "Kiln",
+        EntryKind::Group,
+        printed
+            .into_iter()
+            .map(|path| {
+                Node::leaf(
+                    path.file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                    EntryKind::Sample(path),
+                )
+            })
+            .collect(),
+    ));
+    nodes
 }
 
 /// The songs in the stage's own folder, by name. `None` — a stage with
@@ -346,7 +442,7 @@ pub struct Browser {
     cursor: usize,
     /// Per shelf, because they complete independently: a finished device
     /// list says nothing about whether the sample scan has landed.
-    status: [BrowserStatus; 3],
+    status: [BrowserStatus; Shelf::ALL.len()],
 }
 
 impl Browser {
@@ -357,6 +453,9 @@ impl Browser {
             .map(|shelf| {
                 let children = match shelf {
                     Shelf::Devices => device_nodes(),
+                    // Filled by the stage when it summons the browser,
+                    // from the sound library, the addressed lane first.
+                    Shelf::Sounds => Vec::new(),
                     // Filled by the scanner when it lands.
                     Shelf::Samples => Vec::new(),
                     // Filled by the stage when it summons the browser,
@@ -372,6 +471,7 @@ impl Browser {
             cursor: 0,
             status: [
                 BrowserStatus::Ready,
+                BrowserStatus::Unavailable,
                 BrowserStatus::Scanning,
                 BrowserStatus::Unavailable,
             ],
@@ -712,17 +812,18 @@ mod tests {
     fn a_branch_counts_the_leaves_beneath_it_not_the_doors() {
         let browser = Browser::shelves();
         let devices = browser.node_at(&[0]).expect("the devices shelf");
+        let offered = DEVICES
+            .iter()
+            .filter(|spec| spec.instrument && crate::pages::has_pages(spec.kind))
+            .count();
         assert_eq!(
             devices.leaves(),
-            DEVICES.len(),
+            offered,
             "the shelf miscounted what it holds"
         );
 
         let instruments = browser.node_at(&[0, 0]).expect("the instruments section");
-        assert_eq!(
-            instruments.leaves(),
-            DEVICES.iter().filter(|spec| spec.instrument).count()
-        );
+        assert_eq!(instruments.leaves(), offered);
     }
 
     #[test]
@@ -741,7 +842,7 @@ mod tests {
             "a closed library reported leaves nobody can see"
         );
 
-        for ch in "reverb".chars() {
+        for ch in "drum".chars() {
             browser.type_char(ch);
         }
         assert!(
@@ -749,8 +850,33 @@ mod tests {
             "the filter kept rows but reported no yield"
         );
         assert!(
-            browser.surviving_leaves() < DEVICES.len(),
+            browser.surviving_leaves() < DEVICES.iter().filter(|spec| spec.instrument).count(),
             "the filter reported the whole library as surviving"
+        );
+    }
+
+    #[test]
+    fn the_browser_offers_instruments_and_no_effect_kind() {
+        fn leaves(node: &Node, out: &mut Vec<DeviceKind>) {
+            if let EntryKind::Device(kind) = node.kind {
+                out.push(kind);
+            }
+            for child in &node.children {
+                leaves(child, out);
+            }
+        }
+        let mut offered = Vec::new();
+        for root in device_nodes() {
+            leaves(&root, &mut offered);
+        }
+        assert!(offered.iter().all(|kind| kind.is_instrument()));
+        assert!(offered.iter().all(|kind| crate::pages::has_pages(*kind)));
+        assert_eq!(
+            offered.len(),
+            DEVICES
+                .iter()
+                .filter(|spec| spec.instrument && crate::pages::has_pages(spec.kind))
+                .count()
         );
     }
 
@@ -803,14 +929,14 @@ mod tests {
     }
 
     #[test]
-    fn the_library_opens_closed_on_its_three_shelves() {
+    fn the_library_opens_closed_on_its_four_shelves() {
         let browser = Browser::shelves();
         let labels: Vec<_> = browser
             .rows()
             .iter()
             .map(|row| browser.node_at(&row.path).expect("row").label.clone())
             .collect();
-        assert_eq!(labels, ["Devices", "Samples", "Projects"]);
+        assert_eq!(labels, ["Devices", "Sounds", "Samples", "Projects"]);
     }
 
     #[test]
@@ -840,11 +966,11 @@ mod tests {
     #[test]
     fn left_closes_a_branch_before_it_climbs_out_of_one() {
         let mut browser = Browser::shelves();
-        walk_to(&mut browser, &["Devices", "Instruments", "Synths"]);
-        assert!(browser.step(Step::Left), "SYNTHS would not close");
+        walk_to(&mut browser, &["Devices", "Instruments", "Drums"]);
+        assert!(browser.step(Step::Left), "DRUMS would not close");
         assert_eq!(
             browser.selected().map(|node| node.label.as_str()),
-            Some("Synths"),
+            Some("Drums"),
             "closing a branch also moved the cursor"
         );
 
@@ -868,13 +994,10 @@ mod tests {
     #[test]
     fn a_leaf_refuses_to_open() {
         let mut browser = Browser::shelves();
-        walk_to(
-            &mut browser,
-            &["Devices", "Instruments", "Synths", "poly synth"],
-        );
+        walk_to(&mut browser, &["Devices", "Instruments", "Drums", "drum"]);
         assert_eq!(
             browser.selected().map(|node| node.label.as_str()),
-            Some("poly synth")
+            Some("drum")
         );
         assert!(!browser.step(Step::Right), "a device opened like a folder");
         assert!(!browser.toggle(), "a device toggled like a folder");
@@ -890,27 +1013,18 @@ mod tests {
             .filter(|row| row.depth == 1)
             .map(|row| browser.node_at(&row.path).expect("row").label.clone())
             .collect();
-        assert_eq!(sections, ["Instruments", "Audio Effects"]);
+        assert_eq!(sections, ["Instruments"]);
 
-        walk_to(&mut browser, &["Audio Effects"]);
+        walk_to(&mut browser, &["Instruments"]);
         let families: Vec<_> = browser
             .rows()
             .iter()
-            .filter(|row| row.depth == 2 && row.path[1] == 1)
+            .filter(|row| row.depth == 2 && row.path[1] == 0)
             .map(|row| browser.node_at(&row.path).expect("row").label.clone())
             .collect();
-        assert_eq!(
-            families,
-            [
-                "Dynamics",
-                "EQ & Filters",
-                "Delay & Reverb",
-                "Distortion",
-                "Modulation",
-                "Spectral",
-                "Utilities"
-            ]
-        );
+        // Only families with a machine on the shelf are headings: the
+        // acid under Synths, DRUM and THUMP under Drums.
+        assert_eq!(families, ["Synths", "Drums", "Sampling"]);
     }
 
     #[test]
@@ -927,7 +1041,22 @@ mod tests {
                 );
             }
         }
-        assert_eq!(found, DEVICES.len(), "a device is missing from the tree");
+        assert_eq!(
+            found,
+            DEVICES
+                .iter()
+                .filter(|spec| spec.instrument && crate::pages::has_pages(spec.kind))
+                .count(),
+            "an instrument is missing from the tree"
+        );
+        assert!(
+            nodes
+                .iter()
+                .flat_map(|section| &section.children)
+                .all(|family| family.children.iter().all(
+                    |node| matches!(&node.kind, EntryKind::Device(kind) if kind.spec().instrument)
+                ))
+        );
     }
 
     #[test]
@@ -939,7 +1068,7 @@ mod tests {
     #[test]
     fn typing_opens_the_tree_along_every_path_to_a_match() {
         let mut browser = Browser::shelves();
-        for ch in "reverb".chars() {
+        for ch in "drum".chars() {
             browser.type_char(ch);
         }
         let labels: Vec<_> = browser
@@ -948,15 +1077,15 @@ mod tests {
             .map(|row| browser.node_at(&row.path).expect("row").label.clone())
             .collect();
         assert!(
-            labels.iter().any(|label| label == "reverb"),
+            labels.iter().any(|label| label == "drum"),
             "a match stayed hidden inside a closed branch: {labels:?}"
         );
         assert!(
-            labels.iter().any(|label| label == "Delay & Reverb"),
+            labels.iter().any(|label| label == "Drums"),
             "the heading leading to the match was dropped: {labels:?}"
         );
         assert!(
-            !labels.iter().any(|label| label == "poly synth"),
+            !labels.iter().any(|label| label == "Projects"),
             "the filter kept a row that does not match: {labels:?}"
         );
     }
@@ -983,11 +1112,11 @@ mod tests {
     #[test]
     fn backspace_widens_again_and_reports_when_there_is_nothing_left() {
         let mut browser = Browser::shelves();
-        // `z` alone survives — HAZE carries one — so the query has to be
+        // `u` alone survives — DRUM carries one — so the query has to be
         // two characters to actually empty the tree.
-        browser.type_char('z');
+        browser.type_char('u');
         browser.type_char('q');
-        assert!(browser.is_empty(), "zq matched something");
+        assert!(browser.is_empty(), "uq matched something");
 
         assert!(browser.backspace());
         assert!(!browser.is_empty(), "the tree did not come back");

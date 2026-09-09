@@ -20,7 +20,10 @@ pub(super) fn egui_key(key: Key) -> egui::Key {
         Key::E => egui::Key::E,
         Key::F => egui::Key::F,
         Key::G => egui::Key::G,
+        Key::H => egui::Key::H,
         Key::I => egui::Key::I,
+        Key::J => egui::Key::J,
+        Key::K => egui::Key::K,
         Key::L => egui::Key::L,
         Key::M => egui::Key::M,
         Key::N => egui::Key::N,
@@ -30,9 +33,11 @@ pub(super) fn egui_key(key: Key) -> egui::Key {
         Key::R => egui::Key::R,
         Key::S => egui::Key::S,
         Key::T => egui::Key::T,
+        Key::U => egui::Key::U,
         Key::V => egui::Key::V,
         Key::W => egui::Key::W,
         Key::X => egui::Key::X,
+        Key::Y => egui::Key::Y,
         Key::Z => egui::Key::Z,
         Key::ArrowDown => egui::Key::ArrowDown,
         Key::ArrowLeft => egui::Key::ArrowLeft,
@@ -46,7 +51,14 @@ pub(super) fn egui_key(key: Key) -> egui::Key {
         Key::Enter => egui::Key::Enter,
         Key::Equals => egui::Key::Equals,
         Key::Escape => egui::Key::Escape,
+        Key::F1 => egui::Key::F1,
         Key::F2 => egui::Key::F2,
+        Key::F3 => egui::Key::F3,
+        Key::F4 => egui::Key::F4,
+        Key::F5 => egui::Key::F5,
+        Key::F6 => egui::Key::F6,
+        Key::F7 => egui::Key::F7,
+        Key::F8 => egui::Key::F8,
         Key::F9 => egui::Key::F9,
         Key::Home => egui::Key::Home,
         Key::Minus => egui::Key::Minus,
@@ -137,6 +149,38 @@ pub(super) fn consume_chords(
         .collect()
 }
 
+/// The sixteen physical trig keys, left-to-right across their two rows.
+/// Sampled every frame so tap and hold are a property of the gesture, not
+/// of the operating system's repeat timing.
+pub(super) fn step_mask(input: &egui::InputState) -> u16 {
+    [
+        egui::Key::Num1,
+        egui::Key::Num2,
+        egui::Key::Num3,
+        egui::Key::Num4,
+        egui::Key::Num5,
+        egui::Key::Num6,
+        egui::Key::Num7,
+        egui::Key::Num8,
+        egui::Key::Q,
+        egui::Key::W,
+        egui::Key::E,
+        egui::Key::R,
+        egui::Key::T,
+        egui::Key::Y,
+        egui::Key::U,
+        egui::Key::I,
+    ]
+    .into_iter()
+    .enumerate()
+    // A key pressed and released between two frames is still a tap: it
+    // counts as down for the frame that saw the press, and comes up on
+    // the next.
+    .fold(0, |mask, (bit, key)| {
+        mask | (u16::from(input.key_down(key) || input.key_pressed(key)) << bit)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,6 +191,7 @@ mod tests {
     #[test]
     fn the_symbols_are_eguis_own() {
         let pairs = [
+            (Key::F1, egui::Key::F1),
             (Key::ArrowDown, egui::Key::ArrowDown),
             (Key::ArrowLeft, egui::Key::ArrowLeft),
             (Key::ArrowRight, egui::Key::ArrowRight),

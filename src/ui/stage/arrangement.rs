@@ -599,7 +599,7 @@ impl Stage {
     }
 
     /// Lay `pattern` on `track` at `start`, `length` long, saying so.
-    fn lay_block(
+    pub(super) fn lay_block(
         &mut self,
         track: usize,
         pattern: PatternId,
@@ -1260,7 +1260,7 @@ pub struct Take {
 /// file. The host builds the arrangement's graph and bounces it on a
 /// thread, reporting back through [`Stage::set_export_progress`] and
 /// [`Stage::export_finished`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ExportRequest {
     pub start_tick: usize,
     pub end_tick: usize,
@@ -1271,6 +1271,9 @@ pub struct ExportRequest {
     /// Silence rendered after the musical range so time-based effects can
     /// decay without changing where the requested range begins or ends.
     pub tail_seconds: u32,
+    /// Optional isolated document for printing an instrument phrase.
+    /// Green-zone snapshot; ordinary song exports use the live document.
+    pub source: Option<Box<crate::sequencing::Song>>,
 }
 
 /// An export under way, as the strip shows it.
@@ -1278,6 +1281,7 @@ pub struct ExportRequest {
 pub struct ExportState {
     pub path: std::path::PathBuf,
     pub progress: f32,
+    pub import_sample: bool,
 }
 
 /// `YYYYMMDD-HHMMSS`, now, in UTC: a render's name should say when it
@@ -1355,6 +1359,10 @@ impl Stage {
         };
         self.export_request = None;
         self.utility.export_finished(&export.path, &result);
+        if result.is_ok() && export.import_sample {
+            self.import_sampler_print(export.path);
+            return;
+        }
         self.notice = Some(match result {
             Ok(()) => format!("exported → {}", export.path.display()),
             Err(error) => format!("export failed: {error}"),
@@ -1426,10 +1434,12 @@ impl Stage {
             format,
             rate_hz,
             tail_seconds,
+            source: None,
         });
         self.export = Some(ExportState {
             path,
             progress: 0.0,
+            import_sample: false,
         });
         self.notice = Some(format!(
             "EXPORT · {}",

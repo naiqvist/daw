@@ -14,13 +14,16 @@ pub mod acid;
 pub mod bounce;
 pub mod brick;
 pub mod clamp;
+pub mod clay;
 pub mod console;
+pub mod drum;
 pub mod eq;
 pub mod ferric;
 pub mod filter;
 pub mod flint;
 pub mod gate;
 pub mod gauge;
+pub mod glass;
 pub mod glue;
 pub mod graph;
 pub mod handclap;
@@ -31,15 +34,20 @@ pub mod kit;
 pub mod lens;
 pub mod limiter;
 pub mod loom;
+pub mod mass;
 pub mod material;
 pub mod modulation;
 pub mod modulato;
+pub mod pipe;
+pub mod pluck;
 pub mod poly;
 pub mod preamp;
 pub mod prism;
+pub mod prism_voice;
 pub mod project;
 pub mod quad;
 pub mod resyn;
+pub mod ring;
 pub mod sampler;
 pub mod scomp;
 pub mod sibyl;
@@ -47,12 +55,15 @@ pub mod sigil;
 pub mod snare;
 pub mod stab;
 pub mod strip;
+pub mod table;
+pub mod thump;
 pub mod tine;
 pub mod tom;
 pub mod tone;
 pub mod transport;
 pub mod umbra;
 pub mod utility;
+pub mod vox;
 
 use assert_no_alloc::assert_no_alloc;
 use rtaudio::{
@@ -841,13 +852,14 @@ impl Engine {
         // old graph in the red zone.
         let mut retirement_backlog: [Option<Box<Schedule>>; SCHEDULE_RING] =
             std::array::from_fn(|_| None);
-        // A newly compiled chart has fresh sequencer cursors. Its first
-        // segment must therefore be treated like a seek, even when the
-        // transport itself continued seamlessly while the green side rebuilt
-        // the graph. Without this edge, a mid-play swap starts each fresh
-        // cursor at event zero and can fire the whole elapsed arrangement in
-        // one callback.
-        let mut schedule_discontinuity = false;
+        // A newly compiled chart has fresh sequencer cursors, and a fresh
+        // cursor starts at event zero: left alone it would fire the whole
+        // elapsed arrangement in one callback. So a new node's first
+        // segment is treated like a seek — but a NODE at a time, inside the
+        // schedule, rather than the whole song at once. A recompile changes
+        // one node's events and leaves the rest of the graph running, and
+        // announcing a discontinuity to all of it was what made every edit
+        // stop the sound. See `Schedule::adopt_state`.
 
         // Captured input on its way to a file. Sized for four seconds of
         // every input channel, which is far more backlog than a green
@@ -963,14 +975,24 @@ impl Engine {
                         // recompile happens for a clip drag or a tempo
                         // nudge, once a second, while audio plays — and a
                         // wire mid-glide must not restart it.
-                        if let Some(old) = schedule.as_ref() {
+                        if let Some(old) = schedule.as_mut() {
                             new_schedule.adopt_modulation_continuity(old);
+                            // And the nodes themselves. A recompile is how
+                            // a trig, a note length or a p-lock reaches the
+                            // engine, and every one of them leaves almost
+                            // the whole graph untouched: what did not
+                            // change comes across still sounding, and only
+                            // the nodes that are genuinely new are told to
+                            // find their place. Each node carries that
+                            // news itself, which is why nothing here
+                            // announces a discontinuity to the song at
+                            // large any more.
+                            new_schedule.adopt_state(old);
                         }
                         if let Some(mut old) = schedule.replace(new_schedule) {
                             old.prepare_for_retirement();
                             retirement_backlog[retire_slot] = Some(old);
                         }
-                        schedule_discontinuity = true;
                         schedules_taken += 1;
                     }
                     flush_retirement_backlog(&mut trash_tx, &mut retirement_backlog);
@@ -1091,15 +1113,10 @@ impl Engine {
                                 position: seg.position,
                                 beat,
                                 beats_per_sample,
-                                discontinuity: seg.discontinuity || schedule_discontinuity,
+                                discontinuity: seg.discontinuity,
                             };
                             match schedule.as_mut() {
-                                Some(s) => {
-                                    s.run(output, &ctx);
-                                    // One segment is enough to reseek every
-                                    // PatternClock in the immutable schedule.
-                                    schedule_discontinuity = false;
-                                }
+                                Some(s) => s.run(output, &ctx),
                                 None => {
                                     for ch in 0..out_channels {
                                         let start = ch * frames + done;
@@ -1339,6 +1356,13 @@ impl Engine {
         } else {
             StreamHealth::Running
         }
+    }
+
+    /// The epoch of the schedule the callback is running, or is next to
+    /// run. What a new schedule has to name to inherit its live state —
+    /// see [`crate::audio::graph::Schedule::set_adoption`].
+    pub fn live_epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// Hand the callback a new schedule. Also drains any retired schedules,

@@ -46,7 +46,7 @@ struct LegacyDocument {
     song: Song,
 }
 
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 const BACKUP_LIMIT: usize = 20;
 
 /// Move a stage-native document to the current in-memory shape. Versions zero
@@ -54,10 +54,17 @@ const BACKUP_LIMIT: usize = 20;
 /// exact-unity nodes is an audible no-op with explicit stable ids. Keeping the
 /// step here makes a version we do not understand a refusal rather than a
 /// lossy best guess.
-fn migrate(version: u32, mut song: Song) -> Result<Song, String> {
+fn migrate(version: u32, song: Song) -> Result<Song, String> {
+    migrate_logged(version, song).map(|(song, _)| song)
+}
+
+/// `migrate`, with what the migration dropped: one line per lost thing,
+/// for the log column. A clean load has no lines.
+fn migrate_logged(version: u32, mut song: Song) -> Result<(Song, Vec<String>), String> {
+    let mut log = Vec::new();
     match version {
-        0 | 1 => song.install_default_track_gains(),
-        2 | VERSION => {}
+        0 | 1 => log.extend(song.install_default_track_gains()),
+        2 | 3 | VERSION => {}
         future => {
             return Err(format!(
                 "project version {future} is newer than this build (supports through {VERSION})"
@@ -66,10 +73,11 @@ fn migrate(version: u32, mut song: Song) -> Result<Song, String> {
     }
     song.normalize_group_depths();
     song.normalize_mixer();
-    song.normalize_chains();
+    log.extend(song.normalize_chains());
     song.normalize_modulation();
     song.normalize_timeline();
-    Ok(song)
+    log.dedup();
+    Ok((song, log))
 }
 
 /// Write `song` to `path`, making the directory if it is not there.
@@ -188,6 +196,13 @@ pub fn backup(path: &Path, home: &Path) -> Result<Option<PathBuf>, String> {
 /// frame saved. The song is repaired at the boundary, exactly as the
 /// first frame repairs it, so nothing downstream ever sees illegal data.
 pub fn load(path: &Path) -> Result<Song, String> {
+    load_logged(path).map(|(song, _)| song)
+}
+
+/// `load`, with the migration's log beside the song: every device, wire
+/// or setting the document lost on the way in, named. Empty when
+/// nothing was.
+pub fn load_logged(path: &Path) -> Result<(Song, Vec<String>), String> {
     let text = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
     // `.daw.ron` is the first frame's wrapper. Its version numbers belong to
     // that application rather than this document schema; the compatible Song
@@ -207,20 +222,21 @@ pub fn load(path: &Path) -> Result<Song, String> {
         song.modulators = legacy.modulators;
         song.mod_wires = legacy.mod_wires;
         song.next_modulation_id = legacy.next_modulator_id;
-        song.install_default_track_gains();
+        let mut log = song.install_default_track_gains();
         song.normalize_group_depths();
         song.normalize_mixer();
-        song.normalize_chains();
+        log.extend(song.normalize_chains());
         song.normalize_modulation();
         song.normalize_timeline();
-        return Ok(song);
+        log.dedup();
+        return Ok((song, log));
     }
     // Stage may save back to the path a legacy project already owns. Its
     // native wrapper has no top-level BPM, which distinguishes it from the
     // first-frame format and lets that `.daw.ron` reopen without dropping the
     // modulation now stored inside Song.
     let document: Document = ron::from_str(&text).map_err(|error| error.to_string())?;
-    migrate(document.version, document.song)
+    migrate_logged(document.version, document.song)
 }
 
 /// Where a song with no file of its own is saved, inside the songs
@@ -257,7 +273,7 @@ pub fn title(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sequencing::{DeviceRole, TRACK_VOLUME, TrackKind};
+    use crate::sequencing::{TRACK_VOLUME, TrackKind};
 
     fn scratch(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("daw-stage-{}-{name}", std::process::id()))
@@ -386,32 +402,77 @@ mod tests {
     }
 
     #[test]
-    fn version_one_installs_boundary_gains_once() {
+    fn version_one_migrates_to_the_machine_slot() {
         let mut song = Song::default();
-        song.tracks[0].chain.clear();
         let song_text = ron::ser::to_string(&song).expect("encodes");
         let path = scratch("v1-gains.stage.ron");
         std::fs::write(&path, format!("(version: 1, song: {song_text})")).expect("writes");
 
         let back = load(&path).expect("version one migrates");
-        let roles: Vec<_> = back.tracks[0]
-            .chain
-            .iter()
-            .map(|device| device.role)
-            .collect();
-        assert_eq!(roles, [DeviceRole::InputGain, DeviceRole::OutputGain]);
+        assert_eq!(
+            back.tracks[0].machine.as_ref().map(|d| d.kind),
+            Some(crate::devices::DeviceKind::Poly)
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A document whose chain held things the lane has no place for
+    /// loads, and says what it lost, line by line.
+    #[test]
+    fn a_lossy_migration_is_logged_beside_the_song() {
+        let song = Song::default();
+        let song_text = ron::ser::to_string(&song).expect("encodes");
+        let poly = ron::ser::to_string(&crate::sequencing::Device::new(
+            crate::sequencing::DeviceId(100),
+            crate::devices::DeviceKind::Poly,
+        ))
+        .expect("encodes");
+        let stray = ron::ser::to_string(&crate::sequencing::Device::new(
+            crate::sequencing::DeviceId(101),
+            crate::devices::DeviceKind::Disperser,
+        ))
+        .expect("encodes");
+        let chained =
+            song_text.replacen("machine:", &format!("chain:[{poly},{stray}],machine:"), 1);
+        assert_ne!(
+            chained, song_text,
+            "the track has a machine field to splice before"
+        );
+        let path = scratch("v1-chain.stage.ron");
+        std::fs::write(&path, format!("(version: 1, song: {chained})")).expect("writes");
+
+        let (back, log) = load_logged(&path).expect("loads");
+        assert_eq!(
+            back.tracks[0].machine.as_ref().map(|d| d.kind),
+            Some(crate::devices::DeviceKind::Poly)
+        );
+        assert!(!log.is_empty(), "the disperser was dropped in silence");
+        assert!(load(&path).is_ok());
+
+        let mut stage = super::super::Stage::new();
+        stage.open(&path).expect("opens");
+        assert!(
+            stage
+                .notice
+                .as_deref()
+                .is_some_and(|n| n.contains("dropped")),
+            "{:?}",
+            stage.notice
+        );
+        assert_eq!(stage.take_migration_log(), log);
+        assert!(stage.take_migration_log().is_empty(), "handed over once");
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn current_projects_remember_removed_boundary_gains() {
+    fn current_projects_remember_an_empty_machine_slot() {
         let mut song = Song::default();
-        song.tracks[0].chain.clear();
+        song.tracks[0].machine = None;
         let path = scratch("v2-removed-gains.stage.ron");
         save(&path, &song).expect("saves");
 
         let back = load(&path).expect("loads");
-        assert!(back.tracks[0].chain.is_empty());
+        assert!(back.tracks[0].machine.is_none());
         let _ = std::fs::remove_file(&path);
     }
 

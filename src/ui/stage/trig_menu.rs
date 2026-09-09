@@ -100,12 +100,9 @@ impl LockRow {
     }
 }
 
-/// The voice a track's trigs lock: the head of its chain when that is
-/// an instrument, and the default voice otherwise — the same rule the
-/// compiler applies, so the sliders name the parameters that will
-/// actually be locked.
+/// The voice a track's trigs lock: its one machine slot.
 pub(super) fn voice_of(track: &Track) -> (&'static DeviceSpec, Option<&crate::sequencing::Device>) {
-    match track.chain.first().filter(|device| device.is_instrument()) {
+    match track.machine.as_ref() {
         Some(device) => (device.kind.spec(), Some(device)),
         None => (DeviceKind::Poly.spec(), None),
     }
@@ -196,10 +193,9 @@ pub(super) fn menu_rows(track: &Track, trig: &Trig) -> Vec<MenuRow> {
                 })
             }),
     );
-    // Then the effects, in chain order, each parameter under the
-    // effect's short name: a trig can bend the whole chain, not only
-    // the voice.
-    for effect in track.chain.iter().filter(|device| !device.is_instrument()) {
+    // Then the fixed lane sections: a trig can bend the whole path, not
+    // only the voice.
+    for effect in &track.strip {
         let spec = effect.kind.spec();
         rows.extend(spec.params.iter().zip(spec.labels).map(|(def, label)| {
             MenuRow::Param(LockRow {
@@ -317,10 +313,26 @@ impl TrigAction {
                 tick,
                 delta_semitones: -1,
             }],
-            TrigAction::Condition => vec![Intent::SetProbability {
+            TrigAction::Condition if trig.cond.is_some() => vec![Intent::SetCondition {
                 tick,
-                probability: next_probability(trig.probability),
+                cond: super::deck::condition_step(trig.cond, true),
             }],
+            TrigAction::Condition if trig.probability > 0.11 => {
+                vec![Intent::SetProbability {
+                    tick,
+                    probability: next_probability(trig.probability),
+                }]
+            }
+            TrigAction::Condition => vec![
+                Intent::SetProbability {
+                    tick,
+                    probability: 1.0,
+                },
+                Intent::SetCondition {
+                    tick,
+                    cond: Some((1, 2)),
+                },
+            ],
             TrigAction::Mute => vec![Intent::SetNoteMuted {
                 tick,
                 pitch: trig.pitch,
@@ -349,10 +361,13 @@ mod tests {
             micro_ticks: 0,
             velocity: 100,
             probability: 1.0,
+            cond: None,
             enabled: true,
             muted,
             locks: 0,
             slice: None,
+            sound: false,
+            slides: 0,
         }
     }
 

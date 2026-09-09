@@ -152,7 +152,7 @@ impl super::super::Stage {
         };
         let mut x = left;
         for (label, value, tone) in [
-            ("clip", format!("{:02}", shown.pattern.0), c.fg),
+            ("clip", self.song.tag_of(shown.pattern), c.fg),
             ("tr", format!("{:02}", shown.track + 1), c.fg),
             ("len", format!("{bars:.0} bars"), c.fg),
             ("lens", lens_name.to_owned(), c.fg),
@@ -177,6 +177,7 @@ impl super::super::Stage {
 
         let lens_view = lens::LensView::resolve(lens_name, &self.song.key, &|_| None);
         let notes = sequencer::note_views(pattern, &self.song.key);
+        let rules = sequencer::trig_rules(pattern);
         let name = pattern.name.clone();
         let clip = sequence::ClipView {
             id: shown.pattern.0,
@@ -185,10 +186,14 @@ impl super::super::Stage {
             notes: &notes,
             ghosts: &[],
             slicing: self.slicing_track(shown.track),
+            rules: &rules,
         };
         let focused = self.inside.is_some() && self.browser.is_none();
         // While a callout is up the sequencer is seen and not heard from.
-        let keys = focused && self.trig_menu.is_none() && self.plock_editor.is_none();
+        let keys = focused
+            && self.steps.is_none()
+            && self.trig_menu.is_none()
+            && self.plock_editor.is_none();
 
         let area = egui::Rect::from_min_max(
             egui::pos2(left, tray.min.y + LABEL_H),
@@ -201,6 +206,10 @@ impl super::super::Stage {
         // Computed BEFORE the panel borrows the sequencer: the moment is
         // a fact about the song and the transport, not about the editor.
         let playhead = self.playhead(shown);
+        let step_keys = self
+            .step_keys()
+            .map(|(window, held)| sequence::StepKeysView { window, held });
+        let polarity = self.polarity;
         let outcome = self.sequencer.show(
             &mut child,
             keys,
@@ -211,7 +220,8 @@ impl super::super::Stage {
             self.entered_pitch.take(),
             Some(clip),
             &lens_view,
-            self.polarity,
+            step_keys,
+            polarity,
             playhead,
         );
         let anchor = outcome.cursor_rect;

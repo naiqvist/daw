@@ -31,12 +31,13 @@ const LEADER_STEP: f32 = 6.0;
 /// The families in the order the codebook lists them: what moves the
 /// hand first, then what the hand does where it is, then the rooms,
 /// then the app's own housekeeping last.
-const FAMILY_ORDER: [&str; 16] = [
+const FAMILY_ORDER: [&str; 17] = [
     "move",
     "session",
     "track",
     "mixer",
     "devices",
+    "pages",
     "edit",
     "sample",
     "forge",
@@ -114,6 +115,12 @@ impl super::super::Stage {
         let entries = keymap::palette_entries();
         let mut by_family: Vec<(&'static str, Vec<Row>)> = Vec::new();
         for (mods, key, intent) in keymap::bindings_for(scope) {
+            if let super::super::StageIntent::HeroTool(verb) = intent
+                && !self.deck_hero_tools().iter().any(|t| t.verb == verb)
+            {
+                continue;
+            }
+
             let chord = super::super::carved_chord(&keymap::chord_name(mods, key));
             let entry = entries
                 .iter()

@@ -349,10 +349,13 @@ mod tests {
             micro_ticks: 0,
             velocity: 100,
             probability: 1.0,
+            cond: None,
             enabled: true,
             muted: false,
             locks: 0,
             slice: None,
+            sound: false,
+            slides: 0,
         }
     }
 

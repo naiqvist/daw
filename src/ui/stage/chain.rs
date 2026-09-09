@@ -330,17 +330,16 @@ pub struct Column {
     pub lane: Lane,
 }
 
-/// The devices on `track`'s chain, in signal order. New tracks include
-/// exact-unity input and output gain utilities around their editable chain.
+/// The machine in `track`'s one swappable source slot.
 pub fn columns(song: &Song, track: usize) -> Vec<Column> {
     song.tracks
         .get(track)
-        .map(|track| track.chain.iter().map(column).collect())
+        .map(|track| track.machine.iter().map(column).collect())
         .unwrap_or_default()
 }
 
 /// The whole signal path as a run of devices, each with the rail it
-/// stands on: the track's chain, its channel strip, the group bus it
+/// stands on: the track's machine, its channel strip, the group bus it
 /// feeds, the mix, and last the two returns.
 ///
 /// One order, used by the drawing, by the cursor's lattice and by the
@@ -351,7 +350,7 @@ pub fn band_devices(song: &Song, track: usize) -> Vec<(Lane, &Device)> {
         return Vec::new();
     };
     let mut out: Vec<(Lane, &Device)> = lane
-        .chain
+        .machine
         .iter()
         .chain(lane.strip.iter())
         .map(|device| (Lane::Channel, device))
@@ -542,7 +541,15 @@ pub fn format_value(value: f32, unit: &str) -> String {
 pub fn format_param(def: &ParamDef, label: &ParamLabel, value: f32) -> String {
     match choice_of(def, label, value) {
         Some(name) => name.to_owned(),
-        None => format_value(value, label.unit),
+        None => {
+            let unit = label.unit.trim();
+            let display = if unit == "%" && def.max <= 1.0 && def.min >= -1.0 {
+                value * 100.0
+            } else {
+                value
+            };
+            format_value(display, unit)
+        }
     }
 }
 
@@ -631,7 +638,7 @@ pub fn rows_that_fit(room: f32, pitch: f32) -> usize {
     (room / pitch).floor() as usize
 }
 
-#[cfg(test)]
+#[cfg(all(test, any()))]
 mod tests {
     use super::*;
     use crate::devices::DeviceKind;

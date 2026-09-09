@@ -26,13 +26,14 @@
 
 use crate::design::{Polarity, codex::Sign, kit::Weight, motion::pulse_ink};
 use crate::pitch::Pitch;
+use crate::sequencing::TrigRules;
 use crate::sequencing::{DEFAULT_PATTERN_TICKS, GRID_COLUMNS, GRID_ROWS, PATTERN_STEP_TICKS};
 use crate::ui::affordance::{Afford, Affords};
 use crate::ui::sequencer::chrome;
 use crate::ui::sequencer::grammar::{Motion, Utterance, Voice};
 use crate::ui::sequencer::grid_resolution::{GridResolution, TICKS_PER_BAR};
 use crate::ui::sequencer::lens::LensView;
-use crate::ui::sequencer::registers::{GridRegion, Payload, Registers, TrigNote};
+use crate::ui::sequencer::registers::{GridRegion, Payload, Registers, TrigNote, TrigPayload};
 use crate::ui::sequencer::sequence::{
     ClipView, EDITOR_SWITCH_WIDTH, Editor, Intent, NoteView, editor_switch,
 };
@@ -290,6 +291,7 @@ impl SequenceGrid {
         voice: &mut Voice<'_>,
         clip: Option<ClipView<'_>>,
         lens: &LensView,
+        step_keys: Option<super::sequence::StepKeysView>,
         intents: &mut Vec<Intent>,
         ground: Polarity,
         playhead: Option<usize>,
@@ -512,6 +514,39 @@ impl SequenceGrid {
                     ));
                 }
                 self.draw_cell_events(&cells, rect, clip, lens, step, ground);
+                if let Some(keys) = step_keys {
+                    let physical = tick / PATTERN_STEP_TICKS;
+                    let first = keys.window * 16;
+                    let in_window = (first..first + 16).contains(&physical);
+                    if !in_window {
+                        cells.rect_filled(
+                            rect,
+                            0.0,
+                            egui::Color32::BLACK.gamma_multiply(150.0 / 255.0),
+                        );
+                    } else if tick % PATTERN_STEP_TICKS == 0 {
+                        const GLYPHS: [&str; 16] = [
+                            "1", "2", "3", "4", "5", "6", "7", "8", "Q", "W", "E", "R", "T", "Y",
+                            "U", "I",
+                        ];
+                        let key = physical - first;
+                        let held = keys.held & (1 << key) != 0;
+                        if held {
+                            cells.rect_filled(rect.shrink(2.0), 0.0, wash(54, ground));
+                        }
+                        cells.text(
+                            rect.left_top() + egui::vec2(space::XS, space::XS),
+                            egui::Align2::LEFT_TOP,
+                            GLYPHS[key],
+                            egui::FontId::new(font::MINI_LABEL, egui::FontFamily::Monospace),
+                            if held {
+                                shade(INK_LEVEL, ground)
+                            } else {
+                                shade(LABEL_INK, ground)
+                            },
+                        );
+                    }
+                }
                 if self.cursor_step == step {
                     draw_cursor(&cells, rect, ground, focused);
                     self.cursor_rect = Some(rect);
@@ -893,14 +928,14 @@ impl SequenceGrid {
         // conditions, `notes/20260831-command-grammar.md`). The mark is a
         // SHADE — the trig's density of occurrence as the density of a
         // sign — and the exact figure is the inspector's to state.
-        if note.enabled && note.probability < 1.0 {
+        if note.enabled && (note.probability < 1.0 || note.cond.is_some()) {
             draw_edge_tag(
                 painter,
                 egui::Rect::from_min_size(
                     face.right_bottom() - egui::vec2(13.0, 10.0),
                     egui::vec2(13.0, 10.0),
                 ),
-                &condition_sign(note.probability).to_string(),
+                &condition_sign(note.probability, note.cond),
                 ground,
             );
         }
@@ -910,6 +945,31 @@ impl SequenceGrid {
                 painter,
                 egui::Rect::from_min_size(face.left_top(), egui::vec2(15.0, 10.0)),
                 &deviation,
+                ground,
+            );
+        }
+        // A sound-locked trig says so at its right shoulder; a sliding
+        // lock at its left foot. Both are rules the trig carries, like
+        // the condition, and are marked the same way.
+        if note.enabled && note.sound {
+            draw_edge_tag(
+                painter,
+                egui::Rect::from_min_size(
+                    face.right_top() - egui::vec2(15.0, 0.0),
+                    egui::vec2(15.0, 10.0),
+                ),
+                "SND",
+                ground,
+            );
+        }
+        if note.slides > 0 {
+            draw_edge_tag(
+                painter,
+                egui::Rect::from_min_size(
+                    face.left_bottom() - egui::vec2(0.0, 10.0),
+                    egui::vec2(10.0, 10.0),
+                ),
+                "~",
                 ground,
             );
         }
@@ -1226,6 +1286,30 @@ impl SequenceGrid {
             (Some(Verb::ClipResize), Some(_)) => {
                 self.refusal = Some("CLIP RESIZE: LEFT OR RIGHT".to_owned());
             }
+            // Pitch, on a surface that has no pitch axis: T moves every
+            // note at the addressed steps a semitone per count, Shift+T
+            // an octave.
+            (
+                Some(verb @ (Verb::Transpose | Verb::Octave)),
+                Some(motion @ (Motion::Up | Motion::Down)),
+            ) => {
+                let addressed = self.addressed_starts(clip, &here);
+                if addressed.is_empty() {
+                    self.refusal = Some(format!("{}: NOTHING HERE", verb.name()));
+                } else {
+                    let size = if verb == Verb::Octave { 12 } else { 1 };
+                    let delta = count * size * if motion == Motion::Up { 1 } else { -1 };
+                    for start in addressed {
+                        intents.push(Intent::Transpose {
+                            tick: start,
+                            delta_semitones: delta,
+                        });
+                    }
+                }
+            }
+            (Some(verb @ (Verb::Transpose | Verb::Octave)), Some(_)) => {
+                self.refusal = Some(format!("{}: UP OR DOWN", verb.name()));
+            }
             (
                 Some(Verb::Velocity | Verb::StackVelocity),
                 Some(motion @ (Motion::Up | Motion::Down)),
@@ -1251,6 +1335,11 @@ impl SequenceGrid {
                     return;
                 };
                 let width_ticks = cells.last().copied().unwrap_or(first) + span - first;
+                let rules = cells
+                    .iter()
+                    .map(|cell| (cell - first, rules_at(clip, *cell)))
+                    .collect();
+                let source = (clip.map_or(0, |clip| clip.id), first);
                 let notes = clip
                     .into_iter()
                     .flat_map(|clip| clip.notes.iter())
@@ -1274,12 +1363,18 @@ impl SequenceGrid {
                     cell_span: span,
                     cells: cells.into_iter().map(|cell| cell - first).collect(),
                     notes,
+                    rules,
+                    source,
                 }));
                 self.refusal = Some("YANKED A GRID REGION".to_owned());
             }
             (Some(Verb::Yank | Verb::StackYank), _) => match trig_at(clip, tick, span) {
                 Some(notes) => {
-                    registers.yank(Payload::Trig(notes));
+                    registers.yank(Payload::Trig(TrigPayload {
+                        notes,
+                        rules: rules_at(clip, tick),
+                        source: (clip.map_or(0, |clip| clip.id), tick),
+                    }));
                     self.refusal = Some("YANKED A TRIG".to_owned());
                 }
                 None => self.refusal = Some("YANK: NOTHING HERE".to_owned()),
@@ -1319,9 +1414,20 @@ impl SequenceGrid {
                         });
                     }
                 }
+                for (offset, rules) in &region.rules {
+                    let target = tick + offset;
+                    put_rules(
+                        intents,
+                        target,
+                        &rules_at(clip, target),
+                        rules,
+                        (region.source.0, region.source.1 + offset),
+                    );
+                }
             }
             (Some(Verb::Put | Verb::StackPut), _) => match registers.trig() {
-                Ok(notes) => {
+                Ok(trig) => {
+                    let trig = trig.clone();
                     for start in here
                         .iter()
                         .copied()
@@ -1329,7 +1435,7 @@ impl SequenceGrid {
                     {
                         intents.push(Intent::Clear { tick: start });
                     }
-                    for note in notes {
+                    for note in &trig.notes {
                         intents.push(Intent::AddNote {
                             tick,
                             pitch: note.pitch,
@@ -1345,6 +1451,13 @@ impl SequenceGrid {
                             });
                         }
                     }
+                    put_rules(
+                        intents,
+                        tick,
+                        &rules_at(clip, tick),
+                        &trig.rules,
+                        trig.source,
+                    );
                 }
                 Err(refusal) => self.refusal = Some(refusal),
             },
@@ -1850,13 +1963,15 @@ pub(crate) fn draw_clip_end(
     );
 }
 
-pub(crate) fn condition_sign(probability: f32) -> char {
-    if probability >= 0.7 {
-        '▓'
+pub(crate) fn condition_sign(probability: f32, cond: Option<(u8, u8)>) -> String {
+    if let Some((a, b)) = cond {
+        format!("{a}:{b}")
+    } else if probability >= 0.7 {
+        "▓".to_owned()
     } else if probability >= 0.4 {
-        '▒'
+        "▒".to_owned()
     } else {
-        '░'
+        "░".to_owned()
     }
 }
 
@@ -1919,6 +2034,68 @@ pub(crate) fn trig_at(
         })
         .collect();
     (!notes.is_empty()).then_some(notes)
+}
+
+/// The rules of the step at `tick`, as the clip view carries them.
+pub(crate) fn rules_at(clip: Option<ClipView<'_>>, tick: usize) -> TrigRules {
+    clip.and_then(|clip| clip.rules.get(tick / PATTERN_STEP_TICKS).cloned())
+        .unwrap_or_default()
+}
+
+/// Lay `rules` on the step at `tick` over what it holds (`standing`):
+/// its own locks go first, then the carried locks and their slides, the
+/// condition and the retrig where they differ, and the sound lock by
+/// the source's address. Nothing is said when nothing differs, so a
+/// plain trig's put is the same two intents it always was.
+pub(crate) fn put_rules(
+    intents: &mut Vec<Intent>,
+    tick: usize,
+    standing: &TrigRules,
+    rules: &TrigRules,
+    source: (u64, usize),
+) {
+    for lock in &standing.locks {
+        intents.push(Intent::ClearLock {
+            tick,
+            device: lock.device.map(|id| id.0),
+            param: lock.param,
+        });
+    }
+    for lock in &rules.locks {
+        intents.push(Intent::SetLock {
+            tick,
+            device: lock.device.map(|id| id.0),
+            param: lock.param,
+            value: lock.value,
+        });
+        if lock.slide {
+            intents.push(Intent::SetSlide {
+                tick,
+                device: lock.device.map(|id| id.0),
+                param: lock.param,
+                slide: true,
+            });
+        }
+    }
+    if standing.cond != rules.cond {
+        intents.push(Intent::SetCondition {
+            tick,
+            cond: rules.cond,
+        });
+    }
+    if standing.retrig != rules.retrig {
+        intents.push(Intent::SetRetrig {
+            tick,
+            retrig: rules.retrig,
+        });
+    }
+    if rules.sound || standing.sound {
+        intents.push(Intent::CopySound {
+            tick,
+            from_pattern: source.0,
+            from_tick: source.1,
+        });
+    }
 }
 
 /// The cell's first note: earliest, then lowest.
@@ -2642,6 +2819,7 @@ mod tests {
             notes,
             ghosts: &[],
             slicing: false,
+            rules: &[],
         }
     }
 
@@ -2837,10 +3015,11 @@ mod tests {
 
     #[test]
     fn the_condition_sign_thins_with_the_chance() {
-        assert_eq!(condition_sign(0.75), '▓');
-        assert_eq!(condition_sign(0.5), '▒');
-        assert_eq!(condition_sign(0.25), '░');
-        assert_eq!(condition_sign(0.1), '░');
+        assert_eq!(condition_sign(0.75, None), "▓");
+        assert_eq!(condition_sign(0.5, None), "▒");
+        assert_eq!(condition_sign(0.25, None), "░");
+        assert_eq!(condition_sign(0.1, None), "░");
+        assert_eq!(condition_sign(1.0, Some((2, 4))), "2:4");
     }
 
     #[test]
@@ -2904,6 +3083,7 @@ mod tests {
             notes,
             ghosts: &[],
             slicing: false,
+            rules: &[],
         }
     }
 
@@ -2957,6 +3137,74 @@ mod tests {
         intents
     }
 
+    /// T and Shift+T speak pitch on a surface without a pitch axis: every
+    /// note at the step moves a semitone or an octave per count, up or
+    /// down only, and an empty step refuses.
+    #[test]
+    fn transpose_and_octave_move_the_steps_notes_and_never_travel() {
+        let mut grid = SequenceGrid::default();
+        let step = grid.resolution.step_ticks();
+        let notes = [NoteView::from_midi(60, 0, step, 100, 1.0, true)];
+        let clip = one_note_clip(&notes);
+        let mut registers = Registers::default();
+
+        let intents = utter_on(
+            &mut grid,
+            &mut registers,
+            Some(clip),
+            Some(Verb::Transpose),
+            Some(Motion::Up),
+            2,
+        );
+        assert_eq!(
+            intents,
+            vec![Intent::Transpose {
+                tick: 0,
+                delta_semitones: 2
+            }]
+        );
+        assert_eq!(grid.cursor_step, 0, "a pitch word never travels");
+
+        let intents = utter_on(
+            &mut grid,
+            &mut registers,
+            Some(clip),
+            Some(Verb::Octave),
+            Some(Motion::Down),
+            1,
+        );
+        assert_eq!(
+            intents,
+            vec![Intent::Transpose {
+                tick: 0,
+                delta_semitones: -12
+            }]
+        );
+
+        let intents = utter_on(
+            &mut grid,
+            &mut registers,
+            Some(clip),
+            Some(Verb::Transpose),
+            Some(Motion::Right),
+            1,
+        );
+        assert!(intents.is_empty());
+        assert_eq!(grid.refusal.as_deref(), Some("TRANSPOSE: UP OR DOWN"));
+
+        grid.cursor_step = 1;
+        let intents = utter_on(
+            &mut grid,
+            &mut registers,
+            Some(clip),
+            Some(Verb::Octave),
+            Some(Motion::Up),
+            1,
+        );
+        assert!(intents.is_empty());
+        assert_eq!(grid.refusal.as_deref(), Some("OCTAVE: NOTHING HERE"));
+    }
+
     /// Hold-as-preposition: held arrows edit the trig and never travel;
     /// a hold over nothing, or in a direction the trig cannot answer,
     /// refuses out loud.
@@ -2981,6 +3229,101 @@ mod tests {
         let intents = utter_held(&mut grid, None, Motion::Up, 1);
         assert!(intents.is_empty());
         assert_eq!(grid.refusal.as_deref(), Some("HOLD: NOTHING HERE"));
+    }
+
+    /// A trig is more than its notes: the yank carries its locks, their
+    /// slides, its condition and whether a sound is locked, and the put
+    /// lays them over the target's own.
+    #[test]
+    fn yank_carries_the_trigs_rules_and_put_lays_them_over_the_targets() {
+        use crate::sequencing::ParamLock;
+        let mut grid = SequenceGrid::default();
+        let mut registers = Registers::default();
+        let step = grid.resolution.step_ticks();
+        let notes = [NoteView::from_midi(60, 0, step, 100, 1.0, true)];
+        let mut rules = vec![TrigRules::default(); 16];
+        rules[0] = TrigRules {
+            locks: vec![ParamLock {
+                param: 3,
+                value: 0.5,
+                device: None,
+                slide: true,
+            }],
+            cond: Some((1, 2)),
+            retrig: None,
+            sound: true,
+        };
+        rules[4] = TrigRules {
+            locks: vec![ParamLock {
+                param: 7,
+                value: 1.0,
+                device: None,
+                slide: false,
+            }],
+            ..TrigRules::default()
+        };
+        let clip = ClipView {
+            rules: &rules,
+            ..one_note_clip(&notes)
+        };
+        let _ = utter_on(
+            &mut grid,
+            &mut registers,
+            Some(clip),
+            Some(Verb::Yank),
+            None,
+            1,
+        );
+        assert_eq!(grid.refusal.as_deref(), Some("YANKED A TRIG"));
+        grid.cursor_step = 4;
+        let intents = utter_on(
+            &mut grid,
+            &mut registers,
+            Some(clip),
+            Some(Verb::Put),
+            None,
+            1,
+        );
+        let tick = 4 * step;
+        for wanted in [
+            Intent::ClearLock {
+                tick,
+                device: None,
+                param: 7,
+            },
+            Intent::SetLock {
+                tick,
+                device: None,
+                param: 3,
+                value: 0.5,
+            },
+            Intent::SetSlide {
+                tick,
+                device: None,
+                param: 3,
+                slide: true,
+            },
+            Intent::SetCondition {
+                tick,
+                cond: Some((1, 2)),
+            },
+            Intent::CopySound {
+                tick,
+                from_pattern: 1,
+                from_tick: 0,
+            },
+        ] {
+            assert!(
+                intents.contains(&wanted),
+                "missing {wanted:?} in {intents:?}"
+            );
+        }
+        assert!(
+            !intents
+                .iter()
+                .any(|intent| matches!(intent, Intent::SetRetrig { .. })),
+            "a retrig neither side had was spoken"
+        );
     }
 
     #[test]

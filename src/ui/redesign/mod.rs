@@ -276,6 +276,7 @@ impl Redesign {
                             }),
                         sequence_view,
                         lens_view,
+                        None,
                         // This frame is dark, and stays dark: the ground
                         // turns over on the stage, which is where it is
                         // chosen.

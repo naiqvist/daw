@@ -53,7 +53,7 @@ pub struct SamplerUi {
 /// How many rows the table has. Checked against `sp::TABLE` by a test —
 /// a constant here and a table there is precisely the drift this layout
 /// is trying to avoid, so it is asserted rather than trusted.
-pub const ROWS_TOTAL: usize = 37;
+pub const ROWS_TOTAL: usize = sp::TABLE.len();
 
 impl Default for SamplerUi {
     /// Every knob at the TABLE's default, so a fresh card and a fresh
@@ -204,6 +204,33 @@ fn has_zero_stop(param: u32) -> bool {
 
 fn param_of(param: u32) -> Param {
     let def = params::def(sp::TABLE, param);
+    if param >= sp::PLAYBACK {
+        let choices = sp::extra_choices(param);
+        if !choices.is_empty() {
+            return Param::choice(def.name, choices).with_default(def.default);
+        }
+        let percent = sp::extra_percent(param);
+        let factor = if percent { 100.0 } else { 1.0 };
+        let unit = match param {
+            sp::WINDOW | sp::GLIDE | sp::MIN_GAP => Unit::Ms,
+            sp::COMB_DAMP => Unit::Hz,
+            sp::ENV_PITCH | sp::ENV_FILTER => Unit::Semitones,
+            _ => Unit::Plain,
+        };
+        let mapping = if matches!(param, sp::WINDOW | sp::COMB_DAMP | sp::LOOP_SIZE) {
+            Mapping::Log {
+                min: def.min * factor,
+                max: def.max * factor,
+            }
+        } else {
+            Mapping::Linear {
+                min: def.min * factor,
+                max: def.max * factor,
+            }
+        };
+        return Param::new(def.name, mapping, unit).with_default(def.default * factor);
+    }
+
     let with = |p: Param| p.with_default(shown(param, def.default));
     let log = |name: &'static str, unit| {
         with(Param::new(
@@ -342,6 +369,9 @@ fn param_of(param: u32) -> Param {
 
 /// What the widget SHOWS for an engine value.
 fn shown(param: u32, value: f32) -> f32 {
+    if sp::extra_percent(param) {
+        return value * 100.0;
+    }
     // A zero-stop knob shows its floor for zero, so the position lands at
     // the very bottom of the travel rather than off the scale entirely.
     if has_zero_stop(param) {
@@ -370,6 +400,18 @@ fn shown(param: u32, value: f32) -> f32 {
 /// What the ENGINE receives for a shown value, clamped through the table
 /// so a knob at either stop cannot emit a letter the engine has to bin.
 fn natural(param: u32, value: f32) -> f32 {
+    if param >= sp::PLAYBACK {
+        let v = if sp::extra_percent(param) {
+            value / 100.0
+        } else if !sp::extra_choices(param).is_empty()
+            || matches!(param, sp::SEED | sp::VOICE_COUNT)
+        {
+            value.round()
+        } else {
+            value
+        };
+        return params::def(sp::TABLE, param).clamp(v);
+    }
     // ...and the bottom of the travel reports an exact zero on the way
     // back, which is the half that makes the round trip hold.
     if has_zero_stop(param) {
@@ -470,7 +512,7 @@ pub fn pages() -> usize {
     PAGES.len()
 }
 
-const PAGES: [&[&[u32]]; 5] = [
+const PAGES: [&[&[u32]]; 11] = [
     // sample: what plays, and at what pitch.
     &[&[
         sp::MODE,
@@ -516,6 +558,43 @@ const PAGES: [&[&[u32]]; 5] = [
     ]],
     // dirt: the three colour stages, and the output.
     &[&[sp::DRIVE, sp::RATE, sp::BITS, sp::PREAMP, sp::GAIN, sp::PAN]],
+    &[&[sp::PLAYBACK, sp::TIME, sp::SPEED, sp::WINDOW, sp::TRANSIENT]],
+    &[&[
+        sp::LOOP_SIZE,
+        sp::LOOP_FADE,
+        sp::SCAN,
+        sp::TRAVEL,
+        sp::MOTION_MODE,
+        sp::LOOP_UNITS,
+        sp::LOOP_EXIT,
+    ]],
+    &[&[
+        sp::PLAY_MODE,
+        sp::VOICE_COUNT,
+        sp::GLIDE,
+        sp::SPREAD,
+        sp::ENV_PITCH,
+        sp::ENV_POSITION,
+        sp::ENV_SIZE,
+    ]],
+    &[&[
+        sp::ENV_FILTER,
+        sp::START_JITTER,
+        sp::PITCH_JITTER,
+        sp::SEED,
+        sp::SLIP,
+        sp::ATTACK_SHAPE,
+        sp::FILTER_SLOPE,
+    ]],
+    &[&[sp::COMB_FOCUS, sp::COMB_FEED, sp::COMB_DAMP, sp::COMB_MIX]],
+    &[&[
+        sp::SOURCE_BEATS,
+        sp::FIT_BEATS,
+        sp::SLICE_THRU,
+        sp::HARD,
+        sp::SENSE,
+        sp::MIN_GAP,
+    ]],
 ];
 
 /// How many `POLY_CELL_H` units one row of labelled cells needs.

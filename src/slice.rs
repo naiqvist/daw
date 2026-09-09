@@ -109,13 +109,23 @@ pub fn transients(material: &Material, sensitivity: f32) -> Vec<u64> {
 
 /// `transients`, over a planar view of any samples.
 pub fn transients_of(material: &Planar<'_>, sensitivity: f32) -> Vec<u64> {
+    transients_of_spaced(material, sensitivity, MIN_SPACING_MS)
+}
+
+/// Same detector with an authored minimum distance between hits.
+pub fn transients_of_spaced(material: &Planar<'_>, sensitivity: f32, gap_ms: f32) -> Vec<u64> {
     let mut out = vec![0u64];
     if material.is_empty() || material.sample_rate == 0 {
         return out;
     }
     let sr = material.sample_rate as f32;
     let window = ((sr * WINDOW_MS / 1_000.0) as usize).max(16);
-    let spacing = ((sr * MIN_SPACING_MS / 1_000.0) as u64).max(1);
+    let gap = if gap_ms.is_finite() {
+        gap_ms.clamp(10.0, 500.0)
+    } else {
+        MIN_SPACING_MS
+    };
+    let spacing = ((sr * gap / 1_000.0) as u64).max(1);
     let frames = material.frames as usize;
     if frames < window * 2 {
         return out;

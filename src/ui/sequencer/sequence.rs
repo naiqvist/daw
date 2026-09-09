@@ -149,6 +149,8 @@ pub struct NoteView {
     pub micro_ticks: i16,
     pub velocity: u8,
     pub probability: f32,
+    /// Deterministic A:B cycle condition on this trig.
+    pub cond: Option<(u8, u8)>,
     pub enabled: bool,
     pub muted: bool,
     /// How many parameters the trig this note belongs to holds locked.
@@ -158,6 +160,10 @@ pub struct NoteView {
     /// The slice the trig holds locked, from one, if it holds one — the
     /// sampler's SLICE row. A cell on a slicing track wears it as a tag.
     pub slice: Option<u8>,
+    /// The trig plays through a locked sound, not the track's machine.
+    pub sound: bool,
+    /// How many of the trig's locks slide to the next lock.
+    pub slides: u8,
 }
 
 impl NoteView {
@@ -180,10 +186,13 @@ impl NoteView {
             micro_ticks: 0,
             velocity,
             probability,
+            cond: None,
             enabled,
             muted: !enabled,
             locks: 0,
             slice: None,
+            sound: false,
+            slides: 0,
         }
     }
 }
@@ -203,6 +212,9 @@ pub struct ClipView<'a> {
     /// stays a pitch, because on this deck a note IS a pitch and the
     /// slice is a row.
     pub slicing: bool,
+    /// Each step's rules — locks, condition, retrig, whether a sound is
+    /// locked — so a yank carries a trig whole. Empty means none.
+    pub rules: &'a [crate::sequencing::TrigRules],
 }
 
 pub use crate::intent::sequence::Intent;
@@ -230,6 +242,15 @@ pub struct Outcome {
     /// the thing under the cursor — a callout, a bubble — rather than
     /// somewhere near the editor. `None` when the cell was off screen.
     pub cursor_rect: Option<egui::Rect>,
+}
+
+/// Optional keyboard legend laid over the grid by a frame that turns sixteen
+/// physical keys into step pads. It is presentation state only: the frame
+/// still owns the gesture and the sequencer still owns the cells.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StepKeysView {
+    pub window: usize,
+    pub held: u16,
 }
 
 impl Default for Outcome {
@@ -265,6 +286,30 @@ impl SequencePanel {
             Editor::Grid => self.grid.addressed_ticks(),
             Editor::Roll => self.roll.addressed_ticks(),
         }
+    }
+
+    /// The steps a STANDING selection covers in the editor showing
+    /// `pattern`, or `None` when nothing is selected: what the deck's
+    /// cells lock when a hand has selected first and turns second.
+    pub(crate) fn standing_selection_steps(
+        &self,
+        pattern: u64,
+        step_ticks: usize,
+    ) -> Option<Vec<usize>> {
+        let (selected, ticks) = match self.editor_for(pattern) {
+            Editor::Grid => (self.grid.has_selection(), self.grid.addressed_ticks()),
+            Editor::Roll => (self.roll.has_selection(), self.roll.addressed_ticks()),
+        };
+        if !selected {
+            return None;
+        }
+        let mut steps: Vec<usize> = ticks
+            .into_iter()
+            .map(|tick| tick / step_ticks.max(1))
+            .collect();
+        steps.sort_unstable();
+        steps.dedup();
+        Some(steps)
     }
 
     pub(crate) fn set_time_selected(&mut self, clip: ClipView<'_>, tick: usize, selected: bool) {
@@ -326,6 +371,7 @@ impl SequencePanel {
         entered_pitch: Option<PitchEntry>,
         clip: Option<ClipView<'_>>,
         lens: &crate::ui::sequencer::lens::LensView,
+        step_keys: Option<StepKeysView>,
         ground: crate::design::Polarity,
         // Where the transport is INSIDE this pattern, in ticks, when
         // this clip is the one sounding. `None` covers both a parked
@@ -393,6 +439,7 @@ impl SequencePanel {
                     &mut voice,
                     clip,
                     lens,
+                    step_keys,
                     &mut outcome.intents,
                     ground,
                     playhead,

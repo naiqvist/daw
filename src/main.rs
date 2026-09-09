@@ -6074,6 +6074,17 @@ fn plockable_params(track: &Track) -> Vec<piano_roll::PlockParam> {
         DeviceKind::Tom => daw::params::tom::GAIN,
         DeviceKind::Hat => daw::params::hat::GAIN,
         DeviceKind::Handclap => daw::params::handclap::GAIN,
+        DeviceKind::Drum => daw::params::drum::LEVEL,
+        DeviceKind::Thump => daw::params::thump::LEVEL,
+        DeviceKind::Clay => daw::params::clay::LEVEL,
+        DeviceKind::Table => daw::params::table::LEVEL,
+        DeviceKind::Ring => daw::params::ring::LEVEL,
+        DeviceKind::PrismVoice => daw::params::prism_voice::LEVEL,
+        DeviceKind::Mass => daw::params::mass::LEVEL,
+        DeviceKind::Pluck => daw::params::pluck::LEVEL,
+        DeviceKind::Vox => daw::params::vox::LEVEL,
+        DeviceKind::Pipe => daw::params::pipe::LEVEL,
+        DeviceKind::Glass => daw::params::glass::LEVEL,
         // No id: an effect never heads a chain, so nothing here is
         // p-lockable and there is nothing to exclude.
         DeviceKind::Reverb

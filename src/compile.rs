@@ -145,6 +145,17 @@ pub(crate) fn compile_chain(
             | DeviceState::Tom(_)
             | DeviceState::Hat(_)
             | DeviceState::Handclap(_)
+            | DeviceState::Drum(_)
+            | DeviceState::Thump(_)
+            | DeviceState::Clay(_)
+            | DeviceState::Table(_)
+            | DeviceState::Ring(_)
+            | DeviceState::PrismVoice(_)
+            | DeviceState::Mass(_)
+            | DeviceState::Pluck(_)
+            | DeviceState::Vox(_)
+            | DeviceState::Pipe(_)
+            | DeviceState::Glass(_)
             | DeviceState::Acid(_) => {}
             DeviceState::Utility(params) => {
                 let node = spec.push(NodeSpec::Utility { params });
@@ -729,6 +740,72 @@ pub(crate) fn build_graph_spec(
                         loop_len_beats,
                         params,
                     },
+                    DeviceState::Drum(params) => NodeSpec::Drum {
+                        notes,
+                        subloops: Vec::new(),
+                        loop_len_beats,
+                        params,
+                    },
+                    DeviceState::Thump(params) => NodeSpec::Thump {
+                        notes,
+                        subloops: Vec::new(),
+                        loop_len_beats,
+                        params,
+                    },
+                    DeviceState::Clay(params) => NodeSpec::Clay {
+                        notes,
+                        subloops: Vec::new(),
+                        loop_len_beats,
+                        params,
+                    },
+                    DeviceState::Table(params) => NodeSpec::Table {
+                        notes,
+                        subloops: Vec::new(),
+                        loop_len_beats,
+                        params,
+                    },
+                    DeviceState::Ring(params) => NodeSpec::Ring {
+                        notes,
+                        subloops: Vec::new(),
+                        loop_len_beats,
+                        params,
+                    },
+                    DeviceState::PrismVoice(params) => NodeSpec::PrismVoice {
+                        notes,
+                        subloops: Vec::new(),
+                        loop_len_beats,
+                        params,
+                    },
+                    DeviceState::Mass(params) => NodeSpec::Mass {
+                        notes,
+                        subloops: Vec::new(),
+                        loop_len_beats,
+                        params,
+                    },
+                    DeviceState::Pluck(params) => NodeSpec::Pluck {
+                        notes,
+                        subloops: Vec::new(),
+                        loop_len_beats,
+                        params,
+                    },
+                    DeviceState::Vox(params) => NodeSpec::Vox {
+                        notes,
+                        subloops: Vec::new(),
+                        loop_len_beats,
+                        params,
+                    },
+                    DeviceState::Pipe(params) => NodeSpec::Pipe {
+                        notes,
+                        subloops: Vec::new(),
+                        loop_len_beats,
+                        params,
+                    },
+                    DeviceState::Glass(params) => NodeSpec::Glass {
+                        notes,
+                        subloops: Vec::new(),
+                        loop_len_beats,
+                        params,
+                    },
                     // An effect at the head is not an instrument; the lane
                     // has nothing to make sound with.
                     DeviceState::Reverb(_)
@@ -1251,6 +1328,7 @@ pub(crate) fn build_mod_spec(
         });
     }
     ModSpec {
+        retrigs: Vec::new(),
         sources: modulators.to_vec(),
         wires: out,
     }

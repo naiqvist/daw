@@ -144,6 +144,14 @@ pub fn pattern_length(song: &Song, id: PatternId) -> usize {
 /// grid to draw. Green-zone resolution, once per frame: the view carries
 /// the finished numbers, and the honest flag that the legacy path is
 /// approximating.
+/// Every step's rules, for the clip view to carry beside its notes so a
+/// yank can take a trig whole.
+pub fn trig_rules(pattern: &Pattern) -> Vec<crate::sequencing::TrigRules> {
+    (0..PATTERN_STEPS)
+        .map(|step| pattern.trig(step).rules())
+        .collect()
+}
+
 pub fn note_views(pattern: &Pattern, key: &Key) -> Vec<NoteView> {
     // Sorted by start so a cell's first note is its earliest.
     let mut views: Vec<NoteView> = note_views_unsorted(pattern, key);
@@ -165,10 +173,14 @@ fn note_views_unsorted(pattern: &Pattern, key: &Key) -> Vec<NoteView> {
                         let start = (step * PATTERN_STEP_TICKS)
                             .saturating_add_signed(isize::from(note.micro_ticks));
                         let mut view = note_view(note, start, trig.probability, trig.enabled, key);
+                        view.cond = trig.cond;
                         view.locks = trig.locks.len().min(u8::MAX as usize) as u8;
                         view.slice = trig
                             .lock(crate::params::sampler::SLICE)
                             .map(|slice| slice.round().clamp(1.0, 64.0) as u8);
+                        view.sound = trig.sound.is_some();
+                        view.slides =
+                            trig.locks.iter().filter(|lock| lock.slide).count().min(255) as u8;
                         view
                     })
                 })
@@ -195,10 +207,13 @@ pub fn note_view(
         micro_ticks: note.micro_ticks,
         velocity: note.velocity,
         probability,
+        cond: None,
         enabled,
         muted: note.muted,
         locks: 0,
         slice: None,
+        sound: false,
+        slides: 0,
     }
 }
 

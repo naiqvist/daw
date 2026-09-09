@@ -108,6 +108,16 @@ pub mod sequence {
             tick: usize,
             probability: f32,
         },
+        /// Set or clear the deterministic A:B cycle condition.
+        SetCondition {
+            tick: usize,
+            cond: Option<(u8, u8)>,
+        },
+        /// Set or clear the step's compile-time retrigger recipe.
+        SetRetrig {
+            tick: usize,
+            retrig: Option<crate::sequencing::Retrig>,
+        },
         /// Adjust the velocity of every note at `tick` by a signed amount
         /// (grammar: hold-the-trig + up/down).
         AdjustVelocity {
@@ -140,6 +150,22 @@ pub mod sequence {
             tick: usize,
             device: Option<u64>,
             param: u32,
+        },
+        /// Mark the trig's lock on `param` as a slide to the next lock,
+        /// or back to a plain lock. Nothing to mark is a refusal.
+        SetSlide {
+            tick: usize,
+            device: Option<u64>,
+            param: u32,
+            slide: bool,
+        },
+        /// Lay another step's SOUND lock on this one. The register
+        /// carries the source's address and the stage resolves it: a
+        /// sound is not a value an intent can hold.
+        CopySound {
+            tick: usize,
+            from_pattern: u64,
+            from_tick: usize,
         },
     }
 }

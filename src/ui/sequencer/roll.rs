@@ -16,13 +16,13 @@ use crate::pitch::Pitch;
 use crate::sequencing::PATTERN_STEPS;
 use crate::ui::sequencer::chrome;
 use crate::ui::sequencer::grammar::{Motion, Utterance, Voice};
-use crate::ui::sequencer::registers::{Payload, RollRegion, RollRegionNote, TrigNote};
+use crate::ui::sequencer::registers::{Payload, RollRegion, RollRegionNote, TrigNote, TrigPayload};
 use crate::ui::sequencer::sequence::{
     ClipView, EDITOR_SWITCH_WIDTH, Editor, Intent, NoteView, editor_switch,
 };
 use crate::ui::sequencer::sequence_grid::{
     TrigSelection, beat_fill, clip_veil, draw_clip_end, draw_cursor, draw_lock_marks,
-    next_probability, note_name, trig_at, velocity_ink,
+    next_probability, note_name, put_rules, rules_at, trig_at, velocity_ink,
 };
 use crate::ui::sequencer::verbs::Verb;
 use crate::ui::sequencer::{INK_LEVEL, phase_of, shade};
@@ -665,6 +665,24 @@ impl RollPanel {
         clip: Option<ClipView<'_>>,
         intents: &mut Vec<Intent>,
     ) {
+        // The pitch verbs: on this surface pitch IS the vertical axis, so
+        // TRANSPOSE is the vertical nudge and OCTAVE the same nudge twelve
+        // at a time. Spoken with a horizontal arrow they refuse rather
+        // than move in time — a word for pitch never travels.
+        let utterance = match (utterance.verb, utterance.motion) {
+            (Some(verb @ (Verb::Transpose | Verb::Octave)), Some(Motion::Up | Motion::Down)) => {
+                Utterance {
+                    verb: Some(Verb::Nudge),
+                    count: utterance.count * if verb == Verb::Octave { 12 } else { 1 },
+                    ..utterance
+                }
+            }
+            (Some(verb @ (Verb::Transpose | Verb::Octave)), Some(_)) => {
+                self.refusal = Some(format!("{}: UP OR DOWN", verb.name()));
+                return;
+            }
+            _ => utterance,
+        };
         let count = utterance.count as isize;
         let tick = self.cursor_tick();
         let note_here = clip.and_then(|clip| {
@@ -1179,7 +1197,11 @@ impl RollPanel {
             },
             (Some(Verb::StackYank), _) => match trig_at(clip, tick, STEP_TICKS) {
                 Some(notes) => {
-                    voice.registers.yank(Payload::Trig(notes));
+                    voice.registers.yank(Payload::Trig(TrigPayload {
+                        notes,
+                        rules: rules_at(clip, tick),
+                        source: (clip.map_or(0, |clip| clip.id), tick),
+                    }));
                     self.refusal = Some("YANKED A TRIG".to_owned());
                 }
                 None => self.refusal = Some("STACK YANK: NOTHING HERE".to_owned()),
@@ -1261,9 +1283,10 @@ impl RollPanel {
                 Err(refusal) => self.refusal = Some(refusal),
             },
             (Some(Verb::StackPut), _) => match voice.registers.trig() {
-                Ok(notes) => {
+                Ok(trig) => {
+                    let trig = trig.clone();
                     intents.push(Intent::Clear { tick });
-                    for note in notes {
+                    for note in &trig.notes {
                         intents.push(Intent::AddNote {
                             tick,
                             pitch: note.pitch,
@@ -1279,6 +1302,13 @@ impl RollPanel {
                             });
                         }
                     }
+                    put_rules(
+                        intents,
+                        tick,
+                        &rules_at(clip, tick),
+                        &trig.rules,
+                        trig.source,
+                    );
                 }
                 Err(refusal) => self.refusal = Some(refusal),
             },
@@ -1763,6 +1793,7 @@ mod tests {
             notes,
             ghosts: &[],
             slicing: false,
+            rules: &[],
         }
     }
 
@@ -2174,6 +2205,66 @@ mod tests {
             }]
         );
         assert_eq!(roll.cursor_midi, 52);
+    }
+
+    /// T and Shift+T are the vertical nudge in other words: a semitone
+    /// and an octave per count, never sideways.
+    #[test]
+    fn transpose_and_octave_are_the_vertical_nudge_in_semitones_and_twelves() {
+        let notes = [
+            NoteView::from_midi(60, 0, 12, 100, 1.0, true),
+            NoteView::from_midi(64, 0, 12, 90, 1.0, true),
+        ];
+        let clip = chord_clip(&notes);
+        let mut roll = RollPanel::default();
+        roll.cursor_midi = 64;
+
+        assert_eq!(
+            utter(
+                &mut roll,
+                Some(clip),
+                Some(Verb::Transpose),
+                Some(Motion::Up),
+                2
+            ),
+            vec![Intent::TransposeNote {
+                tick: 0,
+                pitch: Pitch::from_midi(64),
+                delta_semitones: 2,
+            }]
+        );
+        assert_eq!(roll.cursor_midi, 66);
+
+        roll.cursor_midi = 64;
+        assert_eq!(
+            utter(
+                &mut roll,
+                Some(clip),
+                Some(Verb::Octave),
+                Some(Motion::Down),
+                1
+            ),
+            vec![Intent::TransposeNote {
+                tick: 0,
+                pitch: Pitch::from_midi(64),
+                delta_semitones: -12,
+            }]
+        );
+        assert_eq!(roll.cursor_midi, 52);
+
+        roll.cursor_midi = 64;
+        assert!(
+            utter(
+                &mut roll,
+                Some(clip),
+                Some(Verb::Transpose),
+                Some(Motion::Left),
+                1
+            )
+            .is_empty()
+        );
+        assert_eq!(roll.refusal.as_deref(), Some("TRANSPOSE: UP OR DOWN"));
+        assert_eq!(roll.cursor_step, 0, "a pitch word never travels");
     }
 
     #[test]

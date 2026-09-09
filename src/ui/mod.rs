@@ -72,6 +72,7 @@ pub mod glyph;
 pub mod host;
 pub mod hud;
 pub mod keymap;
+pub mod kiln;
 pub mod kit;
 pub mod legibility;
 pub mod nav_cursor;

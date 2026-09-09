@@ -52,6 +52,12 @@ pub(crate) enum Verb {
     StackYank,
     /// Put a yanked stack instead of one note.
     StackPut,
+    /// Pitch, a semitone per count: T then Up/Down, or the arrows
+    /// while T is held, as many times as the hand likes.
+    Transpose,
+    /// Pitch, an octave per count: Shift+T then Up/Down, or the arrows
+    /// while Shift and T are held.
+    Octave,
     /// Enter the Euclidean mode on the step grid: the arrows then cycle
     /// rhythms, Enter keeps one, Escape puts the old steps back.
     Euclid,
@@ -71,13 +77,17 @@ pub(crate) const TABLE: &[(Verb, egui::Key, &str)] = &[
     // right hand owns the arrows: reach beats mnemonics. Q/W/E form the
     // move-and-copy cluster (nudge lives on W below).
     (Verb::Yank, egui::Key::Q, "YANK"),
-    // E is the Euclidean mode; PUT moved to P for it, its mnemonic.
-    (Verb::Euclid, egui::Key::E, "EUCLID"),
-    (Verb::Put, egui::Key::P, "PUT"),
+    // PUT stays on E with its cluster; the Euclidean mode sits on G, the
+    // next home-row key past F, still under the left hand.
+    (Verb::Euclid, egui::Key::G, "EUCLID"),
+    (Verb::Put, egui::Key::E, "PUT"),
     (Verb::Duplicate, egui::Key::D, "DUPLICATE"),
     (Verb::Nudge, egui::Key::W, "NUDGE"),
     (Verb::Resize, egui::Key::R, "RESIZE"),
     (Verb::Velocity, egui::Key::F, "VELOCITY"),
+    // Pitch on the top row beside R: T a semitone, and held T rides the
+    // arrows. In the roll the same word is a vertical nudge.
+    (Verb::Transpose, egui::Key::T, "TRANSPOSE"),
     (Verb::Mute, egui::Key::M, "MUTE"),
     (Verb::Solo, egui::Key::S, "SOLO"),
     (Verb::Arm, egui::Key::A, "ARM"),
@@ -95,10 +105,13 @@ pub(crate) const TABLE: &[(Verb, egui::Key, &str)] = &[
 pub(crate) const SHIFT_TABLE: &[(Verb, egui::Key, &str)] = &[
     (Verb::StackYank, egui::Key::Q, "STACK YANK"),
     (Verb::StackNudge, egui::Key::W, "STACK NUDGE"),
-    (Verb::StackPut, egui::Key::P, "STACK PUT"),
+    (Verb::StackPut, egui::Key::E, "STACK PUT"),
     (Verb::StackDuplicate, egui::Key::D, "STACK DUPLICATE"),
     (Verb::StackResize, egui::Key::R, "STACK RESIZE"),
     (Verb::StackVelocity, egui::Key::F, "STACK VELOCITY"),
+    // Shift+T is not a stack word: it is the same transpose an octave
+    // at a time, because an octave is the other size a hand reaches for.
+    (Verb::Octave, egui::Key::T, "OCTAVE"),
 ];
 
 /// Conventional command chords remain verbs: the modifier is merely the
@@ -138,6 +151,8 @@ impl Verb {
             Self::StackNudge => "then arrow: stack",
             Self::StackResize => "then ←/→: stack",
             Self::StackVelocity => "then ↑/↓: stack vel",
+            Self::Transpose => "hold: ↑/↓ semitone",
+            Self::Octave => "hold: ↑/↓ octave",
         }
     }
 
@@ -165,6 +180,8 @@ impl Verb {
                 | Verb::ClipResize
                 | Verb::Velocity
                 | Verb::StackVelocity
+                | Verb::Transpose
+                | Verb::Octave
         )
     }
 }

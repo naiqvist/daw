@@ -235,6 +235,27 @@ struct Audio {
     trouble: Option<String>,
     /// The stage revision the live schedule was built from.
     built: Option<u64>,
+    /// The spec that schedule was compiled from, and the tempo it was
+    /// compiled at. Kept so the next compile can say which nodes did not
+    /// move and may therefore keep playing across the swap.
+    ///
+    /// The tempo is half of that answer rather than a detail: event stamps
+    /// and loop lengths are baked into a node at compile, so two identical
+    /// specs at two tempos are NOT the same node.
+    built_spec: Option<daw::audio::graph::GraphSpec>,
+    built_bpm: f64,
+    /// The revision this loop has seen, when it last moved, and whether it
+    /// is moving as part of a burst.
+    ///
+    /// A held arrow on a note, a trig length or a p-lock repeats at the
+    /// OS repeat rate. Compiling on every repeat is a schedule swap every
+    /// thirty milliseconds, and even a swap that carries its nodes across
+    /// cannot carry the node being edited — so a held key was a song that
+    /// stopped until the key came up. A burst is compiled once, when the
+    /// hand stops.
+    seen: Option<u64>,
+    seen_at: std::time::Instant,
+    burst: bool,
     /// Whether the graph built was the arrangement's. A mode change is
     /// a rebuild even when the song has not changed.
     built_song: bool,
@@ -283,6 +304,26 @@ struct Audio {
 /// before it is given up on.
 const FIRST_BLOCK_GRACE: std::time::Duration = std::time::Duration::from_millis(1500);
 const MIDI_REFRESH_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+/// A gap longer than this means the hand STOPPED: the edit that follows is
+/// a fresh decision and its schedule is compiled at once.
+const EDIT_BURST: std::time::Duration = std::time::Duration::from_millis(150);
+/// How still a burst of edits has to go before its schedule is compiled.
+/// Short enough to feel immediate on release, long enough to swallow an OS
+/// key repeat whole.
+const EDIT_SETTLE: std::time::Duration = std::time::Duration::from_millis(90);
+
+/// Whether a moved revision is compiled this frame.
+///
+/// A lone edit compiles at once — it has to be heard on the next trig. One
+/// arriving mid-burst waits for the hand to stop, and waiting costs nothing
+/// musically: everything that moves the revision changes what the sequencer
+/// will PLAY, and the soonest any of it can sound is that same next trig
+/// either way.
+///
+/// Pure, so the rule is checkable without a clock.
+fn compile_now(burst: bool, since_change: std::time::Duration) -> bool {
+    !burst || since_change >= EDIT_SETTLE
+}
 const CAPTURE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 
 impl Audio {
@@ -319,6 +360,11 @@ impl Audio {
             api,
             trouble,
             built: None,
+            built_spec: None,
+            built_bpm: 0.0,
+            seen: None,
+            seen_at: std::time::Instant::now(),
+            burst: false,
             built_song: false,
             tempo: None,
             mixed: None,
@@ -356,6 +402,10 @@ impl Audio {
                 self.started = std::time::Instant::now();
                 self.fell_back = false;
                 self.built = None;
+                // A new stream is a new sample rate and a new block size,
+                // which is everything a node is built from: nothing
+                // compiled for the old one may be carried into it.
+                self.built_spec = None;
                 self.built_song = false;
                 self.tempo = None;
                 self.mixed = None;
@@ -387,7 +437,11 @@ impl Audio {
             // The render thread owns one immutable document snapshot and the
             // node addresses minted with its graph. Live playback calls the
             // same evaluator below; only the clock feeding it differs.
-            let song = stage.song().clone();
+            let song = request
+                .source
+                .as_deref()
+                .cloned()
+                .unwrap_or_else(|| stage.song().clone());
             let (spec, _) = song_graph::build_song(&song);
             let sample_rate = request.rate_hz.unwrap_or_else(|| {
                 self.engine
@@ -554,6 +608,39 @@ impl Audio {
                 }
             };
             stage.set_thumb(data);
+        }
+        if stage.take_midi_stop()
+            && let Some(engine) = &mut self.engine
+        {
+            engine.stop_audition();
+        }
+        if let Some(render) = stage.take_midi_audio()
+            && let Some(engine) = &mut self.engine
+        {
+            engine.audition(AuditionBuffer::from_material(material::Material {
+                samples: render.samples,
+                channels: 2,
+                frames: render.frames as u64,
+                sample_rate: render.rate,
+                original_rate: render.rate,
+                truncated: false,
+                source: std::path::PathBuf::from("midi-lab:preview"),
+            }));
+        }
+        if let Some(render) = stage.take_kiln_audio() {
+            if let Some(engine) = &mut self.engine {
+                let frames = render.samples.len() as u64;
+                let piece = material::Material {
+                    samples: render.samples,
+                    channels: 1,
+                    frames,
+                    source: std::path::PathBuf::from("kiln:membrane"),
+                    sample_rate: render.rate,
+                    original_rate: render.rate,
+                    truncated: false,
+                };
+                engine.audition(AuditionBuffer::from_material(piece));
+            }
         }
         if stage.take_audition_stop()
             && let Some(engine) = &mut self.engine
@@ -922,6 +1009,7 @@ impl Audio {
         }
         self.started = std::time::Instant::now();
         self.built = None;
+        self.built_spec = None;
         self.built_song = false;
         self.tempo = None;
         self.mixed = None;
@@ -954,7 +1042,18 @@ impl Audio {
         // What sounds, when it changed. A rebuild mints fresh node ids,
         // so the mapping is captured with the schedule rather than
         // derived from the song afterwards.
-        if self.built != Some(stage.revision()) || self.built_song != stage.song_mode() {
+        let revision = stage.revision();
+        let now = std::time::Instant::now();
+        if self.seen != Some(revision) {
+            // How long the song sat still BEFORE this edit is what says
+            // whether a hand is mid-gesture: a key repeat arrives every
+            // few frames, a decision does not.
+            self.burst = self.seen.is_some() && now.duration_since(self.seen_at) < EDIT_BURST;
+            self.seen = Some(revision);
+            self.seen_at = now;
+        }
+        let settled = compile_now(self.burst, now.duration_since(self.seen_at));
+        if (self.built != Some(revision) && settled) || self.built_song != stage.song_mode() {
             let info = engine.info();
             let song_mode = stage.song_mode();
             let mode_changed = self.built_song != song_mode;
@@ -967,6 +1066,7 @@ impl Audio {
             } else {
                 song_graph::build(stage.song(), stage.playing())
             };
+            let bpm = if song_mode { base_bpm } else { stage.bpm() };
             let compiled = match timeline.as_ref() {
                 Some(timeline) => spec.compile_with_tempo_table(
                     info.sample_rate,
@@ -974,15 +1074,35 @@ impl Audio {
                     base_bpm,
                     timeline,
                 ),
-                None => spec.compile_at_tempo(info.sample_rate, info.max_frames, stage.bpm()),
+                None => spec.compile_at_tempo(info.sample_rate, info.max_frames, bpm),
             };
+            // Which nodes may keep playing across the swap. Offered only
+            // when everything ELSE a node is compiled from has held
+            // still — the mode, the tempo map and the tempo — because a
+            // spec that reads the same at a different tempo compiles to a
+            // different node.
+            let plan = self
+                .built_spec
+                .as_ref()
+                .filter(|_| !mode_changed && !timeline_changed && self.built_bpm == bpm)
+                .map(|prev| spec.adoption_plan(prev));
             match compiled {
-                Ok(schedule) => {
+                Ok(mut schedule) => {
+                    if let Some(plan) = plan {
+                        schedule.set_adoption(plan, engine.live_epoch());
+                    }
                     self.schedule_latency_frames = schedule.latency() as u64;
                     match engine.set_schedule(Box::new(schedule)) {
                         Ok(()) => {
                             self.nodes = Some(nodes);
-                            self.built = Some(stage.revision());
+                            self.built = Some(revision);
+                            // What the NEXT compile compares against. Kept
+                            // only on a schedule that actually reached the
+                            // callback: a plan drawn against a spec that
+                            // never became a running graph would name nodes
+                            // that are not there.
+                            self.built_spec = Some(spec);
+                            self.built_bpm = bpm;
                             self.built_song = song_mode;
                             self.tempo = timeline;
                             // A new map changes the meaning of the transport's
@@ -1259,7 +1379,16 @@ impl App {
         let library_snapshot = storage
             .get(daw::library::CACHE_STORAGE_KEY)
             .unwrap_or_default();
-        let cli_path = std::env::args_os().nth(1).map(std::path::PathBuf::from);
+        let mut cli_args = std::env::args_os().skip(1);
+        let first = cli_args.next();
+        let open_midi = first.as_ref().is_some_and(|arg| arg == "--midi-lab");
+        let open_lab = first.as_ref().is_some_and(|arg| arg == "--lab");
+        let cli_path = if open_lab || open_midi {
+            cli_args.next()
+        } else {
+            first
+        }
+        .map(std::path::PathBuf::from);
 
         let mut stage = Stage::with_library(library_config, library_snapshot);
         // Songs live under the music folder unless a preference gives them a
@@ -1268,6 +1397,9 @@ impl App {
         if let Some(home) = std::env::var_os("HOME") {
             stage.set_home(std::path::PathBuf::from(home).join("Music").join("daw"));
         }
+        // Sounds are filed beside the theme and the tune, one library
+        // for every song on this machine.
+        stage.set_sound_library(daw::sound::dir());
         stage.restore_preferences(prefs, cli_path.is_none());
 
         let audio = Audio::start(engine_config(stage.preferences()));
@@ -1283,6 +1415,12 @@ impl App {
             && let Err(error) = stage.open(path)
         {
             eprintln!("stage: could not open the song — {error}");
+        }
+        if open_midi {
+            stage.open_midi_lab("");
+        }
+        if open_lab {
+            let _ = stage.apply(daw::ui::stage::StageIntent::Lab);
         }
         Self {
             stage,
@@ -1548,6 +1686,30 @@ impl shell::Host for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A held arrow moves the revision every few frames. Compiling on each
+    /// one swapped the schedule thirty times a second, and the node being
+    /// edited cannot ride a swap — so the song went quiet until the key
+    /// came up. The first edit is still heard at once.
+    #[test]
+    fn a_lone_edit_compiles_at_once_and_a_held_key_compiles_when_it_stops() {
+        use std::time::Duration;
+
+        assert!(compile_now(false, Duration::ZERO), "a lone edit waited");
+        assert!(
+            !compile_now(true, Duration::ZERO),
+            "a burst compiled on its first repeat"
+        );
+        assert!(
+            !compile_now(true, EDIT_SETTLE - Duration::from_millis(1)),
+            "a burst compiled while the hand was still moving"
+        );
+        assert!(
+            compile_now(true, EDIT_SETTLE),
+            "a burst never compiled after the hand stopped"
+        );
+        assert!(compile_now(true, Duration::from_secs(1)));
+    }
 
     #[test]
     fn clean_idle_close_needs_no_interlock() {

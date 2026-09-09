@@ -22,6 +22,16 @@ pub(crate) struct TrigNote {
     pub(crate) muted: bool,
 }
 
+/// A whole trig: its notes, its rules, and where it was yanked from —
+/// the address a put copies the sound lock through.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TrigPayload {
+    pub(crate) notes: Vec<TrigNote>,
+    pub(crate) rules: crate::sequencing::TrigRules,
+    /// `(pattern id, tick)` of the yanked step.
+    pub(crate) source: (u64, usize),
+}
+
 /// A sparse time region from the folded step grid. `cells` carries the
 /// holes as well as the sounding cells; notes retain their exact offsets
 /// inside that mask.
@@ -31,6 +41,10 @@ pub(crate) struct GridRegion {
     pub(crate) cell_span: usize,
     pub(crate) cells: Vec<usize>,
     pub(crate) notes: Vec<(usize, TrigNote)>,
+    /// Each cell's rules, at its offset from the first cell.
+    pub(crate) rules: Vec<(usize, crate::sequencing::TrigRules)>,
+    /// `(pattern id, tick)` of the first cell, for sound copies.
+    pub(crate) source: (u64, usize),
 }
 
 /// One note carried by a piano-roll region. `row` is measured downward
@@ -71,7 +85,7 @@ pub(crate) enum Payload {
     /// One pitch-addressed note from a single-note editor.
     Note(TrigNote),
     /// Every note that shared one step: a whole trig, locks and all.
-    Trig(Vec<TrigNote>),
+    Trig(TrigPayload),
     GridRegion(GridRegion),
     RollRegion(RollRegion),
     #[cfg_attr(not(test), allow(dead_code))]
@@ -112,10 +126,10 @@ impl Registers {
     /// The register's content, if it holds a trig. On a kind mismatch the
     /// caller receives the refusal to speak; the register keeps its
     /// content either way — a refused put must not destroy the yank.
-    pub(crate) fn trig(&self) -> Result<&[TrigNote], String> {
+    pub(crate) fn trig(&self) -> Result<&TrigPayload, String> {
         match &self.default {
             None => Err("PUT: NOTHING YANKED".to_owned()),
-            Some(Payload::Trig(notes)) => Ok(notes),
+            Some(Payload::Trig(trig)) => Ok(trig),
             Some(other) => Err(format!("PUT: {} DOES NOT GO HERE", other.kind())),
         }
     }
@@ -155,7 +169,7 @@ impl Registers {
         match &self.default {
             None => None,
             Some(Payload::Note(_)) => Some("N".to_owned()),
-            Some(Payload::Trig(notes)) => Some(format!("T{}", notes.len())),
+            Some(Payload::Trig(trig)) => Some(format!("T{}", trig.notes.len())),
             Some(Payload::GridRegion(region)) => Some(format!("G{}", region.cells.len())),
             Some(Payload::RollRegion(region)) => Some(format!("R{}", region.cells.len())),
             Some(Payload::Clip(_)) => Some("C".to_owned()),
@@ -173,14 +187,18 @@ mod tests {
     use super::*;
 
     fn a_trig() -> Payload {
-        Payload::Trig(vec![TrigNote {
-            pitch: crate::pitch::Pitch::from_midi(60),
-            length_ticks: 12,
-            velocity: 100,
-            probability: 1.0,
-            enabled: true,
-            muted: false,
-        }])
+        Payload::Trig(TrigPayload {
+            notes: vec![TrigNote {
+                pitch: crate::pitch::Pitch::from_midi(60),
+                length_ticks: 12,
+                velocity: 100,
+                probability: 1.0,
+                enabled: true,
+                muted: false,
+            }],
+            rules: Default::default(),
+            source: (0, 0),
+        })
     }
 
     fn a_note() -> TrigNote {
@@ -198,7 +216,7 @@ mod tests {
     fn yank_then_put_round_trips() {
         let mut registers = Registers::default();
         registers.yank(a_trig());
-        assert_eq!(registers.trig().expect("holds a trig").len(), 1);
+        assert_eq!(registers.trig().expect("holds a trig").notes.len(), 1);
     }
 
     #[test]

@@ -146,7 +146,7 @@ impl super::super::Stage {
                         painter.text(
                             egui::pos2(rect.min.x + INSET, rect.center().y),
                             egui::Align2::LEFT_CENTER,
-                            format!("{:02}", id.0),
+                            self.song.tag_of(id),
                             font.clone(),
                             if sounding { c.bright } else { c.fg },
                         );
@@ -201,7 +201,7 @@ impl super::super::Stage {
                     c.nominal,
                 );
                 let word = match self.song.slot_clip(track, scene) {
-                    Some(Clip::Pattern(id)) => format!("PLAYING {:02}", id.0),
+                    Some(Clip::Pattern(id)) => format!("PLAYING {}", self.song.tag_of(id)),
                     None => "PLAYING --".to_owned(),
                 };
                 painter.text(

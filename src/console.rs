@@ -1,8 +1,10 @@
 //! The console: the desk every track sits on.
 //!
-//! Every track carries the same channel strip in the same order — the
-//! twenty sections of [`SectionKind::STRIP`] — and every section is an
-//! effect made for this desk on the engine's own kernels. A section is
+//! Every plain track carries the same channel strip in the same order —
+//! the twenty sections of [`SectionKind::STRIP`] — and a track with a
+//! lane carries that lane's own list of them, in the lane's order
+//! (`crate::lane`). Every section is an effect made for this desk on
+//! the engine's own kernels. A section is
 //! IN or OUT; OUT is not compiled and costs nothing. PREAMP and OUT are
 //! always in: they are the channel. Every strip feeds one of four
 //! buses, every bus feeds the mix, and the buses, the returns and the

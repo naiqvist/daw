@@ -150,6 +150,38 @@ impl Default for Browser {
                                     load: DeviceKind::Loom,
                                 },
                                 BrowserItem {
+                                    name: "Table",
+                                    load: DeviceKind::Table,
+                                },
+                                BrowserItem {
+                                    name: "Ring",
+                                    load: DeviceKind::Ring,
+                                },
+                                BrowserItem {
+                                    name: "Prism",
+                                    load: DeviceKind::PrismVoice,
+                                },
+                                BrowserItem {
+                                    name: "Mass",
+                                    load: DeviceKind::Mass,
+                                },
+                                BrowserItem {
+                                    name: "Pluck",
+                                    load: DeviceKind::Pluck,
+                                },
+                                BrowserItem {
+                                    name: "Vox",
+                                    load: DeviceKind::Vox,
+                                },
+                                BrowserItem {
+                                    name: "Pipe",
+                                    load: DeviceKind::Pipe,
+                                },
+                                BrowserItem {
+                                    name: "Glass",
+                                    load: DeviceKind::Glass,
+                                },
+                                BrowserItem {
                                     name: "Acid",
                                     load: DeviceKind::Acid,
                                 },
@@ -184,6 +216,18 @@ impl Default for Browser {
                                 BrowserItem {
                                     name: "Clap",
                                     load: DeviceKind::Handclap,
+                                },
+                                BrowserItem {
+                                    name: "Drum",
+                                    load: DeviceKind::Drum,
+                                },
+                                BrowserItem {
+                                    name: "Thump",
+                                    load: DeviceKind::Thump,
+                                },
+                                BrowserItem {
+                                    name: "Clay",
+                                    load: DeviceKind::Clay,
                                 },
                             ],
                             open: false,

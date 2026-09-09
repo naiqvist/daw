@@ -277,6 +277,8 @@ const fn verb_name(verb: Verb) -> &'static str {
         Verb::Cancel => "CANCEL",
         Verb::StackYank => "STACK YANK",
         Verb::StackPut => "STACK PUT",
+        Verb::Transpose => "TRANSPOSE",
+        Verb::Octave => "OCTAVE",
     }
 }
 

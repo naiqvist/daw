@@ -92,8 +92,7 @@ macro_rules! tune {
 
 /// Where the overrides live: beside the theme, one console.
 pub fn overrides_path() -> std::path::PathBuf {
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    home.unwrap_or_default().join("Corpus").join("daw.tune")
+    crate::corpus::dir().join("daw.tune")
 }
 
 /// The directories whose sources carry knobs.

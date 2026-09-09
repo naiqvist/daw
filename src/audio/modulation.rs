@@ -326,8 +326,70 @@ pub fn peak_to_level(peak: f32) -> f32 {
 
 /// How many sources and wires the engine will carry, and therefore how
 /// many the telemetry can show. Fixed so the snapshot stays `Copy`.
-pub const MAX_MOD_SOURCES: usize = 16;
-pub const MAX_MOD_WIRES: usize = 64;
+pub const MAX_MOD_SOURCES: usize = 32;
+pub const MAX_MOD_WIRES: usize = 96;
+
+/// How a lane LFO meets the notes of its track. `Free` runs on the
+/// song's beat as every patchbay LFO does; the rest restart from each
+/// trig of the track: `Trig` runs on from there, `One` runs one cycle and
+/// holds at its end, `Half` half a cycle, `Hold` samples the free-running
+/// wave at the trig and holds it. Elektron's track LFO, on the wires.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize,
+)]
+pub enum LfoTrig {
+    #[default]
+    Free,
+    Trig,
+    Hold,
+    One,
+    Half,
+}
+
+impl LfoTrig {
+    pub const ALL: [Self; 5] = [Self::Free, Self::Trig, Self::Hold, Self::One, Self::Half];
+
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Free => "FREE",
+            Self::Trig => "TRIG",
+            Self::Hold => "HOLD",
+            Self::One => "ONE",
+            Self::Half => "HALF",
+        }
+    }
+}
+
+/// Where a source restarts: the trigs of its track, in beats, as the
+/// compiler laid them. `at` is sorted; with `loop_beats` above zero the
+/// list repeats every loop (a session clip), else it is absolute (the
+/// song). Built green-side, read in the callback by binary search.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SourceRestarts {
+    pub source: u64,
+    pub trig: LfoTrig,
+    /// Beats over which the wave fades in after a restart. 0 is none.
+    pub fade_beats: f32,
+    pub loop_beats: f32,
+    pub at: Vec<f32>,
+}
+
+/// How long ago, in beats, the last restart before `local` was — or
+/// `None` when none has happened yet. A looping list counts the last
+/// restart of the previous pass.
+fn restart_age(at: &[f32], local: f32, loop_beats: f32) -> Option<f32> {
+    if at.is_empty() {
+        return None;
+    }
+    let index = at.partition_point(|restart| *restart <= local);
+    if index > 0 {
+        Some(local - at[index - 1])
+    } else if loop_beats > 0.0 {
+        Some(local + loop_beats - at[at.len() - 1])
+    } else {
+        None
+    }
+}
 
 /// One wire, green-side, with its target already resolved from a
 /// `(track, parameter)` pair to a concrete node and param id. Built by the
@@ -366,6 +428,9 @@ pub struct ModSpec {
     /// wire uses, so telemetry indices line up with the UI's list.
     pub sources: Vec<Modulator>,
     pub wires: Vec<WireSpec>,
+    /// Restart lists for the sources that have one: the lane LFOs. A
+    /// source not named here runs free.
+    pub retrigs: Vec<SourceRestarts>,
 }
 
 /// A live edit to one wire's transform chain. The whole chain travels
@@ -398,7 +463,7 @@ pub enum ModEdit {
 }
 
 /// A source as the callback carries it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct PlanSource {
     id: u64,
     kind: ModKind,
@@ -406,6 +471,13 @@ struct PlanSource {
     /// on discontinuity: free-running is a classification, not a bug.
     phase: f32,
     value: f32,
+    /// How the source meets its track's trigs; `Free` ignores `at`.
+    trig: LfoTrig,
+    fade_beats: f32,
+    loop_beats: f32,
+    /// Sorted restart beats, fixed at compile. Read, never grown, in the
+    /// callback.
+    at: Vec<f32>,
 }
 
 /// A wire as the callback carries it: indices, not ids.
@@ -506,11 +578,24 @@ impl ModPlan {
             .sources
             .iter()
             .take(MAX_MOD_SOURCES)
-            .map(|m| PlanSource {
-                id: m.id,
-                kind: m.kind,
-                phase: 0.0,
-                value: 0.0,
+            .map(|m| {
+                let restarts = spec.retrigs.iter().find(|r| r.source == m.id);
+                PlanSource {
+                    id: m.id,
+                    kind: m.kind,
+                    phase: 0.0,
+                    value: 0.0,
+                    trig: restarts.map_or(LfoTrig::Free, |r| r.trig),
+                    fade_beats: restarts.map_or(0.0, |r| r.fade_beats.max(0.0)),
+                    loop_beats: restarts.map_or(0.0, |r| r.loop_beats.max(0.0)),
+                    at: restarts.map_or_else(Vec::new, |r| {
+                        let mut at = r.at.clone();
+                        at.retain(|beat| beat.is_finite());
+                        at.sort_by(f32::total_cmp);
+                        at.dedup();
+                        at
+                    }),
+                }
             })
             .collect();
 
@@ -743,8 +828,39 @@ impl ModPlan {
                         // drift off into a range where f32 loses turns.
                         source.phase = (source.phase + hz.max(0.0) * dt).rem_euclid(1.0);
                         value
-                    } else {
+                    } else if source.trig == LfoTrig::Free {
                         shape.wave(beat / rate_beats.max(1e-3))
+                    } else {
+                        // A lane LFO: the wave is a function of the time
+                        // since the track's last trig. Before the first,
+                        // nothing moves.
+                        let rate = rate_beats.max(1e-3);
+                        let local = if source.loop_beats > 0.0 {
+                            beat.rem_euclid(source.loop_beats)
+                        } else {
+                            beat
+                        };
+                        match restart_age(&source.at, local, source.loop_beats) {
+                            None => 0.0,
+                            Some(since) => {
+                                let fade = if source.fade_beats > 0.0 {
+                                    (since / source.fade_beats).min(1.0)
+                                } else {
+                                    1.0
+                                };
+                                let raw = match source.trig {
+                                    LfoTrig::Free => shape.wave(beat / rate),
+                                    LfoTrig::Trig => shape.wave(since / rate),
+                                    // One cycle, then the wave's last value
+                                    // held: just short of the wrap.
+                                    LfoTrig::One => shape.wave((since / rate).min(1.0 - 1e-4)),
+                                    LfoTrig::Half => shape.wave((since / rate).min(0.5)),
+                                    // The free wave, sampled at the trig.
+                                    LfoTrig::Hold => shape.wave((local - since) / rate),
+                                };
+                                raw * fade
+                            }
+                        }
                     }
                 }
                 ModKind::Follower { track } => self.levels.get(track).copied().unwrap_or(0.0),
@@ -843,6 +959,106 @@ impl ModPlan {
 mod tests {
     use super::*;
 
+    fn restarted(
+        shape: ModShape,
+        rate: f32,
+        trig: LfoTrig,
+        fade: f32,
+        loop_beats: f32,
+        at: &[f32],
+    ) -> ModPlan {
+        let spec = ModSpec {
+            sources: vec![Modulator {
+                id: 7,
+                kind: ModKind::Lfo {
+                    shape,
+                    rate_beats: rate,
+                    free: false,
+                    hz: 1.0,
+                },
+            }],
+            wires: Vec::new(),
+            retrigs: vec![SourceRestarts {
+                source: 7,
+                trig,
+                fade_beats: fade,
+                loop_beats,
+                at: at.to_vec(),
+            }],
+        };
+        ModPlan::compile(&spec, 48_000.0, |_| None)
+    }
+
+    fn value_at(plan: &mut ModPlan, beat: f32) -> f32 {
+        plan.evaluate(beat, 64);
+        let mut out = [0.0; MAX_MOD_SOURCES];
+        plan.source_values(&mut out);
+        out[0]
+    }
+
+    /// A lane LFO's wave is a function of the time since its track's
+    /// last trig: TRIG runs on, HOLD samples, ONE and HALF stop, FADE
+    /// scales, a looping list wraps, and nothing moves before the first.
+    #[test]
+    fn lane_lfo_modes_restart_from_the_tracks_trigs() {
+        let mut trig = restarted(ModShape::Sine, 1.0, LfoTrig::Trig, 0.0, 4.0, &[1.0, 3.0]);
+        assert!(
+            (value_at(&mut trig, 1.25) - 1.0).abs() < 1e-5,
+            "a quarter turn after the trig"
+        );
+        assert!(
+            (value_at(&mut trig, 3.75) + 1.0).abs() < 1e-5,
+            "three quarters after the second"
+        );
+        assert!(
+            (value_at(&mut trig, 5.25) - 1.0).abs() < 1e-5,
+            "the next pass of the loop"
+        );
+        assert!(
+            (value_at(&mut trig, 0.5) - 0.0).abs() < 1e-4,
+            "wrapped: 1.5 beats after the last"
+        );
+
+        let mut absolute = restarted(ModShape::Sine, 1.0, LfoTrig::Trig, 0.0, 0.0, &[2.0]);
+        assert_eq!(
+            value_at(&mut absolute, 1.0),
+            0.0,
+            "nothing before the first trig"
+        );
+        assert!((value_at(&mut absolute, 2.25) - 1.0).abs() < 1e-5);
+
+        let mut hold = restarted(ModShape::Sine, 4.0, LfoTrig::Hold, 0.0, 0.0, &[1.0]);
+        assert!(
+            (value_at(&mut hold, 1.5) - 1.0).abs() < 1e-5,
+            "the free wave at the trig"
+        );
+        assert!((value_at(&mut hold, 2.9) - 1.0).abs() < 1e-5, "held");
+
+        let mut one = restarted(ModShape::Saw, 1.0, LfoTrig::One, 0.0, 0.0, &[1.0]);
+        assert!((value_at(&mut one, 1.5) - 0.0).abs() < 1e-5);
+        assert!(value_at(&mut one, 2.5) > 0.999, "one cycle, then its end");
+
+        let mut half = restarted(ModShape::Saw, 1.0, LfoTrig::Half, 0.0, 0.0, &[1.0]);
+        assert!((value_at(&mut half, 1.25) + 0.5).abs() < 1e-5);
+        assert!(
+            (value_at(&mut half, 2.5) - 0.0).abs() < 1e-5,
+            "half a cycle, then its middle"
+        );
+
+        let mut fade = restarted(ModShape::Saw, 1.0, LfoTrig::Trig, 2.0, 0.0, &[1.0]);
+        assert!(
+            (value_at(&mut fade, 1.25) + 0.0625).abs() < 1e-5,
+            "-0.5 at an eighth of the fade"
+        );
+        assert!((value_at(&mut fade, 3.25) + 0.5).abs() < 1e-5, "faded in");
+
+        let mut free = restarted(ModShape::Sine, 1.0, LfoTrig::Free, 0.0, 4.0, &[1.0]);
+        assert!(
+            (value_at(&mut free, 0.25) - 1.0).abs() < 1e-5,
+            "free ignores the list"
+        );
+    }
+
     fn lfo(shape: ModShape, rate_beats: f32) -> ModKind {
         ModKind::Lfo {
             shape,
@@ -854,6 +1070,7 @@ mod tests {
 
     fn spec_with(kind: ModKind, depth: f32) -> ModSpec {
         ModSpec {
+            retrigs: Vec::new(),
             sources: vec![Modulator { id: 1, kind }],
             wires: vec![WireSpec {
                 id: 10,
@@ -1152,6 +1369,7 @@ mod tests {
     #[test]
     fn an_unwired_source_still_moves() {
         let spec = ModSpec {
+            retrigs: Vec::new(),
             sources: vec![Modulator {
                 id: 1,
                 kind: lfo(ModShape::Saw, 1.0),
@@ -1234,6 +1452,7 @@ mod tests {
     #[test]
     fn a_log_target_wobbles_in_octaves_instead_of_gating() {
         let cutoff_spec = |log: bool| ModSpec {
+            retrigs: Vec::new(),
             sources: vec![Modulator {
                 id: 1,
                 kind: lfo(ModShape::Sine, 4.0),

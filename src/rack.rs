@@ -935,6 +935,52 @@ pub(crate) fn draw_device_card(
         // rack had been asked to draw itself as a leaf, which is a bug in
         // the caller rather than something to render.
         DeviceState::Rack => Vec::new(),
+        // The DRUM voice has no card: its surface is the stage's pages.
+        // The old rack shows its name and edits nothing.
+        DeviceState::Drum(_) => {
+            ui.label("DRUM — edited on the stage's pages");
+            Vec::new()
+        }
+        DeviceState::Thump(_) => {
+            ui.label("THUMP — edited on the stage's pages");
+            Vec::new()
+        }
+        DeviceState::Clay(_) => {
+            ui.label("CLAY — edited on the stage's pages");
+            Vec::new()
+        }
+        DeviceState::Table(_) => {
+            ui.label("TABLE — edited on the stage's pages");
+            Vec::new()
+        }
+        DeviceState::Ring(_) => {
+            ui.label("RING — edited on the stage's pages");
+            Vec::new()
+        }
+        DeviceState::PrismVoice(_) => {
+            ui.label("PRISM — edited on the stage's pages");
+            Vec::new()
+        }
+        DeviceState::Mass(_) => {
+            ui.label("MASS — edited on the stage's pages");
+            Vec::new()
+        }
+        DeviceState::Pluck(_) => {
+            ui.label("PLUCK — edited on the stage's pages");
+            Vec::new()
+        }
+        DeviceState::Vox(_) => {
+            ui.label("VOX — edited on the stage's pages");
+            Vec::new()
+        }
+        DeviceState::Pipe(_) => {
+            ui.label("PIPE — edited on the stage's pages");
+            Vec::new()
+        }
+        DeviceState::Glass(_) => {
+            ui.label("GLASS — edited on the stage's pages");
+            Vec::new()
+        }
         DeviceState::Sampler(params) => {
             let mut knobs = device::SamplerUi::from_engine(|id| params.get(id).unwrap_or_default());
             let face = samplers.get(&instance.id);

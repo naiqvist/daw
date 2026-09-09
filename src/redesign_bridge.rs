@@ -277,7 +277,11 @@ impl App {
                 | Intent::ResizeNote { tick, .. }
                 | Intent::SetLock { tick, .. }
                 | Intent::ClearLock { tick, .. }
+                | Intent::CopySound { tick, .. }
                 | Intent::SetProbability { tick, .. }
+                | Intent::SetCondition { tick, .. }
+                | Intent::SetRetrig { tick, .. }
+                | Intent::SetSlide { tick, .. }
                 | Intent::AdjustVelocity { tick, .. }
                 | Intent::AdjustNoteVelocity { tick, .. }
                 | Intent::SetNoteMuted { tick, .. } => (tick, tick),
@@ -330,7 +334,7 @@ impl App {
                 }
                 // Parameter locks belong to the Song's trigs; the second
                 // frame's clips have no place for them, and say so.
-                Intent::SetLock { .. } | Intent::ClearLock { .. } => {
+                Intent::SetLock { .. } | Intent::ClearLock { .. } | Intent::CopySound { .. } => {
                     self.notice = Some("locks: not in this frame".to_owned());
                 }
                 Intent::Toggle {
@@ -481,6 +485,25 @@ impl App {
                     if !touched {
                         self.notice = Some("condition: no trig here".to_owned());
                     }
+                }
+                Intent::SetCondition { cond, .. } => {
+                    let mut touched = false;
+                    for note in clip.notes.iter_mut().filter(|note| at_tick(note)) {
+                        note.cond = cond;
+                        touched = true;
+                    }
+                    if !touched {
+                        self.notice = Some("condition: no trig here".to_owned());
+                    }
+                }
+                // The arrangement-era Note has no retrigger field. Keep the
+                // Song projection authoritative instead of pretending this
+                // lossy bridge can preserve the edit.
+                Intent::SetRetrig { .. } => {
+                    self.notice = Some("retrig: not in this frame".to_owned());
+                }
+                Intent::SetSlide { .. } => {
+                    self.notice = Some("slide: not in this frame".to_owned());
                 }
                 Intent::Nudge { delta_ticks, .. } => {
                     // The whole trig moves or none of it does: a nudge that
@@ -1145,6 +1168,10 @@ impl App {
             .filter(|preview| Some(preview.pattern()) == song_pattern_id)
             .map(|preview| preview.ghosts(&self.song.key))
             .unwrap_or_default();
+        let sequence_rules = song_pattern_id
+            .and_then(|id| self.song.pattern(id))
+            .map(daw::ui::sequencer::trig_rules)
+            .unwrap_or_default();
         let sequence_view = sequence_clip_id
             .zip(sequence_clip_name.as_deref())
             .zip(sequence_clip_len)
@@ -1155,6 +1182,7 @@ impl App {
                 notes: &sequence_notes,
                 ghosts: &sequence_ghosts,
                 slicing: false,
+                rules: &sequence_rules,
             });
         let position = format_position(
             self.transport.position,
@@ -2561,6 +2589,8 @@ mod projection_tests {
             id: daw::sequencing::TrackId(99),
             name: "AUDIO 01".to_owned(),
             kind: daw::sequencing::TrackKind::Audio,
+            letter: String::new(),
+            tags_minted: 0,
             blocks: Vec::new(),
             audio_blocks: Vec::new(),
             muted: false,
@@ -2572,10 +2602,13 @@ mod projection_tests {
             sends: Vec::new(),
             is_group: false,
             folded: false,
-            chain: Vec::new(),
+            machine: None,
+            legacy_chain: Vec::new(),
             strip: Vec::new(),
             bus: 0,
             bus_by_hand: false,
+            lane: daw::lane::Lane::Plain,
+            lfos: Default::default(),
             depth: 0,
             input: daw::sequencing::TrackInput::None,
             monitor: daw::sequencing::Monitor::Off,
@@ -2617,6 +2650,8 @@ mod projection_tests {
             id: daw::sequencing::TrackId(99),
             name: "AUDIO 01".to_owned(),
             kind: daw::sequencing::TrackKind::Audio,
+            letter: String::new(),
+            tags_minted: 0,
             blocks: Vec::new(),
             audio_blocks: Vec::new(),
             muted: false,
@@ -2628,10 +2663,13 @@ mod projection_tests {
             sends: Vec::new(),
             is_group: false,
             folded: false,
-            chain: Vec::new(),
+            machine: None,
+            legacy_chain: Vec::new(),
             strip: Vec::new(),
             bus: 0,
             bus_by_hand: false,
+            lane: daw::lane::Lane::Plain,
+            lfos: Default::default(),
             depth: 0,
             input: daw::sequencing::TrackInput::None,
             monitor: daw::sequencing::Monitor::Off,

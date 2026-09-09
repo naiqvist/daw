@@ -1380,7 +1380,12 @@ impl Stage {
             dirty: self.dirty,
             track_count: self.song.tracks.len(),
             pattern_count: self.song.patterns.len(),
-            device_count: self.song.tracks.iter().map(|track| track.chain.len()).sum(),
+            device_count: self
+                .song
+                .tracks
+                .iter()
+                .map(|track| usize::from(track.machine.is_some()) + track.strip.len())
+                .sum(),
             bpm: self.bpm(),
             song_end_tick: self.song.end_tick(),
             loop_region: self.song.loop_on.then_some(self.song.loop_brace).flatten(),

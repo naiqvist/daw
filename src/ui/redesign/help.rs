@@ -67,6 +67,8 @@ fn verb_hint(verb: Verb) -> &'static str {
         Verb::StackPut => "replace this step with the yanked stack",
         Verb::Euclid => "Euclidean mode: arrows cycle the rhythm, ENTER keeps, ESC puts it back",
         Verb::Cancel => "leave the mode and put back what was there",
+        Verb::Transpose => "hold T, ▲ ▼: a semitone per press",
+        Verb::Octave => "hold Shift+T, ▲ ▼: an octave per press",
     }
 }
 

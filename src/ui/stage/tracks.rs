@@ -153,6 +153,8 @@ mod tests {
         Track {
             name: name.to_owned(),
             kind,
+            letter: String::new(),
+            tags_minted: 0,
             is_group,
             ..base
         }

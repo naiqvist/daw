@@ -116,6 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
     let mut renderer = egui_wgpu::Renderer::new(&device, format, Default::default());
+    daw::ui::kiln::install(&mut renderer, format);
     let mut screen_pass = daw::shell::screen::Pass::new(&device, format);
     let screen = egui_wgpu::ScreenDescriptor {
         size_in_pixels: size,
@@ -372,12 +373,46 @@ fn posed_key_frames(which: &str) -> Vec<Vec<egui::Event>> {
             frames.push(press(egui::Key::ArrowRight, egui::Modifiers::NONE).to_vec());
         }
     }
+    if which.contains("browser-sounds") {
+        // Down onto SOUNDS, open it, down onto the addressed lane's
+        // folder, open it, stand on its first sound.
+        for key in [
+            egui::Key::ArrowDown,
+            egui::Key::ArrowRight,
+            egui::Key::ArrowDown,
+            egui::Key::ArrowRight,
+            egui::Key::ArrowDown,
+        ] {
+            frames.push(press(key, egui::Modifiers::NONE).to_vec());
+        }
+    }
     if which.contains("browser-find") {
         frames.push(vec![egui::Event::Text("reverb".to_owned())]);
         // Filtered rows retain their real ancestry. Stand on the surviving
         // device rather than its open parents so both PATH and YIELD speak.
         for _ in 0..3 {
             frames.push(press(egui::Key::ArrowDown, egui::Modifiers::NONE).to_vec());
+        }
+    }
+    if which.contains("stage-steps") {
+        // Two pads stay held, then a slot turn marks both as used and lays
+        // the paired locks. The final draw frames retain the held keys.
+        frames.push(
+            press(egui::Key::Num1, egui::Modifiers::NONE)
+                .into_iter()
+                .take(1)
+                .collect(),
+        );
+        frames.push(
+            press(egui::Key::Num2, egui::Modifiers::NONE)
+                .into_iter()
+                .take(1)
+                .collect(),
+        );
+        frames.push(press(egui::Key::ArrowRight, egui::Modifiers::NONE).to_vec());
+        if which.contains("slide") {
+            // N: the lock the turn just laid becomes a slide.
+            frames.push(press(egui::Key::N, egui::Modifiers::NONE).to_vec());
         }
     }
     frames
@@ -450,7 +485,204 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
     if stage.polarity() != want {
         let _ = stage.apply(StageIntent::Ground);
     }
-    if which.contains("modulation") {
+    if which.contains("band-lane") {
+        stage.song_mut().set_lane(0, daw::lane::Lane::Drum);
+        let _ = stage
+            .song_mut()
+            .add_device(0, daw::devices::DeviceKind::Kit);
+        let _ = stage.apply(StageIntent::Devices);
+    } else if which.contains("deck") || which.contains("stage-steps") {
+        use daw::pages::PageKey;
+        use daw::sequencing::{Note, PATTERN_STEP_TICKS};
+
+        let machine = if which.contains("slice") {
+            daw::devices::DeviceKind::Sampler
+        } else if which.contains("clay") {
+            stage.song_mut().set_lane(0, daw::lane::Lane::Drum);
+            daw::devices::DeviceKind::Clay
+        } else if which.contains("acid") {
+            daw::devices::DeviceKind::Acid
+        } else if which.contains("table") {
+            daw::devices::DeviceKind::Table
+        } else if which.contains("ring") {
+            daw::devices::DeviceKind::Ring
+        } else if which.contains("prism_voice") {
+            daw::devices::DeviceKind::PrismVoice
+        } else if which.contains("mass") {
+            daw::devices::DeviceKind::Mass
+        } else if which.contains("pluck") {
+            daw::devices::DeviceKind::Pluck
+        } else if which.contains("vox") {
+            daw::devices::DeviceKind::Vox
+        } else if which.contains("pipe") {
+            daw::devices::DeviceKind::Pipe
+        } else if which.contains("glass") {
+            daw::devices::DeviceKind::Glass
+        } else if which.contains("thump") {
+            stage.song_mut().set_lane(0, daw::lane::Lane::Drum);
+            daw::devices::DeviceKind::Thump
+        } else if which.contains("drumvoice") {
+            stage.song_mut().set_lane(0, daw::lane::Lane::Drum);
+            daw::devices::DeviceKind::Drum
+        } else if which.contains("quad") || which.contains("lfo") {
+            daw::devices::DeviceKind::Quad
+        } else if which.contains("fx-drum") || which.contains("stage-steps") {
+            stage.song_mut().set_lane(0, daw::lane::Lane::Drum);
+            daw::devices::DeviceKind::Kit
+        } else {
+            daw::devices::DeviceKind::Poly
+        };
+        let _ = stage.song_mut().add_device(0, machine);
+
+        if which.contains("slice") {
+            use daw::params::sampler as p;
+            let frames = 192_000usize;
+            let samples: Vec<f32> = (0..frames)
+                .map(|i| {
+                    let local = (i % 12_000) as f32 / 48_000.0;
+                    let kick = (core::f32::consts::TAU
+                        * (48.0 * local + 7.0 * (1.0 - (-local * 35.0).exp())))
+                    .sin()
+                        * (-local * 22.0).exp();
+                    let noise = (((i as u32).wrapping_mul(747796405).wrapping_add(2891336453) >> 8)
+                        % 65536) as f32
+                        / 32768.0
+                        - 1.0;
+                    (kick * 0.68 + noise * (-local * 70.0).exp() * 0.28).clamp(-1.0, 1.0)
+                })
+                .collect();
+            let path = std::path::PathBuf::from("warehouse break.wav");
+            if let Some(d) = stage.song_mut().tracks[0].machine.as_mut() {
+                d.sample = Some(path.clone());
+                d.set_slices((0..16).map(|i| i as f64 / 16.0));
+                for (key, value) in [
+                    (p::LOOP_MODE, 1.0),
+                    (p::LOOP_START, 0.375),
+                    (p::LOOP_SIZE, 0.22),
+                    (p::LOOP_FADE, 0.35),
+                    (p::SOURCE_BEATS, 8.0),
+                    (p::PLAYBACK, 2.0),
+                    (p::TIME, 400.0),
+                ] {
+                    d.set(key, value);
+                }
+            }
+            stage.set_sample(daw::ui::stage::SampleData::from_planar(
+                path,
+                std::sync::Arc::new(samples),
+                1,
+                frames as u64,
+                48_000,
+            ));
+        }
+
+        // Open the first clip and give the grid a phrase, so the strip is
+        // seen over real musical state rather than an empty calibration.
+        let _ = stage.apply(StageIntent::Step(Step::Down));
+        let _ = stage.apply(StageIntent::Enter);
+        if let Some(pattern) = stage.song_mut().patterns.last_mut() {
+            for (step, pitch, velocity) in [(0, 36, 120), (4, 42, 88), (7, 38, 108), (12, 46, 76)] {
+                pattern.set_primary(step, Note::new(pitch, PATTERN_STEP_TICKS, velocity));
+            }
+            pattern.trig_mut(7).cond = Some((2, 4));
+        }
+        let _ = stage.apply(StageIntent::Enter);
+
+        if which.contains("soundlock") {
+            // A small library so the SOUND slot has something to turn to.
+            let library =
+                std::env::temp_dir().join(format!("daw-shot-soundlock-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&library);
+            let sound = daw::sound::Sound::capture(&stage.song_mut().tracks[0]);
+            let _ = daw::sound::save(&library, "eight oh eight", &sound);
+            stage.set_sound_library(library);
+        }
+        // Generic coverage poses: stage-deck-table-fltr-sub1, etc.
+        let coverage_pose = [
+            "table",
+            "ring",
+            "prism_voice",
+            "mass",
+            "pluck",
+            "vox",
+            "pipe",
+            "glass",
+        ]
+        .iter()
+        .any(|name| which.contains(name));
+        let page = if coverage_pose && which.contains("-fltr") {
+            PageKey::Fltr
+        } else if coverage_pose && which.contains("-amp") {
+            PageKey::Amp
+        } else if coverage_pose && which.contains("-fx") {
+            PageKey::Fx
+        } else if which.contains("soundlock") {
+            let _ = stage.apply(StageIntent::Page(PageKey::Trig));
+            PageKey::Trig
+        } else if which.contains("trig") {
+            PageKey::Trig
+        } else if which.contains("lfo") {
+            PageKey::Lfo
+        } else if which.contains("acid-fltr") || which.contains("slice-fltr") {
+            PageKey::Fltr
+        } else if which.contains("thump-amp")
+            || which.contains("clay-amp")
+            || which.contains("slice-amp")
+        {
+            PageKey::Amp
+        } else if which.contains("thump-fx")
+            || which.contains("acid-fx")
+            || which.contains("slice-fx")
+        {
+            PageKey::Fx
+        } else if which.contains("fx-drum") || which.contains("stage-steps") {
+            PageKey::Fx
+        } else {
+            PageKey::Src
+        };
+        let _ = stage.apply(StageIntent::Page(page));
+        if coverage_pose {
+            if let Some(index) = which
+                .split("-sub")
+                .nth(1)
+                .and_then(|word| word.split('-').next())
+                .and_then(|word| word.parse::<usize>().ok())
+            {
+                for _ in 0..index.min(16) {
+                    let _ = stage.apply(StageIntent::Page(page));
+                }
+            }
+        }
+        if which.contains("slice-loop") || which.contains("slice-time") {
+            let _ = stage.apply(StageIntent::Page(page));
+        }
+        if which.contains("slice-time") {
+            let _ = stage.apply(StageIntent::Page(page));
+        }
+        if which.contains("lfo2") {
+            let _ = stage.apply(StageIntent::Page(page));
+        }
+        if which.contains("op3") {
+            let _ = stage.apply(StageIntent::Page(page));
+            let _ = stage.apply(StageIntent::Page(page));
+        }
+        if which.contains("stage-steps") {
+            let _ = stage.apply(StageIntent::StepKeys);
+        }
+    } else if which.contains("midi") {
+        stage.pose_midi_lab(which);
+    } else if which.contains("lab") {
+        // The lab: a kiln in the field; `-two` splits a second beside it.
+        let _ = stage.apply(StageIntent::Lab);
+        if which.contains("two") {
+            let _ = stage.apply(StageIntent::LabWindow);
+            let _ = stage.apply(StageIntent::LabFocus(Step::Left));
+        }
+        if which.contains("sliders") {
+            let _ = stage.apply(StageIntent::KilnBand);
+        }
+        stage.pose_kiln(0.008);
+    } else if which.contains("modulation") {
         // A working patchbay: two differently-clocked LFOs and an envelope
         // follower, each with a real route and measured callback values. The
         // selected first route opens directly into the response shaper.
@@ -743,22 +975,68 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
                 let _ = stage.apply(StageIntent::Launch);
                 stage.transport_seek(daw::sequencing::TICKS_PER_BEAT * 11);
                 let _ = stage.apply(StageIntent::SongView);
-            } else if which.contains("rolling") {
-                let _ = stage.apply(StageIntent::ToggleTransport);
-                stage.set_position(6.5);
+            }
+        } else if which.contains("rolling") {
+            let _ = stage.apply(StageIntent::ToggleTransport);
+            stage.set_position(6.5);
+        }
+    }
+    if which.contains("zoom") {
+        let _ = stage.apply(StageIntent::Song(SongIntent::ZoomIn));
+        let _ = stage.apply(StageIntent::Song(SongIntent::ZoomIn));
+    }
+    if which.contains("meter") {
+        // A real denominator change inside the posed Song: enough to
+        // prove the ruler follows 7/8 beats, then restarts in 3/4.
+        let seven_eighths = daw::sequencing::TICKS_PER_BEAT * 7 / 2;
+        let _ = stage.song_mut().set_meter_mark(0, 7, 8);
+        let _ = stage.song_mut().set_meter_mark(seven_eighths * 2, 3, 4);
+    }
+    if which.contains("matrix") {
+        // The session clip matrix over the song: clips in the first
+        // two scenes of every instrument track, the cursor a bar in.
+        let tracks = stage.song().tracks.len();
+        for track in 0..tracks {
+            for scene in 0..2 {
+                let _ = stage.song_mut().fill_slot(track, scene);
             }
         }
-        if which.contains("zoom") {
-            let _ = stage.apply(StageIntent::Song(SongIntent::ZoomIn));
-            let _ = stage.apply(StageIntent::Song(SongIntent::ZoomIn));
+        let _ = stage.apply(StageIntent::Matrix);
+        if which.contains("scene") {
+            let _ = stage.apply(StageIntent::MatrixHead);
         }
-        if which.contains("meter") {
-            // A real denominator change inside the posed Song: enough to
-            // prove the ruler follows 7/8 beats, then restarts in 3/4.
-            let seven_eighths = daw::sequencing::TICKS_PER_BEAT * 7 / 2;
-            let _ = stage.song_mut().set_meter_mark(0, 7, 8);
-            let _ = stage.song_mut().set_meter_mark(seven_eighths * 2, 3, 4);
+    } else if which.contains("browser-sounds") {
+        // A drum lane over a small library: three kits under drum, one
+        // sound under plain, so the shelf shows the addressed lane first.
+        let library = std::env::temp_dir().join(format!("daw-shot-sounds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&library);
+        stage.song_mut().tracks[0].machine = None;
+        stage.song_mut().set_lane(0, daw::lane::Lane::Drum);
+        let kit = stage.song_mut().tracks[0]
+            .machine
+            .as_ref()
+            .map(|device| device.id)
+            .expect("the drum lane furnishes a kit");
+        for (name, pad) in [
+            ("eight oh eight", 3.0),
+            ("brushes", 0.0),
+            ("tape hits", 7.0),
+        ] {
+            if let Some(device) = stage.song_mut().device_mut(kit) {
+                device.set(daw::params::kit::PAD, pad);
+            }
+            let sound = daw::sound::Sound::capture(&stage.song_mut().tracks[0]);
+            let _ = daw::sound::save(&library, name, &sound);
         }
+        let mut plain = daw::sequencing::Song::default();
+        plain.tracks[0].machine = None;
+        let _ = daw::sound::save(
+            &library,
+            "empty slot",
+            &daw::sound::Sound::capture(&plain.tracks[0]),
+        );
+        stage.set_sound_library(library);
+        let _ = stage.apply(StageIntent::Browse);
     } else if which.contains("browser") {
         let _ = stage.apply(StageIntent::Browse);
     } else if which.contains("help") {
@@ -888,7 +1166,7 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
         for _ in 0..17 {
             let _ = stage.apply(StageIntent::Step(Step::Right));
         }
-    } else if which.contains("ring") {
+    } else if which.contains("ring") && !which.contains("deck") {
         // A carrier above the note, so the difference tones fold below
         // the fundamental and the scatter is plainly inharmonic.
         use daw::devices::DeviceKind;
@@ -1890,6 +2168,10 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
         if page != UtilityPage::Projects {
             stage.open_utility(page);
         }
+    }
+    // Any pose on the light ground: the gruvbox light theme reads.
+    if which.contains("light") {
+        stage.set_light_ground(true);
     }
     stage
 }

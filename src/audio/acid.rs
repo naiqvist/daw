@@ -55,6 +55,7 @@
 use crate::dsp::filters::{Mode as SvfMode, OnePole, Svf};
 use crate::dsp::osc::{MipOsc, Waveform, build_tables, table_len};
 use crate::dsp::shaper::{Mode as ShapeMode, Waveshaper};
+use crate::pages::{Hero, HeroMark, HeroSeries};
 use crate::params::acid as p;
 use crate::params::def;
 
@@ -457,12 +458,192 @@ impl AcidVoice {
     }
 }
 
+// ------------------------------------------------------------ pictures ---
+
+/// The hero picture for one of the acid's sub-pages, with the selected
+/// cell's contribution lit. Plain data the view draws; the arithmetic
+/// is the engine's own.
+pub fn hero(params: &AcidParams, subpage: &str, selected: Option<u32>) -> Option<Hero> {
+    match subpage {
+        "Acid" => Some(wave_picture(params, selected)),
+        "Filter" => Some(match selected {
+            Some(p::ENV_MOD | p::DECAY) => sweep_picture(params, selected),
+            _ => response_picture(params, selected),
+        }),
+        _ => None,
+    }
+}
+
+const POINTS: usize = 96;
+
+fn lit(selected: Option<u32>, ids: &[u32]) -> bool {
+    selected.is_some_and(|id| ids.contains(&id))
+}
+
+/// One cycle of the wave, through the drive: what the filter is fed.
+fn wave_picture(params: &AcidParams, selected: Option<u32>) -> Hero {
+    let mut shaper = Waveshaper::new();
+    shaper.configure(
+        ShapeMode::SoftClip,
+        1.0 + params.drive.clamp(0.0, 1.0) * (DRIVE_MAX - 1.0),
+        0.0,
+        1.0,
+    );
+    let square = params.square();
+    let points = (0..POINTS)
+        .map(|i| {
+            let x = i as f32 / (POINTS - 1) as f32;
+            let raw = if square {
+                if x < 0.5 { 1.0 } else { -1.0 }
+            } else {
+                2.0 * x - 1.0
+            };
+            (x, shaper.shape(raw).clamp(-1.0, 1.0) * 0.5 + 0.5)
+        })
+        .collect();
+    Hero {
+        waveform: None,
+        title: "WAVE · one cycle, driven".to_owned(),
+        series: vec![HeroSeries {
+            name: "wave",
+            points,
+            lit: lit(selected, &[p::WAVE, p::DRIVE]),
+        }],
+        marks: Vec::new(),
+        x_labels: ["0".to_owned(), "1 cycle".to_owned()],
+        y_labels: ["-1".to_owned(), "+1".to_owned()],
+        diagonal: false,
+    }
+}
+
+/// The cutoff over time after a hit: the envelope opens it by ENV MOD
+/// octaves and DECAY lets it fall. Hz on a log axis.
+fn sweep_picture(params: &AcidParams, selected: Option<u32>) -> Hero {
+    let span_ms = (params.decay_ms * 3.0).max(30.0);
+    let top = params.cutoff_hz * (params.env_mod * p::ENV_OCTAVES).exp2();
+    let lo = params.cutoff_hz * 0.5;
+    let hi = (top * 1.5).max(lo * 2.0);
+    let norm = |hz: f32| (hz.max(lo) / lo).ln() / (hi / lo).ln();
+    let points = (0..POINTS)
+        .map(|i| {
+            let x = i as f32 / (POINTS - 1) as f32;
+            let ms = x * span_ms;
+            let env = (-ms / params.decay_ms.max(1e-3)).exp();
+            let hz = params.cutoff_hz * (params.env_mod * env * p::ENV_OCTAVES).exp2();
+            (x, norm(hz))
+        })
+        .collect();
+    Hero {
+        waveform: None,
+        title: "SWEEP · Hz over ms".to_owned(),
+        series: vec![HeroSeries {
+            name: "cutoff",
+            points,
+            lit: true,
+        }],
+        marks: vec![HeroMark {
+            x: (params.decay_ms / span_ms).min(1.0),
+            label: format!("{:.0} ms", params.decay_ms),
+            lit: lit(selected, &[p::DECAY]),
+        }],
+        x_labels: ["0".to_owned(), format!("{span_ms:.0} ms")],
+        y_labels: [format!("{lo:.0} Hz"), format!("{hi:.0} Hz")],
+        diagonal: false,
+    }
+}
+
+/// The filter's magnitude response at rest, and where the envelope's
+/// peak takes it, on a log axis with the cutoff marked. Twelve decibels
+/// of resonant SVF and six of one-pole, as the engine runs them.
+fn response_picture(params: &AcidParams, selected: Option<u32>) -> Hero {
+    const LO: f32 = 20.0;
+    const HI: f32 = 20_000.0;
+    const DB_LO: f32 = -48.0;
+    const DB_HI: f32 = 24.0;
+    let res = params.resonance.clamp(0.0, 1.0);
+    let q = 0.7 + res * res * 12.0;
+    let curve = |cutoff: f32| -> Vec<(f32, f32)> {
+        (0..POINTS)
+            .map(|i| {
+                let x = i as f32 / (POINTS - 1) as f32;
+                let hz = LO * (HI / LO).powf(x);
+                let db = ladder_db(hz, cutoff, q);
+                (x, ((db - DB_LO) / (DB_HI - DB_LO)).clamp(0.0, 1.0))
+            })
+            .collect()
+    };
+    let peak = (params.cutoff_hz * (params.env_mod * p::ENV_OCTAVES).exp2()).min(HI);
+    Hero {
+        waveform: None,
+        title: "FILTER · dB over Hz".to_owned(),
+        series: vec![
+            HeroSeries {
+                name: "peak",
+                points: curve(peak),
+                lit: false,
+            },
+            HeroSeries {
+                name: "rest",
+                points: curve(params.cutoff_hz),
+                lit: true,
+            },
+        ],
+        marks: vec![HeroMark {
+            x: (params.cutoff_hz / LO).ln() / (HI / LO).ln(),
+            label: format!("{:.0} Hz", params.cutoff_hz),
+            lit: lit(selected, &[p::CUTOFF, p::RESONANCE]),
+        }],
+        x_labels: ["20 Hz".to_owned(), "20 kHz".to_owned()],
+        y_labels: [format!("{DB_LO:.0} dB"), format!("+{DB_HI:.0} dB")],
+        diagonal: false,
+    }
+}
+
+/// The analogue prototype of the engine's stack: a resonant two-pole
+/// low-pass at `cutoff` and a one-pole at 1.5× it.
+fn ladder_db(hz: f32, cutoff: f32, q: f32) -> f32 {
+    let x = hz / cutoff.max(1.0);
+    let re = 1.0 - x * x;
+    let im = x / q;
+    let svf = 1.0 / (re * re + im * im).sqrt().max(1e-9);
+    let y = hz / (cutoff * 1.5).max(1.0);
+    let pole = 1.0 / (1.0 + y * y).sqrt();
+    20.0 * (svf * pole).max(1e-9).log10()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
     const FS: f32 = 48_000.0;
+
+    #[test]
+    fn every_subpage_has_a_picture_in_the_unit_square() {
+        let params = AcidParams::default();
+        for (page, id) in [
+            ("Acid", p::DRIVE),
+            ("Acid", p::TUNE),
+            ("Filter", p::CUTOFF),
+            ("Filter", p::DECAY),
+        ] {
+            let hero = hero(&params, page, Some(id)).unwrap();
+            assert!(!hero.series.is_empty(), "{page} has no series");
+            for series in &hero.series {
+                assert!(series.points.len() >= 2);
+                assert!(
+                    series
+                        .points
+                        .iter()
+                        .all(|(x, y)| { (0.0..=1.0).contains(x) && (0.0..=1.0).contains(y) })
+                );
+            }
+        }
+        assert!(hero(&params, "Nowhere", None).is_none());
+        // The resonant peak stands above the pass band.
+        assert!(ladder_db(400.0, 400.0, 6.0) > ladder_db(40.0, 400.0, 6.0));
+        assert!(ladder_db(4_000.0, 400.0, 6.0) < -30.0);
+    }
 
     fn voice(params: AcidParams) -> AcidVoice {
         let mut v = AcidVoice::new();

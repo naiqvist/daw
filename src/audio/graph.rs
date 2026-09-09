@@ -818,6 +818,108 @@ one_shot_drum_voices!(crate::audio::snare::SnareVoice);
 one_shot_drum_voices!(crate::audio::tom::TomVoice);
 one_shot_drum_voices!(crate::audio::hat::HatVoice);
 one_shot_drum_voices!(crate::audio::handclap::HandclapVoice);
+one_shot_drum_voices!(crate::audio::drum::DrumVoice);
+
+/// THUMP as an instrument the pattern clock can play: a drum with a
+/// GATE, because its ADSR has a sustain. `note_off` and `release_all`
+/// let the gate down; there is one voice, so `note_on` never chooses.
+impl Voices for crate::audio::thump::ThumpVoice {
+    fn all_sound_off(&mut self) {
+        crate::audio::thump::ThumpVoice::reset(self);
+    }
+    fn release_all(&mut self) {
+        crate::audio::thump::ThumpVoice::release(self);
+    }
+    fn note_off(&mut self, _pitch: u8) {
+        crate::audio::thump::ThumpVoice::release(self);
+    }
+    fn note_on(&mut self, pitch: u8, vel: u8, _age: u64) {
+        crate::audio::thump::ThumpVoice::trigger(self, pitch, vel);
+    }
+    fn plock(&mut self, param: u32, value: Option<f32>) {
+        crate::audio::thump::ThumpVoice::plock(self, param, value);
+    }
+    fn plock_glide(&mut self, param: u32, alpha: f32) {
+        crate::audio::thump::ThumpVoice::plock_glide(self, param, alpha);
+    }
+    fn render(&mut self, out: &mut [f32], _at: usize, gain: &mut Ramp) {
+        for sample in out.iter_mut() {
+            *sample = 0.0;
+        }
+        crate::audio::thump::ThumpVoice::render_add(self, out, 1.0);
+        for sample in out.iter_mut() {
+            *sample *= gain.next();
+        }
+    }
+}
+
+/// CLAY: a struck voice that also answers the gate for FEED.
+impl Voices for crate::audio::clay::ClayVoice {
+    fn all_sound_off(&mut self) {
+        crate::audio::clay::ClayVoice::reset(self);
+    }
+    fn release_all(&mut self) {
+        crate::audio::clay::ClayVoice::release(self);
+    }
+    fn note_off(&mut self, _pitch: u8) {
+        crate::audio::clay::ClayVoice::release(self);
+    }
+    fn note_on(&mut self, pitch: u8, vel: u8, _age: u64) {
+        crate::audio::clay::ClayVoice::trigger(self, pitch, vel);
+    }
+    fn plock(&mut self, param: u32, value: Option<f32>) {
+        crate::audio::clay::ClayVoice::plock(self, param, value);
+    }
+    fn plock_glide(&mut self, param: u32, alpha: f32) {
+        crate::audio::clay::ClayVoice::plock_glide(self, param, alpha);
+    }
+    fn render(&mut self, out: &mut [f32], _at: usize, gain: &mut Ramp) {
+        for sample in out.iter_mut() {
+            *sample = 0.0;
+        }
+        crate::audio::clay::ClayVoice::render_add(self, out, 1.0);
+        for sample in out.iter_mut() {
+            *sample *= gain.next();
+        }
+    }
+}
+
+/// The new polyphonic machines share the clock contract; their DSP remains distinct.
+macro_rules! coverage_voices {
+    ($voice:ty) => {
+        impl Voices for $voice {
+            fn all_sound_off(&mut self) {
+                <$voice>::reset(self);
+            }
+            fn release_all(&mut self) {
+                <$voice>::release_all(self);
+            }
+            fn note_off(&mut self, pitch: u8) {
+                <$voice>::note_off(self, pitch);
+            }
+            fn note_on(&mut self, pitch: u8, vel: u8, age: u64) {
+                <$voice>::note_on(self, pitch, vel, age);
+            }
+            fn plock(&mut self, param: u32, value: Option<f32>) {
+                <$voice>::plock(self, param, value);
+            }
+            fn plock_glide(&mut self, param: u32, alpha: f32) {
+                <$voice>::plock_glide(self, param, alpha);
+            }
+            fn render(&mut self, out: &mut [f32], at: usize, gain: &mut Ramp) {
+                <$voice>::render(self, out, at, gain);
+            }
+        }
+    };
+}
+coverage_voices!(crate::audio::table::TableVoices);
+coverage_voices!(crate::audio::ring::RingVoices);
+coverage_voices!(crate::audio::prism_voice::PrismVoiceVoices);
+coverage_voices!(crate::audio::mass::MassVoices);
+coverage_voices!(crate::audio::pluck::PluckVoices);
+coverage_voices!(crate::audio::vox::VoxVoices);
+coverage_voices!(crate::audio::pipe::PipeVoices);
+coverage_voices!(crate::audio::glass::GlassVoices);
 
 impl Voices for crate::audio::poly::PolyVoices {
     fn all_sound_off(&mut self) {
@@ -2211,6 +2313,86 @@ pub enum Node {
         gain: f32,
         target_gain: f32,
     },
+    /// The DRUM voice: five models in one machine, the kick's shape.
+    Drum {
+        events: Vec<SeqEvent>,
+        clock: PatternClock,
+        voices: Box<crate::audio::drum::DrumVoice>,
+        gain: f32,
+        target_gain: f32,
+    },
+    /// THUMP, the kick machine: the same shape, with a gate.
+    Thump {
+        events: Vec<SeqEvent>,
+        clock: PatternClock,
+        voices: Box<crate::audio::thump::ThumpVoice>,
+        gain: f32,
+        target_gain: f32,
+    },
+    /// CLAY: the same shape, with a gate for FEED.
+    Clay {
+        events: Vec<SeqEvent>,
+        clock: PatternClock,
+        voices: Box<crate::audio::clay::ClayVoice>,
+        gain: f32,
+        target_gain: f32,
+    },
+    Table {
+        events: Vec<SeqEvent>,
+        clock: PatternClock,
+        voices: Box<crate::audio::table::TableVoices>,
+        gain: f32,
+        target_gain: f32,
+    },
+    Ring {
+        events: Vec<SeqEvent>,
+        clock: PatternClock,
+        voices: Box<crate::audio::ring::RingVoices>,
+        gain: f32,
+        target_gain: f32,
+    },
+    PrismVoice {
+        events: Vec<SeqEvent>,
+        clock: PatternClock,
+        voices: Box<crate::audio::prism_voice::PrismVoiceVoices>,
+        gain: f32,
+        target_gain: f32,
+    },
+    Mass {
+        events: Vec<SeqEvent>,
+        clock: PatternClock,
+        voices: Box<crate::audio::mass::MassVoices>,
+        gain: f32,
+        target_gain: f32,
+    },
+    Pluck {
+        events: Vec<SeqEvent>,
+        clock: PatternClock,
+        voices: Box<crate::audio::pluck::PluckVoices>,
+        gain: f32,
+        target_gain: f32,
+    },
+    Vox {
+        events: Vec<SeqEvent>,
+        clock: PatternClock,
+        voices: Box<crate::audio::vox::VoxVoices>,
+        gain: f32,
+        target_gain: f32,
+    },
+    Pipe {
+        events: Vec<SeqEvent>,
+        clock: PatternClock,
+        voices: Box<crate::audio::pipe::PipeVoices>,
+        gain: f32,
+        target_gain: f32,
+    },
+    Glass {
+        events: Vec<SeqEvent>,
+        clock: PatternClock,
+        voices: Box<crate::audio::glass::GlassVoices>,
+        gain: f32,
+        target_gain: f32,
+    },
     /// Modulato. Everything it owns is inside the effect; this arm is a
     /// wire and a discontinuity cut.
     Modulato {
@@ -2746,6 +2928,12 @@ pub enum Node {
 
 /// Everything a node may read besides its wired inputs: the device input and
 /// the transport, per segment.
+///
+/// `Copy`, so the walk can hand ONE node a segment that differs in a single
+/// flag without rebuilding the rest by hand — which is how a node that is
+/// new to the graph gets its seek while its neighbours are never told the
+/// sound stopped. See [`Schedule::adopt_state`].
+#[derive(Clone, Copy)]
 pub struct ProcessCtx<'a> {
     /// Planar device input for the WHOLE block: ch0 samples, then ch1, ...
     pub device_input: &'a [f32],
@@ -2787,6 +2975,9 @@ impl Node {
             | NodeSpec::Tom { .. }
             | NodeSpec::Hat { .. }
             | NodeSpec::Handclap { .. }
+            | NodeSpec::Drum { .. }
+            | NodeSpec::Thump { .. }
+            | NodeSpec::Clay { .. }
             | NodeSpec::Seq { .. } => 1,
             // Stereo: unison spread is a stereo idea, and a node's channel
             // count is fixed by its kind.
@@ -2794,6 +2985,14 @@ impl Node {
             // saturator that summed to mono would undo the spread.
             NodeSpec::Haze { .. }
             | NodeSpec::Loom { .. }
+            | NodeSpec::Table { .. }
+            | NodeSpec::Ring { .. }
+            | NodeSpec::PrismVoice { .. }
+            | NodeSpec::Mass { .. }
+            | NodeSpec::Pluck { .. }
+            | NodeSpec::Vox { .. }
+            | NodeSpec::Pipe { .. }
+            | NodeSpec::Glass { .. }
             | NodeSpec::Poly { .. }
             | NodeSpec::Tine { .. }
             | NodeSpec::Scomp { .. }
@@ -2860,6 +3059,7 @@ impl Node {
             Node::Quad { voices, .. } => Some(voices.readout()),
             Node::Brick { voices, .. } => Some(voices.readout()),
             Node::Kit { voices, .. } => Some(voices.readout()),
+            Node::Sampler { voices, .. } => Some(voices.readout()),
             Node::Prism { core } => Some(core.readout()),
             Node::Gate { core } => Some(core.readout()),
             Node::Section { core } => Some(core.readout()),
@@ -3437,6 +3637,167 @@ impl Node {
                 clock.run(voices.as_mut(), events, out.l, ctx, &mut ramp);
                 *gain = *target_gain;
             }
+            Node::Drum {
+                events,
+                clock,
+                voices,
+                gain,
+                target_gain,
+            } => {
+                let mut ramp = Ramp::across(*gain, *target_gain, out_len);
+                clock.run(voices.as_mut(), events, out.l, ctx, &mut ramp);
+                *gain = *target_gain;
+            }
+            Node::Thump {
+                events,
+                clock,
+                voices,
+                gain,
+                target_gain,
+            } => {
+                let mut ramp = Ramp::across(*gain, *target_gain, out_len);
+                clock.run(voices.as_mut(), events, out.l, ctx, &mut ramp);
+                *gain = *target_gain;
+            }
+            Node::Clay {
+                events,
+                clock,
+                voices,
+                gain,
+                target_gain,
+            } => {
+                let mut ramp = Ramp::across(*gain, *target_gain, out_len);
+                clock.run(voices.as_mut(), events, out.l, ctx, &mut ramp);
+                *gain = *target_gain;
+            }
+            Node::Table {
+                events,
+                clock,
+                voices,
+                gain,
+                target_gain,
+            } => {
+                let mut ramp = Ramp::across(*gain, *target_gain, out_len);
+                clock.run(voices.as_mut(), events, out.l, ctx, &mut ramp);
+                *gain = *target_gain;
+                if let Some(right) = out.r.as_deref_mut() {
+                    for (dst, src) in right.iter_mut().zip(voices.right(out_len)) {
+                        *dst = *src;
+                    }
+                }
+            }
+            Node::Ring {
+                events,
+                clock,
+                voices,
+                gain,
+                target_gain,
+            } => {
+                let mut ramp = Ramp::across(*gain, *target_gain, out_len);
+                clock.run(voices.as_mut(), events, out.l, ctx, &mut ramp);
+                *gain = *target_gain;
+                if let Some(right) = out.r.as_deref_mut() {
+                    for (dst, src) in right.iter_mut().zip(voices.right(out_len)) {
+                        *dst = *src;
+                    }
+                }
+            }
+            Node::PrismVoice {
+                events,
+                clock,
+                voices,
+                gain,
+                target_gain,
+            } => {
+                let mut ramp = Ramp::across(*gain, *target_gain, out_len);
+                clock.run(voices.as_mut(), events, out.l, ctx, &mut ramp);
+                *gain = *target_gain;
+                if let Some(right) = out.r.as_deref_mut() {
+                    for (dst, src) in right.iter_mut().zip(voices.right(out_len)) {
+                        *dst = *src;
+                    }
+                }
+            }
+            Node::Mass {
+                events,
+                clock,
+                voices,
+                gain,
+                target_gain,
+            } => {
+                let mut ramp = Ramp::across(*gain, *target_gain, out_len);
+                clock.run(voices.as_mut(), events, out.l, ctx, &mut ramp);
+                *gain = *target_gain;
+                if let Some(right) = out.r.as_deref_mut() {
+                    for (dst, src) in right.iter_mut().zip(voices.right(out_len)) {
+                        *dst = *src;
+                    }
+                }
+            }
+            Node::Pluck {
+                events,
+                clock,
+                voices,
+                gain,
+                target_gain,
+            } => {
+                let mut ramp = Ramp::across(*gain, *target_gain, out_len);
+                clock.run(voices.as_mut(), events, out.l, ctx, &mut ramp);
+                *gain = *target_gain;
+                if let Some(right) = out.r.as_deref_mut() {
+                    for (dst, src) in right.iter_mut().zip(voices.right(out_len)) {
+                        *dst = *src;
+                    }
+                }
+            }
+            Node::Vox {
+                events,
+                clock,
+                voices,
+                gain,
+                target_gain,
+            } => {
+                let mut ramp = Ramp::across(*gain, *target_gain, out_len);
+                clock.run(voices.as_mut(), events, out.l, ctx, &mut ramp);
+                *gain = *target_gain;
+                if let Some(right) = out.r.as_deref_mut() {
+                    for (dst, src) in right.iter_mut().zip(voices.right(out_len)) {
+                        *dst = *src;
+                    }
+                }
+            }
+            Node::Pipe {
+                events,
+                clock,
+                voices,
+                gain,
+                target_gain,
+            } => {
+                let mut ramp = Ramp::across(*gain, *target_gain, out_len);
+                clock.run(voices.as_mut(), events, out.l, ctx, &mut ramp);
+                *gain = *target_gain;
+                if let Some(right) = out.r.as_deref_mut() {
+                    for (dst, src) in right.iter_mut().zip(voices.right(out_len)) {
+                        *dst = *src;
+                    }
+                }
+            }
+            Node::Glass {
+                events,
+                clock,
+                voices,
+                gain,
+                target_gain,
+            } => {
+                let mut ramp = Ramp::across(*gain, *target_gain, out_len);
+                clock.run(voices.as_mut(), events, out.l, ctx, &mut ramp);
+                *gain = *target_gain;
+                if let Some(right) = out.r.as_deref_mut() {
+                    for (dst, src) in right.iter_mut().zip(voices.right(out_len)) {
+                        *dst = *src;
+                    }
+                }
+            }
 
             Node::Haze {
                 events,
@@ -3624,6 +3985,7 @@ impl Node {
                 if ctx.discontinuity {
                     preamp.reset();
                 }
+                voices.set_clock(ctx.beats_per_sample);
                 let mut ramp = Ramp::across(*gain, *target_gain, out_len);
                 clock.run(voices.as_mut(), events, out.l, ctx, &mut ramp);
                 *gain = *target_gain;
@@ -4700,7 +5062,18 @@ impl Node {
             | Node::Snare { clock, .. }
             | Node::Tom { clock, .. }
             | Node::Hat { clock, .. }
-            | Node::Handclap { clock, .. } => Some(clock),
+            | Node::Handclap { clock, .. }
+            | Node::Drum { clock, .. }
+            | Node::Thump { clock, .. }
+            | Node::Table { clock, .. }
+            | Node::Ring { clock, .. }
+            | Node::PrismVoice { clock, .. }
+            | Node::Mass { clock, .. }
+            | Node::Pluck { clock, .. }
+            | Node::Vox { clock, .. }
+            | Node::Pipe { clock, .. }
+            | Node::Glass { clock, .. }
+            | Node::Clay { clock, .. } => Some(clock),
             _ => None,
         }
     }
@@ -4852,6 +5225,105 @@ impl Node {
                 if param == crate::params::handclap::GAIN {
                     *target_gain = value;
                 }
+            }
+            Node::Drum {
+                voices,
+                target_gain,
+                ..
+            } => {
+                let Some(value) = crate::params::clamp(crate::params::drum::TABLE, param, value)
+                else {
+                    return;
+                };
+                voices.set_param(param, value);
+                if param == crate::params::drum::LEVEL {
+                    *target_gain = value;
+                }
+            }
+            Node::Thump {
+                voices,
+                target_gain,
+                ..
+            } => {
+                let Some(value) = crate::params::clamp(crate::params::thump::TABLE, param, value)
+                else {
+                    return;
+                };
+                voices.set_param(param, value);
+                if param == crate::params::thump::LEVEL {
+                    *target_gain = value;
+                }
+            }
+            Node::Clay {
+                voices,
+                target_gain,
+                ..
+            } => {
+                let Some(value) = crate::params::clamp(crate::params::clay::TABLE, param, value)
+                else {
+                    return;
+                };
+                voices.set_param(param, value);
+                if param == crate::params::clay::LEVEL {
+                    *target_gain = value;
+                }
+            }
+            Node::Table { voices, .. } => {
+                let Some(value) = crate::params::clamp(crate::params::table::TABLE, param, value)
+                else {
+                    return;
+                };
+                voices.set_param(param, value);
+            }
+            Node::Ring { voices, .. } => {
+                let Some(value) = crate::params::clamp(crate::params::ring::TABLE, param, value)
+                else {
+                    return;
+                };
+                voices.set_param(param, value);
+            }
+            Node::PrismVoice { voices, .. } => {
+                let Some(value) =
+                    crate::params::clamp(crate::params::prism_voice::TABLE, param, value)
+                else {
+                    return;
+                };
+                voices.set_param(param, value);
+            }
+            Node::Mass { voices, .. } => {
+                let Some(value) = crate::params::clamp(crate::params::mass::TABLE, param, value)
+                else {
+                    return;
+                };
+                voices.set_param(param, value);
+            }
+            Node::Pluck { voices, .. } => {
+                let Some(value) = crate::params::clamp(crate::params::pluck::TABLE, param, value)
+                else {
+                    return;
+                };
+                voices.set_param(param, value);
+            }
+            Node::Vox { voices, .. } => {
+                let Some(value) = crate::params::clamp(crate::params::vox::TABLE, param, value)
+                else {
+                    return;
+                };
+                voices.set_param(param, value);
+            }
+            Node::Pipe { voices, .. } => {
+                let Some(value) = crate::params::clamp(crate::params::pipe::TABLE, param, value)
+                else {
+                    return;
+                };
+                voices.set_param(param, value);
+            }
+            Node::Glass { voices, .. } => {
+                let Some(value) = crate::params::clamp(crate::params::glass::TABLE, param, value)
+                else {
+                    return;
+                };
+                voices.set_param(param, value);
             }
             // Every knob is a live letter. Rate, spread and feedback
             // rebuild a coefficient apiece, which is a bounded handful of
@@ -5886,6 +6358,72 @@ fn resolve_timeline_spec(
             subloops,
             loop_len_beats: None,
             ..
+        }
+        | NodeSpec::Drum {
+            notes,
+            subloops,
+            loop_len_beats: None,
+            ..
+        }
+        | NodeSpec::Thump {
+            notes,
+            subloops,
+            loop_len_beats: None,
+            ..
+        }
+        | NodeSpec::Table {
+            notes,
+            subloops,
+            loop_len_beats: None,
+            ..
+        }
+        | NodeSpec::Ring {
+            notes,
+            subloops,
+            loop_len_beats: None,
+            ..
+        }
+        | NodeSpec::PrismVoice {
+            notes,
+            subloops,
+            loop_len_beats: None,
+            ..
+        }
+        | NodeSpec::Mass {
+            notes,
+            subloops,
+            loop_len_beats: None,
+            ..
+        }
+        | NodeSpec::Pluck {
+            notes,
+            subloops,
+            loop_len_beats: None,
+            ..
+        }
+        | NodeSpec::Vox {
+            notes,
+            subloops,
+            loop_len_beats: None,
+            ..
+        }
+        | NodeSpec::Pipe {
+            notes,
+            subloops,
+            loop_len_beats: None,
+            ..
+        }
+        | NodeSpec::Glass {
+            notes,
+            subloops,
+            loop_len_beats: None,
+            ..
+        }
+        | NodeSpec::Clay {
+            notes,
+            subloops,
+            loop_len_beats: None,
+            ..
         } => rewrite_notes(notes, subloops),
         NodeSpec::AudioClip {
             start_beats,
@@ -6094,6 +6632,32 @@ pub struct Schedule {
     /// It is what a transport offsets its recording by and what a latency
     /// readout shows.
     latency: usize,
+    /// Per dense index: the dense index in the schedule this one REPLACES
+    /// whose node was compiled from an identical spec, or `None`.
+    ///
+    /// A swap used to end every sound in the song. The nodes of a new
+    /// schedule are built cold, so a reverb's tail, a filter's history and
+    /// a held note all stopped at the seam — and a trig edit recompiles
+    /// the whole graph to change the events of ONE node. The other sixty
+    /// are built from specs that did not move, and a node is built from
+    /// its spec alone, so those are interchangeable with the ones they
+    /// replace: they are MOVED across the seam instead, and only what is
+    /// genuinely new starts cold.
+    ///
+    /// Built green-side by [`GraphSpec::adoption_plan`], which compares
+    /// the two specs exactly. The callback does index arithmetic and no
+    /// comparison at all.
+    adopt: Vec<Option<u32>>,
+    /// The epoch [`Self::adopt`] was drawn up against. The plan is honoured
+    /// only when the schedule actually being displaced is that exact one,
+    /// so a push that never landed cannot move state between two graphs
+    /// that were never compared.
+    adopt_from: u64,
+    /// Per dense index: this node has yet to find its place on the
+    /// timeline. True for every node of a fresh schedule, cleared for the
+    /// ones carried across, and consumed by the first segment each node
+    /// runs — the seek a swap needs, given only to the nodes that need it.
+    seek_pending: Vec<bool>,
 }
 
 /// What one device has to say about itself over a block.
@@ -6442,6 +7006,59 @@ impl Schedule {
         self.modulation.adopt_continuity(&old.modulation);
     }
 
+    /// Green zone: hand this schedule the plan that lets it inherit live
+    /// state from the one it is about to replace, and name the epoch that
+    /// plan was drawn against. See [`GraphSpec::adoption_plan`].
+    pub fn set_adoption(&mut self, plan: Vec<Option<u32>>, from_epoch: u64) {
+        if plan.len() != self.nodes.len() {
+            return;
+        }
+        self.adopt = plan;
+        self.adopt_from = from_epoch;
+    }
+
+    /// Red zone: take the live state of every node the recompile left
+    /// alone. Returns how many were carried across.
+    ///
+    /// One pointer swap per node and no allocation: the retiring schedule
+    /// leaves holding the cold nodes this one arrived with, and is dropped
+    /// on the green thread like any other retirement. A node that comes
+    /// across keeps its voices, its filter histories and its place in the
+    /// pattern, so the seam is not heard at all.
+    ///
+    /// Refuses unless the plan was drawn against exactly this schedule.
+    /// The latency check is the second half of that: compensation rewrites
+    /// specs before they are compiled, and two graphs that agree node for
+    /// node agree about their deepest path too.
+    pub fn adopt_state(&mut self, old: &mut Schedule) -> usize {
+        if self.adopt.len() != self.nodes.len()
+            || old.epoch != self.adopt_from
+            || old.latency != self.latency
+        {
+            return 0;
+        }
+        let mut carried = 0;
+        for index in 0..self.nodes.len() {
+            let Some(from) = self.adopt[index] else {
+                continue;
+            };
+            let Some(source) = old.nodes.get_mut(from as usize) else {
+                continue;
+            };
+            // The plan is exact, so this can only fail for a caller who
+            // drew one against the wrong graph. Refusing costs a cold node
+            // and nothing else.
+            if std::mem::discriminant(&*source) != std::mem::discriminant(&self.nodes[index]) {
+                continue;
+            }
+            std::mem::swap(&mut self.nodes[index], source);
+            // It arrived knowing where it is. Only the newcomers seek.
+            self.seek_pending[index] = false;
+            carried += 1;
+        }
+        carried
+    }
+
     /// Red zone: deliver one modulation letter. The live door for knob
     /// drags on a wire's depth or an LFO's rate, which must be heard now
     /// rather than at the next debounced schedule swap.
@@ -6551,7 +7168,28 @@ impl Schedule {
                 (l, r)
             };
             let mut out = OutRef { l, r };
-            self.nodes[step.node].process(&gathered[..n_inputs], &mut out, ctx);
+            // A node that did not come across the last swap is new to the
+            // song and does not know where the transport is: it gets the
+            // discontinuity, which seeks its cursor and cuts voices it
+            // does not have. The nodes that DID come across are never told
+            // the sound stopped — that is the whole of what makes a
+            // recompile inaudible. A real transport discontinuity still
+            // reaches everyone, because it reaches them through `ctx`.
+            let seeking = self.seek_pending[step.node];
+            let seeded;
+            let node_ctx = if seeking && !ctx.discontinuity {
+                seeded = ProcessCtx {
+                    discontinuity: true,
+                    ..*ctx
+                };
+                &seeded
+            } else {
+                ctx
+            };
+            self.nodes[step.node].process(&gathered[..n_inputs], &mut out, node_ctx);
+            if seeking {
+                self.seek_pending[step.node] = false;
+            }
 
             // The effect locks this node's clock fired: delivered now,
             // before the nodes downstream render this block. A restore
@@ -6756,7 +7394,18 @@ impl NodeSpec {
             | NodeSpec::Snare { notes, .. }
             | NodeSpec::Tom { notes, .. }
             | NodeSpec::Hat { notes, .. }
-            | NodeSpec::Handclap { notes, .. } => Some(notes),
+            | NodeSpec::Handclap { notes, .. }
+            | NodeSpec::Drum { notes, .. }
+            | NodeSpec::Thump { notes, .. }
+            | NodeSpec::Table { notes, .. }
+            | NodeSpec::Ring { notes, .. }
+            | NodeSpec::PrismVoice { notes, .. }
+            | NodeSpec::Mass { notes, .. }
+            | NodeSpec::Pluck { notes, .. }
+            | NodeSpec::Vox { notes, .. }
+            | NodeSpec::Pipe { notes, .. }
+            | NodeSpec::Glass { notes, .. }
+            | NodeSpec::Clay { notes, .. } => Some(notes),
             _ => None,
         }
     }
@@ -7409,6 +8058,86 @@ pub enum NodeSpec {
         #[serde(default)]
         params: crate::audio::handclap::HandclapParams,
     },
+    /// The DRUM voice: one pattern, one one-shot voice, five models.
+    Drum {
+        notes: Vec<Note>,
+        subloops: Vec<SubLoop>,
+        loop_len_beats: Option<f64>,
+        #[serde(default)]
+        params: crate::audio::drum::DrumParams,
+    },
+    /// THUMP: one pattern, one gated kick voice.
+    Thump {
+        notes: Vec<Note>,
+        subloops: Vec<SubLoop>,
+        loop_len_beats: Option<f64>,
+        #[serde(default)]
+        params: crate::audio::thump::ThumpParams,
+    },
+    /// CLAY: one pattern, one voice that is any drum.
+    Clay {
+        notes: Vec<Note>,
+        subloops: Vec<SubLoop>,
+        loop_len_beats: Option<f64>,
+        #[serde(default)]
+        params: crate::audio::clay::ClayParams,
+    },
+    Table {
+        notes: Vec<Note>,
+        subloops: Vec<SubLoop>,
+        loop_len_beats: Option<f64>,
+        #[serde(default)]
+        params: crate::audio::table::TableParams,
+    },
+    Ring {
+        notes: Vec<Note>,
+        subloops: Vec<SubLoop>,
+        loop_len_beats: Option<f64>,
+        #[serde(default)]
+        params: crate::audio::ring::RingParams,
+    },
+    PrismVoice {
+        notes: Vec<Note>,
+        subloops: Vec<SubLoop>,
+        loop_len_beats: Option<f64>,
+        #[serde(default)]
+        params: crate::audio::prism_voice::PrismVoiceParams,
+    },
+    Mass {
+        notes: Vec<Note>,
+        subloops: Vec<SubLoop>,
+        loop_len_beats: Option<f64>,
+        #[serde(default)]
+        params: crate::audio::mass::MassParams,
+    },
+    Pluck {
+        notes: Vec<Note>,
+        subloops: Vec<SubLoop>,
+        loop_len_beats: Option<f64>,
+        #[serde(default)]
+        params: crate::audio::pluck::PluckParams,
+    },
+    Vox {
+        notes: Vec<Note>,
+        subloops: Vec<SubLoop>,
+        loop_len_beats: Option<f64>,
+        #[serde(default)]
+        params: crate::audio::vox::VoxParams,
+    },
+    Pipe {
+        notes: Vec<Note>,
+        subloops: Vec<SubLoop>,
+        loop_len_beats: Option<f64>,
+        #[serde(default)]
+        params: crate::audio::pipe::PipeParams,
+    },
+    Glass {
+        notes: Vec<Note>,
+        subloops: Vec<SubLoop>,
+        loop_len_beats: Option<f64>,
+        #[serde(default)]
+        params: crate::audio::glass::GlassParams,
+    },
     /// Modulato: chorus, flanger and vibrato, which are one effect.
     ///
     /// Stereo in, stereo out — the two sides run their own line and their
@@ -7483,7 +8212,18 @@ impl GraphSpec {
                 | NodeSpec::Snare { notes, .. }
                 | NodeSpec::Tom { notes, .. }
                 | NodeSpec::Hat { notes, .. }
-                | NodeSpec::Handclap { notes, .. } => swing_note_starts(notes, grid, swing),
+                | NodeSpec::Handclap { notes, .. }
+                | NodeSpec::Drum { notes, .. }
+                | NodeSpec::Thump { notes, .. }
+                | NodeSpec::Table { notes, .. }
+                | NodeSpec::Ring { notes, .. }
+                | NodeSpec::PrismVoice { notes, .. }
+                | NodeSpec::Mass { notes, .. }
+                | NodeSpec::Pluck { notes, .. }
+                | NodeSpec::Vox { notes, .. }
+                | NodeSpec::Pipe { notes, .. }
+                | NodeSpec::Glass { notes, .. }
+                | NodeSpec::Clay { notes, .. } => swing_note_starts(notes, grid, swing),
                 _ => {}
             }
         }
@@ -7700,6 +8440,14 @@ impl GraphSpec {
             // drift apart — and `audio::resyn` MEASURES that figure
             // rather than asserting it.
             NodeSpec::Resyn { .. } => crate::audio::resyn::LATENCY,
+            NodeSpec::Table { .. } => crate::audio::table::latency(sample_rate as f32),
+            NodeSpec::Ring { .. } => crate::audio::ring::latency(sample_rate as f32),
+            NodeSpec::PrismVoice { .. } => crate::audio::prism_voice::latency(sample_rate as f32),
+            NodeSpec::Mass { .. } => crate::audio::mass::latency(sample_rate as f32),
+            NodeSpec::Pluck { .. } => crate::audio::pluck::latency(sample_rate as f32),
+            NodeSpec::Vox { .. } => crate::audio::vox::latency(sample_rate as f32),
+            NodeSpec::Pipe { .. } => crate::audio::pipe::latency(sample_rate as f32),
+            NodeSpec::Glass { .. } => crate::audio::glass::latency(sample_rate as f32),
             NodeSpec::Sibyl { .. } => crate::audio::sibyl::LATENCY,
             NodeSpec::Umbra { .. } => crate::audio::umbra::LATENCY,
             // These console cores look ahead or frame audio and report a real
@@ -7908,6 +8656,45 @@ impl GraphSpec {
     /// name-tag directory. All allocation happens here, in the green zone.
     pub fn compile(&self, sample_rate: u32, block_frames: usize) -> Result<Schedule, CompileError> {
         self.compile_at_tempo(sample_rate, block_frames, 120.0)
+    }
+
+    /// Green zone: which of `prev`'s compiled nodes this spec's nodes may
+    /// inherit live state from, by dense index — the plan behind
+    /// [`Schedule::adopt_state`].
+    ///
+    /// A node qualifies when it is the SAME node, by permanent name tag,
+    /// compiled from an identical spec. `compile` builds a node from its
+    /// spec alone, so two such nodes differ in nothing but what they have
+    /// accumulated since, and the one already running is the better of the
+    /// two. Everything else — a node that is new, one whose spec moved,
+    /// one that changed places — is left to start cold.
+    ///
+    /// The rest of what a node is built from is the CALLER's to hold
+    /// still: sample rate, block size and tempo are compile inputs that
+    /// this cannot see, and a plan must not be offered across a change in
+    /// any of them.
+    ///
+    /// A CLAP node is excluded on purpose. Its spec describes the recipe
+    /// and not the plugin's own state, so two equal specs do not make two
+    /// interchangeable native instances.
+    pub fn adoption_plan(&self, prev: &GraphSpec) -> Vec<Option<u32>> {
+        let mut was_at: HashMap<NodeId, u32> = HashMap::with_capacity(prev.order.len());
+        for (dense, id) in prev.order.iter().enumerate() {
+            // A dense index has to fit the wire it travels on. A graph
+            // this large is not compilable for other reasons long before.
+            if let Ok(dense) = u32::try_from(dense) {
+                was_at.insert(*id, dense);
+            }
+        }
+        self.order
+            .iter()
+            .map(|id| {
+                let dense = was_at.get(id).copied()?;
+                let mine = self.nodes.get(id.0)?;
+                let theirs = prev.nodes.get(id.0)?;
+                (mine == theirs && !self.clap_factories.contains_key(id)).then_some(dense)
+            })
+            .collect()
     }
 
     /// Compile musical placement into timeline-sample stamps at `bpm`.
@@ -8451,6 +9238,337 @@ impl GraphSpec {
                             voices: Box::new(voices),
                             gain: 0.0,
                             target_gain: gain,
+                        }
+                    }
+                    Some(NodeSpec::Drum {
+                        notes,
+                        subloops,
+                        loop_len_beats,
+                        params,
+                    }) => {
+                        let events = compile_events(
+                            notes,
+                            subloops,
+                            *loop_len_beats,
+                            samples_per_beat,
+                            plock_glide_samples,
+                        )?;
+                        let mut voices = crate::audio::drum::DrumVoice::new();
+                        voices.prepare(sample_rate as f32, *params);
+                        let gain = if params.level.is_finite() {
+                            params.level.clamp(0.0, 2.0)
+                        } else {
+                            crate::audio::drum::DrumParams::default().level
+                        };
+                        Node::Drum {
+                            events,
+                            clock: PatternClock::new(
+                                loop_len_beats
+                                    .map(|len| (len * samples_per_beat).round().max(0.0) as u64)
+                                    .unwrap_or(0),
+                                samples_per_beat,
+                            ),
+                            voices: Box::new(voices),
+                            gain: 0.0,
+                            target_gain: gain,
+                        }
+                    }
+                    Some(NodeSpec::Thump {
+                        notes,
+                        subloops,
+                        loop_len_beats,
+                        params,
+                    }) => {
+                        let events = compile_events(
+                            notes,
+                            subloops,
+                            *loop_len_beats,
+                            samples_per_beat,
+                            plock_glide_samples,
+                        )?;
+                        let mut voices = crate::audio::thump::ThumpVoice::new();
+                        voices.prepare(sample_rate as f32, *params);
+                        let gain = if params.level.is_finite() {
+                            params.level.clamp(0.0, 2.0)
+                        } else {
+                            crate::audio::thump::ThumpParams::default().level
+                        };
+                        Node::Thump {
+                            events,
+                            clock: PatternClock::new(
+                                loop_len_beats
+                                    .map(|len| (len * samples_per_beat).round().max(0.0) as u64)
+                                    .unwrap_or(0),
+                                samples_per_beat,
+                            ),
+                            voices: Box::new(voices),
+                            gain: 0.0,
+                            target_gain: gain,
+                        }
+                    }
+                    Some(NodeSpec::Clay {
+                        notes,
+                        subloops,
+                        loop_len_beats,
+                        params,
+                    }) => {
+                        let events = compile_events(
+                            notes,
+                            subloops,
+                            *loop_len_beats,
+                            samples_per_beat,
+                            plock_glide_samples,
+                        )?;
+                        let mut voices = crate::audio::clay::ClayVoice::new();
+                        voices.prepare(sample_rate as f32, *params);
+                        let gain = if params.level.is_finite() {
+                            params.level.clamp(0.0, 2.0)
+                        } else {
+                            crate::audio::clay::ClayParams::default().level
+                        };
+                        Node::Clay {
+                            events,
+                            clock: PatternClock::new(
+                                loop_len_beats
+                                    .map(|len| (len * samples_per_beat).round().max(0.0) as u64)
+                                    .unwrap_or(0),
+                                samples_per_beat,
+                            ),
+                            voices: Box::new(voices),
+                            gain: 0.0,
+                            target_gain: gain,
+                        }
+                    }
+                    Some(NodeSpec::Table {
+                        notes,
+                        subloops,
+                        loop_len_beats,
+                        params,
+                    }) => {
+                        let events = compile_events(
+                            notes,
+                            subloops,
+                            *loop_len_beats,
+                            samples_per_beat,
+                            plock_glide_samples,
+                        )?;
+                        let mut voices = crate::audio::table::TableVoices::new();
+                        voices.prepare(sample_rate as f32, block_frames, *params);
+
+                        Node::Table {
+                            events,
+                            clock: PatternClock::new(
+                                loop_len_beats
+                                    .map(|len| (len * samples_per_beat).round().max(0.0) as u64)
+                                    .unwrap_or(0),
+                                samples_per_beat,
+                            ),
+                            voices: Box::new(voices),
+                            gain: 1.0,
+                            target_gain: 1.0,
+                        }
+                    }
+                    Some(NodeSpec::Ring {
+                        notes,
+                        subloops,
+                        loop_len_beats,
+                        params,
+                    }) => {
+                        let events = compile_events(
+                            notes,
+                            subloops,
+                            *loop_len_beats,
+                            samples_per_beat,
+                            plock_glide_samples,
+                        )?;
+                        let mut voices = crate::audio::ring::RingVoices::new();
+                        voices.prepare(sample_rate as f32, block_frames, *params);
+
+                        Node::Ring {
+                            events,
+                            clock: PatternClock::new(
+                                loop_len_beats
+                                    .map(|len| (len * samples_per_beat).round().max(0.0) as u64)
+                                    .unwrap_or(0),
+                                samples_per_beat,
+                            ),
+                            voices: Box::new(voices),
+                            gain: 1.0,
+                            target_gain: 1.0,
+                        }
+                    }
+                    Some(NodeSpec::PrismVoice {
+                        notes,
+                        subloops,
+                        loop_len_beats,
+                        params,
+                    }) => {
+                        let events = compile_events(
+                            notes,
+                            subloops,
+                            *loop_len_beats,
+                            samples_per_beat,
+                            plock_glide_samples,
+                        )?;
+                        let mut voices = crate::audio::prism_voice::PrismVoiceVoices::new();
+                        voices.prepare(sample_rate as f32, block_frames, *params);
+
+                        Node::PrismVoice {
+                            events,
+                            clock: PatternClock::new(
+                                loop_len_beats
+                                    .map(|len| (len * samples_per_beat).round().max(0.0) as u64)
+                                    .unwrap_or(0),
+                                samples_per_beat,
+                            ),
+                            voices: Box::new(voices),
+                            gain: 1.0,
+                            target_gain: 1.0,
+                        }
+                    }
+                    Some(NodeSpec::Mass {
+                        notes,
+                        subloops,
+                        loop_len_beats,
+                        params,
+                    }) => {
+                        let events = compile_events(
+                            notes,
+                            subloops,
+                            *loop_len_beats,
+                            samples_per_beat,
+                            plock_glide_samples,
+                        )?;
+                        let mut voices = crate::audio::mass::MassVoices::new();
+                        voices.prepare(sample_rate as f32, block_frames, *params);
+
+                        Node::Mass {
+                            events,
+                            clock: PatternClock::new(
+                                loop_len_beats
+                                    .map(|len| (len * samples_per_beat).round().max(0.0) as u64)
+                                    .unwrap_or(0),
+                                samples_per_beat,
+                            ),
+                            voices: Box::new(voices),
+                            gain: 1.0,
+                            target_gain: 1.0,
+                        }
+                    }
+                    Some(NodeSpec::Pluck {
+                        notes,
+                        subloops,
+                        loop_len_beats,
+                        params,
+                    }) => {
+                        let events = compile_events(
+                            notes,
+                            subloops,
+                            *loop_len_beats,
+                            samples_per_beat,
+                            plock_glide_samples,
+                        )?;
+                        let mut voices = crate::audio::pluck::PluckVoices::new();
+                        voices.prepare(sample_rate as f32, block_frames, *params);
+
+                        Node::Pluck {
+                            events,
+                            clock: PatternClock::new(
+                                loop_len_beats
+                                    .map(|len| (len * samples_per_beat).round().max(0.0) as u64)
+                                    .unwrap_or(0),
+                                samples_per_beat,
+                            ),
+                            voices: Box::new(voices),
+                            gain: 1.0,
+                            target_gain: 1.0,
+                        }
+                    }
+                    Some(NodeSpec::Vox {
+                        notes,
+                        subloops,
+                        loop_len_beats,
+                        params,
+                    }) => {
+                        let events = compile_events(
+                            notes,
+                            subloops,
+                            *loop_len_beats,
+                            samples_per_beat,
+                            plock_glide_samples,
+                        )?;
+                        let mut voices = crate::audio::vox::VoxVoices::new();
+                        voices.prepare(sample_rate as f32, block_frames, *params);
+
+                        Node::Vox {
+                            events,
+                            clock: PatternClock::new(
+                                loop_len_beats
+                                    .map(|len| (len * samples_per_beat).round().max(0.0) as u64)
+                                    .unwrap_or(0),
+                                samples_per_beat,
+                            ),
+                            voices: Box::new(voices),
+                            gain: 1.0,
+                            target_gain: 1.0,
+                        }
+                    }
+                    Some(NodeSpec::Pipe {
+                        notes,
+                        subloops,
+                        loop_len_beats,
+                        params,
+                    }) => {
+                        let events = compile_events(
+                            notes,
+                            subloops,
+                            *loop_len_beats,
+                            samples_per_beat,
+                            plock_glide_samples,
+                        )?;
+                        let mut voices = crate::audio::pipe::PipeVoices::new();
+                        voices.prepare(sample_rate as f32, block_frames, *params);
+
+                        Node::Pipe {
+                            events,
+                            clock: PatternClock::new(
+                                loop_len_beats
+                                    .map(|len| (len * samples_per_beat).round().max(0.0) as u64)
+                                    .unwrap_or(0),
+                                samples_per_beat,
+                            ),
+                            voices: Box::new(voices),
+                            gain: 1.0,
+                            target_gain: 1.0,
+                        }
+                    }
+                    Some(NodeSpec::Glass {
+                        notes,
+                        subloops,
+                        loop_len_beats,
+                        params,
+                    }) => {
+                        let events = compile_events(
+                            notes,
+                            subloops,
+                            *loop_len_beats,
+                            samples_per_beat,
+                            plock_glide_samples,
+                        )?;
+                        let mut voices = crate::audio::glass::GlassVoices::new();
+                        voices.prepare(sample_rate as f32, block_frames, *params);
+
+                        Node::Glass {
+                            events,
+                            clock: PatternClock::new(
+                                loop_len_beats
+                                    .map(|len| (len * samples_per_beat).round().max(0.0) as u64)
+                                    .unwrap_or(0),
+                                samples_per_beat,
+                            ),
+                            voices: Box::new(voices),
+                            gain: 1.0,
+                            target_gain: 1.0,
                         }
                     }
                     Some(NodeSpec::Haze {
@@ -9679,6 +10797,11 @@ impl GraphSpec {
             epoch: next_schedule_epoch(),
             timeline: timeline.cloned(),
             nodes,
+            // Nothing is inherited until a caller draws up a plan, and
+            // every node of a schedule nobody has vouched for is new.
+            adopt: Vec::new(),
+            adopt_from: 0,
+            seek_pending: vec![true; n],
             steps,
             arena: Arena::new(num_slots.max(1), block_frames),
             output_slot,
@@ -9905,6 +11028,7 @@ mod tests {
         spec.set_output(mix);
         spec.lock_base(mix, crate::params::mixer::GAIN, 0.5);
         spec.set_modulation(ModSpec {
+            retrigs: Vec::new(),
             sources: vec![Modulator {
                 id: 1,
                 kind: ModKind::Lfo {
@@ -10298,6 +11422,7 @@ mod tests {
             solo: false,
         };
         spec.set_modulation(ModSpec {
+            retrigs: Vec::new(),
             sources,
             wires: vec![wire(10, 1), wire(11, 2), wire(12, 3)],
         });
@@ -10393,6 +11518,7 @@ mod tests {
             spec.connect(sine, mix);
             spec.set_output(mix);
             spec.set_modulation(ModSpec {
+                retrigs: Vec::new(),
                 sources: vec![Modulator {
                     id: 1,
                     // Square at a whole-beat rate: the modulation offset
@@ -11079,6 +12205,145 @@ mod tests {
         };
         sched.run(&mut after, &c2);
         assert!(after[..256].iter().all(|s| s.abs() == 0.0));
+    }
+
+    /// Two sines and a mixer, so a compile has something with a phase and
+    /// a ramp in it to carry.
+    fn ramp_graph(freq: f32) -> GraphSpec {
+        let mut spec = GraphSpec::default();
+        let sine = spec.push(NodeSpec::Sine { freq, amp: 0.5 });
+        let mix = spec.push(NodeSpec::Mixer { gain: 1.0 });
+        spec.connect(sine, mix);
+        spec.set_output(mix);
+        spec
+    }
+
+    /// A schedule that has been playing long enough to be past its
+    /// ramp-in, and the spec it was compiled from.
+    fn warmed(freq: f32) -> (GraphSpec, Schedule) {
+        let spec = ramp_graph(freq);
+        let mut sched = spec.compile(48_000, 256).expect("compile");
+        let mut out = vec![0.0f32; 512];
+        for _ in 0..8 {
+            run(&mut sched, &mut out);
+        }
+        assert!(out[0].abs() > 0.1, "the graph never got going: {}", out[0]);
+        (spec, sched)
+    }
+
+    /// A recompile is how a trig, a note length and a p-lock reach the
+    /// engine, and it used to end every sound in the song: the new
+    /// schedule's nodes were built cold and the swap announced a
+    /// discontinuity to all of them. A node whose spec did not move is
+    /// carried across instead, phase, ramp and all.
+    #[test]
+    fn a_node_the_recompile_left_alone_plays_through_the_swap() {
+        let (before, mut old) = warmed(220.0);
+        // The same graph, compiled again: what an edit somewhere else in
+        // the song does to every node it did not touch.
+        let after = ramp_graph(220.0);
+        let mut carried = after.compile(48_000, 256).expect("compile");
+        carried.set_adoption(after.adoption_plan(&before), old.epoch());
+
+        assert_eq!(carried.adopt_state(&mut old), 2, "both nodes should ride");
+        assert_eq!(
+            carried.seek_pending,
+            vec![false, false],
+            "a node that came across still asked for a seek"
+        );
+        let mut out = vec![0.0f32; 512];
+        run(&mut carried, &mut out);
+        assert!(
+            out[0].abs() > 0.1,
+            "the swap restarted a node it had carried: {}",
+            out[0]
+        );
+    }
+
+    /// The other half of the same rule: what genuinely changed starts
+    /// cold, and says so, so that its cursor is seeked rather than left
+    /// at event zero.
+    #[test]
+    fn a_node_whose_spec_moved_starts_cold_and_seeks() {
+        let (before, mut old) = warmed(220.0);
+        let after = ramp_graph(330.0);
+        let mut fresh = after.compile(48_000, 256).expect("compile");
+        fresh.set_adoption(after.adoption_plan(&before), old.epoch());
+
+        assert_eq!(
+            fresh.adopt_state(&mut old),
+            1,
+            "only the untouched mixer should ride"
+        );
+        assert_eq!(
+            fresh.seek_pending,
+            vec![true, false],
+            "the changed node must be the one that seeks"
+        );
+        let mut out = vec![0.0f32; 512];
+        run(&mut fresh, &mut out);
+        assert_eq!(out[0], 0.0, "a cold node did not ramp in from silence");
+        assert!(
+            fresh.seek_pending.iter().all(|pending| !pending),
+            "a seek outlived the segment that served it"
+        );
+    }
+
+    /// A schedule nobody vouched for inherits nothing — and every node of
+    /// it seeks, which is what stops a fresh sequencer cursor firing the
+    /// whole elapsed arrangement into one callback.
+    #[test]
+    fn a_plan_drawn_against_another_graph_is_refused() {
+        let (before, mut old) = warmed(220.0);
+        let after = ramp_graph(220.0);
+
+        let mut unvouched = after.compile(48_000, 256).expect("compile");
+        assert_eq!(unvouched.adopt_state(&mut old), 0, "no plan, no adoption");
+        assert_eq!(unvouched.seek_pending, vec![true, true]);
+
+        let mut wrong = after.compile(48_000, 256).expect("compile");
+        wrong.set_adoption(after.adoption_plan(&before), old.epoch().wrapping_add(1));
+        assert_eq!(
+            wrong.adopt_state(&mut old),
+            0,
+            "state moved between two graphs that were never compared"
+        );
+
+        let mut short = after.compile(48_000, 256).expect("compile");
+        short.set_adoption(vec![Some(0)], old.epoch());
+        assert_eq!(
+            short.adopt_state(&mut old),
+            0,
+            "a plan that does not cover the graph was honoured"
+        );
+    }
+
+    /// The plan is about the node, not merely the slot: a node that is new
+    /// to the graph is not handed the state of whoever now sits where it
+    /// does.
+    #[test]
+    fn adoption_follows_the_node_and_not_its_place() {
+        let before = ramp_graph(220.0);
+        let mut after = ramp_graph(220.0);
+        // A second source in front of the others: everything that already
+        // existed keeps its state, the newcomer has none to keep.
+        let extra = after.push(NodeSpec::Sine {
+            freq: 440.0,
+            amp: 0.25,
+        });
+        let plan = after.adoption_plan(&before);
+        assert_eq!(
+            plan.len(),
+            3,
+            "the plan must answer for every node in the new graph"
+        );
+        assert_eq!(plan[2], None, "the new node was handed someone's state");
+        assert_eq!(
+            (plan[0], plan[1]),
+            (Some(0), Some(1)),
+            "the nodes that did not move were not recognised"
+        );
+        let _ = extra;
     }
 
     #[test]
@@ -16042,6 +17307,8 @@ mod tests {
         assert_eq!(offs(&first), ons(&first), "an off fired without its on");
         let second = run_cycles(&mk(Some((2, 2)), 1.0), 4);
         assert_eq!(ons(&second), 2, "2:2 over four cycles: {second:?}");
+        let second_of_four = run_cycles(&mk(Some((2, 4)), 1.0), 8);
+        assert_eq!(ons(&second_of_four), 2, "2:4 over eight cycles");
         let last_of_four = run_cycles(&mk(Some((4, 4)), 1.0), 8);
         assert_eq!(ons(&last_of_four), 2, "4:4 over eight cycles");
 

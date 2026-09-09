@@ -131,6 +131,34 @@ impl Sentence {
                 return Some(utterance);
             }
         }
+        // Held T is a pitch qualifier on the arrows: Up and Down move a
+        // semitone while T is down, an octave while Shift is down with
+        // it, and they keep doing so on every press and repeat for as
+        // long as the key is held. The press of T itself was already
+        // spoken above as the pending verb; here it is the hand still on
+        // the key that matters, so the pending word is dropped rather
+        // than doubled.
+        if ctx.input(|input| input.key_down(egui::Key::T)) {
+            for (key, motion) in ARROWS {
+                if !matches!(motion, Motion::Up | Motion::Down) {
+                    continue;
+                }
+                let octave = ctx.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, key));
+                if octave || ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, key)) {
+                    self.pending = None;
+                    return Some(Utterance {
+                        count: self.take_count(),
+                        verb: Some(if octave {
+                            Verb::Octave
+                        } else {
+                            Verb::Transpose
+                        }),
+                        motion: Some(motion),
+                        held: false,
+                    });
+                }
+            }
+        }
         for (key, motion) in ARROWS {
             if ctx.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, key)) {
                 return Some(self.feed_motion(motion, true));
@@ -229,6 +257,98 @@ impl Sentence {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key_event(key: egui::Key, pressed: bool, repeat: bool, shift: bool) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat,
+            modifiers: if shift {
+                egui::Modifiers::SHIFT
+            } else {
+                egui::Modifiers::NONE
+            },
+        }
+    }
+
+    /// One frame of keys through the sentence, as the panel would feed
+    /// them.
+    fn frame(
+        ctx: &egui::Context,
+        sentence: &mut Sentence,
+        events: Vec<egui::Event>,
+    ) -> Option<Utterance> {
+        let mut spoken = None;
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                events,
+                ..egui::RawInput::default()
+            },
+            |ui| spoken = Some(sentence.consume(ui.ctx())),
+        );
+        out.textures_delta.clear();
+        spoken.expect("the sentence was consulted")
+    }
+
+    /// Held T rides the arrows: every Down while T is down is a
+    /// semitone, with Shift an octave, repeats included; the moment T is
+    /// let go the arrows walk again.
+    #[test]
+    fn held_t_transposes_on_every_arrow_until_released() {
+        let ctx = egui::Context::default();
+        let mut sentence = Sentence::default();
+
+        // The press itself is the pending verb, spoken to nobody yet.
+        assert_eq!(
+            frame(
+                &ctx,
+                &mut sentence,
+                vec![key_event(egui::Key::T, true, false, false)]
+            ),
+            None
+        );
+        let down = |repeat| key_event(egui::Key::ArrowDown, true, repeat, false);
+        let first = frame(&ctx, &mut sentence, vec![down(false)]).expect("spoken");
+        assert_eq!(first.verb, Some(Verb::Transpose));
+        assert_eq!(first.motion, Some(Motion::Down));
+        assert!(sentence.is_empty(), "the pending word is not doubled");
+
+        // A repeat while T is still down is another semitone.
+        let again = frame(&ctx, &mut sentence, vec![down(true)]).expect("spoken");
+        assert_eq!(again.verb, Some(Verb::Transpose));
+        assert_eq!(again.count, 1);
+
+        // Shift with it: an octave.
+        let octave = frame(
+            &ctx,
+            &mut sentence,
+            vec![key_event(egui::Key::ArrowDown, true, false, true)],
+        )
+        .expect("spoken");
+        assert_eq!(octave.verb, Some(Verb::Octave));
+        assert_eq!(octave.motion, Some(Motion::Down));
+
+        // Sideways is not a pitch: the arrow walks as it always did.
+        let walk = frame(
+            &ctx,
+            &mut sentence,
+            vec![key_event(egui::Key::ArrowLeft, true, false, false)],
+        )
+        .expect("spoken");
+        assert_eq!(walk.verb, None);
+        assert_eq!(walk.motion, Some(Motion::Left));
+
+        // T released: Down is a walk again.
+        frame(
+            &ctx,
+            &mut sentence,
+            vec![key_event(egui::Key::T, false, false, false)],
+        );
+        let plain = frame(&ctx, &mut sentence, vec![down(false)]).expect("spoken");
+        assert_eq!(plain.verb, None);
+        assert_eq!(plain.motion, Some(Motion::Down));
+    }
 
     #[test]
     fn digits_accumulate_into_one_count() {

@@ -131,9 +131,23 @@ struct Face<'a> {
     armed: bool,
     recording: bool,
     input: Option<String>,
+    /// The lane's word and hue, when the track has a design.
+    lane: Option<(&'static str, egui::Color32)>,
     sounding: bool,
     standing: Standing,
     key: chassis::Key,
+}
+
+/// What a head wears for its lane: the word in the lane's hue, or
+/// nothing for a plain lane.
+fn lane_badge(
+    lane: crate::lane::Lane,
+    c: &palette::Colours,
+) -> Option<(&'static str, egui::Color32)> {
+    match lane {
+        crate::lane::Lane::Plain => None,
+        crate::lane::Lane::Drum => Some((lane.word(), c.drum)),
+    }
 }
 
 impl Stage {
@@ -167,6 +181,7 @@ impl Stage {
                 recording: self.recording() && head.armed,
                 input: (head.kind == crate::sequencing::TrackKind::Audio)
                     .then(|| format!("{} {}", head.input.label(), head.monitor.label())),
+                lane: lane_badge(head.lane, &palette::colours()),
                 sounding: self.playing.get(track).copied().flatten().is_some(),
                 standing: standing(address, Some(track)),
                 key: match (track == first, track == last) {
@@ -187,6 +202,7 @@ impl Stage {
             armed: false,
             recording: false,
             input: None,
+            lane: None,
             sounding: false,
             standing: standing(address, None),
             key: chassis::Key::Right,
@@ -251,6 +267,23 @@ impl Stage {
                 font.clone(),
                 if face.armed { c.alert } else { c.label },
             );
+        } else if let Some((word, hue)) = face.lane {
+            // The lane's badge: its word in its hue at the row's right
+            // end, and a hairline of the same hue along the plate's top
+            // inside edge, so the kind reads at a glance from across the
+            // strip before the word is read at all.
+            painter.text(
+                egui::pos2(inner.max.x, inner.min.y + TYPE_PX + 4.0),
+                egui::Align2::RIGHT_TOP,
+                word,
+                font.clone(),
+                hue,
+            );
+            let band = egui::Rect::from_min_max(
+                egui::pos2(inner.min.x, rect.min.y),
+                egui::pos2(inner.max.x, rect.min.y + 2.0),
+            );
+            painter.rect_filled(band, 0.0, hue);
         }
 
         // Track recording is independent of session-to-song capture. Both

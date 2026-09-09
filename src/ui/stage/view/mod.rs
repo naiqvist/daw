@@ -16,6 +16,7 @@ mod brick_card;
 mod browser;
 mod callouts;
 mod chassis;
+mod deck;
 mod desk;
 mod face;
 mod faces;
@@ -25,8 +26,11 @@ mod help;
 mod input;
 mod inspector;
 mod kit_card;
+mod lab;
 mod lattice;
 mod log;
+mod matrix;
+mod midi_lab;
 mod mixer;
 mod modulation;
 mod palette;
@@ -35,6 +39,8 @@ mod room;
 mod sample;
 mod sampler_card;
 mod scomp_card;
+#[cfg(test)]
+mod slice_tests;
 mod song;
 mod stab_card;
 mod status;
@@ -58,9 +64,11 @@ use eframe::egui;
 /// needs to move to keep the cursor in sight.
 const HOLDS_EVERYTHING: usize = usize::MAX;
 
-/// Timeline statements exposed by the command centre. The palette owns
+/// Typed statements exposed by the command centre. The palette owns
 /// discovery and text entry; parsing and mutation stay in the stage core.
-const TIMELINE_COMMANDS: [crate::ui::palette::TypedCommand; 2] = [
+/// Two speak to the timeline at the cursor's tick; `lane` and `sound`
+/// speak to the cursor's track; `swing` and `scale` to the open clip.
+const TIMELINE_COMMANDS: [crate::ui::palette::TypedCommand; 8] = [
     crate::ui::palette::TypedCommand {
         name: "tempo",
         usage: "tempo <bpm>  |  tempo clear",
@@ -69,11 +77,36 @@ const TIMELINE_COMMANDS: [crate::ui::palette::TypedCommand; 2] = [
         name: "meter",
         usage: "meter <N>/<D>  |  meter clear",
     },
+    crate::ui::palette::TypedCommand {
+        name: "lane",
+        usage: "lane drum  |  lane clear",
+    },
+    crate::ui::palette::TypedCommand {
+        name: "midi",
+        usage: "midi <clip tag>  |  midi a1",
+    },
+    crate::ui::palette::TypedCommand {
+        name: "lab",
+        usage: "lab",
+    },
+    crate::ui::palette::TypedCommand {
+        name: "sound",
+        usage: "sound save <name>  |  sound load <name>  |  sound rename <old> <new>",
+    },
+    crate::ui::palette::TypedCommand {
+        name: "swing",
+        usage: "swing <50..80>  |  swing clear",
+    },
+    crate::ui::palette::TypedCommand {
+        name: "scale",
+        usage: "scale 1/8 1/4 1/2 3/4 1 3/2 2 4 8  |  scale clear",
+    },
 ];
 
 /// The window carved: a title row, the field, a status strip.
 struct Layout {
     title: egui::Rect,
+    deck: egui::Rect,
     field: egui::Rect,
     tray: egui::Rect,
     status: egui::Rect,
@@ -85,9 +118,13 @@ impl Layout {
         let status_h = status::status_h();
         let title =
             egui::Rect::from_min_max(whole.min, egui::pos2(whole.max.x, whole.min.y + title_h));
+        let deck = egui::Rect::from_min_max(
+            title.left_bottom(),
+            egui::pos2(whole.max.x, title.max.y + deck::deck_h()),
+        );
         let status =
             egui::Rect::from_min_max(egui::pos2(whole.min.x, whole.max.y - status_h), whole.max);
-        let band = egui::Rect::from_min_max(title.left_bottom(), status.right_top());
+        let band = egui::Rect::from_min_max(deck.left_bottom(), status.right_top());
         // The tray is cut off the FOOT of the band, fixed: the session
         // above keeps its shape whether or not the tray has a clip.
         let tray_top = (band.max.y - tray::tray_h()).max(band.min.y);
@@ -95,6 +132,7 @@ impl Layout {
         let tray = egui::Rect::from_min_max(egui::pos2(band.min.x, tray_top), band.max);
         Self {
             title,
+            deck,
             field,
             tray,
             status,
@@ -164,6 +202,10 @@ impl Stage {
             }
         }
         self.begin_frame();
+        if self.poll_kiln() {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(16));
+        }
         if self.poll_library() {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(50));
@@ -171,12 +213,16 @@ impl Stage {
         // A utility room is a true modal: it gets the frame's keyboard
         // before the musical surface and may close itself with Escape.
         self.update_utility(ui.ctx());
+        // The console's colours follow the ground: the light file reads
+        // while the ground is turned over.
+        palette::set_polarity(self.polarity);
         let utility_open = self.utility.is_open();
 
         // `:` summons the palette. Checked before anything else reads the
         // keyboard, and not while it is already open, so a held key
         // cannot reset what has been typed into it.
         if !utility_open
+            && !ui.ctx().egui_wants_keyboard_input()
             && !self.palette.is_open()
             && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Colon))
         {
@@ -215,12 +261,13 @@ impl Stage {
                 )
             })
         });
-        let inputs = if palette_open {
+        let inputs = if palette_open || (self.lab.open && ui.ctx().egui_wants_keyboard_input()) {
             Vec::new()
         } else {
             ui.input_mut(|input| {
                 let chords = input::consume_chords(input, scope, |modifiers, key| {
-                    grammar_owns_escape && modifiers == Mods::NONE && key == Key::Escape
+                    (grammar_owns_escape && modifiers == Mods::NONE && key == Key::Escape)
+                    || matches!(keymap::dispatch(scope,keymap::StageInput::Chord(modifiers,key)),Some(StageIntent::HeroTool(verb)) if !self.deck_hero_tools().iter().any(|t|t.verb==verb))
                 });
                 let pressed = |wanted: Key| chords.iter().any(|(_, key)| *key == wanted);
                 let questionmark_consumed = pressed(Key::Questionmark);
@@ -250,6 +297,15 @@ impl Stage {
         };
         let bound: Vec<keymap::StageInput> = inputs.clone();
         self.take_inputs(inputs, selection_held, selection_pressed);
+        let step_mask = if palette_open {
+            self.steps.map_or(0, |steps| steps.held)
+        } else {
+            ui.input(input::step_mask)
+        };
+        // Real elapsed time, not the predicted frame: the view repaints
+        // slowly at rest, and a hold is measured against the clock.
+        let frame_dt = ui.input(|input| input.unstable_dt.min(1.0));
+        self.steps_frame_timed(step_mask, frame_dt);
 
         // Inside a clip, the letters may be pitches. Read after the
         // stage's own chords, so `^T` is never read as a T.
@@ -282,7 +338,7 @@ impl Stage {
             let facts = telemetry::Was_::new(
                 self.transport.motion(),
                 &self.playing,
-                self.inside.map(|o| (o.pattern.0, o.track)),
+                self.inside.map(|o| (self.song.tag_of(o.pattern), o.track)),
                 self.chain.is_some(),
                 self.browser.is_some(),
                 self.help,
@@ -299,6 +355,10 @@ impl Stage {
                 self.notice.clone(),
             );
             telemetry().observe(dt, &bound, facts, master.left.max(master.right));
+            // What the last open dropped, one line each, once.
+            for line in self.take_migration_log() {
+                telemetry().dropped(line);
+            }
         }
         // The refusal is drawn where it happened: the wall the cursor
         // pressed against lights on the mark itself, not only named on
@@ -362,23 +422,35 @@ impl Stage {
         painter.rect_filled(whole, 0.0, palette::colours().ground);
         let layout = Layout::of(whole);
         let modulation_room = egui::Rect::from_min_max(layout.field.min, layout.tray.max);
+        // The lab is a full-screen mode: one room from the title to the
+        // status line, with no deck strip and no tray under it.
+        let lab_room = egui::Rect::from_min_max(layout.deck.min, layout.status.right_top());
         // The field is registered to the glass: marks at its corners.
         chassis::marks(
             &painter,
             if self.modulation.is_some() {
                 modulation_room.shrink(4.0)
+            } else if self.lab.open {
+                lab_room.shrink(4.0)
             } else {
                 layout.field.shrink(4.0)
             },
             10.0,
         );
         self.draw_title(&painter, layout.title);
+        if !self.lab.open {
+            self.draw_deck(&painter, layout.deck);
+        }
         let anchor = if self.modulation.is_some() {
             // A project-wide patchbay needs both the field and its detail
             // band. The session remains exactly where it was underneath and
             // comes back with its cursor intact when the workspace closes.
             self.draw_modulation(ui, modulation_room);
             self.draw_help(&painter, modulation_room);
+            None
+        } else if self.lab.open {
+            self.draw_lab(ui, &painter, lab_room);
+            self.draw_help(&painter, lab_room);
             None
         } else {
             if self.sample.is_some() {
@@ -403,13 +475,26 @@ impl Stage {
                     self.draw_log(&painter, layout.field);
                 }
             }
-            // Over the field: the browser is a window above the work, not a
-            // division of it.
-            self.draw_browser(&painter, layout.field);
-            self.draw_help(&painter, layout.field);
+            // Over the field: the deck's window, then the browser above
+            // it — both are windows above the work, not divisions of it.
+            let compact_material = self.deck_open()
+                && self.deck_hero_height() == crate::pages::HeroHeight::Tall
+                && layout.field.height() < 360.0;
+            let deck_field = if compact_material {
+                egui::Rect::from_min_max(layout.field.min, layout.tray.max)
+            } else {
+                layout.field
+            };
+            self.interact_deck_hero(ui, deck_field);
+            self.draw_deck_window(&painter, deck_field);
+            self.draw_matrix_window(&painter, layout.field);
+            self.draw_browser(&painter, deck_field);
+            self.draw_help(&painter, deck_field);
             // One detail region, and the band and the sequencer are two
             // things to put in it. The band wins while it is showing.
-            if self.chain.is_some() {
+            if compact_material {
+                None
+            } else if self.chain.is_some() {
                 let phase = Phase::of(
                     self.transport.motion().is_rolling(),
                     self.transport.beat_phase(),

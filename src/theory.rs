@@ -14,6 +14,8 @@
 /// rather than wrapping into the bass.
 pub const MAX_PITCH: u8 = 127;
 
+pub mod harmony;
+
 /// A chord quality, as semitone offsets from the root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Quality {
@@ -259,7 +261,7 @@ pub fn pitch_class_name(pitch: u8) -> &'static str {
 
 /// One spelled chord member. Keeping the generic degree beside its semitone
 /// is what makes stacked edits such as `C13b9#11no5` unambiguous.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChordMember {
     pub degree: u8,
     pub semitones: i16,
@@ -435,7 +437,7 @@ impl ChordSymbol {
             if handled {
                 continue;
             }
-            for degree in [13, 11, 9, 7, 6, 5, 4, 3, 2] {
+            for degree in [13, 11, 9, 7, 6, 5, 4, 3, 2, 1] {
                 let token = format!("no{degree}");
                 if let Some(rest) = strip_word_ci(descriptor, &token) {
                     remove_degree(&mut members, degree);

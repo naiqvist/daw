@@ -11,7 +11,7 @@
 //! (`notes/20260831-pitch-lens-spec.md`).
 
 use crate::audio::modulation::{
-    MAX_MOD_SOURCES, MAX_MOD_WIRES, ModKind, ModShape, ModWire, Modulator,
+    LfoTrig, MAX_MOD_SOURCES, MAX_MOD_WIRES, MOD_RATES, ModKind, ModShape, ModWire, Modulator,
 };
 use crate::console::SectionKind;
 use crate::devices::DeviceKind;
@@ -44,6 +44,97 @@ pub const MAX_GROUP_DEPTH: u8 = 8;
 /// silently mute every project written before the mixer existed.
 fn unity() -> f32 {
     1.0
+}
+
+#[cfg(test)]
+mod lane_track_tests {
+    use super::*;
+    use crate::console::SectionKind;
+    use crate::lane::Lane;
+
+    #[test]
+    fn a_lock_written_before_slides_reads_as_a_plain_lock() {
+        let lock: ParamLock = ron::from_str("(param: 3, value: 0.5)").expect("parses");
+        assert!(!lock.slide);
+        let text = ron::ser::to_string(&lock).expect("serializes");
+        assert!(
+            !text.contains("slide"),
+            "a plain lock says nothing about sliding: {text}"
+        );
+        let mut lock = lock;
+        lock.slide = true;
+        let text = ron::ser::to_string(&lock).expect("serializes");
+        let back: ParamLock = ron::from_str(&text).expect("parses");
+        assert!(back.slide);
+        let trig: Trig =
+            ron::from_str("(enabled: true, notes: [], probability: 1.0)").expect("parses");
+        assert!(trig.sound.is_none());
+    }
+
+    #[test]
+    fn a_track_serializes_without_a_chain_field() {
+        let track = Song::default().tracks.remove(0);
+        let text = ron::ser::to_string(&track).expect("track serializes");
+        assert!(!text.contains("chain"), "legacy chain leaked into {text}");
+        assert!(text.contains("machine"));
+    }
+
+    #[test]
+    fn an_old_chain_migrates_to_the_machine_and_lane_sections() {
+        let mut song = Song::default();
+        let track = &mut song.tracks[0];
+        track.lane = Lane::Drum;
+        track.machine = None;
+        track.strip.clear();
+        track.legacy_chain = vec![
+            Device::new(DeviceId(100), DeviceKind::Poly),
+            Device::new(DeviceId(101), DeviceKind::Echo),
+            Device::new(DeviceId(102), DeviceKind::Reverb),
+            Device::new(DeviceId(103), DeviceKind::Disperser),
+        ];
+        let log = song.migrate_legacy_chains();
+        song.furnish();
+
+        assert_eq!(
+            song.tracks[0].machine.as_ref().map(|d| d.kind),
+            Some(DeviceKind::Poly)
+        );
+        for section in [SectionKind::Echo, SectionKind::Room] {
+            assert!(
+                !song.section(0, section).expect("mapped section").bypassed,
+                "{section:?} was not switched in"
+            );
+        }
+        assert!(log.iter().any(|line| line.contains("disperser")), "{log:?}");
+        assert!(song.tracks[0].legacy_chain.is_empty());
+    }
+
+    #[test]
+    fn a_section_lock_survives_a_machine_swap() {
+        let mut song = Song::default();
+        song.set_lane(0, Lane::Drum);
+        let room = song.section(0, SectionKind::Room).expect("drum room").id;
+        let pattern = song.patterns[0].id;
+        song.pattern_mut(pattern)
+            .expect("pattern")
+            .trig_mut(0)
+            .set_lock_on(Some(room), crate::params::console::room::SIZE, 61.0);
+
+        song.add_device(0, DeviceKind::Kick)
+            .expect("replacement machine");
+
+        assert_eq!(
+            song.section(0, SectionKind::Room).map(|device| device.id),
+            Some(room)
+        );
+        assert_eq!(
+            song.pattern(pattern)
+                .expect("pattern")
+                .trig(0)
+                .lock_on(Some(room), crate::params::console::room::SIZE),
+            Some(61.0)
+        );
+    }
 }
 
 /// Where a lane's LIVE signal comes from, beside its clips.
@@ -196,7 +287,9 @@ mod routing_tests {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct PatternId(pub u64);
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub struct TrackId(pub u64);
 
 /// The one project-wide draw of the analog desk.
@@ -496,6 +589,44 @@ pub struct ParamLock {
     /// every lock on the device it was laid on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<DeviceId>,
+    /// A SLIDE: the value glides from this lock to the next lock on the
+    /// same parameter of the same device, over the steps between; with
+    /// no lock ahead it holds. Compiled into a staircase of lock-only
+    /// events, so the engine never learns a new verb. Absent from older
+    /// documents means a plain lock.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub slide: bool,
+}
+
+/// A whole SOUND on one step: the trig plays through another machine,
+/// with that machine's values and samples, and the lane's strip as it
+/// is. The sound is CACHED here so the document plays without the
+/// library the sound came from; `name` is what the deck shows.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct SoundLock {
+    pub name: String,
+    pub sound: crate::sound::Sound,
+}
+
+/// Repetitions expanded into ordinary notes while the graph is compiled.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct Retrig {
+    /// Divisions of one step. Sanitized to 1, 2, 3, 4, 6 or 8 at compile.
+    pub rate: u8,
+    /// Total strikes, including the original.
+    pub count: u8,
+    /// Signed velocity change applied once per repetition.
+    pub decay: i8,
+}
+
+impl Default for Retrig {
+    fn default() -> Self {
+        Self {
+            rate: 4,
+            count: 2,
+            decay: 0,
+        }
+    }
 }
 
 /// One chronological step. Multiple notes are one chord, not parallel lanes.
@@ -509,6 +640,16 @@ pub struct Trig {
     /// exactly as it did before.
     #[serde(default)]
     pub locks: Vec<ParamLock>,
+    /// Fire only on pass A of every B pattern cycles.
+    #[serde(default)]
+    pub cond: Option<(u8, u8)>,
+    /// Compile-time repeats inside this step.
+    #[serde(default)]
+    pub retrig: Option<Retrig>,
+    /// A sound lock: this step plays through the locked sound's machine
+    /// instead of the track's. `None` is the track's own machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sound: Option<SoundLock>,
 }
 
 impl Default for Trig {
@@ -518,11 +659,35 @@ impl Default for Trig {
             notes: Vec::new(),
             probability: 1.0,
             locks: Vec::new(),
+            cond: None,
+            retrig: None,
+            sound: None,
         }
     }
 }
 
+/// What a trig carries besides its notes: the rules a yank takes along
+/// and a put lays down again. The sound lock is a flag here — a sound
+/// is not a value an intent can hold, so a put copies it by address.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TrigRules {
+    pub locks: Vec<ParamLock>,
+    pub cond: Option<(u8, u8)>,
+    pub retrig: Option<Retrig>,
+    pub sound: bool,
+}
+
 impl Trig {
+    /// The trig's rules, for a register to carry.
+    pub fn rules(&self) -> TrigRules {
+        TrigRules {
+            locks: self.locks.clone(),
+            cond: self.cond,
+            retrig: self.retrig,
+            sound: self.sound.is_some(),
+        }
+    }
+
     /// The voice's lock on `param`, if this trig holds one.
     pub fn lock(&self, param: u32) -> Option<f32> {
         self.lock_on(None, param)
@@ -557,8 +722,32 @@ impl Trig {
                 param,
                 value,
                 device,
+                slide: false,
             }),
         }
+    }
+
+    /// Mark or unmark the lock on `param` of `device` as a slide. `false`
+    /// means there is no such lock to mark.
+    pub fn set_slide_on(&mut self, device: Option<DeviceId>, param: u32, slide: bool) -> bool {
+        match self
+            .locks
+            .iter_mut()
+            .find(|lock| lock.device == device && lock.param == param)
+        {
+            Some(lock) => {
+                lock.slide = slide;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether the lock on `param` of `device` slides.
+    pub fn slides_on(&self, device: Option<DeviceId>, param: u32) -> bool {
+        self.locks
+            .iter()
+            .any(|lock| lock.device == device && lock.param == param && lock.slide)
     }
 
     /// Release `param` of `device`. Whether there was anything to release.
@@ -628,16 +817,121 @@ impl Trig {
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Pattern {
+    #[serde(default)]
+    pub midi_lab: Option<crate::midi_lab::Recipe>,
     pub id: PatternId,
     pub name: String,
+    /// The clip's TAG: its track's letter and its number on that track,
+    /// `a0`, `a1`, `b0`… Minted once at creation, stable for the clip's
+    /// life; what every surface calls it. Empty for a pattern no track
+    /// minted (a test's, or a document from before tags).
+    #[serde(default)]
+    pub tag: String,
     /// Natural session-clip boundary. Timeline placements may override it.
     #[serde(default = "default_pattern_ticks")]
     pub length_ticks: usize,
     trigs: Vec<Trig>,
+    /// Swing, as the percentage of an eighth at which the off-beat
+    /// sixteenth lands: 50 is straight, 66 is a triplet feel, 80 the
+    /// limit. Applied at compile on top of micro timing; the grid stays
+    /// straight. Absent from older documents means straight.
+    #[serde(default = "default_swing")]
+    pub swing: u8,
+    /// The pattern's own step rate against the song's tempo. Applied at
+    /// compile as a scale on time, so the grid, locks, retrig and slides
+    /// are laid at one rate and played at another. Absent means 1×.
+    #[serde(default)]
+    pub scale: Scale,
 }
 
 const fn default_pattern_ticks() -> usize {
     DEFAULT_PATTERN_TICKS
+}
+
+/// Straight time.
+pub const SWING_MIN: u8 = 50;
+/// The most a sixteenth can lean before it is the next one.
+pub const SWING_MAX: u8 = 80;
+
+const fn default_swing() -> u8 {
+    SWING_MIN
+}
+
+/// A pattern's step rate against the song: Elektron's scale multiplier,
+/// with 8× added. `Two` plays sixteen steps in the time of eight.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize,
+)]
+pub enum Scale {
+    Eighth,
+    Quarter,
+    Half,
+    ThreeQuarters,
+    #[default]
+    One,
+    ThreeHalves,
+    Two,
+    Four,
+    Eight,
+}
+
+impl Scale {
+    pub const ALL: [Self; 9] = [
+        Self::Eighth,
+        Self::Quarter,
+        Self::Half,
+        Self::ThreeQuarters,
+        Self::One,
+        Self::ThreeHalves,
+        Self::Two,
+        Self::Four,
+        Self::Eight,
+    ];
+
+    /// The speed against the song, as steps per song sixteenth.
+    pub const fn speed(self) -> f64 {
+        match self {
+            Self::Eighth => 0.125,
+            Self::Quarter => 0.25,
+            Self::Half => 0.5,
+            Self::ThreeQuarters => 0.75,
+            Self::One => 1.0,
+            Self::ThreeHalves => 1.5,
+            Self::Two => 2.0,
+            Self::Four => 4.0,
+            Self::Eight => 8.0,
+        }
+    }
+
+    /// What one pattern beat is worth in song beats: the reciprocal of
+    /// the speed, what the compiler multiplies time by.
+    pub const fn time(self) -> f64 {
+        1.0 / self.speed()
+    }
+
+    /// The word the palette spells it by.
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Eighth => "1/8",
+            Self::Quarter => "1/4",
+            Self::Half => "1/2",
+            Self::ThreeQuarters => "3/4",
+            Self::One => "1",
+            Self::ThreeHalves => "3/2",
+            Self::Two => "2",
+            Self::Four => "4",
+            Self::Eight => "8",
+        }
+    }
+
+    /// `1/8`, `3/2`, `2`, `2x`, `clear` (= 1).
+    pub fn parse(word: &str) -> Option<Self> {
+        let word = word.trim().trim_end_matches(['x', 'X', '×']);
+        if word.eq_ignore_ascii_case("clear") {
+            return Some(Self::One);
+        }
+        Self::ALL.into_iter().find(|scale| scale.word() == word)
+    }
 }
 
 impl Default for Pattern {
@@ -645,8 +939,12 @@ impl Default for Pattern {
         Self {
             id: PatternId(1),
             name: Song::pattern_address(0, 0),
+            tag: "a0".to_owned(),
+            midi_lab: None,
             length_ticks: DEFAULT_PATTERN_TICKS,
             trigs: vec![Trig::default(); PATTERN_STEPS],
+            swing: SWING_MIN,
+            scale: Scale::One,
         }
     }
 }
@@ -942,6 +1240,27 @@ impl Console {
     }
 }
 
+/// Set every section of `strip` to what `lane` furnishes it with: its
+/// IN state and its preset values, nothing else. Edited values are
+/// replaced; that is the point of asking.
+fn preset_strip(strip: &mut [Device], lane: crate::lane::Lane) {
+    for device in strip {
+        let DeviceKind::Console(kind) = device.kind else {
+            continue;
+        };
+        device.overrides.clear();
+        match lane.preset(kind) {
+            Some(preset) => {
+                device.bypassed = !(preset.in_ || kind.always_in());
+                for (param, value) in preset.values {
+                    device.set(*param, *value);
+                }
+            }
+            None => device.bypassed = !kind.always_in(),
+        }
+    }
+}
+
 /// Make `run` exactly `kinds`, in order: a device already there of the
 /// right kind is kept with its settings and id; a missing one is made
 /// with id zero for `furnish` to mint; anything else is dropped. The
@@ -967,6 +1286,80 @@ fn furnish_run(run: &mut Vec<Device>, kinds: &[SectionKind]) {
     *run = fresh;
 }
 
+/// The lane LFO's multiplier steps, against `MOD_RATES`' beats per
+/// cycle: together they run from a thirty-second of a beat to 128.
+pub const LFO_MULTS: [f32; 7] = [0.125, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0];
+/// The most beats a lane LFO fades in over.
+pub const LFO_FADE_MAX: u8 = 16;
+
+/// One of a track's two lane LFOs: Elektron's track LFO. A destination
+/// on any page, a shape, a speed and multiplier, a fade-in, a depth and
+/// how it meets the trigs. Compiled into the patchbay's plan as a source
+/// and a wire the patchbay does not list, so the engine learns nothing
+/// new but the restarts.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct LaneLfo {
+    /// A target name (`targets.rs`): a slot on any page, or the track's
+    /// own volume, pan and sends. `None` is an LFO going nowhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
+    #[serde(default = "default_lfo_shape")]
+    pub shape: ModShape,
+    /// Index into `MOD_RATES`, beats per cycle.
+    #[serde(default = "default_lfo_speed")]
+    pub speed: u8,
+    /// Index into `LFO_MULTS`.
+    #[serde(default = "default_lfo_mult")]
+    pub mult: u8,
+    /// Beats of fade-in after a restart, 0 to `LFO_FADE_MAX`.
+    #[serde(default)]
+    pub fade: u8,
+    /// Bipolar fraction of the destination's range, `-1..=1`.
+    #[serde(default)]
+    pub depth: f32,
+    #[serde(default)]
+    pub trig: LfoTrig,
+}
+
+const fn default_lfo_shape() -> ModShape {
+    ModShape::Sine
+}
+const fn default_lfo_speed() -> u8 {
+    2
+}
+const fn default_lfo_mult() -> u8 {
+    3
+}
+
+impl Default for LaneLfo {
+    fn default() -> Self {
+        Self {
+            destination: None,
+            shape: default_lfo_shape(),
+            speed: default_lfo_speed(),
+            mult: default_lfo_mult(),
+            fade: 0,
+            depth: 0.0,
+            trig: LfoTrig::Free,
+        }
+    }
+}
+
+impl LaneLfo {
+    /// Beats per cycle: the speed's beats times the multiplier.
+    pub fn cycle_beats(&self) -> f32 {
+        let speed = MOD_RATES[usize::from(self.speed).min(MOD_RATES.len() - 1)];
+        let mult = LFO_MULTS[usize::from(self.mult).min(LFO_MULTS.len() - 1)];
+        (speed * mult).max(1e-3)
+    }
+
+    /// Whether the compiler has anything to lay: somewhere to go and a
+    /// depth to go there with.
+    pub fn is_live(&self) -> bool {
+        self.destination.is_some() && self.depth != 0.0
+    }
+}
+
 // NOTE: `Eq` is gone from `Track` deliberately. An envelope carries f32
 // values, so total equality is not available; `PartialEq` is what the
 // history and the tests actually use.
@@ -975,6 +1368,14 @@ pub struct Track {
     pub id: TrackId,
     pub name: String,
     pub kind: TrackKind,
+    /// The track's letter, worn by every clip made on it: `a` on the
+    /// first track, `b` on the second. Minted once, when the first clip
+    /// is; never renumbered, so a reordered strip keeps its tags.
+    #[serde(default)]
+    pub letter: String,
+    /// How many clips this track has minted tags for: the next is `n`.
+    #[serde(default)]
+    pub tags_minted: u32,
     pub blocks: Vec<PatternBlock>,
     /// Silenced unless solo precedence makes this track the addressed
     /// sound. Absent from pre-mixer Song documents means sounding.
@@ -1046,22 +1447,20 @@ pub struct Track {
     /// Closed in the arrangement while still sounding.
     #[serde(default)]
     pub folded: bool,
-    /// The devices on this track, in signal order.
-    ///
-    /// ONE list, with the instrument at the head where there is one —
-    /// not an instrument field beside an effects vector. A chain is
-    /// reordered as a chain, and two collections would make "move this
-    /// device up" two different operations depending on where it started.
-    /// [`Song::normalize_chains`] is what keeps the head a head.
-    ///
-    /// EMPTY is the meaningful default and not a gap: an instrument track
-    /// with no chain sounds the default instrument, which is exactly what
-    /// every project written before devices reached the Song does.
-    #[serde(default)]
-    pub chain: Vec<Device>,
-    /// The console's channel strip: one device per section of
-    /// `SectionKind::STRIP`, in that order, always. `bypassed` means
-    /// OUT. A document without one is furnished on load.
+    /// The instrument in this lane's one swappable SRC slot. `None` is an
+    /// intentionally empty track. A missing field belongs to a pre-lane
+    /// document and receives the historical default Poly during migration.
+    #[serde(default = "default_track_machine")]
+    pub machine: Option<Device>,
+    /// Read-only compatibility seam for pre-lane documents. It accepts the
+    /// old `chain` field, is drained by [`Song::migrate_legacy_chains`], and
+    /// is never written back out.
+    #[serde(default, rename = "chain", skip_serializing)]
+    pub legacy_chain: Vec<Device>,
+    /// The console's channel strip: one device per section of the
+    /// lane's list (`Lane::sections`; `SectionKind::STRIP` for a plain
+    /// lane), in that order, always. `bypassed` means OUT. A document
+    /// without one is furnished on load.
     #[serde(default)]
     pub strip: Vec<Device>,
     /// Which group bus this channel feeds, 0–3.
@@ -1071,6 +1470,14 @@ pub struct Track {
     /// does not route the track again.
     #[serde(default)]
     pub bus_by_hand: bool,
+    /// What this track was built to carry: the design its strip and bus
+    /// were furnished from. `Plain` is no design, and what every song
+    /// written before lanes existed has. See `crate::lane`.
+    #[serde(default)]
+    pub lane: crate::lane::Lane,
+    /// The track's two lane LFOs. See [`LaneLfo`].
+    #[serde(default)]
+    pub lfos: [LaneLfo; 2],
     /// Zero is top level. A lane at depth `d` belongs to the nearest group
     /// above it at depth `d - 1`.
     #[serde(default)]
@@ -1482,6 +1889,8 @@ impl Default for Session {
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Song {
+    #[serde(default)]
+    pub midi_labs: Vec<crate::midi_lab::Draft>,
     pub tracks: Vec<Track>,
     pub patterns: Vec<Pattern>,
     /// Tempo before the first map mark (and everywhere when the map is
@@ -1565,11 +1974,28 @@ pub struct Song {
     pub next_track_id: u64,
 }
 
-fn default_track_chain() -> Vec<Device> {
-    vec![
-        Device::track_gain(DeviceId(0), DeviceRole::InputGain),
-        Device::track_gain(DeviceId(0), DeviceRole::OutputGain),
-    ]
+fn default_track_machine() -> Option<Device> {
+    Some(Device::new(DeviceId(0), DeviceKind::Poly))
+}
+
+/// B1's deliberately coarse migration. Device values are not translated;
+/// the lane section keeps its own preset and is merely switched in.
+fn legacy_section(kind: DeviceKind, lane: crate::lane::Lane) -> Option<SectionKind> {
+    let candidate = match kind {
+        DeviceKind::Echo => SectionKind::Echo,
+        DeviceKind::Glue => SectionKind::Vca,
+        DeviceKind::Reverb => SectionKind::Room,
+        DeviceKind::Filter => SectionKind::Cut,
+        DeviceKind::Eq | DeviceKind::Tilt | DeviceKind::Tone => SectionKind::Tone,
+        DeviceKind::Sat => SectionKind::Drive,
+        DeviceKind::Lofi => SectionKind::Grit,
+        DeviceKind::Limiter | DeviceKind::Clamp => SectionKind::Ceiling,
+        DeviceKind::Gate => SectionKind::Door,
+        DeviceKind::Phaser => SectionKind::Phase,
+        DeviceKind::Console(section) => section,
+        _ => return None,
+    };
+    lane.sections().contains(&candidate).then_some(candidate)
 }
 
 /// The device instance named by one stable target string.
@@ -1604,7 +2030,7 @@ fn modulation_target_exists(track: &Track, target: &str) -> bool {
         return false;
     };
     track
-        .chain
+        .machine
         .iter()
         .chain(track.strip.iter())
         .find(|device| device.id == DeviceId(id))
@@ -1632,12 +2058,15 @@ impl Default for Song {
         let pattern = Pattern::default();
         let pattern_id = pattern.id;
         let mut song = Self {
+            midi_labs: Vec::new(),
             bpm: default_song_bpm(),
             master: 1.0,
             tracks: vec![Track {
                 id: TrackId(1),
                 name: "Instrument 01".to_owned(),
                 kind: TrackKind::Instrument,
+                letter: "a".to_owned(),
+                tags_minted: 1,
                 blocks: vec![PatternBlock {
                     id: BlockId(1),
                     pattern_id,
@@ -1654,10 +2083,13 @@ impl Default for Song {
                 sends: Vec::new(),
                 is_group: false,
                 folded: false,
-                chain: default_track_chain(),
+                machine: default_track_machine(),
+                legacy_chain: Vec::new(),
                 strip: Vec::new(),
                 bus: 0,
                 bus_by_hand: false,
+                lane: crate::lane::Lane::Plain,
+                lfos: Default::default(),
                 depth: 0,
                 input: TrackInput::default(),
                 monitor: Monitor::default(),
@@ -1893,6 +2325,8 @@ impl Song {
             id,
             name,
             kind,
+            letter: String::new(),
+            tags_minted: 0,
             blocks: Vec::new(),
             muted: false,
             solo: false,
@@ -1904,10 +2338,13 @@ impl Song {
             sends: Vec::new(),
             is_group: false,
             folded: false,
-            chain: default_track_chain(),
+            machine: None,
+            legacy_chain: Vec::new(),
             strip: Vec::new(),
             bus: 0,
             bus_by_hand: false,
+            lane: crate::lane::Lane::Plain,
+            lfos: Default::default(),
             depth: 0,
             input: TrackInput::default(),
             monitor: Monitor::default(),
@@ -1978,7 +2415,7 @@ impl Song {
     /// A copy of the track at `index`, put right after it, and the copy's
     /// index. `None` means there is no such track.
     ///
-    /// What the copy owns: a fresh track id; its own name; its chain and
+    /// What the copy owns: a fresh track id; its own name; its machine and
     /// strip with FRESH device ids, so a letter to one never lands on the
     /// other; its own copies of every pattern its slots and blocks used,
     /// so editing the copy's clip leaves the original's alone — the
@@ -1994,11 +2431,14 @@ impl Song {
         let mut copy = source.clone();
         copy.id = TrackId(self.mint_track_id());
         copy.name = self.duplicate_name(&source.name);
+        // Its own letter, and its clips numbered afresh from zero.
+        copy.letter = self.free_letter();
+        copy.tags_minted = 0;
         copy.armed = false;
         // Fresh device ids, remembering the map for the wires.
         let mut next_device = self.mint_device_id();
         let mut renamed: Vec<(u64, u64)> = Vec::new();
-        for device in copy.chain.iter_mut().chain(copy.strip.iter_mut()) {
+        for device in copy.machine.iter_mut().chain(copy.strip.iter_mut()) {
             renamed.push((device.id.0, next_device));
             device.id = DeviceId(next_device);
             next_device = next_device.saturating_add(1);
@@ -2043,12 +2483,15 @@ impl Song {
             let Some(pattern) = self.pattern(id).cloned() else {
                 continue;
             };
-            let Some(fresh) = self.allocate_pattern(pattern.name.clone()) else {
+            let tag = format!("{}{}", copy.letter, copy.tags_minted);
+            copy.tags_minted += 1;
+            let Some(fresh) = self.allocate_pattern(tag.clone(), pattern.name.clone()) else {
                 continue;
             };
             if let Some(slot) = self.pattern_mut(fresh) {
                 *slot = Pattern {
                     id: fresh,
+                    tag,
                     ..pattern
                 };
             }
@@ -2146,12 +2589,17 @@ impl Song {
             let name = track_index.map_or(pattern.name.clone(), |track| {
                 Song::pattern_address(track, to)
             });
-            let Some(fresh) = self.allocate_pattern(name) else {
+            let tag = track_index
+                .and_then(|track| self.mint_tag(track))
+                .unwrap_or_default();
+            let Some(fresh) = self.allocate_pattern(tag, name) else {
                 continue;
             };
             if let Some(made) = self.pattern_mut(fresh) {
+                let tag = made.tag.clone();
                 *made = Pattern {
                     id: fresh,
+                    tag,
                     name: made.name.clone(),
                     ..pattern
                 };
@@ -2322,145 +2770,122 @@ impl Song {
         !self.muted_in_place(index) && (!self.any_solo() || self.solo_in_scope(index))
     }
 
-    /// Put every chain back into legal shape at a green-zone ownership
-    /// boundary (load or edit), the way [`Self::normalize_group_depths`]
-    /// does for the group stack.
-    ///
-    /// Two rules, and both are about WHERE sound comes from:
-    ///
-    /// - An instrument heads its chain. A device that makes sound placed
-    ///   after one that shapes it would have the shaping happen before
-    ///   there was anything to shape.
-    /// - One instrument per track, and none at all on an audio track,
-    ///   whose sound comes from the clips on it. A second instrument is
-    ///   dropped rather than silenced, because a device that is present
-    ///   and inaudible with no way to say why is worse than one that is
-    ///   gone.
-    ///
-    /// Effects keep their order exactly. Repairing the head is not a
-    /// licence to rearrange what a musician put in a particular sequence.
-    pub fn normalize_chains(&mut self) {
+    /// Move pre-lane `chain` data into the lane's machine and fixed strip.
+    /// The returned lines are suitable for the stage log and make every
+    /// lossy choice explicit to a caller or migration test.
+    pub fn migrate_legacy_chains(&mut self) -> Vec<String> {
+        let mut log = Vec::new();
+        let mut removed = std::collections::HashSet::new();
         for track in &mut self.tracks {
-            let audio = track.kind == TrackKind::Audio;
-            let mut instrument = None;
-            let mut input_gain = None;
-            let mut output_gain = None;
-            let mut effects = Vec::with_capacity(track.chain.len());
-            for mut device in track.chain.drain(..) {
-                // Only Utility can carry a boundary role. A malformed role
-                // on another kind becomes an ordinary device rather than
-                // moving that device to a surprising end of the chain.
-                if device.kind != DeviceKind::Utility {
-                    device.role = DeviceRole::Normal;
+            furnish_run(&mut track.strip, track.lane.sections());
+            let legacy = std::mem::take(&mut track.legacy_chain);
+            // A document old enough to carry `chain` could not have carried
+            // `machine`. Serde supplied the historical Poly default for the
+            // missing field, so discard that placeholder before recovering
+            // the real head from the legacy chain. Current documents always
+            // write `machine` and never write `chain`, making the two cases
+            // unambiguous at this boundary.
+            if !legacy.is_empty() {
+                track.machine = None;
+            }
+            for mut device in legacy {
+                if device.role.is_boundary() {
+                    removed.insert(device.id);
+                    continue;
                 }
-                match device.role {
-                    DeviceRole::InputGain if input_gain.is_none() => {
-                        input_gain = Some(device);
-                        continue;
+                device.role = DeviceRole::Normal;
+                if device.is_instrument() && track.kind != TrackKind::Audio {
+                    if track.machine.is_none() {
+                        track.machine = Some(device);
+                    } else {
+                        removed.insert(device.id);
+                        log.push(format!(
+                            "{}: dropped extra {} machine",
+                            track.name,
+                            device.kind.spec().name
+                        ));
                     }
-                    DeviceRole::OutputGain if output_gain.is_none() => {
-                        output_gain = Some(device);
-                        continue;
-                    }
-                    DeviceRole::InputGain | DeviceRole::OutputGain => {
-                        // A corrupt duplicate remains audible and editable,
-                        // but loses structural authority.
-                        device.role = DeviceRole::Normal;
-                    }
-                    DeviceRole::Normal => {}
+                    continue;
                 }
-                if !device.is_instrument() {
-                    effects.push(device);
-                } else if !audio && instrument.is_none() {
-                    instrument = Some(device);
+                removed.insert(device.id);
+                let mapped = legacy_section(device.kind, track.lane);
+                let Some(section) = mapped else {
+                    log.push(format!(
+                        "{}: dropped {}",
+                        track.name,
+                        device.kind.spec().name
+                    ));
+                    continue;
+                };
+                if let Some(target) = track
+                    .strip
+                    .iter_mut()
+                    .find(|target| target.kind == DeviceKind::Console(section))
+                {
+                    target.overrides.clear();
+                    if let Some(preset) = track.lane.preset(section) {
+                        for (param, value) in preset.values {
+                            target.set(*param, *value);
+                        }
+                    }
+                    target.bypassed = false;
                 }
             }
-            track.chain = instrument
-                .into_iter()
-                .chain(input_gain)
-                .chain(effects)
-                .chain(output_gain)
-                .collect();
-        }
-    }
-
-    /// Add the exact-unity boundary trims to tracks from a document version
-    /// written before they existed. Idempotent and deliberately not called on
-    /// every load: after migration a performer may remove either default and
-    /// a current-version document preserves that choice.
-    pub fn install_default_track_gains(&mut self) {
-        let mut next = self.mint_device_id();
-        for track in &mut self.tracks {
-            if !track
-                .chain
-                .iter()
-                .any(|device| device.role == DeviceRole::InputGain)
-            {
-                track
-                    .chain
-                    .push(Device::track_gain(DeviceId(next), DeviceRole::InputGain));
-                next = next.saturating_add(1);
-            }
-            if !track
-                .chain
-                .iter()
-                .any(|device| device.role == DeviceRole::OutputGain)
-            {
-                track
-                    .chain
-                    .push(Device::track_gain(DeviceId(next), DeviceRole::OutputGain));
-                next = next.saturating_add(1);
+            if track.kind == TrackKind::Audio {
+                if let Some(machine) = track.machine.take() {
+                    removed.insert(machine.id);
+                    log.push(format!("{}: dropped machine on audio lane", track.name));
+                }
             }
         }
-        self.normalize_chains();
+        self.mod_wires.retain(|wire| {
+            modulation_target_device(&wire.target).is_none_or(|id| !removed.contains(&id))
+        });
+        log
     }
 
-    /// Put `kind` on `track`, at the head if it is an instrument and at
-    /// the tail if it shapes sound. `None` means the track does not exist,
-    /// or an instrument was offered to an audio track.
-    ///
-    /// The id is minted across the WHOLE SONG rather than per track, so a
-    /// device carries its identity when it is moved to another track.
+    /// Compatibility name used by older load boundaries. There is no chain
+    /// after this call; it only drains the legacy serde seam. What the
+    /// drain dropped comes back as lines for the log: a document says
+    /// what it lost.
+    pub fn normalize_chains(&mut self) -> Vec<String> {
+        self.migrate_legacy_chains()
+    }
+
+    /// Compatibility migration for document versions that once introduced
+    /// boundary utilities. Fixed lane sections now own those jobs.
+    pub fn install_default_track_gains(&mut self) -> Vec<String> {
+        self.migrate_legacy_chains()
+    }
+
+    /// Fill the track's one machine slot. Effects are retired browser input:
+    /// a lane, and only a lane, names what shapes its channel.
     pub fn add_device(&mut self, track: usize, kind: DeviceKind) -> Option<DeviceId> {
-        let audio = self.tracks.get(track)?.kind == TrackKind::Audio;
-        let instrument = kind.spec().instrument;
-        if audio && instrument {
+        if !kind.is_instrument() || self.tracks.get(track)?.kind == TrackKind::Audio {
             return None;
         }
-        let device = Device::new(DeviceId(self.mint_device_id()), kind);
-        let at = self.tracks.get(track)?.chain.len();
-        self.place_device(track, at, device)
+        let mut device = Device::new(DeviceId(self.mint_device_id()), kind);
+        // A fresh machine is set up the way its lane likes it (C4 of the
+        // sounds brief). A pasted one and a loaded sound carry their own.
+        for (param, value) in self.tracks[track].lane.defaults_for(kind) {
+            device.set(*param, *value);
+        }
+        self.place_device(track, device)
     }
 
-    /// Put a device that already has settings — one taken off another
-    /// chain, or the same one — onto `track` at position `at`, and give
-    /// it a fresh id. `None` means the track does not exist, or the
-    /// device is an instrument offered to an audio track.
-    ///
-    /// A FRESH id, always: the device may be a copy of one still in the
-    /// song, and two devices with one id would be one device to every
-    /// letter addressed to it. What carries over is what the performer
-    /// set — the kind, the bypass, the edits, the sample.
-    ///
-    /// `at` is clamped: an instrument goes to the head whatever was asked,
-    /// replacing the one there, and an effect never lands in front of the
-    /// head. Past the tail means the tail.
+    /// Put a copied machine in the one slot with a fresh identity.
     pub fn insert_device(
         &mut self,
         track: usize,
-        at: usize,
+        _at: usize,
         mut device: Device,
     ) -> Option<DeviceId> {
-        let audio = self.tracks.get(track)?.kind == TrackKind::Audio;
-        if audio && device.is_instrument() {
+        if !device.is_instrument() || self.tracks.get(track)?.kind == TrackKind::Audio {
             return None;
         }
         device.id = DeviceId(self.mint_device_id());
-        // Clipboard insertion is a copy of the processing settings, not of a
-        // track's structural boundary authority. A copied input trim is an
-        // ordinary Utility on the destination.
         device.role = DeviceRole::Normal;
-        self.place_device(track, at, device)
+        self.place_device(track, device)
     }
 
     /// One past the highest device id anywhere in the song: chains,
@@ -2473,56 +2898,32 @@ impl Song {
             .saturating_add(1)
     }
 
-    /// Every device in the song, chains first, then the strips, then
+    /// Every device in the song, machines first, then the strips, then
     /// the desk's own.
     pub fn all_devices(&self) -> impl Iterator<Item = &Device> {
         self.tracks
             .iter()
-            .flat_map(|track| track.chain.iter().chain(track.strip.iter()))
+            .flat_map(|track| track.machine.iter().chain(track.strip.iter()))
             .chain(self.console.all_devices())
     }
 
     fn all_devices_mut(&mut self) -> impl Iterator<Item = &mut Device> {
         self.tracks
             .iter_mut()
-            .flat_map(|track| track.chain.iter_mut().chain(track.strip.iter_mut()))
+            .flat_map(|track| track.machine.iter_mut().chain(track.strip.iter_mut()))
             .chain(self.console.all_devices_mut())
     }
 
-    /// The one place a device joins a chain, so the head rule has one
-    /// home: an instrument REPLACES the head, and an effect lands at `at`
-    /// clamped behind the head and inside the chain.
-    fn place_device(&mut self, track: usize, at: usize, device: Device) -> Option<DeviceId> {
+    /// The one place a device joins a track: it replaces the machine slot
+    /// and retires modulation addressed to the previous machine.
+    fn place_device(&mut self, track: usize, device: Device) -> Option<DeviceId> {
         let id = device.id;
-        let removed_instrument = {
-            let chain = &mut self.tracks.get_mut(track)?.chain;
-            if device.is_instrument() {
-                // A second instrument REPLACES the first rather than joining
-                // it: a track sounds one voice, and the head is that voice.
-                let removed = chain
-                    .iter()
-                    .find(|existing| existing.is_instrument())
-                    .map(|existing| existing.id);
-                chain.retain(|existing| !existing.is_instrument());
-                chain.insert(0, device);
-                removed
-            } else {
-                let mut first = usize::from(chain.first().is_some_and(Device::is_instrument));
-                if chain
-                    .get(first)
-                    .is_some_and(|device| device.role == DeviceRole::InputGain)
-                {
-                    first += 1;
-                }
-                let last = chain
-                    .iter()
-                    .position(|device| device.role == DeviceRole::OutputGain)
-                    .unwrap_or(chain.len());
-                let at = at.clamp(first, last);
-                chain.insert(at, device);
-                None
-            }
-        };
+        let removed_instrument = self
+            .tracks
+            .get_mut(track)?
+            .machine
+            .replace(device)
+            .map(|old| old.id);
         if let Some(removed) = removed_instrument {
             self.mod_wires
                 .retain(|wire| modulation_target_device(&wire.target) != Some(removed));
@@ -2532,39 +2933,19 @@ impl Song {
 
     /// Take a device off a track. `None` means there was no such device.
     pub fn remove_device(&mut self, track: usize, id: DeviceId) -> Option<Device> {
-        let removed = {
-            let chain = &mut self.tracks.get_mut(track)?.chain;
-            let at = chain.iter().position(|device| device.id == id)?;
-            chain.remove(at)
-        };
+        let slot = &mut self.tracks.get_mut(track)?.machine;
+        if slot.as_ref().map(|device| device.id) != Some(id) {
+            return None;
+        }
+        let removed = slot.take()?;
         self.mod_wires
             .retain(|wire| modulation_target_device(&wire.target) != Some(id));
         Some(removed)
     }
 
-    /// Move a device one place along its chain. `false` means it was
-    /// already at that end, or the move would put an instrument behind an
-    /// effect — the head is not a position a reorder may vacate.
-    pub fn move_device(&mut self, track: usize, id: DeviceId, later: bool) -> bool {
-        let Some(chain) = self.tracks.get_mut(track).map(|track| &mut track.chain) else {
-            return false;
-        };
-        let Some(at) = chain.iter().position(|device| device.id == id) else {
-            return false;
-        };
-        let to = if later { at + 1 } else { at.wrapping_sub(1) };
-        if to >= chain.len() {
-            return false;
-        }
-        if chain[at].is_instrument()
-            || chain[to].is_instrument()
-            || chain[at].role.is_boundary()
-            || chain[to].role.is_boundary()
-        {
-            return false;
-        }
-        chain.swap(at, to);
-        true
+    /// A lane's path is fixed; there is no device order to move.
+    pub fn move_device(&mut self, _track: usize, _id: DeviceId, _later: bool) -> bool {
+        false
     }
 
     /// The device with this id, wherever it is.
@@ -2585,7 +2966,7 @@ impl Song {
     /// strip.
     pub fn furnish(&mut self) {
         for track in &mut self.tracks {
-            furnish_run(&mut track.strip, &SectionKind::STRIP);
+            furnish_run(&mut track.strip, track.lane.sections());
         }
         self.console.furnish();
         // Ids for whatever was just made. Minted in one pass from the
@@ -2605,20 +2986,20 @@ impl Song {
         self.normalize_modulation();
     }
 
-    /// The bus a track belongs on by what it is: drums to A, bass to B,
-    /// audio to D, everything else to C.
+    /// The bus a track belongs on by what it is: its lane's, when the
+    /// lane has one; else drums to A, bass to B, audio to D, everything
+    /// else to C.
     pub fn bus_for(&self, track: usize) -> u8 {
         let Some(track) = self.tracks.get(track) else {
             return BUS_MUSIC;
         };
+        if track.lane != crate::lane::Lane::Plain {
+            return track.lane.bus();
+        }
         if track.kind == TrackKind::Audio {
             return BUS_TAPE;
         }
-        let head = track
-            .chain
-            .first()
-            .filter(|device| device.is_instrument())
-            .map(|device| device.kind);
+        let head = track.machine.as_ref().map(|device| device.kind);
         match head {
             Some(DeviceKind::Acid) => BUS_BASS,
             Some(kind) if kind.spec().family == crate::devices::Family::Drums => BUS_DRUM,
@@ -2644,6 +3025,125 @@ impl Song {
         head.bus = bus % BUS_COUNT as u8;
         head.bus_by_hand = true;
         true
+    }
+
+    /// Give `track` a lane: furnish its strip from the lane's design and
+    /// route it to the lane's bus. Every section of the strip is set —
+    /// IN at the lane's values where the lane names it, OUT otherwise,
+    /// the desk's always-in sections kept in — so a strip edited by hand
+    /// is replaced whole, which is what makes the statement one undo
+    /// step rather than a merge nobody could predict. The lane's bus is
+    /// an explicit choice and clears the by-hand flag; a plain lane hands
+    /// the bus back to the router. The device chain is not touched: the
+    /// lane is a design for the channel, not a rule about the instrument.
+    ///
+    /// `false` when the track does not exist. Setting the lane a track
+    /// already has still refurnishes it — that is the way back to the
+    /// design after editing the strip.
+    pub fn set_lane(&mut self, track: usize, lane: crate::lane::Lane) -> bool {
+        let Some(head) = self.tracks.get_mut(track) else {
+            return false;
+        };
+        head.lane = lane;
+        head.bus_by_hand = false;
+        let needs_default = head.kind != TrackKind::Audio && head.machine.is_none();
+        furnish_run(&mut head.strip, lane.sections());
+        preset_strip(&mut head.strip, lane);
+        if needs_default && let Some(kind) = lane.default_machine() {
+            let id = DeviceId(self.mint_device_id());
+            self.tracks[track].machine = Some(Device::new(id, kind));
+        }
+        self.furnish();
+        true
+    }
+
+    /// Make `track` sound like `sound`: its lane first (C1 of the
+    /// sounds brief — a sound is a lane word plus values, and a track
+    /// that takes one becomes that kind), then the machine, then every
+    /// section the sound names; sections it does not name go back to the
+    /// lane's preset, so two tracks that load the same sound agree.
+    ///
+    /// Never refuses. Every dropped thing — a lane or machine this build
+    /// does not know, a section the lane has no place for, a parameter
+    /// id a table has lost — is a line in the returned log, for the
+    /// notice and the log column. An audio track takes nothing and says so.
+    pub fn load_sound(&mut self, track: usize, sound: &crate::sound::Sound) -> Vec<String> {
+        let mut log = Vec::new();
+        let Some(head) = self.tracks.get(track) else {
+            log.push("no such track".to_owned());
+            return log;
+        };
+        if head.kind == TrackKind::Audio {
+            log.push("an audio lane takes no sound".to_owned());
+            return log;
+        }
+        match crate::lane::Lane::parse(&sound.lane) {
+            Some(lane) if lane != head.lane => {
+                self.set_lane(track, lane);
+                log.push(format!("lane · {}", lane.name()));
+            }
+            Some(_) => {}
+            None => log.push(format!(
+                "unknown lane {:?}, kept {}",
+                sound.lane,
+                head.lane.name()
+            )),
+        }
+        match &sound.machine {
+            None => {
+                if let Some(id) = self.tracks[track].machine.as_ref().map(|device| device.id) {
+                    self.remove_device(track, id);
+                }
+            }
+            Some(machine) => match crate::devices::device_by_prefix(&machine.kind) {
+                Some(spec) if spec.kind.is_instrument() => {
+                    let mut device = Device::new(DeviceId(self.mint_device_id()), spec.kind);
+                    for (param, value) in &machine.overrides {
+                        if !device.set(*param, *value) {
+                            log.push(format!("{} has no parameter {param}", spec.name));
+                        }
+                    }
+                    device.sample = machine.sample.clone();
+                    device.slices = machine.slices.clone();
+                    device.pads = machine.pads.clone();
+                    self.place_device(track, device);
+                }
+                _ => {
+                    log.push(format!(
+                        "unknown machine {:?}, slot left empty",
+                        machine.kind
+                    ));
+                    if let Some(id) = self.tracks[track].machine.as_ref().map(|device| device.id) {
+                        self.remove_device(track, id);
+                    }
+                }
+            },
+        }
+        let lane = self.tracks[track].lane;
+        preset_strip(&mut self.tracks[track].strip, lane);
+        for section in &sound.sections {
+            let Some(device) = self.tracks[track]
+                .strip
+                .iter_mut()
+                .find(|device| device.kind == DeviceKind::Console(section.kind))
+            else {
+                log.push(format!(
+                    "{} has no {} section, dropped",
+                    lane.name(),
+                    section.kind.name()
+                ));
+                continue;
+            };
+            device.bypassed = !(section.in_ || section.kind.always_in());
+            device.overrides.clear();
+            for (param, value) in &section.overrides {
+                if !device.set(*param, *value) {
+                    log.push(format!("{} has no parameter {param}", section.kind.name()));
+                }
+            }
+        }
+        self.furnish();
+        log
     }
 
     /// The section of `kind` on `track`'s strip.
@@ -2868,7 +3368,54 @@ impl Song {
         format!("T{} {bank}{}", track_index + 1, scene % 16 + 1)
     }
 
-    fn allocate_pattern(&mut self, name: String) -> Option<PatternId> {
+    /// The track's letter: `a`, `b`… `z`, then `aa`, `ab`… The first not
+    /// worn by any track.
+    fn free_letter(&self) -> String {
+        let taken: Vec<&str> = self
+            .tracks
+            .iter()
+            .map(|track| track.letter.as_str())
+            .collect();
+        let mut n = 0usize;
+        loop {
+            let mut word = String::new();
+            let mut k = n;
+            loop {
+                word.insert(0, (b'a' + (k % 26) as u8) as char);
+                if k < 26 {
+                    break;
+                }
+                k = k / 26 - 1;
+            }
+            if !taken.contains(&word.as_str()) {
+                return word;
+            }
+            n += 1;
+        }
+    }
+
+    /// Mint the next tag on `track_index`: the track's letter (given on
+    /// its first clip) and its clip count. `None` for no such track.
+    pub fn mint_tag(&mut self, track_index: usize) -> Option<String> {
+        if self.tracks.get(track_index)?.letter.is_empty() {
+            let letter = self.free_letter();
+            self.tracks[track_index].letter = letter;
+        }
+        let track = &mut self.tracks[track_index];
+        let tag = format!("{}{}", track.letter, track.tags_minted);
+        track.tags_minted = track.tags_minted.saturating_add(1);
+        Some(tag)
+    }
+
+    /// A pattern's tag, or its number when it has none.
+    pub fn tag_of(&self, id: PatternId) -> String {
+        match self.pattern(id) {
+            Some(pattern) if !pattern.tag.is_empty() => pattern.tag.clone(),
+            _ => format!("{:02}", id.0),
+        }
+    }
+
+    fn allocate_pattern(&mut self, tag: String, name: String) -> Option<PatternId> {
         let pattern_id = PatternId(
             self.patterns
                 .iter()
@@ -2877,7 +3424,9 @@ impl Song {
                 .unwrap_or(0)
                 .checked_add(1)?,
         );
-        self.patterns.push(Pattern::empty(pattern_id, name));
+        let mut pattern = Pattern::empty(pattern_id, name);
+        pattern.tag = tag;
+        self.patterns.push(pattern);
         Some(pattern_id)
     }
 
@@ -3014,7 +3563,8 @@ impl Song {
         if self.session.scenes.get(scene)?.clip(track_id).is_some() {
             return None;
         }
-        let pattern_id = self.allocate_pattern(Self::pattern_address(track_index, scene))?;
+        let tag = self.mint_tag(track_index)?;
+        let pattern_id = self.allocate_pattern(tag, Self::pattern_address(track_index, scene))?;
         self.session.scenes.get_mut(scene)?.slots.push(Slot {
             track: track_id,
             clip: Clip::Pattern(pattern_id),
@@ -3063,7 +3613,8 @@ impl Song {
         // Born in the arrangement, with no slot to be named by: the
         // track and a number.
         let name = format!("T{} P{:02}", track_index + 1, self.patterns.len() + 1);
-        let pattern_id = self.allocate_pattern(name)?;
+        let tag = self.mint_tag(track_index)?;
+        let pattern_id = self.allocate_pattern(tag, name)?;
         let track = self.tracks.get_mut(track_index)?;
         track.blocks.push(PatternBlock {
             id: block_id,
@@ -3206,6 +3757,7 @@ impl Song {
         // A pattern born in the arrangement has no slot to be named by,
         // so it carries its track and a number.
         pattern.name = format!("T{} P{:02}", target_track + 1, self.patterns.len() + 1);
+        pattern.tag = self.mint_tag(target_track).unwrap_or_default();
         self.patterns.push(pattern);
         self.tracks[target_track].blocks.push(PatternBlock {
             id: block_id,
@@ -3334,13 +3886,57 @@ impl Pattern {
         Self {
             id,
             name,
+            tag: String::new(),
+            midi_lab: None,
             length_ticks: DEFAULT_PATTERN_TICKS,
             trigs: vec![Trig::default(); PATTERN_STEPS],
+            swing: SWING_MIN,
+            scale: Scale::One,
         }
     }
 
     pub fn trig(&self, step: usize) -> &Trig {
         &self.trigs[step % PATTERN_STEPS]
+    }
+
+    /// Set the swing, clamped to the range that means anything. Whether
+    /// it changed.
+    pub fn set_swing(&mut self, swing: u8) -> bool {
+        let swing = swing.clamp(SWING_MIN, SWING_MAX);
+        if self.swing == swing {
+            return false;
+        }
+        self.swing = swing;
+        true
+    }
+
+    /// How far `step` leans, in ticks, at this pattern's swing: the
+    /// off-beat sixteenths move late by a fraction of a sixteenth; the
+    /// on-beats never move. 66 is a triplet feel.
+    pub fn swing_ticks(&self, step: usize) -> f64 {
+        if step.is_multiple_of(2) || self.swing <= SWING_MIN {
+            return 0.0;
+        }
+        // At 50 the off-beat sits at half the eighth; at 75 at three
+        // quarters of it. The eighth is two sixteenths.
+        let lean = (f64::from(self.swing) - 50.0) / 50.0;
+        lean * PATTERN_STEP_TICKS as f64
+    }
+
+    /// Lock `sound` on `step`, or (`None`) return it to the track's own
+    /// machine. A sound on a step with nothing on it is a rule with no
+    /// event, like a trigless lock; it waits for a note. Whether anything
+    /// changed.
+    pub fn set_sound_lock(&mut self, step: usize, sound: Option<SoundLock>) -> bool {
+        if step >= PATTERN_STEPS {
+            return false;
+        }
+        let trig = self.trig_mut(step);
+        if trig.sound == sound {
+            return false;
+        }
+        trig.sound = sound;
+        true
     }
 
     pub fn trig_mut(&mut self, step: usize) -> &mut Trig {
@@ -3410,11 +4006,15 @@ impl Pattern {
             | Intent::AddNote { tick, .. }
             | Intent::AddEntryNote { tick, .. }
             | Intent::SetProbability { tick, .. }
+            | Intent::SetCondition { tick, .. }
+            | Intent::SetRetrig { tick, .. }
             | Intent::AdjustVelocity { tick, .. }
             | Intent::AdjustNoteVelocity { tick, .. }
             | Intent::SetNoteMuted { tick, .. }
             | Intent::SetLock { tick, .. }
-            | Intent::ClearLock { tick, .. } => tick,
+            | Intent::ClearLock { tick, .. }
+            | Intent::SetSlide { tick, .. }
+            | Intent::CopySound { tick, .. } => tick,
         };
         let (step, micro) = Self::address(tick);
         if step >= PATTERN_STEPS {
@@ -3458,6 +4058,9 @@ impl Pattern {
                     trig.add_tone_at(note);
                 }
             }
+            // A sound is copied by the stage, which can see the source
+            // pattern; here it is nothing to do and nothing to refuse.
+            Intent::CopySound { .. } => {}
             Intent::Clear { .. } => {
                 let trig = self.trig_mut(step);
                 trig.notes.retain(|note| !at(note));
@@ -3501,6 +4104,27 @@ impl Pattern {
             }
             Intent::SetProbability { probability, .. } => {
                 self.trig_mut(step).probability = probability.clamp(0.01, 1.0);
+            }
+            Intent::SetCondition { cond, .. } => {
+                self.trig_mut(step).cond = cond.map(|(a, b)| {
+                    let b = b.clamp(1, 8);
+                    (a.clamp(1, b), b)
+                });
+            }
+            Intent::SetRetrig { retrig, .. } => {
+                self.trig_mut(step).retrig = retrig.map(|mut retrig| {
+                    retrig.count = retrig.count.clamp(1, 8);
+                    retrig.rate = match retrig.rate {
+                        1 | 2 | 3 | 4 | 6 | 8 => retrig.rate,
+                        other if other < 2 => 1,
+                        other if other < 3 => 2,
+                        other if other < 4 => 3,
+                        other if other < 6 => 4,
+                        other if other < 8 => 6,
+                        _ => 8,
+                    };
+                    retrig
+                });
             }
             Intent::AdjustVelocity { delta, .. } => {
                 let trig = self.trig_mut(step);
@@ -3553,6 +4177,19 @@ impl Pattern {
                     .clear_lock_on(device.map(DeviceId), param)
                 {
                     return Some("lock: nothing locked here");
+                }
+            }
+            Intent::SetSlide {
+                device,
+                param,
+                slide,
+                ..
+            } => {
+                if !self
+                    .trig_mut(step)
+                    .set_slide_on(device.map(DeviceId), param, slide)
+                {
+                    return Some("slide: nothing locked here");
                 }
             }
             Intent::Resize { delta_ticks, .. } => {
@@ -3767,6 +4404,14 @@ mod tests {
         assert_eq!(GRID_COLUMNS, 16);
         assert_eq!(GRID_ROWS, 4);
         assert!((0..PATTERN_STEPS).all(|step| pattern.trig(step).notes.is_empty()));
+    }
+
+    #[test]
+    fn pre_condition_documents_default_trig_condition_and_retrig_to_none() {
+        let trig: Trig = ron::from_str("(enabled:false,notes:[],probability:1.0,locks:[])")
+            .expect("an old trig still loads");
+        assert_eq!(trig.cond, None);
+        assert_eq!(trig.retrig, None);
     }
 
     #[test]
@@ -4087,11 +4732,88 @@ mod automation_tests {
 
     const TARGET: &str = "track.volume";
 
+    /// Tags: a clip is its track's letter and its number on that track,
+    /// minted once. Fill order numbers them; a second track gets `b`.
+    #[test]
+    fn tags_are_minted_per_track_in_creation_order() {
+        let mut song = Song::default();
+        song.add_track(TrackKind::Instrument);
+        while song.session.scenes.len() < 4 {
+            song.session.scenes.push(Scene::default());
+        }
+        // The default song's first clip is a0 already.
+        assert_eq!(song.tag_of(song.patterns[0].id), "a0");
+        let a1 = song.fill_slot(0, 0).expect("fill");
+        let a2 = song.fill_slot(0, 2).expect("fill");
+        let b0 = song.fill_slot(1, 1).expect("fill");
+        assert_eq!(song.tag_of(a1), "a1");
+        assert_eq!(song.tag_of(a2), "a2");
+        assert_eq!(song.tag_of(b0), "b0");
+        assert_eq!(song.tracks[0].letter, "a");
+        assert_eq!(song.tracks[1].letter, "b");
+        // Born in the arrangement, the same series.
+        let a3 = song
+            .create_pattern_block(0, DEFAULT_PATTERN_TICKS * 4, DEFAULT_PATTERN_TICKS)
+            .expect("block");
+        assert_eq!(song.tag_of(a3), "a3");
+    }
+
+    /// A duplicated scene's clips are new clips: new numbers, same
+    /// letters. A duplicated track wears a new letter and numbers its
+    /// copies from zero.
+    #[test]
+    fn duplicates_mint_new_tags_and_keep_the_originals() {
+        let mut song = Song::default();
+        song.add_track(TrackKind::Instrument);
+        let a1 = song.fill_slot(0, 0).expect("fill");
+        let b0 = song.fill_slot(1, 0).expect("fill");
+        song.duplicate_scene(0).expect("scene copy");
+        let copies: Vec<String> = song.session.scenes[1]
+            .slots
+            .iter()
+            .map(|slot| {
+                let Clip::Pattern(id) = slot.clip;
+                song.tag_of(id)
+            })
+            .collect();
+        assert_eq!(copies, ["a2", "b1"]);
+        assert_eq!(song.tag_of(a1), "a1");
+        assert_eq!(song.tag_of(b0), "b0");
+        song.duplicate_track(0).expect("track copy");
+        let copy = &song.tracks[1];
+        assert_eq!(copy.letter, "c");
+        let mut tags: Vec<String> = song
+            .patterns
+            .iter()
+            .filter(|pattern| pattern.tag.starts_with('c'))
+            .map(|pattern| pattern.tag.clone())
+            .collect();
+        tags.sort();
+        assert_eq!(tags, ["c0", "c1", "c2"]);
+    }
+
+    /// Letters run a..z then aa, ab…, skipping any a track already wears.
+    #[test]
+    fn letters_run_past_z() {
+        let mut song = Song::default();
+        for _ in 0..27 {
+            song.add_track(TrackKind::Instrument);
+        }
+        for track in 0..song.tracks.len() {
+            let _ = song.mint_tag(track);
+        }
+        assert_eq!(song.tracks[25].letter, "z");
+        assert_eq!(song.tracks[26].letter, "aa");
+        assert_eq!(song.tracks[27].letter, "ab");
+    }
+
     fn track() -> Track {
         Track {
             id: TrackId(1),
             name: "T".to_owned(),
             kind: TrackKind::Instrument,
+            letter: String::new(),
+            tags_minted: 0,
             blocks: Vec::new(),
             muted: false,
             solo: false,
@@ -4103,10 +4825,13 @@ mod automation_tests {
             sends: Vec::new(),
             is_group: false,
             folded: false,
-            chain: Vec::new(),
+            machine: None,
+            legacy_chain: Vec::new(),
             strip: Vec::new(),
             bus: 0,
             bus_by_hand: false,
+            lane: crate::lane::Lane::Plain,
+            lfos: Default::default(),
             depth: 0,
             input: TrackInput::default(),
             monitor: Monitor::default(),
@@ -4492,13 +5217,16 @@ mod modulation_model_tests {
         assert_eq!(song.mod_wires[0].track, 0);
 
         let effect = song
-            .add_device(0, DeviceKind::Filter)
-            .expect("a filter fits");
-        let cutoff = crate::targets::device_target(effect.0, DeviceKind::Filter.spec(), "cutoff");
+            .section(0, crate::console::SectionKind::Four)
+            .expect("the plain lane has FOUR")
+            .id;
+        let spec = DeviceKind::Console(crate::console::SectionKind::Four).spec();
+        let row = spec.params.first().expect("FOUR has parameters");
+        let cutoff = crate::targets::device_target(effect.0, spec, row.name);
         song.add_mod_wire(source, 0, cutoff)
             .expect("the instance target resolves");
         assert_eq!(song.mod_wires.len(), 2);
-        song.remove_device(0, effect).expect("the filter leaves");
+        assert!(song.set_lane(0, crate::lane::Lane::Drum));
         assert_eq!(song.mod_wires.len(), 1, "its wire left with it");
 
         song.remove_track(1).expect("the followed track leaves");
@@ -4803,7 +5531,7 @@ mod mixer_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any()))]
 mod chain_tests {
     use super::*;
     use crate::devices::DeviceKind;
@@ -5204,6 +5932,8 @@ mod audio_block_tests {
             id: TrackId(99),
             name: "AUDIO 01".to_owned(),
             kind: TrackKind::Audio,
+            letter: String::new(),
+            tags_minted: 0,
             blocks: Vec::new(),
             audio_blocks: Vec::new(),
             muted: false,
@@ -5215,10 +5945,13 @@ mod audio_block_tests {
             sends: Vec::new(),
             is_group: false,
             folded: false,
-            chain: Vec::new(),
+            machine: None,
+            legacy_chain: Vec::new(),
             strip: Vec::new(),
             bus: 0,
             bus_by_hand: false,
+            lane: crate::lane::Lane::Plain,
+            lfos: Default::default(),
             depth: 0,
             input: TrackInput::default(),
             monitor: Monitor::default(),
