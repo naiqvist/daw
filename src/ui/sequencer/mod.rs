@@ -55,16 +55,22 @@ use sequence::NoteView;
 /// bytes are not a perceptual space — which is the same argument the
 /// design alphabet's ladder is built on.
 pub fn shade(level: u8, ground: design::Polarity) -> egui::Color32 {
-    let level = match ground {
-        design::Polarity::Dark => level,
-        design::Polarity::Light => MIRROR[level as usize],
-    };
     // A frame that projects the ladder through its own ground gets every
     // level as a shade of that ground; otherwise chrome, not grey — the
     // same cold tint the alphabet's ladder wears.
+    //
+    // WHICH OF THE TWO IS MIRRORED MATTERS. `chrome` reads a level as a
+    // BRIGHTNESS, so paper needs the level itself turned over. A
+    // projection reads it as a DISTANCE from its own ground toward its
+    // own ink, and that ground is already the paper — so mirroring
+    // first would send the grid's quietest wash to full ink and leave
+    // the sequencer dark on a light page, which is exactly what it did.
     match SHADE.read().ok().and_then(|s| *s) {
         Some(lift) => lift(f32::from(level) / 255.0),
-        None => design::chrome(level),
+        None => design::chrome(match ground {
+            design::Polarity::Dark => level,
+            design::Polarity::Light => MIRROR[level as usize],
+        }),
     }
 }
 
