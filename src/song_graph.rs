@@ -630,7 +630,7 @@ pub fn build(song: &Song, playing: &[Option<usize>]) -> (GraphSpec, SongNodes) {
                     });
                 }
             }
-            for step in 0..PATTERN_STEPS {
+            for step in 0..pattern.step_count() {
                 for lock in &pattern.trig(step).locks {
                     let Some(id) = lock.device else {
                         continue;
@@ -1127,7 +1127,7 @@ pub fn build_song(song: &Song) -> (GraphSpec, SongNodes) {
                 let Some(pattern) = song.pattern(block.pattern_id) else {
                     continue;
                 };
-                for step in 0..PATTERN_STEPS {
+                for step in 0..pattern.step_count() {
                     for lock in &pattern.trig(step).locks {
                         let Some(id) = lock.device else {
                             continue;
@@ -1722,7 +1722,7 @@ fn device_binding(
 fn sound_pool<'a>(patterns: impl IntoIterator<Item = &'a Pattern>) -> Vec<&'a SoundLock> {
     let mut pool: Vec<&SoundLock> = Vec::new();
     for pattern in patterns {
-        for step in 0..PATTERN_STEPS {
+        for step in 0..pattern.step_count() {
             let Some(sound) = pattern.trig(step).sound.as_ref() else {
                 continue;
             };
@@ -1907,7 +1907,7 @@ fn notes_of_kept(
     keep: &dyn Fn(&Trig) -> bool,
 ) -> Vec<GraphNote> {
     let mut notes = Vec::new();
-    for step in 0..PATTERN_STEPS {
+    for step in 0..pattern.step_count() {
         let trig = pattern.trig(step);
         if !keep(trig) {
             continue;
@@ -2034,13 +2034,13 @@ fn slides_of(
 ) -> Vec<GraphNote> {
     let mut out = Vec::new();
     let spacing = (PATTERN_STEP_TICKS / SLIDE_POINTS_PER_STEP).max(1);
-    for step in 0..PATTERN_STEPS {
+    for step in 0..pattern.step_count() {
         let trig = pattern.trig(step);
         if !keep(trig) {
             continue;
         }
         for lock in trig.locks.iter().filter(|lock| lock.slide) {
-            let Some((ahead, target)) = (step + 1..PATTERN_STEPS).find_map(|later| {
+            let Some((ahead, target)) = (step + 1..pattern.step_count()).find_map(|later| {
                 let next = pattern.trig(later);
                 if !keep(next) {
                     return None;
@@ -4326,5 +4326,39 @@ mod tests {
         assert_eq!(heard(&song), 2);
         song.patterns[0].trig_mut(4).notes[0].muted = true;
         assert_eq!(heard(&song), 1, "a muted note was played anyway");
+    }
+}
+
+#[cfg(test)]
+mod midi_composer_integration {
+    use super::*;
+    #[test]
+    fn eight_bar_composition_compiles_past_the_former_pattern_boundary() {
+        let mut c = crate::midi_lab::composer::Composition::default();
+        c.progression("Cmaj7:8 Am7:8 Dm7:8 G7:8").unwrap();
+        let rendered = crate::midi_lab::composer::render(&c).unwrap();
+        let mut recipe = crate::midi_lab::Recipe::default();
+        recipe.composition = Some(Box::new(c));
+        let mut pattern = Pattern::default();
+        crate::midi_lab::composer::output::write(
+            &mut pattern,
+            &recipe,
+            &rendered.notes,
+            rendered.length,
+        )
+        .unwrap();
+        let song = Song::default();
+        let notes = notes_of(&song, &pattern, &[]);
+        assert_eq!(notes.len(), rendered.notes.len());
+        assert!(notes.iter().any(|n| n.start_beats >= 24.));
+        for n in &rendered.notes {
+            assert!(notes.iter().any(|g| g.pitch == n.pitch
+                && g.start_beats == n.start as f64 / 48.
+                && g.len_beats == n.length as f64 / 48.
+                && g.vel == n.velocity));
+        }
+        let loaded: Pattern = ron::from_str(&ron::to_string(&pattern).unwrap()).unwrap();
+        assert_eq!(loaded.step_count(), 128);
+        assert_eq!(notes_of(&song, &loaded, &[]).len(), notes.len());
     }
 }

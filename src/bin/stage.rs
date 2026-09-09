@@ -783,9 +783,10 @@ impl Audio {
     /// to the newest engine block. The midir stamp preserves order within a
     /// batch; the engine sample clock is the canonical timeline written into
     /// the take.
-    fn pump_midi(&mut self) {
+    fn pump_midi(&mut self, stage: &mut Stage) {
         self.refresh_midi();
         let events = self.midi_input.drain();
+        stage.midi_lab_input(&events);
         let looped = self.looped;
         let Some(active) = self.recording.as_mut() else {
             return;
@@ -935,7 +936,7 @@ impl Audio {
     }
 
     fn drive_recording(&mut self, stage: &mut Stage) {
-        self.pump_midi();
+        self.pump_midi(stage);
         match (stage.recording(), self.recording.is_some()) {
             (true, false) => self.begin_recording(stage),
             (false, true) => self.request_recording_finish(),
@@ -968,7 +969,7 @@ impl Audio {
             return;
         }
         if self.recording.is_some() {
-            self.pump_midi();
+            self.pump_midi(stage);
             stage.recording_failed("audio engine stopped; closing take");
             self.request_recording_finish();
         }

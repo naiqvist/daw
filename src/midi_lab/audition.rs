@@ -56,6 +56,10 @@ pub fn snapshot(
     destination: Destination,
     notes: &[Event],
 ) -> Result<crate::sequencing::Song, String> {
+    if let Some(composition) = &recipe.composition {
+        let rendered = composer::render(composition)?;
+        return composer::output::audition(song, recipe, destination, &rendered);
+    }
     let track = song
         .tracks
         .iter()
@@ -109,13 +113,23 @@ fn render(
         sample_rate: rate,
         block_frames: 256,
         bpm: song.bpm,
-        length_beats: recipe.length as f64 / 48. + 2.,
+        length_beats: if let Some(composition) = &recipe.composition {
+            composer::render(composition)?.length as f64 / 48. + 2.
+        } else {
+            recipe.length as f64 / 48. + 2.
+        },
         start_beats: 0.,
         format: crate::audio::bounce::BounceFormat::Float32,
     };
-    crate::audio::bounce::bounce_with(&spec, &options, &path, |_| {
-        !job.cancel.load(Ordering::Relaxed)
-    })
+    let timeline = crate::tempo::TempoTable::build(&song, f64::from(rate), song.bpm);
+    crate::audio::bounce::bounce_automated_with_tempo_table(
+        &spec,
+        &options,
+        &path,
+        &timeline,
+        |_, _| {},
+        |_| !job.cancel.load(Ordering::Relaxed),
+    )
     .map_err(|e| e.to_string())?;
     let mut reader = hound::WavReader::open(path).map_err(|e| e.to_string())?;
     let interleaved = reader
@@ -139,6 +153,25 @@ static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn composer_preview_renders_complete_tempo_aware_audio() {
+        let mut recipe = Recipe::composed();
+        let c = recipe.composition.as_mut().unwrap();
+        c.progression("Cmaj7:4 Am7:4").unwrap();
+        let song = crate::sequencing::Song::default();
+        let destination = Destination {
+            track: song.tracks[0].id,
+            pattern: song.patterns[0].id,
+        };
+        let job = Job {
+            cancel: AtomicBool::new(false),
+            result: Mutex::new(None),
+        };
+        let audio = render(song, &recipe, destination, &[], 24_000, &job).unwrap();
+        assert!(audio.frames >= 24_000 * 5);
+        assert!(audio.samples.iter().all(|x| x.is_finite()));
+        assert!(audio.samples.iter().any(|x| x.abs() > 0.001));
+    }
     #[test]
     fn preview_uses_the_sent_pattern_and_produces_audio_through_its_instrument() {
         let mut recipe = Recipe::default();

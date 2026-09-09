@@ -3896,7 +3896,23 @@ impl Pattern {
     }
 
     pub fn trig(&self, step: usize) -> &Trig {
-        &self.trigs[step % PATTERN_STEPS]
+        &self.trigs[step % self.trigs.len()]
+    }
+
+    /// Green-zone storage for complete composed passages. The ordinary grid
+    /// retains its 64-step default; compilation visits the actual stored length.
+    pub fn extend_timeline(&mut self, ticks: usize) -> Result<(), String> {
+        if ticks == 0 || ticks > 49_152 {
+            return Err("Pattern timeline must be 1–49152 ticks".into());
+        }
+        let steps = ticks.div_ceil(PATTERN_STEP_TICKS).max(PATTERN_STEPS);
+        self.trigs.resize_with(steps, Trig::default);
+        self.length_ticks = ticks;
+        Ok(())
+    }
+
+    pub fn step_count(&self) -> usize {
+        self.trigs.len()
     }
 
     /// Set the swing, clamped to the range that means anything. Whether
@@ -3928,7 +3944,7 @@ impl Pattern {
     /// event, like a trigless lock; it waits for a note. Whether anything
     /// changed.
     pub fn set_sound_lock(&mut self, step: usize, sound: Option<SoundLock>) -> bool {
-        if step >= PATTERN_STEPS {
+        if step >= self.step_count() {
             return false;
         }
         let trig = self.trig_mut(step);
@@ -3940,7 +3956,8 @@ impl Pattern {
     }
 
     pub fn trig_mut(&mut self, step: usize) -> &mut Trig {
-        &mut self.trigs[step % PATTERN_STEPS]
+        let count = self.trigs.len();
+        &mut self.trigs[step % count]
     }
 
     pub fn set_primary(&mut self, step: usize, note: Note) {
@@ -3986,7 +4003,7 @@ impl Pattern {
                 let next = self
                     .length_ticks
                     .saturating_add_signed(delta_ticks)
-                    .clamp(PATTERN_STEP_TICKS, DEFAULT_PATTERN_TICKS);
+                    .clamp(PATTERN_STEP_TICKS, self.step_count() * PATTERN_STEP_TICKS);
                 if next == self.length_ticks {
                     return Some("clip resize blocked at the pattern edge");
                 }
@@ -4017,7 +4034,7 @@ impl Pattern {
             | Intent::CopySound { tick, .. } => tick,
         };
         let (step, micro) = Self::address(tick);
-        if step >= PATTERN_STEPS {
+        if step >= self.step_count() {
             return Some("sequence step is outside the pattern");
         }
         let at = |note: &Note| note.micro_ticks == micro;
@@ -4230,7 +4247,7 @@ impl Pattern {
                     return Some("nudge blocked at the pattern edge");
                 };
                 let (target_step, target_micro) = Self::address(target_tick);
-                if target_step >= PATTERN_STEPS {
+                if target_step >= self.step_count() {
                     return Some("nudge blocked at the pattern edge");
                 }
                 if (target_step, target_micro) == (step, micro) {
@@ -4289,7 +4306,7 @@ impl Pattern {
                     return Some("nudge blocked at the pattern edge");
                 };
                 let (target_step, target_micro) = Self::address(target_tick);
-                if target_step >= PATTERN_STEPS {
+                if target_step >= self.step_count() {
                     return Some("nudge blocked at the pattern edge");
                 }
                 if (target_step, target_micro) == (step, micro) {

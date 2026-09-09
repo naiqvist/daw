@@ -15,6 +15,8 @@
 pub const MAX_PITCH: u8 = 127;
 
 pub mod harmony;
+pub mod material;
+pub mod functional;
 
 /// A chord quality, as semitone offsets from the root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -404,6 +406,7 @@ impl ChordSymbol {
             );
         }
 
+        let mut altered_degrees = std::collections::BTreeSet::new();
         while !descriptor.is_empty() {
             if let Some(rest) = strip_word_ci(descriptor, "sus2") {
                 remove_degree(&mut members, 3);
@@ -463,11 +466,13 @@ impl ChordSymbol {
                     let delta = descriptor[..accidentals]
                         .bytes()
                         .fold(0i16, |sum, byte| sum + if byte == b'#' { 1 } else { -1 });
-                    set_degree(
-                        &mut members,
-                        degree,
-                        natural_degree_semitones(degree)? + delta,
-                    );
+                    let semitones = natural_degree_semitones(degree)? + delta;
+                    if altered_degrees.insert(degree) {
+                        remove_degree(&mut members, degree);
+                    }
+                    if !members.iter().any(|m| m.degree == degree && m.semitones == semitones) {
+                        members.push(ChordMember { degree, semitones });
+                    }
                     descriptor = &tail[digits..];
                     continue;
                 }

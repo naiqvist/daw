@@ -14,6 +14,10 @@ use eframe::egui::{self, Align2, FontId, Rect, Stroke, pos2, vec2};
 
 impl Stage {
     pub(super) fn draw_midi_lab(&mut self, parent: &mut egui::Ui, rect: Rect, window: usize) {
+        let composed = self.lab.window(window).and_then(|w| {
+            if let Instrument::Midi(m) = &w.instrument { self.song.midi_labs.iter().find(|d|d.id==m.draft) } else { None }
+        }).is_some_and(|d|d.recipe.composition.is_some());
+        if composed { self.draw_composer(parent, rect, window); return; }
         if parent.rect_contains_pointer(rect) && parent.input(|i| i.pointer.any_pressed()) {
             self.lab.focus = Some(window);
             self.lab.inside = true;
@@ -61,6 +65,7 @@ impl Stage {
                     .size(18.)
                     .color(c.bright),
             );
+            if ui.button("Composer").clicked(){match crate::midi_lab::composer::bridge::migrate(&draft.recipe){Ok(c)=>{draft.recipe.composition=Some(Box::new(c));state.cancel();state.status="Legacy notes preserved in a versioned composition".into();},Err(e)=>state.status=e}}
             ui.separator();
             ui.label("Clip");
             let response = ui.add(
@@ -679,14 +684,14 @@ struct DragOrigin {
     row: f32,
 }
 #[derive(Default)]
-struct BarResponse {
-    clicked: bool,
-    delete: bool,
-    edit: Option<(usize, usize, u8)>,
+pub(super) struct BarResponse {
+    pub(super) clicked: bool,
+    pub(super) delete: bool,
+    pub(super) edit: Option<(usize, usize, u8)>,
 }
 /// Both regions have independent stable ids. Captured origin survives overlap
 /// with a neighbour and travel outside the entire timeline.
-fn bar(
+pub(super) fn bar(
     ui: &mut egui::Ui,
     id: egui::Id,
     rect: Rect,

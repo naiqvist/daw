@@ -34,6 +34,7 @@ mod kiln;
 mod lab;
 mod matrix;
 mod midi_lab;
+mod composer;
 mod mixer;
 mod modulation;
 mod plock_editor;

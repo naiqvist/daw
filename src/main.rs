@@ -44,6 +44,8 @@ use daw::targets::{
 // `shell::post` is shared with the library target, where creative constants
 // resolve through `crate::tune!`. Give the binary crate the same root name.
 use daw::tune;
+// The shared shell renderer resolves its native scene registry through this root.
+use daw::ui;
 use daw::ui::action::UiAction;
 use daw::ui::affordance::{Afford, Affords};
 use daw::ui::device;

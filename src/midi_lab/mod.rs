@@ -1,6 +1,7 @@
 //! MIDI Lab authors immutable, tick-addressed clips in the green zone.
 //! The same result feeds preview, the geometry, export and Send.
 pub mod audition;
+pub mod composer;
 pub mod generate;
 use crate::sequencing::{
     DEFAULT_PATTERN_TICKS, Note, PATTERN_STEP_TICKS, Pattern, PatternId, TrackId,
@@ -155,6 +156,10 @@ pub struct Event {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Recipe {
+    /// Versioned composer document. Absence retains the original generator for
+    /// legacy projects until their exact events have been snapshotted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composition: Option<Box<composer::Composition>>,
     pub length: usize,
     pub harmony: Vec<Harmony>,
     pub voices: [VoiceSpec; 5],
@@ -167,6 +172,7 @@ pub struct Recipe {
 impl Default for Recipe {
     fn default() -> Self {
         Self {
+            composition: None,
             length: 384,
             harmony: vec![
                 Harmony {
@@ -207,6 +213,9 @@ impl Default for Recipe {
     }
 }
 impl Recipe {
+    pub fn composed() -> Self {
+        Self { composition: Some(Box::new(composer::Composition::default())), ..Self::default() }
+    }
     pub fn mint(&mut self) -> u64 {
         self.next_id = self.next_id.wrapping_add(1).max(100);
         self.next_id

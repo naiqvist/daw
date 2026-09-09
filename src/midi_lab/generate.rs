@@ -92,6 +92,9 @@ pub fn gates(recipe: &Recipe, voice: Voice) -> Vec<Gate> {
 }
 
 pub fn generate(recipe: &Recipe) -> Result<Generated, String> {
+    if let Some(composition) = &recipe.composition {
+        return super::composer::bridge::generated(composition);
+    }
     if recipe.length == 0 || recipe.length > DEFAULT_PATTERN_TICKS {
         return Err("Clip length must be 1–16 beats".into());
     }

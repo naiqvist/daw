@@ -31,6 +31,7 @@ mod lattice;
 mod log;
 mod matrix;
 mod midi_lab;
+mod composer;
 mod mixer;
 mod modulation;
 mod palette;
