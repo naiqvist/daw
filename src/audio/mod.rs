@@ -11,6 +11,12 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 pub mod acid;
+pub mod spectral;
+pub mod spectral_fx;
+pub mod spectral_mod;
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod spectral_integration_tests;
 pub mod bounce;
 pub mod brick;
 pub mod clamp;

@@ -5,6 +5,15 @@ edition = "2024"
 
 [workspace]
 
+# The audio-only build has no visual compiler, renderer, exporter or frame hook.
+[features]
+default = []
+visuals = []
+
+[[example]]
+name = "visual_score"
+required-features = ["visuals"]
+
 [dependencies]
 
 # --- corpus kernels — GREEN ---

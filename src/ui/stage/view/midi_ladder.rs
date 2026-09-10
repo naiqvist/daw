@@ -90,7 +90,9 @@ impl Stage {
                 .saturating_sub(visible / 2)
                 .min(rows.len() - visible)
         };
-        let painter = painter.with_clip_rect(painter.clip_rect().intersect(body));
+        // The rows are clipped to the body; the status and the key
+        // line below it are NOT, which is why this does not shadow.
+        let rows_painter = painter.with_clip_rect(painter.clip_rect().intersect(body));
         for (slot, (index, row)) in rows
             .iter()
             .enumerate()
@@ -105,9 +107,9 @@ impl Stage {
             );
             let under = index == ladder.at;
             if under {
-                painter.rect_filled(area, 0.0, c.bright.linear_multiply(0.14));
+                rows_painter.rect_filled(area, 0.0, c.bright.linear_multiply(0.14));
                 crate::ui::nav_cursor::claim(
-                    &painter,
+                    &rows_painter,
                     ("midi-ladder", index),
                     area,
                     crate::ui::nav_cursor::Kind::Row,
@@ -118,7 +120,7 @@ impl Stage {
             // A row that IS the standing answer wears a mark, so the
             // list says what was chosen as well as what is possible.
             if row.chosen {
-                painter.text(
+                rows_painter.text(
                     egui::pos2(area.left() + PAD, area.top() + 11.0),
                     egui::Align2::LEFT_CENTER,
                     ">",
@@ -126,14 +128,14 @@ impl Stage {
                     c.nominal,
                 );
             }
-            painter.text(
+            rows_painter.text(
                 egui::pos2(area.left() + PAD + 16.0, area.top() + 11.0),
                 egui::Align2::LEFT_CENTER,
                 &row.label,
                 font.clone(),
                 if under { c.bright } else { c.fg },
             );
-            painter.text(
+            rows_painter.text(
                 egui::pos2(area.right() - PAD, area.top() + 11.0),
                 egui::Align2::RIGHT_CENTER,
                 &row.value,
@@ -141,7 +143,7 @@ impl Stage {
                 if row.chosen { c.nominal } else { c.dim },
             );
             if !row.note.is_empty() {
-                painter.text(
+                rows_painter.text(
                     egui::pos2(area.left() + PAD + 16.0, area.top() + 24.0),
                     egui::Align2::LEFT_CENTER,
                     &row.note,
@@ -160,6 +162,27 @@ impl Stage {
             {
                 self.midi_ladder_click(index);
             }
+        }
+
+        // WHAT THE LAB SAID. A ladder that takes an action and reports
+        // nothing is a ladder you cannot trust: the send that refused
+        // because two parts shared a pitch said so, into a status line
+        // nothing drew.
+        let said = self
+            .midi_focus()
+            .and_then(|(window, _)| self.midi_window(window))
+            .map(|state| state.status.clone())
+            .unwrap_or_default();
+        if !said.is_empty() {
+            // Beside the question, not at the foot of the window: what
+            // just happened belongs where the eye already is.
+            painter.text(
+                egui::pos2(rect.right() - PAD, rect.top() + 46.0),
+                egui::Align2::RIGHT_CENTER,
+                &said,
+                font.clone(),
+                c.nominal,
+            );
         }
 
         // The keys, along the bottom: what this rung answers to.

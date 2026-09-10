@@ -10,6 +10,7 @@ pub mod clap_host;
 pub mod console;
 pub mod corpus;
 pub mod design;
+pub mod drive;
 pub mod devices;
 pub mod dsp;
 pub mod history;
@@ -33,11 +34,14 @@ pub mod shell;
 pub mod slice;
 pub mod song_graph;
 pub mod sound;
+pub mod spectral;
 pub mod targets;
 pub mod tempo;
 pub mod theory;
 pub mod tune;
 pub mod ui;
+#[cfg(feature = "visuals")]
+pub mod visuals;
 
 use eframe::egui;
 use std::collections::VecDeque;

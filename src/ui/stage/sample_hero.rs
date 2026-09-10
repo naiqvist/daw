@@ -791,7 +791,14 @@ impl Stage {
                     .ok_or(RefusalReason::Unavailable)?;
                 self.hero_edit(&[(p::MODE, 2.0), (p::SOURCE_BEATS, beats as f32)])?;
                 self.touched();
-                self.notice = Some("slice pattern added to arrangement".into());
+                // SAY WHERE IT WENT. The pattern is laid after whatever
+                // the track already carries, which is rarely where the
+                // cursor is standing — so a notice that only says it was
+                // "added to the arrangement" sends the reader into the
+                // clip they were already looking at, and they edit an
+                // empty one for a while before noticing.
+                let bar = start / (4 * crate::sequencing::TICKS_PER_BEAT) + 1;
+                self.notice = Some(format!("slice pattern → track {} · bar {bar}", track + 1));
                 return Ok(());
             }
             _ => return Err(RefusalReason::Unavailable),

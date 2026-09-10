@@ -230,6 +230,15 @@ pub(crate) struct PitchEntry {
 
 pub struct Outcome {
     pub intents: Vec<Intent>,
+    /// What the grammar said about the command it just refused or
+    /// answered, on the frame it said it.
+    ///
+    /// The editor draws this over its own header, which is the right
+    /// place to READ it and the wrong place for it to stop: a refusal
+    /// nobody outside the panel can see is one the status line cannot
+    /// report and a scripted run cannot notice. `NUDGE: PATTERN EDGE`
+    /// and `CONDITION: NOTHING HERE` both went unheard that way.
+    pub said: Option<String>,
     pub claim_focus: bool,
     /// Where the panel drew, so the frame that owns focus can mark it
     /// (a focus bar, a scrim, an inversion — the frame's sign, not ours).
@@ -261,6 +270,7 @@ impl Default for Outcome {
             content_rect: egui::Rect::NOTHING,
             cursor_tick: None,
             cursor_rect: None,
+            said: None,
         }
     }
 }
@@ -447,6 +457,7 @@ impl SequencePanel {
                 trig_info::show(ui, trig_rect, self.grid.selection(clip), ground);
                 outcome.cursor_tick = Some(self.grid.cursor_tick());
                 outcome.cursor_rect = self.grid.cursor_rect();
+                outcome.said = self.grid.said();
                 requested
             }
             Editor::Roll => {
@@ -463,6 +474,7 @@ impl SequencePanel {
                 trig_info::show(ui, trig_rect, self.roll.selection(clip), ground);
                 outcome.cursor_tick = Some(self.roll.cursor_tick());
                 outcome.cursor_rect = self.roll.cursor_rect();
+                outcome.said = self.roll.said();
                 requested
             }
         };

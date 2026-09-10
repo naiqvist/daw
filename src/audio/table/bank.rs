@@ -38,6 +38,11 @@ pub struct Bank<P: Patch> {
     steal: Frame,
     steal_left: [usize; N],
     last: Frame,
+    // Glass's mono foundation bypasses internal colour FX. Its separate steal
+    // history keeps note stealing click-limited without changing legacy voices.
+    sub_last: Frame,
+    sub_steal: Frame,
+    sub_steal_left: [usize; N],
     amp: Envelopes,
     motion: Envelopes,
     filter: Lowpass,
@@ -92,6 +97,9 @@ impl<P: Patch> Bank<P> {
             steal: [0.; N],
             steal_left: [0; N],
             last: [0.; N],
+            sub_last: [0.; N],
+            sub_steal: [0.; N],
+            sub_steal_left: [0; N],
             amp: Envelopes::new(),
             motion: Envelopes::new(),
             filter: Lowpass::new(),
@@ -186,6 +194,9 @@ impl<P: Patch> Bank<P> {
         self.tail.fill(0);
         self.steal_left.fill(0);
         self.last.fill(0.);
+        self.sub_last.fill(0.);
+        self.sub_steal.fill(0.);
+        self.sub_steal_left.fill(0);
         self.feedback.fill(0.);
         self.chunk = 0;
         self.locks = 0;
@@ -332,6 +343,12 @@ impl<P: Patch> Bank<P> {
             .find(|&l| !self.amp.active(l) && self.tail[l] == 0)
             .unwrap_or_else(|| (0..N).min_by_key(|&l| self.age[l]).unwrap_or(0));
         self.steal[lane] = self.last[lane];
+        self.sub_steal[lane] = self.sub_last[lane];
+        self.sub_steal_left[lane] = if self.sub_last[lane].abs() > 1e-6 {
+            64
+        } else {
+            0
+        };
         self.steal_left[lane] = if self.last[lane].abs() > 1e-6 { 64 } else { 0 };
         self.pitch[lane] = pitch;
         self.root[lane] = root;
@@ -601,14 +618,44 @@ impl<P: Patch> Bank<P> {
                 let index = index.min(guard + index * (1. - self.v(25, lane)) * 0.1);
                 let feedback = (self.v(20, lane) + disorder * 0.45).min(0.95);
                 let algo = self.v(13, lane).round() as u32;
-                let b = self.sine(1, lane, self.feedback[lane] * feedback * 0.35);
-                let a = self.sine(0, lane, b * index / ::core::f32::consts::TAU);
+                // Operator C uses the existing prepared four-oscillator kernel.
+                // No modulation graph, buffers or per-voice objects are added.
+                // Zero index-B takes the exact legacy arithmetic path.
+                let index_b = self.v(38, lane)
+                    * (self.v(19, lane) + (1. - self.v(19, lane)) * env)
+                    * velocity;
+                let (b, a, parallel_pm) = if index_b > 0. {
+                    let fm_b = fc * self.v(37, lane);
+                    let guard_b = ((self.sr * 0.43 - fc.max(fm)) / fm_b.max(1.) - 2.).max(0.);
+                    let index_b = index_b.min(guard_b + index_b * (1. - self.v(25, lane)) * 0.1);
+                    let c = self.sine(2, lane, 0.) * index_b;
+                    let cascade = self.v(39, lane);
+                    let b = self.sine(
+                        1,
+                        lane,
+                        self.feedback[lane] * feedback * 0.35
+                            + c * cascade / ::core::f32::consts::TAU,
+                    );
+                    let a = self.sine(
+                        0,
+                        lane,
+                        (b * index + c * (1. - cascade)) / ::core::f32::consts::TAU,
+                    );
+                    (b, a, c * (1. - cascade) / ::core::f32::consts::TAU)
+                } else {
+                    let b = self.sine(1, lane, self.feedback[lane] * feedback * 0.35);
+                    let a = self.sine(0, lane, b * index / ::core::f32::consts::TAU);
+                    (b, a, 0.)
+                };
+                // Keep phase running even while C is inaudible; locks can open
+                // its depth without an arbitrary oscillator-phase discontinuity.
+                self.osc.advance(2, lane, fc * self.v(37, lane), self.sr);
                 self.feedback[lane] = if algo == 2 { (a + b) * 0.5 } else { b };
                 self.osc.advance(0, lane, fc, self.sr);
                 self.osc.advance(1, lane, fm, self.sr);
                 if algo == 1 {
                     let mix = index / (index + 1.);
-                    self.sine(0, lane, 0.) * (1. - mix * 0.5) + b * mix * 0.5
+                    self.sine(0, lane, parallel_pm) * (1. - mix * 0.5) + b * mix * 0.5
                 } else {
                     a
                 }
@@ -687,6 +734,7 @@ impl<P: Patch> Bank<P> {
             }
             let mut l = 0.;
             let mut r = 0.;
+            let mut sub = 0.;
             for lane in 0..N {
                 let mut sample = frame[0][lane]
                     * amp[0][lane]
@@ -699,6 +747,36 @@ impl<P: Patch> Bank<P> {
                     self.steal_left[lane] -= 1;
                 }
                 self.last[lane] = sample;
+                if P::KIND == 3 {
+                    // Sine stays mono and outside filter/tilt/shimmer, but still
+                    // follows note gates, velocity, level, tune and voice stealing.
+                    // Downstream track FX can of course still process this sum.
+                    sample *= self.v(42, lane);
+                    let mut foundation = if self.amp.active(lane) {
+                        let sine = self.sine(3, lane, 0.);
+                        self.osc.advance(
+                            3,
+                            lane,
+                            self.frequency[lane] * 2_f32.powf(self.v(41, lane) / 12.),
+                            self.sr,
+                        );
+                        sine * self.v(40, lane)
+                            * amp[0][lane]
+                            * (1. - self.v(4, lane) + self.v(4, lane) * self.velocity[lane])
+                            * self.v(5, lane)
+                            * 0.24
+                            * ::core::f32::consts::FRAC_1_SQRT_2
+                    } else {
+                        0.
+                    };
+                    if self.sub_steal_left[lane] > 0 {
+                        let a = self.sub_steal_left[lane] as f32 / 64.;
+                        foundation = foundation * (1. - a) + self.sub_steal[lane] * a;
+                        self.sub_steal_left[lane] -= 1;
+                    }
+                    self.sub_last[lane] = foundation;
+                    sub += foundation;
+                }
                 let width = self.v(7, lane);
                 let pan_motion = if P::KIND == 3 {
                     self.v(26, lane)
@@ -716,9 +794,9 @@ impl<P: Patch> Bank<P> {
             }
             let (l, r) = self.fx(l, r);
             let g = gain.next();
-            *dst = l * g;
+            *dst = (l + sub) * g;
             if let Some(dst) = self.right.get_mut(at + i) {
-                *dst = r * g;
+                *dst = (r + sub) * g;
             }
         }
     }

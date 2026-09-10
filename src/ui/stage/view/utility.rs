@@ -116,15 +116,25 @@ impl Console {
             return None;
         }
 
-        // Shift-left/right walks the four utility rooms. Unshifted motion
-        // belongs to the value on the current row.
-        if key(ctx, egui::Modifiers::SHIFT, egui::Key::ArrowLeft) {
-            self.cycle_page(-1);
+        // TAB WALKS THE ROOMS, because that is what Tab does everywhere
+        // else in this application and everywhere else in the world: the
+        // rooms are named across the top like tabs and they are tabs.
+        // Shift-arrows still work — they were the only way for a while —
+        // but nobody guesses them, and the cost of guessing wrong here is
+        // not nothing: an unshifted arrow edits the value under the
+        // cursor, so a reader hunting for the export room changes their
+        // audio backend instead.
+        if key(ctx, egui::Modifiers::NONE, egui::Key::Tab)
+            || key(ctx, egui::Modifiers::SHIFT, egui::Key::ArrowRight)
+        {
+            self.cycle_page(1);
             self.clamp_row(stage);
             return None;
         }
-        if key(ctx, egui::Modifiers::SHIFT, egui::Key::ArrowRight) {
-            self.cycle_page(1);
+        if key(ctx, egui::Modifiers::SHIFT, egui::Key::Tab)
+            || key(ctx, egui::Modifiers::SHIFT, egui::Key::ArrowLeft)
+        {
+            self.cycle_page(-1);
             self.clamp_row(stage);
             return None;
         }

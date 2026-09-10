@@ -100,6 +100,8 @@ use device_state::{
     sat_knobs, scomp_knobs, sheen_knobs, sibyl_knobs, sigil_knobs, stab_knobs, strip_knobs,
     synth_knobs, tilt_knobs, tine_knobs, tone_knobs, umbra_knobs, unit_zoom, utility_knobs,
 };
+#[path = "drive.rs"]
+mod drive;
 mod shell;
 use arrangement::*;
 use bar::{Bar, TRANSPORT_GAP, TRANSPORT_GROUP_GAP, bar_layout, buttons_width, fields_width};
@@ -6072,6 +6074,7 @@ fn plockable_params(track: &Track) -> Vec<piano_roll::PlockParam> {
         DeviceKind::SineSynth => daw::params::seq::GAIN,
         DeviceKind::Kick => daw::params::kick::GAIN,
         DeviceKind::Acid => daw::params::acid::LEVEL,
+        DeviceKind::Spectral => daw::params::spectral::LEVEL,
         DeviceKind::Snare => daw::params::snare::GAIN,
         DeviceKind::Tom => daw::params::tom::GAIN,
         DeviceKind::Hat => daw::params::hat::GAIN,

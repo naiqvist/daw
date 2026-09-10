@@ -562,6 +562,7 @@ pub fn key_table(kind: DeviceKind) -> Option<&'static KeyTable> {
         DeviceKind::Glass => Some(&crate::params::glass::KEYS),
         DeviceKind::Rom => Some(&crate::params::rom::KEYS),
         DeviceKind::Acid => Some(&crate::params::acid::KEYS),
+        DeviceKind::Spectral => Some(&crate::params::spectral::KEYS),
         _ => None,
     }
 }

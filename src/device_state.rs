@@ -286,6 +286,7 @@ pub enum DeviceState {
     Strip(daw::audio::strip::StripParams),
     Resyn(daw::audio::resyn::ResynParams),
     Acid(daw::audio::acid::AcidParams),
+    Spectral(daw::audio::spectral::SpectralParams),
     /// A RACK: a container, and nothing else.
     ///
     /// It has no parameters and makes no sound. Its children sit beside
@@ -361,6 +362,7 @@ impl DeviceState {
             DeviceKind::Strip => Self::Strip(daw::audio::strip::StripParams::default()),
             DeviceKind::Resyn => Self::Resyn(daw::audio::resyn::ResynParams::default()),
             DeviceKind::Acid => Self::Acid(daw::audio::acid::AcidParams::default()),
+            DeviceKind::Spectral => Self::Spectral(daw::audio::spectral::SpectralParams::default()),
             DeviceKind::Rack => Self::Rack,
             // A console section never reaches this binary; it is the stage's.
             DeviceKind::Console(_) => Self::Rack,
@@ -424,6 +426,7 @@ impl DeviceState {
             Self::Strip(_) => DeviceKind::Strip,
             Self::Resyn(_) => DeviceKind::Resyn,
             Self::Acid(_) => DeviceKind::Acid,
+            Self::Spectral(_) => DeviceKind::Spectral,
             Self::Rack => DeviceKind::Rack,
             Self::Limiter(_) => DeviceKind::Limiter,
             Self::Modulato(_) => DeviceKind::Modulato,
@@ -592,6 +595,7 @@ impl DeviceState {
             Self::Strip(p) => p.get(param),
             Self::Resyn(p) => p.get(param),
             Self::Acid(p) => p.get(param),
+            Self::Spectral(p) => p.get(param),
             // A rack has no parameters, so every id is unknown to it.
             Self::Rack => None,
             // Its own reader beside its own writer, in the struct that
@@ -724,6 +728,7 @@ impl DeviceState {
             Self::Strip(p) => p.set(param, value),
             Self::Resyn(p) => p.set(param, value),
             Self::Acid(p) => p.set(param, value),
+            Self::Spectral(p) => p.set(param, value),
             Self::Rack => {}
             Self::Limiter(p) => p.set(param, value),
             Self::Modulato(p) => p.set(param, value),
@@ -1223,6 +1228,7 @@ pub fn device_norm(kind: DeviceKind, param: u32, value: f32) -> f32 {
         DeviceKind::Strip => device::strip_norm(param, value),
         DeviceKind::Resyn => device::resyn_norm(param, value),
         DeviceKind::Acid => device::acid_norm(param, value),
+        DeviceKind::Spectral => daw::params::spectral::norm(param, value),
         // A rack has no parameters; nothing ever asks, and this is what
         // it would be told if it did.
         DeviceKind::Rack => 0.0,
@@ -1301,6 +1307,7 @@ pub fn device_is_discrete(kind: DeviceKind, param: u32) -> bool {
         DeviceKind::Strip => device::strip_is_discrete(param),
         DeviceKind::Resyn => device::resyn_is_discrete(param),
         DeviceKind::Acid => device::acid_is_discrete(param),
+        DeviceKind::Spectral => daw::params::spectral::discrete(param),
         // A rack has no parameters; nothing ever asks, and this is what
         // it would be told if it did.
         DeviceKind::Rack => false,
@@ -1374,6 +1381,7 @@ pub fn device_is_log(kind: DeviceKind, param: u32) -> bool {
         DeviceKind::Strip => device::strip_is_log(param),
         DeviceKind::Resyn => device::resyn_is_log(param),
         DeviceKind::Acid => device::acid_is_log(param),
+        DeviceKind::Spectral => daw::params::spectral::LOG.contains(&param),
         // A rack has no parameters; nothing ever asks, and this is what
         // it would be told if it did.
         DeviceKind::Rack => false,
@@ -1447,6 +1455,7 @@ pub fn device_value(kind: DeviceKind, param: u32, norm: f32) -> f32 {
         DeviceKind::Strip => device::strip_value(param, norm),
         DeviceKind::Resyn => device::resyn_value(param, norm),
         DeviceKind::Acid => device::acid_value(param, norm),
+        DeviceKind::Spectral => daw::params::spectral::value(param, norm),
         // A rack has no parameters; nothing ever asks, and this is what
         // it would be told if it did.
         DeviceKind::Rack => 0.0,

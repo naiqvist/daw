@@ -42,6 +42,12 @@ pub struct GlassParams {
     pub tilt_pivot: f32,
     pub tilt_drive: f32,
     pub tilt_mix: f32,
+    pub ratio_b: f32,
+    pub index_b: f32,
+    pub cascade: f32,
+    pub sub: f32,
+    pub sub_tune: f32,
+    pub body: f32,
 }
 impl Default for GlassParams {
     fn default() -> Self {
@@ -83,6 +89,12 @@ impl Default for GlassParams {
             tilt_pivot: crate::params::def(p::TABLE, p::TILT_PIVOT).default,
             tilt_drive: crate::params::def(p::TABLE, p::TILT_DRIVE).default,
             tilt_mix: crate::params::def(p::TABLE, p::TILT_MIX).default,
+            ratio_b: crate::params::def(p::TABLE, p::RATIO_B).default,
+            index_b: crate::params::def(p::TABLE, p::INDEX_B).default,
+            cascade: crate::params::def(p::TABLE, p::CASCADE).default,
+            sub: crate::params::def(p::TABLE, p::SUB).default,
+            sub_tune: crate::params::def(p::TABLE, p::SUB_TUNE).default,
+            body: crate::params::def(p::TABLE, p::BODY).default,
         }
     }
 }
@@ -132,6 +144,12 @@ impl GlassParams {
             p::TILT_PIVOT => self.tilt_pivot = value,
             p::TILT_DRIVE => self.tilt_drive = value,
             p::TILT_MIX => self.tilt_mix = value,
+            p::RATIO_B => self.ratio_b = value,
+            p::INDEX_B => self.index_b = value,
+            p::CASCADE => self.cascade = value,
+            p::SUB => self.sub = value,
+            p::SUB_TUNE => self.sub_tune = value,
+            p::BODY => self.body = value,
             _ => {}
         }
     }
@@ -174,6 +192,12 @@ impl GlassParams {
             p::TILT_PIVOT => self.tilt_pivot,
             p::TILT_DRIVE => self.tilt_drive,
             p::TILT_MIX => self.tilt_mix,
+            p::RATIO_B => self.ratio_b,
+            p::INDEX_B => self.index_b,
+            p::CASCADE => self.cascade,
+            p::SUB => self.sub,
+            p::SUB_TUNE => self.sub_tune,
+            p::BODY => self.body,
             _ => 0.0,
         }
     }
@@ -245,6 +269,106 @@ pub fn hero(params: &GlassParams, page: &str, selected: Option<u32>) -> Option<c
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn neuro() -> GlassParams {
+        GlassParams {
+            ratio: 1.,
+            index: 5.,
+            ratio_b: 2.01,
+            index_b: 4.,
+            cascade: 0.7,
+            sub: 0.8,
+            body: 0.8,
+            width: 0.9,
+            attack: 2.,
+            sustain: 1.,
+            release: 40.,
+            i_sustain: 0.6,
+            ..Default::default()
+        }
+    }
+    fn sound(p: GlassParams) -> (Vec<f32>, Vec<f32>) {
+        let mut v = GlassVoices::new();
+        v.prepare(48000., 4096, p);
+        v.note_on(41, 127, 1);
+        let mut x = vec![0.; 4096];
+        v.render(&mut x, 0, &mut Ramp::across(1., 1., 1));
+        (x, v.right(4096).to_vec())
+    }
+    #[test]
+    fn neuro_controls_serialize_and_have_independent_agency() {
+        let p = neuro();
+        let encoded = ron::to_string(&p).unwrap();
+        assert_eq!(p, ron::from_str::<GlassParams>(&encoded).unwrap());
+        let old: GlassParams = ron::from_str("(ratio:1.0,index:3.0)").unwrap();
+        assert_eq!((old.index_b, old.sub, old.body), (0., 0., 1.));
+        let baseline = sound(p).0;
+        for (id, value) in [
+            (p::RATIO_B, 3.1),
+            (p::INDEX_B, 0.),
+            (p::CASCADE, 0.),
+            (p::SUB, 0.),
+            (p::SUB_TUNE, 0.),
+            (p::BODY, 0.),
+        ] {
+            let mut changed = p;
+            changed.set(id, value);
+            assert_ne!(baseline, sound(changed).0, "parameter {id}");
+        }
+    }
+    #[test]
+    fn neuro_is_exactly_segmentable_and_realtime_safe() {
+        let p = neuro();
+        let whole = sound(p);
+        let mut v = GlassVoices::new();
+        v.prepare(48000., 4096, p);
+        v.note_on(41, 127, 1);
+        let mut x = vec![0.; 4096];
+        assert_no_alloc::assert_no_alloc(|| {
+            v.render(&mut [], 0, &mut Ramp::across(1., 1., 1));
+            let mut at = 0;
+            for n in [1, 31, 257, 100, 3707] {
+                v.render(&mut x[at..at + n], at, &mut Ramp::across(1., 1., 1));
+                at += n;
+            }
+        });
+        assert_eq!(whole.0, x);
+        assert_eq!(whole.1, v.right(4096));
+        assert_no_alloc::assert_no_alloc(|| {
+            for i in 0..32 {
+                v.note_on(36 + (i % 12) as u8, 127, i + 2);
+            }
+            v.render(&mut x[..257], 0, &mut Ramp::across(1., 1., 1));
+            v.release_all();
+            v.reset();
+            v.render(&mut x, 0, &mut Ramp::across(1., 1., 1));
+        });
+        assert!(x.iter().all(|x| *x == 0.));
+    }
+    #[test]
+    fn foundation_is_mono_and_bypasses_internal_colour() {
+        let p = GlassParams {
+            body: 0.,
+            sub: 0.8,
+            width: 1.,
+            pan_motion: 1.,
+            tilt_drive: 12.,
+            tilt: 18.,
+            shimmer_mix: 1.,
+            cutoff: 30.,
+            ..neuro()
+        };
+        let coloured = sound(p);
+        assert_eq!(coloured.0, coloured.1);
+        assert!(coloured.0.iter().any(|x| x.abs() > 0.01));
+        let dry = sound(GlassParams {
+            tilt_drive: 0.,
+            tilt: 0.,
+            shimmer_mix: 0.,
+            cutoff: 20000.,
+            ..p
+        });
+        assert_eq!(coloured, dry);
+    }
     #[test]
     fn mechanics() {
         crate::audio::table::bank::test_bank::<GlassParams>();

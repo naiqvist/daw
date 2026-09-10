@@ -89,6 +89,65 @@ pub enum Key {
 }
 
 impl Key {
+    /// Whether pressing this key also types a character.
+    ///
+    /// Load-bearing while something is taking text. A field that is being
+    /// typed into owns every one of these, because a person typing a
+    /// query means the query — a space in a search box is a space, not
+    /// the transport, and a question mark is a question mark, not the
+    /// codebook.
+    pub fn types_a_character(self) -> bool {
+        matches!(
+            self,
+            Self::A
+                | Self::B
+                | Self::C
+                | Self::D
+                | Self::E
+                | Self::F
+                | Self::G
+                | Self::H
+                | Self::I
+                | Self::J
+                | Self::K
+                | Self::L
+                | Self::M
+                | Self::N
+                | Self::O
+                | Self::P
+                | Self::Q
+                | Self::R
+                | Self::S
+                | Self::T
+                | Self::U
+                | Self::V
+                | Self::W
+                | Self::X
+                | Self::Y
+                | Self::Z
+                | Self::Num0
+                | Self::Num1
+                | Self::Num2
+                | Self::Num3
+                | Self::Num4
+                | Self::Num5
+                | Self::Num6
+                | Self::Num7
+                | Self::Num8
+                | Self::Num9
+                | Self::CloseBracket
+                | Self::OpenBracket
+                | Self::Comma
+                | Self::Period
+                | Self::Minus
+                | Self::Plus
+                | Self::Equals
+                | Self::Questionmark
+                | Self::Slash
+                | Self::Space
+        )
+    }
+
     /// The key's name, as egui spells it.
     pub fn name(self) -> &'static str {
         match self {

@@ -495,6 +495,7 @@ impl Pad {
         Sound {
             lane: crate::lane::Lane::Plain.name().to_owned(),
             machine: Some(Machine {
+                spectral: None,
                 kind: "rom".to_owned(),
                 overrides,
                 sample: None,

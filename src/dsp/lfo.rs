@@ -29,6 +29,105 @@ pub enum LfoShape {
     Square,
 }
 
+/// Lane-major twin of `Lfo`: shared shape/rate, independent note phases.
+/// Zero latency, no scratch, LFO-grade (not a bandlimited audio oscillator).
+#[derive(Clone, Debug)]
+pub struct LaneLfo {
+    phase: [u32; crate::dsp::LANES],
+    inc: u32,
+    shape: LfoShape,
+}
+
+#[cfg(test)]
+mod lane_tests {
+    use super::*;
+    use crate::dsp::LANES;
+    #[test]
+    fn lane_lfo_reference_split_edges_no_alloc_and_independence() {
+        for shape in [
+            LfoShape::Sine,
+            LfoShape::Triangle,
+            LfoShape::SawUp,
+            LfoShape::SawDown,
+            LfoShape::Square,
+        ] {
+            let mut lane = LaneLfo::new();
+            lane.prepare(48_000.0, 3.0, shape);
+            for i in 0..LANES {
+                lane.set_phase(i, i as f32 / 8.0);
+            }
+            let mut split = lane.clone();
+            let mut changed = lane.clone();
+            changed.set_phase(3, 0.9);
+            let mut a = [[0.0; LANES]; 257];
+            let mut b = a;
+            let mut c = a;
+            assert_no_alloc::assert_no_alloc(|| {
+                lane.process(&mut a);
+                split.process(&mut []);
+                split.process(&mut b[..1]);
+                split.process(&mut b[1..130]);
+                split.process(&mut b[130..]);
+                changed.process(&mut c);
+            });
+            assert_eq!(a, b);
+            for i in 0..LANES {
+                let mut scalar = Lfo::new();
+                scalar.prepare(48_000.0);
+                scalar.set_rate(3.0);
+                scalar.set_shape(shape);
+                scalar.set_phase(i as f32 / 8.0);
+                let mut expected = [0.0; 257];
+                scalar.process(&mut expected);
+                for n in 0..257 {
+                    assert_eq!(a[n][i], expected[n]);
+                    if i != 3 {
+                        assert_eq!(a[n][i], c[n][i]);
+                    }
+                }
+            }
+            lane.reset();
+            lane.prepare(48_000.0, 0.0, LfoShape::Sine);
+            lane.process(&mut a);
+            assert!(a.iter().flatten().all(|v| *v == 0.0));
+        }
+    }
+}
+impl Default for LaneLfo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl LaneLfo {
+    pub fn new() -> Self {
+        Self {
+            phase: [0; crate::dsp::LANES],
+            inc: 0,
+            shape: LfoShape::Sine,
+        }
+    }
+    pub fn prepare(&mut self, sr: f32, hz: f32, shape: LfoShape) {
+        self.inc = phase_increment(valid_sample_rate(sr), hz);
+        self.shape = shape;
+    }
+    pub fn reset(&mut self) {
+        self.phase.fill(0);
+    }
+    pub fn set_phase(&mut self, lane: usize, turns: f32) {
+        if let Some(p) = self.phase.get_mut(lane) {
+            *p = phase_from_turns(turns);
+        }
+    }
+    pub fn process(&mut self, out: &mut [crate::dsp::LaneFrame]) {
+        for frame in out {
+            for (lane, sample) in frame.iter_mut().enumerate() {
+                *sample = shape_at(self.shape, self.phase[lane]);
+                self.phase[lane] = self.phase[lane].wrapping_add(self.inc);
+            }
+        }
+    }
+}
+
 /// Fixed-point, bipolar modulation oscillator.
 ///
 /// This is LFO-grade, not for audio rate: its naive corners are intentional

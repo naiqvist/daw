@@ -127,7 +127,7 @@ fn metered(label: &'static str, value: impl Into<String>, tone: Tone, share: f32
 
 /// The keyboard authority currently holding the workstation. This is the
 /// command-centre breadcrumb: a core state, never a decorative mode name.
-fn scope_word(scope: ScopeContext) -> &'static str {
+pub(in crate::ui::stage) fn scope_word(scope: ScopeContext) -> &'static str {
     match scope {
         ScopeContext::Root => "SESSION",
         ScopeContext::Nested => "FIELD",

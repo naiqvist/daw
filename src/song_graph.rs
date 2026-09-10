@@ -802,6 +802,10 @@ fn voice_for(
             }
         }
         DeviceKind::Acid => voice!(Acid, crate::audio::acid::AcidParams, head),
+        DeviceKind::Spectral => NodeSpec::Spectral {
+            notes, subloops: Vec::new(), loop_len_beats,
+            patch: Box::new(crate::audio::spectral::SpectralPatch::from_device(head)),
+        },
         DeviceKind::Kick => voice!(Kick, crate::audio::kick::KickParams, head),
         DeviceKind::Snare => voice!(Snare, crate::audio::snare::SnareParams, head),
         DeviceKind::Hat => voice!(Hat, crate::audio::hat::HatParams, head),
@@ -1466,6 +1470,7 @@ pub(crate) fn modulation_target_is_log(track: &Track, target: &str) -> bool {
         DeviceKind::Strip => device::strip_is_log(param),
         DeviceKind::Resyn => device::resyn_is_log(param),
         DeviceKind::Acid => device::acid_is_log(param),
+        DeviceKind::Spectral => crate::params::spectral::LOG.contains(&param),
         DeviceKind::Modulato => device::modulato::modulato_is_log(param),
         DeviceKind::Utility => device::utility_is_log(param),
     }

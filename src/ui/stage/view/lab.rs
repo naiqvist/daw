@@ -38,6 +38,18 @@ impl Stage {
         painter: &egui::Painter,
         field: egui::Rect,
     ) {
+        // THE LAB OWNS THE KEYBOARD. Its windows carry ordinary egui
+        // buttons, and egui's own focus travels on Tab — so one Tab into
+        // a button and every key after it is the widget's, not the
+        // stage's: the arrows stop turning, the rungs stop climbing, and
+        // nothing on screen says why. Focus is surrendered every frame
+        // the lab is up, because there is no widget here that should
+        // hold it.
+        ui.ctx().memory_mut(|memory| {
+            if let Some(id) = memory.focused() {
+                memory.surrender_focus(id);
+            }
+        });
         let c = palette::colours();
         painter.rect_filled(field, 0.0, c.ground);
         let gap = crate::tune!(GAP);

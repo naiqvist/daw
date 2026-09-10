@@ -1579,6 +1579,12 @@ impl App {
 }
 
 impl shell::Host for App {
+    /// Where the stage is, for the scripted-input trace.
+    fn status(&self) -> String {
+        self.stage.status_line()
+    }
+
+
     /// Fonts and the initial stock-widget theme, once the shell has made
     /// the egui context. The custom shell exists so the completed frame
     /// can pass through `shell::post` before presentation.

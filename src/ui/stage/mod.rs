@@ -38,7 +38,13 @@ mod midi_lab;
 mod midi_ladder;
 mod mixer;
 mod modulation;
+mod navigation_command;
 mod plock_editor;
+mod phrase;
+pub mod parameter_command;
+mod spectral_command;
+#[cfg(feature = "visuals")]
+mod visual_command;
 mod sample;
 mod sample_hero;
 mod scenes;
@@ -376,6 +382,10 @@ pub struct Stage {
     /// Canonical musical facts. Tempo and meter are read from here on every
     /// frame; the transport never keeps a second copy of either.
     song: Song,
+    #[cfg(feature = "visuals")]
+    visual_preview: Option<visual_command::Preview>,
+    #[cfg(feature = "visuals")]
+    visual_export: Option<crate::visuals::export::Job>,
     /// The green-zone clock mirror. A frame delta drives it until an engine
     /// can replace that source without changing anything downstream.
     transport: Transport,
@@ -819,6 +829,10 @@ impl Stage {
             steps_checkpoint: None,
             steps: None,
             song,
+            #[cfg(feature = "visuals")]
+            visual_preview: None,
+            #[cfg(feature = "visuals")]
+            visual_export: None,
             transport: Transport::new(),
             browser: None,
             browser_leaving: None,
@@ -1041,6 +1055,30 @@ impl Stage {
         };
         let mut words = input.split_whitespace();
         let command = words.next().unwrap_or_default();
+        if command == "visual" {
+            #[cfg(feature = "visuals")]
+            { return self.apply_visual_command(input); }
+            #[cfg(not(feature = "visuals"))]
+            {
+                self.notice = Some("REFUSED visuals not built · build stage with --features visuals".into());
+                return false;
+            }
+        }
+        if command == "spectral" {
+            return self.apply_spectral_command(input);
+        }
+        if command == "go" {
+            return self.apply_navigation_command(input);
+        }
+        if command == "render-config" {
+            return self.apply_render_config(input);
+        }
+        if parameter_command::COMMANDS.iter().any(|entry| entry.name == command) {
+            return self.apply_parameter_command(input);
+        }
+        if phrase::COMMANDS.iter().any(|entry| entry.name == command) {
+            return self.apply_phrase_command(input);
+        }
         if command == "sound" {
             let rest: Vec<&str> = words.collect();
             return self.apply_sound_command(&rest);
@@ -1695,6 +1733,8 @@ impl Stage {
     /// song does not have sends focus back to the session; everything
     /// else is clamped rather than reset.
     fn adopt_song(&mut self, mut song: Song) {
+        #[cfg(feature = "visuals")]
+        { self.visual_off(); }
         // Undo and redo replace project data, but an arm is what the performer
         // is doing NOW. Carry it across snapshots by stable identity so an
         // unrelated edit cannot silently disarm (or arm) a live input.
@@ -1710,6 +1750,11 @@ impl Stage {
                 .find_map(|(id, on)| (*id == track.id).then_some(*on))
                 .unwrap_or(false);
         }
+        // The opaque visual document never changes the audio graph, including
+        // when traversing shared undo history in an audio-only build.
+        let visuals = std::mem::replace(&mut song.visuals, self.song.visuals.clone());
+        let audio_changed = song != self.song;
+        song.visuals = visuals;
         self.song = song;
         // Every channel gets its strip and the desk its rails, whatever
         // the file held; a furnished song is left as it is.
@@ -1741,7 +1786,7 @@ impl Stage {
             .retain(|id, _| live_sources.contains(id));
         self.mod_wire_values.retain(|id, _| live_wires.contains(id));
         self.mod_wire_scopes.retain(|id, _| live_wires.contains(id));
-        self.touched();
+        if audio_changed { self.touched(); }
     }
 
     /// Bring the frame's scopes back to the song's shape after an edit
@@ -2226,6 +2271,64 @@ impl Stage {
             }
         }
         self.vitals.tick(dt);
+    }
+
+    /// Move the song's tempo, one beat per minute or ten.
+    ///
+    /// The reading is announced because tempo is read from the status
+    /// bar, which is a long way from wherever the cursor is; a change
+    /// nobody sees land is a change nobody trusts.
+    fn tempo(&mut self, up: bool, coarse: bool) -> Result<(), RefusalReason> {
+        let step = if coarse { 10.0 } else { 1.0 } * if up { 1.0 } else { -1.0 };
+        let now = self.song.base_bpm();
+        // Whole numbers, from wherever a loaded song happened to sit.
+        let wanted = (now + step).round().clamp(20.0, 300.0);
+        if !self.song.set_base_bpm(wanted) {
+            return Err(RefusalReason::Edge(if up { Step::Up } else { Step::Down }));
+        }
+        self.touched();
+        self.remixed();
+        self.notice = Some(format!("bpm {wanted:.0}"));
+        Ok(())
+    }
+
+    /// Where the stage IS and what it last said, in one line.
+    ///
+    /// For the scripted-input trace: a script that plays forty keys
+    /// leaves forty of these, and reading them is faster than opening
+    /// forty pictures — a refusal in the middle of a run is the thing
+    /// worth seeing, and it says so here in words.
+    pub fn status_line(&self) -> String {
+        let mut line = format!("scope {}", view::status::scope_word(self.scope_context()));
+        line.push_str(&format!(" | play bar {:03}", self.transport.place(&self.song).bar));
+        if let Some(track) = self.deck_track().and_then(|at| self.song.tracks.get(at)) {
+            line.push_str(&format!(" | track #{} {}", track.id.0, track.name));
+        }
+        if let Some(opened) = self.inside {
+            line.push_str(&format!(" | clip #{}", opened.pattern.0));
+        }
+        if let Some(browser) = &self.browser
+            && let Some(selected) = browser.selected()
+        {
+            line.push_str(&format!(" | selected {}", selected.label));
+        }
+        line.push_str(if self.library_scanning {
+            " | library scanning"
+        } else {
+            " | library ready"
+        });
+        if let Some(notice) = &self.notice {
+            line.push_str(" | ");
+            line.push_str(notice);
+        }
+        if let Some(status) = &self.utility.status {
+            line.push_str(" | ");
+            line.push_str(status);
+        }
+        if let Some(refusal) = &self.refusal {
+            line.push_str(&format!(" | REFUSED {:?}", refusal.reason));
+        }
+        line
     }
 
     fn scope_context(&self) -> keymap::ScopeContext {
@@ -4519,19 +4622,19 @@ impl Stage {
             // its rows and turn their values, Enter takes the row, Tab
             // climbs a rung, Escape goes back down one.
             StageIntent::MidiLadder => self.ladder_toggle(),
-            StageIntent::Step(step) if self.midi_ladder().is_some() => match step {
+            StageIntent::Step(step) if self.ladder_has_keys().is_some() => match step {
                 Step::Up | Step::Down => self.ladder_move(step),
                 Step::Left => self.ladder_turn(-1),
                 Step::Right => self.ladder_turn(1),
             },
-            StageIntent::Enter if self.midi_ladder().is_some() => self.ladder_enter(),
-            StageIntent::MidiLabGroup if self.midi_ladder().is_some() => self.ladder_rung(true),
-            StageIntent::MidiLabShift(step) if self.midi_ladder().is_some() => {
+            StageIntent::Enter if self.ladder_has_keys().is_some() => self.ladder_enter(),
+            StageIntent::MidiLabGroup if self.ladder_has_keys().is_some() => self.ladder_rung(true),
+            StageIntent::MidiLabShift(step) if self.ladder_has_keys().is_some() => {
                 self.ladder_rung(step == Step::Right)
             }
             StageIntent::Escape
                 if self
-                    .midi_ladder()
+                    .ladder_has_keys()
                     .is_some_and(|ladder| ladder.rung != midi_ladder::Rung::Clip) =>
             {
                 self.ladder_rung(false)
@@ -4582,6 +4685,7 @@ impl Stage {
             StageIntent::Slide => self.toggle_slide(),
             StageIntent::HeroTool(verb) => self.hero_tool(verb),
             StageIntent::Deck => self.toggle_deck(),
+            StageIntent::ParamEntry => self.open_parameter_entry(),
             StageIntent::Matrix => self.toggle_matrix(),
             StageIntent::MatrixLay { over } => self.matrix_lay(over),
             StageIntent::MatrixHead => self.matrix_head(),
@@ -5392,7 +5496,8 @@ impl Stage {
                 let before = self.transport;
                 self.transport.rewind();
                 if self.transport == before {
-                    Err(RefusalReason::AtTop)
+                    // Rewind is an absolute request, already satisfied here.
+                    Ok(())
                 } else {
                     // The stage moved its own clock; the host has to move
                     // the engine's to match, and this is how it knows.
@@ -5639,11 +5744,15 @@ impl Stage {
             StageIntent::Browse => {
                 self.browser = match self.browser {
                     Some(_) => None,
-                    // The library opens at its shelves. The samples are
-                    // not scanned yet; the songs are read from the songs
-                    // folder now, because a folder is not a scan.
+                    // A scan may have completed while the shelf was closed.
+                    // Populate it from the current snapshot on every open.
                     None => {
                         let mut browser = Browser::shelves();
+                        browser.set_children(
+                            Shelf::Samples,
+                            sample_nodes(&self.library_snapshot.assets),
+                            BrowserStatus::Ready,
+                        );
                         browser.set_children(
                             Shelf::Projects,
                             browser::project_nodes(self.home.as_deref()),
@@ -5748,6 +5857,7 @@ impl Stage {
             StageIntent::DeleteTrack => self.delete_track(),
             StageIntent::DuplicateTracks => self.duplicate_tracks(),
             StageIntent::DuplicateScene => self.duplicate_scenes(),
+            StageIntent::Tempo { up, coarse } => self.tempo(up, coarse),
             StageIntent::Nudge => {
                 // Only where there is something to move. Spoken from the
                 // browser or inside a clip it would wait for a motion
@@ -9387,14 +9497,11 @@ mod tests {
     }
 
     #[test]
-    fn return_at_the_top_is_a_reasoned_refusal() {
+    fn return_at_the_top_is_already_satisfied() {
         let mut stage = Stage::new();
         assert_eq!(
             drive(&mut stage, &[Key::Home]),
-            vec![ApplyOutcome::Refused(Refusal {
-                intent: StageIntent::Rewind,
-                reason: RefusalReason::AtTop,
-            })]
+            vec![ApplyOutcome::Changed]
         );
     }
 
@@ -12021,6 +12128,33 @@ mod tests {
     }
 
     #[test]
+    fn browser_open_after_scan_retains_searchable_samples() {
+        let mut stage = Stage::new();
+        stage.library_scanning = false;
+        stage.library_snapshot.assets = vec![crate::library::AssetRecord {
+            path: PathBuf::from("/samples/Breaks/Break 1.wav"),
+            relative_path: PathBuf::from("Breaks/Break 1.wav"),
+            location_id: "samples".into(),
+            name: "Break 1.wav".into(),
+            extension: "wav".into(),
+            bytes: 1,
+            modified_unix_secs: None,
+            tags: Vec::new(),
+        }];
+        for _ in 0..2 {
+            assert_eq!(stage.apply(StageIntent::Browse), ApplyOutcome::Changed);
+            for ch in "Breaks/Break 1".chars() {
+                let _ = stage.apply(StageIntent::TypeChar(ch));
+            }
+            let browser = stage.browser.as_mut().expect("browser open");
+            assert_eq!(browser.surviving_leaves(), 1);
+            // Search now lands on the playable leaf, not its shelf header.
+            assert!(matches!(browser.selected().map(|n| &n.kind), Some(EntryKind::Sample(_))));
+            let _ = stage.apply(StageIntent::Escape);
+        }
+    }
+
+    #[test]
     fn shift_enter_on_a_file_fills_the_kit_from_its_folder() {
         use crate::params::kit as kp;
         let mut stage = Stage::new();
@@ -12446,14 +12580,8 @@ mod tests {
     fn returning_to_the_top_tells_the_host_to_seek() {
         let mut stage = Stage::new();
         assert_eq!(stage.seeks(), 0);
-        assert!(matches!(
-            drive(&mut stage, &[Key::Home])[0],
-            ApplyOutcome::Refused(Refusal {
-                reason: RefusalReason::AtTop,
-                ..
-            })
-        ));
-        assert_eq!(stage.seeks(), 0, "a refused return asked for a seek");
+        assert_eq!(drive(&mut stage, &[Key::Home])[0], ApplyOutcome::Changed);
+        assert_eq!(stage.seeks(), 0, "an already satisfied return asked for a seek");
         stage.transport.seek(100);
         assert_eq!(drive(&mut stage, &[Key::Home]), vec![ApplyOutcome::Changed]);
         assert_eq!(stage.seeks(), 1);
@@ -12877,5 +13005,62 @@ mod tests {
                 crate::sequencing::Scale::One
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tempo_tests {
+    use super::*;
+    use crate::ui::stage::key::{Key, Mods};
+
+    /// THE TEMPO IS REACHABLE. Before this the song was 120 and nothing
+    /// in the application could say otherwise: `set_base_bpm` was called
+    /// only when a file was loaded, so a project's tempo was decided by
+    /// whoever wrote the file and nobody else.
+    #[test]
+    fn the_tempo_moves_by_one_and_by_ten() {
+        let mut stage = Stage::new();
+        assert_eq!(stage.song.base_bpm(), 120.0);
+
+        assert_eq!(
+            stage.handle_key(Mods::COMMAND, Key::ArrowUp),
+            Some(ApplyOutcome::Changed)
+        );
+        assert_eq!(stage.song.base_bpm(), 121.0);
+
+        assert_eq!(
+            stage.handle_key(Mods::COMMAND.plus(Mods::SHIFT), Key::ArrowUp),
+            Some(ApplyOutcome::Changed)
+        );
+        assert_eq!(stage.song.base_bpm(), 131.0);
+
+        let _ = stage.handle_key(Mods::COMMAND, Key::ArrowDown);
+        assert_eq!(stage.song.base_bpm(), 130.0);
+    }
+
+    /// 170 is five coarse presses from 120, and lands exactly — the whole
+    /// point of whole numbers.
+    #[test]
+    fn a_named_tempo_is_reachable_exactly() {
+        let mut stage = Stage::new();
+        for _ in 0..5 {
+            let _ = stage.handle_key(Mods::COMMAND.plus(Mods::SHIFT), Key::ArrowUp);
+        }
+        assert_eq!(stage.song.base_bpm(), 170.0);
+        assert_eq!(stage.notice.as_deref(), Some("bpm 170"));
+    }
+
+    /// The ends hold, and say so rather than lying about changing.
+    #[test]
+    fn the_ends_refuse() {
+        let mut stage = Stage::new();
+        for _ in 0..40 {
+            let _ = stage.handle_key(Mods::COMMAND.plus(Mods::SHIFT), Key::ArrowUp);
+        }
+        assert_eq!(stage.song.base_bpm(), 300.0);
+        assert!(matches!(
+            stage.handle_key(Mods::COMMAND.plus(Mods::SHIFT), Key::ArrowUp),
+            Some(ApplyOutcome::Refused(_))
+        ));
     }
 }

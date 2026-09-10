@@ -39,6 +39,12 @@ pub const TILT: u32 = 33;
 pub const TILT_PIVOT: u32 = 34;
 pub const TILT_DRIVE: u32 = 35;
 pub const TILT_MIX: u32 = 36;
+pub const RATIO_B: u32 = 37;
+pub const INDEX_B: u32 = 38;
+pub const CASCADE: u32 = 39;
+pub const SUB: u32 = 40;
+pub const SUB_TUNE: u32 = 41;
+pub const BODY: u32 = 42;
 pub const GAIN: u32 = LEVEL;
 pub const WALK_X: u32 = DISORDER;
 pub const WALK_Y: u32 = CUTOFF;
@@ -303,6 +309,48 @@ pub const TABLE: &[ParamDef] = &[
         max: 1.0,
         default: 1.0,
     },
+    ParamDef {
+        id: RATIO_B,
+        name: "ratio_b",
+        min: 0.125,
+        max: 16.000,
+        default: 1.000,
+    },
+    ParamDef {
+        id: INDEX_B,
+        name: "index_b",
+        min: 0.000,
+        max: 12.000,
+        default: 0.000,
+    },
+    ParamDef {
+        id: CASCADE,
+        name: "cascade",
+        min: 0.000,
+        max: 1.000,
+        default: 0.000,
+    },
+    ParamDef {
+        id: SUB,
+        name: "sub",
+        min: 0.000,
+        max: 1.000,
+        default: 0.000,
+    },
+    ParamDef {
+        id: SUB_TUNE,
+        name: "sub_tune",
+        min: -24.000,
+        max: 0.000,
+        default: -12.000,
+    },
+    ParamDef {
+        id: BODY,
+        name: "body",
+        min: 0.000,
+        max: 1.000,
+        default: 1.000,
+    },
 ];
 pub const LABELS: &[ParamLabel] = &[
     ParamLabel {
@@ -527,6 +575,42 @@ pub const LABELS: &[ParamLabel] = &[
         group: "Tilt",
         choices: &[],
     },
+    ParamLabel {
+        name: "Ratio B",
+        unit: "",
+        group: "Operator C",
+        choices: &[],
+    },
+    ParamLabel {
+        name: "Index B",
+        unit: "",
+        group: "Operator C",
+        choices: &[],
+    },
+    ParamLabel {
+        name: "Cascade",
+        unit: "",
+        group: "Operator C",
+        choices: &[],
+    },
+    ParamLabel {
+        name: "Sub",
+        unit: "",
+        group: "Foundation",
+        choices: &[],
+    },
+    ParamLabel {
+        name: "Sub Tune",
+        unit: " st",
+        group: "Foundation",
+        choices: &[],
+    },
+    ParamLabel {
+        name: "Body",
+        unit: "",
+        group: "Foundation",
+        choices: &[],
+    },
 ];
 pub const DISCRETE: &[u32] = &[ALGORITHM, COARSE];
 pub const LOG: &[u32] = &[
@@ -578,6 +662,32 @@ pub const KEYS: KeyTable = [
             SubPage {
                 title: "Pitch",
                 slots: [Some(TUNE), None, None, None, None, None, None, None],
+            },
+            SubPage {
+                title: "Operator C",
+                slots: [
+                    Some(RATIO_B),
+                    Some(INDEX_B),
+                    Some(CASCADE),
+                    Some(I_DECAY),
+                    Some(I_SUSTAIN),
+                    None,
+                    None,
+                    None,
+                ],
+            },
+            SubPage {
+                title: "Foundation",
+                slots: [
+                    Some(SUB),
+                    Some(SUB_TUNE),
+                    Some(BODY),
+                    Some(PHASE),
+                    None,
+                    None,
+                    None,
+                    None,
+                ],
             },
         ],
     }),

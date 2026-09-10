@@ -227,6 +227,39 @@ pub fn hero<P: Patch>(p: P, keys: KeyTable, page: &str, selected: Option<u32>) -
                 0.5 + 0.45 * (phase + (phase * ratio).sin() * v(17)).sin()
             }));
         }
+        "Operator C" => {
+            h.title = format!(
+                "C {:0.3}× · INDEX {:0.2} · CASCADE {:0.0}% · STATIC PHASE VIEW",
+                v(37),
+                v(38),
+                v(39) * 100.
+            );
+            h.x_labels = ["0°".into(), "360°".into()];
+            h.y_labels = ["−1".into(), "+1".into()];
+            h.series.push(curve("carrier", &|x| {
+                let phase = core::f32::consts::TAU * x;
+                let c = (phase * v(37)).sin() * v(38);
+                let b = (phase * glass_ratio(v(14), v(15), v(16), v(22)) + c * v(39)).sin();
+                0.5 + 0.45 * (phase + b * v(17) + c * (1. - v(39))).sin()
+            }));
+        }
+        "Foundation" => {
+            h.title = format!(
+                "MONO SUB {:0.0}% · {:+0.0} st · BODY {:0.0}% · SUB BYPASSES INTERNAL FX",
+                v(40) * 100.,
+                v(41),
+                v(42) * 100.
+            );
+            h.x_labels = ["0 ms".into(), "40 ms · C2 reference".into()];
+            h.y_labels = ["−1".into(), "+1".into()];
+            h.series.push(curve("sub", &|x| {
+                0.5 + 0.45
+                    * v(40)
+                    * (core::f32::consts::TAU
+                        * (65.40639 * 2_f32.powf(v(41) / 12.) * x * 0.04 + v(28)))
+                    .sin()
+            }));
+        }
         "Ops" | "Gesture" => {
             let ratio = glass_ratio(v(14), v(15), v(16), v(22));
             h.title = format!(

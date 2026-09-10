@@ -139,6 +139,7 @@ pub enum StageIntent {
     /// V: the deck's window, up or away.
     Deck,
     /// Left and Right with the deck up: the previous or next cell.
+    ParamEntry,
     SlotStep(Step),
     HeroTool(u8),
     /// Tab with a tall panel up: the keys move INTO the panel's own
@@ -317,6 +318,19 @@ pub enum StageIntent {
     Rename,
     /// Take the track the cursor is in out of the song, with its slots.
     DeleteTrack,
+    /// The song's tempo, up or down. Coarse moves it ten at a time.
+    ///
+    /// EXPLICIT ON PURPOSE. Nearly every value in this application is
+    /// reached the same general way — stand on a cell, turn it — and a
+    /// bespoke key for one of them is normally the wrong answer. Tempo
+    /// is the exception the user named: it is wanted constantly, from
+    /// wherever you happen to be standing, and walking to a cell to get
+    /// at it is a tax on every session. So it gets its own key, in every
+    /// musical scope, beside the transport it belongs to.
+    Tempo {
+        up: bool,
+        coarse: bool,
+    },
     /// Arm a move: the next Left or Right shifts the thing under the
     /// cursor — a device along its chain, a track along the strip — one
     /// place that way. The grammar's NUDGE, spoken the same way here.
@@ -689,6 +703,7 @@ impl StageIntent {
                     .map_or("sample tool", |t| t.word)
             }
             Self::Deck => "deck window",
+            Self::ParamEntry => "enter base parameter value",
             Self::Matrix => "clip matrix",
             Self::MatrixLay { over: false } => "lay clip or scene",
             Self::MatrixLay { over: true } => "lay over",
@@ -810,6 +825,10 @@ impl StageIntent {
             Self::Save => "save",
             Self::Rename => "rename track",
             Self::DeleteTrack => "delete track",
+            Self::Tempo { up: true, coarse: false } => "tempo up",
+            Self::Tempo { up: false, coarse: false } => "tempo down",
+            Self::Tempo { up: true, coarse: true } => "tempo up ten",
+            Self::Tempo { up: false, coarse: true } => "tempo down ten",
             Self::Nudge => "nudge, then arrow",
             Self::Yank => "yank device",
             Self::Put => "put device",
@@ -1002,6 +1021,148 @@ const BINDINGS: &[Binding] = &[
         StageIntent::ToggleTransport,
     ),
     Binding::new(ScopeContext::Browser, Key::Home, StageIntent::Rewind),
+    // TEMPO travels with the transport: wanted from anywhere, so bound
+    // in every scope where music is being made.
+    Binding::command(
+        ScopeContext::Root,
+        Key::ArrowUp,
+        StageIntent::Tempo { up: true, coarse: false },
+    ),
+    Binding::command(
+        ScopeContext::Root,
+        Key::ArrowDown,
+        StageIntent::Tempo { up: false, coarse: false },
+    ),
+    Binding::command_shift(
+        ScopeContext::Root,
+        Key::ArrowUp,
+        StageIntent::Tempo { up: true, coarse: true },
+    ),
+    Binding::command_shift(
+        ScopeContext::Root,
+        Key::ArrowDown,
+        StageIntent::Tempo { up: false, coarse: true },
+    ),
+    Binding::command(
+        ScopeContext::Nested,
+        Key::ArrowUp,
+        StageIntent::Tempo { up: true, coarse: false },
+    ),
+    Binding::command(
+        ScopeContext::Nested,
+        Key::ArrowDown,
+        StageIntent::Tempo { up: false, coarse: false },
+    ),
+    Binding::command_shift(
+        ScopeContext::Nested,
+        Key::ArrowUp,
+        StageIntent::Tempo { up: true, coarse: true },
+    ),
+    Binding::command_shift(
+        ScopeContext::Nested,
+        Key::ArrowDown,
+        StageIntent::Tempo { up: false, coarse: true },
+    ),
+    Binding::command(
+        ScopeContext::Browser,
+        Key::ArrowUp,
+        StageIntent::Tempo { up: true, coarse: false },
+    ),
+    Binding::command(
+        ScopeContext::Browser,
+        Key::ArrowDown,
+        StageIntent::Tempo { up: false, coarse: false },
+    ),
+    Binding::command_shift(
+        ScopeContext::Browser,
+        Key::ArrowUp,
+        StageIntent::Tempo { up: true, coarse: true },
+    ),
+    Binding::command_shift(
+        ScopeContext::Browser,
+        Key::ArrowDown,
+        StageIntent::Tempo { up: false, coarse: true },
+    ),
+    Binding::command(
+        ScopeContext::Mixer,
+        Key::ArrowUp,
+        StageIntent::Tempo { up: true, coarse: false },
+    ),
+    Binding::command(
+        ScopeContext::Mixer,
+        Key::ArrowDown,
+        StageIntent::Tempo { up: false, coarse: false },
+    ),
+    Binding::command_shift(
+        ScopeContext::Mixer,
+        Key::ArrowUp,
+        StageIntent::Tempo { up: true, coarse: true },
+    ),
+    Binding::command_shift(
+        ScopeContext::Mixer,
+        Key::ArrowDown,
+        StageIntent::Tempo { up: false, coarse: true },
+    ),
+    Binding::command(
+        ScopeContext::Song,
+        Key::ArrowUp,
+        StageIntent::Tempo { up: true, coarse: false },
+    ),
+    Binding::command(
+        ScopeContext::Song,
+        Key::ArrowDown,
+        StageIntent::Tempo { up: false, coarse: false },
+    ),
+    Binding::command_shift(
+        ScopeContext::Song,
+        Key::ArrowUp,
+        StageIntent::Tempo { up: true, coarse: true },
+    ),
+    Binding::command_shift(
+        ScopeContext::Song,
+        Key::ArrowDown,
+        StageIntent::Tempo { up: false, coarse: true },
+    ),
+    Binding::command(
+        ScopeContext::Clip,
+        Key::ArrowUp,
+        StageIntent::Tempo { up: true, coarse: false },
+    ),
+    Binding::command(
+        ScopeContext::Clip,
+        Key::ArrowDown,
+        StageIntent::Tempo { up: false, coarse: false },
+    ),
+    Binding::command_shift(
+        ScopeContext::Clip,
+        Key::ArrowUp,
+        StageIntent::Tempo { up: true, coarse: true },
+    ),
+    Binding::command_shift(
+        ScopeContext::Clip,
+        Key::ArrowDown,
+        StageIntent::Tempo { up: false, coarse: true },
+    ),
+    Binding::command(
+        ScopeContext::Steps,
+        Key::ArrowUp,
+        StageIntent::Tempo { up: true, coarse: false },
+    ),
+    Binding::command(
+        ScopeContext::Steps,
+        Key::ArrowDown,
+        StageIntent::Tempo { up: false, coarse: false },
+    ),
+    Binding::command_shift(
+        ScopeContext::Steps,
+        Key::ArrowUp,
+        StageIntent::Tempo { up: true, coarse: true },
+    ),
+    Binding::command_shift(
+        ScopeContext::Steps,
+        Key::ArrowDown,
+        StageIntent::Tempo { up: false, coarse: true },
+    ),
     // Record is the dedicated transport key and remains the shortest way
     // both into and out of a take from every musical scope.
     Binding::new(ScopeContext::Root, Key::F9, StageIntent::ToggleRecord),
@@ -2666,6 +2827,7 @@ fn matrix_bindings() -> Vec<(Mods, Key, StageIntent)> {
 /// the digits back and the Steps scope carries the cells instead.
 fn deck_bindings() -> Vec<(Mods, Key, StageIntent)> {
     let mut out = vec![
+        (Mods::NONE, Key::Equals, StageIntent::ParamEntry),
         (Mods::NONE, Key::Space, StageIntent::ToggleTransport),
         (Mods::NONE, Key::Home, StageIntent::Rewind),
         (Mods::NONE, Key::F9, StageIntent::ToggleRecord),
@@ -2891,6 +3053,7 @@ fn family(intent: StageIntent) -> &'static str {
         | StageIntent::HeroTool(_)
         | StageIntent::HeroFocus { .. }
         | StageIntent::Deck
+        | StageIntent::ParamEntry
         | StageIntent::SlotStep(_) => "pages",
         StageIntent::Lab
         | StageIntent::LabWindow
@@ -2921,7 +3084,10 @@ fn family(intent: StageIntent) -> &'static str {
         | StageIntent::KilnZoom(_)
         | StageIntent::KilnScrub(_)
         | StageIntent::KilnEngine => "lab",
-        StageIntent::ToggleTransport | StageIntent::ToggleRecord | StageIntent::Rewind => "time",
+        StageIntent::ToggleTransport
+        | StageIntent::ToggleRecord
+        | StageIntent::Rewind
+        | StageIntent::Tempo { .. } => "time",
         StageIntent::Help
         | StageIntent::Browse
         | StageIntent::Mix

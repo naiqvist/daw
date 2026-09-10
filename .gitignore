@@ -9,3 +9,7 @@
 
 # local tool config
 /reasonix.toml
+
+# Generated Python bytecode (TAKE / analysis tooling)
+__pycache__/
+*.pyc

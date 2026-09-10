@@ -78,6 +78,8 @@ pub(crate) struct RollPanel {
     selected_cells: std::collections::HashSet<(usize, u8)>,
     selection_anchor: Option<(usize, u8)>,
     refusal: Option<String>,
+    /// What was said THIS frame, for the frame above to pass on.
+    said: Option<String>,
     /// Where the cursor's cell was drawn this frame; see the grid's.
     cursor_rect: Option<egui::Rect>,
     last_chord: Vec<Pitch>,
@@ -98,6 +100,7 @@ impl Default for RollPanel {
             selected_cells: std::collections::HashSet::new(),
             selection_anchor: None,
             refusal: None,
+            said: None,
             cursor_rect: None,
             last_chord: vec![Pitch::from_midi(DEFAULT_MIDI)],
             last_entry_tick: None,
@@ -198,9 +201,12 @@ impl RollPanel {
             self.selection_anchor = None;
         }
         let selecting = ui.input(|input| input.key_down(egui::Key::X) || input.modifiers.shift);
+        self.said = None;
         if focused && let Some(utterance) = voice.sentence.consume(ui.ctx()) {
             self.refusal = None;
             self.speak(utterance, selecting, voice, clip, intents);
+            // Whatever it just said, said once, for the status line.
+            self.said = self.refusal.clone();
         }
         self.follow_time();
         let overlay = if voice.sentence.is_empty() {
@@ -586,6 +592,11 @@ impl RollPanel {
     }
 
     /// The cursor cell as last drawn, if it was on screen.
+    /// What this editor said this frame, taken once.
+    pub(crate) fn said(&mut self) -> Option<String> {
+        self.said.take()
+    }
+
     pub(crate) fn cursor_rect(&self) -> Option<egui::Rect> {
         self.cursor_rect
     }

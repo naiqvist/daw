@@ -83,6 +83,13 @@ pub struct AcidParams {
     pub glide_ms: f32,
     pub drive: f32,
     pub level: f32,
+    pub vibrato_speed_hz: f32,
+    pub vibrato_intensity_cents: f32,
+    pub ornament: f32,
+    pub ornament_time_ms: f32,
+    pub ornament_speed_hz: f32,
+    pub ornament_from_cents: f32,
+    pub ornament_other_cents: f32,
 }
 
 impl Default for AcidParams {
@@ -98,6 +105,13 @@ impl Default for AcidParams {
             glide_ms: def(p::TABLE, p::GLIDE).default,
             drive: def(p::TABLE, p::DRIVE).default,
             level: def(p::TABLE, p::LEVEL).default,
+            vibrato_speed_hz: def(p::TABLE, p::VIBRATO_SPEED).default,
+            vibrato_intensity_cents: def(p::TABLE, p::VIBRATO_INTENSITY).default,
+            ornament: def(p::TABLE, p::ORNAMENT).default,
+            ornament_time_ms: def(p::TABLE, p::ORNAMENT_TIME).default,
+            ornament_speed_hz: def(p::TABLE, p::ORNAMENT_SPEED).default,
+            ornament_from_cents: def(p::TABLE, p::ORNAMENT_FROM).default,
+            ornament_other_cents: def(p::TABLE, p::ORNAMENT_OTHER).default,
         }
     }
 }
@@ -116,6 +130,13 @@ impl AcidParams {
             p::GLIDE => self.glide_ms,
             p::DRIVE => self.drive,
             p::LEVEL => self.level,
+            p::VIBRATO_SPEED => self.vibrato_speed_hz,
+            p::VIBRATO_INTENSITY => self.vibrato_intensity_cents,
+            p::ORNAMENT => self.ornament,
+            p::ORNAMENT_TIME => self.ornament_time_ms,
+            p::ORNAMENT_SPEED => self.ornament_speed_hz,
+            p::ORNAMENT_FROM => self.ornament_from_cents,
+            p::ORNAMENT_OTHER => self.ornament_other_cents,
             _ => return None,
         })
     }
@@ -136,6 +157,13 @@ impl AcidParams {
             p::GLIDE => self.glide_ms = value,
             p::DRIVE => self.drive = value,
             p::LEVEL => self.level = value,
+            p::VIBRATO_SPEED => self.vibrato_speed_hz = value,
+            p::VIBRATO_INTENSITY => self.vibrato_intensity_cents = value,
+            p::ORNAMENT => self.ornament = value,
+            p::ORNAMENT_TIME => self.ornament_time_ms = value,
+            p::ORNAMENT_SPEED => self.ornament_speed_hz = value,
+            p::ORNAMENT_FROM => self.ornament_from_cents = value,
+            p::ORNAMENT_OTHER => self.ornament_other_cents = value,
             _ => {}
         }
     }
@@ -143,6 +171,16 @@ impl AcidParams {
     /// Whether the square is selected.
     pub fn square(&self) -> bool {
         self.wave.round() as u32 == p::WAVE_SQUARE
+    }
+
+    fn gesture(&self) -> crate::dsp::pitch_gesture::GestureConfig {
+        crate::dsp::pitch_gesture::GestureConfig {
+            kind: crate::dsp::pitch_gesture::Gesture::from_index(self.ornament.round() as u32),
+            time_ms: self.ornament_time_ms,
+            speed_hz: self.ornament_speed_hz,
+            from_cents: self.ornament_from_cents,
+            other_cents: self.ornament_other_cents,
+        }
     }
 }
 
@@ -162,6 +200,9 @@ pub struct AcidVoice {
     pole: OnePole,
     shaper: Waveshaper,
     chunk: Vec<f32>,
+    motion: crate::dsp::pitch_gesture::PitchGesture,
+    pitch_offsets: [f32; CHUNK],
+    chunk_left: usize,
 
     /// Gate: whether a note is being held. The next note-on while this is
     /// true is a SLIDE.
@@ -201,6 +242,9 @@ impl AcidVoice {
             pole: OnePole::new(),
             shaper: Waveshaper::new(),
             chunk: Vec::new(),
+            motion: crate::dsp::pitch_gesture::PitchGesture::default(),
+            pitch_offsets: [0.0; CHUNK],
+            chunk_left: 0,
             gate: false,
             pitch: 60.0,
             target_pitch: 60.0,
@@ -233,6 +277,7 @@ impl AcidVoice {
         build_tables(Waveform::Saw, &mut self.saw);
         build_tables(Waveform::Square, &mut self.square);
         self.chunk = vec![0.0; CHUNK];
+        self.motion.prepare(self.sample_rate);
 
         self.osc_wave = params.square();
         self.osc.prepare(
@@ -251,6 +296,8 @@ impl AcidVoice {
         self.svf.reset();
         self.pole.reset();
         self.osc.reset();
+        self.motion.reset();
+        self.chunk_left = 0;
         self.gate = false;
         self.env = 0.0;
         self.amp = 0.0;
@@ -310,6 +357,10 @@ impl AcidVoice {
     pub fn note_on(&mut self, pitch: u8, vel: u8) {
         let target = f32::from(pitch);
         let slide = self.gate;
+        let from = slide.then_some(self.pitch + self.motion.last_ornament() - target);
+        let gesture = self.params.gesture();
+        self.motion.trigger(gesture, from);
+        self.chunk_left = 0;
         self.target_pitch = target;
         if slide {
             self.sliding = true;
@@ -323,6 +374,18 @@ impl AcidVoice {
             self.env = 1.0;
         }
         self.gate = true;
+        if matches!(
+            gesture.kind,
+            crate::dsp::pitch_gesture::Gesture::Meend
+                | crate::dsp::pitch_gesture::Gesture::Kan
+                | crate::dsp::pitch_gesture::Gesture::Khatka
+                | crate::dsp::pitch_gesture::Gesture::Murki
+        ) {
+            // A connecting glide or grace cluster owns its pitch path.
+            // Compounding it with portamento would move its named neighbors.
+            self.pitch = target;
+            self.sliding = false;
+        }
         // The accent: everything above the threshold, scaled by the knob.
         let over = f32::from(vel.saturating_sub(p::ACCENT_VEL));
         let span = f32::from(127u8.saturating_sub(p::ACCENT_VEL)).max(1.0);
@@ -390,43 +453,59 @@ impl AcidVoice {
         );
 
         let mut at = 0usize;
+        self.motion.vibrato(
+            self.params.vibrato_speed_hz,
+            self.params.vibrato_intensity_cents,
+        );
         while at < out.len() {
-            let k = CHUNK.min(out.len() - at);
-
-            // --- the glide ---------------------------------------------
-            if self.sliding {
-                self.pitch += (self.target_pitch - self.pitch) * glide;
-                if (self.target_pitch - self.pitch).abs() < 1e-3 {
-                    self.pitch = self.target_pitch;
-                    self.sliding = false;
+            // The control clock belongs to the voice, not render_add's
+            // caller: event/host block splits must not accelerate the glide.
+            if self.chunk_left == 0 {
+                self.chunk_left = CHUNK;
+                // --- the glide ---------------------------------------------
+                if self.sliding {
+                    self.pitch += (self.target_pitch - self.pitch) * glide;
+                    if (self.target_pitch - self.pitch).abs() < 1e-3 {
+                        self.pitch = self.target_pitch;
+                        self.sliding = false;
+                    }
                 }
-            }
-            let hz = 440.0 * ((self.pitch + self.params.tune_st - 69.0) / 12.0).exp2();
-            self.osc.set_freq(hz.clamp(1.0, sr * 0.45));
+                let hz = 440.0 * ((self.pitch + self.params.tune_st - 69.0) / 12.0).exp2();
+                self.osc.set_freq(hz.clamp(1.0, sr * 0.45));
 
-            // --- the filter, opened by the envelope --------------------
-            //
-            // The accent reaches THREE destinations from one knob: it
-            // opens the filter further, rings it harder, and lifts the
-            // level. That is what the original's accent circuit does, and
-            // splitting it into three controls would be three ways to get
-            // it wrong.
-            let env_amount = (self.params.env_mod + self.accent * 0.5).clamp(0.0, 1.5);
-            let octaves = env_amount * self.env * p::ENV_OCTAVES;
-            let cutoff = (self.params.cutoff_hz * octaves.exp2()).clamp(20.0, sr * 0.45);
-            // Resonance as a true Q: the knob's top is where the filter
-            // is on the edge of singing, which is where this instrument
-            // is usually pointed.
-            let res = (self.params.resonance + self.accent * 0.2).clamp(0.0, 1.0);
-            let q = 0.7 + res * res * 12.0;
-            self.svf.prepare(sr, cutoff, q);
-            // The extra six decibels, a little above the resonant corner
-            // so it adds slope without moving the peak.
-            self.pole.prepare(sr, (cutoff * 1.5).clamp(20.0, sr * 0.45));
+                // --- the filter, opened by the envelope --------------------
+                //
+                // The accent reaches THREE destinations from one knob: it
+                // opens the filter further, rings it harder, and lifts the
+                // level. That is what the original's accent circuit does, and
+                // splitting it into three controls would be three ways to get
+                // it wrong.
+                let env_amount = (self.params.env_mod + self.accent * 0.5).clamp(0.0, 1.5);
+                let octaves = env_amount * self.env * p::ENV_OCTAVES;
+                let cutoff = (self.params.cutoff_hz * octaves.exp2()).clamp(20.0, sr * 0.45);
+                // Resonance as a true Q: the knob's top is where the filter
+                // is on the edge of singing, which is where this instrument
+                // is usually pointed.
+                let res = (self.params.resonance + self.accent * 0.2).clamp(0.0, 1.0);
+                let q = 0.7 + res * res * 12.0;
+                self.svf.prepare(sr, cutoff, q);
+                // The extra six decibels, a little above the resonant corner
+                // so it adds slope without moving the peak.
+                self.pole.prepare(sr, (cutoff * 1.5).clamp(20.0, sr * 0.45));
+            }
+            let k = self.chunk_left.min(out.len() - at);
 
             // --- render ------------------------------------------------
             let chunk = &mut self.chunk[..k];
-            self.osc.process(chunk, tables);
+            self.motion.process(&mut self.pitch_offsets[..k]);
+            let hz = 440.0 * ((self.pitch + self.params.tune_st - 69.0) / 12.0).exp2();
+            if self.pitch_offsets[..k].iter().all(|x| *x == 0.0) {
+                self.osc.set_freq(hz.clamp(1.0, sr * 0.45));
+                self.osc.process(chunk, tables);
+            } else {
+                self.osc
+                    .process_pitch(chunk, &self.pitch_offsets[..k], hz, tables);
+            }
             // Both filters block-wise, per band rather than per sample —
             // `Cascade`'s choice and for its reason: one section's
             // coefficients and state stay in registers for the chunk.
@@ -452,7 +531,10 @@ impl AcidVoice {
 
             // The filter envelope falls whether or not the gate is up:
             // on this instrument it is a decay, not a sustain.
-            self.env *= decay;
+            self.chunk_left -= k;
+            if self.chunk_left == 0 {
+                self.env *= decay;
+            }
             at += k;
         }
     }
@@ -466,6 +548,8 @@ impl AcidVoice {
 pub fn hero(params: &AcidParams, subpage: &str, selected: Option<u32>) -> Option<Hero> {
     match subpage {
         "Acid" => Some(wave_picture(params, selected)),
+        "Vibrato" => Some(expression_picture(params, true)),
+        "Ornament" => Some(expression_picture(params, false)),
         "Filter" => Some(match selected {
             Some(p::ENV_MOD | p::DECAY) => sweep_picture(params, selected),
             _ => response_picture(params, selected),
@@ -475,6 +559,62 @@ pub fn hero(params: &AcidParams, subpage: &str, selected: Option<u32>) -> Option
 }
 
 const POINTS: usize = 96;
+
+/// The actual pitch kernel, sampled for a green-side, read-only preview.
+fn expression_picture(params: &AcidParams, vibrato: bool) -> Hero {
+    let mut motion = crate::dsp::pitch_gesture::PitchGesture::default();
+    let span = if vibrato {
+        1.0
+    } else {
+        params.ornament_time_ms * 0.001
+    };
+    let sr = 4_000.0;
+    motion.prepare(sr);
+    if vibrato {
+        motion.vibrato(params.vibrato_speed_hz, params.vibrato_intensity_cents);
+    } else {
+        motion.trigger(params.gesture(), Some(-2.0));
+    }
+    let mut samples = vec![0.0; (span * sr).ceil().max(2.0) as usize + 1];
+    motion.process(&mut samples);
+    let bound = if vibrato {
+        1.0
+    } else {
+        (params
+            .ornament_from_cents
+            .abs()
+            .max(params.ornament_other_cents.abs())
+            * 0.01)
+            .max(2.0)
+    };
+    let points = (0..POINTS)
+        .map(|i| {
+            let x = i as f32 / (POINTS - 1) as f32;
+            let value = samples[i * (samples.len() - 1) / (POINTS - 1)];
+            (x, (0.5 + value / (bound * 2.0)).clamp(0.0, 1.0))
+        })
+        .collect();
+    Hero {
+        waveform: None,
+        title: if vibrato {
+            "VIBRATO · peak depth in cents".into()
+        } else {
+            "ORNAMENT · note-triggered pitch path (meend: -2 st example)".into()
+        },
+        series: vec![HeroSeries {
+            name: "pitch",
+            points,
+            lit: true,
+        }],
+        marks: Vec::new(),
+        x_labels: ["0".into(), format!("{:.0} ms", span * 1_000.0)],
+        y_labels: [
+            format!("-{:.0} ct", bound * 100.0),
+            format!("+{:.0} ct", bound * 100.0),
+        ],
+        diagonal: false,
+    }
+}
 
 fn lit(selected: Option<u32>, ids: &[u32]) -> bool {
     selected.is_some_and(|id| ids.contains(&id))
@@ -626,6 +766,8 @@ mod tests {
             ("Acid", p::TUNE),
             ("Filter", p::CUTOFF),
             ("Filter", p::DECAY),
+            ("Vibrato", p::VIBRATO_INTENSITY),
+            ("Ornament", p::ORNAMENT),
         ] {
             let hero = hero(&params, page, Some(id)).unwrap();
             assert!(!hero.series.is_empty(), "{page} has no series");
@@ -882,6 +1024,73 @@ mod tests {
                 row.name
             );
         }
+    }
+
+    #[test]
+    fn expression_is_off_in_old_serialized_patches_and_reset_is_repeatable() {
+        let old: AcidParams = ron::from_str("(cutoff_hz:1250.0,glide_ms:105.0)").unwrap();
+        assert_eq!(old.vibrato_intensity_cents, 0.0);
+        assert_eq!(old.ornament, 0.0);
+        let mut v = voice(AcidParams {
+            vibrato_intensity_cents: 25.0,
+            ornament: 6.0,
+            ..old
+        });
+        v.note_on(60, 90);
+        let first = render(&mut v, 4_097);
+        v.reset();
+        v.note_on(60, 90);
+        assert_eq!(first, render(&mut v, 4_097));
+    }
+
+    #[test]
+    fn expressive_voice_is_split_block_exact_and_allocation_free() {
+        for ornament in 0..=6 {
+            let mut full = voice(AcidParams {
+                vibrato_intensity_cents: 23.0,
+                ornament: ornament as f32,
+                ornament_time_ms: 400.0,
+                ..Default::default()
+            });
+            full.note_on(53, 90);
+            let _ = render(&mut full, 113);
+            full.note_on(64, 90);
+            let mut split = full.clone();
+            let mut a = [0.0; 4_097];
+            let mut b = [0.0; 4_097];
+            assert_no_alloc::assert_no_alloc(|| {
+                full.render_add(&mut a, 1.0);
+                split.render_add(&mut [], 1.0);
+                split.render_add(&mut b[..1], 1.0);
+                for part in b[1..].chunks_mut(37) {
+                    split.render_add(part, 1.0);
+                }
+            });
+            assert_eq!(a, b, "ornament {ornament}");
+            assert!(a.iter().all(|x| x.is_finite() && x.abs() < 8.0));
+        }
+    }
+
+    #[test]
+    fn note_gestures_latch_locks_but_vibrato_depth_stays_live() {
+        let mut v = voice(AcidParams::default());
+        v.note_on(53, 90);
+        let _ = render(&mut v, 480);
+        let env = v.env;
+        v.plock(p::ORNAMENT, Some(2.0));
+        v.plock(p::ORNAMENT_TIME, Some(400.0));
+        v.note_on(65, 90);
+        assert_eq!(v.env, env, "meend must not retrigger the filter");
+        assert!(!v.sliding, "meend replaces, not doubles, portamento");
+        v.plock(p::ORNAMENT, None);
+        let _ = render(&mut v, 9_600);
+        assert!((v.motion.last_ornament() + 6.0).abs() < 0.1);
+        let _ = render(&mut v, 9_601);
+        assert_eq!(v.motion.last_ornament(), 0.0);
+        v.plock(p::VIBRATO_INTENSITY, Some(24.0));
+        assert_eq!(v.params.vibrato_intensity_cents, 24.0);
+        v.plock(p::VIBRATO_INTENSITY, None);
+        assert_eq!(v.params.vibrato_intensity_cents, 0.0);
     }
 
     /// A p-lock overrides for its note and `None` restores the LIVE base,

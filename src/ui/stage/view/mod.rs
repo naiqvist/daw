@@ -47,7 +47,7 @@ mod scomp_card;
 mod slice_tests;
 mod song;
 mod stab_card;
-mod status;
+pub(in crate::ui::stage) mod status;
 mod strip;
 mod telemetry;
 mod tray;
@@ -229,22 +229,24 @@ impl Stage {
         );
         let utility_open = self.utility.is_open();
 
-        // `:` summons the palette. Checked before anything else reads the
-        // keyboard, and not while it is already open, so a held key
-        // cannot reset what has been typed into it.
+        // Ctrl+Shift+P also works from a focused field. Bare `:` remains
+        // ordinary text there. Neither shortcut resets an open query.
         if !utility_open
-            && !ui.ctx().egui_wants_keyboard_input()
             && !self.palette.is_open()
-            && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Colon))
+            && (ui.input_mut(|input| {
+                input.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::P)
+            }) || (!ui.ctx().egui_wants_keyboard_input()
+                && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Colon))))
         {
             self.palette.open();
         }
+        let palette_owned_frame = self.palette.is_open();
         if !utility_open && let Some(intent) = self.pump_palette(ui.ctx()) {
             let _ = self.apply(intent);
         }
         let utility_open = self.utility.is_open();
         // While the palette is open it owns the keyboard OUTRIGHT.
-        let palette_open = self.palette.is_open() || utility_open;
+        let palette_open = palette_owned_frame || utility_open;
 
         self.hold_browser_for_exit();
 
@@ -278,11 +280,18 @@ impl Stage {
             ui.input_mut(|input| {
                 let chords = input::consume_chords(input, scope, |modifiers, key| {
                     (grammar_owns_escape && modifiers == Mods::NONE && key == Key::Escape)
+                    // TYPING OUTRANKS THE BINDING. While a field is
+                    // taking text, a bare character key is that
+                    // character. Without this the chord layer took the
+                    // key first and the text was dropped to keep the
+                    // keystroke from counting twice — which is how a
+                    // space typed into the browser's find field started
+                    // the transport instead of reaching the query, and
+                    // how a question mark opened the codebook rather
+                    // than being searched for.
+                    || (collect_text && modifiers == Mods::NONE && key.types_a_character())
                     || matches!(keymap::dispatch(scope,keymap::StageInput::Chord(modifiers,key)),Some(StageIntent::HeroTool(verb)) if !self.deck_hero_tools().iter().any(|t|t.verb==verb))
                 });
-                let pressed = |wanted: Key| chords.iter().any(|(_, key)| *key == wanted);
-                let questionmark_consumed = pressed(Key::Questionmark);
-                let space_consumed = pressed(Key::Space);
                 let mut stage_inputs: Vec<keymap::StageInput> = chords
                     .iter()
                     .map(|(modifiers, key)| keymap::StageInput::Chord(*modifiers, *key))
@@ -292,14 +301,9 @@ impl Stage {
                         let egui::Event::Text(text) = event else {
                             continue;
                         };
-                        // A physical '?' is the codebook chord and egui also
-                        // emits it as text; admit each keystroke once.
-                        if questionmark_consumed && text == "?" {
-                            continue;
-                        }
-                        if space_consumed && text == " " {
-                            continue;
-                        }
+                        // No keystroke counts twice: the chord layer
+                        // above left every character key in the input
+                        // rather than taking it.
                         stage_inputs.extend(text.chars().map(keymap::StageInput::Text));
                     }
                 }
@@ -320,8 +324,9 @@ impl Stage {
 
         // Inside a clip, the letters may be pitches. Read after the
         // stage's own chords, so `^T` is never read as a T.
-        let update = self
-            .pitch_entry_mode()
+        let update = (!palette_open)
+            .then(|| self.pitch_entry_mode())
+            .flatten()
             .map(|mode| self.midi_typing.update(ui.ctx(), mode));
         let enter_held = ui.input(|input| input.key_down(egui::Key::Enter));
         self.take_pitch_entry(update, enter_held);
@@ -392,6 +397,10 @@ impl Stage {
         }
 
         self.draw(ui);
+        #[cfg(feature = "visuals")]
+        if self.visual_preview.is_some() || self.visual_export.is_some() {
+            self.show_visuals(ui.ctx());
+        }
     }
 
     /// Pump the command palette while it is open; a chosen command comes
@@ -409,9 +418,17 @@ impl Stage {
         let commands: Vec<crate::ui::palette::Command> =
             entries.iter().map(|entry| entry.command).collect();
         let theme = palette::theme();
+        let mut typed = TIMELINE_COMMANDS.to_vec();
+        typed.extend_from_slice(super::phrase::COMMANDS);
+        typed.extend_from_slice(super::parameter_command::COMMANDS);
+        typed.extend_from_slice(super::spectral_command::COMMANDS);
+        #[cfg(feature = "visuals")]
+        typed.extend_from_slice(super::visual_command::COMMANDS);
+        typed.extend_from_slice(super::utility::COMMANDS);
+        typed.extend_from_slice(super::navigation_command::COMMANDS);
         match self
             .palette
-            .show(ctx, &theme, &commands, &TIMELINE_COMMANDS)?
+            .show(ctx, &theme, &commands, &typed)?
         {
             crate::ui::palette::Choice::Command(id) => entries
                 .iter()
@@ -577,6 +594,43 @@ mod tests {
             |ui| stage.show(ui),
         );
         output.textures_delta.clear();
+    }
+
+    #[test]
+    fn consecutive_palette_sentences_work_at_one_event_per_frame() {
+        let mut stage = Stage::new();
+        stage.set_palette_open(false);
+        crate::ui::stage::tests::into_clip(&mut stage);
+        let ctx = egui::Context::default();
+        crate::install_stage_fonts(&ctx);
+        let id = stage.inside.unwrap().pattern;
+        let chord = |key, modifiers| vec![
+            egui::Event::Key { key, physical_key: Some(key), pressed: true, repeat: false, modifiers },
+            egui::Event::Key { key, physical_key: Some(key), pressed: false, repeat: false, modifiers },
+        ];
+        let commands = ["rhythm 64 0,24 gate 8 vel 112", "rhythm 64 40,46 gate 8 vel 84"];
+        // A previous editor may still own egui focus when a clip opens.
+        ctx.memory_mut(|m| m.request_focus(egui::Id::new("previous_field")));
+        for command in commands {
+            for events in [
+                chord(egui::Key::P, egui::Modifiers::CTRL | egui::Modifiers::SHIFT),
+                vec![egui::Event::Text(command.into())],
+                chord(egui::Key::Enter, egui::Modifiers::NONE),
+            ] {
+                let mut output = ctx.run_ui(egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0))),
+                    events, ..Default::default()
+                }, |ui| stage.show(ui));
+                output.textures_delta.clear();
+            }
+            assert!(!stage.palette.is_open(), "{command}");
+            assert!(stage.notice.as_deref().unwrap_or_default().contains("onsets edited"), "{:?}", stage.notice);
+        }
+        let pattern = stage.song.pattern(id).unwrap();
+        let notes: Vec<_> = (0..pattern.step_count()).flat_map(|step| &pattern.trig(step).notes).collect();
+        assert_eq!(notes.len(), 4);
+        assert!(notes.iter().all(|n| n.length_ticks == 24));
+        assert_eq!(notes.iter().map(|n| n.velocity).collect::<Vec<_>>(), vec![112, 112, 84, 84]);
     }
 
     #[test]

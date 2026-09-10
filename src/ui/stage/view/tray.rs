@@ -191,6 +191,8 @@ impl super::super::Stage {
         let focused = self.inside.is_some() && self.browser.is_none();
         // While a callout is up the sequencer is seen and not heard from.
         let keys = focused
+            && !self.palette.is_open()
+            && !self.utility.is_open()
             && self.steps.is_none()
             && self.trig_menu.is_none()
             && self.plock_editor.is_none();
@@ -224,6 +226,13 @@ impl super::super::Stage {
             polarity,
             playhead,
         );
+        // WHAT THE EDITOR SAID IS WHAT THE STAGE SAYS. The grid draws it
+        // over its own header, which is where it is read; the status line
+        // is where it is HEARD — by a reader looking away from the grid,
+        // and by a scripted run that has no eyes at all.
+        if let Some(said) = outcome.said.clone() {
+            self.notice = Some(said);
+        }
         let anchor = outcome.cursor_rect;
         if focused {
             let edited = !outcome.intents.is_empty();

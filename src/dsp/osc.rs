@@ -296,6 +296,31 @@ impl MipOsc {
         self.xfade = xfade;
     }
 
+    /// Audio-rate pitch input in semitones above `base_hz`, preserving phase
+    /// and selecting the safe mip band at every sample. Mismatched lengths
+    /// write silence without advancing state.
+    pub fn process_pitch(
+        &mut self,
+        out: &mut [f32],
+        offsets: &[f32],
+        base_hz: f32,
+        tables: &[f32],
+    ) {
+        if out.len() != offsets.len() {
+            out.fill(0.0);
+            return;
+        }
+        for (sample, offset) in out.iter_mut().zip(offsets) {
+            let offset = if offset.is_finite() {
+                offset.clamp(-127.0, 127.0)
+            } else {
+                0.0
+            };
+            self.set_freq(base_hz * (offset / 12.0).exp2());
+            self.process(core::slice::from_mut(sample), tables);
+        }
+    }
+
     /// The band decision for one frequency: phase increment, mip level,
     /// and how far into the crossfade toward the next level it sits.
     ///
@@ -901,6 +926,63 @@ mod tests {
                 osc.process(&mut buf, tables);
             }
         });
+    }
+
+    #[test]
+    fn audio_rate_pitch_matches_scalar_reference_and_splits_exactly() {
+        let tables = built(Waveform::Saw);
+        let mut full = MipOsc::new();
+        full.prepare(FS, Waveform::Saw);
+        let mut split = full.clone();
+        let mut reference = full.clone();
+        let mut offsets = [0.0; 257];
+        for (i, x) in offsets.iter_mut().enumerate() {
+            *x = 0.25 * (i as f32 * 0.03).sin();
+        }
+        let mut a = [0.0; 257];
+        let mut b = a;
+        let mut c = a;
+        assert_no_alloc::assert_no_alloc(|| {
+            full.process_pitch(&mut a, &offsets, 880.0, tables);
+            split.process_pitch(&mut [], &[], 880.0, tables);
+            split.process_pitch(&mut b[..1], &offsets[..1], 880.0, tables);
+            split.process_pitch(&mut b[1..100], &offsets[1..100], 880.0, tables);
+            split.process_pitch(&mut b[100..], &offsets[100..], 880.0, tables);
+            for (sample, offset) in c.iter_mut().zip(offsets) {
+                reference.set_freq(880.0 * (offset / 12.0).exp2());
+                reference.process(core::slice::from_mut(sample), tables);
+            }
+        });
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+        // The exact-zero fast path must be identical to ordinary playback.
+        full.reset();
+        reference.reset();
+        full.process_pitch(&mut a, &[0.0; 257], 440.0, tables);
+        reference.set_freq(440.0);
+        reference.process(&mut c, tables);
+        assert_eq!(a, c);
+    }
+
+    #[test]
+    fn audio_rate_pitch_handles_bad_inputs_and_missing_tables_without_nan() {
+        let tables = built(Waveform::Square);
+        let mut osc = MipOsc::new();
+        osc.prepare(FS, Waveform::Square);
+        let mut out = [1.0; 3];
+        osc.process_pitch(
+            &mut out,
+            &[f32::NAN, f32::INFINITY, -127.0],
+            f32::INFINITY,
+            tables,
+        );
+        assert!(out.iter().all(|x| x.is_finite() && !x.is_subnormal()));
+        osc.process_pitch(&mut out, &[0.0; 3], 440.0, &[]);
+        assert_eq!(out, [0.0; 3]);
+        let phase = osc.phase();
+        osc.process_pitch(&mut out, &[], 440.0, tables);
+        assert_eq!(out, [0.0; 3]);
+        assert_eq!(osc.phase(), phase);
     }
 
     // -------------------------------------------------------- edge lengths ---

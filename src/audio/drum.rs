@@ -52,10 +52,22 @@ pub enum Model {
     Hat,
     Clap,
     Tom,
+    /// Broad stochastic bands; no periodic oscillator enters the signal.
+    AirHat,
+    /// Short shell, independently rising wires, and a separate crack burst.
+    SnapSnare,
 }
 
 impl Model {
-    pub const ALL: [Self; 5] = [Self::Kick, Self::Snare, Self::Hat, Self::Clap, Self::Tom];
+    pub const ALL: [Self; 7] = [
+        Self::Kick,
+        Self::Snare,
+        Self::Hat,
+        Self::Clap,
+        Self::Tom,
+        Self::AirHat,
+        Self::SnapSnare,
+    ];
 
     pub fn from_value(value: f32) -> Self {
         let at = value.round().clamp(0.0, (Self::ALL.len() - 1) as f32) as usize;
@@ -66,11 +78,11 @@ impl Model {
     fn base_hz(self) -> f32 {
         match self {
             Self::Kick => 50.0,
-            Self::Snare => 180.0,
+            Self::Snare | Self::SnapSnare => 180.0,
             Self::Tom => 100.0,
             // The hat and the clap have no fundamental; their tune moves
             // the bank and the band.
-            Self::Hat | Self::Clap => 1.0,
+            Self::Hat | Self::AirHat | Self::Clap => 1.0,
         }
     }
 }
@@ -98,6 +110,9 @@ pub struct DrumParams {
     pub amp_decay_ms: f32,
     pub vel: f32,
     pub level: f32,
+    pub open_ms: f32,
+    pub crack: f32,
+    pub wire_rise_ms: f32,
 }
 
 impl Default for DrumParams {
@@ -123,6 +138,9 @@ impl Default for DrumParams {
             amp_decay_ms: at(dp::AMP_DECAY),
             vel: at(dp::VEL),
             level: at(dp::LEVEL),
+            open_ms: at(dp::OPEN_DECAY),
+            crack: at(dp::CRACK),
+            wire_rise_ms: at(dp::WIRE_RISE),
         }
     }
 }
@@ -153,6 +171,9 @@ impl DrumParams {
             dp::AMP_DECAY => self.amp_decay_ms = value,
             dp::VEL => self.vel = value,
             dp::LEVEL => self.level = value,
+            dp::OPEN_DECAY => self.open_ms = value,
+            dp::CRACK => self.crack = value,
+            dp::WIRE_RISE => self.wire_rise_ms = value,
             _ => {}
         }
     }
@@ -178,6 +199,9 @@ impl DrumParams {
             dp::AMP_DECAY => self.amp_decay_ms,
             dp::VEL => self.vel,
             dp::LEVEL => self.level,
+            dp::OPEN_DECAY => self.open_ms,
+            dp::CRACK => self.crack,
+            dp::WIRE_RISE => self.wire_rise_ms,
             _ => 0.0,
         }
     }
@@ -211,6 +235,11 @@ pub struct DrumVoice {
     /// which sample lands where.
     noise: WhiteNoise,
     white: WhiteNoise,
+    // Independent stream per consumer preserves exact split-block equality.
+    crack_noise: WhiteNoise,
+    crack_hp: Svf,
+    crack_env: ExpDecay,
+    wire_env: Adsr,
 
     body: ExpDecay,
     pitch_env: ExpDecay,
@@ -260,6 +289,10 @@ impl DrumVoice {
             square_tables: Vec::new(),
             noise: WhiteNoise::new(),
             white: WhiteNoise::new(),
+            crack_noise: WhiteNoise::new(),
+            crack_hp: Svf::new(),
+            crack_env: ExpDecay::new(),
+            wire_env: Adsr::new(),
             body: ExpDecay::new(),
             pitch_env: ExpDecay::new(),
             snap_env: ExpDecay::new(),
@@ -305,6 +338,7 @@ impl DrumVoice {
         }
         self.noise.seed(0xd12_0d12_5eed_0001);
         self.white.seed(0xd12_0d12_5eed_0002);
+        self.crack_noise.seed(0xd12_0d12_5eed_0003);
         self.params = params;
         self.base = params;
         self.apply_envelopes();
@@ -316,7 +350,12 @@ impl DrumVoice {
     fn apply_envelopes(&mut self) {
         let fs = self.sample_rate;
         let decay = self.params.decay_ms;
-        let body = if self.params.model() == Model::Hat && self.open {
+        let model = self.params.model();
+        let body = if model == Model::AirHat && self.open {
+            self.params.open_ms
+        } else if model == Model::SnapSnare {
+            (decay * 0.45).clamp(10., 130.)
+        } else if model == Model::Hat && self.open {
             decay * 4.0
         } else {
             decay
@@ -324,12 +363,23 @@ impl DrumVoice {
         self.body.prepare(fs, body);
         // The pitch falls in the first fifth of the body: a drop, not a
         // glide, whatever the decay.
-        self.pitch_env.prepare(fs, (decay * 0.2).clamp(3.0, 400.0));
+        self.pitch_env.prepare(
+            fs,
+            if model == Model::SnapSnare {
+                (decay * 0.035).clamp(2., 18.)
+            } else {
+                (decay * 0.2).clamp(3.0, 400.0)
+            },
+        );
+        self.crack_env.prepare(fs, 4.0);
+        self.wire_env
+            .prepare(fs, self.params.wire_rise_ms, 0., 1., 0.);
         let snap = match self.params.model() {
             // The wires ring for most of the shell; a hand is a burst.
             Model::Snare => (decay * 0.6).max(10.0),
+            Model::SnapSnare => decay,
             Model::Clap => 6.0,
-            Model::Kick | Model::Tom | Model::Hat => 2.5,
+            Model::Kick | Model::Tom | Model::Hat | Model::AirHat => 2.5,
         };
         self.snap_env.prepare(fs, snap);
         self.filter_env
@@ -348,11 +398,18 @@ impl DrumVoice {
     fn apply_model(&mut self) {
         let hp = match self.params.model() {
             Model::Hat => HAT_HP_HZ,
+            Model::AirHat => 3_000.0,
+            Model::SnapSnare => 80.0,
             Model::Clap => CLAP_HP_HZ,
             Model::Kick | Model::Snare | Model::Tom => 20.0,
         };
         self.hp
             .prepare(self.sample_rate, hp.min(self.sample_rate * 0.45), 0.707);
+        self.crack_hp.prepare(
+            self.sample_rate,
+            1_500_f32.min(self.sample_rate * 0.4),
+            0.707,
+        );
         for (i, osc) in self.bank.iter_mut().enumerate() {
             osc.set_phase((i as f32 * 0.618_034) % 1.0);
         }
@@ -367,6 +424,10 @@ impl DrumVoice {
         self.osc_b.reset();
         self.noise.reset();
         self.white.reset();
+        self.crack_noise.reset();
+        self.crack_hp.reset();
+        self.crack_env = ExpDecay::new();
+        self.wire_env.reset();
         self.body = ExpDecay::new();
         self.pitch_env = ExpDecay::new();
         self.snap_env = ExpDecay::new();
@@ -402,7 +463,13 @@ impl DrumVoice {
         let model_before = self.params.model();
         self.params.set(param, value);
         match param {
-            dp::DECAY | dp::FATTACK | dp::FDECAY | dp::ATTACK | dp::AMP_DECAY => {
+            dp::DECAY
+            | dp::FATTACK
+            | dp::FDECAY
+            | dp::ATTACK
+            | dp::AMP_DECAY
+            | dp::OPEN_DECAY
+            | dp::WIRE_RISE => {
                 self.apply_envelopes();
             }
             dp::MODEL if self.params.model() != model_before => {
@@ -427,7 +494,7 @@ impl DrumVoice {
         self.note_scale = pitch_scale(pitch);
         self.velocity = f32::from(velocity.max(1)) / 127.0;
         let model = self.params.model();
-        let open = model == Model::Hat && pitch >= OPEN_NOTE;
+        let open = matches!(model, Model::Hat | Model::AirHat) && pitch >= OPEN_NOTE;
         if open != self.open {
             self.open = open;
             self.apply_envelopes();
@@ -440,6 +507,8 @@ impl DrumVoice {
         self.body.trigger(1.0);
         self.pitch_env.trigger(1.0);
         self.snap_env.trigger(1.0);
+        self.crack_env.trigger(1.0);
+        self.wire_env.gate_on();
         self.filter_env.gate_on();
         self.amp.gate_on();
 
@@ -533,11 +602,12 @@ impl DrumVoice {
         let tune = (self.params.tune / 12.0).exp2() * self.note_scale;
         let drop = (self.params.sweep * self.pitch_env.current() / 12.0).exp2();
         match model {
-            Model::Kick | Model::Tom | Model::Snare => {
+            Model::Kick | Model::Tom | Model::Snare | Model::SnapSnare => {
                 let f = model.base_hz() * tune * drop;
                 let ratio = match model {
                     Model::Kick => 1.0 + self.params.tone,
                     Model::Tom => 1.0 + self.params.tone * 0.5,
+                    Model::SnapSnare => 1.59 + self.params.tone * 0.54,
                     _ => 1.5 + self.params.tone * 1.5,
                 };
                 self.osc_a.set_freq(f.clamp(1.0, ceiling));
@@ -546,6 +616,12 @@ impl DrumVoice {
                     // The wires' band: around 1.8 kHz, moved by TONE.
                     let hz = 1_800.0 * ((self.params.tone - 0.5) * 2.0).exp2();
                     self.retune_band(hz.min(ceiling), 0.9);
+                }
+                if model == Model::SnapSnare {
+                    self.retune_band(
+                        (2_200. * (self.params.tone * 1.5).exp2()).min(ceiling),
+                        0.65,
+                    );
                 }
             }
             Model::Hat => {
@@ -558,6 +634,13 @@ impl DrumVoice {
             Model::Clap => {
                 let hz = 300.0 * (self.params.tone * 3.74).exp2() * tune;
                 self.retune_band(hz.clamp(20.0, ceiling), 1.1);
+            }
+            Model::AirHat => {
+                // TUNE shades noise, but GM open/closed note numbers do not
+                // transpose its spectrum. Broad Q avoids a ringing pitch.
+                let colour = (self.params.tune / 24.).exp2();
+                let hz = 4_500. * (self.params.tone * 1.3).exp2() * colour * drop;
+                self.retune_band(hz.clamp(1000., ceiling), 0.55);
             }
         }
         // The filter: the knob, moved by its envelope in semitones and
@@ -610,14 +693,14 @@ impl DrumVoice {
         self.body.process(env_a);
         self.snap_env.process(env_b);
         match model {
-            Model::Kick | Model::Tom | Model::Snare => {
+            Model::Kick | Model::Tom | Model::Snare | Model::SnapSnare => {
                 self.osc_a.process(sig, &self.sine_tables);
                 let mut second = [0.0f32; CHUNK];
                 let Some(second) = second.get_mut(..n) else {
                     return;
                 };
                 self.osc_b.process(second, &self.sine_tables);
-                let weight = if model == Model::Snare {
+                let weight = if matches!(model, Model::Snare | Model::SnapSnare) {
                     1.0
                 } else {
                     self.params.tone
@@ -635,8 +718,15 @@ impl DrumVoice {
                         return;
                     };
                     self.noise.process(burst);
-                    if model == Model::Snare {
+                    if matches!(model, Model::Snare | Model::SnapSnare) {
                         self.band.process(burst, Mode::BandpassUnity);
+                    }
+                    if model == Model::SnapSnare {
+                        let mut rise = [0_f32; CHUNK];
+                        self.wire_env.process(&mut rise[..n]);
+                        for (env, rise) in env_b.iter_mut().zip(&rise) {
+                            *env *= *rise;
+                        }
                     }
                     let level = self.params.snap * velocity;
                     for (sample, (rattle, env)) in
@@ -686,6 +776,24 @@ impl DrumVoice {
                     *sample *= (*burst + *tail * 0.5) * velocity;
                 }
             }
+            Model::AirHat => {
+                self.noise.process(sig);
+                self.band.process(sig, Mode::BandpassUnity);
+                for (sample, env) in sig.iter_mut().zip(env_a.iter()) {
+                    *sample *= *env * velocity;
+                }
+            }
+        }
+
+        if matches!(model, Model::AirHat | Model::SnapSnare) {
+            let mut crack = [0_f32; CHUNK];
+            let crack = &mut crack[..n];
+            self.crack_noise.process(crack);
+            self.crack_hp.process(crack, Mode::Highpass);
+            self.crack_env.process(env_b);
+            for (sample, (noise, env)) in sig.iter_mut().zip(crack.iter().zip(env_b.iter())) {
+                *sample += *noise * *env * self.params.crack * velocity;
+            }
         }
 
         // --- noise: white, under the body, at NOISE -------------------
@@ -700,7 +808,10 @@ impl DrumVoice {
                 *sample += *w * *env * level;
             }
         }
-        if matches!(model, Model::Hat | Model::Clap) {
+        if matches!(
+            model,
+            Model::Hat | Model::AirHat | Model::Clap | Model::SnapSnare
+        ) {
             self.hp.process(sig, Mode::Highpass);
         }
 
@@ -727,6 +838,92 @@ impl DrumVoice {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    fn air() -> DrumParams {
+        DrumParams {
+            decay_ms: 65.,
+            open_ms: 650.,
+            sweep: 0.,
+            tone: 0.65,
+            noise: 0.05,
+            crack: 0.25,
+            drive: 0.05,
+            ..with_model(Model::AirHat)
+        }
+    }
+
+    #[test]
+    fn air_hat_is_broadband_and_has_no_resolved_tonal_peak() {
+        let mut v = voice(air());
+        v.trigger(OPEN_NOTE, 127);
+        let x = render(&mut v, 8192);
+        let n = 4096;
+        let mut fft = crate::dsp::fft::RealFft::new();
+        fft.prepare(n);
+        let input: Vec<f32> = x[1024..1024 + n]
+            .iter()
+            .enumerate()
+            .map(|(i, x)| x * (0.5 - 0.5 * (core::f32::consts::TAU * i as f32 / n as f32).cos()))
+            .collect();
+        let mut re = vec![0.; n / 2 + 1];
+        let mut im = re.clone();
+        let mut scratch = vec![0.; crate::dsp::fft::RealFft::scratch_len(n)];
+        fft.forward(&input, &mut re, &mut im, &mut scratch);
+        let powers: Vec<f32> = (427..1280)
+            .map(|i| (re[i] * re[i] + im[i] * im[i]).max(1e-20))
+            .collect();
+        let sum: f32 = powers.iter().sum();
+        let flatness = (powers.iter().map(|x| x.ln()).sum::<f32>() / powers.len() as f32).exp()
+            / (sum / powers.len() as f32);
+        let concentration = powers.iter().copied().fold(0_f32, f32::max) / sum;
+        assert!(flatness > 0.25, "5–15 kHz flatness {flatness}");
+        assert!(
+            concentration < 0.035,
+            "single-bin concentration {concentration}"
+        );
+    }
+
+    #[test]
+    fn air_articulations_choke_and_dont_transpose_the_noise() {
+        let mut a = voice(air());
+        let mut b = voice(air());
+        a.trigger(42, 127);
+        b.trigger(44, 127);
+        assert_eq!(render(&mut a, 4096), render(&mut b, 4096));
+        let mut open = voice(air());
+        open.trigger(46, 127);
+        let _ = render(&mut open, 4800);
+        let ringing = peak(&render(&mut open, 4800));
+        assert!(ringing > 0.005);
+        open.trigger(42, 127);
+        let _ = render(&mut open, 4800);
+        assert!(peak(&render(&mut open, 4800)) < ringing * 0.1);
+    }
+
+    #[test]
+    fn snap_snare_has_a_fast_front_and_independent_crack() {
+        let params = DrumParams {
+            decay_ms: 150.,
+            snap: 0.9,
+            crack: 0.5,
+            wire_rise_ms: 1.,
+            sweep: 9.,
+            tone: 0.6,
+            ..with_model(Model::SnapSnare)
+        };
+        let mut v = voice(params);
+        v.trigger(36, 127);
+        let x = render(&mut v, 9600);
+        assert!(peak(&x[..480]) > peak(&x[4800..]) * 5.);
+        let mut dry = voice(DrumParams {
+            crack: 0.,
+            ..params
+        });
+        dry.trigger(36, 127);
+        assert_ne!(x, render(&mut dry, 9600));
+        let encoded = ron::to_string(&params).unwrap();
+        assert_eq!(params, ron::from_str::<DrumParams>(&encoded).unwrap());
+    }
 
     fn voice(params: DrumParams) -> DrumVoice {
         let mut v = DrumVoice::new();

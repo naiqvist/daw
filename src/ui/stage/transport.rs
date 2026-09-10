@@ -96,6 +96,9 @@ impl Transport {
         self.tick.max(0.0) as usize
     }
 
+    #[cfg(feature = "visuals")]
+    pub fn precise_tick(&self) -> f64 { self.tick.max(0.0) }
+
     /// Position as a fraction of the way through the current beat, `0..1`.
     /// The subdivision display reads this; the digits do not, which is why
     /// the digits do not churn.

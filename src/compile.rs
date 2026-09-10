@@ -157,7 +157,8 @@ pub(crate) fn compile_chain(
             | DeviceState::Pipe(_)
             | DeviceState::Glass(_)
             | DeviceState::Rom(_)
-            | DeviceState::Acid(_) => {}
+            | DeviceState::Acid(_)
+            | DeviceState::Spectral(_) => {}
             DeviceState::Utility(params) => {
                 let node = spec.push(NodeSpec::Utility { params });
                 spec.connect(tail, node);
@@ -710,6 +711,10 @@ pub(crate) fn build_graph_spec(
                         subloops: Vec::new(),
                         loop_len_beats,
                         params,
+                    },
+                    DeviceState::Spectral(params) => NodeSpec::Spectral {
+                        notes, subloops: Vec::new(), loop_len_beats,
+                        patch: Box::new(daw::audio::spectral::SpectralPatch { params, ..Default::default() }),
                     },
                     DeviceState::Kick(params) => NodeSpec::Kick {
                         notes,

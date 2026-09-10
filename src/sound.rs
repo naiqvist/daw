@@ -57,6 +57,8 @@ pub struct Sound {
 /// The instrument and what it was set to.
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Machine {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spectral: Option<Box<crate::audio::spectral::Routing>>,
     /// `DeviceSpec::prefix` — the stable word the target names already
     /// use in the document, so a machine is named the same way twice.
     pub kind: String,
@@ -109,6 +111,7 @@ impl Sound {
                 sample: device.sample.clone(),
                 slices: device.slices.clone(),
                 pads: device.pads.clone(),
+                spectral: device.spectral.clone(),
             }),
             sections: track
                 .strip
@@ -145,6 +148,7 @@ impl Sound {
         device.sample = machine.sample.clone();
         device.slices = machine.slices.clone();
         device.pads = machine.pads.clone();
+        device.spectral = machine.spectral.clone();
         Some(device)
     }
 }

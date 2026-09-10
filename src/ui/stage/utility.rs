@@ -9,6 +9,13 @@ use crate::design;
 use crate::ui::prefs::{AudioBackend, Autosave, CursorEnergy, ExportFormat, ExportTail, UiPrefs};
 use std::path::{Path, PathBuf};
 
+pub(super) const COMMANDS: &[crate::ui::palette::TypedCommand] = &[
+    crate::ui::palette::TypedCommand {
+        name: "render-config",
+        usage: "render-config format wav24|wav16|float32 rate 48000|device tail 0|1|2|5|10 range song|loop · configure only",
+    },
+];
+
 pub(super) const NAV_W: f32 = 172.0;
 pub(super) const HEADER_H: f32 = 72.0;
 pub(super) const FOOTER_H: f32 = 34.0;
@@ -1295,6 +1302,56 @@ fn health_word(health: Option<&super::Health>) -> String {
 }
 
 impl Stage {
+    pub(super) fn apply_render_config(&mut self, input: &str) -> bool {
+        let words: Vec<_> = input.split_whitespace().skip(1).collect();
+        let mut prefs = self.preferences().clone();
+        let mut range = self.utility.export_range;
+        let result = (|| -> Result<(), &'static str> {
+            if words.is_empty() || words.len() % 2 != 0 || words.len() > 8 {
+                return Err("use pairs: format, rate, tail, range");
+            }
+            let mut seen = std::collections::HashSet::new();
+            for pair in words.chunks_exact(2) {
+                if !seen.insert(pair[0]) { return Err("duplicate render option"); }
+                match pair[0] {
+                    "format" => prefs.export_format = match pair[1] {
+                        "wav24" => ExportFormat::Int24,
+                        "wav16" => ExportFormat::Int16,
+                        "float32" => ExportFormat::Float32,
+                        _ => return Err("format: wav24, wav16 or float32"),
+                    },
+                    "rate" => prefs.export_rate_hz = match pair[1] {
+                        "device" => None,
+                        "44100" => Some(44_100), "48000" => Some(48_000),
+                        "88200" => Some(88_200), "96000" => Some(96_000),
+                        _ => return Err("rate: device, 44100, 48000, 88200 or 96000"),
+                    },
+                    "tail" => prefs.export_tail = match pair[1] {
+                        "0" => ExportTail::None, "1" => ExportTail::OneSecond,
+                        "2" => ExportTail::TwoSeconds, "5" => ExportTail::FiveSeconds,
+                        "10" => ExportTail::TenSeconds,
+                        _ => return Err("tail seconds: 0, 1, 2, 5 or 10"),
+                    },
+                    "range" => range = match pair[1] {
+                        "song" => ExportRange::Song, "loop" => ExportRange::Loop,
+                        _ => return Err("range: song or loop"),
+                    },
+                    _ => return Err("unknown render option"),
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.notice = Some(format!("REFUSED render-config · {error}"));
+            return false;
+        }
+        self.notice = Some(format!("render-config · {} · {} · tail {} · {} · not started",
+            prefs.export_format.label(), prefs.export_rate_hz.map_or("device rate".into(), |r| format!("{r} Hz")), prefs.export_tail.label(), range.label()));
+        *self.utility.prefs_mut() = prefs;
+        self.utility.export_range = range;
+        true
+    }
+
     pub fn restore_preferences(&mut self, prefs: UiPrefs, show_startup: bool) {
         if let Some(folder) = prefs.project_folder.as_deref().map(PathBuf::from) {
             self.home = Some(folder);
@@ -1812,6 +1869,23 @@ fn human_age(age: std::time::Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_config_preflights_all_options_and_does_not_render() {
+        let mut stage = Stage::new();
+        let song = stage.song.clone();
+        let before = ron::to_string(stage.preferences()).unwrap();
+        assert!(!stage.apply_timeline_command("render-config tail 10 rate rubbish"));
+        assert_eq!(ron::to_string(stage.preferences()).unwrap(), before);
+        assert!(stage.apply_timeline_command("render-config format wav24 rate 48000 tail 10 range song"));
+        assert_eq!(stage.preferences().export_tail, ExportTail::TenSeconds);
+        assert_eq!(stage.preferences().export_rate_hz, Some(48_000));
+        assert_eq!(stage.preferences().export_format, ExportFormat::Int24);
+        assert_eq!(stage.song, song);
+        assert!(stage.notice.as_deref().unwrap().contains("not started"));
+        assert!(!stage.apply_timeline_command("render-config tail 2 tail 5"));
+        assert_eq!(stage.preferences().export_tail, ExportTail::TenSeconds);
+    }
 
     fn snapshot() -> UtilitySnapshot {
         UtilitySnapshot {

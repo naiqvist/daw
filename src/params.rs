@@ -19,6 +19,7 @@
 //! `FOO` — names are unique, and every default lies inside its range.
 
 pub mod glass;
+pub mod spectral;
 pub mod mass;
 pub mod pipe;
 pub mod pluck;
@@ -6764,12 +6765,24 @@ pub mod drum {
     pub const AMP_DECAY: u32 = 16;
     pub const VEL: u32 = 17;
     pub const LEVEL: u32 = 18;
+    pub const OPEN_DECAY: u32 = 19;
+    pub const CRACK: u32 = 20;
+    pub const WIRE_RISE: u32 = 21;
     /// What the excluded-gain machinery and the old binary call the level.
     pub const GAIN: u32 = LEVEL;
 
     pub const TUNE_MIN: f32 = -24.0;
     pub const TUNE_MAX: f32 = 24.0;
-    pub const MODELS: f32 = 4.0;
+    pub const MODELS: f32 = 6.0;
+    pub const MODEL_NAMES: &[&str] = &[
+        "KICK",
+        "SNARE",
+        "HAT",
+        "CLAP",
+        "TOM",
+        "AIR HAT",
+        "SNAP SNARE",
+    ];
 
     pub const TABLE: &[ParamDef] = &[
         ParamDef {
@@ -6905,27 +6918,63 @@ pub mod drum {
             max: 2.0,
             default: 0.9,
         },
+        ParamDef {
+            id: OPEN_DECAY,
+            name: "open decay",
+            min: 50.,
+            max: 3000.,
+            default: 600.,
+        },
+        ParamDef {
+            id: CRACK,
+            name: "crack",
+            min: 0.,
+            max: 1.,
+            default: 0.3,
+        },
+        ParamDef {
+            id: WIRE_RISE,
+            name: "wire rise",
+            min: 0.,
+            max: 20.,
+            default: 1.5,
+        },
     ];
 
-    /// The drum's function keys: SRC, FLTR and AMP, one sub-page each.
+    /// The drum's function keys: SRC, FLTR and AMP.
     /// TRIG, LFO, FX and MIX are the track's.
     pub const KEYS: KeyTable = [
         None,
         Some(MachineKey {
             word: "SRC",
-            subpages: &[SubPage {
-                title: "Voice",
-                slots: [
-                    Some(MODEL),
-                    Some(TUNE),
-                    Some(DECAY),
-                    Some(SWEEP),
-                    Some(SNAP),
-                    Some(TONE),
-                    Some(NOISE),
-                    Some(DRIVE),
-                ],
-            }],
+            subpages: &[
+                SubPage {
+                    title: "Voice",
+                    slots: [
+                        Some(MODEL),
+                        Some(TUNE),
+                        Some(DECAY),
+                        Some(SWEEP),
+                        Some(SNAP),
+                        Some(TONE),
+                        Some(NOISE),
+                        Some(DRIVE),
+                    ],
+                },
+                SubPage {
+                    title: "Detail",
+                    slots: [
+                        Some(OPEN_DECAY),
+                        Some(CRACK),
+                        Some(WIRE_RISE),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ],
+                },
+            ],
         }),
         Some(MachineKey {
             word: "FLTR",
@@ -10273,6 +10322,14 @@ pub mod acid {
     pub const GLIDE: u32 = 7;
     pub const DRIVE: u32 = 8;
     pub const LEVEL: u32 = 9;
+    pub const VIBRATO_SPEED: u32 = 10;
+    pub const VIBRATO_INTENSITY: u32 = 11;
+    pub const ORNAMENT: u32 = 12;
+    pub const ORNAMENT_TIME: u32 = 13;
+    pub const ORNAMENT_SPEED: u32 = 14;
+    pub const ORNAMENT_FROM: u32 = 15;
+    pub const ORNAMENT_OTHER: u32 = 16;
+    pub const ORNAMENT_NAMES: &[&str] = &["off", "kan-swar", "meend", "gamak", "khatka", "andolan", "murki"];
 
     pub const WAVE_SAW: u32 = 0;
     pub const WAVE_SQUARE: u32 = 1;
@@ -10395,6 +10452,13 @@ pub mod acid {
             max: 2.0,
             default: 0.8,
         },
+        ParamDef { id: VIBRATO_SPEED, name: "vibrato speed", min: 0.1, max: 12.0, default: 5.2 },
+        ParamDef { id: VIBRATO_INTENSITY, name: "vibrato intensity", min: 0.0, max: 100.0, default: 0.0 },
+        ParamDef { id: ORNAMENT, name: "ornament", min: 0.0, max: 6.0, default: 0.0 },
+        ParamDef { id: ORNAMENT_TIME, name: "ornament time", min: 20.0, max: 2000.0, default: 140.0 },
+        ParamDef { id: ORNAMENT_SPEED, name: "ornament speed", min: 0.1, max: 16.0, default: 5.0 },
+        ParamDef { id: ORNAMENT_FROM, name: "ornament from", min: -1200.0, max: 1200.0, default: -100.0 },
+        ParamDef { id: ORNAMENT_OTHER, name: "ornament other", min: -1200.0, max: 1200.0, default: 200.0 },
     ];
     /// The acid's function keys: SRC (the oscillator, its glide and
     /// accent, the drive and level) and FLTR (the filter that is the
@@ -10416,6 +10480,12 @@ pub mod acid {
                     None,
                     None,
                 ],
+            }, SubPage {
+                title: "Vibrato",
+                slots: [Some(VIBRATO_SPEED), Some(VIBRATO_INTENSITY), None, None, None, None, None, None],
+            }, SubPage {
+                title: "Ornament",
+                slots: [Some(ORNAMENT), Some(ORNAMENT_TIME), Some(ORNAMENT_SPEED), Some(ORNAMENT_FROM), Some(ORNAMENT_OTHER), None, None, None],
             }],
         }),
         Some(MachineKey {

@@ -156,6 +156,8 @@ pub(crate) struct SequenceGrid {
     /// The last refusal, shown in the status line until the next sentence.
     /// Silence is forbidden: an unsupported verb answers out loud.
     refusal: Option<String>,
+    /// What was said THIS frame, for the frame above to pass on.
+    said: Option<String>,
     /// The Euclidean mode while it is on.
     euclid: Option<crate::ui::sequencer::euclid::Euclid>,
     /// Where the cursor's cell was drawn this frame, so a surface over
@@ -179,6 +181,7 @@ impl Default for SequenceGrid {
             selection_clip: None,
             selection_anchor: None,
             refusal: None,
+            said: None,
             euclid: None,
             cursor_rect: None,
         }
@@ -1011,6 +1014,7 @@ impl SequenceGrid {
         };
         self.refusal = None;
         self.speak(utterance, selecting, voice.registers, clip, intents);
+        self.said = self.refusal.clone();
         // The sentence carries the mode's line, and owns Escape while
         // the mode is on.
         voice.sentence.set_modal(
@@ -1611,6 +1615,11 @@ impl SequenceGrid {
     }
 
     /// The cursor cell as last drawn, if it was on screen.
+    /// What this editor said this frame, taken once.
+    pub(crate) fn said(&mut self) -> Option<String> {
+        self.said.take()
+    }
+
     pub(crate) fn cursor_rect(&self) -> Option<egui::Rect> {
         self.cursor_rect
     }

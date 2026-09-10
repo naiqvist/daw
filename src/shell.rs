@@ -72,6 +72,12 @@ pub trait Host {
         false
     }
 
+    /// A short line about where the application IS, for the scripted-input
+    /// trace. Default: nothing, for a host that has nothing to say.
+    fn status(&self) -> String {
+        String::new()
+    }
+
     /// Once, after the context exists and before the first frame —
     /// fonts, zoom, the restored theme. Under eframe this was whatever
     /// `App::new` did with `CreationContext::egui_ctx`; the context now
@@ -176,6 +182,9 @@ fn storage_dir(app_id: &str) -> Option<PathBuf> {
 /// The offscreen colour target egui draws into, and the generation that
 /// says when the bind group pointing at it went stale.
 struct Offscreen {
+    /// Kept, not just its view: DRIVE reads this texture back to make a
+    /// picture of the frame.
+    texture: wgpu::Texture,
     view: wgpu::TextureView,
     size: [u32; 2],
     generation: u64,
@@ -199,11 +208,14 @@ impl Offscreen {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         Self {
             view: texture.create_view(&wgpu::TextureViewDescriptor::default()),
+            texture,
             size,
             generation,
         }
@@ -233,6 +245,8 @@ struct Shell<A: Host> {
     min_size: [f32; 2],
     live: Option<Live>,
     last_save: std::time::Instant,
+    /// The scripted-input channel, when `DAW_DRIVE` asked for one.
+    drive: Option<crate::drive::Drive>,
 }
 
 impl<A: Host> winit::application::ApplicationHandler for Shell<A> {
@@ -348,6 +362,12 @@ impl<A: Host> Shell<A> {
             &live.window,
             false,
         );
+        // A scripted key is indistinguishable from a typed one by the
+        // time the grammar reads it: same events, same frame, same queue.
+        if let Some(drive) = &mut self.drive {
+            let status = self.app.status();
+            raw_input.events.extend(drive.events(&status));
+        }
         let app = &mut self.app;
         let ctx = live.egui.egui_ctx().clone();
         screen::begin_frame(&ctx);
@@ -457,6 +477,22 @@ impl<A: Host> Shell<A> {
             .submit(user.into_iter().chain(std::iter::once(encoder.finish())));
         live.window.pre_present_notify();
         live.queue.present(frame);
+
+        // A frame the script asked to keep. Taken from the offscreen
+        // target — what egui drew, before the screen treatment over it —
+        // and after presentation, so a picture never delays the window.
+        if let Some(path) = self.drive.as_mut().and_then(crate::drive::Drive::taking) {
+            match crate::drive::capture(
+                &live.device,
+                &live.queue,
+                &live.offscreen.texture,
+                live.offscreen.size,
+                &path,
+            ) {
+                Ok(()) => println!("drive      wrote {}", path.display()),
+                Err(err) => eprintln!("drive      {} failed: {err}", path.display()),
+            }
+        }
 
         for id in &textures.free {
             live.renderer.free_texture(id);
@@ -570,6 +606,8 @@ impl<A: Host> Shell<A> {
         );
         let mut renderer = egui_wgpu::Renderer::new(&device, format, Default::default());
         crate::ui::kiln::install(&mut renderer, format);
+        #[cfg(feature = "visuals")]
+        crate::visuals::gpu::install(&mut renderer, format);
         let post = post::Post::new(&device, format);
         let screens = screen::Pass::new(&device, format);
         let offscreen = Offscreen::new(&device, format, size, 0);
@@ -622,6 +660,7 @@ pub fn run<A: Host>(
         min_size,
         live: None,
         last_save: std::time::Instant::now(),
+        drive: crate::drive::Drive::open(),
     };
     event_loop.run_app(&mut shell)?;
     Ok(())

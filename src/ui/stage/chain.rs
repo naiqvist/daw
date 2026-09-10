@@ -614,11 +614,24 @@ pub fn family_runs(rows: &[Row]) -> Vec<(ParamFamily, std::ops::Range<usize>)> {
 
 /// One press of a parameter.
 ///
-/// For a RANGE: a hundredth of it, or a tenth when the press is coarse.
 /// For a LIST: one position, whichever press — a list has no "coarse"
 /// walk, and a press that skipped entries would be a press whose landing
-/// could not be predicted. The catalog says which is which; the shape of
-/// a range cannot be read to find out, and this surface no longer tries.
+/// could not be predicted.
+///
+/// For a RANGE the press is the parameter's OWN UNIT, when the unit has a
+/// smallest amount worth having and the range is short enough to cross in
+/// one: a semitone for semitones, a beat for beats, a cent for cents.
+/// Otherwise a hundredth of the range, or a tenth when the press is
+/// coarse, as everything did before.
+///
+/// The rule earns its keep because a hundredth of a range is an amount
+/// nothing means. Tune spans ±36 semitones, so a hundredth of it was 0.72
+/// of a semitone: every press DETUNED the voice and no press could ever
+/// transpose it. Source beat spans 64, so a hundredth was 0.64 of a beat
+/// and four beats — the length of a bar, the value the parameter exists
+/// to be given — was not among the values it could hold. Neither of those
+/// was a decision anyone made; both fell out of dividing a number by a
+/// hundred without asking what the number was.
 pub fn step_of(def: &ParamDef, label: &ParamLabel, coarse: bool) -> f32 {
     if !label.choices.is_empty() {
         return 1.0;
@@ -627,7 +640,46 @@ pub fn step_of(def: &ParamDef, label: &ParamLabel, coarse: bool) -> f32 {
     if span <= 0.0 {
         return 0.0;
     }
+    // Sub-audio rates need hundredths of a hertz: a whole-hertz step
+    // jumps from a slow pad sweep straight to tremolo (or the floor).
+    if label.unit.trim() == "Hz" && def.min >= 0.0 && def.max <= 20.0 {
+        return if coarse { 0.1 } else { 0.01 };
+    }
+    if let Some((fine, big)) = unit_step(label.unit) {
+        // Only where the whole range is walkable a step at a time.
+        // A delay of 0..5000 ms is not something to cross a millisecond
+        // at a time, and pretending otherwise would trade one useless
+        // press for a slower one.
+        if span / fine <= MOST_PRESSES {
+            return if coarse { big } else { fine };
+        }
+    }
     if coarse { span / 10.0 } else { span / 100.0 }
+}
+
+/// The most presses it is reasonable to ask for from one end of a range
+/// to the other. Past this the unit is too fine for the range and the
+/// proportional step is the kinder one.
+const MOST_PRESSES: f32 = 220.0;
+
+/// A unit's own smallest useful amount, and the bigger one a coarse press
+/// asks for — the musical multiple, where the unit has one: an octave of
+/// semitones, a bar of beats, a semitone of cents.
+///
+/// Spelled with and without the leading space because the catalog is
+/// written both ways.
+fn unit_step(unit: &str) -> Option<(f32, f32)> {
+    match unit.trim() {
+        "st" => Some((1.0, 12.0)),
+        "ct" => Some((1.0, 100.0)),
+        "oct" => Some((1.0, 2.0)),
+        "bt" => Some((1.0, 4.0)),
+        "dB" => Some((0.5, 6.0)),
+        "ms" => Some((1.0, 10.0)),
+        "Hz" => Some((1.0, 100.0)),
+        "%" => Some((1.0, 10.0)),
+        _ => None,
+    }
 }
 
 /// How many parameter rows fit in `room` at `pitch`, and only whole ones.
@@ -1123,5 +1175,86 @@ mod tests {
         assert_eq!(rows_that_fit(99.0, 20.0), 4);
         assert_eq!(rows_that_fit(10.0, 20.0), 0, "half a row is not a row");
         assert_eq!(rows_that_fit(100.0, 0.0), 0);
+    }
+}
+
+#[cfg(test)]
+mod step_tests {
+    use super::*;
+
+    fn def(min: f32, max: f32) -> ParamDef {
+        ParamDef {
+            id: 0,
+            name: "p",
+            min,
+            max,
+            default: min,
+        }
+    }
+
+    fn label(unit: &'static str) -> ParamLabel {
+        ParamLabel {
+            name: "P",
+            unit,
+            group: "G",
+            choices: &[],
+        }
+    }
+
+    /// A press of a semitone parameter moves a SEMITONE. Tune spans ±36,
+    /// where a hundredth of the range was 0.72 — an amount that detunes a
+    /// voice and can never transpose it.
+    #[test]
+    fn a_semitone_parameter_moves_by_semitones() {
+        let (def, label) = (def(-36.0, 36.0), label(" st"));
+        assert_eq!(step_of(&def, &label, false), 1.0);
+        assert_eq!(step_of(&def, &label, true), 12.0, "coarse is an octave");
+    }
+
+    /// And a beat parameter moves by a beat, so a bar is a value it can
+    /// hold. Source beat spans 0..64: at 0.64 a press, 4.00 was not
+    /// reachable from 0 at all.
+    #[test]
+    fn a_beats_parameter_can_be_given_a_bar() {
+        let (def, label) = (def(0.0, 64.0), label(" bt"));
+        assert_eq!(step_of(&def, &label, false), 1.0);
+        assert_eq!(step_of(&def, &label, true), 4.0, "coarse is a bar");
+        // The value the parameter exists to be given is now four presses.
+        let four: f32 = (0..4).map(|_| step_of(&def, &label, false)).sum();
+        assert_eq!(four, 4.0);
+    }
+
+    /// A unit too fine for its range keeps the proportional press. Nobody
+    /// crosses half a second a millisecond at a time.
+    #[test]
+    fn a_long_range_keeps_the_proportional_press() {
+        let (def, label) = (def(5.0, 500.0), label(" ms"));
+        assert_eq!(step_of(&def, &label, false), 4.95);
+        // But a short one in the same unit takes the unit.
+        let short = self::def(0.0, 100.0);
+        assert_eq!(step_of(&short, &label, false), 1.0);
+    }
+
+    /// Everything without a unit is exactly as it was: a hundredth, and a
+    /// tenth when coarse. Most of the catalog is this.
+    #[test]
+    fn an_unitless_range_is_unchanged() {
+        let (def, label) = (def(0.0, 1.0), label(""));
+        assert!((step_of(&def, &label, false) - 0.01).abs() < 1e-6);
+        assert!((step_of(&def, &label, true) - 0.1).abs() < 1e-6);
+    }
+
+    /// A list still walks one entry at a time, coarse or not.
+    #[test]
+    fn a_list_walks_one_at_a_time() {
+        let def = def(0.0, 3.0);
+        let label = ParamLabel {
+            name: "P",
+            unit: "",
+            group: "G",
+            choices: &["a", "b", "c", "d"],
+        };
+        assert_eq!(step_of(&def, &label, false), 1.0);
+        assert_eq!(step_of(&def, &label, true), 1.0);
     }
 }

@@ -49,6 +49,19 @@ struct LegacyDocument {
 const VERSION: u32 = 4;
 const BACKUP_LIMIT: usize = 20;
 
+#[test]
+fn visual_payload_survives_audio_only_document_round_trip() {
+    // Deliberately opaque: this build must preserve versions it cannot render.
+    let mut song = Song::default();
+    song.visuals = Some("(version:999,future_visual_primitive:())".into());
+    let text = ron::ser::to_string(&Document { version:VERSION,song:song.clone() }).unwrap();
+    let back:Document = ron::from_str(&text).unwrap();
+    let (back,_) = migrate_logged(back.version,back.song).unwrap();
+    assert_eq!(back.visuals,song.visuals);
+    song.visuals=None;
+    assert!(!ron::ser::to_string(&song).unwrap().contains("visuals:"));
+}
+
 /// Move a stage-native document to the current in-memory shape. Versions zero
 /// and one predate the default input/output gain utilities; installing their
 /// exact-unity nodes is an audible no-op with explicit stable ids. Keeping the

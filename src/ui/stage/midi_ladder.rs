@@ -203,9 +203,28 @@ fn subject_of(voice: Voice) -> composer::Subject {
 
 impl Stage {
     /// The ladder of the focused MIDI Lab window, if it is on one.
+    ///
+    /// This is the RAW read: it says what the window is on, which is what
+    /// the screen draws and what a test asserts. It does NOT say the
+    /// ladder may answer a key — see [`Stage::ladder_has_keys`].
     pub(super) fn midi_ladder(&self) -> Option<Ladder> {
         self.midi_ladder_window()
             .and_then(|window| self.midi_window(window).and_then(|state| state.ladder))
+    }
+
+    /// The ladder, but only when the keys are ITS to answer.
+    ///
+    /// Three things have to be true, and each was a bug before it was a
+    /// condition: the lab is the field (a window keeps its ladder while
+    /// the lab is away, so without this the SESSION's arrows went to a
+    /// ladder nobody could see and the cursor sat on the first track's
+    /// header refusing to move), the focused window has the keys rather
+    /// than the tiler, and no extension menu stands over it.
+    pub(super) fn ladder_has_keys(&self) -> Option<Ladder> {
+        if !self.lab.open || !self.lab.inside || self.lab.menu.is_some() {
+            return None;
+        }
+        self.midi_ladder()
     }
 
     fn midi_ladder_window(&self) -> Option<usize> {
@@ -446,8 +465,19 @@ impl Stage {
             },
             Row {
                 label: "write it to the clip".to_owned(),
-                value: where_to,
-                note: "one undoable edit; the clip keeps its place".to_owned(),
+                value: if parts > 1 {
+                    format!("{where_to} · +{} tracks", parts - 1)
+                } else {
+                    where_to
+                },
+                note: if parts > 1 {
+                    // Said BEFORE it happens: two parts cannot share one
+                    // instrument, so the extra ones arrive on tracks of
+                    // their own.
+                    "one undoable edit · each part gets its own track".to_owned()
+                } else {
+                    "one undoable edit; the clip keeps its place".to_owned()
+                },
                 chosen: false,
                 act: RowAct::Send,
             },
@@ -636,7 +666,112 @@ impl Stage {
             RowAct::Tonic | RowAct::Turn(_) => Err(RefusalReason::Unavailable),
             RowAct::Hear => self.midi_intent(super::StageIntent::MidiLabHear),
             RowAct::Play => self.midi_intent(super::StageIntent::MidiLabPlay),
-            RowAct::Send => self.midi_intent(super::StageIntent::MidiLabSend),
+            RowAct::Send => {
+                // A PART PER CLIP. Chords, melody and bass on one clip
+                // collide the moment two of them hold the same pitch, and
+                // the composer is right to refuse: one clip on one
+                // instrument cannot say which note is whose. So the
+                // ladder gives every part after the first a clip of its
+                // own, made in an empty slot beside the chosen one —
+                // which is the same answer the first rung gives to
+                // "where does it go".
+                self.ladder_spread_parts(draft);
+                self.midi_intent(super::StageIntent::MidiLabSend)
+            }
+        }
+    }
+
+    /// Give every enabled part after the first a clip of its own, making
+    /// one in an empty slot when there is none spare. The first part
+    /// keeps the clip the ladder was pointed at.
+    fn ladder_spread_parts(&mut self, draft: u64) {
+        let Some(primary) = self
+            .song
+            .midi_labs
+            .iter()
+            .find(|d| d.id == draft)
+            .and_then(|d| d.destination)
+        else {
+            return;
+        };
+        let Some(track) = self
+            .song
+            .tracks
+            .iter()
+            .position(|track| track.id == primary.track)
+        else {
+            return;
+        };
+        let enabled: Vec<usize> = self
+            .song
+            .midi_labs
+            .iter()
+            .find(|d| d.id == draft)
+            .and_then(|d| d.recipe.composition.as_ref())
+            .map(|c| {
+                c.voices
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, part)| part.enabled)
+                    .map(|(at, _)| at)
+                    .collect()
+            })
+            .unwrap_or_default();
+        // A TRACK of its own, not just a clip: two parts holding the
+        // same pitch cannot share one instrument, and the composer says
+        // so rather than writing something it cannot play back.
+        let mut made = Vec::new();
+        for _ in enabled.iter().skip(1) {
+            let id = self
+                .song
+                .add_track(crate::sequencing::TrackKind::Instrument);
+            let Some(at) = self.song.tracks.iter().position(|track| track.id == id) else {
+                break;
+            };
+            // A track with no machine cannot be a destination.
+            let _ = self.song.add_device(at, crate::devices::DeviceKind::Rom);
+            let Some(scene) = self.ladder_free_slot(at) else {
+                break;
+            };
+            let Some(pattern) = self.song.fill_slot(at, scene) else {
+                break;
+            };
+            made.push(crate::midi_lab::Destination { track: id, pattern });
+        }
+        let _ = track;
+        let names: Vec<String> = made
+            .iter()
+            .map(|destination| self.song.tag_of(destination.pattern))
+            .collect();
+        if let Some(composition) = self
+            .song
+            .midi_labs
+            .iter_mut()
+            .find(|d| d.id == draft)
+            .and_then(|d| d.recipe.composition.as_mut())
+        {
+            for (at, voice) in enabled.iter().enumerate() {
+                composition.destinations[*voice] = match at {
+                    0 => Some(primary),
+                    _ => made.get(at - 1).copied(),
+                };
+            }
+        }
+        if !names.is_empty() {
+            // A TRACK IS NOT JUST A ROW IN THE SONG. The session's
+            // lattice is sized to the tracks it can reach, so making one
+            // behind the lattice's back leaves the cursor unable to move
+            // past the first header — which is what it did. This is what
+            // the new-track verb does, minus moving the focus: the hands
+            // are in the lab, and the session's cursor should be where
+            // it was left.
+            self.fit_playing();
+            self.touched();
+            let columns = self.song.tracks.len() + 1;
+            if let super::FocusScope::Lattice(lattice) = self.focus.root_mut() {
+                lattice.resize_cols(columns);
+            }
+            self.remixed();
         }
     }
 
@@ -977,6 +1112,67 @@ mod tests {
     }
 
     /// The last rung says what it will write, and where.
+    /// A WHOLE PASS DOWN THE LADDER PUTS NOTES IN THE CLIP. Every other
+    /// test here checks a rung; this one checks that the five of them
+    /// together do the thing the lab is for — which is how the send's
+    /// refusal on coincident notes was found, after the rungs all passed.
+    #[test]
+    fn a_whole_pass_writes_notes_into_the_clip() {
+        let mut stage = opened();
+        // clip · shape · melody on · bass on · feel · listen
+        for key in [
+            Key::Enter,
+            Key::ArrowDown,
+            Key::Enter,
+            Key::ArrowDown,
+            Key::ArrowDown,
+            Key::Enter,
+            Key::ArrowDown,
+            Key::Enter,
+            Key::Tab,
+            Key::Tab,
+        ] {
+            let _ = stage.handle_key(Mods::NONE, key);
+        }
+        assert_eq!(stage.midi_ladder().map(|l| l.rung), Some(Rung::Listen));
+        // Down to "write it to the clip", and write it.
+        let _ = stage.handle_key(Mods::NONE, Key::ArrowDown);
+        let _ = stage.handle_key(Mods::NONE, Key::ArrowDown);
+        let outcome = stage.handle_key(Mods::NONE, Key::Enter);
+        let said = stage
+            .midi_window(0)
+            .map(|window| window.status.clone())
+            .unwrap_or_default();
+        assert_eq!(
+            outcome,
+            Some(super::super::ApplyOutcome::Changed),
+            "the send refused: {said}"
+        );
+        let destination = stage.song.midi_labs[0]
+            .destination
+            .expect("the ladder chose a clip");
+        let pattern = stage
+            .song
+            .pattern(destination.pattern)
+            .expect("the clip is in the song");
+        let notes: usize = (0..pattern.step_count())
+            .map(|step| pattern.trig(step).notes.len())
+            .sum();
+        assert!(notes > 0, "the clip is still empty: {said}");
+        assert!(said.contains("Sent"), "the lab said {said:?}");
+        // The tracks it made are reachable: the session's lattice grew
+        // with them, or the cursor sticks on the first header.
+        let columns = match stage.focus.levels().first() {
+            Some(super::super::FocusScope::Lattice(lattice)) => lattice.cols(),
+            _ => 0,
+        };
+        assert!(
+            columns >= stage.song.tracks.len(),
+            "the lattice has {columns} columns for {} tracks",
+            stage.song.tracks.len()
+        );
+    }
+
     #[test]
     fn the_listen_rung_says_what_it_will_do() {
         let mut stage = opened();
@@ -997,5 +1193,49 @@ mod tests {
             !rows[2].value.is_empty(),
             "the send row does not say where it goes"
         );
+    }
+
+    /// WITH THE LAB AWAY, THE SESSION ANSWERS ITS OWN ARROWS.
+    ///
+    /// A window keeps its ladder when the lab closes — that is how `^L`
+    /// comes back where you left it. But the ladder's arms sit at the
+    /// HEAD of `apply`, so while they asked only "is this window on a
+    /// ladder?" they went on eating the session's arrows, Enter and
+    /// Escape long after the lab was gone: the cursor sat on the first
+    /// track's header and no key would move it.
+    #[test]
+    fn a_closed_lab_hands_the_arrows_back_to_the_session() {
+        let mut stage = opened();
+        assert!(
+            stage.ladder_has_keys().is_some(),
+            "the open lab does not have the keys"
+        );
+
+        let _ = stage.handle_key(Mods::COMMAND.plus(Mods::SHIFT), Key::L);
+        assert!(!stage.lab.open, "the lab did not go away");
+        assert!(
+            stage.midi_ladder().is_some(),
+            "the window forgot the rung it was on"
+        );
+        assert!(
+            stage.ladder_has_keys().is_none(),
+            "a lab that is not on screen still holds the keys"
+        );
+
+        // And the session's own cursor moves again.
+        let before = session_cursor(&stage);
+        let _ = press(&mut stage, Key::ArrowRight);
+        assert_ne!(
+            session_cursor(&stage),
+            before,
+            "the session's cursor is still stuck"
+        );
+    }
+
+    fn session_cursor(stage: &Stage) -> Option<(usize, usize)> {
+        match stage.focus.levels().first() {
+            Some(super::super::FocusScope::Lattice(lattice)) => lattice.cursor(),
+            _ => None,
+        }
     }
 }

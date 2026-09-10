@@ -1,0 +1,71 @@
+# First native visual TAKE. Prepared score; every edit uses the live palette.
+# 48 ticks/beat. No fixed waits. No manual interventions mid-run.
+pace 1
+timeout 900
+key ctrl+shift+p
+text go bar 5
+key Enter
+key ctrl+shift+p
+text visual on
+key Enter
+until VISUAL ON
+shot /tmp/visual-native-skin.png
+key ctrl+shift+p
+text visual set skin drum-0 hue=0.03; warp=0.45
+key Enter
+key ctrl+shift+p
+text visual key skin drum-0 hue 96 0.045 slide
+key Enter
+key ctrl+shift+p
+text visual key skin drum-0 hue 192 0.03
+key Enter
+key ctrl+shift+p
+text visual lock
+key Enter
+key ctrl+s
+key Space
+until play bar 006
+key ctrl+shift+p
+text visual off
+key Enter
+until VISUAL OFF
+key ctrl+shift+p
+text visual inspect
+key Enter
+until evaluations=0 · worker=false
+until play bar 007
+key Space
+key ctrl+shift+p
+text go bar 41
+key Enter
+key ctrl+shift+p
+text visual on
+key Enter
+shot /tmp/visual-native-coil.png
+key ctrl+shift+p
+text go bar 81
+key Enter
+shot /tmp/visual-native-sky.png
+key ctrl+shift+p
+text visual export 320 180 30 /tmp/visual-cancelled-take.mp4
+key Enter
+key ctrl+shift+p
+text visual off
+key Enter
+until VISUAL OFF
+key ctrl+shift+p
+text visual export 1280 720 30 /home/naiqvist/Music/daw/renders/skin-coil-sky-visual-v1.mp4
+key Enter
+until VIDEO COMPLETE
+key ctrl+shift+p
+text visual off
+key Enter
+until VISUAL OFF
+key ctrl+shift+p
+text go bar 1
+key Enter
+key ctrl+shift+p
+text visual on
+key Enter
+key Space
+echo TAKE COMPLETE

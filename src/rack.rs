@@ -981,6 +981,10 @@ pub(crate) fn draw_device_card(
             ui.label("GLASS — edited on the stage's pages");
             Vec::new()
         }
+        DeviceState::Spectral(_) => {
+            ui.label("SPECTRAL — edited on the stage's pages");
+            Vec::new()
+        }
         DeviceState::Rom(_) => {
             ui.label("ROM — edited on the stage's pages");
             Vec::new()

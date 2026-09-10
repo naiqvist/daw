@@ -920,6 +920,7 @@ coverage_voices!(crate::audio::pluck::PluckVoices);
 coverage_voices!(crate::audio::vox::VoxVoices);
 coverage_voices!(crate::audio::pipe::PipeVoices);
 coverage_voices!(crate::audio::glass::GlassVoices);
+coverage_voices!(crate::audio::spectral::SpectralVoices);
 coverage_voices!(crate::audio::rom::RomVoices);
 
 impl Voices for crate::audio::poly::PolyVoices {
@@ -2256,6 +2257,15 @@ pub enum Node {
         gain: f32,
         target_gain: f32,
     },
+    /// Timeline-locked spectral instrument; prepared internal routing, mono
+    /// output. PatternClock cuts voices AND internal FX on discontinuity.
+    Spectral {
+        events: Vec<SeqEvent>,
+        clock: PatternClock,
+        voices: Box<crate::audio::spectral::SpectralVoices>,
+        gain: f32,
+        target_gain: f32,
+    },
     /// The sampler: a file in RAM, eight voices reading it, and the
     /// machine's output stage after the sum.
     ///
@@ -2981,6 +2991,7 @@ impl Node {
             | NodeSpec::Reverb { .. }
             | NodeSpec::Kick { .. }
             | NodeSpec::Acid { .. }
+            | NodeSpec::Spectral { .. }
             | NodeSpec::Snare { .. }
             | NodeSpec::Tom { .. }
             | NodeSpec::Hat { .. }
@@ -3577,6 +3588,12 @@ impl Node {
             } => {
                 // `Kick`'s shape, a gated instrument along. Mono, so there
                 // is no right channel to read back.
+                let mut ramp = Ramp::across(*gain, *target_gain, out_len);
+                clock.run(voices.as_mut(), events, out.l, ctx, &mut ramp);
+                *gain = *target_gain;
+            }
+
+            Node::Spectral { events, clock, voices, gain, target_gain } => {
                 let mut ramp = Ramp::across(*gain, *target_gain, out_len);
                 clock.run(voices.as_mut(), events, out.l, ctx, &mut ramp);
                 *gain = *target_gain;
@@ -5085,6 +5102,7 @@ impl Node {
             | Node::Haze { clock, .. }
             | Node::Kick { clock, .. }
             | Node::Acid { clock, .. }
+            | Node::Spectral { clock, .. }
             | Node::Sampler { clock, .. }
             | Node::Snare { clock, .. }
             | Node::Tom { clock, .. }
@@ -5158,6 +5176,7 @@ impl Node {
             // gain ramp rather than a multiply inside the voice — so
             // moving it glides across the segment instead of stepping at
             // its edge.
+            Node::Spectral { voices, .. } => { voices.set_param(param, value); }
             Node::Acid {
                 voices,
                 target_gain,
@@ -6364,6 +6383,9 @@ fn resolve_timeline_spec(
             loop_len_beats: None,
             ..
         }
+        | NodeSpec::Spectral {
+            notes, subloops, loop_len_beats: None, ..
+        }
         | NodeSpec::Sampler {
             notes,
             subloops,
@@ -7386,6 +7408,8 @@ impl Schedule {
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum CompileError {
+    #[error("spectral patch could not be prepared: {0}")]
+    SpectralPrepare(String),
     #[error("the graph has a cycle — audio cannot flow in a loop without a delay")]
     Cycle,
     #[error("a wire references a node that no longer exists")]
@@ -7431,6 +7455,7 @@ impl NodeSpec {
             | NodeSpec::Haze { notes, .. }
             | NodeSpec::Kick { notes, .. }
             | NodeSpec::Acid { notes, .. }
+            | NodeSpec::Spectral { notes, .. }
             | NodeSpec::Sampler { notes, .. }
             | NodeSpec::Snare { notes, .. }
             | NodeSpec::Tom { notes, .. }
@@ -8028,6 +8053,13 @@ pub enum NodeSpec {
         #[serde(default)]
         params: crate::audio::acid::AcidParams,
     },
+    Spectral {
+        notes: Vec<Note>,
+        subloops: Vec<SubLoop>,
+        loop_len_beats: Option<f64>,
+        #[serde(default)]
+        patch: Box<crate::audio::spectral::SpectralPatch>,
+    },
     /// The sampler: one pattern, a file, and eight voices reading it.
     ///
     /// The PATH is part of the spec rather than the params because
@@ -8257,6 +8289,7 @@ impl GraphSpec {
                 | NodeSpec::Haze { notes, .. }
                 | NodeSpec::Kick { notes, .. }
                 | NodeSpec::Acid { notes, .. }
+                | NodeSpec::Spectral { notes, .. }
                 | NodeSpec::Sampler { notes, .. }
                 | NodeSpec::Snare { notes, .. }
                 | NodeSpec::Tom { notes, .. }
@@ -8993,6 +9026,16 @@ impl GraphSpec {
                             voices,
                             gain,
                             target_gain: gain,
+                        }
+                    }
+                    Some(NodeSpec::Spectral { notes, subloops, loop_len_beats, patch }) => {
+                        let events = compile_events(notes, subloops, *loop_len_beats, samples_per_beat, plock_glide_samples)?;
+                        let voices = crate::audio::spectral::SpectralVoices::prepare(sample_rate as f32, block_frames, patch, 64 * 1024 * 1024)
+                            .map_err(CompileError::SpectralPrepare)?;
+                        Node::Spectral {
+                            events,
+                            clock: PatternClock::new(loop_len_beats.map(|len| (len*samples_per_beat).round().max(0.0) as u64).unwrap_or(0), samples_per_beat),
+                            voices: Box::new(voices), gain: 0.0, target_gain: 1.0,
                         }
                     }
                     Some(NodeSpec::Acid {

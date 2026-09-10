@@ -232,6 +232,15 @@ impl Palette {
         self.cursor = 0;
     }
 
+    /// Open a contextual command with its target already supplied. The user
+    /// types only the remaining argument; the same parser handles submission.
+    pub fn open_with_query(&mut self, query: String) {
+        self.open = true;
+        self.query = query;
+        self.cursor = 0;
+        self.just_opened = true;
+    }
+
     /// Draw the palette if it is open. Returns the id of a command the
     /// user ran this frame.
     ///
@@ -248,12 +257,24 @@ impl Palette {
         if !self.open {
             return None;
         }
+        let query_id = egui::Id::new("command_palette_query");
+        if self.just_opened {
+            let mut state = egui::text_edit::TextEditState::load(ctx, query_id).unwrap_or_default();
+            state.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+                egui::text::CCursor::new(self.query.chars().count()),
+            )));
+            state.store(ctx, query_id);
+        }
 
         // Escape first: it closes even when the list is empty.
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            ctx.memory_mut(|memory| memory.surrender_focus(query_id));
             self.close();
             return None;
         }
+        // Claim focus before the field processes this frame's text, including
+        // the first frame after reopening. Never leave a hidden field focused.
+        ctx.memory_mut(|memory| memory.request_focus(query_id));
 
         // A typed long form claims the top row while it is being spoken;
         // the ranked list continues below it.
@@ -349,6 +370,7 @@ impl Palette {
                                 |ui| {
                                     ui.add(
                                         egui::TextEdit::singleline(&mut self.query)
+                                            .id(query_id)
                                             .hint_text("run a command")
                                             .desired_width(f32::INFINITY)
                                             .font(egui::TextStyle::Body)
@@ -454,6 +476,7 @@ impl Palette {
             }
         }
         if chosen.is_some() {
+            ctx.memory_mut(|memory| memory.surrender_focus(query_id));
             self.close();
         }
         chosen

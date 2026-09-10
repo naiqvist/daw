@@ -403,6 +403,10 @@ impl DeviceRole {
 /// through, and the parameters that differ from its defaults.
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Device {
+    /// Prepared internally by the spectral instrument. No opaque external file
+    /// dependency: duplicate, undo, song save and sound save carry the graph.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spectral: Option<Box<crate::audio::spectral::Routing>>,
     pub id: DeviceId,
     pub kind: DeviceKind,
     /// Normal user device, or one of the two default track-boundary trims.
@@ -453,6 +457,7 @@ pub struct Device {
 impl Device {
     pub fn new(id: DeviceId, kind: DeviceKind) -> Self {
         Self {
+            spectral: None,
             id,
             kind,
             role: DeviceRole::Normal,
@@ -1889,6 +1894,10 @@ impl Default for Session {
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Song {
+    /// Opaque versioned visual score. Audio-only builds preserve it without
+    /// linking/parsing a visual engine. Never read by song_graph or the callback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visuals: Option<String>,
     #[serde(default)]
     pub midi_labs: Vec<crate::midi_lab::Draft>,
     pub tracks: Vec<Track>,
@@ -2058,6 +2067,7 @@ impl Default for Song {
         let pattern = Pattern::default();
         let pattern_id = pattern.id;
         let mut song = Self {
+            visuals: None,
             midi_labs: Vec::new(),
             bpm: default_song_bpm(),
             master: 1.0,
@@ -3106,6 +3116,7 @@ impl Song {
                     device.sample = machine.sample.clone();
                     device.slices = machine.slices.clone();
                     device.pads = machine.pads.clone();
+                    device.spectral = machine.spectral.clone();
                     self.place_device(track, device);
                 }
                 _ => {

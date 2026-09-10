@@ -656,7 +656,7 @@ pub const LOG: &[u32] = &[
     SLAP_TIME,
     SLAP_DAMP,
 ];
-pub const FX_SECTIONS: &[crate::console::SectionKind] = &[];
+pub const FX_SECTIONS: &[crate::console::SectionKind] = &[crate::console::SectionKind::Room];
 pub const KEYS: KeyTable = [
     None,
     Some(MachineKey {

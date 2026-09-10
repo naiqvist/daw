@@ -495,6 +495,7 @@ impl Browser {
         children: Vec<Node>,
         status: BrowserStatus,
     ) {
+        let standing = self.selected().map(|node| (node.kind.clone(), node.label.clone()));
         self.status[shelf as usize] = status;
         if let Some(node) = self
             .roots
@@ -504,6 +505,13 @@ impl Browser {
             node.children = children;
         }
         self.clamp_cursor();
+        if !self.query.is_empty() {
+            let preserved = standing.and_then(|(kind, label)| self.rows().iter().position(|row| {
+                self.node_at(&row.path).is_some_and(|node| node.kind == kind && node.label == label)
+            }));
+            if let Some(cursor) = preserved { self.cursor = cursor; }
+            else { self.select_query_result(); }
+        }
     }
 
     /// Every row the tree currently shows, in reading order.
@@ -676,7 +684,7 @@ impl Browser {
     /// Extend the query by one character.
     pub fn type_char(&mut self, ch: char) {
         self.query.push(ch);
-        self.cursor = 0;
+        self.select_query_result();
     }
 
     /// Retract the last character. `false` means there was nothing to
@@ -684,7 +692,7 @@ impl Browser {
     pub fn backspace(&mut self) -> bool {
         let popped = self.query.pop().is_some();
         if popped {
-            self.cursor = 0;
+            self.select_query_result();
         }
         popped
     }
@@ -705,6 +713,22 @@ impl Browser {
     fn clamp_cursor(&mut self) {
         let rows = self.rows().len();
         self.cursor = self.cursor.min(rows.saturating_sub(1));
+    }
+
+    /// A query asks for content, not its enclosing headings. Keep the tree
+    /// and full ancestry visible, but put Enter on the best playable result.
+    fn select_query_result(&mut self) {
+        self.cursor = 0;
+        if self.query.is_empty() { return; }
+        let rows = self.rows();
+        let leaves: Vec<_> = rows.iter().enumerate().filter_map(|(at, row)| {
+            let node = self.node_at(&row.path)?;
+            (!node.is_branch()).then_some((at, node))
+        }).collect();
+        self.cursor = leaves.iter().find(|(_, node)| {
+            node.label.eq_ignore_ascii_case(&self.query)
+                || node.label.rsplit('/').next().is_some_and(|name| name.eq_ignore_ascii_case(&self.query))
+        }).or_else(|| leaves.first()).map_or(0, |(at, _)| *at);
     }
 }
 
@@ -757,6 +781,33 @@ pub fn match_positions(label: &str, query: &str) -> Vec<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_device_query_lands_on_content_without_counting_headers() {
+        let mut browser = Browser::shelves();
+        for ch in "table".chars() { browser.type_char(ch); }
+        assert!(matches!(browser.selected().map(|n| &n.kind), Some(EntryKind::Device(DeviceKind::Table))));
+        assert!(!browser.selected().unwrap().is_branch());
+    }
+
+    #[test]
+    fn duplicate_sample_names_remain_distinct_and_scan_preserves_identity() {
+        let mut browser = Browser::shelves();
+        let leaves = vec![
+            Node::leaf("a/kick.wav", EntryKind::Sample(PathBuf::from("/a/kick.wav"))),
+            Node::leaf("b/kick.wav", EntryKind::Sample(PathBuf::from("/b/kick.wav"))),
+        ];
+        browser.set_children(Shelf::Samples, leaves.clone(), BrowserStatus::Ready);
+        for ch in "kick.wav".chars() { browser.type_char(ch); }
+        assert_eq!(browser.surviving_leaves(), 2);
+        assert_eq!(browser.selected().unwrap().label, "a/kick.wav");
+        assert!(browser.step(Step::Down));
+        assert_eq!(browser.selected().unwrap().label, "b/kick.wav");
+        let mut inserted = vec![Node::leaf("0/kick.wav", EntryKind::Sample(PathBuf::from("/0/kick.wav")))];
+        inserted.extend(leaves);
+        browser.set_children(Shelf::Samples, inserted, BrowserStatus::Ready);
+        assert_eq!(browser.selected().unwrap().label, "b/kick.wav");
+    }
 
     #[test]
     fn every_heading_in_the_device_tree_carries_a_mark() {

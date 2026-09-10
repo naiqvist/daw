@@ -38,6 +38,10 @@ use crate::params::acid::{
     ENV_MOD, ENV_OCTAVES, GLIDE, GLIDE_MAX_MS, GLIDE_MIN_MS, LEVEL, RESONANCE, TABLE, TUNE,
     TUNE_MAX_ST, WAVE, WAVE_NAMES,
 };
+use crate::params::acid::{
+    ORNAMENT, ORNAMENT_FROM, ORNAMENT_NAMES, ORNAMENT_OTHER, ORNAMENT_SPEED, ORNAMENT_TIME,
+    VIBRATO_INTENSITY, VIBRATO_SPEED,
+};
 use crate::params::{self};
 use crate::ui::device::synth::ParamEdit;
 use crate::ui::device::{
@@ -61,6 +65,13 @@ pub struct AcidUi {
     pub glide: f32,
     pub drive: f32,
     pub level: f32,
+    pub vibrato_speed: f32,
+    pub vibrato_intensity: f32,
+    pub ornament: f32,
+    pub ornament_time: f32,
+    pub ornament_speed: f32,
+    pub ornament_from: f32,
+    pub ornament_other: f32,
 }
 
 impl Default for AcidUi {
@@ -77,6 +88,13 @@ impl Default for AcidUi {
             glide: at(GLIDE),
             drive: at(DRIVE),
             level: at(LEVEL),
+            vibrato_speed: at(VIBRATO_SPEED),
+            vibrato_intensity: at(VIBRATO_INTENSITY),
+            ornament: at(ORNAMENT),
+            ornament_time: at(ORNAMENT_TIME),
+            ornament_speed: at(ORNAMENT_SPEED),
+            ornament_from: at(ORNAMENT_FROM),
+            ornament_other: at(ORNAMENT_OTHER),
         }
     }
 }
@@ -100,6 +118,13 @@ impl AcidUi {
             GLIDE => &mut self.glide,
             DRIVE => &mut self.drive,
             LEVEL => &mut self.level,
+            VIBRATO_SPEED => &mut self.vibrato_speed,
+            VIBRATO_INTENSITY => &mut self.vibrato_intensity,
+            ORNAMENT => &mut self.ornament,
+            ORNAMENT_TIME => &mut self.ornament_time,
+            ORNAMENT_SPEED => &mut self.ornament_speed,
+            ORNAMENT_FROM => &mut self.ornament_from,
+            ORNAMENT_OTHER => &mut self.ornament_other,
             _ => return None,
         })
     }
@@ -116,6 +141,13 @@ struct Spec {
     glide: Param,
     drive: Param,
     level: Param,
+    vibrato_speed: Param,
+    vibrato_intensity: Param,
+    ornament: Param,
+    ornament_time: Param,
+    ornament_speed: Param,
+    ornament_from: Param,
+    ornament_other: Param,
 }
 
 /// The ten controls, described once.
@@ -126,6 +158,73 @@ fn spec() -> Spec {
         Param::new(name, Mapping::Log { min, max }, Unit::Ms)
     };
     Spec {
+        vibrato_speed: default(
+            Param::new(
+                "vibrato speed",
+                Mapping::Log {
+                    min: 0.1,
+                    max: 12.0,
+                },
+                Unit::Hz,
+            ),
+            VIBRATO_SPEED,
+        ),
+        vibrato_intensity: default(
+            Param::new(
+                "vibrato intensity",
+                Mapping::Linear {
+                    min: 0.0,
+                    max: 100.0,
+                },
+                Unit::Cents,
+            ),
+            VIBRATO_INTENSITY,
+        ),
+        ornament: default(Param::choice("ornament", ORNAMENT_NAMES), ORNAMENT),
+        ornament_time: default(
+            Param::new(
+                "ornament time",
+                Mapping::Log {
+                    min: 20.0,
+                    max: 2000.0,
+                },
+                Unit::Ms,
+            ),
+            ORNAMENT_TIME,
+        ),
+        ornament_speed: default(
+            Param::new(
+                "ornament speed",
+                Mapping::Log {
+                    min: 0.1,
+                    max: 16.0,
+                },
+                Unit::Hz,
+            ),
+            ORNAMENT_SPEED,
+        ),
+        ornament_from: default(
+            Param::new(
+                "ornament from",
+                Mapping::Linear {
+                    min: -1200.0,
+                    max: 1200.0,
+                },
+                Unit::Cents,
+            ),
+            ORNAMENT_FROM,
+        ),
+        ornament_other: default(
+            Param::new(
+                "ornament other",
+                Mapping::Linear {
+                    min: -1200.0,
+                    max: 1200.0,
+                },
+                Unit::Cents,
+            ),
+            ORNAMENT_OTHER,
+        ),
         wave: default(Param::choice("wave", WAVE_NAMES), WAVE),
         tune: default(
             Param::new(
@@ -190,6 +289,13 @@ fn param_of(param: u32) -> Param {
         ACCENT => s.accent,
         GLIDE => s.glide,
         DRIVE => s.drive,
+        VIBRATO_SPEED => s.vibrato_speed,
+        VIBRATO_INTENSITY => s.vibrato_intensity,
+        ORNAMENT => s.ornament,
+        ORNAMENT_TIME => s.ornament_time,
+        ORNAMENT_SPEED => s.ornament_speed,
+        ORNAMENT_FROM => s.ornament_from,
+        ORNAMENT_OTHER => s.ornament_other,
         _ => s.level,
     }
 }
@@ -227,6 +333,13 @@ pub fn acid_edits(state: &AcidUi) -> Vec<ParamEdit> {
         (GLIDE, state.glide),
         (DRIVE, state.drive),
         (LEVEL, state.level),
+        (VIBRATO_SPEED, state.vibrato_speed),
+        (VIBRATO_INTENSITY, state.vibrato_intensity),
+        (ORNAMENT, state.ornament),
+        (ORNAMENT_TIME, state.ornament_time),
+        (ORNAMENT_SPEED, state.ornament_speed),
+        (ORNAMENT_FROM, state.ornament_from),
+        (ORNAMENT_OTHER, state.ornament_other),
     ]
     .into_iter()
     .map(|(param, norm)| ParamEdit {
@@ -386,22 +499,30 @@ fn cell_width(ui: &egui::Ui, theme: &Theme, p: &Param) -> f32 {
     value.max(name) + theme.sp(space::SM)
 }
 
-/// Two balanced rows of five: the tone, then the gesture.
-fn rows(s: &Spec) -> [[(&Param, u32); 5]; 2] {
+/// Two balanced rows: nine sound controls, eight expression controls.
+/// Width is measured from every label's widest value, never squeezed.
+fn rows(s: &Spec) -> [Vec<(&Param, u32)>; 2] {
     [
-        [
+        vec![
             (&s.wave, WAVE),
             (&s.tune, TUNE),
             (&s.cutoff, CUTOFF),
             (&s.resonance, RESONANCE),
             (&s.env_mod, ENV_MOD),
-        ],
-        [
             (&s.decay, DECAY),
             (&s.accent, ACCENT),
-            (&s.glide, GLIDE),
             (&s.drive, DRIVE),
             (&s.level, LEVEL),
+        ],
+        vec![
+            (&s.glide, GLIDE),
+            (&s.vibrato_speed, VIBRATO_SPEED),
+            (&s.vibrato_intensity, VIBRATO_INTENSITY),
+            (&s.ornament, ORNAMENT),
+            (&s.ornament_time, ORNAMENT_TIME),
+            (&s.ornament_speed, ORNAMENT_SPEED),
+            (&s.ornament_from, ORNAMENT_FROM),
+            (&s.ornament_other, ORNAMENT_OTHER),
         ],
     ]
 }
@@ -547,7 +668,7 @@ mod tests {
             for step in 0..=32 {
                 let value = row.min + (row.max - row.min) * step as f32 / 32.0;
                 let back = acid_value(row.id, acid_norm(row.id, value));
-                let tol = if row.id == WAVE {
+                let tol = if acid_is_discrete(row.id) {
                     0.51
                 } else {
                     1e-2 * row.max.abs().max(1.0)
@@ -675,5 +796,84 @@ mod tests {
             plot > theme.sp(control::POLY_CELL_H) * 3.0,
             "the footer left the plot only {plot} points"
         );
+    }
+
+    #[test]
+    fn new_expression_cells_respond_to_real_pointer_gestures() {
+        use crate::ui::device::probe;
+        let theme = Theme::dark();
+        let rect = egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(240.0, 44.0));
+        for id in [
+            VIBRATO_SPEED,
+            VIBRATO_INTENSITY,
+            ORNAMENT,
+            ORNAMENT_TIME,
+            ORNAMENT_SPEED,
+            ORNAMENT_FROM,
+            ORNAMENT_OTHER,
+        ] {
+            let ctx = egui::Context::default();
+            let mut state = AcidUi::default();
+            let before = *state.slot(id).unwrap();
+            let p = param_of(id);
+            let from = egui::pos2(rect.center().x, rect.center().y);
+            let path = if acid_is_discrete(id) {
+                probe::click_path(egui::pos2(rect.right() - 12.0, from.y))
+            } else {
+                probe::drag_path(from, from - egui::vec2(0.0, 32.0), 4)
+            };
+            let edits = probe::run(&ctx, rect, &path, |ui| {
+                poly_widgets::labeled_cell_bar(ui, &theme, &p, state.slot(id).unwrap(), None)
+            });
+            assert!(edits.iter().any(|e| *e), "parameter {id} ignored pointer");
+            assert_ne!(
+                *state.slot(id).unwrap(),
+                before,
+                "parameter {id} did not move"
+            );
+        }
+    }
+
+    #[test]
+    fn expression_rows_cover_the_table_and_card_does_not_edit_at_rest() {
+        use crate::ui::device::probe;
+        let s = spec();
+        let ids = rows(&s)
+            .into_iter()
+            .flatten()
+            .map(|(_, id)| id)
+            .collect::<Vec<_>>();
+        for row in TABLE {
+            assert_eq!(ids.iter().filter(|id| **id == row.id).count(), 1);
+        }
+        let ctx = egui::Context::default();
+        let theme = Theme::dark();
+        let mut state = AcidUi::default();
+        let before = state;
+        let rect = egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(1_600.0, 260.0));
+        let edits = probe::run(
+            &ctx,
+            rect,
+            &[probe::Step::moved(egui::pos2(2.0, 2.0)); 2],
+            |ui| {
+                let required = strip_width(ui, &theme, &s);
+                assert!(required < rect.width());
+                for row in rows(&s) {
+                    let need = row
+                        .iter()
+                        .map(|(p, _)| cell_width(ui, &theme, p))
+                        .sum::<f32>()
+                        + ui.spacing().item_spacing.x * (row.len() - 1) as f32;
+                    assert!(need <= required + 0.1);
+                }
+                acid_card(ui, &theme, &mut state)
+            },
+        );
+        assert!(edits.iter().all(Vec::is_empty));
+        assert_eq!(state, before);
+        for row in TABLE {
+            let got = acid_value(row.id, *state.slot(row.id).unwrap());
+            assert!((got - row.default).abs() < row.default.abs().max(1.0) * 0.001);
+        }
     }
 }
