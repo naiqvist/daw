@@ -466,8 +466,14 @@ impl Stage {
             // Hear the PCM itself, from the cache, with nothing else in
             // the path: the one tool that is not an edit.
             7 => {
-                let path =
-                    crate::audio::rom::audition_file(at, 48_000).ok_or(RefusalReason::Empty)?;
+                let Some(path) = crate::audio::rom::audition_file(at, 48_000) else {
+                    // The graph bakes the bank when a ROM track compiles,
+                    // and the example bakes it ahead of a session. A key
+                    // press must not render one.
+                    self.notice =
+                        Some("no baked PCM yet — play a note, or bake the bank".to_owned());
+                    return Ok(());
+                };
                 self.audition = Some(super::Audition::of(&path, 0.0, 1.0));
                 let name = crate::audio::rom::bank::MULTIS
                     .get(at)
@@ -989,7 +995,11 @@ mod tests {
         assert_eq!(row(&stage), 1.0);
         // Sideways is by group, and so is a coarse turn.
         let _ = stage.hero_focus_arrow(Step::Right, false);
-        assert_eq!(row(&stage), 3.0, "Right did not jump the group");
+        assert_eq!(
+            row(&stage),
+            next_group(1),
+            "Right did not jump to the next group"
+        );
         let _ = stage.hero_focus_arrow(Step::Up, true);
         assert_eq!(row(&stage), 0.0, "a coarse turn is a group");
         // The top of the list is an edge, not a wrap.
@@ -1052,6 +1062,33 @@ mod tests {
         stage
     }
 
+    /// A multisample by NAME, and the first row of the group after the
+    /// one a row sits in: what the category tools are for, asked of the
+    /// bank rather than written into the test as an index.
+    fn multi(name: &str) -> f32 {
+        crate::audio::rom::bank::MULTIS
+            .iter()
+            .position(|multi| multi.name == name)
+            .unwrap_or(0) as f32
+    }
+
+    fn next_group(from: usize) -> f32 {
+        let multis = crate::audio::rom::bank::MULTIS;
+        let group = multis.get(from).map_or("", |multi| multi.category);
+        let mut groups: Vec<&str> = Vec::new();
+        for multi in multis {
+            if !groups.contains(&multi.category) {
+                groups.push(multi.category);
+            }
+        }
+        let here = groups.iter().position(|name| *name == group).unwrap_or(0);
+        let wanted = groups[(here + 1) % groups.len()];
+        multis
+            .iter()
+            .position(|multi| multi.category == wanted)
+            .unwrap_or(0) as f32
+    }
+
     fn rom_value(stage: &Stage, param: u32) -> f32 {
         stage.song.tracks[0]
             .machine
@@ -1095,12 +1132,30 @@ mod tests {
         use crate::params::rom as rp;
         let mut stage = rom_stage(0);
         let before = stage.song.clone();
+        let first = rom_value(&stage, rp::PCM1) as usize;
         let _ = stage.apply(StageIntent::HeroTool(2));
-        assert_eq!(rom_value(&stage, rp::PCM1), 3.0, "CAT > left Tone");
-        let _ = stage.apply(StageIntent::HeroTool(2));
-        assert_eq!(rom_value(&stage, rp::PCM1), 0.0, "CAT > did not wrap");
+        assert_eq!(
+            rom_value(&stage, rp::PCM1),
+            next_group(first),
+            "CAT > did not leave the group"
+        );
         let _ = stage.apply(StageIntent::HeroTool(1));
-        assert_eq!(rom_value(&stage, rp::PCM1), 3.0, "CAT < did not wrap back");
+        assert_eq!(
+            rom_value(&stage, rp::PCM1),
+            first as f32,
+            "CAT < did not come back"
+        );
+        // From the first group, CAT < wraps to the last one.
+        let _ = stage.apply(StageIntent::HeroTool(1));
+        let landed = rom_value(&stage, rp::PCM1) as usize;
+        let last = crate::audio::rom::bank::MULTIS
+            .last()
+            .map_or("", |multi| multi.category);
+        assert_eq!(
+            crate::audio::rom::bank::MULTIS[landed].category,
+            last,
+            "CAT < did not wrap to the last group"
+        );
         for _ in 0..3 {
             let _ = stage.apply(StageIntent::Undo);
         }
@@ -1112,14 +1167,15 @@ mod tests {
         use crate::params::rom as rp;
         let mut stage = rom_stage(0);
         let id = stage.song.tracks[0].machine.as_ref().unwrap().id;
-        stage.song.device_mut(id).unwrap().set(rp::PCM1, 2.0);
+        let tine = multi("Tine");
+        stage.song.device_mut(id).unwrap().set(rp::PCM1, tine);
         let _ = stage.apply(StageIntent::HeroTool(6));
-        assert_eq!(rom_value(&stage, rp::PCM2), 2.0, "the row did not cross");
-        assert_eq!(rom_value(&stage, rp::PCM1), 2.0, "the source moved");
-        assert_eq!(stage.notice.as_deref(), Some("Octave on osc 2"));
+        assert_eq!(rom_value(&stage, rp::PCM2), tine, "the row did not cross");
+        assert_eq!(rom_value(&stage, rp::PCM1), tine, "the source moved");
+        assert_eq!(stage.notice.as_deref(), Some("Tine on osc 2"));
         // The list now marks the row for both oscillators.
         let list = stage.deck_hero_list().expect("the bank");
-        assert_eq!(list.rows[2].tags, "12");
+        assert_eq!(list.rows[tine as usize].tags, "12");
 
         let _ = stage.apply(StageIntent::HeroTool(8));
         assert_eq!(rom_value(&stage, rp::KEY1), 0.0, "FIXED did not pin");

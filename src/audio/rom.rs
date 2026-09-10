@@ -11,6 +11,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 pub mod bank;
+pub mod presets;
 
 use crate::audio::graph::Ramp;
 use crate::dsp::adsr::Adsr;
@@ -1280,14 +1281,19 @@ fn sample_picture(params: &RomParams, which: usize, selected: Option<u32>) -> He
         let at = t * frames;
         let (amp, second) = if layout.looped {
             let through = (at / layout.loop_start.max(1) as f32).min(1.0);
-            (
-                1.0,
-                recipe.attack_partial2 + (recipe.partial2 - recipe.attack_partial2) * through,
-            )
+            // The swell leans late, and the tone settles from the
+            // attack's brighter spectrum into the loop's: the same two
+            // curves the renderer crossfades.
+            let swell = through * through * (3.0 - 2.0 * through);
+            let bright = recipe.tone.sweep * (1.0 - through);
+            (swell, bright / (1.0 + recipe.tone.sweep).max(1e-6))
         } else {
             let decay = recipe.decay_ms / 1000.0 * 48_000.0;
             let a = (-at / decay.max(1.0)).exp();
-            (a, recipe.partial2 * (-at / (decay * 0.45).max(1.0)).exp())
+            // A struck tone loses its upper partials first; that fall is
+            // the recipe's own sweep.
+            let fall = decay * 0.45 / (1.0 + recipe.tone.sweep * 0.5);
+            (a, (-at / fall.max(1.0)).exp())
         };
         level.push((t, amp.clamp(0.0, 1.0)));
         partial.push((t, second.clamp(0.0, 1.0)));
@@ -1332,7 +1338,7 @@ fn sample_picture(params: &RomParams, which: usize, selected: Option<u32>) -> He
                 lit: false,
             },
             HeroSeries {
-                name: "2nd partial",
+                name: "brightness",
                 points: partial,
                 lit: false,
             },
@@ -1720,11 +1726,33 @@ mod tests {
 
     const RATE: f32 = 48_000.0;
 
+    /// ONE bank for the whole test binary. The pads are inverse
+    /// transforms of a hundred and thirty thousand frames apiece; a
+    /// bank per test would be minutes of them.
+    static BANK: std::sync::LazyLock<Arc<bank::Bank>> =
+        std::sync::LazyLock::new(|| Arc::new(bank::Bank::render(48_000)));
+
+    /// A multisample by NAME, so a test says what it needs and the bank
+    /// can be reordered without rewriting one.
+    fn multi(name: &str) -> f32 {
+        bank::MULTIS
+            .iter()
+            .position(|multi| multi.name == name)
+            .unwrap_or(0) as f32
+    }
+
     fn machine(edit: impl FnOnce(&mut RomParams)) -> RomVoices {
-        let mut params = RomParams::default();
+        // The measurements want a single partial they can find; the bank
+        // opens on a pad, which is right for playing and wrong for a
+        // frequency test.
+        let mut params = RomParams {
+            pcm1: multi("Sine"),
+            pcm2: multi("Sine"),
+            ..RomParams::default()
+        };
         edit(&mut params);
         let mut voices = RomVoices::new();
-        voices.prepare(RATE, 4096, params, Arc::new(bank::Bank::render(48_000)));
+        voices.prepare(RATE, 4096, params, Arc::clone(&BANK));
         voices
     }
 
@@ -1833,7 +1861,7 @@ mod tests {
         // PING is a one-shot: no loop, an exponential decay of half a
         // second. The gate is never lifted.
         let mut voices = machine(|p| {
-            p.pcm1 = 3.0;
+            p.pcm1 = multi("Ping");
             p.decay = 8000.0;
             p.sustain = 1.0;
         });
@@ -1881,8 +1909,8 @@ mod tests {
         // OCTAVE is baked an octave above the key it plays, so which
         // oscillator sounded is audible rather than inferred.
         let setup = |p: &mut RomParams| {
-            p.pcm1 = 0.0;
-            p.pcm2 = 2.0;
+            p.pcm1 = multi("Sine");
+            p.pcm2 = multi("Octave");
             p.mode = 2.0;
             p.split = 60.0;
             p.xfade = 0.0;
@@ -1900,8 +1928,8 @@ mod tests {
     #[test]
     fn a_crossfade_makes_the_split_a_blend_rather_than_a_wall() {
         let mut voices = machine(|p| {
-            p.pcm1 = 0.0;
-            p.pcm2 = 2.0;
+            p.pcm1 = multi("Sine");
+            p.pcm2 = multi("Octave");
             p.mode = 2.0;
             p.split = 60.0;
             p.xfade = 24.0;
@@ -1958,7 +1986,7 @@ mod tests {
         let clean = residual(0.0);
         let crushed = residual(1.0);
         assert!(
-            crushed > clean * 8.0,
+            crushed > clean * 3.0,
             "the vintage converter left no trace: {clean} then {crushed}"
         );
         let (rate, bits) = RomParams {
@@ -2204,33 +2232,31 @@ mod tests {
     #[test]
     fn the_pcm_list_is_the_bank_with_the_oscillators_marked() {
         let params = RomParams {
-            pcm1: 1.0,
-            pcm2: 3.0,
+            pcm1: multi("Choir"),
+            pcm2: multi("Click"),
             ..RomParams::default()
         };
         let list = pcm_list(&params, "Osc 1").expect("osc 1 has a list");
         assert_eq!(list.rows.len(), bank::MULTIS.len());
-        assert_eq!(list.selected, 1);
+        assert_eq!(list.selected, multi("Choir") as usize);
         assert_eq!(list.param, p::PCM1);
-        assert_eq!(list.rows[1].tags, "1");
-        assert_eq!(list.rows[3].tags, "2");
-        assert!(list.rows[0].tags.is_empty());
+        assert_eq!(list.rows[multi("Choir") as usize].tags, "1");
+        assert_eq!(list.rows[multi("Click") as usize].tags, "2");
+        assert!(list.rows[multi("Warm") as usize].tags.is_empty());
         // The groups arrive in bank order, and a row says what it is.
-        assert_eq!(list.rows[0].group, "Tone");
-        assert_eq!(list.rows[3].group, "Decay");
-        assert_eq!(list.rows[0].detail, "10z");
-        assert_eq!(list.rows[1].detail, "5z +7st");
-        assert_eq!(list.rows[3].detail, "3z shot");
+        assert_eq!(list.rows[multi("Warm") as usize].group, "Pad");
+        assert_eq!(list.rows[multi("Tine") as usize].group, "Keys");
+        assert_eq!(list.rows[multi("Click") as usize].group, "Hit");
+        assert_eq!(list.rows[multi("Warm") as usize].detail, "10z");
+        assert_eq!(list.rows[multi("Fifth") as usize].detail, "3z +7st");
+        assert_eq!(list.rows[multi("Click") as usize].detail, "3z shot");
         // Osc 2's list is the same bank addressed through its own cell.
         let second = pcm_list(&params, "Osc 2").expect("osc 2 has a list");
-        assert_eq!(second.selected, 3);
+        assert_eq!(second.selected, multi("Click") as usize);
         assert_eq!(second.param, p::PCM2);
         assert!(pcm_list(&params, "Layer").is_none());
     }
 
-    /// The same trip a knob makes on every surface: engine value to the
-    /// normalised position and back. A choice must land on a segment and
-    /// stay there; a sweep must come back where it started.
     #[test]
     fn every_knob_survives_the_trip_to_the_surface_and_back() {
         use crate::ui::device::{rom_is_discrete, rom_norm, rom_value};

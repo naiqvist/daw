@@ -105,7 +105,15 @@ fn a_tool_button_does_what_its_key_does() {
     probe::run(&ctx, FIELD(), &probe::click_path(cell.center()), |ui| {
         stage.interact_deck_hero(ui, FIELD())
     });
-    assert_eq!(pcm(&stage, p::PCM1), 3.0, "the tool button did not fire");
+    // Where CAT > lands is the bank's business: the first row of the
+    // group after the one the cell is on.
+    let multis = crate::audio::rom::bank::MULTIS;
+    let group = multis.first().map_or("", |multi| multi.category);
+    let wanted = multis
+        .iter()
+        .position(|multi| multi.category != group)
+        .unwrap_or(0) as f32;
+    assert_eq!(pcm(&stage, p::PCM1), wanted, "the tool button did not fire");
 }
 
 /// The panel's two halves never overlap, at any width the window takes.
