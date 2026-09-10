@@ -69,6 +69,73 @@ pub struct Colours {
     /// role that names something musical rather than something the
     /// machine says about itself.
     pub drum: Color32,
+    /// The lit page key's ground. The macOS square concept carries two
+    /// different "this one is active" signals and they are not
+    /// interchangeable: an orange rule around the cell the cursor is on
+    /// (`chassis`), and a saturated blue slab under the page key you are
+    /// looking at. Neither reads as the other, so neither role can do
+    /// both jobs.
+    pub tab: Color32,
+}
+
+/// A step from one role toward another.
+///
+/// The module's standing rule is that nothing is mixed at a call site —
+/// which is exactly why this lives here. A raised cell in the reference
+/// is not one flat colour: it carries a slight vertical gradient and a
+/// lighter line along its top edge, and those tones are DERIVED from the
+/// roles rather than being roles of their own. Doing that arithmetic in
+/// one named place keeps the promise; doing it in `deck.rs` would break
+/// it.
+fn toward(a: Color32, b: Color32, pct: u32) -> Color32 {
+    let f = |x: u8, y: u8| ((x as u32 * (100 - pct) + y as u32 * pct) / 100) as u8;
+    Color32::from_rgb(
+        f(a.r(), b.r()),
+        f(a.g(), b.g()),
+        f(a.b(), b.b()),
+    )
+}
+
+/// A raised cell's three tones: the fill at its head, the fill at its
+/// foot, and the line around it.
+///
+/// Traced from `session-macos-square-concept.png`. An unlit key cell runs
+/// #2c4461 to #283e59 inside a #42586f line; the lit one runs #1564c0 to
+/// #1460b6 inside #227ddb. Both are a lift at the top of about eight
+/// units of blue — enough to read as a surface catching light, not enough
+/// to read as a colour of its own.
+pub fn raised(lit: bool) -> (Color32, Color32, Color32) {
+    let c = colours();
+    if lit {
+        (
+            toward(c.tab, c.bright, 8),
+            toward(c.tab, c.ground, 6),
+            toward(c.tab, c.bright, 26),
+        )
+    } else {
+        (c.edge, toward(c.edge, c.panel, 34), c.rule)
+    }
+}
+
+/// A vertical gradient across `rect`, as one quad. Two triangles and four
+/// vertices: cheaper than banding it, and it does not seam.
+pub fn gradient(painter: &eframe::egui::Painter, rect: eframe::egui::Rect, top: Color32, foot: Color32) {
+    use eframe::egui::epaint::{Mesh, Vertex, WHITE_UV};
+    let mut mesh = Mesh::default();
+    for (pos, color) in [
+        (rect.left_top(), top),
+        (rect.right_top(), top),
+        (rect.right_bottom(), foot),
+        (rect.left_bottom(), foot),
+    ] {
+        mesh.vertices.push(Vertex {
+            pos,
+            uv: WHITE_UV,
+            color,
+        });
+    }
+    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+    painter.add(eframe::egui::Shape::mesh(mesh));
 }
 
 /// The ground's channels, so a mix blends toward the real thing.
@@ -108,6 +175,7 @@ impl Colours {
         alert: mix(ORANGE, 92),
         fault: mix(PINK, 88),
         drum: mix(VIOLET, 84),
+        tab: mix(BLUE, 62),
     };
 }
 
@@ -136,13 +204,14 @@ impl Colours {
         alert: rgb(0xaf3a03),
         fault: rgb(0x9d0006),
         drum: rgb(0x8f3f71),
+        tab: rgb(0x458588),
     };
 }
 
 impl Colours {
     /// Every role by name, so a file and this struct cannot disagree
     /// about what a role is called.
-    fn slots(&mut self) -> [(&'static str, &mut Color32); 16] {
+    fn slots(&mut self) -> [(&'static str, &mut Color32); 17] {
         [
             ("ground", &mut self.ground),
             ("ink", &mut self.ink),
@@ -160,6 +229,7 @@ impl Colours {
             ("alert", &mut self.alert),
             ("fault", &mut self.fault),
             ("drum", &mut self.drum),
+            ("tab", &mut self.tab),
         ]
     }
 }
@@ -446,7 +516,11 @@ mod tests {
     fn the_defaults_survive_a_trip_through_the_file() {
         let parsed = theme_file::parse(&to_text(&Colours::DEFAULT)).expect("our own text parses");
         let (back, found) = apply(&parsed, &Colours::DEFAULT);
-        assert_eq!(found, 16);
+        // Seventeen since `tab` joined them. This number is the point of
+        // the test: a role added to the struct and forgotten in `slots`
+        // would never reach the file, and the file would go on looking
+        // complete.
+        assert_eq!(found, 17);
         let mut a = Colours::DEFAULT;
         let mut b = back;
         for ((name, x), (_, y)) in a.slots().into_iter().zip(b.slots()) {

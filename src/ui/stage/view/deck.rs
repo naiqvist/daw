@@ -10,8 +10,8 @@ use crate::ui::chrome;
 use eframe::egui;
 
 /// One compact row between title and field: the eight keys.
-/// @tune 18..40 px
-const DECK_H: f32 = 32.0;
+/// @tune 18..64 px
+const DECK_H: f32 = 48.0;
 const PAD: f32 = 5.0;
 /// @tune 16..32 px
 const WINDOW_TITLE_H: f32 = 22.0;
@@ -24,6 +24,15 @@ const HERO_H: f32 = 140.0;
 /// Clear margin around the hero panel on all four sides.
 /// @tune 0..24 px
 const HERO_INSET: f32 = 8.0;
+/// Clear space at each end of the key row.
+/// @tune 0..40 px
+const KEY_MARGIN: f32 = 13.0;
+/// Between two key cells.
+/// @tune 0..24 px
+const KEY_GAP: f32 = 6.0;
+/// How far a key cell sits inside the row, top and bottom.
+/// @tune 0..12 px
+const KEY_INSET: f32 = 3.0;
 
 struct WindowLayout {
     rect: egui::Rect,
@@ -71,30 +80,47 @@ impl Stage {
             egui::Stroke::new(1.0, c.rule),
         );
         let page_font = egui::FontId::new(11.0, egui::FontFamily::Name(PROFONT.into()));
-        let cell_w = rect.width() / 8.0;
+        // Eight raised cells, not eight labels on a bar. Traced from the
+        // macOS square concept at its own 1280 raster: a 13px margin
+        // either side, 6px between cells, and the cell inset 3px into the
+        // row. The drawing's own cells run 124..176 wide, which is
+        // hand-placement rather than a rule — the rule underneath is that
+        // they share what the margins and gaps leave, and at this width
+        // that is 151, within a pixel of the drawing's mean.
+        let margin = crate::tune!(KEY_MARGIN);
+        let gap = crate::tune!(KEY_GAP);
+        let inset = crate::tune!(KEY_INSET);
+        let cell_w = (rect.width() - 2.0 * margin - 7.0 * gap) / 8.0;
         let lit = self.deck_lit();
         let steps = self.step_keys();
 
         for (index, key) in PageKey::ALL.into_iter().enumerate() {
+            let x = rect.left() + margin + index as f32 * (cell_w + gap);
             let cell = egui::Rect::from_min_max(
-                egui::pos2(rect.left() + index as f32 * cell_w, rect.top()),
-                egui::pos2(rect.left() + (index + 1) as f32 * cell_w, rect.bottom()),
+                egui::pos2(x, rect.top() + inset),
+                egui::pos2(x + cell_w, rect.bottom() - inset),
             );
             let active = lit == Some(key);
             let available = self.page_available(key);
-            if active {
-                painter.rect_filled(cell.shrink(1.0), 0.0, c.select);
-                painter.line_segment(
-                    [cell.left_bottom(), cell.right_bottom()],
-                    egui::Stroke::new(2.0, c.bright),
-                );
-            }
+            // The cell is a SURFACE: a slight vertical gradient with a
+            // lighter line around it, so it reads as something catching
+            // light rather than a rectangle of paint. Both tones and the
+            // line come from `palette::raised`, which owns the arithmetic
+            // — see the note there about not mixing at a call site.
+            let (top, foot, line) = palette::raised(active);
+            palette::gradient(painter, cell, top, foot);
+            painter.rect_stroke(
+                cell,
+                0.0,
+                egui::Stroke::new(1.0, line),
+                egui::StrokeKind::Inside,
+            );
             painter.text(
                 egui::pos2(cell.left() + PAD, cell.center().y),
                 egui::Align2::LEFT_CENTER,
                 format!("F{}", index + 1),
                 page_font.clone(),
-                if active { c.ground } else { c.dim },
+                c.dim,
             );
             painter.text(
                 egui::pos2(cell.left() + 27.0, cell.center().y),
