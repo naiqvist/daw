@@ -511,11 +511,15 @@ def main():
     au.add_argument("--min-side", type=int, default=10, dest="min_side")
     au.add_argument("--lit", type=int, default=60,
                     help="colour distance at which a row member counts as lit")
+    au.add_argument("--no-text", action="store_true", dest="no_text",
+                    help="skip OCR; surfaces only")
     au.add_argument("--limit", type=int, default=12, help="how many single panels to report")
     au.set_defaults(fn=cmd_auto)
 
     rn = sub.add_parser("render", help="rebuild a picture from a spec, to score the measurement")
     rn.add_argument("spec"); rn.add_argument("out")
+    rn.add_argument("--font", default="sans-serif",
+                    help="a family fontconfig knows, or a path to a .ttf")
     rn.set_defaults(fn=cmd_render)
 
     a = p.parse_args()
@@ -656,7 +660,7 @@ def cmd_auto(a):
 
     # Repeated rows: panels sharing a top edge and a height are one row, and
     # a row is where the interesting question lives — rule, or hand-placed.
-    rows, singles = {}, []
+    rows, singles, panel_objs = {}, [], []
     for o in panels:
         rows.setdefault((o["y"], o["h"]), []).append(o)
     spec = dict(source=img, raster=f"{w}x{h}", constants=[], panels=[], roles={})
@@ -720,6 +724,8 @@ def cmd_auto(a):
                 top=hexs(o["colour"]) if o in odd else hexs(r["top"]),
                 foot=hexs(o["colour"]) if o in odd else hexs(r["foot"]),
                 border=hexs(r["border"]), border_px=1.0, shadow=0.0))
+            panel_objs.append((spec["panels"][-1], o))
+            spec["panels"][-1]["_fill"] = r["top"]
         print()
 
     for o in sorted(singles, key=lambda o: -o["area"])[: a.limit]:
@@ -734,8 +740,54 @@ def cmd_auto(a):
             radius=rad, top=hexs(r["top"]), foot=hexs(r["foot"]),
             border=hexs(r["border"]), border_px=1.0, shadow=0.0))
 
-    print(f"\n{glyphs} smaller objects left unmeasured — those are glyphs, and")
-    print("they stay egui's. This tool measures SURFACES.")
+    spec["texts"] = []
+    if not a.no_text:
+        print("\nreading text...")
+        labelled = 0
+        for pan, o in panel_objs:
+            got = panel_text(img, o, pan.get("_fill"))
+            if not got:
+                continue
+            txt, ink = got
+            pan["label"] = txt
+            spec["texts"].append(dict(
+                text=txt, rect=[o["x"], o["y"], o["w"], o["h"]],
+                colour=hexs(ink), size=round(o["h"] * 0.52), align="center"))
+            labelled += 1
+        # Anything not inside a panel: menu bars, captions, status words.
+        loose = 0
+        words = sparse_text(img, bg["colour"])
+        # Size comes from the LINE, not the word. A word's own box height
+        # includes whatever descenders it happens to contain, so "Settings"
+        # measured taller than "File" and rendered visibly bigger on the
+        # same menu bar. Words sharing a baseline share a size: the median
+        # of the line, which no single g or y can move.
+        lines = {}
+        for wrd in words:
+            lines.setdefault(round(wrd["y"] / 6), []).append(wrd)
+        for group_ in lines.values():
+            hs = sorted(x["h"] for x in group_)
+            med = hs[len(hs) // 2]
+            for x in group_:
+                x["line_h"] = med
+        for wrd in words:
+            inside = any(o["x"] <= wrd["x"] and o["y"] <= wrd["y"]
+                         and wrd["x"] + wrd["w"] <= o["x"] + o["w"]
+                         and wrd["y"] + wrd["h"] <= o["y"] + o["h"]
+                         for _, o in panel_objs)
+            if inside:
+                continue
+            ink = ink_of(img, wrd["x"], wrd["y"], wrd["w"], wrd["h"], bg["colour"])
+            spec["texts"].append(dict(
+                text=wrd["text"], rect=[wrd["x"], wrd["y"], wrd["w"], wrd["h"]],
+                colour=hexs(ink), size=round(wrd.get("line_h", wrd["h"]) * 1.05),
+                align="left"))
+            loose += 1
+        print(f"  {labelled} panel labels, {loose} loose words")
+        sample = ", ".join(repr(t["text"]) for t in spec["texts"][:14])
+        print(f"  {sample}")
+
+    print(f"\n{glyphs} objects were too small to be surfaces.")
     spec["roles"]["ground"] = hexs(bg["colour"])
     if a.out:
         json.dump(spec, open(a.out, "w"), indent=2)
@@ -756,8 +808,23 @@ def cmd_auto(a):
 # this and that read the same spec.
 
 
+def resolve_font(name):
+    """A font ImageMagick will actually open.
+
+    Its own font names are build-dependent — this machine knows Adwaita-*
+    and not DejaVu-Sans — so ask fontconfig for a FILE instead. A path
+    always works, and `--font` still accepts one directly.
+    """
+    if "/" in name:
+        return name
+    out = subprocess.run(["fc-match", "-f", "%{file}", name],
+                         capture_output=True, text=True).stdout.strip()
+    return out or name
+
+
 def cmd_render(a):
     spec = json.load(open(a.spec))
+    a.font = resolve_font(a.font)
     w, h = (int(v) for v in spec["raster"].split("x"))
     ground = spec.get("roles", {}).get("ground", "#000000")
     args = ["-size", f"{w}x{h}", f"xc:{ground}"]
@@ -787,9 +854,114 @@ def cmd_render(a):
     _magick([*args, a.out])
     for tile, x, y in tiles:
         _magick([a.out, tile, "-geometry", f"+{x}+{y}", "-composite", a.out])
-    print(f"wrote {a.out}  ({len(tiles)} panels from {a.spec})")
-    print("NOTE: surfaces only. No text — glyphs are not measured, by design,")
-    print("so a recreation is the LAYOUT and the MATERIALS, never the words.")
+    texts = spec.get("texts", [])
+    for t in texts:
+        x, y, tw, th = (int(round(v)) for v in t["rect"])
+        pt = max(6, int(t.get("size", th)))
+        col = t.get("colour") or "#ffffff"
+        if t.get("align") == "center":
+            _magick([a.out, "-font", a.font, "-pointsize", str(pt), "-fill", col,
+                     "-gravity", "center",
+                     "-annotate", f"{x + tw // 2 - w // 2:+d}{y + th // 2 - h // 2:+d}",
+                     t["text"], a.out])
+        else:
+            _magick([a.out, "-font", a.font, "-pointsize", str(pt), "-fill", col,
+                     "-gravity", "NorthWest", "-annotate", f"+{x}+{y}",
+                     t["text"], a.out])
+    print(f"wrote {a.out}  ({len(tiles)} panels, {len(texts)} texts from {a.spec})")
+    print("The STRING may be wrong where OCR guessed; its box, size, colour and")
+    print("alignment are measured, and those are what a layout is made of.")
 
+
+
+# -------------------------------------------------------------------- text
+#
+# Text is layout. Leaving it out made the first KCalc recreation look
+# hollow — the panels were right and the thing still read as a wireframe,
+# because half of what a UI communicates is where its words sit.
+#
+# Two passes, because one does not work. Tesseract in sparse mode finds
+# words — KCalc's File, Edit, Settings, Help, NORM — and misses every single
+# digit, since a lone glyph gives a page segmenter nothing to segment. But
+# by this point the panels are already known, so each button can be cropped
+# and read on its own in single-character mode, which gets them all.
+#
+# The characters do not have to be right for the trace to be useful. Their
+# BOX, SIZE, COLOUR and ALIGNMENT are the measurement; the string is a
+# convenience, and a wrong one is visible immediately.
+
+
+def _ocr(img_args, psm, whitelist=None):
+    tmp = "/tmp/.trace-ocr.png"
+    _magick([*img_args, tmp])
+    cmd = ["tesseract", tmp, "-", "--psm", str(psm)]
+    if whitelist:
+        cmd += ["-c", f"tessedit_char_whitelist={whitelist}"]
+    out = subprocess.run(cmd, capture_output=True, text=True)
+    return out.stdout.strip()
+
+
+def ink_of(img, x, y, w, h, fill):
+    """The text's colour: the pixel in the box furthest from the fill."""
+    px = [c for c in region(img, x, y, w, h).values() if c]
+    if not px or not fill:
+        return None
+    return max(px, key=lambda c: sum(abs(i - j) for i, j in zip(c, fill)))
+
+
+def panel_text(img, o, fill):
+    """One panel's label, read on its own. Returns (text, ink) or None."""
+    dark = luminance(fill) < 0.3 if fill else True
+    args = [img, "-crop", f"{o['w'] - 4}x{o['h'] - 4}+{o['x'] + 2}+{o['y'] + 2}",
+            "+repage", "-resize", "500%"]
+    if dark:
+        args.append("-negate")
+    args += ["-colorspace", "Gray", "-threshold", "55%"]
+    best = ""
+    for psm in (10, 8):
+        t = _ocr(args, psm)
+        t = "".join(ch for ch in t if ch.isprintable()).strip()
+        if len(t) > len(best):
+            best = t
+        if best and psm == 10 and len(best) == 1:
+            break
+    if not best or len(best) > 12:
+        return None
+    return best, ink_of(img, o["x"] + 2, o["y"] + 2, o["w"] - 4, o["h"] - 4, fill)
+
+
+def sparse_text(img, ground, minconf=45):
+    """Words anywhere on the image, with their boxes, at native scale."""
+    dark = luminance(ground) < 0.3 if ground else True
+    args = [img, "-resize", "300%"]
+    if dark:
+        args.append("-negate")
+    args += ["-colorspace", "Gray"]
+    tmp = "/tmp/.trace-ocr-sparse.png"
+    _magick([*args, tmp])
+    out = subprocess.run(["tesseract", tmp, "-", "--psm", "11", "tsv"],
+                         capture_output=True, text=True).stdout
+    found = []
+    for line in out.splitlines()[1:]:
+        f = line.split("\t")
+        if len(f) < 12:
+            continue
+        try:
+            conf = float(f[10])
+        except ValueError:
+            continue
+        word = f[11].strip()
+        if conf < minconf or not word:
+            continue
+        # back out of the 300% used to give tesseract something to chew on
+        x, y, w, h = (int(int(v) / 3) for v in f[6:10])
+        found.append(dict(text=word, x=x, y=y, w=w, h=h, conf=round(conf)))
+    return found
+
+
+# The entrypoint stays at the very foot of this file. Three times now a new
+# command has been appended below it and every one failed with a NameError
+# at call time, because `main()` had already run before the functions it
+# dispatches to existed. Append above this line.
 if __name__ == "__main__":
     main()
