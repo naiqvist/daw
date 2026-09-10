@@ -500,9 +500,178 @@ def main():
     e.add_argument("spec"); e.add_argument("--module")
     e.set_defaults(fn=cmd_emit)
 
+    au = sub.add_parser("auto", help="the whole method: segment, measure, group, emit")
+    au.add_argument("image"); au.add_argument("--out", default="spec.json")
+    au.add_argument("--normalise", action="store_true",
+                    help="strip chrome and resample first")
+    au.add_argument("--size", default="1280x800")
+    au.add_argument("--fuzz", type=int, default=6,
+                    help="percent; higher merges a gradient into one object")
+    au.add_argument("--area", type=int, default=400, help="smallest object counted")
+    au.add_argument("--min-side", type=int, default=10, dest="min_side")
+    au.add_argument("--lit", type=int, default=60,
+                    help="colour distance at which a row member counts as lit")
+    au.add_argument("--limit", type=int, default=12, help="how many single panels to report")
+    au.set_defaults(fn=cmd_auto)
+
     a = p.parse_args()
     a.fn(a)
 
+
+
+
+# -------------------------------------------------------------------- auto
+#
+# The whole method in one command. Everything above is a hand tool; this is
+# the machine. Given a mockup it finds the panels itself, measures each one,
+# groups the repeated rows, and writes a spec.
+#
+# Segmentation is ImageMagick's connected-component labelling rather than
+# anything hand-rolled: with a fuzz it merges each panel's gradient into one
+# object and hands back the bounding box, area and mean colour. That single
+# call replaces the column-scanning the earlier commands do by hand, and it
+# found all eight key cells at the positions measured by hand, including
+# telling the lit one apart by its mean colour alone.
+
+
+def components(img, fuzz, area):
+    """[(id, x, y, w, h, area, mean_rgb)], largest first."""
+    txt = _magick([
+        img, "-fuzz", f"{fuzz}%",
+        "-define", "connected-components:verbose=true",
+        "-define", f"connected-components:area-threshold={area}",
+        "-define", "connected-components:mean-color=true",
+        "-connected-components", "8", "null:",
+    ])
+    out = []
+    for line in txt.splitlines()[1:]:
+        m = re.match(
+            r"\s*(\d+):\s+(\d+)x(\d+)\+(\d+)\+(\d+)\s+[\d.,]+\s+(\d+)\s+srgb\("
+            r"([\d.]+)%,([\d.]+)%,([\d.]+)%\)", line)
+        if not m:
+            continue
+        g = m.groups()
+        out.append(dict(
+            id=int(g[0]), w=int(g[1]), h=int(g[2]), x=int(g[3]), y=int(g[4]),
+            area=int(g[5]),
+            colour=tuple(round(float(v) * 255 / 100) for v in g[6:9]),
+        ))
+    return sorted(out, key=lambda o: -o["area"])
+
+
+def corner_radius(img, o, fill, tol=30):
+    """How far in from the left the fill starts on the panel's first row.
+
+    A square corner gives 0; a rounded one gives roughly its radius. Read
+    two rows down from the top edge so the border itself is not counted.
+    """
+    row_ = strip_row(img, o["y"] + 2, o["x"], o["x"] + min(o["w"], 24))
+    for i, c in enumerate(row_):
+        if c and near(c, fill, tol):
+            return i
+    return 0
+
+
+def cmd_auto(a):
+    img = a.image
+    if a.normalise:
+        norm = (a.out or "spec") + ".normalised.png"
+        cmd_normalise(argparse.Namespace(image=img, out=norm, size=a.size, chroma=35))
+        img = norm
+    w, h = size(img)
+    objs = components(img, a.fuzz, a.area)
+    if not objs:
+        sys.exit("no components found; try a larger --fuzz or smaller --area")
+    bg = objs[0]
+    print(f"{img}  {w}x{h}   {len(objs)} objects, ground {hexs(bg['colour'])}\n")
+
+    # A panel is a component that is not the ground, not a hairline, and not
+    # a glyph. Glyphs are what is left once those go, and they belong to
+    # egui, so they are counted and not measured.
+    panels = [o for o in objs[1:]
+              if o["w"] >= a.min_side and o["h"] >= a.min_side
+              and o["w"] * o["h"] >= a.area]
+    glyphs = len(objs) - 1 - len(panels)
+
+    # Repeated rows: panels sharing a top edge and a height are one row, and
+    # a row is where the interesting question lives — rule, or hand-placed.
+    rows, singles = {}, []
+    for o in panels:
+        rows.setdefault((o["y"], o["h"]), []).append(o)
+    spec = dict(source=img, raster=f"{w}x{h}", constants=[], panels=[], roles={})
+
+    for (y, ph), group in sorted(rows.items()):
+        group.sort(key=lambda o: o["x"])
+        if len(group) < 2:
+            singles.extend(group)
+            continue
+        widths = [o["w"] for o in group]
+        # Members of wildly different sizes are not a row that happens to
+        # be uneven; they are separate things that share a top edge. The
+        # footer's segments did exactly this and came back as a "row" with
+        # a 213% spread, which is a true number and a useless one.
+        if max(widths) > 3 * min(widths):
+            singles.extend(group)
+            continue
+        gaps = [group[i + 1]["x"] - (group[i]["x"] + group[i]["w"])
+                for i in range(len(group) - 1)]
+        lead = group[0]["x"]
+        trail = w - (group[-1]["x"] + group[-1]["w"])
+        n = len(group)
+        gap = round(sum(gaps) / len(gaps)) if gaps else 0
+        even = (w - lead - trail - (n - 1) * gap) / n
+        spread = max(widths) - min(widths)
+        avg = sum(widths) / n
+        print(f"ROW of {n} at y {y}, height {ph}")
+        print(f"  margins {lead} / {trail}   gaps {min(gaps)}..{max(gaps)} (mean {gap})")
+        print(f"  widths  {min(widths)}..{max(widths)} (mean {avg:.1f})   even rule {even:.1f}")
+        if spread > 0.12 * avg:
+            print(f"  VERDICT hand-placed ({100 * spread / avg:.0f}% spread) — take the even rule")
+        else:
+            print("  VERDICT a real grid — copy the widths")
+        # Measure a TYPICAL member, not the first. The first key cell is
+        # the lit one, and the first pass reported its blue as the row's
+        # material — a state described as a style.
+        base = mean([o["colour"] for o in group])
+        first = min(group, key=lambda o: sum(abs(i - j) for i, j in zip(o["colour"], base)))
+        r = anatomy(img, first["x"], y, first["w"], ph)
+        rad = corner_radius(img, first, r["top"]) if r["top"] else 0
+        print(f"  cell    {hexs(r['top'])} -> {hexs(r['foot'])}"
+              f"  {'gradient' if r['gradient'] else 'flat'}"
+              f"  border {hexs(r['border'])}  radius ~{rad}")
+        # A member far from the row's mean colour is the LIT one.
+        odd = [o for o in group if not near(o["colour"], base, a.lit)]
+        for o in odd:
+            print(f"  lit     index {group.index(o)}, {hexs(o['colour'])} — a state, not a style")
+        spec["constants"] += [
+            dict(name=f"ROW{y}_MARGIN", value=lead, doc=f"Row at y {y}: clear space at each end.", min=0, max=64),
+            dict(name=f"ROW{y}_GAP", value=gap, doc=f"Row at y {y}: between two cells.", min=0, max=32),
+            dict(name=f"ROW{y}_H", value=ph, doc=f"Row at y {y}: one cell's height.", min=0, max=96),
+        ]
+        spec["panels"].append(dict(
+            name=f"row at y{y}, cell", rect=[lead, y, round(even, 1), ph],
+            radius=rad, top=hexs(r["top"]), foot=hexs(r["foot"]),
+            border=hexs(r["border"]), border_px=1.0, shadow=0.0))
+        print()
+
+    for o in sorted(singles, key=lambda o: -o["area"])[: a.limit]:
+        r = anatomy(img, o["x"], o["y"], o["w"], o["h"])
+        rad = corner_radius(img, o, r["top"]) if r["top"] else 0
+        print(f"PANEL {o['w']}x{o['h']} at {o['x']},{o['y']}   {hexs(o['colour'])}")
+        print(f"  {hexs(r['top'])} -> {hexs(r['foot'])}"
+              f"  {'gradient' if r['gradient'] else 'flat'}"
+              f"  border {hexs(r['border'])}  radius ~{rad}")
+        spec["panels"].append(dict(
+            name=f"panel at {o['x']},{o['y']}", rect=[o["x"], o["y"], o["w"], o["h"]],
+            radius=rad, top=hexs(r["top"]), foot=hexs(r["foot"]),
+            border=hexs(r["border"]), border_px=1.0, shadow=0.0))
+
+    print(f"\n{glyphs} smaller objects left unmeasured — those are glyphs, and")
+    print("they stay egui's. This tool measures SURFACES.")
+    spec["roles"]["ground"] = hexs(bg["colour"])
+    if a.out:
+        json.dump(spec, open(a.out, "w"), indent=2)
+        print(f"\nwrote {a.out}   ->  tools/trace.py emit {a.out}")
 
 if __name__ == "__main__":
     main()
