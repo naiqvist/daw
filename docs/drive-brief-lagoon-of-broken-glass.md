@@ -1,7 +1,8 @@
 # Drive brief — Lagoon of Broken Glass
 
-Status: prompt prepared; music, drive, and improvement backlog not yet executed.
-Run this brief only when the user explicitly asks to begin.
+Status: v1 composition and native TAKE completed; workflow improvements authorised
+and implemented. Human listening acceptance is still pending. See the
+[implementation and measured retest](lagoon-workflow-retest.md).
 
 ## The prompt
 

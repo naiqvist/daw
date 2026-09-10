@@ -1077,6 +1077,9 @@ impl Stage {
         if command == "go" {
             return self.apply_navigation_command(input);
         }
+        if command == "seek" {
+            return self.apply_seek_command(input);
+        }
         if command == "render-config" {
             return self.apply_render_config(input);
         }

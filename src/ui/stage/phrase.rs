@@ -18,7 +18,7 @@ pub(super) const COMMANDS: &[crate::ui::palette::TypedCommand] = &[
     },
     crate::ui::palette::TypedCommand {
         name: "rhythm",
-        usage: "rhythm <division> <offsets> [at N] [every N] [gate N] [vel values] [pitch semitones] · offsets start at 0",
+        usage: "rhythm <division> <offsets> [at N] [every N] [gate value,cycle,or A:B] [vel values] [pitch semitones] · offsets start at 0",
     },
     crate::ui::palette::TypedCommand {
         name: "group",
@@ -26,7 +26,7 @@ pub(super) const COMMANDS: &[crate::ui::palette::TypedCommand] = &[
     },
     crate::ui::palette::TypedCommand {
         name: "ratchet",
-        usage: "ratchet <division> <start:end> [spacing A:B] [gate N] [vel A:B] [pitch A:B] · end excluded",
+        usage: "ratchet <division> <start:end> [spacing A:B] [gate values] [vel A:B] [pitch A:B] [sweep target=A:B;target=A:B] · notes + FX gesture, one undo",
     },
     crate::ui::palette::TypedCommand {
         name: "shape",
@@ -38,11 +38,11 @@ pub(super) const COMMANDS: &[crate::ui::palette::TypedCommand] = &[
     },
     crate::ui::palette::TypedCommand {
         name: "sweep",
-        usage: "sweep <parameter> <start:end> [curve] [at tick:tick] · end excluded; underscores in names; units allowed",
+        usage: "sweep <parameter> <A:B> [curve] | sweep target=A:B;target=A:B [curve N] [at tick:tick] [every ticks] · end excluded, units allowed",
     },
     crate::ui::palette::TypedCommand {
         name: "lock",
-        usage: "lock <parameter> <value or choice> [at tick,tick,...] · selected time, else clip; 12-tick cells; one undo",
+        usage: "lock <parameter> <value> | lock target=value;target=value [at tick,tick,...] · units/choices, 12-tick cells, one undo",
     },
 ];
 
@@ -105,7 +105,7 @@ impl Contour {
 struct Options {
     at: usize,
     every: Option<usize>,
-    gate: Option<usize>,
+    gate: Option<Contour>,
     velocity: Option<Contour>,
     pitch: Contour,
     spacing: (f64, f64),
@@ -132,7 +132,7 @@ impl Options {
             match pair[0] {
                 "at" if !ratchet => result.at = integer(pair[1])?,
                 "every" if !ratchet => result.every = Some(integer(pair[1])?),
-                "gate" => result.gate = Some(integer(pair[1])?),
+                "gate" => result.gate = Some(Contour::parse(pair[1], 1.0, (LIMIT * 192) as f64)?),
                 "vel" => result.velocity = Some(Contour::parse(pair[1], 1.0, 127.0)?),
                 "pitch" => result.pitch = Contour::parse(pair[1], -60.0, 67.0)?,
                 "spacing" if ratchet => {
@@ -142,7 +142,7 @@ impl Options {
                 _ => return Err(format!("unknown option: {}", pair[0])),
             }
         }
-        if result.every == Some(0) || result.gate == Some(0) {
+        if result.every == Some(0) {
             return Err("period and gate must be positive".into());
         }
         Ok(result)
@@ -182,12 +182,14 @@ fn generate(pattern: &mut Pattern, words: &[&str]) -> Result<usize, String> {
     let ratchet = words[0] == "ratchet";
     let options = Options::parse(&words[3..], ratchet)?;
     let mut placements = Vec::new();
+    let mut ratchet_end = None;
     if ratchet {
         let (a, b) = words[2].split_once(':').ok_or("ratchet needs start:end")?;
         let (start, end) = (integer(a)?, integer(b)?);
         if start >= end || end * unit > pattern.length_ticks {
             return Err("ratchet range is outside the clip".into());
         }
+        ratchet_end = Some(end * unit);
         let mut at = start;
         while at < end {
             if placements.len() == LIMIT {
@@ -197,10 +199,7 @@ fn generate(pattern: &mut Pattern, words: &[&str]) -> Result<usize, String> {
             let spacing = (options.spacing.0 + (options.spacing.1 - options.spacing.0) * progress)
                 .round()
                 .max(1.0) as usize;
-            placements.push((
-                at * unit,
-                options.gate.unwrap_or(spacing).min(end - at) * unit,
-            ));
+            placements.push((at * unit, spacing.min(end - at) * unit));
             at += spacing;
         }
     } else {
@@ -214,7 +213,7 @@ fn generate(pattern: &mut Pattern, words: &[&str]) -> Result<usize, String> {
             }
             motif.push((
                 if group { cursor } else { value },
-                options.gate.unwrap_or(if group { value } else { 1 }),
+                if group { value } else { 1 },
             ));
             cursor = cursor.checked_add(value).ok_or("rhythm too long")?;
         }
@@ -255,6 +254,14 @@ fn generate(pattern: &mut Pattern, words: &[&str]) -> Result<usize, String> {
         return Err("duplicate onset in rhythm".into());
     }
     let count = placements.len();
+    if let Some(gates) = &options.gate {
+        for (i, (tick, length)) in placements.iter_mut().enumerate() {
+            *length = gates.value(i, count).round() as usize * unit;
+            if let Some(end) = ratchet_end {
+                *length = (*length).min(end - *tick);
+            }
+        }
+    }
     // Preserve an existing note/chord as the ratchet's source. New bursts use
     // the ordinary middle-C entry default, so they work on any instrument.
     let source: Vec<Note> = if ratchet {
@@ -431,6 +438,202 @@ fn transform(
     Ok(count)
 }
 
+/// Resolve and validate a complete gesture before touching the candidate clip.
+/// Only the caller commits: malformed late targets cannot leave half a gesture,
+/// enabled FX, a dirty flag, or a new history/audio revision behind.
+fn paint_locks(
+    song: &crate::sequencing::Song,
+    track: usize,
+    pattern: &mut Pattern,
+    input: &str,
+    selected: Option<&[usize]>,
+    inherited_window: Option<(usize, usize)>,
+) -> Result<(usize, Vec<crate::sequencing::DeviceId>), String> {
+    let words: Vec<_> = input.split_whitespace().collect();
+    let sweep = words.first() == Some(&"sweep");
+    let option_at = words
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find(|(_, w)| matches!(**w, "at" | "every" | "curve"))
+        .map_or(words.len(), |(i, _)| i);
+    let body = words[1..option_at].join(" ");
+    let mut curve = 1.0;
+    let mut positional_curve = false;
+    let assignments: Vec<(String, String)> = if body.contains('=') {
+        body.split(';')
+            .map(|part| {
+                let (address, value) = part
+                    .split_once('=')
+                    .ok_or("use target=value;target=value")?;
+                if address.trim().is_empty() || value.trim().is_empty() || value.contains('=') {
+                    return Err("each target needs exactly one value".to_owned());
+                }
+                Ok((address.trim().to_owned(), value.trim().to_owned()))
+            })
+            .collect::<Result<_, String>>()?
+    } else {
+        let parts: Vec<_> = body.split_whitespace().collect();
+        if parts.len() != 2 && !(sweep && parts.len() == 3) {
+            return Err("use parameter value, or target=value;target=value".into());
+        }
+        if parts.len() == 3 {
+            curve = number(parts[2])?;
+            positional_curve = true;
+        }
+        vec![(parts[0].to_owned(), parts[1].to_owned())]
+    };
+    if assignments.is_empty() || assignments.len() > 64 {
+        return Err("use 1..64 parameter assignments".into());
+    }
+    let mut at = None;
+    let mut every = None;
+    let options = &words[option_at..];
+    if options.len() % 2 != 0 {
+        return Err("each time/curve option needs a value".into());
+    }
+    let mut seen = std::collections::HashSet::new();
+    if positional_curve {
+        seen.insert("curve");
+    }
+    for pair in options.chunks_exact(2) {
+        if !seen.insert(pair[0]) {
+            return Err(format!("duplicate option: {}", pair[0]));
+        }
+        match pair[0] {
+            "at" => at = Some(pair[1]),
+            "every" if sweep => every = Some(integer(pair[1])?),
+            "curve" if sweep => curve = number(pair[1])?,
+            _ => {
+                return Err("use at <ticks>, and for sweeps: every <ticks>, curve <number>".into());
+            }
+        }
+    }
+    if !(0.1..=10.).contains(&curve) {
+        return Err("curve must be 0.1..10".into());
+    }
+    if inherited_window.is_some() && (at.is_some() || every.is_some()) {
+        return Err("attached sweeps inherit the ratchet window; no at/every override".into());
+    }
+    if every.is_some() && at.is_none() {
+        return Err("every needs an explicit sweep window".into());
+    }
+    let owned_window = inherited_window.map(|(a, b)| format!("{a}:{b}"));
+    let addressed = at.or(owned_window.as_deref());
+    let mut first_steps = if let Some(address) = addressed {
+        lock_steps(address, pattern.length_ticks, sweep)?
+    } else {
+        selected.map_or_else(
+            || (0..pattern.length_ticks.div_ceil(PATTERN_STEP_TICKS)).collect(),
+            |s| s.to_vec(),
+        )
+    };
+    first_steps.sort_unstable();
+    first_steps.dedup();
+    if first_steps.is_empty() || (sweep && first_steps.len() < 2) {
+        return Err("select at least two time cells for a sweep, one for a lock".into());
+    }
+    if first_steps.len() > 4096
+        || first_steps
+            .iter()
+            .any(|s| *s * PATTERN_STEP_TICKS >= pattern.length_ticks)
+    {
+        return Err("selection must fit the clip and contain at most 4096 cells".into());
+    }
+    let mut windows = vec![first_steps.clone()];
+    if let Some(period) = every {
+        let span = (first_steps.last().unwrap() - first_steps[0] + 1) * PATTERN_STEP_TICKS;
+        if period < span || period % PATTERN_STEP_TICKS != 0 {
+            return Err("repeat period must cover the window and align to 12-tick cells".into());
+        }
+        let mut offset = period;
+        while first_steps[0] * PATTERN_STEP_TICKS + offset < pattern.length_ticks {
+            if (first_steps.last().unwrap() + 1) * PATTERN_STEP_TICKS + offset
+                > pattern.length_ticks
+            {
+                return Err(
+                    "last repeat would overrun the clip; resize the window or period".into(),
+                );
+            }
+            windows.push(
+                first_steps
+                    .iter()
+                    .map(|s| s + offset / PATTERN_STEP_TICKS)
+                    .collect(),
+            );
+            if windows.len() * first_steps.len() > 4096 {
+                return Err("too many repeated lock cells".into());
+            }
+            offset += period;
+        }
+    }
+    let mut targets = Vec::new();
+    let mut enable = Vec::new();
+    let mut unique = std::collections::HashSet::new();
+    for (address, value) in assignments {
+        let address = if address.contains('.') {
+            address
+        } else {
+            format!("machine.{address}")
+        };
+        let target = super::parameter_command::resolve(song, track, &address)?;
+        if target.track != track {
+            return Err("locks must address this clip's track".into());
+        }
+        if sweep && !target.choices.is_empty() {
+            return Err("sweeps require a continuous parameter".into());
+        }
+        let (id, param) = super::parameter_command::device_param(song, &target.id)
+            .ok_or("locks need an instrument or effect target")?;
+        if !unique.insert((id, param)) {
+            return Err("duplicate parameter (including aliases)".into());
+        }
+        let device = song.device(id).ok_or("device missing")?;
+        if device.kind == crate::devices::DeviceKind::Scomp && crate::params::scomp::baked(param) {
+            return Err("this parameter requires baking, not live locks".into());
+        }
+        let lock_device = if song.tracks[track]
+            .machine
+            .as_ref()
+            .is_some_and(|m| m.id == id)
+        {
+            None
+        } else {
+            Some(id)
+        };
+        let (a, b) = if sweep {
+            value.split_once(':').ok_or("sweep needs start:end")?
+        } else {
+            (value.as_str(), value.as_str())
+        };
+        let low = f64::from(super::parameter_command::evaluate(&target, a, "=")?);
+        let high = f64::from(super::parameter_command::evaluate(&target, b, "=")?);
+        if matches!(device.kind,crate::devices::DeviceKind::Console(kind) if !kind.always_in())
+            && device.bypassed
+            && !enable.contains(&id)
+        {
+            enable.push(id);
+        }
+        targets.push((lock_device, param, low, high));
+    }
+    for steps in &windows {
+        let first = steps[0];
+        let last = *steps.last().unwrap();
+        for &(device, param, low, high) in &targets {
+            for &step in steps {
+                let x = (step - first) as f64 / (last - first).max(1) as f64;
+                let trig = pattern.trig_mut(step);
+                trig.set_lock_on(device, param, (low + (high - low) * x.powf(curve)) as f32);
+                trig.set_slide_on(device, param, sweep && step != last);
+            }
+        }
+    }
+    Ok((
+        windows.iter().map(Vec::len).sum::<usize>() * targets.len(),
+        enable,
+    ))
+}
+
 impl Stage {
     pub(super) fn apply_phrase_command(&mut self, input: &str) -> bool {
         let result = self.phrase_edit(input);
@@ -456,108 +659,61 @@ impl Stage {
         }
         let before = self.song.pattern(opened.pattern).ok_or("clip is missing")?;
         let mut edited = before.clone();
-        let mut enable_section = None;
+        let mut enable_sections = Vec::new();
         let selected = self
             .sequencer
             .standing_selection_steps(opened.pattern.0, PATTERN_STEP_TICKS);
         let words: Vec<_> = input.split_whitespace().collect();
         let count = match words.first().copied() {
-            Some("rhythm" | "group" | "ratchet") => generate(&mut edited, &words)?,
+            Some("rhythm" | "group" | "ratchet") => {
+                if words[0] == "ratchet"
+                    && let Some(split) = words.iter().position(|word| *word == "sweep")
+                {
+                    let notes = &words[..split];
+                    let count = generate(&mut edited, notes)?;
+                    let unit = 192 / integer(notes[1])?;
+                    let (from, to) = notes[2].split_once(':').ok_or("ratchet needs start:end")?;
+                    let window = (integer(from)? * unit, integer(to)? * unit);
+                    let (_, enabled) = paint_locks(
+                        &self.song,
+                        opened.track,
+                        &mut edited,
+                        &words[split..].join(" "),
+                        None,
+                        Some(window),
+                    )?;
+                    enable_sections = enabled;
+                    count
+                } else {
+                    generate(&mut edited, &words)?
+                }
+            }
             Some("shape" | "legato" | "voice") => {
                 transform(&mut edited, &words, selected.as_deref(), &self.song.key)?
             }
             Some("sweep" | "lock") => {
-                let sweep = words[0] == "sweep";
-                if words.len() < 3 {
-                    return Err("sweep <parameter> <start:end> [curve] [at tick:tick], or lock <parameter> <value> [at ticks]".into());
-                }
-                let address = if words[1].contains('.') {
-                    words[1].to_owned()
-                } else {
-                    format!("machine.{}", words[1])
-                };
-                let target = super::parameter_command::resolve(&self.song, opened.track, &address)?;
-                if target.track != opened.track {
-                    return Err("locks must address this clip's track".into());
-                }
-                if sweep && !target.choices.is_empty() {
-                    return Err("sweeps require a continuous parameter".into());
-                }
-                let (id, param) = super::parameter_command::device_param(&self.song, &target.id)
-                    .ok_or("sweep needs an instrument or effect target")?;
-                let device = self.song.device(id).ok_or("device missing")?;
-                if device.kind == crate::devices::DeviceKind::Scomp
-                    && crate::params::scomp::baked(param)
-                {
-                    return Err("this parameter requires baking, not live locks".into());
-                }
-                let lock_device = if self.song.tracks[opened.track]
-                    .machine
-                    .as_ref()
-                    .is_some_and(|m| m.id == id)
-                {
-                    None
-                } else {
-                    Some(id)
-                };
-                let (a, b) = if sweep {
-                    words[2].split_once(':').ok_or("sweep needs start:end")?
-                } else {
-                    (words[2], words[2])
-                };
-                let low = f64::from(super::parameter_command::evaluate(&target, a, "=")?);
-                let high = f64::from(super::parameter_command::evaluate(&target, b, "=")?);
-                if matches!(device.kind, crate::devices::DeviceKind::Console(kind) if !kind.always_in())
-                    && device.bypassed
-                {
-                    enable_section = Some(id);
-                }
-                let mut cursor = 3;
-                let curve = if sweep && words.get(cursor).is_some_and(|s| *s != "at") {
-                    let value = number(words[cursor])?;
-                    cursor += 1;
-                    value
-                } else {
-                    1.0
-                };
-                if !(0.1..=10.0).contains(&curve) {
-                    return Err("curve must be 0.1..10".into());
-                }
-                let steps = if cursor == words.len() {
-                    selected.unwrap_or_else(|| {
-                        (0..edited.length_ticks.div_ceil(PATTERN_STEP_TICKS)).collect()
-                    })
-                } else {
-                    if words.get(cursor) != Some(&"at") || words.len() != cursor + 2 {
-                        return Err("expected at <ticks>, no trailing words".into());
-                    }
-                    lock_steps(words[cursor + 1], edited.length_ticks, sweep)?
-                };
-                if sweep && steps.len() < 2 {
-                    return Err("select at least two time cells".into());
-                }
-                let first = *steps.first().ok_or("empty selection")?;
-                let last = *steps.last().ok_or("empty selection")?;
-                for step in &steps {
-                    let x = (*step - first) as f64 / (last - first).max(1) as f64;
-                    let value = low + (high - low) * x.powf(curve);
-                    let trig = edited.trig_mut(*step);
-                    trig.set_lock_on(lock_device, param, value as f32);
-                    trig.set_slide_on(lock_device, param, sweep && *step != last);
-                }
-                steps.len()
+                let (count, enabled) = paint_locks(
+                    &self.song,
+                    opened.track,
+                    &mut edited,
+                    input,
+                    selected.as_deref(),
+                    None,
+                )?;
+                enable_sections = enabled;
+                count
             }
             _ => return Err("unknown phrase operation".into()),
         };
-        if &edited != before || enable_section.is_some() {
+        if &edited != before || !enable_sections.is_empty() {
             *self
                 .song
                 .pattern_mut(opened.pattern)
                 .ok_or("clip is missing")? = edited;
-            if let Some(id) = enable_section
-                && let Some(device) = self.song.device_mut(id)
-            {
-                device.bypassed = false;
+            for id in enable_sections {
+                if let Some(device) = self.song.device_mut(id) {
+                    device.bypassed = false;
+                }
             }
             self.touched();
             self.settle();
@@ -656,6 +812,164 @@ fn lock_steps(text: &str, length: usize, sweep: bool) -> Result<Vec<usize>, Stri
 mod tests {
     use super::*;
     use crate::sequencing::PatternId;
+
+    fn gesture_stage() -> Stage {
+        let mut s = Stage::new();
+        s.song
+            .add_device(0, crate::devices::DeviceKind::Acid)
+            .unwrap();
+        s.song.furnish();
+        let id = s.song.tracks[0].blocks[0].pattern_id;
+        s.inside = Some(super::super::Opened {
+            pattern: id,
+            track: 0,
+        });
+        s.settle();
+        s
+    }
+
+    #[test]
+    fn gate_cycles_replace_repeated_note_rewrites_on_any_division() {
+        let mut p = pattern();
+        run(
+            &mut p,
+            "rhythm 16 10,17,24 gate 8,8,5 pitch 11,6,2 vel 62,70,58",
+        )
+        .unwrap();
+        assert_eq!(
+            [
+                p.trig(10).notes[0].length_ticks,
+                p.trig(17).notes[0].length_ticks,
+                p.trig(24).notes[0].length_ticks
+            ],
+            [96, 96, 60]
+        );
+        run(&mut p, "group 4 3,3,2 at 8 gate 2,3,1").unwrap();
+        assert_eq!(p.trig(32).notes[0].length_ticks, 96);
+        run(&mut p, "ratchet 64 240:256 spacing 2:1 gate 4:1").unwrap();
+        for (tick, step, index) in note_positions(&p, None) {
+            if tick >= 720 {
+                assert!(tick + p.trig(step).notes[index].length_ticks <= 768);
+            }
+        }
+        for bad in [
+            "rhythm 16 0 gate 0",
+            "rhythm 16 0 gate 1,0",
+            "rhythm 16 0 gate NaN",
+            "rhythm 16 0 gate -1:2",
+        ] {
+            assert!(run(&mut p, bad).is_err());
+        }
+    }
+
+    #[test]
+    fn bundled_locks_match_separate_edits_and_undo_all_targets_once() {
+        let mut s = gesture_stage();
+        let before = s.song.clone();
+        for cmd in [
+            "lock ornament murki at 96,192",
+            "lock ornament_time 125ms at 96,192",
+            "lock room.mix 20% at 96,192",
+            "lock echo.mix 15% at 96,192",
+        ] {
+            assert!(s.apply_phrase_command(cmd));
+        }
+        let separate = s.song.clone();
+        for _ in 0..4 {
+            let _ = s.apply(super::super::StageIntent::Undo);
+        }
+        assert_eq!(s.song, before);
+        assert!(s.apply_phrase_command(
+            "lock ornament=murki;ornament_time=125ms;room.mix=20%;echo.mix=15% at 96,192"
+        ));
+        assert_eq!(s.song, separate);
+        let _ = s.apply(super::super::StageIntent::Undo);
+        assert_eq!(s.song, before);
+        let revision = s.revision();
+        for bad in [
+            "lock room.mix=22%;echo.mix=101% at 96",
+            "lock room.mix=22%;missing=1 at 96",
+            "lock cutoff=1000;machine.cutoff=2000 at 96",
+            "lock cutoff=1000; at 96",
+            "lock cutoff=1000 at 97",
+            "lock cutoff=1000 at 96 at 192",
+            "lock cutoff=1000 every 192",
+            "lock cutoff=1000 at 96 trailing",
+            "lock cutoff=1000;cutoff+=1 at 96",
+        ] {
+            assert!(!s.apply_phrase_command(bad), "{bad}");
+            assert_eq!(s.song, before, "{bad}");
+            assert_eq!(s.revision(), revision);
+        }
+    }
+
+    #[test]
+    fn repeating_multi_target_sweeps_preserve_each_endpoint_and_slide() {
+        let mut s = gesture_stage();
+        let before = s.song.clone();
+        for at in [0, 192, 384, 576] {
+            assert!(
+                s.apply_phrase_command(&format!("sweep cutoff 800Hz:4kHz 2 at {at}:{}", at + 96))
+            );
+            assert!(
+                s.apply_phrase_command(&format!("sweep room.mix 5%:25% 2 at {at}:{}", at + 96))
+            );
+        }
+        let separate = s.song.clone();
+        for _ in 0..8 {
+            let _ = s.apply(super::super::StageIntent::Undo);
+        }
+        assert!(s.apply_phrase_command(
+            "sweep cutoff=800Hz:4kHz;room.mix=5%:25% curve 2 at 0:96 every 192"
+        ));
+        assert_eq!(s.song, separate);
+        let _ = s.apply(super::super::StageIntent::Undo);
+        assert_eq!(s.song, before);
+        for bad in [
+            "sweep cutoff=800:4000 at 0:96 every 48",
+            "sweep cutoff=800:4000 at 0:96 every 95",
+            "sweep cutoff=800:4000 at 0:96 every 228",
+            "sweep cutoff=800:4000 every 192",
+            "sweep cutoff=800:4000;ornament=0:1 at 0:96",
+            "sweep cutoff=800:4000 at 0:12",
+            "sweep cutoff=800:4000 curve 0 at 0:96",
+            "sweep cutoff=800:4000 curve NaN at 0:96",
+            "sweep cutoff 800:4000 2 curve 3 at 0:96",
+        ] {
+            assert!(!s.apply_phrase_command(bad), "{bad}");
+            assert_eq!(s.song, before);
+        }
+    }
+
+    #[test]
+    fn attached_ratchet_sweep_is_atomic_and_uses_tick_correct_window() {
+        let mut s = gesture_stage();
+        let before = s.song.clone();
+        assert!(s.apply_phrase_command("ratchet 64 192:256 spacing 4:1 gate 1 vel 30:100 pitch 0"));
+        assert!(s.apply_phrase_command("sweep cutoff 800:8000 at 576:768"));
+        let separate = s.song.clone();
+        let _ = s.apply(super::super::StageIntent::Undo);
+        let _ = s.apply(super::super::StageIntent::Undo);
+        assert!(s.apply_phrase_command(
+            "ratchet 64 192:256 spacing 4:1 gate 1 vel 30:100 pitch 0\t sweep\tcutoff=800:8000"
+        ));
+        assert_eq!(s.song, separate);
+        let _ = s.apply(super::super::StageIntent::Undo);
+        assert_eq!(s.song, before);
+        let revision = s.revision();
+        for bad in [
+            "ratchet 64 192:256 sweep cutoff=800:800000",
+            "ratchet 64 193:256 sweep cutoff=800:8000",
+            "ratchet 64 192:256 sweep room.mix=0:20;ornament=0:2",
+            "ratchet 64 192:256 sweep cutoff=800:8000 at 0:192",
+            "ratchet 64 192:256 sweep cutoff=800:8000 every 192",
+            "ratchet 0 0:4 sweep cutoff=800:8000",
+        ] {
+            assert!(!s.apply_phrase_command(bad), "{bad}");
+            assert_eq!(s.song, before);
+            assert_eq!(s.revision(), revision);
+        }
+    }
 
     #[test]
     fn explicit_length_updates_placements_atomically_and_refuses_cropping() {

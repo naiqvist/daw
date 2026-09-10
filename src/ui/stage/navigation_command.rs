@@ -7,6 +7,10 @@ pub(super) const COMMANDS: &[crate::ui::palette::TypedCommand] = &[
         name: "go",
         usage: "go track <name|#stable-id> | go clip <name|#stable-id> | go bar <1-based> | go tick <0-based> · moves cursor, not playhead",
     },
+    crate::ui::palette::TypedCommand {
+        name: "seek",
+        usage: "seek bar <1-based> | seek tick <0-based> | seek cursor · move playhead, keep edits/focus; not while recording",
+    },
 ];
 
 fn named<'a>(
@@ -59,6 +63,45 @@ fn bar_tick(song: &Song, bar: usize) -> Result<usize, String> {
 }
 
 impl Stage {
+    pub(super) fn apply_seek_command(&mut self, input: &str) -> bool {
+        let result = (|| {
+            if self.recording() {
+                return Err("stop recording before seeking".to_owned());
+            }
+            let words: Vec<_> = input.split_whitespace().collect();
+            let tick = match words.as_slice() {
+                ["seek", "bar", n] => bar_tick(&self.song, n.parse().map_err(|_| "invalid bar")?)?,
+                ["seek", "tick", n] => n
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| *n <= 1_000_000_000)
+                    .ok_or("tick must be 0..1000000000")?,
+                ["seek", "cursor"] => self.arrangement.tick,
+                _ => return Err("seek bar <number>, seek tick <number>, or seek cursor".into()),
+            };
+            let before = self.transport;
+            self.transport.seek(tick);
+            if self.transport != before {
+                // This is a user request, unlike transport_seek(), which poses
+                // the clock for tests. The host must send the discontinuity
+                // through the existing transport ring (all sounding voices off).
+                self.seeks = self.seeks.wrapping_add(1);
+            }
+            self.notice = Some(format!(
+                "seek · playhead {} · tick {tick}",
+                Place::of(&self.song, tick).readout()
+            ));
+            Ok::<_, String>(())
+        })();
+        match result {
+            Ok(()) => true,
+            Err(error) => {
+                self.notice = Some(format!("REFUSED seek · {error}"));
+                false
+            }
+        }
+    }
+
     fn navigate_command(&mut self, input: &str) -> Result<(), String> {
         let mut words = input.splitn(3, char::is_whitespace);
         let _ = words.next();
@@ -189,6 +232,71 @@ impl Stage {
 mod tests {
     use super::*;
     #[test]
+    fn seek_is_explicit_non_editing_and_signals_exactly_one_discontinuity() {
+        let mut s = Stage::new();
+        assert!(s.apply_timeline_command("go bar 9"));
+        assert!(s.apply_timeline_command("meter"));
+        let original = s.song.clone();
+        let revision = s.revision();
+        let seeks = s.seeks();
+        assert!(s.apply_timeline_command("seek bar 5"));
+        assert_eq!(s.transport.tick(), 4 * 192);
+        assert_eq!(s.seeks(), seeks + 1);
+        assert!(s.meter.open);
+        assert!(s.apply_timeline_command("seek bar 5"));
+        assert_eq!(s.seeks(), seeks + 1);
+        assert!(s.apply_timeline_command("seek cursor"));
+        assert_eq!(s.transport.tick(), 8 * 192);
+        assert_eq!(s.song, original);
+        assert_eq!(s.revision(), revision);
+        let seeks = s.seeks();
+        for bad in [
+            "seek bar 0",
+            "seek tick -1",
+            "seek tick 1000000001",
+            "seek tick 12 extra",
+            "seek cursor extra",
+            "seek",
+        ] {
+            assert!(!s.apply_timeline_command(bad));
+            assert_eq!(s.transport.tick(), 8 * 192);
+            assert_eq!(s.seeks(), seeks);
+        }
+    }
+
+    #[test]
+    fn seek_respects_meter_and_refuses_recording() {
+        let mut s = Stage::new();
+        assert!(s.apply_timeline_command("meter 7/8"));
+        assert!(s.apply_timeline_command("seek bar 3"));
+        assert_eq!(s.transport.tick(), 336);
+        s.transport
+            .set_motion(super::super::transport::Motion::Recording);
+        let seeks = s.seeks();
+        assert!(!s.apply_timeline_command("seek tick 0"));
+        assert_eq!(s.transport.tick(), 336);
+        assert_eq!(s.seeks(), seeks);
+    }
+
+    #[test]
+    fn seek_realigns_fractional_time_without_changing_playback_mode() {
+        let mut s = Stage::new();
+        s.transport.set_mode(super::super::transport::Mode::Song);
+        s.transport
+            .set_motion(super::super::transport::Motion::Rolling);
+        s.transport.follow(0.01);
+        assert_eq!(s.transport.tick(), 0);
+        let seeks = s.seeks();
+        assert!(s.apply_timeline_command("seek tick 0"));
+        assert_eq!(s.seeks(), seeks + 1);
+        assert_eq!(s.transport.mode(), super::super::transport::Mode::Song);
+        assert_eq!(
+            s.transport.motion(),
+            super::super::transport::Motion::Rolling
+        );
+        assert_eq!(s.transport.beat_phase(), 0.0);
+    }
+    #[test]
     fn identity_survives_reorder_and_navigation_does_not_edit_or_seek() {
         let mut s = Stage::new();
         let id = s.song.tracks[0].id;
@@ -212,14 +320,16 @@ mod tests {
 
     #[test]
     fn go_leaves_tracker_without_editing_or_recompiling_the_song() {
-        let mut s=Stage::new();
+        let mut s = Stage::new();
         assert!(s.apply_timeline_command("meter"));
-        assert_eq!(s.scope_context(),super::super::keymap::ScopeContext::Meter);
-        let song=s.song.clone();let revision=s.revision();
+        assert_eq!(s.scope_context(), super::super::keymap::ScopeContext::Meter);
+        let song = s.song.clone();
+        let revision = s.revision();
         assert!(s.apply_timeline_command("go bar 3"));
-        assert_eq!(s.scope_context(),super::super::keymap::ScopeContext::Song);
-        assert_eq!(s.arrangement.tick,384);
-        assert_eq!(s.song,song);assert_eq!(s.revision(),revision);
+        assert_eq!(s.scope_context(), super::super::keymap::ScopeContext::Song);
+        assert_eq!(s.arrangement.tick, 384);
+        assert_eq!(s.song, song);
+        assert_eq!(s.revision(), revision);
     }
 
     #[test]
