@@ -33,6 +33,9 @@ const KEY_GAP: f32 = 6.0;
 /// How far a key cell sits inside the row, top and bottom.
 /// @tune 0..12 px
 const KEY_INSET: f32 = 3.0;
+/// The page-key glyph's box, square.
+/// @tune 8..28 px
+const KEY_ICON: f32 = 14.0;
 
 struct WindowLayout {
     rect: egui::Rect,
@@ -115,15 +118,38 @@ impl Stage {
                 egui::Stroke::new(1.0, line),
                 egui::StrokeKind::Inside,
             );
+            // Icon, then the key's number, then its word — the
+            // reference's order and its spacing, measured off the cell's
+            // left edge: glyph at +18, "Fn" at +42, the word at +55.
+            let glyph = crate::tune!(KEY_ICON);
+            let ink = if active { c.bright } else { c.fg };
+            // F8 is the odd one in the drawing and stays odd here: it has
+            // no word, so its number and its cog are one centred pair with
+            // the label FIRST. Every other key reads glyph, number, word.
+            let (icon_x, label_x) = if index == 7 {
+                let pair = 13.0 + 6.0 + glyph;
+                let start = cell.center().x - pair * 0.5;
+                (start + 13.0 + 6.0, start)
+            } else {
+                (cell.left() + 18.0, cell.left() + 42.0)
+            };
+            let box_ = egui::Rect::from_center_size(
+                egui::pos2(icon_x + glyph * 0.5, cell.center().y),
+                egui::vec2(glyph, glyph),
+            );
+            super::keyicon::draw(painter, box_, key, ink);
+            if index == 7 {
+                super::keyicon::cog_hole(painter, box_, top);
+            }
             painter.text(
-                egui::pos2(cell.left() + PAD, cell.center().y),
+                egui::pos2(label_x, cell.center().y),
                 egui::Align2::LEFT_CENTER,
                 format!("F{}", index + 1),
                 page_font.clone(),
                 c.dim,
             );
             painter.text(
-                egui::pos2(cell.left() + 27.0, cell.center().y),
+                egui::pos2(cell.left() + 63.0, cell.center().y),
                 egui::Align2::LEFT_CENTER,
                 self.deck_key_word(key),
                 page_font.clone(),
@@ -140,7 +166,7 @@ impl Stage {
             for pip in 0..count.min(8) {
                 painter.rect_filled(
                     egui::Rect::from_min_size(
-                        egui::pos2(cell.left() + 27.0 + pip as f32 * 5.0, pip_y),
+                        egui::pos2(cell.left() + 63.0 + pip as f32 * 5.0, pip_y),
                         egui::vec2(3.0, 1.0),
                     ),
                     0.0,

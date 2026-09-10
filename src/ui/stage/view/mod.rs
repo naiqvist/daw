@@ -26,6 +26,7 @@ mod heads;
 mod help;
 mod input;
 mod inspector;
+mod keyicon;
 mod kit_card;
 mod lab;
 mod lattice;
