@@ -21,7 +21,7 @@ use crate::PROFONT;
 
 /// The field's inset from the window, on every side.
 /// @tune 0..64 px
-pub(super) const MARGIN: f32 = 16.0;
+pub(super) const MARGIN: f32 = 21.0;
 /// The scene gutter, left of the first column: room for a row's number.
 /// @tune 0..64 px
 pub(super) const GUTTER: f32 = 28.0;
@@ -30,7 +30,7 @@ pub(super) const GUTTER: f32 = 28.0;
 pub(super) const HEAD_W: f32 = 96.0;
 /// One head's height.
 /// @tune 24..96 px
-pub(super) const HEAD_H: f32 = 48.0;
+pub(super) const HEAD_H: f32 = 41.0;
 /// Between two heads, and between the last head and the master.
 /// @tune 0..32 px
 pub(super) const GAP: f32 = 8.0;

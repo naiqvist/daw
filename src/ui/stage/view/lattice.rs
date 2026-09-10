@@ -25,10 +25,10 @@ use eframe::egui;
 
 /// One row of the lattice.
 /// @tune 16..48 px
-const ROW_H: f32 = 24.0;
+const ROW_H: f32 = 28.4;
 /// Between the heads' foot and the first row.
 /// @tune 0..32 px
-const HEAD_GAP: f32 = 8.0;
+const HEAD_GAP: f32 = 12.0;
 /// The empty slot's dot.
 /// @tune 1..6 px
 const DOT: f32 = 2.0;

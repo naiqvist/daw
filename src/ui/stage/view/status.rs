@@ -24,10 +24,10 @@ const LOAD_SEGMENTS: usize = 8;
 
 /// The title row's height.
 /// @tune 12..40 px
-pub(super) const TITLE_H: f32 = 22.0;
+pub(super) const TITLE_H: f32 = 32.0;
 /// The status strip's height.
 /// @tune 12..40 px
-pub(super) const STATUS_H: f32 = 22.0;
+pub(super) const STATUS_H: f32 = 37.0;
 const TYPE_PX: f32 = 12.0;
 const PAD: f32 = 16.0;
 /// Air between a field's blue name and its value. One ProFont cell keeps

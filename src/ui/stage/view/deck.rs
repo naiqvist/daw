@@ -11,7 +11,7 @@ use eframe::egui;
 
 /// One compact row between title and field: the eight keys.
 /// @tune 18..40 px
-const DECK_H: f32 = 24.0;
+const DECK_H: f32 = 32.0;
 const PAD: f32 = 5.0;
 /// @tune 16..32 px
 const WINDOW_TITLE_H: f32 = 22.0;
