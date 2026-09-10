@@ -153,6 +153,7 @@ impl Stage {
         self.browser = None;
         self.chain = None;
         self.mixing = false;
+        self.meter.close();
         self.song_view = true;
         self.arrangement.clear_selection();
         self.arrangement.hold = None;
@@ -207,6 +208,18 @@ mod tests {
         assert!(!s.apply_timeline_command("go track #999999"));
         assert_eq!(s.arrangement, cursor);
         assert_eq!(s.song, original);
+    }
+
+    #[test]
+    fn go_leaves_tracker_without_editing_or_recompiling_the_song() {
+        let mut s=Stage::new();
+        assert!(s.apply_timeline_command("meter"));
+        assert_eq!(s.scope_context(),super::super::keymap::ScopeContext::Meter);
+        let song=s.song.clone();let revision=s.revision();
+        assert!(s.apply_timeline_command("go bar 3"));
+        assert_eq!(s.scope_context(),super::super::keymap::ScopeContext::Song);
+        assert_eq!(s.arrangement.tick,384);
+        assert_eq!(s.song,song);assert_eq!(s.revision(),revision);
     }
 
     #[test]

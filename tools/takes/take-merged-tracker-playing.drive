@@ -1,0 +1,26 @@
+# Prepared Spectral arrangement; start Song playback before opening the tracker.
+# No musical edits, fixed waits, or mid-run interventions.
+pace 1
+timeout 60
+key ctrl+shift+p
+text go bar 1
+key Enter
+key Space
+until play bar 002
+key ctrl+shift+r
+until scope METER
+shot /tmp/tracker-spectral-playing-merged.png
+key ArrowDown
+key ArrowRight
+key Enter
+until play bar 003
+key ctrl+shift+p
+text go bar 1
+key Enter
+until scope SONG
+key Space
+key ctrl+shift+p
+text visual off
+key Enter
+until VISUAL OFF
+echo TAKE COMPLETE

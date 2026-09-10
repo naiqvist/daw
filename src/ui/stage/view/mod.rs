@@ -31,6 +31,9 @@ mod lab;
 mod lattice;
 mod log;
 mod matrix;
+mod meter;
+#[cfg(test)]
+mod meter_perf_tests;
 mod midi_lab;
 mod midi_ladder;
 mod mixer;
@@ -49,6 +52,10 @@ mod song;
 mod stab_card;
 pub(in crate::ui::stage) mod status;
 mod strip;
+#[cfg(feature = "visuals")]
+mod visuals;
+#[cfg(test)]
+mod parameter_tests;
 mod telemetry;
 mod tray;
 mod utility;
@@ -79,7 +86,7 @@ const TIMELINE_COMMANDS: [crate::ui::palette::TypedCommand; 8] = [
     },
     crate::ui::palette::TypedCommand {
         name: "meter",
-        usage: "meter <N>/<D>  |  meter clear",
+        usage: "meter (tracker)  |  meter <N>/<D>  |  meter clear",
     },
     crate::ui::palette::TypedCommand {
         name: "lane",
@@ -453,6 +460,10 @@ impl Stage {
         // The lab is a full-screen mode: one room from the title to the
         // status line, with no deck strip and no tray under it.
         let lab_room = egui::Rect::from_min_max(layout.deck.min, layout.status.right_top());
+        // The meter takes the same room the lab does, and for the same
+        // reason: its subject is the whole song across the whole bar, and
+        // a page row it cannot answer would be a row of dead keys.
+        let meter_room = lab_room;
         // The field is registered to the glass: marks at its corners.
         chassis::marks(
             &painter,
@@ -460,13 +471,15 @@ impl Stage {
                 modulation_room.shrink(4.0)
             } else if self.lab.open {
                 lab_room.shrink(4.0)
+            } else if self.meter_open() {
+                meter_room.shrink(4.0)
             } else {
                 layout.field.shrink(4.0)
             },
             10.0,
         );
         self.draw_title(&painter, layout.title);
-        if !self.lab.open {
+        if !self.lab.open && !self.meter_open() {
             self.draw_deck(&painter, layout.deck);
         }
         let anchor = if self.modulation.is_some() {
@@ -479,6 +492,10 @@ impl Stage {
         } else if self.lab.open {
             self.draw_lab(ui, &painter, lab_room);
             self.draw_help(&painter, lab_room);
+            None
+        } else if self.meter_open() {
+            self.draw_meter(&painter, meter_room);
+            self.draw_help(&painter, meter_room);
             None
         } else {
             if self.sample.is_some() {

@@ -46,6 +46,8 @@ use daw::targets::{
 use daw::tune;
 // The shared shell renderer resolves its native scene registry through this root.
 use daw::ui;
+#[cfg(feature = "visuals")]
+use daw::visuals;
 use daw::ui::action::UiAction;
 use daw::ui::affordance::{Afford, Affords};
 use daw::ui::device;

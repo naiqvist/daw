@@ -150,6 +150,7 @@ pub(in crate::ui::stage) fn scope_word(scope: ScopeContext) -> &'static str {
         ScopeContext::KilnFilter => "FILTER",
         ScopeContext::MidiLab => "MIDILAB",
         ScopeContext::LabMenu => "KINDS",
+        ScopeContext::Meter => "METER",
     }
 }
 

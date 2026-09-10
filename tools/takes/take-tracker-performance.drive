@@ -1,0 +1,30 @@
+# Native regression on the dense Spectral arrangement, after redraw fixes.
+# Navigate and follow while rolling; leave the tracker open and stopped.
+pace 1
+timeout 60
+key ctrl+shift+p
+text go bar 1
+key Enter
+key Space
+until play bar 002
+key ctrl+shift+r
+until scope METER
+shot /tmp/tracker-performance-playing.png
+key ArrowDown
+key ArrowRight
+key ArrowRight
+key Enter
+until play bar 004
+key ctrl+shift+p
+text go bar 1
+key Enter
+until scope SONG
+key Space
+key ctrl+shift+p
+text visual off
+key Enter
+until VISUAL OFF
+key ctrl+shift+r
+until scope METER
+shot /tmp/tracker-performance-stopped.png
+echo TAKE COMPLETE

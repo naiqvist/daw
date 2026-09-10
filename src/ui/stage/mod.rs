@@ -34,6 +34,7 @@ mod keymap;
 mod kiln;
 mod lab;
 mod matrix;
+mod meter;
 mod midi_lab;
 mod midi_ladder;
 mod mixer;
@@ -87,7 +88,7 @@ pub use deck::SlotView;
 pub use grid::{
     FocusColumn, FocusGrid, FocusLattice, FocusRow, FocusScope, FocusStack, Miniature, Step,
 };
-pub use keymap::{ForgeIntent, SampleIntent, SongIntent, StageIntent};
+pub use keymap::{ForgeIntent, MeterIntent, SampleIntent, SongIntent, StageIntent};
 pub use mixer::Reading;
 pub use sample::{Audition, SampleData};
 pub use scenes::Address;
@@ -617,6 +618,11 @@ pub struct Stage {
     sample: Option<SampleEditor>,
     /// The forge, while it is up: one sCOMP, full screen.
     forge: Option<Forge>,
+    /// The meter. Not an `Option`, unlike every other room here,
+    /// because its stream of answered verbs is recorded whether or not
+    /// anyone is watching it — a section that only remembered what
+    /// happened while it was open would open onto nothing every time.
+    meter: meter::Meter,
     /// The file the editor shows, once the host has handed it in. Kept
     /// across the editor closing and opening again on the same file, so
     /// the second look is instant; replaced when the file differs.
@@ -892,6 +898,7 @@ impl Stage {
             mod_wire_gesture: false,
             sample: None,
             forge: None,
+            meter: meter::Meter::default(),
             sample_data: None,
             thumbs: std::collections::HashMap::new(),
             scomp_cards: Vec::new(),
@@ -1090,6 +1097,10 @@ impl Stage {
         let changed = match command {
             // The lab, from the palette as from the chord.
             "lab" if argument.is_empty() => return self.toggle_lab().is_ok(),
+            // The meter, from the palette as from the chord.
+            "meter" if argument.is_empty() => {
+                return self.apply_meter(MeterIntent::Open).is_ok();
+            }
             "midi" | "midilab" => return self.open_midi_lab(argument),
             "tempo" if argument.eq_ignore_ascii_case("clear") => self.song.remove_tempo_mark(at),
             "tempo" => argument
@@ -2252,6 +2263,7 @@ impl Stage {
     /// moves on its own between frames.
     fn tick_clock(&mut self, dt: f32) {
         self.frame_dt = dt;
+        self.meter.tick(dt);
         match self.engine_beat.take() {
             Some(beat) if self.transport.motion().is_rolling() => {
                 self.transport.follow(beat);
@@ -2338,6 +2350,8 @@ impl Stage {
             keymap::ScopeContext::Sample
         } else if self.forge.is_some() {
             keymap::ScopeContext::Forge
+        } else if self.meter.open {
+            keymap::ScopeContext::Meter
         } else if self.plock_editor.is_some() {
             keymap::ScopeContext::Plock
         } else if self.trig_menu.is_some() {
@@ -4615,6 +4629,7 @@ impl Stage {
                 reason: RefusalReason::Unavailable,
             };
             self.refusal = Some(refusal);
+            self.meter_note(intent, true);
             return ApplyOutcome::Refused(refusal);
         }
         let result = match intent {
@@ -5041,6 +5056,21 @@ impl Stage {
             // The cutting room. Its own vocabulary, over one file.
             StageIntent::Sample(intent) => self.apply_sample(intent),
             StageIntent::Forge(intent) => self.apply_forge(intent),
+            // The meter. Every verb is a way of looking; none of them
+            // can touch the song.
+            StageIntent::Meter(intent) => self.apply_meter(intent),
+            // Escape leaves the outermost thing, and while a block is
+            // drawn that is the block. One press puts the selection
+            // away, the next leaves the section — the same two-stage
+            // escape the step grid and the trig menu already have.
+            StageIntent::Escape if self.meter.open && self.meter.anchor.is_some() => {
+                self.meter.anchor = None;
+                Ok(())
+            }
+            StageIntent::Escape if self.meter.open => {
+                self.meter.close();
+                Ok(())
+            }
             StageIntent::Escape if self.forge.is_some() => {
                 self.forge = None;
                 Ok(())
@@ -5495,15 +5525,12 @@ impl Stage {
             StageIntent::Rewind => {
                 let before = self.transport;
                 self.transport.rewind();
-                if self.transport == before {
-                    // Rewind is an absolute request, already satisfied here.
-                    Ok(())
-                } else {
-                    // The stage moved its own clock; the host has to move
-                    // the engine's to match, and this is how it knows.
+                // Rewind is an idempotent absolute navigation request. Only
+                // a position change needs an audio discontinuity.
+                if self.transport != before {
                     self.seeks = self.seeks.wrapping_add(1);
-                    Ok(())
                 }
+                Ok(())
             }
             StageIntent::Help => {
                 self.help = !self.help;
@@ -5896,6 +5923,7 @@ impl Stage {
         if self.plock_editor.is_none() {
             self.settle();
         }
+        self.meter_note(intent, result.is_err());
         match result {
             Ok(()) => ApplyOutcome::Changed,
             Err(reason) => {
@@ -9205,6 +9233,9 @@ mod tests {
                         let _ = stage.handle_key(Mods::COMMAND.plus(Mods::SHIFT), Key::L);
                         let _ = stage.handle_key(Mods::ALT, Key::Enter);
                     }
+                    keymap::ScopeContext::Meter => {
+                        let _ = stage.handle_key(Mods::COMMAND.plus(Mods::SHIFT), Key::R);
+                    }
                     keymap::ScopeContext::Root => {}
                 }
                 // Everything a key is allowed to change. A new piece of
@@ -9213,7 +9244,7 @@ mod tests {
                 // test still called the key a liar.
                 let before = (
                     stage.focus.clone(),
-                    stage.transport,
+                    (stage.transport, stage.seeks, stage.palette.is_open()),
                     stage.help,
                     stage.browser.clone(),
                     stage.mixing,
@@ -9247,6 +9278,18 @@ mod tests {
                                 .forge
                                 .as_ref()
                                 .map(|forge| (forge.row, forge.pass, forge.snapshot.is_some())),
+                            // Where the meter is LOOKING. Its stream is
+                            // deliberately absent: it changes on every
+                            // answered verb, so a tuple that held it
+                            // would call every key a change and this
+                            // test would assert nothing at all.
+                            (
+                                stage.meter.open,
+                                stage.meter.held,
+                                stage.meter.at,
+                                stage.meter.anchor,
+                                stage.meter.add,
+                            ),
                             stage.session_selection.clone(),
                             stage.session_clipboard.clone(),
                             stage.block_clipboard.clone(),
@@ -9263,10 +9306,9 @@ mod tests {
 
                 match stage.handle_key(modifiers, key) {
                     Some(ApplyOutcome::Changed) => {
-                        assert_ne!(
-                            (
+                        let after = (
                                 stage.focus.clone(),
-                                stage.transport,
+                                (stage.transport, stage.seeks, stage.palette.is_open()),
                                 stage.help,
                                 stage.browser.clone(),
                                 stage.mixing,
@@ -9299,6 +9341,13 @@ mod tests {
                                             forge.pass,
                                             forge.snapshot.is_some()
                                         )),
+                                        (
+                                            stage.meter.open,
+                                            stage.meter.held,
+                                            stage.meter.at,
+                                            stage.meter.anchor,
+                                            stage.meter.add,
+                                        ),
                                         stage.session_selection.clone(),
                                         stage.session_clipboard.clone(),
                                         stage.block_clipboard.clone(),
@@ -9311,17 +9360,21 @@ mod tests {
                                     stage.takes.clone(),
                                     (stage.export.clone(), stage.utility.page()),
                                 ),
-                            ),
-                            before,
-                            "{scope:?} + {key:?} lied about changing"
-                        );
+                            );
+                        if _intent == StageIntent::Rewind && before.1.0.tick() == 0 {
+                            // Home at zero intentionally succeeds without
+                            // re-seeking the engine or mutating any fact.
+                            assert_eq!(after, before, "idempotent Home mutated state");
+                        } else {
+                            assert_ne!(after, before, "{scope:?} + {key:?} lied about changing");
+                        }
                         assert_eq!(stage.refusal, None);
                     }
                     Some(ApplyOutcome::Refused(refusal)) => {
                         assert_eq!(
                             (
                                 stage.focus.clone(),
-                                stage.transport,
+                                (stage.transport, stage.seeks, stage.palette.is_open()),
                                 stage.help,
                                 stage.browser.clone(),
                                 stage.mixing,
@@ -9354,6 +9407,13 @@ mod tests {
                                             forge.pass,
                                             forge.snapshot.is_some()
                                         )),
+                                        (
+                                            stage.meter.open,
+                                            stage.meter.held,
+                                            stage.meter.at,
+                                            stage.meter.anchor,
+                                            stage.meter.add,
+                                        ),
                                         stage.session_selection.clone(),
                                         stage.session_clipboard.clone(),
                                         stage.block_clipboard.clone(),
@@ -9419,6 +9479,9 @@ mod tests {
                 keymap::ScopeContext::LabMenu => {
                     let _ = stage.handle_key(Mods::COMMAND.plus(Mods::SHIFT), Key::L);
                     let _ = stage.handle_key(Mods::ALT, Key::Enter);
+                }
+                keymap::ScopeContext::Meter => {
+                    let _ = stage.handle_key(Mods::COMMAND.plus(Mods::SHIFT), Key::R);
                 }
                 keymap::ScopeContext::Root => {}
                 keymap::ScopeContext::Rename => unreachable!(),
@@ -10600,6 +10663,9 @@ mod tests {
                 keymap::ScopeContext::LabMenu => {
                     let _ = stage.handle_key(Mods::COMMAND.plus(Mods::SHIFT), Key::L);
                     let _ = stage.handle_key(Mods::ALT, Key::Enter);
+                }
+                keymap::ScopeContext::Meter => {
+                    let _ = stage.handle_key(Mods::COMMAND.plus(Mods::SHIFT), Key::R);
                 }
                 keymap::ScopeContext::Root => {}
                 keymap::ScopeContext::Nested => {

@@ -141,6 +141,26 @@ AAC: peak −4.70 dBFS, RMS −17.03 dBFS, zero clipped samples. Screenshot revi
 then found and corrected native BGRA capture order and preview gamma handling;
 the latter has an explicit GPU comparison against the sRGB exporter.
 
+The merged tracker/visuals TAKE (`take-merged-tracker-visuals.drive`) completed
+80 commands in 100.84 seconds, with no fixed waits, command refusals, or manual
+interventions. Its second export is
+`/home/naiqvist/Music/daw/renders/skin-coil-sky-visual-v2.mp4`: 5100 H.264 frames,
+1280×720 at 30 fps, stereo 48 kHz AAC, both streams exactly 170.000 seconds.
+Native screenshot colours now match the export. Off inspection reported
+`evaluations=0 · worker=false`; cancellation completed before the final export.
+
+Initial merge verification: feature-enabled and audio-only all-target checks passed,
+the native Stage built, and the final library run passed 3383 tests (4 ignored).
+All 12 visual-filtered tests, including the normally ignored real-GPU colour
+and cancellation checks, passed on the AMD Radeon 890M / RADV STRIX1 adapter.
+One earlier full-suite run intermittently lost the head impulse in
+`audio::bounce::tests::graph_latency_neither_leads_with_silence_nor_truncates_the_last_impulse`;
+it passed alone and on the full rerun. The bounce source/test and AudioClip
+streaming path predate this merge and were not changed. Keep this as a follow-up
+for streaming-readiness investigation, not a claim of resolved flakiness.
+The subsequent tracker performance fix has its independent benchmark and
+3387-pass full-suite receipt in `docs/tracker.md`.
+
 Future improvements should remain reusable: visual routing graphs and reusable
 subgraphs, shared modulator definitions, note-to-visual event extraction, a
 visual arrangement editor, and optional baked playback. Keep the agentic
