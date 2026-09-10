@@ -19,6 +19,21 @@ use eframe::egui;
 /// One beat cell on the strip.
 /// @tune 4..16 px
 const BEAT: f32 = 7.0;
+/// The five parts of the transport cluster, left to right.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Part {
+    Rewind,
+    Stop,
+    Play,
+    Record,
+    Forward,
+}
+/// One transport cell, square.
+/// @tune 12..40 px
+const TRANSPORT_CELL: f32 = 26.0;
+/// Between two transport cells.
+/// @tune 0..12 px
+const TRANSPORT_GAP: f32 = 3.0;
 /// The load meter's segments.
 const LOAD_SEGMENTS: usize = 8;
 
@@ -291,6 +306,87 @@ impl super::super::Stage {
     }
 
     /// The status strip: the transport, then the engine.
+    /// The transport, as five cells: rewind, stop, play, record, forward.
+    ///
+    /// A READOUT, not a control. This app is driven from the keyboard, so
+    /// a cell lights because the transport is in that state — never
+    /// because anything was clicked. The shape is the one every transport
+    /// has had since tape, which is the whole argument for it: the strip
+    /// already says ROLLING in words, and a word has to be read where
+    /// this is recognised.
+    fn draw_transport(&self, painter: &egui::Painter, at: egui::Rect) {
+        let c = palette::colours();
+        let motion = self.transport.motion();
+        let cell = crate::tune!(TRANSPORT_CELL);
+        let gap = crate::tune!(TRANSPORT_GAP);
+        // A filled triangle, pointing left or right, on the cell's centre.
+        let wedge = |mid: egui::Pos2, half: f32, right: bool, ink: egui::Color32| {
+            let d = if right { 1.0 } else { -1.0 };
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(mid.x - d * half * 0.62, mid.y - half),
+                    egui::pos2(mid.x - d * half * 0.62, mid.y + half),
+                    egui::pos2(mid.x + d * half * 0.90, mid.y),
+                ],
+                ink,
+                egui::Stroke::NONE,
+            ));
+        };
+        for (i, part) in [
+            Part::Rewind,
+            Part::Stop,
+            Part::Play,
+            Part::Record,
+            Part::Forward,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(at.min.x + i as f32 * (cell + gap), at.min.y),
+                egui::vec2(cell, cell),
+            );
+            // Only the part that IS the current motion is lit, and it is
+            // lit by its ground, not by a brighter glyph: a lit ground
+            // reads across the room, and a lit glyph reads as an
+            // enabled-looking button nobody can press.
+            let lit = match (part, motion) {
+                (Part::Play, Motion::Rolling) => Some(c.nominal),
+                (Part::Record, Motion::Recording) => Some(c.alert),
+                (Part::Stop, Motion::Stopped) => Some(c.edge),
+                _ => None,
+            };
+            // The strip itself is `panel`, so a resting cell has to be a
+            // RECESS to be seen at all — a panel cell on a panel strip is
+            // an invisible button. Down to the ground, glyph in `fg`.
+            painter.rect_filled(rect, 0.0, lit.unwrap_or(c.ground));
+            let ink = if lit.is_some() { c.ground } else { c.fg };
+            let mid = rect.center();
+            let half = cell * 0.26;
+            match part {
+                Part::Rewind => {
+                    wedge(egui::pos2(mid.x - half * 0.55, mid.y), half, false, ink);
+                    wedge(egui::pos2(mid.x + half * 0.75, mid.y), half, false, ink);
+                }
+                Part::Forward => {
+                    wedge(egui::pos2(mid.x - half * 0.75, mid.y), half, true, ink);
+                    wedge(egui::pos2(mid.x + half * 0.55, mid.y), half, true, ink);
+                }
+                Part::Stop => {
+                    painter.rect_filled(
+                        egui::Rect::from_center_size(mid, egui::vec2(half * 1.7, half * 1.7)),
+                        0.0,
+                        ink,
+                    );
+                }
+                Part::Play => wedge(mid, half, true, ink),
+                Part::Record => {
+                    painter.circle_filled(mid, half * 0.95, ink);
+                }
+            }
+        }
+    }
+
     pub(super) fn draw_status(&self, painter: &egui::Painter, strip: egui::Rect) {
         chassis::instrument_rail(painter, strip);
         let y = strip.center().y;
@@ -347,6 +443,21 @@ impl super::super::Stage {
                 None,
             );
         }
+
+        // The transport, centred on the strip as the mockups place it,
+        // but never at the cost of the words to its left: if the left
+        // group has grown (a long refusal, a held chord), the cluster is
+        // pushed right rather than drawn over.
+        let cell = crate::tune!(TRANSPORT_CELL);
+        let cluster_w = 5.0 * cell + 4.0 * crate::tune!(TRANSPORT_GAP);
+        let cluster_x = (strip.center().x - cluster_w * 0.5).max(transport_end + GAP);
+        self.draw_transport(
+            painter,
+            egui::Rect::from_min_size(
+                egui::pos2(cluster_x, y - cell * 0.5),
+                egui::vec2(cluster_w, cell),
+            ),
+        );
 
         // The engine. An honest absence occupies its space.
         let stream = self.vitals.stream();
