@@ -505,14 +505,18 @@ def main():
     au.add_argument("--normalise", action="store_true",
                     help="strip chrome and resample first")
     au.add_argument("--size", default="1280x800")
-    au.add_argument("--fuzz", type=int, default=6,
-                    help="percent; higher merges a gradient into one object")
+    au.add_argument("--fuzz", type=int, default=None,
+                    help="percent; omit to sweep and choose (recommended)")
     au.add_argument("--area", type=int, default=400, help="smallest object counted")
     au.add_argument("--min-side", type=int, default=10, dest="min_side")
     au.add_argument("--lit", type=int, default=60,
                     help="colour distance at which a row member counts as lit")
     au.add_argument("--limit", type=int, default=12, help="how many single panels to report")
     au.set_defaults(fn=cmd_auto)
+
+    rn = sub.add_parser("render", help="rebuild a picture from a spec, to score the measurement")
+    rn.add_argument("spec"); rn.add_argument("out")
+    rn.set_defaults(fn=cmd_render)
 
     a = p.parse_args()
     a.fn(a)
@@ -559,6 +563,41 @@ def components(img, fuzz, area):
     return sorted(out, key=lambda o: -o["area"])
 
 
+def choose_fuzz(img, area, min_side, verbose=True):
+    """Pick the fuzz that segments this image, by sweeping and reading the shape.
+
+    There is no good default. Fuzz has to bridge a panel's own gradient
+    without bridging the step between a panel and its ground, and how far
+    apart those two are is a property of the DESIGN. The default of 6%
+    suited the macOS concept and silently swallowed the KCalc display,
+    which sits only thirteen units per channel off its window ground — so
+    6% merged them and a whole panel vanished from the spec with no
+    complaint.
+
+    Object count against fuzz has a characteristic shape: a PLATEAU where
+    the segmentation is right, a spike above it where gradients start
+    splitting into bands, and a collapse beyond that as everything merges
+    into one. Take the highest fuzz still on the first plateau — the most
+    forgiving setting that has not yet begun merging things that differ.
+    """
+    counts = []
+    for f in (1, 2, 3, 4, 5, 6, 8, 10):
+        objs = components(img, f, area)
+        counts.append((f, len([o for o in objs if o["w"] >= min_side and o["h"] >= min_side])))
+    best, run = counts[0], []
+    for i, (f, n) in enumerate(counts):
+        if run and abs(n - run[-1][1]) > 0.25 * max(n, run[-1][1]):
+            break
+        run.append((f, n))
+    if run:
+        best = run[-1]
+    if verbose:
+        shape = "  ".join(f"{f}%:{n}" for f, n in counts)
+        print(f"fuzz sweep   {shape}")
+        print(f"chose {best[0]}% — highest still on the first plateau\n")
+    return best[0]
+
+
 def corner_radius(img, o, fill, tol=30):
     """How far in from the left the fill starts on the panel's first row.
 
@@ -579,7 +618,8 @@ def cmd_auto(a):
         cmd_normalise(argparse.Namespace(image=img, out=norm, size=a.size, chroma=35))
         img = norm
     w, h = size(img)
-    objs = components(img, a.fuzz, a.area)
+    fuzz = choose_fuzz(img, a.area, a.min_side) if a.fuzz is None else a.fuzz
+    objs = components(img, fuzz, a.area)
     if not objs:
         sys.exit("no components found; try a larger --fuzz or smaller --area")
     bg = objs[0]
@@ -591,7 +631,28 @@ def cmd_auto(a):
     panels = [o for o in objs[1:]
               if o["w"] >= a.min_side and o["h"] >= a.min_side
               and o["w"] * o["h"] >= a.area]
-    glyphs = len(objs) - 1 - len(panels)
+
+    # Drop nested near-duplicates. A fuzz low enough to keep a panel apart
+    # from its ground is often low enough to return that panel TWICE — once
+    # for its border ring and once for the fill inside it. Drawn back, the
+    # pair is a button with a doubled edge, and it scored WORSE than the
+    # run that had missed a whole panel. Keep the larger of any two that
+    # overlap by most of the smaller's area.
+    def overlap(p, q):
+        w = min(p["x"] + p["w"], q["x"] + q["w"]) - max(p["x"], q["x"])
+        h = min(p["y"] + p["h"], q["y"] + q["h"]) - max(p["y"], q["y"])
+        return max(0, w) * max(0, h)
+    kept = []
+    for o in sorted(panels, key=lambda o: -o["w"] * o["h"]):
+        small = o["w"] * o["h"]
+        if any(overlap(o, k) > 0.7 * small for k in kept):
+            continue
+        kept.append(o)
+    dropped = len(panels) - len(kept)
+    panels = kept
+    if dropped:
+        print(f"({dropped} nested duplicates dropped)\n")
+    glyphs = len(objs) - 1 - len(panels) - dropped
 
     # Repeated rows: panels sharing a top edge and a height are one row, and
     # a row is where the interesting question lives — rule, or hand-placed.
@@ -636,11 +697,11 @@ def cmd_auto(a):
         first = min(group, key=lambda o: sum(abs(i - j) for i, j in zip(o["colour"], base)))
         r = anatomy(img, first["x"], y, first["w"], ph)
         rad = corner_radius(img, first, r["top"]) if r["top"] else 0
+        odd = [o for o in group if not near(o["colour"], base, a.lit)]
         print(f"  cell    {hexs(r['top'])} -> {hexs(r['foot'])}"
               f"  {'gradient' if r['gradient'] else 'flat'}"
               f"  border {hexs(r['border'])}  radius ~{rad}")
         # A member far from the row's mean colour is the LIT one.
-        odd = [o for o in group if not near(o["colour"], base, a.lit)]
         for o in odd:
             print(f"  lit     index {group.index(o)}, {hexs(o['colour'])} — a state, not a style")
         spec["constants"] += [
@@ -648,10 +709,17 @@ def cmd_auto(a):
             dict(name=f"ROW{y}_GAP", value=gap, doc=f"Row at y {y}: between two cells.", min=0, max=32),
             dict(name=f"ROW{y}_H", value=ph, doc=f"Row at y {y}: one cell's height.", min=0, max=96),
         ]
-        spec["panels"].append(dict(
-            name=f"row at y{y}, cell", rect=[lead, y, round(even, 1), ph],
-            radius=rad, top=hexs(r["top"]), foot=hexs(r["foot"]),
-            border=hexs(r["border"]), border_px=1.0, shadow=0.0))
+        for o in group:
+            spec["panels"].append(dict(
+                name=f"row y{y} cell {group.index(o)}",
+                rect=[o["x"], o["y"], o["w"], o["h"]],
+                radius=rad,
+                # A lit member keeps its own colour; the rest share the
+                # row's material. Drawing them all from the representative
+                # would erase exactly the state the row is reporting.
+                top=hexs(o["colour"]) if o in odd else hexs(r["top"]),
+                foot=hexs(o["colour"]) if o in odd else hexs(r["foot"]),
+                border=hexs(r["border"]), border_px=1.0, shadow=0.0))
         print()
 
     for o in sorted(singles, key=lambda o: -o["area"])[: a.limit]:
@@ -672,6 +740,56 @@ def cmd_auto(a):
     if a.out:
         json.dump(spec, open(a.out, "w"), indent=2)
         print(f"\nwrote {a.out}   ->  tools/trace.py emit {a.out}")
+
+
+
+# ------------------------------------------------------------------ render
+#
+# The loop closed. A spec that cannot be drawn back into something like the
+# original is a spec that quietly lost something, and until you try you do
+# not know what. This rebuilds the picture from the JSON alone — no access
+# to the source image — so `diff` between the two is an honest score for the
+# MEASUREMENT rather than for anybody's eye.
+#
+# ImageMagick does the drawing here because it is already the dependency and
+# this is a check, not the product. The real consumer is a wgpu panel pass;
+# this and that read the same spec.
+
+
+def cmd_render(a):
+    spec = json.load(open(a.spec))
+    w, h = (int(v) for v in spec["raster"].split("x"))
+    ground = spec.get("roles", {}).get("ground", "#000000")
+    args = ["-size", f"{w}x{h}", f"xc:{ground}"]
+    tiles = []
+    import tempfile, os
+    tmp = tempfile.mkdtemp(prefix="trace-render-")
+    for i, pan in enumerate(spec.get("panels", [])):
+        x, y, pw, ph = (int(round(v)) for v in pan["rect"])
+        if pw < 1 or ph < 1:
+            continue
+        tile = os.path.join(tmp, f"{i}.png")
+        top, foot = pan.get("top", ground), pan.get("foot", ground)
+        # A vertical gradient, or a flat fill when the two ends agree.
+        if top == foot:
+            _magick(["-size", f"{pw}x{ph}", f"xc:{top}", tile])
+        else:
+            _magick(["-size", f"{pw}x{ph}", f"gradient:{top}-{foot}", tile])
+        r = int(pan.get("radius", 0))
+        border = pan.get("border")
+        draw = []
+        if border and pan.get("border_px", 0) >= 1:
+            draw = ["-fill", "none", "-stroke", border, "-strokewidth", "1",
+                    "-draw", f"roundrectangle 0.5,0.5 {pw - 1.5},{ph - 1.5} {r},{r}"]
+        if draw:
+            _magick([tile, *draw, tile])
+        tiles.append((tile, x, y))
+    _magick([*args, a.out])
+    for tile, x, y in tiles:
+        _magick([a.out, tile, "-geometry", f"+{x}+{y}", "-composite", a.out])
+    print(f"wrote {a.out}  ({len(tiles)} panels from {a.spec})")
+    print("NOTE: surfaces only. No text — glyphs are not measured, by design,")
+    print("so a recreation is the LAYOUT and the MATERIALS, never the words.")
 
 if __name__ == "__main__":
     main()
