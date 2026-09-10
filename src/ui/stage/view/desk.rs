@@ -26,6 +26,16 @@ const FOOT: f32 = 20.0;
 /// The meter's bar, inside its row.
 /// @tune 2..12 px
 const BAR_H: f32 = 3.0;
+/// The header band over the block: DESK, and the L and R that name the
+/// two lanes under it. Measured off the mockup's own raster at 1280x800,
+/// where the band runs y 120..147 against the app's former 121..136.
+/// @tune 12..48 px
+const HEADER_H: f32 = 28.0;
+/// Between the master plate's foot and the block's first content row.
+/// The header band grows upward from there, so this sets where the whole
+/// block sits: the mockup's content starts at y 148, the app's at 138.
+/// @tune 0..48 px
+const MASTER_GAP: f32 = 22.0;
 
 const BUSES: [(&str, usize); 4] = [
     ("01", vitals::BUS_METER),
@@ -101,7 +111,7 @@ impl super::super::Stage {
         let c = palette::colours();
         let font = egui::FontId::new(TYPE_PX, egui::FontFamily::Name(PROFONT.into()));
         let ch = TYPE_PX * 0.6;
-        let top = heads::master_rect(field).max.y + 12.0;
+        let top = heads::master_rect(field).max.y + crate::tune!(MASTER_GAP);
         let master = heads::master_rect(field);
         let bar_x0 = x0 + ch * 5.0;
         let pair_gap = ch * 1.5;
@@ -115,7 +125,7 @@ impl super::super::Stage {
         // that happen to be near each other. Painted first, so every
         // name, rail and meter below lands on top of it.
         let pad = ch;
-        let header_h = TYPE_PX + 6.0;
+        let header_h = crate::tune!(HEADER_H);
         let body_h = height() - crate::tune!(FOOT);
         painter.rect_filled(
             egui::Rect::from_min_max(
