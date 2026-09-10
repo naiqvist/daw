@@ -179,7 +179,11 @@ def cmd_bands(a):
 # ------------------------------------------------------------------ probe
 
 
-def anatomy(img, x, y, w, h):
+def inner_of(col, h):
+    return [c for c in col[2 : h - 2] if c]
+
+
+def anatomy(img, x, y, w, h, ground=None):
     """One element: border colour, and the fill at its head and foot.
 
     A raised cell in these mockups is not one flat colour — it carries a
@@ -211,13 +215,60 @@ def anatomy(img, x, y, w, h):
     head = mean(inner[: max(2, len(inner) // 4)])
     foot = mean(inner[-max(2, len(inner) // 4) :])
     delta = sum(abs(i - j) for i, j in zip(head, foot))
-    left = strip_row(img, y + h // 2, x, x + w)
-    sides = [c for c in (left[0], left[1], left[-2], left[-1]) if c]
-    edge = [c for c in (top_border, bottom_border) if c]
-    if sides:
-        edge.append(max(sides, key=luminance))
+    # Each side measured on its own, then the STRONGEST kept — not the
+    # average of four. Averaging is what made every recreated border come
+    # out dimmer than the original: a bright top edge got blended with
+    # three sides that were half background, and the result was a colour
+    # present nowhere in the drawing.
+    mid_row = strip_row(img, y + h // 2, x, x + w)
+    fill = mean(inner_of(col, h)) if col else None
+
+    # Each side offers its outermost TWO pixels, and the side keeps the
+    # one CLOSER to the fill. A bounding box can be a pixel wide of the
+    # object, and then the outermost pixel is whatever lies beyond it —
+    # for a key cell that is the dark gap between cells, which is further
+    # from the fill than the real border and would win a naive
+    # most-different test. Probing one rect off by a single pixel flipped
+    # the answer from #3f5979 to #010a1a, so the pair is taken and the
+    # outlier discarded.
+    def side(pair):
+        """The outermost pixel, unless it is really the page behind."""
+        cand = [c for c in pair if c]
+        if not cand:
+            return None
+        if ground and fill and len(cand) > 1:
+            d_ground = sum(abs(i - j) for i, j in zip(cand[0], ground))
+            d_fill = sum(abs(i - j) for i, j in zip(cand[0], fill))
+            if d_ground < d_fill:
+                return cand[1]
+        return cand[0]
+
+    # Each pair is ordered OUTERMOST FIRST, which for the bottom and right
+    # sides means reversing the slice. Getting that wrong silently read the
+    # inner pixel on two of the four sides: KCalc's buttons carry their
+    # border on the right edge, so the border came back as the fill and
+    # every recreated button lost its edge.
+    edges = [c for c in (
+        side(col[:2]),
+        side(col[-2:][::-1]),
+        side(mid_row[:2] if mid_row else []),
+        side(mid_row[-2:][::-1] if mid_row else []),
+    ) if c]
+    border = None
+    if edges and fill:
+        border = max(edges, key=lambda c: sum(abs(i - j) for i, j in zip(c, fill)))
+    elif edges:
+        border = edges[0]
+    # Thickness: walk in from the top until the fill is reached.
+    width_px = 0
+    if fill:
+        for c in col[:6]:
+            if c and near(c, fill, 24):
+                break
+            width_px += 1
     return dict(
-        border=mean(edge) if edge else None,
+        border=border,
+        border_px=max(1, min(width_px, 4)),
         top=head,
         foot=foot,
         gradient=delta >= 4,
@@ -227,7 +278,9 @@ def anatomy(img, x, y, w, h):
 
 def cmd_probe(a):
     x, y, w, h = (int(v) for v in a.rect.split(","))
-    r = anatomy(a.image, x, y, w, h)
+    # The page ground, so an overshooting rect can be told from a border.
+    corner = region(a.image, 0, 0, 3, 3).get((1, 1))
+    r = anatomy(a.image, x, y, w, h, corner)
     print(f"{a.image}  rect {x},{y} {w}x{h}")
     print(f"  border   {hexs(r['border'])}")
     print(f"  fill top {hexs(r['top'])}")
@@ -699,7 +752,7 @@ def cmd_auto(a):
         # material — a state described as a style.
         base = mean([o["colour"] for o in group])
         first = min(group, key=lambda o: sum(abs(i - j) for i, j in zip(o["colour"], base)))
-        r = anatomy(img, first["x"], y, first["w"], ph)
+        r = anatomy(img, first["x"], y, first["w"], ph, bg["colour"])
         rad = corner_radius(img, first, r["top"]) if r["top"] else 0
         odd = [o for o in group if not near(o["colour"], base, a.lit)]
         print(f"  cell    {hexs(r['top'])} -> {hexs(r['foot'])}"
@@ -723,13 +776,13 @@ def cmd_auto(a):
                 # would erase exactly the state the row is reporting.
                 top=hexs(o["colour"]) if o in odd else hexs(r["top"]),
                 foot=hexs(o["colour"]) if o in odd else hexs(r["foot"]),
-                border=hexs(r["border"]), border_px=1.0, shadow=0.0))
+                border=hexs(r["border"]), border_px=r.get("border_px", 1), shadow=0.0))
             panel_objs.append((spec["panels"][-1], o))
             spec["panels"][-1]["_fill"] = r["top"]
         print()
 
     for o in sorted(singles, key=lambda o: -o["area"])[: a.limit]:
-        r = anatomy(img, o["x"], o["y"], o["w"], o["h"])
+        r = anatomy(img, o["x"], o["y"], o["w"], o["h"], bg["colour"])
         rad = corner_radius(img, o, r["top"]) if r["top"] else 0
         print(f"PANEL {o['w']}x{o['h']} at {o['x']},{o['y']}   {hexs(o['colour'])}")
         print(f"  {hexs(r['top'])} -> {hexs(r['foot'])}"
@@ -738,7 +791,7 @@ def cmd_auto(a):
         spec["panels"].append(dict(
             name=f"panel at {o['x']},{o['y']}", rect=[o["x"], o["y"], o["w"], o["h"]],
             radius=rad, top=hexs(r["top"]), foot=hexs(r["foot"]),
-            border=hexs(r["border"]), border_px=1.0, shadow=0.0))
+            border=hexs(r["border"]), border_px=r.get("border_px", 1), shadow=0.0))
 
     spec["texts"] = []
     if not a.no_text:
@@ -784,6 +837,34 @@ def cmd_auto(a):
                 align="left"))
             loose += 1
         print(f"  {labelled} panel labels, {loose} loose words")
+        # Whatever had no readable word is a SHAPE. Extract it.
+        spec["icons"] = []
+        icondir = (a.out or "spec") + ".icons"
+        # EVERY panel's ink, whether or not OCR read a word in it. The
+        # string and the mask answer different questions: the app will draw
+        # a real glyph and wants the string, while a recreation has to be
+        # judged against the original and wants the shape. Relying on the
+        # string alone left KCalc's divide sign as a full stop and its
+        # multiply as an X, which is what OCR made of them.
+        for i, (pan, o) in enumerate(panel_objs):
+            got = extract_icon(img, o, pan.get("_fill"), icondir, i)
+            if got:
+                spec["icons"].append(got)
+        for i, o in enumerate(objs[1:]):
+            if o["w"] > 64 or o["h"] > 64 or o["w"] < 5 or o["h"] < 5:
+                continue
+            if any(abs(o["x"] - t["rect"][0]) < 4 and abs(o["y"] - t["rect"][1]) < 4
+                   for t in spec["texts"]):
+                continue
+            if any(abs(o["x"] - g["rect"][0]) < 4 and abs(o["y"] - g["rect"][1]) < 4
+                   for g in spec["icons"]):
+                continue
+            got = extract_icon(img, o, bg["colour"], icondir, 900 + i)
+            if got:
+                spec["icons"].append(got)
+        masks = sum(1 for g in spec["icons"] if g["kind"] == "mask")
+        print(f"  {len(spec['icons'])} icons ({masks} as masks, "
+              f"{len(spec['icons']) - masks} kept as pixels)")
         sample = ", ".join(repr(t["text"]) for t in spec["texts"][:14])
         print(f"  {sample}")
 
@@ -854,7 +935,10 @@ def cmd_render(a):
     _magick([*args, a.out])
     for tile, x, y in tiles:
         _magick([a.out, tile, "-geometry", f"+{x}+{y}", "-composite", a.out])
-    texts = spec.get("texts", [])
+    icons_ = spec.get("icons", [])
+    texts = [t for t in spec.get("texts", [])
+             if not any(abs(t["rect"][0] - g["rect"][0]) < 4
+                        and abs(t["rect"][1] - g["rect"][1]) < 4 for g in icons_)]
     for t in texts:
         x, y, tw, th = (int(round(v)) for v in t["rect"])
         pt = max(6, int(t.get("size", th)))
@@ -868,7 +952,20 @@ def cmd_render(a):
             _magick([a.out, "-font", a.font, "-pointsize", str(pt), "-fill", col,
                      "-gravity", "NorthWest", "-annotate", f"+{x}+{y}",
                      t["text"], a.out])
-    print(f"wrote {a.out}  ({len(tiles)} panels, {len(texts)} texts from {a.spec})")
+    icons = spec.get("icons", [])
+    for g in icons:
+        x, y = int(g["rect"][0]), int(g["rect"][1])
+        if g["kind"] == "mask":
+            # The mask tints: a flat colour, shown through the ink.
+            tint = "/tmp/.trace-icon-tint.png"
+            _magick(["-size", f"{int(g['rect'][2])}x{int(g['rect'][3])}",
+                     f"xc:{g.get('colour', '#ffffff')}", g["file"],
+                     "-alpha", "off", "-compose", "CopyOpacity", "-composite", tint])
+            _magick([a.out, tint, "-geometry", f"+{x}+{y}", "-composite", a.out])
+        else:
+            _magick([a.out, g["file"], "-geometry", f"+{x}+{y}", "-composite", a.out])
+    print(f"wrote {a.out}  ({len(tiles)} panels, {len(texts)} texts, "
+          f"{len(icons)} icons from {a.spec})")
     print("The STRING may be wrong where OCR guessed; its box, size, colour and")
     print("alignment are measured, and those are what a layout is made of.")
 
@@ -957,6 +1054,58 @@ def sparse_text(img, ground, minconf=45):
         x, y, w, h = (int(int(v) / 3) for v in f[6:10])
         found.append(dict(text=word, x=x, y=y, w=w, h=h, conf=round(conf)))
     return found
+
+
+# -------------------------------------------------------------------- icons
+#
+# What is left once surfaces and words are accounted for. A divide sign, a
+# window's close cross, an app badge: shapes with no character to read, and
+# OCR either returns nothing or returns a lie — KCalc's divide came back as
+# a full stop, its multiply as an X.
+#
+# These are extracted as MASKS, not screenshots. The mask is the ink's
+# coverage and the colour is carried beside it, which keeps the icon
+# recolourable by theme and makes it a real trace rather than a pasted
+# fragment. An icon with several colours in it cannot be a mask, so that
+# one is kept as pixels and said to be.
+
+
+def extract_icon(img, o, fill, outdir, idx, tol=42, inset=3):
+    """One object's ink, as a mask plus a colour, or as pixels if it is
+    genuinely multicoloured. Returns a spec entry, or None if the region
+    holds no ink worth keeping."""
+    import os
+    os.makedirs(outdir, exist_ok=True)
+    # Inset past the border ring. Cropping the whole object counted the
+    # border as a second ink, so the one-colour test failed and twenty of
+    # twenty-two glyphs fell back to being kept as pixels — a paste rather
+    # than a trace.
+    inset = min(inset, o["w"] // 4, o["h"] // 4)
+    o = dict(o, x=o["x"] + inset, y=o["y"] + inset,
+             w=max(1, o["w"] - 2 * inset), h=max(1, o["h"] - 2 * inset))
+    px = region(img, o["x"], o["y"], o["w"], o["h"])
+    ink = [c for c in px.values() if c and fill
+           and sum(abs(i - j) for i, j in zip(c, fill)) > tol]
+    if len(ink) < 6:
+        return None
+    # Is the ink one colour wearing antialiasing, or several?
+    strong = sorted(ink, key=lambda c: -sum(abs(i - j) for i, j in zip(c, fill)))
+    head = strong[: max(4, len(strong) // 5)]
+    base = mean(head)
+    spread = max(sum(abs(i - j) for i, j in zip(c, base)) for c in head)
+    stem = os.path.join(outdir, f"icon{idx}")
+    crop = ["-crop", f"{o['w']}x{o['h']}+{o['x']}+{o['y']}", "+repage"]
+    if spread <= 90:
+        # One ink: threshold against the fill into an alpha mask.
+        out = stem + ".mask.png"
+        _magick([img, *crop, "-colorspace", "Gray",
+                 "-negate" if luminance(fill) > luminance(base) else "-auto-level",
+                 "-auto-level", "-alpha", "off", out])
+        return dict(kind="mask", file=out, rect=[o["x"], o["y"], o["w"], o["h"]],
+                    colour=hexs(base))
+    out = stem + ".png"
+    _magick([img, *crop, out])
+    return dict(kind="pixels", file=out, rect=[o["x"], o["y"], o["w"], o["h"]])
 
 
 # The entrypoint stays at the very foot of this file. Three times now a new
