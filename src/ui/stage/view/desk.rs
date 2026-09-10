@@ -108,6 +108,28 @@ impl super::super::Stage {
         let lane_w = ((x1 - bar_x0 - pair_gap) * 0.5).max(1.0);
         let lane_left_x = bar_x0;
         let lane_right_x = bar_x0 + lane_w + pair_gap;
+        // S07: the block is a SURFACE, not a list of hairlines on bare
+        // ground. The mockups give it a lighter header band over a panel
+        // body — measured #564f49 over #393733 — and that is what makes
+        // DESK read as one instrument instead of seven unrelated rows
+        // that happen to be near each other. Painted first, so every
+        // name, rail and meter below lands on top of it.
+        let pad = ch;
+        let header_h = TYPE_PX + 6.0;
+        let body_h = height() - crate::tune!(FOOT);
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(x0 - pad, top - header_h),
+                egui::pos2(x1 + pad, top),
+            ),
+            0.0,
+            c.edge,
+        );
+        painter.rect_filled(
+            egui::Rect::from_min_max(egui::pos2(x0 - pad, top), egui::pos2(x1 + pad, top + body_h)),
+            0.0,
+            c.panel,
+        );
         painter.text(
             egui::pos2(x0, top - 4.0),
             egui::Align2::LEFT_BOTTOM,

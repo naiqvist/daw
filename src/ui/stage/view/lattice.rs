@@ -117,16 +117,25 @@ impl super::super::Stage {
                 let clip = self.song.slot_clip(track, scene);
                 let sounding = self.playing.get(track).copied().flatten() == Some(scene);
                 let selected = self.session_selection.cells.contains(&(track, scene));
+                // S07: three materials, not two-and-a-hole. A cell with
+                // nothing in it is still a PLACE a clip can go, so it
+                // gets the recessed lane; a clip sits raised on top of
+                // it. The mockups measure exactly this — field #302d29,
+                // resting cell #3c3735, clip block #897d70 — and the old
+                // empty-means-no-fill left the columns as a hairline
+                // grid over bare ground.
+                //
+                // Every clip wears `chassis` for now. Per-lane hue is
+                // S19; until the lane kinds carry one, one warm tone
+                // beats four invented ones.
                 let pad = if selected || sounding {
-                    Some(c.select)
+                    c.select
                 } else if clip.is_some() {
-                    Some(c.panel)
+                    c.chassis
                 } else {
-                    None
+                    c.panel
                 };
-                if let Some(fill) = pad {
-                    painter.rect_filled(rect, 0.0, fill);
-                }
+                painter.rect_filled(rect, 0.0, pad);
                 // Selection and playback may occupy the same cell. The
                 // selection keeps its teal ground; this real sounding
                 // state gets the nominal rail, static and independent of
@@ -148,7 +157,14 @@ impl super::super::Stage {
                             egui::Align2::LEFT_CENTER,
                             self.song.tag_of(id),
                             font.clone(),
-                            if sounding { c.bright } else { c.fg },
+                            // A tag reads against the material under it:
+                            // bright on the dark selection ground, the
+                            // ground itself on a raised clip block.
+                            if sounding || selected {
+                                c.bright
+                            } else {
+                                c.ground
+                            },
                         );
                     }
                     None => {

@@ -117,9 +117,17 @@ pub enum Key {
     Both,
 }
 
-/// A chassis keyed by where it stands. Solid when focused, dashed when
-/// not; the cursor itself is the overlay's (`ui::nav_cursor`), so no
-/// brackets are drawn here.
+/// A chassis keyed by where it stands: a FILLED plate, outlined only
+/// when it has the keys. The cursor itself is the overlay's
+/// (`ui::nav_cursor`), so no brackets are drawn here.
+///
+/// S07 of the soft PC-98 earth spec. This used to be an outline and
+/// nothing else — dashed at rest, solid when focused — so a plate was a
+/// shape you inferred from four hairlines over the field's own ground.
+/// The mockups separate a plate from the field by MATERIAL instead: the
+/// fill is the edge, and a rule survives only where it carries meaning.
+/// A dashed rectangle around every head was decoration standing in for a
+/// surface.
 pub fn keyed(painter: &egui::Painter, rect: egui::Rect, focused: bool, key: Key) {
     let c = palette::colours();
     let cut = CUT
@@ -137,20 +145,21 @@ pub fn keyed(painter: &egui::Painter, rect: egui::Rect, focused: bool, key: Key)
     if outline.is_empty() {
         return;
     }
+    let points: Vec<egui::Pos2> = outline.iter().copied().map(to_pos).collect();
+    // The plate itself. A keyed chamfer is convex, so one polygon does it.
+    painter.add(egui::Shape::convex_polygon(
+        points.clone(),
+        c.panel,
+        egui::Stroke::NONE,
+    ));
+    // Focus is still carried by the edge, because that survives any
+    // theme; it is now an edge on a surface rather than an edge instead
+    // of one. At rest the plate wears no outline at all.
     if focused {
         painter.add(egui::Shape::closed_line(
-            outline.iter().copied().map(to_pos).collect(),
+            points,
             egui::Stroke::new(1.0, c.chassis),
         ));
-    } else {
-        let mut closed = outline.clone();
-        closed.push(outline[0]);
-        let mut dashes = Vec::new();
-        dash::dashes(&closed, &dash::Pattern::new(DASH, GAP), &mut dashes);
-        let hairline = egui::Stroke::new(1.0, c.edge);
-        for (a, b) in &dashes {
-            painter.line_segment([to_pos(*a), to_pos(*b)], hairline);
-        }
     }
 }
 
