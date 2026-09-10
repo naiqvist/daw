@@ -655,17 +655,74 @@ def choose_fuzz(img, area, min_side, verbose=True):
     return best[0]
 
 
-def corner_radius(img, o, fill, tol=30):
-    """How far in from the left the fill starts on the panel's first row.
+def grow_to_border(img, o, ground, tol=26, maxring=3):
+    """Expand a bounding box to include the border ring around it.
 
-    A square corner gives 0; a rounded one gives roughly its radius. Read
-    two rows down from the top edge so the border itself is not counted.
+    Connected-component labelling groups a panel by its FILL, and a border
+    is by definition a different colour — so the ring ends up outside the
+    box, as its own thin component or absorbed into the background. The
+    box therefore describes the interior, not the button.
+
+    This was the single cause of two symptoms that looked unrelated: every
+    recreated panel had no outline (there was none inside the rect to
+    draw) and every corner radius measured zero (the rounded part of the
+    corner was outside the rect too).
+
+    A ring counts as a border when the pixels just outside differ from the
+    page ground — otherwise the box already touches open background and
+    there is nothing to take in.
     """
-    row_ = strip_row(img, o["y"] + 2, o["x"], o["x"] + min(o["w"], 24))
-    for i, c in enumerate(row_):
-        if c and near(c, fill, tol):
-            return i
-    return 0
+    w, h = size(img)
+    for _ in range(maxring):
+        y, x = o["y"] - 1, o["x"] - 1
+        if y < 0 or x < 0 or o["x"] + o["w"] >= w or o["y"] + o["h"] >= h:
+            break
+        above = strip_row(img, y, o["x"] + o["w"] // 4, o["x"] + 3 * o["w"] // 4)
+        left = column(img, x, o["y"] + o["h"] // 4, o["y"] + 3 * o["h"] // 4)
+        ring = [c for c in above + left if c]
+        if not ring:
+            break
+        med = mean(ring)
+        if near(med, ground, tol):
+            break
+        o = dict(o, x=o["x"] - 1, y=o["y"] - 1, w=o["w"] + 2, h=o["h"] + 2)
+    return o
+
+
+def corner_radius(img, o, ground, border=None, tol=26):
+    """The corner radius, read off the object's own top row.
+
+    A rounded rectangle's top edge runs from x=r to x=W-r, so the number of
+    leading pixels on row 0 that still belong to the PAGE rather than the
+    panel is the radius itself.
+
+    The first version read two rows down and compared against the fill,
+    which is wrong twice over: two rows in, a small radius has already
+    closed, and the pixels along the top edge are the BORDER colour, not
+    the fill. It returned 0 for every panel on both test images, and every
+    recreated corner came out square.
+    """
+    span = min(o["w"] // 2, 20)
+    if span < 2 or not ground:
+        return 0
+    row_ = strip_row(img, o["y"], o["x"], o["x"] + span)
+    def d(a, b):
+        return sum(abs(i - j) for i, j in zip(a, b))
+    r = 0
+    for c in row_:
+        if not c:
+            break
+        # Closer to the page than to the border means this pixel is still
+        # outside the curve. Comparing against the ground alone was too
+        # strict: a corner is a BLEND of the two, so its pixels sit near
+        # neither and the count stopped at the first one.
+        if border:
+            if d(c, ground) >= d(c, border):
+                break
+        elif not near(c, ground, tol):
+            break
+        r += 1
+    return r
 
 
 def cmd_auto(a):
@@ -699,6 +756,7 @@ def cmd_auto(a):
         w = min(p["x"] + p["w"], q["x"] + q["w"]) - max(p["x"], q["x"])
         h = min(p["y"] + p["h"], q["y"] + q["h"]) - max(p["y"], q["y"])
         return max(0, w) * max(0, h)
+    panels = [grow_to_border(img, o, bg["colour"]) for o in panels]
     kept = []
     for o in sorted(panels, key=lambda o: -o["w"] * o["h"]):
         small = o["w"] * o["h"]
@@ -753,7 +811,7 @@ def cmd_auto(a):
         base = mean([o["colour"] for o in group])
         first = min(group, key=lambda o: sum(abs(i - j) for i, j in zip(o["colour"], base)))
         r = anatomy(img, first["x"], y, first["w"], ph, bg["colour"])
-        rad = corner_radius(img, first, r["top"]) if r["top"] else 0
+        rad = corner_radius(img, first, bg["colour"], r["border"])
         odd = [o for o in group if not near(o["colour"], base, a.lit)]
         print(f"  cell    {hexs(r['top'])} -> {hexs(r['foot'])}"
               f"  {'gradient' if r['gradient'] else 'flat'}"
@@ -783,7 +841,7 @@ def cmd_auto(a):
 
     for o in sorted(singles, key=lambda o: -o["area"])[: a.limit]:
         r = anatomy(img, o["x"], o["y"], o["w"], o["h"], bg["colour"])
-        rad = corner_radius(img, o, r["top"]) if r["top"] else 0
+        rad = corner_radius(img, o, bg["colour"], r["border"])
         print(f"PANEL {o['w']}x{o['h']} at {o['x']},{o['y']}   {hexs(o['colour'])}")
         print(f"  {hexs(r['top'])} -> {hexs(r['foot'])}"
               f"  {'gradient' if r['gradient'] else 'flat'}"
@@ -927,8 +985,18 @@ def cmd_render(a):
         border = pan.get("border")
         draw = []
         if border and pan.get("border_px", 0) >= 1:
-            draw = ["-fill", "none", "-stroke", border, "-strokewidth", "1",
-                    "-draw", f"roundrectangle 0.5,0.5 {pw - 1.5},{ph - 1.5} {r},{r}"]
+            bw = int(pan.get("border_px", 1))
+            # Integer bounds and antialiasing OFF. Drawn at a half-pixel
+            # offset a one-pixel stroke straddles two rows of pixels and
+            # each gets half the colour, so the outline rendered at about
+            # half its measured brightness and read as "no outline at all".
+            # Antialiasing left ON: the straight runs land on whole
+            # pixels because the bounds are integers, while the corners
+            # still curve. Turning it off gave crisp edges and visibly
+            # harder corners than the drawing has.
+            draw = ["-fill", "none", "-stroke", border,
+                    "-strokewidth", str(bw),
+                    "-draw", f"roundrectangle 0,0 {pw - 1},{ph - 1} {r},{r}"]
         if draw:
             _magick([tile, *draw, tile])
         tiles.append((tile, x, y))
