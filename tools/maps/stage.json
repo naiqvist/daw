@@ -1,0 +1,10 @@
+{
+  "_": "Which measurement is which constant. The only hardcoding in the loop: that a row at y45 is the page-key row is knowledge about this app, not about the picture. Row keys are the y the tracer reports; run `auto` first and read them off.",
+  "rows": {
+    "45": { "margin": "deck.KEY_MARGIN", "gap": "deck.KEY_GAP", "h": "deck.DECK_H" }
+  },
+  "panels": {
+    "row at y45, cell": { "radius": "deck.KEY_RADIUS" }
+  },
+  "roles": { "ground": "ground" }
+}

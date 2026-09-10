@@ -575,6 +575,13 @@ def main():
                     help="a family fontconfig knows, or a path to a .ttf")
     rn.set_defaults(fn=cmd_render)
 
+    ap = sub.add_parser("apply", help="write a spec into the files the app watches")
+    ap.add_argument("spec")
+    ap.add_argument("--map", help="JSON saying which measurement is which constant")
+    ap.add_argument("--tune", help="e.g. ~/Corpus/daw.tune")
+    ap.add_argument("--theme", help="e.g. ~/Corpus/daw.theme")
+    ap.set_defaults(fn=cmd_apply)
+
     a = p.parse_args()
     a.fn(a)
 
@@ -620,42 +627,64 @@ def components(img, fuzz, area):
     return sorted(out, key=lambda o: -o["area"])
 
 
-def choose_fuzz(img, area, min_side, verbose=True):
-    """Pick the fuzz that segments this image, by sweeping and reading the shape.
+def choose_fuzz(img, area, min_side, verbose=True, default=6):
+    """Pick the fuzz that segments this image, by scoring the STRUCTURE.
 
-    There is no good default. Fuzz has to bridge a panel's own gradient
-    without bridging the step between a panel and its ground, and how far
-    apart those two are is a property of the DESIGN. The default of 6%
-    suited the macOS concept and silently swallowed the KCalc display,
-    which sits only thirteen units per channel off its window ground — so
-    6% merged them and a whole panel vanished from the spec with no
-    complaint.
+    There is no good default: fuzz has to bridge a panel's own gradient
+    without bridging the step to its ground, and how far apart those are
+    is a property of the design.
 
-    Object count against fuzz has a characteristic shape: a PLATEAU where
-    the segmentation is right, a spike above it where gradients start
-    splitting into bands, and a collapse beyond that as everything merges
-    into one. Take the highest fuzz still on the first plateau — the most
-    forgiving setting that has not yet begun merging things that differ.
+    The first version scored by object COUNT and looked for a plateau.
+    That worked on a calculator, whose counts genuinely plateau, and failed
+    on the macOS concept, whose counts fall monotonically — 126, 98, 64,
+    36, 26, 16 — so "the first plateau" chose 2% and shattered every panel
+    into fragments. Count is not the thing we want more of.
+
+    What we want is ROWS: objects that share a top edge and a height, which
+    is what a key row, a button grid or a list of meters looks like. Score
+    each fuzz by how many objects fall into such a group, and the setting
+    that best reveals the design's own repetition wins. Ties go to the
+    higher fuzz, which merges gradients rather than splitting them.
     """
-    counts = []
+    scores = []
     for f in (1, 2, 3, 4, 5, 6, 8, 10):
-        objs = components(img, f, area)
-        counts.append((f, len([o for o in objs if o["w"] >= min_side and o["h"] >= min_side])))
-    best, run = counts[0], []
-    for i, (f, n) in enumerate(counts):
-        if run and abs(n - run[-1][1]) > 0.25 * max(n, run[-1][1]):
-            break
-        run.append((f, n))
-    if run:
-        best = run[-1]
+        objs = [o for o in components(img, f, area)
+                if o["w"] >= min_side and o["h"] >= min_side]
+        groups = {}
+        for o in objs[1:]:
+            groups.setdefault((o["y"], o["h"]), []).append(o)
+        # AREA in rows, not count. Counting rewarded shattering the image:
+        # at 1% the macOS concept broke into 126 fragments, 86 of which
+        # happened to align into "rows", and that beat the setting which
+        # actually found its eight key cells. Area cannot be gamed by
+        # fragmentation — cutting a panel into ten pieces does not give
+        # you more panel.
+        rowed = sum(o["w"] * o["h"] for g in groups.values() if len(g) >= 2 for o in g)
+        scores.append((f, rowed, len(objs)))
+    # ADVISORY, not automatic. Three scoring rules were tried and each
+    # failed on a design the previous one handled:
+    #
+    #   object count, seeking a plateau  — worked on the calculator, whose
+    #     counts plateau; chose 2% on the macOS concept, whose counts fall
+    #     monotonically (126, 98, 64, 36, 26, 16), shattering every panel
+    #   objects falling into rows        — chose 1%, because fragments
+    #     align into rows better than panels do
+    #   AREA falling into rows           — chose 1% again, because at 1%
+    #     the large regions split into aligned bands
+    #
+    # There is no rule here that survives contact with a new design, and a
+    # fourth guess would only fail somewhere I have not looked yet. The
+    # sweep is printed as EVIDENCE and the default stands; pass --fuzz to
+    # override it, which is the honest amount of hardcoding for this step.
+    best = (default, 0, 0)
     if verbose:
-        shape = "  ".join(f"{f}%:{n}" for f, n in counts)
-        print(f"fuzz sweep   {shape}")
-        print(f"chose {best[0]}% — highest still on the first plateau\n")
+        shape = "  ".join(f"{f}%:{r // 1000}k" for f, r, _ in scores)
+        print(f"fuzz sweep (area in rows)   {shape}")
+        print(f"using {best[0]}% (the default; --fuzz overrides)\n")
     return best[0]
 
 
-def grow_to_border(img, o, ground, tol=26, maxring=3):
+def grow_to_border(img, o, ground, tol=26, maxring=1):
     """Expand a bounding box to include the border ring around it.
 
     Connected-component labelling groups a panel by its FILL, and a border
@@ -667,26 +696,49 @@ def grow_to_border(img, o, ground, tol=26, maxring=3):
     recreated panel had no outline (there was none inside the rect to
     draw) and every corner radius measured zero (the rounded part of the
     corner was outside the rect too).
-
-    A ring counts as a border when the pixels just outside differ from the
-    page ground — otherwise the box already touches open background and
-    there is nothing to take in.
     """
+    # ONE ring. Allowing more let the macOS key cells grow twice: past
+    # their border and on into the dark gap between cells, which reported
+    # a border of #071120 and a corner radius of twenty. Thickness beyond
+    # one pixel is measured separately, by `anatomy`, from inside the box.
     w, h = size(img)
     for _ in range(maxring):
         y, x = o["y"] - 1, o["x"] - 1
         if y < 0 or x < 0 or o["x"] + o["w"] >= w or o["y"] + o["h"] >= h:
             break
-        above = strip_row(img, y, o["x"] + o["w"] // 4, o["x"] + 3 * o["w"] // 4)
-        left = column(img, x, o["y"] + o["h"] // 4, o["y"] + 3 * o["h"] // 4)
-        ring = [c for c in above + left if c]
-        if not ring:
+        # Grow only when the ring is a LINE: one tone at -1, a different
+        # one at -2. A border is thin by definition, so if the two rings
+        # match, -1 is simply whatever the panel sits on and there is
+        # nothing to take in.
+        #
+        # Testing "differs from the page ground" instead was wrong on any
+        # nested panel: a key cell sits on its ROW's ground, not the
+        # page's, so every cell grew a pixel it should not have and the
+        # macOS key row lost two of its eight members to the overlap
+        # check.
+        a1 = mean([c for c in strip_row(img, y, o["x"] + o["w"] // 4,
+                                        o["x"] + 3 * o["w"] // 4) if c])
+        a2 = mean([c for c in strip_row(img, y - 1, o["x"] + o["w"] // 4,
+                                        o["x"] + 3 * o["w"] // 4) if c]) if y > 0 else None
+        if not a1 or not a2:
             break
-        med = mean(ring)
-        if near(med, ground, tol):
+        if near(a1, a2, tol):
             break
         o = dict(o, x=o["x"] - 1, y=o["y"] - 1, w=o["w"] + 2, h=o["h"] + 2)
     return o
+
+
+def local_ground(img, o):
+    """Whatever this object actually sits on, one pixel outside its top.
+
+    Not the page ground: a key cell sits on the deck bar, and comparing
+    its corner against the page made twenty pixels of the top row look
+    like background. The radius came back as the span cap.
+    """
+    if o["y"] < 1:
+        return None
+    band = strip_row(img, o["y"] - 1, o["x"], o["x"] + o["w"])
+    return mean([c for c in band if c])
 
 
 def corner_radius(img, o, ground, border=None, tol=26):
@@ -702,7 +754,9 @@ def corner_radius(img, o, ground, border=None, tol=26):
     the fill. It returned 0 for every panel on both test images, and every
     recreated corner came out square.
     """
-    span = min(o["w"] // 2, 20)
+    # Capped at a third of the shorter side: a corner radius larger than
+    # that is not a rounded rectangle, it is a failed measurement.
+    span = min(o["w"] // 2, o["h"] // 3, 20)
     if span < 2 or not ground:
         return 0
     row_ = strip_row(img, o["y"], o["x"], o["x"] + span)
@@ -722,7 +776,11 @@ def corner_radius(img, o, ground, border=None, tol=26):
         elif not near(c, ground, tol):
             break
         r += 1
-    return r
+    # Running the whole span means no edge was ever found — the surround
+    # reference was wrong, or this is not a rounded rectangle. Report 0
+    # rather than the cap, which would otherwise be emitted as a real
+    # measurement and drawn as a 15px round on a 45px cell.
+    return 0 if r >= span else r
 
 
 def cmd_auto(a):
@@ -811,7 +869,7 @@ def cmd_auto(a):
         base = mean([o["colour"] for o in group])
         first = min(group, key=lambda o: sum(abs(i - j) for i, j in zip(o["colour"], base)))
         r = anatomy(img, first["x"], y, first["w"], ph, bg["colour"])
-        rad = corner_radius(img, first, bg["colour"], r["border"])
+        rad = corner_radius(img, first, local_ground(img, first) or bg["colour"], r["border"])
         odd = [o for o in group if not near(o["colour"], base, a.lit)]
         print(f"  cell    {hexs(r['top'])} -> {hexs(r['foot'])}"
               f"  {'gradient' if r['gradient'] else 'flat'}"
@@ -841,7 +899,7 @@ def cmd_auto(a):
 
     for o in sorted(singles, key=lambda o: -o["area"])[: a.limit]:
         r = anatomy(img, o["x"], o["y"], o["w"], o["h"], bg["colour"])
-        rad = corner_radius(img, o, bg["colour"], r["border"])
+        rad = corner_radius(img, o, local_ground(img, o) or bg["colour"], r["border"])
         print(f"PANEL {o['w']}x{o['h']} at {o['x']},{o['y']}   {hexs(o['colour'])}")
         print(f"  {hexs(r['top'])} -> {hexs(r['foot'])}"
               f"  {'gradient' if r['gradient'] else 'flat'}"
@@ -1174,6 +1232,114 @@ def extract_icon(img, o, fill, outdir, idx, tol=42, inset=3):
     out = stem + ".png"
     _magick([img, *crop, out])
     return dict(kind="pixels", file=out, rect=[o["x"], o["y"], o["w"], o["h"]])
+
+
+# ------------------------------------------------------------------- apply
+#
+# The loop, closed procedurally. `emit` prints Rust for a human to paste,
+# which makes every mockup a hand-editing job; this writes the measurements
+# into the two files the running app already WATCHES:
+#
+#   ~/Corpus/daw.tune    @tune constants, reparsed on the next frame
+#   ~/Corpus/daw.theme   the OkLCh palette, likewise
+#
+# So the loop is: send a mockup, run auto, run apply, and the app changes
+# while it is running. No rebuild, no paste, no edit.
+#
+# The one thing that cannot be derived is WHICH measurement belongs to
+# which constant — that a row at y45 is the page-key row and not the track
+# heads is knowledge about this app, not about the picture. That mapping is
+# a small JSON file and it is the honest place for the hardcoding. Nothing
+# else needs any.
+
+
+def cmd_apply(a):
+    spec = json.load(open(a.spec))
+    mapping = json.load(open(a.map)) if a.map else {}
+    tune_lines, theme_lines, unmapped = [], [], []
+
+    rows = {str(int(c["name"].split("ROW")[1].split("_")[0])): c
+            for c in spec.get("constants", []) if c["name"].startswith("ROW")}
+    by_row = {}
+    for c in spec.get("constants", []):
+        if not c["name"].startswith("ROW"):
+            continue
+        y, _, field = c["name"][3:].partition("_")
+        by_row.setdefault(y, {})[field.lower()] = c["value"]
+
+    for y, fields in sorted(by_row.items()):
+        # Match a mapped row within a few pixels. Exact keys are brittle:
+        # growing a box to take in its border moves every row by one, and
+        # a map written before that change silently stopped applying.
+        want = mapping.get("rows", {})
+        target = want.get(y)
+        if not target:
+            near_ = [k for k in want if abs(int(k) - int(y)) <= 3]
+            target = want[near_[0]] if near_ else None
+        if not target:
+            unmapped.append(f"row at y{y}: {fields}")
+            continue
+        for field, value in fields.items():
+            key = target.get(field)
+            if key:
+                tune_lines.append((key, value))
+
+    for name, hexv in spec.get("roles", {}).items():
+        role = mapping.get("roles", {}).get(name, name)
+        c = tuple(int(hexv.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
+        L, C, h = oklch(c)
+        theme_lines.append((role, f"{L:.3f} {C:.3f} {h:6.3f}", hexv))
+
+    for pan in spec.get("panels", []):
+        target = mapping.get("panels", {}).get(pan.get("name", ""))
+        if not target:
+            continue
+        for field, key in target.items():
+            if field in ("radius", "border_px") and key:
+                tune_lines.append((key, pan.get(field, 0)))
+
+    if a.tune and tune_lines:
+        merge_kv(a.tune, tune_lines, a.spec)
+        print(f"{len(tune_lines)} constants -> {a.tune}")
+        for k, v in tune_lines:
+            print(f"    {k} {v}")
+    if a.theme and theme_lines:
+        merge_roles(a.theme, theme_lines, a.spec)
+        print(f"{len(theme_lines)} roles -> {a.theme}")
+    if unmapped:
+        print(f"\n{len(unmapped)} measurements had nowhere to go:")
+        for u in unmapped:
+            print(f"    {u}")
+        print("  Add them to the map file to have them applied.")
+    if not a.tune and not a.theme:
+        print("nothing written: pass --tune and/or --theme")
+    else:
+        print("\nThe app watches both files. If it is running, it has already changed.")
+
+
+def merge_kv(path, pairs, source):
+    """Rewrite `key value` lines in place, keeping everything else."""
+    import os
+    existing = []
+    if os.path.exists(path):
+        existing = open(path).read().splitlines()
+    keys = {k for k, _ in pairs}
+    out = [ln for ln in existing
+           if not (ln.split(" ")[0] in keys if ln and not ln.startswith("#") else False)]
+    out.append(f"# traced from {os.path.basename(source)} by tools/trace.py")
+    out += [f"{k} {v}" for k, v in pairs]
+    open(path, "w").write("\n".join(out) + "\n")
+
+
+def merge_roles(path, roles, source):
+    import os
+    existing = open(path).read().splitlines() if os.path.exists(path) else []
+    names = {n for n, _, _ in roles}
+    out = [ln for ln in existing
+           if not (ln.split(" ")[0] in names if ln and not ln.startswith("#") else False)]
+    out.append(f"# traced from {os.path.basename(source)} by tools/trace.py")
+    out += [f"{n:8s} {v}   # {h}" for n, v, h in roles]
+    open(path, "w").write("\n".join(out) + "\n")
 
 
 # The entrypoint stays at the very foot of this file. Three times now a new
