@@ -92,10 +92,16 @@ pub(super) enum ScopeContext {
     /// the menu away without opening anything. It owns the keys while
     /// it stands, so the window underneath cannot answer them.
     LabMenu,
+    /// The meter is the field: the stream of answered verbs on the left,
+    /// the song's steps rising through the now-line on the right. A
+    /// place of its own, like the cutting room and the forge, that
+    /// Escape leaves. It reads and never writes, so its whole vocabulary
+    /// is where to look.
+    Meter,
 }
 
 impl ScopeContext {
-    pub(super) const ALL: [Self; 21] = [
+    pub(super) const ALL: [Self; 22] = [
         Self::Root,
         Self::Nested,
         Self::Browser,
@@ -117,6 +123,7 @@ impl ScopeContext {
         Self::KilnFilter,
         Self::MidiLab,
         Self::LabMenu,
+        Self::Meter,
     ];
 }
 
@@ -386,6 +393,8 @@ pub enum StageIntent {
     /// Arm the arrangement: while the session plays, every launch
     /// writes a block into the song.
     RecordSong,
+    /// The meter, and the ways of looking around inside it.
+    Meter(MeterIntent),
 }
 
 /// What the song view does beyond the cursor's walk and the verbs it
@@ -867,6 +876,99 @@ impl StageIntent {
             Self::Bus => "next bus",
             Self::Song(intent) => intent.label(),
             Self::RecordSong => "record to song",
+            Self::Meter(intent) => intent.label(),
+        }
+    }
+}
+
+/// What can be asked of the meter. Every one of them is a way of
+/// LOOKING: the section holds no cursor that writes, so there is
+/// nothing here that could change the song.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MeterIntent {
+    /// The section, up or away.
+    Open,
+    /// Walk the body by hand, a step or a bar at a time. The first walk
+    /// takes the wheel from the playhead.
+    Back,
+    Forward,
+    PageBack,
+    PageForward,
+    /// Walk the cursor across the columns.
+    Left,
+    Right,
+    /// The same four walks, dragging a block behind them.
+    SelectBack,
+    SelectForward,
+    SelectLeft,
+    SelectRight,
+    /// Give the wheel back: the now-line returns to the transport.
+    Follow,
+    /// Turn the field under the cursor, or every field of the block.
+    Turn {
+        up: bool,
+        coarse: bool,
+    },
+    /// A typed letter, A..G: a pitch on the note column, a hex digit on
+    /// the velocity column. The same key, and the column says which —
+    /// which is the tracker's own bargain and the reason the columns
+    /// are named at the head.
+    Letter(u8),
+    /// A typed digit, on the velocity column.
+    Digit(u8),
+    /// The trig itself, on or off.
+    Trig,
+    /// A pitch ADDED to the step rather than replacing it: the shifted
+    /// letters build a chord out of the note already standing there.
+    Chord(u8),
+    /// The lock under the cursor glides to the next one on its address.
+    Slide,
+    /// Clear what the cursor is on: the step, or one lock.
+    Clear,
+    /// Walk which parameter the ADD column offers.
+    AddPrev,
+    AddNext,
+}
+
+impl MeterIntent {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Open => "meter",
+            Self::Back => "back a step",
+            Self::Forward => "on a step",
+            Self::PageBack => "back a bar",
+            Self::PageForward => "on a bar",
+            Self::Left => "previous column",
+            Self::Right => "next column",
+            Self::SelectBack => "select back",
+            Self::SelectForward => "select on",
+            Self::SelectLeft => "select left",
+            Self::SelectRight => "select right",
+            Self::Follow => "follow the song",
+            Self::Turn {
+                up: true,
+                coarse: false,
+            } => "turn up",
+            Self::Turn {
+                up: false,
+                coarse: false,
+            } => "turn down",
+            Self::Turn {
+                up: true,
+                coarse: true,
+            } => "turn up coarse",
+            Self::Turn {
+                up: false,
+                coarse: true,
+            } => "turn down coarse",
+            Self::Letter(_) => "type a letter",
+            Self::Digit(_) => "type a digit",
+            Self::Trig => "trig on / off",
+            Self::Chord(_) => "add to the chord",
+            Self::Slide => "slide the lock",
+            Self::Clear => "clear",
+            Self::AddPrev => "previous parameter",
+            Self::AddNext => "next parameter",
         }
     }
 }
@@ -2165,6 +2267,305 @@ const BINDINGS: &[Binding] = &[
         StageIntent::Forge(ForgeIntent::Randomise),
     ),
     Binding::new(ScopeContext::Forge, Key::Escape, StageIntent::Escape),
+    // The meter: a section of its own, reached from the field's three
+    // projections and from inside a clip — the two places a reader is
+    // when they want to know what the machine just did.
+    Binding::command_shift(
+        ScopeContext::Root,
+        Key::R,
+        StageIntent::Meter(MeterIntent::Open),
+    ),
+    Binding::command_shift(
+        ScopeContext::Nested,
+        Key::R,
+        StageIntent::Meter(MeterIntent::Open),
+    ),
+    Binding::command_shift(
+        ScopeContext::Song,
+        Key::R,
+        StageIntent::Meter(MeterIntent::Open),
+    ),
+    Binding::command_shift(
+        ScopeContext::Mixer,
+        Key::R,
+        StageIntent::Meter(MeterIntent::Open),
+    ),
+    Binding::command_shift(
+        ScopeContext::Clip,
+        Key::R,
+        StageIntent::Meter(MeterIntent::Open),
+    ),
+    Binding::command_shift(
+        ScopeContext::Meter,
+        Key::R,
+        StageIntent::Meter(MeterIntent::Open),
+    ),
+    // Inside it, the whole vocabulary is where to look. The vertical
+    // arrows walk the body and take the wheel from the playhead; Enter
+    // gives it back; the horizontal arrows walk the columns. Time is
+    // global here as everywhere, so the song can be started and stopped
+    // by the reader watching it.
+    Binding::new(
+        ScopeContext::Meter,
+        Key::Space,
+        StageIntent::ToggleTransport,
+    ),
+    Binding::command(ScopeContext::Meter, Key::L, StageIntent::Ground),
+    Binding::new(ScopeContext::Meter, Key::Home, StageIntent::Rewind),
+    Binding::new(ScopeContext::Meter, Key::Escape, StageIntent::Escape),
+    Binding::new(
+        ScopeContext::Meter,
+        Key::ArrowUp,
+        StageIntent::Meter(MeterIntent::Back),
+    ),
+    Binding::new(
+        ScopeContext::Meter,
+        Key::ArrowDown,
+        StageIntent::Meter(MeterIntent::Forward),
+    ),
+    Binding::new(
+        ScopeContext::Meter,
+        Key::PageUp,
+        StageIntent::Meter(MeterIntent::PageBack),
+    ),
+    Binding::new(
+        ScopeContext::Meter,
+        Key::PageDown,
+        StageIntent::Meter(MeterIntent::PageForward),
+    ),
+    Binding::new(
+        ScopeContext::Meter,
+        Key::ArrowLeft,
+        StageIntent::Meter(MeterIntent::Left),
+    ),
+    Binding::new(
+        ScopeContext::Meter,
+        Key::ArrowRight,
+        StageIntent::Meter(MeterIntent::Right),
+    ),
+    Binding::new(
+        ScopeContext::Meter,
+        Key::Enter,
+        StageIntent::Meter(MeterIntent::Follow),
+    ),
+    // The block: the same four walks with Shift on them, which is how
+    // every other surface here extends a selection.
+    Binding::shift(
+        ScopeContext::Meter,
+        Key::ArrowUp,
+        StageIntent::Meter(MeterIntent::SelectBack),
+    ),
+    Binding::shift(
+        ScopeContext::Meter,
+        Key::ArrowDown,
+        StageIntent::Meter(MeterIntent::SelectForward),
+    ),
+    Binding::shift(
+        ScopeContext::Meter,
+        Key::ArrowLeft,
+        StageIntent::Meter(MeterIntent::SelectLeft),
+    ),
+    Binding::shift(
+        ScopeContext::Meter,
+        Key::ArrowRight,
+        StageIntent::Meter(MeterIntent::SelectRight),
+    ),
+    // Turning the field under the cursor. The deck's own idiom, on the
+    // two keys that sit next to each other and mean less and more
+    // everywhere else in this app.
+    Binding::new(
+        ScopeContext::Meter,
+        Key::Minus,
+        StageIntent::Meter(MeterIntent::Turn {
+            up: false,
+            coarse: false,
+        }),
+    ),
+    Binding::new(
+        ScopeContext::Meter,
+        Key::Equals,
+        StageIntent::Meter(MeterIntent::Turn {
+            up: true,
+            coarse: false,
+        }),
+    ),
+    Binding::shift(
+        ScopeContext::Meter,
+        Key::Minus,
+        StageIntent::Meter(MeterIntent::Turn {
+            up: false,
+            coarse: true,
+        }),
+    ),
+    Binding::shift(
+        ScopeContext::Meter,
+        Key::Equals,
+        StageIntent::Meter(MeterIntent::Turn {
+            up: true,
+            coarse: true,
+        }),
+    ),
+    // The trig itself. NOT Space, which stops and rolls the song in
+    // every scope this app has and is not going to mean two things in
+    // one of them.
+    Binding::new(
+        ScopeContext::Meter,
+        Key::T,
+        StageIntent::Meter(MeterIntent::Trig),
+    ),
+    Binding::new(
+        ScopeContext::Meter,
+        Key::S,
+        StageIntent::Meter(MeterIntent::Slide),
+    ),
+    Binding::new(
+        ScopeContext::Meter,
+        Key::Delete,
+        StageIntent::Meter(MeterIntent::Clear),
+    ),
+    Binding::new(
+        ScopeContext::Meter,
+        Key::Backspace,
+        StageIntent::Meter(MeterIntent::Clear),
+    ),
+    // Which parameter the ADD column offers, walked the way the forge
+    // walks its passes.
+    Binding::new(
+        ScopeContext::Meter,
+        Key::Comma,
+        StageIntent::Meter(MeterIntent::AddPrev),
+    ),
+    Binding::new(
+        ScopeContext::Meter,
+        Key::Period,
+        StageIntent::Meter(MeterIntent::AddNext),
+    ),
+    // Shifted, the same letters ADD to the step: a chord is one
+    // step with more notes in it, so building one is adding.
+    Binding::shift(
+        ScopeContext::Meter,
+        Key::A,
+        StageIntent::Meter(MeterIntent::Chord(0)),
+    ),
+    Binding::shift(
+        ScopeContext::Meter,
+        Key::B,
+        StageIntent::Meter(MeterIntent::Chord(1)),
+    ),
+    Binding::shift(
+        ScopeContext::Meter,
+        Key::C,
+        StageIntent::Meter(MeterIntent::Chord(2)),
+    ),
+    Binding::shift(
+        ScopeContext::Meter,
+        Key::D,
+        StageIntent::Meter(MeterIntent::Chord(3)),
+    ),
+    Binding::shift(
+        ScopeContext::Meter,
+        Key::E,
+        StageIntent::Meter(MeterIntent::Chord(4)),
+    ),
+    Binding::shift(
+        ScopeContext::Meter,
+        Key::F,
+        StageIntent::Meter(MeterIntent::Chord(5)),
+    ),
+    Binding::shift(
+        ScopeContext::Meter,
+        Key::G,
+        StageIntent::Meter(MeterIntent::Chord(6)),
+    ),
+    // Typed values. A..G are pitches on the note column and the
+    // upper half of a hex digit on the velocity column; the digits
+    // are the lower half. Nothing here is a mode: the column the
+    // cursor is on decides, and the head says which column that is.
+    Binding::new(
+        ScopeContext::Meter,
+        Key::A,
+        StageIntent::Meter(MeterIntent::Letter(0)),
+    ),
+    Binding::new(
+        ScopeContext::Meter,
+        Key::B,
+        StageIntent::Meter(MeterIntent::Letter(1)),
+    ),
+    Binding::new(
+        ScopeContext::Meter,
+        Key::C,
+        StageIntent::Meter(MeterIntent::Letter(2)),
+    ),
+    Binding::new(
+        ScopeContext::Meter,
+        Key::D,
+        StageIntent::Meter(MeterIntent::Letter(3)),
+    ),
+    Binding::new(
+        ScopeContext::Meter,
+        Key::E,
+        StageIntent::Meter(MeterIntent::Letter(4)),
+    ),
+    Binding::new(
+        ScopeContext::Meter,
+        Key::F,
+        StageIntent::Meter(MeterIntent::Letter(5)),
+    ),
+    Binding::new(
+        ScopeContext::Meter,
+        Key::G,
+        StageIntent::Meter(MeterIntent::Letter(6)),
+    ),
+    Binding::new(
+        ScopeContext::Meter,
+        Key::Num0,
+        StageIntent::Meter(MeterIntent::Digit(0)),
+    ),
+    Binding::new(
+        ScopeContext::Meter,
+        Key::Num1,
+        StageIntent::Meter(MeterIntent::Digit(1)),
+    ),
+    Binding::new(
+        ScopeContext::Meter,
+        Key::Num2,
+        StageIntent::Meter(MeterIntent::Digit(2)),
+    ),
+    Binding::new(
+        ScopeContext::Meter,
+        Key::Num3,
+        StageIntent::Meter(MeterIntent::Digit(3)),
+    ),
+    Binding::new(
+        ScopeContext::Meter,
+        Key::Num4,
+        StageIntent::Meter(MeterIntent::Digit(4)),
+    ),
+    Binding::new(
+        ScopeContext::Meter,
+        Key::Num5,
+        StageIntent::Meter(MeterIntent::Digit(5)),
+    ),
+    Binding::new(
+        ScopeContext::Meter,
+        Key::Num6,
+        StageIntent::Meter(MeterIntent::Digit(6)),
+    ),
+    Binding::new(
+        ScopeContext::Meter,
+        Key::Num7,
+        StageIntent::Meter(MeterIntent::Digit(7)),
+    ),
+    Binding::new(
+        ScopeContext::Meter,
+        Key::Num8,
+        StageIntent::Meter(MeterIntent::Digit(8)),
+    ),
+    Binding::new(
+        ScopeContext::Meter,
+        Key::Num9,
+        StageIntent::Meter(MeterIntent::Digit(9)),
+    ),
     Binding::new(
         ScopeContext::Forge,
         Key::Space,
@@ -2871,7 +3272,7 @@ fn page_bindings(scope: ScopeContext) -> Vec<(Mods, Key, StageIntent)> {
 /// A closed match rather than a field on the binding: a new intent that
 /// forgets its family is a COMPILE ERROR, the same rule `label` follows,
 /// so the palette cannot come to hold a verb it has no word for.
-fn family(intent: StageIntent) -> &'static str {
+pub(super) fn family(intent: StageIntent) -> &'static str {
     match intent {
         StageIntent::Step(_)
         | StageIntent::Group(_)
@@ -2892,6 +3293,7 @@ fn family(intent: StageIntent) -> &'static str {
         | StageIntent::HeroFocus { .. }
         | StageIntent::Deck
         | StageIntent::SlotStep(_) => "pages",
+        StageIntent::Meter(_) => "meter",
         StageIntent::Lab
         | StageIntent::LabWindow
         | StageIntent::MidiLabOpen

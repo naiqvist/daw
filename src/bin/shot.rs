@@ -485,7 +485,12 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
     if stage.polarity() != want {
         let _ = stage.apply(StageIntent::Ground);
     }
-    if which.contains("band-lane") {
+    if which.contains("meter") {
+        // The meter poses itself: it needs a whole rolling song behind
+        // it, and a stream of verbs already answered, neither of which
+        // a default stage has.
+        stage.pose_meter(which);
+    } else if which.contains("band-lane") {
         stage.song_mut().set_lane(0, daw::lane::Lane::Drum);
         let _ = stage
             .song_mut()
@@ -999,7 +1004,10 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
         let _ = stage.apply(StageIntent::Song(SongIntent::ZoomIn));
         let _ = stage.apply(StageIntent::Song(SongIntent::ZoomIn));
     }
-    if which.contains("meter") {
+    // `stage-meter` is the METER SECTION's pose and brings its own
+    // signature; every other name carrying the word means the song's
+    // time signature, which is what this block is for.
+    if which.contains("meter") && !which.starts_with("stage-meter") {
         // A real denominator change inside the posed Song: enough to
         // prove the ruler follows 7/8 beats, then restarts in 3/4.
         let seven_eighths = daw::sequencing::TICKS_PER_BEAT * 7 / 2;

@@ -1384,7 +1384,13 @@ impl App {
         let first = cli_args.next();
         let open_midi = first.as_ref().is_some_and(|arg| arg == "--midi-lab");
         let open_lab = first.as_ref().is_some_and(|arg| arg == "--lab");
-        let cli_path = if open_lab || open_midi {
+        let open_meter = first.as_ref().is_some_and(|arg| arg == "--meter");
+        // `--meter-demo` opens the section on material of its own, and
+        // rolling. A metering surface opened onto an empty parked song
+        // shows the one state it never shows, so the door that exists
+        // to LOOK at the section brings something to look at.
+        let demo_meter = first.as_ref().is_some_and(|arg| arg == "--meter-demo");
+        let cli_path = if open_lab || open_midi || open_meter || demo_meter {
             cli_args.next()
         } else {
             first
@@ -1422,6 +1428,14 @@ impl App {
         }
         if open_lab {
             let _ = stage.apply(daw::ui::stage::StageIntent::Lab);
+        }
+        if open_meter {
+            let _ = stage.apply(daw::ui::stage::StageIntent::Meter(
+                daw::ui::stage::MeterIntent::Open,
+            ));
+        }
+        if demo_meter {
+            stage.pose_meter("stage-meter");
         }
         Self {
             stage,
